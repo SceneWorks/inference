@@ -58,13 +58,18 @@
 //! forward feeds `quantized_matmul` f32 inputs.
 
 use mlx_rs::error::{Exception, Result as MlxResult};
-use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{concatenate_axis, split};
+use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
+use mlx_rs::ops::split;
 use mlx_rs::transforms::checkpoint;
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::adapters::LinearFacts;
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, Adapter};
 use mlx_gen::nn::{conv2d, gelu_tanh, modulate, silu, timestep_sincos};
+use mlx_gen::qkv::{
+    self, AttnPrepSpec, FusedQkvProjection, QkNormSpec, QkvHeads, QkvPart, QkvSource, RotationAxes,
+    StreamOrder,
+};
 use mlx_gen::train::lora::LoraParams;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -106,26 +111,25 @@ fn lin(w: &Weights, prefix: &str) -> Result<AdaptableLinear> {
 #[allow(clippy::too_many_arguments)]
 fn process_qkv(
     x: &Array,
-    q_w: &AdaptableLinear,
-    k_w: &AdaptableLinear,
-    v_w: &AdaptableLinear,
+    qkv_proj: &FusedQkvProjection,
     norm_q: &Array,
     norm_k: &Array,
     heads: i32,
     head_dim: i32,
-) -> Result<(Array, Array, Array)> {
-    let sh = x.shape();
-    let (b, s) = (sh[0], sh[1]);
-    let to_bhsd = |a: Array| -> Result<Array> {
-        Ok(a.reshape(&[b, s, heads, head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?)
-    };
-    let q = to_bhsd(q_w.forward(x)?)?;
-    let k = to_bhsd(k_w.forward(x)?)?;
-    let v = to_bhsd(v_w.forward(x)?)?;
-    let q = rms_norm(&q, norm_q, RMS_EPS)?;
-    let k = rms_norm(&k, norm_k, RMS_EPS)?;
-    Ok((q, k, v))
+) -> Result<QkvHeads> {
+    // SC-18319 — the shared prologue. SD3's knob selection is the sparsest in the tree: separate
+    // q/k/v (knob 9), per-head q/k RMSNorm over `head_dim` (knob 1), **no RoPE at all** (knob 7 —
+    // SD3 is position-embedded at the patch embedder, not in attention), head-major axes, and an
+    // `[img, txt]` join (knob 11) at the call site.
+    let spec = AttnPrepSpec::new(heads, head_dim)
+        .with_qk_norm(QkNormSpec::per_head(norm_q, norm_k, RMS_EPS))
+        .with_rotation_axes(RotationAxes::HeadMajor);
+    // SC-18319 P4 — the three projections arrive through `FusedQkvProjection`, so this is ONE matmul
+    // when the pack is engaged and three concatenated forwards when it is not. Both hand `prepare` the
+    // same `[B, S, 3 * H * D]` tensor, split at the offsets a `Separate` source would have carried, so
+    // the arithmetic is identical either way: a matmul's output rows are independent, and the packed
+    // weight is exactly the row-wise concatenation of the three bases.
+    qkv::prepare(QkvSource::Packed(&qkv_proj.forward_packed(x)?), &spec)
 }
 
 /// SDPA over `[B,H,S,D] → [B,S,H·D]` (no mask; full bidirectional attention over the joint sequence).
@@ -138,6 +142,7 @@ fn attention(
     v: &Array,
     head_dim: i32,
     sdpa_checkpoint: bool,
+    plan: mlx_gen::attention::AttentionPlan<'_>,
 ) -> Result<Array> {
     let b = q.shape()[0];
     // q is `[B,H,S,D]` here (post `process_qkv` transpose), so axis 1 is the head count, not the
@@ -155,7 +160,7 @@ fn attention(
             .next()
             .ok_or_else(|| Error::Msg("sd3: SDPA checkpoint produced no output".into()))?
     } else {
-        scaled_dot_product_attention(q, k, v, scale, None, None)?
+        mlx_gen::attention::sdpa_budgeted_bhsd(q, k, v, scale, None, plan)?
     };
     Ok(o.transpose_axes(&[0, 2, 1, 3])?
         .reshape(&[b, -1, num_heads * head_dim])?)
@@ -167,17 +172,15 @@ fn attention(
 
 #[derive(Clone)]
 struct JointAttention {
-    // image stream
-    to_q: AdaptableLinear,
-    to_k: AdaptableLinear,
-    to_v: AdaptableLinear,
+    // image stream: `to_q`/`to_k`/`to_v` behind one adapter/quant-aware packed matrix (SC-18319 P4).
+    // The three read the SAME activation (`img`), which is what makes them fusable at all; the text
+    // triple below is a second, independent projection precisely because it reads `txt`.
+    img_qkv: FusedQkvProjection,
     to_out: AdaptableLinear,
     norm_q: Array,
     norm_k: Array,
     // text stream
-    add_q: AdaptableLinear,
-    add_k: AdaptableLinear,
-    add_v: AdaptableLinear,
+    txt_qkv: FusedQkvProjection,
     /// `None` on the final `context_pre_only` block (the text attention output is discarded).
     to_add_out: Option<AdaptableLinear>,
     norm_added_q: Array,
@@ -199,15 +202,11 @@ impl JointAttention {
         let g = |n: &str| w.require(&format!("{prefix}.{n}.weight")).cloned();
         let l = |n: &str| lin(w, &format!("{prefix}.{n}"));
         Ok(Self {
-            to_q: l("to_q")?,
-            to_k: l("to_k")?,
-            to_v: l("to_v")?,
+            img_qkv: FusedQkvProjection::new(l("to_q")?, l("to_k")?, l("to_v")?),
             to_out: l("to_out.0")?,
             norm_q: g("norm_q")?,
             norm_k: g("norm_k")?,
-            add_q: l("add_q_proj")?,
-            add_k: l("add_k_proj")?,
-            add_v: l("add_v_proj")?,
+            txt_qkv: FusedQkvProjection::new(l("add_q_proj")?, l("add_k_proj")?, l("add_v_proj")?),
             to_add_out: if context_pre_only {
                 None
             } else {
@@ -224,17 +223,11 @@ impl JointAttention {
     /// Cast the projection weights to the training compute `dtype` in place (T2). The qk-RMSNorm
     /// weights stay f32 (norms reduce in f32). Inference never calls this.
     fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
-        for p in [
-            &mut self.to_q,
-            &mut self.to_k,
-            &mut self.to_v,
-            &mut self.to_out,
-            &mut self.add_q,
-            &mut self.add_k,
-            &mut self.add_v,
-        ] {
-            p.cast_weights(dtype)?;
-        }
+        // `FusedQkvProjection::cast_weights` unfuses, casts each base and re-packs: the packed matrix
+        // is built from the bases, so it is not a view of them.
+        self.img_qkv.cast_weights(dtype)?;
+        self.txt_qkv.cast_weights(dtype)?;
+        self.to_out.cast_weights(dtype)?;
         if let Some(o) = self.to_add_out.as_mut() {
             o.cast_weights(dtype)?;
         }
@@ -246,17 +239,9 @@ impl JointAttention {
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
-        for p in [
-            &mut self.to_q,
-            &mut self.to_k,
-            &mut self.to_v,
-            &mut self.to_out,
-            &mut self.add_q,
-            &mut self.add_k,
-            &mut self.add_v,
-        ] {
-            p.quantize(bits, None)?;
-        }
+        self.img_qkv.quantize(bits, None)?;
+        self.txt_qkv.quantize(bits, None)?;
+        self.to_out.quantize(bits, None)?;
         if let Some(o) = self.to_add_out.as_mut() {
             o.quantize(bits, None)?;
         }
@@ -266,32 +251,38 @@ impl JointAttention {
     /// Joint attention over `[img ; txt]` (diffusers concatenates the text AFTER the image along the
     /// sequence). Returns `(img_attn_out, Option<txt_attn_out>)`; the text output is `None` on the
     /// final `context_pre_only` block.
-    fn forward(&self, img: &Array, txt: &Array) -> Result<(Array, Option<Array>)> {
-        let (iq, ik, iv) = process_qkv(
+    fn forward(
+        &self,
+        img: &Array,
+        txt: &Array,
+        plan: mlx_gen::attention::AttentionPlan<'_>,
+    ) -> Result<(Array, Option<Array>)> {
+        let image = process_qkv(
             img,
-            &self.to_q,
-            &self.to_k,
-            &self.to_v,
+            &self.img_qkv,
             &self.norm_q,
             &self.norm_k,
             self.heads,
             self.head_dim,
         )?;
-        let (tq, tk, tv) = process_qkv(
+        let text = process_qkv(
             txt,
-            &self.add_q,
-            &self.add_k,
-            &self.add_v,
+            &self.txt_qkv,
             &self.norm_added_q,
             &self.norm_added_k,
             self.heads,
             self.head_dim,
         )?;
         // [img, txt] order along the sequence (axis 2 in BHSD) — diffusers `cat([sample, context])`.
-        let q = concatenate_axis(&[&iq, &tq], 2)?;
-        let k = concatenate_axis(&[&ik, &tk], 2)?;
-        let v = concatenate_axis(&[&iv, &tv], 2)?;
-        let o = attention(&q, &k, &v, self.head_dim, self.sdpa_checkpoint)?;
+        let joint = StreamOrder::ImageFirst.join(&image, &text)?;
+        let o = attention(
+            &joint.q,
+            &joint.k,
+            &joint.v,
+            self.head_dim,
+            self.sdpa_checkpoint,
+            plan,
+        )?;
 
         // The joint output is `[img ; txt]` concatenated along the sequence (axis 1). The two halves
         // are contiguous, so a single `split_axis` at the image/text boundary reproduces exactly the
@@ -313,17 +304,36 @@ impl JointAttention {
 /// `to_add_out`). The final `context_pre_only` block has no `to_add_out` — that suffix returns `None`
 /// cleanly there (and is omitted from the enumerated paths). Diffusers SD3 LoRA naming.
 impl AdaptableHost for JointAttention {
+    /// The MUTATION half: resolving a q/k/v path goes through [`FusedQkvProjection::part_mut`], which
+    /// unfuses first, so an adapter installed through the returned handle can never be stranded
+    /// behind a stale packed matrix.
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
-            ["to_q"] => Some(&mut self.to_q),
-            ["to_k"] => Some(&mut self.to_k),
-            ["to_v"] => Some(&mut self.to_v),
+            ["to_q"] => self.img_qkv.part_mut(QkvPart::Q).ok(),
+            ["to_k"] => self.img_qkv.part_mut(QkvPart::K).ok(),
+            ["to_v"] => self.img_qkv.part_mut(QkvPart::V).ok(),
             ["to_out", "0"] => Some(&mut self.to_out),
-            ["add_q_proj"] => Some(&mut self.add_q),
-            ["add_k_proj"] => Some(&mut self.add_k),
-            ["add_v_proj"] => Some(&mut self.add_v),
+            ["add_q_proj"] => self.txt_qkv.part_mut(QkvPart::Q).ok(),
+            ["add_k_proj"] => self.txt_qkv.part_mut(QkvPart::K).ok(),
+            ["add_v_proj"] => self.txt_qkv.part_mut(QkvPart::V).ok(),
             ["to_add_out"] => self.to_add_out.as_mut(),
             _ => None,
+        }
+    }
+
+    /// The PROBE half (SC-18319): the six fused paths answer from
+    /// [`FusedQkvProjection::part_facts`], which reads the packed representation instead of
+    /// dismantling it. Everything else falls through to the `adaptable_mut` delegation, which is
+    /// what the trait default does and is correct for a plain [`AdaptableLinear`].
+    fn adaptable_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        match path {
+            ["to_q"] => Some(self.img_qkv.part_facts(QkvPart::Q)),
+            ["to_k"] => Some(self.img_qkv.part_facts(QkvPart::K)),
+            ["to_v"] => Some(self.img_qkv.part_facts(QkvPart::V)),
+            ["add_q_proj"] => Some(self.txt_qkv.part_facts(QkvPart::Q)),
+            ["add_k_proj"] => Some(self.txt_qkv.part_facts(QkvPart::K)),
+            ["add_v_proj"] => Some(self.txt_qkv.part_facts(QkvPart::V)),
+            _ => self.adaptable_mut(path).map(|l| LinearFacts::of(l)),
         }
     }
 
@@ -358,9 +368,8 @@ impl AdaptableHost for JointAttention {
 /// [`process_qkv`]/[`attention`] ops as the joint attention's image side (no RoPE).
 #[derive(Clone)]
 struct SelfAttention {
-    to_q: AdaptableLinear,
-    to_k: AdaptableLinear,
-    to_v: AdaptableLinear,
+    /// One packed image-stream q/k/v (SC-18319 P4). A true self-attention, so all three read `x`.
+    qkv: FusedQkvProjection,
     to_out: AdaptableLinear,
     norm_q: Array,
     norm_k: Array,
@@ -375,9 +384,7 @@ impl SelfAttention {
         let g = |n: &str| w.require(&format!("{prefix}.{n}.weight")).cloned();
         let l = |n: &str| lin(w, &format!("{prefix}.{n}"));
         Ok(Self {
-            to_q: l("to_q")?,
-            to_k: l("to_k")?,
-            to_v: l("to_v")?,
+            qkv: FusedQkvProjection::new(l("to_q")?, l("to_k")?, l("to_v")?),
             to_out: l("to_out.0")?,
             norm_q: g("norm_q")?,
             norm_k: g("norm_k")?,
@@ -388,14 +395,8 @@ impl SelfAttention {
     }
 
     fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
-        for p in [
-            &mut self.to_q,
-            &mut self.to_k,
-            &mut self.to_v,
-            &mut self.to_out,
-        ] {
-            p.cast_weights(dtype)?;
-        }
+        self.qkv.cast_weights(dtype)?;
+        self.to_out.cast_weights(dtype)?;
         Ok(())
     }
 
@@ -404,30 +405,22 @@ impl SelfAttention {
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
-        for p in [
-            &mut self.to_q,
-            &mut self.to_k,
-            &mut self.to_v,
-            &mut self.to_out,
-        ] {
-            p.quantize(bits, None)?;
-        }
+        self.qkv.quantize(bits, None)?;
+        self.to_out.quantize(bits, None)?;
         Ok(())
     }
 
     /// Image-stream self-attention over `x [B,S,H·D]` → `[B,S,H·D]`.
-    fn forward(&self, x: &Array) -> Result<Array> {
-        let (q, k, v) = process_qkv(
+    fn forward(&self, x: &Array, plan: mlx_gen::attention::AttentionPlan<'_>) -> Result<Array> {
+        let h = process_qkv(
             x,
-            &self.to_q,
-            &self.to_k,
-            &self.to_v,
+            &self.qkv,
             &self.norm_q,
             &self.norm_k,
             self.heads,
             self.head_dim,
         )?;
-        let o = attention(&q, &k, &v, self.head_dim, self.sdpa_checkpoint)?;
+        let o = attention(&h.q, &h.k, &h.v, self.head_dim, self.sdpa_checkpoint, plan)?;
         self.to_out.forward(&o)
     }
 }
@@ -438,11 +431,21 @@ impl SelfAttention {
 impl AdaptableHost for SelfAttention {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
-            ["to_q"] => Some(&mut self.to_q),
-            ["to_k"] => Some(&mut self.to_k),
-            ["to_v"] => Some(&mut self.to_v),
+            ["to_q"] => self.qkv.part_mut(QkvPart::Q).ok(),
+            ["to_k"] => self.qkv.part_mut(QkvPart::K).ok(),
+            ["to_v"] => self.qkv.part_mut(QkvPart::V).ok(),
             ["to_out", "0"] => Some(&mut self.to_out),
             _ => None,
+        }
+    }
+
+    /// The PROBE half (SC-18319). See [`JointAttention::adaptable_facts`].
+    fn adaptable_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        match path {
+            ["to_q"] => Some(self.qkv.part_facts(QkvPart::Q)),
+            ["to_k"] => Some(self.qkv.part_facts(QkvPart::K)),
+            ["to_v"] => Some(self.qkv.part_facts(QkvPart::V)),
+            _ => self.adaptable_mut(path).map(|l| LinearFacts::of(l)),
         }
     }
 
@@ -667,7 +670,7 @@ fn gated(x: &Array, gate: &Array, y: &Array) -> Result<Array> {
 // ----------------------------------------------------------------------------------------------
 
 #[derive(Clone)]
-struct JointBlock {
+pub(crate) struct JointBlock {
     /// Plain block: AdaLN-zero (6 chunks). MMDiT-X dual block: `SD35AdaLayerNormZeroX` (9 chunks).
     norm1: ImageNorm,
     /// Non-final: AdaLN-zero (6 chunks). Final (`context_pre_only`): AdaLN-continuous (2 chunks).
@@ -695,7 +698,7 @@ enum ContextNorm {
 }
 
 impl JointBlock {
-    fn from_weights(
+    pub(crate) fn from_weights(
         w: &Weights,
         idx: usize,
         is_last: bool,
@@ -796,7 +799,13 @@ impl JointBlock {
     /// encoder_hidden_states)`. On the final block `encoder_hidden_states` is returned unchanged
     /// (`context_pre_only`: the text stream is read-only after attention). Faithful mirror of
     /// diffusers `JointTransformerBlock.forward`.
-    fn forward(&self, img: &Array, txt: &Array, temb: &Array) -> Result<(Array, Array)> {
+    pub(crate) fn forward(
+        &self,
+        img: &Array,
+        txt: &Array,
+        temb: &Array,
+        plan: mlx_gen::attention::AttentionPlan<'_>,
+    ) -> Result<(Array, Array)> {
         // Image-stream norm1: plain AdaLN-zero (6 chunks) OR SD35AdaLayerNormZeroX (9 chunks). In the
         // dual case the extra (norm_img2, gate_msa2) drive the second `attn2` self-attention branch.
         let (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp, dual_mod) =
@@ -835,7 +844,7 @@ impl JointBlock {
         let finish_image = |img_attn: &Array| -> Result<Array> {
             let mut img = gated(img, &gate_msa, img_attn)?;
             if let (Some((norm_img2, gate_msa2)), Some(attn2)) = (&dual_mod, &self.attn2) {
-                let attn2_out = attn2.forward(norm_img2)?;
+                let attn2_out = attn2.forward(norm_img2, plan)?;
                 img = gated(&img, gate_msa2, &attn2_out)?;
             }
             let norm_img_mlp = modulated_layer_norm(&img, &shift_mlp, &scale_mlp)?;
@@ -850,7 +859,7 @@ impl JointBlock {
                     zero.forward(temb)?;
                 let norm_txt = modulated_layer_norm(txt, &c_shift_msa, &c_scale_msa)?;
 
-                let (img_attn, txt_attn) = self.attn.forward(&norm_img, &norm_txt)?;
+                let (img_attn, txt_attn) = self.attn.forward(&norm_img, &norm_txt, plan)?;
                 let txt_attn = txt_attn.ok_or_else(|| {
                     Error::Msg("sd3 non-final block: missing text attention output".into())
                 })?;
@@ -873,7 +882,7 @@ impl JointBlock {
                 let (c_shift, c_scale) = cont.forward(temb)?;
                 let norm_txt = modulated_layer_norm(txt, &c_shift, &c_scale)?;
 
-                let (img_attn, _txt_attn) = self.attn.forward(&norm_img, &norm_txt)?;
+                let (img_attn, _txt_attn) = self.attn.forward(&norm_img, &norm_txt, plan)?;
 
                 let img = finish_image(&img_attn)?;
 
@@ -895,6 +904,18 @@ impl AdaptableHost for JointBlock {
             ["attn2", rest @ ..] => self.attn2.as_mut()?.adaptable_mut(rest),
             ["ff", rest @ ..] => self.ff.adaptable_mut(rest),
             ["ff_context", rest @ ..] => self.ff_context.as_mut()?.adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    /// SC-18319: an intermediate hop on the way to a fused leaf MUST forward the probe. The trait's
+    /// default would delegate to `adaptable_mut` here and unfuse the attention below it.
+    fn adaptable_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        match path {
+            ["attn", rest @ ..] => self.attn.adaptable_facts(rest),
+            ["attn2", rest @ ..] => self.attn2.as_mut()?.adaptable_facts(rest),
+            ["ff", rest @ ..] => self.ff.adaptable_facts(rest),
+            ["ff_context", rest @ ..] => self.ff_context.as_mut()?.adaptable_facts(rest),
             _ => None,
         }
     }
@@ -1094,6 +1115,7 @@ pub struct Sd3Transformer {
     time_text_embed: TimeTextEmbed,
     context_embedder: AdaptableLinear,
     blocks: Vec<JointBlock>,
+    block_stream: Option<crate::block_stream::Sd3BlockStream>,
     norm_out: AdaLnContinuous,
     proj_out: AdaptableLinear,
 }
@@ -1119,6 +1141,7 @@ impl Sd3Transformer {
             time_text_embed: TimeTextEmbed::from_weights(w, arch)?,
             context_embedder: lin(w, "context_embedder")?,
             blocks,
+            block_stream: None,
             norm_out: AdaLnContinuous::from_weights(w, "norm_out")?,
             proj_out: lin(w, "proj_out")?,
         })
@@ -1165,7 +1188,26 @@ impl Sd3Transformer {
     /// The number of joint `transformer_blocks` — the trainer's gradient-checkpoint bookkeeping
     /// indexes per block.
     pub fn num_blocks(&self) -> usize {
-        self.blocks.len()
+        self.block_stream.as_ref().map_or(
+            self.blocks.len(),
+            crate::block_stream::Sd3BlockStream::blocks,
+        )
+    }
+
+    pub(crate) fn with_block_stream(
+        mut self,
+        inventory: crate::artifact_inventory::Sd3ArtifactInventory,
+        arch: Sd3Arch,
+    ) -> Self {
+        self.block_stream = Some(crate::block_stream::Sd3BlockStream::new(inventory, arch));
+        self
+    }
+
+    pub(crate) fn finalize_block_stream(&mut self) -> Result<()> {
+        let Some(stream) = &self.block_stream else {
+            return Ok(());
+        };
+        crate::block_stream::evict_resident_blocks(&mut self.blocks, stream.blocks())
     }
 
     /// Cast the whole MMDiT to the training compute `dtype` in place (T2 sc-7883). Covers every
@@ -1220,7 +1262,35 @@ impl Sd3Transformer {
     ) -> Result<Array> {
         // f32-exact inference: do NOT follow the base weight dtype (see method docs). The training
         // seam is the only caller that runs the body in bf16, via `forward_with`.
-        self.forward_with(latent, context, pooled, timestep, Dtype::Float32)
+        self.forward_inference(
+            latent,
+            context,
+            pooled,
+            timestep,
+            mlx_gen::attention::AttentionPlan::UNBOUNDED,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_inference(
+        &self,
+        latent: &Array,
+        context: &Array,
+        pooled: &Array,
+        timestep: &Array,
+        plan: mlx_gen::attention::AttentionPlan<'_>,
+        window: Option<(usize, &mlx_gen::CancelFlag)>,
+    ) -> Result<Array> {
+        self.forward_body(
+            latent,
+            context,
+            pooled,
+            timestep,
+            Dtype::Float32,
+            plan,
+            window,
+        )
     }
 
     /// MMDiT forward at an explicitly-chosen compute `dtype` — the shared body behind
@@ -1238,6 +1308,28 @@ impl Sd3Transformer {
         timestep: &Array,
         dt: Dtype,
     ) -> Result<Array> {
+        self.forward_body(
+            latent,
+            context,
+            pooled,
+            timestep,
+            dt,
+            mlx_gen::attention::AttentionPlan::UNBOUNDED,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_body(
+        &self,
+        latent: &Array,
+        context: &Array,
+        pooled: &Array,
+        timestep: &Array,
+        dt: Dtype,
+        plan: mlx_gen::attention::AttentionPlan<'_>,
+        window: Option<(usize, &mlx_gen::CancelFlag)>,
+    ) -> Result<Array> {
         let latent = latent.as_dtype(dt)?;
         let context = context.as_dtype(dt)?;
 
@@ -1249,10 +1341,44 @@ impl Sd3Transformer {
         let mut txt = self.context_embedder.forward(&context)?;
 
         // 4. joint blocks (Large: 38 plain; Medium MMDiT-X: 13 dual-attention + 11 plain).
-        for block in &self.blocks {
-            let (i, t) = block.forward(&img, &txt, &temb)?;
-            img = i;
-            txt = t;
+        if let Some((window_size, cancel)) = window {
+            if window_size != 1 {
+                return Err(Error::Unsupported(format!(
+                    "sd3: only a one-block transformer window is implemented (got {window_size})"
+                )));
+            }
+            let stream = self.block_stream.as_ref().ok_or_else(|| {
+                Error::Unsupported(
+                    "sd3: transformer streaming requested for an unverified resident artifact"
+                        .to_owned(),
+                )
+            })?;
+            let mut weights = stream.open()?;
+            for index in 0..stream.blocks() {
+                if cancel.is_cancelled() {
+                    return Err(Error::Canceled);
+                }
+                let block = stream.materialize(&mut weights, index)?;
+                let (i, t) = block.forward(&img, &txt, &temb, plan)?;
+                mlx_rs::transforms::eval([&i, &t])?;
+                img = i;
+                txt = t;
+                drop(block);
+                mlx_rs::memory::clear_cache();
+                stream.verify_materialized_window()?;
+            }
+        } else {
+            if self.blocks.is_empty() {
+                return Err(Error::Unsupported(
+                    "sd3: resident transformer blocks were evicted; select the advertised one-block window"
+                        .to_owned(),
+                ));
+            }
+            for block in &self.blocks {
+                let (i, t) = block.forward(&img, &txt, &temb, plan)?;
+                img = i;
+                txt = t;
+            }
         }
 
         // 5. AdaLN-continuous output norm + proj_out.
@@ -1346,14 +1472,19 @@ impl Sd3Transformer {
                         .ok_or_else(|| {
                             Exception::custom(format!("checkpoint LoRA target not found: {local}"))
                         })?
-                        .set_adapters(vec![Adapter::Lora {
+                        .set_training_adapters(vec![Adapter::Lora {
                             a,
                             b: bb,
                             scale: 1.0,
                         }]);
                 }
                 let (img_o, txt_o) = b
-                    .forward(&inp[0], &inp[1], &temb_c)
+                    .forward(
+                        &inp[0],
+                        &inp[1],
+                        &temb_c,
+                        mlx_gen::attention::AttentionPlan::UNBOUNDED,
+                    )
                     .map_err(|e| Exception::custom(e.to_string()))?;
                 Ok(vec![img_o, txt_o])
             });
@@ -1404,6 +1535,17 @@ impl AdaptableHost for Sd3Transformer {
             ["context_embedder"] => Some(&mut self.context_embedder),
             ["proj_out"] => Some(&mut self.proj_out),
             _ => None,
+        }
+    }
+
+    /// SC-18319: forward the probe down to the blocks. See the `JointBlock` twin.
+    fn adaptable_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        match path {
+            ["transformer_blocks", n, rest @ ..] => self
+                .blocks
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_facts(rest),
+            _ => self.adaptable_mut(path).map(|l| LinearFacts::of(l)),
         }
     }
 

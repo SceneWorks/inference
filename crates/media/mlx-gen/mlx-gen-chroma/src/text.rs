@@ -31,11 +31,34 @@ pub fn encode_prompt(
     t5: &T5TextEncoder,
     prompt: &str,
 ) -> Result<(Array, Array)> {
+    encode_prompt_windowed(tokenizer, t5, prompt, None, &mlx_gen::CancelFlag::new())
+}
+
+/// [`encode_prompt`] with an optional rung-4 encoder block window (SC-15520).
+///
+/// `window = None` is byte-for-byte [`encode_prompt`]. `Some(size)` requires a T5 loaded with an
+/// armed [`mlx_gen_flux::T5BlockStream`] and holds `size` of its 24 blocks materialized at a time —
+/// the `TransformerComponent::TextEncoder` scope.
+///
+/// **That scope is implemented and it is not this family's default**, which is the opposite of what
+/// the component sizes suggest: the T5-XXL encoder is the largest single component (dense bf16, a
+/// 10.15 GiB conditioning phase against a 7.14 GiB packed DiT), but ladder rung 1 has already shed
+/// it before the heavy phase loads, so measured end to end a `TextEncoder` window moves the request
+/// peak by **−0.00%** against `Dit`'s −23.50%. See
+/// [`crate::memory_strategy::TRANSFORMER_WINDOW_COMPONENT`] for the table and
+/// `the_window_component_scopes_are_measured_not_inherited` for the measurement.
+pub fn encode_prompt_windowed(
+    tokenizer: &TextTokenizer,
+    t5: &T5TextEncoder,
+    prompt: &str,
+    window: Option<usize>,
+    cancel: &mlx_gen::CancelFlag,
+) -> Result<(Array, Array)> {
     let tok = tokenizer.tokenize(prompt)?;
     let (input_ids, _) = to_arrays(&tok);
     let pad = tokenizer.config().pad_token_id;
     let key_mask = t5_key_mask(&input_ids, pad)?;
-    let embeds = t5.forward_masked(&input_ids, Some(&key_mask))?;
+    let embeds = t5.forward_masked_windowed(&input_ids, Some(&key_mask), window, cancel)?;
     let text_mask = transformer_text_mask(&input_ids, pad)?;
     Ok((embeds, text_mask))
 }

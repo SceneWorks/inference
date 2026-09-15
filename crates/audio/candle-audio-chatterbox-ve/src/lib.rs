@@ -45,12 +45,20 @@ pub use model::{
     descriptor, load, ChatterboxVoiceEmbedder, HUB_REPO, HUB_REVISION, MODEL_ID, REGISTRATION,
     WEIGHTS_FILE,
 };
-pub use model::{WEIGHT_LICENSE, WEIGHT_LICENSE_ENTRY};
 
-/// This crate's model-weight-license entries for catalog aggregation (sc-13332) — one row keyed by
-/// [`MODEL_ID`]. The audio catalog concatenates every provider's slice into the model-licenses
-/// manifest SceneWorks lists on its end-product licenses page.
-pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[model::WEIGHT_LICENSE_ENTRY];
+/// This crate ships **no** component licence row of its own (sc-16663): the `chatterbox_ve` voice embedder loads the
+/// same `ResembleAI/chatterbox` artifact the `chatterbox_tts` generator does, and one artifact is
+/// one row. That row lives in `candle-audio-chatterbox`; this crate only maps its provider id onto
+/// the same component key — duplicating the row is rejected by the table conformance checker.
+pub const COMPONENT_LICENSES: &[gen_core::ComponentLicense] = &[];
+
+/// The provider→component mapping this crate contributes. A provider's effective terms are
+/// **derived** from these components by [`gen_core::provider_terms`] — never hand-authored — so
+/// they cannot drift from the component rows they summarize.
+pub const PROVIDER_COMPONENTS: &[gen_core::ProviderComponents] = &[gen_core::ProviderComponents {
+    provider_id: model::MODEL_ID,
+    components: &["chatterbox"],
+}];
 
 /// Add the Chatterbox voice embedder to an explicit audio registry builder (catalog composition).
 pub fn register_providers(

@@ -5,7 +5,7 @@
 //! (temporal-pos add + object-pointer sine-PE/project/4×64-split) end-to-end through memory attention.
 //! `#[ignore]` until weights + fixture are staged (sc-6248). Run:
 //!   SAM3_WEIGHTS=<snapshot> SAM3_MEMCOND_FIXTURE=<memcond_fixture.safetensors> \
-//!     cargo test -p candle-gen-sam3 --release --features cuda --test memcond_parity -- --ignored --nocapture
+//!     cargo test -p candle-gen-sam3 --release --features cuda --test integration memcond_parity:: -- --ignored --nocapture
 
 use std::path::Path;
 

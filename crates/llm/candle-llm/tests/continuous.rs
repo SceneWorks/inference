@@ -51,11 +51,14 @@ fn ones(d: usize) -> Tensor {
 }
 
 fn build_tiny_llama() -> CausalLm {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static SEQ: AtomicU32 = AtomicU32::new(0);
-    let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("candle-llm-cont-{}-{uniq}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    // sc-17755: a `TempDir` guard rather than a hand-rolled `temp_dir()` join. The snapshot is
+    // read fully into memory by the loader below (`safetensors::load`, not an mmap), so the tree
+    // is safe to remove when this helper returns — and it now does, including out of a panic.
+    let guard = tempfile::Builder::new()
+        .prefix("candle-llm-cont-")
+        .tempdir()
+        .expect("fixture temp dir");
+    let dir = guard.path();
 
     let cfg = format!(
         r#"{{
@@ -105,11 +108,9 @@ fn build_tiny_llama() -> CausalLm {
     }
 
     candle_core::safetensors::save(&w, dir.join("model.safetensors")).unwrap();
-    let cfg = ModelConfig::from_dir(&dir).unwrap();
-    let model =
-        CausalLm::from_weights(&Weights::from_dir(&dir, &Device::Cpu).unwrap(), "", cfg).unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-    model
+    let cfg = ModelConfig::from_dir(dir).unwrap();
+
+    CausalLm::from_weights(&Weights::from_dir(dir, &Device::Cpu).unwrap(), "", cfg).unwrap()
 }
 
 // ---- Helpers -------------------------------------------------------------------------------------
@@ -654,14 +655,14 @@ mod real {
             }
         }
         let ids = Tensor::from_vec(ids, (k, max_l), device).unwrap();
-        let (cos, sin) = model.rope_tables(&pos, k as i32, max_l as i32).unwrap();
+        let tables = model.rope_tables(&pos, k as i32, max_l as i32).unwrap();
         let mask = Tensor::from_vec(mask, (k, 1, max_l, max_l), device)
             .unwrap()
             .to_dtype(dtype)
             .unwrap();
         let mut cache = model.new_cache();
         let _ = model
-            .decode_logits_masked(&ids, &mut cache, &cos, &sin, &mask)
+            .decode_logits_masked(&ids, &mut cache, &tables, &mask)
             .unwrap();
     }
 

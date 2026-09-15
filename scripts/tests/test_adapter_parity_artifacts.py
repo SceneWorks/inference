@@ -1,0 +1,1085 @@
+import ast
+import copy
+import hashlib
+import importlib.util
+import json
+import pathlib
+import struct
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+TOOLS = ROOT / "crates/media/mlx-gen/tools"
+sys.path.insert(0, str(TOOLS))
+import _adapter_parity_provenance as PROVENANCE
+import record_adapter_parity_transcript as RECORDER
+
+SPEC = importlib.util.spec_from_file_location(
+    "verify_adapter_parity_artifacts",
+    TOOLS / "verify_adapter_parity_artifacts.py",
+)
+VERIFY = importlib.util.module_from_spec(SPEC)
+assert SPEC.loader is not None
+SPEC.loader.exec_module(VERIFY)
+
+
+class AdapterParityArtifactProvenanceTest(unittest.TestCase):
+    def load_z_image_low_peak_functions(self, script, namespace):
+        parsed = ast.parse(script.read_text(encoding="utf-8"), filename=str(script))
+        functions = [
+            node
+            for node in parsed.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"configure_low_peak", "release_text_encoder"}
+        ]
+        self.assertEqual({node.name for node in functions}, {"configure_low_peak", "release_text_encoder"})
+        module = ast.Module(body=functions, type_ignores=[])
+        exec(compile(ast.fix_missing_locations(module), str(script), "exec"), namespace)
+        return namespace["configure_low_peak"], namespace["release_text_encoder"]
+
+    def test_z_image_low_peak_policy_materializes_features_before_releasing_encoder(self):
+        class FakeMx:
+            def __init__(self):
+                self.calls = []
+
+            def set_cache_limit(self, value):
+                self.calls.append(("set_cache_limit", value))
+
+            def clear_cache(self):
+                self.calls.append(("clear_cache",))
+
+            def reset_peak_memory(self):
+                self.calls.append(("reset_peak_memory",))
+
+            def eval(self, value):
+                self.calls.append(("eval", value))
+
+        class FakeGc:
+            def __init__(self):
+                self.calls = 0
+
+            def collect(self):
+                self.calls += 1
+
+        class Model:
+            pass
+
+        for script_name in ("dump_z_image_golden.py", "dump_z_image_adapter_golden.py"):
+            with self.subTest(script=script_name):
+                mx = FakeMx()
+                gc = FakeGc()
+                configure, release = self.load_z_image_low_peak_functions(
+                    TOOLS / script_name,
+                    {"mx": mx, "gc": gc, "MLX_CACHE_LIMIT_GB": 2.5},
+                )
+                model = Model()
+                model.text_encoder = object()
+                model.transformer = object()
+                model.vae = object()
+                model.tokenizers = {"z_image": object()}
+                model.adapters = [object()]
+                feature_tensor = object()
+                transformer = model.transformer
+                vae = model.vae
+                tokenizers = model.tokenizers
+                adapters = model.adapters
+
+                configure()
+                self.assertEqual(mx.calls[0], ("set_cache_limit", 2_500_000_000))
+                release(model, feature_tensor)
+                self.assertIsNone(model.text_encoder)
+                self.assertIs(model.transformer, transformer)
+                self.assertIs(model.vae, vae)
+                self.assertIs(model.tokenizers, tokenizers)
+                self.assertIs(model.adapters, adapters)
+                self.assertEqual(gc.calls, 1)
+                self.assertLess(
+                    mx.calls.index(("eval", feature_tensor)),
+                    mx.calls.index(("clear_cache",), 4),
+                )
+
+    def test_z_image_low_peak_policy_rejects_nonpositive_cache_or_missing_encoder(self):
+        class FakeMx:
+            def set_cache_limit(self, value):
+                pass
+
+            def clear_cache(self):
+                pass
+
+            def reset_peak_memory(self):
+                pass
+
+            def eval(self, value):
+                pass
+
+        class FakeGc:
+            def collect(self):
+                pass
+
+        class Model:
+            text_encoder = None
+
+        for script_name in ("dump_z_image_golden.py", "dump_z_image_adapter_golden.py"):
+            with self.subTest(script=script_name):
+                mx = FakeMx()
+                configure, release = self.load_z_image_low_peak_functions(
+                    TOOLS / script_name,
+                    {"mx": mx, "gc": FakeGc(), "MLX_CACHE_LIMIT_GB": 0},
+                )
+                with self.assertRaisesRegex(ValueError, "positive"):
+                    configure()
+                with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                    release(Model(), object())
+
+    def test_qwen_adapter_generator_requires_one_isolated_kind(self):
+        source = (TOOLS / "dump_qwen_adapter_golden.py").read_text(encoding="utf-8")
+        self.assertIn('ADAPTER_KIND = os.environ.get("QWEN_ADAPTER_KIND")', source)
+        self.assertIn('ADAPTER_KIND not in {"lora", "lokr"}', source)
+        self.assertIn("QWEN_ADAPTER_KIND=lora or QWEN_ADAPTER_KIND=lokr", source)
+        self.assertIn('builder = {"lora": build_lora, "lokr": build_lokr}[ADAPTER_KIND]', source)
+
+    def write_safetensors(self, path, metadata):
+        header = json.dumps(
+            {
+                "__metadata__": metadata,
+                "fixture": {
+                    "dtype": "U8",
+                    "shape": [1],
+                    "data_offsets": [0, 1],
+                },
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        path.write_bytes(struct.pack("<Q", len(header)) + header + b"\0")
+
+    def frozen_repo(self, directory):
+        root = pathlib.Path(directory)
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        subprocess.run(
+            ["git", "-C", str(root), "remote", "add", "origin", "git@github.com:example/reference.git"],
+            check=True,
+        )
+        source = root / "src/reference.py"
+        source.parent.mkdir()
+        source.write_text("VALUE = 1\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "-c",
+                "user.name=Codex Test",
+                "-c",
+                "user.email=codex@example.invalid",
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "-m",
+                "fixture",
+            ],
+            check=True,
+        )
+        revision = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        ).stdout.strip()
+        return root, source, revision
+
+    def valid_manifest(self):
+        manifest = copy.deepcopy(VERIFY.load_manifest())
+        manifest["results"]["hyper_flux_scale_zero"]["byte_differences"] = 0
+        for name, result in manifest["results"]["fork_parity"].items():
+            result["samples_gt8"] = 0
+            result["base_floor"] = 1
+            result["cap"] = 3
+            result["rgb_samples"] = 200
+            if name.startswith("z_image_"):
+                result["residual_samples_gt8"] = 0
+                result["zero_residual_samples_gt8"] = 2
+                result["residual_cap"] = 1
+            else:
+                result["acceptance_effect_samples_gt8"] = 2
+                result["effect_gate"].update(
+                    {
+                        "status": "locked",
+                        "effect_samples_gt8": 2,
+                        "minimum_samples_gt8": 1,
+                    }
+                )
+        evidence = manifest["results"]["evidence"]
+        evidence["status"] = "verified"
+        evidence.pop("pending_reason", None)
+        evidence["transcript"]["bytes"] = 1
+        evidence["transcript"]["sha256"] = "1" * 64
+        evidence["receipt"]["bytes"] = 1
+        evidence["receipt"]["sha256"] = "2" * 64
+        for index, (name, record) in enumerate(manifest["artifacts"].items(), start=1):
+            if record["bytes"] < 1:
+                record["bytes"] = index
+            if len(record["sha256"]) != 64:
+                record["sha256"] = f"{index:064x}"
+            evidence["artifact_sha256"][name] = record["sha256"]
+        return manifest
+
+    def test_tracked_manifest_and_script_hashes_are_locked(self):
+        VERIFY.validate_manifest(self.valid_manifest(), TOOLS)
+
+    def test_missing_artifact_is_rejected(self):
+        manifest = self.valid_manifest()
+        manifest["artifacts"].pop("qwen_lokr_golden")
+        with self.assertRaisesRegex(VERIFY.InvalidManifest, "inventory"):
+            VERIFY.validate_manifest(manifest, TOOLS)
+
+    def test_wrong_reference_revision_is_rejected(self):
+        manifest = self.valid_manifest()
+        manifest["reference"]["revision"] = "0" * 40
+        with self.assertRaisesRegex(VERIFY.InvalidManifest, "mflux revision"):
+            VERIFY.validate_manifest(manifest, TOOLS)
+
+    def test_nonzero_hyper_scale_zero_result_is_rejected(self):
+        manifest = self.valid_manifest()
+        manifest["results"]["hyper_flux_scale_zero"]["byte_differences"] = 1
+        with self.assertRaisesRegex(VERIFY.InvalidManifest, "not bit-exact"):
+            VERIFY.validate_manifest(manifest, TOOLS)
+
+    def test_provider_specific_adapter_gates_reject_inert_mutations(self):
+        manifest = self.valid_manifest()
+        z_result = manifest["results"]["fork_parity"]["z_image_lokr"]
+        z_result["zero_residual_samples_gt8"] = z_result["residual_cap"]
+        with self.assertRaisesRegex(VERIFY.InvalidManifest, "residual mutation gate"):
+            VERIFY.validate_manifest(manifest, TOOLS)
+
+        manifest = self.valid_manifest()
+        q_result = manifest["results"]["fork_parity"]["qwen_lokr"]
+        q_result["effect_gate"]["effect_samples_gt8"] = 0
+        with self.assertRaisesRegex(VERIFY.InvalidManifest, "invalid measured effect"):
+            VERIFY.validate_manifest(manifest, TOOLS)
+
+        manifest = self.valid_manifest()
+        q_result = manifest["results"]["fork_parity"]["qwen_lora"]
+        q_result["cap"] -= 1
+        with self.assertRaisesRegex(VERIFY.InvalidManifest, "floor-relative formula"):
+            VERIFY.validate_manifest(manifest, TOOLS)
+
+        manifest = self.valid_manifest()
+        q_result = manifest["results"]["fork_parity"]["qwen_lora"]
+        q_result["acceptance_effect_samples_gt8"] = 0
+        with self.assertRaisesRegex(VERIFY.InvalidManifest, "invalid acceptance effect"):
+            VERIFY.validate_manifest(manifest, TOOLS)
+
+    def test_qwen_acceptance_and_diagnostic_effect_maps_cannot_substitute_each_other(self):
+        manifest = self.valid_manifest()
+        q_result = manifest["results"]["fork_parity"]["qwen_lokr"]
+        q_result["acceptance_effect_samples_gt8"] = 5
+        q_result["effect_gate"]["effect_samples_gt8"] = 3
+        q_result["effect_gate"]["minimum_samples_gt8"] = 1
+
+        acceptance = VERIFY.expected_result_measurements(manifest)
+        diagnostic = VERIFY.expected_qwen_effect_diagnostic_measurements(manifest)
+        self.assertEqual(acceptance["qwen_lokr"]["effect_samples_gt8"], 5)
+        self.assertEqual(diagnostic["qwen_lokr"]["effect_samples_gt8"], 3)
+
+        differences = VERIFY.differing_json_paths(
+            acceptance,
+            {
+                **acceptance,
+                "qwen_lokr": {
+                    **acceptance["qwen_lokr"],
+                    "effect_samples_gt8": 3,
+                },
+            },
+        )
+        self.assertEqual(
+            differences,
+            [
+                {
+                    "path": "qwen_lokr.effect_samples_gt8",
+                    "expected": 5,
+                    "actual": 3,
+                }
+            ],
+        )
+
+    def test_diagnostic_evidence_requires_sealed_transcript_and_receipt_for_every_mode(self):
+        manifest = self.valid_manifest()
+        manifest["results"]["evidence"]["diagnostics"].pop("residual_diagnostic")
+        with self.assertRaisesRegex(VERIFY.InvalidManifest, "diagnostic evidence inventory"):
+            VERIFY.validate_manifest(manifest, TOOLS)
+
+        manifest = self.valid_manifest()
+        receipt = manifest["results"]["evidence"]["diagnostics"]["qwen_effect_diagnostic"][
+            "receipt"
+        ]
+        receipt["sha256"] = "PENDING"
+        with self.assertRaisesRegex(VERIFY.InvalidManifest, "qwen_effect_diagnostic receipt sha256"):
+            VERIFY.validate_manifest(manifest, TOOLS)
+
+    def test_pending_qwen_effect_gate_cannot_fabricate_measurement(self):
+        manifest = copy.deepcopy(VERIFY.load_manifest())
+        evidence = manifest["results"]["evidence"]
+        evidence["status"] = "diagnostic_pending"
+        evidence["pending_reason"] = "test fixture awaits effect diagnostic"
+        for record in (evidence["transcript"], evidence["receipt"]):
+            record["bytes"] = -1
+            record["sha256"] = "PENDING"
+        for diagnostic in evidence["diagnostics"].values():
+            for record in diagnostic.values():
+                record["bytes"] = -1
+                record["sha256"] = "PENDING"
+        for result in manifest["results"]["fork_parity"].values():
+            if not result.get("effect_gate"):
+                continue
+            gate = result["effect_gate"]
+            gate["status"] = "diagnostic_pending"
+            gate.pop("effect_samples_gt8")
+            gate.pop("minimum_samples_gt8")
+        VERIFY.validate_manifest(manifest, TOOLS)
+        gate = manifest["results"]["fork_parity"]["qwen_lora"]["effect_gate"]
+        gate["effect_samples_gt8"] = 1
+        with self.assertRaisesRegex(VERIFY.InvalidManifest, "fabricates evidence"):
+            VERIFY.validate_manifest(manifest, TOOLS)
+
+    def test_changed_dump_script_is_rejected(self):
+        manifest = self.valid_manifest()
+        manifest["scripts"]["dump_qwen_adapter_golden.py"] = "0" * 64
+        with self.assertRaisesRegex(VERIFY.InvalidManifest, "script hash mismatch"):
+            VERIFY.validate_manifest(manifest, TOOLS)
+
+    def test_changed_gitignored_artifact_is_rejected(self):
+        manifest = self.valid_manifest()
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = pathlib.Path(directory) / "artifact.safetensors"
+            payload = b"reference"
+            artifact.write_bytes(payload)
+            for record in manifest["artifacts"].values():
+                record["local_path"] = str(artifact)
+                record["bytes"] = len(payload)
+                record["sha256"] = hashlib.sha256(payload).hexdigest()
+            VERIFY.verify_artifact_files(manifest, TOOLS)
+
+            artifact.write_bytes(b"mutati0n!")
+            with self.assertRaisesRegex(VERIFY.InvalidManifest, "sha256 mismatch"):
+                VERIFY.verify_artifact_files(manifest, TOOLS)
+
+    def test_frozen_reference_rejects_tracked_and_untracked_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, source, revision = self.frozen_repo(directory)
+            kwargs = {
+                "expected_revision": revision,
+                "expected_identity": "github.com/example/reference",
+            }
+            PROVENANCE.assert_frozen_repository(root, **kwargs)
+            source.write_text("VALUE = 2\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "tracked/index state"):
+                PROVENANCE.assert_frozen_repository(root, **kwargs)
+            subprocess.run(["git", "-C", str(root), "restore", "src/reference.py"], check=True)
+            (root / "src/untracked.py").write_text("VALUE = 3\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "untracked source"):
+                PROVENANCE.assert_frozen_repository(root, **kwargs)
+
+    def test_proof_source_digest_is_stable_when_untracked_file_is_staged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, _, revision = self.frozen_repo(directory)
+            proof = root / "src/proof.py"
+            proof.write_text("PROOF = 1\n", encoding="utf-8")
+            manifest = {
+                "implementation_base": revision,
+                "scripts": {},
+            }
+            kwargs = {
+                "root": root,
+                "source_files": ("src/proof.py",),
+                "permitted_changes": {"src/proof.py"},
+            }
+            before = VERIFY.source_state(manifest, **kwargs)
+            subprocess.run(["git", "-C", str(root), "add", "src/proof.py"], check=True)
+            after = VERIFY.source_state(manifest, **kwargs)
+            self.assertEqual(before, after)
+
+            (root / "src/outside.rs").write_text("fn changed() {}\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "outside the bound allowlist"):
+                VERIFY.source_state(manifest, **kwargs)
+
+    def proof_source_repo(self, directory):
+        """A fixture worktree carrying every path `source_state` hashes.
+
+        Mirrors the real layout: the four Rust sources plus one file per
+        manifest script, all committed, so `implementation_base` is HEAD and
+        nothing is changed or untracked until a test edits it.
+        """
+        root = pathlib.Path(directory)
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        # Keep the committed bytes byte-identical to what is hashed off disk.
+        subprocess.run(["git", "-C", str(root), "config", "core.autocrlf", "false"], check=True)
+        scripts = {
+            name: f"crates/media/mlx-gen/tools/{name}"
+            for name in VERIFY.load_manifest()["scripts"]
+        }
+        for index, relative in enumerate(
+            (*RECORDER.RUST_SOURCE_FILES, *scripts.values())
+        ):
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"ORIGINAL = {index}\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "-c",
+                "user.name=Codex Test",
+                "-c",
+                "user.email=codex@example.invalid",
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "-m",
+                "proof base",
+            ],
+            check=True,
+        )
+        revision = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        ).stdout.strip()
+        manifest = {"implementation_base": revision, "scripts": dict.fromkeys(scripts, "0" * 64)}
+        return root, manifest, scripts
+
+    def test_verifier_bytes_are_not_bound_into_the_proof_source_state(self):
+        verifier = "verify_adapter_parity_artifacts.py"
+        with tempfile.TemporaryDirectory() as directory:
+            root, manifest, scripts = self.proof_source_repo(directory)
+            before = RECORDER.source_state(manifest, root=root)
+            self.assertNotIn(scripts[verifier], before["files"])
+            self.assertIn(scripts["record_adapter_parity_transcript.py"], before["files"])
+            self.assertIn(scripts["dump_qwen_adapter_golden.py"], before["files"])
+            self.assertIn(RECORDER.RUST_SOURCE_FILES[0], before["files"])
+
+            # Editing only the checker must neither move the digest nor trip the
+            # allowlist, even though git now reports it as a changed path.
+            (root / scripts[verifier]).write_text("EDITED = 1\n", encoding="utf-8")
+            after = RECORDER.source_state(manifest, root=root)
+            self.assertEqual(before["files"], after["files"])
+            self.assertEqual(before["source_sha256"], after["source_sha256"])
+            self.assertIn(scripts[verifier], after["changed_paths"])
+
+            # Every producing file stays bound.
+            for producer in (
+                scripts["dump_qwen_adapter_golden.py"],
+                scripts["record_adapter_parity_transcript.py"],
+                scripts["_adapter_parity_provenance.py"],
+                RECORDER.RUST_SOURCE_FILES[0],
+            ):
+                path = root / producer
+                original = path.read_bytes()
+                path.write_text("EDITED = 2\n", encoding="utf-8")
+                moved = RECORDER.source_state(manifest, root=root)
+                self.assertNotEqual(before["files"][producer], moved["files"][producer], producer)
+                self.assertNotEqual(before["source_sha256"], moved["source_sha256"], producer)
+                path.write_bytes(original)
+            self.assertEqual(
+                before["source_sha256"],
+                RECORDER.source_state(manifest, root=root)["source_sha256"],
+            )
+
+    def test_empty_overrides_are_honoured_rather_than_falling_back(self):
+        """`()`/`set()` mean "nothing", not "use the default".
+
+        Splitting the hashed set from the allowlist made both kwargs load-bearing,
+        so a falsy-but-present override must not silently reinstate the manifest
+        set or the permissive default allowlist.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root, manifest, scripts = self.proof_source_repo(directory)
+            empty = RECORDER.source_state(
+                manifest, root=root, source_files=(), permitted_changes=set()
+            )
+            self.assertEqual(empty["files"], {})
+
+            (root / scripts["dump_z_image_golden.py"]).write_text("EDITED = 1\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "outside the bound allowlist"):
+                RECORDER.source_state(
+                    manifest, root=root, source_files=(), permitted_changes=set()
+                )
+
+    def test_unbound_source_files_must_stay_in_the_manifest_script_map(self):
+        manifest = {"implementation_base": "0" * 40, "scripts": {"dump_z_image_golden.py": "0" * 64}}
+        with self.assertRaisesRegex(RuntimeError, "silently rejoin the hashed set"):
+            RECORDER.bound_source_files(manifest)
+
+    def test_tracked_manifest_binds_every_script_but_hashes_only_the_producers(self):
+        manifest = VERIFY.load_manifest()
+        bound = set(RECORDER.bound_source_files(manifest))
+        pinned = {f"crates/media/mlx-gen/tools/{name}" for name in manifest["scripts"]}
+        self.assertEqual(bound, (pinned | set(RECORDER.RUST_SOURCE_FILES)) - RECORDER.UNBOUND_SOURCE_FILES)
+        self.assertEqual(
+            RECORDER.UNBOUND_SOURCE_FILES,
+            {"crates/media/mlx-gen/tools/verify_adapter_parity_artifacts.py"},
+        )
+        # The verifier loses its transcript binding but keeps its in-place
+        # repairable manifest pin, which `validate_manifest` still enforces.
+        self.assertIn("verify_adapter_parity_artifacts.py", manifest["scripts"])
+
+    def test_residual_diagnostic_uses_exact_sanitized_runs(self):
+        runs = RECORDER.residual_diagnostic_runs(self.valid_manifest())
+        self.assertEqual(
+            [run["name"] for run in runs],
+            ["z_image_residual_diagnostic", "qwen_residual_diagnostic"],
+        )
+        expected_base = RECORDER.proof_environment()
+        for run in runs:
+            self.assertIn("--exact", run["argv"])
+            target_index = run["argv"].index("--test")
+            self.assertEqual(run["argv"][target_index + 1], "integration")
+            self.assertIn(
+                "adapter_real_weights::residual_mutation_diagnostic",
+                run["argv"],
+            )
+            self.assertEqual(
+                {key: run["env"][key] for key in expected_base},
+                expected_base,
+            )
+            self.assertNotIn("GH_TOKEN", run["env"])
+        effect_runs = RECORDER.qwen_effect_diagnostic_runs(self.valid_manifest())
+        self.assertEqual([run["name"] for run in effect_runs], ["qwen_effect_diagnostic"])
+        self.assertIn("--exact", effect_runs[0]["argv"])
+        target_index = effect_runs[0]["argv"].index("--test")
+        self.assertEqual(effect_runs[0]["argv"][target_index + 1], "integration")
+        self.assertIn(
+            "adapter_real_weights::adapter_effect_diagnostic",
+            effect_runs[0]["argv"],
+        )
+        self.assertEqual(
+            {key: effect_runs[0]["env"][key] for key in expected_base},
+            expected_base,
+        )
+
+    def test_acceptance_uses_integration_targets_with_module_qualified_exact_filters(self):
+        runs = RECORDER.expected_runs(self.valid_manifest())
+        expected_filters = {
+            "hyper_flux_scale_zero": (
+                "hyper_flux_real_weights::hyper_flux_scale_zero_is_bit_exact_noop"
+            ),
+            "z_image_lora": "adapter_real_weights::lora_render_matches_fork_golden",
+            "z_image_lokr": "adapter_real_weights::lokr_render_matches_fork_golden",
+            "qwen_lora": "adapter_real_weights::lora_render_matches_fork_golden",
+            "qwen_lokr": "adapter_real_weights::lokr_render_matches_fork_golden",
+        }
+        self.assertEqual({run["name"] for run in runs}, set(expected_filters))
+        for run in runs:
+            target_index = run["argv"].index("--test")
+            self.assertEqual(run["argv"][target_index + 1], "integration")
+            self.assertEqual(run["argv"][target_index + 2], expected_filters[run["name"]])
+            self.assertIn("--exact", run["argv"])
+            self.assertEqual(
+                run["env"]["CARGO_TARGET_DIR"],
+                str(RECORDER.ROOT / "target" / "sc-21781-adapter-parity"),
+            )
+
+    def test_diagnostics_refuse_reserved_output_without_writing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            receipt = root / "adapter_parity_receipt.json"
+            acceptance = root / "sc-15505-real-weight-transcript.json"
+            diagnostic = root / "sc-15505-residual-diagnostic-transcript.json"
+            effect = root / "sc-15505-qwen-effect-diagnostic-transcript.json"
+            receipt.write_text("do not replace\n", encoding="utf-8")
+
+            for flag, reserved in (
+                ("--residual-diagnostic", receipt),
+                ("--qwen-effect-diagnostic", acceptance),
+            ):
+                with (
+                    mock.patch.object(RECORDER, "RECEIPT", receipt),
+                    mock.patch.object(RECORDER, "ACCEPTANCE_TRANSCRIPT", acceptance),
+                    mock.patch.object(RECORDER, "DIAGNOSTIC_TRANSCRIPT", diagnostic),
+                    mock.patch.object(RECORDER, "QWEN_EFFECT_TRANSCRIPT", effect),
+                    mock.patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "record_adapter_parity_transcript.py",
+                            flag,
+                            "--output",
+                            str(reserved),
+                        ],
+                    ),
+                    self.assertRaises(SystemExit) as raised,
+                ):
+                    RECORDER.main()
+                self.assertEqual(raised.exception.code, 2)
+            self.assertEqual(receipt.read_text(encoding="utf-8"), "do not replace\n")
+            self.assertFalse(acceptance.exists())
+            self.assertFalse(diagnostic.exists())
+            self.assertFalse(effect.exists())
+
+    def test_residual_results_are_bound_to_their_run_and_exact_fields(self):
+        z_results = {
+            name: {
+                "residual_samples_gt8": 10,
+                "zero_residual_samples_gt8": 20,
+                "rgb_samples": 100,
+            }
+            for name in ("z_image_lora", "z_image_lokr")
+        }
+        RECORDER.validate_residual_run_results("z_image_residual_diagnostic", z_results)
+
+        wrong_fields = copy.deepcopy(z_results)
+        wrong_fields["z_image_lora"]["base_floor"] = 1
+        with self.assertRaisesRegex(ValueError, "field inventory mismatch"):
+            RECORDER.validate_residual_run_results(
+                "z_image_residual_diagnostic",
+                wrong_fields,
+            )
+
+        cross_run = copy.deepcopy(z_results)
+        cross_run["qwen_lora"] = cross_run.pop("z_image_lora")
+        with self.assertRaisesRegex(ValueError, "result inventory mismatch"):
+            RECORDER.validate_residual_run_results(
+                "z_image_residual_diagnostic",
+                cross_run,
+            )
+
+        inconsistent = {
+            **z_results,
+            "qwen_lora": {
+                "residual_samples_gt8": 10,
+                "zero_residual_samples_gt8": 20,
+                "rgb_samples": 101,
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "one nonzero RGB sample count"):
+            RECORDER.validate_shared_residual_sample_count(inconsistent)
+
+    def test_residual_results_start_on_lines_after_cargo_test_prefix(self):
+        output = (
+            "test residual_mutation_diagnostic ... \n"
+            "SC15505_RESULT z_image_lora residual_samples_gt8=10 "
+            "zero_residual_samples_gt8=20 rgb_samples=100\n"
+            "SC15505_RESULT z_image_lokr residual_samples_gt8=11 "
+            "zero_residual_samples_gt8=21 rgb_samples=100\n"
+            "ok\n"
+        )
+        parsed = RECORDER.parsed_results(output)
+        RECORDER.validate_residual_run_results("z_image_residual_diagnostic", parsed)
+
+    def test_qwen_effect_results_bind_structure_and_exact_fields(self):
+        results = {
+            "qwen_lora": {
+                "effect_samples_gt8": 100,
+                "scale_zero_byte_differences": 0,
+                "applied": 24,
+                "unmatched": 0,
+                "rgb_samples": 1_000,
+            },
+            "qwen_lokr": {
+                "effect_samples_gt8": 200,
+                "scale_zero_byte_differences": 0,
+                "applied": 21,
+                "unmatched": 0,
+                "rgb_samples": 1_000,
+            },
+        }
+        RECORDER.validate_qwen_effect_results(results)
+
+        wrong_fields = copy.deepcopy(results)
+        wrong_fields["qwen_lora"]["residual_samples_gt8"] = 1
+        with self.assertRaisesRegex(ValueError, "field inventory mismatch"):
+            RECORDER.validate_qwen_effect_results(wrong_fields)
+
+        wrong_applied = copy.deepcopy(results)
+        wrong_applied["qwen_lokr"]["applied"] = 20
+        with self.assertRaisesRegex(ValueError, "applied module count"):
+            RECORDER.validate_qwen_effect_results(wrong_applied)
+
+        unmatched = copy.deepcopy(results)
+        unmatched["qwen_lora"]["unmatched"] = 1
+        with self.assertRaisesRegex(ValueError, "unmatched adapter paths"):
+            RECORDER.validate_qwen_effect_results(unmatched)
+
+        dropped = copy.deepcopy(results)
+        dropped["qwen_lora"]["effect_samples_gt8"] = 0
+        with self.assertRaisesRegex(ValueError, "invalid RGB/effect sample count"):
+            RECORDER.validate_qwen_effect_results(dropped)
+
+    def test_base_adapter_metadata_binds_prompt_guidance_and_reference(self):
+        z_base = {field: f"value:{field}" for field in VERIFY.Z_IMAGE_BEHAVIOR_FIELDS}
+        z_adapter = dict(z_base)
+        VERIFY.verify_matching_generation_metadata(
+            z_base,
+            z_adapter,
+            VERIFY.Z_IMAGE_BEHAVIOR_FIELDS,
+            "z_image_lora",
+        )
+        z_adapter["prompt"] = "different prompt"
+        with self.assertRaisesRegex(VERIFY.InvalidManifest, "prompt"):
+            VERIFY.verify_matching_generation_metadata(
+                z_base,
+                z_adapter,
+                VERIFY.Z_IMAGE_BEHAVIOR_FIELDS,
+                "z_image_lora",
+            )
+
+        qwen_base = {field: f"value:{field}" for field in VERIFY.QWEN_BEHAVIOR_FIELDS}
+        qwen_adapter = dict(qwen_base)
+        qwen_adapter["guidance"] = "different guidance"
+        with self.assertRaisesRegex(VERIFY.InvalidManifest, "guidance"):
+            VERIFY.verify_matching_generation_metadata(
+                qwen_base,
+                qwen_adapter,
+                VERIFY.QWEN_BEHAVIOR_FIELDS,
+                "qwen_lora",
+            )
+
+    def test_snapshot_claim_and_inventory_are_content_bound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            revision = "a" * 40
+            snapshot = (
+                pathlib.Path(directory)
+                / "models--example--model"
+                / "snapshots"
+                / revision
+                / "bf16"
+            )
+            snapshot.mkdir(parents=True)
+            refs = snapshot.parents[2] / "refs"
+            refs.mkdir()
+            (refs / "main").write_text(revision, encoding="utf-8")
+            model = snapshot / "model.safetensors"
+            model.write_bytes(b"weights1")
+            _, before = PROVENANCE.assert_hf_snapshot(
+                snapshot,
+                repository="example/model",
+                revision=revision,
+                subdirectory="bf16",
+            )
+            with self.assertRaisesRegex(RuntimeError, "claimed repository/revision"):
+                PROVENANCE.assert_hf_snapshot(
+                    snapshot,
+                    repository="example/model",
+                    revision="b" * 40,
+                    subdirectory="bf16",
+                )
+            model.write_bytes(b"weights2")
+            _, after = PROVENANCE.assert_hf_snapshot(
+                snapshot,
+                repository="example/model",
+                revision=revision,
+                subdirectory="bf16",
+            )
+            self.assertNotEqual(before, after)
+
+    def test_snapshot_inventory_hashes_dereferenced_blob_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            revision = "c" * 40
+            repository = pathlib.Path(directory) / "models--example--linked"
+            snapshot = repository / "snapshots" / revision / "bf16"
+            blob = repository / "blobs" / ("d" * 64)
+            snapshot.mkdir(parents=True)
+            blob.parent.mkdir()
+            blob.write_bytes(b"weights1")
+            (snapshot / "model.safetensors").symlink_to(
+                pathlib.Path("../../../blobs") / blob.name
+            )
+            refs = repository / "refs"
+            refs.mkdir()
+            (refs / "main").write_text(revision, encoding="utf-8")
+            _, before = PROVENANCE.assert_hf_snapshot(
+                snapshot,
+                repository="example/linked",
+                revision=revision,
+                subdirectory="bf16",
+            )
+            blob.write_bytes(b"weights2")
+            _, after = PROVENANCE.assert_hf_snapshot(
+                snapshot,
+                repository="example/linked",
+                revision=revision,
+                subdirectory="bf16",
+            )
+            self.assertNotEqual(before, after)
+
+    def test_generated_metadata_is_bound_to_manifest(self):
+        manifest = self.valid_manifest()
+        name = "z_image_lora_adapter"
+        record = manifest["artifacts"][name]
+        source = record["source"]
+        metadata = {
+            "artifact_role": "adapter",
+            "adapter_kind": "lora",
+            "reference_mflux_repository": manifest["reference"]["repository"],
+            "reference_mflux_revision": manifest["reference"]["revision"],
+            "reference_script_sha256": manifest["scripts"][source["script"]],
+            "reference_provenance_sha256": manifest["scripts"][
+                "_adapter_parity_provenance.py"
+            ],
+            "reference_model_repository": source["model_repository"],
+            "reference_model_revision": source["model_revision"],
+            "reference_model_ref": source["model_reference"],
+            "reference_model_subdirectory": source["model_subdirectory"],
+            "reference_model_path": source["model_path"],
+            "reference_model_inventory_sha256": source["model_inventory_sha256"],
+            "reference_runtime": json.dumps(manifest["reference"]["runtime"]),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = pathlib.Path(directory) / "fixture.safetensors"
+            self.write_safetensors(fixture, metadata)
+            VERIFY.verify_generated_metadata(manifest, name, record, fixture)
+            metadata["reference_model_revision"] = "0" * 40
+            self.write_safetensors(fixture, metadata)
+            with self.assertRaisesRegex(VERIFY.InvalidManifest, "model revision mismatch"):
+                VERIFY.verify_generated_metadata(manifest, name, record, fixture)
+            metadata["reference_model_revision"] = source["model_revision"]
+            metadata["reference_model_path"] = str(
+                pathlib.PurePosixPath(source["model_path"]).parent / ("0" * 40)
+            )
+            self.write_safetensors(fixture, metadata)
+            with self.assertRaisesRegex(VERIFY.InvalidManifest, "model path mismatch"):
+                VERIFY.verify_generated_metadata(manifest, name, record, fixture)
+
+    def test_generated_model_path_is_compared_without_resolving_it_locally(self):
+        # Parity goldens are dumped on one host and the manifest records that host's
+        # absolute path (see crates/media/mlx-gen/tools/golden/README.md). Verification
+        # asks whether a golden was dumped against the model directory the manifest
+        # names, never whether that path exists here — so it must not re-root the
+        # recorded path onto the verifying host. Exercise both a POSIX-shaped and a
+        # Windows-shaped recording so the comparison stays an identity on either OS.
+        for recorded in (
+            "/Users/reference/.cache/huggingface/hub/models--example--model/snapshots/"
+            + "a" * 40,
+            "E:\\goldens\\hub\\models--example--model\\snapshots\\" + "a" * 40,
+        ):
+            with self.subTest(recorded=recorded):
+                manifest = self.valid_manifest()
+                name = "z_image_lora_adapter"
+                record = manifest["artifacts"][name]
+                source = record["source"]
+                source["model_path"] = recorded
+                metadata = {
+                    "artifact_role": "adapter",
+                    "adapter_kind": "lora",
+                    "reference_mflux_repository": manifest["reference"]["repository"],
+                    "reference_mflux_revision": manifest["reference"]["revision"],
+                    "reference_script_sha256": manifest["scripts"][source["script"]],
+                    "reference_provenance_sha256": manifest["scripts"][
+                        "_adapter_parity_provenance.py"
+                    ],
+                    "reference_model_repository": source["model_repository"],
+                    "reference_model_revision": source["model_revision"],
+                    "reference_model_ref": source["model_reference"],
+                    "reference_model_subdirectory": source["model_subdirectory"],
+                    "reference_model_path": recorded,
+                    "reference_model_inventory_sha256": source["model_inventory_sha256"],
+                    "reference_runtime": json.dumps(manifest["reference"]["runtime"]),
+                }
+                with tempfile.TemporaryDirectory() as directory:
+                    fixture = pathlib.Path(directory) / "fixture.safetensors"
+                    self.write_safetensors(fixture, metadata)
+                    VERIFY.verify_generated_metadata(manifest, name, record, fixture)
+
+    def test_transcript_measurements_are_bound_to_artifact_hashes(self):
+        manifest = self.valid_manifest()
+        results = manifest["results"]
+        specs = VERIFY.expected_runs(manifest)
+        result_lines = {
+            "hyper_flux_scale_zero": (
+                "SC15505_RESULT hyper_flux_scale_zero "
+                "byte_differences=0 rgb_samples=786432"
+            ),
+            "z_image_lora": (
+                "SC15505_RESULT z_image_lora samples_gt8=0 base_floor=1 cap=3 "
+                "residual_samples_gt8=0 zero_residual_samples_gt8=2 residual_cap=1 "
+                "rgb_samples=200"
+            ),
+            "z_image_lokr": (
+                "SC15505_RESULT z_image_lokr samples_gt8=0 base_floor=1 cap=3 "
+                "residual_samples_gt8=0 zero_residual_samples_gt8=2 residual_cap=1 "
+                "rgb_samples=200"
+            ),
+            "qwen_lora": (
+                "SC15505_RESULT qwen_lora samples_gt8=0 base_floor=1 cap=3 "
+                "effect_samples_gt8=2 minimum_samples_gt8=1 "
+                "scale_zero_byte_differences=0 applied=24 unmatched=0 rgb_samples=200"
+            ),
+            "qwen_lokr": (
+                "SC15505_RESULT qwen_lokr samples_gt8=0 base_floor=1 cap=3 "
+                "effect_samples_gt8=2 minimum_samples_gt8=1 "
+                "scale_zero_byte_differences=0 applied=21 unmatched=0 rgb_samples=200"
+            ),
+        }
+        runs = [
+            {
+                **spec,
+                "returncode": 0,
+                "stdout": result_lines[spec["name"]] + "\ntest result: ok.\n",
+                "stderr": "",
+            }
+            for spec in specs
+        ]
+        source = {
+            "commit": manifest["implementation_base"],
+            "base_commit": manifest["implementation_base"],
+            "source_sha256": "d" * 64,
+            "files": {"fixture": "e" * 64},
+            "changed_paths": ["fixture"],
+        }
+        execution = {"fixture": "execution"}
+        models = {"fixture": {"inventory_sha256": "f" * 64}}
+        parsed = {
+            name: VERIFY.parsed_results(line)[name]
+            for name, line in result_lines.items()
+        }
+        transcript = {
+            "schema": 2,
+            "story": "sc-15505",
+            "mode": "acceptance",
+            "source": source,
+            "source_after": source,
+            "execution": execution,
+            "execution_after": execution,
+            "models_before": models,
+            "models_after": models,
+            "artifacts_before": results["evidence"]["artifact_sha256"],
+            "artifacts_after": results["evidence"]["artifact_sha256"],
+            "runs": runs,
+            "results": parsed,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "transcript.json"
+
+            def write_transcript():
+                path.write_text(json.dumps(transcript), encoding="utf-8")
+                record = results["evidence"]["transcript"]
+                record["local_path"] = str(path)
+                record["bytes"] = path.stat().st_size
+                record["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+                receipt_path = pathlib.Path(directory) / "receipt.json"
+                receipt_path.write_text(
+                    json.dumps(VERIFY.receipt_for(transcript, path)),
+                    encoding="utf-8",
+                )
+                receipt_record = results["evidence"]["receipt"]
+                receipt_record["local_path"] = str(receipt_path)
+                receipt_record["bytes"] = receipt_path.stat().st_size
+                receipt_record["sha256"] = hashlib.sha256(
+                    receipt_path.read_bytes()
+                ).hexdigest()
+
+            write_transcript()
+            with (
+                mock.patch.object(VERIFY, "model_inventories", return_value=models),
+                mock.patch.object(VERIFY, "source_state", return_value=source),
+                mock.patch.object(VERIFY, "execution_metadata", return_value=execution),
+            ):
+                VERIFY.verify_result_transcript(manifest, TOOLS)
+                runs[1]["stdout"] = runs[1]["stdout"].replace(
+                    "z_image_lora samples_gt8=0",
+                    "z_image_lora samples_gt8=1",
+                )
+                transcript["results"]["z_image_lora"]["samples_gt8"] = 1
+                write_transcript()
+                with self.assertRaisesRegex(VERIFY.InvalidManifest, "measurements mismatch"):
+                    VERIFY.verify_result_transcript(manifest, TOOLS)
+                runs[1]["stdout"] = runs[1]["stdout"].replace(
+                    "z_image_lora samples_gt8=1",
+                    "z_image_lora samples_gt8=0",
+                )
+                runs[1]["stdout"] += result_lines["z_image_lora"] + "\n"
+                transcript["results"]["z_image_lora"]["samples_gt8"] = 0
+                write_transcript()
+                with self.assertRaisesRegex(VERIFY.InvalidManifest, "duplicate result name"):
+                    VERIFY.verify_result_transcript(manifest, TOOLS)
+
+    def test_transcript_rejects_duplicate_result_lines_and_fields(self):
+        line = (
+            "SC15505_RESULT z_image_lora samples_gt8=0 no_adapter_samples_gt8=2 "
+            "base_floor=0 cap=1 rgb_samples=786432\n"
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate result name"):
+            VERIFY.parsed_results(line + line)
+        duplicate_field = (
+            "SC15505_RESULT z_image_lora samples_gt8=0 samples_gt8=1 "
+            "no_adapter_samples_gt8=2 base_floor=0 cap=1 rgb_samples=786432\n"
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate result field"):
+            VERIFY.parsed_results(duplicate_field)
+
+    def test_hyper_flux_dump_canonicalizes_metadata_order_after_saving(self):
+        """The Hyper-FLUX golden must stay byte-reproducible (sc-17651).
+
+        `safetensors.numpy.save_file` serializes `__metadata__` out of a Rust `HashMap`
+        with per-process iteration order, so without the canonicalization step this dump
+        writes a different file hash on every run while the tensors stay bit-identical —
+        making the manifest's SHA-256 pin for `flux_hyper_golden` unreachable by
+        regeneration. Dropping the call would go unnoticed until someone re-recorded on
+        the licensed host, so guard it over the source text: the module imports torch and
+        diffusers at module scope and cannot be imported here. The sibling dumps write via
+        `mx.save_safetensors` and need no such step.
+        """
+        source = (TOOLS / "dump_hyper_flux_golden.py").read_text(encoding="utf-8")
+        self.assertIn(
+            "def _canonicalize_metadata_order(",
+            source,
+            "dump_hyper_flux_golden.py lost its metadata-order canonicalization helper",
+        )
+        save = source.index("save_file(tensors, OUT, metadata=meta)")
+        self.assertNotEqual(
+            source.find("_canonicalize_metadata_order(OUT)", save),
+            -1,
+            "dump_hyper_flux_golden.py must call _canonicalize_metadata_order(OUT) after "
+            "save_file, or the golden stops being byte-reproducible",
+        )
+
+    def test_hyper_flux_metadata_canonicalization_is_order_invariant(self):
+        """Differing metadata orders must collapse to identical bytes, payload untouched."""
+        source = (TOOLS / "dump_hyper_flux_golden.py").read_text(encoding="utf-8")
+        start = source.index("def _canonicalize_metadata_order(")
+        end = source.index("\n\n\nBASE = ", start)
+        namespace = {"json": json, "struct": struct}
+        exec(source[start:end], namespace)
+        canonicalize = namespace["_canonicalize_metadata_order"]
+
+        payload = bytes(range(256)) * 4
+        produced = []
+        for order in (["b", "a", "c"], ["c", "a", "b"]):
+            header = {
+                "__metadata__": {key: f"value-{key}" for key in order},
+                "t": {
+                    "dtype": "U8",
+                    "shape": [len(payload)],
+                    "data_offsets": [0, len(payload)],
+                },
+            }
+            blob = json.dumps(header, separators=(",", ":")).encode("utf-8")
+            blob += b" " * ((8 - len(blob) % 8) % 8)
+            with tempfile.TemporaryDirectory() as directory:
+                path = pathlib.Path(directory) / "golden.safetensors"
+                path.write_bytes(struct.pack("<Q", len(blob)) + blob + payload)
+                canonicalize(path)
+                produced.append(path.read_bytes())
+
+        self.assertEqual(produced[0], produced[1], "canonicalization is not order-invariant")
+        for blob in produced:
+            length = struct.unpack("<Q", blob[:8])[0]
+            self.assertEqual(blob[8 + length :], payload, "canonicalization moved the payload")
+            self.assertEqual(
+                list(json.loads(blob[8 : 8 + length])["__metadata__"]),
+                ["a", "b", "c"],
+                "metadata was not sorted",
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

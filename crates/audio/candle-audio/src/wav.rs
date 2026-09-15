@@ -129,8 +129,8 @@ mod tests {
         let t = track(vec![0.25, -0.25, 0.5, -0.5], 44_100, 2);
         let bytes = encode_wav_pcm16(&t).unwrap();
         assert_eq!(u16::from_le_bytes(bytes[22..24].try_into().unwrap()), 2);
-        let dir = std::env::temp_dir().join("candle-audio-wav-test");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let path = dir.join("stereo.wav");
         write_wav_pcm16(&path, &t).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes);

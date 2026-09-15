@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! MLX_LLM_QWEN35_MODEL=/path/to/Qwen3.6-27B \
-//!   cargo test --test qwen35_tools -- --ignored --nocapture
+//!   cargo test --test integration -- qwen35_tools:: --ignored --nocapture
 //! ```
 //!
 //! This exercises the whole tool path on real weights: a request offering a `get_weather` function

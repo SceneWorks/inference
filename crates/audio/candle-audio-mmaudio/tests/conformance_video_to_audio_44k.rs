@@ -5,7 +5,7 @@
 //! Both tests are `#[ignore]`d and stage the five pinned checkpoints across three repos as named
 //! `LoadSpec` components (sc-13666), resolved from env-pointed per-repo snapshot paths, falling back
 //! to the audio lane's F-029 hub path (~9.5 GB across `hkchengrex/MMAudio`,
-//! `apple/DFN5B-CLIP-ViT-H-14-384`, and `nvidia/bigvgan_v2_44khz_128band_512x`) — see [`common`] for
+//! `apple/DFN5B-CLIP-ViT-H-14-378`, and `nvidia/bigvgan_v2_44khz_128band_512x`) — see [`common`] for
 //! the env vars. The full 44k pipeline (the 1.03B large_44k_v2 MM-DiT plus CLIP ViT-H, Synchformer,
 //! the 44k VAE, and NVIDIA BigVGAN v2) is heavy — see the crate PR notes for the memory envelope.
 //!

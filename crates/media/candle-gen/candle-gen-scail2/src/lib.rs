@@ -36,18 +36,47 @@ pub mod adapters;
 pub mod clip;
 pub mod config;
 pub mod generate;
+pub mod memory_strategy;
 pub mod model;
 pub mod pipeline;
 pub mod preprocess;
 pub mod resize;
 pub mod rope;
 
+/// The single VAE implementation used by SCAIL-2.
+pub type ProviderVae = candle_gen_wan::vae16::WanVae16;
+/// SCAIL-2's provider-facing geometry, derived from its concrete VAE assignment.
+pub const VAE_TILING: candle_gen::gen_core::tiling::VaeTiling = ProviderVae::VAE_TILING;
+
+/// Resolve SCAIL-2 VAE geometry by registered generator id.
+pub fn vae_tiling(provider_id: &str) -> Option<candle_gen::gen_core::tiling::VaeTiling> {
+    (provider_id == MODEL_ID).then_some(VAE_TILING)
+}
+
+/// Resolve SCAIL-2's provider-owned conservative VAE decode working-set peak.
+pub fn conservative_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<candle_gen::VideoDecodeMemoryProfile> {
+    vae_tiling(provider_id)?;
+    candle_gen::VideoDecodeMemoryProfile::new(
+        candle_gen_wan::conservative_video_decode_peak_bytes_for_vae(
+            VAE_TILING, width, height, frames,
+        )?,
+        0,
+    )
+}
+
 pub use adapters::{has_diff_patch_keys, merge_adapters, MergeReport};
 pub use clip::{ClipVisionConfig, ScailClip};
 pub use config::Scail2Config;
 pub use generate::{generate, CharacterRef, Components, Scail2Job};
 pub use model::{Scail2Dit, Scail2Inputs};
-pub use pipeline::{descriptor, load, MODEL_ID};
+pub use pipeline::{
+    descriptor, load, snapshot_layout, SnapshotLayout, MODEL_ID, SHARED_TIER_FILES,
+};
 pub use preprocess::extract_and_compress_mask_to_latent;
 pub use resize::{clip_preprocess, downsample_half, interpolate, Interp};
 pub use rope::ScailRope;
@@ -56,7 +85,22 @@ pub use rope::ScailRope;
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(pipeline::REGISTRATION)
+    let registry = registry.register_generator(pipeline::REGISTRATION);
+    #[cfg(feature = "cuda")]
+    let registry = register_memory_contract_surfaces(registry);
+    registry
+}
+
+/// Add SCAIL-2's Resident-only memory registration without constructing weights.
+///
+/// CUDA builds receive it through [`register_providers`]; CPU catalog conformance composes this
+/// same declaration explicitly so it can exercise the provider's public contract without CUDA.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_resident_only_memory_contract(memory_strategy::RESIDENT_ONLY_WITNESS)
 }
 
 /// Build the complete explicit Candle Scail2 provider catalog.
@@ -74,5 +118,26 @@ mod explicit_registry_tests {
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
         assert_eq!(explicit, ["scail2_14b"]);
+    }
+
+    #[test]
+    fn provider_id_is_bound_to_the_causal_wan_z16_geometry() {
+        assert_eq!(super::VAE_TILING, super::ProviderVae::VAE_TILING);
+        assert_eq!(super::VAE_TILING.full_res_channels, 96);
+        assert_eq!(super::preprocess::TEMPORAL_STRIDE, 4);
+        assert_eq!(super::generate::DIM_ALIGN, 32);
+        let mapped = super::vae_tiling(super::MODEL_ID).unwrap();
+        assert!(mapped.causal_temporal);
+        assert_eq!(mapped, super::VAE_TILING);
+        assert_eq!(
+            super::conservative_video_decode_memory_profile(super::MODEL_ID, 64, 64, 9).map(
+                |profile| (
+                    profile.working_set_bytes(),
+                    profile.resident_decoder_bytes_included(),
+                )
+            ),
+            Some((265_830_400, 0))
+        );
+        assert_eq!(super::vae_tiling("not_scail2"), None);
     }
 }

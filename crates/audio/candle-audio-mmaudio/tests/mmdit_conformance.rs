@@ -13,23 +13,35 @@
 //! - [`mmdit_sample_shape_finite_deterministic`] — the full CFG-4.5 / Euler-25 sample from a fixed
 //!   prior → finite, deterministic, correctly-shaped `(1, 250, 20)` **audio latents** (the shape the
 //!   16k VAE decodes), and materially different from the input noise.
-//! - [`mmdit_matches_reference`] — **numerical parity** against the PyTorch MMAudio network, run
-//!   only when `MMAUDIO_DIT_PARITY_DIR` points at the `ref_dump.py` dump directory. Feeds the exact
-//!   dumped features/latent and compares (a) a single `predict_flow` and (b) the full CFG-25 sample
-//!   with cosine `> 0.999` and small max-abs-diff. This isolates the ported MM-DiT + sampler from
-//!   the feature encoders by feeding the exact reference inputs.
+//! - [`mmdit_matches_reference`] — **numerical parity** against the PyTorch MMAudio network. Feeds
+//!   the exact features/latent from the committed fixture and compares (a) a single `predict_flow`
+//!   and (b) the full CFG-25 sample with cosine `> 0.999` and small max-abs-diff. This isolates the
+//!   ported MM-DiT + sampler from the feature encoders by feeding the exact reference inputs.
+//!
+//!   Its fixture is produced by `scripts/reference/mmaudio_reference.py` and **committed**
+//!   (sc-17285). Before that this test read a directory path from `MMAUDIO_DIT_PARITY_DIR` and,
+//!   when it was unset — which it always was, because no script in this repository produced such a
+//!   directory — `return`ed early to a *passing* result. A run-count assertion cannot tell that
+//!   apart from real work, so sc-17266 had to exclude this test by name from the real-weight lane
+//!   rather than inherit a vacuous green. There is no unset case left: the fixture resolves from
+//!   `CARGO_MANIFEST_DIR`, and a missing or malformed one fails.
 //!
 //! `#[ignore]`d and snapshot-gated like every audio family's real-weight tests:
 //! ```text
 //! cargo test --locked -p candle-audio-mmaudio --test mmdit_conformance -- --ignored --nocapture
 //! ```
 //! Set `MMAUDIO_DIT_SNAPSHOT` to a `mmaudio_small_16k.pth` file (or a dir containing it under
-//! `weights/` or at its root), or leave unset to resolve the pinned checkpoint via the audio lane's
-//! F-029 hub path.
+//! `weights/` or at its root). It is **required**: `load_net` panics when it is unset, because
+//! inference never self-fetches and never derives a hub-cache location (epic 13657). There is no
+//! hub fallback.
+
+mod common;
 
 use candle_audio_mmaudio as m;
 use candle_audio_mmaudio::candle_audio::candle_core::{Device, Tensor};
 use candle_audio_mmaudio::mmdit;
+
+const FIXTURE: &str = "mmaudio_parity_mmdit.safetensors";
 
 fn load_net() -> mmdit::MmAudioDit {
     let dev = Device::Cpu;
@@ -62,26 +74,14 @@ fn fixed(shape: &[usize], seed: u64) -> Tensor {
     Tensor::from_vec(v, shape, &Device::Cpu).unwrap()
 }
 
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    dot / (na * nb)
-}
-
-fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+/// f32 variant used by the weight-free determinism check below. The parity test uses
+/// [`common::max_abs_diff`], which accumulates in f64 like the other gates; the two are named
+/// apart so it is obvious at each call site which one is in play.
+fn max_abs_diff_f32(a: &[f32], b: &[f32]) -> f32 {
     a.iter()
         .zip(b)
         .map(|(x, y)| (x - y).abs())
         .fold(0f32, f32::max)
-}
-
-fn read_f32(path: &std::path::Path) -> Vec<f32> {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
 }
 
 fn vecof(t: &Tensor) -> Vec<f32> {
@@ -138,7 +138,7 @@ fn mmdit_sample_shape_finite_deterministic() {
     let b = vecof(&net.sample_default(&x0, &cond).unwrap());
     assert_eq!(a, b, "sample must be deterministic run-to-run");
     // materially different from the input noise
-    let diff = max_abs_diff(&a, &vecof(&x0));
+    let diff = max_abs_diff_f32(&a, &vecof(&x0));
     assert!(
         diff > 1e-2,
         "output must differ from the input prior (Δ={diff})"
@@ -152,47 +152,41 @@ fn mmdit_sample_shape_finite_deterministic() {
 }
 
 #[test]
-#[ignore = "numerical parity vs PyTorch MMAudio; set MMAUDIO_DIT_PARITY_DIR to the ref_dump.py dir"]
+#[ignore = "numerical parity vs PyTorch MMAudio; needs mmaudio_small_16k.pth. Run with --ignored"]
 fn mmdit_matches_reference() {
-    let dir = match std::env::var("MMAUDIO_DIT_PARITY_DIR") {
-        Ok(d) => std::path::PathBuf::from(d),
-        Err(_) => {
-            eprintln!("MMAUDIO_DIT_PARITY_DIR unset; skipping parity");
-            return;
-        }
-    };
     let dev = Device::Cpu;
+    let tensors = common::load_fixture(FIXTURE, &dev);
+    let load = |name: &str| common::fixture_tensor(&tensors, FIXTURE, name);
     let net = load_net();
 
-    let load = |name: &str, shape: &[usize]| -> Tensor {
-        Tensor::from_vec(read_f32(&dir.join(format!("{name}.f32"))), shape, &dev).unwrap()
-    };
-
     // ---- single predict_flow parity (isolates the MM-DiT from the feature encoders) ----
-    let clip = load("clip_f", &[1, 64, 1024]);
-    let sync = load("sync_f", &[1, 192, 768]);
-    let text = load("text_f", &[1, 77, 1024]);
-    let latent = load("latent", &[1, 250, 20]);
-    let t = load("t", &[1]);
+    let clip = load("clip_f");
+    let sync = load("sync_f");
+    let text = load("text_f");
+    let latent = load("latent");
+    let t = load("t");
     let cond = net.preprocess_conditions(&clip, &sync, &text).unwrap();
     let got = vecof(&net.predict_flow(&latent, &t, &cond).unwrap());
-    let want = read_f32(&dir.join("flow.f32"));
+    let want = common::flat(&load("flow"));
     assert_eq!(got.len(), want.len(), "flow length");
-    let f_cos = cosine(&got, &want);
-    let f_mad = max_abs_diff(&got, &want);
+    let f_cos = common::cosine(&got, &want);
+    let f_mad = common::max_abs_diff(&got, &want);
     eprintln!("PARITY predict_flow: cos={f_cos:.6} max|Δ|={f_mad:.6}");
     assert!(f_cos > 0.999, "flow cosine {f_cos} must exceed 0.999");
     assert!(f_mad < 0.05, "flow max-abs-diff {f_mad} too large");
 
     // ---- full CFG-4.5 / Euler-25 sample parity (uses the SAME cond, the reference x0 noise) ----
-    let x0 = load("x0", &[1, 250, 20]);
+    // `sample_default` builds its own DEFAULT empty conditions (no negative text), so the fixture
+    // is produced from `get_empty_conditions(1)` rather than the negative-text form the assembled
+    // pipeline uses — otherwise the two sides would sample different distributions.
+    let x0 = load("x0");
     let got_s = vecof(&net.sample_default(&x0, &cond).unwrap());
-    let want_s = read_f32(&dir.join("x1_unnorm.f32"));
+    let want_s = common::flat(&load("x1_unnorm"));
     assert_eq!(got_s.len(), want_s.len(), "sample length");
-    let s_cos = cosine(&got_s, &want_s);
-    let s_mad = max_abs_diff(&got_s, &want_s);
+    let s_cos = common::cosine(&got_s, &want_s);
+    let s_mad = common::max_abs_diff(&got_s, &want_s);
     // scale the tolerance to the reference magnitude (unnormalized latents are O(100s)).
-    let ref_absmax = want_s.iter().cloned().fold(0f32, |a, v| a.max(v.abs()));
+    let ref_absmax = want_s.iter().fold(0f64, |a, v| a.max(v.abs() as f64));
     eprintln!(
         "PARITY sample(unnorm): cos={s_cos:.6} max|Δ|={s_mad:.4} ref|max|={ref_absmax:.2} rel={:.5}",
         s_mad / ref_absmax

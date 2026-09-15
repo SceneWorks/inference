@@ -67,14 +67,18 @@ fn ones(d: usize) -> Tensor {
     Tensor::from_vec(vec![1.0f32; d], (d,), &Device::Cpu).unwrap()
 }
 
-/// Write a tiny 4-layer `llama` snapshot from deterministic random weights and return its directory
-/// (kept on disk so it can be loaded several ways; the caller removes it).
-fn build_tiny_dir() -> std::path::PathBuf {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static SEQ: AtomicU32 = AtomicU32::new(0);
-    let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("candle-llm-shard-{}-{uniq}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+/// Write a tiny 4-layer `llama` snapshot from deterministic random weights and return its directory,
+/// kept on disk so it can be loaded several ways.
+///
+/// sc-17755: returns the `TempDir` guard, not a bare `PathBuf` — the caller loads from the path
+/// several times after this returns, so the guard has to outlive the helper, and the trailing
+/// `remove_dir_all(..).ok()` it replaces never ran on a failing test.
+fn build_tiny_dir() -> tempfile::TempDir {
+    let guard = tempfile::Builder::new()
+        .prefix("candle-llm-shard-")
+        .tempdir()
+        .expect("fixture temp dir");
+    let dir = guard.path();
 
     let cfg = format!(
         r#"{{
@@ -124,25 +128,26 @@ fn build_tiny_dir() -> std::path::PathBuf {
     }
 
     candle_core::safetensors::save(&w, dir.join("model.safetensors")).unwrap();
-    dir
+    guard
 }
 
 /// Sharded-onto-one-device is a perfect drop-in for an ordinary load: same loader output, same
 /// inferred per-layer device, same forward (the cross-device hand-off is a no-op on one device).
 #[test]
 fn sharded_single_device_matches_plain_cpu() {
-    let dir = build_tiny_dir();
+    let guard = build_tiny_dir();
+    let dir = guard.path();
 
     let plain = CausalLm::from_weights(
-        &Weights::from_dir(&dir, &Device::Cpu).unwrap(),
+        &Weights::from_dir(dir, &Device::Cpu).unwrap(),
         "",
-        ModelConfig::from_dir(&dir).unwrap(),
+        ModelConfig::from_dir(dir).unwrap(),
     )
     .unwrap();
 
     let sharded = CausalLm::from_dir_sharded(
-        &dir,
-        ModelConfig::from_dir(&dir).unwrap(),
+        dir,
+        ModelConfig::from_dir(dir).unwrap(),
         DType::F32,
         &[Device::Cpu],
     )
@@ -163,8 +168,6 @@ fn sharded_single_device_matches_plain_cpu() {
         sharded_out, plain_out,
         "a sharded load onto one device must be token-for-token identical to a plain load"
     );
-
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 // ---- Real multi-GPU variant (#[ignore]) ----------------------------------------------------------

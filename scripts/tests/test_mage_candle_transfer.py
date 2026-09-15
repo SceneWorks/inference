@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -70,3 +71,51 @@ class MageCandleTransferTests(unittest.TestCase):
         (self.output / self.module.FILES[0]).write_bytes(b"mutated")
         with self.assertRaises(self.module.InvalidTransfer):
             self.module.verify(self.output, *self.snapshots, False)
+
+    def test_migrates_only_the_edit_variant_manifest_record(self) -> None:
+        self.module.verify(self.output, *self.snapshots, True)
+        with self.assertRaises(self.module.InvalidTransfer):
+            self.module.migrate_edit_variant_manifest_hash_only(
+                self.output, *self.snapshots
+            )
+        target = self.output / "mage_edit_variants_manifest.json"
+        target.write_bytes(b"strictly-migrated-edit-variant-manifest")
+
+        self.module.migrate_edit_variant_manifest_hash_only(
+            self.output, *self.snapshots
+        )
+        self.module.verify(self.output, *self.snapshots, False)
+
+    def test_migration_rejects_any_second_stale_record_or_revision(self) -> None:
+        self.module.verify(self.output, *self.snapshots, True)
+        (self.output / "mage_edit_variants_manifest.json").write_bytes(b"migrated")
+        manifest_path = self.output / self.module.MANIFEST
+        original = manifest_path.read_text(encoding="utf-8")
+
+        (self.output / self.module.FILES[0]).write_bytes(b"also-stale")
+        with self.assertRaises(self.module.InvalidTransfer):
+            self.module.migrate_edit_variant_manifest_hash_only(
+                self.output, *self.snapshots
+            )
+        self.assertEqual(manifest_path.read_text(encoding="utf-8"), original)
+
+        (self.output / self.module.FILES[0]).write_bytes(self.module.FILES[0].encode())
+        document = json.loads(original)
+        document["generationSnapshotRevision"] = "f" * 40
+        manifest_path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaises(self.module.InvalidTransfer):
+            self.module.migrate_edit_variant_manifest_hash_only(
+                self.output, *self.snapshots
+            )
+
+    def test_migration_rejects_a_linked_transfer_manifest(self) -> None:
+        self.module.verify(self.output, *self.snapshots, True)
+        (self.output / "mage_edit_variants_manifest.json").write_bytes(b"migrated")
+        manifest_path = self.output / self.module.MANIFEST
+        external = self.root / "external-manifest.json"
+        manifest_path.replace(external)
+        os.link(external, manifest_path)
+        with self.assertRaises(self.module.InvalidTransfer):
+            self.module.migrate_edit_variant_manifest_hash_only(
+                self.output, *self.snapshots
+            )

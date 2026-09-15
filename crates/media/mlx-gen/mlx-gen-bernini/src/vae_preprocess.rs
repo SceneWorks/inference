@@ -97,6 +97,8 @@ mod tests {
         assert_eq!(resize_dims(24, 24, 624, 1, 16), (32, 32));
         // long edge clamp: 1920x1080 -> 624x352.
         assert_eq!(resize_dims(1920, 1080, 624, 1, 16), (624, 352));
+        // Two-stage rounding is observable: round(24 * 624/625) = 24, then round(24/16) = 2.
+        assert_eq!(resize_dims(24, 625, 624, 1, 16), (32, 624));
         // already in-range multiple: identity.
         assert_eq!(resize_dims(320, 240, 624, 1, 16), (320, 240));
     }

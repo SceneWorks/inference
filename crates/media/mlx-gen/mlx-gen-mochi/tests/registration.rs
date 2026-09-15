@@ -13,8 +13,8 @@ use mlx_gen::{LoadSpec, Modality, Quant, WeightsSource};
 use mlx_gen_mochi::MODEL_ID;
 
 /// A throwaway empty model dir (an incomplete snapshot — no `vae/config.json`).
-fn temp_model_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("mochi_reg_{}_{}", std::process::id(), tag));
+fn temp_model_dir(tmp: &tempfile::TempDir, tag: &str) -> PathBuf {
+    let dir = tmp.path().join(format!("mochi_reg_{}", tag));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -47,7 +47,8 @@ fn mochi_is_registered() {
 
 #[test]
 fn load_rejects_single_file_source() {
-    let dir = temp_model_dir("single");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = temp_model_dir(&tmp, "single");
     assert!(
         mlx_gen_mochi::provider_registry()
             .unwrap()
@@ -63,7 +64,8 @@ fn load_rejects_single_file_source() {
 
 #[test]
 fn load_rejects_on_the_fly_quant() {
-    let dir = temp_model_dir("quant");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = temp_model_dir(&tmp, "quant");
     assert!(
         mlx_gen_mochi::provider_registry()
             .unwrap()
@@ -79,9 +81,10 @@ fn load_rejects_on_the_fly_quant() {
 
 #[test]
 fn load_requires_full_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
     // An empty dir has no `vae/config.json` (nor T5/DiT shards) — `load` must error rather than
     // return a stub. (The full-model load + generate is exercised by the real-weights `e2e_parity`.)
-    let dir = temp_model_dir("incomplete");
+    let dir = temp_model_dir(&tmp, "incomplete");
     assert!(
         mlx_gen_mochi::provider_registry()
             .unwrap()

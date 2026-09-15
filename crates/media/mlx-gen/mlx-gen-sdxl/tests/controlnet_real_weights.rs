@@ -2,7 +2,7 @@
 //!
 //! `#[ignore]`d — needs `xinsir/controlnet-tile-sdxl-1.0` + the golden from
 //! `tools/dump_sdxl_controlnet_golden.py`. Run:
-//!   cargo test -p mlx-gen-sdxl --release --test controlnet_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sdxl --release --test integration controlnet_real_weights:: -- --ignored --nocapture
 //!
 //! Validates the whole branch (conditioning embedding + UNet-encoder copy + zero-conv heads) by
 //! matching the 9 down residuals + the mid residual on a fixed (latents, control image, timestep,

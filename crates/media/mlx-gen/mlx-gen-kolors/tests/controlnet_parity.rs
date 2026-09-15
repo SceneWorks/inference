@@ -15,7 +15,7 @@
 //!  - the same test then renders with `control_scale > 0` and asserts the output is coherent AND
 //!    actually differs from the scale-0 render (the control influences the image).
 //!
-//! Run: `cargo test -p mlx-gen-kolors --release --test controlnet_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-kolors --release --test integration controlnet_parity:: -- --ignored --nocapture`
 
 use std::path::PathBuf;
 

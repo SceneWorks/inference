@@ -1,0 +1,26 @@
+# Direct dependencies for the CPU-only MMAudio parity-fixture producer
+# (`scripts/reference/mmaudio_reference.py dump`).
+#
+# These pins ARE part of the oracle: the committed fixtures record this reference's numbers, and
+# torch in particular changes them across releases. `mmaudio_reference_environment.py` restates
+# them as REFERENCE_PACKAGES and refuses to run `dump` in an environment that does not match, so a
+# regenerated fixture cannot silently come from a different stack than the one on record.
+#
+# The set is the reachable subset of the vendored reference's own `pyproject.toml` dependencies —
+# the packages its inference path actually imports. Excluded: the training/eval/serving stack
+# (tensorboard, gradio, hydra-core, nitrous-ema, tensordict, opencv-python, av, torchcodec,
+# gitpython, python-dotenv, cython, colorlog, Pillow, scipy), none of which is on any import chain
+# `dump` walks.
+torch==2.13.0
+torchvision==0.28.0
+open_clip_torch==3.3.0
+timm==1.0.28
+numpy==2.4.3
+safetensors==0.8.0
+einops==0.8.2
+torchdiffeq==0.2.5
+huggingface-hub==1.26.0
+omegaconf==2.3.1
+librosa==0.11.0
+tqdm==4.70.0
+requests==2.34.2

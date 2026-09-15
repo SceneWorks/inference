@@ -195,6 +195,16 @@ impl Variant {
 /// VAE spatial compression (8×) and latent channels (16) — shared with Qwen-Image.
 pub const VAE_COMPRESSION: u32 = 8;
 pub const VAE_CHANNELS: usize = 16;
+/// The axis of the length-1 **temporal** dimension in Anima's 5-D Cosmos latent
+/// `[1, VAE_CHANNELS, T, H/8, W/8]`.
+///
+/// Anima is a still-image family riding the Cosmos-Predict2 video layout, so `T` is always 1 and
+/// every consumer of the latent has to drop that axis before doing anything spatial with it. Two do:
+/// the decode tail (`pipeline`, before `vae::QwenVae::decode`) and the per-step preview projector
+/// (`preview`, before the reused QwenVae RGB fit). Named here so those two share one source rather
+/// than two spellings of `2` that could drift apart — the preview only shows the right picture while
+/// it squeezes the same axis the decode does.
+pub const LATENT_TEMPORAL_AXIS: usize = 2;
 /// patchify + VAE alignment: `vae(8) · patch(2) = 16` — W/H must be a multiple of this. Exposed as
 /// the pinned-engine stride SceneWorks ties each advertised Anima image bucket to (sc-12612),
 /// mirroring `wan::config::SIZE_MULTIPLE_14B`. `validate` enforces exactly this value, so the const

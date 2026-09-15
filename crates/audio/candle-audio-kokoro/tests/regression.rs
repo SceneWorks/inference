@@ -23,6 +23,16 @@
 //!   across architectures) and the observed hash is printed instead; the envelope and
 //!   intra-process repeatability still gate.
 //!
+//! The exact-hash tuple is (backend, os, arch, **opt-level**) — sc-17004. Measured on the
+//! real-weights runner: an opt-level 0 and an opt-level 3 build of this workspace's own crates
+//! produce two different PCM streams, each internally deterministic (12x opt0, 4x opt3) and
+//! acoustically indistinguishable (identical duration/LUFS/dBTP/clipping). The specific codegen
+//! transform responsible has **not** been isolated — notably it is *not* FMA contraction, which
+//! rustc leaves off (verified: `a * b + c` emits separate `fmul`/`fadd` at `-C opt-level=3`).
+//! So the fixture commits **both** hashes (`pcm_sha256_opt0`, `pcm_sha256_opt3`) and the test
+//! asserts the one matching this build, keeping the gate at full strength in either profile
+//! instead of going quiet in one. CI runs `--release`.
+//!
 //! [`MetricEnvelope`]: candle_audio::harness::MetricEnvelope
 
 use std::path::PathBuf;
@@ -148,9 +158,44 @@ fn kokoro_regression_fixture() {
     let fx_arch = field(&fx, &["repeatability", "arch"])
         .as_str()
         .expect("arch");
-    let fx_hash = field(&fx, &["repeatability", "pcm_sha256"])
+    // sc-17004: the exact-hash tuple includes OPT-LEVEL. Measured on the real-weights runner, an
+    // opt-level 0 and an opt-level 3 build produce different (each internally deterministic) PCM,
+    // so one committed hash cannot gate both. `[profile.dev.package."*"] opt-level = 3` covers
+    // registry DEPENDENCIES only — not workspace members — so candle is identical across profiles
+    // and the moving parts are this workspace's own crates (`candle-audio-kokoro` and its
+    // `candle-audio` host-DSP dependency, both opt-level 0 in dev). The exact transform is NOT
+    // isolated, and in particular is not FMA contraction: rustc leaves FP contraction off, and
+    // `a * b + c` still emits separate `fmul`/`fadd` at `-C opt-level=3` on this target.
+    //
+    // We therefore commit one hash per opt-level and select for this build. `debug_assertions` is a
+    // CORRELATE of opt-level, not the causal variable (`CARGO_PROFILE_DEV_OPT_LEVEL=3` moves the
+    // hash while leaving debug_assertions on) — it is chosen because it needs no build script and
+    // is accurate for this workspace's two stock profiles, which have no `[profile.dev]` /
+    // `[profile.release]` overrides. Known false-failure modes, all of them loud rather than
+    // silent: an overridden opt-level (diagnosed by name below), `opt-level` 1 or 2 (never
+    // baselined — reported as drift), and `[profile.release] debug-assertions = true` (selects the
+    // opt0 key on an opt3 build). Reading the real level would take a `build.rs` exporting
+    // `OPT_LEVEL`; that would be this workspace's first build script, which is not worth it for a
+    // single fixture.
+    let (fx_key, other_key, profile) = if cfg!(debug_assertions) {
+        (
+            "pcm_sha256_opt0",
+            "pcm_sha256_opt3",
+            "unoptimized (opt-level 0)",
+        )
+    } else {
+        (
+            "pcm_sha256_opt3",
+            "pcm_sha256_opt0",
+            "optimized (opt-level 3)",
+        )
+    };
+    let fx_hash = field(&fx, &["repeatability", fx_key])
         .as_str()
-        .expect("pcm_sha256");
+        .expect("pcm_sha256 for this build's opt-level");
+    let fx_other = field(&fx, &["repeatability", other_key])
+        .as_str()
+        .expect("pcm_sha256 for the other opt-level");
     // The exact PCM hash is a **CPU** determinism gate: candle's Metal/CUDA kernels are not
     // bit-identical to CPU, so the committed hash applies only to a CPU build on the canonical
     // platform. On a GPU build (this crate compiled `--features metal` / `--features cuda`) the
@@ -161,10 +206,33 @@ fn kokoro_regression_fixture() {
     // `--features metal` run on macos/aarch64 would spuriously fail against the CPU hash.
     let cpu_build = cfg!(not(any(feature = "metal", feature = "cuda")));
     if cpu_build && std::env::consts::OS == fx_os && std::env::consts::ARCH == fx_arch {
+        // The two baselines must differ, or the diagnosis below would fire on a correct build.
+        // They can legitimately converge one day (a contraction-stable rewrite), and if they do
+        // this fixture wants ONE hash, not two equal ones — so fail here rather than let the
+        // diagnosis make every run red.
+        assert_ne!(
+            fx_hash, fx_other,
+            "fixture baselines {fx_key} and {other_key} are identical — if the profiles have \
+             genuinely converged, collapse them to a single committed hash instead"
+        );
+        // Name the confusable failure rather than letting it read as plain drift: landing exactly
+        // on the OTHER committed baseline is far more likely a build-configuration mismatch than a
+        // coincidental regression. It is not provably so from the hash alone, so say both.
+        assert_ne!(
+            hash, fx_other,
+            "PCM hash matches the fixture's {other_key} baseline but this build is {profile}. \
+             Most likely the build's real opt-level does not match its profile default (an \
+             overridden opt-level, e.g. CARGO_PROFILE_DEV_OPT_LEVEL, or `debug-assertions` set \
+             against the profile default) — in which case the output is a known-good baseline and \
+             nothing has drifted. If the build is stock, then the two profiles have converged, \
+             which is a real change in the seeded output and wants a fixture re-baseline."
+        );
         assert_eq!(
             hash, fx_hash,
             "PCM repeatability hash drifted from the committed fixture on the canonical \
-             platform ({fx_os}/{fx_arch}) — the seeded output changed"
+             platform ({fx_os}/{fx_arch}, {profile}) — the seeded output changed. Only opt-level \
+             0 and 3 are baselined; if this build uses opt-level 1 or 2, that alone explains the \
+             mismatch and is not a regression."
         );
     } else {
         let backend = if cfg!(feature = "cuda") {
@@ -177,7 +245,8 @@ fn kokoro_regression_fixture() {
         println!(
             "note: exact-hash check skipped (backend={backend}, platform {}/{} vs fixture \
              canonical cpu {fx_os}/{fx_arch}); metric envelope + intra-process repeatability gate \
-             this run — observed hash {hash}",
+             this run — observed hash {hash} for a {profile} build (the hash is opt-level \
+             dependent, so quote the profile alongside it)",
             std::env::consts::OS,
             std::env::consts::ARCH,
         );

@@ -11,8 +11,6 @@
 //! `tests/qwen35_tools.rs` real-weight acceptance gate.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use candle_core::{DType, Device, Tensor};
 
@@ -22,7 +20,6 @@ use core_llm::{LoadSpec, Message, Sampling, TextLlm, TextLlmRequest, ToolSpec};
 use core_llm_testkit::{textllm_conformance, TextLlmProfile};
 
 const VOCAB: usize = 32;
-static SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// A ChatML-style Jinja template that renders an OpenAI-shaped `<tools>` section when `tools` are
 /// offered and re-renders a prior assistant turn's `tool_calls` as the Qwen3.6 `<function=…>` /
@@ -55,11 +52,14 @@ fn tokenizer_json() -> String {
     )
 }
 
-fn write_tools_snapshot() -> PathBuf {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("candle-llm-tools-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+/// sc-17755: returns the `TempDir` guard rather than a bare `PathBuf`. Callers load from the
+/// snapshot after this returns, so the guard must stay bound; the tree then leaves on `Drop`.
+fn write_tools_snapshot() -> tempfile::TempDir {
+    let guard = tempfile::Builder::new()
+        .prefix("candle-llm-tools-")
+        .tempdir()
+        .expect("fixture temp dir");
+    let dir = guard.path();
     std::fs::write(
         dir.join("config.json"),
         r#"{ "hidden_size": 8, "intermediate_size": 16, "num_hidden_layers": 2,
@@ -100,7 +100,7 @@ fn write_tools_snapshot() -> PathBuf {
         arrays.insert(p("mlp.down_proj.weight"), randn((h, inter), &mut rng));
     }
     candle_core::safetensors::save(&arrays, dir.join("model.safetensors")).unwrap();
-    dir
+    guard
 }
 
 fn weather_tool() -> ToolSpec {
@@ -117,7 +117,8 @@ fn weather_tool() -> ToolSpec {
 
 #[test]
 fn tools_provider_passes_core_llm_conformance() {
-    let dir = write_tools_snapshot();
+    let guard = write_tools_snapshot();
+    let dir = guard.path();
     let spec = LoadSpec::dense(dir.to_str().unwrap().to_string());
 
     // The template renders tool calls, so the provider advertises tool calling (and no reasoning).
@@ -139,7 +140,6 @@ fn tools_provider_passes_core_llm_conformance() {
         || Box::new(LlamaProvider::load(&spec).expect("load tools provider")),
         &TextLlmProfile::cheap(),
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A tools request validates and generates without error on a tools-capable provider, and never
@@ -148,7 +148,8 @@ fn tools_provider_passes_core_llm_conformance() {
 /// call is made).
 #[test]
 fn tools_request_generates_without_leaking_markup() {
-    let dir = write_tools_snapshot();
+    let guard = write_tools_snapshot();
+    let dir = guard.path();
     let spec = LoadSpec::dense(dir.to_str().unwrap().to_string());
     let p = LlamaProvider::load(&spec).expect("load tools provider");
 
@@ -171,5 +172,4 @@ fn tools_request_generates_without_leaking_markup() {
     );
     // The synthetic model's t0..t31 vocabulary cannot spell `<tool_call>`, so it makes no call.
     assert!(out.tool_calls.is_empty());
-    let _ = std::fs::remove_dir_all(&dir);
 }

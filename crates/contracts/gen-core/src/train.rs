@@ -20,6 +20,7 @@ pub mod schedule;
 use std::path::PathBuf;
 
 pub use schedule::LrSchedule;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::generator::Modality;
 use crate::media::Image;
@@ -135,6 +136,15 @@ pub struct TrainingConfig {
     /// Guidance scale for preview samples. Guidance-distilled families (z-image-turbo,
     /// lens-turbo, …) ignore it / render at their fixed schedule; CFG families (sdxl, kolors) honor it.
     pub sample_guidance_scale: f32,
+    /// Model-specific training options forwarded losslessly by the product layer.
+    ///
+    /// The common fields above remain the portable contract. Families with a genuinely richer
+    /// strategy surface use this bag instead of overloading unrelated scalar fields. LTX-2.5, for
+    /// example, carries its video/audio generation flags, intrinsic/reference conditions, and
+    /// validation CFG/STG/modality-guidance recipe here. A trainer must parse and validate the keys
+    /// it consumes and reject an unsupported requested mode; it must never silently collapse one
+    /// workflow into another.
+    pub model_options: JsonMap<String, JsonValue>,
     /// Mid-schedule **resume** (sc-9560 / F-125): when `true`, the family trainer looks in
     /// [`output_dir`](TrainingRequest::output_dir) for the latest resume snapshot written by a prior
     /// interrupted run of the **same** output adapter (`file_name`) at [`save_every`](Self::save_every)
@@ -183,6 +193,7 @@ impl Default for TrainingConfig {
             sample_prompts: Vec::new(),
             sample_steps: 20,
             sample_guidance_scale: 1.0,
+            model_options: JsonMap::new(),
             // Resume is OFF by default (F-125): a caller that does not opt in trains from scratch,
             // exactly as before. The worker sets it from the plan when re-running an interrupted job.
             resume: false,
@@ -201,6 +212,15 @@ pub struct TrainingItem {
     /// case, which every existing trainer ignores. A control-branch trainer requires it present on
     /// every item (its `validate` rejects the request otherwise).
     pub control_image_path: Option<PathBuf>,
+    /// Model-specific per-example inputs forwarded losslessly by the product layer.
+    ///
+    /// Most image trainers leave this empty. Rich multimodal trainers use it for resolved sidecar
+    /// paths and shape metadata that cannot be represented by the legacy image/control-image pair.
+    /// LTX-2.5, for example, consumes preprocessed video/audio latents plus optional intrinsic
+    /// masks and reference latents from this bag. A family must validate every field it consumes
+    /// and reject missing inputs for the selected workflow; it must never substitute the image
+    /// path or silently fall back to another workflow.
+    pub model_options: JsonMap<String, JsonValue>,
 }
 
 impl TrainingItem {
@@ -211,6 +231,7 @@ impl TrainingItem {
             image_path,
             caption,
             control_image_path: None,
+            model_options: JsonMap::new(),
         }
     }
 
@@ -220,6 +241,7 @@ impl TrainingItem {
             image_path,
             caption,
             control_image_path: Some(control_image_path),
+            model_options: JsonMap::new(),
         }
     }
 }

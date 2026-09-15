@@ -8,7 +8,7 @@ use mlx_rs::ops::{add, multiply};
 use mlx_rs::Array;
 
 use crate::image::resize_lanczos_u8;
-use crate::{Error, Image, Result};
+use crate::{Conditioning, Error, GenerationRequest, Image, Result};
 
 /// Default strength for a supplied img2img reference when neither the reference nor request sets
 /// one. A reference must not silently fall back to the pure-noise txt2img path.
@@ -18,6 +18,29 @@ pub const DEFAULT_IMG2IMG_STRENGTH: f32 = 0.5;
 /// default. An explicit `Some(0.0)` is preserved as the deliberate no-op/txt2img selection.
 pub fn resolve_strength(reference: Option<f32>, request: Option<f32>) -> f32 {
     reference.or(request).unwrap_or(DEFAULT_IMG2IMG_STRENGTH)
+}
+
+/// Resolve the single img2img init image from a generation request. The per-reference strength
+/// takes precedence over `req.strength`; its absence remains `None` so families that have a
+/// different default can apply it explicitly through [`resolve_strength`]. A `Reference` is a
+/// single-image t2i/img2img surface: multi-image edit paths use [`Conditioning::MultiReference`]
+/// and must resolve that policy independently.
+pub fn resolve_reference<'a>(
+    req: &'a GenerationRequest,
+    id: &str,
+) -> Result<Option<(&'a Image, Option<f32>)>> {
+    let mut reference = None;
+    for conditioning in &req.conditioning {
+        if let Conditioning::Reference { image, strength } = conditioning {
+            if reference.is_some() {
+                return Err(Error::Msg(format!(
+                    "{id}: multiple reference images are not supported (single img2img init only)"
+                )));
+            }
+            reference = Some((image, strength.or(req.strength)));
+        }
+    }
+    Ok(reference)
 }
 
 /// Resolve the img2img start step (the fork's `Config.init_time_step`): for a reference image with
@@ -71,4 +94,79 @@ pub fn add_noise_by_interpolation(clean: &Array, noise: &Array, sigma: f32) -> R
     let one_minus = Array::from_slice(&[1.0 - sigma], &[1]);
     let s = Array::from_slice(&[sigma], &[1]);
     Ok(add(&multiply(clean, one_minus)?, &multiply(noise, s)?)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image() -> Image {
+        Image {
+            width: 2,
+            height: 2,
+            pixels: vec![42; 12],
+        }
+    }
+
+    #[test]
+    fn resolve_reference_enforces_shared_single_image_policy() {
+        let none = GenerationRequest {
+            prompt: "a fox".into(),
+            ..Default::default()
+        };
+        assert!(resolve_reference(&none, "test").unwrap().is_none());
+
+        let per_reference = GenerationRequest {
+            prompt: "a fox".into(),
+            strength: Some(0.6),
+            conditioning: vec![Conditioning::Reference {
+                image: image(),
+                strength: Some(0.3),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_reference(&per_reference, "test")
+                .unwrap()
+                .unwrap()
+                .1,
+            Some(0.3)
+        );
+
+        let request_fallback = GenerationRequest {
+            prompt: "a fox".into(),
+            strength: Some(0.6),
+            conditioning: vec![Conditioning::Reference {
+                image: image(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_reference(&request_fallback, "test")
+                .unwrap()
+                .unwrap()
+                .1,
+            Some(0.6)
+        );
+
+        let multiple = GenerationRequest {
+            prompt: "a fox".into(),
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: image(),
+                    strength: None,
+                },
+                Conditioning::Reference {
+                    image: image(),
+                    strength: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let error = resolve_reference(&multiple, "test")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("multiple reference images"), "{error}");
+    }
 }

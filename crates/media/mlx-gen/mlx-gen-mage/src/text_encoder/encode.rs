@@ -86,6 +86,23 @@ impl MageTextEncoder {
         self.lm.quantized_linear_count()
     }
 
+    pub(crate) fn arm_lm_block_stream(
+        &mut self,
+        source: mlx_gen::WeightsSource,
+        layer_quant_bits: Option<i32>,
+    ) -> Result<()> {
+        self.lm.arm_block_stream(
+            source,
+            super::load::LM_PREFIX,
+            crate::config::QwenVlTextConfig::mage_flow(),
+            layer_quant_bits,
+        )
+    }
+
+    pub(crate) fn resident_lm_layer_count(&self) -> usize {
+        self.lm.resident_layer_count()
+    }
+
     /// Pair an already-loaded tokenizer and LM. [`load`](super::load()) builds both from a snapshot.
     pub fn new(tokenizer: TextTokenizer, lm: Qwen3VlTextEncoder) -> Self {
         Self {
@@ -144,6 +161,15 @@ impl MageTextEncoder {
     /// the reference does (`pipeline.py:318-323`); per-segment isolation is what makes that
     /// equivalent to separate calls (see [`Qwen3VlTextEncoder::forward_packed`]).
     pub fn encode(&self, bodies: &[&str], kind: PromptKind) -> Result<Conditioning> {
+        self.encode_with_cancel(bodies, kind, None)
+    }
+
+    pub(crate) fn encode_with_cancel(
+        &self,
+        bodies: &[&str],
+        kind: PromptKind,
+        cancel: Option<&mlx_gen::CancelFlag>,
+    ) -> Result<Conditioning> {
         if bodies.is_empty() {
             return Err(Error::Msg(
                 "mage_flow text encoder: no prompts to encode".into(),
@@ -156,7 +182,12 @@ impl MageTextEncoder {
             lens.push(seg.len());
             ids.extend_from_slice(&seg);
         }
-        self.encode_packed_ids(&ids, &cu_seqlens_from_lens(&lens), kind.drop_idx())
+        self.encode_packed_ids_with_cancel(
+            &ids,
+            &cu_seqlens_from_lens(&lens),
+            kind.drop_idx(),
+            cancel,
+        )
     }
 
     /// Encode pre-built packed token ids. Separated from [`encode`](Self::encode) because the edit
@@ -171,13 +202,34 @@ impl MageTextEncoder {
         cu_seqlens: &[i32],
         drop_idx: usize,
     ) -> Result<Conditioning> {
+        self.encode_packed_ids_with_cancel(ids, cu_seqlens, drop_idx, None)
+    }
+
+    fn encode_packed_ids_with_cancel(
+        &self,
+        ids: &[i32],
+        cu_seqlens: &[i32],
+        drop_idx: usize,
+        cancel: Option<&mlx_gen::CancelFlag>,
+    ) -> Result<Conditioning> {
         let lens = seq_lens_from_cu(cu_seqlens, ids.len())?;
-        let hidden = self.lm.forward_packed(ids, cu_seqlens)?;
+        let hidden = self
+            .lm
+            .forward_packed_with_cancel(ids, cu_seqlens, cancel)?;
         drop_system_prompt(&hidden, &lens, drop_idx)
     }
 
     /// Encode one edit instruction grounded by one or more source images through Qwen3-VL.
     pub fn encode_edit(&self, instruction: &str, references: &[RgbImage]) -> Result<Conditioning> {
+        self.encode_edit_with_cancel(instruction, references, None)
+    }
+
+    pub(crate) fn encode_edit_with_cancel(
+        &self,
+        instruction: &str,
+        references: &[RgbImage],
+        cancel: Option<&mlx_gen::CancelFlag>,
+    ) -> Result<Conditioning> {
         if references.is_empty() {
             return Err(Error::Msg(
                 "mage_flow edit: at least one reference image is required".into(),
@@ -192,7 +244,7 @@ impl MageTextEncoder {
             deepstack.push(image_deepstack);
             grids.push(grid);
         }
-        self.encode_edit_with_features(instruction, &embeds, &deepstack, &grids)
+        self.encode_edit_with_features_and_cancel(instruction, &embeds, &deepstack, &grids, cancel)
     }
 
     /// Encode an edit instruction from precomputed vision/deepstack boundaries.
@@ -203,6 +255,17 @@ impl MageTextEncoder {
         deepstack: &[Vec<Array>],
         grids: &[[i32; 3]],
     ) -> Result<Conditioning> {
+        self.encode_edit_with_features_and_cancel(instruction, embeds, deepstack, grids, None)
+    }
+
+    fn encode_edit_with_features_and_cancel(
+        &self,
+        instruction: &str,
+        embeds: &[Array],
+        deepstack: &[Vec<Array>],
+        grids: &[[i32; 3]],
+        cancel: Option<&mlx_gen::CancelFlag>,
+    ) -> Result<Conditioning> {
         let counts = embeds
             .iter()
             .map(|embed| embed.shape()[0] as usize)
@@ -210,7 +273,15 @@ impl MageTextEncoder {
         let ids = self.edit_input_ids(instruction, &counts)?;
         let hidden = self
             .lm
-            .forward_grounded(&ids, IMAGE_TOKEN_ID, embeds, deepstack, grids)?
+            .forward_grounded_trace_with_cancel(
+                &ids,
+                IMAGE_TOKEN_ID,
+                embeds,
+                deepstack,
+                grids,
+                cancel,
+            )?
+            .0
             .reshape(&[ids.len() as i32, -1])?;
         drop_system_prompt(&hidden, &[ids.len()], PromptKind::Edit.drop_idx())
     }

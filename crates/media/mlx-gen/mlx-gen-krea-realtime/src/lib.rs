@@ -50,6 +50,17 @@
 //! * [`causal`] — **S5** also bounds the KV cache: [`CausalKvCache`] evicts older tail K/V beyond the
 //!   sink + read window (unit-corrected to the reference's `local_attn_size × frame_seq_length` frames),
 //!   so long clips stay memory-feasible on Mac. Pure cache slicing.
+//! * [`causal`] — **sc-17807** makes the cache's *per-token cost* a knob on top of that *token count*.
+//!   The cache holds activations, so a Q4 DiT does not shrink it: a DiT token costs **800 KiB** of
+//!   bf16 KV ([`KreaRealtimeConfig::kv_bytes_per_token`]). **sc-17894** retains only the cached part
+//!   the next chunk reads: 3.57 GiB at the shipped 6-frame window, then 14.3 and 32.1 GiB at the
+//!   wider 15- and 30-frame rows. Unlike the fixed ~9 GiB of Q4 weights, that term scales with the
+//!   window. [`KreaArConfig::kv_cache_quant`] stores K/V group-wise-quantized and dequantizes the
+//!   read window per layer (there is no fused quantized SDPA to attend over packed K/V with — see
+//!   [`KvCacheQuant`]); Q8 measures **0.53×** the bf16 cache. It defaults to `None`,
+//!   and the measurement says keep it there: the sc-17807 A/B found Q8 drifting further than bf16 on
+//!   every bounded row of the S18 sweep, resolvably on row C (+2.79/255 against a 2·SEM of 0.80),
+//!   for a 0.76–0.86× peak. A trade with a measured price, not a free saving.
 //!
 //! **Attention-bias reconciliation (S5).** The block-causal mask ([`build_block_causal_mask`]) + the KV
 //! read window + the causal RoPE offset are the *complete* causal mechanism: the released reference
@@ -80,10 +91,19 @@
 //! The reference's **first-frame VAE re-anchor** (`release_server.py::get_clean_context_frames`,
 //! re-encoding the first decoded output frame as a persistent clean-context anchor) re-encodes decoded
 //! pixels *mid-generation*, so that *mechanism* is streaming-coupled and correctly out of this batch path
-//! (which decodes once at the end). But the bounded Mac window runs for every clip and the shipped 14B
-//! config sets `sink_size = 0` — so the always-attended sink prefix is empty and a long batch clip slides
-//! its window with **no** persistent anchor, a real long-range coherence risk **tracked as sc-15127
-//! (S18)** and measured on the gated real-weight run (see [`t2v::generate_t2v_from_components`]).
+//! (which decodes once at the end). The bounded Mac window runs for every clip and the shipped 14B
+//! config sets `sink_size = 0`, so a long batch clip slides its window with no persistent anchor.
+//! **sc-15127 (S18) measured that on real weights (q4, three seeds, 13 window rolls) and found a long
+//! clip *does* drift, well past the measurement's budget** — headline mode a colour-cast/tone drift
+//! (the blue–yellow opponent axis wins every row-A cell at 832×480), alongside a separately observable
+//! saturation rise. **Whether the bounded window causes it is not resolved**: an enlarged
+//! within-regime dose ladder at 13/10/5 eviction rolls fits +0.571 ±1.897/255 per roll at 640×384 and
+//! −0.278 ±1.678/255 per roll at 832×480 (mean ± the predeclared 2·SEM heuristic). Neither direction
+//! clears the heuristic. Across the full eight-roll span, effects below practical floors of 19.75/255
+//! and 15.65/255 respectively remain unresolved. So no sink anchor is wired — the sink comparison is
+//! likewise unresolved at three seeds — the `sink_size` knob stays plumbed for a checkpoint that ships
+//! one, and the drift itself is tracked as **sc-15571**.
+//! See [`t2v::generate_t2v_from_components`] for the table and the limits of the claim.
 //! **i2v/v2v conditioning** (S7) is now wired (see [`generate`] / [`t2v`] above); its real-weight
 //! watchable-clip coherence overlaps the S13 real-weight validation.
 //!
@@ -98,14 +118,36 @@ pub mod config;
 pub mod convert;
 pub mod generate;
 pub mod load;
+pub mod memory_strategy;
 pub mod pipeline;
 pub mod scheduler;
 pub mod t2v;
 
+/// The single VAE implementation used by Krea Realtime.
+pub type ProviderVae = mlx_gen_wan::WanVae;
+/// Krea Realtime's provider-facing geometry, derived from its concrete VAE assignment.
+pub const VAE_TILING: mlx_gen::tiling::VaeTiling = ProviderVae::VAE_TILING;
+
+/// Resolve Krea Realtime VAE geometry by registered generator id.
+pub fn vae_tiling(provider_id: &str) -> Option<mlx_gen::tiling::VaeTiling> {
+    (provider_id == MODEL_ID).then_some(VAE_TILING)
+}
+
+/// Resolve Krea Realtime's provider-owned conservative VAE decode working-set peak.
+pub fn conservative_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<mlx_gen::VideoDecodeMemoryProfile> {
+    vae_tiling(provider_id)?;
+    mlx_gen_wan::conservative_video_decode_memory_profile_for_vae(VAE_TILING, width, height, frames)
+}
+
 pub use causal::{
     block_causal_mask, build_block_causal_mask, CausalKreaTransformer, CausalKvCache,
 };
-pub use config::{KreaArConfig, KreaRealtimeConfig, MODEL_ID};
+pub use config::{KreaArConfig, KreaRealtimeConfig, KvCacheQuant, MODEL_ID};
 pub use convert::{
     convert_krea_realtime_tier, convert_krea_realtime_tier_sharded,
     convert_krea_realtime_tier_with_config, convert_krea_realtime_transformer, normalize_krea_keys,
@@ -121,12 +163,17 @@ pub use load::{
     load_krea_realtime_transformer_with_quant, probe_packed_quant, resolve_load_time_quant,
     resolve_snapshot_quant, verify_transformer_tensors, TensorSpec, PACKED_LINEARS_PER_BLOCK,
 };
+pub use memory_strategy::resolved_numeric_tier;
+pub use memory_strategy::{
+    canonical_artifact_identity, memory_strategy_contract, production_calibration_fingerprint,
+    production_calibration_identity, STATIC_BEHAVIOR_FINGERPRINT,
+};
 pub use pipeline::{descriptor, load as load_generator, KreaRealtime, SELF_FORCING_SAMPLER};
 pub use scheduler::{euler_x0, renoise_step, FewStepSchedule, NUM_TRAIN_TIMESTEPS};
 pub use t2v::{
-    decode_latents_to_video, generate_i2v, generate_i2v_from_components, generate_t2v,
-    generate_t2v_from_components, generate_v2v, generate_v2v_from_components, mac_ar_config,
-    KreaRealtimeJob,
+    decode_latents_to_video, decode_tiling, generate_i2v, generate_i2v_from_components,
+    generate_t2v, generate_t2v_from_components, generate_v2v, generate_v2v_from_components,
+    mac_ar_config, KreaRealtimeJob,
 };
 
 // Re-export the reused Wan config types so callers can name the DiT dimensions — and a snapshot's
@@ -138,7 +185,10 @@ pub use mlx_gen_wan::config::{WanModelConfig, WanQuant};
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(pipeline::REGISTRATION)
+    registry
+        .register_generator(pipeline::REGISTRATION)
+        .register_memory_strategy(memory_strategy::REGISTRATION)
+        .register_resident_only_memory_contract(memory_strategy::RESIDENT_ONLY_WITNESS)
 }
 
 /// Build the complete explicit MLX Krea Realtime provider catalog.
@@ -188,5 +238,35 @@ mod explicit_registry_tests {
             unknown.contains("no generator registered"),
             "got: {unknown}"
         );
+    }
+
+    #[test]
+    fn provider_id_is_bound_to_the_wan_z16_geometry() {
+        assert_eq!(super::VAE_TILING, super::ProviderVae::VAE_TILING);
+        assert_eq!(super::VAE_TILING, mlx_gen::tiling::VaeTiling::WAN);
+        assert_eq!(super::vae_tiling(super::MODEL_ID), Some(super::VAE_TILING));
+        assert_eq!(
+            super::conservative_video_decode_memory_profile(super::MODEL_ID, 64, 64, 9).map(
+                |profile| (
+                    profile.working_set_bytes(),
+                    profile.resident_decoder_bytes_included()
+                )
+            ),
+            Some((322_633_728, 0))
+        );
+        assert_eq!(super::vae_tiling("not_krea_realtime"), None);
+    }
+
+    #[test]
+    fn resident_only_memory_surface_is_explicit_and_weights_free() {
+        let registry = super::provider_registry().unwrap();
+        assert_eq!(
+            registry
+                .resident_only_memory_contract_registrations()
+                .map(|registration| registration.provider_id)
+                .collect::<Vec<_>>(),
+            [super::MODEL_ID]
+        );
+        assert!(registry.memory_contract_surfaces().unwrap().is_empty());
     }
 }

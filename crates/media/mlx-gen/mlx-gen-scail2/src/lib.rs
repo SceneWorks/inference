@@ -28,11 +28,48 @@ pub mod config;
 pub mod convert;
 pub mod generate;
 pub mod lora;
+pub mod memory_strategy;
 pub mod model;
 pub mod pipeline;
 pub mod preprocess;
 pub mod resize;
 pub mod rope;
+
+/// The single VAE implementation used by SCAIL-2.
+pub type ProviderVae = mlx_gen_wan::WanVae;
+/// SCAIL-2's provider-facing geometry, derived from its concrete VAE assignment.
+/// Whether the experimental bf16 denoiser-compute opt-in is set (`SCAIL2_COMPUTE_BF16=1`).
+///
+/// SCAIL-2 runs its DiT at `Dtype::Float32` by default: the bf16 quantized matmul overflows to NaN
+/// at this route's long sequences (sc-5681), so f32 is the validated path and bf16 is an opt-in
+/// experiment guarded per segment by the F-096 NaN check.
+///
+/// This lives on the crate root because TWO surfaces must agree about it and used not to (SC-22667):
+/// `generate` selects the compute dtype from it, and the memory contract's
+/// `MemoryArchitectureFacts::activation_dtype_width` describes that same dtype. The contract
+/// hardcoded 4 while its own comment named the hatch, so an opted-in run published a 2x
+/// over-estimate of every activation-sized term.
+pub fn compute_bf16_opt_in() -> bool {
+    std::env::var("SCAIL2_COMPUTE_BF16").is_ok_and(|value| value == "1")
+}
+
+pub const VAE_TILING: mlx_gen::tiling::VaeTiling = ProviderVae::VAE_TILING;
+
+/// Resolve SCAIL-2 VAE geometry by registered generator id.
+pub fn vae_tiling(provider_id: &str) -> Option<mlx_gen::tiling::VaeTiling> {
+    (provider_id == pipeline::MODEL_ID).then_some(VAE_TILING)
+}
+
+/// Resolve SCAIL-2's provider-owned conservative VAE decode working-set peak.
+pub fn conservative_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<mlx_gen::VideoDecodeMemoryProfile> {
+    vae_tiling(provider_id)?;
+    mlx_gen_wan::conservative_video_decode_memory_profile_for_vae(VAE_TILING, width, height, frames)
+}
 
 pub use clip::{ClipVisionConfig, ScailClip};
 pub use config::Scail2Config;
@@ -48,7 +85,10 @@ pub use rope::ScailRope;
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(pipeline::REGISTRATION)
+    registry
+        .register_generator(pipeline::REGISTRATION)
+        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_resident_only_memory_contract(memory_strategy::RESIDENT_ONLY_WITNESS)
 }
 
 /// Build the complete explicit MLX Scail2 provider catalog.
@@ -66,5 +106,26 @@ mod explicit_registry_tests {
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
         assert_eq!(explicit, ["scail2_14b"]);
+    }
+
+    #[test]
+    fn provider_id_is_bound_to_the_wan_z16_geometry() {
+        assert_eq!(super::VAE_TILING, super::ProviderVae::VAE_TILING);
+        assert_eq!(super::VAE_TILING, mlx_gen::tiling::VaeTiling::WAN);
+        assert_eq!(super::preprocess::TEMPORAL_STRIDE, 4);
+        assert_eq!(super::generate::DIM_ALIGN, 32);
+        assert_eq!(
+            super::vae_tiling(super::pipeline::MODEL_ID),
+            Some(super::VAE_TILING)
+        );
+        assert_eq!(
+            super::conservative_video_decode_memory_profile(super::pipeline::MODEL_ID, 64, 64, 9)
+                .map(|profile| (
+                    profile.working_set_bytes(),
+                    profile.resident_decoder_bytes_included()
+                )),
+            Some((322_633_728, 0))
+        );
+        assert_eq!(super::vae_tiling("not_scail2"), None);
     }
 }

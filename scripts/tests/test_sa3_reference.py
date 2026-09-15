@@ -1,9 +1,11 @@
 import hashlib
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts.reference.sa3_reference import (
     COMMON_FILES,
@@ -108,6 +110,13 @@ class StableAudio3ReferenceTests(unittest.TestCase):
         with self.assertRaisesRegex(InvalidReference, SNAPSHOTS[0].env):
             resolve_snapshots({})
 
+    def test_explicit_empty_environment_never_reads_ambient_snapshot_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            environ, _ = self.make_snapshots(Path(temporary))
+            with mock.patch.dict(os.environ, environ, clear=True):
+                with self.assertRaisesRegex(InvalidReference, SNAPSHOTS[0].env):
+                    resolve_snapshots({})
+
     def test_accepts_all_pinned_complete_snapshot_payloads(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             environ, lock = self.make_snapshots(Path(temporary))
@@ -170,7 +179,7 @@ class StableAudio3ReferenceTests(unittest.TestCase):
             source.write_text("PINNED = True\n", encoding="utf-8")
             gitignore = root / ".gitignore"
             gitignore.write_text(
-                "*.py[cod]\nignored-cache/\n.venv/\n", encoding="utf-8"
+                "*.py[cod]\nignored-cache/\n", encoding="utf-8"
             )
             subprocess.run(
                 ["git", "-C", str(root), "add", "source.py", ".gitignore"],
@@ -206,6 +215,14 @@ class StableAudio3ReferenceTests(unittest.TestCase):
             with self.assertRaisesRegex(InvalidReference, "not clean"):
                 validate_upstream_checkout(root, revision)
             untracked.unlink()
+            untracked_directory_file = root / "generated" / "nested" / "payload.bin"
+            untracked_directory_file.parent.mkdir(parents=True)
+            untracked_directory_file.write_bytes(b"rejected")
+            with self.assertRaisesRegex(InvalidReference, "generated/nested/payload.bin"):
+                validate_upstream_checkout(root, revision)
+            untracked_directory_file.unlink()
+            untracked_directory_file.parent.rmdir()
+            untracked_directory_file.parent.parent.rmdir()
             source.write_text("PINNED = False\n", encoding="utf-8")
             with self.assertRaisesRegex(InvalidReference, "not clean"):
                 validate_upstream_checkout(root, revision)

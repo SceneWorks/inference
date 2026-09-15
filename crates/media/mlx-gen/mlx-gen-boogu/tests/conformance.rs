@@ -9,7 +9,7 @@
 //! `#[ignore]` because it needs the converted Boogu turnkey snapshot; run on a populated dev box:
 //! ```sh
 //! BOOGU_TURBO_DIR=<converted turbo snapshot> \
-//!   cargo test -p mlx-gen-boogu --release --test conformance -- --ignored --nocapture
+//!   cargo test -p mlx-gen-boogu --release --test integration conformance:: -- --ignored --nocapture
 //! ```
 //!
 //! The weights-free descriptor-level sweep for all three Boogu ids runs by default in

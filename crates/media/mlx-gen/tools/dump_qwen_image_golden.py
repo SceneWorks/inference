@@ -19,6 +19,7 @@ import os
 
 import mlx.core as mx
 
+from _adapter_parity_provenance import assert_frozen_mflux, golden_metadata
 from mflux.models.common.config.config import Config
 from mflux.models.qwen.latent_creator.qwen_latent_creator import QwenLatentCreator
 from mflux.models.qwen.model.qwen_text_encoder.qwen_prompt_encoder import QwenPromptEncoder
@@ -33,8 +34,14 @@ HEIGHT = int(os.environ.get("QWEN_H", "512"))
 WIDTH = int(os.environ.get("QWEN_W", "512"))
 GUIDANCE = 4.0
 QUANTIZE = int(os.environ["QUANTIZE"]) if os.environ.get("QUANTIZE") else None
+MODEL_REPOSITORY = os.environ.get("QWEN_REFERENCE_REPOSITORY", "Qwen/Qwen-Image")
+MODEL_REVISION = os.environ.get(
+    "QWEN_REFERENCE_REVISION", "75e0b4be04f60ec59a75f475837eced720f823b6"
+)
+MODEL_PATH = os.environ.get("QWEN_REFERENCE_MODEL", "Qwen/Qwen-Image")
+assert_frozen_mflux()
 
-model = QwenImage(quantize=QUANTIZE)
+model = QwenImage(quantize=QUANTIZE, model_path=MODEL_PATH)
 config = Config(
     model_config=model.model_config,
     num_inference_steps=STEPS,
@@ -102,6 +109,13 @@ mx.save_safetensors(
         "guidance": str(GUIDANCE),
         "prompt": PROMPT,
         "quantize": str(QUANTIZE),
+        **golden_metadata(
+            script=__file__,
+            model_path=MODEL_PATH,
+            model_repository=MODEL_REPOSITORY,
+            model_revision=MODEL_REVISION,
+            model_subdirectory="bf16",
+        ),
     },
 )
 print(f"prompt_embeds={prompt_embeds.shape} neg={neg_embeds.shape} noise={noise.shape}")

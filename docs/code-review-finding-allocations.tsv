@@ -1,0 +1,7 @@
+# Append-only code-review finding allocation registry (sc-16542).
+# kind<TAB>start<TAB>end<TAB>review document
+legacy	1	78	crates/media/candle-gen/CODE_REVIEW_2026-07-01.md
+legacy	79	163	crates/media/candle-gen/CODE_REVIEW_2026-07-12.md
+legacy	1	150	crates/media/mlx-gen/CODE_REVIEW_2026-07-01.md
+legacy	1	181	crates/media/mlx-gen/CODE_REVIEW_2026-07-11.md
+review	182	273	CODE_REVIEW_2026-08-01.md

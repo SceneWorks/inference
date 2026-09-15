@@ -29,7 +29,9 @@ use std::sync::Mutex;
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::tiling::{SpatialTiling, TileCandidates, TilingConfig, VaeTiling};
+use candle_gen::gen_core::tiling::{
+    SpatialTiling, TemporalOverlapPolicy, TileCandidates, TilingConfig, VaeTiling,
+};
 use candle_gen::vae_tiling;
 use candle_gen::Result as CResult;
 
@@ -335,6 +337,17 @@ pub struct WanVae16 {
 }
 
 impl WanVae16 {
+    /// Geometry owned by the concrete causal z16 decoder.
+    ///
+    /// This deliberately differs from MLX's non-causal z16 temporal geometry while retaining the
+    /// same 96-channel full-resolution write bound.
+    pub const VAE_TILING: VaeTiling = VaeTiling {
+        spatial_scale: 8,
+        temporal_scale: 4,
+        causal_temporal: true,
+        full_res_channels: 96,
+    };
+
     /// Build a **decode-only** z16 VAE from a diffusers `vae/` snapshot (T2V — no I2V conditioning).
     pub fn new(cfg: &Vae16Config, vb: VarBuilder) -> Result<Self> {
         Self::build(cfg, vb, false)
@@ -474,8 +487,9 @@ impl WanVae16 {
     ///
     /// Shares the pure [`gen_core::tiling`](candle_gen::gen_core::tiling) geometry + the seam-free
     /// blend/stitch DRIVER ([`vae_tiling::decode_tiled`]) with the z48/LTX halves, but with the **z16**
-    /// geometry (`WAN_Z16`: ×8 spatial — not the z48's ×16 — ×4 **causal** temporal): each spatial tile
-    /// is decoded via the per-frame streaming `decode`, then trapezoidally blended into the full video.
+    /// geometry ([`Self::VAE_TILING`]: ×8 spatial — not the z48's ×16 — ×4 **causal** temporal): each
+    /// spatial tile is decoded via the per-frame streaming `decode`, then trapezoidally blended into
+    /// the full video.
     /// Because the z16 `MidAttn` is **global per-frame spatial attention**, a tile attends only within
     /// itself, so this is an *approximation* softened by the overlapping blend (seam-free ≈ PSNR ~35 dB,
     /// not bit-exact) — exactly the z48 tradeoff. Falls back to a single streaming `decode` when `cfg`
@@ -492,16 +506,16 @@ impl WanVae16 {
         cancel: &CancelFlag,
     ) -> CResult<Tensor> {
         // The tile/narrow/blend/slice-accumulate/normalize DRIVER is the shared
-        // `candle_gen::vae_tiling::decode_tiled`; what stays z16-specific is the `WAN_Z16` geometry and
-        // the per-frame-streaming `decode` closure. With a spatial-only `cfg`, `plan.t` is a single
-        // full-extent temporal tile, so each `decode` call streams the whole clip (temporal bound kept).
+        // `candle_gen::vae_tiling::decode_tiled`; what stays z16-specific is `Self::VAE_TILING` and the
+        // per-frame-streaming `decode` closure. With a spatial-only `cfg`, `plan.t` is a single full-
+        // extent temporal tile, so each `decode` call streams the whole clip (temporal bound kept).
         //
         // Each tile is decoded in the VAE's working dtype (bf16 on the A14B, sc-12818 — where the
         // per-tile im2col/conv activations, the decode's dominant transient, get the VRAM win), then
         // upcast to f32 so the shared seam-blend accumulates against its f32 trapezoidal mask (the
         // accumulator is small vs. the per-tile activations, so f32 there costs little and keeps the
         // stitch precise). A no-op cast on the f32 path.
-        vae_tiling::decode_tiled(WAN_Z16, "wan z16 vae", z, cfg, |tile| {
+        vae_tiling::decode_tiled(Self::VAE_TILING, "wan z16 vae", z, cfg, |tile| {
             Ok(self
                 .decode_with_cancel(tile, cancel)?
                 .to_dtype(DType::F32)?)
@@ -524,11 +538,33 @@ impl WanVae16 {
     }
 
     pub fn decode_budgeted_with_cancel(&self, z: &Tensor, cancel: &CancelFlag) -> CResult<Tensor> {
+        self.decode_budgeted_with_cancel_and_tile_cap(z, cancel, None)
+    }
+
+    /// Budgeted z16 decode intersected with a provider-selected maximum spatial tile edge.
+    ///
+    /// `max_tile_edge` is the request-scoped rung-2 seam used by Bernini still generation. It does
+    /// not replace the live free-VRAM plan: it can only keep or shrink that plan. This makes the
+    /// selected cap load-bearing at the final decode without weakening the existing budget and
+    /// im2col guards.
+    ///
+    /// A selected cap **always** routes through [`decode_tiled_with_cancel`](Self::decode_tiled_with_cancel),
+    /// including when the output already fits inside one tile. Engaging only above the cap made
+    /// BoundedDecode a no-op at exactly the fitting geometries it is admitted for — a 512×512 output
+    /// at `decode_tile_edge = 512` ran the untiled path while the rung reported itself engaged, so
+    /// the observed peak belonged to a policy the request never selected. This matches the LTX
+    /// precedent in `candle-gen-ltx`'s `decode_budgeted_with_spatial_cap`.
+    pub fn decode_budgeted_with_cancel_and_tile_cap(
+        &self,
+        z: &Tensor,
+        cancel: &CancelFlag,
+        max_tile_edge: Option<u32>,
+    ) -> CResult<Tensor> {
         let (_b, _c, f, h, w) = z.dims5()?;
-        let out_f = 1 + (f as i32 - 1) * WAN_Z16.temporal_scale; // causal ×4
-        let out_h = h as i32 * WAN_Z16.spatial_scale; // ×8
-        let out_w = w as i32 * WAN_Z16.spatial_scale;
-        match auto_tiling_budgeted_wan_z16(out_h, out_w, out_f)? {
+        let out_f = 1 + (f as i32 - 1) * Self::VAE_TILING.temporal_scale; // causal ×4
+        let out_h = h as i32 * Self::VAE_TILING.spatial_scale; // ×8
+        let out_w = w as i32 * Self::VAE_TILING.spatial_scale;
+        match wan_z16_decode_plan(out_h, out_w, out_f, max_tile_edge)? {
             Some(cfg) => self.decode_tiled_with_cancel(z, &cfg, cancel),
             None => self.decode_with_cancel(z, cancel),
         }
@@ -647,13 +683,6 @@ impl WanVae16 {
 /// preset and is **non-causal** (`out_f = f·4`) — the candle decode is causal, so the plan's `out_f`
 /// must match `decode`'s frame count. Kept local (not a new `gen_core` preset) to keep this the z16's
 /// own path with zero blast radius on the shared contract.
-const WAN_Z16: VaeTiling = VaeTiling {
-    spatial_scale: 8,
-    temporal_scale: 4,
-    causal_temporal: true,
-    full_res_channels: 96,
-};
-
 const GIB_F64: f64 = 1024.0 * 1024.0 * 1024.0;
 /// Env override read by the shared [`vae_tiling::free_aware_safe_budget_gib`] resolver — the SAME
 /// deterministic injection point as the z48 tiler (only one Wan VAE runs per process), per sc-12758.
@@ -685,8 +714,8 @@ const WAN_Z16_VAE_DEFAULT_BUDGET_GIB: f64 = 16.0;
 // (over-predicting) side (ratios 1.14× / 1.14× / 1.86× for single / 512 / 256) so the selector never OKs
 // a tile / single-pass that OOMs. Over-prediction also serves the "fit as small as we can go" directive
 // (it errs toward smaller tiles). Re-run the sweep after a decoder or candle-allocator change.
-const WAN_Z16_VAE_ACCUM_BYTES_PER_VOXEL: f64 = 100.0;
-const WAN_Z16_VAE_FRAME_BYTES_PER_OUT_PX: f64 = 64_000.0;
+const WAN_Z16_VAE_ACCUM_BYTES_PER_VOXEL: u64 = 100;
+const WAN_Z16_VAE_FRAME_BYTES_PER_OUT_PX: u64 = 64_000;
 
 /// Candidate spatial tile sizes (output px, multiples of the z16 ×8 scale, overlap 64). Coarser at the
 /// top (fewer tiles = faster) down to a 192 px floor (past which per-tile decoder overhead amortizes
@@ -778,8 +807,24 @@ fn estimated_wan_z16_decode_peak_gib(
 ) -> f64 {
     let out_voxels = (out_f * out_h * out_w) as f64;
     let frame_px = (tile_h * tile_w) as f64;
-    (WAN_Z16_VAE_ACCUM_BYTES_PER_VOXEL * out_voxels + WAN_Z16_VAE_FRAME_BYTES_PER_OUT_PX * frame_px)
+    (WAN_Z16_VAE_ACCUM_BYTES_PER_VOXEL as f64 * out_voxels
+        + WAN_Z16_VAE_FRAME_BYTES_PER_OUT_PX as f64 * frame_px)
         / GIB_F64
+}
+
+/// Conservative single-pass causal z16 VAE decode working-set peak in bytes.
+///
+/// This is the full-output case of the calibrated streaming cost function consumed by the actual
+/// budget planner. It excludes DiT and text-encoder composition weights.
+pub fn conservative_video_decode_peak_bytes(width: u32, height: u32, frames: u32) -> Option<u64> {
+    let frame_pixels = u64::from(width).checked_mul(u64::from(height))?;
+    let output_voxels = frame_pixels.checked_mul(u64::from(frames))?;
+    if output_voxels == 0 {
+        return None;
+    }
+    WAN_Z16_VAE_ACCUM_BYTES_PER_VOXEL
+        .checked_mul(output_voxels)?
+        .checked_add(WAN_Z16_VAE_FRAME_BYTES_PER_OUT_PX.checked_mul(frame_pixels)?)
 }
 
 /// The safe peak-GiB budget for the z16 decode tiler — **free-aware** (sc-12734/sc-12758). The decode
@@ -810,6 +855,56 @@ pub fn auto_tiling_budgeted_wan_z16(
     plan_wan_z16_tiling(height, width, out_frames, wan_z16_vae_safe_budget_gib())
 }
 
+/// The live free-VRAM plan for this output, intersected with a request-selected spatial cap.
+pub fn wan_z16_decode_plan(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+    max_tile_edge: Option<u32>,
+) -> CResult<Option<TilingConfig>> {
+    apply_decode_tile_cap(
+        auto_tiling_budgeted_wan_z16(height, width, out_frames)?,
+        max_tile_edge,
+    )
+}
+
+/// Intersect a budgeted plan with the request-scoped BoundedDecode cap.
+///
+/// The cap can only keep or shrink the budgeted tile, and once a cap is selected the result is
+/// **always** a tiled plan — even when the whole output fits inside one tile. Returning `None` for
+/// a fitting geometry would run the untiled decoder while the rung reported BoundedDecode engaged,
+/// which is the no-op this function exists to prevent; `candle-gen-ltx`'s
+/// `decode_budgeted_with_spatial_cap` takes the same position.
+fn apply_decode_tile_cap(
+    plan: Option<TilingConfig>,
+    max_tile_edge: Option<u32>,
+) -> CResult<Option<TilingConfig>> {
+    let Some(max_tile_edge) = max_tile_edge else {
+        return Ok(plan);
+    };
+    let max_tile_edge = i32::try_from(max_tile_edge).map_err(|_| {
+        candle_gen::candle_core::Error::Msg("wan z16 decode tile cap exceeds i32".into())
+    })?;
+    if !WAN_Z16_VAE_SPATIAL_PX.contains(&max_tile_edge) {
+        return Err(candle_gen::candle_core::Error::Msg(format!(
+            "wan z16 decode tile cap {max_tile_edge} is outside the production domain {:?}",
+            WAN_Z16_VAE_SPATIAL_PX
+        ))
+        .into());
+    }
+    let budget_edge = plan
+        .as_ref()
+        .and_then(|cfg| cfg.spatial.map(|spatial| spatial.tile_px));
+    let tile_px = budget_edge.map_or(max_tile_edge, |edge| edge.min(max_tile_edge));
+    Ok(Some(TilingConfig {
+        spatial: Some(SpatialTiling {
+            tile_px,
+            overlap_px: WAN_Z16_VAE_SPATIAL_OVERLAP_PX,
+        }),
+        temporal: plan.and_then(|cfg| cfg.temporal),
+    }))
+}
+
 /// Pure z16 spatial tile selector (the `safe_gib` ceiling injected so it is unit-testable without a
 /// GPU). Supplies the z16 candidate grid + cost model to the shared [`vae_tiling::plan_tiling`]; same
 /// `Ok(None)` / `Ok(Some)` / catchable-`Err` contract as the z48 half.
@@ -823,10 +918,11 @@ fn plan_wan_z16_tiling(
         spatial_px: &WAN_Z16_VAE_SPATIAL_PX,
         spatial_overlap_px: WAN_Z16_VAE_SPATIAL_OVERLAP_PX,
         temporal: &WAN_Z16_VAE_TEMPORAL_FR,
+        temporal_overlap_policy: TemporalOverlapPolicy::Candidate,
     };
     let budget_plan = vae_tiling::plan_tiling(
         "wan z16 vae decode",
-        WAN_Z16,
+        WanVae16::VAE_TILING,
         height,
         width,
         out_frames,
@@ -843,6 +939,19 @@ fn plan_wan_z16_tiling(
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+
+    #[test]
+    fn public_decode_peak_is_the_planners_full_output_case() {
+        assert_eq!(
+            conservative_video_decode_peak_bytes(64, 64, 9),
+            Some(265_830_400)
+        );
+        assert_eq!(conservative_video_decode_peak_bytes(64, 64, 0), None);
+        assert_eq!(
+            conservative_video_decode_peak_bytes(u32::MAX, u32::MAX, u32::MAX),
+            None
+        );
+    }
 
     #[test]
     fn wan_z16_tiling_single_pass_when_small() {
@@ -1030,7 +1139,7 @@ mod budget_tests {
     /// peak-VRAM anchors (RTX PRO 6000 Blackwell, sm_120, f32, real Wan2.2-T2V-A14B z16 weights) it was
     /// fit from — `estimated ≥ measured` for every anchor (never under-predict ⇒ the selector never OKs
     /// a tile / single-pass that OOMs), and not absurdly over (≤ 2.5×). Regenerate the tiled anchors with
-    /// `cargo test -p candle-gen-wan --features cuda --release --test vae16_decode_sweep -- --ignored
+    /// `cargo test -p candle-gen-wan --features cuda --release --test integration vae16_decode_sweep:: -- --ignored
     /// --nocapture` after a decoder or candle-allocator change.
     #[test]
     fn wan_z16_decode_peak_matches_cuda_anchors() {
@@ -1054,6 +1163,79 @@ mod budget_tests {
                 "over-predicts {ow}x{oh}x{of} tile {tw}x{th}: est {est:.2} > 2.5x measured {measured:.2} GiB"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod bounded_decode_plan_tests {
+    //! sc-20799: a selected BoundedDecode tile edge must reach the tiled decoder at **every**
+    //! admitted geometry, including the ones that already fit inside one tile.
+    //!
+    //! The rung was previously engaged only when the output exceeded the cap, so a 512x512 output
+    //! admitted at `decode_tile_edge = 512` ran the untiled path while the contract reported
+    //! BoundedDecode engaged — the observed peak then belonged to a policy the request never
+    //! selected. `candle-gen-ltx`'s `decode_budgeted_with_spatial_cap` always routes through
+    //! `decode_tiled`; this half now matches it.
+
+    use candle_gen::gen_core::tiling::{SpatialTiling, TemporalTiling, TilingConfig};
+
+    use super::{apply_decode_tile_cap, WAN_Z16_VAE_SPATIAL_OVERLAP_PX, WAN_Z16_VAE_SPATIAL_PX};
+
+    #[test]
+    fn a_selected_cap_always_produces_a_tiled_plan_even_when_one_tile_suffices() {
+        // `None` is the budgeted verdict "the whole output fits untiled" — exactly the fitting
+        // geometry where the rung used to become a no-op.
+        for &edge in WAN_Z16_VAE_SPATIAL_PX.iter() {
+            let plan = apply_decode_tile_cap(None, Some(edge as u32))
+                .unwrap()
+                .expect("a selected cap must never fall back to the untiled decoder");
+            let spatial = plan.spatial.expect("a capped plan is spatially tiled");
+            assert_eq!(spatial.tile_px, edge);
+            assert_eq!(spatial.overlap_px, WAN_Z16_VAE_SPATIAL_OVERLAP_PX);
+            assert!(plan.temporal.is_none());
+        }
+    }
+
+    #[test]
+    fn the_cap_can_only_shrink_the_budgeted_tile_and_preserves_the_temporal_half() {
+        let budgeted = |tile_px| {
+            Some(TilingConfig {
+                spatial: Some(SpatialTiling {
+                    tile_px,
+                    overlap_px: WAN_Z16_VAE_SPATIAL_OVERLAP_PX,
+                }),
+                temporal: Some(TemporalTiling {
+                    tile_frames: 8,
+                    overlap_frames: 2,
+                }),
+            })
+        };
+        let smallest = *WAN_Z16_VAE_SPATIAL_PX.iter().min().unwrap();
+        let largest = *WAN_Z16_VAE_SPATIAL_PX.iter().max().unwrap();
+
+        // A tighter live budget wins over a looser selected cap.
+        let plan = apply_decode_tile_cap(budgeted(smallest), Some(largest as u32))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.spatial.unwrap().tile_px, smallest);
+        assert_eq!(plan.temporal.unwrap().tile_frames, 8);
+
+        // A tighter selected cap wins over a looser live budget.
+        let plan = apply_decode_tile_cap(budgeted(largest), Some(smallest as u32))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.spatial.unwrap().tile_px, smallest);
+        assert_eq!(plan.temporal.unwrap().overlap_frames, 2);
+    }
+
+    #[test]
+    fn no_cap_preserves_the_budgeted_plan_and_an_off_domain_cap_is_refused() {
+        assert!(apply_decode_tile_cap(None, None).unwrap().is_none());
+        let off_domain = WAN_Z16_VAE_SPATIAL_PX.iter().max().unwrap() + 1;
+        let error = apply_decode_tile_cap(None, Some(off_domain as u32))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("outside the production domain"), "{error}");
     }
 }
 

@@ -42,6 +42,7 @@ pub mod convert;
 pub mod distill;
 pub mod fm;
 pub mod loader;
+pub mod memory_strategy;
 pub mod model;
 pub(crate) mod quant;
 pub mod qwen3;
@@ -61,7 +62,8 @@ pub use fm::{
 };
 pub use loader::{check_coverage, expected_keys, load_raw, Coverage};
 pub use model::{
-    descriptor, descriptor_fast, load, load_fast, SenseNova, CELL, MODEL_ID, MODEL_ID_FAST,
+    descriptor, descriptor_fast, load, load_fast, load_runtime, load_runtime_fast, SenseNova, CELL,
+    MODEL_ID, MODEL_ID_FAST,
 };
 pub use qwen3::{KvCache, Path, Qwen3Backbone};
 pub use runtime::{Sampler, ThinkRollout};
@@ -75,13 +77,40 @@ pub use text::{
 };
 pub use vision::NeoVisionEmbedder;
 
+/// sc-16209 Apple-Silicon warm sweep: SenseNova quality q8 peaked below 1.34 GiB at 1024².
+/// One- and two-step controls produced the same warm high-water mark.
+pub const QUALITY_ACTIVATION_MEMORY_REGISTRATION: mlx_gen::gen_core::ActivationMemoryRegistration =
+    mlx_gen::gen_core::ActivationMemoryRegistration {
+        provider_id: MODEL_ID,
+        anchor: mlx_gen::ActivationMemoryAnchor {
+            bytes_1024: 1_438_814_045,
+        },
+    };
+
 /// Add all MLX SenseNova providers to an explicit media registry builder.
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::QUALITY_REGISTRATION)
+        .register_memory_strategy(model::QUALITY_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: MODEL_ID,
+            contract: |spec| memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec),
+        })
+        .register_memory_behavior(model::QUALITY_MEMORY_BEHAVIOR)
+        .register_activation_memory(QUALITY_ACTIVATION_MEMORY_REGISTRATION)
         .register_generator(model::FAST_REGISTRATION)
+        .register_memory_strategy(model::FAST_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: MODEL_ID_FAST,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(MODEL_ID_FAST, spec)
+            },
+        })
+        .register_memory_behavior(model::FAST_MEMORY_BEHAVIOR)
 }
 
 /// Build the complete explicit MLX SenseNova provider catalog.

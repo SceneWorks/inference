@@ -71,10 +71,33 @@
 //!
 //! Shared audio functionality stays in [`candle_audio`]. Consumers should use
 //! [`candle_audio::dsp::resample`] for sample-rate conversion rather than adding provider-local DSP.
+//!
+//! # Audio→audio restyle (sc-14547)
+//!
+//! All six ids advertise [`gen_core::ConditioningKind::ReferenceAudio`]: pass an existing recording
+//! plus a prompt and the source is conformed to the model's 44.1 kHz stereo timeline, SAME-encoded,
+//! and mixed into the sampler's initial noise instead of starting from pure noise. Off-rate source
+//! audio is **resampled**, not rejected — the rest of this lane emits 48 kHz.
+//!
+//! `Conditioning::ReferenceAudio.strength` is **retention**-oriented on this family, matching the
+//! workspace's mflux-derived img2img convention: `1.0` returns the prepared source without a DiT
+//! forward, `0.0` is pure generation, and an omitted value resolves to
+//! [`model::DEFAULT_REFERENCE_STRENGTH`]. The sampler's own `strength` is upstream's
+//! `init_noise_level` and runs the *other* way; the single conversion between the two lives in
+//! [`model::reference_noise_level`]. Its sign is pinned by **three** mutation gates in
+//! `tests/reference_audio.rs`, one per seam the value crosses, because a correct conversion whose
+//! result never travels is the same bug by another route: the conversion itself; the field selection
+//! in [`model::reference_audio_for`], which carries the converted value into the pipeline; and
+//! [`pipeline::sampler_strength_for`], which decides the scalar the sampler is handed. Each is
+//! verified to fail under its own single-token mutation. That chain is continuous from
+//! `GenerationRequest` to the sampler `strength` argument; past that argument
+//! (`build_schedule`/`initialize_latents`) the sampler's own oracles take over. See
+//! `docs/migration/SC_14547_REFERENCE_AUDIO_RESTYLE.md`.
 
 pub use candle_audio;
 pub use candle_audio::gen_core;
 
+pub mod adapters;
 pub mod config;
 pub mod dit;
 pub mod model;
@@ -84,26 +107,37 @@ pub mod pretransform;
 pub mod same;
 pub mod sampler;
 pub mod softnorm;
+pub mod svd;
 pub mod t5gemma;
 pub mod transformer;
 pub mod weight_norm;
 pub mod weights;
 
 pub use model::{
-    descriptor, descriptor_for, load, load_generator, load_medium_base_generator,
+    audio_edit_for, descriptor, descriptor_for, load, load_generator, load_medium_base_generator,
     load_medium_generator, load_music_base_generator, load_sfx_base_generator, load_sfx_generator,
     load_variant, medium_base_descriptor, medium_base_load, medium_descriptor, medium_load,
-    music_base_descriptor, music_base_load, sfx_base_descriptor, sfx_base_load, sfx_descriptor,
-    sfx_load, StableAudio3Generator, Variant, VariantShape, HUB_REPO, HUB_REVISION,
-    MAX_DURATION_SECS, MEDIUM_BASE_HUB_REPO, MEDIUM_BASE_HUB_REVISION, MEDIUM_BASE_MODEL_ID,
-    MEDIUM_BASE_REGISTRATION, MEDIUM_HUB_REPO, MEDIUM_HUB_REVISION, MEDIUM_MAX_DURATION_SECS,
-    MEDIUM_MODEL_ID, MEDIUM_REGISTRATION, MEDIUM_SHAPE, MODEL_ID, MUSIC_BASE_HUB_REPO,
-    MUSIC_BASE_HUB_REVISION, MUSIC_BASE_MODEL_ID, MUSIC_BASE_REGISTRATION, REGISTRATION,
+    music_base_descriptor, music_base_load, reference_audio_for, reference_noise_level,
+    resolve_audio_edit, resolve_reference_audio, sfx_base_descriptor, sfx_base_load,
+    sfx_descriptor, sfx_load, synthesis_parameters, ResolvedEdit, ResolvedReference,
+    StableAudio3Generator, Variant, VariantShape, COMPONENT_LICENSES, DEFAULT_REFERENCE_STRENGTH,
+    EDIT_TIMING_TOLERANCE_SECS, HUB_REPO, HUB_REVISION, MAX_DURATION_SECS, MEDIUM_BASE_HUB_REPO,
+    MEDIUM_BASE_HUB_REVISION, MEDIUM_BASE_MODEL_ID, MEDIUM_BASE_REGISTRATION, MEDIUM_HUB_REPO,
+    MEDIUM_HUB_REVISION, MEDIUM_MAX_DURATION_SECS, MEDIUM_MODEL_ID, MEDIUM_REGISTRATION,
+    MEDIUM_SHAPE, MODEL_ID, MUSIC_BASE_HUB_REPO, MUSIC_BASE_HUB_REVISION, MUSIC_BASE_MODEL_ID,
+    MUSIC_BASE_REGISTRATION, PROVIDER_COMPONENTS, REFERENCE_STRENGTH_RANGE, REGISTRATION,
     SFX_BASE_HUB_REPO, SFX_BASE_HUB_REVISION, SFX_BASE_MODEL_ID, SFX_BASE_REGISTRATION,
     SFX_HUB_REPO, SFX_HUB_REVISION, SFX_MODEL_ID, SFX_REGISTRATION, SMALL_BASE_MAX_SAMPLE_SIZE,
-    SMALL_BASE_SHAPE, SMALL_MAX_SAMPLE_SIZE, SMALL_SHAPE, WEIGHT_LICENSES,
+    SMALL_BASE_SHAPE, SMALL_MAX_SAMPLE_SIZE, SMALL_SHAPE,
 };
-pub use pipeline::{ComputeDTypes, StableAudio3Pipeline, VariantGeometry};
+pub use pipeline::{
+    conditioning_is_forwarded, edit_geometry, edit_geometry_matches_request, edit_keep_mask,
+    edit_local_conditioning, edit_local_conditioning_is_present, edit_region_latents,
+    edit_region_samples, edit_retained_latent_count, prepare_reference_pcm, resampled_frame_count,
+    sampler_strength_for, stitch_outside_region, AudioEdit, ComputeDTypes, EditGeometry,
+    ForwardedConditioning, ReferenceAudio, ReferenceDrawOrder, StableAudio3Pipeline,
+    VariantGeometry,
+};
 
 /// Add every registered Stable Audio 3 generator to an explicit audio registry builder.
 ///

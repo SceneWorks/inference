@@ -16,6 +16,9 @@ use crate::primitives::quant::QuantizedLinear;
 pub struct QuantSpec {
     /// The target GGML block-quant dtype.
     pub dtype: GgmlDType,
+    /// Source group size when the checkpoint stores an MLX affine packed triple.
+    /// Dense load-time quantization ignores this value.
+    group_size: usize,
 }
 
 impl QuantSpec {
@@ -23,6 +26,7 @@ impl QuantSpec {
     pub fn q4() -> Self {
         Self {
             dtype: GgmlDType::Q4K,
+            group_size: 64,
         }
     }
 
@@ -30,15 +34,30 @@ impl QuantSpec {
     pub fn q8() -> Self {
         Self {
             dtype: GgmlDType::Q8_0,
+            group_size: 64,
         }
     }
 
     /// Map a persisted `quantization.bits` value to a spec: `4 → Q4_K`, `8 → Q8_0`. Any other width
     /// is unrecognized (`None`) — the snapshot writer only ever emits 4 or 8.
     pub fn from_bits(bits: u32) -> Option<Self> {
+        Self::from_bits_and_group_size(bits, 64)
+    }
+
+    /// Map a persisted affine quantization block to its bit width and source group size.
+    pub fn from_bits_and_group_size(bits: u32, group_size: usize) -> Option<Self> {
+        if group_size == 0 {
+            return None;
+        }
         match bits {
-            4 => Some(Self::q4()),
-            8 => Some(Self::q8()),
+            4 => Some(Self {
+                dtype: GgmlDType::Q4K,
+                group_size,
+            }),
+            8 => Some(Self {
+                dtype: GgmlDType::Q8_0,
+                group_size,
+            }),
             _ => None,
         }
     }
@@ -49,6 +68,11 @@ impl QuantSpec {
             GgmlDType::Q8_0 => 8,
             _ => 4,
         }
+    }
+
+    /// Group size declared by an MLX affine packed source.
+    pub fn group_size(&self) -> usize {
+        self.group_size
     }
 }
 
@@ -81,6 +105,33 @@ impl Projection {
         }
     }
 
+    /// Load a pre-quantized MLX affine Q8 triple without interpreting its shortened U32 code
+    /// matrix as a dense projection. The source is converted once to the resident Q8_0 form used by
+    /// the existing quantized forward.
+    pub fn load_mlx_affine_q8(
+        weight: &Tensor,
+        scales: &Tensor,
+        biases: &Tensor,
+        bias: Option<Tensor>,
+        quant: QuantSpec,
+        device: &candle_core::Device,
+    ) -> Result<Self> {
+        if quant.bits() != 8 {
+            return Err(crate::error::Error::Config(format!(
+                "MLX affine projection requires Q8, got Q{}",
+                quant.bits()
+            )));
+        }
+        Ok(Projection::Quantized(QuantizedLinear::from_mlx_affine_q8(
+            weight,
+            scales,
+            biases,
+            bias,
+            quant.group_size(),
+            device,
+        )?))
+    }
+
     /// `x @ weightᵀ`.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
@@ -92,5 +143,69 @@ impl Projection {
     /// Whether this projection is quantized.
     pub fn is_quantized(&self) -> bool {
         matches!(self, Projection::Quantized(_))
+    }
+}
+
+/// A layer's key **and** value projections, which may be one shared weight.
+///
+/// Gemma 4's `attention_k_eq_v` makes the `full_attention` layers reuse the key projection's output
+/// as the value projection's — there is no `v_proj` weight in the checkpoint at all. That is a
+/// projection-layer fact, not a decoder one: the value path still gets its own (scale-free) per-head
+/// norm afterwards, so K and V remain different tensors; only the matmul and the weight are shared.
+///
+/// Holding it here keeps the saving real. A decoder that "supported" `k_eq_v` by running the same
+/// weight through two projections would produce identical numbers while paying twice the matmul and
+/// twice the (quantized) weight footprint — the whole point of the flag.
+pub struct KvProjection {
+    k: Projection,
+    /// `None` means `attention_k_eq_v`: the value heads come from `k`'s output.
+    v: Option<Projection>,
+}
+
+impl KvProjection {
+    /// Independent key and value projections (every architecture before Gemma 4, and Gemma 4's
+    /// `sliding_attention` layers).
+    pub fn separate(k: Projection, v: Projection) -> Self {
+        Self { k, v: Some(v) }
+    }
+
+    /// One shared projection feeding both key and value heads (`attention_k_eq_v: true`).
+    pub fn shared(k: Projection) -> Self {
+        Self { k, v: None }
+    }
+
+    /// Whether K and V share a projection.
+    pub fn k_eq_v(&self) -> bool {
+        self.v.is_none()
+    }
+
+    /// The key projection.
+    pub fn key(&self) -> &Projection {
+        &self.k
+    }
+
+    /// The value projection, or `None` when it is shared with the key's.
+    pub fn value(&self) -> Option<&Projection> {
+        self.v.as_ref()
+    }
+
+    /// Project `x` into the **raw** key and value tensors, before any per-head norm or RoPE.
+    ///
+    /// When shared, the key projection runs **once** and both returned handles reference that one
+    /// result (Candle tensors are refcounted, so this is a handle clone, not a copy).
+    pub fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
+        let k = self.k.forward(x)?;
+        match &self.v {
+            Some(v) => {
+                let v = v.forward(x)?;
+                Ok((k, v))
+            }
+            None => Ok((k.clone(), k)),
+        }
+    }
+
+    /// Whether either half is quantized.
+    pub fn is_quantized(&self) -> bool {
+        self.k.is_quantized() || self.v.as_ref().is_some_and(Projection::is_quantized)
     }
 }

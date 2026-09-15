@@ -9,19 +9,22 @@
 use mlx_gen::weights::Weights;
 use mlx_gen_krea::transformer::block::{SingleStreamBlock, TextFusionTransformer};
 use mlx_gen_krea::transformer::rope::RopeTables;
-use mlx_gen_krea::{Krea2Config, Krea2Transformer};
+use mlx_gen_krea::Krea2Transformer;
 use mlx_rs::ops::{all_close, multiply, sqrt, subtract, sum};
 use mlx_rs::{Array, Dtype};
 
-const FIX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
+use crate::common;
 
-// Tiny config shared by the dump script (`mmdit` derives axes [8,12,12] from head_dim 32).
-const HEADS: i32 = 4;
-const KV: i32 = 2;
-const HEAD_DIM: i32 = 32;
-const HIDDEN: i32 = 128;
-const TXT_HEADS: i32 = 2;
-const EPS: f32 = 1e-5;
+use common::{
+    tiny_dit_config, SHARED_FIXTURE_DIT_AXES_DIMS_ROPE, SHARED_FIXTURE_DIT_EPS,
+    SHARED_FIXTURE_DIT_HEADS, SHARED_FIXTURE_DIT_HEAD_DIM, SHARED_FIXTURE_DIT_HIDDEN,
+    SHARED_FIXTURE_DIT_KV_HEADS, SHARED_FIXTURE_DIT_NUM_LAYERWISE_TEXT_BLOCKS,
+    SHARED_FIXTURE_DIT_NUM_REFINER_TEXT_BLOCKS, SHARED_FIXTURE_DIT_ROPE_THETA,
+    SHARED_FIXTURE_DIT_TXT_HEADS, SHARED_FIXTURE_ROPE_CAP_LEN, SHARED_FIXTURE_ROPE_GRID_H,
+    SHARED_FIXTURE_ROPE_GRID_W,
+};
+
+const FIX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
 
 fn load(name: &str) -> Weights {
     Weights::from_file(format!("{FIX}{name}")).unwrap_or_else(|e| {
@@ -52,8 +55,19 @@ fn max_abs_diff(a: &Array, b: &Array) -> f32 {
 fn rope_matches_reference() {
     let g = load("rope_golden.safetensors");
     // meta = [n_tok, ht, wt, ax0, ax1, ax2] (see the dump); theta fixed at 1000.
-    let (cap, ht, wt) = (5usize, 4usize, 4usize);
-    let (cos, sin) = RopeTables::build_t2i(cap, ht, wt, [8, 12, 12], 1000.0).joint();
+    let (cap, ht, wt) = (
+        SHARED_FIXTURE_ROPE_CAP_LEN,
+        SHARED_FIXTURE_ROPE_GRID_H,
+        SHARED_FIXTURE_ROPE_GRID_W,
+    );
+    let (cos, sin) = RopeTables::build_t2i(
+        cap,
+        ht,
+        wt,
+        SHARED_FIXTURE_DIT_AXES_DIMS_ROPE,
+        SHARED_FIXTURE_DIT_ROPE_THETA as f64,
+    )
+    .joint();
 
     let want_cos = g.require("cos").unwrap();
     let want_sin = g.require("sin").unwrap();
@@ -79,7 +93,16 @@ fn rope_matches_reference() {
 #[test]
 fn single_block_matches_reference() {
     let w = load("single_block_golden.safetensors");
-    let blk = SingleStreamBlock::from_weights(&w, "blk", HEADS, KV, HEAD_DIM, HIDDEN, EPS).unwrap();
+    let blk = SingleStreamBlock::from_weights(
+        &w,
+        "blk",
+        SHARED_FIXTURE_DIT_HEADS,
+        SHARED_FIXTURE_DIT_KV_HEADS,
+        SHARED_FIXTURE_DIT_HEAD_DIM,
+        SHARED_FIXTURE_DIT_HIDDEN,
+        SHARED_FIXTURE_DIT_EPS,
+    )
+    .unwrap();
     let y = blk
         .forward(
             w.require("in.x").unwrap(),
@@ -108,8 +131,16 @@ fn single_block_matches_reference() {
 #[test]
 fn text_fusion_matches_reference() {
     let w = load("text_fusion_golden.safetensors");
-    let tf =
-        TextFusionTransformer::from_weights(&w, 2, 2, TXT_HEADS, TXT_HEADS, HEAD_DIM, EPS).unwrap();
+    let tf = TextFusionTransformer::from_weights(
+        &w,
+        SHARED_FIXTURE_DIT_NUM_LAYERWISE_TEXT_BLOCKS,
+        SHARED_FIXTURE_DIT_NUM_REFINER_TEXT_BLOCKS,
+        SHARED_FIXTURE_DIT_TXT_HEADS,
+        SHARED_FIXTURE_DIT_TXT_HEADS,
+        SHARED_FIXTURE_DIT_HEAD_DIM,
+        SHARED_FIXTURE_DIT_EPS,
+    )
+    .unwrap();
     let y = tf.forward(w.require("in.x").unwrap()).unwrap();
     let want = w.require("out.y").unwrap();
     assert_eq!(y.shape(), want.shape());
@@ -126,30 +157,46 @@ fn text_fusion_matches_reference() {
     );
 }
 
-/// Tiny config matching `tools/dump_krea_dit_golden.py::dump_dit` (the SwiGLU inner dims are read from
-/// the weights, so `intermediate_size` is documentary).
-fn tiny_dit_config() -> Krea2Config {
-    Krea2Config {
-        in_channels: 16,
-        patch_size: 2,
-        hidden_size: 128,
-        num_attention_heads: 4,
-        num_kv_heads: 2,
-        attention_head_dim: 32,
-        num_layers: 2,
-        intermediate_size: 384,
-        norm_eps: 1e-5,
-        axes_dims_rope: [8, 12, 12],
-        rope_theta: 1000.0,
-        timestep_embed_dim: 64,
-        num_text_layers: 3,
-        num_layerwise_text_blocks: 2,
-        num_refiner_text_blocks: 2,
-        text_hidden_dim: 64,
-        text_intermediate_size: 256,
-        text_num_attention_heads: 2,
-        text_num_kv_heads: 2,
+/// **sc-20644 — the adapter's declared logical shapes are the shapes the real module tree loads.**
+///
+/// `dit_golden.safetensors` is the committed reference dump: every tensor is at the shape the
+/// reference `SingleStreamDiT` actually constructs for `tiny_dit_config()` (the same bytes
+/// `dit_matches_reference` loads and runs). Checking `logical_shape` against that header — not
+/// against a shape this test invents — is what makes the declaration trustworthy for an MXFP8
+/// unpad. `in.*` / `out.*` are the golden's forward inputs, not model weights.
+#[test]
+fn declared_logical_shapes_match_the_reference_dit_header() {
+    use mlx_gen::gen_core::LogicalKeyMapping;
+
+    let w = load("dit_golden.safetensors");
+    let cfg = tiny_dit_config();
+    let mapping = mlx_gen_krea::KreaNativeToDiffusersMapping::for_config(&cfg);
+
+    let mut checked = 0usize;
+    for key in w.keys() {
+        if key.starts_with("in.") || key.starts_with("out.") {
+            continue;
+        }
+        let want: Vec<usize> = w
+            .require(key)
+            .unwrap()
+            .shape()
+            .iter()
+            .map(|d| *d as usize)
+            .collect();
+        assert_eq!(
+            mapping.logical_shape(key),
+            Some(want),
+            "declared logical shape disagrees with the reference dump for `{key}`"
+        );
+        checked += 1;
     }
+    // The golden holds the whole module tree; a silently shrunken fixture must not pass vacuously.
+    assert_eq!(
+        checked,
+        mlx_gen_krea::convert::expected_transformer_keys(&cfg).len(),
+        "the golden must cover every transformer key"
+    );
 }
 
 /// Full `SingleStreamDiT` forward: img patch-embed, the custom timestep embedding + shared modulation,

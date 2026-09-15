@@ -2,7 +2,7 @@
 //! (`#[ignore]`): drives the PUBLIC [`Trainer`] surface (`load_trainer` → `Trainer::train`) on the real
 //! `krea/Krea-2-Raw` snapshot, a short run that must produce a **loadable PEFT adapter** — the story AC.
 //!
-//!   cargo test -p mlx-gen-krea --release --test trainer_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-krea --release --test integration trainer_real_weights:: -- --ignored --nocapture
 //!
 //! Set `KREA_RAW_DIR` to override the snapshot location (else the newest HF-cache `krea/Krea-2-Raw`).
 
@@ -49,8 +49,8 @@ fn safetensors_header(path: &std::path::Path) -> String {
 #[ignore = "needs real krea/Krea-2-Raw weights (~25 GB) + a Mac; run as its own process"]
 fn short_train_produces_loadable_adapter() {
     let root = raw_snapshot().expect("krea/Krea-2-Raw snapshot (HF cache or KREA_RAW_DIR)");
-    let tmp = std::env::temp_dir().join("krea_trainer_smoke");
-    std::fs::create_dir_all(&tmp).unwrap();
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let img_path = tmp.join("swatch.png");
     write_synth_image(&img_path);
 
@@ -61,6 +61,7 @@ fn short_train_produces_loadable_adapter() {
             image_path: img_path,
             caption: "a vivid abstract color swatch".into(),
             control_image_path: None,
+            model_options: Default::default(),
         }],
         config: TrainingConfig {
             rank: 4,
@@ -131,8 +132,8 @@ fn short_train_produces_loadable_adapter() {
 #[ignore = "needs real krea/Krea-2-Raw weights (~25 GB) + a Mac; run as its own process"]
 fn short_train_checkpointed_produces_loadable_adapter() {
     let root = raw_snapshot().expect("krea/Krea-2-Raw snapshot (HF cache or KREA_RAW_DIR)");
-    let tmp = std::env::temp_dir().join("krea_trainer_smoke_ckpt");
-    std::fs::create_dir_all(&tmp).unwrap();
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let img_path = tmp.join("swatch.png");
     write_synth_image(&img_path);
 
@@ -142,6 +143,7 @@ fn short_train_checkpointed_produces_loadable_adapter() {
             image_path: img_path,
             caption: "a vivid abstract color swatch".into(),
             control_image_path: None,
+            model_options: Default::default(),
         }],
         config: TrainingConfig {
             rank: 4,

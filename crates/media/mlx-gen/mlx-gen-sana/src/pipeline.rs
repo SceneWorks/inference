@@ -45,11 +45,15 @@
 //! `[1, H, W, 3]`; [`mlx_gen::image::decoded_to_image`] expects NCHW, so the output is transposed back
 //! to NCHW before the `clip(x·0.5 + 0.5)` → RGB8 conversion.
 
+use mlx_gen::attention::AttentionBudget;
+use mlx_gen::block_residency::BlockPlan;
+use mlx_gen::gen_core::GenerationMemory;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
+use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::{
-    run_flow_sampler, CancelFlag, Error, FlowMatchEuler, Image, Progress, Result,
-    TimestepConvention,
+    run_flow_sampler_with_latent_hook, CancelFlag, Error, FlowMatchEuler, Image, PreviewSink,
+    Progress, Result, StagedHeavy, TimestepConvention,
 };
 use mlx_rs::ops::{add, divide, multiply, subtract};
 use mlx_rs::{random, Array};
@@ -109,14 +113,89 @@ pub fn denoise_cfg(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_cfg_with_preview(
+        transformer,
+        scheduler,
+        sampler_name,
+        start_step,
+        seed,
+        latents,
+        cond,
+        cond_mask,
+        uncond,
+        uncond_mask,
+        guidance_scale,
+        cancel,
+        on_progress,
+        &PreviewSink::default(),
+    )
+}
+
+/// [`denoise_cfg`] with an optional best-effort preview of each actual outer solver step.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_cfg_with_preview(
+    transformer: &SanaTransformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    start_step: usize,
+    seed: u64,
+    latents: Array,
+    cond: &Array,
+    cond_mask: Option<&Array>,
+    uncond: Option<&Array>,
+    uncond_mask: Option<&Array>,
+    guidance_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+) -> Result<Array> {
+    denoise_cfg_with_memory(
+        transformer,
+        scheduler,
+        sampler_name,
+        start_step,
+        seed,
+        latents,
+        cond,
+        cond_mask,
+        uncond,
+        uncond_mask,
+        guidance_scale,
+        cancel,
+        on_progress,
+        preview,
+        crate::transformer::SanaForwardPlan::RESIDENT,
+    )
+}
+
+/// [`denoise_cfg_with_preview`] under an explicit memory plan (SC-15523 rungs 3 and 4).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_cfg_with_memory(
+    transformer: &SanaTransformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    start_step: usize,
+    seed: u64,
+    latents: Array,
+    cond: &Array,
+    cond_mask: Option<&Array>,
+    uncond: Option<&Array>,
+    uncond_mask: Option<&Array>,
+    guidance_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    plan: crate::transformer::SanaForwardPlan,
+) -> Result<Array> {
     let predict = |x: &Array, timestep: f32| -> Result<Array> {
         // The unified flow sampler hands `timestep = σ`; the SANA trunk embeds `σ·1000`.
         let t = Array::from_slice(&[timestep * NUM_TRAIN_TIMESTEPS], &[1]);
-        let pred_cond = transformer.forward_with_guidance(x, cond, &t, None, cond_mask)?;
+        let pred_cond =
+            transformer.forward_with_memory(x, cond, &t, None, cond_mask, plan, cancel)?;
         match uncond {
             Some(uc) if guidance_scale > 1.0 => {
                 let pred_uncond =
-                    transformer.forward_with_guidance(x, uc, &t, None, uncond_mask)?;
+                    transformer.forward_with_memory(x, uc, &t, None, uncond_mask, plan, cancel)?;
                 // pred = uncond + scale·(cond − uncond).
                 let delta = subtract(&pred_cond, &pred_uncond)?;
                 Ok(add(
@@ -130,14 +209,19 @@ pub fn denoise_cfg(
     // img2img runs the tail of the schedule (`sigmas[start_step..]`); txt2img passes `start_step = 0`
     // → the full schedule, byte-identical to the pre-img2img path. The pre-noised init latent (blended
     // at `sigmas[start_step]` by the caller) is the loop's starting point.
-    run_flow_sampler(
+    let sigmas = &scheduler.sigmas[start_step.min(scheduler.sigmas.len().saturating_sub(1))..];
+    let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
+    run_flow_sampler_with_latent_hook(
         sampler_name,
         TimestepConvention::Sigma,
-        &scheduler.sigmas[start_step.min(scheduler.sigmas.len().saturating_sub(1))..],
+        sigmas,
         latents,
         seed,
         cancel,
         on_progress,
+        |latents, sigma| {
+            crate::preview::emit_base_preview(preview, &previews, sigmas, sigma, latents);
+        },
         predict,
     )
 }
@@ -151,11 +235,217 @@ pub fn decode_to_image(
     latents: &Array,
     cancel: &CancelFlag,
 ) -> Result<Image> {
+    decode_to_image_with_tiling(decoder, cfg, latents, cancel, None)
+}
+
+fn decode_to_image_with_tiling(
+    decoder: &DcAeDecoder,
+    cfg: &DcAeConfig,
+    latents: &Array,
+    cancel: &CancelFlag,
+    tiling: Option<&TilingConfig>,
+) -> Result<Image> {
     let scale = Array::from_slice(&[cfg.scaling_factor], &[1]);
     let unscaled = divide(latents, &scale)?; // diffusers: latents / scaling_factor
-    let decoded_nhwc = decoder.decode(&unscaled, cancel)?; // [1, H, W, 3] NHWC, f32
+    let decoded_nhwc = match tiling {
+        Some(tiling) => decode_tiled(decoder, &unscaled, tiling, cancel)?,
+        None => decoder.decode(&unscaled, cancel)?,
+    }; // [1, H, W, 3] NHWC, f32
     let decoded_nchw = decoded_nhwc.transpose_axes(&[0, 3, 1, 2])?; // → NCHW for decoded_to_image
     decoded_to_image(&decoded_nchw)
+}
+
+/// Measured production DC-AE tile domain. All edges use one fixed 48-pixel overlap; edges below
+/// 192 reached the same 3294-MiB request floor while degrading output and remain a rejection set.
+///
+/// The overlap is quantized by the 32x DC-AE scale — the shared tiling plan computes
+/// `overlap_px / 32` **latent cells**, so 48 px is ONE blended latent cell and anything below
+/// 32 px is no blend at all. Both ends of that lever are measured (sc-17863, `sana_1600m` q4 at
+/// 1024², tiled vs whole-image decode): dropping the blend (24 px = 0 cells) produces visible
+/// blocky patches and meanD 6.31..6.43 — past the declared 6.0 ceiling — while widening it to
+/// 96 px (3 cells) cuts meanD to 3.04..3.28 at a request peak IDENTICAL to four decimals
+/// (3.2172 GiB; overlap adds tiles, not bigger tiles) but costs +1..4 s of decode wall per
+/// render, which Sprint's 2-step schedule cannot absorb. 48 px is the adjudicated shipping
+/// point: no visible artifact at 1:1, the memory floor intact, and the sweep table at
+/// `DECODE_TILING_MEAN_ABS_U8` (tests/memory_ladder_real_weights.rs) records the measured menu
+/// for any future quality-first move.
+///
+/// **sc-19753 — that sweep measured a superseded mechanism.** Every row above was captured while
+/// `decode_tiled` tiled the *whole* decoder, so each tile's nine `EfficientVit` blocks aggregated
+/// their ReLU-linear attention over that tile's tokens instead of the image. That is why widening
+/// the overlap to 96 px only floored at meanD ~3.0 instead of converging: overlap width cannot fix
+/// a per-tile global reduction. The attention now runs once in the dense head and only the
+/// attention-free tail tiles, so the residual these numbers describe is expected to be
+/// substantially smaller. **The recorded values are accepted ceilings, not targets** — they are
+/// left untouched here (a better result still passes) and re-capturing them is a measurement
+/// campaign, not part of this fix.
+pub const DECODE_TILE_EDGE: i32 = 192;
+pub const DECODE_OVERLAP: i32 = 48;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeTilingSource {
+    EnvOverride,
+    Request,
+    SequentialDefault,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodeTilingPlan {
+    pub edge: i32,
+    pub overlap: i32,
+    pub source: DecodeTilingSource,
+}
+
+/// Resolve the actual DC-AE geometry with total precedence: request-scoped shared-contract signal,
+/// admitted measurement override, then the Sequential shipping default. The calibration harness
+/// cannot supersede an admitted request or run unpublished geometry. Resident stays whole-image
+/// unless the caller explicitly selects bounded decode.
+pub fn resolved_decode_plan(
+    memory: Option<GenerationMemory>,
+    is_sequential: bool,
+) -> Option<DecodeTilingPlan> {
+    if let Some(memory) = memory {
+        if !memory.tile_vae_decode {
+            return None;
+        }
+        return Some(DecodeTilingPlan {
+            edge: memory
+                .decode_tile_edge
+                .map_or(DECODE_TILE_EDGE, |edge| edge as i32),
+            overlap: memory
+                .decode_overlap
+                .map_or(DECODE_OVERLAP, |overlap| overlap as i32),
+            source: DecodeTilingSource::Request,
+        });
+    }
+    if let Some(edge) = std::env::var("MLX_GEN_SANA_DECODE_TILE")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+    {
+        if edge == 0 {
+            return None;
+        }
+        if edge > 0 && crate::memory_strategy::DECODE_TILE_EDGES.contains(&(edge as u32)) {
+            return Some(DecodeTilingPlan {
+                edge,
+                overlap: DECODE_OVERLAP,
+                source: DecodeTilingSource::EnvOverride,
+            });
+        }
+    }
+    is_sequential.then_some(DecodeTilingPlan {
+        edge: DECODE_TILE_EDGE,
+        overlap: DECODE_OVERLAP,
+        source: DecodeTilingSource::SequentialDefault,
+    })
+}
+
+pub fn resolve_decode_tiling(
+    memory: Option<GenerationMemory>,
+    is_sequential: bool,
+) -> Option<TilingConfig> {
+    resolved_decode_plan(memory, is_sequential)
+        .map(|plan| TilingConfig::spatial_only(plan.edge, plan.overlap))
+}
+
+/// Resolve the two **denoise-phase** constrained rungs from the request-scoped shared-contract
+/// signal (SC-15523). Rung 2 has its own resolver above; this is rungs 3 and 4.
+///
+/// Nothing is selected by default: a request that sets neither flag gets
+/// [`SanaForwardPlan::RESIDENT`], which is byte-for-byte the pre-SC-15523 trunk forward. `n_blocks`
+/// comes from the loaded trunk rather than from the config constant, so a plan can never describe a
+/// different stack than the one that will run it.
+///
+/// Parameter *values* are validated against the published domain before this runs — see
+/// [`crate::memory_strategy::validate_request_memory`], which the production `generate` path calls
+/// and which refuses an out-of-domain selection rather than silently executing an unmeasured one.
+pub(crate) fn resolved_rung_plan(
+    memory: Option<GenerationMemory>,
+    n_blocks: usize,
+) -> Result<crate::transformer::SanaForwardPlan> {
+    let Some(memory) = memory else {
+        return Ok(crate::transformer::SanaForwardPlan::RESIDENT);
+    };
+    let attention = if memory.chunk_attention {
+        AttentionBudget::from_score_elements(
+            u64::from(
+                memory
+                    .attention_chunk_size
+                    .unwrap_or(crate::memory_strategy::ATTENTION_CHUNK_SIZE),
+            ),
+            // The per-chunk graph cut is where MLX's saving comes from; a lazily-chunked budget
+            // measured as no better than unbounded on the sibling families (SC-15615).
+            true,
+        )
+    } else {
+        AttentionBudget::UNBOUNDED
+    };
+    let window = memory
+        .stream_transformer_blocks
+        .then(|| {
+            BlockPlan::new(
+                n_blocks,
+                memory
+                    .transformer_window_size
+                    .unwrap_or(crate::memory_strategy::TRANSFORMER_WINDOW_SIZE)
+                    as usize,
+            )
+        })
+        .transpose()?;
+    Ok(crate::transformer::SanaForwardPlan { attention, window })
+}
+
+/// Decode one NCHW DC-AE latent through the shared 5-D tiled-VAE seam. SANA's decoder emits NHWC,
+/// so a dummy temporal axis keeps the head-feature and decoded tile spatial axes aligned.
+///
+/// **Normalization semantics (sc-19753).** Only the decoder's shallow, attention-free
+/// [`DcAeDecoder::decode_tail`] is tiled. The deep `EfficientVit` stages run once on the whole
+/// latent via [`DcAeDecoder::decode_head`], because their ReLU-linear attention contracts over
+/// **every** `H·W` token — evaluating one on a crop aggregates over that crop instead of the image,
+/// the same defect class as a per-tile GroupNorm. This route previously tiled the *entire* decoder,
+/// putting nine such attention blocks inside the per-tile closure.
+///
+/// The tile plan is therefore keyed on the **tail's** ×8 upsample rather than the whole decoder's
+/// ×32: the tiles now partition the head feature map, which is already ×4 the latent.
+///
+/// The candle sibling (`candle_gen_sana::DcAeDecoder::decode_with`) has had this split since
+/// sc-11804; the MLX lane is the one that had not been converted.
+fn decode_tiled(
+    decoder: &DcAeDecoder,
+    latent: &Array,
+    tiling: &TilingConfig,
+    cancel: &CancelFlag,
+) -> Result<Array> {
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    // A config with no attention-free shallow run has no tileable tail at all.
+    if decoder.num_tail_stages() == 0 {
+        return decoder.decode(latent, cancel);
+    }
+    let head = decoder.decode_head(latent)?; // NHWC, at the tail's input resolution
+    let shape = head.shape();
+    let (height, width, channels) = (shape[1], shape[2], shape[3]);
+    let vae = VaeTiling {
+        spatial_scale: decoder.tail_scale(),
+        temporal_scale: 1,
+        causal_temporal: false,
+        full_res_channels: 3,
+    };
+    if !tiling.needs_tiling(vae, 1, height, width) {
+        return decoder.decode_tail(&head);
+    }
+    let plan = tiling.plan(vae, 1, height, width);
+    let lifted = head.reshape(&[1, 1, height, width, channels])?;
+    let out = mlx_gen::vae_tiling::tiled_decode(&lifted, &plan, [1, 2, 3], Some(cancel), |tile| {
+        let shape = tile.shape();
+        let tile = tile.reshape(&[1, shape[2], shape[3], shape[4]])?;
+        let decoded = decoder.decode_tail(&tile)?;
+        let shape = decoded.shape();
+        Ok(decoded.reshape(&[1, 1, shape[1], shape[2], shape[3]])?)
+    })?;
+    let shape = out.shape();
+    Ok(out.reshape(&[1, shape[2], shape[3], shape[4]])?)
 }
 
 // =================================================================================================
@@ -200,9 +490,39 @@ pub fn denoise_sprint(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_sprint_with_preview(
+        transformer,
+        scheduler,
+        seed,
+        latents,
+        cond,
+        cond_mask,
+        guidance_scale,
+        guidance_embeds_scale,
+        cancel,
+        on_progress,
+        &PreviewSink::default(),
+    )
+}
+
+/// [`denoise_sprint`] with an optional best-effort preview of each SCM step.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_sprint_with_preview(
+    transformer: &SanaTransformer,
+    scheduler: &ScmScheduler,
+    seed: u64,
+    latents: Array,
+    cond: &Array,
+    cond_mask: Option<&Array>,
+    guidance_scale: f32,
+    guidance_embeds_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+) -> Result<Array> {
     // txt2img: seed the SCM prior (`latents * sigma_data`) and run the whole angle schedule (start 0).
     let latents = multiply(&latents, arr1(scheduler.sigma_data))?;
-    denoise_sprint_from(
+    denoise_sprint_from_with_preview(
         transformer,
         scheduler,
         0,
@@ -214,6 +534,7 @@ pub fn denoise_sprint(
         guidance_embeds_scale,
         cancel,
         on_progress,
+        preview,
     )
 }
 
@@ -236,6 +557,72 @@ pub fn denoise_sprint_from(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_sprint_from_with_preview(
+        transformer,
+        scheduler,
+        start_step,
+        seed,
+        latents,
+        cond,
+        cond_mask,
+        guidance_scale,
+        guidance_embeds_scale,
+        cancel,
+        on_progress,
+        &PreviewSink::default(),
+    )
+}
+
+/// [`denoise_sprint_from`] with an optional best-effort preview of each SCM step.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_sprint_from_with_preview(
+    transformer: &SanaTransformer,
+    scheduler: &ScmScheduler,
+    start_step: usize,
+    seed: u64,
+    latents: Array,
+    cond: &Array,
+    cond_mask: Option<&Array>,
+    guidance_scale: f32,
+    guidance_embeds_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+) -> Result<Array> {
+    denoise_sprint_from_with_memory(
+        transformer,
+        scheduler,
+        start_step,
+        seed,
+        latents,
+        cond,
+        cond_mask,
+        guidance_scale,
+        guidance_embeds_scale,
+        cancel,
+        on_progress,
+        preview,
+        crate::transformer::SanaForwardPlan::RESIDENT,
+    )
+}
+
+/// [`denoise_sprint_from_with_preview`] under an explicit memory plan (SC-15523 rungs 3 and 4).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_sprint_from_with_memory(
+    transformer: &SanaTransformer,
+    scheduler: &ScmScheduler,
+    start_step: usize,
+    seed: u64,
+    latents: Array,
+    cond: &Array,
+    cond_mask: Option<&Array>,
+    guidance_scale: f32,
+    guidance_embeds_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    plan: crate::transformer::SanaForwardPlan,
+) -> Result<Array> {
     use mlx_rs::transforms::eval;
 
     let sd = scheduler.sigma_data;
@@ -248,6 +635,8 @@ pub fn denoise_sprint_from(
     let n = scheduler.num_steps();
     let start = start_step.min(n);
     let total = (n - start).max(1) as u32;
+    let preview_schedule = &scheduler.timesteps[start..];
+    let previews = mlx_gen::preview::PreviewCounter::new(preview_schedule);
     let mut denoised = latents.clone();
     // Per-step renoise key — a distinct subkey per step so the between-step noise is decorrelated and
     // deterministic for a given request seed (mirrors the unified sampler's `StepRng` derivation).
@@ -269,6 +658,14 @@ pub fn denoise_sprint_from(
         });
 
         let s = scheduler.timesteps[i];
+        crate::preview::emit_sprint_preview(
+            preview,
+            &previews,
+            preview_schedule,
+            s,
+            &latents,
+            1.0 / sd,
+        );
         let t_next = scheduler.timesteps[i + 1];
         let scm_t = scheduler.scm_timestep(i);
         let in_scale = scheduler.input_scale(i);
@@ -276,12 +673,14 @@ pub fn denoise_sprint_from(
         // model input = (latents / sigma_data) * sqrt(scm_t² + (1-scm_t)²).
         let lat_in = multiply(&divide(&latents, arr1(sd))?, arr1(in_scale))?;
         let scm_t_arr = arr1(scm_t);
-        let raw = transformer.forward_with_guidance(
+        let raw = transformer.forward_with_memory(
             &lat_in,
             cond,
             &scm_t_arr,
             Some(&guidance),
             cond_mask,
+            plan,
+            cancel,
         )?;
 
         // diffusers trigflow recombination of the raw output (uses `latent_model_input` = the SCALED
@@ -382,7 +781,7 @@ pub struct SanaHeavy {
     transformer: SanaTransformer,
     /// DC-AE **encoder** — the img2img reference→latent path (sc-10190). Loaded from the SAME
     /// `vae/` snapshot as the decoder (the checkpoint ships both `encoder.*` and `decoder.*` keys).
-    encoder: DcAeEncoder,
+    encoder: Option<DcAeEncoder>,
     decoder: DcAeDecoder,
     dc_ae_cfg: DcAeConfig,
     sprint: bool,
@@ -476,7 +875,22 @@ impl SanaHeavy {
     ) -> Self {
         Self {
             transformer,
-            encoder,
+            encoder: Some(encoder),
+            decoder,
+            dc_ae_cfg,
+            sprint: false,
+            guidance_embeds_scale: 0.0,
+        }
+    }
+
+    pub fn new_text_to_image(
+        transformer: SanaTransformer,
+        decoder: DcAeDecoder,
+        dc_ae_cfg: DcAeConfig,
+    ) -> Self {
+        Self {
+            transformer,
+            encoder: None,
             decoder,
             dc_ae_cfg,
             sprint: false,
@@ -498,7 +912,23 @@ impl SanaHeavy {
     ) -> Self {
         Self {
             transformer,
-            encoder,
+            encoder: Some(encoder),
+            decoder,
+            dc_ae_cfg,
+            sprint: true,
+            guidance_embeds_scale,
+        }
+    }
+
+    pub fn new_sprint_text_to_image(
+        transformer: SanaTransformer,
+        decoder: DcAeDecoder,
+        dc_ae_cfg: DcAeConfig,
+        guidance_embeds_scale: f32,
+    ) -> Self {
+        Self {
+            transformer,
+            encoder: None,
             decoder,
             dc_ae_cfg,
             sprint: true,
@@ -522,6 +952,43 @@ impl SanaHeavy {
         }
     }
 
+    /// Encode the request's seed-independent img2img reference once. The returned denoise-space
+    /// latent is reusable for every seed in a `count` batch; `None` is the exact txt2img / explicit
+    /// zero-strength path. Both base flow-match and Sprint SCM use this same preparation boundary.
+    pub(crate) fn prepare_reference(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        cancel: &CancelFlag,
+    ) -> Result<Option<Array>> {
+        let steps = req.steps.unwrap_or(if self.sprint {
+            SPRINT_DEFAULT_STEPS
+        } else {
+            DEFAULT_STEPS
+        });
+        let start_step = match req.init_image {
+            Some(_) => init_time_step(steps, req.strength),
+            None => 0,
+        };
+        if start_step == 0 {
+            return Ok(None);
+        }
+
+        let image = req.init_image.ok_or_else(|| {
+            Error::Msg("SANA positive img2img start requires an init image".into())
+        })?;
+        let encoder = self.encoder.as_ref().ok_or_else(|| {
+            Error::Msg("SANA text-to-image bundle cannot encode an init image".into())
+        })?;
+        Ok(Some(encode_init_latents(
+            encoder,
+            &self.dc_ae_cfg,
+            image,
+            req.width,
+            req.height,
+            cancel,
+        )?))
+    }
+
     /// Render ONE image from pre-encoded [`SanaConditioning`] + a per-image request. `guidance` is the
     /// already-resolved guidance scale (the caller resolved it against [`Self::default_guidance`] so the
     /// encode's uncond decision and this render agree). Branches on `sprint`. Byte-identical to the tail
@@ -535,22 +1002,143 @@ impl SanaHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        if self.sprint {
-            self.render_sprint(cond, req, guidance, cancel, on_progress)
-        } else {
-            self.render_cfg(cond, req, guidance, cancel, on_progress)
-        }
+        self.render_one_with_preview(
+            cond,
+            req,
+            guidance,
+            cancel,
+            on_progress,
+            &PreviewSink::default(),
+        )
     }
 
-    /// The base SANA-1.6B true-CFG flow-match render for one image (the pre-seam `generate_with` tail).
-    fn render_cfg(
+    /// [`Self::render_one`] with an optional best-effort native-latent preview sink.
+    pub fn render_one_with_preview(
         &self,
         cond: &SanaConditioning,
         req: &SanaGenerateRequest<'_>,
         guidance: f32,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewSink,
     ) -> Result<Image> {
+        self.render_one_with_preview_and_tiling(
+            cond,
+            req,
+            guidance,
+            cancel,
+            on_progress,
+            preview,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_one_with_preview_and_tiling(
+        &self,
+        cond: &SanaConditioning,
+        req: &SanaGenerateRequest<'_>,
+        guidance: f32,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewSink,
+        tiling: Option<&TilingConfig>,
+    ) -> Result<Image> {
+        let latents = self.denoise_one_with_preview(
+            cond,
+            req,
+            guidance,
+            cancel,
+            on_progress,
+            preview,
+            crate::transformer::SanaForwardPlan::RESIDENT,
+        )?;
+        mlx_rs::transforms::eval([&latents])?;
+        on_progress(Progress::Decoding);
+        self.decode_view().decode_one(&latents, cancel, tiling)
+    }
+
+    /// The trunk's block count — the rung-4 plan's `n_blocks`, read from the loaded trunk rather
+    /// than from a config constant.
+    pub(crate) fn transformer_blocks(&self) -> usize {
+        self.transformer.n_blocks()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn denoise_one_with_preview(
+        &self,
+        cond: &SanaConditioning,
+        req: &SanaGenerateRequest<'_>,
+        guidance: f32,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewSink,
+        plan: crate::transformer::SanaForwardPlan,
+    ) -> Result<Array> {
+        let prepared_reference = self.prepare_reference(req, cancel)?;
+        self.denoise_one_with_prepared_reference(
+            cond,
+            req,
+            guidance,
+            prepared_reference.as_ref(),
+            cancel,
+            on_progress,
+            preview,
+            plan,
+        )
+    }
+
+    /// Seed-dependent denoise tail over a reference latent prepared once at request scope.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn denoise_one_with_prepared_reference(
+        &self,
+        cond: &SanaConditioning,
+        req: &SanaGenerateRequest<'_>,
+        guidance: f32,
+        prepared_reference: Option<&Array>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewSink,
+        plan: crate::transformer::SanaForwardPlan,
+    ) -> Result<Array> {
+        if self.sprint {
+            self.denoise_sprint(
+                cond,
+                req,
+                guidance,
+                prepared_reference,
+                cancel,
+                on_progress,
+                preview,
+                plan,
+            )
+        } else {
+            self.denoise_cfg(
+                cond,
+                req,
+                guidance,
+                prepared_reference,
+                cancel,
+                on_progress,
+                preview,
+                plan,
+            )
+        }
+    }
+
+    /// The base SANA-1.6B true-CFG flow-match denoise for one image.
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_cfg(
+        &self,
+        cond: &SanaConditioning,
+        req: &SanaGenerateRequest<'_>,
+        guidance: f32,
+        prepared_reference: Option<&Array>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewSink,
+        plan: crate::transformer::SanaForwardPlan,
+    ) -> Result<Array> {
         let steps = req.steps.unwrap_or(DEFAULT_STEPS);
         let seed = req.seed.unwrap_or(0);
 
@@ -571,40 +1159,25 @@ impl SanaHeavy {
             Some(_) => init_time_step(steps, req.strength),
             None => 0,
         };
-        let clean = if start_step > 0 {
-            let image = req
-                .init_image
-                .expect("start_step > 0 implies an init image");
-            Some(encode_init_latents(
-                &self.encoder,
-                &self.dc_ae_cfg,
-                image,
-                req.width,
-                req.height,
-                cancel,
-            )?)
-        } else {
-            None
-        };
-
         let noise = create_noise(seed, req.width, req.height)?;
-        let latents = match &clean {
-            // Blend the pre-encoded clean latents with the noise at `sigma = sigmas[start_step]`.
-            Some(clean) => {
-                let sigma = *scheduler.sigmas.get(start_step).ok_or_else(|| {
-                    Error::Msg(format!(
-                        "sana img2img: start step {start_step} out of range for {}-element schedule",
-                        scheduler.sigmas.len()
-                    ))
-                })?;
-                add_noise_by_interpolation(clean, &noise, sigma)?
-            }
-            None => noise,
+        let latents = if start_step > 0 {
+            let clean = prepared_reference.ok_or_else(|| {
+                Error::Msg("SANA img2img denoise requires a prepared reference latent".into())
+            })?;
+            let sigma = *scheduler.sigmas.get(start_step).ok_or_else(|| {
+                Error::Msg(format!(
+                    "sana img2img: start step {start_step} out of range for {}-element schedule",
+                    scheduler.sigmas.len()
+                ))
+            })?;
+            add_noise_by_interpolation(clean, &noise, sigma)?
+        } else {
+            noise
         };
         // The uncond twin is present only for base SANA with CFG active (`encode_conditioning`).
         let uncond = cond.uncond.as_ref().map(|(u, _)| u);
         let uncond_mask = cond.uncond.as_ref().map(|(_, um)| um);
-        let latents = denoise_cfg(
+        let latents = denoise_cfg_with_memory(
             &self.transformer,
             &scheduler,
             req.sampler,
@@ -618,9 +1191,10 @@ impl SanaHeavy {
             guidance,
             cancel,
             on_progress,
+            preview,
+            plan,
         )?;
-        on_progress(Progress::Decoding);
-        decode_to_image(&self.decoder, &self.dc_ae_cfg, &latents, cancel)
+        Ok(latents)
     }
 
     /// The **SANA-Sprint** (CFG-free SCM/TrigFlow few-step) render for one image (the pre-seam
@@ -632,14 +1206,18 @@ impl SanaHeavy {
     /// DC-AE-encoded init to that angle: `x_t = cos(t)·x0 + sin(t)·noise·σ_data` with `x0 =
     /// encode·scaling_factor·σ_data` and `t = timesteps[start]`. Distilled/consistency, so the strength
     /// window is narrow — validate the band on-device. `start = 0` is the byte-identical txt2img path.
-    fn render_sprint(
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_sprint(
         &self,
         cond: &SanaConditioning,
         req: &SanaGenerateRequest<'_>,
         guidance: f32,
+        prepared_reference: Option<&Array>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Image> {
+        preview: &PreviewSink,
+        plan: crate::transformer::SanaForwardPlan,
+    ) -> Result<Array> {
         let steps = req.steps.unwrap_or(SPRINT_DEFAULT_STEPS);
         let seed = req.seed.unwrap_or(0);
 
@@ -654,19 +1232,13 @@ impl SanaHeavy {
         let noise = create_noise(seed, req.width, req.height)?;
         let latents = if start_step > 0 {
             // img2img: renoise the encoded init to the start angle `timesteps[start_step]`.
-            let image = req
-                .init_image
-                .expect("start_step > 0 implies an init image");
-            let clean = encode_init_latents(
-                &self.encoder,
-                &self.dc_ae_cfg,
-                image,
-                req.width,
-                req.height,
-                cancel,
-            )?;
+            let clean = prepared_reference.ok_or_else(|| {
+                Error::Msg(
+                    "SANA-Sprint img2img denoise requires a prepared reference latent".into(),
+                )
+            })?;
             // x0 in the SCM prior space (σ_data-scaled); noise likewise. TrigFlow renoise to angle t.
-            let x0 = multiply(&clean, arr1(sd))?;
+            let x0 = multiply(clean, arr1(sd))?;
             let noise_sd = multiply(&noise, arr1(sd))?;
             let t = scheduler.timesteps[start_step];
             add(
@@ -677,7 +1249,7 @@ impl SanaHeavy {
             // txt2img: the SCM prior is `noise · σ_data`.
             multiply(&noise, arr1(sd))?
         };
-        let latents = denoise_sprint_from(
+        let latents = denoise_sprint_from_with_memory(
             &self.transformer,
             &scheduler,
             start_step,
@@ -689,9 +1261,57 @@ impl SanaHeavy {
             self.guidance_embeds_scale,
             cancel,
             on_progress,
+            preview,
+            plan,
         )?;
-        on_progress(Progress::Decoding);
-        decode_to_image(&self.decoder, &self.dc_ae_cfg, &latents, cancel)
+        Ok(latents)
+    }
+}
+
+pub struct SanaLight {
+    decoder: DcAeDecoder,
+    dc_ae_cfg: DcAeConfig,
+}
+
+pub struct SanaDecodeView<'a> {
+    decoder: &'a DcAeDecoder,
+    dc_ae_cfg: &'a DcAeConfig,
+}
+
+impl SanaDecodeView<'_> {
+    pub fn decode_one(
+        &self,
+        latents: &Array,
+        cancel: &CancelFlag,
+        tiling: Option<&TilingConfig>,
+    ) -> Result<Image> {
+        decode_to_image_with_tiling(self.decoder, self.dc_ae_cfg, latents, cancel, tiling)
+    }
+}
+
+impl mlx_gen::StagedHeavy for SanaHeavy {
+    type Light = SanaLight;
+    type DecodeView<'a> = SanaDecodeView<'a>;
+
+    fn shed_dit(self) -> SanaLight {
+        SanaLight {
+            decoder: self.decoder,
+            dc_ae_cfg: self.dc_ae_cfg,
+        }
+    }
+
+    fn decode_view(&self) -> SanaDecodeView<'_> {
+        SanaDecodeView {
+            decoder: &self.decoder,
+            dc_ae_cfg: &self.dc_ae_cfg,
+        }
+    }
+
+    fn light_view(light: &SanaLight) -> SanaDecodeView<'_> {
+        SanaDecodeView {
+            decoder: &light.decoder,
+            dc_ae_cfg: &light.dc_ae_cfg,
+        }
     }
 }
 
@@ -789,6 +1409,330 @@ impl SanaPipeline {
 mod tests {
     use super::*;
     use mlx_rs::transforms::eval;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    fn braced_item<'a>(source: &'a str, marker: &str) -> &'a str {
+        let start = source
+            .find(marker)
+            .unwrap_or_else(|| panic!("missing production item {marker}"));
+        let open = source[start..]
+            .find('{')
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| panic!("production item {marker} has no body"));
+        let mut depth = 0usize;
+        for (offset, byte) in source[open..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[start..open + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("production item {marker} has unbalanced braces")
+    }
+
+    fn replace_in_item(source: &str, marker: &str, from: &str, to: &str) -> String {
+        let start = source.find(marker).unwrap();
+        let item = braced_item(source, marker);
+        let replaced = item.replacen(from, to, 1);
+        assert_ne!(item, replaced, "mutation target must exist in {marker}");
+        format!(
+            "{}{}{}",
+            &source[..start],
+            replaced,
+            &source[start + item.len()..]
+        )
+    }
+
+    fn call_arguments(source: &str, marker: &str) -> Vec<String> {
+        call_arguments_nth(source, marker, 0)
+    }
+
+    fn call_arguments_nth(source: &str, marker: &str, nth: usize) -> Vec<String> {
+        let start = source
+            .match_indices(marker)
+            .nth(nth)
+            .map(|(offset, _)| offset)
+            .map(|offset| offset + marker.len())
+            .unwrap_or_else(|| panic!("missing production call {marker} occurrence {nth}"));
+        let mut depth = 0usize;
+        let mut current = String::new();
+        let mut arguments = Vec::new();
+        for ch in source[start..].chars() {
+            match ch {
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                ')' if depth == 0 => {
+                    if !current.trim().is_empty() {
+                        arguments.push(current.trim().to_owned());
+                    }
+                    return arguments;
+                }
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    current.push(ch);
+                }
+                ',' if depth == 0 => {
+                    arguments.push(current.trim().to_owned());
+                    current.clear();
+                }
+                _ => current.push(ch),
+            }
+        }
+        panic!("production call {marker} has no closing parenthesis")
+    }
+
+    fn compact(item: &str) -> String {
+        item.split_whitespace().collect()
+    }
+
+    fn check_registered_mask_routes(source: &str) -> Result<()> {
+        let encode = braced_item(source, "pub fn encode_conditioning(");
+        if encode
+            .matches("text_encoder.encode_with_mask(prompt)?")
+            .count()
+            != 1
+            || encode
+                .matches("text_encoder.encode_with_mask(negative_prompt.unwrap_or(\"\"))?")
+                .count()
+                != 1
+        {
+            return Err(Error::Msg(
+                "SANA conditioning must obtain positive and CFG-negative masks beside their selected embeddings"
+                    .into(),
+            ));
+        }
+
+        let base = braced_item(source, "    fn denoise_cfg(\n        &self,");
+        let base_args = call_arguments(base, "denoise_cfg_with_memory(");
+        if base_args.len() != 15
+            || base_args[6] != "&cond.cond"
+            || base_args[7] != "Some(&cond.cond_mask)"
+            || base_args[8] != "uncond"
+            || base_args[9] != "uncond_mask"
+        {
+            return Err(Error::Msg(
+                "Base CFG-on/off must route each selected embedding with its own gathered mask"
+                    .into(),
+            ));
+        }
+
+        let sprint = braced_item(source, "    fn denoise_sprint(\n        &self,");
+        let sprint_args = call_arguments(sprint, "denoise_sprint_from_with_memory(");
+        if sprint_args.len() != 13
+            || sprint_args[5] != "&cond.cond"
+            || sprint_args[6] != "Some(&cond.cond_mask)"
+        {
+            return Err(Error::Msg(
+                "Sprint must route the selected positive embedding with its gathered mask".into(),
+            ));
+        }
+
+        let base_impl = braced_item(source, "pub(crate) fn denoise_cfg_with_memory(");
+        let cond_call = call_arguments_nth(base_impl, "transformer.forward_with_memory(", 0);
+        let uncond_call = call_arguments_nth(base_impl, "transformer.forward_with_memory(", 1);
+        if cond_call.len() != 7
+            || cond_call[1] != "cond"
+            || cond_call[4] != "cond_mask"
+            || uncond_call.len() != 7
+            || uncond_call[1] != "uc"
+            || uncond_call[4] != "uncond_mask"
+        {
+            return Err(Error::Msg(
+                "Base's actual cond/uncond transformer calls must receive their matching masks"
+                    .into(),
+            ));
+        }
+
+        let sprint_impl = braced_item(source, "pub(crate) fn denoise_sprint_from_with_memory(");
+        let sprint_call = call_arguments(sprint_impl, "transformer.forward_with_memory(");
+        if sprint_call.len() != 7
+            || sprint_call[1] != "cond"
+            || sprint_call[3] != "Some(&guidance)"
+            || sprint_call[4] != "cond_mask"
+        {
+            return Err(Error::Msg(
+                "Sprint's actual transformer call must receive its gathered positive mask".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_transformer_mask_propagation(source: &str) -> Result<()> {
+        let forward = compact(braced_item(source, "pub(crate) fn forward_with_memory("));
+        if !forward.contains(
+            "block.forward(&hidden,&caption,caption_mask,&temb,ph,pw,plan.attention,)?",
+        ) || !forward.contains(
+            "self.run_windowed_blocks(hidden,&caption,caption_mask,&temb,ph,pw,plan.attention,window,cancel,)?",
+        ) {
+            return Err(Error::Msg(
+                "resident and windowed transformer routes must preserve caption_mask".into(),
+            ));
+        }
+
+        let windowed = compact(braced_item(source, "fn run_windowed_blocks("));
+        if !windowed.contains("block.forward(&cur,caption,caption_mask,temb,h,w,budget)?") {
+            return Err(Error::Msg(
+                "every materialized window block must receive caption_mask".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn registered_mask_route_table_is_positional_and_mutation_sensitive() {
+        let shipped = include_str!("pipeline.rs");
+        check_registered_mask_routes(shipped).unwrap();
+
+        let base_marker = "    fn denoise_cfg(\n        &self,";
+        let sprint_marker = "    fn denoise_sprint(\n        &self,";
+        for mutated in [
+            replace_in_item(shipped, base_marker, "Some(&cond.cond_mask),", "None,"),
+            replace_in_item(shipped, base_marker, "uncond_mask,", "None,"),
+            replace_in_item(
+                shipped,
+                base_marker,
+                "Some(&cond.cond_mask),\n            uncond,\n            uncond_mask,",
+                "uncond_mask,\n            uncond,\n            Some(&cond.cond_mask),",
+            ),
+            replace_in_item(shipped, sprint_marker, "Some(&cond.cond_mask),", "None,"),
+        ] {
+            assert!(
+                check_registered_mask_routes(&mutated).is_err(),
+                "dropping or swapping any Base/Sprint production mask must fail"
+            );
+        }
+
+        for mutated in [
+            replace_in_item(
+                shipped,
+                "pub(crate) fn denoise_cfg_with_memory(",
+                "transformer.forward_with_memory(x, cond, &t, None, cond_mask, plan, cancel)?",
+                "transformer.forward_with_memory(x, cond, &t, None, None, plan, cancel)?",
+            ),
+            replace_in_item(
+                shipped,
+                "pub(crate) fn denoise_cfg_with_memory(",
+                "transformer.forward_with_memory(x, uc, &t, None, uncond_mask, plan, cancel)?",
+                "transformer.forward_with_memory(x, uc, &t, None, None, plan, cancel)?",
+            ),
+            replace_in_item(
+                shipped,
+                "pub(crate) fn denoise_sprint_from_with_memory(",
+                "            Some(&guidance),\n            cond_mask,\n            plan,",
+                "            Some(&guidance),\n            None,\n            plan,",
+            ),
+        ] {
+            assert!(
+                check_registered_mask_routes(&mutated).is_err(),
+                "dropping a mask at an actual Base/Sprint transformer call must fail"
+            );
+        }
+
+        let transformer = include_str!("transformer.rs");
+        check_transformer_mask_propagation(transformer).unwrap();
+        for mutated in [
+            replace_in_item(
+                transformer,
+                "pub(crate) fn forward_with_memory(",
+                "                        caption_mask,\n                        &temb,",
+                "                        None,\n                        &temb,",
+            ),
+            replace_in_item(
+                transformer,
+                "pub(crate) fn forward_with_memory(",
+                "                caption_mask,\n                &temb,",
+                "                None,\n                &temb,",
+            ),
+            replace_in_item(
+                transformer,
+                "fn run_windowed_blocks(",
+                "block.forward(&cur, caption, caption_mask, temb, h, w, budget)?",
+                "block.forward(&cur, caption, None, temb, h, w, budget)?",
+            ),
+        ] {
+            assert!(
+                check_transformer_mask_propagation(&mutated).is_err(),
+                "dropping caption_mask from resident/windowed block propagation must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_default_is_the_measured_192_at_fixed_48_overlap() {
+        let _lock = env_lock();
+        std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
+        assert!(resolved_decode_plan(None, false).is_none());
+        assert_eq!(
+            resolved_decode_plan(None, true),
+            Some(DecodeTilingPlan {
+                edge: 192,
+                overlap: 48,
+                source: DecodeTilingSource::SequentialDefault,
+            })
+        );
+        assert!(resolved_decode_plan(Some(GenerationMemory::default()), true).is_none());
+    }
+
+    #[test]
+    fn request_geometry_uses_the_single_published_overlap() {
+        let _lock = env_lock();
+        std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
+        let plan = resolved_decode_plan(
+            Some(GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: Some(512),
+                ..Default::default()
+            }),
+            false,
+        )
+        .unwrap();
+        assert_eq!((plan.edge, plan.overlap), (512, 48));
+        assert_eq!(plan.source, DecodeTilingSource::Request);
+    }
+
+    #[test]
+    fn admitted_measurement_override_never_supersedes_a_contract_request() {
+        let _lock = env_lock();
+        let request = Some(GenerationMemory {
+            tile_vae_decode: true,
+            decode_tile_edge: Some(256),
+            ..Default::default()
+        });
+        std::env::set_var("MLX_GEN_SANA_DECODE_TILE", "512");
+        let plan = resolved_decode_plan(request, true).unwrap();
+        assert_eq!(plan.source, DecodeTilingSource::Request);
+        assert_eq!((plan.edge, plan.overlap), (256, 48));
+        std::env::set_var("MLX_GEN_SANA_DECODE_TILE", "0");
+        assert_eq!(
+            resolved_decode_plan(request, true).unwrap().source,
+            DecodeTilingSource::Request
+        );
+
+        std::env::set_var("MLX_GEN_SANA_DECODE_TILE", "512");
+        let plan = resolved_decode_plan(None, true).unwrap();
+        assert_eq!(plan.source, DecodeTilingSource::EnvOverride);
+        assert_eq!((plan.edge, plan.overlap), (512, 48));
+        std::env::set_var("MLX_GEN_SANA_DECODE_TILE", "128");
+        assert_eq!(
+            resolved_decode_plan(None, true).unwrap().source,
+            DecodeTilingSource::SequentialDefault
+        );
+        std::env::set_var("MLX_GEN_SANA_DECODE_TILE", "0");
+        assert!(resolved_decode_plan(None, true).is_none());
+        std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
+    }
 
     #[test]
     fn noise_shape_is_batch1_32ch() {

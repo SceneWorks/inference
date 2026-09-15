@@ -19,7 +19,10 @@ use mlx_rs::ops::{add, concatenate_axis, maximum, minimum, multiply, subtract};
 use mlx_rs::Array;
 
 use mlx_gen::image::resize_lanczos_u8;
-use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingBudgetError, TilingConfig, VaeTiling};
+use mlx_gen::tiling::{
+    budgeted_plan, SpatialTiling, TemporalOverlapPolicy, TileCandidates, TilingBudgetError,
+    TilingConfig, VaeTiling,
+};
 use mlx_gen::{default_seed, CancelFlag, Error, GenerationRequest, Image, Progress, Result};
 
 use crate::scheduler::{compute_sigmas, make_scheduler, SolverKind, WanScheduler};
@@ -57,12 +60,30 @@ pub fn reject_over_area(
     dh: u32,
     max_area: usize,
 ) -> Result<()> {
+    reject_over_area_dims(id, req.width, req.height, dw, dh, max_area)
+}
+
+/// [`reject_over_area`] over an explicit `width`/`height` instead of `req`'s, for a provider whose
+/// rendered geometry is **not** the one on the request.
+///
+/// SCAIL-2 resolves `width`/`height == 0` from its driving-video frames (sc-16167), so `req.width`
+/// is the sentinel `0` and reading it would measure the wrong geometry — `0` area passes every cap.
+/// The two entry points share this body so the cap means the same thing whether the geometry was
+/// typed or resolved; there is no second copy of the alignment or the message to drift.
+pub fn reject_over_area_dims(
+    id: &str,
+    width: u32,
+    height: u32,
+    dw: u32,
+    dh: u32,
+    max_area: usize,
+) -> Result<()> {
     if max_area == 0 {
         return Ok(());
     }
     let (w, h) = (
-        align_dim(req.width, 1, dw as usize),
-        align_dim(req.height, 1, dh as usize),
+        align_dim(width, 1, dw as usize),
+        align_dim(height, 1, dh as usize),
     );
     let area = w as usize * h as usize;
     if area > max_area {
@@ -239,8 +260,8 @@ fn estimated_denoise_peak_gib(
 /// largest tile's output volume (≈3800 B/voxel through the decoder's 1024-channel stack). With these
 /// two constants both anchors reproduce within ~10 % on the conservative side (the model
 /// over-estimates slightly — what a guard wants).
-const VAE22_ACCUM_BYTES_PER_VOXEL: f64 = 40.0;
-const VAE22_TILE_BYTES_PER_OUT_VOXEL: f64 = 3800.0;
+const VAE22_ACCUM_BYTES_PER_VOXEL: u64 = 40;
+const VAE22_TILE_BYTES_PER_OUT_VOXEL: u64 = 3_800;
 /// Per-tile coefficient for a **bf16** decode (sc-5039). Measured on the same real-weight rig at two
 /// tiles of the 1024×576×97 video (cosine 0.99995, no NaN both): 768 px / 64-frame → **79.7 GB**
 /// (vs 97.7 GB f32), 640 px / 48-frame → **55.1 GB**. The per-tile term only drops to ~85 % of f32
@@ -249,7 +270,7 @@ const VAE22_TILE_BYTES_PER_OUT_VOXEL: f64 = 3800.0;
 /// (the 640/48 point) so the estimate never under-shoots a real peak — the 3100 first guess let the
 /// selector pick a tile that measured 55.1 GB, just over the 54.4 GB safe line at the 64 GB tier.
 /// The fixed accumulator term is unchanged (the blend buffers are f32 either way).
-const VAE22_TILE_BYTES_PER_OUT_VOXEL_BF16: f64 = 3400.0;
+const VAE22_TILE_BYTES_PER_OUT_VOXEL_BF16: u64 = 3_400;
 
 /// Estimated concurrent GPU peak (GiB) of a z48 `vae22` decode whose **largest tile** spans
 /// `tile_f·tile_h·tile_w` output voxels while assembling a `out_f·out_h·out_w` video. `bf16` selects
@@ -271,21 +292,48 @@ fn estimated_vae22_decode_peak_gib(
     bf16: bool,
 ) -> f64 {
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-    let tile_coeff = if bf16 {
+    vae22_decode_peak_bytes(out_f, out_h, out_w, tile_f, tile_h, tile_w, bf16)
+        .map_or(f64::INFINITY, |bytes| bytes as f64 / GIB)
+}
+
+/// Candidate spatial tile sizes (output px, multiples of the vae22 ×16 spatial scale, overlap 64).
+pub(crate) const VAE22_SPATIAL_PX: [i32; 8] = [768, 640, 512, 448, 384, 320, 256, 192];
+/// Fixed spatial overlap paired with every selected MLX Wan z48 tile edge.
+pub const VAE22_SELECTED_OVERLAP: u32 = 64;
+/// Candidate temporal tiles `(tile_frames, overlap_frames)` in output frames (matching the preset
+/// overlaps: 24 for the longer tiles, 16/8 for the shorter).
+pub(crate) const VAE22_TEMPORAL_FR: [(i32, i32); 4] = [(96, 24), (64, 24), (48, 16), (32, 8)];
+
+/// Checked byte form of the z48 decode model. Both the live planner and the worker-facing selected
+/// profile call this one function, so admission cannot price a different tile than generation runs.
+fn vae22_decode_peak_bytes(
+    out_f: i64,
+    out_h: i64,
+    out_w: i64,
+    tile_f: i64,
+    tile_h: i64,
+    tile_w: i64,
+    bf16: bool,
+) -> Option<u64> {
+    let to_u64 = |value: i64| u64::try_from(value).ok();
+    let output_voxels = to_u64(out_f)?
+        .checked_mul(to_u64(out_h)?)?
+        .checked_mul(to_u64(out_w)?)?;
+    if output_voxels == 0 {
+        return None;
+    }
+    let tile_voxels = to_u64(tile_f)?
+        .checked_mul(to_u64(tile_h)?)?
+        .checked_mul(to_u64(tile_w)?)?;
+    let tile_coefficient = if bf16 {
         VAE22_TILE_BYTES_PER_OUT_VOXEL_BF16
     } else {
         VAE22_TILE_BYTES_PER_OUT_VOXEL
     };
-    let out_voxels = (out_f * out_h * out_w) as f64;
-    let tile_voxels = (tile_f * tile_h * tile_w) as f64;
-    (VAE22_ACCUM_BYTES_PER_VOXEL * out_voxels + tile_coeff * tile_voxels) / GIB
+    VAE22_ACCUM_BYTES_PER_VOXEL
+        .checked_mul(output_voxels)?
+        .checked_add(tile_coefficient.checked_mul(tile_voxels)?)
 }
-
-/// Candidate spatial tile sizes (output px, multiples of the vae22 ×16 spatial scale, overlap 64).
-const VAE22_SPATIAL_PX: [i32; 8] = [768, 640, 512, 448, 384, 320, 256, 192];
-/// Candidate temporal tiles `(tile_frames, overlap_frames)` in output frames (matching the preset
-/// overlaps: 24 for the longer tiles, 16/8 for the shorter).
-const VAE22_TEMPORAL_FR: [(i32, i32); 4] = [(96, 24), (64, 24), (48, 16), (32, 8)];
 
 // --- sc-12737: free-aware VAE-decode budget (contract-aligned with candle sc-12734) --------------
 //
@@ -419,9 +467,10 @@ fn plan_vae22_tiling(
         spatial_px: &VAE22_SPATIAL_PX,
         spatial_overlap_px: 64,
         temporal: &VAE22_TEMPORAL_FR,
+        temporal_overlap_policy: TemporalOverlapPolicy::Candidate,
     };
     budgeted_plan(
-        VaeTiling::WAN22,
+        Wan22Vae::VAE_TILING,
         height,
         width,
         out_frames,
@@ -430,6 +479,114 @@ fn plan_vae22_tiling(
         |of, oh, ow, tf, th, tw| estimated_vae22_decode_peak_gib(of, oh, ow, tf, th, tw, bf16),
     )
     .map_err(|e| wan_budget_error("z48 vae22", width, height, out_frames, e))
+}
+
+/// Resolve a decode plan for one worker-selected spatial cap. The selected edge is the only spatial
+/// candidate: the planner may shorten the temporal tile to stay within the same live safe budget as
+/// the historical automatic route, but it may neither silently widen nor shrink the admitted edge.
+fn plan_vae22_tiling_for_selected_spatial(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+    tile_edge: i32,
+    overlap: i32,
+    safe_gib: f64,
+) -> Result<TilingConfig> {
+    let spatial = [tile_edge];
+    let candidates = TileCandidates {
+        spatial_px: &spatial,
+        spatial_overlap_px: overlap,
+        temporal: &VAE22_TEMPORAL_FR,
+        temporal_overlap_policy: TemporalOverlapPolicy::Candidate,
+    };
+    let max_spatial = i64::from(height.max(width));
+    let tile_edge_i64 = i64::from(tile_edge);
+    let mut plan = budgeted_plan(
+        Wan22Vae::VAE_TILING,
+        height,
+        width,
+        out_frames,
+        safe_gib,
+        candidates,
+        |of, oh, ow, tf, th, tw| {
+            // `budgeted_plan` adds a full-spatial candidate. Above the admitted cap that candidate
+            // must never bypass the worker selection, even when the host could afford it.
+            if max_spatial > tile_edge_i64 && th == oh && tw == ow {
+                f64::INFINITY
+            } else {
+                estimated_vae22_decode_peak_gib(of, oh, ow, tf, th, tw, true)
+            }
+        },
+    )
+    .map_err(|error| wan_budget_error("z48 vae22", width, height, out_frames, error))?
+    .unwrap_or_default();
+
+    // Keep the selected carrier observable even when the output is smaller than the cap. Decode
+    // clamps it to the output extent, while diagnostics still see the exact admitted parameters.
+    plan.spatial = Some(SpatialTiling {
+        tile_px: tile_edge,
+        overlap_px: overlap,
+    });
+    Ok(plan)
+}
+
+fn selected_vae22_plan_with_budget(
+    width: u32,
+    height: u32,
+    frames: u32,
+    tile_edge: u32,
+    overlap: u32,
+    safe_gib: f64,
+) -> Result<(TilingConfig, mlx_gen::VideoDecodeMemoryProfile)> {
+    let width = i32::try_from(width)
+        .map_err(|_| Error::Msg("wan z48 vae22 decode width exceeds i32".into()))?;
+    let height = i32::try_from(height)
+        .map_err(|_| Error::Msg("wan z48 vae22 decode height exceeds i32".into()))?;
+    let frames = i32::try_from(frames)
+        .map_err(|_| Error::Msg("wan z48 vae22 decode frame count exceeds i32".into()))?;
+    let tile_edge = i32::try_from(tile_edge)
+        .map_err(|_| Error::Msg("wan z48 vae22 decode tile edge exceeds i32".into()))?;
+    let overlap = i32::try_from(overlap)
+        .map_err(|_| Error::Msg("wan z48 vae22 decode overlap exceeds i32".into()))?;
+    if width <= 0 || height <= 0 || frames <= 0 || tile_edge <= overlap || overlap < 0 {
+        return Err(Error::Msg(
+            "wan z48 vae22 decode requires positive geometry and tile_edge > overlap".into(),
+        ));
+    }
+
+    let tiling = plan_vae22_tiling_for_selected_spatial(
+        height, width, frames, tile_edge, overlap, safe_gib,
+    )?;
+    let bytes = video_decode_peak_bytes_for_vae_and_tiling(
+        Wan22Vae::VAE_TILING,
+        width as u32,
+        height as u32,
+        frames as u32,
+        Some(&tiling),
+    )
+    .ok_or_else(|| Error::Msg("wan z48 vae22 decode byte projection overflows u64".into()))?;
+    let profile = mlx_gen::VideoDecodeMemoryProfile::new(bytes, 0)
+        .expect("zero included decoder bytes always form a valid decode profile");
+    Ok((tiling, profile))
+}
+
+/// Resolve the exact provider-owned z48 decode carrier and working-set profile for a selected
+/// bounded-decode edge. Admission and generation share this live-budgeted entry point.
+pub fn selected_vae22_plan(
+    width: u32,
+    height: u32,
+    frames: u32,
+    tile_edge: u32,
+    overlap: u32,
+) -> Result<(TilingConfig, mlx_gen::VideoDecodeMemoryProfile)> {
+    selected_vae22_plan_with_budget(
+        width,
+        height,
+        frames,
+        tile_edge,
+        overlap,
+        wan_vae_safe_budget_gib(),
+    )
 }
 
 /// Map gen-core's neutral [`TilingBudgetError`] to a wan-facing message tagged with the VAE `label`
@@ -474,12 +631,12 @@ fn wan_budget_error(
 /// anchors (128 GB M-series, f32): the 768²×16 single-pass peak (56.35 GB) minus the same output tiled
 /// @384 px (14.46 GB) pins this term at ~57 B/voxel; rounded **up** to 64 for headroom (the model must
 /// never under-predict — an under-shoot is an OOM, an over-shoot only tiles slightly more).
-const VAE16_ACCUM_BYTES_PER_VOXEL: f64 = 64.0;
+const VAE16_ACCUM_BYTES_PER_VOXEL: u64 = 64;
 /// Per-tile-output-voxel cost of the z16 decoder working set (conv stack + ×8 spatial / ×4 temporal
 /// upsample). Fit from the same anchors at ~6355 B/voxel (≈1.7× the z48 `vae22`'s 3800 — the bigger
 /// spatial upsample); rounded **up** to 6500. z16 decodes f32 in production, so there is no bf16
 /// coefficient (unlike `vae22`, sc-5039).
-const VAE16_TILE_BYTES_PER_OUT_VOXEL: f64 = 6500.0;
+const VAE16_TILE_BYTES_PER_OUT_VOXEL: u64 = 6_500;
 
 /// Candidate spatial tile sizes (output px, multiples of the z16 ×8 spatial scale, overlap 64).
 const VAE16_SPATIAL_PX: [i32; 8] = [768, 640, 512, 448, 384, 320, 256, 192];
@@ -501,7 +658,87 @@ fn estimated_z16_decode_peak_gib(
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
     let out_voxels = (out_f * out_h * out_w) as f64;
     let tile_voxels = (tile_f * tile_h * tile_w) as f64;
-    (VAE16_ACCUM_BYTES_PER_VOXEL * out_voxels + VAE16_TILE_BYTES_PER_OUT_VOXEL * tile_voxels) / GIB
+    (VAE16_ACCUM_BYTES_PER_VOXEL as f64 * out_voxels
+        + VAE16_TILE_BYTES_PER_OUT_VOXEL as f64 * tile_voxels)
+        / GIB
+}
+
+/// Evaluate the calibrated Wan VAE decode cost for one output and optional tiling configuration.
+///
+/// Tile extents are capped at the output on every axis, exactly as the budget planner sizes a
+/// candidate. All coefficients are non-negative, so passing `None` is a conservative upper bound for
+/// every valid tiled configuration. The z48 path uses its shipped bf16 coefficient.
+#[doc(hidden)]
+pub fn video_decode_peak_bytes_for_vae_and_tiling(
+    vae: VaeTiling,
+    width: u32,
+    height: u32,
+    frames: u32,
+    tiling: Option<&TilingConfig>,
+) -> Option<u64> {
+    let width = u64::from(width);
+    let height = u64::from(height);
+    let frames = u64::from(frames);
+    let output_voxels = width.checked_mul(height)?.checked_mul(frames)?;
+    if output_voxels == 0 {
+        return None;
+    }
+    if vae != WanVae::VAE_TILING && vae != Wan22Vae::VAE_TILING {
+        return None;
+    }
+
+    let positive_extent = |configured: i32, full: u64| {
+        let configured = u64::try_from(configured).ok()?;
+        (configured > 0).then_some(configured.min(full))
+    };
+    let tile_width = tiling
+        .and_then(|cfg| cfg.spatial)
+        .map_or(Some(width), |spatial| {
+            positive_extent(spatial.tile_px, width)
+        })?;
+    let tile_height = tiling
+        .and_then(|cfg| cfg.spatial)
+        .map_or(Some(height), |spatial| {
+            positive_extent(spatial.tile_px, height)
+        })?;
+    let tile_frames = tiling
+        .and_then(|cfg| cfg.temporal)
+        .map_or(Some(frames), |temporal| {
+            positive_extent(temporal.tile_frames, frames)
+        })?;
+    if vae == Wan22Vae::VAE_TILING {
+        return vae22_decode_peak_bytes(
+            i64::try_from(frames).ok()?,
+            i64::try_from(height).ok()?,
+            i64::try_from(width).ok()?,
+            i64::try_from(tile_frames).ok()?,
+            i64::try_from(tile_height).ok()?,
+            i64::try_from(tile_width).ok()?,
+            true,
+        );
+    }
+
+    let tile_voxels = tile_width
+        .checked_mul(tile_height)?
+        .checked_mul(tile_frames)?;
+    VAE16_ACCUM_BYTES_PER_VOXEL
+        .checked_mul(output_voxels)?
+        .checked_add(VAE16_TILE_BYTES_PER_OUT_VOXEL.checked_mul(tile_voxels)?)
+}
+
+/// Conservative single-pass Wan VAE decode working-set peak in bytes for a concrete VAE geometry.
+///
+/// This is the full-output case of the calibrated cost function used by the actual z16/z48 budget
+/// planners. Because [`video_decode_peak_bytes_for_vae_and_tiling`] caps every configured tile at the
+/// output extent and the cost is monotone, this also bounds providers that use a different valid
+/// tiling selector over the same concrete VAE. It excludes DiT/text-encoder weights.
+pub fn conservative_video_decode_peak_bytes_for_vae(
+    vae: VaeTiling,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<u64> {
+    video_decode_peak_bytes_for_vae_and_tiling(vae, width, height, frames, None)
 }
 
 /// **Memory-budgeted** tiling for the z16 Wan 2.1 VAE decode (sc-6894 F-009): the z16 analogue of
@@ -517,6 +754,24 @@ pub fn auto_tiling_budgeted_z16(
     plan_z16_tiling(height, width, out_frames, wan_vae_safe_budget_gib())
 }
 
+/// The z16 selector used by Krea Realtime and SCAIL-2. It shares Wan's candidate grid, peak model,
+/// and free-aware budget, but deliberately retains sc-15325's quality-oriented half-tile overlap.
+/// Wan's own product providers use [`auto_tiling_budgeted_z16`], which restores the measured
+/// candidate overlap after sc-15445 found the half-tile policy materially slower for a marginal gain.
+pub fn auto_tiling_budgeted_z16_quality_overlap(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+) -> Result<Option<TilingConfig>> {
+    plan_z16_tiling_with_overlap(
+        height,
+        width,
+        out_frames,
+        wan_vae_safe_budget_gib(),
+        TemporalOverlapPolicy::HalfTile,
+    )
+}
+
 /// Pure z16 tile selector behind [`auto_tiling_budgeted_z16`] (the `safe_gib` ceiling is injected so it
 /// is unit-testable without touching the global memory limit). Supplies the z16 cost model + candidate
 /// grid to the shared [`budgeted_plan`]; same `Ok(None)` / `Ok(Some)` / catchable-`Err` contract as
@@ -527,13 +782,30 @@ fn plan_z16_tiling(
     out_frames: i32,
     safe_gib: f64,
 ) -> Result<Option<TilingConfig>> {
+    plan_z16_tiling_with_overlap(
+        height,
+        width,
+        out_frames,
+        safe_gib,
+        TemporalOverlapPolicy::Candidate,
+    )
+}
+
+fn plan_z16_tiling_with_overlap(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+    safe_gib: f64,
+    temporal_overlap_policy: TemporalOverlapPolicy,
+) -> Result<Option<TilingConfig>> {
     let candidates = TileCandidates {
         spatial_px: &VAE16_SPATIAL_PX,
         spatial_overlap_px: 64,
         temporal: &VAE16_TEMPORAL_FR,
+        temporal_overlap_policy,
     };
     budgeted_plan(
-        VaeTiling::WAN,
+        WanVae::VAE_TILING,
         height,
         width,
         out_frames,
@@ -611,12 +883,35 @@ fn predict(
     guidance: f32,
     y: Option<&Array>,
 ) -> Result<Array> {
+    predict_approx(transformer, latents, t, cache, guidance, y, None, None)
+}
+
+/// [`predict`] carrying the sc-18322 denoise feature cache. `trunk: None` is exactly [`predict`].
+#[allow(clippy::too_many_arguments)]
+fn predict_approx(
+    transformer: &WanTransformer,
+    latents: &Array,
+    t: f32,
+    cache: &StepCache,
+    guidance: f32,
+    y: Option<&Array>,
+    trunk: Option<&mut crate::feature_cache::TrunkCache>,
+    prune: Option<&crate::token_pruning::TokenPruner>,
+) -> Result<Array> {
     let x = match y {
         Some(y) => concatenate_axis(&[latents, y], 0)?,
         None => latents.clone(),
     };
-    let preds =
-        transformer.forward_cached(&x, t, &cache.cross_kv, &cache.cos, &cache.sin, cache.batch)?;
+    let preds = transformer.forward_cached_approx(
+        &x,
+        t,
+        &cache.cross_kv,
+        &cache.cos,
+        &cache.sin,
+        cache.batch,
+        trunk,
+        prune,
+    )?;
     if cache.batch == 2 {
         // preds[0] = cond (context row 0), preds[1] = uncond (row 1).
         cfg_combine(&preds[0], &preds[1], guidance)
@@ -646,6 +941,88 @@ pub fn denoise(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<Array> {
+    denoise_approx(
+        transformer,
+        kind,
+        num_train_timesteps,
+        steps,
+        shift,
+        guidance,
+        ctx_cond,
+        ctx_uncond,
+        init_noise,
+        cancel,
+        on_step,
+        None,
+        None,
+    )
+}
+
+/// Refuse an approximate plan on a denoise route that does not implement it (sc-18322).
+///
+/// The routes that are **not** wired for the denoise feature cache — the TI2V mask-blend, the curated
+/// unified solvers, and the MoE expert-swap paths — must refuse rather than run exactly, because
+/// silently ignoring a selection is the defect the typed approximate surface exists to remove. Each
+/// has a structural reason it is unwired, named in the message so a caller knows it is not a gap
+/// waiting to be filled by a retry:
+///
+/// * **TI2V mask-blend** re-blends the conditioning latent into the trajectory after every step, so a
+///   trunk residual captured at one step is not the quantity a later step needs.
+/// * **Curated solvers** evaluate the model 1..N times per solver step (Heun twice, DPM++ SDE at a
+///   midpoint), so "the previous step's residual" is ambiguous — and the step index the cache keys on
+///   never reaches the predict closure.
+/// * **MoE expert swap** changes transformers mid-trajectory, so a residual captured under the
+///   high-noise expert is meaningless under the low-noise one, a rotation phase captured under one is
+///   not the other's, and retaining either across the swap would keep the outgoing expert's weights
+///   alive.
+///
+/// Each of those three has a live call site: `Wan::generate_impl`'s TI2V and curated arms, and
+/// `Wan14b::generate_impl`, which covers every A14B route because every A14B route swaps experts. The
+/// refusal names the plan's **actually selected** mechanisms rather than a fixed string, so a
+/// pruning-only plan is not refused with the cache's name.
+///
+/// Unreachable today — the shared floor refuses every approximate selection before a provider is
+/// called, so no plan reaching here can be anything but `Exact`. It exists so that the day a
+/// characterization artifact makes selection possible, these routes fail closed by construction
+/// instead of needing to be remembered.
+pub fn refuse_unwired_approximation(
+    id: &str,
+    route: &str,
+    plan: &mlx_gen::gen_core::ApproximationPlan,
+) -> Result<()> {
+    if plan.is_exact() {
+        return Ok(());
+    }
+    Err(Error::Unsupported(format!(
+        "{id}: the {route} denoise route does not implement {}. Leave approximation unset for this \
+         route's exact denoise.",
+        plan.describe_selection()
+    )))
+}
+
+/// [`denoise`] carrying the sc-18322 **denoise feature cache**.
+///
+/// `trunk: None` is exactly [`denoise`]. When present, the cache decides per step whether the block
+/// stack runs or its retained trunk residual is reapplied — and note where that decision is *not*: the
+/// cancel check, the per-step `eval` and the progress callback below are straight-line statements in
+/// this loop, outside the branch, so a reused step performs all three exactly as a recomputed one
+/// does. That is the whole of the cancel-responsiveness discipline; see [`crate::feature_cache`].
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_approx(
+    transformer: &WanTransformer,
+    kind: SolverKind,
+    num_train_timesteps: usize,
+    steps: usize,
+    shift: f32,
+    guidance: f32,
+    ctx_cond: &Array,
+    ctx_uncond: Option<&Array>,
+    init_noise: &Array,
+    cancel: &CancelFlag,
+    on_step: &mut dyn FnMut(usize),
+    mut trunk: Option<&mut crate::feature_cache::TrunkCache>,
+    mut prune: Option<&mut crate::token_pruning::TokenPruner>,
+) -> Result<Array> {
     let mut sched = make_scheduler(kind, num_train_timesteps);
     sched.set_timesteps(steps, shift);
     let timesteps: Vec<f32> = sched.timesteps().to_vec();
@@ -653,7 +1030,7 @@ pub fn denoise(
     // sc-2957: run the DiT's fusable elementwise glue (adaLN affine, gated residual, gated-GELU FFN,
     // RoPE rotation) through `mx.compile` — bit-exact (proven `max|Δ|=0` real + tiny, perf.rs /
     // compile_parity.rs) and ~14% faster/step at production geometry. Scoped + restored on drop by the
-    // RAII guard (F-006/F-007) instead of leaking the process-global toggle on.
+    // RAII guard (F-006/F-007) instead of leaking the render thread's setting into later work.
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
 
     // Precompute the RoPE + cross-K/V caches once (grid + context are constant across steps).
@@ -669,10 +1046,38 @@ pub fn denoise(
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        let pred = predict(transformer, &latents, t, &cache, guidance, None)?;
+        // Declare the step to the feature cache before the forward: the step index lives here, in the
+        // only loop that has one, so the cache never has to derive it from a timestep (sc-18322).
+        if let Some(cache) = trunk.as_deref_mut() {
+            cache.begin_step(i);
+        }
+        // Pruning declares the step for the same reason the cache does — it keys its per-block rotation
+        // on it — and its warmup decision comes from the contract's own predicate, so a warmup step
+        // passes `None` and runs the untouched block loop.
+        if let Some(pruner) = prune.as_deref_mut() {
+            pruner.begin_step(i);
+        }
+        let prune_this_step = match prune.as_deref() {
+            Some(pruner) if pruner.prunes_step(i) => Some(pruner),
+            _ => None,
+        };
+        let pred = predict_approx(
+            transformer,
+            &latents,
+            t,
+            &cache,
+            guidance,
+            None,
+            trunk.as_deref_mut(),
+            prune_this_step,
+        )?;
         latents = sched.step(&pred, &latents)?;
         // Force evaluation each step to bound the lazy graph's peak memory (the reference's
         // per-step `mx.eval(latents)`).
+        //
+        // Unconditional, and outside the feature-cache branch three call levels down: a reused step is
+        // materialized and progress-reported exactly like a recomputed one, so skipping the block stack
+        // can never make the loop less cancel-responsive (sc-18322).
         mlx_rs::transforms::eval([&latents])?;
         on_step(i + 1);
     }
@@ -789,7 +1194,7 @@ pub fn denoise_ti2v(
 
     // sc-2957: compile the DiT's fusable elementwise glue (bit-exact, ~14% faster/step). The per-token
     // modulation shapes differ from T2V's, so `mx.compile` simply re-traces them once. Scoped +
-    // restored on drop by the RAII guard (F-006/F-007) instead of leaking the process-global toggle on.
+    // restored on drop by the RAII guard (F-006/F-007) instead of leaking into later work.
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
 
     // Precompute the RoPE + cross-K/V caches once (grid + context constant across steps), exactly like
@@ -920,7 +1325,7 @@ pub fn denoise_moe(
     let timesteps: Vec<f32> = sched.timesteps().to_vec();
 
     // sc-2957: compiled elementwise glue (bit-exact, ~14% faster/step) — see `denoise`. Scoped +
-    // restored on drop by the RAII guard (F-006/F-007) instead of leaking the process-global on.
+    // restored on drop by the RAII guard (F-006/F-007) instead of leaking into later work.
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
 
     // The grid is shared — the channel-concat `y` doesn't change F/H/W and each expert's contexts are
@@ -1197,9 +1602,11 @@ pub fn frames_to_images(frames_u8: &Array) -> Result<Vec<Image>> {
     // the (transpose-strided) H/W/C axes, which forces a contiguous logical-order copy (`as_slice`
     // returns the physical buffer), and it never forms the full `f·h·w·c` product — `f` stays its own
     // dim and the inner `h·w·c` is a single frame (≤ ~1e8 even at 8K, well within i32). This retires
-    // the F-070 `reshape(-1)` workaround: on MLX 0.32.0 reshape is int64-safe past `i32::MAX`
-    // (verified in `mlx-gen/tests/mlx_write_bound_probe.rs`), so `f·h·w·3 > i32::MAX` (1920×1088@349f
-    // ≈ 2.19e9; 4K@89f) now renders rather than overflowing. Byte-identical to the old reshape below-bound.
+    // the F-070 `reshape(-1)` workaround: on the pinned MLX 0.32.0 fork, a multi-dimensional reshape
+    // whose individual dimensions fit i32 is exact past an `i32::MAX` total (verified in
+    // `mlx-gen/tests/mlx_write_bound_probe.rs`; a single `reshape(-1)` dimension still raises). Thus
+    // `f·h·w·3 > i32::MAX` (1920×1088@349f ≈ 2.19e9; 4K@89f) now renders rather than overflowing.
+    // Byte-identical to the old reshape below-bound.
     let per = (h as i64 * w as i64 * c as i64) as usize;
     let flat = frames_u8.reshape(&[f, h * w * c])?;
     let bytes = flat.as_slice::<u8>();
@@ -1345,53 +1752,24 @@ pub fn preprocess_ti2v_image(image: &Image, width: u32, height: u32) -> Result<A
         .expand_dims(0)?) // [1, 1, H, W, 3]
 }
 
-/// Build the TI2V-5B mask-blend tensors (port of `i2v_utils.build_i2v_mask`):
-///  - `mask` `[z, T_lat, h_lat, w_lat]` (f32): `0.0` for the first latent temporal frame (all
-///    channels/spatial), `1.0` elsewhere — the latent the first frame is frozen, the rest denoise.
-///  - `mask_tokens` `[1, L]` (f32): the channel-0 mask subsampled to the patch grid (`0.0` for the
-///    first-frame tokens, `1.0` for the rest), `L` = the DiT patch-token count `(T_lat/pt)·(h_lat/ph)·
-///    (w_lat/pw)`. Token order is temporal-slowest (matching [`crate::patchify::patchify`]).
+/// Build the TI2V-5B mask-blend tensors (port of `i2v_utils.build_i2v_mask`, generalized to the
+/// Wan-native multi-keyframe pins of epic 3040 and to per-pin **strength**, sc-19571):
+///  - `mask` `[z, T_lat, h_lat, w_lat]` (f32): `1 − strength` at each pinned latent temporal frame
+///    (all channels/spatial), `1.0` elsewhere. `strength = 1.0` fully freezes the frame (mask `0`,
+///    the historical hard pin); `strength = 0.0` leaves it free to denoise; anything between is a
+///    partial pin, which is the whole point of the knob.
+///  - `mask_tokens` `[1, L]` (f32): the channel-0 mask subsampled to the patch grid (`1 − strength`
+///    for each pinned frame's tokens, `1.0` for the rest), `L` = the DiT patch-token count
+///    `(T_lat/pt)·(h_lat/ph)·(w_lat/pw)`. Token order is temporal-slowest (matching
+///    [`crate::patchify::patchify`]).
+///
+/// `pins` are `(latent_frame, strength)` pairs: first_last_frame is `[(0, s0), (t_lat-1, s1)]`, a
+/// single `Reference` image is `[(0, s)]`. Latent indices `>= t_lat` are ignored (the caller
+/// validates); the same weight drives both the clean-latent blend and the per-token diffusion
+/// timestep, so one number controls the whole pin. **Byte-for-byte the same construction as
+/// candle's `candle_gen_wan::pipeline::build_ti2v_mask`** — the two lanes must not diverge here.
 pub fn build_ti2v_mask(
-    z_dim: usize,
-    t_lat: usize,
-    h_lat: usize,
-    w_lat: usize,
-    patch_size: (usize, usize, usize),
-) -> (Array, Array) {
-    let plane = h_lat * w_lat;
-    // mask: 1.0 everywhere except temporal index 0 (= 0.0).
-    let mut mask = vec![1f32; z_dim * t_lat * plane];
-    for c in 0..z_dim {
-        let base = c * t_lat * plane; // temporal index 0 of channel c
-        for p in 0..plane {
-            mask[base + p] = 0.0;
-        }
-    }
-    let mask = Array::from_slice(
-        &mask,
-        &[z_dim as i32, t_lat as i32, h_lat as i32, w_lat as i32],
-    );
-
-    // mask_tokens: subsample channel 0 by the patch grid. mask is 0 only at temporal index 0, so a
-    // token is 0 iff its source temporal index `t'·pt == 0` (i.e. `t' == 0`) → the first `hg·wg`
-    // tokens (temporal-slowest order) are 0, the rest 1.
-    let (pt, ph, pw) = patch_size;
-    let (tg, hg, wg) = (t_lat / pt, h_lat / ph, w_lat / pw);
-    let mut tok = vec![1f32; tg * hg * wg];
-    for v in tok.iter_mut().take(hg * wg) {
-        *v = 0.0;
-    }
-    let mask_tokens = Array::from_slice(&tok, &[1, (tg * hg * wg) as i32]);
-    (mask, mask_tokens)
-}
-
-/// Multi-keyframe generalization of [`build_ti2v_mask`] (epic 3040, Wan-native first_last_frame):
-/// pin the latent temporal frames in `indices` (mask `0.0` there, `1.0` elsewhere) instead of only
-/// frame 0. first_last_frame = `indices = [0, t_lat-1]`. `mask` `[z, T_lat, h, w]` + `mask_tokens`
-/// `[1, L]` (the `hg·wg` tokens of each pinned frame are `0`). Indices must be `< t_lat`; out-of-range
-/// indices are ignored (the caller validates). With `indices = [0]` this is exactly `build_ti2v_mask`.
-pub fn build_ti2v_multi_mask(
-    indices: &[usize],
+    pins: &[(usize, f32)],
     z_dim: usize,
     t_lat: usize,
     h_lat: usize,
@@ -1401,14 +1779,9 @@ pub fn build_ti2v_multi_mask(
     let plane = h_lat * w_lat;
     let mut mask = vec![1f32; z_dim * t_lat * plane];
     for c in 0..z_dim {
-        for &t in indices {
-            if t >= t_lat {
-                continue;
-            }
+        for &(t, strength) in pins.iter().filter(|&&(t, _)| t < t_lat) {
             let base = (c * t_lat + t) * plane;
-            for p in 0..plane {
-                mask[base + p] = 0.0;
-            }
+            mask[base..base + plane].fill(1.0 - strength);
         }
     }
     let mask = Array::from_slice(
@@ -1419,13 +1792,10 @@ pub fn build_ti2v_multi_mask(
     let (pt, ph, pw) = patch_size;
     let (tg, hg, wg) = (t_lat / pt, h_lat / ph, w_lat / pw);
     let mut tok = vec![1f32; tg * hg * wg];
-    for &t in indices {
+    for &(t, strength) in pins {
         let tg_idx = t / pt;
-        if tg_idx >= tg {
-            continue;
-        }
-        for k in 0..(hg * wg) {
-            tok[tg_idx * hg * wg + k] = 0.0;
+        if tg_idx < tg {
+            tok[(tg_idx * hg * wg)..((tg_idx + 1) * hg * wg)].fill(1.0 - strength);
         }
     }
     let mask_tokens = Array::from_slice(&tok, &[1, (tg * hg * wg) as i32]);
@@ -1468,6 +1838,247 @@ pub fn ti2v_blend_init(z_img: &Array, mask: &Array, noise: &Array) -> Result<Arr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_decode_peaks_are_the_planners_full_output_cases() {
+        assert_eq!(
+            conservative_video_decode_peak_bytes_for_vae(WanVae::VAE_TILING, 64, 64, 9),
+            Some(241_975_296)
+        );
+        assert_eq!(
+            conservative_video_decode_peak_bytes_for_vae(Wan22Vae::VAE_TILING, 64, 64, 9),
+            Some(126_812_160)
+        );
+        assert_eq!(
+            conservative_video_decode_peak_bytes_for_vae(VaeTiling::QWEN_IMAGE, 64, 64, 9),
+            None
+        );
+        assert_eq!(
+            conservative_video_decode_peak_bytes_for_vae(WanVae::VAE_TILING, 0, 64, 9),
+            None
+        );
+    }
+
+    #[test]
+    fn full_output_peak_bounds_every_valid_tiling_shape() {
+        use mlx_gen::tiling::{SpatialTiling, TemporalTiling};
+
+        let (width, height, frames) = (1280, 720, 121);
+        for vae in [WanVae::VAE_TILING, Wan22Vae::VAE_TILING] {
+            let full =
+                conservative_video_decode_peak_bytes_for_vae(vae, width, height, frames).unwrap();
+            for tiling in [
+                TilingConfig::spatial_only(768, 64),
+                TilingConfig::spatial_only(192, 64),
+                TilingConfig::temporal_only(96, 24),
+                TilingConfig {
+                    spatial: Some(SpatialTiling {
+                        tile_px: 384,
+                        overlap_px: 64,
+                    }),
+                    temporal: Some(TemporalTiling {
+                        tile_frames: 32,
+                        overlap_frames: 8,
+                    }),
+                },
+            ] {
+                let tiled = video_decode_peak_bytes_for_vae_and_tiling(
+                    vae,
+                    width,
+                    height,
+                    frames,
+                    Some(&tiling),
+                )
+                .unwrap();
+                assert!(tiled <= full, "{vae:?} {tiling:?}: {tiled} > {full}");
+            }
+        }
+    }
+
+    #[test]
+    fn selected_vae22_plan_preserves_exact_edge_and_observable_spatial_carrier() {
+        let (tiling, profile) =
+            selected_vae22_plan_with_budget(480, 480, 1, 768, 64, 100.0).unwrap();
+        assert_eq!(
+            tiling
+                .spatial
+                .map(|spatial| (spatial.tile_px, spatial.overlap_px)),
+            Some((768, 64)),
+            "the admitted carrier stays observable even below its cap"
+        );
+        assert_eq!(tiling.temporal.map(|tile| tile.tile_frames), None);
+        assert_eq!(profile.resident_decoder_bytes_included(), 0);
+        assert_eq!(
+            profile.working_set_bytes(),
+            video_decode_peak_bytes_for_vae_and_tiling(
+                Wan22Vae::VAE_TILING,
+                480,
+                480,
+                1,
+                Some(&tiling),
+            )
+            .unwrap()
+        );
+
+        let (tiling, _) = selected_vae22_plan_with_budget(1280, 704, 97, 448, 64, 1_000.0).unwrap();
+        assert_eq!(
+            tiling
+                .spatial
+                .map(|spatial| (spatial.tile_px, spatial.overlap_px)),
+            Some((448, 64)),
+            "the full-spatial candidate must not bypass an admitted lower cap"
+        );
+    }
+
+    #[test]
+    fn selected_vae22_plan_uses_real_temporal_candidates_and_refuses_overbudget() {
+        // At this output/edge, 96 frames projects to ~67.5 GiB while 64 projects to ~47.2 GiB.
+        // The injected 60 GiB budget therefore selects the exact measured 64/24 temporal row.
+        let (tiling, profile) =
+            selected_vae22_plan_with_budget(1280, 704, 193, 448, 64, 60.0).unwrap();
+        assert_eq!(
+            tiling
+                .spatial
+                .map(|spatial| (spatial.tile_px, spatial.overlap_px)),
+            Some((448, 64))
+        );
+        assert_eq!(
+            tiling
+                .temporal
+                .map(|temporal| (temporal.tile_frames, temporal.overlap_frames)),
+            Some((64, 24))
+        );
+        let exact = video_decode_peak_bytes_for_vae_and_tiling(
+            Wan22Vae::VAE_TILING,
+            1280,
+            704,
+            193,
+            Some(&tiling),
+        )
+        .unwrap();
+        assert_eq!(profile.working_set_bytes(), exact);
+        assert!(exact as f64 / (1024.0 * 1024.0 * 1024.0) <= 60.0);
+
+        assert!(selected_vae22_plan_with_budget(1280, 704, 193, 448, 64, 6.0).is_err());
+    }
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const WAN_OVERLAP_EVIDENCE: [(&str, &str); 4] = [
+        (
+            "z16-640",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../../docs/migration/evidence/sc-15445/z16-640.log"
+            )),
+        ),
+        (
+            "z16-832",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../../docs/migration/evidence/sc-15445/z16-832.log"
+            )),
+        ),
+        (
+            "z48-640",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../../docs/migration/evidence/sc-15445/z48-640.log"
+            )),
+        ),
+        (
+            "z48-832",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../../docs/migration/evidence/sc-15445/z48-832.log"
+            )),
+        ),
+    ];
+    const WAN_OVERLAP_Z48_832_CLEAN_QUALITY: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../../docs/migration/evidence/sc-15445/z48-832-quality-clean.log"
+    ));
+
+    fn evidence_result(log: &'static str) -> &'static str {
+        let mut results = log.lines().filter_map(|line| line.strip_prefix("RESULT "));
+        let result = results
+            .next()
+            .expect("evidence log must contain one RESULT");
+        assert!(
+            results.next().is_none(),
+            "evidence log must contain exactly one RESULT"
+        );
+        result
+    }
+
+    fn evidence_fields(log: &'static str) -> BTreeMap<&'static str, &'static str> {
+        evidence_result(log)
+            .split_ascii_whitespace()
+            .map(|field| {
+                field
+                    .split_once('=')
+                    .expect("every RESULT field must be key=value")
+            })
+            .collect()
+    }
+
+    fn evidence_f64(fields: &BTreeMap<&str, &str>, key: &str) -> f64 {
+        fields
+            .get(key)
+            .unwrap_or_else(|| panic!("evidence RESULT missing {key}"))
+            .parse()
+            .unwrap_or_else(|_| panic!("evidence RESULT {key} must be numeric"))
+    }
+
+    fn evidence_i32(fields: &BTreeMap<&str, &str>, key: &str) -> i32 {
+        fields
+            .get(key)
+            .unwrap_or_else(|| panic!("evidence RESULT missing {key}"))
+            .parse()
+            .unwrap_or_else(|_| panic!("evidence RESULT {key} must be an integer"))
+    }
+
+    fn evidence_pair(fields: &BTreeMap<&str, &str>, key: &str) -> (usize, usize) {
+        let value = fields
+            .get(key)
+            .unwrap_or_else(|| panic!("evidence RESULT missing {key}"));
+        let (old, half) = value
+            .split_once("=>")
+            .unwrap_or_else(|| panic!("evidence RESULT {key} must be old=>half"));
+        (
+            old.parse()
+                .unwrap_or_else(|_| panic!("evidence RESULT {key} old must be an integer")),
+            half.parse()
+                .unwrap_or_else(|_| panic!("evidence RESULT {key} half must be an integer")),
+        )
+    }
+
+    fn evidence_range(fields: &BTreeMap<&str, &str>, key: &str) -> (f64, f64) {
+        let value = fields
+            .get(key)
+            .unwrap_or_else(|| panic!("evidence RESULT missing {key}"));
+        let (min, max) = value
+            .split_once("..")
+            .unwrap_or_else(|| panic!("evidence RESULT {key} must be min..max"));
+        (
+            min.parse()
+                .unwrap_or_else(|_| panic!("evidence RESULT {key} min must be numeric")),
+            max.parse()
+                .unwrap_or_else(|_| panic!("evidence RESULT {key} max must be numeric")),
+        )
+    }
+
+    fn evidence_result_checksum() -> u64 {
+        WAN_OVERLAP_EVIDENCE
+            .iter()
+            .map(|(_, log)| evidence_result(log))
+            .chain(std::iter::once(evidence_result(
+                WAN_OVERLAP_Z48_832_CLEAN_QUALITY,
+            )))
+            .flat_map(|result| result.bytes().chain(std::iter::once(b'\n')))
+            .fold(0xcbf29ce484222325, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+            })
+    }
 
     /// Pin the actual callback order for all four curated samplers. Heun and DPM++ SDE add
     /// intermediate evaluations, but their sigma streams still cross the expert boundary exactly
@@ -1786,9 +2397,9 @@ mod tests {
     fn z16_tiles_past_the_write_bound_on_an_unlimited_budget() {
         let (h, w, f) = (720i32, 1280i32, 81i32);
         assert!(
-            (f as i64) > VaeTiling::WAN.writable_frame_cap(h, w),
+            (f as i64) > WanVae::VAE_TILING.writable_frame_cap(h, w),
             "test precondition: 81 frames at 720p must exceed the z16 write cap ({})",
-            VaeTiling::WAN.writable_frame_cap(h, w)
+            WanVae::VAE_TILING.writable_frame_cap(h, w)
         );
 
         let cfg = plan_z16_tiling(h, w, f, f64::INFINITY)
@@ -1814,7 +2425,7 @@ mod tests {
                 )
             })
             .unwrap_or((h as i64, w as i64));
-        let write = VaeTiling::WAN.full_res_channels as i64 * tf * th * tw;
+        let write = WanVae::VAE_TILING.full_res_channels as i64 * tf * th * tw;
         assert!(
             write <= mlx_gen::tiling::MAX_WRITABLE_ELEMS,
             "the selected z16 tile writes {write} elements, past the bound — plan {cfg:?}"
@@ -2084,6 +2695,172 @@ mod tests {
         );
     }
 
+    /// sc-15445 decision gate: Wan product selectors restore the historical candidate overlap while
+    /// Krea/SCAIL-2's z16 selector retains half-tile overlap. The budgets deliberately select the
+    /// 32-frame row measured at 640×384×81, so changing either policy is independently red.
+    #[test]
+    fn wan_product_and_quality_selectors_keep_the_measured_overlap_split() {
+        let wan_z16 = plan_z16_tiling(384, 640, 84, 10.0).unwrap().unwrap();
+        let quality_z16 =
+            plan_z16_tiling_with_overlap(384, 640, 84, 10.0, TemporalOverlapPolicy::HalfTile)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            wan_z16.temporal.map(|t| (t.tile_frames, t.overlap_frames)),
+            Some((32, 8)),
+        );
+        assert_eq!(
+            quality_z16
+                .temporal
+                .map(|t| (t.tile_frames, t.overlap_frames)),
+            Some((32, 16)),
+        );
+        assert_eq!(
+            wan_z16.spatial.map(|s| (s.tile_px, s.overlap_px)),
+            quality_z16.spatial.map(|s| (s.tile_px, s.overlap_px)),
+            "the policy split must change only temporal overlap",
+        );
+
+        let wan_z48 = plan_vae22_tiling(384, 640, 81, 4.5, true).unwrap().unwrap();
+        assert_eq!(
+            wan_z48.temporal.map(|t| (t.tile_frames, t.overlap_frames)),
+            Some((32, 8)),
+        );
+
+        // Parse the committed raw RESULT records rather than restating their numbers in this test.
+        // The checksum makes any evidence-row edit explicit; the assertions below independently
+        // gate the four-cell scope, reproduce every recorded call count from live tiling geometry,
+        // and enforce the cost/quality thresholds behind Candidate.
+        let expected_cells = [
+            "Z16:640x384:81",
+            "Z16:832x480:121",
+            "Z48:640x384:81",
+            "Z48:832x480:121",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let mut actual_cells = BTreeSet::new();
+        for (_, log) in WAN_OVERLAP_EVIDENCE {
+            let fields = evidence_fields(log);
+            let family = fields["family"];
+            let cell = format!("{family}:{}:{}", fields["bucket"], fields["product_frames"]);
+            assert!(actual_cells.insert(cell.clone()), "duplicate evidence cell");
+
+            let vae = match family {
+                "Z16" => WanVae::VAE_TILING,
+                "Z48" => Wan22Vae::VAE_TILING,
+                other => panic!("unexpected evidence family {other}"),
+            };
+            let (width, height) = fields["bucket"]
+                .split_once('x')
+                .map(|(w, h)| {
+                    (
+                        w.parse::<i32>().expect("numeric evidence width"),
+                        h.parse::<i32>().expect("numeric evidence height"),
+                    )
+                })
+                .expect("evidence bucket must be WIDTHxHEIGHT");
+            let decoded_frames = evidence_i32(&fields, "decoded_frames");
+            let latent_frames = if vae.causal_temporal {
+                (decoded_frames - 1) / vae.temporal_scale + 1
+            } else {
+                decoded_frames / vae.temporal_scale
+            };
+            let tile_frames = evidence_i32(&fields, "tile");
+            let candidate_overlap = evidence_i32(&fields, "old_overlap");
+            let half_overlap = evidence_i32(&fields, "current_overlap");
+            let iterations = |overlap_frames| {
+                let plan = TilingConfig {
+                    spatial: Some(mlx_gen::tiling::SpatialTiling {
+                        tile_px: 192,
+                        overlap_px: 64,
+                    }),
+                    temporal: Some(mlx_gen::tiling::TemporalTiling {
+                        tile_frames,
+                        overlap_frames,
+                    }),
+                }
+                .plan(
+                    vae,
+                    latent_frames,
+                    height / vae.spatial_scale,
+                    width / vae.spatial_scale,
+                );
+                (plan.t.len(), plan.t.len() * plan.h.len() * plan.w.len())
+            };
+            let candidate_iters = iterations(candidate_overlap);
+            let half_iters = iterations(half_overlap);
+            assert_eq!(
+                (candidate_iters.0, half_iters.0),
+                evidence_pair(&fields, "temporal_iterations"),
+                "{cell}: temporal calls must reproduce from the live planner",
+            );
+            assert_eq!(
+                (candidate_iters.1, half_iters.1),
+                evidence_pair(&fields, "all_iterations"),
+                "{cell}: all tile calls must reproduce from the live planner",
+            );
+
+            let old_s = evidence_f64(&fields, "old_seconds_median");
+            let half_s = evidence_f64(&fields, "current_seconds_median");
+            let recorded_ratio = evidence_f64(&fields, "wall_ratio");
+            assert!(
+                (half_s / old_s - recorded_ratio).abs() <= 0.0001,
+                "{cell}: recorded wall ratio must agree with medians",
+            );
+            assert!(
+                half_s / old_s >= 1.20,
+                "{cell}: half-tile wall cost stopped being material",
+            );
+            let (_, old_max) = evidence_range(&fields, "old_seconds_range");
+            let (half_min, _) = evidence_range(&fields, "current_seconds_range");
+            assert!(half_min > old_max, "{cell}: repeated timing ranges overlap",);
+
+            let old_err = evidence_f64(&fields, "old_mae255");
+            let half_err = evidence_f64(&fields, "current_mae255");
+            assert!(
+                half_err < old_err && old_err - half_err <= 0.61,
+                "{cell}: recorded quality trade no longer supports the measured decision",
+            );
+            let old_peak = evidence_f64(&fields, "old_peak_gib");
+            let half_peak = evidence_f64(&fields, "current_peak_gib");
+            assert!(
+                (half_peak / old_peak - 1.0f64).abs() <= 0.05,
+                "{cell}: overlap unexpectedly changed peak memory",
+            );
+        }
+        assert_eq!(
+            actual_cells, expected_cells,
+            "evidence must contain exactly both shipping buckets for both Wan VAE families",
+        );
+        assert_eq!(
+            evidence_result_checksum(),
+            0x5717_3a67_4348_cabb,
+            "sc-15445 RESULT records changed; audit the new evidence and update this checksum",
+        );
+
+        // The final timed row's post-timing quality phase overlapped another Metal task. Its
+        // uncontended quality-only rerun must reproduce every metric used by the decision.
+        let timed = evidence_fields(WAN_OVERLAP_EVIDENCE[3].1);
+        let clean = evidence_fields(WAN_OVERLAP_Z48_832_CLEAN_QUALITY);
+        for key in [
+            "old_mae255",
+            "current_mae255",
+            "reference_clip_mean",
+            "reference_clip_worst",
+            "old_clip_mean",
+            "old_clip_worst",
+            "current_clip_mean",
+            "current_clip_worst",
+        ] {
+            assert_eq!(
+                timed[key], clean[key],
+                "clean z48 832 quality rerun changed {key}",
+            );
+        }
+    }
+
     #[test]
     fn z16_tiling_errors_when_unfittable() {
         // 4K × 240 frames under an 8 GiB budget: the output accumulators alone blow it → a catchable
@@ -2332,7 +3109,7 @@ mod tests {
     #[test]
     fn build_ti2v_mask_freezes_first_frame() {
         // z=2, T_lat=2, h=w=2, patch (1,2,2) → grid (2,1,1) → L=2 tokens.
-        let (mask, tokens) = build_ti2v_mask(2, 2, 2, 2, (1, 2, 2));
+        let (mask, tokens) = build_ti2v_mask(&[(0, 1.0)], 2, 2, 2, 2, (1, 2, 2));
         assert_eq!(mask.shape(), &[2, 2, 2, 2]);
         // Per channel (8 vals): temporal 0 → 0.0 (4 spatial), temporal 1 → 1.0 (4 spatial).
         assert_eq!(
@@ -2345,10 +3122,9 @@ mod tests {
     }
 
     #[test]
-    fn build_ti2v_multi_mask_freezes_first_and_last() {
+    fn build_ti2v_mask_pins_first_and_last() {
         // first_last_frame: z=1, T_lat=3, h=w=2, patch (1,2,2) → grid (3,1,1) → 3 tokens.
-        // Pin frames [0, 2] (first + last). With indices=[0] it must equal build_ti2v_mask.
-        let (mask, tokens) = build_ti2v_multi_mask(&[0, 2], 1, 3, 2, 2, (1, 2, 2));
+        let (mask, tokens) = build_ti2v_mask(&[(0, 1.0), (2, 1.0)], 1, 3, 2, 2, (1, 2, 2));
         assert_eq!(mask.shape(), &[1, 3, 2, 2]);
         // temporal 0 → 0 (4), temporal 1 → 1 (4), temporal 2 → 0 (4).
         assert_eq!(
@@ -2357,11 +3133,44 @@ mod tests {
         );
         // token mask: frame0 + frame2 tokens 0, frame1 token 1.
         assert_eq!(tokens.as_slice::<f32>(), &[0., 1., 0.]);
-        // Single-index [0] reproduces build_ti2v_mask exactly.
-        let (m1, t1) = build_ti2v_multi_mask(&[0], 2, 2, 2, 2, (1, 2, 2));
-        let (m0, t0) = build_ti2v_mask(2, 2, 2, 2, (1, 2, 2));
-        assert_eq!(m1.as_slice::<f32>(), m0.as_slice::<f32>());
-        assert_eq!(t1.as_slice::<f32>(), t0.as_slice::<f32>());
+    }
+
+    /// sc-19571: the per-pin strength must land in BOTH masks as `1 − strength`, with each pin
+    /// carrying its OWN weight — the defect this replaced built a hard 0/1 mask from the indices
+    /// alone, so every value below is one a `strength`-blind builder cannot produce. Deliberately
+    /// **non-default**: 1.0 (the old hard pin) appears nowhere as a strength here.
+    #[test]
+    fn build_ti2v_mask_threads_per_pin_strength() {
+        // z=1, T_lat=3, h=w=2, patch (1,2,2) → grid (3,1,1) → 3 tokens. First pinned at 0.25,
+        // last at 0.75 — different from each other, so a builder that reused one strength for
+        // every pin is also caught.
+        let (mask, tokens) = build_ti2v_mask(&[(0, 0.25), (2, 0.75)], 1, 3, 2, 2, (1, 2, 2));
+        assert_eq!(
+            mask.as_slice::<f32>(),
+            &[0.75, 0.75, 0.75, 0.75, 1., 1., 1., 1., 0.25, 0.25, 0.25, 0.25],
+            "latent mask must be 1 − strength at each pin, per pin"
+        );
+        assert_eq!(
+            tokens.as_slice::<f32>(),
+            &[0.75, 1., 0.25],
+            "token mask must carry the same per-pin 1 − strength"
+        );
+        // strength 0.0 is a no-op pin: the frame denoises exactly as if it were never pinned.
+        let (free, free_tokens) = build_ti2v_mask(&[(0, 0.0)], 1, 2, 1, 1, (1, 1, 1));
+        assert_eq!(free.as_slice::<f32>(), &[1., 1.]);
+        assert_eq!(free_tokens.as_slice::<f32>(), &[1., 1.]);
+
+        // **Cross-lane pin.** These are the literal inputs and expected values in candle's
+        // `candle_gen_wan::pipeline::ti2v_tests::mask_and_keyframe_scatter_pin_first_and_last`, so
+        // the two backends are gated against the same numbers rather than each against its own idea
+        // of the construction — the divergence that let one lane honor the knob while the other
+        // silently dropped it is exactly what this asserts away.
+        let (mask, tokens) = build_ti2v_mask(&[(0, 1.0), (2, 0.25)], 1, 3, 2, 2, (1, 2, 2));
+        assert_eq!(
+            mask.as_slice::<f32>(),
+            &[0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.75, 0.75, 0.75, 0.75]
+        );
+        assert_eq!(tokens.as_slice::<f32>(), &[0.0, 1.0, 0.75]);
     }
 
     #[test]

@@ -6,15 +6,19 @@
 //! the base txt2img generation path.
 
 pub mod adapters;
+pub(crate) mod artifact_inventory;
+pub(crate) mod block_stream;
 pub mod config;
 pub mod control_transformer;
 pub mod convert;
 pub mod image_encoder;
 pub mod ip_adapter;
 pub mod loader;
+pub mod memory_strategy;
 pub mod model;
 pub mod model_control;
 pub mod pipeline;
+pub mod preview;
 pub mod quant;
 pub mod text_encoder;
 pub mod transformer;
@@ -29,7 +33,7 @@ pub use image_encoder::FluxIpImageEncoder;
 pub use ip_adapter::{FluxIpAdapter, FluxIpInjector};
 pub use loader::{
     load_clip_encoder, load_clip_tokenizer, load_control_transformer_dev, load_t5_encoder,
-    load_t5_tokenizer, load_transformer, load_vae,
+    load_t5_tokenizer, load_transformer, load_vae, load_vae_from_weights,
 };
 pub use model::{
     descriptor_dev, descriptor_for, descriptor_schnell, load_dev, load_schnell, Flux1,
@@ -38,9 +42,21 @@ pub use model::{
 pub use model_control::{descriptor_dev_control, load_dev_control, Flux1DevControl};
 pub use pipeline::{
     build_linear_sigmas, create_noise, image_seq_len, pack_latents, unpack_latents,
+    LATENT_CHANNELS, LATENT_PATCH_SIZE, PACKED_TOKEN_WIDTH,
 };
-pub use text_encoder::{ClipTextEncoder, FluxTextEncoders, T5TextEncoder};
+pub use text_encoder::{
+    ClipTextEncoder, FluxTextEncoders, T5BlockStream, T5TextEncoder, T5_BLOCKS,
+};
 pub use transformer::{FluxTransformer, FluxTransformerConfig};
+
+/// sc-16209 Apple-Silicon warm sweep: FLUX.1 Dev bf16 peaked below 14.06 GiB at 1024².
+pub const DEV_ACTIVATION_MEMORY_REGISTRATION: mlx_gen::gen_core::ActivationMemoryRegistration =
+    mlx_gen::gen_core::ActivationMemoryRegistration {
+        provider_id: FLUX1_DEV_ID,
+        anchor: mlx_gen::ActivationMemoryAnchor {
+            bytes_1024: 15_096_810_046,
+        },
+    };
 
 /// Add all MLX FLUX.1 providers to an explicit media registry builder.
 pub fn register_providers(
@@ -48,8 +64,63 @@ pub fn register_providers(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::SCHNELL_REGISTRATION)
+        .register_memory_strategy(model::SCHNELL_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: FLUX1_SCHNELL_ID,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(FLUX1_SCHNELL_ID, spec)
+            },
+        })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: FLUX1_SCHNELL_ID,
+                contract: |surface| {
+                    memory_strategy::weights_free_memory_surface_contract(FLUX1_SCHNELL_ID, surface)
+                },
+            },
+        )
+        .register_memory_behavior(model::SCHNELL_MEMORY_BEHAVIOR)
         .register_generator(model::DEV_REGISTRATION)
+        .register_memory_strategy(model::DEV_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: FLUX1_DEV_ID,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(FLUX1_DEV_ID, spec)
+            },
+        })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: FLUX1_DEV_ID,
+                contract: |surface| {
+                    memory_strategy::weights_free_memory_surface_contract(FLUX1_DEV_ID, surface)
+                },
+            },
+        )
+        .register_memory_behavior(model::DEV_MEMORY_BEHAVIOR)
+        .register_activation_memory(DEV_ACTIVATION_MEMORY_REGISTRATION)
         .register_generator(model_control::DEV_CONTROL_REGISTRATION)
+        .register_memory_strategy(model_control::DEV_CONTROL_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: FLUX1_DEV_CONTROL_ID,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(FLUX1_DEV_CONTROL_ID, spec)
+            },
+        })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: FLUX1_DEV_CONTROL_ID,
+                contract: |surface| {
+                    memory_strategy::weights_free_memory_surface_contract(
+                        FLUX1_DEV_CONTROL_ID,
+                        surface,
+                    )
+                },
+            },
+        )
+        .register_memory_behavior(model_control::DEV_CONTROL_MEMORY_BEHAVIOR)
 }
 
 /// Build the complete explicit MLX FLUX.1 provider catalog.

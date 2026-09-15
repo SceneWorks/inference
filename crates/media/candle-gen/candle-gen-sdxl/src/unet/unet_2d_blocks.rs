@@ -493,6 +493,15 @@ impl UNetMidBlock2DCrossAttn {
         Ok(())
     }
 
+    pub(crate) fn move_norms_to(&mut self, device: &candle_core::Device) -> Result<()> {
+        self.resnet.move_norms_to(device)?;
+        for (attention, resnet) in &mut self.attn_resnets {
+            attention.move_norms_to(device)?;
+            resnet.move_norms_to(device)?;
+        }
+        Ok(())
+    }
+
     /// Visit every conv in the mid block (the lead resnet + each attention block's trailing resnet) for
     /// a conv-LoRA additive install (sc-11682).
     pub fn visit_conv_lora_mut(
@@ -627,6 +636,13 @@ impl DownBlock2D {
         Ok(())
     }
 
+    pub(crate) fn move_norms_to(&mut self, device: &candle_core::Device) -> Result<()> {
+        for resnet in &mut self.resnets {
+            resnet.move_norms_to(device)?;
+        }
+        Ok(())
+    }
+
     /// Visit every conv in this down block (each resnet's convs + the optional downsampler conv) for a
     /// conv-LoRA additive install (sc-11682).
     pub fn visit_conv_lora_mut(
@@ -752,6 +768,14 @@ impl CrossAttnDownBlock2D {
         self.downblock.visit_lora_mut(f)?;
         for attn in self.attentions.iter_mut() {
             attn.visit_lora_mut(f)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn move_norms_to(&mut self, device: &candle_core::Device) -> Result<()> {
+        self.downblock.move_norms_to(device)?;
+        for attention in &mut self.attentions {
+            attention.move_norms_to(device)?;
         }
         Ok(())
     }
@@ -891,6 +915,13 @@ impl UpBlock2D {
         Ok(())
     }
 
+    pub(crate) fn move_norms_to(&mut self, device: &candle_core::Device) -> Result<()> {
+        for resnet in &mut self.resnets {
+            resnet.move_norms_to(device)?;
+        }
+        Ok(())
+    }
+
     /// Visit every conv in this up block (each resnet's convs + the optional upsampler conv) for a
     /// conv-LoRA additive install (sc-11682).
     pub fn visit_conv_lora_mut(
@@ -1015,6 +1046,14 @@ impl CrossAttnUpBlock2D {
         self.upblock.visit_lora_mut(f)?;
         for attn in self.attentions.iter_mut() {
             attn.visit_lora_mut(f)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn move_norms_to(&mut self, device: &candle_core::Device) -> Result<()> {
+        self.upblock.move_norms_to(device)?;
+        for attention in &mut self.attentions {
+            attention.move_norms_to(device)?;
         }
         Ok(())
     }

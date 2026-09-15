@@ -37,7 +37,7 @@ use mlx_gen::{
 use crate::config::NeoChatConfig;
 use crate::distill::{resolve_distill_lora, DISTILL_MERGED_MARKER};
 use crate::loader::{check_coverage, load_raw};
-use crate::t2i::{smart_resize, StepReporter, T2iModel, T2iOptions};
+use crate::t2i::{request_phase_bounds, smart_resize, StepReporter, T2iModel, T2iOptions};
 use crate::text::load_tokenizer;
 use mlx_gen::weights::Weights;
 
@@ -58,6 +58,16 @@ pub const CELL: u32 = 32;
 /// Source-image preprocessing bounds (the reference `it2i_generate` `load_image_native`).
 const REF_MIN_PIXELS: i64 = 512 * 512;
 const REF_MAX_PIXELS: i64 = 2048 * 2048;
+/// Tokenizer-level sentinels owned by the internal image-prefix builder. Letting user text inject
+/// one would corrupt the token/grid relationship that the understanding path derives.
+const RESERVED_IMAGE_MARKERS: [&str; 3] = ["<IMG_CONTEXT>", "<img>", "</img>"];
+
+/// Resolve the request's image-guidance scale for the reference-conditioned it2i path. Keeping this
+/// seam explicit prevents `true_cfg` from being advertised while accidentally dropping it before
+/// [`T2iModel::it2i_generate`].
+fn image_cfg_scale(req: &GenerationRequest) -> f32 {
+    req.true_cfg.unwrap_or(1.0)
+}
 
 pub fn descriptor() -> ModelDescriptor {
     descriptor_for(MODEL_ID)
@@ -71,13 +81,15 @@ pub fn descriptor_fast() -> ModelDescriptor {
 
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: None,
+        control_kinds: None,
         required_components: &[],
         id,
         family: "sensenova-u1",
         backend: "mlx",
         modality: Modality::Image,
         capabilities: Capabilities {
-            supports_negative_prompt: false,
             // `guidance` → text cfg_scale; `true_cfg` → image cfg (it2i edit≈1.0 / character≈1.5).
             supports_guidance: true,
             supports_true_cfg: true,
@@ -86,8 +98,6 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
                 ConditioningKind::Reference,
                 ConditioningKind::MultiReference,
             ],
-            supports_lora: false,
-            supports_lokr: false,
             supported_quants: &[Quant::Q4, Quant::Q8],
             // Bespoke-by-architecture (epic 7114, sc-7120, task 7185): SenseNova-U1 is NOT routed through
             // the unified curated-sampler framework. Its denoise threads each step through an
@@ -98,8 +108,6 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             // output. It is also x0-prediction over a clean-fraction timestep grid (not noise-fraction σ).
             // Its native shifted-Euler loop is its only valid sampler. See `t2i::denoise`/`it2i_denoise`.
             samplers: Vec::new(),
-            schedulers: Vec::new(),
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,
@@ -110,17 +118,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             requires_sigma_shift: true,
             // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
             supports_sequential_offload: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            ..Default::default()
         },
     }
 }
@@ -132,19 +130,231 @@ pub struct SenseNova {
     model: T2iModel,
     /// The 8-step distilled variant — selects the distilled generation defaults (8 NFE, CFG 1.0).
     fast: bool,
+    memory_strategy: gen_core::MemoryProviderContract,
+    loaded_quant: Option<Quant>,
+    pinned_artifact: Option<crate::memory_strategy::PinnedArtifact>,
+}
+
+fn guard_pinned_artifact<T>(
+    artifact: Option<&crate::memory_strategy::PinnedArtifact>,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if let Some(artifact) = artifact {
+        artifact
+            .ensure_unchanged()
+            .map_err(|error| Error::Msg(error.to_string()))?;
+    }
+    let result = operation();
+    if let Some(artifact) = artifact {
+        // Always run the post-check, including after a generation error. A mutation error takes
+        // precedence so no output (or misleading earlier failure) can escape a changed artifact.
+        artifact
+            .ensure_unchanged()
+            .map_err(|error| Error::Msg(error.to_string()))?;
+    }
+    result
 }
 
 impl SenseNova {
-    /// The unified model, for the worker paths the `Generator` contract can't express (VQA text,
-    /// interleave text+images): call [`T2iModel::vqa`] / [`T2iModel::interleave_gen`] directly.
-    pub fn model(&self) -> &T2iModel {
-        &self.model
+    /// Execute a worker-owned VQA/interleave operation under the same before/after artifact guard
+    /// as registry generation. The post-check also runs on cancellation and ordinary errors, and a
+    /// crossed artifact mutation takes precedence over a stale result.
+    fn with_runtime<T>(
+        &self,
+        operation: impl FnOnce(&T2iModel, &mlx_gen::tokenizer::TextTokenizer) -> Result<T>,
+    ) -> Result<T> {
+        guard_pinned_artifact(self.pinned_artifact.as_ref(), || {
+            operation(&self.model, &self.tokenizer)
+        })
     }
 
-    /// The tokenizer (shared by every mode).
-    pub fn tokenizer(&self) -> &mlx_gen::tokenizer::TextTokenizer {
-        &self.tokenizer
+    fn validate_direct_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+        actual_mode: gen_core::MemoryMode,
+        request: &GenerationRequest,
+        actual_reference_count: usize,
+    ) -> Result<()> {
+        let actual_reference_count = u32::try_from(actual_reference_count)
+            .map_err(|_| Error::Msg("sensenova: too many direct image references".into()))?;
+        if request.image_reference_count() != actual_reference_count {
+            return Err(Error::Msg(format!(
+                "sensenova: request declares {} image references but direct execution received {actual_reference_count}",
+                request.image_reference_count()
+            )));
+        }
+        Ok(crate::memory_strategy::validate_direct_operation_identity(
+            self.descriptor.id,
+            context,
+            &actual_mode,
+            gen_core::MemoryGeometry {
+                width: request.width,
+                height: request.height,
+                batch: request.count,
+                frames: request.frames.unwrap_or(context.geometry.frames),
+                reference_count: actual_reference_count,
+            },
+        )?)
     }
+
+    fn apply_request_memory(request: &GenerationRequest, options: &mut T2iOptions) {
+        let memory = request.memory;
+        options.attention_score_budget = memory
+            .filter(|memory| memory.chunk_attention)
+            .and_then(|memory| memory.attention_chunk_size);
+        options.transformer_window_size = memory
+            .filter(|memory| memory.stream_transformer_blocks)
+            .and_then(|memory| memory.transformer_window_size);
+    }
+
+    fn finish_direct<T>(
+        scope: &mut dyn gen_core::MemoryRequestScope,
+        result: Result<T>,
+    ) -> Result<T> {
+        let outcome = match &result {
+            Ok(_) => gen_core::MemoryRunOutcome::Complete,
+            Err(Error::Canceled) => gen_core::MemoryRunOutcome::Canceled,
+            Err(error) => gen_core::MemoryRunOutcome::Error {
+                message: error.to_string(),
+            },
+        };
+        scope.finish(outcome)?;
+        result
+    }
+
+    fn run_direct_scope<T>(
+        scope: &mut dyn gen_core::MemoryRequestScope,
+        request: &mut GenerationRequest,
+        operation: impl FnOnce(&GenerationRequest) -> Result<T>,
+    ) -> Result<T> {
+        let result = scope
+            .configure_request(request)
+            .map_err(Error::from)
+            .and_then(|()| operation(request));
+        Self::finish_direct(scope, result)
+    }
+
+    fn begin_direct_scope(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> Result<Box<dyn gen_core::MemoryRequestScope>> {
+        crate::memory_strategy::begin_request(
+            self.descriptor.id,
+            &self.memory_strategy,
+            self.loaded_quant,
+            context,
+            mlx_gen::request_scope::MlxScopeCleanup::Device,
+        )?
+        .ok_or_else(|| {
+            Error::Msg("sensenova: admitted direct route produced no request scope".into())
+        })
+    }
+
+    /// Run VQA under the exact admitted request. The concrete operation and configured options stay
+    /// inside this provider-owned method, and the request scope is finished exactly once.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_vqa(
+        &self,
+        context: &gen_core::MemoryRunContext,
+        mut request: GenerationRequest,
+        question: &str,
+        images: &[Array],
+        max_new_tokens: usize,
+        sampler: crate::runtime::Sampler,
+        mut options: T2iOptions,
+        cancel: Option<&gen_core::CancelFlag>,
+    ) -> Result<String> {
+        self.validate_direct_request(
+            context,
+            gen_core::MemoryMode::Other("vqa".into()),
+            &request,
+            images.len(),
+        )?;
+        let mut scope = self.begin_direct_scope(context)?;
+        Self::run_direct_scope(&mut *scope, &mut request, |request| {
+            Self::apply_request_memory(request, &mut options);
+            self.with_runtime(|model, tokenizer| {
+                model.vqa_with_options(
+                    tokenizer,
+                    question,
+                    images,
+                    max_new_tokens,
+                    sampler,
+                    &options,
+                    cancel,
+                )
+            })
+        })
+    }
+
+    /// Run Document Studio interleave under the exact admitted request and lifecycle scope.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_interleave(
+        &self,
+        context: &gen_core::MemoryRunContext,
+        mut request: GenerationRequest,
+        prompt: &str,
+        input_images: &[Array],
+        width: i32,
+        height: i32,
+        mut options: T2iOptions,
+        system_message: &str,
+        max_new_tokens: usize,
+        max_images: usize,
+        init_noises: Option<&[Array]>,
+        cancel: &gen_core::CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<crate::t2i::InterleaveOutput> {
+        validate_interleave_count(&request, max_images)?;
+        if i64::from(request.width) != i64::from(width)
+            || i64::from(request.height) != i64::from(height)
+        {
+            return Err(Error::Msg(format!(
+                "sensenova: interleave execution {width}x{height} does not match request {}x{}",
+                request.width, request.height
+            )));
+        }
+        self.validate_direct_request(
+            context,
+            gen_core::MemoryMode::Other("interleave".into()),
+            &request,
+            input_images.len(),
+        )?;
+        let mut scope = self.begin_direct_scope(context)?;
+        Self::run_direct_scope(&mut *scope, &mut request, |request| {
+            Self::apply_request_memory(request, &mut options);
+            self.with_runtime(|model, tokenizer| {
+                model.interleave_gen(
+                    tokenizer,
+                    prompt,
+                    input_images,
+                    width,
+                    height,
+                    &options,
+                    system_message,
+                    max_new_tokens,
+                    max_images,
+                    init_noises,
+                    cancel,
+                    on_progress,
+                )
+            })
+        })
+    }
+
+    pub fn memory_contract(&self) -> &gen_core::MemoryProviderContract {
+        &self.memory_strategy
+    }
+}
+
+fn validate_interleave_count(request: &GenerationRequest, max_images: usize) -> Result<()> {
+    if !(1..=10).contains(&max_images) || request.count != max_images as u32 {
+        return Err(Error::Msg(format!(
+            "sensenova: interleave max_images must be 1..=10 and exactly match admitted request count (max_images={max_images}, count={})",
+            request.count
+        )));
+    }
+    Ok(())
 }
 
 /// Construct the base [`SenseNova`] (`sensenova_u1_8b`) from a [`LoadSpec`]. `spec.weights` must be a
@@ -152,6 +362,13 @@ impl SenseNova {
 /// at their on-disk dtype (bf16); `spec.quantize` (Q4/Q8) then quantizes the backbone decoder stack
 /// (sc-3193).
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    Ok(Box::new(load_runtime(spec)?))
+}
+
+/// Typed loader for worker-owned VQA/interleave routes. It preserves the exact registry loader's
+/// artifact pin, quantization, provider contract, and cache identity instead of constructing a
+/// second bespoke runtime beside the registered provider.
+pub fn load_runtime(spec: &LoadSpec) -> Result<SenseNova> {
     load_inner(spec, false)
 }
 
@@ -166,11 +383,18 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 ///   is already baked into the on-disk weights, so the loader skips it (a packed tier cannot re-merge
 ///   — its base is quantized). Either way the distilled 8-NFE / CFG-1.0 defaults apply.
 pub fn load_fast(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    Ok(Box::new(load_runtime_fast(spec)?))
+}
+
+pub fn load_runtime_fast(spec: &LoadSpec) -> Result<SenseNova> {
     load_inner(spec, true)
 }
 
-fn load_inner(spec: &LoadSpec, fast: bool) -> Result<Box<dyn Generator>> {
+fn load_inner(spec: &LoadSpec, fast: bool) -> Result<SenseNova> {
     let id = if fast { MODEL_ID_FAST } else { MODEL_ID };
+    crate::memory_strategy::validate_load_contract(id, spec)?;
+    crate::memory_strategy::validate_resolved_artifact_binding(spec)?;
+    crate::memory_strategy::validate_artifact_tier(spec)?;
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(format!(
             "{id}: only dense bf16 is wired (drop the precision override)"
@@ -193,7 +417,11 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<Box<dyn Generator>> {
     };
     // Named-component contract (sc-13658/sc-13664): the fast variant reads the `distill_lora`
     // component; the base id reads none. Reject any unrecognized component key up front.
-    let known: &[&str] = if fast { &["distill_lora"] } else { &[] };
+    let known: &[&str] = if fast {
+        &[crate::memory_strategy::DISTILL_LORA_COMPONENT]
+    } else {
+        &[]
+    };
     reject_unknown_components(spec, known, id)?;
     // Resolve (and existence-check) the distill LoRA path for a dense-base fast tier *before* the heavy
     // config/weights I/O, so a missing LoRA fails fast at load with an actionable, `distill_lora`-named
@@ -204,20 +432,44 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<Box<dyn Generator>> {
     // universal requirement that broke the pre-merged tier).
     let distill_lora_path = if fast && !root.join(DISTILL_MERGED_MARKER).exists() {
         Some(resolve_distill_lora(
-            spec.components.get("distill_lora"),
+            spec.components
+                .get(crate::memory_strategy::DISTILL_LORA_COMPONENT),
             root,
         )?)
     } else {
         None
     };
     let cfg = NeoChatConfig::from_dir(root)?;
-    let weights = load_raw(root)?;
+    // A single-file artifact is verified once and then becomes the source of truth for the initial
+    // load, calibration identity, and every deferred Gen window. Sharded/multi-file layouts
+    // retain the historical eager directory loader but truthfully do not advertise rung 4.
+    let pinned_artifact = crate::memory_strategy::verified_artifact(spec);
+    let weights = if let Some(artifact) = pinned_artifact.as_ref() {
+        artifact.open_weights()?
+    } else {
+        load_raw(root)?
+    };
     // F-137: diff the checkpoint against the canonical key set before building modules (the loader
     // module doc promised this validation). Missing keys still fail via `require` with the exact
     // name during `from_weights`; this additionally rejects extra/renamed tensors that would
     // otherwise load silently with whatever subset matches.
     check_coverage(weights.keys(), &cfg).require_no_unexpected(id)?;
-    let mut model = T2iModel::from_weights(&weights, &cfg)?;
+    let deferred_gen = distill_lora_path.is_none()
+        && crate::memory_strategy::can_stream_gen_with_artifact(id, spec, pinned_artifact.as_ref());
+    let mut model = if deferred_gen {
+        T2iModel::from_weights_deferred(
+            &weights,
+            &cfg,
+            pinned_artifact
+                .clone()
+                .expect("streamable artifact is pinned"),
+            spec.quantize,
+        )?
+    } else {
+        // A fast dense-base load needs a runtime LoRA merge into all generation blocks. Keep that
+        // exact path eager; the contract refuses rung 4 until the artifact is a pre-merged turnkey.
+        T2iModel::from_weights(&weights, &cfg)?
+    };
     // The fast variant merges the 8-step distill LoRA into the dense generation path — UNLESS the
     // tier is a **pre-merged** turnkey (sc-8775: the packed/dense fast tiers bake the merge in at
     // convert time and drop `DISTILL_MERGED_MARKER`). A pre-merged tier must NOT re-merge: for a
@@ -246,12 +498,19 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<Box<dyn Generator>> {
         model.quantize(q.bits())?;
     }
     let tokenizer = load_tokenizer(root)?;
-    Ok(Box::new(SenseNova {
+    Ok(SenseNova {
         descriptor: descriptor_for(id),
         tokenizer,
         model,
         fast,
-    }))
+        memory_strategy: crate::memory_strategy::validated_memory_strategy_contract_with_artifact(
+            id,
+            spec,
+            pinned_artifact.as_ref(),
+        )?,
+        loaded_quant: spec.quantize,
+        pinned_artifact,
+    })
 }
 
 impl SenseNova {
@@ -283,10 +542,22 @@ impl SenseNova {
         };
         T2iOptions {
             cfg_scale: req.guidance.unwrap_or(def_guidance),
-            img_cfg_scale: req.true_cfg.unwrap_or(1.0),
+            img_cfg_scale: image_cfg_scale(req),
             num_steps: req.steps.unwrap_or(def_steps) as usize,
             timestep_shift: req.scheduler_shift.unwrap_or(DEFAULT_TIMESTEP_SHIFT),
             seed,
+            attention_score_budget: req
+                .memory
+                .filter(|memory| memory.chunk_attention)
+                .and_then(|memory| memory.attention_chunk_size),
+            transformer_window_size: req
+                .memory
+                .filter(|memory| memory.stream_transformer_blocks)
+                .and_then(|memory| memory.transformer_window_size),
+            calibration_stream_fault: req.memory.is_some_and(|memory| {
+                memory.calibration_fault_harness_authorized
+                    && memory.calibration_error_phase == Some(gen_core::MemoryPhase::Denoise)
+            }),
             ..Default::default()
         }
     }
@@ -302,6 +573,7 @@ impl Generator for SenseNova {
         // right model (F-143).
         let id = self.descriptor.id;
         self.descriptor.capabilities.validate_request(id, req)?;
+        validate_reserved_image_markers(id, req).map_err(gen_core::Error::from)?;
         validate_dims_and_steps(id, req).map_err(Into::into)
     }
 
@@ -310,7 +582,34 @@ impl Generator for SenseNova {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        guard_pinned_artifact(self.pinned_artifact.as_ref(), || {
+            self.generate_impl(req, on_progress)
+        })
+        .map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.memory_strategy, self.loaded_quant, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::begin_request(
+            self.descriptor.id,
+            &self.memory_strategy,
+            self.loaded_quant,
+            context,
+            mlx_gen::request_scope::MlxScopeCleanup::Device,
+        )
     }
 }
 
@@ -339,7 +638,11 @@ impl SenseNova {
             let opts = self.options(req, base_seed.wrapping_add(i as u64));
             // Thread cancellation + per-step progress into the denoise loop. Progress now reports the
             // denoise step (Kolors/SDXL semantics), not the image index as the old single tick did.
-            let reporter = StepReporter::new(&req.cancel, on_progress);
+            // The request's two phase boundaries are opened once each — by the first image's loop
+            // and the last image's loop — not once per image (sc-22738).
+            let (opens_denoise, opens_decode) = request_phase_bounds(i, req.count);
+            let reporter = StepReporter::new(&req.cancel, on_progress)
+                .with_phase_bounds(opens_denoise, opens_decode);
             let out = if references.is_empty() {
                 self.model.generate(
                     &self.tokenizer,
@@ -368,10 +671,40 @@ impl SenseNova {
     }
 }
 
-/// Request-boundary checks beyond the capability surface: 32-pixel alignment per side and a positive
-/// step count. Factored out so it can be unit-tested without loaded weights. `id` is the rejecting
-/// model's descriptor id (base or `_fast`) so the error attributes to the right variant (F-143).
+/// Reject internal image-prefix sentinels before the prompt reaches the token/grid expansion
+/// path. `<image>` remains the public placeholder and is deliberately not included here.
+fn validate_reserved_image_markers(id: &str, req: &GenerationRequest) -> Result<()> {
+    if let Some(marker) = RESERVED_IMAGE_MARKERS
+        .iter()
+        .find(|marker| req.prompt.contains(**marker))
+    {
+        return Err(Error::Unsupported(format!(
+            "{id}: prompt contains reserved internal image marker {marker}"
+        )));
+    }
+    Ok(())
+}
+
+/// Request-boundary checks beyond the capability surface: reference-only image guidance, 32-pixel
+/// alignment per side, and a positive step count. Factored out so it can be unit-tested without
+/// loaded weights. `id` is the rejecting model's descriptor id (base or `_fast`) so the error
+/// attributes to the right variant (F-143).
 fn validate_dims_and_steps(id: &str, req: &GenerationRequest) -> Result<()> {
+    if req.true_cfg.is_some()
+        && !req
+            .conditioning
+            .iter()
+            .any(|conditioning| match conditioning {
+                Conditioning::Reference { .. } => true,
+                Conditioning::MultiReference { images } => !images.is_empty(),
+                _ => false,
+            })
+    {
+        return Err(Error::Unsupported(format!(
+            "{id}: true_cfg is image guidance and requires Reference or non-empty MultiReference \
+             conditioning"
+        )));
+    }
     if !req.width.is_multiple_of(CELL) || !req.height.is_multiple_of(CELL) {
         return Err(Error::Msg(format!(
             "{id}: {}x{} must be a multiple of {CELL} per side",
@@ -414,7 +747,8 @@ fn image_to_chw01(img: &Image) -> Result<Array> {
 /// (the dual-path `_mot_gen` layout — see [`crate::loader`]), so there is NO separable text encoder to
 /// stage. Report the whole checkpoint as the heavy component (`text_encoder = 0`) — an honest
 /// "`Sequential` residency buys nothing here" (staged peak == resident peak) rather than a fabricated
-/// split. sensenova is not in the worker's sequential-capable allowlist, so this only makes that explicit.
+/// split. sensenova's descriptor sets `supports_sequential_offload: false` — the capability bit the
+/// worker's fit-gate keys on — so the sequential path is never taken; this only makes that explicit.
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
@@ -437,6 +771,38 @@ mlx_gen::register_generators! {
     pub(crate) const QUALITY_REGISTRATION = descriptor => load;
     footprint = component_footprint
 }
+
+pub const QUALITY_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
+        safety_check: crate::memory_strategy::registered_safety_check,
+    };
+
+pub const FAST_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID_FAST,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID_FAST, spec),
+        safety_check: crate::memory_strategy::registered_safety_check,
+    };
+
+pub const QUALITY_MEMORY_BEHAVIOR: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(MODEL_ID, spec, contract, context)
+        },
+    };
+
+pub const FAST_MEMORY_BEHAVIOR: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID_FAST,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(MODEL_ID_FAST, spec, contract, context)
+        },
+    };
 mlx_gen::register_generators! {
     pub(crate) const FAST_REGISTRATION = descriptor_fast => load_fast;
     footprint = component_footprint
@@ -445,6 +811,148 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingScope {
+        configured: usize,
+        outcomes: Vec<gen_core::MemoryRunOutcome>,
+        reject_configure: bool,
+    }
+
+    impl gen_core::MemoryRequestScope for RecordingScope {
+        fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
+            self.configured += 1;
+            if self.reject_configure {
+                return Err(gen_core::Error::Unsupported("crossed request".into()));
+            }
+            request.memory = Some(gen_core::GenerationMemory {
+                chunk_attention: true,
+                attention_chunk_size: Some(123),
+                ..Default::default()
+            });
+            Ok(())
+        }
+        fn enter_phase(&mut self, _phase: gen_core::MemoryPhase) -> gen_core::Result<()> {
+            Ok(())
+        }
+        fn leave_phase(&mut self, _phase: gen_core::MemoryPhase) -> gen_core::Result<()> {
+            Ok(())
+        }
+        fn configure_decode(
+            &mut self,
+            _tile_edge: u32,
+            _overlap: u32,
+            _geometry: gen_core::MemoryGeometry,
+        ) -> gen_core::Result<()> {
+            Ok(())
+        }
+        fn configure_attention(&mut self, _chunk_size: u32) -> gen_core::Result<()> {
+            Ok(())
+        }
+        fn materialize_transformer_window(
+            &mut self,
+            _first_block: u32,
+            _block_count: u32,
+        ) -> gen_core::Result<()> {
+            Ok(())
+        }
+        fn finish(&mut self, outcome: gen_core::MemoryRunOutcome) -> gen_core::Result<()> {
+            if !self.outcomes.is_empty() {
+                return Err(gen_core::Error::Msg("finished twice".into()));
+            }
+            self.outcomes.push(outcome);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn typed_direct_scope_configures_and_finishes_every_terminal_outcome_once() {
+        let mut complete = RecordingScope::default();
+        let mut request = GenerationRequest::default();
+        let value = SenseNova::run_direct_scope(&mut complete, &mut request, |configured| {
+            assert_eq!(
+                configured
+                    .memory
+                    .and_then(|memory| memory.attention_chunk_size),
+                Some(123)
+            );
+            Ok(7)
+        })
+        .unwrap();
+        assert_eq!(value, 7);
+        assert_eq!(complete.configured, 1);
+        assert_eq!(complete.outcomes, [gen_core::MemoryRunOutcome::Complete]);
+
+        let mut canceled = RecordingScope::default();
+        let result: Result<()> =
+            SenseNova::run_direct_scope(&mut canceled, &mut GenerationRequest::default(), |_| {
+                Err(Error::Canceled)
+            });
+        assert!(matches!(result, Err(Error::Canceled)));
+        assert_eq!(canceled.outcomes, [gen_core::MemoryRunOutcome::Canceled]);
+
+        let mut failed = RecordingScope::default();
+        let result: Result<()> =
+            SenseNova::run_direct_scope(&mut failed, &mut GenerationRequest::default(), |_| {
+                Err(Error::Msg("operation failed".into()))
+            });
+        assert!(result.is_err());
+        assert!(matches!(
+            failed.outcomes.as_slice(),
+            [gen_core::MemoryRunOutcome::Error { message }] if message == "operation failed"
+        ));
+
+        let mut crossed = RecordingScope {
+            reject_configure: true,
+            ..Default::default()
+        };
+        let mut called = false;
+        let result: Result<()> =
+            SenseNova::run_direct_scope(&mut crossed, &mut GenerationRequest::default(), |_| {
+                called = true;
+                Ok(())
+            });
+        assert!(result.is_err());
+        assert!(!called);
+        assert_eq!(crossed.configured, 1);
+        assert!(matches!(
+            crossed.outcomes.as_slice(),
+            [gen_core::MemoryRunOutcome::Error { .. }]
+        ));
+    }
+
+    #[test]
+    fn interleave_output_count_is_exactly_admission_bound() {
+        let request = GenerationRequest {
+            count: 4,
+            ..Default::default()
+        };
+        assert!(validate_interleave_count(&request, 4).is_ok());
+        for crossed in [0, 3, 5, 11] {
+            assert!(validate_interleave_count(&request, crossed).is_err());
+        }
+    }
+
+    #[test]
+    fn request_guard_reports_post_materialization_mutation_even_after_operation_error() {
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
+        let path = root.join("model.safetensors");
+        std::fs::write(&path, [0_u8; 8]).unwrap();
+        let artifact = crate::memory_strategy::PinnedArtifact::verify_file(&path).unwrap();
+        let result: Result<()> = guard_pinned_artifact(Some(&artifact), || {
+            let replacement = root.join("replacement.safetensors");
+            std::fs::write(&replacement, [1_u8; 8]).unwrap();
+            std::fs::rename(replacement, &path).unwrap();
+            Err(Error::Msg("earlier generation failure".to_owned()))
+        });
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("replaced or mutated"), "got: {error}");
+        assert!(
+            !error.contains("earlier generation failure"),
+            "got: {error}"
+        );
+    }
 
     #[test]
     fn descriptor_is_sensenova() {
@@ -455,6 +963,51 @@ mod tests {
         assert!(d.capabilities.accepts(ConditioningKind::MultiReference));
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supports_true_cfg);
+    }
+
+    #[test]
+    fn true_cfg_is_reference_image_guidance_not_text_cfg() {
+        let request = GenerationRequest {
+            prompt: "turn this into a watercolor".into(),
+            true_cfg: Some(1.75),
+            conditioning: vec![Conditioning::Reference {
+                image: Image::default(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            image_cfg_scale(&request),
+            1.75,
+            "request.true_cfg must reach T2iOptions.img_cfg_scale verbatim"
+        );
+        assert!(validate_dims_and_steps(MODEL_ID, &request).is_ok());
+
+        let no_reference = GenerationRequest {
+            conditioning: vec![],
+            ..request.clone()
+        };
+        let error = validate_dims_and_steps(MODEL_ID, &no_reference)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("requires Reference"),
+            "true_cfg on txt2img would otherwise be silently ignored: {error}"
+        );
+
+        let empty_multi = GenerationRequest {
+            conditioning: vec![Conditioning::MultiReference { images: vec![] }],
+            ..request
+        };
+        assert!(
+            validate_dims_and_steps(MODEL_ID, &empty_multi).is_err(),
+            "an empty MultiReference does not create the image-guidance branch"
+        );
+        assert_eq!(
+            image_cfg_scale(&GenerationRequest::default()),
+            1.0,
+            "unset true_cfg preserves the reference path's neutral image-guidance scale"
+        );
     }
 
     #[test]
@@ -618,6 +1171,51 @@ mod tests {
             },
         )
         .is_ok());
+    }
+
+    #[test]
+    fn reserved_image_markers_are_typed_refusals_for_text_and_image_requests() {
+        for conditioning in [
+            vec![],
+            vec![Conditioning::Reference {
+                image: Image::default(),
+                strength: None,
+            }],
+        ] {
+            for marker in RESERVED_IMAGE_MARKERS {
+                let request = GenerationRequest {
+                    prompt: format!("preserve the literal {marker} label"),
+                    width: 512,
+                    height: 512,
+                    conditioning: conditioning.clone(),
+                    ..Default::default()
+                };
+                let err: gen_core::Error = validate_reserved_image_markers(MODEL_ID, &request)
+                    .expect_err("reserved tokenizer markers must never reach the position builder")
+                    .into();
+                assert!(matches!(err, gen_core::Error::Unsupported(_)));
+                assert_eq!(
+                    err.to_string(),
+                    format!(
+                        "unsupported: {MODEL_ID}: prompt contains reserved internal image marker {marker}"
+                    )
+                );
+            }
+        }
+
+        // `<image>` is the public interleave placeholder. It must survive admission so the
+        // existing synthetic it2i/VQA parity fixtures can expand it to the matching vision spans.
+        let public_marker = GenerationRequest {
+            prompt: "compare this <image> with the description".into(),
+            width: 512,
+            height: 512,
+            conditioning: vec![Conditioning::Reference {
+                image: Image::default(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        assert!(validate_reserved_image_markers(MODEL_ID, &public_marker).is_ok());
     }
 
     #[test]

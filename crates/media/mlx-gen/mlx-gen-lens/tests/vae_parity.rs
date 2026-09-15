@@ -6,7 +6,7 @@
 //! exercises the whole shim — the reshape-to-packed-grid, the bn de-normalize, the 2×2 unpatchify, and
 //! the Flux.2 conv decoder — end to end.
 //!
-//! Run: `cargo test -p mlx-gen-lens --test vae_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-lens --test integration vae_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max, subtract};
 use mlx_rs::Dtype;
@@ -22,7 +22,7 @@ const GOLDEN: &str = concat!(
 
 fn snapshot_root() -> std::path::PathBuf {
     let base = std::path::PathBuf::from(std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)"))
-        .join("models--microsoft--Lens-Turbo/snapshots");
+        .join("models--SceneWorks--Lens-Turbo/snapshots");
     std::fs::read_dir(&base)
         .unwrap_or_else(|_| panic!("snapshot dir {}", base.display()))
         .filter_map(|e| e.ok())

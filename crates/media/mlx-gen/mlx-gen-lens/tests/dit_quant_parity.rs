@@ -6,7 +6,7 @@
 //! (the standard load-time-quant gate across the codebase; no torch reference needed). `#[ignore]`d —
 //! needs the golden + the ~8 GB bf16 transformer snapshot.
 //!
-//! Run: `cargo test -p mlx-gen-lens --test dit_quant_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-lens --test integration dit_quant_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max, multiply, subtract, sum};
 use mlx_rs::{Array, Dtype};
@@ -22,7 +22,7 @@ const GOLDEN: &str = concat!(
 
 fn transformer_dir() -> std::path::PathBuf {
     let base = std::path::PathBuf::from(std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)"))
-        .join("models--microsoft--Lens-Turbo/snapshots");
+        .join("models--SceneWorks--Lens-Turbo/snapshots");
     std::fs::read_dir(&base)
         .unwrap_or_else(|_| panic!("snapshot dir {}", base.display()))
         .filter_map(|e| e.ok())

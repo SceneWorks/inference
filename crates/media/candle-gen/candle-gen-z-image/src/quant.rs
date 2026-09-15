@@ -169,6 +169,7 @@ mod tests {
     /// reproduce the affine grid bit-exactly.
     #[test]
     fn linear_detect_fires_on_to_out_remap_and_leaves_dense_unchanged() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (64usize, 128usize);
         let (wq, s, b, grid) = q4_packed(out_dim, in_dim);
@@ -184,8 +185,7 @@ mod tests {
             Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?,
         );
 
-        let tmp =
-            std::env::temp_dir().join(format!("sc9408_detect_{}.safetensors", std::process::id()));
+        let tmp = tmp.path().join("sc9408_detect.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: we just wrote this file and nothing else touches it during the test.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -215,7 +215,6 @@ mod tests {
         let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "packed vs affine-grid cosine {cos:.6}");
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 
@@ -224,6 +223,7 @@ mod tests {
     /// table stays dense.
     #[test]
     fn embedding_detect_fires_and_matches_grid() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (vocab, hidden) = (32usize, 128usize);
         let (wq, s, b, grid) = q4_packed(vocab, hidden);
@@ -236,8 +236,7 @@ mod tests {
             "dense.weight".into(),
             Tensor::from_vec(grid.clone(), (vocab, hidden), &dev)?,
         );
-        let tmp =
-            std::env::temp_dir().join(format!("sc9408_emb_{}.safetensors", std::process::id()));
+        let tmp = tmp.path().join("sc9408_emb.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: freshly written, single-reader.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -257,7 +256,6 @@ mod tests {
             "packed embedding deviates from the dense grid"
         );
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 
@@ -265,6 +263,7 @@ mod tests {
     /// represents (the path the stock VAE consumes for the 8 mid-block attention projections).
     #[test]
     fn dequant_packed_to_dense_matches_grid() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (512usize, 64usize); // the real VAE mid-block attn shape
         let (wq, s, b, grid) = q4_packed(out_dim, in_dim);
@@ -273,8 +272,7 @@ mod tests {
         map.insert("to_q.weight".into(), wq);
         map.insert("to_q.scales".into(), s);
         map.insert("to_q.biases".into(), b);
-        let tmp =
-            std::env::temp_dir().join(format!("sc9408_vae_{}.safetensors", std::process::id()));
+        let tmp = tmp.path().join("sc9408_vae.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: freshly written, single-reader.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -286,7 +284,6 @@ mod tests {
         let dev_max = (dense.sub(&grid_t)?).abs()?.max_all()?.to_scalar::<f32>()?;
         assert_eq!(dev_max, 0.0, "vae dequant deviates from the affine grid");
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 }

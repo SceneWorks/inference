@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! set SENSENOVA_SNAPSHOT=C:\Users\…\models--sensenova--SenseNova-U1-8B-MoT\snapshots\<hash>
-//! cargo test -p candle-gen-sensenova --features cuda --release --test conformance -- --ignored
+//! cargo test -p candle-gen-sensenova --features cuda --release --test integration conformance:: -- --ignored
 //! ```
 //!
 //! The snapshot must carry a materialized `tokenizer.json` (the checkpoint ships only vocab.json +

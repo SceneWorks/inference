@@ -33,7 +33,8 @@ use std::sync::{Arc, Mutex};
 
 use candle_audio::gen_core::{
     self, AudioEditMode, AudioTrack, Capabilities, ConditioningKind, GenerationOutput,
-    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Progress, WeightsSource,
+    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Progress, StepSupport,
+    WeightsSource,
 };
 use candle_audio::{AudioError, Result as AudioResult};
 
@@ -53,31 +54,62 @@ pub const MODEL_ID: &str = "acestep_v15_turbo";
 pub const HUB_REPO: &str = "ACE-Step/acestep-v15-xl-turbo-diffusers";
 pub const HUB_REVISION: &str = "200ba991ae448051e14b0183157e35c2d27c9fb0";
 
-/// The license of the pinned ACE-Step v1.5 XL Turbo weight checkpoint (sc-13332) — surfaced for
-/// SceneWorks' end-product licenses page. MIT (permissive), verified against the
-/// `ACE-Step/acestep-v15-xl-turbo-diffusers` model card. The bundled `text_encoder`
-/// (Qwen3-Embedding-0.6B) is redistributed under Apache-2.0 — noted so the product surfaces the
-/// full picture even though the primary weight license governs.
-pub const WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
-    candle_audio::gen_core::WeightLicense {
-        spdx_id: "MIT",
-        name: "MIT License",
+/// Component keys for the artifacts the ACE-Step provider loads (sc-16663). One key per loaded
+/// artifact, not one per provider: the turbo primary and its bundled Qwen3 text encoder are two
+/// separately licensed artifacts inside one repository, and the three sft cover modules are three
+/// more.
+pub const COMPONENT_KEY: &str = "acestep_v15_xl_turbo";
+/// Component key for the bundled `text_encoder` (Qwen3-Embedding-0.6B), redistributed under its own
+/// Apache-2.0 grant inside the MIT-licensed turbo repository.
+pub const TEXT_ENCODER_COMPONENT_KEY: &str = "acestep_v15_turbo_text_encoder";
+/// Component key for the sft `audio_tokenizer` (FSQ) cover-conditioning checkpoint.
+pub const SFT_AUDIO_TOKENIZER_COMPONENT_KEY: &str = "acestep_v15_sft_audio_tokenizer";
+/// Component key for the sft `audio_token_detokenizer` cover-conditioning checkpoint.
+pub const SFT_AUDIO_TOKEN_DETOKENIZER_COMPONENT_KEY: &str =
+    "acestep_v15_sft_audio_token_detokenizer";
+/// Component key for the sft `transformer` — the non-distilled reference cover DiT.
+pub const SFT_TRANSFORMER_COMPONENT_KEY: &str = "acestep_v15_sft_transformer";
+
+/// The schema-3 licence row for the pinned ACE-Step v1.5 XL Turbo checkpoint (sc-16663).
+///
+/// **Disclosure only.** `declared` and `gated` were read from the
+/// `ACE-Step/acestep-v15-xl-turbo-diffusers` model card on `retrieved`.
+pub const COMPONENT_LICENSE: candle_audio::gen_core::ComponentLicense =
+    candle_audio::gen_core::ComponentLicense {
+        component: COMPONENT_KEY,
         source_url: "https://huggingface.co/ACE-Step/acestep-v15-xl-turbo-diffusers",
+        gated: false,
+        declared: "mit",
+        family: "mit",
         attribution: Some("ACE-Step v1.5 XL Turbo © ACE-Step — licensed under MIT"),
-        commercial_use: true,
-        restriction: Some(
-            "Bundled text_encoder (Qwen3-Embedding-0.6B) is redistributed under Apache-2.0.",
-        ),
+        retrieved: "2026-08-02",
     };
 
-/// This provider's **composite** weight-license entry (keyed by [`MODEL_ID`], `component == None`)
-/// for catalog aggregation — the at-a-glance effective license. All ACE-Step checkpoints (turbo
-/// primary + the sft cover FSQ modules) are MIT, so the composite is MIT.
-pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
-    candle_audio::gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: None,
-        license: WEIGHT_LICENSE,
+/// The schema-3 licence row for the bundled `text_encoder` (Qwen3-Embedding-0.6B).
+///
+/// v2 carried this fact as prose on the provider's composite row ("Bundled text_encoder
+/// (Qwen3-Embedding-0.6B) is redistributed under Apache-2.0."). A separately licensed artifact is a
+/// row of its own in schema 3, so the Apache-2.0 attribution and notice duties reach the derived
+/// provider union instead of sitting in a sentence nothing joins over. `declared` was read from the
+/// upstream `Qwen/Qwen3-Embedding-0.6B` model card on `retrieved`.
+///
+/// `source_url` names that upstream card rather than the ACE-Step repository this copy is
+/// redistributed in, per the rule on [`ComponentLicense::source_url`]: the field points at the
+/// document `declared` was transcribed from, and the ACE-Step card declares the *bundle's* licence,
+/// not this component's. Re-reading `apache-2.0` is only possible at Qwen's card.
+///
+/// [`ComponentLicense::source_url`]: candle_audio::gen_core::ComponentLicense::source_url
+pub const TEXT_ENCODER_COMPONENT_LICENSE: candle_audio::gen_core::ComponentLicense =
+    candle_audio::gen_core::ComponentLicense {
+        component: TEXT_ENCODER_COMPONENT_KEY,
+        source_url: "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B",
+        gated: false,
+        declared: "apache-2.0",
+        family: "apache-2-0",
+        attribution: Some(
+            "Qwen3-Embedding-0.6B © Alibaba Cloud — licensed under Apache-2.0; redistributed as the text_encoder of ACE-Step/acestep-v15-xl-turbo-diffusers",
+        ),
+        retrieved: "2026-08-02",
     };
 
 /// Hub pin for the Cover checkpoint (sc-13251): `ACE-Step/acestep-v15-xl-sft-diffusers` at an
@@ -99,68 +131,47 @@ pub const SFT_HUB_REVISION: &str = "4bf7b60a63b27144f539f980927eeb89f5f912b0";
 /// `transformer/`); a Cover request without it errors actionably at generate and never self-fetches.
 pub const COVER_COMPONENT_ID: &str = "sft_cover";
 
-/// License of the sft `audio_tokenizer` (FSQ) cover-conditioning checkpoint — MIT, verified against
-/// the `acestep-v15-xl-sft-diffusers` model card.
-pub const AUDIO_TOKENIZER_WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
-    candle_audio::gen_core::WeightLicense {
-        spdx_id: "MIT",
-        name: "MIT License",
+/// The schema-3 licence row for the sft `audio_tokenizer` (FSQ) cover-conditioning checkpoint.
+/// `declared` was read from the `ACE-Step/acestep-v15-xl-sft-diffusers` model card on `retrieved`.
+pub const SFT_AUDIO_TOKENIZER_COMPONENT_LICENSE: candle_audio::gen_core::ComponentLicense =
+    candle_audio::gen_core::ComponentLicense {
+        component: SFT_AUDIO_TOKENIZER_COMPONENT_KEY,
         source_url: "https://huggingface.co/ACE-Step/acestep-v15-xl-sft-diffusers",
+        gated: false,
+        declared: "mit",
+        family: "mit",
         attribution: Some(
             "ACE-Step v1.5 XL SFT audio_tokenizer (FSQ) © ACE-Step — licensed under MIT",
         ),
-        commercial_use: true,
-        restriction: None,
+        retrieved: "2026-08-02",
     };
 
-/// License of the sft `audio_token_detokenizer` cover-conditioning checkpoint — MIT.
-pub const AUDIO_TOKEN_DETOKENIZER_WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
-    candle_audio::gen_core::WeightLicense {
-        spdx_id: "MIT",
-        name: "MIT License",
+/// The schema-3 licence row for the sft `audio_token_detokenizer` cover-conditioning checkpoint.
+pub const SFT_AUDIO_TOKEN_DETOKENIZER_COMPONENT_LICENSE: candle_audio::gen_core::ComponentLicense =
+    candle_audio::gen_core::ComponentLicense {
+        component: SFT_AUDIO_TOKEN_DETOKENIZER_COMPONENT_KEY,
         source_url: "https://huggingface.co/ACE-Step/acestep-v15-xl-sft-diffusers",
+        gated: false,
+        declared: "mit",
+        family: "mit",
         attribution: Some(
             "ACE-Step v1.5 XL SFT audio_token_detokenizer © ACE-Step — licensed under MIT",
         ),
-        commercial_use: true,
-        restriction: None,
+        retrieved: "2026-08-02",
     };
 
-/// Per-checkpoint attribution row for the sft `audio_tokenizer` (component of [`MODEL_ID`]).
-pub const WEIGHT_LICENSE_ENTRY_AUDIO_TOKENIZER: candle_audio::gen_core::WeightLicenseEntry =
-    candle_audio::gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: Some("audio_tokenizer"),
-        license: AUDIO_TOKENIZER_WEIGHT_LICENSE,
-    };
-
-/// Per-checkpoint attribution row for the sft `audio_token_detokenizer` (component of [`MODEL_ID`]).
-pub const WEIGHT_LICENSE_ENTRY_AUDIO_TOKEN_DETOKENIZER: candle_audio::gen_core::WeightLicenseEntry =
-    candle_audio::gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: Some("audio_token_detokenizer"),
-        license: AUDIO_TOKEN_DETOKENIZER_WEIGHT_LICENSE,
-    };
-
-/// License of the sft `transformer` — the non-distilled reference cover DiT (sc-13251) — MIT.
-pub const SFT_TRANSFORMER_WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
-    candle_audio::gen_core::WeightLicense {
-        spdx_id: "MIT",
-        name: "MIT License",
+/// The schema-3 licence row for the sft `transformer` — the non-distilled reference cover DiT.
+pub const SFT_TRANSFORMER_COMPONENT_LICENSE: candle_audio::gen_core::ComponentLicense =
+    candle_audio::gen_core::ComponentLicense {
+        component: SFT_TRANSFORMER_COMPONENT_KEY,
         source_url: "https://huggingface.co/ACE-Step/acestep-v15-xl-sft-diffusers",
+        gated: false,
+        declared: "mit",
+        family: "mit",
         attribution: Some(
             "ACE-Step v1.5 XL SFT transformer (cover DiT) © ACE-Step — licensed under MIT",
         ),
-        commercial_use: true,
-        restriction: None,
-    };
-
-/// Per-checkpoint attribution row for the sft `transformer` cover DiT (component of [`MODEL_ID`]).
-pub const WEIGHT_LICENSE_ENTRY_SFT_TRANSFORMER: candle_audio::gen_core::WeightLicenseEntry =
-    candle_audio::gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: Some("transformer"),
-        license: SFT_TRANSFORMER_WEIGHT_LICENSE,
+        retrieved: "2026-08-02",
     };
 
 /// Native output sample rate (Hz).
@@ -183,6 +194,9 @@ pub const LANGUAGES: &[&str] = &["en", "zh", "ja", "ko", "fr", "de", "es", "it",
 /// ACE-Step's identity + capabilities — constructible without weights.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: None,
+        control_kinds: None,
         // Cover's ~7.8 GB sft snapshot is an OPTIONAL, on-demand component ([`COVER_COMPONENT_ID`] =
         // `sft_cover`, read only for a Cover request), NOT a hard requirement — text2music + the
         // region edit modes load without it — so it is deliberately absent here (mirrors LTX's
@@ -197,25 +211,21 @@ pub fn descriptor() -> ModelDescriptor {
             // negative-prompt / guidance surface is advertised (an explicit value is a typed
             // Unsupported / ignored, never a second forward).
             supports_negative_prompt: false,
-            supports_guidance: false,
-            supports_true_cfg: false,
             // Prompted source-audio editing (sc-12847): the SAME turbo weights natively serve
             // ACE-Step's audio-to-audio task modes, so the edit capability rides this existing
             // generator via a new conditioning kind rather than a distinct provider id.
             conditioning: vec![ConditioningKind::AudioEdit],
-            supports_lora: false,
-            supports_lokr: false,
-            samplers: vec![],
-            schedulers: vec![],
-            supported_guidance_methods: vec![],
             // Pure audio: no width/height. The descriptor sweep exempts Audio from the size floor
             // (sc-13314) and `validate_request_audio` skips the range, so these stay at the natural
             // unused 0 rather than a nominal placeholder bound.
             min_size: 0,
-            max_size: 0,
             // One clip per request (GenerationOutput::Audio carries a single track).
             max_count: 1,
-            mac_only: false,
+            // The provider's 200-step ceiling, advertised rather than hidden (sc-19559).
+            supported_steps: StepSupport::Range {
+                min: 1,
+                max: MAX_STEPS,
+            },
             audio_sample_rates: vec![SAMPLE_RATE],
             max_audio_duration_secs: Some(MAX_DURATION_SECS),
             // No voice/speaker surface — music, not TTS.
@@ -233,15 +243,7 @@ pub fn descriptor() -> ModelDescriptor {
                 AudioEditMode::Extend,
                 AudioEditMode::Cover,
             ],
-            supported_quants: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
+            ..Default::default()
         },
     }
 }
@@ -874,7 +876,8 @@ mod tests {
 
     #[test]
     fn load_rejects_unsupported_spec_shapes() {
-        let dir = std::env::temp_dir();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let spec = LoadSpec::new(WeightsSource::File(dir.join("x.safetensors")));
         assert!(load(&spec).is_err());
         let mut spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
@@ -884,8 +887,8 @@ mod tests {
 
     #[test]
     fn pre_tripped_cancel_returns_typed_canceled_before_any_heavy_work() {
-        let dir = std::env::temp_dir().join("acestep-missing-snapshot");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let g = load(&LoadSpec::new(WeightsSource::Dir(dir))).unwrap();
         let flag = CancelFlag::new();
         flag.cancel();
@@ -900,7 +903,8 @@ mod tests {
 
     #[test]
     fn load_captures_the_optional_sft_cover_component() {
-        let dir = std::env::temp_dir();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         // No component ⇒ loads fine (text2music / region-edit path); the Cover snapshot stays absent.
         assert!(load(&LoadSpec::new(WeightsSource::Dir(dir.clone()))).is_ok());
         // A staged `sft_cover` Dir is accepted (path captured, no I/O at load).
@@ -928,8 +932,8 @@ mod tests {
         // message (naming the component) — before the base pipeline is built, and never self-fetches.
         // `root` is an empty temp dir with no real weights, so reaching the base load would panic/err;
         // the fail-fast guard means we never get there.
-        let dir = std::env::temp_dir().join("acestep-cover-no-component");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let g = load(&LoadSpec::new(WeightsSource::Dir(dir))).unwrap();
         let err = g
             .generate(&edit_req(AudioEditMode::Cover, None), &mut |_| {})

@@ -313,6 +313,15 @@ const WAN_QUANT_SUFFIXES: &[&str] = &[
     ".ffn.fc2",
 ];
 
+/// Whether a sanitized Wan transformer linear belongs to the converter/runtime packed surface.
+/// Memory admission shares this predicate so its projected resident bytes cannot drift from the
+/// exact linears `quantize_wan_transformer` packs.
+pub(crate) fn is_wan_quantized_linear(base: &str) -> bool {
+    WAN_QUANT_SUFFIXES
+        .iter()
+        .any(|suffix| base.ends_with(suffix))
+}
+
 /// Port of `sanitize_wan_vae_weights` (the Wan2.1 z16 VAE — `convert_wan.py`): channels-last conv
 /// transposes only (Conv3d/Conv2d weights gated on `"weight" in key`), **no** key renames. Distinct
 /// from the bespoke z48 [`sanitize_wan22_vae`].
@@ -341,7 +350,7 @@ pub fn quantize_wan_transformer(
     let mut out = HashMap::with_capacity(map.len());
     for (k, v) in map {
         let base = k.strip_suffix(".weight");
-        let is_q = base.is_some_and(|b| WAN_QUANT_SUFFIXES.iter().any(|s| b.ends_with(s)));
+        let is_q = base.is_some_and(is_wan_quantized_linear);
         if let (true, Some(base)) = (is_q, base) {
             let (wq, scales, biases) = quantize(&v, group_size, bits)?;
             out.insert(format!("{base}.weight"), wq);
@@ -1322,8 +1331,8 @@ mod tests {
     /// it is pure file packaging.
     #[test]
     fn assemble_wan_vace_snapshot_links_components() {
-        let tmp = std::env::temp_dir().join(format!("wanvace_assemble_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         let tf = tmp.join("vace_repo/transformer");
         let base = tmp.join("base_wan");
         let out = tmp.join("wan_vace");
@@ -1375,8 +1384,6 @@ mod tests {
         std::fs::remove_file(base.join("vae.safetensors")).unwrap();
         let err = assemble_wan_vace_snapshot(out.join("again"), &tf, &base, true).unwrap_err();
         assert!(err.to_string().contains("vae.safetensors"), "got: {err}");
-
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// `assemble_wan_vace_fun_snapshot` (sc-6604) lays out a load-ready dual-expert `wan2_2_vace_fun_14b`
@@ -1384,8 +1391,8 @@ mod tests {
     /// idempotent. Pure file packaging, no weights.
     #[test]
     fn assemble_wan_vace_fun_snapshot_links_both_experts() {
-        let tmp = std::env::temp_dir().join(format!("wanvacefun_assemble_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         let high = tmp.join("vace_fun_repo/transformer");
         let low = tmp.join("vace_fun_repo/transformer_2");
         let base = tmp.join("base_wan");
@@ -1434,7 +1441,5 @@ mod tests {
         let err = assemble_wan_vace_fun_snapshot(out.join("again"), &high, &low, &base, true)
             .unwrap_err();
         assert!(err.to_string().contains("transformer_2"), "got: {err}");
-
-        std::fs::remove_dir_all(&tmp).ok();
     }
 }

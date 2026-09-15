@@ -4,7 +4,7 @@
 //!
 //!   FLUX1_DEV_SNAPSHOT=/path/to/FLUX.1-dev \
 //!   FLUX1_CONTROL_CHECKPOINT=/path/to/diffusion_pytorch_model.safetensors \
-//!     cargo test -p mlx-gen-flux --release --test control_real_weights -- --ignored --nocapture
+//!     cargo test -p mlx-gen-flux --release --test integration control_real_weights:: -- --ignored --nocapture
 //!
 //! This is the **maintainer's on-device gate** (epic 8236): it proves the control vertical end to end —
 //! load the dev snapshot through the registry as `flux1_dev_control` with the control checkpoint

@@ -3,7 +3,7 @@
 //!
 //! `#[ignore]`d — needs the real `Kwai-Kolors/Kolors-diffusers` snapshot in the HF cache (or
 //! `KOLORS_SNAPSHOT`), with the materialized `tokenizer/tokenizer.json`. Run:
-//!   cargo test -p mlx-gen-kolors --release --test trainer_e2e -- --ignored --nocapture
+//!   cargo test -p mlx-gen-kolors --release --test integration trainer_e2e:: -- --ignored --nocapture
 //!
 //! Proves the full prepare→load→cache→train→save lifecycle: a tiny captioned PNG dataset is
 //! VAE/ChatGLM3-encoded and cached, AdamW training drives the epsilon flow down, and an adapter is
@@ -11,7 +11,7 @@
 //! onto a fresh Kolors-loaded U-Net (Kolors' U-Net == the SDXL `UNet2DConditionModel`) — merging into
 //! every trained target and forwarding finite under Kolors conditioning shapes.
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 
@@ -55,6 +55,7 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
             image_path: path,
             caption: format!("a solid colour swatch number {i}"),
             control_image_path: None,
+            model_options: Default::default(),
         });
     }
     items
@@ -141,7 +142,8 @@ fn run_cfg(
 #[test]
 #[ignore = "needs real Kolors weights"]
 fn kolors_trainer_trains_and_writes_lora_that_reloads() {
-    let tmp = std::env::temp_dir().join("kolors_trainer_lora_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let (_losses, _steps, adapter_path) = run(&tmp, "swatch_lora.safetensors", NetworkType::Lora);
 
     // The produced adapter carries PEFT keys under the diffusers-UNet prefix + reload metadata.
@@ -182,7 +184,8 @@ fn kolors_trainer_trains_and_writes_lora_that_reloads() {
 #[test]
 #[ignore = "needs real Kolors weights"]
 fn kolors_trainer_trains_and_writes_lokr_that_reloads() {
-    let tmp = std::env::temp_dir().join("kolors_trainer_lokr_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let (_losses, _steps, adapter_path) = run(&tmp, "swatch_lokr.safetensors", NetworkType::Lokr);
 
     let w = Weights::from_file(&adapter_path).unwrap();
@@ -222,7 +225,8 @@ fn kolors_trainer_trains_and_writes_lokr_that_reloads() {
 #[test]
 #[ignore = "needs real Kolors weights"]
 fn kolors_trainer_gradient_checkpointing_converges() {
-    let tmp = std::env::temp_dir().join("kolors_trainer_gc_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let (losses, steps, adapter_path) = run_cfg(
         &tmp,
         "swatch_lora_gc.safetensors",
@@ -280,11 +284,12 @@ fn forward_finite(unet: &mlx_gen_sdxl::UNet2DConditionModel) {
 
 /// sc-5637 — preview samples. Proves the Kolors render path (install in-progress adapter → ChatGLM
 /// CFG denoise → VAE decode → `Image`) on real weights. Run:
-///   cargo test -p mlx-gen-kolors --release --test trainer_e2e -- --ignored --nocapture kolors_trainer_emits_preview_samples
+///   cargo test -p mlx-gen-kolors --release --test integration -- --ignored --nocapture trainer_e2e::kolors_trainer_emits_preview_samples
 #[test]
 #[ignore = "needs real Kolors weights (+ tokenizer.json overlay)"]
 fn kolors_trainer_emits_preview_samples() {
-    let tmp = std::env::temp_dir().join("kolors_trainer_samples_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
     assert_eq!(mlx_gen_kolors::MODEL_ID, "kolors");
     let mut trainer = mlx_gen_kolors::provider_registry()

@@ -10,7 +10,7 @@
 //!   * each incremental-decode step's logits match the reference (peak-rel within the f32 floor),
 //!   * the greedy token stream is bit-identical to the reference's.
 //!
-//! Run: `cargo test -p mlx-gen-sensenova --test runtime_parity -- --nocapture`
+//! Run: `cargo test -p mlx-gen-sensenova --test integration runtime_parity:: -- --nocapture`
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sensenova::{NeoChatConfig, Path, Qwen3Backbone, Sampler, ThinkRollout};

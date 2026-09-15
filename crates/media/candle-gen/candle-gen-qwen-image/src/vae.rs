@@ -14,17 +14,10 @@
 use candle_gen::candle_core::{DType, Error as CandleError, IndexOp, Result, Tensor};
 use candle_gen::candle_nn::{Conv2d, Conv2dConfig, Module, VarBuilder};
 use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
+use candle_gen::gen_core::{QWEN_WAN_Z16_MEAN as LATENTS_MEAN, QWEN_WAN_Z16_STD as LATENTS_STD};
+use candle_gen::LatentDecoder;
 
 const NORM_EPS: f64 = 1e-12;
-
-const LATENTS_MEAN: [f32; 16] = [
-    -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508, 0.4134, -0.0715, 0.5517,
-    -0.3632, -0.1922, -0.9497, 0.2503, -0.2921,
-];
-const LATENTS_STD: [f32; 16] = [
-    2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743, 3.2687, 2.1526, 2.8652, 1.5579,
-    1.6382, 1.1253, 2.8251, 1.916,
-];
 
 /// Load a `CausalConv3d` (`[O,I,kD,kH,kW]`) as a candle `Conv2d`, keeping only the last depth tap.
 fn causal_conv2d(
@@ -221,16 +214,18 @@ const DECODE_TILE_ABOVE_PX: usize = 1536;
 ///  - **correctness** (sc-10023): above [`DECODE_TILE_ABOVE_PX`] a monolithic tail conv overflows
 ///    candle's im2col launch and must tile regardless of the caller — so this fires even when
 ///    `force_tile` is false;
-///  - **VRAM** (sc-11744): `force_tile` engages the seam-free tiled tail *below* the threshold to cap the
-///    end-of-render decode spike on a constrained card. It is a pure *speed* trade (no quality cost), so
-///    the default caller keeps it false and a card with headroom decodes monolithically at full speed.
+///  - **VRAM** (sc-11744): `force_tile` engages the tiled tail *below* the threshold to cap the
+///    end-of-render decode spike on a constrained card. The tiling is normalization-correct but not
+///    bit-exact (see [`QwenVae::decode_with`]), so the default caller keeps it false and a card with
+///    headroom decodes monolithically at full speed.
 fn should_tile_tail(out_px_max: usize, force_tile: bool) -> bool {
     force_tile || out_px_max > DECODE_TILE_ABOVE_PX
 }
 
 /// Tail-decode tiling geometry (sc-10023): the decoder tail upsamples ×8 spatially, an image VAE has no
-/// temporal axis (`f = 1`, non-causal). Matches SDXL's `SDXL_VAE_TILING`.
-const TAIL_TILING: VaeTiling = VaeTiling {
+/// temporal axis (`f = 1`, non-causal). Matches SDXL's `SDXL_VAE_TILING`. `pub(crate)` so the memory
+/// contract publishes `vae_spatial_scale` from this geometry rather than from a literal.
+pub(crate) const TAIL_TILING: VaeTiling = VaeTiling {
     spatial_scale: 8,
     temporal_scale: 1,
     causal_temporal: false,
@@ -321,17 +316,56 @@ impl QwenVae {
     /// im2col-overflow correctness gate, unchanged). `force_tile = true` runs the seam-free tiled tail
     /// even *below* the threshold: the tail's peak activation is the ~full-resolution upsampler conv, so
     /// tiling it caps the end-of-render VRAM spike that OOMs a constrained card at a resolution the
-    /// denoise loop itself fits (the Krea pose-ControlNet fit-ladder's cheapest rung — a *speed* cost,
-    /// **no quality cost**, since the `Self::tile_blend_tail` trapezoidal blend is attention-free and a
-    /// partition of unity over the overlap). The default caller keeps `force_tile = false` so nothing
-    /// tiles on a card with headroom.
+    /// denoise loop itself fits (the Krea pose-ControlNet fit-ladder's cheapest rung).
+    ///
+    /// What the head/tail split guarantees is that the tiling is **normalization-correct**: no global
+    /// statistic is ever computed per crop, because the only global op — [`Self::decode_mid`]'s
+    /// `mid_attn`, a softmax over all H·W tokens — runs once on the whole latent, and every op in
+    /// [`Self::decode_tail`] is spatially local (convs, nearest upsample, and `ChanNorm`, whose
+    /// reduction is over the channel axis). It is **not** bit-exact: each tile's padded convolutions
+    /// zero-pad at their own crop boundary, so the tiled result is a close *approximation* of the
+    /// single-pass decode. `tests/vae_tiled_decode_parity.rs` holds that as a PSNR floor (≥ 40 dB)
+    /// rather than an equality, and proves the split is load-bearing by measuring the same tiling
+    /// applied to the whole decoder. The default caller keeps `force_tile = false` so nothing tiles on
+    /// a card with headroom.
     pub fn decode_with(&self, latents: &Tensor, force_tile: bool) -> Result<Tensor> {
+        let tile = force_tile.then_some((
+            crate::memory_strategy::DECODE_TILE_EDGE,
+            crate::memory_strategy::DECODE_OVERLAP,
+        ));
+        self.decode_with_tile(latents, tile)
+    }
+
+    /// Decode with an explicit production tail-tile candidate in output pixels. `None` preserves the
+    /// default monolithic path below the correctness threshold; above it the same provider fallback is
+    /// engaged so candle's im2col index limit cannot corrupt the output.
+    pub fn decode_with_tile(&self, latents: &Tensor, tile: Option<(u32, u32)>) -> Result<Tensor> {
+        match self.decode_with_tile_cancelable(latents, tile, None) {
+            Ok(decoded) => Ok(decoded),
+            Err(candle_gen::CandleError::Candle(error)) => Err(error),
+            Err(error) => Err(CandleError::Msg(error.to_string())),
+        }
+    }
+
+    fn decode_with_tile_cancelable(
+        &self,
+        latents: &Tensor,
+        tile: Option<(u32, u32)>,
+        cancel: Option<&candle_gen::gen_core::CancelFlag>,
+    ) -> candle_gen::Result<Tensor> {
+        if cancel.is_some_and(candle_gen::gen_core::CancelFlag::is_cancelled) {
+            return Err(candle_gen::CandleError::Canceled);
+        }
         let (_, _, lh, lw) = latents.dims4()?;
         let mid = self.decode_mid(latents)?;
-        if should_tile_tail((lh * 8).max(lw * 8), force_tile) {
-            self.tile_blend_tail(&mid)
+        if should_tile_tail((lh * 8).max(lw * 8), tile.is_some()) {
+            // Keep the pre-ladder high-resolution correctness fallback byte-for-byte compatible.
+            // The calibrated 64 px overlap applies only to an explicit memory-ladder selection;
+            // legacy automatic tiling above the im2col threshold remains 512/128.
+            let (edge, overlap) = tile.unwrap_or((512, 128));
+            self.tile_blend_tail(&mid, edge, overlap, cancel)
         } else {
-            self.decode_tail(&mid)
+            Ok(self.decode_tail(&mid)?)
         }
     }
 
@@ -364,13 +398,19 @@ impl QwenVae {
 
     /// Tiled [`Self::decode_tail`] with trapezoidal seam blending (sc-10023) — the SDXL sc-4987
     /// `tile_blend_decode` policy specialized to the Qwen tail. Splits the mid feature map `[1,384,h,w]`
-    /// into overlapping 64²-mid tiles (512² output, 128 px overlap), decodes each tail tile, and
+    /// into caller-selected output-pixel tiles (512²/64 px by default), decodes each tail tile, and
     /// accumulates `Σ(maskᵢ·decodeᵢ) / Σ maskᵢ`. Because the tail is attention-free and the per-axis
     /// trapezoidal masks are a partition of unity over the overlap, the blend is seam-free.
-    fn tile_blend_tail(&self, mid: &Tensor) -> Result<Tensor> {
+    fn tile_blend_tail(
+        &self,
+        mid: &Tensor,
+        tile_edge: u32,
+        overlap: u32,
+        cancel: Option<&candle_gen::gen_core::CancelFlag>,
+    ) -> candle_gen::Result<Tensor> {
         let device = mid.device();
         let (_b, _c, h, w) = mid.dims4()?;
-        let cfg = TilingConfig::spatial_only(512, 128);
+        let cfg = TilingConfig::spatial_only(tile_edge as i32, overlap as i32);
         let plan = cfg.plan(TAIL_TILING, 1, h as i32, w as i32);
         let (out_h, out_w) = (plan.out_h as usize, plan.out_w as usize);
 
@@ -378,6 +418,9 @@ impl QwenVae {
         let mut weights: Option<Tensor> = None; // [1, 1, out_h, out_w] f32
         for hh in &plan.h {
             for ww in &plan.w {
+                if cancel.is_some_and(candle_gen::gen_core::CancelFlag::is_cancelled) {
+                    return Err(candle_gen::CandleError::Canceled);
+                }
                 let tile = mid
                     .narrow(2, hh.start as usize, (hh.end - hh.start) as usize)?
                     .narrow(3, ww.start as usize, (ww.end - ww.start) as usize)?;
@@ -421,7 +464,51 @@ impl QwenVae {
         let weights =
             weights.ok_or_else(|| CandleError::Msg("vae tail tiling produced no tiles".into()))?;
         // Floor the divisor to avoid a divide-by-zero at any coverage gap (the plan guarantees > 0).
-        output.broadcast_div(&weights.clamp(1e-8f32, f32::MAX)?)
+        Ok(output.broadcast_div(&weights.clamp(1e-8f32, f32::MAX)?)?)
+    }
+}
+
+impl LatentDecoder for QwenVae {
+    fn input_latent_space(&self) -> Option<&candle_gen::gen_core::LatentSpace> {
+        Some(&candle_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE)
+    }
+
+    fn decode(&self, latents: &Tensor) -> candle_gen::Result<Tensor> {
+        Ok(QwenVae::decode(self, latents)?)
+    }
+
+    fn decode_tiled(
+        &self,
+        latents: &Tensor,
+        tiling: &TilingConfig,
+        cancel: Option<&candle_gen::gen_core::CancelFlag>,
+    ) -> candle_gen::Result<Tensor> {
+        if cancel.is_some_and(candle_gen::gen_core::CancelFlag::is_cancelled) {
+            return Err(candle_gen::CandleError::Canceled);
+        }
+        let tile = tiling
+            .spatial
+            .map(|spatial| {
+                if spatial.tile_px <= 0
+                    || spatial.overlap_px < 0
+                    || spatial.overlap_px >= spatial.tile_px
+                {
+                    return Err(candle_gen::CandleError::Msg(format!(
+                        "Qwen VAE tile policy requires 0 <= overlap < edge, got {}/{}",
+                        spatial.tile_px, spatial.overlap_px
+                    )));
+                }
+                Ok((spatial.tile_px as u32, spatial.overlap_px as u32))
+            })
+            .transpose()?;
+        let Some(tile) = tile else {
+            return Ok(QwenVae::decode(self, latents)?);
+        };
+        let (_, _, h, w) = latents.dims4()?;
+        if !tiling.needs_tiling(TAIL_TILING, 1, h as i32, w as i32) {
+            return Ok(QwenVae::decode(self, latents)?);
+        }
+        self.decode_with_tile_cancelable(latents, Some(tile), cancel)
     }
 }
 
@@ -566,7 +653,85 @@ impl QwenVaeEncoder {
 
 #[cfg(test)]
 mod tests {
-    use super::{should_tile_tail, DECODE_TILE_ABOVE_PX};
+    use super::{should_tile_tail, DECODE_TILE_ABOVE_PX, TAIL_TILING};
+    use candle_gen::gen_core::tiling::TilingConfig;
+
+    /// Real Qwen-VAE overlap decision harness for SC-15817. Run in separate CUDA processes with
+    /// `QWEN_VAE_OVERLAP=0`, `64`, and `96` (`0` is the monolithic quality reference); the process
+    /// boundary prevents cudarc's allocator high-water
+    /// from contaminating the second arm. `QWEN_VAE_OUT` optionally captures the rounded RGB bytes so
+    /// the two quality arms can be compared independently from their device peaks.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs QWEN_VAE_DIFFUSERS_DIR, QWEN_VAE_OVERLAP=0|64|96, and an idle CUDA GPU"]
+    fn real_weight_sub_512_overlap_probe() {
+        use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
+
+        let root = std::path::PathBuf::from(
+            std::env::var("QWEN_VAE_DIFFUSERS_DIR")
+                .expect("set QWEN_VAE_DIFFUSERS_DIR to a diffusers Qwen VAE directory"),
+        );
+        let overlap = std::env::var("QWEN_VAE_OVERLAP")
+            .expect("set QWEN_VAE_OVERLAP to 0, 64, or 96")
+            .parse::<u32>()
+            .expect("QWEN_VAE_OVERLAP must be an integer");
+        assert!(
+            matches!(overlap, 0 | 64 | 96),
+            "probe only compares monolithic, overlap 64, and overlap 96"
+        );
+        let edge = std::env::var("QWEN_VAE_TILE_EDGE")
+            .ok()
+            .map(|value| value.parse::<u32>().expect("QWEN_VAE_TILE_EDGE integer"))
+            .unwrap_or(384);
+        assert!(
+            edge < 512,
+            "this experiment is specifically the sub-512 decision"
+        );
+
+        let device = candle_gen::default_device().expect("CUDA device");
+        let mut probe = candle_gen::testkit::VramProbe::start_rendered().assert_idle(1.0);
+        let load_phase = probe.phase();
+        let files = candle_gen::sorted_safetensors(&root, "qwen-image").expect("Qwen VAE files");
+        let vb = candle_gen::mmap_var_builder(&files, DType::F32, &device).expect("Qwen VAE mmap");
+        let vae = super::QwenVae::new(vb).expect("Qwen VAE load");
+        probe.end_load(load_phase);
+
+        let count = 16usize * 128 * 128;
+        let values = (0..count)
+            .map(|index| ((index % 251) as f32 / 251.0) - 0.5)
+            .collect::<Vec<_>>();
+        let latent = Tensor::from_vec(values, (1, 16, 128, 128), &device).expect("latent");
+        let decode_phase = probe.phase();
+        let decoded = vae
+            .decode_with_tile(&latent, (overlap != 0).then_some((edge, overlap)))
+            .expect("candidate decode");
+        device.synchronize().expect("synchronize decode");
+        probe.end_gen(decode_phase);
+
+        let scaled = ((decoded.clamp(-1f32, 1f32).unwrap() + 1.0).unwrap() * 127.5).unwrap();
+        let pixels = candle_gen::round_rgb8(&scaled)
+            .unwrap()
+            .i(0)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .permute((1, 2, 0))
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<u8>()
+            .unwrap();
+        if let Ok(path) = std::env::var("QWEN_VAE_OUT") {
+            std::fs::write(&path, &pixels).expect("write rounded RGB bytes");
+        }
+        let report = probe.report();
+        eprintln!(
+            "QWEN_VAE_OVERLAP edge={edge} overlap={overlap} gpu={} bytes={} {report}",
+            candle_gen::testkit::probe_gpu(),
+            pixels.len()
+        );
+        report.assert_trustworthy(1.0);
+    }
 
     #[test]
     fn default_decode_preserves_the_im2col_correctness_gate() {
@@ -586,5 +751,27 @@ mod tests {
         assert!(should_tile_tail(512, true));
         // Above the threshold it stays tiled (correctness never regresses when VRAM tiling is also asked).
         assert!(should_tile_tail(2048, true));
+    }
+
+    #[test]
+    fn every_published_tile_edge_has_exact_coverage_with_shipped_overlap() {
+        for &edge in crate::memory_strategy::DECODE_TILE_EDGES {
+            let plan = TilingConfig::spatial_only(
+                edge as i32,
+                crate::memory_strategy::DECODE_OVERLAP as i32,
+            )
+            .plan(TAIL_TILING, 1, 128, 160);
+            assert_eq!((plan.out_h, plan.out_w), (1024, 1280));
+            for (tiles, out) in [(&plan.h, plan.out_h), (&plan.w, plan.out_w)] {
+                let mut coverage = vec![0.0f32; out as usize];
+                for tile in tiles {
+                    assert!(tile.out_stop - tile.out_start <= edge as i32);
+                    for (offset, weight) in tile.mask.iter().enumerate() {
+                        coverage[tile.out_start as usize + offset] += weight;
+                    }
+                }
+                assert!(coverage.iter().all(|weight| *weight > 0.0));
+            }
+        }
     }
 }

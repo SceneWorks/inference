@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! MLX_LLM_TEST_MODEL=/path/to/SmolLM2-135M-Instruct \
-//!   cargo test --test speculative -- --ignored --nocapture
+//!   cargo test --test integration -- speculative:: --ignored --nocapture
 //! ```
 //!
 //! ## What these prove

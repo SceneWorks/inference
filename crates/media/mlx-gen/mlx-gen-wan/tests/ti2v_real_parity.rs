@@ -19,7 +19,7 @@
 //! ```text
 //! WAN_5B_MODEL_DIR="$HOME/Library/Application Support/SceneWorks/data/models/mlx/wan_2_2_ti2v_5b" \
 //! WAN_5B_FIXTURE=/tmp/wan_5b_ti2v.safetensors \
-//!   cargo test -p mlx-gen-wan --test ti2v_real_parity -- --ignored --nocapture
+//!   cargo test -p mlx-gen-wan --test integration ti2v_real_parity:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;
@@ -140,7 +140,7 @@ fn wan_ti2v_5b_real_weight_e2e_matches_reference() {
         noise.shape()[2] as usize,
         noise.shape()[3] as usize,
     );
-    let (mask, mask_tokens) = build_ti2v_mask(zd, t_lat, h_lat, w_lat, cfg.patch_size);
+    let (mask, mask_tokens) = build_ti2v_mask(&[(0, 1.0)], zd, t_lat, h_lat, w_lat, cfg.patch_size);
 
     // --- Load the real DiT once; embed contexts; run both denoise modes ---
     let dit_w = Weights::from_file(model_dir.join("model.safetensors")).expect("dit");

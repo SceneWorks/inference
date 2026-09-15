@@ -17,7 +17,7 @@
 //! guard; a real structural bug escapes the band or breaks the guard.
 //!
 //! Windows run:
-//!   `MOCHI_SNAPSHOT=/path/to/mochi-1-preview cargo test -p candle-gen-mochi --features cuda --test e2e_parity -- --ignored --nocapture`
+//!   `MOCHI_SNAPSHOT=/path/to/mochi-1-preview cargo test -p candle-gen-mochi --features cuda --test integration e2e_parity:: -- --ignored --nocapture`
 #![cfg(feature = "cuda")]
 
 use std::path::{Path, PathBuf};

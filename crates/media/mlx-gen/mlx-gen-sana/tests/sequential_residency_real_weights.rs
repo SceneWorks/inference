@@ -3,7 +3,7 @@
 //! `#[ignore]`d — needs a real `Sana_1600M_1024px_diffusers`-shaped snapshot (`SANA_PIPELINE_WEIGHTS`).
 //! Run:
 //!   SANA_PIPELINE_WEIGHTS=/path/Sana_1600M_1024px_diffusers \
-//!     cargo test -p mlx-gen-sana --release --test sequential_residency_real_weights -- --ignored --nocapture
+//!     cargo test -p mlx-gen-sana --release --test integration sequential_residency_real_weights:: -- --ignored --nocapture
 //!
 //! Same two claims as the SDXL / Z-Image A/Bs: (1) `Sequential` peaks LOWER than `Resident` because the
 //! Gemma-2 CHI text encoder is dropped (+ `clear_cache()`) before the Linear-DiT trunk + DC-AE
@@ -13,6 +13,7 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::gen_core::GenerationMemory;
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy, WeightsSource};
 use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
 
@@ -101,7 +102,10 @@ fn sequential_bounds_peak_and_is_byte_identical() {
         eprintln!("skipping: set SANA_PIPELINE_WEIGHTS to run the SANA residency A/B");
         return;
     };
-    let req = probe_request();
+    let mut req = probe_request();
+    // Isolate rung 1: an explicit all-disabled request block overrides Sequential's shipping
+    // bounded-decode default, so this A/B compares only the component-residency lifecycle.
+    req.memory = Some(GenerationMemory::default());
     let (pixels_resident, peak_resident) =
         render_measured(OffloadPolicy::Resident, snap.clone(), &req);
     let (pixels_sequential, peak_sequential) =

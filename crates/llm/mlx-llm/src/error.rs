@@ -36,6 +36,27 @@ pub enum Error {
     #[error("cancelled")]
     Canceled,
 
+    /// A freshly loaded weight buffer whose GPU view never converged on the bytes the CPU holds
+    /// (sc-22414). Typed so a consumer can tell "the host's Metal mapping is lagging" from a
+    /// generic failure; see `primitives::coherence`.
+    #[error(
+        "GPU view of `{name}` ({bytes} bytes) never matched the CPU view after {attempts} reads \
+         (cpu checksum {cpu:#x}, gpu checksum {gpu:#x}): the Metal mapping of a freshly loaded \
+         buffer is stale — retry the load once the host's write-back pressure subsides (sc-22414)"
+    )]
+    IncoherentLoad {
+        /// The tensor key.
+        name: String,
+        /// Its byte size.
+        bytes: usize,
+        /// The CPU-stream checksum (the reference).
+        cpu: u64,
+        /// The last GPU-stream checksum observed.
+        gpu: u64,
+        /// GPU reads attempted.
+        attempts: u32,
+    },
+
     /// Anything else, with a human-readable message.
     #[error("{0}")]
     Msg(String),

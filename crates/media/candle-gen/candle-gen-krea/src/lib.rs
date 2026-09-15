@@ -23,8 +23,12 @@
 //!
 //! `backend = "candle"`, `mac_only = false`. Apache-2.0; Krea 2 Community License (non-commercial use
 //! satisfies it). The packed q4/q8/bf16 turnkey loads per-tier via `loader::linear_detect` (sc-9411);
-//! the descriptor advertises `supported_quants: [Q4, Q8]` so the worker's A-B quant toggle engages
-//! (sc-9607).
+//! the descriptor advertises `supported_quants: [Q4, Q8, Nvfp4]` so the worker can select both
+//! packed turnkey tiers and native NVIDIA Kitchen NVFP4 checkpoints
+//! (sc-9607). Packed loads retain file-backed converted sidecars: writable snapshots cache beside the
+//! component, while read-only snapshots use the configurable per-user external cache (sc-16587). A
+//! complete valid warm cache is read without taking its preparation lock; operators should budget
+//! roughly one additional packed-projection copy in whichever cache location is selected.
 
 pub mod adapters;
 pub mod config;
@@ -33,10 +37,14 @@ pub mod loader;
 /// Multi-phase Krea denoise primitive (epic 13879, sc-13887 — the candle mirror of mlx-gen-krea's
 /// sc-13884). Pure host-side decomposition of an ordered phase list over ONE shared sigma schedule.
 pub mod multiphase;
+pub mod native_mapping;
 /// The NVFP4 precision seam for the Krea 2 DiT trunk (sc-12110, epic 11037) — the epic's SC#1/SC#2
 /// validation vehicle. See [`nvfp4_dit`].
 pub mod nvfp4_dit;
 pub mod pipeline;
+/// Krea's per-step latent preview seam (epic 16948, sc-16950) — the projector closure every render
+/// route hands [`candle_gen::run_flow_sampler`], over the **reused** epic-16624 QwenVae fit.
+mod preview;
 pub mod quant;
 pub mod schedule;
 pub mod text_encoder;
@@ -80,7 +88,8 @@ pub use adapters::{
 };
 pub use config::Krea2Config;
 pub use control_provider::{
-    Krea2Control, Krea2ControlPaths, Krea2ControlRequest, DEFAULT_CONTROL_SCALE,
+    load_control_from_native_dit_file, Krea2Control, Krea2ControlPaths, Krea2ControlRequest,
+    DEFAULT_CONTROL_SCALE,
 };
 // The resident aggregate. It splits internally into `pipeline::KreaText` (tokenizer + Qwen3-VL-4B TE)
 // and `pipeline::KreaHeavy` (DiT + VAE + optional PiD) so the `Sequential` path can drop the first
@@ -90,8 +99,8 @@ pub use control_provider::{
 // methods; ours carry none.)
 // The NVFP4 seam (sc-12110): the plan/probe/report surface a validation harness drives.
 pub use nvfp4_dit::{
-    summarize, ActProbe, ActRecord, DitPlan, LayerRole, LayerSparsitySummary, Nvfp4Quant,
-    Nvfp4Report,
+    summarize, ActProbe, ActRecord, BlockLeaf, DenseReason, DitPlan, ExecutionRole, KreaSite,
+    LayerRole, LayerSparsitySummary, Nvfp4Capability, Nvfp4Quant, Nvfp4Report,
 };
 pub use pipeline::Components;
 pub use schedule::{krea_sigmas, turbo_sigmas, TURBO_MU, TURBO_STEPS};
@@ -107,15 +116,143 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{Device, Tensor};
+#[cfg(test)]
+use candle_gen::gen_core::OffloadPolicy;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, OffloadPolicy,
-    Progress, Quant, WeightsSource,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant,
+    WeightsSource, BASE_SNAPSHOT_COMPONENT, KREA_CONVROT_DIT_COMPONENT,
 };
 
 /// Registry id for the Krea 2 Turbo text-to-image variant. Matches the SceneWorks worker's
 /// `payload.model` and the manifest `engine_id` (sc-7572).
 pub const KREA_2_TURBO_ID: &str = "krea_2_turbo";
+
+/// Qwen3-VL-4B conditioning architecture shared by every Krea 2 route.
+pub const TOKENIZER_CONTRACT: gen_core::EncoderTokenizerContract =
+    gen_core::EncoderTokenizerContract {
+        family: "qwen3_vl",
+        binding: gen_core::EncoderTokenizerBinding::RetainBase,
+        artifact_candidates: &["tokenizer/tokenizer.json"],
+        required_tokens: &[
+            gen_core::EncoderRequiredToken {
+                role: "qwen_endoftext",
+                literal: "<|endoftext|>",
+                id: 151_643,
+                config_field: Some("bos_token_id"),
+            },
+            gen_core::EncoderRequiredToken {
+                role: "qwen_im_start",
+                literal: "<|im_start|>",
+                id: 151_644,
+                config_field: None,
+            },
+            gen_core::EncoderRequiredToken {
+                role: "qwen_im_end",
+                literal: "<|im_end|>",
+                id: 151_645,
+                config_field: Some("eos_token_id"),
+            },
+            gen_core::EncoderRequiredToken {
+                role: "qwen_vision_start",
+                literal: "<|vision_start|>",
+                id: 151_652,
+                config_field: Some("vision_start_token_id"),
+            },
+            gen_core::EncoderRequiredToken {
+                role: "qwen_vision_end",
+                literal: "<|vision_end|>",
+                id: 151_653,
+                config_field: Some("vision_end_token_id"),
+            },
+            gen_core::EncoderRequiredToken {
+                role: "qwen_image_pad",
+                literal: "<|image_pad|>",
+                id: 151_655,
+                config_field: Some("image_token_id"),
+            },
+        ],
+    };
+
+pub const PROMPT_EXECUTIONS: &[gen_core::EncoderPromptExecutionContract] = &[
+    gen_core::EncoderPromptExecutionContract {
+        purpose: "krea_t2i",
+        template: gen_core::EncoderPromptTemplate::KreaQwen3Vl,
+        add_special_tokens: false,
+        length: gen_core::EncoderPromptLengthPolicy::RejectAbove { max_tokens: 1024 },
+        padding: gen_core::EncoderPromptPadding::None,
+        prefix_trim: 34,
+    },
+    gen_core::EncoderPromptExecutionContract {
+        purpose: "krea_edit",
+        template: gen_core::EncoderPromptTemplate::KreaQwen3VlEdit,
+        add_special_tokens: false,
+        length: gen_core::EncoderPromptLengthPolicy::RejectAbove { max_tokens: 8192 },
+        padding: gen_core::EncoderPromptPadding::None,
+        prefix_trim: 34,
+    },
+];
+
+pub const ENCODER_CONTRACT: gen_core::EncoderContract = gen_core::EncoderContract {
+    architecture: "qwen3_vl_text",
+    hidden_size: 2560,
+    intermediate_size: 9728,
+    num_hidden_layers: 36,
+    num_attention_heads: 32,
+    num_key_value_heads: 8,
+    head_dim: 128,
+    vocab_size: 151_936,
+    output_width: 2560,
+    loaded_hidden_layers: 35,
+    requires_final_norm: false,
+    requires_lm_head: false,
+    hidden_activation: "silu",
+    attention_dropout: gen_core::EncoderConfigFloat::new(0.0),
+    rms_norm_eps: gen_core::EncoderConfigFloat::new(1e-6),
+    qk_norm_eps: Some(gen_core::EncoderConfigFloat::new(1e-6)),
+    rope_theta: gen_core::EncoderConfigFloat::new(5_000_000.0),
+    max_position_embeddings: 262_144,
+    attention_bias: gen_core::EncoderConfigBool::Required(false),
+    tie_word_embeddings: gen_core::EncoderConfigBool::Required(true),
+    tokenizer: TOKENIZER_CONTRACT,
+    prompt_executions: PROMPT_EXECUTIONS,
+    bos_token_id: Some(151_643),
+    eos_token_id: Some(151_645),
+    image_token_id: Some(151_655),
+    vision_start_token_id: Some(151_652),
+    vision_end_token_id: Some(151_653),
+    mrope_section: &[24, 20, 20],
+    mrope_interleaved: Some(true),
+    selected_hidden_layers: &[2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35],
+    packing: Some(gen_core::EncoderPackingContract {
+        group_size: 64,
+        pack_embedding: false,
+        pack_lm_head: false,
+        supports_file: false,
+    }),
+    dense_storage_dtype_probe: Some("language_model.layers.0.input_layernorm.weight"),
+};
+
+pub const VISION_ENCODER_CONTRACT: gen_core::VisionEncoderContract =
+    gen_core::VisionEncoderContract {
+        architecture: gen_core::VisionEncoderArchitecture::Qwen3Vl,
+        hidden_size: 1024,
+        intermediate_size: 4096,
+        num_hidden_layers: 24,
+        num_attention_heads: 16,
+        output_width: 2560,
+        hidden_activation: "gelu_pytorch_tanh",
+        rope_theta: gen_core::EncoderConfigFloat::new(10_000.0),
+        normalization_eps: gen_core::EncoderConfigFloat::new(1e-6),
+        patch_size: 16,
+        temporal_patch_size: 2,
+        spatial_merge_size: 2,
+        in_channels: 3,
+        num_position_embeddings: Some(2304),
+        deepstack_visual_indexes: &[5, 11, 17],
+        window_size: None,
+        full_attention_block_indexes: &[],
+    };
 
 /// Registry id for the undistilled **Raw** full-CFG text-to-image variant (sc-9994 / epic 9992). The
 /// SAME string as the Krea LoRA *trainer* base (`crate::training::KREA_2_RAW_ID`) — Path 1 makes one id
@@ -131,12 +268,24 @@ pub const KREA_2_RAW_ID: &str = "krea_2_raw";
 /// `krea_2_edit` seam. Matches the worker `payload.model` + manifest `engine_id`.
 pub const KREA_2_EDIT_ID: &str = "krea_2_edit";
 
-/// Surface tag for the **distilled Turbo image-edit** (`krea_2_turbo_edit`, sc-11640). Not a registered
-/// `Generator` id — the CFG-free distilled edit is driven through the worker's bespoke
-/// `generate_candle_krea_edit_stream` lane, which calls [`pipeline::render_edit`] with `distilled = true`
-/// directly. Named here so the shared edit path (PiD decode-seam errors, sc-11197) reports the right
-/// surface for the Turbo edit vs the Raw [`KREA_2_EDIT_ID`].
+/// Registered surface tag for the **distilled Turbo image-edit** (`krea_2_turbo_edit`, sc-11640).
+/// The CFG-free distilled edit shares [`pipeline::render_edit`] with the Raw edit and passes
+/// `distilled = true`, so the route uses Turbo's few-step schedule and reports its own surface in
+/// PiD decode-seam errors (sc-11197).
 pub const KREA_2_TURBO_EDIT_ID: &str = "krea_2_turbo_edit";
+/// Content identity for the CUDA resident/staged and ladder calibration harness.
+pub const RESIDENCY_CALIBRATION_FINGERPRINT: &str = "krea-cuda-residency-ladder-v1";
+/// Provider contract identity for the Krea Turbo five-rung phase curves — the **measured q4 cell**.
+///
+/// sc-22735 (epic sc-22723 E1/E4). This string used to be published by `krea_2_turbo` at all three
+/// artifact tiers, so a bf16 or q8 turbo capture would have been filed under the same key as the
+/// only turbo record that exists. SceneWorks' `config/memory-anchors.json` holds exactly one turbo
+/// anchor — `krea_2_turbo:candle:q4` — recorded against this exact string, so it is preserved
+/// byte-identical and is now reachable only from the q4 arm of
+/// [`krea_turbo_production_calibration_fingerprint`]. bf16 and q8 get their own keys.
+pub const TURBO_MEMORY_CALIBRATION_FINGERPRINT: &str = "krea-turbo-cuda-phase-curves-v1";
+/// Provider contract identity for the Krea pose-control direct calibration.
+pub const CONTROL_MEMORY_CALIBRATION_FINGERPRINT: &str = "sc-16013-krea-control-direct-1024-v1";
 
 /// patch_size(2)·vae_downsample(8) = 16 — patchify requires latent dims divisible by this. Exposed as
 /// the pinned-engine stride SceneWorks ties each advertised Krea image bucket to (sc-12612), mirroring
@@ -206,14 +355,24 @@ impl ResidentKrea {
 pub struct KreaGenerator {
     descriptor: ModelDescriptor,
     device: Device,
+    loaded_quant: Option<Quant>,
+    /// Load-time folding request for the companion text encoder. This differs from
+    /// `loaded_quant`: an already-packed companion reports the effective tier but must be loaded
+    /// directly on the compute device instead of entering the dense CPU-fold path.
+    text_load_quant: Option<Quant>,
+    #[cfg(any(feature = "cuda", test))]
+    memory_contract: Option<gen_core::MemoryProviderContract>,
     residency: candle_gen::Residency<KreaTextPhase, KreaHeavyPhase>,
-    /// Effective load policy retained so per-generation memory levers can select the physical
-    /// three-stage Turbo path only when the consumer actually requested sequential residency.
-    offload_policy: OffloadPolicy,
     /// The snapshot root — retained so the multi-phase render (epic 13879, sc-13887) can load its
     /// **job-local** base DiT from `transformer/` regardless of residency mode (the shared resident DiT
     /// is never mutated for per-phase adapter toggling — the concurrency-safety invariant).
     root: PathBuf,
+    /// Exact text-encoder source validated at construction, retained for request-staged reloads.
+    text_encoder_source: gen_core::ValidatedEncoderSource,
+    /// Imported native DiT source, when `LoadSpec::weights` was a single file. Pinned once at
+    /// generator construction and retained across resident, sequential, streamed, and multi-phase
+    /// materialization so no later request can silently adopt a replacement at the same path.
+    native_dit: Option<gen_core::PinnedWeightsFile>,
     /// The LoRA/LoKr adapters this model was loaded with (`LoadSpec::adapters`), retained so the
     /// multi-phase render can install each phase's named subset (by index, bounds-checked against
     /// `adapters.len()`, with an optional per-phase weight) on that phase's job-local DiT. Empty ⇒ a
@@ -228,11 +387,403 @@ pub struct KreaGenerator {
     /// Multi-phase is therefore rejected loudly on such a model (low-rank LoRA/LoKr — including the
     /// rank-64 turbo LoRA — toggle cleanly and are unaffected).
     has_diff_patch: bool,
+    /// Prepared File identities retained for lazy/sequential adapter, PiD, component, and imported
+    /// primary reopens. The cache key and every later provider read consume these same tokens.
+    file_pin_spec: LoadSpec,
+    /// The consumer-facing end of the checkpoint-facts handoff (sc-21484 follow-up). The other end
+    /// is a clone held by the residency load closures, which publish into it from
+    /// [`pipeline::load_native_dit_at_dtype`] — the one place that holds the
+    /// [`loader::Weights`] the shared logical-weight reader compiled a plan for.
+    ///
+    /// It is **empty until the first materialization** and stays empty forever on a directory
+    /// source, which is exactly what `Generator::checkpoint_weight_facts` returning `None` means:
+    /// this load produced no compiled plan (or has not read anything yet), never "the source stores
+    /// nothing quantized".
+    checkpoint_facts: gen_core::CheckpointFactsSink,
+}
+
+#[cfg(any(feature = "cuda", test))]
+struct KreaMemoryScope {
+    device: Device,
+    memory: Option<gen_core::GenerationMemory>,
+    provider_id: String,
+    mode: gen_core::MemoryMode,
+    reference_count: u32,
+    use_pid: bool,
+    has_phases: bool,
+    finished: bool,
+}
+
+#[cfg(test)]
+fn krea_generation_memory(
+    contract: &gen_core::MemoryProviderContract,
+    selection: gen_core::MemorySelection,
+) -> Option<gen_core::GenerationMemory> {
+    contract.generation_memory(&selection)
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl KreaMemoryScope {
+    fn ensure_active(&self) -> gen_core::Result<()> {
+        if self.finished {
+            Err(gen_core::Error::Msg(
+                "krea memory-strategy request scope is already finished".to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl gen_core::MemoryRequestScope for KreaMemoryScope {
+    fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
+        self.ensure_active()?;
+        let reference_count =
+            request.conditioning.iter().try_fold(0_u32, |count, item| {
+                let additional =
+                    match item {
+                        Conditioning::Reference { .. } => 1,
+                        Conditioning::MultiReference { images } => u32::try_from(images.len())
+                            .map_err(|_| {
+                                gen_core::Error::Unsupported(
+                                    "krea: reference count exceeds the typed memory-route domain"
+                                        .to_owned(),
+                                )
+                            })?,
+                        _ => return Err(gen_core::Error::Unsupported(
+                            "krea: request conditioning does not match the admitted memory route"
+                                .to_owned(),
+                        )),
+                    };
+                count.checked_add(additional).ok_or_else(|| {
+                    gen_core::Error::Unsupported(
+                        "krea: reference count exceeds the typed memory-route domain".to_owned(),
+                    )
+                })
+            })?;
+        if reference_count != self.reference_count
+            || request.phases.is_some() != self.has_phases
+            || request.use_pid != self.use_pid
+        {
+            return Err(gen_core::Error::Unsupported(
+                format!(
+                    "{}: request mode/reference/PiD/phase shape does not match the admitted {} r{} pid={} phases={} memory route",
+                    self.provider_id,
+                    self.mode.as_key(),
+                    self.reference_count,
+                    self.use_pid,
+                    self.has_phases,
+                ),
+            ));
+        }
+        // The shared selection is authoritative and request-scoped. Overwrite any state left on a
+        // reused warm request so a deeper prior rung cannot leak into the next run.
+        request.memory = self.memory;
+        Ok(())
+    }
+
+    fn enter_phase(&mut self, _phase: gen_core::MemoryPhase) -> gen_core::Result<()> {
+        self.ensure_active()
+    }
+
+    fn leave_phase(&mut self, _phase: gen_core::MemoryPhase) -> gen_core::Result<()> {
+        self.ensure_active()
+    }
+
+    fn configure_decode(
+        &mut self,
+        tile_edge: u32,
+        overlap: u32,
+        _geometry: gen_core::MemoryGeometry,
+    ) -> gen_core::Result<()> {
+        self.ensure_active()?;
+        if matches!(
+            self.provider_id.as_str(),
+            KREA_2_RAW_ID | KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID
+        ) {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: bounded decode is not implemented",
+                self.provider_id
+            )));
+        }
+        if SUPPORTED_DECODE_TILE_EDGES.contains(&tile_edge)
+            && SUPPORTED_DECODE_OVERLAPS.contains(&overlap)
+        {
+            Ok(())
+        } else {
+            Err(gen_core::Error::Unsupported(format!(
+                "krea_2_turbo: decode tiling is fixed at 512/128, got {tile_edge}/{overlap}"
+            )))
+        }
+    }
+
+    fn configure_attention(&mut self, chunk_size: u32) -> gen_core::Result<()> {
+        self.ensure_active()?;
+        if matches!(
+            self.provider_id.as_str(),
+            KREA_2_RAW_ID | KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID
+        ) {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: bounded attention is not implemented",
+                self.provider_id
+            )));
+        }
+        if SUPPORTED_ATTENTION_CHUNK_SIZES.contains(&chunk_size) {
+            Ok(())
+        } else {
+            Err(gen_core::Error::Unsupported(format!(
+                "krea_2_turbo: attention chunk size is fixed at {}, got {chunk_size}",
+                pipeline::CONSTRAINED_ATTN_SCORES_BUDGET
+            )))
+        }
+    }
+
+    fn materialize_transformer_window(
+        &mut self,
+        _first_block: u32,
+        block_count: u32,
+    ) -> gen_core::Result<()> {
+        self.ensure_active()?;
+        if matches!(
+            self.provider_id.as_str(),
+            KREA_2_RAW_ID | KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID
+        ) {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: bounded transformer residency is not implemented",
+                self.provider_id
+            )));
+        }
+        if SUPPORTED_TRANSFORMER_WINDOWS.contains(&block_count) {
+            Ok(())
+        } else {
+            Err(gen_core::Error::Unsupported(format!(
+                "krea_2_turbo: transformer residency window is fixed at \
+                 {SUPPORTED_TRANSFORMER_WINDOWS:?}, got {block_count}"
+            )))
+        }
+    }
+
+    fn finish(&mut self, _outcome: gen_core::MemoryRunOutcome) -> gen_core::Result<()> {
+        self.ensure_active()?;
+        self.device
+            .synchronize()
+            .map_err(gen_core::Error::backend)?;
+        self.finished = true;
+        Ok(())
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl Drop for KreaMemoryScope {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.device.synchronize();
+            self.finished = true;
+        }
+    }
+}
+
+/// The shared ladder → this provider's per-request execution controls.
+///
+/// SC-15805: the cumulative default is **contract-owned and defeasible**, so ask
+/// [`gen_core::MemoryProviderContract::engages`] which rungs the selection engages instead of
+/// hardcoding the cost order in a `match`. A hardcoded `tile_vae_decode: true` on the rung-3 and
+/// rung-4 arms is the same hazard as a `>=` comparison in different syntax — it turns a lever on
+/// underneath a provider that has not declared that rung `Implemented`. Krea Turbo's contract
+/// declares every rung `Implemented`, so the two agree exactly today; this is a consistency fix,
+/// not a behavior change.
+/// The rung-4 windows this provider will execute — the same list
+/// `krea_turbo_memory_strategy_contract` publishes as `transformer_window_sizes`.
+///
+/// One entry, deliberately. SC-16154 re-measured the post-SC-16096 sidecar path on CUDA with 12
+/// balanced interleaved samples per window (95.6 GiB RTX PRO 6000 Blackwell, device 0):
+///
+/// | window | median step | full min–max spread | paired mean delta vs 1 (95% CI) |
+/// |---:|---:|---:|---:|
+/// | 1 | 2.0423 s | 1.6311–2.3491 s | reference |
+/// | 2 | 2.0027 s | 1.6234–2.4844 s | +0.0416 s (-0.0984–+0.1817) |
+/// | 4 | 1.9914 s | 1.6957–2.4211 s | -0.0091 s (-0.1403–+0.1222) |
+/// | 8 | 1.8468 s | 1.7265–2.2018 s | -0.0651 s (-0.2120–+0.0818) |
+/// | 15 | 1.9286 s | 1.7662–2.4683 s | +0.0193 s (-0.1461–+0.1847) |
+/// | 30 | 2.0813 s | 1.7697–2.6964 s | +0.1911 s (+0.0298–+0.3524) |
+///
+/// Paired time is flat through window 15 (every interval includes zero) and increasing at window 30
+/// (+191 ms, interval excludes zero); the median-time fit is +2.0 ms/block. Even window 8's apparent
+/// -9.6% median is unresolved by its paired interval. Peak is linear at
+/// `107.9·window + 153.4 MiB`, so no wider window buys a demonstrated speedup while every one spends
+/// more VRAM. Rung 4 is selected only for a caller already short of VRAM; publish only the
+/// minimum-peak window. See
+/// [`crate::transformer::DEFAULT_TRANSFORMER_WINDOW`].
+///
+/// NOT cfg-gated, unlike the contract that publishes it: `generate` re-validates the window on every
+/// build, and the streamed trunk itself is not cuda-only (it runs on CPU in the parity tests).
+const SUPPORTED_TRANSFORMER_WINDOWS: &[u32] = &[1];
+const SUPPORTED_DECODE_TILE_EDGES: &[u32] = &[512];
+const SUPPORTED_DECODE_OVERLAPS: &[u32] = &[128];
+const SUPPORTED_ATTENTION_CHUNK_SIZES: &[u32] = &[pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32];
+
+fn validate_memory_parameters(
+    id: &str,
+    memory: gen_core::GenerationMemory,
+) -> gen_core::Result<()> {
+    for (name, value, engaged, allowed) in [
+        (
+            "decode_tile_edge",
+            memory.decode_tile_edge,
+            memory.tile_vae_decode,
+            SUPPORTED_DECODE_TILE_EDGES,
+        ),
+        (
+            "decode_overlap",
+            memory.decode_overlap,
+            memory.tile_vae_decode,
+            SUPPORTED_DECODE_OVERLAPS,
+        ),
+        (
+            "attention_chunk_size",
+            memory.attention_chunk_size,
+            memory.chunk_attention,
+            SUPPORTED_ATTENTION_CHUNK_SIZES,
+        ),
+    ] {
+        if value.is_some() && !engaged {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{id}: {name} is present but its owning memory-strategy rung is not engaged"
+            )));
+        }
+        if let Some(value) = value {
+            if !allowed.contains(&value) {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "{id}: {name}={value} is outside the published candidates {allowed:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_krea_memory_route(
+    provider_id: &str,
+    context: &gen_core::MemoryRunContext,
+) -> gen_core::Result<()> {
+    let references = context.geometry.reference_count;
+    let plain_overlay = context.overlay.is_none();
+    let supported = match provider_id {
+        KREA_2_TURBO_ID => {
+            context.mode == gen_core::MemoryMode::TextToImage
+                && references == 0
+                && !context.use_pid
+                && !context.has_phases
+                && plain_overlay
+        }
+        KREA_2_RAW_ID => {
+            plain_overlay
+                && ((!context.has_phases
+                    && matches!(
+                        (&context.mode, references),
+                        (gen_core::MemoryMode::TextToImage, 0)
+                            | (gen_core::MemoryMode::ImageToImage, 1)
+                    ))
+                    || (context.has_phases
+                        && context.mode == gen_core::MemoryMode::TextToImage
+                        && references == 0
+                        && !context.use_pid))
+        }
+        KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID => {
+            context.mode == gen_core::MemoryMode::Edit
+                && matches!(references, 1 | 2)
+                && !context.has_phases
+                && plain_overlay
+        }
+        "krea_2_turbo_control" => {
+            context.mode == gen_core::MemoryMode::ImageToImage
+                && references == 1
+                && !context.use_pid
+                && !context.has_phases
+                && context.overlay.as_deref() == Some("pose-control")
+        }
+        _ => false,
+    };
+    if supported {
+        Ok(())
+    } else {
+        Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: memory route does not support mode={} references={references} pid={} phases={} overlay={:?}",
+            context.mode.as_key(),
+            context.use_pid,
+            context.has_phases,
+            context.overlay,
+        )))
+    }
 }
 
 impl Generator for KreaGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    /// The three correlated facts about the checkpoint this generator loaded (sc-21484 follow-up).
+    ///
+    /// Krea's single-file native import route publishes here from the shared logical-weight reader;
+    /// the directory and packed-tier routes have no compiled plan and leave this `None`. Because
+    /// Krea residency is lazy, this is also `None` between construction and the first
+    /// materialization — there is no measured receipt to report before anything has been read.
+    fn checkpoint_weight_facts(&self) -> Option<gen_core::CheckpointWeightFacts> {
+        self.checkpoint_facts.facts()
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        #[cfg(any(feature = "cuda", test))]
+        {
+            self.memory_contract.as_ref()
+        }
+        #[cfg(not(any(feature = "cuda", test)))]
+        {
+            None
+        }
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let Some(contract) = self.memory_strategy_contract() else {
+            return gen_core::MemorySafetyDecision::Accept;
+        };
+        krea_memory_strategy_safety_check(contract, self.loaded_quant, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        #[cfg(feature = "cuda")]
+        {
+            if let gen_core::MemorySafetyDecision::Reject { reason } =
+                self.memory_strategy_safety_check(context)
+            {
+                return Err(gen_core::Error::Unsupported(reason));
+            }
+            Ok(Some(Box::new(KreaMemoryScope {
+                device: self.device.clone(),
+                memory: self
+                    .memory_contract
+                    .as_ref()
+                    .and_then(|contract| contract.generation_memory(&context.selection)),
+                provider_id: self.descriptor.id.to_owned(),
+                mode: context.mode.clone(),
+                reference_count: context.geometry.reference_count,
+                use_pid: context.use_pid,
+                has_phases: context.has_phases,
+                finished: false,
+            })))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = context;
+            Ok(None)
+        }
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -255,7 +806,7 @@ impl Generator for KreaGenerator {
         // The Edit variant needs 1..=2 source references (image 1, then image 2). The capability floor
         // above accepts a single `Reference` on Turbo/Raw (img2img latent-init) but rejects a
         // MultiReference there; only `krea_2_edit` advertises both, so resolve + count-check here.
-        if self.descriptor.id == KREA_2_EDIT_ID {
+        if matches!(self.descriptor.id, KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID) {
             resolve_edit_references(req)?;
         }
         // Multi-phase denoise (epic 13879, sc-13887): Raw-only, from pure noise, ≥1-step phases. The
@@ -270,12 +821,27 @@ impl Generator for KreaGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        if let Some(memory) = req.memory {
+            validate_memory_parameters(self.descriptor.id, memory)?;
+        }
+        if req
+            .memory
+            .is_some_and(|memory| memory.stream_transformer_blocks)
+            && !self.adapters.is_empty()
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: streamed transformer residency does not support load-time LoRA/LoKr or \
+                 diff-patch adapters",
+                self.descriptor.id
+            )));
+        }
         // Loud-reject a multi-phase request on a diff-patch model (sc-13887): its baked `.diff` delta
         // can't be toggled off per phase, so it would silently corrupt "base-only" phases.
         ensure_multiphase_allowed_for(self.descriptor.id, self.has_diff_patch, req)?;
 
         let raw = self.descriptor.id == KREA_2_RAW_ID;
-        let edit = self.descriptor.id == KREA_2_EDIT_ID;
+        let turbo_edit = self.descriptor.id == KREA_2_TURBO_EDIT_ID;
+        let edit = self.descriptor.id == KREA_2_EDIT_ID || turbo_edit;
         let edit_references: Vec<Image> = if edit {
             resolve_edit_references(req)?.into_iter().cloned().collect()
         } else {
@@ -283,26 +849,79 @@ impl Generator for KreaGenerator {
         };
         let reference = img2img_reference(req);
 
-        if req.memory.is_some() {
+        let has_higher_rung_controls = req.memory.as_ref().is_some_and(|memory| {
+            gen_core::GenerationMemory {
+                stage_residency: false,
+                ..*memory
+            } != gen_core::GenerationMemory::default()
+        });
+        if has_higher_rung_controls {
+            let memory = req
+                .memory
+                .as_ref()
+                .expect("higher-rung controls require a GenerationMemory block");
+            // A request that is already cancelled must stop before capability checks or any
+            // request-scoped component transition. This preserves the cancellation contract for
+            // every descriptor, including variants that do not support the selected memory rung.
+            candle_gen::check_cancel(&req.cancel)?;
+            if self.native_dit.is_some() {
+                validate_native_file_transformer_request(
+                    self.descriptor.id,
+                    &self.file_pin_spec,
+                    *memory,
+                )?;
+            }
             if self.descriptor.id != KREA_2_TURBO_ID
-                || self.offload_policy != OffloadPolicy::Sequential
+                || !self.descriptor.capabilities.supports_sequential_offload
                 || reference.is_some()
                 || req.phases.is_some()
                 || req.use_pid
             {
                 return Err(gen_core::Error::Unsupported(format!(
-                    "{}: per-generation memory adaptation is supported only for sequential, \
-                     native-VAE, ordinary Turbo text-to-image requests",
+                    "{}: per-generation memory adaptation is supported only for native-VAE, \
+                     ordinary Turbo text-to-image requests",
                     self.descriptor.id
                 )));
             }
-            let images = pipeline::render_three_stage(
-                &self.root,
-                &self.device,
-                &self.adapters,
-                req,
-                on_progress,
-            )?;
+            // SC-15792: re-validate the rung-4 window here, not only in `MemoryRequestScope`.
+            // `materialize_transformer_window` guards the calibration lifecycle, but this arm is
+            // reachable with a hand-built `GenerationMemory` that never opens a scope — and since
+            // the window is now genuinely honoured, an out-of-domain value would execute a schedule
+            // the provider never declared. gen-core's rule for these fields is that an unsupported
+            // value is "a typed rejection rather than a silently different execution than the
+            // selector chose"; before the window was plumbed the same request silently ran 1.
+            if let Some(window) = memory.transformer_window_size {
+                if !SUPPORTED_TRANSFORMER_WINDOWS.contains(&window) {
+                    return Err(gen_core::Error::Unsupported(format!(
+                        "{}: transformer residency window is fixed at {:?}, got {window}",
+                        self.descriptor.id, SUPPORTED_TRANSFORMER_WINDOWS
+                    )));
+                }
+            }
+            // Keep Krea's established text → DiT → VAE phase bodies disjoint. The shared owner
+            // contributes the request-scoped warm-cache transition; this pipeline retains the
+            // three-stage execution needed by every cumulative memory rung.
+            let images = self.residency.run_exclusive_staged(&req.cancel, || {
+                self.file_pin_spec.read_files_unchanged(
+                    self.file_pin_spec.file_source_paths(),
+                    || {
+                        pipeline::render_three_stage_with_native(
+                            &self.root,
+                            &self.text_encoder_source,
+                            self.native_dit.as_ref(),
+                            &self.device,
+                            &self.adapters,
+                            pipeline::NativeFileQuantization {
+                                transformer: self.loaded_quant,
+                                text_encoder: self.text_load_quant,
+                            },
+                            req,
+                            on_progress,
+                            &self.checkpoint_facts,
+                        )
+                    },
+                )
+            })?;
             return Ok(GenerationOutput::Images(images));
         }
 
@@ -330,9 +949,15 @@ impl Generator for KreaGenerator {
             .map(|r| multiphase::any_phase_uses_cfg(r))
             .unwrap_or(false);
 
-        let images = self.residency.run(
+        let stage_residency = req
+            .memory
+            .as_ref()
+            .is_some_and(|memory| memory.stage_residency);
+        let synchronize = |result| candle_gen::synchronize_result(&self.device, result);
+        let images = self.residency.run_request_scoped(
+            stage_residency,
+            false,
             &req.cancel,
-            &self.device,
             req.use_pid,
             on_progress,
             |text| match text {
@@ -351,7 +976,7 @@ impl Generator for KreaGenerator {
                         text,
                         req,
                         &edit_references,
-                        false,
+                        turbo_edit,
                         &self.device,
                     )?))
                 }
@@ -359,6 +984,7 @@ impl Generator for KreaGenerator {
                     pipeline::encode_residency(text, raw, req)?,
                 )),
             },
+            |_| Ok(self.device.synchronize()?),
             |heavy, encoded, on_progress| match (heavy, encoded) {
                 // Multi-phase render (sc-13887): drive the resolved phases over the ONE global Raw schedule
                 // through a job-local re-adapted DiT (the shared resident is never mutated). `Sequential`
@@ -370,16 +996,23 @@ impl Generator for KreaGenerator {
                     let resolved = mp_resolved
                         .as_ref()
                         .expect("multi-phase encode implies a resolved plan");
-                    pipeline::render_multiphase(
-                        heavy.vae(),
-                        &self.root,
-                        &self.device,
-                        resolved,
-                        &self.adapters,
-                        &context,
-                        negative.as_ref(),
-                        req,
-                        on_progress,
+                    self.file_pin_spec.read_files_unchanged(
+                        self.file_pin_spec.file_source_paths(),
+                        || {
+                            synchronize(pipeline::render_multiphase(
+                                heavy.vae(),
+                                &self.root,
+                                self.native_dit.as_ref(),
+                                self.loaded_quant,
+                                &self.device,
+                                resolved,
+                                &self.adapters,
+                                &context,
+                                negative.as_ref(),
+                                req,
+                                on_progress,
+                            ))
+                        },
                     )
                 }
                 (KreaHeavyPhase::Resident(resident), KreaEncoded::Resident)
@@ -391,48 +1024,55 @@ impl Generator for KreaGenerator {
                     let comps = &resident.components;
                     let (context, negative) =
                         pipeline::encode_multiphase_contexts(comps.text(), req, mp_need_neg)?;
-                    pipeline::render_multiphase(
-                        comps.vae(),
-                        &self.root,
-                        &self.device,
-                        resolved,
-                        &self.adapters,
-                        &context,
-                        negative.as_ref(),
-                        req,
-                        on_progress,
+                    self.file_pin_spec.read_files_unchanged(
+                        self.file_pin_spec.file_source_paths(),
+                        || {
+                            synchronize(pipeline::render_multiphase(
+                                comps.vae(),
+                                &self.root,
+                                self.native_dit.as_ref(),
+                                self.loaded_quant,
+                                &self.device,
+                                resolved,
+                                &self.adapters,
+                                &context,
+                                negative.as_ref(),
+                                req,
+                                on_progress,
+                            ))
+                        },
                     )
                 }
                 (KreaHeavyPhase::Sequential(heavy), KreaEncoded::Edit(context)) => {
-                    pipeline::render_edit_residency(
+                    synchronize(pipeline::render_edit_residency(
                         heavy,
                         context,
                         req,
                         &edit_references,
                         &self.device,
                         on_progress,
-                    )
+                    ))
                 }
                 (KreaHeavyPhase::Sequential(heavy), KreaEncoded::Sequential(context)) => {
-                    pipeline::render_residency(
+                    synchronize(pipeline::render_residency(
                         heavy,
                         context,
                         req,
                         reference,
                         &self.device,
                         on_progress,
-                    )
+                    ))
                 }
                 (KreaHeavyPhase::Resident(resident), KreaEncoded::Resident) => {
                     let comps = &resident.components;
-                    if edit {
+                    let result = if edit {
                         let edit = resident.edit_components()?;
                         pipeline::render_edit(
                             comps,
                             &edit,
                             req,
                             &edit_references,
-                            false,
+                            turbo_edit,
                             &self.device,
                             on_progress,
                         )
@@ -464,7 +1104,8 @@ impl Generator for KreaGenerator {
                         )
                     } else {
                         pipeline::render(comps, req, &self.device, on_progress)
-                    }
+                    };
+                    synchronize(result)
                 }
                 _ => unreachable!("residency phase variants are constructed in matching pairs"),
             },
@@ -480,16 +1121,17 @@ impl Generator for KreaGenerator {
 /// `Conditioning::Reference` — but no control conditioning on the Turbo checkpoint.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: Some(ENCODER_CONTRACT),
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
+        control_kinds: None,
         required_components: &[],
         id: KREA_2_TURBO_ID,
         family: "krea_2",
         backend: "candle",
         modality: Modality::Image,
         capabilities: Capabilities {
-            supports_negative_prompt: false,
             // CFG-free distilled student (like Ideogram Turbo / Boogu Turbo / SDXL-Lightning).
             supports_guidance: false,
-            supports_true_cfg: false,
             // Turbo img2img reference-guided latent-init (sc-10134, epic 8588): a single
             // `Conditioning::Reference { image, strength }` seeds the denoise from the VAE-encoded
             // reference (`pipeline::render_img2img`). A MultiReference is NOT accepted here (that is the
@@ -505,17 +1147,13 @@ pub fn descriptor() -> ModelDescriptor {
             // native distilled loop stays the byte-exact default (`req.sampler == None`).
             samplers: candle_gen::curated_sampler_names(),
             schedulers: candle_gen::curated_scheduler_names(),
-            supported_guidance_methods: vec![],
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
-            mac_only: false,
-            // sc-9607: advertise the packed tiers so the worker's A-B quant toggle engages off-Mac.
-            // The resolved q4/q8/bf16 turnkey subdir self-describes its tier (`loader::linear_detect`,
-            // sc-9411); `build` no-ops the requested quant, and it composes with a merged LoRA overlay.
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
+            // Advertise packed turnkey tiers plus the native Kitchen NVFP4 file encoding. The
+            // resolved q4/q8/bf16 turnkey subdir self-describes its tier (`loader::linear_detect`,
+            // sc-9411); imported native NVFP4 is selected explicitly by its stamped source format.
+            supported_quants: &[Quant::Q4, Quant::Q8, Quant::Nvfp4],
             // sc-12089 (epic 10765 Phase 1c): the Turbo txt2img lane wires the load→encode→drop
             // residency lifecycle (`pipeline::render_sequential`), so it advertises the discovery bit
             // the worker's fit-gate reads. `raw_descriptor` inherits this for its CFG twin, and
@@ -527,17 +1165,20 @@ pub fn descriptor() -> ModelDescriptor {
             // actually run resident makes the gate under-predict its real peak — an admitted job that
             // then OOMs. Never flip this on ahead of the wiring.
             supports_sequential_offload: true,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            // sc-16951 (epic 16948): sc-16950 wired EVERY shipped Krea render route — the seven
+            // `pipeline` sites (Turbo three-stage / t2i / img2img, Raw t2i / multi-phase / img2img,
+            // and the shared Turbo+Raw edit) plus the pose-control provider — to hand
+            // `candle_gen::run_flow_sampler` a `PreviewHook`, so all three descriptors derived from
+            // this one (Turbo here, `raw_descriptor`, `edit_descriptor`) genuinely emit per-step
+            // latent previews. The same lockstep rule as the offload bit above applies, in the same
+            // direction: never advertise ahead of the wiring. What is new is that it is now
+            // enforced rather than merely written down — `candle-gen-catalog`'s
+            // `preview_advertising` guard derives from the Krea sources whether the routes actually
+            // pass a hook and fails the build if this flag and that fact disagree in EITHER
+            // direction. The trainer's periodic sample render is deliberately outside that set: it
+            // renders from a synthetic request that carries no sink.
+            supports_preview: true,
+            ..Default::default()
         },
     }
 }
@@ -583,6 +1224,17 @@ pub fn edit_descriptor() -> ModelDescriptor {
     // drops before the DiT/VAE bundle loads. Keep this advertisement in lockstep with that route: the
     // worker uses it to decide whether a staged peak is safe to admit.
     d.capabilities.supports_sequential_offload = true;
+    d
+}
+
+/// Distilled CFG-free twin of [`edit_descriptor`], routed through the same grounded edit pipeline but
+/// using Turbo's few-step schedule and single conditional forward.
+pub fn turbo_edit_descriptor() -> ModelDescriptor {
+    let mut d = edit_descriptor();
+    d.id = KREA_2_TURBO_EDIT_ID;
+    d.capabilities.supports_negative_prompt = false;
+    d.capabilities.supports_guidance = false;
+    d.capabilities.supports_true_cfg = false;
     d
 }
 
@@ -716,44 +1368,82 @@ fn ensure_multiphase_allowed_for(
 }
 
 /// sc-9300 ConvRot selection: decode whether a [`LoadSpec`] selects the community INT8-ConvRot DiT
-/// consume path, returning the DiT single-file checkpoint when it does. ConvRot rides the shared,
-/// already-optional [`LoadSpec::text_encoder`] field as a [`WeightsSource::File`]; a [`WeightsSource::Dir`]
-/// there is a mis-shaped spec (ConvRot is a single file) and errors. `None` on `text_encoder` ⇒ the
-/// dense/packed snapshot path. Extracted from [`build`] so the routing decision is unit-testable on CPU
-/// without loading weights.
+/// consume path, returning the DiT single-file checkpoint when it does. ConvRot has its own named
+/// component so [`LoadSpec::text_encoder`] means the text encoder uniformly across every provider.
 fn convrot_selector(spec: &LoadSpec, id: &str) -> gen_core::Result<Option<PathBuf>> {
-    match spec.text_encoder.as_ref() {
+    match spec.components.get(KREA_CONVROT_DIT_COMPONENT) {
         Some(WeightsSource::File(p)) => Ok(Some(p.clone())),
         Some(WeightsSource::Dir(_)) => Err(gen_core::Error::Msg(format!(
-            "candle {id}: LoadSpec::text_encoder selects the INT8-ConvRot DiT and must be a single \
-             .safetensors file (WeightsSource::File), not a directory"
+            "candle {id}: component {KREA_CONVROT_DIT_COMPONENT} must be a single .safetensors file \
+             (WeightsSource::File), not a directory"
         ))),
         None => Ok(None),
     }
 }
 
-fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<dyn Generator>> {
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p.clone(),
-        WeightsSource::File(_) => {
-            return Err(gen_core::Error::Msg(format!(
-                "{} expects a snapshot directory (transformer/ text_encoder/ vae/ tokenizer/), not a \
-                 single .safetensors file",
-                descriptor.id
-            )));
-        }
-    };
+fn resolved_base_and_native(
+    spec: &LoadSpec,
+    id: &str,
+) -> gen_core::Result<(PathBuf, Option<gen_core::PinnedWeightsFile>)> {
+    match &spec.weights {
+        WeightsSource::Dir(path) => Ok((path.clone(), None)),
+        WeightsSource::File(_) => Ok((
+            gen_core::require_base_snapshot(spec, id)?.to_path_buf(),
+            Some(
+                spec.weights_file_pin()?
+                    .expect("File weights must resolve to a pin"),
+            ),
+        )),
+    }
+}
+
+type ValidatedKreaLoad = (
+    PathBuf,
+    Option<gen_core::PinnedWeightsFile>,
+    Option<PathBuf>,
+    Option<Quant>,
+    gen_core::ValidatedEncoderSource,
+);
+
+/// Static/load-source validation shared by generator construction and the registered memory
+/// contract. Keeping this as the one File-spec gate prevents a contract from accepting a composition
+/// the production loader later rejects (or advertising facts for fields the loader silently ignores).
+fn validate_load_spec(spec: &LoadSpec, id: &str) -> gen_core::Result<ValidatedKreaLoad> {
+    spec.validate_prepared_file_pins()?;
+    gen_core::reject_unknown_components(
+        spec,
+        &[BASE_SNAPSHOT_COMPONENT, KREA_CONVROT_DIT_COMPONENT],
+        id,
+    )?;
+    let (root, native_dit) = resolved_base_and_native(spec, id)?;
+    if spec.identity.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "candle {id}: Krea providers do not accept identity fields"
+        )));
+    }
     // sc-9300 seam: select the community **INT8-ConvRot** DiT consume path when the spec carries a
-    // ConvRot DiT single-file checkpoint. It rides the shared, already-optional `LoadSpec::text_encoder`
-    // field as a `WeightsSource::File` — the canonical Krea 2 snapshot (`spec.weights`, a `Dir`) still
+    // ConvRot DiT single-file checkpoint. The canonical Krea 2 snapshot (`spec.weights`, a `Dir`) still
     // supplies the tokenizer / Qwen3-VL TE / Qwen-Image VAE / config + all non-quantized surface, and
     // only the DiT weights are taken from the int8 checkpoint (`pipeline::load_components_convrot`,
-    // which enforces the sm_89 compute-cap floor). This reuses an existing extensibility point (the same
-    // pattern LTX uses to ride an aux path on `text_encoder`) rather than growing the shared
-    // `WeightsSource` enum with a ConvRot variant — which would force a new match arm across every
-    // provider in candle-gen AND the worker plus a gen-core pin bump. Only Krea reads this; every other
-    // engine ignores `text_encoder` unchanged. `None`/`Dir` here ⇒ the dense/packed snapshot path below.
-    let convrot_dit = convrot_selector(spec, descriptor.id)?;
+    // which enforces the sm_89 compute-cap floor). The provider-specific component avoids overloading
+    // the shared encoder seam. `None` here selects the dense/packed snapshot path below.
+    let convrot_dit = convrot_selector(spec, id)?;
+    if native_dit.is_some() && convrot_dit.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "candle {}: primary imported DiT and {KREA_CONVROT_DIT_COMPONENT} are mutually exclusive",
+            id
+        )));
+    }
+    let loaded_quant = actual_quant_tier(spec, id)?;
+    let text_encoder_source = ENCODER_CONTRACT.source_for_load(spec, &root)?;
+    let builtin_text_encoder = WeightsSource::Dir(root.join("text_encoder"));
+    let expected_text_encoder_bits =
+        gen_core::text_encoder_packed_quant_bits(&builtin_text_encoder)?;
+    if let Some(bits) = text_encoder_source.load_time_quant_bits(expected_text_encoder_bits, id)? {
+        return Err(gen_core::Error::Unsupported(format!(
+            "candle {id} requires a selected text encoder already packed at Q{bits}; this provider does not repack a dense Krea encoder on the fly"
+        )));
+    }
     // LoRA/LoKr adapters are accepted and merged into the DiT at first `generate` (sc-7836); the merge
     // (`adapters::merge_into_weights`) is lazy, so a nonexistent adapter path still loads here.
     //
@@ -764,28 +1454,123 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {} does not support ControlNet / IP-Adapter overlays",
-            descriptor.id
+            id
         )));
     }
-    // The ConvRot consume path (sc-9300) is DiT-only and does not thread LoRA/LoKr or PiD overlays — the
-    // int8 checkpoint replaces the dense transformer wholesale. Reject the combination up front so the
-    // worker gets a clear error instead of silently dropping the overlay.
-    if convrot_dit.is_some() && (!spec.adapters.is_empty() || spec.pid.is_some()) {
+    // PiD still cannot compose with the DiT-only ConvRot artifact. LoRA/LoKr ride as forward-time
+    // residuals over the int8 base, preserving the checkpoint's packed/rotated representation.
+    if convrot_dit.is_some() && spec.pid.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
-            "candle {}: the INT8-ConvRot DiT path does not support LoRA/LoKr adapters or a PiD decoder \
-             overlay",
-            descriptor.id
+            "candle {}: the INT8-ConvRot DiT path does not support a PiD decoder overlay",
+            id
         )));
     }
+    Ok((
+        root,
+        native_dit,
+        convrot_dit,
+        loaded_quant,
+        text_encoder_source,
+    ))
+}
+
+/// Physical eligibility for the registered native-File block loader.
+///
+/// This deliberately does not consult the public memory contract: File rung-4 evidence remains
+/// Missing, while an explicit adapter-free Sequential + Deferred load can still exercise the pinned
+/// native stream path. Candle cannot replay adapters onto streamed blocks, so every adapter form —
+/// including diff-patches — stays excluded.
+fn native_file_streamable(provider_id: &str, spec: &LoadSpec) -> bool {
+    provider_id == KREA_2_TURBO_ID
+        && matches!(spec.weights, WeightsSource::File(_))
+        && matches!(spec.offload_policy, gen_core::OffloadPolicy::Sequential)
+        && matches!(
+            spec.load_shape,
+            gen_core::LoadShape::DeferredMaterialization
+        )
+        && spec.quantize.is_none()
+        && spec.adapters.is_empty()
+}
+
+fn validate_native_file_transformer_request(
+    provider_id: &str,
+    spec: &LoadSpec,
+    memory: gen_core::GenerationMemory,
+) -> gen_core::Result<()> {
+    if !matches!(spec.weights, WeightsSource::File(_)) {
+        return Ok(());
+    }
+    let has_owned_parameter =
+        memory.transformer_window_size.is_some() || memory.transformer_window_component.is_some();
+    if has_owned_parameter && !memory.stream_transformer_blocks {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: transformer_window_size and transformer_window_component require \
+             stream_transformer_blocks=true"
+        )));
+    }
+    if !memory.stream_transformer_blocks {
+        return Ok(());
+    }
+    if !native_file_streamable(provider_id, spec) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: imported File transformer streaming requires the Turbo text-to-image \
+             route and an adapter-free Sequential + DeferredMaterialization load"
+        )));
+    }
+    let component = memory.transformer_window_component.unwrap_or_default();
+    if component != gen_core::TransformerComponent::Dit {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: imported File transformer streaming owns the DiT component only; \
+             requested {component:?}"
+        )));
+    }
+    let window = memory
+        .transformer_window_size
+        .unwrap_or(SUPPORTED_TRANSFORMER_WINDOWS[0]);
+    if !SUPPORTED_TRANSFORMER_WINDOWS.contains(&window) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: transformer residency window is fixed at \
+             {SUPPORTED_TRANSFORMER_WINDOWS:?}, got {window}"
+        )));
+    }
+    Ok(())
+}
+
+fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<dyn Generator>> {
+    // sc-21483: refuse an adapter-bearing load against a descriptor that does not advertise adapter
+    // support — the shape an imported-model route takes when its binding declares
+    // `inherit_adapters = false` (the registry withdraws `supports_lora`/`supports_lokr` from the
+    // route's descriptor). Refusing here is the difference between a typed capability error and a
+    // silently un-adapted render. It runs BEFORE the load-source validation because the answer does
+    // not depend on the weights: the caller asked for something this route cannot do at all.
+    gen_core::reject_unsupported_adapters(
+        descriptor.id,
+        &descriptor.capabilities,
+        spec.adapters.len(),
+    )?;
+    let (root, native_dit, convrot_dit, loaded_quant, text_encoder_source) =
+        validate_load_spec(spec, descriptor.id)?;
+    #[cfg(any(feature = "cuda", test))]
+    let memory_contract = match descriptor.id {
+        KREA_2_TURBO_ID => Some(validated_krea_turbo_memory_strategy_contract(spec)?),
+        KREA_2_RAW_ID | KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID => Some(
+            validated_krea_request_scoped_memory_strategy_contract(descriptor.id, spec)?,
+        ),
+        _ => None,
+    };
     let device = candle_gen::default_device()?;
-    let policy = effective_residency_policy(spec.offload_policy, convrot_dit.is_some());
     let resident_root = root.clone();
     let resident_device = device.clone();
     let resident_adapters = spec.adapters.clone();
     let resident_pid = spec.pid.clone();
     let resident_convrot = convrot_dit.clone();
+    let resident_native = native_dit.clone();
+    let resident_file_spec = spec.clone();
+    let native_quant = native_dit.as_ref().and(spec.quantize);
+    let resident_text_encoder = text_encoder_source.clone();
     let text_root = root.clone();
     let text_device = device.clone();
+    let request_text_encoder = text_encoder_source.clone();
     let heavy_root = root.clone();
     let heavy_device = device.clone();
     let heavy_adapters = spec.adapters.clone();
@@ -793,24 +1578,62 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     // sc-12425: the sequential heavy phase must know whether to load the int8-ConvRot DiT (from the
     // single file) or the snapshot's dense/packed `transformer/`. Absent this the sequential path loaded
     // `root/transformer` unconditionally — the wrong DiT for a ConvRot request — which is why ConvRot
-    // was pinned Resident (`effective_residency_policy`) rather than dropping its 15.6 GB f32 TE.
+    // previously bypassed staged residency rather than dropping its 15.6 GB f32 TE.
     let heavy_convrot = convrot_dit.clone();
-    let residency = candle_gen::Residency::from_policy_with_resident(
-        policy,
-        move || {
-            let components = match resident_convrot.as_ref() {
-                Some(convrot_dit) => pipeline::load_components_convrot(
-                    &resident_root,
-                    convrot_dit,
-                    &resident_device,
-                )?,
-                None => pipeline::load_components(
-                    &resident_root,
-                    &resident_device,
-                    &resident_adapters,
-                    resident_pid.as_ref(),
-                )?,
-            };
+    let heavy_native = native_dit.clone();
+    let heavy_file_spec = spec.clone();
+    // A packed companion snapshot must load its text encoder directly on the compute device. The
+    // CPU-stage fold path is only for a dense companion: QLinear's packed `quantize_onto` is
+    // intentionally idempotent and therefore cannot migrate an already-packed CPU base.
+    let text_quant = text_encoder_quant_tier(spec, descriptor.id)?;
+    let heavy_quant = native_quant;
+    // Keep physical execution separate from evidence publication. The File contract below remains
+    // rung-4 Missing, but an explicit eligible load arms the retained native pin for real block
+    // windows rather than silently falling back to an eager DiT.
+    let native_streamable = native_file_streamable(descriptor.id, spec);
+    // The checkpoint-facts handoff (sc-21484 follow-up). One sink, three holders: the resident
+    // closure, the sequential heavy closure, and the generator itself. Residency is lazy, so the
+    // clones must be minted here — the generator is constructed long before either closure runs.
+    let checkpoint_facts = gen_core::CheckpointFactsSink::new();
+    let resident_facts = checkpoint_facts.clone();
+    let heavy_facts = checkpoint_facts.clone();
+    let residency = candle_gen::Residency::request_scoped_with_resident_cancelable(
+        move |_| {
+            let components = resident_file_spec.read_files_unchanged(
+                resident_file_spec.file_source_paths(),
+                || match (resident_native.as_ref(), resident_convrot.as_ref()) {
+                    (Some(native_dit), None) => {
+                        pipeline::load_components_native_registry_with_encoder(
+                            &resident_root,
+                            &resident_text_encoder,
+                            native_dit,
+                            &resident_device,
+                            &resident_adapters,
+                            native_quant,
+                            text_quant,
+                            resident_pid.as_ref(),
+                            &resident_facts,
+                        )
+                    }
+                    (None, Some(convrot_dit)) => pipeline::load_components_convrot_with_encoder(
+                        &resident_root,
+                        &resident_text_encoder,
+                        convrot_dit,
+                        &resident_device,
+                        &resident_adapters,
+                    ),
+                    (None, None) => pipeline::load_components_with_encoder(
+                        &resident_root,
+                        &resident_text_encoder,
+                        &resident_device,
+                        &resident_adapters,
+                        resident_pid.as_ref(),
+                    ),
+                    (Some(_), Some(_)) => {
+                        unreachable!("mutually exclusive source forms")
+                    }
+                },
+            )?;
             Ok((
                 KreaTextPhase::Resident,
                 KreaHeavyPhase::Resident(Box::new(ResidentKrea {
@@ -822,57 +1645,97 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
                 })),
             ))
         },
-        move || {
-            Ok(KreaTextPhase::Sequential(Box::new(pipeline::load_text(
-                &text_root,
-                &text_device,
-            )?)))
-        },
-        move |use_pid| {
-            let heavy = match heavy_convrot.as_ref() {
-                // ConvRot: the int8 DiT from the single file + VAE (no adapters/PiD — the lane rejects
-                // both, sc-9300). The TE was already loaded, encoded, and dropped by the text phase, so
-                // this loads into that freed pool — the whole point of going sequential here.
-                Some(convrot_dit) => {
-                    pipeline::load_residency_heavy_convrot(&heavy_root, convrot_dit, &heavy_device)?
-                }
-                None => pipeline::load_residency_heavy(
-                    &heavy_root,
-                    &heavy_device,
-                    &heavy_adapters,
-                    heavy_pid.as_ref(),
-                    use_pid,
+        move |_, cancel| {
+            let text = match text_quant {
+                Some(quant) => pipeline::load_text_quantized_for_request(
+                    &text_root,
+                    &request_text_encoder,
+                    &text_device,
+                    cancel,
+                    quant,
+                )?,
+                None => pipeline::load_text_for_request_with_source(
+                    &text_root,
+                    &request_text_encoder,
+                    &text_device,
+                    cancel,
                 )?,
             };
+            Ok(KreaTextPhase::Sequential(Box::new(text)))
+        },
+        move |use_pid, _, cancel| {
+            let heavy = heavy_file_spec.read_files_unchanged(
+                heavy_file_spec.file_source_paths(),
+                || match (heavy_native.as_ref(), heavy_convrot.as_ref()) {
+                    (Some(native_dit), None) => {
+                        candle_gen::check_cancel(cancel)?;
+                        let heavy = pipeline::load_residency_heavy_native_registry(
+                            &heavy_root,
+                            native_dit,
+                            &heavy_device,
+                            &heavy_adapters,
+                            heavy_quant,
+                            pipeline::PidLoad {
+                                spec: heavy_pid.as_ref(),
+                                enabled: use_pid,
+                            },
+                            native_streamable,
+                            &heavy_facts,
+                        )?;
+                        candle_gen::check_cancel(cancel)?;
+                        Ok(heavy)
+                    }
+                    // ConvRot: the int8 DiT from the single file + additive adapters + VAE (PiD is
+                    // still rejected for this lane, sc-9300; LoRA/LoKr install as residuals over the
+                    // frozen int8 base since sc-18477). The TE was already loaded, encoded, and dropped
+                    // by the text phase, so this loads into that freed pool — the whole point of going
+                    // sequential here.
+                    (None, Some(convrot_dit)) => {
+                        candle_gen::check_cancel(cancel)?;
+                        let heavy = pipeline::load_residency_heavy_convrot(
+                            &heavy_root,
+                            convrot_dit,
+                            &heavy_device,
+                            &heavy_adapters,
+                        )?;
+                        candle_gen::check_cancel(cancel)?;
+                        Ok(heavy)
+                    }
+                    (None, None) => pipeline::load_residency_heavy_for_request(
+                        &heavy_root,
+                        &heavy_device,
+                        &heavy_adapters,
+                        heavy_pid.as_ref(),
+                        use_pid,
+                        cancel,
+                    ),
+                    (Some(_), Some(_)) => unreachable!("mutually exclusive source forms"),
+                },
+            )?;
             Ok(KreaHeavyPhase::Sequential(Box::new(heavy)))
         },
-    )?;
+    );
     Ok(Box::new(KreaGenerator {
         descriptor,
         device,
+        loaded_quant,
+        text_load_quant: text_quant,
+        #[cfg(any(feature = "cuda", test))]
+        memory_contract,
         residency,
-        offload_policy: policy,
         root,
-        // The multi-phase diff-patch guard input (sc-13887): read the adapter file keys at load. The
-        // ConvRot path already rejected adapters above, so `spec.adapters` is empty there ⇒ `false`.
-        has_diff_patch: crate::adapters::any_diff_patch(&spec.adapters),
+        text_encoder_source,
+        native_dit,
+        // The multi-phase diff-patch guard input (sc-13887): read adapter keys for every registered
+        // tier, through the prepared-file pin so a swap between prepare and load is caught. ConvRot
+        // low-rank adapters remain additive while any diff patch still drives residency policy.
+        has_diff_patch: spec.read_prepared_files_unchanged(|| {
+            Ok::<_, gen_core::Error>(crate::adapters::any_diff_patch(&spec.adapters))
+        })?,
         adapters: spec.adapters.clone(),
+        file_pin_spec: spec.clone(),
+        checkpoint_facts,
     }))
-}
-
-/// The residency policy this generator runs — the request's `offload_policy` after the
-/// `CANDLE_GEN_OFFLOAD` override (`candle_gen::effective_offload_policy`).
-///
-/// `_has_convrot` is taken but no longer changes the answer (sc-12425). ConvRot USED to be forced
-/// `Resident` here, because the sequential heavy loader read `root/transformer/` and could not source
-/// the int8 single-file DiT; [`pipeline::load_residency_heavy_convrot`] now sources it, so ConvRot drops
-/// its 15.6 GB f32 text encoder after encoding like every other Turbo request (measured 42.9 → ~29 GB
-/// peak, sc-12381). The parameter (and the test pinning it no longer matters) stays so a future reader
-/// cannot quietly re-add the special-case: the Turbo descriptor advertises `supports_sequential_offload`,
-/// so a ConvRot generator that silently ran `Resident` would make the worker's fit-gate predict a staged
-/// peak it never achieves — the sc-10840 lockstep violation the descriptor's own comment warns against.
-fn effective_residency_policy(requested: OffloadPolicy, _has_convrot: bool) -> OffloadPolicy {
-    candle_gen::effective_offload_policy(requested)
 }
 
 /// Construct a lazy candle Krea 2 **Turbo** generator. `spec.weights` must be a [`WeightsSource::Dir`]
@@ -880,10 +1743,10 @@ fn effective_residency_policy(requested: OffloadPolicy, _has_convrot: bool) -> O
 ///
 /// **INT8-ConvRot (sc-9300).** To load the community int8-quantized DiT instead of the snapshot's dense
 /// `transformer/`, pass the ConvRot DiT single-file checkpoint as
-/// `spec.text_encoder = Some(WeightsSource::File(convrot_dit.safetensors))` while keeping
+/// `spec.components[KREA_CONVROT_DIT_COMPONENT] = WeightsSource::File(convrot_dit.safetensors)` while keeping
 /// `spec.weights = WeightsSource::Dir(canonical_snapshot)` (which supplies the tokenizer / TE / VAE /
-/// config). The ConvRot path enforces the sm_89 compute-cap floor and does not combine with LoRA/LoKr
-/// or PiD overlays.
+/// config). The ConvRot path enforces the sm_89 compute-cap floor, applies LoRA/LoKr additively over the
+/// frozen int8 DiT, and does not combine with PiD overlays.
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     build(spec, descriptor())
 }
@@ -892,7 +1755,8 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 /// snapshot assembly to [`load`] — the Raw + Turbo turnkeys share the exact architecture / weight layout
 /// (only distilled-vs-base DiT weights differ), so one `build` serves both — but stores the CFG-capable
 /// [`raw_descriptor`] so `generate` runs the full-CFG [`pipeline::render_base`] path. Accepts the same
-/// LoRA/LoKr, PiD, and packed-quant surface as Turbo; the ConvRot / ControlNet rejections are shared.
+/// LoRA/LoKr, PiD, and packed-quant surface as Turbo; ConvRot supports low-rank adapters but still
+/// rejects PiD, while ControlNet/IP overlays remain outside this registered base generator.
 pub fn load_raw(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     build(spec, raw_descriptor())
 }
@@ -904,6 +1768,10 @@ pub fn load_raw(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 /// `spec.adapters` merge path, exactly like a Raw-trained adapter on the txt2img ids.
 pub fn load_edit(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     build(spec, edit_descriptor())
+}
+
+pub fn load_turbo_edit(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    build(spec, turbo_edit_descriptor())
 }
 
 /// Build a Krea 2 generator from a **community single-file DiT checkpoint** (sc-14022, epic 14015 S0b) —
@@ -920,43 +1788,32 @@ pub fn load_edit(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 /// `W = codes.i8 * weight_scale` per row. Neither is corrupted by a rotation that was never applied. It is
 /// coverage/bijection + shape validated ([`convert::validate_native_transformer`], fail-closed on any
 /// unmapped/missing/foreign key) before assembly; the TE / VAE / tokenizer load from `base_snapshot_dir`
-/// exactly as [`load`] does. The result is a warm-`Resident` generator that renders through the same
-/// pipeline as a snapshot load. `descriptor` selects the surface — Turbo [`descriptor()`] is the natural
-/// default (variant5 is a distilled-Turbo dense merge).
+/// exactly as [`load`] does. The result renders through the same provider pipeline as a snapshot load.
+/// `descriptor` selects the surface — Turbo [`descriptor()`] is the natural default (variant5 is a
+/// distilled-Turbo dense merge).
 ///
-/// No load-time adapters (the community merge already baked its LoRAs into the weights). `Sequential`
-/// offload is not threaded — the single-file DiT has no
-/// snapshot dir to re-load from — so the generator is always `Resident`, mirroring the MLX entrypoint.
+/// `adapters` is the caller-selected user stack. Dense and plain-int8 native DiTs use the same
+/// canonical Krea target names as the snapshot route: diff-patches fold before assembly and
+/// LoRA/LoKr residuals install additively, with per-selected-file apply-or-reject.
+///
+/// This routes through the equivalent File [`LoadSpec`] and the crate-private `build` rather than
+/// assembling a bespoke resident generator, so the caller gets the FULL registered surface —
+/// including the pinned-file validation and the native `Sequential` block-streaming route that
+/// `native_file_streamable` admits — instead of being pinned to warm-`Resident`.
 pub fn load_from_native_dit_file(
     dit_file: impl AsRef<std::path::Path>,
     base_snapshot_dir: impl AsRef<std::path::Path>,
+    adapters: &[AdapterSpec],
     descriptor: ModelDescriptor,
 ) -> gen_core::Result<Box<dyn Generator>> {
-    let root = base_snapshot_dir.as_ref().to_path_buf();
-    let device = candle_gen::default_device()?;
-    // Architecture config + TE/VAE/tokenizer come from the resident turnkey; only the DiT weights come
-    // from the single file (dense or descriptor-validated plain int8 through the native remap).
-    let components = pipeline::load_components_native(&root, dit_file.as_ref(), &device)?;
-    let residency = candle_gen::Residency::resident(
-        KreaTextPhase::Resident,
-        KreaHeavyPhase::Resident(Box::new(ResidentKrea {
-            components: Arc::new(components),
-            root: root.clone(),
-            device: device.clone(),
-            edit_components: Mutex::new(None),
-            img2img_encoder: Mutex::new(None),
-        })),
-    );
-    Ok(Box::new(KreaGenerator {
-        descriptor,
-        device,
-        residency,
-        offload_policy: OffloadPolicy::Resident,
-        root,
-        // The single-file entrypoint threads no load-time adapters (S0b scope), so no diff-patch guard.
-        adapters: Vec::new(),
-        has_diff_patch: false,
-    }))
+    let mut spec = LoadSpec::new(WeightsSource::File(dit_file.as_ref().to_path_buf()))
+        .with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(base_snapshot_dir.as_ref().to_path_buf()),
+        )
+        .with_adapters(adapters.to_vec());
+    spec.prepare_file_sources()?;
+    build(&spec, descriptor)
 }
 
 // Link-time registration: all three variants register here — `krea_2_turbo` (distilled, CFG-free),
@@ -971,17 +1828,1829 @@ candle_gen::register_generators! {
 candle_gen::register_generators! {
     pub(crate) const EDIT_REGISTRATION = edit_descriptor => load_edit
 }
+candle_gen::register_generators! {
+    pub(crate) const TURBO_EDIT_REGISTRATION = turbo_edit_descriptor => load_turbo_edit
+}
+
+/// Activation dtype every Krea route computes the DiT in. `pipeline.rs` pins `DIT_DTYPE =
+/// DType::BF16` for the dense, packed and convrot loads alike, so this is the provider's real
+/// activation width rather than a memory-model literal.
+const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::BF16;
+
+/// Snapshot-read architecture axes shared by every Krea 2 route (epic SC-22657, E2).
+///
+/// The DiT axes come from the **same** configuration the loader builds its model from:
+/// [`crate::config::Krea2Config::from_snapshot`] parses `<root>/transformer/config.json`
+/// (`num_attention_heads`, `attention_head_dim`, `num_layers`) plus `<root>/model_index.json`
+/// (`patch_size`), falling back per field to the published [`config::Krea2Config::turbo`] reference
+/// exactly as the loader does. Reading the axes back off that struct therefore publishes what the
+/// pipeline will actually execute — a snapshot whose config disagrees with the reference publishes
+/// what it says, and nothing is inferred from the model id.
+///
+/// Krea 2 is a **dense single-stream** DiT: `num_layers` is the whole trunk (there is no
+/// double/single split to add together), and `hidden_size` is *derived* as
+/// `num_attention_heads · attention_head_dim`, so `attention_head_dim` is already the per-head
+/// width and needs no divisibility check.
+///
+/// The decoder axes are the reused Qwen-Image `AutoencoderKLQwenImage` constants
+/// ([`vae::VAE_CHANNELS`], [`vae::VAE_COMPRESSION`]) rather than JSON: the loader constructs that
+/// VAE from code, so `<root>/vae/config.json` is not what runs and must not be read here.
+///
+/// A weights-free contract — the registry's sentinel surface path, a single-file import, or a
+/// snapshot whose transformer config cannot be parsed — publishes
+/// `MemoryArchitectureFacts::default()`.
+/// The materialized Krea snapshot this spec loads its config, tokenizer, TE and VAE from.
+///
+/// `spec.weights` on the snapshot routes, and the `BASE_SNAPSHOT_COMPONENT` directory on the
+/// single-file import routes — which is exactly what [`resolved_base_and_native`] resolves for the
+/// loader, restated here without the `id`-keyed validation so the weights-free surface stays quiet.
+///
+/// SC-22667 (E2): reading only `spec.weights` published `MemoryArchitectureFacts::default()` for
+/// every `load_from_native_dit_file` load, even though that route hands the loader a resident
+/// turnkey snapshot precisely *because* the single file omits the DiT architecture config — the
+/// axes are read from disk on that route, they were simply read from a directory this function was
+/// not looking at.
+fn materialized_snapshot_root(spec: &LoadSpec) -> Option<&std::path::Path> {
+    candle_gen::architecture_facts::snapshot_root(spec).or_else(|| {
+        match spec.components.get(BASE_SNAPSHOT_COMPONENT) {
+            Some(WeightsSource::Dir(root)) if root.is_dir() => Some(root.as_path()),
+            _ => None,
+        }
+    })
+}
+
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    let Some(root) = materialized_snapshot_root(spec) else {
+        return gen_core::MemoryArchitectureFacts::default();
+    };
+    let Ok(config) = crate::config::Krea2Config::from_snapshot(root) else {
+        return gen_core::MemoryArchitectureFacts::default();
+    };
+    gen_core::MemoryArchitectureFacts {
+        attention_heads: af::declared(config.num_attention_heads),
+        head_dim: af::declared(config.attention_head_dim),
+        transformer_blocks: af::declared(config.num_layers),
+        patch_size: af::declared(config.patch_size),
+        latent_channels: af::declared(crate::vae::VAE_CHANNELS as usize),
+        vae_spatial_scale: af::declared(crate::vae::VAE_COMPRESSION as usize),
+        // Structurally absent: Krea drives the Qwen-Image VAE collapsed to a single frame on the
+        // image path, so there is no frames-per-latent axis to declare (absent is `None`, never 0).
+        vae_temporal_scale: None,
+        activation_dtype_width: af::dtype_width(ACTIVATION_DTYPE),
+    }
+}
+
+/// The `language_model` tensor `pipeline::load_te_weights` probes to decide the TE **store** dtype
+/// (sc-12828): bf16 when the snapshot ships bf16, else an f32 store with no silent truncation.
+const TE_STORE_PROBE: &str = "language_model.layers.0.input_layernorm.weight";
+
+/// Bytes per element of the DiT's load dtype (`pipeline::DIT_DTYPE = DType::BF16`).
+const DIT_WIDTH: u64 = 2;
+
+/// Bytes per element of the autoencoder's load dtype — `vae::vae_varbuilder` opens the reused
+/// Qwen-Image VAE at `DType::F32` (decode-precision-sensitive), from a checkpoint that ships bf16.
+const VAE_WIDTH: u64 = 4;
+
+/// Bytes per element of the Edit-only Qwen3-VL vision tower's load dtype (SC-22667 review):
+/// `vision::load_vision_tower_from_source` opens it at [`vision::VISION_DTYPE`] = `DType::F32`
+/// unconditionally — **not** at the TE store width, which is 2 whenever the snapshot ships bf16. A
+/// test pins this constant to that dtype.
+const VISION_WIDTH: u64 = 4;
+
+/// Bytes per element of the text encoder on the **control** route: `control_provider::load_control_text`
+/// opens `Weights::from_dir(.., DType::F32)`, not the bf16-probed store the generation pipeline uses.
+const CONTROL_TE_WIDTH: u64 = 4;
+
+const KREA_2_TURBO_CONTROL_ID: &str = "krea_2_turbo_control";
+
+fn is_edit_route(provider_id: &str) -> bool {
+    matches!(provider_id, KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID)
+}
+
+fn is_control_route(provider_id: &str) -> bool {
+    provider_id == KREA_2_TURBO_CONTROL_ID
+}
+
+/// The `vae/` tensors only `QwenVaeEncoder::new` reads: the `encoder.*` subtree and its
+/// `quant_conv`. `QwenVae::new` (decode) reads `post_quant_conv` and `decoder.*`; the prefix test is
+/// anchored so `post_quant_conv` cannot match it.
+fn vae_tensor_is_encoder_only(name: &str) -> bool {
+    name.starts_with("encoder.") || name.starts_with("quant_conv.")
+}
+
+/// Whether `provider_id`'s heavy phase materializes the Qwen-Image VAE **encoder** alongside the
+/// decoder — every Krea route does, on the load shapes that matter (SC-22667 review):
+///
+/// * the Edit routes VAE-encode their references (`pipeline::load_edit_components`, `lib.rs`'s
+///   `img2img_encoder`);
+/// * the control route builds `QwenVaeEncoder::new` eagerly in `load_control_heavy`
+///   (`control_provider.rs`), beside `load_vae`;
+/// * the text-to-image routes are **request-scoped**: their staged heavy twins
+///   (`pipeline::load_residency_heavy_for_request`, `load_residency_heavy_native`,
+///   `load_residency_heavy_convrot`) all construct `vae_encoder: load_vae_encoder(root, device)`
+///   eagerly on every `StagedResidency` request, whatever the request is, and the resident twin
+///   materializes the same encoder lazily on the first img2img request.
+///
+/// The only render that never holds the encoder is a resident-shape text-to-image request — a
+/// **request-time** fact this per-load declaration cannot see, and one whose absence is chosen
+/// precisely when memory is *not* tight. E3 (estimates only ever err large) settles the remaining
+/// choice: the staged path is the memory-tight path and it holds the encoder, so the encoder is
+/// charged on every route rather than under-declared on the one shape the fit gate exists for.
+/// The decode-only subtree is still separated by [`vae_tensor_is_encoder_only`], so a route whose
+/// loader is later shown never to materialize the encoder can drop it by name.
+fn vae_encoder_materialized(_provider_id: &str) -> bool {
+    true
+}
+
+/// Load-exact bytes of the Qwen-Image autoencoder as `provider_id` materializes it, opened at
+/// [`VAE_WIDTH`] from a bf16 checkpoint.
+fn vae_resident_bytes(root: &std::path::Path, provider_id: &str) -> gen_core::Result<u64> {
+    let dir = root.join("vae");
+    let with_encoder = vae_encoder_materialized(provider_id);
+    let kept = gen_core::safetensors_path_tensor_headers(&dir)?
+        .into_iter()
+        .filter(|header| with_encoder || !vae_tensor_is_encoder_only(&header.name))
+        .collect::<Vec<_>>();
+    gen_core::materialized_header_bytes(&kept, VAE_WIDTH, &dir)
+}
+
+/// The TE store width this snapshot resolves to, from the same probe the loader uses.
+fn te_store_width(headers: &[gen_core::SafetensorsTensorHeader]) -> u64 {
+    match headers.iter().find(|header| header.name == TE_STORE_PROBE) {
+        Some(header) if header.dtype == gen_core::weightsmeta::Dtype::BF16 => 2,
+        // Either the snapshot does not ship bf16 (the loader reopens at f32), or the probe key is
+        // absent and there is nothing to justify the halved store — both take the f32 branch, which
+        // is the loader's own fail-safe direction.
+        _ => 4,
+    }
+}
+
+/// Load-exact bytes of the DiT the loader will build from a **snapshot `transformer/`** or an
+/// **INT8-ConvRot** single file — the two DiT sources the shared `Weights` reader opens directly.
+///
+/// Candle's own `coerce_float` boundary is the rule for both: a float tensor is materialized at
+/// `DIT_DTYPE` and everything else keeps its stored width. That prices a dense diffusers
+/// `transformer/` at bf16 and an INT8-ConvRot file at its resident `i8` code planes; the ConvRot
+/// per-row `weight_scale` is read through `get_native_f32` and stays at its stored f32 width, so it
+/// is priced as stored rather than cast. The one source that needs more is an **MLX-packed tier**,
+/// whose affine triples Candle repacks into a device-format GGML tensor that is neither the source
+/// sidecars nor a dense matrix of the packed weight's shortened last dimension —
+/// `mlx_packed_qtensor_resident_bytes` is the shared pricing for exactly that conversion.
+///
+/// A **planned single-file native import** is NOT priced here (SC-22667 review): that route reads
+/// every projection through the checkpoint-codec plan, whose residency decides per row whether an
+/// fp8 / NVFP4 layer stays packed or decodes dense — see [`native_dit_resident_bytes`].
+fn dit_resident_bytes(path: &std::path::Path) -> gen_core::Result<u64> {
+    let headers = gen_core::safetensors_path_tensor_headers(path)?;
+    let by_name = headers
+        .iter()
+        .map(|header| (header.name.as_str(), header))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let group = loader::read_packed_config(path)
+        .ok()
+        .flatten()
+        .map(|config| config.group_size as usize)
+        .unwrap_or(candle_gen::quant::MLX_GROUP_SIZE);
+    let mut total = 0_u64;
+    let mut dense = Vec::new();
+    for header in &headers {
+        if header.name.ends_with(".weight_scale") {
+            // ConvRot's per-output-row int8 scale: `get_native_f32` keeps it at its stored f32.
+            total = total
+                .checked_add(header.data_bytes)
+                .ok_or_else(|| gen_core::Error::Msg("krea: DiT byte overflow".into()))?;
+            continue;
+        }
+        if header.name.ends_with(".scales") || header.name.ends_with(".biases") {
+            // Priced with the `.weight` of their triple; an orphan simply falls through as dense.
+            if let Some(base) = header
+                .name
+                .strip_suffix(".scales")
+                .or_else(|| header.name.strip_suffix(".biases"))
+            {
+                if by_name.contains_key(format!("{base}.weight").as_str()) {
+                    continue;
+                }
+            }
+            dense.push(header.clone());
+            continue;
+        }
+        let triple = header.name.strip_suffix(".weight").and_then(|base| {
+            Some((
+                *by_name.get(format!("{base}.scales").as_str())?,
+                *by_name.get(format!("{base}.biases").as_str())?,
+            ))
+        });
+        match triple {
+            Some((scales, biases)) => {
+                total = total
+                    .checked_add(candle_gen::quant::mlx_packed_qtensor_resident_bytes(
+                        header, scales, biases, group,
+                    )?)
+                    .ok_or_else(|| gen_core::Error::Msg("krea: DiT byte overflow".into()))?;
+            }
+            None => dense.push(header.clone()),
+        }
+    }
+    total
+        .checked_add(gen_core::materialized_header_bytes(
+            &dense, DIT_WIDTH, path,
+        )?)
+        .ok_or_else(|| gen_core::Error::Msg("krea: DiT byte overflow".into()))
+}
+
+/// The residency policy the memory contract prices a planned native import under: the SAME
+/// [`loader::native_import_residency`] the loader plans under, probed on the same process-default
+/// device the loader constructs on (`candle_gen::default_device`). A device that will not construct
+/// is priced dense — the larger of the two residencies, and also the truth: a loader that cannot
+/// build the device cannot take the native leg either.
+fn native_pricing_residency() -> candle_gen::logical_weights::CandleCodecResidency {
+    match candle_gen::default_device() {
+        Ok(device) => loader::native_import_residency(&device),
+        Err(_) => candle_gen::logical_weights::CandleCodecResidency::DENSE,
+    }
+}
+
+/// Load-exact bytes of a **planned single-file native DiT import**, priced from the compiled plan
+/// the loader consumes (SC-22667 review).
+///
+/// `Weights::from_pinned_native_file_for` compiles `plan_logical_weights` over this file under
+/// `residency` and reads every projection through it, so the per-row residency is the plan's, not
+/// the stored header's:
+///
+/// * a **Dense** row — a stored bf16/f32 projection, an fp8 row (the fp8 leg is masked for this
+///   import on every host, so an `F8_E4M3` weight takes the exact dense decode with its
+///   `weight_scale` applied), an int8-per-row projection, or an NVFP4 row on a host below the
+///   `sm_120` floor — lands as a dense `DIT_DTYPE` matrix over its **logical** shape, and its
+///   scale companions are consumed by the decode; pricing an fp8 row at its stored byte, as the
+///   `coerce_float` rule does, under-declares it by exactly half;
+/// * a **Packed** row — an NVFP4 projection on an `sm_120` host — stays in its stored container
+///   (`residency.resident_bytes`, nibbles already sliced for a transformed output) and **retains**
+///   its scale companions, *unless* Krea's own role table serves it W4A16: `Krea2Transformer::load`
+///   builds an NVFP4 import under `DitPlan::nvfp4(Nvfp4Quant::Mixed)`, whose `execution_role_for_layer`
+///   sends the edge blocks, the context readers, the post-nonlinearity leaves and the trunk head to
+///   dense bf16 (`demote_packed_row_to_dense`), which holds 2 B per logical element and consumes the
+///   companions in its one-time dequant.
+///
+/// `cfg` is the base snapshot's architecture config, exactly as the loader hands it in
+/// (`DeclaredLogicalShapes::FromConfig`), so a block-padded layer prices at its true geometry;
+/// `None` plans at the stored grid, which is what the loader does with no config in scope.
+fn native_dit_resident_bytes(
+    path: &std::path::Path,
+    cfg: Option<&crate::config::Krea2Config>,
+    residency: &candle_gen::logical_weights::CandleCodecResidency,
+) -> gen_core::Result<u64> {
+    use gen_core::checkpoint_codec::ResidencyMode;
+
+    let headers = gen_core::safetensors_path_tensor_headers(path)?;
+    let prefix = loader::detect_native_prefix_from_keys(headers.iter().map(|h| h.name.as_str()));
+    let mapping = crate::native_mapping::KreaNativeToDiffusersMapping::new(
+        &prefix,
+        crate::native_mapping::DeclaredLogicalShapes::from_base(cfg),
+    );
+    let plan = candle_gen::logical_weights::plan_logical_weights(path, &mapping, residency)
+        .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+    let dit_plan = crate::nvfp4_dit::DitPlan::nvfp4(crate::nvfp4_dit::Nvfp4Quant::Mixed);
+    let dit_plan = match cfg {
+        Some(cfg) => dit_plan.with_num_layers(cfg.num_layers),
+        None => dit_plan,
+    };
+    let overflow = || gen_core::Error::Msg("krea: native DiT byte overflow".into());
+    let dense_bytes = |shape: &[usize]| -> gen_core::Result<u64> {
+        shape
+            .iter()
+            .try_fold(DIT_WIDTH, |acc, dim| acc.checked_mul(*dim as u64))
+            .ok_or_else(overflow)
+    };
+    let mut total = 0_u64;
+    let mut packed_owner = std::collections::BTreeSet::new();
+    for tensor in &plan.tensors {
+        let base = tensor
+            .logical_key
+            .strip_suffix(".weight")
+            .unwrap_or(&tensor.logical_key);
+        let bytes = match tensor.residency.mode {
+            ResidencyMode::Packed if dit_plan.execution_role_for_layer(base).is_packed_w4a4() => {
+                packed_owner.insert(tensor.physical_key.as_str());
+                tensor.residency.resident_bytes
+            }
+            // A Packed-priced row the role table serves W4A16: dense bf16 over the logical shape.
+            ResidencyMode::Packed | ResidencyMode::Dense => dense_bytes(&tensor.shape)?,
+        };
+        total = total.checked_add(bytes).ok_or_else(overflow)?;
+    }
+    for companion in &plan.companions {
+        if companion.resident_bytes == 0
+            || !packed_owner.contains(companion.owner_physical_key.as_str())
+        {
+            // Consumed by a dense decode (or a W4A16 dequant): nothing stays resident.
+            continue;
+        }
+        total = total
+            .checked_add(companion.resident_bytes)
+            .ok_or_else(overflow)?;
+    }
+    Ok(total)
+}
+
+/// Load-exact per-component asset facts for a validated Krea load (epic SC-22657, E1; feature-end
+/// sweep SC-22667).
+///
+/// Every Krea contract used to publish `MemoryAssetFacts::default()` — all zeros — on a fully
+/// materialized load, on the grounds that the manifest phase curves already carry the measured
+/// resident floors. That reasoning is about the *predicted peak*, which these fields do not feed:
+/// `predicted_peak_from_base` never reads `base_bytes`. What they do feed is
+/// `MemoryProviderContract::total_resident_bytes` and the E1 decomposition, and a zero there is not
+/// a conservative estimate but an absent fact — on the request-scoped routes it sat beside a formula
+/// that declares `MemoryFormulaVariable::AssetBytes`.
+///
+/// The three fields follow the *One network, one field* rule. The Qwen-Image autoencoder is charged
+/// once, in `decoder_bytes`, on every route including the Edit ones that VAE-encode their references
+/// through the same weights (its encoder half by [`vae_encoder_materialized`]); the Qwen3-VL vision
+/// tower is Edit-only residency and joins `conditioning_bytes` there and nowhere else, at the f32
+/// [`VISION_WIDTH`] its loader opens it in. The control route's text encoder is opened f32
+/// ([`CONTROL_TE_WIDTH`]) where the generation pipeline probes for a bf16 store.
+/// A component that is not readable yet contributes **no signal**, never a load failure.
+///
+/// Krea's `build` is lazy: it constructs a generator whose components open on first use, so a
+/// contract is legitimately built before a shard exists on disk (and the registry's own surface
+/// specs resolve nothing at all). Refusing a load because a pre-load admission fact could not be
+/// measured would be the strictly worse trade — the same call `candle-gen-ltx`'s
+/// `component_footprint_reports_no_signal_rather_than_failing` documents — so an unreadable
+/// component reads as 0 here and `load_components` surfaces the real error moments later.
+fn component_bytes_or_no_signal(bytes: gen_core::Result<u64>) -> u64 {
+    bytes.unwrap_or(0)
+}
+
+fn loaded_asset_facts(
+    provider_id: &str,
+    root: &std::path::Path,
+    native_dit: Option<&std::path::Path>,
+    convrot_dit: Option<&std::path::Path>,
+    encoder_source: &gen_core::ValidatedEncoderSource,
+) -> gen_core::Result<gen_core::MemoryAssetFacts> {
+    let language = encoder_source
+        .materialized_language_tensor_headers(&ENCODER_CONTRACT)
+        .unwrap_or_default();
+    let te_width = if is_control_route(provider_id) {
+        CONTROL_TE_WIDTH
+    } else {
+        te_store_width(&language)
+    };
+    let mut conditioning = component_bytes_or_no_signal(gen_core::materialized_header_bytes(
+        &language, te_width, root,
+    ));
+    if is_edit_route(provider_id) {
+        // `pipeline::vision()` materializes the tower lazily on the Edit routes only — and at
+        // `vision::VISION_DTYPE` (f32), never at the TE's probed store width.
+        let vision = encoder_source
+            .materialized_vision_tensor_headers(&VISION_ENCODER_CONTRACT, &ENCODER_CONTRACT)
+            .unwrap_or_default();
+        conditioning = conditioning.saturating_add(component_bytes_or_no_signal(
+            gen_core::materialized_header_bytes(&vision, VISION_WIDTH, root),
+        ));
+    }
+    let transformer = component_bytes_or_no_signal(match (convrot_dit, native_dit) {
+        (Some(convrot), _) => dit_resident_bytes(convrot),
+        (None, Some(native)) => native_dit_resident_bytes(
+            native,
+            crate::config::Krea2Config::from_snapshot(root)
+                .ok()
+                .as_ref(),
+            &native_pricing_residency(),
+        ),
+        (None, None) => dit_resident_bytes(&root.join("transformer")),
+    });
+    let decoder = component_bytes_or_no_signal(vae_resident_bytes(root, provider_id));
+    Ok(gen_core::MemoryAssetFacts {
+        base_bytes: conditioning
+            .saturating_add(transformer)
+            .saturating_add(decoder),
+        conditioning_bytes: conditioning,
+        transformer_bytes: transformer,
+        decoder_bytes: decoder,
+        // Krea's adapter/PiD/control overlays are outside this base declaration; the routes that
+        // accept them do so through their own request scope, and none is charged here.
+        overlay_bytes: 0,
+    })
+}
+
+/// Krea Turbo's provider-owned half of the shared memory-strategy handshake. The measured phase
+/// coefficients and exact fit boundaries stay in SceneWorks generated evidence; this declaration
+/// pins the executable structure that makes those measurements valid.
+fn build_krea_turbo_memory_strategy_contract(spec: &LoadSpec) -> gen_core::MemoryProviderContract {
+    use gen_core::{
+        LoadShape, MemoryBackendRealization, MemoryFormulaKind, MemoryFormulaVariable,
+        MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope,
+        MemoryProviderContract, MemoryRuntimeSemantics, MemoryStrategy, MemoryStrategyCapability,
+        MemoryStrategyPrerequisite, MemoryStrategySupport, MemoryWindowMaterialization,
+    };
+
+    // File and Dir execute through one provider identity, so the already-qualified resident/staged
+    // cells remain applicable. The promoted evidence matrix has no load-source axis, however: its
+    // rung-4 measurements were captured from snapshot directories. Keep File rung 4 Missing until a
+    // real imported-file run is measured rather than silently relabeling Dir evidence.
+    let streamable = spec.adapters.is_empty() && matches!(spec.weights, WeightsSource::Dir(_));
+    MemoryProviderContract {
+        phase_facts: None,
+        architecture_facts: architecture_facts(spec),
+        provider_id: KREA_2_TURBO_ID.to_owned(),
+        backend: MemoryBackendRealization::CandleCuda {
+            device_residency: true,
+            host_backed_weights: true,
+            host_to_device_block_materialization: true,
+            // SC-16096: component open content-addresses each MLX affine source triple and prepares a
+            // GGML q4/q8 sidecar once. Each streamed window maps that artifact and transfers its bytes
+            // directly to CUDA; there is no per-window conversion or device-to-host round trip.
+            block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
+        },
+        strategies: MemoryStrategy::ALL
+            .into_iter()
+            .map(|strategy| MemoryStrategyCapability {
+                strategy,
+                support: if strategy == MemoryStrategy::BoundedTransformerResidency && !streamable {
+                    MemoryStrategySupport::Missing
+                } else {
+                    MemoryStrategySupport::Implemented
+                },
+                parameters: match strategy {
+                    MemoryStrategy::BoundedDecode => MemoryParameterRanges {
+                        decode_tile_edges: SUPPORTED_DECODE_TILE_EDGES.to_vec(),
+                        decode_overlaps: SUPPORTED_DECODE_OVERLAPS.to_vec(),
+                        ..Default::default()
+                    },
+                    MemoryStrategy::BoundedAttention => MemoryParameterRanges {
+                        attention_chunk_sizes: SUPPORTED_ATTENTION_CHUNK_SIZES.to_vec(),
+                        ..Default::default()
+                    },
+                    MemoryStrategy::BoundedTransformerResidency if streamable => {
+                        MemoryParameterRanges {
+                            // One source for what this provider publishes, what its request scope
+                            // accepts, and what `generate` re-validates — three sites that were three
+                            // independent literals before SC-15792 and would have drifted silently.
+                            transformer_window_sizes: SUPPORTED_TRANSFORMER_WINDOWS.to_vec(),
+                            ..Default::default()
+                        }
+                    }
+                    MemoryStrategy::Resident
+                    | MemoryStrategy::StagedResidency
+                    | MemoryStrategy::BoundedTransformerResidency => {
+                        MemoryParameterRanges::default()
+                    }
+                },
+            })
+            .collect(),
+        decode_geometry_policy_authoritative: false,
+        pid_decode_routes: None,
+        load_shape: LoadShape::DeferredMaterialization,
+        // Every higher-rung Krea control is executed by `render_three_stage`: the provider reloads
+        // text, DiT, and VAE in disjoint phases whenever decode tiling, attention chunking, or
+        // transformer streaming is selected. Record that backend coupling on every affected rung so
+        // selection/evidence identity cannot omit a mechanism that physically executes. This remains
+        // provider-specific; MLX and other Candle providers keep the shared non-staged default.
+        additional_prerequisites: [
+            MemoryStrategy::BoundedDecode,
+            MemoryStrategy::BoundedAttention,
+            MemoryStrategy::BoundedTransformerResidency,
+        ]
+        .into_iter()
+        .map(|strategy| {
+            (
+                strategy,
+                MemoryStrategyPrerequisite::Rung {
+                    rung: MemoryStrategy::StagedResidency,
+                    scope: MemoryPrerequisiteScope::EngagedInSameRequest,
+                },
+            )
+        })
+        .collect(),
+        default_engagement_exclusions: Vec::new(),
+        resident_request_memory: gen_core::ResidentRequestMemory::PreserveLoadDefaults,
+        lifecycle: MemoryLifecycleCapabilities {
+            phases: vec![
+                MemoryPhase::Conditioning,
+                MemoryPhase::Denoise,
+                MemoryPhase::Decode,
+            ],
+            synchronized_phase_release: true,
+            decode_tiling: true,
+            attention_chunking: true,
+            transformer_window_materialization: streamable,
+        },
+        formula: MemoryFormulaKind::PhaseEnvelope {
+            phases: vec![
+                MemoryPhase::Conditioning,
+                MemoryPhase::Denoise,
+                MemoryPhase::Decode,
+            ],
+            variables: vec![
+                MemoryFormulaVariable::PixelCount,
+                MemoryFormulaVariable::BatchCount,
+                MemoryFormulaVariable::OverlayBytes,
+            ],
+        },
+        // sc-22735: no identity here. This builder serves BOTH the validated load and the
+        // weights-free surface, and the two must not publish the same key — the tier a production
+        // identity names has to be proven from the artifact, which only the validated path can do.
+        // `validated_krea_turbo_memory_strategy_contract` stamps the production (route, tier) cell;
+        // `weights_free_krea_turbo_memory_strategy_contract` stamps the registry-behavior key.
+        calibration: None,
+        // Zero here, and only here: this builder also serves the weights-free surface, which
+        // resolves no snapshot. A **validated** load stamps the load-exact decomposition over these
+        // through `loaded_asset_facts` (SC-22667, E1); see
+        // `validated_krea_turbo_memory_strategy_contract`.
+        asset_facts: gen_core::MemoryAssetFacts::default(),
+        runtime: MemoryRuntimeSemantics::default(),
+    }
+}
+
+/// Production calibration identity of `krea_2_turbo`, keyed on the **artifact-proven tier**.
+///
+/// sc-22735 (epic sc-22723 E1/E4). Turbo shipped three tiers behind one string, so a bf16 or q8
+/// turbo capture would have been filed under the key of the single measured q4 record. Only the q4
+/// arm is measured, and it keeps [`TURBO_MEMORY_CALIBRATION_FINGERPRINT`] byte-identical — the
+/// SceneWorks anchor `krea_2_turbo:candle:q4` is bound by exactly that string. bf16 and q8 name
+/// their own cells in the same `phase-curves` family, so an anchor captured on either can never be
+/// read back as authority for the measured one.
+///
+/// `None` for a tier this lane does not ship (NVFP4 and the INT8-ConvRot rotated artifact): the
+/// honest answer is no identity, never another cell's.
+pub fn krea_turbo_production_calibration_fingerprint(tier: Option<Quant>) -> Option<String> {
+    match tier {
+        Some(Quant::Q4) => Some(TURBO_MEMORY_CALIBRATION_FINGERPRINT.to_owned()),
+        None => Some("krea-2-turbo-bf16-cuda-phase-curves-v1".to_owned()),
+        Some(Quant::Q8) => Some("krea-2-turbo-q8-cuda-phase-curves-v1".to_owned()),
+        Some(_) => None,
+    }
+}
+
+/// Weights-free registry-behavior identity of `krea_2_turbo` at one declared surface tier.
+///
+/// Disjoint from every production string by construction, so a catalog surface — which resolves no
+/// snapshot and therefore measures nothing — can never read as evidence of the cell it describes.
+///
+/// Covers **every tier the turbo surface is declared at**, NVFP4 included — which is why this does
+/// not reuse [`request_scoped_tier_token`]. The two axes are different questions and must not share
+/// a token: a PRODUCTION identity answers "which measured cell is this", so NVFP4 correctly has
+/// none ([`krea_turbo_production_calibration_fingerprint`] returns `None`); a registry-behavior
+/// identity answers "which declared surface is this", and `krea_2_turbo` declares an NVFP4 import
+/// surface (`supported_quants` lists `Quant::Nvfp4`). Withholding a key there does not withhold
+/// evidence — there is none either way — it makes the surface builder fail and takes the whole
+/// declaration walk down with it, which is exactly what `raw_and_edit_catalog_surfaces_are_exact…`
+/// caught. Before sc-22735 every one of these surfaces published the MEASURED q4 string instead.
+fn krea_turbo_static_behavior_fingerprint(tier: Option<Quant>) -> Option<String> {
+    // Deliberately exhaustive over `Quant`: the declared surface covers every tier, so a new
+    // variant must fail to compile here rather than silently fall into a "no declaration" refusal.
+    let tier = match tier {
+        None => "bf16",
+        Some(Quant::Q4) => "q4",
+        Some(Quant::Q8) => "q8",
+        Some(Quant::Nvfp4) => "nvfp4",
+    };
+    Some(format!("krea-2-turbo-candle-registry-behavior-v1-{tier}"))
+}
+
+fn validated_krea_turbo_memory_strategy_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    let (root, native_dit, convrot_dit, _, encoder_source) =
+        validate_load_spec(spec, KREA_2_TURBO_ID)?;
+    let mut contract = build_krea_turbo_memory_strategy_contract(spec);
+    // sc-22735: the tier comes from the ARTIFACT, never from `spec.quantize` — the SceneWorks
+    // worker forwards a default quant for the packed turnkeys at every tier, so keying on the
+    // request knob would collapse all three cells back onto one string. Unprovable (an unreadable
+    // packed marker, or the INT8-ConvRot rotated DiT, which is not one of the three measured
+    // tiers) publishes NO identity, which forces admission to name an explicit estimate authority.
+    contract.calibration = krea_provable_artifact_tier(spec, KREA_2_TURBO_ID)
+        .and_then(krea_turbo_production_calibration_fingerprint)
+        .map(|fingerprint| {
+            gen_core::MemoryCalibrationIdentity::new(
+                fingerprint,
+                gen_core::LoadShape::DeferredMaterialization,
+            )
+        });
+    // The pin is the sealed identity this load validated; price its path, not `spec.weights`.
+    contract.asset_facts = loaded_asset_facts(
+        KREA_2_TURBO_ID,
+        &root,
+        native_dit
+            .as_ref()
+            .map(gen_core::PinnedWeightsFile::loader_path),
+        convrot_dit.as_deref(),
+        &encoder_source,
+    )?;
+    Ok(contract)
+}
+
+fn registered_krea_turbo_memory_strategy_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    validated_krea_turbo_memory_strategy_contract(spec)
+}
+
+fn weights_free_krea_turbo_memory_strategy_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    let fingerprint = krea_turbo_static_behavior_fingerprint(spec.quantize).ok_or_else(|| {
+        gen_core::Error::Unsupported(format!(
+            "{KREA_2_TURBO_ID}: no weights-free Krea turbo declaration is registered for tier {:?}",
+            spec.quantize
+        ))
+    })?;
+    let mut contract = build_krea_turbo_memory_strategy_contract(spec);
+    contract.calibration = Some(gen_core::MemoryCalibrationIdentity::new(
+        fingerprint,
+        gen_core::LoadShape::DeferredMaterialization,
+    ));
+    Ok(contract)
+}
+
+/// Trailing stem of every request-scoped **production** calibration identity: the backend and the
+/// structural mechanism the string names, after the `{route}-{tier}` key.
+///
+/// sc-22735 (epic sc-22723 E1/E4). This used to be a whole, standalone fingerprint —
+/// `krea-candle-request-scoped-staged-residency-v1` — published verbatim by all three request-scoped
+/// routes at all three artifact tiers, and republished by the weights-free surfaces. Nine production
+/// cells and thirty-six weights-free surfaces shared one string, so a captured anchor could not say
+/// which cell it measured. It survives only as this stem; the full identity is composed by
+/// [`krea_request_scoped_production_calibration_fingerprint`].
+const REQUEST_SCOPED_MEMORY_FINGERPRINT_STEM: &str = "cuda-staged-residency-v1";
+
+/// Namespace of the **weights-free** request-scoped identities: registry-behavior declarations that
+/// resolve no snapshot and therefore measure nothing. Kept disjoint from every production string so
+/// a fixture or catalog surface can never read as evidence of a measured cell.
+const REQUEST_SCOPED_STATIC_BEHAVIOR_FINGERPRINT: &str = "krea-2-candle-registry-behavior-v1";
+
+fn is_request_scoped_memory_provider(provider_id: &str) -> bool {
+    matches!(
+        provider_id,
+        KREA_2_RAW_ID | KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID
+    )
+}
+
+/// Kebab token naming an artifact tier inside a calibration identity.
+fn request_scoped_tier_token(tier: Option<Quant>) -> Option<&'static str> {
+    match tier {
+        None => Some("bf16"),
+        Some(Quant::Q4) => Some("q4"),
+        Some(Quant::Q8) => Some("q8"),
+        Some(_) => None,
+    }
+}
+
+/// Production calibration identity of one request-scoped Krea route, keyed on **(route, tier)**.
+///
+/// `krea_2_raw`, `krea_2_edit` and `krea_2_turbo_edit` execute the same structural staging seam but
+/// are three separate evidence domains, and each ships three artifact tiers — nine cells that an
+/// anchor must be able to tell apart. The string is
+/// `{route}-{tier}-cuda-staged-residency-v1` with `{route}` the provider id in kebab case and
+/// `{tier}` in `{q4, q8, bf16}`.
+///
+/// `None` for a provider no request-scoped route serves and for a tier this lane does not ship
+/// (NVFP4): publishing nothing is correct, publishing another cell's string is not.
+pub fn krea_request_scoped_production_calibration_fingerprint(
+    provider_id: &str,
+    tier: Option<Quant>,
+) -> Option<String> {
+    if !is_request_scoped_memory_provider(provider_id) {
+        return None;
+    }
+    let tier = request_scoped_tier_token(tier)?;
+    Some(format!(
+        "{}-{tier}-{REQUEST_SCOPED_MEMORY_FINGERPRINT_STEM}",
+        provider_id.replace('_', "-")
+    ))
+}
+
+/// The tier a Krea load can **prove** from the artifact, or `None` when it cannot. Shared by the
+/// three request-scoped routes and by `krea_2_turbo`.
+///
+/// `LoadSpec::quantize` is not the answer: on a `WeightsSource::Dir` load this crate accepts it as a
+/// no-op recipe knob (the turnkey is already packed), and the SceneWorks worker forwards a default
+/// tier regardless of what is on disk. [`actual_quant_tier`] reads the transformer's own packed
+/// marker instead, so the tier named in a published identity is the tier that was opened.
+///
+/// Fails closed to `None` — never to an error, and never to a fabricated tier — for an unreadable or
+/// malformed packed config, an unsupported packed width, an imported single file whose companion
+/// snapshot disagrees with the request, and the INT8-ConvRot DiT path, whose rotated single-file
+/// artifact is not one of the three measured tiers.
+fn krea_provable_artifact_tier(spec: &LoadSpec, provider_id: &str) -> Option<Option<Quant>> {
+    match convrot_selector(spec, provider_id) {
+        Ok(None) => {}
+        Ok(Some(_)) | Err(_) => return None,
+    }
+    actual_quant_tier(spec, provider_id).ok()
+}
+
+/// The production calibration identity a request-scoped load publishes, or `None` when the artifact
+/// tier cannot be proven.
+fn krea_request_scoped_production_calibration(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> Option<gen_core::MemoryCalibrationIdentity> {
+    let tier = krea_provable_artifact_tier(spec, provider_id)?;
+    let fingerprint = krea_request_scoped_production_calibration_fingerprint(provider_id, tier)?;
+    Some(gen_core::MemoryCalibrationIdentity::new(
+        fingerprint,
+        spec.load_shape,
+    ))
+}
+
+/// Weights-free registry-behavior identity of one request-scoped route at one **declared** surface
+/// tier: `krea-2-candle-registry-behavior-v1-{route}-{tier}`.
+///
+/// The tier comes from the surface selector, which names an already-resolved artifact tier — not
+/// from `LoadSpec::quantize` (the surface builder deliberately erases it) and not from the
+/// filesystem (there is no snapshot to read). `None` for a tier this lane does not declare.
+fn krea_request_scoped_static_behavior_fingerprint(
+    provider_id: &str,
+    tier: Option<Quant>,
+) -> Option<String> {
+    if !is_request_scoped_memory_provider(provider_id) {
+        return None;
+    }
+    let tier = request_scoped_tier_token(tier)?;
+    Some(format!(
+        "{REQUEST_SCOPED_STATIC_BEHAVIOR_FINGERPRINT}-{}-{tier}",
+        provider_id.replace('_', "-")
+    ))
+}
+
+/// The artifact tier a weights-free surface selector declares, as a [`Quant`] key.
+///
+/// NVFP4 is refused: this lane ships no NVFP4 request-scoped turnkey, which is the same refusal
+/// [`surface_selector_matches_request_scoped_spec`] already makes.
+fn request_scoped_surface_tier(tier: gen_core::MemoryContractSurfaceTier) -> Option<Option<Quant>> {
+    match tier {
+        gen_core::MemoryContractSurfaceTier::Bf16 => Some(None),
+        gen_core::MemoryContractSurfaceTier::Q4 => Some(Some(Quant::Q4)),
+        gen_core::MemoryContractSurfaceTier::Q8 => Some(Some(Quant::Q8)),
+        gen_core::MemoryContractSurfaceTier::Nvfp4 => None,
+    }
+}
+
+/// Source-derived contract shared by the Raw and both Edit execution paths.
+///
+/// These generators all execute request-scoped component staging, but deliberately reject Turbo's
+/// decode tiling, attention chunking, and block-window controls. The contract identifies this
+/// structural execution seam; it is not a performance, capacity, or real-weight claim.
+///
+/// The calibration identity it publishes is the **production** one, keyed on (route, tier) with the
+/// tier proven from the artifact. Weights-free callers overwrite it with the registry-behavior
+/// identity through [`weights_free_krea_request_scoped_contract`].
+fn build_krea_request_scoped_memory_strategy_contract(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    use gen_core::{
+        MemoryBackendRealization, MemoryFormulaKind, MemoryFormulaVariable,
+        MemoryLifecycleCapabilities, MemoryPhase, MemoryProviderContract, MemoryStrategy,
+        MemoryStrategySupport, MemoryWindowMaterialization,
+    };
+
+    if !is_request_scoped_memory_provider(provider_id) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: no Krea request-scoped structural memory contract is registered"
+        )));
+    }
+    let mut contract = MemoryProviderContract::compatibility_default(
+        provider_id,
+        MemoryBackendRealization::CandleCuda {
+            device_residency: true,
+            host_backed_weights: true,
+            host_to_device_block_materialization: false,
+            block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
+        },
+    );
+    contract.architecture_facts = architecture_facts(spec);
+    contract.load_shape = spec.load_shape;
+    contract.lifecycle = MemoryLifecycleCapabilities {
+        phases: vec![
+            MemoryPhase::Conditioning,
+            MemoryPhase::Denoise,
+            MemoryPhase::Decode,
+        ],
+        synchronized_phase_release: true,
+        decode_tiling: false,
+        attention_chunking: false,
+        transformer_window_materialization: false,
+    };
+    contract.formula = MemoryFormulaKind::PhaseEnvelope {
+        phases: contract.lifecycle.phases.clone(),
+        variables: vec![
+            MemoryFormulaVariable::AssetBytes,
+            MemoryFormulaVariable::PixelCount,
+            MemoryFormulaVariable::BatchCount,
+            MemoryFormulaVariable::ConditioningTokenCount,
+        ],
+    };
+    contract.calibration = krea_request_scoped_production_calibration(provider_id, spec);
+    contract
+        .strategies
+        .iter_mut()
+        .find(|capability| capability.strategy == MemoryStrategy::StagedResidency)
+        .expect("compatibility contract contains every strategy")
+        .support = MemoryStrategySupport::Implemented;
+    Ok(contract)
+}
+
+fn validated_krea_request_scoped_memory_strategy_contract(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    let (root, native_dit, convrot_dit, _, encoder_source) = validate_load_spec(spec, provider_id)?;
+    let mut contract = build_krea_request_scoped_memory_strategy_contract(provider_id, spec)?;
+    // SC-22667 (E1). This route's formula declares `MemoryFormulaVariable::AssetBytes`, so the
+    // all-zero `compatibility_default` facts it inherited were a formula input that was never
+    // supplied. The pin is the sealed identity this load validated; price its path.
+    contract.asset_facts = loaded_asset_facts(
+        provider_id,
+        &root,
+        native_dit
+            .as_ref()
+            .map(gen_core::PinnedWeightsFile::loader_path),
+        convrot_dit.as_deref(),
+        &encoder_source,
+    )?;
+    Ok(contract)
+}
+
+fn surface_selector_matches_request_scoped_spec(
+    surface: &gen_core::MemoryContractSurfaceSpec,
+) -> gen_core::Result<()> {
+    let tier_matches = match surface.resolved_artifact_tier() {
+        gen_core::MemoryContractSurfaceTier::Bf16 => {
+            surface.spec.precision == gen_core::Precision::Bf16 && surface.spec.quantize.is_none()
+        }
+        gen_core::MemoryContractSurfaceTier::Q4 => surface.spec.quantize == Some(Quant::Q4),
+        gen_core::MemoryContractSurfaceTier::Q8 => surface.spec.quantize == Some(Quant::Q8),
+        gen_core::MemoryContractSurfaceTier::Nvfp4 => false,
+    };
+    let exact_base_axes = surface.spec.resolved_route.is_none()
+        && surface.spec.decode_geometry_policies.is_empty()
+        && !surface.spec.decode_geometry_policy_authoritative
+        && surface.spec.decode_quality_runtime_identity.is_none()
+        && surface.spec.precision == gen_core::Precision::Bf16
+        && matches!(surface.spec.weights, WeightsSource::Dir(_))
+        && surface.selector.offload_policy == surface.spec.offload_policy
+        && surface.selector.load_shape == surface.spec.load_shape
+        && surface.spec.control.is_none()
+        && surface.spec.extra_controls.is_empty()
+        && surface.spec.ip_adapter.is_none()
+        && surface.spec.identity.is_none()
+        && surface.spec.text_encoder.is_none()
+        && surface.spec.components.is_empty();
+    if tier_matches && exact_base_axes {
+        Ok(())
+    } else {
+        Err(gen_core::Error::Msg(format!(
+            "Krea request-scoped memory surface selector '{}' does not match its weights-free LoadSpec",
+            surface.selector.id()
+        )))
+    }
+}
+
+/// Structural declaration of one request-scoped route at one **declared** tier, resolving no
+/// snapshot.
+///
+/// The contract body is the production one; only the calibration identity differs, and it must:
+/// it names the registry-behavior namespace, so a catalog surface can never be mistaken for
+/// evidence of the production cell it describes. The identity stays `Some(..)` — a weights-free
+/// declaration that publishes none is indistinguishable from a route with no memory contract at
+/// all — and keeps `spec.load_shape` on the materialization axis.
+fn weights_free_krea_request_scoped_contract(
+    provider_id: &str,
+    spec: &LoadSpec,
+    tier: Option<Quant>,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    let fingerprint = krea_request_scoped_static_behavior_fingerprint(provider_id, tier)
+        .ok_or_else(|| {
+            gen_core::Error::Unsupported(format!(
+                "{provider_id}: no weights-free Krea request-scoped declaration is registered for tier {tier:?}"
+            ))
+        })?;
+    let mut contract = build_krea_request_scoped_memory_strategy_contract(provider_id, spec)?;
+    contract.calibration = Some(gen_core::MemoryCalibrationIdentity::new(
+        fingerprint,
+        spec.load_shape,
+    ));
+    Ok(contract)
+}
+
+fn weights_free_krea_request_scoped_surface_contract(
+    provider_id: &str,
+    surface: &gen_core::MemoryContractSurfaceSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    surface_selector_matches_request_scoped_spec(surface)?;
+    // The SELECTOR carries the resolved artifact tier; the spec's `quantize` is erased below, so it
+    // has to be read before that happens.
+    let tier = request_scoped_surface_tier(surface.resolved_artifact_tier()).ok_or_else(|| {
+        gen_core::Error::Unsupported(format!(
+            "{provider_id}: Krea ships no request-scoped {:?} surface",
+            surface.resolved_artifact_tier()
+        ))
+    })?;
+    let mut production_spec = surface.spec.clone();
+    // Q4/Q8 are already-packed artifact tiers. The generic fixture uses this field only to make its
+    // selector self-checking; the real Krea directory loader resolves the packed marker itself.
+    production_spec.quantize = None;
+    weights_free_krea_request_scoped_contract(provider_id, &production_spec, tier)
+}
+
+/// The turbo contract the safety-check tests grade against: the shape
+/// [`build_krea_turbo_memory_strategy_contract`] produces, carrying the identity a **validated q4**
+/// load would stamp on it.
+///
+/// sc-22735: the shared builder itself publishes no identity any more — it serves both the validated
+/// load and the weights-free surface, and only the validated path can prove a tier from the
+/// artifact. These tests exercise the tier/authority handshake, which needs a contract that actually
+/// names a calibration, and the q4 cell is the one turbo record that is measured. Stamping it here
+/// (rather than restoring it in the builder) keeps the production split intact: a builder that
+/// published this string again would re-file a bf16 or q8 capture under the measured q4 key, which
+/// is exactly the defect this story closes. The path is deliberately nonexistent, so nothing here
+/// can be mistaken for a real artifact-proven load.
+#[cfg(test)]
+fn krea_turbo_memory_strategy_contract() -> &'static gen_core::MemoryProviderContract {
+    static CONTRACT: std::sync::OnceLock<gen_core::MemoryProviderContract> =
+        std::sync::OnceLock::new();
+    CONTRACT.get_or_init(|| {
+        let mut contract = build_krea_turbo_memory_strategy_contract(&LoadSpec::new(
+            WeightsSource::Dir("/nonexistent/krea".into()),
+        ));
+        assert!(
+            contract.calibration.is_none(),
+            "the shared turbo builder must publish no identity; only a validated load proves a tier"
+        );
+        contract.calibration = Some(gen_core::MemoryCalibrationIdentity::new(
+            krea_turbo_production_calibration_fingerprint(Some(Quant::Q4))
+                .expect("krea_2_turbo publishes a production identity at q4"),
+            gen_core::LoadShape::DeferredMaterialization,
+        ));
+        contract
+    })
+}
+
+fn companion_quant_tier(spec: &LoadSpec, id: &str) -> gen_core::Result<Option<Quant>> {
+    let root = match &spec.weights {
+        WeightsSource::Dir(root) => root,
+        WeightsSource::File(_) => gen_core::require_base_snapshot(spec, id)?,
+    };
+    let companion_quant = loader::read_packed_config(&root.join("transformer"))
+        .map_err(gen_core::Error::backend)?
+        .map(|packed| match packed.bits {
+            4 => Ok(Quant::Q4),
+            8 => Ok(Quant::Q8),
+            bits => Err(gen_core::Error::Unsupported(format!(
+                "{id}: transformer declares unsupported packed quantization width {bits}"
+            ))),
+        })
+        .transpose()?;
+    Ok(companion_quant)
+}
+
+/// Resolve the quantize-on-load tier for an imported checkpoint's companion text encoder.
+///
+/// `LoadSpec::quantize` describes the imported DiT's numeric tier as well as the requested tier for
+/// dense Q4/Q8 imports. Native NVFP4 is different: the single-file DiT is already packed and is
+/// loaded by `Nvfp4Linear`, while the companion text encoder remains dense. Forwarding `Nvfp4` to
+/// the text encoder would incorrectly enter the generic GGUF fold path, where NVFP4 deliberately
+/// has no block type.
+fn text_encoder_quant_tier(spec: &LoadSpec, id: &str) -> gen_core::Result<Option<Quant>> {
+    if !matches!(spec.weights, WeightsSource::File(_)) || companion_quant_tier(spec, id)?.is_some()
+    {
+        return Ok(None);
+    }
+
+    Ok(spec
+        .quantize
+        .filter(|quant| matches!(quant, Quant::Q4 | Quant::Q8)))
+}
+
+fn actual_quant_tier(spec: &LoadSpec, id: &str) -> gen_core::Result<Option<Quant>> {
+    if convrot_selector(spec, id)?.is_some() {
+        return Ok(Some(Quant::Q8));
+    }
+    let companion_quant = companion_quant_tier(spec, id)?;
+    if matches!(spec.weights, WeightsSource::Dir(_)) {
+        return Ok(companion_quant);
+    }
+
+    let requested = spec.quantize;
+    match (companion_quant, requested) {
+        (Some(companion), Some(requested)) if companion == requested => Ok(Some(requested)),
+        (Some(companion), Some(requested)) => Err(gen_core::Error::Unsupported(format!(
+            "{id}: imported native checkpoint requests {requested:?}, but its companion snapshot is packed {companion:?}; stage the matching tier or a dense companion snapshot"
+        ))),
+        (Some(companion), None) => Err(gen_core::Error::Unsupported(format!(
+            "{id}: imported native checkpoint has no quant request, but its companion snapshot is packed {companion:?}; request the matching tier or stage a dense companion snapshot"
+        ))),
+        (None, requested) => Ok(requested),
+    }
+}
+
+fn registered_krea_safety_check(
+    spec: &LoadSpec,
+    contract: &gen_core::MemoryProviderContract,
+    context: &gen_core::MemoryRunContext,
+) -> gen_core::MemorySafetyDecision {
+    match actual_quant_tier(spec, &contract.provider_id) {
+        Ok(quant) => krea_memory_strategy_safety_check(contract, quant, context),
+        Err(error) => gen_core::MemorySafetyDecision::Reject {
+            reason: error.to_string(),
+        },
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn registered_krea_valid_fixture(
+    spec: &LoadSpec,
+    contract: &gen_core::MemoryProviderContract,
+    strategy: gen_core::MemoryStrategy,
+) -> gen_core::Result<Vec<gen_core::MemoryBehaviorFixture>> {
+    if !strategy.is_optimized() {
+        return Ok(Vec::new());
+    }
+    let tier = gen_core::MemoryNumericTier {
+        precision: gen_core::Precision::Bf16,
+        quant: actual_quant_tier(spec, &contract.provider_id)?,
+        component_precision_floors: &[],
+    };
+    let routes: Vec<gen_core::MemoryBehaviorRoute> = match contract.provider_id.as_str() {
+        KREA_2_RAW_ID => vec![
+            (gen_core::MemoryMode::TextToImage, 0, false, false),
+            (gen_core::MemoryMode::TextToImage, 0, true, false),
+            (gen_core::MemoryMode::ImageToImage, 1, false, false),
+            (gen_core::MemoryMode::ImageToImage, 1, true, false),
+            (gen_core::MemoryMode::TextToImage, 0, false, true),
+        ]
+        .into_iter()
+        .map(
+            |(mode, reference_count, use_pid, has_phases)| gen_core::MemoryBehaviorRoute {
+                mode,
+                reference_count,
+                use_pid,
+                has_phases,
+                overlay: None,
+            },
+        )
+        .collect(),
+        KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID => [1, 2]
+            .into_iter()
+            .flat_map(|reference_count| {
+                [false, true].map(move |use_pid| gen_core::MemoryBehaviorRoute {
+                    mode: gen_core::MemoryMode::Edit,
+                    reference_count,
+                    use_pid,
+                    has_phases: false,
+                    overlay: None,
+                })
+            })
+            .collect(),
+        "krea_2_turbo_control" => vec![gen_core::MemoryBehaviorRoute {
+            mode: gen_core::MemoryMode::ImageToImage,
+            reference_count: 1,
+            use_pid: false,
+            has_phases: false,
+            overlay: Some("pose-control".to_owned()),
+        }],
+        KREA_2_TURBO_ID => vec![gen_core::MemoryBehaviorRoute {
+            mode: gen_core::MemoryMode::TextToImage,
+            reference_count: 0,
+            use_pid: false,
+            has_phases: false,
+            overlay: None,
+        }],
+        provider_id => {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{provider_id}: no Krea memory behavior route is registered"
+            )))
+        }
+    };
+    routes
+        .into_iter()
+        .map(|route| {
+            let has_phases = route.has_phases;
+            let edit = route.mode == gen_core::MemoryMode::Edit;
+            let context =
+                gen_core::standard_memory_behavior_context(contract, strategy, tier, route)?;
+            let mut fixture = gen_core::MemoryBehaviorFixture::new(context);
+            if edit {
+                for conditioning in &mut fixture.request.conditioning {
+                    if let Conditioning::Reference { strength, .. } = conditioning {
+                        *strength = None;
+                    }
+                }
+            }
+            if has_phases {
+                fixture.request.phases = Some(vec![gen_core::GenerationPhase {
+                    steps: 1,
+                    ..Default::default()
+                }]);
+            }
+            Ok(fixture)
+        })
+        .collect()
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn registered_krea_begin_request(
+    spec: &LoadSpec,
+    contract: &gen_core::MemoryProviderContract,
+    context: &gen_core::MemoryRunContext,
+) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope>>> {
+    if let gen_core::MemorySafetyDecision::Reject { reason } =
+        registered_krea_safety_check(spec, contract, context)
+    {
+        return Err(gen_core::Error::Unsupported(reason));
+    }
+    Ok(Some(Box::new(KreaMemoryScope {
+        device: Device::Cpu,
+        memory: contract.generation_memory(&context.selection),
+        provider_id: contract.provider_id.clone(),
+        mode: context.mode.clone(),
+        reference_count: context.geometry.reference_count,
+        use_pid: context.use_pid,
+        has_phases: context.has_phases,
+        finished: false,
+    })))
+}
+
+#[cfg(test)]
+mod weights_free_behavior_tests {
+    use super::*;
+
+    fn surface_copy(
+        surface: &gen_core::MemoryContractSurfaceSpec,
+    ) -> gen_core::MemoryContractSurfaceSpec {
+        gen_core::MemoryContractSurfaceSpec {
+            selector: surface.selector,
+            spec: surface.spec.clone(),
+        }
+    }
+
+    #[test]
+    fn raw_and_edit_catalog_surfaces_are_exact_and_only_publish_request_scoped_staging() {
+        let registry = register_memory_contract_surfaces(register_providers(
+            gen_core::ProviderRegistryBuilder::new(),
+        ))
+        .build()
+        .unwrap();
+        assert_eq!(registry.memory_strategy_registrations().len(), 5);
+        let surfaces = registry.memory_contract_surfaces().unwrap();
+        assert_eq!(surfaces.len(), 2 * 16 + 3 * 12);
+        for provider_id in [KREA_2_RAW_ID, KREA_2_EDIT_ID, KREA_2_TURBO_EDIT_ID] {
+            let provider_surfaces: Vec<_> = surfaces
+                .iter()
+                .filter(|surface| surface.contract.provider_id == provider_id)
+                .collect();
+            assert_eq!(provider_surfaces.len(), 12, "{provider_id}");
+            for surface in provider_surfaces {
+                assert!(!surface.composed, "{provider_id}");
+                assert_eq!(
+                    surface.contract.asset_facts,
+                    gen_core::MemoryAssetFacts::default(),
+                    "{provider_id}: weights-free catalog surfaces cannot claim inventory"
+                );
+                // A weights-free catalog surface declares the registry-behavior identity of its own
+                // (route, declared tier) — never a production cell's string.
+                let tier = request_scoped_surface_tier(surface.resolved_artifact_tier()).unwrap();
+                assert_eq!(
+                    surface.contract.calibration.as_ref().unwrap().fingerprint,
+                    krea_request_scoped_static_behavior_fingerprint(provider_id, tier).unwrap(),
+                    "{provider_id}:{}",
+                    surface.selector.id()
+                );
+                for strategy in gen_core::MemoryStrategy::ALL {
+                    let support = &surface.contract.capability(strategy).unwrap().support;
+                    let expected = matches!(
+                        strategy,
+                        gen_core::MemoryStrategy::Resident
+                            | gen_core::MemoryStrategy::StagedResidency
+                    );
+                    assert_eq!(
+                        support == &gen_core::MemoryStrategySupport::Implemented,
+                        expected,
+                        "{provider_id}:{}:{strategy:?}",
+                        surface.selector.id()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn request_scoped_surface_resolver_uses_explicit_tier_and_fails_closed_on_axis_mutation() {
+        let q4 = gen_core::candle_memory_contract_surface_specs()
+            .into_iter()
+            .find(|surface| {
+                surface.resolved_artifact_tier() == gen_core::MemoryContractSurfaceTier::Q4
+                    && surface.selector.offload_policy == gen_core::OffloadPolicy::Sequential
+                    && surface.selector.load_shape == gen_core::LoadShape::DeferredMaterialization
+            })
+            .unwrap();
+        let contract = weights_free_krea_request_scoped_surface_contract(KREA_2_RAW_ID, &q4)
+            .expect("prepacked Q4 surface");
+        assert_eq!(contract.provider_id, KREA_2_RAW_ID);
+        assert_eq!(contract.load_shape, q4.selector.load_shape);
+
+        let mut composed = surface_copy(&q4);
+        composed.spec.adapters.push(gen_core::AdapterSpec::new(
+            "/nonexistent/adapter.safetensors".into(),
+            1.0,
+            gen_core::AdapterKind::Lora,
+        ));
+        composed.spec.pid = Some(gen_core::PidWeights {
+            checkpoint: WeightsSource::File("/nonexistent/pid.safetensors".into()),
+            gemma: WeightsSource::Dir("/nonexistent/gemma".into()),
+        });
+        weights_free_krea_request_scoped_surface_contract(KREA_2_RAW_ID, &composed)
+            .expect("LoRA + PiD remains a valid Krea composition");
+
+        let mut mutations = Vec::new();
+        let mut tier = surface_copy(&q4);
+        tier.spec.quantize = Some(Quant::Q8);
+        mutations.push(tier);
+        let mut source = surface_copy(&q4);
+        source.spec.weights = WeightsSource::File("/nonexistent/krea.safetensors".into());
+        mutations.push(source);
+        let mut precision = surface_copy(&q4);
+        precision.spec.precision = gen_core::Precision::Fp32;
+        mutations.push(precision);
+        let mut offload = surface_copy(&q4);
+        offload.spec.offload_policy = gen_core::OffloadPolicy::Resident;
+        mutations.push(offload);
+        let mut shape = surface_copy(&q4);
+        shape.spec.load_shape = gen_core::LoadShape::EagerMaterialization;
+        mutations.push(shape);
+        let mut route = surface_copy(&q4);
+        route.spec.resolved_route = Some(KREA_2_EDIT_ID.to_owned());
+        mutations.push(route);
+        let mut control = surface_copy(&q4);
+        control.spec.control = Some(WeightsSource::File(
+            "/nonexistent/control.safetensors".into(),
+        ));
+        mutations.push(control);
+        let mut external_te = surface_copy(&q4);
+        external_te.spec.text_encoder = Some(WeightsSource::Dir("/nonexistent/te".into()));
+        mutations.push(external_te);
+        let mut component = surface_copy(&q4);
+        component.spec.components.insert(
+            "unknown".to_owned(),
+            WeightsSource::Dir("/nonexistent".into()),
+        );
+        mutations.push(component);
+        let mut identity = surface_copy(&q4);
+        identity.spec.identity = Some(gen_core::IdentityWeights::default());
+        mutations.push(identity);
+        for mutation in mutations {
+            assert!(
+                weights_free_krea_request_scoped_surface_contract(KREA_2_RAW_ID, &mutation)
+                    .is_err(),
+                "mutated surface must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn request_scoped_behaviors_cover_raw_edit_and_turbo_edit_routes_exactly() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/krea".into()));
+        for (provider_id, expected) in [
+            (KREA_2_RAW_ID, 5),
+            (KREA_2_EDIT_ID, 4),
+            (KREA_2_TURBO_EDIT_ID, 4),
+        ] {
+            let contract =
+                build_krea_request_scoped_memory_strategy_contract(provider_id, &spec).unwrap();
+            let fixtures = registered_krea_valid_fixture(
+                &spec,
+                &contract,
+                gen_core::MemoryStrategy::StagedResidency,
+            )
+            .unwrap();
+            assert_eq!(fixtures.len(), expected, "{provider_id}");
+            for mut fixture in fixtures {
+                validate_krea_memory_route(provider_id, &fixture.context).unwrap();
+                let mut scope = registered_krea_begin_request(&spec, &contract, &fixture.context)
+                    .unwrap()
+                    .unwrap();
+                scope.configure_request(&mut fixture.request).unwrap();
+                assert_eq!(
+                    fixture.request.memory,
+                    Some(gen_core::GenerationMemory {
+                        stage_residency: true,
+                        ..Default::default()
+                    })
+                );
+                assert!(scope
+                    .configure_decode(512, 128, fixture.context.geometry)
+                    .is_err());
+                assert!(scope.configure_attention(128 * 1024 * 1024).is_err());
+                assert!(scope.materialize_transformer_window(0, 1).is_err());
+                scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn request_scoped_route_mutations_cannot_cross_provider_mode_or_geometry() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/krea".into()));
+        let contract =
+            build_krea_request_scoped_memory_strategy_contract(KREA_2_RAW_ID, &spec).unwrap();
+        let mut context = gen_core::standard_memory_behavior_context(
+            &contract,
+            gen_core::MemoryStrategy::StagedResidency,
+            gen_core::MemoryNumericTier {
+                precision: gen_core::Precision::Bf16,
+                quant: None,
+                component_precision_floors: &[],
+            },
+            gen_core::MemoryBehaviorRoute {
+                mode: gen_core::MemoryMode::TextToImage,
+                reference_count: 0,
+                use_pid: false,
+                has_phases: false,
+                overlay: None,
+            },
+        )
+        .unwrap();
+        validate_krea_memory_route(KREA_2_RAW_ID, &context).unwrap();
+        assert!(validate_krea_memory_route(KREA_2_EDIT_ID, &context).is_err());
+
+        context.mode = gen_core::MemoryMode::Edit;
+        assert!(validate_krea_memory_route(KREA_2_RAW_ID, &context).is_err());
+        context.mode = gen_core::MemoryMode::TextToImage;
+        context.geometry.reference_count = 1;
+        context.has_reference = true;
+        assert!(validate_krea_memory_route(KREA_2_RAW_ID, &context).is_err());
+        context.geometry.reference_count = 0;
+        context.has_reference = false;
+        context.overlay = Some("lora".to_owned());
+        assert!(validate_krea_memory_route(KREA_2_RAW_ID, &context).is_err());
+        context.overlay = None;
+        context.use_pid = true;
+        context.has_phases = true;
+        assert!(validate_krea_memory_route(KREA_2_RAW_ID, &context).is_err());
+    }
+
+    #[test]
+    fn catalog_contract_fixture_is_weights_free_but_production_admission_stays_strict() {
+        let spec = LoadSpec::new(WeightsSource::Dir(
+            "Z:\\nonexistent\\krea-catalog-fixture".into(),
+        ));
+        let contract = build_krea_turbo_memory_strategy_contract(&spec);
+        assert_eq!(contract.provider_id, KREA_2_TURBO_ID);
+        assert_eq!(contract.asset_facts, gen_core::MemoryAssetFacts::default());
+        assert!(
+            validated_krea_turbo_memory_strategy_contract(&spec).is_err(),
+            "production admission must still validate Krea assets"
+        );
+        for provider_id in [KREA_2_RAW_ID, KREA_2_EDIT_ID, KREA_2_TURBO_EDIT_ID] {
+            assert!(
+                validated_krea_request_scoped_memory_strategy_contract(provider_id, &spec).is_err(),
+                "{provider_id}: production admission must still validate Krea assets"
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_scope_executes_the_registered_base_and_control_behaviors() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/krea".into()));
+        for (contract, strategy) in [
+            (
+                // sc-22735: the SHARED builder publishes no identity now (only a validated load can
+                // prove a tier), and an optimized behavior needs one. Grade against the turbo
+                // contract carrying the identity a validated q4 load stamps.
+                krea_turbo_memory_strategy_contract().clone(),
+                gen_core::MemoryStrategy::BoundedDecode,
+            ),
+            (
+                build_krea_control_memory_strategy_contract(&spec).unwrap(),
+                gen_core::MemoryStrategy::BoundedAttention,
+            ),
+        ] {
+            let mut fixture = registered_krea_valid_fixture(&spec, &contract, strategy)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
+            let mut scope = registered_krea_begin_request(&spec, &contract, &fixture.context)
+                .unwrap()
+                .unwrap();
+            scope.configure_request(&mut fixture.request).unwrap();
+            assert_eq!(
+                fixture.request.memory,
+                contract.generation_memory(&fixture.context.selection)
+            );
+            scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
+        }
+    }
+}
+
+fn krea_memory_strategy_safety_check(
+    contract: &gen_core::MemoryProviderContract,
+    loaded_quant: Option<Quant>,
+    context: &gen_core::MemoryRunContext,
+) -> gen_core::MemorySafetyDecision {
+    // Krea executes its dense tensors at the provider's BF16/default tier. `LoadSpec::precision`
+    // is not wired into the loader, so it must not relabel the calibration evidence admitted here.
+    let route_gate = || validate_krea_memory_route(&contract.provider_id, context);
+    gen_core::standard_memory_strategy_safety_check(
+        contract,
+        context,
+        Some(gen_core::MemoryNumericTier {
+            precision: gen_core::Precision::Bf16,
+            quant: loaded_quant,
+            component_precision_floors: &[],
+        }),
+        Some(&route_gate),
+    )
+}
+
+const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: KREA_2_TURBO_ID,
+    contract: registered_krea_turbo_memory_strategy_contract,
+    safety_check: registered_krea_safety_check,
+};
+#[cfg(feature = "cuda")]
+const TURBO_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: KREA_2_TURBO_ID,
+        valid_fixtures: registered_krea_valid_fixture,
+        begin_request: registered_krea_begin_request,
+    };
+
+macro_rules! request_scoped_memory_registration {
+    (
+        $registration:ident,
+        $behavior:ident,
+        $registered_contract:ident,
+        $surface_contract:ident,
+        $provider_id:expr
+    ) => {
+        fn $registered_contract(
+            spec: &LoadSpec,
+        ) -> gen_core::Result<gen_core::MemoryProviderContract> {
+            validated_krea_request_scoped_memory_strategy_contract($provider_id, spec)
+        }
+
+        fn $surface_contract(
+            surface: &gen_core::MemoryContractSurfaceSpec,
+        ) -> gen_core::Result<gen_core::MemoryProviderContract> {
+            weights_free_krea_request_scoped_surface_contract($provider_id, surface)
+        }
+
+        const $registration: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+            provider_id: $provider_id,
+            contract: $registered_contract,
+            safety_check: registered_krea_safety_check,
+        };
+
+        #[cfg(feature = "cuda")]
+        const $behavior: gen_core::MemoryBehaviorRegistration =
+            gen_core::MemoryBehaviorRegistration {
+                provider_id: $provider_id,
+                valid_fixtures: registered_krea_valid_fixture,
+                begin_request: registered_krea_begin_request,
+            };
+    };
+}
+
+request_scoped_memory_registration!(
+    RAW_MEMORY_REGISTRATION,
+    RAW_MEMORY_BEHAVIOR,
+    registered_krea_raw_memory_strategy_contract,
+    weights_free_krea_raw_surface_contract,
+    KREA_2_RAW_ID
+);
+request_scoped_memory_registration!(
+    EDIT_MEMORY_REGISTRATION,
+    EDIT_MEMORY_BEHAVIOR,
+    registered_krea_edit_memory_strategy_contract,
+    weights_free_krea_edit_surface_contract,
+    KREA_2_EDIT_ID
+);
+request_scoped_memory_registration!(
+    TURBO_EDIT_MEMORY_REGISTRATION,
+    TURBO_EDIT_MEMORY_BEHAVIOR,
+    registered_krea_turbo_edit_memory_strategy_contract,
+    weights_free_krea_turbo_edit_surface_contract,
+    KREA_2_TURBO_EDIT_ID
+);
+
+/// Provider-owned executable capabilities for SceneWorks' composed Krea Turbo + pose-ControlNet
+/// route. The worker owns measured evidence and live-budget selection; this declaration owns which
+/// controls the provider can actually execute.
+fn build_krea_control_memory_strategy_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    let quant = actual_quant_tier(spec, KREA_2_TURBO_CONTROL_ID)?;
+    let mut contract = build_krea_control_memory_strategy_contract_for_tier(quant, spec);
+    // SC-22667 (E1, review round): this builder serves the registered contract and the real-load
+    // probe alike, and both used to publish `MemoryAssetFacts::default()` on a fully materialized
+    // control load. The weights-free surface keeps the zero facts by calling `_for_tier` directly.
+    contract.asset_facts = control_asset_facts(spec)?;
+    Ok(contract)
+}
+
+/// Load-exact per-component asset facts for a materialized **control** load (SC-22667 review).
+///
+/// The control route validates its own spec shape (`control_provider::load_with_spec`): the base is
+/// the runtime snapshot **directory** (a `File` base is rejected there), the ConvRot DiT arrives as
+/// `KREA_CONVROT_DIT_COMPONENT`, a native DiT only through runtime paths the spec cannot carry, and
+/// `spec.control` names the pose branch — an auxiliary overlay outside these base fields. The
+/// components it then materializes differ from the generation routes in two widths, both read off
+/// `control_provider.rs`: the text encoder opens f32 (`load_control_text`) and the autoencoder is
+/// built encoder-and-decoder (`load_control_heavy`: `load_vae` + `QwenVaeEncoder::new`).
+///
+/// A spec whose snapshot is not on disk — the registry's sentinel surface, a fixture — publishes
+/// the zero facts, exactly as the generation routes' weights-free builders do.
+fn control_asset_facts(spec: &LoadSpec) -> gen_core::Result<gen_core::MemoryAssetFacts> {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return Ok(gen_core::MemoryAssetFacts::default());
+    };
+    if !root.is_dir() {
+        return Ok(gen_core::MemoryAssetFacts::default());
+    }
+    let convrot_dit = convrot_selector(spec, KREA_2_TURBO_CONTROL_ID)?;
+    // The same encoder-contract resolution `resolve_control_text_encoder_source` performs; a source
+    // that does not validate is a load `Krea2Control::load` refuses, and contributes no signal here.
+    let Ok(encoder_source) = ENCODER_CONTRACT.source_for_load(spec, root) else {
+        return Ok(gen_core::MemoryAssetFacts::default());
+    };
+    loaded_asset_facts(
+        KREA_2_TURBO_CONTROL_ID,
+        root,
+        None,
+        convrot_dit.as_deref(),
+        &encoder_source,
+    )
+}
+
+/// The control route runs the same Krea 2 DiT and Qwen-Image VAE as Turbo, so it reads the same
+/// snapshot axes. `spec` is threaded in alongside the already-resolved tier purely so those axes
+/// come from the snapshot actually being loaded; the weights-free surface passes the registry's
+/// sentinel spec and therefore still publishes no facts.
+fn build_krea_control_memory_strategy_contract_for_tier(
+    quant: Option<Quant>,
+    spec: &LoadSpec,
+) -> gen_core::MemoryProviderContract {
+    use gen_core::{
+        LoadShape, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
+        MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase,
+        MemoryPrerequisiteScope, MemoryProviderContract, MemoryStrategy,
+        MemoryStrategyEngagementExclusion, MemoryStrategyPrerequisite, MemoryStrategySupport,
+        MemoryWindowMaterialization,
+    };
+
+    let mut contract = MemoryProviderContract::compatibility_default(
+        "krea_2_turbo_control",
+        MemoryBackendRealization::CandleCuda {
+            device_residency: true,
+            host_backed_weights: true,
+            host_to_device_block_materialization: false,
+            block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
+        },
+    );
+    contract.architecture_facts = architecture_facts(spec);
+    contract.load_shape = LoadShape::EagerMaterialization;
+    contract.lifecycle = MemoryLifecycleCapabilities {
+        phases: vec![
+            MemoryPhase::Conditioning,
+            MemoryPhase::Denoise,
+            MemoryPhase::Decode,
+        ],
+        synchronized_phase_release: true,
+        decode_tiling: true,
+        attention_chunking: true,
+        transformer_window_materialization: false,
+    };
+    contract.formula = MemoryFormulaKind::PhaseEnvelope {
+        phases: contract.lifecycle.phases.clone(),
+        variables: vec![
+            MemoryFormulaVariable::PixelCount,
+            MemoryFormulaVariable::BatchCount,
+            MemoryFormulaVariable::OverlayBytes,
+        ],
+    };
+    contract.calibration = Some(MemoryCalibrationIdentity::new(
+        CONTROL_MEMORY_CALIBRATION_FINGERPRINT,
+        LoadShape::EagerMaterialization,
+    ));
+    for capability in &mut contract.strategies {
+        capability.support = match capability.strategy {
+            MemoryStrategy::Resident | MemoryStrategy::StagedResidency => {
+                MemoryStrategySupport::Implemented
+            }
+            MemoryStrategy::BoundedDecode => {
+                capability.parameters = MemoryParameterRanges {
+                    decode_tile_edges: vec![512],
+                    decode_overlaps: vec![128],
+                    ..Default::default()
+                };
+                MemoryStrategySupport::Implemented
+            }
+            MemoryStrategy::BoundedAttention => {
+                capability.parameters = MemoryParameterRanges {
+                    attention_chunk_sizes: vec![128 * 1024 * 1024],
+                    ..Default::default()
+                };
+                MemoryStrategySupport::Implemented
+            }
+            MemoryStrategy::BoundedTransformerResidency => {
+                MemoryStrategySupport::StructurallyNotApplicable {
+                    reason: "the Krea control provider has no transformer-window execution path"
+                        .to_owned(),
+                }
+            }
+        };
+    }
+    contract.additional_prerequisites = [
+        MemoryStrategy::BoundedDecode,
+        MemoryStrategy::BoundedAttention,
+    ]
+    .into_iter()
+    .map(|strategy| {
+        (
+            strategy,
+            MemoryStrategyPrerequisite::Rung {
+                rung: MemoryStrategy::StagedResidency,
+                scope: MemoryPrerequisiteScope::EngagedInSameRequest,
+            },
+        )
+    })
+    .collect();
+    if quant != Some(Quant::Q4) {
+        // SC-16013's direct 1024² calibration found no decode-tail peak on q8, bf16, or
+        // INT8-ConvRot. Attention chunking is independently executable there, so forcing tiled decode
+        // underneath it adds a speed cost with no measured memory saving. Q4 retains the cumulative
+        // composition because its staged 29.6 → 22.4 GiB decode saving is directly measured.
+        contract
+            .default_engagement_exclusions
+            .push(MemoryStrategyEngagementExclusion {
+            selection: MemoryStrategy::BoundedAttention,
+            excluded_rung: MemoryStrategy::BoundedDecode,
+            evidence:
+                "sc-16013-krea-control-direct-1024-v1: non-q4 decode tail is not the measured peak"
+                    .to_owned(),
+        });
+    }
+    contract
+}
+
+fn registered_krea_control_memory_strategy_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    build_krea_control_memory_strategy_contract(spec)
+}
+
+fn weights_free_krea_control_memory_strategy_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    Ok(build_krea_control_memory_strategy_contract_for_tier(
+        spec.quantize,
+        spec,
+    ))
+}
+
+const CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: "krea_2_turbo_control",
+    contract: registered_krea_control_memory_strategy_contract,
+    safety_check: registered_krea_safety_check,
+};
+#[cfg(feature = "cuda")]
+const CONTROL_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: "krea_2_turbo_control",
+        valid_fixtures: registered_krea_valid_fixture,
+        begin_request: registered_krea_begin_request,
+    };
 
 /// Add all Candle Krea generators and trainers to an explicit media registry builder.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_generator(TURBO_REGISTRATION)
         .register_generator(RAW_REGISTRATION)
         .register_generator(EDIT_REGISTRATION)
+        .register_generator(TURBO_EDIT_REGISTRATION)
+        .register_encoder_contract_route(gen_core::EncoderContractRouteRegistration {
+            route_id: "krea_2_turbo_control",
+            provider_id: KREA_2_TURBO_ID,
+        });
+    #[cfg(feature = "cuda")]
+    let registry = register_memory_contract_surfaces(registry)
+        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
+        .register_memory_behavior(RAW_MEMORY_BEHAVIOR)
+        .register_memory_behavior(EDIT_MEMORY_BEHAVIOR)
+        .register_memory_behavior(TURBO_EDIT_MEMORY_BEHAVIOR)
+        .register_memory_behavior(CONTROL_MEMORY_BEHAVIOR);
+    registry
+        .register_checkpoint_adapter(gen_core::CheckpointAdapterRegistration {
+            backend_bindings: &[
+                gen_core::CheckpointBackendBindingRegistration {
+                    backend: gen_core::CheckpointBackend::Candle,
+                    source: gen_core::ImportedModelSource::TransformerFile,
+                    operation: gen_core::ImportedModelOperation::Generate,
+                    provider_id: KREA_2_TURBO_ID,
+                    required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                    inherit_adapters: true,
+                },
+                gen_core::CheckpointBackendBindingRegistration {
+                    backend: gen_core::CheckpointBackend::Candle,
+                    source: gen_core::ImportedModelSource::TransformerFile,
+                    operation: gen_core::ImportedModelOperation::Edit,
+                    provider_id: KREA_2_TURBO_EDIT_ID,
+                    required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                    inherit_adapters: true,
+                },
+                gen_core::CheckpointBackendBindingRegistration {
+                    backend: gen_core::CheckpointBackend::Candle,
+                    source: gen_core::ImportedModelSource::TransformerFile,
+                    operation: gen_core::ImportedModelOperation::MultiPhase,
+                    provider_id: KREA_2_RAW_ID,
+                    required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                    inherit_adapters: true,
+                },
+            ],
+            ..gen_core::KREA_2_CHECKPOINT_ADAPTER
+        })
         .register_trainer(training::TRAINER_REGISTRATION)
         .register_trainer(control_trainer::CONTROL_TRAINER_REGISTRATION)
+}
+
+/// Register only weights-free memory-contract surfaces; safe on every build platform.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_nvfp4_memory_contract_surface_specs,
+            provider_id: KREA_2_TURBO_ID,
+            contract: weights_free_krea_turbo_memory_strategy_contract,
+        })
+        .register_memory_strategy(RAW_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: KREA_2_RAW_ID,
+            contract: |spec| {
+                // A weights-free conformance witness, so it declares the registry-behavior
+                // identity rather than the production (route, tier) cell. Its tier is the one the
+                // witness spec names; there is no artifact to prove one from.
+                weights_free_krea_request_scoped_contract(KREA_2_RAW_ID, spec, spec.quantize)
+            },
+        })
+        .register_memory_contract_surface_resolver(
+            gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: KREA_2_RAW_ID,
+                contract: weights_free_krea_raw_surface_contract,
+            },
+        )
+        .register_memory_strategy(EDIT_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: KREA_2_EDIT_ID,
+            contract: |spec| {
+                // A weights-free conformance witness, so it declares the registry-behavior
+                // identity rather than the production (route, tier) cell. Its tier is the one the
+                // witness spec names; there is no artifact to prove one from.
+                weights_free_krea_request_scoped_contract(KREA_2_EDIT_ID, spec, spec.quantize)
+            },
+        })
+        .register_memory_contract_surface_resolver(
+            gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: KREA_2_EDIT_ID,
+                contract: weights_free_krea_edit_surface_contract,
+            },
+        )
+        .register_memory_strategy(TURBO_EDIT_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: KREA_2_TURBO_EDIT_ID,
+            contract: |spec| {
+                // A weights-free conformance witness, so it declares the registry-behavior
+                // identity rather than the production (route, tier) cell. Its tier is the one the
+                // witness spec names; there is no artifact to prove one from.
+                weights_free_krea_request_scoped_contract(KREA_2_TURBO_EDIT_ID, spec, spec.quantize)
+            },
+        })
+        .register_memory_contract_surface_resolver(
+            gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: KREA_2_TURBO_EDIT_ID,
+                contract: weights_free_krea_turbo_edit_surface_contract,
+            },
+        )
+        // The direct CUDA control runtime composes the registered Krea base with a native control
+        // overlay in SceneWorks; it is a real route, but not a standalone gen-core Generator.
+        .register_composed_memory_strategy(CONTROL_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_nvfp4_memory_contract_surface_specs,
+            provider_id: "krea_2_turbo_control",
+            contract: weights_free_krea_control_memory_strategy_contract,
+        })
 }
 
 /// Build the complete explicit Candle Krea provider catalog.
@@ -989,8 +3658,450 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
     register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
 }
 
+/// sc-22735 (epic sc-22723 E1/E4): the request-scoped calibration identities are the key a captured
+/// SceneWorks memory anchor is filed under, so every cell that can be measured separately must be
+/// nameable separately. Three routes x three artifact tiers = nine production cells, plus a disjoint
+/// weights-free namespace for the declarations that measure nothing.
+#[cfg(test)]
+mod request_scoped_calibration_identity_tests {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    use super::*;
+
+    const ROUTES: [&str; 3] = [KREA_2_RAW_ID, KREA_2_EDIT_ID, KREA_2_TURBO_EDIT_ID];
+    const TIERS: [Option<Quant>; 3] = [None, Some(Quant::Q4), Some(Quant::Q8)];
+
+    fn tier_token(tier: Option<Quant>) -> &'static str {
+        match tier {
+            None => "bf16",
+            Some(Quant::Q4) => "q4",
+            Some(Quant::Q8) => "q8",
+            Some(other) => unreachable!("this lane ships no {other:?} request-scoped tier"),
+        }
+    }
+
+    /// A snapshot whose `transformer/config.json` declares `tier` — the marker
+    /// `loader::read_packed_config` reads and the only place the tier can be proven from.
+    fn snapshot_at_tier(root: &Path, tier: Option<Quant>) -> LoadSpec {
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            ENCODER_CONTRACT,
+            VISION_ENCODER_CONTRACT,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        let config = match tier {
+            None => serde_json::json!({ "hidden_size": 6144 }),
+            Some(Quant::Q4) => {
+                serde_json::json!({ "quantization": { "bits": 4, "group_size": 64 } })
+            }
+            Some(Quant::Q8) => {
+                serde_json::json!({ "quantization": { "bits": 8, "group_size": 64 } })
+            }
+            Some(other) => unreachable!("this lane ships no {other:?} request-scoped tier"),
+        };
+        std::fs::write(
+            root.join("transformer").join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+    }
+
+    fn published(provider_id: &str, spec: &LoadSpec) -> Option<String> {
+        build_krea_request_scoped_memory_strategy_contract(provider_id, spec)
+            .expect("the request-scoped contract builder never fails on a registered route")
+            .calibration
+            .map(|identity| identity.fingerprint)
+    }
+
+    /// The nine production strings, derived from the documented format rather than frozen here, so
+    /// the other tests can assert disjointness against a set that cannot silently shrink.
+    fn production_identities() -> BTreeSet<String> {
+        let set: BTreeSet<String> = ROUTES
+            .into_iter()
+            .flat_map(|route| {
+                TIERS.into_iter().map(move |tier| {
+                    krea_request_scoped_production_calibration_fingerprint(route, tier)
+                        .expect("every shipped (route, tier) cell has a production identity")
+                })
+            })
+            .collect();
+        assert_eq!(set.len(), ROUTES.len() * TIERS.len());
+        set
+    }
+
+    #[test]
+    fn every_request_scoped_cell_publishes_its_own_production_identity_keyed_on_the_artifact() {
+        let mut seen: std::collections::BTreeMap<String, (&str, Option<Quant>)> =
+            Default::default();
+        for route in ROUTES {
+            for tier in TIERS {
+                let tmp = tempfile::tempdir().unwrap();
+                let spec = snapshot_at_tier(tmp.path(), tier);
+                let fingerprint = published(route, &spec).unwrap_or_else(|| {
+                    panic!("{route}/{tier:?} must publish a production identity")
+                });
+                assert_eq!(
+                    fingerprint,
+                    format!(
+                        "{}-{}-cuda-staged-residency-v1",
+                        route.replace('_', "-"),
+                        tier_token(tier)
+                    ),
+                    "{route}/{tier:?}"
+                );
+                gen_core::validate_calibration_fingerprint(&fingerprint).unwrap();
+
+                // THE load-bearing property: the key is the tier on disk, not the request knob. A
+                // `Dir` load accepts `quantize` as a recipe-only no-op and the SceneWorks worker
+                // forwards a default tier regardless of the artifact, so a request-keyed identity
+                // would file three different artifacts under one string.
+                for requested in [Some(Quant::Q4), Some(Quant::Q8)] {
+                    let mut misrequested = spec.clone();
+                    misrequested.quantize = requested;
+                    assert_eq!(
+                        published(route, &misrequested).as_deref(),
+                        Some(fingerprint.as_str()),
+                        "{route}/{tier:?}: a {requested:?} request must not relabel the artifact"
+                    );
+                }
+
+                assert!(
+                    seen.insert(fingerprint.clone(), (route, tier)).is_none(),
+                    "{route}/{tier:?} collides with {:?} on '{fingerprint}'",
+                    seen.get(&fingerprint)
+                );
+            }
+        }
+        assert_eq!(seen.len(), ROUTES.len() * TIERS.len());
+        assert_eq!(
+            seen.keys().cloned().collect::<BTreeSet<_>>(),
+            production_identities()
+        );
+    }
+
+    #[test]
+    fn the_three_request_scoped_routes_never_share_an_identity_at_the_same_tier() {
+        for tier in TIERS {
+            let tmp = tempfile::tempdir().unwrap();
+            let spec = snapshot_at_tier(tmp.path(), tier);
+            let per_route: Vec<String> = ROUTES
+                .into_iter()
+                .map(|route| published(route, &spec).unwrap())
+                .collect();
+            assert_eq!(
+                per_route.iter().collect::<BTreeSet<_>>().len(),
+                ROUTES.len(),
+                "{tier:?}: raw/edit/turbo-edit must be distinguishable: {per_route:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_validated_production_path_carries_the_same_cell_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = snapshot_at_tier(tmp.path(), None);
+        for route in ROUTES {
+            let contract =
+                validated_krea_request_scoped_memory_strategy_contract(route, &spec).unwrap();
+            assert_eq!(
+                contract.calibration.as_ref().unwrap().fingerprint,
+                krea_request_scoped_production_calibration_fingerprint(route, None).unwrap(),
+                "{route}"
+            );
+            assert!(contract.conformance_errors().is_empty(), "{route}");
+        }
+    }
+
+    #[test]
+    fn turbo_and_control_keep_the_bound_measured_identities_they_already_published() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/krea".into()));
+        let turbo = build_krea_turbo_memory_strategy_contract(&spec);
+        // sc-22735 fix pass. The SHARED builder publishes nothing: it serves the weights-free
+        // surface as well as the validated load, and a surface that resolves no snapshot cannot
+        // prove which of the three tiers it is describing.
+        assert!(
+            turbo.calibration.is_none(),
+            "the shared turbo builder must not name a cell it cannot prove"
+        );
+        // The measured cell is q4 and ONLY q4, and it keeps its string byte-identical — the
+        // SceneWorks anchor `krea_2_turbo:candle:q4` is bound by exactly this literal.
+        assert_eq!(
+            krea_turbo_production_calibration_fingerprint(Some(Quant::Q4)).unwrap(),
+            TURBO_MEMORY_CALIBRATION_FINGERPRINT
+        );
+        assert_eq!(
+            TURBO_MEMORY_CALIBRATION_FINGERPRINT, "krea-turbo-cuda-phase-curves-v1",
+            "the SceneWorks anchor plan and the packaged krea_2_turbo candle q4 record name this"
+        );
+        // The two unmeasured tiers name their own cells, so a bf16 or q8 capture can never be read
+        // back as authority for the measured one.
+        let bf16 = krea_turbo_production_calibration_fingerprint(None).unwrap();
+        let q8 = krea_turbo_production_calibration_fingerprint(Some(Quant::Q8)).unwrap();
+        for other in [&bf16, &q8] {
+            assert_ne!(
+                other, TURBO_MEMORY_CALIBRATION_FINGERPRINT,
+                "an unmeasured turbo tier must not republish the measured q4 key"
+            );
+        }
+        assert_ne!(
+            bf16, q8,
+            "the two unmeasured turbo tiers are distinct cells"
+        );
+        // A tier this lane does not ship gets no identity rather than another cell's.
+        assert_eq!(
+            krea_turbo_production_calibration_fingerprint(Some(Quant::Nvfp4)),
+            None
+        );
+        assert_eq!(
+            turbo.load_shape,
+            gen_core::LoadShape::DeferredMaterialization
+        );
+
+        let control = build_krea_control_memory_strategy_contract(&spec).unwrap();
+        assert_eq!(
+            control.calibration.as_ref().unwrap().fingerprint,
+            CONTROL_MEMORY_CALIBRATION_FINGERPRINT
+        );
+        assert_eq!(
+            CONTROL_MEMORY_CALIBRATION_FINGERPRINT,
+            "sc-16013-krea-control-direct-1024-v1"
+        );
+
+        let production = production_identities();
+        for bound in [
+            TURBO_MEMORY_CALIBRATION_FINGERPRINT,
+            CONTROL_MEMORY_CALIBRATION_FINGERPRINT,
+        ] {
+            assert!(
+                !production.contains(bound),
+                "the request-scoped split must not reach into '{bound}'"
+            );
+            assert!(!bound.starts_with(REQUEST_SCOPED_STATIC_BEHAVIOR_FINGERPRINT));
+        }
+    }
+
+    #[test]
+    fn weights_free_declarations_are_disjoint_from_every_production_identity() {
+        type SurfaceSeam = fn(
+            &gen_core::MemoryContractSurfaceSpec,
+        ) -> gen_core::Result<gen_core::MemoryProviderContract>;
+
+        let production = production_identities();
+        let surfaces = gen_core::candle_memory_contract_surface_specs();
+        assert!(!surfaces.is_empty());
+        let mut every_route = BTreeSet::new();
+        for (route, seam) in [
+            (
+                KREA_2_RAW_ID,
+                weights_free_krea_raw_surface_contract as SurfaceSeam,
+            ),
+            (KREA_2_EDIT_ID, weights_free_krea_edit_surface_contract),
+            (
+                KREA_2_TURBO_EDIT_ID,
+                weights_free_krea_turbo_edit_surface_contract,
+            ),
+        ] {
+            let mut per_route = BTreeSet::new();
+            for surface in &surfaces {
+                let contract = seam(surface).unwrap();
+                let fingerprint = contract.calibration.as_ref().unwrap().fingerprint.clone();
+                assert!(
+                    fingerprint.starts_with(REQUEST_SCOPED_STATIC_BEHAVIOR_FINGERPRINT),
+                    "{route}: '{fingerprint}' is outside the registry-behavior namespace"
+                );
+                assert!(
+                    !production.contains(&fingerprint),
+                    "{route}: weights-free surface republished production identity '{fingerprint}'"
+                );
+                assert_eq!(
+                    fingerprint,
+                    format!(
+                        "{REQUEST_SCOPED_STATIC_BEHAVIOR_FINGERPRINT}-{}-{}",
+                        route.replace('_', "-"),
+                        tier_token(
+                            request_scoped_surface_tier(surface.resolved_artifact_tier()).unwrap()
+                        )
+                    )
+                );
+                assert!(contract.conformance_errors().is_empty(), "{route}");
+                // The macro-generated seam and the shared entry point are the same declaration.
+                assert_eq!(
+                    weights_free_krea_request_scoped_surface_contract(route, surface)
+                        .unwrap()
+                        .calibration
+                        .unwrap()
+                        .fingerprint,
+                    fingerprint
+                );
+                per_route.insert(fingerprint);
+            }
+            assert_eq!(
+                per_route.len(),
+                TIERS.len(),
+                "{route}: the three declared surface tiers must be distinguishable: {per_route:?}"
+            );
+            every_route.extend(per_route);
+        }
+        assert_eq!(every_route.len(), ROUTES.len() * TIERS.len());
+
+        // The conformance-fixture seam registered alongside the resolver is weights-free too.
+        let witness = LoadSpec::new(WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        for route in ROUTES {
+            for tier in TIERS {
+                let fingerprint = weights_free_krea_request_scoped_contract(route, &witness, tier)
+                    .unwrap()
+                    .calibration
+                    .unwrap()
+                    .fingerprint;
+                assert!(!production.contains(&fingerprint), "{route}/{tier:?}");
+                assert!(every_route.contains(&fingerprint), "{route}/{tier:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn nvfp4_has_no_request_scoped_identity_on_either_side_of_the_split() {
+        for route in ROUTES {
+            assert!(krea_request_scoped_production_calibration_fingerprint(
+                route,
+                Some(Quant::Nvfp4)
+            )
+            .is_none());
+            assert!(
+                krea_request_scoped_static_behavior_fingerprint(route, Some(Quant::Nvfp4))
+                    .is_none()
+            );
+        }
+        assert!(
+            request_scoped_surface_tier(gen_core::MemoryContractSurfaceTier::Nvfp4).is_none(),
+            "the NVFP4 surface refusal must stay"
+        );
+        for foreign in [KREA_2_TURBO_ID, "krea_2_turbo_control", "krea_2_raw_typo"] {
+            assert!(
+                krea_request_scoped_production_calibration_fingerprint(foreign, None).is_none()
+            );
+            assert!(krea_request_scoped_static_behavior_fingerprint(foreign, None).is_none());
+        }
+    }
+
+    #[test]
+    fn an_unprovable_artifact_tier_withholds_the_identity_without_failing_the_contract() {
+        // An unsupported packed width: the marker is present and readable, and names a tier this
+        // lane has never measured.
+        let unsupported = tempfile::tempdir().unwrap();
+        let spec = snapshot_at_tier(unsupported.path(), Some(Quant::Q4));
+        std::fs::write(
+            unsupported.path().join("transformer").join("config.json"),
+            br#"{"quantization": {"bits": 5, "group_size": 64}}"#,
+        )
+        .unwrap();
+
+        // A malformed marker: present but not JSON.
+        let corrupt = tempfile::tempdir().unwrap();
+        let corrupt_spec = snapshot_at_tier(corrupt.path(), None);
+        std::fs::write(
+            corrupt.path().join("transformer").join("config.json"),
+            b"{ not json",
+        )
+        .unwrap();
+
+        // The INT8-ConvRot single-file DiT: a rotated artifact that is none of the three tiers.
+        let convrot = tempfile::tempdir().unwrap();
+        let mut convrot_spec = snapshot_at_tier(convrot.path(), None);
+        convrot_spec.components.insert(
+            KREA_CONVROT_DIT_COMPONENT.to_owned(),
+            WeightsSource::File(convrot.path().join("krea2_int8_convrot.safetensors")),
+        );
+
+        // An imported single file with no base snapshot: nothing to read the marker from.
+        let imported = tempfile::tempdir().unwrap();
+        let native = imported.path().join("imported.safetensors");
+        std::fs::write(&native, b"pinned source fixture").unwrap();
+        let imported_spec = LoadSpec::new(WeightsSource::File(native));
+
+        for (label, spec) in [
+            ("unsupported packed width", &spec),
+            ("corrupt packed marker", &corrupt_spec),
+            ("convrot single-file DiT", &convrot_spec),
+            ("imported file without a base snapshot", &imported_spec),
+        ] {
+            for route in ROUTES {
+                let contract =
+                    build_krea_request_scoped_memory_strategy_contract(route, spec).unwrap();
+                assert!(
+                    contract.calibration.is_none(),
+                    "{route}: {label} must withhold the identity, not fabricate one"
+                );
+                assert!(contract.conformance_errors().is_empty(), "{route}: {label}");
+                assert_eq!(
+                    contract
+                        .capability(gen_core::MemoryStrategy::StagedResidency)
+                        .unwrap()
+                        .support,
+                    gen_core::MemoryStrategySupport::Implemented,
+                    "{route}: {label}: the structural declaration still stands"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod explicit_registry_tests {
+    fn imported_file_spec() -> (tempfile::TempDir, candle_gen::gen_core::LoadSpec) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dit = tmp.path().join("imported.safetensors");
+        std::fs::write(&dit, b"pinned source fixture").unwrap();
+        let base = tmp.path().join("base");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &base.join("text_encoder"),
+            super::ENCODER_CONTRACT,
+        )
+        .unwrap();
+        let spec =
+            candle_gen::gen_core::LoadSpec::new(candle_gen::gen_core::WeightsSource::File(dit))
+                .with_component(
+                    candle_gen::gen_core::BASE_SNAPSHOT_COMPONENT,
+                    candle_gen::gen_core::WeightsSource::Dir(base),
+                );
+        (tmp, spec)
+    }
+
+    #[test]
+    fn every_registered_file_route_rejects_identity_and_accepts_a_valid_selected_encoder() {
+        let registry = super::provider_registry().unwrap();
+        let (tmp, base_spec) = imported_file_spec();
+        for id in [
+            "krea_2_turbo",
+            "krea_2_raw",
+            "krea_2_edit",
+            "krea_2_turbo_edit",
+        ] {
+            let mut identity = base_spec.clone();
+            identity.identity = Some(candle_gen::gen_core::IdentityWeights::default());
+            let error = registry
+                .load(id, &identity)
+                .err()
+                .expect("identity field must be rejected")
+                .to_string();
+            assert!(error.contains("identity"), "{id}: {error}");
+
+            let external = tmp.path().join(format!("{id}-external-te"));
+            gen_core_testkit::write_encoder_contract_fixture(&external, super::ENCODER_CONTRACT)
+                .unwrap();
+            let mut text_encoder = base_spec.clone();
+            text_encoder.text_encoder = Some(candle_gen::gen_core::WeightsSource::Dir(external));
+            registry
+                .load(id, &text_encoder)
+                .unwrap_or_else(|error| panic!("{id}: valid selected encoder rejected: {error}"));
+        }
+    }
+
     #[test]
     fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
@@ -1005,19 +4116,1856 @@ mod explicit_registry_tests {
 
         assert_eq!(
             explicit_generators,
-            ["krea_2_turbo", "krea_2_raw", "krea_2_edit"]
+            [
+                "krea_2_turbo",
+                "krea_2_raw",
+                "krea_2_edit",
+                "krea_2_turbo_edit"
+            ]
         );
         assert_eq!(explicit_trainers, ["krea_2_raw", "krea_2_control"]);
+        assert_eq!(
+            registry.provider_encoder_contract(super::KREA_2_TURBO_ID),
+            Some(super::ENCODER_CONTRACT)
+        );
+        assert_eq!(
+            registry.provider_encoder_contract("krea_2_turbo_control"),
+            Some(super::ENCODER_CONTRACT)
+        );
+        assert_eq!(
+            registry.provider_encoder_contract("krea_2_control_typo"),
+            None
+        );
+
+        let spec = candle_gen::gen_core::LoadSpec::new(candle_gen::gen_core::WeightsSource::Dir(
+            "/nonexistent".into(),
+        ));
+        #[cfg(feature = "cuda")]
+        {
+            let production_tmp = tempfile::tempdir().unwrap();
+            gen_core_testkit::write_multimodal_encoder_contract_fixture(
+                &production_tmp.path().join("text_encoder"),
+                super::ENCODER_CONTRACT,
+                super::VISION_ENCODER_CONTRACT,
+            )
+            .unwrap();
+            let production_spec = candle_gen::gen_core::LoadSpec::new(
+                candle_gen::gen_core::WeightsSource::Dir(production_tmp.path().to_path_buf()),
+            );
+            let contract = registry
+                .memory_strategy_contract(super::KREA_2_TURBO_ID, &production_spec)
+                .unwrap()
+                .expect("Krea Turbo must register its CUDA memory-strategy contract");
+            assert_eq!(
+                contract.calibration.as_ref().unwrap().fingerprint,
+                "krea-turbo-cuda-phase-curves-v1"
+            );
+            assert_eq!(contract.strategies.len(), 5);
+            assert!(contract.strategies.iter().all(|capability| matches!(
+                capability.support,
+                candle_gen::gen_core::MemoryStrategySupport::Implemented
+            )));
+            gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
+
+            let control_contract = registry
+                .memory_strategy_contract("krea_2_turbo_control", &spec)
+                .unwrap()
+                .expect("Krea control must register its CUDA memory-strategy contract");
+            assert_eq!(
+                control_contract.calibration.as_ref().unwrap().fingerprint,
+                "sc-16013-krea-control-direct-1024-v1"
+            );
+            assert!(matches!(
+                control_contract
+                    .capability(candle_gen::gen_core::MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap()
+                    .support,
+                candle_gen::gen_core::MemoryStrategySupport::StructurallyNotApplicable { .. }
+            ));
+            gen_core_testkit::check_memory_strategy_contract(&control_contract).unwrap();
+
+            for provider_id in [
+                super::KREA_2_RAW_ID,
+                super::KREA_2_EDIT_ID,
+                super::KREA_2_TURBO_EDIT_ID,
+            ] {
+                let contract = registry
+                    .memory_strategy_contract(provider_id, &production_spec)
+                    .unwrap()
+                    .unwrap_or_else(|| {
+                        panic!("{provider_id} must register its CUDA memory-strategy contract")
+                    });
+                // A production load: the dense fixture snapshot proves the bf16 cell, and the
+                // identity names that route and that tier alone.
+                assert_eq!(
+                    contract.calibration.as_ref().unwrap().fingerprint,
+                    super::krea_request_scoped_production_calibration_fingerprint(
+                        provider_id,
+                        None
+                    )
+                    .unwrap(),
+                    "{provider_id}"
+                );
+                for strategy in candle_gen::gen_core::MemoryStrategy::ALL {
+                    let expected = matches!(
+                        strategy,
+                        candle_gen::gen_core::MemoryStrategy::Resident
+                            | candle_gen::gen_core::MemoryStrategy::StagedResidency
+                    );
+                    assert_eq!(
+                        contract.capability(strategy).unwrap().support
+                            == candle_gen::gen_core::MemoryStrategySupport::Implemented,
+                        expected,
+                        "{provider_id}: {strategy:?}"
+                    );
+                }
+                gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            for provider_id in [
+                super::KREA_2_TURBO_ID,
+                super::KREA_2_RAW_ID,
+                super::KREA_2_EDIT_ID,
+                super::KREA_2_TURBO_EDIT_ID,
+            ] {
+                assert!(
+                    registry
+                        .memory_strategy_contract(provider_id, &spec)
+                        .unwrap()
+                        .is_none(),
+                    "{provider_id} must not register a CUDA contract without the CUDA feature"
+                );
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    fn write_valid_text_encoder(root: &Path) {
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            ENCODER_CONTRACT,
+            VISION_ENCODER_CONTRACT,
+        )
+        .unwrap();
+    }
+
+    fn valid_directory_spec(root: &Path) -> LoadSpec {
+        write_valid_text_encoder(root);
+        LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+    }
+
+    fn valid_imported_spec(root: &Path, name: &str) -> LoadSpec {
+        write_valid_text_encoder(root);
+        let native = root.join(name);
+        std::fs::write(&native, b"pinned source fixture").unwrap();
+        LoadSpec::new(WeightsSource::File(native)).with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(root.to_path_buf()),
+        )
+    }
+
+    /// The published Krea-2 Turbo `transformer/config.json` axes the loader actually reads through
+    /// [`config::Krea2Config::from_snapshot`], plus the `model_index.json` that carries
+    /// `patch_size`. `num_layers` is a parameter so a drifting snapshot can be exercised.
+    fn write_reference_dit_config(root: &Path, num_layers: usize) {
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        std::fs::write(
+            root.join("transformer").join("config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "num_attention_heads": 48,
+                "attention_head_dim": 128,
+                "num_key_value_heads": 12,
+                "num_layers": num_layers,
+                "in_channels": 64,
+                "intermediate_size": 16384,
+                "axes_dims_rope": [32, 48, 48],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join("model_index.json"), br#"{"patch_size": 2}"#).unwrap();
+    }
+
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let fixture = tempfile::tempdir().unwrap();
+        write_reference_dit_config(fixture.path(), 28);
+        let spec = LoadSpec::new(WeightsSource::Dir(fixture.path().to_path_buf()));
+
+        let expected = gen_core::MemoryArchitectureFacts {
+            attention_heads: Some(48),
+            head_dim: Some(128),
+            transformer_blocks: Some(28),
+            patch_size: Some(2),
+            latent_channels: Some(16),
+            vae_spatial_scale: Some(8),
+            // Structurally absent: the reused Qwen-Image `AutoencoderKLQwenImage` decodes exactly
+            // one frame per image here, so Krea has no frames-per-latent axis to declare.
+            vae_temporal_scale: None,
+            activation_dtype_width: Some(2),
+        };
+
+        let turbo = build_krea_turbo_memory_strategy_contract(&spec);
+        assert_eq!(turbo.architecture_facts, expected);
+        gen_core_testkit::assert_memory_contract_facts_conform(&turbo);
+
+        let raw = build_krea_request_scoped_memory_strategy_contract(KREA_2_RAW_ID, &spec).unwrap();
+        assert_eq!(raw.architecture_facts, expected);
+        gen_core_testkit::assert_memory_contract_facts_conform(&raw);
+
+        let control = build_krea_control_memory_strategy_contract_for_tier(None, &spec);
+        assert_eq!(control.architecture_facts, expected);
+        gen_core_testkit::assert_memory_contract_facts_conform(&control);
+
+        // The axes are READ, not asserted: a snapshot declaring a different trunk publishes it.
+        let drifted = tempfile::tempdir().unwrap();
+        write_reference_dit_config(drifted.path(), 24);
+        let drifted_spec = LoadSpec::new(WeightsSource::Dir(drifted.path().to_path_buf()));
+        assert_eq!(
+            build_krea_turbo_memory_strategy_contract(&drifted_spec)
+                .architecture_facts
+                .transformer_blocks,
+            Some(24)
+        );
+
+        // The registry's weights-free surface names a sentinel that is not on disk: nothing about
+        // the pipeline is resolved there, so every axis stays undeclared.
+        let weights_free = LoadSpec::new(WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        assert!(build_krea_turbo_memory_strategy_contract(&weights_free)
+            .architecture_facts
+            .is_empty());
+        assert!(
+            build_krea_request_scoped_memory_strategy_contract(KREA_2_RAW_ID, &weights_free)
+                .unwrap()
+                .architecture_facts
+                .is_empty()
+        );
+        assert!(
+            weights_free_krea_control_memory_strategy_contract(&weights_free)
+                .unwrap()
+                .architecture_facts
+                .is_empty()
+        );
+    }
+
+    /// Header-only safetensors, for fixtures whose subject is tensor geometry rather than values.
+    fn write_tensors(path: &Path, tensors: &[(&str, &str, &[usize])]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut header = serde_json::Map::new();
+        let mut offset = 0_u64;
+        for &(name, dtype, shape) in tensors {
+            let width = match dtype {
+                "U8" | "F8_E4M3" => 1_u64,
+                "BF16" | "F16" => 2,
+                "F32" | "U32" => 4,
+                other => panic!("unhandled fixture dtype {other}"),
+            };
+            let bytes = shape.iter().product::<usize>() as u64 * width;
+            header.insert(
+                name.to_owned(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [offset, offset + bytes],
+                }),
+            );
+            offset += bytes;
+        }
+        let mut json = serde_json::to_vec(&header).unwrap();
+        while !json.len().is_multiple_of(8) {
+            json.push(b' ');
+        }
+        let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(json);
+        bytes.extend(vec![0_u8; offset as usize]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Feature-end review (SC-22667, E2). `load_from_native_dit_file` routes a single-file DiT
+    /// import through a **resident turnkey snapshot** precisely because the single file omits the
+    /// DiT architecture config — so the axes on that route are read from disk exactly as they are on
+    /// a snapshot load, from the `BASE_SNAPSHOT_COMPONENT` directory.
+    ///
+    /// Mutation that fails this: narrowing `materialized_snapshot_root` back to
+    /// `architecture_facts::snapshot_root(spec)`, which sees a `WeightsSource::File` and publishes
+    /// `MemoryArchitectureFacts::default()` — every axis `None` on a fully materialized load.
+    #[test]
+    fn a_single_file_import_publishes_the_base_snapshots_architecture_axes() {
+        let fixture = tempfile::tempdir().unwrap();
+        write_reference_dit_config(fixture.path(), 28);
+        let imported = valid_imported_spec(fixture.path(), "kreamania_variant5.safetensors");
+
+        let facts = build_krea_turbo_memory_strategy_contract(&imported).architecture_facts;
+        assert!(
+            facts.has_declared_architecture_axis(),
+            "the base snapshot supplies the geometry this route loads"
+        );
+        assert_eq!(facts.attention_heads, Some(48));
+        assert_eq!(facts.head_dim, Some(128));
+        assert_eq!(facts.transformer_blocks, Some(28));
+        assert_eq!(facts.patch_size, Some(2));
+        // The decoder axes are the reused Qwen-Image constants either way.
+        assert_eq!(facts.latent_channels, Some(16));
+        assert_eq!(facts.vae_spatial_scale, Some(8));
+
+        // A single-file spec with NO base snapshot resolves nothing and declares nothing.
+        let bare = LoadSpec::new(WeightsSource::File(
+            fixture.path().join("kreamania_variant5.safetensors"),
+        ));
+        assert!(build_krea_turbo_memory_strategy_contract(&bare)
+            .architecture_facts
+            .is_empty());
+    }
+
+    /// Feature-end review (SC-22667, E1). Every loaded Krea contract used to publish
+    /// `MemoryAssetFacts::default()` — all zeros — including the request-scoped routes whose formula
+    /// declares `MemoryFormulaVariable::AssetBytes`. A validated load now publishes the per-component
+    /// decomposition at the widths the loader opens each component in.
+    ///
+    /// Mutation that fails this: dropping the `contract.asset_facts = loaded_asset_facts(…)` stamp
+    /// from `validated_krea_turbo_memory_strategy_contract`, which restores the all-zero facts.
+    #[test]
+    fn a_validated_load_publishes_its_per_component_decomposition() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let spec = valid_directory_spec(root);
+        write_reference_dit_config(root, 28);
+        write_tensors(
+            &root.join("transformer/model.safetensors"),
+            &[("img_in.weight", "BF16", &[64, 64])],
+        );
+        // The reused Qwen-Image autoencoder ships bf16 and is opened f32.
+        write_tensors(
+            &root.join("vae/model.safetensors"),
+            &[("decoder.conv_out.weight", "BF16", &[8, 8])],
+        );
+
+        let contract = validated_krea_turbo_memory_strategy_contract(&spec).unwrap();
+        let facts = contract.asset_facts;
+        assert_eq!(facts.transformer_bytes, 4_096 * 2, "the DiT is opened bf16");
+        assert_eq!(
+            facts.decoder_bytes,
+            64 * 4,
+            "the autoencoder is opened f32; its shards weigh half this"
+        );
+        assert!(
+            facts.conditioning_bytes > 0,
+            "the validated encoder source is priced"
+        );
+        assert_eq!(
+            facts.base_bytes,
+            facts.conditioning_bytes + facts.transformer_bytes + facts.decoder_bytes
+        );
+        gen_core_testkit::check_memory_contract_asset_facts(&contract)
+            .unwrap_or_else(|errors| panic!("{errors:?}"));
+
+        // The request-scoped routes carry the same decomposition, and their formula declares
+        // `AssetBytes` — the variable that was never supplied before.
+        let raw =
+            validated_krea_request_scoped_memory_strategy_contract(KREA_2_RAW_ID, &spec).unwrap();
+        assert_eq!(raw.asset_facts, facts);
+        assert!(raw
+            .formula
+            .uses(gen_core::MemoryFormulaVariable::AssetBytes));
+        gen_core_testkit::check_memory_contract_asset_facts(&raw)
+            .unwrap_or_else(|errors| panic!("{errors:?}"));
+
+        // The weights-free surface resolves no snapshot and still declares nothing.
+        let weights_free = LoadSpec::new(WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        assert_eq!(
+            weights_free_krea_turbo_memory_strategy_contract(&weights_free)
+                .unwrap()
+                .asset_facts,
+            gen_core::MemoryAssetFacts::default()
+        );
+    }
+
+    /// The `vae/` shard every fixture below ships: the decode path (`post_quant_conv` + `decoder.*`,
+    /// 80 values) and the encoder half (`encoder.*` + `quant_conv`, 80 values), all bf16 on disk.
+    fn write_full_vae(root: &Path) {
+        write_tensors(
+            &root.join("vae/model.safetensors"),
+            &[
+                ("decoder.conv_out.weight", "BF16", &[8, 8]),
+                ("post_quant_conv.weight", "BF16", &[4, 4]),
+                ("encoder.conv_in.weight", "BF16", &[8, 8]),
+                ("quant_conv.weight", "BF16", &[4, 4]),
+            ],
+        );
+    }
+
+    /// Re-stamp the testkit fixture's `language_model.*` tensors from F16 to **BF16** — the dtype the
+    /// shipping Krea snapshot stores its TE in, and the one `TE_STORE_PROBE` halves the store for.
+    /// Without this every language tensor reads F16, `te_store_width` answers the f32 fail-safe (4),
+    /// and a vision tower priced at `te_width` is indistinguishable from one priced at `VISION_WIDTH`.
+    ///
+    /// Only the header changes (F16 and BF16 are both 2 bytes per element): the header is rewritten
+    /// at the front of the file, the sparse zero payload shifts by the header's growth, and the file
+    /// is extended by the same amount so every `data_offsets` range still lands inside it.
+    fn restamp_language_store_bf16(root: &Path) {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let path = root.join("text_encoder").join("model.safetensors");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut len = [0_u8; 8];
+        file.read_exact(&mut len).unwrap();
+        let old_len = u64::from_le_bytes(len) as usize;
+        let mut encoded = vec![0_u8; old_len];
+        file.read_exact(&mut encoded).unwrap();
+        let mut header: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&encoded).unwrap();
+        for (name, entry) in header.iter_mut() {
+            if name.starts_with("language_model.")
+                && entry.get("dtype").and_then(|dtype| dtype.as_str()) == Some("F16")
+            {
+                entry["dtype"] = serde_json::json!("BF16");
+            }
+        }
+        let encoded = serde_json::to_vec(&header).unwrap();
+        assert!(
+            encoded.len() >= old_len,
+            "the re-stamp only grows the header"
+        );
+        let total = file.metadata().unwrap().len();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&(encoded.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&encoded).unwrap();
+        file.set_len(total + (encoded.len() - old_len) as u64)
+            .unwrap();
+    }
+
+    /// Feature-end review (SC-22667). Two width corrections on the generation routes:
+    ///
+    /// * the Qwen-Image autoencoder is priced **by name**, with the `encoder.*` / `quant_conv`
+    ///   subtree separated from the `post_quant_conv` / `decoder.*` decode path, and charged on the
+    ///   routes whose heavy loaders materialize it (`vae_encoder_materialized` — every route, see
+    ///   its doc for the four loader sites);
+    /// * the Edit-only Qwen3-VL vision tower is priced at `vision::VISION_DTYPE` (f32), not at the
+    ///   TE's probed store width: the Edit delta over Turbo is exactly 4 bytes per stored element.
+    ///
+    /// Mutations that fail this: charging the vision headers at `te_width` (the Edit delta halves
+    /// to 2 bytes per element); a `VISION_WIDTH` that drifts from `VISION_DTYPE`; and a
+    /// `vae_tensor_is_encoder_only` that matches `post_quant_conv` (the decode-only figure drops
+    /// to 64 values).
+    #[test]
+    fn the_vision_tower_is_priced_f32_and_the_autoencoder_by_name() {
+        assert_eq!(
+            VISION_WIDTH,
+            crate::vision::VISION_DTYPE.size_in_bytes() as u64,
+            "VISION_WIDTH must be the vision loader's own dtype"
+        );
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let spec = valid_directory_spec(root);
+        write_reference_dit_config(root, 28);
+        write_tensors(
+            &root.join("transformer/model.safetensors"),
+            &[("img_in.weight", "BF16", &[64, 64])],
+        );
+        write_full_vae(root);
+        restamp_language_store_bf16(root);
+
+        // The name split: the encoder half is exactly the tensors `QwenVaeEncoder::new` reads.
+        assert!(vae_tensor_is_encoder_only("encoder.conv_in.weight"));
+        assert!(vae_tensor_is_encoder_only("quant_conv.weight"));
+        assert!(!vae_tensor_is_encoder_only("post_quant_conv.weight"));
+        assert!(!vae_tensor_is_encoder_only("decoder.conv_out.weight"));
+        let vae_headers = gen_core::safetensors_path_tensor_headers(root.join("vae")).unwrap();
+        let decode_only = vae_headers
+            .iter()
+            .filter(|header| !vae_tensor_is_encoder_only(&header.name))
+            .map(|header| header.element_count().unwrap())
+            .sum::<u64>();
+        assert_eq!(decode_only, 64 + 16);
+
+        let turbo = validated_krea_turbo_memory_strategy_contract(&spec).unwrap();
+        assert_eq!(
+            turbo.asset_facts.decoder_bytes,
+            (64 + 16 + 64 + 16) * VAE_WIDTH,
+            "the whole autoencoder, opened f32, on a route whose staged heavy twin builds the encoder"
+        );
+
+        // The Edit route adds the vision tower and nothing else to conditioning, at 4 B/element.
+        let edit =
+            validated_krea_request_scoped_memory_strategy_contract(KREA_2_EDIT_ID, &spec).unwrap();
+        let encoder_source = ENCODER_CONTRACT.source_for_load(&spec, root).unwrap();
+        // The premise that makes the delta assertion discriminating: this snapshot's TE store is
+        // bf16, so the TE width is 2 and only a tower priced at its own f32 dtype reaches 4.
+        let language = encoder_source
+            .materialized_language_tensor_headers(&ENCODER_CONTRACT)
+            .unwrap();
+        assert_eq!(
+            te_store_width(&language),
+            2,
+            "the fixture's TE store is bf16"
+        );
+        let vision = encoder_source
+            .materialized_vision_tensor_headers(&VISION_ENCODER_CONTRACT, &ENCODER_CONTRACT)
+            .unwrap();
+        let vision_elements = vision
+            .iter()
+            .map(|header| header.element_count().unwrap())
+            .sum::<u64>();
+        let vision_stored = vision.iter().map(|header| header.data_bytes).sum::<u64>();
+        assert!(
+            vision_elements > 0,
+            "the multimodal fixture ships a vision tower"
+        );
+        assert_eq!(
+            vision_stored,
+            vision_elements * 2,
+            "the fixture stores the tower at a 2-byte width"
+        );
+        assert_eq!(
+            edit.asset_facts.conditioning_bytes - turbo.asset_facts.conditioning_bytes,
+            vision_elements * 4,
+            "the Edit delta is 4 bytes per stored element: VISION_DTYPE is f32"
+        );
+        assert_eq!(
+            edit.asset_facts.decoder_bytes,
+            turbo.asset_facts.decoder_bytes
+        );
+        assert_eq!(
+            edit.asset_facts.transformer_bytes,
+            turbo.asset_facts.transformer_bytes
+        );
+        gen_core_testkit::check_memory_contract_asset_facts(&edit)
+            .unwrap_or_else(|errors| panic!("{errors:?}"));
+    }
+
+    /// Feature-end review (SC-22667). A planned single-file native import is priced from the
+    /// **compiled plan** under the loader's own residency, not from stored headers through the
+    /// `coerce_float` rule:
+    ///
+    /// * an `F8_E4M3` row takes the exact dense decode on every host (the fp8 leg is masked for this
+    ///   import) and lands as `DIT_DTYPE` — 2 bytes per element, where the stored header says 1;
+    /// * an NVFP4 row on a host below the `sm_120` floor decodes dense bf16 over its **logical**
+    ///   shape, and on an eligible host stays packed only where Krea's role table serves it W4A4 —
+    ///   the Kitchen fixture's block 0 is an edge block, so `Nvfp4Quant::Mixed` demotes it to dense
+    ///   bf16 even under a packed residency.
+    ///
+    /// Mutations that fail this: pricing the native leg with `dit_resident_bytes` (fp8 reads 256,
+    /// the NVFP4 nibbles read their stored 2_048 + scale planes); and pricing a Packed row at
+    /// `residency.resident_bytes` without consulting the role table (the packed-residency figure
+    /// drops below the dense one).
+    #[test]
+    fn a_planned_native_import_prices_fp8_and_nvfp4_rows_from_the_plan() {
+        use candle_gen::logical_weights::CandleCodecResidency;
+        use gen_core::checkpoint_codec::ResidencyMode;
+
+        let fixture = tempfile::tempdir().unwrap();
+
+        // ---- fp8: 256 stored bytes, 512 resident ------------------------------------------
+        let fp8 = fixture.path().join("kreamania_fp8.safetensors");
+        write_tensors(
+            &fp8,
+            &[(
+                "model.diffusion_model.blocks.0.attn.wq.weight",
+                "F8_E4M3",
+                &[16, 16],
+            )],
+        );
+        assert_eq!(
+            dit_resident_bytes(&fp8).unwrap(),
+            256,
+            "the stored-width rule (the figure under review)"
+        );
+        assert_eq!(
+            native_dit_resident_bytes(&fp8, None, &CandleCodecResidency::DENSE).unwrap(),
+            256 * DIT_WIDTH,
+            "the plan's dense decode of an fp8 row lands bf16"
+        );
+        let masked = CandleCodecResidency {
+            fp8_e4m3_native: true,
+            nvfp4_native: false,
+        }
+        .with_dense_fp8();
+        assert_eq!(
+            native_dit_resident_bytes(&fp8, None, &masked).unwrap(),
+            256 * DIT_WIDTH,
+            "the fp8 leg is masked for this import on every host"
+        );
+
+        // ---- NVFP4: dense fallback below the floor, role-table demotion above it ------------
+        let nvfp4 = fixture.path().join("kreamania_variant7.safetensors");
+        crate::testfix::write_kitchen_nvfp4_native_file(&nvfp4);
+        let cfg = crate::testfix::kitchen_nvfp4_config();
+        // `attn.wq` is `[q_dim = 64, hidden = 64]` logical; `first` is `[64, 16]` f32 on disk.
+        let dense_expected = (64 * 64 + 64 * 16) * DIT_WIDTH;
+        assert_eq!(
+            native_dit_resident_bytes(&nvfp4, Some(&cfg), &CandleCodecResidency::DENSE).unwrap(),
+            dense_expected
+        );
+        let stored = dit_resident_bytes(&nvfp4).unwrap();
+        assert!(
+            stored < dense_expected,
+            "the stored-width rule under-declares the dense fallback ({stored} < {dense_expected})"
+        );
+        let packed = CandleCodecResidency {
+            fp8_e4m3_native: false,
+            nvfp4_native: true,
+        };
+        let prefix = crate::native_mapping::KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX;
+        let mapping = crate::native_mapping::KreaNativeToDiffusersMapping::for_config(prefix, &cfg);
+        let plan =
+            candle_gen::logical_weights::plan_logical_weights(&nvfp4, &mapping, &packed).unwrap();
+        assert!(
+            plan.tensors
+                .iter()
+                .any(|tensor| tensor.residency.mode == ResidencyMode::Packed),
+            "the premise: under the packed residency the plan prices the NVFP4 row Packed"
+        );
+        assert!(
+            plan.resident_bytes() < dense_expected,
+            "the plan's packed pricing is below the dense figure"
+        );
+        assert_eq!(
+            native_dit_resident_bytes(&nvfp4, Some(&cfg), &packed).unwrap(),
+            dense_expected,
+            "block 0 is an edge block: `Nvfp4Quant::Mixed` serves it W4A16, dense bf16, so the \
+             contract prices what the role table builds rather than what the plan priced"
+        );
+    }
+
+    /// Feature-end review (SC-22667). `krea_2_turbo_control` is a registered memory provider whose
+    /// contract was built from `compatibility_default` with no `asset_facts` stamp — the one Krea
+    /// route still publishing all-zero component bytes on a materialized load. It now prices what
+    /// `control_provider.rs` materializes: the text encoder opened **f32** (`load_control_text`),
+    /// the snapshot (or ConvRot) DiT, and the autoencoder encoder-and-decoder (`load_control_heavy`).
+    ///
+    /// Mutation that fails this: dropping the `contract.asset_facts = control_asset_facts(spec)?`
+    /// stamp from `build_krea_control_memory_strategy_contract` (all four fields read 0), or pricing
+    /// the control TE at the probed store width (conditioning halves on a bf16 fixture).
+    #[test]
+    fn the_control_route_publishes_its_materialized_decomposition() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let spec = valid_directory_spec(root);
+        write_reference_dit_config(root, 28);
+        write_tensors(
+            &root.join("transformer/model.safetensors"),
+            &[("img_in.weight", "BF16", &[64, 64])],
+        );
+        write_full_vae(root);
+        restamp_language_store_bf16(root);
+
+        let control = build_krea_control_memory_strategy_contract(&spec).unwrap();
+        let facts = control.asset_facts;
+        let language = ENCODER_CONTRACT
+            .source_for_load(&spec, root)
+            .unwrap()
+            .materialized_language_tensor_headers(&ENCODER_CONTRACT)
+            .unwrap();
+        let language_elements = language
+            .iter()
+            .map(|header| header.element_count().unwrap())
+            .sum::<u64>();
+        assert!(language_elements > 0);
+        // The generation pipeline probes this bf16 store and opens it at 2 B; the control route's
+        // `load_control_text` opens `DType::F32` regardless.
+        assert_eq!(
+            te_store_width(&language),
+            2,
+            "the fixture's TE store is bf16"
+        );
+        assert_eq!(
+            validated_krea_turbo_memory_strategy_contract(&spec)
+                .unwrap()
+                .asset_facts
+                .conditioning_bytes,
+            language_elements * 2
+        );
+        assert_eq!(
+            facts.conditioning_bytes,
+            language_elements * CONTROL_TE_WIDTH,
+            "the control text encoder opens f32"
+        );
+        assert_eq!(facts.transformer_bytes, 64 * 64 * DIT_WIDTH);
+        assert_eq!(
+            facts.decoder_bytes,
+            (64 + 16 + 64 + 16) * VAE_WIDTH,
+            "`load_control_heavy` builds the decoder and the encoder"
+        );
+        assert_eq!(
+            facts.base_bytes,
+            facts.conditioning_bytes + facts.transformer_bytes + facts.decoder_bytes
+        );
+        gen_core_testkit::check_memory_contract_asset_facts(&control)
+            .unwrap_or_else(|errors| panic!("{errors:?}"));
+
+        // The weights-free surface still declares nothing.
+        let weights_free = LoadSpec::new(WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        assert_eq!(
+            weights_free_krea_control_memory_strategy_contract(&weights_free)
+                .unwrap()
+                .asset_facts,
+            gen_core::MemoryAssetFacts::default()
+        );
+        assert_eq!(
+            build_krea_control_memory_strategy_contract(&weights_free)
+                .unwrap()
+                .asset_facts,
+            gen_core::MemoryAssetFacts::default(),
+            "a snapshot that is not on disk contributes no signal"
+        );
+    }
+
+    #[test]
+    fn native_nvfp4_dit_does_not_quantize_the_dense_companion_text_encoder() {
+        let fixture = tempfile::tempdir().unwrap();
+
+        let nvfp4 =
+            valid_imported_spec(fixture.path(), "krea-nvfp4.safetensors").with_quant(Quant::Nvfp4);
+        assert_eq!(
+            actual_quant_tier(&nvfp4, KREA_2_TURBO_ID).unwrap(),
+            Some(Quant::Nvfp4),
+            "the provider memory contract must retain the packed DiT tier"
+        );
+        assert_eq!(
+            text_encoder_quant_tier(&nvfp4, KREA_2_TURBO_ID).unwrap(),
+            None,
+            "NVFP4 is already packed in the DiT and has no text-encoder GGUF fold"
+        );
+
+        for quant in [Quant::Q4, Quant::Q8] {
+            let dense_import =
+                valid_imported_spec(fixture.path(), "krea-dense.safetensors").with_quant(quant);
+            assert_eq!(
+                text_encoder_quant_tier(&dense_import, KREA_2_TURBO_ID).unwrap(),
+                Some(quant),
+                "dense imported checkpoints still quantize their dense companion text encoder"
+            );
+        }
+    }
+
+    /// **sc-21484 follow-up: the facts reach the surface a worker actually holds.**
+    ///
+    /// The merged handoff exposed `checkpoint_weight_facts()` only on `loader::Weights` and the
+    /// shared `LogicalWeightReader` — types SceneWorks never touches. It hands the runtime registry
+    /// a [`LoadSpec`] and gets back a `Box<dyn Generator>`, so the contract asserted here is
+    /// [`gen_core::Generator::checkpoint_weight_facts`] on that handle.
+    ///
+    /// Both halves of the AC, on CPU:
+    ///
+    /// * a **native-NVFP4 single-file import** — the Kitchen fixture — reports `Some`, with the
+    ///   source stored `nvfp4-v1` and this dense-only host's execution split as `dense-fallback`;
+    /// * a **directory-sourced** load, built through the real `load()` entrypoint, reports `None`
+    ///   because it compiles no plan at all.
+    ///
+    /// # Mutation
+    ///
+    /// Drop the propagation — return `None` from `KreaGenerator::checkpoint_weight_facts`, or make
+    /// `CheckpointFactsSink::publish` a no-op, or drop `checkpoint_facts` from the `KreaGenerator`
+    /// built by `build()` so the generator holds a sink nothing publishes into: the `expect` below
+    /// goes red. `pipeline`'s
+    /// `the_native_file_load_publishes_its_checkpoint_facts_into_the_generators_sink` is the other
+    /// half — it proves the production load path is what calls `publish`.
+    #[test]
+    fn a_loaded_generator_exposes_the_checkpoint_facts_of_a_native_nvfp4_import() {
+        use candle_gen::candle_core::DType;
+        use candle_gen::gen_core::checkpoint_codec::NVFP4_CODEC;
+        use candle_gen::gen_core::checkpoint_facts::ExecutionRepresentation;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // ---- the directory route: no compiled plan, so no facts ------------------------------
+        let dir_root = tmp.path().join("snapshot");
+        std::fs::create_dir_all(&dir_root).unwrap();
+        let directory = load(&valid_directory_spec(&dir_root)).expect("a directory spec loads");
+        assert!(
+            directory.checkpoint_weight_facts().is_none(),
+            "a directory-sourced load has no plan and must report None rather than fabricating one"
+        );
+
+        // ---- the native NVFP4 import: the facts the provider build publishes ------------------
+        // The sink is the seam `pipeline::load_native_dit_at_dtype` publishes into; here it is fed
+        // the same accessor result that production line feeds it, from the same Kitchen fixture.
+        let path = tmp.path().join("kreamania_variant7.safetensors");
+        crate::testfix::write_kitchen_nvfp4_native_file(&path);
+        let cfg = crate::testfix::kitchen_nvfp4_config();
+        let weights = crate::loader::Weights::from_native_file_for(
+            &path,
+            &Device::Cpu,
+            DType::F32,
+            crate::native_mapping::DeclaredLogicalShapes::FromConfig(&cfg),
+        )
+        .expect("the Kitchen fixture imports");
+        // Materialize the fixture's projections. The receipt measures what has actually been read,
+        // so a reader nothing has consumed yet honestly reports no residency rows at all — the
+        // facts only become interesting once the trunk has been built from them.
+        let plan = crate::nvfp4_dit::DitPlan::nvfp4(crate::nvfp4_dit::Nvfp4Quant::Mixed)
+            .with_num_layers(1);
+        for base in ["transformer_blocks.0.attn.to_q", "img_in"] {
+            crate::loader::linear_detect_planned(&weights, base, false, &plan)
+                .expect("the Kitchen projections materialize on CPU");
+        }
+
+        let sink = gen_core::CheckpointFactsSink::new();
+        let mut generator = sequential_generator(descriptor());
+        generator.checkpoint_facts = sink.clone();
+        assert!(
+            Generator::checkpoint_weight_facts(&generator).is_none(),
+            "before anything materializes there is no measured receipt to report"
+        );
+
+        sink.publish_optional(
+            weights
+                .checkpoint_weight_facts()
+                .expect("the pinned source is unchanged"),
+        );
+
+        let facts = Generator::checkpoint_weight_facts(&generator)
+            .expect("the generator surface exposes what the load published");
+        assert!(
+            facts.source().declares(NVFP4_CODEC.codec_id),
+            "fact 2 — the source stores nvfp4-v1 whatever this host can execute"
+        );
+        assert!(
+            facts.capability().is_dense_only(),
+            "fact 1 — a CPU host executes nothing in its stored packing"
+        );
+        let dense = facts
+            .materialized_as(NVFP4_CODEC.codec_id, ExecutionRepresentation::DenseFallback)
+            .expect("fact 3 — the nvfp4 rows materialized as the declared dense fallback");
+        assert!(dense.tensor_count > 0);
+        assert!(
+            facts
+                .materialized_as(NVFP4_CODEC.codec_id, ExecutionRepresentation::NativePacked)
+                .is_none(),
+            "a dense-fallback run must never surface a native-packed row"
+        );
+        assert!(!facts.executes_natively(NVFP4_CODEC.codec_id));
+        // The binding travels with the facts, so a consumer can say which artifact they describe.
+        assert_eq!(
+            facts
+                .source_binding()
+                .expect("the verified pin is carried through")
+                .stable_token(),
+            format!(
+                "kreamania_variant7.safetensors@{}",
+                std::fs::metadata(&path).unwrap().len()
+            )
+        );
+    }
+
+    #[test]
+    fn raw_and_edit_contract_validation_preserves_low_rank_adapter_plus_pid_compositions() {
+        for kind in [gen_core::AdapterKind::Lora, gen_core::AdapterKind::Lokr] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut spec = valid_directory_spec(tmp.path());
+            spec.adapters.push(gen_core::AdapterSpec::new(
+                tmp.path().join("adapter.safetensors"),
+                0.75,
+                kind,
+            ));
+            spec.pid = Some(gen_core::PidWeights {
+                checkpoint: WeightsSource::File(tmp.path().join("pid.safetensors")),
+                gemma: WeightsSource::Dir(tmp.path().join("gemma")),
+            });
+            for provider_id in [KREA_2_RAW_ID, KREA_2_EDIT_ID, KREA_2_TURBO_EDIT_ID] {
+                let contract =
+                    validated_krea_request_scoped_memory_strategy_contract(provider_id, &spec)
+                        .unwrap_or_else(|error| {
+                            panic!("{provider_id} rejected {kind:?} + PiD: {error}")
+                        });
+                assert_eq!(
+                    contract
+                        .capability(gen_core::MemoryStrategy::StagedResidency)
+                        .unwrap()
+                        .support,
+                    gen_core::MemoryStrategySupport::Implemented
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn directory_loads_reject_identity_for_every_krea_variant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = valid_directory_spec(tmp.path());
+        spec.identity = Some(gen_core::IdentityWeights::default());
+        for provider_id in [
+            KREA_2_TURBO_ID,
+            KREA_2_RAW_ID,
+            KREA_2_EDIT_ID,
+            KREA_2_TURBO_EDIT_ID,
+        ] {
+            let error = validate_load_spec(&spec, provider_id)
+                .expect_err("identity must fail closed for directory loads")
+                .to_string();
+            assert!(error.contains("identity"), "{provider_id}: {error}");
+        }
+    }
+
+    fn resident_memory_context(
+        contract: &gen_core::MemoryProviderContract,
+        quant: Option<Quant>,
+    ) -> gen_core::MemoryRunContext {
+        let calibration = contract.calibration.as_ref().unwrap();
+        gen_core::MemoryRunContext {
+            optimization_authority: gen_core::MemoryOptimizationAuthority::Calibrated,
+            selection: gen_core::MemorySelection {
+                strategy: gen_core::MemoryStrategy::Resident,
+                parameters: Default::default(),
+                tier: gen_core::MemoryNumericTier {
+                    precision: gen_core::Precision::Bf16,
+                    quant,
+                    component_precision_floors: &[],
+                },
+            },
+            calibration_abi: calibration.abi,
+            calibration_fingerprint: calibration.fingerprint.clone(),
+            load_shape: calibration.load_shape,
+            mode: gen_core::MemoryMode::TextToImage,
+            has_reference: false,
+            use_pid: false,
+            has_phases: false,
+            geometry: gen_core::MemoryGeometry {
+                width: 512,
+                height: 512,
+                batch: 1,
+                frames: 1,
+                reference_count: 0,
+            },
+            overlay: None,
+            budget: gen_core::MemoryBudget {
+                total_bytes: 1024,
+                committed_bytes: 0,
+                reclaimable_bytes: 0,
+                reserved_headroom_bytes: 0,
+            },
+            predicted_peak_bytes: 512,
+            cache_state: gen_core::MemoryCacheState::Cold,
+            evidence_revision: "test".to_owned(),
+        }
+    }
+
+    #[test]
+    fn prepacked_turnkeys_without_overrides_bind_registration_to_q4_and_q8() {
+        for (bits, actual, wrong) in [
+            (4, Quant::Q4, Some(Quant::Q8)),
+            (8, Quant::Q8, Some(Quant::Q4)),
+        ] {
+            let root_tmp = tempfile::tempdir().unwrap();
+            let root = root_tmp.path().to_path_buf();
+            std::fs::create_dir_all(root.join("transformer")).unwrap();
+            std::fs::write(
+                root.join("transformer/config.json"),
+                format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
+            )
+            .unwrap();
+            let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+            let contract = krea_turbo_memory_strategy_contract();
+            let actual_context = resident_memory_context(contract, Some(actual));
+            assert_eq!(
+                registered_krea_safety_check(&spec, contract, &actual_context),
+                gen_core::MemorySafetyDecision::Accept
+            );
+            let mut generator = sequential_generator(descriptor());
+            generator.loaded_quant = Some(actual);
+            assert_eq!(
+                generator.memory_strategy_safety_check(&actual_context),
+                gen_core::MemorySafetyDecision::Accept
+            );
+            for selected in [None, wrong] {
+                assert!(matches!(
+                    registered_krea_safety_check(
+                        &spec,
+                        contract,
+                        &resident_memory_context(contract, selected),
+                    ),
+                    gen_core::MemorySafetyDecision::Reject { reason }
+                        if reason.contains("does not match loaded tier")
+                ));
+                assert!(matches!(
+                    generator.memory_strategy_safety_check(&resident_memory_context(
+                        contract, selected,
+                    )),
+                    gen_core::MemorySafetyDecision::Reject { reason }
+                        if reason.contains("does not match loaded tier")
+                ));
+            }
+        }
+    }
+
+    /// **AC#3 (sc-21483) — a descriptor that does not inherit adapters REFUSES an adapter-bearing
+    /// request** with a typed capability error, rather than loading and ignoring the adapter.
+    ///
+    /// This is the shape an imported-model route takes when its binding declares
+    /// `inherit_adapters = false`: the registry withdraws `supports_lora`/`supports_lokr` from the
+    /// route's descriptor before handing it to `build`. Krea's own registered descriptors all
+    /// inherit adapters (asserted below), so the negative case is exercised by withdrawing the
+    /// capability the way the registry does.
+    #[test]
+    fn a_descriptor_that_does_not_inherit_adapters_refuses_an_adapter_bearing_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("base");
+        std::fs::create_dir_all(&root).unwrap();
+        let adapter = tmp.path().join("style.safetensors");
+        std::fs::write(&adapter, b"fixture").unwrap();
+
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root));
+        spec.adapters = vec![gen_core::AdapterSpec::new(
+            adapter,
+            1.0,
+            gen_core::AdapterKind::Lora,
+        )];
+
+        // The registered descriptor DOES inherit adapters, so the same spec is admitted here…
+        let inheriting = descriptor();
+        assert!(inheriting.capabilities.supports_lora || inheriting.capabilities.supports_lokr);
+        gen_core::reject_unsupported_adapters(
+            inheriting.id,
+            &inheriting.capabilities,
+            spec.adapters.len(),
+        )
+        .expect("an adapter-inheriting route admits an adapter-bearing spec");
+
+        // …and refused once the route withdraws adapter inheritance.
+        let mut withdrawn = descriptor();
+        withdrawn.capabilities.supports_lora = false;
+        withdrawn.capabilities.supports_lokr = false;
+        let error = match build(&spec, withdrawn) {
+            Ok(_) => panic!("an adapter-bearing load must not silently drop the adapter"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, gen_core::Error::Unsupported(_)),
+            "the refusal must be a typed capability error, got {error:?}"
+        );
+        let error = error.to_string();
+        assert!(error.contains("does not inherit adapters"), "{error}");
+        assert!(error.contains(KREA_2_TURBO_ID), "{error}");
+
+        // An adapter-free spec against the SAME withdrawn descriptor is not refused for this
+        // reason — the gate keys off the adapter selection, not the capability alone.
+        let mut withdrawn = descriptor();
+        withdrawn.capabilities.supports_lora = false;
+        withdrawn.capabilities.supports_lokr = false;
+        gen_core::reject_unsupported_adapters(withdrawn.id, &withdrawn.capabilities, 0)
+            .expect("an adapter-free spec is unaffected");
+    }
+
+    #[test]
+    fn imported_file_refuses_a_mismatched_packed_companion_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("base");
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        std::fs::write(
+            root.join("transformer/config.json"),
+            r#"{"quantization":{"bits":4,"group_size":64}}"#,
+        )
+        .unwrap();
+        let primary = tmp.path().join("imported.safetensors");
+        std::fs::write(&primary, b"pinned fixture").unwrap();
+        let spec = LoadSpec::new(WeightsSource::File(primary))
+            .with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(root))
+            .with_quant(Quant::Q8);
+        let error = validate_load_spec(&spec, KREA_2_TURBO_ID)
+            .expect_err("Q8 imported DiT plus Q4 companion must fail")
+            .to_string();
+        assert!(error.contains("companion snapshot is packed Q4"), "{error}");
+    }
+
+    #[test]
+    fn fp32_load_spec_cannot_relabel_bf16_loaded_or_registered_admission() {
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        spec.precision = gen_core::Precision::Fp32;
+        let contract = krea_turbo_memory_strategy_contract();
+        let generator = sequential_generator(descriptor());
+
+        let mut fp32_context = resident_memory_context(contract, None);
+        fp32_context.selection.tier.precision = gen_core::Precision::Fp32;
+        assert!(matches!(
+            registered_krea_safety_check(&spec, contract, &fp32_context),
+            gen_core::MemorySafetyDecision::Reject { reason }
+                if reason.contains("does not match loaded tier")
+        ));
+        assert!(matches!(
+            generator.memory_strategy_safety_check(&fp32_context),
+            gen_core::MemorySafetyDecision::Reject { reason }
+                if reason.contains("does not match loaded tier")
+        ));
+
+        let bf16_context = resident_memory_context(contract, None);
+        assert_eq!(
+            registered_krea_safety_check(&spec, contract, &bf16_context),
+            gen_core::MemorySafetyDecision::Accept
+        );
+        assert_eq!(
+            generator.memory_strategy_safety_check(&bf16_context),
+            gen_core::MemorySafetyDecision::Accept
+        );
+    }
+
+    #[test]
+    fn krea_control_memory_contract_publishes_the_executable_surface() {
+        let dense = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let contract = build_krea_control_memory_strategy_contract(&dense).unwrap();
+        gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
+        assert!(matches!(
+            contract
+                .capability(gen_core::MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            gen_core::MemoryStrategySupport::StructurallyNotApplicable { .. }
+        ));
+        assert!(matches!(
+            contract
+                .capability(gen_core::MemoryStrategy::BoundedDecode)
+                .unwrap()
+                .support,
+            gen_core::MemoryStrategySupport::Implemented
+        ));
+        assert!(!contract.engages(
+            gen_core::MemoryStrategy::BoundedAttention,
+            gen_core::MemoryStrategy::BoundedDecode
+        ));
+
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        std::fs::write(
+            root.join("transformer/config.json"),
+            r#"{"quantization":{"bits":4,"group_size":64}}"#,
+        )
+        .unwrap();
+        let q4 = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        let q4_contract = build_krea_control_memory_strategy_contract(&q4).unwrap();
+        assert!(q4_contract.engages(
+            gen_core::MemoryStrategy::BoundedAttention,
+            gen_core::MemoryStrategy::BoundedDecode
+        ));
+    }
+
+    /// **Krea keeps its own 128 Mi budget while consuming the shared rung-3 planner (SC-15796).**
+    ///
+    /// SC-15796 hoisted candle's chunk arithmetic onto `gen_core::attention_budget`, which also carries
+    /// Z-Image's measured 64 Mi operating point. Krea's 128 Mi is a **legitimately different, measured**
+    /// family operating point — the GPU-validated ControlNet chunk size — published through the same
+    /// `attentionChunkSize` field, and `configure_attention` rejects anything else. Unifying the two
+    /// numbers would silently re-calibrate this family, so this pins the split explicitly:
+    ///
+    /// 1. Krea declares exactly 128 Mi, and it is **not** the shared Z-Image constant.
+    /// 2. The declared value is still interpreted by the *shared planner* — at the krea grounded-TE
+    ///    geometry (B·H = 1·32, Sq = Sk = 8192, the inclusive token cap) 128 Mi plans 512 query rows
+    ///    where 64 Mi would plan 256, so the number is load-bearing and the planner reads it.
+    /// 3. `configure_attention` accepts 128 Mi and rejects the shared 64 Mi.
+    #[test]
+    fn krea_keeps_its_own_128_mi_budget_on_the_shared_planner() {
+        use candle_gen::attention::{AttentionBudget, CONSTRAINED_ATTN_SCORES_BUDGET as SHARED};
+
+        // (1) The declared family operating point, and that it is not the shared one.
+        assert_eq!(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET, 128 * 1024 * 1024);
+        assert_eq!(SHARED, 64 * 1024 * 1024);
+        assert_ne!(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u64, SHARED);
+
+        // (2) Shared planner, krea's budget. The grounded TE at its 8192-token cap: 32·8192 score
+        // elements per query row.
+        let rows_per_query = 32u64 * 8192;
+        let krea = AttentionBudget::from_score_elements(
+            pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u64,
+            false,
+        );
+        assert_eq!(krea.query_block_rows(rows_per_query, 8192), 512);
+        let z_image = AttentionBudget::from_score_elements(SHARED, false);
+        assert_eq!(z_image.query_block_rows(rows_per_query, 8192), 256);
+
+        // (3) The published contract admits krea's value and only krea's value.
+        use gen_core::MemoryRequestScope;
+        let mut scope = KreaMemoryScope {
+            device: Device::Cpu,
+            memory: Some(gen_core::GenerationMemory {
+                chunk_attention: true,
+                ..Default::default()
+            }),
+            provider_id: KREA_2_TURBO_ID.to_owned(),
+            mode: gen_core::MemoryMode::TextToImage,
+            reference_count: 0,
+            use_pid: false,
+            has_phases: false,
+            finished: false,
+        };
+        scope
+            .configure_attention(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32)
+            .expect("krea must accept its own declared budget");
+        let err = scope
+            .configure_attention(SHARED as u32)
+            .expect_err("krea must reject the shared z-image budget");
+        assert!(
+            err.to_string().contains("attention chunk size is fixed"),
+            "{err}"
+        );
+        scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
+    }
+
+    #[test]
+    fn shared_memory_ladder_maps_to_cumulative_existing_controls() {
+        let tier = gen_core::MemoryNumericTier {
+            precision: gen_core::Precision::Bf16,
+            quant: Some(Quant::Q4),
+            component_precision_floors: &[],
+        };
+        let parameters = gen_core::MemoryStrategyParameters {
+            stage_residency: None,
+            decode_tile_edge: Some(512),
+            decode_overlap: Some(128),
+            attention_chunk_size: Some(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32),
+            transformer_window_size: Some(1),
+            // Krea streams only the DiT (SC-15794 scoped the encoder for z-image); None is the
+            // DiT-only default, so this declaration is unchanged in meaning.
+            transformer_window_component: None,
+        };
+        let selected = |strategy| gen_core::MemorySelection {
+            strategy,
+            parameters,
+            tier,
+        };
+        let contract = krea_turbo_memory_strategy_contract();
+        assert!(
+            !gen_core::MemoryStrategy::BoundedTransformerResidency
+                .engages(gen_core::MemoryStrategy::StagedResidency),
+            "the shared rung-4 contract must not imply phase release"
+        );
+        assert!(
+            contract.engages(
+                gen_core::MemoryStrategy::BoundedDecode,
+                gen_core::MemoryStrategy::StagedResidency
+            ),
+            "Krea's additive backend prerequisite must preserve its current three-stage coupling"
+        );
+        assert_eq!(
+            contract.engaged_composition(gen_core::MemoryStrategy::BoundedAttention),
+            vec![
+                gen_core::MemoryStrategy::Resident,
+                gen_core::MemoryStrategy::StagedResidency,
+                gen_core::MemoryStrategy::BoundedDecode,
+                gen_core::MemoryStrategy::BoundedAttention,
+            ]
+        );
+
+        assert_eq!(
+            krea_generation_memory(contract, selected(gen_core::MemoryStrategy::Resident)),
+            None
+        );
+        assert_eq!(
+            krea_generation_memory(
+                contract,
+                selected(gen_core::MemoryStrategy::StagedResidency)
+            ),
+            Some(gen_core::GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            krea_generation_memory(contract, selected(gen_core::MemoryStrategy::BoundedDecode)),
+            Some(gen_core::GenerationMemory {
+                stage_residency: true,
+                tile_vae_decode: true,
+                decode_tile_edge: Some(512),
+                decode_overlap: Some(128),
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            krea_generation_memory(
+                contract,
+                selected(gen_core::MemoryStrategy::BoundedAttention)
+            ),
+            Some(gen_core::GenerationMemory {
+                stage_residency: true,
+                tile_vae_decode: true,
+                decode_tile_edge: Some(512),
+                decode_overlap: Some(128),
+                chunk_attention: true,
+                attention_chunk_size: Some(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32),
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            krea_generation_memory(
+                contract,
+                selected(gen_core::MemoryStrategy::BoundedTransformerResidency)
+            ),
+            Some(gen_core::GenerationMemory {
+                stage_residency: true,
+                tile_vae_decode: true,
+                decode_tile_edge: Some(512),
+                decode_overlap: Some(128),
+                chunk_attention: true,
+                attention_chunk_size: Some(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32),
+                stream_transformer_blocks: true,
+                // SC-15792: the SELECTED window travels with the selection. Pinned as a non-default
+                // value on purpose — `None` is `GenerationMemory::default()`, so asserting it would
+                // pass with the propagation deleted, which is exactly how the field came to be
+                // dropped on the floor in the first place.
+                transformer_window_size: Some(1),
+                transformer_window_component: Some(gen_core::TransformerComponent::Dit),
+                ..Default::default()
+            })
+        );
+    }
+
+    /// **SC-15792 — the selected window must be the executed one.**
+    ///
+    /// `krea_generation_memory` used to build its `GenerationMemory` with `..Default::default()`,
+    /// which silently discarded `transformer_window_size`: the pipeline then fell back to the
+    /// provider constant no matter what the selector chose. That is invisible while the constant and
+    /// the only published candidate are both 1 — so this drives a window the provider does NOT
+    /// publish, which the shipped path can never produce, and asserts it survives the mapping.
+    ///
+    /// The companion half is that such a value is REJECTED at the request boundary rather than
+    /// executed; `generate` checks it against `SUPPORTED_TRANSFORMER_WINDOWS`.
+    #[test]
+    fn the_selected_transformer_window_travels_to_the_request() {
+        use gen_core::MemoryStrategy;
+
+        let contract = krea_turbo_memory_strategy_contract();
+        let select = |strategy, window| {
+            krea_generation_memory(
+                contract,
+                gen_core::MemorySelection {
+                    strategy,
+                    parameters: gen_core::MemoryStrategyParameters {
+                        transformer_window_size: window,
+                        ..Default::default()
+                    },
+                    tier: gen_core::MemoryNumericTier {
+                        precision: gen_core::Precision::Bf16,
+                        quant: Some(Quant::Q4),
+                        component_precision_floors: &[],
+                    },
+                },
+            )
+        };
+
+        // A window the provider does not publish still arrives intact — the mapping's job is to
+        // carry the selection faithfully, and rejecting it is `generate`'s job, not this one's.
+        let engaged = select(MemoryStrategy::BoundedTransformerResidency, Some(4))
+            .expect("rung 4 maps to a per-generation memory block");
+        assert!(engaged.stream_transformer_blocks);
+        assert_eq!(
+            engaged.transformer_window_size,
+            Some(4),
+            "the selected window was dropped; the pipeline would silently run the provider default"
+        );
+
+        // A rung that does not stream blocks must not carry a window: it would be a parameter for a
+        // lever that is off, and the pipeline reads the field without re-checking the flag.
+        let shallower = select(MemoryStrategy::BoundedAttention, Some(4))
+            .expect("rung 3 maps to a per-generation memory block");
+        assert!(!shallower.stream_transformer_blocks);
+        assert_eq!(shallower.transformer_window_size, None);
+    }
+
+    /// The three places this provider states its rung-4 window — what it publishes, what its request
+    /// scope accepts, and what `generate` re-validates — must agree. They were three independent
+    /// literals before SC-15792.
+    #[test]
+    fn the_published_window_candidates_are_the_ones_the_scope_accepts() {
+        let contract = krea_turbo_memory_strategy_contract();
+        let published = contract
+            .capability(gen_core::MemoryStrategy::BoundedTransformerResidency)
+            .expect("rung 4 is declared")
+            .parameters
+            .transformer_window_sizes
+            .clone();
+        assert_eq!(published, SUPPORTED_TRANSFORMER_WINDOWS.to_vec());
+        assert!(
+            !published.is_empty(),
+            "an empty candidate list would make every window unsupported and rung 4 unselectable"
+        );
+        assert!(
+            SUPPORTED_TRANSFORMER_WINDOWS
+                .contains(&(crate::transformer::DEFAULT_TRANSFORMER_WINDOW as u32)),
+            "the shipped default must be one of the windows the contract publishes"
+        );
+    }
+
+    #[test]
+    fn adapter_specs_remove_only_registered_transformer_streaming() {
+        let plain = LoadSpec::new(WeightsSource::Dir("/nonexistent/krea".into()));
+        let plain_contract = build_krea_turbo_memory_strategy_contract(&plain);
+        assert!(matches!(
+            plain_contract
+                .capability(gen_core::MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            gen_core::MemoryStrategySupport::Implemented
+        ));
+        for (path, kind) in [
+            ("/nonexistent/lora.safetensors", gen_core::AdapterKind::Lora),
+            ("/nonexistent/lokr.safetensors", gen_core::AdapterKind::Lokr),
+            (
+                "/nonexistent/weights.diff.safetensors",
+                gen_core::AdapterKind::Lora,
+            ),
+        ] {
+            let adapted =
+                plain
+                    .clone()
+                    .with_adapters(vec![AdapterSpec::new(path.into(), 1.0, kind)]);
+            let adapted_contract = build_krea_turbo_memory_strategy_contract(&adapted);
+            let streaming = adapted_contract
+                .capability(gen_core::MemoryStrategy::BoundedTransformerResidency)
+                .unwrap();
+            assert!(matches!(
+                streaming.support,
+                gen_core::MemoryStrategySupport::Missing
+            ));
+            assert!(streaming.parameters.transformer_window_sizes.is_empty());
+            for rung in [
+                gen_core::MemoryStrategy::Resident,
+                gen_core::MemoryStrategy::StagedResidency,
+                gen_core::MemoryStrategy::BoundedDecode,
+                gen_core::MemoryStrategy::BoundedAttention,
+            ] {
+                assert!(matches!(
+                    adapted_contract.capability(rung).unwrap().support,
+                    gen_core::MemoryStrategySupport::Implemented
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn imported_file_does_not_claim_snapshot_rung_four_evidence() {
+        let spec = LoadSpec::new(WeightsSource::File("/imports/krea.safetensors".into()))
+            .with_component(
+                BASE_SNAPSHOT_COMPONENT,
+                WeightsSource::Dir("/snap/krea".into()),
+            );
+        let contract = build_krea_turbo_memory_strategy_contract(&spec);
+        assert!(matches!(
+            contract
+                .capability(gen_core::MemoryStrategy::BoundedTransformerResidency)
+                .expect("rung 4 declared")
+                .support,
+            gen_core::MemoryStrategySupport::Missing
+        ));
+        for rung in [
+            gen_core::MemoryStrategy::Resident,
+            gen_core::MemoryStrategy::StagedResidency,
+            gen_core::MemoryStrategy::BoundedDecode,
+            gen_core::MemoryStrategy::BoundedAttention,
+        ] {
+            assert!(matches!(
+                contract
+                    .capability(rung)
+                    .expect("lower rung declared")
+                    .support,
+                gen_core::MemoryStrategySupport::Implemented
+            ));
+        }
+
+        let eligible = spec
+            .clone()
+            .with_offload_policy(gen_core::OffloadPolicy::Sequential)
+            .with_load_shape(gen_core::LoadShape::DeferredMaterialization);
+        assert!(
+            native_file_streamable(KREA_2_TURBO_ID, &eligible),
+            "the explicit File load shape must arm the physical native block loader"
+        );
+        let explicit_window = gen_core::GenerationMemory {
+            stage_residency: true,
+            stream_transformer_blocks: true,
+            transformer_window_size: Some(SUPPORTED_TRANSFORMER_WINDOWS[0]),
+            transformer_window_component: Some(gen_core::TransformerComponent::Dit),
+            ..Default::default()
+        };
+        validate_native_file_transformer_request(KREA_2_TURBO_ID, &eligible, explicit_window)
+            .expect("an eligible explicit File window must reach the physical renderer");
+        let default_dit_window = gen_core::GenerationMemory {
+            stage_residency: true,
+            stream_transformer_blocks: true,
+            ..Default::default()
+        };
+        validate_native_file_transformer_request(KREA_2_TURBO_ID, &eligible, default_dit_window)
+            .expect("an omitted component/window defaults to the calibrated DiT window");
+        for component in [
+            gen_core::TransformerComponent::TextEncoder,
+            gen_core::TransformerComponent::Both,
+        ] {
+            let wrong_component = gen_core::GenerationMemory {
+                transformer_window_component: Some(component),
+                ..explicit_window
+            };
+            let error = validate_native_file_transformer_request(
+                KREA_2_TURBO_ID,
+                &eligible,
+                wrong_component,
+            )
+            .expect_err("File streaming may not claim a non-DiT component");
+            assert!(error.to_string().contains("DiT component only"), "{error}");
+        }
+        for parameter_only in [
+            gen_core::GenerationMemory {
+                transformer_window_size: Some(SUPPORTED_TRANSFORMER_WINDOWS[0]),
+                ..Default::default()
+            },
+            gen_core::GenerationMemory {
+                transformer_window_component: Some(gen_core::TransformerComponent::Dit),
+                ..Default::default()
+            },
+        ] {
+            let error = validate_native_file_transformer_request(
+                KREA_2_TURBO_ID,
+                &eligible,
+                parameter_only,
+            )
+            .expect_err("transformer parameters without streaming must be rejected");
+            assert!(
+                error.to_string().contains("stream_transformer_blocks=true"),
+                "{error}"
+            );
+        }
+        let invalid_window = gen_core::GenerationMemory {
+            transformer_window_size: Some(SUPPORTED_TRANSFORMER_WINDOWS[0] + 1),
+            ..explicit_window
+        };
+        let error =
+            validate_native_file_transformer_request(KREA_2_TURBO_ID, &eligible, invalid_window)
+                .expect_err("an uncalibrated File window must be rejected");
+        assert!(error.to_string().contains("window is fixed"), "{error}");
+        let eligible_contract = build_krea_turbo_memory_strategy_contract(&eligible);
+        assert!(matches!(
+            eligible_contract
+                .capability(gen_core::MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            gen_core::MemoryStrategySupport::Missing
+        ));
+
+        let mut resident = eligible.clone();
+        resident.offload_policy = gen_core::OffloadPolicy::Resident;
+        assert!(!native_file_streamable(KREA_2_TURBO_ID, &resident));
+        assert!(validate_native_file_transformer_request(
+            KREA_2_TURBO_ID,
+            &resident,
+            explicit_window
+        )
+        .is_err());
+
+        let mut eager = eligible.clone();
+        eager.load_shape = gen_core::LoadShape::EagerMaterialization;
+        assert!(!native_file_streamable(KREA_2_TURBO_ID, &eager));
+        assert!(
+            validate_native_file_transformer_request(KREA_2_TURBO_ID, &eager, explicit_window)
+                .is_err()
+        );
+
+        let quantized = eligible.clone().with_quant(Quant::Q4);
+        assert!(!native_file_streamable(KREA_2_TURBO_ID, &quantized));
+        assert!(validate_native_file_transformer_request(
+            KREA_2_TURBO_ID,
+            &quantized,
+            explicit_window
+        )
+        .is_err());
+
+        let adapted = eligible.clone().with_adapters(vec![AdapterSpec::new(
+            "/imports/adapter.safetensors".into(),
+            1.0,
+            gen_core::AdapterKind::Lora,
+        )]);
+        assert!(!native_file_streamable(KREA_2_TURBO_ID, &adapted));
+        assert!(validate_native_file_transformer_request(
+            KREA_2_TURBO_ID,
+            &adapted,
+            explicit_window
+        )
+        .is_err());
+        assert!(
+            !native_file_streamable(KREA_2_RAW_ID, &eligible),
+            "Candle's streamed trunk is only wired through the ordinary Turbo t2i renderer"
+        );
+    }
+
+    #[test]
+    fn imported_file_contract_matches_the_loader_for_every_typed_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base");
+        let valid = valid_imported_spec(&base, "krea.safetensors");
+
+        let mut precision = valid.clone();
+        precision.precision = gen_core::Precision::Fp32;
+        let mut control = valid.clone();
+        control.control = Some(WeightsSource::File(tmp.path().join("control.safetensors")));
+        let mut extra_control = valid.clone();
+        extra_control.extra_controls.push(WeightsSource::File(
+            tmp.path().join("extra-control.safetensors"),
+        ));
+        let mut ip_adapter = valid.clone();
+        ip_adapter.ip_adapter = Some(WeightsSource::Dir(tmp.path().join("ip-adapter")));
+        let mut identity = valid.clone();
+        identity.identity = Some(gen_core::IdentityWeights::default());
+        let mut text_encoder = valid.clone();
+        let external_text_encoder = tmp.path().join("external-text-encoder");
+        gen_core_testkit::write_encoder_contract_fixture(&external_text_encoder, ENCODER_CONTRACT)
+            .unwrap();
+        text_encoder.text_encoder = Some(WeightsSource::Dir(external_text_encoder));
+        let mut unknown_component = valid.clone();
+        unknown_component.components.insert(
+            "unknown".into(),
+            WeightsSource::File(tmp.path().join("unknown.safetensors")),
+        );
+        let mut missing_base = valid.clone();
+        missing_base.components.clear();
+        let accepted_adapter = valid.clone().with_adapters(vec![AdapterSpec::new(
+            tmp.path().join("adapter.safetensors"),
+            1.0,
+            gen_core::AdapterKind::Lora,
+        )]);
+        let accepted_pid = valid.clone().with_pid(
+            WeightsSource::File(tmp.path().join("pid.safetensors")),
+            WeightsSource::Dir(tmp.path().join("gemma")),
+        );
+        let accepted_deferred = valid
+            .clone()
+            .with_offload_policy(gen_core::OffloadPolicy::Sequential)
+            .with_load_shape(gen_core::LoadShape::DeferredMaterialization);
+
+        for (case, spec, expected) in [
+            ("valid", valid.clone(), true),
+            ("adapter", accepted_adapter, true),
+            ("pid", accepted_pid, true),
+            ("precision", precision, true),
+            ("deferred", accepted_deferred, true),
+            ("quantize", valid.clone().with_quant(Quant::Q4), true),
+            ("control", control, false),
+            ("extra_control", extra_control, false),
+            ("ip_adapter", ip_adapter, false),
+            ("identity", identity, false),
+            ("text_encoder", text_encoder, true),
+            ("unknown_component", unknown_component, false),
+            ("missing_base", missing_base, false),
+        ] {
+            let loader = validate_load_spec(&spec, KREA_2_TURBO_ID).is_ok();
+            let contract = validated_krea_turbo_memory_strategy_contract(&spec).is_ok();
+            assert_eq!(loader, expected, "loader validation for {case}");
+            assert_eq!(contract, loader, "contract/loader parity for {case}");
+        }
+    }
+
+    #[test]
+    fn memory_parameter_domains_reject_orphans_and_unknown_values() {
+        let id = KREA_2_TURBO_ID;
+        let valid = gen_core::GenerationMemory {
+            tile_vae_decode: true,
+            chunk_attention: true,
+            decode_tile_edge: Some(512),
+            decode_overlap: Some(128),
+            attention_chunk_size: Some(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32),
+            ..Default::default()
+        };
+        validate_memory_parameters(id, valid).unwrap();
+        for invalid in [
+            gen_core::GenerationMemory {
+                decode_tile_edge: Some(512),
+                ..Default::default()
+            },
+            gen_core::GenerationMemory {
+                decode_overlap: Some(128),
+                ..Default::default()
+            },
+            gen_core::GenerationMemory {
+                attention_chunk_size: Some(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32),
+                ..Default::default()
+            },
+            gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: Some(256),
+                ..Default::default()
+            },
+            gen_core::GenerationMemory {
+                chunk_attention: true,
+                attention_chunk_size: Some(1),
+                ..Default::default()
+            },
+        ] {
+            assert!(matches!(
+                validate_memory_parameters(id, invalid),
+                Err(gen_core::Error::Unsupported(_))
+            ));
+        }
+    }
+
+    /// SC-15805: the cumulative default is DEFEASIBLE, and this provider now reads it from the
+    /// contract rather than from the ladder's numeric order. Pin that with a contract that declares
+    /// a cheaper rung unavailable: a deeper selection must leave that rung's lever OFF.
+    ///
+    /// Without this, reverting `krea_generation_memory` to its `match`-over-the-cost-order form is
+    /// invisible — every other test uses the production contract, where all five rungs are
+    /// `Implemented` and the two forms agree exactly.
+    #[test]
+    fn a_rung_the_provider_does_not_implement_is_not_engaged_by_a_deeper_selection() {
+        use gen_core::{MemoryStrategy, MemoryStrategySupport};
+
+        let mut contract = krea_turbo_memory_strategy_contract().clone();
+        for capability in &mut contract.strategies {
+            if capability.strategy == MemoryStrategy::BoundedDecode {
+                capability.support = MemoryStrategySupport::Missing;
+            }
+        }
+
+        let memory = krea_generation_memory(
+            &contract,
+            gen_core::MemorySelection {
+                strategy: MemoryStrategy::BoundedTransformerResidency,
+                parameters: gen_core::MemoryStrategyParameters {
+                    transformer_window_size: Some(1),
+                    ..Default::default()
+                },
+                tier: gen_core::MemoryNumericTier {
+                    precision: gen_core::Precision::Bf16,
+                    quant: Some(Quant::Q4),
+                    component_precision_floors: &[],
+                },
+            },
+        )
+        .expect("an optimized rung maps to a control set");
+
+        assert!(
+            !memory.tile_vae_decode,
+            "rung 2 is declared Missing, so a rung-4 selection must not tile the decode; the \
+             cost order is not a dependency"
+        );
+        // ...while the rungs the provider DOES declare stay on, so this is not a vacuous all-false.
+        assert!(memory.chunk_attention);
+        assert!(memory.stream_transformer_blocks);
+    }
+
+    /// **SC-16090/SC-16096.** The shipped contract must be conformance-clean, asserted here rather than only in
+    /// gen-core's own tests, because `conformance_errors` has no caller in this repo: the consumer is
+    /// SceneWorks' selector, which bails on ANY non-empty result and drops this provider to
+    /// resident-only gating. The assertion also pins SC-16096's device-format transfer declaration.
+    #[test]
+    fn the_shipped_contract_is_conformance_clean_and_declares_its_window_realization() {
+        use gen_core::{MemoryStrategy, MemoryStrategySupport, MemoryWindowMaterialization};
+
+        let contract = krea_turbo_memory_strategy_contract().clone();
+        assert_eq!(
+            contract.conformance_errors(),
+            Vec::<String>::new(),
+            "the shipped Krea contract must be conformance-clean; a non-empty result makes the \
+             shared selector drop every rung, not just rung 4"
+        );
+
+        // Rung 4 is declared Implemented, so the window-realization rule is genuinely engaged above
+        // rather than passing because nothing streams.
+        assert!(matches!(
+            contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .map(|capability| &capability.support),
+            Some(MemoryStrategySupport::Implemented)
+        ));
+
+        assert_eq!(
+            contract.window_materialization(),
+            Some(&MemoryWindowMaterialization::DeviceFormatTransfer),
+            "Krea's streamed trunk maps a content-addressed GGML sidecar and transfers those bytes; \
+             the shipped contract must not retain the transitional conversion escape hatch"
+        );
+    }
+
+    #[test]
+    fn request_scope_reapplies_warm_state_rejects_non_t2i_and_finishes_once() {
+        use gen_core::MemoryRequestScope;
+
+        let attention_memory = gen_core::GenerationMemory {
+            tile_vae_decode: true,
+            chunk_attention: true,
+            ..Default::default()
+        };
+        let mut scope = KreaMemoryScope {
+            device: Device::Cpu,
+            memory: Some(attention_memory),
+            provider_id: KREA_2_TURBO_ID.to_owned(),
+            mode: gen_core::MemoryMode::TextToImage,
+            reference_count: 0,
+            use_pid: false,
+            has_phases: false,
+            finished: false,
+        };
+        let mut request = GenerationRequest {
+            prompt: "test".to_owned(),
+            memory: Some(gen_core::GenerationMemory {
+                stream_transformer_blocks: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        scope.configure_request(&mut request).unwrap();
+        assert_eq!(request.memory, Some(attention_memory));
+        request
+            .memory
+            .as_mut()
+            .unwrap()
+            .authorize_calibration_fault(gen_core::MemoryPhase::Denoise);
+        scope.configure_request(&mut request).unwrap();
+        assert_eq!(
+            request.memory,
+            Some(attention_memory),
+            "a warm follow-up request must not inherit a prior calibration fault"
+        );
+        scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
+        assert!(scope.finish(gen_core::MemoryRunOutcome::Complete).is_err());
+
+        let mut rejected = KreaMemoryScope {
+            device: Device::Cpu,
+            memory: Some(attention_memory),
+            provider_id: KREA_2_TURBO_ID.to_owned(),
+            mode: gen_core::MemoryMode::TextToImage,
+            reference_count: 0,
+            use_pid: false,
+            has_phases: false,
+            finished: false,
+        };
+        let mut img2img = GenerationRequest {
+            prompt: "test".to_owned(),
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 16,
+                    height: 16,
+                    pixels: vec![0; 16 * 16 * 3],
+                },
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            rejected.configure_request(&mut img2img),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+        rejected
+            .finish(gen_core::MemoryRunOutcome::Canceled)
+            .unwrap();
+    }
 
     #[test]
     fn registers_krea_2_turbo_as_candle() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
         let g = crate::provider_registry()
             .unwrap()
             .load(KREA_2_TURBO_ID, &spec)
@@ -1032,7 +5980,8 @@ mod tests {
 
     #[test]
     fn registers_krea_2_raw_as_candle() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
         let g = crate::provider_registry()
             .unwrap()
             .load(KREA_2_RAW_ID, &spec)
@@ -1059,7 +6008,10 @@ mod tests {
         assert!(!d.capabilities.supports_true_cfg);
         // Shared surface stays in lockstep with Turbo (derived from `descriptor()`).
         assert!(d.capabilities.supports_lora && d.capabilities.supports_lokr);
-        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
+        assert_eq!(
+            d.capabilities.supported_quants,
+            &[Quant::Q4, Quant::Q8, Quant::Nvfp4]
+        );
         assert_eq!(d.capabilities.samplers, descriptor().capabilities.samplers);
         assert!(!d.capabilities.mac_only);
         assert_eq!(pipeline::RAW_STEPS, 52);
@@ -1069,7 +6021,8 @@ mod tests {
     #[test]
     fn raw_validate_accepts_guidance_and_negative_prompt() {
         // The CFG floor that rejects these on Turbo must ACCEPT them on Raw.
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
         let g = crate::provider_registry()
             .unwrap()
             .load(KREA_2_RAW_ID, &spec)
@@ -1091,7 +6044,8 @@ mod tests {
     #[test]
     fn size_multiple_is_the_pinned_stride() {
         assert_eq!(SIZE_MULTIPLE, 16);
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
         let g = crate::provider_registry()
             .unwrap()
             .load(KREA_2_TURBO_ID, &spec)
@@ -1120,12 +6074,20 @@ mod tests {
     }
 
     #[test]
-    fn load_raw_rejects_single_file_like_turbo() {
-        // Same snapshot loader as Turbo — a single-file weights source is rejected the same way.
-        let file = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
+    fn load_raw_requires_a_base_snapshot_for_single_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let native = tmp.path().join("raw.safetensors");
+        std::fs::write(&native, b"pinned source fixture").unwrap();
+        let file = LoadSpec::new(WeightsSource::File(native));
         assert!(load_raw(&file).is_err());
+        write_valid_text_encoder(tmp.path());
+        let imported = file.with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(tmp.path().to_path_buf()),
+        );
+        assert!(load_raw(&imported).is_ok());
         // A LoRA `LoadSpec` on the Raw id is accepted + lazy, exactly like Turbo (sc-7836 wiring).
-        let dir = LoadSpec::new(WeightsSource::Dir("/snap".into()));
+        let dir = valid_directory_spec(tmp.path());
         assert!(load_raw(&dir).is_ok());
     }
 
@@ -1141,17 +6103,21 @@ mod tests {
             d.capabilities.conditioning,
             vec![ConditioningKind::Reference]
         );
-        // LoRA/LoKr merge wired (sc-7836); packed Q4/Q8 tiers advertised (sc-9607).
+        // LoRA/LoKr merge wired (sc-7836); packed Q4/Q8 tiers and native NVFP4 advertised.
         assert!(d.capabilities.supports_lora);
         assert!(d.capabilities.supports_lokr);
-        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
+        assert_eq!(
+            d.capabilities.supported_quants,
+            &[Quant::Q4, Quant::Q8, Quant::Nvfp4]
+        );
         assert_eq!(d.capabilities.max_size, 2048);
         assert_eq!(TURBO_STEPS, 8);
     }
 
     #[test]
     fn validate_accepts_txt2img_and_rejects_bad() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
         let g = crate::provider_registry()
             .unwrap()
             .load(KREA_2_TURBO_ID, &spec)
@@ -1188,7 +6154,8 @@ mod tests {
     /// reach the TE as an effectively-empty sequence.
     #[test]
     fn validate_rejects_whitespace_only_prompt() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
         let g = crate::provider_registry()
             .unwrap()
             .load(KREA_2_TURBO_ID, &spec)
@@ -1209,7 +6176,8 @@ mod tests {
 
     #[test]
     fn validate_rejects_guidance_and_negative_prompt() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
         let g = crate::provider_registry()
             .unwrap()
             .load(KREA_2_TURBO_ID, &spec)
@@ -1235,27 +6203,66 @@ mod tests {
     }
 
     #[test]
-    fn load_accepts_lora_rejects_single_file_and_unwired_surfaces() {
+    fn load_accepts_lora_and_complete_single_file_specs() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
-        let file = LoadSpec::new(WeightsSource::File("/tmp/q.safetensors".into()));
+        let tmp = tempfile::tempdir().unwrap();
+        let native = tmp.path().join("turbo.safetensors");
+        std::fs::write(&native, b"pinned source fixture").unwrap();
+        let file = LoadSpec::new(WeightsSource::File(native));
         assert!(load(&file).is_err());
+        write_valid_text_encoder(tmp.path());
+        let imported = file.with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(tmp.path().to_path_buf()),
+        );
+        assert!(load(&imported).is_ok());
         // LoRA/LoKr now wired (sc-7836): a LoRA `LoadSpec` is accepted (lazily — the merge happens at
         // first `generate`), so `load` resolves rather than rejecting.
-        let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
-            AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
-        ]);
+        let lora = valid_directory_spec(tmp.path()).with_adapters(vec![AdapterSpec::new(
+            "/lora.safetensors".into(),
+            1.0,
+            AdapterKind::Lora,
+        )]);
         assert!(load(&lora).is_ok(), "LoRA load is wired + lazy (sc-7836)");
         // sc-9607: a Q4/Q8 `spec.quantize` is now ACCEPTED (a no-op on the already-packed tier) — load
         // proceeds past the quant check and constructs lazily, exactly like the LoRA case above.
-        let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
+        let quant = valid_directory_spec(tmp.path()).with_quant(Quant::Q8);
         assert!(
             load(&quant).is_ok(),
             "Q4/Q8 quant is accepted + lazy (sc-9607)"
         );
     }
 
+    #[test]
+    fn imported_source_is_pinned_before_resident_or_sequential_materialization() {
+        for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+            let tmp = tempfile::tempdir().unwrap();
+            let native = tmp.path().join("krea.safetensors");
+            std::fs::write(&native, b"construction-time bytes").unwrap();
+            let mut spec = LoadSpec::new(WeightsSource::File(native.clone()))
+                .with_component(
+                    BASE_SNAPSHOT_COMPONENT,
+                    WeightsSource::Dir(tmp.path().join("base")),
+                )
+                .with_offload_policy(policy);
+            spec.prepare_file_sources().unwrap();
+            let prepared = spec.weights_file_pin().unwrap().unwrap();
+            let (_, pinned) = resolved_base_and_native(&spec, KREA_2_RAW_ID).unwrap();
+            let pinned = pinned.expect("File source must carry a construction-time pin");
+            assert_eq!(pinned, prepared, "provider must retain the cache-key token");
+            assert_eq!(pinned.loader_path(), std::path::absolute(&native).unwrap());
+
+            std::fs::write(&native, b"replacement after construction").unwrap();
+            let error = pinned
+                .ensure_unchanged()
+                .expect_err("later materialization must reject the replacement")
+                .to_string();
+            assert!(error.contains("changed after load"), "{policy:?}: {error}");
+        }
+    }
+
     // sc-9300: the ConvRot consume path is reachable through the LoadSpec API. The selector routes a
-    // `WeightsSource::File` on `text_encoder` to the INT8-ConvRot DiT (`load_components_convrot`), a
+    // `WeightsSource::File` on the named ConvRot component to the INT8-ConvRot DiT (`load_components_convrot`), a
     // plain `Dir` weights spec to the dense/packed snapshot path (`load_components`), and rejects the
     // mis-shaped / incompatible combinations. These assert the routing decision on CPU (no weights).
     #[test]
@@ -1267,18 +6274,19 @@ mod tests {
             None,
             "a Dir-only spec dispatches to the dense/packed snapshot path"
         );
-        // A ConvRot DiT single-file on `text_encoder` ⇒ the ConvRot path, carrying the DiT checkpoint.
+        // A ConvRot DiT single-file on the named component ⇒ the ConvRot path, carrying the DiT checkpoint.
         let convrot = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_convrot_text_encoder();
         assert_eq!(
             convrot_selector(&convrot, KREA_2_TURBO_ID).unwrap(),
             Some(PathBuf::from("/krea2_int8_convrot.safetensors")),
-            "a File on text_encoder selects the ConvRot DiT consume path"
+            "a File on the named component selects the ConvRot DiT consume path"
         );
-        // A `Dir` on `text_encoder` is not a valid ConvRot selector (ConvRot is a single file).
-        let bad = LoadSpec {
-            text_encoder: Some(WeightsSource::Dir("/te_dir".into())),
-            ..LoadSpec::new(WeightsSource::Dir("/snap".into()))
-        };
+        // A `Dir` on the ConvRot component is not valid (ConvRot is a single file).
+        let mut bad = LoadSpec::new(WeightsSource::Dir("/snap".into()));
+        bad.components.insert(
+            KREA_CONVROT_DIT_COMPONENT.to_owned(),
+            WeightsSource::Dir("/convrot-dir".into()),
+        );
         assert!(
             convrot_selector(&bad, KREA_2_TURBO_ID).is_err(),
             "a Dir on text_encoder is a mis-shaped ConvRot selector and errors"
@@ -1286,16 +6294,17 @@ mod tests {
     }
 
     #[test]
-    fn load_accepts_convrot_and_rejects_convrot_with_overlays() {
+    fn load_accepts_convrot_adapters_and_rejects_only_pid_overlay() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
         // A ConvRot-selecting spec loads (lazily — the int8 DiT + snapshot load at first `generate`).
-        let convrot = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_convrot_text_encoder();
+        let fixture = tempfile::tempdir().unwrap();
+        let convrot = valid_directory_spec(fixture.path()).with_convrot_text_encoder();
         assert!(
             load(&convrot).is_ok(),
             "a ConvRot LoadSpec is accepted + lazy (sc-9300)"
         );
-        // ConvRot does not thread LoRA/LoKr — the int8 checkpoint replaces the dense DiT wholesale.
-        let convrot_lora = LoadSpec::new(WeightsSource::Dir("/snap".into()))
+        // ConvRot LoRA/LoKr stays lazy and installs as a residual over the int8 DiT at generation.
+        let convrot_lora = valid_directory_spec(fixture.path())
             .with_convrot_text_encoder()
             .with_adapters(vec![AdapterSpec::new(
                 "/lora.safetensors".into(),
@@ -1303,11 +6312,11 @@ mod tests {
                 AdapterKind::Lora,
             )]);
         assert!(
-            load(&convrot_lora).is_err(),
-            "ConvRot + LoRA is rejected (the int8 DiT path is not adapter-wired)"
+            load(&convrot_lora).is_ok(),
+            "ConvRot + LoRA must be admitted to the adapter-wired int8 DiT path"
         );
         // ConvRot does not thread a PiD decoder overlay either.
-        let convrot_pid = LoadSpec::new(WeightsSource::Dir("/snap".into()))
+        let convrot_pid = valid_directory_spec(fixture.path())
             .with_convrot_text_encoder()
             .with_pid(
                 WeightsSource::File("/pid.safetensors".into()),
@@ -1323,7 +6332,8 @@ mod tests {
 
     #[test]
     fn registers_krea_2_edit_as_candle() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
         let g = crate::provider_registry()
             .unwrap()
             .load(KREA_2_EDIT_ID, &spec)
@@ -1365,22 +6375,35 @@ mod tests {
         );
         // Shared surface stays in lockstep with Raw/Turbo (derived from `raw_descriptor()`).
         assert!(d.capabilities.supports_lora && d.capabilities.supports_lokr);
-        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
+        assert_eq!(
+            d.capabilities.supported_quants,
+            &[Quant::Q4, Quant::Q8, Quant::Nvfp4]
+        );
     }
 
     #[test]
-    fn load_edit_rejects_single_file_accepts_dir_and_lora() {
+    fn load_edit_accepts_complete_single_file_dir_and_lora() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
-        // Same snapshot loader as Turbo/Raw — a single-file weights source is rejected.
-        let file = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
+        let tmp = tempfile::tempdir().unwrap();
+        let native = tmp.path().join("edit.safetensors");
+        std::fs::write(&native, b"pinned source fixture").unwrap();
+        let file = LoadSpec::new(WeightsSource::File(native));
         assert!(load_edit(&file).is_err());
+        write_valid_text_encoder(tmp.path());
+        let imported = file.with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(tmp.path().to_path_buf()),
+        );
+        assert!(load_edit(&imported).is_ok());
         // A plain snapshot dir loads lazily.
-        let dir = LoadSpec::new(WeightsSource::Dir("/snap".into()));
+        let dir = valid_directory_spec(tmp.path());
         assert!(load_edit(&dir).is_ok());
         // The edit LoRA rides the shared `spec.adapters` merge path (accepted + lazy).
-        let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
-            AdapterSpec::new("/edit_lora.safetensors".into(), 1.0, AdapterKind::Lora),
-        ]);
+        let lora = valid_directory_spec(tmp.path()).with_adapters(vec![AdapterSpec::new(
+            "/edit_lora.safetensors".into(),
+            1.0,
+            AdapterKind::Lora,
+        )]);
         assert!(load_edit(&lora).is_ok(), "edit LoRA load is wired + lazy");
     }
 
@@ -1501,7 +6524,8 @@ mod tests {
 
     #[test]
     fn turbo_validate_accepts_reference_rejects_multireference() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
         let g = crate::provider_registry()
             .unwrap()
             .load(KREA_2_TURBO_ID, &spec)
@@ -1533,95 +6557,18 @@ mod tests {
 
     // --- Sequential component residency — sc-12089 / epic 10765 Phase 1c ---
 
-    /// Pin `CANDLE_GEN_OFFLOAD` to a known value for the duration of a test, restoring the prior value
-    /// on drop.
-    ///
-    /// Both properties matter and neither is optional here:
-    ///
-    /// * **Pinning.** `candle_gen::sequential_offload_enabled` reads a process-global var, and the route
-    ///   assertions below turn on the `Resident` default reaching `sequential() == false`. An ambient
-    ///   `CANDLE_GEN_OFFLOAD=sequential` — which is exactly what a developer running the two-process A/B
-    ///   has exported in that shell — would otherwise turn them red for a reason that has nothing to do
-    ///   with the code under test.
-    /// * **Restoring on `Drop`, not at the end of the body.** A failing assertion unwinds; a restore
-    ///   written as the last statement would be skipped, leaking the mutation into every later test in
-    ///   the binary (they run in-process and single-threaded — `.cargo/config.toml` force-pins
-    ///   `RUST_TEST_THREADS=1`, F-160). One red test would then cascade into several.
-    struct OffloadEnvGuard(Option<String>);
-
-    impl OffloadEnvGuard {
-        /// Pin the var to `value` (`None` ⇒ unset) until the guard drops.
-        fn set(value: Option<&str>) -> Self {
-            let prior = std::env::var(candle_gen::OFFLOAD_ENV).ok();
-            match value {
-                Some(v) => std::env::set_var(candle_gen::OFFLOAD_ENV, v),
-                None => std::env::remove_var(candle_gen::OFFLOAD_ENV),
-            }
-            Self(prior)
-        }
-    }
-
-    impl Drop for OffloadEnvGuard {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(v) => std::env::set_var(candle_gen::OFFLOAD_ENV, v),
-                None => std::env::remove_var(candle_gen::OFFLOAD_ENV),
-            }
-        }
-    }
-
-    /// The offload contract (sc-12089): `with_offload_policy` is CAPTURED at load and never rejected —
-    /// on every id. Loading stays lazy, so this asserts the plumbing on
-    /// CPU with no weights and no GPU; the phased route itself is selected inside `generate` and
-    /// exercised end-to-end by the cuda A/B harness below.
-    ///
-    /// The env override's own semantics (spelling, case, whitespace) are asserted where the reader now
-    /// lives — `candle_gen::residency`'s `offload_env_reads_sequential_case_insensitively` — rather than
-    /// re-tested per engine.
+    /// Image construction stays lazy and ignores the legacy load-time policy; the request owns the
+    /// decision. This is weight-free because no loader runs until `generate`.
     #[test]
-    fn offload_policy_is_captured_not_rejected() {
-        let _env = OffloadEnvGuard::set(None);
-
-        // Resident remains lazy, but its cache now lives inside the shared residency owner.
-        let spec = LoadSpec::new(WeightsSource::Dir("/snap".into()));
-        assert_eq!(spec.offload_policy, OffloadPolicy::Resident);
-        assert!(load(&spec).is_ok());
-        assert!(load_raw(&spec).is_ok());
-
-        // `Sequential` is honored, not rejected — for all registered variants. Weights are never touched.
-        let seq = LoadSpec::new(WeightsSource::Dir("/snap".into()))
-            .with_offload_policy(OffloadPolicy::Sequential);
-        assert_eq!(seq.offload_policy, OffloadPolicy::Sequential);
-        assert!(load(&seq).is_ok());
-        assert!(load_raw(&seq).is_ok());
-        // Edit now selects the same deferred phase loaders; construction remains weights-free.
-        assert!(load_edit(&seq).is_ok());
-    }
-
-    /// The env override reaches THIS engine's route decision (sc-12089) — the seam the two-process A/B
-    /// harness drives when it cannot set a `LoadSpec`. The reader's own parsing is asserted in
-    /// `candle_gen::residency`; what this pins is that krea consults it at all, and that it can flip a
-    /// `Resident`-specced generator onto the phased path.
-    #[test]
-    fn env_override_selects_the_phased_route_on_a_resident_spec() {
-        // One scope per guard: a second `let _env` would SHADOW the first rather than replace it, and
-        // both would then live to the end of the body — restoring correctly only by accident of LIFO drop
-        // order. Explicit scopes make each pin end where it is meant to.
-        {
-            let _env = OffloadEnvGuard::set(Some("sequential"));
-            assert!(
-                effective_residency_policy(OffloadPolicy::Resident, false)
-                    == OffloadPolicy::Sequential,
-                "CANDLE_GEN_OFFLOAD=sequential must select the phased path regardless of the spec"
-            );
-        }
-        {
-            let _env = OffloadEnvGuard::set(None);
-            assert!(
-                effective_residency_policy(OffloadPolicy::Resident, false)
-                    == OffloadPolicy::Resident,
-                "with the override unset, a Resident spec stays resident"
-            );
+    fn image_load_policy_is_not_a_residency_authority() {
+        let fixture = tempfile::tempdir().unwrap();
+        let resident = valid_directory_spec(fixture.path());
+        let legacy_staged =
+            valid_directory_spec(fixture.path()).with_offload_policy(OffloadPolicy::Sequential);
+        for spec in [&resident, &legacy_staged] {
+            assert!(load(spec).is_ok());
+            assert!(load_raw(spec).is_ok());
+            assert!(load_edit(spec).is_ok());
         }
     }
 
@@ -1641,50 +6588,47 @@ mod tests {
         assert!(edit_descriptor().capabilities.supports_sequential_offload);
     }
 
+    fn unused_validated_text_encoder() -> gen_core::ValidatedEncoderSource {
+        let component = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(component.path(), ENCODER_CONTRACT)
+            .unwrap();
+        // These synthetic generators replace every residency loader and therefore never open this
+        // source. Constructing a real validated value keeps the production invariant non-optional;
+        // the dropped fixture also makes any accidental use fail closed.
+        ENCODER_CONTRACT
+            .validate_source(&WeightsSource::Dir(component.path().to_path_buf()))
+            .unwrap()
+    }
+
     fn sequential_generator(descriptor: ModelDescriptor) -> KreaGenerator {
+        let has_memory_contract = descriptor.id == KREA_2_TURBO_ID;
         KreaGenerator {
             descriptor,
             device: candle_gen::default_device().expect("a default device"),
-            residency: candle_gen::Residency::sequential(
-                || {
+            loaded_quant: None,
+            text_load_quant: None,
+            memory_contract: has_memory_contract
+                .then(|| krea_turbo_memory_strategy_contract().clone()),
+            residency: candle_gen::Residency::request_scoped(
+                |_| {
                     Err(candle_gen::CandleError::Msg(
                         "test text loader must not run".into(),
                     ))
                 },
-                |_| {
+                |_, _| {
                     Err(candle_gen::CandleError::Msg(
                         "test heavy loader must not run".into(),
                     ))
                 },
             ),
-            offload_policy: OffloadPolicy::Sequential,
             root: "/snap".into(),
+            text_encoder_source: unused_validated_text_encoder(),
+            native_dit: None,
             adapters: Vec::new(),
             has_diff_patch: false,
+            file_pin_spec: LoadSpec::new(WeightsSource::Dir("/snap".into())),
+            checkpoint_facts: gen_core::CheckpointFactsSink::new(),
         }
-    }
-
-    #[test]
-    fn constrained_memory_route_requires_sequential_plain_turbo_t2i() {
-        let mut generator = sequential_generator(descriptor());
-        generator.offload_policy = OffloadPolicy::Resident;
-        let req = GenerationRequest {
-            prompt: "test".into(),
-            memory: Some(gen_core::GenerationMemory::default()),
-            ..Default::default()
-        };
-        let error = generator.generate(&req, &mut |_| {}).unwrap_err();
-        assert!(
-            error.to_string().contains("only for sequential"),
-            "unexpected error: {error}"
-        );
-
-        let raw = sequential_generator(raw_descriptor());
-        let error = raw.generate(&req, &mut |_| {}).unwrap_err();
-        assert!(
-            error.to_string().contains("only for sequential"),
-            "unexpected error: {error}"
-        );
     }
 
     #[test]
@@ -1698,6 +6642,7 @@ mod tests {
                 tile_vae_decode: true,
                 chunk_attention: true,
                 stream_transformer_blocks: true,
+                ..Default::default()
             }),
             cancel,
             ..Default::default()
@@ -1706,6 +6651,39 @@ mod tests {
             generator.generate(&req, &mut |_| {}),
             Err(gen_core::Error::Canceled)
         ));
+    }
+
+    #[test]
+    fn direct_streamed_request_with_adapter_rejects_before_progress_or_load() {
+        let mut generator = sequential_generator(descriptor());
+        generator.adapters.push(AdapterSpec::new(
+            "/nonexistent/adapter.safetensors".into(),
+            1.0,
+            gen_core::AdapterKind::Lora,
+        ));
+        let request = GenerationRequest {
+            prompt: "a lighthouse".to_owned(),
+            memory: Some(gen_core::GenerationMemory {
+                stage_residency: true,
+                tile_vae_decode: true,
+                chunk_attention: true,
+                stream_transformer_blocks: true,
+                decode_tile_edge: Some(512),
+                decode_overlap: Some(128),
+                attention_chunk_size: Some(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32),
+                transformer_window_size: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let progress_calls = std::cell::Cell::new(0usize);
+        let error = generator
+            .generate(&request, &mut |_| {
+                progress_calls.set(progress_calls.get() + 1)
+            })
+            .expect_err("adapter-bearing direct streaming must reject");
+        assert!(matches!(error, gen_core::Error::Unsupported(_)));
+        assert_eq!(progress_calls.get(), 0);
     }
 
     /// F-173 (sc-12089): a request cancelled before `generate` returns `Canceled` without loading a
@@ -1722,8 +6700,6 @@ mod tests {
     /// multi-GB load inside `generate`, ahead of the first cancellable step.
     #[test]
     fn cancelled_sequential_request_returns_before_loading_anything() {
-        let _env = OffloadEnvGuard::set(None);
-
         let cancel = gen_core::runtime::CancelFlag::new();
         cancel.cancel();
         let req = GenerationRequest {
@@ -1731,6 +6707,10 @@ mod tests {
             width: 1024,
             height: 1024,
             cancel: cancel.clone(),
+            memory: Some(gen_core::GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            }),
             ..Default::default()
         };
 
@@ -1764,93 +6744,179 @@ mod tests {
         );
     }
 
-    /// The route guard (sc-12089). Two properties, and the second is the load-bearing one:
-    ///
-    /// 1. `Sequential` selects the phased path on Turbo/Raw/Edit; `Resident` (the default) never does.
-    /// 2. **An advertising id takes the phased path for EVERY request it accepts** — txt2img, img2img,
-    ///    and grounded edit. Because `supports_sequential_offload` is per-engine, a request-shape-dependent
-    ///    deferral would silently break the fit-gate's staged-peak prediction and OOM the admitted job.
-    ///    The only deferral is ConvRot, selected uniformly by the load spec rather than request shape.
     #[test]
-    fn sequential_route_covers_every_request_an_advertising_id_accepts() {
-        // The `Resident` assertions below read the process-global override through `sequential()`; pin it
-        // off so an A/B runner's ambient export cannot turn them red (see `OffloadEnvGuard`).
-        let _env = OffloadEnvGuard::set(None);
+    fn stage_only_requests_cancel_inside_cold_source_hash_for_every_krea_descriptor() {
+        use candle_gen::candle_core::{DType, Device, Tensor};
+        use std::collections::HashMap;
 
-        let plain = GenerationRequest {
-            prompt: "a rusty robot holding a lit candle".into(),
-            width: 1024,
-            height: 1024,
-            ..Default::default()
-        };
-        let img2img = GenerationRequest {
-            prompt: "a red apple".into(),
-            width: 1024,
-            height: 1024,
-            conditioning: vec![Conditioning::Reference {
-                image: ref_image(64, 64),
-                strength: Some(0.5),
-            }],
-            ..Default::default()
-        };
+        let component_tmp = tempfile::tempdir().unwrap();
+        let component = component_tmp.path().to_path_buf();
+        std::fs::write(
+            component.join("config.json"),
+            r#"{"quantization":{"bits":4,"group_size":64}}"#,
+        )
+        .unwrap();
+        // The packed code tensor alone is exactly one 4 MiB cancellation chunk. Scales and biases
+        // make the fixture a valid group-64 affine triple without ever reaching repack/build.
+        let out_dim = 131_072usize;
+        let tensors = HashMap::from([
+            (
+                "layers.0.proj.weight".to_owned(),
+                Tensor::zeros((out_dim, 8), DType::U32, &Device::Cpu).unwrap(),
+            ),
+            (
+                "layers.0.proj.scales".to_owned(),
+                Tensor::zeros((out_dim, 1), DType::F32, &Device::Cpu).unwrap(),
+            ),
+            (
+                "layers.0.proj.biases".to_owned(),
+                Tensor::zeros((out_dim, 1), DType::F32, &Device::Cpu).unwrap(),
+            ),
+        ]);
+        candle_gen::candle_core::safetensors::save(&tensors, component.join("model.safetensors"))
+            .unwrap();
 
-        // Every (id, request-shape) pair the advertising ids accept takes the phased path — no shape
-        // silently falls back to resident while the descriptor claims otherwise.
-        for descriptor in [descriptor(), raw_descriptor()] {
-            assert!(descriptor.capabilities.supports_sequential_offload);
-            for _req in [&plain, &img2img] {
-                assert!(
-                    effective_residency_policy(OffloadPolicy::Sequential, false)
-                        == OffloadPolicy::Sequential,
-                    "{} must honor Sequential for every request it accepts",
-                    descriptor.id
-                );
-            }
+        for descriptor in [descriptor(), raw_descriptor(), edit_descriptor()] {
+            let text_component = component.clone();
+            let has_memory_contract = descriptor.id == KREA_2_TURBO_ID;
+            let generator = KreaGenerator {
+                descriptor: descriptor.clone(),
+                device: Device::Cpu,
+                loaded_quant: None,
+                text_load_quant: None,
+                memory_contract: has_memory_contract
+                    .then(|| krea_turbo_memory_strategy_contract().clone()),
+                residency: candle_gen::Residency::request_scoped_with_resident_cancelable(
+                    |_| {
+                        Err(candle_gen::CandleError::Msg(
+                            "warm loader must not run for a stage-only request".into(),
+                        ))
+                    },
+                    move |_, cancel| {
+                        let _ = crate::loader::Weights::from_dir_cancelable(
+                            &text_component,
+                            &Device::Cpu,
+                            DType::BF16,
+                            cancel,
+                        )?;
+                        Err(candle_gen::CandleError::Msg(
+                            "cold source hash unexpectedly completed".into(),
+                        ))
+                    },
+                    |_, _, _| {
+                        Err(candle_gen::CandleError::Msg(
+                            "heavy loader must not run after text cancellation".into(),
+                        ))
+                    },
+                ),
+                root: "/snap".into(),
+                text_encoder_source: unused_validated_text_encoder(),
+                native_dit: None,
+                adapters: Vec::new(),
+                has_diff_patch: false,
+                file_pin_spec: LoadSpec::new(WeightsSource::Dir("/snap".into())),
+                checkpoint_facts: gen_core::CheckpointFactsSink::new(),
+            };
+            let cancel = gen_core::CancelFlag::new();
+            let request = GenerationRequest {
+                prompt: "cancel during cold packed hashing".into(),
+                conditioning: (descriptor.id == KREA_2_EDIT_ID)
+                    .then(|| Conditioning::Reference {
+                        image: ref_image(64, 64),
+                        strength: None,
+                    })
+                    .into_iter()
+                    .collect(),
+                memory: Some(gen_core::GenerationMemory {
+                    stage_residency: true,
+                    ..Default::default()
+                }),
+                cancel: cancel.clone(),
+                ..Default::default()
+            };
+            candle_gen::quant::sidecar::cancel_source_hash_after_chunks(1);
+            let error = generator
+                .generate(&request, &mut |_| {})
+                .expect_err("stage-only cold hashing must observe cancellation");
+            assert!(
+                matches!(error, gen_core::Error::Canceled),
+                "{} returned {error:?}",
+                descriptor.id
+            );
+            assert!(cancel.is_cancelled());
         }
+    }
 
-        let edit_req = GenerationRequest {
-            prompt: "make the person smile".into(),
-            width: 1024,
-            height: 1024,
-            conditioning: vec![Conditioning::Reference {
-                image: ref_image(64, 64),
-                strength: None,
-            }],
+    #[test]
+    fn rung_one_reaches_the_shared_staged_loader_for_every_advertised_krea_shape() {
+        let staged = || GenerationRequest {
+            prompt: "a rusty robot holding a lit candle".into(),
+            memory: Some(gen_core::GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            }),
             ..Default::default()
         };
-        let edit = edit_descriptor();
-        edit.capabilities
-            .validate_request(edit.id, &edit_req)
-            .expect("the edit descriptor accepts grounded reference conditioning");
-        assert!(edit.capabilities.supports_sequential_offload);
-        assert_eq!(
-            effective_residency_policy(OffloadPolicy::Sequential, false),
-            OffloadPolicy::Sequential
-        );
+        let mut cases = vec![
+            (descriptor(), staged()),
+            (raw_descriptor(), staged()),
+            (
+                descriptor(),
+                GenerationRequest {
+                    conditioning: vec![Conditioning::Reference {
+                        image: ref_image(64, 64),
+                        strength: Some(0.5),
+                    }],
+                    ..staged()
+                },
+            ),
+            (
+                edit_descriptor(),
+                GenerationRequest {
+                    conditioning: vec![Conditioning::Reference {
+                        image: ref_image(64, 64),
+                        strength: None,
+                    }],
+                    ..staged()
+                },
+            ),
+            (
+                descriptor(),
+                GenerationRequest {
+                    use_pid: true,
+                    ..staged()
+                },
+            ),
+            (
+                raw_descriptor(),
+                GenerationRequest {
+                    phases: Some(vec![gen_core::GenerationPhase {
+                        steps: 1,
+                        ..Default::default()
+                    }]),
+                    ..staged()
+                },
+            ),
+        ];
 
-        // `Resident` (the default) never takes it — that is the whole opt-in contract.
-        assert_eq!(
-            effective_residency_policy(OffloadPolicy::Resident, false),
-            OffloadPolicy::Resident
-        );
-
-        // ConvRot NO LONGER defers (sc-12425): `load_residency_heavy_convrot` sources the int8 single
-        // file on the sequential path, so a ConvRot request drops its 15.6 GB f32 TE like every other
-        // Turbo request. It MUST follow the policy — the Turbo descriptor advertises
-        // `supports_sequential_offload`, and a ConvRot generator silently running Resident would make the
-        // fit-gate under-predict its peak (the sc-10840 lockstep violation).
-        assert_eq!(
-            effective_residency_policy(OffloadPolicy::Sequential, true),
-            OffloadPolicy::Sequential
-        );
+        for (descriptor, request) in cases.drain(..) {
+            let generator = sequential_generator(descriptor.clone());
+            let error = generator
+                .generate(&request, &mut |_| {})
+                .expect_err("the fake text loader must fail");
+            assert!(
+                error.to_string().contains("test text loader must not run"),
+                "{} must reach rung-one staging for this request shape, got {error:?}",
+                descriptor.id
+            );
+        }
     }
 
     /// Sequential-residency GPU validation (epic 10765 Phase 1c, sc-12089) — the candle twin of the MLX
     /// krea A/B (sc-11101), mirroring the candle-gen-flux harness (sc-10769).
     ///
-    /// ONE probed generation whose residency mode is chosen by the same two seams `generate` reads:
-    /// `CANDLE_GEN_OFFLOAD=sequential` (the env override) or `KREA_OFFLOAD_MODE=spec-sequential` →
-    /// `LoadSpec::offload_policy` (the worker-facing contract, with `CANDLE_GEN_OFFLOAD` unset). Prints
+    /// ONE probed generation whose residency mode is carried by the request memory contract and
+    /// calibrated with `KREA_OFFLOAD_MODE=request-staged`. Prints
     /// the device peak VRAM and writes the raw RGB pixels to `KREA_OUT`.
     ///
     /// **Run it TWICE in SEPARATE processes** (resident vs sequential) and compare: the pixel files must
@@ -1888,6 +6954,13 @@ mod tests {
         let raw = std::env::var("KREA_SEQ_RAW").is_ok();
         let edit = std::env::var("KREA_SEQ_EDIT").is_ok();
         assert!(!(raw && edit), "set only one of KREA_SEQ_RAW/KREA_SEQ_EDIT");
+        let id = if edit {
+            KREA_2_EDIT_ID
+        } else if raw {
+            KREA_2_RAW_ID
+        } else {
+            KREA_2_TURBO_ID
+        };
         // `krea_2_raw` is a DIFFERENT CHECKPOINT (the undistilled base DiT), not a mode of the Turbo
         // snapshot — so it reads its own dir (the mlx-gen-krea `KREA_RAW_DIR` convention, sc-11101).
         // Sharing `KREA_TURBO_DIR` across both would silently load the DISTILLED DiT and run it under
@@ -1906,8 +6979,8 @@ mod tests {
                 std::env::var("KREA_EDIT_LORA").expect("set KREA_EDIT_LORA for KREA_SEQ_EDIT=1");
             spec = spec.with_adapters(vec![AdapterSpec::new(lora.into(), 1.0, AdapterKind::Lora)]);
         }
-        // sc-12425: `KREA_CONVROT_DIT` measures the community INT8-ConvRot lane by riding the DiT single
-        // file on `text_encoder` (the `convrot_selector` seam). Run resident vs spec-sequential in two
+        // sc-12425: `KREA_CONVROT_DIT` measures the community INT8-ConvRot lane through its named DiT
+        // component. Run resident vs request-staged in two
         // processes: sequential must drop the 15.6 GB f32 Qwen3-VL TE before the int8 DiT loads, taking
         // the ~42.9 GB resident peak (sc-12381) down toward the DiT phase alone.
         if let Ok(convrot) = std::env::var("KREA_CONVROT_DIT") {
@@ -1915,13 +6988,14 @@ mod tests {
                 !raw && !edit,
                 "KREA_CONVROT_DIT is the Turbo-only community checkpoint; unset KREA_SEQ_RAW/EDIT"
             );
-            spec.text_encoder = Some(WeightsSource::File(convrot.into()));
+            spec = spec.with_component(
+                KREA_CONVROT_DIT_COMPONENT,
+                WeightsSource::File(convrot.into()),
+            );
         }
-        let spec_mode = std::env::var("KREA_OFFLOAD_MODE").unwrap_or_default();
+        let stage_residency =
+            std::env::var("KREA_OFFLOAD_MODE").is_ok_and(|mode| mode == "request-staged");
         let memory_mode = std::env::var("KREA_MEMORY_RUNG").unwrap_or_default();
-        if spec_mode == "spec-sequential" || !memory_mode.is_empty() {
-            spec = spec.with_offload_policy(OffloadPolicy::Sequential);
-        }
         // Square edge (default 768, the sc-11101 MLX A/B's resolution so the two backends compare).
         // Set `KREA_AB_RES=1024` to match the condition the manifest's `candle.vramGbByTier` q4 was
         // measured at (RTX PRO 6000, 1024²/8-step) — the activation transient scales with pixel count and
@@ -1954,21 +7028,32 @@ mod tests {
             Vec::new()
         };
         let memory = match memory_mode.as_str() {
+            "" if stage_residency => Some(gen_core::GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            }),
             "" => None,
-            "three-stage" => Some(gen_core::GenerationMemory::default()),
+            "three-stage" => Some(gen_core::GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            }),
             "tiled-vae" => Some(gen_core::GenerationMemory {
+                stage_residency: true,
                 tile_vae_decode: true,
                 ..Default::default()
             }),
             "chunked-attention" => Some(gen_core::GenerationMemory {
+                stage_residency: true,
                 tile_vae_decode: true,
                 chunk_attention: true,
                 ..Default::default()
             }),
             "streamed-blocks" => Some(gen_core::GenerationMemory {
+                stage_residency: true,
                 tile_vae_decode: true,
                 chunk_attention: true,
                 stream_transformer_blocks: true,
+                ..Default::default()
             }),
             other => panic!(
                 "unknown KREA_MEMORY_RUNG={other}; use three-stage/tiled-vae/chunked-attention/streamed-blocks"
@@ -2012,8 +7097,7 @@ mod tests {
                 !raw && !edit && memory.is_some(),
                 "KREA_SWAP_DIR is supported only by the constrained ordinary Turbo probe"
             );
-            let swap_spec = LoadSpec::new(WeightsSource::Dir(swap_dir.into()))
-                .with_offload_policy(OffloadPolicy::Sequential);
+            let swap_spec = LoadSpec::new(WeightsSource::Dir(swap_dir.into()));
             let swap = load(&swap_spec).expect("load KREA_SWAP_DIR");
             let mut swap_req = req.clone();
             swap_req.steps = Some(1);
@@ -2035,6 +7119,10 @@ mod tests {
         // (weights → device) from the denoise/decode activation spike — the epic's open question is which
         // dominates, and a single fused peak can't say (sc-11925 notes the transient was only calibrated
         // at 1024²).
+        assert!(
+            candle_gen::testkit::reset_cuda_mempool_high_water(0),
+            "reset CUDA live-allocation high-water after any swap probe"
+        );
         let load_phase = probe.phase();
         let g = if edit {
             load_edit(&spec).expect("load krea_2_edit")
@@ -2122,32 +7210,123 @@ mod tests {
         }
         let elapsed_s = started.elapsed().as_secs_f64();
         probe.end_gen(gen_phase);
-        let report = probe.report();
+        let report = probe.report().assert_trustworthy(max_baseline_gb);
+        let live_peak_bytes = candle_gen::testkit::cuda_mempool_used_high_bytes(0)
+            .expect("read CUDA live-allocation high-water");
+        assert!(
+            live_peak_bytes > 0,
+            "CUDA live-allocation peak must be positive"
+        );
 
         let img = img.expect("at least one repeated image");
         std::fs::write(&out, &img.pixels).expect("write pixels");
 
-        let env_mode = std::env::var("CANDLE_GEN_OFFLOAD").unwrap_or_default();
-        let mode = if !memory_mode.is_empty() {
-            memory_mode.as_str()
-        } else if spec_mode == "spec-sequential" {
-            "spec-sequential"
-        } else if env_mode.eq_ignore_ascii_case("sequential") {
-            "env-sequential"
-        } else {
-            "resident"
+        let (strategy, parameters) = match memory_mode.as_str() {
+            "three-stage" => (
+                gen_core::MemoryStrategy::StagedResidency,
+                gen_core::MemoryStrategyParameters::default(),
+            ),
+            "" if stage_residency => (
+                gen_core::MemoryStrategy::StagedResidency,
+                gen_core::MemoryStrategyParameters::default(),
+            ),
+            "" => (
+                gen_core::MemoryStrategy::Resident,
+                gen_core::MemoryStrategyParameters::default(),
+            ),
+            "tiled-vae" => (
+                gen_core::MemoryStrategy::BoundedDecode,
+                gen_core::MemoryStrategyParameters {
+                    decode_tile_edge: Some(512),
+                    decode_overlap: Some(128),
+                    ..Default::default()
+                },
+            ),
+            "chunked-attention" => (
+                gen_core::MemoryStrategy::BoundedAttention,
+                gen_core::MemoryStrategyParameters {
+                    decode_tile_edge: Some(512),
+                    decode_overlap: Some(128),
+                    attention_chunk_size: Some(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32),
+                    ..Default::default()
+                },
+            ),
+            "streamed-blocks" => (
+                gen_core::MemoryStrategy::BoundedTransformerResidency,
+                gen_core::MemoryStrategyParameters {
+                    decode_tile_edge: Some(512),
+                    decode_overlap: Some(128),
+                    attention_chunk_size: Some(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32),
+                    transformer_window_size: Some(1),
+                    ..Default::default()
+                },
+            ),
+            other => unreachable!("validated KREA_MEMORY_RUNG {other}"),
         };
-        let id = if edit {
-            KREA_2_EDIT_ID
-        } else if raw {
-            KREA_2_RAW_ID
+        let engaged_composition = if raw || edit {
+            if strategy == gen_core::MemoryStrategy::StagedResidency {
+                vec![
+                    gen_core::MemoryStrategy::Resident,
+                    gen_core::MemoryStrategy::StagedResidency,
+                ]
+            } else {
+                vec![gen_core::MemoryStrategy::Resident]
+            }
         } else {
-            KREA_2_TURBO_ID
+            build_krea_turbo_memory_strategy_contract(&spec).engaged_composition(strategy)
         };
+        let observed_calibration = if raw || edit {
+            gen_core::MemoryCalibrationIdentity::new(
+                RESIDENCY_CALIBRATION_FINGERPRINT,
+                spec.load_shape,
+            )
+        } else {
+            build_krea_turbo_memory_strategy_contract(&spec)
+                .calibration
+                .clone()
+                .expect("Krea Turbo contract must export its calibration identity")
+        };
+        let evidence_load_shape = observed_calibration.load_shape;
         eprintln!(
-            "SEQ_AB id={id} mode={mode} gpu={} {}x{} steps={:?} repeats={repeats} \
-             elapsed_s={elapsed_s:.3} repeat_elapsed_s={repeat_elapsed:?} | {report} | bytes={} \
-             out={out}",
+            "{}",
+            candle_gen::testkit::memory_evidence_v1_line(
+                candle_gen::testkit::MemoryEvidenceProbe {
+                    resolved_route: id,
+                    declared_calibration: candle_gen::testkit::expected_memory_calibration(
+                        evidence_load_shape,
+                    ),
+                    observed_calibration,
+                    tier: gen_core::MemoryNumericTier {
+                        precision: spec.precision,
+                        quant: actual_quant_tier(&spec, id).expect("resolve measured Krea tier"),
+                        component_precision_floors: &[],
+                    },
+                    load_shape: evidence_load_shape,
+                    mode: if edit {
+                        gen_core::MemoryMode::Edit
+                    } else {
+                        gen_core::MemoryMode::TextToImage
+                    },
+                    overlay: edit.then(|| "edit-adapter".to_owned()),
+                    geometry: gen_core::MemoryGeometry {
+                        width: req.width,
+                        height: req.height,
+                        batch: req.count,
+                        frames: 1,
+                        reference_count: u32::from(edit),
+                    },
+                    strategy,
+                    engaged_composition,
+                    parameters,
+                    observed_peak_bytes: live_peak_bytes,
+                    harness_version: "candle-krea-residency-ladder-v1",
+                    output_bytes: &img.pixels,
+                }
+            )
+        );
+        eprintln!(
+            "MEMORY_EVIDENCE_DIAGNOSTIC id={id} gpu={} {}x{} steps={:?} repeats={repeats} \
+             elapsed_s={elapsed_s:.3} repeat_elapsed_s={repeat_elapsed:?} | {report} | bytes={} out={out}",
             candle_gen::testkit::probe_gpu(),
             req.width,
             req.height,
@@ -2159,7 +7338,6 @@ mod tests {
                 "KREA_PHASE rung={memory_mode} repeat={repeat} phase={phase} peak_gb={peak_gb:.3}"
             );
         }
-        report.assert_trustworthy(max_baseline_gb);
     }
 
     /// Test helper: attach a ConvRot DiT single-file selector on `text_encoder` (sc-9300).
@@ -2168,9 +7346,10 @@ mod tests {
     }
     impl WithConvRot for LoadSpec {
         fn with_convrot_text_encoder(mut self) -> Self {
-            self.text_encoder = Some(WeightsSource::File(
-                "/krea2_int8_convrot.safetensors".into(),
-            ));
+            self.components.insert(
+                KREA_CONVROT_DIT_COMPONENT.to_owned(),
+                WeightsSource::File("/krea2_int8_convrot.safetensors".into()),
+            );
             self
         }
     }
@@ -2210,7 +7389,8 @@ mod tests {
     /// of scope). Exercised through the full generator `validate`, so the whole request-gate chain runs.
     #[test]
     fn multiphase_rejected_on_non_raw_variants() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
         let r = phase_req(vec![phase(8, None)]);
         for id in [KREA_2_TURBO_ID, KREA_2_EDIT_ID] {
             // Free-fn gate.
@@ -2328,7 +7508,8 @@ mod tests {
         };
         assert!(validate_phases(KREA_2_RAW_ID, &single).is_ok());
         assert_eq!(single.phases, None);
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
         let g = crate::provider_registry()
             .unwrap()
             .load(KREA_2_RAW_ID, &spec)

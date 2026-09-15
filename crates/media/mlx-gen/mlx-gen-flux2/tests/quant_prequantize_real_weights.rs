@@ -1,7 +1,7 @@
 //! sc-5917: FLUX.2-**dev** pre-quantization (producer + packed consumer) on the real checkpoint.
 //! `#[ignore]`d — needs the real `black-forest-labs/FLUX.2-dev` snapshot (~60 GB DiT + ~45 GB TE):
 //!
-//!   cargo test -p mlx-gen-flux2 --release --test quant_prequantize_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux2 --release --test integration quant_prequantize_real_weights:: -- --ignored --nocapture
 //!
 //! Each test is the offline convert vehicle AND the integration proof: it pre-quantizes one
 //! component to a temp dir (the producer, `convert::quantize_flux2_*`), then loads it back through
@@ -25,8 +25,20 @@ use mlx_gen_flux2::{
 };
 use mlx_rs::{random, Dtype};
 
+use crate::atomic_cache;
+
 const BITS: i32 = 4;
 const GROUP_SIZE: i32 = 64;
+
+/// Root for this suite's **deliberately persistent** artifacts. `MLX_GEN_FLUX2_PREQUANT_DIR` points them
+/// somewhere durable; the `$TMPDIR` default is intentional and must NOT become a `tempfile`
+/// guard — these outputs outlive the test on purpose (a pre-quantized snapshot the NEXT run is meant to reuse), so a guard
+/// would delete the very thing the test exists to produce (sc-17791).
+fn prequant_root() -> PathBuf {
+    std::env::var("MLX_GEN_FLUX2_PREQUANT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir())
+}
 
 fn snapshot() -> PathBuf {
     let p = std::env::var("MLX_GEN_FLUX2_DEV_SNAPSHOT").unwrap_or_else(|_| panic!("set MLX_GEN_FLUX2_DEV_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
@@ -36,7 +48,7 @@ fn snapshot() -> PathBuf {
 /// A stable temp output root for the pre-quantized components, so a second run (e.g. the TE test
 /// after the DiT test) reuses an already-converted component instead of re-packing.
 fn out_root() -> PathBuf {
-    std::env::temp_dir().join(format!("mlx_gen_flux2_dev_prequant_q{BITS}"))
+    prequant_root().join(format!("mlx_gen_flux2_dev_prequant_q{BITS}"))
 }
 
 #[test]
@@ -55,13 +67,11 @@ fn dit_prequantize_loads_packed_and_forwards() {
             "converting dev DiT → Q{BITS} (group {GROUP_SIZE}) at {}",
             dst_transformer.display()
         );
-        quantize_flux2_dit(
-            &snap.join("transformer"),
-            &dst_transformer,
-            BITS,
-            GROUP_SIZE,
-        )
-        .expect("pre-quantize dev DiT");
+        let staging =
+            atomic_cache::prepare_staging(&dst_transformer).expect("prepare dev DiT staging dir");
+        quantize_flux2_dit(&snap.join("transformer"), &staging, BITS, GROUP_SIZE)
+            .expect("pre-quantize dev DiT");
+        atomic_cache::publish(&staging, &dst_transformer).expect("publish dev DiT");
     } else {
         println!("reusing pre-quantized DiT at {}", dst_transformer.display());
     }
@@ -118,8 +128,10 @@ fn te_prequantize_loads_packed_and_encodes() {
             "converting dev Mistral TE → Q{BITS} (group {GROUP_SIZE}) at {}",
             dst_te.display()
         );
-        quantize_flux2_text_encoder_dir(&snap.join("text_encoder"), &dst_te, BITS, GROUP_SIZE)
+        let staging = atomic_cache::prepare_staging(&dst_te).expect("prepare dev TE staging dir");
+        quantize_flux2_text_encoder_dir(&snap.join("text_encoder"), &staging, BITS, GROUP_SIZE)
             .expect("pre-quantize dev TE");
+        atomic_cache::publish(&staging, &dst_te).expect("publish dev TE");
     } else {
         println!("reusing pre-quantized TE at {}", dst_te.display());
     }

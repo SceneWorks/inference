@@ -32,14 +32,8 @@
 
 use candle_core::Tensor;
 
+use candle_gen::diffusion_schedule::{SDXL_BETA_END, SDXL_BETA_START, SDXL_TRAIN_STEPS};
 use candle_gen::{CandleError, Result};
-
-/// SDXL's `scaled_linear` β endpoints + train-step count (the diffusers SDXL scheduler defaults,
-/// also what candle-transformers' `DDIMSchedulerConfig::default()` carries). The σ table is built
-/// from these.
-const SDXL_BETA_START: f64 = 0.00085;
-const SDXL_BETA_END: f64 = 0.012;
-const SDXL_TRAIN_STEPS: usize = 1000;
 
 /// A discrete Euler / Euler-ancestral sampler over a precomputed σ table. SDXL uses the **ancestral**
 /// variant; the plain Euler step is kept for completeness (and matches the mlx `ancestral=false` path).
@@ -54,8 +48,13 @@ impl EulerAncestralSampler {
     /// The production SDXL ancestral sampler (`scaled_linear` β 0.00085→0.012, 1000 train steps).
     pub fn sdxl() -> Self {
         // The table is built from constants that cannot fail; `new` only errors on an empty schedule.
-        Self::new(SDXL_TRAIN_STEPS, SDXL_BETA_START, SDXL_BETA_END, true)
-            .expect("sdxl sampler: nonzero train steps")
+        Self::new(
+            SDXL_TRAIN_STEPS,
+            SDXL_BETA_START.into(),
+            SDXL_BETA_END.into(),
+            true,
+        )
+        .expect("sdxl sampler: nonzero train steps")
     }
 
     /// Build a sampler from the `scaled_linear` β schedule. `ancestral` selects the
@@ -446,7 +445,13 @@ mod tests {
     /// every step (no σ_up term) — pinning the `ancestral=false` branch.
     #[test]
     fn euler_step_matches_reference_and_ignores_noise() {
-        let s = EulerAncestralSampler::new(1000, SDXL_BETA_START, SDXL_BETA_END, false).unwrap();
+        let s = EulerAncestralSampler::new(
+            SDXL_TRAIN_STEPS,
+            SDXL_BETA_START.into(),
+            SDXL_BETA_END.into(),
+            false,
+        )
+        .unwrap();
         assert!(!s.is_ancestral());
         let dev = Device::Cpu;
         let (t, t_prev) = (700.0, 500.0);
@@ -473,10 +478,17 @@ mod tests {
     /// would divide `0 / 0` in the β interp and seed the σ table with a NaN. `2` is the valid floor.
     #[test]
     fn under_two_train_steps_is_rejected() {
-        assert!(EulerAncestralSampler::new(0, SDXL_BETA_START, SDXL_BETA_END, true).is_err());
-        assert!(EulerAncestralSampler::new(1, SDXL_BETA_START, SDXL_BETA_END, true).is_err());
+        assert!(
+            EulerAncestralSampler::new(0, SDXL_BETA_START.into(), SDXL_BETA_END.into(), true,)
+                .is_err()
+        );
+        assert!(
+            EulerAncestralSampler::new(1, SDXL_BETA_START.into(), SDXL_BETA_END.into(), true,)
+                .is_err()
+        );
         // The floor is accepted and yields a finite, monotone σ table (no NaN leak).
-        let s = EulerAncestralSampler::new(2, SDXL_BETA_START, SDXL_BETA_END, true).unwrap();
+        let s = EulerAncestralSampler::new(2, SDXL_BETA_START.into(), SDXL_BETA_END.into(), true)
+            .unwrap();
         assert!(s.sigma_last().is_finite());
     }
 }

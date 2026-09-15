@@ -45,9 +45,6 @@ use mlx_gen::quant::lin;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
-const LN_EPS: f32 = 1e-6;
-const ROPE_THETA: f32 = 10000.0;
-
 /// Qwen3-VL vision-tower config (the `vision_config` block of `mllm/config.json`).
 #[derive(Clone, Debug)]
 pub struct VisionConfig {
@@ -56,6 +53,8 @@ pub struct VisionConfig {
     pub intermediate_size: i32,
     pub depth: i32,
     pub out_hidden_size: i32,
+    pub norm_eps: f32,
+    pub rope_theta: f32,
     pub patch_size: i32,
     pub temporal_patch_size: i32,
     pub spatial_merge_size: i32,
@@ -73,6 +72,8 @@ impl VisionConfig {
             intermediate_size: 4304,
             depth: 27,
             out_hidden_size: 4096,
+            norm_eps: 1e-6,
+            rope_theta: 10_000.0,
             patch_size: 16,
             temporal_patch_size: 2,
             spatial_merge_size: 2,
@@ -98,8 +99,8 @@ impl VisionConfig {
 }
 
 /// LayerNorm in the model dtype (matches the reference's bf16 `nn.LayerNorm`).
-fn ln(x: &Array, w: &Array, b: &Array) -> Result<Array> {
-    Ok(layer_norm(x, Some(w), Some(b), LN_EPS)?)
+fn ln(x: &Array, w: &Array, b: &Array, eps: f32) -> Result<Array> {
+    Ok(layer_norm(x, Some(w), Some(b), eps)?)
 }
 
 /// HF half-split rotary `rotate_half`: `cat(-x[d/2:], x[:d/2])` on the last axis.
@@ -187,10 +188,22 @@ impl Block {
         self.fc2.forward(&gelu_tanh(&self.fc1.forward(x)?)?)
     }
 
-    fn forward(&self, x: &Array, cos: &Array, sin: &Array, nh: i32) -> Result<Array> {
-        let a = self.attention(&ln(x, &self.norm1_w, &self.norm1_b)?, cos, sin, nh)?;
+    fn forward(
+        &self,
+        x: &Array,
+        cos: &Array,
+        sin: &Array,
+        nh: i32,
+        norm_eps: f32,
+    ) -> Result<Array> {
+        let a = self.attention(
+            &ln(x, &self.norm1_w, &self.norm1_b, norm_eps)?,
+            cos,
+            sin,
+            nh,
+        )?;
         let x = add(x, &a)?;
-        let m = self.mlp(&ln(&x, &self.norm2_w, &self.norm2_b)?)?;
+        let m = self.mlp(&ln(&x, &self.norm2_w, &self.norm2_b, norm_eps)?)?;
         Ok(add(&x, &m)?)
     }
 }
@@ -231,14 +244,14 @@ impl Merger {
     }
 
     /// `x` `[seq, hidden]` → `[merged, out_hidden]` (`merged = seq / merge²`).
-    fn forward(&self, x: &Array, merged: i32) -> Result<Array> {
+    fn forward(&self, x: &Array, merged: i32, norm_eps: f32) -> Result<Array> {
         let x = if self.postshuffle {
             // group merge-units first, then norm over hidden·merge².
             let g = x.reshape(&[merged, self.merged_dim])?;
-            ln(&g, &self.norm_w, &self.norm_b)?
+            ln(&g, &self.norm_w, &self.norm_b, norm_eps)?
         } else {
             // norm over hidden per-patch, then group merge-units.
-            let n = ln(x, &self.norm_w, &self.norm_b)?;
+            let n = ln(x, &self.norm_w, &self.norm_b, norm_eps)?;
             n.reshape(&[merged, self.merged_dim])?
         };
         self.fc2.forward(&gelu_exact(&self.fc1.forward(&x)?)?)
@@ -361,7 +374,7 @@ impl VisionTower {
         let nfreq = rd / 2; // inv_freq length (= head_dim/4)
         let side = c.num_grid_per_side();
         let inv: Vec<f32> = (0..nfreq)
-            .map(|j| ROPE_THETA.powf(-((2 * j) as f32) / rd as f32))
+            .map(|j| c.rope_theta.powf(-((2 * j) as f32) / rd as f32))
             .collect();
 
         let mut seq = 0i32;
@@ -499,17 +512,17 @@ impl VisionTower {
 
         let mut deepstack = Vec::with_capacity(c.deepstack_visual_indexes.len());
         for (i, blk) in self.blocks.iter().enumerate() {
-            h = blk.forward(&h, &plan.cos, &plan.sin, nh)?;
+            h = blk.forward(&h, &plan.cos, &plan.sin, nh, c.norm_eps)?;
             if let Some(di) = c
                 .deepstack_visual_indexes
                 .iter()
                 .position(|&x| x == i as i32)
             {
-                deepstack.push(self.deepstack_mergers[di].forward(&h, merged)?);
+                deepstack.push(self.deepstack_mergers[di].forward(&h, merged, c.norm_eps)?);
             }
         }
 
-        let embeds = self.merger.forward(&h, merged)?;
+        let embeds = self.merger.forward(&h, merged, c.norm_eps)?;
         Ok((embeds, deepstack, h))
     }
 }

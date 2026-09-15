@@ -4,8 +4,24 @@
 pub use candle_audio_catalog::audio;
 #[cfg(feature = "media")]
 pub use candle_gen_catalog::media;
+#[cfg(feature = "media")]
+pub use candle_gen_catalog::vae_tiling;
 pub use candle_llm as llm;
-pub use runtime_catalog::{core_llm, gen_core, RuntimeCatalog, RuntimeCatalogSnapshot};
+pub use runtime_catalog::{
+    core_llm, gen_core, memory_strategy, RuntimeCatalog, RuntimeCatalogSnapshot,
+    VideoDecodeMemoryProfile,
+};
+
+#[cfg(feature = "media")]
+/// Resolve a provider-owned conservative VAE decode profile for contract-safe memory composition.
+pub fn conservative_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<VideoDecodeMemoryProfile> {
+    candle_gen_catalog::conservative_video_decode_memory_profile(provider_id, width, height, frames)
+}
 
 /// The Candle backend crates this platform owns, re-exported from the media catalog
 /// (available under the default `media` feature).
@@ -13,6 +29,11 @@ pub use runtime_catalog::{core_llm, gen_core, RuntimeCatalog, RuntimeCatalogSnap
 pub mod providers {
     pub use candle_gen_catalog::providers::*;
 }
+
+/// Descriptor-less provider memory routes that the CUDA bundle intentionally reconciles outside
+/// the ordinary generator registry.
+#[cfg(feature = "media")]
+pub use candle_gen_catalog::{BespokeMemoryRouteWaiver, BESPOKE_MEMORY_ROUTE_WAIVERS};
 
 /// The advanced quant tiers this CUDA runtime surfaces beyond affine `Q4`/`Q8` — the NVFP4 FP4
 /// tensor-core tier (epic 11037, sc-11042 Option A) on consumer Blackwell `sm_120`. Re-exported from
@@ -49,6 +70,19 @@ fn media_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
     }
 }
 
+/// Complete weights-free memory-contract surface for capability generation and reconciliation.
+pub fn memory_contract_surface_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
+    #[cfg(feature = "media")]
+    {
+        candle_gen_catalog::memory_contract_surface_registry()
+    }
+
+    #[cfg(not(feature = "media"))]
+    {
+        gen_core::ProviderRegistryBuilder::new().build()
+    }
+}
+
 /// The bundle's explicit audio lane (sc-12835): the complete Candle audio catalog from the audio
 /// composition root, plus the lane's snapshot preparer carried **in the lane** so audio model
 /// snapshots are prepared through the same registry shape on every platform. Since sc-12836 the
@@ -72,7 +106,7 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
             PLATFORM,
             BACKEND,
             media_registry(),
-            candle_llm::text_registry(),
+            candle_llm::cuda_text_registry(),
             candle_llm::snapshot_preparer_registry(),
             audio_lane(),
         )
@@ -85,7 +119,7 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
             PLATFORM,
             BACKEND,
             media_registry(),
-            candle_llm::text_registry(),
+            candle_llm::cuda_text_registry(),
             candle_llm::snapshot_preparer_registry(),
         )
     }
@@ -93,6 +127,61 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
 
 #[cfg(test)]
 mod tests {
+    /// AC (sc-22661 / epic SC-22657 E1+E2): every generator registered in the CUDA bundle publishes
+    /// a contract surface whose byte decomposition is honest and whose architecture axes are not
+    /// fabricated.
+    ///
+    /// This is the epic's registry-wide acceptance skeleton on the shipped CUDA registry. Surfaces
+    /// are built weights-free — the registry names the sentinel snapshot
+    /// `/__sceneworks_memory_contract_surface__`, which is not on disk — so every provider here
+    /// lands on the walk's Candle arm, where `MemoryArchitectureFacts::default()` is the required
+    /// state and an axis declared with no component config to read was inferred from the provider
+    /// id.
+    ///
+    /// The walk's **materialized** arm is deliberately not driven here: it needs a per-provider
+    /// snapshot fixture, `candle-gen-catalog` owns those and runs that half over the same
+    /// composition on a lane that needs no accelerator. This bundle's job is to prove the *shipped
+    /// CUDA* set is composed and honest, not to rebuild fixtures.
+    #[cfg(feature = "media")]
+    #[test]
+    fn every_registered_contract_surface_publishes_honest_facts() {
+        let registry = super::memory_contract_surface_registry()
+            .expect("the CUDA bundle composes a contract-surface registry");
+        let coverage =
+            gen_core_testkit::memory_contract_surface_registry_facts_conformance(&registry, None);
+        assert!(
+            coverage.surfaces_checked > 0,
+            "the CUDA bundle must publish contract surfaces for the facts walk to check"
+        );
+    }
+
+    #[cfg(feature = "media")]
+    #[test]
+    fn bundle_exposes_engine_id_vae_geometry() {
+        let tiling: super::gen_core::tiling::VaeTiling =
+            super::vae_tiling("bernini").expect("modelled video id");
+        assert_eq!(tiling.full_res_channels, 96);
+        assert!(tiling.causal_temporal);
+        assert_eq!(
+            super::conservative_video_decode_memory_profile("bernini", 64, 64, 9).map(|profile| (
+                profile.working_set_bytes(),
+                profile.resident_decoder_bytes_included(),
+            )),
+            Some((265_830_400, 0))
+        );
+
+        let svd = super::vae_tiling("svd_xt").expect("SVD decode geometry");
+        assert_eq!(svd, super::providers::svd::ProviderVae::VAE_TILING);
+        assert_eq!(svd.full_res_channels, 256);
+        assert_eq!(svd.writable_frame_cap(576, 1024), 14);
+        assert_eq!(svd.writable_frame_cap(1024, 576), 14);
+        assert_eq!(
+            super::conservative_video_decode_memory_profile("svd_xt", 1024, 576, 25),
+            None,
+            "the exact tiling geometry must not imply a budget-independent SVD peak profile"
+        );
+    }
+
     #[test]
     fn smoke_catalog_is_explicit_and_machine_readable() {
         let snapshot = super::catalog().unwrap().snapshot();
@@ -102,7 +191,15 @@ mod tests {
         assert!(snapshot.generator_ids.len() > 40);
         #[cfg(not(feature = "media"))]
         assert!(snapshot.generator_ids.is_empty());
-        assert_eq!(snapshot.text_llm_ids, ["candle-llama", "candle-llava"]);
+        assert_eq!(
+            snapshot.text_llm_ids,
+            [
+                "candle-llama",
+                "candle-llava",
+                "candle-starvector-1b",
+                "candle-starvector-8b",
+            ]
+        );
         assert_eq!(snapshot.snapshot_preparer_backends, ["candle"]);
         // The audio lane is Candle-native (sc-12901) and matches this bundle's own backend. Its
         // ordered id surface is the audio catalog's — shipped generators kokoro_82m (sc-12836),
@@ -174,6 +271,9 @@ mod tests {
 
         fn dummy_audio_descriptor() -> gen_core::ModelDescriptor {
             gen_core::ModelDescriptor {
+                encoder_contract: None,
+                denoiser_output_latent_space: None,
+                control_kinds: None,
                 required_components: &[],
                 id: "dummy-audio",
                 family: "test-audio",
@@ -208,7 +308,7 @@ mod tests {
             super::PLATFORM,
             super::BACKEND,
             super::media_registry(),
-            super::llm::text_registry(),
+            super::llm::cuda_text_registry(),
             super::llm::snapshot_preparer_registry(),
             runtime_catalog::AudioLane {
                 backend: super::AUDIO_BACKEND,
@@ -257,5 +357,49 @@ mod tests {
     fn cuda_bundle_surfaces_nvfp4_tier() {
         use super::gen_core::Quant;
         assert_eq!(super::nvfp4_quant_tiers(), &[Quant::Nvfp4]);
+    }
+
+    #[cfg(feature = "media")]
+    #[test]
+    fn cuda_bundle_reexports_the_exact_bespoke_memory_route_waiver() {
+        // Shape, not population. This used to destructure `[waiver]` and pin `pulid_flux`/`pulid`,
+        // so a second legitimate bespoke route went RED with nothing actually broken — and, because
+        // the table reaches this bundle through a plain `pub use`, re-checking those ids proved only
+        // what the compiler already had. The load-bearing claim is that each waived route really is
+        // absent from *this* bundle's composed registry: that absence is what the waiver documents,
+        // and it is what a bundle that quietly grew a registration would break.
+        let waivers: &[super::BespokeMemoryRouteWaiver] = super::BESPOKE_MEMORY_ROUTE_WAIVERS;
+        assert!(
+            !waivers.is_empty(),
+            "the CUDA bundle exposes descriptor-less memory routes; an empty waiver table would \
+             make every check below vacuous"
+        );
+        let registry = super::media_registry().expect("CUDA media registry");
+        assert!(
+            registry.generators().next().is_some(),
+            "an empty registry would make every absence check below vacuously true"
+        );
+        for waiver in waivers {
+            assert_eq!(
+                waiver.owner,
+                format!("candle-gen-{}", waiver.crate_name),
+                "a waiver's owner must be the crate that owns the route"
+            );
+            assert!(
+                registry.generators().all(|registration| {
+                    let id = (registration.descriptor)().id;
+                    id != waiver.provider_id && id != waiver.crate_name
+                }),
+                "waived route {:?} has a generator registration in the CUDA bundle after all",
+                waiver.provider_id
+            );
+            assert!(
+                registry
+                    .memory_strategy_registrations()
+                    .all(|registration| registration.provider_id != waiver.provider_id),
+                "waived route {:?} has a memory-strategy registration in the CUDA bundle after all",
+                waiver.provider_id
+            );
+        }
     }
 }

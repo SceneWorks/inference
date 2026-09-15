@@ -85,6 +85,7 @@ fn main() -> Result<()> {
                 PathBuf::from(&dit),
                 PathBuf::from(&snapshot),
                 vae.map(PathBuf::from),
+                Vec::new(),
             )?
         }
         None => {

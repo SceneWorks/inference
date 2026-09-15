@@ -2,7 +2,7 @@
 //!
 //! `#[ignore]`d — needs the real `Tongyi-MAI/Z-Image-Turbo` weights in the HF cache and the golden
 //! produced by `tools/dump_z_image_img2img_golden.py` (gitignored, local). Run with:
-//!   cargo test -p mlx-gen-z-image --release --test img2img_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-z-image --release --test integration img2img_real_weights:: -- --ignored --nocapture
 //!
 //! Stage gates isolate each new piece — the flow-match schedule, the LANCZOS preprocess, the VAE
 //! **encoder**, and the noise blend — then the final gate drives the **public**
@@ -25,7 +25,7 @@ const GOLDEN: &str = concat!(
     "/../tools/golden/z_image_img2img_golden.safetensors"
 );
 
-mod common;
+use crate::common;
 use common::snapshot;
 
 /// `(peak-relative, mean-relative)` error vs the golden tensor `b`.

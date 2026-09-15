@@ -40,10 +40,12 @@
 //! (`sdxl_conformance` / `realvisxl_conformance` on the CUDA lane). See `pipeline` for the layout
 //! finding and the one accepted sampler difference (DDIM vs euler_ancestral, sc-3673).
 
+mod control_provider;
+mod memory_strategy;
 mod pipeline;
 // The PiD backbone (latent-space) tag (epic 7840 / sc-8373), re-exported so `candle-gen-instantid`
 // loads the same `sdxl` student through its own `with_pid` (it composes the SDXL VAE).
-pub use pipeline::PID_BACKBONE;
+pub use pipeline::{SdxlLatentDecoder, PID_BACKBONE};
 
 // The vendored, packed-detecting SDXL CLIP text-encoder tower (sc-9527, sc-9089j follow-up to the
 // sc-9416 UNet packed-load): its Linear surface (attn q/k/v/out_proj, MLP fc1/fc2, bigG
@@ -86,15 +88,26 @@ pub mod weights;
 pub mod sampler;
 pub use sampler::EulerAncestralSampler;
 
+// The 4-channel SDXL/Kolors per-step latent preview seam (epic 16948, sc-16954) — the reused epic
+// 16624 RGB fit plus the VE→fit-domain renormalization the ε/DDPM cohort needs. `candle-gen-kolors`
+// projects through this module rather than restating the coefficients.
+pub mod preview;
+
 // InstantID denoise loop + the SDXL conditioning/prior/control/decode helpers (sc-5491) — the candle
 // twin of `mlx-gen-sdxl::pipeline`'s `denoise_ip_control` family, composing the IP-Adapter UNet, the
 // IdentityNet ControlNet, and the euler-ancestral sampler. Driven by the `candle-gen-instantid` glue.
 pub mod denoise;
 pub use denoise::{
-    decode_image, denoise_curated, denoise_ip_control, denoise_ip_multi_control,
-    preprocess_control_image, seeded_prior, seeded_sigma_prior, text_time_ids, ControlContext,
-    Denoiser,
+    decode_image, decode_image_with_tiling, denoise_curated, denoise_ip_control,
+    denoise_ip_multi_control, preprocess_control_image, seeded_prior, seeded_sigma_prior,
+    text_time_ids, ControlContext, Denoiser,
 };
+
+// Long-prompt chunk-and-concatenate for the CLIP encoders (sc-20528) — the A1111/compel "long prompt
+// weighting" shape that lets every CLIP-conditioned SDXL family accept a prompt past CLIP's
+// architectural 77-token window instead of hard-erroring. Shared by the txt2img `pipeline`, the
+// InstantID `conditioning` conditioner, and the `training` caption encoder so the three cannot drift.
+mod long_prompt;
 
 // SDXL dual-CLIP conditioning (sc-5491) — penultimate hidden (cross-attn) + pooled text-embeds
 // (add_embedding), the micro-conditioning the txt2img `pipeline` skips but `forward_instantid` needs.
@@ -108,17 +121,24 @@ pub mod ldm;
 pub mod loaders;
 pub use loaders::{
     load_instantid_unet, load_instantid_unet_with_adapters, load_sdxl_controlnet, load_sdxl_vae,
+    load_sdxl_vae_encoder, load_vendored_unet_with_adapters,
 };
 
-// The SDXL VAE type the loader returns, re-exported so the `candle-gen-instantid` glue can hold one as
-// a field + pass it to `decode_image` without depending on candle-transformers directly.
-pub use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
+// The SDXL VAE decode path (sc-19753). Ported natively rather than reusing candle-transformers'
+// `AutoEncoderKL`, whose decoder internals are private and therefore cannot host the layer-wise,
+// normalization-correct bounded decode. Re-exported so the `candle-gen-instantid` glue can hold one
+// as a field + pass it to `decode_image` without depending on candle-transformers directly.
+pub mod vae_decoder;
+pub use vae_decoder::SdxlVaeDecoder;
 
 // The vendored UNet itself, re-exported so the `candle-gen-instantid` glue can hold one + drive its
 // InstantID surface (install_ip_adapter / set_ip_context / forward_instantid via the denoise loop).
 // `sdxl_unet_config` + `UNet2DConditionModelConfig`/`BlockConfig` are re-exported too so the Kolors
 // IP-Adapter provider (sc-5488) can build the same vendored stack from the SDXL-family Kolors UNet.
-pub use unet::{sdxl_unet_config, BlockConfig, UNet2DConditionModel, UNet2DConditionModelConfig};
+pub use unet::{
+    sdxl_unet_config, BlockConfig, UNet2DConditionModel, UNet2DConditionModelConfig,
+    VaeMomentsEncoder,
+};
 
 // SDXL IP-Adapter-Plus reference-image provider (sc-5488, epic 5480) — the [`ip_adapter`] +
 // [`denoise`] stack composed without a face embedder / ControlNet: CLIP ViT-H image tokens → pure-IP
@@ -141,6 +161,11 @@ pub mod edit_provider;
 pub use edit_provider::{
     SdxlEdit, SdxlEditPaths, SdxlEditRequest, DEFAULT_EDIT_STRENGTH, DEFAULT_INPAINT_STRENGTH,
 };
+
+// SDXL-family tile-ControlNet img2img provider for the image-detail utility (sc-18480). Kept as an
+// explicit route instead of widening the generic `sdxl` descriptor to arbitrary ControlNet shapes.
+pub mod detail_provider;
+pub use detail_provider::{SdxlDetail, SdxlDetailPaths, SdxlDetailRequest};
 
 /// SDXL edit (img2img / inpaint / outpaint) real-weight GPU validation (sc-6037) — env-driven,
 /// `#[ignore]`d integration test (the analog of the IP-Adapter Phase-5 harness).
@@ -174,12 +199,26 @@ use candle_gen::gen_core::{
     Modality, ModelDescriptor, PidWeights, Progress, Quant, WeightsSource,
 };
 
+use control_provider::SdxlControlGenerator;
 use pipeline::{Components, Pipeline, SdxlComponents};
 
 /// Registry id — matches the SceneWorks worker's `payload.model` (`MODEL_TABLE["sdxl"]`). The
 /// worker maps both `sdxl` and `realvisxl` onto engine id `"sdxl"`, so — exactly like
 /// `mlx-gen-sdxl` — this crate registers a SINGLE descriptor under `"sdxl"`.
 pub const MODEL_ID: &str = "sdxl";
+
+pub use memory_strategy::{
+    provider_contract_for_spec,
+    resolved_numeric_tier,
+    // Exported so the sibling providers that load *this* crate's vendored SDXL UNet + VAE
+    // (candle-gen-instantid, sc-5491) publish the identical architecture axes at their own pinned
+    // activation width rather than duplicating the geometry constants.
+    sdxl_unet_family_architecture_facts,
+    SdxlArtifactSeal,
+    SdxlSurface,
+    REQUEST_EVIDENCE_REVISION,
+    SDXL_ROUTES,
+};
 
 /// SDXL works in latent space at /8: both dims must be multiples of 8. Exposed as the pinned-engine
 /// stride SceneWorks ties each advertised SDXL image bucket to (sc-12612), mirroring
@@ -263,6 +302,17 @@ pub struct SdxlGenerator {
     /// behind an `Arc` (model-agnostic); `lock_recover` mirrors the components-cache poison recovery.
     tokenizers: Mutex<Option<Arc<pipeline::SdxlTokenizers>>>,
     ldm: Option<Arc<ldm::LdmComponents>>,
+    /// Exact source token retained for the lifetime of an imported fused checkpoint. The checkpoint
+    /// is split eagerly, but retaining the token keeps deferred component/adaptor materialization
+    /// tied to the same caller-prepared identity.
+    _ldm_source_pin: Option<gen_core::PinnedWeightsFile>,
+    /// Complete prepared-file set, reused when the lazy UNet/VAE + adapter component cache fills.
+    file_pin_spec: LoadSpec,
+    /// Real load-time affine fold for an imported fused checkpoint. Snapshot directories select
+    /// their packed tier on disk and leave this unset.
+    quant: Option<Quant>,
+    memory_contract: Option<gen_core::MemoryProviderContract>,
+    artifact_seal: Option<SdxlArtifactSeal>,
 }
 
 impl SdxlGenerator {
@@ -285,7 +335,9 @@ impl SdxlGenerator {
                 return Ok(comps.clone());
             }
         }
-        let comps = pipe.load_components(flash)?;
+        let comps = self
+            .file_pin_spec
+            .read_prepared_files_unchanged(|| pipe.load_components(flash))?;
         *guard = Some((flash, comps.clone()));
         Ok(comps)
     }
@@ -295,11 +347,13 @@ impl SdxlGenerator {
     /// them once here removes the tens-of-ms `tokenizer.json` re-parse the per-encode load did. The
     /// shared [`candle_gen::cached`] read-through recovers a poisoned lock internally (the F-031 idiom).
     fn tokenizers(&self) -> gen_core::Result<Arc<pipeline::SdxlTokenizers>> {
-        candle_gen::cached(&self.tokenizers, || {
-            Ok(Arc::new(pipeline::SdxlTokenizers::load(
-                &self.component_paths.tokenizer_clip_l,
-                &self.component_paths.tokenizer_clip_bigg,
-            )?))
+        self.file_pin_spec.read_prepared_files_unchanged(|| {
+            candle_gen::cached(&self.tokenizers, || {
+                Ok(Arc::new(pipeline::SdxlTokenizers::load(
+                    &self.component_paths.tokenizer_clip_l,
+                    &self.component_paths.tokenizer_clip_bigg,
+                )?))
+            })
         })
     }
 }
@@ -307,6 +361,47 @@ impl SdxlGenerator {
 impl Generator for SdxlGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_contract.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let Some(contract) = self.memory_contract.as_ref() else {
+            return gen_core::default_memory_strategy_safety_check(
+                &gen_core::MemoryProviderContract::compatibility_default(
+                    MODEL_ID,
+                    memory_strategy::backend(),
+                ),
+                context,
+            );
+        };
+        memory_strategy::safety_check(contract, context, self.artifact_seal.as_ref())
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let Some(contract) = self.memory_contract.as_ref() else {
+            return Ok(None);
+        };
+        let seal = self.artifact_seal.as_ref().ok_or_else(|| {
+            gen_core::Error::Unsupported(
+                "sdxl: authoritative memory contract has no artifact seal".into(),
+            )
+        })?;
+        seal.ensure_unchanged()?;
+        memory_strategy::validate_context(contract, context, seal)?;
+        Ok(Some(Box::new(memory_strategy::request_scope(
+            self.device.clone(),
+            contract,
+            context,
+        )?)))
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -362,6 +457,11 @@ impl Generator for SdxlGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        if let Some(seal) = &self.artifact_seal {
+            seal.ensure_unchanged()?;
+        }
+        let staged = req.memory.is_some_and(|memory| memory.stage_residency);
+        let _staged_guard = staged.then(|| StagedCacheGuard::new(&self.components));
         // The rich-`CandleError` tail — including the typed `Canceled` — bridges into
         // `gen_core::Error` via `?` (the From bridge). The light `Pipeline` handle carries this
         // request's latent dims; the heavy UNet/VAE come from the cache.
@@ -375,37 +475,118 @@ impl Generator for SdxlGenerator {
             self.pid_spec.clone(),
             self.component_paths.vae_fp16_fix.clone(),
             self.ldm.clone(),
+            self.quant,
         )?;
         // Encode text FIRST (loads + frees CLIP) so the cold-call ordering — CLIP gone before the
         // UNet/VAE are resident — is preserved (sc-4987); only then acquire the cached UNet/VAE
         // (sc-5037). On a warm call the UNet/VAE are already resident, but CLIP loads one encoder at a
         // time, so the footprint stays under the denoise-time peak.
         let negative = req.negative_prompt.as_deref().unwrap_or("");
+        if let Some(seal) = &self.artifact_seal {
+            seal.ensure_unchanged()?;
+        }
         let tokenizers = self.tokenizers()?;
         let text_embeddings = pipe.text_embeddings(&tokenizers, &req.prompt, negative)?;
+        if let Some(seal) = &self.artifact_seal {
+            seal.ensure_unchanged()?;
+        }
         let components = self.components(&pipe)?;
-        let images = pipe.render(
-            req,
-            &text_embeddings,
-            &components.unet,
-            &components.vae,
-            components.pid.as_deref(),
-            on_progress,
-        )?;
+        let images = with_request_attention_budget(req, || {
+            pipe.render(
+                req,
+                &text_embeddings,
+                &components.unet,
+                &components.vae,
+                components.pid.as_deref(),
+                on_progress,
+            )
+        })?;
         Ok(GenerationOutput::Images(images))
     }
+}
+
+struct StagedCacheGuard<'a> {
+    components: &'a Mutex<Option<(bool, Components)>>,
+}
+
+impl<'a> StagedCacheGuard<'a> {
+    fn new(components: &'a Mutex<Option<(bool, Components)>>) -> Self {
+        candle_gen::lock_recover(components).take();
+        Self { components }
+    }
+}
+
+impl Drop for StagedCacheGuard<'_> {
+    fn drop(&mut self) {
+        candle_gen::lock_recover(self.components).take();
+    }
+}
+
+thread_local! {
+    static REQUEST_ATTENTION_BUDGET: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(candle_gen::ATTN_SCORES_BUDGET) };
+}
+
+pub(crate) fn request_attention_budget() -> usize {
+    REQUEST_ATTENTION_BUDGET.get()
+}
+
+fn with_request_attention_budget<T>(request: &GenerationRequest, f: impl FnOnce() -> T) -> T {
+    with_attention_memory(request.memory, f)
+}
+
+pub(crate) fn with_attention_memory<T>(
+    memory: Option<gen_core::GenerationMemory>,
+    f: impl FnOnce() -> T,
+) -> T {
+    let _guard = enter_attention_memory(memory);
+    f()
+}
+
+pub(crate) struct AttentionMemoryGuard(usize);
+
+impl Drop for AttentionMemoryGuard {
+    fn drop(&mut self) {
+        REQUEST_ATTENTION_BUDGET.set(self.0);
+    }
+}
+
+pub(crate) fn enter_attention_memory(
+    memory: Option<gen_core::GenerationMemory>,
+) -> AttentionMemoryGuard {
+    let previous = REQUEST_ATTENTION_BUDGET.get();
+    let selected = memory
+        .filter(|memory| memory.chunk_attention)
+        .and_then(|memory| memory.attention_chunk_size)
+        .map(|budget| budget as usize)
+        .unwrap_or(candle_gen::ATTN_SCORES_BUDGET);
+    REQUEST_ATTENTION_BUDGET.set(selected);
+    AttentionMemoryGuard(previous)
 }
 
 /// SDXL's identity + the surface candle wires: real classifier-free guidance (negative prompt + CFG
 /// scale), txt2img, `ddim`, the few-step **`lightning`** sampler (sc-6128 — Euler-trailing, CFG-off,
 /// for distilled Lightning checkpoints), and **LoRA/LoKr** (sc-5165 — load-time merge of a trained
-/// adapter into the UNet weights, see [`load`] + `pipeline`). No conditioning is advertised, and the
-/// other acceleration samplers (lcm/hyper) remain the Python fallback's job (sc-3678) until candle
-/// wires them — so the descriptor never promises a path `generate` can't serve (the false-capability
-/// trap). Two backend-correct deviations from `mlx-gen-sdxl`: `backend = "candle"` and
+/// adapter into the UNet weights, see [`load`] + `pipeline`). The registry declares the optional
+/// ControlNet overlay so callers can stage it; a base load without [`LoadSpec::control`] keeps a
+/// narrower descriptor. Other acceleration samplers (lcm/hyper) remain the Python fallback's job
+/// (sc-3678). Two backend-correct deviations from `mlx-gen-sdxl`: `backend = "candle"` and
 /// `mac_only = false`.
 pub fn descriptor() -> ModelDescriptor {
+    let mut descriptor = plain_descriptor();
+    descriptor.control_kinds = Some(gen_core::AcceptedControlKinds::Any);
+    descriptor.capabilities.conditioning = vec![gen_core::ConditioningKind::Control];
+    descriptor
+}
+
+/// The narrower descriptor installed on an ordinary base load without a ControlNet checkpoint.
+/// Keeping it separate prevents a request from being admitted and then rendered without its control
+/// residuals.
+fn plain_descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::SDXL_LATENT_SPACE),
+        control_kinds: None,
         // epic 13657 (sc-13663): SDXL requires three caller-staged components — the two model-agnostic
         // CLIP tokenizers + the fp16-fix VAE — that used to be self-fetched from pinned upstream repos
         // on the render path. Advertised so SceneWorks stages them, and `load` fails fast if it doesn't.
@@ -417,12 +598,27 @@ pub fn descriptor() -> ModelDescriptor {
         modality: Modality::Image,
         capabilities: Capabilities {
             // SDXL uses real classifier-free guidance: honors the negative prompt + a CFG scale.
+            //
+            // sc-14195 — the `guidance ≤ 1.0` contract, stated once here because it governs BOTH of
+            // these flags. `guidance > 1.0` engages CFG; anything at or below 1.0 is **accepted and
+            // runs the CFG-off single-branch path** (one conditioned forward per step) rather than
+            // being rejected. That is diffusers' own rule (`do_classifier_free_guidance =
+            // guidance_scale > 1`), and at exactly 1.0 it is provably the same result — the combine
+            // `uncond + 1.0·(cond − uncond)` reduces to `cond` — for half the compute. Sub-1.0 and
+            // non-positive values fold into the same branch rather than interpolating toward the
+            // uncond prediction; they are not rejected, since the request is still satisfiable.
+            //
+            // Consequence, deliberate: with CFG off there is no uncond branch, so a supplied
+            // `negative_prompt` has nothing to act on and is dropped. This matches diffusers and the
+            // `lightning` lane (also CFG-free, also drops it). It is NOT the F-004 "reject a
+            // silently-dropped axis" shape — that rule fires when a request names an axis the engine
+            // cannot honor at all (e.g. `lightning` + a curated scheduler); here the user chose the
+            // guidance value that switches the negative off, so honoring it literally IS the drop.
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
-            // txt2img only in sc-3675 — img2img/inpaint/control land later; advertising none means
-            // the shared `validate_request` rejects any conditioning, and the worker keeps those
-            // shapes on the Python path (sc-3678).
+            // The base load is txt2img only. The registry-level descriptor widens this to Control
+            // when the caller stages `LoadSpec::control`; an unloaded base must reject every
+            // conditioning shape rather than silently drop one.
             conditioning: vec![],
             // sc-5165: a trained LoRA/LoKr adapter is merged into the UNet weights at load (`load` +
             // `pipeline::Pipeline::load_components`). Advertised so the worker routes adapter jobs here
@@ -446,32 +642,21 @@ pub fn descriptor() -> ModelDescriptor {
                 candle_gen::curated_scheduler_names(),
                 &["discrete"],
             ),
-            supported_guidance_methods: vec![],
             min_size: 512,
             max_size: 2048,
             max_count: 8,
-            // candle is the Windows/CUDA backend — NOT Mac-only (the MLX provider sets this true).
-            mac_only: false,
             // Packed q4/q8 MLX-tier inference (sc-9416 UNet + sc-9527 dual-CLIP + sc-9528 adapter fold)
             // is wired end-to-end, so advertise Q4/Q8 (sc-10767, epic 9083 full-catalog parity). The
             // tier is packed-detected from disk (`detect_packed_unet` / `detect_packed_clip`); the
             // LoadSpec `quant` overlay is an advisory no-op on an already-packed tier (as with
             // boogu/flux2-dev). bf16 tiers stay dense (Quant::None), verbatim.
             supported_quants: &[Quant::Q4, Quant::Q8],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            // Per-step latent previews (epic 16948, sc-16954): every shipped SDXL render lane
+            // emits -- the curated driver lane and the bespoke Lightning loop on this registered
+            // route, plus the name-driven edit / IP-Adapter providers. `crate::preview` reuses the
+            // epic-16624 four-channel fit; the trainer's sample render stays deliberately dark.
+            supports_preview: true,
+            ..Default::default()
         },
     }
 }
@@ -486,17 +671,64 @@ pub fn descriptor() -> ModelDescriptor {
 /// PEFT/kohya LoKr are supported; an adapter that matches no UNet target errors at that first
 /// `generate` rather than rendering an unadapted image silently.
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    spec.validate_prepared_file_pins()?;
     // Validate the model-agnostic staged components before opening a potentially multi-gigabyte
     // fused checkpoint.
     let component_paths = SdxlComponents::from_spec(spec, MODEL_ID)?;
-    let (root, ldm) = match &spec.weights {
-        WeightsSource::Dir(p) => (p.clone(), None),
-        WeightsSource::File(file) => (
-            file.parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf(),
-            Some(Arc::new(ldm::split_ldm_checkpoint(file)?)),
-        ),
+    let authoritative_seal = if spec.resolved_route.is_some() {
+        Some(SdxlArtifactSeal::capture(spec)?)
+    } else {
+        None
+    };
+    // A ControlNet changes the graph: route it through the vendored SDXL stack that carries the
+    // add-embedding and residual-injection seams.  Do not let the historical txt2img pipeline
+    // accept an overlay it would never read.
+    if spec.control.is_some() {
+        return Ok(Box::new(SdxlControlGenerator::new(
+            spec,
+            component_paths,
+            candle_gen::default_device()?,
+            authoritative_seal,
+        )?));
+    }
+    if !spec.extra_controls.is_empty() {
+        return Err(gen_core::Error::Unsupported(
+            "sdxl: extra ControlNet checkpoints require LoadSpec::control as the first branch"
+                .into(),
+        ));
+    }
+    if spec.ip_adapter.is_some() {
+        return Err(gen_core::Error::Unsupported(
+            "sdxl: generic SDXL does not accept an IP-Adapter overlay; use its dedicated provider"
+                .into(),
+        ));
+    }
+    if matches!(spec.weights, WeightsSource::File(_)) && matches!(spec.quantize, Some(Quant::Nvfp4))
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{MODEL_ID}: imported fused checkpoints support Q4/Q8 affine tiers, not NVFP4"
+        )));
+    }
+    let (memory_contract, artifact_seal) = if let Some(seal) = authoritative_seal {
+        (Some(seal.contract().clone()), Some(seal))
+    } else {
+        (None, None)
+    };
+    let (root, ldm, ldm_source_pin) = match &spec.weights {
+        WeightsSource::Dir(p) => (p.clone(), None, None),
+        WeightsSource::File(file) => {
+            let pin = spec
+                .weights_file_pin()?
+                .expect("File weights must resolve to a pin");
+            let components = pin.read_unchanged(ldm::split_ldm_checkpoint)?;
+            (
+                file.parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf(),
+                Some(Arc::new(components)),
+                Some(pin),
+            )
+        }
     };
     // epic 13657 (sc-13663) load gate: resolve + validate the three passed-in components
     // (`tokenizer_clip_l` / `tokenizer_clip_bigg` / `vae_fp16_fix`) before any work — a missing one is
@@ -506,7 +738,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     // is the backend selected at compile time (CUDA on Windows, Metal/CPU on Mac).
     let device = candle_gen::default_device()?;
     Ok(Box::new(SdxlGenerator {
-        descriptor: descriptor(),
+        descriptor: plain_descriptor(),
         root,
         device,
         dtype: DType::F16,
@@ -518,7 +750,12 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         pid_spec: spec.pid.clone(),
         components: Mutex::new(None),
         tokenizers: Mutex::new(None),
+        quant: ldm.as_ref().and(spec.quantize),
         ldm,
+        _ldm_source_pin: ldm_source_pin,
+        file_pin_spec: spec.clone(),
+        memory_contract,
+        artifact_seal,
     }))
 }
 
@@ -532,9 +769,91 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
-        .register_generator(REGISTRATION)
+    let registry = registry.register_generator(REGISTRATION);
+    register_memory_contract_surfaces(registry)
+        .register_checkpoint_adapter(gen_core::CheckpointAdapterRegistration {
+            backend_bindings: &[
+                gen_core::CheckpointBackendBindingRegistration {
+                    backend: gen_core::CheckpointBackend::Candle,
+                    source: gen_core::ImportedModelSource::FusedCheckpoint,
+                    operation: gen_core::ImportedModelOperation::Generate,
+                    provider_id: MODEL_ID,
+                    required_components: Some(pipeline::LDM_REQUIRED_COMPONENTS),
+                    inherit_adapters: true,
+                },
+                // **No `ImportedModelOperation::Edit` binding on Candle** (sc-20651 review, item 8).
+                //
+                // One was carried across from `main` when this epic replaced
+                // `register_imported_model` with the checkpoint adapter, on the reasoning that a
+                // capability `main` had added should not be silently dropped by the port. That
+                // reasoning was wrong about what `main` had added: the binding named
+                // `provider_id: MODEL_ID`, and `MODEL_ID`'s registered generator is
+                // [`SdxlGenerator`], whose descriptor advertises `conditioning: [Control]` on the
+                // registry route and `[]` on a plain load. `Capabilities::validate_request` rejects
+                // every conditioning kind a descriptor does not list, so an Edit import resolving
+                // through that binding got a generator that refuses `Conditioning::Reference` —
+                // i.e. the operation was **declared and unreachable**, which is worse than absent:
+                // SceneWorks stages components and routes a request that can only end in a refusal.
+                //
+                // It is not a wiring oversight; the fused route cannot reach the edit stack as
+                // either side is currently shaped. Naming the exact blockers, since "it's hard" is
+                // not evidence:
+                //
+                //  1. `registry.rs`'s builder requires a binding's `provider_id` to name a
+                //     **registered `Generator`**. `edit_provider::SdxlEdit` does not implement
+                //     `gen_core::Generator` at all — it has a bespoke `generate(&SdxlEditRequest,
+                //     &Image, ..)` / `generate_masked(.., &Image, &Image, ..)` surface that takes
+                //     the source image as a positional argument, not as request conditioning.
+                //  2. `SdxlEdit::load` takes `SdxlEditPaths { sdxl_base: PathBuf, .. }` and hands
+                //     it to `SdxlConditioner::load(root: &Path, ..)`, which reads the diffusers
+                //     `text_encoder/` + `text_encoder_2/` subtrees (`load_clip_tower_with_vb`, for
+                //     the bigG `text_projection` head) and to
+                //     `loaders::load_instantid_unet_with_adapters(root, ..)`, which reads `unet/`.
+                //     Both are directory-shaped. There is no `LdmComponents`-fed constructor for
+                //     either: `ldm::split_ldm_checkpoint` has exactly one caller, `load` below,
+                //     which threads its tensor maps into `pipeline::Pipeline` — a type `SdxlEdit`
+                //     does not use and cannot borrow a VAE **encoder** from (`Pipeline` builds only
+                //     `SdxlVaeDecoder` on the fused path; `VaeMomentsEncoder` has no fused caller).
+                //  3. `SdxlEditPaths.vae_fp16_fix` is required, but this route's
+                //     `LDM_REQUIRED_COMPONENTS` is `[tokenizer_clip_l, tokenizer_clip_bigg]` —
+                //     deliberately no VAE, because a fused checkpoint carries its own. Nothing on
+                //     the fused route can supply that field.
+                //  4. `memory_strategy::validate_bespoke_spec_common` (via
+                //     `SdxlEdit::load_admitted`) hard-requires
+                //     `matches!(spec.weights, WeightsSource::Dir(p) if p == base)` and refuses a
+                //     `WeightsSource::File` outright.
+                //
+                // Dropping the binding is structurally permitted: `SDXL_CHECKPOINT_ADAPTER`'s
+                // `eligible_backends` is `[Mlx, Candle]`, so the builder's per-operation
+                // completeness check (which fires only for a *sole* eligible backend) does not
+                // require Candle to implement every operation — the same way Candle Krea
+                // truthfully omits the MLX-only Pose route. MLX keeps its Edit binding, and its
+                // descriptor really does declare `Reference`/`Mask` and really does consume them.
+                //
+                // `SdxlEdit` itself is untouched and still reachable as the name-driven worker
+                // provider it has always been (a diffusers **snapshot dir** + a staged fp16-fix
+                // VAE). What is gone is only the claim that a *fused single-file import* can edit.
+                // Making that claim true is a feature, not a review fix: it needs
+                // `LdmComponents`-fed CLIP/UNet/VAE-encoder constructors plus an edit-capable
+                // registered generator id, mirroring `candle-gen-krea`'s `krea_2_edit`.
+            ],
+            ..gen_core::SDXL_CHECKPOINT_ADAPTER
+        })
         .register_trainer(training::TRAINER_REGISTRATION)
+}
+
+/// Register SDXL's exhaustive weights-free q4/q8/bf16 contract and behavior surface.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(memory_strategy::memory_registration())
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: memory_strategy::surface_specs,
+            provider_id: MODEL_ID,
+            contract: memory_strategy::weights_free_contract,
+        })
+        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
 }
 
 /// Build the complete explicit Candle SDXL provider catalog.
@@ -544,6 +863,8 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
 
 #[cfg(test)]
 mod explicit_registry_tests {
+    use super::{gen_core, pipeline};
+
     #[test]
     fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
@@ -558,6 +879,72 @@ mod explicit_registry_tests {
 
         assert_eq!(explicit_generators, ["sdxl"]);
         assert_eq!(explicit_trainers, ["sdxl"]);
+        let imported = registry
+            .imported_model_descriptor(
+                "sdxl",
+                gen_core::ImportedModelSource::FusedCheckpoint,
+                gen_core::ImportedModelOperation::Generate,
+            )
+            .expect("fused SDXL route");
+        assert_eq!(
+            imported.required_components,
+            pipeline::LDM_REQUIRED_COMPONENTS
+        );
+    }
+
+    /// sc-20651 review (8). **Every checkpoint-import operation this crate binds must resolve to a
+    /// descriptor that can actually accept the conditioning that operation is made of.**
+    ///
+    /// This is deliberately not `assert_eq!(operations, [Generate])` — that would only pin today's
+    /// list and would go green again the moment someone re-adds an `Edit` binding pointing at a
+    /// txt2img generator, which is exactly the defect. Instead it asks the question the registry
+    /// consumer asks: resolve the binding the way SceneWorks does
+    /// (`imported_model_descriptor(family, source, operation)`), then check the resolved descriptor
+    /// against `Capabilities::accepts` for the kind that operation *requires*. An `Edit` route whose
+    /// descriptor cannot take a `Reference` is a route that can only ever refuse.
+    ///
+    /// `Generate` requires no conditioning, so it is checked for resolvability only.
+    #[test]
+    fn every_bound_import_operation_resolves_to_a_descriptor_that_accepts_its_conditioning() {
+        use gen_core::{ConditioningKind, ImportedModelOperation};
+
+        let registry = super::provider_registry().unwrap();
+        // The operation → conditioning kind an import of that operation cannot work without.
+        let required_kind = |operation: ImportedModelOperation| match operation {
+            ImportedModelOperation::Generate => None,
+            _ => Some(ConditioningKind::Reference),
+        };
+
+        let mut checked = 0;
+        for operation in [
+            ImportedModelOperation::Generate,
+            ImportedModelOperation::Edit,
+        ] {
+            let Some(descriptor) = registry.imported_model_descriptor(
+                "sdxl",
+                gen_core::ImportedModelSource::FusedCheckpoint,
+                operation,
+            ) else {
+                // Not bound at all is fine and honest — the adapter's `eligible_backends` is
+                // `[Mlx, Candle]`, so Candle is not obliged to implement every operation.
+                continue;
+            };
+            checked += 1;
+            if let Some(kind) = required_kind(operation) {
+                assert!(
+                    descriptor.capabilities.accepts(kind),
+                    "fused-checkpoint {operation:?} binds provider '{}', whose descriptor does not \
+                     accept {kind:?} — the operation is declared but every request through it is \
+                     refused by the capability floor",
+                    descriptor.id
+                );
+            }
+        }
+        // A guard that resolved nothing asks no question.
+        assert!(
+            checked > 0,
+            "no fused-checkpoint route resolved; this crate must bind at least Generate"
+        );
     }
 }
 
@@ -607,10 +994,10 @@ mod tests {
         assert!(d.capabilities.supports_guidance);
         assert!(!d.capabilities.supports_true_cfg);
         assert!(!d.capabilities.mac_only);
-        // txt2img: no conditioning advertised. sc-5165: LoRA/LoKr ARE now wired (load-time merge), so
-        // they are advertised — the worker routes adapter jobs to candle. sc-6128: the few-step
-        // `lightning` accel sampler is wired too (the lcm/hyper accel samplers still are not).
-        assert!(d.capabilities.conditioning.is_empty());
+        // The registry declares ControlNet so orchestration stages the overlay. A bare base load has
+        // a narrower dynamic descriptor and rejects it; that is asserted below.
+        assert_eq!(d.capabilities.conditioning, vec![ConditioningKind::Control]);
+        assert_eq!(d.control_kinds, Some(gen_core::AcceptedControlKinds::Any));
         assert!(d.capabilities.supports_lora);
         assert!(d.capabilities.supports_lokr);
         // sc-10767 (epic 9083): the packed q4/q8 MLX-tier inference path (sc-9416/9527/9528) is now
@@ -719,7 +1106,8 @@ mod tests {
         };
         assert!(g.validate(&ok).is_ok());
 
-        // Empty prompt, non-multiple-of-8 size, explicit 0 steps, and any conditioning are rejected.
+        // Empty prompt, non-multiple-of-8 size, explicit 0 steps, and any conditioning are rejected
+        // by this base (no-overlay) load.
         for bad in [
             GenerationRequest::default(), // empty prompt
             GenerationRequest {
@@ -740,13 +1128,24 @@ mod tests {
                 }],
                 ..Default::default()
             },
+            GenerationRequest {
+                prompt: "x".into(),
+                conditioning: vec![Conditioning::Control {
+                    image: Image::default(),
+                    kind: gen_core::ControlKind::Pose,
+                    scale: None,
+                }],
+                ..Default::default()
+            },
         ] {
             assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");
         }
-        // Sanity: the rejected conditioning above is a kind the descriptor does not advertise.
-        assert!(!descriptor()
+        // The registry advertises ControlNet, but this *base load* deliberately does not: the
+        // capability and the loaded graph stay aligned, so an overlay can never be dropped.
+        assert!(!g
+            .descriptor()
             .capabilities
-            .accepts(ConditioningKind::Reference));
+            .accepts(ConditioningKind::Control));
 
         // sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised SDXL bucket
         // to. Pin the value and mutation-check that a size which is a multiple of 4 but not
@@ -868,12 +1267,71 @@ mod tests {
         assert!(g.descriptor().capabilities.supports_lokr);
     }
 
+    /// sc-14195, the **request** half of the seam: `validate` must ACCEPT `guidance = 1.0` (and the
+    /// rest of the CFG-off range) rather than reject it with a 4xx. The story allowed either
+    /// outcome — accept-and-run-CFG-off or reject — and this pins which one shipped, so a later
+    /// "just validate it away" change has to break a test that says so out loud.
+    ///
+    /// The engine half (that accepting it actually renders, on the cond row) is
+    /// `pipeline::tests::render_at_guidance_one_runs_cfg_off_without_batch_mismatch`; together they
+    /// span request → engine. GPU-free (lazy generator, no weights touched).
+    #[test]
+    fn validate_accepts_cfg_off_guidance() {
+        let spec = sdxl_spec(WeightsSource::Dir("/nonexistent".into()));
+        let g = crate::provider_registry()
+            .unwrap()
+            .load("sdxl", &spec)
+            .unwrap();
+
+        // The story's exact value, plus the rest of the range that resolves to the same CFG-off
+        // branch (`use_guide = guidance > 1.0`). None of these is an error.
+        for guidance in [1.0f32, 0.5, 0.0, -1.0] {
+            let req = GenerationRequest {
+                prompt: "a rusty robot holding a lit candle".into(),
+                guidance: Some(guidance),
+                ..Default::default()
+            };
+            assert!(
+                g.validate(&req).is_ok(),
+                "guidance {guidance} must be accepted and run CFG-off, not rejected"
+            );
+        }
+
+        // A negative prompt alongside CFG-off is accepted too (it is dropped, by the contract
+        // documented on `Capabilities` above — not a rejection, and not a hard error).
+        assert!(g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                negative_prompt: Some("blurry".into()),
+                guidance: Some(1.0),
+                ..Default::default()
+            })
+            .is_ok());
+
+        // Mutation guard: a NON-finite guidance is still rejected (the F-053 check), so this test
+        // cannot pass by `validate` having become a blanket accept-everything.
+        assert!(g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                guidance: Some(f32::NAN),
+                ..Default::default()
+            })
+            .is_err());
+    }
+
     #[test]
     fn load_reports_missing_single_file_source() {
         let spec = sdxl_spec(WeightsSource::File("/tmp/sdxl.safetensors".into()));
         let err = load(&spec).err().expect("expected an error").to_string();
+        // The message is the OS's, so it is platform-specific: POSIX says "No such file or
+        // directory", Windows says "The system cannot find the file specified. (os error 2)".
+        // Accept either phrasing — what is under test is that the missing file is *reported*, not
+        // how libc spells it. (Drive-by: the POSIX-only assertion made this test fail on every
+        // Windows run of `cargo test -p candle-gen-sdxl`.)
         assert!(
-            err.contains("No such file") || err.contains("not found"),
+            err.contains("No such file")
+                || err.contains("not found")
+                || err.contains("cannot find the file"),
             "got: {err}"
         );
     }

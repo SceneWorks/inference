@@ -7,6 +7,7 @@ use mlx_rs::ops::{add, multiply, split};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::attention::AttentionPlan;
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -123,6 +124,33 @@ impl LensTransformerBlock {
         txt_sin: &Array,
         mask: Option<&Array>,
     ) -> Result<(Array, Array)> {
+        self.forward_with_attention(
+            hidden_states,
+            encoder_hidden_states,
+            temb,
+            img_cos,
+            img_sin,
+            txt_cos,
+            txt_sin,
+            mask,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    /// Inference forward using the shared query-budget plan.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_attention(
+        &self,
+        hidden_states: &Array,
+        encoder_hidden_states: &Array,
+        temb: &Array,
+        img_cos: &Array,
+        img_sin: &Array,
+        txt_cos: &Array,
+        txt_sin: &Array,
+        mask: Option<&Array>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<(Array, Array)> {
         // SiLU'd timestep → per-stream 6·dim modulation, split into mod1 (around attn) / mod2 (MLP).
         let act = silu(temb)?;
         let img_mod = split(&self.img_mod.forward(&act)?, 2, 1)?; // [mod1, mod2], each [B, 3·dim]
@@ -137,7 +165,7 @@ impl LensTransformerBlock {
             &txt_mod[0],
         )?;
 
-        let (img_attn, txt_attn) = self.attn.forward(
+        let (img_attn, txt_attn) = self.attn.forward_with_attention(
             &img_modulated,
             &txt_modulated,
             img_cos,
@@ -145,6 +173,7 @@ impl LensTransformerBlock {
             txt_cos,
             txt_sin,
             mask,
+            attention,
         )?;
 
         let hidden_states = add(hidden_states, &multiply(&img_gate1, &img_attn)?)?;

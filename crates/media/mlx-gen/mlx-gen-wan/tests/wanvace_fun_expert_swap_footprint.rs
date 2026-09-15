@@ -1,6 +1,6 @@
 //! Real-weight Mac acceptance gate for SC-12794. Run with:
-//! `WANVACE_FUN_DIR=<assembled snapshot> cargo test -p mlx-gen-wan --test
-//! wanvace_fun_expert_swap_footprint -- --ignored --nocapture`.
+//! `WANVACE_FUN_DIR=<assembled snapshot> cargo test -p mlx-gen-wan --test integration --
+//! wanvace_fun_expert_swap_footprint:: --ignored --nocapture`.
 
 use std::path::PathBuf;
 

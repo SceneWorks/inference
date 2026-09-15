@@ -1,6 +1,6 @@
 //! sc-2348 slice 4: Qwen-Image T2I end-to-end parity vs the frozen fork.
 //!
-//! `#[ignore]`d — needs the real `Qwen/Qwen-Image` snapshot (env `QWEN_IMAGE_SNAPSHOT`, else the
+//! `#[ignore]`d — needs the real `Qwen/Qwen-Image` snapshot (env `MLX_GEN_QWEN_SNAPSHOT`, else the
 //! HF cache) and the local golden from `tools/dump_qwen_image_golden.py` (gitignored). The golden
 //! fixes seed 42, 512×512, 4 steps, guidance 4.0, prompt "a fox sitting in a forest,
 //! photorealistic", empty negative.
@@ -15,7 +15,7 @@
 //!    2 through the slice-4 loader).
 //!
 //! Run (loads the ~40 GB transformer; the text-encoder check adds ~14 GB):
-//!   cargo test -p mlx-gen-qwen-image --release --test e2e_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-qwen-image --release --test integration e2e_real_weights:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 
@@ -46,7 +46,7 @@ const Q4_GOLDEN: &str = concat!(
 );
 
 fn snapshot() -> PathBuf {
-    let p = std::env::var("QWEN_IMAGE_SNAPSHOT").unwrap_or_else(|_| panic!("set QWEN_IMAGE_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    let p = std::env::var("MLX_GEN_QWEN_SNAPSHOT").unwrap_or_else(|_| panic!("set MLX_GEN_QWEN_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
     PathBuf::from(p)
 }
 
@@ -107,6 +107,7 @@ fn transformer_pipeline_vae_matches_fork() {
         HEIGHT,
         0, // txt2img: denoise every step
         &CancelFlag::default(),
+        &mlx_gen::PreviewSink::default(),
         &mut |_| {},
     )
     .unwrap();
@@ -186,6 +187,7 @@ fn q_pipeline_matches_fork(golden_path: &str, bits: i32, max_latent_mean: f32, m
         HEIGHT,
         0, // txt2img: denoise every step
         &CancelFlag::default(),
+        &mlx_gen::PreviewSink::default(),
         &mut |_| {},
     )
     .unwrap();

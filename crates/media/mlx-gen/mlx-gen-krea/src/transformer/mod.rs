@@ -34,6 +34,7 @@ use crate::config::Krea2Config;
 use crate::quant::lin;
 use block::{RmsScale, SingleStreamBlock, TextFusionTransformer};
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, Adapter};
+use mlx_gen::attention::AttentionPlan;
 use mlx_gen::train::lora::LoraParams;
 use rope::RopeTables;
 
@@ -59,14 +60,52 @@ pub struct Krea2Transformer {
     txt_in_l2: AdaptableLinear,
     text_fusion: TextFusionTransformer,
     blocks: Vec<SingleStreamBlock>,
+    /// Re-openable description of `transformer_blocks`, present only for deferred snapshot loads.
+    block_stream: Option<crate::block_stream::KreaBlockStream>,
     final_norm: RmsScale,
     final_linear: AdaptableLinear,
     final_sstable: Array, // [1, 2, hidden]
 }
 
+fn resident_block_slots(cfg: &Krea2Config, resident_blocks: bool) -> usize {
+    if resident_blocks {
+        cfg.num_layers
+    } else {
+        0
+    }
+}
+
+fn clone_for_multiphase_with<T: Clone>(
+    source: &T,
+    clear: impl FnOnce(&mut T),
+    apply: impl FnOnce(&mut T) -> Result<()>,
+) -> Result<T> {
+    let mut phase = source.clone();
+    clear(&mut phase);
+    apply(&mut phase)?;
+    Ok(phase)
+}
+
 impl Krea2Transformer {
     /// Build from a loaded `transformer/` weight set (already validated by [`crate::convert`]).
     pub fn from_weights(w: &Weights, cfg: &Krea2Config) -> Result<Self> {
+        Self::from_weights_with_block_residency(w, cfg, true)
+    }
+
+    /// Build only the tensors that remain resident around a deferred transformer-block stream.
+    ///
+    /// The 28 uniform `transformer_blocks` are deliberately not assembled here. Their source arrays
+    /// therefore never enter the resident object (and are not part of the constructor's pin-bound
+    /// `materialize_accessed` set); each denoise window reopens and consumes only its exact blocks.
+    pub(crate) fn from_weights_deferred(w: &Weights, cfg: &Krea2Config) -> Result<Self> {
+        Self::from_weights_with_block_residency(w, cfg, false)
+    }
+
+    fn from_weights_with_block_residency(
+        w: &Weights,
+        cfg: &Krea2Config,
+        resident_blocks: bool,
+    ) -> Result<Self> {
         let (heads, kv, hd, eps) = (
             cfg.num_attention_heads as i32,
             cfg.num_kv_heads as i32,
@@ -106,7 +145,7 @@ impl Krea2Transformer {
                 hd,
                 eps,
             )?,
-            blocks: (0..cfg.num_layers)
+            blocks: (0..resident_block_slots(cfg, resident_blocks))
                 .map(|i| {
                     SingleStreamBlock::from_weights(
                         w,
@@ -119,10 +158,158 @@ impl Krea2Transformer {
                     )
                 })
                 .collect::<Result<_>>()?,
+            block_stream: None,
             final_norm: RmsScale::from_weights(w, "final_layer.norm.weight", eps)?,
             final_linear: lin(w, "final_layer.linear", true)?,
             final_sstable,
         })
+    }
+
+    /// Arm bounded transformer residency for a re-openable transformer snapshot.
+    pub(crate) fn with_block_stream(mut self, source: mlx_gen::WeightsSource) -> Self {
+        self.block_stream = Some(crate::block_stream::KreaBlockStream::new(
+            source,
+            self.cfg.clone(),
+        ));
+        self
+    }
+
+    /// Arm bounded residency from a native/ComfyUI single-file DiT. The pinned source is reopened
+    /// and native-key-normalized for every block window; the extension-bearing loader path is kept
+    /// verbatim rather than canonicalized to an extensionless cache blob.
+    pub(crate) fn with_native_block_stream(mut self, source: mlx_gen::PinnedWeightsFile) -> Self {
+        self.block_stream = Some(crate::block_stream::KreaBlockStream::new_native(
+            source,
+            self.cfg.clone(),
+        ));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_block_stream(
+        mut self,
+        materializations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.block_stream = Some(crate::block_stream::KreaBlockStream::for_test(
+            self.cfg.clone(),
+            self.blocks.clone(),
+            materializations,
+        ));
+        self
+    }
+
+    pub(crate) fn block_window<'a>(
+        &self,
+        window_size: Option<usize>,
+        cancel: &'a mlx_gen::CancelFlag,
+    ) -> Result<Option<crate::block_stream::BlockWindow<'a>>> {
+        let size = match window_size {
+            Some(size) => size,
+            // A genuinely deferred transformer has no resident block fallback. Even when an older
+            // caller omitted the request-level rung-4 flag, keep execution correct and physically
+            // bounded by using the family-calibrated window rather than traversing an empty stack.
+            None if self.blocks.is_empty() && self.block_stream.is_some() => {
+                crate::block_memory_strategy::TRANSFORMER_WINDOW_SIZE as usize
+            }
+            None => return Ok(None),
+        };
+        if self.block_stream.is_none() {
+            return Err(mlx_gen::Error::Unsupported(
+                "krea: bounded transformer residency needs a deferred, re-openable snapshot load"
+                    .to_owned(),
+            ));
+        }
+        Ok(Some(crate::block_stream::BlockWindow {
+            plan: mlx_gen::block_residency::BlockPlan::new(self.cfg.num_layers, size)?,
+            cancel,
+        }))
+    }
+
+    /// Re-snapshot the forward-time adapter stacks after a load or a job-local multi-phase reapply.
+    pub(crate) fn capture_block_adapters(&mut self) {
+        if !self.blocks.is_empty() {
+            if let Some(stream) = self.block_stream.as_mut() {
+                stream.capture_adapters(&mut self.blocks);
+            }
+        }
+    }
+
+    /// Apply load-time adapters while preserving a genuinely deferred block stack.
+    ///
+    /// A resident transformer routes directly through its real blocks. A deferred transformer opens
+    /// a lazy, non-evaluated adapter proxy surface, runs the same strict loader, snapshots only the
+    /// resulting residual stacks into [`KreaBlockStream`], and immediately drops every proxy base.
+    pub(crate) fn apply_adapters_strict(
+        &mut self,
+        specs: &[mlx_gen::AdapterSpec],
+        with_diff_patch: bool,
+    ) -> Result<()> {
+        let deferred = self.blocks.is_empty() && self.block_stream.is_some();
+        if deferred {
+            self.blocks = self
+                .block_stream
+                .as_ref()
+                .expect("checked above")
+                .adapter_proxy_blocks()?;
+        }
+
+        let result = if with_diff_patch {
+            mlx_gen::adapters::loader::apply_adapters_strict_with_diff_patch(self, specs, "krea_2")
+                .map(|_| ())
+        } else {
+            mlx_gen::adapters::loader::apply_adapters_strict(self, specs, "krea_2").map(|_| ())
+        }
+        .and_then(|()| self.materialize_adapter_payloads());
+
+        if result.is_ok() {
+            self.capture_block_adapters();
+        }
+        if deferred {
+            // Proxy blocks contain only lazy base handles plus adapter stacks. The stream now owns
+            // the latter; retaining the former would recreate whole-stack residency by accident.
+            self.blocks.clear();
+        }
+        result
+    }
+
+    /// Build the job-local DiT clone used by one multi-phase slice, with exactly that slice's
+    /// low-rank adapter subset. Deferred clones keep no resident block proxies after replay.
+    pub(crate) fn clone_for_multiphase(&self, specs: &[mlx_gen::AdapterSpec]) -> Result<Self> {
+        clone_for_multiphase_with(self, Krea2Transformer::clear_adapters, |dit| {
+            if !specs.is_empty() {
+                dit.apply_adapters_strict(specs, false)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn materialize_adapter_payloads(&mut self) -> Result<()> {
+        for linear in [
+            &self.img_in,
+            &self.time_embed_l1,
+            &self.time_embed_l2,
+            &self.time_mod_proj,
+            &self.txt_in_l1,
+            &self.txt_in_l2,
+            &self.final_linear,
+        ] {
+            linear.materialize_adapters()?;
+        }
+        self.text_fusion.materialize_adapters()?;
+        for block in &mut self.blocks {
+            block.materialize_adapters()?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resident_block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    fn disarm_block_stream(&mut self) {
+        self.block_stream = None;
     }
 
     /// Velocity prediction.
@@ -286,6 +473,21 @@ impl Krea2Transformer {
         timestep: &Array,
         prep: &EditPrep,
     ) -> Result<Array> {
+        self.forward_prepared_edit_windowed_budgeted(
+            noise_latent,
+            timestep,
+            prep,
+            None,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    fn edit_joint_inputs(
+        &self,
+        noise_latent: &Array,
+        timestep: &Array,
+        prep: &EditPrep,
+    ) -> Result<(Array, Array, Array)> {
         let cfg = &self.cfg;
         let dt = self.dtype;
 
@@ -310,18 +512,7 @@ impl Krea2Transformer {
             parts.push(rt);
         }
         parts.push(&img);
-        let mut combined = concatenate_axis(&parts, 1)?;
-
-        for blk in &self.blocks {
-            combined = blk.forward(&combined, &tvec, &prep.rcos, &prep.rsin)?;
-        }
-
-        // Final layer, then slice the noise tokens — the contiguous tail after text + references.
-        let out = self.final_layer(&combined, &t)?; // [b, cap+refs+img_len, in_channels]
-        let img_len = prep.ht * prep.wt;
-        let head = prep.cap_len + prep.n_refs * img_len;
-        let img_out = split_axis1(&out, head)?.swap_remove(1); // [b, img_len, in_channels]
-        unpatchify(&img_out, prep.ht, prep.wt, prep.p, prep.latent_ch)
+        Ok((concatenate_axis(&parts, 1)?, t, tvec))
     }
 
     /// Velocity prediction from a precomputed [`JointPrep`] — runs the per-step compute only: image
@@ -334,11 +525,384 @@ impl Krea2Transformer {
         prep: &JointPrep,
     ) -> Result<Array> {
         let j = self.joint_inputs(latent, timestep, prep)?;
-        let mut combined = j.combined.clone();
-        for blk in &self.blocks {
-            combined = blk.forward(&combined, &j.tvec, &j.rcos, &j.rsin)?;
-        }
+        let combined = self.run_blocks(
+            j.combined.clone(),
+            &j.tvec,
+            &j.rcos,
+            &j.rsin,
+            None,
+            AttentionPlan::UNBOUNDED,
+        )?;
         self.finalize(&combined, &j.t, &j)
+    }
+
+    /// Prepared text-to-image/img2img forward with an optional shared block-residency window.
+    #[cfg(test)]
+    pub(crate) fn forward_prepared_windowed(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        prep: &JointPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<Array> {
+        self.forward_prepared_windowed_budgeted(
+            latent,
+            timestep,
+            prep,
+            window,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    pub(crate) fn forward_prepared_windowed_budgeted(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        prep: &JointPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Array> {
+        let j = self.joint_inputs(latent, timestep, prep)?;
+        let combined = self.run_blocks(
+            j.combined.clone(),
+            &j.tvec,
+            &j.rcos,
+            &j.rsin,
+            window,
+            attention,
+        )?;
+        self.finalize(&combined, &j.t, &j)
+    }
+
+    /// Run conditional and unconditional prepared states through one block traversal. Under bounded
+    /// residency each block is reconstructed once, then applied to both independent carries before
+    /// both are evaluated and the window is released.
+    #[cfg(test)]
+    pub(crate) fn forward_prepared_pair_windowed(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        positive: &JointPrep,
+        negative: &JointPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<(Array, Array)> {
+        self.forward_prepared_pair_windowed_budgeted(
+            latent,
+            timestep,
+            positive,
+            negative,
+            window,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    pub(crate) fn forward_prepared_pair_windowed_budgeted(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        positive: &JointPrep,
+        negative: &JointPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<(Array, Array)> {
+        let positive = self.joint_inputs(latent, timestep, positive)?;
+        let negative = self.joint_inputs(latent, timestep, negative)?;
+        let (positive_combined, negative_combined) = self.run_blocks_paired(
+            (positive.combined.clone(), negative.combined.clone()),
+            (&positive.tvec, &positive.rcos, &positive.rsin),
+            (&negative.tvec, &negative.rcos, &negative.rsin),
+            window,
+            attention,
+        )?;
+        Ok((
+            self.finalize(&positive_combined, &positive.t, &positive)?,
+            self.finalize(&negative_combined, &negative.t, &negative)?,
+        ))
+    }
+
+    /// Prepared edit forward with the same windowing semantics as the ordinary prepared forward.
+    #[cfg(test)]
+    pub(crate) fn forward_prepared_edit_windowed(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        prep: &EditPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<Array> {
+        self.forward_prepared_edit_windowed_budgeted(
+            latent,
+            timestep,
+            prep,
+            window,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    pub(crate) fn forward_prepared_edit_windowed_budgeted(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        prep: &EditPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Array> {
+        let (mut combined, t, tvec) = self.edit_joint_inputs(latent, timestep, prep)?;
+        combined = self.run_blocks(combined, &tvec, &prep.rcos, &prep.rsin, window, attention)?;
+        let out = self.final_layer(&combined, &t)?;
+        let img_len = prep.ht * prep.wt;
+        let head = prep.cap_len + prep.n_refs * img_len;
+        let img_out = split_axis1(&out, head)?.swap_remove(1);
+        unpatchify(&img_out, prep.ht, prep.wt, prep.p, prep.latent_ch)
+    }
+
+    /// Paired conditional/unconditional edit forward with one block-window traversal.
+    #[cfg(test)]
+    pub(crate) fn forward_prepared_edit_pair_windowed(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        positive: &EditPrep,
+        negative: &EditPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<(Array, Array)> {
+        self.forward_prepared_edit_pair_windowed_budgeted(
+            latent,
+            timestep,
+            positive,
+            negative,
+            window,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    pub(crate) fn forward_prepared_edit_pair_windowed_budgeted(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        positive: &EditPrep,
+        negative: &EditPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<(Array, Array)> {
+        let (positive_combined, positive_t, positive_tvec) =
+            self.edit_joint_inputs(latent, timestep, positive)?;
+        let (negative_combined, negative_t, negative_tvec) =
+            self.edit_joint_inputs(latent, timestep, negative)?;
+        let (positive_combined, negative_combined) = self.run_blocks_paired(
+            (positive_combined, negative_combined),
+            (&positive_tvec, &positive.rcos, &positive.rsin),
+            (&negative_tvec, &negative.rcos, &negative.rsin),
+            window,
+            attention,
+        )?;
+        let finish = |combined: &Array, t: &Array, prep: &EditPrep| -> Result<Array> {
+            let out = self.final_layer(combined, t)?;
+            let img_len = prep.ht * prep.wt;
+            let head = prep.cap_len + prep.n_refs * img_len;
+            let img_out = split_axis1(&out, head)?.swap_remove(1);
+            unpatchify(&img_out, prep.ht, prep.wt, prep.p, prep.latent_ch)
+        };
+        Ok((
+            finish(&positive_combined, &positive_t, positive)?,
+            finish(&negative_combined, &negative_t, negative)?,
+        ))
+    }
+
+    /// Pose-control forward over the same request-scoped base-block window as the ordinary routes.
+    /// The control branch remains a separately-accounted resident overlay; `inject` applies its
+    /// precomputed residual immediately before each matching frozen base block.
+    pub(crate) fn forward_prepared_injected_windowed(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        prep: &JointPrep,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+        mut inject: impl FnMut(usize, Array, i32) -> Result<Array>,
+    ) -> Result<Array> {
+        let j = self.joint_inputs(latent, timestep, prep)?;
+        let combined = self.run_blocks_injected(
+            j.combined.clone(),
+            &j.tvec,
+            &j.rcos,
+            &j.rsin,
+            window,
+            attention,
+            j.cap_len,
+            &mut inject,
+        )?;
+        self.finalize(&combined, &j.t, &j)
+    }
+
+    fn run_blocks_paired(
+        &self,
+        mut states: (Array, Array),
+        positive: (&Array, &Array, &Array),
+        negative: (&Array, &Array, &Array),
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<(Array, Array)> {
+        let Some(window) = window else {
+            self.require_resident_blocks()?;
+            for block in &self.blocks {
+                states.0 = block
+                    .forward_budgeted(&states.0, positive.0, positive.1, positive.2, attention)?;
+                states.1 = block
+                    .forward_budgeted(&states.1, negative.0, negative.1, negative.2, attention)?;
+            }
+            return Ok(states);
+        };
+        let stream = self.block_stream.as_ref().ok_or_else(|| {
+            mlx_gen::Error::Unsupported(
+                "krea: bounded transformer residency was requested without a re-openable block stream"
+                    .to_owned(),
+            )
+        })?;
+        if window.plan.n_blocks() != self.cfg.num_layers || stream.n_blocks() != self.cfg.num_layers
+        {
+            return Err(mlx_gen::Error::Msg(format!(
+                "krea: block plan covers {} blocks and the stream {}, but the DiT has {}",
+                window.plan.n_blocks(),
+                stream.n_blocks(),
+                self.cfg.num_layers
+            )));
+        }
+        mlx_gen::block_residency::run_windowed(
+            &window.plan,
+            window.cancel,
+            states,
+            || stream.open(),
+            |states, view, range| {
+                run_paired_range(
+                    states,
+                    range,
+                    |index| stream.materialize(view, index),
+                    |block, state| {
+                        block
+                            .forward_budgeted(&state, positive.0, positive.1, positive.2, attention)
+                    },
+                    |block, state| {
+                        block
+                            .forward_budgeted(&state, negative.0, negative.1, negative.2, attention)
+                    },
+                )
+            },
+            |(positive, negative): &(Array, Array)| {
+                Ok(mlx_rs::transforms::eval([positive, negative])?)
+            },
+        )
+    }
+
+    fn run_blocks(
+        &self,
+        mut combined: Array,
+        tvec: &Array,
+        rcos: &Array,
+        rsin: &Array,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Array> {
+        let Some(window) = window else {
+            self.require_resident_blocks()?;
+            for block in &self.blocks {
+                combined = block.forward_budgeted(&combined, tvec, rcos, rsin, attention)?;
+            }
+            return Ok(combined);
+        };
+        let stream = self.block_stream.as_ref().ok_or_else(|| {
+            mlx_gen::Error::Unsupported(
+                "krea: bounded transformer residency was requested without a re-openable block stream"
+                    .to_owned(),
+            )
+        })?;
+        if window.plan.n_blocks() != self.cfg.num_layers || stream.n_blocks() != self.cfg.num_layers
+        {
+            return Err(mlx_gen::Error::Msg(format!(
+                "krea: block plan covers {} blocks and the stream {}, but the DiT has {}",
+                window.plan.n_blocks(),
+                stream.n_blocks(),
+                self.cfg.num_layers
+            )));
+        }
+        mlx_gen::block_residency::run_windowed(
+            &window.plan,
+            window.cancel,
+            combined,
+            || stream.open(),
+            |state, view, range| {
+                let mut current = state;
+                for index in range {
+                    let block = stream.materialize(view, index)?;
+                    current = block.forward_budgeted(&current, tvec, rcos, rsin, attention)?;
+                }
+                Ok(current)
+            },
+            |state: &Array| Ok(mlx_rs::transforms::eval([state])?),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_blocks_injected(
+        &self,
+        mut combined: Array,
+        tvec: &Array,
+        rcos: &Array,
+        rsin: &Array,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+        cap_len: i32,
+        inject: &mut impl FnMut(usize, Array, i32) -> Result<Array>,
+    ) -> Result<Array> {
+        let Some(window) = window else {
+            self.require_resident_blocks()?;
+            for (index, block) in self.blocks.iter().enumerate() {
+                combined = inject(index, combined, cap_len)?;
+                combined = block.forward_budgeted(&combined, tvec, rcos, rsin, attention)?;
+            }
+            return Ok(combined);
+        };
+        let stream = self.block_stream.as_ref().ok_or_else(|| {
+            mlx_gen::Error::Unsupported(
+                "krea: bounded transformer residency was requested without a re-openable block stream"
+                    .to_owned(),
+            )
+        })?;
+        if window.plan.n_blocks() != self.cfg.num_layers || stream.n_blocks() != self.cfg.num_layers
+        {
+            return Err(mlx_gen::Error::Msg(format!(
+                "krea: block plan covers {} blocks and the stream {}, but the DiT has {}",
+                window.plan.n_blocks(),
+                stream.n_blocks(),
+                self.cfg.num_layers
+            )));
+        }
+        mlx_gen::block_residency::run_windowed(
+            &window.plan,
+            window.cancel,
+            combined,
+            || stream.open(),
+            |state, view, range| {
+                let mut current = state;
+                for index in range {
+                    current = inject(index, current, cap_len)?;
+                    let block = stream.materialize(view, index)?;
+                    current = block.forward_budgeted(&current, tvec, rcos, rsin, attention)?;
+                }
+                Ok(current)
+            },
+            |state: &Array| Ok(mlx_rs::transforms::eval([state])?),
+        )
+    }
+
+    fn require_resident_blocks(&self) -> Result<()> {
+        if self.blocks.len() == self.cfg.num_layers {
+            return Ok(());
+        }
+        Err(mlx_gen::Error::Unsupported(format!(
+            "krea: resident execution requires {} transformer blocks, but this deferred model holds {}",
+            self.cfg.num_layers,
+            self.blocks.len()
+        )))
     }
 
     /// Velocity prediction with **per-single-stream-block gradient checkpointing** (sc-7577, training
@@ -417,7 +981,7 @@ impl Krea2Transformer {
                         .ok_or_else(|| {
                             Exception::custom(format!("checkpoint LoRA target not found: {local}"))
                         })?
-                        .set_adapters(vec![Adapter::Lora {
+                        .set_training_adapters(vec![Adapter::Lora {
                             a,
                             b: bb,
                             scale: 1.0,
@@ -493,6 +1057,7 @@ impl Krea2Transformer {
     /// whole-block checkpointing is on (the block recompute already covers attention). Inference never
     /// calls it (attention stays the un-checkpointed fused SDPA).
     pub fn set_sdpa_checkpoint(&mut self, on: bool) {
+        self.disarm_block_stream();
         for b in &mut self.blocks {
             b.set_sdpa_checkpoint(on);
         }
@@ -507,14 +1072,7 @@ impl Krea2Transformer {
     /// Number of single-stream `transformer_blocks` (`num_layers`) — the trainer's gradient-checkpoint
     /// bookkeeping indexes per block.
     pub fn num_blocks(&self) -> usize {
-        self.blocks.len()
-    }
-
-    /// The frozen single-stream blocks, for the pose-control branch's own injection loop (sc-8465,
-    /// [`crate::control`]): it drives `blk.forward(..)` per block and adds a residual before selected
-    /// blocks, rather than the straight-through [`Self::forward_prepared`] loop.
-    pub(crate) fn blocks(&self) -> &[SingleStreamBlock] {
-        &self.blocks
+        self.cfg.num_layers
     }
 
     /// Patch-embed a latent through the frozen base `img_in` (the SAME embedder the noisy image latent
@@ -533,6 +1091,7 @@ impl Krea2Transformer {
     /// single-stream blocks, final layer, scale-shift tables — is cast. Destructive for a narrowing
     /// cast (f32→bf16); reload for f32. Inference never calls this.
     pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        self.disarm_block_stream();
         for l in [
             &mut self.img_in,
             &mut self.time_embed_l1,
@@ -575,10 +1134,38 @@ impl Krea2Transformer {
     /// block (the 256 targets [`crate::convert::transformer_quant_targets`] packs). The embedders,
     /// `time_mod_proj`, `txt_in`, `projector`, and `final_layer` stay dense, matching the converter.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        if let Some(stream) = self.block_stream.as_mut() {
+            stream.set_quant_bits(bits);
+        }
         self.text_fusion.quantize(bits)?;
         for b in &mut self.blocks {
             b.quantize(bits)?;
         }
+        Ok(())
+    }
+
+    /// Materialize retained weights projection-by-projection.  When called after `quantize`, each
+    /// projection evaluates its packed representation and releases the dense file-backed graph
+    /// before the next projection, avoiding a full-dense imported-DiT peak.
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        for projection in [
+            &self.img_in,
+            &self.time_embed_l1,
+            &self.time_embed_l2,
+            &self.time_mod_proj,
+            &self.txt_in_l1,
+            &self.txt_in_l2,
+            &self.final_linear,
+        ] {
+            projection.materialize_weights()?;
+        }
+        self.txt_in_norm.materialize_weights()?;
+        self.text_fusion.materialize_weights()?;
+        for block in &self.blocks {
+            block.materialize_weights()?;
+        }
+        self.final_norm.materialize_weights()?;
+        mlx_rs::transforms::eval([&self.final_sstable])?;
         Ok(())
     }
 
@@ -600,6 +1187,9 @@ impl Krea2Transformer {
         self.txt_in_l1.set_adapters(Vec::new());
         self.txt_in_l2.set_adapters(Vec::new());
         self.final_linear.set_adapters(Vec::new());
+        if let Some(stream) = self.block_stream.as_mut() {
+            stream.clear_adapters();
+        }
         // The per-block + text-fusion targets, via the enumerated adapter paths (each resolves through
         // `adaptable_mut`, per the `AdaptableHost` contract). `adaptable_paths` borrows `&self` and
         // returns owned strings, so the subsequent `&mut self` resolves are unencumbered.
@@ -610,6 +1200,122 @@ impl Krea2Transformer {
             }
         }
     }
+}
+
+#[cfg(test)]
+fn executable_test_weights() -> (Weights, Krea2Config) {
+    let mut cfg = Krea2Config::turbo();
+    cfg.hidden_size = 8;
+    cfg.num_attention_heads = 1;
+    cfg.num_kv_heads = 1;
+    cfg.attention_head_dim = 8;
+    cfg.num_layers = 2;
+    cfg.intermediate_size = 16;
+    cfg.axes_dims_rope = [2, 2, 4];
+    cfg.timestep_embed_dim = 8;
+    cfg.num_text_layers = 1;
+    cfg.num_layerwise_text_blocks = 0;
+    cfg.num_refiner_text_blocks = 0;
+    cfg.text_hidden_dim = 8;
+    cfg.text_intermediate_size = 16;
+    cfg.text_num_attention_heads = 1;
+    cfg.text_num_kv_heads = 1;
+
+    let mut weights = Weights::empty();
+    let values = |len: usize, seed: usize| -> Vec<f32> {
+        (0..len)
+            .map(|index| (((index + seed) % 19) as f32 - 9.0) * 0.0075)
+            .collect()
+    };
+    {
+        let mut linear = |base: &str, out: i32, input: i32, bias: bool, seed: usize| {
+            weights.insert(
+                format!("{base}.weight"),
+                Array::from_slice(&values((out * input) as usize, seed), &[out, input]),
+            );
+            if bias {
+                weights.insert(
+                    format!("{base}.bias"),
+                    Array::from_slice(&values(out as usize, seed + 3), &[out]),
+                );
+            }
+        };
+        linear("img_in", 8, 64, true, 1);
+        linear("time_embed.linear_1", 8, 8, true, 2);
+        linear("time_embed.linear_2", 8, 8, true, 3);
+        linear("time_mod_proj", 48, 8, true, 4);
+        linear("txt_in.linear_1", 8, 8, true, 5);
+        linear("txt_in.linear_2", 8, 8, true, 6);
+        linear("final_layer.linear", 64, 8, true, 7);
+        linear("text_fusion.projector", 1, 1, false, 8);
+    }
+    for key in ["txt_in.norm.weight", "final_layer.norm.weight"] {
+        weights.insert(key, Array::from_slice(&[0.0_f32; 8], &[8]));
+    }
+    weights.insert(
+        "final_layer.scale_shift_table",
+        Array::from_slice(&values(16, 9), &[2, 8]),
+    );
+
+    for block in 0..cfg.num_layers {
+        let prefix = format!("transformer_blocks.{block}");
+        weights.insert(
+            format!("{prefix}.scale_shift_table"),
+            Array::from_slice(&values(48, 10 + block), &[6, 8]),
+        );
+        for key in ["norm1.weight", "norm2.weight"] {
+            weights.insert(
+                format!("{prefix}.{key}"),
+                Array::from_slice(&[0.0_f32; 8], &[8]),
+            );
+        }
+        for key in ["attn.norm_q.weight", "attn.norm_k.weight"] {
+            weights.insert(
+                format!("{prefix}.{key}"),
+                Array::from_slice(&[0.0_f32; 8], &[8]),
+            );
+        }
+        for (name, out, input, seed) in [
+            ("attn.to_q", 8, 8, 20),
+            ("attn.to_k", 8, 8, 21),
+            ("attn.to_v", 8, 8, 22),
+            ("attn.to_gate", 8, 8, 23),
+            ("attn.to_out.0", 8, 8, 24),
+            ("ff.gate", 16, 8, 25),
+            ("ff.up", 16, 8, 26),
+            ("ff.down", 8, 16, 27),
+        ] {
+            weights.insert(
+                format!("{prefix}.{name}.weight"),
+                Array::from_slice(&values((out * input) as usize, seed + block), &[out, input]),
+            );
+        }
+    }
+
+    (weights, cfg)
+}
+
+#[cfg(test)]
+pub(crate) fn executable_test_fixture(
+    materializations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> Result<Krea2Transformer> {
+    let (weights, cfg) = executable_test_weights();
+    Ok(Krea2Transformer::from_weights(&weights, &cfg)?.with_test_block_stream(materializations))
+}
+
+fn run_paired_range<S, B>(
+    mut states: (S, S),
+    range: std::ops::Range<usize>,
+    mut materialize: impl FnMut(usize) -> Result<B>,
+    mut apply_positive: impl FnMut(&B, S) -> Result<S>,
+    mut apply_negative: impl FnMut(&B, S) -> Result<S>,
+) -> Result<(S, S)> {
+    for index in range {
+        let block = materialize(index)?;
+        states.0 = apply_positive(&block, states.0)?;
+        states.1 = apply_negative(&block, states.1)?;
+    }
+    Ok(states)
 }
 
 /// The embed/fuse preamble outputs shared by the dense and checkpointed forwards: the joint hidden
@@ -785,6 +1491,435 @@ fn unpatchify(tokens: &Array, ht: i32, wt: i32, p: i32, c: i32) -> Result<Array>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn assert_exact(left: &Array, right: &Array) {
+        mlx_rs::transforms::eval([left, right]).unwrap();
+        assert_eq!(left.as_slice::<f32>(), right.as_slice::<f32>());
+    }
+
+    #[test]
+    fn deferred_storage_plan_has_zero_resident_block_slots() {
+        let cfg = Krea2Config::turbo();
+        assert_eq!(resident_block_slots(&cfg, false), 0);
+        assert_eq!(resident_block_slots(&cfg, true), cfg.num_layers);
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct MockMultiphaseClone {
+        cleared: bool,
+    }
+
+    fn write_lazy_lora_payload(path: &std::path::Path, value: f32) {
+        let mut header = br#"{"a":{"dtype":"F32","shape":[8,2],"data_offsets":[0,64]},"b":{"dtype":"F32","shape":[2,8],"data_offsets":[64,128]}}"#.to_vec();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = Vec::with_capacity(8 + header.len() + 128);
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&header);
+        for _ in 0..32 {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn multiphase_replay_materializes_lora_before_the_prepared_pin_postcheck() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("phase-lora.safetensors");
+        let replacement = dir.path().join("phase-lora-replacement.safetensors");
+        write_lazy_lora_payload(&source, 0.25);
+        write_lazy_lora_payload(&replacement, -0.75);
+        let mut spec =
+            mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(dir.path().join("unused-base")))
+                .with_adapters(vec![mlx_gen::AdapterSpec::new(
+                    source.clone(),
+                    1.0,
+                    mlx_gen::AdapterKind::Lora,
+                )]);
+        spec.prepare_file_sources().unwrap();
+
+        let result: mlx_gen::Result<MockMultiphaseClone> =
+            spec.read_files_unchanged(spec.adapters.iter().map(|adapter| &adapter.path), || {
+                clone_for_multiphase_with(
+                    &MockMultiphaseClone::default(),
+                    |phase| phase.cleared = true,
+                    |phase| {
+                        assert!(phase.cleared, "phase adapters must replay after clear");
+                        let weights = Weights::from_file(&spec.adapters[0].path)?;
+                        let adapter = Adapter::Lora {
+                            a: weights.require("a")?.clone(),
+                            b: weights.require("b")?.clone(),
+                            scale: 1.0,
+                        };
+                        std::fs::rename(&replacement, &source)?;
+                        adapter.materialize()
+                    },
+                )
+            });
+        let error = result.expect_err("A to B phase adapter replacement must invalidate its pin");
+        match error {
+            mlx_gen::Error::Unsupported(reason)
+                if reason.starts_with("artifact seal mismatch after load: ") => {}
+            mlx_gen::Error::Unsupported(reason) => {
+                panic!("unexpected artifact-seal reason: {reason}")
+            }
+            other => panic!("expected a typed artifact-seal rejection, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an accessible Apple Metal device to build the executable transformer fixture"]
+    fn deferred_construction_retains_no_base_blocks() {
+        let (weights, cfg) = executable_test_weights();
+        let resident = Krea2Transformer::from_weights(&weights, &cfg).unwrap();
+        let source_blocks = resident.blocks.clone();
+        assert_eq!(source_blocks.len(), cfg.num_layers);
+
+        let materializations = Arc::new(AtomicUsize::new(0));
+        let mut deferred = Krea2Transformer::from_weights_deferred(&weights, &cfg).unwrap();
+        deferred.block_stream = Some(crate::block_stream::KreaBlockStream::for_test(
+            cfg.clone(),
+            source_blocks,
+            Arc::clone(&materializations),
+        ));
+
+        assert_eq!(
+            deferred.resident_block_count(),
+            0,
+            "the deferred constructor must not retain the uniform base block stack"
+        );
+        assert_eq!(deferred.num_blocks(), cfg.num_layers);
+        assert!(
+            deferred
+                .block_window(None, &mlx_gen::CancelFlag::new())
+                .unwrap()
+                .is_some(),
+            "a deferred model must never fall through to an empty resident traversal"
+        );
+        assert_eq!(
+            materializations.load(Ordering::Relaxed),
+            0,
+            "construction must not materialize any streamed block"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an accessible Apple Metal device to serialize and reload adapter tensors"]
+    fn deferred_adapter_proxy_is_dropped_and_replays_exact_block_lora() {
+        let (weights, cfg) = executable_test_weights();
+        let resident = Krea2Transformer::from_weights(&weights, &cfg).unwrap();
+        let materializations = Arc::new(AtomicUsize::new(0));
+        let mut deferred = Krea2Transformer::from_weights_deferred(&weights, &cfg).unwrap();
+        deferred.block_stream = Some(crate::block_stream::KreaBlockStream::for_test(
+            cfg.clone(),
+            resident.blocks.clone(),
+            Arc::clone(&materializations),
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let adapter_path = dir.path().join("block-lora.safetensors");
+        let down = Array::from_slice(&[0.01_f32; 16], &[2, 8]);
+        let up = Array::from_slice(&[0.02_f32; 16], &[8, 2]);
+        Array::save_safetensors(
+            vec![
+                (
+                    "transformer.transformer_blocks.0.attn.to_q.lora_A.weight",
+                    &down,
+                ),
+                (
+                    "transformer.transformer_blocks.0.attn.to_q.lora_B.weight",
+                    &up,
+                ),
+            ],
+            None,
+            &adapter_path,
+        )
+        .unwrap();
+        deferred
+            .apply_adapters_strict(
+                &[mlx_gen::AdapterSpec::new(
+                    adapter_path,
+                    1.0,
+                    mlx_gen::AdapterKind::Lora,
+                )],
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            deferred.resident_block_count(),
+            0,
+            "adapter routing proxies must be dropped after their residuals are captured"
+        );
+        assert_eq!(materializations.load(Ordering::Relaxed), 0);
+
+        let stream = deferred.block_stream.as_ref().unwrap();
+        let mut empty = Weights::empty();
+        let mut block0 = stream.materialize(&mut empty, 0).unwrap();
+        assert_eq!(
+            block0
+                .adaptable_mut(&["attn", "to_q"])
+                .unwrap()
+                .adapters()
+                .len(),
+            1,
+            "the exact block LoRA must be replayed on window materialization"
+        );
+        let mut block1 = stream.materialize(&mut empty, 1).unwrap();
+        assert!(block1
+            .adaptable_mut(&["attn", "to_q"])
+            .unwrap()
+            .adapters()
+            .is_empty());
+    }
+
+    #[test]
+    fn actual_prepared_entrypoints_preserve_cfg_order_parity_and_materialization_counts() {
+        let materializations = Arc::new(AtomicUsize::new(0));
+        let transformer = executable_test_fixture(Arc::clone(&materializations)).unwrap();
+        let latent = Array::from_slice(
+            &(0..64)
+                .map(|index| index as f32 * 0.01 - 0.3)
+                .collect::<Vec<_>>(),
+            &[1, 16, 2, 2],
+        );
+        let timestep = Array::from_slice(&[0.37_f32], &[1]);
+        let positive_context = Array::from_slice(
+            &(0..16)
+                .map(|index| index as f32 * 0.025 - 0.2)
+                .collect::<Vec<_>>(),
+            &[1, 2, 1, 8],
+        );
+        let negative_context = Array::from_slice(
+            &(0..8)
+                .map(|index| 0.4 - index as f32 * 0.03)
+                .collect::<Vec<_>>(),
+            &[1, 1, 1, 8],
+        );
+        let positive = transformer
+            .prepare(&positive_context, None, &latent)
+            .unwrap();
+        let negative = transformer
+            .prepare(&negative_context, None, &latent)
+            .unwrap();
+        let expected_positive = transformer
+            .forward_prepared_windowed(&latent, &timestep, &positive, None)
+            .unwrap();
+        let expected_negative = transformer
+            .forward_prepared_windowed(&latent, &timestep, &negative, None)
+            .unwrap();
+        mlx_rs::transforms::eval([&expected_positive, &expected_negative]).unwrap();
+        assert_ne!(
+            expected_positive.as_slice::<f32>(),
+            expected_negative.as_slice::<f32>(),
+            "the fixture must distinguish positive and negative routing"
+        );
+
+        let (resident_positive, resident_negative) = transformer
+            .forward_prepared_pair_windowed(&latent, &timestep, &positive, &negative, None)
+            .unwrap();
+        assert_exact(&resident_positive, &expected_positive);
+        assert_exact(&resident_negative, &expected_negative);
+        assert_eq!(materializations.load(Ordering::Relaxed), 0);
+
+        let attention = mlx_gen::attention::AttentionPlan::budgeted(
+            mlx_gen::attention::AttentionBudget::from_score_elements(1, false),
+        );
+        let bounded_positive = transformer
+            .forward_prepared_windowed_budgeted(&latent, &timestep, &positive, None, attention)
+            .unwrap();
+        mlx_rs::transforms::eval([&bounded_positive, &expected_positive]).unwrap();
+        let expected = expected_positive.as_slice::<f32>();
+        let bounded = bounded_positive.as_slice::<f32>();
+        let peak = expected
+            .iter()
+            .fold(0.0_f32, |value, item| value.max(item.abs()))
+            .max(1e-12);
+        let delta = expected
+            .iter()
+            .zip(bounded)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max)
+            / peak;
+        assert!(
+            delta <= 2e-3,
+            "bounded Krea attention changed the prepared DiT output: peak-relative delta {delta:e}"
+        );
+        let cancelled = mlx_gen::CancelFlag::new();
+        cancelled.cancel();
+        let result = transformer.forward_prepared_windowed_budgeted(
+            &latent,
+            &timestep,
+            &positive,
+            None,
+            attention.with_cancel(&cancelled),
+        );
+        assert!(
+            matches!(result, Err(mlx_gen::Error::Canceled)),
+            "a pre-cancelled bounded plan must cross a physical query-chunk boundary"
+        );
+
+        materializations.store(0, Ordering::Relaxed);
+        let cancel = mlx_gen::CancelFlag::new();
+        let window = transformer.block_window(Some(1), &cancel).unwrap();
+        let (windowed_positive, windowed_negative) = transformer
+            .forward_prepared_pair_windowed(&latent, &timestep, &positive, &negative, window)
+            .unwrap();
+        assert_exact(&windowed_positive, &expected_positive);
+        assert_exact(&windowed_negative, &expected_negative);
+        assert_eq!(
+            materializations.load(Ordering::Relaxed),
+            transformer.num_blocks(),
+            "paired CFG must materialize each block once"
+        );
+
+        materializations.store(0, Ordering::Relaxed);
+        let single = transformer
+            .forward_prepared_windowed(&latent, &timestep, &positive, window)
+            .unwrap();
+        assert_exact(&single, &expected_positive);
+        assert_eq!(
+            materializations.load(Ordering::Relaxed),
+            transformer.num_blocks(),
+            "the non-CFG path must retain one traversal"
+        );
+
+        let reference = Array::from_slice(
+            &(0..64)
+                .map(|index| 0.15 - index as f32 * 0.004)
+                .collect::<Vec<_>>(),
+            &[1, 16, 2, 2],
+        );
+        let edit_positive = transformer
+            .prepare_edit(
+                &positive_context,
+                None,
+                &latent,
+                std::slice::from_ref(&reference),
+            )
+            .unwrap();
+        let edit_negative = transformer
+            .prepare_edit(&negative_context, None, &latent, &[reference])
+            .unwrap();
+        let expected_edit_positive = transformer
+            .forward_prepared_edit_windowed(&latent, &timestep, &edit_positive, None)
+            .unwrap();
+        let expected_edit_negative = transformer
+            .forward_prepared_edit_windowed(&latent, &timestep, &edit_negative, None)
+            .unwrap();
+        let (resident_edit_positive, resident_edit_negative) = transformer
+            .forward_prepared_edit_pair_windowed(
+                &latent,
+                &timestep,
+                &edit_positive,
+                &edit_negative,
+                None,
+            )
+            .unwrap();
+        assert_exact(&resident_edit_positive, &expected_edit_positive);
+        assert_exact(&resident_edit_negative, &expected_edit_negative);
+
+        materializations.store(0, Ordering::Relaxed);
+        let (windowed_edit_positive, windowed_edit_negative) = transformer
+            .forward_prepared_edit_pair_windowed(
+                &latent,
+                &timestep,
+                &edit_positive,
+                &edit_negative,
+                window,
+            )
+            .unwrap();
+        assert_exact(&windowed_edit_positive, &expected_edit_positive);
+        assert_exact(&windowed_edit_negative, &expected_edit_negative);
+        assert_eq!(
+            materializations.load(Ordering::Relaxed),
+            transformer.num_blocks()
+        );
+
+        materializations.store(0, Ordering::Relaxed);
+        let single_edit = transformer
+            .forward_prepared_edit_windowed(&latent, &timestep, &edit_positive, window)
+            .unwrap();
+        assert_exact(&single_edit, &expected_edit_positive);
+        assert_eq!(
+            materializations.load(Ordering::Relaxed),
+            transformer.num_blocks()
+        );
+    }
+
+    #[test]
+    fn paired_range_matches_two_legacy_states_and_materializes_each_block_once() {
+        let blocks = [2_i32, 3, 5];
+        let legacy_materializations = Cell::new(0usize);
+        let legacy = |mut state: i32| {
+            for block in blocks {
+                legacy_materializations.set(legacy_materializations.get() + 1);
+                state = state * block + 1;
+            }
+            state
+        };
+        let expected = (legacy(1), legacy(7));
+
+        let paired_materializations = Cell::new(0usize);
+        let actual = run_paired_range(
+            (1_i32, 7_i32),
+            0..blocks.len(),
+            |index| {
+                paired_materializations.set(paired_materializations.get() + 1);
+                Ok(blocks[index])
+            },
+            |block, state| Ok(state * block + 1),
+            |block, state| Ok(state * block + 1),
+        )
+        .unwrap();
+
+        assert_eq!(
+            actual, expected,
+            "paired traversal must preserve both outputs"
+        );
+        assert_eq!(legacy_materializations.get(), blocks.len() * 2);
+        assert_eq!(paired_materializations.get(), blocks.len());
+    }
+
+    #[test]
+    fn paired_carry_preserves_typed_cancellation_at_window_boundaries() {
+        let cancel = mlx_gen::CancelFlag::new();
+        let opened = Cell::new(0usize);
+        let materialized_blocks = Cell::new(0usize);
+        let error = mlx_gen::block_residency::run_windowed(
+            &mlx_gen::block_residency::BlockPlan::new(4, 2).unwrap(),
+            &cancel,
+            (0usize, 10usize),
+            || {
+                opened.set(opened.get() + 1);
+                Ok(Weights::empty())
+            },
+            |states, _view, range| {
+                run_paired_range(
+                    states,
+                    range,
+                    |index| {
+                        materialized_blocks.set(materialized_blocks.get() + 1);
+                        Ok(index)
+                    },
+                    |block, state| Ok(state + block + 1),
+                    |block, state| Ok(state + block + 1),
+                )
+            },
+            |_| {
+                cancel.cancel();
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, mlx_gen::Error::Canceled));
+        assert_eq!(opened.get(), 1, "cancellation must prevent the next window");
+        assert_eq!(materialized_blocks.get(), 2);
+    }
 
     /// A dense `[out, in]` weight (+ its `[out]` bias) at `base` — values are irrelevant (these tests
     /// route by shape, never forward), so each global projection gets a distinct `out` we can match on.

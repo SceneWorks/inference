@@ -31,16 +31,53 @@ Env-overridable: FLUX_DEV (snapshot dir or HF id), HYPER_LORA (path), FLUX_SEED,
 FLUX_H, FLUX_GUIDANCE, HYPER_LORA_SCALE, FLUX_PROMPT.
 """
 
+import json
 import os
+import struct
 
 import numpy as np
 import torch
+from _adapter_parity_provenance import (
+    assert_frozen_mflux,
+    assert_hf_file,
+    golden_metadata,
+    sha256,
+)
 from diffusers import FluxPipeline
 from diffusers.pipelines.flux.pipeline_flux import calculate_shift
 from safetensors.numpy import save_file
 
 _GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golden")
 os.makedirs(_GOLDEN_DIR, exist_ok=True)
+
+
+def _canonicalize_metadata_order(path):
+    """Sort `__metadata__` in the safetensors header so this golden is byte-reproducible.
+
+    `safetensors.numpy.save_file` serializes `__metadata__` out of a Rust `HashMap`, whose
+    iteration order is randomized per process — so two runs producing bit-identical tensors
+    still write different file bytes, and the manifest's SHA-256 pin for this artifact can
+    never be re-met by regeneration (sc-17651; the sibling dumps use `mx.save_safetensors`
+    and are unaffected). Tensor entries are already emitted in data-offset order.
+
+    Sorting only permutes keys, so the re-serialized header has the same length; it is
+    re-padded with spaces back into the original slot. The write is confined to the header
+    bytes (`r+b` + `seek(8)`, exactly `length` bytes) so the payload cannot move even if
+    this is interrupted — a truncating rewrite would put a 10-minute licensed regeneration
+    at risk for no gain.
+    """
+    with open(path, "rb") as handle:
+        length = struct.unpack("<Q", handle.read(8))[0]
+        header = json.loads(handle.read(length))
+    canonical = {"__metadata__": dict(sorted(header.get("__metadata__", {}).items()))}
+    canonical.update((k, v) for k, v in header.items() if k != "__metadata__")
+    encoded = json.dumps(canonical, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    if len(encoded) > length:
+        raise RuntimeError(f"canonical header {len(encoded)} exceeds the {length}-byte slot")
+    with open(path, "r+b") as handle:
+        handle.seek(8)
+        handle.write(encoded + b" " * (length - len(encoded)))
+
 
 BASE = os.environ.get(
     "FLUX_DEV",
@@ -51,7 +88,12 @@ BASE = os.environ.get(
 )
 LORA = os.environ.get(
     "HYPER_LORA",
-    os.path.expanduser("~/repos/test-files/Hyper-FLUX.1-dev-8steps-lora.safetensors"),
+    os.path.join(
+        os.path.expanduser(os.environ.get("HF_HOME", "~/.cache/huggingface")),
+        "hub/models--ByteDance--Hyper-SD/snapshots/"
+        "bc08d970a87c74c71209491d64e3525845698863/"
+        "Hyper-FLUX.1-dev-8steps-lora.safetensors",
+    ),
 )
 PROMPT = os.environ.get("FLUX_PROMPT", "a photo of a red fox in a snowy forest, golden hour")
 SEED = int(os.environ.get("FLUX_SEED", "7"))
@@ -60,11 +102,30 @@ H = int(os.environ.get("FLUX_H", "512"))
 STEPS = int(os.environ.get("FLUX_STEPS", "8"))
 GUIDANCE = float(os.environ.get("FLUX_GUIDANCE", "3.5"))
 LORA_SCALE = float(os.environ.get("HYPER_LORA_SCALE", "0.125"))
+BASE_REPOSITORY = "black-forest-labs/FLUX.1-dev"
+BASE_REVISION = os.environ.get(
+    "FLUX_DEV_REVISION", "3de623fc3c33e44ffbe2bad470d0f45bccf2eb21"
+)
+LORA_REPOSITORY = "ByteDance/Hyper-SD"
+LORA_REVISION = "bc08d970a87c74c71209491d64e3525845698863"
+LORA_SHA256 = "e0ab0fdf569cd01a382f19bd87681f628879dea7ad51fe5a3799b6c18c7b2d03"
+assert_frozen_mflux()
 
 OUT = os.path.join(_GOLDEN_DIR, "flux1_dev_hyper_golden.safetensors")
 PNG = os.path.join(_GOLDEN_DIR, "diffusers_hyper_flux.png")
 
 print(f"loading FLUX.1-dev from {BASE} (bf16) …")
+assert_hf_file(
+    LORA,
+    repository=LORA_REPOSITORY,
+    revision=LORA_REVISION,
+    file="Hyper-FLUX.1-dev-8steps-lora.safetensors",
+)
+actual_lora_sha256 = sha256(LORA)
+if actual_lora_sha256 != LORA_SHA256:
+    raise RuntimeError(
+        f"Hyper-FLUX artifact mismatch: expected {LORA_SHA256}, got {actual_lora_sha256}"
+    )
 pipe = FluxPipeline.from_pretrained(BASE, torch_dtype=torch.bfloat16)
 pipe.to("mps" if torch.backends.mps.is_available() else "cpu")
 
@@ -143,7 +204,17 @@ meta = {
     "height": str(H),
     "guidance": str(GUIDANCE),
     "lora_scale": str(LORA_SCALE),
+    "lora_repository": LORA_REPOSITORY,
+    "lora_revision": LORA_REVISION,
+    "lora_sha256": LORA_SHA256,
+    **golden_metadata(
+        script=__file__,
+        model_path=BASE,
+        model_repository=BASE_REPOSITORY,
+        model_revision=BASE_REVISION,
+    ),
 }
 save_file(tensors, OUT, metadata=meta)
+_canonicalize_metadata_order(OUT)
 print(f"wrote {OUT}")
 print({k: v.shape for k, v in tensors.items()})

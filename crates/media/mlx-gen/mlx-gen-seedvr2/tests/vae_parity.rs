@@ -3,7 +3,7 @@
 //!
 //! Weights + IO goldens come from `tools/dump_seedvr2_goldens.py --component vae` (real 3B VAE,
 //! ~1 GB f32). Set `SEEDVR2_GOLDEN_DIR` (default `~/.cache/mlx-gen-seedvr2-golden`). Skipped when
-//! absent. Run: `cargo test -p mlx-gen-seedvr2 --test vae_parity -- --nocapture`.
+//! absent. Run: `cargo test -p mlx-gen-seedvr2 --test integration vae_parity:: -- --nocapture`.
 
 use mlx_gen::weights::Weights;
 use mlx_gen_seedvr2::vae::Seedvr2Vae;

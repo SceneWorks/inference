@@ -30,6 +30,17 @@ pub const FACTOR: usize = PATCH_SIZE * MERGE_SIZE;
 pub const MIN_PIXELS: usize = 65_536;
 pub const MAX_PIXELS: usize = 16_777_216;
 
+/// Host-only image geometry shared by edit admission and the real preprocessor. Computing this before
+/// either the VAE or vision tower runs makes the combined edit-token budget exact without allocating
+/// backend tensors, while reusing it in [`preprocess_image`] prevents admission/execution drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageGeometry {
+    pub resized_height: usize,
+    pub resized_width: usize,
+    pub grid: [i32; 3],
+    pub merged_tokens: usize,
+}
+
 /// Qwen-VL `smart_resize`: snap `(height, width)` to multiples of `factor`, keeping aspect ratio
 /// while clamping total pixels into `[min_pixels, max_pixels]`. Python round-half-to-even.
 pub fn smart_resize(
@@ -53,6 +64,28 @@ pub fn smart_resize(
         w_bar = (wf * beta / ff).ceil() * ff;
     }
     (h_bar as usize, w_bar as usize)
+}
+
+/// Derive the exact smart-resized patch grid and merged-token count without touching image pixels.
+pub fn image_geometry(height: usize, width: usize) -> Result<ImageGeometry> {
+    if height == 0 || width == 0 {
+        return Err(CandleError::Msg(format!(
+            "boogu vision: zero dimension ({width}x{height})"
+        )));
+    }
+    let (resized_height, resized_width) =
+        smart_resize(height, width, FACTOR, MIN_PIXELS, MAX_PIXELS);
+    let grid_h = resized_height / PATCH_SIZE;
+    let grid_w = resized_width / PATCH_SIZE;
+    let merged_tokens = (grid_h / MERGE_SIZE)
+        .checked_mul(grid_w / MERGE_SIZE)
+        .ok_or_else(|| CandleError::Msg("boogu vision: merged-token count overflow".into()))?;
+    Ok(ImageGeometry {
+        resized_height,
+        resized_width,
+        grid: [1, grid_h as i32, grid_w as i32],
+        merged_tokens,
+    })
 }
 
 /// Full Qwen3-VL preprocessing of one RGB8 image (HWC, `[0, 255]`) → `pixel_values [seq, 1536]`
@@ -81,7 +114,8 @@ pub fn preprocess_image(
             pixels_hwc.len()
         )));
     }
-    let (rh, rw) = smart_resize(height, width, FACTOR, MIN_PIXELS, MAX_PIXELS);
+    let geometry = image_geometry(height, width)?;
+    let (rh, rw) = (geometry.resized_height, geometry.resized_width);
 
     // Resize on the uint8 image (PIL-exact bicubic) → f32 HWC in [0, 255].
     let resized: Vec<f32> = if (height, width) == (rh, rw) {
@@ -140,7 +174,9 @@ pub fn preprocess_image(
     }
 
     let pixel_values = Tensor::from_vec(pixel_values, (gh * gw, feat), device)?;
-    Ok((pixel_values, [1, gh as i32, gw as i32]))
+    let grid = [1, gh as i32, gw as i32];
+    debug_assert_eq!(grid, geometry.grid);
+    Ok((pixel_values, grid))
 }
 
 #[cfg(test)]
@@ -153,6 +189,15 @@ mod tests {
         assert_eq!(
             smart_resize(512, 512, 32, MIN_PIXELS, MAX_PIXELS),
             (512, 512)
+        );
+        assert_eq!(
+            image_geometry(2048, 2048).unwrap(),
+            ImageGeometry {
+                resized_height: 2048,
+                resized_width: 2048,
+                grid: [1, 128, 128],
+                merged_tokens: 4096,
+            }
         );
     }
 

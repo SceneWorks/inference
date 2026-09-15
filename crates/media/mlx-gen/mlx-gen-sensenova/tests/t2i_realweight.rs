@@ -8,7 +8,7 @@
 //! asserts the tokenizer encodes the prompt query to the same ids as the reference.
 //!
 //! Requires the local checkpoint + the dumped golden; neither is in CI. Run:
-//!   cargo test -p mlx-gen-sensenova --test t2i_realweight -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sensenova --test integration t2i_realweight:: -- --ignored --nocapture
 //! Override the snapshot dir with `SENSENOVA_SNAPSHOT=/path/to/snapshot`.
 
 use std::path::PathBuf;

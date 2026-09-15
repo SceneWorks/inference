@@ -70,15 +70,16 @@ impl FluxVariant {
 
     pub fn descriptor(self) -> ModelDescriptor {
         ModelDescriptor {
+            encoder_contract: None,
+            denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
+            control_kinds: None,
             required_components: &[],
             id: self.id(),
             family: "flux",
             backend: "mlx",
             modality: Modality::Image,
             capabilities: Capabilities {
-                supports_negative_prompt: false,
                 supports_guidance: self.supports_guidance(),
-                supports_true_cfg: false,
                 // FLUX.1 reference-image conditioning is the XLabs IP-Adapter (epic 3621): a single
                 // `Reference` rides `Conditioning::Reference { image, strength=ipAdapterScale }`,
                 // exactly as SDXL exposes its IP-Adapter. Only wired when a `LoadSpec::ip_adapter`
@@ -110,28 +111,17 @@ impl FluxVariant {
                     s.push("linear");
                     s
                 },
-                supported_guidance_methods: vec![],
                 min_size: 256,
                 max_size: 2048,
                 max_count: 8,
                 mac_only: true,
-                supports_kv_cache: false,
                 requires_sigma_shift: self.requires_sigma_shift(),
                 // Wired onto the shared `Residency` seam (sc-10840); honors Sequential offload —
                 // drops the T5-XXL + CLIP-L text encoders after the prompt encode so peak unified
                 // memory is bounded to `max(T5+CLIP, DiT+VAE)` instead of their sum.
                 supports_sequential_offload: true,
-                supports_streaming: false,
-                supports_multi_speaker: false,
-                supports_conversation_history: false,
-                supports_conversation_session: false,
-                max_speakers: None,
-                // No audio surface (sc-12834): pure image/video model.
-                audio_sample_rates: vec![],
-                max_audio_duration_secs: None,
-                audio_voices: vec![],
-                audio_languages: vec![],
-                audio_edit_modes: vec![],
+                supports_preview: true,
+                ..Default::default()
             },
         }
     }

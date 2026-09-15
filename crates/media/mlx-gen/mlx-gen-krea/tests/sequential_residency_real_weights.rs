@@ -12,7 +12,7 @@
 //!   `SceneWorks/krea2-pose-controlnet-beta` overlay (`KREA_CONTROL_DIR` / `KREA_CONTROL_OVERLAY`); the
 //!   quantized A/B (sc-11727) quantizes the base at load via `with_quant`.
 //!
-//! Run e.g. `cargo test -p mlx-gen-krea --release --test sequential_residency_real_weights --
+//! Run e.g. `cargo test -p mlx-gen-krea --release --test integration sequential_residency_real_weights:: --
 //! --ignored --nocapture`.
 //!
 //! Two claims (the SDXL/Z-Image/Qwen/Lens A/B): (1) `Sequential` peaks LOWER than `Resident` because

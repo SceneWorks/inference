@@ -15,7 +15,7 @@
 //!
 //! Run it:
 //! ```text
-//! cargo test --release -p mlx-gen-flux2 --test compile_micro -- --ignored --nocapture
+//! cargo test --release -p mlx-gen-flux2 --test integration compile_micro:: -- --ignored --nocapture
 //! ```
 
 use std::time::Instant;

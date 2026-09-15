@@ -8,7 +8,7 @@
 //!   BOOGU_ASM_TURBO=1                     (use the Turbo sampler for the verify render)
 //! e.g. assemble Base→Q8 + verify:
 //!   BOOGU_ASM_SRC=<base> BOOGU_ASM_OUT=~/boogu-image-mlx/base CARGO_TARGET_DIR=~/Repos/mlx-gen/target \
-//!     cargo test -p mlx-gen-boogu --test turnkey assemble_turnkey_loads -- --ignored --nocapture
+//!     cargo test -p mlx-gen-boogu --test integration turnkey::assemble_turnkey_loads -- --ignored --nocapture
 
 use std::path::PathBuf;
 

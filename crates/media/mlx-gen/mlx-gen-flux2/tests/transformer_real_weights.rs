@@ -1,7 +1,7 @@
 //! sc-2346 S3: real-weights smoke for the FLUX.2 MMDiT transformer. `#[ignore]`d — needs the real
 //! `black-forest-labs/FLUX.2-klein-9b` snapshot:
 //!
-//!   cargo test -p mlx-gen-flux2 --test transformer_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux2 --test integration transformer_real_weights:: -- --ignored --nocapture
 //!
 //! The committed `transformer_parity.rs` proves the forward *math* bit-tight in f32 on a tiny
 //! config; this proves the *loader* on the real checkpoint — every key + the diffusers→internal

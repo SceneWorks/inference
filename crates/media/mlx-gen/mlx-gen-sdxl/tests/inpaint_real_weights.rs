@@ -1,7 +1,7 @@
 //! sc-3057: SDXL masked-inpaint correctness on real weights.
 //!
 //! `#[ignore]`d — needs the real SDXL snapshot. Run:
-//!   cargo test -p mlx-gen-sdxl --release --test inpaint_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sdxl --release --test integration inpaint_real_weights:: -- --ignored --nocapture
 //!
 //! The inpaint blend rides the already-validated img2img path (sc-2638, pixel-parity to the vendored
 //! reference), so correctness is proven by two end-to-end invariants of the blend itself — no new
@@ -11,7 +11,7 @@
 //!   2. **mask = all-black ⇒ output = VAE round-trip of the init.** Every step pins the latent to the
 //!      init (final step to the clean `x₀`), so decoding equals `decode(encode(init))`.
 
-mod common;
+use crate::common;
 
 use mlx_gen::{Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
 use mlx_gen_sdxl::{decode_image, encode_init_latents, load_vae};

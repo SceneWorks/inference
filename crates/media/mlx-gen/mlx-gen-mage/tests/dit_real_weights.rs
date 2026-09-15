@@ -38,10 +38,10 @@
 //! repository derives no cache location of its own):
 //! ```text
 //! MAGE_SNAPSHOT=/path/to/Mage-Flow-snapshot \
-//!   cargo test --locked -p mlx-gen-mage --release --test dit_real_weights -- --ignored --nocapture
+//!   cargo test --locked -p mlx-gen-mage --release --test integration dit_real_weights:: -- --ignored --nocapture
 //! ```
 
-mod common;
+use crate::common;
 
 use common::{
     bf16_ulp_at, error, ints, peak_abs, require_golden, require_transformer_dir, BLOCK_GOLDEN,

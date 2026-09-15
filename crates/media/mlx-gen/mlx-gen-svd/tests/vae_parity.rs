@@ -4,7 +4,7 @@
 //! model (`tools/dump_svd_vae_golden.py`), in f32 so the gate isolates the math from fp16 rounding.
 //! Needs the SVD checkpoint locally → `--ignored`.
 //!
-//! Run: `cargo test -p mlx-gen-svd --test vae_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-svd --test integration vae_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max as max_op, sqrt, square, subtract, sum};
 use mlx_rs::{Array, Dtype};

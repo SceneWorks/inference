@@ -40,14 +40,22 @@ cargo test --locked --no-default-features --features audio --lib -p runtime-cpu
 ```
 
 Run a **single test**: `cargo test --locked -p <crate> <test_name>`
-(e.g. `cargo test --locked -p mlx-llm --test conformance real_model_passes_core_llm_conformance -- --ignored`).
+(e.g. `cargo test --locked -p mlx-llm --test integration conformance::real_model_passes_core_llm_conformance -- --ignored`).
 Real-weight tests are `#[ignore]`d and gated behind snapshot env vars — see `.github/workflows/real-weights.yml`.
+
+**Parity goldens are single-host, deliberately.** The rows reading `crates/media/mlx-gen/tools/golden/`
+(119 artifacts, 110 test files, 22 crates) fail in 0.00 s on any machine that did not dump them, and
+a fresh clone has none of them. That is the intended state, not a gap: the reference environment is
+named by location (a private `mflux` fork plus a source-built-MLX venv with no lockfile), so a second
+party cannot regenerate one. **Anyone gating on real-weight conformance must count these rows as
+contributing nothing off-host** — a 0.00 s failure still looks like coverage in the run output. Full
+statement and the routes that would change it: `crates/media/mlx-gen/tools/golden/README.md`.
 
 `cargo test` runs **single-threaded** by default here (`.cargo/config.toml` forces
 `RUST_TEST_THREADS=1` with `force = true`): MLX's shared Metal device is not thread-safe and
 parallel tests SIGSEGV. Do not remove or override this.
 
-### Repository gates (Python 3, no deps)
+### Repository gates (Python 3)
 
 ```sh
 ./scripts/check-workspace.py                          # graph invariants (see below)
@@ -55,6 +63,23 @@ python3 -m unittest discover -s scripts/tests -v      # tooling unit tests
 python3 scripts/check_docs.py                         # local doc-link check
 cargo deny --locked check advisories bans licenses sources   # supply-chain policy (deny.toml)
 ```
+
+Everything above is stdlib-only **except the tooling tests**: `test_mmaudio_reference.py` needs
+`numpy` and `safetensors`, which CI installs in the `workspace` job before the discover step. It
+imports them at module scope, so a machine without them does not report a skip — the module fails
+to import and its **16 tests silently vanish from the run**, leaving a plausible-looking
+`Ran 488 tests ... FAILED (errors=1)` that is easy to dismiss as unrelated. Install the CI pins
+once, matching `.github/workflows/ci.yml`:
+
+```sh
+python3 -m pip install --user --break-system-packages numpy==2.4.3 safetensors==0.8.0
+```
+
+`--break-system-packages` is required on a Homebrew Python (PEP 668) and `--user` keeps the
+install in your user site rather than Homebrew's, which is Homebrew's own recommended form when
+overriding. User site is version-scoped, so this needs redoing when Homebrew bumps the Python
+minor. A full local run is `Ran 504 tests ... OK (skipped=1)`; the one skip is the frozen Stable
+Audio 3 checkout, which is a genuine declared skip rather than a missing dependency.
 
 `check-workspace.py` is the enforcement point for the architecture: it asserts the
 `EXPECTED_MEMBER_COUNT` of path members, one root `Cargo.lock`, one `[workspace]` manifest, that all internal deps are path edges
@@ -72,6 +97,16 @@ fetching and cache placement are the consumer's job, and user-supplied models at
 must load. `deny.toml` bans the same network clients for defense in depth. Explicit passed-in-path
 test env vars (`MLX_LLM_TEST_MODEL`, per-crate `*_SNAPSHOT`/`*_SNAPSHOT_DIR`) stay allowed — the
 lint targets cache-location *derivation*, not passed-in paths.
+
+`check_snapshot_path_derivation` extends that boundary into **test harnesses**, where the same defect
+survived unlinted: a resolver that reads `$HOME` with no override anywhere in its chain means
+pointing a variable at a real store reads somewhere else, so the row skips or mis-resolves *while
+still reporting green*. It fails a `$HOME` read in a function that also joins a store-shaped literal
+and reads no other env var — all three conditions, because dropping any one re-flags the legitimate
+`env::var(NAME).unwrap_or_else(|_| home.join(…))` fallback the passing harnesses use. The fix shape
+is **adding the override, not deleting the path**: keep `$HOME` as the default for a *derived cache*
+the tests build themselves (`MLX_GEN_CONVERTED_ROOT`, `LTX_GOLDEN_ROOT`), and hard-fail with the
+epic-13657 message for a *provided input* (`BOOGU_VISION_TEST_IMAGE`).
 
 ## Architecture — explicit composition (the core invariant)
 

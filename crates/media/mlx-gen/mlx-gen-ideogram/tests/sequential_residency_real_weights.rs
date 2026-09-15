@@ -2,7 +2,7 @@
 //!
 //! `#[ignore]`d — needs a converted Ideogram 4 MLX snapshot (`IDEOGRAM4_MLX`, else
 //! `~/.cache/ideogram4-mlx-convert`) and Metal. Run:
-//!   cargo test -p mlx-gen-ideogram --release --test sequential_residency_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-ideogram --release --test integration sequential_residency_real_weights:: -- --ignored --nocapture
 //!
 //! Same two claims as the SD3 / SANA / Lens A/Bs: (1) `Sequential` peaks LOWER than `Resident` because
 //! the Qwen3-VL text encoder is dropped (+ `clear_cache()`) before the two DiTs + VAE materialize, and

@@ -172,8 +172,8 @@ mod tests {
         w
     }
 
-    fn temp_file(label: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
+    fn temp_file(tmp: &tempfile::TempDir, label: &str) -> std::path::PathBuf {
+        tmp.path().join(format!(
             "mlx-gen-seedvr2-{label}-{}-{}.safetensors",
             std::process::id(),
             std::thread::current().name().unwrap_or("test")
@@ -182,6 +182,7 @@ mod tests {
 
     #[test]
     fn offline_snapshot_stores_shared_attention_once_and_loader_expands_it() {
+        let tmp = tempfile::tempdir().unwrap();
         let raw = synthetic_dit();
         let stored = convert_dit_for_storage(&raw).unwrap();
 
@@ -193,8 +194,8 @@ mod tests {
         assert!(stored.get("blocks.2.attn.proj_qkv_txt.weight").is_some());
         assert!(stored.get("blocks.10.ada.params_all.weight").is_some());
 
-        let compact_path = temp_file("compact");
-        let legacy_path = temp_file("legacy");
+        let compact_path = temp_file(&tmp, "compact");
+        let legacy_path = temp_file(&tmp, "legacy");
         save_weights(&stored, &compact_path).unwrap();
         save_weights(&convert_dit(&raw).unwrap(), &legacy_path).unwrap();
 

@@ -2,7 +2,7 @@
 //!
 //! All `#[ignore]`d and real-weights-gated: they need the `circlestone-labs/Anima` base snapshot
 //! (DiT + TE + VAE) and the `Anima-Official-LoRAs` snapshot in the HF cache, plus Metal. Run with:
-//!   cargo test -p mlx-gen-anima --release --test packed_adapters -- --ignored --nocapture
+//!   cargo test -p mlx-gen-anima --release --test integration packed_adapters:: -- --ignored --nocapture
 //!
 //! CI runs none of these (no weights). The *math* — that a packed base installs the structured
 //! Kronecker form and that the residual matches the materialized one — is covered in CI by the shared
@@ -38,7 +38,10 @@
 //! and a scale-0 adapter is an exact no-op. A fold would break every one of those while leaving
 //! `rel_err` at ~0.
 
-mod common;
+use crate::common;
+
+#[path = "../../tests/support/atomic_cache.rs"]
+mod atomic_cache;
 
 use std::path::{Path, PathBuf};
 
@@ -66,33 +69,34 @@ const DIT_Q_KEY: &str = "diffusion_model.blocks.0.self_attn.q_proj";
 ///
 /// Cached across runs — quantizing the 3.9 GB bf16 DiT takes real time, and the output is a pure
 /// function of (source checkpoint, bits, group_size).
-fn packed_split_files(bits: i32) -> PathBuf {
+fn packed_split_files(tmp: &tempfile::TempDir, bits: i32) -> PathBuf {
     let real = split_files().expect("Anima base snapshot");
-    let root = std::env::temp_dir().join(format!("anima_sc10578_q{bits}/split_files"));
+    let root = tmp
+        .path()
+        .join(format!("anima_sc10578_q{bits}/split_files"));
     let dit_dst = root
         .join("diffusion_models")
         .join(Variant::Base.dit_filename());
 
     if !dit_dst.is_file() {
-        std::fs::create_dir_all(dit_dst.parent().unwrap()).unwrap();
+        let staging = atomic_cache::prepare_staging(&dit_dst).expect("prepare packed DiT staging");
         let dit_src = real
             .join("diffusion_models")
             .join(Variant::Base.dit_filename());
         eprintln!("[sc-10578] packing {} → q{bits} …", dit_src.display());
-        quantize_anima_dit(&dit_src, &dit_dst, bits, 64).expect("quantize DiT");
+        quantize_anima_dit(&dit_src, &staging, bits, 64).expect("quantize DiT");
+        atomic_cache::publish(&staging, &dit_dst).expect("publish packed DiT");
     }
     // Symlink the components the converter leaves dense (idempotent).
     for sub in ["text_encoders", "vae"] {
         let dst = root.join(sub);
-        if !dst.exists() {
-            std::os::unix::fs::symlink(real.join(sub), &dst).unwrap();
-        }
+        atomic_cache::symlink_or_reuse(&real.join(sub), &dst).expect("publish component symlink");
     }
     root
 }
 
-fn load_packed(bits: i32) -> AnimaComponents {
-    let root = packed_split_files(bits);
+fn load_packed(tmp: &tempfile::TempDir, bits: i32) -> AnimaComponents {
+    let root = packed_split_files(tmp, bits);
     AnimaComponents::load(&WeightsSource::Dir(root), Variant::Base).expect("load packed components")
 }
 
@@ -127,10 +131,11 @@ fn assert_dit_is_packed(c: &mut AnimaComponents, bits: i32) {
 #[test]
 #[ignore = "needs the circlestone-labs/Anima + Anima-Official-LoRAs snapshots; SLOW (packs a 3.9 GB DiT)"]
 fn packed_dit_lora_is_additive_over_packed_codes() {
+    let tmp = tempfile::tempdir().unwrap();
     let lw = Weights::from_file(style_lora()).expect("style LoRA");
 
     for bits in [4, 8] {
-        let mut c = load_packed(bits);
+        let mut c = load_packed(&tmp, bits);
         assert_dit_is_packed(&mut c, bits);
 
         // Capture the PACKED base forward AND the packed triple before injection. Force-eval: the
@@ -203,7 +208,7 @@ fn packed_dit_lora_is_additive_over_packed_codes() {
         // MUTATION: at scale 0 the residual vanishes, so the forward must return to the packed base
         // exactly. If this does not hold, `y_base` was not really the pre-injection packed forward and
         // the assertion above is measuring nothing.
-        let mut c0 = load_packed(bits);
+        let mut c0 = load_packed(&tmp, bits);
         let y0_base = c0
             .dit
             .adaptable_mut(DIT_Q_PATH)
@@ -238,9 +243,10 @@ fn packed_dit_lora_is_additive_over_packed_codes() {
 #[test]
 #[ignore = "needs the circlestone-labs/Anima snapshot; SLOW (packs a 3.9 GB DiT)"]
 fn packed_dit_lokr_is_structured_while_dense_conditioner_stays_materialized() {
-    let lokr = synth_lokr();
+    let tmp = tempfile::tempdir().unwrap();
+    let lokr = synth_lokr(&tmp);
     let bits = 4;
-    let mut c = load_packed(bits);
+    let mut c = load_packed(&tmp, bits);
     assert_dit_is_packed(&mut c, bits);
 
     // The converter keeps the bundled conditioner dense (sc-10517 policy) — verify, don't assume.
@@ -340,11 +346,12 @@ fn write_ppm(path: &Path, pixels: &[u8], w: u32, h: u32) {
 #[test]
 #[ignore = "needs both Anima snapshots; VERY SLOW (packs a 3.9 GB DiT, then two 30-step 1024² denoises)"]
 fn packed_q4_plus_style_lora_generates_a_visibly_restyled_image() {
+    let tmp = tempfile::tempdir().unwrap();
     use mlx_gen::runtime::CancelFlag;
     use mlx_gen::Progress;
     use mlx_gen_anima::pipeline::{AnimaPipeline, GenOptions};
 
-    let root = packed_split_files(4);
+    let root = packed_split_files(&tmp, 4);
     let opts = GenOptions {
         width: 1024,
         height: 1024,
@@ -374,8 +381,8 @@ fn packed_q4_plus_style_lora_generates_a_visibly_restyled_image() {
     let plain = gen(&[]);
     let styled = gen(&[lora_spec(style_lora(), 1.0)]);
 
-    let dir = std::env::temp_dir().join("anima_sc10578_images");
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_tmp = tempfile::tempdir().unwrap();
+    let dir = dir_tmp.path().to_path_buf();
     write_ppm(&dir.join("q4_plain.ppm"), &plain.pixels, 1024, 1024);
     write_ppm(&dir.join("q4_style_lora.ppm"), &styled.pixels, 1024, 1024);
     println!("[sc-10578] wrote images to {}", dir.display());

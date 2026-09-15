@@ -11,7 +11,7 @@
 //!
 //! Run (torch venv for the golden, then cargo):
 //!   ~/.bisenet-spike/venv/bin/python tools/convert_bisenet.py
-//!   cargo test -p mlx-gen-face --release --test bisenet_parity -- --ignored --nocapture
+//!   cargo test -p mlx-gen-face --release --test integration bisenet_parity:: -- --ignored --nocapture
 
 use mlx_gen::weights::Weights;
 use mlx_gen_face::{bisenet, face_features_image, BiSeNet};

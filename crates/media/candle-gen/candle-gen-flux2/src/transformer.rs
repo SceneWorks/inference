@@ -13,7 +13,9 @@
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 use candle_gen::candle_nn::{ops::softmax_last_dim, rms_norm, Module, RmsNorm, VarBuilder};
+use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::Quant;
+use candle_gen::Result as GenResult;
 
 use crate::config::Flux2Config;
 use crate::pos_embed::Flux2PosEmbed;
@@ -72,22 +74,22 @@ fn timestep_embedding(t: f32, dim: usize, device: &Device) -> Result<Tensor> {
 /// i32-overflow-safe [`candle_gen::sdpa_budgeted_bhsd`] (sc-9570), which chunks over the query rows once
 /// the `[B,H,Sq,Sk]` scores tensor would exceed [`candle_gen::ATTN_SCORES_BUDGET`] (the candle CUDA
 /// i32-index limit). The `softmax_last_dim` closure keeps the exact fused softmax; each query row's
-/// softmax is over all keys and independent, so the chunked result is byte-identical to the single pass —
-/// only the long edit/joint sequences trip it. This crate does the head-merge transpose/reshape here.
-fn attention(q: &Tensor, k: &Tensor, v: &Tensor, head_dim: usize) -> Result<Tensor> {
+/// softmax is over all keys and independent, so the chunked result is *mathematically* equal to the
+/// single pass — not bitwise equal, since narrowing the query axis changes the GEMM `M` and so may change
+/// the f32 accumulation order (SC-15943). Only the long edit/joint sequences trip it. This crate does the
+/// head-merge transpose/reshape here.
+fn attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    head_dim: usize,
+    plan: AttentionPlan<'_>,
+) -> GenResult<Tensor> {
     let (b, _h, s, _d) = q.dims4()?;
     let scale = (head_dim as f64).powf(-0.5);
-    let o = candle_gen::sdpa_budgeted_bhsd(
-        q,
-        k,
-        v,
-        scale,
-        None,
-        softmax_last_dim,
-        candle_gen::ATTN_SCORES_BUDGET,
-    )?; // [B,H,S,D]
+    let o = candle_gen::sdpa_planned_bhsd(q, k, v, scale, None, softmax_last_dim, plan)?; // [B,H,S,D]
     let (_b, h, _s, d) = o.dims4()?;
-    o.transpose(1, 2)?.reshape((b, s, h * d))
+    Ok(o.transpose(1, 2)?.reshape((b, s, h * d))?)
 }
 
 /// Reshape `[B,S,inner]` → `[B,H,S,head_dim]`, applying per-head RMSNorm (over head_dim) when `norm`
@@ -102,6 +104,79 @@ fn to_heads(x: &Tensor, heads: usize, head_dim: usize, norm: Option<&RmsNorm>) -
     x.transpose(1, 2)?.contiguous() // [B,H,S,head_dim]
 }
 
+/// Where DiT weights come from at construction (sc-21485): the diffusers-keyed **VarBuilder**
+/// tree (directory snapshots, the in-memory dev ComfyUI map), or the shared mapped logical-weight
+/// reader over a **planned** single-file checkpoint
+/// ([`crate::single_file::PlannedDitWeights`]), which can hand back packed NVFP4 projections a
+/// VarBuilder cannot express. One constructor tree serves both, so the model topology cannot
+/// drift between the two sources.
+#[derive(Clone)]
+pub(crate) enum DitWeights<'a> {
+    Vb(VarBuilder<'static>),
+    Planned {
+        src: &'a crate::single_file::PlannedDitWeights,
+        prefix: String,
+    },
+}
+
+impl<'a> DitWeights<'a> {
+    fn join(prefix: &str, name: &str) -> String {
+        if prefix.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{prefix}.{name}")
+        }
+    }
+
+    /// Push one dotted path segment (the `VarBuilder::pp` analog).
+    fn pp(&self, seg: impl std::string::ToString) -> DitWeights<'a> {
+        match self {
+            Self::Vb(vb) => Self::Vb(vb.pp(seg.to_string())),
+            Self::Planned { src, prefix } => Self::Planned {
+                src,
+                prefix: Self::join(prefix, &seg.to_string()),
+            },
+        }
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        match self {
+            Self::Vb(vb) => vb.contains_tensor(name),
+            Self::Planned { src, prefix } => src.contains(&Self::join(prefix, name)),
+        }
+    }
+
+    /// Build one projection under this prefix. The VarBuilder arm keeps the packed-tier detecting
+    /// [`QLinear::linear_detect`]; the planned arm constructs from the reader's Dense/`PackedNvfp4`
+    /// logical tensor — the plan's decision, never a re-classification here.
+    fn linear(&self, in_dim: usize, out_dim: usize, name: &str, bias: bool) -> Result<QLinear> {
+        match self {
+            Self::Vb(vb) => QLinear::linear_detect(in_dim, out_dim, vb, name, bias),
+            Self::Planned { src, prefix } => {
+                src.qlinear(&Self::join(prefix, name), in_dim, out_dim, bias)
+            }
+        }
+    }
+
+    /// Build one per-head RMSNorm (`{name}.weight`) at `eps`.
+    fn rms_norm(&self, dim: usize, eps: f64, name: &str) -> Result<RmsNorm> {
+        match self {
+            Self::Vb(vb) => rms_norm(dim, eps, vb.pp(name)),
+            Self::Planned { src, prefix } => {
+                let key = format!("{}.weight", Self::join(prefix, name));
+                src.rms_norm(&key, eps)
+            }
+        }
+    }
+
+    fn device(&self) -> Device {
+        match self {
+            Self::Vb(vb) => vb.device().clone(),
+            Self::Planned { src, .. } => src.device().clone(),
+        }
+    }
+}
+
 /// A sinusoidal-scalar embedding MLP: `timestep_embedding → linear_1 → silu → linear_2` → `[1, inner]`.
 /// Shared by the timestep and (dev) guidance branches of `time_guidance_embed`.
 struct SinEmbed {
@@ -111,11 +186,11 @@ struct SinEmbed {
 }
 
 impl SinEmbed {
-    fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Flux2Config, vb: DitWeights<'_>) -> Result<Self> {
         let inner = cfg.inner_dim();
         Ok(Self {
-            linear_1: QLinear::linear_detect(cfg.timestep_channels, inner, &vb, "linear_1", false)?,
-            linear_2: QLinear::linear_detect(inner, inner, &vb, "linear_2", false)?,
+            linear_1: vb.linear(cfg.timestep_channels, inner, "linear_1", false)?,
+            linear_2: vb.linear(inner, inner, "linear_2", false)?,
             channels: cfg.timestep_channels,
         })
     }
@@ -142,7 +217,7 @@ struct TimeGuidanceEmbed {
 }
 
 impl TimeGuidanceEmbed {
-    fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Flux2Config, vb: DitWeights<'_>) -> Result<Self> {
         let timestep = SinEmbed::new(cfg, vb.pp("timestep_embedder"))?;
         // The guidance embedder exists only on dev; gate on the weight (mirrors the mlx `w.get(...)`
         // presence check) so a klein checkpoint loads without looking for absent keys.
@@ -182,10 +257,10 @@ struct Modulation {
 }
 
 impl Modulation {
-    fn new(cfg: &Flux2Config, sets: usize, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Flux2Config, sets: usize, vb: DitWeights<'_>) -> Result<Self> {
         let inner = cfg.inner_dim();
         Ok(Self {
-            linear: QLinear::linear_detect(inner, 3 * sets * inner, &vb, "linear", false)?,
+            linear: vb.linear(inner, 3 * sets * inner, "linear", false)?,
             sets,
         })
     }
@@ -229,25 +304,25 @@ struct DoubleAttention {
 }
 
 impl DoubleAttention {
-    fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Flux2Config, vb: DitWeights<'_>) -> Result<Self> {
         let inner = cfg.inner_dim();
         let hd = cfg.head_dim;
         Ok(Self {
-            to_q: QLinear::linear_detect(inner, inner, &vb, "to_q", false)?,
-            to_k: QLinear::linear_detect(inner, inner, &vb, "to_k", false)?,
-            to_v: QLinear::linear_detect(inner, inner, &vb, "to_v", false)?,
+            to_q: vb.linear(inner, inner, "to_q", false)?,
+            to_k: vb.linear(inner, inner, "to_k", false)?,
+            to_v: vb.linear(inner, inner, "to_v", false)?,
             // `to_out.0`: the packed `.scales`/`.biases` siblings sit under the same dotted prefix, so
-            // pass the full `to_out.0` base to `linear_detect` (never `.pp("0")` past the sibling — the
+            // pass the full `to_out.0` base to `linear` (never `.pp("0")` past the sibling — the
             // sc-8670 remap trap the story flags).
-            to_out: QLinear::linear_detect(inner, inner, &vb, "to_out.0", false)?,
-            norm_q: rms_norm(hd, RMS_EPS, vb.pp("norm_q"))?,
-            norm_k: rms_norm(hd, RMS_EPS, vb.pp("norm_k"))?,
-            add_q: QLinear::linear_detect(inner, inner, &vb, "add_q_proj", false)?,
-            add_k: QLinear::linear_detect(inner, inner, &vb, "add_k_proj", false)?,
-            add_v: QLinear::linear_detect(inner, inner, &vb, "add_v_proj", false)?,
-            to_add_out: QLinear::linear_detect(inner, inner, &vb, "to_add_out", false)?,
-            norm_added_q: rms_norm(hd, RMS_EPS, vb.pp("norm_added_q"))?,
-            norm_added_k: rms_norm(hd, RMS_EPS, vb.pp("norm_added_k"))?,
+            to_out: vb.linear(inner, inner, "to_out.0", false)?,
+            norm_q: vb.rms_norm(hd, RMS_EPS, "norm_q")?,
+            norm_k: vb.rms_norm(hd, RMS_EPS, "norm_k")?,
+            add_q: vb.linear(inner, inner, "add_q_proj", false)?,
+            add_k: vb.linear(inner, inner, "add_k_proj", false)?,
+            add_v: vb.linear(inner, inner, "add_v_proj", false)?,
+            to_add_out: vb.linear(inner, inner, "to_add_out", false)?,
+            norm_added_q: vb.rms_norm(hd, RMS_EPS, "norm_added_q")?,
+            norm_added_k: vb.rms_norm(hd, RMS_EPS, "norm_added_k")?,
             heads: cfg.num_heads,
             head_dim: hd,
         })
@@ -280,7 +355,8 @@ impl DoubleAttention {
         norm_txt: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-    ) -> Result<(Tensor, Tensor)> {
+        attention_plan: AttentionPlan<'_>,
+    ) -> GenResult<(Tensor, Tensor)> {
         let (h, hd) = (self.heads, self.head_dim);
         let txt_seq = norm_txt.dim(1)?;
 
@@ -310,7 +386,7 @@ impl DoubleAttention {
         let q = Flux2PosEmbed::apply(&q, cos, sin)?;
         let k = Flux2PosEmbed::apply(&k, cos, sin)?;
 
-        let o = attention(&q, &k, &v, hd)?; // [B, txt_seq+img_seq, inner]
+        let o = attention(&q, &k, &v, hd, attention_plan)?; // [B, txt_seq+img_seq, inner]
         let txt_out = o.narrow(1, 0, txt_seq)?;
         let img_out = o.narrow(1, txt_seq, o.dim(1)? - txt_seq)?;
         let txt_out = self.to_add_out.forward(&txt_out.contiguous()?)?;
@@ -326,10 +402,10 @@ struct FeedForward {
 }
 
 impl FeedForward {
-    fn new(in_dim: usize, hidden: usize, vb: VarBuilder) -> Result<Self> {
+    fn new(in_dim: usize, hidden: usize, vb: DitWeights<'_>) -> Result<Self> {
         Ok(Self {
-            linear_in: QLinear::linear_detect(in_dim, 2 * hidden, &vb, "linear_in", false)?,
-            linear_out: QLinear::linear_detect(hidden, in_dim, &vb, "linear_out", false)?,
+            linear_in: vb.linear(in_dim, 2 * hidden, "linear_in", false)?,
+            linear_out: vb.linear(hidden, in_dim, "linear_out", false)?,
         })
     }
 
@@ -351,7 +427,7 @@ struct DoubleBlock {
 }
 
 impl DoubleBlock {
-    fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Flux2Config, vb: DitWeights<'_>) -> Result<Self> {
         let inner = cfg.inner_dim();
         let ff_hidden = (cfg.mlp_ratio * inner as f32) as usize;
         Ok(Self {
@@ -377,7 +453,8 @@ impl DoubleBlock {
         txt_mod: &[(Tensor, Tensor, Tensor)],
         cos: &Tensor,
         sin: &Tensor,
-    ) -> Result<(Tensor, Tensor)> {
+        attention_plan: AttentionPlan<'_>,
+    ) -> GenResult<(Tensor, Tensor)> {
         let (shift_msa, scale_msa, gate_msa) = &img_mod[0];
         let (shift_mlp, scale_mlp, gate_mlp) = &img_mod[1];
         let (c_shift_msa, c_scale_msa, c_gate_msa) = &txt_mod[0];
@@ -385,7 +462,9 @@ impl DoubleBlock {
 
         let norm_img = modulate(&layer_norm(img)?, scale_msa, shift_msa)?;
         let norm_txt = modulate(&layer_norm(txt)?, c_scale_msa, c_shift_msa)?;
-        let (img_attn, txt_attn) = self.attn.forward(&norm_img, &norm_txt, cos, sin)?;
+        let (img_attn, txt_attn) =
+            self.attn
+                .forward(&norm_img, &norm_txt, cos, sin, attention_plan)?;
         let mut img = gated(img, gate_msa, &img_attn)?;
         let mut txt = gated(txt, c_gate_msa, &txt_attn)?;
 
@@ -413,17 +492,17 @@ struct SingleBlock {
 }
 
 impl SingleBlock {
-    fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Flux2Config, vb: DitWeights<'_>) -> Result<Self> {
         let inner = cfg.inner_dim();
         let mlp_hidden = cfg.single_mlp_hidden();
         let proj_out = 3 * inner + 2 * mlp_hidden;
         // The single block's projections nest under `attn.` in the diffusers checkpoint.
         let attn = vb.pp("attn");
         Ok(Self {
-            to_qkv_mlp: QLinear::linear_detect(inner, proj_out, &attn, "to_qkv_mlp_proj", false)?,
-            to_out: QLinear::linear_detect(inner + mlp_hidden, inner, &attn, "to_out", false)?,
-            norm_q: rms_norm(cfg.head_dim, RMS_EPS, attn.pp("norm_q"))?,
-            norm_k: rms_norm(cfg.head_dim, RMS_EPS, attn.pp("norm_k"))?,
+            to_qkv_mlp: attn.linear(inner, proj_out, "to_qkv_mlp_proj", false)?,
+            to_out: attn.linear(inner + mlp_hidden, inner, "to_out", false)?,
+            norm_q: attn.rms_norm(cfg.head_dim, RMS_EPS, "norm_q")?,
+            norm_k: attn.rms_norm(cfg.head_dim, RMS_EPS, "norm_k")?,
             inner,
             heads: cfg.num_heads,
             head_dim: cfg.head_dim,
@@ -444,7 +523,8 @@ impl SingleBlock {
         m: &(Tensor, Tensor, Tensor),
         cos: &Tensor,
         sin: &Tensor,
-    ) -> Result<Tensor> {
+        attention_plan: AttentionPlan<'_>,
+    ) -> GenResult<Tensor> {
         let (shift, scale, gate) = m;
         let norm = modulate(&layer_norm(hidden)?, scale, shift)?;
         let proj = self.to_qkv_mlp.forward(&norm)?;
@@ -459,12 +539,12 @@ impl SingleBlock {
         let v = to_heads(&v, self.heads, self.head_dim, None)?;
         let q = Flux2PosEmbed::apply(&q, cos, sin)?;
         let k = Flux2PosEmbed::apply(&k, cos, sin)?;
-        let attn = attention(&q, &k, &v, self.head_dim)?; // [B,S,inner]
+        let attn = attention(&q, &k, &v, self.head_dim, attention_plan)?; // [B,S,inner]
 
         let mlp = swiglu(&mlp)?; // [B,S,mlp_hidden]
         let cat = Tensor::cat(&[&attn, &mlp], D::Minus1)?;
         let attn_output = self.to_out.forward(&cat)?;
-        gated(hidden, gate, &attn_output)
+        Ok(gated(hidden, gate, &attn_output)?)
     }
 }
 
@@ -475,10 +555,10 @@ struct NormOut {
 }
 
 impl NormOut {
-    fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Flux2Config, vb: DitWeights<'_>) -> Result<Self> {
         let inner = cfg.inner_dim();
         Ok(Self {
-            linear: QLinear::linear_detect(inner, 2 * inner, &vb, "linear", false)?,
+            linear: vb.linear(inner, 2 * inner, "linear", false)?,
         })
     }
 
@@ -507,6 +587,19 @@ struct Flux2RopeCache {
     sin: Tensor,
 }
 
+enum Flux2Blocks {
+    Resident {
+        double: Vec<DoubleBlock>,
+        single: Vec<SingleBlock>,
+    },
+    Streamed {
+        weights: VarBuilder<'static>,
+        config: Box<Flux2Config>,
+        quant: Option<Quant>,
+        target_device: Device,
+    },
+}
+
 pub struct Flux2Transformer {
     x_embedder: QLinear,
     context_embedder: QLinear,
@@ -514,8 +607,7 @@ pub struct Flux2Transformer {
     mod_img: Modulation,
     mod_txt: Modulation,
     mod_single: Modulation,
-    double_blocks: Vec<DoubleBlock>,
-    single_blocks: Vec<SingleBlock>,
+    blocks: Flux2Blocks,
     norm_out: NormOut,
     proj_out: QLinear,
     pos_embed: Flux2PosEmbed,
@@ -526,25 +618,160 @@ pub struct Flux2Transformer {
 }
 
 impl Flux2Transformer {
-    pub fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &Flux2Config, vb: VarBuilder<'static>) -> Result<Self> {
+        Self::new_with_blocks(cfg, DitWeights::Vb(vb), false, None, None)
+    }
+
+    /// Build resident from a **planned single-file** weight source (sc-21485): the shared
+    /// logical-weight reader hands each projection back as Dense or `PackedNvfp4`, and this
+    /// constructor tree consumes either through [`DitWeights`]. Block streaming and load-time
+    /// quant folding do not apply to this source (the packed rows are already quantized).
+    pub(crate) fn new_planned(
+        cfg: &Flux2Config,
+        src: &crate::single_file::PlannedDitWeights,
+    ) -> Result<Self> {
+        Self::new_with_blocks(
+            cfg,
+            DitWeights::Planned {
+                src,
+                prefix: String::new(),
+            },
+            false,
+            None,
+            None,
+        )
+    }
+
+    pub fn visit_adaptable_mut(
+        &mut self,
+        visitor: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        visitor("x_embedder", &mut self.x_embedder)?;
+        visitor("context_embedder", &mut self.context_embedder)?;
+        visitor(
+            "time_guidance_embed.timestep_embedder.linear_1",
+            &mut self.time_embed.timestep.linear_1,
+        )?;
+        visitor(
+            "time_guidance_embed.timestep_embedder.linear_2",
+            &mut self.time_embed.timestep.linear_2,
+        )?;
+        if let Some(guidance) = &mut self.time_embed.guidance {
+            visitor(
+                "time_guidance_embed.guidance_embedder.linear_1",
+                &mut guidance.linear_1,
+            )?;
+            visitor(
+                "time_guidance_embed.guidance_embedder.linear_2",
+                &mut guidance.linear_2,
+            )?;
+        }
+        visitor(
+            "double_stream_modulation_img.linear",
+            &mut self.mod_img.linear,
+        )?;
+        visitor(
+            "double_stream_modulation_txt.linear",
+            &mut self.mod_txt.linear,
+        )?;
+        visitor(
+            "single_stream_modulation.linear",
+            &mut self.mod_single.linear,
+        )?;
+        match &mut self.blocks {
+            Flux2Blocks::Resident { double, single } => {
+                for (index, block) in double.iter_mut().enumerate() {
+                    let prefix = format!("transformer_blocks.{index}");
+                    for (name, linear) in [
+                        ("to_q", &mut block.attn.to_q),
+                        ("to_k", &mut block.attn.to_k),
+                        ("to_v", &mut block.attn.to_v),
+                        ("to_out.0", &mut block.attn.to_out),
+                        ("add_q_proj", &mut block.attn.add_q),
+                        ("add_k_proj", &mut block.attn.add_k),
+                        ("add_v_proj", &mut block.attn.add_v),
+                        ("to_add_out", &mut block.attn.to_add_out),
+                    ] {
+                        visitor(&format!("{prefix}.attn.{name}"), linear)?;
+                    }
+                    visitor(&format!("{prefix}.ff.linear_in"), &mut block.ff.linear_in)?;
+                    visitor(&format!("{prefix}.ff.linear_out"), &mut block.ff.linear_out)?;
+                    visitor(
+                        &format!("{prefix}.ff_context.linear_in"),
+                        &mut block.ff_context.linear_in,
+                    )?;
+                    visitor(
+                        &format!("{prefix}.ff_context.linear_out"),
+                        &mut block.ff_context.linear_out,
+                    )?;
+                }
+                for (index, block) in single.iter_mut().enumerate() {
+                    let prefix = format!("single_transformer_blocks.{index}.attn");
+                    visitor(&format!("{prefix}.to_qkv_mlp_proj"), &mut block.to_qkv_mlp)?;
+                    visitor(&format!("{prefix}.to_out"), &mut block.to_out)?;
+                }
+            }
+            Flux2Blocks::Streamed { .. } => {
+                candle_gen::candle_core::bail!(
+                    "FLUX.2 adapters require resident transformer blocks; disable block streaming"
+                )
+            }
+        }
+        visitor("norm_out.linear", &mut self.norm_out.linear)?;
+        visitor("proj_out", &mut self.proj_out)
+    }
+
+    /// Build only the non-block FLUX.2 trunk and retain host-backed block weights. Each forward
+    /// materializes one admitted window, executes it, synchronizes, and releases it before advancing.
+    pub fn new_block_streamed(
+        cfg: &Flux2Config,
+        vb: VarBuilder<'static>,
+        quant: Option<Quant>,
+        target_device: Device,
+    ) -> Result<Self> {
+        Self::new_with_blocks(cfg, DitWeights::Vb(vb), true, quant, Some(target_device))
+    }
+
+    fn new_with_blocks(
+        cfg: &Flux2Config,
+        vb: DitWeights<'_>,
+        stream_blocks: bool,
+        quant: Option<Quant>,
+        target_device: Option<Device>,
+    ) -> Result<Self> {
         let inner = cfg.inner_dim();
-        let mut double_blocks = Vec::with_capacity(cfg.num_double_layers);
-        for i in 0..cfg.num_double_layers {
-            double_blocks.push(DoubleBlock::new(cfg, vb.pp("transformer_blocks").pp(i))?);
-        }
-        let mut single_blocks = Vec::with_capacity(cfg.num_single_layers);
-        for i in 0..cfg.num_single_layers {
-            single_blocks.push(SingleBlock::new(
-                cfg,
-                vb.pp("single_transformer_blocks").pp(i),
-            )?);
-        }
-        Ok(Self {
-            x_embedder: QLinear::linear_detect(cfg.in_channels, inner, &vb, "x_embedder", false)?,
-            context_embedder: QLinear::linear_detect(
+        let blocks = if stream_blocks {
+            let DitWeights::Vb(weights) = &vb else {
+                candle_gen::candle_core::bail!(
+                    "FLUX.2 block streaming requires a VarBuilder-backed transformer tier; the \
+                     planned single-file source is resident-only"
+                )
+            };
+            Flux2Blocks::Streamed {
+                weights: weights.clone(),
+                config: Box::new(*cfg),
+                quant,
+                target_device: target_device.clone().unwrap_or_else(|| vb.device()),
+            }
+        } else {
+            let mut double = Vec::with_capacity(cfg.num_double_layers);
+            for i in 0..cfg.num_double_layers {
+                double.push(DoubleBlock::new(cfg, vb.pp("transformer_blocks").pp(i))?);
+            }
+            let mut single = Vec::with_capacity(cfg.num_single_layers);
+            for i in 0..cfg.num_single_layers {
+                single.push(SingleBlock::new(
+                    cfg,
+                    vb.pp("single_transformer_blocks").pp(i),
+                )?);
+            }
+            Flux2Blocks::Resident { double, single }
+        };
+        let mut transformer = Self {
+            x_embedder: vb.linear(cfg.in_channels, inner, "x_embedder", false)?,
+            context_embedder: vb.linear(
                 cfg.joint_attention_dim,
                 inner,
-                &vb,
                 "context_embedder",
                 false,
             )?,
@@ -552,14 +779,22 @@ impl Flux2Transformer {
             mod_img: Modulation::new(cfg, 2, vb.pp("double_stream_modulation_img"))?,
             mod_txt: Modulation::new(cfg, 2, vb.pp("double_stream_modulation_txt"))?,
             mod_single: Modulation::new(cfg, 1, vb.pp("single_stream_modulation"))?,
-            double_blocks,
-            single_blocks,
+            blocks,
             norm_out: NormOut::new(cfg, vb.pp("norm_out"))?,
-            proj_out: QLinear::linear_detect(inner, cfg.out_channels, &vb, "proj_out", false)?,
+            proj_out: vb.linear(inner, cfg.out_channels, "proj_out", false)?,
             pos_embed: Flux2PosEmbed::new(cfg),
-            device: vb.device().clone(),
+            device: vb.device(),
             rope_cache: std::sync::Mutex::new(None),
-        })
+        };
+        if stream_blocks {
+            if let Some(quant) = quant {
+                let device = target_device
+                    .as_ref()
+                    .expect("streamed transformer target device");
+                transformer.quantize_non_blocks(quant, device)?;
+            }
+        }
+        Ok(transformer)
     }
 
     /// Build (or reuse) the `[txt, img]` RoPE `(cos, sin)` tables for this render's fixed geometry
@@ -592,18 +827,25 @@ impl Flux2Transformer {
     /// `QLinear`. The affine-free LayerNorms hold no weights, and `pos_embed` builds its RoPE tables on
     /// `self.device` at forward time, so updating `self.device` is enough to move them.
     pub fn quantize(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        self.quantize_non_blocks(quant, device)?;
+        if let Flux2Blocks::Resident { double, single } = &mut self.blocks {
+            for b in double {
+                b.quantize_onto(quant, device)?;
+            }
+            for b in single {
+                b.quantize_onto(quant, device)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn quantize_non_blocks(&mut self, quant: Quant, device: &Device) -> Result<()> {
         self.x_embedder.quantize_onto(quant, device)?;
         self.context_embedder.quantize_onto(quant, device)?;
         self.time_embed.quantize_onto(quant, device)?;
         self.mod_img.quantize_onto(quant, device)?;
         self.mod_txt.quantize_onto(quant, device)?;
         self.mod_single.quantize_onto(quant, device)?;
-        for b in &mut self.double_blocks {
-            b.quantize_onto(quant, device)?;
-        }
-        for b in &mut self.single_blocks {
-            b.quantize_onto(quant, device)?;
-        }
         self.norm_out.quantize_onto(quant, device)?;
         self.proj_out.quantize_onto(quant, device)?;
         self.device = device.clone();
@@ -628,6 +870,36 @@ impl Flux2Transformer {
         timestep: f32,
         guidance: Option<f32>,
     ) -> Result<Tensor> {
+        self.forward_with_memory(
+            hidden_states,
+            encoder_hidden_states,
+            img_ids,
+            txt_ids,
+            timestep,
+            guidance,
+            AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+                candle_gen::ATTN_SCORES_BUDGET as u64,
+                false,
+            )),
+            usize::MAX,
+            &candle_gen::gen_core::CancelFlag::default(),
+        )
+        .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_memory(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        img_ids: &[[i64; 4]],
+        txt_ids: &[[i64; 4]],
+        timestep: f32,
+        guidance: Option<f32>,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> GenResult<Tensor> {
         self.forward_inner(
             hidden_states,
             encoder_hidden_states,
@@ -636,6 +908,9 @@ impl Flux2Transformer {
             timestep,
             guidance,
             None,
+            attention_plan,
+            transformer_window,
+            cancel,
         )
     }
 
@@ -655,6 +930,38 @@ impl Flux2Transformer {
         guidance: Option<f32>,
         control: (&Flux2ControlBranch, &Tensor, f32),
     ) -> Result<Tensor> {
+        self.forward_with_control_memory(
+            hidden_states,
+            encoder_hidden_states,
+            img_ids,
+            txt_ids,
+            timestep,
+            guidance,
+            control,
+            AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+                candle_gen::ATTN_SCORES_BUDGET as u64,
+                false,
+            )),
+            usize::MAX,
+            &candle_gen::gen_core::CancelFlag::default(),
+        )
+        .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_control_memory(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        img_ids: &[[i64; 4]],
+        txt_ids: &[[i64; 4]],
+        timestep: f32,
+        guidance: Option<f32>,
+        control: (&Flux2ControlBranch, &Tensor, f32),
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> GenResult<Tensor> {
         self.forward_inner(
             hidden_states,
             encoder_hidden_states,
@@ -663,6 +970,9 @@ impl Flux2Transformer {
             timestep,
             guidance,
             Some(control),
+            attention_plan,
+            transformer_window,
+            cancel,
         )
     }
 
@@ -680,7 +990,24 @@ impl Flux2Transformer {
         timestep: f32,
         guidance: Option<f32>,
         control: Option<(&Flux2ControlBranch, &Tensor, f32)>,
-    ) -> Result<Tensor> {
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> GenResult<Tensor> {
+        if matches!(self.blocks, Flux2Blocks::Streamed { .. }) {
+            return self.forward_streamed_inner(
+                hidden_states,
+                encoder_hidden_states,
+                img_ids,
+                txt_ids,
+                timestep,
+                guidance,
+                control,
+                attention_plan,
+                transformer_window,
+                cancel,
+            );
+        }
         let temb = self.time_embed.forward(timestep, guidance, &self.device)?;
         let mut img = self
             .x_embedder
@@ -699,14 +1026,28 @@ impl Flux2Transformer {
         // VACE control hints (sc-7460): computed once from the post-embedder image+caption streams,
         // before the base double-block loop (the fork's `forward_control`), then injected per block.
         let hints = match control {
-            Some((branch, cc, _)) => {
-                Some(branch.forward_control(&img, &txt, cc, &img_mod, &txt_mod, &cos, &sin)?)
-            }
+            Some((branch, cc, _)) => Some(branch.forward_control(
+                &img,
+                &txt,
+                cc,
+                &img_mod,
+                &txt_mod,
+                &cos,
+                &sin,
+                attention_plan,
+            )?),
             None => None,
         };
 
-        for (idx, block) in self.double_blocks.iter().enumerate() {
-            let (t, i) = block.forward(&img, &txt, &img_mod, &txt_mod, &cos, &sin)?;
+        let Flux2Blocks::Resident { double, single } = &self.blocks else {
+            return Err(candle_gen::CandleError::Msg(
+                "flux2 streamed blocks are not yet driven".to_owned(),
+            ));
+        };
+        for (idx, block) in double.iter().enumerate() {
+            candle_gen::check_cancel(cancel)?;
+            let (t, i) =
+                block.forward(&img, &txt, &img_mod, &txt_mod, &cos, &sin, attention_plan)?;
             txt = t;
             img = i;
             // Add the control hint into the base image stream (`img + hints[n]·scale`) at the mapped
@@ -721,14 +1062,145 @@ impl Flux2Transformer {
         let txt_seq = txt.dim(1)?;
         let mut hidden = Tensor::cat(&[&txt, &img], 1)?;
         let single_mod = self.mod_single.forward(&temb)?;
-        for block in &self.single_blocks {
-            hidden = block.forward(&hidden, &single_mod[0], &cos, &sin)?;
+        for block in single {
+            candle_gen::check_cancel(cancel)?;
+            hidden = block.forward(&hidden, &single_mod[0], &cos, &sin, attention_plan)?;
         }
 
         let img_seq = hidden.dim(1)? - txt_seq;
         let img_out = hidden.narrow(1, txt_seq, img_seq)?;
         let img_out = self.norm_out.forward(&img_out.contiguous()?, &temb)?;
-        self.proj_out.forward(&img_out)
+        Ok(self.proj_out.forward(&img_out)?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_streamed_inner(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        img_ids: &[[i64; 4]],
+        txt_ids: &[[i64; 4]],
+        timestep: f32,
+        guidance: Option<f32>,
+        control: Option<(&Flux2ControlBranch, &Tensor, f32)>,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> GenResult<Tensor> {
+        let Flux2Blocks::Streamed {
+            weights,
+            config,
+            quant,
+            target_device,
+        } = &self.blocks
+        else {
+            unreachable!("resident FLUX.2 blocks returned above")
+        };
+        let temb = self.time_embed.forward(timestep, guidance, &self.device)?;
+        let img = self
+            .x_embedder
+            .forward(&hidden_states.to_dtype(DType::F32)?)?;
+        let txt = self
+            .context_embedder
+            .forward(&encoder_hidden_states.to_dtype(DType::F32)?)?;
+        let (cos, sin) = self.rope_tables(img_ids, txt_ids)?;
+        let img_mod = self.mod_img.forward(&temb)?;
+        let txt_mod = self.mod_txt.forward(&temb)?;
+        let hints = match control {
+            Some((branch, cc, _)) => Some(branch.forward_control(
+                &img,
+                &txt,
+                cc,
+                &img_mod,
+                &txt_mod,
+                &cos,
+                &sin,
+                attention_plan,
+            )?),
+            None => None,
+        };
+
+        let double_plan = candle_gen::block_window::BlockPlan::new(
+            config.num_double_layers,
+            transformer_window.max(1),
+        )?;
+        let (txt, img) = candle_gen::block_window::run_windowed(
+            target_device,
+            &double_plan,
+            cancel,
+            (txt, img),
+            || Ok(weights.clone()),
+            |(mut txt, mut img), view, range| {
+                let blocks = range
+                    .map(|idx| {
+                        let mut block = DoubleBlock::new(
+                            config,
+                            DitWeights::Vb(view.pp("transformer_blocks").pp(idx)),
+                        )?;
+                        if let Some(quant) = quant {
+                            block.quantize_onto(*quant, target_device)?;
+                        }
+                        Ok::<_, candle_gen::CandleError>((idx, block))
+                    })
+                    .collect::<GenResult<Vec<_>>>()?;
+                for (idx, block) in &blocks {
+                    candle_gen::check_cancel(cancel)?;
+                    (txt, img) = block.forward(
+                        &img,
+                        &txt,
+                        &img_mod,
+                        &txt_mod,
+                        &cos,
+                        &sin,
+                        attention_plan,
+                    )?;
+                    if let (Some(hints), Some((branch, _, scale))) = (&hints, &control) {
+                        if let Some(n) = branch.hint_index(*idx) {
+                            img = (&img + (&hints[n] * (*scale as f64))?)?;
+                        }
+                    }
+                }
+                Ok((txt, img))
+            },
+        )?;
+
+        let txt_seq = txt.dim(1)?;
+        let hidden = Tensor::cat(&[&txt, &img], 1)?;
+        let single_mod = self.mod_single.forward(&temb)?;
+        let single_plan = candle_gen::block_window::BlockPlan::new(
+            config.num_single_layers,
+            transformer_window.max(1),
+        )?;
+        let hidden = candle_gen::block_window::run_windowed(
+            target_device,
+            &single_plan,
+            cancel,
+            hidden,
+            || Ok(weights.clone()),
+            |mut hidden, view, range| {
+                let blocks = range
+                    .map(|idx| {
+                        let mut block = SingleBlock::new(
+                            config,
+                            DitWeights::Vb(view.pp("single_transformer_blocks").pp(idx)),
+                        )?;
+                        if let Some(quant) = quant {
+                            block.quantize_onto(*quant, target_device)?;
+                        }
+                        Ok::<_, candle_gen::CandleError>(block)
+                    })
+                    .collect::<GenResult<Vec<_>>>()?;
+                for block in &blocks {
+                    candle_gen::check_cancel(cancel)?;
+                    hidden = block.forward(&hidden, &single_mod[0], &cos, &sin, attention_plan)?;
+                }
+                Ok(hidden)
+            },
+        )?;
+        let img_seq = hidden.dim(1)? - txt_seq;
+        let img_out = hidden.narrow(1, txt_seq, img_seq)?;
+        let img_out = self.norm_out.forward(&img_out.contiguous()?, &temb)?;
+        Ok(self.proj_out.forward(&img_out)?)
     }
 }
 
@@ -764,11 +1236,11 @@ struct Flux2ControlBlock {
 }
 
 impl Flux2ControlBlock {
-    fn new(cfg: &Flux2Config, vb: VarBuilder, has_before_proj: bool) -> Result<Self> {
+    fn new(cfg: &Flux2Config, vb: VarBuilder<'static>, has_before_proj: bool) -> Result<Self> {
         let inner = cfg.inner_dim();
         // The control block's attn/ff/ff_context keys match a base double block 1:1 (diffusers naming,
         // `attn.to_out.0` read natively by `DoubleBlock`); load dense, quantized in place after load.
-        let base = DoubleBlock::new(cfg, vb.clone())?;
+        let base = DoubleBlock::new(cfg, DitWeights::Vb(vb.clone()))?;
         let after_proj = QLinear::linear_detect(inner, inner, &vb, "after_proj", true)?;
         let before_proj = if has_before_proj {
             Some(QLinear::linear_detect(
@@ -818,7 +1290,7 @@ impl Flux2ControlBranch {
     /// Build from the Fun-Controlnet-Union checkpoint VarBuilder. Keys are un-prefixed for a real
     /// checkpoint (`control_img_in.*`, `control_transformer_blocks.{i}.*`). `control_layers =
     /// range(0, num_double_layers, 2)`.
-    pub fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &Flux2Config, vb: VarBuilder<'static>) -> Result<Self> {
         let inner = cfg.inner_dim();
         let places = cfg.control_layer_places();
         let control_img_in =
@@ -868,7 +1340,8 @@ impl Flux2ControlBranch {
         txt_mod: &[(Tensor, Tensor, Tensor)],
         cos: &Tensor,
         sin: &Tensor,
-    ) -> Result<Vec<Tensor>> {
+        attention_plan: AttentionPlan<'_>,
+    ) -> GenResult<Vec<Tensor>> {
         let mut c = self
             .control_img_in
             .forward(&control_context.to_dtype(DType::F32)?)?;
@@ -884,7 +1357,10 @@ impl Flux2ControlBranch {
                 c = (&bp.forward(&c)? + img_embed)?;
             }
             // The base double block returns `(txt, img)`; the control image stream is `img` (`new_c`).
-            let (new_txt, new_c) = block.base.forward(&c, &txt, img_mod, txt_mod, cos, sin)?;
+            let (new_txt, new_c) =
+                block
+                    .base
+                    .forward(&c, &txt, img_mod, txt_mod, cos, sin, attention_plan)?;
             hints.push(block.after_proj.forward(&new_c)?);
             c = new_c;
             txt = new_txt;
@@ -938,6 +1414,35 @@ impl Flux2ControlTransformer {
             timestep,
             guidance,
             (&self.branch, control_context, control_context_scale),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_memory(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        img_ids: &[[i64; 4]],
+        txt_ids: &[[i64; 4]],
+        timestep: f32,
+        guidance: Option<f32>,
+        control_context: &Tensor,
+        control_context_scale: f32,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> GenResult<Tensor> {
+        self.base.forward_with_control_memory(
+            hidden_states,
+            encoder_hidden_states,
+            img_ids,
+            txt_ids,
+            timestep,
+            guidance,
+            (&self.branch, control_context, control_context_scale),
+            attention_plan,
+            transformer_window,
+            cancel,
         )
     }
 }

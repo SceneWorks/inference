@@ -6,7 +6,7 @@
 //! The per-mode numerics are pinned by the t2i/it2i/vqa/interleave parity + real-weight tests; this
 //! validates the registration + request-mapping + Array→Image plumbing.
 //!
-//! Run: `cargo test -p mlx-gen-sensenova --test model_realweight -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-sensenova --test integration model_realweight:: -- --ignored --nocapture`
 
 use std::path::PathBuf;
 

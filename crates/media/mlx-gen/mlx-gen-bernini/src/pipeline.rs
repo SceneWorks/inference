@@ -12,6 +12,7 @@ use mlx_rs::memory::clear_cache;
 use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array};
 
+use mlx_gen::block_residency::BlockPlan;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
@@ -23,15 +24,16 @@ use mlx_gen_wan::config::WanModelConfig;
 use mlx_gen_wan::pipeline::{align_dim, decode_to_frames, frames_to_images, latent_shape};
 use mlx_gen_wan::scheduler::{make_scheduler, SolverKind};
 use mlx_gen_wan::text_encoder::{load_tokenizer, Umt5Encoder};
-use mlx_gen_wan::{WanTransformer, WanVae};
+use mlx_gen_wan::{WanBlockStream, WanTransformer};
 
 use crate::config::{resolve_mode, validate_bernini_geometry, BerniniKnobs, Defaults};
 use crate::forward::{
     guided_velocity, num_momentum_buffers, vit_one_step, GuidanceParams, Mode, PackedForward,
-    VitGuidanceParams, VitMode, VitStreams,
+    Trunk, VitGuidanceParams, VitMode, VitStreams,
 };
 use crate::guidance::MomentumBuffer;
 use crate::preprocess::{encode_image, encode_videoclip};
+use crate::{decoded_output_geometry, ProviderVae, PROVIDER_VAE_STRIDE};
 
 pub const MODEL_ID: &str = "bernini_renderer";
 
@@ -39,6 +41,9 @@ pub const MODEL_ID: &str = "bernini_renderer";
 /// source-id rotary + token-packed conditioning + APG guidance; t2v/t2i/i2i/v2v/r2v/rv2v).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "bernini",
@@ -47,7 +52,6 @@ pub fn descriptor() -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             // Source media: a single Reference (i2i) / MultiReference (r2v refs) / VideoClip (v2v/rv2v
             // source video). Text-only modes (t2i/t2v) need no conditioning.
             conditioning: vec![
@@ -57,38 +61,24 @@ pub fn descriptor() -> ModelDescriptor {
             ],
             // LoRA/quant are follow-ons (sc-5146); the renderer ships dense bf16.
             supports_lora: false,
-            supports_lokr: false,
             samplers: vec!["unipc"],
-            schedulers: Vec::new(),
-            supported_guidance_methods: vec![],
             min_size: 16,
             max_size: 1280,
             max_count: 1,
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: true,
-            requires_sigma_shift: false,
             // The renderer is structurally always-staged (epic 10834, sc-10840): `generate_impl` holds
             // NO component weights on the generator and loads per generate in phase order — UMT5-XXL T5
             // → drop → (source-VAE encoder for i2i/v2v/r2v) → drop → the two co-resident MoE experts +
             // z16 VAE — dropping BOTH encoders (+ `clear_cache()`) before the experts, so peak unified
             // memory is already bounded to the dominant expert phase. The shared per-component footprint
             // reports the two experts as the DiT phase (the peak), so the fit-gate's staged estimate is
-            // sound. `OffloadPolicy` is not consumed — there is no Resident-warm mode to toggle. (This id
-            // is `Modality::Video`; the worker's image fit-gate does not gate on it, so advertising the
-            // flag is honest discovery parity + memory hygiene, not a behavior change.)
-            supports_sequential_offload: true,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            // sound. `OffloadPolicy` is not consumed — there is no Resident-warm mode to toggle, so this
+            // is unconditional physical staging rather than a selectable offload control.
+            supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: true,
+            ..Default::default()
         },
     }
 }
@@ -101,6 +91,11 @@ pub struct BerniniRenderer {
     knobs: BerniniKnobs,
     root: PathBuf,
     quant: Option<Quant>,
+    /// The contract this LOAD publishes, and the spec it was built from (sc-18609). Both are needed
+    /// by the `Generator` memory hooks below: without them the loaded generator inherits the trait
+    /// defaults and the whole declared ladder is unreachable through the production route.
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
+    loaded_spec: LoadSpec,
 }
 
 /// Load the Bernini renderer from a converted MLX snapshot directory
@@ -124,12 +119,15 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         )));
     }
     let knobs = BerniniKnobs::from_dir(&root)?;
+    let memory_strategy = crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?;
     Ok(Box::new(BerniniRenderer {
         descriptor: descriptor(),
         config,
         knobs,
         root,
         quant: spec.quantize,
+        memory_strategy,
+        loaded_spec: spec.clone(),
     }))
 }
 
@@ -144,12 +142,12 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// TE/DiT/VAE render split (they are still in the worker's whole-model total). Shared by `bernini` +
 /// `bernini_renderer`.
 ///
-/// Both ids now advertise `supports_sequential_offload` (sc-10840) — each is structurally always-staged
+/// Both ids declare unconditional staged residency — each is structurally always-staged
 /// (the encoders are dropped + `clear_cache()`d before the two co-resident experts load), and this split
-/// is the staged peak the fit-gate should bound (`max(encoders, DiT+VAE)`, dominated by the experts).
-/// Adding bernini to the worker's `SEQUENTIAL_CAPABLE_ENGINES` allowlist so the fit-gate consumes this
-/// split is the downstream worker-repo step of the fan-out (this crate reports the bytes; the worker
-/// decides to use them).
+/// is the staged peak the fit-gate bounds (`max(encoders, DiT+VAE)`, dominated by the experts). The
+/// worker can consume that physical fact independently of the false selectable-control bit and this
+/// split generically through the registered footprint seam (this crate reports the bytes; the worker
+/// decides how to use them).
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
@@ -172,19 +170,35 @@ mlx_gen::register_generators! {
 /// One expert (high or low) with its prepared per-expert cross-attention K/V for the cond / empty-neg
 /// text contexts (text embedding is per-expert, so K/V is built per expert).
 struct BExpert<'a> {
-    transformer: &'a WanTransformer,
+    trunk: Trunk<'a>,
     cross_kv_cond: Vec<(Array, Array)>,
     cross_kv_uncond: Vec<(Array, Array)>,
 }
 
 impl<'a> BExpert<'a> {
-    fn build(dit: &'a WanTransformer, context: &Array, context_null: &Array) -> Result<Self> {
+    /// Build this expert's cross-attention K/V.
+    ///
+    /// On a rung-4 (windowed) trunk the DiT holds no blocks, so `prepare_cross_kv` cannot serve the
+    /// cache from it; the stream walks the same plan once here instead. The caches are small
+    /// (`[B, n, text_len, d]` per block) and are reused across every step and every guidance pass, so
+    /// they stay resident deliberately — re-deriving them per window per forward would multiply a
+    /// once-per-generate cost by the pass count for no residency saving.
+    fn build(trunk: Trunk<'a>, context: &Array, context_null: &Array) -> Result<Self> {
+        let dit = trunk.dit;
         let cc = dit.embed_text(context)?;
         let cu = dit.embed_text(context_null)?;
+        let prepare = |embedded: &Array| -> Result<Vec<(Array, Array)>> {
+            match trunk.window {
+                None => dit.prepare_cross_kv(embedded),
+                Some((stream, plan, cancel)) => {
+                    stream.prepare_cross_kv_windowed(embedded, plan, cancel)
+                }
+            }
+        };
         Ok(Self {
-            transformer: dit,
-            cross_kv_cond: dit.prepare_cross_kv(&cc)?,
-            cross_kv_uncond: dit.prepare_cross_kv(&cu)?,
+            cross_kv_cond: prepare(&cc)?,
+            cross_kv_uncond: prepare(&cu)?,
+            trunk,
         })
     }
 }
@@ -249,7 +263,7 @@ fn denoise_bernini(
         let v = guided_velocity(
             pf,
             mode,
-            expert.transformer,
+            expert.trunk,
             &latent,
             videos,
             images,
@@ -271,7 +285,7 @@ fn denoise_bernini(
 /// planner ViT-context)` (sc-5140), in renderer `text_dim` space, so it goes through the same
 /// `embed_text` → `prepare_cross_kv` as the renderer's text context.
 pub struct BVitExpert<'a> {
-    transformer: &'a WanTransformer,
+    trunk: Trunk<'a>,
     wtxt_wvit: Vec<(Array, Array)>,
     wtxt_wovit: Vec<(Array, Array)>,
     wotxt_wvit: Vec<(Array, Array)>,
@@ -280,16 +294,24 @@ pub struct BVitExpert<'a> {
 
 impl<'a> BVitExpert<'a> {
     /// `streams` = `[wtxt_wvit, wtxt_wovit, wotxt_wvit, wotxt_wovit]` prompt-embed contexts.
-    pub fn build(dit: &'a WanTransformer, streams: [&Array; 4]) -> Result<Self> {
+    pub fn build(trunk: Trunk<'a>, streams: [&Array; 4]) -> Result<Self> {
+        let dit = trunk.dit;
+        // See `BExpert::build` for why a windowed trunk builds its cross-K/V through the plan.
         let prep = |s: &Array| -> Result<Vec<(Array, Array)>> {
-            dit.prepare_cross_kv(&dit.embed_text(s)?)
+            let embedded = dit.embed_text(s)?;
+            match trunk.window {
+                None => dit.prepare_cross_kv(&embedded),
+                Some((stream, plan, cancel)) => {
+                    stream.prepare_cross_kv_windowed(&embedded, plan, cancel)
+                }
+            }
         };
         Ok(Self {
-            transformer: dit,
             wtxt_wvit: prep(streams[0])?,
             wtxt_wovit: prep(streams[1])?,
             wotxt_wvit: prep(streams[2])?,
             wotxt_wovit: prep(streams[3])?,
+            trunk,
         })
     }
 
@@ -358,7 +380,7 @@ pub fn denoise_bernini_wvitcfg(
         };
         let v = vit_one_step(
             pf,
-            expert.transformer,
+            expert.trunk,
             mode,
             &latent,
             images,
@@ -374,10 +396,61 @@ pub fn denoise_bernini_wvitcfg(
     Ok(latent)
 }
 
-mlx_gen::impl_generator!(BerniniRenderer {
-    validate: |s, req| s.validate_impl(req),
-    generate: generate_impl,
-});
+// Hand-written rather than `mlx_gen::impl_generator!` (sc-18609). That macro emits only
+// `descriptor`/`validate`/`generate`, so a provider using it inherits the `Generator` memory-strategy
+// defaults: contract `None`, a safety check that rejects EVERY optimized strategy, and a request
+// scope that returns `Ok(None)`. `memory_strategy.rs` has declared the full five-rung ladder since
+// sc-15528, but until this impl existed the production route reached none of it — the registry
+// declaration was real and the loaded generator was silent about it. Same reason chroma spells its
+// `Generator` out by hand (SC-15520).
+impl Generator for BerniniRenderer {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        self.validate_impl(req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        crate::memory_strategy::loaded_safety_check(
+            MODEL_ID,
+            &self.loaded_spec,
+            &self.memory_strategy,
+            context,
+            self.config.num_layers,
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        crate::memory_strategy::loaded_begin_request(
+            MODEL_ID,
+            &self.loaded_spec,
+            &self.memory_strategy,
+            context,
+            self.config.num_layers,
+        )
+    }
+}
 
 impl BerniniRenderer {
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
@@ -389,6 +462,9 @@ impl BerniniRenderer {
         // `1 + 4·k` frame rule — mirrored from candle's `validate_bernini_geometry` so the same
         // request gets the same rejection on both backends.
         validate_bernini_geometry(self.descriptor.id, req)?;
+        // sc-20264 — the same per-clip knob refusal the `bernini` id runs; both providers take the
+        // same conditioning through the same encode path, so they must give the same answer.
+        crate::bernini::reject_unimplemented_video_clip_knobs(self.descriptor.id, req)?;
         Ok(())
     }
 
@@ -410,8 +486,8 @@ impl BerniniRenderer {
         // sc-12500 (F-040): `validate_impl` rejects any off-grid width/height, so the reference's
         // align-down is a no-op here — assert that instead of silently refitting the request
         // (1000×1000 used to render 992×992 with no diagnostic while candle errored).
-        let width = align_dim(req.width, cfg.patch_size.2, cfg.vae_stride.2);
-        let height = align_dim(req.height, cfg.patch_size.1, cfg.vae_stride.1);
+        let width = align_dim(req.width, cfg.patch_size.2, PROVIDER_VAE_STRIDE.2);
+        let height = align_dim(req.height, cfg.patch_size.1, PROVIDER_VAE_STRIDE.1);
         debug_assert_eq!(
             (width, height),
             (req.width, req.height),
@@ -443,7 +519,7 @@ impl BerniniRenderer {
             norm_threshold: [Defaults::NORM_THRESHOLD, Defaults::NORM_THRESHOLD],
         };
 
-        let lat = latent_shape(frames, height, width, cfg.vae_z_dim, cfg.vae_stride)?;
+        let lat = latent_shape(frames, height, width, cfg.vae_z_dim, PROVIDER_VAE_STRIDE)?;
 
         // --- Stage 1: UMT5 text encode (loaded → used → freed) ---
         let tokenizer = load_tokenizer(self.root.join("tokenizer.json"), cfg.text_len)?;
@@ -471,7 +547,7 @@ impl BerniniRenderer {
         // --- Stage 1b: VAE-encode source media → conditioning latents (→ encoder freed) ---
         let (videos, images) = if has_video || has_image {
             let w = Weights::from_file(self.root.join("vae.safetensors"))?;
-            let vae = WanVae::from_weights(&w)?;
+            let vae = ProviderVae::from_weights(&w)?;
             let mut videos = Vec::new();
             let mut images = Vec::new();
             for c in &req.conditioning {
@@ -518,25 +594,63 @@ impl BerniniRenderer {
         // Load+quantize each expert before loading the next so only one bf16 transient is resident at
         // a time (sc-5360 — `WanTransformer::quantize` eval-frees its bf16 dequant). Without quant this
         // just loads both bf16.
-        let load_expert = |name: &str| -> Result<WanTransformer> {
-            let w = Weights::from_file(self.root.join(name))?;
-            let mut dit = WanTransformer::from_weights(&w, cfg)?;
-            if let Some(q) = self.quant {
-                dit.quantize(q.bits(), None)?;
+        // ── Ladder rungs 3 + 4 (sc-15528) ────────────────────────────────────────────────────
+        // Rung 4 is per-request: when a window is selected the expert's block stack is NEVER
+        // materialized (`from_weights_deferred` holds zero blocks) and the stream rebuilds
+        // `plan.window()` blocks at a time. On a DUAL-expert config that is the whole point --
+        // sc-16354's finding is that a naive per-expert window leaves the idle expert's 40 blocks
+        // resident, and a stack that was never materialized has no idle half to pay for. Both
+        // experts are deferred here, so the bound is over the full 80-block trunk, not one expert.
+        let window = crate::memory_strategy::transformer_window_size(req)?;
+        let attn_budget = crate::memory_strategy::attention_budget(req);
+        let plan = window
+            .map(|size| BlockPlan::new(cfg.num_layers, size))
+            .transpose()?;
+        let load_expert = |name: &str| -> Result<(WanTransformer, Option<WanBlockStream>)> {
+            let path = self.root.join(name);
+            let w = Weights::from_file(&path)?;
+            if window.is_some() {
+                let dit = WanTransformer::from_weights_deferred(&w, cfg)?;
+                // No adapters can reach here (`supports_lora: false`), and the stream refuses an
+                // adapted load anyway -- Wan MERGES deltas at load, so a streamed block re-read from
+                // the snapshot would silently carry none of them.
+                let mut stream = WanBlockStream::new(WeightsSource::File(path), cfg.clone(), &[])?;
+                if let Some(q) = self.quant {
+                    // Replayed per materialized block so the streamed weights are byte-identical to
+                    // the resident ones. A pre-packed tier takes this through `cfg.quantization`
+                    // inside the block constructor instead, exactly as the resident path does.
+                    stream.set_quant_bits(q.bits());
+                }
+                stream.set_attention_budget(attn_budget);
+                Ok((dit, Some(stream)))
+            } else {
+                let mut dit = WanTransformer::from_weights(&w, cfg)?;
+                if let Some(q) = self.quant {
+                    dit.quantize(q.bits(), None)?;
+                }
+                dit.set_attention_budget(attn_budget);
+                Ok((dit, None))
             }
-            Ok(dit)
         };
         let latents = {
-            let low_dit = load_expert("low_noise_model.safetensors")?;
+            let (low_dit, low_stream) = load_expert("low_noise_model.safetensors")?;
             if req.cancel.is_cancelled() {
                 return Err(Error::Canceled);
             }
-            let high_dit = load_expert("high_noise_model.safetensors")?;
+            let (high_dit, high_stream) = load_expert("high_noise_model.safetensors")?;
             if req.cancel.is_cancelled() {
                 return Err(Error::Canceled);
             }
-            let low = BExpert::build(&low_dit, &context, &context_null)?;
-            let high = BExpert::build(&high_dit, &context, &context_null)?;
+            let low = BExpert::build(
+                Trunk::for_load(&low_dit, low_stream.as_ref(), plan.as_ref(), &req.cancel),
+                &context,
+                &context_null,
+            )?;
+            let high = BExpert::build(
+                Trunk::for_load(&high_dit, high_stream.as_ref(), plan.as_ref(), &req.cancel),
+                &context,
+                &context_null,
+            )?;
             let pf = PackedForward::new(
                 cfg.dim / cfg.num_heads,
                 cfg.out_dim,
@@ -575,11 +689,15 @@ impl BerniniRenderer {
 
         // --- Stage 3: z16 VAE decode → RGB8 frames ---
         on_progress(Progress::Decoding);
-        let out_frames = lat[1] * cfg.vae_stride.0 as i32;
-        let tiling = TilingConfig::auto(height as i32, width as i32, out_frames);
+        let (out_frames, out_height, out_width) = decoded_output_geometry(lat[1], lat[2], lat[3])?;
+        // Ladder rung 2 (sc-15528) — see the note on the full pipeline's decode.
+        let tiling = match crate::memory_strategy::decode_tiling(req)? {
+            Some(explicit) => Some(explicit),
+            None => TilingConfig::auto(out_height, out_width, out_frames),
+        };
         let frames_u8 = {
             let w = Weights::from_file(self.root.join("vae.safetensors"))?;
-            let vae = WanVae::from_weights(&w)?;
+            let vae = ProviderVae::from_weights(&w)?;
             decode_to_frames(&vae, &latents, tiling.as_ref(), Some(&req.cancel))?
         };
         let images_out = frames_to_images(&frames_u8)?;
@@ -608,16 +726,18 @@ mod tests {
     use super::*;
     use mlx_rs::ops::multiply;
 
-    /// Component residency (epic 10834, sc-10840): the renderer advertises `supports_sequential_offload`
-    /// because it is structurally always-staged — `generate_impl` drops the UMT5 text encoder and the
+    /// Component residency (epic 10834, sc-10840): the renderer is structurally always-staged —
+    /// `generate_impl` drops the UMT5 text encoder and the
     /// source-VAE encoder (each + `clear_cache()`) before loading the two co-resident MoE experts, so
     /// peak unified memory is already bounded to the dominant expert phase (the footprint's DiT split).
     #[test]
-    fn advertises_sequential_offload() {
-        assert!(
-            descriptor().capabilities.supports_sequential_offload,
-            "bernini_renderer is always-staged (UMT5 + source-VAE dropped before the experts); it must \
-             advertise supports_sequential_offload so the fit-gate consumes the staged footprint"
+    fn declares_unconditional_staged_residency_without_a_selectable_control() {
+        let capabilities = descriptor().capabilities;
+        assert!(!capabilities.supports_sequential_offload);
+        assert!(capabilities.unconditionally_engages_staged_residency);
+        assert_eq!(
+            capabilities.staged_residency_availability(),
+            mlx_gen::StagedResidencyAvailability::UnconditionallyEngaged,
         );
     }
 
@@ -674,8 +794,8 @@ mod tests {
             scale(cu, 0.5),
         );
         let streams = [&s0, &s1, &s2, &s3];
-        let low = BVitExpert::build(&dit, streams).expect("low expert");
-        let high = BVitExpert::build(&dit, streams).expect("high expert");
+        let low = BVitExpert::build(Trunk::resident(&dit), streams).expect("low expert");
+        let high = BVitExpert::build(Trunk::resident(&dit), streams).expect("high expert");
         let g = VitGuidanceParams {
             omega_txt: 4.0,
             omega_img: 4.5,

@@ -58,26 +58,25 @@ pub const FAMILY: &str = "whisper";
 pub const HUB_REPO: &str = "openai/whisper-base";
 pub const HUB_REVISION: &str = "e37978b90ca9030d5170a5c07aadb050351a65bb";
 
-/// The license of the pinned Whisper weight checkpoint (sc-13332) — surfaced for SceneWorks'
-/// end-product licenses page. Apache-2.0 (permissive), verified against the `openai/whisper-base`
-/// model-card metadata (`license: apache-2.0`) — note this is the checkpoint's license, distinct
-/// from the MIT license on OpenAI's Whisper *source* repository.
-pub const WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
-    candle_audio::gen_core::WeightLicense {
-        spdx_id: "Apache-2.0",
-        name: "Apache License 2.0",
-        source_url: "https://huggingface.co/openai/whisper-base",
-        attribution: Some("Whisper © OpenAI — licensed under Apache-2.0"),
-        commercial_use: true,
-        restriction: None,
-    };
+/// Stable component key for the pinned Whisper base checkpoint — what `PROVIDER_COMPONENTS`
+/// resolves through, and the licence manifest's unique row key.
+pub const COMPONENT_KEY: &str = "whisper_base";
 
-/// This provider's weight-license entry (keyed by [`MODEL_ID`]) for catalog aggregation.
-pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
-    candle_audio::gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: None,
-        license: WEIGHT_LICENSE,
+/// The schema-3 licence row for the pinned Whisper base checkpoint (sc-16663).
+///
+/// **Disclosure only.** The row records what the upstream declares so a consumer can show it to a
+/// user; nothing here decides whether any use is permitted. `declared` and `gated` were read from
+/// the `openai/whisper-base` model card on `retrieved`, and `family` normalizes that declaration onto
+/// [`candle_audio::gen_core::license::families::APACHE_2_0`].
+pub const COMPONENT_LICENSE: candle_audio::gen_core::ComponentLicense =
+    candle_audio::gen_core::ComponentLicense {
+        component: COMPONENT_KEY,
+        source_url: "https://huggingface.co/openai/whisper-base",
+        gated: false,
+        declared: "apache-2.0",
+        family: "apache-2-0",
+        attribution: Some("Whisper © OpenAI — licensed under Apache-2.0"),
+        retrieved: "2026-08-02",
     };
 
 /// The three files inside the pinned repo the provider resolves.
@@ -356,7 +355,8 @@ mod tests {
 
     #[test]
     fn validate_rejects_empty_and_overlong_audio() {
-        let t = load(&LoadSpec::new(WeightsSource::Dir(std::env::temp_dir()))).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let t = load(&LoadSpec::new(WeightsSource::Dir(tmp.path().to_path_buf()))).unwrap();
         // Empty audio → rejected.
         assert!(t.validate(&TranscribeRequest::default()).is_err());
         // Over the max duration → rejected.
@@ -375,21 +375,22 @@ mod tests {
 
     #[test]
     fn load_rejects_unsupported_spec_shapes() {
+        let tmp = tempfile::tempdir().unwrap();
         // A single file is not a snapshot dir.
         assert!(load(&LoadSpec::new(WeightsSource::File(
-            std::env::temp_dir().join("model.safetensors")
+            tmp.path().join("model.safetensors")
         )))
         .is_err());
         // Quantization is refused (typed Unsupported).
-        let mut spec = LoadSpec::new(WeightsSource::Dir(std::env::temp_dir()));
+        let mut spec = LoadSpec::new(WeightsSource::Dir(tmp.path().to_path_buf()));
         spec.quantize = Some(gen_core::Quant::Q4);
         assert!(matches!(load(&spec), Err(gen_core::Error::Unsupported(_))));
     }
 
     #[test]
     fn pre_tripped_cancel_returns_typed_canceled_before_any_heavy_work() {
-        let dir = std::env::temp_dir().join("whisper-missing-snapshot");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let t = load(&LoadSpec::new(WeightsSource::Dir(dir))).unwrap();
         let flag = CancelFlag::new();
         flag.cancel();

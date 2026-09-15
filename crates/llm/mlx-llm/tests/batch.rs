@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! MLX_LLM_TEST_MODEL=/path/to/SmolLM2-135M-Instruct \
-//!   cargo test --test batch -- --ignored --nocapture
+//!   cargo test --test integration -- batch:: --ignored --nocapture
 //! ```
 //!
 //! ## What "outputs identical to batch-1" means for a floating-point engine

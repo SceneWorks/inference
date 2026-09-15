@@ -18,7 +18,8 @@
 
 use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
 use mlx_gen::{
-    run_flow_sampler, CancelFlag, FlowMatchEuler, Image, Progress, Result, TimestepConvention,
+    resolve_flow_schedule, run_flow_sampler_with_latent_hook, CancelFlag, FlowMatchEuler, Image,
+    PreviewSink, Progress, Result, TimestepConvention,
 };
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
@@ -38,6 +39,14 @@ pub const SPATIAL_SCALE: u32 = 8;
 pub const NUM_TRAIN_TIMESTEPS: f32 = 1000.0;
 /// SD3.5-Large static flow-match shift (`scheduler_config.json` `shift = 3.0`, no dynamic shifting).
 pub const SCHEDULE_SHIFT: f32 = 3.0;
+
+/// Resolve SD3.5's native or curated flow schedule over its static model shift.  The `normal`
+/// endpoint is intentionally the same as the frozen native fixture; other curated names may
+/// redistribute interior steps but must never lose the static shift.
+pub(crate) fn resolve_sd3_sigmas(scheduler: Option<&str>, steps: usize) -> Vec<f32> {
+    let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
+    resolve_flow_schedule(scheduler, SCHEDULE_SHIFT.ln(), steps, &native.sigmas)
+}
 
 /// Seeded txt2img latent noise — shape `[1, 16, height/8, width/8]`, f32. diffusers
 /// `randn_tensor([B, 16, H/8, W/8])`; we draw f32 via `mx.random.normal` keyed on `seed`.
@@ -59,10 +68,24 @@ pub fn create_noise(seed: u64, width: u32, height: u32) -> Result<Array> {
 /// every default (unset-negative) render — an earlier `is_empty() → Vec::new()` shortcut produced
 /// 77×EOS with NO BOS, changing every hidden state and shifting the pooled-at-argmax EOS selection
 /// from index 1 to 0 (F-004; same bug family as z-image sc-8958).
+///
+/// An over-long prompt is **truncated** here, deliberately: SD3.5 carries its long-form prompt on
+/// the 256-token T5 lane, and diffusers' `_get_clip_prompt_embeds` likewise tokenizes CLIP with
+/// `truncation=True, max_length=77`. The two CLIP lanes (L and bigG) share this one id sequence.
 fn clip_token_ids(tokenizer: &ClipBpeTokenizer, prompt: &str) -> Result<Vec<i32>> {
     let mut ids = tokenizer.tokenize(prompt)?;
     if ids.len() > CLIP_MAX_LENGTH {
         ids.truncate(CLIP_MAX_LENGTH);
+        // sc-20528: restore the EOS the truncation just cut off. Until sc-20528,
+        // `ClipBpeTokenizer::tokenize` capped at 77 itself and wrote eos into the last slot; it now
+        // returns the full encoding (SDXL windows it instead), so a bare `truncate` would hand the
+        // encoder `[BOS, 76 content]` with NO end-of-text token. `ClipTextEncoder::forward` pools
+        // at `argmax(row)` — EOS is the highest CLIP id, so with no EOS present the pooled vector
+        // (SD3's adaLN conditioning, and half of the 2048-wide pooled projection) would be gathered
+        // at whichever content token happened to hold the largest id: silent quality loss on every
+        // >77-token SD3.5 render and on SD3 LoRA training captions. Terminating the window keeps
+        // the pre-sc-20528 ids byte-for-byte.
+        ids[CLIP_MAX_LENGTH - 1] = tokenizer.eos_id();
     }
     Ok(ids)
 }
@@ -116,14 +139,26 @@ fn denoise_over_sigmas(
     guidance_scale: f32,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    attention: mlx_gen::attention::AttentionPlan<'_>,
+    transformer_window: Option<usize>,
 ) -> Result<Array> {
     let predict = |x: &Array, timestep: f32| -> Result<Array> {
         // The unified flow sampler hands `timestep = σ`; the MMDiT embeds `σ·1000`.
         let t = Array::from_slice(&[timestep * NUM_TRAIN_TIMESTEPS], &[1]);
-        let pred_cond = transformer.forward(x, &cond.context, &cond.pooled, &t)?;
+        let window = transformer_window.map(|size| (size, cancel));
+        let pred_cond =
+            transformer.forward_inference(x, &cond.context, &cond.pooled, &t, attention, window)?;
         match uncond {
             Some(uc) if guidance_scale != 1.0 => {
-                let pred_uncond = transformer.forward(x, &uc.context, &uc.pooled, &t)?;
+                let pred_uncond = transformer.forward_inference(
+                    x,
+                    &uc.context,
+                    &uc.pooled,
+                    &t,
+                    attention,
+                    window,
+                )?;
                 // pred = uncond + scale·(cond − uncond).
                 let delta = subtract(&pred_cond, &pred_uncond)?;
                 Ok(add(
@@ -134,7 +169,8 @@ fn denoise_over_sigmas(
             _ => Ok(pred_cond),
         }
     };
-    run_flow_sampler(
+    let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
+    run_flow_sampler_with_latent_hook(
         sampler_name,
         TimestepConvention::Sigma,
         sigmas,
@@ -142,6 +178,9 @@ fn denoise_over_sigmas(
         seed,
         cancel,
         on_progress,
+        |latents, sigma| {
+            crate::preview::emit_preview(preview, &previews, sigmas, sigma, latents);
+        },
         predict,
     )
 }
@@ -162,6 +201,69 @@ pub fn denoise_cfg(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_cfg_with_preview(
+        transformer,
+        scheduler,
+        sampler_name,
+        seed,
+        latents,
+        cond,
+        uncond,
+        guidance_scale,
+        cancel,
+        on_progress,
+        &PreviewSink::default(),
+    )
+}
+
+/// [`denoise_cfg`] with an optional best-effort per-outer-step preview sink.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_cfg_with_preview(
+    transformer: &Sd3Transformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
+    latents: Array,
+    cond: &Sd3Conditioning,
+    uncond: Option<&Sd3Conditioning>,
+    guidance_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+) -> Result<Array> {
+    denoise_cfg_with_memory(
+        transformer,
+        scheduler,
+        sampler_name,
+        seed,
+        latents,
+        cond,
+        uncond,
+        guidance_scale,
+        cancel,
+        on_progress,
+        preview,
+        mlx_gen::attention::AttentionPlan::UNBOUNDED,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_cfg_with_memory(
+    transformer: &Sd3Transformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
+    latents: Array,
+    cond: &Sd3Conditioning,
+    uncond: Option<&Sd3Conditioning>,
+    guidance_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    attention: mlx_gen::attention::AttentionPlan<'_>,
+    transformer_window: Option<usize>,
+) -> Result<Array> {
     denoise_over_sigmas(
         transformer,
         &scheduler.sigmas,
@@ -173,6 +275,9 @@ pub fn denoise_cfg(
         guidance_scale,
         cancel,
         on_progress,
+        preview,
+        attention,
+        transformer_window,
     )
 }
 
@@ -205,17 +310,148 @@ pub fn denoise_img2img_cfg(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_img2img_cfg_with_preview(
+        transformer,
+        scheduler,
+        sampler_name,
+        seed,
+        vae,
+        init,
+        strength,
+        width,
+        height,
+        steps,
+        cond,
+        uncond,
+        guidance_scale,
+        cancel,
+        on_progress,
+        &PreviewSink::default(),
+    )
+}
+
+/// [`denoise_img2img_cfg`] with an optional best-effort per-outer-step preview sink.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_img2img_cfg_with_preview(
+    transformer: &Sd3Transformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
+    vae: &Vae,
+    init: &Image,
+    strength: f32,
+    width: u32,
+    height: u32,
+    steps: usize,
+    cond: &Sd3Conditioning,
+    uncond: Option<&Sd3Conditioning>,
+    guidance_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+) -> Result<Array> {
+    denoise_img2img_cfg_with_memory(
+        transformer,
+        scheduler,
+        sampler_name,
+        seed,
+        vae,
+        init,
+        strength,
+        width,
+        height,
+        steps,
+        cond,
+        uncond,
+        guidance_scale,
+        cancel,
+        on_progress,
+        preview,
+        mlx_gen::attention::AttentionPlan::UNBOUNDED,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_img2img_cfg_with_memory(
+    transformer: &Sd3Transformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
+    vae: &Vae,
+    init: &Image,
+    strength: f32,
+    width: u32,
+    height: u32,
+    steps: usize,
+    cond: &Sd3Conditioning,
+    uncond: Option<&Sd3Conditioning>,
+    guidance_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    attention: mlx_gen::attention::AttentionPlan<'_>,
+    transformer_window: Option<usize>,
+) -> Result<Array> {
+    let clean = encode_reference(vae, init, width, height)?;
+    denoise_img2img_from_clean_cfg_with_memory(
+        transformer,
+        scheduler,
+        sampler_name,
+        seed,
+        &clean,
+        strength,
+        width,
+        height,
+        steps,
+        cond,
+        uncond,
+        guidance_scale,
+        cancel,
+        on_progress,
+        preview,
+        attention,
+        transformer_window,
+    )
+}
+
+/// Encode the seed-independent SD3 img2img reference into its normalized clean latent. Callers
+/// producing multiple outputs must materialize and reuse this value across their per-seed loop.
+pub fn encode_reference(vae: &Vae, init: &Image, width: u32, height: u32) -> Result<Array> {
     // Reference → clean latent [1, 16, H/8, W/8]. `Vae::encode` returns the normalized `(mean−shift)·
     // scale` latent (the same space as `create_noise`); SD3.5's MMDiT patchifies internally, so keep it
     // unpacked.
     let image_nchw = preprocess_init_image(init, width, height)?;
-    let clean = vae.encode(&image_nchw)?;
+    vae.encode(&image_nchw)
+}
+
+/// Per-seed img2img denoise from an already encoded clean reference latent.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_img2img_from_clean_cfg_with_memory(
+    transformer: &Sd3Transformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
+    clean: &Array,
+    strength: f32,
+    width: u32,
+    height: u32,
+    steps: usize,
+    cond: &Sd3Conditioning,
+    uncond: Option<&Sd3Conditioning>,
+    guidance_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    attention: mlx_gen::attention::AttentionPlan<'_>,
+    transformer_window: Option<usize>,
+) -> Result<Array> {
     let noise = create_noise(seed, width, height)?;
 
     // Start step from strength; blend clean⊕noise at σ_k, then denoise sigmas[k..]. The schedule has
     // `steps + 1` sigmas, so clamp the start index inside it (strength ≥ 1 → the last usable step).
     let start = init_time_step(steps, Some(strength)).min(scheduler.sigmas.len().saturating_sub(1));
-    let x_start = add_noise_by_interpolation(&clean, &noise, scheduler.sigmas[start])?;
+    let x_start = add_noise_by_interpolation(clean, &noise, scheduler.sigmas[start])?;
     denoise_over_sigmas(
         transformer,
         &scheduler.sigmas[start..],
@@ -227,6 +463,9 @@ pub fn denoise_img2img_cfg(
         guidance_scale,
         cancel,
         on_progress,
+        preview,
+        attention,
+        transformer_window,
     )
 }
 
@@ -235,6 +474,20 @@ pub fn denoise_img2img_cfg(
 /// is handed straight through.
 pub fn decode_to_image(vae: &Vae, latents: &Array) -> Result<Image> {
     let decoded = vae.decode(latents)?.as_dtype(Dtype::Float32)?;
+    mlx_gen::image::decoded_to_image(&decoded)
+}
+
+pub(crate) fn decode_to_image_tiled(
+    vae: &Vae,
+    latents: &Array,
+    tiling: Option<&mlx_gen::tiling::TilingConfig>,
+    cancel: &CancelFlag,
+) -> Result<Image> {
+    let decoded = match tiling {
+        Some(config) => vae.decode_tiled(latents, config, Some(cancel))?,
+        None => vae.decode(latents)?,
+    }
+    .as_dtype(Dtype::Float32)?;
     mlx_gen::image::decoded_to_image(&decoded)
 }
 
@@ -252,9 +505,12 @@ mod tests {
     /// Written to a unique temp dir and loaded through the real [`ClipBpeTokenizer::from_dir`] path so
     /// this exercises production code (matching the crate's `std::env::temp_dir()` test convention).
     /// `pad_token` selects the config's pad string (`"!"` = bigG, `"<|endoftext|>"` = L).
-    fn synthetic_clip_tokenizer_dir(tag: &str, pad_token: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("mlx_gen_sd3_clip_tok_{}_{tag}", std::process::id()));
+    fn synthetic_clip_tokenizer_dir(
+        tmp: &tempfile::TempDir,
+        tag: &str,
+        pad_token: &str,
+    ) -> std::path::PathBuf {
+        let dir = tmp.path().join(format!("mlx_gen_sd3_clip_tok_{tag}"));
         std::fs::create_dir_all(&dir).unwrap();
         // Vocab: the two specials at their real CLIP ids, `!` at 0 (bigG's pad), plus a few
         // SINGLE-character `</w>` word tokens. The synthetic `merges.txt` has NO merges, so the
@@ -280,16 +536,17 @@ mod tests {
         dir
     }
 
-    fn synthetic_clip_tokenizer() -> ClipBpeTokenizer {
-        ClipBpeTokenizer::from_dir(synthetic_clip_tokenizer_dir("l", "<|endoftext|>")).unwrap()
+    fn synthetic_clip_tokenizer(tmp: &tempfile::TempDir) -> ClipBpeTokenizer {
+        ClipBpeTokenizer::from_dir(synthetic_clip_tokenizer_dir(tmp, "l", "<|endoftext|>")).unwrap()
     }
 
     #[test]
     fn empty_prompt_clip_ids_keep_bos_and_match_tokenize_path() {
+        let tmp = tempfile::tempdir().unwrap();
         // F-004 (default-run, no real weights): the empty (uncond) prompt must NOT be special-cased.
         // The padded row must equal the padded `tokenize("")` path and begin with BOS (49406) then
         // EOS (49407) — NOT 77×EOS-with-no-BOS as the removed `is_empty() → Vec::new()` shortcut did.
-        let tok = synthetic_clip_tokenizer();
+        let tok = synthetic_clip_tokenizer(&tmp);
 
         // tokenize("") is [BOS, EOS].
         assert_eq!(tok.tokenize("").unwrap(), vec![49406, 49407]);
@@ -322,12 +579,73 @@ mod tests {
         );
     }
 
+    /// sc-20528: a prompt past CLIP's window must still END in EOS. `ClipBpeTokenizer::tokenize`
+    /// used to cap at 77 and write eos into the last slot; it now returns the full encoding, so
+    /// `clip_token_ids`' truncation has to re-terminate the window itself. Without that, the row is
+    /// `[BOS, 76 content]` and `ClipTextEncoder::forward`'s `argmax` EOS-pooling gathers at an
+    /// arbitrary content token — silently wrong adaLN conditioning on long SD3.5 prompts and on SD3
+    /// LoRA training captions (`training.rs` → `encode_prompt`).
+    #[test]
+    fn over_long_prompt_truncates_to_an_eos_terminated_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tok = synthetic_clip_tokenizer(&tmp);
+        // The synthetic vocab holds only single-char words, so "a " x100 is a legal ~100-word prompt.
+        let prompt = "a ".repeat(100);
+
+        // The tokenizer itself no longer caps — that is what makes the re-termination load-bearing.
+        assert_eq!(tok.tokenize(&prompt).unwrap().len(), 102, "BOS + 100 + EOS");
+        assert_eq!(
+            tok.eos_id(),
+            CLIP_EOS_ID,
+            "synthetic eos is the real CLIP eos"
+        );
+
+        let ids = clip_token_ids(&tok, &prompt).unwrap();
+        assert_eq!(ids.len(), CLIP_MAX_LENGTH, "exactly one CLIP window");
+        assert_eq!(ids[0], 49406, "the window still opens with BOS");
+        assert_eq!(
+            ids[CLIP_MAX_LENGTH - 1],
+            CLIP_EOS_ID,
+            "the truncated window must be EOS-terminated"
+        );
+        assert!(
+            ids[1..CLIP_MAX_LENGTH - 1].iter().all(|&t| t == 320),
+            "the surviving 75 slots are content"
+        );
+        // EOS appears exactly once, at the end — so `argmax` pools at the true end of text.
+        assert_eq!(
+            ids.iter().position(|&t| t == CLIP_EOS_ID),
+            Some(CLIP_MAX_LENGTH - 1),
+            "argmax EOS-pooling must land on the final slot"
+        );
+    }
+
+    /// The other half of the contract: a prompt inside the window is passed through untouched, so
+    /// every ≤77-token SD3.5 render keeps its pre-sc-20528 ids byte for byte.
+    #[test]
+    fn short_prompt_clip_ids_are_the_tokenizer_encoding_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tok = synthetic_clip_tokenizer(&tmp);
+        for prompt in ["", "a", "a b", "a b a b a"] {
+            assert_eq!(
+                clip_token_ids(&tok, prompt).unwrap(),
+                tok.tokenize(prompt).unwrap(),
+                "{prompt:?} fits the window and must not be rewritten"
+            );
+        }
+        assert_eq!(
+            clip_token_ids(&tok, "a b").unwrap(),
+            vec![49406, 320, 321, 49407]
+        );
+    }
+
     #[test]
     fn resolve_clip_pad_reads_per_encoder_pad_token() {
+        let tmp = tempfile::tempdir().unwrap();
         // sc-9581: L resolves `<|endoftext|>` (49407); bigG resolves `!` (0). A `tokenizer_config.json`
         // with no `pad_token` (or an unknown token) falls back to eos.
-        let l_dir = synthetic_clip_tokenizer_dir("padl", "<|endoftext|>");
-        let g_dir = synthetic_clip_tokenizer_dir("padg", "!");
+        let l_dir = synthetic_clip_tokenizer_dir(&tmp, "padl", "<|endoftext|>");
+        let g_dir = synthetic_clip_tokenizer_dir(&tmp, "padg", "!");
         assert_eq!(
             resolve_clip_pad_id(&l_dir).unwrap(),
             49407,
@@ -340,11 +658,8 @@ mod tests {
         );
 
         // Fallback: a dir whose config lacks `pad_token` -> eos.
-        let f_dir = std::env::temp_dir().join(format!(
-            "mlx_gen_sd3_clip_tok_{}_nofallback",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&f_dir).unwrap();
+        let f_dir_tmp = tempfile::tempdir().unwrap();
+        let f_dir = f_dir_tmp.path().to_path_buf();
         std::fs::write(f_dir.join("tokenizer_config.json"), "{}").unwrap();
         assert_eq!(
             resolve_clip_pad_id(&f_dir).unwrap(),
@@ -377,9 +692,10 @@ mod tests {
 
     #[test]
     fn bigg_pads_with_bang_not_eos() {
+        let tmp = tempfile::tempdir().unwrap();
         // sc-9581 core regression: with a sub-77-token prompt, the bigG row must be padded with `!`
         // (0), NOT eos (49407). The pre-fix code shared one eos-padded row for both encoders.
-        let tok = synthetic_clip_tokenizer();
+        let tok = synthetic_clip_tokenizer(&tmp);
         // Single-char words only (`"a b"` -> [BOS, 320, 321, EOS], len 4) so the no-merges synthetic
         // BPE tokenizes without an OOV error; still a sub-77 prompt with a real pad region.
         let ids = clip_token_ids(&tok, "a b").unwrap();
@@ -439,5 +755,24 @@ mod tests {
         for (got, want) in s.sigmas.iter().zip(expected) {
             assert!((got - want).abs() < 1e-5, "got {got} want {want}");
         }
+    }
+
+    #[test]
+    fn native_and_curated_sd35_schedule_endpoints_match_frozen_fixture() {
+        // Frozen from diffusers FlowMatchEulerDiscreteScheduler { shift: 3.0 } at four steps.
+        let fixture = [1.0_f32, 0.9, 0.75, 0.5, 0.0];
+        let native = resolve_sd3_sigmas(None, 4);
+        assert_eq!(native.len(), fixture.len());
+        for (got, want) in native.iter().zip(fixture) {
+            assert!((got - want).abs() < 1e-5, "native got {got} want {want}");
+        }
+
+        let curated = resolve_sd3_sigmas(Some("normal"), 4);
+        assert_eq!(curated.first(), Some(&fixture[0]));
+        assert_eq!(curated.last(), Some(&fixture[4]));
+        assert!(
+            curated[1] > 0.8,
+            "curated SD3.5 schedule lost static shift: {curated:?}"
+        );
     }
 }

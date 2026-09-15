@@ -54,6 +54,20 @@ pub struct TextLlmRegistration {
     /// returns `false` for a snapshot likewise defers to the static descriptor — the probe only ever
     /// *adds* vision capability for a snapshot, never revokes the statically-declared one.
     pub weightless_vision: Option<fn(&LoadSpec) -> bool>,
+    /// **Weightless** per-snapshot audio probe: does this provider serve the model at `spec.source`
+    /// *with* audio (raw-PCM conditioning) support? The audio analogue of
+    /// [`weightless_vision`](Self::weightless_vision), and it exists for the same reason: one generic
+    /// registration serves text-only checkpoints and audio-capable ones (mlx-llm / candle-llm's
+    /// `*-llama` serves a plain Qwen3 *and* a Gemma 4 unified snapshot whose `audio_config` +
+    /// audio projector make it audio-capable), so the static descriptor must stay
+    /// `supports_audio=false` and a model-first audio-required load would otherwise be rejected at
+    /// the pre-load gate.
+    ///
+    /// Reads only `config.json`; MUST NOT touch weight shards. `None` ⇒ no per-snapshot distinction,
+    /// falling back to the static descriptor's
+    /// [`supports_audio`](crate::capabilities::TextLlmCapabilities::supports_audio). Like the vision
+    /// probe it only ever *adds* capability for a snapshot, never revokes a statically-declared one.
+    pub weightless_audio: Option<fn(&LoadSpec) -> bool>,
 }
 
 /// Builder for an ordinary, explicit LLM provider registry.
@@ -157,6 +171,11 @@ pub struct ModelRequirements {
     /// routing constraint beyond `vision`; it records the request's intent for future video-only
     /// provider disambiguation.
     pub video: bool,
+    /// The provider must accept audio (raw-PCM) input. Routed through its own per-snapshot probe
+    /// ([`TextLlmRegistration::weightless_audio`]) rather than the vision one: Gemma 4's audio
+    /// projector is independent of its vision embedder, so an audio-required load must not be
+    /// satisfied by a merely vision-capable provider.
+    pub audio: bool,
     /// The provider must be able to enforce each of these output constraints.
     pub constraints: Vec<Constraint>,
 }
@@ -164,13 +183,15 @@ pub struct ModelRequirements {
 impl ModelRequirements {
     /// Derive the requirements implied by a concrete request: vision if any message carries an image
     /// **or video** (both route to the vision-capable provider), the `video` flag when any message
-    /// carries video, plus the request's output constraint (if any). This is the bridge the worker
-    /// uses — `load_for_model_with(spec, &ModelRequirements::from_request(req))`.
+    /// carries video, the `audio` flag when any message carries audio, plus the request's output
+    /// constraint (if any). This is the bridge the worker uses —
+    /// `load_for_model_with(spec, &ModelRequirements::from_request(req))`.
     pub fn from_request(req: &TextLlmRequest) -> Self {
         let video = req.has_video();
         Self {
             vision: req.has_image() || video,
             video,
+            audio: req.has_audio(),
             constraints: req.constraint.iter().copied().collect(),
         }
     }
@@ -186,6 +207,14 @@ impl ModelRequirements {
     pub fn with_video(mut self) -> Self {
         self.video = true;
         self.vision = true;
+        self
+    }
+
+    /// Require audio (raw-PCM) input support. Deliberately does **not** imply
+    /// [`with_vision`](Self::with_vision): Gemma 4's audio projector is independent of its vision
+    /// embedder, so an audio-only need must not be widened into a vision requirement.
+    pub fn with_audio(mut self) -> Self {
+        self.audio = true;
         self
     }
 
@@ -249,17 +278,27 @@ fn serves_vision(reg: &TextLlmRegistration, spec: &LoadSpec) -> bool {
         || (reg.descriptor)().capabilities.supports_vision
 }
 
-/// Whether a registration satisfies the caller's requirements for `spec`. Vision is judged
-/// per-snapshot via [`serves_vision`]; constraints come from the static descriptor (they are not
-/// snapshot-dependent).
+/// Whether a registration serves `spec` **with audio** — the audio analogue of [`serves_vision`],
+/// judged per-snapshot by the registration's weightless audio probe, falling back to the static
+/// descriptor's `supports_audio`. Deliberately independent of [`serves_vision`]: a vision-capable
+/// provider is not thereby audio-capable.
+fn serves_audio(reg: &TextLlmRegistration, spec: &LoadSpec) -> bool {
+    reg.weightless_audio.map(|p| p(spec)).unwrap_or(false)
+        || (reg.descriptor)().capabilities.supports_audio
+}
+
+/// Whether a registration satisfies the caller's requirements for `spec`. Vision and audio are each
+/// judged per-snapshot via [`serves_vision`] / [`serves_audio`]; constraints come from the static
+/// descriptor (they are not snapshot-dependent).
 fn meets(reg: &TextLlmRegistration, spec: &LoadSpec, reqs: &ModelRequirements) -> bool {
     if reqs.vision && !serves_vision(reg, spec) {
         return false;
     }
+    if reqs.audio && !serves_audio(reg, spec) {
+        return false;
+    }
     let caps = (reg.descriptor)().capabilities;
-    reqs.constraints
-        .iter()
-        .all(|c| caps.supports_constraint(*c))
+    reqs.constraints.iter().all(|c| caps.supports_constraint(c))
 }
 
 /// `id (backend)` summary of a set of registrations, for diagnostics.
@@ -336,9 +375,10 @@ fn unmet_caps_msg(
 ) -> String {
     format!(
         "model '{}' is loadable, but no available provider meets the requested capabilities \
-         (vision={}, constraints={:?}); providers that match the architecture: {}",
+         (vision={}, audio={}, constraints={:?}); providers that match the architecture: {}",
         spec.source,
         reqs.vision,
+        reqs.audio,
         reqs.constraints,
         summary(accepting),
     )
@@ -349,6 +389,11 @@ mod tests {
     use super::*;
     use crate::capabilities::TextLlmCapabilities;
     use crate::output::{StreamEvent, TextLlmOutput};
+    use crate::{
+        DecoderArchitecture, ImagePreprocessing, ProjectionMetadata, StarVectorDescriptor,
+        StarVectorFinishReason, StarVectorOutput, StarVectorProvider, StarVectorRequest,
+        StarVectorStreamEvent, StarVectorTier, VisionEncoderArchitecture,
+    };
 
     // --- A throwaway provider whose `load` is never invoked by `select` (resolution only). ---
     struct Dummy;
@@ -378,9 +423,10 @@ mod tests {
             supports_system_prompt: true,
             supports_vision: vision,
             supports_video: false,
+            supports_audio: false,
             supports_thinking: false,
             supports_tools: false,
-            supported_constraints: constraints.to_vec(),
+            supported_constraints: constraints.iter().map(Constraint::kind).collect(),
         }
     }
 
@@ -400,6 +446,171 @@ mod tests {
             backend: "test".into(),
             capabilities: caps(true, &[]),
         }
+    }
+
+    struct LoadedNonStar {
+        descriptor: TextLlmDescriptor,
+    }
+
+    impl TextLlm for LoadedNonStar {
+        fn descriptor(&self) -> &TextLlmDescriptor {
+            &self.descriptor
+        }
+
+        fn validate(&self, _req: &TextLlmRequest) -> Result<()> {
+            Ok(())
+        }
+
+        fn generate(
+            &self,
+            _req: &TextLlmRequest,
+            _on_event: &mut dyn FnMut(StreamEvent),
+        ) -> Result<TextLlmOutput> {
+            unreachable!("the typed-view test does not generate text")
+        }
+    }
+
+    struct LoadedStarVector {
+        descriptor: TextLlmDescriptor,
+        starvector: StarVectorDescriptor,
+    }
+
+    impl TextLlm for LoadedStarVector {
+        fn descriptor(&self) -> &TextLlmDescriptor {
+            &self.descriptor
+        }
+
+        fn as_starvector_provider(&self) -> Option<&dyn StarVectorProvider> {
+            Some(self)
+        }
+
+        fn validate(&self, _req: &TextLlmRequest) -> Result<()> {
+            Ok(())
+        }
+
+        fn generate(
+            &self,
+            _req: &TextLlmRequest,
+            _on_event: &mut dyn FnMut(StreamEvent),
+        ) -> Result<TextLlmOutput> {
+            unreachable!("the typed-view test calls generate_svg directly")
+        }
+    }
+
+    impl StarVectorProvider for LoadedStarVector {
+        fn starvector_descriptor(&self) -> &StarVectorDescriptor {
+            &self.starvector
+        }
+
+        fn generate_svg(
+            &self,
+            _request: &StarVectorRequest,
+            on_event: &mut dyn FnMut(StarVectorStreamEvent),
+        ) -> Result<StarVectorOutput> {
+            let output = StarVectorOutput {
+                svg: Some("<svg/>".to_owned()),
+                generated_tokens: 1,
+                generated_bytes: "<svg/>".len(),
+                finish_reason: StarVectorFinishReason::CompleteRoot,
+            };
+            on_event(StarVectorStreamEvent::Done {
+                finish_reason: output.finish_reason,
+                generated_tokens: output.generated_tokens,
+                generated_bytes: output.generated_bytes,
+            });
+            Ok(output)
+        }
+    }
+
+    fn starvector_desc() -> TextLlmDescriptor {
+        TextLlmDescriptor {
+            id: "starvector-test".into(),
+            family: "starvector".into(),
+            backend: "test".into(),
+            capabilities: caps(true, &[]),
+        }
+    }
+
+    fn loaded_non_star(_spec: &LoadSpec) -> Result<Box<dyn TextLlm>> {
+        Ok(Box::new(LoadedNonStar {
+            descriptor: text_desc(),
+        }))
+    }
+
+    fn loaded_starvector(_spec: &LoadSpec) -> Result<Box<dyn TextLlm>> {
+        Ok(Box::new(LoadedStarVector {
+            descriptor: starvector_desc(),
+            starvector: StarVectorDescriptor {
+                tier: StarVectorTier::OneB,
+                preprocessing: ImagePreprocessing {
+                    image_size: 224,
+                    channels: 3,
+                    preserve_aspect_ratio: true,
+                },
+                projection: ProjectionMetadata {
+                    vision_encoder: VisionEncoderArchitecture::Clip,
+                    decoder: DecoderArchitecture::GptBigCode,
+                    vision_hidden_size: 1024,
+                    decoder_hidden_size: 2048,
+                    image_token_count: 257,
+                },
+                max_svg_bytes: 1024,
+                max_wall_time: None,
+            },
+        }))
+    }
+
+    #[test]
+    fn registry_loaded_textllm_exposes_only_the_typed_starvector_view() {
+        let registry = TextLlmRegistryBuilder::new()
+            .register(TextLlmRegistration {
+                descriptor: text_desc,
+                load: loaded_non_star,
+                can_load: |_| false,
+                weightless_vision: None,
+                weightless_audio: None,
+            })
+            .register(TextLlmRegistration {
+                descriptor: starvector_desc,
+                load: loaded_starvector,
+                can_load: |_| false,
+                weightless_vision: None,
+                weightless_audio: None,
+            })
+            .build()
+            .expect("distinct explicit registrations build");
+        let spec = LoadSpec::dense("synthetic-starvector-snapshot");
+
+        let ordinary = registry
+            .load_textllm("text", &spec)
+            .expect("non-StarVector provider loads through the same registry");
+        assert!(ordinary.as_starvector_provider().is_none());
+
+        let loaded = registry
+            .load_textllm("starvector-test", &spec)
+            .expect("StarVector provider loads through the ordinary registry");
+        assert_eq!(loaded.descriptor().id, "starvector-test");
+        let typed = loaded
+            .as_starvector_provider()
+            .expect("loaded StarVector exposes its typed view");
+        assert_eq!(typed.starvector_descriptor().tier, StarVectorTier::OneB);
+
+        let request = StarVectorRequest::new(
+            TextLlmRequest::new(Vec::new(), 1),
+            16,
+            std::time::Duration::from_secs(1),
+        );
+        let mut done = None;
+        let output = typed
+            .generate_svg(&request, &mut |event| {
+                if let StarVectorStreamEvent::Done { finish_reason, .. } = event {
+                    done = Some(finish_reason);
+                }
+            })
+            .expect("typed view exposes StarVector output");
+        assert_eq!(output.svg.as_deref(), Some("<svg/>"));
+        assert_eq!(output.finish_reason, StarVectorFinishReason::CompleteRoot);
+        assert_eq!(done, Some(StarVectorFinishReason::CompleteRoot));
     }
 
     // --- Qwen3-VL model-first routing fixtures (sc-8077) ---------------------------------------
@@ -429,13 +640,15 @@ mod tests {
     /// Write a faithful Qwen3-VL `config.json` (model_type `qwen3_vl`, nested `qwen3_vl_text`
     /// decoder, `vision_config` present) into a fresh temp dir and return a [`LoadSpec`] for it. This
     /// mirrors the cached `Qwen/Qwen3-VL-8B-Instruct` (rev 0c351dd0) wrapper shape.
-    fn qwen3vl_snapshot(tag: &str) -> (std::path::PathBuf, LoadSpec) {
-        let dir = std::env::temp_dir().join(format!(
-            "core-llm-qwen3vl-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+    /// Returns the `TempDir` guard alongside the spec (sc-17755): the spec holds only a path string,
+    /// so the guard has to stay bound for as long as the test reads the snapshot. The trailing
+    /// `remove_dir_all` lines this replaced were skipped by any test that panicked first.
+    fn qwen3vl_snapshot(tag: &str) -> (tempfile::TempDir, LoadSpec) {
+        let guard = tempfile::Builder::new()
+            .prefix(&format!("core-llm-qwen3vl-{tag}-"))
+            .tempdir()
+            .expect("fixture temp dir");
+        let dir = guard.path();
         std::fs::write(
             dir.join("config.json"),
             br#"{"architectures":["Qwen3VLForConditionalGeneration"],
@@ -446,7 +659,7 @@ mod tests {
         )
         .unwrap();
         let spec = LoadSpec::dense(dir.to_str().unwrap().to_string());
-        (dir, spec)
+        (guard, spec)
     }
 
     /// A weightless vision probe of the `mlx-llama` shape: reads only `config.json` and advertises
@@ -499,6 +712,7 @@ mod tests {
             load: never_loads,
             can_load,
             weightless_vision: None,
+            weightless_audio: None,
         }
     }
 
@@ -513,6 +727,23 @@ mod tests {
             load: never_loads,
             can_load,
             weightless_vision: Some(weightless_vision),
+            weightless_audio: None,
+        }
+    }
+
+    /// A registration that adds a per-snapshot weightless **audio** probe (the model-first audio
+    /// gate) and no vision probe — the shape that proves audio routing is independent of vision.
+    fn reg_with_audio_probe(
+        descriptor: fn() -> TextLlmDescriptor,
+        can_load: fn(&LoadSpec) -> bool,
+        weightless_audio: fn(&LoadSpec) -> bool,
+    ) -> TextLlmRegistration {
+        TextLlmRegistration {
+            descriptor,
+            load: never_loads,
+            can_load,
+            weightless_vision: None,
+            weightless_audio: Some(weightless_audio),
         }
     }
 
@@ -585,8 +816,11 @@ mod tests {
         // while the real decoder type a provider dispatches on is nested under `text_config`. The hint
         // must surface BOTH so an unknown-architecture error names the actual decoder, not just the
         // wrapper — otherwise the message points the reader at `qwen3_5` when the gap is `qwen3_5_text`.
-        let dir = std::env::temp_dir().join(format!("core-llm-archhint-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let guard = tempfile::Builder::new()
+            .prefix("core-llm-archhint-")
+            .tempdir()
+            .expect("fixture temp dir");
+        let dir = guard.path();
         std::fs::write(
             dir.join("config.json"),
             br#"{"architectures":["Qwen3_5ForConditionalGeneration"],
@@ -602,12 +836,13 @@ mod tests {
             "architectures=Qwen3_5ForConditionalGeneration, model_type=qwen3_5, \
              text_config.model_type=qwen3_5_text"
         );
-        let _ = std::fs::remove_dir_all(&dir);
 
         // A flat (non-wrapped) config still works and omits the nested part.
-        let flat =
-            std::env::temp_dir().join(format!("core-llm-archhint-flat-{}", std::process::id()));
-        std::fs::create_dir_all(&flat).unwrap();
+        let flat_guard = tempfile::Builder::new()
+            .prefix("core-llm-archhint-flat-")
+            .tempdir()
+            .expect("fixture temp dir");
+        let flat = flat_guard.path();
         std::fs::write(
             flat.join("config.json"),
             br#"{"architectures":["LlamaForCausalLM"],"model_type":"llama"}"#,
@@ -615,7 +850,6 @@ mod tests {
         .unwrap();
         let hint = raw_arch_hint(&LoadSpec::dense(flat.to_str().unwrap().to_string())).unwrap();
         assert_eq!(hint, "architectures=LlamaForCausalLM, model_type=llama");
-        let _ = std::fs::remove_dir_all(&flat);
     }
 
     #[test]
@@ -696,7 +930,7 @@ mod tests {
         // Qwen3-VL snapshot — only the id-based / default-requirements path worked. With the
         // weightless per-snapshot vision probe, the gate now recognizes the `qwen3_vl` wrapper as
         // vision-capable from `config.json` alone and resolves it.
-        let (dir, spec) = qwen3vl_snapshot("vision-required");
+        let (_dir, spec) = qwen3vl_snapshot("vision-required");
         // Sanity: the static descriptor really is text-only — without the probe this would fail.
         assert!(!generic_text_desc().capabilities.supports_vision);
 
@@ -705,7 +939,6 @@ mod tests {
         let id = picked_for(&[&generic], &spec, &reqs)
             .expect("vision-required model-first load must resolve the qwen3_vl provider");
         assert_eq!(id, "mlx-llama");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -713,7 +946,7 @@ mod tests {
         // Guard the gate's other side: a text-only provider with NO weightless vision probe must
         // still be rejected for a vision-required load (the probe only ever *adds* capability — it
         // is not a blanket bypass of the vision gate).
-        let (dir, spec) = qwen3vl_snapshot("no-probe");
+        let (_dir, spec) = qwen3vl_snapshot("no-probe");
         let generic = reg(generic_text_desc, yes); // no vision probe
         let reqs = ModelRequirements::default().with_vision();
         let err = picked_for(&[&generic], &spec, &reqs).unwrap_err();
@@ -721,7 +954,6 @@ mod tests {
             matches!(err, Error::Unsupported(_)),
             "a text-only provider with no vision probe must not satisfy a vision-required load: {err:?}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -731,7 +963,7 @@ mod tests {
         // advertises vision, it never claims the architecture. A vision-required Qwen3-VL load must
         // resolve to the generic `mlx-llama` provider (whose weightless probe advertises vision for
         // this snapshot), NOT the JoyCaption path — mirroring the qwen3.6→JoyCaption fix.
-        let (dir, spec) = qwen3vl_snapshot("no-misroute");
+        let (_dir, spec) = qwen3vl_snapshot("no-misroute");
         let joycaption = reg(joycaption_desc, no); // LLaVA-only can_load declines qwen3_vl
         let generic = reg_with_vision_probe(generic_text_desc, yes, qwen_vl_vision_probe);
 
@@ -745,7 +977,6 @@ mod tests {
             picked_for(&[&generic, &joycaption], &spec, &reqs).unwrap(),
             "mlx-llama"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -753,7 +984,7 @@ mod tests {
         // A plain (default-requirements) load of the same snapshot — the id-based path that already
         // worked — still resolves to the generic provider and is unaffected by the new probe (a
         // JoyCaption provider that declines the architecture never competes).
-        let (dir, spec) = qwen3vl_snapshot("default");
+        let (_dir, spec) = qwen3vl_snapshot("default");
         let joycaption = reg(joycaption_desc, no);
         let generic = reg_with_vision_probe(generic_text_desc, yes, qwen_vl_vision_probe);
         let id = picked_for(
@@ -763,6 +994,87 @@ mod tests {
         )
         .unwrap();
         assert_eq!(id, "mlx-llama");
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- audio routing (sc-18772) ---------------------------------------------------------------
+
+    #[test]
+    fn audio_required_load_needs_an_audio_probe_not_a_vision_one() {
+        // The defect this guards: routing audio through the vision gate. A provider that advertises
+        // vision for the snapshot (and nothing else) must NOT satisfy an audio-required load, and a
+        // provider with only an audio probe must.
+        let spec = LoadSpec::dense("/no/such/snapshot");
+        let vision_only = reg_with_vision_probe(generic_text_desc, yes, yes);
+        let audio_only = reg_with_audio_probe(text_desc, yes, yes);
+
+        // Vision-only cannot serve audio: with it alone the gate must refuse outright.
+        let reqs = ModelRequirements::default().with_audio();
+        assert!(
+            picked_for(&[&vision_only], &spec, &reqs).is_err(),
+            "a vision-capable provider must not satisfy an audio-required load"
+        );
+        // The audio-probed provider is chosen even when the vision-capable one is registered first.
+        assert_eq!(
+            picked_for(&[&vision_only, &audio_only], &spec, &reqs).unwrap(),
+            "text"
+        );
+    }
+
+    #[test]
+    fn audio_probe_only_adds_capability_for_the_probed_snapshot() {
+        // `no` probe ⇒ defer to the static descriptor (which is audio-free here) ⇒ unmet.
+        let spec = LoadSpec::dense("/no/such/snapshot");
+        let declines = reg_with_audio_probe(text_desc, yes, no);
+        let err = picked_for(
+            &[&declines],
+            &spec,
+            &ModelRequirements::default().with_audio(),
+        )
+        .expect_err("an audio probe that declines must not be routed audio work");
+        // The diagnostic names the unmet audio requirement, not just vision.
+        assert!(
+            format!("{err}").contains("audio=true"),
+            "unmet-capability message must report the audio requirement: {err}"
+        );
+        // Without the audio requirement the same registration still serves ordinary text.
+        assert_eq!(
+            picked_for(&[&declines], &spec, &ModelRequirements::default()).unwrap(),
+            "text"
+        );
+    }
+
+    #[test]
+    fn with_audio_does_not_imply_vision() {
+        // Audio and vision are independent surfaces; widening audio into vision would silently
+        // re-route an audio-only request to a VLM.
+        let reqs = ModelRequirements::default().with_audio();
+        assert!(reqs.audio);
+        assert!(
+            !reqs.vision,
+            "with_audio must not set the vision requirement"
+        );
+        // ...while `with_video` still implies vision, as before.
+        assert!(ModelRequirements::default().with_video().vision);
+    }
+
+    #[test]
+    fn from_request_carries_audio_content_into_the_requirements() {
+        use crate::message::{AudioRef, Content, Message};
+        let audio = AudioRef::new(16_000, vec![0.0; 640]).unwrap();
+        let req = TextLlmRequest {
+            messages: vec![Message {
+                role: crate::message::Role::User,
+                content: vec![Content::Audio(audio), Content::text("what do you hear?")],
+                thinking: None,
+                tool_calls: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let reqs = ModelRequirements::from_request(&req);
+        assert!(reqs.audio, "an audio-carrying request must require audio");
+        assert!(
+            !reqs.vision,
+            "an audio-only request must not require vision"
+        );
     }
 }

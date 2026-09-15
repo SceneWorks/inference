@@ -12,7 +12,7 @@
 //! The append/image numerics are validated deterministically by `interleave_parity` (the synthetic
 //! `append_generated_image` golden) + the sc-3188/3189 image-gen parity.
 //!
-//! Run: `cargo test -p mlx-gen-sensenova --test interleave_realweight -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-sensenova --test integration interleave_realweight:: -- --ignored --nocapture`
 
 use std::path::PathBuf;
 

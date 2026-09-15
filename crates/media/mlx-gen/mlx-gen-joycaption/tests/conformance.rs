@@ -6,7 +6,7 @@
 //! identically. `#[ignore]` because it needs the real
 //! `fancyfeast/llama-joycaption-beta-one-hf-llava` snapshot; run on the self-hosted Apple-Silicon
 //! runner or a populated dev box:
-//!   cargo test -p mlx-gen-joycaption --test conformance -- --ignored --nocapture
+//!   cargo test -p mlx-gen-joycaption --test integration conformance:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 

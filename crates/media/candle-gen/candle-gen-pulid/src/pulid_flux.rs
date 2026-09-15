@@ -28,10 +28,16 @@ use rand::{rngs::StdRng, SeedableRng};
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{Image, PidWeights, Progress};
+use candle_gen::gen_core::{
+    GenerationMemory, Image, MemoryProviderContract, MemoryRunContext, PidWeights, PreviewSink,
+    Progress,
+};
+use candle_gen::preview::PreviewHook;
 use candle_gen::weights::Weights;
 use candle_gen::{CandleError, Result};
-use candle_gen_flux::{flow_mu, DitImageInjector, FluxRefBackbone, Variant, BASE_SHIFT, MAX_SHIFT};
+use candle_gen_flux::{
+    flow_mu, DitImageInjector, FluxRefBackbone, FluxRefHeavy, Variant, BASE_SHIFT, MAX_SHIFT,
+};
 use candle_gen_pid::{PidDecoder, PidEngine};
 
 use crate::ca::PulidCa;
@@ -45,7 +51,7 @@ const NUM_SINGLE_BLOCKS: usize = 38;
 const DTYPE: DType = DType::BF16;
 const COND_DTYPE: DType = DType::F32;
 /// FLUX latent channel count (the raw VAE latent / initial noise; the DiT packs it 2×2 to 64).
-const LATENT_CHANNELS: usize = 16;
+pub(crate) const LATENT_CHANNELS: usize = 16;
 // FLUX dev's flow-match time-shift endpoints (`BASE_SHIFT`/`MAX_SHIFT`) and the `flow_mu` linear map
 // are shared from `candle-gen-flux` (sc-11249 / F-140) — PuLID (always dev) reuses the exact
 // parity-critical schedule constants rather than maintaining a third copy.
@@ -77,6 +83,20 @@ fn reject_below_floor(req: &PulidFluxRequest) -> Result<()> {
     Ok(())
 }
 
+/// Poll cancellation at every boundary of the expensive identity preparation stack. A cancellation
+/// that arrives while a synchronous face/EVA/IDFormer stage is running is observed before the next
+/// stage or any generation setup begins.
+fn identity_stage<T>(cancel: &CancelFlag, work: impl FnOnce() -> Result<T>) -> Result<T> {
+    if cancel.is_cancelled() {
+        return Err(CandleError::Canceled);
+    }
+    let output = work()?;
+    if cancel.is_cancelled() {
+        return Err(CandleError::Canceled);
+    }
+    Ok(output)
+}
+
 /// Default PuLID `id_weight` (the reference-face strength; 0–3, upstream default 1.0).
 pub const DEFAULT_ID_WEIGHT: f32 = 1.0;
 /// Default dev guidance for the PuLID photoreal recipe.
@@ -97,6 +117,7 @@ pub struct PulidFluxPaths {
     pub eva_weights: PathBuf,
     /// The native face-stack dir (`scrfd_10g` / `arcface_iresnet100` / `bisenet_parsing`).
     pub face_dir: PathBuf,
+    pub adapters: Vec<candle_gen::gen_core::AdapterSpec>,
 }
 
 /// One PuLID-FLUX generation request.
@@ -125,6 +146,13 @@ pub struct PulidFluxRequest {
     /// (4× SR → 2K/4K) instead of the native FLUX.1 VAE. PiD is a *generative* decoder, so face likeness
     /// may shift — the user judges per-generation. `false` (default) keeps the byte-exact VAE decode.
     pub use_pid: bool,
+    /// Per-step latent-preview sink (epic 16948, sc-16956) - the bespoke-request twin of
+    /// [`gen_core::GenerationRequest::preview`](candle_gen::gen_core::GenerationRequest::preview),
+    /// which PuLID cannot carry because it registers no descriptor at all (a `BESPOKE_UTILITY_CRATES`
+    /// member the worker drives by name). Frames are the *image* latent alone; the identity embedding
+    /// is injected inside the DiT forward and never joins it (see [`crate::preview`]). Default is
+    /// inert, and an inert sink makes a seeded render byte-identical to one with no preview at all.
+    pub preview: PreviewSink,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
 }
@@ -142,6 +170,7 @@ impl Default for PulidFluxRequest {
             scheduler: None,
             seed: 0,
             use_pid: false,
+            preview: PreviewSink::default(),
             cancel: CancelFlag::default(),
         }
     }
@@ -179,12 +208,50 @@ pub struct PulidFlux {
     /// Optional PiD super-resolving decoder (epic 7840, sc-8044), attached via [`with_pid`](Self::with_pid).
     /// PuLID composes the FLUX.1-dev VAE, so it loads the `flux` student (same tag as the base FLUX provider).
     pid: Option<PidEngine>,
+    /// Exact request-scoped contract/context selected for the bespoke route. Legacy callers that use
+    /// `load`/`load_with_memory` leave these empty; the SceneWorks route uses
+    /// `load_with_memory_context` and must then call `generate_with_memory_context`.
+    memory_contract: Option<MemoryProviderContract>,
+    admitted_context: Option<MemoryRunContext>,
 }
 
 impl PulidFlux {
     /// Load the FLUX.1-dev backbone + the EVA tower + the IDFormer + the PuLID CA weights + the native
     /// face stack (with the BiSeNet parser) from the [`PulidFluxPaths`].
     pub fn load(paths: &PulidFluxPaths) -> Result<Self> {
+        Self::load_with_memory(paths, GenerationMemory::default())
+    }
+
+    /// Load PuLID with the shared FLUX request memory plan. Identity modules remain resident while the
+    /// base backbone may stage text→DiT/VAE, stream its two block stacks, and CPU-decode through the
+    /// calibrated bounded-host path.
+    pub fn load_with_memory(paths: &PulidFluxPaths, memory: GenerationMemory) -> Result<Self> {
+        Self::load_internal(paths, memory, None, None)
+    }
+
+    /// Load under an exact shared-ladder admission context. The provider rebuilds and validates the
+    /// contract from the actual resolved paths, derives `GenerationMemory` from the admitted
+    /// selection, and retains the handshake for every subsequent bespoke request.
+    pub fn load_with_memory_context(
+        paths: &PulidFluxPaths,
+        context: MemoryRunContext,
+    ) -> Result<Self> {
+        let contract = crate::memory_strategy::provider_contract(paths)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        crate::memory_strategy::validate_context(paths, &contract, &context)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        let memory = contract
+            .generation_memory(&context.selection)
+            .unwrap_or_default();
+        Self::load_internal(paths, memory, Some(contract), Some(context))
+    }
+
+    fn load_internal(
+        paths: &PulidFluxPaths,
+        memory: GenerationMemory,
+        memory_contract: Option<MemoryProviderContract>,
+        admitted_context: Option<MemoryRunContext>,
+    ) -> Result<Self> {
         let device = candle_gen::default_device()?;
         let dtype = DTYPE;
 
@@ -193,7 +260,14 @@ impl PulidFlux {
         // detect-and-load, so PuLID consumes the SAME q4/q8/bf16 tiers `flux_dev` does. The PuLID CA
         // injection runs through the backbone's post-block `forward_injected` seam (on the BFL `IpFlux`
         // or the diffusers `PackedFluxDit`, whichever tier loaded).
-        let backbone = FluxRefBackbone::load(&paths.flux_base, Variant::Dev, &device, dtype)?;
+        let backbone = FluxRefBackbone::load_with_memory(
+            &paths.flux_base,
+            Variant::Dev,
+            &device,
+            dtype,
+            memory,
+            paths.adapters.clone(),
+        )?;
 
         // EVA-CLIP tower (f32 conditioning path).
         let eva_w = Weights::from_file(&paths.eva_weights, &device, COND_DTYPE).map_err(|e| {
@@ -225,6 +299,8 @@ impl PulidFlux {
             pulid,
             face,
             pid: None,
+            memory_contract,
+            admitted_context,
         })
     }
 
@@ -260,8 +336,19 @@ impl PulidFlux {
     }
 
     /// Reference face (RGB [`Image`]) → `id_embedding` `[1,32,2048]` (f32). Mirrors PuLID's
-    /// `get_id_embedding` (the conditional side).
+    /// `get_id_embedding` (the conditional side). Direct callers retain the historical non-cancelable
+    /// API; generation uses the cancellation-aware internal path below.
     pub fn compute_id_embedding(&self, reference: &Image) -> Result<Tensor> {
+        self.compute_id_embedding_with_cancel(reference, &CancelFlag::new())
+    }
+
+    /// Cancellation-aware identity preparation used by generation. Polls `cancel` between each
+    /// synchronous face/EVA/IDFormer stage before any denoise setup can begin.
+    fn compute_id_embedding_with_cancel(
+        &self,
+        reference: &Image,
+        cancel: &CancelFlag,
+    ) -> Result<Tensor> {
         let inner = self.face.inner();
         let (h, w) = (reference.height as usize, reference.width as usize);
         // Detect-then-embed-the-largest (sc-11249 / F-138), matching the `candle-gen-face` /
@@ -270,21 +357,31 @@ impl PulidFlux {
         // avoids `analyze`'s N−1 wasted host norm-crops + N-row batched forward for a group-photo
         // reference; iresnet100 has no cross-batch ops, so the kept embedding is bit-identical to the
         // old `analyze(..).first()`.
-        let dets = inner.detect(&reference.pixels, h, w)?;
+        let dets = identity_stage(cancel, || inner.detect(&reference.pixels, h, w))?;
         let det = dets.first().ok_or_else(|| {
             CandleError::Msg("pulid_flux: no face detected in the reference image".into())
         })?;
-        let face = inner.embed(&reference.pixels, h, w, det)?;
+        let face = identity_stage(cancel, || inner.embed(&reference.pixels, h, w, det))?;
         // ArcFace 512-d (raw, un-normalized) → [1, 512] f32.
         let dim = face.embedding.len();
-        let arcface = Tensor::from_vec(face.embedding.clone(), (1, dim), &self.device)?;
+        let arcface = identity_stage(cancel, || {
+            Ok(Tensor::from_vec(
+                face.embedding.clone(),
+                (1, dim),
+                &self.device,
+            )?)
+        })?;
         // face_features_image (512² NCHW) → EVA 336² transform → tower.
-        let ffi = inner.face_features_image(&reference.pixels, h, w, &face)?;
-        let eva_in = transform::eva_transform(&ffi, self.eva.config().image_size)?;
-        let eva_out = self.eva.forward(&eva_in)?;
-        let id_cond_vit = l2_normalize_rows(&eva_out.id_cond_vit)?; // [1,768]
-        let id_cond = Tensor::cat(&[&arcface, &id_cond_vit], 1)?; // [1,1280]
-        self.idformer.forward(&id_cond, &eva_out.hidden)
+        let ffi = identity_stage(cancel, || {
+            inner.face_features_image(&reference.pixels, h, w, &face)
+        })?;
+        let eva_in = identity_stage(cancel, || {
+            transform::eva_transform(&ffi, self.eva.config().image_size)
+        })?;
+        let eva_out = identity_stage(cancel, || Ok(self.eva.forward(&eva_in)?))?;
+        let id_cond_vit = identity_stage(cancel, || Ok(l2_normalize_rows(&eva_out.id_cond_vit)?))?; // [1,768]
+        let id_cond = identity_stage(cancel, || Ok(Tensor::cat(&[&arcface, &id_cond_vit], 1)?))?; // [1,1280]
+        identity_stage(cancel, || self.idformer.forward(&id_cond, &eva_out.hidden))
     }
 
     /// Reference-image identity T2I: condition the FLUX.1-dev generation on `reference`'s PuLID
@@ -295,25 +392,85 @@ impl PulidFlux {
         reference: &Image,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        if self.admitted_context.is_some() {
+            return Err(CandleError::Msg(
+                "pulid_flux: admitted model requires generate_with_memory_context".into(),
+            ));
+        }
+        self.generate_inner(req, reference, on_progress)
+    }
+
+    /// Execute one bespoke PuLID request under the exact admission handshake retained at load. The
+    /// route and geometry are revalidated at the last responsible moment and the CUDA device is
+    /// synchronized on both success and failure so request-scoped materializations cannot leak into
+    /// the next job's budget snapshot.
+    pub fn generate_with_memory_context(
+        &self,
+        context: &MemoryRunContext,
+        req: &PulidFluxRequest,
+        reference: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let admitted = self.admitted_context.as_ref().ok_or_else(|| {
+            CandleError::Msg("pulid_flux: model was not loaded with a memory context".into())
+        })?;
+        let contract = self.memory_contract.as_ref().ok_or_else(|| {
+            CandleError::Msg("pulid_flux: admitted model lost its memory contract".into())
+        })?;
+        if admitted != context {
+            return Err(CandleError::Msg(
+                "pulid_flux: request memory context changed after provider load".into(),
+            ));
+        }
+        validate_request_geometry(
+            &context.geometry,
+            context.has_reference,
+            context.use_pid,
+            req,
+        )?;
+        crate::memory_strategy::validate_context_from_loaded(contract, context)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        let result = self.generate_inner(req, reference, on_progress);
+        let synchronized = self.device.synchronize().map_err(CandleError::Candle);
+        match (result, synchronized) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(image), Ok(())) => Ok(image),
+        }
+    }
+
+    fn generate_inner(
+        &self,
+        req: &PulidFluxRequest,
+        reference: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
         reject_below_floor(req)?;
+        self.backbone
+            .validate_native_vae_request(req.use_pid, &req.cancel)?;
 
         // Identity conditioning (computed once; constant across the denoise).
-        let id_embedding = self.compute_id_embedding(reference)?;
-        let pulid_ca = PulidCa::from_weights(
-            &self.pulid,
-            "pulid_ca",
-            id_embedding,
-            req.id_weight as f64,
-            NUM_DOUBLE_BLOCKS,
-            NUM_SINGLE_BLOCKS,
-        )?;
+        let id_embedding = self.compute_id_embedding_with_cancel(reference, &req.cancel)?;
+        let pulid_ca = identity_stage(&req.cancel, || {
+            PulidCa::from_weights(
+                &self.pulid,
+                "pulid_ca",
+                id_embedding,
+                req.id_weight as f64,
+                NUM_DOUBLE_BLOCKS,
+                NUM_SINGLE_BLOCKS,
+            )
+        })?;
 
         // Text conditioning (T5 seq + CLIP pooled) — tier-agnostic via the backbone (dense or packed
         // encoders, same token ids either way).
-        let (t5_emb, clip_emb) = self.backbone.encode_text(&req.prompt)?;
+        let (t5_emb, clip_emb) = self
+            .backbone
+            .encode_text_with_memory(&req.prompt, &req.cancel)?;
+        let heavy = self.backbone.load_heavy(&req.cancel)?;
 
         // candle's get_noise geometry: latent is /8 of a multiple-of-16 request.
         let lat_h = (req.height as usize).div_ceil(16) * 2;
@@ -331,14 +488,20 @@ impl PulidFlux {
         let timesteps = get_schedule(req.steps, Some((state.img.dim(1)?, BASE_SHIFT, MAX_SHIFT)));
         let guidance = req.guidance as f64;
 
+        // Per-step latent preview (epic 16948, sc-16956), bound to the SAME `(width, height)` the
+        // decode below is given. The PuLID CA identity residuals are injected inside the DiT forward
+        // and never join the running latent, so the strip shows the developing image alone.
+        let preview = crate::preview::hook(&req.preview, req.width, req.height);
         let latents = self.denoise(
             &state,
             &timesteps,
             guidance,
             &pulid_ca,
+            heavy.as_ref(),
             req.sampler.as_deref(),
             req.scheduler.as_deref(),
             req.seed,
+            &preview,
             &req.cancel,
             on_progress,
         )?;
@@ -347,11 +510,13 @@ impl PulidFlux {
         // this generation opted in (`req.use_pid`) and `with_pid` loaded one (epic 7840, sc-8044). PiD is a
         // generative decoder, so face likeness may shift — the user's per-gen call.
         let pid_decoder = self.pid_decoder_for(req)?;
-        self.backbone.decode(
+        self.backbone.decode_with_memory(
+            heavy.as_ref(),
             &latents,
             req.height as usize,
             req.width as usize,
             pid_decoder.as_ref(),
+            &req.cancel,
         )
     }
 
@@ -371,9 +536,11 @@ impl PulidFlux {
         timesteps: &[f64],
         guidance: f64,
         injector: &PulidCa,
+        heavy: Option<&FluxRefHeavy>,
         sampler: Option<&str>,
         scheduler: Option<&str>,
         seed: u64,
+        preview: &PreviewHook<'_>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
@@ -396,12 +563,14 @@ impl PulidFlux {
             seed,
             cancel,
             on_progress,
+            Some(preview),
             |img, t| -> Result<Tensor> {
                 // The backbone dispatches to the loaded tier's DiT (BFL `IpFlux` or packed
                 // `PackedFluxDit`) `forward_injected`; the PuLID CA identity injection lives inside this
                 // closure so a multi-eval solver re-runs the whole step.
                 let t_vec = Tensor::full(t, b_sz, &self.device)?;
-                self.backbone.forward_injected(
+                self.backbone.forward_injected_with_memory(
+                    heavy,
                     img,
                     &state.img_ids,
                     &state.txt,
@@ -410,10 +579,32 @@ impl PulidFlux {
                     &state.vec,
                     Some(&guidance_t),
                     Some(injector as &dyn DitImageInjector),
+                    cancel,
                 )
             },
         )
     }
+}
+
+fn validate_request_geometry(
+    geometry: &candle_gen::gen_core::MemoryGeometry,
+    has_reference: bool,
+    use_pid: bool,
+    req: &PulidFluxRequest,
+) -> Result<()> {
+    if geometry.width != req.width
+        || geometry.height != req.height
+        || geometry.batch != 1
+        || geometry.frames != 1
+        || geometry.reference_count != 1
+        || has_reference != (geometry.reference_count > 0)
+        || use_pid != req.use_pid
+    {
+        return Err(CandleError::Msg(
+            "pulid_flux: request route or geometry changed after memory admission".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -472,6 +663,68 @@ mod tests {
         assert_eq!(r.guidance, DEFAULT_GUIDANCE);
         assert_eq!(r.id_weight, DEFAULT_ID_WEIGHT);
         assert!(!r.cancel.is_cancelled());
+    }
+
+    /// F-108: a request canceled before identity preparation starts returns the shared cancellation
+    /// error without invoking the first identity stage.
+    #[test]
+    fn identity_stage_pre_cancelled_skips_work() {
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let mut calls = 0;
+        let result = identity_stage(&cancel, || {
+            calls += 1;
+            Ok(())
+        });
+
+        assert!(matches!(result, Err(CandleError::Canceled)));
+        assert_eq!(calls, 0);
+    }
+
+    /// F-108: cancellation observed after an identity operation prevents every later identity or
+    /// generation stage from starting, and preserves the shared `CandleError::Canceled` result.
+    #[test]
+    fn identity_stage_cancellation_checkpoint_stops_before_next_stage() {
+        let cancel = CancelFlag::new();
+        let mut first_calls = 0;
+        let mut next_calls = 0;
+        let result: Result<()> = (|| {
+            identity_stage(&cancel, || {
+                first_calls += 1;
+                cancel.cancel();
+                Ok(())
+            })?;
+            identity_stage(&cancel, || {
+                next_calls += 1;
+                Ok(())
+            })
+        })();
+
+        assert!(matches!(result, Err(CandleError::Canceled)));
+        assert_eq!(first_calls, 1);
+        assert_eq!(
+            next_calls, 0,
+            "generation setup must not follow a canceled identity stage"
+        );
+    }
+
+    #[test]
+    fn admitted_generation_geometry_rejects_zero_or_multi_image_batches() {
+        let req = PulidFluxRequest::default();
+        let mut geometry = candle_gen::gen_core::MemoryGeometry {
+            width: req.width,
+            height: req.height,
+            batch: 1,
+            frames: 1,
+            reference_count: 1,
+        };
+
+        assert!(validate_request_geometry(&geometry, true, false, &req).is_ok());
+        for batch in [0, 2] {
+            geometry.batch = batch;
+            let error = validate_request_geometry(&geometry, true, false, &req).unwrap_err();
+            assert!(error.to_string().contains("geometry changed"), "{error}");
+        }
     }
 
     /// `l2_normalize_rows` returns unit-norm rows (and the FLUX block counts the schedule is built over

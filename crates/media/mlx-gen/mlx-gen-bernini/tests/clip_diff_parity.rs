@@ -6,7 +6,7 @@
 //! (TimestepEmbedder, adaLN ResBlocks, FinalLayer), and a full triple-CFG `sample()` denoise — all
 //! f32. Tolerances reflect the MLX-Metal-vs-torch f32 matmul floor accumulated over each path.
 //!
-//! Run: `cargo test -p mlx-gen-bernini --test clip_diff_parity -- --nocapture`
+//! Run: `cargo test -p mlx-gen-bernini --test integration clip_diff_parity:: -- --nocapture`
 
 use mlx_gen::weights::Weights;
 use mlx_gen_bernini::clip_diff::DiffLossFm;

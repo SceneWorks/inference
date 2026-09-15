@@ -52,7 +52,9 @@ fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
 /// over the query rows once the full `[b,h,Sq,Sk]` scores tensor would exceed
 /// [`candle_gen::ATTN_SCORES_BUDGET`] (the candle CUDA i32-index limit) — only the long Edit /
 /// multi-reference joint sequences trip it. The `softmax_last_dim` closure keeps the exact fused softmax;
-/// each query row's softmax is independent, so the chunked result is byte-identical to the single pass.
+/// each query row's softmax is independent, so the chunked result is *mathematically* equal to the single
+/// pass — not bitwise equal, since narrowing the query axis changes the GEMM `M` and so may change the
+/// f32 accumulation order (SC-15943).
 fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
     candle_gen::sdpa_budgeted_bhsd(
         q,

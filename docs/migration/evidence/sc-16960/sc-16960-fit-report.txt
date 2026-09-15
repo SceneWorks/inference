@@ -1,0 +1,26 @@
+SenseNova-U1 preview OLS (sc-16960): 4 fit + 2 DISJOINT holdout renders, 512², 8 flow-match Euler steps, guidance 4, token cell 32 ⇒ 16² frames
+split: whole renders, never a pixel subsample — fit seeds [1696001, 1696002, 1696003, 1696004], holdout seeds [1696091, 1696092], and the holdout prompts are disjoint from the fit prompts
+latent space: THREE-channel pixel space — SenseNova-U1 ships no VAE, so this could not be one of the seven epic-16624 spaces and had to be measured
+FIT      R2 (R,G,B) = [0.9999951696458816, 0.9999901565635435, 0.9999844088384774]  overall = 0.99998989
+HOLDOUT  R2 (R,G,B) = [0.9999912288251502, 0.9999894543368515, 0.9999754415534841]  overall = 0.99998292
+go/no-go: the epic's bar is HOLDOUT overall R2 >= 0.88 (LTX .984 fit/.619 holdout, Mage .938/.806, Mochi .847/.807 were rejected on it); measured holdout overall = 0.99998292
+max |coefficient − analytic x·0.5+0.5| = 0.0024188976 (the residual is the decode's clamp)
+fit[0] n = 256 samples; target variance RGB = [0.055620234817366374, 0.02609804560406742, 0.018658751531943272]; per-image spatial R2 overall = 0.99997791
+fit[1] n = 256 samples; target variance RGB = [0.09444397900568653, 0.12621009075068892, 0.1662748157356211]; per-image spatial R2 overall = 0.99998422
+fit[2] n = 256 samples; target variance RGB = [0.04450889260896133, 0.04877316898611154, 0.041201730906600495]; per-image spatial R2 overall = 0.99997275
+fit[3] n = 256 samples; target variance RGB = [0.07851664107246019, 0.01840166155590025, 0.06377001538338137]; per-image spatial R2 overall = 0.99998979
+holdout[0] n = 256 samples; target variance RGB = [0.007197227055179715, 0.020065700693935838, 0.08537770402315163]; per-image spatial R2 overall = 0.99997004
+holdout[1] n = 256 samples; target variance RGB = [0.009322580777918463, 0.006878879236941618, 0.046349676244834784]; per-image spatial R2 overall = 0.99998058
+const RGB_FACTORS: [[f32; 3]; 3] = [
+    [0.499482566, 0.001114516, 0.001276602],
+    [-0.000450976, 0.497581102, -0.000060032],
+    [0.000828717, 0.000887129, 0.497608008],
+];
+const RGB_BIAS: [f32; 3] = [0.500254442, 0.500271806, 0.499321467];
+fit[0] shipped projector vs independent f64 evaluation of the solved coefficients: max RGB8 delta = 0
+fit[1] shipped projector vs independent f64 evaluation of the solved coefficients: max RGB8 delta = 0
+fit[2] shipped projector vs independent f64 evaluation of the solved coefficients: max RGB8 delta = 0
+fit[3] shipped projector vs independent f64 evaluation of the solved coefficients: max RGB8 delta = 0
+holdout[0] shipped projector vs independent f64 evaluation of the solved coefficients: max RGB8 delta = 0
+holdout[1] shipped projector vs independent f64 evaluation of the solved coefficients: max RGB8 delta = 0
+inert-vs-live replay at seed 1696001: final f32 state identical; the live render emitted 8 frames over 8 steps

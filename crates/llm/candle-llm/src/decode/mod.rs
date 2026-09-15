@@ -24,8 +24,9 @@ pub use speculative::{
     generate_draft_speculative, generate_prompt_lookup, SpeculativeConfig, SpeculativeStats,
 };
 pub use stream::{
-    generate, generate_from_prefill, generate_with, generate_with_cache, ConstraintMask, Decode,
-    FinishReason, GenerationConfig, GenerationOutput, StreamEvent,
+    generate, generate_from_prefill, generate_from_prefill_with_stop, generate_with,
+    generate_with_cache, ConstraintMask, Decode, FinishReason, GenerationConfig, GenerationOutput,
+    StreamEvent,
 };
 
 pub(super) enum LaneStep {

@@ -32,10 +32,10 @@ use mlx_gen::image::decoded_to_image;
 use mlx_gen::img2img::preprocess_init_image;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, require_base_dir,
-    require_control, run_flow_sampler, AcceptedControlKinds, Capabilities, ConditioningKind,
-    ControlBranch, ControlKind, Error, GenerationOutput, GenerationRequest, Generator, Image,
-    LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency,
-    Result, TimestepConvention,
+    require_control, run_flow_sampler_with_latent_hook, AcceptedControlKinds, Capabilities,
+    ConditioningKind, ControlBranch, ControlKind, Error, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress,
+    Quant, Residency, Result, TimestepConvention,
 };
 use mlx_rs::{Array, Dtype};
 
@@ -65,16 +65,17 @@ const DEFAULT_CONTROL_SCALE: f32 = 0.7;
 /// `resolve_control`, not capability introspection.
 pub fn descriptor_dev_control() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
+        control_kinds: Some(accepted_control_kinds()),
         required_components: &[],
         id: FLUX1_DEV_CONTROL_ID,
         family: "flux",
         backend: "mlx",
         modality: Modality::Image,
         capabilities: Capabilities {
-            supports_negative_prompt: false,
             // dev consumes its guidance scale as an embedded scalar (FLUX.1-dev pattern), not CFG.
             supports_guidance: true,
-            supports_true_cfg: false,
             // Control (required) — the structural hint (pose/canny/depth, input-agnostic).
             conditioning: vec![ConditioningKind::Control],
             supported_quants: &[Quant::Q4, Quant::Q8],
@@ -92,28 +93,17 @@ pub fn descriptor_dev_control() -> ModelDescriptor {
                 s.push("linear");
                 s
             },
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,
             mac_only: true,
-            supports_kv_cache: false,
             requires_sigma_shift: FluxVariant::Dev.requires_sigma_shift(),
             // Wired onto the shared `Residency` seam (sc-10840); honors Sequential offload — the
             // T5-XXL + CLIP-L text encoders drop after the prompt encode, then the DiT (with the
             // control branch) + VAE load, bounding peak to `max(T5+CLIP, DiT+control+VAE)`.
             supports_sequential_offload: true,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            supports_preview: true,
+            ..Default::default()
         },
     }
 }
@@ -135,6 +125,9 @@ pub(crate) struct FluxControlHeavyOwned {
 pub struct Flux1DevControl {
     descriptor: ModelDescriptor,
     residency: Residency<FluxTextOwned, FluxControlHeavyOwned>,
+    /// Loaded contract and exact axes used by the registered request-scope lifecycle.
+    memory_strategy: gen_core::MemoryProviderContract,
+    loaded_spec: LoadSpec,
 }
 
 /// FLUX.1-dev Fun-Controlnet-Union (sc-8238): load the dev snapshot + the Shakker control checkpoint and
@@ -163,6 +156,8 @@ pub fn load_dev_control(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         FLUX1_DEV_CONTROL_ID,
         "FLUX.1-dev-ControlNet-Union-Pro-2.0",
     )?;
+    let memory_strategy =
+        crate::memory_strategy::memory_strategy_contract(FLUX1_DEV_CONTROL_ID, spec)?;
     // F-181: a `Sequential` + `spec.quantize` load over a dense snapshot re-quantizes every generate.
     if let Some(q) = spec.quantize {
         if matches!(spec.offload_policy, OffloadPolicy::Sequential) {
@@ -173,6 +168,8 @@ pub fn load_dev_control(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     Ok(Box::new(Flux1DevControl {
         descriptor: descriptor_dev_control(),
         residency: build_control_residency(spec)?,
+        memory_strategy,
+        loaded_spec: spec.clone(),
     }))
 }
 
@@ -187,7 +184,7 @@ fn build_control_residency(
     let spec_heavy = spec.clone();
     Residency::from_policy(
         spec.offload_policy,
-        move || load_flux_text(FluxVariant::Dev, &spec_text),
+        move || load_flux_text(FluxVariant::Dev, &spec_text, None),
         // The control variant has no PiD overlay, so the heavy loader ignores `use_pid`.
         move |_use_pid| load_control_heavy(&spec_heavy),
     )
@@ -282,7 +279,10 @@ impl Flux1DevControl {
             req.use_pid,
             on_progress,
             |text: &FluxTextOwned| text.encode(&req.prompt),
-            |(prompt_embeds, pooled_prompt_embeds)| {
+            |encoded| {
+                let Some((prompt_embeds, pooled_prompt_embeds)) = encoded else {
+                    return Ok(());
+                };
                 mlx_rs::transforms::eval([prompt_embeds, pooled_prompt_embeds])?;
                 Ok(())
             },
@@ -300,7 +300,8 @@ impl Flux1DevControl {
                 for i in 0..req.count {
                     let seed = base_seed.wrapping_add(i as u64);
                     let latents = create_noise(seed, req.width, req.height)?;
-                    let final_latents = run_flow_sampler(
+                    let previews = mlx_gen::preview::PreviewCounter::new(&sigmas);
+                    let final_latents = run_flow_sampler_with_latent_hook(
                         Some(sampler_name),
                         TimestepConvention::Sigma,
                         &sigmas,
@@ -308,6 +309,17 @@ impl Flux1DevControl {
                         seed,
                         &req.cancel,
                         on_progress,
+                        |latents, sigma| {
+                            crate::preview::emit_preview(
+                                &req.preview,
+                                &previews,
+                                &sigmas,
+                                sigma,
+                                latents,
+                                req.width,
+                                req.height,
+                            );
+                        },
                         |x_in, timestep| {
                             heavy.transformer.forward_composed(
                                 x_in,
@@ -396,10 +408,6 @@ impl ControlBranch for Flux1DevControl {
         FLUX1_DEV_CONTROL_ID
     }
 
-    fn accepted_control_kinds(&self) -> AcceptedControlKinds {
-        accepted_control_kinds()
-    }
-
     fn unsupported_kind_message(&self, kind: &ControlKind) -> String {
         // The trait default wording ("v1 supports pose control only") is Qwen-v1 specific. Union-Pro-2.0
         // supports pose/canny/depth — say so.
@@ -435,6 +443,29 @@ impl Generator for Flux1DevControl {
     ) -> gen_core::Result<GenerationOutput> {
         self.generate_impl(req, on_progress).map_err(Into::into)
     }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.loaded_spec, &self.memory_strategy, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::begin_request(
+            FLUX1_DEV_CONTROL_ID,
+            &self.loaded_spec,
+            &self.memory_strategy,
+            context,
+        )
+    }
 }
 
 // Explicit registration lets the platform catalog resolve `flux1_dev_control` by id. The
@@ -445,10 +476,87 @@ mlx_gen::register_generators! {
     footprint = crate::model::component_footprint
 }
 
+pub const DEV_CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
+    gen_core::MemoryRegistration {
+        provider_id: FLUX1_DEV_CONTROL_ID,
+        contract: |spec| {
+            crate::memory_strategy::memory_strategy_contract(FLUX1_DEV_CONTROL_ID, spec)
+        },
+        safety_check: crate::memory_strategy::registered_safety_check,
+    };
+
+pub const DEV_CONTROL_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: FLUX1_DEV_CONTROL_ID,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(
+                FLUX1_DEV_CONTROL_ID,
+                spec,
+                contract,
+                context,
+            )
+        },
+    };
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mlx_gen::WeightsSource;
+
+    #[test]
+    fn loaded_control_generator_exposes_and_executes_its_registered_scope() {
+        let spec = missing_snapshot_spec(OffloadPolicy::Sequential);
+        let model = load_dev_control(&spec)
+            .expect("Sequential load must construct the loaded control generator");
+        let contract = model
+            .memory_strategy_contract()
+            .expect("loaded control generator must expose its exact contract");
+        let fixture_contract = crate::memory_strategy::weights_free_memory_strategy_contract(
+            FLUX1_DEV_CONTROL_ID,
+            &spec,
+        )
+        .unwrap();
+        let mut fixture = crate::memory_strategy::registered_valid_fixture(
+            &spec,
+            &fixture_contract,
+            gen_core::MemoryStrategy::StagedResidency,
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(contract.provider_id, FLUX1_DEV_CONTROL_ID);
+        fixture.context.optimization_authority = gen_core::MemoryOptimizationAuthority::Estimated;
+        assert_eq!(
+            model.memory_strategy_safety_check(&fixture.context),
+            gen_core::MemorySafetyDecision::Accept
+        );
+        let mut scope = model
+            .begin_memory_strategy_request(&fixture.context)
+            .unwrap()
+            .expect("loaded control generator must open its registered request scope");
+        scope.configure_request(&mut fixture.request).unwrap();
+        assert!(fixture.request.memory.unwrap().stage_residency);
+
+        let mut pid_context = fixture.context;
+        pid_context.use_pid = true;
+        assert!(matches!(
+            model.memory_strategy_safety_check(&pid_context),
+            gen_core::MemorySafetyDecision::Reject { .. }
+        ));
+        assert!(model.begin_memory_strategy_request(&pid_context).is_err());
+    }
+
+    #[test]
+    fn production_control_load_rejects_the_same_unsupported_components_as_registry_admission() {
+        let mut spec = missing_snapshot_spec(OffloadPolicy::Sequential);
+        spec.extra_controls.push(WeightsSource::File(
+            "/nonexistent/extra-control.safetensors".into(),
+        ));
+        assert!(
+            crate::memory_strategy::memory_strategy_contract(FLUX1_DEV_CONTROL_ID, &spec).is_err()
+        );
+        assert!(load_dev_control(&spec).is_err());
+    }
 
     #[test]
     fn descriptor_is_flux1_dev_control() {
@@ -549,6 +657,27 @@ mod tests {
         };
         assert!(matches!(
             caps.validate_request(FLUX1_DEV_CONTROL_ID, &tcfg),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+
+        // The control provider declares Control only. A Reference carried alongside the pose is
+        // therefore a typed refusal, rather than an identity hint that might be ignored.
+        let reference_plus_control = GenerationRequest {
+            conditioning: vec![
+                mlx_gen::Conditioning::Reference {
+                    image: Image {
+                        width: 64,
+                        height: 64,
+                        pixels: vec![0u8; 64 * 64 * 3],
+                    },
+                    strength: Some(0.7),
+                },
+                base.conditioning[0].clone(),
+            ],
+            ..base
+        };
+        assert!(matches!(
+            caps.validate_request(FLUX1_DEV_CONTROL_ID, &reference_plus_control),
             Err(gen_core::Error::Unsupported(_))
         ));
     }

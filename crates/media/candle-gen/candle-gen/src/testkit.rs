@@ -27,8 +27,189 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
+use sha2::{Digest, Sha256};
+
 use crate::candle_core::{Device, Tensor};
-use crate::gen_core::Image;
+use crate::gen_core::{
+    Image, LoadShape, MemoryBackend, MemoryCalibrationIdentity, MemoryEvidenceKey,
+    MemoryEvidenceLogRecord, MemoryGeometry, MemoryMode, MemoryNumericTier, MemoryParityContract,
+    MemoryParityResult, MemoryReferenceShape, MemoryStrategy, MemoryStrategyParameters,
+};
+
+/// Typed inputs for one real-weight calibration observation.
+pub struct MemoryEvidenceProbe<'a> {
+    pub resolved_route: &'a str,
+    pub declared_calibration: MemoryCalibrationIdentity,
+    pub observed_calibration: MemoryCalibrationIdentity,
+    pub tier: MemoryNumericTier,
+    pub load_shape: LoadShape,
+    pub mode: MemoryMode,
+    pub overlay: Option<String>,
+    pub geometry: MemoryGeometry,
+    pub strategy: MemoryStrategy,
+    pub engaged_composition: Vec<MemoryStrategy>,
+    pub parameters: MemoryStrategyParameters,
+    pub observed_peak_bytes: u64,
+    pub harness_version: &'a str,
+    pub output_bytes: &'a [u8],
+}
+
+/// The typed E2 evidence axes a probe can carry beyond its geometry.
+///
+/// Both default to "not supplied", which reproduces the pre-E2 record exactly: no frame rate, and
+/// an opaque `legacy-untyped-reference-count-N` carrier shape. That default is only honest for a
+/// **still-image** probe. A video probe (`geometry.frames > 1`) that leaves
+/// [`frames_per_second`](Self::frames_per_second) unset would fold two genuinely different
+/// calibration cells — e.g. Wan2.2 Ti2V-5B at 16 fps and at 24 fps, which admit disjoint frame
+/// menus and different peaks — into a single key, so the emitters below refuse it rather than
+/// stamp an ambiguous record.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryEvidenceAxes {
+    /// The request's public frame rate. Required for a video probe; meaningless for a still.
+    pub frames_per_second: Option<u32>,
+    /// The typed carrier shape behind `geometry.reference_count`. `None` keeps the opaque legacy
+    /// spelling, which is distinct from every typed shape and from a different count.
+    pub reference_shape: Option<MemoryReferenceShape>,
+}
+
+/// Emit one strict `MEMORY_EVIDENCE_V1` line from a Candle real-weight probe.
+///
+/// The measurement establishes the prediction at this exact calibration cell, so the observed
+/// high-water is written to both peak fields. A later out-of-sample validation must construct
+/// [`MemoryEvidenceLogRecord`] directly with the previously promoted prediction.
+pub fn memory_evidence_v1_line(probe: MemoryEvidenceProbe<'_>) -> String {
+    memory_evidence_v1_line_with_parity(
+        probe,
+        MemoryParityContract::Exact,
+        MemoryParityResult::NotRun,
+    )
+}
+
+/// Emit one strict observation with the parity contract/result established by a provider-owned
+/// real-weight comparator. The ordinary helper above remains conservative (`Exact` / `NotRun`) for
+/// harnesses that only capture an output and leave comparison to a later verifier.
+pub fn memory_evidence_v1_line_with_parity(
+    probe: MemoryEvidenceProbe<'_>,
+    parity: MemoryParityContract,
+    parity_result: MemoryParityResult,
+) -> String {
+    memory_evidence_v1_line_with_axes(probe, parity, parity_result, MemoryEvidenceAxes::default())
+}
+
+/// Emit one strict observation with explicit typed E2 axes. See [`MemoryEvidenceAxes`].
+///
+/// # Panics
+/// When a video probe (`geometry.frames > 1`) supplies no frame rate: the resulting record would
+/// silently share one calibration cell with every other rate at the same geometry.
+pub fn memory_evidence_v1_line_with_axes(
+    probe: MemoryEvidenceProbe<'_>,
+    parity: MemoryParityContract,
+    parity_result: MemoryParityResult,
+    axes: MemoryEvidenceAxes,
+) -> String {
+    assert!(
+        probe.geometry.frames <= 1 || axes.frames_per_second.is_some(),
+        "a {}-frame probe must supply MemoryEvidenceAxes::frames_per_second: without it the record \
+         shares one evidence cell with every other frame rate at this geometry",
+        probe.geometry.frames
+    );
+    assert!(
+        axes.reference_shape
+            .as_ref()
+            .is_none_or(|shape| shape.is_none() == (probe.geometry.reference_count == 0)),
+        "typed reference shape {:?} contradicts reference_count={}",
+        axes.reference_shape,
+        probe.geometry.reference_count
+    );
+    let output_sha256 = format!("{:x}", Sha256::digest(probe.output_bytes));
+    MemoryEvidenceLogRecord {
+        key: MemoryEvidenceKey {
+            // Older probe call sites carry a resolved route but not a catalog-family token. Keeping
+            // the route as this legacy record's family is conservative: it cannot share evidence
+            // across routes, and new collectors can mint a distinct explicit family key directly.
+            model_family: probe.resolved_route.to_owned(),
+            resolved_route: probe.resolved_route.to_owned(),
+            backend: MemoryBackend::Candle,
+            tier: probe.tier,
+            load_shape: probe.load_shape,
+            mode: probe.mode,
+            reference_shape: match axes.reference_shape {
+                Some(shape) => shape,
+                None if probe.geometry.reference_count == 0 => MemoryReferenceShape::None,
+                // Do not silently label an old, shape-less probe as an image reference. The opaque
+                // carrier keeps it distinct from every newly typed shape and from a different count.
+                None => MemoryReferenceShape::Other(format!(
+                    "legacy-untyped-reference-count-{}",
+                    probe.geometry.reference_count
+                )),
+            },
+            overlay: probe.overlay,
+            geometry: probe.geometry,
+            frames_per_second: axes.frames_per_second,
+            strategy: probe.strategy,
+            engaged_composition: probe.engaged_composition,
+            parameters: probe.parameters,
+        },
+        declared_calibration: probe.declared_calibration,
+        observed_calibration: probe.observed_calibration,
+        predicted_peak_bytes: probe.observed_peak_bytes,
+        observed_peak_bytes: probe.observed_peak_bytes,
+        inference_revision: required_git_revision("INFERENCE_REVISION"),
+        sceneworks_revision: required_git_revision("SCENEWORKS_REVISION"),
+        model_revision: required_git_revision("MEMORY_MODEL_REVISION"),
+        model_inventory_sha256: required_sha256("MEMORY_MODEL_INVENTORY_SHA256"),
+        harness_version: probe.harness_version.to_owned(),
+        output_sha256,
+        parity,
+        parity_result,
+    }
+    .to_json_line()
+    .expect("real-weight probe must produce a valid MEMORY_EVIDENCE_V1 record")
+}
+
+fn required_sha256(name: &str) -> String {
+    let value = std::env::var(name).unwrap_or_else(|_| panic!("set {name} to an exact SHA-256"));
+    assert!(
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{name} must be an exact lowercase 64-character SHA-256"
+    );
+    value
+}
+
+/// The calibration identity the operator/workflow expected before loading the provider.
+///
+/// The observed identity comes from the provider's exported constant or executable contract and is
+/// passed separately to [`MemoryEvidenceProbe`]. Keeping these sources distinct makes a stale runner
+/// fail at the writer instead of stamping its expectation onto the observed record.
+pub fn expected_memory_calibration(load_shape: LoadShape) -> MemoryCalibrationIdentity {
+    let fingerprint = std::env::var("MEMORY_EXPECTED_FINGERPRINT")
+        .expect("set MEMORY_EXPECTED_FINGERPRINT to the provider's exported fingerprint");
+    let abi = std::env::var("MEMORY_EXPECTED_ABI")
+        .expect("set MEMORY_EXPECTED_ABI to the provider's exported ABI")
+        .parse::<u32>()
+        .expect("MEMORY_EXPECTED_ABI must be an unsigned integer");
+    MemoryCalibrationIdentity {
+        abi,
+        fingerprint,
+        load_shape,
+    }
+}
+
+fn required_git_revision(name: &str) -> String {
+    let revision =
+        std::env::var(name).unwrap_or_else(|_| panic!("set {name} to an exact Git commit"));
+    assert!(
+        revision.len() == 40
+            && revision
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{name} must be an exact lowercase 40-character Git commit"
+    );
+    revision
+}
 
 // ---------------------------------------------------------------------------------------------------
 // Env paths
@@ -305,89 +486,17 @@ mod quant_fixture_tests {
 // ---------------------------------------------------------------------------------------------------
 
 pub use gpu_peak::{probe_gpu, used_mib, PeakSampler};
-pub use vram_probe::{VramProbe, VramReport};
+pub use vram_probe::{StableIdleConfig, VramProbe, VramReport};
 
-#[cfg(feature = "cuda")]
-pub use cuda_mempool::{cuda_mempool_used_high_bytes, reset_cuda_mempool_high_water};
-
-/// Driver memory-pool `USED_MEM_HIGH` probe — the ACCURATE concurrent-live VRAM peak (sc-12818).
+/// The driver memory-pool probe moved to [`crate::cuda_mempool`] in SC-15792 so it is compiled and
+/// linted by the CUDA lane (which enables `cuda` but not `testkit`) and so the rung-4 harnesses have
+/// one implementation to share instead of a fork. Re-exported here unchanged for the provider
+/// real-weight tests that already import it from `testkit`.
 ///
-/// The [`PeakSampler`] samples `nvidia-smi memory.used` (the driver's **reserved** bytes) every ~40 ms
-/// and so **misses sub-poll transients** — the brief im2col / VAE-decode / attention spikes the
-/// stream-ordered pool allocates then releases back to the driver between polls — which understated the
-/// Wan A14B peak ~2×. The CUDA driver instead tracks `CU_MEMPOOL_ATTR_USED_MEM_HIGH` continuously: the
-/// high-water of bytes actually **live** in the device's default async-alloc pool — the true
-/// concurrent-live peak. candle 0.10 allocates every tensor via `cuMemAllocAsync` on cuda:0's default
-/// stream (cudarc's `has_async_alloc`, true on any pools-capable card), which draws from that default
-/// pool, so its high-water IS candle's real peak.
-///
-/// Best-effort: any driver error yields `None`/`false`. The ordinal is candle's **logical** device (the
-/// driver API honours `CUDA_VISIBLE_DEVICES`, so logical 0 is the card candle renders on — NOT
-/// [`probe_gpu`]'s physical nvidia-smi ordinal). The attribute is resettable (write-to-zero), so
-/// bracketing a phase with [`reset_cuda_mempool_high_water`] → work → [`cuda_mempool_used_high_bytes`]
-/// yields that phase's isolated true peak.
+/// New code should reach for [`crate::cuda_mempool::MemPool`], which also exposes the RESERVED
+/// counters an admission gate actually reads, the release threshold, and a non-default pool handle.
 #[cfg(feature = "cuda")]
-mod cuda_mempool {
-    use std::ffi::c_void;
-
-    use candle_core::cuda::cudarc::driver::sys;
-
-    const USED_MEM_HIGH: sys::CUmemPool_attribute =
-        sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH;
-
-    /// The default stream-ordered memory pool `cuMemAllocAsync` draws from for **logical** device
-    /// `ordinal`, or `None` on any driver error. `cuInit` is idempotent (candle calls it too), so this is
-    /// safe to run before candle builds its context — the default pool is a stable per-device handle,
-    /// unaffected by context retain.
-    fn default_pool(ordinal: i32) -> Option<sys::CUmemoryPool> {
-        unsafe {
-            if sys::cuInit(0) != sys::CUresult::CUDA_SUCCESS {
-                return None;
-            }
-            let mut dev: sys::CUdevice = 0;
-            if sys::cuDeviceGet(&mut dev, ordinal) != sys::CUresult::CUDA_SUCCESS {
-                return None;
-            }
-            let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
-            if sys::cuDeviceGetDefaultMemPool(&mut pool, dev) != sys::CUresult::CUDA_SUCCESS {
-                return None;
-            }
-            Some(pool)
-        }
-    }
-
-    /// Reset logical device `ordinal`'s pool `USED_MEM_HIGH` watermark (the attribute is write-to-zero
-    /// per the driver ABI) so a later [`cuda_mempool_used_high_bytes`] reads the peak of just the work
-    /// since this call. Returns whether the reset landed.
-    pub fn reset_cuda_mempool_high_water(ordinal: i32) -> bool {
-        let Some(pool) = default_pool(ordinal) else {
-            return false;
-        };
-        let mut zero: u64 = 0;
-        unsafe {
-            sys::cuMemPoolSetAttribute(
-                pool,
-                USED_MEM_HIGH,
-                (&mut zero as *mut u64).cast::<c_void>(),
-            ) == sys::CUresult::CUDA_SUCCESS
-        }
-    }
-
-    /// Logical device `ordinal`'s pool `USED_MEM_HIGH` watermark in bytes — the driver's continuous
-    /// high-water of concurrently-live pool bytes — or `None` on any driver error.
-    pub fn cuda_mempool_used_high_bytes(ordinal: i32) -> Option<u64> {
-        let pool = default_pool(ordinal)?;
-        let mut bytes: u64 = 0;
-        let ok = unsafe {
-            sys::cuMemPoolGetAttribute(
-                pool,
-                USED_MEM_HIGH,
-                (&mut bytes as *mut u64).cast::<c_void>(),
-            ) == sys::CUresult::CUDA_SUCCESS
-        };
-        ok.then_some(bytes)
-    }
-}
+pub use crate::cuda_mempool::{cuda_mempool_used_high_bytes, reset_cuda_mempool_high_water};
 
 mod vram_probe {
     //! sc-9094 — the per-tier VRAM measuring harness (epic 9083's packed-load rollout). Wraps the
@@ -422,6 +531,8 @@ mod vram_probe {
     //! ```
 
     use super::gpu_peak::{probe_gpu, used_mib, PeakSampler};
+    use std::process::Command;
+    use std::time::Duration;
 
     /// MiB → GB (10⁹ bytes — the manifest's `minMemoryGb` is base-10 GB, matching the MLX footprint
     /// numbers). `1 MiB = 2²⁰ bytes`.
@@ -484,6 +595,114 @@ mod vram_probe {
         overall_peak_mib: u64,
     }
 
+    /// Stricter evidence configuration for WDDM runners whose otherwise-idle graphics residency is
+    /// non-zero. The ordinary [`VramProbe::assert_idle`] remains the right default for headless
+    /// lanes; this opt-in guard additionally proves repeated baseline stability and rejects a pure
+    /// compute process before allowing a device-level delta measurement.
+    #[derive(Clone, Copy, Debug)]
+    pub struct StableIdleConfig {
+        pub max_baseline_gb: f64,
+        pub sample_count: usize,
+        pub max_drift_mib: u64,
+        pub sample_interval_ms: u64,
+    }
+
+    impl StableIdleConfig {
+        pub const fn new(
+            max_baseline_gb: f64,
+            sample_count: usize,
+            max_drift_mib: u64,
+            sample_interval_ms: u64,
+        ) -> Self {
+            Self {
+                max_baseline_gb,
+                sample_count,
+                max_drift_mib,
+                sample_interval_ms,
+            }
+        }
+    }
+
+    fn pure_compute_pids(pmon: &str, expected_gpu: usize) -> Result<Vec<u32>, String> {
+        let mut pids = Vec::new();
+        for line in pmon.lines().map(str::trim) {
+            if line.is_empty()
+                || line.starts_with('#')
+                || line.eq_ignore_ascii_case("No running processes found")
+            {
+                continue;
+            }
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() < 3 {
+                return Err(format!("malformed nvidia-smi pmon row: {line}"));
+            }
+            let gpu = fields[0]
+                .parse::<usize>()
+                .map_err(|_| format!("malformed GPU ordinal in nvidia-smi pmon row: {line}"))?;
+            if gpu != expected_gpu {
+                return Err(format!(
+                    "nvidia-smi pmon returned physical GPU {gpu}, expected {expected_gpu}; refusing cross-device evidence"
+                ));
+            }
+            let pid = fields[1]
+                .parse::<u32>()
+                .map_err(|_| format!("malformed PID in nvidia-smi pmon row: {line}"))?;
+            match fields[2] {
+                "C" => pids.push(pid),
+                // WDDM desktop processes are reported as C+G even with zero SM/memory activity.
+                // Their fixed device-level residency is handled by the stable baseline below.
+                "C+G" | "G" => {}
+                kind => {
+                    return Err(format!(
+                        "unknown process type {kind:?} in nvidia-smi pmon row: {line}"
+                    ));
+                }
+            }
+        }
+        Ok(pids)
+    }
+
+    fn validated_stable_baseline(
+        samples: &[u64],
+        config: StableIdleConfig,
+        pure_compute_pids: &[u32],
+    ) -> Result<u64, String> {
+        if config.sample_count < 2 || samples.len() != config.sample_count {
+            return Err(format!(
+                "stable idle evidence needs exactly {} samples (at least 2), got {}",
+                config.sample_count,
+                samples.len()
+            ));
+        }
+        if !config.max_baseline_gb.is_finite() || config.max_baseline_gb <= 0.0 {
+            return Err("stable idle maximum baseline must be finite and positive".to_owned());
+        }
+        if !pure_compute_pids.is_empty() {
+            return Err(format!(
+                "pure compute processes {:?} are resident on the profiled GPU; the peak is contaminated",
+                pure_compute_pids
+            ));
+        }
+        let min = *samples.iter().min().expect("non-empty sample set");
+        let max = *samples.iter().max().expect("non-empty sample set");
+        if max.saturating_sub(min) > config.max_drift_mib {
+            return Err(format!(
+                "idle baseline drifted from {min} MiB to {max} MiB (allowed {} MiB); the peak is contaminated",
+                config.max_drift_mib
+            ));
+        }
+        if mib_to_gb(max) >= config.max_baseline_gb {
+            return Err(format!(
+                "stable idle baseline reached {:.1} GB (required < {:.1} GB); the peak is contaminated",
+                mib_to_gb(max),
+                config.max_baseline_gb
+            ));
+        }
+        // Subtract the lowest stable sample so the reported delta cannot be understated by a small
+        // downward fluctuation between the baseline window and the measured phase.
+        Ok(min)
+    }
+
     impl VramProbe {
         /// Record the idle baseline on the physical GPU that Candle's logical `cuda:0` renders on.
         /// This derives the ordinal from `CUDA_VISIBLE_DEVICES` via [`probe_gpu`] so a multi-GPU run
@@ -520,6 +739,54 @@ mod vram_probe {
                 baseline_gb < max_baseline_gb,
                 "sampled GPU was not idle (baseline {baseline_gb:.1} GB, required < {max_baseline_gb:.1} GB); the peak is contaminated"
             );
+            self
+        }
+
+        /// Prove an idle WDDM device with repeated samples and process evidence, then use the lowest
+        /// stable sample as the delta baseline. This is intentionally opt-in: existing headless
+        /// evidence lanes retain their stricter one-shot ceilings.
+        pub fn assert_stable_idle(mut self, config: StableIdleConfig) -> Self {
+            let mut samples = Vec::with_capacity(config.sample_count.max(1));
+            samples.push(self.baseline_mib);
+            for _ in 1..config.sample_count {
+                std::thread::sleep(Duration::from_millis(config.sample_interval_ms));
+                samples.push(used_mib(self.gpu).unwrap_or_else(|| {
+                    panic!(
+                        "cannot read repeated VRAM baseline for physical GPU {} with nvidia-smi",
+                        self.gpu
+                    )
+                }));
+            }
+
+            let gpu = self.gpu.to_string();
+            let nvidia_smi = crate::gpu::resolve_nvidia_smi().unwrap_or_else(|| {
+                panic!(
+                    "cannot resolve a trusted nvidia-smi executable for stable-idle process evidence"
+                )
+            });
+            let output = Command::new(nvidia_smi)
+                .args(["pmon", "-i", &gpu, "-c", "1", "-s", "um"])
+                .output()
+                .unwrap_or_else(|error| panic!("cannot run nvidia-smi pmon: {error}"));
+            assert!(
+                output.status.success(),
+                "nvidia-smi pmon failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let pmon = String::from_utf8(output.stdout)
+                .expect("nvidia-smi pmon output must be valid UTF-8");
+            let compute = pure_compute_pids(&pmon, self.gpu)
+                .unwrap_or_else(|error| panic!("untrustworthy GPU process evidence: {error}"));
+            let baseline = validated_stable_baseline(&samples, config, &compute)
+                .unwrap_or_else(|error| panic!("untrustworthy stable idle baseline: {error}"));
+            eprintln!(
+                "[[CUDA_STABLE_IDLE]] gpu={} samplesMiB={samples:?} maxDriftMiB={} maxBaselineGb={:.1} pureComputePids={compute:?}",
+                self.gpu, config.max_drift_mib, config.max_baseline_gb
+            );
+            self.baseline_mib = baseline;
+            self.load_peak_mib = baseline;
+            self.steady_mib = baseline;
+            self.overall_peak_mib = baseline;
             self
         }
 
@@ -634,6 +901,42 @@ mod vram_probe {
 
             assert_eq!(probe(200).assert_idle(1.0).baseline_mib, 200);
             assert!(std::panic::catch_unwind(|| probe(2_000).assert_idle(1.0)).is_err());
+        }
+
+        #[test]
+        fn stable_idle_evidence_rejects_drift_cap_and_compute_processes() {
+            let config = StableIdleConfig::new(2.0, 4, 64, 0);
+            assert_eq!(
+                validated_stable_baseline(&[1_552, 1_552, 1_553, 1_552], config, &[]).unwrap(),
+                1_552
+            );
+            assert!(
+                validated_stable_baseline(&[1_552, 1_552, 1_700, 1_552], config, &[])
+                    .unwrap_err()
+                    .contains("drifted")
+            );
+            assert!(validated_stable_baseline(&[1_950; 4], config, &[])
+                .unwrap_err()
+                .contains("required < 2.0 GB"));
+            assert!(validated_stable_baseline(&[1_552; 4], config, &[42])
+                .unwrap_err()
+                .contains("pure compute processes [42]"));
+        }
+
+        #[test]
+        fn pmon_process_evidence_rejects_compute_wrong_gpu_and_unknown_rows() {
+            let wddm = "# gpu pid type sm mem\n1 3732 C+G - -\n1 6032 G - -\n";
+            assert!(pure_compute_pids(wddm, 1).unwrap().is_empty());
+            assert_eq!(pure_compute_pids("1 420 C 0 0\n", 1).unwrap(), vec![420]);
+            assert!(pure_compute_pids("0 420 C 0 0\n", 1)
+                .unwrap_err()
+                .contains("expected 1"));
+            assert!(pure_compute_pids("1 420 ? 0 0\n", 1)
+                .unwrap_err()
+                .contains("unknown process type"));
+            assert!(pure_compute_pids("garbage\n", 1)
+                .unwrap_err()
+                .contains("malformed"));
         }
     }
 }

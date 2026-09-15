@@ -12,7 +12,7 @@
 //!
 //! Run:
 //!   PYTHONPATH=/tmp/sam2-mlx/src ~/mlx-flux-venv/bin/python tools/dump_sam2_video_golden.py --size large
-//!   cargo test -p mlx-gen-sam2 --release --test video_parity -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sam2 --release --test integration video_parity:: -- --ignored --nocapture
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sam2::{Sam2ModelSize, Sam2VideoPredictor};
@@ -97,7 +97,9 @@ fn video_propagation_matches_mlx_reference_large() {
     let t = images.shape()[0];
 
     let predictor = Sam2VideoPredictor::from_weights_for_size(&g, Sam2ModelSize::Large).unwrap();
-    let mut state = predictor.init_state_from_pixels(images, video_h, video_w);
+    let mut state = predictor
+        .init_state_from_pixels(images, video_h, video_w)
+        .expect("golden clip has canonical SAM2 state inputs");
     predictor.add_new_box(&mut state, 0, box_xyxy).unwrap();
     let results = predictor.propagate(&mut state, None, None).unwrap();
     assert_eq!(results.len(), t as usize, "propagated frame count");
@@ -147,7 +149,9 @@ fn video_reverse_propagation_matches_mlx_reference_large() {
     let t = images.shape()[0];
 
     let predictor = Sam2VideoPredictor::from_weights_for_size(&g, Sam2ModelSize::Large).unwrap();
-    let mut state = predictor.init_state_from_pixels(images, video_h, video_w);
+    let mut state = predictor
+        .init_state_from_pixels(images, video_h, video_w)
+        .expect("reverse golden clip has canonical SAM2 state inputs");
     predictor
         .add_new_box(&mut state, prompt_frame_idx, box_xyxy)
         .unwrap();
@@ -196,7 +200,9 @@ fn correction_before_propagate_does_not_panic() {
     let box_xyxy = [bx[0], bx[1], bx[2], bx[3]];
 
     let predictor = Sam2VideoPredictor::from_weights_for_size(&g, Sam2ModelSize::Large).unwrap();
-    let mut state = predictor.init_state_from_pixels(images, video_h, video_w);
+    let mut state = predictor
+        .init_state_from_pixels(images, video_h, video_w)
+        .expect("golden clip has canonical SAM2 state inputs");
     predictor.add_new_box(&mut state, 0, box_xyxy).unwrap();
 
     // A positive correction click at the box center on the SAME frame, before any propagate.

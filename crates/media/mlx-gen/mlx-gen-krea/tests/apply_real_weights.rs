@@ -15,7 +15,7 @@
 //! ```sh
 //! KREA_RAW_DIR=/path/to/models--krea--Krea-2-Raw/snapshots/<rev> \
 //! KREA_TURBO_DIR=/path/to/models--krea--Krea-2-Turbo/snapshots/<rev> \
-//!   cargo test -p mlx-gen-krea --release --test apply_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-krea --release --test integration apply_real_weights:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;
@@ -27,6 +27,10 @@ use mlx_gen::{
     WeightsSource,
 };
 use mlx_gen_krea::{load, load_trainer};
+
+#[path = "../../tests/support/atomic_cache.rs"]
+#[allow(dead_code)] // this cache publishes a file, not symlink components
+mod atomic_cache;
 
 /// Resolve a cached HF snapshot dir (the `{env}` override, else the newest `models--{repo}` snapshot
 /// with a `transformer/` tree).
@@ -94,8 +98,13 @@ fn mean_abs_diff(a: &[u8], b: &[u8]) -> f32 {
 }
 
 /// Train a tiny adapter (`network_type`) on the real Raw DiT and return its `.safetensors` path.
-fn train_tiny_adapter(raw: &std::path::Path, network_type: NetworkType, tag: &str) -> PathBuf {
-    let tmp = std::env::temp_dir().join(format!("krea_apply_smoke_{tag}"));
+fn train_tiny_adapter(
+    tmp: &tempfile::TempDir,
+    raw: &std::path::Path,
+    network_type: NetworkType,
+    tag: &str,
+) -> PathBuf {
+    let tmp = tmp.path().join(format!("krea_apply_smoke_{tag}"));
     std::fs::create_dir_all(&tmp).unwrap();
     let img_path = tmp.join("swatch.png");
     write_synth_image(&img_path);
@@ -107,6 +116,7 @@ fn train_tiny_adapter(raw: &std::path::Path, network_type: NetworkType, tag: &st
             image_path: img_path,
             caption: "a vivid abstract color swatch".into(),
             control_image_path: None,
+            model_options: Default::default(),
         }],
         config: TrainingConfig {
             rank: 4,
@@ -206,17 +216,24 @@ fn save_png(img: &Image, name: &str) {
     eprintln!("  saved {}", p.display());
 }
 
+fn viability_adapter_path(tmp: &tempfile::TempDir) -> PathBuf {
+    tmp.path()
+        .join("krea_lora_viability")
+        .join("viability_magenta.safetensors")
+}
+
 /// Train a real LoRA on Raw over `images`/`caption` for `steps` steps at `rank` (512², grad-checkpointed).
 fn train_concept_lora(
+    tmp: &tempfile::TempDir,
     raw: &std::path::Path,
     images: &[PathBuf],
     caption: &str,
     rank: u32,
     steps: u32,
-    out_name: &str,
 ) -> PathBuf {
-    let tmp = std::env::temp_dir().join("krea_lora_viability");
-    std::fs::create_dir_all(&tmp).unwrap();
+    let final_adapter = viability_adapter_path(tmp);
+    let staging =
+        atomic_cache::prepare_staging(&final_adapter).expect("prepare viability adapter staging");
     let mut trainer =
         load_trainer(&LoadSpec::new(WeightsSource::Dir(raw.to_path_buf()))).expect("load_trainer");
     let req = TrainingRequest {
@@ -226,6 +243,7 @@ fn train_concept_lora(
                 image_path: p.clone(),
                 caption: caption.to_string(),
                 control_image_path: None,
+                model_options: Default::default(),
             })
             .collect(),
         config: TrainingConfig {
@@ -239,8 +257,8 @@ fn train_concept_lora(
             gradient_checkpointing: true,
             ..Default::default()
         },
-        output_dir: tmp.clone(),
-        file_name: format!("{out_name}.safetensors"),
+        output_dir: staging.parent().unwrap().to_path_buf(),
+        file_name: staging.file_name().unwrap().to_string_lossy().into_owned(),
         trigger_words: vec![],
         cancel: CancelFlag::new(),
     };
@@ -253,7 +271,9 @@ fn train_concept_lora(
             }
         })
         .expect("train");
-    out.adapter_path
+    assert_eq!(out.adapter_path, staging, "trainer wrote the staging path");
+    atomic_cache::publish(&staging, &final_adapter).expect("publish viability adapter");
+    final_adapter
 }
 
 /// Render Turbo on an arbitrary `prompt` with `adapters` (seed 0, 512², 8 steps).
@@ -287,6 +307,7 @@ fn render_turbo_prompt(turbo: &std::path::Path, adapters: Vec<AdapterSpec>, prom
 #[test]
 #[ignore = "viability (sc-7579): real Raw+Turbo + a Mac; ~160-step train — run as its own process"]
 fn raw_lora_visibly_shifts_turbo_toward_concept() {
+    let tmp = tempfile::tempdir().unwrap();
     let (Some(raw), Some(turbo)) = (
         snapshot("KREA_RAW_DIR", "models--krea--Krea-2-Raw"),
         snapshot("KREA_TURBO_DIR", "models--krea--Krea-2-Turbo"),
@@ -295,9 +316,7 @@ fn raw_lora_visibly_shifts_turbo_toward_concept() {
         return;
     };
 
-    let tmp = std::env::temp_dir().join("krea_lora_viability");
-    std::fs::create_dir_all(&tmp).unwrap();
-    let images = write_solid_images(&tmp, 5, [230, 30, 230]);
+    let images = write_solid_images(tmp.path(), 5, [230, 30, 230]);
     let steps: u32 = std::env::var("KREA_LORA_STEPS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -308,12 +327,12 @@ fn raw_lora_visibly_shifts_turbo_toward_concept() {
         .unwrap_or(1.0);
 
     let adapter = train_concept_lora(
+        &tmp,
         &raw,
         &images,
         "a solid magenta color field",
         16,
         steps,
-        "viability_magenta",
     );
     // A PERMISSIVE prompt: the few-step distilled Turbo adheres strongly to prompt, so it resists a
     // LoRA that tries to OVERRIDE a strongly-described scene (e.g. "snowy mountain" stays a mountain);
@@ -363,17 +382,14 @@ fn raw_lora_visibly_shifts_turbo_toward_concept() {
 #[test]
 #[ignore = "characterization (sc-7579): reuses the saved magenta adapter; run after the viability test"]
 fn lora_scale_sweep_over_trained_concept() {
+    let tmp = tempfile::tempdir().unwrap();
     let Some(turbo) = snapshot("KREA_TURBO_DIR", "models--krea--Krea-2-Turbo") else {
         eprintln!("skipping: set KREA_TURBO_DIR");
         return;
     };
     let adapter = std::env::var("KREA_ADAPTER")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::temp_dir()
-                .join("krea_lora_viability")
-                .join("viability_magenta.safetensors")
-        });
+        .unwrap_or_else(|_| viability_adapter_path(&tmp));
     if !adapter.is_file() {
         eprintln!(
             "skipping: no adapter at {} (run raw_lora_visibly_shifts_turbo_toward_concept first)",
@@ -412,6 +428,7 @@ fn lora_scale_sweep_over_trained_concept() {
 #[test]
 #[ignore = "needs real Krea 2 Raw + Turbo snapshots (~45 GB) + a Mac; run as its own process"]
 fn raw_trained_lora_applies_at_turbo_inference() {
+    let tmp = tempfile::tempdir().unwrap();
     let (Some(raw), Some(turbo)) = (
         snapshot("KREA_RAW_DIR", "models--krea--Krea-2-Raw"),
         snapshot("KREA_TURBO_DIR", "models--krea--Krea-2-Turbo"),
@@ -421,7 +438,7 @@ fn raw_trained_lora_applies_at_turbo_inference() {
     };
 
     // Train a tiny LoRA on Raw, then render Turbo with and without it (same seed).
-    let adapter = train_tiny_adapter(&raw, NetworkType::Lora, "lora");
+    let adapter = train_tiny_adapter(&tmp, &raw, NetworkType::Lora, "lora");
     let spec = AdapterSpec::new(adapter, 4.0, AdapterKind::Lora);
 
     let base = render_turbo(&turbo, Vec::new());
@@ -451,6 +468,7 @@ fn raw_trained_lora_applies_at_turbo_inference() {
 #[test]
 #[ignore = "needs real Krea 2 Raw + Turbo snapshots (~45 GB) + a Mac; run as its own process"]
 fn raw_trained_lokr_applies_at_turbo_inference() {
+    let tmp = tempfile::tempdir().unwrap();
     let (Some(raw), Some(turbo)) = (
         snapshot("KREA_RAW_DIR", "models--krea--Krea-2-Raw"),
         snapshot("KREA_TURBO_DIR", "models--krea--Krea-2-Turbo"),
@@ -461,7 +479,7 @@ fn raw_trained_lokr_applies_at_turbo_inference() {
 
     // The LoKr path rides the same `apply_adapters_strict` seam (Kronecker delta → residual); confirm
     // a Raw-trained LoKr loads + renders coherently at Turbo.
-    let adapter = train_tiny_adapter(&raw, NetworkType::Lokr, "lokr");
+    let adapter = train_tiny_adapter(&tmp, &raw, NetworkType::Lokr, "lokr");
     let spec = AdapterSpec::new(adapter, 2.0, AdapterKind::Lokr);
     let adapted = render_turbo(&turbo, vec![spec]);
 

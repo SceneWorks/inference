@@ -306,14 +306,16 @@ impl Qwen35VisionModel {
             .map(|i| load_merger(p(&format!("deepstack_merger_list.{i}")), true))
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(Self {
+        let model = Self {
             patch_embed,
             pos_embed,
             blocks,
             merger,
             deepstack_mergers,
             cfg,
-        })
+        };
+        w.verify_accessed_gpu_view()?;
+        Ok(model)
     }
 
     /// The tower geometry.

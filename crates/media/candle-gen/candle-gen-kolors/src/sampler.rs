@@ -12,12 +12,12 @@
 //!  - `scale_model_input`: divide latents by `√(σ²+1)` before the UNet;
 //!  - Euler step (ε-pred, γ=0): `x_next = x + ε·(σ_next − σ)`.
 
+use candle_gen::candle_core::Tensor;
+use candle_gen::diffusion_schedule::{KOLORS_BETA_END, KOLORS_BETA_START};
+
 /// Kolors' `num_train_timesteps` — the length of the `scaled_linear` schedule the sampler interpolates
 /// over. `num_steps` must lie in `1..=NUM_TRAIN_TIMESTEPS`.
-pub const NUM_TRAIN_TIMESTEPS: usize = 1100;
-
-const BETA_START: f64 = 0.00085;
-const BETA_END: f64 = 0.014;
+pub use candle_gen::diffusion_schedule::KOLORS_TRAIN_STEPS as NUM_TRAIN_TIMESTEPS;
 const STEPS_OFFSET: i64 = 1;
 
 /// Kolors' EulerDiscrete (leading) sampler over the 1100-step `scaled_linear` schedule.
@@ -28,6 +28,8 @@ pub struct KolorsEulerSampler {
     /// The (float) leading timesteps fed to the UNet, length `num_steps`.
     timesteps: Vec<f32>,
     init_noise_sigma: f32,
+    /// Sigma used to seed a VAE-encoded img2img init. For the full schedule this is the maximum sigma.
+    start_sigma: f32,
 }
 
 impl KolorsEulerSampler {
@@ -45,7 +47,10 @@ impl KolorsEulerSampler {
 
         // scaled_linear betas → alphas → alphas_cumprod (f64 throughout, matching diffusers).
         let n_train = NUM_TRAIN_TIMESTEPS;
-        let (b0, b1) = (BETA_START.sqrt(), BETA_END.sqrt());
+        let (b0, b1) = (
+            f64::from(KOLORS_BETA_START).sqrt(),
+            f64::from(KOLORS_BETA_END).sqrt(),
+        );
         let mut acp = 1.0f64;
         let mut full: Vec<f64> = Vec::with_capacity(n_train);
         for i in 0..n_train {
@@ -84,6 +89,26 @@ impl KolorsEulerSampler {
             timesteps,
             // leading spacing ⇒ init_noise_sigma = (max_sigma² + 1)^0.5.
             init_noise_sigma: (max_sigma * max_sigma + 1.0).sqrt(),
+            start_sigma: max_sigma,
+        })
+    }
+
+    /// Build the full schedule, then keep only the strength-selected denoise tail. This mirrors
+    /// diffusers' `KolorsImg2ImgPipeline.get_timesteps`: `floor(steps * strength)` effective steps,
+    /// clamped to the original schedule. Strength zero retains only the terminal sigma and runs no
+    /// denoise steps, so the deterministic VAE mean round-trips without injected noise.
+    pub fn img2img(num_steps: usize, strength: f32) -> Result<Self, String> {
+        let full = Self::new(num_steps)?;
+        let effective = ((num_steps as f32 * strength.clamp(0.0, 1.0)) as usize).min(num_steps);
+        let start = num_steps - effective;
+        let sigmas = full.sigmas[start..].to_vec();
+        let timesteps = full.timesteps[start..].to_vec();
+        let start_sigma = sigmas[0];
+        Ok(Self {
+            sigmas,
+            timesteps,
+            init_noise_sigma: full.init_noise_sigma,
+            start_sigma,
         })
     }
 
@@ -100,6 +125,15 @@ impl KolorsEulerSampler {
     /// `init_noise_sigma` — the initial latents are `noise · init_noise_sigma`.
     pub fn init_noise_sigma(&self) -> f32 {
         self.init_noise_sigma
+    }
+
+    /// Seed an img2img latent in raw VE sigma space: `x0 + noise * sigma_start`.
+    pub fn add_noise(
+        &self,
+        x0: &Tensor,
+        noise: &Tensor,
+    ) -> candle_gen::candle_core::Result<Tensor> {
+        x0 + (noise * self.start_sigma as f64)?
     }
 
     /// The `scale_model_input` divisor at step `i`: `√(σ_i² + 1)` (latents are divided by this before
@@ -162,5 +196,22 @@ mod tests {
         for i in 0..s.num_steps() {
             assert!(s.step_dt(i) <= 0.0, "dt at {i} should be <= 0");
         }
+    }
+
+    #[test]
+    fn img2img_strength_selects_the_schedule_tail_and_start_sigma() {
+        let full = KolorsEulerSampler::new(10).unwrap();
+        let half = KolorsEulerSampler::img2img(10, 0.5).unwrap();
+        assert_eq!(half.num_steps(), 5);
+        assert_eq!(half.timesteps, full.timesteps[5..]);
+        assert_eq!(half.sigmas, full.sigmas[5..]);
+
+        let zero = KolorsEulerSampler::img2img(10, 0.0).unwrap();
+        assert_eq!(zero.num_steps(), 0);
+        assert_eq!(zero.sigmas, vec![0.0]);
+
+        let over = KolorsEulerSampler::img2img(10, 2.0).unwrap();
+        assert_eq!(over.timesteps, full.timesteps);
+        assert_eq!(over.sigmas, full.sigmas);
     }
 }

@@ -18,13 +18,12 @@
 
 use std::cell::RefCell;
 
-use mlx_gen::nn::{gelu_tanh, silu};
+use mlx_gen::nn::{gelu_tanh, quantized_matmul_with_bias, silu};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{
-    add, broadcast_to, concatenate_axis, cos, matmul, multiply, quantize as quantize_affine,
-    quantized_matmul, sin,
+    add, broadcast_to, concatenate_axis, cos, matmul, multiply, quantize as quantize_affine, sin,
 };
 use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Dtype};
@@ -68,19 +67,21 @@ impl Linear {
         })
     }
     fn forward(&self, x: &Array) -> Result<Array> {
-        let y = match &self.w {
-            LinearWeight::Dense(w) => matmul(x, w.t())?,
+        match &self.w {
+            LinearWeight::Dense(w) => {
+                let y = matmul(x, w.t())?;
+                match &self.b {
+                    Some(b) => Ok(add(&y, b)?),
+                    None => Ok(y),
+                }
+            }
             LinearWeight::Quant {
                 wq,
                 scales,
                 biases,
                 group,
                 bits,
-            } => quantized_matmul(x, wq, scales, biases, true, *group, *bits)?,
-        };
-        match &self.b {
-            Some(b) => Ok(add(&y, b)?),
-            None => Ok(y),
+            } => quantized_matmul_with_bias(x, wq, scales, biases, self.b.as_ref(), *group, *bits),
         }
     }
 

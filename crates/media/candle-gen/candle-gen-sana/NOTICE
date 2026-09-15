@@ -13,24 +13,31 @@ seam. It does not include or redistribute any model weights.
 Model weights (NOT distributed with this crate)
 ------------------------------------------------------------------------------
 
-The candle-gen-sana-txt2img example downloads model weights at runtime, on the
-user's machine, from the official public Hugging Face repository. Those weights
-are NOT part of this crate and remain subject to the licenses of their
+Model weights are supplied by the caller. Neither this crate nor its examples
+download them: inference never self-fetches and never derives a hub-cache
+location (epic 13657). Both examples take a local snapshot directory you have
+staged out-of-band — `--snapshot <dir>`, or the `SANA_SNAPSHOT` /
+`SANA_SPRINT_SNAPSHOT` env var — and load it via `WeightsSource::Dir`. Those
+weights are NOT part of this crate and remain subject to the licenses of their
 respective providers:
 
   * SANA-1.6B transformer + DC-AE autoencoder
       Efficient-Large-Model/Sana_1600M_1024px_diffusers
-      Licensed under the NVIDIA License (the NVIDIA Open Model License family).
-      See the repository's LICENSE.txt:
-      https://huggingface.co/Efficient-Large-Model/Sana_1600M_1024px_diffusers/blob/main/LICENSE.txt
+      Licensed under the Apache License, Version 2.0: the repository ships an
+      Apache-2.0 LICENSE file and its model card declares `license: apache-2.0`
+      (verified against the upstream repository 2026-08-02).
+      See the repository's LICENSE:
+      https://huggingface.co/Efficient-Large-Model/Sana_1600M_1024px_diffusers/blob/main/LICENSE
       SANA is a work of NVIDIA / NVlabs (https://github.com/NVlabs/Sana).
 
   * SANA-Sprint 1.6B transformer + DC-AE autoencoder (the CFG-free, SCM/TrigFlow
     continuous-time-consistency-distilled, 1-4 step variant — sc-11781)
       Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers
-      Licensed under the NVIDIA License (the NVIDIA Open Model License family).
-      See the repository's LICENSE.txt:
-      https://huggingface.co/Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers/blob/main/LICENSE.txt
+      Licensed under the Apache License, Version 2.0: the repository ships an
+      Apache-2.0 LICENSE file and its model card declares `license: apache-2.0`
+      (verified against the upstream repository 2026-08-02).
+      See the repository's LICENSE:
+      https://huggingface.co/Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers/blob/main/LICENSE
       SANA-Sprint is a work of NVIDIA / NVlabs (https://github.com/NVlabs/Sana).
 
   * gemma-2-2b-it text encoder (the SANA caption encoder)
@@ -39,9 +46,9 @@ respective providers:
       This crate reuses candle-gen-pid's gemma-2-2b-it loader; the example loads
       the gemma weights bundled in the SANA diffusers repository above.
 
-Use of the downloaded weights is governed by the above licenses. By downloading
-and using them you agree to the applicable terms. This crate's Apache-2.0
-license covers the source code only, not the model weights.
+Use of those weights is governed by the above licenses. By obtaining and using
+them you agree to the applicable terms. This crate's Apache-2.0 license covers
+the source code only, not the model weights.
 
 This crate gratefully acknowledges the following as architectural lineage,
 references, and parity baselines (no source code is copied from them):

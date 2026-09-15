@@ -42,6 +42,9 @@ const MAX_ASPECT: u32 = 6;
 /// introspection / capability advertisement).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "ideogram",
@@ -53,7 +56,6 @@ pub fn descriptor() -> ModelDescriptor {
             // prompt is not.
             supports_negative_prompt: false,
             supports_guidance: true,
-            supports_true_cfg: false,
             // Edit (sc-6303/6330): img2img / Remix via a source `Reference`, and mask inpaint via a
             // `Mask` (white = repaint) alongside the `Reference`. The prompt stays the model's native
             // JSON caption. No control/pose/multi-reference. Edit works in both quality and turbo.
@@ -74,8 +76,6 @@ pub fn descriptor() -> ModelDescriptor {
             // Advertising the curated menu would expose solvers that produce broken output — so the
             // native logit-normal Euler is its only valid sampler. See `pipeline::run_denoise`.
             samplers: Vec::new(),
-            schedulers: Vec::new(),
-            supported_guidance_methods: vec![],
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
@@ -83,25 +83,14 @@ pub fn descriptor() -> ModelDescriptor {
             // Load-time Q4/Q8 over the whole model (both DiTs + TE + VAE), sc-5989. Q8 default is
             // the worker's call; Q4 roughly halves the ~27 GB Q8 weights for smaller Macs.
             supported_quants: &[Quant::Q4, Quant::Q8],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam (epic 10834, sc-10840); honors Sequential offload
             // (F-176). Under `Sequential` the Qwen3-VL text encoder is encoded, materialized, then
             // dropped before the two DiTs + VAE load — bounding peak unified memory to
             // `max(TE, DiTs+VAE)`. Ideogram Q4/Q8 quantize the whole model DENSE at load, so a
             // `Sequential` + `quantize` load re-quantizes each generate (F-181 advisory in `load`).
             supports_sequential_offload: true,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            supports_preview: true,
+            ..Default::default()
         },
     }
 }
@@ -130,6 +119,13 @@ pub struct Ideogram4 {
     /// `true` for `ideogram_4_turbo` (CFG-free single DiT) — selects the few-step default and the
     /// turbo heavy-load path (single DiT + bundled TurboTime LoRA). Known without loading weights.
     turbo: bool,
+    /// The memory-strategy contract this exact load publishes (sc-22732). Built once at load from
+    /// [`crate::memory_strategy::memory_strategy_contract`], so the artifact-proven calibration
+    /// identity a memory anchor binds to is the one the loaded generator carries.
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
+    /// The numeric tier this load runs at, kept for the contract's own safety gate.
+    precision: Precision,
+    quant: Option<Quant>,
     residency: Residency<Ideogram4Text, Ideogram4HeavyOwned>,
 }
 
@@ -163,6 +159,9 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     Ok(Box::new(Ideogram4 {
         descriptor: descriptor(),
         turbo: false,
+        memory_strategy: crate::memory_strategy::memory_strategy_contract(IDEOGRAM_4_ID, spec)?,
+        precision: spec.precision,
+        quant: spec.quantize,
         residency: build_residency(spec, false)?,
     }))
 }
@@ -194,6 +193,12 @@ pub fn load_turbo(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     Ok(Box::new(Ideogram4 {
         descriptor: descriptor_turbo(),
         turbo: true,
+        memory_strategy: crate::memory_strategy::memory_strategy_contract(
+            IDEOGRAM_4_TURBO_ID,
+            spec,
+        )?,
+        precision: spec.precision,
+        quant: spec.quantize,
         residency: build_residency(spec, true)?,
     }))
 }
@@ -306,10 +311,58 @@ fn load_pid(spec: &LoadSpec) -> Result<Option<PidEngine>> {
         .transpose()
 }
 
-mlx_gen::impl_generator!(Ideogram4 {
-    validate: |s, req| validate_request(&s.descriptor.capabilities, req),
-    generate: generate_impl,
-});
+// Hand-written rather than `mlx_gen::impl_generator!`: that macro emits `descriptor`, `validate`
+// and `generate` and has no memory hook, so a provider that publishes a `MemoryProviderContract`
+// cannot use it. The three bodies below are the macro's, verbatim.
+impl Generator for Ideogram4 {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        validate_request(&self.descriptor.capabilities, req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    /// sc-22732: the loaded generator publishes its artifact-proven contract, which is what the
+    /// SceneWorks memory-anchor capture arm reads `calibration` off.
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(
+            &self.memory_strategy,
+            self.precision,
+            self.quant,
+            context,
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        crate::memory_strategy::begin_request(
+            self.descriptor.id,
+            &self.memory_strategy,
+            self.precision,
+            self.quant,
+            context,
+        )
+    }
+}
 
 impl Ideogram4 {
     /// The rich-`Result` body behind [`Generator::generate`] — kept on the crate's own
@@ -353,7 +406,8 @@ impl Ideogram4 {
                 text.encode(&ids)
             },
             // Materialize the Qwen3-VL embeds while the encoder is still alive (Sequential only).
-            |te_out: &Array| {
+            |te_out: Option<&Array>| {
+                let Some(te_out) = te_out else { return Ok(()) };
                 mlx_rs::transforms::eval([te_out])?;
                 Ok(())
             },
@@ -398,7 +452,7 @@ impl Ideogram4 {
                 let mut images = Vec::with_capacity(req.count as usize);
                 for n in 0..req.count {
                     let seed = base_seed.wrapping_add(n as u64);
-                    let arr = heavy.run_denoise_from_embeds(
+                    let arr = heavy.run_denoise_from_embeds_with_preview(
                         &te_out,
                         req.height,
                         req.width,
@@ -410,6 +464,7 @@ impl Ideogram4 {
                         pid_ref,
                         &req.cancel,
                         on_progress,
+                        &req.preview,
                     )?;
                     images.push(array_to_image(&arr)?);
                 }
@@ -558,6 +613,41 @@ mlx_gen::register_generators! {
     pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo;
     footprint = component_footprint
 }
+
+/// Memory-strategy + weights-free behavior registrations (sc-22732), one pair per route.
+pub(crate) const QUALITY_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
+        safety_check: crate::memory_strategy::registered_safety_check,
+    };
+pub(crate) const QUALITY_MEMORY_BEHAVIOR: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(MODEL_ID, spec, contract, context)
+        },
+    };
+pub(crate) const TURBO_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID_TURBO,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID_TURBO, spec),
+        safety_check: crate::memory_strategy::registered_safety_check,
+    };
+pub(crate) const TURBO_MEMORY_BEHAVIOR: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID_TURBO,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(
+                MODEL_ID_TURBO,
+                spec,
+                contract,
+                context,
+            )
+        },
+    };
 
 #[cfg(test)]
 mod tests {
@@ -896,8 +986,10 @@ mod tests {
     fn load_turbo_errors_when_bundled_lora_missing() {
         // A dir with no turbo_lora.safetensors must fail loudly on the missing bundled LoRA (the
         // model-defining component), not silently fall back to a CFG render.
-        let dir = std::env::temp_dir().join("ideogram4_turbo_no_lora_test");
-        std::fs::create_dir_all(&dir).unwrap();
+        // Per-process scratch dir: the "no turbo_lora.safetensors here" premise must not be broken by
+        // a second concurrent `cargo test` process writing into the shared `$TMPDIR`.
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
         let e = load_turbo(&spec)
             .err()
@@ -907,7 +999,6 @@ mod tests {
             e.contains("turbo_lora.safetensors") || e.contains("TurboTime LoRA not found"),
             "got: {e}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

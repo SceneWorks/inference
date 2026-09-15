@@ -42,6 +42,19 @@ pub fn rms_norm(x: &Array, weight: &Array, eps: f32) -> Result<Array> {
     Ok(mlx_rs::fast::rms_norm(x, weight, eps)?)
 }
 
+/// **Scale-free** RMSNorm: `x / rms(x)`, with no learned weight — Gemma 4's value norm
+/// (`Gemma4UnifiedRMSNorm(..., with_scale=False)`), which normalizes the value heads without a
+/// parameter of its own.
+///
+/// Implemented as [`rms_norm`] against an all-ones weight so it goes through the identical fused
+/// reduction as the scaled norms in the same block (same kernel, same accumulation order) rather
+/// than a separately-rounded hand-rolled mean.
+pub fn rms_norm_unscaled(x: &Array, eps: f32) -> Result<Array> {
+    let width = *x.shape().last().unwrap_or(&1);
+    let ones = mlx_rs::ops::ones_dtype(&[width], x.dtype())?;
+    rms_norm(x, &ones, eps)
+}
+
 /// LayerNorm via MLX's fused kernel (optional affine weight/bias).
 pub fn layer_norm(
     x: &Array,

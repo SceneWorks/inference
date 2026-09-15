@@ -98,6 +98,38 @@ pub fn safe_budget_gib() -> f64 {
     clamp_budget_to_cap(raw_safe_budget_gib(), max_buffer_length_gib())
 }
 
+/// Environment variable that emulates a **memory-constrained host** by lowering MLX's own memory
+/// limit (SC-15754).
+pub const MEMORY_CAP_ENV: &str = "SCENEWORKS_MLX_MEMORY_CAP_GB";
+
+/// Apply [`MEMORY_CAP_ENV`] if it is set, returning the cap in GiB that is now in force.
+///
+/// **This is a calibration/measurement facility, not a production policy.** Nothing in the render
+/// paths calls it; a harness does, so a rung's cost can be measured somewhere other than a 128 GB
+/// developer machine. `None` (unset, unparseable, or non-positive) leaves MLX untouched, so an
+/// ordinary process is unaffected.
+///
+/// What it does and does not emulate is worth stating, because the difference decides how far a
+/// constrained-host number can be trusted:
+///
+/// - it **does** emulate the accelerator-side pressure — MLX stops holding freed buffers in its
+///   allocator cache and starts recycling, which is what makes a re-materializing rung actually pay
+///   for its re-reads instead of being handed them back for free;
+/// - it does **not** emulate OS page-cache eviction. The weights stay in the host page cache, so a
+///   re-read is still a memcpy rather than a disk read. On a real small Mac under pressure the page
+///   cache is the first thing evicted, so a re-materialization cost measured under this cap is a
+///   **lower bound** on the constrained-host cost, not an estimate of it.
+///
+/// A measurement taken here has to say which of the two it is claiming.
+pub fn apply_memory_cap_env() -> Option<f64> {
+    let gib: f64 = std::env::var(MEMORY_CAP_ENV).ok()?.parse().ok()?;
+    if !(gib.is_finite() && gib > 0.0) {
+        return None;
+    }
+    mlx_rs::memory::set_memory_limit((gib * GIB) as usize);
+    Some(gib)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

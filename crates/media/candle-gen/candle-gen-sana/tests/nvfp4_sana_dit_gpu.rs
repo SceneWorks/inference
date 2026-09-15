@@ -34,8 +34,8 @@
 //!
 //! Run (exclusive GPU, `--release`; `-j 1` avoids lld OOM):
 //! ```text
-//! CUDA_COMPUTE_CAP=120 cargo test --locked -j 1 -p candle-gen-sana --test nvfp4_sana_dit_gpu \
-//!     --features cuda --release -- --ignored --nocapture
+//! CUDA_COMPUTE_CAP=120 cargo test --locked -j 1 -p candle-gen-sana --test integration \
+//!     --features nvfp4_sana_dit_gpu::cuda --release -- --ignored --nocapture
 //! ```
 
 #![cfg(feature = "cuda")]
@@ -45,7 +45,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::{CancelFlag, Image, Progress};
+use candle_gen::gen_core::{CancelFlag, Image, PreviewSink, Progress};
+use candle_gen::preview::PreviewHook;
 use candle_gen::quant::{ActPrecision, CublasLt, OutlierClass};
 use candle_gen::Weights;
 use candle_gen_sana::pipeline::{
@@ -209,6 +210,11 @@ fn run_denoise(
             pr.set_step(current as usize);
         }
     };
+    // sc-16959: the denoise takes its preview hook by reference rather than as an `Option`, so this
+    // NVFP4 harness supplies one over an inert sink — byte-identical to a run without the seam, and
+    // one `is_active()` check per evaluation.
+    let inert = PreviewSink::default();
+    let preview = PreviewHook::new(&inert, candle_gen_sana::preview::project_base_latents);
     denoise_cfg(
         model,
         &sigmas,
@@ -221,6 +227,7 @@ fn run_denoise(
         dev,
         &cancel,
         &mut on_progress,
+        &preview,
     )
     .expect("denoise must not fail (a NaN guard trip surfaces here)")
 }

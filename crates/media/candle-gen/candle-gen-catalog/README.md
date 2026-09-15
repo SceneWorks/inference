@@ -40,6 +40,36 @@ that every descriptor is on the `candle` backend, and runs the weights-free desc
 conformance sweep. Changing the shipped surface requires an intentional update to that test —
 that edit is the review point where platform inclusion becomes visible.
 
+The `preview_advertising` test module (epic 16948, sc-16951) guards `Capabilities::supports_preview`
+the same way, in both directions — but against the provider **sources** rather than against a second
+hand-kept list. A crate that emits must advertise, and a descriptor that advertises must have wiring
+behind it. Emission is read out of the crate's own **shipped** module tree in both shapes candle
+families come in: a shared-driver family passes a preview hook to `run_flow_sampler` /
+`run_curated_sampler` / `run_scm_sampler`, and a bespoke family (SenseNova, Ideogram) calls
+`PreviewHook::emit` / `emit_step` or the `emit_preview` / `emit_preview_at` functions underneath.
+Only the shipped tree is read — the walk starts at `src/lib.rs` and follows `mod` declarations, so an
+out-of-line `#[cfg(test)] mod NAME;` file is never mistaken for shipped code.
+
+**A story that wires a family amends that module in its own PR**, in three places:
+
+1. add the family's exact route ids to `PREVIEW_ROUTE_IDS`,
+2. flip its descriptors' `supports_preview`, and
+3. add the family's **route inventory** to its `ProviderCrate` row — per-file `hooked` / `direct`
+   counts and a `DarkSite` (driver + occurrence index + reason) for every site that deliberately
+   passes `None`, the way sc-16950 pinned Krea's.
+
+The build fails until all three happen. Steps 1 and 2 are enforced by the source-derived half; step 3
+is what keeps a wired family honest afterwards — without exact per-file counts, blanking one route of
+an already-inventoried file changes nothing any assertion can see. Weights-free, like the rest of the
+contract.
+
+Route ids and wired lanes are **not** one-to-one, and step 1 is about ids. `candle-gen-qwen-image`
+(sc-16952) wires three render lanes — base txt2img, reference edit, and 2512-Fun ControlNet — but
+registers one generator descriptor, because the latter two are bespoke providers the worker drives by
+name and so carry a `preview` sink on their own request types instead of a descriptor. One id in
+`PREVIEW_ROUTE_IDS`, three hooked sites in the route inventory; step 3 is what holds the two bespoke
+lanes to account.
+
 Consumers reach this catalog through the [`runtime-cuda`](../../../bundles/runtime-cuda/README.md)
 and [`runtime-cpu`](../../../bundles/runtime-cpu/README.md) bundles, which validate it against
 the Candle backend and pair it with the Candle LLM and snapshot-preparer catalogs.

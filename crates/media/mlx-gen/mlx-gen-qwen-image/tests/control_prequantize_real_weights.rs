@@ -11,7 +11,7 @@
 //!
 //! `#[ignore]`d — needs the alibaba-pai `Qwen-Image-2512-Fun-Controlnet-Union` checkpoint (the
 //! `-2602.safetensors` overlay, ~3.3 GB bf16). Run with:
-//!   cargo test -p mlx-gen-qwen-image --release --test control_prequantize_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-qwen-image --release --test integration control_prequantize_real_weights:: -- --ignored --nocapture
 //!
 //! Env knobs:
 //!   SC9517_CONTROL  the `-2602.safetensors` overlay (default: the HF-cache copy)
@@ -52,8 +52,8 @@ fn bits_env() -> i32 {
 /// Build-only harness for producing the **hostable** control tier (epic 9083 rollout): pack the
 /// overlay into `SC9517_OUT` and keep it — no load (fast, variant-agnostic). Run per tier:
 ///   SC9517_CONTROL=<overlay> SC9517_OUT=<staging/control-q4> SC9517_BITS=4 \
-///     cargo test -p mlx-gen-qwen-image --release --test control_prequantize_real_weights \
-///     -- --ignored build_control_tier_only --nocapture
+///     cargo test -p mlx-gen-qwen-image --release --test integration \
+///     -- --ignored control_prequantize_real_weights::build_control_tier_only --nocapture
 #[test]
 #[ignore = "build-only control-tier producer for hosting; set SC9517_CONTROL/OUT/BITS"]
 fn build_control_tier_only() {

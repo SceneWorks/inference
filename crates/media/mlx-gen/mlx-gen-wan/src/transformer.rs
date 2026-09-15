@@ -24,18 +24,17 @@
 //! MLX **0.32.0**. Remaining bounded bf16 drift is a matched-version cross-stack kernel-selection
 //! difference, not the former 0.31.1/0.31.2 version gap (sc-12896; see the Wan parity tests).
 
-use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, Adapter};
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, Adapter, DiffPatchPart};
 use mlx_gen::array::scalar;
+use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 use mlx_gen::train::lora::LoraParams;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{
-    add, broadcast_to, concatenate_axis, cos, multiply, power, sigmoid, sin, split, tanh,
-};
+use mlx_rs::ops::{add, broadcast_to, concatenate_axis, cos, multiply, power, sin, split, tanh};
 use mlx_rs::transforms::checkpoint;
-use mlx_rs::transforms::compile::compile;
+use mlx_rs::transforms::compile::{compile, compile_retained};
 use mlx_rs::{Array, Dtype};
 
 use crate::config::{WanModelConfig, WanQuant};
@@ -51,32 +50,127 @@ use crate::text_encoder::gelu_tanh;
 // so the tiny reference-parity gates run the eager form and `compile_parity.rs` can A/B both.
 //
 // The toggle + its RAII [`CompileGlueGuard`] are hoisted into core (F-104); re-export core's so the
-// process-global is shared with the FLUX family rather than each crate hand-rolling its own `AtomicBool`.
+// request/thread-local setting is shared with the FLUX family.
 pub(crate) use mlx_gen::nn::compile_glue;
 pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
+
+use mlx_gen::nn::{retained_compilation_requested, RetainedTernary, RetainedUnary};
+
+const SITE_MODULATE: &str = "wan::transformer::modulate";
+const SITE_GATED: &str = "wan::transformer::gated";
+const SITE_GELU_FFN: &str = "wan::transformer::gelu_ffn";
+
+fn modulate_impl(
+    (m, scale, shift): (&Array, &Array, &Array),
+) -> std::result::Result<Array, Exception> {
+    add(&multiply(m, &add(scale, scalar(1.0))?)?, shift)
+}
+
+fn gated_impl((x, y, gate): (&Array, &Array, &Array)) -> std::result::Result<Array, Exception> {
+    add(x, &multiply(y, gate)?)
+}
+
+fn gelu_ffn_impl(x: &Array) -> std::result::Result<Array, Exception> {
+    let dt = x.dtype();
+    let s = |v: f32| -> std::result::Result<Array, Exception> { scalar(v).as_dtype(dt) };
+    let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
+    let x3 = power(x, Array::from_int(3))?;
+    let inner = multiply(&add(x, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
+    let gate = add(&tanh(&inner)?, &s(1.0)?)?;
+    multiply(&multiply(x, &s(0.5)?)?, &gate)
+}
+
+struct WanRetainedCompileGlue {
+    modulate: RetainedTernary,
+    gated: RetainedTernary,
+    gelu_ffn: RetainedUnary,
+}
+
+impl WanRetainedCompileGlue {
+    fn new() -> Self {
+        Self {
+            modulate: RetainedTernary::new(compile_retained(modulate_impl, true)),
+            gated: RetainedTernary::new(compile_retained(gated_impl, true)),
+            gelu_ffn: RetainedUnary::new(compile_retained(gelu_ffn_impl, true)),
+        }
+    }
+}
+
+thread_local! {
+    static RETAINED_COMPILE_GLUE: std::cell::RefCell<Option<WanRetainedCompileGlue>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn with_retained_compile_glue<T>(
+    f: impl FnOnce(&mut WanRetainedCompileGlue) -> std::result::Result<T, Exception>,
+) -> std::result::Result<T, Exception> {
+    mlx_gen::nn::prepare_retained_compilation_thread();
+    RETAINED_COMPILE_GLUE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        f(slot.get_or_insert_with(WanRetainedCompileGlue::new))
+    })
+}
+
+/// Exercise every retained handle owned by the Wan transformer once for the release memory audit.
+#[doc(hidden)]
+pub fn exercise_retained_compile_inventory(input: &Array) -> Result<()> {
+    let output = with_retained_compile_glue(|compiled| {
+        compiled.modulate.call(SITE_MODULATE, (input, input, input))
+    })?;
+    output.eval()?;
+    drop(output);
+
+    let output = with_retained_compile_glue(|compiled| {
+        compiled.gated.call(SITE_GATED, (input, input, input))
+    })?;
+    output.eval()?;
+    drop(output);
+
+    let output =
+        with_retained_compile_glue(|compiled| compiled.gelu_ffn.call(SITE_GELU_FFN, input))?;
+    output.eval()?;
+    drop(output);
+    Ok(())
+}
 
 /// adaLN affine `m·(1+e_scale)+e_shift` — one fused kernel when compiled, else 2 eager ops. The
 /// `mx.compile` graph is bit-exact to the eager form (proven `max|Δ|=0`, `tests/compile_micro.rs`).
 fn modulate(m: &Array, e_scale: &Array, e_shift: &Array) -> Result<Array> {
-    let f = |(m, s, sh): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
-        add(&multiply(m, &add(s, scalar(1.0))?)?, sh)
-    };
     if compile_glue() {
-        Ok(compile(f, true)((m, e_scale, e_shift))?)
+        if retained_compilation_requested() {
+            Ok(with_retained_compile_glue(|compiled| {
+                compiled.modulate.call(SITE_MODULATE, (m, e_scale, e_shift))
+            })?)
+        } else {
+            mlx_gen::diagnostics::record_compile(
+                SITE_MODULATE,
+                mlx_gen::diagnostics::CompileDisposition::OneShot,
+            );
+            Ok(compile(modulate_impl, true)((m, e_scale, e_shift))?)
+        }
     } else {
-        Ok(f((m, e_scale, e_shift))?)
+        mlx_gen::diagnostics::record_fallback(SITE_MODULATE, "compiled_glue_disabled");
+        Ok(modulate_impl((m, e_scale, e_shift))?)
     }
 }
 
 /// Gated residual `x + y·gate` — one fused kernel when compiled.
 fn gated(x: &Array, y: &Array, gate: &Array) -> Result<Array> {
-    let f = |(x, y, g): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
-        add(x, &multiply(y, g)?)
-    };
     if compile_glue() {
-        Ok(compile(f, true)((x, y, gate))?)
+        if retained_compilation_requested() {
+            Ok(with_retained_compile_glue(|compiled| {
+                compiled.gated.call(SITE_GATED, (x, y, gate))
+            })?)
+        } else {
+            mlx_gen::diagnostics::record_compile(
+                SITE_GATED,
+                mlx_gen::diagnostics::CompileDisposition::OneShot,
+            );
+            Ok(compile(gated_impl, true)((x, y, gate))?)
+        }
     } else {
-        Ok(f((x, y, gate))?)
+        mlx_gen::diagnostics::record_fallback(SITE_GATED, "compiled_glue_disabled");
+        Ok(gated_impl((x, y, gate))?)
     }
 }
 
@@ -85,18 +179,141 @@ fn gated(x: &Array, y: &Array, gate: &Array) -> Result<Array> {
 /// per-step glue cost — ~600 MB bf16 tensor × 40 layers, sc-2957). Off ⇒ defers to core `gelu_tanh`.
 fn gelu_ffn(x: &Array) -> Result<Array> {
     if !compile_glue() {
+        mlx_gen::diagnostics::record_fallback(SITE_GELU_FFN, "compiled_glue_disabled");
         return gelu_tanh(x);
     }
-    let f = |x_: &Array| -> std::result::Result<Array, Exception> {
-        let dt = x_.dtype();
-        let s = |v: f32| -> std::result::Result<Array, Exception> { scalar(v).as_dtype(dt) };
-        let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
-        let x3 = power(x_, Array::from_int(3))?;
-        let inner = multiply(&add(x_, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
-        let gate = add(&tanh(&inner)?, &s(1.0)?)?;
-        multiply(&multiply(x_, &s(0.5)?)?, &gate)
+    if retained_compilation_requested() {
+        Ok(with_retained_compile_glue(|compiled| {
+            compiled.gelu_ffn.call(SITE_GELU_FFN, x)
+        })?)
+    } else {
+        mlx_gen::diagnostics::record_compile(
+            SITE_GELU_FFN,
+            mlx_gen::diagnostics::CompileDisposition::OneShot,
+        );
+        Ok(compile(gelu_ffn_impl, true)(x)?)
+    }
+}
+
+#[cfg(test)]
+mod retained_compile_tests {
+    use super::*;
+    use mlx_gen::diagnostics::{
+        self, CompileDisposition, DiagnosticCounter, ToggleDisposition, RETAINED_COMPILATION,
     };
-    Ok(compile(f, true)(x)?)
+    use mlx_rs::ops::array_eq;
+
+    fn same(lhs: &Array, rhs: &Array) -> bool {
+        array_eq(lhs, rhs, None).unwrap().item::<bool>()
+    }
+
+    #[test]
+    fn retained_transformer_glue_reuses_every_site_across_requests() {
+        RETAINED_COMPILE_GLUE.with(|slot| *slot.borrow_mut() = None);
+        let x = Array::from_slice(&[1.0f32, -2.0, 3.0, 0.5], &[1, 1, 4]);
+        let scale = Array::from_slice(&[0.5f32, 0.25, -0.5, 2.0], &[1, 1, 4]);
+        let shift = Array::from_slice(&[2.0f32, 2.0, 2.0, 2.0], &[1, 1, 4]);
+
+        set_compile_glue(false);
+        let eager_modulate = modulate(&x, &scale, &shift).unwrap();
+        let eager_gated = gated(&x, &shift, &scale).unwrap();
+        let eager_gelu = gelu_ffn(&x).unwrap();
+
+        set_compile_glue(true);
+        let scope = diagnostics::begin_request_with_toggles(
+            "wan-retained-glue",
+            "wan",
+            &[RETAINED_COMPILATION],
+        )
+        .unwrap();
+        for (first, second, eager) in [
+            (
+                modulate(&x, &scale, &shift).unwrap(),
+                modulate(&x, &scale, &shift).unwrap(),
+                &eager_modulate,
+            ),
+            (
+                gated(&x, &shift, &scale).unwrap(),
+                gated(&x, &shift, &scale).unwrap(),
+                &eager_gated,
+            ),
+            (gelu_ffn(&x).unwrap(), gelu_ffn(&x).unwrap(), &eager_gelu),
+        ] {
+            assert!(same(&first, eager));
+            assert!(same(&second, eager));
+        }
+        let report = scope.finish();
+        for site in [SITE_MODULATE, SITE_GATED, SITE_GELU_FFN] {
+            for disposition in [
+                CompileDisposition::RetainedMiss,
+                CompileDisposition::RetainedHit,
+            ] {
+                assert!(report.counters.iter().any(|counter| matches!(
+                    counter,
+                    DiagnosticCounter::Compile {
+                        site: recorded_site,
+                        disposition: recorded_disposition,
+                        count: 1,
+                    } if *recorded_site == site && *recorded_disposition == disposition
+                )));
+            }
+        }
+        assert!(report.counters.iter().any(|counter| matches!(
+            counter,
+            DiagnosticCounter::Toggle {
+                toggle: RETAINED_COMPILATION,
+                disposition: ToggleDisposition::Applied,
+                count: 6,
+            }
+        )));
+
+        let next = diagnostics::begin_request_with_toggles(
+            "wan-retained-glue-next",
+            "wan",
+            &[RETAINED_COMPILATION],
+        )
+        .unwrap();
+        assert!(same(&gated(&x, &shift, &scale).unwrap(), &eager_gated));
+        let next = next.finish();
+        assert!(next.counters.iter().any(|counter| matches!(
+            counter,
+            DiagnosticCounter::Compile {
+                site: SITE_GATED,
+                disposition: CompileDisposition::RetainedHit,
+                count: 1,
+            }
+        )));
+
+        let baseline = diagnostics::begin_request("wan-oneshot-glue", "wan").unwrap();
+        assert!(same(
+            &modulate(&x, &scale, &shift).unwrap(),
+            &eager_modulate
+        ));
+        assert!(same(&gated(&x, &shift, &scale).unwrap(), &eager_gated));
+        assert!(same(&gelu_ffn(&x).unwrap(), &eager_gelu));
+        let baseline = baseline.finish();
+        for site in [SITE_MODULATE, SITE_GATED, SITE_GELU_FFN] {
+            assert!(baseline.counters.iter().any(|counter| matches!(
+                counter,
+                DiagnosticCounter::Compile {
+                    site: recorded_site,
+                    disposition: CompileDisposition::OneShot,
+                    count: 1,
+                } if *recorded_site == site
+            )));
+        }
+        assert!(!baseline.counters.iter().any(|counter| matches!(
+            counter,
+            DiagnosticCounter::Toggle {
+                toggle: RETAINED_COMPILATION,
+                disposition: ToggleDisposition::Applied,
+                ..
+            }
+        )));
+
+        set_compile_glue(false);
+        RETAINED_COMPILE_GLUE.with(|slot| *slot.borrow_mut() = None);
+    }
 }
 
 /// Load a biased `[out, in]` Linear as a core [`AdaptableLinear`] (every Wan DiT `nn.Linear` is
@@ -132,7 +349,7 @@ fn load_linear(w: &Weights, prefix: &str, quant: Option<WanQuant>) -> Result<Ada
 
 /// SiLU `x·σ(x)` (the reference `nn.SiLU`), bit-exact and dtype-preserving.
 fn silu(x: &Array) -> Result<Array> {
-    Ok(multiply(x, &sigmoid(x)?)?)
+    mlx_gen::nn::silu(x)
 }
 
 fn f32(x: &Array) -> Result<Array> {
@@ -177,6 +394,9 @@ struct SelfAttention {
     /// decomposed attention (MLX has no fused SDPA backward) instead of retaining the per-layer seq²
     /// probability matrix. Training-only; `false` on the inference path (byte-identical).
     ckpt_sdpa: bool,
+    /// Ladder rung 3 (sc-15528). [`AttentionBudget::UNBOUNDED`] is the load default and takes the
+    /// bare `scaled_dot_product_attention` line, so every pre-rung-3 caller is byte-identical.
+    attn_budget: AttentionBudget,
 }
 
 impl SelfAttention {
@@ -195,6 +415,7 @@ impl SelfAttention {
             scale: (head_dim as f32).powf(-0.5),
             eps: cfg.eps as f32,
             ckpt_sdpa: false,
+            attn_budget: AttentionBudget::UNBOUNDED,
         })
     }
 
@@ -225,40 +446,98 @@ impl SelfAttention {
         }
     }
 
+    /// Route a ComfyUI/lightx2v diff-patch target to this attention's qk-RMSNorm gain (sc-15326).
+    /// RMSNorm here is weight-only, so a `.diff_b` on `norm_q`/`norm_k` resolves to nothing and is
+    /// surfaced as a skip rather than inventing an offset the reference module does not have. These
+    /// gains are dense on **every** quant tier (`_quantize_predicate` packs only the attn/FFN Linears),
+    /// which is what makes a fold through this surface tier-independent.
+    fn norm_param_mut(&mut self, path: &[&str], part: DiffPatchPart) -> Option<&mut Array> {
+        match (path, part) {
+            (["norm_q"], DiffPatchPart::Weight) => Some(&mut self.norm_q),
+            (["norm_k"], DiffPatchPart::Weight) => Some(&mut self.norm_k),
+            _ => None,
+        }
+    }
+
+    /// sc-15326 — test-only **field-level** view of this attention's qk-RMSNorm gains, in the
+    /// [`WAN_BLOCK_NORM_DIFF_PATCH_TARGETS`] order (`norm_q`, then `norm_k`). Names the two fields
+    /// **directly** rather than routing through [`norm_param_mut`](Self::norm_param_mut), which is
+    /// exactly the point: a routing test that both writes and reads through the accessor passes under
+    /// any consistent bijection (including a `norm_q`↔`norm_k` or weight↔bias swap), so the read-back
+    /// side has to name the fields.
+    #[cfg(test)]
+    pub(crate) fn norm_diff_patch_fields(&self) -> [&Array; 2] {
+        [&self.norm_q, &self.norm_k]
+    }
+
     /// `x_mod`: `[B, L, dim]` (f32). `cos`/`sin`: `[L, 1, half_d]` (bf16). Returns `[B, L, dim]` bf16.
     /// Batched over `B` (the CFG cond/uncond branches) — attention never mixes batch elements, so the
     /// `B=2` result is bit-identical to two `B=1` calls (the cos/sin broadcast across batch + heads).
     fn forward(&self, x_mod: &Array, cos: &Array, sin: &Array) -> Result<Array> {
+        self.forward_split(x_mod, cos, sin, x_mod, cos, sin)
+    }
+
+    /// Self-attention with the **query side and the key/value side supplied separately** — the seam
+    /// sc-18322's token pruning needs.
+    ///
+    /// [`forward`](Self::forward) is `forward_split(x, cos, sin, x, cos, sin)`, and the
+    /// **single-cast** guard below is what makes that delegation free rather than a hidden regression:
+    /// when the query and key/value inputs are the same tensor, the bf16 cast runs **once** and the
+    /// result is shared, exactly as the pre-sc-18322 body's one `xw` did. Two casts would have added a
+    /// duplicate full `[B, L, dim]` bf16 transient per block per step — ~227 MiB at the dense 5B's
+    /// production geometry — to the production path of every Wan MLX provider, in the one lane where
+    /// memory is the binding constraint. The values would have agreed, so no parity test would have
+    /// caught it.
+    ///
+    /// Pruning passes a gathered `[B, L', dim]` query stream (with its RoPE tables gathered to the same
+    /// `L'`) against the **full** `[B, L, dim]` key/value stream, so every surviving query still attends
+    /// over every token — see [`crate::token_pruning`] for why that bound matters. The fused MLX SDPA
+    /// already runs with `Sq != Sk` on the rung-3 query-chunking path, and each query row's softmax is
+    /// over all keys and independent of the other rows, so a *subset* of query rows is as sound as a
+    /// contiguous *block* of them. Returns `[B, L', dim]` — the caller restores full length.
+    fn forward_split(
+        &self,
+        x_q: &Array,
+        cos_q: &Array,
+        sin_q: &Array,
+        x_kv: &Array,
+        cos_kv: &Array,
+        sin_kv: &Array,
+    ) -> Result<Array> {
         // Matmuls run bf16 (the reference's `x.astype(w_dtype)`); the f32 residual is restored by the
         // block's modulation. q/k get full-dim bf16 RMSNorm before the head split; RoPE applies in
         // f32 on bf16 cos/sin then casts back to bf16 for the bf16 SDPA.
-        let xw = bf16(x_mod)?;
+        //
+        let (xq, xkv, _casts) = split_attention_casts(x_q, x_kv)?;
         let (n, d) = (self.num_heads as i32, self.head_dim as i32);
-        let b = x_mod.shape()[0];
-        let s = x_mod.shape()[1];
+        let b = x_q.shape()[0];
+        let sq = x_q.shape()[1];
+        let skv = x_kv.shape()[1];
 
-        let q = rms_norm(&self.q.forward(&xw)?, &self.norm_q, self.eps)?;
-        let k = rms_norm(&self.k.forward(&xw)?, &self.norm_k, self.eps)?;
+        let q = rms_norm(&self.q.forward(&xq)?, &self.norm_q, self.eps)?;
+        let k = rms_norm(&self.k.forward(&xkv)?, &self.norm_k, self.eps)?;
         let q = bf16(&crate::rope::rope_apply(
-            &f32(&q.reshape(&[b, s, n, d])?)?,
-            cos,
-            sin,
+            &f32(&q.reshape(&[b, sq, n, d])?)?,
+            cos_q,
+            sin_q,
         )?)?
         .transpose_axes(&[0, 2, 1, 3])?;
         let k = bf16(&crate::rope::rope_apply(
-            &f32(&k.reshape(&[b, s, n, d])?)?,
-            cos,
-            sin,
+            &f32(&k.reshape(&[b, skv, n, d])?)?,
+            cos_kv,
+            sin_kv,
         )?)?
         .transpose_axes(&[0, 2, 1, 3])?;
         let v = self
             .v
-            .forward(&xw)?
-            .reshape(&[b, s, n, d])?
+            .forward(&xkv)?
+            .reshape(&[b, skv, n, d])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
-        let out = sdpa_maybe_checkpoint(&q, &k, &v, self.scale, self.ckpt_sdpa)?;
-        let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, n * d])?;
+        let out = sdpa_maybe_checkpoint(&q, &k, &v, self.scale, self.ckpt_sdpa, self.attn_budget)?;
+        let out = out
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[b, sq, n * d])?;
         self.o.forward(&out)
     }
 
@@ -340,9 +619,33 @@ impl SelfAttention {
 /// through them) and only the f32 `scale` is captured; the backward recomputes the decomposed
 /// attention for this layer alone, so the seq² probability matrix is a per-layer transient rather than
 /// retained across all blocks. `ckpt = false` is byte-identical to the bare call (inference).
-fn sdpa_maybe_checkpoint(q: &Array, k: &Array, v: &Array, scale: f32, ckpt: bool) -> Result<Array> {
+///
+/// The `ckpt` arm is taken FIRST and always runs unbounded: `eval` inside an autograd trace is
+/// invalid, so gradient checkpointing and a rung-3 budget are mutually exclusive by construction
+/// rather than by convention. A training forward therefore stays `UNBOUNDED` whatever is declared.
+fn sdpa_maybe_checkpoint(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    scale: f32,
+    ckpt: bool,
+    budget: AttentionBudget,
+) -> Result<Array> {
     if !ckpt {
-        return Ok(scaled_dot_product_attention(q, k, v, scale, None, None)?);
+        if budget.is_unbounded() {
+            return Ok(scaled_dot_product_attention(q, k, v, scale, None, None)?);
+        }
+        // Ladder rung 3 (sc-15528). On MLX the saving is NOT a bounded score tensor — `fast::sdpa` is
+        // a fused Metal kernel that already streams them — it is the per-chunk `eval` cutting the lazy
+        // graph. See `mlx_gen::attention`'s module docs, and do not carry the Candle figure across.
+        return mlx_gen::attention::sdpa_budgeted_bhsd(
+            q,
+            k,
+            v,
+            scale,
+            None,
+            AttentionPlan::budgeted(budget),
+        );
     }
     let mut seg = checkpoint(move |inp: &[Array]| -> MlxResult<Vec<Array>> {
         Ok(vec![scaled_dot_product_attention(
@@ -369,6 +672,8 @@ struct CrossAttention {
     eps: f32,
     /// sc-4942 — SDPA-segment checkpointing (training-only). See [`SelfAttention::ckpt_sdpa`].
     ckpt_sdpa: bool,
+    /// Ladder rung 3 (sc-15528). See [`SelfAttention::attn_budget`].
+    attn_budget: AttentionBudget,
 }
 
 impl CrossAttention {
@@ -387,6 +692,7 @@ impl CrossAttention {
             scale: (head_dim as f32).powf(-0.5),
             eps: cfg.eps as f32,
             ckpt_sdpa: false,
+            attn_budget: AttentionBudget::UNBOUNDED,
         })
     }
 
@@ -422,6 +728,30 @@ impl CrossAttention {
         }
     }
 
+    /// Route a ComfyUI/lightx2v diff-patch target to this attention's qk-RMSNorm gain (sc-15326).
+    /// RMSNorm here is weight-only, so a `.diff_b` on `norm_q`/`norm_k` resolves to nothing and is
+    /// surfaced as a skip rather than inventing an offset the reference module does not have. These
+    /// gains are dense on **every** quant tier (`_quantize_predicate` packs only the attn/FFN Linears),
+    /// which is what makes a fold through this surface tier-independent.
+    fn norm_param_mut(&mut self, path: &[&str], part: DiffPatchPart) -> Option<&mut Array> {
+        match (path, part) {
+            (["norm_q"], DiffPatchPart::Weight) => Some(&mut self.norm_q),
+            (["norm_k"], DiffPatchPart::Weight) => Some(&mut self.norm_k),
+            _ => None,
+        }
+    }
+
+    /// sc-15326 — test-only **field-level** view of this attention's qk-RMSNorm gains, in the
+    /// [`WAN_BLOCK_NORM_DIFF_PATCH_TARGETS`] order (`norm_q`, then `norm_k`). Names the two fields
+    /// **directly** rather than routing through [`norm_param_mut`](Self::norm_param_mut), which is
+    /// exactly the point: a routing test that both writes and reads through the accessor passes under
+    /// any consistent bijection (including a `norm_q`↔`norm_k` or weight↔bias swap), so the read-back
+    /// side has to name the fields.
+    #[cfg(test)]
+    pub(crate) fn norm_diff_patch_fields(&self) -> [&Array; 2] {
+        [&self.norm_q, &self.norm_k]
+    }
+
     /// Cached K/V from the (bf16) text context `[B, L_ctx, dim]` — computed once, reused per step.
     /// `B` is the forward batch (2 for CFG cond+uncond, 1 otherwise); returns `(k, v)` each
     /// `[B, n, L_ctx, d]`.
@@ -448,14 +778,21 @@ impl CrossAttention {
         let q = rms_norm(&self.q.forward(&bf16(x)?)?, &self.norm_q, self.eps)?
             .reshape(&[b, s, n, d])?
             .transpose_axes(&[0, 2, 1, 3])?;
-        let out = sdpa_maybe_checkpoint(&q, &kv.0, &kv.1, self.scale, self.ckpt_sdpa)?;
+        let out = sdpa_maybe_checkpoint(
+            &q,
+            &kv.0,
+            &kv.1,
+            self.scale,
+            self.ckpt_sdpa,
+            self.attn_budget,
+        )?;
         let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, n * d])?;
         self.o.forward(&out)
     }
 }
 
 #[derive(Clone)]
-struct Block {
+pub(crate) struct Block {
     modulation: Array, // [1, 6, dim]
     self_attn: SelfAttention,
     cross_attn: CrossAttention,
@@ -467,7 +804,7 @@ struct Block {
 }
 
 impl Block {
-    fn load(w: &Weights, i: usize, cfg: &WanModelConfig) -> Result<Self> {
+    pub(crate) fn load(w: &Weights, i: usize, cfg: &WanModelConfig) -> Result<Self> {
         let p = format!("blocks.{i}");
         Ok(Self {
             modulation: f32(w.require(&format!("{p}.modulation"))?)?,
@@ -483,7 +820,7 @@ impl Block {
 
     /// Quantize this block's `_quantize_predicate` surface (self/cross attn `q/k/v/o` + `ffn.fc1/fc2`)
     /// to Q4/Q8 in place. The modulation table, `norm3`, and the qk-RMSNorm weights stay dense.
-    fn quantize(&mut self, bits: i32, group: Option<i32>) -> Result<()> {
+    pub(crate) fn quantize(&mut self, bits: i32, group: Option<i32>) -> Result<()> {
         self.self_attn.quantize(bits, group)?;
         self.cross_attn.quantize(bits, group)?;
         self.ffn_fc1.quantize(bits, group)?;
@@ -491,8 +828,14 @@ impl Block {
         Ok(())
     }
 
+    /// Apply ladder rung 3's attention budget to both of this block's SDPA seams (sc-15528).
+    pub(crate) fn set_attention_budget(&mut self, budget: AttentionBudget) {
+        self.self_attn.attn_budget = budget;
+        self.cross_attn.attn_budget = budget;
+    }
+
     /// Collect this block's quantized packs (sc-5360 eval-to-free).
-    fn push_quant_arrays<'a>(&'a self, out: &mut Vec<&'a Array>) {
+    pub(crate) fn push_quant_arrays<'a>(&'a self, out: &mut Vec<&'a Array>) {
         self.self_attn.push_quant_arrays(out);
         self.cross_attn.push_quant_arrays(out);
         push_quant_arrays(&self.ffn_fc1, out);
@@ -511,7 +854,36 @@ impl Block {
         }
     }
 
-    fn prepare_kv(&self, context: &Array) -> Result<(Array, Array)> {
+    /// Route a diff-patch target to this block's dense norm parameters (sc-15326): the two attentions'
+    /// qk-RMSNorm gains, and the affine cross-attention LayerNorm `norm3` (both halves). Every one of
+    /// them stays dense at Q4/Q8, so a lightx2v step-distill file's 200 `.diff` + 40 `norm3.diff_b`
+    /// deltas fold identically on every tier.
+    fn norm_param_mut(&mut self, path: &[&str], part: DiffPatchPart) -> Option<&mut Array> {
+        match (path, part) {
+            (["self_attn", rest @ ..], _) => self.self_attn.norm_param_mut(rest, part),
+            (["cross_attn", rest @ ..], _) => self.cross_attn.norm_param_mut(rest, part),
+            (["norm3"], DiffPatchPart::Weight) => Some(&mut self.norm3_w),
+            (["norm3"], DiffPatchPart::Bias) => Some(&mut self.norm3_b),
+            _ => None,
+        }
+    }
+
+    /// sc-15326 — test-only **field-level** view of this block's six diff-patch norm parameters, in
+    /// the exact order of [`WAN_BLOCK_NORM_DIFF_PATCH_TARGETS`]. Every entry names its struct field
+    /// directly (`norm3_w` is the LayerNorm **gain**, `norm3_b` its **bias** — the γ/β passed to
+    /// `layer_norm` in both [`forward`](Self::forward) and [`forward_causal`](Self::forward_causal)),
+    /// so the routing test can assert that a marker stamped through `norm_param_mut` landed on the
+    /// parameter the forward actually reads. Round-tripping through the accessor cannot do that: a
+    /// weight↔bias swap in the match arms above is self-consistent and would read back clean while
+    /// corrupting the render on all 40 blocks.
+    #[cfg(test)]
+    pub(crate) fn norm_diff_patch_fields(&self) -> [&Array; 6] {
+        let [sq, sk] = self.self_attn.norm_diff_patch_fields();
+        let [cq, ck] = self.cross_attn.norm_diff_patch_fields();
+        [sq, sk, cq, ck, &self.norm3_w, &self.norm3_b]
+    }
+
+    pub(crate) fn prepare_kv(&self, context: &Array) -> Result<(Array, Array)> {
         self.cross_attn.prepare_kv(context)
     }
 
@@ -526,7 +898,7 @@ impl Block {
     /// `L_e = L` for the **per-token** timestep (TI2V mask-blend `t_tokens`, sc-2680; broadcasts over
     /// the CFG batch only). Every modulation/residual op below is broadcast over `B`; only the
     /// self/cross attention reshapes to `B`.
-    fn forward(
+    pub(crate) fn forward(
         &self,
         x: &Array,
         e: &Array,
@@ -558,6 +930,72 @@ impl Block {
         let y = gelu_ffn(&self.ffn_fc1.forward(&bf16(&x_mod)?)?)?;
         let y = self.ffn_fc2.forward(&y)?;
         gated(&x, &y, &e5)
+    }
+
+    /// [`forward`](Self::forward) with **token pruning** (sc-18322): each of the block's three sublayer
+    /// contributions is computed only for the tokens `keep` selects, and the dropped tokens pass through
+    /// **bit-exactly**.
+    ///
+    /// The pass-through exactness is a property of Wan's residual structure rather than a tolerance:
+    /// every residual here is `x + gate·y` or `x + y`, and [`TokenKeepSet::restore`] fills a dropped
+    /// row's `y` with an exact zero, so that row leaves the block holding precisely the bits it entered
+    /// with. Each sublayer restores full length immediately after its output projection — before the
+    /// residual add, and after the projection because the projections carry biases, so a zero-filled
+    /// *input* would emerge as the bias rather than as zero.
+    ///
+    /// Self-attention's key/value side reads the **full** stream, so surviving queries still attend over
+    /// every token; cross-attention's K/V come from the text context and never depended on the latent
+    /// token count.
+    ///
+    /// Per-token time modulation (`L_e == L`, the TI2V mask-blend) is **refused**: `e0..e5` would have to
+    /// be gathered in lockstep and `apply_head` broadcasts the modulation against the token axis, so a
+    /// mismatch there is a silent broadcast rather than an error. That route declares no pruning and
+    /// refuses a non-exact plan at the provider (`pipeline::refuse_unwired_approximation`); this guard is
+    /// the local backstop.
+    pub(crate) fn forward_pruned(
+        &self,
+        x: &Array,
+        e: &Array,
+        kv: &(Array, Array),
+        cos: &Array,
+        sin: &Array,
+        keep: &crate::token_pruning::TokenKeepSet,
+    ) -> Result<Array> {
+        let dim = self.self_attn.num_heads as i32 * self.self_attn.head_dim as i32;
+        let m = add(&self.modulation, e)?;
+        let l_e = m.shape()[1];
+        if l_e != 1 {
+            return Err(Error::Msg(format!(
+                "wan: token pruning does not support per-token time modulation (L_e={l_e}); the TI2V \
+                 mask-blend route declares no pruning"
+            )));
+        }
+        let p = split(&m, 6, 2)?;
+        let v = |i: usize| -> Result<Array> { Ok(p[i].reshape(&[1, l_e, dim])?) };
+        let (e0, e1, e2) = (v(0)?, v(1)?, v(2)?);
+        let (e3, e4, e5) = (v(3)?, v(4)?, v(5)?);
+
+        // Self-attention: queries from the kept rows, keys/values from the whole stream.
+        let x_mod = modulate(&ln(x, self.eps)?, &e1, &e0)?;
+        let x_mod_keep = keep.gather(&x_mod, 1)?;
+        let (cos_keep, sin_keep) = (keep.gather(cos, 0)?, keep.gather(sin, 0)?);
+        let y =
+            self.self_attn
+                .forward_split(&x_mod_keep, &cos_keep, &sin_keep, &x_mod, cos, sin)?;
+        let x = gated(x, &keep.restore(&y)?, &e2)?;
+
+        // Cross-attention: the text K/V are token-count independent, so only the query side prunes.
+        let x_cross = layer_norm(&x, Some(&self.norm3_w), Some(&self.norm3_b), self.eps)?;
+        let x_cross_keep = keep.gather(&x_cross, 1)?;
+        let y = self.cross_attn.forward(&x_cross_keep, kv)?;
+        let x = add(&x, &keep.restore(&y)?)?;
+
+        // Gated-GELU FFN — per-token by construction, so a row subset is exactly that row subset.
+        let x_mod = modulate(&ln(&x, self.eps)?, &e4, &e3)?;
+        let x_mod_keep = keep.gather(&x_mod, 1)?;
+        let y = gelu_ffn(&self.ffn_fc1.forward(&bf16(&x_mod_keep)?)?)?;
+        let y = self.ffn_fc2.forward(&y)?;
+        gated(&x, &keep.restore(&y)?, &e5)
     }
 
     /// **Causal cached** block forward — the Krea Realtime AR delta (sc-8436, S3). Identical wiring to
@@ -626,6 +1064,13 @@ pub struct WanTransformer {
     time_embedding_1: AdaptableLinear,
     time_projection: AdaptableLinear,
     blocks: Vec<Block>,
+    /// Ladder rung 4 (sc-15528): this transformer was built with
+    /// [`LoadShape::DeferredMaterialization`](mlx_gen::LoadShape::DeferredMaterialization) and holds
+    /// **no** blocks. `blocks` is empty and every block-reading path must route through a
+    /// [`WanBlockStream`](crate::block_stream::WanBlockStream). Kept as an explicit flag rather than
+    /// inferred from `blocks.is_empty()` so "deferred" and "degenerate zero-layer config" cannot be
+    /// confused by a reader or by a future `num_layers` overlay.
+    blocks_deferred: bool,
     head_modulation: Array, // [1, 2, dim]
     head: AdaptableLinear,
     rope: RopeTable,
@@ -669,12 +1114,103 @@ impl AdaptableHost for WanTransformer {
     }
 }
 
+/// The whole-model (non-block) adaptable Linears in **native converted** naming — the spellings
+/// [`normalize_wan_key`](crate::adapters::normalize_wan_key) produces for a Wan-family LoRA's global
+/// targets. Paired with [`WanTransformer::global_adaptable_mut`], which routes exactly these.
+///
+/// Deliberately **not** folded into [`AdaptableHost::adaptable_paths`] for [`WanTransformer`]: that
+/// surface is also the LoRA **trainer**'s target enumeration ([`crate::training`]), so widening it would
+/// change what a Wan fine-tune can be pointed at. This is an opt-in *inference* surface a host composes
+/// in — `mlx-gen-krea-realtime` does, so a real Wan-T2V step-distill LoRA (lightx2v / FastWan) installs
+/// instead of hard-erroring as an unmatched target (sc-8446, S13). Those files carry genuine low-rank
+/// factors for **six** of these seven — `patch_embedding` ships only a `.diff_b` bias delta — which is
+/// why a real install reports 406 targets against a 407-wide surface. The list stays seven wide because
+/// it describes the Linears the model HAS, not the ones a given file happens to populate.
+pub const WAN_GLOBAL_ADAPTABLE_PATHS: &[&str] = &[
+    "patch_embedding_proj",
+    "text_embedding_0",
+    "text_embedding_1",
+    "time_embedding_0",
+    "time_embedding_1",
+    "time_projection",
+    "head.head",
+];
+
+/// The per-block **norm** parameters a ComfyUI/lightx2v diff-patch can fold into, as
+/// `(module suffix, part)` pairs in native converted naming (sc-15326). Exactly the five norms a Wan
+/// step-distill / lightning file patches: the self- and cross-attention qk-RMSNorm gains (weight-only)
+/// and the affine cross-attention LayerNorm `norm3` (weight **and** bias).
+///
+/// Single source of truth for what [`WanTransformer::norm_param_mut`] routes, so a test can assert the
+/// two agree instead of trusting a hand-kept list. Deliberately **not** part of
+/// [`AdaptableHost::adaptable_paths`]: these are not `AdaptableLinear`s and are not LoRA-trainable
+/// targets — they are a diff-patch fold surface only.
+pub const WAN_BLOCK_NORM_DIFF_PATCH_TARGETS: &[(&str, DiffPatchPart)] = &[
+    ("self_attn.norm_q", DiffPatchPart::Weight),
+    ("self_attn.norm_k", DiffPatchPart::Weight),
+    ("cross_attn.norm_q", DiffPatchPart::Weight),
+    ("cross_attn.norm_k", DiffPatchPart::Weight),
+    ("norm3", DiffPatchPart::Weight),
+    ("norm3", DiffPatchPart::Bias),
+];
+
 impl WanTransformer {
-    pub fn from_weights(w: &Weights, cfg: &WanModelConfig) -> Result<Self> {
-        let mut blocks = Vec::with_capacity(cfg.num_layers);
-        for i in 0..cfg.num_layers {
-            blocks.push(Block::load(w, i, cfg)?);
+    /// Route a diff-patch delta to the dense **norm** parameter at `path` (native converted naming),
+    /// the norm analog of [`global_adaptable_mut`](Self::global_adaptable_mut) (sc-15326). Composed in
+    /// by a host's [`AdaptableHost::diff_patch_param_mut`]; `mlx-gen-krea-realtime` does, so a lightx2v
+    /// step-distill LoRA's 200 `.diff` + 40 `norm3.diff_b` norm deltas land instead of being dropped.
+    ///
+    /// Every parameter reachable here is dense on **every** quant tier — the reference
+    /// `_quantize_predicate` packs only the per-block attention/FFN Linears — so the fold is
+    /// tier-independent, unlike a weight `.diff` into a Linear.
+    pub fn norm_param_mut(&mut self, path: &[&str], part: DiffPatchPart) -> Option<&mut Array> {
+        match path {
+            ["blocks", i, rest @ ..] => self
+                .blocks
+                .get_mut(i.parse::<usize>().ok()?)?
+                .norm_param_mut(rest, part),
+            _ => None,
         }
+    }
+
+    /// sc-15326 — test-only **field-level** view of block `i`'s six diff-patch norm parameters, in
+    /// [`WAN_BLOCK_NORM_DIFF_PATCH_TARGETS`] order. See `Block::norm_diff_patch_fields`: the routing
+    /// test reads back through *this* rather than through [`norm_param_mut`](Self::norm_param_mut), so
+    /// a swapped or aliased match arm cannot round-trip clean.
+    #[cfg(test)]
+    pub(crate) fn block_norm_diff_patch_fields(&self, i: usize) -> [&Array; 6] {
+        self.blocks[i].norm_diff_patch_fields()
+    }
+
+    /// Route one of the seven whole-model [`WAN_GLOBAL_ADAPTABLE_PATHS`] to its [`AdaptableLinear`], in
+    /// **native converted** naming. Returns `None` for anything else — including the per-block paths,
+    /// which [`AdaptableHost::adaptable_mut`] already routes; a host composes the two.
+    pub fn global_adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["patch_embedding_proj"] => Some(&mut self.patch_embedding),
+            ["text_embedding_0"] => Some(&mut self.text_embedding_0),
+            ["text_embedding_1"] => Some(&mut self.text_embedding_1),
+            ["time_embedding_0"] => Some(&mut self.time_embedding_0),
+            ["time_embedding_1"] => Some(&mut self.time_embedding_1),
+            ["time_projection"] => Some(&mut self.time_projection),
+            ["head", "head"] => Some(&mut self.head),
+            _ => None,
+        }
+    }
+
+    pub fn from_weights(w: &Weights, cfg: &WanModelConfig) -> Result<Self> {
+        let mut dit = Self::from_weights_without_blocks(w, cfg)?;
+        dit.blocks = Vec::with_capacity(cfg.num_layers);
+        for i in 0..cfg.num_layers {
+            dit.blocks.push(Block::load(w, i, cfg)?);
+        }
+        Ok(dit)
+    }
+
+    /// Everything except the block stack. The single derivation both
+    /// [`from_weights`](Self::from_weights) and [`from_weights_deferred`](Self::from_weights_deferred)
+    /// share, so the two shapes cannot drift on the embeddings, the head or the RoPE table.
+    fn from_weights_without_blocks(w: &Weights, cfg: &WanModelConfig) -> Result<Self> {
         let half = cfg.freq_dim / 2;
         let inv: Vec<f32> = (0..half)
             .map(|j| (10000.0_f64.powf(-(j as f64) / half as f64)) as f32)
@@ -690,7 +1226,8 @@ impl WanTransformer {
             time_embedding_0: load_linear(w, "time_embedding_0", None)?,
             time_embedding_1: load_linear(w, "time_embedding_1", None)?,
             time_projection: load_linear(w, "time_projection", None)?,
-            blocks,
+            blocks: Vec::new(),
+            blocks_deferred: false,
             head_modulation: f32(w.require("head.modulation")?)?,
             head: load_linear(w, "head.head", None)?,
             rope: RopeTable::new(cfg.dim / cfg.num_heads),
@@ -730,8 +1267,111 @@ impl WanTransformer {
     }
 
     /// Number of transformer blocks (for the trainer's target enumeration).
+    ///
+    /// On a **deferred** stack (rung 4) this is the config's `num_layers` rather than `blocks.len()`,
+    /// which is zero — the plan must be sized by the stack the checkpoint has, not by what is
+    /// currently materialized.
     pub fn num_blocks(&self) -> usize {
-        self.blocks.len()
+        if self.blocks_deferred {
+            self.cfg.num_layers
+        } else {
+            self.blocks.len()
+        }
+    }
+
+    /// Whether this transformer holds **no** blocks and must be driven through a
+    /// [`WanBlockStream`](crate::block_stream::WanBlockStream) — ladder rung 4 (sc-15528).
+    pub fn is_deferred(&self) -> bool {
+        self.blocks_deferred
+    }
+
+    /// Build every non-block component and **defer** the block stack (ladder rung 4, sc-15528).
+    ///
+    /// The result holds zero blocks, so the whole `blocks.*` weight set — 40 of 40 layers on a Wan
+    /// A14B expert — is never materialized. `forward_packed` and every other resident block path will
+    /// refuse; the caller must drive [`forward_packed_windowed`](Self::forward_packed_windowed) with a
+    /// stream and a plan.
+    ///
+    /// This is the shape [`LoadShape::DeferredMaterialization`](mlx_gen::LoadShape::DeferredMaterialization)
+    /// names, and it is the prerequisite the shared contract declares for rung 4: a window over an
+    /// already-materialized trunk bounds nothing — it *adds* a copy on top.
+    pub fn from_weights_deferred(w: &Weights, cfg: &WanModelConfig) -> Result<Self> {
+        let mut dit = Self::from_weights_without_blocks(w, cfg)?;
+        dit.blocks_deferred = true;
+        Ok(dit)
+    }
+
+    /// Apply ladder rung 3's attention budget to every resident block (sc-15528).
+    ///
+    /// A **deferred** stack has no resident block to configure; its budget travels on the stream
+    /// ([`WanBlockStream::set_attention_budget`](crate::block_stream::WanBlockStream::set_attention_budget)),
+    /// so this is a no-op there rather than a silent half-application.
+    pub fn set_attention_budget(&mut self, budget: mlx_gen::attention::AttentionBudget) {
+        for block in &mut self.blocks {
+            block.set_attention_budget(budget);
+        }
+    }
+
+    /// [`forward_packed`](Self::forward_packed) over a **windowed** block schedule (ladder rung 4).
+    ///
+    /// Identical arithmetic to `forward_packed` — same `time_embed`, same per-block call, same head —
+    /// with the block stack materialized `plan.window()` blocks at a time out of a freshly re-opened
+    /// lazy view and released after each window. Output is bit-identical to the resident path, which
+    /// is what makes the parity contract `Exact` rather than a tolerance.
+    ///
+    /// `cross_kv` must already be the full per-block cache (build it once per generate with
+    /// [`WanBlockStream::prepare_cross_kv_windowed`](crate::block_stream::WanBlockStream::prepare_cross_kv_windowed)
+    /// on a deferred stack); it is small and legitimately resident, so it is not re-derived per window.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_packed_windowed(
+        &self,
+        tokens: &Array,
+        t: f32,
+        cross_kv: &[(Array, Array)],
+        cos: &Array,
+        sin: &Array,
+        stream: &crate::block_stream::WanBlockStream,
+        plan: &mlx_gen::block_residency::BlockPlan,
+        cancel: &mlx_gen::CancelFlag,
+    ) -> Result<Array> {
+        if plan.n_blocks() != self.num_blocks() || stream.n_blocks() != self.num_blocks() {
+            return Err(Error::Msg(format!(
+                "wan: windowed forward plan covers {} blocks and the stream {}, but the transformer \
+                 has {}",
+                plan.n_blocks(),
+                stream.n_blocks(),
+                self.num_blocks()
+            )));
+        }
+        if cross_kv.len() != self.num_blocks() {
+            return Err(Error::Msg(format!(
+                "wan: windowed forward needs one cross-K/V pair per block, got {} for {} blocks",
+                cross_kv.len(),
+                self.num_blocks()
+            )));
+        }
+        let (e, e0) = self.time_embed(t)?;
+        let x = mlx_gen::block_residency::run_windowed(
+            plan,
+            cancel,
+            tokens.clone(),
+            || stream.open(),
+            |mut x: Array, view: &mut Weights, range: std::ops::Range<usize>| {
+                for index in range {
+                    let block = stream.materialize(view, index)?;
+                    x = block.forward(&x, &e0, &cross_kv[index], cos, sin)?;
+                }
+                Ok(x)
+            },
+            |x: &Array| {
+                // LOAD-BEARING: MLX is lazy, so the carried activation is an unevaluated graph node
+                // still referencing the window's weights. Dropping before forcing evaluation frees
+                // NOTHING — silently, with correct output either way.
+                mlx_rs::transforms::eval([x])?;
+                Ok(())
+            },
+        )?;
+        self.apply_head(&x, &e)
     }
 
     /// Toggle SDPA-segment gradient checkpointing across the whole block stack (sc-4942) — both the
@@ -835,7 +1475,7 @@ impl WanTransformer {
                                 local.join(".")
                             ))
                         })?
-                        .set_adapters(vec![Adapter::Lora { a, b, scale: 1.0 }]);
+                        .set_training_adapters(vec![Adapter::Lora { a, b, scale: 1.0 }]);
                 }
                 let kv = blk
                     .prepare_kv(&context_c)
@@ -1028,6 +1668,13 @@ impl WanTransformer {
     /// [`forward_tokens_cached`](Self::forward_tokens_cached) paths differ **only** in how they build
     /// `(e, e0)` (scalar `time_embed` vs per-token `time_embed_tokens`), so they precompute it and pass
     /// it in here — keeping the ~45-line body in one place so the TI2V path can't silently diverge.
+    ///
+    /// `trunk` is the sc-18322 **denoise feature cache**, and `None` — the state every pre-existing
+    /// caller is in — is byte-for-byte the pre-sc-18322 body: the `is_some` below is the only added
+    /// instruction, and the block loop, its inputs and its dtypes are untouched. When present the block
+    /// stack is either run and its aggregate residual retained, or skipped and the retained residual
+    /// reapplied, per the declared policy. See [`crate::feature_cache`] — including why the
+    /// evaluation/cancel discipline is unaffected (the step loop owns both, outside this branch).
     #[allow(clippy::too_many_arguments)]
     fn forward_with_modulation(
         &self,
@@ -1038,6 +1685,8 @@ impl WanTransformer {
         cos: &Array,
         sin: &Array,
         batch: usize,
+        trunk: Option<&mut crate::feature_cache::TrunkCache>,
+        prune: Option<&crate::token_pruning::TokenPruner>,
     ) -> Result<Vec<Array>> {
         // Patchify + embed once; cast to bf16 to start the block stream (reference casts to w_dtype).
         let (tokens, grid) = patchify(latent, self.cfg.patch_size)?;
@@ -1045,6 +1694,162 @@ impl WanTransformer {
         let dim = self.cfg.dim as i32;
         let x1 = bf16(&self.patch_embedding.forward(&tokens)?)?.reshape(&[1, l, dim])?;
         // Broadcast the shared patch embedding across the CFG batch (the reference's `broadcast_to`).
+        let x = if batch > 1 {
+            broadcast_to(&x1, &[batch as i32, l, dim])?
+        } else {
+            x1
+        };
+
+        // One block-stack traversal, with or without pruning. Every block restores full token length
+        // before returning, so the two approximate mechanisms compose without either knowing about the
+        // other and `apply_head` / `unpatchify` below see the shape they always saw (sc-18322).
+        let run_blocks = |mut x: Array| -> Result<Array> {
+            match prune {
+                // The pre-sc-18322 block loop, unchanged.
+                None => {
+                    for (block, kv) in self.blocks.iter().zip(cross_kv.iter()) {
+                        x = block.forward(&x, e0, kv, cos, sin)?;
+                    }
+                }
+                Some(pruner) => {
+                    // The rotation happens HERE, per block: `keep_for_block` selects the
+                    // `(step + block) % stride` phase, so no position is dropped by every block of a
+                    // step and key/value staleness is bounded to one block (sc-18322, see
+                    // `crate::token_pruning`).
+                    for (index, (block, kv)) in self.blocks.iter().zip(cross_kv.iter()).enumerate()
+                    {
+                        let keep = pruner.keep_for_block(index)?;
+                        x = block.forward_pruned(&x, e0, kv, cos, sin, keep)?;
+                    }
+                }
+            }
+            Ok(x)
+        };
+
+        let x = match trunk {
+            // The pre-sc-18322 path, unchanged.
+            None => run_blocks(x)?,
+            Some(cache) => {
+                if cache.recomputes()? {
+                    let x_in = x.clone();
+                    let x = run_blocks(x)?;
+                    cache.capture(&x_in, &x)?;
+                    x
+                } else {
+                    cache.reuse(&x)?
+                }
+            }
+        };
+
+        let x = self.apply_head(&x, e)?; // [batch, L, out_dim·∏patch] f32
+        let op = x.shape()[2];
+
+        // Unpatchify each batch element back to [out_dim, F, H, W].
+        if batch == 1 {
+            let xb = x.reshape(&[l, op])?;
+            return Ok(vec![unpatchify(
+                &xb,
+                grid,
+                self.cfg.out_dim,
+                self.cfg.patch_size,
+            )?]);
+        }
+        let mut out = Vec::with_capacity(batch);
+        for part in split(&x, batch as i32, 0)? {
+            let xb = part.reshape(&[l, op])?;
+            out.push(unpatchify(
+                &xb,
+                grid,
+                self.cfg.out_dim,
+                self.cfg.patch_size,
+            )?);
+        }
+        Ok(out)
+    }
+
+    /// Drive **one** block's pruned forward directly (sc-18322).
+    ///
+    /// The pass-through exactness of a dropped token is only observable at a *block's* own output — by
+    /// the time the stack finishes, every token has been touched by some block's full-stream key/value
+    /// side. `#[cfg(test)]`, like the mechanism's other bypasses.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn block_forward_pruned_for_test(
+        &self,
+        index: usize,
+        x: &Array,
+        t: f32,
+        kv: &(Array, Array),
+        cos: &Array,
+        sin: &Array,
+        keep: &crate::token_pruning::TokenKeepSet,
+    ) -> Result<Array> {
+        let (_, e0) = self.time_embed(t)?;
+        self.blocks[index].forward_pruned(x, &e0, kv, cos, sin, keep)
+    }
+
+    /// One block's **exact** forward at the same modulation `block_forward_pruned_for_test` uses — the
+    /// control the pruning full-key assertion compares against.
+    #[cfg(test)]
+    pub(crate) fn block_forward_for_test(
+        &self,
+        index: usize,
+        x: &Array,
+        t: f32,
+        kv: &(Array, Array),
+        cos: &Array,
+        sin: &Array,
+    ) -> Result<Array> {
+        let (_, e0) = self.time_embed(t)?;
+        self.blocks[index].forward(x, &e0, kv, cos, sin)
+    }
+
+    /// One block's pruned forward under a **per-token** time modulation, to reach the guard that refuses
+    /// it. `t_tokens` is `[1, L]`, the TI2V mask-blend shape.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn block_forward_pruned_per_token_for_test(
+        &self,
+        index: usize,
+        x: &Array,
+        t_tokens: &Array,
+        kv: &(Array, Array),
+        cos: &Array,
+        sin: &Array,
+        keep: &crate::token_pruning::TokenKeepSet,
+    ) -> Result<Array> {
+        let (_, e0) = self.time_embed_tokens(t_tokens)?;
+        self.blocks[index].forward_pruned(x, &e0, kv, cos, sin, keep)
+    }
+
+    /// **The pre-sc-18322 cached forward, copied verbatim, as an independent test control.**
+    ///
+    /// A byte-identity claim needs a reference the production code cannot influence. Comparing
+    /// [`forward_cached`](Self::forward_cached) against
+    /// [`forward_cached_approx`](Self::forward_cached_approx)`(.., None, None)` cannot do that — the
+    /// former is a one-line delegation to the latter, so both sides run the same instructions and the
+    /// comparison holds no matter what either does. This is the honest control: the block loop, the
+    /// block body and the self-attention body as they stood at `2a42ab64c`, transcribed, calling **none**
+    /// of the sc-18322 code paths.
+    ///
+    /// Test-side duplication is the point — production keeps its single path, and this copy diverging
+    /// from it is exactly what the comparison is for. It is `#[cfg(test)]`, so it costs a production
+    /// build nothing.
+    #[cfg(test)]
+    pub(crate) fn forward_cached_pre_sc18322_control(
+        &self,
+        latent: &Array,
+        t: f32,
+        cross_kv: &[(Array, Array)],
+        cos: &Array,
+        sin: &Array,
+        batch: usize,
+    ) -> Result<Vec<Array>> {
+        let (e, e0) = self.time_embed(t)?;
+        let (tokens, grid) = patchify(latent, self.cfg.patch_size)?;
+        let l = (grid.0 * grid.1 * grid.2) as i32;
+        let dim = self.cfg.dim as i32;
+        let x1 = bf16(&self.patch_embedding.forward(&tokens)?)?.reshape(&[1, l, dim])?;
         let mut x = if batch > 1 {
             broadcast_to(&x1, &[batch as i32, l, dim])?
         } else {
@@ -1052,13 +1857,11 @@ impl WanTransformer {
         };
 
         for (block, kv) in self.blocks.iter().zip(cross_kv.iter()) {
-            x = block.forward(&x, e0, kv, cos, sin)?;
+            x = control_block_forward(block, &x, &e0, kv, cos, sin)?;
         }
 
-        let x = self.apply_head(&x, e)?; // [batch, L, out_dim·∏patch] f32
+        let x = self.apply_head(&x, &e)?;
         let op = x.shape()[2];
-
-        // Unpatchify each batch element back to [out_dim, F, H, W].
         if batch == 1 {
             let xb = x.reshape(&[l, op])?;
             return Ok(vec![unpatchify(
@@ -1090,8 +1893,28 @@ impl WanTransformer {
         sin: &Array,
         batch: usize,
     ) -> Result<Vec<Array>> {
+        self.forward_cached_approx(latent, t, cross_kv, cos, sin, batch, None, None)
+    }
+
+    /// [`forward_cached`](Self::forward_cached) carrying the sc-18322 **denoise feature cache**.
+    ///
+    /// `trunk: None` is exactly [`forward_cached`](Self::forward_cached) — that is how the byte-identity
+    /// of the off path is guaranteed rather than asserted: there is one body, and the off path is the
+    /// arm of it that existed before. See [`crate::feature_cache`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_cached_approx(
+        &self,
+        latent: &Array,
+        t: f32,
+        cross_kv: &[(Array, Array)],
+        cos: &Array,
+        sin: &Array,
+        batch: usize,
+        trunk: Option<&mut crate::feature_cache::TrunkCache>,
+        prune: Option<&crate::token_pruning::TokenPruner>,
+    ) -> Result<Vec<Array>> {
         let (e, e0) = self.time_embed(t)?;
-        self.forward_with_modulation(latent, &e, &e0, cross_kv, cos, sin, batch)
+        self.forward_with_modulation(latent, &e, &e0, cross_kv, cos, sin, batch, trunk, prune)
     }
 
     /// Full DiT forward for a single latent (B=1). `latent`: `[C, F, H, W]` (f32). `t`: integer-valued
@@ -1216,7 +2039,12 @@ impl WanTransformer {
         batch: usize,
     ) -> Result<Vec<Array>> {
         let (e, e0) = self.time_embed_tokens(t_tokens)?;
-        self.forward_with_modulation(latent, &e, &e0, cross_kv, cos, sin, batch)
+        // The per-token TI2V mask-blend route is deliberately NOT wired for the sc-18322 feature cache
+        // (`None`): its post-step re-blend mixes the conditioning latent back into the trajectory every
+        // step, so a residual captured under one blend state is not the same quantity a later step
+        // needs. `Wan::generate` refuses a non-exact plan on that route by name rather than silently
+        // running it exactly. See `crate::feature_cache`.
+        self.forward_with_modulation(latent, &e, &e0, cross_kv, cos, sin, batch, None, None)
     }
 
     /// B=1 per-token convenience wrapper (builds the caches on the fly + runs [`Self::forward_tokens_cached`]
@@ -1238,4 +2066,128 @@ impl WanTransformer {
             Error::Msg("wan: forward_tokens_cached produced no output for batch=1".into())
         })
     }
+}
+
+/// **`Block::forward` as it stood at `2a42ab64c`, transcribed verbatim** — the test control for
+/// sc-18322's byte-identity claim. See
+/// [`WanTransformer::forward_cached_pre_sc18322_control`] for why a transcription rather than a call.
+///
+/// The only edit from the original is `self` becoming the `block` parameter and the self-attention call
+/// going to [`control_self_attn_forward`] instead of `SelfAttention::forward` (which is now a
+/// delegation). Nothing else may change here: if production's block body legitimately changes, this
+/// copy must be updated in the same commit, and the failing comparison is the prompt to do it.
+#[cfg(test)]
+fn control_block_forward(
+    block: &Block,
+    x: &Array,
+    e: &Array,
+    kv: &(Array, Array),
+    cos: &Array,
+    sin: &Array,
+) -> Result<Array> {
+    let dim = block.self_attn.num_heads as i32 * block.self_attn.head_dim as i32;
+    let m = add(&block.modulation, e)?;
+    let l_e = m.shape()[1];
+    let p = split(&m, 6, 2)?;
+    let v = |i: usize| -> Result<Array> { Ok(p[i].reshape(&[1, l_e, dim])?) };
+    let (e0, e1, e2) = (v(0)?, v(1)?, v(2)?);
+    let (e3, e4, e5) = (v(3)?, v(4)?, v(5)?);
+
+    // Self-attention.
+    let x_mod = modulate(&ln(x, block.eps)?, &e1, &e0)?;
+    let y = control_self_attn_forward(&block.self_attn, &x_mod, cos, sin)?;
+    let x = gated(x, &y, &e2)?;
+
+    // Cross-attention (affine LayerNorm on context-side query, no modulation).
+    let x_cross = layer_norm(&x, Some(&block.norm3_w), Some(&block.norm3_b), block.eps)?;
+    let x = add(&x, &block.cross_attn.forward(&x_cross, kv)?)?;
+
+    // Gated-GELU FFN (bf16 matmuls; the reference's `x.astype(w_dtype)`).
+    let x_mod = modulate(&ln(&x, block.eps)?, &e4, &e3)?;
+    let y = gelu_ffn(&block.ffn_fc1.forward(&bf16(&x_mod)?)?)?;
+    let y = block.ffn_fc2.forward(&y)?;
+    gated(&x, &y, &e5)
+}
+
+/// **`SelfAttention::forward` as it stood at `2a42ab64c`, transcribed verbatim** — note the single
+/// `xw` cast, which is the property MAJOR 1's fix restores on the production path.
+#[cfg(test)]
+fn control_self_attn_forward(
+    attn: &SelfAttention,
+    x_mod: &Array,
+    cos: &Array,
+    sin: &Array,
+) -> Result<Array> {
+    let xw = bf16(x_mod)?;
+    let (n, d) = (attn.num_heads as i32, attn.head_dim as i32);
+    let b = x_mod.shape()[0];
+    let s = x_mod.shape()[1];
+
+    let q = rms_norm(&attn.q.forward(&xw)?, &attn.norm_q, attn.eps)?;
+    let k = rms_norm(&attn.k.forward(&xw)?, &attn.norm_k, attn.eps)?;
+    let q = bf16(&crate::rope::rope_apply(
+        &f32(&q.reshape(&[b, s, n, d])?)?,
+        cos,
+        sin,
+    )?)?
+    .transpose_axes(&[0, 2, 1, 3])?;
+    let k = bf16(&crate::rope::rope_apply(
+        &f32(&k.reshape(&[b, s, n, d])?)?,
+        cos,
+        sin,
+    )?)?
+    .transpose_axes(&[0, 2, 1, 3])?;
+    let v = attn
+        .v
+        .forward(&xw)?
+        .reshape(&[b, s, n, d])?
+        .transpose_axes(&[0, 2, 1, 3])?;
+
+    let out = sdpa_maybe_checkpoint(&q, &k, &v, attn.scale, attn.ckpt_sdpa, attn.attn_budget)?;
+    let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, n * d])?;
+    attn.o.forward(&out)
+}
+
+/// The bf16 cast selection [`SelfAttention::forward_split`] performs on its two input streams
+/// (sc-18322).
+///
+/// Its whole reason to exist as a named function is that it is the **only** observable of MAJOR 1's
+/// regression: casting the same tensor twice produces equal arrays, so no value comparison can see it —
+/// only object identity can, and only if a test can call exactly what production calls. Extracting it
+/// here is what makes `the_unpruned_self_attention_casts_its_input_once` a real test rather than a
+/// restatement of the condition.
+///
+/// When the two streams are the same tensor — the un-pruned path — the cast runs once and the handle is
+/// shared, reproducing the pre-sc-18322 body's single `xw`. `Array::clone` is a refcount bump on the
+/// same `mlx_array`, not a buffer copy. A pruned caller can never hit the shared branch, because its
+/// query stream is a freshly gathered tensor.
+pub(crate) fn split_attention_casts(
+    x_q: &Array,
+    x_kv: &Array,
+) -> Result<(Array, Array, AttentionCasts)> {
+    let xq = bf16(x_q)?;
+    if std::ptr::eq(x_q, x_kv) {
+        // `Array::clone` copies the handle and shares the underlying array, so this performs no second
+        // cast and allocates no second transient.
+        let xkv = xq.clone();
+        return Ok((xq, xkv, AttentionCasts::Shared));
+    }
+    let xkv = bf16(x_kv)?;
+    Ok((xq, xkv, AttentionCasts::Separate))
+}
+
+/// How many bf16 casts [`split_attention_casts`] performed — the **outcome**, returned rather than
+/// re-derivable, because that is the only way a test can observe MAJOR 1's regression.
+///
+/// Handle identity cannot serve: mlx-rs's `Array::clone` mints a fresh `mlx_array` around the same
+/// underlying array, so a shared cast and a duplicate cast are indistinguishable by pointer. Values
+/// cannot serve either — a duplicate cast of the same tensor is equal to the original. Returning the
+/// decision is what makes "the un-pruned path casts once" an assertion about the code that runs rather
+/// than a restatement of its condition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AttentionCasts {
+    /// One cast, shared by the query and key/value sides — the un-pruned path.
+    Shared,
+    /// One cast per side — the pruned path, whose query stream is a distinct gathered tensor.
+    Separate,
 }

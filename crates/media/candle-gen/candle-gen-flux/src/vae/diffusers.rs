@@ -649,6 +649,14 @@ impl AutoEncoderKL {
         (z - self.shift_factor)? * self.scale_factor
     }
 
+    /// Deterministic posterior-mean encode for structural control hints.
+    pub fn encode_mean(&self, xs: &Tensor) -> Result<Tensor> {
+        let mean = xs
+            .apply(&self.encoder)?
+            .apply(&DiagonalGaussian::new(false))?;
+        (mean - self.shift_factor)? * self.scale_factor
+    }
+
     /// Decode latent to image
     /// xs: (B, latent_channels, H/8, W/8)
     /// Returns: (B, 3, H, W) RGB image, range [-1, 1]

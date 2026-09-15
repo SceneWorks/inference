@@ -26,7 +26,7 @@
 //!
 //! Run:
 //!   ~/.dwpose-spike/venv/bin/python tools/dump_face_align_golden.py
-//!   cargo test -p mlx-gen-face --release --test align_parity -- --ignored --nocapture
+//!   cargo test -p mlx-gen-face --release --test integration align_parity:: -- --ignored --nocapture
 
 use mlx_gen::weights::Weights;
 use mlx_gen_face::{align, norm_crop, to_arcface_input, ArcFace, Scrfd};

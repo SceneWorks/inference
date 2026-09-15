@@ -18,14 +18,24 @@
 //! stage-by-stage against goldens (see `tools/dump_sdxl_golden.py`).
 
 pub mod adapters;
+pub(crate) mod block_stream;
 pub mod config;
 pub mod convert;
 pub mod inpaint;
 pub mod ip_adapter;
 pub mod ldm;
 pub mod loader;
+// Long-prompt chunk-and-concatenate for the CLIP encoders (sc-20528) — the A1111/compel "long
+// prompt weighting" shape, ported from `candle-gen-sdxl/src/long_prompt.rs` so the two lanes
+// condition on the same tokens. Before it this lane silently truncated at 77 while candle saw the
+// whole prompt. Shared by the txt2img `model` path and the `training` caption/preview encoders so
+// they cannot drift; `ChunkedTokens` is re-exported below because it crosses `pipeline`'s surface.
+mod long_prompt;
+pub mod memory_strategy;
 pub mod model;
 pub mod pipeline;
+pub mod plan;
+pub mod preview;
 pub mod quant;
 pub mod sampler;
 pub mod text_encoder;
@@ -49,25 +59,41 @@ pub use ip_adapter::{
 pub use loader::{
     load_controlnet, load_ip_adapter, load_text_encoder_1, load_text_encoder_1_dtype,
     load_text_encoder_2, load_text_encoder_2_dtype, load_tokenizer, load_unet, load_unet_dtype,
-    load_unet_kolors_dtype, load_unet_with_config, load_vae,
+    load_unet_kolors_dtype, load_unet_with_config, load_vae, resolve_unet_weight_file,
+    resolve_vae_weight_file,
 };
+pub use long_prompt::ChunkedTokens;
 pub use model::{
-    descriptor, load, load_from_ldm_file, Sdxl, MODEL_ID, PID_BACKBONE, SIZE_MULTIPLE,
+    descriptor, load, load_concrete, load_from_ldm_file, snapshot_component_footprint,
+    DecodeQualitySample, Sdxl, LDM_TOKENIZER_COMPONENT, MODEL_ID, PID_BACKBONE, SIZE_MULTIPLE,
 };
 pub use pipeline::{
-    decode_image, decoded_to_image, denoise, denoise_control, denoise_curated, denoise_inpaint,
-    denoise_ip, denoise_ip_control, denoise_ip_multi_control, denoise_multi_control,
-    encode_conditioning, encode_init_latents, preprocess_control_image, preprocess_init_image,
-    seeded_prior, text_time_ids, ControlContext, Denoiser,
+    decode_image, decode_image_tiled, decoded_to_image, denoise, denoise_cfgpp,
+    denoise_cfgpp_with_preview, denoise_control, denoise_control_with_preview, denoise_curated,
+    denoise_curated_with_preview, denoise_inpaint, denoise_inpaint_with_preview, denoise_ip,
+    denoise_ip_control, denoise_ip_control_with_preview, denoise_ip_multi_control,
+    denoise_ip_multi_control_with_preview, denoise_ip_with_preview, denoise_multi_control,
+    denoise_multi_control_with_preview, denoise_with_preview, encode_conditioning,
+    encode_conditioning_windows, encode_init_latents, preprocess_control_image,
+    preprocess_init_image, seeded_prior, text_time_ids, ControlContext, Denoiser,
 };
+pub use plan::{SdxlBlockWindow, SdxlForwardPlan};
 pub use sampler::EulerSampler;
 pub use text_encoder::{ClipOutput, ClipTextEncoder};
 pub use tokenizer::{ClipBpeTokenizer, PAD_ID};
 pub use training::family::{train_family, SdxlFamilyHooks, TrainTimestep};
 pub use training::{load_trainer, SdxlTrainer};
-pub use unet::{ControlNet, ControlResiduals, UNet2DConditionModel};
-pub use vae::Autoencoder;
+pub use unet::{ControlNet, ControlResiduals, Transformer2D, UNet2DConditionModel};
+pub use vae::{Autoencoder, SdxlLatentDecoder};
 pub use vision_encoder::{ClipVisionEncoder, VisionConfig};
+
+/// Shared-optimization toggles whose production call sites this provider can actually execute.
+/// Availability never substitutes for the request-local `Applied` receipt required by P6.
+pub const BENCHMARK_TOGGLE_CAPABILITIES: &[&str] = &[
+    mlx_gen::diagnostics::RETAINED_COMPILATION,
+    mlx_gen::diagnostics::GEOMETRY_AWARE_DECODE,
+    mlx_gen::diagnostics::EXACT_EPILOGUES,
+];
 
 // sc-2963 compiled-glue toggle: when on, the UNet's remaining fusable elementwise glue — the **SiLU**
 // activations (`x·sigmoid(x)`: ResNet GN→SiLU, the time-embedding MLP, the output head) — runs through
@@ -80,9 +106,47 @@ pub use vision_encoder::{ClipVisionEncoder, VisionConfig};
 // denoise loop** ([`pipeline::denoise`]); **off by default**.
 //
 // The toggle + its RAII [`CompileGlueGuard`] are hoisted into core (F-104); re-export core's so the
-// process-global is shared with the FLUX family rather than each crate hand-rolling its own `AtomicBool`.
+// request/thread-local setting is shared with the FLUX family.
 pub(crate) use mlx_gen::nn::compile_glue;
 pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
+
+const SITE_SILU_GLUE: &str = "sdxl::silu_glue";
+
+fn silu_glue_impl(
+    x: &mlx_rs::Array,
+) -> std::result::Result<mlx_rs::Array, mlx_rs::error::Exception> {
+    mlx_rs::ops::multiply(x, &mlx_rs::ops::sigmoid(x)?)
+}
+
+thread_local! {
+    static RETAINED_SILU_GLUE: std::cell::RefCell<Option<mlx_gen::nn::RetainedUnary>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn retained_silu_glue(
+    x: &mlx_rs::Array,
+) -> std::result::Result<mlx_rs::Array, mlx_rs::error::Exception> {
+    mlx_gen::nn::prepare_retained_compilation_thread();
+    RETAINED_SILU_GLUE.with(|slot| {
+        slot.borrow_mut()
+            .get_or_insert_with(|| {
+                mlx_gen::nn::RetainedUnary::new(mlx_rs::transforms::compile::compile_retained(
+                    silu_glue_impl,
+                    true,
+                ))
+            })
+            .call(SITE_SILU_GLUE, x)
+    })
+}
+
+/// Exercise this crate's production retained handle once for the release memory audit.
+#[doc(hidden)]
+pub fn exercise_retained_compile_inventory(input: &mlx_rs::Array) -> mlx_gen::Result<()> {
+    let output = retained_silu_glue(input)?;
+    output.eval()?;
+    drop(output);
+    Ok(())
+}
 
 /// Add the MLX SDXL generator and trainer to an explicit media registry builder.
 pub fn register_providers(
@@ -90,6 +154,43 @@ pub fn register_providers(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::REGISTRATION)
+        .register_checkpoint_adapter(mlx_gen::gen_core::CheckpointAdapterRegistration {
+            backend_bindings: &[
+                mlx_gen::gen_core::CheckpointBackendBindingRegistration {
+                    backend: mlx_gen::gen_core::CheckpointBackend::Mlx,
+                    source: mlx_gen::gen_core::ImportedModelSource::FusedCheckpoint,
+                    operation: mlx_gen::gen_core::ImportedModelOperation::Generate,
+                    provider_id: MODEL_ID,
+                    required_components: Some(&[LDM_TOKENIZER_COMPONENT]),
+                    inherit_adapters: true,
+                },
+                mlx_gen::gen_core::CheckpointBackendBindingRegistration {
+                    backend: mlx_gen::gen_core::CheckpointBackend::Mlx,
+                    source: mlx_gen::gen_core::ImportedModelSource::FusedCheckpoint,
+                    operation: mlx_gen::gen_core::ImportedModelOperation::Edit,
+                    provider_id: MODEL_ID,
+                    required_components: Some(&[LDM_TOKENIZER_COMPONENT]),
+                    inherit_adapters: true,
+                },
+            ],
+            ..mlx_gen::gen_core::SDXL_CHECKPOINT_ADAPTER
+        })
+        .register_activation_memory(model::ACTIVATION_MEMORY_REGISTRATION)
+        .register_memory_strategy(model::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: MODEL_ID,
+            contract: |spec| memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec),
+        })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: MODEL_ID,
+                contract: |surface| {
+                    memory_strategy::weights_free_memory_surface_contract(MODEL_ID, surface)
+                },
+            },
+        )
+        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION)
         .register_trainer(training::TRAINER_REGISTRATION)
 }
 
@@ -100,6 +201,57 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::Provi
 
 #[cfg(test)]
 mod explicit_registry_tests {
+    /// One line per selector: the whole ladder's per-surface disposition, in rung order 0..4.
+    /// `I` = Implemented, `S` = StructurallyNotApplicable, `-` = Missing.
+    fn ladder_lines(provider_id: &str) -> Vec<String> {
+        use mlx_gen::gen_core::{MemoryStrategy, MemoryStrategySupport};
+
+        let registry = super::provider_registry().unwrap();
+        registry
+            .memory_contract_surfaces()
+            .unwrap()
+            .iter()
+            .filter(|surface| surface.contract.provider_id == provider_id)
+            .map(|surface| {
+                let ladder: String = MemoryStrategy::ALL
+                    .iter()
+                    .map(
+                        |strategy| match surface.contract.capability(*strategy).unwrap().support {
+                            MemoryStrategySupport::Implemented => 'I',
+                            MemoryStrategySupport::StructurallyNotApplicable { .. } => 'S',
+                            MemoryStrategySupport::Missing => '-',
+                        },
+                    )
+                    .collect();
+                format!("{} {ladder}", surface.selector.id())
+            })
+            .collect()
+    }
+
+    /// sc-21510: rung 4 is tier-agnostic. The selector names an already-resolved artifact tier, so a
+    /// packed Q4/Q8 snapshot re-quantizes nothing and its blocks stay as lazy as BF16's. Every other
+    /// (surface, rung) disposition is unchanged.
+    #[test]
+    fn published_ladder_surface_is_pinned_per_selector() {
+        assert_eq!(
+            ladder_lines(super::MODEL_ID),
+            [
+                "bf16:resident:eager II---",
+                "bf16:resident:deferred II--I",
+                "bf16:sequential:eager II---",
+                "bf16:sequential:deferred II--I",
+                "q4:resident:eager II---",
+                "q4:resident:deferred II--I",
+                "q4:sequential:eager II---",
+                "q4:sequential:deferred II--I",
+                "q8:resident:eager II---",
+                "q8:resident:deferred II--I",
+                "q8:sequential:eager II---",
+                "q8:sequential:deferred II--I",
+            ]
+        );
+    }
+
     #[test]
     fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
@@ -115,20 +267,52 @@ mod explicit_registry_tests {
         assert_eq!(explicit_generators, ["sdxl"]);
         assert_eq!(explicit_trainers, ["sdxl"]);
     }
+
+    /// Weights-free behavioral oracle for the shared memory ladder (SC-15525).
+    ///
+    /// This is the check that makes the declaration non-vacuous without weights: for **every**
+    /// declared rung it builds the provider's own representative selection, drives the whole request
+    /// scope through it (`configure_request` → phases → `configure_decode` / `configure_attention` /
+    /// `materialize_transformer_window` → `finish`), proves the safety check is not blind to an
+    /// impossible budget, and — because this contract declares native/PiD decode routes — proves
+    /// each route's geometry is accepted on its own route and **rejected on the other**, with the
+    /// matching-route controls that keep the rejection non-vacuous.
+    #[test]
+    fn shared_ladder_registrations_pass_the_weights_free_behavior_oracle() {
+        let registry = super::provider_registry().unwrap();
+        for shape in [
+            mlx_gen::LoadShape::DeferredMaterialization,
+            mlx_gen::LoadShape::EagerMaterialization,
+        ] {
+            let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
+                .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+                .with_load_shape(shape);
+            gen_core_testkit::memory_strategy::memory_strategy_registry_conformance(
+                &registry, &spec,
+            );
+        }
+    }
 }
 
 /// SiLU `x·sigmoid(x)` — one fused kernel when the sc-2963 glue toggle is on, else the eager core
 /// [`mlx_gen::nn::silu`]. Bit-identical to eager in fp16 AND f32 (proven `max|Δ|=0`,
 /// `tests/compile_parity.rs`), so it is golden-safe on the precision-load-bearing fp16 UNet.
 pub(crate) fn silu_glue(x: &mlx_rs::Array) -> mlx_gen::Result<mlx_rs::Array> {
-    use mlx_rs::ops::{multiply, sigmoid};
     if !compile_glue() {
+        mlx_gen::diagnostics::record_fallback(SITE_SILU_GLUE, "compiled_glue_disabled");
         return mlx_gen::nn::silu(x);
     }
-    let f = |x_: &mlx_rs::Array| -> std::result::Result<mlx_rs::Array, mlx_rs::error::Exception> {
-        multiply(x_, &sigmoid(x_)?)
-    };
-    Ok(mlx_rs::transforms::compile::compile(f, true)(x)?)
+    if mlx_gen::nn::retained_compilation_requested() {
+        Ok(retained_silu_glue(x)?)
+    } else {
+        mlx_gen::diagnostics::record_compile(
+            SITE_SILU_GLUE,
+            mlx_gen::diagnostics::CompileDisposition::OneShot,
+        );
+        Ok(mlx_rs::transforms::compile::compile(silu_glue_impl, true)(
+            x,
+        )?)
+    }
 }
 
 #[cfg(test)]
@@ -179,5 +363,85 @@ mod sc2963 {
                 "SDXL compiled SiLU diverged from eager in {dt:?}: rel|Δ|={rel:e} exceeds {tol:e}"
             );
         }
+    }
+
+    #[test]
+    fn retained_silu_reuses_across_requests_and_baseline_stays_oneshot() {
+        use mlx_gen::diagnostics::{
+            self, CompileDisposition, DiagnosticCounter, ToggleDisposition, RETAINED_COMPILATION,
+        };
+
+        super::RETAINED_SILU_GLUE.with(|slot| *slot.borrow_mut() = None);
+        let x = random::normal::<f32>(&[1, 8, 8, 16], None, None, Some(&random::key(1).unwrap()))
+            .unwrap()
+            .as_dtype(Dtype::Float16)
+            .unwrap();
+        super::set_compile_glue(false);
+        let eager = super::silu_glue(&x).unwrap();
+
+        super::set_compile_glue(true);
+        let scope = diagnostics::begin_request_with_toggles(
+            "sdxl-retained-silu",
+            "sdxl",
+            &[RETAINED_COMPILATION],
+        )
+        .unwrap();
+        for _ in 0..2 {
+            assert_eq!(max_abs(&super::silu_glue(&x).unwrap(), &eager), 0.0);
+        }
+        let report = scope.finish();
+        for disposition in [
+            CompileDisposition::RetainedMiss,
+            CompileDisposition::RetainedHit,
+        ] {
+            assert!(report.counters.iter().any(|counter| matches!(
+                counter,
+                DiagnosticCounter::Compile {
+                    site: super::SITE_SILU_GLUE,
+                    disposition: recorded,
+                    count: 1,
+                } if *recorded == disposition
+            )));
+        }
+        assert!(report.counters.iter().any(|counter| matches!(
+            counter,
+            DiagnosticCounter::Toggle {
+                toggle: RETAINED_COMPILATION,
+                disposition: ToggleDisposition::Applied,
+                count: 2,
+            }
+        )));
+
+        let next = diagnostics::begin_request_with_toggles(
+            "sdxl-retained-silu-next",
+            "sdxl",
+            &[RETAINED_COMPILATION],
+        )
+        .unwrap();
+        assert_eq!(max_abs(&super::silu_glue(&x).unwrap(), &eager), 0.0);
+        let next = next.finish();
+        assert!(next.counters.iter().any(|counter| matches!(
+            counter,
+            DiagnosticCounter::Compile {
+                site: super::SITE_SILU_GLUE,
+                disposition: CompileDisposition::RetainedHit,
+                count: 1,
+            }
+        )));
+
+        let baseline = diagnostics::begin_request("sdxl-oneshot-silu", "sdxl").unwrap();
+        assert_eq!(max_abs(&super::silu_glue(&x).unwrap(), &eager), 0.0);
+        let baseline = baseline.finish();
+        assert!(baseline.counters.iter().any(|counter| matches!(
+            counter,
+            DiagnosticCounter::Compile {
+                site: super::SITE_SILU_GLUE,
+                disposition: CompileDisposition::OneShot,
+                count: 1,
+            }
+        )));
+
+        super::set_compile_glue(false);
+        super::RETAINED_SILU_GLUE.with(|slot| *slot.borrow_mut() = None);
     }
 }

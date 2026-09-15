@@ -9,7 +9,7 @@
 //!
 //! `#[ignore]`d — needs the real `Tongyi-MAI/Z-Image-Turbo` snapshot (env `ZIMAGE_SNAPSHOT` or the HF
 //! cache):
-//!   cargo test -p mlx-gen-z-image --test unified_sampler_smoke -- --ignored --nocapture
+//!   cargo test -p mlx-gen-z-image --test integration unified_sampler_smoke:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 

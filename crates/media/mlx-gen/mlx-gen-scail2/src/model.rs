@@ -441,7 +441,7 @@ impl Block {
         let x = add(&x, &to_f32(&cx)?)?;
         // feed-forward (the `[L, ffn_dim]` intermediate is the single biggest transient → chunk it).
         let x_mod = modulate(&ln(&x, self.eps)?, &p[4], &p[3])?.as_dtype(cdt)?;
-        let y = map_seq_chunks(&x_mod, mem.ffn_seq_chunk, |c, _start| {
+        let y = map_seq_chunks(&x_mod, mem.ffn_chunk_rows(), |c, _start| {
             let h = gelu_tanh(&self.ffn0.forward(c)?)?;
             self.ffn2.forward(&h)
         })?;
@@ -782,13 +782,15 @@ impl Scail2Dit {
         let img_ctx = self.embed_img(inp.clip_fea)?;
 
         // --- transformer blocks (f32 activations) ---
-        // sc-5681: with `mem.eval_per_block`, force-evaluate each block's output before the next so
-        // the peak is ~one block's activations rather than the whole 40-block lazy graph (the
-        // dominant memory lever; bit-identical — `eval` only schedules materialization).
+        // sc-5681: on the configured evaluation cadence, force-evaluate a block's output before the
+        // next so the peak is ~that many blocks' activations rather than the whole 40-block lazy
+        // graph (the dominant memory lever; bit-identical — `eval` only schedules materialization).
+        // sc-18317 generalized the cadence from the retired `eval_per_block` bool; the decision lives
+        // in `DitMemoryConfig::evaluates_after_block` so it cannot drift per call site.
         let mut x = to_f32(&tokens)?;
-        for block in &self.blocks {
+        for (index, block) in self.blocks.iter().enumerate() {
             x = block.forward(&x, &e0, &text_ctx, &img_ctx, &cos, &sin, cdt, &self.mem)?;
-            if self.mem.eval_per_block {
+            if self.mem.evaluates_after_block(index) {
                 mlx_rs::transforms::eval([&x])?;
             }
         }

@@ -13,12 +13,12 @@
 //!
 //! Run (base transformer for the routing map):
 //!   IDEOGRAM4_MLX=~/.cache/ideogram4-mlx-convert \
-//!     cargo test -p mlx-gen-ideogram --test turbo turbo_host_map -- --ignored --nocapture
+//!     cargo test -p mlx-gen-ideogram --test integration turbo::turbo_host_map -- --ignored --nocapture
 //! Run (turbo render — the snapshot dir must contain `turbo_lora.safetensors`):
 //!   IDEOGRAM4_TURBO_MLX=~/.cache/ideogram4-mlx-turbo \
-//!     cargo test -p mlx-gen-ideogram --test turbo turbo_generates -- --ignored --nocapture
+//!     cargo test -p mlx-gen-ideogram --test integration turbo::turbo_generates -- --ignored --nocapture
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 
@@ -144,7 +144,8 @@ fn turbo_generates_single_dit_8step() {
     );
     assert!(max > min, "degenerate (constant) turbo image — no signal");
 
-    let out_path = std::env::temp_dir().join("ideogram4_turbo_8step.png");
+    let out_path =
+        std::env::temp_dir().join(format!("ideogram4_turbo_8step_{}.png", std::process::id()));
     image::RgbImage::from_raw(res, res, img.pixels.clone())
         .unwrap()
         .save(&out_path)

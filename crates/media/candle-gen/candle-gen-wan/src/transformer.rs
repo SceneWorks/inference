@@ -80,8 +80,9 @@ fn wan_self_attn_budget() -> usize {
 /// scores' native **bf16** instead of the f32 upcast — the candle CUDA softmax kernel max-stabilizes
 /// and accumulates the sum in f32 regardless (`SOFTMAX_OP(__nv_bfloat16, float, …)`), so only the
 /// `exp`/probs carry bf16 rounding, which halves the per-chunk transient. Off by default (the f32
-/// upcast is numerically exact — the chunk lever alone is byte-identical to the un-chunked pass);
-/// gated on only after a parity A/B confirms the bf16 path stays within tolerance. Read once.
+/// upcast is numerically exact, and the chunk lever alone perturbs only the f32 rounding order — close
+/// to, but not bit-identical to, the un-chunked pass; see SC-15943 and [`sdpa_budgeted`]); gated on only
+/// after a parity A/B confirms the bf16 path stays within tolerance. Read once.
 fn wan_self_attn_bf16_softmax() -> bool {
     use std::sync::OnceLock;
     static BF16: OnceLock<bool> = OnceLock::new();
@@ -108,9 +109,12 @@ fn wan_self_attn_bf16_softmax() -> bool {
 /// before the first denoise step — chunking caps each block's transient near the budget instead. The
 /// budget is Wan's own reduced [`WAN_SELF_ATTN_SCORES_BUDGET`] (sc-12894): small enough that the
 /// per-chunk f32 scores + probs transient fits the denoise peak under 24 GiB, still ≪ `i32::MAX`. Each
-/// query row's softmax is over all keys and independent of the others, so the chunked result equals the
-/// single pass; the chunking engages only on the over-budget denoise self-attention and stays a no-op
-/// single pass for the small cross-attention (S_kv = text tokens) and every in-budget size.
+/// query row's softmax is over all keys and independent of the others, so the chunked result is
+/// *mathematically* equal to the single pass — but **not bitwise** equal to it: narrowing the query axis
+/// changes the GEMM `M`, so the f32 accumulation order may change (SC-15943). The
+/// chunking engages only on the over-budget denoise self-attention and stays a no-op single pass — that
+/// one byte-identical by construction, being literally the same call — for the small cross-attention
+/// (S_kv = text tokens) and every in-budget size.
 fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
     let dtype = q.dtype();
     let bf16 = wan_self_attn_bf16_softmax();
@@ -161,6 +165,40 @@ struct Attention {
     eps: f64,
 }
 
+/// Request-scoped K/V heads for one block's cross-attention.  These depend only on the projected
+/// text context, never on the noisy latent or timestep, so the denoise loop must reuse them.
+pub(crate) struct PreparedBlockCrossKv {
+    key: Tensor,
+    value: Tensor,
+}
+
+/// Request-scoped cross-attention K/V heads for every base Wan block.
+pub(crate) struct PreparedWanCrossKv {
+    blocks: Vec<PreparedBlockCrossKv>,
+}
+
+#[cfg(test)]
+static CROSS_KV_PREPARATION_PAIRS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+static CROSS_KV_PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn lock_cross_kv_probe() -> std::sync::MutexGuard<'static, ()> {
+    candle_gen::lock_recover(&CROSS_KV_PROBE_LOCK)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_cross_kv_preparation_pairs() {
+    CROSS_KV_PREPARATION_PAIRS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn cross_kv_preparation_pairs() -> usize {
+    CROSS_KV_PREPARATION_PAIRS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Attention {
     /// Build this attention's projections + qk-norms from `src` — the dense (`WeightSrc::Dense`) and
     /// native-GGUF k-quant (`WeightSrc::Gguf`, sc-12735) paths share this ONE builder, so the resident-
@@ -182,6 +220,14 @@ impl Attention {
         })
     }
 
+    #[cfg(test)]
+    fn all_projections_packed(&self) -> bool {
+        self.to_q.is_packed()
+            && self.to_k.is_packed()
+            && self.to_v.is_packed()
+            && self.to_out.is_packed()
+    }
+
     /// Visit this attention's four adaptable projections (`{prefix}.{to_q,to_k,to_v,to_out.0}`) for the
     /// additive-adapter walk (sc-10094).
     fn visit_adaptable_mut(
@@ -196,37 +242,61 @@ impl Attention {
         Ok(())
     }
 
-    /// `hidden`: `[B, S, dim]`; `context`: cross-attn K/V source (= hidden for self-attn). RoPE is
-    /// applied only when `cos`/`sin` are given (self-attn).
+    /// Project a step-invariant cross-attention source into K/V heads once per request conditioning
+    /// payload.  The resulting tensors remain owned by the caller's request scope.
+    fn prepare_kv(&self, context: &Tensor) -> Result<PreparedBlockCrossKv> {
+        let (b, s_kv, _) = context.dims3()?;
+        let k = rms(&self.to_k.forward(context)?, &self.norm_k, self.eps)?;
+        let v = self.to_v.forward(context)?;
+        let to_heads = |t: &Tensor| -> Result<Tensor> {
+            t.reshape((b, s_kv, self.num_heads, self.head_dim))?
+                .transpose(1, 2)?
+                .contiguous()
+        };
+        Ok(PreparedBlockCrossKv {
+            key: to_heads(&k)?,
+            value: to_heads(&v)?,
+        })
+    }
+
+    /// `hidden`: `[B, S, dim]`; `kv`: preprojected K/V heads. RoPE is applied only when
+    /// `cos`/`sin` are given (self-attention).
+    fn forward_prepared(
+        &self,
+        hidden: &Tensor,
+        kv: &PreparedBlockCrossKv,
+        rope: Option<(&Tensor, &Tensor)>,
+    ) -> Result<Tensor> {
+        let (b, s, _) = hidden.dims3()?;
+        let q = rms(&self.to_q.forward(hidden)?, &self.norm_q, self.eps)?;
+        let to_heads = |t: &Tensor| -> Result<Tensor> {
+            t.reshape((b, s, self.num_heads, self.head_dim))?
+                .transpose(1, 2)?
+                .contiguous()
+        };
+        let mut q = to_heads(&q)?; // [B,H,S,d]
+        let mut k = kv.key.clone();
+        if let Some((cos, sin)) = rope {
+            q = apply_rope(&q, cos, sin)?;
+            k = apply_rope(&k, cos, sin)?;
+        }
+        let scale = (self.head_dim as f64).powf(-0.5);
+        let out = sdpa(&q, &k, &kv.value, scale)?; // [B,H,S,d]
+        let out = out
+            .transpose(1, 2)?
+            .reshape((b, s, self.num_heads * self.head_dim))?;
+        self.to_out.forward(&out)
+    }
+
+    /// Compatibility path for self-attention and one-off callers. Request render paths use
+    /// [`Self::prepare_kv`] outside the step loop instead.
     fn forward(
         &self,
         hidden: &Tensor,
         context: &Tensor,
         rope: Option<(&Tensor, &Tensor)>,
     ) -> Result<Tensor> {
-        let (b, s, _) = hidden.dims3()?;
-        let s_kv = context.dim(1)?;
-        let q = rms(&self.to_q.forward(hidden)?, &self.norm_q, self.eps)?;
-        let k = rms(&self.to_k.forward(context)?, &self.norm_k, self.eps)?;
-        let v = self.to_v.forward(context)?;
-        let to_heads = |t: &Tensor, len: usize| -> Result<Tensor> {
-            t.reshape((b, len, self.num_heads, self.head_dim))?
-                .transpose(1, 2)?
-                .contiguous()
-        };
-        let mut q = to_heads(&q, s)?; // [B,H,S,d]
-        let mut k = to_heads(&k, s_kv)?;
-        let v = to_heads(&v, s_kv)?;
-        if let Some((cos, sin)) = rope {
-            q = apply_rope(&q, cos, sin)?;
-            k = apply_rope(&k, cos, sin)?;
-        }
-        let scale = (self.head_dim as f64).powf(-0.5);
-        let out = sdpa(&q, &k, &v, scale)?; // [B,H,S,d]
-        let out = out
-            .transpose(1, 2)?
-            .reshape((b, s, self.num_heads * self.head_dim))?;
-        self.to_out.forward(&out)
+        self.forward_prepared(hidden, &self.prepare_kv(context)?, rope)
     }
 }
 
@@ -243,6 +313,11 @@ impl Ffn {
             proj: src.qlinear(cfg.dim, cfg.ffn_dim, "net.0.proj", true)?,
             out: src.qlinear(cfg.ffn_dim, cfg.dim, "net.2", true)?,
         })
+    }
+
+    #[cfg(test)]
+    fn all_projections_packed(&self) -> bool {
+        self.proj.is_packed() && self.out.is_packed()
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         self.out.forward(&self.proj.forward(x)?.gelu()?)
@@ -279,6 +354,13 @@ impl Block {
         Self::build(cfg, WeightSrc::dense(vb))
     }
 
+    #[cfg(test)]
+    pub(crate) fn all_projections_packed(&self) -> bool {
+        self.attn1.all_projections_packed()
+            && self.attn2.all_projections_packed()
+            && self.ffn.all_projections_packed()
+    }
+
     /// Build a block from `src` — the ONE builder the dense/MLX-packed path (`WeightSrc::Dense`) and the
     /// native-GGUF k-quant path (`WeightSrc::Gguf`, sc-12735) share, so the resident-QTensor DiT reads the
     /// identical block structure. The `scale_shift_table` / `norm2` / qk-norms are dense sidecars either
@@ -297,19 +379,39 @@ impl Block {
         })
     }
 
-    /// `hidden`: `[B,S,dim]` (bf16); `temb6`: `[B,6,dim]` (f32); `context`: `[B,S_ctx,dim]` (bf16).
-    pub(crate) fn forward(
+    pub(crate) fn prepare_cross_kv(&self, context: &Tensor) -> Result<PreparedBlockCrossKv> {
+        #[cfg(test)]
+        CROSS_KV_PREPARATION_PAIRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.attn2.prepare_kv(context)
+    }
+
+    /// `hidden`: `[B,S,dim]` (bf16); `temb6`: `[B,6,dim]` (f32); `cross_kv`: request-scoped
+    /// prepared text K/V for this block.
+    pub(crate) fn forward_prepared(
         &self,
         hidden: &Tensor,
         temb6: &Tensor,
-        context: &Tensor,
+        cross_kv: &PreparedBlockCrossKv,
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
         let dt = hidden.dtype();
         // mods: scale_shift_table[1,6,dim] + temb6[B,6,dim] → 6 × [B,1,dim] (f32).
-        let mods = self.scale_shift_table.broadcast_add(temb6)?;
-        let m = |i: usize| -> Result<Tensor> { mods.narrow(1, i, 1) };
+        let table = if temb6.rank() == 4 {
+            self.scale_shift_table.unsqueeze(1)?
+        } else {
+            self.scale_shift_table.clone()
+        };
+        let mods = table.broadcast_add(temb6)?;
+        let modulation_axis = if mods.rank() == 4 { 2 } else { 1 };
+        let m = |i: usize| -> Result<Tensor> {
+            let value = mods.narrow(modulation_axis, i, 1)?;
+            if modulation_axis == 2 {
+                value.squeeze(2)
+            } else {
+                Ok(value)
+            }
+        };
         let (shift_msa, scale_msa, gate_msa) = (m(0)?, m(1)?, m(2)?);
         let (c_shift, c_scale, c_gate) = (m(3)?, m(4)?, m(5)?);
 
@@ -327,7 +429,7 @@ impl Block {
             .broadcast_mul(&self.norm2_w)?
             .broadcast_add(&self.norm2_b)?
             .to_dtype(dt)?;
-        let a = self.attn2.forward(&n, context, None)?;
+        let a = self.attn2.forward_prepared(&n, cross_kv, None)?;
         let hf = (hf + a.to_dtype(DType::F32)?)?;
 
         // 3. feed-forward
@@ -373,6 +475,21 @@ pub(crate) fn timestep_sinusoid(t: f64, freq_dim: usize, b: usize, dev: &Device)
     } else {
         Ok(one.broadcast_as((b, freq_dim))?.contiguous()?)
     }
+}
+
+/// Vectorized timestep embedding for TI2V mask blending. `timesteps` is `[B,L]`; the result is
+/// `[B,L,freq_dim]`, so pinned tokens can carry timestep zero independently of generated tokens.
+fn timestep_sinusoid_tokens(timesteps: &Tensor, freq_dim: usize, dev: &Device) -> Result<Tensor> {
+    let half = freq_dim / 2;
+    let freqs = (0..half)
+        .map(|i| (-(10000f64.ln()) * i as f64 / half as f64).exp() as f32)
+        .collect::<Vec<_>>();
+    let freqs = Tensor::from_vec(freqs, (1, 1, half), dev)?;
+    let angles = timesteps
+        .to_dtype(DType::F32)?
+        .unsqueeze(2)?
+        .broadcast_mul(&freqs)?;
+    Tensor::cat(&[&angles.cos()?, &angles.sin()?], 2)
 }
 
 pub struct WanTransformer {
@@ -491,6 +608,19 @@ impl WanTransformer {
         self.text_l2.forward(&self.text_l1.forward(&x)?.gelu()?)
     }
 
+    /// Prepare all step-invariant text cross-attention K/V heads for one projected conditioning
+    /// payload. The returned cache is intentionally request-scoped: callers create it after the DiT
+    /// loads and retain it only for the matching denoise branch.
+    pub(crate) fn prepare_cross_kv(&self, context: &Tensor) -> Result<PreparedWanCrossKv> {
+        Ok(PreparedWanCrossKv {
+            blocks: self
+                .blocks
+                .iter()
+                .map(|block| block.prepare_cross_kv(context))
+                .collect::<Result<Vec<_>>>()?,
+        })
+    }
+
     /// One DiT forward: `latents [B,in_c,F,Hl,Wl]`, projected `context [B,S,dim]`, scalar `t`,
     /// RoPE `cos`/`sin [L,64]` → predicted velocity `[B,out_c,F,Hl,Wl]`.
     ///
@@ -507,7 +637,22 @@ impl WanTransformer {
         sin: &Tensor,
     ) -> Result<Tensor> {
         let (tokens, grid) = self.patch_embed_tokens(latents)?;
-        let out = self.forward_packed(&tokens, t, context, cos, sin)?;
+        let cross_kv = self.prepare_cross_kv(context)?;
+        let out = self.forward_packed_prepared(&tokens, t, &cross_kv, cos, sin)?;
+        self.unpatchify_tokens(&out, grid)
+    }
+
+    /// Denoise one scalar-timestep latent against request-scoped prepared text K/V.
+    pub(crate) fn forward_prepared(
+        &self,
+        latents: &Tensor,
+        t: f64,
+        cross_kv: &PreparedWanCrossKv,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<Tensor> {
+        let (tokens, grid) = self.patch_embed_tokens(latents)?;
+        let out = self.forward_packed_prepared(&tokens, t, cross_kv, cos, sin)?;
         self.unpatchify_tokens(&out, grid)
     }
 
@@ -554,7 +699,27 @@ impl WanTransformer {
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
+        let cross_kv = self.prepare_cross_kv(context)?;
+        self.forward_packed_prepared(tokens, t, &cross_kv, cos, sin)
+    }
+
+    /// Run the block stack + head with preprojected request-scoped text K/V.
+    pub(crate) fn forward_packed_prepared(
+        &self,
+        tokens: &Tensor,
+        t: f64,
+        cross_kv: &PreparedWanCrossKv,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<Tensor> {
         let (b, _l, _dim) = tokens.dims3()?;
+        if cross_kv.blocks.len() != self.blocks.len() {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "wan prepared cross K/V has {} blocks; transformer has {}",
+                cross_kv.blocks.len(),
+                self.blocks.len()
+            )));
+        }
         // Time embedding → temb [B,dim], and the per-block 6-vector temb6 [B,6,dim] (f32).
         let sinus =
             timestep_sinusoid(t, self.cfg.freq_dim, b, &self.device)?.to_dtype(self.dtype)?;
@@ -568,8 +733,8 @@ impl WanTransformer {
             .to_dtype(DType::F32)?;
 
         let mut hidden = tokens.clone();
-        for blk in &self.blocks {
-            hidden = blk.forward(&hidden, &temb6, context, cos, sin)?;
+        for (blk, kv) in self.blocks.iter().zip(&cross_kv.blocks) {
+            hidden = blk.forward_prepared(&hidden, &temb6, kv, cos, sin)?;
             // sc-12768: on the sequential-offload path, drain the stream after each block so the deep
             // async denoise pipeline cannot race candle's churned cudarc caching pool (the freed TE /
             // inactive-expert pages the next expert's weights + full-res activations reuse) — the
@@ -594,6 +759,78 @@ impl WanTransformer {
         self.proj_out.forward(&normed) // [B,L,out_c*patch]
     }
 
+    /// TI2V mask-blend forward with per-token timesteps `[B,L]`. The scalar T2V entry point above is
+    /// intentionally unchanged; this only generalizes AdaLN/head modulation to the token axis.
+    pub fn forward_tokens(
+        &self,
+        latents: &Tensor,
+        timestep_tokens: &Tensor,
+        context: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<Tensor> {
+        let cross_kv = self.prepare_cross_kv(context)?;
+        self.forward_tokens_prepared(latents, timestep_tokens, &cross_kv, cos, sin)
+    }
+
+    /// TI2V mask-blend forward with request-scoped prepared text K/V.
+    pub(crate) fn forward_tokens_prepared(
+        &self,
+        latents: &Tensor,
+        timestep_tokens: &Tensor,
+        cross_kv: &PreparedWanCrossKv,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<Tensor> {
+        let (tokens, grid) = self.patch_embed_tokens(latents)?;
+        let (b, l, _dim) = tokens.dims3()?;
+        if cross_kv.blocks.len() != self.blocks.len() {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "wan prepared cross K/V has {} blocks; transformer has {}",
+                cross_kv.blocks.len(),
+                self.blocks.len()
+            )));
+        }
+        let (tb, tl) = timestep_tokens.dims2()?;
+        if (tb, tl) != (b, l) {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "wan TI2V timestep tokens must be [{b},{l}] (got [{tb},{tl}])"
+            )));
+        }
+        let sinus = timestep_sinusoid_tokens(timestep_tokens, self.cfg.freq_dim, &self.device)?
+            .to_dtype(self.dtype)?;
+        let temb = self
+            .time_l2
+            .forward(&self.time_l1.forward(&sinus)?.silu()?)?; // [B,L,dim]
+        let temb6 = self
+            .time_proj
+            .forward(&temb.silu()?)?
+            .reshape((b, l, 6, self.cfg.dim))?
+            .to_dtype(DType::F32)?;
+
+        let mut hidden = tokens;
+        for (block, kv) in self.blocks.iter().zip(&cross_kv.blocks) {
+            hidden = block.forward_prepared(&hidden, &temb6, kv, cos, sin)?;
+            if self.bounded_offload {
+                self.device.synchronize()?;
+            }
+        }
+
+        let head_mod = self
+            .scale_shift_table
+            .unsqueeze(1)?
+            .broadcast_add(&temb.unsqueeze(2)?.to_dtype(DType::F32)?)?; // [B,L,2,dim]
+        let shift = head_mod.narrow(2, 0, 1)?.squeeze(2)?;
+        let scale = head_mod.narrow(2, 1, 1)?.squeeze(2)?;
+        let hidden = hidden.to_dtype(DType::F32)?;
+        let normed = ln_no_affine(&hidden, self.norm_out_eps)?
+            .broadcast_mul(&(scale + 1.0)?)?
+            .broadcast_add(&shift)?
+            .to_dtype(self.dtype)?;
+        let out = self.proj_out.forward(&normed)?;
+        self.unpatchify_tokens(&out, grid)
+    }
+
     /// Unpatchify a per-token velocity `[B, L, out_channels·∏patch]` (with `L = ppf·pph·ppw`) back to a
     /// spatial latent `[B, out_channels, F, Hl, Wl]` (f32) — the tail of [`forward`](Self::forward),
     /// exposed so the Bernini renderer can unpatchify the **target-sliced** packed output (sc-11004).
@@ -613,7 +850,7 @@ impl WanTransformer {
     }
 
     /// Whether this DiT loaded from a **packed** MLX tier (its projections are quantized) — the additive
-    /// router uses this to reject LoKr/LoHa on a packed base (sc-10094). Probed on `proj_out` (every
+    /// router uses this to select packed-safe additive residuals (sc-10094). Probed on `proj_out` (every
     /// projection in a tier packs together; a dense checkpoint packs none).
     pub fn is_packed(&self) -> bool {
         self.proj_out.is_packed()
@@ -758,6 +995,53 @@ mod tests {
         WanTransformer::new(cfg, vb).unwrap()
     }
 
+    /// Max-abs bound for a **chunked-vs-un-chunked SDPA** comparison (SC-15943). Query-row chunking is
+    /// mathematically equivalent, never bitwise equal: it changes the GEMM `M` dimension, and candle's
+    /// CPU `gemm` and cuBLAS may pick a different tiling and accumulation order per `M`, so the f32
+    /// rounding differs. This is the metric + limit the parity-evidence rule asks for, not a "looks
+    /// similar" fudge.
+    ///
+    /// **Measured, on the host that exposed the defect** (macOS 26.x / Darwin 25.5.0, Apple silicon,
+    /// toolchain 1.96.0) — 1,000,000 random draws at this test's `[1,2,7,4]` shape, both budgets, i.e.
+    /// 2e6 tensor comparisons / ~3.8e7 differing elements:
+    ///
+    /// | quantity                                    | measured                  |
+    /// |---------------------------------------------|---------------------------|
+    /// | draws where `budget 42` differs from single  | 99.7 % (never 0.0)        |
+    /// | draws where `budget 1` differs from single   | 100 %                     |
+    /// | worst max\|Δ\| over 1e6 draws                | **1.31e-6**               |
+    /// | differing elements above `1e-6`             | 1 of 37,978,005           |
+    /// | differing elements above `2e-6`             | 0                         |
+    /// | `probs·v` alone, bit-identical inputs        | diverges (up to 2.4e-7)   |
+    ///
+    /// The last row is the mechanism isolated: feeding *bit-identical* `probs` and `v` and varying only
+    /// `M` already diverges, so this is GEMM shape — not the softmax and not the f32 upcast.
+    ///
+    /// Deliberately stated as an **absolute** bound rather than in ULP. The deltas land on
+    /// near-cancelling output elements, so a per-element ULP ratio is unbounded (a measured
+    /// 1.4e7 "ULP" at an element near zero) and describes nothing useful; against the tensor's own
+    /// scale (|out| ≲ 4.5 for unit-normal inputs) the same worst case is only ~3 ULP. Two references,
+    /// six orders apart, which is exactly why the assertion tests the absolute delta.
+    ///
+    /// `1e-5` sits ~8× above the measured worst case, and ~5 orders below what any real chunking
+    /// regression produces — a mis-narrowed offset, a mis-ordered `cat`, or a dropped softmax all move
+    /// whole rows, i.e. O(1); the two mutations run for SC-15943 gave 1.6e0 and 9.6e-1. It is also the
+    /// bound the shared kernel's own equivalence helper uses for this comparison
+    /// (`candle_gen::attention`'s `approx_eq`), so the two crates agree.
+    ///
+    /// Do **not** tighten this. `1e-6` — the bound SC-15943's own analysis first proposed, from a
+    /// 20k-draw sample whose worst case was 7.2e-7 — is *below* the measured 1e6-draw tail of 1.31e-6:
+    /// it does not merely flake, it fails. Do **not** "fix" this by seeding the RNG either; that hides
+    /// the tail behind one lucky draw and leaves a false invariant standing for the next `M`, host, or
+    /// BLAS version.
+    ///
+    /// **This host is the outlier, and no CI lane checks it.** On x86-64 Linux the same comparison is
+    /// exactly `0.0` — `Candle CPU packages (Linux)` is green on main while main still asserts
+    /// `== 0.0`. That lane (`ubuntu-latest`) is the only one that runs these lib tests; the macOS lane
+    /// reaches `candle-gen*` through Clippy alone, so on arm64 this test is compiled and never
+    /// executed. The invariant was never evaluated on the architecture that breaks it.
+    const CHUNK_PARITY_MAX_ABS: f32 = 1e-5;
+
     fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
         (a - b)
             .unwrap()
@@ -797,6 +1081,97 @@ mod tests {
             max_abs(&got, &want),
             0.0,
             "seam composition must equal forward"
+        );
+    }
+
+    /// The Candle work-count probe for SC-21692. Each projected text payload gets one K/V pair per
+    /// block; scalar and TI2V-token denoise forwards reuse that request-scoped cache without another
+    /// text K/V projection. The prepared result remains exactly pinned to the prior small CPU fixture.
+    #[test]
+    fn prepared_cross_kv_runs_once_per_payload_and_preserves_small_fixture_output() {
+        let _probe_lock = lock_cross_kv_probe();
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let dit = tiny_dit(&cfg, &dev);
+        let latents = Tensor::randn(0f32, 1f32, (1, 16, 2, 4, 4), &dev).unwrap();
+        let pos = Tensor::randn(0f32, 1f32, (1, 3, cfg.dim), &dev).unwrap();
+        let neg = Tensor::randn(0f32, 1f32, (1, 3, cfg.dim), &dev).unwrap();
+        let (cos, sin) = WanRope::new(&cfg).cos_sin(2, 2, 2, &dev).unwrap();
+        let timestep = 833.0;
+
+        let prior = dit.forward(&latents, &pos, timestep, &cos, &sin).unwrap();
+        reset_cross_kv_preparation_pairs();
+        let pos_kv = dit.prepare_cross_kv(&pos).unwrap();
+        let neg_kv = dit.prepare_cross_kv(&neg).unwrap();
+        assert_eq!(
+            cross_kv_preparation_pairs(),
+            cfg.num_layers * 2,
+            "one K/V pair per block and conditioning payload"
+        );
+
+        let prepared = dit
+            .forward_prepared(&latents, timestep, &pos_kv, &cos, &sin)
+            .unwrap();
+        assert_eq!(
+            max_abs(&prior, &prepared),
+            0.0,
+            "prepared scalar forward must preserve the prior fixture"
+        );
+        let tokens = Tensor::full(timestep as f32, (1, 8), &dev).unwrap();
+        let tokenized = dit
+            .forward_tokens_prepared(&latents, &tokens, &pos_kv, &cos, &sin)
+            .unwrap();
+        assert!(
+            max_abs(&prepared, &tokenized) < 1e-5,
+            "prepared TI2V-token forward must retain scalar parity"
+        );
+        // Repeat both CFG branches across multiple denoise steps. Only Q changes; text K/V is untouched.
+        for step in [700.0, 500.0, 250.0] {
+            dit.forward_prepared(&latents, step, &pos_kv, &cos, &sin)
+                .unwrap();
+            dit.forward_prepared(&latents, step, &neg_kv, &cos, &sin)
+                .unwrap();
+        }
+        assert_eq!(
+            cross_kv_preparation_pairs(),
+            cfg.num_layers * 2,
+            "denoise repetition must not reproject text K/V"
+        );
+    }
+
+    #[test]
+    fn per_token_timestep_forward_reduces_to_scalar_and_honors_pinned_tokens() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let dit = tiny_dit(&cfg, &dev);
+        let latents = Tensor::randn(0f32, 1f32, (1, 16, 2, 4, 4), &dev).unwrap();
+        let context = Tensor::randn(0f32, 1f32, (1, 3, cfg.dim), &dev).unwrap();
+        let (cos, sin) = WanRope::new(&cfg).cos_sin(2, 2, 2, &dev).unwrap();
+        let timestep = 833.0;
+        let scalar = dit
+            .forward(&latents, &context, timestep, &cos, &sin)
+            .unwrap();
+        let all_equal = Tensor::full(timestep as f32, (1, 8), &dev).unwrap();
+        let tokenized = dit
+            .forward_tokens(&latents, &all_equal, &context, &cos, &sin)
+            .unwrap();
+        assert!(
+            max_abs(&scalar, &tokenized) < 1e-5,
+            "all-equal token timesteps must reduce to the scalar forward"
+        );
+
+        let mixed = Tensor::from_vec(
+            vec![0f32, 0.0, 0.0, 0.0, 833.0, 833.0, 833.0, 833.0],
+            (1, 8),
+            &dev,
+        )
+        .unwrap();
+        let pinned = dit
+            .forward_tokens(&latents, &mixed, &context, &cos, &sin)
+            .unwrap();
+        assert!(
+            max_abs(&tokenized, &pinned) > 1e-5,
+            "zero-timestep pinned tokens must change the modulation path"
         );
     }
 
@@ -864,11 +1239,20 @@ mod tests {
     }
 
     /// The ported sc-6217 query-row chunking (sc-12434): forcing a tiny scores budget must split the
-    /// query rows yet reproduce the single un-chunked pass — byte-for-byte (exact `0.0`), since each
-    /// query row's softmax is independent. This is the guarantee that stops the A14B self-attention
-    /// from materializing the whole `[B,H,S,S]` block. Counting softmax invocations **through the
-    /// production `sdpa_budgeted`** proves the render's own path chunks (one call per query block), so
-    /// a regression back to a single materialized pass fails here, not just a silently-slower one.
+    /// query rows yet reproduce the single un-chunked pass to within [`CHUNK_PARITY_MAX_ABS`], since
+    /// each query row's softmax is over all keys and independent of the other rows. This is the
+    /// guarantee that stops the A14B self-attention from materializing the whole `[B,H,S,S]` block.
+    /// Counting softmax invocations **through the production `sdpa_budgeted`** proves the render's own
+    /// path chunks (one call per query block), so a regression back to a single materialized pass fails
+    /// here, not just a silently-slower one.
+    ///
+    /// **Per-row independence is a statement about the math, not about the bits** (SC-15943). This
+    /// asserted exact `0.0` until SC-15943: narrowing the query axis changes the GEMM `M` dimension
+    /// (7 → 3/3/1 here), and candle's CPU `gemm` and cuBLAS are both free to select a different tiling
+    /// and accumulation order at a different `M`. A different summation order over f32 perturbs the low
+    /// bits, so bit-identity is not available on this path and never was — see [`CHUNK_PARITY_MAX_ABS`]
+    /// for the measured distribution and bound, and `candle_gen::sdpa_budgeted_bhsd`'s own contract,
+    /// which says the same thing.
     #[test]
     fn sdpa_chunks_query_rows_and_matches_single_pass() {
         use std::cell::Cell;
@@ -880,13 +1264,26 @@ mod tests {
         let scale = (d as f64).powf(-0.5);
         let dtype = q.dtype();
 
-        // Production default budget (ATTN_SCORES_BUDGET ≫ this size) is a single un-chunked pass.
+        // Production default budget (ATTN_SCORES_BUDGET ≫ this size) is a single un-chunked pass. Pin
+        // that rather than assume it: `single` is the reference both tolerance checks below compare
+        // against, and the counting closure is wired only into the `sdpa_budgeted` calls, so nothing
+        // else would notice if `single` itself started chunking. `sdpa_bhsd_impl` takes the un-chunked
+        // branch iff `budget / (b·h·sk) >= sq`, i.e. `budget >= b·h·sk·sq` — so a `WAN_ATTN_SCORES_BUDGET`
+        // override small enough to chunk the reference fails here loudly instead of being absorbed by
+        // the tolerance (SC-15943).
+        assert!(
+            wan_self_attn_budget() >= b * h * s * s,
+            "the reference pass must be un-chunked: budget {} < b·h·sk·sq {}",
+            wan_self_attn_budget(),
+            b * h * s * s
+        );
         let single = sdpa(&q, &k, &v, scale).unwrap();
 
         // Drive the PRODUCTION `sdpa_budgeted` with a call-counting wrapper of the exact f32-upcast
         // softmax and tiny budgets. budget 42 → block = 42/(b·h·sk) = 42/14 = 3 → blocks 3,3,1 over
         // S=7 (3 calls); budget 1 → 7 single-row blocks (7 more calls). A regression that stopped
-        // chunking would report 1 and fail. Each chunked result is byte-identical to the single pass.
+        // chunking would report 1 and fail. Each chunked result matches the single pass to
+        // `CHUNK_PARITY_MAX_ABS` — a rounding-order difference, not a bit-identity (SC-15943).
         let calls = Cell::new(0usize);
         let counting = |scores: &Tensor| {
             calls.set(calls.get() + 1);
@@ -898,17 +1295,17 @@ mod tests {
             3,
             "budget 42 must split S=7 into 3 query-row blocks (3,3,1)"
         );
-        assert_eq!(
-            max_abs(&single, &chunked),
-            0.0,
-            "chunked attention must be byte-identical to the single pass"
+        let d_chunked = max_abs(&single, &chunked);
+        assert!(
+            d_chunked < CHUNK_PARITY_MAX_ABS,
+            "chunked attention diverged from the single pass: max|Δ| {d_chunked:e} ≥ {CHUNK_PARITY_MAX_ABS:e}"
         );
         let block1 = sdpa_budgeted(&q, &k, &v, scale, 1, counting).unwrap();
         assert_eq!(calls.get(), 10, "budget 1 adds 7 single-row blocks (3 + 7)");
-        assert_eq!(
-            max_abs(&single, &block1),
-            0.0,
-            "single-row chunks must be byte-identical to the single pass"
+        let d_block1 = max_abs(&single, &block1);
+        assert!(
+            d_block1 < CHUNK_PARITY_MAX_ABS,
+            "single-row chunks diverged from the single pass: max|Δ| {d_block1:e} ≥ {CHUNK_PARITY_MAX_ABS:e}"
         );
 
         // The production budget genuinely engages at the story's 832x480 A14B proof geometry
@@ -930,11 +1327,12 @@ mod tests {
     }
 
     /// sc-12894 parity gate for the **bf16-softmax** lever (the `WAN_ATTN_SOFTMAX_BF16` knob). The
-    /// chunk lever is byte-exact (proven above); the bf16 softmax is not — it trades the f32 upcast for
-    /// half the per-chunk transient. This bounds that trade against the actual CUDA kernels (bf16 matmul
-    /// and softmax are CUDA-only — CPU has no bf16 matmul), so a regression that widened the gap (say a
-    /// bf16 sum accumulator) is caught here and the delta the GPU render's PSNR check corroborates is
-    /// quantified. The two paths must stay tightly correlated: the CUDA bf16 softmax still max-stabilizes
+    /// chunk lever is a rounding-order effect bounded by [`CHUNK_PARITY_MAX_ABS`] (`1e-5`); the bf16
+    /// softmax is a far coarser trade — it gives up the f32 upcast for half the per-chunk transient, so
+    /// its bound below is `0.05`, nearly four orders wider. This bounds that trade against the actual
+    /// CUDA kernels (bf16 matmul and softmax are CUDA-only — CPU has no bf16 matmul), so a regression
+    /// that widened the gap (say a bf16 sum accumulator) is caught here and the delta the GPU render's
+    /// PSNR check corroborates is quantified. The two paths must stay tightly correlated: the CUDA bf16 softmax still max-stabilizes
     /// and sums in f32, so only the `exp`/probs carry ~2^-8 bf16 rounding and the attention output — a
     /// convex combination of unit-scale values — tracks the f32 path to well within a distilled sampler's
     /// tolerance.

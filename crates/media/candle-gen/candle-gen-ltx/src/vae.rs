@@ -14,7 +14,9 @@
 
 use candle_gen::candle_core::{Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::tiling::{TileCandidates, TilingConfig, VaeTiling};
+use candle_gen::gen_core::tiling::{
+    TemporalOverlapPolicy, TileCandidates, TilingConfig, VaeTiling,
+};
 use candle_gen::vae_tiling;
 
 use crate::config::{LATENT_CHANNELS, SPATIAL_SCALE, TEMPORAL_SCALE};
@@ -122,7 +124,7 @@ const DECODER_BLOCKS: [DBlock; 9] = [
 ];
 
 /// `(B, C·p², F, H, W) -> (B, C, F, H·p, W·p)` (spatial-only unpatchify, patch_size_t = 1).
-fn unpatchify(x: &Tensor, p: usize) -> Result<Tensor> {
+pub(crate) fn unpatchify(x: &Tensor, p: usize) -> Result<Tensor> {
     let (b, c_packed, f, h, w) = x.dims5()?;
     let c = c_packed / (p * p);
     // (B, C, 1, p, p, F, H, W) -> transpose (0,1,5,2,6,4,7,3) -> (B, C, F, H·p, W·p).
@@ -132,7 +134,7 @@ fn unpatchify(x: &Tensor, p: usize) -> Result<Tensor> {
 }
 
 /// Spatial-only patchify (`patch_size_t = 1`) used at the encoder input.
-fn patchify(x: &Tensor, p: usize) -> Result<Tensor> {
+pub(crate) fn patchify(x: &Tensor, p: usize) -> Result<Tensor> {
     let (b, c, f, h, w) = x.dims5()?;
     if h % p != 0 || w % p != 0 {
         return Err(candle_gen::candle_core::Error::Msg(format!(
@@ -383,9 +385,9 @@ impl VideoEncoder {
 }
 
 pub struct LtxVideoVae {
-    conv_in: CausalConv3d,
+    conv_in: Option<CausalConv3d>,
     up_blocks: Vec<UpLayer>,
-    conv_out: CausalConv3d,
+    conv_out: Option<CausalConv3d>,
     mean: Tensor, // [1, 128, 1, 1, 1]
     std: Tensor,  // [1, 128, 1, 1, 1]
     patch_size: usize,
@@ -393,6 +395,20 @@ pub struct LtxVideoVae {
 }
 
 impl LtxVideoVae {
+    /// Geometry owned by the concrete decoder and consumed by its planner and tiled driver.
+    pub const VAE_TILING: VaeTiling = VaeTiling::LTX;
+
+    /// Convert DiT-normalized latents to the learned-upscaler's VAE latent
+    /// domain. The stats are loaded from the same checkpoint as decode.
+    pub(crate) fn denormalize_latents(&self, latents: &Tensor) -> Result<Tensor> {
+        latents.broadcast_mul(&self.std)?.broadcast_add(&self.mean)
+    }
+
+    /// Convert learned-upscaler output back into the DiT-normalized domain.
+    pub(crate) fn normalize_latents(&self, latents: &Tensor) -> Result<Tensor> {
+        latents.broadcast_sub(&self.mean)?.broadcast_div(&self.std)
+    }
+
     /// Build a decoder-only VAE from a VarBuilder rooted at the `vae.` prefix.
     pub fn new(vb: VarBuilder, latent_channels: usize, patch_size: usize) -> Result<Self> {
         Self::build(vb, None, latent_channels, patch_size)
@@ -407,6 +423,61 @@ impl LtxVideoVae {
         patch_size: usize,
     ) -> Result<Self> {
         Self::build(decoder_vb, Some(encoder_vb), latent_channels, patch_size)
+    }
+
+    /// Build only the causal encoder and latent-normalization surface. DiffVAE owns final decode,
+    /// so forcing its route to materialize a convolutional decoder is both unnecessary and wrong
+    /// for converted tiers that deliberately ship no `vae_decoder.safetensors`.
+    pub fn new_encoder_only(
+        encoder_vb: VarBuilder,
+        latent_channels: usize,
+        patch_size: usize,
+    ) -> Result<Self> {
+        Self::build_without_decoder(encoder_vb, true, latent_channels, patch_size)
+    }
+
+    /// Build only latent normalization. Pure T2V on the DiffVAE route needs the statistics for the
+    /// learned upsampler hand-off but never loads or calls a convolutional encoder/decoder.
+    pub fn new_statistics_only(
+        stats_vb: VarBuilder,
+        latent_channels: usize,
+        patch_size: usize,
+    ) -> Result<Self> {
+        Self::build_without_decoder(stats_vb, false, latent_channels, patch_size)
+    }
+
+    fn build_without_decoder(
+        vb: VarBuilder,
+        with_encoder: bool,
+        latent_channels: usize,
+        patch_size: usize,
+    ) -> Result<Self> {
+        let stats = vb.pp("per_channel_statistics");
+        let mean = stats
+            .get_unchecked("mean-of-means")?
+            .reshape((1, latent_channels, 1, 1, 1))?;
+        let std = stats
+            .get_unchecked("std-of-means")?
+            .reshape((1, latent_channels, 1, 1, 1))?;
+        let encoder = with_encoder
+            .then(|| {
+                VideoEncoder::load(
+                    vb.pp("encoder"),
+                    vb.pp("per_channel_statistics"),
+                    latent_channels,
+                    patch_size,
+                )
+            })
+            .transpose()?;
+        Ok(Self {
+            conv_in: None,
+            up_blocks: Vec::new(),
+            conv_out: None,
+            mean,
+            std,
+            patch_size,
+            encoder,
+        })
     }
 
     fn build(
@@ -452,9 +523,9 @@ impl LtxVideoVae {
             None => None,
         };
         Ok(Self {
-            conv_in: CausalConv3d::load(dec.clone(), "conv_in.conv")?,
+            conv_in: Some(CausalConv3d::load(dec.clone(), "conv_in.conv")?),
             up_blocks,
-            conv_out: CausalConv3d::load(dec, "conv_out.conv")?,
+            conv_out: Some(CausalConv3d::load(dec, "conv_out.conv")?),
             mean,
             std,
             patch_size,
@@ -500,10 +571,17 @@ impl LtxVideoVae {
 
     /// Decode a normalized latent `[B, 128, F', H', W']` → video `[B, 3, F, 32·H', 32·W']` in ~[-1,1].
     pub fn decode(&self, latent: &Tensor) -> Result<Tensor> {
+        let conv_in = self.conv_in.as_ref().ok_or_else(|| {
+            candle_gen::candle_core::Error::Msg(
+                "ltx vae decode: convolutional decoder weights were not loaded on the DiffVAE route"
+                    .into(),
+            )
+        })?;
+        let conv_out = self.conv_out.as_ref().expect("decoder fields are atomic");
         // Denormalize: x · std + mean.
         let x =
             (latent.broadcast_mul(&self.std)? + self.mean.broadcast_as(latent.shape())?.clone())?;
-        let mut x = self.conv_in.forward(&x, false)?;
+        let mut x = conv_in.forward(&x, false)?;
         for layer in &self.up_blocks {
             x = match layer {
                 UpLayer::Res(blocks) => {
@@ -518,7 +596,7 @@ impl LtxVideoVae {
         }
         let x = pixel_norm(&x)?;
         let x = candle_gen::candle_nn::ops::silu(&x)?;
-        let x = self.conv_out.forward(&x, false)?;
+        let x = conv_out.forward(&x, false)?;
         unpatchify(&x, self.patch_size)
     }
 
@@ -542,7 +620,7 @@ impl LtxVideoVae {
         // `VaeTiling::LTX` geometry (×32 spatial / ×8 causal temporal) and the single-pass `decode`
         // closure. Unlike wan, `cfg` may carry a temporal tile (ltx `decode` is not per-frame
         // streaming); the shared driver's `plan.t` loop handles both.
-        vae_tiling::decode_tiled(VaeTiling::LTX, "ltx vae", latent, cfg, |tile| {
+        vae_tiling::decode_tiled(Self::VAE_TILING, "ltx vae", latent, cfg, |tile| {
             self.decode(tile)
         })
     }
@@ -555,13 +633,36 @@ impl LtxVideoVae {
     /// analogue of mlx-gen-ltx `decode_to_frames`'s internal budgeting.
     pub fn decode_budgeted(&self, latent: &Tensor) -> Result<Tensor> {
         let (_b, _c, f, h, w) = latent.dims5()?;
-        let out_f = 1 + (f as i32 - 1) * VaeTiling::LTX.temporal_scale; // causal ×8
-        let out_h = h as i32 * VaeTiling::LTX.spatial_scale; // ×32
-        let out_w = w as i32 * VaeTiling::LTX.spatial_scale;
+        let out_f = 1 + (f as i32 - 1) * Self::VAE_TILING.temporal_scale; // causal ×8
+        let out_h = h as i32 * Self::VAE_TILING.spatial_scale; // ×32
+        let out_w = w as i32 * Self::VAE_TILING.spatial_scale;
         match auto_tiling_budgeted_ltx(out_h, out_w, out_f)? {
             Some(cfg) => self.decode_tiled(latent, &cfg),
             None => self.decode(latent),
         }
+    }
+
+    /// Execute the request-scoped bounded-decode rung.  The selected spatial cap is never merely
+    /// telemetry: it forces the same shared tiling driver used by automatic safety budgeting.
+    pub fn decode_budgeted_with_spatial_cap(
+        &self,
+        latent: &Tensor,
+        tile_edge: u32,
+        overlap: u32,
+    ) -> Result<Tensor> {
+        let (_b, _c, f, h, w) = latent.dims5()?;
+        let out_f = 1 + (f as i32 - 1) * Self::VAE_TILING.temporal_scale;
+        let out_h = h as i32 * Self::VAE_TILING.spatial_scale;
+        let out_w = w as i32 * Self::VAE_TILING.spatial_scale;
+        let mut cfg =
+            plan_ltx_tiling(out_h, out_w, out_f, ltx_vae_safe_budget_gib())?.unwrap_or_default();
+        // A one-tile result is still materialized through `decode_tiled`, preserving the selected
+        // control rather than silently falling back to ordinary decode.
+        cfg.spatial = Some(candle_gen::gen_core::tiling::SpatialTiling {
+            tile_px: tile_edge as i32,
+            overlap_px: overlap as i32,
+        });
+        self.decode_tiled(latent, &cfg)
     }
 }
 
@@ -601,9 +702,9 @@ const LTX_VAE_DEFAULT_BUDGET_GIB: f64 = 16.0;
 // anchor regression below still proves that the selector does not under-predict any calibrated row.
 // The placeholders (40/300) under-predicted single-pass by ~1.9×; re-run the sweep after a decoder or
 // candle-allocator change. See the `ltx_decode_peak_matches_cuda_anchors` regression test below.
-const LTX_VAE_FIXED_BYTES: f64 = 2.7e9;
-const LTX_VAE_ACCUM_BYTES_PER_VOXEL: f64 = 80.0;
-const LTX_VAE_TILE_BYTES_PER_OUT_VOXEL: f64 = 620.0;
+const LTX_VAE_FIXED_BYTES: u64 = 2_700_000_000;
+const LTX_VAE_ACCUM_BYTES_PER_VOXEL: u64 = 80;
+const LTX_VAE_TILE_BYTES_PER_OUT_VOXEL: u64 = 620;
 
 /// Candidate spatial tile sizes (output px, multiples of the LTX ×32 scale, overlap 64).
 const LTX_VAE_SPATIAL_PX: [i32; 8] = [768, 640, 512, 448, 384, 320, 256, 192];
@@ -623,10 +724,43 @@ fn estimated_ltx_decode_peak_gib(
 ) -> f64 {
     let out_voxels = (out_f * out_h * out_w) as f64;
     let tile_voxels = (tile_f * tile_h * tile_w) as f64;
-    (LTX_VAE_FIXED_BYTES
-        + LTX_VAE_ACCUM_BYTES_PER_VOXEL * out_voxels
-        + LTX_VAE_TILE_BYTES_PER_OUT_VOXEL * tile_voxels)
+    (LTX_VAE_FIXED_BYTES as f64
+        + LTX_VAE_ACCUM_BYTES_PER_VOXEL as f64 * out_voxels
+        + LTX_VAE_TILE_BYTES_PER_OUT_VOXEL as f64 * tile_voxels)
         / GIB_F64
+}
+
+/// Conservative single-pass LTX VAE decode working-set peak in bytes.
+///
+/// This is the exact full-output case of the calibrated cost function used by
+/// [`auto_tiling_budgeted_ltx`]. It includes that model's fixed decoder/base-working-set floor and
+/// decode accumulators/activations, but no DiT or text-encoder composition weights.
+pub fn conservative_video_decode_peak_bytes(width: u32, height: u32, frames: u32) -> Option<u64> {
+    let voxels = u64::from(width)
+        .checked_mul(u64::from(height))?
+        .checked_mul(u64::from(frames))?;
+    if voxels == 0 {
+        return None;
+    }
+    let variable_per_voxel =
+        LTX_VAE_ACCUM_BYTES_PER_VOXEL.checked_add(LTX_VAE_TILE_BYTES_PER_OUT_VOXEL)?;
+    LTX_VAE_FIXED_BYTES.checked_add(variable_per_voxel.checked_mul(voxels)?)
+}
+
+/// Composable form of [`conservative_video_decode_peak_bytes`].
+///
+/// The calibrated fixed term mixes decoder residency with backend/runtime working set, so no
+/// decoder-only portion is source-grounded. It therefore remains entirely in `working_set_bytes`
+/// and `resident_decoder_bytes_included` is conservatively zero.
+pub fn conservative_video_decode_memory_profile(
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<candle_gen::VideoDecodeMemoryProfile> {
+    candle_gen::VideoDecodeMemoryProfile::new(
+        conservative_video_decode_peak_bytes(width, height, frames)?,
+        0,
+    )
 }
 
 /// The safe peak-GiB budget for the LTX decode tiler. Resolved in order: `LTX_VAE_BUDGET_GIB` env
@@ -666,10 +800,11 @@ fn plan_ltx_tiling(
         spatial_px: &LTX_VAE_SPATIAL_PX,
         spatial_overlap_px: 64,
         temporal: &LTX_VAE_TEMPORAL_FR,
+        temporal_overlap_policy: TemporalOverlapPolicy::HalfTile,
     };
     vae_tiling::plan_tiling(
         "ltx vae decode",
-        VaeTiling::LTX,
+        LtxVideoVae::VAE_TILING,
         height,
         width,
         out_frames,
@@ -682,6 +817,117 @@ fn plan_ltx_tiling(
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+
+    /// This file's own source, for the route guard below.
+    const VAE_SRC: &str = include_str!("vae.rs");
+
+    /// The body of one `fn` in [`VAE_SRC`], from its signature to the matching `}`.
+    fn fn_body(name: &str) -> &'static str {
+        let start = VAE_SRC
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("vae.rs no longer defines `fn {name}`"));
+        let open = VAE_SRC[start..]
+            .find('{')
+            .expect("a fn signature is followed by its body");
+        let rest = &VAE_SRC[start + open..];
+        let mut depth = 0usize;
+        for (i, c) in rest.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &rest[..=i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces while slicing `fn {name}`");
+    }
+
+    /// sc-18799 AC1 — the **conv** decode must still route through [`auto_tiling_budgeted_ltx`],
+    /// unchanged by the DiffVAE getting a budgeted selector of its own.
+    ///
+    /// Asserted on the ROUTE, not on an output: an output-level check would look identical whether
+    /// the tiling came from the conv selector or from a "unified" one, because on a machine with
+    /// headroom both would answer `None` and both decodes would be the same picture. What must not
+    /// change is *which selector the call site names* — so this reads the call site.
+    #[test]
+    fn conv_decode_budgeted_still_selects_through_auto_tiling_budgeted_ltx() {
+        let body = fn_body("decode_budgeted");
+        assert!(
+            body.contains("match auto_tiling_budgeted_ltx(out_h, out_w, out_f)?"),
+            "the conv decode's auto-tiling arm no longer calls `auto_tiling_budgeted_ltx` with the \
+             conv output dims — sc-18799 budgets the DiffVAE, it does not re-route the conv \
+             decoder:\n{body}"
+        );
+        for foreign in ["diff_vae", "DiffVae", "budget::", "auto_diffvae"] {
+            assert!(
+                !body.contains(foreign),
+                "the conv decode route now mentions `{foreign}` — the DiffVAE selector must not \
+                 reach the conv decoder:\n{body}"
+            );
+        }
+    }
+
+    /// The other half of the same guard: the conv selector still answers from the **conv** candidate
+    /// grid. A rewrite that pointed it at the DiffVAE's three-axis stage-4 grid would keep the call
+    /// site's name and still be the regression this AC is about.
+    #[test]
+    fn the_conv_selector_still_answers_from_the_conv_candidate_grid() {
+        // Sweep the budget down a long clip so both halves of the conv grid are asked their
+        // question: every spatial edge selected must come from the conv list at overlap 64, and at
+        // least one budget must be tight enough to select a conv temporal tile.
+        let mut spatial_seen = 0usize;
+        let mut temporal_seen = 0usize;
+        for &safe_gib in &[40.0_f64, 32.0, 28.0, 26.0, 25.0] {
+            let Ok(Some(plan)) = plan_ltx_tiling(720, 1280, 241, safe_gib) else {
+                continue;
+            };
+            if let Some(spatial) = plan.spatial {
+                spatial_seen += 1;
+                assert!(
+                    LTX_VAE_SPATIAL_PX.contains(&spatial.tile_px),
+                    "conv spatial edge {} at {safe_gib} GiB is not one of the conv candidates \
+                     {LTX_VAE_SPATIAL_PX:?}",
+                    spatial.tile_px
+                );
+                assert_eq!(
+                    spatial.overlap_px, 64,
+                    "the conv selector's spatial overlap is 64 px"
+                );
+            }
+            if let Some(temporal) = plan.temporal {
+                temporal_seen += 1;
+                assert!(
+                    LTX_VAE_TEMPORAL_FR
+                        .iter()
+                        .any(|&(tile, _)| tile == temporal.tile_frames),
+                    "conv temporal tile {} at {safe_gib} GiB is not one of the conv candidates \
+                     {LTX_VAE_TEMPORAL_FR:?}",
+                    temporal.tile_frames
+                );
+            }
+        }
+        assert!(
+            spatial_seen > 0 && temporal_seen > 0,
+            "the sweep never exercised both conv axes (spatial {spatial_seen}, temporal \
+             {temporal_seen}) — the identity claim is untested"
+        );
+    }
+
+    #[test]
+    fn public_decode_peak_is_the_planners_full_output_case() {
+        let profile = conservative_video_decode_memory_profile(64, 64, 9).unwrap();
+        assert_eq!(profile.working_set_bytes(), 2_725_804_800);
+        assert_eq!(profile.resident_decoder_bytes_included(), 0);
+        assert_eq!(conservative_video_decode_peak_bytes(0, 64, 9), None);
+        assert_eq!(
+            conservative_video_decode_peak_bytes(u32::MAX, u32::MAX, u32::MAX),
+            None
+        );
+    }
 
     #[test]
     fn ltx_tiling_single_pass_when_small() {
@@ -718,6 +964,104 @@ mod budget_tests {
         assert!(plan_ltx_tiling(2160, 3840, 257, 8.0).is_err());
     }
 
+    /// **sc-15325 — the CUDA lane's LTX grid can no longer starve the decoder either.**
+    ///
+    /// This crate carries the *identical* [`LTX_VAE_TEMPORAL_FR`] grid and routes through the
+    /// *identical* gen-core `budgeted_plan`, so gen-core's `MIN_TEMPORAL_TILE_LATENT_FRAMES` removes
+    /// the same `(48, 16)` and `(24, 8)` candidates — latent **6** and **3** at LTX's ×8
+    /// `temporal_scale`. What is *not* shared is the cost model: these constants are CUDA-calibrated
+    /// (sc-7148, RTX PRO 6000) with a 2.7 GiB fixed floor, where the mlx sibling's are Metal ones. So
+    /// "does the floor keep the shipped envelope plannable?" is a genuinely different question here
+    /// and has to be asked separately — a candidate removed on both backends can still be the one
+    /// that made a CUDA budget fit.
+    ///
+    /// This is the mirror of `mlx-gen-ltx`'s `ltx_tiling_never_selects_a_starved_temporal_tile`
+    /// (`crates/media/mlx-gen/mlx-gen-ltx/src/pipeline.rs`). The Linux/CUDA CI lanes exercise
+    /// compilation, not tiling *selection*, so without this the CUDA lane would inherit the policy
+    /// change with no coverage at all.
+    #[test]
+    fn ltx_tiling_never_selects_a_starved_temporal_tile() {
+        use candle_gen::gen_core::tiling::{
+            min_temporal_tile_frames, MIN_TEMPORAL_TILE_LATENT_FRAMES,
+            MIN_TEMPORAL_TILE_LATENT_OVERLAP,
+        };
+        let scale = LtxVideoVae::VAE_TILING.temporal_scale;
+
+        // The grid this crate actually ships, read through the floor: the two starved entries go.
+        let kept: Vec<i32> = LTX_VAE_TEMPORAL_FR
+            .iter()
+            .map(|&(t, _)| t)
+            .filter(|&t| t >= min_temporal_tile_frames(LtxVideoVae::VAE_TILING))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![96, 64],
+            "the floor must remove candle-gen-ltx's latent-6 (48f) and latent-3 (24f) candidates"
+        );
+
+        for (w, h, f) in [
+            (1280, 704, 121),
+            (1280, 720, 121),
+            (768, 512, 241),
+            (1920, 1088, 121),
+        ] {
+            for safe in [12.0f64, 16.0, 24.0, 32.0, 48.0, 96.0] {
+                let Ok(Some(cfg)) = plan_ltx_tiling(h, w, f, safe) else {
+                    continue; // infeasible or single-pass — neither can starve a tile.
+                };
+                let Some(t) = cfg.temporal else { continue };
+                let lat = t.tile_frames / scale;
+                assert!(
+                    lat >= MIN_TEMPORAL_TILE_LATENT_FRAMES,
+                    "{w}x{h}x{f} @ {safe} GiB: selected a {lat}-latent-frame LTX temporal tile \
+                     ({} output frames) — sc-15325's receptive-field floor",
+                    t.tile_frames
+                );
+                assert!(
+                    (t.overlap_frames / scale).min(lat - 1) >= MIN_TEMPORAL_TILE_LATENT_OVERLAP,
+                    "{w}x{h}x{f} @ {safe} GiB: latent overlap under the blend floor"
+                );
+            }
+        }
+
+        // ...and the shipped envelope is still plannable on a real CUDA card. **This is the check the
+        // mlx sibling could not make for us, and it found something**: on the CUDA cost model the
+        // floor genuinely narrows the feasible window at 1280×704×121, because the accumulator floor
+        // there is already 10.64 GiB and only the tile term is left to trade.
+        //
+        // | plan at 192 px spatial | latent tile | estimated peak |
+        // |---|---|---|
+        // | `(24, 8)` — removed by the floor | 3 | 11.15 GiB |
+        // | `(48, 16)` — removed by the floor | 6 | 11.66 GiB |
+        // | `(64, 16)` — the floor's smallest survivor | 8 | **12.00 GiB** |
+        //
+        // So the smallest budget that can plan this bucket moved **11.15 → 12.00 GiB safe**. No real
+        // card class crosses that gap: `safe = total × 0.85`, so a 12 GB card is 10.2 GiB (already
+        // under the 10.64 GiB accumulator floor — infeasible before *and* after, for a reason the
+        // floor has nothing to do with) and a 16 GB card is 13.6 GiB (feasible before and after). The
+        // exposed band is a 13.1–14.1 GB card, which is not a thing. Assert the 16 GB case, and pin
+        // the band explicitly so a future cost-model change that widens it is visible rather than
+        // discovered by a user.
+        const SAFE_16GB: f64 = 16.0 * LTX_VAE_BUDGET_SAFE_FRAC; // 13.6 GiB
+        for (w, h, f) in [(1280, 704, 121), (1280, 720, 121), (768, 512, 241)] {
+            plan_ltx_tiling(h, w, f, SAFE_16GB).unwrap_or_else(|e| {
+                panic!("{w}x{h}x{f} became infeasible on a 16 GB card ({SAFE_16GB} GiB safe): {e}")
+            });
+        }
+        // The narrowed band itself, pinned. If this ever starts passing, the floor's cost on this
+        // backend changed and the paragraph above needs re-deriving.
+        assert!(
+            plan_ltx_tiling(704, 1280, 121, 11.5).is_err(),
+            "1280x704x121 now plans at 11.5 GiB — the floor's CUDA feasibility floor moved; re-derive \
+             the 11.15 -> 12.00 GiB band documented above"
+        );
+        assert!(
+            plan_ltx_tiling(704, 1280, 121, 12.1).is_ok(),
+            "1280x704x121 no longer plans at 12.1 GiB — the floor's CUDA cost grew beyond the \
+             documented 12.00 GiB survivor"
+        );
+    }
+
     #[test]
     fn ltx_budget_env_override_wins() {
         // The deterministic injection point the worker/tests use. (Set/clear in-process.)
@@ -730,7 +1074,8 @@ mod budget_tests {
     /// anchors (RTX PRO 6000 Blackwell, sm_120, f32) it was fit from — `estimated ≥ measured` for every
     /// anchor (never under-predict ⇒ the selector never OKs a tile that OOMs), and not absurdly over
     /// (≤ 2.5×). Regenerate the anchors with `cargo test -p candle-gen-ltx --features cuda --release
-    /// --test vae_decode_sweep -- --ignored --nocapture` after a decoder or candle-allocator change.
+    /// --test integration -- vae_decode_sweep:: --ignored --nocapture` after a decoder or
+    /// candle-allocator change.
     #[test]
     fn ltx_decode_peak_matches_cuda_anchors() {
         // (out_f, out_h, out_w, tile_f, tile_h, tile_w, measured_peak_gib). Single-pass ⇒ tile == out.

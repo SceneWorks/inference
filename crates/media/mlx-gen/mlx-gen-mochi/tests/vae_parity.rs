@@ -10,7 +10,7 @@
 //!    `video` reproduces `mochi_vae_golden.safetensors` (pixel space).
 //!
 //! Run the real-weight gate:
-//!   `MOCHI_SNAPSHOT=/path/to/mochi-1-preview cargo test -p mlx-gen-mochi --test vae_parity -- --ignored --nocapture`
+//!   `MOCHI_SNAPSHOT=/path/to/mochi-1-preview cargo test -p mlx-gen-mochi --test integration vae_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max, mean, subtract};
 use mlx_rs::{Array, Dtype};

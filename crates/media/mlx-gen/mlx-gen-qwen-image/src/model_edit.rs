@@ -24,9 +24,10 @@ use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, Modality, ModelDescriptor,
-    OffloadPolicy, Precision, Progress, Quant, Residency, Result, WeightsSource,
+    OffloadPolicy, Precision, Progress, Quant, Residency, Result, WeightsSource, VAE_COMPONENT,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
+use mlx_gen_wan::OwnedWanSingleFrameDecoder;
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{Array, Dtype};
 use std::path::Path;
@@ -35,8 +36,8 @@ use crate::image_processor::{ImageInput, QwenImageProcessor};
 use crate::loader;
 use crate::model::validate_request;
 use crate::pipeline::{
-    create_noise, decode_and_collect, denoise_edit_with_progress, qwen_samplers, qwen_schedulers,
-    resolve_run_params, PID_BACKBONE,
+    create_noise, decode_and_collect, denoise_edit_with_progress_windowed, qwen_samplers,
+    qwen_schedulers, resolve_run_params, PID_BACKBONE,
 };
 use crate::text_encoder::vision::grid::Grid;
 use crate::text_encoder::QwenVisionLanguageEncoder;
@@ -54,6 +55,9 @@ pub const MODEL_ID: &str = "qwen_image_edit";
 /// VAE-encoded and folded into the transformer's dual-latent sequence (sc-2529).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: Some(crate::ENCODER_CONTRACT),
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "qwen-image",
@@ -75,27 +79,16 @@ pub fn descriptor() -> ModelDescriptor {
             // Curated unified-framework integrator menu (epic 7114 P3) + the `lightning` profile.
             samplers: qwen_samplers(),
             schedulers: qwen_schedulers(),
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
-            supports_kv_cache: false,
             requires_sigma_shift: true,
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
             supports_sequential_offload: true,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            supports_preview: true,
+            ..Default::default()
         },
     }
 }
@@ -115,6 +108,9 @@ pub struct QwenImageEdit {
     /// [`Residency`] seam owns the eval/drop/clear discipline, the stage-boundary cancel checks, and
     /// the error-safe cache flush.
     residency: Residency<QwenVisionLanguageEncoder, QwenEditHeavyOwned>,
+    memory_strategy: gen_core::MemoryProviderContract,
+    precision: Precision,
+    quant: Option<Quant>,
 }
 
 /// The heavy render-phase components (the edit MMDiT transformer, the VAE, and the optional PiD
@@ -125,6 +121,7 @@ struct QwenEditHeavyOwned {
     vae: QwenVae,
     /// Optional PiD super-resolving decoder (epic 7840, sc-7845); see [`crate::model::QwenImage`].
     pid: Option<PidEngine>,
+    alternate_decoder: Option<OwnedWanSingleFrameDecoder>,
 }
 
 /// A borrow of the heavy render-phase components, so the denoise/decode body runs identically whether
@@ -133,6 +130,7 @@ struct QwenEditHeavy<'a> {
     transformer: &'a QwenTransformer,
     vae: &'a QwenVae,
     pid: Option<&'a PidEngine>,
+    alternate_decoder: Option<&'a OwnedWanSingleFrameDecoder>,
 }
 
 impl QwenEditHeavyOwned {
@@ -141,6 +139,7 @@ impl QwenEditHeavyOwned {
             transformer: &self.transformer,
             vae: &self.vae,
             pid: self.pid.as_ref(),
+            alternate_decoder: self.alternate_decoder.as_ref(),
         }
     }
 }
@@ -161,6 +160,8 @@ impl QwenEditHeavyOwned {
 /// `max(VL-encoder, DiT+VAE)`. Both use the same per-phase loaders, so the components are
 /// byte-identical.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    mlx_gen::gen_core::reject_unknown_components(spec, &[VAE_COMPONENT], MODEL_ID)?;
+    mlx_gen_wan::validate_selected_single_frame_decoder(spec, &descriptor())?;
     // Resolve the snapshot dir up front — fail-fast for BOTH policies — then the always-warm
     // tokenizer/processor, then the shared [`build_residency`] dispatch.
     let root = resolve_root(spec)?;
@@ -174,12 +175,17 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             mlx_gen::residency::warn_sequential_requantize(MODEL_ID, q.bits());
         }
     }
-    let tokenizer = loader::load_tokenizer(root)?;
+    let text_encoder_source = crate::active_encoder_contract().source_for_load(spec, root)?;
+    text_encoder_source.load_time_quant_bits(None, MODEL_ID)?;
+    let tokenizer = loader::load_validated_tokenizer(&text_encoder_source)?;
     Ok(Box::new(QwenImageEdit {
         descriptor: descriptor(),
         tokenizer,
         processor: QwenImageProcessor::default(),
-        residency: build_residency(spec)?,
+        residency: build_residency_with_source(spec, text_encoder_source)?,
+        memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
+        precision: spec.precision,
+        quant: spec.quantize,
     }))
 }
 
@@ -192,14 +198,20 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// byte-identical to the pre-seam one. The deferral is weight-free-testable: under `Sequential` this
 /// touches no component weights, so a dispatch that ignored `offload_policy` would eager-load and fail
 /// the "Sequential defers" unit test.
-fn build_residency(
+fn build_residency_with_source(
     spec: &LoadSpec,
+    text_encoder_source: mlx_gen::gen_core::ValidatedEncoderSource,
 ) -> Result<Residency<QwenVisionLanguageEncoder, QwenEditHeavyOwned>> {
-    let spec_text = spec.clone();
+    let root = resolve_root(spec)?;
+    let encoder_contract = crate::active_encoder_contract();
+    let vision_encoder_source = encoder_contract
+        .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+    vision_encoder_source
+        .validate_vision(&crate::active_vision_encoder_contract(), &encoder_contract)?;
     let spec_heavy = spec.clone();
-    Residency::from_policy(
-        spec.offload_policy,
-        move || load_vl_encoder_only(resolve_root(&spec_text)?),
+    crate::model::residency_from_spec(
+        spec,
+        move || load_vl_encoder_only(&text_encoder_source, &vision_encoder_source),
         move |use_pid| load_heavy(&spec_heavy, resolve_root(&spec_heavy)?, use_pid),
     )
 }
@@ -228,8 +240,15 @@ fn resolve_root(spec: &LoadSpec) -> Result<&Path> {
 /// from the shared `text_encoder/` shard set (F-080). Never quantized (the fork marks the
 /// `text_encoder` component `skip_quantization=True`), so the `Resident` and `Sequential` paths build
 /// byte-identical encoders.
-fn load_vl_encoder_only(root: &Path) -> Result<QwenVisionLanguageEncoder> {
-    loader::load_vision_language_encoder(root)
+fn load_vl_encoder_only(
+    language_source: &mlx_gen::gen_core::ValidatedEncoderSource,
+    vision_source: &mlx_gen::gen_core::ValidatedEncoderSource,
+) -> Result<QwenVisionLanguageEncoder> {
+    language_source.read_unchanged(|language| {
+        vision_source.read_unchanged(|vision| {
+            loader::load_vision_language_encoder_from_sources(language, vision)
+        })
+    })
 }
 
 /// Load the heavy render-phase components — the edit MMDiT transformer (+ Q4/Q8 + LoRA/LoKr
@@ -241,6 +260,10 @@ fn load_vl_encoder_only(root: &Path) -> Result<QwenVisionLanguageEncoder> {
 fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<QwenEditHeavyOwned> {
     // Edit-2511 transformer (zero_cond_t on): clean-timestep modulation for the conditioning tokens.
     let mut transformer = loader::load_transformer_edit(root)?;
+    if crate::memory_strategy::should_arm_block_stream(MODEL_ID, spec) {
+        transformer =
+            transformer.with_block_stream(WeightsSource::Dir(root.join("transformer")), "");
+    }
     if let Some(q) = spec.quantize {
         // F-076: reject a requested-vs-packed quant-tier mismatch instead of silently serving the
         // snapshot's tier; skip the no-op quantize when the turnkey is already packed at the
@@ -253,6 +276,7 @@ fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<QwenEditHe
     if !spec.adapters.is_empty() {
         crate::adapters::apply_qwen_adapters(&mut transformer, &spec.adapters)?;
     }
+    transformer.capture_block_adapters();
     // Optional PiD overlay, loaded only when the spec carries it AND this generate uses it (`load_pid`,
     // F-177) — Resident passes `true`, Sequential passes `req.use_pid` so a non-PiD generate skips the
     // student + its Gemma-2 caption encoder entirely.
@@ -265,10 +289,12 @@ fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<QwenEditHe
         None
     };
     let vae = loader::load_vae(root)?;
+    let alternate_decoder = mlx_gen_wan::load_selected_single_frame_decoder(spec, &descriptor())?;
     Ok(QwenEditHeavyOwned {
         transformer,
         vae,
         pid,
+        alternate_decoder,
     })
 }
 
@@ -348,6 +374,35 @@ impl Generator for QwenImageEdit {
     ) -> gen_core::Result<GenerationOutput> {
         self.generate_impl(req, on_progress).map_err(Into::into)
     }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(
+            &self.memory_strategy,
+            self.precision,
+            self.quant,
+            context,
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::begin_request(
+            MODEL_ID,
+            &self.memory_strategy,
+            self.precision,
+            self.quant,
+            context,
+        )
+    }
 }
 
 impl QwenImageEdit {
@@ -360,13 +415,17 @@ impl QwenImageEdit {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+        let crate::pipeline::RequestRungs {
+            block_window,
+            attention_budget,
+            decode_tiling,
+        } = crate::pipeline::resolve_request_rungs(req, &self.memory_strategy)?;
 
         // Shared step/sampler/guidance/seed resolution (F-117): `req.sampler == "lightning"` selects
         // the few-step recipe (its matching Edit Lightning LoRA must be supplied via `spec.adapters`),
         // else the production resolution-dependent schedule.
         let (out_w, out_h) = (req.width, req.height);
         let params = resolve_run_params(req, out_w, out_h);
-
         // Phase A: reference + prompts → conditioning embeds (epic 10834 Phase 1, sc-11006; sc-11125).
         // Under `Sequential` the shared seam loads the Qwen2.5-VL encoder, runs the vision tower over
         // the reference + the LM over pos/neg, materializes, then DROPS it + `clear_cache()` so its
@@ -376,23 +435,25 @@ impl QwenImageEdit {
             &req.cancel,
             req.use_pid,
             on_progress,
-            |vl: &QwenVisionLanguageEncoder| self.encode_phase_a(vl, req, params.is_lightning),
-            // Materialize pos (+neg) while the VL encoder is still alive (Sequential only) — this forces
-            // the vision-tower AND LM forwards, else the outputs keep the encoder referenced and the
-            // drop would free nothing.
-            |(pos, neg)| {
-                match neg {
-                    Some(neg) => mlx_rs::transforms::eval([pos, neg])?,
-                    None => mlx_rs::transforms::eval([pos])?,
-                }
-                Ok(())
+            |vl: &QwenVisionLanguageEncoder| {
+                let encoded = self.encode_phase_a(vl, req, params.is_lightning)?;
+                crate::pipeline::finish_conditioning(req, MODEL_ID, || {
+                    match &encoded.1 {
+                        Some(neg) => mlx_rs::transforms::eval([&encoded.0, neg])?,
+                        None => mlx_rs::transforms::eval([&encoded.0])?,
+                    }
+                    Ok(())
+                })?;
+                Ok(encoded)
             },
+            // The shared boundary already forced the vision tower and LM while the VL encoder was
+            // alive, including Resident requests; Sequential has nothing left before its text drop.
+            |_| Ok(()),
             // ── Establish the heavy render components (edit DiT + VAE + PiD) and run the dual-latent
             // VAE-encode + denoise/decode body once against the `heavy` borrow — identical for both.
             |heavy_owned, enc, on_progress| {
                 let heavy = heavy_owned.as_ref();
                 let (pos, neg) = enc;
-
                 let references = reference_images(req);
                 let last = *references.last().expect("validated non-empty");
 
@@ -438,13 +499,21 @@ impl QwenImageEdit {
                     MODEL_ID,
                     capture_sigma,
                 )?;
-                let decoder: &dyn LatentDecoder = match &pid_decoder {
-                    Some(d) => d,
-                    None => heavy.vae,
-                };
                 let denoise_sigmas = &params.sigmas[..keep];
+                let decoder = pid_decoder
+                    .as_ref()
+                    .map(|decoder| decoder as &dyn LatentDecoder)
+                    .or_else(|| {
+                        heavy
+                            .alternate_decoder
+                            .map(|decoder| decoder as &dyn LatentDecoder)
+                    });
                 let images = decode_and_collect(
+                    heavy.vae,
                     decoder,
+                    decode_tiling.as_ref(),
+                    req,
+                    MODEL_ID,
                     req.count,
                     params.base_seed,
                     out_w,
@@ -452,7 +521,7 @@ impl QwenImageEdit {
                     on_progress,
                     |seed, progress| {
                         let noise = create_noise(seed, out_w, out_h)?;
-                        denoise_edit_with_progress(
+                        let latents = denoise_edit_with_progress_windowed(
                             heavy.transformer,
                             params.sampler_name.as_deref(),
                             denoise_sigmas,
@@ -465,9 +534,18 @@ impl QwenImageEdit {
                             params.guidance,
                             out_w,
                             out_h,
+                            attention_budget,
+                            block_window,
                             &req.cancel,
+                            &req.preview,
                             progress,
-                        )
+                        )?;
+                        crate::pipeline::calibration_fault(
+                            req,
+                            mlx_gen::gen_core::MemoryPhase::Denoise,
+                            MODEL_ID,
+                        )?;
+                        Ok(latents)
                     },
                 )?;
                 Ok(GenerationOutput::Images(images))
@@ -550,8 +628,23 @@ fn validate_reference_images(req: &GenerationRequest) -> Result<()> {
 // shared `validate_request`, so it is not the plain delegation `impl_generator!` expresses.
 mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load;
-    footprint = crate::model::component_footprint
+    footprint = crate::model::edit_component_footprint
 }
+
+pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
+        safety_check: crate::memory_strategy::registered_safety_check,
+    };
+pub const MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(MODEL_ID, spec, contract, context)
+        },
+    };
 
 #[cfg(test)]
 mod tests {
@@ -695,40 +788,48 @@ mod tests {
         assert_eq!(got.last().unwrap().width, 24);
     }
 
-    // ── F-180 (sc-11126): weight-free, default-run proof that Qwen-Image-Edit's dispatch HONORS
-    // `offload_policy`. `build_residency` points at a non-existent snapshot *directory* (so the up-front
-    // precision/single-file guard in `resolve_root` passes) and the discriminator is deferral:
-    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
-    //   * `Resident` eager-loads the Qwen2.5-VL vision-language encoder from the missing dir → `Err`.
-    // A dispatch that ignored `offload_policy` (always `Resident`) would eager-load under a `Sequential`
-    // request and fail the first assertion. The A/B real-weight test is `#[ignore]`d; this runs by
-    // default.
-    fn missing_snapshot_spec(policy: OffloadPolicy) -> LoadSpec {
-        LoadSpec::new(WeightsSource::Dir(
-            "/nonexistent/qwen-image-edit-residency-test-snapshot".into(),
-        ))
-        .with_offload_policy(policy)
+    fn sealed_then_mutated_language_source(
+        policy: OffloadPolicy,
+    ) -> (
+        tempfile::TempDir,
+        LoadSpec,
+        mlx_gen::gen_core::ValidatedEncoderSource,
+    ) {
+        let fixture = tempfile::tempdir().unwrap();
+        let contract = crate::active_encoder_contract();
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &fixture.path().join("text_encoder"),
+            contract,
+            crate::active_vision_encoder_contract(),
+        )
+        .unwrap();
+        let alternate = fixture.path().join("alternate-language");
+        gen_core_testkit::write_encoder_contract_fixture(&alternate, contract).unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(fixture.path().to_path_buf()))
+            .with_text_encoder(WeightsSource::Dir(alternate.clone()))
+            .with_offload_policy(policy);
+        let source = contract.source_for_load(&spec, fixture.path()).unwrap();
+        std::fs::write(alternate.join("config.json"), b"{}\n").unwrap();
+        (fixture, spec, source)
     }
 
     #[test]
     fn build_residency_sequential_defers_all_component_loads() {
-        let res = build_residency(&missing_snapshot_spec(OffloadPolicy::Sequential))
-            .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
-        assert!(
-            res.is_sequential(),
-            "Sequential policy must build a Sequential (deferred) residency"
-        );
+        let _guard = crate::scoped_bounded_encoder_contract();
+        let (_fixture, spec, source) =
+            sealed_then_mutated_language_source(OffloadPolicy::Sequential);
+        let residency = build_residency_with_source(&spec, source).unwrap();
+        assert!(residency.is_sequential());
     }
 
     #[test]
-    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
-        let err = build_residency(&missing_snapshot_spec(OffloadPolicy::Resident))
+    fn build_residency_resident_eagerly_invokes_the_text_loader() {
+        let _guard = crate::scoped_bounded_encoder_contract();
+        let (_fixture, spec, source) = sealed_then_mutated_language_source(OffloadPolicy::Resident);
+        let error = build_residency_with_source(&spec, source)
             .err()
-            .expect("Resident must eager-load and fail on a missing snapshot dir");
-        let msg = err.to_string();
-        assert!(
-            !msg.contains("single .safetensors file") && !msg.contains("precision override"),
-            "expected an eager-load failure, not the up-front guard: {msg}"
-        );
+            .expect("Resident must eagerly invoke the production edit text loader")
+            .to_string();
+        assert!(error.contains("changed after load"), "{error}");
     }
 }

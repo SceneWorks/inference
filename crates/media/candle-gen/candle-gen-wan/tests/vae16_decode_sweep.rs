@@ -20,7 +20,7 @@
 //! set CUDA_VISIBLE_DEVICES=0
 //! set WAN_VAE16_SNAPSHOT=E:\staged\12402\wan-t2v-q4
 //! set WAN_W=1280& set WAN_H=720& set WAN_FRAMES=81
-//!   cargo test -p candle-gen-wan --features cuda --release --test vae16_decode_sweep -- --ignored --nocapture
+//!   cargo test -p candle-gen-wan --features cuda --release --test integration vae16_decode_sweep:: -- --ignored --nocapture
 //! # add WAN_TILE_PX=512 [WAN_OVERLAP_PX=64] for a fixed spatial-tile run (anchor fitting)
 //! # add WAN_BUDGETED=1 [WAN_VAE_BUDGET_GIB=20] to exercise the production budgeted selector
 //! # add WAN_GPU=0 to pick which GPU ordinal nvidia-smi samples (default 0; pair with CUDA_VISIBLE_DEVICES)

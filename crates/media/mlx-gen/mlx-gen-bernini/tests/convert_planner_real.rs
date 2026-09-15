@@ -11,6 +11,22 @@ use std::path::PathBuf;
 use mlx_gen::weights::Weights;
 use mlx_gen_bernini::convert::assemble_bernini_planner_snapshot;
 
+/// The converted-snapshot store these tests assemble into.
+///
+/// `MLX_GEN_CONVERTED_ROOT` overrides it. The `$HOME` default stays because this is a **derived
+/// cache** the tests build themselves from a caller-provisioned HF snapshot — not a provided input,
+/// which is why it takes a fallback rather than the hard epic-13657 requirement `MLX_GEN_MODELS_ROOT`
+/// and the `*_SRC` variables carry. Without the override, pointing the suite at a real store did
+/// nothing: resolution read `$HOME` unconditionally and the rows skipped or mis-resolved while still
+/// reporting green.
+fn converted_root() -> PathBuf {
+    std::env::var("MLX_GEN_CONVERTED_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").expect("HOME")).join(".cache/mlx-gen-models")
+        })
+}
+
 fn hf_snapshot(repo: &str) -> Option<PathBuf> {
     let home = std::env::var("MLX_GEN_MODELS_ROOT").ok()?;
     let snaps = PathBuf::from(home)
@@ -35,8 +51,7 @@ fn count_and_shape(file: &PathBuf, key: &str) -> (usize, Vec<i32>) {
 fn assemble_real_bernini_planner() {
     let pkg = hf_snapshot("ByteDance/Bernini-Diffusers")
         .expect("ByteDance/Bernini-Diffusers snapshot in the HF cache");
-    let out = PathBuf::from(std::env::var("HOME").unwrap())
-        .join(".cache/mlx-gen-models/bernini_planner_mlx_bf16");
+    let out = converted_root().join("bernini_planner_mlx_bf16");
 
     // Link the shared encoders (zero-copy) — this is the default the e2e pipeline (sc-5145) uses.
     let dir =

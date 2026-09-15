@@ -1,49 +1,735 @@
+import json
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.release.verify_residency_ab import read_peak, verify
+from scripts.release.verify_residency_ab import (
+    PREFIX,
+    parse_expected_parity,
+    read_record,
+    verify,
+)
+
+
+REVISION = "a" * 40
+SCENEWORKS_REVISION = "b" * 40
+MODEL_REVISION = "c" * 40
+MODEL_INVENTORY_SHA256 = "d" * 64
+FINGERPRINT = "test-layout-v1"
+OUTPUT = b"exact parity output"
+OUTPUT_SHA256 = hashlib.sha256(OUTPUT).hexdigest()
+EXACT = parse_expected_parity("exact")
+TOLERANCE = parse_expected_parity("tolerance:mean_abs_u8_subpixel:4.0")
+
+
+def record(strategy: str, peak: int, output: bytes = OUTPUT, parity: dict | None = None) -> dict:
+    composition = ["resident"]
+    if strategy == "staged_residency":
+        composition.append("staged_residency")
+    return {
+        "schema_version": 2,
+        "key": {
+            "model_family": "flux",
+            "resolved_route": "flux1_dev",
+            "backend": "candle",
+            "tier": {
+                "precision": "bf16",
+                "quant": "q8",
+                "component_precision_floors": [],
+            },
+            "load_shape": "eager_materialization",
+            "mode": "text_to_image",
+            "reference_shape": "none",
+            "overlay": None,
+            "geometry": {
+                "width": 1024,
+                "height": 1024,
+                "batch": 1,
+                "frames": 1,
+                "reference_count": 0,
+            },
+            "frames_per_second": None,
+            "strategy": strategy,
+            "engaged_composition": composition,
+            "parameters": {
+                "decode_tile_edge": None,
+                "decode_overlap": None,
+                "attention_chunk_size": None,
+                "transformer_window_size": None,
+                "transformer_window_component": None,
+            },
+        },
+        "declared_calibration": {
+            "abi": 3,
+            "fingerprint": FINGERPRINT,
+            "load_shape": "eager_materialization",
+        },
+        "observed_calibration": {
+            "abi": 3,
+            "fingerprint": FINGERPRINT,
+            "load_shape": "eager_materialization",
+        },
+        "predicted_peak_bytes": peak,
+        "observed_peak_bytes": peak,
+        "inference_revision": REVISION,
+        "sceneworks_revision": SCENEWORKS_REVISION,
+        "model_revision": MODEL_REVISION,
+        "model_inventory_sha256": MODEL_INVENTORY_SHA256,
+        "harness_version": "test-harness-v1",
+        "output_sha256": hashlib.sha256(output).hexdigest(),
+        "parity": dict(parity) if parity is not None else {"kind": "exact"},
+        "parity_result": {"kind": "not_run"},
+    }
 
 
 class VerifyResidencyAbTests(unittest.TestCase):
-    def write_log(self, root: Path, name: str, mode: str, peak: int) -> Path:
+    def write_log(self, root: Path, name: str, payload: dict) -> Path:
         path = root / name
         path.write_text(
-            f"test output\nSEQ_AB model=flux1_dev mode={mode} gpu=NVIDIA peak_mib={peak} | sample\n",
+            "test output\n" + PREFIX + json.dumps(payload, separators=(",", ":")) + "\n",
             encoding="utf-8",
         )
         return path
 
-    def test_accepts_material_reduction(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            resident = self.write_log(root, "resident.log", "resident", 24000)
-            sequential = self.write_log(root, "sequential.log", "spec-sequential", 15000)
-            self.assertEqual(verify(resident, sequential, 512), (24000, 15000))
+    def valid_pair(self, root: Path) -> tuple[Path, Path, Path, Path]:
+        resident = self.write_log(root, "resident.log", record("resident", 24_000 << 20))
+        staged = self.write_log(
+            root, "staged.log", record("staged_residency", 15_000 << 20)
+        )
+        resident_output = root / "resident.rgb"
+        staged_output = root / "staged.rgb"
+        resident_output.write_bytes(OUTPUT)
+        staged_output.write_bytes(OUTPUT)
+        return resident, staged, resident_output, staged_output
 
-    def test_rejects_wrong_mode_and_insufficient_reduction(self) -> None:
+    def test_accepts_complete_material_reduction(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            resident = self.write_log(root, "resident.log", "resident", 16000)
-            wrong = self.write_log(root, "wrong.log", "resident", 14000)
-            with self.assertRaisesRegex(RuntimeError, "expected mode=spec-sequential"):
-                read_peak(wrong, "spec-sequential")
-            sequential = self.write_log(root, "sequential.log", "spec-sequential", 15700)
-            with self.assertRaisesRegex(RuntimeError, "required at least 512"):
-                verify(resident, sequential, 512)
+            resident, staged, resident_output, staged_output = self.valid_pair(Path(temporary))
+            self.assertEqual(
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                    EXACT,
+                ),
+                (24_000 << 20, 15_000 << 20, None, None),
+            )
 
-    def test_rejects_missing_or_ambiguous_results(self) -> None:
+    def test_rejects_legacy_missing_duplicate_and_malformed_records(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "log"
-            path.write_text("no result\n", encoding="utf-8")
-            with self.assertRaisesRegex(RuntimeError, "found 0"):
-                read_peak(path, "resident")
+            path.write_text("SEQ_AB mode=resident peak_mib=1\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "legacy SEQ_AB"):
+                read_record(path, "resident")
+            payload = json.dumps(record("resident", 10))
+            path.write_text(f"{PREFIX}{payload}\n{PREFIX}{payload}\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "found 2"):
+                read_record(path, "resident")
             path.write_text(
-                "SEQ_AB mode=resident peak_mib=1\nSEQ_AB mode=resident peak_mib=2\n",
+                f"{PREFIX}{payload}\nSEQ_AB mode=resident peak_mib=1\n",
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(RuntimeError, "found 2"):
-                read_peak(path, "resident")
+            with self.assertRaisesRegex(RuntimeError, "legacy SEQ_AB"):
+                read_record(path, "resident")
+            path.write_text(
+                f"test output SEQ_AB mode=resident peak_mib=1\n{PREFIX}{payload}\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "legacy SEQ_AB"):
+                read_record(path, "resident")
+            path.write_text(f'{PREFIX}{{"schema_version":2,"schema_version":2}}\n', encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "duplicate JSON key"):
+                read_record(path, "resident")
+
+    def test_rejects_missing_extra_and_wrongly_typed_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, mutate, message in (
+                ("missing", lambda value: value.pop("harness_version"), "missing"),
+                ("extra", lambda value: value.update({"legacy_peak_mib": 4}), "extra"),
+                (
+                    "bool-peak",
+                    lambda value: value.update({"observed_peak_bytes": True}),
+                    "positive integer",
+                ),
+            ):
+                payload = record("resident", 10)
+                mutate(payload)
+                path = self.write_log(root, name, payload)
+                with self.assertRaisesRegex(RuntimeError, message):
+                    read_record(path, "resident")
+
+            payload = record("resident", 10)
+            payload["parity"] = {
+                "kind": "tolerance",
+                "metric": "max_abs",
+                "maximum_error": float("nan"),
+            }
+            path = self.write_log(root, "non-finite", payload)
+            with self.assertRaisesRegex(RuntimeError, "non-finite JSON number"):
+                read_record(path, "resident")
+
+            overflow = record("resident", 10)
+            overflow["parity"] = {
+                "kind": "tolerance",
+                "metric": "max_abs",
+                "maximum_error": 0,
+            }
+            encoded = json.dumps(overflow, separators=(",", ":")).replace(
+                '"maximum_error":0', '"maximum_error":1e9999'
+            )
+            path.write_text(f"{PREFIX}{encoded}\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "finite and non-negative"):
+                read_record(path, "resident")
+
+    def test_requires_schema_v2_and_the_expanded_evidence_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            old_schema = record("resident", 10)
+            old_schema["schema_version"] = 1
+            with self.assertRaisesRegex(RuntimeError, "schema_version must be 2"):
+                read_record(self.write_log(root, "old-schema", old_schema), "resident")
+
+            missing_family = record("resident", 10)
+            missing_family["key"].pop("model_family")
+            with self.assertRaisesRegex(RuntimeError, "key keys differ"):
+                read_record(self.write_log(root, "missing-family", missing_family), "resident")
+
+            crossed_reference = record("resident", 10)
+            crossed_reference["key"]["reference_shape"] = "image"
+            with self.assertRaisesRegex(RuntimeError, "reference_shape must be none"):
+                read_record(self.write_log(root, "crossed-reference", crossed_reference), "resident")
+
+    def test_rejects_fingerprint_abi_revision_and_load_shape_mismatches(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            resident, staged, resident_output, staged_output = self.valid_pair(root)
+            with self.assertRaisesRegex(RuntimeError, "exported calibration fingerprint"):
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    "other-layout-v1",
+                    3,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                    EXACT,
+                )
+            with self.assertRaisesRegex(RuntimeError, "exported ABI"):
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    4,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                    EXACT,
+                )
+            with self.assertRaisesRegex(RuntimeError, "model revision"):
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    "e" * 40,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                    EXACT,
+                )
+            with self.assertRaisesRegex(RuntimeError, "model inventory SHA-256"):
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    MODEL_REVISION,
+                    "f" * 64,
+                    resident_output,
+                    staged_output,
+                    EXACT,
+                )
+
+            for name, mutate, message in (
+                (
+                    "observed-fingerprint",
+                    lambda value: value["observed_calibration"].update(
+                        {"fingerprint": "other-layout-v1"}
+                    ),
+                    "identities differ",
+                ),
+                (
+                    "shape",
+                    lambda value: value["observed_calibration"].update(
+                        {"load_shape": "deferred_materialization"}
+                    ),
+                    "identities differ",
+                ),
+                (
+                    "revision",
+                    lambda value: value.update({"inference_revision": "main"}),
+                    "exact lowercase",
+                ),
+                (
+                    "model-inventory",
+                    lambda value: value.update({"model_inventory_sha256": "mutable"}),
+                    "64 lowercase",
+                ),
+                (
+                    "grammar",
+                    lambda value: [
+                        value[field].update({"fingerprint": "Layout_V1"})
+                        for field in ("declared_calibration", "observed_calibration")
+                    ],
+                    "lowercase ASCII kebab",
+                ),
+                (
+                    "zero-version",
+                    lambda value: [
+                        value[field].update({"fingerprint": "layout-v0-v1"})
+                        for field in ("declared_calibration", "observed_calibration")
+                    ],
+                    "exactly one positive",
+                ),
+            ):
+                payload = record("resident", 10)
+                mutate(payload)
+                path = self.write_log(root, name, payload)
+                with self.assertRaisesRegex(RuntimeError, message):
+                    read_record(path, "resident")
+
+    def test_rejects_every_non_strategy_ab_invariant_and_small_reduction(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            resident_payload = record("resident", 16_000 << 20)
+            resident_output = root / "resident.rgb"
+            staged_output = root / "staged.rgb"
+            resident_output.write_bytes(OUTPUT)
+            staged_output.write_bytes(OUTPUT)
+            for field, value in (
+                ("backend", "mlx"),
+                ("mode", "edit"),
+                ("overlay", "control"),
+                ("load_shape", "deferred_materialization"),
+            ):
+                staged_payload = record("staged_residency", 14_000 << 20)
+                staged_payload["key"][field] = value
+                if field == "load_shape":
+                    staged_payload["declared_calibration"]["load_shape"] = value
+                    staged_payload["observed_calibration"]["load_shape"] = value
+                resident = self.write_log(root, f"resident-{field}", resident_payload)
+                staged = self.write_log(root, f"staged-{field}", staged_payload)
+                with self.assertRaisesRegex(RuntimeError, "non-strategy A/B invariant"):
+                    verify(
+                        resident,
+                        staged,
+                        512,
+                        "flux1_dev",
+                        FINGERPRINT,
+                        3,
+                        MODEL_REVISION,
+                        MODEL_INVENTORY_SHA256,
+                        resident_output,
+                        staged_output,
+                        EXACT,
+                    )
+
+            resident = self.write_log(root, "resident-small", resident_payload)
+            staged = self.write_log(
+                root, "staged-small", record("staged_residency", 15_700 << 20)
+            )
+            with self.assertRaisesRegex(RuntimeError, "required at least"):
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                    EXACT,
+                )
+
+            resident, staged, resident_output, staged_output = self.valid_pair(root)
+            staged_output.write_bytes(b"different output")
+            with self.assertRaisesRegex(RuntimeError, "SHA-256 does not match"):
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                    EXACT,
+                )
+            with self.assertRaisesRegex(RuntimeError, "non-negative"):
+                verify(
+                    resident,
+                    staged,
+                    -1,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                    EXACT,
+                )
+
+    def tolerance_pair(
+        self, root: Path, resident_bytes: bytes, staged_bytes: bytes
+    ) -> tuple[Path, Path, Path, Path]:
+        resident = self.write_log(
+            root,
+            "resident.log",
+            record("resident", 24_000 << 20, output=resident_bytes, parity=TOLERANCE),
+        )
+        staged = self.write_log(
+            root,
+            "staged.log",
+            record(
+                "staged_residency", 15_000 << 20, output=staged_bytes, parity=TOLERANCE
+            ),
+        )
+        resident_output = root / "resident.rgb"
+        staged_output = root / "staged.rgb"
+        resident_output.write_bytes(resident_bytes)
+        staged_output.write_bytes(staged_bytes)
+        return resident, staged, resident_output, staged_output
+
+    def test_accepts_declared_tolerance_within_ceiling(self) -> None:
+        # Mean drift 2.0 under the declared 4.0 ceiling: the sc-18149 adjudicated shape. The
+        # measured drift is recomputed from the artifacts and returned for the result line.
+        with tempfile.TemporaryDirectory() as temporary:
+            resident, staged, resident_output, staged_output = self.tolerance_pair(
+                Path(temporary), bytes([0] * 16), bytes([2] * 16)
+            )
+            self.assertEqual(
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                    TOLERANCE,
+                ),
+                (24_000 << 20, 15_000 << 20, 2.0, None),
+            )
+
+    def test_rejects_tolerance_drift_above_the_declared_ceiling(self) -> None:
+        # Mean drift 5.0 over the declared 4.0 ceiling: the mutation check — the recomputed metric,
+        # not the records' own verdict, is what fails the lane.
+        with tempfile.TemporaryDirectory() as temporary:
+            resident, staged, resident_output, staged_output = self.tolerance_pair(
+                Path(temporary), bytes([0] * 16), bytes([5] * 16)
+            )
+            with self.assertRaisesRegex(RuntimeError, "above the declared tolerance"):
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                    TOLERANCE,
+                )
+
+    def test_rejects_tolerance_outputs_that_differ_in_length(self) -> None:
+        # The mean over zipped bytes would silently truncate; the explicit length check refuses.
+        with tempfile.TemporaryDirectory() as temporary:
+            resident, staged, resident_output, staged_output = self.tolerance_pair(
+                Path(temporary), bytes([0] * 16), bytes([0] * 12)
+            )
+            with self.assertRaisesRegex(RuntimeError, "differ in length"):
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                    TOLERANCE,
+                )
+
+    def test_rejects_records_whose_contract_differs_from_the_lane_expectation(self) -> None:
+        # The lane pins the contract; records cannot self-declare a looser (or different) one. Both
+        # directions must refuse: exact records under a tolerance lane, tolerance records under an
+        # exact lane, and a tolerance lane whose ceiling differs from the records'.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            resident, staged, resident_output, staged_output = self.valid_pair(root)
+            with self.assertRaisesRegex(RuntimeError, "parity contract this lane declares"):
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                    TOLERANCE,
+                )
+        with tempfile.TemporaryDirectory() as temporary:
+            resident, staged, resident_output, staged_output = self.tolerance_pair(
+                Path(temporary), OUTPUT, OUTPUT
+            )
+            for expectation in (
+                EXACT,
+                parse_expected_parity("tolerance:mean_abs_u8_subpixel:6.0"),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "parity contract this lane declares"
+                ):
+                    verify(
+                        resident,
+                        staged,
+                        512,
+                        "flux1_dev",
+                        FINGERPRINT,
+                        3,
+                        MODEL_REVISION,
+                        MODEL_INVENTORY_SHA256,
+                        resident_output,
+                        staged_output,
+                        expectation,
+                    )
+
+    def test_rejects_exact_expectation_when_outputs_differ(self) -> None:
+        # Each record's SHA-256 binds to its own (differing) artifact, so the sha checks pass and
+        # only the exact-parity comparison itself can refuse — it must.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            other = b"drifted parity output"
+            resident = self.write_log(root, "resident.log", record("resident", 24_000 << 20))
+            staged = self.write_log(
+                root,
+                "staged.log",
+                record("staged_residency", 15_000 << 20, output=other),
+            )
+            resident_output = root / "resident.rgb"
+            staged_output = root / "staged.rgb"
+            resident_output.write_bytes(OUTPUT)
+            staged_output.write_bytes(other)
+            with self.assertRaisesRegex(RuntimeError, "violate exact parity"):
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                    EXACT,
+                )
+
+    def test_accepts_and_binds_the_isolator_artifact(self) -> None:
+        # The isolator leg (Resident + forced tiled decode) must be byte-identical to the staged
+        # output — recomputed HERE from the persisted artifact (sc-18149 review), so residency
+        # exactness is verifier-enforced rather than harness-trusted.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            staged_bytes = bytes([2] * 16)
+            resident, staged, resident_output, staged_output = self.tolerance_pair(
+                root, bytes([0] * 16), staged_bytes
+            )
+            isolator_output = root / "resident-tiled.rgb"
+            isolator_output.write_bytes(staged_bytes)
+            self.assertEqual(
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                    TOLERANCE,
+                    isolator_output=isolator_output,
+                ),
+                (24_000 << 20, 15_000 << 20, 2.0, None),
+            )
+
+    def test_rejects_an_isolator_that_differs_from_the_staged_output(self) -> None:
+        # A staged/isolator byte difference means residency staging itself drifted — the decode
+        # tolerance must not absorb it, and the verifier must catch it independently.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            resident, staged, resident_output, staged_output = self.tolerance_pair(
+                root, bytes([0] * 16), bytes([2] * 16)
+            )
+            isolator_output = root / "resident-tiled.rgb"
+            isolator_output.write_bytes(bytes([3] * 16))
+            with self.assertRaisesRegex(
+                RuntimeError, "not byte-identical to the resident\\+tiled isolator"
+            ):
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                    TOLERANCE,
+                    isolator_output=isolator_output,
+                )
+
+    def test_rejects_a_missing_isolator_artifact(self) -> None:
+        # A harness that stops persisting the isolator leg must fail the lane, not silently drop
+        # the exactness check.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            resident, staged, resident_output, staged_output = self.tolerance_pair(
+                root, bytes([0] * 16), bytes([2] * 16)
+            )
+            with self.assertRaisesRegex(RuntimeError, "isolator output artifact is missing"):
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                    TOLERANCE,
+                    isolator_output=root / "never-written.rgb",
+                )
+
+    def test_accepts_a_p99_within_the_declared_tail_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            resident, staged, resident_output, staged_output = self.tolerance_pair(
+                Path(temporary), bytes([0] * 16), bytes([2] * 16)
+            )
+            self.assertEqual(
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                    TOLERANCE,
+                    max_p99_abs_u8=13,
+                ),
+                (24_000 << 20, 15_000 << 20, 2.0, 2),
+            )
+
+    def test_rejects_a_p99_breach_even_when_the_mean_is_within_ceiling(self) -> None:
+        # 11 of 1000 subpixels at 255, the rest identical: mean 2.805 passes the 4.0 ceiling but
+        # more than 1% of subpixels sit at 255, so p99 = 255 — the tail redistribution the pin
+        # exists to catch, recomputed by the verifier from the artifacts.
+        with tempfile.TemporaryDirectory() as temporary:
+            staged_bytes = bytes([255] * 11 + [0] * 989)
+            resident, staged, resident_output, staged_output = self.tolerance_pair(
+                Path(temporary), bytes([0] * 1000), staged_bytes
+            )
+            with self.assertRaisesRegex(RuntimeError, "above the declared tail pin"):
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                    TOLERANCE,
+                    max_p99_abs_u8=13,
+                )
+
+    def test_rejects_malformed_expected_parity(self) -> None:
+        for value, message in (
+            ("tolerance:not_a_metric:4.0", "not recomputable"),
+            ("tolerance:mean_abs_u8_subpixel:x", "must be a number"),
+            ("tolerance:mean_abs_u8_subpixel:-1", "finite and non-negative"),
+            ("tolerance:mean_abs_u8_subpixel:inf", "finite and non-negative"),
+            ("golden:fixture:m:1.0", "must be 'exact'"),
+            ("", "must be 'exact'"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, message):
+                parse_expected_parity(value)
+
+    def test_rejects_strategy_composition_and_parameter_schema_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = record("staged_residency", 10)
+            payload["key"]["engaged_composition"] = ["resident"]
+            path = self.write_log(root, "composition", payload)
+            with self.assertRaisesRegex(RuntimeError, "engaged_composition"):
+                read_record(path, "staged_residency")
+
+            payload = record("resident", 10)
+            payload["key"]["parameters"]["decode_tile_edge"] = "512"
+            path = self.write_log(root, "parameter", payload)
+            with self.assertRaisesRegex(RuntimeError, "non-negative integer or null"):
+                read_record(path, "resident")
+
+            payload = record("staged_residency", 10)
+            payload["key"]["parameters"]["decode_tile_edge"] = 512
+            path = self.write_log(root, "resident-parameter", payload)
+            with self.assertRaisesRegex(RuntimeError, "must be empty"):
+                read_record(path, "staged_residency")
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@
 //! the unit tests in `src/tokenizer.rs` that DO run on CI. Run this locally:
 //!
 //!   MLX_GEN_ZIMAGE_TOKENIZER=/path/to/Z-Image-Turbo/tokenizer/tokenizer.json \
-//!     cargo test --test tokenizer_parity -- --ignored
+//!     cargo test --test integration -- tokenizer_parity:: --ignored
 //!
 //! Fixture `tests/fixtures/tokenizer_zimage.safetensors` ← `tools/dump_z_image_tokenizer.py`.
 

@@ -265,15 +265,8 @@ mod tests {
 
     #[test]
     fn resume_bundle_round_trips_and_rejects_factor_corruption() {
-        let dir = std::env::temp_dir().join(format!(
-            "candle_resume_bundle_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let source = adapter(7);
         let source_opt =
             TrainOptimizer::from_config("adamw", source.vars.clone(), 1e-3, 0.01).unwrap();
@@ -400,6 +393,5 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("dataset/request fingerprint differs"));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -14,13 +14,14 @@
 //! exposes); the modulation table stays frozen.
 //!
 //! Since sc-11720, every Linear leaf on the frozen base — the attention `to_gate`, the SwiGLU FFN, and
-//! the pre-main front-end (`img_in`, the timestep MLP, `txt_in.linear_1/2`, `final_layer.linear`) — is
-//! also wrapped so it can host a **forward-time additive USER LoRA** at control-lane inference (the
-//! [`crate::adapters::AdditiveDit`] surface, disjoint from the trainer surface above). These wrappers
-//! carry no trainable factor, so training and `control_scale=0` are byte-identical to a plain `Linear`:
-//! candle's `sorted_nodes` prunes any backward branch that reaches no `Var`, so the front-end is still
-//! never differentiated and train/infer conditioning parity holds at zero cost. `time_mod_proj` stays a
-//! plain `Linear` (out of the adapter surface, matching the txt2img front-end set).
+//! the pre-main front-end (`img_in`, the timestep MLP, `time_mod_proj`, `txt_in.linear_1/2`,
+//! `final_layer.linear`) — is also wrapped so it can host a **forward-time additive USER LoRA** at
+//! control-lane inference (the [`crate::adapters::AdditiveDit`] surface, disjoint from the trainer
+//! surface above). These wrappers carry no trainable factor, so training and `control_scale=0` are
+//! byte-identical to a plain `Linear`: candle's `sorted_nodes` prunes any backward branch that reaches
+//! no `Var`, so the front-end is still never differentiated and train/infer conditioning parity holds
+//! at zero cost. The surface matches the txt2img front end, including the native `tproj.1` target that
+//! normalizes to canonical `time_mod_proj` (sc-18477).
 //!
 //! ## Velocity sign
 //!
@@ -41,14 +42,15 @@
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 use candle_gen::candle_nn::ops::{sigmoid, softmax};
-use candle_gen::candle_nn::{Linear, Module};
+use candle_gen::candle_nn::Module;
 use candle_gen::train::gradient_checkpoint::Segment;
 use candle_gen::train::lora::{LoraHost, LoraLinear};
 
 use crate::config::Krea2Config;
 use candle_gen::quant::QLinear as SharedQLinear;
 
-use crate::loader::{linear, rms_scale_weight, Weights};
+use crate::loader::{linear, linear_detect, rms_scale_weight, Weights};
+use crate::quant::QLinear as KreaQLinear;
 use crate::transformer::block::{RmsScale, SwiGlu, TextFusionTransformer};
 use crate::transformer::rope::{apply_interleaved_rope, RopeTables};
 use crate::transformer::{patchify, temb, unpatchify, RopeCache, ROPE_CACHE_CAP};
@@ -123,10 +125,61 @@ pub(crate) fn sdpa_diff_budgeted(
 /// Build a frozen base `Linear` (no bias) from the mmap'd `Weights` and wrap it as a trainable
 /// [`LoraLinear`], reading `in`/`out` from the on-disk shape (`[out, in]`) and recording `path` as the
 /// PEFT module path the harness matches against.
-fn lora_proj(w: &Weights, path: &str, bias: bool) -> Result<LoraLinear> {
+fn lora_proj(w: &Weights, path: &str, bias: bool) -> Result<ComposableLinear> {
     let base = linear(w, path, bias)?;
     let (out_f, in_f) = base.weight().dims2()?;
-    Ok(LoraLinear::from_linear(base, in_f, out_f, path.to_string()))
+    Ok(ComposableLinear::Adapt(LoraLinear::from_linear(
+        base,
+        in_f,
+        out_f,
+        path.to_string(),
+    )))
+}
+
+/// A projection in the composable control DiT. Dense and MLX-packed bases retain the adapter-capable
+/// [`LoraLinear`] path; an immutable ConvRot checkpoint uses Krea's native [`KreaQLinear`] so its I8
+/// codes, per-row scales, online Hadamard rotation, and shared cuBLASLt context remain intact. Both
+/// arms expose the same inference-only additive LoRA/LoKr contract.
+pub(crate) enum ComposableLinear {
+    Adapt(LoraLinear),
+    ConvRot(KreaQLinear),
+}
+
+impl ComposableLinear {
+    fn lora_mut(&mut self) -> Option<&mut LoraLinear> {
+        match self {
+            Self::Adapt(linear) => Some(linear),
+            Self::ConvRot(_) => None,
+        }
+    }
+
+    fn visit_additive(
+        &mut self,
+        path: &str,
+        f: &mut dyn FnMut(&str, &mut dyn crate::adapters::AdditiveProj) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        match self {
+            Self::Adapt(linear) => f(path, linear),
+            Self::ConvRot(linear) => match linear.as_additive_mut() {
+                Some(linear) => f(path, linear),
+                None => Ok(()),
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_convrot(&self) -> bool {
+        matches!(self, Self::ConvRot(_))
+    }
+}
+
+impl Module for ComposableLinear {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Adapt(linear) => linear.forward(x),
+            Self::ConvRot(linear) => linear.forward(x),
+        }
+    }
 }
 
 /// Packed-inference twin of [`lora_proj`] (sc-11727). On a packed q4/q8 tier, build the projection's
@@ -138,7 +191,10 @@ fn lora_proj(w: &Weights, path: &str, bias: bool) -> Result<LoraLinear> {
 /// weight is materialized just to read them. On a dense (bf16) tier there is no packed base to keep, so
 /// defer to [`lora_proj`] (identical). INFERENCE-ONLY: a packed base cannot host a trainable `Var`
 /// residual, so the trainer keeps [`lora_proj`].
-fn lora_proj_packed(w: &Weights, path: &str, bias: bool) -> Result<LoraLinear> {
+pub(crate) fn lora_proj_packed(w: &Weights, path: &str, bias: bool) -> Result<ComposableLinear> {
+    if w.is_convrot() {
+        return Ok(ComposableLinear::ConvRot(linear_detect(w, path, bias)?));
+    }
     let scales_key = format!("{path}.scales");
     match w.packed() {
         Some(cfg) if w.contains(&scales_key) => {
@@ -165,7 +221,12 @@ fn lora_proj_packed(w: &Weights, path: &str, bias: bool) -> Result<LoraLinear> {
                 group,
                 w.device(),
             )?;
-            Ok(LoraLinear::from_qlinear(ql, in_f, out_f, path.to_string()))
+            Ok(ComposableLinear::Adapt(LoraLinear::from_qlinear(
+                ql,
+                in_f,
+                out_f,
+                path.to_string(),
+            )))
         }
         _ => lora_proj(w, path, bias),
     }
@@ -173,7 +234,7 @@ fn lora_proj_packed(w: &Weights, path: &str, bias: bool) -> Result<LoraLinear> {
 
 /// The projection loader a [`KreaTrainDit`] build uses: the packed-detecting [`lora_proj_packed`] on the
 /// control-INFERENCE path (`packed = true`, codes stay in VRAM), else the dense trainable [`lora_proj`].
-type ProjLoader = fn(&Weights, &str, bool) -> Result<LoraLinear>;
+type ProjLoader = fn(&Weights, &str, bool) -> Result<ComposableLinear>;
 
 fn proj_loader(packed: bool) -> ProjLoader {
     if packed {
@@ -187,11 +248,11 @@ fn proj_loader(packed: bool) -> ProjLoader {
 /// frozen `to_gate` / per-head `+1` RMSNorm — the trainable twin of [`crate::transformer::block`]'s
 /// `GatedAttention`.
 struct TrainAttention {
-    q: LoraLinear,
-    k: LoraLinear,
-    v: LoraLinear,
-    gate: LoraLinear,
-    o: LoraLinear,
+    q: ComposableLinear,
+    k: ComposableLinear,
+    v: ComposableLinear,
+    gate: ComposableLinear,
+    o: ComposableLinear,
     norm_q: Tensor, // f32, scale + 1
     norm_k: Tensor, // f32, scale + 1
     heads: usize,
@@ -238,10 +299,11 @@ impl TrainAttention {
         &mut self,
         f: &mut dyn FnMut(&mut LoraLinear) -> candle_gen::Result<()>,
     ) -> candle_gen::Result<()> {
-        f(&mut self.q)?;
-        f(&mut self.k)?;
-        f(&mut self.v)?;
-        f(&mut self.o)?;
+        for proj in [&mut self.q, &mut self.k, &mut self.v, &mut self.o] {
+            if let Some(proj) = proj.lora_mut() {
+                f(proj)?;
+            }
+        }
         Ok(())
     }
 
@@ -367,6 +429,23 @@ pub struct MainCtx {
     patch: usize,
 }
 
+/// Request-owned base/control conditioning. The text-fusion projection, joint RoPE, and encoded
+/// control-image tokens do not vary with Euler time or seed, so the control provider prepares them
+/// once before entering its denoise loop.
+pub(crate) struct PreparedControlConditioning {
+    context: Tensor,
+    pub(crate) ctrl_tokens: Tensor,
+    cap_len: usize,
+    img_len: usize,
+    ht: usize,
+    wt: usize,
+    latent_ch: usize,
+    dtype: DType,
+    device: candle_gen::candle_core::DeviceLocation,
+    rcos: Tensor,
+    rsin: Tensor,
+}
+
 /// The trainable Krea 2 single-stream DiT. Built from the same mmap'd `transformer/` `Weights` the
 /// inference path loads — the frozen base is shared; only the attention projections grow a `Var`-backed
 /// LoRA residual (installed by [`build_lora_targets`](candle_gen::train::lora::build_lora_targets)).
@@ -375,22 +454,22 @@ pub struct KreaTrainDit {
     device: Device,
     dtype: DType,
     // --- pre-main front-end. Upstream of the control branch (never trained); the Linear leaves are
-    //     `LoraLinear` so a USER LoRA (control-lane inference, sc-11720) can ride additively — identity
-    //     to the plain Linear when unadapted, so training / control_scale=0 stay byte-exact. `time_mod_
-    //     proj` stays plain Linear (out of the adapter surface, matching the txt2img front-end set). ---
-    img_in: LoraLinear,
-    time_embed_l1: LoraLinear,
-    time_embed_l2: LoraLinear,
-    time_mod_proj: Linear,
+    //     composable so a USER LoRA/LoKr (control-lane inference, sc-11720/sc-18477) can ride
+    //     additively — identity to the plain Linear when unadapted, so training / control_scale=0 stay
+    //     byte-exact. The surface matches txt2img, including canonical `time_mod_proj`. ---
+    img_in: ComposableLinear,
+    time_embed_l1: ComposableLinear,
+    time_embed_l2: ComposableLinear,
+    time_mod_proj: ComposableLinear,
     txt_in_norm: RmsScale,
-    txt_in_l1: LoraLinear,
-    txt_in_l2: LoraLinear,
+    txt_in_l1: ComposableLinear,
+    txt_in_l2: ComposableLinear,
     text_fusion: TextFusionTransformer,
     // --- trainable single-stream stack ---
     blocks: Vec<TrainBlock>,
     // --- final layer (composable; on the backward path to every adapter) ---
     final_norm: Tensor, // f32, scale + 1
-    final_linear: LoraLinear,
+    final_linear: ComposableLinear,
     final_sstable: Tensor, // [1, 2, hidden]
     /// The control/training front-end sees fixed `(caption, height, width)` geometry throughout a
     /// denoise loop, so share the same bounded RoPE cache used by the inference DiT.
@@ -440,7 +519,7 @@ impl KreaTrainDit {
             img_in: proj(w, "img_in", true)?,
             time_embed_l1: proj(w, "time_embed.linear_1", true)?,
             time_embed_l2: proj(w, "time_embed.linear_2", true)?,
-            time_mod_proj: linear(w, "time_mod_proj", true)?,
+            time_mod_proj: proj(w, "time_mod_proj", true)?,
             txt_in_norm: RmsScale::load(w, "txt_in.norm.weight", eps)?,
             txt_in_l1: proj(w, "txt_in.linear_1", true)?,
             txt_in_l2: proj(w, "txt_in.linear_2", true)?,
@@ -486,6 +565,91 @@ impl KreaTrainDit {
             )?;
             Ok(rope.joint())
         })
+    }
+
+    /// Prepare the seed/step-invariant text/control state for a strict-pose request.
+    pub(crate) fn prepare_control_conditioning(
+        &self,
+        context: &Tensor,
+        ctrl_latent: &Tensor,
+    ) -> candle_gen::Result<PreparedControlConditioning> {
+        let (_, channels, h, w) = ctrl_latent.dims4()?;
+        let p = self.cfg.patch_size;
+        if channels != self.cfg.in_channels / (p * p) || h == 0 || w == 0 {
+            return Err(candle_gen::CandleError::Msg(
+                "krea control: prepared conditioning has an invalid control latent geometry".into(),
+            ));
+        }
+        let (ht, wt) = (h / p, w / p);
+        let cap_len = context.dim(1)?;
+        let context = context.to_dtype(self.dtype)?;
+        let context = self.text_fusion.forward(&context)?;
+        let context = self.txt_in_norm.forward(&context)?;
+        let context = self
+            .txt_in_l2
+            .forward(&self.txt_in_l1.forward(&context)?.gelu()?)?;
+        let ctrl_tokens = self.embed_latent(ctrl_latent)?;
+        let (rcos, rsin) = self.rope_tables(cap_len, ht, wt)?;
+        Ok(PreparedControlConditioning {
+            context,
+            ctrl_tokens,
+            cap_len,
+            img_len: ht * wt,
+            ht,
+            wt,
+            latent_ch: channels,
+            dtype: self.dtype,
+            device: self.device.location(),
+            rcos,
+            rsin,
+        })
+    }
+
+    pub(crate) fn forward_pre_main_prepared(
+        &self,
+        latent: &Tensor,
+        timestep: &Tensor,
+        prepared: &PreparedControlConditioning,
+    ) -> candle_gen::Result<(Tensor, MainCtx)> {
+        let (_, channels, h, w) = latent.dims4()?;
+        let p = self.cfg.patch_size;
+        let latent_ch = self.cfg.in_channels / (p * p);
+        if prepared.latent_ch != latent_ch
+            || channels != prepared.latent_ch
+            || (h / p, w / p) != (prepared.ht, prepared.wt)
+            || h % p != 0
+            || w % p != 0
+            || self.dtype != prepared.dtype
+            || self.device.location() != prepared.device
+            || latent.device().location() != prepared.device
+        {
+            return Err(candle_gen::CandleError::Msg(
+                "krea control: prepared conditioning request identity, geometry, dtype, or device does not match latent".into(),
+            ));
+        }
+        let dt = self.dtype;
+        let img = self.img_in.forward(&patchify(&latent.to_dtype(dt)?, p)?)?;
+        let t_sin = temb(timestep, self.cfg.timestep_embed_dim, &self.device)?.to_dtype(dt)?;
+        let t = self
+            .time_embed_l2
+            .forward(&self.time_embed_l1.forward(&t_sin)?.gelu()?)?;
+        let tvec = self.time_mod_proj.forward(&t.gelu()?)?;
+        let combined = Tensor::cat(&[&prepared.context, &img], 1)?;
+        Ok((
+            combined,
+            MainCtx {
+                tvec,
+                rcos: prepared.rcos.clone(),
+                rsin: prepared.rsin.clone(),
+                t,
+                cap_len: prepared.cap_len,
+                img_len: prepared.img_len,
+                ht: prepared.ht,
+                wt: prepared.wt,
+                latent_ch: prepared.latent_ch,
+                patch: p,
+            },
+        ))
     }
 
     /// Run the frozen front-end: patch-embed the latent, build the shared modulation, aggregate +
@@ -638,11 +802,15 @@ impl crate::adapters::AdditiveDit for KreaTrainDit {
     ) -> candle_gen::Result<()> {
         for (i, blk) in self.blocks.iter_mut().enumerate() {
             let p = format!("transformer_blocks.{i}");
-            f(&format!("{p}.attn.to_q"), &mut blk.attn.q)?;
-            f(&format!("{p}.attn.to_k"), &mut blk.attn.k)?;
-            f(&format!("{p}.attn.to_v"), &mut blk.attn.v)?;
-            f(&format!("{p}.attn.to_gate"), &mut blk.attn.gate)?;
-            f(&format!("{p}.attn.to_out.0"), &mut blk.attn.o)?;
+            for (path, proj) in [
+                (format!("{p}.attn.to_q"), &mut blk.attn.q),
+                (format!("{p}.attn.to_k"), &mut blk.attn.k),
+                (format!("{p}.attn.to_v"), &mut blk.attn.v),
+                (format!("{p}.attn.to_gate"), &mut blk.attn.gate),
+                (format!("{p}.attn.to_out.0"), &mut blk.attn.o),
+            ] {
+                proj.visit_additive(&path, f)?;
+            }
             blk.mlp
                 .visit_adaptable_mut(&format!("{p}.ff"), &mut |path, a| f(path, a))?;
         }
@@ -652,11 +820,12 @@ impl crate::adapters::AdditiveDit for KreaTrainDit {
             ("img_in", &mut self.img_in),
             ("time_embed.linear_1", &mut self.time_embed_l1),
             ("time_embed.linear_2", &mut self.time_embed_l2),
+            ("time_mod_proj", &mut self.time_mod_proj),
             ("txt_in.linear_1", &mut self.txt_in_l1),
             ("txt_in.linear_2", &mut self.txt_in_l2),
             ("final_layer.linear", &mut self.final_linear),
         ] {
-            f(path, proj)?;
+            proj.visit_additive(path, f)?;
         }
         Ok(())
     }
@@ -669,7 +838,8 @@ impl crate::adapters::AdditiveDit for KreaTrainDit {
         "expected bare/PEFT `<path>.lora_A/B.weight` (LoRA) or `<module>.lokr_w1/w2` (LoKr) over the \
          control-base DiT attention (to_q|to_k|to_v|to_gate|to_out.0) + SwiGLU FFN (ff.gate|ff.up|ff.\
          down) across the single-stream transformer_blocks and text_fusion blocks, plus the front-end \
-         (img_in|time_embed.linear_1/2|txt_in.linear_1/2|final_layer.linear) projections; or a ComfyUI/\
+         (img_in|time_embed.linear_1/2|time_mod_proj|txt_in.linear_1/2|final_layer.linear) projections; \
+         or a ComfyUI/\
          lightx2v `<module>.diff`/`.diff_b` diff-patch (full-weight/bias delta, incl. the \
          text_fusion.projector 12→1 collapse). The pose control branch is never adapted; conv-layer / \
          text-encoder adapters are out of surface"
@@ -679,7 +849,183 @@ impl crate::adapters::AdditiveDit for KreaTrainDit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::{install_additive, AdditiveDit};
+    use candle_gen::gen_core::{AdapterKind, AdapterSpec};
     use std::cell::Cell;
+
+    #[test]
+    fn prepared_control_accepts_a_normalizable_sampler_dtype_and_binds_model_dtype() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, cfg, _) = crate::testfix::tiny_dit(&tmp);
+        let latent_ch = cfg.in_channels / (cfg.patch_size * cfg.patch_size);
+        let latent = crate::testfix::rnd(&[1, latent_ch, 4, 4])
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let control = crate::testfix::rnd(&[1, latent_ch, 4, 4])
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let context = crate::testfix::rnd(&[1, 3, cfg.num_text_layers, cfg.text_hidden_dim]);
+        let timestep = Tensor::from_vec(vec![0.5_f32], 1, &Device::Cpu).unwrap();
+
+        let (expected, _) = dit
+            .forward_pre_main(&latent, &timestep, &context)
+            .expect("the base control seam normalizes the sampler dtype");
+        let prepared = dit
+            .prepare_control_conditioning(&context, &control)
+            .unwrap();
+        let (got, _) = dit
+            .forward_pre_main_prepared(&latent, &timestep, &prepared)
+            .expect("prepared control accepts the same normalizable sampler dtype");
+        let max = (&got - &expected)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec0::<f32>()
+            .unwrap();
+        assert_eq!(max, 0.0, "mixed-dtype prepared control parity");
+
+        let mut wrong_model = dit
+            .prepare_control_conditioning(&context, &control)
+            .unwrap();
+        wrong_model.dtype = DType::BF16;
+        let error = match dit.forward_pre_main_prepared(&latent, &timestep, &wrong_model) {
+            Ok(_) => panic!("prepared control dtype must stay bound to the model"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, candle_gen::CandleError::Msg(ref message) if message.contains("prepared conditioning request identity")),
+            "expected control model-identity rejection, got {error:?}"
+        );
+    }
+
+    /// sc-18477: the strict-control DiT must expose the same canonical adapter surface as the base DiT,
+    /// including native Krea's `tproj.1` target after it normalizes to `time_mod_proj`. This deliberately
+    /// installs one already-supported target alongside `tproj.1`: before the fix, installation returned
+    /// success for `img_in` while silently leaving the modulation residual in `skipped_targets`.
+    #[test]
+    fn control_adapter_surface_matches_base_and_installs_native_time_mod_projection() {
+        let dev = Device::Cpu;
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut control, cfg, weights_path) = crate::testfix::tiny_dit(&tmp);
+        let weights = Weights::from_file(&weights_path, &dev, DType::F32).unwrap();
+        let mut base = crate::transformer::Krea2Transformer::load(&weights, &cfg).unwrap();
+
+        let surface = |dit: &mut dyn AdditiveDit| {
+            let mut paths = Vec::new();
+            dit.visit_additive(&mut |path, _| {
+                paths.push(path.to_string());
+                Ok(())
+            })
+            .unwrap();
+            paths.sort();
+            paths
+        };
+        let base_surface = surface(&mut base);
+        let control_surface = surface(&mut control);
+        assert_eq!(
+            control_surface, base_surface,
+            "strict-control and base DiTs must expose identical adapter targets"
+        );
+        assert_eq!(
+            control_surface
+                .iter()
+                .filter(|path| path.as_str() == "time_mod_proj")
+                .count(),
+            1,
+            "canonical time_mod_proj must be visited exactly once"
+        );
+
+        let adapter_path = tmp.path().join("native-time-mod-and-img-in.safetensors");
+        let adapter = std::collections::HashMap::from([
+            (
+                "first.lora_A.weight".to_string(),
+                Tensor::ones((1, cfg.in_channels), DType::F32, &dev).unwrap(),
+            ),
+            (
+                "first.lora_B.weight".to_string(),
+                Tensor::ones((cfg.hidden_size, 1), DType::F32, &dev).unwrap(),
+            ),
+            (
+                "tproj.1.lora_A.weight".to_string(),
+                Tensor::ones((1, cfg.hidden_size), DType::F32, &dev).unwrap(),
+            ),
+            (
+                "tproj.1.lora_B.weight".to_string(),
+                Tensor::ones((cfg.time_mod_dim(), 1), DType::F32, &dev).unwrap(),
+            ),
+        ]);
+        candle_gen::candle_core::safetensors::save(&adapter, &adapter_path).unwrap();
+        let specs = [AdapterSpec::new(adapter_path, 1.0, AdapterKind::Lora)];
+
+        let base_report = install_additive(&mut base, &specs, 0).unwrap();
+        let control_report = install_additive(&mut control, &specs, 0).unwrap();
+        for (lane, report) in [("base", base_report), ("strict-control", control_report)] {
+            assert_eq!(report.applied, 2, "{lane} must install both native targets");
+            assert!(
+                report.skipped_targets.is_empty(),
+                "{lane} silently dropped targets: {:?}",
+                report.skipped_targets
+            );
+            assert_eq!(report.skipped_keys, 0, "{lane} rejected adapter keys");
+        }
+    }
+
+    #[test]
+    fn convrot_time_mod_projection_is_exposed_to_additive_adapter_walk() {
+        let dev = Device::Cpu;
+        let canonical = Tensor::from_vec(
+            vec![
+                0.5f32, -0.2, 0.1, 0.7, -0.3, 0.8, -0.4, 0.2, 0.6, 0.1, -0.5, 0.9, -0.7, 0.4, 0.3,
+                -0.1,
+            ],
+            (4, 4),
+            &dev,
+        )
+        .unwrap();
+        let rotation = candle_gen::quant::regular_hadamard(4, &dev).unwrap();
+        let rotated = candle_gen::quant::convrot_rotate(&canonical, &rotation).unwrap();
+        let parts = candle_gen::quant::quantize_weight_int8_per_channel(&rotated).unwrap();
+        let mut projection = ComposableLinear::ConvRot(
+            KreaQLinear::convrot_int8(parts.q, parts.scale, 4, None, &dev).unwrap(),
+        );
+        let x = Tensor::ones((1, 4), DType::F32, &dev).unwrap();
+        let bare = projection.forward(&x).unwrap();
+        let mut visited = 0usize;
+        projection
+            .visit_additive("time_mod_proj", &mut |path, host| {
+                assert_eq!(path, "time_mod_proj");
+                host.add_lora(
+                    Tensor::ones((4, 1), DType::F32, &dev).unwrap(),
+                    Tensor::ones((1, 4), DType::F32, &dev).unwrap(),
+                    0.5,
+                )?;
+                visited += 1;
+                Ok(())
+            })
+            .unwrap();
+        let adapted = projection.forward(&x).unwrap();
+        let shift = (adapted - bare)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(
+            visited, 1,
+            "strict-control ConvRot host must be visited once"
+        );
+        assert!(shift > 1e-4, "visited ConvRot host must apply its residual");
+        assert!(
+            projection.is_convrot(),
+            "adapter must preserve the int8 base"
+        );
+    }
 
     #[test]
     fn control_rope_cache_builds_once_and_matches_fresh_tables() -> Result<()> {

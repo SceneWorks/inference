@@ -16,7 +16,7 @@
 //! `normalize_vace_key` end-to-end on real weights (it must match diffusers' converter), while the
 //! `vace_blocks` factors exercise the diffusers passthrough (incl. `proj_in`/`proj_out`).
 //!
-//! Run: `WANVACE_DIR=<snapshot> cargo test -p mlx-gen-wan --test wanvace_lora_real_parity -- \
+//! Run: `WANVACE_DIR=<snapshot> cargo test -p mlx-gen-wan --test integration wanvace_lora_real_parity:: -- \
 //! --ignored --nocapture` (defaults to the HF cache snapshot of the 1.3B repo).
 
 use std::path::PathBuf;

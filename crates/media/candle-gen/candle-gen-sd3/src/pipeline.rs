@@ -24,6 +24,7 @@
 //!   (`StdRng`) seeded by `seed`, moved to the device — NOT candle's CUDA `randn`. The Euler step is
 //!   non-stochastic, so generation is a pure function of `(seed, request)`.
 
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -106,10 +107,14 @@ impl Variant {
 /// VAE spatial downscale (image/8 per side) — re-exported from [`crate::vae`] for the latent geometry.
 const VAE_SCALE: u32 = SPATIAL_SCALE;
 
+/// SD3.5 img2img's product default, shared with the MLX provider: an omitted strength starts at
+/// the midpoint rather than silently changing a reference-guided request into txt2img.
+pub const DEFAULT_IMG2IMG_STRENGTH: f32 = 0.5;
+
 /// The SD3.5 `FlowMatchEulerDiscreteScheduler` σ ramp for `steps` inference steps with the given
 /// `shift`, matching diffusers `set_timesteps`:
 ///
-/// 1. `sigmas = linspace(1.0, 1/num_train, steps)` (the σ table the timesteps map to, σ_max = 1.0);
+/// 1. `sigmas = linspace(1.0, 1/steps, steps)` (the inference σ table, σ_max = 1.0);
 /// 2. shift each: `σ' = shift·σ / (1 + (shift − 1)·σ)` (the resolution-independent flow shift);
 /// 3. append a trailing `0.0` (the clean end).
 ///
@@ -117,10 +122,10 @@ const VAE_SCALE: u32 = SPATIAL_SCALE;
 /// [`candle_gen::resolve_flow_schedule`]. Pure; unit-tested without a GPU.
 pub fn sd3_sigmas(steps: usize, shift: f32) -> Vec<f32> {
     let steps = steps.max(1);
-    // diffusers: timesteps = linspace(num_train, ~0, steps); sigmas = timesteps / num_train. With
-    // num_train = 1000 this is sigmas = linspace(1.0, 1/1000, steps). The exact lower endpoint barely
-    // matters (it is shifted then the trailing 0.0 dominates the final step); use 1/num_train for parity.
-    let num_train = 1000.0f32;
+    // `FlowMatchEulerDiscreteScheduler.set_timesteps` builds the inference schedule from
+    // `linspace(1.0, 1/steps, steps)`.  Using the training-grid endpoint (1/1000) here made Candle
+    // disagree with MLX and the frozen SD3.5 fixture at every interior point.
+    let min_sigma = 1.0 / steps as f32;
     let mut out: Vec<f32> = (0..steps)
         .map(|i| {
             let frac = if steps == 1 {
@@ -128,13 +133,21 @@ pub fn sd3_sigmas(steps: usize, shift: f32) -> Vec<f32> {
             } else {
                 i as f32 / (steps - 1) as f32
             };
-            // linspace(1.0, 1/num_train, steps)
-            let sigma = 1.0 - frac * (1.0 - 1.0 / num_train);
+            // linspace(1.0, 1/steps, steps)
+            let sigma = 1.0 - frac * (1.0 - min_sigma);
             shift * sigma / (1.0 + (shift - 1.0) * sigma)
         })
         .collect();
     out.push(0.0);
     out
+}
+
+/// Resolve SD3.5's native or curated flow schedule over the model's static shift.  Curated
+/// schedules must retain the model's `shift = 3.0`; using an unshifted flow model here silently
+/// turns their interior sigmas into a linear ramp.
+pub(crate) fn resolve_sd3_sigmas(scheduler: Option<&str>, steps: usize, shift: f32) -> Vec<f32> {
+    let native = sd3_sigmas(steps, shift);
+    candle_gen::resolve_flow_schedule(scheduler, shift.ln(), steps, &native)
 }
 
 /// The img2img **fork step** (sc-11784) — how many σ-schedule nodes to SKIP before the denoise starts,
@@ -145,7 +158,12 @@ pub fn sd3_sigmas(steps: usize, shift: f32) -> Vec<f32> {
 /// strength knob behaves identically on the Mac (MLX) and Windows (candle) SD3.5 lanes. `floor` because
 /// Python `int(steps · strength)` truncates toward zero for `s ≥ 0`. Pure function so the
 /// cross-backend-parity law is unit-testable without a GPU.
-pub(crate) fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
+///
+/// `pub` so the sc-16958 preview harness can derive an img2img run's **emitted frame count** —
+/// `steps − init_time_step(steps, strength)`, since the driver only ever sees the reduced
+/// `sigmas[start..]` tail — from the very function the fork uses, rather than restating that
+/// arithmetic beside it and drifting from it.
+pub fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
     match strength {
         Some(s) if s > 0.0 => {
             let s = s.clamp(0.0, 1.0);
@@ -153,6 +171,12 @@ pub(crate) fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
         }
         _ => 0,
     }
+}
+
+/// Resolve a reference's optional strength at the SD3.5 img2img boundary.  Keeping this explicit
+/// makes an omitted UI value match MLX instead of falling through to the txt2img start step.
+pub(crate) fn resolve_img2img_strength(strength: Option<f32>) -> f32 {
+    strength.unwrap_or(DEFAULT_IMG2IMG_STRENGTH)
 }
 
 /// Resolve the single img2img init image + its effective strength from the request's conditioning
@@ -202,6 +226,82 @@ pub(crate) struct Components {
     vae: Arc<AutoEncoderKL>,
 }
 
+trait PhaseSynchronizer {
+    fn synchronize(&self) -> Result<()>;
+}
+
+impl PhaseSynchronizer for Device {
+    fn synchronize(&self) -> Result<()> {
+        Ok(Device::synchronize(self)?)
+    }
+}
+
+/// Own a staged phase until queued backend work is synchronized. Normal returns, errors,
+/// cancellation, and unwinding all preserve the synchronize-before-release ordering.
+struct SynchronizedPhase<T, S: PhaseSynchronizer = Device> {
+    component: Option<T>,
+    synchronizer: S,
+    phase: &'static str,
+}
+
+impl<T, S: PhaseSynchronizer> SynchronizedPhase<T, S> {
+    fn new(component: T, synchronizer: S, phase: &'static str) -> Self {
+        Self {
+            component: Some(component),
+            synchronizer,
+            phase,
+        }
+    }
+
+    fn synchronize_before_release(&mut self) -> Result<()> {
+        let Some(component) = self.component.take() else {
+            return Ok(());
+        };
+        match self.synchronizer.synchronize() {
+            Ok(()) => {
+                drop(component);
+                Ok(())
+            }
+            Err(error) => {
+                std::mem::forget(component);
+                Err(CandleError::Msg(format!(
+                    "sd3: synchronize before releasing {}: {error}",
+                    self.phase
+                )))
+            }
+        }
+    }
+
+    fn release(mut self) -> Result<()> {
+        self.synchronize_before_release()
+    }
+}
+
+impl<T, S: PhaseSynchronizer> Deref for SynchronizedPhase<T, S> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        self.component
+            .as_ref()
+            .expect("released SD3 staged phase is consumed")
+    }
+}
+
+impl<T, S: PhaseSynchronizer> Drop for SynchronizedPhase<T, S> {
+    fn drop(&mut self) {
+        let _ = self.synchronize_before_release();
+    }
+}
+
+struct StagedCleanup {
+    device: Device,
+}
+
+impl Drop for StagedCleanup {
+    fn drop(&mut self) {
+        let _ = self.device.synchronize();
+    }
+}
+
 impl Pipeline {
     /// Build the (light) pipeline handle. Does **no** weight I/O — components load lazily via
     /// [`load_components`](Self::load_components).
@@ -227,8 +327,21 @@ impl Pipeline {
     /// Load the three text encoders + the MMDiT + the VAE from the diffusers component subdirs
     /// (`text_encoder*/`, `transformer/`, `vae/`).
     pub(crate) fn load_components(&self) -> Result<Components> {
-        let encoders =
-            Sd3TextEncoders::load(&self.root, self.cfg.t5_seq_len, &self.device, self.dtype)?;
+        let encoders = self.load_text_encoders()?;
+        let transformer = self.load_transformer()?;
+        let vae = self.load_decoder()?;
+        Ok(Components {
+            encoders: Arc::new(Mutex::new(encoders)),
+            transformer: Arc::new(transformer),
+            vae: Arc::new(vae),
+        })
+    }
+
+    fn load_text_encoders(&self) -> Result<Sd3TextEncoders> {
+        Sd3TextEncoders::load(&self.root, self.cfg.t5_seq_len, &self.device, self.dtype)
+    }
+
+    fn load_transformer(&self) -> Result<Sd3Transformer> {
         // Adapters ride as **forward-time additive residuals** on the DiT (sc-11105) — on BOTH tiers:
         // the base is never folded (`W += δ` would pin an un-evictable in-memory copy — epic 10765), so
         // it stays an unmutated mmap (dense) / packed base. Quantization (if any) then folds ONLY the
@@ -237,7 +350,7 @@ impl Pipeline {
         // Whether `transformer/` is a pre-quantized MLX-packed tier (`config.json` carries a
         // `quantization` block) — gates the no-adapter packed-detect build below + the group-size guard.
         let packed_cfg = self.transformer_packed_config();
-        let packed_tier = self.adapters.is_empty() && packed_cfg.is_some();
+        let packed_tier = packed_cfg.is_some();
         // Adapters ride as forward-time additive residuals on the DiT — on BOTH tiers (sc-11105,
         // additive-everywhere for epic 10765); the base is never mutated, so it stays evictable.
         let additive = !self.adapters.is_empty();
@@ -315,12 +428,25 @@ impl Pipeline {
                 )?,
             }
         };
-        let vae = load_vae(self.component_vb("vae")?)?;
-        Ok(Components {
-            encoders: Arc::new(Mutex::new(encoders)),
-            transformer: Arc::new(transformer),
-            vae: Arc::new(vae),
-        })
+        Ok(transformer)
+    }
+
+    fn load_decoder(&self) -> Result<AutoEncoderKL> {
+        Ok(load_vae(self.component_vb("vae")?)?)
+    }
+
+    /// Training-only staged text-encoder load. Callers cache every caption and drop this before the
+    /// dense MMDiT is loaded.
+    pub(crate) fn load_training_encoders(&self) -> Result<Sd3TextEncoders> {
+        Sd3TextEncoders::load(&self.root, self.cfg.t5_seq_len, &self.device, self.dtype)
+    }
+
+    /// Training-only dense MMDiT load with no inference adapters or quantization.
+    pub(crate) fn load_training_transformer(&self) -> Result<Sd3Transformer> {
+        Ok(Sd3Transformer::new(
+            &self.cfg,
+            self.component_vb_on("transformer", &self.device)?,
+        )?)
     }
 
     /// Resolve the sorted list of `.safetensors` files in the snapshot component subdir `sub`
@@ -456,6 +582,23 @@ impl Pipeline {
         // gates the uncond encode — at 1.0 the CFG blend collapses to cond, so it's skipped (sc-8993).
         let (cond, uncond) = self.conditioning(&components.encoders, req, cfg_scale)?;
 
+        // Per-step latent preview (epic 16948, sc-16958). Opting in is the sc-16949 projector hook and
+        // nothing else: the driver owns frame numbering, the multi-eval dedup and the swallow-on-failure
+        // contract, so neither this loop nor `render_core` changes shape. The hook is built once and
+        // handed to each per-seed driver call, and the driver builds a fresh counter per call — so a
+        // batched request restarts each image's trajectory at frame 1 rather than continuing the
+        // previous one's numbering. Over an inert sink this costs one `is_active` check per evaluation
+        // and leaves the render seeded-byte-identical. See [`crate::preview`].
+        //
+        // `render_core` takes the hook **by reference, not as an `Option`** — deliberately. The
+        // catalog's route inventory classifies the argument one hop further in, at the
+        // `run_flow_sampler` call, so an `Option` here would let this lane be turned dark by changing
+        // one argument to `None` while `hooked: 1` and `supports_preview: true` kept advertising.
+        // Going dark now requires a type change; `crate::preview`'s
+        // `the_render_lane_builds_its_hook_from_the_requests_sink` covers the other half — that the
+        // sink the hook is built over is the request's.
+        let preview = request_preview(req);
+
         candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             render_core(
                 &components.transformer,
@@ -475,15 +618,139 @@ impl Pipeline {
                 start_step,
                 &req.cancel,
                 on_progress,
+                &preview,
             )
         })
     }
+
+    /// Request-authoritative staged execution. The triple text encoders are released before the
+    /// optional F32 I2I encoder is opened; both are released before the MMDiT (plus the exact
+    /// additive adapter stack), and the MMDiT is released before the decoder VAE is opened.
+    pub(crate) fn render_staged(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+        verify: &dyn Fn() -> Result<()>,
+    ) -> Result<Vec<Image>> {
+        let _cleanup = StagedCleanup {
+            device: self.device.clone(),
+        };
+        candle_gen::check_cancel(&req.cancel)?;
+        let steps = req
+            .steps
+            .map(|value| value as usize)
+            .unwrap_or_else(|| self.variant.default_steps());
+        let cfg_scale = if self.variant.cfg_enabled() {
+            req.guidance.unwrap_or_else(|| self.variant.default_cfg())
+        } else {
+            1.0
+        };
+        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let latent_hw = (
+            (req.height / VAE_SCALE) as usize,
+            (req.width / VAE_SCALE) as usize,
+        );
+
+        verify()?;
+        let text = SynchronizedPhase::new(
+            Mutex::new(self.load_text_encoders()?),
+            self.device.clone(),
+            "triple text encoders",
+        );
+        let (cond, uncond) = self.conditioning(&text, req, cfg_scale)?;
+        text.release()?;
+
+        let reference = resolve_reference(req)?;
+        let start_step = match &reference {
+            Some((_, strength)) => init_time_step(steps, Some(resolve_img2img_strength(*strength))),
+            None => 0,
+        };
+        let clean = if start_step > 0 {
+            candle_gen::check_cancel(&req.cancel)?;
+            verify()?;
+            let encoder = SynchronizedPhase::new(
+                self.load_vae_encoder()?,
+                self.device.clone(),
+                "F32 I2I encoder",
+            );
+            let (image, _) = reference.expect("positive I2I fork has a reference");
+            let clean = self.encode_reference(&encoder, image, req.width, req.height)?;
+            encoder.release()?;
+            Some(clean)
+        } else {
+            None
+        };
+
+        candle_gen::check_cancel(&req.cancel)?;
+        verify()?;
+        let denoiser = SynchronizedPhase::new(
+            self.load_transformer()?,
+            self.device.clone(),
+            "MMDiT and ordered adapters",
+        );
+        let mut latents = Vec::with_capacity(req.count as usize);
+        for index in 0..req.count {
+            candle_gen::check_cancel(&req.cancel)?;
+            let seed = base_seed.wrapping_add(u64::from(index));
+            let preview = request_preview(req);
+            latents.push(denoise_latents(
+                &denoiser,
+                &cond,
+                uncond.as_ref(),
+                cfg_scale,
+                steps,
+                self.variant.shift(),
+                latent_hw,
+                seed,
+                self.device.clone(),
+                self.dtype,
+                req.sampler.as_deref(),
+                req.scheduler.as_deref(),
+                clean.as_ref(),
+                start_step,
+                &req.cancel,
+                on_progress,
+                &preview,
+            )?);
+        }
+        denoiser.release()?;
+
+        candle_gen::check_cancel(&req.cancel)?;
+        verify()?;
+        let decoder =
+            SynchronizedPhase::new(self.load_decoder()?, self.device.clone(), "decoder VAE");
+        let mut images = Vec::with_capacity(latents.len());
+        for latent in &latents {
+            candle_gen::check_cancel(&req.cancel)?;
+            on_progress(Progress::Decoding);
+            images.push(decode_image(&decoder, latent)?);
+        }
+        decoder.release()?;
+        Ok(images)
+    }
+}
+
+fn request_preview(req: &GenerationRequest) -> candle_gen::preview::PreviewHook<'_> {
+    crate::preview::hook(&req.preview)
 }
 
 /// The render core shared by [`Pipeline::render`] and the structural/CUDA smoke tests: build the
 /// deterministic CPU-seeded noise, run the unified flow-match sampler (with CFG when `uncond` is
 /// `Some`, distilled-single-eval when `None`), and VAE-decode. Decoupled from snapshot I/O so a test
 /// can drive it with a random-weight transformer + VAE.
+///
+/// `preview` is the per-step latent preview hook (epic 16948, sc-16958) — the **single**
+/// shared-driver site every SD3.5 route and lane funnels through, so hooking it here wires all six
+/// user-reachable lanes at once. See [`crate::preview`] for the enumeration, the reused fit and why
+/// the latent needs no unpack.
+///
+/// It is **not** an `Option`, unlike the shared driver's own parameter. This crate has no
+/// deliberately dark lane to express — no trainer, no descriptor-less provider — so an `Option` here
+/// would buy nothing and cost the guarantee that matters: with `&PreviewHook` a caller cannot go
+/// preview-dark by editing one argument, which is invisible to the catalog's route inventory because
+/// that inventory classifies the driver argument one hop further in. A hook over an inert
+/// [`gen_core::PreviewSink`] is the way to run this without previews, and it is byte-identical to a
+/// run without one: the emitter returns before any tensor work when the sink is inert.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_core(
     transformer: &Sd3Transformer,
@@ -503,12 +770,12 @@ pub(crate) fn render_core(
     start_step: usize,
     cancel: &gen_core::CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
+    preview: &candle_gen::preview::PreviewHook<'_>,
 ) -> Result<Image> {
     let (lat_h, lat_w) = latent_hw;
 
     // Native SD3 flow-match schedule (shifted), then the curated scheduler axis (default = native).
-    let native = sd3_sigmas(steps, shift);
-    let sigmas = candle_gen::resolve_flow_schedule(scheduler, 0.0, steps, &native);
+    let sigmas = resolve_sd3_sigmas(scheduler, steps, shift);
 
     // sc-3673 parity — deterministic, launch-portable initial noise: N(0,1) from a CPU RNG seeded by
     // `seed`, built on CPU then moved to the device.
@@ -544,6 +811,7 @@ pub(crate) fn render_core(
         seed,
         cancel,
         on_progress,
+        Some(preview),
         |latents, sigma| -> Result<Tensor> {
             // SD3 feeds the DiT `t = σ·1000` (the timestep convention; the embedder scales the
             // sinusoid). f32 here is correct — the embedder upcasts internally.
@@ -569,6 +837,69 @@ pub(crate) fn render_core(
     decode_image(vae, &latents)
 }
 
+/// The denoise-only half of [`render_core`], used by staged execution so every final latent can be
+/// retained while the MMDiT is resident and decoded only after that phase has been released.
+#[allow(clippy::too_many_arguments)]
+fn denoise_latents(
+    transformer: &Sd3Transformer,
+    cond: &Sd3Conditioning,
+    uncond: Option<&Sd3Conditioning>,
+    cfg_scale: f32,
+    steps: usize,
+    shift: f32,
+    latent_hw: (usize, usize),
+    seed: u64,
+    device: Device,
+    dtype: DType,
+    sampler: Option<&str>,
+    scheduler: Option<&str>,
+    clean: Option<&Tensor>,
+    start_step: usize,
+    cancel: &gen_core::CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &candle_gen::preview::PreviewHook<'_>,
+) -> Result<Tensor> {
+    let (lat_h, lat_w) = latent_hw;
+    let sigmas = resolve_sd3_sigmas(scheduler, steps, shift);
+    let n = LATENT_CHANNELS * lat_h * lat_w;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let noise = candle_gen::seeded_normal_vec(&mut rng, n);
+    let noise = Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
+        .to_device(&device)?
+        .to_dtype(dtype)?;
+    let start = start_step.min(sigmas.len().saturating_sub(1));
+    let latents = match clean {
+        Some(clean) => {
+            let sigma_start = sigmas[start] as f64;
+            (clean.affine(1.0 - sigma_start, 0.0)? + noise.affine(sigma_start, 0.0)?)?
+        }
+        None => noise,
+    };
+    candle_gen::run_flow_sampler(
+        sampler,
+        TimestepConvention::Sigma,
+        &sigmas[start..],
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        Some(preview),
+        |latents, sigma| -> Result<Tensor> {
+            let t = Tensor::from_vec(vec![sigma * 1000.0], (1,), &device)?;
+            let v_cond = transformer.forward(latents, &cond.context, &cond.pooled, &t)?;
+            let v = match uncond {
+                Some(uncond) => {
+                    let v_uncond =
+                        transformer.forward(latents, &uncond.context, &uncond.pooled, &t)?;
+                    (&v_uncond + ((&v_cond - &v_uncond)? * cfg_scale as f64)?)?
+                }
+                None => v_cond,
+            };
+            Ok(v.to_dtype(latents.dtype())?)
+        },
+    )
+}
+
 /// VAE-decode the final latents `(1, 16, h, w)` to an RGB8 [`Image`]. The VAE applies its own
 /// `/scaling_factor + shift_factor` un-scale inside `decode`; the `[-1, 1]` output maps to `[0, 255]`
 /// u8.
@@ -592,6 +923,116 @@ fn decode_image(vae: &AutoEncoderKL, latents: &Tensor) -> Result<Image> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct RecordingSynchronizer {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        fail: bool,
+    }
+
+    impl PhaseSynchronizer for RecordingSynchronizer {
+        fn synchronize(&self) -> Result<()> {
+            candle_gen::lock_recover(&self.events).push("synchronize");
+            if self.fail {
+                Err(CandleError::Msg("expected synchronize failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct RecordingComponent(Arc<Mutex<Vec<&'static str>>>);
+
+    impl Drop for RecordingComponent {
+        fn drop(&mut self) {
+            candle_gen::lock_recover(&self.0).push("release");
+        }
+    }
+
+    fn early_staged_exit(events: Arc<Mutex<Vec<&'static str>>>) -> Result<()> {
+        let _phase = SynchronizedPhase::new(
+            RecordingComponent(events.clone()),
+            RecordingSynchronizer {
+                events,
+                fail: false,
+            },
+            "fixture",
+        );
+        Err(CandleError::Msg("expected early exit".into()))
+    }
+
+    #[test]
+    fn staged_release_orders_normal_error_cancel_panic_and_sync_failure() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        SynchronizedPhase::new(
+            RecordingComponent(events.clone()),
+            RecordingSynchronizer {
+                events: events.clone(),
+                fail: false,
+            },
+            "normal",
+        )
+        .release()
+        .unwrap();
+        assert_eq!(
+            *candle_gen::lock_recover(&events),
+            ["synchronize", "release"]
+        );
+
+        for _outcome in ["error", "canceled"] {
+            candle_gen::lock_recover(&events).clear();
+            assert!(early_staged_exit(events.clone()).is_err());
+            assert_eq!(
+                *candle_gen::lock_recover(&events),
+                ["synchronize", "release"]
+            );
+        }
+
+        candle_gen::lock_recover(&events).clear();
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let events = events.clone();
+            move || {
+                let _phase = SynchronizedPhase::new(
+                    RecordingComponent(events.clone()),
+                    RecordingSynchronizer {
+                        events,
+                        fail: false,
+                    },
+                    "panic",
+                );
+                panic!("expected panic");
+            }
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(
+            *candle_gen::lock_recover(&events),
+            ["synchronize", "release"]
+        );
+
+        candle_gen::lock_recover(&events).clear();
+        assert!(SynchronizedPhase::new(
+            RecordingComponent(events.clone()),
+            RecordingSynchronizer {
+                events: events.clone(),
+                fail: true
+            },
+            "failed sync",
+        )
+        .release()
+        .is_err());
+        assert_eq!(*candle_gen::lock_recover(&events), ["synchronize"]);
+    }
+
+    /// The inert preview hook every structural row below hands [`render_core`].
+    ///
+    /// `render_core` takes its hook by reference rather than as an `Option` (see its docs — that is
+    /// what makes the shipped lane un-blankable), so these rows opt out of previews by handing it a
+    /// hook over an inert [`gen_core::PreviewSink`] rather than by passing `None`. The two are
+    /// byte-identical: `candle_gen::preview::emit_preview` returns before any tensor work when the
+    /// sink is inert, and the counter never advances.
+    fn inert_sink() -> gen_core::PreviewSink {
+        gen_core::PreviewSink::default()
+    }
 
     #[test]
     fn variant_defaults_match_sd35() {
@@ -647,6 +1088,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn native_and_curated_sd35_schedule_endpoints_match_frozen_fixture() {
+        // Frozen from diffusers FlowMatchEulerDiscreteScheduler { shift: 3.0 } at four steps.
+        // The native route must preserve the whole table; curated routes may redistribute interior
+        // points, but retain the model's shifted high-noise region and both endpoints.
+        let fixture = [1.0_f32, 0.9, 0.75, 0.5, 0.0];
+        let native = resolve_sd3_sigmas(None, 4, 3.0);
+        assert_eq!(native.len(), fixture.len());
+        for (got, want) in native.iter().zip(fixture) {
+            assert!((got - want).abs() < 1e-5, "native got {got} want {want}");
+        }
+
+        let curated = resolve_sd3_sigmas(Some("normal"), 4, 3.0);
+        assert_eq!(curated.first(), Some(&fixture[0]));
+        assert_eq!(curated.last(), Some(&fixture[4]));
+        assert!(
+            curated[1] > 0.8,
+            "curated SD3.5 schedule lost static shift: {curated:?}"
+        );
+    }
+
     /// **The parsed packed `group_size` is threaded, not discarded** (sc-9474). A `transformer/config.json`
     /// carrying `quantization: { bits, group_size }` parses into a `PackedConfig` whose `group_size` is the
     /// on-disk value (32 here, boogu's group size) — proving `transformer_packed_config` no longer throws
@@ -655,14 +1117,8 @@ mod tests {
     /// packed loaders assume the MLX default 64).
     #[test]
     fn transformer_packed_config_threads_parsed_group_size() {
-        let tmp = std::env::temp_dir().join(format!(
-            "sc9474_sd3_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         let tdir = tmp.join("transformer");
         std::fs::create_dir_all(&tdir).unwrap();
         let write_cfg = |json: &str| std::fs::write(tdir.join("config.json"), json).unwrap();
@@ -696,8 +1152,6 @@ mod tests {
         // A dense config (no `quantization`) ⇒ None (dense path, no guard).
         write_cfg(r#"{"in_channels": 16}"#);
         assert!(pipe(&tmp).transformer_packed_config().is_none());
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// Turbo's 4-step schedule starts at 1.0 and is strictly decreasing to 0.
@@ -731,6 +1185,17 @@ mod tests {
             .map(|&s| init_time_step(28, Some(s)))
             .collect();
         assert!(starts.windows(2).all(|w| w[0] <= w[1]), "{starts:?}");
+    }
+
+    #[test]
+    fn missing_img2img_strength_defaults_to_mlx_midpoint() {
+        assert_eq!(DEFAULT_IMG2IMG_STRENGTH, 0.5);
+        assert_eq!(resolve_img2img_strength(None), DEFAULT_IMG2IMG_STRENGTH);
+        assert_eq!(
+            init_time_step(28, Some(resolve_img2img_strength(None))),
+            14,
+            "a missing img2img strength must not silently become txt2img"
+        );
     }
 
     /// `resolve_reference` pulls the single img2img init image + its effective strength from the
@@ -902,6 +1367,9 @@ mod tests {
         let mut progress = |_p: Progress| steps_seen += 1;
         let lat = 4usize; // 32px image at /8
         let steps = variant.default_steps().min(4);
+        // This row measures the render, not the decorative strip.
+        let inert = inert_sink();
+        let preview = crate::preview::hook(&inert);
         let img = render_core(
             &transformer,
             &vae,
@@ -920,6 +1388,7 @@ mod tests {
             0,    // start_step: full schedule
             &cancel,
             &mut progress,
+            &preview,
         )
         .unwrap();
         assert_eq!(img.width, (lat as u32) * SPATIAL_SCALE);
@@ -963,6 +1432,9 @@ mod tests {
         let device = Device::Cpu;
         let cfg = tiny_cfg();
         let (transformer, vae, cond, _uncond) = harness(&cfg, &device);
+        // These rows measure the render, not the decorative strip.
+        let inert = inert_sink();
+        let preview = crate::preview::hook(&inert);
         let cancel = CancelFlag::default();
         let render = |seed| {
             render_core(
@@ -983,6 +1455,7 @@ mod tests {
                 0,    // start_step: full schedule
                 &cancel,
                 &mut |_p: Progress| {},
+                &preview,
             )
             .unwrap()
         };
@@ -1011,6 +1484,9 @@ mod tests {
         let device = Device::Cpu;
         let cfg = tiny_cfg();
         let (transformer, vae, cond, uncond) = harness(&cfg, &device);
+        // These rows measure the render, not the decorative strip.
+        let inert = inert_sink();
+        let preview = crate::preview::hook(&inert);
         let cancel = CancelFlag::default();
         let render = |uncond_ref: Option<&Sd3Conditioning>| {
             render_core(
@@ -1031,6 +1507,7 @@ mod tests {
                 0,    // start_step: full schedule
                 &cancel,
                 &mut |_p: Progress| {},
+                &preview,
             )
             .unwrap()
         };
@@ -1070,6 +1547,9 @@ mod tests {
         let device = Device::Cpu;
         let cfg = tiny_cfg();
         let (transformer, vae, cond, _uncond) = harness(&cfg, &device);
+        // These rows measure the render, not the decorative strip.
+        let inert = inert_sink();
+        let preview = crate::preview::hook(&inert);
         let cancel = CancelFlag::default();
         let steps = 4usize;
         let lat = 4usize;
@@ -1094,6 +1574,7 @@ mod tests {
                 start,
                 &cancel,
                 &mut |_p: Progress| {},
+                &preview,
             )
             .unwrap()
         };
@@ -1236,6 +1717,9 @@ mod tests {
         let device = Device::new_cuda(0).expect("CUDA device 0");
         let cfg = tiny_cfg();
         let (transformer, vae, cond, uncond) = harness(&cfg, &device);
+        // These rows measure the render, not the decorative strip.
+        let inert = inert_sink();
+        let preview = crate::preview::hook(&inert);
         let cancel = CancelFlag::default();
         let render = |uncond_ref: Option<&Sd3Conditioning>, scale: f32| {
             render_core(
@@ -1256,6 +1740,7 @@ mod tests {
                 0,    // start_step: full schedule
                 &cancel,
                 &mut |_p: Progress| {},
+                &preview,
             )
             .unwrap()
         };

@@ -23,9 +23,11 @@
 use mlx_rs::ops::{add, divide, matmul, minimum, multiply, subtract, sum_axes};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::attention::{AttentionBudget, AttentionPlan};
+use mlx_gen::gen_core::LoadPhase;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, Error, Progress, Result};
+use mlx_gen::{CancelFlag, Error, Progress, Quant, Result};
 
 use crate::config::NeoChatConfig;
 use crate::fm::{
@@ -45,6 +47,25 @@ use mlx_llm::primitives::{KvCache as _, SplitMix64};
 /// production [`SenseNova`](crate::SenseNova) path passes the request's flag and the worker's progress
 /// callback so a multi-minute 8B run is cancellable and reports **denoise steps**, not the image index
 /// (F-128).
+///
+/// ## Lifecycle boundaries (sc-22738)
+///
+/// The reporter also owns the two **phase boundaries** a consumer segments a run by — the
+/// SceneWorks memory-measurement adapter cuts its conditioning/denoise/decode windows on exactly
+/// these, the same events `mlx-gen-bernini` and `mlx-gen-mage` emit:
+///
+/// * [`Progress::Loading`]`(`[`LoadPhase::Renderer`]`)` opens the **denoise** phase. It is emitted
+///   by the denoise loops ([`T2iModel::denoise`], [`T2iModel::it2i_denoise`]) after every prefill —
+///   the conditioning work — and before the first step. On the deferred load shape this is
+///   literally a load: the generation half of every dual-path block is materialized in bounded
+///   windows only from here on. On the resident shape it is the phase marker.
+/// * [`Progress::Decoding`] opens the **decode** phase: emitted after the last step, before the
+///   final RGB patches are converted to an image (`unpatchify` + the host copy).
+///
+/// Both are emitted **once per request**, never once per image: a multi-image request (`count >
+/// 1`, or the model-driven interleave loop) restarts neither the bar nor the phases. That is what
+/// the `opens_denoise` / `opens_decode` flags carry — the route that owns the request decides
+/// which of its per-image reporters opens which phase ([`Self::with_phase_bounds`]).
 pub struct StepReporter<'a> {
     cancel: &'a CancelFlag,
     on_progress: &'a mut dyn FnMut(Progress),
@@ -54,16 +75,35 @@ pub struct StepReporter<'a> {
     /// When set, overrides the per-denoise `total` with the aggregate grand total so the interleave
     /// bar is one monotone `1..=(max_images × num_steps)` sweep instead of restarting per image.
     total_override: Option<usize>,
+    /// Whether this reporter's denoise loop opens the request's denoise phase
+    /// (`Loading(Renderer)` before its first step). See the type docs.
+    opens_denoise: bool,
+    /// Whether this reporter's denoise loop opens the request's decode phase (`Decoding` after its
+    /// last step). See the type docs.
+    opens_decode: bool,
 }
 
 impl<'a> StepReporter<'a> {
+    /// A reporter for a single-image request: opens both phases around its one denoise loop.
     pub fn new(cancel: &'a CancelFlag, on_progress: &'a mut dyn FnMut(Progress)) -> Self {
         Self {
             cancel,
             on_progress,
             offset: 0,
             total_override: None,
+            opens_denoise: true,
+            opens_decode: true,
         }
+    }
+
+    /// Choose which of the request's phase boundaries this reporter's denoise loop opens
+    /// (sc-22738). A route that runs several denoise loops per request hands the first loop
+    /// `opens_denoise` and the last loop `opens_decode`, so the request reports each boundary
+    /// exactly once — see [`request_phase_bounds`] and the interleave loop.
+    pub fn with_phase_bounds(mut self, opens_denoise: bool, opens_decode: bool) -> Self {
+        self.opens_denoise = opens_denoise;
+        self.opens_decode = opens_decode;
+        self
     }
 
     /// A reporter for one image of a multi-image aggregate (F-136, sc-11133): its `current` is
@@ -80,6 +120,8 @@ impl<'a> StepReporter<'a> {
             on_progress,
             offset,
             total_override: Some(total),
+            opens_denoise: true,
+            opens_decode: true,
         }
     }
 
@@ -106,6 +148,38 @@ impl<'a> StepReporter<'a> {
             total: total as u32,
         });
     }
+
+    /// Open the denoise phase — `Progress::Loading(LoadPhase::Renderer)` — if this reporter owns
+    /// that boundary (sc-22738). Called by the denoise loops after every prefill and before their
+    /// first step.
+    fn open_denoise_phase(&mut self) {
+        if self.opens_denoise {
+            (self.on_progress)(Progress::Loading(LoadPhase::Renderer));
+        }
+    }
+
+    /// Open the decode phase — `Progress::Decoding` — if this reporter owns that boundary
+    /// (sc-22738). Called by the denoise loops after their last step.
+    fn open_decode_phase(&mut self) {
+        if self.opens_decode {
+            open_decode_phase(self.on_progress);
+        }
+    }
+}
+
+/// The one place the decode boundary is spelled: [`Progress::Decoding`], emitted after the last
+/// denoise step of a request and before its RGB patches become an image (sc-22738).
+fn open_decode_phase(on_progress: &mut dyn FnMut(Progress)) {
+    on_progress(Progress::Decoding);
+}
+
+/// Which of a request's phase boundaries the denoise loop for image `index` of `count` opens
+/// (sc-22738): the first loop opens the denoise phase, the last opens the decode phase, and a
+/// single-image request opens both. Each boundary is reported exactly once per request whatever the
+/// count, so a multi-image request does not restart the phases the way it would if every image
+/// opened its own.
+pub fn request_phase_bounds(index: u32, count: u32) -> (bool, bool) {
+    (index == 0, index + 1 >= count)
 }
 
 /// F-136 residual (sc-11133): `interleave_gen`'s loop is model-driven and can stop before
@@ -130,6 +204,24 @@ fn fill_interleave_bar(
         current: grand_total,
         total: grand_total,
     });
+}
+
+/// Close the interleave run's progress stream (sc-22738): fill the folded bar to its total
+/// ([`fill_interleave_bar`]) and then, if the run denoised at least one image, open the decode
+/// phase — once, after the last step of the last image, so the stream ends `…Step, Decoding` like
+/// the single-image routes. The per-image reporters inside the loop never open it themselves: the
+/// loop is model-driven and cannot know which image is the last. A text-only run (no image) ran no
+/// denoise and opens no decode phase either.
+fn finish_interleave_progress(
+    on_progress: &mut dyn FnMut(Progress),
+    realized_images: usize,
+    max_images: usize,
+    num_steps: usize,
+) {
+    fill_interleave_bar(on_progress, realized_images, max_images, num_steps);
+    if realized_images > 0 {
+        open_decode_phase(on_progress);
+    }
 }
 
 /// Classifier-free-guidance velocity-blend normalisation (`t2i_generate`'s `cfg_norm`).
@@ -161,6 +253,16 @@ pub struct T2iOptions {
     pub seed: u64,
     pub think_mode: bool,
     pub max_think_tokens: usize,
+    /// Maximum score-domain elements per shared bounded-attention call. `None` preserves the
+    /// historical single-call path. Production request paths consume it for both understanding and
+    /// generation forwards, including VQA, interleave, and think-token attention.
+    pub attention_score_budget: Option<u32>,
+    /// Generation-path Qwen block window selected by rung 4. `None` is the resident/default
+    /// execution shape (or one all-covering window on a deferred load).
+    pub transformer_window_size: Option<u32>,
+    /// Calibration-only deterministic failure after the first streamed Gen block materializes.
+    #[doc(hidden)]
+    pub calibration_stream_fault: bool,
 }
 
 impl Default for T2iOptions {
@@ -177,7 +279,24 @@ impl Default for T2iOptions {
             seed: 0,
             think_mode: false,
             max_think_tokens: 1024,
+            attention_score_budget: None,
+            transformer_window_size: None,
+            calibration_stream_fault: false,
         }
+    }
+}
+
+fn attention_plan<'a>(opts: &T2iOptions, cancel: Option<&'a CancelFlag>) -> AttentionPlan<'a> {
+    let Some(score_elements) = opts.attention_score_budget else {
+        return AttentionPlan::UNBOUNDED;
+    };
+    let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+        u64::from(score_elements),
+        true,
+    ));
+    match cancel {
+        Some(cancel) => plan.with_cancel(cancel),
+        None => plan,
     }
 }
 
@@ -246,6 +365,24 @@ pub struct T2iModel {
 impl T2iModel {
     /// Build from a loaded checkpoint (`language_model.*` + `fm_modules.*`).
     pub fn from_weights(w: &Weights, cfg: &NeoChatConfig) -> Result<Self> {
+        Self::validate_config(cfg)?;
+        let backbone = Qwen3Backbone::from_weights(w, cfg, "language_model")?;
+        Self::from_weights_with_backbone(w, cfg, backbone)
+    }
+
+    pub fn from_weights_deferred(
+        w: &Weights,
+        cfg: &NeoChatConfig,
+        artifact: crate::memory_strategy::PinnedArtifact,
+        quant: Option<Quant>,
+    ) -> Result<Self> {
+        Self::validate_config(cfg)?;
+        let backbone =
+            Qwen3Backbone::from_weights_deferred(w, cfg, "language_model", artifact, quant)?;
+        Self::from_weights_with_backbone(w, cfg, backbone)
+    }
+
+    fn validate_config(cfg: &NeoChatConfig) -> Result<()> {
         // `noise_scale_embed` divides each denoise step's conditioning by `noise_scale_max_value`
         // (`scale.min(max)` then `/max`); a zero/negative value from a misconfigured config.json
         // would inject NaN/Inf conditioning silently. Reject it at load (F-012).
@@ -255,6 +392,14 @@ impl T2iModel {
                 cfg.noise_scale_max_value
             )));
         }
+        Ok(())
+    }
+
+    fn from_weights_with_backbone(
+        w: &Weights,
+        cfg: &NeoChatConfig,
+        backbone: Qwen3Backbone,
+    ) -> Result<Self> {
         let noise_scale_embedder = if cfg.add_noise_scale_embedding {
             Some(TimestepEmbedder::from_weights(
                 w,
@@ -278,7 +423,7 @@ impl T2iModel {
             None
         };
         Ok(Self {
-            backbone: Qwen3Backbone::from_weights(w, cfg, "language_model")?,
+            backbone,
             gen_vision: NeoVisionEmbedder::from_weights(
                 w,
                 cfg,
@@ -372,6 +517,7 @@ impl T2iModel {
     /// per-cache [`RopeMask`] from [`Self::prepare_gen`], `fm_head` → `x_pred`, then the
     /// flow-matching velocity. `image_embeds` is the vision+timestep conditioned image block
     /// `[1, L, hidden]`.
+    #[allow(clippy::too_many_arguments)]
     fn predict_v(
         &self,
         image_embeds: &Array,
@@ -380,25 +526,47 @@ impl T2iModel {
         z: &Array,
         t: f32,
         t_eps: f32,
+        attention: AttentionPlan<'_>,
+        transformer_window: Option<usize>,
+        calibration_stream_fault: bool,
     ) -> Result<Array> {
-        let hidden = self
-            .backbone
-            .forward_prepared(image_embeds, rm, Path::Gen, cache, false)?;
+        let hidden = self.backbone.forward_prepared_memory(
+            image_embeds,
+            rm,
+            Path::Gen,
+            cache,
+            false,
+            attention,
+            transformer_window,
+            calibration_stream_fault,
+        )?;
         let x_pred = self.fm_head.forward(&hidden)?;
         velocity(&x_pred, z, t, t_eps)
     }
 
     /// Prefill a text query into a fresh cache on the understanding path. Returns the cache, the
     /// last-position logits (for think-mode), and the prefix token length.
-    fn prefill(&self, ids: &[i32]) -> Result<(KvCache, Array, usize)> {
+    fn prefill(
+        &self,
+        ids: &[i32],
+        opts: &T2iOptions,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<(KvCache, Array, usize)> {
         let n = ids.len() as i32;
         let ids_arr = Array::from_slice(ids, &[1, n]);
         let embeds = self.backbone.embed(&ids_arr)?;
         let (t, h, wid) = text_indexes(ids.len());
         let mut cache = self.backbone.new_cache();
-        let hidden =
-            self.backbone
-                .forward_cached(&embeds, &t, &h, &wid, Path::Und, &mut cache, true)?;
+        let hidden = self.backbone.forward_cached_budgeted(
+            &embeds,
+            &t,
+            &h,
+            &wid,
+            Path::Und,
+            &mut cache,
+            true,
+            attention_plan(opts, cancel),
+        )?;
         // Only the last position's logits are kept, so slice the hidden state to `[1, 1, 4096]`
         // *before* `lm_head` — applying it over the whole `[1, S, 4096]` prefix would materialize an
         // `[1, S, vocab]` (~GB) tensor and an `S×4096×vocab` matmul just to drop all but one row (F-129).
@@ -483,14 +651,18 @@ impl T2iModel {
             think_sentinel
         );
         let ids_cond = tokenizer.encode_ids(&query_cond, true)?;
-        let (mut cache_cond, last_logits, prefix_len) = self.prefill(&ids_cond)?;
+        let (mut cache_cond, last_logits, prefix_len) = self.prefill(
+            &ids_cond,
+            opts,
+            reporter.as_ref().map(StepReporter::cancel_flag),
+        )?;
 
         // think-mode: roll out the reasoning block, then append `\n\n<img>`.
         let mut think_text = None;
         let mut text_len = prefix_len;
         if opts.think_mode {
             let append_ids = tokenizer.encode_ids("\n\n<img>", false)?;
-            let roll = self.backbone.generate_think(
+            let roll = self.backbone.generate_think_budgeted(
                 last_logits.as_slice::<f32>(),
                 &mut cache_cond,
                 (prefix_len - 1) as i32,
@@ -499,6 +671,7 @@ impl T2iModel {
                 &append_ids,
                 opts.max_think_tokens,
                 reporter.as_ref().map(StepReporter::cancel_flag),
+                attention_plan(opts, reporter.as_ref().map(StepReporter::cancel_flag)),
             )?;
             let ids_u32: Vec<u32> = roll.think_token_ids.iter().map(|&i| i as u32).collect();
             think_text = Some(tokenizer.decode(&ids_u32, false)?);
@@ -511,7 +684,11 @@ impl T2iModel {
         if needs_cfg {
             let query_uncond = format!("{}<img>", build_neo1_query("", ""));
             let ids_uncond = tokenizer.encode_ids(&query_uncond, true)?;
-            let (cache, _, plen) = self.prefill(&ids_uncond)?;
+            let (cache, _, plen) = self.prefill(
+                &ids_uncond,
+                opts,
+                reporter.as_ref().map(StepReporter::cancel_flag),
+            )?;
             cache_uncond = Some((cache, plen));
         }
 
@@ -536,7 +713,7 @@ impl T2iModel {
     /// Prefill `ids` into a fresh understanding-path cache; returns the cache and prefix length.
     /// Exposed for tests/callers that drive [`T2iModel::denoise`] with an explicit prefix.
     pub fn prefill_ids(&self, ids: &[i32]) -> Result<(KvCache, usize)> {
-        let (cache, _, len) = self.prefill(ids)?;
+        let (cache, _, len) = self.prefill(ids, &T2iOptions::default(), None)?;
         Ok((cache, len))
     }
 
@@ -583,6 +760,11 @@ impl T2iModel {
             None => None,
         };
         let mut traj = Vec::with_capacity(steps);
+        // Conditioning (the prefills) is complete: open the denoise phase before the first step
+        // (sc-22738).
+        if let Some(r) = reporter.as_mut() {
+            r.open_denoise_phase();
+        }
         for i in 0..steps {
             if let Some(r) = reporter.as_ref() {
                 r.check_cancel()?;
@@ -592,7 +774,17 @@ impl T2iModel {
 
             let (z, cond) = self.step_cond_embeds(&image, grid_h, grid_w, l, t, &noise_embed)?;
 
-            let v_cond = self.predict_v(&cond, &rm_cond, cache_cond, &z, t, opts.t_eps)?;
+            let v_cond = self.predict_v(
+                &cond,
+                &rm_cond,
+                cache_cond,
+                &z,
+                t,
+                opts.t_eps,
+                attention_plan(opts, reporter.as_ref().map(StepReporter::cancel_flag)),
+                opts.transformer_window_size.map(|window| window as usize),
+                opts.calibration_stream_fault,
+            )?;
 
             // CFG-interval gate for the T2I path: **inclusive** both ends, a faithful port of the
             // reference `modeling_neo_chat.py:1799`
@@ -608,7 +800,17 @@ impl T2iModel {
                 let rm_u = rm_uncond.as_ref().ok_or_else(|| {
                     Error::Msg("sensenova: CFG enabled but uncond running-mean is absent".into())
                 })?;
-                let v_uncond = self.predict_v(&cond, rm_u, cache_u, &z, t, opts.t_eps)?;
+                let v_uncond = self.predict_v(
+                    &cond,
+                    rm_u,
+                    cache_u,
+                    &z,
+                    t,
+                    opts.t_eps,
+                    attention_plan(opts, reporter.as_ref().map(StepReporter::cancel_flag)),
+                    opts.transformer_window_size.map(|window| window as usize),
+                    opts.calibration_stream_fault,
+                )?;
                 cfg_blend(&v_cond, &v_uncond, opts.cfg_scale, opts.cfg_norm, i)?
             } else {
                 v_cond
@@ -632,6 +834,11 @@ impl T2iModel {
             if let Some(r) = reporter.as_mut() {
                 r.step(i + 1, steps);
             }
+        }
+        // The last step is done: open the decode phase before the RGB patches become an image
+        // (sc-22738).
+        if let Some(r) = reporter.as_mut() {
+            r.open_decode_phase();
         }
         Ok(traj)
     }
@@ -831,10 +1038,28 @@ impl T2iModel {
         h: &[i32],
         w: &[i32],
     ) -> Result<(KvCache, Array, usize)> {
+        self.prefill_prefix_budgeted(embeds, t, h, w, AttentionPlan::UNBOUNDED)
+    }
+
+    fn prefill_prefix_budgeted(
+        &self,
+        embeds: &Array,
+        t: &[i32],
+        h: &[i32],
+        w: &[i32],
+        attention: AttentionPlan<'_>,
+    ) -> Result<(KvCache, Array, usize)> {
         let mut cache = self.backbone.new_cache();
-        let hidden = self
-            .backbone
-            .forward_cached(embeds, t, h, w, Path::Und, &mut cache, true)?;
+        let hidden = self.backbone.forward_cached_budgeted(
+            embeds,
+            t,
+            h,
+            w,
+            Path::Und,
+            &mut cache,
+            true,
+            attention,
+        )?;
         // Slice the last hidden row before `lm_head` — only its logits are used, and the prefix here
         // includes image-context blocks, so the full `[1, S, vocab]` projection is the worst case of
         // F-129 (an `S×4096×vocab` matmul + ~GB tensor) repeated per CFG cache.
@@ -883,8 +1108,19 @@ impl T2iModel {
         pixel_values: Option<&Array>,
         grids: &[(i32, i32)],
     ) -> Result<(KvCache, Vec<f32>, usize)> {
+        self.prefill_it2i_logits_budgeted(ids, pixel_values, grids, AttentionPlan::UNBOUNDED)
+    }
+
+    pub fn prefill_it2i_logits_budgeted(
+        &self,
+        ids: &[i32],
+        pixel_values: Option<&Array>,
+        grids: &[(i32, i32)],
+        attention: AttentionPlan<'_>,
+    ) -> Result<(KvCache, Vec<f32>, usize)> {
         let (embeds, t, h, w) = self.build_it2i_prefix(ids, pixel_values, grids)?;
-        let (cache, last, img_temporal) = self.prefill_prefix(&embeds, &t, &h, &w)?;
+        let (cache, last, img_temporal) =
+            self.prefill_prefix_budgeted(&embeds, &t, &h, &w, attention)?;
         Ok((cache, last.as_slice::<f32>().to_vec(), img_temporal - 1))
     }
 
@@ -902,7 +1138,31 @@ impl T2iModel {
         sampler: Sampler,
         cancel: Option<&CancelFlag>,
     ) -> Result<Vec<i32>> {
-        self.backbone.generate(
+        self.decode_text_budgeted(
+            first_logits,
+            cache,
+            t_idx,
+            eos,
+            max_new_tokens,
+            sampler,
+            cancel,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_text_budgeted(
+        &self,
+        first_logits: &[f32],
+        cache: &mut KvCache,
+        t_idx: usize,
+        eos: &[i32],
+        max_new_tokens: usize,
+        sampler: Sampler,
+        cancel: Option<&CancelFlag>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Vec<i32>> {
+        self.backbone.generate_budgeted(
             first_logits,
             cache,
             t_idx as i32,
@@ -910,6 +1170,7 @@ impl T2iModel {
             max_new_tokens,
             sampler,
             cancel,
+            attention,
         )
     }
 
@@ -1005,14 +1266,19 @@ impl T2iModel {
         let cond_ids = self.build_it2i_query_ids(tokenizer, &cond_query, &grids)?;
         let (cond_embeds, ct, ch, cw) =
             self.build_it2i_prefix(&cond_ids, Some(&pixel_values), &grids)?;
-        let (mut cache_cond, last_logits, mut cond_temporal) =
-            self.prefill_prefix(&cond_embeds, &ct, &ch, &cw)?;
+        let (mut cache_cond, last_logits, mut cond_temporal) = self.prefill_prefix_budgeted(
+            &cond_embeds,
+            &ct,
+            &ch,
+            &cw,
+            attention_plan(opts, reporter.as_ref().map(StepReporter::cancel_flag)),
+        )?;
 
         // think-mode rollout (extends cache + advances the image-block temporal index).
         let mut think_text = None;
         if opts.think_mode {
             let append_ids = tokenizer.encode_ids("\n\n<img>", false)?;
-            let roll = self.backbone.generate_think(
+            let roll = self.backbone.generate_think_budgeted(
                 last_logits.as_slice::<f32>(),
                 &mut cache_cond,
                 (cond_temporal - 1) as i32,
@@ -1021,6 +1287,7 @@ impl T2iModel {
                 &append_ids,
                 opts.max_think_tokens,
                 reporter.as_ref().map(StepReporter::cancel_flag),
+                attention_plan(opts, reporter.as_ref().map(StepReporter::cancel_flag)),
             )?;
             let u32s: Vec<u32> = roll.think_token_ids.iter().map(|&i| i as u32).collect();
             think_text = Some(tokenizer.decode(&u32s, false)?);
@@ -1036,7 +1303,13 @@ impl T2iModel {
             );
             let ids = self.build_it2i_query_ids(tokenizer, &q, &grids)?;
             let (embeds, t, h, w) = self.build_it2i_prefix(&ids, Some(&pixel_values), &grids)?;
-            let (cache, _, temporal) = self.prefill_prefix(&embeds, &t, &h, &w)?;
+            let (cache, _, temporal) = self.prefill_prefix_budgeted(
+                &embeds,
+                &t,
+                &h,
+                &w,
+                attention_plan(opts, reporter.as_ref().map(StepReporter::cancel_flag)),
+            )?;
             cache_img = Some((cache, temporal));
         }
 
@@ -1046,7 +1319,13 @@ impl T2iModel {
             let q = format!("{}<img>", build_neo1_query("", ""));
             let ids = tokenizer.encode_ids(&q, true)?;
             let (embeds, t, h, w) = self.build_it2i_prefix(&ids, None, &[])?;
-            let (cache, _, temporal) = self.prefill_prefix(&embeds, &t, &h, &w)?;
+            let (cache, _, temporal) = self.prefill_prefix_budgeted(
+                &embeds,
+                &t,
+                &h,
+                &w,
+                attention_plan(opts, reporter.as_ref().map(StepReporter::cancel_flag)),
+            )?;
             cache_uncond = Some((cache, temporal));
         }
 
@@ -1089,6 +1368,31 @@ impl T2iModel {
         sampler: Sampler,
         cancel: Option<&CancelFlag>,
     ) -> Result<String> {
+        self.vqa_with_options(
+            tokenizer,
+            question,
+            images,
+            max_new_tokens,
+            sampler,
+            &T2iOptions::default(),
+            cancel,
+        )
+    }
+
+    /// Request-memory-aware VQA. Bounded attention applies to image/text prefill and every AR
+    /// decode token; transformer block residency remains structurally N/A because VQA never enters
+    /// the generation path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn vqa_with_options(
+        &self,
+        tokenizer: &TextTokenizer,
+        question: &str,
+        images: &[Array],
+        max_new_tokens: usize,
+        sampler: Sampler,
+        opts: &T2iOptions,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<String> {
         // Preprocess any source images.
         let mut pv_parts = Vec::with_capacity(images.len());
         let mut grids = Vec::with_capacity(images.len());
@@ -1123,9 +1427,13 @@ impl T2iModel {
             self.build_it2i_query_ids(tokenizer, &base, &grids)?
         };
 
-        let (mut cache, last_logits, t_idx) =
-            self.prefill_it2i_logits(&ids, pixel_values.as_ref(), &grids)?;
-        let tokens = self.decode_text(
+        let (mut cache, last_logits, t_idx) = self.prefill_it2i_logits_budgeted(
+            &ids,
+            pixel_values.as_ref(),
+            &grids,
+            attention_plan(opts, cancel),
+        )?;
+        let tokens = self.decode_text_budgeted(
             &last_logits,
             &mut cache,
             t_idx,
@@ -1133,6 +1441,7 @@ impl T2iModel {
             max_new_tokens,
             sampler,
             cancel,
+            attention_plan(opts, cancel),
         )?;
         let u32s: Vec<u32> = tokens.iter().map(|&i| i as u32).collect();
         Ok(tokenizer.decode(&u32s, true)?.trim().to_string())
@@ -1154,6 +1463,26 @@ impl T2iModel {
         token_w: i32,
         t_idx: usize,
         cache: &mut KvCache,
+    ) -> Result<(Vec<f32>, usize)> {
+        self.append_generated_image_budgeted(
+            image,
+            token_h,
+            token_w,
+            t_idx,
+            cache,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_generated_image_budgeted(
+        &self,
+        image: &Array,
+        token_h: i32,
+        token_w: i32,
+        t_idx: usize,
+        cache: &mut KvCache,
+        attention: AttentionPlan<'_>,
     ) -> Result<(Vec<f32>, usize)> {
         let sh = image.shape();
         let (h, w) = (sh[2], sh[3]);
@@ -1179,9 +1508,16 @@ impl T2iModel {
         // Row-major 2D position ids for the merged image grid (+ trailing `img_end` token), with the
         // `n_img == token_h * token_w` cross-check that the old `let _ = (token_h, token_w);` hid (F-135).
         let (hh, ww) = merged_grid_position_ids(n_img, token_h, token_w)?;
-        let hs = self
-            .backbone
-            .forward_cached(&embeds, &t, &hh, &ww, Path::Und, cache, true)?;
+        let hs = self.backbone.forward_cached_budgeted(
+            &embeds,
+            &t,
+            &hh,
+            &ww,
+            Path::Und,
+            cache,
+            true,
+            attention,
+        )?;
         // Same one-row-kept pattern as the prefill paths (F-129): slice the kept hidden row (the `end`
         // token at index `n_img`) before `lm_head` instead of projecting all `n_img + 1` rows.
         let last_hidden = hs.take_axis(Array::from_slice(&[n_img], &[1]), 1)?;
@@ -1255,8 +1591,12 @@ impl T2iModel {
         } else {
             self.build_it2i_query_ids(tokenizer, &cond_query, &grids)?
         };
-        let (mut cache_cond, cond_logits, mut t_cond) =
-            self.prefill_it2i_logits(&cond_ids, pixel_values.as_ref(), &grids)?;
+        let (mut cache_cond, cond_logits, mut t_cond) = self.prefill_it2i_logits_budgeted(
+            &cond_ids,
+            pixel_values.as_ref(),
+            &grids,
+            attention_plan(opts, Some(cancel)),
+        )?;
 
         let tu_query = build_neo1_query(&"<image>".repeat(input_images.len()), "");
         let tu_ids = if input_images.is_empty() {
@@ -1264,12 +1604,21 @@ impl T2iModel {
         } else {
             self.build_it2i_query_ids(tokenizer, &tu_query, &grids)?
         };
-        let (mut cache_tu, _, mut t_tu) =
-            self.prefill_it2i_logits(&tu_ids, pixel_values.as_ref(), &grids)?;
+        let (mut cache_tu, _, mut t_tu) = self.prefill_it2i_logits_budgeted(
+            &tu_ids,
+            pixel_values.as_ref(),
+            &grids,
+            attention_plan(opts, Some(cancel)),
+        )?;
 
         let iu_query = format!("{}<img>", build_neo1_query("", ""));
         let iu_ids = tokenizer.encode_ids(&iu_query, true)?;
-        let (mut cache_iu, _, iu_max) = self.prefill_it2i_logits(&iu_ids, None, &[])?;
+        let (mut cache_iu, _, iu_max) = self.prefill_it2i_logits_budgeted(
+            &iu_ids,
+            None,
+            &[],
+            attention_plan(opts, Some(cancel)),
+        )?;
 
         let mut text = String::new();
         let mut images = Vec::new();
@@ -1293,9 +1642,12 @@ impl T2iModel {
                 // transfer) instead of copying the whole `[vocab]` f32 row (~600 KB/token) to host and
                 // arg-maxing there. MLX `argmax` breaks ties to the lowest index, matching the host
                 // `argmax`, so the greedy stream is bit-identical (F-095, F-140 precedent).
-                next = self
-                    .backbone
-                    .decode_argmax(next, (t_cond + 1) as i32, &mut cache_cond)?;
+                next = self.backbone.decode_argmax_budgeted(
+                    next,
+                    (t_cond + 1) as i32,
+                    &mut cache_cond,
+                    attention_plan(opts, Some(cancel)),
+                )?;
                 t_cond += 1;
                 if total_tokens >= max_new_tokens {
                     hit_max = true;
@@ -1320,14 +1672,18 @@ impl T2iModel {
             // `lm_head` projection or the host copy (`append_tokens`; F-095, F-140 precedent).
             // `append_tokens(&[id], t, cache)` forwards it at temporal `t+1` (h=w=0, Path::Und),
             // identical to the prior `decode_logits(id, t+1, cache)`.
-            t_cond =
-                self.backbone
-                    .append_tokens(&[self.img_start_id], t_cond as i32, &mut cache_cond)?
-                    as usize;
-            t_tu = self
-                .backbone
-                .append_tokens(&[self.img_start_id], t_tu as i32, &mut cache_tu)?
-                as usize;
+            t_cond = self.backbone.append_tokens_budgeted(
+                &[self.img_start_id],
+                t_cond as i32,
+                &mut cache_cond,
+                attention_plan(opts, Some(cancel)),
+            )? as usize;
+            t_tu = self.backbone.append_tokens_budgeted(
+                &[self.img_start_id],
+                t_tu as i32,
+                &mut cache_tu,
+                attention_plan(opts, Some(cancel)),
+            )? as usize;
 
             let base_noise = match init_noises {
                 Some(ns) if images.len() < ns.len() => ns[images.len()].as_dtype(Dtype::Float32)?,
@@ -1350,21 +1706,34 @@ impl T2iModel {
                 height,
                 &base_noise,
                 opts,
-                Some(StepReporter::new_folded(
-                    cancel,
-                    on_progress,
-                    offset,
-                    grand_total,
-                )),
+                // sc-22738: only the FIRST image's loop opens the denoise phase, and no per-image
+                // loop opens the decode phase — the loop is model-driven, so which image is last
+                // is only known once it exits (`finish_interleave_progress`).
+                Some(
+                    StepReporter::new_folded(cancel, on_progress, offset, grand_total)
+                        .with_phase_bounds(images.is_empty(), false),
+                ),
             )?;
             let image = traj.into_iter().last().expect("at least one step");
 
             // Re-encode the generated image back into the condition + text-uncondition caches.
-            let (cond_next, nt_cond) =
-                self.append_generated_image(&image, token_h, token_w, t_cond, &mut cache_cond)?;
+            let (cond_next, nt_cond) = self.append_generated_image_budgeted(
+                &image,
+                token_h,
+                token_w,
+                t_cond,
+                &mut cache_cond,
+                attention_plan(opts, Some(cancel)),
+            )?;
             t_cond = nt_cond;
-            let (_, nt_tu) =
-                self.append_generated_image(&image, token_h, token_w, t_tu, &mut cache_tu)?;
+            let (_, nt_tu) = self.append_generated_image_budgeted(
+                &image,
+                token_h,
+                token_w,
+                t_tu,
+                &mut cache_tu,
+                attention_plan(opts, Some(cancel)),
+            )?;
             t_tu = nt_tu;
             images.push(image);
             next = argmax(&cond_next);
@@ -1374,7 +1743,8 @@ impl T2iModel {
         // `max_images` images, freezing the folded bar below its pinned grand total. Fill it to total
         // on completion so the aggregate progression finishes instead of hanging (no-op for a 0-image
         // or full-`max_images` run).
-        fill_interleave_bar(on_progress, images.len(), max_images, opts.num_steps);
+        // Then open the decode phase once, after the last image's last step (sc-22738).
+        finish_interleave_progress(on_progress, images.len(), max_images, opts.num_steps);
 
         Ok(InterleaveOutput { text, images })
     }
@@ -1443,6 +1813,11 @@ impl T2iModel {
             None => None,
         };
         let mut traj = Vec::with_capacity(steps);
+        // Conditioning (the prefills) is complete: open the denoise phase before the first step
+        // (sc-22738).
+        if let Some(r) = reporter.as_mut() {
+            r.open_denoise_phase();
+        }
         for i in 0..steps {
             if let Some(r) = reporter.as_ref() {
                 r.check_cancel()?;
@@ -1459,14 +1834,34 @@ impl T2iModel {
 
             let (z, cond_emb) =
                 self.step_cond_embeds(&image, grid_h, grid_w, l, t, &noise_embed)?;
-            let out_cond = self.predict_v(&cond_emb, &rm_cond, cache_cond, &z, t, opts.t_eps)?;
+            let out_cond = self.predict_v(
+                &cond_emb,
+                &rm_cond,
+                cache_cond,
+                &z,
+                t,
+                opts.t_eps,
+                attention_plan(opts, reporter.as_ref().map(StepReporter::cancel_flag)),
+                opts.transformer_window_size.map(|window| window as usize),
+                opts.calibration_stream_fault,
+            )?;
 
             let mut v_pred = if !use_cfg || (cfg == 1.0 && img_cfg == 1.0) {
                 out_cond.clone()
             } else if img_cfg == 1.0 {
                 let rm_i = rm_img.as_ref().ok_or_else(img_cache_err)?;
                 let (c, _) = img.as_mut().ok_or_else(img_cache_err)?;
-                let oi = self.predict_v(&cond_emb, rm_i, c, &z, t, opts.t_eps)?;
+                let oi = self.predict_v(
+                    &cond_emb,
+                    rm_i,
+                    c,
+                    &z,
+                    t,
+                    opts.t_eps,
+                    attention_plan(opts, reporter.as_ref().map(StepReporter::cancel_flag)),
+                    opts.transformer_window_size.map(|window| window as usize),
+                    opts.calibration_stream_fault,
+                )?;
                 add(
                     &oi,
                     &multiply(&subtract(&out_cond, &oi)?, Array::from_f32(cfg))?,
@@ -1474,7 +1869,17 @@ impl T2iModel {
             } else if cfg == img_cfg {
                 let rm_u = rm_uncond.as_ref().ok_or_else(uncond_cache_err)?;
                 let (c, _) = uncond.as_mut().ok_or_else(uncond_cache_err)?;
-                let ou = self.predict_v(&cond_emb, rm_u, c, &z, t, opts.t_eps)?;
+                let ou = self.predict_v(
+                    &cond_emb,
+                    rm_u,
+                    c,
+                    &z,
+                    t,
+                    opts.t_eps,
+                    attention_plan(opts, reporter.as_ref().map(StepReporter::cancel_flag)),
+                    opts.transformer_window_size.map(|window| window as usize),
+                    opts.calibration_stream_fault,
+                )?;
                 add(
                     &ou,
                     &multiply(&subtract(&out_cond, &ou)?, Array::from_f32(cfg))?,
@@ -1483,12 +1888,32 @@ impl T2iModel {
                 let oi = {
                     let rm_i = rm_img.as_ref().ok_or_else(img_cache_err)?;
                     let (c, _) = img.as_mut().ok_or_else(img_cache_err)?;
-                    self.predict_v(&cond_emb, rm_i, c, &z, t, opts.t_eps)?
+                    self.predict_v(
+                        &cond_emb,
+                        rm_i,
+                        c,
+                        &z,
+                        t,
+                        opts.t_eps,
+                        attention_plan(opts, reporter.as_ref().map(StepReporter::cancel_flag)),
+                        opts.transformer_window_size.map(|window| window as usize),
+                        opts.calibration_stream_fault,
+                    )?
                 };
                 let ou = {
                     let rm_u = rm_uncond.as_ref().ok_or_else(uncond_cache_err)?;
                     let (c, _) = uncond.as_mut().ok_or_else(uncond_cache_err)?;
-                    self.predict_v(&cond_emb, rm_u, c, &z, t, opts.t_eps)?
+                    self.predict_v(
+                        &cond_emb,
+                        rm_u,
+                        c,
+                        &z,
+                        t,
+                        opts.t_eps,
+                        attention_plan(opts, reporter.as_ref().map(StepReporter::cancel_flag)),
+                        opts.transformer_window_size.map(|window| window as usize),
+                        opts.calibration_stream_fault,
+                    )?
                 };
                 let a = multiply(&subtract(&out_cond, &oi)?, Array::from_f32(cfg))?;
                 let b = multiply(&subtract(&oi, &ou)?, Array::from_f32(img_cfg))?;
@@ -1517,6 +1942,11 @@ impl T2iModel {
             if let Some(r) = reporter.as_mut() {
                 r.step(i + 1, steps);
             }
+        }
+        // The last step is done: open the decode phase before the RGB patches become an image
+        // (sc-22738).
+        if let Some(r) = reporter.as_mut() {
+            r.open_decode_phase();
         }
         Ok(traj)
     }
@@ -1807,6 +2237,127 @@ mod tests {
         r.step(1, 4);
         r.step(4, 4);
         assert_eq!(*seen.borrow(), vec![(1u32, 4u32), (4, 4)]);
+    }
+
+    /// sc-22738: a single-image reporter brackets its denoise loop with the two lifecycle
+    /// boundaries — `Loading(Renderer)` before the first step, `Decoding` after the last — and
+    /// [`request_phase_bounds`] hands a multi-image request each boundary exactly once.
+    #[test]
+    fn step_reporter_opens_each_phase_once_per_request() {
+        let live = CancelFlag::new();
+        let mut events: Vec<Progress> = Vec::new();
+        {
+            let mut sink = |p: Progress| events.push(p);
+            let mut r = StepReporter::new(&live, &mut sink);
+            r.open_denoise_phase();
+            r.step(1, 2);
+            r.step(2, 2);
+            r.open_decode_phase();
+        }
+        assert_eq!(
+            events,
+            vec![
+                Progress::Loading(LoadPhase::Renderer),
+                Progress::Step {
+                    current: 1,
+                    total: 2
+                },
+                Progress::Step {
+                    current: 2,
+                    total: 2
+                },
+                Progress::Decoding,
+            ]
+        );
+
+        // A reporter that owns neither boundary reports only its steps.
+        let mut events: Vec<Progress> = Vec::new();
+        {
+            let mut sink = |p: Progress| events.push(p);
+            let mut r = StepReporter::new(&live, &mut sink).with_phase_bounds(false, false);
+            r.open_denoise_phase();
+            r.step(1, 1);
+            r.open_decode_phase();
+        }
+        assert_eq!(
+            events,
+            vec![Progress::Step {
+                current: 1,
+                total: 1
+            }]
+        );
+
+        // The first image opens denoise, the last opens decode, a single image opens both.
+        assert_eq!(request_phase_bounds(0, 1), (true, true));
+        assert_eq!(request_phase_bounds(0, 3), (true, false));
+        assert_eq!(request_phase_bounds(1, 3), (false, false));
+        assert_eq!(request_phase_bounds(2, 3), (false, true));
+        // Every boundary opens exactly once across any count.
+        for count in 1..=8u32 {
+            let opened: Vec<(bool, bool)> =
+                (0..count).map(|i| request_phase_bounds(i, count)).collect();
+            assert_eq!(opened.iter().filter(|(d, _)| *d).count(), 1, "{count}");
+            assert_eq!(opened.iter().filter(|(_, d)| *d).count(), 1, "{count}");
+        }
+    }
+
+    /// sc-22738: the interleave loop's per-image reporters open the denoise phase on the first
+    /// image only and never the decode phase; [`finish_interleave_progress`] closes the run with
+    /// exactly one `Decoding`, after the bar fill, and only when an image was denoised.
+    #[test]
+    fn interleave_run_opens_denoise_once_and_closes_with_one_decode_boundary() {
+        let cancel = CancelFlag::default();
+        let num_steps = 2usize;
+        let max_images = 3usize;
+        let grand_total = max_images * num_steps;
+
+        // Two of three images realized, driven the way `interleave_gen` drives its reporters.
+        let mut events: Vec<Progress> = Vec::new();
+        {
+            let mut sink = |p: Progress| events.push(p);
+            for image_idx in 0..2usize {
+                let mut r = StepReporter::new_folded(
+                    &cancel,
+                    &mut sink,
+                    image_idx * num_steps,
+                    grand_total,
+                )
+                .with_phase_bounds(image_idx == 0, false);
+                r.open_denoise_phase();
+                for i in 0..num_steps {
+                    r.step(i + 1, num_steps);
+                }
+                r.open_decode_phase();
+            }
+            finish_interleave_progress(&mut sink, 2, max_images, num_steps);
+        }
+        let step = |current: u32| Progress::Step {
+            current,
+            total: grand_total as u32,
+        };
+        assert_eq!(
+            events,
+            vec![
+                Progress::Loading(LoadPhase::Renderer),
+                step(1),
+                step(2),
+                step(3),
+                step(4),
+                step(6),
+                Progress::Decoding,
+            ],
+            "one denoise boundary before the first step, one decode boundary after the fill"
+        );
+
+        // A full run: no fill, still exactly one terminal `Decoding`.
+        let mut full: Vec<Progress> = Vec::new();
+        finish_interleave_progress(&mut |p| full.push(p), max_images, max_images, num_steps);
+        assert_eq!(full, vec![Progress::Decoding]);
+
+        // A text-only run denoised nothing and opens no decode phase.
+        let mut none: Vec<Progress> = Vec::new();
+        finish_interleave_progress(&mut |p| none.push(p), 0, max_images, num_steps);
+        assert!(none.is_empty(), "{none:?}");
     }
 
     #[test]

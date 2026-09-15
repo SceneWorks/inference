@@ -163,15 +163,21 @@ fn link(source: &Path, destination: &Path) {
 /// from a different checkpoint.
 struct Assembled {
     root: PathBuf,
+    /// sc-17755. Unlike the other helpers in this sweep, this one did NOT leak — it carried a hand
+    /// -written `impl Drop` that removed the tree. The guard replaces that `Drop` (one cleanup path,
+    /// not two) and fixes the lesser problem the old
+    /// `temp_dir().join(format!("sa3-variant-binding-{pid}-{label}"))` name had: it was reused within
+    /// a process, so a rerun under the same PID and label reopened the previous run's tree.
+    _guard: tempfile::TempDir,
 }
 
 impl Assembled {
     fn new(label: &str, base: &Path, overrides: &[(&str, PathBuf)]) -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "sa3-variant-binding-{}-{label}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let guard = tempfile::Builder::new()
+            .prefix(&format!("sa3-variant-binding-{label}-"))
+            .tempdir()
+            .expect("fixture temp dir");
+        let root = guard.path().to_path_buf();
         std::fs::create_dir_all(root.join("t5gemma-b-b-ul2")).unwrap();
         for entry in ENTRIES {
             let source_root = overrides
@@ -181,7 +187,10 @@ impl Assembled {
                 .unwrap_or_else(|| base.to_path_buf());
             link(&source_root.join(entry), &root.join(entry));
         }
-        Self { root }
+        Self {
+            root,
+            _guard: guard,
+        }
     }
 
     fn spec(&self) -> LoadSpec {
@@ -213,12 +222,6 @@ fn assert_unmutated_reassembly_loads(label: &str, variant: Variant, base: &Path)
             variant.model_id()
         )
     });
-}
-
-impl Drop for Assembled {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
 }
 
 fn expect_rejected(label: &str, variant: Variant, spec: &LoadSpec) {

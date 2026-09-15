@@ -21,7 +21,7 @@
 //! set CUDA_VISIBLE_DEVICES=0
 //! set WAN_SNAPSHOT=C:\Users\…\models--Wan-AI--Wan2.2-TI2V-5B-Diffusers\snapshots\<h>
 //! set WAN_W=1280& set WAN_H=1280& set WAN_FRAMES=13
-//!   cargo test -p candle-gen-wan --features cuda --release --test vae_decode_sweep -- --ignored --nocapture
+//!   cargo test -p candle-gen-wan --features cuda --release --test integration vae_decode_sweep:: -- --ignored --nocapture
 //! # add WAN_TILE_PX=512 [WAN_OVERLAP_PX=64] for a fixed spatial-tile run
 //! # add WAN_BUDGETED=1 [WAN_VAE_BUDGET_GIB=48] to exercise the production budgeted selector
 //! # add WAN_GPU=0 to pick which GPU ordinal nvidia-smi samples (default 0; pair with CUDA_VISIBLE_DEVICES)

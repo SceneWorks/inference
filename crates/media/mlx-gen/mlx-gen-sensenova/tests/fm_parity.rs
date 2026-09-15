@@ -4,7 +4,7 @@
 //! (Linear→GELU→Linear), the GLIDE `TimestepEmbedder`, the standard time schedule, the Euler step +
 //! velocity formula, and patchify/unpatchify — all dumped from the reference. f32.
 //!
-//! Run: `cargo test -p mlx-gen-sensenova --test fm_parity -- --nocapture`
+//! Run: `cargo test -p mlx-gen-sensenova --test integration fm_parity:: -- --nocapture`
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sensenova::{

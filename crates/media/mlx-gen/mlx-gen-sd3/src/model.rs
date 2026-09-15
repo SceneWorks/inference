@@ -38,17 +38,18 @@ use std::path::Path;
 
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, resolve_flow_schedule, Conditioning, Error, FlowMatchEuler, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, ModelDescriptor, OffloadPolicy, Precision,
-    Progress, Quant, Residency, Result, WeightsSource,
+    default_seed, Conditioning, Error, FlowMatchEuler, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadSpec, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant,
+    Residency, Result, WeightsSource,
 };
 
 use mlx_gen_sdxl::tokenizer::ClipBpeTokenizer;
 use mlx_gen_z_image::vae::Vae;
+use mlx_rs::Array;
 
 use crate::config::Sd3Variant;
 use crate::loader;
-use crate::pipeline::{self, SCHEDULE_SHIFT};
+use crate::pipeline;
 use crate::text::{Sd3Conditioning, Sd3TextEncoders};
 use crate::transformer::Sd3Transformer;
 
@@ -101,6 +102,8 @@ pub struct Sd3Large {
     /// checks, and the error-safe cache flush once for all providers. The tokenizers stay always-warm
     /// (cheap) on the struct above.
     residency: Residency<Sd3TextEncoders, Sd3Heavy>,
+    memory_strategy: Option<mlx_gen::gen_core::MemoryProviderContract>,
+    loaded_spec: LoadSpec,
 }
 
 /// The heavy render-phase components (everything but the triple text encoder): the MMDiT transformer
@@ -110,6 +113,59 @@ pub struct Sd3Large {
 pub(crate) struct Sd3Heavy {
     transformer: Sd3Transformer,
     vae: Vae,
+}
+
+/// Seed-independent reference work for one SD3 request. The production implementation owns both
+/// the VAE encode and the eager eval, while tests inject a tensor-free counter through this exact
+/// boundary. [`Sd3Variant::map_seeded_outputs`] calls `prepare` before entering its output loop.
+trait Sd3ReferencePreparer<R, P, E> {
+    fn prepare(&mut self, route: Sd3Variant, reference: &R) -> std::result::Result<P, E>;
+}
+
+/// Production reference preparer shared by Large, Turbo, and Medium. Keeping the only reference
+/// encode/eval pair in this adapter makes its placement independently mutation-checkable without
+/// loading MLX tensors or weights.
+struct MlxReferencePreparer<'a> {
+    vae: &'a Vae,
+    width: u32,
+    height: u32,
+}
+
+impl Sd3ReferencePreparer<Image, Array, Error> for MlxReferencePreparer<'_> {
+    fn prepare(&mut self, _route: Sd3Variant, init: &Image) -> Result<Array> {
+        let clean = pipeline::encode_reference(self.vae, init, self.width, self.height)?;
+        // MLX is lazy: force the clean latent while the one reference-encode graph is current so
+        // every seed reuses data, not a deferred VAE graph.
+        mlx_rs::transforms::eval([&clean])?;
+        Ok(clean)
+    }
+}
+
+impl Sd3Variant {
+    /// Tensor-free request scheduler shared by the production Large, Turbo, and Medium generator
+    /// path. `preparer` owns the one seed-independent reference encode/materialization; `output`
+    /// owns each seed-specific noise, denoise, and decode. Keeping this seam on the route itself
+    /// makes the production call injectable without constructing MLX arrays in its
+    /// mutation-sensitive tests.
+    fn map_seeded_outputs<R, P, O, E, A>(
+        self,
+        reference: Option<&R>,
+        base_seed: u64,
+        count: u32,
+        preparer: &mut A,
+        mut output: impl FnMut(Self, u64, Option<&P>) -> std::result::Result<O, E>,
+    ) -> std::result::Result<Vec<O>, E>
+    where
+        A: Sd3ReferencePreparer<R, P, E>,
+    {
+        mlx_gen::gen_core::map_sd3_seeded_outputs(
+            reference,
+            base_seed,
+            count,
+            |reference| preparer.prepare(self, reference),
+            |seed, prepared| output(self, seed, prepared),
+        )
+    }
 }
 
 /// Construct a SD3.5-**Large** generator from a [`LoadSpec`]. See [`load_variant`] for the shared body.
@@ -167,6 +223,10 @@ pub fn load_variant(spec: &LoadSpec, variant: Sd3Variant) -> Result<Box<dyn Gene
         }
     }
     let residency = build_residency(spec, variant)?;
+    let memory_strategy = Some(
+        crate::memory_strategy::contract_for(id, spec)
+            .map_err(|error| Error::Msg(error.to_string()))?,
+    );
     Ok(Box::new(Sd3Large {
         variant,
         descriptor: variant.descriptor(),
@@ -174,6 +234,8 @@ pub fn load_variant(spec: &LoadSpec, variant: Sd3Variant) -> Result<Box<dyn Gene
         clip_pad: loader::load_clip_pad_ids(root)?,
         t5_tokenizer: loader::load_t5_tokenizer(root)?,
         residency,
+        memory_strategy,
+        loaded_spec: spec.clone(),
     }))
 }
 
@@ -243,13 +305,63 @@ fn load_heavy(spec: &LoadSpec, root: &Path, variant: Sd3Variant) -> Result<Sd3He
     if !spec.adapters.is_empty() {
         crate::adapters::apply_sd3_adapters(&mut transformer, &spec.adapters)?;
     }
+    // SC-18606: the one-block window is variant-generic. `stream_inventory` is the SAME seam
+    // `memory_strategy::contract_for` consults to decide whether to publish
+    // `BoundedTransformerResidency` as `Implemented`, so a route can never advertise a rung this
+    // loader would then decline to attach — nor the reverse. `None` (an unstreamable selector or a
+    // snapshot with no readable `transformer/` subtree) leaves the resident block stack in place,
+    // exactly matching the rung-4-`Missing` contract the same spec produces.
+    if let Some(inventory) = crate::artifact_inventory::stream_inventory(variant.id(), spec)? {
+        transformer = transformer.with_block_stream(inventory, arch);
+        transformer.finalize_block_stream()?;
+    }
     Ok(Sd3Heavy { transformer, vae })
 }
 
-mlx_gen::impl_generator!(Sd3Large {
-    validate: |s, req| validate_request(&s.descriptor, req),
-    generate: generate_impl,
-});
+impl Generator for Sd3Large {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        validate_request(&self.descriptor, req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        self.memory_strategy.as_ref().map_or_else(
+            || mlx_gen::gen_core::MemorySafetyDecision::Reject {
+                reason: format!("{} has no memory-strategy contract", self.descriptor.id),
+            },
+            |contract| crate::memory_strategy::safety_check(&self.loaded_spec, contract, context),
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        let Some(contract) = self.memory_strategy.as_ref() else {
+            return Ok(None);
+        };
+        crate::memory_strategy::begin_request(&self.loaded_spec, contract, context)
+    }
+}
 
 impl Sd3Large {
     /// The rich-`Result` body behind [`Generator::generate`]. The staged residency lifecycle (triple-TE
@@ -280,9 +392,7 @@ impl Sd3Large {
         // is loaded), so this routes for Large/Medium (true-CFG) and the distilled Large-Turbo alike.
         // Seed-independent; resolved above the residency lifecycle.
         let reference = single_reference(req)?;
-        let strength = reference
-            .and_then(|(_, s)| s.or(req.strength))
-            .unwrap_or(0.5);
+        let strength = img2img_strength(reference.and_then(|(_, s)| s), req.strength);
         let sampler_name = req.sampler.as_deref();
 
         self.residency.run(
@@ -322,7 +432,10 @@ impl Sd3Large {
             // while the encoders are still alive (Sequential only) — MLX is lazy, so an un-evaluated
             // output keeps all three encoders referenced through the graph and the drop would free
             // nothing. All of `context`/`pooled` (cond + optional uncond) are forced before the drop.
-            |(cond, uncond): &(Sd3Conditioning, Option<Sd3Conditioning>)| {
+            |encoded: Option<&(Sd3Conditioning, Option<Sd3Conditioning>)>| {
+                let Some((cond, uncond)) = encoded else {
+                    return Ok(());
+                };
                 let mut arrays = vec![&cond.context, &cond.pooled];
                 if let Some(uc) = uncond {
                     arrays.push(&uc.context);
@@ -337,53 +450,72 @@ impl Sd3Large {
                 // Static shift=3.0 schedule (scheduler_config.json), resolution-independent — build
                 // once. An unset req.scheduler keeps it byte-exact; a curated name re-shapes σ over the
                 // same mu=ln(3).
-                let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
-                let scheduler = FlowMatchEuler::from_sigmas(resolve_flow_schedule(
+                let scheduler = FlowMatchEuler::from_sigmas(pipeline::resolve_sd3_sigmas(
                     req.scheduler.as_deref(),
-                    SCHEDULE_SHIFT.ln(),
                     steps,
-                    &native.sigmas,
                 ))?;
 
-                let mut images = Vec::with_capacity(req.count as usize);
-                for i in 0..req.count {
-                    let seed = base_seed.wrapping_add(i as u64);
-                    let latents = if let Some((init, _)) = reference {
-                        pipeline::denoise_img2img_cfg(
-                            &heavy.transformer,
-                            &scheduler,
-                            sampler_name,
-                            seed,
+                let attention = crate::memory_strategy::attention_plan(req);
+                let transformer_window = crate::memory_strategy::transformer_window(req)?;
+                let decode_tiling = crate::memory_strategy::decode_tiling(req)?;
+                let mut reference_preparer = MlxReferencePreparer {
+                    vae: &heavy.vae,
+                    width: req.width,
+                    height: req.height,
+                };
+                let images = self.variant.map_seeded_outputs(
+                    reference.map(|(image, _)| image),
+                    base_seed,
+                    req.count,
+                    &mut reference_preparer,
+                    |_route, seed, clean| {
+                        let latents = if let Some(clean) = clean {
+                            pipeline::denoise_img2img_from_clean_cfg_with_memory(
+                                &heavy.transformer,
+                                &scheduler,
+                                sampler_name,
+                                seed,
+                                clean,
+                                strength,
+                                req.width,
+                                req.height,
+                                steps,
+                                &cond,
+                                uncond.as_ref(),
+                                guidance,
+                                &req.cancel,
+                                on_progress,
+                                &req.preview,
+                                attention,
+                                transformer_window,
+                            )?
+                        } else {
+                            let latents = pipeline::create_noise(seed, req.width, req.height)?;
+                            pipeline::denoise_cfg_with_memory(
+                                &heavy.transformer,
+                                &scheduler,
+                                sampler_name,
+                                seed,
+                                latents,
+                                &cond,
+                                uncond.as_ref(),
+                                guidance,
+                                &req.cancel,
+                                on_progress,
+                                &req.preview,
+                                attention,
+                                transformer_window,
+                            )?
+                        };
+                        on_progress(Progress::Decoding);
+                        pipeline::decode_to_image_tiled(
                             &heavy.vae,
-                            init,
-                            strength,
-                            req.width,
-                            req.height,
-                            steps,
-                            &cond,
-                            uncond.as_ref(),
-                            guidance,
+                            &latents,
+                            decode_tiling.as_ref(),
                             &req.cancel,
-                            on_progress,
-                        )?
-                    } else {
-                        let latents = pipeline::create_noise(seed, req.width, req.height)?;
-                        pipeline::denoise_cfg(
-                            &heavy.transformer,
-                            &scheduler,
-                            sampler_name,
-                            seed,
-                            latents,
-                            &cond,
-                            uncond.as_ref(),
-                            guidance,
-                            &req.cancel,
-                            on_progress,
-                        )?
-                    };
-                    on_progress(Progress::Decoding);
-                    images.push(pipeline::decode_to_image(&heavy.vae, &latents)?);
-                }
+                        )
+                    },
+                )?;
                 Ok(GenerationOutput::Images(images))
             },
         )
@@ -446,29 +578,111 @@ fn single_reference(req: &GenerationRequest) -> Result<Option<(&Image, Option<f3
     }
 }
 
+/// Resolve SD3.5's reference strength with the explicit product default shared by Candle.
+fn img2img_strength(reference: Option<f32>, request: Option<f32>) -> f32 {
+    reference
+        .or(request)
+        .unwrap_or(mlx_gen::img2img::DEFAULT_IMG2IMG_STRENGTH)
+}
+
 // The registration constants bridge the crate's rich `Result` into backend-neutral
 // `gen_core::Result`. Both the true-CFG
 // Large (E5) and the distilled CFG-off Large-Turbo (E6) register here on the shared backbone.
-/// Per-component on-disk footprint (sc-10894) for the MLX fit-gate's staged-residency split — the THREE
-/// text encoders (CLIP-L `text_encoder/`, CLIP-G `text_encoder_2/`, T5-XXL `text_encoder_3/`), the MMDiT
-/// (`transformer/`), and the VAE (`vae/`), summed from the exact snapshot subdirs [`crate::loader`]
-/// loads. (`text_encoder_3/` ships f32 + fp16 shards side by side; the on-disk sum counts both, matching
-/// the worker's whole-model total — a conservative over-count on the encoder side, the safe direction.)
+/// Per-component footprint (sc-10894) for the MLX fit-gate's staged-residency split — the THREE
+/// text encoders (CLIP-L `text_encoder/`, CLIP-G `text_encoder_2/`, T5-XXL `text_encoder_3/`), the
+/// MMDiT (`transformer/`), and the VAE (`vae/`).
+///
+/// The conditioning field is **projected**, not summed off disk (SC-22667). A directory sum was
+/// wrong in both directions at once and the two errors do not cancel, because they land on
+/// different files:
+///
+/// * `load_clip_l` and `load_clip_g` each do `w.cast_all(Dtype::Float32)` unconditionally, and the
+///   pinned SD3.5-Large snapshot stores both at 2 bytes per element — so CLIP-L (123.65M params)
+///   plus CLIP-G (694.66M) were under-declared by their own stored size, about 1.6 GB.
+/// * `text_encoder_3/` ships f32 and fp16 shards side by side and
+///   `resolve_sd3_text_encoder_artifacts` deliberately selects only the master set, so
+///   the directory sum counted shards no load ever opens.
+///
+/// The projection therefore prices exactly the artifacts the resolver hands `load_text_encoders`:
+/// the two CLIP files at their **materialized** f32 width, and the selected T5 shards at their
+/// stored width (`T5TextEncoder::from_weights` performs no `cast_all`; the T5 promotes internally
+/// per activation).
+///
+/// When those artifacts cannot be resolved — a snapshot with no `text_encoder*` subtree at all,
+/// which the structural admission path deliberately accepts — the previous directory sum stands.
+/// This builder runs at contract time, ahead of any deferred component load, so an unresolvable
+/// encoder set must not become a contract-time refusal.
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
-    mlx_gen::PerComponentBytes::from_spec_subdirs(
+    let mut footprint = mlx_gen::PerComponentBytes::from_spec_subdirs(
         spec,
         &["text_encoder", "text_encoder_2", "text_encoder_3"],
         &["transformer"],
         &["vae"],
-    )
+    )?;
+    if let mlx_gen::WeightsSource::Dir(root) = &spec.weights {
+        if let Some(projected) = projected_conditioning_bytes(root) {
+            footprint.text_encoder = projected;
+        }
+    }
+    Ok(footprint)
+}
+
+/// Bytes the three text encoders occupy on device, at the width each is materialized in.
+///
+/// `None` means the exact artifact set could not be resolved or read; see [`component_footprint`]
+/// for why that keeps the directory sum rather than failing the contract.
+fn projected_conditioning_bytes(root: &std::path::Path) -> Option<u64> {
+    use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
+
+    let artifacts = mlx_gen::gen_core::resolve_sd3_text_encoder_artifacts(root).ok()?;
+    let clip_l =
+        projected_safetensors_bytes(&artifacts.clip_l, |_| ResidentProjection::Float32).ok()?;
+    let clip_g =
+        projected_safetensors_bytes(&artifacts.clip_g, |_| ResidentProjection::Float32).ok()?;
+    let mut total = clip_l.saturating_add(clip_g);
+    for shard in &artifacts.t5_shards {
+        total = total.saturating_add(
+            projected_safetensors_bytes(shard, |_| ResidentProjection::Stored).ok()?,
+        );
+    }
+    Some(total)
 }
 
 mlx_gen::register_generators! {
     pub(crate) const LARGE_REGISTRATION = descriptor => load;
     footprint = component_footprint
 }
+
+macro_rules! memory_registration {
+    ($registration:ident, $behavior:ident, $provider_id:expr) => {
+        pub(crate) const $registration: mlx_gen::gen_core::MemoryRegistration =
+            mlx_gen::gen_core::MemoryRegistration {
+                provider_id: $provider_id,
+                contract: |spec| crate::memory_strategy::contract_for($provider_id, spec),
+                safety_check: crate::memory_strategy::safety_check,
+            };
+        pub(crate) const $behavior: mlx_gen::gen_core::MemoryBehaviorRegistration =
+            mlx_gen::gen_core::MemoryBehaviorRegistration {
+                provider_id: $provider_id,
+                valid_fixtures: crate::memory_strategy::registered_fixture,
+                begin_request: crate::memory_strategy::registered_begin_request,
+            };
+    };
+}
+
+memory_registration!(LARGE_MEMORY_REGISTRATION, LARGE_MEMORY_BEHAVIOR, MODEL_ID);
+memory_registration!(
+    TURBO_MEMORY_REGISTRATION,
+    TURBO_MEMORY_BEHAVIOR,
+    TURBO_MODEL_ID
+);
+memory_registration!(
+    MEDIUM_MEMORY_REGISTRATION,
+    MEDIUM_MEMORY_BEHAVIOR,
+    MEDIUM_MODEL_ID
+);
 mlx_gen::register_generators! {
     pub(crate) const TURBO_REGISTRATION = turbo_descriptor => load_turbo;
     footprint = component_footprint
@@ -482,6 +696,171 @@ mlx_gen::register_generators! {
 mod tests {
     use super::*;
     use mlx_gen::{ConditioningKind, Modality};
+    use std::cell::Cell;
+
+    /// Feature-end review (SC-22667, E1): the conditioning field must price what the loader
+    /// materializes, at the width it materializes it in. `load_clip_l` and `load_clip_g` both
+    /// `cast_all(Dtype::Float32)` unconditionally over half-precision masters, and
+    /// `resolve_sd3_text_encoder_artifacts` selects only the master T5 shard family while
+    /// `text_encoder_3/` also ships an fp16 family. A directory sum was therefore wrong in both
+    /// directions at once, on different files, so the two errors could not cancel.
+    ///
+    /// Mutation that fails this: dropping the `projected_conditioning_bytes` override in
+    /// `component_footprint` — `text_encoder` falls back to the stored directory sum, which counts
+    /// the two CLIP masters at half their materialized size and adds the fp16 shard nobody loads.
+    #[test]
+    fn conditioning_bytes_price_the_resolved_artifacts_at_their_materialized_width() {
+        /// One-tensor safetensors file: `dtype` must agree with `width`, because the shared header
+        /// reader refuses a payload length that is not `elements * dtype.size()`.
+        fn write_tensor(path: &std::path::Path, dtype: &str, elements: usize, width: usize) {
+            let data_bytes = elements * width;
+            let mut header = format!(
+                "{{\"weight\":{{\"dtype\":\"{dtype}\",\"shape\":[{elements}],\"data_offsets\":[0,{data_bytes}]}}}}"
+            )
+            .into_bytes();
+            while !header.len().is_multiple_of(8) {
+                header.push(b' ');
+            }
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend(header);
+            bytes.resize(bytes.len() + data_bytes, 0);
+            std::fs::write(path, bytes).unwrap();
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for component in [
+            "text_encoder",
+            "text_encoder_2",
+            "text_encoder_3",
+            "transformer",
+        ] {
+            std::fs::create_dir_all(root.join(component)).unwrap();
+        }
+        // CLIP-L and CLIP-G ship at half precision and are upcast to f32 on every load.
+        write_tensor(&root.join("text_encoder/model.safetensors"), "F16", 100, 2);
+        write_tensor(&root.join("text_encoder_2/model.safetensors"), "F16", 50, 2);
+        // The T5 master family, plus the fp16 family the resolver deliberately does not select.
+        write_tensor(
+            &root.join("text_encoder_3/model-00001-of-00001.safetensors"),
+            "BF16",
+            40,
+            2,
+        );
+        write_tensor(
+            &root.join("text_encoder_3/model.fp16-00001-of-00001.safetensors"),
+            "F16",
+            40,
+            2,
+        );
+        std::fs::write(
+            root.join("text_encoder_3/model.safetensors.index.json"),
+            br#"{"weight_map":{"weight":"model-00001-of-00001.safetensors"}}"#,
+        )
+        .unwrap();
+        // The resolver refuses an fp16 family without its own authoritative index, so the fixture
+        // ships the complete side-by-side pair the real snapshot has.
+        std::fs::write(
+            root.join("text_encoder_3/model.safetensors.index.fp16.json"),
+            br#"{"weight_map":{"weight":"model.fp16-00001-of-00001.safetensors"}}"#,
+        )
+        .unwrap();
+
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(root.to_path_buf()));
+        let footprint = component_footprint(&spec).unwrap();
+        assert_eq!(
+            footprint.text_encoder,
+            // CLIP-L 100 x f32 + CLIP-G 50 x f32 + the selected T5 shard at its stored width.
+            400 + 200 + 80,
+            "the two upcast CLIP towers must be priced at 4 bytes per element, and only the master \
+             T5 shard family may be counted"
+        );
+
+        // A snapshot with no encoder subtree at all is the structural-admission shape: the resolver
+        // declines, and the previous directory sum (zero here) stands rather than the contract
+        // refusing at build time.
+        let bare = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(bare.path().join("transformer")).unwrap();
+        let bare_spec =
+            mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(bare.path().to_path_buf()));
+        assert_eq!(component_footprint(&bare_spec).unwrap().text_encoder, 0);
+    }
+
+    struct CountingReferencePreparer<'a> {
+        expected_route: Sd3Variant,
+        expected_reference: u8,
+        request_id: u32,
+        encode_count: &'a Cell<u32>,
+        eval_count: &'a Cell<u32>,
+    }
+
+    impl Sd3ReferencePreparer<u8, Box<u32>, ()> for CountingReferencePreparer<'_> {
+        fn prepare(&mut self, route: Sd3Variant, source: &u8) -> std::result::Result<Box<u32>, ()> {
+            assert_eq!(route, self.expected_route);
+            assert_eq!(*source, self.expected_reference);
+            self.encode_count.set(self.encode_count.get() + 1);
+            // The production adapter evaluates the lazy VAE result immediately after encoding.
+            // Keep a separate counter so moving either operation into the output loop fails.
+            self.eval_count.set(self.eval_count.get() + 1);
+            Ok(Box::new(self.request_id))
+        }
+    }
+
+    fn production_reference_placement_is_valid(source: &str) -> bool {
+        let Some((_, adapter_tail)) = source.split_once(
+            "impl Sd3ReferencePreparer<Image, Array, Error> for MlxReferencePreparer<'_> {",
+        ) else {
+            return false;
+        };
+        let Some((adapter_body, _)) = adapter_tail.split_once("\n}\n\nimpl Sd3Variant {") else {
+            return false;
+        };
+
+        let Some((_, generate_tail)) = source.split_once("    fn generate_impl(") else {
+            return false;
+        };
+        let Some((generate_body, _)) =
+            generate_tail.split_once("\n/// Required divisor for requested image dims")
+        else {
+            return false;
+        };
+
+        let encode = "pipeline::encode_reference(";
+        let eval = "mlx_rs::transforms::eval([&clean])";
+        let adapter_order_is_encode_then_eval = adapter_body
+            .find(encode)
+            .zip(adapter_body.find(eval))
+            .is_some_and(|(encode_at, eval_at)| encode_at < eval_at);
+
+        adapter_body.matches(encode).count() == 1
+            && adapter_body.matches(eval).count() == 1
+            && adapter_order_is_encode_then_eval
+            && generate_body
+                .matches("let mut reference_preparer = MlxReferencePreparer {")
+                .count()
+                == 1
+            && generate_body
+                .matches("self.variant.map_seeded_outputs(")
+                .count()
+                == 1
+            && generate_body.matches("&mut reference_preparer,").count() == 1
+            && !generate_body.contains(encode)
+            && !generate_body.contains(eval)
+    }
+
+    fn move_prepare_operation_into_output(
+        source: &str,
+        operation: &str,
+        replacement: &str,
+        output_statement: &str,
+    ) -> String {
+        let without_adapter_operation = source.replacen(operation, replacement, 1);
+        without_adapter_operation.replacen(
+            "                    |_route, seed, clean| {",
+            &format!("                    |_route, seed, clean| {{\n{output_statement}"),
+            1,
+        )
+    }
 
     fn tiny_image() -> Image {
         Image {
@@ -502,6 +881,115 @@ mod tests {
                 })
                 .collect(),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn every_variant_schedules_one_request_local_reference_encode_and_distinct_seeds() {
+        for route in [
+            Sd3Variant::Large,
+            Sd3Variant::LargeTurbo,
+            Sd3Variant::Medium,
+        ] {
+            let encode_count = Cell::new(0_u32);
+            let eval_count = Cell::new(0_u32);
+            let reference = 17_u8;
+
+            let run_request = |request_id: u32, base_seed: u64, count: u32| {
+                let mut preparer = CountingReferencePreparer {
+                    expected_route: route,
+                    expected_reference: reference,
+                    request_id,
+                    encode_count: &encode_count,
+                    eval_count: &eval_count,
+                };
+                route
+                    .map_seeded_outputs(
+                        Some(&reference),
+                        base_seed,
+                        count,
+                        &mut preparer,
+                        |output_route, seed, clean| {
+                            assert_eq!(output_route, route);
+                            let clean = clean.expect("reference request carries a clean latent");
+                            Ok::<_, ()>((
+                                seed,
+                                **clean,
+                                std::ptr::from_ref(clean.as_ref()) as usize,
+                            ))
+                        },
+                    )
+                    .unwrap()
+            };
+
+            let first = run_request(1, u64::MAX - 1, 3);
+            assert_eq!(
+                first.iter().map(|(seed, _, _)| *seed).collect::<Vec<_>>(),
+                [u64::MAX - 1, u64::MAX, 0]
+            );
+            assert!(first.iter().all(|(_, request_id, _)| *request_id == 1));
+            assert!(
+                first.windows(2).all(|pair| pair[0].2 == pair[1].2),
+                "every output must borrow the same prepared clean latent"
+            );
+            assert_eq!(encode_count.get(), 1);
+            assert_eq!(eval_count.get(), 1);
+
+            let second = run_request(2, 41, 2);
+            assert_eq!(
+                second.iter().map(|(seed, _, _)| *seed).collect::<Vec<_>>(),
+                [41, 42]
+            );
+            assert!(second.iter().all(|(_, request_id, _)| *request_id == 2));
+            assert_eq!(encode_count.get(), 2, "a second request must encode afresh");
+            assert_eq!(eval_count.get(), 2, "a second request must evaluate afresh");
+        }
+    }
+
+    #[test]
+    fn production_reference_work_is_bound_to_the_tested_adapter_and_scheduler() {
+        let source = include_str!("model.rs");
+        assert!(production_reference_placement_is_valid(source));
+
+        let mutations = [
+            (
+                "production scheduler bypass",
+                source.replacen(
+                    "self.variant.map_seeded_outputs(",
+                    "self.variant.map_seeded_outputs_bypassed(",
+                    1,
+                ),
+            ),
+            (
+                "reference encode moved into the per-output closure",
+                move_prepare_operation_into_output(
+                    source,
+                    "pipeline::encode_reference(",
+                    "pipeline::reference_encode_moved_for_mutation(",
+                    "                        let _mutation = \
+                         pipeline::encode_reference(/* moved per output */);\n",
+                ),
+            ),
+            (
+                "reference eval moved into the per-output closure",
+                move_prepare_operation_into_output(
+                    source,
+                    "mlx_rs::transforms::eval([&clean])",
+                    "mlx_rs::transforms::eval_moved_for_mutation([&clean])",
+                    "                        let _mutation = \
+                         mlx_rs::transforms::eval([&clean]);\n",
+                ),
+            ),
+            (
+                "production adapter disconnected",
+                source.replacen("&mut reference_preparer,", "&mut bypass_preparer,", 1),
+            ),
+        ];
+        for (mutation, mutated_source) in mutations {
+            assert!(
+                !production_reference_placement_is_valid(&mutated_source),
+                "placement contract must reject mutation: {mutation}"
+            );
         }
     }
 
@@ -575,12 +1063,25 @@ mod tests {
     }
 
     #[test]
+    fn missing_img2img_strength_defaults_to_midpoint() {
+        assert_eq!(
+            img2img_strength(None, None),
+            mlx_gen::img2img::DEFAULT_IMG2IMG_STRENGTH
+        );
+        assert_eq!(img2img_strength(Some(0.75), Some(0.2)), 0.75);
+        assert_eq!(img2img_strength(None, Some(0.2)), 0.2);
+    }
+
+    #[test]
     fn descriptor_is_sd3_5_large() {
         let d = descriptor();
         assert_eq!(d.id, "sd3_5_large");
         assert_eq!(d.family, "sd3");
         assert_eq!(d.modality, Modality::Image);
-        assert!(d.capabilities.supports_true_cfg);
+        assert!(
+            !d.capabilities.supports_true_cfg,
+            "the MLX SD3.5 render path does not consume request.true_cfg"
+        );
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supports_negative_prompt);
     }
@@ -628,7 +1129,8 @@ mod tests {
 
     #[test]
     fn validate_accepts_guidance_and_negative_prompt() {
-        // Large is true-CFG: guidance + negative prompt are supported (unlike a distilled Turbo).
+        // Large uses classifier-free guidance: guidance + negative prompt are supported (unlike a
+        // distilled Turbo), while the separate request.true_cfg knob is rejected.
         let d = descriptor();
         let req = GenerationRequest {
             prompt: "a fox".into(),
@@ -637,6 +1139,14 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_request(&d, &req).is_ok());
+        let with_true_cfg = GenerationRequest {
+            true_cfg: Some(4.5),
+            ..req
+        };
+        let err = validate_request(&d, &with_true_cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("true_cfg is not supported"), "got: {err}");
     }
 
     #[test]
@@ -752,14 +1262,14 @@ mod tests {
     // --- M3 (sc-7869): SD3.5-Medium vertical -----------------------------------------------------
 
     #[test]
-    fn medium_descriptor_is_sd3_5_medium_true_cfg() {
-        // Medium registers its own engine id and is true-CFG (negative prompt + guidance), like Large
-        // (NOT a distilled Turbo).
+    fn medium_descriptor_is_sd3_5_medium_cfg() {
+        // Medium registers its own engine id and uses classifier-free guidance (negative prompt +
+        // guidance), like Large (NOT a distilled Turbo). It does not consume request.true_cfg.
         let d = medium_descriptor();
         assert_eq!(d.id, "sd3_5_medium");
         assert_eq!(d.family, "sd3");
         assert_eq!(d.modality, Modality::Image);
-        assert!(d.capabilities.supports_true_cfg);
+        assert!(!d.capabilities.supports_true_cfg);
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supports_negative_prompt);
         // The higher-res ceiling: Medium's pos_embed_max_size (384) spans up to 1440² (patch grid
@@ -799,6 +1309,17 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_request(&d, &req).is_ok());
+        assert!(
+            validate_request(
+                &d,
+                &GenerationRequest {
+                    true_cfg: Some(5.0),
+                    ..req
+                },
+            )
+            .is_err(),
+            "Medium must reject request.true_cfg because the render path never consumes it"
+        );
     }
 
     #[test]

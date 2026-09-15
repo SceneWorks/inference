@@ -72,9 +72,9 @@ pub use flow::Flow;
 pub use hift::HiftGenerator;
 pub use mel24::Mel24Extractor;
 pub use model::{
-    descriptor, load, load_generator, ChatterboxGenerator, COMPONENT_PERTH,
-    COMPONENT_VOICE_EMBEDDING, HUB_REPO, HUB_REVISION, MODEL_ID, REGISTRATION, REQUIRED_COMPONENTS,
-    T3_WEIGHTS_FILE, TOKENIZER_FILE, WEIGHT_LICENSE, WEIGHT_LICENSE_ENTRY,
+    descriptor, load, load_generator, ChatterboxGenerator, COMPONENT_KEY, COMPONENT_LICENSE,
+    COMPONENT_PERTH, COMPONENT_VOICE_EMBEDDING, HUB_REPO, HUB_REVISION, MODEL_ID, REGISTRATION,
+    REQUIRED_COMPONENTS, T3_WEIGHTS_FILE, TOKENIZER_FILE,
 };
 pub use perth::{
     snr_db, PerthWatermarker, PERTH_HUB_REPO, PERTH_HUB_REVISION, PERTH_SR, PERTH_WEIGHTS_FILE,
@@ -82,10 +82,17 @@ pub use perth::{
 pub use s3gen::S3Gen;
 pub use s3tokenizer::S3Tokenizer;
 
-/// Every model-weight license this crate ships (sc-13332) — the `chatterbox_tts` generator's pinned
-/// `ResembleAI/chatterbox` (MIT) checkpoint. `candle-audio-catalog` aggregates this into the
-/// release-tooling weight-license manifest.
-pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[model::WEIGHT_LICENSE_ENTRY];
+/// This crate's schema-3 component licence rows — one per loaded artifact (sc-16663). The audio
+/// catalog concatenates every provider crate's slice into the licence table it ships.
+pub const COMPONENT_LICENSES: &[gen_core::ComponentLicense] = &[model::COMPONENT_LICENSE];
+
+/// The provider→component mapping this crate contributes. A provider's effective terms are
+/// **derived** from these components by [`gen_core::provider_terms`] — never hand-authored — so
+/// they cannot drift from the component rows they summarize.
+pub const PROVIDER_COMPONENTS: &[gen_core::ProviderComponents] = &[gen_core::ProviderComponents {
+    provider_id: model::MODEL_ID,
+    components: &[model::COMPONENT_KEY],
+}];
 
 /// Add the Chatterbox clone-TTS generator (`chatterbox_tts`) to an explicit audio registry builder.
 /// `candle-audio-catalog` calls this in stable catalog order (sc-13239); this crate's own

@@ -161,8 +161,14 @@ fn ones(d: usize) -> Tensor {
 
 /// Write a tiny 2-layer `llama` snapshot from deterministic random weights and load it on CPU.
 fn build_tiny_llama() -> CausalLm {
-    let dir = std::env::temp_dir().join(format!("candle-llm-prefix-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    // sc-17755: a `TempDir` guard rather than a hand-rolled `temp_dir()` join. The snapshot is
+    // read fully into memory by the loader below (`safetensors::load`, not an mmap), so the tree
+    // is safe to remove when this helper returns — and it now does, including out of a panic.
+    let guard = tempfile::Builder::new()
+        .prefix("candle-llm-prefix-")
+        .tempdir()
+        .expect("fixture temp dir");
+    let dir = guard.path();
 
     let config = format!(
         r#"{{
@@ -212,11 +218,10 @@ fn build_tiny_llama() -> CausalLm {
     }
 
     candle_core::safetensors::save(&w, dir.join("model.safetensors")).unwrap();
-    let cfg = ModelConfig::from_dir(&dir).unwrap();
-    let weights = Weights::from_dir(&dir, &Device::Cpu).unwrap();
-    let model = CausalLm::from_weights(&weights, "", cfg).unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-    model
+    let cfg = ModelConfig::from_dir(dir).unwrap();
+    let weights = Weights::from_dir(dir, &Device::Cpu).unwrap();
+
+    CausalLm::from_weights(&weights, "", cfg).unwrap()
 }
 
 #[test]

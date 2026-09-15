@@ -1,6 +1,8 @@
-//! The candle Kolors **txt2img** pipeline — ChatGLM3-6B prompt encode → the SDXL-family Kolors UNet
-//! (real CFG over the leading-Euler schedule) → the SDXL VAE, driven through the backend-neutral
-//! [`gen_core::Generator`] contract and parity-matched to the macOS `mlx-gen-kolors` provider.
+//! The candle Kolors **txt2img + source-image img2img** pipeline — ChatGLM3-6B prompt encode → seeded
+//! noise or a VAE-encoded reference with the strength-selected schedule tail → the SDXL-family
+//! Kolors UNet (real CFG over the leading-Euler schedule) → the SDXL VAE, driven through the
+//! backend-neutral [`gen_core::Generator`] contract and parity-matched to the macOS
+//! `mlx-gen-kolors` provider.
 //!
 //! Parity choices (grounded in the mlx `model.rs` + diffusers `KolorsPipeline`):
 //! - **Conditioning**: each prompt is tokenized to the fixed 256-len left-padded form and run through
@@ -18,12 +20,16 @@
 //! over bf16 weights"); the SDXL VAE is f32-stable so it needs no fp16-fix.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::diffusion_schedule::{KOLORS_BETA_END, KOLORS_BETA_START, KOLORS_TRAIN_STEPS};
+use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::sampling::{AlphaSchedule, Scheduler, Solver};
-use candle_gen::gen_core::{self, GenerationRequest, Image, PidWeights, Progress};
+use candle_gen::gen_core::{
+    self, AdapterSpec, Conditioning, GenerationRequest, Image, PidWeights, Progress,
+};
 use candle_gen::quant::{PackedConfig, QLinear, MLX_GROUP_SIZE};
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
 use candle_gen::{CandleError, Result};
@@ -33,7 +39,9 @@ use candle_gen::{CandleError, Result};
 // `add_embedding` + the external `encoder_hid_proj`) are handled outside the block stack, exactly as the
 // Kolors IP-Adapter provider already does (sc-10819).
 use candle_gen_pid::PidEngine;
-use candle_gen_sdxl::{sdxl_unet_config, UNet2DConditionModel as VendoredUNet};
+use candle_gen_sdxl::{
+    load_vendored_unet_with_adapters, UNet2DConditionModel as VendoredUNet, VaeMomentsEncoder,
+};
 use candle_transformers::models::stable_diffusion::vae::{AutoEncoderKL, AutoEncoderKLConfig};
 
 use crate::chatglm3::ChatGlmModel;
@@ -53,14 +61,6 @@ const PID_BACKBONE: &str = "sdxl";
 /// decode — the diffusers-correct SDXL value (NOT candle's hardcoded SD1.5 0.18215). `pub(crate)` so
 /// the IP-Adapter provider (sc-5488) shares the exact decode scale.
 pub(crate) const VAE_SCALE: f64 = 0.13025;
-
-/// Kolors' `scaled_linear` β endpoints + train-step count — the diffusers `EulerDiscreteScheduler`
-/// config the native [`KolorsEulerSampler`](crate::sampler) is built from (β₁ = **0.014**, NOT SDXL's
-/// 0.012; N = **1100**, NOT SDXL's 1000). The curated [`DiscreteModelSampling`] σ-table (sc-7124) is
-/// built from these same values so the ε/DDPM menu integrates over Kolors' own noise schedule.
-const KOLORS_BETA_START: f32 = 0.00085;
-const KOLORS_BETA_END: f32 = 0.014;
-const KOLORS_TRAIN_STEPS: usize = crate::sampler::NUM_TRAIN_TIMESTEPS;
 
 /// Build Kolors' ε-prediction α-cumprod schedule (`scaled_linear` β over the 1100 train steps) — the
 /// [`DiscreteModelSampling`] source the curated unified-sampler path integrates over. Shared by the
@@ -105,6 +105,8 @@ pub(crate) struct Pipeline {
     /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), built into the cached
     /// [`Components`] so the PiD engine loads once alongside the base model. `None` ⇒ native VAE decode.
     pid_spec: Option<PidWeights>,
+    adapters: Vec<AdapterSpec>,
+    load_seal: Option<crate::memory_strategy::KolorsLoadSeal>,
 }
 
 /// Kolors' two UNet deltas vs stock SDXL, both auto-present in the checkpoint: the `add_embedding` MLP
@@ -194,17 +196,43 @@ pub(crate) struct Components {
     chatglm: Arc<ChatGlmModel>,
     unet: KolorsUnet,
     vae: Arc<AutoEncoderKL>,
+    /// The img2img-only half of the VAE. Ordinary T2I must not pay for or retain a second copy of
+    /// the encoder weights, so the first reference request populates this shared read-through slot.
+    vae_encoder: Arc<Mutex<Option<Arc<VaeMomentsEncoder>>>>,
     /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853); None ⇒ native VAE decode.
     pid: Option<Arc<PidEngine>>,
 }
 
 impl Pipeline {
-    pub(crate) fn load(root: &Path, device: &Device, pid_spec: Option<PidWeights>) -> Self {
+    pub(crate) fn load(
+        root: &Path,
+        device: &Device,
+        pid_spec: Option<PidWeights>,
+        adapters: Vec<AdapterSpec>,
+    ) -> Self {
         Self {
             root: root.to_path_buf(),
             device: device.clone(),
             pid_spec,
+            adapters,
+            load_seal: None,
         }
+    }
+
+    pub(crate) fn with_load_seal(
+        mut self,
+        seal: Option<crate::memory_strategy::KolorsLoadSeal>,
+    ) -> Self {
+        self.load_seal = seal;
+        self
+    }
+
+    fn ensure_load_seal(&self) -> Result<()> {
+        if let Some(seal) = &self.load_seal {
+            seal.ensure_unchanged()
+                .map_err(|error| CandleError::Msg(error.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Load the four heavy components from the Kolors-diffusers snapshot (`tokenizer/`, `text_encoder/`
@@ -220,6 +248,25 @@ impl Pipeline {
     ///   dense `unet/` builds the stock [`KolorsUNet`] (the byte-exact default path);
     /// - the VAE stays dense f32 in every tier (the MLX packer mirrors it, not packs it).
     pub(crate) fn load_components(&self) -> Result<Components> {
+        let (tokenizer, chatglm) = self.load_conditioner()?;
+        let unet = self.load_unet()?;
+        let vae = self.load_vae()?;
+        let pid = self.load_pid()?;
+        Ok(Components {
+            tokenizer: Arc::new(tokenizer),
+            chatglm: Arc::new(chatglm),
+            unet,
+            vae: Arc::new(vae),
+            vae_encoder: Arc::new(Mutex::new(None)),
+            pid,
+        })
+    }
+
+    /// Materialize only the tokenizer and ChatGLM conditioning phase.  Staged
+    /// requests use this independently so the 6B text tower is released before
+    /// the UNet phase is opened.
+    fn load_conditioner(&self) -> Result<(KolorsTokenizer, ChatGlmModel)> {
+        self.ensure_load_seal()?;
         let tokenizer = KolorsTokenizer::from_dir(self.root.join("tokenizer"))?;
 
         // ChatGLM3-6B text encoder. The four GLM projections packed-detect on their `.scales` sibling
@@ -232,22 +279,29 @@ impl Pipeline {
             self.f32_vb(&te_dir)?,
             te_group,
         )?;
+        Ok((tokenizer, chatglm))
+    }
 
+    /// Materialize only the denoise phase, preserving the packed/dense fork.
+    fn load_unet(&self) -> Result<KolorsUnet> {
+        self.ensure_load_seal()?;
         // UNet: a packed MLX tier (a `quantization` block in `unet/config.json`) builds the vendored,
         // packed-detecting SDXL UNet + the two Kolors deltas straight from the packed parts; a dense
         // snapshot builds the stock `KolorsUNet` (byte-exact default path, zero regression).
-        let unet = match detect_packed_unet(&self.root)? {
+        match detect_packed_unet(&self.root)? {
             Some((unet_file, group_size)) => {
                 let vs = candle_gen::mmap_var_builder(&[unet_file], DType::F32, &self.device)?;
                 // The vendored UNet + the 5632 `add_embedding` (both packed-detecting via the shared
                 // `candle_gen::quant` seam); `sdxl_unet_config` is the canonical 3-block SDXL geometry
                 // Kolors shares. `false` = math attention (the vendored flash path is a stub).
-                let vendored = VendoredUNet::new(vs.clone(), 4, 4, false, sdxl_unet_config())?
-                    .with_add_embedding(
-                        vs.clone(),
-                        ADDITION_TIME_EMBED_DIM,
-                        PROJECTION_INPUT_DIM,
-                    )?;
+                let vendored = load_vendored_unet_with_adapters(
+                    &self.root,
+                    &self.device,
+                    DType::F32,
+                    &self.adapters,
+                    ADDITION_TIME_EMBED_DIM,
+                    PROJECTION_INPUT_DIM,
+                )?;
                 // The Kolors `encoder_hid_proj` is packed inside `unet/` (pack-all), so it must
                 // packed-detect too — a bare `candle_nn::Linear` would read the u32 codes as garbage.
                 let encoder_hid_proj = QLinear::linear_detect_gs(
@@ -258,39 +312,64 @@ impl Pipeline {
                     true,
                     group_size,
                 )?;
-                KolorsUnet::Packed {
+                Ok(KolorsUnet::Packed {
                     unet: Arc::new(vendored),
                     encoder_hid_proj: Arc::new(encoder_hid_proj),
-                }
+                })
             }
-            None => KolorsUnet::Dense(Arc::new(KolorsUNet::new(
+            None if self.adapters.is_empty() => Ok(KolorsUnet::Dense(Arc::new(KolorsUNet::new(
                 self.f32_vb(&self.root.join("unet"))?,
                 false,
-            )?)),
-        };
+            )?))),
+            None => {
+                let vs = self.f32_vb(&self.root.join("unet"))?;
+                let vendored = load_vendored_unet_with_adapters(
+                    &self.root,
+                    &self.device,
+                    DType::F32,
+                    &self.adapters,
+                    ADDITION_TIME_EMBED_DIM,
+                    PROJECTION_INPUT_DIM,
+                )?;
+                let encoder_hid_proj = QLinear::linear_detect_gs(
+                    CONTEXT_DIM,
+                    CROSS_ATTENTION_DIM,
+                    &vs,
+                    "encoder_hid_proj",
+                    true,
+                    MLX_GROUP_SIZE,
+                )?;
+                Ok(KolorsUnet::Packed {
+                    unet: Arc::new(vendored),
+                    encoder_hid_proj: Arc::new(encoder_hid_proj),
+                })
+            }
+        }
+    }
 
-        let vae = AutoEncoderKL::new(
+    /// Materialize only the native F32 SDXL VAE decode phase.  bf16 snapshots
+    /// intentionally still execute this exact F32 recipe.
+    fn load_vae(&self) -> Result<AutoEncoderKL> {
+        self.ensure_load_seal()?;
+        Ok(AutoEncoderKL::new(
             self.f32_vb(&self.root.join("vae"))?,
             3,
             3,
             sdxl_vae_config(),
-        )?;
+        )?)
+    }
+
+    fn load_pid(&self) -> Result<Option<Arc<PidEngine>>> {
+        self.ensure_load_seal()?;
         // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller
         // opted in via `LoadSpec::pid`; Kolors shares the SDXL VAE latent space (`sdxl` student).
-        let pid = match self.pid_spec.as_ref() {
+        Ok(match self.pid_spec.as_ref() {
             Some(spec) => Some(Arc::new(PidEngine::from_spec(
                 spec,
                 PID_BACKBONE,
                 &self.device,
             )?)),
             None => None,
-        };
-        Ok(Components {
-            tokenizer: Arc::new(tokenizer),
-            chatglm: Arc::new(chatglm),
-            unet,
-            vae: Arc::new(vae),
-            pid,
         })
     }
 
@@ -298,6 +377,14 @@ impl Pipeline {
     /// sharded or single-file).
     fn f32_vb(&self, dir: &Path) -> Result<VarBuilder<'static>> {
         candle_gen::load_sorted_mmap(dir, DType::F32, &self.device, "kolors")
+    }
+
+    fn load_vae_encoder(&self) -> Result<VaeMomentsEncoder> {
+        self.ensure_load_seal()?;
+        Ok(VaeMomentsEncoder::new(
+            self.f32_vb(&self.root.join("vae"))?,
+            VAE_SCALE,
+        )?)
     }
 
     /// Render `req` against pre-loaded `components`, emitting per-step progress and honoring
@@ -308,6 +395,7 @@ impl Pipeline {
         components: &Components,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
+        ensure_not_cancelled(req)?;
         let steps = req
             .steps
             .map(|s| s as usize)
@@ -317,6 +405,11 @@ impl Pipeline {
         let negative = req.negative_prompt.as_deref().unwrap_or("");
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let (h, w) = (req.height, req.width);
+        let img2img = resolve_reference(req)?;
+        let init_latents = match img2img {
+            Some((image, _)) => Some(self.encode_reference(components, image, w, h)?),
+            None => None,
+        };
 
         // sc-7124 (epic 7114 P4): a curated solver name (≠ the native `euler_discrete` default / None)
         // OR a curated scheduler (sc-8984) routes the unified `Sampler` over `DiscreteModelSampling`
@@ -336,15 +429,23 @@ impl Pipeline {
             crate::MODEL_ID,
         )?;
 
-        let sampler = KolorsEulerSampler::new(steps).map_err(CandleError::Msg)?;
+        let sampler = match img2img {
+            Some((_, strength)) => {
+                KolorsEulerSampler::img2img(steps, strength).map_err(CandleError::Msg)?
+            }
+            None => KolorsEulerSampler::new(steps).map_err(CandleError::Msg)?,
+        };
 
         // Conditioning is seed-independent — encode once. CFG batch is [uncond, cond] (candle's chunk
         // order); without guidance only the positive branch is built. The ChatGLM3 encode stays local
         // (it threads `components`); the shared helper owns only the identical CFG-concat convention.
-        let (context, pooled, batch) =
-            common::cfg_batch_context(&req.prompt, negative, use_guide, |p| {
-                self.encode(components, p)
-            })?;
+        let (context, pooled, batch) = common::cfg_batch_context(
+            &req.prompt,
+            negative,
+            use_guide,
+            common::resolve_cfg_batching(req),
+            |p| self.encode(components, p),
+        )?;
         let time_ids = common::build_time_ids(&self.device, batch, h, w)?;
 
         // The Kolors `encoder_hid_proj` (ChatGLM3 4096 → cross-attention 2048) is step-invariant, so
@@ -356,6 +457,9 @@ impl Pipeline {
         let (lat_h, lat_w) = ((h / 8) as usize, (w / 8) as usize);
         let total = sampler.num_steps() as u32;
         candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+            // A cancellation raised during prompt/reference setup must be observed even when this
+            // image's strength selects an empty denoise schedule.
+            ensure_not_cancelled(req)?;
             let noise = common::initial_noise(&self.device, seed, lat_h, lat_w)?;
 
             let latents = if let Some(name) = curated {
@@ -363,6 +467,8 @@ impl Pipeline {
                     req,
                     name,
                     &noise,
+                    init_latents.as_ref(),
+                    img2img.map_or(1.0, |(_, strength)| strength),
                     components,
                     &encoder_hidden_states,
                     &pooled,
@@ -374,12 +480,27 @@ impl Pipeline {
                     on_progress,
                 )?
             } else {
-                let mut latents = (&noise * sampler.init_noise_sigma() as f64)?;
+                let mut latents = match init_latents.as_ref() {
+                    Some(init) => sampler.add_noise(init, &noise)?,
+                    None => (&noise * sampler.init_noise_sigma() as f64)?,
+                };
+                // Per-step latent preview (epic 16948, sc-16954). A bespoke loop, so it numbers its
+                // own frames on the STEP INDEX -- this lane walks a `KolorsEulerSampler` timestep
+                // table, not a descending sigma array. One eval per step, so nothing repeats for the
+                // counter to dedup; it still bounds and dedups on principle.
+                let preview_counter =
+                    candle_gen::preview::PreviewCounter::with_steps(sampler.num_steps());
                 for i in 0..sampler.num_steps() {
                     if req.cancel.is_cancelled() {
                         return Err(CandleError::Canceled);
                     }
                     let scaled = (&latents / sampler.scale_in(i) as f64)?;
+                    // Preview `scaled` -- the very tensor this step feeds the UNet, and therefore the
+                    // domain the reused fit was measured in. Binding the preview to the lane's own
+                    // `scale_in` is what stops the two coming to disagree about the renormalization.
+                    candle_gen::preview::emit_preview_at(&req.preview, &preview_counter, i, || {
+                        crate::preview::project_spatial_latents(&scaled)
+                    });
                     let model_in = if use_guide {
                         Tensor::cat(&[&scaled, &scaled], 0)?
                     } else {
@@ -408,9 +529,160 @@ impl Pipeline {
                 latents
             };
 
+            // Zero-strength img2img executes no denoise iteration on either route, so this explicit
+            // checkpoint is the final guard against decoding a canceled request.
+            ensure_not_cancelled(req)?;
             on_progress(Progress::Decoding);
             common::decode(&components.vae, pid_decoder.as_ref(), &latents)
         })
+    }
+
+    /// Request-authoritative staged execution.  The conditioning tower, denoiser, and decoder are
+    /// materialized in three non-overlapping phases; img2img opens its VAE encoder before
+    /// conditioning.  Every phase synchronizes before it is dropped, including on cancellation or
+    /// an error through [`SynchronizedPhase`]'s drop guard.  This must remain separate from the warm
+    /// [`Components`] cache: a staged request must never inherit resident heavyweight components.
+    pub(crate) fn render_staged(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<Image>> {
+        ensure_not_cancelled(req)?;
+        let steps = req
+            .steps
+            .map(|s| s as usize)
+            .unwrap_or(DEFAULT_STEPS as usize);
+        let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+        let use_guide = guidance > 1.0;
+        let negative = req.negative_prompt.as_deref().unwrap_or("");
+        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let (h, w) = (req.height, req.width);
+        let img2img = resolve_reference(req)?;
+
+        // Edit's latent-init phase precedes ChatGLM and does not retain the VAE encoder once the
+        // deterministic posterior mean has been produced.
+        let init_latents = match img2img {
+            Some((image, _)) => {
+                let encoder = SynchronizedPhase::new(self.load_vae_encoder()?, self.device.clone());
+                let latents = self.encode_reference_with(&encoder, image, w, h)?;
+                encoder.release()?;
+                Some(latents)
+            }
+            None => None,
+        };
+
+        ensure_not_cancelled(req)?;
+        let conditioner = SynchronizedPhase::new(self.load_conditioner()?, self.device.clone());
+        let (context, pooled, batch) = common::cfg_batch_context(
+            &req.prompt,
+            negative,
+            use_guide,
+            common::resolve_cfg_batching(req),
+            |prompt| self.encode_with(&conditioner.0, &conditioner.1, prompt),
+        )?;
+        let time_ids = common::build_time_ids(&self.device, batch, h, w)?;
+        conditioner.release()?;
+
+        ensure_not_cancelled(req)?;
+        let unet = SynchronizedPhase::new(self.load_unet()?, self.device.clone());
+        let encoder_hidden_states = unet.project_context(&context)?;
+        let sampler = match img2img {
+            Some((_, strength)) => {
+                KolorsEulerSampler::img2img(steps, strength).map_err(CandleError::Msg)?
+            }
+            None => KolorsEulerSampler::new(steps).map_err(CandleError::Msg)?,
+        };
+        let curated = curated_route(req.sampler.as_deref(), req.scheduler.as_deref());
+        let (lat_h, lat_w) = ((h / 8) as usize, (w / 8) as usize);
+        let total = sampler.num_steps() as u32;
+        let mut latents = Vec::with_capacity(req.count as usize);
+        for index in 0..req.count {
+            ensure_not_cancelled(req)?;
+            let seed = base_seed.wrapping_add(u64::from(index));
+            let noise = common::initial_noise(&self.device, seed, lat_h, lat_w)?;
+            let rendered = if let Some(name) = curated {
+                self.denoise_curated_with_unet(
+                    req,
+                    name,
+                    &noise,
+                    init_latents.as_ref(),
+                    img2img.map_or(1.0, |(_, strength)| strength),
+                    &unet,
+                    &encoder_hidden_states,
+                    &pooled,
+                    &time_ids,
+                    steps,
+                    use_guide,
+                    guidance,
+                    seed,
+                    on_progress,
+                )?
+            } else {
+                let mut current = match init_latents.as_ref() {
+                    Some(init) => sampler.add_noise(init, &noise)?,
+                    None => (&noise * sampler.init_noise_sigma() as f64)?,
+                };
+                let preview_counter =
+                    candle_gen::preview::PreviewCounter::with_steps(sampler.num_steps());
+                for step in 0..sampler.num_steps() {
+                    ensure_not_cancelled(req)?;
+                    let scaled = (&current / sampler.scale_in(step) as f64)?;
+                    candle_gen::preview::emit_preview_at(
+                        &req.preview,
+                        &preview_counter,
+                        step,
+                        || crate::preview::project_spatial_latents(&scaled),
+                    );
+                    let model_in = if use_guide {
+                        Tensor::cat(&[&scaled, &scaled], 0)?
+                    } else {
+                        scaled
+                    };
+                    let eps = unet.forward_projected(
+                        &model_in,
+                        sampler.timestep(step) as f64,
+                        &encoder_hidden_states,
+                        &pooled,
+                        &time_ids,
+                    )?;
+                    let eps = if use_guide {
+                        let chunks = eps.chunk(2, 0)?;
+                        (&chunks[0] + ((&chunks[1] - &chunks[0])? * guidance as f64)?)?
+                    } else {
+                        eps
+                    };
+                    current = (&current + (eps * sampler.step_dt(step) as f64)?)?;
+                    on_progress(Progress::Step {
+                        current: step as u32 + 1,
+                        total,
+                    });
+                }
+                current
+            };
+            latents.push(rendered);
+        }
+        unet.release()?;
+
+        ensure_not_cancelled(req)?;
+        // The native VAE is deliberately F32 for all physical tiers; PiD is a replacement decoder,
+        // not a co-resident fourth phase.
+        let decoder =
+            SynchronizedPhase::new((self.load_vae()?, self.load_pid()?), self.device.clone());
+        let pid_decoder = candle_gen_pid::resolve_pid_decoder(
+            decoder.1.as_deref(),
+            req,
+            base_seed,
+            crate::MODEL_ID,
+        )?;
+        let mut images = Vec::with_capacity(latents.len());
+        for latent in &latents {
+            ensure_not_cancelled(req)?;
+            on_progress(Progress::Decoding);
+            images.push(common::decode(&decoder.0, pid_decoder.as_ref(), latent)?);
+        }
+        drop(pid_decoder);
+        decoder.release()?;
+        Ok(images)
     }
 
     /// The **curated** ε/DDPM denoise (epic 7114 P4, sc-7124) — an ADDITIVE option alongside the native
@@ -430,8 +702,46 @@ impl Pipeline {
         &self,
         req: &GenerationRequest,
         sampler: &str,
-        init: &Tensor,
+        noise: &Tensor,
+        init_latents: Option<&Tensor>,
+        strength: f32,
         components: &Components,
+        encoder_hidden_states: &Tensor,
+        pooled: &Tensor,
+        time_ids: &Tensor,
+        steps: usize,
+        use_guide: bool,
+        guidance: f32,
+        seed: u64,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Tensor> {
+        self.denoise_curated_with_unet(
+            req,
+            sampler,
+            noise,
+            init_latents,
+            strength,
+            &components.unet,
+            encoder_hidden_states,
+            pooled,
+            time_ids,
+            steps,
+            use_guide,
+            guidance,
+            seed,
+            on_progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_curated_with_unet(
+        &self,
+        req: &GenerationRequest,
+        sampler: &str,
+        noise: &Tensor,
+        init_latents: Option<&Tensor>,
+        strength: f32,
+        unet: &KolorsUnet,
         encoder_hidden_states: &Tensor,
         pooled: &Tensor,
         time_ids: &Tensor,
@@ -443,7 +753,17 @@ impl Pipeline {
     ) -> Result<Tensor> {
         // Shared curated-σ setup (sc-9001): the Kolors DiscreteModelSampling + σ-table + VE-σ prior,
         // identical across the three entry points. `init` is the raw seeded noise (lifted to σ-space).
-        let setup = CuratedSetup::new(req.scheduler.as_deref(), steps, init)?;
+        let setup = match init_latents {
+            Some(init) => {
+                CuratedSetup::new_img2img(req.scheduler.as_deref(), steps, strength, noise, init)?
+            }
+            None => CuratedSetup::new(req.scheduler.as_deref(), steps, noise)?,
+        };
+        // Per-step latent preview (epic 16948, sc-16954). The sc-16949 projector hook, so the loop is
+        // not restructured and the driver owns frame numbering plus the multi-eval dedup. `ve_hook`
+        // because the running latent here is raw k-diffusion VE sigma-space. Built per image: the
+        // driver starts a fresh counter per call.
+        let preview = crate::preview::ve_hook(&req.preview);
         let out = candle_gen::run_curated_sampler(
             Some(sampler),
             &setup.model_sampling,
@@ -452,6 +772,7 @@ impl Pipeline {
             seed,
             &req.cancel,
             on_progress,
+            Some(&preview),
             |x_in, t| -> Result<Tensor> {
                 // `x_in` is already `1/√(σ²+1)`-scaled by `denoise()`; `t` is the nearest training-step
                 // index the UNet embeds. CFG batches/combines exactly like the native leading-Euler path.
@@ -460,7 +781,7 @@ impl Pipeline {
                 } else {
                     x_in.clone()
                 };
-                let eps = components.unet.forward_projected(
+                let eps = unet.forward_projected(
                     &model_in,
                     t as f64,
                     encoder_hidden_states,
@@ -482,14 +803,181 @@ impl Pipeline {
         Ok(out.to_dtype(DType::F32)?)
     }
 
+    /// Deterministically VAE-encode one img2img reference: LANCZOS to the render size, RGB
+    /// `[0,255]` to NCHW `[-1,1]`, then the scaled posterior mean (never a device-RNG sample).
+    fn encode_reference(
+        &self,
+        components: &Components,
+        image: &Image,
+        width: u32,
+        height: u32,
+    ) -> Result<Tensor> {
+        let (in_w, in_h) = (image.width as usize, image.height as usize);
+        let expected =
+            gen_core::imageops::checked_image_buffer_len(in_w, in_h, 3).ok_or_else(|| {
+                CandleError::Msg(format!(
+                    "kolors: invalid reference dimensions {}x{}",
+                    image.width, image.height
+                ))
+            })?;
+        if image.pixels.len() != expected {
+            return Err(CandleError::Msg(format!(
+                "kolors: reference pixel buffer {} != {in_w}x{in_h}x3",
+                image.pixels.len()
+            )));
+        }
+        let (out_w, out_h) = (width as usize, height as usize);
+        let resized = resize_lanczos_u8(&image.pixels, in_h, in_w, out_h, out_w)?;
+        let data: Vec<f32> = resized
+            .into_iter()
+            .map(|pixel| pixel / 127.5 - 1.0)
+            .collect();
+        let input = Tensor::from_vec(data, (out_h, out_w, 3), &self.device)?
+            .permute((2, 0, 1))?
+            .unsqueeze(0)?
+            .contiguous()?
+            .to_dtype(DType::F32)?;
+        let vae_encoder = candle_gen::cached(&components.vae_encoder, || {
+            Ok::<_, CandleError>(Arc::new(VaeMomentsEncoder::new(
+                self.f32_vb(&self.root.join("vae"))?,
+                VAE_SCALE,
+            )?))
+        })?;
+        Ok(vae_encoder.encode_mean(&input)?)
+    }
+
+    fn encode_reference_with(
+        &self,
+        vae_encoder: &VaeMomentsEncoder,
+        image: &Image,
+        width: u32,
+        height: u32,
+    ) -> Result<Tensor> {
+        let (in_w, in_h) = (image.width as usize, image.height as usize);
+        let expected =
+            gen_core::imageops::checked_image_buffer_len(in_w, in_h, 3).ok_or_else(|| {
+                CandleError::Msg(format!(
+                    "kolors: invalid reference dimensions {}x{}",
+                    image.width, image.height
+                ))
+            })?;
+        if image.pixels.len() != expected {
+            return Err(CandleError::Msg(format!(
+                "kolors: reference pixel buffer {} != {in_w}x{in_h}x3",
+                image.pixels.len()
+            )));
+        }
+        let (out_w, out_h) = (width as usize, height as usize);
+        let resized = resize_lanczos_u8(&image.pixels, in_h, in_w, out_h, out_w)?;
+        let data: Vec<f32> = resized
+            .into_iter()
+            .map(|pixel| pixel / 127.5 - 1.0)
+            .collect();
+        let input = Tensor::from_vec(data, (out_h, out_w, 3), &self.device)?
+            .permute((2, 0, 1))?
+            .unsqueeze(0)?
+            .contiguous()?
+            .to_dtype(DType::F32)?;
+        Ok(vae_encoder.encode_mean(&input)?)
+    }
+
     /// Encode one prompt → `(context [1, 256, 4096], pooled [1, 4096])` via the ChatGLM3 encoder. Stays
     /// local (not in [`crate::common`]) because it threads the cached [`Components`]; the shared
     /// [`common::cfg_batch_context`] takes this as a closure so the CFG-concat convention is the only
     /// shared piece — the ChatGLM3 tokenize/encode specifics stay per-site.
     fn encode(&self, components: &Components, prompt: &str) -> Result<(Tensor, Tensor)> {
-        let tokens = components.tokenizer.encode(prompt)?;
-        Ok(components.chatglm.encode_prompt(&tokens)?)
+        self.encode_with(&components.tokenizer, &components.chatglm, prompt)
     }
+
+    fn encode_with(
+        &self,
+        tokenizer: &KolorsTokenizer,
+        chatglm: &ChatGlmModel,
+        prompt: &str,
+    ) -> Result<(Tensor, Tensor)> {
+        let tokens = tokenizer.encode(prompt)?;
+        Ok(chatglm.encode_prompt(&tokens)?)
+    }
+}
+
+/// Own one staged component group and synchronize its device work before release.  Explicit
+/// `release` catches synchronization failures; `Drop` supplies the same cleanup for cancellation,
+/// error, and unwind paths where there is no result channel.
+pub(crate) struct SynchronizedPhase<T> {
+    value: Option<T>,
+    device: Device,
+}
+
+impl<T> SynchronizedPhase<T> {
+    pub(crate) fn new(value: T, device: Device) -> Self {
+        Self {
+            value: Some(value),
+            device,
+        }
+    }
+    pub(crate) fn release(mut self) -> Result<()> {
+        self.device.synchronize()?;
+        drop(self.value.take());
+        Ok(())
+    }
+}
+
+impl<T> std::ops::Deref for SynchronizedPhase<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        self.value.as_ref().expect("staged phase released")
+    }
+}
+
+impl<T> std::ops::DerefMut for SynchronizedPhase<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.value.as_mut().expect("staged phase released")
+    }
+}
+
+impl<T> Drop for SynchronizedPhase<T> {
+    fn drop(&mut self) {
+        if self.value.is_some() {
+            let _ = self.device.synchronize();
+            drop(self.value.take());
+        }
+    }
+}
+
+/// Cancellation gate used before setup, at each count iteration, and immediately before decode.
+/// The latter two are required for img2img strength `0`, whose native and curated schedules contain
+/// no model evaluations and therefore cannot rely on a denoise-loop poll.
+#[inline]
+fn ensure_not_cancelled(req: &GenerationRequest) -> Result<()> {
+    if req.cancel.is_cancelled() {
+        Err(CandleError::Canceled)
+    } else {
+        Ok(())
+    }
+}
+
+/// Resolve Kolors' one latent-init reference. Per-reference strength wins over the request-level
+/// value, then the diffusers default (0.3); more than one reference is unsupported and fails closed.
+fn resolve_reference(req: &GenerationRequest) -> Result<Option<(&Image, f32)>> {
+    const DEFAULT_IMG2IMG_STRENGTH: f32 = 0.3;
+    let mut reference = None;
+    for conditioning in &req.conditioning {
+        if let Conditioning::Reference { image, strength } = conditioning {
+            if reference.is_some() {
+                return Err(CandleError::Msg(
+                    "kolors: multiple reference images are not supported".into(),
+                ));
+            }
+            reference = Some((
+                image,
+                strength
+                    .or(req.strength)
+                    .unwrap_or(DEFAULT_IMG2IMG_STRENGTH)
+                    .clamp(0.0, 1.0),
+            ));
+        }
+    }
+    Ok(reference)
 }
 
 /// Parse the packed `group_size` out of a component `config.json` (sc-10819): `Some(group_size)` when
@@ -497,7 +985,11 @@ impl Pipeline {
 /// missing config is treated as dense; the downstream loader gives the precise "missing X" error). Used
 /// for the ChatGLM3 `text_encoder/` group thread (the per-Linear `.scales` detection is
 /// [`QLinear::linear_detect_gs`]'s job, so this only recovers the grid, never gates the packed path).
-fn detect_packed_group(cfg_path: &Path) -> Result<Option<usize>> {
+/// Read the physical MLX packing grid from a component config.  The conditioned
+/// IP/Control providers use this too: their base snapshot is the same canonical
+/// q4/q8 artifact as the registered route, so treating those paths as dense
+/// would either decode u32 codes as weights or silently cross a tier.
+pub(crate) fn detect_packed_group(cfg_path: &Path) -> Result<Option<usize>> {
     if !cfg_path.is_file() {
         return Ok(None);
     }
@@ -554,6 +1046,15 @@ pub(crate) fn sdxl_vae_config() -> AutoEncoderKLConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn kolors_schedule_constants_match_the_canonical_candle_grid() {
+        let shared = kolors_alpha_schedule().unwrap();
+        let direct =
+            AlphaSchedule::scaled_linear(KOLORS_TRAIN_STEPS, KOLORS_BETA_START, KOLORS_BETA_END);
+        assert_eq!(shared.alphas_cumprod, direct.alphas_cumprod);
+    }
 
     /// sc-8984: a scheduler-only curated request (default / absent sampler) MUST route the curated
     /// path — it was previously dropped on the floor by txt2img, silently rendering the native
@@ -591,13 +1092,173 @@ mod tests {
         assert_eq!(curated_route(None, Some("not_a_scheduler")), None);
     }
 
+    #[test]
+    fn reference_strength_precedence_default_and_bounds_match_mlx() {
+        let request = GenerationRequest {
+            strength: Some(0.7),
+            conditioning: vec![Conditioning::Reference {
+                image: Image::default(),
+                strength: Some(0.4),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(resolve_reference(&request).unwrap().unwrap().1, 0.4);
+
+        let request_level = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: Image::default(),
+                strength: None,
+            }],
+            ..request.clone()
+        };
+        assert_eq!(resolve_reference(&request_level).unwrap().unwrap().1, 0.7);
+
+        let defaulted = GenerationRequest {
+            strength: None,
+            ..request_level.clone()
+        };
+        assert_eq!(resolve_reference(&defaulted).unwrap().unwrap().1, 0.3);
+
+        let clamped = GenerationRequest {
+            strength: Some(2.0),
+            ..request_level.clone()
+        };
+        assert_eq!(resolve_reference(&clamped).unwrap().unwrap().1, 1.0);
+
+        let multiple = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: Image::default(),
+                    strength: None,
+                },
+                Conditioning::Reference {
+                    image: Image::default(),
+                    strength: None,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(resolve_reference(&multiple).is_err());
+    }
+
+    fn zero_strength_reference(sampler: Option<&str>) -> GenerationRequest {
+        GenerationRequest {
+            prompt: "edit the reference".into(),
+            width: 512,
+            height: 512,
+            steps: Some(10),
+            sampler: sampler.map(str::to_owned),
+            conditioning: vec![Conditioning::Reference {
+                image: Image::default(),
+                strength: Some(0.0),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn assert_zero_strength_cancellation(request: &GenerationRequest, curated: bool) {
+        let (_, strength) = resolve_reference(request).unwrap().unwrap();
+        assert_eq!(strength, 0.0);
+        let native_schedule =
+            KolorsEulerSampler::img2img(request.steps.unwrap() as usize, strength).unwrap();
+        assert_eq!(native_schedule.num_steps(), 0, "the denoise loop is empty");
+        assert_eq!(
+            curated_route(request.sampler.as_deref(), request.scheduler.as_deref()).is_some(),
+            curated
+        );
+
+        // Production's first checkpoint handles a pre-canceled request.
+        let mut pre_cancelled = request.clone();
+        pre_cancelled.cancel = gen_core::CancelFlag::new();
+        pre_cancelled.cancel.cancel();
+        assert!(matches!(
+            ensure_not_cancelled(&pre_cancelled),
+            Err(CandleError::Canceled)
+        ));
+
+        // Recreate the second case with a fresh active request, then cancel after setup: the
+        // per-image and pre-decode calls use this same gate and must not depend on a denoise
+        // iteration existing.
+        ensure_not_cancelled(request).expect("request begins active");
+        request.cancel.cancel();
+        assert!(matches!(
+            ensure_not_cancelled(request),
+            Err(CandleError::Canceled)
+        ));
+    }
+
+    #[test]
+    fn native_zero_strength_img2img_observes_cancellation_without_a_step() {
+        let request = zero_strength_reference(None);
+        assert_zero_strength_cancellation(&request, false);
+    }
+
+    #[test]
+    fn curated_zero_strength_img2img_observes_cancellation_without_a_step() {
+        let request = zero_strength_reference(Some("dpmpp_2m"));
+        assert_zero_strength_cancellation(&request, true);
+    }
+
+    #[test]
+    fn t2i_component_load_leaves_the_img2img_encoder_cache_empty() {
+        // Lock the production construction boundary: the ordinary component load creates only the
+        // decoder-bearing AutoEncoderKL and an empty shared slot. VaeMomentsEncoder construction is
+        // confined to encode_reference's read-through miss, reached only by reference requests.
+        let source = include_str!("pipeline.rs");
+        let loader_start = source.find("pub(crate) fn load_components").unwrap();
+        let loader_end = source[loader_start..].find("    fn f32_vb").unwrap() + loader_start;
+        let loader = &source[loader_start..loader_end];
+        assert!(loader.contains("vae_encoder: Arc::new(Mutex::new(None))"));
+        assert!(!loader.contains("VaeMomentsEncoder::new"));
+
+        let encode_start = source.find("    fn encode_reference").unwrap();
+        let encode_end = source[encode_start..].find("    fn encode(").unwrap() + encode_start;
+        let encode = &source[encode_start..encode_end];
+        assert!(encode.contains("candle_gen::cached(&components.vae_encoder"));
+        assert!(encode.contains("VaeMomentsEncoder::new"));
+    }
+
+    #[test]
+    fn synchronized_phase_releases_on_success_error_and_panic() {
+        struct Probe(std::sync::Arc<AtomicUsize>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let device = Device::Cpu;
+        let drops = std::sync::Arc::new(AtomicUsize::new(0));
+        SynchronizedPhase::new(Probe(drops.clone()), device.clone())
+            .release()
+            .unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        let error_path = || -> Result<()> {
+            let _phase = SynchronizedPhase::new(Probe(drops.clone()), device.clone());
+            Err(CandleError::Msg("injected phase error".into()))
+        };
+        assert!(error_path().is_err());
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+
+        let unwind = std::panic::catch_unwind({
+            let drops = drops.clone();
+            move || {
+                let _phase = SynchronizedPhase::new(Probe(drops), Device::Cpu);
+                panic!("injected phase panic");
+            }
+        });
+        assert!(unwind.is_err());
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
+    }
+
     /// sc-10819: `detect_packed_unet` returns `Some((file, group))` when `unet/config.json` carries a
     /// `quantization` block AND the packed weight file exists (a `SceneWorks/kolors-mlx` tier), `None`
     /// for a dense snapshot (no block), and errors on a non-64 group (the vendored SDXL UNet threads
     /// only 64). `detect_packed_group` returns the text-encoder group for the ChatGLM3 thread. GPU-free.
     #[test]
     fn detect_packed_unet_reads_quantization_block() {
-        let tmp = std::env::temp_dir().join(format!("sc10819_detect_{}", std::process::id()));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         let unet_dir = tmp.join("unet");
         std::fs::create_dir_all(&unet_dir).unwrap();
         std::fs::write(
@@ -638,16 +1299,14 @@ mod tests {
         )
         .unwrap();
         assert!(detect_packed_unet(&tmp).is_err());
-
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// `detect_packed_group` recovers the packed group for the ChatGLM3 `text_encoder/` thread, and is
     /// `None` for a dense config or an absent file (the dense fallback the loader defaults to 64).
     #[test]
     fn detect_packed_group_reads_text_encoder_config() {
-        let tmp = std::env::temp_dir().join(format!("sc10819_group_{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         let cfg = tmp.join("config.json");
         // Absent file ⇒ dense.
         assert_eq!(detect_packed_group(&cfg).unwrap(), None);
@@ -655,7 +1314,6 @@ mod tests {
         assert_eq!(detect_packed_group(&cfg).unwrap(), Some(64));
         std::fs::write(&cfg, br#"{"hidden_size": 4096}"#).unwrap();
         assert_eq!(detect_packed_group(&cfg).unwrap(), None);
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

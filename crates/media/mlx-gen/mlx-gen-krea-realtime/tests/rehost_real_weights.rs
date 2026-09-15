@@ -15,16 +15,16 @@
 //! ```text
 //! # 1. Inventory gate — settles the two S2 gated notes. Shapes only (MLX loads are lazy), so this
 //! #    reads the safetensors header and never materializes the 28.58 GB of weights.
-//! cargo test -p mlx-gen-krea-realtime --test rehost_real_weights -- --ignored --nocapture \
+//! cargo test -p mlx-gen-krea-realtime --test integration rehost_real_weights:: -- --ignored --nocapture \
 //!   real_checkpoint_matches_the_audited_inventory
 //!
 //! # 2. Emit ONE tier, then load it back. `KREA_REHOST_TIER` = bf16 | q8 | q4 (default q4).
-//! KREA_REHOST_TIER=q4 cargo test -p mlx-gen-krea-realtime --test rehost_real_weights \
-//!   -- --ignored --nocapture emit_tier_and_load_it_back
+//! KREA_REHOST_TIER=q4 cargo test -p mlx-gen-krea-realtime --test integration \
+//!   -- --ignored --nocapture rehost_real_weights::emit_tier_and_load_it_back
 //!
 //! # 2b. …or as a sharded `transformer/` dir (how the dense bf16 tier ships).
-//! KREA_REHOST_TIER=bf16 cargo test -p mlx-gen-krea-realtime --test rehost_real_weights \
-//!   -- --ignored --nocapture emit_tier_sharded_and_validate_every_shard
+//! KREA_REHOST_TIER=bf16 cargo test -p mlx-gen-krea-realtime --test integration \
+//!   -- --ignored --nocapture rehost_real_weights::emit_tier_sharded_and_validate_every_shard
 //! ```
 //!
 //! Publishing the validated snapshot (operator step, outside the test binary).
@@ -325,10 +325,24 @@ fn emit_tier_sharded_and_validate_every_shard() {
         })
         .unwrap_or_else(|e| panic!("sharded emit of the {label} tier: {e}"));
 
-    assert!(
-        checked > 0,
-        "{label}: no shard tensor was comparable against the source — the per-shard check is inert"
-    );
+    // On a **dense** tier every tensor is comparable, so the per-shard check must have covered the
+    // whole audited inventory — not merely "something". That is what makes the delete-as-you-go flow
+    // self-verifying end to end: with the shards gone, this count is the only remaining evidence that
+    // all 1095 tensors were written and read back correctly. (A packed tier legitimately skips the
+    // affine-triple companions and caps its comparisons, so it keeps the weaker non-inert floor.)
+    if quant.is_none() {
+        assert_eq!(
+            checked, AUDIT_TENSOR_COUNT,
+            "{label}: the per-shard check covered {checked} tensor(s), not the full audited \
+             inventory of {AUDIT_TENSOR_COUNT} — a shard went unverified"
+        );
+    } else {
+        assert!(
+            checked > 0,
+            "{label}: no shard tensor was comparable against the source — the per-shard check is \
+             inert"
+        );
+    }
     println!(
         "tier {label}: {} shard(s) emitted in {:.1?}, {checked} tensor(s) spot-checked -> {}",
         shards.len(),

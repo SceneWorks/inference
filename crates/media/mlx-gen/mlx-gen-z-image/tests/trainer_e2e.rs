@@ -3,7 +3,7 @@
 //!
 //! `#[ignore]`d — needs the real `Tongyi-MAI/Z-Image-Turbo` weights in the HF cache (or
 //! `ZIMAGE_SNAPSHOT`). Run:
-//!   cargo test -p mlx-gen-z-image --release --test trainer_e2e -- --ignored --nocapture
+//!   cargo test -p mlx-gen-z-image --release --test integration trainer_e2e:: -- --ignored --nocapture
 //!
 //! Proves the full prepare→load→cache→train→save lifecycle: a tiny captioned PNG dataset is
 //! VAE/text-encoded and cached, AdamW training drives the flow-match loss down, and a PEFT adapter
@@ -18,7 +18,7 @@ use mlx_gen::{
     TrainingProgress, TrainingRequest, WeightsSource,
 };
 
-mod common;
+use crate::common;
 use common::snapshot;
 
 /// Two solid-colour swatch PNGs + captions in `dir`.
@@ -37,6 +37,7 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
             image_path: path,
             caption: format!("a solid colour swatch number {i}"),
             control_image_path: None,
+            model_options: Default::default(),
         });
     }
     items
@@ -46,7 +47,8 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
 #[ignore = "needs real Z-Image weights"]
 fn z_image_trainer_trains_and_writes_adapter() {
     // Tiny synthetic dataset: two solid-colour swatches + captions, written as PNGs.
-    let tmp = std::env::temp_dir().join("z_image_trainer_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
 
     assert_eq!(mlx_gen_z_image::MODEL_ID, "z_image_turbo");
@@ -185,7 +187,8 @@ fn z_image_trainer_trains_and_writes_adapter() {
 #[test]
 #[ignore = "needs real Z-Image weights"]
 fn z_image_trainer_lokr_trains_and_reloads() {
-    let tmp = std::env::temp_dir().join("z_image_trainer_lokr_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
     assert_eq!(mlx_gen_z_image::MODEL_ID, "z_image_turbo");
 
@@ -311,11 +314,12 @@ fn z_image_trainer_lokr_trains_and_reloads() {
 /// render path (install in-progress adapter → txt2img denoise → VAE decode → `Image`) works on real
 /// weights — the part the worker persists as a project asset. Tiny resolution (64) keeps the
 /// per-cadence inference cheap. Run:
-///   cargo test -p mlx-gen-z-image --release --test trainer_e2e -- --ignored --nocapture z_image_trainer_emits_preview_samples
+///   cargo test -p mlx-gen-z-image --release --test integration -- --ignored --nocapture trainer_e2e::z_image_trainer_emits_preview_samples
 #[test]
 #[ignore = "needs real Z-Image weights"]
 fn z_image_trainer_emits_preview_samples() {
-    let tmp = std::env::temp_dir().join("z_image_trainer_samples_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
     assert_eq!(mlx_gen_z_image::MODEL_ID, "z_image_turbo");
 

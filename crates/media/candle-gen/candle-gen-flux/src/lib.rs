@@ -26,6 +26,15 @@
 
 mod pipeline;
 
+#[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
+pub mod memory_strategy;
+
+// Per-step latent previews (epic 16948, sc-16956) — the 16-channel FLUX.1 fit reused verbatim from
+// epic 16624's `mlx-gen-flux`, plus the packed-token → native-latent recovery every route projects
+// through. `candle-gen-chroma` and `candle-gen-pulid` share this latent space and reach it here rather
+// than restating the constants; see the module docs for the tensor-byte provenance.
+pub mod preview;
+
 // Vendored, i32-overflow-safe FLUX.1 VAEs (sc-11154 / F-081): faithful copies of the BFL/native
 // `flux::autoencoder` and the diffusers `z_image::vae` with the mid-block spatial self-attention routed
 // through the shared budgeted helper (the stock upstream overflows i32 on CUDA at a 2048² decode).
@@ -97,7 +106,7 @@ pub use pipeline::{flow_mu, BASE_SHIFT, MAX_SHIFT};
 // q4/q8/bf16 turnkey tiers the base generator does, driving the post-block `DitImageInjector` seam on
 // either the BFL `IpFlux` or the diffusers `PackedFluxDit`.
 mod ref_backbone;
-pub use ref_backbone::FluxRefBackbone;
+pub use ref_backbone::{FluxRefBackbone, FluxRefHeavy};
 
 /// FLUX XLabs IP-Adapter real-weight GPU validation (sc-5872) — env-driven, `#[ignore]`d integration
 /// test (the analog of the SDXL/Kolors IP-Adapter Phase-5 harnesses).
@@ -105,20 +114,21 @@ pub use ref_backbone::FluxRefBackbone;
 mod ip_validate;
 
 use candle_gen::candle_core::DType;
-#[cfg(all(test, feature = "cuda"))]
-use candle_gen::gen_core::OffloadPolicy;
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
     ModelDescriptor, Progress, WeightsSource,
 };
 
 use pipeline::{Pipeline, SeqHeavy, SeqTextEncoders};
+use std::sync::{Arc, Mutex};
 
 /// Registry id for FLUX.1 `schnell` — matches the SceneWorks worker's engine id and the macOS
 /// `mlx-gen-flux` descriptor.
 pub const FLUX1_SCHNELL_ID: &str = "flux1_schnell";
 /// Registry id for FLUX.1 `dev`.
 pub const FLUX1_DEV_ID: &str = "flux1_dev";
+/// Content identity for the CUDA resident/staged real-weight calibration harness.
+pub const RESIDENCY_CALIBRATION_FINGERPRINT: &str = "flux1-cuda-residency-v1";
 
 /// FLUX works in the VAE's /8 latent and the DiT packs that 2×2, so both image dims must be multiples
 /// of **16** for a clean pack. Enforced in [`validate`](Generator::validate). Exposed as the
@@ -143,6 +153,17 @@ impl Variant {
             Variant::Schnell => FLUX1_SCHNELL_ID,
             Variant::Dev => FLUX1_DEV_ID,
         }
+    }
+
+    /// The variant a registry / engine id names — the exact inverse of [`Self::model_id`].
+    ///
+    /// `None` for any other id rather than a defaulted variant: a caller holding an unknown id has
+    /// not selected a FLUX variant at all, and silently answering `Dev` is how a schnell route ends
+    /// up described by dev's geometry.
+    pub fn from_model_id(model_id: &str) -> Option<Self> {
+        [Variant::Schnell, Variant::Dev]
+            .into_iter()
+            .find(|variant| variant.model_id() == model_id)
     }
 
     /// Distilled default step count (mlx parity): schnell 4, dev 25.
@@ -194,11 +215,56 @@ pub struct FluxGenerator {
     descriptor: ModelDescriptor,
     pipe: Pipeline,
     residency: candle_gen::Residency<SeqTextEncoders, SeqHeavy>,
+    lifecycle: Mutex<()>,
+    stream_cancel: Arc<Mutex<gen_core::CancelFlag>>,
+    bounded_host_decode: Arc<Mutex<bool>>,
+    loaded_quant: Option<gen_core::Quant>,
+    memory_strategy: Option<gen_core::MemoryProviderContract>,
 }
 
 impl Generator for FluxGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let Some(contract) = self.memory_strategy.as_ref() else {
+            return gen_core::MemorySafetyDecision::Accept;
+        };
+        memory_strategy::admission_safety_check(
+            self.variant.model_id(),
+            contract,
+            context,
+            self.loaded_quant,
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let Some(contract) = self.memory_strategy.as_ref() else {
+            return Ok(None);
+        };
+        memory_strategy::validate_context(
+            self.variant.model_id(),
+            contract,
+            context,
+            self.loaded_quant,
+        )?;
+        Ok(Some(Box::new(memory_strategy::FluxMemoryScope::new(
+            self.variant.model_id(),
+            self.pipe.device().clone(),
+            contract,
+            context,
+        ))))
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -234,16 +300,53 @@ impl Generator for FluxGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let images = self.residency.run(
+        let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
+        let stage_residency = req
+            .memory
+            .as_ref()
+            .is_some_and(|memory| memory.stage_residency);
+        let stream_transformer_blocks = req
+            .memory
+            .as_ref()
+            .is_some_and(|memory| memory.stream_transformer_blocks);
+        if req.memory.as_ref().is_some_and(|memory| {
+            memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks
+        }) && !stage_residency
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: bounded decode, attention, and transformer residency require request-scoped staged residency",
+                self.variant.model_id()
+            )));
+        }
+        if req.use_pid
+            && req.memory.is_some_and(|memory| {
+                memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks
+            })
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: optimized native-VAE memory strategies do not support PiD decode",
+                self.variant.model_id()
+            )));
+        }
+        *candle_gen::lock_recover(&self.stream_cancel) = req.cancel.clone();
+        *candle_gen::lock_recover(&self.bounded_host_decode) =
+            req.memory.is_some_and(|memory| memory.tile_vae_decode);
+        let result = self.residency.run_request_scoped(
+            stage_residency,
+            stream_transformer_blocks,
             &req.cancel,
-            self.pipe.device(),
             req.use_pid,
             on_progress,
             |text| self.pipe.encode_residency(text, &req.prompt),
+            |_| Ok(self.pipe.device().synchronize()?),
             |heavy, encoded, on_progress| {
-                self.pipe.render_residency(req, heavy, encoded, on_progress)
+                let result = self.pipe.render_residency(req, heavy, encoded, on_progress);
+                candle_gen::synchronize_result(self.pipe.device(), result)
             },
-        )?;
+        );
+        *candle_gen::lock_recover(&self.bounded_host_decode) = false;
+        *candle_gen::lock_recover(&self.stream_cancel) = gen_core::CancelFlag::default();
+        let images = result?;
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -254,6 +357,9 @@ impl Generator for FluxGenerator {
 /// `"candle"` and `mac_only` is `false` (the two backend-correct deviations from `mlx-gen-flux`).
 fn descriptor_for(variant: Variant) -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE),
+        control_kinds: None,
         required_components: &[],
         id: variant.model_id(),
         family: "flux",
@@ -264,42 +370,31 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // which this txt2img slice does not wire — so neither is advertised on either variant.
             supports_negative_prompt: false,
             supports_guidance: variant.supports_guidance(),
-            supports_true_cfg: false,
             // txt2img only in sc-3694 — Reference/IP-adapter lands later; an empty list means the
             // shared `validate_request` rejects any conditioning and the worker keeps those shapes on
             // the Python path.
             conditioning: vec![],
-            // LoRA/LoKr (mlx supports both) and Q4/Q8 quantization are deferred to a later slice; not
-            // advertised, and rejected at load rather than silently dropped.
-            supports_lora: false,
-            supports_lokr: false,
+            // LoRA/LoKr apply as residuals over dense or packed FLUX projections. Q4/Q8 tiers remain
+            // prepacked snapshot choices rather than on-the-fly quantization.
+            supports_lora: true,
+            supports_lokr: true,
             // Unified curated sampler/scheduler menu (epic 7114 P4, sc-7123): the denoise routes
             // through the shared driver, so the per-generation `sampler`/`scheduler` knob can select any
             // curated integrator/schedule. The DEFAULT (None/None) reproduces the native flow-match
             // Euler path (N1). FLUX had no legacy sampler/scheduler aliases, so no `menu_with_aliases`.
             samplers: candle_gen::curated_sampler_names(),
             schedulers: candle_gen::curated_scheduler_names(),
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,
-            // candle is the Windows/CUDA backend — NOT Mac-only (the MLX provider sets this true).
-            mac_only: false,
-            supported_quants: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             supports_sequential_offload: true,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            // Per-step latent previews (epic 16948, sc-16956): the registered txt2img route hands
+            // `crate::preview::hook` to the shared flow driver, projecting the unpacked 16-channel
+            // latent through the reused epic-16624 fit. Both variants share one render lane, so both
+            // advertise. `candle-gen-catalog`'s `preview_advertising` guard derives this from the
+            // sources and fails if the flag and the wiring ever disagree.
+            supports_preview: true,
+            ..Default::default()
         },
     }
 }
@@ -331,11 +426,6 @@ fn load_variant(variant: Variant, spec: &LoadSpec) -> gen_core::Result<Box<dyn G
             )));
         }
     };
-    if !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "candle {id} does not support LoRA/LoKr yet — refusing to silently drop the adapters"
-        )));
-    }
     if spec.quantize.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {id} does not support on-the-fly Q4/Q8 quantization yet"
@@ -349,27 +439,53 @@ fn load_variant(variant: Variant, spec: &LoadSpec) -> gen_core::Result<Box<dyn G
     // FLUX is a bf16 model; load at bf16 regardless of the CPU-default dtype. The device is the
     // backend selected at compile time (CUDA on Windows, Metal/CPU on Mac).
     let device = candle_gen::default_device()?;
-    let pipe = Pipeline::load(variant, &root, &device, DType::BF16, spec.pid.clone());
-    let policy = candle_gen::effective_offload_policy(spec.offload_policy);
+    let pipe = Pipeline::load(
+        variant,
+        &root,
+        &device,
+        DType::BF16,
+        spec.pid.clone(),
+        spec.adapters.clone(),
+    );
+    let loaded_quant = memory_strategy::snapshot_quant_tier(spec, id)?;
+    #[cfg(any(feature = "cuda", test))]
+    let memory_strategy = Some(memory_strategy::provider_contract(id, spec)?);
+    #[cfg(not(any(feature = "cuda", test)))]
+    let memory_strategy = None;
     let resident_pipe = pipe.clone();
     let text_pipe = pipe.clone();
     let heavy_pipe = pipe.clone();
-    let residency = candle_gen::Residency::from_policy_with_resident(
-        policy,
-        move || {
+    let stream_cancel = Arc::new(Mutex::new(gen_core::CancelFlag::default()));
+    let heavy_cancel = stream_cancel.clone();
+    let bounded_host_decode = Arc::new(Mutex::new(false));
+    let heavy_bounded_host_decode = bounded_host_decode.clone();
+    let residency = candle_gen::Residency::request_scoped_with_resident(
+        move |_| {
             Ok((
                 resident_pipe.load_text_residency()?,
                 resident_pipe.load_heavy_residency(true)?,
             ))
         },
-        move || text_pipe.load_text_residency(),
-        move |use_pid| heavy_pipe.load_heavy_residency(use_pid),
-    )?;
+        move |_| text_pipe.load_text_residency(),
+        move |use_pid, stream_transformer_blocks| {
+            heavy_pipe.load_heavy_residency_with_memory(
+                use_pid,
+                stream_transformer_blocks,
+                *candle_gen::lock_recover(&heavy_bounded_host_decode),
+                &candle_gen::lock_recover(&heavy_cancel),
+            )
+        },
+    );
     Ok(Box::new(FluxGenerator {
         variant,
         descriptor: descriptor_for(variant),
         pipe,
         residency,
+        lifecycle: Mutex::new(()),
+        stream_cancel,
+        bounded_host_decode,
+        loaded_quant,
+        memory_strategy,
     }))
 }
 
@@ -397,10 +513,78 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_generator(SCHNELL_REGISTRATION)
-        .register_generator(DEV_REGISTRATION)
+        .register_generator(DEV_REGISTRATION);
+    #[cfg(feature = "cuda")]
+    let registry = register_memory_contract_surfaces(registry)
+        .register_memory_behavior(SCHNELL_MEMORY_BEHAVIOR)
+        .register_memory_behavior(DEV_MEMORY_BEHAVIOR);
+    registry
 }
+
+/// Register only weights-free memory-contract surfaces; safe on every build platform.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(SCHNELL_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: FLUX1_SCHNELL_ID,
+            contract: registered_schnell_memory_contract,
+        })
+        .register_memory_strategy(DEV_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: FLUX1_DEV_ID,
+            contract: registered_dev_memory_contract,
+        })
+}
+
+fn registered_schnell_memory_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::provider_contract(FLUX1_SCHNELL_ID, spec)
+}
+
+fn registered_dev_memory_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::provider_contract(FLUX1_DEV_ID, spec)
+}
+
+const SCHNELL_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: FLUX1_SCHNELL_ID,
+    contract: registered_schnell_memory_contract,
+    safety_check: memory_strategy::registered_safety_check,
+};
+
+const DEV_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: FLUX1_DEV_ID,
+    contract: registered_dev_memory_contract,
+    safety_check: memory_strategy::registered_safety_check,
+};
+
+#[cfg(feature = "cuda")]
+const SCHNELL_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: FLUX1_SCHNELL_ID,
+        valid_fixtures: memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            memory_strategy::registered_begin_request(FLUX1_SCHNELL_ID, spec, contract, context)
+        },
+    };
+
+#[cfg(feature = "cuda")]
+const DEV_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: FLUX1_DEV_ID,
+        valid_fixtures: memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            memory_strategy::registered_begin_request(FLUX1_DEV_ID, spec, contract, context)
+        },
+    };
 
 /// Build the complete explicit Candle FLUX.1 provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
@@ -425,6 +609,18 @@ mod explicit_registry_tests {
 mod tests {
     use super::*;
     use candle_gen::gen_core::{Conditioning, ConditioningKind, Image, LoadSpec, WeightsSource};
+
+    /// `from_model_id` is the exact inverse of `model_id`, and answers nothing for an id it does
+    /// not own. The memory contract selects its trunk geometry through it (sc-22661), so a version
+    /// that defaulted to `Dev` would publish dev's geometry for schnell.
+    #[test]
+    fn a_model_id_resolves_to_its_own_variant_and_no_other() {
+        for variant in [Variant::Schnell, Variant::Dev] {
+            assert_eq!(Variant::from_model_id(variant.model_id()), Some(variant));
+        }
+        assert_eq!(Variant::from_model_id("flux2_dev"), None);
+        assert_eq!(Variant::from_model_id(""), None);
+    }
 
     /// Both variants resolve as candle generators through the family registry. `load` is lazy, so a nonexistent
     /// weights dir still resolves (no file I/O until `generate`).
@@ -463,8 +659,8 @@ mod tests {
             assert!(!d.capabilities.supports_true_cfg);
             assert!(!d.capabilities.mac_only);
             assert!(d.capabilities.conditioning.is_empty());
-            assert!(!d.capabilities.supports_lora);
-            assert!(!d.capabilities.supports_lokr);
+            assert!(d.capabilities.supports_lora);
+            assert!(d.capabilities.supports_lokr);
             assert!(d.capabilities.supported_quants.is_empty());
             assert_eq!(d.capabilities.min_size, 256);
             assert_eq!(d.capabilities.max_size, 2048);
@@ -576,9 +772,7 @@ mod tests {
             .is_ok());
     }
 
-    /// LoRA adapters / quantization / control overlays are rejected at load as typed `Unsupported`
-    /// (both variants), so the worker can fall back to Python rather than the backend silently
-    /// dropping them.
+    /// Adapters are accepted; unsupported quant/control overlays remain typed rejections.
     #[test]
     fn load_rejects_unwired_surfaces() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec, Quant};
@@ -586,10 +780,7 @@ mod tests {
             let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
                 AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
             ]);
-            assert!(matches!(
-                load(&lora).err().expect("err"),
-                gen_core::Error::Unsupported(_)
-            ));
+            assert!(load(&lora).is_ok());
 
             let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
             assert!(matches!(
@@ -616,7 +807,7 @@ mod tests {
     }
 
     /// Shared real-weight sequential-residency A/B body for FLUX.1 dev and schnell (sc-12138). Runs ONE
-    /// probed generation whose mode is the `CANDLE_GEN_OFFLOAD` env the generator reads, writes raw RGB
+    /// probed generation whose mode is carried by `GenerationMemory::stage_residency`, writes raw RGB
     /// pixels to `FLUX_OUT`, and prints the device peak. Run it TWICE in SEPARATE processes (resident vs
     /// sequential): pixels must be byte-identical and the sequential peak materially lower because the
     /// ~9 GB T5-XXL drops before the DiT loads. Separate processes are required because candle's cudarc
@@ -632,14 +823,60 @@ mod tests {
             panic!("set {dir_env} to a real-file (hardlink-staged) {label} snapshot")
         });
         let out = std::env::var("FLUX_OUT").expect("set FLUX_OUT to the pixel-dump path");
-        // Two ways to select sequential residency, both exercised by the A/B runner:
-        //   - env `CANDLE_GEN_OFFLOAD=sequential` (the override, sc-10769), OR
-        //   - `FLUX_OFFLOAD_MODE=spec-sequential` → drive it through `LoadSpec::offload_policy`
-        //     (the worker-facing contract, sc-10821), with CANDLE_GEN_OFFLOAD UNSET.
+        let rung = std::env::var("FLUX_MEMORY_RUNG").unwrap_or_else(|_| "resident".into());
+        let (strategy, memory) = match rung.as_str() {
+            "resident" => (gen_core::MemoryStrategy::Resident, Default::default()),
+            "staged" => (
+                gen_core::MemoryStrategy::StagedResidency,
+                gen_core::GenerationMemory {
+                    stage_residency: true,
+                    ..Default::default()
+                },
+            ),
+            "bounded-decode" => (
+                gen_core::MemoryStrategy::BoundedDecode,
+                gen_core::GenerationMemory {
+                    stage_residency: true,
+                    tile_vae_decode: true,
+                    decode_tile_edge: Some(memory_strategy::DECODE_TILE_EDGE),
+                    decode_overlap: Some(memory_strategy::DECODE_OVERLAP),
+                    ..Default::default()
+                },
+            ),
+            "bounded-attention" => (
+                gen_core::MemoryStrategy::BoundedAttention,
+                gen_core::GenerationMemory {
+                    stage_residency: true,
+                    tile_vae_decode: true,
+                    chunk_attention: true,
+                    decode_tile_edge: Some(memory_strategy::DECODE_TILE_EDGE),
+                    decode_overlap: Some(memory_strategy::DECODE_OVERLAP),
+                    attention_chunk_size: Some(memory_strategy::ATTENTION_CHUNK_SIZE),
+                    ..Default::default()
+                },
+            ),
+            "bounded-transformer" => (
+                gen_core::MemoryStrategy::BoundedTransformerResidency,
+                gen_core::GenerationMemory {
+                    stage_residency: true,
+                    tile_vae_decode: true,
+                    chunk_attention: true,
+                    stream_transformer_blocks: true,
+                    decode_tile_edge: Some(memory_strategy::DECODE_TILE_EDGE),
+                    decode_overlap: Some(memory_strategy::DECODE_OVERLAP),
+                    attention_chunk_size: Some(memory_strategy::ATTENTION_CHUNK_SIZE),
+                    transformer_window_size: Some(
+                        memory_strategy::DEFAULT_TRANSFORMER_WINDOW as u32,
+                    ),
+                    transformer_window_component: Some(gen_core::TransformerComponent::Dit),
+                    ..Default::default()
+                },
+            ),
+            other => panic!("unknown FLUX_MEMORY_RUNG `{other}`"),
+        };
         let mut spec = LoadSpec::new(WeightsSource::Dir(dir.into()));
-        let spec_mode = std::env::var("FLUX_OFFLOAD_MODE").unwrap_or_default();
-        if spec_mode == "spec-sequential" {
-            spec = spec.with_offload_policy(OffloadPolicy::Sequential);
+        if strategy == gen_core::MemoryStrategy::BoundedTransformerResidency {
+            spec = spec.with_load_shape(gen_core::LoadShape::DeferredMaterialization);
         }
         let req = GenerationRequest {
             prompt: "a rusty robot holding a lit candle, studio lighting".into(),
@@ -648,38 +885,87 @@ mod tests {
             steps: Some(steps),
             seed: Some(42),
             count: 1,
+            memory: Some(memory),
             ..Default::default()
         };
-        let mut probe = candle_gen::testkit::VramProbe::start_rendered();
+        assert!(
+            candle_gen::testkit::reset_cuda_mempool_high_water(0),
+            "reset CUDA live-allocation high-water"
+        );
+        // Reject a contaminated GPU before spending minutes loading and generating. The final
+        // report is still validated below so evidence cannot become trustworthy merely because
+        // the device happened to be idle at this boundary.
+        let mut probe = candle_gen::testkit::VramProbe::start_rendered().assert_idle(1.0);
         let load_phase = probe.phase();
         let g = load(&spec).unwrap_or_else(|e| panic!("load {label}: {e}"));
         probe.end_load(load_phase);
         let generate_phase = probe.phase();
         let output = g.generate(&req, &mut |_| {}).expect("generate");
         probe.end_gen(generate_phase);
-        let report = probe.report();
-        let peak_mib = (report.peak_gb * 1.0e9 / (1024.0 * 1024.0)).round() as u64;
+        let report = probe.report().assert_trustworthy(1.0);
+        let live_peak_bytes = candle_gen::testkit::cuda_mempool_used_high_bytes(0)
+            .expect("read CUDA live-allocation high-water");
+        assert!(
+            live_peak_bytes > 0,
+            "CUDA live-allocation peak must be positive"
+        );
         let img = match output {
             GenerationOutput::Images(mut v) => v.remove(0),
             other => panic!("expected images, got {other:?}"),
         };
         std::fs::write(&out, &img.pixels).expect("write pixels");
-        let env_mode = std::env::var("CANDLE_GEN_OFFLOAD").unwrap_or_default();
-        let mode = if spec_mode == "spec-sequential" {
-            "spec-sequential"
-        } else if env_mode.eq_ignore_ascii_case("sequential") {
-            "env-sequential"
-        } else {
-            "resident"
+        let contract = memory_strategy::provider_contract(label, &spec).expect("memory contract");
+        let selection = gen_core::MemorySelection {
+            strategy,
+            parameters: gen_core::MemoryStrategyParameters {
+                stage_residency: None,
+                decode_tile_edge: memory.decode_tile_edge,
+                decode_overlap: memory.decode_overlap,
+                attention_chunk_size: memory.attention_chunk_size,
+                transformer_window_size: memory.transformer_window_size,
+                transformer_window_component: memory.transformer_window_component,
+            },
+            tier: memory_strategy::resolved_numeric_tier(&spec, label).expect("numeric tier"),
         };
         eprintln!(
-            "SEQ_AB model={label} mode={mode} gpu={} peak_mib={peak_mib} | {report} | bytes={} {}x{} out={out}",
+            "{}",
+            candle_gen::testkit::memory_evidence_v1_line(
+                candle_gen::testkit::MemoryEvidenceProbe {
+                    resolved_route: label,
+                    declared_calibration: candle_gen::testkit::expected_memory_calibration(
+                        spec.load_shape,
+                    ),
+                    observed_calibration: contract.calibration.clone().expect("calibration"),
+                    // Packed q4/q8 snapshots intentionally leave `LoadSpec::quantize` empty:
+                    // their actual tier comes from transformer/config.json. Preserve the exact
+                    // tier already resolved for admission instead of restamping the request hint.
+                    tier: selection.tier,
+                    load_shape: spec.load_shape,
+                    mode: gen_core::MemoryMode::TextToImage,
+                    overlay: None,
+                    geometry: gen_core::MemoryGeometry {
+                        width: req.width,
+                        height: req.height,
+                        batch: req.count,
+                        frames: 1,
+                        reference_count: 0,
+                    },
+                    strategy,
+                    engaged_composition: contract.engaged_composition(strategy),
+                    parameters: selection.parameters,
+                    observed_peak_bytes: live_peak_bytes,
+                    harness_version: "candle-flux1-memory-ladder-v1",
+                    output_bytes: &img.pixels,
+                }
+            )
+        );
+        eprintln!(
+            "MEMORY_EVIDENCE_DIAGNOSTIC gpu={} {report} bytes={} {}x{} out={out}",
             candle_gen::testkit::probe_gpu(),
             img.pixels.len(),
             img.width,
             img.height
         );
-        report.assert_trustworthy(1.0);
     }
 
     /// FLUX.1-dev real-weight A/B (epic 10765 Phase 1, sc-10769/sc-12138). Needs a real-file snapshot

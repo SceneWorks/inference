@@ -1,7 +1,7 @@
 //! sc-10840 (epic 10834): Bernini's staged-residency peak scaffold on real weights.
 //!
 //! `#[ignore]`d — assembles + loads the full ~56 GB Bernini snapshot (see `bernini_e2e.rs`). Run:
-//!   cargo test -p mlx-gen-bernini --release --test sequential_residency_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-bernini --release --test integration sequential_residency_real_weights:: -- --ignored --nocapture
 //!
 //! **Why no Resident-vs-Sequential A/B.** Unlike the image engines wired onto the two-phase
 //! [`mlx_gen::Residency`] seam (SD3 / Qwen-Image / Boogu), Bernini is **structurally always-staged**:
@@ -17,12 +17,31 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::gen_core::{
+    MemoryOptimizationAuthority, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
+};
 use mlx_gen::media::Image;
-use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
+use mlx_gen::{GenerationOutput, GenerationRequest, LoadShape, LoadSpec, WeightsSource};
 use mlx_gen_bernini::convert::assemble_bernini_snapshot;
 use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+/// The converted-snapshot store these tests assemble into.
+///
+/// `MLX_GEN_CONVERTED_ROOT` overrides it. The `$HOME` default stays because this is a **derived
+/// cache** the tests build themselves from a caller-provisioned HF snapshot — not a provided input,
+/// which is why it takes a fallback rather than the hard epic-13657 requirement `MLX_GEN_MODELS_ROOT`
+/// and the `*_SRC` variables carry. Without the override, pointing the suite at a real store did
+/// nothing: resolution read `$HOME` unconditionally and the rows skipped or mis-resolved while still
+/// reporting green.
+fn converted_root() -> PathBuf {
+    std::env::var("MLX_GEN_CONVERTED_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").expect("HOME")).join(".cache/mlx-gen-models")
+        })
+}
 
 fn hf_snapshot(repo: &str) -> Option<PathBuf> {
     let home = std::env::var("MLX_GEN_MODELS_ROOT").ok()?;
@@ -37,14 +56,14 @@ fn hf_snapshot(repo: &str) -> Option<PathBuf> {
 
 /// Assemble the combined full-Bernini snapshot once (reused across reruns), returning its dir.
 fn ensure_snapshot() -> PathBuf {
-    let home = PathBuf::from(std::env::var("HOME").unwrap());
-    let snapshot = home.join(".cache/mlx-gen-models/bernini_full_mlx_bf16");
+    let home = converted_root();
+    let snapshot = home.join("bernini_full_mlx_bf16");
     let complete = snapshot.join("qwen2_5_vl.safetensors").is_file()
         && snapshot.join("high_noise_model.safetensors").is_file();
     if !complete {
         let pkg = hf_snapshot("ByteDance/Bernini-Diffusers")
             .expect("ByteDance/Bernini-Diffusers snapshot in the HF cache");
-        let base = home.join(".cache/mlx-gen-models/wan2_2_t2v_a14b_mlx_bf16");
+        let base = home.join("wan2_2_t2v_a14b_mlx_bf16");
         assert!(
             base.join("high_noise_model.safetensors").is_file(),
             "converted base Wan2.2-T2V-A14B snapshot required at {}",
@@ -130,6 +149,141 @@ fn staged_peak_bounds_below_whole_model_sum() {
         peak as f64 / GIB,
         HEADROOM_GIB,
         ceiling,
+    );
+    drop(model);
+    clear_cache();
+}
+
+/// sc-18609 — the resident-versus-selected rung-4 A/B, driven through the **loaded generator's**
+/// memory-strategy hooks rather than by hand-writing `req.memory`.
+///
+/// The module header above explains why this family has no Resident-vs-Sequential *load* A/B: it is
+/// structurally always-staged. Rung 4 is a different axis and does have one — the baseline is the
+/// same load with no optimized selection, and the arm is the same load with the windowed selection
+/// the contract admits. Both render the same request, so a peak drop that comes with a changed image
+/// is a regression, not a saving.
+///
+/// Driving it through `begin_memory_strategy_request` is the point: that is the seam the worker uses,
+/// and until sc-18609 the loaded generator did not implement it at all, so an evidence run that set
+/// `req.memory` directly would have measured a mechanism no production route could select.
+///
+/// **Not executed by CI, and not executed by the change that added it** — it needs the ~56 GB
+/// snapshot and a multi-minute Apple-Silicon render. It is the harness the epic's evidence campaign
+/// runs; treat a green `0.00s` here as the skip it is.
+#[test]
+#[ignore = "real weights: loads the ~56 GB full Bernini snapshot twice and renders both A/B arms"]
+fn windowed_trunk_lowers_the_request_peak_and_preserves_the_render() {
+    let snapshot = ensure_snapshot();
+    let spec = LoadSpec::new(WeightsSource::Dir(snapshot.clone()))
+        .with_load_shape(LoadShape::DeferredMaterialization);
+    let request = || GenerationRequest {
+        prompt: "a red apple on a wooden table, studio lighting".into(),
+        width: 256,
+        height: 256,
+        frames: Some(1),
+        steps: Some(4),
+        seed: Some(0),
+        video_mode: Some("t2i".into()),
+        ..Default::default()
+    };
+    let pixels = |output: GenerationOutput| match output {
+        GenerationOutput::Images(mut images) => {
+            assert_eq!(images.len(), 1);
+            images.pop().unwrap()
+        }
+        _ => panic!("expected Images for a 1-frame request"),
+    };
+
+    // Baseline: the identical load and request with no optimized selection.
+    let model = mlx_gen_bernini::bernini::load(&spec).expect("load bernini");
+    reset_peak_memory();
+    let resident = pixels(model.generate(&request(), &mut |_| {}).expect("generate"));
+    let resident_peak = get_peak_memory();
+    drop(model);
+    clear_cache();
+
+    // Arm: the same load, with the window the loaded generator's own admission accepts.
+    let model = mlx_gen_bernini::bernini::load(&spec).expect("load bernini");
+    assert_eq!(
+        model
+            .memory_strategy_contract()
+            .expect("sc-18609: the loaded generator must publish its declared contract")
+            .provider_id,
+        mlx_gen_bernini::bernini::MODEL_ID
+    );
+    // The run context is built from the DECLARATION contract because it is the only one carrying a
+    // calibration identity until this family's first cell is measured; admission below still runs
+    // against the LOADED generator, which is the seam under test.
+    let declaration = mlx_gen_bernini::memory_strategy::weights_free_memory_strategy_contract(
+        mlx_gen_bernini::bernini::MODEL_ID,
+        &spec,
+    )
+    .expect("declaration contract");
+    let mut context = mlx_gen::gen_core::standard_memory_behavior_context(
+        &declaration,
+        MemoryStrategy::BoundedTransformerResidency,
+        mlx_gen::gen_core::MemoryNumericTier {
+            precision: spec.precision,
+            quant: spec.quantize,
+            component_precision_floors: &[],
+        },
+        mlx_gen::gen_core::MemoryBehaviorRoute {
+            mode: mlx_gen::gen_core::MemoryMode::TextToImage,
+            reference_count: 0,
+            use_pid: false,
+            has_phases: false,
+            overlay: None,
+        },
+    )
+    .expect("windowed run context");
+    context.optimization_authority = MemoryOptimizationAuthority::Estimated;
+    context.geometry.width = 256;
+    context.geometry.height = 256;
+    assert_eq!(
+        model.memory_strategy_safety_check(&context),
+        MemorySafetyDecision::Accept,
+        "the declared rung-4 route must be admitted by the loaded generator"
+    );
+    let mut windowed = request();
+    let mut scope = model
+        .begin_memory_strategy_request(&context)
+        .expect("rung 4 must open a request scope")
+        .expect("rung 4 must open a request scope");
+    scope.configure_request(&mut windowed).unwrap();
+    assert!(
+        windowed
+            .memory
+            .expect("the scope configures request memory")
+            .stream_transformer_blocks,
+        "the admitted selection must reach the block-plan lever"
+    );
+    reset_peak_memory();
+    let selected = pixels(model.generate(&windowed, &mut |_| {}).expect("generate"));
+    let selected_peak = get_peak_memory();
+    scope.finish(MemoryRunOutcome::Complete).unwrap();
+    // The scope borrows the generator, so it must be released before the generator is dropped.
+    drop(scope);
+
+    println!(
+        "Bernini rung-4 A/B (t2i 256^2 @ 4 steps): resident peak = {:.3} GiB, windowed peak = {:.3} GiB",
+        resident_peak as f64 / GIB,
+        selected_peak as f64 / GIB,
+    );
+    let Image {
+        width,
+        height,
+        pixels: selected_pixels,
+    } = &selected;
+    assert_eq!((*width, *height), (256, 256));
+    assert_eq!(
+        selected_pixels.len(),
+        resident.pixels.len(),
+        "the window is a residency lever, not a geometry one"
+    );
+    assert!(
+        selected_peak < resident_peak,
+        "windowing the 80-block dual-expert trunk must lower the request peak: \
+         resident {resident_peak}, windowed {selected_peak}"
     );
     drop(model);
     clear_cache();

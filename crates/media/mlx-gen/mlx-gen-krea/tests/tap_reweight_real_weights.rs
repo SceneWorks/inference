@@ -10,7 +10,7 @@
 //! `#[ignore]` — needs the real Krea 2 Turbo snapshot (bf16 ≈ 32 GB resident, or `KREA_QUANT=q8`):
 //! ```sh
 //! KREA_TURBO_DIR=/path/to/models--SceneWorks--krea-2-turbo-mlx/snapshots/<rev>/bf16 \
-//!   cargo test -p mlx-gen-krea --release --test tap_reweight_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-krea --release --test integration tap_reweight_real_weights:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

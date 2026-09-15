@@ -24,12 +24,12 @@ use std::collections::HashMap;
 
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
 use mlx_rs::nn::relu;
-use mlx_rs::ops::{
-    self, add, broadcast_to, concatenate_axis, multiply, sigmoid, stack_axis, subtract,
-};
+#[cfg(test)]
+use mlx_rs::ops;
+use mlx_rs::ops::{add, broadcast_to, concatenate_axis, multiply, sigmoid, stack_axis, subtract};
 use mlx_rs::Array;
 
-use mlx_gen::nn::{gelu_exact, linear};
+use mlx_gen::nn::{conv2d_general, gelu_exact, linear};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -65,15 +65,15 @@ fn conv2d_nchw(
     pad: i32,
     groups: i32,
 ) -> Result<Array> {
-    let y = ops::conv2d(
-        x.transpose_axes(&[0, 2, 3, 1])?,
+    let y = conv2d_general(
+        &x.transpose_axes(&[0, 2, 3, 1])?,
         w,
+        Some(b),
         (stride, stride),
         (pad, pad),
         (1, 1),
         groups,
     )?;
-    let y = add(&y, b)?; // bias over the last (channel) axis, NHWC
     Ok(y.transpose_axes(&[0, 3, 1, 2])?)
 }
 
@@ -715,7 +715,14 @@ mod tests {
         t.push((format!("{ma}.norm.weight"), zeros(&[256])));
         t.push((format!("{ma}.norm.bias"), zeros(&[256])));
 
-        let path = std::env::temp_dir().join("mlx_gen_sam2_synth_memory.safetensors");
+        // Process-unique: `RUST_TEST_THREADS=1` serializes tests *within* a run, but two concurrent
+        // `cargo test` invocations on one machine (two worktrees, two agents) share `$TMPDIR`, so a
+        // fixed name lets the other run's copy of this same test truncate or delete the file between
+        // this save and load — `Weights::from_file` then fails `NotFile`.
+        let path_tmp = tempfile::tempdir().unwrap();
+        let path = path_tmp
+            .path()
+            .join("mlx_gen_sam2_synth_memory.safetensors");
         let refs: Vec<(&str, &Array)> = t.iter().map(|(k, v)| (k.as_str(), v)).collect();
         Array::save_safetensors(refs, None, &path).unwrap();
         let w = Weights::from_file(&path).unwrap();

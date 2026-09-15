@@ -120,6 +120,130 @@ pub struct CaptionOutput {
     pub finish_reason: Option<CaptionFinishReason>,
 }
 
+/// One caption-trigger boundary conformance case.
+///
+/// The table below is intentionally public so every consumer can prove it uses the same caption
+/// post-processing contract without copying either the matching implementation or its expected
+/// results.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaptionTriggerWordConformanceCase {
+    pub caption: &'static str,
+    pub trigger_words: &'static [&'static str],
+    pub expected: &'static str,
+}
+
+/// The canonical caption-trigger boundary matrix.
+///
+/// Caption and trigger whitespace are normalized to one ASCII space. Matching is Unicode
+/// case-insensitive by lowercase comparison and requires the trigger text to have complete outer
+/// token boundaries: letters, numbers, and `_` are token characters; punctuation and Unicode
+/// whitespace are boundaries. Multiword triggers therefore require the normalized complete phrase,
+/// rather than independently matching its component words.
+pub const CAPTION_TRIGGER_WORD_CONFORMANCE: &[CaptionTriggerWordConformanceCase] = &[
+    CaptionTriggerWordConformanceCase {
+        caption: "portrait",
+        trigger_words: &["art"],
+        expected: "art, portrait",
+    },
+    CaptionTriggerWordConformanceCase {
+        caption: "A polished ART.",
+        trigger_words: &["art"],
+        expected: "A polished ART.",
+    },
+    CaptionTriggerWordConformanceCase {
+        caption: "fine_art portrait",
+        trigger_words: &["art"],
+        expected: "art, fine_art portrait",
+    },
+    CaptionTriggerWordConformanceCase {
+        caption: "fine-art portrait",
+        trigger_words: &["art"],
+        expected: "fine-art portrait",
+    },
+    CaptionTriggerWordConformanceCase {
+        caption: "Mika\u{00a0}\tToken wears a hat",
+        trigger_words: &["mika token"],
+        expected: "Mika Token wears a hat",
+    },
+    CaptionTriggerWordConformanceCase {
+        caption: "a blue-haired person",
+        trigger_words: &["blue hair"],
+        expected: "blue hair, a blue-haired person",
+    },
+    CaptionTriggerWordConformanceCase {
+        caption: "a BLUE   Hair person",
+        trigger_words: &["blue hair"],
+        expected: "a BLUE Hair person",
+    },
+    CaptionTriggerWordConformanceCase {
+        caption: "subject",
+        trigger_words: &["  Mika\tToken  "],
+        expected: "Mika Token, subject",
+    },
+    CaptionTriggerWordConformanceCase {
+        caption: "subject",
+        trigger_words: &["ART", "art"],
+        expected: "ART, subject",
+    },
+];
+
+/// Prepend each missing training trigger to a generated caption.
+///
+/// This is the only caption-trigger matching policy used by SceneWorks inference. It deliberately
+/// does not use regex word boundaries: Rust regex treats ASCII and Unicode boundaries differently,
+/// while this contract names `_` as a token character and defines phrase matching after whitespace
+/// normalization. The returned text has normalized whitespace; the first case-preserving spelling
+/// of each missing trigger is retained.
+pub fn apply_caption_trigger_words(caption: &str, trigger_words: &[String]) -> String {
+    let cleaned_caption = normalize_caption_trigger_whitespace(caption);
+    let folded_caption = cleaned_caption.to_lowercase();
+    let mut parts = Vec::new();
+
+    for trigger in trigger_words {
+        let trigger = normalize_caption_trigger_whitespace(trigger);
+        if trigger.is_empty() {
+            continue;
+        }
+        let folded_trigger = trigger.to_lowercase();
+        if contains_complete_caption_trigger(&folded_caption, &folded_trigger)
+            || parts
+                .iter()
+                .any(|part: &String| part.to_lowercase() == folded_trigger)
+        {
+            continue;
+        }
+        parts.push(trigger);
+    }
+
+    if !cleaned_caption.is_empty() {
+        parts.push(cleaned_caption);
+    }
+    parts.join(", ")
+}
+
+fn normalize_caption_trigger_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn contains_complete_caption_trigger(caption: &str, trigger: &str) -> bool {
+    caption.match_indices(trigger).any(|(start, _)| {
+        let end = start + trigger.len();
+        let starts_at_boundary = caption[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !is_caption_token_character(ch));
+        let ends_at_boundary = caption[end..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !is_caption_token_character(ch));
+        starts_at_boundary && ends_at_boundary
+    })
+}
+
+fn is_caption_token_character(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
 /// Why generation stopped, when the provider can report it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptionFinishReason {
@@ -293,6 +417,21 @@ impl CaptionCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caption_trigger_words_follow_canonical_conformance_matrix() {
+        for case in CAPTION_TRIGGER_WORD_CONFORMANCE {
+            let trigger_words = case
+                .trigger_words
+                .iter()
+                .map(|word| (*word).to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                apply_caption_trigger_words(case.caption, &trigger_words),
+                case.expected
+            );
+        }
+    }
 
     fn img(w: u32, h: u32) -> Image {
         Image {

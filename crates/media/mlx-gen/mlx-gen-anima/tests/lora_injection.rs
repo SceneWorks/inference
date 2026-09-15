@@ -1,7 +1,7 @@
 //! LoRA/LoKr injection tests for mlx-gen-anima (sc-10521). All `#[ignore]`d and real-weights-gated —
 //! they need BOTH the `circlestone-labs/Anima` base snapshot (DiT checkpoints) and the
 //! `circlestone-labs/Anima-Official-LoRAs` snapshot in the HF cache, plus Metal. Run with:
-//!   cargo test -p mlx-gen-anima --release --test lora_injection -- --ignored --nocapture
+//!   cargo test -p mlx-gen-anima --release --test integration lora_injection:: -- --ignored --nocapture
 //! The α = r ⇒ scale-1.0 weight-level checks live in a sibling process-isolated binary,
 //! `tests/scale_convention.rs` (see its module doc for the Metal-stream reason). Both binaries — and
 //! `tests/real_weights.rs` / `tests/velocity_convention.rs` — run under the full documented invocation
@@ -28,7 +28,7 @@
 //!   2. the α = r ⇒ scale 1.0 convention (weight-level: injected forward == base + B·A, + the
 //!      halve-scale mutation) — in `tests/scale_convention.rs`.
 
-mod common;
+use crate::common;
 
 use mlx_rs::ops::{matmul, multiply, subtract};
 use mlx_rs::Dtype;
@@ -268,8 +268,9 @@ fn turbo_checkpoint_is_not_base_plus_lora() {
 #[test]
 #[ignore = "needs the circlestone-labs/Anima snapshot"]
 fn lokr_loads_and_applies_to_dit_and_conditioner() {
+    let tmp = tempfile::tempdir().unwrap();
     let mut c = load_base();
-    let spec = AdapterSpec::new(synth_lokr(), 1.0, AdapterKind::Lokr);
+    let spec = AdapterSpec::new(synth_lokr(&tmp), 1.0, AdapterKind::Lokr);
     let report = apply_anima_adapters(&mut c.dit, &mut c.conditioner, &[spec]).expect("apply LoKr");
     assert_eq!(
         report.applied, 2,
@@ -302,11 +303,12 @@ fn lokr_loads_and_applies_to_dit_and_conditioner() {
 #[test]
 #[ignore = "needs the circlestone-labs/Anima + Anima-Official-LoRAs snapshots"]
 fn stacked_lora_plus_lokr_mixed() {
+    let tmp = tempfile::tempdir().unwrap();
     // Apply the turbo LoRA (508 targets) AND the synthetic LoKr (2 targets) in one strict call.
     let mut c = load_base();
     let specs = vec![
         lora_spec(turbo_lora(), 1.0),
-        AdapterSpec::new(synth_lokr(), 1.0, AdapterKind::Lokr),
+        AdapterSpec::new(synth_lokr(&tmp), 1.0, AdapterKind::Lokr),
     ];
     let report =
         apply_anima_adapters(&mut c.dit, &mut c.conditioner, &specs).expect("apply stacked");

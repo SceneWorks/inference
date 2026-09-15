@@ -9,6 +9,7 @@ use mlx_rs::Array;
 use super::attention::ZImageAttention;
 use super::feed_forward::FeedForward;
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
+use mlx_gen::attention::AttentionPlan;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -81,10 +82,25 @@ impl ZImageContextBlock {
         Ok(())
     }
 
+    /// The unbounded context-block forward — byte-identical to the pre-SC-15615 path.
     pub fn forward(&self, x: &Array, freqs_cis: &Array) -> Result<Array> {
-        let attn_out = self
-            .attention
-            .forward(&rms_norm(x, &self.attention_norm1, self.eps)?, freqs_cis)?;
+        self.forward_budgeted(x, freqs_cis, AttentionPlan::UNBOUNDED)
+    }
+
+    /// [`Self::forward`] with an explicit attention-score budget (SC-15615). The caption stream is 32
+    /// tokens (padded to a multiple of 32), so in practice its scores always fit and this is the
+    /// single-call fast path — it is threaded anyway so no route silently skips the rung.
+    pub fn forward_budgeted(
+        &self,
+        x: &Array,
+        freqs_cis: &Array,
+        plan: AttentionPlan<'_>,
+    ) -> Result<Array> {
+        let attn_out = self.attention.forward_budgeted(
+            &rms_norm(x, &self.attention_norm1, self.eps)?,
+            freqs_cis,
+            plan,
+        )?;
         let x = add(x, &rms_norm(&attn_out, &self.attention_norm2, self.eps)?)?;
         let ffn_out = self
             .feed_forward

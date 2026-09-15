@@ -447,12 +447,13 @@ fn verification_is_exact_on_a_packed_tier() {
 /// attention + FFN targets — the FFN spelled in the reference `ffn.0`/`ffn.2` naming a real
 /// Wan-family file carries, so the host's key normalization is exercised too.
 ///
-/// `dt` is the **factor dtype**, and it matters (see
-/// [`scale_zero_is_a_bit_exact_no_op_on_every_tier`]): the residual is added to the base's output at
-/// the promoted dtype, so f32 factors widen the Linear's bf16 output to f32. That widening is
-/// value-preserving at the Linear itself but changes downstream rounding, on a **dense** base exactly
-/// as much as on a packed one.
-fn write_lora(name: &str, seed: u64, mag: f32, dt: Dtype) -> PathBuf {
+/// `dt` is the **factor dtype**. It used to matter (see
+/// [`scale_zero_is_a_bit_exact_no_op_on_every_tier`]): the residual was added to the base's output at
+/// the *promoted* dtype, so f32 factors widened the Linear's bf16 output to f32 — value-preserving at
+/// the Linear itself, but it changed downstream rounding, on a **dense** base exactly as much as on a
+/// packed one. sc-15265 fixed that at the shared `mlx-gen` seam (the residual is narrowed to the
+/// host's output dtype before the add), so both factor dtypes are now gated identically.
+fn write_lora(tmp: &tempfile::TempDir, name: &str, seed: u64, mag: f32, dt: Dtype) -> PathBuf {
     const RANK: i32 = 4;
     let stems: [(&str, i32, i32); 5] = [
         ("blocks.0.self_attn.q", 64, 64),
@@ -468,7 +469,7 @@ fn write_lora(name: &str, seed: u64, mag: f32, dt: Dtype) -> PathBuf {
         entries.push((format!("diffusion_model.{stem}.lora_A.weight"), a));
         entries.push((format!("diffusion_model.{stem}.lora_B.weight"), b));
     }
-    let dir = std::env::temp_dir().join("mlx_gen_krea_quant_tier_test");
+    let dir = tmp.path().join("mlx_gen_krea_quant_tier_test");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
     let refs: Vec<(&str, &Array)> = entries.iter().map(|(k, v)| (k.as_str(), v)).collect();
@@ -496,8 +497,9 @@ const TIERS: [(&str, Option<i32>); 3] = [("bf16", None), ("q8", Some(8)), ("q4",
 /// blow the whole point of the tier (a 14B Q4 base dequantized back to bf16 is ~28 GB resident).
 #[test]
 fn lora_installs_additively_over_a_packed_base_without_dequantizing_it() {
+    let tmp = tempfile::tempdir().unwrap();
     let cfg = tiny_cfg();
-    let lora = write_lora("packed_base.safetensors", 5, 0.5, Dtype::Float32);
+    let lora = write_lora(&tmp, "packed_base.safetensors", 5, 0.5, Dtype::Float32);
 
     for bits in [4, 8] {
         let baseline = forward_once(&packed_transformer(&cfg, bits), &cfg);
@@ -536,43 +538,61 @@ fn lora_installs_additively_over_a_packed_base_without_dequantizing_it() {
 /// what excludes "the forward changed by accident" from gate (6), and it proves the install never
 /// mutates the base (which on a packed tier would mean an unpack/repack round trip).
 ///
-/// The factors are **bf16** here deliberately. The shared loader adds the residual at the factors'
-/// promoted dtype, so an *f32*-factor adapter widens the host Linear's bf16 output to f32 — a
-/// value-preserving widening at the Linear, but one that changes downstream rounding (`rms_norm`,
-/// SDPA, the FFN chain) and so is not bit-exact end-to-end even at scale 0. Measured, that artifact is
-/// ~1.9e-4 on a dense base and ~2.9e-4 on Q4: present on **both**, i.e. a property of the shared
-/// adapter path, not of the packed tier. Pinning the bf16 case keeps this gate about the tier.
+/// It is gated at **both** factor dtypes, and the f32 leg is the discriminating one (sc-15265). The
+/// shared loader used to add the residual at the factors' *promoted* dtype, so an f32-factor adapter
+/// widened the host Linear's bf16 output to f32 — value-preserving at the Linear, but it changed
+/// downstream rounding (`rms_norm`, SDPA, the FFN chain) and so was **not** bit-exact end-to-end even
+/// at scale 0. Measured on this geometry before the fix: `1.91e-4` bf16 / `2.99e-4` Q8 / `2.94e-4`
+/// Q4 — present on a dense base as much as on a packed one, i.e. a property of the shared adapter
+/// path, not of the packed tier. `mlx-gen`'s `AdaptableLinear` now narrows the residual to the host's
+/// output dtype before adding it (and skips a `scale == 0` adapter outright), so all six legs are
+/// exactly `0.0`. Keeping both dtypes here is what stops the artifact silently coming back.
 #[test]
 fn scale_zero_is_a_bit_exact_no_op_on_every_tier() {
+    let tmp = tempfile::tempdir().unwrap();
     let cfg = tiny_cfg();
-    let lora = write_lora("scale_zero.safetensors", 5, 0.5, Dtype::Bfloat16);
+    // Same factors, two on-disk dtypes: bf16 matches the host's activation dtype, f32 (what the
+    // real community/PEFT files ship) is the combination that used to promote the host to f32.
+    let loras = [
+        (
+            "bf16",
+            write_lora(&tmp, "scale_zero.safetensors", 5, 0.5, Dtype::Bfloat16),
+        ),
+        (
+            "f32",
+            write_lora(&tmp, "scale_zero_f32.safetensors", 5, 0.5, Dtype::Float32),
+        ),
+    ];
 
     for (name, bits) in TIERS {
         let baseline = forward_once(&tier_transformer(&cfg, bits), &cfg);
-        let mut zero = tier_transformer(&cfg, bits);
-        apply_adapters_strict(
-            &mut zero,
-            &[AdapterSpec::new(lora.clone(), 0.0, AdapterKind::Lora)],
-            MODEL_ID,
-        )
-        .unwrap_or_else(|e| panic!("{name}: scale-0 install failed: {e}"));
-        assert_eq!(
-            max_abs_diff(&baseline, &forward_once(&zero, &cfg)),
-            0.0,
-            "{name}: a scale-0 LoRA must be a bit-exact no-op"
-        );
-        // …and a non-zero scale of the SAME file does move it, so the no-op is not vacuous.
-        let mut on = tier_transformer(&cfg, bits);
-        apply_adapters_strict(
-            &mut on,
-            &[AdapterSpec::new(lora.clone(), 1.0, AdapterKind::Lora)],
-            MODEL_ID,
-        )
-        .unwrap();
-        assert!(
-            max_abs_diff(&baseline, &forward_once(&on, &cfg)) > 1e-4,
-            "{name}: the same file at scale 1 must move the forward"
-        );
+        for (dt, lora) in &loras {
+            let mut zero = tier_transformer(&cfg, bits);
+            apply_adapters_strict(
+                &mut zero,
+                &[AdapterSpec::new(lora.clone(), 0.0, AdapterKind::Lora)],
+                MODEL_ID,
+            )
+            .unwrap_or_else(|e| panic!("{name}/{dt}: scale-0 install failed: {e}"));
+            let drift = max_abs_diff(&baseline, &forward_once(&zero, &cfg));
+            println!("{name}/{dt} factors: scale-0 drift vs no-adapter = {drift:e}");
+            assert_eq!(
+                drift, 0.0,
+                "{name}/{dt}: a scale-0 LoRA must be a bit-exact no-op vs no adapter at all"
+            );
+            // …and a non-zero scale of the SAME file does move it, so the no-op is not vacuous.
+            let mut on = tier_transformer(&cfg, bits);
+            apply_adapters_strict(
+                &mut on,
+                &[AdapterSpec::new(lora.clone(), 1.0, AdapterKind::Lora)],
+                MODEL_ID,
+            )
+            .unwrap();
+            assert!(
+                max_abs_diff(&baseline, &forward_once(&on, &cfg)) > 1e-4,
+                "{name}/{dt}: the same file at scale 1 must move the forward"
+            );
+        }
     }
 }
 
@@ -580,8 +600,9 @@ fn scale_zero_is_a_bit_exact_no_op_on_every_tier() {
 /// (`supports_lora` alongside `supported_quants = [Q4, Q8]`) has to hold at Q4/Q8, not only bf16.
 #[test]
 fn the_same_lora_installs_on_every_tier() {
+    let tmp = tempfile::tempdir().unwrap();
     let cfg = tiny_cfg();
-    let lora = write_lora("every_tier.safetensors", 77, 0.5, Dtype::Float32);
+    let lora = write_lora(&tmp, "every_tier.safetensors", 77, 0.5, Dtype::Float32);
     let spec = AdapterSpec::new(lora, 1.0, AdapterKind::Lora);
 
     for (name, bits) in TIERS {
@@ -659,7 +680,8 @@ fn write_native_checkpoint(cfg: &KreaRealtimeConfig, base: &std::path::Path) -> 
 #[test]
 fn tier_converter_writes_a_snapshot_the_load_path_reads_back() {
     let cfg = tiny_cfg();
-    let base = std::env::temp_dir().join(format!("krea_tier_convert_{}", std::process::id()));
+    let base_tmp = tempfile::tempdir().unwrap();
+    let base = base_tmp.path().to_path_buf();
     let native = write_native_checkpoint(&cfg, &base);
 
     for (tier, quantize) in [
@@ -717,8 +739,6 @@ fn tier_converter_writes_a_snapshot_the_load_path_reads_back() {
             "{tier}: packed-ness must match the tier"
         );
     }
-
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// (11) **The sharded emitter is interchangeable with the single-file one.** `convert_krea_realtime_
@@ -738,7 +758,8 @@ fn tier_converter_writes_a_snapshot_the_load_path_reads_back() {
 #[test]
 fn sharded_emitter_matches_the_single_file_emitter_and_holds_one_shard_at_a_time() {
     let cfg = tiny_cfg();
-    let base = std::env::temp_dir().join(format!("krea_tier_sharded_{}", std::process::id()));
+    let base_tmp = tempfile::tempdir().unwrap();
+    let base = base_tmp.path().to_path_buf();
     let native = write_native_checkpoint(&cfg, &base);
 
     for (tier, quantize) in [("bf16", None), ("q4", Some((4, GROUP)))] {
@@ -861,8 +882,6 @@ fn sharded_emitter_matches_the_single_file_emitter_and_holds_one_shard_at_a_time
             "{tier}: the sharded snapshot must resolve to the emitted tier"
         );
     }
-
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Do `a` and `b` differ in **any** element? Element-wise `!=` reduced with `any`, which stays in the
@@ -928,7 +947,8 @@ fn tensor_comparison_sees_u32_code_words_that_f32_cannot_distinguish() {
 #[test]
 fn emitting_into_the_source_directory_is_refused() {
     let cfg = tiny_cfg();
-    let base = std::env::temp_dir().join(format!("krea_shard_selfsrc_{}", std::process::id()));
+    let base_tmp = tempfile::tempdir().unwrap();
+    let base = base_tmp.path().to_path_buf();
     let native = write_native_checkpoint(&cfg, &base);
     let out = base.join("tier");
 
@@ -951,8 +971,6 @@ fn emitting_into_the_source_directory_is_refused() {
         before,
         "the source shards must not have been deleted"
     );
-
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// `(index, total)` out of a `dit-{i}-of-{n}.safetensors` shard path.
@@ -976,7 +994,8 @@ fn parse_shard_name(p: &std::path::Path) -> (usize, usize) {
 #[test]
 fn re_emitting_at_a_different_budget_clears_the_previous_shard_set() {
     let cfg = tiny_cfg();
-    let base = std::env::temp_dir().join(format!("krea_shard_restale_{}", std::process::id()));
+    let base_tmp = tempfile::tempdir().unwrap();
+    let base = base_tmp.path().to_path_buf();
     let native = write_native_checkpoint(&cfg, &base);
     let out = base.join("tier");
 
@@ -1018,8 +1037,6 @@ fn re_emitting_at_a_different_budget_clears_the_previous_shard_set() {
     );
     // And the directory still loads cleanly (a leftover set would collide on duplicate keys).
     mlx_gen::weights::Weights::from_dir(&dir).expect("re-emitted shard dir must load");
-
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// The mis-shaped-tensor count out of `verify_transformer_tensors`' summary
@@ -1051,7 +1068,8 @@ fn wrong_shape_count(msg: &str) -> usize {
 #[test]
 fn a_geometry_mismatched_source_is_rejected_before_anything_is_written() {
     let cfg = tiny_cfg();
-    let base = std::env::temp_dir().join(format!("krea_tier_mismatch_{}", std::process::id()));
+    let base_tmp = tempfile::tempdir().unwrap();
+    let base = base_tmp.path().to_path_buf();
     let native = write_native_checkpoint(&cfg, &base);
 
     for (tier, quantize) in [
@@ -1102,8 +1120,6 @@ fn a_geometry_mismatched_source_is_rejected_before_anything_is_written() {
             "{tier}: nothing may be written on a near-miss geometry either"
         );
     }
-
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// (12) [`PACKED_LINEARS_PER_BLOCK`] is the **real** predicate surface, not a stale description of it:

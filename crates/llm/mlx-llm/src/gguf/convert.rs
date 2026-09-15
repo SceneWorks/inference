@@ -86,6 +86,33 @@ pub fn convert_file(
     convert(&g, out_dir, opts)
 }
 
+/// Why a Gemma 4 GGUF is refused rather than converted (sc-18772).
+///
+/// Three things a converter would have to invent, none of which upstream has defined because
+/// llama.cpp ships no Gemma 4 export:
+///
+/// 1. **The 4-norm block.** [`remap_key`] maps `ffn_norm` → `post_attention_layernorm`, which is
+///    correct for Llama's two-norm block. Gemma 4 has four (`input_layernorm`,
+///    `post_attention_layernorm`, `pre_feedforward_layernorm`, `post_feedforward_layernorm`), so
+///    that same mapping would land the pre-FFN norm on the post-attention slot — a silent
+///    mis-conversion producing a loadable model that generates noise, not a load error.
+/// 2. **`layer_scalar`.** Every Gemma 4 decoder layer carries a per-layer scalar buffer. There is
+///    no GGML tensor name for it, so it cannot be round-tripped.
+/// 3. **The per-layer-type attention table.** `global_head_dim`, `num_global_key_value_heads`,
+///    `attention_k_eq_v`, and the dual (`sliding` 10k default / `full` 1M proportional) RoPE
+///    schedule have no GGUF metadata keys. The full-attention layers additionally ship **no**
+///    `attn_v` at all, which no existing converter path expects.
+///
+/// The safetensors path serves Gemma 4 completely, including q4/q8 quantize-on-load, so this refusal
+/// costs the ingestion route, not the model.
+pub(crate) const GEMMA4_GGUF_REFUSAL: &str = "GGUF architecture \"gemma4\": Gemma 4 is served \
+     through the safetensors snapshot path (including Q4/Q8 quantize-on-load), not GGUF. A GGUF \
+     converter would have to invent three mappings upstream has not defined — the four-norm \
+     sandwich block (`ffn_norm` would silently land on `post_attention_layernorm`), the per-layer \
+     `layer_scalar` buffer, and the per-layer-type attention table (`global_head_dim`, \
+     `num_global_key_value_heads`, `attention_k_eq_v`, the dual sliding/full RoPE schedule, and \
+     full-attention layers that ship no `attn_v`). Point the loader at the HF snapshot instead.";
+
 /// Convert an already-parsed GGUF file into an MLX snapshot directory.
 pub fn convert(
     g: &GgufFile,
@@ -101,6 +128,12 @@ pub fn convert(
     let (model_type, hf_arch) = match arch.as_str() {
         "llama" => ("llama", "LlamaForCausalLM"),
         "qwen3" => ("qwen3", "Qwen3ForCausalLM"),
+        // Gemma 4 is deliberately refused here rather than mapped (sc-18772). The safetensors path
+        // serves it fully; GGUF cannot yet, and a guessed mapping would mis-convert silently rather
+        // than fail. See `GEMMA4_GGUF_REFUSAL` for what is actually missing.
+        "gemma4" | "gemma4_unified" => {
+            return Err(Error::Unsupported(GEMMA4_GGUF_REFUSAL.to_string()))
+        }
         other => {
             return Err(Error::Unsupported(format!(
                 "GGUF architecture {other:?} (engine supports llama/mistral and qwen3; \
@@ -382,6 +415,7 @@ fn reconstruct_rope_scaling(g: &GgufFile, arch: &str) -> Option<Value> {
 mod tests {
     use super::*;
     use crate::primitives::quant::QuantizedLinear;
+    use crate::test_fixture::{assert_fixture_is_a_guarded_entry, Fixture};
 
     fn push_gguf_string(bytes: &mut Vec<u8>, value: &str) {
         bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
@@ -454,6 +488,58 @@ mod tests {
         GgufFile::parse(bytes).unwrap()
     }
 
+    /// A minimal GGUF whose only claim is its architecture string — enough to exercise the
+    /// architecture gate without building tensors the refusal never reaches.
+    fn arch_only_gguf(arch: &str) -> GgufFile {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x4655_4747u32.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // no tensors
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // one metadata entry
+        push_gguf_string(&mut bytes, "general.architecture");
+        bytes.extend_from_slice(&8u32.to_le_bytes()); // string type
+        push_gguf_string(&mut bytes, arch);
+        while !bytes.len().is_multiple_of(32) {
+            bytes.push(0);
+        }
+        GgufFile::parse(bytes).unwrap()
+    }
+
+    /// A Gemma 4 GGUF is refused with a message naming what is missing — NOT converted with the
+    /// Llama tensor mapping.
+    ///
+    /// The defect this guards is silent mis-conversion, not a missing feature: `remap_key` happily
+    /// maps every Gemma tensor name it recognizes, and `ffn_norm` -> `post_attention_layernorm`
+    /// would put Gemma's pre-FFN norm on the post-attention slot. That converts "successfully" and
+    /// produces a model that generates noise. Refusing at the architecture gate is what keeps the
+    /// failure loud.
+    #[test]
+    fn gemma4_gguf_is_refused_with_a_specific_reason() {
+        let out = Fixture::new("gemma4-gguf-refusal", None);
+        for arch in ["gemma4", "gemma4_unified"] {
+            let err = convert(&arch_only_gguf(arch), &out, ConvertOptions::default())
+                .map(|_| ())
+                .expect_err("a Gemma 4 GGUF must be refused");
+            let msg = format!("{err}");
+            assert!(
+                matches!(err, Error::Unsupported(_)),
+                "the refusal must be typed Unsupported, not a generic error: {msg}"
+            );
+            // The message has to be actionable: name the safetensors alternative and at least one
+            // concrete missing mapping, so a reader is not left guessing why.
+            assert!(msg.contains("safetensors"), "{msg}");
+            assert!(msg.contains("layer_scalar"), "{msg}");
+            assert!(msg.contains("post_attention_layernorm"), "{msg}");
+        }
+        // An unrelated unknown architecture still gets the ordinary message, so the Gemma 4 branch
+        // has not swallowed the general case.
+        let err = convert(&arch_only_gguf("bert"), &out, ConvertOptions::default())
+            .map(|_| ())
+            .expect_err("an unsupported architecture must be refused");
+        assert!(format!("{err}").contains("bert"), "{err}");
+        assert!(!format!("{err}").contains("layer_scalar"), "{err}");
+    }
+
     #[test]
     fn remaps_non_layer_keys() {
         assert_eq!(
@@ -508,9 +594,9 @@ mod tests {
 
         // Feed the independently unpermuted result through the streaming sink and pin every stored
         // BF16 value, rather than comparing two invocations of the same writer.
-        let dir =
-            std::env::temp_dir().join(format!("mlx-llm-gguf-qk-stream-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        // sc-17768: the writer creates its output dir and allocates staging as a *sibling* of it,
+        // so the fixture points at an entry inside the guarded root, not at the root itself.
+        let dir = Fixture::new("mlx-llm-gguf-qk-stream-", Some("out"));
         let key = "model.layers.0.self_attn.q_proj.weight".to_string();
         crate::snapshot::write_streaming_snapshot(
             &dir,
@@ -524,7 +610,6 @@ mod tests {
         let stored = Array::load_safetensors(dir.join("model.safetensors")).unwrap();
         let expected: Vec<half::bf16> = hf.iter().copied().map(half::bf16::from_f32).collect();
         assert_eq!(stored[&key].as_slice::<half::bf16>(), expected);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -547,12 +632,7 @@ mod tests {
         );
         let key = "model.layers.0.self_attn.q_proj.weight";
         for spec in [QuantSpec::q4(), QuantSpec::q8()] {
-            let out = std::env::temp_dir().join(format!(
-                "mlx-llm-full-gguf-q{}-{}",
-                spec.bits,
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&out);
+            let out = Fixture::new(&format!("mlx-llm-full-gguf-q{}-", spec.bits), Some("out"));
             convert(
                 &gguf,
                 &out,
@@ -597,8 +677,14 @@ mod tests {
                     .unwrap();
             assert_eq!(config["hidden_size"], 64);
             assert_eq!(config["quantization"]["bits"], spec.bits);
-            std::fs::remove_dir_all(out).unwrap();
         }
+    }
+
+    /// Drop-regression for this suite's fixture helper: the root leaves with the value. Flip
+    /// [`Fixture::new`]'s builder to `disable_cleanup(true)` and this goes RED.
+    #[test]
+    fn convert_fixture_is_self_removing() {
+        assert_fixture_is_a_guarded_entry(Fixture::new("mlx-llm-gguf-qk-stream-", Some("out")));
     }
 
     #[test]

@@ -27,16 +27,18 @@ use candle_transformers::models::stable_diffusion::unet_2d_blocks::{
 /// One SDXL UNet stage: output channels, optional cross-attn (with its transformer-layer count), and
 /// the per-head channel count. Matches candle's `unet_2d::BlockConfig`.
 #[derive(Clone, Copy)]
-struct BlockConfig {
-    out_channels: usize,
+pub(crate) struct BlockConfig {
+    pub(crate) out_channels: usize,
     use_cross_attn: Option<usize>,
-    attention_head_dim: usize,
+    /// diffusers' SDXL `attention_head_dim` is the per-block **head count**, not the head width;
+    /// the per-head width is `out_channels / attention_head_dim`.
+    pub(crate) attention_head_dim: usize,
 }
 
 /// The canonical SDXL UNet shape (`stabilityai/stable-diffusion-xl-base-1.0/unet/config.json`), shared
 /// verbatim by Kolors. `cross_attention_dim = 2048` is the width the ChatGLM3 context is projected to.
-struct UNetShape {
-    blocks: [BlockConfig; 3],
+pub(crate) struct UNetShape {
+    pub(crate) blocks: [BlockConfig; 3],
     cross_attention_dim: usize,
     layers_per_block: usize,
     norm_num_groups: usize,
@@ -46,7 +48,7 @@ struct UNetShape {
 }
 
 impl UNetShape {
-    fn sdxl() -> Self {
+    pub(crate) fn sdxl() -> Self {
         let bc = |out_channels, use_cross_attn, attention_head_dim| BlockConfig {
             out_channels,
             use_cross_attn,

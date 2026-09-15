@@ -66,7 +66,11 @@ class MageEditVariantOracleTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def args(self, verify_only: bool = True) -> list[str]:
+    def args(
+        self,
+        verify_only: bool = True,
+        migrate_reference_environment_manifest_only: bool = False,
+    ) -> list[str]:
         args = [
             str(SCRIPT),
             "--gen",
@@ -82,6 +86,8 @@ class MageEditVariantOracleTests(unittest.TestCase):
         ]
         if verify_only:
             args.append("--verify-only")
+        if migrate_reference_environment_manifest_only:
+            args.append("--migrate-reference-environment-manifest-only")
         return args
 
     def manifest(self) -> dict:
@@ -105,8 +111,46 @@ class MageEditVariantOracleTests(unittest.TestCase):
             "reference": "microsoft/Mage frozen vendored reference",
             "device": "cpu",
             "generationSnapshotRevision": self.gen_revision,
+            "referenceEnvironment": dict(self.module.REFERENCE_PACKAGES),
             "files": records,
         }
+
+    def test_shared_reference_environment_is_exact_and_rejects_package_drift(self) -> None:
+        self.assertEqual(self.module.REFERENCE_PYTHON, (3, 12, 10))
+        self.assertEqual(
+            self.module.REFERENCE_PACKAGES,
+            {
+                "accelerate": "1.13.0",
+                "diffusers": "0.38.0",
+                "einops": "0.8.2",
+                "loguru": "0.7.3",
+                "numpy": "2.4.3",
+                "pillow": "12.3.0",
+                "pydantic": "2.12.5",
+                "safetensors": "0.8.0",
+                "torch": "2.13.0",
+                "torchvision": "0.28.0",
+                "transformers": "5.5.0",
+                "typing_extensions": "4.15.0",
+            },
+        )
+        validator_globals = self.module.validate_reference_environment.__globals__
+        metadata = validator_globals["importlib"].metadata
+        runtime = validator_globals["sys"]
+        with (
+            mock.patch.object(runtime, "version_info", self.module.REFERENCE_PYTHON),
+            mock.patch.object(
+                metadata,
+                "version",
+                side_effect=lambda package: (
+                    "0.0.0"
+                    if package == "transformers"
+                    else self.module.REFERENCE_PACKAGES[package]
+                ),
+            ),
+            self.assertRaisesRegex(RuntimeError, "transformers==0.0.0"),
+        ):
+            self.module.validate_reference_environment()
 
     def record(self, steps: int = 30, cfg: float = 5.0) -> dict:
         sigmas, timesteps = self.module.expected_schedule(steps)
@@ -159,6 +203,11 @@ class MageEditVariantOracleTests(unittest.TestCase):
         )
         with (
             mock.patch.object(sys, "argv", self.args()),
+            mock.patch.object(
+                self.module,
+                "validate_reference_environment",
+                side_effect=AssertionError("verify-only must be runtime-portable"),
+            ),
             mock.patch.object(self.module, "sha256", side_effect=lambda path: f"hash:{path.name}"),
             mock.patch.object(self.module, "validate") as validate,
             mock.patch.object(
@@ -181,6 +230,34 @@ class MageEditVariantOracleTests(unittest.TestCase):
                 for label, filename, steps, cfg in self.module.CASES
             ],
         )
+
+    def test_production_environment_failure_precedes_every_side_effect(self) -> None:
+        with (
+            mock.patch.object(sys, "argv", self.args(verify_only=False)),
+            mock.patch.object(
+                self.module,
+                "validate_reference_environment",
+                side_effect=RuntimeError("bad reference environment"),
+            ),
+            mock.patch.object(
+                Path, "mkdir", side_effect=AssertionError("must not mutate output")
+            ),
+            mock.patch.object(
+                Path, "write_text", side_effect=AssertionError("must not write manifest")
+            ),
+            mock.patch.object(
+                self.module.shutil,
+                "copy2",
+                side_effect=AssertionError("must not copy"),
+            ),
+            mock.patch.object(
+                self.module.subprocess,
+                "run",
+                side_effect=AssertionError("must not launch producer"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "bad reference environment"),
+        ):
+            self.module.main()
 
     def test_producer_environment_rejects_hostile_ambient_mage_inputs(self) -> None:
         hostile = {
@@ -218,6 +295,203 @@ class MageEditVariantOracleTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "manifest .* stale"),
         ):
             self.module.main()
+
+    def test_verify_only_rejects_reference_environment_drift(self) -> None:
+        manifest = self.manifest()
+        manifest["referenceEnvironment"]["torch"] = "2.12.0"
+        (self.output / "mage_edit_variants_manifest.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+        with (
+            mock.patch.object(sys, "argv", self.args()),
+            mock.patch.object(
+                self.module,
+                "validate_reference_environment",
+                side_effect=AssertionError("verify-only must not inspect its runtime"),
+            ),
+            mock.patch.object(
+                self.module,
+                "sha256",
+                side_effect=lambda path: f"hash:{path.name}",
+            ),
+            mock.patch.object(self.module, "validate"),
+            self.assertRaisesRegex(RuntimeError, "manifest .* stale"),
+        ):
+            self.module.main()
+
+    def test_manifest_only_migration_accepts_only_the_exact_legacy_manifest(self) -> None:
+        legacy = self.manifest()
+        del legacy["referenceEnvironment"]
+        manifest_path = self.output / "mage_edit_variants_manifest.json"
+        manifest_path.write_text(json.dumps(legacy, indent=2) + "\n", encoding="utf-8")
+        oracle_bytes = {
+            filename: (self.output / filename).read_bytes()
+            for _label, filename, _steps, _cfg in self.module.CASES
+        }
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                self.args(
+                    verify_only=False,
+                    migrate_reference_environment_manifest_only=True,
+                ),
+            ),
+            mock.patch.object(
+                self.module,
+                "validate_reference_environment",
+                side_effect=AssertionError("migration must be runtime-portable"),
+            ),
+            mock.patch.object(
+                self.module, "sha256", side_effect=lambda path: f"hash:{path.name}"
+            ),
+            mock.patch.object(self.module, "validate") as validate,
+            mock.patch.object(
+                self.module.subprocess,
+                "run",
+                side_effect=AssertionError("migration must not regenerate"),
+            ),
+            mock.patch.object(
+                self.module.shutil,
+                "copy2",
+                side_effect=AssertionError("migration must not replace an oracle"),
+            ),
+        ):
+            self.assertEqual(self.module.main(), 0)
+        self.assertEqual(
+            json.loads(manifest_path.read_text(encoding="utf-8")), self.manifest()
+        )
+        self.assertEqual(
+            {
+                filename: (self.output / filename).read_bytes()
+                for _label, filename, _steps, _cfg in self.module.CASES
+            },
+            oracle_bytes,
+        )
+        self.assertEqual(validate.call_count, len(self.module.CASES))
+
+    def test_manifest_only_migration_rejects_any_non_environment_drift_without_writing(
+        self,
+    ) -> None:
+        for field, replacement in (
+            ("sha256", "stale"),
+            ("snapshotRevision", "0" * 40),
+            ("cfg", 4.0),
+        ):
+            legacy = self.manifest()
+            del legacy["referenceEnvironment"]
+            legacy["files"][1][field] = replacement
+            manifest_path = self.output / "mage_edit_variants_manifest.json"
+            original = json.dumps(legacy, indent=2) + "\n"
+            manifest_path.write_text(original, encoding="utf-8")
+            with (
+                self.subTest(field=field),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    self.args(
+                        verify_only=False,
+                        migrate_reference_environment_manifest_only=True,
+                    ),
+                ),
+                mock.patch.object(
+                    self.module,
+                    "sha256",
+                    side_effect=lambda path: f"hash:{path.name}",
+                ),
+                mock.patch.object(self.module, "validate"),
+                self.assertRaisesRegex(RuntimeError, "migration refused"),
+            ):
+                self.module.main()
+            self.assertEqual(manifest_path.read_text(encoding="utf-8"), original)
+
+    def test_manifest_only_migration_never_masks_oracle_geometry_failure(self) -> None:
+        legacy = self.manifest()
+        del legacy["referenceEnvironment"]
+        manifest_path = self.output / "mage_edit_variants_manifest.json"
+        original = json.dumps(legacy, indent=2) + "\n"
+        manifest_path.write_text(original, encoding="utf-8")
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                self.args(
+                    verify_only=False,
+                    migrate_reference_environment_manifest_only=True,
+                ),
+            ),
+            mock.patch.object(
+                self.module, "sha256", side_effect=lambda path: f"hash:{path.name}"
+            ),
+            mock.patch.object(
+                self.module, "validate", side_effect=RuntimeError("geometry is stale")
+            ),
+            self.assertRaisesRegex(RuntimeError, "geometry is stale"),
+        ):
+            self.module.main()
+        self.assertEqual(manifest_path.read_text(encoding="utf-8"), original)
+
+    def test_manifest_only_migration_rejects_external_manifest_hard_link(self) -> None:
+        legacy = self.manifest()
+        del legacy["referenceEnvironment"]
+        original = json.dumps(legacy, indent=2) + "\n"
+        external = self.root / "persistent-seed-manifest.json"
+        external.write_text(original, encoding="utf-8")
+        manifest_path = self.output / "mage_edit_variants_manifest.json"
+        self.module.os.link(external, manifest_path)
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                self.args(
+                    verify_only=False,
+                    migrate_reference_environment_manifest_only=True,
+                ),
+            ),
+            mock.patch.object(
+                self.module, "sha256", side_effect=lambda path: f"hash:{path.name}"
+            ),
+            mock.patch.object(self.module, "validate"),
+            self.assertRaisesRegex(RuntimeError, "exactly one hard link"),
+        ):
+            self.module.main()
+        self.assertEqual(external.read_text(encoding="utf-8"), original)
+        self.assertEqual(manifest_path.read_text(encoding="utf-8"), original)
+
+    def test_manifest_only_migration_rejects_external_oracle_hard_link(self) -> None:
+        legacy = self.manifest()
+        del legacy["referenceEnvironment"]
+        manifest_path = self.output / "mage_edit_variants_manifest.json"
+        original_manifest = json.dumps(legacy, indent=2) + "\n"
+        manifest_path.write_text(original_manifest, encoding="utf-8")
+        filename = self.module.CASES[0][1]
+        oracle_path = self.output / filename
+        oracle_path.unlink()
+        external = self.root / "persistent-seed-oracle.safetensors"
+        original_oracle = filename.encode()
+        external.write_bytes(original_oracle)
+        self.module.os.link(external, oracle_path)
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                self.args(
+                    verify_only=False,
+                    migrate_reference_environment_manifest_only=True,
+                ),
+            ),
+            mock.patch.object(
+                self.module, "sha256", side_effect=lambda path: f"hash:{path.name}"
+            ),
+            mock.patch.object(self.module, "validate"),
+            self.assertRaisesRegex(RuntimeError, "exactly one hard link"),
+        ):
+            self.module.main()
+        self.assertEqual(external.read_bytes(), original_oracle)
+        self.assertEqual(oracle_path.read_bytes(), original_oracle)
+        self.assertEqual(
+            manifest_path.read_text(encoding="utf-8"), original_manifest
+        )
 
     def test_manifest_rejects_every_cross_type_numeric_alias(self) -> None:
         for _label, filename, _steps, _cfg in self.module.CASES:

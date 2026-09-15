@@ -716,6 +716,9 @@ pub fn apply_sdxl_adapters_with(
     let mut report = SdxlLoraReport::default();
     for spec in specs {
         let w = Weights::from_file(&spec.path)?;
+        // Adapter tensors are lazy too. Materialize their source payload before the prepared-file
+        // guard around the provider phase performs its post-read identity check.
+        w.materialize()?;
         // Third-party LyCORIS (sc-3671): `lokr_*` / `hada_*` keys without a `networkType=lokr` stamp,
         // so the caller can't label the kind — detect + route by keys before the kind match. (A peft
         // LoKr has the stamp and goes through the `Lokr` arm; `is_lokr_keys` excludes it via `is_lokr`.)

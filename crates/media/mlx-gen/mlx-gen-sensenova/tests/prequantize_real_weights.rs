@@ -15,7 +15,7 @@
 //!
 //! `#[ignore]`d — needs the real ~33 GB SenseNova-U1-8B-MoT snapshot. Run per tier:
 //!   SC8771_SRC=<snap> SC8771_BITS=4 \
-//!     cargo test -p mlx-gen-sensenova --release --test prequantize_real_weights -- --ignored --nocapture
+//!     cargo test -p mlx-gen-sensenova --release --test integration prequantize_real_weights:: -- --ignored --nocapture
 //!
 //! For `SC8771_MODEL=sensenova_u1_8b_fast` (sc-8775) the tier is built by
 //! [`mlx_gen_sensenova::convert::prequantize_fast_turnkey`], which pre-merges the 8-step distill LoRA
@@ -55,7 +55,7 @@ fn bits_env() -> i32 {
 /// is a verbatim mirror of the source; copy the shards + assets directly rather than running the
 /// packer. Run per tier:
 ///   SC8771_SRC=<snap> SC8771_OUT=<staging/q4> SC8771_BITS=4 \
-///     cargo test -p mlx-gen-sensenova --release --test prequantize_real_weights -- --ignored build_tier_only --nocapture
+///     cargo test -p mlx-gen-sensenova --release --test integration -- --ignored prequantize_real_weights::build_tier_only --nocapture
 #[test]
 #[ignore = "build-only tier producer for hosting; set SC8771_SRC/OUT/BITS"]
 fn build_tier_only() {

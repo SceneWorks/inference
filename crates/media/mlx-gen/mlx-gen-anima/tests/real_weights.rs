@@ -1,6 +1,6 @@
 //! Real-weights tests for mlx-gen-anima (sc-10515). `#[ignore]`d — they need the licensed
 //! `circlestone-labs/Anima` snapshot in the HF cache and Metal. Run with:
-//!   cargo test -p mlx-gen-anima --release --test real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-anima --release --test integration real_weights:: -- --ignored --nocapture
 //!
 //! The snapshot dir is resolved by glob (no hardcoded sha); PNG output goes to `$ANIMA_OUT`
 //! (default `/tmp/anima_sc10515`).

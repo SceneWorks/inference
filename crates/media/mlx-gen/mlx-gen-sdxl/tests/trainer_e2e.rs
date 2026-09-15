@@ -3,14 +3,14 @@
 //!
 //! `#[ignore]`d — needs the real `stabilityai/stable-diffusion-xl-base-1.0` snapshot in the HF cache
 //! (or `SDXL_SNAPSHOT`). Run:
-//!   cargo test -p mlx-gen-sdxl --release --test trainer_e2e -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sdxl --release --test integration trainer_e2e:: -- --ignored --nocapture
 //!
 //! Proves the full prepare→load→cache→train→save lifecycle: a tiny captioned PNG dataset is
 //! VAE/dual-CLIP-encoded and cached, AdamW training drives the epsilon flow down, and an adapter is
 //! written that reloads through the REAL SDXL inference path (`apply_sdxl_adapters[_with]`) onto a
 //! fresh U-Net — merging into every trained target and forwarding finite.
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 
@@ -41,6 +41,7 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
             image_path: path,
             caption: format!("a solid colour swatch number {i}"),
             control_image_path: None,
+            model_options: Default::default(),
         });
     }
     items
@@ -153,8 +154,8 @@ fn train_to(out_dir: &Path, cfg: TrainingConfig) -> PathBuf {
 #[test]
 #[ignore = "needs real SDXL weights; validates F-125 end-to-end resume"]
 fn sdxl_resume_matches_uninterrupted() {
-    let base = std::env::temp_dir().join("sdxl_resume_e2e");
-    let _ = std::fs::remove_dir_all(&base);
+    let base_tmp = tempfile::tempdir().unwrap();
+    let base = base_tmp.path().to_path_buf();
 
     let mk_cfg = |steps: u32, save_every: u32, resume: bool| TrainingConfig {
         rank: 4,
@@ -210,7 +211,8 @@ fn sdxl_resume_matches_uninterrupted() {
 #[test]
 #[ignore = "needs real SDXL weights"]
 fn sdxl_trainer_trains_and_writes_lora_that_reloads() {
-    let tmp = std::env::temp_dir().join("sdxl_trainer_lora_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let (_losses, _steps, adapter_path) = run(&tmp, "swatch_lora.safetensors", NetworkType::Lora);
 
     // The produced adapter carries PEFT keys under the SDXL prefix + reload metadata.
@@ -251,7 +253,8 @@ fn sdxl_trainer_trains_and_writes_lora_that_reloads() {
 #[test]
 #[ignore = "needs real SDXL weights"]
 fn sdxl_trainer_trains_and_writes_lokr_that_reloads() {
-    let tmp = std::env::temp_dir().join("sdxl_trainer_lokr_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let (_losses, _steps, adapter_path) = run(&tmp, "swatch_lokr.safetensors", NetworkType::Lokr);
 
     let w = Weights::from_file(&adapter_path).unwrap();
@@ -288,7 +291,8 @@ fn sdxl_trainer_trains_and_writes_lokr_that_reloads() {
 #[test]
 #[ignore = "needs real SDXL weights"]
 fn sdxl_trainer_gradient_checkpointing_converges() {
-    let tmp = std::env::temp_dir().join("sdxl_trainer_gc_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let (losses, steps, adapter_path) = run_cfg(
         &tmp,
         "swatch_lora_gc.safetensors",
@@ -346,11 +350,12 @@ fn forward_finite(unet: &mlx_gen_sdxl::UNet2DConditionModel) {
 /// `TrainingProgress::Sample` events at the cadence, each a real decoded RGB bitmap (SDXL renders
 /// previews with real CFG). Proves the SDXL render path (install in-progress adapter → CFG denoise →
 /// VAE decode → `Image`) on real weights. Run:
-///   cargo test -p mlx-gen-sdxl --release --test trainer_e2e -- --ignored --nocapture sdxl_trainer_emits_preview_samples
+///   cargo test -p mlx-gen-sdxl --release --test integration -- --ignored --nocapture trainer_e2e::sdxl_trainer_emits_preview_samples
 #[test]
 #[ignore = "needs real SDXL weights"]
 fn sdxl_trainer_emits_preview_samples() {
-    let tmp = std::env::temp_dir().join("sdxl_trainer_samples_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
     assert_eq!(mlx_gen_sdxl::MODEL_ID, "sdxl");
     let mut trainer = mlx_gen_sdxl::provider_registry()

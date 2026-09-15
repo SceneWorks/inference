@@ -14,10 +14,11 @@ use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, AdapterSpec, Capabilities,
     Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator,
     LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Residency,
-    Result, WeightsSource,
+    Result, WeightsSource, BASE_SNAPSHOT_COMPONENT, VAE_COMPONENT,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_qwen_image::pipeline::PID_BACKBONE;
+use mlx_gen_wan::OwnedWanSingleFrameDecoder;
 
 use mlx_rs::Array;
 use std::path::Path;
@@ -31,6 +32,222 @@ use crate::pipeline::{
 /// Registry id for the Krea 2 Turbo text-to-image variant. Matches the SceneWorks worker's
 /// `payload.model` and the manifest `engine_id` (sc-7572).
 pub const KREA_2_TURBO_ID: &str = "krea_2_turbo";
+
+/// Qwen3-VL-4B conditioning architecture shared by every Krea 2 route.
+pub const TOKENIZER_CONTRACT: mlx_gen::gen_core::EncoderTokenizerContract =
+    mlx_gen::gen_core::EncoderTokenizerContract {
+        family: "qwen3_vl",
+        binding: mlx_gen::gen_core::EncoderTokenizerBinding::RetainBase,
+        artifact_candidates: &["tokenizer/tokenizer.json"],
+        required_tokens: &[
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_endoftext",
+                literal: "<|endoftext|>",
+                id: 151_643,
+                config_field: Some("bos_token_id"),
+            },
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_im_start",
+                literal: "<|im_start|>",
+                id: 151_644,
+                config_field: None,
+            },
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_im_end",
+                literal: "<|im_end|>",
+                id: 151_645,
+                config_field: Some("eos_token_id"),
+            },
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_vision_start",
+                literal: "<|vision_start|>",
+                id: 151_652,
+                config_field: Some("vision_start_token_id"),
+            },
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_vision_end",
+                literal: "<|vision_end|>",
+                id: 151_653,
+                config_field: Some("vision_end_token_id"),
+            },
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_image_pad",
+                literal: "<|image_pad|>",
+                id: 151_655,
+                config_field: Some("image_token_id"),
+            },
+        ],
+    };
+/// The declared prompt executions — field for field identical to candle-gen-krea's
+/// `PROMPT_EXECUTIONS`, the sc-9047 fail-loud admission posture on both lanes.
+///
+/// The two `length` caps are spelled as literals rather than as
+/// [`crate::text_encoder::tokenizer::MAX_TEXT_TOKENS`] / `MAX_EDIT_TOKENS` because the cross-backend
+/// contract gate compares these declarations as source text and does not resolve an identifier
+/// through another module, so naming the constant here reads as a divergence from candle's literal.
+/// The literals cannot drift from what the tokenizer enforces:
+/// `tokenizer::tests::declared_length_policy_matches_the_enforced_caps` asserts they are equal.
+pub const PROMPT_EXECUTIONS: &[mlx_gen::gen_core::EncoderPromptExecutionContract] = &[
+    mlx_gen::gen_core::EncoderPromptExecutionContract {
+        purpose: "krea_t2i",
+        template: mlx_gen::gen_core::EncoderPromptTemplate::KreaQwen3Vl,
+        add_special_tokens: false,
+        length: mlx_gen::gen_core::EncoderPromptLengthPolicy::RejectAbove { max_tokens: 1024 },
+        padding: mlx_gen::gen_core::EncoderPromptPadding::None,
+        prefix_trim: 34,
+    },
+    mlx_gen::gen_core::EncoderPromptExecutionContract {
+        purpose: "krea_edit",
+        template: mlx_gen::gen_core::EncoderPromptTemplate::KreaQwen3VlEdit,
+        add_special_tokens: false,
+        length: mlx_gen::gen_core::EncoderPromptLengthPolicy::RejectAbove { max_tokens: 8192 },
+        padding: mlx_gen::gen_core::EncoderPromptPadding::None,
+        prefix_trim: 34,
+    },
+];
+
+pub const ENCODER_CONTRACT: mlx_gen::gen_core::EncoderContract =
+    mlx_gen::gen_core::EncoderContract {
+        architecture: "qwen3_vl_text",
+        hidden_size: 2560,
+        intermediate_size: 9728,
+        num_hidden_layers: 36,
+        num_attention_heads: 32,
+        num_key_value_heads: 8,
+        head_dim: 128,
+        vocab_size: 151_936,
+        output_width: 2560,
+        loaded_hidden_layers: 35,
+        requires_final_norm: false,
+        requires_lm_head: false,
+        hidden_activation: "silu",
+        attention_dropout: mlx_gen::gen_core::EncoderConfigFloat::new(0.0),
+        rms_norm_eps: mlx_gen::gen_core::EncoderConfigFloat::new(1e-6),
+        qk_norm_eps: Some(mlx_gen::gen_core::EncoderConfigFloat::new(1e-6)),
+        rope_theta: mlx_gen::gen_core::EncoderConfigFloat::new(5_000_000.0),
+        max_position_embeddings: 262_144,
+        attention_bias: mlx_gen::gen_core::EncoderConfigBool::Required(false),
+        tie_word_embeddings: mlx_gen::gen_core::EncoderConfigBool::Required(true),
+        tokenizer: TOKENIZER_CONTRACT,
+        prompt_executions: PROMPT_EXECUTIONS,
+        bos_token_id: Some(151_643),
+        eos_token_id: Some(151_645),
+        image_token_id: Some(151_655),
+        vision_start_token_id: Some(151_652),
+        vision_end_token_id: Some(151_653),
+        mrope_section: &[24, 20, 20],
+        mrope_interleaved: Some(true),
+        selected_hidden_layers: &[2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35],
+        packing: Some(mlx_gen::gen_core::EncoderPackingContract {
+            group_size: 64,
+            pack_embedding: false,
+            pack_lm_head: false,
+            supports_file: true,
+        }),
+        dense_storage_dtype_probe: None,
+    };
+
+pub const VISION_ENCODER_CONTRACT: mlx_gen::gen_core::VisionEncoderContract =
+    mlx_gen::gen_core::VisionEncoderContract {
+        architecture: mlx_gen::gen_core::VisionEncoderArchitecture::Qwen3Vl,
+        hidden_size: 1024,
+        intermediate_size: 4096,
+        num_hidden_layers: 24,
+        num_attention_heads: 16,
+        output_width: 2560,
+        hidden_activation: "gelu_pytorch_tanh",
+        rope_theta: mlx_gen::gen_core::EncoderConfigFloat::new(10_000.0),
+        normalization_eps: mlx_gen::gen_core::EncoderConfigFloat::new(1e-6),
+        patch_size: 16,
+        temporal_patch_size: 2,
+        spatial_merge_size: 2,
+        in_channels: 3,
+        num_position_embeddings: Some(2304),
+        deepstack_visual_indexes: &[5, 11, 17],
+        window_size: None,
+        full_attention_block_indexes: &[],
+    };
+
+/// Compact Qwen3-VL text geometry for unit tests that must exercise the real source validator and
+/// [`mlx_gen::ArtifactSeal`] without hashing the production checkpoint's multi-gigabyte sparse
+/// payload. Token IDs, vocabulary, multimodal RoPE, prompt/tokenizer policy, packing, and every
+/// other behavior-bearing field remain production-exact.
+#[cfg(test)]
+pub(crate) fn bounded_encoder_contract() -> mlx_gen::gen_core::EncoderContract {
+    mlx_gen::gen_core::EncoderContract {
+        hidden_size: 64,
+        intermediate_size: 128,
+        num_hidden_layers: 1,
+        num_attention_heads: 2,
+        num_key_value_heads: 1,
+        // The production multimodal RoPE partition sums to half this width.
+        head_dim: 128,
+        output_width: 64,
+        loaded_hidden_layers: 1,
+        max_position_embeddings: 512,
+        selected_hidden_layers: &[1],
+        ..ENCODER_CONTRACT
+    }
+}
+
+/// Compact Qwen3-VL vision geometry paired with [`bounded_encoder_contract`]. The deep-stack index
+/// is geometry-dependent, so the bounded contract retains the feature with its only valid layer.
+#[cfg(test)]
+pub(crate) fn bounded_vision_encoder_contract() -> mlx_gen::gen_core::VisionEncoderContract {
+    mlx_gen::gen_core::VisionEncoderContract {
+        hidden_size: 64,
+        intermediate_size: 128,
+        num_hidden_layers: 1,
+        num_attention_heads: 2,
+        output_width: 64,
+        num_position_embeddings: Some(16),
+        deepstack_visual_indexes: &[0],
+        ..VISION_ENCODER_CONTRACT
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static USE_BOUNDED_ENCODER_CONTRACTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Opt the current unit-test thread into compact real-validator fixtures. Rust's test harness runs
+/// each test on its own thread, so the selection cannot leak into explicitly run ignored real-weight
+/// tests; those keep the production contract by default.
+#[cfg(test)]
+pub(crate) fn test_encoder_contract() -> mlx_gen::gen_core::EncoderContract {
+    USE_BOUNDED_ENCODER_CONTRACTS.with(|enabled| enabled.set(true));
+    bounded_encoder_contract()
+}
+
+#[cfg(test)]
+pub(crate) fn test_vision_encoder_contract() -> mlx_gen::gen_core::VisionEncoderContract {
+    USE_BOUNDED_ENCODER_CONTRACTS.with(|enabled| enabled.set(true));
+    bounded_vision_encoder_contract()
+}
+
+/// Contract used by the runtime path. Production and real-weight tests use the public production
+/// descriptor. Default unit tests opt into behavior-equivalent bounded geometry only when they
+/// deliberately create one of the compact fixtures above.
+pub(crate) fn runtime_encoder_contract() -> mlx_gen::gen_core::EncoderContract {
+    #[cfg(test)]
+    {
+        if USE_BOUNDED_ENCODER_CONTRACTS.with(std::cell::Cell::get) {
+            return bounded_encoder_contract();
+        }
+    }
+    ENCODER_CONTRACT
+}
+
+pub(crate) fn runtime_vision_encoder_contract() -> mlx_gen::gen_core::VisionEncoderContract {
+    #[cfg(test)]
+    {
+        if USE_BOUNDED_ENCODER_CONTRACTS.with(std::cell::Cell::get) {
+            return bounded_vision_encoder_contract();
+        }
+    }
+    VISION_ENCODER_CONTRACT
+}
 
 /// Max images per request (the image-model standard, shared with the other MLX families).
 const MAX_COUNT: u32 = 8;
@@ -92,16 +309,17 @@ pub const KREA_2_TURBO_EDIT_ID: &str = "krea_2_turbo_edit";
 /// no user negative prompt, no img2img/control conditioning on the Turbo checkpoint.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: Some(ENCODER_CONTRACT),
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
+        control_kinds: None,
         required_components: &[],
         id: KREA_2_TURBO_ID,
         family: "krea_2",
         backend: "mlx",
         modality: Modality::Image,
         capabilities: Capabilities {
-            supports_negative_prompt: false,
             // CFG-free distilled student (like Ideogram Turbo / Boogu Turbo / SDXL-Lightning).
             supports_guidance: false,
-            supports_true_cfg: false,
             // Reference-image conditioning = img2img latent-init (epic 8588 slice A, sc-10135): a single
             // `Conditioning::Reference { image, strength }` seeds the denoise from the VAE-encoded
             // reference (see [`generate_impl`] → `generate_turbo_img2img_with_progress`). Turbo only; the
@@ -119,7 +337,6 @@ pub fn descriptor() -> ModelDescriptor {
             // point. The native distilled loop stays the byte-exact default (`req.sampler == None`).
             samplers: curated_sampler_names(),
             schedulers: curated_scheduler_names(),
-            supported_guidance_methods: vec![],
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
@@ -127,21 +344,10 @@ pub fn descriptor() -> ModelDescriptor {
             // The turnkey ships pre-packed Q8/Q4 ([`crate::convert::assemble_quantized_snapshot`]);
             // load-time quantize over a dense bf16 build is a no-op on an already-packed snapshot.
             supported_quants: &[Quant::Q4, Quant::Q8],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
             supports_sequential_offload: true,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            supports_preview: true,
+            ..Default::default()
         },
     }
 }
@@ -214,6 +420,13 @@ pub fn turbo_edit_descriptor() -> ModelDescriptor {
 /// Raw = full-CFG undistilled; edit = the Raw pipeline routed to the Kontext edit entrypoint).
 pub struct Krea {
     descriptor: ModelDescriptor,
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
+    precision: Precision,
+    quant: Option<Quant>,
+    streamable_transformer: bool,
+    /// The constructor-time pin for an imported File route. Sequential/lazy loader closures retain a
+    /// clone of this same identity; keeping it on the generator makes that lifetime explicit.
+    _native_dit: Option<mlx_gen::PinnedWeightsFile>,
     /// Component-residency strategy (epic 10834 Phase 1, sc-11101; hoisted to the shared seam in
     /// sc-11125), selected from [`LoadSpec::offload_policy`]. `Resident` (default) holds the Qwen3-VL-4B
     /// text phase + DiT + VAE warm for the whole job and across jobs; `Sequential` holds only the
@@ -238,6 +451,10 @@ pub struct Krea {
     /// phase would silently carry the diff-patch. Multi-phase is therefore rejected loudly on such a
     /// model (low-rank LoRA/LoKr — including the turbo LoRA — toggle cleanly and are unaffected).
     has_diff_patch: bool,
+    /// Caller-prepared identities retained for any adapter files reopened by multi-phase generation.
+    /// Primary/PiD deferred loaders keep their exact tokens too; retaining the complete spec makes
+    /// every later path lookup use the same cache-identity contract.
+    file_pin_spec: LoadSpec,
 }
 
 /// The heavy render-phase components (the single-stream DiT + VAE, via [`KreaHeavy`], plus the optional
@@ -249,6 +466,9 @@ pub(crate) struct KreaHeavyOwned {
     /// reuses the Qwen-Image latent space, so it shares the `qwenimage` PiD student. `req.use_pid`
     /// routes decode through it instead of the VAE. `None` for the plain VAE path.
     pid: Option<PidEngine>,
+    /// Experimental load-time VAE override. This is mutually exclusive with PiD and exists only
+    /// for the explicitly compatible z16 Krea variants advertised by gen-core.
+    alternate_decoder: Option<OwnedWanSingleFrameDecoder>,
 }
 
 /// A borrow of the heavy render-phase components, so the denoise/decode dispatch runs identically
@@ -256,6 +476,7 @@ pub(crate) struct KreaHeavyOwned {
 struct KreaHeavyRef<'a> {
     heavy: &'a KreaHeavy,
     pid: Option<&'a PidEngine>,
+    alternate_decoder: Option<&'a OwnedWanSingleFrameDecoder>,
 }
 
 impl KreaHeavyOwned {
@@ -263,6 +484,7 @@ impl KreaHeavyOwned {
         KreaHeavyRef {
             heavy: &self.heavy,
             pid: self.pid.as_ref(),
+            alternate_decoder: self.alternate_decoder.as_ref(),
         }
     }
 }
@@ -334,54 +556,48 @@ pub fn load_turbo_edit(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// typed error on any adapter target that matches no module, never a silent drop). The t2i/img2img callers
 /// pass `&[]`, whose dense-bf16 native-key load is byte-identical to before this parameter existed.
 ///
-/// Supports dense bf16 and descriptor-validated, non-rotated int8-per-row single files. `Sequential`
-/// offload is not yet threaded (the single-file DiT has no snapshot dir to re-load from) — a follow-on.
+/// Supports dense bf16 and descriptor-validated, non-rotated int8-per-row single files. This legacy
+/// signature is now only a `LoadSpec` construction shim; registry and direct callers share exactly the
+/// same validation, adapter folding, pinned-file streaming, and generator assembly path.
 pub fn load_from_native_dit_file(
     dit_file: impl AsRef<Path>,
     base_snapshot_dir: impl AsRef<Path>,
     adapters: &[AdapterSpec],
     descriptor: ModelDescriptor,
 ) -> Result<Box<dyn Generator>> {
-    Ok(Box::new(build_native_krea(
-        dit_file,
-        base_snapshot_dir,
-        adapters,
-        descriptor,
-    )?))
+    let dit_file = dit_file.as_ref();
+    let base_snapshot_dir = base_snapshot_dir.as_ref();
+    let mut spec = LoadSpec::new(WeightsSource::File(dit_file.to_path_buf()))
+        .with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(base_snapshot_dir.to_path_buf()),
+        )
+        .with_adapters(adapters.to_vec());
+    spec.prepare_file_sources()?;
+    load_variant(&spec, descriptor)
 }
 
 /// The concrete-[`Krea`] assembly behind [`load_from_native_dit_file`] (which boxes the result). Returning
 /// the concrete type lets the real-weight harness assert the installed `adapters` / `has_diff_patch`
 /// fields — a `Box<dyn Generator>` could not be inspected. See [`load_from_native_dit_file`] for the full
 /// contract; this carries the adapter-fold ordering.
+#[cfg(test)]
 pub(crate) fn build_native_krea(
     dit_file: impl AsRef<Path>,
     base_snapshot_dir: impl AsRef<Path>,
     adapters: &[AdapterSpec],
     descriptor: ModelDescriptor,
 ) -> Result<Krea> {
-    let base = base_snapshot_dir.as_ref();
-    // Architecture config from the resident turnkey (the single file ships no config.json); the
-    // community merge shares the published Krea 2 architecture exactly.
-    let cfg = crate::config::Krea2Config::from_snapshot(base)?;
-    let dit = crate::loader::load_transformer_from_native_file(dit_file.as_ref(), &cfg)?;
-    let vae = crate::vae::load_vae(base)?;
-    let mut heavy = KreaHeavy::from_parts(dit, vae);
-    // Install any Raw-trained LoRA/LoKr adapters onto the single-file DiT BEFORE residency is finalized,
-    // mirroring the snapshot path's load→apply order (`load_krea_heavy`). The shared seam errors (never
-    // silently drops) on an adapter target that matches no module, so a bad adapter fails the load loudly.
-    // An empty slice leaves the dense-bf16 native load byte-identical to the pre-adapter behavior.
-    if !adapters.is_empty() {
-        heavy.apply_adapters(adapters)?;
-    }
-    let text = KreaText::from_snapshot(base)?;
-    let residency = Residency::resident(text, KreaHeavyOwned { heavy, pid: None });
-    Ok(Krea {
-        descriptor,
-        residency,
-        adapters: adapters.to_vec(),
-        has_diff_patch: adapters_have_diff_patch(adapters),
-    })
+    let dit_file = dit_file.as_ref();
+    let base_snapshot_dir = base_snapshot_dir.as_ref();
+    let mut spec = LoadSpec::new(WeightsSource::File(dit_file.to_path_buf()))
+        .with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(base_snapshot_dir.to_path_buf()),
+        )
+        .with_adapters(adapters.to_vec());
+    spec.prepare_file_sources()?;
+    build_native_krea_from_spec(&spec, descriptor)
 }
 
 /// Shared loader behind [`load`] / [`load_raw`] / [`load_edit`]: build the residency from a snapshot
@@ -391,13 +607,202 @@ pub(crate) fn build_native_krea(
 /// ([`load_krea_text`] / [`load_krea_heavy`]), so the components are byte-identical. `descriptor`
 /// selects the variant (Turbo vs Raw vs edit) the returned [`Krea`] renders.
 fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn Generator>> {
-    let residency = build_residency(spec, descriptor.id)?;
+    spec.validate_prepared_file_pins()?;
+    validate_base_krea_load_axes(spec, descriptor.id)?;
+    mlx_gen_wan::validate_selected_single_frame_decoder(spec, &descriptor)?;
+    if matches!(spec.weights, WeightsSource::File(_)) {
+        return Ok(Box::new(build_native_krea_from_spec(spec, descriptor)?));
+    }
+    let (memory_strategy, load_plan) =
+        crate::block_memory_strategy::memory_strategy_contract_with_plan(descriptor.id, spec)?;
+    let residency = build_residency(spec, descriptor.id, load_plan)?;
     Ok(Box::new(Krea {
         descriptor,
+        memory_strategy,
+        precision: spec.precision,
+        quant: load_plan.effective_quant,
+        streamable_transformer: load_plan.streamable_transformer,
+        _native_dit: None,
         residency,
         adapters: spec.adapters.clone(),
-        has_diff_patch: adapters_have_diff_patch(&spec.adapters),
+        has_diff_patch: adapters_have_diff_patch_for_spec(spec)?,
+        file_pin_spec: spec.clone(),
     }))
+}
+
+pub(crate) fn validate_base_krea_load_axes(spec: &LoadSpec, provider_id: &str) -> Result<()> {
+    let allowed_components: &[&str] = if matches!(spec.weights, WeightsSource::File(_)) {
+        &[BASE_SNAPSHOT_COMPONENT, VAE_COMPONENT]
+    } else {
+        &[VAE_COMPONENT]
+    };
+    mlx_gen::gen_core::reject_unknown_components(spec, allowed_components, provider_id)?;
+    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
+        return Err(Error::Unsupported(format!(
+            "{provider_id}: the base Krea provider does not accept control/IP-adapter overlays"
+        )));
+    }
+    if spec.identity.is_some() {
+        return Err(Error::Unsupported(format!(
+            "{provider_id}: the base Krea provider does not accept identity fields"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_native_krea_spec(spec: &LoadSpec, provider_id: &str) -> Result<()> {
+    validate_base_krea_load_axes(spec, provider_id)?;
+    mlx_gen_wan::validate_selected_single_frame_decoder(spec, &descriptor_for_id(provider_id))?;
+    if spec.precision != Precision::Bf16 {
+        return Err(Error::Msg(format!(
+            "{}: only the default dense precision is wired (drop the precision override)",
+            provider_id
+        )));
+    }
+    let _ = mlx_gen::gen_core::require_base_snapshot(spec, provider_id)?;
+    Ok(())
+}
+
+fn build_native_krea_from_spec(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Krea> {
+    validate_native_krea_spec(spec, descriptor.id)?;
+    let base = mlx_gen::gen_core::require_base_snapshot(spec, descriptor.id)?;
+    let WeightsSource::File(_) = &spec.weights else {
+        unreachable!("native builder is called only for File weights")
+    };
+    let native_dit = spec
+        .weights_file_pin()?
+        .expect("File weights must resolve to a pin");
+    let mut pinned_spec = spec.clone();
+    pinned_spec.weights = WeightsSource::File(native_dit.loader_path().to_path_buf());
+    // Physical execution eligibility is intentionally independent from public evidence. An explicit
+    // Sequential + Deferred File request can use the retained pin to reopen one transformer block at
+    // a time, while the contract below continues to report rung 4 as Missing until File-specific
+    // measurements are promoted.
+    let reopenable = native_file_streamable(spec)?;
+    let memory_strategy = native_dit.read_unchanged(|_| {
+        crate::block_memory_strategy::native_memory_strategy_contract_from_spec(
+            descriptor.id,
+            &pinned_spec,
+            base,
+            false,
+        )
+        .map_err(Error::from)
+    })?;
+    let text_base = base.to_path_buf();
+    let text_encoder_source = runtime_encoder_contract().source_for_load(spec, base)?;
+    let expected_text_encoder_bits = native_text_encoder_expected_quant_bits(base)?;
+    let text_encoder_load_time_quant_bits =
+        text_encoder_source.load_time_quant_bits(expected_text_encoder_bits, descriptor.id)?;
+    let heavy_base = base.to_path_buf();
+    let heavy_dit = native_dit.clone();
+    let heavy_spec = spec.clone();
+    let heavy_id = descriptor.id;
+    let residency = Residency::from_policy(
+        spec.offload_policy,
+        move || {
+            load_krea_text_resolved(
+                &text_base,
+                &text_encoder_source,
+                text_encoder_load_time_quant_bits,
+            )
+        },
+        move |load_pid| {
+            load_native_krea_heavy(
+                &heavy_spec,
+                &heavy_base,
+                &heavy_dit,
+                reopenable,
+                load_pid,
+                heavy_id,
+            )
+        },
+    )?;
+    Ok(Krea {
+        descriptor,
+        memory_strategy,
+        precision: spec.precision,
+        quant: spec.quantize,
+        streamable_transformer: reopenable,
+        _native_dit: Some(native_dit),
+        residency,
+        adapters: spec.adapters.clone(),
+        has_diff_patch: adapters_have_diff_patch_for_spec(spec)?,
+        file_pin_spec: spec.clone(),
+    })
+}
+
+/// Whether a registered primary-File provider can physically execute bounded transformer residency.
+///
+/// This is an execution predicate, not an evidence claim: File contracts deliberately keep rung 4
+/// `Missing`. Low-rank adapters are replayed by [`crate::block_stream::KreaBlockStream`], while a
+/// dense diff-patch is excluded because it irreversibly mutates the eager base and cannot be rebuilt
+/// from a pristine per-window reopen. Header inspection runs beneath the caller-prepared File tokens.
+pub(crate) fn native_file_streamable(spec: &LoadSpec) -> Result<bool> {
+    if !matches!(spec.weights, WeightsSource::File(_)) {
+        return Ok(false);
+    }
+    Ok(matches!(
+        spec.offload_policy,
+        mlx_gen::gen_core::OffloadPolicy::Sequential
+    ) && matches!(
+        spec.load_shape,
+        mlx_gen::gen_core::LoadShape::DeferredMaterialization
+    ) && spec.quantize.is_none()
+        && !adapters_have_diff_patch_for_spec(spec)?)
+}
+
+fn load_native_krea_heavy(
+    spec: &LoadSpec,
+    base: &Path,
+    dit_file: &mlx_gen::PinnedWeightsFile,
+    streamable: bool,
+    load_pid: bool,
+    id: &'static str,
+) -> Result<KreaHeavyOwned> {
+    let cfg = crate::config::Krea2Config::from_snapshot(base)?;
+    let dit = if let Some(quant) = spec.quantize {
+        crate::loader::load_transformer_from_pinned_native_file_bounded(dit_file, &cfg, |dit| {
+            if !spec.adapters.is_empty() {
+                spec.read_files_unchanged(
+                    spec.adapters.iter().map(|adapter| &adapter.path),
+                    || dit.apply_adapters_strict(&spec.adapters, true),
+                )?;
+            }
+            dit.quantize(quant.bits())
+        })?
+    } else {
+        crate::loader::load_transformer_from_pinned_native_file_with_stream(
+            dit_file, &cfg, streamable,
+        )?
+    };
+    let vae = crate::vae::load_vae(base)?;
+    let mut heavy = KreaHeavy::from_parts(dit, vae);
+    if spec.quantize.is_none() && !spec.adapters.is_empty() {
+        spec.read_files_unchanged(spec.adapters.iter().map(|adapter| &adapter.path), || {
+            heavy.apply_adapters(&spec.adapters)
+        })?;
+    }
+    let pid = load_pid
+        .then(|| load_prepared_pid(spec))
+        .transpose()?
+        .flatten();
+    let alternate_decoder =
+        mlx_gen_wan::load_selected_single_frame_decoder(spec, &descriptor_for_id(id))?;
+    Ok(KreaHeavyOwned {
+        heavy,
+        pid,
+        alternate_decoder,
+    })
+}
+
+fn descriptor_for_id(id: &str) -> ModelDescriptor {
+    match id {
+        KREA_2_TURBO_ID => descriptor(),
+        KREA_2_RAW_ID => raw_descriptor(),
+        KREA_2_EDIT_ID => edit_descriptor(),
+        KREA_2_TURBO_EDIT_ID => turbo_edit_descriptor(),
+        _ => unreachable!("Krea loader called with unregistered descriptor id {id}"),
+    }
 }
 
 /// Detect whether any load-time adapter is a ComfyUI/lightx2v **diff-patch** (`.diff`/`.diff_b`), read
@@ -405,12 +810,69 @@ fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn 
 /// input. Best-effort: a header we cannot read yields `false` here, but the same file is read for real
 /// by the load-time [`KreaHeavy::apply_adapters`], which surfaces the genuine error loudly — so an
 /// unreadable file never silently slips a diff-patch through into a wrong multi-phase render.
-fn adapters_have_diff_patch(specs: &[AdapterSpec]) -> bool {
+pub(crate) fn adapters_have_diff_patch(specs: &[AdapterSpec]) -> bool {
     specs.iter().any(|spec| {
         mlx_gen::gen_core::weightsmeta::CheckpointMeta::from_file(&spec.path)
             .map(|meta| mlx_gen::adapters::loader::has_diff_patch_key_names(meta.keys()))
             .unwrap_or(false)
     })
+}
+
+/// Prepared-token wrapper for [`adapters_have_diff_patch`]. The header classification influences
+/// multi-phase safety, so it must inspect the same adapter identities the cache key and merge use.
+pub(crate) fn adapters_have_diff_patch_for_spec(spec: &LoadSpec) -> Result<bool> {
+    spec.read_prepared_files_unchanged(|| Ok(adapters_have_diff_patch(&spec.adapters)))
+}
+
+/// Load PiD beneath the same caller-prepared File tokens used for request cache identity.
+///
+/// Today the checkpoint is normally a File and Gemma is normally a Dir, but guarding both declared
+/// sources keeps this correct for any accepted File-shaped compatibility input. The outer pre/post
+/// checks also span the provider's lazy tensor materialization.
+fn load_prepared_pid(spec: &LoadSpec) -> Result<Option<PidEngine>> {
+    let Some(pid) = &spec.pid else {
+        return Ok(None);
+    };
+    let file_paths = [&pid.checkpoint, &pid.gemma]
+        .into_iter()
+        .filter_map(|source| match source {
+            WeightsSource::File(path) => Some(path.as_path()),
+            WeightsSource::Dir(_) => None,
+        });
+    spec.read_files_unchanged(file_paths, || PidEngine::from_spec(pid, PID_BACKBONE))
+        .map(Some)
+}
+
+pub(crate) fn resolve_transformer_window(
+    req: &GenerationRequest,
+    streamable: bool,
+) -> Result<Option<usize>> {
+    let Some(memory) = req.memory.filter(|memory| memory.stream_transformer_blocks) else {
+        return Ok(None);
+    };
+    let component = memory.transformer_window_component.unwrap_or_default();
+    if component != mlx_gen::gen_core::TransformerComponent::Dit {
+        return Err(Error::Unsupported(format!(
+            "krea: rung 4 implements the DiT component only; requested {component:?}"
+        )));
+    }
+    if !streamable {
+        return Err(Error::Unsupported(
+            "krea: bounded transformer residency requires a Sequential, deferred-materialization, \
+             re-openable snapshot load without a dense diff-patch adapter"
+                .to_owned(),
+        ));
+    }
+    let window = memory
+        .transformer_window_size
+        .unwrap_or(crate::block_memory_strategy::TRANSFORMER_WINDOW_SIZE);
+    if window != crate::block_memory_strategy::TRANSFORMER_WINDOW_SIZE {
+        return Err(Error::Unsupported(format!(
+            "krea: transformer_window_size={window} is outside the measured domain {:?}",
+            [crate::block_memory_strategy::TRANSFORMER_WINDOW_SIZE]
+        )));
+    }
+    Ok(Some(window as usize))
 }
 
 /// The policy→[`Residency`] dispatch every Krea variant shares (sc-11101; routed through the single
@@ -426,15 +888,33 @@ fn adapters_have_diff_patch(specs: &[AdapterSpec]) -> bool {
 pub(crate) fn build_residency(
     spec: &LoadSpec,
     id: &'static str,
+    load_plan: ResolvedLoadPlan,
 ) -> Result<Residency<KreaText, KreaHeavyOwned>> {
     // Up-front fail-fast for both policies (precision override + single-file rejection).
-    let _ = resolve_root(spec, id)?;
-    let spec_text = spec.clone();
+    let root = resolve_root(spec, id)?;
+    let text_encoder_source = runtime_encoder_contract().source_for_load(spec, root)?;
+    let text_encoder_load_time_quant_bits =
+        text_encoder_source.load_time_quant_bits(load_plan.effective_quant.map(Quant::bits), id)?;
+    let text_root = root.to_path_buf();
     let spec_heavy = spec.clone();
     Residency::from_policy(
         spec.offload_policy,
-        move || load_krea_text(&spec_text, resolve_root(&spec_text, id)?, id),
-        move |use_pid| load_krea_heavy(&spec_heavy, resolve_root(&spec_heavy, id)?, id, use_pid),
+        move || {
+            load_krea_text_resolved(
+                &text_root,
+                &text_encoder_source,
+                text_encoder_load_time_quant_bits,
+            )
+        },
+        move |use_pid| {
+            load_krea_heavy(
+                &spec_heavy,
+                resolve_root(&spec_heavy, id)?,
+                use_pid,
+                load_plan,
+                id,
+            )
+        },
     )
 }
 
@@ -447,13 +927,7 @@ fn resolve_root<'a>(spec: &'a LoadSpec, id: &str) -> Result<&'a Path> {
             "{id}: only the default dense precision is wired (drop the precision override)"
         )));
     }
-    match &spec.weights {
-        WeightsSource::Dir(p) => Ok(p),
-        WeightsSource::File(_) => Err(Error::Msg(format!(
-            "{id} expects a snapshot directory (transformer/ text_encoder/ vae/), not a single \
-             .safetensors file"
-        ))),
-    }
+    mlx_gen::gen_core::require_base_snapshot(spec, id).map_err(Into::into)
 }
 
 /// Resolve the load-time quantize for a component (F-076). Returns `Some(bits)` to quantize the dense
@@ -461,15 +935,84 @@ fn resolve_root<'a>(spec: &'a LoadSpec, id: &str) -> Result<&'a Path> {
 /// bits (`quantize()` would be a no-op). Errors on a packed-vs-requested mismatch so e.g. Q4 over a Q8
 /// turnkey never silently serves Q8. Shared by the text + heavy loaders (the marker in
 /// `transformer/config.json` is model-wide), so both phases decide identically.
-pub(crate) fn load_time_quant_bits(spec: &LoadSpec, root: &Path, id: &str) -> Result<Option<i32>> {
-    let Some(q) = spec.quantize else {
-        return Ok(None);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedLoadPlan {
+    pub(crate) load_time_quant_bits: Option<i32>,
+    pub(crate) effective_quant: Option<Quant>,
+    pub(crate) streamable_transformer: bool,
+}
+
+pub(crate) fn resolve_load_plan(
+    spec: &LoadSpec,
+    root: &Path,
+    id: &str,
+) -> Result<ResolvedLoadPlan> {
+    resolve_load_plan_for_component(
+        spec,
+        root,
+        id,
+        matches!(spec.weights, WeightsSource::File(_)),
+    )
+}
+
+/// Resolve the quantization carried by `root`. For an imported primary File, the base snapshot's
+/// text tower is only a companion component: it may be prepacked even though the File DiT carries
+/// its own numeric format. Callers loading that text-only component set `primary_file_rules=false`;
+/// primary-DiT admission retains the mismatch refusal.
+pub(crate) fn resolve_load_plan_for_component(
+    spec: &LoadSpec,
+    root: &Path,
+    id: &str,
+    primary_file_rules: bool,
+) -> Result<ResolvedLoadPlan> {
+    // Parse the marker even without a quantization override. Contract construction, admission, and
+    // loading must all reject the same malformed/unreadable packed snapshot instead of letting rung 4
+    // advertise a source the generator cannot subsequently load.
+    let packed_bits = mlx_gen::quant::packed_quant_bits(root, "transformer")?;
+    let requested_bits = match spec.quantize {
+        Some(quant @ (Quant::Q4 | Quant::Q8)) => Some(quant.bits()),
+        Some(quant) => {
+            return Err(Error::Unsupported(format!(
+                "{id}: unsupported MLX quantization tier {quant:?}; expected Q4 or Q8"
+            )))
+        }
+        None => None,
     };
-    if mlx_gen::quant::needs_load_time_quant(root, "transformer", q.bits(), id)? {
-        Ok(Some(q.bits()))
-    } else {
-        Ok(None)
+    if let (true, Some(packed), None) = (primary_file_rules, packed_bits, requested_bits) {
+        return Err(Error::Msg(format!(
+            "{id}: imported single-file weights have no quant request, but the companion snapshot is pre-quantized Q{}; request the matching tier or stage a dense companion snapshot",
+            packed
+        )));
     }
+    if let (Some(packed), Some(requested)) = (packed_bits, requested_bits) {
+        if packed != requested {
+            return Err(Error::Msg(format!(
+                "{id}: transformer/ is a pre-quantized Q{packed} turnkey but Q{requested} was \
+                 requested; quantize is a no-op on packed weights so the request would silently \
+                 serve Q{packed}. Point at a Q{requested} snapshot (or a dense one)."
+            )));
+        }
+    }
+    let load_time_quant_bits = packed_bits.is_none().then_some(requested_bits).flatten();
+    let effective_bits = packed_bits.or(load_time_quant_bits);
+    let effective_quant = effective_bits
+        .map(|bits| {
+            crate::memory::tier_from_bits(bits).ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "{id}: transformer declares unsupported packed quantization width {bits}"
+                ))
+            })
+        })
+        .transpose()?;
+    Ok(ResolvedLoadPlan {
+        load_time_quant_bits,
+        effective_quant,
+        streamable_transformer: false,
+    })
+}
+
+pub(crate) fn load_time_quant_bits(spec: &LoadSpec, root: &Path, id: &str) -> Result<Option<i32>> {
+    Ok(resolve_load_plan(spec, root, id)?.load_time_quant_bits)
 }
 
 /// The base DiT's **effective** quant bits for the pose-control branch gate (sc-11748): the tier the base
@@ -483,14 +1026,54 @@ pub(crate) fn effective_base_quant_bits(
     root: &Path,
     id: &str,
 ) -> Result<Option<i32>> {
-    if let Some(packed) = mlx_gen::quant::packed_quant_bits(root, "transformer")? {
-        // Pre-packed turnkey: run load_time_quant_bits for its packed-vs-requested mismatch guard (e.g. a
-        // Q4 request over a Q8 turnkey), then report the on-disk tier (load_time_quant_bits itself
-        // returns None here).
-        load_time_quant_bits(spec, root, id)?;
-        return Ok(Some(packed));
-    }
-    load_time_quant_bits(spec, root, id)
+    Ok(resolve_load_plan(spec, root, id)?
+        .effective_quant
+        .map(Quant::bits))
+}
+
+/// Resolve the tier the base transformer actually uses. Unlike `LoadSpec::quantize`, this observes a
+/// pre-packed turnkey's on-disk marker and therefore remains correct when the worker selects Q4/Q8 by
+/// choosing a tier-specific snapshot without requesting an in-place quantization pass.
+pub(crate) fn effective_base_quant_tier(spec: &LoadSpec, id: &str) -> Result<Option<Quant>> {
+    let root = resolve_root(spec, id)?;
+    Ok(resolve_load_plan(spec, root, id)?.effective_quant)
+}
+
+/// Project the exact language tensors retained from a validated encoder source using the same
+/// effective numeric policy as [`load_krea_text_resolved`]. A dense alternate inherits the base
+/// transformer's Q4/Q8 tier, a matching packed alternate keeps its stored affine triples, and a
+/// packed mismatch fails before memory admission can authorize a load the runtime rejects.
+pub(crate) fn selected_language_resident_bytes(
+    source: &mlx_gen::gen_core::ValidatedEncoderSource,
+    expected_bits: Option<i32>,
+    provider_id: &str,
+) -> mlx_gen::gen_core::Result<u64> {
+    let load_time_quant_bits = source.load_time_quant_bits(expected_bits, provider_id)?;
+    let headers = source.materialized_language_tensor_headers(&runtime_encoder_contract())?;
+    mlx_gen::asset_facts::projected_tensor_headers_bytes(&headers, |tensor| {
+        if let Some(bits) = load_time_quant_bits
+            .filter(|_| crate::convert::is_text_encoder_quant_target(&tensor.name))
+        {
+            mlx_gen::asset_facts::ResidentProjection::GroupQuantized {
+                bits,
+                group_size: crate::quant::GROUP_SIZE as usize,
+            }
+        } else {
+            mlx_gen::asset_facts::ResidentProjection::Stored
+        }
+    })
+}
+
+/// The text-encoder policy retained by an imported native-DiT composition. Native Krea files are
+/// materialized dense independently of the borrowed snapshot, while the runtime deliberately keeps
+/// the borrowed snapshot's language tier. Keep that File-specific policy in one seam shared by load
+/// and admission rather than attempting to infer it from the imported DiT's storage descriptor.
+pub(crate) fn native_text_encoder_expected_quant_bits(
+    base_snapshot_dir: &Path,
+) -> mlx_gen::gen_core::Result<Option<i32>> {
+    mlx_gen::gen_core::text_encoder_packed_quant_bits(&WeightsSource::Dir(
+        base_snapshot_dir.join("text_encoder"),
+    ))
 }
 
 /// Load the Krea text phase (tokenizer + Qwen3-VL-4B condition encoder + vision tower) — the component
@@ -498,9 +1081,21 @@ pub(crate) fn effective_base_quant_bits(
 /// VAE + vision tower stay dense (the monolithic `KreaPipeline::quantize` quantized `te` + `dit`, not
 /// the VAE/vision), so the `Resident` and `Sequential` paths build byte-identical text phases.
 pub(crate) fn load_krea_text(spec: &LoadSpec, root: &Path, id: &str) -> Result<KreaText> {
-    let mut text = KreaText::from_snapshot(root)?;
-    if let Some(bits) = load_time_quant_bits(spec, root, id)? {
+    let plan = resolve_load_plan(spec, root, id)?;
+    let source = runtime_encoder_contract().source_for_load(spec, root)?;
+    let bits = source.load_time_quant_bits(plan.effective_quant.map(Quant::bits), id)?;
+    load_krea_text_resolved(root, &source, bits)
+}
+
+pub(crate) fn load_krea_text_resolved(
+    root: &Path,
+    source: &mlx_gen::gen_core::ValidatedEncoderSource,
+    load_time_quant_bits: Option<i32>,
+) -> Result<KreaText> {
+    let mut text = KreaText::from_snapshot_with_text_encoder(root, source)?;
+    if let Some(bits) = load_time_quant_bits {
         text.quantize(bits)?;
+        text.materialize_weights()?;
     }
     Ok(text)
 }
@@ -513,39 +1108,85 @@ pub(crate) fn load_krea_text(spec: &LoadSpec, root: &Path, id: &str) -> Result<K
 fn load_krea_heavy(
     spec: &LoadSpec,
     root: &Path,
-    id: &str,
     load_pid: bool,
+    load_plan: ResolvedLoadPlan,
+    id: &'static str,
 ) -> Result<KreaHeavyOwned> {
-    let mut heavy = KreaHeavy::from_snapshot(root)?;
+    let mut heavy = KreaHeavy::from_snapshot_with_stream(root, load_plan.streamable_transformer)?;
     if !spec.adapters.is_empty() {
-        heavy.apply_adapters(&spec.adapters)?;
+        spec.read_files_unchanged(spec.adapters.iter().map(|adapter| &adapter.path), || {
+            heavy.apply_adapters(&spec.adapters)
+        })?;
     }
-    if let Some(bits) = load_time_quant_bits(spec, root, id)? {
+    if let Some(bits) = load_plan.load_time_quant_bits {
         heavy.quantize(bits)?;
     }
     // Optional PiD decoder overlay (sc-7845): Krea reuses the Qwen-Image latent space, so it loads the
     // same `qwenimage` student + Gemma-2 caption encoder when `spec.pid` is set AND this generate uses
     // it (`load_pid`, F-177) — Resident passes `true` (loaded once, reused), Sequential passes
     // `req.use_pid` so a non-PiD generate skips the student + its Gemma-2 caption encoder entirely.
-    let pid = if load_pid {
-        spec.pid
-            .as_ref()
-            .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
-            .transpose()?
-    } else {
-        None
-    };
-    Ok(KreaHeavyOwned { heavy, pid })
+    let pid = load_pid
+        .then(|| load_prepared_pid(spec))
+        .transpose()?
+        .flatten();
+    let alternate_decoder =
+        mlx_gen_wan::load_selected_single_frame_decoder(spec, &descriptor_for_id(id))?;
+    Ok(KreaHeavyOwned {
+        heavy,
+        pid,
+        alternate_decoder,
+    })
 }
 
-mlx_gen::impl_generator!(Krea {
-    validate: |s, req| {
-        validate_request(&s.descriptor, req)?;
-        // The load-time diff-patch guard needs `s` (the free `validate_request` can't see it).
-        ensure_multiphase_allowed_for(s.descriptor.id, s.has_diff_patch, req)
-    },
-    generate: generate_impl,
-});
+impl Generator for Krea {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        crate::block_memory_strategy::safety_check(
+            &self.memory_strategy,
+            self.precision,
+            self.quant,
+            context,
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        crate::block_memory_strategy::begin_request(
+            self.descriptor.id,
+            &self.memory_strategy,
+            self.precision,
+            self.quant,
+            context,
+        )
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        validate_request(&self.descriptor, req)?;
+        ensure_multiphase_allowed_for(self.descriptor.id, self.has_diff_patch, req)?;
+        Ok(())
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
 
 impl Krea {
     /// Text-encode the prompt (and, for true CFG, the negative) per the residency (sc-11101). `Resident`
@@ -626,6 +1267,7 @@ impl Krea {
         // Loud-reject a multi-phase request on a diff-patch model (sc-13884): its baked `.diff` delta
         // can't be toggled off per phase, so it would silently corrupt "base-only" phases.
         ensure_multiphase_allowed_for(self.descriptor.id, self.has_diff_patch, req)?;
+        let transformer_window_size = resolve_transformer_window(req, self.streamable_transformer)?;
         let base_seed = req.seed.unwrap_or_else(default_seed);
         // Variant read back off the descriptor id: Raw = full-CFG undistilled (52-step, dynamic-mu);
         // Turbo = CFG-free distilled (8-step, fixed mu). One `Krea` struct, two render paths. The edit
@@ -740,7 +1382,7 @@ impl Krea {
             req.use_pid,
             on_progress,
             |text: &KreaText| {
-                self.encode_contexts(
+                let ctx = self.encode_contexts(
                     text,
                     req,
                     is_raw,
@@ -748,11 +1390,31 @@ impl Krea {
                     encode_guidance,
                     &negative,
                     &edit_sources,
-                )
+                )?;
+                // SC-15449/sc-22738: the conditioning phase physically completes here. `Residency::run`
+                // materializes only under `Sequential`, so an armed fault evaluates the contexts itself
+                // — the boundary is then identical under both residencies, and an ordinary render (both
+                // controls unset) keeps its laziness untouched.
+                if crate::memory_strategy::calibration_fault_armed(
+                    req.memory,
+                    mlx_gen::gen_core::MemoryPhase::Conditioning,
+                ) {
+                    match &ctx.neg {
+                        Some(neg) => mlx_rs::transforms::eval([&ctx.pos, neg])?,
+                        None => mlx_rs::transforms::eval([&ctx.pos])?,
+                    }
+                    crate::memory_strategy::calibration_fault(
+                        req,
+                        mlx_gen::gen_core::MemoryPhase::Conditioning,
+                        self.descriptor.id,
+                    )?;
+                }
+                Ok(ctx)
             },
             // Materialize pos (+neg) while the text phase is still alive (Sequential only) — MLX is
             // lazy, so an un-evaluated context keeps the encoder referenced and the drop frees nothing.
-            |ctx: &KreaContexts| {
+            |ctx: Option<&KreaContexts>| {
+                let Some(ctx) = ctx else { return Ok(()) };
                 match &ctx.neg {
                     Some(neg) => mlx_rs::transforms::eval([&ctx.pos, neg])?,
                     None => mlx_rs::transforms::eval([&ctx.pos])?,
@@ -774,7 +1436,14 @@ impl Krea {
                     self.descriptor.id,
                     capture_sigma,
                 )?;
-                let decoder = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+                let decoder = pid_decoder
+                    .as_ref()
+                    .map(|decoder| decoder as &dyn LatentDecoder)
+                    .or_else(|| {
+                        heavy
+                            .alternate_decoder
+                            .map(|decoder| decoder as &dyn LatentDecoder)
+                    });
 
                 // Multi-phase render (epic 13879, sc-13884): drive the resolved phases over the ONE
                 // global schedule — per-phase guidance selecting the true-CFG (two-forward) or CFG-off
@@ -784,13 +1453,18 @@ impl Krea {
                 // that phase uses CFG, backed by the `encode_guidance` neg-context gate) and reused
                 // across the count loop (one image per seed). Returns before the single-phase dispatch.
                 if let (Some(resolved), Some(full)) = (mp_resolved.as_ref(), mp_sigmas.as_ref()) {
-                    let plans = heavy.heavy.prepare_multiphase(
-                        resolved,
-                        &self.adapters,
-                        &ctx.pos,
-                        ctx.neg.as_ref(),
-                        req.width,
-                        req.height,
+                    let plans = self.file_pin_spec.read_files_unchanged(
+                        self.adapters.iter().map(|adapter| &adapter.path),
+                        || {
+                            heavy.heavy.prepare_multiphase(
+                                resolved,
+                                &self.adapters,
+                                &ctx.pos,
+                                ctx.neg.as_ref(),
+                                req.width,
+                                req.height,
+                            )
+                        },
                     )?;
                     let mut images = Vec::with_capacity(req.count as usize);
                     for n in 0..req.count {
@@ -801,13 +1475,21 @@ impl Krea {
                             seed: base_seed.wrapping_add(n as u64),
                             sampler: req.sampler.clone(),
                             scheduler: req.scheduler.clone(),
+                            transformer_window_size,
+                            memory: req.memory.unwrap_or_default(),
+                            provider_id: self.descriptor.id,
                         };
+                        // sc-22738: the Denoise + Decode phase EXITS live inside the render body
+                        // (`KreaHeavy::decode_latents`, pipeline.rs), where the produced latent and
+                        // decoded image actually exist; `opts` above carries the request-scoped
+                        // `memory` + `provider_id` those hooks read.
                         images.push(heavy.heavy.render_multiphase(
                             &plans,
                             full,
                             &opts,
                             decoder,
                             &req.cancel,
+                            &req.preview,
                             on_progress,
                         )?);
                     }
@@ -883,7 +1565,14 @@ impl Krea {
                         seed: base_seed.wrapping_add(n as u64),
                         sampler: req.sampler.clone(),
                         scheduler: req.scheduler.clone(),
+                        transformer_window_size,
+                        memory: req.memory.unwrap_or_default(),
+                        provider_id: self.descriptor.id,
                     };
+                    // sc-22738: the Denoise + Decode phase EXITS live inside the render body
+                    // (`KreaHeavy::decode_latents`, pipeline.rs), where the produced latent and
+                    // decoded image actually exist; `opts` above carries the request-scoped `memory`
+                    // + `provider_id` those hooks read.
                     // The one render body per path (sc-11101): the same `KreaHeavy::render_*_from` for
                     // both residencies, so a Sequential job (text phase already dropped) is byte-identical
                     // to Resident.
@@ -901,6 +1590,7 @@ impl Krea {
                             // partially-denoised latent it expects, instead of the σ=0 clean one.
                             keep,
                             &req.cancel,
+                            &req.preview,
                             on_progress,
                         )?,
                         KreaRenderPlan::Img2ImgRaw { plan, strength } => {
@@ -915,6 +1605,7 @@ impl Krea {
                                 // partially-denoised latent; `sigmas.len()` (no capture) runs the tail.
                                 keep,
                                 &req.cancel,
+                                &req.preview,
                                 on_progress,
                             )?
                         }
@@ -927,6 +1618,7 @@ impl Krea {
                                 // from_ldm early-stop (sc-10121): see the Raw arm above.
                                 keep,
                                 &req.cancel,
+                                &req.preview,
                                 on_progress,
                             )?
                         }
@@ -937,6 +1629,7 @@ impl Krea {
                             decoder,
                             keep,
                             &req.cancel,
+                            &req.preview,
                             on_progress,
                         )?,
                         KreaRenderPlan::Turbo(p) => heavy.heavy.render_turbo_from(
@@ -945,6 +1638,7 @@ impl Krea {
                             decoder,
                             keep,
                             &req.cancel,
+                            &req.preview,
                             on_progress,
                         )?,
                     };
@@ -960,7 +1654,20 @@ impl Krea {
 /// Layers Krea's model-specific constraints (non-empty prompt, size multiple-of-16, steps ≥ 1) on top
 /// of the shared [`Capabilities::validate_request`] floor (count/size range, negative/guidance/true_cfg
 /// flags, conditioning kinds).
-pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<()> {
+/// # Callable without weights, and deliberately `pub`
+///
+/// Every rule in this function reads only `desc` and `req` — there is no `&self`,
+/// no loaded generator and no tensor. It was `pub(crate)`, which made it
+/// unreachable to a caller that wants to type-check a request *before* paying for
+/// a load, so such a caller had no option but to re-implement these rules and
+/// maintain a copy that drifts.
+///
+/// That is not hypothetical: SceneWorks' Aether Studio mirrors this function by
+/// hand for exactly that reason, and keeps a test that runs the engine's own
+/// [`Capabilities::validate_request`] over the same corpus to detect the drift it
+/// cannot prevent. Making this `pub` lets that mirror be deleted rather than
+/// maintained.
+pub fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<()> {
     let id = desc.id;
     if req.prompt.is_empty() {
         return Err(Error::Msg(format!("{id}: prompt must not be empty")));
@@ -1148,41 +1855,1046 @@ fn edit_references(req: &GenerationRequest) -> Result<Vec<&Image>> {
 // `krea_2_edit` (the Raw pipeline routed to the Kontext edit entrypoint; epic 10871), and
 // `krea_2_turbo_edit` (that edit surface on the distilled few-step CFG-free schedule; sc-11640).
 /// Per-component on-disk footprint (sc-10894) for the MLX fit-gate's staged-residency split — the
-/// Qwen3-VL text/vision encoder (`text_encoder/`), the DiT (`transformer/`), and the Qwen-Image VAE
-/// (`vae/`), summed from the exact snapshot subdirs [`crate::loader`] loads. Shared by every krea_2 id
-/// (turbo/raw/edit/turbo_edit + turbo_control); the control checkpoint is folded by the worker.
+/// Route-exact conditioning plus the DiT (`transformer/`) and Qwen-Image VAE (`vae/`). Every route
+/// materializes the selected Qwen3 language tower; edit/turbo-edit also materialize the checkpoint-
+/// coupled builtin vision side. The control checkpoint itself is folded by the worker.
+pub(crate) fn component_footprint_for(
+    provider_id: &str,
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    if provider_id != crate::model_control::KREA_2_TURBO_CONTROL_ID {
+        validate_base_krea_load_axes(spec, provider_id)
+            .map_err(|error| mlx_gen::gen_core::Error::Msg(error.to_string()))?;
+    }
+    let base = mlx_gen::require_base_snapshot(spec, "krea_2 imported provider")?;
+    let expected_language_bits = match &spec.weights {
+        WeightsSource::Dir(root) => resolve_load_plan(spec, root, provider_id)?
+            .effective_quant
+            .map(Quant::bits),
+        WeightsSource::File(_) => {
+            if provider_id == crate::model_control::KREA_2_TURBO_CONTROL_ID {
+                crate::model_control::validate_control_spec(spec)
+                    .map_err(|error| mlx_gen::gen_core::Error::Msg(error.to_string()))?;
+            } else {
+                validate_native_krea_spec(spec, provider_id)
+                    .map_err(|error| mlx_gen::gen_core::Error::Msg(error.to_string()))?;
+            }
+            native_text_encoder_expected_quant_bits(base)?
+        }
+    };
+    let selected = runtime_encoder_contract().source_for_load(spec, base)?;
+    let language_bytes =
+        selected_language_resident_bytes(&selected, expected_language_bits, provider_id)?;
+    let mut vision_bytes = 0;
+    if provider_id == KREA_2_EDIT_ID || provider_id == KREA_2_TURBO_EDIT_ID {
+        let language_contract = runtime_encoder_contract();
+        let builtin = language_contract
+            .validate_source_against_base(&WeightsSource::Dir(base.join("text_encoder")), base)?;
+        let vision = builtin.materialized_vision_tensor_headers(
+            &runtime_vision_encoder_contract(),
+            &language_contract,
+        )?;
+        vision_bytes = mlx_gen::asset_facts::projected_tensor_headers_bytes(&vision, |_| {
+            mlx_gen::asset_facts::ResidentProjection::Stored
+        })?;
+    }
+    let text_encoder = language_bytes.checked_add(vision_bytes).ok_or_else(|| {
+        mlx_gen::gen_core::Error::Msg(format!(
+            "{provider_id}: selected language plus builtin vision resident byte overflow"
+        ))
+    })?;
+    match &spec.weights {
+        WeightsSource::Dir(_) => {
+            let mut footprint = mlx_gen::PerComponentBytes::from_spec_subdirs(
+                spec,
+                &["text_encoder"],
+                &["transformer"],
+                &["vae"],
+            )?;
+            footprint.text_encoder = text_encoder;
+            Ok(footprint)
+        }
+        WeightsSource::File(dit) => Ok(mlx_gen::PerComponentBytes {
+            text_encoder,
+            // Priced from the logical-weight plan (sc-20385): a dense bf16 file prices at its
+            // stored bytes as before, while int8/fp8/mxfp8 layers price at their dense bf16
+            // resident form — the file bytes alone would under-report a quantized import by 2×.
+            // `None` quant: like the Dir arm, the footprint reports the pre-load-time-quant dense
+            // form; the memory-strategy contract prices `spec.quantize` for admission.
+            //
+            // Two consequences of pricing from the plan instead of the file length, both
+            // deliberate (sc-20385 review):
+            //
+            // * **Header bytes are excluded.** `safetensors_path_bytes` — the Dir arm, and what
+            //   this arm used to do — counts the whole file, header included. The plan sums tensor
+            //   residency, so a ~100 KB safetensors header no longer lands in the DiT number.
+            //   Against a 12-26 GB DiT that is noise, and counting header bytes as resident weight
+            //   bytes was never right.
+            // * **A file the plan refuses cannot be priced, so this fails closed** — the same
+            //   refusal the load itself would raise, surfaced at admission instead of after the
+            //   caller has committed to loading.
+            //
+            // Cost: this compiles a plan (one header parse plus a bounded `.comfy_quant` payload
+            // scan; no tensor data is read). Measured at ~3 ms in a debug build on the real
+            // 430-tensor 26 GB `kreamania_variant4`. It is a per-load/admission call and never a
+            // per-listing one — every caller of the provider `footprint` seam supplies a resolved
+            // `LoadSpec`, and `ProviderRegistry::footprint` already wraps the call in
+            // `read_prepared_files_unchanged` — so it is left uncached rather than carrying a
+            // second cache alongside that pin.
+            // The base tier's architecture config declares the logical shapes an MXFP8 layer unpads
+            // to (sc-20644), so the footprint prices what the load will actually make resident; see
+            // `block_memory_strategy::base_architecture_config` for the no-config case.
+            dit: crate::block_memory_strategy::native_dit_transformer_bytes(
+                provider_id,
+                dit,
+                None,
+                crate::native_remap::DeclaredLogicalShapes::from_base(
+                    crate::block_memory_strategy::base_architecture_config(provider_id, base)?
+                        .as_ref(),
+                ),
+            )?,
+            vae: mlx_gen::safetensors_path_bytes(base.join("vae")),
+        }),
+    }
+}
+
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
-    mlx_gen::PerComponentBytes::from_spec_subdirs(
-        spec,
-        &["text_encoder"],
-        &["transformer"],
-        &["vae"],
-    )
+    component_footprint_for(KREA_2_TURBO_ID, spec)
+}
+
+pub(crate) fn raw_component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    component_footprint_for(KREA_2_RAW_ID, spec)
+}
+
+pub(crate) fn edit_component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    component_footprint_for(KREA_2_EDIT_ID, spec)
+}
+
+pub(crate) fn turbo_edit_component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    component_footprint_for(KREA_2_TURBO_EDIT_ID, spec)
+}
+
+pub(crate) fn control_component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    component_footprint_for(crate::model_control::KREA_2_TURBO_CONTROL_ID, spec)
 }
 
 mlx_gen::register_generators! {
     pub(crate) const TURBO_REGISTRATION = descriptor => load;
     footprint = component_footprint
 }
+
+macro_rules! memory_registration {
+    ($name:ident, $behavior:ident, $provider_id:expr) => {
+        pub const $name: mlx_gen::gen_core::MemoryRegistration =
+            mlx_gen::gen_core::MemoryRegistration {
+                provider_id: $provider_id,
+                contract: |spec| {
+                    crate::block_memory_strategy::memory_strategy_contract($provider_id, spec)
+                },
+                safety_check: crate::block_memory_strategy::registered_safety_check,
+            };
+        pub const $behavior: mlx_gen::gen_core::MemoryBehaviorRegistration =
+            mlx_gen::gen_core::MemoryBehaviorRegistration {
+                provider_id: $provider_id,
+                valid_fixtures: crate::block_memory_strategy::registered_valid_fixture,
+                begin_request: |spec, contract, context| {
+                    crate::block_memory_strategy::registered_begin_request(
+                        $provider_id,
+                        spec,
+                        contract,
+                        context,
+                    )
+                },
+            };
+    };
+}
+
+memory_registration!(
+    TURBO_MEMORY_REGISTRATION,
+    TURBO_MEMORY_BEHAVIOR,
+    KREA_2_TURBO_ID
+);
+memory_registration!(RAW_MEMORY_REGISTRATION, RAW_MEMORY_BEHAVIOR, KREA_2_RAW_ID);
+memory_registration!(
+    EDIT_MEMORY_REGISTRATION,
+    EDIT_MEMORY_BEHAVIOR,
+    KREA_2_EDIT_ID
+);
+memory_registration!(
+    TURBO_EDIT_MEMORY_REGISTRATION,
+    TURBO_EDIT_MEMORY_BEHAVIOR,
+    KREA_2_TURBO_EDIT_ID
+);
 mlx_gen::register_generators! {
     pub(crate) const RAW_REGISTRATION = raw_descriptor => load_raw;
-    footprint = component_footprint
+    footprint = raw_component_footprint
 }
 mlx_gen::register_generators! {
     pub(crate) const EDIT_REGISTRATION = edit_descriptor => load_edit;
-    footprint = component_footprint
+    footprint = edit_component_footprint
 }
 mlx_gen::register_generators! {
     pub(crate) const TURBO_EDIT_REGISTRATION = turbo_edit_descriptor => load_turbo_edit;
-    footprint = component_footprint
+    footprint = turbo_edit_component_footprint
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use mlx_gen::{AdapterKind, AdapterSpec, OffloadPolicy};
+    use std::path::PathBuf;
+
+    /// The `generate_impl` body — the base t2i/img2img/edit/multi-phase render — as source text.
+    /// The calibration-fault boundaries are structural claims about *where* in this body the fault
+    /// fires; a weights-free test cannot drive the real DiT, so the placement is pinned here and the
+    /// gating behaviour by `memory_strategy`'s own tests.
+    fn generate_impl_source() -> &'static str {
+        let source = include_str!("model.rs");
+        let body = source
+            .split_once("    fn generate_impl(")
+            .expect("generate_impl")
+            .1;
+        body.split_once("\n#[cfg(test)]")
+            .map(|(head, _)| head)
+            .unwrap_or(body)
+    }
+
+    /// Conditioning: the fault fires at the conditioning phase's EXIT — after `encode_contexts` has
+    /// produced (and, when armed, evaluated) the contexts, and before the heavy phase begins.
+    #[test]
+    fn the_conditioning_calibration_fault_fires_after_the_encode_and_before_the_heavy_phase() {
+        let body = generate_impl_source();
+        let encode = body
+            .find("self.encode_contexts(")
+            .expect("generate_impl must encode the contexts");
+        let fault = body
+            .find("MemoryPhase::Conditioning")
+            .expect("generate_impl must carry a Conditioning calibration fault");
+        let heavy = body
+            .find("// Phase B: heavy render components")
+            .expect("phase B marker");
+        assert!(
+            encode < fault,
+            "the Conditioning fault must FOLLOW the text encode, not precede it"
+        );
+        assert!(
+            fault < heavy,
+            "the Conditioning fault must fire in the text-encode phase, not after it"
+        );
+    }
+
+    /// sc-22738 (coordinator decision): `generate_impl` no longer carries an entry-convention Denoise
+    /// hook before its render dispatches. The Denoise and Decode faults are phase EXITS and live in
+    /// `pipeline.rs` (`denoise_exit_fault` after the sampler, `decode_exit_fault` after the VAE),
+    /// where the produced latent and decoded image actually exist. A hook re-added here would fire
+    /// before the first DiT step and certify a pre-denoise heap.
+    #[test]
+    fn generate_impl_carries_no_entry_convention_render_hook() {
+        let body = generate_impl_source();
+        for phase in ["MemoryPhase::Denoise", "MemoryPhase::Decode"] {
+            assert!(
+                !body.contains(phase),
+                "{phase} must fire at its phase exit in pipeline.rs, not in generate_impl"
+            );
+        }
+    }
+
+    /// sc-22738: every `TurboOptions` `generate_impl` builds threads the **request-scoped** memory
+    /// selection and this provider's id down to the render body. `pipeline.rs`'s `denoise_exit_fault`
+    /// / `decode_exit_fault` read exactly those two fields, so replacing
+    /// `req.memory.unwrap_or_default()` with `Default::default()` (or hardcoding the id) makes every
+    /// render-side hook unreachable — and would leave the ordering tests above green. Pinned as
+    /// source text because driving the real render needs the Krea 2 snapshot.
+    #[test]
+    fn every_turbo_options_threads_the_request_scoped_memory_and_provider_id() {
+        let body = generate_impl_source();
+        let mut count = 0usize;
+        let mut rest = body;
+        while let Some(at) = rest.find("TurboOptions {") {
+            let tail = &rest[at..];
+            let region = tail
+                .split_once("};")
+                .expect("TurboOptions literal must be terminated")
+                .0;
+            assert!(
+                region.contains("memory: req.memory.unwrap_or_default(),"),
+                "a TurboOptions literal drops the request-scoped memory: {region}"
+            );
+            assert!(
+                region.contains("provider_id: self.descriptor.id,"),
+                "a TurboOptions literal drops the provider id: {region}"
+            );
+            count += 1;
+            rest = &tail["TurboOptions {".len()..];
+        }
+        assert_eq!(
+            count, 2,
+            "generate_impl builds one TurboOptions per render dispatch (multi-phase + single-phase)"
+        );
+    }
+
+    #[test]
+    fn bounded_encoder_contracts_retain_production_policy_and_production_headers_stay_exact() {
+        let bounded = bounded_encoder_contract();
+        let production = ENCODER_CONTRACT;
+        assert_eq!(
+            runtime_encoder_contract().hidden_size,
+            production.hidden_size
+        );
+        assert_eq!(
+            runtime_vision_encoder_contract().hidden_size,
+            VISION_ENCODER_CONTRACT.hidden_size
+        );
+        for (actual, expected) in [
+            (bounded.architecture, production.architecture),
+            (bounded.hidden_activation, production.hidden_activation),
+        ] {
+            assert_eq!(actual, expected);
+        }
+        assert_eq!(bounded.requires_final_norm, production.requires_final_norm);
+        assert_eq!(bounded.requires_lm_head, production.requires_lm_head);
+        assert_eq!(bounded.attention_dropout, production.attention_dropout);
+        assert_eq!(bounded.rms_norm_eps, production.rms_norm_eps);
+        assert_eq!(bounded.qk_norm_eps, production.qk_norm_eps);
+        assert_eq!(bounded.rope_theta, production.rope_theta);
+        assert_eq!(bounded.attention_bias, production.attention_bias);
+        assert_eq!(bounded.tie_word_embeddings, production.tie_word_embeddings);
+        assert_eq!(bounded.tokenizer, production.tokenizer);
+        assert_eq!(bounded.prompt_executions, production.prompt_executions);
+        assert_eq!(bounded.bos_token_id, production.bos_token_id);
+        assert_eq!(bounded.eos_token_id, production.eos_token_id);
+        assert_eq!(bounded.image_token_id, production.image_token_id);
+        assert_eq!(
+            bounded.vision_start_token_id,
+            production.vision_start_token_id
+        );
+        assert_eq!(bounded.vision_end_token_id, production.vision_end_token_id);
+        assert_eq!(bounded.mrope_section, production.mrope_section);
+        assert_eq!(bounded.mrope_interleaved, production.mrope_interleaved);
+        assert_eq!(bounded.packing, production.packing);
+        assert_eq!(
+            bounded.dense_storage_dtype_probe,
+            production.dense_storage_dtype_probe
+        );
+        // Vocabulary and head width cannot be reduced without changing authored token/RoPE policy.
+        assert_eq!(bounded.vocab_size, production.vocab_size);
+        assert_eq!(bounded.head_dim, production.head_dim);
+        bounded.validate_definition().unwrap();
+
+        let bounded_vision = bounded_vision_encoder_contract();
+        let production_vision = VISION_ENCODER_CONTRACT;
+        assert_eq!(bounded_vision.architecture, production_vision.architecture);
+        assert_eq!(
+            bounded_vision.hidden_activation,
+            production_vision.hidden_activation
+        );
+        assert_eq!(bounded_vision.rope_theta, production_vision.rope_theta);
+        assert_eq!(
+            bounded_vision.normalization_eps,
+            production_vision.normalization_eps
+        );
+        assert_eq!(bounded_vision.patch_size, production_vision.patch_size);
+        assert_eq!(
+            bounded_vision.temporal_patch_size,
+            production_vision.temporal_patch_size
+        );
+        assert_eq!(
+            bounded_vision.spatial_merge_size,
+            production_vision.spatial_merge_size
+        );
+        assert_eq!(bounded_vision.in_channels, production_vision.in_channels);
+        assert_eq!(bounded_vision.window_size, production_vision.window_size);
+        assert_eq!(
+            bounded_vision.full_attention_block_indexes,
+            production_vision.full_attention_block_indexes
+        );
+        bounded_vision.validate_definition(&bounded).unwrap();
+
+        // Pure headers keep the actual checkpoint geometry under assertion without creating an
+        // 8.7 GB sparse file only to SHA every logical zero byte.
+        assert_eq!(production.hidden_size, 2560);
+        assert_eq!(production.intermediate_size, 9728);
+        assert_eq!(production.num_hidden_layers, 36);
+        assert_eq!(production.loaded_hidden_layers, 35);
+        assert_eq!(
+            production.selected_hidden_layers,
+            &[2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35]
+        );
+        let language_headers =
+            gen_core_testkit::encoder_contract_fixture_tensor_headers(production, None).unwrap();
+        assert_eq!(
+            language_headers
+                .iter()
+                .map(|header| header.data_bytes)
+                .sum::<u64>(),
+            7_843_069_440
+        );
+        let production_q4_bytes =
+            mlx_gen::asset_facts::projected_tensor_headers_bytes(&language_headers, |tensor| {
+                if crate::convert::is_text_encoder_quant_target(&tensor.name) {
+                    mlx_gen::asset_facts::ResidentProjection::GroupQuantized {
+                        bits: 4,
+                        group_size: crate::quant::GROUP_SIZE as usize,
+                    }
+                } else {
+                    mlx_gen::asset_facts::ResidentProjection::Stored
+                }
+            })
+            .unwrap();
+        assert_eq!(production_q4_bytes, 2_765_258_240);
+        assert_eq!(production_vision.hidden_size, 1024);
+        assert_eq!(production_vision.intermediate_size, 4096);
+        assert_eq!(production_vision.num_hidden_layers, 24);
+        assert_eq!(production_vision.deepstack_visual_indexes, &[5, 11, 17]);
+        let vision_bytes = production_vision
+            .expected_headers()
+            .unwrap()
+            .into_iter()
+            .map(|(_, shape)| shape.into_iter().product::<usize>() as u64 * 2)
+            .sum::<u64>();
+        assert_eq!(vision_bytes, 830_695_424);
+    }
+
+    fn write_minimal_safetensors(path: &Path) {
+        // A real native DiT key: since sc-20385 imported-file pricing and loading compile the
+        // logical-weight plan, so a foreign probe key would refuse where these fixtures expect a
+        // priceable file. Harmless for component fixtures (their keys are not planned).
+        write_named_safetensors(path, "model.diffusion_model.first.weight");
+    }
+
+    fn write_named_safetensors(path: &Path, tensor: &str) {
+        let mut header =
+            format!(r#"{{"{tensor}":{{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}}}"#)
+                .into_bytes();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend([0_u8; 2]);
+        std::fs::write(path, bytes).expect("write minimal safetensors");
+    }
+
+    fn footprint_snapshot(tmp: &tempfile::TempDir) -> PathBuf {
+        let root = tmp.path().join("footprint-base");
+        for component in ["transformer", "vae"] {
+            let dir = root.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            write_minimal_safetensors(&dir.join("model.safetensors"));
+        }
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            test_encoder_contract(),
+            test_vision_encoder_contract(),
+        )
+        .unwrap();
+        root
+    }
+
+    #[test]
+    fn registry_footprints_price_language_only_except_edit_builtin_vision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = crate::provider_registry().unwrap();
+        let root = footprint_snapshot(&tmp);
+        let base_spec = LoadSpec::new(WeightsSource::Dir(root));
+        let footprint =
+            |id: &str, spec: &LoadSpec| registry.footprint(id, spec).unwrap().unwrap().text_encoder;
+        let t2i = footprint(KREA_2_TURBO_ID, &base_spec);
+        assert_eq!(footprint(KREA_2_RAW_ID, &base_spec), t2i);
+        assert_eq!(
+            footprint(crate::model_control::KREA_2_TURBO_CONTROL_ID, &base_spec),
+            t2i
+        );
+        let edit = footprint(KREA_2_EDIT_ID, &base_spec);
+        assert_eq!(footprint(KREA_2_TURBO_EDIT_ID, &base_spec), edit);
+        assert!(edit > t2i);
+
+        let language_only = tmp.path().join("alternate-language");
+        gen_core_testkit::write_encoder_contract_fixture(&language_only, test_encoder_contract())
+            .unwrap();
+        let complete = tmp.path().join("alternate-complete");
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &complete.join("text_encoder"),
+            test_encoder_contract(),
+            test_vision_encoder_contract(),
+        )
+        .unwrap();
+        let language_spec = base_spec
+            .clone()
+            .with_text_encoder(WeightsSource::Dir(language_only));
+        let complete_spec = base_spec
+            .clone()
+            .with_text_encoder(WeightsSource::Dir(complete));
+        for id in [
+            KREA_2_TURBO_ID,
+            KREA_2_RAW_ID,
+            KREA_2_EDIT_ID,
+            KREA_2_TURBO_EDIT_ID,
+            crate::model_control::KREA_2_TURBO_CONTROL_ID,
+        ] {
+            assert_eq!(
+                footprint(id, &language_spec),
+                footprint(id, &complete_spec),
+                "{id}: selected visual tensors are ignored and must not be priced"
+            );
+        }
+        assert_eq!(
+            footprint(KREA_2_EDIT_ID, &language_spec) - footprint(KREA_2_TURBO_ID, &language_spec),
+            edit - t2i,
+            "edit adds the builtin vision side exactly once"
+        );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum FootprintEncoderSelection {
+        Builtin,
+        ComponentDir,
+        ComponentFile,
+        CompleteSnapshot,
+    }
+
+    fn selected_footprint_spec(
+        base_spec: &LoadSpec,
+        fixture: &Path,
+        selection: FootprintEncoderSelection,
+        packed_bits: Option<i32>,
+    ) -> LoadSpec {
+        let mut spec = base_spec.clone();
+        let selected = fixture.join(format!("selected-{selection:?}"));
+        spec.text_encoder = match selection {
+            FootprintEncoderSelection::Builtin => None,
+            FootprintEncoderSelection::ComponentDir => {
+                gen_core_testkit::write_encoder_contract_fixture_with_quant(
+                    &selected,
+                    test_encoder_contract(),
+                    packed_bits,
+                )
+                .unwrap();
+                Some(WeightsSource::Dir(selected))
+            }
+            FootprintEncoderSelection::ComponentFile => {
+                gen_core_testkit::write_encoder_contract_fixture_with_quant(
+                    &selected,
+                    test_encoder_contract(),
+                    packed_bits,
+                )
+                .unwrap();
+                Some(WeightsSource::File(selected.join("model.safetensors")))
+            }
+            FootprintEncoderSelection::CompleteSnapshot => {
+                gen_core_testkit::write_encoder_contract_fixture_with_quant(
+                    &selected.join("text_encoder"),
+                    test_encoder_contract(),
+                    packed_bits,
+                )
+                .unwrap();
+                Some(WeightsSource::Dir(selected))
+            }
+        };
+        spec
+    }
+
+    fn expected_language_bytes(spec: &LoadSpec, bits: Option<i32>, provider_id: &str) -> u64 {
+        let base = mlx_gen::require_base_snapshot(spec, provider_id).unwrap();
+        let contract = test_encoder_contract();
+        let selected = contract.source_for_load(spec, base).unwrap();
+        let action = selected.load_time_quant_bits(bits, provider_id).unwrap();
+        let headers = selected
+            .materialized_language_tensor_headers(&contract)
+            .unwrap();
+        mlx_gen::asset_facts::projected_tensor_headers_bytes(&headers, |tensor| {
+            if let Some(bits) =
+                action.filter(|_| crate::convert::is_text_encoder_quant_target(&tensor.name))
+            {
+                mlx_gen::asset_facts::ResidentProjection::GroupQuantized {
+                    bits,
+                    group_size: crate::quant::GROUP_SIZE as usize,
+                }
+            } else {
+                mlx_gen::asset_facts::ResidentProjection::Stored
+            }
+        })
+        .unwrap()
+    }
+
+    fn expected_builtin_vision_bytes(root: &Path) -> u64 {
+        let language_contract = test_encoder_contract();
+        let builtin = language_contract
+            .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)
+            .unwrap();
+        let headers = builtin
+            .materialized_vision_tensor_headers(&test_vision_encoder_contract(), &language_contract)
+            .unwrap();
+        mlx_gen::asset_facts::projected_tensor_headers_bytes(&headers, |_| {
+            mlx_gen::asset_facts::ResidentProjection::Stored
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn all_registered_dir_routes_price_selected_language_at_the_effective_base_tier() {
+        let registry = crate::provider_registry().unwrap();
+        let routes = [
+            KREA_2_TURBO_ID,
+            KREA_2_RAW_ID,
+            KREA_2_EDIT_ID,
+            KREA_2_TURBO_EDIT_ID,
+            crate::model_control::KREA_2_TURBO_CONTROL_ID,
+        ];
+        for (quant, bits) in [(Quant::Q4, 4), (Quant::Q8, 8)] {
+            for requested in [false, true] {
+                for selection in [
+                    FootprintEncoderSelection::Builtin,
+                    FootprintEncoderSelection::ComponentDir,
+                    FootprintEncoderSelection::ComponentFile,
+                    FootprintEncoderSelection::CompleteSnapshot,
+                ] {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let root = footprint_snapshot(&tmp);
+                    std::fs::write(
+                        root.join("transformer/config.json"),
+                        if requested {
+                            "{}".to_owned()
+                        } else {
+                            format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#)
+                        },
+                    )
+                    .unwrap();
+                    let control = tmp.path().join("control");
+                    std::fs::create_dir_all(&control).unwrap();
+                    write_minimal_safetensors(&control.join("model.safetensors"));
+                    let mut base_spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+                    if requested {
+                        base_spec.quantize = Some(quant);
+                    }
+                    let spec = selected_footprint_spec(
+                        &base_spec,
+                        &tmp.path().join(format!("{bits}-{requested}")),
+                        selection,
+                        None,
+                    );
+                    let language = expected_language_bytes(&spec, Some(bits), KREA_2_TURBO_ID);
+                    let vision = expected_builtin_vision_bytes(&root);
+
+                    for id in routes {
+                        let route_spec = if id == crate::model_control::KREA_2_TURBO_CONTROL_ID {
+                            spec.clone()
+                                .with_control(WeightsSource::Dir(control.clone()))
+                        } else {
+                            spec.clone()
+                        };
+                        let footprint = registry
+                            .footprint(id, &route_spec)
+                            .unwrap_or_else(|error| {
+                                panic!("Q{bits} requested={requested} {selection:?} {id}: {error}")
+                            })
+                            .expect("registered Krea route exposes a footprint");
+                        let expected_conditioning =
+                            if matches!(id, KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID) {
+                                language + vision
+                            } else {
+                                language
+                            };
+                        assert_eq!(
+                            footprint.text_encoder, expected_conditioning,
+                            "Q{bits} requested={requested} {selection:?} {id}"
+                        );
+                        let contract = registry
+                            .memory_strategy_contract(id, &route_spec)
+                            .unwrap_or_else(|error| {
+                                panic!("Q{bits} requested={requested} {selection:?} {id}: {error}")
+                            })
+                            .expect("registered Krea route exposes a memory contract");
+                        assert_eq!(
+                            contract.asset_facts.conditioning_bytes,
+                            expected_conditioning
+                        );
+                        assert!(contract.asset_facts.transformer_bytes > 0);
+                        assert!(contract.asset_facts.transformer_bytes <= footprint.dit);
+                        assert!(contract.asset_facts.decoder_bytes > 0);
+                        assert!(contract.asset_facts.decoder_bytes <= footprint.vae);
+                        assert_eq!(
+                            contract.asset_facts.base_bytes,
+                            contract.asset_facts.conditioning_bytes
+                                + contract.asset_facts.transformer_bytes
+                                + contract.asset_facts.decoder_bytes
+                        );
+                        if id == crate::model_control::KREA_2_TURBO_CONTROL_ID {
+                            assert!(contract.asset_facts.overlay_bytes > 0);
+                        } else {
+                            assert_eq!(contract.asset_facts.overlay_bytes, 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn all_registered_dir_routes_preserve_matching_packs_and_reject_mismatches() {
+        let registry = crate::provider_registry().unwrap();
+        let routes = [
+            KREA_2_TURBO_ID,
+            KREA_2_RAW_ID,
+            KREA_2_EDIT_ID,
+            KREA_2_TURBO_EDIT_ID,
+            crate::model_control::KREA_2_TURBO_CONTROL_ID,
+        ];
+        for bits in [4, 8] {
+            for selection in [
+                FootprintEncoderSelection::ComponentDir,
+                FootprintEncoderSelection::ComponentFile,
+                FootprintEncoderSelection::CompleteSnapshot,
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let root = footprint_snapshot(&tmp);
+                std::fs::write(
+                    root.join("transformer/config.json"),
+                    format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
+                )
+                .unwrap();
+                let control = tmp.path().join("control");
+                std::fs::create_dir_all(&control).unwrap();
+                write_minimal_safetensors(&control.join("model.safetensors"));
+                let base_spec = LoadSpec::new(WeightsSource::Dir(root));
+                let matching = selected_footprint_spec(
+                    &base_spec,
+                    &tmp.path().join("matching"),
+                    selection,
+                    Some(bits),
+                );
+                for id in routes {
+                    let route_spec = if id == crate::model_control::KREA_2_TURBO_CONTROL_ID {
+                        matching
+                            .clone()
+                            .with_control(WeightsSource::Dir(control.clone()))
+                    } else {
+                        matching.clone()
+                    };
+                    assert!(
+                        registry.footprint(id, &route_spec).unwrap().is_some(),
+                        "Q{bits} {selection:?} {id}"
+                    );
+                    assert!(registry
+                        .memory_strategy_contract(id, &route_spec)
+                        .unwrap()
+                        .is_some());
+                }
+
+                let mismatching = selected_footprint_spec(
+                    &base_spec,
+                    &tmp.path().join("mismatching"),
+                    selection,
+                    Some(if bits == 4 { 8 } else { 4 }),
+                );
+                for id in routes {
+                    let route_spec = if id == crate::model_control::KREA_2_TURBO_CONTROL_ID {
+                        mismatching
+                            .clone()
+                            .with_control(WeightsSource::Dir(control.clone()))
+                    } else {
+                        mismatching.clone()
+                    };
+                    let footprint_error =
+                        registry.footprint(id, &route_spec).unwrap_err().to_string();
+                    assert!(
+                        footprint_error.contains("pre-quantized")
+                            && footprint_error.contains("model policy"),
+                        "Q{bits} {selection:?} {id}: {footprint_error}"
+                    );
+                    assert!(footprint_error.contains(id), "{id}: {footprint_error}");
+                    let contract_error = registry
+                        .memory_strategy_contract(id, &route_spec)
+                        .unwrap_err()
+                        .to_string();
+                    assert!(
+                        contract_error.contains("pre-quantized")
+                            && contract_error.contains("model policy"),
+                        "Q{bits} {selection:?} {id}: {contract_error}"
+                    );
+                    assert!(contract_error.contains(id), "{id}: {contract_error}");
+                }
+            }
+        }
+    }
+
+    fn complete_native_file_spec(tmp: &tempfile::TempDir) -> LoadSpec {
+        let base = tmp.path().join("base");
+        for component in ["text_encoder", "vae"] {
+            let dir = base.join(component);
+            std::fs::create_dir_all(&dir).expect("create base component");
+            write_minimal_safetensors(&dir.join("model.safetensors"));
+        }
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &base.join("text_encoder"),
+            test_encoder_contract(),
+            test_vision_encoder_contract(),
+        )
+        .expect("validation-complete text encoder fixture");
+        let dit = tmp.path().join("imported-krea.safetensors");
+        write_minimal_safetensors(&dit);
+        LoadSpec::new(WeightsSource::File(dit))
+            .with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(base))
+            .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+    }
+
+    #[test]
+    fn native_file_base_and_pose_routes_follow_the_borrowed_encoder_tier() {
+        let registry = crate::provider_registry().unwrap();
+        for bits in [4, 8] {
+            for selection in [
+                FootprintEncoderSelection::ComponentDir,
+                FootprintEncoderSelection::ComponentFile,
+                FootprintEncoderSelection::CompleteSnapshot,
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let base_spec = complete_native_file_spec(&tmp);
+                let base = mlx_gen::require_base_snapshot(&base_spec, KREA_2_TURBO_ID).unwrap();
+                gen_core_testkit::write_multimodal_encoder_contract_fixture_with_quant(
+                    &base.join("text_encoder"),
+                    test_encoder_contract(),
+                    test_vision_encoder_contract(),
+                    Some(bits),
+                )
+                .unwrap();
+                let control = tmp.path().join("native-pose.safetensors");
+                write_minimal_safetensors(&control);
+                let dense =
+                    selected_footprint_spec(&base_spec, &tmp.path().join("dense"), selection, None);
+                let expected = expected_language_bytes(&dense, Some(bits), KREA_2_TURBO_ID);
+                for id in [
+                    KREA_2_TURBO_ID,
+                    KREA_2_RAW_ID,
+                    KREA_2_EDIT_ID,
+                    KREA_2_TURBO_EDIT_ID,
+                    crate::model_control::KREA_2_TURBO_CONTROL_ID,
+                ] {
+                    let route_spec = if id == crate::model_control::KREA_2_TURBO_CONTROL_ID {
+                        dense
+                            .clone()
+                            .with_control(WeightsSource::File(control.clone()))
+                    } else {
+                        dense.clone()
+                    };
+                    let footprint = registry.footprint(id, &route_spec).unwrap().unwrap();
+                    let expected_conditioning =
+                        if matches!(id, KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID) {
+                            expected + expected_builtin_vision_bytes(base)
+                        } else {
+                            expected
+                        };
+                    assert_eq!(
+                        footprint.text_encoder, expected_conditioning,
+                        "Q{bits} {selection:?} {id}"
+                    );
+                    let contract = registry
+                        .memory_strategy_contract(id, &route_spec)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        contract.asset_facts.conditioning_bytes,
+                        expected_conditioning
+                    );
+                    assert!(contract.asset_facts.transformer_bytes > 0);
+                    assert!(contract.asset_facts.decoder_bytes > 0);
+                    assert_eq!(
+                        contract.asset_facts.base_bytes,
+                        contract.asset_facts.conditioning_bytes
+                            + contract.asset_facts.transformer_bytes
+                            + contract.asset_facts.decoder_bytes
+                    );
+                    assert_eq!(
+                        contract.asset_facts.overlay_bytes > 0,
+                        id == crate::model_control::KREA_2_TURBO_CONTROL_ID
+                    );
+                }
+
+                let matching = selected_footprint_spec(
+                    &base_spec,
+                    &tmp.path().join("matching"),
+                    selection,
+                    Some(bits),
+                );
+                for id in [
+                    KREA_2_TURBO_ID,
+                    KREA_2_RAW_ID,
+                    KREA_2_EDIT_ID,
+                    KREA_2_TURBO_EDIT_ID,
+                    crate::model_control::KREA_2_TURBO_CONTROL_ID,
+                ] {
+                    let route_spec = if id == crate::model_control::KREA_2_TURBO_CONTROL_ID {
+                        matching
+                            .clone()
+                            .with_control(WeightsSource::File(control.clone()))
+                    } else {
+                        matching.clone()
+                    };
+                    let expected_conditioning =
+                        if matches!(id, KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID) {
+                            expected + expected_builtin_vision_bytes(base)
+                        } else {
+                            expected
+                        };
+                    assert_eq!(
+                        registry
+                            .footprint(id, &route_spec)
+                            .unwrap()
+                            .unwrap()
+                            .text_encoder,
+                        expected_conditioning,
+                        "Q{bits} matching {selection:?} {id}"
+                    );
+                    assert_eq!(
+                        registry
+                            .memory_strategy_contract(id, &route_spec)
+                            .unwrap()
+                            .unwrap()
+                            .asset_facts
+                            .conditioning_bytes,
+                        expected_conditioning
+                    );
+                }
+                let mismatch = selected_footprint_spec(
+                    &base_spec,
+                    &tmp.path().join("mismatch"),
+                    selection,
+                    Some(if bits == 4 { 8 } else { 4 }),
+                );
+                for id in [
+                    KREA_2_TURBO_ID,
+                    KREA_2_RAW_ID,
+                    KREA_2_EDIT_ID,
+                    KREA_2_TURBO_EDIT_ID,
+                    crate::model_control::KREA_2_TURBO_CONTROL_ID,
+                ] {
+                    let route_spec = if id == crate::model_control::KREA_2_TURBO_CONTROL_ID {
+                        mismatch
+                            .clone()
+                            .with_control(WeightsSource::File(control.clone()))
+                    } else {
+                        mismatch.clone()
+                    };
+                    let footprint_error =
+                        registry.footprint(id, &route_spec).unwrap_err().to_string();
+                    assert!(footprint_error.contains(id), "{id}: {footprint_error}");
+                    let contract_error = registry
+                        .memory_strategy_contract(id, &route_spec)
+                        .unwrap_err()
+                        .to_string();
+                    assert!(contract_error.contains(id), "{id}: {contract_error}");
+                }
+            }
+        }
+    }
+
+    fn incomplete_native_file_fixture(tmp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+        let base = tmp.path().join("incomplete-base");
+        std::fs::create_dir_all(base.join("transformer")).expect("create transformer config dir");
+        std::fs::write(base.join("transformer/config.json"), "{}")
+            .expect("write parseable transformer config");
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &base.join("text_encoder"),
+            test_encoder_contract(),
+            test_vision_encoder_contract(),
+        )
+        .expect("validation-complete text encoder fixture");
+        let dit = tmp.path().join("native-dit.safetensors");
+        write_minimal_safetensors(&dit);
+        (dit, base)
+    }
+
+    #[test]
+    fn sequential_native_generator_retains_the_constructor_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = complete_native_file_spec(&tmp);
+        spec.load_shape = mlx_gen::LoadShape::DeferredMaterialization;
+        let native = match &spec.weights {
+            WeightsSource::File(path) => path.clone(),
+            WeightsSource::Dir(_) => unreachable!(),
+        };
+        spec.prepare_file_sources().unwrap();
+        let prepared = spec
+            .weights_file_pin()
+            .unwrap()
+            .expect("prepared primary token");
+        let model = build_native_krea_from_spec(&spec, descriptor()).unwrap();
+        assert!(
+            model.streamable_transformer,
+            "an explicit Sequential + Deferred File load must arm the physical stream"
+        );
+        assert_eq!(
+            model
+                .memory_strategy
+                .capability(mlx_gen::gen_core::MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            mlx_gen::gen_core::MemoryStrategySupport::Missing,
+            "physical File streaming must not inherit the Dir evidence cell"
+        );
+        let pin = model
+            ._native_dit
+            .expect("native generator must retain its pin");
+        assert_eq!(pin, prepared, "provider must retain the cache-key token");
+        assert_eq!(pin.loader_path(), std::path::absolute(&native).unwrap());
+
+        std::fs::write(&native, b"replacement after construction").unwrap();
+        let error = pin
+            .ensure_unchanged()
+            .expect_err("sequential reopen must reject a replacement")
+            .to_string();
+        assert!(error.contains("changed after load"), "{error}");
+    }
+
+    #[test]
+    fn native_file_streaming_requires_the_explicit_shape_and_excludes_diff_patches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut eligible = complete_native_file_spec(&tmp);
+        eligible.load_shape = mlx_gen::LoadShape::DeferredMaterialization;
+        assert!(native_file_streamable(&eligible).unwrap());
+
+        let mut resident = eligible.clone();
+        resident.offload_policy = mlx_gen::OffloadPolicy::Resident;
+        assert!(!native_file_streamable(&resident).unwrap());
+        let mut eager = eligible.clone();
+        eager.load_shape = mlx_gen::LoadShape::EagerMaterialization;
+        assert!(!native_file_streamable(&eager).unwrap());
+        assert!(!native_file_streamable(&eligible.clone().with_quant(mlx_gen::Quant::Q4)).unwrap());
+
+        let lora = tmp.path().join("adapter.safetensors");
+        write_named_safetensors(
+            &lora,
+            "transformer.transformer_blocks.0.attn.to_q.lora_down.weight",
+        );
+        let mut residual =
+            eligible
+                .clone()
+                .with_adapters(vec![AdapterSpec::new(lora, 1.0, AdapterKind::Lora)]);
+        residual.prepare_file_sources().unwrap();
+        assert!(
+            native_file_streamable(&residual).unwrap(),
+            "MLX block streams capture and replay forward-time low-rank adapters"
+        );
+
+        let diff = tmp.path().join("diff-patch.safetensors");
+        write_named_safetensors(&diff, "diffusion_model.transformer_blocks.0.attn.to_q.diff");
+        let mut patched =
+            eligible.with_adapters(vec![AdapterSpec::new(diff, 1.0, AdapterKind::Lora)]);
+        patched.prepare_file_sources().unwrap();
+        assert!(
+            !native_file_streamable(&patched).unwrap(),
+            "an irreversible diff-patch cannot be replayed from pristine window reopens"
+        );
+    }
 
     fn req(w: u32, h: u32) -> GenerationRequest {
         GenerationRequest {
@@ -1413,10 +3125,16 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_single_file() {
+    fn load_accepts_complete_single_file_spec() {
         let file = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
         let e = load(&file).err().expect("error").to_string();
-        assert!(e.contains("snapshot directory"), "got: {e}");
+        assert!(e.contains(BASE_SNAPSHOT_COMPONENT), "got: {e}");
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let complete = complete_native_file_spec(&tmp);
+        assert!(
+            load(&complete).is_ok(),
+            "complete File spec is registry-loadable"
+        );
     }
 
     #[test]
@@ -1443,52 +3161,83 @@ mod tests {
     #[test]
     fn native_load_empty_adapters_preserves_load() {
         // sc-14119: an empty adapter slice keeps the native single-file load behaving as it always has —
-        // it still runs the turnkey config read first (and, with a bogus base dir, fails there), so the
-        // new parameter is inert for the t2i/img2img callers that pass `&[]`.
-        let e = load_from_native_dit_file(
-            "/nonexistent-krea/dit.safetensors",
-            "/nonexistent-krea",
-            &[],
-            descriptor(),
-        )
-        .err()
-        .expect("missing base snapshot → err")
-        .to_string();
+        // it still runs the fail-closed base inventory first (and, with an incomplete base, fails there),
+        // so the new parameter is inert for the t2i/img2img callers that pass `&[]`.
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, base) = incomplete_native_file_fixture(&tmp);
+        let e = load_from_native_dit_file(&dit, &base, &[], descriptor())
+            .err()
+            .expect("missing base snapshot → err")
+            .to_string();
         assert!(
-            e.contains("config.json") || e.contains("read"),
-            "expected the missing-base config-read error, got: {e}"
+            e.contains("native base VAE asset facts"),
+            "expected the missing-base inventory error, got: {e}"
         );
     }
 
     #[test]
     fn native_load_accepts_adapters_without_early_rejection() {
         // sc-14119: a non-empty adapter slice is threaded through the native loader (parity with the
-        // snapshot `load` path) and must NOT be rejected at the door. With a bogus base the load still
-        // fails first at the turnkey config read — the adapter fold (`KreaHeavy::apply_adapters`) is
-        // weights-gated and exercised in the #[ignore] real-weight harness below.
-        let adapters = vec![AdapterSpec::new(
-            std::path::PathBuf::from("/nonexistent-krea/krea2_identity_edit.safetensors"),
-            1.0,
-            AdapterKind::Lora,
-        )];
-        let e = load_from_native_dit_file(
-            "/nonexistent-krea/dit.safetensors",
-            "/nonexistent-krea",
-            &adapters,
-            edit_descriptor(),
-        )
-        .err()
-        .expect("missing base snapshot → err")
-        .to_string();
+        // snapshot `load` path) and must NOT be rejected at the door. With an incomplete base the load still
+        // fails first at the fail-closed base inventory — the adapter fold
+        // (`KreaHeavy::apply_adapters`) is weights-gated and exercised in the #[ignore] real-weight
+        // harness below.
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, base) = incomplete_native_file_fixture(&tmp);
+        let adapter = tmp.path().join("krea2_identity_edit.safetensors");
+        write_minimal_safetensors(&adapter);
+        let adapters = vec![AdapterSpec::new(adapter, 1.0, AdapterKind::Lora)];
+        let e = load_from_native_dit_file(&dit, &base, &adapters, edit_descriptor())
+            .err()
+            .expect("missing base snapshot → err")
+            .to_string();
         assert!(
             !e.to_lowercase().contains("not yet supported")
                 && !e.to_lowercase().contains("not supported"),
             "adapters must be accepted by the native loader, got: {e}"
         );
         assert!(
-            e.contains("config.json") || e.contains("read"),
-            "expected the missing-base config-read error, got: {e}"
+            e.contains("native base VAE asset facts"),
+            "expected the missing-base inventory error, got: {e}"
         );
+    }
+
+    #[test]
+    fn prepared_adapter_header_classification_rejects_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let adapter = tmp.path().join("adapter.safetensors");
+        write_minimal_safetensors(&adapter);
+        let mut spec =
+            LoadSpec::new(WeightsSource::Dir(tmp.path().join("base"))).with_adapters(vec![
+                AdapterSpec::new(adapter.clone(), 1.0, AdapterKind::Lora),
+            ]);
+        spec.prepare_file_sources().unwrap();
+
+        std::fs::write(&adapter, b"replacement adapter bytes").unwrap();
+        let error = adapters_have_diff_patch_for_spec(&spec)
+            .expect_err("header classification must consume the prepared adapter token");
+        match error {
+            Error::Unsupported(reason)
+                if reason.starts_with("artifact seal mismatch after load: ") => {}
+            Error::Unsupported(reason) => panic!("unexpected artifact-seal reason: {reason}"),
+            other => panic!("expected a typed artifact-seal rejection, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn native_load_valid_config_reaches_fail_closed_base_asset_sizing() {
+        let root_tmp = tempfile::tempdir().unwrap();
+        let (dit, root) = incomplete_native_file_fixture(&root_tmp);
+
+        let e = load_from_native_dit_file(&dit, &root, &[], descriptor())
+            .err()
+            .expect("missing required base components must fail")
+            .to_string();
+        assert!(
+            e.contains("native base VAE asset facts"),
+            "expected the fail-closed base asset-sizing stage, got: {e}"
+        );
+        assert!(!e.contains("config.json"), "config was valid, got: {e}");
     }
 
     /// Real-weight harness for the native single-file + adapter fold (sc-14119): the discriminating check
@@ -1522,6 +3271,114 @@ mod tests {
             adapters_have_diff_patch(&adapters),
             "has_diff_patch must be computed from the passed adapters, not hardcoded"
         );
+    }
+
+    /// Real-weight fixed-seed render of a community dense Krea 2 DiT through the native single-file
+    /// entrypoint (sc-20634) — on this revision that means the mapped logical-weight reader + dense
+    /// codec table. Prints the pixel sha256 (and saves a PNG-free raw RGB dump) so it can be
+    /// compared with the SceneWorks parity lane's `legacy_pixel_sha256.txt` rendered on the pinned
+    /// revision: same file, same base, same request ⇒ the two revisions must agree byte for byte.
+    /// `KREA_EXPECTED_PIXEL_SHA256`, when set, is asserted.
+    ///
+    /// ```text
+    /// KREA_NATIVE_DIT=$HOME/models/kreamania_variant5.safetensors \
+    /// KREA_TURBO_DIR=<hub>/models--SceneWorks--krea-2-turbo-mlx/snapshots/<rev>/bf16 \
+    /// KREA_EXPECTED_PIXEL_SHA256=<sha from the SceneWorks lane> \
+    /// cargo test -p mlx-gen-krea --lib variant5_native_file_render_fixed_seed_sha -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs real weights + Metal: set KREA_NATIVE_DIT and KREA_TURBO_DIR"]
+    fn variant5_native_file_render_fixed_seed_sha() {
+        use sha2::{Digest, Sha256};
+
+        let env_or =
+            |key: &str, default: &str| std::env::var(key).unwrap_or_else(|_| default.to_owned());
+        let dit = std::path::PathBuf::from(
+            std::env::var("KREA_NATIVE_DIT").expect("set KREA_NATIVE_DIT"),
+        );
+        let base =
+            std::path::PathBuf::from(std::env::var("KREA_TURBO_DIR").expect("set KREA_TURBO_DIR"));
+        let steps: u32 = env_or("KREA_STEPS", "2").parse().expect("KREA_STEPS");
+        let width: u32 = env_or("KREA_W", "512").parse().expect("KREA_W");
+        let height: u32 = env_or("KREA_H", "512").parse().expect("KREA_H");
+        let seed: u64 = env_or("KREA_SEED", "42").parse().expect("KREA_SEED");
+        let prompt = env_or(
+            "KREA_PROMPT",
+            "a photorealistic portrait of a red fox sitting in a sunlit autumn forest, sharp focus, \
+             shallow depth of field",
+        );
+
+        // The whole-generator entry has no way to hand the receipt back, so this test observes the
+        // process-global slot. `reset → load → read` is not atomic, so hold the lock across all
+        // three (sc-20634 review); `every_process_global_receipt_observation_is_serialized` pins it.
+        let _receipt_guard = crate::loader::RECEIPT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::loader::reset_native_file_receipt();
+        let generator = load_from_native_dit_file(&dit, &base, &[], descriptor())
+            .expect("native single-file load through the logical-weight reader");
+        let receipt = crate::loader::last_native_file_receipt()
+            .expect("the dense native load records its logical-weight receipt");
+        assert_eq!(
+            receipt.materialization,
+            mlx_gen::gen_core::LogicalReadMaterialization::Materialized,
+            "a resident load materializes through the reader"
+        );
+        assert!(receipt.tensor_count > 0);
+        // Measured residency equals the plan's prediction for whatever codec mix the file uses:
+        // a dense bf16 file leaves exactly its source bytes resident, an fp8 cast twice them.
+        // Same declared logical shapes the render's own load used, so the two plans are comparable.
+        let base_cfg = crate::config::Krea2Config::from_snapshot(&base)
+            .expect("the base snapshot carries the architecture config");
+        let plan = mlx_gen::logical_weights::plan_logical_weights(
+            &dit,
+            &crate::native_remap::KreaNativeToDiffusersMapping::for_config(&base_cfg),
+        )
+        .expect("the rendered file compiles a codec plan");
+        assert_eq!(
+            receipt.resident_bytes(),
+            plan.resident_bytes(),
+            "measured residency must equal the plan's packed-vs-dense pricing"
+        );
+        let request = GenerationRequest {
+            prompt,
+            width,
+            height,
+            count: 1,
+            seed: Some(seed),
+            steps: Some(steps),
+            guidance: None,
+            ..Default::default()
+        };
+        let output = generator
+            .generate(&request, &mut |_| {})
+            .expect("fixed-seed render");
+        let image = match output {
+            GenerationOutput::Images(mut images) => images.pop().expect("one image"),
+            other => panic!("expected Images, got {other:?}"),
+        };
+        assert_eq!((image.width, image.height), (width, height));
+        let sha = format!("{:x}", Sha256::digest(&image.pixels));
+        eprintln!(
+            "RESULT provider=krea_2_turbo source=native-file geometry={width}x{height} steps={steps} \
+             seed={seed} pixel_sha256={sha} receipt_tensors={} receipt_source_bytes={} \
+             receipt_resident_bytes={} codecs={:?}",
+            receipt.tensor_count,
+            receipt.source_bytes,
+            receipt.resident_bytes(),
+            receipt
+                .residency
+                .iter()
+                .map(|report| (report.codec_id, report.tensor_count))
+                .collect::<Vec<_>>()
+        );
+        if let Ok(expected) = std::env::var("KREA_EXPECTED_PIXEL_SHA256") {
+            assert_eq!(
+                sha,
+                expected.trim(),
+                "render differs from the pixel sha rendered on the pinned revision"
+            );
+        }
     }
 
     #[test]
@@ -1617,10 +3474,12 @@ mod tests {
                 .any(|r| (r.descriptor)().id == KREA_2_RAW_ID),
             "id {KREA_2_RAW_ID} not registered"
         );
-        // Same snapshot loader as Turbo — a single-file weights source is rejected the same way.
         let file = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
         let e = load_raw(&file).err().expect("error").to_string();
-        assert!(e.contains("snapshot directory"), "got: {e}");
+        assert!(e.contains(BASE_SNAPSHOT_COMPONENT), "got: {e}");
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let complete = complete_native_file_spec(&tmp);
+        assert!(load_raw(&complete).is_ok());
     }
 
     // --- Image-edit variant (Kontext-style) — epic 10871 ---
@@ -1690,10 +3549,12 @@ mod tests {
                 .any(|r| (r.descriptor)().id == KREA_2_EDIT_ID),
             "id {KREA_2_EDIT_ID} not registered"
         );
-        // Same snapshot loader as Raw/Turbo — a single-file weights source is rejected the same way.
         let file = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
         let e = load_edit(&file).err().expect("error").to_string();
-        assert!(e.contains("snapshot directory"), "got: {e}");
+        assert!(e.contains(BASE_SNAPSHOT_COMPONENT), "got: {e}");
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let complete = complete_native_file_spec(&tmp);
+        assert!(load_edit(&complete).is_ok());
     }
 
     // --- CFG-free Turbo image-edit variant — sc-11640 ---
@@ -1750,10 +3611,12 @@ mod tests {
                 .any(|r| (r.descriptor)().id == KREA_2_TURBO_EDIT_ID),
             "id {KREA_2_TURBO_EDIT_ID} not registered"
         );
-        // Same snapshot loader as the other variants — a single-file weights source is rejected.
         let file = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
         let e = load_turbo_edit(&file).err().expect("error").to_string();
-        assert!(e.contains("snapshot directory"), "got: {e}");
+        assert!(e.contains(BASE_SNAPSHOT_COMPONENT), "got: {e}");
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let complete = complete_native_file_spec(&tmp);
+        assert!(load_turbo_edit(&complete).is_ok());
     }
 
     // ── F-180 (sc-11126): weight-free, default-run proof that Krea's dispatch HONORS
@@ -1766,21 +3629,28 @@ mod tests {
     // A dispatch that ignored `offload_policy` and always built `Resident` (the F-172 bug class) would
     // eager-load under a `Sequential` request and turn the first assertion's `Ok` into an `Err` —
     // this test would fail. That is exactly the ignore-`offload_policy` regression the smoke tests miss.
-    fn missing_snapshot_spec(policy: OffloadPolicy) -> LoadSpec {
-        LoadSpec::new(WeightsSource::Dir(
-            "/nonexistent/krea-residency-test-snapshot".into(),
-        ))
-        .with_offload_policy(policy)
+    fn validation_complete_snapshot_spec(root: &Path, policy: OffloadPolicy) -> LoadSpec {
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            test_encoder_contract(),
+        )
+        .expect("validation-complete text encoder fixture");
+        LoadSpec::new(WeightsSource::Dir(root.to_path_buf())).with_offload_policy(policy)
     }
 
     #[test]
     fn build_residency_sequential_defers_all_component_loads() {
         // Sequential defers every heavy/text load, so a missing snapshot dir is NOT touched here.
-        let res = build_residency(
-            &missing_snapshot_spec(OffloadPolicy::Sequential),
+        let fixture = tempfile::tempdir().expect("snapshot fixture");
+        let spec = validation_complete_snapshot_spec(fixture.path(), OffloadPolicy::Sequential);
+        let plan = resolve_load_plan(
+            &spec,
+            resolve_root(&spec, KREA_2_TURBO_ID).unwrap(),
             KREA_2_TURBO_ID,
         )
-        .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
+        .unwrap();
+        let res = build_residency(&spec, KREA_2_TURBO_ID, plan)
+            .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
         assert!(
             res.is_sequential(),
             "Sequential policy must build a Sequential residency (the deferred state machine)"
@@ -1791,12 +3661,17 @@ mod tests {
     fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
         // Resident eager-loads the text encoder now, so the missing snapshot dir surfaces as an error
         // at construction — the flip side that proves the Sequential test's `Ok` came from deferral.
-        let err = build_residency(
-            &missing_snapshot_spec(OffloadPolicy::Resident),
+        let fixture = tempfile::tempdir().expect("snapshot fixture");
+        let spec = validation_complete_snapshot_spec(fixture.path(), OffloadPolicy::Resident);
+        let plan = resolve_load_plan(
+            &spec,
+            resolve_root(&spec, KREA_2_TURBO_ID).unwrap(),
             KREA_2_TURBO_ID,
         )
-        .err()
-        .expect("Resident must eager-load and fail on a missing snapshot dir");
+        .unwrap();
+        let err = build_residency(&spec, KREA_2_TURBO_ID, plan)
+            .err()
+            .expect("Resident must eager-load and fail on a missing snapshot dir");
         // A load/IO error, not the precision/single-file guard (which a Dir source passes).
         let msg = err.to_string();
         assert!(
@@ -1807,13 +3682,8 @@ mod tests {
 
     #[test]
     fn shared_quant_guard_drives_load_time_and_effective_tiers() {
-        let root = std::env::temp_dir().join(format!(
-            "krea-shared-tier-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         std::fs::create_dir_all(root.join("transformer")).unwrap();
         std::fs::write(
             root.join("transformer/config.json"),
@@ -1841,7 +3711,6 @@ mod tests {
 
         std::fs::write(root.join("transformer/config.json"), "{").unwrap();
         assert!(effective_base_quant_bits(&q8, &root, KREA_2_TURBO_ID).is_err());
-        std::fs::remove_dir_all(root).ok();
     }
 
     // ── Multi-phase request validation (epic 13879, sc-13884) ────────────────────────────────────

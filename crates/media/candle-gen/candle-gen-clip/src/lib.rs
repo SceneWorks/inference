@@ -534,12 +534,8 @@ mod tests {
         candle_core::safetensors::save(&m, path).unwrap();
     }
 
-    fn scratch_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "candle_gen_clip_resolve_{tag}_{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&d);
+    fn scratch_dir(tmp: &tempfile::TempDir, tag: &str) -> PathBuf {
+        let d = tmp.path().join(format!("candle_gen_clip_resolve_{tag}"));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -548,7 +544,8 @@ mod tests {
     /// even if the dir also holds other stray `*.safetensors`.
     #[test]
     fn resolve_prefers_named_model_file() {
-        let dir = scratch_dir("named");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = scratch_dir(&tmp, "named");
         write_st(&dir.join(WEIGHTS_FILE), "w", 0.0);
         write_st(&dir.join("extra.safetensors"), "w", 0.0);
         let files = resolve_weights_files(&dir).unwrap();
@@ -561,7 +558,8 @@ mod tests {
     /// loads the UNION of a resharded snapshot's keys.
     #[test]
     fn resolve_fallback_returns_all_shards_sorted_and_merges_union() {
-        let dir = scratch_dir("shards");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = scratch_dir(&tmp, "shards");
         // Deliberately create out of lexical order to prove the sort.
         write_st(
             &dir.join("model-00002-of-00002.safetensors"),
@@ -605,7 +603,8 @@ mod tests {
     /// arbitrary pick), routed through the shared loader.
     #[test]
     fn resolve_errors_cleanly_on_empty_dir() {
-        let dir = scratch_dir("empty");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = scratch_dir(&tmp, "empty");
         std::fs::write(dir.join("config.json"), b"{}").unwrap();
         let err = resolve_weights_files(&dir).unwrap_err();
         assert!(

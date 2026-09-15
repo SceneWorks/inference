@@ -19,7 +19,7 @@ pub mod stream;
 pub use batch::{generate_batch, BatchRequest};
 pub use cancel::CancelFlag;
 pub use continuous::{generate_continuous, BatchExactness, ContinuousConfig};
-pub use prefix::{generate_cached, PrefixCache, PrefixStats};
+pub use prefix::{generate_cached, generate_cached_with, PrefixCache, PrefixStats};
 pub use speculative::{
     generate_draft_speculative, generate_prompt_lookup, SpeculativeConfig, SpeculativeStats,
 };

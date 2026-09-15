@@ -7,6 +7,9 @@
 //! # point at a diffusers-layout dual-expert snapshot dir (text_encoder/ transformer/ transformer_2/ vae/ tokenizer/)
 //! export SCENEWORKS_BERNINI_SNAPSHOT="E:/huggingface/hub/models--SceneWorks--wan2.2-t2v-a14b-candle/snapshots/<hash>/q4"
 //! export SCENEWORKS_BERNINI_OUT="D:/tmp/bernini_render.png"   # optional; defaults to the temp dir
+//! # Optional exact-shape A/B: both files must target the named Wan expert.
+//! export SCENEWORKS_BERNINI_ADAPTER_HIGH="D:/models/high.safetensors"
+//! export SCENEWORKS_BERNINI_ADAPTER_LOW="D:/models/low.safetensors"
 //! # vcvars 14.44 + CUDA_COMPUTE_CAP=120, then:
 //! cargo test -p candle-gen-bernini --release --features cuda gpu_smoke_raw_render -- --ignored --nocapture
 //! ```
@@ -14,7 +17,8 @@
 use std::time::Instant;
 
 use candle_gen::gen_core::{
-    GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+    AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, LoadSpec, MoeExpert, Progress,
+    WeightsSource,
 };
 
 #[test]
@@ -86,6 +90,52 @@ fn gpu_smoke_raw_render() {
     let first = image.pixels[0];
     let varied = image.pixels.iter().any(|&p| p != first);
     assert!(varied, "decoded frame must not be a single flat color");
+
+    // Compile-only in ordinary CI. When both expert adapters are explicitly supplied, reload after
+    // dropping the baseline so GPU residency stays sequential, then render the exact same request once
+    // per expert. Independent divergence proves both expert-tagged selections flow through the full
+    // Bernini provider rather than one valid expert masking a silently ignored peer.
+    if let (Ok(high), Ok(low)) = (
+        std::env::var("SCENEWORKS_BERNINI_ADAPTER_HIGH"),
+        std::env::var("SCENEWORKS_BERNINI_ADAPTER_LOW"),
+    ) {
+        drop(gen);
+        for (label, path, expert) in [
+            ("high", high, MoeExpert::High),
+            ("low", low, MoeExpert::Low),
+        ] {
+            let mut adapted_spec = LoadSpec::new(WeightsSource::Dir(snapshot.clone().into()));
+            adapted_spec.adapters =
+                vec![AdapterSpec::new(path.into(), 1.0, AdapterKind::Lora).with_moe_expert(expert)];
+            let adapted = candle_gen_bernini::provider_registry()
+                .unwrap()
+                .load("bernini_renderer", &adapted_spec)
+                .unwrap_or_else(|error| panic!("load {label}-adapted bernini_renderer: {error}"));
+            let mut adapted_last_step = 0;
+            let adapted_out = adapted
+                .generate(&req, &mut |progress| {
+                    if let Progress::Step { current, .. } = progress {
+                        adapted_last_step = current;
+                    }
+                })
+                .unwrap_or_else(|error| panic!("{label}-adapted Bernini render: {error}"));
+            let adapted_image = match adapted_out {
+                GenerationOutput::Images(mut images) => images.remove(0),
+                GenerationOutput::Video { mut frames, .. } => frames.remove(0),
+                _ => panic!("expected a {label}-adapted visual output"),
+            };
+            assert_eq!(
+                (adapted_image.width, adapted_image.height),
+                (image.width, image.height),
+                "{label}-expert adapter A/B must preserve request shape"
+            );
+            assert_ne!(
+                adapted_image.pixels, image.pixels,
+                "selected Bernini {label}-expert adapter must change output"
+            );
+            assert_eq!(adapted_last_step, req.steps.unwrap());
+        }
+    }
 
     image::save_buffer(
         &out_path,

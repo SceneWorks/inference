@@ -5,9 +5,9 @@
 //! `#[ignore]`d — needs the real SDXL snapshot (`SDXL_SNAPSHOT` or the HF cache). Validates that a
 //! genuine third-party file (`lycoris_<flattened.path>.{lokr_*,hada_*}` + per-module `.alpha`, NO
 //! `networkType`) resolves against the real UNet module names and folds a delta into the weight. Run:
-//!   SDXL_SNAPSHOT=… cargo test -p mlx-gen-sdxl --test thirdparty_lycoris_real_weights -- --ignored --nocapture
+//!   SDXL_SNAPSHOT=… cargo test -p mlx-gen-sdxl --test integration thirdparty_lycoris_real_weights:: -- --ignored --nocapture
 
-mod common;
+use crate::common;
 
 use mlx_gen::{AdapterKind, AdapterSpec};
 use mlx_gen_sdxl::{apply_sdxl_adapters, load_unet};
@@ -39,8 +39,8 @@ fn thirdparty_loha_and_lokr_merge_on_real_unet() {
         .collect();
     println!("SDXL targets: {:?}", shapes);
 
-    let dir = std::env::temp_dir().join("mlx_gen_sdxl_thirdparty_rw");
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_tmp = tempfile::tempdir().unwrap();
+    let dir = dir_tmp.path().to_path_buf();
     let r = 2i32;
 
     let mut loha: Vec<(String, Array)> = Vec::new();

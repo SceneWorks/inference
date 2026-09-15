@@ -49,25 +49,25 @@ pub const MODEL_ID: &str = "kokoro_82m";
 pub const HUB_REPO: &str = "hexgrad/Kokoro-82M";
 pub const HUB_REVISION: &str = "f3ff3571791e39611d31c381e3a41a3af07b4987";
 
-/// The license of the pinned Kokoro-82M weight checkpoint (sc-13332) — surfaced for SceneWorks'
-/// end-product licenses page. Apache-2.0 (permissive), verified against the `hexgrad/Kokoro-82M`
-/// model card.
-pub const WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
-    candle_audio::gen_core::WeightLicense {
-        spdx_id: "Apache-2.0",
-        name: "Apache License 2.0",
-        source_url: "https://huggingface.co/hexgrad/Kokoro-82M",
-        attribution: Some("Kokoro-82M © hexgrad — licensed under Apache-2.0"),
-        commercial_use: true,
-        restriction: None,
-    };
+/// Stable component key for the pinned Kokoro-82M checkpoint — what `PROVIDER_COMPONENTS`
+/// resolves through, and the licence manifest's unique row key.
+pub const COMPONENT_KEY: &str = "kokoro_82m";
 
-/// This provider's weight-license entry (keyed by [`MODEL_ID`]) for catalog aggregation.
-pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
-    candle_audio::gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: None,
-        license: WEIGHT_LICENSE,
+/// The schema-3 licence row for the pinned Kokoro-82M checkpoint (sc-16663).
+///
+/// **Disclosure only.** The row records what the upstream declares so a consumer can show it to a
+/// user; nothing here decides whether any use is permitted. `declared` and `gated` were read from
+/// the `hexgrad/Kokoro-82M` model card on `retrieved`, and `family` normalizes that declaration onto
+/// [`candle_audio::gen_core::license::families::APACHE_2_0`].
+pub const COMPONENT_LICENSE: candle_audio::gen_core::ComponentLicense =
+    candle_audio::gen_core::ComponentLicense {
+        component: COMPONENT_KEY,
+        source_url: "https://huggingface.co/hexgrad/Kokoro-82M",
+        gated: false,
+        declared: "apache-2.0",
+        family: "apache-2-0",
+        attribution: Some("Kokoro-82M © hexgrad — licensed under Apache-2.0"),
+        retrieved: "2026-08-02",
     };
 
 /// The advertised voice surface: every English voice the pinned snapshot ships (leading
@@ -119,43 +119,26 @@ pub const MAX_DURATION_SECS: f32 = 30.0;
 /// Kokoro's identity + capabilities — constructible without weights (registry introspection).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: None,
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "kokoro",
         backend: "candle",
         modality: Modality::Audio,
         capabilities: Capabilities {
-            supports_negative_prompt: false,
-            supports_guidance: false,
-            supports_true_cfg: false,
-            conditioning: Vec::new(),
-            supports_lora: false,
-            supports_lokr: false,
-            samplers: vec![],
-            schedulers: vec![],
-            supported_guidance_methods: vec![],
             // Pure audio: no width/height. The descriptor sweep exempts Audio from the size floor
             // (sc-13314) and `validate_request_audio` skips the range, so these stay at the natural
             // unused 0 rather than a nominal placeholder bound.
             min_size: 0,
-            max_size: 0,
             // One clip per request (GenerationOutput::Audio carries a single track).
             max_count: 1,
-            mac_only: false,
             audio_sample_rates: vec![SAMPLE_RATE],
             max_audio_duration_secs: Some(MAX_DURATION_SECS),
             audio_voices: VOICES.to_vec(),
             audio_languages: LANGUAGES.to_vec(),
-            audio_edit_modes: vec![],
-            supported_quants: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
+            ..Default::default()
         },
     }
 }
@@ -473,7 +456,8 @@ mod tests {
 
     #[test]
     fn load_rejects_unsupported_spec_shapes() {
-        let dir = std::env::temp_dir();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let spec = LoadSpec::new(WeightsSource::File(dir.join("x.pth")));
         assert!(load(&spec).is_err());
         let mut spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
@@ -483,8 +467,8 @@ mod tests {
 
     #[test]
     fn pre_tripped_cancel_returns_typed_canceled_before_any_heavy_work() {
-        let dir = std::env::temp_dir().join("kokoro-missing-snapshot");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let g = load(&LoadSpec::new(WeightsSource::Dir(dir))).unwrap();
         let flag = CancelFlag::new();
         flag.cancel();
@@ -502,8 +486,8 @@ mod tests {
     #[test]
     fn generate_on_a_missing_snapshot_fails_cleanly() {
         // A generator over an empty dir: generate must error (no weights), never panic.
-        let dir = std::env::temp_dir().join("kokoro-missing-snapshot");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let g = load(&LoadSpec::new(WeightsSource::Dir(dir))).unwrap();
         let req = GenerationRequest {
             prompt: "hi".into(),

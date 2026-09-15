@@ -1,10 +1,13 @@
-"""Real-weights Qwen-Image LoRA + LoKr golden — the reference for the mlx-gen adapter gate (sc-2528).
+"""Real-weights Qwen-Image LoRA or LoKr golden — the reference for the mlx-gen adapter gate (sc-2528).
 
-Run from the fork venv (loads the full ~54 GB model):
-    ~/Repos/mflux/.venv/bin/python ~/Repos/mlx-gen/.../tools/dump_qwen_adapter_golden.py
+Run exactly one kind in each isolated fork-venv process (the pinned repository, revision, and model
+path are the production contract in ``tools/golden/README.md``):
+    QWEN_ADAPTER_KIND=lora "$REF_PY" "$TOOLS/dump_qwen_adapter_golden.py"
+    QWEN_ADAPTER_KIND=lokr "$REF_PY" "$TOOLS/dump_qwen_adapter_golden.py"
 
-Builds a deterministic synthetic adapter (LoRA, then LoKr) targeting the joint-attention projections
-across a few blocks — the trained case — saves each in the on-disk format BOTH engines parse (peft
+``QWEN_ADAPTER_KIND`` is required and is deliberately fail-closed: a process builds one deterministic
+synthetic adapter targeting the joint-attention projections across a few blocks — the trained case —
+saves it in the on-disk format BOTH engines parse (peft
 `diffusion_model.`-prefixed `lora_A/B.weight`, NO `.alpha` key so the fork's bare-only alpha
 patterns and the Rust loader agree; bare `lokr_w1/w2` + `networkType=lokr` metadata for LoKr),
 applies it through the fork's real `QwenImage(lora_paths=…, lora_scales=[1.0])`, runs the fixed
@@ -16,6 +19,7 @@ import os
 
 import mlx.core as mx
 import numpy as np
+from _adapter_parity_provenance import assert_frozen_mflux, golden_metadata, sha256
 from mflux.models.common.config.config import Config
 from mflux.models.qwen.latent_creator.qwen_latent_creator import QwenLatentCreator
 from mflux.models.qwen.model.qwen_text_encoder.qwen_prompt_encoder import QwenPromptEncoder
@@ -23,6 +27,19 @@ from mflux.models.qwen.variants.txt2img.qwen_image import QwenImage
 
 _GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golden")
 os.makedirs(_GOLDEN_DIR, exist_ok=True)
+MODEL_REPOSITORY = os.environ.get("QWEN_REFERENCE_REPOSITORY", "Qwen/Qwen-Image")
+MODEL_REVISION = os.environ.get(
+    "QWEN_REFERENCE_REVISION", "75e0b4be04f60ec59a75f475837eced720f823b6"
+)
+MODEL_PATH = os.environ.get("QWEN_REFERENCE_MODEL", "Qwen/Qwen-Image")
+BUILD_ADAPTERS_ONLY = os.environ.get("BUILD_ADAPTERS_ONLY") == "1"
+ADAPTER_KIND = os.environ.get("QWEN_ADAPTER_KIND")
+assert_frozen_mflux()
+
+if ADAPTER_KIND not in {"lora", "lokr"}:
+    raise RuntimeError(
+        "Qwen adapter golden generation requires QWEN_ADAPTER_KIND=lora or QWEN_ADAPTER_KIND=lokr"
+    )
 
 SEED = 42
 PROMPT = "a fox sitting in a forest, photorealistic"
@@ -47,6 +64,20 @@ LOKR_PROJS = [p for p in PROJS if p != "to_out.0"]
 DIM = 3072  # all attention projections are [3072, 3072]
 
 
+def adapter_metadata(kind):
+    return {
+        "artifact_role": "adapter",
+        "adapter_kind": kind,
+        **golden_metadata(
+            script=__file__,
+            model_path=MODEL_PATH,
+            model_repository=MODEL_REPOSITORY,
+            model_revision=MODEL_REVISION,
+            model_subdirectory="bf16",
+        ),
+    }
+
+
 def build_lora(path):
     # peft `lora_A/B` under the `diffusion_model.` prefix, but a BARE `alpha` (the fork's Qwen
     # mapping has bare-only alpha patterns). alpha = 2*RANK so alpha/rank = 2 has a visible,
@@ -63,7 +94,7 @@ def build_lora(path):
             t[f"{base}.lora_A.weight"] = mx.array(a)
             t[f"{base}.lora_B.weight"] = mx.array(bb)
             t[f"{bare}.alpha"] = mx.array(np.array([float(2 * RANK)], dtype=np.float32))
-    mx.save_safetensors(path, t)
+    mx.save_safetensors(path, t, adapter_metadata("lora"))
     return path
 
 
@@ -77,12 +108,26 @@ def build_lokr(path):
             w2 = rng.normal(0.0, LOKR_STD, size=(64, 64)).astype(np.float32)
             t[f"{base}.lokr_w1"] = mx.array(w1)
             t[f"{base}.lokr_w2"] = mx.array(w2)
-    mx.save_safetensors(path, t, {"networkType": "lokr", "alpha": "1.0", "rank": "1"})
+    mx.save_safetensors(
+        path,
+        t,
+        {
+            "networkType": "lokr",
+            "alpha": "1.0",
+            "rank": "1",
+            **adapter_metadata("lokr"),
+        },
+    )
     return path
 
 
 def render(adapter_path):
-    model = QwenImage(quantize=None, lora_paths=[adapter_path], lora_scales=[1.0])
+    model = QwenImage(
+        quantize=None,
+        lora_paths=[adapter_path],
+        lora_scales=[1.0],
+        model_path=MODEL_PATH,
+    )
     config = Config(
         model_config=model.model_config,
         num_inference_steps=STEPS,
@@ -112,17 +157,28 @@ def render(adapter_path):
     return decoded
 
 
-for kind, builder in [("lora", build_lora), ("lokr", build_lokr)]:
-    adapter_path = os.path.join(_GOLDEN_DIR, f"qwen_{kind}_adapter.safetensors")
-    builder(adapter_path)
+builder = {"lora": build_lora, "lokr": build_lokr}[ADAPTER_KIND]
+adapter_path = os.path.join(_GOLDEN_DIR, f"qwen_{ADAPTER_KIND}_adapter.safetensors")
+builder(adapter_path)
+if BUILD_ADAPTERS_ONLY:
+    print(f"wrote deterministic {ADAPTER_KIND} adapter → {adapter_path}")
+else:
     decoded = render(adapter_path)
-    out = os.path.join(_GOLDEN_DIR, f"qwen_{kind}_golden.safetensors")
+    out = os.path.join(_GOLDEN_DIR, f"qwen_{ADAPTER_KIND}_golden.safetensors")
     mx.save_safetensors(
         out,
         {"decoded": decoded.astype(mx.float32)},
         {
             "prompt": PROMPT, "seed": str(SEED), "steps": str(STEPS), "width": str(W),
-            "height": str(H), "guidance": str(GUIDANCE), "kind": kind,
+            "height": str(H), "guidance": str(GUIDANCE), "kind": ADAPTER_KIND,
+            "adapter_sha256": sha256(adapter_path),
+            **golden_metadata(
+                script=__file__,
+                model_path=MODEL_PATH,
+                model_repository=MODEL_REPOSITORY,
+                model_revision=MODEL_REVISION,
+                model_subdirectory="bf16",
+            ),
         },
     )
     print(f"wrote {out} + {adapter_path}; decoded {tuple(decoded.shape)}")

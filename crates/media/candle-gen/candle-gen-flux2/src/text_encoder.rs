@@ -7,17 +7,18 @@
 //! likewise unifies both behind a single `qk_norm` flag).
 //!
 //! Both: GQA (32 query / 8 kv heads), **bias-less** q/k/v/o projections, HF half-split RoPE, SwiGLU
-//! MLP, pre-norm residual blocks. The prompt path runs only up to `max(out_layers)` layers (higher
-//! layers cannot influence the kept states), applies **no** final norm, and concatenates the three
-//! saved states on the feature axis. Runs in **f32** (the transformer's x/context embedders require
-//! f32 input). The per-head q/k RMSNorm is the Qwen3 addition — gated by `te_qk_norm` (klein on,
-//! dev off).
+//! MLP, pre-norm residual blocks. The ordinary prompt path runs only up to `max(out_layers)`, applies
+//! no final norm, and concatenates the three saved states. Dev additionally loads all 40 layers plus
+//! the final norm/lm_head for caption upsampling with a contiguous per-layer KV cache. Runs in f32
+//! (the transformer's x/context embedders require f32 input). The per-head q/k RMSNorm is the Qwen3
+//! addition — gated by `te_qk_norm` (klein on, dev off).
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 use candle_gen::candle_nn::{
     ops::softmax_last_dim, rms_norm, rotary_emb::rope, Module, RmsNorm, VarBuilder,
 };
 use candle_gen::gen_core::Quant;
+use candle_llm::primitives::{sample, ContiguousKvCache, KvCache, SamplingParams, SplitMix64};
 
 use crate::config::Flux2Config;
 use crate::quant::{rms_norm_to, QEmbedding, QLinear};
@@ -54,9 +55,13 @@ impl Rotary {
     }
 
     fn apply(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
+        self.apply_at(q, k, 0)
+    }
+
+    fn apply_at(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
         let (_, _, seq, _) = q.dims4()?;
-        let cos = self.cos.narrow(0, 0, seq)?;
-        let sin = self.sin.narrow(0, 0, seq)?;
+        let cos = self.cos.narrow(0, offset, seq)?;
+        let sin = self.sin.narrow(0, offset, seq)?;
         let q = rope(&q.contiguous()?, &cos, &sin)?;
         let k = rope(&k.contiguous()?, &cos, &sin)?;
         Ok((q, k))
@@ -162,6 +167,59 @@ impl Attention {
         let o = o.transpose(1, 2)?.reshape((b, s, nh * hd))?;
         self.o_proj.forward(&o)
     }
+
+    fn forward_step(
+        &self,
+        x: &Tensor,
+        rotary: &Rotary,
+        cache: &mut ContiguousKvCache,
+        layer: usize,
+        offset: usize,
+    ) -> Result<Tensor> {
+        let (b, q_len, _) = x.dims3()?;
+        let (nh, nkv, hd) = (self.n_heads, self.n_kv_heads, self.head_dim);
+        let q = self.q_proj.forward(x)?.reshape((b, q_len, nh, hd))?;
+        let k = self.k_proj.forward(x)?.reshape((b, q_len, nkv, hd))?;
+        let v = self.v_proj.forward(x)?.reshape((b, q_len, nkv, hd))?;
+        let q = match &self.q_norm {
+            Some(n) => n.forward(&q)?,
+            None => q,
+        }
+        .transpose(1, 2)?;
+        let k = match &self.k_norm {
+            Some(n) => n.forward(&k)?,
+            None => k,
+        }
+        .transpose(1, 2)?;
+        let v = v.transpose(1, 2)?.contiguous()?;
+        let (q, k) = rotary.apply_at(&q, &k, offset)?;
+        let (k, v) = cache
+            .update(layer, &k, &v)
+            .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?;
+        let total = k.dim(2)?;
+        let k = repeat_kv(&k, nh / nkv)?;
+        let v = repeat_kv(&v, nh / nkv)?;
+        let scale = (hd as f64).powf(-0.5);
+        let mut scores = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
+        if q_len > 1 {
+            let mut data = vec![0f32; b * q_len * total];
+            for bi in 0..b {
+                for qi in 0..q_len {
+                    for ki in 0..total {
+                        if ki > offset + qi {
+                            data[(bi * q_len + qi) * total + ki] = f32::NEG_INFINITY;
+                        }
+                    }
+                }
+            }
+            let mask = Tensor::from_vec(data, (b, 1, q_len, total), x.device())?;
+            scores = scores.broadcast_add(&mask)?;
+        }
+        let probs = softmax_last_dim(&scores)?;
+        let o = probs.matmul(&v)?;
+        self.o_proj
+            .forward(&o.transpose(1, 2)?.reshape((b, q_len, nh * hd))?)
+    }
 }
 
 /// Repeat each kv head `groups` times along the head axis ([B, nkv, S, D] → [B, nkv·groups, S, D]).
@@ -245,6 +303,31 @@ impl DecoderLayer {
             .forward(&self.input_ln.forward(x)?, rotary, mask)?)?;
         &h + self.mlp.forward(&self.post_ln.forward(&h)?)?
     }
+
+    fn forward_step(
+        &self,
+        x: &Tensor,
+        rotary: &Rotary,
+        cache: &mut ContiguousKvCache,
+        layer: usize,
+        offset: usize,
+    ) -> Result<Tensor> {
+        let h = (x + self.attn.forward_step(
+            &self.input_ln.forward(x)?,
+            rotary,
+            cache,
+            layer,
+            offset,
+        )?)?;
+        &h + self.mlp.forward(&self.post_ln.forward(&h)?)?
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct UpsampleSampling {
+    pub temperature: f32,
+    pub max_new_tokens: usize,
+    pub seed: u64,
 }
 
 /// The FLUX.2 decoder-LM prompt-embeds encoder. Backbone varies by variant (Qwen3 for klein,
@@ -256,13 +339,16 @@ pub struct Flux2PromptEncoder {
     rotary: Rotary,
     out_layers: [usize; 3],
     max_run: usize,
+    final_norm: Option<RmsNorm>,
+    lm_head: Option<QLinear>,
+    eps: f64,
 }
 
 impl Flux2PromptEncoder {
-    /// Build under `cfg.te_prefix` (klein Qwen3: `model`; dev Mistral: `language_model.model`). The
-    /// final `…norm` and `lm_head` are intentionally not loaded — `prompt_embeds` uses the
-    /// pre-final-norm intermediate states only. Only the first `max(out_layers)` layers are
-    /// constructed (higher layers cannot affect the kept states).
+    /// Build under `cfg.te_prefix` (klein Qwen3: `model`; dev Mistral: `language_model.model`).
+    /// Klein constructs only the first `max(out_layers)` blocks and no generation head. Dev retains
+    /// that exact prompt-embedding path while also loading all 40 blocks plus `norm`/`lm_head` for
+    /// native autoregressive caption upsampling.
     pub fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
         let model = vb.pp(cfg.te_prefix);
         let embed_tokens = QEmbedding::detect(
@@ -272,15 +358,42 @@ impl Flux2PromptEncoder {
             cfg.te_hidden_size,
         )?;
         let max_run = *cfg.te_out_layers.iter().max().unwrap();
-        let mut layers = Vec::with_capacity(max_run);
+        // Dev's Mistral3 caption-upsample path needs all 40 layers. Klein retains the exact early-stop
+        // prompt-embed load and never loads an autoregressive head.
+        let load_layers = if cfg.te_qk_norm {
+            max_run
+        } else {
+            cfg.te_n_layers
+        };
+        let mut layers = Vec::with_capacity(load_layers);
         let vb_layers = model.pp("layers");
-        for i in 0..max_run {
+        for i in 0..load_layers {
             layers.push(DecoderLayer::new(cfg, vb_layers.pp(i))?);
         }
+        let (final_norm, lm_head) = if cfg.te_qk_norm {
+            (None, None)
+        } else {
+            (
+                Some(rms_norm(
+                    cfg.te_hidden_size,
+                    cfg.te_rms_norm_eps,
+                    model.pp("norm"),
+                )?),
+                Some(QLinear::linear_detect(
+                    cfg.te_hidden_size,
+                    cfg.te_vocab_size,
+                    &vb.pp("language_model"),
+                    "lm_head",
+                    false,
+                )?),
+            )
+        };
         let rotary = Rotary::new(
             cfg.te_head_dim,
             cfg.te_rope_theta,
-            cfg.max_sequence_length.max(1),
+            (cfg.max_sequence_length
+                + 2 * candle_gen::gen_core::generator::MAX_ENHANCE_TOKENS as usize)
+                .max(1),
             vb.device(),
         )?;
         Ok(Self {
@@ -289,6 +402,9 @@ impl Flux2PromptEncoder {
             rotary,
             out_layers: cfg.te_out_layers,
             max_run,
+            final_norm,
+            lm_head,
+            eps: cfg.te_rms_norm_eps,
         })
     }
 
@@ -304,6 +420,14 @@ impl Flux2PromptEncoder {
         self.rotary = self.rotary.to_device(device)?;
         for layer in &mut self.layers {
             layer.quantize_onto(quant, device)?;
+        }
+        if let Some(norm) = &self.final_norm {
+            self.final_norm = Some(rms_norm_to(norm, self.eps, device)?);
+        }
+        if let Some(head) = &mut self.lm_head {
+            // The output head is an accuracy-sensitive dense leaf in the reference Mistral3
+            // upsampler. Keep it dense across Q4/Q8 tiers; only the transformer projections fold.
+            head.to_device(device)?;
         }
         Ok(())
     }
@@ -348,6 +472,83 @@ impl Flux2PromptEncoder {
         let [a, b_, c] = self.out_layers;
         Tensor::cat(&[pick(a)?, pick(b_)?, pick(c)?], D::Minus1)
     }
+
+    pub(crate) fn embed(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.embed_tokens.forward(input_ids)?.to_dtype(DType::F32)
+    }
+
+    pub(crate) fn device(&self) -> &Device {
+        self.rotary.cos.device()
+    }
+
+    fn decode_logits_from_embeds(
+        &self,
+        embeds: &Tensor,
+        cache: &mut ContiguousKvCache,
+        offset: usize,
+    ) -> Result<Tensor> {
+        let final_norm = self.final_norm.as_ref().ok_or_else(|| {
+            candle_gen::candle_core::Error::Msg(
+                "flux2 caption-upsample: Mistral3 generation head is unavailable".to_owned(),
+            )
+        })?;
+        let lm_head = self.lm_head.as_ref().ok_or_else(|| {
+            candle_gen::candle_core::Error::Msg(
+                "flux2 caption-upsample: Mistral3 lm_head is unavailable".to_owned(),
+            )
+        })?;
+        let (b, q_len, hidden) = embeds.dims3()?;
+        check_seq_len(offset + q_len, self.rotary.max_seq()?)?;
+        let mut x = embeds.clone();
+        for (i, layer) in self.layers.iter().enumerate() {
+            x = layer.forward_step(&x, &self.rotary, cache, i, offset)?;
+        }
+        let last = x.narrow(1, q_len - 1, 1)?.reshape((b, hidden))?;
+        lm_head.forward(&final_norm.forward(&last)?)
+    }
+
+    pub fn generate_from_embeds(
+        &self,
+        prompt_embeds: &Tensor,
+        eos_token: i32,
+        sampling: UpsampleSampling,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> candle_gen::Result<Vec<i32>> {
+        let (batch, prompt_len, _) = prompt_embeds.dims3()?;
+        if batch != 1 {
+            return Err(candle_gen::CandleError::Msg(format!(
+                "flux2 caption-upsample: expected batch 1, got {batch}"
+            )));
+        }
+        candle_gen::check_cancel(cancel)?;
+        let mut cache = ContiguousKvCache::new(self.layers.len());
+        let mut rng = SplitMix64::new(sampling.seed);
+        let params = SamplingParams {
+            temperature: sampling.temperature,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            repetition_context: 0,
+        };
+        let mut logits = self.decode_logits_from_embeds(prompt_embeds, &mut cache, 0)?;
+        let mut generated = Vec::new();
+        for step in 0..sampling.max_new_tokens {
+            candle_gen::check_cancel(cancel)?;
+            let next = sample(&logits, &[], &params, &mut rng, None)
+                .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?;
+            if next == eos_token {
+                break;
+            }
+            generated.push(next);
+            if step + 1 == sampling.max_new_tokens {
+                break;
+            }
+            let ids = Tensor::from_vec(vec![next as u32], (1, 1), prompt_embeds.device())?;
+            let embeds = self.embed(&ids)?;
+            logits = self.decode_logits_from_embeds(&embeds, &mut cache, prompt_len + step)?;
+        }
+        Ok(generated)
+    }
 }
 
 /// Validate a token-sequence length against the RoPE-table cap (sc-9386, F-077 sibling): a sequence
@@ -389,6 +590,77 @@ fn build_mask(attention_mask: &Tensor, b: usize, s: usize, device: &Device) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tiny_dev_encoder() -> Result<Flux2PromptEncoder> {
+        let mut cfg = crate::config::Flux2Config::dev();
+        cfg.te_hidden_size = 8;
+        cfg.te_intermediate_size = 16;
+        cfg.te_n_layers = 2;
+        cfg.te_n_heads = 2;
+        cfg.te_n_kv_heads = 1;
+        cfg.te_head_dim = 4;
+        cfg.te_vocab_size = 16;
+        cfg.te_out_layers = [0, 1, 2];
+        cfg.max_sequence_length = 4;
+        let vars = candle_gen::candle_nn::VarMap::new();
+        let vb = VarBuilder::from_varmap(&vars, DType::F32, &Device::Cpu);
+        Flux2PromptEncoder::new(&cfg, vb)
+    }
+
+    #[test]
+    fn cached_offset_decode_matches_one_shot_prefill() -> Result<()> {
+        let encoder = tiny_dev_encoder()?;
+        let embeds = Tensor::from_vec(
+            (0..24).map(|value| value as f32 / 24.0).collect::<Vec<_>>(),
+            (1, 3, 8),
+            &Device::Cpu,
+        )?;
+        let mut one_shot = ContiguousKvCache::new(2);
+        let expected = encoder.decode_logits_from_embeds(&embeds, &mut one_shot, 0)?;
+
+        let mut incremental = ContiguousKvCache::new(2);
+        let mut actual = None;
+        for offset in 0..3 {
+            let token = embeds.narrow(1, offset, 1)?;
+            actual = Some(encoder.decode_logits_from_embeds(&token, &mut incremental, offset)?);
+        }
+        let expected = expected.flatten_all()?.to_vec1::<f32>()?;
+        let actual = actual.unwrap().flatten_all()?.to_vec1::<f32>()?;
+        let max_abs = expected
+            .iter()
+            .zip(actual)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_abs <= 1e-4, "cached decode drifted by {max_abs}");
+        Ok(())
+    }
+
+    #[test]
+    fn generation_is_seeded_bounded_and_pre_cancelable() -> Result<()> {
+        let encoder = tiny_dev_encoder()?;
+        let embeds = Tensor::zeros((1, 2, 8), DType::F32, &Device::Cpu)?;
+        let sampling = UpsampleSampling {
+            temperature: 0.15,
+            max_new_tokens: 3,
+            seed: 42,
+        };
+        let first = encoder
+            .generate_from_embeds(&embeds, -1, sampling, &Default::default())
+            .unwrap();
+        let second = encoder
+            .generate_from_embeds(&embeds, -1, sampling, &Default::default())
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 3);
+
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+        cancel.cancel();
+        assert!(matches!(
+            encoder.generate_from_embeds(&embeds, -1, sampling, &cancel),
+            Err(candle_gen::CandleError::Canceled)
+        ));
+        Ok(())
+    }
 
     #[test]
     fn check_seq_len_rejects_over_cap_with_clear_message() {

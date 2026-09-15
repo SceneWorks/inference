@@ -52,11 +52,14 @@ fn zeros(d: usize) -> Tensor {
 /// Build a tiny `LlavaForConditionalGeneration` snapshot and load it. A per-call atomic sequence
 /// keeps the temp dir unique so concurrent tests never share (and delete) one another's snapshot.
 fn build_tiny_llava() -> LlavaModel {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static SEQ: AtomicU32 = AtomicU32::new(0);
-    let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("candle-llm-vlm-{}-{uniq}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    // sc-17755: a `TempDir` guard rather than a hand-rolled `temp_dir()` join. The snapshot is
+    // read fully into memory by the loader below (`safetensors::load`, not an mmap), so the tree
+    // is safe to remove when this helper returns — and it now does, including out of a panic.
+    let guard = tempfile::Builder::new()
+        .prefix("candle-llm-vlm-")
+        .tempdir()
+        .expect("fixture temp dir");
+    let dir = guard.path();
 
     let cfg = format!(
         r#"{{
@@ -183,9 +186,8 @@ fn build_tiny_llava() -> LlavaModel {
     }
 
     candle_core::safetensors::save(&w, dir.join("model.safetensors")).unwrap();
-    let model = LlavaModel::from_dir(&dir, &Device::Cpu).unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-    model
+
+    LlavaModel::from_dir(dir, &Device::Cpu).unwrap()
 }
 
 fn greedy() -> SamplingParams {

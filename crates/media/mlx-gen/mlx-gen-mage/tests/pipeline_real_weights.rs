@@ -3,7 +3,7 @@
 //! The committed bundle defaults to a fast 256²/4-step capture. Re-dump and run at the story
 //! geometry with `MAGE_DEVICE=cpu MAGE_H=1024 MAGE_W=1024 MAGE_STEPS=20` for the release witness.
 
-mod common;
+use crate::common;
 
 use common::{error, require_golden};
 use mlx_gen_mage::{GsKey, MageFlowPipeline};

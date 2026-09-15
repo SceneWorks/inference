@@ -9,7 +9,7 @@
 //! ```text
 //! set LTX_TRAINING_TIER=E:\huggingface\hub\models--SceneWorks--ltx-2.3-mlx\snapshots\<hash>\q4
 //! set LTX_GEMMA_DIR=E:\huggingface\hub\models--SceneWorks--ltx-2.3-mlx\snapshots\<hash>\gemma
-//! cargo test -p candle-gen-ltx --features cuda --release --test trainer_e2e -- --ignored --nocapture
+//! cargo test -p candle-gen-ltx --features cuda --release --test integration trainer_e2e:: -- --ignored --nocapture
 //! ```
 #![cfg(feature = "cuda")]
 
@@ -98,7 +98,8 @@ fn ltx_trainer_round_trips_through_inference_and_changes_render() {
     assert_eq!(candle_gen_ltx::config::TRAINER_ID, "ltx_2_3");
     assert_eq!(candle_gen_ltx::config::MODEL_ID, "ltx_2_3_distilled");
 
-    let tmp = std::env::temp_dir().join(format!("candle_ltx_trainer_e2e_{}", std::process::id()));
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let item = make_item(&tmp.join("data"));
     let output_dir = tmp.join("out");
     let mut trainer = candle_gen_ltx::provider_registry()

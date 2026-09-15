@@ -4,13 +4,44 @@
 use mlx_rs::{
     error::Exception,
     ops::{multiply, sigmoid},
-    transforms::compile::compile,
+    transforms::compile::{compile, compile_retained},
     Array,
 };
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
+
+const SITE_SWIGLU: &str = "z_image::feed_forward::swiglu";
+
+fn swiglu_impl((h1, h3): (&Array, &Array)) -> std::result::Result<Array, Exception> {
+    multiply(&multiply(h1, &sigmoid(h1)?)?, h3)
+}
+
+thread_local! {
+    static RETAINED_SWIGLU: std::cell::RefCell<Option<mlx_gen::nn::RetainedBinary>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn retained_swiglu(args: (&Array, &Array)) -> std::result::Result<Array, mlx_rs::error::Exception> {
+    mlx_gen::nn::prepare_retained_compilation_thread();
+    RETAINED_SWIGLU.with(|slot| {
+        slot.borrow_mut()
+            .get_or_insert_with(|| {
+                mlx_gen::nn::RetainedBinary::new(compile_retained(swiglu_impl, true))
+            })
+            .call(SITE_SWIGLU, args)
+    })
+}
+
+/// Exercise this module's production retained handle once for the release memory audit.
+#[doc(hidden)]
+pub fn exercise_retained_compile_inventory(input: &Array) -> Result<()> {
+    let output = retained_swiglu((input, input))?;
+    output.eval()?;
+    drop(output);
+    Ok(())
+}
 
 #[derive(Clone)]
 pub struct FeedForward {
@@ -59,13 +90,19 @@ impl FeedForward {
 /// arithmetic is compiled into one kernel when the sc-2963 glue toggle is on. Dtype-preserving and
 /// bit-identical to the eager `multiply(silu, h3)` — the mixed-precision flow (sc-2720) is untouched.
 fn swiglu(h1: &Array, h3: &Array) -> Result<Array> {
-    let f = |(h1, h3): (&Array, &Array)| -> std::result::Result<Array, Exception> {
-        multiply(&multiply(h1, &sigmoid(h1)?)?, h3)
-    };
     if crate::compile_glue() {
-        Ok(compile(f, true)((h1, h3))?)
+        if mlx_gen::nn::retained_compilation_requested() {
+            Ok(retained_swiglu((h1, h3))?)
+        } else {
+            mlx_gen::diagnostics::record_compile(
+                SITE_SWIGLU,
+                mlx_gen::diagnostics::CompileDisposition::OneShot,
+            );
+            Ok(compile(swiglu_impl, true)((h1, h3))?)
+        }
     } else {
-        Ok(f((h1, h3))?)
+        mlx_gen::diagnostics::record_fallback(SITE_SWIGLU, "compiled_glue_disabled");
+        Ok(swiglu_impl((h1, h3))?)
     }
 }
 
@@ -104,10 +141,22 @@ mod sc2963 {
             let (h1, h3) = (mk(dt), mk(dt));
             crate::set_compile_glue(false);
             let e = swiglu(&h1, &h3).unwrap();
+
+            mlx_rs::transforms::compile::clear_cache();
+            RETAINED_SWIGLU.with(|slot| *slot.borrow_mut() = None);
+            let scope = mlx_gen::diagnostics::begin_request_with_toggles(
+                format!("z-image-retained-binary-{dt:?}"),
+                "test",
+                &[mlx_gen::diagnostics::RETAINED_COMPILATION],
+            )
+            .unwrap();
             crate::set_compile_glue(true);
             let c = swiglu(&h1, &h3).unwrap();
+            let hit = swiglu(&h1, &h3).unwrap();
+            let _ = scope.finish();
             crate::set_compile_glue(false);
             assert_eq!(c.dtype(), dt, "swiglu dtype {dt:?}");
+            assert_eq!(hit.dtype(), dt, "retained-hit swiglu dtype {dt:?}");
             assert_eq!(e.dtype(), dt, "eager swiglu dtype {dt:?}");
             // sc-12747: under MLX 0.32.0 the compiled SwiGLU (`silu(h1)·h3`) rounds ~1 ULP-f32
             // differently from eager (0-ULP on the prior 0.31.2 pin); bf16 stays bit-identical. f32
@@ -122,6 +171,12 @@ mod sc2963 {
                 rel <= tol,
                 "swiglu compiled vs eager {dt:?}: rel|Δ|={rel:e} exceeds {tol:e}"
             );
+            assert_eq!(
+                mlx_gen::nn::max_rel_diff(&hit, &e),
+                rel,
+                "retained miss/hit must have identical dtype/value behavior"
+            );
         }
+        RETAINED_SWIGLU.with(|slot| *slot.borrow_mut() = None);
     }
 }

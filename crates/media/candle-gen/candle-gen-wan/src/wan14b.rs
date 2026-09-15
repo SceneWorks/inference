@@ -33,21 +33,37 @@ use candle_gen::gen_core::{
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert,
     OffloadPolicy, Progress, Quant, WeightsSource,
 };
-use candle_gen::{check_cancel, effective_offload_policy, CandleError, Result as CResult};
+use candle_gen::{check_cancel, CandleError, Result as CResult};
 
 use crate::config::{
     TextEncoderConfig, TransformerConfig, Vae16Config, DEFAULT_FPS_14B, DEFAULT_FRAMES_14B,
     DEFAULT_STEPS_14B, I2V_14B_BOUNDARY, I2V_14B_FLOW_SHIFT, I2V_14B_GUIDANCE_HIGH,
     I2V_14B_GUIDANCE_LOW, MAX_AREA_14B, MODEL_ID_I2V_14B, MODEL_ID_T2V_14B, NEGATIVE_FALLBACK,
     NUM_TRAIN_TIMESTEPS, SIZE_MULTIPLE_14B, T2V_14B_BOUNDARY, T2V_14B_FLOW_SHIFT,
-    T2V_14B_GUIDANCE_HIGH, T2V_14B_GUIDANCE_LOW, VAE16_STRIDE_SPATIAL, VAE16_STRIDE_TEMPORAL,
+    T2V_14B_GUIDANCE_HIGH, T2V_14B_GUIDANCE_LOW,
 };
 use crate::pipeline::{cfg, create_noise, frames_to_images};
 use crate::rope::WanRope;
 use crate::scheduler::{FlowScheduler, Sampler};
 use crate::text_encoder::Umt5Encoder;
 use crate::transformer::WanTransformer;
-use crate::vae16::WanVae16;
+/// Concrete z16 VAE assigned to both A14B routes.
+pub type ProviderVae = crate::vae16::WanVae16;
+
+/// Resolve either A14B route's load-bearing VAE geometry.
+pub fn vae_tiling(provider_id: &str) -> Option<candle_gen::gen_core::tiling::VaeTiling> {
+    matches!(provider_id, MODEL_ID_T2V_14B | MODEL_ID_I2V_14B).then_some(ProviderVae::VAE_TILING)
+}
+
+/// Runtime latent geometry for either A14B route, derived from the assigned VAE.
+pub(crate) fn latent_dims(frames: u32, width: u32, height: u32) -> (usize, usize, usize) {
+    let temporal_scale = ProviderVae::VAE_TILING.temporal_scale as u32;
+    let spatial_scale = ProviderVae::VAE_TILING.spatial_scale as u32;
+    let t_lat = (frames - 1) / temporal_scale + 1;
+    let h_lat = height / spatial_scale;
+    let w_lat = width / spatial_scale;
+    (t_lat as usize, h_lat as usize, w_lat as usize)
+}
 
 /// The experts run bf16 (the diffusers fp32 weights load as bf16, the 5B regime); UMT5 runs bf16
 /// (sc-12778 — halving the f32 encoder resident + its ENCODE-stage transient; the DiT `embed_text`
@@ -59,7 +75,7 @@ use crate::vae16::WanVae16;
 /// floor, independent of the VAE spatial-tile budget** (weights + the un-tileable f32 decode
 /// activations, not something tiling can shrink). Running the z16 VAE bf16 ~halves that floor → it fits
 /// a 24 GiB card. bf16 keeps f32's 8-bit exponent (no fp16 overflow risk), and the L2/softmax
-/// reductions stay f32-reduced in [`WanVae16`], so decode parity holds (GPU-checked ≥35 dB PSNR vs f32).
+/// reductions stay f32-reduced in [`ProviderVae`], so decode parity holds (GPU-checked ≥35 dB PSNR vs f32).
 const DIT_DTYPE: DType = DType::BF16;
 const ENC_DTYPE: DType = DType::BF16;
 const VAE_DTYPE: DType = DType::BF16;
@@ -123,7 +139,7 @@ struct Components {
     high: Arc<WanTransformer>,
     /// `transformer_2/` — the **low-noise** expert (timestep < boundary).
     low: Arc<WanTransformer>,
-    vae: Arc<WanVae16>,
+    vae: Arc<ProviderVae>,
     /// UMT5 tokenizer, loaded+parsed **once** at component load and reused across encodes (sc-8991 /
     /// F-011) instead of re-parsing `tokenizer.json` per prompt/branch.
     tok: Arc<candle_gen::gen_core::tokenizer::TextTokenizer>,
@@ -210,13 +226,13 @@ impl Pipeline {
     /// `VarBuilder::from_tensors` at [`VAE_DTYPE`] (**bf16**, sc-12818 — the weights load bf16, the
     /// decode-floor win; `get` casts each tensor to that dtype). I2V builds the encoder too (the
     /// conditioning image's first-frame latent).
-    fn build_vae_comfyui(&self, file: &Path) -> CResult<WanVae16> {
+    fn build_vae_comfyui(&self, file: &Path) -> CResult<ProviderVae> {
         let map = cst::load(file, &Device::Cpu)?;
         let map = crate::comfyui::remap_vae_wan_to_diffusers(map)?;
         let vb = VarBuilder::from_tensors(map, VAE_DTYPE, &self.device);
         match self.variant {
-            Variant::I2v => Ok(WanVae16::new_with_encoder(&self.vae_cfg, vb)?),
-            Variant::T2v => Ok(WanVae16::new(&self.vae_cfg, vb)?),
+            Variant::I2v => Ok(ProviderVae::new_with_encoder(&self.vae_cfg, vb)?),
+            Variant::T2v => Ok(ProviderVae::new(&self.vae_cfg, vb)?),
         }
     }
 
@@ -239,8 +255,8 @@ impl Pipeline {
     ///   `merge_adapters` hard-errors on its own zero-match (the report is otherwise discarded, F-051).
     /// - **Packed** q4/q8 tier (sc-10095): a packed tier has **no dense `W`** to fold into, so the
     ///   adapters attach as forward-time **additive** residuals on the packed `QLinear`
-    ///   ([`crate::adapters::install_additive`], sc-10094) — the base weight stays q4/q8. LoKr/LoHa on a
-    ///   packed tier is rejected there (deferred to sc-10050/10051).
+    ///   ([`crate::adapters::install_additive`], sc-10094) — the base weight stays q4/q8. Structured
+    ///   LoKr is packed-safe; LoHa fails closed because it has no truthful additive representation.
     ///
     /// Returns the expert plus `Some(applied)` on the packed path (the count of attached residuals, for
     /// the caller's cross-expert zero-match guard) or `None` on the dense/no-adapter paths (which
@@ -325,15 +341,15 @@ impl Pipeline {
     /// reads it from the user's tree (native→diffusers key remap); else the snapshot `vae/`. I2V builds
     /// the encoder too (the conditioning image's first-frame latent). Shared by the resident and staged
     /// paths (sc-12733).
-    fn load_vae(&self) -> CResult<WanVae16> {
+    fn load_vae(&self) -> CResult<ProviderVae> {
         match self.comfyui.as_ref().and_then(|c| c.vae_file.as_deref()) {
             Some(vae_file) => self.build_vae_comfyui(vae_file),
             None => {
                 let vae_vb = self.component_vb("vae", VAE_DTYPE)?;
                 match self.variant {
                     // I2V needs the VAE encoder (the conditioning image's first-frame latent).
-                    Variant::I2v => Ok(WanVae16::new_with_encoder(&self.vae_cfg, vae_vb)?),
-                    Variant::T2v => Ok(WanVae16::new(&self.vae_cfg, vae_vb)?),
+                    Variant::I2v => Ok(ProviderVae::new_with_encoder(&self.vae_cfg, vae_vb)?),
+                    Variant::T2v => Ok(ProviderVae::new(&self.vae_cfg, vae_vb)?),
                 }
             }
         }
@@ -413,7 +429,7 @@ impl Pipeline {
     /// `generate_wan.py`'s `is_i2v_channel_concat` setup. Constant across denoise steps + both experts.
     fn build_i2v_y(
         &self,
-        vae: &WanVae16,
+        vae: &ProviderVae,
         image: &Image,
         frames: u32,
         width: u32,
@@ -487,9 +503,7 @@ impl Pipeline {
         req: &GenerationRequest,
         frames: u32,
     ) -> CResult<(usize, usize, usize, Tensor, Tensor)> {
-        let t_lat = ((frames - 1) / VAE16_STRIDE_TEMPORAL + 1) as usize;
-        let h_lat = (req.height / VAE16_STRIDE_SPATIAL) as usize;
-        let w_lat = (req.width / VAE16_STRIDE_SPATIAL) as usize;
+        let (t_lat, h_lat, w_lat) = latent_dims(frames, req.width, req.height);
         let (pt, ph, pw) = self.dit_cfg.patch;
         let (ppf, pph, ppw) = (t_lat / pt, h_lat / ph, w_lat / pw);
         let (cos, sin) = WanRope::new(&self.dit_cfg).cos_sin(ppf, pph, ppw, &self.device)?;
@@ -532,6 +546,13 @@ impl Pipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<()> {
+        // One cache per projected conditioning payload for this expert's request-scoped denoise range.
+        // A staged high/low render builds it after loading each expert, so no K/V survives an expert drop.
+        check_cancel(cancel)?;
+        let pos_kv = expert.prepare_cross_kv(ctx_pos)?;
+        let neg_kv = ctx_neg
+            .map(|context| expert.prepare_cross_kv(context))
+            .transpose()?;
         for i in range {
             check_cancel(cancel)?;
             let t = sched.timestep(i);
@@ -540,12 +561,12 @@ impl Pipeline {
                 Some(y) => Tensor::cat(&[&*latents, y], 1)?,
                 None => latents.clone(),
             };
-            let v_pos = expert.forward(&x, ctx_pos, t, cos, sin)?;
+            let v_pos = expert.forward_prepared(&x, t, &pos_kv, cos, sin)?;
             // Negative branch (and CFG combine) only when this expert's guidance enables it; `ctx_neg`
             // is `Some` iff that guidance > 1.0 (sc-8993).
-            let v = match ctx_neg {
-                Some(ctx_neg) if cfg_active(guidance) => {
-                    let v_neg = expert.forward(&x, ctx_neg, t, cos, sin)?;
+            let v = match &neg_kv {
+                Some(neg_kv) if cfg_active(guidance) => {
+                    let v_neg = expert.forward_prepared(&x, t, neg_kv, cos, sin)?;
                     cfg(&v_pos, &v_neg, guidance)?
                 }
                 _ => v_pos,
@@ -650,9 +671,12 @@ impl Pipeline {
         // sc-12758: free-aware budgeted **spatial** tiling for the z16 decode. Falls back to plain
         // `decode` when a single high-res frame already fits (behavior-identical when the budget is
         // ample); tiles the 42 GB A14B decode spike down to fit a small card otherwise.
-        let decoded = comps
-            .vae
-            .decode_budgeted_with_cancel(&latents, &req.cancel)?;
+        let decode_cap = crate::i2v_memory_strategy::selected_decode_cap(req)?;
+        let decoded = comps.vae.decode_budgeted_with_cancel_and_tile_cap(
+            &latents,
+            &req.cancel,
+            decode_cap,
+        )?;
         let images = frames_to_images(&decoded)?;
         Ok((images, knobs.fps))
     }
@@ -832,7 +856,8 @@ impl Pipeline {
         // sc-12758: the experts + TE are offloaded by now, so the decode budgets against nearly the
         // whole card. Free-aware budgeted spatial tiling drives the 42 GB z16 decode spike down to fit
         // the free VRAM — the sole thing that kept the A14B off a 24 GB card (denoise is only ~11 GB).
-        let decoded = vae.decode_budgeted_with_cancel(&latents, cancel)?;
+        let decode_cap = crate::i2v_memory_strategy::selected_decode_cap(req)?;
+        let decoded = vae.decode_budgeted_with_cancel_and_tile_cap(&latents, cancel, decode_cap)?;
         let images = frames_to_images(&decoded)?;
         Ok((images, knobs.fps))
     }
@@ -890,7 +915,7 @@ struct SwapState<'a> {
 /// emit their [`Progress::Loading`] before the (heavy) load; the use closures receive `&mut St` to
 /// advance the shared scheduler/latents.
 #[allow(clippy::too_many_arguments)]
-fn staged_expert_swap<E, St>(
+pub(crate) fn staged_expert_swap<E, St>(
     k: usize,
     steps: usize,
     state: &mut St,
@@ -1010,14 +1035,15 @@ pub struct Wan14bGenerator {
     /// these files, the UMT5 TE + VAE in place when their files are set (sc-10909) else from
     /// [`Self::root`], and the tiny tokenizer always from [`Self::root`]; `None` on the registry path.
     comfyui: Option<std::sync::Arc<crate::comfyui::ComfyuiExperts>>,
-    /// Component-residency policy (epic 12732, sc-12733), resolved once at load via
-    /// [`effective_offload_policy`] (honoring both `LoadSpec::offload_policy` and the family-wide
-    /// `CANDLE_GEN_OFFLOAD=sequential` A/B override). [`OffloadPolicy::Resident`] keeps the cached
+    /// Video component-residency policy (epic 12732, sc-12733), copied from `LoadSpec` at load.
+    /// [`OffloadPolicy::Resident`] keeps the cached
     /// [`Components`] warm; [`OffloadPolicy::Sequential`] drives the staged
     /// [`Pipeline::render_sequential`] (TE-offload + expert-swap + VAE-staging), bounding the denoise
     /// peak on a 24 GB card. The resident [`components`](Self::components) cache stays untouched under
     /// `Sequential` — the staged path never populates it.
     offload: OffloadPolicy,
+    i2v_memory: Option<crate::i2v_memory_strategy::PreparedWanI2vMemory>,
+    lifecycle: Mutex<()>,
     components: Mutex<Option<Components>>,
 }
 
@@ -1092,6 +1118,9 @@ impl Generator for Wan14bGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        if let Some(prepared) = &self.i2v_memory {
+            crate::i2v_memory_strategy::validate_active_request(prepared, req)?;
+        }
         let pipe = match &self.comfyui {
             Some(experts) => {
                 Pipeline::load_comfyui(&self.root, &self.device, self.variant, experts.clone())
@@ -1106,18 +1135,62 @@ impl Generator for Wan14bGenerator {
         // Sequential offload (sc-12733): stage load→use→drop each heavy component so the denoise peak is
         // one expert instead of TE + both experts + VAE co-resident. Resident (default): the cached
         // `Components` bundle, unchanged path. The staged path never populates the resident cache.
-        let (frames, fps) = match self.offload {
-            OffloadPolicy::Sequential => pipe.render_sequential(req, on_progress)?,
-            OffloadPolicy::Resident => {
-                let components = self.components(&pipe)?;
-                pipe.render(req, &components, on_progress)?
+        let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
+        let staged =
+            self.offload == OffloadPolicy::Sequential || crate::i2v_memory_strategy::staged(req);
+        let (frames, fps) = if staged {
+            let mut components = candle_gen::lock_recover(&self.components);
+            if components.is_some() {
+                self.device
+                    .synchronize()
+                    .map_err(gen_core::Error::backend)?;
+                drop(components.take());
             }
+            drop(components);
+            pipe.render_sequential(req, on_progress)?
+        } else {
+            let components = self.components(&pipe)?;
+            pipe.render(req, &components, on_progress)?
         };
         Ok(GenerationOutput::Video {
             frames,
             fps,
             audio: None,
         })
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.i2v_memory.as_ref().map(|prepared| &prepared.contract)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        self.i2v_memory.as_ref().map_or_else(
+            || {
+                if context.selection.strategy == gen_core::MemoryStrategy::Resident {
+                    gen_core::MemorySafetyDecision::Accept
+                } else {
+                    gen_core::MemorySafetyDecision::Reject {
+                        reason: format!("{} has no prepared I2V memory receipt", self.variant.id()),
+                    }
+                }
+            },
+            |prepared| crate::i2v_memory_strategy::safety_check(prepared, context),
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        match &self.i2v_memory {
+            Some(prepared) => {
+                crate::i2v_memory_strategy::begin_request(prepared, self.device.clone(), context)
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -1126,6 +1199,9 @@ impl Generator for Wan14bGenerator {
 /// load; quant still deferred). `conditioning` differs per variant.
 fn descriptor_for(variant: Variant) -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
+        control_kinds: None,
         required_components: &[],
         id: variant.id(),
         family: "wan",
@@ -1134,7 +1210,6 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             conditioning: match variant {
                 Variant::T2v => vec![],
                 Variant::I2v => vec![ConditioningKind::Reference],
@@ -1143,34 +1218,19 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             supports_lokr: true,
             // Curated `uni_pc` (sc-7296) → Wan's native UniPC; `euler` flow Euler. Legacy `unipc` alias.
             samplers: vec!["uni_pc", "euler", "unipc"],
-            schedulers: vec![],
-            supported_guidance_methods: vec![],
             min_size: 16,
             max_size: 1280,
             max_count: 1,
-            mac_only: false,
             // Q4/Q8 packed MLX tiers (sc-10025): both dual-expert `WanTransformer` backbones load packed
             // via the shared packed-detect loaders; the tiers are pre-quantized (no on-the-fly quant).
             // Tier ingestion (MLX layout + key remap) is sc-10026.
             supported_quants: &[Quant::Q4, Quant::Q8],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // A14B honors `OffloadPolicy::Sequential` (epic 12732, sc-12733): the staged
             // `render_sequential` offloads UMT5 during denoise and holds only the ACTIVE MoE expert
             // resident (never both), dropping the pre-decode peak on a 24 GB card. Advertised so the
             // worker's fit-gate can tell "bounds peak here" from a no-op fallback.
             supports_sequential_offload: true,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            ..Default::default()
         },
     }
 }
@@ -1214,9 +1274,14 @@ fn build_generator(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Wan14b
         )));
     }
     let device = candle_gen::default_device()?;
-    // Resolve the residency policy once (sc-12733): honors both `spec.offload_policy` and the
-    // family-wide `CANDLE_GEN_OFFLOAD=sequential` A/B override.
-    let offload = effective_offload_policy(spec.offload_policy);
+    // Video retains the explicit load-time policy contract (sc-12733).
+    let offload = spec.offload_policy;
+    let i2v_memory =
+        if spec.resolved_route.as_deref() == Some(id) && spec.prepared_file_pins().is_prepared() {
+            Some(crate::i2v_memory_strategy::prepare(spec, id)?)
+        } else {
+            None
+        };
     Ok(Wan14bGenerator {
         descriptor: descriptor_for(variant),
         variant,
@@ -1225,6 +1290,8 @@ fn build_generator(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Wan14b
         adapters: spec.adapters.clone(),
         comfyui: None,
         offload,
+        i2v_memory,
+        lifecycle: Mutex::new(()),
         components: Mutex::new(None),
     })
 }
@@ -1309,7 +1376,7 @@ fn build_comfyui_generator(
 ) -> gen_core::Result<Wan14bGenerator> {
     let variant = if i2v { Variant::I2v } else { Variant::T2v };
     let device = candle_gen::default_device()?;
-    let offload = effective_offload_policy(offload_policy);
+    let offload = offload_policy;
     Ok(Wan14bGenerator {
         descriptor: descriptor_for(variant),
         variant,
@@ -1323,6 +1390,8 @@ fn build_comfyui_generator(
             vae_file,
         })),
         offload,
+        i2v_memory: None,
+        lifecycle: Mutex::new(()),
         components: Mutex::new(None),
     })
 }
@@ -1350,6 +1419,101 @@ candle_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn both_a14b_public_loaders_publish_prepared_contracts_at_every_tier() {
+        use gen_core::wan_i2v_memory::{fixture_snapshot_root, WanI2vBackend, WanI2vRoute};
+        use gen_core::Quant;
+        for (variant, route, repository, revision) in [
+            (
+                Variant::T2v,
+                WanI2vRoute::T2v14b,
+                "SceneWorks--wan2.2-t2v-a14b-candle",
+                "da1909b66b360e1ea8cdeb3e39e40dca172cfa32",
+            ),
+            (
+                Variant::I2v,
+                WanI2vRoute::I2v14b,
+                "SceneWorks--wan2.2-i2v-a14b-candle",
+                "d01bf1ea995c01a5bc545cefb977a320c9cb9fd0",
+            ),
+        ] {
+            for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = if let Some(quant) = quant {
+                    temp.path()
+                        .join(format!("models--{repository}"))
+                        .join("snapshots")
+                        .join(revision)
+                        .join(if quant == Quant::Q4 { "q4" } else { "q8" })
+                } else {
+                    fixture_snapshot_root(temp.path(), WanI2vBackend::Candle, route)
+                };
+                std::fs::create_dir_all(root.join("tokenizer")).unwrap();
+                std::fs::write(root.join("model_index.json"), "{}").unwrap();
+                std::fs::write(root.join("tokenizer/tokenizer.json"), "{}").unwrap();
+                for component in ["transformer", "transformer_2", "vae", "text_encoder"] {
+                    let dir = root.join(component);
+                    std::fs::create_dir_all(&dir).unwrap();
+                    std::fs::write(dir.join("config.json"), "{}").unwrap();
+                    let mut headers = serde_json::Map::new();
+                    let mut offset = 0usize;
+                    let mut add = |name: &str, dtype: &str, shape: Vec<usize>, width: usize| {
+                        let end = offset + shape.iter().product::<usize>() * width;
+                        headers.insert(name.to_owned(), serde_json::json!({"dtype":dtype,"shape":shape,"data_offsets":[offset,end]}));
+                        offset = end;
+                    };
+                    if let Some(quant) = quant.filter(|_| component.starts_with("transformer")) {
+                        add(
+                            "proj.weight",
+                            "U32",
+                            vec![2, if quant == Quant::Q4 { 8 } else { 16 }],
+                            4,
+                        );
+                        add("proj.scales", "F32", vec![2, 1], 4);
+                        add("proj.biases", "F32", vec![2, 1], 4);
+                        std::fs::write(
+                            dir.join("quantize_config.json"),
+                            format!(
+                                "{{\"bits\":{},\"quantization\":{{\"group_size\":64}}}}",
+                                quant.bits()
+                            ),
+                        )
+                        .unwrap();
+                    } else {
+                        add("weight", "F32", vec![2, 64], 4);
+                    }
+                    let mut header = serde_json::to_vec(&headers).unwrap();
+                    while !header.len().is_multiple_of(8) {
+                        header.push(b' ');
+                    }
+                    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+                    bytes.extend(header);
+                    bytes.resize(bytes.len() + offset, 0);
+                    std::fs::write(dir.join("model.safetensors"), bytes).unwrap();
+                }
+                let mut spec =
+                    LoadSpec::new(WeightsSource::Dir(root)).with_resolved_route(variant.id());
+                spec.quantize = quant;
+                let registry = crate::provider_registry().unwrap();
+                assert!(registry
+                    .load(variant.id(), &spec)
+                    .unwrap()
+                    .memory_strategy_contract()
+                    .is_none());
+                crate::i2v_memory_strategy::prepare_load_spec(&mut spec, variant.id()).unwrap();
+                let prepared = crate::i2v_memory_strategy::prepare(&spec, variant.id()).unwrap();
+                let loaded = registry.load(variant.id(), &spec).unwrap();
+                let contract = loaded
+                    .memory_strategy_contract()
+                    .expect("prepared public loader retains its contract");
+                assert_eq!(contract.provider_id, variant.id());
+                assert_eq!(contract.calibration, prepared.contract.calibration);
+                assert_eq!(contract.asset_facts, prepared.contract.asset_facts);
+                assert_eq!(prepared.tier.quant, quant);
+            }
+        }
+    }
 
     #[test]
     fn registers_both_as_candle_video() {
@@ -1636,8 +1800,24 @@ mod tests {
         }
     }
 
-    /// The load path resolves the residency policy from `LoadSpec::offload_policy` via
-    /// [`effective_offload_policy`]: the default spec stays `Resident` (cached-components, unchanged
+    #[test]
+    fn descriptors_classify_staging_as_selectable_not_unconditional() {
+        for descriptor in [descriptor_t2v_14b(), descriptor_i2v_14b()] {
+            assert!(
+                !descriptor
+                    .capabilities
+                    .unconditionally_engages_staged_residency
+            );
+            assert_eq!(
+                descriptor.capabilities.staged_residency_availability(),
+                candle_gen::gen_core::StagedResidencyAvailability::Selectable,
+                "{} only stages when the selectable policy is requested",
+                descriptor.id
+            );
+        }
+    }
+
+    /// The load path copies the residency policy from `LoadSpec::offload_policy`: the default spec stays `Resident` (cached-components, unchanged
     /// path), an explicit `Sequential` spec flips the generator onto the staged expert-swap render.
     #[test]
     fn load_resolves_offload_policy_from_spec() {
@@ -1658,7 +1838,7 @@ mod tests {
     }
 
     #[test]
-    fn comfyui_public_load_honors_explicit_policy_and_env_override() {
+    fn comfyui_public_load_honors_explicit_policy() {
         let call = |policy| {
             load_from_comfyui_experts_with_offload(
                 "/comfy/high.safetensors",
@@ -1672,7 +1852,6 @@ mod tests {
             .unwrap();
             last_public_comfyui_offload_for_test().unwrap()
         };
-        let _env = candle_gen::testkit::EnvVarGuard::set(candle_gen::OFFLOAD_ENV, None);
         assert_eq!(
             call(OffloadPolicy::Sequential),
             OffloadPolicy::Sequential,
@@ -1682,15 +1861,6 @@ mod tests {
             call(OffloadPolicy::Resident),
             OffloadPolicy::Resident,
             "the compatibility loader's historical default remains resident"
-        );
-
-        drop(_env);
-        let _env =
-            candle_gen::testkit::EnvVarGuard::set(candle_gen::OFFLOAD_ENV, Some("sequential"));
-        assert_eq!(
-            call(OffloadPolicy::Resident),
-            OffloadPolicy::Sequential,
-            "the documented process-wide override still upgrades the public Resident request"
         );
     }
 

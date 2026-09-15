@@ -20,7 +20,7 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{Image, OffloadPolicy, Progress, Quant};
+use candle_gen::gen_core::{Image, OffloadPolicy, PreviewSink, Progress, Quant};
 use candle_gen_krea::{
     Krea2Control, Krea2ControlPaths, Krea2ControlRequest, DEFAULT_CONTROL_SCALE,
 };
@@ -37,11 +37,11 @@ struct Args {
     out: PathBuf,
     /// Quantize the control-branch overlay for the small-card load (sc-11743): `q4` / `q8` keep it
     /// packed in VRAM (dequant-on-forward), `bf16` (default) is the full-precision branch.
-    branch_quant: Option<Quant>,
+    branch_tier: Option<Quant>,
 }
 
 /// `q4` / `q8` → the packed branch load; `bf16` → dense. Any other value panics (example CLI).
-fn parse_branch_quant(v: &str) -> Option<Quant> {
+fn parse_branch_tier(v: &str) -> Option<Quant> {
     match v {
         "q4" | "Q4" => Some(Quant::Q4),
         "q8" | "Q8" => Some(Quant::Q8),
@@ -61,7 +61,7 @@ fn parse_args() -> Args {
         steps: 8,
         size: 1024,
         out: PathBuf::from("krea_control_provider.png"),
-        branch_quant: None,
+        branch_tier: None,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -82,7 +82,7 @@ fn parse_args() -> Args {
             "--steps" => a.steps = val().parse().expect("--steps"),
             "--size" => a.size = val().parse().expect("--size"),
             "--out" => a.out = val().into(),
-            "--branch-quant" => a.branch_quant = parse_branch_quant(&val()),
+            "--branch-quant" => a.branch_tier = parse_branch_tier(&val()),
             other => panic!("unknown flag {other}"),
         }
         i += 2;
@@ -117,16 +117,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(false);
     let model = Krea2Control::load(&Krea2ControlPaths {
         root: a.snapshot,
+        convrot_dit: std::env::var("KREA_CONTROL_CONVROT_DIT")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from),
+        native_dit: None,
         control: a.ckpt,
         adapters: Vec::new(),
-        branch_quant: a.branch_quant,
+        branch_tier: a.branch_tier,
         chunk_attention,
-        // `CANDLE_GEN_OFFLOAD=sequential` overrides this resident default for the two-process peak A/B.
+        // Legacy compatibility only; set `Krea2ControlRequest::stage_residency` per request.
         offload_policy: OffloadPolicy::Resident,
     })?;
     eprintln!(
-        "loaded Krea2Control (branch_quant {:?}, chunk_attention {chunk_attention}); rendering {}x{} @ scale {}",
-        a.branch_quant, a.size, a.size, a.scale
+        "loaded Krea2Control (branch_tier {:?}, chunk_attention {chunk_attention}); rendering {}x{} @ scale {}",
+        a.branch_tier, a.size, a.size, a.scale
     );
 
     // `KREA_TILE_VAE=1` forces the seam-free tiled VAE decode below the im2col threshold (sc-11744) —
@@ -134,6 +139,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tile_vae_decode = std::env::var("KREA_TILE_VAE")
         .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
         .unwrap_or(false);
+    // `KREA_PREVIEW_DIR=<dir>` attaches a live per-step preview sink (epic 16948, sc-16950) and writes
+    // each latent-resolution frame as a PNG — the control route's real-weight preview check, since it
+    // is a bespoke by-name provider rather than a registered generator a test can drive. Unset leaves
+    // the inert default, which is byte-identical to a render with no preview at all.
+    let preview = match std::env::var("KREA_PREVIEW_DIR").ok().map(PathBuf::from) {
+        Some(dir) => {
+            std::fs::create_dir_all(&dir)?;
+            eprintln!("preview frames → {}", dir.display());
+            PreviewSink::new(move |frame| {
+                let path = dir.join(format!("preview_{:03}.png", frame.current));
+                let saved = image::RgbImage::from_raw(
+                    frame.image.width,
+                    frame.image.height,
+                    frame.image.pixels,
+                )
+                .map(|buf| buf.save(&path));
+                eprintln!(
+                    "  preview {}/{} {}x{} → {}",
+                    frame.current,
+                    frame.total,
+                    frame.image.width,
+                    frame.image.height,
+                    if matches!(saved, Some(Ok(()))) {
+                        path.display().to_string()
+                    } else {
+                        "(write failed)".to_owned()
+                    }
+                );
+            })
+        }
+        None => PreviewSink::default(),
+    };
     let req = Krea2ControlRequest {
         prompt: a.prompt,
         width: a.size,
@@ -143,7 +180,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         text_style_gain: None,
         seed: a.seed,
         tile_vae_decode,
+        stage_residency: false,
         cancel: CancelFlag::new(),
+        preview,
     };
     let mut on_progress = |p: Progress| {
         if let Progress::Step { current, total } = p {

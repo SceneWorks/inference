@@ -515,6 +515,27 @@ pub struct VideoState {
     encoded: BTreeMap<i32, Encoded>,
 }
 
+/// Validate the externally supplied clip tensor and its original pixel geometry before constructing
+/// any mutable tracking state. `images` is the reference predictor's preprocessed clip.
+fn validate_video_state_inputs(shape: &[i32], video_h: u32, video_w: u32) -> Result<i32> {
+    if video_h == 0 || video_w == 0 {
+        return Err(Error::Msg(format!(
+            "sam2 video init: video dimensions must be non-zero, got {video_w}x{video_h}"
+        )));
+    }
+    if shape.len() != 4
+        || shape[0] <= 0
+        || shape[1] != 3
+        || shape[2] != IMAGE_SIZE
+        || shape[3] != IMAGE_SIZE
+    {
+        return Err(Error::Msg(format!(
+            "sam2 video init: images must have shape [T, 3, {IMAGE_SIZE}, {IMAGE_SIZE}] with T > 0, got {shape:?}"
+        )));
+    }
+    Ok(shape[0])
+}
+
 impl Sam2VideoPredictor {
     pub fn from_weights(w: &Weights, cfg: &Sam2ImageEncoderConfig) -> Result<Self> {
         Ok(Self {
@@ -528,9 +549,14 @@ impl Sam2VideoPredictor {
 
     /// `init_state` from already-preprocessed frames `[T, 3, 1024, 1024]` (the reference's
     /// `state["images"]`) plus the original video size (for prompt coordinate scaling).
-    pub fn init_state_from_pixels(&self, images: Array, video_h: u32, video_w: u32) -> VideoState {
-        let num_frames = images.shape()[0];
-        VideoState {
+    pub fn init_state_from_pixels(
+        &self,
+        images: Array,
+        video_h: u32,
+        video_w: u32,
+    ) -> Result<VideoState> {
+        let num_frames = validate_video_state_inputs(images.shape(), video_h, video_w)?;
+        Ok(VideoState {
             images,
             num_frames,
             video_h,
@@ -540,7 +566,7 @@ impl Sam2VideoPredictor {
             points: BTreeMap::new(),
             frames_tracked: BTreeMap::new(),
             encoded: BTreeMap::new(),
-        }
+        })
     }
 
     /// `init_state` from raw RGB8 HWC frames (each `video_h × video_w × 3`): preprocess them into the
@@ -551,12 +577,22 @@ impl Sam2VideoPredictor {
         video_h: u32,
         video_w: u32,
     ) -> Result<VideoState> {
+        if frames.is_empty() {
+            return Err(Error::Msg(
+                "sam2 video init: frames must contain at least one image".into(),
+            ));
+        }
+        if video_h == 0 || video_w == 0 {
+            return Err(Error::Msg(format!(
+                "sam2 video init: video dimensions must be non-zero, got {video_w}x{video_h}"
+            )));
+        }
         let per = frames
             .iter()
             .map(|f| preprocess(f, video_h as usize, video_w as usize))
             .collect::<Result<Vec<_>>>()?;
         let images = concatenate_axis(&per.iter().collect::<Vec<_>>(), 0)?;
-        Ok(self.init_state_from_pixels(images, video_h, video_w))
+        self.init_state_from_pixels(images, video_h, video_w)
     }
 
     fn frame_pixels(&self, state: &VideoState, frame_idx: i32) -> Result<Array> {
@@ -1000,6 +1036,46 @@ use crate::util::bilinear_resize_f32 as resize_bilinear_2d;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_state_rejects_zero_pixel_dimensions() {
+        for (height, width) in [(0, 640), (480, 0), (0, 0)] {
+            let err = validate_video_state_inputs(&[1, 3, 1024, 1024], height, width).unwrap_err();
+            assert!(
+                matches!(err, Error::Msg(message) if message.contains("dimensions must be non-zero"))
+            );
+        }
+    }
+
+    #[test]
+    fn video_state_rejects_zero_or_malformed_clip_shapes() {
+        let malformed: &[&[i32]] = &[
+            &[],
+            &[1],
+            &[1, 3, 1024],
+            &[0, 3, 1024, 1024],
+            &[1, 1, 1024, 1024],
+            &[1, 3, 512, 1024],
+            &[1, 3, 1024, 512],
+            &[1, 3, 1024, 1024, 1],
+        ];
+        for shape in malformed {
+            let err = validate_video_state_inputs(shape, 480, 640).unwrap_err();
+            assert!(matches!(
+                err,
+                Error::Msg(message)
+                    if message.contains("images must have shape [T, 3, 1024, 1024]")
+            ));
+        }
+    }
+
+    #[test]
+    fn video_state_accepts_a_non_empty_canonical_clip_shape() {
+        assert_eq!(
+            validate_video_state_inputs(&[7, 3, 1024, 1024], 480, 640).unwrap(),
+            7
+        );
+    }
 
     /// Forward tracking pulls the spatial memory bank from the consecutive frames immediately behind
     /// the current one: slots t_pos 6..1 → frames `current-1 .. current-6` (stride 1).

@@ -85,7 +85,7 @@ Apple Silicon required.
 ```sh
 cargo test          # unit + synthetic streaming tests (no model weights needed)
 # Real-weights end-to-end test (downloads/points at a Llama snapshot):
-MLX_LLM_TEST_MODEL=/path/to/snapshot cargo test --test real_weights -- --ignored --nocapture
+MLX_LLM_TEST_MODEL=/path/to/snapshot cargo test --test integration -- real_weights:: --ignored --nocapture
 ```
 
 ## License

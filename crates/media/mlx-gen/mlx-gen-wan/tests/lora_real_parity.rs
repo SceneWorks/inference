@@ -19,7 +19,7 @@
 //! WAN_LORA_HIGH="…/lauren_high/lauren_wan22_high_epoch_95.safetensors" \
 //! WAN_LORA_LOW="…/lauren_low/lauren_wan22_low_epoch_30.safetensors" \
 //! WAN_LORA_FIXTURE=/tmp/wan_a14b_lora.safetensors \
-//!   cargo test -p mlx-gen-wan --test lora_real_parity -- --ignored --nocapture
+//!   cargo test -p mlx-gen-wan --test integration lora_real_parity:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

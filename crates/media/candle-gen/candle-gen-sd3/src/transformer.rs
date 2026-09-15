@@ -1549,15 +1549,14 @@ mod tests {
                 Tensor::randn(0f32, 0.5f32, (out, rank), &dev).unwrap(),
             );
         }
-        let tmp =
-            std::env::temp_dir().join(format!("sc11105_sd3_{}.safetensors", std::process::id()));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().join("sc11105_sd3.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp).unwrap();
         let report = crate::adapters::install_additive(
             &mut adapted,
             &[AdapterSpec::new(tmp.clone(), 1.0, AdapterKind::Lora)],
         )
         .unwrap();
-        std::fs::remove_file(&tmp).ok();
         assert_eq!(
             report.applied, 4,
             "attn (to_q + to_out.0) + AdaLN/embedder (norm_out.linear + timestep_embedder.linear_2) \

@@ -4,7 +4,7 @@
 //! `#[ignore]`d — needs the real `microsoft/Mage-Flow-Base` snapshot in `MAGE_BASE_SNAPSHOT`. Run
 //! (this Mac can run MLX GPU):
 //!   MAGE_BASE_SNAPSHOT=/path/to/Mage-Flow-Base \
-//!     cargo test -p mlx-gen-mage --release --test trainer_e2e -- --ignored --nocapture
+//!     cargo test -p mlx-gen-mage --release --test integration trainer_e2e:: -- --ignored --nocapture
 //!
 //! Proves the full prepare→cache→train→save lifecycle: a tiny captioned PNG dataset is Mage-VAE /
 //! Qwen3-VL encoded and cached, AdamW training drives the rectified flow-match loss down, and a PEFT
@@ -84,7 +84,8 @@ fn max_abs_diff(a: &mlx_rs::Array, b: &mlx_rs::Array) -> f32 {
 }
 
 fn train_and_check(network_type: NetworkType, kind: AdapterKind, tag: &str) {
-    let tmp = std::env::temp_dir().join(format!("mage_trainer_e2e_{tag}"));
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
 
     let mut trainer = mlx_gen_mage::provider_registry()
@@ -236,7 +237,8 @@ fn mage_lokr_trains_writes_adapter_and_reloads() {
 #[test]
 #[ignore = "needs real Mage-Flow-Base weights (MAGE_BASE_SNAPSHOT); renders previews"]
 fn mage_trainer_emits_preview_samples() {
-    let tmp = std::env::temp_dir().join("mage_trainer_e2e_samples");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
 
     let mut trainer = mlx_gen_mage::provider_registry()
@@ -321,7 +323,8 @@ fn mage_trainer_emits_preview_samples() {
 fn mage_lora_reload_changes_generated_image() {
     use mlx_gen_mage::{resolve_gs_key, GenerationSample, MageFlowPipeline};
 
-    let tmp = std::env::temp_dir().join("mage_trainer_e2e_render");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
 
     let mut trainer = mlx_gen_mage::provider_registry()

@@ -2,7 +2,7 @@
 
 Run from the fork:  cd ~/repos/mflux && uv run python tools/dump_z_image_golden.py
 
-Loads the real Tongyi-MAI/Z-Image-Turbo models and runs a fixed (prompt, seed, steps, size)
+Loads the licensed SceneWorks Z-Image-Turbo MLX snapshot and runs a fixed (prompt, seed, steps, size)
 generation by hand (mirroring z_image.py), dumping EVERY intermediate so the Rust port can be
 validated stage-by-stage: the chat-template string, input_ids/attention_mask, cap_feats, the
 seeded init noise, the final latents, and the decoded image. Real bf16 path (matches production).
@@ -14,8 +14,12 @@ in, so the gate isolates the transformer's (and VAE-decode's) quantization parit
 methodology as `dump_qwen_image_golden.py`. Output suffix: `_q8` / `_q4`.
 """
 
+import gc
+import os
+
 import mlx.core as mx
 import numpy as np
+from _adapter_parity_provenance import assert_frozen_mflux, golden_metadata
 from mflux.models.common.config.model_config import ModelConfig
 from mflux.models.common.schedulers.flow_match_euler_discrete_scheduler import (
     FlowMatchEulerDiscreteScheduler as S,
@@ -24,8 +28,6 @@ from mflux.models.z_image.latent_creator.z_image_latent_creator import ZImageLat
 from mflux.models.z_image.model.z_image_text_encoder.prompt_encoder import PromptEncoder
 from mflux.models.z_image.z_image_initializer import ZImageInitializer
 from mflux.utils.image_util import ImageUtil
-
-import os
 
 # Golden lives next to this script (tools/golden/), gitignored — and is where the Rust e2e test's
 # `CARGO_MANIFEST_DIR/../tools/golden` resolves when run from this checkout/worktree.
@@ -39,6 +41,17 @@ STEPS = int(os.environ.get("ZIMAGE_STEPS", "4"))
 W = int(os.environ.get("ZIMAGE_W", "256"))
 H = int(os.environ.get("ZIMAGE_H", "256"))
 QUANTIZE = int(os.environ["QUANTIZE"]) if os.environ.get("QUANTIZE") else None
+MODEL_REPOSITORY = os.environ.get(
+    "ZIMAGE_REFERENCE_REPOSITORY", "SceneWorks/z-image-turbo-mlx"
+)
+MODEL_REVISION = os.environ.get(
+    "ZIMAGE_REFERENCE_REVISION", "bb2bc9893b3c49ae96c813350775f791a2e8bc80"
+)
+MODEL_SUBDIRECTORY = os.environ.get("ZIMAGE_REFERENCE_SUBDIRECTORY", "bf16")
+MODEL_REFERENCE = os.environ.get("ZIMAGE_REFERENCE_REF", "main")
+MODEL_PATH = os.environ.get("ZIMAGE_REFERENCE_MODEL", MODEL_REPOSITORY)
+MLX_CACHE_LIMIT_GB = float(os.environ.get("ZIMAGE_MLX_CACHE_LIMIT_GB", "2.5"))
+assert_frozen_mflux()
 
 _SUFFIX = f"_q{QUANTIZE}" if QUANTIZE else ""
 OUT = os.path.join(_GOLDEN_DIR, f"z_image{_SUFFIX}_golden.safetensors")
@@ -49,8 +62,31 @@ class Holder:
     pass
 
 
+def configure_low_peak() -> None:
+    if MLX_CACHE_LIMIT_GB <= 0:
+        raise ValueError("MLX cache limit must be positive")
+    mx.set_cache_limit(int(MLX_CACHE_LIMIT_GB * (1000**3)))
+    mx.clear_cache()
+    mx.reset_peak_memory()
+
+
+def release_text_encoder(model, cap_feats) -> None:
+    mx.eval(cap_feats)
+    if not hasattr(model, "text_encoder") or model.text_encoder is None:
+        raise RuntimeError("Z-Image text encoder was unavailable before prompt release")
+    model.text_encoder = None
+    gc.collect()
+    mx.clear_cache()
+
+
 model = Holder()
-ZImageInitializer.init(model, model_config=ModelConfig.z_image_turbo(), quantize=QUANTIZE)
+configure_low_peak()
+ZImageInitializer.init(
+    model,
+    model_config=ModelConfig.z_image_turbo(),
+    quantize=QUANTIZE,
+    model_path=MODEL_PATH,
+)
 
 tok = model.tokenizers["z_image"]
 chat = tok.tokenizer.apply_chat_template(
@@ -68,6 +104,7 @@ num_valid = int(mx.sum(attn[0]).item())
 print(f"num_valid tokens: {num_valid}; first ids: {np.array(input_ids[0, :num_valid]).tolist()}")
 
 cap_feats = PromptEncoder.encode_prompt(PROMPT, tok, model.text_encoder)  # [num_valid, 2560]
+release_text_encoder(model, cap_feats)
 
 # Schedule + seeded init noise. Z-Image-Turbo pins a STATIC time-shift (its
 # scheduler/scheduler_config.json: FlowMatchEulerDiscreteScheduler, shift=3.0,
@@ -109,7 +146,23 @@ tensors = {
     "decoded": decoded.astype(mx.float32),
     "sigmas": sigmas.astype(mx.float32),
 }
-meta = {"prompt": PROMPT, "seed": str(SEED), "steps": str(STEPS), "w": str(W), "h": str(H),
-        "num_valid": str(num_valid), "chat": chat, "quantize": str(QUANTIZE)}
+meta = {
+    "prompt": PROMPT,
+    "seed": str(SEED),
+    "steps": str(STEPS),
+    "w": str(W),
+    "h": str(H),
+    "num_valid": str(num_valid),
+    "chat": chat,
+    "quantize": str(QUANTIZE),
+    **golden_metadata(
+        script=__file__,
+        model_path=MODEL_PATH,
+        model_repository=MODEL_REPOSITORY,
+        model_revision=MODEL_REVISION,
+        model_subdirectory=MODEL_SUBDIRECTORY,
+        model_reference=MODEL_REFERENCE,
+    ),
+}
 mx.save_safetensors(OUT, tensors, meta)
 print(f"\nwrote {OUT} + {PNG}; final_latents {tuple(latents.shape)}, decoded {tuple(decoded.shape)}")

@@ -93,7 +93,7 @@ fn run_smoke(dir: &PathBuf, sampler: SampleParams) -> String {
 }
 
 /// Heavy: censored path on the loaded TE backbone (the default enhancer). Run with
-/// `cargo test -p mlx-gen-ltx --test enhance_parity -- --ignored --nocapture`.
+/// `cargo test -p mlx-gen-ltx --test integration enhance_parity:: -- --ignored --nocapture`.
 #[test]
 #[ignore = "heavy: needs the local gemma-3-12b-it-bf16 snapshot (~24GB) + autoregressive generation"]
 fn censored_enhancer_produces_nonempty_cleaned_rewrite() {

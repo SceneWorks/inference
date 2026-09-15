@@ -11,7 +11,7 @@
 //! low step count to bound cost (the decode is what's under test).
 //!
 //! ```sh
-//! cargo test -p mlx-gen-flux --release --test pid_decode_real_weights -- --ignored --nocapture
+//! cargo test -p mlx-gen-flux --release --test integration pid_decode_real_weights:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

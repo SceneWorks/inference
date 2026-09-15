@@ -56,4 +56,10 @@ impl Qwen3DecoderLayer {
         self.mlp.quantize(bits)?;
         Ok(())
     }
+
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        mlx_rs::transforms::eval([&self.input_ln, &self.post_ln])?;
+        self.attn.materialize_weights()?;
+        self.mlp.materialize_weights()
+    }
 }

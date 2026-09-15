@@ -7,7 +7,7 @@
 //!     reference run with `do_resize=False`, so the non-bit-identical PIL resize is excluded) —
 //!     elementwise affine + an exact reshape, so it matches to ~1e-5.
 //!
-//! Run: `cargo test -p mlx-gen-bernini --test vit_preprocess_parity -- --nocapture`
+//! Run: `cargo test -p mlx-gen-bernini --test integration vit_preprocess_parity:: -- --nocapture`
 
 use mlx_gen::weights::Weights;
 use mlx_gen_bernini::vit_preprocess::{pack_patches, smart_resize, smart_video_nframes};

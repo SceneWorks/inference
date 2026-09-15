@@ -5,7 +5,7 @@
 //!
 //! ```sh
 //! MAGE_SNAPSHOT=/path/to/microsoft--Mage-Flow/snapshots/<rev> \
-//!   cargo test -p mlx-gen-mage --release --test vae_decode_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-mage --release --test integration vae_decode_real_weights:: -- --ignored --nocapture
 //! ```
 //!
 //! Weights come from `$MAGE_SNAPSHOT` (required); goldens from `$MAGE_GOLDEN_DIR` or

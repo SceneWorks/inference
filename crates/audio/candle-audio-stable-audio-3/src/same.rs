@@ -1206,6 +1206,19 @@ impl SameAutoencoder {
             .0)
     }
 
+    /// Type-erased encoder seam, so the request-local stream can drive an encode without owning a
+    /// second [`SameNoiseRng`]. Mirrors [`Self::decode_with_noise_source`].
+    fn encode_with_noise_source(
+        &self,
+        audio: &Tensor,
+        override_strides: Option<&[usize]>,
+        rng: &mut dyn SameNoiseSource,
+    ) -> Result<Tensor> {
+        Ok(self
+            .encode_internal(audio, override_strides, None, Some(rng), false)?
+            .0)
+    }
+
     /// Explicit encoder token-noise parity seam, in encoder stage order.
     pub fn encode_with_noise(
         &self,
@@ -1525,6 +1538,56 @@ impl SameAutoencoder {
             pieces.push(owned_piece(&encoded, ownership)?);
         }
         concatenate_owned(pieces, plan.total_units, "encode")
+    }
+
+    /// Encode with the same request-local stream used for initial latents, Pingpong, and decode.
+    ///
+    /// This is the seam the audio→audio restyle path needs (sc-14547). [`Self::encode_audio_with_rng`]
+    /// takes a concrete [`SameNoiseRng`], i.e. a stochastic stream *independent* of the request, so a
+    /// provider using it could not state — let alone gate — where the source encode's draws sit
+    /// relative to the sampler's initial noise. Threading the request stream makes the draw order
+    /// observable through [`NoiseSource::draws`](crate::sampler::NoiseSource::draws).
+    ///
+    /// Cancellation is checked before every direct or chunked SAME dispatch, matching
+    /// [`Self::decode_audio_with_request_rng`].
+    pub fn encode_audio_with_request_rng(
+        &self,
+        audio: &Tensor,
+        policy: SameChunkingPolicy,
+        parameters: SameChunkingParameters,
+        rng: &mut SeededNoise,
+        is_canceled: &dyn Fn() -> bool,
+    ) -> candle_audio::Result<Tensor> {
+        let mut adapter = RequestSameNoise { source: rng };
+        let plan = self.encode_chunk_plan(audio, policy, parameters)?;
+        if !plan.chunked {
+            if is_canceled() {
+                return Err(candle_audio::AudioError::Canceled);
+            }
+            return Ok(self.encode_with_noise_source(audio, None, &mut adapter)?);
+        }
+        let chunk_samples = plan
+            .chunk_size
+            .checked_mul(self.downsampling_ratio)
+            .ok_or_else(|| {
+                candle_audio::AudioError::Msg("SAME outer encode chunk size overflow".into())
+            })?;
+        let mut pieces = Vec::with_capacity(plan.ownership.len());
+        for ownership in &plan.ownership {
+            if is_canceled() {
+                return Err(candle_audio::AudioError::Canceled);
+            }
+            let sample_start = ownership
+                .chunk_start
+                .checked_mul(self.downsampling_ratio)
+                .ok_or_else(|| {
+                    candle_audio::AudioError::Msg("SAME outer encode start overflow".into())
+                })?;
+            let chunk = audio.narrow(2, sample_start, chunk_samples)?;
+            let encoded = self.encode_with_noise_source(&chunk, None, &mut adapter)?;
+            pieces.push(owned_piece(&encoded, ownership)?);
+        }
+        Ok(concatenate_owned(pieces, plan.total_units, "encode")?)
     }
 
     /// Controlled-noise outer encode seam. One stage-noise vector is required per executed chunk;

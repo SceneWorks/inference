@@ -5,11 +5,10 @@
 //! Krea ships a **pre-quantized** MLX tier (`SceneWorks/krea-2-turbo-mlx`, bf16/q4/q8) whose q4/q8
 //! snapshots store each quantized `Linear` as the MLX packed triple `{base}.weight` (u32 codes) +
 //! `{base}.scales` + `{base}.biases`. The group size is read from each component `config.json`'s
-//! `quantization.group_size` ([`candle_gen::quant::PackedConfig`]) and threaded through the shared
-//! group-size-aware loaders ([`candle_gen::quant::QLinear::from_packed_gs`] /
-//! `QEmbedding::from_packed_dtype_gs`, Q4 → `Q4_1` lossless repack, Q8 → `Q8_0`) — **not** a hardcoded
-//! 64 (the hosted tier happens to pack at 64, but the loader honours whatever the config says, exactly
-//! as boogu threads its group 32). **No dense bf16 weight is ever materialized** on the packed path.
+//! `quantization.group_size` ([`candle_gen::quant::PackedConfig`]). Component open prepares
+//! content-addressed GGML sidecars (Q4 → `Q4_1` lossless repack, Q8 → `Q8_0`) using that group size;
+//! module construction maps the sidecar and transfers its bytes without re-reading or converting the
+//! affine triple. **No dense bf16 weight is ever materialized** on the packed path.
 //!
 //! Absent `.scales` (a dense bf16 tier, or a projection MLX left dense) the **dense** path is taken
 //! **unchanged** (`candle_nn::Linear` / `Embedding` from `{base}.weight`), so one crate serves both a
@@ -17,7 +16,7 @@
 //!
 //! Krea's loader is a thin `MmapedSafetensors` wrapper ([`crate::loader::Weights`]) with an
 //! adapter-merge **overlay** (`set_overlay`, sc-7836), not a `VarBuilder` — so this seam builds the
-//! quantized module from **raw tensors** pulled through `Weights` (`from_packed_gs`) rather than the
+//! quantized module from a device-format [`QTensor`] supplied by `Weights` rather than the
 //! VarBuilder-detecting `candle_gen::quant::lin`. The compute path is identical (the shared
 //! dequant-on-forward `QLinear`/`QEmbedding`, sc-7702 — *not* candle's int8 `QMatMul` fast path, whose
 //! q8_1 activation quant NaNs on outlier text features).
@@ -30,8 +29,10 @@
 //! untargeted projections, while an adapted projection resolves to its correct merged dense weight —
 //! there is no packed `quantize_onto` to no-op here (that is the VarBuilder crates' seam).
 
+use candle_gen::candle_core::quantized::QTensor;
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear, Module};
+use candle_gen::gen_core::Quant;
 use candle_gen::quant::{self as shared, AdaptLinear, Int8Context};
 
 /// A Linear projection that is **residual-capable** (dense or MLX-packed base + optional forward-time
@@ -105,6 +106,46 @@ pub struct ConvRotInt8 {
     /// [`Self::forward`]).
     #[cfg(feature = "cuda")]
     lt: Option<std::sync::Arc<candle_gen::quant::Int8Linear>>,
+    /// User-selected residuals applied over the frozen INT8-ConvRot base. Keeping these separate from
+    /// the base preserves the int8 GEMM/online-rotation path and avoids materializing a dense weight.
+    adapters: Vec<ConvRotAdapter>,
+}
+
+enum ConvRotAdapter {
+    Lora {
+        a: Tensor,
+        b: Tensor,
+        scale: f64,
+    },
+    Lokr {
+        factors: candle_gen::quant::LokrFactors,
+    },
+}
+
+fn apply_adapter_factor(x: &Tensor, w: &Tensor) -> Result<Tensor> {
+    let dims = x.dims();
+    if w.rank() != 2 || dims.len() <= 2 {
+        return x.broadcast_matmul(w);
+    }
+    let (lead, k) = dims.split_at(dims.len() - 1);
+    let m: usize = lead.iter().product();
+    let mut out_dims = lead.to_vec();
+    out_dims.push(w.dim(1)?);
+    x.reshape((m, k[0]))?.matmul(w)?.reshape(out_dims)
+}
+
+impl ConvRotAdapter {
+    fn residual(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Lora { a, b, scale } => {
+                let dtype = x.dtype();
+                let a = a.to_dtype(dtype)?;
+                let b = b.to_dtype(dtype)?;
+                apply_adapter_factor(&apply_adapter_factor(x, &a)?, &b)? * *scale
+            }
+            Self::Lokr { factors } => factors.residual(x),
+        }
+    }
 }
 
 impl ConvRotInt8 {
@@ -125,7 +166,7 @@ impl ConvRotInt8 {
         Ok(self.rot.get_or_init(|| r))
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward_base(&self, x: &Tensor) -> Result<Tensor> {
         // Online ConvRot leg (sc-9601): rotate the activation by the same regular Hadamard folded into
         // the stored weight, so `RHT(x)·RHT(W)ᵀ = x·Wᵀ`. Runs on both the CUDA and CPU paths.
         let r = self.rotation(x)?.clone();
@@ -149,6 +190,18 @@ impl ConvRotInt8 {
             None => None,
         };
         Linear::new(w, bias).forward(&xr.to_dtype(in_dtype)?)
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let mut y = self.forward_base(x)?;
+        for adapter in &self.adapters {
+            if matches!(adapter, ConvRotAdapter::Lora { scale, .. } if *scale == 0.0) {
+                continue;
+            }
+            let residual = adapter.residual(x)?.to_dtype(y.dtype())?;
+            y = (y + residual)?;
+        }
+        Ok(y)
     }
 }
 
@@ -183,6 +236,22 @@ impl QLinear {
             (sd[0], sd[1] * group_size)
         };
         let q = shared::QLinear::from_packed_gs(wq, scales, biases, bias, group_size, &device)?;
+        Ok(Self::Adapt(AdaptLinear::from_packed(q, in_dim, out_dim)))
+    }
+
+    /// Build a packed projection from an already-converted GGML `QTensor` loaded from the
+    /// content-addressed sidecar cache (SC-16096). Unlike [`Self::packed`], this accepts no MLX
+    /// affine triple and therefore cannot repeat format conversion inside a block-window loop.
+    pub fn packed_device_format(qtensor: QTensor, bias: Option<Tensor>) -> Result<Self> {
+        let dims = qtensor.shape().dims();
+        if dims.len() != 2 {
+            candle_gen::candle_core::bail!(
+                "Krea packed device-format projection must be rank 2, got {:?}",
+                qtensor.shape()
+            );
+        }
+        let (out_dim, in_dim) = (dims[0], dims[1]);
+        let q = shared::QLinear::from_qtensor_dequant(std::sync::Arc::new(qtensor), bias);
         Ok(Self::Adapt(AdaptLinear::from_packed(q, in_dim, out_dim)))
     }
 
@@ -284,6 +353,7 @@ impl QLinear {
             rot: std::sync::OnceLock::new(),
             #[cfg(feature = "cuda")]
             lt,
+            adapters: Vec::new(),
         }))
     }
 
@@ -312,6 +382,56 @@ impl QLinear {
         }
     }
 
+    /// Fold a dense residual-capable base to Q4/Q8 while preserving its additive adapter stack.
+    /// Specialized ConvRot/NVFP4/probe projections implement different numeric contracts and reject
+    /// an affine fold instead of silently changing format.
+    pub fn quantize(&mut self, quant: Quant) -> Result<()> {
+        match self {
+            Self::Adapt(linear) => linear.quantize(quant),
+            Self::ConvRotInt8(_) => candle_gen::candle_core::bail!(
+                "Krea INT8-ConvRot projections cannot be re-quantized as {quant:?}"
+            ),
+            Self::Nvfp4(_) => candle_gen::candle_core::bail!(
+                "Krea NVFP4 projections cannot be re-quantized as {quant:?}"
+            ),
+            Self::Probed(_) => candle_gen::candle_core::bail!(
+                "Krea activation-probe projections cannot be quantized"
+            ),
+        }
+    }
+
+    /// CPU-stage fold for imported dense checkpoints: quantized projections land directly on the
+    /// compute device, so the full dense DiT never co-resides there with its Q4/Q8 replacement.
+    pub fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        match self {
+            Self::Adapt(linear) => {
+                linear.quantize_dequant_onto(quant, device)?;
+                linear.to_device(device)
+            }
+            Self::ConvRotInt8(_) => candle_gen::candle_core::bail!(
+                "Krea INT8-ConvRot projections cannot be re-quantized as {quant:?}"
+            ),
+            Self::Nvfp4(_) => candle_gen::candle_core::bail!(
+                "Krea NVFP4 projections cannot be re-quantized as {quant:?}"
+            ),
+            Self::Probed(_) => candle_gen::candle_core::bail!(
+                "Krea activation-probe projections cannot be quantized"
+            ),
+        }
+    }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        match self {
+            Self::Adapt(linear) => linear.to_device(device),
+            // sc-21483: route the NVFP4 arm through the shared host so any installed residual
+            // migrates with the projection, and a cross-device move is refused rather than silently
+            // dropped (the packed weight is staged at construction and cannot be re-staged). A move
+            // onto the device it already occupies stays the no-op it has always been.
+            Self::Nvfp4(p) => p.adapt_mut().to_device(device),
+            Self::ConvRotInt8(_) | Self::Probed(_) => Ok(()),
+        }
+    }
+
     /// The NVFP4 leg, when this projection is served through [`candle_gen::quant::Nvfp4Linear`] — the
     /// accounting seam [`crate::transformer::Krea2Transformer::nvfp4_report`] walks for SC#6/SC#4.
     pub(crate) fn nvfp4(&self) -> Option<&candle_gen::quant::Nvfp4Linear> {
@@ -336,14 +456,113 @@ impl QLinear {
         matches!(self, Self::ConvRotInt8(_))
     }
 
-    /// The inner residual-capable [`AdaptLinear`] (for the additive install to push a forward-time LoRA/
-    /// LoKr residual — sc-11105), or `None` on an int8-ConvRot projection (never adaptable — the ConvRot
-    /// lane rejects adapters) and on the NVFP4 / probed validation legs (sc-12110), which are bench-only
-    /// and never carry an adapter. The `visit_adaptable_mut` walk yields this to the installer.
+    /// The inner shared [`AdaptLinear`] used by dense/MLX-packed projections. INT8-ConvRot carries its
+    /// own additive stack through `as_additive_mut`; the probe leg is instrumentation-only.
     pub fn as_adapt_mut(&mut self) -> Option<&mut AdaptLinear> {
         match self {
             Self::Adapt(a) => Some(a),
-            Self::ConvRotInt8(_) | Self::Nvfp4(_) | Self::Probed(_) => None,
+            Self::Nvfp4(p) => Some(p.adapt_mut()),
+            Self::ConvRotInt8(_) | Self::Probed(_) => None,
+        }
+    }
+
+    /// Whether this projection can host job-local additive LoRA/LoKr residuals. Shipping dense,
+    /// MLX-packed, **NVFP4** (sc-21483), and INT8-ConvRot projections are all supported; only the
+    /// probe leg is excluded, because it is measurement instrumentation and never on a shipping path.
+    pub(crate) fn as_additive_mut(&mut self) -> Option<&mut Self> {
+        match self {
+            Self::Adapt(_) | Self::ConvRotInt8(_) | Self::Nvfp4(_) => Some(self),
+            Self::Probed(_) => None,
+        }
+    }
+
+    /// Whether a factor this projection cannot host must be a hard **admission error** rather than a
+    /// skipped key (sc-21483). True for NVFP4: it has no fallback — the base cannot be folded,
+    /// dequantized, or re-quantized to accommodate a mismatched adapter — so silently skipping would
+    /// render an unadapted base with no signal. The dense and MLX-packed arms keep their existing
+    /// skip-and-report behavior, where a shape mismatch means the key targeted a different module.
+    ///
+    /// Strictness follows the **constructed representation, not the plan**, and that is deliberate.
+    /// A row the plan marks NVFP4 is served DENSE whenever the FP4 representation is unavailable —
+    /// on CPU, on a pre-`sm_120` device, or when the row's shape cannot be aligned to
+    /// `NVFP4_K_ALIGN`/`NVFP4_N_ALIGN` — and such a row arrives here as `Self::Adapt`, so it keeps
+    /// skip-and-report. That is the correct answer for it: a dense base genuinely *can* fold or
+    /// absorb a delta, so the no-fallback premise that justifies refusing does not hold. The
+    /// consequence is that admission strictness is device-dependent for a plan-NVFP4 checkpoint —
+    /// intended, and the same rule `AdditiveProj for AdaptLinear::strict_admission`
+    /// (`crate::adapters`) applies, so the two hosts of one projection never disagree.
+    pub(crate) fn strict_adapter_admission(&self) -> bool {
+        matches!(self, Self::Nvfp4(_))
+    }
+
+    pub(crate) fn additive_shape(&self) -> (usize, usize) {
+        match self {
+            Self::Adapt(a) => a.base_shape(),
+            Self::Nvfp4(p) => p.adapt().base_shape(),
+            Self::ConvRotInt8(c) => {
+                let (out, input) = c.w_i8.dims2().expect("validated ConvRot rank-2 weight");
+                (out, input)
+            }
+            Self::Probed(_) => {
+                unreachable!("probe projections are not exposed to adapter installation")
+            }
+        }
+    }
+
+    pub(crate) fn push_additive_lora(&mut self, a: Tensor, b: Tensor, scale: f64) -> Result<()> {
+        match self {
+            Self::Adapt(host) => {
+                return host
+                    .push_lora(a, b, scale)
+                    .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
+            }
+            // NVFP4 admits through the shared CHECKED push: a shape/dtype/device mismatch is a typed
+            // error here — at install, before the first sampler step — and the packed base is never
+            // converted to another regime to make the factor fit.
+            Self::Nvfp4(host) => {
+                return host
+                    .adapt_mut()
+                    .push_lora_checked(a, b, scale)
+                    .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
+            }
+            Self::ConvRotInt8(host) => host.adapters.push(ConvRotAdapter::Lora { a, b, scale }),
+            Self::Probed(_) => {
+                unreachable!("probe projections are not exposed to adapter installation")
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn push_additive_lokr(
+        &mut self,
+        factors: candle_gen::quant::LokrFactors,
+    ) -> Result<()> {
+        match self {
+            Self::Adapt(host) => {
+                return host
+                    .push_lokr_structured(factors)
+                    .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
+            }
+            Self::Nvfp4(host) => {
+                return host
+                    .adapt_mut()
+                    .push_lokr_structured_checked(factors)
+                    .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
+            }
+            Self::ConvRotInt8(host) => host.adapters.push(ConvRotAdapter::Lokr { factors }),
+            Self::Probed(_) => {
+                unreachable!("probe projections are not exposed to adapter installation")
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_adapters(&mut self) {
+        match self {
+            Self::Adapt(host) => host.clear_adapters(),
+            Self::Nvfp4(host) => host.adapt_mut().clear_adapters(),
+            Self::ConvRotInt8(host) => host.adapters.clear(),
+            Self::Probed(_) => {}
         }
     }
 }
@@ -385,12 +604,29 @@ impl QEmbedding {
         )?))
     }
 
+    /// Build from already-device-format bytes loaded through the file-backed sidecar cache.
+    pub fn packed_device_format(qtensor: QTensor, out_dtype: DType) -> Result<Self> {
+        Ok(Self::Packed(shared::QEmbedding::from_qtensor(
+            qtensor, out_dtype,
+        )?))
+    }
+
     /// Index-select the embedding rows for `indexes`.
     pub fn forward(&self, indexes: &Tensor) -> Result<Tensor> {
         match self {
             Self::Dense(e) => e.forward(indexes),
             Self::Packed(e) => e.forward(indexes),
         }
+    }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        if let Self::Dense(embedding) = self {
+            *embedding = Embedding::new(
+                embedding.embeddings().to_device(device)?,
+                embedding.hidden_size(),
+            );
+        }
+        Ok(())
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -540,6 +776,79 @@ mod tests {
             QLinear::convrot_int8(pc.q.clone(), pc.scale.clone(), G + 1, None, &dev).is_err(),
             "non-power-of-four group_size must be a typed error"
         );
+        Ok(())
+    }
+
+    /// User LoRA and structured LoKr remain forward-time residuals over the ConvRot int8 base. The
+    /// base forward is identical in each pair, so subtraction isolates the adapter contribution and
+    /// proves the INT8-ConvRot route does not silently drop either advertised adapter kind.
+    #[test]
+    fn convrot_int8_applies_lora_and_lokr_without_replacing_int8_base() -> Result<()> {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim, group) = (4usize, 4usize, 4usize);
+        let canonical = Tensor::from_vec(
+            vec![
+                0.5, -0.2, 0.1, 0.7, -0.3, 0.8, -0.4, 0.2, 0.6, 0.1, -0.5, 0.9, -0.7, 0.4, 0.3,
+                -0.1,
+            ],
+            (out_dim, in_dim),
+            &dev,
+        )?;
+        let rotation = candle_gen::quant::regular_hadamard(group, &dev)?;
+        let rotated = candle_gen::quant::convrot_rotate(&canonical, &rotation)?;
+        let parts = candle_gen::quant::quantize_weight_int8_per_channel(&rotated)?;
+        let build =
+            || QLinear::convrot_int8(parts.q.clone(), parts.scale.clone(), group, None, &dev);
+        let x = Tensor::from_vec(
+            vec![0.2f32, -0.4, 0.6, 0.8, -0.3, 0.5, 0.7, -0.9],
+            (2, in_dim),
+            &dev,
+        )?;
+
+        let bare = build()?;
+        let mut lora = build()?;
+        let a = Tensor::from_vec(vec![0.4f32, -0.2, 0.7, 0.3], (in_dim, 1), &dev)?;
+        let b = Tensor::from_vec(vec![0.5f32, -0.6, 0.2, 0.9], (1, out_dim), &dev)?;
+        lora.push_additive_lora(a.clone(), b.clone(), 0.75)?;
+        let lora_actual = (lora.forward(&x)? - bare.forward(&x)?)?;
+        let lora_expected = (x.matmul(&a)?.matmul(&b)? * 0.75)?;
+        let lora_max = (lora_actual - lora_expected)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(
+            lora_max < 1e-5,
+            "ConvRot LoRA residual drifted ({lora_max})"
+        );
+
+        let w1 = Tensor::from_vec(vec![0.8f32, -0.3, 0.2, 0.6], (2, 2), &dev)?;
+        let w2 = Tensor::from_vec(vec![0.4f32, 0.7, -0.5, 0.9], (2, 2), &dev)?;
+        let factors = candle_gen::quant::LokrFactors::build(
+            0.5,
+            (out_dim, in_dim),
+            Some(&w1),
+            None,
+            None,
+            Some(&w2),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("2x2 kron factors fit a 4x4 projection");
+        let expected = factors.residual(&x)?;
+        let mut lokr = build()?;
+        lokr.push_additive_lokr(factors)?;
+        let lokr_actual = (lokr.forward(&x)? - bare.forward(&x)?)?;
+        let lokr_max = (lokr_actual - expected)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(
+            lokr_max < 1e-5,
+            "ConvRot LoKr residual drifted ({lokr_max})"
+        );
+        assert!(lora.is_convrot_int8() && lokr.is_convrot_int8());
         Ok(())
     }
 

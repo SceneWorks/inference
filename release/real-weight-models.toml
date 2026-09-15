@@ -1,3 +1,15 @@
+# Pinned real-weight model catalogue.
+#
+# `environment` names the variables that point a real-weight test at this model's snapshot. Every
+# such name is expected to be referenced somewhere under `.github/workflows/` — otherwise the model
+# is provisioned, pinned and stored, but the tests it gates run nowhere. That is not a hypothetical:
+# an exhaustive cross-check in sc-17266 found eleven such keys at once, several of them backing
+# real conformance and parity gates that had never executed.
+#
+# `test_manifest_environment_keys_are_wired_or_explicitly_exempt` in
+# `scripts/tests/test_ci_workflow_policy.py` enforces this both ways. A model whose keys are
+# deliberately NOT wired must say so in `unwired_reason`, and a model that carries an
+# `unwired_reason` must NOT be referenced — so an exemption cannot quietly outlive its reason.
 schema_version = 1
 captured_on = "2026-07-12"
 
@@ -20,6 +32,61 @@ size_class = "medium"
 profiles = ["llm-macos", "llm-cuda"]
 environment = ["MLX_LLM_QWEN3_MODEL", "CANDLE_LLM_QWEN3_MODEL"]
 expected_files = ["config.json", "tokenizer.json", "model.safetensors"]
+
+# SC-22261 terminal-only native StarVector campaign. These rows intentionally do not ride the
+# scheduled/all LLM sweep: the single campaign must serialize its MLX and authoritative CUDA
+# measurements and bind both implementations to the same immutable SVG-Bench receipt.
+[[models]]
+key = "starvector-1b-im2svg"
+repository = "starvector/starvector-1b-im2svg"
+revision = "380ab95d25a8e9ab1dc825debe238b4953ae13b9"
+license = "Apache-2.0"
+size_class = "medium"
+profiles = ["starvector-terminal"]
+environment = ["STARVECTOR_1B_SNAPSHOT"]
+# Native Rust loads these exact model, processor, and tokenizer components. Deliberately exclude
+# the repository's Python architecture helpers: the shipping MLX/Candle providers do not execute
+# them, and a change to one cannot lend provenance to the native runtime.
+expected_files = [
+    "added_tokens.json",
+    "config.json",
+    "merges.txt",
+    "model-00001-of-00002.safetensors",
+    "model-00002-of-00002.safetensors",
+    "model.safetensors.index.json",
+    "preprocessor_config.json",
+    "processor_config.json",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "vocab.json",
+]
+
+[[models]]
+key = "starvector-8b-im2svg"
+repository = "starvector/starvector-8b-im2svg"
+revision = "518beea8dcb5f7a37c5911e92d1d62a76beee7f9"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["starvector-terminal"]
+environment = ["STARVECTOR_8B_SNAPSHOT"]
+# The immutable snapshot has no tokenizer.json; the native tokenizer consumes the pinned
+# merges/vocabulary plus the special-token configuration directly.
+expected_files = [
+    "added_tokens.json",
+    "config.json",
+    "merges.txt",
+    "model-00001-of-00004.safetensors",
+    "model-00002-of-00004.safetensors",
+    "model-00003-of-00004.safetensors",
+    "model-00004-of-00004.safetensors",
+    "model.safetensors.index.json",
+    "preprocessor_config.json",
+    "processor_config.json",
+    "special_tokens_map.json",
+    "tokenizer_config.json",
+    "vocab.json",
+]
 
 [[models]]
 # Full SigLIP2 + projector + Llama-3.1 8B JoyCaption VLM. The MLX real-weight gate prepares this
@@ -49,6 +116,31 @@ license = "Apache-2.0"
 size_class = "very-large"
 profiles = ["media-cuda-residency-ab"]
 environment = ["QWEN_IMAGE_SNAPSHOT"]
+# The `media-cuda-residency-ab` profile is operator-run by design, not a CI lane:
+# `scripts/release/run-residency-ab.ps1` drives it by hand, and
+# `test_residency_ab_is_operator_run_without_ci_model_dependencies` asserts this variable never
+# appears in real-weights.yml. Wiring it would contradict that recorded decision, so the exemption
+# is recorded here instead (sc-17266). Note the repository variable's value
+# (C:\Users\Michael\.cache\huggingface\hub\models--Qwen--Qwen-Image\...) does not currently exist on
+# nax-windows, so a lane added today would fail closed on materialization anyway.
+#
+# THIS NAME NO LONGER HAS AN MLX CONSUMER (sc-17284). Until then the 45 mlx-gen-qwen-image
+# real-weight tests read QWEN_IMAGE_SNAPSHOT too — and fed it something this row does not describe.
+# The repo's own provenance receipt records what they were actually given:
+# `tools/adapter_parity_receipt.json` recorded those runs under QWEN_IMAGE_SNAPSHOT at
+# `models--SceneWorks--qwen-image-mlx/snapshots/8080a417…/bf16` — the sc-17651 re-record now
+# pins that same path under MLX_GEN_QWEN_SNAPSHOT — an MLX re-host at a different
+# revision of a different repository from the `Qwen/Qwen-Image@75e0b4be` pinned here. One name
+# cannot be verified against two pins: `ensure_model_snapshot.py --model qwen-image` checks for
+# revision 75e0b4be and would fail closed on the re-host. So the MLX half was renamed to
+# MLX_GEN_QWEN_SNAPSHOT (matching the sibling crate's MLX_GEN_FLUX_SNAPSHOT) and given its own
+# `qwen-image-mlx` row below, which the macOS `mlx-qwen-image` lane wires.
+#
+# What is left under THIS name is the CUDA half, and it is still unrun: the operator A/B above plus
+# `candle-gen-qwen-image` (tests/conformance.rs and the src/lib.rs probed-offload test). Both are
+# buildable on nax-windows and both are blocked on the ~60 GB snapshot not existing there — a disk
+# decision, tracked separately, NOT something this exemption resolves.
+unwired_reason = "operator-run residency A/B (run-residency-ab.ps1), deliberately outside CI (sc-17266)"
 expected_files = [
     "model_index.json",
     "tokenizer/tokenizer.json",
@@ -64,10 +156,63 @@ expected_files = [
 key = "flux-1-dev"
 repository = "black-forest-labs/FLUX.1-dev"
 revision = "3de623fc3c33e44ffbe2bad470d0f45bccf2eb21"
+# The canonical BFL repository is gated, but the macOS PiD lane runs without a runner token.
+# Materialize cache misses from the public SceneWorks MLX matrix's dense `bf16/` projection while
+# retaining the canonical revision identity used by the Windows operator A/B. At these immutable
+# commits every required file and every referenced shard has the same size and LFS SHA-256 as the
+# canonical diffusers tree; the alternate-source receipt records the exact projection.
+materialization_repository = "SceneWorks/flux1-dev-mlx"
+materialization_revision = "323fd12d79f78ad444e882e8d8e871914584f2b9"
+materialization_path_prefix = "bf16"
+materialization_expected_files = [
+    "LICENSE.md",
+    "model_index.json",
+    "scheduler/scheduler_config.json",
+    "text_encoder/config.json",
+    "text_encoder/model.safetensors",
+    "text_encoder_2/config.json",
+    "text_encoder_2/model-00001-of-00002.safetensors",
+    "text_encoder_2/model-00002-of-00002.safetensors",
+    "text_encoder_2/model.safetensors.index.json",
+    "tokenizer/merges.txt",
+    "tokenizer/special_tokens_map.json",
+    "tokenizer/tokenizer_config.json",
+    "tokenizer/vocab.json",
+    "tokenizer_2/special_tokens_map.json",
+    "tokenizer_2/spiece.model",
+    "tokenizer_2/tokenizer.json",
+    "tokenizer_2/tokenizer_config.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model-00001-of-00003.safetensors",
+    "transformer/diffusion_pytorch_model-00002-of-00003.safetensors",
+    "transformer/diffusion_pytorch_model-00003-of-00003.safetensors",
+    "transformer/diffusion_pytorch_model.safetensors.index.json",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
 license = "FLUX-1-dev Non-Commercial License"
 size_class = "very-large"
-profiles = ["media-cuda-residency-ab"]
+profiles = ["media-cuda-residency-ab", "media-macos"]
 environment = ["FLUX_DEV_DIR"]
+# WIRED as of sc-17284 — the exemption this row used to carry is deleted, not weakened.
+#
+# Two consumers, and unlike qwen-image above they want the SAME pinned artifact, so one name and one
+# row still describe it truthfully:
+#   - `scripts/release/run-residency-ab.ps1` (CUDA, operator-run, still deliberately outside CI);
+#   - `mlx-gen-flux/tests/pid_decode_real_weights.rs`, whose two `#[ignore]` tests the macOS
+#     `mlx-qwen-image-pid` job now runs on the schedule.
+# `test_residency_ab_is_operator_run_without_ci_model_dependencies` used to enforce the operator-run
+# decision by asserting the string FLUX_DEV_DIR never appears in real-weights.yml. That proxy was
+# only ever valid while the CUDA A/B was the sole consumer; it now gates the A/B directly instead:
+# no `residency-ab`, neither `*_probed_generate_for_offload_ab` test name, and neither operator
+# repository variable (`vars.FLUX_DEV_DIR` / `vars.QWEN_IMAGE_SNAPSHOT`, which hold Windows paths).
+# It does NOT ban `--features cuda` — real-weights.yml has 57 of those for the Windows lanes — so a
+# BLANKET `cargo test -p candle-gen-qwen-image --features cuda -- --ignored` would still conscript
+# the A/B without naming it. Name-selecting every CUDA step is what closes that, not this test.
+#
+# `FLUX_DEV_DIR` is deliberately NOT folded into the crate's own MLX_GEN_FLUX_DEV_SNAPSHOT, which
+# names the same snapshot for adapter/hyper/ip-adapter tests. That variable gates ~11 further
+# mlx-gen-flux `#[ignore]` tests this lane does not run, so wiring it would mark them covered.
 expected_files = [
     "model_index.json",
     "tokenizer/vocab.json",
@@ -79,6 +224,508 @@ expected_files = [
     "transformer/config.json",
     "transformer/diffusion_pytorch_model.safetensors.index.json",
     "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# SC-15831 representative Candle/CUDA fixture. The operator-run provider/reference-route ladder
+# harness consumes the q4 tier only; catalog siblings own their own artifact/tier/mode calibration.
+key = "flux2-klein-9b-mlx-q4"
+repository = "SceneWorks/flux2-klein-9b-mlx"
+revision = "1902693279fcfb828919370dfac2b8922d99499a"
+license = "FLUX Non-Commercial License"
+size_class = "very-large"
+profiles = ["media-cuda-memory-ladder"]
+environment = ["FLUX2_KLEIN_DIR"]
+unwired_reason = "operator-run SC-15831 memory-ladder calibration; deliberately serialized on authoritative GPU0"
+download_files = ["q4/*"]
+expected_files = [
+    "q4/model_index.json",
+    "q4/scheduler/scheduler_config.json",
+    "q4/text_encoder/config.json",
+    "q4/text_encoder/model.safetensors",
+    "q4/tokenizer/added_tokens.json",
+    "q4/tokenizer/chat_template.jinja",
+    "q4/tokenizer/merges.txt",
+    "q4/tokenizer/special_tokens_map.json",
+    "q4/tokenizer/tokenizer.json",
+    "q4/tokenizer/tokenizer_config.json",
+    "q4/tokenizer/vocab.json",
+    "q4/transformer/config.json",
+    "q4/transformer/diffusion_pytorch_model.safetensors",
+    "q4/vae/config.json",
+    "q4/vae/diffusion_pytorch_model.safetensors",
+]
+
+# sc-18213 (epic 18093) — `SceneWorks/flux2-dev-mlx`, the re-host `mlx-gen-flux2`'s DEV engine
+# actually loads (`MLX_GEN_FLUX2_DEV_SNAPSHOT` points one level in, at a tier dir). NOT the klein
+# entry above: klein is a different model in the same family, and its key matching "flux2" in a
+# grep is exactly how this artifact went unbound. The repo ships three self-contained
+# diffusers-layout tiers; the epic-18093 right-size calibration measures per artifact x tier and
+# each tier is provisioned independently (q8 alone is ~57 GiB), so the binding is keyed per tier —
+# the flux2-klein-9b-mlx-q4 shape — rather than one key whose `expected_files` would demand all
+# ~150 GiB of siblings on disk before any single tier's capture could bind evidence. All three
+# keys share one repository + revision; `verify_model_snapshot.py --inventory-output` still
+# inventories sibling tiers when present, so a multi-tier snapshot changes the inventory sha
+# rather than silently reusing a single-tier one.
+[[models]]
+key = "flux2-dev-mlx-bf16"
+repository = "SceneWorks/flux2-dev-mlx"
+revision = "2868b1461b2b6e6e05d84e52534df3632b4c7d5d"
+license = "FLUX Non-Commercial License v2.1"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["MLX_GEN_FLUX2_DEV_SNAPSHOT"]
+unwired_reason = "operator-run epic-18093 right-size calibration on authoritative Apple hardware; pinned to bind capture evidence to exact weights (sc-18213), no CI lane dispatches the flux2 dev-tier harnesses"
+download_files = ["bf16/*"]
+expected_files = [
+    "bf16/LICENSE.md",
+    "bf16/model_index.json",
+    "bf16/scheduler/scheduler_config.json",
+    "bf16/text_encoder/config.json",
+    "bf16/text_encoder/generation_config.json",
+    "bf16/text_encoder/model.safetensors.index.json",
+    "bf16/tokenizer/chat_template.jinja",
+    "bf16/tokenizer/preprocessor_config.json",
+    "bf16/tokenizer/processor_config.json",
+    "bf16/tokenizer/special_tokens_map.json",
+    "bf16/tokenizer/tokenizer.json",
+    "bf16/tokenizer/tokenizer_config.json",
+    "bf16/transformer/config.json",
+    "bf16/transformer/diffusion_pytorch_model.safetensors.index.json",
+    "bf16/vae/config.json",
+    "bf16/vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+key = "flux2-dev-mlx-q8"
+repository = "SceneWorks/flux2-dev-mlx"
+revision = "2868b1461b2b6e6e05d84e52534df3632b4c7d5d"
+license = "FLUX Non-Commercial License v2.1"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["MLX_GEN_FLUX2_DEV_SNAPSHOT"]
+unwired_reason = "operator-run epic-18093 right-size calibration on authoritative Apple hardware; pinned to bind capture evidence to exact weights (sc-18213), no CI lane dispatches the flux2 dev-tier harnesses"
+download_files = ["q8/*"]
+expected_files = [
+    "q8/LICENSE.md",
+    "q8/model_index.json",
+    "q8/scheduler/scheduler_config.json",
+    "q8/text_encoder/config.json",
+    "q8/text_encoder/model.safetensors",
+    "q8/tokenizer/chat_template.jinja",
+    "q8/tokenizer/preprocessor_config.json",
+    "q8/tokenizer/processor_config.json",
+    "q8/tokenizer/special_tokens_map.json",
+    "q8/tokenizer/tokenizer.json",
+    "q8/tokenizer/tokenizer_config.json",
+    "q8/transformer/config.json",
+    "q8/transformer/diffusion_pytorch_model.safetensors",
+    "q8/vae/config.json",
+    "q8/vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+key = "flux2-dev-mlx-q4"
+repository = "SceneWorks/flux2-dev-mlx"
+revision = "2868b1461b2b6e6e05d84e52534df3632b4c7d5d"
+license = "FLUX Non-Commercial License v2.1"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["MLX_GEN_FLUX2_DEV_SNAPSHOT"]
+unwired_reason = "operator-run epic-18093 right-size calibration on authoritative Apple hardware; pinned to bind capture evidence to exact weights (sc-18213), no CI lane dispatches the flux2 dev-tier harnesses"
+download_files = ["q4/*"]
+expected_files = [
+    "q4/LICENSE.md",
+    "q4/model_index.json",
+    "q4/scheduler/scheduler_config.json",
+    "q4/text_encoder/config.json",
+    "q4/text_encoder/model.safetensors",
+    "q4/tokenizer/chat_template.jinja",
+    "q4/tokenizer/preprocessor_config.json",
+    "q4/tokenizer/processor_config.json",
+    "q4/tokenizer/special_tokens_map.json",
+    "q4/tokenizer/tokenizer.json",
+    "q4/tokenizer/tokenizer_config.json",
+    "q4/transformer/config.json",
+    "q4/transformer/diffusion_pytorch_model.safetensors",
+    "q4/vae/config.json",
+    "q4/vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# sc-17284 — what `mlx-gen-qwen-image` ACTUALLY loads. The engine never reads `Qwen/Qwen-Image`
+# above: every real-weight test takes a tier directory of this SceneWorks MLX re-host, whose q4/q8
+# READMEs carry the upstream Qwen-Image-2512 card. Each tier subdir is a complete diffusers-layout
+# snapshot, so tests are pointed one level in (`/bf16`, `/q8`) — the same shape as
+# krea-realtime-14b-mlx.
+#
+# BOTH tiers are required and neither is redundant. `bf16` is the only dense tier, so it is what the
+# on-the-fly `LoadSpec::with_quant` paths and the dense control/sampler forwards need; `q8` is a
+# pre-quantized tier and is what `block_residency_real_weights` measures against (`QWEN_RUNG4_TIER`).
+# `q4` is not fetched — no test in the wired lane selects it.
+#
+# COVERAGE THESE VARIABLES ACTUALLY BUY, because a name gates tests and "wired" is per-name. The
+# three names above gate 41 tests, and the arithmetic is the point — 20 + 21 + 0 = 41:
+#
+# RECOUNTED FROM 45 BY sc-17519, and the 4 that came off were never gated by these names. The old
+# figure was enumerated per test FILE and per job STEP, so it counted every Edit-only test that
+# happens to share a file or a job with a T2I one: `edit_sequential_bounds_peak_and_is_byte_identical`,
+# `edit_lightning_render_is_coherent` and — since sc-17513 — the `perf.rs` Edit arm, all three inside
+# the WIRED 23, plus `edit_lightning_user_lora_reference_repro` inside the EXCLUDED 1. Read them and
+# none resolves `MLX_GEN_QWEN_SNAPSHOT`, `QWEN_IMAGE_MLX_SNAPSHOT` or `QWEN_CONTROL_BASE_SNAPSHOT` —
+# they take `QWEN_IMAGE_EDIT_SNAPSHOT`, and they are accounted for on `qwen-image-edit-2511-mlx`
+# below. The recount matters because sc-17519 wired a FIFTH Edit-only test into this same job
+# (`edit_generate_is_deterministic_rust`): per-step counting would have read that as 46 while these
+# three variables gate no more than they did before. Per-test counting is what keeps the heading true.
+#
+# WIRED, 20: 16 in `mlx-qwen-image` on the schedule (control x4, unified sampler x2, sequential
+# residency x3, rung-4 block residency, Lightning render x1, golden-free adapter x3, preview fit,
+# compiled-glue A/B x1), 3 in `mlx-qwen-image-pid`, 1 in the dispatch-only
+# `mlx-qwen-image-producers`. All measured passing on nax-macos — 17 of them 2026-08-04, and the
+# three most recently wired 2026-08-06: `lightning_loras_apply_cleanly` (sc-17518), the preview fit
+# (sc-17515), and the `perf.rs` T2I arm (sc-17513). The job ALSO runs 4 Edit-only tests these three
+# variables do not gate — the sequential-residency and Lightning Edit arms, the sc-17513 `perf.rs`
+# Edit arm, and the sc-17519 determinism gate — counted on the Edit row, not here.
+#
+# BLOCKED ON THE ORACLE BUNDLE, 21: adapter 6, e2e 7, img2img 6, text_encoder 2 read
+# `tools/golden/`, which is gitignored by design and minted by the frozen `mflux` fork against the
+# ~60 GB torch original — a Mage-shaped operator seed bundle, sc-17503. It is 21 and not "all 9 of
+# adapter_real_weights": three of that file's tests resolve no golden at all.
+#
+# EXCLUDED WITH A MEASUREMENT, 0 — and that is a first for this row. Its last remaining entry,
+# `edit_lightning_user_lora_reference_repro`, is Edit-only: it reads `QWEN_IMAGE_EDIT_SNAPSHOT` and
+# none of these three variables, so it is counted on the Edit row below rather than here. Nothing
+# these three names gate is excluded any more.
+#
+# This block held FIVE entries until 2026-08-06 and holds NONE now. Four graduated in the same week,
+# and every one had been excluded on a number that turned out to measure the test rather than the
+# code. The fifth did not graduate — it is the Edit-only entry just described, which moved rather
+# than went green. Note that the `perf.rs` bullet below covers BOTH arms and only its T2I arm is
+# gated by these three variables; the Edit arm's graduation is recorded on the Edit row:
+#   * `lightning_loras_apply_cleanly` (sc-17518) asserted `applied == 840` — the HOST map's
+#     60 x 14 target count, never a measured application. Both pinned lightx2v files apply
+#     60 x 12 = 720 with zero unmatched; no published Lightning release has ever trained
+#     `img_mod.1`/`txt_mod.1`. Evidence and the per-class assertion that replaced the raw count are
+#     in the test's doc comment.
+#   * `fit_preview_rgb_factors` (sc-17515) was excluded at R^2 = 0.0114 against its own 0.90 floor.
+#     That was a defect in the test's host readback — `mlx-rs` `as_slice` returns physical storage
+#     for a transpose view, so it regressed latent channel 0 against the red channel. With the
+#     contiguity pass it measures R^2 = 0.9521 (unclamped re-solve, the quantity the floor gates).
+#   * `perf.rs` x2 (sc-17513) asserted the compiled sc-2963 glue was BIT-identical to eager on the
+#     real 60-layer forward — `assert_eq!(max_diff, 0.0)` — which had never held: sc-17284 measured
+#     max|D| 1.897e-3 / 1.475e-3 / 9.739e-3 (T2I 256/512/1024 px) and 1.345e-3 (Edit). sc-17513
+#     swept 18 shapes across both arms (T2I bf16 128..1280 px, Edit q8 256..1024 px) and ran two
+#     controls that settle what the residual IS: truncating the transformer to 1 layer makes
+#     compiled-vs-eager exactly 0.0 on the same real weights against a max|out| of 114.1, so the
+#     zero is not vacuous (0.3 ULP at 2 layers), and perturbing the EAGER forward's own input by
+#     1-4 f32 ULP moves its output by the same 1e-4..2.5e-3 the whole compiled-vs-eager gap does.
+#     So it is this stack's amplification of a sub-ULP rounding difference, not a fusion defect —
+#     which also explains why it is non-monotonic in sequence length (the amplification is). The
+#     gate is now peak-RELATIVE and PER-ARM: 1.0e-2 (T2I) and 2.6e-3 (Edit), each 4x that arm's own
+#     measured conditioning envelope and ~4.5x its worst measured divergence. One shared constant
+#     left the Edit arm 85x loose at the geometry this lane runs, which would not have caught a 20x
+#     regression on it. A genuinely wrong fusion is O(1e-1) and still trips both. The tables and the
+#     derivation are on `perf.rs::COMPILED_GLUE_WHOLE_FWD_REL_TOL_T2I`; the sweep that produced them
+#     is committed as `mlx-gen-qwen-image/examples/qwen_compiled_glue_sweep.rs` (an example, not a
+#     test — it adds nothing to the 45 above).
+# All four are WIRED above. None weakened a gate to get there.
+key = "qwen-image-mlx"
+repository = "SceneWorks/qwen-image-mlx"
+revision = "8080a4171f1c8b7fca6c30491eafbe6ffab754bf"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["media-macos"]
+# QWEN_CONTROL_BASE_SNAPSHOT is the same artifact under a second name: the control engine takes the
+# base transformer separately from the control branch. Both are wired by the `mlx-qwen-image` job.
+environment = [
+    "QWEN_IMAGE_MLX_SNAPSHOT",
+    "MLX_GEN_QWEN_SNAPSHOT",
+    "QWEN_CONTROL_BASE_SNAPSHOT",
+]
+download_files = ["bf16/*", "q8/*"]
+expected_files = [
+    "bf16/model_index.json",
+    "bf16/tokenizer/tokenizer.json",
+    "bf16/text_encoder/config.json",
+    "bf16/text_encoder/model.safetensors.index.json",
+    "bf16/transformer/config.json",
+    "bf16/transformer/diffusion_pytorch_model.safetensors.index.json",
+    "bf16/vae/config.json",
+    "bf16/vae/diffusion_pytorch_model.safetensors",
+    "q8/model_index.json",
+    "q8/tokenizer/tokenizer.json",
+    "q8/text_encoder/model.safetensors.index.json",
+    "q8/transformer/config.json",
+    "q8/transformer/model.safetensors",
+    "q8/vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# SC-18309 N1 needs only the real SDXL VAE to prove that the shared native decode seam is byte-
+# exact to the former direct engine expression. Keep this as an exact two-file projection instead
+# of materializing the 13.5 GB full SDXL matrix on the rw-mage runner.
+key = "sdxl-base-mlx-vae-bf16"
+repository = "SceneWorks/sdxl-base-mlx"
+revision = "36699bb8a6353e61c920e3bf19f0e6f8e4151c55"
+license = "CreativeML Open RAIL++-M"
+size_class = "medium"
+profiles = ["media-macos"]
+environment = ["SDXL_N1_SNAPSHOT"]
+download_files = [
+    "bf16/vae/config.json",
+    "bf16/vae/diffusion_pytorch_model.fp16.safetensors",
+]
+expected_files = [
+    "bf16/vae/config.json",
+    "bf16/vae/diffusion_pytorch_model.fp16.safetensors",
+]
+
+[[models]]
+# The Edit sibling, for the one `sequential_residency_real_weights` arm whose dropped component is
+# the Qwen2.5-VL *vision-language* encoder rather than the text encoder.
+#
+# q8 ONLY, and that is not a tuning choice: this repo's `bf16/` tier is metadata-only (~31 MB of
+# configs and tokenizer files, no `vae/`, no transformer shards), so pointing the test at it fails
+# to load. `expected_files` names the q8 weights so a partial fetch cannot pass verification.
+#
+# COVERAGE THIS VARIABLE ACTUALLY BUYS, because one name gates 18 tests and "wired" is per-name.
+# sc-17284 wired `QWEN_IMAGE_EDIT_SNAPSHOT` for the sequential-residency Edit arm, which satisfied
+# the per-VARIABLE gate while 19 further tests ran nowhere. sc-17519 executed all 19 on real weights
+# for the first time (2026-08-06, nax-macos, q8 tier resident). The 18 account for exactly, and the
+# arithmetic is the point — 4 + 13 + 1 = 18:
+#
+# COUNTED BY READING EVERY TEST, not per test FILE and not per job STEP — that distinction is what
+# this row is for. 11 of the 12 in `edit_real_weights.rs`, 3 of the 7 in `vision_real_weights.rs`,
+# 1 sequential-residency arm, 2 Lightning Edit arms, 1 `perf.rs` Edit arm = 18.
+#
+# GATED BY NOTHING, 5 — deliberately NOT in the 18. Five of the 19 never call `edit_snapshot()` and
+# read no environment variable at all; they resolve a golden and nothing else. This variable buys no
+# coverage of them, and counting them here would be the same overstatement the row exists to retire:
+# `edit_rope_multi_image_matches_fork` (`edit_real_weights.rs`) and the four index/Gate-A gates in
+# `vision_real_weights.rs` — `window_index_and_cu_window_match_fork`, `cu_seqlens_match_fork`,
+# `rot_pos_emb_matches_fork`, `small_vision_transformer_matches_fork`. Given their goldens they run
+# in the ORDINARY macOS lane on every PR, on any clone, with no weight set and no schedule. sc-17519
+# made that true for the first of them — see the weight-free block below.
+#
+# NOT disjoint from the count on `qwen-image-mlx` above, and the overlap is an ACCOUNTING ARTIFACT
+# rather than dual gating. Four tests are counted in both blocks — `edit_sequential_bounds_peak_and_
+# is_byte_identical`, `edit_lightning_render_is_coherent`, `edit_lightning_user_lora_reference_repro`
+# and the `perf.rs` Edit arm — and NONE of the four reads a T2I variable. Verified by reading them:
+# `edit_sequential_bounds_...` resolves `edit_snapshot()` (`QWEN_IMAGE_EDIT_SNAPSHOT`) and never calls
+# the `snapshot()` helper that reads `MLX_GEN_QWEN_SNAPSHOT`; both Lightning arms read this variable
+# plus `QWEN_EDIT_LIGHTNING_SNAPSHOT` / `QWEN_EDIT_REPRO_*`, also never `snapshot()`; and
+# `qwen_edit_per_step_compiled_vs_eager` reads `snapshot("QWEN_IMAGE_EDIT_SNAPSHOT")` and nothing
+# else. They were swept in because that row enumerated per test FILE and per job STEP, which counts
+# an Edit-only test whenever it shares a file or a job with a T2I one — sc-17513 then put the
+# `perf.rs` Edit arm in that row's WIRED block and sc-17519 added a fifth Edit-only test to the same
+# job, which is how a per-step count reaches 46 without the variables gating anything more. That
+# row's total is corrected in place above (45 -> 41) rather than left standing: a wrong reason turns
+# a plain over-count into apparent design, and this row is the one meant to catch that.
+#
+# WIRED, 4, all in `mlx-qwen-image` on the schedule and all measured passing on nax-macos:
+# `edit_sequential_bounds_peak_and_is_byte_identical` and `edit_lightning_render_is_coherent`
+# (sc-17284); `qwen_edit_per_step_compiled_vs_eager` (sc-17513), which left this row's EXCLUDED block
+# when its `assert_eq!(max_diff, 0.0)` was replaced by a per-arm peak-relative bound of 2.6e-3 —
+# derived, not loosened, from the Edit arm's own measured conditioning envelope; and
+# `edit_generate_is_deterministic_rust` (sc-17519) — 34.19 / 35.80 / 44.11 s of libtest time over
+# three runs, peak RSS 35.0 GiB, reporting 0/3145728 bytes differing between two renders of the same
+# edit. That last one is the ONLY one of the 19 that resolves no golden AT ALL, which is the only
+# reason it was wirable on the schedule now. (`edit_rope_multi_image_matches_fork` also runs today,
+# but it is not wired anywhere and does not need to be — see the last block.)
+#
+# BLOCKED ON THE EDIT-2511 ORACLE BUNDLE, 13: `edit_real_weights.rs` 10 and `vision_real_weights.rs`
+# 3 read 9 distinct artifacts under `tools/golden/`, which is gitignored by design — only one of the
+# nine (`qwen_image_edit_q8_golden`) has a checksum recorded at all. Each needs the
+# `Qwen/Qwen-Image-Edit-2511` torch original to mint from, which is not resident on nax-macos. This
+# is a SEPARATE bundle from the 21 T2I tests on `qwen-image-mlx`, whose producers need the ~60 GB
+# `Qwen/Qwen-Image` instead (sc-17503). Tracked in sc-17909.
+#
+# BLOCKED ONLY ON A GOLDEN, NO WEIGHTS REQUIRED, 4 — and this is the half sc-17909 recorded wrong.
+# The four index/Gate-A gates in `vision_real_weights.rs` need no weights on either side: their
+# producer, `tools/dump_qwen_vision_golden.py`, says so itself at its line 9 ("zero model download")
+# for Gate 1 and line 70 ("NO snapshot/weights") for Gate A. The ONLY reason they are blocked is that
+# the producer packs Gate B — the real depth-32 vision tower, line 96 onward, which does load the
+# Edit-2511 original — into the SAME output file, so the cheap half cannot be minted without the
+# expensive one. Splitting that producer is the whole fix, and it costs no download. Recording these
+# as blocked on the most expensive artifact in the epic is exactly the record-vs-reality drift this
+# row exists to retire. Tracked separately from the oracle bundle, in sc-18085.
+#
+# ALL 17 OF THE ABOVE, MEASURED: each fails at `Weights::from_file` with `SafeTensors(NotFile)` in
+# 0.02 s, before any weights load, so NONE of their numeric assertions has ever been evaluated in any
+# checkout. Do not read their absence as evidence they would pass — of the 23 tests sc-17284 ran for
+# the first time, four failed.
+#
+# NEITHER BLOCKED NOR GATED, 1 — `edit_rope_multi_image_matches_fork`, unblocked by sc-17519 at zero
+# cost. Its producer `tools/dump_qwen_edit_rope_golden.py` imports one symbol (the fork's
+# `QwenEmbedRopeMLX`) and touches no snapshot, no HF cache and no torch original, so the golden was
+# minted and COMMITTED to `mlx-gen-qwen-image/tests/fixtures/qwen_edit_rope_golden.safetensors`
+# (78,133 bytes; four f32 tables for grids (1,8,12)+(1,6,6), txt=20). Vendoring a golden is a licence
+# decision and the fork is MIT, the same reasoning that carries the sc-14036 Mage-Flow exception in
+# `crates/media/mlx-gen/.gitignore`. The test's `#[ignore]` is GONE: it runs in the ordinary macOS
+# lane on every PR, measured 0.03 s, max abs diff 5.960e-8 against a 1e-5 bound on all four tables,
+# with `MLX_GEN_MODELS_ROOT` and `QWEN_IMAGE_EDIT_SNAPSHOT` unset. Its producer described it as "the
+# novel core of the Edit transformer path"; it had been sitting behind a licence question that a
+# two-minute check answered. Provenance + fork pin are in `tools/golden/README.md`.
+#
+# EXCLUDED WITH A MEASUREMENT, 1. A lane that is red every week is ignored within a month
+# (sc-16981), so it is recorded here rather than wired red or quietly dropped:
+#   * `edit_lightning_user_lora_reference_repro` x1 — needs a user LoRA and a reference PPM that
+#     exist in no repository and on no Hub. It is the LAST exclusion anywhere on the Qwen surface:
+#     `qwen-image-mlx`'s block is empty as of sc-17513, and this one is not a numbers problem that a
+#     derivation can retire — no bound would help, the inputs do not exist.
+#
+# The hazard this row recorded until 2026-08-06 — "wired" reading as whole-surface coverage when one
+# arm of one test was what ran — is retired by the arithmetic above rather than by the wiring: 13 of
+# the 18 this variable gates still execute nowhere, and so do 4 more it does not gate at all. That is
+# the same shape recorded against MLX_GEN_FLUX_DEV_SNAPSHOT on `flux-1-dev`; the difference is that
+# this row's blocked set now names its artifact, its story, and — for the cheap half — the fact that
+# no artifact is needed.
+#
+# CROSS-CHECK, both directions. `edit_real_weights.rs` holds 12 tests: 1 gated by nothing (rope),
+# 1 wired (determinism), 10 blocked. `vision_real_weights.rs` holds 7: 4 gated by nothing, 3 blocked.
+# 12 + 7 = 19. By blocker: 1 runs today + 1 wired + 13 need the Edit-2511 oracle + 4 need only a
+# producer split = 19. By variable: (11 + 3 from those two files) + 1 + 2 + 1 elsewhere = 18 gated,
+# 5 gated by nothing, and 18 + 5 = 23 — which is where the retired "23" came from. It was the size
+# of the union, not of what the variable buys, and the row's own heading asks for the latter.
+key = "qwen-image-edit-2511-mlx"
+repository = "SceneWorks/qwen-image-edit-2511-mlx"
+revision = "0dfbf3a018bcee42d77de14494c35f97a7531def"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["QWEN_IMAGE_EDIT_MLX_SNAPSHOT", "QWEN_IMAGE_EDIT_SNAPSHOT"]
+download_files = ["q8/*"]
+expected_files = [
+    "q8/model_index.json",
+    "q8/tokenizer/tokenizer.json",
+    "q8/text_encoder/model.safetensors.index.json",
+    "q8/transformer/config.json",
+    "q8/transformer/model.safetensors",
+    "q8/vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# The alibaba-pai VACE-style control branch (`Qwen-Image-2512-Fun-Controlnet-Union`) that replaced
+# the retired InstantX union shape. Single-file per tier; the tests take the file, not the dir.
+key = "qwen-image-2512-fun-controlnet-union"
+repository = "SceneWorks/qwen-image-2512-fun-controlnet-union"
+revision = "a061fbc42a4744d6a7ec206370fbd3a37d4a7cca"
+license = "Apache-2.0"
+size_class = "medium"
+profiles = ["media-macos"]
+environment = ["QWEN_CONTROL_UNION_SNAPSHOT", "QWEN_CONTROL_WEIGHTS"]
+download_files = ["bf16/*"]
+expected_files = ["bf16/model.safetensors"]
+
+[[models]]
+# The converted PiD (progressive-in-decoder) super-resolution students for the two engines whose
+# integrated decode seam is gated on the schedule. Each test falls back to a GITIGNORED
+# `tools/golden/pid/*.safetensors` when its env var is unset, which no CI checkout has — the
+# published re-hosts below are what make these three + two tests wirable at all.
+key = "pid-qwenimage"
+repository = "SceneWorks/pid-qwenimage"
+revision = "39d7b0a9003a3fc934d36d8b5658b2d8ea9c1231"
+license = "NVIDIA License"
+size_class = "medium"
+profiles = ["media-macos"]
+environment = ["PID_QWEN_SNAPSHOT", "PID_QWEN_SAFETENSORS"]
+expected_files = ["pid_qwenimage_2kto4k.safetensors"]
+
+[[models]]
+key = "pid-flux"
+repository = "SceneWorks/pid-flux"
+revision = "52d9474830ad05ea8dc55edb59a21cb14d1a4615"
+license = "NVIDIA License"
+size_class = "medium"
+profiles = ["media-macos"]
+environment = ["PID_FLUX_SNAPSHOT", "PID_FLUX_SAFETENSORS"]
+expected_files = ["pid_flux_2kto4k.safetensors"]
+
+[[models]]
+# The lightx2v 8-step Lightning distillation LoRAs for T2I and Edit-2511. Only the one file each
+# suite loads is fetched (~0.85 GB apiece), not the repos' full variant matrices.
+#
+# Neither carries a repository variable of its own. The LANE derives
+# `$MLX_GEN_MODELS_ROOT/models--<org>--<repo>/snapshots/<rev>` from the revision pinned below,
+# exports it as the environment name in this record via `$GITHUB_ENV`, and verifies THAT dir with
+# `ensure_model_snapshot.py`; the tests read the variable and fail loudly if it points at a file
+# that is not there. Deriving the dir from this pin is what keeps the revision CI verifies and the
+# revision the tests actually load identical; a second repository variable could only drift from it.
+#
+# The T2I file has a THIRD consumer as of sc-17515: `fit_preview_rgb_factors` renders its fit corpus
+# through it, because the committed `preview::RGB_FACTORS` document an "8-step Lightning" fit and
+# `lightning_sigmas` alone is only the schedule half of that. Measured: without the LoRA the re-solve
+# lands 0.26 from the committed factors, with it 0.082.
+#
+# No test hard-codes a revision. With the variable unset (local dev) the three consumers fall back
+# on their own, and not identically: `adapter_real_weights` and `fit_preview_rgb_factors` each scan
+# `snapshots/` and take the sorted-first entry, while `lightning_render_real_weights` takes whatever
+# `read_dir` yields first — so two of the three are at least run-to-run stable, and none of them is
+# this pin.
+key = "qwen-image-lightning"
+repository = "lightx2v/Qwen-Image-Lightning"
+revision = "e74da8d4e71a54b341de86aa9f8d2509165aa513"
+license = "Apache-2.0"
+size_class = "medium"
+profiles = ["media-macos"]
+environment = ["QWEN_LIGHTNING_SNAPSHOT"]
+download_files = ["Qwen-Image-Lightning-8steps-V1.1-bf16.safetensors"]
+expected_files = ["Qwen-Image-Lightning-8steps-V1.1-bf16.safetensors"]
+
+[[models]]
+key = "qwen-image-edit-2511-lightning"
+repository = "lightx2v/Qwen-Image-Edit-2511-Lightning"
+revision = "d74eba145674fd7e31b949324e148e21e7118abd"
+license = "Apache-2.0"
+size_class = "medium"
+profiles = ["media-macos"]
+environment = ["QWEN_EDIT_LIGHTNING_SNAPSHOT"]
+# The 4-step file backs `edit_lightning_user_lora_reference_repro`, which is NOT wired: it also
+# needs a user-supplied LoRA (QWEN_EDIT_REPRO_LORA) and a reference PPM (QWEN_EDIT_REPRO_REF_PPM)
+# that exist in no repository and on no Hub. It is a bug-repro harness, not a gate.
+download_files = ["Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors"]
+expected_files = ["Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors"]
+
+[[models]]
+# The PiD decoder's text conditioner. Both PiD suites load it alongside the full base model, which is
+# why they default to Q8 — Qwen/FLUX + the PiD net + Gemma coexist in one process.
+key = "gemma-2-2b-it"
+repository = "SceneWorks/gemma-2-2b-it"
+revision = "684c553b5b41a1c835989d89f62f585e6269a7de"
+license = "Gemma Terms of Use"
+size_class = "large"
+profiles = ["media-macos"]
+environment = ["PID_GEMMA_SNAPSHOT", "PID_GEMMA_DIR"]
+expected_files = [
+    "config.json",
+    "tokenizer.json",
+    "model.safetensors.index.json",
+]
+
+[[models]]
+# sc-17739 — `mlx-gen-lens` shipped in the macOS catalog with NO real-weight coverage of any kind:
+# no testkit dev-dependency, no conformance test, no entry here, no job. sc-17418 recorded that its
+# `check_cfg_off_render` arm covered lens "on the nightly"; it never did, because the suite is a
+# per-crate opt-in and lens had never opted in. This row plus the `mlx-media` wiring is what makes
+# that true.
+#
+# The upstream `microsoft/Lens-Turbo` was DELETED from the Hub by Microsoft; this is SceneWorks's
+# re-assembled diffusers-layout repackage (byte-identical weights, per its model card). Three test
+# resolvers still derived the dead `models--microsoft--Lens-Turbo` path and are repointed in the same
+# change.
+key = "lens-turbo"
+repository = "SceneWorks/Lens-Turbo"
+revision = "33acd265a2fc97a4a2f5d546ef4952b5a960aa56"
+license = "MIT"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["LENS_SNAPSHOT"]
+expected_files = [
+    "model_index.json",
+    "tokenizer/tokenizer.json",
+    "text_encoder/model.safetensors.index.json",
+    "transformer/lens_turbo_bf16.safetensors",
     "vae/diffusion_pytorch_model.safetensors",
 ]
 
@@ -95,6 +742,94 @@ expected_files = [
     "tokenizer/tokenizer.json",
     "transformer/diffusion_pytorch_model.safetensors.index.json",
     "vae/diffusion_pytorch_model.safetensors",
+]
+
+# sc-18213 (epic 18093) — `SceneWorks/z-image-turbo-mlx`, the pre-quantized MLX re-host of the
+# torch original pinned directly above. One env name per verifier pin — the sc-17284 Qwen split:
+# `ZIMAGE_SNAPSHOT` stays the TORCH original's name (the entry above; it is what the wired
+# memory-evidence-v1 and MLX-media lanes export after verifying `--model z-image-turbo`), and the
+# re-host tier-dir consumers in `mlx-gen-z-image` were renamed onto `MLX_GEN_ZIMAGE_SNAPSHOT`
+# (tests/common `tier_snapshot()`, the tier-dir real-weight tests, `fit_preview_rgb`, the
+# `training.rs` first-step harness). `ZIMAGE_TURBO_SNAPSHOT` is `preview_real_weights.rs`'s
+# pre-existing name for the same tier dirs. Neither name is exported by any workflow: these keys
+# are operator-run epic-18093 right-size calibration bindings (mlx:z_image_turbo is the #2
+# provider by widened admission surface), hence the `unwired_reason`. Keyed per tier — each tier
+# subdir is a complete diffusers-layout snapshot and each rung of the calibration ladder verifies
+# its own tier without requiring the ~19 GiB-per-tier siblings on disk. All three keys share one
+# repository + revision.
+[[models]]
+key = "z-image-turbo-mlx-bf16"
+repository = "SceneWorks/z-image-turbo-mlx"
+revision = "bb2bc9893b3c49ae96c813350775f791a2e8bc80"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["MLX_GEN_ZIMAGE_SNAPSHOT", "ZIMAGE_TURBO_SNAPSHOT"]
+unwired_reason = "operator-run epic-18093 right-size calibration on authoritative Apple hardware; pinned to bind capture evidence to exact weights (sc-18213), no CI lane dispatches the re-host tier harnesses (the wired z-image lanes verify and feed the z-image-turbo torch original)"
+download_files = ["bf16/*"]
+expected_files = [
+    "bf16/model_index.json",
+    "bf16/scheduler/scheduler_config.json",
+    "bf16/text_encoder/config.json",
+    "bf16/text_encoder/model.safetensors",
+    "bf16/tokenizer/merges.txt",
+    "bf16/tokenizer/tokenizer.json",
+    "bf16/tokenizer/tokenizer_config.json",
+    "bf16/tokenizer/vocab.json",
+    "bf16/transformer/config.json",
+    "bf16/transformer/model.safetensors",
+    "bf16/vae/config.json",
+    "bf16/vae/model.safetensors",
+]
+
+[[models]]
+key = "z-image-turbo-mlx-q8"
+repository = "SceneWorks/z-image-turbo-mlx"
+revision = "bb2bc9893b3c49ae96c813350775f791a2e8bc80"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["MLX_GEN_ZIMAGE_SNAPSHOT", "ZIMAGE_TURBO_SNAPSHOT"]
+unwired_reason = "operator-run epic-18093 right-size calibration on authoritative Apple hardware; pinned to bind capture evidence to exact weights (sc-18213), no CI lane dispatches the re-host tier harnesses (the wired z-image lanes verify and feed the z-image-turbo torch original)"
+download_files = ["q8/*"]
+expected_files = [
+    "q8/model_index.json",
+    "q8/scheduler/scheduler_config.json",
+    "q8/text_encoder/config.json",
+    "q8/text_encoder/model.safetensors",
+    "q8/tokenizer/merges.txt",
+    "q8/tokenizer/tokenizer.json",
+    "q8/tokenizer/tokenizer_config.json",
+    "q8/tokenizer/vocab.json",
+    "q8/transformer/config.json",
+    "q8/transformer/model.safetensors",
+    "q8/vae/config.json",
+    "q8/vae/model.safetensors",
+]
+
+[[models]]
+key = "z-image-turbo-mlx-q4"
+repository = "SceneWorks/z-image-turbo-mlx"
+revision = "bb2bc9893b3c49ae96c813350775f791a2e8bc80"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["MLX_GEN_ZIMAGE_SNAPSHOT", "ZIMAGE_TURBO_SNAPSHOT"]
+unwired_reason = "operator-run epic-18093 right-size calibration on authoritative Apple hardware; pinned to bind capture evidence to exact weights (sc-18213), no CI lane dispatches the re-host tier harnesses (the wired z-image lanes verify and feed the z-image-turbo torch original)"
+download_files = ["q4/*"]
+expected_files = [
+    "q4/model_index.json",
+    "q4/scheduler/scheduler_config.json",
+    "q4/text_encoder/config.json",
+    "q4/text_encoder/model.safetensors",
+    "q4/tokenizer/merges.txt",
+    "q4/tokenizer/tokenizer.json",
+    "q4/tokenizer/tokenizer_config.json",
+    "q4/tokenizer/vocab.json",
+    "q4/transformer/config.json",
+    "q4/transformer/model.safetensors",
+    "q4/vae/config.json",
+    "q4/vae/model.safetensors",
 ]
 
 [[models]]
@@ -452,6 +1187,12 @@ license = "Apache-2.0"
 size_class = "very-large"
 profiles = ["media-macos", "media-cuda"]
 environment = ["MOCHI_SNAPSHOT"]
+# Michael, 2026-08-03: "Mochi-1 does not need to be tested. That code is frozen until a lightning
+# version is released. I don't want any weights tests because it will take hours. It's the slowest
+# model I've ever seen." The 13 crate files reading MOCHI_SNAPSHOT are therefore ungated ON PURPOSE.
+# Do not "fix" this by adding a lane; revisit only when a Mochi lightning variant makes a
+# real-weight run tractable.
+unwired_reason = "frozen until a Mochi lightning variant lands; a real-weight run takes hours (sc-17266)"
 expected_files = [
     "model_index.json",
     "tokenizer/spiece.model",
@@ -585,8 +1326,10 @@ environment = ["MMAUDIO_BIGVGAN_SNAPSHOT"]
 expected_files = ["ext_weights/best_netG.pt"]
 download_files = ["ext_weights/best_netG.pt"]
 [[models]]
-# DFN5B-CLIP ViT-H/14-384 (sc-13437, epic sc-12833): the CLIP model MMAudio conditions on — Apple's
-# open_clip ViT-H/14 quickgelu DFN5B variant, ported natively in candle-audio-mmaudio::clip. Visual
+# DFN5B-CLIP ViT-H/14-378 (sc-13437, epic sc-12833): the CLIP model MMAudio conditions on — Apple's
+# open_clip ViT-H/14 quickgelu DFN5B variant, ported natively in candle-audio-mmaudio::clip. MMAudio
+# deliberately feeds 384×384 frames to the 378-native checkpoint; patch 14 with stride 14 produces
+# the same 27×27 patch grid at both resolutions. The stable catalog key remains `...-384`. Visual
 # tower -> 1024-d per-frame features (encode_image, normalize=True); 77-token text tower ->
 # per-token (77,1024) last-hidden-state (MMAudio's patched encode_text). ~3.9 GB open_clip pickle.
 # Weights are Apple Machine Learning Research Model License (research / non-commercial only). Gated
@@ -594,7 +1337,7 @@ download_files = ["ext_weights/best_netG.pt"]
 # deterministic, discriminative) + an open_clip numerical-parity test (cos>0.999). Parity validated
 # locally at cos=1.000000 (image) / 1.000000 (text) — see PR sc-13437.
 key = "dfn5b-clip-vit-h14-384"
-repository = "apple/DFN5B-CLIP-ViT-H-14-384"
+repository = "apple/DFN5B-CLIP-ViT-H-14-378"
 revision = "01b771ed0d1395ca5ffdd279897d665ebe00dfd2"
 license = "Apple Machine Learning Research Model License"
 size_class = "very-large"
@@ -636,7 +1379,12 @@ revision = "eb13a1a98fdbec91753775c57b074ccdfc60587c"
 license = "CC-BY-NC-4.0"
 size_class = "very-large"
 profiles = ["audio-cuda"]
-environment = ["MMAUDIO_DIT_44K_SNAPSHOT"]
+# sc-17266: this declared MMAUDIO_DIT_44K_SNAPSHOT, a name NO crate file has ever read. Unlike the
+# 16k DiT (MMAUDIO_DIT_SNAPSHOT, tests/mmdit_conformance.rs) the 44k network has no standalone
+# component test; it is reached only through tests/common/mod.rs::dit_44k_source(), which joins
+# `weights/mmaudio_large_44k_v2.pth` onto the shared hkchengrex repo dir. That shared dir variable is
+# what the checkpoint actually resolves from, so it is the one declared here.
+environment = ["MMAUDIO_MMAUDIO_SNAPSHOT"]
 expected_files = ["weights/mmaudio_large_44k_v2.pth"]
 download_files = ["weights/mmaudio_large_44k_v2.pth"]
 
@@ -784,10 +1532,48 @@ expected_files = [
 key = "mage-flow"
 repository = "microsoft/Mage-Flow"
 revision = "faca09c18c1c19458e7fbc3f7bce6f7a7d4d01a9"
+# Microsoft withdrew the canonical Hub repository. This immutable public mirror records 24/24 LFS
+# objects and 43/43 model files byte-matching the canonical revision; only card/licence metadata was
+# added. Preserve the canonical revision marker so the independently produced Mage oracle bundle
+# and existing Windows caches stay valid, but make new materializations anonymous and reproducible.
+materialization_repository = "SceneWorks/Mage-Flow"
+materialization_revision = "5f6455818d8ca80ce780e9c01b9e0de1d8c5f9db"
 license = "MIT"
 size_class = "very-large"
 profiles = ["media-macos", "media-cuda"]
 environment = ["MAGE_SNAPSHOT"]
+# The mirrors also publish q4/q8/bf16 conversion tiers. Fetch the complete canonical root model
+# surface, not those additional projections: four whole-repo downloads would waste ~56 GiB on the
+# 192 GiB rw-mage runner before the PiD lane materializes its own FLUX snapshot.
+download_files = [
+    "model_index.json",
+    "scheduler/*",
+    "text_encoder/*",
+    "transformer/*",
+    "vae/*",
+]
+materialization_expected_files = [
+    "model_index.json",
+    "scheduler/scheduler_config.json",
+    "text_encoder/.gitattributes",
+    "text_encoder/README.md",
+    "text_encoder/chat_template.json",
+    "text_encoder/config.json",
+    "text_encoder/generation_config.json",
+    "text_encoder/merges.txt",
+    "text_encoder/model-00001-of-00002.safetensors",
+    "text_encoder/model-00002-of-00002.safetensors",
+    "text_encoder/model.safetensors.index.json",
+    "text_encoder/preprocessor_config.json",
+    "text_encoder/tokenizer.json",
+    "text_encoder/tokenizer_config.json",
+    "text_encoder/video_preprocessor_config.json",
+    "text_encoder/vocab.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
 expected_files = [
     "model_index.json",
     "scheduler/scheduler_config.json",
@@ -806,10 +1592,41 @@ expected_files = [
 key = "mage-flow-edit-base"
 repository = "microsoft/Mage-Flow-Edit-Base"
 revision = "8654a7bc0283ab2946385230b5b2eb944e0b76ea"
+materialization_repository = "SceneWorks/Mage-Flow-Edit-Base"
+materialization_revision = "6c119cdac7ce7cf8c1ab4990d9c8ca18641f2c5d"
 license = "MIT"
 size_class = "very-large"
 profiles = ["media-macos", "media-cuda"]
 environment = ["MAGE_EDIT_BASE_SNAPSHOT"]
+download_files = [
+    "model_index.json",
+    "scheduler/*",
+    "text_encoder/*",
+    "transformer/*",
+    "vae/*",
+]
+materialization_expected_files = [
+    "model_index.json",
+    "scheduler/scheduler_config.json",
+    "text_encoder/.gitattributes",
+    "text_encoder/README.md",
+    "text_encoder/chat_template.json",
+    "text_encoder/config.json",
+    "text_encoder/generation_config.json",
+    "text_encoder/merges.txt",
+    "text_encoder/model-00001-of-00002.safetensors",
+    "text_encoder/model-00002-of-00002.safetensors",
+    "text_encoder/model.safetensors.index.json",
+    "text_encoder/preprocessor_config.json",
+    "text_encoder/tokenizer.json",
+    "text_encoder/tokenizer_config.json",
+    "text_encoder/video_preprocessor_config.json",
+    "text_encoder/vocab.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
 expected_files = [
     "model_index.json",
     "scheduler/scheduler_config.json",
@@ -828,10 +1645,41 @@ expected_files = [
 key = "mage-flow-edit-turbo"
 repository = "microsoft/Mage-Flow-Edit-Turbo"
 revision = "14427bd7627d3a25436497a5939e1096f6a0d523"
+materialization_repository = "SceneWorks/Mage-Flow-Edit-Turbo"
+materialization_revision = "75c11a2957aca2c78272984375502105b2b235ab"
 license = "MIT"
 size_class = "very-large"
 profiles = ["media-macos", "media-cuda"]
 environment = ["MAGE_EDIT_TURBO_SNAPSHOT"]
+download_files = [
+    "model_index.json",
+    "scheduler/*",
+    "text_encoder/*",
+    "transformer/*",
+    "vae/*",
+]
+materialization_expected_files = [
+    "model_index.json",
+    "scheduler/scheduler_config.json",
+    "text_encoder/.gitattributes",
+    "text_encoder/README.md",
+    "text_encoder/chat_template.json",
+    "text_encoder/config.json",
+    "text_encoder/generation_config.json",
+    "text_encoder/merges.txt",
+    "text_encoder/model-00001-of-00002.safetensors",
+    "text_encoder/model-00002-of-00002.safetensors",
+    "text_encoder/model.safetensors.index.json",
+    "text_encoder/preprocessor_config.json",
+    "text_encoder/tokenizer.json",
+    "text_encoder/tokenizer_config.json",
+    "text_encoder/video_preprocessor_config.json",
+    "text_encoder/vocab.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
 expected_files = [
     "model_index.json",
     "scheduler/scheduler_config.json",
@@ -853,10 +1701,41 @@ expected_files = [
 key = "mage-flow-edit"
 repository = "microsoft/Mage-Flow-Edit"
 revision = "b01d524f86498b7dabcc4b3572c6d264d786a16e"
+materialization_repository = "SceneWorks/Mage-Flow-Edit"
+materialization_revision = "dbd4a9c07faca94491ad88ab21225d62e054d9cc"
 license = "MIT"
 size_class = "very-large"
 profiles = ["media-macos", "media-cuda"]
 environment = ["MAGE_EDIT_SNAPSHOT"]
+download_files = [
+    "model_index.json",
+    "scheduler/*",
+    "text_encoder/*",
+    "transformer/*",
+    "vae/*",
+]
+materialization_expected_files = [
+    "model_index.json",
+    "scheduler/scheduler_config.json",
+    "text_encoder/.gitattributes",
+    "text_encoder/README.md",
+    "text_encoder/chat_template.json",
+    "text_encoder/config.json",
+    "text_encoder/generation_config.json",
+    "text_encoder/merges.txt",
+    "text_encoder/model-00001-of-00002.safetensors",
+    "text_encoder/model-00002-of-00002.safetensors",
+    "text_encoder/model.safetensors.index.json",
+    "text_encoder/preprocessor_config.json",
+    "text_encoder/tokenizer.json",
+    "text_encoder/tokenizer_config.json",
+    "text_encoder/video_preprocessor_config.json",
+    "text_encoder/vocab.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
 expected_files = [
     "model_index.json",
     "scheduler/scheduler_config.json",
@@ -867,4 +1746,615 @@ expected_files = [
     "text_encoder/config.json",
     "text_encoder/tokenizer.json",
     "text_encoder/model.safetensors.index.json",
+]
+
+[[models]]
+# Krea Realtime 14B (epic 8431, sc-8446 S13): the SceneWorks MLX rehost of `krea/krea-realtime-video`
+# (Wan-2.1-T2V-14B weight-for-weight, distilled Self-Forcing autoregressive). The repo ships three
+# self-contained tiers; the real-weight lane runs **q4/** only — `download_files` fetches ~20 GB of the
+# repo's ~88 GB, and Q4 is the tier the Mac product path actually serves for this dense-video engine.
+# Each tier dir is a complete snapshot (`dit` + the stock Wan `t5_encoder`/`vae`/`tokenizer`), so
+# `KREA_REALTIME_SNAPSHOT_DIR` points one level in, at `<snapshot>/q4`.
+key = "krea-realtime-14b-mlx"
+repository = "SceneWorks/krea-realtime-14b-mlx"
+revision = "e68e9a3d98187fdf6936838ffcf6df5aa48d6626"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["KREA_REALTIME_SNAPSHOT"]
+download_files = ["q4/*"]
+expected_files = [
+    "q4/config.json",
+    "q4/dit.safetensors",
+    "q4/t5_encoder.safetensors",
+    "q4/tokenizer.json",
+    "q4/vae.safetensors",
+]
+
+[[models]]
+# SC-18315 uses only the stock Wan z16 VAE from Krea Realtime's q8 tier as Krea 2's experimental
+# alternate terminal decoder. Keep this as a standalone exact-file projection: the correctness lane
+# must not materialize the unrelated complete repository or silently widen this donor dependency.
+key = "krea-realtime-14b-mlx-wan-z16-vae-q8"
+repository = "SceneWorks/krea-realtime-14b-mlx"
+revision = "e68e9a3d98187fdf6936838ffcf6df5aa48d6626"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["media-macos"]
+environment = ["KREA_ALTERNATE_DECODER_WAN_VAE_SNAPSHOT"]
+download_files = ["q8/vae.safetensors"]
+expected_files = ["q8/vae.safetensors"]
+
+# sc-18213 (epic 18093) — `SceneWorks/krea-2-turbo-mlx`, the Krea 2 Turbo IMAGE re-host
+# `mlx-gen-krea` actually loads (`KREA_TURBO_DIR` points one level in, at a tier dir). NOT related
+# to `krea-realtime-14b-mlx` above beyond the vendor name: that is a Wan-2.1 video model. The repo
+# ships three self-contained diffusers-layout tiers. The explicit SC-18315 correctness lane uses
+# q4 only; the epic-18093 right-size calibration keeps bf16/q8 operator-only. Each tier is
+# provisioned independently (bf16 alone is ~33 GiB), so the binding is keyed per tier — the
+# flux2-klein-9b-mlx-q4 shape. All three keys share one
+# repository + revision; sibling tiers present on disk are still inventoried by
+# `verify_model_snapshot.py --inventory-output`, so a multi-tier snapshot changes the inventory
+# sha rather than silently reusing a single-tier one.
+[[models]]
+key = "krea-2-turbo-mlx-bf16"
+repository = "SceneWorks/krea-2-turbo-mlx"
+revision = "d009674080cc1bccf2b629d834c34bf5eccdb723"
+license = "Krea 2 Community License"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["KREA_TURBO_DIR"]
+unwired_reason = "operator-run epic-18093 right-size calibration on authoritative Apple hardware; pinned to bind capture evidence to exact weights (sc-18213), no CI lane dispatches the krea-2-turbo harnesses"
+download_files = ["bf16/*", "LICENSE.pdf"]
+expected_files = [
+    "LICENSE.pdf",
+    "bf16/model_index.json",
+    "bf16/scheduler/scheduler_config.json",
+    "bf16/text_encoder/config.json",
+    "bf16/text_encoder/model.safetensors",
+    "bf16/tokenizer/chat_template.jinja",
+    "bf16/tokenizer/tokenizer.json",
+    "bf16/tokenizer/tokenizer_config.json",
+    "bf16/transformer/config.json",
+    "bf16/transformer/diffusion_pytorch_model.safetensors.index.json",
+    "bf16/vae/config.json",
+    "bf16/vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+key = "krea-2-turbo-mlx-q8"
+repository = "SceneWorks/krea-2-turbo-mlx"
+revision = "d009674080cc1bccf2b629d834c34bf5eccdb723"
+license = "Krea 2 Community License"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["KREA_TURBO_DIR"]
+unwired_reason = "operator-run epic-18093 right-size calibration on authoritative Apple hardware; pinned to bind capture evidence to exact weights (sc-18213), no CI lane dispatches the krea-2-turbo harnesses"
+download_files = ["q8/*", "LICENSE.pdf"]
+expected_files = [
+    "LICENSE.pdf",
+    "q8/model_index.json",
+    "q8/scheduler/scheduler_config.json",
+    "q8/text_encoder/config.json",
+    "q8/text_encoder/model.safetensors",
+    "q8/tokenizer/chat_template.jinja",
+    "q8/tokenizer/tokenizer.json",
+    "q8/tokenizer/tokenizer_config.json",
+    "q8/transformer/config.json",
+    "q8/transformer/diffusion_pytorch_model.safetensors",
+    "q8/vae/config.json",
+    "q8/vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+key = "krea-2-turbo-mlx-q4"
+repository = "SceneWorks/krea-2-turbo-mlx"
+revision = "d009674080cc1bccf2b629d834c34bf5eccdb723"
+license = "Krea 2 Community License"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["KREA_TURBO_DIR"]
+download_files = ["q4/*", "LICENSE.pdf"]
+expected_files = [
+    "LICENSE.pdf",
+    "q4/model_index.json",
+    "q4/scheduler/scheduler_config.json",
+    "q4/text_encoder/config.json",
+    "q4/text_encoder/model.safetensors",
+    "q4/tokenizer/chat_template.jinja",
+    "q4/tokenizer/tokenizer.json",
+    "q4/tokenizer/tokenizer_config.json",
+    "q4/transformer/config.json",
+    "q4/transformer/diffusion_pytorch_model.safetensors",
+    "q4/vae/config.json",
+    "q4/vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# A published, canonical Wan-2.1-14B **style** LoRA (sc-8446 S13): 400 per-block attention + FFN stems,
+# no globals, no I2V image cross-attention — the class the Krea Realtime adapter surface must accept and
+# measurably render with. Small (~307 MB); only the LoRA file is fetched, not the sample videos.
+key = "wan-origami-style-lora"
+repository = "shauray/Origami_WanLora"
+revision = "698ea6952da38438a55112ab51fea0f5a53556bc"
+license = "Apache-2.0"
+size_class = "small"
+profiles = ["media-macos"]
+environment = ["KREA_STYLE_LORA_SNAPSHOT"]
+download_files = ["origami_000000500.safetensors"]
+expected_files = ["origami_000000500.safetensors"]
+
+[[models]]
+# A published Wan-2.1-T2V-14B **step-distill** LoRA (sc-8446 S13): the class that settled the
+# globals-surface decision. It carries low-rank factors for 6 of the 7 whole-model globals
+# (`patch_embedding` ships a `.diff_b` bias delta only), so a real install resolves 406 targets against
+# the 407-wide surface — on the pre-sc-8446 per-block-only surface `apply_adapters_strict` rejected the
+# whole file. This is the only real-weight regression gate on that decision. Only the one LoRA file is
+# fetched, not the ~200 other checkpoints in the repo.
+key = "wan-lightx2v-step-distill-lora"
+repository = "Kijai/WanVideo_comfy"
+revision = "8260d429d19fd7a72304cad059160b95d843913f"
+license = "Apache-2.0"
+size_class = "medium"
+profiles = ["media-macos"]
+environment = ["KREA_DISTILL_LORA_SNAPSHOT"]
+download_files = ["Lightx2v/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16.safetensors"]
+expected_files = ["Lightx2v/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16.safetensors"]
+
+[[models]]
+# SANA-1.6B 1024px, the SceneWorks MLX re-host (epic 8485, memory ladder SC-15523). The pin exists so
+# the SC-15523 rung-3/rung-4 evidence records can name the exact bytes they were measured over:
+# `verify_model_snapshot.py --inventory-output` turns this entry plus the snapshot on disk into the
+# `model_revision` + `model_inventory_sha256` pair every `MEMORY_EVIDENCE_V1` record carries, and
+# without it those two fields would be operator-typed strings nothing can check.
+#
+# `expected_files` names the q4 turnkey tier, the tier both SANA entries ship and the one the ladder
+# was measured at; bf16/ and q8/ are siblings under the same revision and are inventoried when
+# present, so a later per-tier sweep changes the inventory sha rather than silently reusing this one.
+key = "sana-1600m-mlx"
+repository = "SceneWorks/Sana_1600M_1024px_mlx"
+revision = "ac421696dd6eb0b41f446f4c45a53ccc057d82a1"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["media-macos"]
+environment = ["SANA_LADDER_1600M"]
+# Wired since sc-18249: the operator-dispatched `mlx-sana-drift-ceiling` lane in real-weights.yml
+# runs the two tiled-decode drift-ceiling tests in `memory_ladder_real_weights.rs` (mean-abs-u8
+# ceiling 6.0) against this snapshot. The REST of the memory-ladder harness stays operator-run on
+# authoritative Apple hardware — a rung-4 sweep re-materializes the trunk once per block per step,
+# so hosting the whole ladder would be many hours per entry; widening the lane is sc-17848's call.
+expected_files = [
+    "q4/transformer/diffusion_pytorch_model.safetensors",
+    "q4/vae/diffusion_pytorch_model.safetensors",
+    "q4/text_encoder/gemma-2-2b-it.safetensors",
+    "q4/text_encoder/tokenizer.json",
+]
+
+[[models]]
+# SANA-Sprint 1.6B 1024px — the CFG-free, continuous-time-consistency-distilled few-step variant
+# (sc-8490). Same Linear-DiT backbone and the same DC-AE, a different checkpoint and a different
+# sampler, which is exactly why it owes its own memory-ladder evidence rather than inheriting the
+# base entry's. It is the SC-15523 representative for the multi-row sweeps: 2 CFG-free steps against
+# base SANA's 40 trunk forwards per image.
+key = "sana-sprint-1600m-mlx"
+repository = "SceneWorks/Sana_Sprint_1.6B_1024px_mlx"
+revision = "0b0d18484cac2fb515e76d25a09a5911ae4ab58e"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["media-macos"]
+environment = ["SANA_LADDER_SPRINT"]
+unwired_reason = "epic-15448 ladder harnesses are operator-run on authoritative hardware; pinned here only to bind evidence records to exact weights (sc-15523)"
+expected_files = [
+    "q4/transformer/diffusion_pytorch_model.safetensors",
+    "q4/vae/diffusion_pytorch_model.safetensors",
+    "q4/text_encoder/gemma-2-2b-it.safetensors",
+    "q4/text_encoder/tokenizer.json",
+]
+
+[[models]]
+# Bernini — the SceneWorks MLX re-host of ByteDance Bernini (Qwen2.5-VL-7B latent-semantic planner
+# driving a Wan2.2-T2V-A14B dual-expert renderer), memory ladder sc-15528 / sc-16354.
+#
+# The pin exists so this family's `MEMORY_EVIDENCE_V1` records can name the exact bytes they were
+# measured over: `verify_model_snapshot.py --inventory-output` turns this entry plus the snapshot on
+# disk into the `model_revision` + `model_inventory_sha256` pair every record carries. Without it
+# those two fields would be operator-typed strings nothing can check.
+#
+# `expected_files` names the q4 tier — the smallest of the three and the only one that leaves useful
+# headroom for a rung-4 sweep on a 128 GB Mac (q4 is ~35 GiB on disk against ~51 GiB for q8 and
+# ~82 GiB for bf16, and the card measures ~44 GB peak at q4). bf16/ and q8/ are siblings under the
+# same revision and are inventoried when present, so a later per-tier sweep changes the inventory sha
+# rather than silently reusing this one.
+key = "bernini-mlx"
+repository = "SceneWorks/bernini-mlx"
+revision = "533d688f16c8f33dc832890c1e16c11921a2019a"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["media-macos"]
+environment = ["BERNINI_LADDER_SNAPSHOT"]
+expected_files = [
+  "q4/config.json",
+  "q4/bernini_renderer.json",
+  "q4/high_noise_model.safetensors",
+  "q4/low_noise_model.safetensors",
+  "q4/qwen2_5_vl.safetensors",
+  "q4/t5_encoder.safetensors",
+  "q4/vae.safetensors",
+  "q4/tokenizer.json",
+]
+# NOT wired to a lane, and the reason is specific rather than the family-wide posture. The repository
+# is public and ungated, so it IS provisionable exactly the way `chroma-memory-ladder` provisions
+# Chroma (anonymous `snapshot_download` into `runner.temp`) — what is missing is the harness the lane
+# would invoke: sc-15528 lands the ladder mechanism and its weights-free gates, not
+# `tests/memory_ladder_real_weights.rs`. A lane dispatching a test file that does not exist is worse
+# than no lane, so this stays exempt until the harness lands with it. See the follow-up on sc-15528.
+unwired_reason = "sc-15528 landed the Bernini ladder mechanism; the real-weight harness and its lane are the tracked follow-up, and a lane with no test to run would be vacuously green"
+
+# ── MiniMax-H3 upstream components (sc-18932) ───────────────────────────────────────────────────
+# `MiniMaxAI/MiniMax-H3` is ONE ~196 GB repository holding the DiT (`transformer/` and
+# `transformer_ref/`, 62 GB each), the dense Qwen3-VL-32B text encoder (62 GB), both VAEs, the
+# tokenizer and the FL2VA source bundles. It was absent from this manifest entirely while
+# `MINIMAX_H3_SNAPSHOT` was read by ~30 `#[ignore]`d tests across BOTH backends and referenced by no
+# workflow — so every one of them could only ever be run by hand. That is the gap this row closes.
+#
+# The tests are correct: they ASSERT on the variable instead of returning early, so a missing
+# snapshot fails loudly (exit 101) rather than printing `ok` in 0.00 s. Nothing could supply the
+# variable, which is a different defect from a vacuous green and is why it survived so long.
+#
+# `download_files` is a deliberate 11.638 GB slice of the 196 GB (measured 2026-08-13 with
+# `os.stat` over the snapshot on nax-macos, symlinks dereferenced; the TOTAL was re-summed
+# 2026-08-15 for sc-19445 and is 11.638 — what the rows below actually add to — not the 11.640 this
+# line used to carry):
+#
+#   vae/                                       10.416 GB  video VAE: 3 shards + index + config
+#   audio_vae/                                  0.605 GB  the diffusers-repackaged audio VAE
+#   FL2VA/audio_vae/                            0.605 GB  the reference's own `from_pretrained`
+#                                                         inputs — the config.json / config.yaml /
+#                                                         metadata.json triple plus model.safetensors
+#   tokenizer/                                  0.012 GB  tokenizer.json + tokenizer_config.json
+#   text_encoder/model.safetensors.index.json   0.0001 GB the TE SHARD INDEX ONLY, no shards
+#
+# That slice is what makes NINETEEN previously undrivable selections runnable in CI — eleven in
+# `mlx-gen-minimax-h3` (three header/config gates, the TE-index and tokenizer gates, the video,
+# multi-chunk and ~0.6 GB audio decodes, the diffusers parity gate, and sc-17151's two
+# staged-residency tripwire arms) and eight in `candle-gen-minimax-h3` (four header/config gates,
+# the stored-Kaiser-filter check, and the video, multi-chunk and audio decodes). See the
+# `mlx-minimax-h3` and `candle-minimax-h3` jobs in `.github/workflows/real-weights.yml`, and
+# `test_minimax_h3_lanes_select_tests_that_exist_and_pin_their_run_count`, which binds each selected
+# name to a still-`#[ignore]`d `fn` so a rename on either side is a red on the next PR.
+#
+# THIRTEEN of the nineteen were executed against these bytes on 2026-08-13, before the lanes were
+# written. SIX have not been: the three candle decodes and the candle
+# `declared_encoder_shapes_match_the_published_checkpoint` gate, which did not exist on 2026-08-13
+# (sc-19008 added it on 2026-08-14); that one is header-only and device-free, so there is no
+# capacity question attached to it. The decodes are the deliberate distinction: sc-18932 left them
+# out because no VRAM figure for the Windows box existed, and sc-19414 wired them from one. The two
+# sc-17151 arms are the other pair, added 2026-08-15 and likewise not yet executed anywhere — the
+# `mlx-minimax-h3` lane's first run is their first; they hold ~11 GB, under this row's parity gate.
+#
+# sc-17151's OTHER arms are deliberately NOT selected, for the same reason the two candle DiT header
+# gates below are not: `staged_residency.rs`'s te/dit arms, every `#[ignore]`d arm of
+# `ref2va_checkpoint.rs`, and both arms of `te_tier_generate_stages.rs` open `transformer/`,
+# `transformer_ref/` or `text_encoder/` through `Weights::from_dir`, and this row carries no shards
+# of any of them. They stay hand-driven on a box holding the full snapshot.
+#
+#   SUPPLY  `nvidia-smi` in run 31353865709 puts 2x RTX PRO 6000 Blackwell at 97887 MiB
+#           (95.59 GiB) each on `MICHAEL-TRX50`, and `default_device()` pins GPU 0.
+#   DEMAND  measured from the published safetensors HEADERS, not inherited: `vae/` ships **F32,
+#           all 703 tensors** (9.70 GiB), so loading it at f32 is a no-op cast rather than a
+#           doubling. The video decodes take the 585-tensor decode half — **9.03 GiB / 9.69 GB**,
+#           not the ~19.4 GB an earlier note claimed — and the audio decode takes 914 tensors of
+#           the likewise-all-F32 `audio_vae/`, **0.242 GiB / 0.26 GB**, not ~1.2 GB. The bf16
+#           component in this checkpoint is `transformer/`, which this row does not fetch.
+#   VERDICT 9.4% of the card for a video decode, 10.6x headroom.
+#
+# That is a sizing decision taken on measurement, but it is NOT an observed execution: those three
+# have never run on candle anywhere, and the first run of the `candle-minimax-h3` lane is their
+# first. The arithmetic is recorded in that job's header.
+#
+# THE TE INDEX IS DELIBERATELY NOT IN `expected_files`. `verify_model_snapshot.py` parses every
+# `*.index.json` it is given and requires each shard the `weight_map` names, so listing it would
+# demand all fourteen TE shards — 62 GB, five times the rest of this row put together. It is fetched
+# and consumed instead: `te_layer_50_tap_is_exhaustive_and_the_tail_is_trimmable` panics on a missing
+# index, so its absence is loud at the test rather than at verification.
+#
+# THE THREE OPERATOR ARTIFACTS are deliberately NOT `environment` entries here, and the omission is
+# a category judgement rather than an oversight. `environment` names variables that point a test at
+# THIS PINNED SNAPSHOT; `MINIMAX_H3_VIDEO_VAE_REFERENCE` (~840 KB),
+# `MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE` (~5.7 MB, sc-19445) and `MINIMAX_H3_TE_REFERENCE`
+# (~226 KB, sc-19438) each point at a file an operator PRODUCES from the snapshot with a
+# `crates/media/mlx-gen/tools/dump_minimax_h3_*_real.py` script. Listing them would claim the pin
+# describes bytes no revision can. They live in the `mlx-minimax-h3` job instead, the way
+# `MAGE_ORACLE_SEED_DIR` lives only in `mlx-media` — recorded here so a census reader finds them.
+#
+# THE TWO HEAVY COMPONENTS ARE NOT IN THIS ROW, AND THAT IS STILL THE RIGHT SHAPE. Adding
+# `transformer/*` or `text_encoder/*` here would multiply the cost of the row EVERY H3 lane fetches
+# by six, for gates only some of them run. Each gets its OWN key instead — `minimax-h3-dit`
+# (sc-19558) and `minimax-h3-text-encoder` (sc-19438) below — the same per-key split
+# `minimax-h3-mlx-*` already uses over one repository, so a lane provisions exactly the components
+# its selections read.
+#
+# THIS ROW THEREFORE STAYS AT ITS 11.638 GB SLICE, and the split is the whole point: this row is
+# `profiles = ["media-macos", "media-cuda"]` and the Windows CUDA lane materializes it by key, so
+# folding the text-encoder row's 58.568 GB of shards into it would put those bytes on a shared dev
+# box whose lane reads not one of them — and folding the DiT's 132.6 GB in would do the same to the
+# macOS lane.
+#
+# THE TWO CANDLE DiT HEADER GATES (`declared_dit_tensor_names_match_the_published_checkpoint`,
+# `the_adaln_projections_are_the_documented_twenty_six_gigabytes`) are no longer hand-driven: they
+# read only headers but need the `transformer/` component to exist, and `minimax-h3-dit` below is
+# the row that supplies it.
+[[models]]
+key = "minimax-h3"
+repository = "MiniMaxAI/MiniMax-H3"
+revision = "939557dc319dd91227e30195a763f272ba7f8765"
+license = "MiniMax H3 Community License Agreement"
+size_class = "very-large"
+profiles = ["media-macos", "media-cuda"]
+environment = ["MINIMAX_H3_SNAPSHOT"]
+download_files = [
+  "vae/*",
+  "audio_vae/*",
+  "FL2VA/audio_vae/*",
+  "tokenizer/*",
+  "text_encoder/model.safetensors.index.json",
+]
+expected_files = [
+  "vae/config.json",
+  "vae/diffusion_pytorch_model.safetensors.index.json",
+  "audio_vae/config.json",
+  "audio_vae/diffusion_pytorch_model.safetensors",
+  "FL2VA/audio_vae/config.json",
+  "FL2VA/audio_vae/config.yaml",
+  "FL2VA/audio_vae/metadata.json",
+  "FL2VA/audio_vae/model.safetensors",
+  "tokenizer/tokenizer.json",
+  "tokenizer/tokenizer_config.json",
+]
+
+# ── MiniMax-H3 VRAM campaign (sc-20754) ──────────────────────────────────────────────────────────
+#
+# A dedicated exact allow-list keeps the normal `minimax-h3` header/decode slice small. The CUDA
+# VRAM campaign needs the dense root transformer and every text-encoder shard, whereas ordinary
+# lanes do not. The workflow deliberately refuses the runner's Hugging Face cache snapshot because
+# its reparse-point blob links cannot be memmapped by candle; an operator must hardlink/copy-stage
+# this exact projection. Both indexes are expected so verification follows their weight maps and
+# fails loudly for a missing shard rather than discovering it during a render.
+[[models]]
+key = "minimax-h3-vram"
+repository = "MiniMaxAI/MiniMax-H3"
+revision = "939557dc319dd91227e30195a763f272ba7f8765"
+license = "MiniMax H3 Community License Agreement"
+size_class = "very-large"
+profiles = ["media-cuda"]
+environment = ["CANDLE_MINIMAX_H3_SNAPSHOT"]
+download_files = [
+  "text_encoder/config.json",
+  "text_encoder/model-00001-of-00014.safetensors",
+  "text_encoder/model-00002-of-00014.safetensors",
+  "text_encoder/model-00003-of-00014.safetensors",
+  "text_encoder/model-00004-of-00014.safetensors",
+  "text_encoder/model-00005-of-00014.safetensors",
+  "text_encoder/model-00006-of-00014.safetensors",
+  "text_encoder/model-00007-of-00014.safetensors",
+  "text_encoder/model-00008-of-00014.safetensors",
+  "text_encoder/model-00009-of-00014.safetensors",
+  "text_encoder/model-00010-of-00014.safetensors",
+  "text_encoder/model-00011-of-00014.safetensors",
+  "text_encoder/model-00012-of-00014.safetensors",
+  "text_encoder/model-00013-of-00014.safetensors",
+  "text_encoder/model-00014-of-00014.safetensors",
+  "text_encoder/model.safetensors.index.json",
+  "transformer/*",
+]
+expected_files = [
+  "text_encoder/config.json",
+  "text_encoder/model.safetensors.index.json",
+  "transformer/config.json",
+  "transformer/diffusion_pytorch_model.safetensors.index.json",
+]
+
+# ── MiniMax-H3 text encoder, layer-50 tap only (sc-19438) ───────────────────────────────────────
+# The SAME repository and the SAME pinned revision as `minimax-h3` above, materialized into the
+# SAME `MINIMAX_H3_SNAPSHOT` directory. It is a separate key rather than more entries on that row
+# for one reason: that row is `media-macos` AND `media-cuda`, and the Windows CUDA lane
+# materializes it by key. Folding these 58.568 GB of text encoder into it would put those bytes on
+# a shared dev box whose lane reads not one of them. Only `mlx-minimax-h3` materializes this key.
+#
+# WHY IT IS FETCHED AT ALL. `real_weight_te_context_matches_the_official_conditioner` is the only
+# executable parity gate on the component that sets this family's entire ~53 GB memory floor. Its
+# `select_hidden = 50` and its no-chat-template presentation are documented in the MODEL CARD
+# ALONE, and the absence of this gate is how sc-18741 shipped a chat-template prefix into the
+# conditioning the DiT sees. sc-18932 deliberately scoped the fetch out and was right to for an
+# inventory story; the consequence was that the gate asserted-rather-than-skipped on an artifact
+# nobody could point it at, which is a red lane, not coverage.
+#
+# TWELVE OF THE FOURTEEN SHARDS, and twelve is a MIRROR of production rather than a derived
+# minimum: it is exactly `TE_SHARDS` (`1..=12`, declared at
+# `crates/media/mlx-gen/mlx-gen-minimax-h3/src/text_encoder/mod.rs:376`), the range the `t2va`
+# loader itself maps. ELEVEN would in fact serve the layer-50 tap — measured from this revision's
+# own shard headers, `embed_tokens` and decoder layers 0-49 live entirely in shards 1-11 (53.692
+# GB), and shard 12 carries only layers 53-58, none of which the tap executes. Fetching `TE_SHARDS`
+# verbatim is what stops this row and the loader drifting apart; it is not a floor.
+#
+# WHAT THE TRIM SAVES, measured from the same headers: shards 13-14, **8.147 GB**, so 58.568 GB
+# fetched rather than the component's full 66.715 GB. That is NOT the 15.209 GB
+# `te_layer_50_tap_is_exhaustive_and_the_tail_is_trimmable` asserts — that is a different quantity,
+# the TENSOR bytes of layers 50-63 + `lm_head` + `norm`, which straddle shards 11-14 and therefore
+# cannot all be dropped at shard granularity. Nor is that test this list's keeper: it reads
+# `weight_map` KEYS and config dims only, never which shard a tensor lives in, so it passes
+# bit-identically under any re-sharding. The keeper is
+# `real_weight_te_context_matches_the_official_conditioner`, which maps
+# `model-00001-of-00014` .. `model-00012-of-00014` by literal filename and panics on a missing one.
+#
+# DROPPING SHARD 14 DROPS THE WHOLE QWEN3-VL VISION TOWER: all 351 `model.visual.*` tensors live in
+# shard 14 and nowhere else (`VISION_SHARD = 14`, same module). Nothing this lane runs today reads
+# one of them, so the omission is correct as it stands — but the first `fl2va` / `ref2va` gate
+# needs the vision half, and will need a thirteenth entry here to get it.
+#
+# `expected_files` names two shards rather than the index. Listing
+# `text_encoder/model.safetensors.index.json` would make `verify_model_snapshot.py` walk its
+# `weight_map` and demand all fourteen — including the two this row deliberately does not fetch.
+# The first and twelfth are the two ends of the range, so a truncated transfer fails here rather
+# than 50 layers into a Metal forward.
+#
+# THE BYTES WERE NEVER THE ONLY BLOCKER, and sc-19558 was right to say so: this gate also needs
+# `MINIMAX_H3_TE_REFERENCE`, a ~226 KB context artifact an operator produces by hand with
+# `crates/media/mlx-gen/tools/dump_minimax_h3_te_real.py`, and it asserts rather than skips when
+# that is absent — so a key added on its own would fetch 58.568 GB per run and then red the lane.
+# sc-19558 closed with "add the key in the same change that sets the variable"; THIS is that change.
+# The `mlx-minimax-h3` job passes `vars.MINIMAX_H3_TE_REFERENCE` into the test environment and
+# preflights it — unset, non-absolute or empty fails the job with a named message BEFORE the fetch,
+# so the lane refuses to report green without it rather than paying 58.568 GB to red.
+[[models]]
+key = "minimax-h3-text-encoder"
+repository = "MiniMaxAI/MiniMax-H3"
+revision = "939557dc319dd91227e30195a763f272ba7f8765"
+license = "MiniMax H3 Community License Agreement"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["MINIMAX_H3_SNAPSHOT"]
+download_files = [
+  "text_encoder/config.json",
+  "text_encoder/model.safetensors.index.json",
+  "text_encoder/model-00001-of-00014.safetensors",
+  "text_encoder/model-00002-of-00014.safetensors",
+  "text_encoder/model-00003-of-00014.safetensors",
+  "text_encoder/model-00004-of-00014.safetensors",
+  "text_encoder/model-00005-of-00014.safetensors",
+  "text_encoder/model-00006-of-00014.safetensors",
+  "text_encoder/model-00007-of-00014.safetensors",
+  "text_encoder/model-00008-of-00014.safetensors",
+  "text_encoder/model-00009-of-00014.safetensors",
+  "text_encoder/model-00010-of-00014.safetensors",
+  "text_encoder/model-00011-of-00014.safetensors",
+  "text_encoder/model-00012-of-00014.safetensors",
+]
+expected_files = [
+  "text_encoder/config.json",
+  "text_encoder/model-00001-of-00014.safetensors",
+  "text_encoder/model-00012-of-00014.safetensors",
+]
+
+# ── MiniMax-H3 DiT component (sc-19558) ──────────────────────────────────────────────────────────
+#
+# THE GAP THIS CLOSES. Two `#[ignore]`d candle gates read HEADERS ONLY and were nevertheless
+# unreachable in CI, because the component whose headers they read was in no row:
+# `declared_dit_tensor_names_match_the_published_checkpoint` and
+# `the_adaln_projections_are_the_documented_twenty_six_gigabytes` need `transformer/`. They were
+# recorded as "hand-driven on a box that already holds the full snapshot", which describes an
+# operator habit rather than a lane — and an operator habit is not coverage.
+#
+# WHY A SEPARATE KEY AND NOT A WIDER `minimax-h3`. `download_files` is per ROW, so widening the
+# shared row would put 132.6 GB on every box that fetches ANY H3 slice, including the macOS lane
+# whose selections read none of it. Keying per component is the `minimax-h3-mlx-*` shape already in
+# this file: one `ensure_model_snapshot.py --model <key>` per component a lane actually reads, into
+# the SAME snapshot directory, so a lane pays for what it selects and nothing more.
+#
+# ⚠️ MARGINAL COST ON THE BOX THAT RUNS THIS IS NOT 132.6 GB. `ensure_model_snapshot.py` is
+# incremental — it fetches what is missing and verifies the rest — and sc-18677 provisioned the FULL
+# upstream snapshot on the Windows CUDA box at
+# `E:\huggingface\hub\models--MiniMaxAI--MiniMax-H3\snapshots\939557dc…`. On a box that already has
+# the bytes this key VERIFIES rather than downloads. On a fresh box it does cost the full component,
+# which is the honest price of a gate that reads that component's headers.
+#
+# `expected_files` lists `config.json` + the safetensors index per component and nothing else, for
+# the reason the tier block below spells out: `verify_model_snapshot.py` parses any `*.index.json` in
+# `expected_files` and checks every shard the `weight_map` names, so the index covers a re-shard that
+# a hand-maintained list of fourteen shard names would silently stop covering.
+
+[[models]]
+key = "minimax-h3-dit"
+repository = "MiniMaxAI/MiniMax-H3"
+revision = "939557dc319dd91227e30195a763f272ba7f8765"
+license = "MiniMax H3 Community License Agreement"
+size_class = "very-large"
+profiles = ["media-cuda"]
+environment = ["MINIMAX_H3_SNAPSHOT"]
+# BOTH partitions, 66.281 GB each measured by `os.stat` over the pinned snapshot with symlinks
+# dereferenced. `transformer_ref/` is included because `declared_dit_tensor_names_match_the_published_checkpoint`
+# reads the declared name set against the published one and the two partitions are structurally
+# identical — a gate that only ever saw `transformer/` could not catch a divergence in the other.
+download_files = [
+  "transformer/*",
+  "transformer_ref/*",
+]
+expected_files = [
+  "transformer/config.json",
+  "transformer/diffusion_pytorch_model.safetensors.index.json",
+  "transformer_ref/config.json",
+  "transformer_ref/diffusion_pytorch_model.safetensors.index.json",
+]
+
+# ── MiniMax-H3 DiT tiers (sc-17150) ─────────────────────────────────────────────────────────────
+# `SceneWorks/minimax-h3-mlx` hosts ONLY the tiered DiT. The text encoder, both VAEs and the
+# tokenizer are dense in every tier and shared as a co-requisite, sourced from upstream
+# `MiniMaxAI/MiniMax-H3` (activity 18712 on sc-17150 — 0 GB rehosted, provenance stays
+# hash-verifiable). So a tier here is two components, `transformer/` and `transformer_ref/`, and
+# nothing else; do not add TE/VAE rows expecting them in this repository.
+#
+# Keyed **per tier**, the `flux2-dev-mlx-*` shape (sc-18213): the three tiers together are 240.7 GB
+# and each is provisioned independently, so one key whose `expected_files` demanded every sibling
+# would put 240.7 GB on disk before any single tier could be verified.
+#
+# Each tier lists only `config.json` + the safetensors index per component — FOUR entries covering
+# 32 files. `verify_model_snapshot.py` parses any `*.index.json` in `expected_files` and checks every
+# shard its `weight_map` references, resolved against the index's own directory. `convert.rs` writes
+# that index per tier for exactly this reason; without it a tier would need fourteen hand-maintained
+# shard names per component and would silently stop covering a re-shard.
+
+[[models]]
+key = "minimax-h3-mlx-bf16"
+repository = "SceneWorks/minimax-h3-mlx"
+revision = "137ce668c55a20bc0935fd1cf2a3de8448abb7f4"
+license = "MiniMax H3 Community License Agreement"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["MINIMAX_H3_DIT"]
+# sc-18932 wired the UPSTREAM components (`minimax-h3` above) into `mlx-minimax-h3` /
+# `candle-minimax-h3`, so "no MiniMax-H3 lane exists" is no longer the reason and this text was
+# rewritten rather than left to rot. What is still true is narrower and specific to the TIERS: the
+# only consumer of `MINIMAX_H3_DIT` is sc-17150's per-tier render harness `tests/quant_tiers_real.rs`,
+# each render is hours of Metal (activity 19108: 147.87 s/step at the shipped default canvas) and the
+# three tiers are 240.7 GB on disk, so it is dispatched by hand. Wiring it is sc-17153's fit-gate work.
+unwired_reason = "sc-17150's per-tier render harness tests/quant_tiers_real.rs is the only consumer and is dispatched by hand — hours of Metal per tier against a 240.7 GB three-tier fetch; wiring a lane is sc-17153's fit-gate work (the upstream components ARE wired, see the minimax-h3 row)"
+download_files = ["bf16/*"]
+expected_files = [
+  "bf16/transformer/config.json",
+  "bf16/transformer/diffusion_pytorch_model.safetensors.index.json",
+  "bf16/transformer_ref/config.json",
+  "bf16/transformer_ref/diffusion_pytorch_model.safetensors.index.json",
+]
+
+[[models]]
+key = "minimax-h3-mlx-q8"
+repository = "SceneWorks/minimax-h3-mlx"
+revision = "137ce668c55a20bc0935fd1cf2a3de8448abb7f4"
+license = "MiniMax H3 Community License Agreement"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["MINIMAX_H3_DIT"]
+unwired_reason = "MINIMAX_H3_DIT has one hand-dispatched consumer, sc-17150 tests/quant_tiers_real.rs — see minimax-h3-mlx-bf16"
+download_files = ["q8/*"]
+expected_files = [
+  "q8/transformer/config.json",
+  "q8/transformer/diffusion_pytorch_model.safetensors.index.json",
+  "q8/transformer_ref/config.json",
+  "q8/transformer_ref/diffusion_pytorch_model.safetensors.index.json",
+]
+
+[[models]]
+key = "minimax-h3-mlx-q4"
+repository = "SceneWorks/minimax-h3-mlx"
+revision = "137ce668c55a20bc0935fd1cf2a3de8448abb7f4"
+license = "MiniMax H3 Community License Agreement"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["MINIMAX_H3_DIT"]
+unwired_reason = "MINIMAX_H3_DIT has one hand-dispatched consumer, sc-17150 tests/quant_tiers_real.rs — see minimax-h3-mlx-bf16"
+download_files = ["q4/*"]
+expected_files = [
+  "q4/transformer/config.json",
+  "q4/transformer/diffusion_pytorch_model.safetensors.index.json",
+  "q4/transformer_ref/config.json",
+  "q4/transformer_ref/diffusion_pytorch_model.safetensors.index.json",
 ]

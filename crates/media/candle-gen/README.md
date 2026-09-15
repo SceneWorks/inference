@@ -596,7 +596,7 @@ Krea suite needs `KREA_TURBO_BF16_DIR` + `KREA_TURBO_Q4_DIR`:
 CUDA_VISIBLE_DEVICES=0 CUDA_COMPUTE_CAP=120 \
 KREA_TURBO_BF16_DIR=…/krea-2-turbo-mlx/snapshots/<rev>/bf16 \
 KREA_TURBO_Q4_DIR=…/krea-2-turbo-mlx/snapshots/<rev>/q4 \
-  cargo test -p candle-gen-krea --release --features cuda --test nvfp4_krea_dit_gpu -- --ignored --nocapture
+  cargo test -p candle-gen-krea --release --features cuda --test integration nvfp4_krea_dit_gpu:: -- --ignored --nocapture
 ```
 
 **Budget ~10 minutes per NVFP4 trunk build**: `Nvfp4Tensor::pack` runs single-threaded on the CPU, and
@@ -634,9 +634,31 @@ workspace `[patch]`. nvcc accumulates `-gencode` flags, so `libmoe.a` becomes a 
 Hopper → Blackwell and JITs forward to newer archs. Keep `CUDA_COMPUTE_CAP=80` in the recipes (it
 seeds the sm_80 baseline for both paths). Verified on RTX PRO 6000 (sm_120): `cuobjdump --list-elf`
 shows sm_80/sm_90/sm_120 cubin per kernel, and `candle-gen`'s `cuda_quant_smoke` test has the Q4/Q8
-`QMatMul` matching the CPU reference (cos ≈ 1.0, vs cos ≈ 0 / all-zeros before). That smoke runs in
-the CUDA gate so the regression can't return silently. **Re-vendor on every candle pin bump** — see
-`vendor/candle-kernels/VENDORED.md`.
+`QMatMul` matching the CPU reference (vs all-zeros before). **Re-vendor on every candle pin bump** —
+see `vendor/candle-kernels/VENDORED.md`.
+
+Two corrections from sc-19545, both of which had made this paragraph read stronger than it was:
+
+* **That smoke does not "run in the CUDA gate", and never has.** It runs in
+  `scripts/check-cuda.ps1`, a LOCAL, manual script that no workflow invokes (`grep -rn check-cuda
+  .github/` is empty). The only automated CUDA lane compiles with `--no-run` and discards the
+  binary, and the lane that would execute it (`windows-cuda`) is `workflow_dispatch`-only and was
+  skipped in all 25 most recent ci.yml runs. **The canary against a silent-zeros regression has
+  never been fired by CI.** Wiring it into an executing lane was scoped out of sc-19545 and remains
+  open — until then, running `check-cuda.ps1` by hand is the only thing that exercises it.
+* **Cosine was the wrong comparison.** cos ≈ 1.0 is not evidence of correctness: cosine is
+  scale-invariant, so a kernel returning `2 × reference`, or the right values under a wrong dequant
+  scale, scores 1.0. The test now asserts on relative max-abs-diff plus an explicit all-zeros check
+  and prints cosine only as a diagnostic. (Cosine did catch *exact* zeros, so sc-7544 itself would
+  have tripped it; the neighbouring scale-error class would not have.)
+
+The invariant is **not** that `CUDA_COMPUTE_CAP` matches the GPU — it deliberately does not, and
+"correcting" 80 to the runner's 120 deletes the ladder's bottom rung, breaking quantized models on
+every pre-Blackwell GPU and lifting the dense PTX floor to `compute_120`. What must hold is that the
+runner's arch is served by *some* rung. Note that **datacenter Blackwell sm_100 (B100/B200) is not
+covered** on the quant path — major 10 is served by neither the sm_9x/sm_12x cubins nor the
+`compute_120` PTX floor. `build.rs` says this is deliberate; it is recorded here because such a card
+joining the pool would render black rather than fail. None of this is enforced by any check.
 
 ### Build
 

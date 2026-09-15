@@ -98,9 +98,9 @@ fn resolve_split_files(source: &WeightsSource) -> Result<PathBuf> {
 /// `split_files/`); this seam reports the real bytes. Shared by anima base/aesthetic/turbo (they differ
 /// only in the DiT filename inside `diffusion_models/`).
 ///
-/// PRE-WIRING: this split is computed correctly, but anima is NOT yet in the worker's
-/// `SEQUENTIAL_CAPABLE_ENGINES` allowlist, so the fit-gate does not consume it until anima is added
-/// there in the fan-out (sc-10840). Until then it is inert (the worker uses its whole-model total).
+/// WIRED (sc-10840): all three anima variants set `supports_sequential_offload: true` in their
+/// descriptor capabilities, and the worker's fit-gate keys on that capability bit (there is no
+/// allowlist) and consumes this split generically through the registered footprint seam.
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
@@ -173,6 +173,25 @@ pub fn load_heavy_phase(
     source: &WeightsSource,
     variant: Variant,
 ) -> Result<(CosmosDiT, AnimaTextConditioner, QwenVae)> {
+    load_heavy_phase_with_stream(source, variant, false)
+}
+
+/// [`load_heavy_phase`] in the component form this request selected (SC-15524).
+///
+/// `streamable` arms ladder rung 4 by recording the exact variant checkpoint the 28 DiT blocks can be
+/// re-read from (`crate::block_stream`). It changes nothing about WHICH weights are loaded or how
+/// they are built — the resident stack is constructed identically either way — only whether a request
+/// may later rebuild blocks per window instead of reading the resident ones. That is safe because
+/// `Array::load_safetensors` is lazy per tensor: an unused resident block costs handles, not bytes.
+///
+/// The recorded source is the resolved `diffusion_models/anima-{variant}-v1.0.safetensors`, never the
+/// caller's raw `spec.weights` — which may be the `split_files/` root, or a `File` pointing at a
+/// DIFFERENT variant's checkpoint used only to locate that root.
+pub fn load_heavy_phase_with_stream(
+    source: &WeightsSource,
+    variant: Variant,
+    streamable: bool,
+) -> Result<(CosmosDiT, AnimaTextConditioner, QwenVae)> {
     let root = resolve_split_files(source)?;
     let dit_path = root.join("diffusion_models").join(variant.dit_filename());
     if !dit_path.is_file() {
@@ -187,6 +206,11 @@ pub fn load_heavy_phase(
     let dit_weights = Weights::from_file(&dit_path)?;
     let prefix = detect_dit_prefix(&dit_weights)?;
     let dit = CosmosDiT::from_weights(&dit_weights, &prefix, DitConfig::anima())?;
+    let dit = if streamable {
+        dit.with_block_stream(WeightsSource::File(dit_path), &prefix)
+    } else {
+        dit
+    };
     let conditioner = AnimaTextConditioner::from_weights(
         &dit_weights,
         &format!("{prefix}.llm_adapter"),

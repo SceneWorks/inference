@@ -12,7 +12,7 @@
 //!
 //! `#[ignore]`d — needs the real Boogu Base snapshot (`mllm/ transformer/ vae/`), env `BOOGU_BASE_DIR`:
 //!   BOOGU_BASE_DIR=/path/to/boogu_base \
-//!     cargo test -p mlx-gen-boogu --release --test unified_sampler_smoke -- --ignored --nocapture
+//!     cargo test -p mlx-gen-boogu --release --test integration unified_sampler_smoke:: -- --ignored --nocapture
 
 use std::path::{Path, PathBuf};
 

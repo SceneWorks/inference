@@ -5,7 +5,7 @@
 //! triple-CFG `sample()` denoise — all f32. Tolerances reflect the cross-backend f32 matmul floor.
 //! CPU, no cuda/weights.
 
-mod common;
+use crate::common;
 
 use common::{errors, flat_f32, Golden};
 

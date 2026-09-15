@@ -23,10 +23,11 @@
 //! would be a **silent** skip if a future tier ever packed the tower. [`linear_guard_dense`] exposes
 //! the same guard for other dense consumers and its focused tests.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use candle_gen::candle_core::safetensors::MmapedSafetensors;
-use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
+use candle_gen::candle_core::{DType, Device, Result, Tensor, Var, D};
 use candle_gen::candle_nn::{Embedding, Linear};
 use candle_gen::quant::PackedConfig;
 
@@ -37,12 +38,19 @@ use crate::quant::{QEmbedding, QLinear};
 /// so [`linear_detect`] / [`embedding_detect`] can build the quantized modules at the tier's group
 /// size straight from the packed parts.
 pub struct Weights {
-    st: MmapedSafetensors,
+    storage: WeightStorage,
     device: Device,
     dtype: DType,
     /// The component's `quantization` manifest, `Some` for a packed q4 tier (carries the group size
     /// the shapes can't disambiguate), `None` for a dense bf16 tier.
     packed: Option<PackedConfig>,
+}
+
+enum WeightStorage {
+    Mmap(MmapedSafetensors),
+    /// Training-only live tensors. Each value is the tensor handle owned by the corresponding
+    /// returned [`Var`], so rebuilding a model from this map preserves the backward edge.
+    Owned(HashMap<String, Tensor>),
 }
 
 impl Weights {
@@ -54,31 +62,96 @@ impl Weights {
         // SAFETY: read-only mmap of weight files; the standard candle loading path.
         let st = unsafe { MmapedSafetensors::multi(&files)? };
         Ok(Self {
-            st,
+            storage: WeightStorage::Mmap(st),
             device: device.clone(),
             dtype,
             packed: read_packed_config(dir)?,
         })
     }
 
+    /// Mmap one explicitly selected safetensors file. Its sibling `config.json`, when present,
+    /// carries the same packed-triple metadata as a component directory.
+    pub fn from_file(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
+        // SAFETY: read-only mmap of the caller-validated weight file.
+        let st = unsafe { MmapedSafetensors::multi(&[path.to_path_buf()])? };
+        Ok(Self {
+            storage: WeightStorage::Mmap(st),
+            device: device.clone(),
+            dtype,
+            packed: read_packed_config(path.parent().unwrap_or_else(|| Path::new(".")))?,
+        })
+    }
+
+    /// Load every dense tensor into an owned live [`Var`] at `dtype`. This is intentionally distinct
+    /// from inference's mmap constructor: a full-base trainer needs the model's tensor handles to
+    /// remain connected to mutable optimizer state and must later save the complete original key set.
+    pub fn from_trainable_dir(
+        dir: &Path,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<(Self, Vec<(String, Var)>)> {
+        if read_packed_config(dir)?.is_some() {
+            candle_gen::candle_core::bail!(
+                "boogu: trainable weights require a dense component, got packed {}",
+                dir.display()
+            );
+        }
+        let files = candle_gen::sorted_safetensors(dir, "boogu")
+            .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?;
+        let mut tensors = HashMap::new();
+        for file in files {
+            for (name, tensor) in candle_gen::candle_core::safetensors::load(file, device)? {
+                if tensors
+                    .insert(name.clone(), tensor.to_dtype(dtype)?)
+                    .is_some()
+                {
+                    candle_gen::candle_core::bail!(
+                        "boogu: duplicate trainable tensor `{name}` across {}",
+                        dir.display()
+                    );
+                }
+            }
+        }
+        let mut named = Vec::with_capacity(tensors.len());
+        let mut live = HashMap::with_capacity(tensors.len());
+        for (name, tensor) in tensors {
+            let var = Var::from_tensor(&tensor)?;
+            live.insert(name.clone(), var.as_tensor().clone());
+            named.push((name, var));
+        }
+        named.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok((
+            Self {
+                storage: WeightStorage::Owned(live),
+                device: device.clone(),
+                dtype,
+                packed: None,
+            },
+            named,
+        ))
+    }
+
     /// Load `name` at the component dtype.
     pub fn get(&self, name: &str) -> Result<Tensor> {
-        self.st.load(name, &self.device)?.to_dtype(self.dtype)
+        self.load_native(name)?.to_dtype(self.dtype)
     }
 
     /// Load `name` at its **native** stored dtype (no cast) on the component device — used for the
     /// packed triple's u32 codes (a cast would reinterpret the bit-packed nibbles).
     pub fn get_native(&self, name: &str) -> Result<Tensor> {
-        self.st.load(name, &self.device)
+        self.load_native(name)
     }
 
     /// Load `name` forcing f32 (norm weights and other precision-sensitive scalars).
     pub fn get_f32(&self, name: &str) -> Result<Tensor> {
-        self.st.load(name, &self.device)?.to_dtype(DType::F32)
+        self.load_native(name)?.to_dtype(DType::F32)
     }
 
     pub fn contains(&self, name: &str) -> bool {
-        self.st.get(name).is_ok()
+        match &self.storage {
+            WeightStorage::Mmap(st) => st.get(name).is_ok(),
+            WeightStorage::Owned(tensors) => tensors.contains_key(name),
+        }
     }
 
     pub fn device(&self) -> &Device {
@@ -92,6 +165,15 @@ impl Weights {
     /// The MLX `quantization` block when this component is a packed q4 tier, else `None`.
     pub fn packed(&self) -> Option<PackedConfig> {
         self.packed
+    }
+
+    fn load_native(&self, name: &str) -> Result<Tensor> {
+        match &self.storage {
+            WeightStorage::Mmap(st) => st.load(name, &self.device),
+            WeightStorage::Owned(tensors) => tensors.get(name).cloned().ok_or_else(|| {
+                candle_gen::candle_core::Error::Msg(format!("missing tensor `{name}`"))
+            }),
+        }
     }
 }
 
@@ -281,6 +363,90 @@ mod tests {
         std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
     }
 
+    #[test]
+    fn mmap_and_owned_dense_backings_preserve_values_and_live_vars() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        let original = Tensor::from_vec(vec![1.0f32, -2.0, 3.0, 4.0], (2, 2), &Device::Cpu)?;
+        safetensors::save(
+            &HashMap::from([("layer.weight".to_string(), original.clone())]),
+            dir.join("model.safetensors"),
+        )?;
+
+        let mmap = Weights::from_dir(dir, &Device::Cpu, DType::F32)?;
+        assert_eq!(
+            mmap.get("layer.weight")?.to_vec2::<f32>()?,
+            original.to_vec2::<f32>()?
+        );
+
+        let (owned, named) = Weights::from_trainable_dir(dir, &Device::Cpu, DType::F32)?;
+        assert_eq!(
+            named
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["layer.weight"]
+        );
+        let loss = owned.get("layer.weight")?.sqr()?.mean_all()?;
+        let grads = loss.backward()?;
+        assert!(grads.get(named[0].1.as_tensor()).is_some());
+        named[0]
+            .1
+            .set(&Tensor::zeros((2, 2), DType::F32, &Device::Cpu)?)?;
+        assert_eq!(
+            owned.get("layer.weight")?.to_vec2::<f32>()?,
+            vec![vec![0.0; 2]; 2]
+        );
+        assert!(owned.get("missing.weight").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn owned_dense_round_trip_keeps_every_name_shape_and_dtype() -> Result<()> {
+        let source = tempfile::tempdir().unwrap();
+        let map = HashMap::from([
+            (
+                "early.weight".to_string(),
+                Tensor::ones((2, 3), DType::F32, &Device::Cpu)?,
+            ),
+            (
+                "late.bias".to_string(),
+                Tensor::zeros(5, DType::F32, &Device::Cpu)?,
+            ),
+        ]);
+        safetensors::save(&map, source.path().join("model.safetensors"))?;
+        let (_owned, named) = Weights::from_trainable_dir(source.path(), &Device::Cpu, DType::F32)?;
+        let saved = tempfile::tempdir().unwrap();
+        let complete = named
+            .iter()
+            .map(|(name, var)| (name.clone(), var.as_tensor().clone()))
+            .collect::<HashMap<_, _>>();
+        safetensors::save(&complete, saved.path().join("model.safetensors"))?;
+        let reloaded = safetensors::load(saved.path().join("model.safetensors"), &Device::Cpu)?;
+        assert_eq!(reloaded.len(), named.len());
+        for (name, var) in named {
+            let tensor = reloaded.get(&name).expect("original owned key survived");
+            assert_eq!(tensor.dims(), var.dims());
+            assert_eq!(tensor.dtype(), DType::F32);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn owned_dense_rejects_duplicate_names_across_shards() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let tensor = Tensor::ones(1, DType::F32, &Device::Cpu)?;
+        let map = HashMap::from([("duplicate".to_string(), tensor)]);
+        safetensors::save(&map, temp.path().join("model-00001.safetensors"))?;
+        safetensors::save(&map, temp.path().join("model-00002.safetensors"))?;
+        let error = Weights::from_trainable_dir(temp.path(), &Device::Cpu, DType::F32)
+            .err()
+            .expect("duplicate trainable keys must fail closed")
+            .to_string();
+        assert!(error.contains("duplicate trainable tensor"), "{error}");
+        Ok(())
+    }
+
     /// **Packed-detect fires on the boogu key layout, incl. the `attn.to_out.0` nesting (sc-9410).**
     /// A packed q4 component (with the `quantization` block) whose `attn.to_out.0` is a group-32 packed
     /// triple must `linear_detect` to a `Packed` projection — the `.scales`/`.biases` siblings surviving
@@ -300,7 +466,8 @@ mod tests {
         map.insert("attn.to_out.0.biases".into(), b);
         map.insert("attn.to_q.weight".into(), dense_w.clone());
 
-        let dir = std::env::temp_dir().join(format!("sc9410_detect_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         write_component(&dir, map, true);
         let w = Weights::from_dir(&dir, &dev, DType::F32)?;
         assert_eq!(w.packed().map(|c| c.group_size), Some(G as i32));
@@ -327,7 +494,28 @@ mod tests {
         let cos = dot / (na.sqrt() * nb.sqrt() + 1e-12);
         assert!(cos > 0.99999, "group-32 packed vs grid cosine {cos:.6}");
 
-        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_q4_component_infers_a_q8_projection_from_its_shapes() -> Result<()> {
+        let dev = Device::Cpu;
+        let dense = Tensor::randn(0f32, 1f32, (64usize, 128usize), &dev)?;
+        let (wq, scales, biases) = candle_gen::quant::pack_mlx_affine(&dense, 8, G)?;
+        let mut map = HashMap::new();
+        map.insert("layers.0.q_proj.weight".into(), wq);
+        map.insert("layers.0.q_proj.scales".into(), scales);
+        map.insert("layers.0.q_proj.biases".into(), biases);
+
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
+        // The component marker remains q4 even though this floor-target projection is q8.
+        write_component(&dir, map, true);
+        let weights = Weights::from_dir(&dir, &dev, DType::F32)?;
+        assert_eq!(weights.packed().map(|cfg| cfg.bits), Some(4));
+        let mut projection = linear_detect(&weights, "layers.0.q_proj", false)?;
+        projection.quantize_dequant_onto(candle_gen::gen_core::Quant::Q8, &dev)?;
+
         Ok(())
     }
 
@@ -354,7 +542,8 @@ mod tests {
             Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?,
         );
 
-        let dir = std::env::temp_dir().join(format!("sc9410_guard_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         write_component(&dir, map, true); // packed component config (quantization block present)
         let w = Weights::from_dir(&dir, &dev, DType::F32)?;
         assert!(w.packed().is_some(), "packed component config");
@@ -371,7 +560,6 @@ mod tests {
             "a dense vision weight (no `.scales`) still loads"
         );
 
-        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 
@@ -388,7 +576,8 @@ mod tests {
             "attn.to_q.weight".into(),
             Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?,
         );
-        let dir = std::env::temp_dir().join(format!("sc9410_dense_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         write_component(&dir, map, false);
 
         let w = Weights::from_dir(&dir, &dev, DType::F32)?;
@@ -396,7 +585,6 @@ mod tests {
         let lin = linear_detect(&w, "attn.to_q", false)?;
         assert!(!lin.is_packed(), "dense tier ⇒ dense projection");
 
-        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 
@@ -406,8 +594,8 @@ mod tests {
     /// errors loudly naming the file instead of silently swallowing to the dense path.
     #[test]
     fn read_packed_config_absent_vs_corrupt() {
-        let dir = std::env::temp_dir().join(format!("sc9426_boogu_cfg_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
 
         // A `quantization` block → packed tier.
         let packed = dir.join("packed");
@@ -450,8 +638,6 @@ mod tests {
             format!("{err}").contains("config.json"),
             "the error should name the offending file, got: {err}"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The packed-detecting **embedding** loader fires on a group-32 packed `embed_tokens` triple and
@@ -467,7 +653,8 @@ mod tests {
         map.insert("embed_tokens.weight".into(), wq);
         map.insert("embed_tokens.scales".into(), s);
         map.insert("embed_tokens.biases".into(), b);
-        let dir = std::env::temp_dir().join(format!("sc9410_emb_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         write_component(&dir, map, true);
 
         let w = Weights::from_dir(&dir, &dev, DType::F32)?;
@@ -487,7 +674,6 @@ mod tests {
             "group-32 packed embedding deviates from the grid"
         );
 
-        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 
@@ -506,7 +692,8 @@ mod tests {
         map.insert("embed_tokens.weight".into(), wq);
         map.insert("embed_tokens.scales".into(), s);
         map.insert("embed_tokens.biases".into(), b);
-        let dir = std::env::temp_dir().join(format!("sc12828_emb_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         write_component(&dir, map, true);
 
         // bf16 store — the sc-12828 regime (the projections would ride bf16; the packed embed must not).
@@ -530,7 +717,6 @@ mod tests {
             "f32-dequant packed embed deviates from the grid"
         );
 
-        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 }

@@ -10,10 +10,24 @@ import json
 import os
 import platform
 import struct
-import subprocess
 import sys
 from pathlib import Path
 from unittest import mock
+
+try:
+    from sa3_reference import (
+        portable_values as _portable_values,
+        sha256_file,
+        tensor_records,
+        validate_upstream_checkout,
+    )
+except ModuleNotFoundError:
+    from .sa3_reference import (
+        portable_values as _portable_values,
+        sha256_file,
+        tensor_records,
+        validate_upstream_checkout,
+    )
 
 
 UPSTREAM_COMMIT = "124e8a799f57a1f665495ecb72e547d0a62867f1"
@@ -42,18 +56,11 @@ EXPECTED_ARTIFACT_SHA256 = "ab537ae1803d0b74834e5c32c3a3c677e16bd0d41156116971ae
 EXPECTED_ARTIFACT_BYTES = 2_035_792
 EXPECTED_OUTPUTS_SHA256 = "7a1a3eaf67506d8c6e0a62d9004b2886826d97e10adf1e7b617670e17615d965"
 EXPECTED_OUTPUTS_BYTES = 22_365_984
+ROOT = Path(__file__).resolve().parents[2]
 
 
 class InvalidReference(RuntimeError):
     pass
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def require_revision(path: Path, revision: str, label: str) -> None:
@@ -80,35 +87,17 @@ def require_snapshot_files(
 
 
 def validate_upstream(path: Path) -> None:
-    revision = subprocess.run(
-        ["git", "-C", str(path), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    ).stdout.strip()
-    if revision != UPSTREAM_COMMIT:
-        raise InvalidReference(f"upstream revision mismatch: {revision}")
-    status = subprocess.run(
-        ["git", "-C", str(path), "status", "--porcelain=v1"],
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    ).stdout.strip()
-    if status:
-        raise InvalidReference(f"upstream checkout is not clean: {status}")
+    validate_upstream_checkout(
+        path,
+        UPSTREAM_COMMIT,
+        error_type=InvalidReference,
+        allow_venv=False,
+        include_ignored=False,
+    )
 
 
 def portable_values(torch, shape, stream: int):
-    count = 1
-    for dim in shape:
-        count *= dim
-    index = torch.arange(count, dtype=torch.int64)
-    bits = (index * 1_664_525 + (SEED + stream) * 1_013_904_223) & 0xFFFF_FFFF
-    return (bits.to(torch.float64) / 2_147_483_648.0 - 1.0).to(
-        torch.float32
-    ).reshape(shape)
+    return _portable_values(torch, tuple(shape), stream, seed=SEED)
 
 
 def chunk_starts(total: int) -> list[int]:
@@ -206,24 +195,6 @@ def spectral_boundaries(torch, value, starts: list[int]) -> list[dict]:
                 ),
             }
         )
-    return records
-
-
-def tensor_records(torch, tensors: dict) -> dict:
-    from safetensors.torch import save
-
-    records = {}
-    for name, value in tensors.items():
-        value = value.detach().cpu().contiguous()
-        payload_bytes = value.numel() * value.element_size()
-        serialized = save({"x": value})
-        records[name] = {
-            "dtype": str(value.dtype).removeprefix("torch."),
-            "shape": list(value.shape),
-            "sha256": hashlib.sha256(
-                serialized[-payload_bytes:] if payload_bytes else b""
-            ).hexdigest(),
-        }
     return records
 
 
@@ -499,7 +470,7 @@ def parse_args():
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("docs/migration/sa3-chunked-reference"),
+        default=ROOT / "docs/migration/sa3-chunked-reference",
     )
     args = parser.parse_args()
     if not args.verify and not all((args.upstream, args.same_s, args.same_l)):

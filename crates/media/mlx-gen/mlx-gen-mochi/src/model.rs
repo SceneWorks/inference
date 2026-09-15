@@ -56,6 +56,9 @@ const DEFAULT_FPS: u32 = 30;
 /// Stable identity + advertised capabilities for Mochi 1 (text-to-video, true CFG, no audio).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::MOCHI_VIDEO_LATENT_SPACE),
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "mochi",
@@ -68,13 +71,9 @@ pub fn descriptor() -> ModelDescriptor {
             supports_true_cfg: true,
             // Text-to-video only in the base preview (I2V = sc-11998, a follow-on).
             conditioning: Vec::new(),
-            supports_lora: false,
-            supports_lokr: false,
             // A single fixed flow-match Euler integrator; a selectable sampler/scheduler axis is not
             // wired for Mochi, so advertising one would be a false capability.
             samplers: Vec::new(),
-            schedulers: Vec::new(),
-            supported_guidance_methods: Vec::new(),
             // Width/height must be divisible by SIZE_MULTIPLE (VAE 8× spatial × DiT patch 2). 480p target = 848×480.
             min_size: 16,
             max_size: 1280,
@@ -83,20 +82,7 @@ pub fn descriptor() -> ModelDescriptor {
             // Quant tiers are pre-quantized per-tier checkpoints (epic 1788 / A6 sc-11990), selected by
             // pointing `WeightsSource` at the tier dir — NOT on-the-fly requant. So no on-the-fly levels.
             supported_quants: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            ..Default::default()
         },
     }
 }
@@ -430,14 +416,13 @@ mod tests {
         // `spec.quantize` only *asserts* the tier's level; a dir with no `split_model.json` quant
         // manifest is dense, so asking for Q4 there is a hard error (never a silent bf16 run / an
         // on-the-fly requant — that is not the Mochi tier mechanism).
-        let dir = std::env::temp_dir().join(format!("mochi_load_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let spec = LoadSpec::new(WeightsSource::Dir(dir.clone())).with_quant(mlx_gen::Quant::Q4);
         assert!(
             load(&spec).is_err(),
             "Q4 against a dense (manifest-less) dir must error"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

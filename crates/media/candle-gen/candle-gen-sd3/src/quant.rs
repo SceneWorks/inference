@@ -339,10 +339,13 @@ mod tests {
     /// A VarBuilder over an in-memory packed safetensors map, exercising the real `contains_tensor` /
     /// `get_unchecked_dtype` detect path (not a hand-built enum). No external temp-file crate — writes
     /// to the system temp dir under a per-process unique name (the Lens-quant test pattern).
-    fn vb_from_map(tag: &str, map: HashMap<String, Tensor>) -> VarBuilder<'static> {
-        let tmp = std::env::temp_dir().join(format!(
-            "sc9414_{tag}_{}_{}.safetensors",
-            std::process::id(),
+    fn vb_from_map(
+        tmp: &tempfile::TempDir,
+        tag: &str,
+        map: HashMap<String, Tensor>,
+    ) -> VarBuilder<'static> {
+        let tmp = tmp.path().join(format!(
+            "sc9414_{tag}_{}.safetensors",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -378,6 +381,7 @@ mod tests {
     /// from the exact affine grid the packed parts represent.
     #[test]
     fn packed_detect_fires_on_sd3_layout_and_leaves_dense_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (64usize, 128usize); // in_dim = 2 groups of 64
         let (wq, scales, biases, grid) = q4_packed(out_dim, in_dim);
@@ -393,7 +397,7 @@ mod tests {
             "attn.to_q.bias".into(),
             Tensor::randn(0f32, 1f32, (out_dim,), &dev).unwrap(),
         );
-        let vb = vb_from_map("detect", map);
+        let vb = vb_from_map(&tmp, "detect", map);
         let attn = vb.pp("attn");
 
         // `to_out.0` — packed-detected through the remapped base (never `.pp("0")` past the sibling).
@@ -432,9 +436,11 @@ mod tests {
     /// and [`QLinear::quantize_dequant_onto`], the CPU-stage fold).
     #[test]
     fn quantize_is_noop_on_packed() {
+        let tmp = tempfile::tempdir().unwrap();
         let (out_dim, in_dim) = (64usize, 128usize);
         let (wq, scales, biases, _grid) = q4_packed(out_dim, in_dim);
         let vb = vb_from_map(
+            &tmp,
             "noop",
             packed_map("context_embedder", &wq, &scales, &biases, None),
         );
@@ -462,11 +468,13 @@ mod tests {
     /// affine grid the parts represent. Absent `.scales` it is a plain dense read.
     #[test]
     fn linear_detect_dense_dequantizes_packed_to_dense() {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (48usize, 64usize); // 1 group of 64
         let (wq, scales, biases, grid) = q4_packed(out_dim, in_dim);
         let bias = Tensor::randn(0f32, 1f32, (out_dim,), &dev).unwrap();
         let vb = vb_from_map(
+            &tmp,
             "adaln",
             packed_map("norm1.linear", &wq, &scales, &biases, Some(&bias)),
         );
@@ -497,7 +505,7 @@ mod tests {
             "d.bias".into(),
             Tensor::randn(0f32, 1f32, (out_dim,), &dev).unwrap(),
         );
-        let vb2 = vb_from_map("adaln_dense", map);
+        let vb2 = vb_from_map(&tmp, "adaln_dense", map);
         let lin2 = linear_detect_dense(in_dim, out_dim, &vb2, "d", true).unwrap();
         assert_eq!(lin2.weight().dims(), &[out_dim, in_dim]);
     }

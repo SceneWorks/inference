@@ -3,12 +3,12 @@
 //! `#[ignore]`d — needs the real SDXL snapshot, the LCM-LoRA (for the stacking gate), and the goldens
 //! from `tools/dump_sdxl_lokr_golden.py` (a synthesized LoKr merged with the validated LyCORIS
 //! formula — `reconstruct_lokr_delta`, proven vs the real fork in sc-2602/sc-2528).
-//! Run: cargo test -p mlx-gen-sdxl --release --test lokr_real_weights -- --ignored --nocapture
+//! Run: cargo test -p mlx-gen-sdxl --release --test integration lokr_real_weights:: -- --ignored --nocapture
 //!
 //! Gates: merge count (16 synthesized modules); render parity vs the reference (cross-build floor);
 //! scale-0 bit-exact no-op; **stacks with LoRA** (LCM-LoRA 515 + LoKr 16 = 531, render parity).
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 

@@ -9,7 +9,7 @@
 //!   SAM3_WEIGHTS=<facebook/sam3 snapshot dir OR model.safetensors> \
 //!   SAM3_TEXT_FIXTURE=<.../sam3_oracle/text_fixture.safetensors> \
 //!   SAM3_TOKENIZER=<.../tokenizer.json> \
-//!     cargo test -p candle-gen-sam3 --release --features cuda --test text_parity -- --ignored --nocapture
+//!     cargo test -p candle-gen-sam3 --release --features cuda --test integration text_parity:: -- --ignored --nocapture
 
 use std::path::Path;
 

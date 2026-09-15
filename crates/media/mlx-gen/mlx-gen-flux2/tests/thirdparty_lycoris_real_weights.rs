@@ -5,7 +5,7 @@
 //! Validates the link the unit/parity tests can't: a genuine third-party file (kohya/lycoris keys —
 //! `<prefix>_<flattened.path>.{lokr_*,hada_*}` + per-module `.alpha`, NO `networkType` metadata)
 //! resolves against the real model's module names and installs a forward-time delta. Run:
-//!   MLX_GEN_FLUX2_SNAPSHOT=… cargo test -p mlx-gen-flux2 --test thirdparty_lycoris_real_weights -- --ignored --nocapture
+//!   MLX_GEN_FLUX2_SNAPSHOT=… cargo test -p mlx-gen-flux2 --test integration thirdparty_lycoris_real_weights:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 
@@ -54,8 +54,8 @@ fn thirdparty_loha_and_lokr_apply_on_real_tree() {
         shapes.iter().map(|(p, s)| (p, s)).collect::<Vec<_>>()
     );
 
-    let dir = std::env::temp_dir().join("mlx_gen_flux2_thirdparty_rw");
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_tmp = tempfile::tempdir().unwrap();
+    let dir = dir_tmp.path().to_path_buf();
     let r = 2i32;
 
     // ---- third-party LoHa: lycoris keys, per-module .alpha (scale = alpha/rank = 1), NO metadata.

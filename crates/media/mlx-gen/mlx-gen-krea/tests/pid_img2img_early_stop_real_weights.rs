@@ -15,7 +15,7 @@
 //! ```sh
 //! KREA_TURBO_DIR=/path/to/models--SceneWorks--krea-2-turbo-mlx/snapshots/<rev>/q8 \
 //!   PID_QWEN_SAFETENSORS=tools/golden/pid/qwenimage_2kto4k.safetensors \
-//!   cargo test -p mlx-gen-krea --release --test pid_img2img_early_stop_real_weights \
+//!   cargo test -p mlx-gen-krea --release --test integration pid_img2img_early_stop_real_weights:: \
 //!     -- --ignored --nocapture
 //! ```
 //! (With no env, auto-resolves the newest cached `SceneWorks/krea-2-turbo-mlx` q8 turnkey, the golden

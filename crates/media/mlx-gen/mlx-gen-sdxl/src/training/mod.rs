@@ -30,8 +30,8 @@
 //!     under matches what inference applies it under. (This deliberately diverges from the torch
 //!     trainer's real-resolution time_ids — that would mismatch this engine's inference.)
 //!   * **Dual-CLIP conditioning.** `encoder_hidden_states = concat(CLIP-L.hidden[-2], bigG.hidden[-2])`
-//!     and pooled `text_embeds = bigG.pooled`, via [`encode_conditioning`]. Single forward, no CFG
-//!     (the torch ref encodes with `do_classifier_free_guidance=False`).
+//!     and pooled `text_embeds = bigG.pooled`, via [`encode_conditioning_windows`]. Single forward
+//!     per CLIP window, no CFG (the torch ref encodes with `do_classifier_free_guidance=False`).
 //!   * **f32 base.** The U-Net + both text encoders + VAE load at f32 for clean autograd (the
 //!     inference path runs fp16; the trained f32 factors merge into the fp16 base at load, casts
 //!     handled by the loader). The VAE encodes the f32 init image to the scaled latent `x0`.
@@ -53,7 +53,7 @@ use mlx_rs::{random, Array, Dtype};
 
 use crate::config::DiffusionConfig;
 use crate::model::MODEL_ID;
-use crate::pipeline::{encode_conditioning, render_sample, text_time_ids};
+use crate::pipeline::{encode_conditioning_windows, render_sample, text_time_ids};
 use crate::sampler::EulerSampler;
 use crate::text_encoder::ClipTextEncoder;
 use crate::tokenizer::ClipBpeTokenizer;
@@ -95,22 +95,28 @@ impl SdxlFamilyHooks for SdxlHooks {
         "sdxl"
     }
 
-    /// Caption → `(conditioning [1, N, 2048], pooled [1, 1280])`: tokenize (no negative — training is
-    /// CFG-off), run both CLIP encoders, and assemble the SDXL dual-CLIP conditioning + pooled embed
-    /// exactly as the inference [`encode_conditioning`] path.
+    /// Caption → `(conditioning [1, n·77, 2048], pooled [1, 1280])`: tokenize (no negative —
+    /// training is CFG-off), run both CLIP encoders, and assemble the SDXL dual-CLIP conditioning +
+    /// pooled embed exactly as the inference [`encode_conditioning_windows`] path.
+    ///
+    /// Long captions are windowed rather than truncated (sc-20528) — the trainer must condition on
+    /// the same tokens inference will, or a LoRA trained on a clipped caption is being taught the
+    /// wrong association. `n == 1` for every caption inside CLIP's context, which is the
+    /// pre-sc-20528 encoding unchanged.
     fn encode_prompt(&self, caption: &str) -> Result<(Array, Array)> {
         let (te1, te2) = self.encoders()?;
-        let tokens = self.tokenizer.tokenize_batch(caption, None)?;
-        encode_conditioning(te1, te2, &tokens)
+        let tokens = self.tokenizer.tokenize_windows(caption, None)?;
+        encode_conditioning_windows(te1, te2, &tokens)
     }
 
     /// Preview-sample CFG batch (`[2, …]` = positive then empty-negative): the tokenizer builds the
-    /// `Some("")` negative row, so `encode_conditioning` produces the `[2, …]` conditioning SDXL's
-    /// real-CFG preview denoise needs.
+    /// `Some("")` negative row — aligned to the positive's window count (sc-20528) — so
+    /// `encode_conditioning_windows` produces the `[2, …]` conditioning SDXL's real-CFG preview
+    /// denoise needs at one sequence length.
     fn encode_sample_cfg(&self, prompt: &str) -> Result<(Array, Array)> {
         let (te1, te2) = self.encoders()?;
-        let tokens = self.tokenizer.tokenize_batch(prompt, Some(""))?;
-        encode_conditioning(te1, te2, &tokens)
+        let tokens = self.tokenizer.tokenize_windows(prompt, Some(""))?;
+        encode_conditioning_windows(te1, te2, &tokens)
     }
 
     fn free_text_encoders(&mut self) {

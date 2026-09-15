@@ -7,7 +7,9 @@ mod block;
 mod controlnet;
 mod embeddings;
 mod resnet;
-mod transformer;
+// `pub(crate)` for ladder rung 4: `crate::block_stream` names `TransformerBlock` so it can rebuild
+// one with the SAME constructor the resident stack used (SC-16355).
+pub(crate) mod transformer;
 
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::ops::add;
@@ -25,7 +27,7 @@ use mlx_gen::Result;
 use crate::config::UNetConfig;
 use block::{BlockSpec, UNetBlock2D};
 use embeddings::{text_time_temb, SinusoidalPositionalEncoding, TimestepEmbedding};
-use transformer::Transformer2D;
+pub use transformer::Transformer2D;
 
 // Shared with the VAE (the vendored VAE reuses the UNet `ResnetBlock2D` without a time embedding).
 pub use resnet::ResnetBlock2D;
@@ -34,6 +36,46 @@ pub use controlnet::{ControlNet, ControlResiduals};
 
 const GN_GROUPS: i32 = 32;
 const GN_EPS: f32 = 1e-5;
+
+/// Inject one ControlNet's already-scaled down-path residuals into the U-Net skip stack.
+///
+/// This is kept as the narrow production seam for the control/no-control distinction: every SDXL
+/// denoise route, including the CFG-free Lightning route, reaches this helper through
+/// [`UNet2DConditionModel::forward_planned`]. A mismatched ControlNet geometry remains a typed error
+/// rather than being truncated by `zip`.
+pub(crate) fn inject_control_down_residuals(
+    residuals: &mut [Array],
+    control: Option<&ControlResiduals>,
+) -> Result<()> {
+    let Some(control) = control else {
+        return Ok(());
+    };
+    if control.down.len() != residuals.len() {
+        return Err(mlx_gen::Error::Msg(format!(
+            "controlnet produced {} down residuals, UNet expects {}",
+            control.down.len(),
+            residuals.len()
+        )));
+    }
+    for (residual, control_residual) in residuals.iter_mut().zip(&control.down) {
+        *residual = add(&*residual, control_residual)?;
+    }
+    Ok(())
+}
+
+/// Inject one ControlNet's already-scaled mid residual into the U-Net hidden state.
+///
+/// Keeping absent-control as an identity is important for the ordinary SDXL and acceleration paths;
+/// a zero residual is the executable `conditioning_scale = 0` identity used by parity tests.
+pub(crate) fn inject_control_mid_residual(
+    hidden: Array,
+    control: Option<&ControlResiduals>,
+) -> Result<Array> {
+    match control {
+        Some(control) => Ok(add(&hidden, &control.mid)?),
+        None => Ok(hidden),
+    }
+}
 
 /// Transpose a stored NCHW conv weight `[out, in, kH, kW]` to mlx's NHWC `[out, kH, kW, in]`.
 pub(crate) fn nchw_to_nhwc(w: &Array) -> Result<Array> {
@@ -197,11 +239,45 @@ impl UNet2DConditionModel {
         Ok(())
     }
 
+    /// Evaluate the retained U-Net representation one module at a time. This is the final step of
+    /// fused-file Q4/Q8 loading: linears have already been replaced by packed projections, so the
+    /// walk bounds dense source evaluation to the convolution/norm leaves that intentionally stay
+    /// dense plus one packed projection at a time.
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        self.conv_in.materialize_weights()?;
+        self.timesteps.materialize_weights()?;
+        self.time_embedding.materialize_weights()?;
+        self.add_time_proj.materialize_weights()?;
+        self.add_embedding.materialize_weights()?;
+        for block in &self.down_blocks {
+            block.materialize_weights()?;
+        }
+        self.mid_resnet0.materialize_weights()?;
+        self.mid_transformer.materialize_weights()?;
+        self.mid_resnet1.materialize_weights()?;
+        for block in &self.up_blocks {
+            block.materialize_weights()?;
+        }
+        mlx_rs::transforms::eval([&self.conv_norm_out_w, &self.conv_norm_out_b])?;
+        self.conv_out.materialize_weights()?;
+        if let Some(projection) = &self.encoder_hid_proj {
+            projection.materialize_weights()?;
+        }
+        Ok(())
+    }
+
     /// Toggle SDPA-segment gradient checkpointing across every cross-attention transformer (sc-4941):
     /// down/up blocks + the mid transformer. Training-only; opt-in (the SDXL first-step working set
     /// fits unified memory without it, so the trainer gates this on `gradient_checkpointing` rather
     /// than forcing it always-on). Grads are bit-identical to the retained backward.
     pub fn set_sdpa_checkpoint(&mut self, on: bool) {
+        // Ladder rung 4 (SC-15525): this flag is per-block state with NO on-disk representation, so
+        // a block re-materialized from the snapshot would silently run a DIFFERENT backward. The
+        // rung is turned off rather than left to produce that; `block_window` then returns a typed
+        // error for a window request. Inference never calls this mutator, so it is inert on every
+        // render — it exists for the trainer's `gradient_checkpointing`, and `eval` is invalid
+        // inside an autograd trace anyway.
+        self.disarm_block_streams();
         for b in &mut self.down_blocks {
             b.set_sdpa_checkpoint(on);
         }
@@ -250,6 +326,73 @@ impl UNet2DConditionModel {
         Some(self.conv_in.weight_dtype())
     }
 
+    /// Arm ladder rung 4 (SC-15525, closing SC-16355) across **every** `Transformer2D` in the
+    /// U-Net, recording where each sub-stack's blocks can be re-read from.
+    ///
+    /// `source` must be the exact U-Net weight file the resident stack was built from (the resolved
+    /// `unet/diffusion_pytorch_model{,.fp16}.safetensors`, **not** the snapshot root) and
+    /// `quant_bits` the load-time quantization the resident stack received, so a streamed block is
+    /// byte-identical to its resident twin.
+    ///
+    /// Call this **last** — after `install_ip_adapter`, after the adapter merge, after `quantize` —
+    /// because each stream captures the installed IP projections and residual adapters off the
+    /// finished resident blocks. Arming earlier would capture an empty state and silently render
+    /// without the image prompt.
+    ///
+    /// Deliberately not called for an eager load: its blocks are already committed, so a window
+    /// would add a second copy on top rather than bounding anything.
+    pub fn arm_block_streams(&mut self, source: &mlx_gen::WeightsSource, quant_bits: Option<i32>) {
+        for (i, block) in self.down_blocks.iter_mut().enumerate() {
+            block.arm_block_streams(source, &format!("down_blocks.{i}"), quant_bits);
+        }
+        self.mid_transformer
+            .arm_block_stream(source.clone(), "mid_block.attentions.0", quant_bits);
+        for (k, block) in self.up_blocks.iter_mut().enumerate() {
+            block.arm_block_streams(source, &format!("up_blocks.{k}"), quant_bits);
+        }
+    }
+
+    /// Disarm rung 4 everywhere. See [`Self::set_sdpa_checkpoint`] for the one case that needs it.
+    pub fn disarm_block_streams(&mut self) {
+        for block in &mut self.down_blocks {
+            block.disarm_block_streams();
+        }
+        self.mid_transformer.disarm_block_stream();
+        for block in &mut self.up_blocks {
+            block.disarm_block_streams();
+        }
+    }
+
+    /// Whether rung 4 can execute on this U-Net — every `Transformer2D` has a re-openable stream.
+    ///
+    /// All-or-nothing on purpose: a partially armed U-Net would window some sub-stacks and leave
+    /// others resident, which is neither the measured configuration nor a describable one.
+    pub fn can_stream_blocks(&self) -> bool {
+        self.down_blocks
+            .iter()
+            .all(UNetBlock2D::block_streams_armed)
+            && self.mid_transformer.can_stream_blocks()
+            && self.up_blocks.iter().all(UNetBlock2D::block_streams_armed)
+    }
+
+    /// Every windowable sub-stack's depth, in forward order — `down_blocks` → `mid` → `up_blocks`.
+    ///
+    /// For SDXL-base this is `[2, 2, 10, 10, 10, 10, 10, 10, 2, 2, 2]`: eleven `Transformer2D`, six
+    /// at depth 10 and five at depth 2, 70 windowable blocks in total. It is derived from the built
+    /// stacks rather than re-read from the config, so a config/checkpoint disagreement shows up here
+    /// instead of in a window that silently covers the wrong number of blocks.
+    pub fn transformer_stack_depths(&self) -> Vec<usize> {
+        let mut depths: Vec<usize> = Vec::new();
+        for block in &self.down_blocks {
+            depths.extend(block.attention_depths());
+        }
+        depths.push(self.mid_transformer.depth());
+        for block in &self.up_blocks {
+            depths.extend(block.attention_depths());
+        }
+        depths
+    }
+
     /// Install IP-Adapter decoupled K/V projections (sc-3059) into the cross-attention modules, in
     /// the diffusers `attn_processors` walk order — **down_blocks → up_blocks → mid_block** (the
     /// empirical `ip_adapter.{1,3,…}` numeric order). `pairs` are the `to_k_ip/to_v_ip` weights, one
@@ -286,7 +429,16 @@ impl UNet2DConditionModel {
         text_emb: &Array,
         time_ids: &Array,
     ) -> Result<Array> {
-        self.forward_core(x, timestep, encoder_x, text_emb, time_ids, None, None)
+        self.forward_core(
+            x,
+            timestep,
+            encoder_x,
+            text_emb,
+            time_ids,
+            None,
+            None,
+            crate::plan::SdxlForwardPlan::UNBOUNDED,
+        )
     }
 
     /// Like [`forward`](Self::forward) but adds a ControlNet's residuals (sc-3058): each control
@@ -309,6 +461,7 @@ impl UNet2DConditionModel {
             time_ids,
             Some(control),
             None,
+            crate::plan::SdxlForwardPlan::UNBOUNDED,
         )
     }
 
@@ -325,7 +478,16 @@ impl UNet2DConditionModel {
         time_ids: &Array,
         ip: (&Array, f32),
     ) -> Result<Array> {
-        self.forward_core(x, timestep, encoder_x, text_emb, time_ids, None, Some(ip))
+        self.forward_core(
+            x,
+            timestep,
+            encoder_x,
+            text_emb,
+            time_ids,
+            None,
+            Some(ip),
+            crate::plan::SdxlForwardPlan::UNBOUNDED,
+        )
     }
 
     /// Combined decoupled-cross-attn IP tokens **and** ControlNet residuals in one forward — the
@@ -354,6 +516,32 @@ impl UNet2DConditionModel {
             time_ids,
             Some(control),
             Some(ip),
+            crate::plan::SdxlForwardPlan::UNBOUNDED,
+        )
+    }
+
+    /// The **single bounded entry point** for the ladder (SC-15525): every denoise route in one
+    /// signature, plus the rung-3/rung-4 [`SdxlForwardPlan`](crate::plan::SdxlForwardPlan).
+    ///
+    /// The four historical `forward*` wrappers above are preserved byte-for-byte and simply pass
+    /// [`SdxlForwardPlan::UNBOUNDED`](crate::plan::SdxlForwardPlan::UNBOUNDED), so nothing that
+    /// existed before this rung can change behaviour or signature. Adding a fifth bounded wrapper
+    /// per (control × ip) combination would have been four more; the production denoise loop already
+    /// dispatches on those two `Option`s in `pipeline::forward_eps`, so it calls this directly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_planned(
+        &self,
+        x: &Array,
+        timestep: f32,
+        encoder_x: &Array,
+        text_emb: &Array,
+        time_ids: &Array,
+        control: Option<&ControlResiduals>,
+        ip: Option<(&Array, f32)>,
+        plan: crate::plan::SdxlForwardPlan<'_>,
+    ) -> Result<Array> {
+        self.forward_core(
+            x, timestep, encoder_x, text_emb, time_ids, control, ip, plan,
         )
     }
 
@@ -367,6 +555,7 @@ impl UNet2DConditionModel {
         time_ids: &Array,
         control: Option<&ControlResiduals>,
         ip: Option<(&Array, f32)>,
+        plan: crate::plan::SdxlForwardPlan<'_>,
     ) -> Result<Array> {
         let batch = x.shape()[0];
         let dtype = x.dtype();
@@ -402,37 +591,25 @@ impl UNet2DConditionModel {
         // Down path — collect skip residuals (starting with the stem output).
         let mut residuals: Vec<Array> = vec![x.clone()];
         for block in &self.down_blocks {
-            let (out, res) = block.forward_ip(&x, encoder_x, &temb, None, ip)?;
+            let (out, res) = block.forward_ip(&x, encoder_x, &temb, None, ip, plan)?;
             x = out;
             residuals.extend(res);
         }
 
         // ControlNet (sc-3058): add the (scaled) control down residuals to the skip connections.
-        if let Some(c) = control {
-            if c.down.len() != residuals.len() {
-                return Err(mlx_gen::Error::Msg(format!(
-                    "controlnet produced {} down residuals, UNet expects {}",
-                    c.down.len(),
-                    residuals.len()
-                )));
-            }
-            for (r, cr) in residuals.iter_mut().zip(&c.down) {
-                *r = add(&*r, cr)?;
-            }
-        }
+        inject_control_down_residuals(&mut residuals, control)?;
 
         // Mid.
         x = self.mid_resnet0.forward(&x, Some(&temb))?;
-        x = self.mid_transformer.forward_ip(&x, encoder_x, ip)?;
+        x = self.mid_transformer.forward_ip(&x, encoder_x, ip, plan)?;
         x = self.mid_resnet1.forward(&x, Some(&temb))?;
         // ControlNet: add the (scaled) control mid residual to the mid output.
-        if let Some(c) = control {
-            x = add(&x, &c.mid)?;
-        }
+        x = inject_control_mid_residual(x, control)?;
 
         // Up path — each block pops its skip residuals.
         for block in &self.up_blocks {
-            let (out, _) = block.forward_ip(&x, encoder_x, &temb, Some(&mut residuals), ip)?;
+            let (out, _) =
+                block.forward_ip(&x, encoder_x, &temb, Some(&mut residuals), ip, plan)?;
             x = out;
         }
 
@@ -520,7 +697,14 @@ impl UNet2DConditionModel {
                 // path's cotangent would be dropped, scrambling the down-block grads). The next block
                 // takes `x` from the last state.
                 let (_out, res) = blk
-                    .forward_ip(&inp[0], &ex, &tb, None, None)
+                    .forward_ip(
+                        &inp[0],
+                        &ex,
+                        &tb,
+                        None,
+                        None,
+                        crate::plan::SdxlForwardPlan::UNBOUNDED,
+                    )
                     .map_err(|e| Exception::custom(e.to_string()))?;
                 Ok(res)
             });
@@ -535,7 +719,12 @@ impl UNet2DConditionModel {
         // Mid — dense (lowest-resolution block, cheap to retain; its LoRA trains via the adapters the
         // caller installed on `self`).
         x = self.mid_resnet0.forward(&x, Some(&temb))?;
-        x = self.mid_transformer.forward_ip(&x, encoder_x, None)?;
+        x = self.mid_transformer.forward_ip(
+            &x,
+            encoder_x,
+            None,
+            crate::plan::SdxlForwardPlan::UNBOUNDED,
+        )?;
         x = self.mid_resnet1.forward(&x, Some(&temb))?;
 
         // Up path — each block checkpointed; its skip residuals are peeled off the stack (in push
@@ -558,7 +747,14 @@ impl UNet2DConditionModel {
                 let mut skips_v: Vec<Array> = inp[1..1 + kskip].to_vec();
                 install_threaded_lora(&mut blk, &locals, &inp[1 + kskip..], alpha, dtype)?;
                 let (out, _) = blk
-                    .forward_ip(&inp[0], &ex, &tb, Some(&mut skips_v), None)
+                    .forward_ip(
+                        &inp[0],
+                        &ex,
+                        &tb,
+                        Some(&mut skips_v),
+                        None,
+                        crate::plan::SdxlForwardPlan::UNBOUNDED,
+                    )
                     .map_err(|e| Exception::custom(e.to_string()))?;
                 Ok(vec![out])
             });
@@ -709,7 +905,7 @@ fn install_threaded_lora<H: AdaptableHost>(
         block
             .adaptable_mut(&segs)
             .ok_or_else(|| Exception::custom(format!("checkpoint LoRA target not found: {local}")))?
-            .set_adapters(vec![Adapter::Lora { a, b, scale: 1.0 }]);
+            .set_training_adapters(vec![Adapter::Lora { a, b, scale: 1.0 }]);
     }
     Ok(())
 }

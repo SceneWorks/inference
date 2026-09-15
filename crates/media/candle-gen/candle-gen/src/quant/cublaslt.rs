@@ -133,6 +133,54 @@ pub fn quantize_weight_int8_per_channel(w: &Tensor) -> Result<PerChannelInt8Weig
     Ok(PerChannelInt8Weight { q, scale })
 }
 
+/// **Locked-decision-7 8-bit floor**, as a `(major, minor)` compute capability: the whole 8-bit
+/// track (fp8 E4M3 *and* int8 IGEMM, which the hardware would allow at 8.0) is gated at sm_89.
+///
+/// The one definition of the threshold. `CublasLt::meets_fp8_floor` applies it to a bound handle's
+/// capability; callers that only have a `candle_core::Device` — the logical-weight residency policy
+/// decides packed-vs-dense at *plan* time, long before any GEMM handle exists, and building one
+/// would allocate the handle's 32 MiB workspace — read the capability off the device and apply it
+/// here. Neither re-spells `(8, 9)`.
+pub const FP8_COMPUTE_CAP_FLOOR: (i32, i32) = (8, 9);
+
+/// Whether a `(major, minor)` compute capability meets [`FP8_COMPUTE_CAP_FLOOR`].
+pub fn compute_cap_meets_fp8_floor(cap: (i32, i32)) -> bool {
+    cap >= FP8_COMPUTE_CAP_FLOOR
+}
+
+/// **NVFP4 floor**, as a `(major, minor)` compute capability: consumer Blackwell `sm_120` (cap
+/// 12.0). The master-gate spike (sc-11038) confirmed cuBLASLt dispatches a real `CUDA_R_4F_E2M1` +
+/// `VEC16_UE4M3` tensor-core kernel there — plain `sm_120`, not `sm_120a`; datacenter `sm_100` is
+/// out of epic scope.
+///
+/// The one definition of the threshold, in the same shape as [`FP8_COMPUTE_CAP_FLOOR`] and for the
+/// same reason: `CublasLt::meets_nvfp4_floor` applies it to a bound handle, while the
+/// logical-weight residency policy (sc-20641) decides packed-vs-dense at *plan* time, before any
+/// GEMM handle exists, and reads the capability straight off the `Device`. Neither re-spells 12.0.
+pub const NVFP4_COMPUTE_CAP_FLOOR: (i32, i32) = (12, 0);
+
+/// Whether a `(major, minor)` compute capability meets [`NVFP4_COMPUTE_CAP_FLOOR`].
+pub fn compute_cap_meets_nvfp4_floor(cap: (i32, i32)) -> bool {
+    cap >= NVFP4_COMPUTE_CAP_FLOOR
+}
+
+/// The required padded-K multiple for the NVFP4 cuBLASLt path (sc-11039 handoff item (b),
+/// GPU-confirmed on the RTX PRO 6000). The `nvfp4_k_alignment_probe` swept K on live hardware:
+/// K∈{32,64,128} are ACCEPTED (bit-accurate), K∈{16,48} return `CUBLAS_STATUS_NOT_SUPPORTED` — so
+/// cuBLASLt's FP4 block-scaled path requires **K a multiple of 32** (two NVFP4 blocks), *not* the
+/// single 16-element block and *not* the 64-element 4-block scale atom. The sc-11040 packer pads
+/// `cols_padded` only to a multiple of 16, so an `in_features` in e.g. `[33,47]` packs to K=48 and
+/// is rejected by `check_nvfp4_alignment` with a clear message.
+///
+/// Lives outside `cuda_impl` (sc-20641) so the plan-time layout predicate — which must answer
+/// "would this layer's stored geometry be accepted?" on every build, including the Metal and CPU
+/// lanes that unit-test it — shares the one definition instead of re-spelling 32.
+pub const NVFP4_K_ALIGN: usize = 32;
+
+/// The output-row (N) multiple the cuBLASLt NVFP4 path requires, paired with [`NVFP4_K_ALIGN`] by
+/// `check_nvfp4_alignment` and by the plan-time predicate.
+pub const NVFP4_N_ALIGN: usize = 16;
+
 #[cfg(feature = "cuda")]
 mod cuda_impl {
     use super::super::nvfp4::{Nvfp4Tensor, SF_ATOM_COLS, SF_ATOM_ROWS};
@@ -160,9 +208,13 @@ mod cuda_impl {
         /// resident-weight forward (and the throughput probe) reflect real FP4 tensor-core speed rather
         /// than repeated heuristic searches. The fp8/int8 paths do not cache (they were spike/bench
         /// scaffolding); the NVFP4 path is a shipping compute lane so it does.
-        nvfp4_algos: std::sync::Mutex<
-            std::collections::HashMap<(usize, usize, usize), sys::cublasLtMatmulAlgo_t>,
-        >,
+        nvfp4_algos:
+            std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), CachedNvfp4Algo>>,
+        /// Number of cuBLASLt heuristic selections performed for each NVFP4 shape by this handle.
+        /// This is intentionally per-handle state, rather than a process-global test hook: it makes
+        /// cache reuse observable without coupling independent devices or test processes.
+        nvfp4_heuristic_selection_counts:
+            std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), usize>>,
         /// Cached device-resident **gather index** (`U32`) for the on-device NVFP4 activation
         /// quantizer (sc-11044), keyed by `(rows, n_blocks)`. For each byte offset in cuBLASLt's
         /// row-major scale-factor-atom layout it holds the source index into the row-major
@@ -184,6 +236,113 @@ mod cuda_impl {
     /// standard device intrinsics (no fp8/fp4 headers) so nvrtc needs no extra include path.
     const NVFP4_QUANT_CU: &str = include_str!("nvfp4_quant.cu");
 
+    /// The public, driver-reported configuration identity of the cuBLASLt algorithm selected for
+    /// one NVFP4 GEMM shape. This deliberately copies documented scalar configuration attributes
+    /// instead of exposing cuBLASLt's opaque `cublasLtMatmulAlgo_t` outside this module.
+    ///
+    /// The values identify the exact kernel/configuration selected by this installed driver; they
+    /// are evidence for a live device gate, not a cross-driver compatibility contract. In
+    /// particular, callers must not persist or hard-code them as universal expected values.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct Nvfp4AlgorithmIdentity {
+        /// cuBLASLt's algorithm index.
+        pub algorithm_id: i32,
+        /// cuBLASLt tile configuration selected for this launch.
+        pub tile_id: u32,
+        /// Number of K splits selected for this launch.
+        pub split_k_num: i32,
+        /// cuBLASLt reduction scheme selected for this launch.
+        pub reduction_scheme: u32,
+        /// cuBLASLt CTA swizzle selected for this launch.
+        pub cta_swizzling: u32,
+        /// cuBLASLt algorithm-specific custom option.
+        pub custom_option: u32,
+        /// cuBLASLt pipeline-stages configuration.
+        pub stages_id: u32,
+        /// cuBLASLt tensor-core MMA inner-shape configuration.
+        pub inner_shape_id: u16,
+        /// cuBLASLt thread-block cluster-shape configuration.
+        pub cluster_shape_id: u16,
+    }
+
+    #[derive(Clone, Copy)]
+    struct CachedNvfp4Algo {
+        algo: sys::cublasLtMatmulAlgo_t,
+        identity: Nvfp4AlgorithmIdentity,
+    }
+
+    /// RAII wrappers keep cuBLASLt resources balanced on every error path after descriptor creation.
+    /// The raw handles are only borrowed for cuBLASLt calls; their destructors run at scope exit.
+    struct MatmulDesc(sys::cublasLtMatmulDesc_t);
+
+    impl MatmulDesc {
+        fn new(
+            compute_type: sys::cublasComputeType_t,
+            scale_type: sys::cudaDataType_t,
+        ) -> Result<Self> {
+            lt::create_matmul_desc(compute_type, scale_type)
+                .map(Self)
+                .map_err(cublas_err)
+        }
+
+        fn raw(&self) -> sys::cublasLtMatmulDesc_t {
+            self.0
+        }
+    }
+
+    impl Drop for MatmulDesc {
+        fn drop(&mut self) {
+            // Safety: `self.0` came from `create_matmul_desc` and is destroyed exactly once here.
+            unsafe {
+                let _ = lt::destroy_matmul_desc(self.0);
+            }
+        }
+    }
+
+    struct MatrixLayout(sys::cublasLtMatrixLayout_t);
+
+    impl MatrixLayout {
+        fn new(dtype: sys::cudaDataType_t, rows: u64, cols: u64, leading_dim: i64) -> Result<Self> {
+            lt::create_matrix_layout(dtype, rows, cols, leading_dim)
+                .map(Self)
+                .map_err(cublas_err)
+        }
+
+        fn raw(&self) -> sys::cublasLtMatrixLayout_t {
+            self.0
+        }
+    }
+
+    impl Drop for MatrixLayout {
+        fn drop(&mut self) {
+            // Safety: `self.0` came from `create_matrix_layout` and is destroyed exactly once here.
+            unsafe {
+                let _ = lt::destroy_matrix_layout(self.0);
+            }
+        }
+    }
+
+    struct MatmulPreference(sys::cublasLtMatmulPreference_t);
+
+    impl MatmulPreference {
+        fn new() -> Result<Self> {
+            lt::create_matmul_pref().map(Self).map_err(cublas_err)
+        }
+
+        fn raw(&self) -> sys::cublasLtMatmulPreference_t {
+            self.0
+        }
+    }
+
+    impl Drop for MatmulPreference {
+        fn drop(&mut self) {
+            // Safety: `self.0` came from `create_matmul_pref` and is destroyed exactly once here.
+            unsafe {
+                let _ = lt::destroy_matmul_pref(self.0);
+            }
+        }
+    }
+
     /// The two nvrtc-compiled kernels of the fused activation quantizer, cached on the handle. The
     /// `CudaFunction`s keep their owning module alive. Force `Send`/`Sync` to match [`CublasLt`]'s own
     /// contract (the handle is used single-threaded per `RUST_TEST_THREADS=1`).
@@ -198,6 +357,78 @@ mod cuda_impl {
     unsafe impl Send for CublasLt {}
     unsafe impl Sync for CublasLt {}
 
+    unsafe fn nvfp4_algo_config_attr<T>(
+        algo: &sys::cublasLtMatmulAlgo_t,
+        attr: sys::cublasLtMatmulAlgoConfigAttributes_t,
+    ) -> Result<T> {
+        let mut value = std::mem::MaybeUninit::<T>::uninit();
+        let mut size_written = 0usize;
+        sys::cublasLtMatmulAlgoConfigGetAttribute(
+            algo,
+            attr,
+            value.as_mut_ptr().cast::<c_void>(),
+            size_of::<T>(),
+            &mut size_written,
+        )
+        .result()
+        .map_err(cublas_err)?;
+        if size_written != size_of::<T>() {
+            candle_core::bail!(
+                "cuBLASLt returned {size_written} bytes for {attr:?}; expected {}",
+                size_of::<T>()
+            );
+        }
+        Ok(value.assume_init())
+    }
+
+    fn nvfp4_algorithm_identity(
+        algo: &sys::cublasLtMatmulAlgo_t,
+    ) -> Result<Nvfp4AlgorithmIdentity> {
+        // These types are the documented storage types in CUDA 12.9's cublasLt.h. Reading them
+        // through the API is safe and remains valid even though `cublasLtMatmulAlgo_t` itself is
+        // opaque to this wrapper.
+        unsafe {
+            Ok(Nvfp4AlgorithmIdentity {
+                algorithm_id: nvfp4_algo_config_attr(
+                    algo,
+                    sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_ID,
+                )?,
+                tile_id: nvfp4_algo_config_attr(
+                    algo,
+                    sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_TILE_ID,
+                )?,
+                split_k_num: nvfp4_algo_config_attr(
+                    algo,
+                    sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+                )?,
+                reduction_scheme: nvfp4_algo_config_attr(
+                    algo,
+                    sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
+                )?,
+                cta_swizzling: nvfp4_algo_config_attr(
+                    algo,
+                    sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING,
+                )?,
+                custom_option: nvfp4_algo_config_attr(
+                    algo,
+                    sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION,
+                )?,
+                stages_id: nvfp4_algo_config_attr(
+                    algo,
+                    sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_STAGES_ID,
+                )?,
+                inner_shape_id: nvfp4_algo_config_attr(
+                    algo,
+                    sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID,
+                )?,
+                cluster_shape_id: nvfp4_algo_config_attr(
+                    algo,
+                    sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID,
+                )?,
+            })
+        }
+    }
+
     impl Drop for CublasLt {
         fn drop(&mut self) {
             unsafe {
@@ -209,6 +440,32 @@ mod cuda_impl {
     impl CublasLt {
         /// 32 MiB workspace — enough for the Split-K / stream-K algos cuBLASLt picks at DiT shapes.
         const WORKSPACE: usize = 32 * 1024 * 1024;
+
+        /// Returns the driver-reported identity for the cached NVFP4 algorithm selected for
+        /// `(m, k, n)`, if that shape has already run. This is an observation seam for device
+        /// gates: a successful FP4-descriptor heuristic search must leave a concrete, cacheable
+        /// tensor-core algorithm configuration, without pretending its driver-specific IDs are
+        /// stable across CUDA releases.
+        pub fn selected_nvfp4_algorithm_identity(
+            &self,
+            m: usize,
+            k: usize,
+            n: usize,
+        ) -> Option<Nvfp4AlgorithmIdentity> {
+            crate::lock_recover(&self.nvfp4_algos)
+                .get(&(m, k, n))
+                .map(|cached| cached.identity)
+        }
+
+        /// Returns how often this handle has invoked cuBLASLt's NVFP4 heuristic for `(m, k, n)`.
+        /// A successful cache-backed repeat must leave this at one, so device tests can prove cache
+        /// reuse without relying on driver-specific algorithm IDs.
+        pub fn nvfp4_heuristic_selection_count(&self, m: usize, k: usize, n: usize) -> usize {
+            crate::lock_recover(&self.nvfp4_heuristic_selection_counts)
+                .get(&(m, k, n))
+                .copied()
+                .unwrap_or(0)
+        }
 
         pub fn new(dev: &Device) -> Result<Self> {
             let device = match dev {
@@ -225,6 +482,9 @@ mod cuda_impl {
                 workspace,
                 workspace_size: Self::WORKSPACE,
                 nvfp4_algos: std::sync::Mutex::new(std::collections::HashMap::new()),
+                nvfp4_heuristic_selection_counts: std::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                ),
                 nvfp4_act_scale_gather_idx: std::sync::Mutex::new(std::collections::HashMap::new()),
                 nvfp4_quant_kernels: std::sync::Mutex::new(None),
             })
@@ -245,10 +505,10 @@ mod cuda_impl {
         }
 
         /// True iff the device meets the sc-9299 sm_89 floor (fp8 needs 8.9; int8 IGEMM 8.0, but the
-        /// whole 8-bit track is floored at 8.9 per locked-decision-7).
+        /// whole 8-bit track is floored at 8.9 per locked-decision-7). The threshold itself lives in
+        /// [`super::FP8_COMPUTE_CAP_FLOOR`] so the plan-time residency policy shares it.
         pub fn meets_fp8_floor(&self) -> Result<bool> {
-            let (maj, min) = self.compute_cap()?;
-            Ok(maj > 8 || (maj == 8 && min >= 9))
+            Ok(super::compute_cap_meets_fp8_floor(self.compute_cap()?))
         }
 
         /// True iff the device can run the NVFP4 block-scaled FP4 GEMM (sc-11039). The master-gate
@@ -257,9 +517,10 @@ mod cuda_impl {
         /// `sm_120a`. Datacenter `sm_100` is out of epic scope; the floor is cap ≥ 12.0. Below this the
         /// caller falls back to the dequant→bf16 dense path (the same fallback the non-cuda build takes
         /// by construction — this whole handle is `#[cfg(feature = "cuda")]`).
+        /// The threshold itself lives in [`super::NVFP4_COMPUTE_CAP_FLOOR`] so the plan-time
+        /// residency policy shares it (sc-20641); this never re-derives it.
         pub fn meets_nvfp4_floor(&self) -> Result<bool> {
-            let (maj, _min) = self.compute_cap()?;
-            Ok(maj >= 12)
+            Ok(super::compute_cap_meets_nvfp4_floor(self.compute_cap()?))
         }
 
         /// **fp8 E4M3 GEMM**: `D = (scale_w·scale_x) · (X · Wᵀ)` → bf16 `(M, N)`.
@@ -1148,21 +1409,20 @@ mod cuda_impl {
         ) -> Result<()> {
             let io_dtype = sys::cudaDataType_t::CUDA_R_4F_E2M1;
             let out_dtype = sys::cudaDataType_t::CUDA_R_16BF;
-            let desc = lt::create_matmul_desc(
+            let desc = MatmulDesc::new(
                 sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
                 sys::cudaDataType_t::CUDA_R_32F,
-            )
-            .map_err(cublas_err)?;
+            )?;
 
             let transa: i32 = 1; // CUBLAS_OP_T  (A = W declared (K,N) col-major == our row-major (N,K))
             let transb: i32 = 0; // CUBLAS_OP_N  (B = X declared (K,M) col-major == our row-major (M,K))
             set_attr(
-                desc,
+                desc.raw(),
                 sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
                 &transa,
             )?;
             set_attr(
-                desc,
+                desc.raw(),
                 sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
                 &transb,
             )?;
@@ -1172,22 +1432,22 @@ mod cuda_impl {
             let scale_mode =
                 sys::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
             set_attr(
-                desc,
+                desc.raw(),
                 sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
                 &scale_mode,
             )?;
             set_attr(
-                desc,
+                desc.raw(),
                 sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
                 &scale_mode,
             )?;
             set_attr(
-                desc,
+                desc.raw(),
                 sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
                 &sa_ptr,
             )?;
             set_attr(
-                desc,
+                desc.raw(),
                 sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
                 &sb_ptr,
             )?;
@@ -1195,12 +1455,9 @@ mod cuda_impl {
             // Layouts (see [`Self::run`] doc): A=(K,N) ld=K, B=(K,M) ld=K, D=(N,M) ld=N. For FP4 the
             // leading dim is in *elements* (K / N), not bytes — cuBLASLt handles the 2-nibbles/byte
             // packing internally from the `CUDA_R_4F_E2M1` dtype.
-            let a_layout = lt::create_matrix_layout(io_dtype, k as u64, n as u64, k as i64)
-                .map_err(cublas_err)?;
-            let b_layout = lt::create_matrix_layout(io_dtype, k as u64, m as u64, k as i64)
-                .map_err(cublas_err)?;
-            let d_layout = lt::create_matrix_layout(out_dtype, n as u64, m as u64, n as i64)
-                .map_err(cublas_err)?;
+            let a_layout = MatrixLayout::new(io_dtype, k as u64, n as u64, k as i64)?;
+            let b_layout = MatrixLayout::new(io_dtype, k as u64, m as u64, k as i64)?;
+            let d_layout = MatrixLayout::new(out_dtype, n as u64, m as u64, n as i64)?;
 
             // Algo: reuse the cached pick for this shape if present (the heuristic search is a host-side
             // cost that otherwise dominates a small FP4 GEMM); else run the heuristic once and cache it.
@@ -1211,11 +1468,11 @@ mod cuda_impl {
                 .get(&(m, k, n))
                 .copied();
             let algo = match cached {
-                Some(a) => a,
+                Some(cached) => cached.algo,
                 None => {
-                    let pref = lt::create_matmul_pref().map_err(cublas_err)?;
+                    let pref = MatmulPreference::new()?;
                     lt::set_matmul_pref_attribute(
-                        pref,
+                        pref.raw(),
                         sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                         &self.workspace_size as *const _ as *const c_void,
                         size_of::<usize>(),
@@ -1223,25 +1480,23 @@ mod cuda_impl {
                     .map_err(cublas_err)?;
                     let heuristic = lt::get_matmul_algo_heuristic(
                         self.handle,
-                        desc,
-                        a_layout,
-                        b_layout,
-                        d_layout,
-                        d_layout,
-                        pref,
+                        desc.raw(),
+                        a_layout.raw(),
+                        b_layout.raw(),
+                        d_layout.raw(),
+                        d_layout.raw(),
+                        pref.raw(),
                     );
-                    let _ = lt::destroy_matmul_pref(pref);
+                    *crate::lock_recover(&self.nvfp4_heuristic_selection_counts)
+                        .entry((m, k, n))
+                        .or_default() += 1;
                     let algo = match heuristic {
                         Ok(h) => h.algo,
-                        Err(e) => {
-                            let _ = lt::destroy_matrix_layout(a_layout);
-                            let _ = lt::destroy_matrix_layout(b_layout);
-                            let _ = lt::destroy_matrix_layout(d_layout);
-                            let _ = lt::destroy_matmul_desc(desc);
-                            return Err(cublas_err(e));
-                        }
+                        Err(e) => return Err(cublas_err(e)),
                     };
-                    crate::lock_recover(&self.nvfp4_algos).insert((m, k, n), algo);
+                    let identity = nvfp4_algorithm_identity(&algo)?;
+                    crate::lock_recover(&self.nvfp4_algos)
+                        .insert((m, k, n), CachedNvfp4Algo { algo, identity });
                     algo
                 }
             };
@@ -1251,27 +1506,23 @@ mod cuda_impl {
             let (ws_ptr, _gw) = self.workspace.device_ptr(&self.stream);
             let res = lt::matmul(
                 self.handle,
-                desc,
+                desc.raw(),
                 &alpha as *const f32 as *const c_void,
                 &beta as *const f32 as *const c_void,
                 a_ptr as *const c_void,
-                a_layout,
+                a_layout.raw(),
                 b_ptr as *const c_void,
-                b_layout,
+                b_layout.raw(),
                 d_ptr as *const c_void,
-                d_layout,
+                d_layout.raw(),
                 d_ptr as *mut c_void,
-                d_layout,
+                d_layout.raw(),
                 &algo as *const _,
                 ws_ptr as *mut c_void,
                 self.workspace_size,
                 self.stream.cu_stream() as sys::cudaStream_t,
             );
 
-            let _ = lt::destroy_matrix_layout(a_layout);
-            let _ = lt::destroy_matrix_layout(b_layout);
-            let _ = lt::destroy_matrix_layout(d_layout);
-            let _ = lt::destroy_matmul_desc(desc);
             res.map_err(cublas_err)
         }
     }
@@ -1605,14 +1856,9 @@ mod cuda_impl {
         Ok(())
     }
 
-    /// The required padded-K multiple for the NVFP4 cuBLASLt path (sc-11039 handoff item (b),
-    /// GPU-confirmed on the RTX PRO 6000). The `nvfp4_k_alignment_probe` swept K on live hardware:
-    /// K∈{32,64,128} are ACCEPTED (bit-accurate), K∈{16,48} return `CUBLAS_STATUS_NOT_SUPPORTED` — so
-    /// cuBLASLt's FP4 block-scaled path requires **K a multiple of 32** (two NVFP4 blocks), *not* the
-    /// single 16-element block and *not* the 64-element 4-block scale atom. The sc-11040 packer pads
-    /// `cols_padded` only to a multiple of 16, so an `in_features` in e.g. `[33,47]` packs to K=48 and
-    /// is rejected here with a clear message (follow-up: have the packer pad K to 32).
-    pub const NVFP4_K_ALIGN: usize = 32;
+    /// Imported from the always-compiled half of this module (sc-20641) so the `cuda` callers
+    /// below and the plan-time layout predicate share one definition.
+    use super::{NVFP4_K_ALIGN, NVFP4_N_ALIGN};
 
     fn check_nvfp4_alignment(k: usize, n: usize) -> Result<()> {
         if !k.is_multiple_of(NVFP4_K_ALIGN) {
@@ -1622,8 +1868,8 @@ mod cuda_impl {
                  in_features that rounds to a multiple of {NVFP4_K_ALIGN}"
             );
         }
-        if !n.is_multiple_of(16) {
-            candle_core::bail!("cuBLASLt NVFP4: N ({n}) must be a multiple of 16");
+        if !n.is_multiple_of(NVFP4_N_ALIGN) {
+            candle_core::bail!("cuBLASLt NVFP4: N ({n}) must be a multiple of {NVFP4_N_ALIGN}");
         }
         Ok(())
     }
@@ -1643,8 +1889,11 @@ mod cuda_impl {
     }
 }
 
+// `NVFP4_K_ALIGN` / `NVFP4_N_ALIGN` are NOT re-exported here: sc-20641 moved them to this module's
+// always-compiled half (the plan-time layout predicate needs them on every build), and `cuda_impl`
+// only borrows them back with its own `pub use`.
 #[cfg(feature = "cuda")]
-pub use cuda_impl::{CublasLt, DevFp8, DevInt8, DevNvfp4, NVFP4_K_ALIGN};
+pub use cuda_impl::{CublasLt, DevFp8, DevInt8, DevNvfp4, Nvfp4AlgorithmIdentity};
 
 /// **One `CublasLt` handle per device**, shared by every INT8 projection built against it (sc-12301)
 /// — the int8 twin of [`Nvfp4Context`](super::nvfp4_linear::Nvfp4Context).

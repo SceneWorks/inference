@@ -154,18 +154,19 @@ mod tests {
     /// dense single-root load path is left unchanged.
     #[test]
     fn detect_returns_none_for_non_tier_dir() {
-        let tmp = std::env::temp_dir().join(format!("sc11990_nontier_{}", std::process::id()));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         std::fs::create_dir_all(tmp.join("transformer")).unwrap();
         // No split_model.json ⇒ not a tier.
         assert!(MochiTierPaths::detect(&tmp).is_none());
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// A tier dir (`split_model.json` + `transformer/`) is detected, and the shared root resolves to the
     /// parent when the parent holds a `text_encoder/` (the `convert.rs` staged layout).
     #[test]
     fn detect_resolves_shared_root_to_parent() {
-        let root = std::env::temp_dir().join(format!("sc11990_tier_{}", std::process::id()));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         let tier = root.join("q4");
         std::fs::create_dir_all(tier.join("transformer")).unwrap();
         std::fs::create_dir_all(root.join("text_encoder")).unwrap();
@@ -189,15 +190,14 @@ mod tests {
         assert!(paths.is_quantized().unwrap());
         assert_eq!(paths.manifest_bits().unwrap(), Some(4));
         paths.validate_group_size().unwrap();
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A dense `bf16` tier (`quantized: false`, no `quantize_config.json`) validates trivially and has no
     /// manifest bits.
     #[test]
     fn dense_bf16_tier_has_no_packed_config() {
-        let root = std::env::temp_dir().join(format!("sc11990_bf16_{}", std::process::id()));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         let tier = root.join("bf16");
         std::fs::create_dir_all(tier.join("transformer")).unwrap();
         std::fs::create_dir_all(root.join("text_encoder")).unwrap();
@@ -207,13 +207,13 @@ mod tests {
         assert!(!paths.is_quantized().unwrap());
         assert_eq!(paths.manifest_bits().unwrap(), None);
         paths.validate_group_size().unwrap(); // no-op for dense
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A quantized tier whose `quantize_config.json` declares a non-64 group is rejected loudly.
     #[test]
     fn validate_group_size_rejects_non_64_group() {
-        let root = std::env::temp_dir().join(format!("sc11990_g32_{}", std::process::id()));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         let tier = root.join("q4");
         std::fs::create_dir_all(tier.join("transformer")).unwrap();
         std::fs::create_dir_all(root.join("text_encoder")).unwrap();
@@ -229,6 +229,5 @@ mod tests {
             paths.validate_group_size().is_err(),
             "a non-64 group must be rejected"
         );
-        std::fs::remove_dir_all(&root).ok();
     }
 }

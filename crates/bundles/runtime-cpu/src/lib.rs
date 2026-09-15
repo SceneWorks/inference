@@ -4,8 +4,24 @@
 pub use candle_audio_catalog::audio;
 #[cfg(feature = "media")]
 pub use candle_gen_catalog::media;
+#[cfg(feature = "media")]
+pub use candle_gen_catalog::vae_tiling;
 pub use candle_llm as llm;
-pub use runtime_catalog::{core_llm, gen_core, RuntimeCatalog, RuntimeCatalogSnapshot};
+pub use runtime_catalog::{
+    core_llm, gen_core, memory_strategy, RuntimeCatalog, RuntimeCatalogSnapshot,
+    VideoDecodeMemoryProfile,
+};
+
+#[cfg(feature = "media")]
+/// Resolve a provider-owned conservative VAE decode profile for contract-safe memory composition.
+pub fn conservative_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<VideoDecodeMemoryProfile> {
+    candle_gen_catalog::conservative_video_decode_memory_profile(provider_id, width, height, frames)
+}
 
 /// The Candle backend crates this platform owns, re-exported from the media catalog
 /// (available under the default `media` feature).
@@ -13,6 +29,11 @@ pub use runtime_catalog::{core_llm, gen_core, RuntimeCatalog, RuntimeCatalogSnap
 pub mod providers {
     pub use candle_gen_catalog::providers::*;
 }
+
+/// Descriptor-less provider memory routes that the CPU bundle intentionally reconciles outside the
+/// ordinary generator registry.
+#[cfg(feature = "media")]
+pub use candle_gen_catalog::{BespokeMemoryRouteWaiver, BESPOKE_MEMORY_ROUTE_WAIVERS};
 
 /// Platform label for this bundle; matches `RuntimeCatalog::platform`.
 pub const PLATFORM: &str = "cpu";
@@ -89,6 +110,33 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "media")]
+    #[test]
+    fn bundle_exposes_engine_id_vae_geometry() {
+        let tiling: super::gen_core::tiling::VaeTiling =
+            super::vae_tiling("bernini").expect("modelled video id");
+        assert_eq!(tiling.full_res_channels, 96);
+        assert!(tiling.causal_temporal);
+        assert_eq!(
+            super::conservative_video_decode_memory_profile("bernini", 64, 64, 9).map(|profile| (
+                profile.working_set_bytes(),
+                profile.resident_decoder_bytes_included(),
+            )),
+            Some((265_830_400, 0))
+        );
+
+        let svd = super::vae_tiling("svd_xt").expect("SVD decode geometry");
+        assert_eq!(svd, super::providers::svd::ProviderVae::VAE_TILING);
+        assert_eq!(svd.full_res_channels, 256);
+        assert_eq!(svd.writable_frame_cap(576, 1024), 14);
+        assert_eq!(svd.writable_frame_cap(1024, 576), 14);
+        assert_eq!(
+            super::conservative_video_decode_memory_profile("svd_xt", 1024, 576, 25),
+            None,
+            "the exact tiling geometry must not imply a budget-independent SVD peak profile"
+        );
+    }
+
     #[test]
     fn smoke_catalog_is_explicit_and_machine_readable() {
         let snapshot = super::catalog().unwrap().snapshot();
@@ -98,7 +146,10 @@ mod tests {
         assert!(snapshot.generator_ids.len() > 40);
         #[cfg(not(feature = "media"))]
         assert!(snapshot.generator_ids.is_empty());
-        assert_eq!(snapshot.text_llm_ids, ["candle-llama", "candle-llava"]);
+        assert_eq!(
+            snapshot.text_llm_ids,
+            ["candle-llama", "candle-llava", "candle-starvector-1b"]
+        );
         assert_eq!(snapshot.snapshot_preparer_backends, ["candle"]);
         // The audio lane is Candle-native (sc-12901) and matches this bundle's own backend. Its
         // ordered id surface is the audio catalog's — shipped generators kokoro_82m (sc-12836),
@@ -170,6 +221,9 @@ mod tests {
 
         fn dummy_audio_descriptor() -> gen_core::ModelDescriptor {
             gen_core::ModelDescriptor {
+                encoder_contract: None,
+                denoiser_output_latent_space: None,
+                control_kinds: None,
                 required_components: &[],
                 id: "dummy-audio",
                 family: "test-audio",
@@ -275,6 +329,50 @@ mod tests {
             assert!(
                 candle_gen_catalog::nvfp4_quant_tiers().is_empty(),
                 "the supported CPU-only resolution must NOT surface the NVFP4 tier"
+            );
+        }
+    }
+
+    #[cfg(feature = "media")]
+    #[test]
+    fn cpu_bundle_reexports_the_exact_bespoke_memory_route_waiver() {
+        // Shape, not population. This used to destructure `[waiver]` and pin `pulid_flux`/`pulid`,
+        // so a second legitimate bespoke route went RED with nothing actually broken — and, because
+        // the table reaches this bundle through a plain `pub use`, re-checking those ids proved only
+        // what the compiler already had. The load-bearing claim is that each waived route really is
+        // absent from *this* bundle's composed registry: that absence is what the waiver documents,
+        // and it is what a bundle that quietly grew a registration would break.
+        let waivers: &[super::BespokeMemoryRouteWaiver] = super::BESPOKE_MEMORY_ROUTE_WAIVERS;
+        assert!(
+            !waivers.is_empty(),
+            "the CPU bundle exposes descriptor-less memory routes; an empty waiver table would make \
+             every check below vacuous"
+        );
+        let registry = super::media_registry().expect("CPU media registry");
+        assert!(
+            registry.generators().next().is_some(),
+            "an empty registry would make every absence check below vacuously true"
+        );
+        for waiver in waivers {
+            assert_eq!(
+                waiver.owner,
+                format!("candle-gen-{}", waiver.crate_name),
+                "a waiver's owner must be the crate that owns the route"
+            );
+            assert!(
+                registry.generators().all(|registration| {
+                    let id = (registration.descriptor)().id;
+                    id != waiver.provider_id && id != waiver.crate_name
+                }),
+                "waived route {:?} has a generator registration in the CPU bundle after all",
+                waiver.provider_id
+            );
+            assert!(
+                registry
+                    .memory_strategy_registrations()
+                    .all(|registration| registration.provider_id != waiver.provider_id),
+                "waived route {:?} has a memory-strategy registration in the CPU bundle after all",
+                waiver.provider_id
             );
         }
     }

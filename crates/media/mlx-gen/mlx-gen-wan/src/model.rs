@@ -4,7 +4,7 @@
 //! channel-concat image conditioning, in_dim 36 — sc-2681), plus their registry self-registration.
 //!
 //! The 5B [`Wan`] struct runs the complete dense pipeline (sc-2680) — [`Wan::generate`]: UMT5-XXL
-//! encode → the dense [`denoise`] (T2V) or the [`denoise_ti2v`] per-token mask-blend (TI2V, single- or
+//! encode → the dense [`crate::pipeline::denoise`] (T2V) or the [`denoise_ti2v`] per-token mask-blend (TI2V, single- or
 //! multi-keyframe) → z48 VAE decode → RGB8 frames, with Q4/Q8 + LoRA. The shared [`Wan14b`] struct
 //! serves both A14B variants — [`Wan14b::generate`] runs the
 //! complete pipeline: UMT5-XXL encode → (I2V only) build the channel-concat conditioning `y` →
@@ -16,6 +16,10 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::gen_core::{
+    adapter_stack_resident_bytes, AdapterResidencyMode, ApproximationPlan, ApproximationSurface,
+};
+use mlx_gen::tiling::VaeTiling;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     AdapterSpec, CancelFlag, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
@@ -30,19 +34,43 @@ use crate::adapters::{
     WanLoraReport,
 };
 use crate::config::{WanModelConfig, WanQuant, MIN_SIZE};
+use crate::feature_cache::TrunkCache;
 use crate::pipeline::{
-    align_dim, auto_tiling_budgeted, auto_tiling_budgeted_z16, build_i2v_y, build_ti2v_keyframe_z,
-    build_ti2v_mask, build_ti2v_multi_mask, crossing_index, decode_to_frames, decode_to_frames_22,
-    denoise, denoise_curated, denoise_moe, denoise_moe_curated, denoise_moe_curated_swapped,
-    denoise_range, denoise_ti2v, frames_to_images, latent_shape, preflight_denoise_memory_guard,
-    preprocess_ti2v_image, reject_off_grid, reject_over_area, resolve_sampler_knobs, seq_len,
-    staged_expert_swap, ti2v_blend_init, Expert,
+    align_dim, auto_tiling_budgeted_z16, build_i2v_y, build_ti2v_keyframe_z, build_ti2v_mask,
+    crossing_index, decode_to_frames, decode_to_frames_22, denoise_approx, denoise_curated,
+    denoise_moe, denoise_moe_curated, denoise_moe_curated_swapped, denoise_range, denoise_ti2v,
+    frames_to_images, latent_shape, preflight_denoise_memory_guard, preprocess_ti2v_image,
+    refuse_unwired_approximation, reject_off_grid, reject_over_area, resolve_sampler_knobs,
+    seq_len, staged_expert_swap, ti2v_blend_init, Expert,
 };
 use crate::scheduler::{make_scheduler, SolverKind, WanScheduler};
 use crate::text_encoder::encode_text_staged_for_tier;
+use crate::token_pruning::TokenPruner;
 use crate::transformer::WanTransformer;
-use crate::vae::WanVae;
-use crate::vae22::Wan22Vae;
+
+/// Concrete z48 VAE assigned to the TI2V-5B route.
+pub type Ti2vProviderVae = crate::vae22::Wan22Vae;
+/// Concrete z16 VAE assigned to both A14B routes.
+pub type A14bProviderVae = crate::vae::WanVae;
+
+const fn provider_vae_stride(vae: VaeTiling) -> (usize, usize, usize) {
+    (
+        vae.temporal_scale as usize,
+        vae.spatial_scale as usize,
+        vae.spatial_scale as usize,
+    )
+}
+
+/// Resolve the TI2V-5B route's load-bearing VAE geometry.
+pub fn ti2v_vae_tiling(provider_id: &str) -> Option<mlx_gen::tiling::VaeTiling> {
+    (provider_id == MODEL_ID).then_some(Ti2vProviderVae::VAE_TILING)
+}
+
+/// Resolve either A14B route's load-bearing VAE geometry.
+pub fn a14b_vae_tiling(provider_id: &str) -> Option<mlx_gen::tiling::VaeTiling> {
+    matches!(provider_id, MODEL_ID_T2V_14B | MODEL_ID_I2V_14B)
+        .then_some(A14bProviderVae::VAE_TILING)
+}
 
 /// The curated unified solvers (epic 7114, sc-7121) every Wan generator exposes ADDITIVELY beyond its
 /// native solvers — the gen-core-only solvers, routed through `run_flow_sampler` over Wan's own flow-σ
@@ -65,6 +93,27 @@ const WAN_NATIVE_SAMPLERS: [&str; 3] = ["uni_pc", "euler", "dpmpp_2m"];
 /// they map to the same native solvers via [`crate::scheduler::SolverKind::from_name`]. The SceneWorks
 /// manifest surfaces only the curated names.
 const WAN_LEGACY_SAMPLERS: [&str; 2] = ["unipc", "dpmpp2m"];
+
+/// The dense-5B decode plan. A benchmark scope's fixed-tile control still wins outright — it exists to
+/// hold tiles constant across a measurement campaign — and otherwise this defers to the carrier-aware
+/// planner, which honors a worker-selected bounded-decode rung and falls back to
+/// `auto_tiling_budgeted` when the request carries no memory strategy.
+fn dense_decode_tiling(
+    request: &GenerationRequest,
+    width: u32,
+    height: u32,
+    out_frames: u32,
+) -> Result<Option<mlx_gen::TilingConfig>> {
+    match mlx_gen::diagnostics::benchmark_decode_control() {
+        Some(control) => Ok(Some(control.tiling_config())),
+        None if request.video_mode.as_deref() == Some("image_to_video")
+            && request.memory.is_some() =>
+        {
+            crate::i2v_memory_strategy::decode_tiling(request, width, height, out_frames)
+        }
+        None => crate::memory_strategy::decode_tiling(request, width, height, out_frames),
+    }
+}
 
 /// Wan's full per-generation sampler menu: native solvers (curated vocabulary) + the curated gen-core
 /// fold-ins + the legacy aliases.
@@ -95,6 +144,9 @@ pub const MODEL_ID: &str = "wan2_2_ti2v_5b";
 /// Stable identity + advertised capabilities for the Wan2.2 TI2V-5B (dense text+image→video).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::WAN_Z48_LATENT_SPACE),
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "wan",
@@ -107,7 +159,6 @@ pub fn descriptor() -> ModelDescriptor {
             // mask-blend, pinning the listed latent frames instead of only frame 0.
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             conditioning: vec![ConditioningKind::Reference, ConditioningKind::Keyframe],
             // Q4/Q8 (sc-2682) loads via `spec.quantize` (transformer-only); LoRA/LoKr merge onto the
             // single dense model at generate time (the reference `_loras_single` path — shared
@@ -115,7 +166,6 @@ pub fn descriptor() -> ModelDescriptor {
             supports_lora: true,
             supports_lokr: true,
             samplers: wan_samplers(),
-            schedulers: Vec::new(),
             // H/W align to patch×vae_stride = 32 (`reject_off_grid`); floor each side at MIN_SIZE = 480
             // (= 15·32 — the z48 vae22 renders garbage below a 15×15 latent grid, sc-10306/sc-12636),
             // matching candle; cap the long edge at 1280 (max_area 704×1280).
@@ -125,6 +175,7 @@ pub fn descriptor() -> ModelDescriptor {
             max_count: 1,
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
+            component_precision_floors: crate::memory_strategy::COMPONENT_PRECISION_FLOORS,
             // Cross-attention text K/V is cached across denoise steps.
             supports_kv_cache: true,
             // Wan pins a static `sample_shift` from config (not the empirical per-resolution mu).
@@ -136,19 +187,123 @@ pub fn descriptor() -> ModelDescriptor {
             // wired-memory pressure) through denoise + decode. Advertised so the worker's fit-gate can
             // tell "bounds footprint here" from a no-op fallback.
             supports_sequential_offload: true,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            // TE → DiT → z48 VAE is phase-staged on every request; Sequential additionally flushes
+            // dead allocator cache between those already-staged phases.
+            unconditionally_engages_staged_residency: true,
+            // The sc-18322 denoise feature cache, declared on the dense 5B alone: it is the one Wan
+            // provider with a single transformer for the whole trajectory (no MoE expert swap to
+            // invalidate a retained residual across) and a native one-forward-per-step loop with a step
+            // index. Implemented in `crate::feature_cache`, wired into `pipeline::denoise_approx`.
+            //
+            // Declared is NOT selectable. No characterization artifact family exists yet, so the shared
+            // floor refuses every selection against this surface — see `gen_core::approximation`. The
+            // declaration is what makes the mechanism discoverable and what the terminal measurement
+            // campaign narrows from these candidate intervals to the ones it can vouch for.
+            approximation: approximation_surface(),
+            ..Default::default()
         },
     }
+}
+
+/// The dense 5B's declared approximate-capability surface (sc-18322).
+///
+/// The candidate intervals are the mechanism's implemented operating points, not measured ones — the
+/// domain shape carries no measurement claim, and the characterization binding (absent, and
+/// unconstructible) is what refuses selection until one exists. Warmup is capped at 8 steps because the
+/// native Wan trajectories run 20-50 steps and a warmup past a third of them leaves nothing to reuse.
+pub(crate) fn approximation_surface() -> ApproximationSurface {
+    ApproximationSurface::feature_cache(vec![2, 3, 4], 8).with_token_pruning(vec![2, 3, 4], 8)
+}
+
+/// The denoise feature cache a resolved plan asks for — the provider-side bridge from contract to
+/// mechanism (sc-18322).
+///
+/// Deliberately two definitions rather than one with an inner `cfg`, so the production answer is
+/// visibly and unconditionally `None`: [`TrunkCache`]'s only constructor is `#[cfg(test)]`, so a
+/// production build cannot reach the uncharacterized path even if it somehow held a
+/// [`ApproximationPlan::Approximate`]. That is the second of two independent locks — the first is the
+/// contract refusing every approximate selection for want of a characterization artifact.
+/// Both bridges first run [`refuse_inert_over_trajectory`], because the step count is only known here.
+#[cfg(not(test))]
+fn trunk_cache(id: &str, plan: &ApproximationPlan, steps: usize) -> Result<Option<TrunkCache>> {
+    refuse_inert_over_trajectory(id, plan, steps)?;
+    Ok(None)
+}
+
+#[cfg(test)]
+fn trunk_cache(id: &str, plan: &ApproximationPlan, steps: usize) -> Result<Option<TrunkCache>> {
+    refuse_inert_over_trajectory(id, plan, steps)?;
+    Ok(TrunkCache::from_plan_for_test(plan))
+}
+
+/// The token pruner a resolved plan asks for — the second provider-side bridge, locked exactly like
+/// [`trunk_cache`] (sc-18322). `total` is the generate's patchified token count, which the rotation
+/// phases are built over.
+#[cfg(not(test))]
+fn token_pruner(
+    id: &str,
+    plan: &ApproximationPlan,
+    steps: usize,
+    _total: usize,
+) -> Result<Option<TokenPruner>> {
+    refuse_inert_over_trajectory(id, plan, steps)?;
+    Ok(None)
+}
+
+#[cfg(test)]
+fn token_pruner(
+    id: &str,
+    plan: &ApproximationPlan,
+    steps: usize,
+    total: usize,
+) -> Result<Option<TokenPruner>> {
+    refuse_inert_over_trajectory(id, plan, steps)?;
+    TokenPruner::from_plan_for_test(plan, total)
+}
+
+/// Refuse an approximate policy that would engage on **no step** of this request's trajectory
+/// (sc-18322).
+///
+/// The last way to encode *off* inside an `Approximate` plan. A warmup is gated against the declared
+/// `max_warmup_steps` without knowing the step count — a request may leave `steps` to the model's default
+/// — so a policy well inside its declared domain can still cover the whole trajectory and produce a
+/// result bit-identical to the exact path. That is exactly the second-encoding-of-off defect that
+/// rejecting a reuse interval of `1` exists to prevent, and letting it through here would make the
+/// contract's own "an approximate plan changed the output" claim false.
+///
+/// This is the one place the step count and the policy are both in hand, so it is the one place the
+/// refusal can be made. Unreachable today (no plan reaching a provider can be anything but `Exact`), and
+/// it fails closed the day selection becomes possible.
+pub(crate) fn refuse_inert_over_trajectory(
+    id: &str,
+    plan: &ApproximationPlan,
+    steps: usize,
+) -> Result<()> {
+    if let Some(policy) = plan.feature_cache() {
+        if policy.is_inert_over(steps) {
+            return Err(Error::Unsupported(format!(
+                "{id}: the selected denoise feature cache (interval {} steps, warmup {}) reuses \
+                 nothing over this request's {steps} steps, so it would produce the exact result \
+                 through the approximate path. Lower the warmup, raise the step count, or leave \
+                 approximation unset.",
+                policy.reuse_interval.steps(),
+                policy.warmup.steps()
+            )));
+        }
+    }
+    if let Some(policy) = plan.token_pruning() {
+        if policy.is_inert_over(steps) {
+            return Err(Error::Unsupported(format!(
+                "{id}: the selected token pruning (drop stride {}, warmup {}) prunes nothing over \
+                 this request's {steps} steps, so it would produce the exact result through the \
+                 approximate path. Lower the warmup, raise the step count, or leave approximation \
+                 unset.",
+                policy.drop_stride.stride(),
+                policy.warmup.steps()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The projection width the UMT5 text encoder packs to on a quantized tier: **Q8** (sc-12831). Q8 is
@@ -158,7 +313,7 @@ pub fn descriptor() -> ModelDescriptor {
 /// GiB** — well under the epic's <16 GB-with-margin target — so we floor the TE at Q8 even when the DiT
 /// tier is Q4: the user's Q4 *DiT* creative choice is untouched, and the TE stays regression-free (the
 /// extra ~2 GiB a Q4 TE would save is not needed and not worth the drift).
-const TE_QUANT_BITS: i32 = 8;
+pub(crate) const TE_QUANT_BITS: i32 = 8;
 
 /// The effective UMT5 text-encoder quantization for a Wan tier (sc-12831). The DiT is packed on an
 /// MLX-affine tier iff a pre-quantized snapshot manifest is present (`config.quantization`) **or** a
@@ -202,6 +357,12 @@ pub struct Wan {
     /// follow — bounding the unified-memory RSS / wired footprint. No expert swap (single dense DiT).
     /// Captured from [`LoadSpec::offload_policy`] at load.
     offload_policy: OffloadPolicy,
+    /// Load-exact memory contract and numeric tier for the one calibrated plain Resident/Eager
+    /// route. Other supported Wan loads remain available but deliberately publish no contract.
+    memory_strategy: Option<mlx_gen::gen_core::MemoryProviderContract>,
+    memory_tier: Option<mlx_gen::gen_core::MemoryNumericTier>,
+    /// Exact provider-owned public-I2V artifact and adapter receipt, when the caller prepared one.
+    i2v_memory: Option<crate::i2v_memory_strategy::PreparedWanI2vMemory>,
 }
 
 impl Wan {
@@ -301,6 +462,17 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         )));
     }
     let quant = resolve_load_time_quant(MODEL_ID, &config, spec.quantize)?;
+    let memory = crate::memory_strategy::contract_for_loaded(spec).map_err(Error::from)?;
+    let (memory_strategy, memory_tier) = memory
+        .map(|(contract, tier)| (Some(contract), Some(tier)))
+        .unwrap_or((None, None));
+    let i2v_memory = if spec.resolved_route.as_deref() == Some(MODEL_ID)
+        && spec.prepared_file_pins().is_prepared()
+    {
+        Some(crate::i2v_memory_strategy::prepare(spec, MODEL_ID).map_err(Error::from)?)
+    } else {
+        None
+    };
     Ok(Box::new(Wan {
         descriptor: descriptor(),
         config,
@@ -308,13 +480,74 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         adapters: spec.adapters.clone(),
         quant,
         offload_policy: spec.offload_policy,
+        memory_strategy,
+        memory_tier,
+        i2v_memory,
     }))
 }
 
-mlx_gen::impl_generator!(Wan {
-    validate: |s, req| s.validate_impl(req),
-    generate: generate_impl,
-});
+// Hand-written so the load-exact SC-19236 contract is a property of the loaded provider. The
+// descriptor/validation/generation arms are otherwise the same delegation emitted by
+// `impl_generator!` for the other Wan routes.
+impl Generator for Wan {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        self.validate_impl(req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        self.i2v_memory
+            .as_ref()
+            .map(|prepared| &prepared.contract)
+            .or(self.memory_strategy.as_ref())
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        if let Some(prepared) = &self.i2v_memory {
+            return crate::i2v_memory_strategy::safety_check(prepared, context);
+        }
+        let (Some(contract), Some(tier)) = (self.memory_strategy.as_ref(), self.memory_tier) else {
+            return if context.selection.strategy == mlx_gen::gen_core::MemoryStrategy::Resident {
+                mlx_gen::gen_core::MemorySafetyDecision::Accept
+            } else {
+                mlx_gen::gen_core::MemorySafetyDecision::Reject {
+                    reason: format!(
+                        "{MODEL_ID} loaded route has no calibrated memory-strategy contract"
+                    ),
+                }
+            };
+        };
+        crate::memory_strategy::safety_check(contract, tier, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        if let Some(prepared) = &self.i2v_memory {
+            return crate::i2v_memory_strategy::begin_request(prepared, context);
+        }
+        let (Some(contract), Some(tier)) = (self.memory_strategy.as_ref(), self.memory_tier) else {
+            return Ok(None);
+        };
+        crate::memory_strategy::begin_request(contract, tier, context)
+    }
+}
 
 impl Wan {
     /// Validate body — kept on the crate's own [`mlx_gen::Error`] so `?` on the capability check
@@ -346,9 +579,13 @@ impl Wan {
         // request means one geometry on both backends. sc-12607: the 32-px grid stride (candle rejects
         // via `is_multiple_of(SIZE_MULTIPLE)`). sc-12308: the 5B's OWN 901 120 area budget — its 32-px
         // grid makes 1280×704 the geometry it genuinely renders.
-        let (dw, dh) = grid(&self.config);
+        let (dw, dh) = grid(&self.config, Ti2vProviderVae::VAE_TILING);
         reject_off_grid(MODEL_ID, req, dw, dh)?;
         reject_over_area(MODEL_ID, req, dw, dh, self.config.max_area)?;
+        // sc-19571: the conditioning strengths now reach the mask builder, so their range is load
+        // bearing — reject out-of-range/non-finite here rather than letting `1 − strength` become a
+        // negative mask deep in the denoise.
+        reject_out_of_range_strengths(MODEL_ID, req)?;
         // The TI2V mask-blend path (the `ti2v = Some(_)` branch of `generate_impl`) is entered by
         // Keyframe conditioning OR a Reference image — the contract checks below must cover both.
         let image_conditioned = !req.keyframes().is_empty() || i2v_reference(req).is_some();
@@ -398,7 +635,7 @@ impl Wan {
     /// then **stages** the phases to bound memory: (1) UMT5 encode the prompt (+ neg, unless CFG is
     /// off); (1b, TI2V) load the z48 vae22, encode the conditioning image → `z_img`, build the
     /// first-frame mask + per-token mask, blend the noise init; (2) load the 5B DiT (merge adapters,
-    /// quantize), embed the contexts, run the dense [`denoise`] (T2V) or [`denoise_ti2v`] mask-blend
+    /// quantize), embed the contexts, run the dense [`crate::pipeline::denoise`] (T2V) or [`denoise_ti2v`] mask-blend
     /// loop; (3) load the vae22 decoder → RGB8 frames. CFG runs with the single guidance scale.
     fn generate_impl(
         &self,
@@ -408,6 +645,22 @@ impl Wan {
         // Reject anything outside the advertised surface before doing expensive work — in particular
         // an unknown `sampler`, which `solver_kind` would otherwise silently map to UniPC.
         self.validate(req)?;
+        if let Some(prepared) = &self.i2v_memory {
+            crate::i2v_memory_strategy::validate_active_request(prepared, req)
+                .map_err(Error::from)?;
+        }
+        // The resolved approximate-capability plan (sc-18322). `validate` already ran the same
+        // resolution at the shared floor, so this cannot fail here; resolving again is how the route
+        // dispatch below gets a plan without re-reading the request and re-deriving a policy.
+        //
+        // Always `Exact` today — the contract refuses every approximate selection until a
+        // quality-characterization artifact family exists — but the three unwired routes refuse a
+        // non-exact plan **by name** rather than by omission, so the day selection becomes possible they
+        // fail closed instead of silently running the exact denoise.
+        let approximation = self
+            .descriptor
+            .capabilities
+            .approximation_plan(self.descriptor.id, req)?;
         let cfg = &self.config;
         // Sequential offload (epic 12732, sc-12796): the dense render is already staged (TE → DiT → z48
         // VAE, each loaded → used → dropped in turn), so there is no expert swap. Under `Sequential`,
@@ -415,14 +668,16 @@ impl Wan {
         // freed UMT5 TE / VAE-encoder don't linger in MLX's buffer cache (RSS / wired footprint) through
         // the denoise + decode that follow. `Resident` (default) leaves the cache warm — the
         // byte-identical pre-offload path (residency/lifetime change only, numerics untouched).
-        let sequential = self.offload_policy == OffloadPolicy::Sequential;
+        let sequential = self.offload_policy == OffloadPolicy::Sequential
+            || crate::i2v_memory_strategy::staged(req);
 
         // --- Resolve request knobs against config defaults ---
         let frames = req.frames.map(|f| f as usize).unwrap_or(cfg.frame_num);
         let trim = req.trim_first_frames.unwrap_or(0) as usize;
-        let trim_out = trim * cfg.vae_stride.0; // discarded output frames = trim · 4
+        let vae_stride = provider_vae_stride(Ti2vProviderVae::VAE_TILING);
+        let trim_out = trim * vae_stride.0; // discarded output frames = trim · 4
         let gen_frames = frames + trim_out;
-        let (width, height) = resolve_capped_dims(req, cfg);
+        let (width, height) = resolve_capped_dims(req, cfg, Ti2vProviderVae::VAE_TILING);
         let (steps, shift, kind, seed) =
             resolve_sampler_knobs(req, cfg.sample_steps, cfg.sample_shift);
         // The 5B is dense → a single guidance scale (config Single(5.0), overridable per request).
@@ -433,7 +688,7 @@ impl Wan {
             .clone()
             .unwrap_or_else(|| cfg.sample_neg_prompt.clone());
 
-        let lat = latent_shape(gen_frames, height, width, cfg.vae_z_dim, cfg.vae_stride)?;
+        let lat = latent_shape(gen_frames, height, width, cfg.vae_z_dim, vae_stride)?;
 
         // sc-4986 — fail fast (catchable) if the DiT-denoise stage won't fit, before any heavy load.
         // sc-12796: this is policy-INdependent for the dense 5B (unlike the A14B's `moe_denoise_resident_bytes`,
@@ -441,9 +696,24 @@ impl Wan {
         // resident during denoise under both `Resident` and `Sequential` — the TE/VAE are staged out
         // either way; `Sequential` only additionally `clear_cache`-flushes their dead buffers — so the
         // single-DiT byte count is already the correct budget for both policies.
+        let adapter_bytes = adapter_stack_resident_bytes(
+            &self.adapters,
+            if self.config.quantization.is_some() {
+                AdapterResidencyMode::Additive
+            } else {
+                AdapterResidencyMode::Folded
+            },
+        )
+        .ok_or_else(|| {
+            Error::Msg(format!(
+                "{}: cannot size every additive adapter before the denoise fit gate",
+                self.descriptor.id
+            ))
+        })?;
         preflight_denoise_memory_guard(
             self.descriptor.id,
-            dit_resident_bytes(&[self.root.join("model.safetensors")], self.quant),
+            dit_resident_bytes(&[self.root.join("model.safetensors")], self.quant)
+                .saturating_add(adapter_bytes),
             seq_len(lat, cfg.patch_size),
             cfg.dim,
             !cfg_disabled,
@@ -454,8 +724,11 @@ impl Wan {
         // catchably *before* the heavy denoise rather than OOM-ing in the post-loop decode stage.
         // sc-5039 — the decode runs **bf16** (visually lossless, cosine 0.999954 real-weight; lower
         // peak ⇒ the budget fits bigger tiles), so the plan uses the bf16 cost coefficient.
+        let out_frames = 1 + (lat[1] - 1) * Ti2vProviderVae::VAE_TILING.temporal_scale;
+        let out_height = lat[2] * Ti2vProviderVae::VAE_TILING.spatial_scale;
+        let out_width = lat[3] * Ti2vProviderVae::VAE_TILING.spatial_scale;
         let decode_tiling =
-            auto_tiling_budgeted(height as i32, width as i32, gen_frames as i32, true)?;
+            dense_decode_tiling(req, out_width as u32, out_height as u32, out_frames as u32)?;
 
         // --- Stage 1: UMT5 text encode (loaded → used → freed) ---
         let (context, context_null) = encode_text_staged_for_tier(
@@ -486,58 +759,47 @@ impl Wan {
         // (`[z,T,h,w]`, 0 at frame 0) + per-token mask (`[1,L]`), and blend `(1−mask)·z_img +
         // mask·noise`. Without an image this is pure-noise T2V.
         // Channels-first `[z,1,h,w]` latent for one preprocessed TI2V image (z48-VAE-encode → reshape).
-        let encode_kf = |vae: &Wan22Vae, image: &Image| -> Result<Array> {
+        let encode_kf = |vae: &Ti2vProviderVae, image: &Image| -> Result<Array> {
             let img_thwc = preprocess_ti2v_image(image, width, height)?; // [1,1,H,W,3]
             let z = vae.encode(&img_thwc)?; // [1,1,h,w,z]
             Ok(z.reshape(&z.shape()[1..])?.transpose_axes(&[3, 0, 1, 2])?) // [z,1,h,w]
         };
         let (t_lat, h_lat, w_lat) = (lat[1] as usize, lat[2] as usize, lat[3] as usize);
         let keyframes = req.keyframes();
-        let (latents_init, ti2v) = if !keyframes.is_empty() {
-            // Wan-native first_last_frame / multi-keyframe (sc-3357): pin each Keyframe's latent frame
-            // via the mask-blend (frame_idx is a latent index, negative-from-end → `-1` = last frame).
-            let w = Weights::from_file(self.root.join("vae.safetensors"))?;
-            let vae = Wan22Vae::from_weights(&w)?;
-            let mut frames: Vec<(Array, usize)> = Vec::with_capacity(keyframes.len());
-            let mut indices: Vec<usize> = Vec::with_capacity(keyframes.len());
-            for kf in &keyframes {
-                let idx = if kf.frame_idx < 0 {
-                    t_lat as i32 + kf.frame_idx
+        // **The seam** (sc-19571). Every conditioning strength the request carries is resolved into
+        // `(latent_frame, strength)` pins HERE, once, and the mask builder below is driven by these
+        // and by nothing else — so a strength cannot be "accepted at the boundary and defaulted on
+        // the way in" the way it was when the builder took bare indices. `resolve_ti2v_pins` is pure
+        // and unit-tested against non-default strengths (`ti2v_pins_carry_*`).
+        let pins = resolve_ti2v_pins(req, t_lat)?;
+        let (latents_init, ti2v) = if pins.is_empty() {
+            (init_noise.clone(), None)
+        } else {
+            // Wan-native first_last_frame / multi-keyframe (sc-3357) or a single `Reference` image:
+            // encode the conditioning frame(s), scatter them into the clean latent, then mask-blend.
+            // The VAE encoder is scoped to this block so it drops before the mask build (sc-12796).
+            let z = {
+                let w = Weights::from_file(self.root.join("vae.safetensors"))?;
+                let vae = Ti2vProviderVae::from_weights(&w)?;
+                if keyframes.is_empty() {
+                    // `[z,1,h,w]` — broadcasts over T_lat in the blend (the pin is frame 0).
+                    let (image, _) = i2v_reference(req).expect("pins are non-empty");
+                    encode_kf(&vae, image)?
                 } else {
-                    kf.frame_idx
-                };
-                if idx < 0 || idx as usize >= t_lat {
-                    return Err(Error::Msg(format!(
-                        "wan2_2_ti2v_5b: keyframe latent frame index {} out of bounds for {t_lat} \
-                         latent frames",
-                        kf.frame_idx
-                    )));
+                    // Positional with `pins`: `resolve_ti2v_pins` walks `req.keyframes()` in the same
+                    // request order, so `pins[i]` is this keyframe's resolved latent frame.
+                    let mut frames: Vec<(Array, usize)> = Vec::with_capacity(keyframes.len());
+                    for (kf, &(idx, _)) in keyframes.iter().zip(pins.iter()) {
+                        frames.push((encode_kf(&vae, kf.image)?, idx));
+                    }
+                    build_ti2v_keyframe_z(&frames, cfg.vae_z_dim, t_lat, h_lat, w_lat)?
                 }
-                frames.push((encode_kf(&vae, kf.image)?, idx as usize));
-                indices.push(idx as usize);
-            }
-            let z = build_ti2v_keyframe_z(&frames, cfg.vae_z_dim, t_lat, h_lat, w_lat)?;
+            };
             let (mask, mask_tokens) =
-                build_ti2v_multi_mask(&indices, cfg.vae_z_dim, t_lat, h_lat, w_lat, cfg.patch_size);
+                build_ti2v_mask(&pins, cfg.vae_z_dim, t_lat, h_lat, w_lat, cfg.patch_size);
             let latents = ti2v_blend_init(&z, &mask, &init_noise)?;
             mlx_rs::transforms::eval([&latents, &z])?;
             (latents, Some((z, mask, mask_tokens)))
-        } else {
-            match i2v_reference(req) {
-                Some(image) => {
-                    let z_img = {
-                        let w = Weights::from_file(self.root.join("vae.safetensors"))?;
-                        let vae = Wan22Vae::from_weights(&w)?;
-                        encode_kf(&vae, image)?
-                    };
-                    let (mask, mask_tokens) =
-                        build_ti2v_mask(cfg.vae_z_dim, t_lat, h_lat, w_lat, cfg.patch_size);
-                    let latents = ti2v_blend_init(&z_img, &mask, &init_noise)?;
-                    mlx_rs::transforms::eval([&latents, &z_img])?;
-                    (latents, Some((z_img, mask, mask_tokens)))
-                }
-                None => (init_noise.clone(), None),
-            }
         };
         // sc-12796: the TI2V/keyframe path above loads the z48 VAE **encoder** to encode the reference
         // image(s), then drops it at the brace (`latents_init`/`z` are eval'd and independent of it).
@@ -574,6 +836,12 @@ impl Wan {
                 None => None,
             };
             let total = steps as u32;
+            // Provider-neutral benchmark boundary: model construction, adapter/quant work, and
+            // context embedding above are pre-denoise preparation. Emit only when the solver is
+            // ready to consume its first latent, matching Qwen and SDXL.
+            mlx_gen::diagnostics::record_phase_boundary(
+                mlx_gen::diagnostics::BenchmarkPhaseBoundary::DenoiseStart,
+            );
             // Curated unified solver (epic 7114, sc-7121): the gen-core-only solvers route through the
             // shared `denoise_curated`; the native unipc/euler/dpmpp2m stay on `scheduler.rs` (N1). The
             // image-conditioned TI2V mask-blend (per-token timesteps + a post-step re-blend) has no
@@ -589,6 +857,13 @@ impl Wan {
                     ));
                 }
                 (Some((z_img, mask, mask_tokens)), false) => {
+                    // Unwired for the denoise feature cache: the mask-blend re-mixes the conditioning
+                    // latent into the trajectory after every step (sc-18322).
+                    refuse_unwired_approximation(
+                        self.descriptor.id,
+                        "TI2V mask-blend",
+                        &approximation,
+                    )?;
                     let mut on_step = |i: usize| {
                         on_progress(Progress::Step {
                             current: i as u32,
@@ -612,20 +887,29 @@ impl Wan {
                         &mut on_step,
                     )?
                 }
-                (None, true) => denoise_curated(
-                    &dit,
-                    req.sampler.as_deref().expect("is_wan_curated ⇒ Some"),
-                    cfg.num_train_timesteps,
-                    steps,
-                    shift,
-                    guidance,
-                    &ctx_cond,
-                    ctx_uncond.as_ref(),
-                    &latents_init,
-                    seed,
-                    &req.cancel,
-                    on_progress,
-                )?,
+                (None, true) => {
+                    // Unwired: a curated solver evaluates the model 1..N times per solver step, so
+                    // "the previous step's residual" has no single meaning (sc-18322).
+                    refuse_unwired_approximation(
+                        self.descriptor.id,
+                        "curated unified solver",
+                        &approximation,
+                    )?;
+                    denoise_curated(
+                        &dit,
+                        req.sampler.as_deref().expect("is_wan_curated ⇒ Some"),
+                        cfg.num_train_timesteps,
+                        steps,
+                        shift,
+                        guidance,
+                        &ctx_cond,
+                        ctx_uncond.as_ref(),
+                        &latents_init,
+                        seed,
+                        &req.cancel,
+                        on_progress,
+                    )?
+                }
                 (None, false) => {
                     let mut on_step = |i: usize| {
                         on_progress(Progress::Step {
@@ -633,7 +917,21 @@ impl Wan {
                             total,
                         })
                     };
-                    denoise(
+                    // The one wired route: native dense T2V, one forward per step over one
+                    // transformer, with the step index in hand (sc-18322). Neither `TrunkCache` nor
+                    // `TokenPruner` has a production constructor, so both are `None` in every non-test
+                    // build — the plan being `Exact` is the contract-level reason, this is the
+                    // mechanism-level one. The step count is only known here, which is why the
+                    // inert-over-the-trajectory refusal lives in these two bridges.
+                    let grid = dit.patch_grid(&latents_init);
+                    let mut trunk = trunk_cache(self.descriptor.id, &approximation, steps)?;
+                    let mut prune = token_pruner(
+                        self.descriptor.id,
+                        &approximation,
+                        steps,
+                        grid.0 * grid.1 * grid.2,
+                    )?;
+                    denoise_approx(
                         &dit,
                         kind,
                         cfg.num_train_timesteps,
@@ -645,6 +943,8 @@ impl Wan {
                         &latents_init,
                         &req.cancel,
                         &mut on_step,
+                        trunk.as_mut(),
+                        prune.as_mut(),
                     )?
                 }
             }
@@ -660,6 +960,9 @@ impl Wan {
         }
 
         // --- Stage 3: z48 vae22 decode → RGB8 frames ---
+        mlx_gen::diagnostics::record_phase_boundary(
+            mlx_gen::diagnostics::BenchmarkPhaseBoundary::DecodeStart,
+        );
         on_progress(Progress::Decoding);
         // Causal temporal decode: t_lat → 1 + (t_lat−1)·4 output frames (= gen_frames). The tiling
         // was chosen (and budget-checked) up front by `auto_tiling_budgeted` (sc-4998). sc-5039 casts
@@ -669,7 +972,7 @@ impl Wan {
         let frames_u8 = {
             let mut w = Weights::from_file(self.root.join("vae.safetensors"))?;
             w.cast_all(mlx_rs::Dtype::Bfloat16)?;
-            let vae = Wan22Vae::from_weights(&w)?;
+            let vae = Ti2vProviderVae::from_weights(&w)?;
             decode_to_frames_22(&vae, &latents, decode_tiling.as_ref(), Some(&req.cancel))?
         };
         let mut images = frames_to_images(&frames_u8)?;
@@ -703,6 +1006,9 @@ pub const MODEL_ID_T2V_14B: &str = "wan2_2_t2v_14b";
 /// Stable identity + advertised capabilities for the Wan2.2 T2V-A14B (dual-expert MoE text→video).
 pub fn descriptor_t2v_14b() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID_T2V_14B,
         family: "wan",
@@ -713,14 +1019,11 @@ pub fn descriptor_t2v_14b() -> ModelDescriptor {
             // prompt. Pure text→video: no image conditioning.
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
-            conditioning: Vec::new(),
             // LoRA + LoKr merge per-expert at generate time (sc-2683 / sc-2393, PEFT/kohya + LoKr,
             // MoE high/low); Q4/Q8 (sc-2682) loads via `spec.quantize` or a pre-quantized snapshot.
             supports_lora: true,
             supports_lokr: true,
             samplers: wan_samplers(),
-            schedulers: Vec::new(),
             // H/W align to patch×vae_stride = 16 (z16 VAE, spatial stride 8); long edge cap 1280.
             supported_guidance_methods: vec![],
             min_size: 16,
@@ -730,23 +1033,15 @@ pub fn descriptor_t2v_14b() -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8],
             // Cross-attention text K/V is cached across denoise steps (per expert).
             supports_kv_cache: true,
-            requires_sigma_shift: false,
             // A14B honors `OffloadPolicy::Sequential` (epic 12732, sc-12736): the staged expert swap
             // holds only the ACTIVE MoE expert resident (never both) and frees the UMT5 TE / VAE
             // off-GPU during denoise, dropping the unified-memory peak to ~one expert. Advertised so
             // the worker's fit-gate can tell "bounds peak here" from a no-op fallback.
             supports_sequential_offload: true,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            // TE/VAE and the active expert are phase-staged even under Resident; Sequential adds the
+            // stronger cache-flush/expert-residency controls described above.
+            unconditionally_engages_staged_residency: true,
+            ..Default::default()
         },
     }
 }
@@ -775,6 +1070,8 @@ pub struct Wan14b {
     /// peak to ~one expert. Advertised via `supports_sequential_offload` so the worker's fit-gate can
     /// select it under a memory ceiling. Captured from [`LoadSpec::offload_policy`] at load.
     offload_policy: OffloadPolicy,
+    /// Exact provider-owned public-I2V artifact and adapter receipt. Absent on direct T2V loads.
+    i2v_memory: Option<crate::i2v_memory_strategy::PreparedWanI2vMemory>,
 }
 
 impl Wan14b {
@@ -1066,6 +1363,36 @@ fn resolve_load_time_quant(
     }
 }
 
+/// The z16 decode tiling for one A14B render, from the decoded output dims.
+///
+/// A BoundedDecode the route's own contract admitted has to be REACHED: the sealed edge/overlap
+/// pair only ever comes out of [`crate::i2v_memory_strategy::decode_tiling`], never out of the auto
+/// selector. The I2V arm reaches it through its `image_to_video` mode; the T2V route has no such
+/// mode, so the `tile_vae_decode` knob is the second door — otherwise the T2V provider would
+/// publish a BoundedDecode contract, admit the rung, and silently decode with the auto tile
+/// (sc-22738). Everything else keeps the z16 selector, which is the A14B autoencoder's own cost
+/// model.
+pub(crate) fn a14b_decode_tiling(
+    req: &GenerationRequest,
+    out_width: i32,
+    out_height: i32,
+    out_frames: i32,
+) -> Result<Option<mlx_gen::TilingConfig>> {
+    let bounded_decode = req.memory.is_some_and(|memory| memory.tile_vae_decode);
+    if bounded_decode
+        || (req.video_mode.as_deref() == Some("image_to_video") && req.memory.is_some())
+    {
+        crate::i2v_memory_strategy::decode_tiling(
+            req,
+            out_width as u32,
+            out_height as u32,
+            out_frames as u32,
+        )
+    } else {
+        auto_tiling_budgeted_z16(out_height, out_width, out_frames)
+    }
+}
+
 /// Load the Wan2.2 T2V-A14B from a converted MLX snapshot directory (`convert_wan.py` output:
 /// `low_noise_model.safetensors` + `high_noise_model.safetensors` + `t5_encoder.safetensors` +
 /// `vae.safetensors` + `tokenizer.json` + `config.json`). LoRA adapters merge per-expert at generate
@@ -1097,6 +1424,20 @@ pub fn load_t2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         )));
     }
     let quant = resolve_load_time_quant(MODEL_ID_T2V_14B, &config, spec.quantize)?;
+    // The T2V-A14B route publishes the same pre-load memory surface as its I2V sibling (`lib.rs`
+    // registers `i2v_memory_strategy::t2v_14b::MEMORY_{REGISTRATION,FIXTURE,BEHAVIOR}`), so the
+    // LOADED provider has to seal the same receipt. Without it the registry declares a contract
+    // the generator never publishes: `memory_strategy_contract()` answers `None`,
+    // `memory_strategy_safety_check` refuses every optimized rung with "has no prepared I2V memory
+    // receipt", and `begin_memory_strategy_request` opens no scope — so a selection the video gate
+    // admits dies at the consumer's scope check (sc-22738).
+    let i2v_memory = if spec.resolved_route.as_deref() == Some(MODEL_ID_T2V_14B)
+        && spec.prepared_file_pins().is_prepared()
+    {
+        Some(crate::i2v_memory_strategy::prepare(spec, MODEL_ID_T2V_14B).map_err(Error::from)?)
+    } else {
+        None
+    };
     Ok(Box::new(Wan14b {
         descriptor: descriptor_t2v_14b(),
         config,
@@ -1104,13 +1445,63 @@ pub fn load_t2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         adapters: spec.adapters.clone(),
         quant,
         offload_policy: spec.offload_policy,
+        i2v_memory,
     }))
 }
 
-mlx_gen::impl_generator!(Wan14b {
-    validate: |s, req| s.validate_impl(req),
-    generate: generate_impl,
-});
+impl Generator for Wan14b {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, request: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        self.validate_impl(request).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        request: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(request, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        self.i2v_memory.as_ref().map(|prepared| &prepared.contract)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        self.i2v_memory.as_ref().map_or_else(
+            || {
+                if context.selection.strategy == mlx_gen::gen_core::MemoryStrategy::Resident {
+                    mlx_gen::gen_core::MemorySafetyDecision::Accept
+                } else {
+                    mlx_gen::gen_core::MemorySafetyDecision::Reject {
+                        reason: format!(
+                            "{} has no prepared I2V memory receipt",
+                            self.descriptor.id
+                        ),
+                    }
+                }
+            },
+            |prepared| crate::i2v_memory_strategy::safety_check(prepared, context),
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        match &self.i2v_memory {
+            Some(prepared) => crate::i2v_memory_strategy::begin_request(prepared, context),
+            None => Ok(None),
+        }
+    }
+}
 
 impl Wan14b {
     /// Validate body — kept on the crate's own [`mlx_gen::Error`] so `?` on the capability check
@@ -1140,16 +1531,31 @@ impl Wan14b {
         // sc-12607: the 16-px grid stride (candle rejects via `is_multiple_of(SIZE_MULTIPLE_14B)`).
         // sc-12308: the area cap (T2V was uncapped entirely; I2V refit 1280×720 → 1264×704). Both A14B
         // variants share the 14B family's 921 600 budget.
-        let (dw, dh) = grid(&self.config);
+        let (dw, dh) = grid(&self.config, A14bProviderVae::VAE_TILING);
         reject_off_grid(id, req, dw, dh)?;
         reject_over_area(id, req, dw, dh, self.config.max_area)?;
         // I2V channel-concat requires a single reference image (the first conditioning frame), and
         // does not support `trim_first_frames` (the reference builds `y` from `num_frames`, so an
         // extended noise length would mismatch the conditioning's temporal dim).
         if self.config.is_i2v_concat() {
-            if i2v_reference(req).is_none() {
+            let Some((_, strength)) = i2v_reference(req) else {
                 return Err(Error::Msg(format!(
                     "{id}: image-to-video requires a Reference conditioning image"
+                )));
+            };
+            // sc-19571 — **refuse, do not ignore.** The A14B I2V conditions by CHANNEL-CONCAT: the
+            // reference is VAE-encoded into `y` and concatenated onto every forward's latent, with
+            // no denoise mask anywhere in the path. There is therefore nothing for a conditioning
+            // strength to weight, and the 5B's `1 − strength` mask-blend cannot be extended here
+            // (sc-19504). Accepting the knob and quietly rendering a full pin is the exact failure
+            // this story exists to close, so a request that asks for anything other than a full pin
+            // gets a typed error naming the mechanism.
+            if strength != 1.0 {
+                return Err(Error::Msg(format!(
+                    "{id}: conditioning strength is not supported for A14B image-to-video (got \
+                     {strength}) — the reference is channel-concatenated, not mask-blended, so \
+                     there is no denoise mask to weight; use strength 1.0, or wan2_2_ti2v_5b, \
+                     whose mask-blend honors it"
                 )));
             }
             if req.trim_first_frames.unwrap_or(0) > 0 {
@@ -1178,11 +1584,31 @@ impl Wan14b {
         // Reject anything outside the advertised surface before doing expensive work — in particular
         // an unknown `sampler`, which `solver_kind` would otherwise silently map to UniPC.
         self.validate(req)?;
+        if let Some(prepared) = &self.i2v_memory {
+            crate::i2v_memory_strategy::validate_active_request(prepared, req)
+                .map_err(Error::from)?;
+        }
+        // Every A14B route is an expert-swap route: the trajectory changes transformers at the
+        // boundary, so a retained trunk residual or a rotation phase captured under the high-noise
+        // expert is meaningless under the low-noise one (and retaining it would keep the outgoing
+        // expert's weights alive). This provider therefore declares no approximate mechanism, and
+        // refuses a non-exact plan **by name** here rather than by omission — resolving the plan is
+        // what makes that refusal exist at all, and its absence was why the guard's doc claimed a
+        // coverage it did not have (sc-18322).
+        refuse_unwired_approximation(
+            self.descriptor.id,
+            "MoE expert swap",
+            &self
+                .descriptor
+                .capabilities
+                .approximation_plan(self.descriptor.id, req)?,
+        )?;
         let cfg = &self.config;
         // Sequential offload (epic 12732, sc-12736): free the UMT5 TE / VAE off-GPU during denoise and
         // hold only the ACTIVE MoE expert resident (the expert swap). `Resident` (default) is the
         // byte-identical pre-swap path (both experts co-resident, no per-stage `clear_cache`).
-        let sequential = self.offload_policy == OffloadPolicy::Sequential;
+        let sequential = self.offload_policy == OffloadPolicy::Sequential
+            || crate::i2v_memory_strategy::staged(req);
 
         // --- Resolve request knobs against config defaults ---
         let frames = req.frames.map(|f| f as usize).unwrap_or(cfg.frame_num);
@@ -1191,11 +1617,12 @@ impl Wan14b {
         // decode, so the first kept frame sees a full temporal receptive field (port of
         // generate_wan.py). gen_frames stays 1+4k since frames is and we add a multiple of 4.
         let trim = req.trim_first_frames.unwrap_or(0) as usize;
-        let trim_out = trim * cfg.vae_stride.0; // discarded output frames = trim · 4
-        let gen_frames = frames + trim * cfg.vae_stride.0;
+        let vae_stride = provider_vae_stride(A14bProviderVae::VAE_TILING);
+        let trim_out = trim * vae_stride.0; // discarded output frames = trim · 4
+        let gen_frames = frames + trim * vae_stride.0;
         // validate() already rejected sub-tile + bad frame counts; round H/W down to the grid, then
         // enforce the model's max-area cap (I2V-14B / TI2V-5B: 704×1280; no-op for T2V's max_area 0).
-        let (width, height) = resolve_capped_dims(req, cfg);
+        let (width, height) = resolve_capped_dims(req, cfg, A14bProviderVae::VAE_TILING);
         let (steps, shift, kind, seed) =
             resolve_sampler_knobs(req, cfg.sample_steps, cfg.sample_shift);
         // A scalar request `guidance` overrides both experts; otherwise use the config (low, high).
@@ -1207,7 +1634,7 @@ impl Wan14b {
 
         // Init-noise latent geometry: [z_dim, t_lat, h_lat, w_lat] for the (possibly trim-extended)
         // generation length.
-        let lat = latent_shape(gen_frames, height, width, cfg.vae_z_dim, cfg.vae_stride)?;
+        let lat = latent_shape(gen_frames, height, width, cfg.vae_z_dim, vae_stride)?;
 
         // sc-4986 — fail fast (catchable) if the DiT-denoise stage won't fit, before any heavy load.
         // sc-12736/sc-12795: every `Sequential` route keeps only ONE expert resident; `Resident`
@@ -1219,13 +1646,25 @@ impl Wan14b {
             &[self.root.join("high_noise_model.safetensors")],
             self.quant,
         );
+        let adapter_mode = if self.config.quantization.is_some() {
+            AdapterResidencyMode::Additive
+        } else {
+            AdapterResidencyMode::Folded
+        };
+        let (low_adapter_bytes, high_adapter_bytes) =
+            wan14b_adapter_bytes_per_expert(&self.adapters, adapter_mode).ok_or_else(|| {
+                Error::Msg(format!(
+                    "{}: cannot size every additive adapter before the denoise fit gate",
+                    self.descriptor.id
+                ))
+            })?;
         preflight_denoise_memory_guard(
             self.descriptor.id,
             wan14b_denoise_resident_bytes(
                 self.offload_policy,
                 req.sampler.as_deref(),
-                low_bytes,
-                high_bytes,
+                low_bytes.saturating_add(low_adapter_bytes),
+                high_bytes.saturating_add(high_adapter_bytes),
             ),
             seq_len(lat, cfg.patch_size),
             cfg.dim,
@@ -1264,15 +1703,18 @@ impl Wan14b {
         // `[20, T_lat, h_lat, w_lat]` (f32), concatenated onto each forward's noise latent in
         // `denoise_moe`. `frames` (not `gen_frames`) — validate() rejected `trim` for I2V.
         let y = if cfg.is_i2v_concat() {
-            let image = i2v_reference(req).ok_or_else(|| {
+            // sc-19571: the strength is deliberately NOT read here — the A14B I2V is channel-concat,
+            // which has no denoise mask to weight, so `validate_impl` refuses a non-default strength
+            // outright rather than accepting it and dropping it silently.
+            let (image, _) = i2v_reference(req).ok_or_else(|| {
                 Error::Msg(format!(
                     "{}: image-to-video requires a Reference conditioning image",
                     self.descriptor.id
                 ))
             })?;
             let w = Weights::from_file(self.root.join("vae.safetensors"))?;
-            let vae = WanVae::from_weights(&w)?;
-            let y = build_i2v_y(&vae, image, frames, height, width, cfg.vae_stride)?;
+            let vae = A14bProviderVae::from_weights(&w)?;
+            let y = build_i2v_y(&vae, image, frames, height, width, vae_stride)?;
             mlx_rs::transforms::eval([&y])?;
             Some(y)
         } else {
@@ -1442,11 +1884,13 @@ impl Wan14b {
         // `TilingConfig::auto` that could pick an over-budget tile and OOM the largest-resident model.
         // `Ok(None)` for small outputs → single-pass; an over-budget decode returns a catchable error
         // here instead of a SIGKILL in the decode. decode_to_frames re-checks `needs_tiling`.
-        let out_frames = lat[1] * cfg.vae_stride.0 as i32;
-        let tiling = auto_tiling_budgeted_z16(height as i32, width as i32, out_frames)?;
+        let out_frames = lat[1] * A14bProviderVae::VAE_TILING.temporal_scale;
+        let out_height = lat[2] * A14bProviderVae::VAE_TILING.spatial_scale;
+        let out_width = lat[3] * A14bProviderVae::VAE_TILING.spatial_scale;
+        let tiling = a14b_decode_tiling(req, out_width, out_height, out_frames)?;
         let frames_u8 = {
             let w = Weights::from_file(self.root.join("vae.safetensors"))?;
-            let vae = WanVae::from_weights(&w)?;
+            let vae = A14bProviderVae::from_weights(&w)?;
             decode_to_frames(&vae, &latents, tiling.as_ref(), Some(&req.cancel))?
         };
         let mut images = frames_to_images(&frames_u8)?;
@@ -1573,12 +2017,117 @@ fn wan14b_denoise_resident_bytes(
     }
 }
 
-/// The single conditioning reference image for I2V (the first video frame), if present.
-fn i2v_reference(req: &GenerationRequest) -> Option<&Image> {
+/// Load-exact adapter residency for each Wan A14B expert. Packed Q4/Q8 snapshots retain additive
+/// residuals; dense snapshots fold factors and therefore add no independent bytes. A shared adapter
+/// is installed once on each expert, while an expert-tagged adapter contributes only to its target.
+/// `None` keeps the preflight fail-closed when any additive source cannot be sized.
+fn wan14b_adapter_bytes_per_expert(
+    adapters: &[AdapterSpec],
+    mode: AdapterResidencyMode,
+) -> Option<(u64, u64)> {
+    if adapters.is_empty() || mode == AdapterResidencyMode::Folded {
+        return Some((0, 0));
+    }
+    adapters
+        .iter()
+        .try_fold((0_u64, 0_u64), |(low, high), adapter| {
+            let bytes = mlx_gen::gen_core::weightsmeta::safetensors_path_bytes(&adapter.path);
+            if bytes == 0 {
+                return None;
+            }
+            Some(match adapter.moe_expert {
+                None => (low.saturating_add(bytes), high.saturating_add(bytes)),
+                Some(MoeExpert::Low) => (low.saturating_add(bytes), high),
+                Some(MoeExpert::High) => (low, high.saturating_add(bytes)),
+            })
+        })
+}
+
+/// The single conditioning reference image for I2V (the first video frame) **and its resolved
+/// conditioning strength**, if present.
+///
+/// sc-19571: this used to return the image alone, which is how the TI2V mask-blend came to build a
+/// hard 0/1 pin no matter what the caller asked for. The per-`Reference` `strength` wins over the
+/// request-level img2img `strength`, falling back to `1.0` (a full pin) — the identical resolution
+/// candle's `candle_gen_wan` TI2V path performs, so the two lanes read one number the same way.
+fn i2v_reference(req: &GenerationRequest) -> Option<(&Image, f32)> {
     req.conditioning.iter().find_map(|c| match c {
-        Conditioning::Reference { image, .. } => Some(image),
+        Conditioning::Reference { image, strength } => {
+            Some((image, strength.or(req.strength).unwrap_or(1.0)))
+        }
         _ => None,
     })
+}
+
+/// **The TI2V mask-blend seam** (sc-19571): resolve the request's image conditioning into the
+/// `(latent_frame, strength)` pins that drive [`build_ti2v_mask`], and nothing else.
+///
+/// * `Keyframe`s (first_last_frame / multi-keyframe) → one pin each, **in request order**, so the
+///   caller can zip the pins against `req.keyframes()` to pair each resolved index with its image.
+///   `frame_idx` is a latent index with negative-from-end resolution (`-1` = last latent frame).
+/// * otherwise a single `Reference` image → one pin at latent frame 0 with the strength
+///   [`i2v_reference`] resolves.
+/// * no image conditioning → no pins, i.e. pure-noise T2V.
+///
+/// Pure and total (no GPU, no weights), because the whole defect this closes was a strength that
+/// was carried as far as the provider and then dropped on the way into the mask — which is exactly
+/// the hop a unit test can only pin if it is expressible without a render.
+fn resolve_ti2v_pins(req: &GenerationRequest, t_lat: usize) -> Result<Vec<(usize, f32)>> {
+    let keyframes = req.keyframes();
+    if keyframes.is_empty() {
+        return Ok(i2v_reference(req)
+            .map(|(_, strength)| vec![(0usize, strength)])
+            .unwrap_or_default());
+    }
+    let mut pins = Vec::with_capacity(keyframes.len());
+    for kf in &keyframes {
+        let idx = if kf.frame_idx < 0 {
+            t_lat as i32 + kf.frame_idx
+        } else {
+            kf.frame_idx
+        };
+        if idx < 0 || idx as usize >= t_lat {
+            return Err(Error::Msg(format!(
+                "wan2_2_ti2v_5b: keyframe latent frame index {} out of bounds for {t_lat} latent \
+                 frames",
+                kf.frame_idx
+            )));
+        }
+        pins.push((idx as usize, kf.strength));
+    }
+    Ok(pins)
+}
+
+/// Range-gate every conditioning strength a Wan request can carry (sc-19571, mirroring candle's
+/// `check_strength` and mlx-gen-ltx's F-054 gate).
+///
+/// `strength > 1` yields a **negative** denoise mask (`1 − strength`) → negative per-token timesteps
+/// and extrapolating blends: silent garbage rather than a louder pin. `strength < 0` over-weights
+/// the noise the same way. Now that the number actually reaches the mask, the range has to be a
+/// request-boundary rejection instead of a value nobody read.
+fn reject_out_of_range_strengths(id: &str, req: &GenerationRequest) -> Result<()> {
+    let check = |label: &str, strength: f32| -> Result<()> {
+        if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+            return Err(Error::Msg(format!(
+                "{id}: {label} strength must be finite and in [0, 1] (got {strength})"
+            )));
+        }
+        Ok(())
+    };
+    if let Some(strength) = req.strength {
+        check("img2img", strength)?;
+    }
+    for c in &req.conditioning {
+        match c {
+            Conditioning::Reference {
+                strength: Some(strength),
+                ..
+            } => check("Reference", *strength)?,
+            Conditioning::Keyframe { strength, .. } => check("Keyframe", *strength)?,
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the output `(width, height)` for a **dense** Wan path (5B TI2V, A14B): round the requested
@@ -1593,17 +2142,23 @@ fn i2v_reference(req: &GenerationRequest) -> Option<&Image> {
 /// **sc-12607:** `validate_impl` now *also* rejects an off-grid `width`/`height` (via
 /// [`reject_off_grid`], matching candle), so a validated request is already grid-aligned and this
 /// rounding is a defensive identity — it never silently snaps a geometry the caller chose.
-fn resolve_capped_dims(req: &GenerationRequest, cfg: &WanModelConfig) -> (u32, u32) {
-    let width = align_dim(req.width, cfg.patch_size.2, cfg.vae_stride.2);
-    let height = align_dim(req.height, cfg.patch_size.1, cfg.vae_stride.1);
+fn resolve_capped_dims(
+    req: &GenerationRequest,
+    cfg: &WanModelConfig,
+    vae: VaeTiling,
+) -> (u32, u32) {
+    let stride = provider_vae_stride(vae);
+    let width = align_dim(req.width, cfg.patch_size.2, stride.2);
+    let height = align_dim(req.height, cfg.patch_size.1, stride.1);
     (width, height)
 }
 
 /// The model's `(dw, dh)` pixel grid = `patch · vae_stride` — the lattice every Wan geometry sits on.
-fn grid(cfg: &WanModelConfig) -> (u32, u32) {
+fn grid(cfg: &WanModelConfig, vae: VaeTiling) -> (u32, u32) {
+    let stride = provider_vae_stride(vae);
     (
-        (cfg.patch_size.2 * cfg.vae_stride.2) as u32,
-        (cfg.patch_size.1 * cfg.vae_stride.1) as u32,
+        (cfg.patch_size.2 * stride.2) as u32,
+        (cfg.patch_size.1 * stride.1) as u32,
     )
 }
 
@@ -1612,6 +2167,9 @@ fn grid(cfg: &WanModelConfig) -> (u32, u32) {
 /// concat first frame) and the (3.5, 3.5) per-expert guidance.
 pub fn descriptor_i2v_14b() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID_I2V_14B,
         family: "wan",
@@ -1620,7 +2178,6 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             // A single image is channel-concatenated as the first-frame conditioning (in_dim 36).
             conditioning: vec![ConditioningKind::Reference],
             // LoRA + LoKr merge per-expert at generate time (sc-2683 / sc-2393, PEFT/kohya + LoKr,
@@ -1628,7 +2185,6 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
             supports_lora: true,
             supports_lokr: true,
             samplers: wan_samplers(),
-            schedulers: Vec::new(),
             // H/W align to patch×vae_stride = 16 (z16 VAE, spatial stride 8); long edge cap 1280.
             supported_guidance_methods: vec![],
             min_size: 16,
@@ -1637,23 +2193,15 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: true,
-            requires_sigma_shift: false,
             // A14B honors `OffloadPolicy::Sequential` (epic 12732, sc-12736): the staged expert swap
             // holds only the ACTIVE MoE expert resident (never both) and frees the UMT5 TE / VAE
             // off-GPU during denoise, dropping the unified-memory peak to ~one expert. Advertised so
             // the worker's fit-gate can tell "bounds peak here" from a no-op fallback.
             supports_sequential_offload: true,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            // TE/VAE and the active expert are phase-staged even under Resident; Sequential adds the
+            // stronger cache-flush/expert-residency controls described above.
+            unconditionally_engages_staged_residency: true,
+            ..Default::default()
         },
     }
 }
@@ -1697,6 +2245,13 @@ pub fn load_i2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         ));
     }
     let quant = resolve_load_time_quant(MODEL_ID_I2V_14B, &config, spec.quantize)?;
+    let i2v_memory = if spec.resolved_route.as_deref() == Some(MODEL_ID_I2V_14B)
+        && spec.prepared_file_pins().is_prepared()
+    {
+        Some(crate::i2v_memory_strategy::prepare(spec, MODEL_ID_I2V_14B).map_err(Error::from)?)
+    } else {
+        None
+    };
     Ok(Box::new(Wan14b {
         descriptor: descriptor_i2v_14b(),
         config,
@@ -1704,6 +2259,7 @@ pub fn load_i2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         adapters: spec.adapters.clone(),
         quant,
         offload_policy: spec.offload_policy,
+        i2v_memory,
     }))
 }
 
@@ -1724,17 +2280,245 @@ mod tests {
         }
     }
 
+    /// A tiny solid-color RGB conditioning frame.
+    fn dummy_image() -> Image {
+        Image {
+            width: 64,
+            height: 64,
+            pixels: vec![128u8; 64 * 64 * 3],
+        }
+    }
+
+    fn keyframe(frame_idx: i32, strength: f32) -> Conditioning {
+        Conditioning::Keyframe {
+            image: dummy_image(),
+            frame_idx,
+            strength,
+        }
+    }
+
+    /// **The seam assertion** (sc-19571). `resolve_ti2v_pins` is the single hop between the request
+    /// and [`build_ti2v_mask`], so this pins what the mask builder is actually handed — with
+    /// **non-default** strengths on both ends of a first_last_frame pair, because the defect it
+    /// replaces produced a full 1.0 pin for every keyframe and would satisfy any assertion written
+    /// against the default.
+    ///
+    /// Mutation guard: change the `pins.push((idx as usize, kf.strength))` in `resolve_ti2v_pins` to
+    /// `(idx as usize, 1.0)` — i.e. re-introduce the exact defect — and the strength asserts below
+    /// go red while every index assert still passes. That asymmetry is the point: indices were never
+    /// the broken half.
+    #[test]
+    fn ti2v_pins_carry_each_keyframes_own_strength_to_the_mask_builder() {
+        // t_lat = 4 latent frames. first_last_frame with two DIFFERENT, non-default strengths, and
+        // the last frame addressed negative-from-end (the shape SceneWorks actually sends).
+        let mut r = req(704, 480);
+        // 0.25 / 0.75 are exactly representable in f32, so `1 − strength` is exact and the mask
+        // assertion below can be `==` rather than an epsilon that could hide a wrong-but-close pin.
+        r.conditioning = vec![keyframe(0, 0.25), keyframe(-1, 0.75)];
+        let pins = resolve_ti2v_pins(&r, 4).expect("pins");
+        assert_eq!(
+            pins,
+            vec![(0usize, 0.25f32), (3usize, 0.75f32)],
+            "each keyframe's own strength must reach the mask builder, in request order"
+        );
+
+        // …and the mask the builder derives from them carries `1 − strength` at each pinned frame.
+        // z=1, t_lat=4, h=w=1, patch (1,1,1) → one token per latent frame.
+        let (mask, tokens) = build_ti2v_mask(&pins, 1, 4, 1, 1, (1, 1, 1));
+        assert_eq!(mask.as_slice::<f32>(), &[0.75, 1.0, 1.0, 0.25]);
+        assert_eq!(tokens.as_slice::<f32>(), &[0.75, 1.0, 1.0, 0.25]);
+    }
+
+    /// The `Reference` half of the same seam: a single conditioning image pins latent frame 0 at the
+    /// strength the request resolves — the per-`Reference` value first, then the request-level
+    /// img2img `strength`, then a full pin. Non-default at every rung.
+    #[test]
+    fn ti2v_pins_resolve_the_reference_strength_precedence() {
+        let mut r = req(704, 480);
+        // Per-reference strength wins.
+        r.conditioning = vec![Conditioning::Reference {
+            image: dummy_image(),
+            strength: Some(0.4),
+        }];
+        r.strength = Some(0.9);
+        assert_eq!(resolve_ti2v_pins(&r, 4).unwrap(), vec![(0usize, 0.4f32)]);
+        // No per-reference strength → the request-level img2img strength.
+        r.conditioning = vec![Conditioning::Reference {
+            image: dummy_image(),
+            strength: None,
+        }];
+        assert_eq!(resolve_ti2v_pins(&r, 4).unwrap(), vec![(0usize, 0.9f32)]);
+        // Neither → a full pin (the historical hard mask).
+        r.strength = None;
+        assert_eq!(resolve_ti2v_pins(&r, 4).unwrap(), vec![(0usize, 1.0f32)]);
+        // No image conditioning at all → no pins, i.e. pure-noise T2V.
+        r.conditioning = vec![];
+        assert!(resolve_ti2v_pins(&r, 4).unwrap().is_empty());
+    }
+
+    /// Out-of-bounds latent indices still reject (this moved into `resolve_ti2v_pins` with the
+    /// strengths — the guard must not have been lost in the move).
+    #[test]
+    fn ti2v_pins_reject_out_of_bounds_latent_indices() {
+        let mut r = req(704, 480);
+        r.conditioning = vec![keyframe(4, 1.0)];
+        let err = resolve_ti2v_pins(&r, 4).unwrap_err().to_string();
+        assert!(err.contains("out of bounds"), "unexpected: {err}");
+        r.conditioning = vec![keyframe(-5, 1.0)];
+        assert!(resolve_ti2v_pins(&r, 4).is_err());
+    }
+
+    /// sc-19571 — the strengths now reach `1 − strength`, so a value outside `[0,1]` would build a
+    /// NEGATIVE mask: negative per-token timesteps and an extrapolating blend, i.e. silent garbage.
+    /// Mirrors candle's `validate_rejects_non_finite_or_out_of_range_ti2v_strengths`.
+    ///
+    /// Two gates, deliberately asserted apart: **non-finite** is the shared gen-core floor
+    /// (`ensure_finite_floats`, which sc-19571 also taught about `Keyframe.strength`), **finite but
+    /// out of range** is this provider's own gate. Mutation guard: delete the
+    /// `reject_out_of_range_strengths` call in `validate_impl` and the `[0, 1]` asserts go red while
+    /// the finiteness ones still pass — which is how you can tell the two gates are distinct and
+    /// neither is carrying the other.
+    #[test]
+    fn validate_rejects_out_of_range_conditioning_strengths_5b() {
+        let wan = wan_5b();
+        for bad in [1.5f32, -0.1] {
+            let mut r = req(704, 480);
+            r.conditioning = vec![keyframe(0, bad)];
+            let err = wan.validate_impl(&r).unwrap_err().to_string();
+            assert!(
+                err.contains("Keyframe strength must be finite and in [0, 1]"),
+                "keyframe {bad}: {err}"
+            );
+
+            let mut r = req(704, 480);
+            r.conditioning = vec![Conditioning::Reference {
+                image: dummy_image(),
+                strength: Some(bad),
+            }];
+            let err = wan.validate_impl(&r).unwrap_err().to_string();
+            assert!(
+                err.contains("Reference strength must be finite and in [0, 1]"),
+                "reference {bad}: {err}"
+            );
+
+            let mut r = req(704, 480);
+            r.strength = Some(bad);
+            let err = wan.validate_impl(&r).unwrap_err().to_string();
+            assert!(
+                err.contains("img2img strength must be finite and in [0, 1]"),
+                "img2img {bad}: {err}"
+            );
+        }
+        // Non-finite is caught one layer up, by the shared finiteness floor.
+        for bad in [f32::NAN, f32::INFINITY] {
+            let mut r = req(704, 480);
+            r.conditioning = vec![keyframe(0, bad)];
+            let err = wan.validate_impl(&r).unwrap_err().to_string();
+            assert!(
+                err.contains("conditioning.keyframe.strength") && err.contains("must be finite"),
+                "keyframe {bad}: {err}"
+            );
+        }
+        // The in-range partial pins this story exists to enable still validate.
+        let mut ok = req(704, 480);
+        ok.conditioning = vec![keyframe(0, 0.35), keyframe(-1, 0.0)];
+        assert!(wan.validate_impl(&ok).is_ok());
+    }
+
+    /// sc-19571 — **refuse, do not ignore.** The A14B I2V is channel-concat and has no denoise mask,
+    /// so a conditioning strength cannot be honored there; it must be rejected with a message naming
+    /// the mechanism rather than accepted and dropped. Mutation guard: delete the `strength != 1.0`
+    /// branch in `Wan14b::validate_impl` and the `unwrap_err`s below panic.
+    #[test]
+    fn validate_refuses_conditioning_strength_on_a14b_i2v() {
+        let wan = Wan14b {
+            descriptor: descriptor_i2v_14b(),
+            config: WanModelConfig::wan22_i2v_14b(),
+            root: PathBuf::new(),
+            adapters: vec![],
+            quant: None,
+            offload_policy: OffloadPolicy::Resident,
+            i2v_memory: None,
+        };
+        let reference = |strength: Option<f32>| Conditioning::Reference {
+            image: dummy_image(),
+            strength,
+        };
+        // A full pin — the only thing channel-concat can express — validates.
+        let mut ok = req(704, 480);
+        ok.conditioning = vec![reference(Some(1.0))];
+        assert!(wan.validate_impl(&ok).is_ok(), "strength 1.0 must validate");
+        let mut ok = req(704, 480);
+        ok.conditioning = vec![reference(None)];
+        assert!(wan.validate_impl(&ok).is_ok(), "unset must validate");
+
+        // Anything else is refused, on either carrier.
+        let mut bad = req(704, 480);
+        bad.conditioning = vec![reference(Some(0.5))];
+        let err = wan.validate_impl(&bad).unwrap_err().to_string();
+        assert!(
+            err.contains("conditioning strength is not supported")
+                && err.contains("channel-concatenated"),
+            "unexpected: {err}"
+        );
+        let mut bad = req(704, 480);
+        bad.conditioning = vec![reference(None)];
+        bad.strength = Some(0.5);
+        assert!(
+            wan.validate_impl(&bad).is_err(),
+            "the request-level img2img strength resolves into the same pin and must be refused too"
+        );
+    }
+
     #[test]
     fn resolve_capped_dims_aligns_down_only() {
         // 14B aligns to patch.{1,2}·vae_stride.{1,2} = 2·8 = 16, so 130 → 128 on both axes.
         let cfg = WanModelConfig::wan22_t2v_14b();
-        assert_eq!(resolve_capped_dims(&req(130, 130), &cfg), (128, 128));
+        assert_eq!(
+            resolve_capped_dims(&req(130, 130), &cfg, A14bProviderVae::VAE_TILING),
+            (128, 128)
+        );
         // Already on-grid → unchanged.
-        assert_eq!(resolve_capped_dims(&req(128, 256), &cfg), (128, 256));
+        assert_eq!(
+            resolve_capped_dims(&req(128, 256), &cfg, A14bProviderVae::VAE_TILING),
+            (128, 256)
+        );
         // The 5B's z48 VAE gives a 32-px grid instead.
         let five_b = WanModelConfig::wan22_ti2v_5b();
-        assert_eq!(resolve_capped_dims(&req(720, 720), &five_b), (704, 704));
-        assert_eq!(resolve_capped_dims(&req(512, 512), &five_b), (512, 512));
+        assert_eq!(
+            resolve_capped_dims(&req(720, 720), &five_b, Ti2vProviderVae::VAE_TILING),
+            (704, 704)
+        );
+        assert_eq!(
+            resolve_capped_dims(&req(512, 512), &five_b, Ti2vProviderVae::VAE_TILING),
+            (512, 512)
+        );
+    }
+
+    #[test]
+    fn benchmark_scope_forces_dense_wan_spatial_and_temporal_tiles() {
+        let scope = mlx_gen::diagnostics::begin_benchmark_request(
+            "wan-fixed-tile",
+            "wan_video",
+            &[],
+            Some(mlx_gen::diagnostics::BenchmarkDecodeControl {
+                spatial_tile_px: 256,
+                spatial_overlap_px: 64,
+                temporal_tile_frames: Some(32),
+                temporal_overlap_frames: Some(8),
+            }),
+            |_| {},
+        )
+        .unwrap();
+        let tiling = dense_decode_tiling(&GenerationRequest::default(), 832, 480, 81)
+            .unwrap()
+            .unwrap();
+        let spatial = tiling.spatial.unwrap();
+        let temporal = tiling.temporal.unwrap();
+        assert_eq!((spatial.tile_px, spatial.overlap_px), (256, 64));
+        assert_eq!((temporal.tile_frames, temporal.overlap_frames), (32, 8));
+        scope.finish();
+        assert_eq!(mlx_gen::diagnostics::benchmark_decode_control(), None);
     }
 
     #[test]
@@ -1775,7 +2559,10 @@ mod tests {
         let cfg = WanModelConfig::wan22_ti2v_5b();
         // The geometry `validate_impl` would have rejected passes through UNCHANGED (bar alignment)
         // rather than being silently refit to something the caller never asked for.
-        assert_eq!(resolve_capped_dims(&req(2048, 2048), &cfg), (2048, 2048));
+        assert_eq!(
+            resolve_capped_dims(&req(2048, 2048), &cfg, Ti2vProviderVae::VAE_TILING),
+            (2048, 2048)
+        );
         assert!(
             2048 * 2048 > cfg.max_area,
             "the guard belongs to validate, not to this function"
@@ -1783,7 +2570,10 @@ mod tests {
 
         // The 14B family's canonical 720p is at its cap and is a fixed point of the alignment.
         let a14b = WanModelConfig::wan22_i2v_14b();
-        assert_eq!(resolve_capped_dims(&req(1280, 720), &a14b), (1280, 720));
+        assert_eq!(
+            resolve_capped_dims(&req(1280, 720), &a14b, A14bProviderVae::VAE_TILING),
+            (1280, 720)
+        );
         assert_eq!(1280 * 720, a14b.max_area);
     }
 
@@ -1811,6 +2601,20 @@ mod tests {
             "the dense TI2V-5B must advertise sequential offload (sc-12796) — the staged TE/VAE \
              clear_cache flush bounds its unified-memory footprint"
         );
+    }
+
+    #[test]
+    fn all_registered_base_wan_variants_also_declare_unconditional_phase_staging() {
+        for descriptor in [descriptor(), descriptor_t2v_14b(), descriptor_i2v_14b()] {
+            assert_eq!(
+                descriptor.capabilities.staged_residency_availability(),
+                mlx_gen::StagedResidencyAvailability::UnconditionallyEngaged,
+                "{} must distinguish its always-staged physical path from the stronger selectable \
+                 Sequential controls it also supports",
+                descriptor.id
+            );
+            assert!(descriptor.capabilities.supports_sequential_offload);
+        }
     }
 
     /// sc-12736: the sc-4986 pre-flight denoise guard's expert-byte accounting must track the ACTUAL
@@ -1861,6 +2665,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wan14b_adapter_residency_tracks_packed_folded_and_expert_routing() {
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
+        let shared = root.join("shared.safetensors");
+        let low = root.join("low.safetensors");
+        let high = root.join("high.safetensors");
+        std::fs::write(&shared, vec![0_u8; 10]).unwrap();
+        std::fs::write(&low, vec![0_u8; 20]).unwrap();
+        std::fs::write(&high, vec![0_u8; 30]).unwrap();
+        let adapters = vec![
+            AdapterSpec::new(shared, 1.0, mlx_gen::AdapterKind::Lora),
+            AdapterSpec::new(low, 1.0, mlx_gen::AdapterKind::Lora).with_moe_expert(MoeExpert::Low),
+            AdapterSpec::new(high, 1.0, mlx_gen::AdapterKind::Lora)
+                .with_moe_expert(MoeExpert::High),
+        ];
+
+        assert_eq!(
+            wan14b_adapter_bytes_per_expert(&adapters, AdapterResidencyMode::Folded),
+            Some((0, 0)),
+            "dense factors are folded into the base experts"
+        );
+        assert_eq!(
+            wan14b_adapter_bytes_per_expert(&adapters, AdapterResidencyMode::Additive),
+            Some((30, 40)),
+            "packed factors remain resident on their routed experts"
+        );
+        assert_eq!(
+            wan14b_denoise_resident_bytes(OffloadPolicy::Resident, None, 100 + 30, 200 + 40),
+            370
+        );
+        assert_eq!(
+            wan14b_denoise_resident_bytes(OffloadPolicy::Sequential, None, 100 + 30, 200 + 40),
+            240
+        );
+
+        let missing = vec![AdapterSpec::new(
+            root.join("missing.safetensors"),
+            1.0,
+            mlx_gen::AdapterKind::Lora,
+        )];
+        assert_eq!(
+            wan14b_adapter_bytes_per_expert(&missing, AdapterResidencyMode::Additive),
+            None
+        );
+    }
+
     fn wan_5b() -> Wan {
         Wan {
             descriptor: descriptor(),
@@ -1869,6 +2720,9 @@ mod tests {
             adapters: vec![],
             quant: None,
             offload_policy: OffloadPolicy::Resident,
+            memory_strategy: None,
+            memory_tier: None,
+            i2v_memory: None,
         }
     }
 
@@ -1880,6 +2734,7 @@ mod tests {
             adapters: vec![],
             quant: None,
             offload_policy: OffloadPolicy::Resident,
+            i2v_memory: None,
         }
     }
 
@@ -1947,28 +2802,38 @@ mod tests {
     fn pinned_stride_consts_match_the_enforced_lattice() {
         use crate::config::{SIZE_MULTIPLE, SIZE_MULTIPLE_14B};
         assert_eq!(
-            grid(&WanModelConfig::wan22_ti2v_5b()),
+            grid(
+                &WanModelConfig::wan22_ti2v_5b(),
+                Ti2vProviderVae::VAE_TILING
+            ),
             (SIZE_MULTIPLE, SIZE_MULTIPLE)
         );
         assert_eq!(
-            grid(&WanModelConfig::wan22_t2v_14b()),
+            grid(
+                &WanModelConfig::wan22_t2v_14b(),
+                A14bProviderVae::VAE_TILING
+            ),
             (SIZE_MULTIPLE_14B, SIZE_MULTIPLE_14B)
         );
         assert_eq!(
-            grid(&WanModelConfig::wan22_i2v_14b()),
+            grid(
+                &WanModelConfig::wan22_i2v_14b(),
+                A14bProviderVae::VAE_TILING
+            ),
             (SIZE_MULTIPLE_14B, SIZE_MULTIPLE_14B)
         );
     }
 
     // ---- sc-12459: `dit_resident_bytes` shard-dir sizing must match `Weights::from_dir` ----------
 
-    /// A fresh, empty scratch dir for one sizing test (recreated per run; RUST_TEST_THREADS=1 is
-    /// forced repo-wide, so no cross-test races on the shared temp root).
-    fn sizing_dir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir()
-            .join("mlx_gen_wan_dit_sizing")
-            .join(name);
-        let _ = std::fs::remove_dir_all(&d);
+    /// A fresh, empty scratch dir for one sizing test (recreated per run).
+    ///
+    /// Keyed by pid as well as `name`: `RUST_TEST_THREADS=1` only serializes tests *within* one
+    /// invocation, so it rules out cross-*test* races but not cross-*process* ones — two concurrent
+    /// `cargo test` runs on the same machine share `$TMPDIR`, and the `remove_dir_all` below would
+    /// then delete the other run's fixtures mid-test.
+    fn sizing_dir(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
+        let d = tmp.path().join(name);
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -1981,7 +2846,8 @@ mod tests {
     /// blob target instead.
     #[test]
     fn dit_resident_bytes_dir_sums_symlinked_shards_at_target_size() {
-        let root = sizing_dir("symlinked_shards");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = sizing_dir(&tmp, "symlinked_shards");
         let blobs = root.join("blobs");
         std::fs::create_dir_all(&blobs).unwrap();
         let blob = blobs.join("blob0");
@@ -2010,7 +2876,8 @@ mod tests {
     /// contribute nothing, so the sizing matches what the loader will actually map.
     #[test]
     fn dit_resident_bytes_dir_skips_hidden_sidecars_and_non_safetensors() {
-        let shard_dir = sizing_dir("hidden_sidecars");
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = sizing_dir(&tmp, "hidden_sidecars");
         std::fs::write(shard_dir.join("model.safetensors"), vec![0u8; 1024]).unwrap();
         std::fs::write(shard_dir.join("._model.safetensors"), vec![0u8; 999]).unwrap();
         std::fs::write(shard_dir.join("config.json"), b"{}").unwrap();
@@ -2056,8 +2923,9 @@ mod tests {
         c
     }
 
-    fn tmp_dir() -> PathBuf {
-        let d = std::env::temp_dir().join("mlx_gen_wan_model_site_test");
+    fn tmp_dir(tmp: &tempfile::TempDir) -> PathBuf {
+        // Per-process scratch dir — a fixed `$TMPDIR` name races a second concurrent `cargo test`.
+        let d = tmp.path().join("mlx_gen_wan_model_site_test");
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -2071,7 +2939,7 @@ mod tests {
     /// Build a tiny dense [`WanTransformer`] from synthesized weights matching [`tiny_cfg`]. Every
     /// tensor `from_weights` + `Block::load` requires is present; the per-block attn/ffn Linears carry
     /// `in = 64`/`128` so a subsequent `.quantize(bits)` packs them (group 64).
-    fn tiny_transformer(cfg: &WanModelConfig) -> WanTransformer {
+    fn tiny_transformer(tmp: &tempfile::TempDir, cfg: &WanModelConfig) -> WanTransformer {
         let dim = cfg.dim as i32;
         let ffn = cfg.ffn_dim as i32;
         let mut entries: Vec<(String, Array)> = Vec::new();
@@ -2153,16 +3021,90 @@ mod tests {
         lin(&mut entries, "blocks.0.ffn.fc1", ffn, dim, 1.5);
         lin(&mut entries, "blocks.0.ffn.fc2", dim, ffn, 1.6);
 
-        let path = tmp_dir().join("tiny_wan.safetensors");
+        let path = tmp_dir(tmp).join("tiny_wan.safetensors");
         let refs: Vec<(&str, &Array)> = entries.iter().map(|(k, v)| (k.as_str(), v)).collect();
         Array::save_safetensors(refs, None, &path).unwrap();
         let w = Weights::from_file(&path).unwrap();
         WanTransformer::from_weights(&w, cfg).unwrap()
     }
 
+    use crate::transformer::WAN_BLOCK_NORM_DIFF_PATCH_TARGETS;
+
+    /// sc-15326 — the norm diff-patch surface routes each `(module, part)` to the **field the forward
+    /// actually reads**.
+    ///
+    /// A step-distill LoRA patches `norm3` on both halves (`norm3.diff` + `norm3.diff_b`), so an
+    /// aliased or swapped routing would fold the bias delta onto the LayerNorm *gain* — a wrong render
+    /// on all 40 blocks that still reports a clean, fully-applied install.
+    ///
+    /// **Written through the accessor, read back off the fields.** Stamping a marker through
+    /// `norm_param_mut` and reading it back through the same accessor is non-discriminating: any
+    /// consistent bijection over the six targets passes, including swapping `norm3`'s `Weight` and
+    /// `Bias` arms (the γ and β of `layer_norm(x, γ, β, eps)`) or `norm_q`↔`norm_k`. So the read-back
+    /// side uses `WanTransformer::block_norm_diff_patch_fields`, which names `norm_q` / `norm_k` /
+    /// `norm3_w` / `norm3_b` **directly** and shares no code with the routing match arms.
+    #[test]
+    fn wan_norm_diff_patch_targets_route_to_distinct_parameters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tiny_cfg();
+        let mut dit = tiny_transformer(&tmp, &cfg);
+        assert_eq!(
+            WAN_BLOCK_NORM_DIFF_PATCH_TARGETS.len(),
+            6,
+            "4 qk-RMSNorm gains + norm3 weight + norm3 bias"
+        );
+
+        // Stamp a unique constant into every target.
+        for (i, (suffix, part)) in WAN_BLOCK_NORM_DIFF_PATCH_TARGETS.iter().enumerate() {
+            let dotted = format!("blocks.0.{suffix}");
+            let segs: Vec<&str> = dotted.split('.').collect();
+            let p = dit.norm_param_mut(&segs, *part).unwrap_or_else(|| {
+                panic!("`{dotted}` / {part:?} is advertised but does not route")
+            });
+            let marker = 100.0 + i as f32;
+            *p = Array::full::<f32>(p.shape(), &Array::from_f32(marker)).unwrap();
+        }
+
+        // Read them back OFF THE FIELDS, in the advertised order. Target `i` must have landed on
+        // field `i` — the parameter the block's forward passes to `rms_norm` / `layer_norm`. An
+        // aliased, swapped, or wrong-part arm fails here even though it round-trips through the
+        // accessor cleanly.
+        let fields = dit.block_norm_diff_patch_fields(0);
+        for (i, (suffix, part)) in WAN_BLOCK_NORM_DIFF_PATCH_TARGETS.iter().enumerate() {
+            let got = mlx_rs::ops::max(fields[i].as_dtype(mlx_rs::Dtype::Float32).unwrap(), None)
+                .unwrap()
+                .item::<f32>();
+            assert_eq!(
+                got,
+                100.0 + i as f32,
+                "`blocks.0.{suffix}` / {part:?} did not land on the field the forward reads \
+                 (aliased, swapped, or routed to the wrong part)"
+            );
+        }
+
+        // The qk-RMSNorms are weight-only: a `.diff_b` on one has nowhere to land and must NOT be
+        // quietly absorbed by the gain.
+        for suffix in ["self_attn.norm_q", "cross_attn.norm_k"] {
+            let dotted = format!("blocks.0.{suffix}");
+            let segs: Vec<&str> = dotted.split('.').collect();
+            assert!(
+                dit.norm_param_mut(&segs, mlx_gen::adapters::DiffPatchPart::Bias)
+                    .is_none(),
+                "`{dotted}` is an RMSNorm and has no bias channel"
+            );
+        }
+        // An out-of-surface stem routes nowhere (reported unmatched by the fold, never dropped).
+        assert!(dit
+            .norm_param_mut(
+                &["blocks", "0", "cross_attn", "norm_k_img"],
+                mlx_gen::adapters::DiffPatchPart::Weight
+            )
+            .is_none());
+    }
+
     /// A PEFT LoRA file targeting `blocks.0.self_attn.q` ([dim,dim]) — `diffusion_model.`-prefixed,
     /// A `[rank,dim]`, B `[dim,rank]`, no alpha.
-    fn tiny_lora(name: &str, dim: i32, rank: i32) -> PathBuf {
+    fn tiny_lora(tmp: &tempfile::TempDir, name: &str, dim: i32, rank: i32) -> PathBuf {
         let a = bf16(
             (0..rank * dim).map(|i| (i as f32 * 0.01).sin() * 0.03),
             &[rank, dim],
@@ -2171,7 +3113,7 @@ mod tests {
             (0..dim * rank).map(|i| (i as f32 * 0.007).cos() * 0.03),
             &[dim, rank],
         );
-        let path = tmp_dir().join(name);
+        let path = tmp_dir(tmp).join(name);
         Array::save_safetensors(
             vec![
                 ("diffusion_model.blocks.0.self_attn.q.lora_A.weight", &a),
@@ -2185,7 +3127,7 @@ mod tests {
     }
 
     /// A peft LoKr file (networkType=lokr) targeting `blocks.0.self_attn.q` ([64,64] = kron([8,8],[8,8])).
-    fn tiny_lokr(name: &str) -> PathBuf {
+    fn tiny_lokr(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
         let w1 = Array::from_slice(
             &(0..64)
                 .map(|i| (i as f32 * 0.03).sin() * 0.1)
@@ -2203,7 +3145,7 @@ mod tests {
             ("alpha".to_string(), "8".to_string()),
             ("rank".to_string(), "8".to_string()),
         ]);
-        let path = tmp_dir().join(name);
+        let path = tmp_dir(tmp).join(name);
         Array::save_safetensors(
             vec![
                 ("blocks.0.self_attn.q.lokr_w1", &w1),
@@ -2236,7 +3178,7 @@ mod tests {
 
     /// Construct a bare pre-quantized `Wan` (5B) with a config that reports pre-quantized, so the
     /// generate path would route to the additive install. `bits` mirrors a Q4/Q8 snapshot.
-    fn wan_5b_prequant(adapters: Vec<AdapterSpec>) -> Wan {
+    fn wan_5b_prequant(tmp: &tempfile::TempDir, adapters: Vec<AdapterSpec>) -> Wan {
         let mut cfg = tiny_cfg();
         cfg.quantization = Some(crate::config::WanQuant {
             bits: 8,
@@ -2245,14 +3187,17 @@ mod tests {
         Wan {
             descriptor: descriptor(),
             config: cfg,
-            root: tmp_dir(),
+            root: tmp_dir(tmp),
             adapters,
             quant: None,
             offload_policy: OffloadPolicy::Resident,
+            memory_strategy: None,
+            memory_tier: None,
+            i2v_memory: None,
         }
     }
 
-    fn wan_14b_prequant(adapters: Vec<AdapterSpec>) -> Wan14b {
+    fn wan_14b_prequant(tmp: &tempfile::TempDir, adapters: Vec<AdapterSpec>) -> Wan14b {
         let mut cfg = tiny_cfg();
         cfg.dual_model = true;
         cfg.quantization = Some(crate::config::WanQuant {
@@ -2262,27 +3207,33 @@ mod tests {
         Wan14b {
             descriptor: descriptor_t2v_14b(),
             config: cfg,
-            root: tmp_dir(),
+            root: tmp_dir(tmp),
             adapters,
             quant: None,
             offload_policy: OffloadPolicy::Resident,
+            i2v_memory: None,
         }
     }
 
     #[test]
     fn site_5b_packed_lora_installs_additively_no_error() {
+        let tmp = tempfile::tempdir().unwrap();
         // 5B `Wan::install_adapters_additive`: a plain LoRA installs on a PACKED base with no error;
         // the base stays packed and the q forward-linear gains a residual.
         let cfg = tiny_cfg();
-        let mut dit = tiny_transformer(&cfg);
+        let mut dit = tiny_transformer(&tmp, &cfg);
         dit.quantize(8, None).unwrap();
         assert!(q_is_quantized(&mut dit), "base packed before install");
 
-        let model = wan_5b_prequant(vec![lora_spec(tiny_lora(
-            "site5b.safetensors",
-            cfg.dim as i32,
-            8,
-        ))]);
+        let model = wan_5b_prequant(
+            &tmp,
+            vec![lora_spec(tiny_lora(
+                &tmp,
+                "site5b.safetensors",
+                cfg.dim as i32,
+                8,
+            ))],
+        );
         model
             .install_adapters_additive(&mut dit)
             .expect("plain LoRA on a packed 5B must install with no error");
@@ -2294,16 +3245,17 @@ mod tests {
 
     #[test]
     fn site_5b_packed_lokr_installs_structurally_no_error() {
+        let tmp = tempfile::tempdir().unwrap();
         // 5B (sc-10050): LoKr on a packed base now installs via the structured deferred-Kronecker path
         // with NO error (the sc-10045 interim rejection is gone), and the base STAYS packed.
         let cfg = tiny_cfg();
-        let mut dit = tiny_transformer(&cfg);
+        let mut dit = tiny_transformer(&tmp, &cfg);
         dit.quantize(8, None).unwrap();
         assert!(q_is_quantized(&mut dit), "base packed before install");
 
-        let mut spec = lora_spec(tiny_lokr("site5b_lokr.safetensors"));
+        let mut spec = lora_spec(tiny_lokr(&tmp, "site5b_lokr.safetensors"));
         spec.kind = AdapterKind::Lokr;
-        let model = wan_5b_prequant(vec![spec]);
+        let model = wan_5b_prequant(&tmp, vec![spec]);
         model
             .install_adapters_additive(&mut dit)
             .expect("LoKr on a packed 5B must install structurally with no error (sc-10050)");
@@ -2315,19 +3267,24 @@ mod tests {
 
     #[test]
     fn site_14b_packed_lora_installs_on_both_experts() {
+        let tmp = tempfile::tempdir().unwrap();
         // A14B `Wan14b::install_adapters_additive`: a shared plain LoRA installs onto BOTH packed
         // experts with no error; both bases stay packed.
         let cfg = tiny_cfg();
-        let mut low = tiny_transformer(&cfg);
-        let mut high = tiny_transformer(&cfg);
+        let mut low = tiny_transformer(&tmp, &cfg);
+        let mut high = tiny_transformer(&tmp, &cfg);
         low.quantize(4, None).unwrap();
         high.quantize(4, None).unwrap();
 
-        let model = wan_14b_prequant(vec![lora_spec(tiny_lora(
-            "site14b.safetensors",
-            cfg.dim as i32,
-            8,
-        ))]);
+        let model = wan_14b_prequant(
+            &tmp,
+            vec![lora_spec(tiny_lora(
+                &tmp,
+                "site14b.safetensors",
+                cfg.dim as i32,
+                8,
+            ))],
+        );
         model
             .install_adapters_additive(&mut low, &mut high)
             .expect("plain LoRA on packed A14B experts must install with no error");
@@ -2339,17 +3296,18 @@ mod tests {
 
     #[test]
     fn site_14b_packed_lokr_installs_structurally_no_error() {
+        let tmp = tempfile::tempdir().unwrap();
         // A14B (sc-10050): a shared LoKr installs onto BOTH packed experts via the structured
         // deferred-Kronecker path with NO error; both bases stay packed.
         let cfg = tiny_cfg();
-        let mut low = tiny_transformer(&cfg);
-        let mut high = tiny_transformer(&cfg);
+        let mut low = tiny_transformer(&tmp, &cfg);
+        let mut high = tiny_transformer(&tmp, &cfg);
         low.quantize(4, None).unwrap();
         high.quantize(4, None).unwrap();
 
-        let mut spec = lora_spec(tiny_lokr("site14b_lokr.safetensors"));
+        let mut spec = lora_spec(tiny_lokr(&tmp, "site14b_lokr.safetensors"));
         spec.kind = AdapterKind::Lokr;
-        let model = wan_14b_prequant(vec![spec]);
+        let model = wan_14b_prequant(&tmp, vec![spec]);
         model.install_adapters_additive(&mut low, &mut high).expect(
             "LoKr on packed A14B experts must install structurally with no error (sc-10050)",
         );
@@ -2361,17 +3319,18 @@ mod tests {
 
     #[test]
     fn site_5b_packed_loha_is_explicit_typed_error() {
+        let tmp = tempfile::tempdir().unwrap();
         // 5B: LoHa on a packed base is still rejected (LoHa is sc-10051, out of scope) — the actionable
         // error points at the bf16 tier + sc-10051, not a panic, not the old "not yet wired".
         let cfg = tiny_cfg();
-        let mut dit = tiny_transformer(&cfg);
+        let mut dit = tiny_transformer(&tmp, &cfg);
         dit.quantize(8, None).unwrap();
 
         // A committed third-party LoHa fixture (detected by `hada_*` keys).
         let loha = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("tests/fixtures/sc3643_loha/linear.safetensors");
-        let model = wan_5b_prequant(vec![lora_spec(loha)]);
+        let model = wan_5b_prequant(&tmp, vec![lora_spec(loha)]);
         let err = model
             .install_adapters_additive(&mut dit)
             .expect_err("LoHa on a packed 5B must be rejected (sc-10051)");
@@ -2388,16 +3347,17 @@ mod tests {
 
     #[test]
     fn site_14b_dense_fold_still_works() {
+        let tmp = tempfile::tempdir().unwrap();
         // Dense-path regression: `Wan14b::merge_adapters` (the fold path) still folds a plain LoRA onto
         // both dense expert weight maps, unchanged by sc-10045.
         let cfg = tiny_cfg();
-        let lora = tiny_lora("site14b_dense.safetensors", cfg.dim as i32, 8);
+        let lora = tiny_lora(&tmp, "site14b_dense.safetensors", cfg.dim as i32, 8);
         // Build the two dense expert weight maps from the tiny synthetic base.
         let base_path = {
             let mut c = cfg.clone();
             c.dual_model = true;
-            let _ = tiny_transformer(&c); // side-effect: writes tiny_wan.safetensors
-            tmp_dir().join("tiny_wan.safetensors")
+            let _ = tiny_transformer(&tmp, &c); // side-effect: writes tiny_wan.safetensors
+            tmp_dir(&tmp).join("tiny_wan.safetensors")
         };
         let mut low_w = Weights::from_file(&base_path).unwrap();
         let mut high_w = Weights::from_file(&base_path).unwrap();
@@ -2406,7 +3366,7 @@ mod tests {
             .unwrap()
             .clone();
 
-        let model = wan_14b_prequant(vec![lora_spec(lora)]);
+        let model = wan_14b_prequant(&tmp, vec![lora_spec(lora)]);
         // Use a DENSE config for the fold path (quantization None).
         let dense = Wan14b {
             config: {

@@ -21,7 +21,9 @@ use std::path::{Path, PathBuf};
 use candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::{schedule_sigmas, DiscreteModelSampling, Scheduler, Solver};
-use candle_gen::gen_core::{Image, Progress, WeightsSource};
+use candle_gen::gen_core::{
+    AdapterSpec, Image, LoadSpec, MemoryRunContext, PreviewSink, Progress, WeightsSource,
+};
 // Shared ancestral-step RNG salt (`seed + STEP_RNG_SALT`) — one home in `candle-gen` (sc-9043 / F-059).
 // `LatentDecoder` is the decode seam the optional PiD student implements (epic 7840, sc-8044).
 use candle_gen::gen_core::PidWeights;
@@ -32,17 +34,17 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 use crate::denoise::{
-    decode_image, denoise_curated, denoise_ip_multi_control, seeded_prior, seeded_sigma_prior,
-    text_time_ids, Denoiser,
+    decode_image_with_tiling, denoise_curated, denoise_ip_multi_control, seeded_prior,
+    seeded_sigma_prior, text_time_ids, Denoiser,
 };
 use crate::ip_adapter::{load_ip_kv_pairs, IpImageEncoder, Resampler, ResamplerConfig};
-use crate::loaders::{load_instantid_unet, load_sdxl_vae};
+use crate::loaders::{load_instantid_unet_with_adapters, load_sdxl_vae};
 use crate::pipeline::sdxl_alpha_schedule;
 use crate::sampler::EulerAncestralSampler;
 use crate::unet::UNet2DConditionModel;
 use crate::vision_encoder::{check_layer_count, ClipVisionEncoder, VisionConfig};
 use crate::weights::Weights;
-use crate::{conditioning::SdxlConditioner, AutoEncoderKL, PID_BACKBONE};
+use crate::{conditioning::SdxlConditioner, SdxlArtifactSeal, SdxlVaeDecoder, PID_BACKBONE};
 
 /// The IP-Adapter compute dtype — fp16, matching the production SDXL path (the VAE is the f16-stable
 /// `madebyollin/sdxl-vae-fp16-fix`; the CLIP image encoder runs at this dtype too).
@@ -69,6 +71,9 @@ pub struct IpAdapterSdxlPaths {
     pub tokenizer_clip_bigg: WeightsSource,
     /// The fp16-stable VAE component (`vae_fp16_fix`) — the `.safetensors` file or its dir.
     pub vae_fp16_fix: WeightsSource,
+    /// User-selected SDXL LoRA/LoKr stack, applied to the base UNet before the decoupled IP-Adapter
+    /// K/V pairs are installed. A non-empty non-matching stack fails closed in the shared loader.
+    pub adapters: Vec<AdapterSpec>,
 }
 
 /// One SDXL IP-Adapter generation request.
@@ -97,6 +102,11 @@ pub struct IpAdapterSdxlRequest {
     pub use_pid: bool,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
+    /// The caller's live per-step latent preview sink (epic 16948, sc-16954). This provider is driven
+    /// by name rather than through the registry, so — like Krea's control route and the Qwen-Image
+    /// edit/Fun lanes — the sink travels on the request instead of on a `GenerationRequest`. The
+    /// default (inert) sink leaves the render byte-identical. See [`crate::preview`].
+    pub preview: PreviewSink,
 }
 
 impl Default for IpAdapterSdxlRequest {
@@ -114,6 +124,8 @@ impl Default for IpAdapterSdxlRequest {
             seed: 0,
             use_pid: false,
             cancel: CancelFlag::default(),
+            // Inert by default: a caller that never sets a sink gets exactly today's render.
+            preview: PreviewSink::default(),
         }
     }
 }
@@ -157,13 +169,14 @@ pub struct IpAdapterSdxl {
     conditioner: SdxlConditioner,
     unet: UNet2DConditionModel,
     ip_encoder: IpImageEncoder,
-    vae: AutoEncoderKL,
+    vae: SdxlVaeDecoder,
     sampler: EulerAncestralSampler,
     /// Optional PiD super-resolving decoder (epic 7840, sc-8044), attached via [`with_pid`](Self::with_pid).
     /// Composes the SDXL VAE, so it loads the SAME `sdxl` student ([`PID_BACKBONE`]) as the registered
     /// SDXL provider.
     pid: Option<PidEngine>,
     device: Device,
+    memory_admission: Option<(SdxlArtifactSeal, MemoryRunContext)>,
 }
 
 impl IpAdapterSdxl {
@@ -180,7 +193,7 @@ impl IpAdapterSdxl {
             &paths.tokenizer_clip_l,
             &paths.tokenizer_clip_bigg,
         )?;
-        let mut unet = load_instantid_unet(root, &device, DTYPE)?;
+        let mut unet = load_instantid_unet_with_adapters(root, &device, DTYPE, &paths.adapters)?;
 
         // IP-Adapter-Plus bundle: the Resampler (`image_proj.*`) + the decoupled K/V pairs
         // (`ip_adapter.*`), both at the UNet dtype.
@@ -215,7 +228,24 @@ impl IpAdapterSdxl {
             sampler: EulerAncestralSampler::sdxl(),
             pid: None,
             device,
+            memory_admission: None,
         })
+    }
+
+    /// Load only after the worker's exact selector decision has been bound to the same physical
+    /// base, IP bundle, image encoder, components, adapters, tier, and request context.
+    pub fn load_admitted(
+        paths: &IpAdapterSdxlPaths,
+        spec: &LoadSpec,
+        context: MemoryRunContext,
+    ) -> Result<Self> {
+        crate::memory_strategy::validate_ip_spec(paths, spec)?;
+        let seal = SdxlArtifactSeal::capture_for(spec, crate::SdxlSurface::Bespoke)?;
+        crate::memory_strategy::validate_context(seal.contract(), &context, &seal)?;
+        crate::memory_strategy::validate_bespoke_context(&context)?;
+        let mut model = Self::load(paths)?;
+        model.memory_admission = Some((seal, context));
+        Ok(model)
     }
 
     /// Attach the optional PiD super-resolving decoder (epic 7840, sc-8044). Same [`PidWeights`] load-spec
@@ -259,6 +289,21 @@ impl IpAdapterSdxl {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
+        let memory = if let Some((seal, context)) = &self.memory_admission {
+            crate::memory_strategy::validate_bespoke_request(
+                seal,
+                context,
+                req.width,
+                req.height,
+                1,
+                req.use_pid,
+                "character_image",
+            )?;
+            seal.contract().generation_memory(&context.selection)
+        } else {
+            None
+        };
+        let _attention = crate::enter_attention_memory(memory);
         reject_zero_steps(req.steps)?;
         let cfg_on = req.guidance > 1.0;
 
@@ -298,6 +343,8 @@ impl IpAdapterSdxl {
                 seeded_sigma_prior(req.seed, req.width, req.height, sigmas[0], &self.device)?;
             // Pure IP: no ControlNet branch (`controls = &[]`); `conditioning` is the UNet cross-attn
             // context (and fills the unused `controlnet_encoder` slot). IP tokens preconditioned above.
+            // The curated lane denoises in raw VE σ-space, so the preview renormalizes (sc-16954).
+            let preview = crate::preview::ve_hook(&req.preview);
             denoise_curated(
                 &self.unet,
                 Some(sampler_name),
@@ -312,6 +359,7 @@ impl IpAdapterSdxl {
                 req.seed,
                 &req.cancel,
                 on_progress,
+                Some(&preview),
                 &[],
                 &conditioning,
             )?
@@ -334,7 +382,8 @@ impl IpAdapterSdxl {
                 &mut rng,
                 &req.cancel,
                 on_progress,
-                &[],           // pure IP — no ControlNet branches
+                &req.preview, // ancestral: the running latent is already in the fit's domain
+                &[],          // pure IP — no ControlNet branches
                 &conditioning, // controlnet_encoder is unused with no controls
             )?
         };
@@ -343,7 +392,8 @@ impl IpAdapterSdxl {
         // generation opted in (`req.use_pid`) and `with_pid` loaded one (epic 7840, sc-8044).
         let pid_decoder = self.pid_decoder_for(req)?;
         let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
-        decode_image(&self.vae, &latents, pid_ref)
+        let tiling = crate::denoise::decode_tiling(memory);
+        decode_image_with_tiling(&self.vae, &latents, pid_ref, Some(&req.cancel), tiling)
     }
 
     /// Build the CFG-batched IP tokens from the reference image. **Uncond-first**: under CFG the uncond
@@ -396,13 +446,8 @@ mod tests {
     /// `resolve_image_encoder`: a directory resolves `model.safetensors`; a missing dir errors loudly.
     #[test]
     fn image_encoder_resolution() {
-        let dir = std::env::temp_dir().join(format!(
-            "candle_ipadapter_enc_{}_{}",
-            std::process::id(),
-            "t"
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         // No weight file yet → error.
         assert!(resolve_image_encoder(&dir).is_err());
         // Create a model.safetensors stand-in → resolves to it.
@@ -411,6 +456,5 @@ mod tests {
         assert_eq!(resolve_image_encoder(&dir).unwrap(), f);
         // A direct file path is used as-is.
         assert_eq!(resolve_image_encoder(&f).unwrap(), f);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

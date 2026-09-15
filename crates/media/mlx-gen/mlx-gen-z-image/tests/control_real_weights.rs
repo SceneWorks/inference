@@ -4,7 +4,7 @@
 //! `#[ignore]`d — needs the real `Tongyi-MAI/Z-Image-Turbo` base + the
 //! `alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1` control checkpoint in the HF cache, plus the
 //! golden produced by `tools/dump_z_image_control_golden.py` (gitignored, local). Run with:
-//!   cargo test -p mlx-gen-z-image --release --test control_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-z-image --release --test integration control_real_weights:: -- --ignored --nocapture
 //!
 //! Stage gates isolate the control transformer (feeding the fork's exact `cap_feats` +
 //! `control_context`): the scale-0 self-consistency (control inert ⇒ base), the single-forward
@@ -34,9 +34,10 @@ const Q8_GOLDEN: &str = concat!(
     "/../tools/golden/z_image_control_q8_golden.safetensors"
 );
 
-/// Locate the base Z-Image-Turbo snapshot dir (env override, else the HF cache).
-mod common;
+use crate::common;
+
 use common::snapshot;
+use mlx_gen::attention::AttentionBudget;
 
 /// Locate the Fun-Controlnet-Union checkpoint (env override `CONTROL_WEIGHTS`, else the golden's
 /// recorded path, else the HF cache). Returned as a single-file `WeightsSource`.
@@ -213,6 +214,8 @@ fn control_denoise_loop_matches_golden() {
         &cc,
         scale,
         0,
+        AttentionBudget::UNBOUNDED,
+        None,
         &Default::default(),
         &mut |_| {},
     )
@@ -274,6 +277,8 @@ fn control_dtype_compare() {
             &cc,
             scale,
             0,
+            AttentionBudget::UNBOUNDED,
+            None,
             &Default::default(),
             &mut |_| {},
         )
@@ -396,6 +401,8 @@ fn control_q8_transformer_matches_golden() {
         &cc,
         scale,
         0,
+        AttentionBudget::UNBOUNDED,
+        None,
         &Default::default(),
         &mut |_| {},
     )
@@ -610,6 +617,8 @@ fn control_q8_determinism() {
             &cc,
             scale,
             0,
+            AttentionBudget::UNBOUNDED,
+            None,
             &Default::default(),
             &mut |_| {},
         )

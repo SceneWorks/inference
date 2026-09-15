@@ -6,7 +6,7 @@
 //! reference `input_ids` **byte-for-byte** for every prompt (using the golden's recorded date for the
 //! harmony preamble), and that the preamble is exactly `TXT_OFFSET` tokens.
 //!
-//! Run: `cargo test -p mlx-gen-lens --test tokenizer_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-lens --test integration tokenizer_parity:: -- --ignored --nocapture`
 
 use mlx_gen::weights::Weights;
 use mlx_gen_lens::text::{LensTokenizer, TXT_OFFSET};
@@ -18,7 +18,7 @@ const GOLDEN: &str = concat!(
 
 fn newest_snapshot() -> std::path::PathBuf {
     let base = std::path::PathBuf::from(std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)"))
-        .join("models--microsoft--Lens-Turbo/snapshots");
+        .join("models--SceneWorks--Lens-Turbo/snapshots");
     std::fs::read_dir(&base)
         .unwrap_or_else(|_| panic!("snapshot dir {}", base.display()))
         .filter_map(|e| e.ok())

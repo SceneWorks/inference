@@ -173,8 +173,8 @@ mod tests {
 
     #[test]
     fn probe_rejects_non_moss_layouts() {
-        let dir = std::env::temp_dir().join("moss-sfx-prepare-probe");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         std::fs::create_dir_all(dir.join("transformer")).unwrap();
         // Empty dir → no.
         assert!(!can_prepare(&spec(&dir)));
@@ -197,13 +197,12 @@ mod tests {
         )
         .unwrap();
         assert!(can_prepare(&spec(&dir)));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn prepare_refuses_quantization_typed() {
-        let dir = std::env::temp_dir().join("moss-sfx-prepare-quant");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         std::fs::create_dir_all(dir.join("transformer")).unwrap();
         std::fs::write(dir.join(DIT_WEIGHTS), tiny_safetensors(&["w"])).unwrap();
         std::fs::write(
@@ -214,17 +213,14 @@ mod tests {
         let mut s = spec(&dir);
         s.quantize = Some(core_llm::Quantize::Q4);
         assert!(matches!(prepare(&s), Err(CoreError::Unsupported(_))));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn safetensors_header_count_is_metadata_free() {
-        let dir = std::env::temp_dir().join("moss-sfx-prepare-count");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let p = dir.join("x.safetensors");
         std::fs::write(&p, tiny_safetensors(&["a", "b", "__metadata__"])).unwrap();
         assert_eq!(safetensors_tensor_count(&p).unwrap(), 2);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

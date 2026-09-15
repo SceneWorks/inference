@@ -38,21 +38,20 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{Image, Progress};
+use candle_gen::gen_core::{Image, PreviewSink, Progress, WeightsSource};
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::z_image::preprocess::prepare_inputs;
 use candle_transformers::models::z_image::scheduler::{
     calculate_shift, FlowMatchEulerDiscreteScheduler, SchedulerConfig, BASE_IMAGE_SEQ_LEN,
     BASE_SHIFT, MAX_IMAGE_SEQ_LEN, MAX_SHIFT,
 };
-use candle_transformers::models::z_image::text_encoder::{TextEncoderConfig, ZImageTextEncoder};
-use candle_transformers::models::z_image::transformer::{
-    Config as DitConfig, ZImageTransformer2DModel,
-};
+use candle_transformers::models::z_image::transformer::Config as DitConfig;
 use candle_transformers::models::z_image::vae::{AutoEncoderKL, Encoder as VaeEncoder, VaeConfig};
 
 // Shared Z-Image plumbing (loader/decode/preprocess/tokenizer/seed) — one home (sc-9002 / F-022).
 use crate::common::{self, ResizePolicy, ENC_DTYPE, PATCH_SIZE, SPATIAL_SCALE};
+use crate::dit::ZImageTransformer2DModel;
+use crate::pipeline::{Pipeline, TextEnc};
 
 /// The transformer + latents run bf16 (Z-Image native, the validated candle txt2img dtype); the VAE
 /// encoder runs f32 (the encode path's dtype) and its mean is cast to bf16 for the init latent.
@@ -76,6 +75,10 @@ pub struct ZImageEditPaths {
     /// The `Tongyi-MAI/Z-Image-Turbo` base snapshot dir (`tokenizer/`, `text_encoder/`, `transformer/`,
     /// `vae/`).
     pub base: PathBuf,
+    /// Explicit text-encoder substitution selected for this route. `None` preserves the bundled
+    /// `<base>/text_encoder` source byte-for-byte. An override is exhaustively validated and pinned
+    /// before its tensor payload opens.
+    pub text_encoder: Option<WeightsSource>,
 }
 
 /// One Z-Image img2img / edit request. No negative/guidance — Z-Image-Turbo is guidance-distilled.
@@ -91,6 +94,16 @@ pub struct ZImageEditRequest {
     pub seed: u64,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
+    /// Per-step latent-preview sink (epic 16948, sc-16957) — the bespoke-request twin of
+    /// [`gen_core::GenerationRequest::preview`](candle_gen::gen_core::GenerationRequest::preview),
+    /// which this provider cannot use because the worker drives it by name rather than through the
+    /// registry. [`PreviewSink::default`] is inert and byte-identical to a render with no preview at
+    /// all.
+    ///
+    /// This lane owns its denoise loop, so it emits against the sink directly rather than handing a
+    /// hook to a driver. Frames cover the **reduced** `start..steps` tail the strength selects, which
+    /// is also the range the lane reports as `Progress::Step`.
+    pub preview: PreviewSink,
 }
 
 impl Default for ZImageEditRequest {
@@ -103,6 +116,7 @@ impl Default for ZImageEditRequest {
             strength: DEFAULT_EDIT_STRENGTH,
             seed: 0,
             cancel: CancelFlag::default(),
+            preview: PreviewSink::default(),
         }
     }
 }
@@ -112,7 +126,7 @@ impl Default for ZImageEditRequest {
 /// encoder (deterministic mean encode of the source).
 pub struct ZImageEdit {
     device: Device,
-    text_encoder: ZImageTextEncoder,
+    text_encoder: TextEnc,
     /// Qwen tokenizer, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
     /// instead of re-parsing `tokenizer.json` per prompt.
     tokenizer: candle_gen::gen_core::tokenizer::TextTokenizer,
@@ -132,10 +146,16 @@ impl ZImageEdit {
         let device = candle_gen::default_device()?;
         let root = paths.base.clone();
 
-        let text_encoder = ZImageTextEncoder::new(
-            &TextEncoderConfig::z_image(),
-            component_vb(&root, "text_encoder", DTYPE, &device)?,
-        )?;
+        let builtin = candle_gen::gen_core::WeightsSource::Dir(root.join("text_encoder"));
+        let selected = paths.text_encoder.as_ref().unwrap_or(&builtin);
+        let validated = crate::ENCODER_CONTRACT
+            .validate_source_against_base(selected, &root)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        let pipeline =
+            Pipeline::load_with_text_encoder(&root, validated, &device, DTYPE, &[], None);
+        let text = pipeline.load_text_phase()?;
+        let text_encoder = text.text_encoder;
+        let tokenizer = text.tokenizer;
 
         let mut dit_cfg = DitConfig::z_image_turbo();
         // sc-9032: no-op `flash-attn` feature removed; accelerated dispatch is never wired behind a
@@ -153,7 +173,6 @@ impl ZImageEdit {
             component_vb(&root, "vae", ENC_DTYPE, &device)?.pp("encoder"),
         )?;
 
-        let tokenizer = common::build_tokenizer(&root, "z-image edit")?;
         Ok(Self {
             device,
             text_encoder,
@@ -163,6 +182,34 @@ impl ZImageEdit {
             vae_encoder,
             vae_shift: vae_cfg.shift_factor,
             vae_scale: vae_cfg.scaling_factor,
+        })
+    }
+
+    /// Load through the exact prepared text-encoder receipt retained by the caller.
+    pub fn load_with_spec(
+        paths: &ZImageEditPaths,
+        spec: &candle_gen::gen_core::LoadSpec,
+    ) -> Result<Self> {
+        match &spec.weights {
+            WeightsSource::Dir(admitted_root) if admitted_root == &paths.base => {}
+            WeightsSource::Dir(admitted_root) => {
+                return Err(CandleError::Msg(format!(
+                    "z-image edit: runtime base {} differs from admitted base {}",
+                    paths.base.display(),
+                    admitted_root.display()
+                )));
+            }
+            WeightsSource::File(_) => {
+                return Err(CandleError::Msg(
+                    "z-image edit: admitted base must be the runtime snapshot directory".to_owned(),
+                ));
+            }
+        }
+        spec.read_prepared_files_unchanged(|| {
+            Self::load(&ZImageEditPaths {
+                base: paths.base.clone(),
+                text_encoder: spec.text_encoder.clone(),
+            })
         })
     }
 
@@ -219,26 +266,44 @@ impl ZImageEdit {
         let x_t = ((clean * (1.0 - sigma_start))? + (noise * sigma_start)?)?;
 
         // prepare_inputs pads cap_feats (+ mask) and adds the frame axis → latents (1,16,1,lat_h,lat_w).
+        candle_gen::check_cancel(&req.cancel)?;
         let prepared = prepare_inputs(&x_t, std::slice::from_ref(&cap), &self.device)?;
         let cap_feats = prepared.cap_feats;
         let cap_mask = prepared.cap_mask;
         let mut latents = prepared.latents;
+        let dit_prepared = self
+            .transformer
+            .prepare_conditioning(&latents, &cap_feats, &cap_mask)?;
 
         // Reduced schedule: run steps `start..steps`. Reading scheduler.sigmas/timesteps directly (both
         // pub) and doing the Euler step inline is byte-identical to the txt2img loop's
         // `current_timestep_normalized()` + `step()` — it just starts at `start` instead of 0.
         let total = (steps - start) as u32;
+        // Per-step latent preview (epic 16948, sc-16957). A bespoke loop, so it numbers its own frames
+        // against the shared step-keyed counter — built over `total`, the REDUCED step count this lane
+        // reports as `Progress::Step { total }`, and fed the loop-local `step_i - start`. Using the
+        // absolute index would number the first frame `start + 1` and emit nothing at all once
+        // `start >= total`. Emitted at the TOP of the iteration, on the latent ENTERING the step, which
+        // is where the shared drivers emit (`candle-gen/src/sampler.rs`). The VAE-encoded source is
+        // already folded into `x_t` before the loop, so there is one trajectory and it is the target's.
+        let preview_counter = crate::preview::bespoke_counter(total as usize);
         for step_i in start..steps {
             if req.cancel.is_cancelled() {
                 return Err(CandleError::Canceled);
             }
+            candle_gen::preview::emit_preview_at(
+                &req.preview,
+                &preview_counter,
+                step_i - start,
+                || crate::preview::project_frame_latents(&latents),
+            );
             // The DiT timestep convention is 1−σ (the scheduler's `current_timestep_normalized`).
             let t_norm = (1000.0 - scheduler.timesteps[step_i]) / 1000.0;
             let t = Tensor::from_vec(vec![t_norm as f32], (1,), &self.device)?;
             // The Z-Image DiT velocity is negated before the flow-match Euler step (the sign convention).
             let velocity = self
                 .transformer
-                .forward(&latents, &t, &cap_feats, &cap_mask)?
+                .forward_prepared(&latents, &t, &dit_prepared)?
                 .neg()?;
             // Euler step: x_{i+1} = x_i + (σ_{i+1} − σ_i)·velocity (= scheduler.step).
             let dt = scheduler.sigmas[step_i + 1] - scheduler.sigmas[step_i];
@@ -308,6 +373,28 @@ fn component_vb(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edit_rejects_wrong_selected_encoder_before_transformer_load() {
+        let snapshot = tempfile::tempdir().unwrap();
+        let encoder = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(encoder.path(), crate::ENCODER_CONTRACT)
+            .unwrap();
+        let config_path = encoder.path().join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["vocab_size"] = serde_json::json!(crate::ENCODER_CONTRACT.vocab_size - 1);
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+        let error = ZImageEdit::load(&ZImageEditPaths {
+            base: snapshot.path().to_path_buf(),
+            text_encoder: Some(WeightsSource::Dir(encoder.path().to_path_buf())),
+        })
+        .err()
+        .expect("wrong encoder must reject before transformer or VAE load")
+        .to_string();
+        assert!(error.contains("field vocab_size"), "{error}");
+    }
 
     #[test]
     fn request_defaults() {

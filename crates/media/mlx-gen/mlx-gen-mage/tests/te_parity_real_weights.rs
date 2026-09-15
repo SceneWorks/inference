@@ -7,7 +7,7 @@
 //! ```sh
 //! MAGE_SNAPSHOT=/path/to/models--microsoft--Mage-Flow/snapshots/<rev> \
 //! MAGE_FLOW_TE_GOLDEN=/path/to/tools/golden/mage_flow_te_golden.safetensors \
-//!   cargo test -p mlx-gen-mage --release --test te_parity_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-mage --release --test integration te_parity_real_weights:: -- --ignored --nocapture
 //! ```
 //!
 //! Both are **caller-provisioned local paths** — this crate never derives a cache location

@@ -7,9 +7,9 @@
 //! In-process via `mlx_rs::memory` (Metal wired memory is not in `ps` RSS / `/usr/bin/time` would
 //! only catch the process peak). `#[ignore]` — needs the converted snapshot (~53 GB). Run e.g.:
 //!   IDEOGRAM4_QUANT=q4 IDEOGRAM4_SMOKE_RES=1024 IDEOGRAM4_SMOKE_STEPS=8 \
-//!     cargo test -p mlx-gen-ideogram --test memprofile -- --ignored --nocapture
+//!     cargo test -p mlx-gen-ideogram --test integration memprofile:: -- --ignored --nocapture
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 
@@ -112,7 +112,10 @@ fn profile_footprint() {
         "[{label}] degenerate image — quant broke the forward"
     );
 
-    let out_path = std::env::temp_dir().join(format!("ideogram4_{label}_{res}.png"));
+    let out_path = std::env::temp_dir().join(format!(
+        "ideogram4_{label}_{res}_{}.png",
+        std::process::id()
+    ));
     image::RgbImage::from_raw(res, res, im.pixels.clone())
         .unwrap()
         .save(&out_path)

@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! set Z_IMAGE_SNAPSHOT=C:\Users\…\models--Tongyi-MAI--Z-Image-Turbo\snapshots\<hash>
-//! cargo test -p candle-gen-z-image --features cuda --release --test trainer_e2e -- --ignored --nocapture
+//! cargo test -p candle-gen-z-image --features cuda --release --test integration trainer_e2e:: -- --ignored --nocapture
 //! ```
 //!
 //! What it proves:
@@ -65,6 +65,7 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
             image_path: path,
             caption: format!("a solid colour swatch number {i}"),
             control_image_path: None,
+            model_options: Default::default(),
         });
     }
     items
@@ -218,7 +219,8 @@ fn assert_reloads(adapter_path: &Path, kind: AdapterKind, n_targets: usize) {
 #[test]
 #[ignore = "needs real Z-Image weights + a CUDA GPU; run with --features cuda --release --ignored"]
 fn z_image_trainer_lora_trains_reloads_and_renders() {
-    let tmp = std::env::temp_dir().join("candle_zimage_trainer_lora_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let out = run(
         &tmp,
         "swatch_lora.safetensors",
@@ -260,7 +262,8 @@ fn z_image_trainer_lora_trains_reloads_and_renders() {
 #[test]
 #[ignore = "needs real Z-Image weights + a CUDA GPU; run with --features cuda --release --ignored"]
 fn z_image_trainer_gradient_checkpointing_trains_and_reloads() {
-    let tmp = std::env::temp_dir().join("candle_zimage_trainer_ckpt_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let out = run(&tmp, "swatch_ckpt.safetensors", NetworkType::Lora, 64, true);
     assert_converged("zimage-ckpt", &out.losses);
 
@@ -298,7 +301,8 @@ fn z_image_trainer_gradient_checkpointing_trains_and_reloads() {
 #[test]
 #[ignore = "needs real Z-Image weights + a CUDA GPU; run with --features cuda --release --ignored"]
 fn z_image_trainer_lokr_trains_and_reloads() {
-    let tmp = std::env::temp_dir().join("candle_zimage_trainer_lokr_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     // 128 steps: the LoKr Kronecker reparam descends slower than LoRA at the same lr/rank, so it needs
     // more steps to show a clear median fall on this tiny over-fit task.
     let out = run(
@@ -333,7 +337,8 @@ fn z_image_trainer_emits_preview_samples() {
         eprintln!("skipping: set Z_IMAGE_SNAPSHOT (or populate the HF cache)");
         return;
     }
-    let tmp = std::env::temp_dir().join("candle_zimage_trainer_samples_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
     assert_eq!(candle_gen_z_image::MODEL_ID, "z_image_turbo");
     let mut trainer = candle_gen_z_image::provider_registry()
@@ -414,15 +419,17 @@ fn z_image_trainer_emits_preview_samples() {
 #[test]
 #[ignore = "needs real Z-Image weights + a CUDA GPU; run with --features cuda --release --ignored"]
 fn z_image_trainer_same_seed_is_reproducible() {
+    let det_a = tempfile::tempdir().unwrap();
+    let det_b = tempfile::tempdir().unwrap();
     let a = run(
-        &std::env::temp_dir().join("candle_zimage_trainer_det_a"),
+        det_a.path(),
         "det_a.safetensors",
         NetworkType::Lora,
         6,
         false,
     );
     let b = run(
-        &std::env::temp_dir().join("candle_zimage_trainer_det_b"),
+        det_b.path(),
         "det_b.safetensors",
         NetworkType::Lora,
         6,

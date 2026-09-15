@@ -6,13 +6,13 @@
 //! and VAE-decode each segment back to pixels.
 //!
 //! Reuse map — the heavy components are `candle-gen-wan`'s (SCAIL-2 *is* Wan2.1-14B I2V): the z16
-//! [`WanVae16`] (encode/decode; its decode already streams one latent frame at a time = the
+//! [`ProviderVae`] (encode/decode; its decode already streams one latent frame at a time = the
 //! temporal-tiled decode the high-res fix needs), the [`Umt5Encoder`] text encoder, and the
 //! flow-matching [`FlowScheduler`] (UniPC). SCAIL-2's own pieces are the [`Scail2Dit`] forward, the
 //! open-CLIP [`ScailClip`] image encode, the 28-channel [`extract_and_compress_mask_to_latent`] mask
 //! build, and the [`interpolate`]/[`downsample_half`] resizes.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
@@ -23,23 +23,23 @@ use candle_gen_wan::config::TextEncoderConfig;
 use candle_gen_wan::pipeline::frames_to_images;
 use candle_gen_wan::scheduler::{FlowScheduler, Sampler};
 use candle_gen_wan::text_encoder::Umt5Encoder;
-use candle_gen_wan::vae16::WanVae16;
 
 use crate::clip::ScailClip;
 use crate::model::{Scail2Dit, Scail2Inputs};
 use crate::preprocess::{extract_and_compress_mask_to_latent, TEMPORAL_STRIDE};
 use crate::resize::{clip_preprocess, downsample_half, interpolate, Interp};
+use crate::ProviderVae;
 
 /// Inputs must be divisible by 32: the pose path halves spatially (→ ÷16) before the ÷8 VAE stride, and
 /// the 28-channel mask pools 8×, so both the full and half grids stay integer + even.
-const DIM_ALIGN: u32 = 32;
+pub(crate) const DIM_ALIGN: u32 = crate::VAE_TILING.spatial_scale as u32 * 4;
 
 /// The loaded SCAIL-2 components (resident in the [`crate::pipeline::Scail2`] generator's cache). All
 /// run f32 (the DiT's high-token-length NaN avoidance, and z16 VAE / UMT5 / CLIP are f32 anyway).
 pub struct Components {
     pub te: Umt5Encoder,
     pub dit: Scail2Dit,
-    pub vae: WanVae16,
+    pub vae: ProviderVae,
     pub clip: ScailClip,
     /// UMT5 tokenizer, loaded+parsed **once** at component load and reused across the pos/neg encodes
     /// (sc-8991 / F-011) instead of re-parsing `tokenizer.json` per generate call.
@@ -48,13 +48,16 @@ pub struct Components {
 
 /// One masked character reference (the primary subject or an extra character): an RGB image paired with
 /// its color-coded segmentation mask.
+#[derive(Debug)]
 pub struct CharacterRef<'a> {
     pub image: &'a Image,
     pub mask: &'a Image,
 }
 
 /// A fully-specified SCAIL-2 generation job (the engine-internal form the worker maps a
-/// `GenerationRequest` onto). All images are decoded + resized to `(width, height)` here.
+/// `GenerationRequest` onto). `width` and `height` must already be non-zero multiples of the
+/// 32-pixel render lattice; [`generate`] rejects an invalid job rather than silently changing its geometry.
+/// All images are decoded + resized to `(width, height)` here.
 pub struct Scail2Job<'a> {
     pub prompt: &'a str,
     pub negative_prompt: &'a str,
@@ -76,8 +79,60 @@ pub struct Scail2Job<'a> {
     pub segment_overlap: usize,
 }
 
-/// Round a requested dim down to a multiple of [`DIM_ALIGN`] (min one tile).
-fn align(value: u32) -> usize {
+/// Encode every additional character while observing cancellation before, between, and after the
+/// individual VAE/mask passes. Extra references are input-side work and intentionally emit no
+/// progress events: the existing global denoise sweep remains the sole `Progress::Step` sequence
+/// and therefore stays monotonic.
+fn map_additional_references<T, U>(
+    additional: &[CharacterRef<'_>],
+    cancel: &CancelFlag,
+    mut encode_image: impl FnMut(&CharacterRef<'_>) -> CResult<T>,
+    mut encode_mask: impl FnMut(&CharacterRef<'_>) -> CResult<U>,
+) -> CResult<Vec<(T, U)>> {
+    let mut encoded = Vec::with_capacity(additional.len());
+    for reference in additional {
+        if cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        let image = encode_image(reference)?;
+        if cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        let mask = encode_mask(reference)?;
+        if cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        encoded.push((image, mask));
+    }
+    Ok(encoded)
+}
+
+/// Validate the exact render geometry carried by the public [`Scail2Job`] API.
+///
+/// Direct callers do not carry the explicit-versus-resolved origin available to the provider
+/// adapter, so this lower-level API accepts exact render geometry only.
+fn validate_job_geometry(width: u32, height: u32) -> CResult<(usize, usize)> {
+    if width < DIM_ALIGN
+        || height < DIM_ALIGN
+        || !width.is_multiple_of(DIM_ALIGN)
+        || !height.is_multiple_of(DIM_ALIGN)
+    {
+        return Err(CandleError::Msg(format!(
+            "scail2: Scail2Job width/height must be non-zero multiples of {DIM_ALIGN} \
+             (got {width}×{height})"
+        )));
+    }
+    Ok((width as usize, height as usize))
+}
+
+/// Project a dimension onto the SCAIL-2 render lattice for the provider's area calculation.
+///
+/// Since sc-16198, the provider rejects off-grid explicit requests before the area gate, so this is
+/// a no-op for every reachable explicit request. Keeping the lattice projection in the area helper
+/// preserves sc-16197's rendered-geometry rule for direct helper probes and any future resolved-size
+/// path. The public low-level [`generate`] API does not call this function: it requires exact geometry
+/// through [`validate_job_geometry`].
+pub(crate) fn align(value: u32) -> usize {
     (value / DIM_ALIGN).max(1) as usize * DIM_ALIGN as usize
 }
 
@@ -135,7 +190,7 @@ fn stack_masks(masks: &[Image], tw: usize, th: usize) -> CResult<Tensor> {
 }
 
 /// VAE-encode a `[3, T, H, W]` pixel clip (`[-1,1]`) → `[16, T_lat, H/8, W/8]` (drops the batch dim).
-fn vae_encode_cthw(vae: &WanVae16, cthw: &Tensor) -> CResult<Tensor> {
+fn vae_encode_cthw(vae: &ProviderVae, cthw: &Tensor) -> CResult<Tensor> {
     let (c, t, h, w) = cthw.dims4()?;
     let z = vae.encode(&cthw.reshape((1, c, t, h, w))?)?; // [1,16,T_lat,h,w]
     let (_, zc, zt, zh, zw) = z.dims5()?;
@@ -260,12 +315,16 @@ fn encode_text(
     Ok(embeds.reshape((l, d))?)
 }
 
-/// Build the SCAIL-2 UMT5 tokenizer from `root/tokenizer/tokenizer.json` **once** (sc-8991 / F-011), so
-/// the generator caches it on its `Components` and reuses it across generate calls rather than
-/// re-parsing per request. Byte-identical [`TokenizerConfig`] to the old per-generate load.
-pub fn build_tokenizer(root: &Path, te_cfg: &TextEncoderConfig) -> CResult<TextTokenizer> {
+/// Build the SCAIL-2 UMT5 tokenizer from an explicit `tokenizer.json` path **once** (sc-8991 /
+/// F-011). The legacy candle snapshot stores it under `tokenizer/tokenizer.json`; the shared
+/// `SceneWorks/scail2-mlx` tier stores the byte-identical tokenizer at the tier root. Keeping this
+/// path-shaped lets both layouts share one parser without copying the file.
+pub fn build_tokenizer_from_path(
+    tokenizer_path: PathBuf,
+    te_cfg: &TextEncoderConfig,
+) -> CResult<TextTokenizer> {
     TextTokenizer::from_file(
-        root.join("tokenizer/tokenizer.json"),
+        tokenizer_path,
         TokenizerConfig {
             max_length: te_cfg.max_length,
             pad_token_id: te_cfg.pad_token_id,
@@ -274,6 +333,11 @@ pub fn build_tokenizer(root: &Path, te_cfg: &TextEncoderConfig) -> CResult<TextT
         },
     )
     .map_err(|e| CandleError::Msg(format!("scail2: load tokenizer: {e}")))
+}
+
+/// Legacy component-directory wrapper retained for caller compatibility.
+pub fn build_tokenizer(root: &Path, te_cfg: &TextEncoderConfig) -> CResult<TextTokenizer> {
+    build_tokenizer_from_path(root.join("tokenizer/tokenizer.json"), te_cfg)
 }
 
 /// Run the full SCAIL-2 generation for `job` against the resident `comps`. `cancel` is polled each
@@ -310,7 +374,9 @@ pub fn generate(
         )));
     }
     let dev = comps.dit.device();
-    let (tw, th) = (align(job.width), align(job.height));
+    // This is the exact geometry all image and latent paths consume. Keeping validation in the
+    // conversion makes it impossible for the public job API to snap before rendering.
+    let (tw, th) = validate_job_geometry(job.width, job.height)?;
     let cfg_disabled = job.guidance <= 1.0;
 
     // --- decode + resize all pixel inputs to (tw, th) ---
@@ -332,20 +398,28 @@ pub fn generate(
     let (additional_ref_latent, additional_ref_masks) = if job.additional.is_empty() {
         (None, None)
     } else {
-        let mut lats = Vec::new();
-        let mut masks = Vec::new();
-        for c in &job.additional {
-            let img =
-                image_to_chw(c.image, tw, th, Interp::Bicubic, dev)?.reshape((3, 1, th, tw))?;
-            lats.push(vae_encode_cthw(&comps.vae, &img)?);
-            let mk =
-                image_to_chw(c.mask, tw, th, Interp::Bilinear, dev)?.reshape((3, 1, th, tw))?;
-            masks.push(extract_and_compress_mask_to_latent(&mk, TEMPORAL_STRIDE)?);
-        }
+        let encoded = map_additional_references(
+            &job.additional,
+            cancel,
+            |c| {
+                let img =
+                    image_to_chw(c.image, tw, th, Interp::Bicubic, dev)?.reshape((3, 1, th, tw))?;
+                vae_encode_cthw(&comps.vae, &img)
+            },
+            |c| {
+                let mk =
+                    image_to_chw(c.mask, tw, th, Interp::Bilinear, dev)?.reshape((3, 1, th, tw))?;
+                Ok(extract_and_compress_mask_to_latent(&mk, TEMPORAL_STRIDE)?)
+            },
+        )?;
+        let (lats, masks): (Vec<_>, Vec<_>) = encoded.into_iter().unzip();
         let lr: Vec<&Tensor> = lats.iter().collect();
         let mr: Vec<&Tensor> = masks.iter().collect();
         (Some(Tensor::cat(&lr, 1)?), Some(Tensor::cat(&mr, 1)?))
     };
+    if cancel.is_cancelled() {
+        return Err(CandleError::Canceled);
+    }
 
     // --- UMT5 text encode + CLIP reference-image features (once) ---
     // The tokenizer is loaded+parsed once at component load (sc-8991 / F-011) — reuse the cached one.
@@ -498,12 +572,33 @@ pub fn generate(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_segments, image_to_chw_host, segment_step_progress, stack_frames, stack_masks,
-        vae_align, Image, Interp, TEMPORAL_STRIDE,
+        build_segments, image_to_chw_host, map_additional_references, segment_step_progress,
+        stack_frames, stack_masks, vae_align, validate_job_geometry, CharacterRef, Image, Interp,
+        TEMPORAL_STRIDE,
     };
     use crate::preprocess::extract_and_compress_mask_to_latent;
     use crate::resize::{downsample_half, interpolate};
     use candle_gen::candle_core::{Device, Tensor};
+    use candle_gen::gen_core::runtime::CancelFlag;
+    use candle_gen::CandleError;
+
+    #[test]
+    fn public_job_geometry_is_exact_or_rejected() {
+        assert_eq!(
+            validate_job_geometry(1280, 704).expect("on-grid geometry is exact"),
+            (1280, 704)
+        );
+        for (width, height) in [(1280, 730), (730, 1280), (0, 704), (704, 0)] {
+            let err = validate_job_geometry(width, height)
+                .expect_err("the public low-level job must never be silently snapped")
+                .to_string();
+            assert!(
+                err.contains("non-zero multiples of 32")
+                    && err.contains(&format!("{width}×{height}")),
+                "got: {err}"
+            );
+        }
+    }
 
     /// The pre-sc-12517 ordering: upload the native-sized normalized tensor to `dev`, then call the
     /// host-backed resize, which reads it back and recreates the output on `dev`.
@@ -793,5 +888,71 @@ mod tests {
             assert_eq!(current, (i + 1) as u32);
             assert_eq!(total, steps as u32);
         }
+    }
+
+    #[test]
+    fn cancellation_during_one_extra_vae_stops_before_mask_and_later_conditioning() {
+        let first = sample_image(2, 2, 1);
+        let refs = [CharacterRef {
+            image: &first,
+            mask: &first,
+        }];
+        let cancel = CancelFlag::new();
+        let mut vae_passes = 0;
+        let mut mask_passes = 0;
+        let mut later_conditioning_entered = false;
+        let result = map_additional_references(
+            &refs,
+            &cancel,
+            |_| {
+                vae_passes += 1;
+                cancel.cancel();
+                Ok(())
+            },
+            |_| {
+                mask_passes += 1;
+                Ok(())
+            },
+        );
+        if result.is_ok() {
+            later_conditioning_entered = true;
+        }
+        let error = result.expect_err("cancellation during VAE must stop the single extra pair");
+        assert!(matches!(error, CandleError::Canceled), "got: {error}");
+        assert_eq!(vae_passes, 1, "the extra reference entered its VAE pass");
+        assert_eq!(mask_passes, 0, "mask preprocessing must not begin");
+        assert!(
+            !later_conditioning_entered,
+            "later text/image conditioning must not begin"
+        );
+    }
+
+    #[test]
+    fn cancellation_during_last_extra_mask_stops_before_later_conditioning() {
+        let first = sample_image(2, 2, 1);
+        let refs = [CharacterRef {
+            image: &first,
+            mask: &first,
+        }];
+        let cancel = CancelFlag::new();
+        let mut later_conditioning_entered = false;
+        let result = map_additional_references(
+            &refs,
+            &cancel,
+            |_| Ok(()),
+            |_| {
+                cancel.cancel();
+                Ok(())
+            },
+        );
+        if result.is_ok() {
+            later_conditioning_entered = true;
+        }
+        let error = result.expect_err("cancellation after the last mask must stop conditioning");
+        assert!(matches!(error, CandleError::Canceled), "got: {error}");
+        assert!(
+            !later_conditioning_entered,
+            "later text/image conditioning must not begin"
+        );
     }
 }

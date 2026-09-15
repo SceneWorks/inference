@@ -49,25 +49,25 @@ pub const FAMILY: &str = "openvoice";
 pub const HUB_REPO: &str = "myshell-ai/OpenVoiceV2";
 pub const HUB_REVISION: &str = "f36e7edfe1684461a8343844af60babc2efbb727";
 
-/// The license of the pinned OpenVoice V2 weight checkpoint (sc-13332) — surfaced for SceneWorks'
-/// end-product licenses page. MIT (permissive), verified against the `myshell-ai/OpenVoiceV2`
-/// model card (both V1 and V2 relicensed to MIT in April 2024).
-pub const WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
-    candle_audio::gen_core::WeightLicense {
-        spdx_id: "MIT",
-        name: "MIT License",
-        source_url: "https://huggingface.co/myshell-ai/OpenVoiceV2",
-        attribution: Some("OpenVoice V2 © MyShell.ai — licensed under MIT"),
-        commercial_use: true,
-        restriction: None,
-    };
+/// Stable component key for the pinned OpenVoice V2 checkpoint — what `PROVIDER_COMPONENTS`
+/// resolves through, and the licence manifest's unique row key.
+pub const COMPONENT_KEY: &str = "openvoice_v2";
 
-/// This provider's weight-license entry (keyed by [`MODEL_ID`]) for catalog aggregation.
-pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
-    candle_audio::gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: None,
-        license: WEIGHT_LICENSE,
+/// The schema-3 licence row for the pinned OpenVoice V2 checkpoint (sc-16663).
+///
+/// **Disclosure only.** The row records what the upstream declares so a consumer can show it to a
+/// user; nothing here decides whether any use is permitted. `declared` and `gated` were read from
+/// the `myshell-ai/OpenVoiceV2` model card on `retrieved`, and `family` normalizes that declaration onto
+/// [`candle_audio::gen_core::license::families::MIT`].
+pub const COMPONENT_LICENSE: candle_audio::gen_core::ComponentLicense =
+    candle_audio::gen_core::ComponentLicense {
+        component: COMPONENT_KEY,
+        source_url: "https://huggingface.co/myshell-ai/OpenVoiceV2",
+        gated: false,
+        declared: "mit",
+        family: "mit",
+        attribution: Some("OpenVoice V2 © MyShell.ai — licensed under MIT"),
+        retrieved: "2026-08-02",
     };
 
 /// The converter files inside the pinned repo (both live under `converter/`).
@@ -357,7 +357,8 @@ mod tests {
 
     #[test]
     fn load_rejects_unsupported_spec_shapes() {
-        let dir = std::env::temp_dir();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         assert!(load(&LoadSpec::new(WeightsSource::File(
             dir.join("checkpoint.pth")
         )))
@@ -369,8 +370,8 @@ mod tests {
 
     #[test]
     fn pre_tripped_cancel_returns_typed_canceled_before_any_heavy_work() {
-        let dir = std::env::temp_dir().join("openvoice-missing-snapshot");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let t = load(&LoadSpec::new(WeightsSource::Dir(dir))).unwrap();
         let flag = CancelFlag::new();
         flag.cancel();
@@ -386,8 +387,8 @@ mod tests {
 
     #[test]
     fn apply_on_a_missing_snapshot_fails_cleanly() {
-        let dir = std::env::temp_dir().join("openvoice-missing-snapshot");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let t = load(&LoadSpec::new(WeightsSource::Dir(dir))).unwrap();
         let req = AudioTransformRequest {
             audio: track(config::MIN_SAMPLES, 24_000),

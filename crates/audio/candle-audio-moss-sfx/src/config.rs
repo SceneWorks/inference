@@ -260,8 +260,8 @@ mod tests {
 
     #[test]
     fn parses_the_pinned_snapshot_shape() {
-        let dir = std::env::temp_dir().join("moss-sfx-config-parse");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         write_snapshot(&dir);
         let cfg = SnapshotConfig::from_snapshot(&dir).unwrap();
         assert_eq!(cfg.index.sample_rate, 48_000);
@@ -271,13 +271,12 @@ mod tests {
         assert_eq!(cfg.dit.dim, 1536);
         assert_eq!(cfg.dit.head_dim(), 128);
         assert_eq!(cfg.text_encoder.num_hidden_layers, 28);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn rejects_foreign_or_drifted_snapshots() {
-        let dir = std::env::temp_dir().join("moss-sfx-config-reject");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         write_snapshot(&dir);
         // A different pipeline class is rejected up front.
         std::fs::write(
@@ -296,6 +295,5 @@ mod tests {
         )
         .unwrap();
         assert!(SnapshotConfig::from_snapshot(&dir).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

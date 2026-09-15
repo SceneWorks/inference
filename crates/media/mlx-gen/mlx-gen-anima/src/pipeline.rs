@@ -6,17 +6,20 @@ use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::adapters::loader::ApplyReport;
+use mlx_gen::attention::AttentionPlan;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::media::Image;
 use mlx_gen::runtime::{AdapterSpec, CancelFlag};
+use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{
-    resolve_flow_schedule, run_flow_sampler, Error, Progress, Result, TimestepConvention,
-    WeightsSource,
+    resolve_flow_schedule, run_flow_sampler, Error, PreviewSink, Progress, Result, StagedHeavy,
+    TimestepConvention, WeightsSource,
 };
 
+use crate::block_stream::BlockWindow;
 use crate::conditioner::AnimaTextConditioner;
 use crate::config::{Variant, SIGMA_SHIFT, VAE_CHANNELS, VAE_COMPRESSION};
-use crate::loader::{load_heavy_phase, load_text_phase, AnimaComponents};
+use crate::loader::{load_heavy_phase_with_stream, load_text_phase, AnimaComponents};
 use crate::text_encoder::AnimaQwen3;
 use crate::tokenizer::AnimaTokenizers;
 use crate::transformer::CosmosDiT;
@@ -233,6 +236,7 @@ impl AnimaPipeline {
             scheduler,
             seed,
             dtype,
+            &PreviewSink::default(),
             cancel,
             on_progress,
         )
@@ -269,6 +273,7 @@ impl AnimaPipeline {
             None,
             0,
             dit_dtype,
+            &PreviewSink::default(),
             &cancel,
             &mut prog,
         )
@@ -371,11 +376,68 @@ impl AnimaPipeline {
     }
 }
 
+/// One inference denoise trajectory's preview state. Anima owns schedule cadence; Qwen owns the
+/// single-frame layout conversion and latent-to-RGB fit because both families use the same VAE.
+struct AnimaPreview<'a> {
+    sink: &'a PreviewSink,
+    counter: mlx_gen::preview::PreviewCounter,
+    sigmas: &'a [f32],
+}
+
+impl<'a> AnimaPreview<'a> {
+    fn new(sink: &'a PreviewSink, sigmas: &'a [f32]) -> Self {
+        Self {
+            sink,
+            counter: mlx_gen::preview::PreviewCounter::new(sigmas),
+            sigmas,
+        }
+    }
+
+    fn emit(&self, sigma: f32, latents: &Array) {
+        mlx_gen_qwen_image::preview::emit_single_frame_preview(
+            self.sink,
+            &self.counter,
+            self.sigmas,
+            sigma,
+            latents,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_anima_sampler<F>(
+    sampler: Option<&str>,
+    sigmas: &[f32],
+    latents: Array,
+    seed: u64,
+    cancel: &CancelFlag,
+    preview: &AnimaPreview<'_>,
+    on_progress: &mut dyn FnMut(Progress),
+    mut predict: F,
+) -> Result<Array>
+where
+    F: FnMut(&Array, f32) -> Result<Array>,
+{
+    run_flow_sampler(
+        sampler,
+        TimestepConvention::Sigma,
+        sigmas,
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        |x, timestep| {
+            preview.emit(timestep, x);
+            predict(x, timestep)
+        },
+    )
+}
+
 /// The core flow-denoise loop given ALREADY-COMPUTED conditioning (sc-10577 decoupling; hoisted to a
 /// free fn over the DiT in sc-10840 so the resident struct API AND the staged-residency generator share
 /// one integrator): run `sampler` over [`anima_schedule`] from `init`, evaluating `dit` in `dit_dtype`,
 /// with CFG when `uncond` is `Some`. Byte-identical to the pre-hoist method — it took `&self` only to
-/// reach `self.components.dit`.
+/// reach `self.components.dit`. `preview` is advisory and cannot fail the denoise.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn denoise_loop(
     dit: &CosmosDiT,
@@ -388,18 +450,62 @@ pub(crate) fn denoise_loop(
     scheduler: Option<&str>,
     seed: u64,
     dit_dtype: Dtype,
+    preview: &PreviewSink,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_loop_bounded(
+        dit,
+        init,
+        cond,
+        uncond,
+        steps,
+        guidance,
+        sampler,
+        scheduler,
+        seed,
+        dit_dtype,
+        preview,
+        cancel,
+        on_progress,
+        AttentionPlan::UNBOUNDED,
+        None,
+    )
+}
+
+/// [`denoise_loop`] under the request's memory plan — ladder rungs 3 and 4 (SC-15524).
+///
+/// `attention` and `window` reach **every** advertised denoise route: the plain Turbo single forward
+/// and BOTH forwards of the Base/Aesthetic CFG pair. Neither changes precision, seed, σ schedule,
+/// sampler or conditioning; `UNBOUNDED` + `None` is byte-for-byte [`denoise_loop`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_loop_bounded(
+    dit: &CosmosDiT,
+    init: &Array,
+    cond: &Array,
+    uncond: Option<&Array>,
+    steps: usize,
+    guidance: f32,
+    sampler: &str,
+    scheduler: Option<&str>,
+    seed: u64,
+    dit_dtype: Dtype,
+    preview: &PreviewSink,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    attention: AttentionPlan<'_>,
+    window: Option<BlockWindow<'_>>,
+) -> Result<Array> {
     let sigmas = anima_schedule(scheduler, steps);
+    let previews = AnimaPreview::new(preview, &sigmas);
     let guidance = Array::from_slice(&[guidance], &[1]);
     let predict = |x: &Array, sigma: f32| -> Result<Array> {
         let s = Array::from_slice(&[sigma], &[1]);
-        let v_cond = dit.forward(x, &s, cond, dit_dtype)?;
+        let v_cond = dit.forward_bounded(x, &s, cond, dit_dtype, attention, window)?;
         let v = match uncond {
             // CFG: v = v_uncond + guidance·(v_cond − v_uncond).
             Some(u) => {
-                let v_u = dit.forward(x, &s, u, dit_dtype)?;
+                let v_u = dit.forward_bounded(x, &s, u, dit_dtype, attention, window)?;
                 add(&v_u, &multiply(&subtract(&v_cond, &v_u)?, &guidance)?)?
             }
             None => v_cond,
@@ -407,13 +513,13 @@ pub(crate) fn denoise_loop(
         // Integrate in f32 (the reference keeps latents f32).
         Ok(v.as_dtype(Dtype::Float32)?)
     };
-    run_flow_sampler(
+    run_anima_sampler(
         Some(sampler),
-        TimestepConvention::Sigma,
         &sigmas,
         init.clone(),
         seed,
         cancel,
+        &previews,
         on_progress,
         predict,
     )
@@ -525,9 +631,20 @@ pub struct AnimaHeavy {
 
 impl AnimaHeavy {
     /// Load the DiT + bundled conditioner (`diffusion_models/`) + VAE (`vae/`), via the shared
-    /// [`load_heavy_phase`] the resident `AnimaComponents::load` also uses.
+    /// [`load_heavy_phase`](crate::loader::load_heavy_phase) the resident `AnimaComponents::load`
+    /// also uses.
     pub fn load(source: &WeightsSource, variant: Variant) -> Result<Self> {
-        let (dit, conditioner, vae) = load_heavy_phase(source, variant)?;
+        Self::load_with_stream(source, variant, false)
+    }
+
+    /// [`load`](Self::load) in the component form this request selected (SC-15524). `streamable`
+    /// arms ladder rung 4 on the DiT; every other component is loaded identically.
+    pub fn load_with_stream(
+        source: &WeightsSource,
+        variant: Variant,
+        streamable: bool,
+    ) -> Result<Self> {
+        let (dit, conditioner, vae) = load_heavy_phase_with_stream(source, variant, streamable)?;
         Ok(Self {
             dit,
             conditioner,
@@ -535,11 +652,34 @@ impl AnimaHeavy {
         })
     }
 
+    /// Whether ladder rung 4 can execute on this bundle.
+    pub fn can_stream_blocks(&self) -> bool {
+        self.dit.can_stream_blocks()
+    }
+
     /// Bake LoRA/LoKr adapters onto the DiT **and** the bundled conditioner in one strict pass
     /// (sc-10521 / sc-10274). Both live on this bundle, so the whole spec — `blocks.*` (DiT) +
     /// `llm_adapter.*` (conditioner) — is validated together and a span-both LoRA can't load partial.
+    ///
+    /// The per-block adapter capture for rung 4 happens HERE, immediately after the strict install,
+    /// so a streamed block replays exactly what the resident block ended up holding. Doing it any
+    /// later would leave a window at which a rung-4 render silently drops every LoRA — identity-free
+    /// output with no error (the `anima-turbo-lora-v0.2` 508-target failure mode).
     pub fn apply_adapters(&mut self, specs: &[AdapterSpec]) -> Result<ApplyReport> {
-        crate::adapters::apply_anima_adapters(&mut self.dit, &mut self.conditioner, specs)
+        let report =
+            crate::adapters::apply_anima_adapters(&mut self.dit, &mut self.conditioner, specs)?;
+        self.dit.capture_block_adapters();
+        Ok(report)
+    }
+
+    /// Plan a rung-4 block window for this request, or `None` for the resident stack. A window
+    /// requested on a bundle that cannot stream is a typed error, never a silent resident execution.
+    pub(crate) fn block_window<'a>(
+        &self,
+        window_size: Option<usize>,
+        cancel: &'a CancelFlag,
+    ) -> Result<Option<BlockWindow<'a>>> {
+        self.dit.block_window(window_size, cancel)
     }
 
     /// Run the conditioner forward over the phase-A inputs → `encoder_hidden_states` `[1, 512, 1024]`.
@@ -565,11 +705,110 @@ impl AnimaHeavy {
         sampler: &str,
         scheduler: Option<&str>,
         seed: u64,
+        preview: &PreviewSink,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        let latent = self.denoise_one(
+            cond,
+            uncond,
+            width,
+            height,
+            steps,
+            guidance,
+            sampler,
+            scheduler,
+            seed,
+            preview,
+            cancel,
+            on_progress,
+            AttentionPlan::UNBOUNDED,
+            None,
+        )?;
+        on_progress(Progress::Decoding);
+        self.decode_view().decode_one(&latent, cancel, None)
+    }
+
+    /// Calibration seam (SC-15524): [`denoise_one`](Self::denoise_one) at an explicit rung-3/rung-4
+    /// execution shape, with the block window taken **raw** rather than through the published
+    /// domain.
+    ///
+    /// The split is deliberate and is the same one rung 2 already has:
+    /// [`crate::memory_strategy::transformer_window_size`] owns the *policy* (which cadences this
+    /// family measured and will execute) and the production path refuses everything outside it,
+    /// while this is the *mechanism* — the exact analogue of `QwenVae::decode_tiled` accepting any
+    /// `TilingConfig` so the decode sweep can measure the edges it then rejects.
+    ///
+    /// It exists so `transformer_window_sweep_shows_the_published_domain_is_exact` can MEASURE the
+    /// unpublished cadences (including the all-covering control that bounds nothing) instead of
+    /// asserting the domain it is supposed to be deriving. Nothing in production calls it: a request
+    /// cannot reach it, because it takes a `usize` and not a `GenerationRequest`.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn calibration_denoise_one(
+        &self,
+        cond: &Array,
+        uncond: Option<&Array>,
+        width: u32,
+        height: u32,
+        steps: usize,
+        guidance: f32,
+        sampler: &str,
+        seed: u64,
+        chunk_attention: bool,
+        window_size: Option<usize>,
+        cancel: &CancelFlag,
+    ) -> Result<Array> {
+        let attention = if chunk_attention {
+            AttentionPlan::budgeted(mlx_gen::attention::AttentionBudget::CONSTRAINED)
+                .with_cancel(cancel)
+        } else {
+            AttentionPlan::UNBOUNDED
+        };
+        let window = self.block_window(window_size, cancel)?;
+        self.denoise_one(
+            cond,
+            uncond,
+            width,
+            height,
+            steps,
+            guidance,
+            sampler,
+            None,
+            seed,
+            &PreviewSink::default(),
+            cancel,
+            &mut |_| {},
+            attention,
+            window,
+        )
+    }
+
+    /// The denoise half of [`render_one`] — seed → noise → flow denoise (`dit`, bf16) → latent.
+    ///
+    /// Split out for ladder rung 1: the staged schedule materializes every latent while the DiT is
+    /// alive, sheds the DiT + conditioner, and only then decodes. `attention`/`window` carry rungs 3
+    /// and 4; `UNBOUNDED` + `None` reproduces the historical trajectory exactly.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn denoise_one(
+        &self,
+        cond: &Array,
+        uncond: Option<&Array>,
+        width: u32,
+        height: u32,
+        steps: usize,
+        guidance: f32,
+        sampler: &str,
+        scheduler: Option<&str>,
+        seed: u64,
+        preview: &PreviewSink,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        attention: AttentionPlan<'_>,
+        window: Option<BlockWindow<'_>>,
+    ) -> Result<Array> {
         let noise = create_noise(seed, width, height)?;
-        let latent = denoise_loop(
+        denoise_loop_bounded(
             &self.dit,
             &noise,
             cond,
@@ -580,11 +819,72 @@ impl AnimaHeavy {
             scheduler,
             seed,
             Dtype::Bfloat16,
+            preview,
             cancel,
             on_progress,
-        )?;
-        let decoded = self.vae.decode(&latent)?; // [1, 3, 1, H, W] f32 in [-1, 1]
+            attention,
+            window,
+        )
+    }
+}
+
+/// What survives ladder rung 1's denoise→decode boundary: the ~250 MB Qwen-Image VAE. The DiT and the
+/// bundled conditioner — the 4.18 GB the request is actually bound by — are dropped.
+pub struct AnimaLight {
+    vae: QwenVae,
+}
+
+/// A borrow of whichever VAE the decode phase should use: the warm bundle's (Resident) or the shed
+/// bundle's (staged). One decode body serves both, so a staged request is byte-identical to a warm one.
+pub struct AnimaDecodeView<'a> {
+    vae: &'a QwenVae,
+}
+
+impl AnimaDecodeView<'_> {
+    /// Decode one `[1, 16, 1, H/8, W/8]` latent to RGB, optionally through the bounded (tiled) VAE
+    /// path — ladder rung 2. The tiled decode preserves the exact output geometry: the shared
+    /// `mlx_gen::vae_tiling` accumulator blends `scale×` tile slabs into the same `H×W` buffer the
+    /// single-pass decode writes.
+    ///
+    /// **Both arms honor `cancel`, and the untiled one has exactly one place it can.** MLX is lazy:
+    /// `vae.decode` only *builds* the graph, and `decoded_to_image`'s `as_slice` readback is what
+    /// forces the whole single-pass decode — the most expensive uninterruptible span in the request.
+    /// There is no interior boundary to poll inside it (that is what rung 2's per-tile check buys),
+    /// so the honest guarantee is per-latent: a cancel observed before this decode starts aborts
+    /// here rather than after the readback. Rung 1 made that matter — decodes moved from
+    /// interleaved-with-denoise to a trailing batch, so a `count = 8` render has eight of these in a
+    /// row and the phase-C loop re-checks before each one.
+    pub fn decode_one(
+        &self,
+        latent: &Array,
+        cancel: &CancelFlag,
+        tiling: Option<&TilingConfig>,
+    ) -> Result<Image> {
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let decoded = match tiling {
+            Some(tiling) => self.vae.decode_tiled(latent, tiling, Some(cancel))?,
+            None => self.vae.decode(latent)?,
+        }; // [1, 3, 1, H, W] f32 in [-1, 1]
         decoded_to_image(&decoded)
+    }
+}
+
+impl StagedHeavy for AnimaHeavy {
+    type Light = AnimaLight;
+    type DecodeView<'a> = AnimaDecodeView<'a>;
+
+    fn shed_dit(self) -> AnimaLight {
+        AnimaLight { vae: self.vae }
+    }
+
+    fn decode_view(&self) -> AnimaDecodeView<'_> {
+        AnimaDecodeView { vae: &self.vae }
+    }
+
+    fn light_view(light: &AnimaLight) -> AnimaDecodeView<'_> {
+        AnimaDecodeView { vae: &light.vae }
     }
 }
 
@@ -732,7 +1032,141 @@ pub(crate) fn render_latent_with_enc(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+
+    fn zero_velocity(x: &Array, _sigma: f32) -> Result<Array> {
+        Ok(Array::zeros::<f32>(x.shape())?)
+    }
+
+    fn captured_sink() -> (PreviewSink, Arc<Mutex<Vec<mlx_gen::PreviewFrame>>>) {
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&frames);
+        let sink = PreviewSink::new(move |frame| captured.lock().unwrap().push(frame));
+        (sink, frames)
+    }
+
+    #[test]
+    fn active_preview_emits_one_numbered_frame_per_euler_step() {
+        let sigmas = [1.0_f32, 0.7, 0.3, 0.0];
+        let (sink, frames) = captured_sink();
+        let previews = AnimaPreview::new(&sink, &sigmas);
+
+        run_anima_sampler(
+            Some("euler"),
+            &sigmas,
+            Array::zeros::<f32>(&[1, 16, 1, 2, 3]).unwrap(),
+            16629,
+            &CancelFlag::new(),
+            &previews,
+            &mut |_| {},
+            zero_velocity,
+        )
+        .unwrap();
+
+        let frames = frames.lock().unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| (frame.current, frame.total))
+                .collect::<Vec<_>>(),
+            [(1, 3), (2, 3), (3, 3)]
+        );
+        assert!(frames
+            .iter()
+            .all(|frame| (frame.image.width, frame.image.height) == (3, 2)));
+    }
+
+    #[test]
+    fn active_preview_deduplicates_multieval_heun_steps() {
+        let sigmas = [1.0_f32, 0.7, 0.3, 0.0];
+        let (sink, frames) = captured_sink();
+        let previews = AnimaPreview::new(&sink, &sigmas);
+
+        run_anima_sampler(
+            Some("heun"),
+            &sigmas,
+            Array::zeros::<f32>(&[1, 16, 1, 2, 2]).unwrap(),
+            16629,
+            &CancelFlag::new(),
+            &previews,
+            &mut |_| {},
+            zero_velocity,
+        )
+        .unwrap();
+
+        let frames = frames.lock().unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames.last().map(|frame| frame.current), Some(3));
+        assert!(frames.iter().all(|frame| frame.total == 3));
+    }
+
+    #[test]
+    fn inert_preview_preserves_fixed_seed_default_sampler_bytes() {
+        let sigmas = anima_sigmas(4);
+        let seed = 16629;
+        let initial = create_noise(seed, 16, 16).unwrap();
+        let direct = run_flow_sampler(
+            Some(DEFAULT_SAMPLER),
+            TimestepConvention::Sigma,
+            &sigmas,
+            initial.clone(),
+            seed,
+            &CancelFlag::new(),
+            &mut |_| {},
+            zero_velocity,
+        )
+        .unwrap();
+        let sink = PreviewSink::default();
+        let previews = AnimaPreview::new(&sink, &sigmas);
+        let wrapped = run_anima_sampler(
+            Some(DEFAULT_SAMPLER),
+            &sigmas,
+            initial,
+            seed,
+            &CancelFlag::new(),
+            &previews,
+            &mut |_| {},
+            zero_velocity,
+        )
+        .unwrap();
+
+        assert_eq!(
+            direct.try_as_slice::<f32>().unwrap(),
+            wrapped.try_as_slice::<f32>().unwrap()
+        );
+        assert_eq!(previews.counter.next(&sigmas, sigmas[0]), Some(1));
+    }
+
+    #[test]
+    fn single_frame_layout_reuses_qwen_projection_exactly() {
+        let sigmas = [1.0_f32, 0.0];
+        let latents = create_noise(42, 16, 24).unwrap();
+        assert_eq!(latents.shape(), &[1, 16, 1, 3, 2]);
+
+        let (anima_sink, anima_frames) = captured_sink();
+        AnimaPreview::new(&anima_sink, &sigmas).emit(sigmas[0], &latents);
+
+        let spatial = latents.reshape(&[1, 16, 3, 2]).unwrap();
+        let (qwen_sink, qwen_frames) = captured_sink();
+        mlx_gen_qwen_image::preview::emit_spatial_preview(
+            &qwen_sink,
+            &mlx_gen::preview::PreviewCounter::new(&sigmas),
+            &sigmas,
+            sigmas[0],
+            &spatial,
+        );
+
+        let anima_frames = anima_frames.lock().unwrap();
+        let qwen_frames = qwen_frames.lock().unwrap();
+        assert_eq!(anima_frames.len(), 1);
+        assert_eq!(qwen_frames.len(), 1);
+        assert_eq!(anima_frames[0].current, qwen_frames[0].current);
+        assert_eq!(anima_frames[0].total, qwen_frames[0].total);
+        assert_eq!(anima_frames[0].image, qwen_frames[0].image);
+    }
 
     #[test]
     fn sigma_schedule_linspace_shift3() {

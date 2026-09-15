@@ -14,7 +14,7 @@
 //! `#[ignore]` until weights + fixtures are staged on the box (sc-6248). Run:
 //!   SAM3_WEIGHTS=<snapshot> SAM3_E2E_FIXTURE=<e2e_fixture.safetensors> \
 //!   SAM3_TRACKER_FIXTURE=<tracker_fixture.safetensors> \
-//!     cargo test -p candle-gen-sam3 --release --features cuda --test quant_smoke -- --ignored --nocapture
+//!     cargo test -p candle-gen-sam3 --release --features cuda --test integration quant_smoke:: -- --ignored --nocapture
 
 use std::path::Path;
 

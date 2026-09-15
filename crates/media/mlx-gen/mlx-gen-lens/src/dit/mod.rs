@@ -12,6 +12,7 @@
 pub mod attention;
 pub mod block;
 pub mod rope;
+mod stream;
 #[allow(clippy::module_inception)]
 pub mod transformer;
 

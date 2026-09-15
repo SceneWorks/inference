@@ -4,7 +4,7 @@
 //! (`mlx-gen/scripts/spikes/sam3_oracle/dump_trackframe_fixture.py`). `#[ignore]` until weights +
 //! fixture are staged (sc-6248). Run:
 //!   SAM3_WEIGHTS=<snapshot> SAM3_TRACKFRAME_FIXTURE=<trackframe_fixture.safetensors> \
-//!     cargo test -p candle-gen-sam3 --release --features cuda --test trackframe_parity -- --ignored --nocapture
+//!     cargo test -p candle-gen-sam3 --release --features cuda --test integration trackframe_parity:: -- --ignored --nocapture
 
 use std::path::Path;
 

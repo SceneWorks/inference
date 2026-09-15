@@ -17,7 +17,7 @@ use layers::{
     fold_patches, unfold_patches, FinalLayer, PatchTokenEmbedder, PixelTokenEmbedder,
     TimestepConditioner,
 };
-use rope::{rope_1d_text, rope_2d_ntk};
+use rope::RopeTableCache;
 
 // The pure host-side positional math is exposed so parity tests can gate it directly.
 pub use layers::sincos_2d_pos;
@@ -51,6 +51,8 @@ pub struct PixDiT {
     pixel_blocks: Vec<PiTBlock>,
     final_layer: FinalLayer,
     cfg: PidConfig,
+    /// Step-invariant host RoPE tables, keyed by geometry and bounded per-generation backbone.
+    rope_cache: RopeTableCache,
 }
 
 /// Slice the `[B, S, …]` axis-1 prefix `[:, :n]` (no-op when `S == n`).
@@ -99,6 +101,7 @@ impl PixDiT {
             pixel_blocks,
             final_layer: FinalLayer::from_weights(w, &format!("{prefix}final_layer"))?,
             cfg: cfg.clone(),
+            rope_cache: RopeTableCache::default(),
         })
     }
 
@@ -147,7 +150,7 @@ impl PixDiT {
         let mut y_emb = y_emb.broadcast_add(&y_pos)?;
 
         let condition = t_emb.silu()?;
-        let (cos_img, sin_img) = rope_2d_ntk(
+        let (cos_img, sin_img) = self.rope_cache.image(
             cfg.head_dim(),
             hs,
             ws,
@@ -158,7 +161,8 @@ impl PixDiT {
             device,
         )?;
         let (cos_txt, sin_txt) =
-            rope_1d_text(cfg.head_dim(), ltxt as i32, cfg.text_rope_theta, device)?;
+            self.rope_cache
+                .text(cfg.head_dim(), ltxt as i32, cfg.text_rope_theta, device)?;
 
         let mut s_main = self.s_embedder.forward(&x_patches)?;
         for (i, blk) in self.patch_blocks.iter().enumerate() {
@@ -181,7 +185,7 @@ impl PixDiT {
         let s_cond = s.reshape((b * l, cfg.hidden_size as usize))?;
 
         let mut x_pixels = self.pixel_embedder.forward(x, h as i32, w as i32, patch)?;
-        let (cos_pix, sin_pix) = rope_2d_ntk(
+        let (cos_pix, sin_pix) = self.rope_cache.image(
             cfg.pixel_head_dim(),
             hs,
             ws,

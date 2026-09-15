@@ -8,13 +8,18 @@
 //!   seeded sampler), and non-degenerate (not a single collapsed id). A broken backbone / weight
 //!   mapping / RoPE / multi-embedding sum / local-transformer head wiring would produce empty,
 //!   out-of-range, or all-identical frames and fail here.
-//! - [`moss_tts_realtime_is_incremental`] — the AR loop is genuinely incremental: the time to the
-//!   **first** RVQ frame is materially less than the time to the **full** budget.
+//! - [`moss_tts_realtime_is_incremental`] — the AR loop's progress reporting is one-per-frame:
+//!   `Progress::Step { current }` arrives once per returned frame, starting at 1 and advancing by
+//!   one. sc-19556 replaced the former "time to the first frame < time to the full budget" bound,
+//!   which was degenerate as well as clock-bound; see the note at the assertion. This does NOT
+//!   distinguish an incremental decode from a buffer-everything one.
 //! - [`moss_tts_realtime_streaming_gate`] — the sc-13334 streaming acceptance gate, now released by
 //!   the codec: `gen_core_testkit::check_audio_streaming` against the **real** registered provider
 //!   ((a) ≥ 2 PCM chunks before completion; (b) concat(chunks) == one-shot `generate()`
 //!   byte-identical; (c) valid 24 kHz mono track), plus (c) full audio non-silent / speech-shaped
-//!   and (d) first-chunk latency < full-generation latency, and it writes a playable demo WAV.
+//!   and (d) the chunk stream is a faithful partition of the returned track — non-empty first
+//!   chunk, strictly smaller than the track, and the chunks reassemble to it exactly. It also
+//!   writes a playable demo WAV. sc-19556 replaced the former first-chunk-latency bound here too.
 //! - [`moss_tts_realtime_asr_roundtrip_fidelity`] — the sc-13433 **text-fidelity** gate: a curated
 //!   fixed prompt set is synthesized at the shipped sampling default and transcribed back with
 //!   `whisper_base`; each transcript must match its prompt within a character-error-rate bound (and
@@ -25,8 +30,13 @@
 //!
 //! `#[ignore]`d and snapshot-gated like every audio family's real-weight tests:
 //! ```text
-//! cargo test --locked -p candle-audio-moss-tts-realtime --test conformance -- --ignored --nocapture
+//! cargo test --locked -p candle-audio-moss-tts-realtime --test conformance -- \
+//!     --ignored --nocapture --test-threads=1
 //! ```
+//! `--test-threads=1` is **required**, not tidiness: this binary installs a process-wide
+//! [`TrackingAlloc`] global allocator (sc-17263) and
+//! [`moss_audio_codec_chunked_encode_matches_single_shot`] measures heap high-water marks through
+//! it, so a test running concurrently in the same process would land in its measurement window.
 //! Set `MOSS_TTS_REALTIME_SNAPSHOT` to the AR snapshot dir (~4.66 GB, holding `config.json`,
 //! `model.safetensors`, `tokenizer.json`) — **required**, a passed-in path: inference never
 //! self-fetches or derives a cache location (epic 13657). The MOSS-Audio-Tokenizer codec (~7.1 GB) is
@@ -37,7 +47,6 @@
 //! `WHISPER_SNAPSHOT` (the ~150 MB snapshot dir), also a passed-in path, never a hub fetch.
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
 
 use candle_audio_moss_tts_realtime as moss;
 use candle_audio_moss_tts_realtime::gen_core::{
@@ -91,6 +100,45 @@ fn request(seconds: f32) -> GenerationRequest {
         seed: Some(20260719),
         ..Default::default()
     }
+}
+
+/// Require the emitted chunks to be the returned track's exact ordered sample partition.
+#[track_caller]
+fn assert_chunks_reassemble_exact<'a>(chunks: impl IntoIterator<Item = &'a [f32]>, track: &[f32]) {
+    let reassembled: Vec<f32> = chunks.into_iter().flatten().copied().collect();
+    assert_eq!(
+        reassembled.len(),
+        track.len(),
+        "the chunks must reassemble to the returned track's exact sample count"
+    );
+    if let Some(index) = reassembled
+        .iter()
+        .zip(track)
+        .position(|(chunk, track)| chunk != track)
+    {
+        panic!(
+            "the chunks must reassemble sample-for-sample to exactly the returned track: sample \
+             {index} differs (chunk {}, track {})",
+            reassembled[index], track[index]
+        );
+    }
+}
+
+#[test]
+fn exact_chunk_reassembly_rejects_equal_length_sample_corruption() {
+    let first = [0.25, -0.5];
+    let second = [0.75, 1.0];
+    let track = [0.25, -0.5, 0.75, 1.0];
+    assert_chunks_reassemble_exact([first.as_slice(), second.as_slice()], &track);
+
+    let corrupted_first = [-0.25, -0.5];
+    assert!(
+        std::panic::catch_unwind(|| {
+            assert_chunks_reassemble_exact([corrupted_first.as_slice(), second.as_slice()], &track)
+        })
+        .is_err(),
+        "equal-length chunks with changed sample content must be rejected"
+    );
 }
 
 /// AR-stage gate: real weights decode valid, non-degenerate, deterministic RVQ frames.
@@ -172,39 +220,66 @@ fn moss_tts_realtime_is_incremental() {
         .expect("warm-up decode");
 
     use candle_audio_moss_tts_realtime::gen_core::Progress;
-    let mut first_frame_at: Option<std::time::Duration> = None;
-    let start = Instant::now();
+    // sc-19556: this used to compare `first_frame_at` against the total elapsed decode. That
+    // comparison was DEGENERATE as well as clock-bound: `total` is sampled after `rvq_frames`
+    // returns, and the callback necessarily fires before then, so `first < total` held for ANY
+    // implementation — including the "emit everything at the end" one the assertion named as the
+    // case it existed to catch.
+    //
+    // What replaces it is a PROGRESS-CADENCE check, read from the callback stream with no clock:
+    // `Step { current }` must arrive once per returned frame, starting at 1 and advancing by one.
+    // That catches a decode whose reporting has come loose from its production — a wrong count, a
+    // skipped or repeated index, an out-of-order stream, or no reporting at all.
+    //
+    // SCOPE, stated plainly because the assertion being replaced overclaimed at exactly this point:
+    // this does NOT catch the buffer-everything implementation. A decode that computed every frame
+    // first and then fired N callbacks 1..N satisfies the count, first-index and consecutiveness
+    // checks below. Separating that case from a real incremental decode needs evidence that the
+    // callback fires BEFORE the remaining frames exist, which is either a clock — just removed here
+    // for being degenerate — or a seam this generator does not expose. So the cadence claim is the
+    // one the stream can actually support, and it is the only one made.
+    let mut steps: Vec<u32> = Vec::new();
     let result = gen
         .rvq_frames(&request(1.6), &mut |p| {
-            if let Progress::Step { current: 1, .. } = p {
-                first_frame_at = Some(start.elapsed());
+            if let Progress::Step { current, .. } = p {
+                steps.push(current);
             }
         })
-        .expect("timed AR decode");
-    let total = start.elapsed();
-    let first = first_frame_at.expect("at least one frame was decoded");
+        .expect("AR decode");
     eprintln!(
-        "first frame at {:.3?}, full {} frames at {:.3?}",
-        first,
-        result.frames.len(),
-        total
+        "progress steps {:?} for {} frames",
+        steps,
+        result.frames.len()
     );
     assert!(
         result.frames.len() >= 2,
         "need ≥ 2 frames to demonstrate incrementality"
     );
-    // The first frame must arrive strictly (and materially) before the full budget — the streaming
-    // premise. A non-incremental "emit everything at the end" implementation would fail this.
+    // One report per frame, strictly increasing, starting at the first frame: the AR loop announced
+    // each frame as it produced it.
+    assert_eq!(
+        steps.len(),
+        result.frames.len(),
+        "the AR loop must report progress once per frame, got {} reports for {} frames",
+        steps.len(),
+        result.frames.len()
+    );
+    assert_eq!(
+        steps.first().copied(),
+        Some(1),
+        "the first progress report must be frame 1, got {steps:?}"
+    );
     assert!(
-        first < total,
-        "first-frame latency {first:.3?} was not less than the full-decode latency {total:.3?}"
+        steps.windows(2).all(|w| w[1] == w[0] + 1),
+        "progress must advance one frame at a time and in order, got {steps:?}"
     );
 }
 
 /// The streaming acceptance gate (sc-13334, released by the sc-13392 codec): the shared
 /// `check_audio_streaming` suite against the **real registered provider** (chunk-count, reassembly
-/// law, one-shot == stream), plus the DoD extras — first-chunk latency < full-generation latency,
-/// non-silent speech-shaped 24 kHz audio, and a playable demo WAV.
+/// law, one-shot == stream), plus the DoD extras — the chunk stream is a faithful partition of the
+/// returned track, non-silent speech-shaped 24 kHz audio, and a playable demo WAV. The first-chunk
+/// latency bound this used to carry was removed as degenerate in sc-19556; see the note inline.
 #[test]
 #[ignore = "real weights: needs the ~4.66 GB AR + ~7.1 GB codec snapshots; run with --ignored"]
 fn moss_tts_realtime_streaming_gate() {
@@ -234,41 +309,60 @@ fn moss_tts_realtime_streaming_gate() {
     gen_core_testkit::check_audio_streaming(generator.as_ref(), &profile)
         .expect("check_audio_streaming against the real MOSS-TTS-Realtime provider");
 
-    // (d) first-chunk latency < full-generation latency, measured directly.
+    // (d) the chunk stream is a faithful partition of the returned track, checked directly.
     let req = request(seconds);
-    let start = Instant::now();
-    let mut first_chunk_at: Option<Duration> = None;
     let mut chunks: Vec<AudioChunk> = Vec::new();
     let out = generator
-        .generate_streaming(
-            &req,
-            &mut |c| {
-                if first_chunk_at.is_none() {
-                    first_chunk_at = Some(start.elapsed());
-                }
-                chunks.push(c);
-            },
-            &mut |_| {},
-        )
+        .generate_streaming(&req, &mut |c| chunks.push(c), &mut |_| {})
         .expect("streaming generate");
-    let full = start.elapsed();
-    let first = first_chunk_at.expect("at least one chunk was emitted");
     let track = match out {
         GenerationOutput::Audio(t) => t,
         other => panic!("expected GenerationOutput::Audio, got {other:?}"),
     };
     eprintln!(
-        "streaming: {} chunks, first chunk at {first:.3?}, full generation {full:.3?}",
-        chunks.len()
+        "streaming: {} chunks, first chunk {} samples, full track {} samples",
+        chunks.len(),
+        chunks.first().map(|c| c.samples.len()).unwrap_or(0),
+        track.samples.len()
     );
     assert!(
         chunks.len() >= 2,
         "expected >= 2 stream chunks, got {}",
         chunks.len()
     );
+    // sc-19556: `first < full` (first-chunk latency vs full-generation latency) was replaced. Like
+    // its AR-stage twin above it was degenerate — `full` is sampled after `generate_streaming`
+    // returns, so any implementation that emits a chunk at all satisfies it, including the
+    // buffer-everything one it named.
+    //
+    // What replaces it is a CHUNKING-AND-REASSEMBLY check, with no clock: the first chunk carries
+    // audio, it is strictly smaller than the finished track, and the chunks sum to exactly the
+    // track that was returned. The reassembly law is genuinely new coverage — nothing here
+    // previously tied the emitted chunks to the returned track at all, so a stream that dropped,
+    // duplicated or rescaled samples relative to the track passed.
+    //
+    // SCOPE, stated plainly for the same reason as its AR-stage twin above: this does NOT catch the
+    // buffer-everything implementation either. One that generated the whole track and then sliced
+    // it into >= 2 chunks satisfies non-empty-first, first < track, and exact reassembly. What is
+    // gated is that the chunk stream is a faithful partition of the track, not that it was produced
+    // before the track existed — the latter needs a clock or a seam this generator does not expose.
+    let first_chunk = chunks.first().expect("at least one chunk was emitted");
     assert!(
-        first < full,
-        "first-chunk latency {first:.3?} was not less than full-generation latency {full:.3?}"
+        !first_chunk.samples.is_empty(),
+        "the first chunk must carry audio, not an empty priming chunk"
+    );
+    assert!(
+        first_chunk.samples.len() < track.samples.len(),
+        "the first chunk carries {} of the track's {} samples — a first chunk holding the whole \
+         track is a buffered generate wearing a streaming signature",
+        first_chunk.samples.len(),
+        track.samples.len()
+    );
+    // The reassembly law (`check_audio_streaming` gates it too) is what makes the size comparison
+    // above mean "a prefix" rather than "a differently-shaped buffer".
+    assert_chunks_reassemble_exact(
+        chunks.iter().map(|chunk| chunk.samples.as_slice()),
+        &track.samples,
     );
 
     // (c) valid 24 kHz mono track, finite, non-empty.
@@ -336,10 +430,11 @@ fn moss_tts_realtime_streaming_gate() {
     candle_audio::wav::write_wav_pcm16(&out_path, &track).expect("write demo WAV");
     println!(
         "moss_tts_realtime_streaming_gate: wrote {} ({secs:.2}s @ 24 kHz mono, {} chunks, peak \
-         {peak:.4}, interior RMS {rms:.4}, frame-RMS CV {cv:.3}, first-chunk {first:.3?} < full \
-         {full:.3?})",
+         {peak:.4}, interior RMS {rms:.4}, frame-RMS CV {cv:.3}, first chunk {} of {} samples)",
         out_path.display(),
         chunks.len(),
+        chunks.first().map(|c| c.samples.len()).unwrap_or(0),
+        track.samples.len(),
     );
 }
 
@@ -372,7 +467,11 @@ fn codec_only_decodes_synthetic_frames() {
         (0..25).map(|_| (0..16).map(|_| next()).collect()).collect()
     };
     let wav = codec
-        .decode_frames(&frames, &|| false)
+        .decode_frames(
+            &frames,
+            moss::codec::decode_partition_schedule(frames.len()),
+            &|| false,
+        )
         .expect("decode")
         .expect("not cancelled");
     let n = wav.len() as f32;
@@ -608,7 +707,14 @@ fn pearson(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn read_f32le(path: &str) -> Vec<f32> {
-    let bytes = std::fs::read(path).expect("read clip.f32");
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read f32-LE clip {path}: {e}"));
+    // A trailing partial sample means the file is truncated, not that the last sample is optional;
+    // `chunks_exact` would drop it and hand back a quietly shorter waveform.
+    assert!(
+        !bytes.is_empty() && bytes.len().is_multiple_of(4),
+        "f32-LE clip {path} is {} bytes — empty or not a whole number of f32 samples",
+        bytes.len()
+    );
     bytes
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -625,65 +731,125 @@ fn read_codes_csv(path: &str) -> Vec<Vec<u32>> {
         .collect()
 }
 
+/// Resolve a committed fixture under `tests/fixtures/`, with `env` as an override.
+///
+/// Two fixture sets ride on this, both for the same reason — an env-only path meant an unset
+/// variable silently removed real-weight coverage that nothing else replaced:
+///
+/// - **Encode reference parity (sc-17270)** — `MOSS_CODEC_CLIP` / `MOSS_CODEC_REF_CODES`. The
+///   cross-check used to sit behind `if let Ok(..)`, so an unset variable dropped it entirely while
+///   libtest still reported the test as passing. Regenerate with
+///   `scripts/reference/moss_audio_codec_reference.py`.
+/// - **Voice cloning (sc-17264)** — `MOSS_VOICECLONE_REF`. These two tests *did* fail loudly on an
+///   unset variable, so the coverage was lost a rung earlier: both were left out of the real-weight
+///   lane altogether because the clip existed nowhere. Regenerate with
+///   `cargo run -p candle-audio-moss-tts-realtime --example voiceclone_ref_clip`.
+///
+/// The variables survive as an override for pointing the same gate at different audio; what they
+/// can no longer do is decide whether the gate runs at all.
+///
+/// An empty or whitespace-only value counts as unset. An unconfigured `${{ vars.X }}` expands to
+/// the empty string in a workflow, so treating it as an override would turn a mis-wired lane into
+/// a confusing read failure instead of simply using the fixture that ships with the test.
+fn fixture_path(env: &str, file: &str) -> String {
+    match std::env::var(env) {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(file)
+            .to_string_lossy()
+            .into_owned(),
+    }
+}
+
 #[test]
 #[ignore = "real weights: needs the ~7.1 GB MOSS-Audio-Tokenizer codec snapshot; run with --ignored --nocapture"]
 fn moss_audio_codec_encode_roundtrip_and_reference() {
     use candle_audio_moss_tts_realtime::codec::MossAudioCodec;
     let codec = MossAudioCodec::load(&codec_dir(), 16).expect("load codec");
 
-    // Strong cross-check (when provisioned): the port's encode codebook-0 must match the reference
-    // PyTorch `codec.encode` on a byte-identical clip. `MOSS_CODEC_CLIP` = raw f32-LE mono samples at
-    // 24 kHz; `MOSS_CODEC_REF_CODES` = the reference codes CSV (`frames[T][16]`).
-    if let (Ok(clip_p), Ok(ref_p)) = (
-        std::env::var("MOSS_CODEC_CLIP"),
-        std::env::var("MOSS_CODEC_REF_CODES"),
-    ) {
-        let clip = read_f32le(&clip_p);
-        let port = codec.encode(&clip, 24_000).expect("encode reference clip");
-        let refc = read_codes_csv(&ref_p);
-        let n = port.len().min(refc.len());
-        assert!(n > 0, "no frames to compare");
-        let (mut cb0, mut allm, mut tot) = (0usize, 0usize, 0usize);
-        for f in 0..n {
-            if port[f][0] == refc[f][0] {
-                cb0 += 1;
-            }
-            for q in 0..16 {
-                tot += 1;
-                if port[f].get(q) == refc[f].get(q) {
-                    allm += 1;
-                }
-            }
-        }
-        let cb0_rate = cb0 as f32 / n as f32;
-        let all_rate = allm as f32 / tot as f32;
-        println!(
-            "codec ref cross-check: port {} vs ref {} frames (cmp {n}); cb0 agree {cb0_rate:.3}, \
-             all-cb agree {all_rate:.3}",
-            port.len(),
-            refc.len()
+    // Strong cross-check: the port's encode must match the reference PyTorch `codec.encode` on a
+    // byte-identical clip. `MOSS_CODEC_CLIP` = raw f32-LE mono samples at 24 kHz;
+    // `MOSS_CODEC_REF_CODES` = the reference codes CSV (`frames[T][16]`). Both default to the
+    // committed fixture (sc-17270), so this arm ALWAYS runs — it is the half of this test that
+    // actually gates the port against the reference encoder, and it used to be skippable by simply
+    // not setting two variables that nothing in the repository set.
+    // Both or neither: half an override pairs a custom clip against the committed codes, which
+    // fails with a frame-count or agreement message that says nothing about the real mistake.
+    assert_eq!(
+        std::env::var("MOSS_CODEC_CLIP").is_ok(),
+        std::env::var("MOSS_CODEC_REF_CODES").is_ok(),
+        "set MOSS_CODEC_CLIP and MOSS_CODEC_REF_CODES together or not at all — the codes are only \
+         valid for the clip they were generated from"
+    );
+    let clip_p = fixture_path("MOSS_CODEC_CLIP", "moss_codec_ref_clip.f32");
+    let ref_p = fixture_path("MOSS_CODEC_REF_CODES", "moss_codec_ref_codes.csv");
+    let clip = read_f32le(&clip_p);
+    let port = codec.encode(&clip, 24_000).expect("encode reference clip");
+    let refc = read_codes_csv(&ref_p);
+    let n = port.len().min(refc.len());
+    assert!(n > 0, "no frames to compare");
+    assert_eq!(
+        port.len(),
+        refc.len(),
+        "frame count must match the reference"
+    );
+    // Per-quantizer, not just pooled. A pooled rate over 16 codebooks hides its own worst case: at
+    // the 0.98 bound below, one deep quantizer may disagree on 32 of 100 frames and still pass,
+    // because the other fifteen are perfect. Count each codebook separately so a regression
+    // confined to one of them cannot hide in the average.
+    let mut agree_per_q = [0usize; 16];
+    for f in 0..n {
+        assert_eq!(
+            port[f].len(),
+            16,
+            "port frame {f} has {} codebooks, expected 16",
+            port[f].len()
         );
         assert_eq!(
-            port.len(),
-            refc.len(),
-            "frame count must match the reference"
+            refc[f].len(),
+            16,
+            "reference frame {f} has {} codebooks, expected 16",
+            refc[f].len()
         );
-        // The port matches the reference codec.encode exactly (measured 1.000 across all 16
-        // codebooks); the bounds sit just under that to allow only cross-platform argmax tie noise, so
-        // a real regression on codebook-0 OR any higher quantizer fails here.
-        assert!(
-            cb0_rate >= 0.99,
-            "port encode codebook-0 must match the reference encoder (agree {cb0_rate:.3})"
-        );
-        assert!(
-            all_rate >= 0.98,
-            "port encode must match the reference across all 16 codebooks (agree {all_rate:.3})"
-        );
-    } else {
-        println!(
-            "codec ref cross-check SKIPPED (set MOSS_CODEC_CLIP + MOSS_CODEC_REF_CODES to enable)"
-        );
+        for q in 0..16 {
+            if port[f][q] == refc[f][q] {
+                agree_per_q[q] += 1;
+            }
+        }
     }
+    let cb0_rate = agree_per_q[0] as f32 / n as f32;
+    let all_rate = agree_per_q.iter().sum::<usize>() as f32 / (n * 16) as f32;
+    let (worst_q, worst_agree) = agree_per_q
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, agree)| **agree)
+        .map(|(q, agree)| (q, *agree))
+        .expect("16 quantizers");
+    let worst_rate = worst_agree as f32 / n as f32;
+    println!(
+        "codec ref cross-check: port {} vs ref {} frames (cmp {n}); cb0 agree {cb0_rate:.3}, \
+         all-cb agree {all_rate:.3}, worst codebook {worst_q} agree {worst_rate:.3}",
+        port.len(),
+        refc.len()
+    );
+    // The port matches the reference codec.encode exactly — measured 1.000 on every one of the 16
+    // codebooks against the committed fixture. The bounds sit just under that to allow only
+    // cross-platform argmax tie noise, so a real regression on codebook-0, on the pooled rate, or
+    // on any single higher quantizer fails here.
+    assert!(
+        cb0_rate >= 0.99,
+        "port encode codebook-0 must match the reference encoder (agree {cb0_rate:.3})"
+    );
+    assert!(
+        all_rate >= 0.98,
+        "port encode must match the reference across all 16 codebooks (agree {all_rate:.3})"
+    );
+    assert!(
+        worst_rate >= 0.95,
+        "every codebook must match the reference; codebook {worst_q} agrees only {worst_rate:.3}"
+    );
 
     // Self-contained round-trip: a real codec waveform (decode a fixed pseudo-random 40-frame pattern)
     // → encode → decode must reconstruct it — the encoder emits decodable, faithful codes.
@@ -694,7 +860,11 @@ fn moss_audio_codec_encode_roundtrip_and_reference() {
     };
     let frames0: Vec<Vec<u32>> = (0..40).map(|_| (0..16).map(|_| next()).collect()).collect();
     let w0 = codec
-        .decode_frames(&frames0, &|| false)
+        .decode_frames(
+            &frames0,
+            moss::codec::decode_partition_schedule(frames0.len()),
+            &|| false,
+        )
         .unwrap()
         .expect("decode w0");
     let codes1 = codec.encode(&w0, 24_000).expect("encode w0");
@@ -713,7 +883,11 @@ fn moss_audio_codec_encode_roundtrip_and_reference() {
         "codes in the codebook range [0, 1024)"
     );
     let w1 = codec
-        .decode_frames(&codes1, &|| false)
+        .decode_frames(
+            &codes1,
+            moss::codec::decode_partition_schedule(codes1.len()),
+            &|| false,
+        )
         .unwrap()
         .expect("decode w1");
     let corr = pearson(&w0, &w1);
@@ -737,43 +911,137 @@ fn moss_audio_codec_encode_roundtrip_and_reference() {
 // ~100 fps, so a single-shot encode materializes a `[1, H, T, T]` attention that is quadratic in the
 // clip length (a 60 s clip → T ≈ 6000 → multi-GB per layer). The streaming path bounds that to
 // `[1, H, chunk, chunk + context]` per layer. This gate asserts the two paths emit **identical
-// codes** on a real ≥ 30 s clip, and that the streaming path's peak RSS sits well below single-shot's.
+// codes** on a real ≥ 30 s clip, and that the streaming path's peak heap sits well below
+// single-shot's — measured at the allocator, not by sampling RSS on a timer (sc-17263).
 // ---------------------------------------------------------------------------------------------
 
-/// Current resident-set size of this process, in bytes, via `ps -o rss=` (KiB on both macOS and
-/// Linux). Unlike `getrusage`'s `ru_maxrss` — a monotonic high-water mark the 7 GB codec load already
-/// pins far above any encode transient — this reads the *instantaneous* RSS, so a sampler can catch
-/// the transient attention spike. `0` if the probe fails (the memory assertion then no-ops).
-fn current_rss_bytes() -> u64 {
-    std::process::Command::new("ps")
-        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .map(|kib| kib * 1024)
-        .unwrap_or(0)
+/// One `AtomicU64` on its own cache line. Every allocation in the process touches both counters
+/// below, from whatever rayon worker candle's gemm is using; packed adjacently they would share a
+/// line and turn each allocation into a false-sharing round trip. 128 B is Apple Silicon's line
+/// size (and a safe over-estimate of x86's 64 B).
+#[repr(align(128))]
+struct PaddedCounter(std::sync::atomic::AtomicU64);
+
+/// Live heap bytes currently handed out by [`TrackingAlloc`], and a resettable high-water mark of
+/// that same quantity. `PEAK` is only ever raised by the allocator and re-armed by
+/// [`with_peak_alloc`]; both are plain byte counts, meaningful only relative to the base captured
+/// at the start of a measurement window.
+static LIVE_BYTES: PaddedCounter = PaddedCounter(std::sync::atomic::AtomicU64::new(0));
+static PEAK_BYTES: PaddedCounter = PaddedCounter(std::sync::atomic::AtomicU64::new(0));
+
+/// A `System`-delegating global allocator that tracks in-flight heap bytes and their high-water
+/// mark (sc-17263).
+///
+/// This replaces the previous probe — `ps -o rss=` sampled on a 5 ms timer — which measured a
+/// *transient* with a wall-clock sampler: the faster the box, the shorter the quadratic-attention
+/// burst, the fewer samples landed inside it, and the further the measured peak fell below the true
+/// one. That made the gate's verdict a function of machine speed (it read ~291 MB of a ~1.6 GB
+/// spike on an M5 Max and failed a bound tuned elsewhere). Counting at the allocator is
+/// event-driven, so it observes every byte regardless of how briefly it is held.
+///
+/// **Precision.** Exact for `alloc`/`alloc_zeroed`/`dealloc`, in the sense that every byte the
+/// caller *requested* is counted — not the size class the allocator actually reserved, so the true
+/// footprint is a little larger than the number reported. `realloc` is counted as a delta, so a
+/// *relocating* grow (malloc-new + copy + free-old) undercounts the window in which both blocks are
+/// live. Neither approximation is load-bearing here: the quantity under test is one multi-hundred-MB
+/// `Tensor` allocation, and the bounds below clear the error by orders of magnitude.
+///
+/// **Cost to the rest of the binary.** Installing this is process-wide, so the other real-weight
+/// tests here pay two relaxed atomic RMWs per allocation. A/B'd on the heaviest of them
+/// (`moss_tts_realtime_asr_roundtrip_fidelity`, a whisper round-trip): 517 s / 311 s installed vs
+/// 327 s / 361 s not installed — no measurable penalty, and the installed arm was not the slower
+/// one. Run-to-run spread on a loaded box (~60%) is far wider than any effect here, so read that as
+/// ruling out a large regression, not as a precise overhead figure.
+///
+/// It measures the right thing here because candle's CPU tensor storage is a `Vec<T>`
+/// (`cpu_backend/mod.rs`), so the first stage's `[1, H, T, T]` attention is a single
+/// global-allocator request. Note the codec's ~7.1 GB of weights are **not** excluded by being
+/// mmapped: `VarBuilder::from_mmaped_safetensors` copies each tensor onto the Rust heap on the way
+/// in (`convert_slice` → `Tensor::from_slice` → `to_cpu_storage` → `data.to_vec()`), so they sit in
+/// `LIVE_BYTES` too. What isolates the transient is [`with_peak_alloc`] subtracting the resting
+/// total — which is why the warm-up call in the test below is load-bearing, not hygiene.
+struct TrackingAlloc;
+
+impl TrackingAlloc {
+    /// Add `n` bytes to the live count and raise the high-water mark to match.
+    fn record_alloc(n: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if n == 0 {
+            return;
+        }
+        let live = LIVE_BYTES.0.fetch_add(n as u64, Relaxed) + n as u64;
+        PEAK_BYTES.0.fetch_max(live, Relaxed);
+    }
 }
 
-/// Run `f` while a background thread samples [`current_rss_bytes`] every few ms, and return
-/// `(result, peak_rss_during_f)`. Used to measure each encode path's transient memory spike.
-fn with_peak_rss<T>(f: impl FnOnce() -> T) -> (T, u64) {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::Arc;
-    let stop = Arc::new(AtomicBool::new(false));
-    let peak = Arc::new(AtomicU64::new(0));
-    let (s, p) = (Arc::clone(&stop), Arc::clone(&peak));
-    let sampler = std::thread::spawn(move || {
-        while !s.load(Ordering::Relaxed) {
-            p.fetch_max(current_rss_bytes(), Ordering::Relaxed);
-            std::thread::sleep(std::time::Duration::from_millis(5));
+// SAFETY: every arm delegates to `System` (itself a valid `GlobalAlloc`) with the caller's original
+// pointer/layout contract untouched, and only adds relaxed atomic bookkeeping around it. The
+// counters are advisory-only — no allocation decision reads them — so a torn or reordered count can
+// never affect memory safety.
+unsafe impl std::alloc::GlobalAlloc for TrackingAlloc {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let p = std::alloc::System.alloc(layout);
+        if !p.is_null() {
+            Self::record_alloc(layout.size());
         }
-    });
+        p
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let p = std::alloc::System.alloc_zeroed(layout);
+        if !p.is_null() {
+            Self::record_alloc(layout.size());
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        LIVE_BYTES
+            .0
+            .fetch_sub(layout.size() as u64, std::sync::atomic::Ordering::Relaxed);
+        std::alloc::System.dealloc(ptr, layout);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        let p = std::alloc::System.realloc(ptr, layout, new_size);
+        if !p.is_null() {
+            // Only the delta moves; a grow can set a new peak, a shrink never can.
+            match new_size.checked_sub(layout.size()) {
+                Some(grew) => Self::record_alloc(grew),
+                None => {
+                    LIVE_BYTES.0.fetch_sub(
+                        (layout.size() - new_size) as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+            }
+        }
+        p
+    }
+}
+
+/// Installed for this **test binary only** — `tests/conformance.rs` is its own crate root, so the
+/// shipping library and its consumers keep the default allocator.
+#[global_allocator]
+static ALLOC: TrackingAlloc = TrackingAlloc;
+
+/// Run `f` and return `(result, peak_heap_bytes_above_the_pre-call_live_total)` — the transient this
+/// call added, with the already-resident heap (weights included) subtracted out.
+///
+/// Measured process-wide, so a *concurrently running* test in the same binary would add noise: the
+/// real-weight harness selects one test at a time (`--exact`) and the module doc requires
+/// `--test-threads=1`. The two encode paths are measured back-to-back on the same thread, and the
+/// ordering here rests on that same-thread program order — not on the `Relaxed` counter updates,
+/// which deliberately claim no cross-thread happens-before. Allocations made by rayon workers
+/// candle has already fenced into the call are counted; anything genuinely concurrent is noise the
+/// bounds below are sized to absorb.
+fn with_peak_alloc<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let base = LIVE_BYTES.0.load(Relaxed);
+    PEAK_BYTES.0.store(base, Relaxed);
     let out = f();
-    peak.fetch_max(current_rss_bytes(), Ordering::Relaxed);
-    stop.store(true, Ordering::Relaxed);
-    sampler.join().expect("rss sampler thread");
-    (out, peak.load(Ordering::Relaxed))
+    let peak = PEAK_BYTES.0.load(Relaxed);
+    (out, peak.saturating_sub(base))
 }
 
 /// Total number of differing codes between two `frames[T][nq]` grids (plus any length gap), for the
@@ -797,7 +1065,7 @@ fn count_code_mismatches(a: &[Vec<u32>], b: &[Vec<u32>]) -> usize {
 /// feature) — see the `codec::tests::chunked_stage_matches_single_shot` unit gate for the stage-level
 /// equivalence proof this end-to-end test complements.
 #[test]
-#[ignore = "real weights: needs the ~7.1 GB MOSS-Audio-Tokenizer codec snapshot; run with --ignored --nocapture"]
+#[ignore = "real weights: needs the ~7.1 GB MOSS-Audio-Tokenizer codec snapshot; run with --ignored --nocapture --test-threads=1 (the heap probe is process-wide)"]
 fn moss_audio_codec_chunked_encode_matches_single_shot() {
     use candle_audio_moss_tts_realtime::codec::MossAudioCodec;
     let codec = MossAudioCodec::load(&codec_dir(), 16).expect("load codec");
@@ -815,7 +1083,11 @@ fn moss_audio_codec_chunked_encode_matches_single_shot() {
         .map(|_| (0..16).map(|_| next()).collect())
         .collect();
     let clip = codec
-        .decode_frames(&pattern, &|| false)
+        .decode_frames(
+            &pattern,
+            moss::codec::decode_partition_schedule(pattern.len()),
+            &|| false,
+        )
         .expect("decode long clip")
         .expect("not cancelled");
     let secs = clip.len() as f32 / moss::codec::SAMPLE_RATE as f32;
@@ -824,23 +1096,30 @@ fn moss_audio_codec_chunked_encode_matches_single_shot() {
         "clip must be ≥ 30 s to exercise the bound (got {secs:.1}s)"
     );
 
-    // Warm the lazy encoder half (mmap + build) on a short slice so the memory probe below measures
-    // the analysis attention, not the one-time weight fault-in.
+    // Warm the lazy encoder half on a short slice. This is **load-bearing for the measurement**, not
+    // hygiene: `from_mmaped_safetensors` copies every weight onto the Rust heap, so building the
+    // encoder half allocates GBs through the probe. Doing it here folds that into the resting total
+    // `with_peak_alloc` subtracts, leaving the windows below measuring analysis attention alone.
     let warm_len = 48_000.min(clip.len());
     let _ = codec
         .encode_chunked(&clip[..warm_len], moss::codec::SAMPLE_RATE, 10.0)
         .expect("warm encoder half");
 
-    // Sample the instantaneous RSS spike each path adds above its immediately-preceding resting RSS,
-    // so the transient attention allocation is isolated from the (huge, already-resident) model.
-    let rest_chunk = current_rss_bytes();
-    let (chunked_small, peak_chunk) = with_peak_rss(|| {
+    // Measure the heap high-water mark each path adds above the already-resident total, so the
+    // transient attention allocation is isolated from the (huge, heap-resident) model. The half-clip
+    // chunked window is measured too: it is what turns "peak memory is independent of clip length"
+    // from an unbacked claim in a comment into something this test actually observes.
+    let (_, chunk_spike_half) = with_peak_alloc(|| {
+        codec
+            .encode_chunked(&clip[..clip.len() / 2], moss::codec::SAMPLE_RATE, 1.5)
+            .expect("chunked encode (1.5 s window, half clip)")
+    });
+    let (chunked_small, chunk_spike) = with_peak_alloc(|| {
         codec
             .encode_chunked(&clip, moss::codec::SAMPLE_RATE, 1.5)
             .expect("chunked encode (1.5 s window)")
     });
-    let rest_single = current_rss_bytes();
-    let (single, peak_single) = with_peak_rss(|| {
+    let (single, single_spike) = with_peak_alloc(|| {
         codec
             .encode_single_shot(&clip, moss::codec::SAMPLE_RATE)
             .expect("single-shot encode")
@@ -879,30 +1158,89 @@ fn moss_audio_codec_chunked_encode_matches_single_shot() {
 
     // (2) Memory bound: single-shot's quadratic first-stage attention spikes materially above the
     // bounded streaming path. For this clip the first stage is ~[1,20,3200,3200] f32 ≈ 780 MB/layer
-    // single-shot vs the chunked ~[1,20,~150,~1150] ≈ 55 MB — a several-hundred-MB gap.
-    let chunk_spike = peak_chunk.saturating_sub(rest_chunk);
-    let single_spike = peak_single.saturating_sub(rest_single);
+    // single-shot — scores plus the softmax over them, so ~1.6 GB in flight — vs the chunked
+    // ~[1,20,~150,~1150]. Measured: +1669 MB vs +68 MB, a ~24x gap, byte-identical run to run.
+    //
+    // Four bounds. (a) alone is not enough: it goes green whenever the two paths differ by 200 MB,
+    // including the case this gate most needs to catch — *both* arms expensive (chunked 1.0 GB,
+    // single-shot 1.3 GB) because the streaming window stopped bounding anything. So:
+    //   (a) the gap — sc-14181's original >200 MB bar, unchanged;
+    //   (b) the ratio — scale-free, so proportional drift on another machine does not erode it;
+    //   (c) an absolute ceiling on the chunked arm — catches "both expensive", and stays meaningful
+    //       even if the single-shot arm ever stops being quadratic;
+    //   (d) growth across clip length — the streaming claim itself, measured rather than asserted.
+    //
+    // Heap-counted, so this arm needs the CPU device: on `metal`/`cuda` the stage tensors are device
+    // buffers the global allocator never sees, and both paths would read as ~nothing. Keyed on the
+    // device the codec actually loaded onto (`candle_audio::default_device`, exactly what
+    // `MossAudioCodec::load` calls) rather than on this crate's feature flags, which are only a
+    // proxy for it.
+    //
+    // This REFUSES rather than skips. A skip would pass while measuring nothing, and the weekly
+    // lane's `test result: ok. 1 passed` grep cannot see a branch that was not taken — the precise
+    // false green sc-17270 removed from this file and now gates against in
+    // `scripts/tests/test_moss_audio_codec_reference.py`. Failing on a build that cannot run this
+    // gate costs one clear error message; skipping costs the coverage, silently.
+    assert!(
+        moss::candle_audio::default_device()
+            .expect("resolve the codec's device")
+            .is_cpu(),
+        "this gate measures a HEAP high-water mark, but the codec loaded onto a non-CPU device \
+         whose stage tensors are device buffers the allocator never sees. Run it on the default \
+         (CPU) build — `-p candle-audio-moss-tts-realtime` with no metal/cuda feature.",
+    );
     println!(
-        "sc-14181 transient RSS spike above resting: chunked(1.5s) +{:.0} MB, single-shot +{:.0} MB",
+        "sc-14181 transient heap high-water above resting: chunked(1.5s) +{:.0} MB, single-shot \
+         +{:.0} MB (ratio {:.1}x); chunked on the half clip +{:.0} MB",
         chunk_spike as f64 / 1e6,
         single_spike as f64 / 1e6,
+        single_spike as f64 / chunk_spike.max(1) as f64,
+        chunk_spike_half as f64 / 1e6,
     );
-    if peak_chunk > 0 && peak_single > 0 {
-        assert!(
-            single_spike > chunk_spike + 200_000_000,
-            "single-shot's transient RSS spike (+{} MB) should exceed the chunked path's (+{} MB) by \
-             >200 MB — the streaming path is not bounding the first-stage attention",
-            single_spike / 1_000_000,
-            chunk_spike / 1_000_000,
-        );
-    }
+    assert!(
+        single_spike > chunk_spike + 200_000_000,
+        "single-shot's transient heap spike (+{} MB) should exceed the chunked path's (+{} MB) by \
+         >200 MB — the streaming path is not bounding the first-stage attention",
+        single_spike / 1_000_000,
+        chunk_spike / 1_000_000,
+    );
+    assert!(
+        single_spike >= chunk_spike.saturating_mul(8),
+        "single-shot's transient heap spike (+{} MB) should be at least 8x the chunked path's \
+         (+{} MB) — the streaming window is not bounding attention the way `forward_chunked` claims",
+        single_spike / 1_000_000,
+        chunk_spike / 1_000_000,
+    );
+    assert!(
+        chunk_spike < 250_000_000,
+        "the chunked path's transient heap spike (+{} MB) on this {secs:.1}s clip must stay under \
+         250 MB — a bounded sliding window cannot need that much, so the streaming path is \
+         materializing something proportional to the clip",
+        chunk_spike / 1_000_000,
+    );
+    // Doubling the clip must not double the chunked transient: the window is fixed, so only the
+    // linear side-buffers (input PCM, per-stage activations) may grow. A quadratic — or even
+    // linear-dominated — chunked path fails here while (a)-(c) could still pass.
+    //
+    // Measured 56 MB → 68 MB across the 16 s → 32 s doubling, i.e. 1.21x. A linear-dominated path
+    // would read ~2.0x and a quadratic one ~4x, so the 1.5x bar sits between what is healthy and
+    // the cheapest regression it must catch.
+    assert!(
+        chunk_spike < chunk_spike_half.saturating_mul(3) / 2,
+        "chunked spike grew from +{} MB on {:.1}s to +{} MB on {secs:.1}s — doubling the clip must \
+         not scale the streaming path's peak memory; the window is supposed to bound it",
+        chunk_spike_half / 1_000_000,
+        secs / 2.0,
+        chunk_spike / 1_000_000,
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
 // sc-14149 — voice cloning: generate the same text with the default voice and with a reference
 // clip; both must be intelligible (ASR CER) and the cloned output must DIFFER from the default
-// (the reference timbre conditioning takes effect). `MOSS_VOICECLONE_REF` = a 24 kHz f32-LE mono
-// reference clip. The speaker-identity (x-vector similarity) gate lands with the CAMPPlus harness.
+// (the reference timbre conditioning takes effect). The reference speaker is a committed fixture
+// (sc-17264) rendered by Kokoro — `MOSS_VOICECLONE_REF` overrides it with another 24 kHz f32-LE
+// mono clip, but no longer decides whether this test can run at all.
 // ---------------------------------------------------------------------------------------------
 
 #[test]
@@ -923,10 +1261,10 @@ fn moss_tts_realtime_voice_clone() {
         .expect("whisper registry")
         .load_transcriber(candle_audio_whisper::MODEL_ID, &wspec)
         .expect("whisper_base loads");
-    let ref_clip = read_f32le(
-        &std::env::var("MOSS_VOICECLONE_REF")
-            .expect("set MOSS_VOICECLONE_REF to a 24 kHz f32-LE mono reference clip"),
-    );
+    let ref_clip = read_f32le(&fixture_path(
+        "MOSS_VOICECLONE_REF",
+        "moss_voiceclone_ref_clip.f32",
+    ));
 
     let text = "The quick brown fox jumps over the lazy dog.";
     let req = |conditioning: Vec<Conditioning>| GenerationRequest {
@@ -1450,16 +1788,16 @@ fn moss_tts_realtime_multi_turn_user_context() {
 /// the reference speaker more than the default (no-clone) voice does (so the clone threads into the
 /// later turn, not only turn 0), and the turns are mutually the same speaker.
 #[test]
-#[ignore = "real weights: MOSS-TTS-Realtime AR + codec + whisper_base + Chatterbox CAMPPlus + MOSS_VOICECLONE_REF; run with --ignored --nocapture"]
+#[ignore = "real weights: MOSS-TTS-Realtime AR + codec + whisper_base + Chatterbox CAMPPlus; run with --ignored --nocapture"]
 fn moss_tts_realtime_multi_turn_voice_clone() {
     use moss::gen_core::{AudioTrack, Conditioning, ConversationRole, ConversationTurn};
 
     let generator = load();
     let transcribe = whisper_transcriber();
-    let ref_clip = read_f32le(
-        &std::env::var("MOSS_VOICECLONE_REF")
-            .expect("set MOSS_VOICECLONE_REF to a 24 kHz f32-LE mono reference clip"),
-    );
+    let ref_clip = read_f32le(&fixture_path(
+        "MOSS_VOICECLONE_REF",
+        "moss_voiceclone_ref_clip.f32",
+    ));
     let ref_track = AudioTrack {
         samples: ref_clip.clone(),
         sample_rate: 24_000,

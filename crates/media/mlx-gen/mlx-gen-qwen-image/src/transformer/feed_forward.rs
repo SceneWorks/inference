@@ -4,7 +4,7 @@
 
 use mlx_rs::error::Exception;
 use mlx_rs::ops::{add, multiply, power, tanh};
-use mlx_rs::transforms::compile::compile;
+use mlx_rs::transforms::compile::{compile, compile_retained};
 use mlx_rs::Array;
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
@@ -14,6 +14,43 @@ use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
 use super::{compile_glue, join, linear_from};
+
+const SITE_GELU_FFN: &str = "qwen_image::feed_forward::gelu_ffn";
+
+fn gelu_ffn_impl(x: &Array) -> std::result::Result<Array, Exception> {
+    let dt = x.dtype();
+    let s = |v: f32| -> std::result::Result<Array, Exception> { scalar(v).as_dtype(dt) };
+    let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
+    let x3 = power(x, Array::from_int(3))?;
+    let inner = multiply(&add(x, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
+    let gate = add(&tanh(&inner)?, &s(1.0)?)?;
+    multiply(&multiply(x, &s(0.5)?)?, &gate)
+}
+
+thread_local! {
+    static RETAINED_GELU_FFN: std::cell::RefCell<Option<mlx_gen::nn::RetainedUnary>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn retained_gelu_ffn(x: &Array) -> std::result::Result<Array, Exception> {
+    mlx_gen::nn::prepare_retained_compilation_thread();
+    RETAINED_GELU_FFN.with(|slot| {
+        slot.borrow_mut()
+            .get_or_insert_with(|| {
+                mlx_gen::nn::RetainedUnary::new(compile_retained(gelu_ffn_impl, true))
+            })
+            .call(SITE_GELU_FFN, x)
+    })
+}
+
+/// Exercise this module's production retained handle once for the release memory audit.
+#[doc(hidden)]
+pub fn exercise_retained_compile_inventory(input: &Array) -> Result<()> {
+    let output = retained_gelu_ffn(input)?;
+    output.eval()?;
+    drop(output);
+    Ok(())
+}
 
 pub struct FeedForward {
     mlp_in: AdaptableLinear,
@@ -67,18 +104,18 @@ impl FeedForward {
 /// `gelu_tanh`, so the eager path is byte-for-byte the previous behaviour.
 fn gelu_ffn(x: &Array) -> Result<Array> {
     if !compile_glue() {
+        mlx_gen::diagnostics::record_fallback(SITE_GELU_FFN, "compiled_glue_disabled");
         return gelu_tanh(x);
     }
-    let f = |x_: &Array| -> std::result::Result<Array, Exception> {
-        let dt = x_.dtype();
-        let s = |v: f32| -> std::result::Result<Array, Exception> { scalar(v).as_dtype(dt) };
-        let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
-        let x3 = power(x_, Array::from_int(3))?;
-        let inner = multiply(&add(x_, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
-        let gate = add(&tanh(&inner)?, &s(1.0)?)?;
-        multiply(&multiply(x_, &s(0.5)?)?, &gate)
-    };
-    Ok(compile(f, true)(x)?)
+    if mlx_gen::nn::retained_compilation_requested() {
+        Ok(retained_gelu_ffn(x)?)
+    } else {
+        mlx_gen::diagnostics::record_compile(
+            SITE_GELU_FFN,
+            mlx_gen::diagnostics::CompileDisposition::OneShot,
+        );
+        Ok(compile(gelu_ffn_impl, true)(x)?)
+    }
 }
 
 #[cfg(test)]
@@ -114,5 +151,69 @@ mod sc2963 {
                 "gelu_ffn compiled vs eager {dt:?}: rel|Δ|={rel:e} exceeds {tol:e}"
             );
         }
+    }
+
+    #[test]
+    fn retained_gelu_reports_miss_hit_applied_and_oneshot_baseline() {
+        use mlx_gen::diagnostics::{
+            self, CompileDisposition, DiagnosticCounter, ToggleDisposition, RETAINED_COMPILATION,
+        };
+
+        RETAINED_GELU_FFN.with(|slot| *slot.borrow_mut() = None);
+        let x = rnd(&[1, 4, 16], Bfloat16);
+        set_compile_glue(false);
+        let eager = gelu_ffn(&x).unwrap();
+
+        set_compile_glue(true);
+        let scope = diagnostics::begin_request_with_toggles(
+            "qwen-retained-gelu",
+            "qwen_image",
+            &[RETAINED_COMPILATION],
+        )
+        .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                mlx_gen::nn::max_rel_diff(&gelu_ffn(&x).unwrap(), &eager),
+                0.0
+            );
+        }
+        let report = scope.finish();
+        for disposition in [
+            CompileDisposition::RetainedMiss,
+            CompileDisposition::RetainedHit,
+        ] {
+            assert!(report.counters.iter().any(|counter| matches!(
+                counter,
+                DiagnosticCounter::Compile {
+                    site: SITE_GELU_FFN,
+                    disposition: recorded,
+                    count: 1,
+                } if *recorded == disposition
+            )));
+        }
+        assert!(report.counters.iter().any(|counter| matches!(
+            counter,
+            DiagnosticCounter::Toggle {
+                toggle: RETAINED_COMPILATION,
+                disposition: ToggleDisposition::Applied,
+                count: 2,
+            }
+        )));
+
+        let baseline = diagnostics::begin_request("qwen-oneshot-gelu", "qwen_image").unwrap();
+        let oneshot = gelu_ffn(&x).unwrap();
+        let baseline = baseline.finish();
+        assert_eq!(mlx_gen::nn::max_rel_diff(&oneshot, &eager), 0.0);
+        assert!(baseline.counters.iter().any(|counter| matches!(
+            counter,
+            DiagnosticCounter::Compile {
+                site: SITE_GELU_FFN,
+                disposition: CompileDisposition::OneShot,
+                count: 1,
+            }
+        )));
+
+        set_compile_glue(false);
+        RETAINED_GELU_FFN.with(|slot| *slot.borrow_mut() = None);
     }
 }

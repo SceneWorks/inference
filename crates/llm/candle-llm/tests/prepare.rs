@@ -18,7 +18,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use candle_core::{DType, Device, Tensor};
 
@@ -31,17 +30,16 @@ use core_llm::{
 use core_llm_testkit::{check_snapshot_preparer, SnapshotPreparerProfile};
 
 const VOCAB: usize = 32;
-static SEQ: AtomicU32 = AtomicU32::new(0);
+mod common;
+use common::Fixture;
 
-fn unique_dir(tag: &str) -> PathBuf {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "candle-llm-prepare-{}-{tag}-{n}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// A fresh fixture root that removes itself on `Drop` (sc-17755).
+///
+/// This replaced a hand-rolled `temp_dir().join(format!("candle-llm-prepare-{pid}-{tag}-{n}"))` whose
+/// `remove_dir_all` prelude only made it idempotent *within* one process — every new PID left another
+/// tree behind. Callers must bind the returned [`Fixture`] for as long as they read the path.
+fn unique_dir(tag: &str) -> Fixture {
+    Fixture::new(&format!("candle-llm-prepare-{tag}-"), None)
 }
 
 fn randn(shape: (usize, usize), rng: &mut SplitMix64) -> Tensor {
@@ -68,7 +66,7 @@ fn tokenizer_json() -> String {
 
 /// Write a tiny synthetic HF snapshot whose projection in-dims all equal `hidden` (and `inter`), so a
 /// `hidden`/`inter` that is block-aligned (32 for Q8, 256 for Q4) can be re-quantized.
-fn write_synthetic(tag: &str, hidden: usize, inter: usize) -> PathBuf {
+fn write_synthetic(tag: &str, hidden: usize, inter: usize) -> Fixture {
     let dir = unique_dir(tag);
     let config = format!(
         r#"{{ "hidden_size": {hidden}, "intermediate_size": {inter}, "num_hidden_layers": 2,
@@ -113,29 +111,29 @@ fn synthetic_dense_passthrough_and_loads() {
     assert_eq!(detect_format(&src).unwrap(), ModelFormat::Safetensors);
 
     let out = unique_dir("dense-out");
-    let report = prepare_snapshot(&PrepareSpec::dense(&src, &out)).unwrap();
+    let report =
+        prepare_snapshot(&PrepareSpec::dense(src.to_path_buf(), out.to_path_buf())).unwrap();
     assert!(
         report.passthrough,
         "dense already-loadable source is a passthrough"
     );
     assert_eq!(report.quantized, None);
-    assert_eq!(report.out_dir, src, "passthrough returns the source dir");
+    assert_eq!(report.out_dir, *src, "passthrough returns the source dir");
     assert!(report.num_tensors > 0);
 
     // The full contract helper: prepare -> report self-consistency -> load_for_model, plus the
     // unknown-source Unsupported path.
+    let check_out = unique_dir("dense-check");
     check_snapshot_preparer(
         &SnapshotPreparerProfile {
-            source: src.clone(),
-            out_dir: unique_dir("dense-check"),
+            source: src.to_path_buf(),
+            out_dir: check_out.to_path_buf(),
             quantize: None,
         },
         &candle_llm::snapshot_preparer_registry().unwrap(),
         &candle_llm::text_registry().unwrap(),
     )
     .unwrap();
-
-    let _ = std::fs::remove_dir_all(&src);
 }
 
 /// A Q8 prepare re-quantizes the projections, stamps a `quantization` block, and the prepared
@@ -155,13 +153,18 @@ fn quant_round_trip(tag: &str, hidden: usize, inter: usize, quant: Quantize) {
     let src = write_synthetic(tag, hidden, inter);
     let out = unique_dir(&format!("{tag}-out"));
 
-    let report = prepare_snapshot(&PrepareSpec::quantized(&src, &out, quant)).unwrap();
+    let report = prepare_snapshot(&PrepareSpec::quantized(
+        src.to_path_buf(),
+        out.to_path_buf(),
+        quant,
+    ))
+    .unwrap();
     assert!(
         !report.passthrough,
         "a quantized prepare writes a fresh snapshot"
     );
     assert_eq!(report.quantized, Some(quant));
-    assert_eq!(report.out_dir, out);
+    assert_eq!(report.out_dir, *out);
     assert!(out.join("model.safetensors").is_file());
     assert!(out.join("tokenizer.json").is_file());
 
@@ -180,19 +183,17 @@ fn quant_round_trip(tag: &str, hidden: usize, inter: usize, quant: Quantize) {
         "{tag}: persisted block must load quantized"
     );
 
+    let check_out = unique_dir(&format!("{tag}-check"));
     check_snapshot_preparer(
         &SnapshotPreparerProfile {
-            source: src.clone(),
-            out_dir: unique_dir(&format!("{tag}-check")),
+            source: src.to_path_buf(),
+            out_dir: check_out.to_path_buf(),
             quantize: Some(quant),
         },
         &candle_llm::snapshot_preparer_registry().unwrap(),
         &candle_llm::text_registry().unwrap(),
     )
     .unwrap();
-
-    let _ = std::fs::remove_dir_all(&src);
-    let _ = std::fs::remove_dir_all(&out);
 }
 
 /// A multimodal snapshot (a `vision_config` block) is declined by the text preparer, so
@@ -209,13 +210,16 @@ fn vlm_source_is_declined() {
     std::fs::write(dir.join("tokenizer.json"), tokenizer_json()).unwrap();
     std::fs::write(dir.join("model.safetensors"), b"\x00").unwrap();
 
-    match prepare_snapshot(&PrepareSpec::dense(&dir, unique_dir("vlm-out"))) {
+    let vlm_out = unique_dir("vlm-out");
+    match prepare_snapshot(&PrepareSpec::dense(
+        dir.to_path_buf(),
+        vlm_out.to_path_buf(),
+    )) {
         Err(core_llm::Error::Unsupported(m)) => {
             assert!(m.contains("no linked backend can prepare"), "{m}")
         }
         other => panic!("expected Unsupported for a VLM source, got {other:?}"),
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // --- gated real-model conformance: prepare a real snapshot, run the helper, and generate ---
@@ -224,16 +228,17 @@ fn real_check(source: PathBuf, quant: Option<Quantize>, tag: &str) {
     let out = unique_dir(&format!("real-{tag}"));
     let report: PrepareReport = prepare_snapshot(&PrepareSpec {
         source: source.clone(),
-        out_dir: out.clone(),
+        out_dir: out.to_path_buf(),
         quantize: quant,
     })
     .unwrap_or_else(|e| panic!("{tag}: prepare failed: {e}"));
     assert_eq!(report.quantized, quant);
 
+    let real_check_out = unique_dir(&format!("real-{tag}-check"));
     check_snapshot_preparer(
         &SnapshotPreparerProfile {
             source,
-            out_dir: unique_dir(&format!("real-{tag}-check")),
+            out_dir: real_check_out.to_path_buf(),
             quantize: quant,
         },
         &candle_llm::snapshot_preparer_registry().unwrap(),
@@ -255,7 +260,6 @@ fn real_check(source: PathBuf, quant: Option<Quantize>, tag: &str) {
         !text.is_empty(),
         "{tag}: prepared snapshot produced no text"
     );
-    let _ = std::fs::remove_dir_all(&out);
 }
 
 #[test]

@@ -270,6 +270,27 @@ pub fn transformer_quant_targets(cfg: &Krea2Config) -> BTreeSet<String> {
     t
 }
 
+/// Structural form of [`transformer_quant_targets`] for header-only resident sizing, where the
+/// checkpoint itself supplies the block indices and no architecture config needs to be guessed.
+pub(crate) fn is_transformer_quant_target(name: &str) -> bool {
+    let in_quantized_stack = name.starts_with("transformer_blocks.")
+        || name.starts_with("text_fusion.layerwise_blocks.")
+        || name.starts_with("text_fusion.refiner_blocks.");
+    in_quantized_stack
+        && [
+            ".attn.to_q.weight",
+            ".attn.to_k.weight",
+            ".attn.to_v.weight",
+            ".attn.to_gate.weight",
+            ".attn.to_out.0.weight",
+            ".ff.gate.weight",
+            ".ff.up.weight",
+            ".ff.down.weight",
+        ]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
 /// The Qwen3-VL **text tower** Linear `….weight` keys quantized at load: each decoder layer's
 /// `self_attn` `q/k/v/o_proj` + `mlp` `gate/up/down_proj`. The `embed_tokens` table stays **dense**,
 /// as do the **vision tower** (`visual.*`, runs f32 for the edit/VLM path — unused for T2I), the
@@ -290,6 +311,22 @@ pub fn text_encoder_quant_targets(num_layers: usize) -> BTreeSet<String> {
         }
     }
     t
+}
+
+/// Structural form of [`text_encoder_quant_targets`] for header-only resident sizing.
+pub(crate) fn is_text_encoder_quant_target(name: &str) -> bool {
+    name.starts_with("language_model.layers.")
+        && [
+            ".self_attn.q_proj.weight",
+            ".self_attn.k_proj.weight",
+            ".self_attn.v_proj.weight",
+            ".self_attn.o_proj.weight",
+            ".mlp.gate_proj.weight",
+            ".mlp.up_proj.weight",
+            ".mlp.down_proj.weight",
+        ]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
 }
 
 /// Group-wise affine Q4/Q8-pack every `targets` `{base}.weight` in `map` (cast to bf16 first so the
@@ -400,6 +437,26 @@ mod tests {
     use mlx_rs::Dtype;
 
     #[test]
+    fn load_time_and_offline_krea_quantization_both_keep_embeddings_dense() {
+        assert!(!is_text_encoder_quant_target(
+            "language_model.embed_tokens.weight"
+        ));
+        assert_eq!(
+            text_encoder_quant_targets(2)
+                .into_iter()
+                .filter(|name| name.contains("embed_tokens"))
+                .count(),
+            0
+        );
+        assert!(
+            !crate::model::ENCODER_CONTRACT
+                .packing
+                .expect("Krea supports projection packing")
+                .pack_embedding
+        );
+    }
+
+    #[test]
     fn expected_key_count_matches_published_turbo() {
         let cfg = Krea2Config::turbo();
         let keys = expected_transformer_keys(&cfg);
@@ -424,9 +481,16 @@ mod tests {
                 expected.contains(k),
                 "quant target not in expected keys: {k}"
             );
+            assert!(
+                is_transformer_quant_target(k),
+                "structural projection must match generated target: {k}"
+            );
         }
         // 28 single-stream blocks × 8 + 4 text-fusion blocks × 8 = 256 (== the on-disk BF16 count).
         assert_eq!(targets.len(), 256, "DiT Linear count");
+        assert!(!is_transformer_quant_target(
+            "transformer_blocks.0.norm1.weight"
+        ));
     }
 
     #[test]
@@ -435,6 +499,10 @@ mod tests {
         // 36 layers × (4 attn proj + 3 mlp proj); embed_tokens + norms + visual.* stay dense.
         assert_eq!(t.len(), 36 * 7);
         assert!(t.iter().all(|k| k.starts_with("language_model.layers.")));
+        assert!(t.iter().all(|k| is_text_encoder_quant_target(k)));
+        assert!(!is_text_encoder_quant_target(
+            "language_model.embed_tokens.weight"
+        ));
     }
 
     #[test]
@@ -495,7 +563,9 @@ mod tests {
         let root =
             std::path::PathBuf::from(std::env::var("KREA_TURBO_DIR").expect("set KREA_TURBO_DIR"));
         let cfg = Krea2Config::from_snapshot(&root).unwrap();
-        let dst = std::env::temp_dir().join("krea_q8_convert_test");
+        // Per-process scratch dir: the `remove_dir_all` below would otherwise wipe a second
+        // concurrent `cargo test` process's fixtures out of the shared `$TMPDIR`.
+        let dst = std::env::temp_dir().join(format!("krea_q8_convert_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dst);
         quantize_transformer(&root, &dst, 8).unwrap();
 

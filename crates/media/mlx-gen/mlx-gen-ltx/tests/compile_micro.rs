@@ -13,7 +13,7 @@
 //!
 //! Run it:
 //! ```text
-//! cargo test --release -p mlx-gen-ltx --test compile_micro -- --ignored --nocapture
+//! cargo test --release -p mlx-gen-ltx --test integration compile_micro:: -- --ignored --nocapture
 //! ```
 
 use std::time::Instant;

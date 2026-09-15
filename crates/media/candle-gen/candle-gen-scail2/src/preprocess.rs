@@ -11,7 +11,7 @@ const ON_THRESH: f64 = (225.0 - 127.5) / 127.5;
 
 /// Default temporal-compression stride (the z16 VAE temporal stride): 4 frames → 1 latent frame,
 /// packed into the channel axis (×7 colors = 28).
-pub const TEMPORAL_STRIDE: usize = 4;
+pub const TEMPORAL_STRIDE: usize = crate::VAE_TILING.temporal_scale as usize;
 
 /// `1 - x`.
 fn one_minus(x: &Tensor) -> Result<Tensor> {

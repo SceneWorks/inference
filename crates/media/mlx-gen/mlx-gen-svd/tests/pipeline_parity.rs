@@ -4,7 +4,7 @@
 //! from the real components fed identical conditioning + init noise (`tools/dump_svd_pipeline_golden.py`),
 //! in f32. Needs the SVD checkpoint locally → `--ignored`.
 //!
-//! Run: `cargo test -p mlx-gen-svd --test pipeline_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-svd --test integration pipeline_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max as max_op, sqrt, square, subtract, sum};
 use mlx_rs::{Array, Dtype};

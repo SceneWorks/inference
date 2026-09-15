@@ -28,7 +28,7 @@ use candle_nn::VarBuilder;
 use tokenizers::Tokenizer;
 
 use crate::backbone::Backbone;
-use crate::codec::MossAudioCodec;
+use crate::codec::{DecodePartitionSchedule, MossAudioCodec};
 use crate::config::MossTtsRealtimeConfig;
 use crate::conversation::{self, ConvState, PreparedTurn, Role};
 use crate::decode::{build_prompt_frames, Decoder};
@@ -59,23 +59,24 @@ pub const CODEC_HUB_REVISION: &str = "3cd226ba2947efa357ef453bcad111b6eafba782";
 /// from the staged directory.
 pub const CODEC_COMPONENT_ID: &str = "codec";
 
-/// The license of the pinned MOSS-TTS-Realtime weight checkpoint (sc-13332) — surfaced for
-/// SceneWorks' end-product licenses page. Apache-2.0 (permissive), verified against the
-/// `OpenMOSS-Team/MOSS-TTS-Realtime` model card.
-pub const WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "Apache-2.0",
-    name: "Apache License 2.0",
-    source_url: "https://huggingface.co/OpenMOSS-Team/MOSS-TTS-Realtime",
-    attribution: Some("MOSS-TTS-Realtime-1.7B © OpenMOSS Team — licensed under Apache-2.0"),
-    commercial_use: true,
-    restriction: None,
-};
+/// Stable component key for the pinned MOSS-TTS-Realtime-1.7B checkpoint — what `PROVIDER_COMPONENTS`
+/// resolves through, and the licence manifest's unique row key.
+pub const COMPONENT_KEY: &str = "moss_tts_realtime_1_7b";
 
-/// This provider's weight-license entry (keyed by [`MODEL_ID`]) for catalog aggregation.
-pub const WEIGHT_LICENSE_ENTRY: gen_core::WeightLicenseEntry = gen_core::WeightLicenseEntry {
-    provider_id: MODEL_ID,
-    component: None,
-    license: WEIGHT_LICENSE,
+/// The schema-3 licence row for the pinned MOSS-TTS-Realtime-1.7B checkpoint (sc-16663).
+///
+/// **Disclosure only.** The row records what the upstream declares so a consumer can show it to a
+/// user; nothing here decides whether any use is permitted. `declared` and `gated` were read from
+/// the `OpenMOSS-Team/MOSS-TTS-Realtime` model card on `retrieved`, and `family` normalizes that declaration onto
+/// [`gen_core::license::families::APACHE_2_0`].
+pub const COMPONENT_LICENSE: gen_core::ComponentLicense = gen_core::ComponentLicense {
+    component: COMPONENT_KEY,
+    source_url: "https://huggingface.co/OpenMOSS-Team/MOSS-TTS-Realtime",
+    gated: false,
+    declared: "apache-2.0",
+    family: "apache-2-0",
+    attribution: Some("MOSS-TTS-Realtime-1.7B © OpenMOSS Team — licensed under Apache-2.0"),
+    retrieved: "2026-08-02",
 };
 
 /// Native output sample rate of the codec (Hz).
@@ -103,15 +104,15 @@ pub const LANGUAGES: &[&str] = &["en", "zh"];
 /// a time (the codec decodes a block of frames into a streamed PCM chunk).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: None,
+        control_kinds: None,
         required_components: &[CODEC_COMPONENT_ID],
         id: MODEL_ID,
         family: "moss_tts_realtime",
         backend: "candle",
         modality: Modality::Audio,
         capabilities: Capabilities {
-            supports_negative_prompt: false,
-            supports_guidance: false,
-            supports_true_cfg: false,
             // Voice cloning (sc-14149): a reference clip is supplied as `Conditioning::ReferenceAudio`
             // and encoded into the timbre prompt. Absent it, the model uses its default voice.
             // Multi-turn (sc-14151): a `Conditioning::ConversationHistory` drives the stateless path A
@@ -120,31 +121,16 @@ pub fn descriptor() -> ModelDescriptor {
                 gen_core::ConditioningKind::ReferenceAudio,
                 gen_core::ConditioningKind::ConversationHistory,
             ],
-            supports_lora: false,
-            supports_lokr: false,
-            samplers: vec![],
-            schedulers: vec![],
-            supported_guidance_methods: vec![],
-            min_size: 0,
-            max_size: 0,
             max_count: 1,
-            mac_only: false,
             audio_sample_rates: vec![SAMPLE_RATE],
             max_audio_duration_secs: Some(MAX_DURATION_SECS),
-            audio_voices: vec![],
             audio_languages: LANGUAGES.to_vec(),
-            audio_edit_modes: vec![],
-            supported_quants: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
             supports_streaming: true,
-            supports_multi_speaker: false,
             // Multi-turn conversational continuation (sc-14151), both selectable shapes: the stateless
             // history-in-request path (A) and the stateful warm-KV session (B).
             supports_conversation_history: true,
             supports_conversation_session: true,
-            max_speakers: None,
+            ..Default::default()
         },
     }
 }
@@ -230,19 +216,6 @@ impl Loaded {
     }
 }
 
-/// Default RVQ frames per streaming block (≈ 0.64 s at 12.5 fps). Sized down per request so a short
-/// clip still yields ≥ 2 chunks (the streaming incrementality law).
-const DEFAULT_FRAMES_PER_BLOCK: usize = 8;
-
-/// The streaming block size for a clip of `budget_frames` (the AR frame budget): at most
-/// [`DEFAULT_FRAMES_PER_BLOCK`], but never more than half the budget, so a budget-reaching run of
-/// `≥ 2` frames always streams `≥ 2` chunks.
-fn frames_per_block(budget_frames: usize) -> usize {
-    DEFAULT_FRAMES_PER_BLOCK
-        .min(budget_frames.div_ceil(2))
-        .max(1)
-}
-
 /// A loaded (lazy) MOSS-TTS-Realtime generator.
 pub struct MossTtsRealtimeGenerator {
     descriptor: ModelDescriptor,
@@ -275,6 +248,15 @@ fn mono_samples(track: &AudioTrack) -> Vec<f32> {
         .collect()
 }
 
+fn contextual_audio_error(context: String, error: candle_audio::AudioError) -> gen_core::Error {
+    match error {
+        candle_audio::AudioError::Msg(message) => {
+            gen_core::Error::Msg(format!("{context}: {message}"))
+        }
+        typed => typed.into(),
+    }
+}
+
 /// Prepare one contract [`ConversationTurn`] for the engine (sc-14151): map its role and encode its
 /// PCM audio (if any) to RVQ frames through the codec (a user turn's speech, or a resumed assistant
 /// turn). A synthesis turn (assistant, no audio) prepares with `audio_codes: None`.
@@ -292,9 +274,10 @@ fn prepare_turn(
             let codes = codec
                 .encode(&mono_samples(track), track.sample_rate)
                 .map_err(|e| {
-                    gen_core::Error::Msg(format!(
-                        "{MODEL_ID}: encode conversation turn {index} audio: {e}"
-                    ))
+                    contextual_audio_error(
+                        format!("{MODEL_ID}: encode conversation turn {index} audio"),
+                        e,
+                    )
                 })?;
             if codes.is_empty() {
                 return Err(gen_core::Error::Msg(format!(
@@ -321,19 +304,25 @@ fn prepare_turn(
 fn emit_pcm_as_chunks(
     pcm: &[f32],
     sample_rate: u32,
-    block_samples: usize,
+    samples_per_frame: usize,
+    schedule: DecodePartitionSchedule,
     chunk_index: &mut usize,
     on_chunk: &mut dyn FnMut(AudioChunk),
 ) {
-    let block = block_samples.max(1);
-    for slice in pcm.chunks(block) {
+    let mut offset = 0usize;
+    let mut block_index = 0usize;
+    while offset < pcm.len() {
+        let block_samples = schedule.block_frames(block_index) * samples_per_frame;
+        let end = (offset + block_samples).min(pcm.len());
         on_chunk(AudioChunk {
-            samples: slice.to_vec(),
+            samples: pcm[offset..end].to_vec(),
             sample_rate,
             channels: 1,
             index: *chunk_index,
         });
         *chunk_index += 1;
+        block_index += 1;
+        offset = end;
     }
 }
 
@@ -365,7 +354,7 @@ impl MossTtsRealtimeGenerator {
         let codes = codec
             .encode(&mono_samples(track), track.sample_rate)
             .map_err(|e| {
-                gen_core::Error::Msg(format!("{MODEL_ID}: encode reference audio: {e}"))
+                contextual_audio_error(format!("{MODEL_ID}: encode reference audio"), e)
             })?;
         if codes.is_empty() {
             return Err(gen_core::Error::Msg(format!(
@@ -418,6 +407,7 @@ impl MossTtsRealtimeGenerator {
         let voice_clone = self.reference_codes(req)?;
         let base_seed = req.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
         let budget = frame_budget(req);
+        let decode_schedule = crate::codec::decode_partition_schedule(budget);
         let synth_turns = turns
             .iter()
             .filter(|t| t.role == Role::Assistant && t.audio_codes.is_none())
@@ -461,7 +451,6 @@ impl MossTtsRealtimeGenerator {
         // per *turn* (not per block as the single-turn `StreamingChunker` path is): first-chunk latency
         // is one whole turn, not one block — the multi-turn session trades intra-turn streaming for the
         // per-turn independence that keeps A (batch) and B (session) byte-identical.
-        let block_samples = DEFAULT_FRAMES_PER_BLOCK * codec.samples_per_frame();
         let mut all: Vec<f32> = Vec::new();
         let mut chunk_index = 0usize;
         for frames in &rendered.turns {
@@ -469,10 +458,17 @@ impl MossTtsRealtimeGenerator {
                 continue;
             }
             let pcm = codec
-                .decode_frames(frames, &probe)
+                .decode_frames(frames, decode_schedule, &probe)
                 .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: codec decode: {e}")))?
                 .ok_or(gen_core::Error::Canceled)?;
-            emit_pcm_as_chunks(&pcm, SAMPLE_RATE, block_samples, &mut chunk_index, on_chunk);
+            emit_pcm_as_chunks(
+                &pcm,
+                SAMPLE_RATE,
+                codec.samples_per_frame(),
+                decode_schedule,
+                &mut chunk_index,
+                on_chunk,
+            );
             all.extend_from_slice(&pcm);
         }
         if all.is_empty() {
@@ -557,16 +553,15 @@ impl MossTtsRealtimeGenerator {
 
     /// The single deterministic synthesis path shared by [`generate`](Self::generate) and
     /// [`generate_streaming`](Self::generate_streaming): drive the AR brain and, **from inside the AR
-    /// loop**, decode the codec block-wise over the growing RVQ-frame prefix — emitting one
-    /// [`AudioChunk`] per newly-revealed PCM block *while later frames are still being generated*
+    /// loop**, decode each newly available RVQ-frame block with request-local bounded codec state —
+    /// emitting one [`AudioChunk`] per new PCM block *while later frames are still being generated*
     /// ([`crate::chunk::StreamingChunker`]).
     ///
-    /// Because the codec decode graph is fully causal, decoding a growing prefix reproduces the
-    /// earlier samples byte-for-byte — so the concatenated chunks equal the returned track exactly
-    /// (the reassembly law), and the two entry points return byte-identical audio for the same
-    /// request+seed (they call this one function). The first chunk is emitted after the first block
-    /// of AR frames rather than after the whole track, so first-chunk latency is proportional to one
-    /// block of AR frames, not the full synthesis time.
+    /// Because the codec decode graph is fully causal, each stage can carry its absolute position and
+    /// fixed-window KV history without replaying earlier frames. The concatenated chunks equal the
+    /// returned track exactly (the reassembly law), and the two entry points return byte-identical
+    /// audio for the same request+seed because they call this one function. The first chunk is emitted
+    /// after the first block of AR frames rather than after the whole track.
     ///
     /// The AR backbone runs a KV cache (sc-13417): the prompt is prefilled once and each emitted
     /// frame is a single-token step, so per-frame cost is O(1) amortized rather than O(seq). This is
@@ -602,15 +597,11 @@ impl MossTtsRealtimeGenerator {
         // Deterministic token sampling seeded by the request (a `None` seed maps to a fixed constant),
         // so the gen-core reproducibility law holds and generate/generate_streaming agree.
         let seed = req.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
-        // Block sizing is driven by the frame budget (known up front, before the loop): at most
-        // DEFAULT_FRAMES_PER_BLOCK and never more than half the budget, so a budget-reaching run
-        // always streams >= 2 chunks.
-        let block = frames_per_block(budget);
-
+        let decode_schedule = crate::codec::decode_partition_schedule(budget);
         let cancel = req.cancel.clone();
         let probe = move || cancel.is_cancelled();
 
-        let mut chunker = crate::chunk::StreamingChunker::new(codec.as_ref(), block);
+        let mut chunker = crate::chunk::StreamingChunker::new(codec.as_ref(), decode_schedule);
         let mut canceled = false;
         let run = {
             // The AR loop hands each emitted frame here; the chunker decodes + streams block-wise.
@@ -703,6 +694,7 @@ impl Generator for MossTtsRealtimeGenerator {
         let voice_clone = self.reference_codes(req)?;
         let base_seed = req.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
         let budget = frame_budget(req);
+        let decode_schedule = crate::codec::decode_partition_schedule(budget);
         let state = ConvState::new(&pipeline.decoder);
         Ok(Box::new(MossConversationSession {
             loaded: pipeline,
@@ -710,6 +702,7 @@ impl Generator for MossTtsRealtimeGenerator {
             voice_clone,
             base_seed,
             budget,
+            decode_schedule,
             state,
             cancel: req.cancel.clone(),
             turn_index: 0,
@@ -727,6 +720,7 @@ struct MossConversationSession {
     voice_clone: Option<Vec<Vec<u32>>>,
     base_seed: u64,
     budget: usize,
+    decode_schedule: DecodePartitionSchedule,
     state: ConvState,
     cancel: CancelFlag,
     turn_index: usize,
@@ -806,14 +800,20 @@ impl ConversationSession for MossConversationSession {
                 ..Default::default()
             });
         }
-        let block_samples = DEFAULT_FRAMES_PER_BLOCK * self.codec.samples_per_frame();
         let pcm = self
             .codec
-            .decode_frames(&frames, &probe)
+            .decode_frames(&frames, self.decode_schedule, &probe)
             .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: codec decode: {e}")))?
             .ok_or(gen_core::Error::Canceled)?;
         let mut chunk_index = 0usize;
-        emit_pcm_as_chunks(&pcm, SAMPLE_RATE, block_samples, &mut chunk_index, on_chunk);
+        emit_pcm_as_chunks(
+            &pcm,
+            SAMPLE_RATE,
+            self.codec.samples_per_frame(),
+            self.decode_schedule,
+            &mut chunk_index,
+            on_chunk,
+        );
         Ok(AudioTrack {
             samples: pcm,
             sample_rate: SAMPLE_RATE,
@@ -908,6 +908,28 @@ pub fn provider_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codec_context_preserves_typed_backend_and_cancellation() {
+        let canceled =
+            contextual_audio_error("codec encode".into(), candle_audio::AudioError::Canceled);
+        assert!(matches!(canceled, gen_core::Error::Canceled));
+
+        let backend = contextual_audio_error(
+            "codec encode".into(),
+            candle_audio::AudioError::Candle(candle_audio::candle_core::Error::Msg(
+                "device failed".into(),
+            )),
+        );
+        assert!(matches!(backend, gen_core::Error::Backend(_)));
+
+        let message = contextual_audio_error(
+            "encode reference".into(),
+            candle_audio::AudioError::Msg("bad rate".into()),
+        );
+        assert!(matches!(message, gen_core::Error::Msg(_)));
+        assert_eq!(message.to_string(), "encode reference: bad rate");
+    }
     use candle_audio::gen_core::{AudioParams, CancelFlag, SpeechSegment};
 
     fn audio_req(audio: AudioParams) -> GenerationRequest {
@@ -982,12 +1004,18 @@ mod tests {
             Err(gen_core::Error::Unsupported(_))
         ));
 
-        // Duration above the advertised cap rejected.
+        // Duration above the advertised cap is a typed range error before any model/codec load or
+        // duration-sized allocation can occur.
         let bad = audio_req(AudioParams {
             target_duration: Some(MAX_DURATION_SECS + 1.0),
             ..Default::default()
         });
-        assert!(validate_request(&d, &bad).is_err());
+        assert!(matches!(
+            validate_request(&d, &bad),
+            Err(gen_core::Error::Msg(message))
+                if message.contains("audio.target_duration")
+                    && message.contains("supported maximum")
+        ));
 
         // A multi-speaker script → typed Unsupported (we do not advertise multi-speaker).
         let bad = audio_req(AudioParams {
@@ -1027,9 +1055,49 @@ mod tests {
         );
     }
 
+    /// Conversation and session both use `emit_pcm_as_chunks` after the shared scheduled codec
+    /// decode. Pin the actual-EOS/request-budget cross product at that production seam so neither
+    /// route can regress to slicing with one scalar budget-derived block.
+    #[test]
+    fn early_eos_conversation_chunks_follow_the_decode_schedule() {
+        const SAMPLES_PER_FRAME: usize = 3;
+        for actual_frames in 2usize..=7 {
+            let pcm: Vec<f32> = (0..actual_frames * SAMPLES_PER_FRAME)
+                .map(|sample| sample as f32)
+                .collect();
+            for requested_budget in [actual_frames, 19] {
+                let schedule = crate::codec::decode_partition_schedule(requested_budget);
+                let mut chunks = Vec::new();
+                let mut chunk_index = 0usize;
+                emit_pcm_as_chunks(
+                    &pcm,
+                    SAMPLE_RATE,
+                    SAMPLES_PER_FRAME,
+                    schedule,
+                    &mut chunk_index,
+                    &mut |chunk| chunks.push(chunk),
+                );
+                assert!(
+                    chunks.len() >= 2,
+                    "actual {actual_frames}, requested budget {requested_budget}"
+                );
+                assert!(chunks.iter().all(|chunk| chunk.samples.len() < pcm.len()));
+                assert_eq!(
+                    chunks
+                        .iter()
+                        .flat_map(|chunk| chunk.samples.iter().copied())
+                        .collect::<Vec<_>>(),
+                    pcm
+                );
+                assert_eq!(chunk_index, chunks.len());
+            }
+        }
+    }
+
     #[test]
     fn load_rejects_unsupported_spec_shapes() {
-        let dir = std::env::temp_dir();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let spec = LoadSpec::new(WeightsSource::File(dir.join("x.safetensors")));
         assert!(load(&spec).is_err());
         let mut spec = spec_with_codec(dir.clone());
@@ -1042,8 +1110,8 @@ mod tests {
     /// never fetched mid-render (epic 13657). Driven through the real `load` by the shared testkit.
     #[test]
     fn missing_codec_component_fails_at_load() {
-        let dir = std::env::temp_dir().join("moss-tts-rt-load-gate");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let base = spec_with_codec(dir);
         // The fully-provisioned spec loads (the codec is lazy — no directory read yet).
         assert!(
@@ -1056,8 +1124,8 @@ mod tests {
 
     #[test]
     fn pre_tripped_cancel_returns_typed_canceled_before_any_heavy_work() {
-        let dir = std::env::temp_dir().join("moss-tts-rt-missing-snapshot");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let g = load_generator(&spec_with_codec(dir)).unwrap();
         let flag = CancelFlag::new();
         flag.cancel();
@@ -1071,10 +1139,17 @@ mod tests {
     }
 
     #[test]
-    fn weight_license_is_apache() {
-        let lic = WEIGHT_LICENSE;
-        assert_eq!(lic.spdx_id, "Apache-2.0");
-        assert!(lic.commercial_use, "Apache-2.0 permits commercial use");
-        assert_eq!(WEIGHT_LICENSE_ENTRY.provider_id, MODEL_ID);
+    fn component_licence_resolves_to_the_apache_family() {
+        use gen_core::{resolve_family, LicenseTerm, LICENSE_FAMILIES};
+        assert!(COMPONENT_LICENSE.is_well_formed(LICENSE_FAMILIES));
+        assert_eq!(COMPONENT_LICENSE.declared, "apache-2.0");
+        let family = resolve_family(LICENSE_FAMILIES, COMPONENT_LICENSE.family).unwrap();
+        assert_eq!(family.spdx_id, "Apache-2.0");
+        // Apache-2.0 states three duties; a "permissive" flag recorded none of them.
+        assert!(family.imposes(LicenseTerm::AttributionRequired));
+        assert!(family.imposes(LicenseTerm::NoticeFileRequired));
+        assert!(family.imposes(LicenseTerm::DownstreamLicenseCopy {
+            family: "apache-2-0"
+        }));
     }
 }

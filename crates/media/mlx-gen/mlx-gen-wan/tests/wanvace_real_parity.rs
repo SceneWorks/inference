@@ -14,7 +14,7 @@
 //! named floor the base Wan S3 gate carries). The non-trivial monotone `control_hidden_states_scale`
 //! in the golden makes a mis-applied / reversed hint scale fail decisively.
 //!
-//! Run: `WANVACE_DIR=<snapshot> cargo test -p mlx-gen-wan --test wanvace_real_parity -- --ignored
+//! Run: `WANVACE_DIR=<snapshot> cargo test -p mlx-gen-wan --test integration wanvace_real_parity:: -- --ignored
 //! --nocapture` (defaults to the HF cache snapshot of the 1.3B repo).
 
 use std::path::PathBuf;

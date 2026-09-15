@@ -10,10 +10,9 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::SdxlVaeDecoder;
 use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
-use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
-use candle_transformers::models::stable_diffusion::StableDiffusionConfig;
 
 use candle_gen::gen_core::{AdapterSpec, WeightsSource};
 use candle_gen::{CandleError, Result};
@@ -96,6 +95,28 @@ pub fn load_instantid_unet_with_adapters(
     dtype: DType,
     adapters: &[AdapterSpec],
 ) -> Result<UNet2DConditionModel> {
+    load_vendored_unet_with_adapters(
+        root,
+        device,
+        dtype,
+        adapters,
+        ADDITION_TIME_EMBED_DIM,
+        PROJECTION_INPUT_DIM,
+    )
+}
+
+/// Load the vendored SDXL-family UNet with an arbitrary add-embedding shape and apply the selected
+/// adapter stack. Kolors shares the SDXL UNet body but uses a 5632-wide add embedding, so its plain,
+/// IP-Adapter, and strict-control providers use this seam rather than duplicating the packed/dense
+/// adapter rules (including the zero-match and declared-kind guards).
+pub fn load_vendored_unet_with_adapters(
+    root: &Path,
+    device: &Device,
+    dtype: DType,
+    adapters: &[AdapterSpec],
+    addition_time_embed_dim: usize,
+    projection_input_dim: usize,
+) -> Result<UNet2DConditionModel> {
     match crate::pipeline::detect_packed_unet(root)? {
         Some((packed_file, group_size)) => {
             // The vendored UNet threads only the default MLX group 64 through its blocks; a non-64 tier
@@ -107,23 +128,34 @@ pub fn load_instantid_unet_with_adapters(
             let conv = crate::adapters::fold_conv_adapters(&mut raw, adapters, &table)?;
             let vs = VarBuilder::from_tensors(raw, dtype, device);
             let mut unet = UNet2DConditionModel::new(vs.clone(), 4, 4, false, sdxl_unet_config())?
-                .with_add_embedding(vs, ADDITION_TIME_EMBED_DIM, PROJECTION_INPUT_DIM)?;
+                .with_add_embedding(vs, addition_time_embed_dim, projection_input_dim)?;
             let add = crate::adapters::install_additive(&mut unet, adapters, &table, device)?;
-            crate::adapters::guard_additive_matched(adapters.len(), conv.merged + add.applied)?;
+            crate::adapters::guard_each_adapter_matched(
+                adapters,
+                &[&conv.applied_by_spec, &add.applied_by_spec],
+            )?;
             Ok(unet)
         }
         None => {
             // sc-11682: keep the bf16 base a pristine mmap (evictable — epic 10765) and apply the
             // adapter additively (Linear + conv residuals) instead of folding into a host `from_tensors`
             // map. The `add_embedding` head shares the same mmap VarBuilder.
-            let unet_file = snapshot_file(root, "unet/diffusion_pytorch_model.fp16.safetensors")?;
+            let dense = root.join("unet/diffusion_pytorch_model.safetensors");
+            let unet_file = if dense.is_file() {
+                dense
+            } else {
+                snapshot_file(root, "unet/diffusion_pytorch_model.fp16.safetensors")?
+            };
             let table = crate::adapters::build_sdxl_kohya_table_from_file(&unet_file)?;
             let vs = candle_gen::mmap_var_builder(&[unet_file], dtype, device)?;
             let mut unet = UNet2DConditionModel::new(vs.clone(), 4, 4, false, sdxl_unet_config())?
-                .with_add_embedding(vs, ADDITION_TIME_EMBED_DIM, PROJECTION_INPUT_DIM)?;
+                .with_add_embedding(vs, addition_time_embed_dim, projection_input_dim)?;
             let lin = crate::adapters::install_additive(&mut unet, adapters, &table, device)?;
             let conv = crate::adapters::install_additive_conv(&mut unet, adapters, &table, device)?;
-            crate::adapters::guard_additive_matched(adapters.len(), lin.applied + conv.applied)?;
+            crate::adapters::guard_each_adapter_matched(
+                adapters,
+                &[&lin.applied_by_spec, &conv.applied_by_spec],
+            )?;
             Ok(unet)
         }
     }
@@ -131,19 +163,30 @@ pub fn load_instantid_unet_with_adapters(
 
 /// Load the f16-stable SDXL VAE (`madebyollin/sdxl-vae-fp16-fix`) from the caller-staged `vae_fp16_fix`
 /// component (epic 13657, sc-13663 — passed in, never self-fetched) at `dtype`. Resolution-agnostic —
-/// `build_vae` reads only the autoencoder sub-config.
+/// only the autoencoder sub-config is read.
+///
+/// Builds [`SdxlVaeDecoder`] rather than the stock `AutoEncoderKL` (sc-19753): the layer-wise
+/// bounded decode has to reach inside the decoder, which the upstream type does not allow. Only the
+/// decode half is loaded — `AutoEncoderKL::encode` was never called from this crate — so this also
+/// drops the encoder tower and `quant_conv` from residency.
+/// `tests/vae_decoder_parity.rs` pins that its decode matches `StableDiffusionConfig::sdxl`'s own
+/// `build_vae`, config included.
 pub fn load_sdxl_vae(
     vae_fp16_fix: &WeightsSource,
     device: &Device,
     dtype: DType,
-) -> Result<AutoEncoderKL> {
-    let config = StableDiffusionConfig::sdxl(None, None, None);
-    Ok(config.build_vae(resolve_vae_file(vae_fp16_fix), device, dtype)?)
+) -> Result<SdxlVaeDecoder> {
+    SdxlVaeDecoder::from_file(
+        &resolve_vae_file(vae_fp16_fix),
+        device,
+        dtype,
+        &crate::pipeline::sdxl_vae_config(),
+    )
 }
 
 /// Load the **deterministic VAE moments-encoder** for the SDXL edit path (sc-6037) — the encode
 /// counterpart of [`load_sdxl_vae`], built from the SAME f16-stable VAE checkpoint
-/// (`madebyollin/sdxl-vae-fp16-fix`). candle's stock `AutoEncoderKL` exposes only `decode` plus a
+/// (`madebyollin/sdxl-vae-fp16-fix`). candle's stock `AutoEncoderKL` exposed only `decode` plus a
 /// device-RNG `sample` (non-portable; the very thing sc-3673 banned), so `VaeMomentsEncoder`
 /// (vendored for the trainer, sc-5165) is reused to take the clean latent **mean** × `VAE_SCALE`
 /// (0.13025) — the launch-portable img2img/inpaint init latent (no sampling, no device RNG).
@@ -200,8 +243,8 @@ mod tests {
     /// forcing dense bf16. GPU-free: asserts file selection only (no mmap / weights).
     #[test]
     fn instantid_unet_file_forks_packed_vs_dense() {
-        let tmp =
-            std::env::temp_dir().join(format!("sc10813_instantid_unet_{}", std::process::id()));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         let unet_dir = tmp.join("unet");
         std::fs::create_dir_all(&unet_dir).unwrap();
 
@@ -238,8 +281,6 @@ mod tests {
             unet_dir.join("diffusion_pytorch_model.fp16.safetensors"),
             "a dense snapshot ⇒ the .fp16 weight file (unchanged pre-sc-10813 behavior)"
         );
-
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// sc-11176 (F-084): the InstantID/edit/IP-Adapter **adapter** loader forks on the packed tier the
@@ -251,8 +292,8 @@ mod tests {
     /// (and the dense arm still does), proving the fork is taken.
     #[test]
     fn instantid_adapter_load_forks_packed_vs_dense() {
-        let tmp =
-            std::env::temp_dir().join(format!("sc11176_instantid_adapter_{}", std::process::id()));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         let unet_dir = tmp.join("unet");
         std::fs::create_dir_all(&unet_dir).unwrap();
         let dev = Device::Cpu;
@@ -294,7 +335,5 @@ mod tests {
             err.contains("fp16"),
             "a dense snapshot with no weights ⇒ the missing-.fp16 diagnosis (got: {err})"
         );
-
-        std::fs::remove_dir_all(&tmp).ok();
     }
 }

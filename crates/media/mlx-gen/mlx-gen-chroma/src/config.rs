@@ -92,6 +92,9 @@ impl ChromaVariant {
 
     pub fn descriptor(self) -> ModelDescriptor {
         ModelDescriptor {
+            encoder_contract: None,
+            denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
+            control_kinds: None,
             required_components: &[],
             id: self.id(),
             family: "chroma",
@@ -126,29 +129,18 @@ impl ChromaVariant {
                     s.push("linear");
                     s
                 },
-                supported_guidance_methods: vec![],
                 min_size: 256,
                 max_size: 2048,
                 max_count: 8,
                 mac_only: true,
-                supports_kv_cache: false,
                 // FLUX-style flow-match sigma shift (calculate_shift) is applied in the generate path.
                 requires_sigma_shift: true,
                 // Wired onto the shared `Residency` seam (sc-10840); honors Sequential offload —
                 // drops the T5-XXL encoder after the prompt encode so peak unified memory is bounded
                 // to `max(T5, DiT+VAE)` instead of their sum.
                 supports_sequential_offload: true,
-                supports_streaming: false,
-                supports_multi_speaker: false,
-                supports_conversation_history: false,
-                supports_conversation_session: false,
-                max_speakers: None,
-                // No audio surface (sc-12834): pure image/video model.
-                audio_sample_rates: vec![],
-                max_audio_duration_secs: None,
-                audio_voices: vec![],
-                audio_languages: vec![],
-                audio_edit_modes: vec![],
+                supports_preview: true,
+                ..Default::default()
             },
         }
     }

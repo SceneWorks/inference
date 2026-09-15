@@ -2,14 +2,14 @@
 //!
 //! `#[ignore]`d — needs the real SDXL snapshot + the golden from `tools/dump_sdxl_unet_golden.py`.
 //! Run with:
-//!   cargo test -p mlx-gen-sdxl --release --test unet_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sdxl --release --test integration unet_real_weights:: -- --ignored --nocapture
 //!
 //! Feeds the golden's exact inputs (latents, timestep, dual-CLIP conditioning, pooled, the hardcoded
 //! `[512,512,0,0,512,512]` micro-conditioning) and checks the predicted eps. Reference + Rust both
 //! f32, so the tolerance is tight — this isolates the entire U-Net forward (down/mid/up, cross-attn,
 //! the time + text_time embeddings, the skip connections).
 
-mod common;
+use crate::common;
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sdxl::load_unet;

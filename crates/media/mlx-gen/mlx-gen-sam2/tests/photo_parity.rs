@@ -9,7 +9,7 @@
 //!
 //! Run (weights from the SceneWorks mirror or tools/convert_sam2_to_mlx.py):
 //!   SCENEWORKS_SAM2_WEIGHTS=/path/to/sam2.1_hiera_large.safetensors \
-//!     cargo test -p mlx-gen-sam2 --release --test photo_parity -- --ignored --nocapture
+//!     cargo test -p mlx-gen-sam2 --release --test integration photo_parity:: -- --ignored --nocapture
 
 use std::time::Instant;
 

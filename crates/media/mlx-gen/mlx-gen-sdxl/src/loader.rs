@@ -40,12 +40,21 @@ fn is_packed(w: &Weights) -> bool {
 }
 
 /// Resolve a component's weight file inside `subdir`, picking the variant that best matches `dtype`.
+///
+/// `pub(crate)` for ladder rung 4 (SC-15525): `model::load_heavy` records the U-Net file this
+/// resolves to as the block stream's re-openable source, so a streamed block reads the **same file**
+/// the resident stack was built from rather than re-deriving the fp16/f32 variant rule.
 /// diffusers snapshots ship the f32 master (`<stem>.safetensors`) and/or an fp16 variant
 /// (`<stem>.fp16.safetensors`); the fp16 file is exactly `astype(f16)` of the f32 master, so for an
 /// f16 load the two are equivalent. We prefer the variant matching `dtype` (fp16 file for f16, the
 /// f32 file otherwise) and fall back to the other when only one is cached — the caller casts to
 /// `dtype` regardless, so the result is identical when both exist.
-fn resolve_weight_file(root: &Path, subdir: &str, stem: &str, dtype: Dtype) -> Result<PathBuf> {
+pub(crate) fn resolve_weight_file(
+    root: &Path,
+    subdir: &str,
+    stem: &str,
+    dtype: Dtype,
+) -> Result<PathBuf> {
     let plain = root.join(subdir).join(format!("{stem}.safetensors"));
     let fp16 = root.join(subdir).join(format!("{stem}.fp16.safetensors"));
     let (first, second) = if dtype == Dtype::Float16 {
@@ -174,6 +183,18 @@ pub fn load_unet_kolors_dtype(root: &Path, dtype: Dtype) -> Result<UNet2DConditi
     load_unet_with_config(root, dtype, &UNetConfig::kolors())
 }
 
+/// The **exact** U-Net weight file [`load_unet_with_config`] would read out of `root` at `dtype` —
+/// the re-openable source ladder rung 4 records when it arms a block stream.
+///
+/// `pub` for `mlx-gen-kolors` (SC-15521): Kolors re-exports this crate's [`UNet2DConditionModel`]
+/// verbatim but registers its own provider and arms its own streams, so it needs the same
+/// fp16/f32-variant resolution the resident load performed rather than a second derivation of the
+/// rule. Getting a *different* file here would silently stream blocks from a different snapshot
+/// variant than the resident stack was built from.
+pub fn resolve_unet_weight_file(root: &Path, dtype: Dtype) -> Result<PathBuf> {
+    resolve_weight_file(root, "unet", "diffusion_pytorch_model", dtype)
+}
+
 /// Load an SDXL **ControlNet** branch (sc-3058) from a diffusers `ControlNetModel` checkpoint — a
 /// single `.safetensors` file or a directory containing `diffusion_pytorch_model.safetensors`. Cast
 /// to `dtype` (fp16 in production, matching the U-Net it injects into).
@@ -193,6 +214,17 @@ pub fn load_controlnet(
     crate::unet::ControlNet::from_weights(&w, &UNetConfig::sdxl_base())
 }
 
+/// The ViT-H image encoder inside an `h94/IP-Adapter`-layout snapshot, relative to its root.
+pub(crate) const IP_ADAPTER_IMAGE_ENCODER_FILE: &str = "models/image_encoder/model.safetensors";
+
+/// The IP weights [`load_ip_adapter`] opens, in preference order: plus-face first, plus as the
+/// fallback (they share the Resampler architecture). Shared with the memory contract (SC-22667)
+/// so the overlay it prices is the file this loader materializes and never a third candidate.
+pub(crate) const IP_ADAPTER_WEIGHT_FILES: [&str; 2] = [
+    "sdxl_models/ip-adapter-plus-face_sdxl_vit-h.safetensors",
+    "sdxl_models/ip-adapter-plus_sdxl_vit-h.safetensors",
+];
+
 /// Load the **IP-Adapter** (sc-3059) from an `h94/IP-Adapter`-layout snapshot directory: the ViT-H
 /// image encoder at `models/image_encoder/model.safetensors` and the IP weights (Resampler +
 /// decoupled-attn K/V pairs) at `sdxl_models/ip-adapter-plus[-face]_sdxl_vit-h.safetensors`
@@ -208,26 +240,23 @@ pub fn load_ip_adapter(
     use crate::ip_adapter::{load_ip_kv_pairs, IpImageEncoder, Resampler, ResamplerConfig};
     use crate::vision_encoder::{ClipVisionEncoder, VisionConfig};
 
-    let mut enc_w = Weights::from_file(dir.join("models/image_encoder/model.safetensors"))?;
+    let mut enc_w = Weights::from_file(dir.join(IP_ADAPTER_IMAGE_ENCODER_FILE))?;
     // F-082: packed guard, as in `load_unet_with_config` — never cast pre-quantized payloads.
     if !is_packed(&enc_w) {
         enc_w.cast_all(dtype)?;
     }
     let encoder = ClipVisionEncoder::from_weights(&enc_w, &VisionConfig::vit_h_14())?;
 
-    let ip_file = [
-        "sdxl_models/ip-adapter-plus-face_sdxl_vit-h.safetensors",
-        "sdxl_models/ip-adapter-plus_sdxl_vit-h.safetensors",
-    ]
-    .iter()
-    .map(|f| dir.join(f))
-    .find(|p| p.exists())
-    .ok_or_else(|| {
-        Error::Msg(format!(
-            "ip-adapter: no plus/plus-face sdxl_vit-h weights under {}/sdxl_models",
-            dir.display()
-        ))
-    })?;
+    let ip_file = IP_ADAPTER_WEIGHT_FILES
+        .iter()
+        .map(|f| dir.join(f))
+        .find(|p| p.exists())
+        .ok_or_else(|| {
+            Error::Msg(format!(
+                "ip-adapter: no plus/plus-face sdxl_vit-h weights under {}/sdxl_models",
+                dir.display()
+            ))
+        })?;
     let mut ip_w = Weights::from_file(&ip_file)?;
     // F-082: packed guard, as in `load_unet_with_config` — never cast pre-quantized payloads.
     if !is_packed(&ip_w) {
@@ -246,10 +275,22 @@ pub fn load_ip_adapter(
 /// is cached it is upcast to f32 (fp16-precision weights — note: not bit-identical to the true f32
 /// VAE; fetch `vae/diffusion_pytorch_model.safetensors` for an exact decode).
 pub fn load_vae(root: &Path) -> Result<Autoencoder> {
-    let file = resolve_weight_file(root, "vae", "diffusion_pytorch_model", Dtype::Float32)?;
+    let file = resolve_vae_weight_file(root)?;
     let mut w = Weights::from_file(&file)?;
     w.cast_all(Dtype::Float32)?;
     Autoencoder::from_weights(&w, &VaeConfig::sdxl_base())
+}
+
+/// The **exact** VAE weight file [`load_vae`] would read out of `root`.
+///
+/// `pub` for the same reason [`resolve_unet_weight_file`] is: a memory contract that prices the
+/// decoder must size the file the resident load actually opens, not a directory sum. It matters
+/// more here than for the U-Net, because [`load_vae`] `cast_all`s to **f32 unconditionally** while
+/// every SceneWorks SDXL-family tier ships only `diffusion_pytorch_model.fp16.safetensors` — so a
+/// decoder footprint taken from stored bytes is underpriced by exactly 2x, at every tier
+/// (sc-15839). Pair this with `mlx_gen::asset_facts::ResidentProjection::Float32`.
+pub fn resolve_vae_weight_file(root: &Path) -> Result<PathBuf> {
+    resolve_weight_file(root, "vae", "diffusion_pytorch_model", Dtype::Float32)
 }
 
 /// F-181: the `Sequential` re-quant warn (and the `needs_load_time_quant` tier guard) must fire only
@@ -261,10 +302,9 @@ mod quant_tier_tests {
 
     /// Make a fresh temp snapshot root with `unet/config.json` = `body` (skip the file when `body` is
     /// `None` — a dense snapshot with no quantization marker).
-    fn snapshot(body: Option<&str>) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "sdxl-tier-{}-{:?}",
-            std::process::id(),
+    fn snapshot(tmp: &tempfile::TempDir, body: Option<&str>) -> std::path::PathBuf {
+        let root = tmp.path().join(format!(
+            "sdxl-tier-{:?}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -279,9 +319,10 @@ mod quant_tier_tests {
 
     #[test]
     fn dense_snapshot_needs_quant_and_warns() {
+        let tmp = tempfile::tempdir().unwrap();
         // No config.json at all, and a config with no `quantization` marker, both read as dense.
         for body in [None, Some("{}"), Some(r#"{"in_channels": 4}"#)] {
-            let root = snapshot(body);
+            let root = snapshot(&tmp, body);
             assert!(
                 needs_load_time_quant(&root, "unet", 4, "sdxl").unwrap(),
                 "dense snapshot must report a load-time quant (→ warn)"
@@ -292,7 +333,11 @@ mod quant_tier_tests {
 
     #[test]
     fn already_packed_at_requested_bits_does_not_warn() {
-        let root = snapshot(Some(r#"{"quantization": {"bits": 8, "group_size": 64}}"#));
+        let tmp = tempfile::tempdir().unwrap();
+        let root = snapshot(
+            &tmp,
+            Some(r#"{"quantization": {"bits": 8, "group_size": 64}}"#),
+        );
         assert!(
             !needs_load_time_quant(&root, "unet", 8, "sdxl").unwrap(),
             "an already-packed Q8 turnkey must NOT report a load-time quant (no warn)"
@@ -302,7 +347,11 @@ mod quant_tier_tests {
 
     #[test]
     fn tier_mismatch_errors() {
-        let root = snapshot(Some(r#"{"quantization": {"bits": 8, "group_size": 64}}"#));
+        let tmp = tempfile::tempdir().unwrap();
+        let root = snapshot(
+            &tmp,
+            Some(r#"{"quantization": {"bits": 8, "group_size": 64}}"#),
+        );
         let err = needs_load_time_quant(&root, "unet", 4, "sdxl").unwrap_err();
         assert!(
             format!("{err}").contains("pre-quantized Q8"),

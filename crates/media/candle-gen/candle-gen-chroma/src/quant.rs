@@ -32,29 +32,18 @@
 //! [`crate::vae`] loaders unchanged; only the DiT threads through this packed-detect seam.
 
 use candle_gen::candle_core::{Result, Tensor};
-use candle_gen::candle_nn::{Linear, Module, VarBuilder};
+#[cfg(test)]
+use candle_gen::candle_nn::Linear;
+use candle_gen::candle_nn::{Module, VarBuilder};
 use candle_gen::quant as shared;
 
 /// A Linear projection that is **dense** (the loaded bf16/f32 weight) or **packed** (loaded straight
 /// from an MLX-packed tier via the shared [`candle_gen::quant::QLinear`], sc-9409). Built dense
-/// ([`Self::linear`]) or packed-detected ([`Self::linear_detect`] / [`Self::linear_detect_gs`]); both
+/// Built through packed detection ([`Self::linear_detect`] / [`Self::linear_detect_gs`]); both
 /// forwards compute `x·Wᵀ + b`.
-pub enum QLinear {
-    Dense(Linear),
-    /// Loaded directly from an MLX-packed tier through the shared module — the resident `Q4_1`/`Q8_0`
-    /// weight **dequantizes-on-forward** into a dense matmul (sc-7702, *not* the int8 `QMatMul` fast
-    /// path).
-    Packed(shared::QLinear),
-}
+pub struct QLinear(shared::AdaptLinear);
 
 impl QLinear {
-    /// A biased dense `[out, in]` projection from `vb` (`{prefix}.weight` + `{prefix}.bias`).
-    pub fn linear(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
-        Ok(Self::Dense(candle_gen::candle_nn::linear(
-            in_dim, out_dim, vb,
-        )?))
-    }
-
     /// **Packed-detecting** `[out, in]` loader at the default MLX group size 64 — see
     /// [`Self::linear_detect_gs`]. Every Chroma packed tier ships `quantization.group_size = 64`, so
     /// this is the common call; the `_gs` form threads a non-64 group size read from `config.json`.
@@ -87,22 +76,15 @@ impl QLinear {
         bias: bool,
         group_size: usize,
     ) -> Result<Self> {
-        if vb.contains_tensor(&format!("{base}.scales")) {
-            return Ok(Self::Packed(shared::lin_gs(
-                vb, base, in_dim, out_dim, bias, group_size,
-            )?));
-        }
-        let sub = vb.pp(base);
-        Self::linear(in_dim, out_dim, sub)
+        Ok(Self(shared::AdaptLinear::linear_detect_gs(
+            in_dim, out_dim, vb, base, bias, group_size,
+        )?))
     }
 
     /// `x·Wᵀ + b`. Dense delegates to `candle_nn::Linear`; packed delegates to the shared
     /// dequant-on-forward `QLinear` (sc-7702).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        match self {
-            Self::Dense(l) => l.forward(x),
-            Self::Packed(l) => l.forward(x),
-        }
+        self.0.forward(x)
     }
 
     /// Whether this projection loaded directly from an MLX-packed tier (the packed path). Distinguishes
@@ -110,7 +92,16 @@ impl QLinear {
     /// packed path (and did not silently fall back to dense).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_packed(&self) -> bool {
-        matches!(self, Self::Packed(_))
+        self.0.is_packed()
+    }
+
+    pub(crate) fn adaptable_mut(&mut self) -> &mut shared::AdaptLinear {
+        &mut self.0
+    }
+
+    #[cfg(test)]
+    fn from_dense(linear: Linear, in_dim: usize, out_dim: usize) -> Self {
+        Self(shared::AdaptLinear::from_dense(linear, in_dim, out_dim))
     }
 }
 
@@ -128,6 +119,23 @@ mod tests {
     use candle_gen::testkit::{q4_packed, tensor_cosine};
     use std::collections::HashMap;
 
+    /// A deterministic stand-in for `Tensor::randn`: `rows x cols` values in `[-1, 1)` from a fixed
+    /// LCG seeded by `seed`. The device RNG is unseeded, so a `randn` input here made the
+    /// `cos > 0.99999` bounds below a per-run coin flip (the CPU-lane flake on PR #946); the same
+    /// bounds over a fixed input are a property of the loader, not of the draw.
+    fn lcg_input(rows: usize, cols: usize, seed: u64, dev: &Device) -> Result<Tensor> {
+        let mut state = seed;
+        let values: Vec<f32> = (0..rows * cols)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 40) as f32 / (1u64 << 23) as f32) - 1.0
+            })
+            .collect();
+        Tensor::from_vec(values, (rows, cols), dev)
+    }
+
     /// **Packed-detect fires on the Chroma DiT key layout (incl. the `attn.to_out.0` nesting and a
     /// biased projection).** Writes a safetensors mimicking the real Chroma packed layout — a
     /// `to_out.0` triple *with* a dense `.bias` (the key remap that would silently fall back to dense if
@@ -137,6 +145,7 @@ mod tests {
     /// biased forward must reproduce the affine grid (+ bias) bit-exactly.
     #[test]
     fn linear_detect_fires_on_to_out_remap_and_leaves_dense_unchanged() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (64usize, 128usize);
         let (wq, s, b, grid) = q4_packed(out_dim, in_dim, 64);
@@ -155,15 +164,14 @@ mod tests {
         // A dense sibling (`to_q`) with no `.scales` → the dense path must stay unchanged.
         map.insert(
             "attn.to_q.weight".into(),
-            Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?,
+            lcg_input(out_dim, in_dim, 0x5c94_0901, &dev)?,
         );
         map.insert(
             "attn.to_q.bias".into(),
             Tensor::zeros((out_dim,), DType::F32, &dev)?,
         );
 
-        let tmp =
-            std::env::temp_dir().join(format!("sc9409_detect_{}.safetensors", std::process::id()));
+        let tmp = tmp.path().join("sc9409_detect.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: we just wrote this file and nothing else touches it during the test.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -177,18 +185,20 @@ mod tests {
         // `to_q` — dense (no `.scales`), path unchanged.
         let dense = QLinear::linear_detect(in_dim, out_dim, &attn, "to_q", true)?;
         assert!(!dense.is_packed(), "no `.scales` ⇒ dense path unchanged");
-        assert!(matches!(dense, QLinear::Dense(_)));
 
         // The packed forward reproduces the affine grid + bias (bit-exact repack + dequant-on-forward).
-        let grid_lin = QLinear::Dense(Linear::new(
-            Tensor::from_vec(grid, (out_dim, in_dim), &dev)?,
-            Some(Tensor::from_vec(bias_vec, (out_dim,), &dev)?),
-        ));
-        let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
+        let grid_lin = QLinear::from_dense(
+            Linear::new(
+                Tensor::from_vec(grid, (out_dim, in_dim), &dev)?,
+                Some(Tensor::from_vec(bias_vec, (out_dim,), &dev)?),
+            ),
+            in_dim,
+            out_dim,
+        );
+        let x = lcg_input(4, in_dim, 0x5c94_0902, &dev)?;
         let cos = tensor_cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "packed vs affine-grid cosine {cos:.6}");
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 
@@ -197,6 +207,7 @@ mod tests {
     /// trips through the packed forward, proving the group size is honored end to end.
     #[test]
     fn linear_detect_gs_threads_group_size() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (32usize, 64usize);
         // group 32 fixture: 2 groups per row.
@@ -237,8 +248,7 @@ mod tests {
             Tensor::from_vec(biases, (out_dim, gpr), &dev)?,
         );
 
-        let tmp =
-            std::env::temp_dir().join(format!("sc9409_gs_{}.safetensors", std::process::id()));
+        let tmp = tmp.path().join("sc9409_gs.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: freshly written, single-reader.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -246,15 +256,15 @@ mod tests {
 
         let packed = QLinear::linear_detect_gs(in_dim, out_dim, &vb, "p", false, G)?;
         assert!(packed.is_packed());
-        let grid_lin = QLinear::Dense(Linear::new(
-            Tensor::from_vec(grid, (out_dim, in_dim), &dev)?,
-            None,
-        ));
-        let x = Tensor::randn(0f32, 1f32, (3, in_dim), &dev)?;
+        let grid_lin = QLinear::from_dense(
+            Linear::new(Tensor::from_vec(grid, (out_dim, in_dim), &dev)?, None),
+            in_dim,
+            out_dim,
+        );
+        let x = lcg_input(3, in_dim, 0x5c94_0903, &dev)?;
         let cos = tensor_cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "group-32 packed vs grid cosine {cos:.6}");
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 }

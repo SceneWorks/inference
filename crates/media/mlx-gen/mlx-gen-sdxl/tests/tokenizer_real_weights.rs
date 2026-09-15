@@ -3,12 +3,12 @@
 //!
 //! `#[ignore]`d — needs the real `stabilityai/stable-diffusion-xl-base-1.0` snapshot in the HF
 //! cache and the golden from `tools/dump_sdxl_tokenizer_golden.py` (gitignored, local). Run with:
-//!   cargo test -p mlx-gen-sdxl --release --test tokenizer_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sdxl --release --test integration tokenizer_real_weights:: -- --ignored --nocapture
 //!
 //! The tokenizer must reproduce the vendored ids *exactly* (not "close") — any divergence shifts
 //! the conditioning sequence and breaks downstream parity.
 
-mod common;
+use crate::common;
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sdxl::ClipBpeTokenizer;

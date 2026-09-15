@@ -184,8 +184,8 @@ mod tests {
     /// `None`. Mirrors the candle crate's coverage. Path-only, so no tokenizer file need be valid.
     #[test]
     fn resolve_tokenizer_path_prefers_own_then_borrows_a_sibling_tier() {
-        let snap = std::env::temp_dir().join(format!("sensenova-mlx-tok-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&snap);
+        let snap_tmp = tempfile::tempdir().unwrap();
+        let snap = snap_tmp.path().to_path_buf();
         let touch = |rel: &str| {
             let path = snap.join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();

@@ -12,7 +12,7 @@
 //! bugs (wrong RoPE axis, transposed weight, mis-ordered modulation). The golden + the ~16 GB f32
 //! weight load keep this `#[ignore]`d; the golden is gitignored.
 //!
-//! Run: `cargo test -p mlx-gen-lens --test dit_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-lens --test integration dit_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max, multiply, subtract, sum};
 use mlx_rs::{Array, Dtype};
@@ -28,7 +28,7 @@ const GOLDEN: &str = concat!(
 
 fn transformer_dir() -> std::path::PathBuf {
     let base = std::path::PathBuf::from(std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)"))
-        .join("models--microsoft--Lens-Turbo/snapshots");
+        .join("models--SceneWorks--Lens-Turbo/snapshots");
     let snap = std::fs::read_dir(&base)
         .unwrap_or_else(|_| panic!("snapshot dir {}", base.display()))
         .filter_map(|e| e.ok())

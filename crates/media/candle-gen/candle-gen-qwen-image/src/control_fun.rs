@@ -24,7 +24,9 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{Image, Progress};
+use candle_gen::gen_core::{
+    AdapterSpec, Image, PreviewSink, Progress, ValidatedEncoderSource, WeightsSource,
+};
 use candle_gen::{CandleError, Result};
 
 use crate::config::{TextEncoderConfig, TransformerConfig, NEGATIVE_FALLBACK};
@@ -56,9 +58,14 @@ pub struct QwenFunControlPaths {
     /// The `Qwen/Qwen-Image-2512` diffusers snapshot dir (`text_encoder/`, `transformer/`, `vae/`,
     /// `tokenizer/`).
     pub qwen_base: PathBuf,
+    /// Optional decoder-LM substitution. It must satisfy the Qwen2.5-VL decoder contract and remain
+    /// dense; the fixed 2512 control route has no visual-tower substitution surface.
+    pub text_encoder: Option<WeightsSource>,
     /// The alibaba-pai `Qwen-Image-2512-Fun-Controlnet-Union` checkpoint — a single `.safetensors`
     /// file or a dir of shards.
     pub controlnet: PathBuf,
+    /// User LoRA/LoKr stack applied to the base MMDiT before the VACE control branch.
+    pub adapters: Vec<AdapterSpec>,
 }
 
 /// One Qwen-Image 2512-Fun (pose/canny/depth) generation request. The control **kind** is implicit in
@@ -76,6 +83,12 @@ pub struct QwenFunControlRequest {
     pub control_scale: f32,
     pub seed: u64,
     pub cancel: CancelFlag,
+    /// Per-step latent-preview sink (epic 16948, sc-16952) — the bespoke-request twin of
+    /// [`gen_core::GenerationRequest::preview`](candle_gen::gen_core::GenerationRequest::preview),
+    /// carried as a field because this lane is a bespoke provider the worker drives by name rather
+    /// than through the registry. The [`Default`] is inert, and an inert sink is
+    /// seeded-byte-identical to a render with no preview at all.
+    pub preview: PreviewSink,
 }
 
 impl Default for QwenFunControlRequest {
@@ -90,6 +103,7 @@ impl Default for QwenFunControlRequest {
             control_scale: DEFAULT_CONTROL_SCALE,
             seed: 0,
             cancel: CancelFlag::default(),
+            preview: PreviewSink::default(),
         }
     }
 }
@@ -101,6 +115,35 @@ fn resolve_controlnet_files(path: &Path) -> Result<Vec<PathBuf>> {
     // Shared file-or-dir resolver (sc-8999 / F-019): single `.safetensors` → itself, a dir → its
     // sorted shards, a missing path → the crafted `{label}: no .safetensors ...` error.
     candle_gen::resolve_weight_files(path, "qwen fun-control")
+}
+
+fn resolve_text_encoder_source(
+    root: &Path,
+    selected: &WeightsSource,
+) -> Result<ValidatedEncoderSource> {
+    let selected = crate::ENCODER_CONTRACT.validate_source_against_base(selected, root)?;
+    selected.load_time_quant_bits(None, "qwen_image_2512_fun_control")?;
+    // `root` remains an explicit argument so this helper's contract cannot accidentally grow into a
+    // visual-tower override: only the decoder-LM source is selected; every other component stays at
+    // the provider-owned 2512 base below.
+    Ok(selected)
+}
+
+fn load_selected_text_encoder(
+    source: &ValidatedEncoderSource,
+    config: &TextEncoderConfig,
+    device: &Device,
+) -> Result<QwenTextEncoder> {
+    source.read_unchanged(|weights| -> Result<QwenTextEncoder> {
+        let path = match weights {
+            WeightsSource::Dir(path) | WeightsSource::File(path) => path,
+        };
+        let files = candle_gen::resolve_weight_files(path, "qwen fun-control text encoder")?;
+        Ok(QwenTextEncoder::new(
+            config,
+            candle_gen::mmap_var_builder(&files, ENC_DTYPE, device)?,
+        )?)
+    })
 }
 
 /// The loaded Qwen-Image 2512-Fun control model: the reused base text encoder / DiT / VAE-decoder, plus
@@ -125,19 +168,24 @@ impl QwenFunControl {
         // The 2512 base reuses the base config verbatim (sc-8647 / sc-8271 parity).
         let te_cfg = TextEncoderConfig::qwen_image_2512();
         let dit_cfg = TransformerConfig::qwen_image_2512();
+        let selected = paths
+            .text_encoder
+            .clone()
+            .unwrap_or_else(|| WeightsSource::Dir(root.join("text_encoder")));
+        let text_encoder = resolve_text_encoder_source(&root, &selected)?;
 
-        let te = QwenTextEncoder::new(
-            &te_cfg,
-            control_common::component_vb(&root, "text_encoder", ENC_DTYPE, &device, LABEL)?,
-        )?;
+        let te = load_selected_text_encoder(&text_encoder, &te_cfg, &device)?;
         // The base 2512 MMDiT packed-detects (a packed MLX base tier loads straight from the packed
         // parts; a dense base snapshot unchanged) at the `group_size` read from `transformer/config.json`.
         let gs = crate::transformer_group_size(&root.join("transformer"));
-        let transformer = QwenTransformer::new_gs(
+        let mut transformer = QwenTransformer::new_gs(
             &dit_cfg,
             control_common::component_vb(&root, "transformer", DIT_DTYPE, &device, LABEL)?,
             gs,
         )?;
+        if !paths.adapters.is_empty() {
+            let _ = crate::adapters::install_additive(&mut transformer, &paths.adapters)?;
+        }
         let vae = QwenVae::new(control_common::component_vb(
             &root, "vae", ENC_DTYPE, &device, LABEL,
         )?)?;
@@ -150,7 +198,7 @@ impl QwenFunControl {
         let controlnet =
             QwenFunControlBranch::new(&dit_cfg, &CONTROL_LAYERS, CONTROL_IN_DIM, cn_vb)?;
 
-        let tokenizer = control_common::load_tokenizer(&root, &te_cfg, LABEL)?;
+        let tokenizer = control_common::load_tokenizer(&text_encoder, &te_cfg, LABEL)?;
         Ok(Self {
             device,
             te,
@@ -159,6 +207,45 @@ impl QwenFunControl {
             controlnet,
             vae,
             vae_encoder,
+        })
+    }
+
+    /// Load through the exact prepared text-encoder receipt retained by the caller.
+    pub fn load_with_spec(
+        paths: &QwenFunControlPaths,
+        spec: &candle_gen::gen_core::LoadSpec,
+    ) -> Result<Self> {
+        match &spec.weights {
+            WeightsSource::Dir(admitted_root) if admitted_root == &paths.qwen_base => {}
+            WeightsSource::Dir(admitted_root) => {
+                return Err(CandleError::Msg(format!(
+                    "qwen fun-control: runtime base {} differs from admitted base {}",
+                    paths.qwen_base.display(),
+                    admitted_root.display()
+                )));
+            }
+            WeightsSource::File(_) => {
+                return Err(CandleError::Msg(
+                    "qwen fun-control: admitted base must be the runtime snapshot directory"
+                        .to_owned(),
+                ));
+            }
+        }
+        spec.read_prepared_files_unchanged(|| {
+            let controlnet = match spec.control.as_ref() {
+                Some(WeightsSource::Dir(path) | WeightsSource::File(path)) => path.clone(),
+                None => {
+                    return Err(CandleError::Msg(
+                        "qwen fun-control: prepared load spec has no control overlay".to_owned(),
+                    ));
+                }
+            };
+            Self::load(&QwenFunControlPaths {
+                qwen_base: paths.qwen_base.clone(),
+                text_encoder: spec.text_encoder.clone(),
+                controlnet,
+                adapters: spec.adapters.clone(),
+            })
         })
     }
 
@@ -228,6 +315,13 @@ impl QwenFunControl {
         let latents = pipeline::create_noise(req.seed, req.width, req.height, &self.device)?
             .to_dtype(DIT_DTYPE)?;
 
+        // Per-step latent preview (epic 16948, sc-16952). The sampler's running latent is the packed
+        // `[1, (H/16)·(W/16), 64]` target; the packed 132-channel VACE control context is a closure
+        // capture, constant across steps and never part of it, and the true-CFG pos/neg blend also
+        // lives inside the closure. The projector unpacks to `[1, 16, H/8, W/8]` before applying the
+        // QwenVae fit.
+        let preview = crate::preview::hook(&req.preview, req.width, req.height);
+
         let latents = candle_gen::run_flow_sampler(
             None,
             candle_gen::gen_core::sampling::TimestepConvention::Sigma,
@@ -236,6 +330,7 @@ impl QwenFunControl {
             req.seed,
             &req.cancel,
             on_progress,
+            Some(&preview),
             |latents, sigma| -> Result<Tensor> {
                 let pos_v = self.transformer.forward_fun_control(
                     latents,
@@ -296,6 +391,136 @@ mod tests {
     use super::*;
     use candle_gen::gen_core::Image;
 
+    #[test]
+    fn selected_text_encoder_is_exact_and_dense_only() {
+        let fixture = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_tokenizer_fixture(
+            fixture.path(),
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
+        let valid = fixture.path().join("valid");
+        gen_core_testkit::write_encoder_contract_fixture(&valid, crate::ENCODER_CONTRACT).unwrap();
+        resolve_text_encoder_source(fixture.path(), &WeightsSource::Dir(valid))
+            .expect("the exact Qwen2.5-VL decoder contract is accepted");
+
+        let wrong = fixture.path().join("wrong-hidden-size");
+        gen_core_testkit::write_encoder_contract_fixture(&wrong, crate::ENCODER_CONTRACT).unwrap();
+        let config_path = wrong.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["hidden_size"] = serde_json::json!(crate::ENCODER_CONTRACT.hidden_size + 1);
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let error = resolve_text_encoder_source(fixture.path(), &WeightsSource::Dir(wrong))
+            .expect_err("a wrong decoder width must reject")
+            .to_string();
+        assert!(error.contains("hidden_size"), "unexpected: {error}");
+
+        let packed = fixture.path().join("packed");
+        gen_core_testkit::write_encoder_contract_fixture(&packed, crate::ENCODER_CONTRACT).unwrap();
+        let config_path = packed.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["quantization"] = serde_json::json!({"bits": 4, "group_size": 64});
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let error = resolve_text_encoder_source(fixture.path(), &WeightsSource::Dir(packed))
+            .expect_err("the Candle Qwen decoder route is dense-only")
+            .to_string();
+        assert!(error.contains("dense"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn prepared_file_dir_and_snapshot_mutations_fail_before_bespoke_control_load() {
+        for shape in ["file", "dir", "snapshot"] {
+            let fixture = tempfile::tempdir().unwrap();
+            let base = fixture.path().join("base");
+            let selected = fixture.path().join("selected");
+            let control = fixture.path().join("control.safetensors");
+            std::fs::create_dir_all(&base).unwrap();
+            std::fs::write(&control, b"nonempty").unwrap();
+            gen_core_testkit::write_encoder_contract_tokenizer_fixture(
+                &base,
+                crate::ENCODER_CONTRACT,
+            )
+            .unwrap();
+
+            let source = match shape {
+                "file" => {
+                    gen_core_testkit::write_encoder_contract_fixture(
+                        &selected,
+                        crate::ENCODER_CONTRACT,
+                    )
+                    .unwrap();
+                    WeightsSource::File(selected.join("model.safetensors"))
+                }
+                "dir" => {
+                    gen_core_testkit::write_encoder_contract_fixture(
+                        &selected,
+                        crate::ENCODER_CONTRACT,
+                    )
+                    .unwrap();
+                    WeightsSource::Dir(selected.clone())
+                }
+                "snapshot" => {
+                    gen_core_testkit::write_encoder_contract_fixture(
+                        &selected.join("text_encoder"),
+                        crate::ENCODER_CONTRACT,
+                    )
+                    .unwrap();
+                    gen_core_testkit::write_encoder_contract_tokenizer_fixture(
+                        &selected,
+                        crate::ENCODER_CONTRACT,
+                    )
+                    .unwrap();
+                    WeightsSource::Dir(selected.clone())
+                }
+                _ => unreachable!(),
+            };
+            let validated = crate::ENCODER_CONTRACT
+                .validate_source_against_base(&source, &base)
+                .unwrap();
+            let mut spec = candle_gen::gen_core::LoadSpec::new(WeightsSource::Dir(base.clone()))
+                .with_control(WeightsSource::File(control.clone()));
+            validated.prepare_load_spec(&mut spec).unwrap();
+
+            match shape {
+                "file" => std::fs::write(selected.join("config.json"), b"{}").unwrap(),
+                "dir" => {
+                    // The mutation under test is that a new `.safetensors` appeared in the prepared
+                    // directory. `std::fs::copy` would write out the encoder fixture's whole
+                    // multi-GB payload to say that; the sparse copy leaves the same bytes behind a
+                    // hole.
+                    gen_core_testkit::copy_sparse_fixture(
+                        &selected.join("model.safetensors"),
+                        &selected.join("added.safetensors"),
+                    )
+                    .unwrap();
+                }
+                "snapshot" => {
+                    std::fs::write(selected.join("tokenizer/tokenizer.json"), b"{}").unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let error = QwenFunControl::load_with_spec(
+                &QwenFunControlPaths {
+                    qwen_base: base,
+                    text_encoder: None,
+                    controlnet: control,
+                    adapters: Vec::new(),
+                },
+                &spec,
+            )
+            .err()
+            .expect("a mutated prepared source must fail before provider/device load")
+            .to_string();
+            assert!(
+                error.contains("receipt changed") || error.contains("pinned weights"),
+                "{shape}: {error}"
+            );
+        }
+    }
+
     /// sc-11187 / F-085: the control lane's positive prompt is required. An empty or whitespace-only
     /// prompt is rejected up front (before it can reach `tokenize("")` and underflow `prompt_embeds`);
     /// a real prompt passes. This bespoke stream never runs the txt2img descriptor's `validate`, so it
@@ -343,9 +568,8 @@ mod tests {
 
     #[test]
     fn controlnet_file_resolution() {
-        let dir = std::env::temp_dir().join(format!("qwen_fun_cn_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         // Empty dir → error.
         assert!(resolve_controlnet_files(&dir).is_err());
         // A single file path resolves to itself.
@@ -357,7 +581,6 @@ mod tests {
         std::fs::write(&g, b"y").unwrap();
         let got = resolve_controlnet_files(&dir).unwrap();
         assert_eq!(got, vec![f, g]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// This lane's control-image preprocessing goes through the shared [`control_common`] helper with
@@ -478,10 +701,8 @@ mod tests {
             Tensor::zeros((inner,), DType::F32, &dev)?,
         );
 
-        let tmp = std::env::temp_dir().join(format!(
-            "sc9869_2512fun_packed_{}.safetensors",
-            std::process::id()
-        ));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().join("sc9869_2512fun_packed.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: freshly written by this test, single reader.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -534,7 +755,6 @@ mod tests {
             "packed control_img_in vs affine grid cosine {cos:.6}"
         );
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 

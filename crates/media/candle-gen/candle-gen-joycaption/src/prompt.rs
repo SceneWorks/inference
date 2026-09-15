@@ -1,3 +1,16 @@
+//! ATTRIBUTION: The caption-type taxonomy, prompt template bodies, and name option below are
+//! reproduced from fpgaminer/joycaption (<https://github.com/fpgaminer/joycaption>),
+//! `gradio-app/app.py`'s `CAPTION_TYPE_MAP` and `NAME_OPTION`, commit
+//! 8445b2e55db7856d522e44ae84e7415fcf3413f6, licensed under the Apache License 2.0
+//! (Copyright 2024 fpgaminer@bitcoin-mining.com). The license text ships in SceneWorks' About ->
+//! Licenses corpus as the `joycaption-source` component.
+//!
+//! MODIFIED BY SCENEWORKS (Apache-2.0 section 4(b)): ported from Python to Rust; renamed the
+//! prompt-table and name-option symbols; normalized prompt punctuation (em dashes, curly quotes,
+//! ellipses, backticks, quoted tag prefixes, and `(if any)`); removed `very long` from the caption
+//! lengths; and changed the three Straightforward prompts from requiring watermark, signature, and
+//! compression-artifact mentions to forbidding them.
+//!
 //! JoyCaption caption **product policy** — the SceneWorks caption prompt map, the default system
 //! prompt, the capability surface, and trigger-word post-processing. Pure string logic, backend
 //! agnostic.
@@ -6,6 +19,7 @@
 //! live here too; they moved into candle-llm's `candle-llava` provider when this crate was repointed
 //! onto the unified engine (sc-7692). What remains is product content only.
 
+use candle_gen::gen_core;
 use candle_gen::gen_core::{CaptionCapabilities, CaptionOptions};
 
 pub const JOY_CAPTION_MODEL_ID: &str = "fancyfeast/llama-joycaption-beta-one-hf-llava";
@@ -159,6 +173,7 @@ pub fn build_prompt(options: &CaptionOptions) -> String {
     if !custom.is_empty() {
         return custom.to_owned();
     }
+
     let caption_length = options.caption_length.as_str();
     let template_index = if caption_length == "any" {
         0
@@ -178,21 +193,9 @@ pub fn build_prompt(options: &CaptionOptions) -> String {
         .replace("{word_count}", caption_length)
 }
 
-pub fn apply_trigger_words(caption: &str, trigger_words: &[String]) -> String {
-    let cleaned = caption.split_whitespace().collect::<Vec<_>>().join(" ");
-    let lower_caption = cleaned.to_lowercase();
-    let mut parts: Vec<String> = trigger_words
-        .iter()
-        .map(|word| word.trim())
-        .filter(|word| !word.is_empty())
-        .filter(|word| !lower_caption.contains(&word.to_lowercase()))
-        .map(ToOwned::to_owned)
-        .collect();
-    if !cleaned.is_empty() {
-        parts.push(cleaned);
-    }
-    parts.join(", ")
-}
+/// Compatibility export for backend callers. The policy itself is backend-neutral and lives in
+/// `gen-core`, shared with the SceneWorks worker.
+pub use gen_core::apply_caption_trigger_words as apply_trigger_words;
 
 fn templates_for(caption_type: &str) -> &'static [&'static str; 3] {
     PROMPT_TEMPLATES
@@ -223,19 +226,40 @@ mod tests {
     }
 
     #[test]
-    fn prompt_defaults_match_sceneworks() {
+    fn prompt_selection_matrix_matches_upstream_and_lane_policy() {
         assert_eq!(
             build_prompt(&CaptionOptions::default()),
             "Write a long detailed description for this image."
         );
-        assert_eq!(
-            build_prompt(&options("Descriptive", "any")),
-            "Write a detailed description for this image."
-        );
-        assert_eq!(
-            build_prompt(&options("Descriptive", "85")),
-            "Write a detailed description for this image in 85 words or less."
-        );
+        for (kind, length, expected) in [
+            (
+                "Descriptive",
+                "any",
+                "Write a detailed description for this image.",
+            ),
+            (
+                "Descriptive",
+                "85",
+                "Write a detailed description for this image in 85 words or less.",
+            ),
+            (
+                "Descriptive",
+                "short",
+                "Write a short detailed description for this image.",
+            ),
+            (
+                "Descriptive",
+                "",
+                "Write a  detailed description for this image.",
+            ),
+            (
+                "Not a real type",
+                "short",
+                "Write a short detailed description for this image.",
+            ),
+        ] {
+            assert_eq!(build_prompt(&options(kind, length)), expected);
+        }
     }
 
     #[test]
@@ -248,15 +272,14 @@ mod tests {
     }
 
     #[test]
-    fn trigger_words_are_prepended_only_when_missing() {
-        let trigger_words = vec!["mika_token".to_owned(), "hat".to_owned()];
-        assert_eq!(
-            apply_trigger_words("A portrait of Mika wearing a hat.", &trigger_words),
-            "mika_token, A portrait of Mika wearing a hat."
-        );
-        assert_eq!(
-            apply_trigger_words("   ", &trigger_words),
-            "mika_token, hat"
-        );
+    fn trigger_words_follow_gen_core_conformance_matrix() {
+        for case in candle_gen::gen_core::caption::CAPTION_TRIGGER_WORD_CONFORMANCE {
+            let triggers = case
+                .trigger_words
+                .iter()
+                .map(|word| (*word).to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(apply_trigger_words(case.caption, &triggers), case.expected);
+        }
     }
 }

@@ -6,7 +6,12 @@
 //! carry the patchified noise latents (`input_proj`). Both streams live in one sequence, mixed every
 //! block by full (segment-masked) attention + interleaved 3D MRoPE.
 
-use candle_gen::candle_core::{DType, Result, Tensor, D};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use candle_gen::candle_core::{DType, Device, DeviceLocation, Result, Tensor, TensorId, D};
+use candle_gen::gen_core::{AdapterSpec, CancelFlag};
 
 use super::block::Ideogram4Block;
 use super::mrope::Ideogram4MRoPE;
@@ -23,6 +28,52 @@ const LLM_TOKEN_INDICATOR: i64 = 3;
 const COND_NORM_EPS: f64 = 1e-6;
 const FINAL_NORM_EPS: f64 = 1e-6;
 
+static NEXT_IDEOGRAM_LOAD_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_IDEOGRAM_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_ideogram_load_id() -> u64 {
+    NEXT_IDEOGRAM_LOAD_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn host_slice_fingerprint(values: &[i64]) -> u64 {
+    values.iter().fold(0xcbf29ce484222325, |hash, value| {
+        value.to_le_bytes().iter().fold(hash, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
+    })
+}
+
+/// O(1) denoise-loop identity for the immutable host-owned role and segment packing. Construct this
+/// only after `Packing` is complete, then pass the same value to preparation and every prepared
+/// forward. A new request always receives a new nonce, even when its host arrays have identical data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostConditioningIdentity {
+    request_id: u64,
+    indicator_len: usize,
+    segment_len: usize,
+    indicator_fingerprint: u64,
+    segment_fingerprint: u64,
+}
+
+impl HostConditioningIdentity {
+    pub(crate) fn new(indicator: &[i64], segment_ids: &[i64]) -> Self {
+        Self {
+            request_id: NEXT_IDEOGRAM_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+            indicator_len: indicator.len(),
+            segment_len: segment_ids.len(),
+            indicator_fingerprint: host_slice_fingerprint(indicator),
+            segment_fingerprint: host_slice_fingerprint(segment_ids),
+        }
+    }
+
+    fn matches_host(&self, indicator: &[i64], segment_ids: &[i64]) -> bool {
+        self.indicator_len == indicator.len()
+            && self.segment_len == segment_ids.len()
+            && self.indicator_fingerprint == host_slice_fingerprint(indicator)
+            && self.segment_fingerprint == host_slice_fingerprint(segment_ids)
+    }
+}
+
 pub struct Ideogram4Transformer {
     input_proj: QLinear,
     llm_cond_norm: Tensor,
@@ -32,37 +83,157 @@ pub struct Ideogram4Transformer {
     adaln_proj: QLinear,
     embed_image_indicator: QEmbedding,
     rotary_emb: Ideogram4MRoPE,
-    layers: Vec<Ideogram4Block>,
+    layers: TransformerLayers,
     final_adaln: QLinear,
     final_linear: QLinear,
     /// Sinusoidal frequencies for the `t` embedding (`[1, emb_dim/2]`, f32).
     t_freqs: Tensor,
     dtype: DType,
-    /// Per-render step-invariant-tensor cache (sc-8992 / F-012). The role masks (from `indicator`), the
-    /// segment attention mask (from `segment_ids`), and the MRoPE `(cos, sin)` tables (from
-    /// `position_ids`) depend only on the fixed packing geometry — not on σ / `t` / the current latent —
-    /// so they are identical across every denoise step (×2 under CFG). This crate previously rebuilt the
-    /// `[B,1,L,L]` mask in a host loop and round-tripped `indicator` device→host **every** forward.
-    /// Cache them keyed on the (loop-invariant) inputs' host contents. `Mutex` (not `RefCell`): the DiT
-    /// is used behind a shared cache and must stay `Send + Sync`.
-    cond_cache: std::sync::Mutex<Option<PreparedCond>>,
+    load_id: u64,
 }
 
-/// The step-invariant conditioning tensors prepared once per render (sc-8992). `seg_mask = None` when
+enum TransformerLayers {
+    Resident(Vec<Ideogram4Block>),
+    Streamed(StreamedLayers),
+}
+
+struct StreamedLayers {
+    weights: Arc<Weights>,
+    config: Ideogram4DitConfig,
+    window_size: usize,
+    turbo_adapter: Option<PathBuf>,
+    user_adapters: Vec<AdapterSpec>,
+}
+
+struct MaterializedWindow {
+    layers: Vec<(usize, Ideogram4Block)>,
+    device: Device,
+}
+
+impl Drop for MaterializedWindow {
+    fn drop(&mut self) {
+        // Transfers and kernels may still reference the current window. Always synchronize before the
+        // device tensors are released, including error, cancellation, and panic unwinding.
+        let _ = self.device.synchronize();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TensorSpec {
+    shape: Vec<usize>,
+    dtype: DType,
+    device: DeviceLocation,
+}
+
+impl TensorSpec {
+    fn new(tensor: &Tensor) -> Self {
+        Self {
+            shape: tensor.dims().to_vec(),
+            dtype: tensor.dtype(),
+            device: tensor.device().location(),
+        }
+    }
+
+    fn matches(&self, tensor: &Tensor) -> bool {
+        tensor.dims() == self.shape
+            && tensor.dtype() == self.dtype
+            && tensor.device().location() == self.device
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TensorIdentity {
+    id: TensorId,
+    spec: TensorSpec,
+}
+
+impl TensorIdentity {
+    fn new(tensor: &Tensor) -> Self {
+        Self {
+            id: tensor.id(),
+            spec: TensorSpec::new(tensor),
+        }
+    }
+
+    fn matches(&self, tensor: &Tensor) -> bool {
+        tensor.id() == self.id && self.spec.matches(tensor)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedConditioningRequest {
+    model_load_id: u64,
+    host: HostConditioningIdentity,
+    input: TensorSpec,
+    llm_features: TensorIdentity,
+    position_ids: TensorIdentity,
+}
+
+impl PreparedConditioningRequest {
+    fn new(
+        model_load_id: u64,
+        host: HostConditioningIdentity,
+        input: &Tensor,
+        llm_features: &Tensor,
+        position_ids: &Tensor,
+    ) -> Result<Self> {
+        let (b, l, _) = input.dims3()?;
+        let (llm_b, llm_l, _) = llm_features.dims3()?;
+        let (position_b, position_l, axes) = position_ids.dims3()?;
+        if (llm_b, llm_l) != (b, l) || (position_b, position_l, axes) != (b, l, 3) {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "ideogram: conditioning geometry does not match input [batch={b}, tokens={l}]"
+            )));
+        }
+        let device = input.device().location();
+        if llm_features.device().location() != device || position_ids.device().location() != device
+        {
+            return Err(candle_gen::candle_core::Error::Msg(
+                "ideogram: conditioning tensors and input must share a device".into(),
+            ));
+        }
+        Ok(Self {
+            model_load_id,
+            host,
+            input: TensorSpec::new(input),
+            llm_features: TensorIdentity::new(llm_features),
+            position_ids: TensorIdentity::new(position_ids),
+        })
+    }
+
+    fn validate(
+        &self,
+        model_load_id: u64,
+        host: HostConditioningIdentity,
+        input: &Tensor,
+        llm_features: &Tensor,
+        position_ids: &Tensor,
+    ) -> Result<()> {
+        if model_load_id != self.model_load_id
+            || host != self.host
+            || !self.input.matches(input)
+            || !self.llm_features.matches(llm_features)
+            || !self.position_ids.matches(position_ids)
+        {
+            return Err(candle_gen::candle_core::Error::Msg(
+                "ideogram: prepared conditioning request identity does not match model, geometry, position grid, dtype, or device".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The step-invariant conditioning tensors prepared once per render (sc-11280). `seg_mask = None` when
 /// every token shares a segment id — the additive mask is provably all-zeros, so the per-block add is
 /// skipped entirely (softmax over `scores + 0` == softmax over `scores`, so the step is byte-identical).
-struct PreparedCond {
-    b: usize,
-    l: usize,
-    indicator: Vec<i64>,
-    segment_ids: Vec<i64>,
-    position_ids: Vec<f32>,
-    llm_mask: Tensor,
+pub(crate) struct PreparedConditioning {
+    request: PreparedConditioningRequest,
     img_mask: Tensor,
-    img_idx: Tensor,
     cos: Tensor,
     sin: Tensor,
     seg_mask: Option<Tensor>,
+    llm: Tensor,
+    indicator_emb: Tensor,
 }
 
 impl Ideogram4Transformer {
@@ -102,13 +273,128 @@ impl Ideogram4Transformer {
                 cfg.mrope_section,
                 w.device(),
             )?,
+            layers: TransformerLayers::Resident(layers),
+            final_adaln: linear_detect(w, "final_layer.adaln_modulation", true)?,
+            final_linear: linear_detect(w, "final_layer.linear", true)?,
+            t_freqs,
+            dtype: w.dtype(),
+            load_id: next_ideogram_load_id(),
+        })
+    }
+
+    /// Build the exact deferred-materialization form: top-level projections remain resident for the
+    /// denoise phase, while the 34 trunk blocks stay mmap-backed and are materialized in request-sized
+    /// windows. Adapter factors are reattached to every materialized subset in their original order.
+    pub(crate) fn load_streamed(
+        weights: Weights,
+        cfg: &Ideogram4DitConfig,
+        window_size: usize,
+        turbo_adapter: Option<&Path>,
+        user_adapters: &[AdapterSpec],
+    ) -> Result<Self> {
+        if window_size == 0 || window_size > cfg.num_layers {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "ideogram: invalid transformer window {window_size} for {} layers",
+                cfg.num_layers
+            )));
+        }
+        let weights = Arc::new(weights);
+        let mut transformer = Self::load_top(
+            &weights,
+            cfg,
+            TransformerLayers::Streamed(StreamedLayers {
+                weights: Arc::clone(&weights),
+                config: *cfg,
+                window_size,
+                turbo_adapter: turbo_adapter.map(Path::to_path_buf),
+                user_adapters: user_adapters.to_vec(),
+            }),
+        )?;
+        transformer.install_top_adapters()?;
+        Ok(transformer)
+    }
+
+    fn load_top(w: &Weights, cfg: &Ideogram4DitConfig, layers: TransformerLayers) -> Result<Self> {
+        let head_dim = cfg.emb_dim / cfg.num_heads;
+        let half = cfg.emb_dim / 2;
+        let lf = (1e4f32).ln() / (half as f32 - 1.0);
+        let t_freqs = Tensor::from_vec(
+            (0..half)
+                .map(|d| (-lf * d as f32).exp())
+                .collect::<Vec<_>>(),
+            (1, half),
+            w.device(),
+        )?;
+        Ok(Self {
+            input_proj: linear_detect(w, "input_proj", true)?,
+            llm_cond_norm: w.get("llm_cond_norm.weight")?,
+            llm_cond_proj: linear_detect(w, "llm_cond_proj", true)?,
+            t_mlp_in: linear_detect(w, "t_embedding.mlp_in", true)?,
+            t_mlp_out: linear_detect(w, "t_embedding.mlp_out", true)?,
+            adaln_proj: linear_detect(w, "adaln_proj", true)?,
+            embed_image_indicator: embedding_detect(w, "embed_image_indicator")?,
+            rotary_emb: Ideogram4MRoPE::new(
+                head_dim,
+                cfg.rope_theta,
+                cfg.mrope_section,
+                w.device(),
+            )?,
             layers,
             final_adaln: linear_detect(w, "final_layer.adaln_modulation", true)?,
             final_linear: linear_detect(w, "final_layer.linear", true)?,
             t_freqs,
             dtype: w.dtype(),
-            cond_cache: std::sync::Mutex::new(None),
+            load_id: next_ideogram_load_id(),
         })
+    }
+
+    fn visit_top_adaptable_mut(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> Result<()>,
+    ) -> Result<()> {
+        f("input_proj", &mut self.input_proj)?;
+        f("llm_cond_proj", &mut self.llm_cond_proj)?;
+        f("t_embedding.mlp_in", &mut self.t_mlp_in)?;
+        f("t_embedding.mlp_out", &mut self.t_mlp_out)?;
+        f("adaln_proj", &mut self.adaln_proj)?;
+        f("final_layer.adaln_modulation", &mut self.final_adaln)?;
+        f("final_layer.linear", &mut self.final_linear)
+    }
+
+    fn install_top_adapters(&mut self) -> Result<()> {
+        let TransformerLayers::Streamed(streamed) = &self.layers else {
+            return Ok(());
+        };
+        let turbo = streamed
+            .turbo_adapter
+            .as_ref()
+            .filter(|path| adapter_targets(path, None).unwrap_or(true))
+            .cloned();
+        let adapters = streamed
+            .user_adapters
+            .iter()
+            .filter(|adapter| adapter_targets(&adapter.path, None).unwrap_or(true))
+            .cloned()
+            .collect::<Vec<_>>();
+        let device = self.device();
+        if let Some(path) = turbo {
+            crate::adapters::install_turbo_lora_additive_for_visitor(
+                &device,
+                &path,
+                crate::config::TURBO_LORA_SCALE,
+                |visitor| self.visit_top_adaptable_mut(visitor),
+            )?;
+        }
+        if !adapters.is_empty() {
+            candle_gen::quant::install_dotted_adapters(
+                "ideogram streamed top-level",
+                &adapters,
+                &device,
+                |visitor| self.visit_top_adaptable_mut(visitor),
+            )
+            .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
+        }
+        Ok(())
     }
 
     /// The DiT's compute device (every weight loaded onto it) — the device a resolved additive residual
@@ -132,8 +418,10 @@ impl Ideogram4Transformer {
         f("t_embedding.mlp_in", &mut self.t_mlp_in)?;
         f("t_embedding.mlp_out", &mut self.t_mlp_out)?;
         f("adaln_proj", &mut self.adaln_proj)?;
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            layer.visit_adaptable_mut(&format!("layers.{i}"), f)?;
+        if let TransformerLayers::Resident(layers) = &mut self.layers {
+            for (i, layer) in layers.iter_mut().enumerate() {
+                layer.visit_adaptable_mut(&format!("layers.{i}"), f)?;
+            }
         }
         f("final_layer.adaln_modulation", &mut self.final_adaln)?;
         f("final_layer.linear", &mut self.final_linear)?;
@@ -161,32 +449,188 @@ impl Ideogram4Transformer {
         position_ids: &Tensor,
         segment_ids: &Tensor,
         indicator: &Tensor,
+        attention_budget: usize,
+        cancel: &CancelFlag,
     ) -> Result<Tensor> {
-        let (b, l, _) = x.dims3()?;
-        // The role masks, MRoPE tables, and segment mask are step-invariant (fixed packing geometry),
-        // so build them once per render and reuse across every step / CFG pass (sc-8992). `seg_mask`
-        // is `None` for the always-uniform-segment path this pipeline drives — the mask is all-zeros,
-        // so the per-block add is skipped (byte-identical after softmax).
-        let (llm_mask, img_mask, img_idx, cos, sin, seg_mask) =
-            self.prepared_cond(indicator, segment_ids, position_ids, b, l)?;
+        let prepared = self.prepare(llm_features, x, indicator, segment_ids, position_ids)?;
+        let host = prepared.request.host;
+        self.forward_prepared(
+            x,
+            t,
+            llm_features,
+            position_ids,
+            host,
+            &prepared,
+            attention_budget,
+            cancel,
+        )
+    }
 
+    /// Materialize request-scoped geometry conditioning. The caller owns the handle, rather than the
+    /// model retaining a mutable cache, so repeated forwards never need a device-to-host key readback.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_from_host(
+        &self,
+        llm_features: &Tensor,
+        input: &Tensor,
+        indicator: &[i64],
+        segment_ids: &[i64],
+        position_ids: &Tensor,
+        host: HostConditioningIdentity,
+    ) -> Result<PreparedConditioning> {
+        let (b, l, _) = input.dims3()?;
+        if indicator.len() != b * l || segment_ids.len() != b * l {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "ideogram: host conditioning lengths ({}, {}) must equal batch*tokens {}",
+                indicator.len(),
+                segment_ids.len(),
+                b * l
+            )));
+        }
+        if !host.matches_host(indicator, segment_ids) {
+            return Err(candle_gen::candle_core::Error::Msg(
+                "ideogram: host conditioning identity does not match role or segment packing"
+                    .into(),
+            ));
+        }
+        let request = PreparedConditioningRequest::new(
+            self.load_id,
+            host,
+            input,
+            llm_features,
+            position_ids,
+        )?;
+        let (llm_mask, img_mask, img_idx) =
+            role_tensors(indicator, b, l, self.dtype, position_ids.device())?;
+        let (cos, sin) = self.rotary_emb.forward(position_ids)?;
+        let seg_mask = segment_mask(segment_ids, b, l, position_ids.device())?;
         let llm_features = llm_features
             .to_dtype(self.dtype)?
             .broadcast_mul(&llm_mask)?;
-        let x = x.to_dtype(self.dtype)?.broadcast_mul(&img_mask)?;
-        let x = self.input_proj.forward(&x)?.broadcast_mul(&img_mask)?;
+        let llm = rmsnorm(&llm_features, &self.llm_cond_norm, COND_NORM_EPS)?;
+        let llm = self.llm_cond_proj.forward(&llm)?.broadcast_mul(&llm_mask)?;
+        let indicator_emb = self.embed_image_indicator.forward(&img_idx)?;
+        Ok(PreparedConditioning {
+            request,
+            img_mask,
+            cos,
+            sin,
+            seg_mask,
+            llm,
+            indicator_emb,
+        })
+    }
+
+    /// Compatibility preparation entry for one-off callers. Render loops must use
+    /// [`prepare_from_host`](Self::prepare_from_host) while the packing is still host-owned.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare(
+        &self,
+        llm_features: &Tensor,
+        input: &Tensor,
+        indicator: &Tensor,
+        segment_ids: &Tensor,
+        position_ids: &Tensor,
+    ) -> Result<PreparedConditioning> {
+        let ind = indicator
+            .to_dtype(DType::I64)?
+            .flatten_all()?
+            .to_vec1::<i64>()?;
+        let seg = segment_ids
+            .to_dtype(DType::I64)?
+            .flatten_all()?
+            .to_vec1::<i64>()?;
+        let host = HostConditioningIdentity::new(&ind, &seg);
+        self.prepare_from_host(llm_features, input, &ind, &seg, position_ids, host)
+    }
+
+    /// Run one denoise forward against request-scoped prepared conditioning.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_prepared(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        llm_features: &Tensor,
+        position_ids: &Tensor,
+        host: HostConditioningIdentity,
+        prepared: &PreparedConditioning,
+        attention_budget: usize,
+        cancel: &CancelFlag,
+    ) -> Result<Tensor> {
+        prepared
+            .request
+            .validate(self.load_id, host, x, llm_features, position_ids)?;
+        let img_mask = &prepared.img_mask;
+        let cos = &prepared.cos;
+        let sin = &prepared.sin;
+        let seg_mask = &prepared.seg_mask;
+
+        let x = x.to_dtype(self.dtype)?.broadcast_mul(img_mask)?;
+        let x = self.input_proj.forward(&x)?.broadcast_mul(img_mask)?;
 
         let t_cond = self.t_embedding(t)?.unsqueeze(1)?; // [B,1,emb]
         let adaln_input = self.adaln_proj.forward(&t_cond)?.silu()?; // [B,1,adaln]
 
-        let llm = rmsnorm(&llm_features, &self.llm_cond_norm, COND_NORM_EPS)?;
-        let llm = self.llm_cond_proj.forward(&llm)?.broadcast_mul(&llm_mask)?;
+        let mut h = (&x + &prepared.llm)?;
+        h = (h + &prepared.indicator_emb)?;
 
-        let mut h = (&x + &llm)?;
-        h = (h + self.embed_image_indicator.forward(&img_idx)?)?;
-
-        for layer in &self.layers {
-            h = layer.forward(&h, &cos, &sin, seg_mask.as_ref(), &adaln_input)?;
+        match &self.layers {
+            TransformerLayers::Resident(layers) => {
+                for layer in layers {
+                    if cancel.is_cancelled() {
+                        return Err(candle_gen::candle_core::Error::Msg(
+                            "ideogram: generation canceled".into(),
+                        ));
+                    }
+                    h = layer.forward(
+                        &h,
+                        cos,
+                        sin,
+                        seg_mask.as_ref(),
+                        &adaln_input,
+                        attention_budget,
+                    )?;
+                }
+            }
+            TransformerLayers::Streamed(streamed) => {
+                for first in (0..streamed.config.num_layers).step_by(streamed.window_size) {
+                    if cancel.is_cancelled() {
+                        return Err(candle_gen::candle_core::Error::Msg(
+                            "ideogram: generation canceled".into(),
+                        ));
+                    }
+                    let count = streamed.window_size.min(streamed.config.num_layers - first);
+                    let mut window = MaterializedWindow {
+                        layers: Vec::with_capacity(count),
+                        device: streamed.weights.device().clone(),
+                    };
+                    for index in first..first + count {
+                        window.layers.push((
+                            index,
+                            Ideogram4Block::load(
+                                &streamed.weights,
+                                &format!("layers.{index}"),
+                                streamed.config.num_heads,
+                                streamed.config.head_dim,
+                                streamed.config.norm_eps,
+                            )?,
+                        ));
+                    }
+                    install_window_adapters(streamed, &mut window)?;
+                    for (_, layer) in &window.layers {
+                        h = layer.forward(
+                            &h,
+                            cos,
+                            sin,
+                            seg_mask.as_ref(),
+                            &adaln_input,
+                            attention_budget,
+                        )?;
+                    }
+                    // The drop guard synchronizes before releasing this window.
+                    drop(window);
+                }
+            }
         }
 
         // Final layer: scale = 1 + adaln(silu(c)); linear(layernorm_no_affine(h) · scale).
@@ -195,74 +639,82 @@ impl Ideogram4Transformer {
         let out = self.final_linear.forward(&normed.broadcast_mul(&scale)?)?;
         out.to_dtype(DType::F32)
     }
+}
 
-    /// Build (or reuse) the step-invariant conditioning tensors for this render (sc-8992): the role
-    /// masks (`indicator`), the MRoPE `(cos, sin)` (`position_ids`), and the segment attention mask
-    /// (`segment_ids`; `None` when all segment ids are equal → the mask is all-zeros and the per-block
-    /// add is skipped). Recomputed only when the loop-invariant inputs change; otherwise the Arc-backed
-    /// handles are cloned. The construction is identical to computing it inline, so every step is
-    /// byte-identical.
-    #[allow(clippy::type_complexity)]
-    fn prepared_cond(
-        &self,
-        indicator: &Tensor,
-        segment_ids: &Tensor,
-        position_ids: &Tensor,
-        b: usize,
-        l: usize,
-    ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor, Option<Tensor>)> {
-        let ind: Vec<i64> = indicator
-            .to_dtype(DType::I64)?
-            .flatten_all()?
-            .to_vec1::<i64>()?;
-        let seg: Vec<i64> = segment_ids
-            .to_dtype(DType::I64)?
-            .flatten_all()?
-            .to_vec1::<i64>()?;
-        let pos: Vec<f32> = position_ids
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-
-        let mut guard = candle_gen::lock_recover(&self.cond_cache);
-        if let Some(c) = guard.as_ref() {
-            if c.b == b
-                && c.l == l
-                && c.indicator == ind
-                && c.segment_ids == seg
-                && c.position_ids == pos
-            {
-                return Ok((
-                    c.llm_mask.clone(),
-                    c.img_mask.clone(),
-                    c.img_idx.clone(),
-                    c.cos.clone(),
-                    c.sin.clone(),
-                    c.seg_mask.clone(),
-                ));
+fn adapter_layer_index(name: &str) -> Option<usize> {
+    for marker in ["layers.", "layers_"] {
+        if let Some(rest) = name.split(marker).nth(1) {
+            let digits = rest
+                .chars()
+                .take_while(|character| character.is_ascii_digit())
+                .collect::<String>();
+            if !digits.is_empty() {
+                return digits.parse().ok();
             }
         }
-
-        let (llm_mask, img_mask, img_idx) =
-            role_tensors(&ind, b, l, self.dtype, indicator.device())?;
-        let (cos, sin) = self.rotary_emb.forward(position_ids)?;
-        let seg_mask = segment_mask(&seg, b, l, indicator.device())?;
-
-        *guard = Some(PreparedCond {
-            b,
-            l,
-            indicator: ind,
-            segment_ids: seg,
-            position_ids: pos,
-            llm_mask: llm_mask.clone(),
-            img_mask: img_mask.clone(),
-            img_idx: img_idx.clone(),
-            cos: cos.clone(),
-            sin: sin.clone(),
-            seg_mask: seg_mask.clone(),
-        });
-        Ok((llm_mask, img_mask, img_idx, cos, sin, seg_mask))
     }
+    None
+}
+
+fn adapter_targets(path: &Path, window: Option<(usize, usize)>) -> Result<bool> {
+    let headers = candle_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)
+        .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
+    Ok(headers
+        .iter()
+        .any(|header| match (window, adapter_layer_index(&header.name)) {
+            (None, None) => true,
+            (Some((first, count)), Some(index)) => (first..first + count).contains(&index),
+            _ => false,
+        }))
+}
+
+fn install_window_adapters(
+    streamed: &StreamedLayers,
+    window: &mut MaterializedWindow,
+) -> Result<()> {
+    let Some(first) = window.layers.first().map(|(first, _)| *first) else {
+        return Ok(());
+    };
+    let count = window.layers.len();
+    let device = window.device.clone();
+    if let Some(path) = streamed
+        .turbo_adapter
+        .as_ref()
+        .filter(|path| adapter_targets(path, Some((first, count))).unwrap_or(true))
+    {
+        crate::adapters::install_turbo_lora_additive_for_visitor(
+            &device,
+            path,
+            crate::config::TURBO_LORA_SCALE,
+            |visitor| {
+                for (index, layer) in &mut window.layers {
+                    layer.visit_adaptable_mut(&format!("layers.{index}"), visitor)?;
+                }
+                Ok(())
+            },
+        )?;
+    }
+    let adapters = streamed
+        .user_adapters
+        .iter()
+        .filter(|adapter| adapter_targets(&adapter.path, Some((first, count))).unwrap_or(true))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !adapters.is_empty() {
+        candle_gen::quant::install_dotted_adapters(
+            "ideogram streamed transformer window",
+            &adapters,
+            &device,
+            |visitor| {
+                for (index, layer) in &mut window.layers {
+                    layer.visit_adaptable_mut(&format!("layers.{index}"), visitor)?;
+                }
+                Ok(())
+            },
+        )
+        .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
+    }
+    Ok(())
 }
 
 /// No-affine LayerNorm over the last dim (computed in f32 for stability, cast back to `x`'s dtype).
@@ -367,5 +819,88 @@ mod tests {
         assert_eq!(at(2, 3), 0.0);
         assert!(at(0, 2).is_infinite() && at(0, 2) < 0.0);
         assert!(at(3, 1).is_infinite() && at(3, 1) < 0.0);
+    }
+
+    #[test]
+    fn prepared_conditioning_request_reuses_once_and_rejects_stale_identity() -> Result<()> {
+        let device = Device::Cpu;
+        let input = Tensor::zeros((1, 4, 8), DType::F32, &device)?;
+        let llm = Tensor::zeros((1, 4, 12), DType::F32, &device)?;
+        let positions = Tensor::zeros((1, 4, 3), DType::I64, &device)?;
+        let host = HostConditioningIdentity::new(&[3, 3, 2, 2], &[0, 0, 0, 0]);
+        let prepared = PreparedConditioningRequest::new(23, host, &input, &llm, &positions)?;
+
+        // The latent value changes each step, but the prepared request remains valid.
+        for _ in 0..2 {
+            let next = Tensor::ones((1, 4, 8), DType::F32, &device)?;
+            prepared.validate(23, host, &next, &llm, &positions)?;
+        }
+
+        // Tensor identity catches a changed same-shape position grid; rebuilding accepts it.
+        let changed_positions = Tensor::ones((1, 4, 3), DType::I64, &device)?;
+        assert!(prepared
+            .validate(23, host, &input, &llm, &changed_positions)
+            .is_err());
+        let rebuilt = PreparedConditioningRequest::new(23, host, &input, &llm, &changed_positions)?;
+        rebuilt.validate(23, host, &input, &llm, &changed_positions)?;
+
+        let changed_llm = Tensor::ones((1, 4, 12), DType::F32, &device)?;
+        assert!(prepared
+            .validate(23, host, &input, &changed_llm, &positions)
+            .is_err());
+        let wrong_geometry = Tensor::zeros((1, 5, 8), DType::F32, &device)?;
+        assert!(prepared
+            .validate(23, host, &wrong_geometry, &llm, &positions)
+            .is_err());
+        let wrong_dtype = input.to_dtype(DType::F16)?;
+        assert!(prepared
+            .validate(23, host, &wrong_dtype, &llm, &positions)
+            .is_err());
+        let mut wrong_device = prepared.clone();
+        wrong_device.input.device = DeviceLocation::Cuda { gpu_id: 9 };
+        assert!(wrong_device
+            .validate(23, host, &input, &llm, &positions)
+            .is_err());
+        let new_host = HostConditioningIdentity::new(&[3, 2, 2, 2], &[0, 0, 0, 0]);
+        assert!(prepared
+            .validate(23, new_host, &input, &llm, &positions)
+            .is_err());
+        let rebuilt_host =
+            PreparedConditioningRequest::new(23, new_host, &input, &llm, &positions)?;
+        rebuilt_host.validate(23, new_host, &input, &llm, &positions)?;
+        assert!(prepared
+            .validate(24, host, &input, &llm, &positions)
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_adapter_routing_covers_top_first_middle_and_last_windows() {
+        use std::collections::HashMap;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("adapter.safetensors");
+        let mut tensors = HashMap::new();
+        for name in [
+            "input_proj.lora_A.weight",
+            "layers.0.attention.qkv.lora_A.weight",
+            "layers.16.feed_forward.w1.lora_A.weight",
+            "layers.33.attention.o.lora_A.weight",
+        ] {
+            tensors.insert(
+                name.to_owned(),
+                Tensor::ones((1, 1), DType::F32, &Device::Cpu).unwrap(),
+            );
+        }
+        candle_gen::candle_core::safetensors::save(&tensors, &path).unwrap();
+        assert!(adapter_targets(&path, None).unwrap());
+        assert!(adapter_targets(&path, Some((0, 4))).unwrap());
+        assert!(adapter_targets(&path, Some((16, 4))).unwrap());
+        assert!(adapter_targets(&path, Some((32, 2))).unwrap());
+        assert!(!adapter_targets(&path, Some((4, 4))).unwrap());
+        assert_eq!(
+            adapter_layer_index("lora_unet_layers_33_attention_o"),
+            Some(33)
+        );
     }
 }

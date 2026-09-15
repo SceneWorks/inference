@@ -9,11 +9,17 @@
 //!
 //! Requires the converted snapshot's `mllm/tokenizer.json` (~11 MB, not committed); `#[ignore]`
 //! otherwise. Point `BERNINI_MLLM_TOKENIZER` at the `tokenizer.json` and run:
-//!   `cargo test -p candle-gen-bernini --test template_parity -- --ignored --nocapture`
+//!   `cargo test -p candle-gen-bernini --test integration template_parity:: -- --ignored --nocapture`
 
-mod common;
+use crate::common;
 
-use common::Golden;
+use common::{
+    Golden, SHARED_FIXTURE_TEMPLATE_IMAGE_TOKEN_NUMS, SHARED_FIXTURE_TEMPLATE_INPUT_IMAGE_HW,
+    SHARED_FIXTURE_TEMPLATE_INPUT_VIDEO_COUNT, SHARED_FIXTURE_TEMPLATE_OUTPUT_H,
+    SHARED_FIXTURE_TEMPLATE_OUTPUT_T, SHARED_FIXTURE_TEMPLATE_OUTPUT_W,
+    SHARED_FIXTURE_TEMPLATE_PROMPTS, SHARED_FIXTURE_TEMPLATE_TASKS,
+    SHARED_FIXTURE_TEMPLATE_VIDEO_TOKEN_NUMS,
+};
 
 use candle_gen_bernini::process::generate_unified_inputs;
 use candle_gen_bernini::template::{BerniniTemplate, TemplateOutput};
@@ -22,32 +28,23 @@ use candle_gen_bernini::template::{BerniniTemplate, TemplateOutput};
 /// token_num = t·(h/2)·(w/2).
 #[allow(clippy::type_complexity)]
 fn cases() -> Vec<(&'static str, Vec<serde_json::Value>, Vec<i64>, Vec<i64>)> {
-    vec![
-        (
-            "t2i",
-            generate_unified_inputs("a cat", &[], 0, 1, 64, 64),
-            vec![4],
-            vec![],
-        ),
-        (
-            "i2i",
-            generate_unified_inputs("edit", &[(48, 72)], 0, 1, 64, 64),
-            vec![6, 4],
-            vec![],
-        ),
-        (
-            "r2v",
-            generate_unified_inputs("subj", &[(72, 48)], 0, 9, 64, 64),
-            vec![6],
-            vec![12],
-        ),
-        (
-            "rv2v",
-            generate_unified_inputs("edit v", &[], 1, 9, 64, 64),
-            vec![],
-            vec![12, 20],
-        ),
-    ]
+    (0..SHARED_FIXTURE_TEMPLATE_TASKS.len())
+        .map(|i| {
+            (
+                SHARED_FIXTURE_TEMPLATE_TASKS[i],
+                generate_unified_inputs(
+                    SHARED_FIXTURE_TEMPLATE_PROMPTS[i],
+                    SHARED_FIXTURE_TEMPLATE_INPUT_IMAGE_HW[i],
+                    SHARED_FIXTURE_TEMPLATE_INPUT_VIDEO_COUNT[i],
+                    SHARED_FIXTURE_TEMPLATE_OUTPUT_T[i],
+                    SHARED_FIXTURE_TEMPLATE_OUTPUT_H,
+                    SHARED_FIXTURE_TEMPLATE_OUTPUT_W,
+                ),
+                SHARED_FIXTURE_TEMPLATE_IMAGE_TOKEN_NUMS[i].to_vec(),
+                SHARED_FIXTURE_TEMPLATE_VIDEO_TOKEN_NUMS[i].to_vec(),
+            )
+        })
+        .collect()
 }
 
 #[test]

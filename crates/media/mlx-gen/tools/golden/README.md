@@ -18,6 +18,58 @@ weights and a Mac with Metal, which is exactly why the tests that read them are 
 Default-running tests only depend on committed inputs; anything needing un-committable inputs is
 `#[ignore]`d. So a fresh clone's `cargo test` is green without this directory.
 
+## These goldens are single-host. That is the intent, not a gap.
+
+**Read this before treating a missing golden as something to fix.**
+
+On any machine that is not the one a golden was dumped on, the row that reads it fails in **0.00 s**
+on `Weights::from_file(GOLDEN)` — before any weights load, any device, any work. On a fresh clone
+that is *every* row: this directory ships `README.md` and `CHECKSUMS.txt` and nothing else. As of
+this writing that is **118 distinct golden artifacts, referenced by 110 test files across 22
+crates** — 119 until sc-17519 promoted `qwen_edit_rope_golden.safetensors` out of this directory and
+into `mlx-gen-qwen-image/tests/fixtures/` (see the section on it below).
+
+The "Regenerating" section above says the goldens are regenerable, and in principle they are. In
+practice a second party with the licensed weights and a Metal Mac still cannot reproduce one,
+because two of the three inputs are named by *location* rather than derivable:
+
+- **the frozen `mflux` fork at `~/repos/mflux`** — a private checkout, not a published artifact, and
+  the only place the reference implementation exists;
+- **the reference venv at `~/Repos/mflux/.venv-0320`** — python 3.12 + diffusers 0.37.1 +
+  transformers 5.10.1 + torch 2.12.0, *plus* MLX 0.32.0 **built from source** at
+  `MACOSX_DEPLOYMENT_TARGET=15.0`. There is no lockfile and no build script; the pip wheel is
+  explicitly not a valid substitute on M3-class-or-newer hosts.
+
+So the honest statement is the one this section exists to make: **these rows are single-host and are
+not currently intended to be reproducible elsewhere.** A missing golden off-host is the expected
+state, not an accident and not a gap for a downstream consumer to close.
+
+### What that means if you are gating on real-weight conformance
+
+A consumer running these suites to gate an engine pin (SceneWorks issue #311 was filed by one) must
+treat every golden-backed row as **contributing nothing to that gate off-host**. The failure mode is
+quiet in the direction that matters: a 0.00 s failure or a skipped row still *looks* like a line of
+coverage in the run output, so counting rows overstates what was actually verified. Count only rows
+whose inputs you can supply.
+
+### What would change this, and why it has not
+
+Three routes were considered (#311). None is done, and the reason is recorded here so it is not
+re-litigated from scratch:
+
+1. **Publish the dumps** — an HF dataset repo, or release assets keyed to the MLX version this
+   README already says the goldens are sensitive to. The blocker is that a golden is a derived work
+   of licensed multi-GB weights, so republishing it is a licensing question per source model, not an
+   infrastructure one.
+2. **Publish a reproducible recipe for the reference venv** — a lockfile or an exact build script,
+   so `~/Repos/mflux/.venv-0320` becomes derivable. This is the cheapest of the three and the one
+   worth doing first, but it is only half a fix while the `mflux` fork itself is unpublished.
+3. **Say so explicitly** — this section. It does not add coverage; it stops the absence reading as
+   an accident, which is the part that was actively misleading.
+
+Route 3 landing does not close 1 or 2. If you need these rows to execute off-host, they are still
+the work.
+
 ## Regenerating
 
 > **sc-12896 (MLX 0.32.0): use the version-matched NON-NAX env.** Goldens must be dumped with
@@ -44,11 +96,240 @@ Each script writes into `tools/golden/` next to itself (paths are `__file__`-rel
 works from any checkout/worktree). Run the matching `#[ignore]`d test with, e.g.:
 
 ```sh
-cargo test -p mlx-gen-z-image --release --test e2e_real_weights -- --ignored --nocapture
+cargo test -p mlx-gen-z-image --release --test integration -- e2e_real_weights:: --ignored --nocapture
 ```
 
 Prerequisites: macOS + Metal; the frozen `mflux` fork at `~/repos/mflux`; the model weights in
 `~/.cache/huggingface/hub/` (auto-downloaded by the fork on first run).
+
+## Licensed adapter parity set (`sc-15505`)
+
+The FLUX Hyper, Z-Image LoRA/LoKr, and Qwen LoRA/LoKr gates use the
+provenance-locked inventory in `../adapter_parity_artifacts.json`. The manifest records every
+gitignored binary's source, license, size, checksum, producing script, and frozen reference
+revision. Before the real-weight transcript exists, the verifier deliberately exits nonzero with
+`results remain non-proof until transcript is verified`; mutation tests still validate the pending
+manifest's structure and pinned scripts:
+
+```sh
+python3 -m unittest scripts.tests.test_adapter_parity_artifacts -v
+```
+
+On the licensed Metal host used for `sc-15505`, the exact production commands are:
+
+```sh
+# Frozen reference checkout and version-matched runtime.
+export PYTHONPATH=/Users/michael/Repos/mflux/src
+export REF_PY=/Users/michael/Repos/mflux/.venv-0320/bin/python
+export REF_HF=/Users/michael/Repos/mflux/.venv-0320/bin/hf
+export TOOLS="$PWD/crates/media/mlx-gen/tools"
+export HF_MODELS_ROOT="${HF_HOME:-$HOME/.cache/huggingface}/hub"
+
+# Authoritative ByteDance Hyper-FLUX artifact. The dump script also refuses any
+# file whose cache repository, ref, revision, filename, or SHA-256 differs.
+export HYPER_LORA="$("$REF_HF" download ByteDance/Hyper-SD \
+  Hyper-FLUX.1-dev-8steps-lora.safetensors \
+  --revision bc08d970a87c74c71209491d64e3525845698863)"
+
+# Reference goldens. Keep the 512² base and adapter configurations identical.
+ZIMAGE_REFERENCE_MODEL="$HF_MODELS_ROOT/models--SceneWorks--z-image-turbo-mlx/snapshots/bb2bc9893b3c49ae96c813350775f791a2e8bc80/bf16" \
+  ZIMAGE_W=512 ZIMAGE_H=512 "$REF_PY" "$TOOLS/dump_z_image_golden.py"
+ZIMAGE_REFERENCE_MODEL="$HF_MODELS_ROOT/models--SceneWorks--z-image-turbo-mlx/snapshots/bb2bc9893b3c49ae96c813350775f791a2e8bc80/bf16" \
+  ZIMAGE_W=512 ZIMAGE_H=512 "$REF_PY" "$TOOLS/dump_z_image_adapter_golden.py"
+
+QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx \
+  QWEN_REFERENCE_REVISION=8080a4171f1c8b7fca6c30491eafbe6ffab754bf \
+  QWEN_REFERENCE_MODEL="$HF_MODELS_ROOT/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16" \
+  QWEN_W=512 QWEN_H=512 "$REF_PY" "$TOOLS/dump_qwen_image_golden.py"
+# Qwen adapters are intentionally one kind per process. Record both the adapter-only and
+# adapter-plus-decoded-golden producers so each manifest source command is reproducible.
+QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx \
+  QWEN_REFERENCE_REVISION=8080a4171f1c8b7fca6c30491eafbe6ffab754bf \
+  QWEN_REFERENCE_MODEL="$HF_MODELS_ROOT/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16" \
+  QWEN_ADAPTER_KIND=lora BUILD_ADAPTERS_ONLY=1 "$REF_PY" "$TOOLS/dump_qwen_adapter_golden.py"
+QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx \
+  QWEN_REFERENCE_REVISION=8080a4171f1c8b7fca6c30491eafbe6ffab754bf \
+  QWEN_REFERENCE_MODEL="$HF_MODELS_ROOT/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16" \
+  QWEN_ADAPTER_KIND=lora QWEN_W=512 QWEN_H=512 "$REF_PY" "$TOOLS/dump_qwen_adapter_golden.py"
+QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx \
+  QWEN_REFERENCE_REVISION=8080a4171f1c8b7fca6c30491eafbe6ffab754bf \
+  QWEN_REFERENCE_MODEL="$HF_MODELS_ROOT/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16" \
+  QWEN_ADAPTER_KIND=lokr BUILD_ADAPTERS_ONLY=1 "$REF_PY" "$TOOLS/dump_qwen_adapter_golden.py"
+QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx \
+  QWEN_REFERENCE_REVISION=8080a4171f1c8b7fca6c30491eafbe6ffab754bf \
+  QWEN_REFERENCE_MODEL="$HF_MODELS_ROOT/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16" \
+  QWEN_ADAPTER_KIND=lokr QWEN_W=512 QWEN_H=512 "$REF_PY" "$TOOLS/dump_qwen_adapter_golden.py"
+
+FLUX_DEV="$HF_MODELS_ROOT/models--black-forest-labs--FLUX.1-dev/snapshots/3de623fc3c33e44ffbe2bad470d0f45bccf2eb21" \
+  "$REF_PY" "$TOOLS/dump_hyper_flux_golden.py"
+
+# Before tightening, the exact tolerance-based diagnostic measured 0 differing
+# bytes across 786,432 RGB samples. The assertion is now byte equality and the
+# retained runner itself executes
+# five exact cargo invocations in a constructed environment (ambient variables
+# are not inherited), captures real argv/env, stdout/stderr/return codes plus
+# rustc/cargo/platform/hardware identity, and checks artifact/model/source
+# identities before and after. It rejects a zero-test cargo result because each
+# run must emit its one structured SC15505_RESULT line. Record every sealed mode in
+# this order, without overlap. After the three writes, update the six transcript/receipt
+# sizes and hashes in the manifest before the two verifier commands.
+python3 "$TOOLS/record_adapter_parity_transcript.py" --residual-diagnostic
+python3 "$TOOLS/record_adapter_parity_transcript.py" --qwen-effect-diagnostic
+python3 "$TOOLS/record_adapter_parity_transcript.py"
+python3 "$TOOLS/verify_adapter_parity_artifacts.py" --diagnose-result-measurements
+python3 "$TOOLS/verify_adapter_parity_artifacts.py"
+```
+
+The scripts reject a dirty/index-modified or source-augmented frozen fork, the wrong Git remote,
+and a model path whose Hugging Face cache repository/revision/subdirectory does not match its
+claim. The retained runner computes a canonical digest from the exact executable source contents
+instead of Git's staging representation, and rejects every baseline-relative changed path outside
+the reviewed sc-15505 allowlist (including untracked files).
+
+If a direct-output no-adapter control is not worse than the adapted render, it cannot support a
+mutation-sensitive threshold and must not be widened into one. Run the pre-tightening residual
+diagnostic instead:
+
+```sh
+python3 "$TOOLS/record_adapter_parity_transcript.py" --residual-diagnostic
+```
+
+That exact, sanitized runner records `(Rust adapted - Rust base)` versus
+`(fork adapted - fork base)` and compares it with the dropped-adapter control (a zero Rust
+residual). It writes its own ignored diagnostic transcript and dedicated diagnostic receipt, never
+the acceptance receipt. A final
+residual cap may be locked only after the adapted residual is measured below the zero-residual
+control; the reviewed rule is their integer midpoint. If there is no separation, the parity claim
+must be reframed instead of forcing a passing cap.
+
+The retained residual diagnostic separated Z LoRA (12,940 adapted vs 26,587 zero control) and
+Z LoKr (14,028 vs 40,120), but rejected Qwen LoRA (63,030 vs 43,903) and Qwen LoKr
+(69,111 vs 50,446): both Qwen adapted residual errors were worse than the dropped-adapter
+control. Qwen therefore keeps the original floor-relative fork gate
+`adapted_px_gt8 <= 2 * base_floor + rgb_samples / 200` and uses a separate same-runtime effect
+gate to prove the adapter is active. Measure that effect before locking its nonzero minimum:
+
+```sh
+python3 "$TOOLS/record_adapter_parity_transcript.py" --qwen-effect-diagnostic
+```
+
+This dedicated diagnostic records active-adapter-vs-base px>8, scale-zero byte differences, exact
+applied-module count (LoRA 24; LoKr 21), empty unmatched-path count, and RGB sample count. It has a
+fixed schema and output path and cannot write the acceptance transcript or its receipt. It writes
+its own path-redacted diagnostic receipt, which the manifest and verifier seal separately from
+acceptance. The retained measurement is LoRA effect 44,799 (minimum 22,399) and LoKr
+effect 39,409 (minimum 19,704), each over 786,432 RGB samples; both scale-zero counts are 0 and
+their apply reports are exactly 24/21 applied with no unmatched paths. The fixed minimum is
+`measured_effect_samples_gt8 / 2`, so dropping/inerting an adapter produces zero and turns the
+effect clause red while the separate floor-relative clause continues to constrain fork parity.
+
+After recording, update the manifest with the measured `SC15505_RESULT` values plus every
+artifact/transcript/receipt size and SHA-256, then first compare the acceptance and Qwen-effect
+maps without rehashing model inputs:
+
+```sh
+python3 "$TOOLS/verify_adapter_parity_artifacts.py" --diagnose-result-measurements
+```
+
+It exits nonzero and prints exact JSON paths with expected/actual values when a stale manifest
+field differs from recorder output. Once that map is empty, run
+`python3 "$TOOLS/verify_adapter_parity_artifacts.py"`. That final verifier cross-checks the
+safetensors metadata, model inventories, exact artifact hashes, and retained cargo output. The
+binaries and raw transcripts remain uncommitted. The recorder emits one committed, path-redacted
+receipt for acceptance plus one for each diagnostic; the manifest binds all six transcript/receipt
+identities, and the verifier requires every receipt to be the exact redacted projection of its own
+transcript. Qwen acceptance and diagnostic effects are stored and verified independently, even when
+a clean run yields the same numeric value; neither record may substitute for the other. A deliberate
+reference refresh must update the manifest, all receipts, and `CHECKSUMS.txt` in the same review as
+any changed acceptance number; silently accepting a new golden is not permitted.
+
+**What the transcript binds, and what it deliberately does not (sc-17070).** `source_state()` keeps
+two different sets. The **hashed** set — `bound_source_files()` — is the Rust sources plus every
+manifest `scripts` entry *except* `UNBOUND_SOURCE_FILES`, and its SHA-256 map is frozen into the
+transcript's `source.files`/`source_sha256`. The **changed-path allowlist** is that set plus
+`UNBOUND_SOURCE_FILES` plus `EVIDENCE_CHANGE_FILES`. `verify_adapter_parity_artifacts.py` is the sole
+unbound entry: the dump scripts, `_adapter_parity_provenance.py`, and `record_adapter_parity_transcript.py`
+*produced* the goldens and the measurements, so freezing their bytes is meaningful; the verifier only
+checks, so freezing its bytes would mean any edit to it — a pure bugfix included — invalidated the
+proof and demanded a licensed real-weight re-record that buys no extra assurance about the parity
+numbers. It keeps its `scripts` hash pin, which `validate_manifest` still enforces and which *is*
+repairable in place. Both halves are covered by tests that do not mock `source_state`; if the verifier
+is ever renamed, `bound_source_files()` refuses rather than silently rebinding it.
+
+**A source binding is current only when its sealed transcript verifies against the worktree being
+checked.** Do not borrow the historical sc-17651 map or assert that a feature branch matches
+`main`: a current sc-21781 record binds every producer and measured Rust source byte. The verifier
+remains outside that frozen map so a checker repair does not force a licensed model run, but its
+manifest script pin still must match. `adapter_parity_receipt.json`'s `proof.source.files` is the
+committed, path-redacted copy of the frozen map, so the comparison needs no gitignored binaries:
+
+```python
+import hashlib, json, pathlib, sys
+sys.path.insert(0, 'crates/media/mlx-gen/tools')
+import record_adapter_parity_transcript as R
+frozen = json.loads(pathlib.Path('crates/media/mlx-gen/tools/adapter_parity_receipt.json').read_text())['proof']['source']['files']
+manifest = json.loads(pathlib.Path('crates/media/mlx-gen/tools/adapter_parity_artifacts.json').read_text())
+for name in R.bound_source_files(manifest):
+    live = hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest()
+    print(name, 'MATCH' if frozen.get(name) == live else f'DRIFT {frozen.get(name)} -> {live}')
+```
+
+*What the re-record settled (sc-17651).* Between `071b84ff` and the re-record, two bound harnesses
+had moved — `mlx-gen-z-image/tests/adapter_real_weights.rs` and
+`mlx-gen-qwen-image/tests/adapter_real_weights.rs`, the files that emit the `SC15505_RESULT` lines —
+via `11eab9cf` (sc-16057, process-unique temp fixtures) and `716c97d9` (sc-17284, macOS real-weight
+CI lanes). Re-running the full acceptance proof reproduced **every one of the 34 pinned measurement
+fields exactly**, so neither change moved a number. Two things are worth keeping, because reading
+the diffs alone would not have established either:
+
+- sc-16057 touched only `kohya_matches_peft_on_real_tree()`, which emits no `SC15505_RESULT` and is
+  never selected — each recorded run names one test with `--exact`.
+- sc-17284 renamed the Qwen snapshot variable to `MLX_GEN_QWEN_SNAPSHOT` on the measured path and
+  renamed `expected_runs()` in lockstep, so the resolved model directory is unchanged. But
+  `verify_result_transcript` compares `run["env"]` against a freshly built `expected_runs()`, so the
+  *old* transcript's two Qwen rows had become unverifiable (`env mismatch`) independently of any
+  measurement question. A stale binding here is not always just bookkeeping — check whether the
+  recorded run spec still reproduces before assuming the numbers are the only question.
+
+*Reproducing the artifact set.* The **11 generated** artifacts regenerate byte-for-byte on the
+reference host from the commands in each `artifacts.*.source.command`, given the frozen fork at
+`81106c83` and `.venv-0320`; that includes the MLX renders, not just the synthetic adapters. The
+12th, `hyper_flux_lora`, is `source.kind: "huggingface"` — a pinned 1.38 GB ByteDance download with
+no `command`, verified by hash rather than regenerated. If a regenerated golden's SHA-256 does *not*
+match, treat it as a real signal rather than as expected float noise — the one historical exception
+was a defect, not nondeterministic math: `dump_hyper_flux_golden.py` is the only dump here that
+writes via `safetensors.numpy.save_file`, which serializes `__metadata__` out of a Rust `HashMap`
+with per-process iteration order, so its file hash changed every run while all eight tensors stayed
+bit-identical. `_canonicalize_metadata_order()` sorts the metadata after the write — a key
+permutation that preserves the serialized length, re-padded into the original header slot, with the
+write confined to the header bytes so the payload cannot move. That made the artifact reproducible
+and moved its pinned hash, in the sc-17651 review.
+
+Two consequences worth knowing before you touch that script. Its own SHA-256 is embedded in the
+golden it writes (`golden_metadata()` sets `reference_script_sha256`), so **any byte edit to
+`dump_hyper_flux_golden.py` invalidates this artifact's pin and forces a licensed regeneration plus
+a re-record** — it is a bound source file too. That is the same ratchet sc-17070 removed for the
+verifier, and it is why the canonicalization helper lives in this script rather than in
+`_adapter_parity_provenance.py`: that module's hash is embedded in *all five* generated goldens as
+`reference_provenance_sha256`, so hoisting the helper there would invalidate every one of them. Do
+not "simplify" it by moving it. The sibling dumps use `mx.save_safetensors` and were never affected.
+
+Note also what the recorded Hyper-FLUX run does and does not pin. `hyper_flux_scale_zero_is_bit_exact_noop`
+compares `injected_render(None)` against `injected_render(Some(0.0))` — both sides read the same
+golden — so `byte_differences=0` is insensitive to the golden's tensor *values*; the tests that
+would detect a changed Hyper-FLUX golden (they compare against `image_u8`/`final_latents`) are not
+in the recorded run set. What evidences a faithful regeneration here is therefore the artifact's
+unchanged byte count and the ten sibling artifacts reproducing byte-exactly from the same
+fork/venv/models — not that single acceptance number.
+
+One operational note. A full (non-`--manifest-only`) run from an ordinary `main` checkout never
+reaches the source comparison at all: `source_state()` raises `proof worktree contains changes
+outside the bound allowlist` first (944 paths differ from `implementation_base` at the time of
+writing). The comparison is only reachable from a detached checkout at `implementation_base`
+(`39a11d36…`) with the proof's source overlaid — the 11 bound files plus `UNBOUND_SOURCE_FILES` plus
+`EVIDENCE_CHANGE_FILES` — which is the same protocol a re-record runs under. And when it is reached,
+any file-hash drift also moves `source_sha256`, which is compared first — so the failure you
+actually see is `result transcript source source_sha256 mismatch`, not the `files` one.
 
 ## Manifest
 
@@ -71,9 +352,55 @@ Prerequisites: macOS + Metal; the frozen `mflux` fork at `~/repos/mflux`; the mo
 | `qwen_transformer_golden.safetensors` | `dump_qwen_transformer_golden.py` | `tests/transformer_real_weights.rs` |
 | `qwen_vae_golden.safetensors` | `dump_qwen_vae_golden.py` | `tests/vae_real_weights.rs` |
 | `qwen_vision_golden.safetensors`, `qwen_vl_encoder_golden.safetensors`, `qwen_vl_tokenize_golden.safetensors` | `dump_qwen_vision_golden.py`, `dump_qwen_vl_encoder_golden.py`, `dump_qwen_vl_tokenize_golden.py` | `tests/vision_real_weights.rs` |
-| `qwen_edit_rope_golden.safetensors`, `qwen_edit_tokenize_debug.safetensors`, `qwen_edit_vision_stages_debug.safetensors` | `dump_qwen_edit_rope_golden.py`, `dump_qwen_edit_tokenize_debug.py`, `dump_qwen_edit_vision_stages_debug.py` | `tests/edit_real_weights.rs` (debug/bisection gates) |
+| `qwen_edit_tokenize_debug.safetensors`, `qwen_edit_vision_stages_debug.safetensors` | `dump_qwen_edit_tokenize_debug.py`, `dump_qwen_edit_vision_stages_debug.py` | `tests/edit_real_weights.rs` (debug/bisection gates) |
+| ~~`qwen_edit_rope_golden.safetensors`~~ | `dump_qwen_edit_rope_golden.py` | **PROMOTED to `mlx-gen-qwen-image/tests/fixtures/` (sc-17519)** — see below |
 
 See each script's module docstring for its exact env vars / arguments.
+
+### `qwen_edit_rope_golden.safetensors` — promoted out of this directory (sc-17519)
+
+Two rows elsewhere in this file already flag `mage_flow_noise_golden` and `pil_resize_golden` as
+weight-free and "candidate to promote into `tests/fixtures/`". This is the first one to actually make
+the move, and the reasoning is the template for the rest.
+
+**Why it qualified.** `dump_qwen_edit_rope_golden.py` imports exactly one symbol —
+`mflux.models.qwen.model.qwen_transformer.qwen_rope.QwenEmbedRopeMLX` — and calls it. It resolves no
+snapshot, reads no HF cache, and never touches the `Qwen/Qwen-Image-Edit-2511` torch original. The
+Rust side (`QwenRope3d::forward_multi`) is pure math too. So neither half of the gate needs weights,
+and the "can't be produced or consumed without the licensed multi-GB weights" rationale at the top of
+this file — the reason everything here is gitignored — simply does not apply to it.
+
+**Why vendoring is allowed.** Committing a golden minted from a third-party fork is a licence
+decision, not a size decision. `mflux` is **MIT** (`LICENSE`: "MIT License, Copyright (c) 2026 Filip
+Strand"; `pyproject.toml` `license = { file = "LICENSE" }`), so redistribution is permitted with its
+notice. That is the same reasoning `crates/media/mlx-gen/.gitignore` already records for the sc-14036
+Mage-Flow exception ("microsoft/Mage is MIT — redistribution is permitted with its notice"), which is
+the in-repo precedent for an exception to the blanket rule a few lines above it.
+
+**Provenance.**
+
+| | |
+|---|---|
+| artifact | `crates/media/mlx-gen/mlx-gen-qwen-image/tests/fixtures/qwen_edit_rope_golden.safetensors` |
+| size / sha256 | 78,133 bytes / `ab31b3836089fe90dae9dc8347c0c50726e74648e8e989c2c106c5ce7bd6f212` |
+| minted | 2026-08-07, `cd ~/Repos/mflux && uv run python .../tools/dump_qwen_edit_rope_golden.py` |
+| fork pin | `mflux` @ `81106c833435d1a1f62ca04a8c01c1d380d39272` (2026-06-04, "sc-2997: Qwen-Image-Edit-2511 zero_cond_t") |
+| upstream licence | MIT — `~/Repos/mflux/LICENSE` |
+| contents | `img_cos`/`img_sin` `[132, 64]` and `txt_cos`/`txt_sin` `[20, 64]`, all f32, for `video_fhw=[(1,8,12), (1,6,6)]`, `txt_seq_lens=[20]` |
+| consumer | `tests/edit_real_weights.rs::edit_rope_multi_image_matches_fork`, **not `#[ignore]`d** |
+
+Do NOT re-add the `#[ignore]`. The test runs in the default `cargo test` on any clone, measured
+0.03 s, max abs diff 5.960e-8 against its 1e-5 bound on all four tables with `MLX_GEN_MODELS_ROOT`
+and `QWEN_IMAGE_EDIT_SNAPSHOT` unset. Mutation-checked: perturbing the conditioning grid to `(6, 7)`
+fails it. `*.safetensors binary` in the root `.gitattributes` already covers the path, so the
+`text=auto` 8000-byte sniff cannot rewrite its bytes.
+
+The other four weight-free Qwen gates — the index/Gate-A tests in `tests/vision_real_weights.rs` —
+CANNOT follow yet, and the blocker is not licence or weights. `dump_qwen_vision_golden.py` writes its
+Gate-1 (line 9, "zero model download") and Gate-A (line 70, "NO snapshot/weights") tensors into the
+same output file as Gate B (line 96 onward), which loads the Edit-2511 original. Splitting that
+producer in two is the entire fix and costs no download. Tracked in **sc-18085**, deliberately apart
+from the oracle-bundle story (sc-17909) so it does not wait on a ~60 GB decision it has no stake in.
 
 ### FLUX.2-klein (`mlx-gen-flux2`)
 
@@ -175,6 +502,18 @@ tests; the e2e/i2v/av goldens gate the full pipeline. Several scripts also write
 | `ltx_av_e2e_golden.safetensors` | `dump_ltx_av_e2e_golden.py` | `tests/av_e2e_parity.rs` | AV e2e. |
 | `ltx_av_lora_e2e_golden.safetensors` | `dump_ltx_av_lora_e2e_golden.py` | `tests/av_lora_e2e_parity.rs` | AV e2e with LoRA (sc-2687). |
 | `ltx_vocoder_golden.safetensors` | `dump_ltx_vocoder_golden.py` | `tests/vocoder_parity.rs` | audio vocoder. |
+
+### LTX-2.5 video (`mlx-gen-ltx` + `candle-gen-ltx`, epic 18755)
+
+Dumped from **upstream** rather than the mflux fork: Lightricks/LTX-2 v1.2.0 at
+`d151147788a9284cca791edc6ce898007e727fe6`, via `tools/_ltx25_diffvae_ref.py`'s shared loader
+(`LTX2_SRC` = `packages/ltx-core/src` of that checkout). Backend-neutral by construction — every
+tensor is f32 and each fixture carries its own inputs — so `candle-gen-ltx` asserts against the same
+file by relative path instead of a second dump.
+
+| golden | dump script | consumed by | notes |
+|---|---|---|---|
+| `ltx25_te_connector_golden.safetensors` | `dump_ltx25_te_connector_golden.py` | `mlx-gen-ltx` + `candle-gen-ltx` `tests/ltx_2_5_te_connector_inputs.rs` | sc-18770 LTX-2.5 text encoder → connector. Reference `LTXGemmaTextEncoder` + `EmbeddingsProcessor` (f32) on the **unquantized** `gemma4-12b-with-proj-ltx-2.5-bf16` encoder and the bf16 DiT's `{video,audio}_embeddings_connector`; needs `LTX25_TE_DIR` (the LTX-2.5 snapshot root) and `transformers>=5.8,<5.15` for `gemma4_unified`. One fixed prompt, tokenized once by the reference tokenizer at `MAX_LEN=256` (18 valid, 238 left-pad) and shipped as `input_ids`/`mask01` so neither backend re-tokenizes. Bundles `video_features` `[1,256,4096]` / `audio_features` `[1,256,2048]` (the connector **inputs**, in the tokenizer's left-padded order) and `video_embeddings`/`audio_embeddings` (the RAW connector output — register-reordered, valid rows first). `normed` (~192 MB) deliberately omitted. Bars are the 2.3 TE sibling's: `1.5e-2` on the features, `6e-2` after the connector, each asserted globally **and** over the valid rows alone. Run against the **bf16** tier, not `q8`, so tier quantization stays out of a correctness gate. Measured: `video_features 2.282e-3`, `audio_features 1.432e-3` — and the connector-output half is currently RED (`1.275e0` / `1.771e0`) on a `crate::connector` defect this golden surfaced (sc-21663); see the test's doc comment. |
 
 ### Wan-VACE video (`mlx-gen-wan`, sc-3388)
 
@@ -390,6 +729,12 @@ generated are listed.
 > ```sh
 > cd tools/golden && shasum -a 256 *.safetensors > CHECKSUMS.txt   # after a full re-dump
 > ```
+>
+> **Only run that after a genuinely full re-dump.** `>` truncates, so on a host holding a subset
+> of the directory it silently *deletes* every row it cannot see. sc-17651 regenerated only the
+> 11 sc-15505 artifacts out of the ~76 rows listed here; re-blessing from the directory would
+> have dropped the other 65, so that review hand-edited the single changed line instead. Editing
+> the affected rows is the correct move whenever you re-dumped less than everything.
 >
 > Until that next full re-dump, the `shasum -c` tripwire silently passes for any family it doesn't
 > list — so the manifest above is the source of truth for *what should exist*. The byte tripwire

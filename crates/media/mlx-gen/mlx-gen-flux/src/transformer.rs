@@ -4,15 +4,17 @@
 
 use mlx_gen::adapters::loader::{BflTarget, LoraRowSlice};
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
+use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
 use mlx_gen::nn::{gelu_tanh, silu};
 use mlx_gen::weights::{join, Weights};
 use mlx_gen::Result;
 use mlx_rs::error::Exception;
-use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
+use mlx_rs::fast::{layer_norm, rms_norm};
 use mlx_rs::nn::gelu;
 use mlx_rs::ops::{add, concatenate_axis, multiply, power, split, tanh};
-use mlx_rs::transforms::compile::compile;
+use mlx_rs::transforms::compile::{compile, compile_retained};
 use mlx_rs::{Array, Dtype};
+use std::cell::Cell;
 
 use crate::config::FluxVariant;
 
@@ -32,6 +34,43 @@ const RMS_EPS: f32 = 1e-5;
 use mlx_gen::nn::compile_glue;
 pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
 
+const SITE_GELU_FFN: &str = "flux::transformer::gelu_ffn";
+
+fn gelu_ffn_impl(x: &Array) -> std::result::Result<Array, Exception> {
+    let dt = x.dtype();
+    let s = |v: f32| -> std::result::Result<Array, Exception> { scalar(v).as_dtype(dt) };
+    let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
+    let x3 = power(x, Array::from_int(3))?;
+    let inner = multiply(&add(x, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
+    let gate = add(&tanh(&inner)?, &s(1.0)?)?;
+    multiply(&multiply(x, &s(0.5)?)?, &gate)
+}
+
+thread_local! {
+    static RETAINED_GELU_FFN: std::cell::RefCell<Option<mlx_gen::nn::RetainedUnary>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn retained_gelu_ffn(x: &Array) -> std::result::Result<Array, Exception> {
+    mlx_gen::nn::prepare_retained_compilation_thread();
+    RETAINED_GELU_FFN.with(|slot| {
+        slot.borrow_mut()
+            .get_or_insert_with(|| {
+                mlx_gen::nn::RetainedUnary::new(compile_retained(gelu_ffn_impl, true))
+            })
+            .call(SITE_GELU_FFN, x)
+    })
+}
+
+/// Exercise this crate's production retained handle once for the release memory audit.
+#[doc(hidden)]
+pub fn exercise_retained_compile_inventory(input: &Array) -> Result<()> {
+    let output = retained_gelu_ffn(input)?;
+    output.eval()?;
+    drop(output);
+    Ok(())
+}
+
 /// adaLN affine `normed·(1+scale)+shift` — FLUX.1 casts the `1` to `scale`'s dtype (bf16-coarse,
 /// sc-2787). Forwards to the shared [`mlx_gen::nn::modulate`].
 fn modulate(normed: &Array, scale: &Array, shift: &Array) -> Result<Array> {
@@ -48,18 +87,18 @@ fn gated(x: &Array, gate: &Array, y: &Array) -> Result<Array> {
 /// MLX fuses its ~8 elementwise ops into one kernel. Off ⇒ defers to the core `gelu_tanh`.
 fn gelu_ffn(x: &Array) -> Result<Array> {
     if !compile_glue() {
+        mlx_gen::diagnostics::record_fallback(SITE_GELU_FFN, "compiled_glue_disabled");
         return gelu_tanh(x);
     }
-    let f = |x_: &Array| -> std::result::Result<Array, Exception> {
-        let dt = x_.dtype();
-        let s = |v: f32| -> std::result::Result<Array, Exception> { scalar(v).as_dtype(dt) };
-        let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
-        let x3 = power(x_, Array::from_int(3))?;
-        let inner = multiply(&add(x_, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
-        let gate = add(&tanh(&inner)?, &s(1.0)?)?;
-        multiply(&multiply(x_, &s(0.5)?)?, &gate)
-    };
-    Ok(compile(f, true)(x)?)
+    if mlx_gen::nn::retained_compilation_requested() {
+        Ok(retained_gelu_ffn(x)?)
+    } else {
+        mlx_gen::diagnostics::record_compile(
+            SITE_GELU_FFN,
+            mlx_gen::diagnostics::CompileDisposition::OneShot,
+        );
+        Ok(compile(gelu_ffn_impl, true)(x)?)
+    }
 }
 
 /// The complex RoPE rotation `(real + imag·i)·(cos + sin·i)` → `(out_real, out_imag)`, in f32.
@@ -120,6 +159,7 @@ pub struct FluxTransformer {
     norm_out: AdaLayerNormContinuous,
     proj_out: AdaptableLinear,
     pos_embed: FluxRope,
+    block_stream: Option<crate::block_stream::FluxBlockStream>,
 }
 
 impl FluxTransformer {
@@ -152,7 +192,63 @@ impl FluxTransformer {
             norm_out: AdaLayerNormContinuous::from_weights(w, &p("norm_out"))?,
             proj_out: linear_from(w, &p("proj_out"), true)?,
             pos_embed: FluxRope::new(),
+            block_stream: None,
         })
+    }
+
+    /// Arm exact snapshot-backed reconstruction for both FLUX.1 block stacks. The caller must run
+    /// [`Self::finalize_block_stream`] after all load-time transformations have completed.
+    pub(crate) fn with_block_stream(
+        mut self,
+        inventory: crate::artifact_inventory::PackedArtifactInventory,
+        quant_bits: Option<i32>,
+    ) -> Self {
+        self.block_stream = Some(crate::block_stream::FluxBlockStream::new(
+            inventory,
+            self.blocks.len(),
+            self.single_blocks.len(),
+            quant_bits,
+        ));
+        self
+    }
+
+    /// Evict both resident block stacks after the deferred stream has captured their exact shape.
+    /// The global embedders, conditioning trunk, RoPE, norm, and output projection remain resident.
+    pub(crate) fn finalize_block_stream(&mut self) -> Result<()> {
+        let Some(stream) = self.block_stream.as_ref() else {
+            return Ok(());
+        };
+        crate::block_stream::evict_resident_blocks(
+            &mut self.blocks,
+            &mut self.single_blocks,
+            stream.joint_blocks(),
+            stream.single_blocks(),
+        )
+    }
+
+    pub(crate) fn resident_block_counts(&self) -> (usize, usize) {
+        (self.blocks.len(), self.single_blocks.len())
+    }
+
+    pub(crate) fn block_window<'a>(
+        &self,
+        size: Option<usize>,
+        cancel: &'a mlx_gen::CancelFlag,
+        calibration_stream_fault: bool,
+    ) -> Result<Option<crate::block_stream::FluxBlockWindow<'a>>> {
+        let Some(size) = size else { return Ok(None) };
+        let stream = self.block_stream.as_ref().ok_or_else(|| {
+            mlx_gen::Error::Unsupported(
+                "flux1: bounded transformer residency needs a verified packed stream".to_owned(),
+            )
+        })?;
+        Ok(Some(crate::block_stream::FluxBlockWindow::new(
+            stream.joint_blocks(),
+            stream.single_blocks(),
+            size,
+            cancel,
+            calibration_stream_fault,
+        )?))
     }
 
     /// Number of base double (joint) blocks (FLUX.1 = 19). Drives the ControlNet residual injection
@@ -220,6 +316,62 @@ impl FluxTransformer {
         height: u32,
         injector: Option<&dyn DitImageInjector>,
     ) -> Result<Array> {
+        self.forward_injected_memory(
+            hidden_states,
+            prompt_embeds,
+            pooled_prompt_embeds,
+            sigma,
+            guidance,
+            width,
+            height,
+            injector,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    /// Request-scoped bounded-attention variant used by the shared memory ladder.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_injected_memory(
+        &self,
+        hidden_states: &Array,
+        prompt_embeds: &Array,
+        pooled_prompt_embeds: &Array,
+        sigma: f32,
+        guidance: f32,
+        width: u32,
+        height: u32,
+        injector: Option<&dyn DitImageInjector>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Array> {
+        self.forward_injected_memory_windowed(
+            hidden_states,
+            prompt_embeds,
+            pooled_prompt_embeds,
+            sigma,
+            guidance,
+            width,
+            height,
+            injector,
+            attention,
+            None,
+        )
+    }
+
+    /// Clean-base request-scoped forward with optional independent joint/single block windows.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_injected_memory_windowed(
+        &self,
+        hidden_states: &Array,
+        prompt_embeds: &Array,
+        pooled_prompt_embeds: &Array,
+        sigma: f32,
+        guidance: f32,
+        width: u32,
+        height: u32,
+        injector: Option<&dyn DitImageInjector>,
+        attention: AttentionPlan<'_>,
+        window: Option<crate::block_stream::FluxBlockWindow<'_>>,
+    ) -> Result<Array> {
         self.forward_inner(
             hidden_states,
             prompt_embeds,
@@ -230,6 +382,8 @@ impl FluxTransformer {
             height,
             injector,
             None,
+            attention,
+            window,
         )
     }
 
@@ -268,6 +422,8 @@ impl FluxTransformer {
             height,
             injector,
             control,
+            AttentionPlan::UNBOUNDED,
+            None,
         )
     }
 
@@ -287,6 +443,8 @@ impl FluxTransformer {
         height: u32,
         injector: Option<&dyn DitImageInjector>,
         control: Option<(&[Array], f32)>,
+        attention: AttentionPlan<'_>,
+        window: Option<crate::block_stream::FluxBlockWindow<'_>>,
     ) -> Result<Array> {
         let mut hidden = self.x_embedder.forward(hidden_states)?;
         let mut encoder = self.context_embedder.forward(prompt_embeds)?;
@@ -322,29 +480,115 @@ impl FluxTransformer {
             None => None,
         };
 
-        for (i, block) in self.blocks.iter().enumerate() {
-            // The image-query (XLabs IP-Adapter) seam is consulted inside the block's attention; the
-            // post-block residual seam (PuLID) is consulted just below. With `injector = None` both
-            // are inert and this is byte-identical to the plain path.
-            let (e, h) = block.forward_with_ip(
-                &hidden,
-                &encoder,
-                &text_embeddings,
-                &rope,
-                injector.map(|inj| (inj, i)),
-            )?;
-            encoder = e;
-            hidden = h;
-            if let Some(inj) = injector {
-                if let Some(r) = inj.after_double(i, &hidden)? {
-                    hidden = add(&hidden, &r)?;
+        match window {
+            None => {
+                if self.block_stream.is_some() && self.blocks.is_empty() {
+                    return Err(mlx_gen::Error::Unsupported(
+                        "flux1: a deferred transformer requires an explicit block window"
+                            .to_owned(),
+                    ));
+                }
+                for (i, block) in self.blocks.iter().enumerate() {
+                    // The image-query (XLabs IP-Adapter) seam is consulted inside the block's
+                    // attention; the post-block residual seam (PuLID) is consulted just below. With
+                    // `injector = None` both are inert and this is byte-identical to the plain path.
+                    let (e, h) = block.forward_with_ip(
+                        &hidden,
+                        &encoder,
+                        &text_embeddings,
+                        &rope,
+                        injector.map(|inj| (inj, i)),
+                        attention,
+                    )?;
+                    encoder = e;
+                    hidden = h;
+                    if let Some(inj) = injector {
+                        if let Some(r) = inj.after_double(i, &hidden)? {
+                            hidden = add(&hidden, &r)?;
+                        }
+                    }
+                    // Fun-Controlnet-Union residual (sc-8238), added AFTER the identity injector so
+                    // the two compose.
+                    if let Some((res, interval)) = &scaled_control {
+                        let idx = (i / interval).min(res.len() - 1);
+                        hidden = add(&hidden, &res[idx])?;
+                    }
                 }
             }
-            // Fun-Controlnet-Union residual (sc-8238), added AFTER the identity injector so the two
-            // compose: `hidden = hidden + controlnet_block_samples[i / interval]·scale`.
-            if let Some((res, interval)) = &scaled_control {
-                let idx = (i / interval).min(res.len() - 1);
-                hidden = add(&hidden, &res[idx])?;
+            Some(window) => {
+                if scaled_control.is_some() {
+                    return Err(mlx_gen::Error::Unsupported(
+                        "flux1: block streaming does not support control residual stacks"
+                            .to_owned(),
+                    ));
+                }
+                if !self.blocks.is_empty() || !self.single_blocks.is_empty() {
+                    return Err(mlx_gen::Error::Msg(
+                        "flux1: deferred transformer retained resident blocks".to_owned(),
+                    ));
+                }
+                let source = self.block_stream.as_ref().ok_or_else(|| {
+                    mlx_gen::Error::Unsupported(
+                        "flux1: no verified snapshot-backed block stream".to_owned(),
+                    )
+                })?;
+                if window.joint.n_blocks() != source.joint_blocks()
+                    || window.single.n_blocks() != source.single_blocks()
+                {
+                    return Err(mlx_gen::Error::Msg(
+                        "flux1: joint/single block plan depth mismatch".to_owned(),
+                    ));
+                }
+                let active_joint_window = Cell::new((0usize, 0usize));
+                let result = mlx_gen::block_residency::run_windowed(
+                    &window.joint,
+                    window.cancel,
+                    (encoder, hidden),
+                    || source.open(),
+                    |(mut encoder, mut hidden), view, range| {
+                        let (start, end) = (range.start, range.end);
+                        active_joint_window.set((start, end));
+                        for i in range {
+                            let block = source.materialize_joint(view, i)?;
+                            crate::block_stream::calibration_stream_fault(
+                                window.calibration_stream_fault,
+                                i,
+                            )?;
+                            (encoder, hidden) = block.forward_with_ip(
+                                &hidden,
+                                &encoder,
+                                &text_embeddings,
+                                &rope,
+                                injector.map(|inj| (inj, i)),
+                                attention,
+                            )
+                            .map_err(|error| {
+                                mlx_gen::Error::Msg(format!(
+                                    "flux1 block stream: joint window {start}..{end} block {i} forward: {error}"
+                                ))
+                            })?;
+                            if let Some(inj) = injector {
+                                if let Some(r) = inj.after_double(i, &hidden)? {
+                                    hidden = add(&hidden, &r)?;
+                                }
+                            }
+                        }
+                        Ok((encoder, hidden))
+                    },
+                    |(encoder, hidden)| {
+                        let (start, end) = active_joint_window.get();
+                        mlx_rs::transforms::eval([encoder, hidden]).map_err(|error| {
+                            mlx_gen::Error::Msg(format!(
+                                "flux1 block stream: joint window {start}..{end} eval: {error}"
+                            ))
+                        })?;
+                        source.verify_materialized_window()
+                    },
+                );
+                // `run_windowed` has already released the active view and cleared MLX's allocator
+                // cache on every success/error/cancel edge before this final integrity check.
+                source.verify_materialized_window()?;
+                (encoder, hidden) = result?;
             }
         }
 
@@ -362,16 +606,69 @@ impl FluxTransformer {
         // The Shakker Union-Pro-2.0 checkpoint has 0 control SINGLE blocks, so there is no
         // single-stream control residual (diffusers `controlnet_single_block_samples = None`); the
         // single-block injector seam below is the identity path, unchanged.
-        for (i, block) in self.single_blocks.iter().enumerate() {
-            joint = block.forward(&joint, &text_embeddings, &rope)?;
-            if let Some(inj) = injector {
-                if inj.injects_after_single(i) {
-                    let img = joint.take_axis(&img_idx, 1)?;
-                    if let Some(r) = inj.after_single(i, &img)? {
-                        let txt = joint.take_axis(&txt_idx, 1)?;
-                        joint = concatenate_axis(&[&txt, &add(&img, &r)?], 1)?;
+        match window {
+            None => {
+                for (i, block) in self.single_blocks.iter().enumerate() {
+                    joint = block.forward(&joint, &text_embeddings, &rope, attention)?;
+                    if let Some(inj) = injector {
+                        if inj.injects_after_single(i) {
+                            let img = joint.take_axis(&img_idx, 1)?;
+                            if let Some(r) = inj.after_single(i, &img)? {
+                                let txt = joint.take_axis(&txt_idx, 1)?;
+                                joint = concatenate_axis(&[&txt, &add(&img, &r)?], 1)?;
+                            }
+                        }
                     }
                 }
+            }
+            Some(window) => {
+                let source = self.block_stream.as_ref().ok_or_else(|| {
+                    mlx_gen::Error::Unsupported(
+                        "flux1: no verified snapshot-backed block stream".to_owned(),
+                    )
+                })?;
+                let active_single_window = Cell::new((0usize, 0usize));
+                let result = mlx_gen::block_residency::run_windowed(
+                    &window.single,
+                    window.cancel,
+                    joint,
+                    || source.open(),
+                    |mut joint, view, range| {
+                        let (start, end) = (range.start, range.end);
+                        active_single_window.set((start, end));
+                        for i in range {
+                            let block = source.materialize_single(view, i)?;
+                            joint = block
+                                .forward(&joint, &text_embeddings, &rope, attention)
+                                .map_err(|error| {
+                                    mlx_gen::Error::Msg(format!(
+                                        "flux1 block stream: single window {start}..{end} block {i} forward: {error}"
+                                    ))
+                                })?;
+                            if let Some(inj) = injector {
+                                if inj.injects_after_single(i) {
+                                    let img = joint.take_axis(&img_idx, 1)?;
+                                    if let Some(r) = inj.after_single(i, &img)? {
+                                        let txt = joint.take_axis(&txt_idx, 1)?;
+                                        joint = concatenate_axis(&[&txt, &add(&img, &r)?], 1)?;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(joint)
+                    },
+                    |joint: &Array| {
+                        let (start, end) = active_single_window.get();
+                        mlx_rs::transforms::eval([joint]).map_err(|error| {
+                            mlx_gen::Error::Msg(format!(
+                                "flux1 block stream: single window {start}..{end} eval: {error}"
+                            ))
+                        })?;
+                        source.verify_materialized_window()
+                    },
+                );
+                source.verify_materialized_window()?;
+                joint = result?;
             }
         }
         let hidden = joint.take_axis(&img_idx, 1)?;
@@ -429,7 +726,7 @@ impl FluxTransformer {
         let img_seq = hidden.shape()[1];
         let mut joint = concatenate_axis(&[&encoder, &hidden], 1)?;
         for block in &self.single_blocks {
-            joint = block.forward(&joint, &text_embeddings, &rope)?;
+            joint = block.forward(&joint, &text_embeddings, &rope, AttentionPlan::UNBOUNDED)?;
         }
         let idx = Array::from_slice(
             &(txt_seq..txt_seq + img_seq).collect::<Vec<i32>>(),
@@ -463,7 +760,7 @@ impl FluxTransformer {
             num_blocks
         };
         for block in self.single_blocks.iter().take(n) {
-            joint = block.forward(&joint, text_embeddings, &rope)?;
+            joint = block.forward(&joint, text_embeddings, &rope, AttentionPlan::UNBOUNDED)?;
         }
         let idx = Array::from_slice(
             &(txt_seq..txt_seq + img_seq).collect::<Vec<i32>>(),
@@ -502,7 +799,7 @@ impl FluxTransformer {
         let joint = concatenate_axis(&[encoder, hidden], 1)?;
         let b = &self.single_blocks[0];
         let (normed, _gate) = b.norm.forward_three(&joint, text_embeddings)?;
-        let attn = b.attn.forward(&normed, &rope)?;
+        let attn = b.attn.forward(&normed, &rope, AttentionPlan::UNBOUNDED)?;
         let ff = gelu_tanh(&b.proj_mlp.forward(&normed)?)?;
         Ok(vec![
             ("sb0_norm".into(), normed),
@@ -625,7 +922,7 @@ impl JointBlock {
         emb: &Array,
         rope: &RopeTable,
     ) -> Result<(Array, Array)> {
-        self.forward_with_ip(hidden, encoder, emb, rope, None)
+        self.forward_with_ip(hidden, encoder, emb, rope, None, AttentionPlan::UNBOUNDED)
     }
 
     /// As [`forward`], but consulting the XLabs IP-Adapter image-query seam
@@ -638,6 +935,7 @@ impl JointBlock {
         emb: &Array,
         rope: &RopeTable,
         ip: Option<(&dyn DitImageInjector, usize)>,
+        plan: AttentionPlan<'_>,
     ) -> Result<(Array, Array)> {
         let (norm_hidden, gate_msa, shift_mlp, scale_mlp, gate_mlp) =
             self.norm1.forward_six(hidden, emb)?;
@@ -645,7 +943,7 @@ impl JointBlock {
             self.norm1_context.forward_six(encoder, emb)?;
         let (attn_hidden, attn_context, ip_residual) =
             self.attn
-                .forward_with_ip(&norm_hidden, &norm_encoder, rope, ip)?;
+                .forward_with_ip(&norm_hidden, &norm_encoder, rope, ip, plan)?;
         let hidden = apply_norm_ff(
             hidden,
             &attn_hidden,
@@ -684,7 +982,7 @@ impl JointBlock {
     }
 }
 
-struct SingleBlock {
+pub(crate) struct SingleBlock {
     norm: AdaLayerNormZero,
     attn: SingleAttention,
     proj_mlp: AdaptableLinear,
@@ -692,7 +990,7 @@ struct SingleBlock {
 }
 
 impl SingleBlock {
-    fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+    pub(crate) fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         Ok(Self {
             norm: AdaLayerNormZero::from_weights(w, &join(prefix, "norm"), 3)?,
             attn: SingleAttention::from_weights(w, &join(prefix, "attn"))?,
@@ -701,17 +999,23 @@ impl SingleBlock {
         })
     }
 
-    fn forward(&self, hidden: &Array, emb: &Array, rope: &RopeTable) -> Result<Array> {
+    fn forward(
+        &self,
+        hidden: &Array,
+        emb: &Array,
+        rope: &RopeTable,
+        plan: AttentionPlan<'_>,
+    ) -> Result<Array> {
         let residual = hidden;
         let (normed, gate) = self.norm.forward_three(hidden, emb)?;
-        let attn = self.attn.forward(&normed, rope)?;
+        let attn = self.attn.forward(&normed, rope, plan)?;
         let ff = gelu_ffn(&self.proj_mlp.forward(&normed)?)?;
         let out = concatenate_axis(&[&attn, &ff], 2)?;
         let proj = self.proj_out.forward(&out)?;
         gated(residual, &gate.expand_dims(1)?, &proj)
     }
 
-    fn quantize(&mut self, bits: i32) -> Result<()> {
+    pub(crate) fn quantize(&mut self, bits: i32) -> Result<()> {
         self.norm.quantize(bits)?;
         self.attn.quantize(bits)?;
         self.proj_mlp.quantize(bits, None)?;
@@ -769,6 +1073,7 @@ impl JointAttention {
         encoder: &Array,
         rope: &RopeTable,
         ip: Option<(&dyn DitImageInjector, usize)>,
+        plan: AttentionPlan<'_>,
     ) -> Result<(Array, Array, Option<Array>)> {
         let (q, k, v) = process_qkv(
             hidden,
@@ -793,7 +1098,7 @@ impl JointAttention {
         let k = concatenate_axis(&[&ek, &k], 2)?;
         let v = concatenate_axis(&[&ev, &v], 2)?;
         let (q, k) = apply_rope(&q, &k, rope)?;
-        let out = attention(&q, &k, &v)?;
+        let out = attention(&q, &k, &v, plan)?;
         let txt_seq = encoder.shape()[1];
         // `out` is `[txt ; img]` along the sequence axis; split at `txt_seq` (a contiguous slice)
         // rather than gathering two aranges (F-111). `out_txt` is consumed by `to_add_out` below.
@@ -848,7 +1153,7 @@ impl SingleAttention {
         })
     }
 
-    fn forward(&self, hidden: &Array, rope: &RopeTable) -> Result<Array> {
+    fn forward(&self, hidden: &Array, rope: &RopeTable, plan: AttentionPlan<'_>) -> Result<Array> {
         let (q, k, v) = process_qkv(
             hidden,
             &self.to_q,
@@ -858,7 +1163,7 @@ impl SingleAttention {
             &self.norm_k,
         )?;
         let (q, k) = apply_rope(&q, &k, rope)?;
-        attention(&q, &k, &v)
+        attention(&q, &k, &v, plan)
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
@@ -1063,9 +1368,9 @@ fn process_qkv(
     Ok((q, k, v))
 }
 
-fn attention(q: &Array, k: &Array, v: &Array) -> Result<Array> {
+fn attention(q: &Array, k: &Array, v: &Array, plan: AttentionPlan<'_>) -> Result<Array> {
     let b = q.shape()[0];
-    let y = scaled_dot_product_attention(q, k, v, (HEAD_DIM as f32).powf(-0.5), None, None)?;
+    let y = sdpa_budgeted_bhsd(q, k, v, (HEAD_DIM as f32).powf(-0.5), None, plan)?;
     Ok(y.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, -1, DIM])?)
 }
 
@@ -1712,12 +2017,14 @@ mod tests {
             },
             proj_out: dummy_lin(),
             pos_embed: FluxRope::new(),
+            block_stream: None,
         }
     }
 
     fn resolves(host: &mut impl AdaptableHost, path: &str) -> bool {
         let segs: Vec<&str> = path.split('.').collect();
-        host.adaptable_mut(&segs).is_some()
+        // SC-18319 — reachability is a probe question.
+        host.adaptable_facts(&segs).is_some()
     }
 
     /// The full fork `FluxLoRAMapping` surface — joint + single block linears INCLUDING the adaLN
@@ -1876,8 +2183,9 @@ mod tests {
         ));
     }
 
-    fn tmp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("mlx_gen_flux_adapter_test");
+    fn scratch_file(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
+        // Per-process scratch dir — a fixed `$TMPDIR` name races a second concurrent `cargo test`.
+        let dir = tmp.path().join("mlx_gen_flux_adapter_test");
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
     }
@@ -1894,6 +2202,7 @@ mod tests {
     /// (the row-slice operates on the source factors, not the base), so this is a CI gate.
     #[test]
     fn bfl_fused_qkv_matches_diffusers_split() {
+        let tmp = tempfile::tempdir().unwrap();
         let none = None as Option<&HashMap<String, String>>;
         let (inner, inp, r) = (3072i32, 8i32, 2i32);
         let head = |seed: i32| -> Vec<f32> {
@@ -1918,7 +2227,7 @@ mod tests {
         );
         let alpha = Array::from_slice(&[4.0f32], &[1]);
 
-        let bfl_path = tmp("bfl_qkv.safetensors");
+        let bfl_path = scratch_file(&tmp, "bfl_qkv.safetensors");
         Array::save_safetensors(
             vec![
                 (
@@ -1935,7 +2244,7 @@ mod tests {
             &bfl_path,
         )
         .unwrap();
-        let peft_path = tmp("bfl_qkv_split_peft.safetensors");
+        let peft_path = scratch_file(&tmp, "bfl_qkv_split_peft.safetensors");
         Array::save_safetensors(
             vec![
                 (
@@ -2015,6 +2324,7 @@ mod tests {
     /// split reconstructs byte-identically to the diffusers split-target file (the `Dims` boundaries).
     #[test]
     fn bfl_fused_single_linear1_matches_diffusers_split() {
+        let tmp = tempfile::tempdir().unwrap();
         let none = None as Option<&HashMap<String, String>>;
         let (r, inp) = (2i32, 8i32);
         let dims = [DIM, DIM, DIM, 4 * DIM]; // q,k,v,mlp
@@ -2041,7 +2351,7 @@ mod tests {
         );
         let alpha = Array::from_slice(&[8.0f32], &[1]);
 
-        let bfl_path = tmp("bfl_single.safetensors");
+        let bfl_path = scratch_file(&tmp, "bfl_single.safetensors");
         Array::save_safetensors(
             vec![
                 (
@@ -2073,7 +2383,7 @@ mod tests {
                 alpha.clone(),
             ));
         }
-        let peft_path = tmp("bfl_single_split_peft.safetensors");
+        let peft_path = scratch_file(&tmp, "bfl_single_split_peft.safetensors");
         Array::save_safetensors(
             peft.iter()
                 .map(|(k, v)| (k.as_str(), v))
@@ -2128,6 +2438,7 @@ mod tests {
     /// installs both; an off-surface target errors (strict no-silent-drop).
     #[test]
     fn scale_zero_noop_mixed_stack_and_strict() {
+        let tmp = tempfile::tempdir().unwrap();
         // scale-0: a no-op adapter installed on a resolved linear leaves its forward unchanged.
         let mut t = test_transformer(1, 0);
         let x = Array::from_slice(&[1.0f32], &[1, 1]);
@@ -2157,7 +2468,7 @@ mod tests {
         );
 
         // Mixed LoRA + LoKr spec list targeting two distinct FLUX.1 modules applies both.
-        let lora_path = tmp("mix_lora.safetensors");
+        let lora_path = scratch_file(&tmp, "mix_lora.safetensors");
         Array::save_safetensors(
             vec![
                 (
@@ -2177,7 +2488,7 @@ mod tests {
         meta.insert("networkType".to_string(), "lokr".to_string());
         meta.insert("alpha".to_string(), "1.0".to_string());
         meta.insert("rank".to_string(), "1".to_string());
-        let lokr_path = tmp("mix_lokr.safetensors");
+        let lokr_path = scratch_file(&tmp, "mix_lokr.safetensors");
         Array::save_safetensors(
             vec![
                 (
@@ -2218,7 +2529,7 @@ mod tests {
         assert!(report.unmatched_paths.is_empty());
 
         // Strict no-silent-drop: an off-surface target errors.
-        let miss = tmp("miss.safetensors");
+        let miss = scratch_file(&tmp, "miss.safetensors");
         Array::save_safetensors(
             vec![
                 (

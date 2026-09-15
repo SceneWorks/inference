@@ -19,6 +19,10 @@ candle-audio = { path = "../candle-audio" }
 candle-nn = { workspace = true }
 
 [dev-dependencies]
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }
 # Kokoro TTS supplies the distinct reference voices the discriminative real-weight test embeds
 # (the sanctioned "Kokoro-generated reference audio" path — no external audio fixtures). Dev-only.
 candle-audio-kokoro = { path = "../candle-audio-kokoro" }

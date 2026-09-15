@@ -3,7 +3,7 @@
 //!
 //! `#[ignore]`d — needs the real `microsoft/Lens-Turbo` snapshot (env `LENS_DIR`, else the HF cache).
 //! Run:
-//!   cargo test -p mlx-gen-lens --release --test sequential_residency_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-lens --release --test integration sequential_residency_real_weights:: -- --ignored --nocapture
 //!
 //! Two claims (same as the SDXL/Z-Image/Qwen A/B): (1) `Sequential` peaks LOWER than `Resident`
 //! because the gpt-oss MoE text encoder is dropped (+ `clear_cache()`) before the DiT + the denoise

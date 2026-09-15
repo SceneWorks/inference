@@ -5,13 +5,13 @@
 //! `pipeline_contract::real_weight_1024_e2e` at it (its `from_weights` packed-detects the same dir):
 //!
 //!   SANA_PIPELINE_WEIGHTS=$SANA_OUT cargo test -p mlx-gen-sana --release \
-//!     --test pipeline_contract -- --ignored --nocapture real_weight_1024_e2e
+//!     --test integration -- pipeline_contract::real_weight_1024_e2e --ignored --nocapture
 //!
 //! Build:
 //!   SANA_SRC=/path/to/models--SceneWorks--Sana_1600M_1024px_mlx/snapshots/<hash> \
 //!   SANA_OUT=~/sana-staging/1600m/q4 SANA_BITS=4 \
-//!   cargo test -p mlx-gen-sana --release --test prequantize_real_weights \
-//!     -- --ignored --nocapture build_tier
+//!   cargo test -p mlx-gen-sana --release --test integration \
+//!     -- --ignored --nocapture prequantize_real_weights::build_tier
 
 use mlx_gen_sana::convert::prequantize_turnkey;
 use std::path::PathBuf;

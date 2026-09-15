@@ -140,10 +140,10 @@ pub fn generate_batch(
     // ---- Prefill: left-pad every prompt to `max_prompt` and run one batched forward. ----
     let (ids, positions, mask_h) = build_prefill(requests, max_prompt);
     let ids = Tensor::from_vec(ids, (n, max_prompt as usize), &device)?;
-    let (cos, sin) = model.rope_tables(&positions, n as i32, max_prompt)?;
+    let tables = model.rope_tables(&positions, n as i32, max_prompt)?;
     let mp = max_prompt as usize;
     let mask = Tensor::from_vec(mask_h, (n, 1, mp, mp), &device)?.to_dtype(dtype)?;
-    let logits = model.decode_logits_masked(&ids, cache.as_mut(), &cos, &sin, &mask)?;
+    let logits = model.decode_logits_masked(&ids, cache.as_mut(), &tables, &mask)?;
 
     // Sample the first token per sequence; keep the lanes that did not immediately retire.
     let mut active: Vec<Lane> = Vec::new();
@@ -198,10 +198,10 @@ pub fn generate_batch(
             .iter()
             .map(|l| sched.offset(l.seq) as i32 - 1)
             .collect();
-        let (cos, sin) = model.rope_tables(&positions, b as i32, 1)?;
+        let tables = model.rope_tables(&positions, b as i32, 1)?;
         let mask = decode_mask(&active, k_total, dtype, &device)?;
 
-        let logits = model.decode_logits_masked(&feed, cache.as_mut(), &cos, &sin, &mask)?;
+        let logits = model.decode_logits_masked(&feed, cache.as_mut(), &tables, &mask)?;
 
         let mut next_keep: Vec<i32> = Vec::new();
         let mut next_active: Vec<Lane> = Vec::new();

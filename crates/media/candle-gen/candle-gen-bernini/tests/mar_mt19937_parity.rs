@@ -10,7 +10,7 @@
 //!
 //! CPU, no cuda / weights.
 
-mod common;
+use crate::common;
 
 use common::Golden;
 

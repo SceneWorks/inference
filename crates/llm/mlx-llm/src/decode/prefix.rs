@@ -24,7 +24,7 @@ use core_llm::prefix::{PrefixId, PrefixIndex};
 
 use crate::decode::cancel::CancelFlag;
 use crate::decode::stream::{
-    decode_loop, default_seed, GenerationConfig, GenerationOutput, StreamEvent,
+    decode_loop, default_seed, ConstraintMask, GenerationConfig, GenerationOutput, StreamEvent,
 };
 use crate::error::{Error, Result};
 use crate::models::CausalLm;
@@ -157,6 +157,33 @@ pub fn generate_cached(
     on_event: &mut dyn FnMut(StreamEvent),
     prefix_cache: &mut PrefixCache,
 ) -> Result<GenerationOutput> {
+    generate_cached_with(
+        model,
+        prompt_ids,
+        config,
+        cancel,
+        on_event,
+        prefix_cache,
+        None,
+        None,
+    )
+}
+
+/// [`generate_cached`] with the same per-step constraint and host-stop seams as
+/// [`crate::decode::generate_with`]. Keeping these on the prefix path lets a caller reuse a static
+/// system-prompt prefix without giving up generation semantics such as Hugging Face's
+/// `no_repeat_ngram_size`.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_cached_with(
+    model: &CausalLm,
+    prompt_ids: &[i32],
+    config: &GenerationConfig,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    prefix_cache: &mut PrefixCache,
+    constraint: Option<&mut dyn ConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
+) -> Result<GenerationOutput> {
     if cancel.is_cancelled() {
         return Err(crate::error::Error::Canceled); // typed pre-inference cancel
     }
@@ -185,8 +212,8 @@ pub fn generate_cached(
         config,
         cancel,
         on_event,
-        None,
-        None,
+        constraint,
+        should_stop,
     )?;
 
     // Store the sequence whose KV the cache actually holds, so the next shared-prefix request

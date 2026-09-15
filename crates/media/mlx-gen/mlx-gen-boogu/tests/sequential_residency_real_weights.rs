@@ -3,7 +3,7 @@
 //! `#[ignore]`d — needs a converted Boogu Base snapshot (`BOOGU_BASE_DIR`, the crate's real-weight
 //! convention — see `tests/generator.rs`). Run:
 //!   BOOGU_BASE_DIR=<base snapshot> \
-//!     cargo test -p mlx-gen-boogu --release --test sequential_residency_real_weights -- --ignored --nocapture
+//!     cargo test -p mlx-gen-boogu --release --test integration sequential_residency_real_weights:: -- --ignored --nocapture
 //!
 //! Same two claims as the SD3 / Z-Image A/Bs: (1) `Sequential` peaks LOWER than `Resident` because the
 //! ~17.5 GB Qwen3-VL `mllm/` encoder is dropped (+ `clear_cache()`) before the ~20.6 GB DiT + VAE

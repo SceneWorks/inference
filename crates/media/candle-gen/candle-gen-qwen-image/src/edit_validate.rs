@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{AdapterKind, AdapterSpec, Image, OffloadPolicy, Progress};
+use candle_gen::gen_core::{AdapterKind, AdapterSpec, Image, OffloadPolicy, PreviewSink, Progress};
 use candle_gen::testkit::{env_path, mean_abs_diff, read_ppm, write_ppm};
 
 use crate::edit::{QwenEdit, QwenEditPaths, QwenEditRequest};
@@ -51,6 +51,7 @@ fn real_weight_edit() {
     let t0 = std::time::Instant::now();
     let model = QwenEdit::load(&QwenEditPaths {
         root: env_path("QWEN_EDIT_BASE"),
+        text_encoder: None,
         adapters: vec![],
         offload_policy: OffloadPolicy::Resident,
     })
@@ -69,7 +70,10 @@ fn real_weight_edit() {
         guidance: 4.0,
         seed: 12345,
         lightning: false,
+        stage_residency: false,
+        memory: None,
         cancel: CancelFlag::new(),
+        preview: PreviewSink::default(),
     };
 
     let mut noop = |_p: Progress| {};
@@ -174,6 +178,7 @@ fn high_res_edit_avoids_i32_overflow() {
     let reference = read_ppm(&env_path("QWEN_EDIT_REF"));
     let model = QwenEdit::load(&QwenEditPaths {
         root: env_path("QWEN_EDIT_BASE"),
+        text_encoder: None,
         adapters: vec![],
         offload_policy: OffloadPolicy::Resident,
     })
@@ -188,7 +193,10 @@ fn high_res_edit_avoids_i32_overflow() {
         guidance: 4.0,
         seed: 12345,
         lightning: false,
+        stage_residency: false,
+        memory: None,
         cancel: CancelFlag::new(),
+        preview: PreviewSink::default(),
     };
     let mut noop = |_p: Progress| {};
 
@@ -229,6 +237,7 @@ fn lightning_edit_4steps() {
     let t0 = std::time::Instant::now();
     let model = QwenEdit::load(&QwenEditPaths {
         root: env_path("QWEN_EDIT_BASE"),
+        text_encoder: None,
         adapters: vec![AdapterSpec::new(lora, 1.0, AdapterKind::Lora)],
         offload_policy: OffloadPolicy::Resident,
     })
@@ -247,7 +256,10 @@ fn lightning_edit_4steps() {
         guidance: 1.0,
         seed: 12345,
         lightning: true,
+        stage_residency: false,
+        memory: None,
         cancel: CancelFlag::new(),
+        preview: PreviewSink::default(),
     };
     let mut noop = |_p: Progress| {};
 

@@ -77,7 +77,10 @@ pub use loader::{
 // chroma/flux2/qwen-image VAE mid-blocks) share ONE guarded copy. candle CUDA kernels index elements
 // with i32; a scores tensor over `i32::MAX` silently corrupts its tail at large render sizes.
 pub mod attention;
-pub use attention::{sdpa_budgeted_bhsd, sdpa_budgeted_flat, ATTN_SCORES_BUDGET};
+pub use attention::{
+    sdpa_budgeted_bhsd, sdpa_budgeted_flat, sdpa_planned_bhsd, sdpa_planned_flat,
+    ATTN_SCORES_BUDGET,
+};
 
 // Shared Qwen3-VL text-encoder grounding helpers (sc-11205 / F-118): the MRoPE / vision-splice
 // machinery (`Rotary` 1-D RoPE table, GQA `repeat_kv`, `<|image_pad|>` `image_blocks`, the vision-embed
@@ -91,7 +94,10 @@ pub mod grounding;
 // final `vae.decode(latent)` through so a per-generation `req.use_pid` toggle can swap in NVIDIA PiD
 // (`candle-gen-pid`) without N bespoke per-engine ports. The candle twin of `mlx_gen::decoder`.
 pub mod decoder;
-pub use decoder::LatentDecoder;
+pub use decoder::{ensure_decoder_compatible, ensure_decoder_layout, LatentDecoder};
+
+// Canonical SDXL-family `scaled_linear` schedule parameters shared by inference and training.
+pub mod diffusion_schedule;
 
 // Shared VRAM-budget probe (sc-9014 / F-030): the trusted-path `nvidia-smi` resolver the video-VAE
 // decode tilers (seedvr2/wan/ltx) route through, instead of each spawning a bare
@@ -104,6 +110,15 @@ pub mod gpu;
 // matrix. Provider crates' packed-detect loaders build on this.
 pub mod quant;
 
+// Shared per-step latent preview machinery (epic 16948 / sc-16949) — the candle twin of
+// `mlx_gen::preview`. Numbers schedule positions (deduping the repeat a multi-eval solver produces),
+// projects an unpacked `[1, C, h, w]` latent through a family-owned linear RGB fit, and emits the
+// frame best-effort. Families opt in by handing a `preview::PreviewHook` to the sampler drivers.
+pub mod preview;
+pub use preview::{emit_preview, emit_preview_at, project_latents, PreviewCounter, PreviewHook};
+
+pub mod request_scope;
+
 // The shared native training harness (epic 5164 / sc-5165) — the candle twin of `mlx_gen::train`.
 // Provider crates (sdxl/z-image/wan/lens) build their `gen_core::Trainer` on top of this.
 pub mod train;
@@ -115,8 +130,8 @@ pub mod sampler;
 pub use sampler::{
     curated_sampler_names, curated_scheduler_names, menu_with_aliases, resolve_flow_schedule,
     resolve_schedule, run_av_curated_sampler, run_curated_sampler, run_flow_sampler,
-    run_scm_sampler, AvLatents, CandleAvLatentOps, CandleLatentOps, ScmScheduler,
-    SCM_DEFAULT_INTERMEDIATE_TIMESTEP, SCM_DEFAULT_MAX_TIMESTEP, SCM_SIGMA_DATA,
+    run_scm_sampler, run_scm_sampler_from, AvLatents, CandleAvLatentOps, CandleLatentOps,
+    ScmScheduler, SCM_DEFAULT_INTERMEDIATE_TIMESTEP, SCM_DEFAULT_MAX_TIMESTEP, SCM_SIGMA_DATA,
 };
 
 // Shared seed-derivation + launch-portable seeded-noise helpers (sc-7792 consolidation / F-059,
@@ -134,12 +149,14 @@ pub use seed::{
 // tile GEOMETRY stays in `gen_core::tiling`; this module owns the candle-side execution of a plan,
 // parameterized by each VAE's cost model + decode closure so the per-VAE numerics are unchanged.
 pub mod vae_tiling;
+pub use gen_core::tiling::VideoDecodeMemoryProfile;
 
 // Shared safetensors key→`Tensor` weight map (sc-9044 / F-060): the non-`VarBuilder` loader (float
 // dtype-coerce, hard duplicate-key policy, prefix-filtered header-only reads) that the SDXL IP-Adapter/
 // ControlNet loads AND the FLUX-family IP-Adapter / PuLID EVA-CLIP towers all share. It had drifted into
 // `candle-gen-sdxl`, making that pipeline crate a de-facto commons crate that PuLID/FLUX pulled the whole
 // ~12k-LOC SDXL crate in for. Hoisted here; `candle-gen-sdxl::weights` re-exports it for compatibility.
+pub mod logical_weights;
 pub mod weights;
 pub use weights::Weights;
 
@@ -148,7 +165,7 @@ pub use weights::Weights;
 // Wan2.1 16-channel VAE, stored with native WAN-VAE keys. The rename lives here (the `weights` module's
 // F-060 posture) rather than duplicated in each pipeline crate's `comfyui` seam.
 pub mod comfyui_vae;
-pub use comfyui_vae::remap_vae_wan_to_diffusers;
+pub use comfyui_vae::{remap_vae_wan_mlx_to_diffusers, remap_vae_wan_to_diffusers};
 
 // Poison-tolerant locking + read-through helper for the shared generator/component caches (sc-9015 /
 // F-031; `cached` sc-7792): a panic while holding a cache `Mutex` (e.g. a CUDA OOM lifted to a panic
@@ -166,9 +183,35 @@ pub use sync::{cached, lock_recover};
 // schedule and each omitted the same two things.
 pub mod residency;
 pub use residency::{
-    check_cancel, effective_offload_policy, run_sequential, run_three_stage_sequential,
-    sequential_offload_enabled, Residency, OFFLOAD_ENV,
+    check_cancel, run_sequential, run_three_stage_sequential, synchronize_result, Residency,
+    StagedHeavy,
 };
+
+// Driver memory-pool introspection (sc-12818, widened by SC-15792). Gated on `cuda` alone rather
+// than on `testkit`: the CUDA compile/Clippy lane enables `cuda` and NOT `testkit`, so a probe living
+// only behind `testkit` is invisible to the one lane that can build it — which is precisely why
+// SC-15791's spike ended up forking `default_pool` instead of extending testkit. `testkit` re-exports
+// the two original functions, so existing consumers are unchanged.
+#[cfg(feature = "cuda")]
+pub mod cuda_mempool;
+
+// sc-19545: the runtime arch-coverage diagnostic. NOT cuda-gated as a whole — the comparison is a
+// pure function over a baked-in ladder, so it stays unit-testable on the CPU/Metal lanes, which are
+// the only ones most contributors can run. Only the device read inside it is cuda-gated.
+pub mod cuda_arch;
+
+// Rung-4 bounded transformer residency, the candle half (SC-15792, epic 15448). The schedule lives
+// in `gen_core::block_window` (hoisted by SC-15790 so candle would not fork it); this binds candle's
+// two backend answers — both measured in SC-15791, both different from MLX's — plus the teardown
+// synchronize that has no MLX counterpart because MLX has no driver/pool split.
+pub mod block_window;
+pub use block_window::BlockPlan;
+
+// Snapshot-read architecture axes shared by every provider's `MemoryArchitectureFacts` (epic
+// SC-22657, E2). The honesty rules — no zero-valued axis, no scale invented from a stage count no
+// VAE could ship, a missing config that is absent rather than an error — live here once instead of
+// being re-derived in twenty provider crates.
+pub mod architecture_facts;
 
 // Shared test-support helpers (sc-9055 / F-069): the PPM read/write, cosine, env-path, and GPU
 // peak-VRAM helpers that had been hand-copied — and had drifted — across ~16 `#[cfg(test)]`
@@ -202,6 +245,18 @@ pub enum CandleError {
     /// variant, sc-4481). Mirrors mlx-gen's `Error::Canceled`.
     #[error("cancelled")]
     Canceled,
+
+    /// A measured pre-render refusal. Keep every decision-surface field typed across the Candle seam
+    /// so worker/API telemetry can distinguish it from an opaque backend failure.
+    #[error(
+        "geometry refused: {reason}; requested {requested_width}x{requested_height}; verified alternative: {alternative:?}"
+    )]
+    GeometryRefused {
+        reason: String,
+        requested_width: u32,
+        requested_height: u32,
+        alternative: Option<(u32, u32)>,
+    },
 }
 
 impl From<CandleError> for gen_core::Error {
@@ -212,6 +267,17 @@ impl From<CandleError> for gen_core::Error {
             CandleError::Msg(s) => gen_core::Error::Msg(s),
             // Preserve the typed cancellation signal across the bridge (do NOT stringify to Msg).
             CandleError::Canceled => gen_core::Error::Canceled,
+            CandleError::GeometryRefused {
+                reason,
+                requested_width,
+                requested_height,
+                alternative,
+            } => gen_core::Error::GeometryRefused {
+                reason,
+                requested_width,
+                requested_height,
+                alternative,
+            },
         }
     }
 }
@@ -229,6 +295,17 @@ impl From<gen_core::Error> for CandleError {
             gen_core::Error::Canceled => CandleError::Canceled,
             gen_core::Error::MissingTensor(s) => CandleError::Msg(format!("missing tensor: {s}")),
             gen_core::Error::Unsupported(s) => CandleError::Msg(format!("unsupported: {s}")),
+            gen_core::Error::GeometryRefused {
+                reason,
+                requested_width,
+                requested_height,
+                alternative,
+            } => CandleError::GeometryRefused {
+                reason,
+                requested_width,
+                requested_height,
+                alternative,
+            },
             gen_core::Error::Io(io) => CandleError::Msg(io.to_string()),
             gen_core::Error::Backend(b) => CandleError::Msg(b.to_string()),
             gen_core::Error::Msg(s) => CandleError::Msg(s),
@@ -262,6 +339,13 @@ pub fn default_device() -> Result<candle_core::Device> {
     let dev = candle_core::Device::new_metal(0)?;
     #[cfg(not(any(feature = "cuda", feature = "metal")))]
     let dev = candle_core::Device::Cpu;
+    // sc-19545: warn (once per process, NON-fatally) if this GPU's architecture is served by no
+    // rung of the quantized-kernel fatbin. Uncovered means Q4/Q8 matmuls return ZEROS without
+    // erroring, so the symptom is a black render behind a green exit code. This is the CUDA
+    // construction chokepoint, hence the cheapest place to say so. See `cuda_arch` for why it warns
+    // rather than fails, and what has to be verified before that could change.
+    #[cfg(feature = "cuda")]
+    cuda_arch::warn_if_device_uncovered(&dev);
     Ok(dev)
 }
 
@@ -310,6 +394,36 @@ mod tests {
         let candle_err = CandleError::from(bad.unwrap_err());
         let neutral: gen_core::Error = candle_err.into();
         assert!(matches!(neutral, gen_core::Error::Backend(_)));
+    }
+
+    #[test]
+    fn geometry_refusal_round_trips_without_losing_decision_fields() {
+        let neutral = gen_core::Error::GeometryRefused {
+            reason: "measured infeasible".to_owned(),
+            requested_width: 1536,
+            requested_height: 1024,
+            alternative: Some((1024, 1024)),
+        };
+        let candle = CandleError::from(neutral);
+        assert!(matches!(
+            &candle,
+            CandleError::GeometryRefused {
+                reason,
+                requested_width: 1536,
+                requested_height: 1024,
+                alternative: Some((1024, 1024)),
+            } if reason == "measured infeasible"
+        ));
+        let neutral = gen_core::Error::from(candle);
+        assert!(matches!(
+            neutral,
+            gen_core::Error::GeometryRefused {
+                requested_width: 1536,
+                requested_height: 1024,
+                alternative: Some((1024, 1024)),
+                ..
+            }
+        ));
     }
 
     #[test]

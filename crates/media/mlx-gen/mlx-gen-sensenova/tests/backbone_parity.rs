@@ -7,7 +7,7 @@
 //! both the understanding (`forward_und`) and generation (`forward_gen`) paths, without the 41 GB
 //! checkpoint. f32 throughout; the tolerance reflects the MLX-Metal-vs-torch f32 matmul floor.
 //!
-//! Run: `cargo test -p mlx-gen-sensenova --test backbone_parity -- --nocapture`
+//! Run: `cargo test -p mlx-gen-sensenova --test integration backbone_parity:: -- --nocapture`
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sensenova::{NeoChatConfig, Path, Qwen3Backbone};

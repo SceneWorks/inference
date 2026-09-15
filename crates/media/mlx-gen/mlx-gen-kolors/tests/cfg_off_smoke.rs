@@ -16,13 +16,12 @@
 //! ChatGLM3-6B + SDXL U-Net + VAE fixture to run it default-green.
 //!
 //!   KOLORS_SNAPSHOT=<Kolors-diffusers dir> [KOLORS_CONTROLNET=<Kolors-ControlNet-Pose dir>] \
-//!     cargo test -p mlx-gen-kolors --release --test cfg_off_smoke -- --ignored --nocapture
+//!     cargo test -p mlx-gen-kolors --release --test integration cfg_off_smoke:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 
 use mlx_gen::{
-    Conditioning, ControlKind, GenerationOutput, GenerationRequest, Image, LoadSpec, Precision,
-    WeightsSource,
+    Conditioning, ControlKind, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource,
 };
 use mlx_gen_kolors::MODEL_ID;
 
@@ -75,20 +74,9 @@ fn synthetic_image() -> Image {
 }
 
 fn spec(base: PathBuf, control: Option<PathBuf>) -> LoadSpec {
-    LoadSpec {
-        weights: WeightsSource::Dir(base),
-        quantize: None,
-        precision: Precision::Bf16,
-        control: control.map(WeightsSource::Dir),
-        ip_adapter: None,
-        adapters: Vec::new(),
-        extra_controls: Vec::new(),
-        pid: None,
-        identity: None,
-        text_encoder: None,
-        offload_policy: Default::default(),
-        components: Default::default(),
-    }
+    let mut spec = LoadSpec::new(WeightsSource::Dir(base));
+    spec.control = control.map(WeightsSource::Dir);
+    spec
 }
 
 /// A `guidance: Some(1.0)` request (CFG off) with the given conditioning. A negative prompt IS set,

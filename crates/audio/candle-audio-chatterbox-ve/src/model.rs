@@ -17,6 +17,7 @@
 //! for cosine similarity; a cloned-voice TTS generator (a future sc-12844 slice) feeds it raw
 //! through [`Conditioning::VoiceEmbedding`](gen_core::generator::Conditioning::VoiceEmbedding).
 
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use candle_audio::candle_core::DType;
@@ -40,33 +41,12 @@ pub const FAMILY: &str = "voice";
 pub const HUB_REPO: &str = "ResembleAI/chatterbox";
 pub const HUB_REVISION: &str = "5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18";
 
-/// The license of the pinned Chatterbox weight checkpoint (sc-13332) — surfaced for SceneWorks'
-/// end-product licenses page. MIT (permissive), verified against the `ResembleAI/chatterbox`
-/// model card.
-pub const WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
-    candle_audio::gen_core::WeightLicense {
-        spdx_id: "MIT",
-        name: "MIT License",
-        source_url: "https://huggingface.co/ResembleAI/chatterbox",
-        attribution: Some("Chatterbox © Resemble AI — licensed under MIT"),
-        commercial_use: true,
-        restriction: None,
-    };
-
-/// This provider's weight-license entry (keyed by [`MODEL_ID`]) for catalog aggregation.
-pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
-    candle_audio::gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: None,
-        license: WEIGHT_LICENSE,
-    };
-
 /// The voice-encoder checkpoint (a single safetensors file inside the pinned repo).
 pub const WEIGHTS_FILE: &str = "ve.safetensors";
 
-/// Minimum reference-clip length (samples, at the source rate) `embed` will accept — one FFT
+/// Minimum reference-clip length (mono frames, at the source rate) `embed` will accept — one FFT
 /// frame is meaningless as an identity cue, so a shorter clip is a typed error, not a silent
-/// degenerate vector.
+/// degenerate vector. Multichannel interleaving does not multiply the effective duration.
 pub const MIN_REFERENCE_SAMPLES: usize = config::N_FFT;
 
 /// Chatterbox voice-encoder identity + advertised shape — constructible without weights
@@ -136,16 +116,30 @@ impl VoiceEmbedder for ChatterboxVoiceEmbedder {
     }
 
     fn embed(&self, audio: &AudioTrack) -> gen_core::Result<VoiceEmbedding> {
-        if audio.samples.len() < MIN_REFERENCE_SAMPLES {
+        if audio.channels == 0 {
             return Err(gen_core::Error::Msg(format!(
-                "{MODEL_ID}: reference clip has {} samples (< {MIN_REFERENCE_SAMPLES}); too short \
-                 to extract a speaker identity",
-                audio.samples.len()
+                "{MODEL_ID}: reference audio channels must be non-zero"
+            )));
+        }
+        let channels = audio.channels as usize;
+        if !audio.samples.len().is_multiple_of(channels) {
+            return Err(gen_core::Error::Msg(format!(
+                "{MODEL_ID}: reference audio has {} samples, not a whole number of {}-channel frames",
+                audio.samples.len(),
+                audio.channels
+            )));
+        }
+        let input_frames = audio.samples.len() / channels;
+        if input_frames < MIN_REFERENCE_SAMPLES {
+            return Err(gen_core::Error::Msg(format!(
+                "{MODEL_ID}: reference clip has {input_frames} frames (< {MIN_REFERENCE_SAMPLES}); \
+                 too short to extract a speaker identity"
             )));
         }
         // Down-mix to mono if the caller handed an interleaved multi-channel clip.
         let mono = to_mono(&audio.samples, audio.channels);
-        let mel = wav_to_mel_frames(&mono, audio.sample_rate).map_err(gen_core::Error::from)?;
+        let mel =
+            wav_to_mel_frames(mono.as_ref(), audio.sample_rate).map_err(gen_core::Error::from)?;
         if mel.is_empty() {
             return Err(gen_core::Error::Msg(format!(
                 "{MODEL_ID}: reference clip produced no analysis frames"
@@ -159,16 +153,18 @@ impl VoiceEmbedder for ChatterboxVoiceEmbedder {
     }
 }
 
-/// Interleaved `channels`-channel PCM → mono by averaging channels (a no-op for mono).
-fn to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
+/// Interleaved `channels`-channel PCM → mono by averaging channels (a borrow for mono).
+fn to_mono(samples: &[f32], channels: u16) -> Cow<'_, [f32]> {
     if channels <= 1 {
-        return samples.to_vec();
+        return Cow::Borrowed(samples);
     }
     let ch = channels as usize;
-    samples
-        .chunks(ch)
-        .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
-        .collect()
+    Cow::Owned(
+        samples
+            .chunks(ch)
+            .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
+            .collect(),
+    )
 }
 
 /// Construct the (lazy) Chatterbox voice embedder from a [`LoadSpec`]. `spec.weights` must be the
@@ -225,7 +221,8 @@ mod tests {
 
     #[test]
     fn load_rejects_unsupported_spec_shapes() {
-        let dir = std::env::temp_dir();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         // A snapshot dir is rejected (single-file provider).
         assert!(load(&LoadSpec::new(WeightsSource::Dir(dir.clone()))).is_err());
         // Quantization is rejected, typed Unsupported.
@@ -236,8 +233,9 @@ mod tests {
 
     #[test]
     fn embed_rejects_a_too_short_clip() {
+        let tmp = tempfile::tempdir().unwrap();
         let e = load(&LoadSpec::new(WeightsSource::File(
-            std::env::temp_dir().join("ve.safetensors"),
+            tmp.path().join("ve.safetensors"),
         )))
         .unwrap();
         let clip = AudioTrack {
@@ -251,11 +249,35 @@ mod tests {
     }
 
     #[test]
+    fn embed_rejects_short_stereo_by_frame_count_before_weight_io() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = load(&LoadSpec::new(WeightsSource::File(
+            tmp.path().join("missing-ve.safetensors"),
+        )))
+        .unwrap();
+        let clip = AudioTrack {
+            // 300 stereo frames are 600 interleaved samples: raw sample count exceeds the old
+            // 400-sample gate, but effective mono duration remains too short.
+            samples: vec![0.0; 300 * 2],
+            sample_rate: 16_000,
+            channels: 2,
+            ..Default::default()
+        };
+        let error = e.embed(&clip).unwrap_err();
+        assert!(error.to_string().contains("300 frames"), "{error}");
+        assert!(error.to_string().contains("too short"), "{error}");
+    }
+
+    #[test]
     fn to_mono_averages_channels() {
         // Stereo [L,R,L,R] → mono average.
         let m = to_mono(&[1.0, 3.0, 2.0, 4.0], 2);
-        assert_eq!(m, vec![2.0, 3.0]);
-        // Mono passthrough.
-        assert_eq!(to_mono(&[1.0, 2.0], 1), vec![1.0, 2.0]);
+        assert_eq!(m.as_ref(), [2.0, 3.0]);
+        assert!(matches!(m, Cow::Owned(_)));
+
+        let mono = [1.0, 2.0];
+        let passthrough = to_mono(&mono, 1);
+        assert!(matches!(passthrough, Cow::Borrowed(_)));
+        assert!(std::ptr::eq(passthrough.as_ptr(), mono.as_ptr()));
     }
 }

@@ -10,6 +10,9 @@
 //! `AdaptableLinear::quantize`.
 
 use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::gen_core::{
+    effective_component_quant, ComponentPrecisionFloor, PrecisionFloorComponent, Quant,
+};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -24,7 +27,7 @@ pub(crate) const GROUP_SIZE: i32 = 64;
 /// `norm_out.linear`, `[6144, 3072]` (`scale, shift = chunk(linear(silu(temb)), 2)`).
 ///
 /// Named here rather than inlined because the **load-time** packer ([`crate::final_layer`]) and the
-/// **offline** converter ([`crate::convert`]) must apply [`FINAL_MOD_MIN_BITS`] to the same tensor or
+/// **offline** converter ([`crate::convert`]) must apply [`COMPONENT_PRECISION_FLOORS`] to the same tensor or
 /// a pre-quantized tier stops matching load-time quantization byte for byte.
 pub(crate) const FINAL_MOD_BASE: &str = "norm_out.linear";
 
@@ -60,7 +63,8 @@ pub(crate) const FINAL_MOD_BASE: &str = "norm_out.linear";
 /// holds too: the whole DiT at Q4 *except* this tensor renders correctly (0.853), and at this
 /// 8-bit floor with everything else at Q4 it renders correctly (0.835) — against 0.329 for the
 /// uniform-Q4 DiT that shipped. (Those three figures hold the text encoder dense, to isolate the
-/// DiT; the end-to-end Q4 tier additionally needs [`LM_LAYER_MIN_BITS`].)
+/// DiT; the end-to-end Q4 tier additionally needs the text-encoder row in
+/// [`COMPONENT_PRECISION_FLOORS`].)
 ///
 /// **Why a floor and not an exclusion.** Keeping it packed at 8 bits costs 18.9 MB against 10.6 MB
 /// at Q4 (a dense bf16 exclusion would cost 37.7 MB), leaves the Q4 tier's quantized-projection
@@ -68,13 +72,14 @@ pub(crate) const FINAL_MOD_BASE: &str = "norm_out.linear";
 /// — only the Q4 artifact changes. Bit-width is derived per tensor from the packed shapes
 /// ([`mlx_gen::quant::packed_bits`]), so a mixed-width artifact needs no loader change and no side
 /// manifest.
+#[cfg(test)]
 pub(crate) const FINAL_MOD_MIN_BITS: i32 = 8;
 
 /// On-disk key prefix of the Qwen3-VL LM's 36 decoder layers — everything under
 /// `model.language_model.layers.` (`self_attn.{q,k,v,o}_proj`, `mlp.{gate,up,down}_proj`).
 ///
 /// The **token embedding** (`model.language_model.embed_tokens`) and the **vision tower**
-/// (`model.visual.*`) sit outside this prefix on purpose; see [`LM_LAYER_MIN_BITS`].
+/// (`model.visual.*`) sit outside this prefix on purpose; see [`COMPONENT_PRECISION_FLOORS`].
 pub(crate) const LM_LAYER_PREFIX: &str = "model.language_model.layers.";
 
 /// The bit-width floor for the LM decoder-layer projections — **8, never 4** (sc-15071).
@@ -91,7 +96,8 @@ pub(crate) const LM_LAYER_PREFIX: &str = "model.language_model.layers.";
 /// usable". It is — *against a dense DiT*. Q4 text and Q4 image weights are not independently
 /// tolerable errors: each alone is recoverable, together they are not.
 ///
-/// **Measured** (same scene/seed as [`FINAL_MOD_MIN_BITS`], luma correlation vs the bf16 render,
+/// **Measured** (same scene/seed as the [`FINAL_MOD_BASE`] evidence above, luma correlation vs the
+/// bf16 render,
 /// always with the **repaired** Q4 DiT so this table isolates the text encoder):
 ///
 /// | embed_tokens | layer attn | layer MLP | luma corr |
@@ -109,7 +115,37 @@ pub(crate) const LM_LAYER_PREFIX: &str = "model.language_model.layers.";
 /// tier's width and its 195 MB saving on the single largest tensor in the model. The floor covers
 /// attention as well as the MLP because attention at Q4 costs a further 0.877 → 0.761 for ~0.25 GB,
 /// which is not a trade worth taking on the tier that has to render correctly.
+#[cfg(test)]
 pub(crate) const LM_LAYER_MIN_BITS: i32 = 8;
+
+/// The binding, descriptor-visible form of Mage's two q4 precision floors. The provider's
+/// load-time and offline packing seams resolve through this table, and SceneWorks reads the same
+/// declarations for effective-tier labels and evidence identity.
+pub const COMPONENT_PRECISION_FLOORS: &[ComponentPrecisionFloor] = &[
+    ComponentPrecisionFloor {
+        component: PrecisionFloorComponent::TextEncoder,
+        selected_tier: Quant::Q4,
+        resident_tier: Quant::Q8,
+    },
+    ComponentPrecisionFloor {
+        component: PrecisionFloorComponent::TransformerHead,
+        selected_tier: Quant::Q4,
+        resident_tier: Quant::Q8,
+    },
+];
+
+/// The descriptor declaration filtered to the floors active for one selected numeric tier.
+///
+/// Both current Mage floors are Q4-only. Q8 and dense BF16 still publish the declaration through
+/// the descriptor, but their request/evidence receipts must be empty: they apply no promotion.
+pub(crate) const fn active_component_precision_floors(
+    selected: Option<Quant>,
+) -> &'static [ComponentPrecisionFloor] {
+    match selected {
+        Some(Quant::Q4) => COMPONENT_PRECISION_FLOORS,
+        _ => &[],
+    }
+}
 
 /// The width `base` is actually packed at when tier `requested` was asked for.
 ///
@@ -119,13 +155,21 @@ pub(crate) const LM_LAYER_MIN_BITS: i32 = 8;
 /// is asserted end-to-end by `a_packed_tier_renders_identically_to_load_time_quantization`
 /// (max_abs 0).
 pub(crate) fn floor_bits(base: &str, requested: i32) -> i32 {
-    if base == FINAL_MOD_BASE {
-        requested.max(FINAL_MOD_MIN_BITS)
+    let selected = match requested {
+        4 => Quant::Q4,
+        8 => Quant::Q8,
+        _ => return requested,
+    };
+    let component = if base == FINAL_MOD_BASE {
+        Some(PrecisionFloorComponent::TransformerHead)
     } else if base.starts_with(LM_LAYER_PREFIX) {
-        requested.max(LM_LAYER_MIN_BITS)
+        Some(PrecisionFloorComponent::TextEncoder)
     } else {
-        requested
-    }
+        None
+    };
+    component.map_or(requested, |component| {
+        effective_component_quant(COMPONENT_PRECISION_FLOORS, component, selected).bits()
+    })
 }
 
 /// Load `{base}` as an [`AdaptableLinear`], packed when `{base}.scales` is present, else dense.
@@ -135,4 +179,53 @@ pub(crate) fn floor_bits(base: &str, requested: i32) -> i32 {
 /// quantization zero-point that rides with a packed weight.
 pub(crate) fn lin(w: &Weights, base: &str, bias: bool) -> Result<AdaptableLinear> {
     mlx_gen::quant::lin(w, base, bias, GROUP_SIZE)
+}
+
+#[cfg(test)]
+mod descriptor_floor_tests {
+    use super::*;
+
+    #[test]
+    fn q4_floors_are_visible_through_every_mage_descriptor() {
+        for variant in crate::model::MageVariant::ALL {
+            assert_eq!(
+                crate::model::descriptor_for(variant)
+                    .capabilities
+                    .component_precision_floors,
+                COMPONENT_PRECISION_FLOORS
+            );
+        }
+        assert_eq!(floor_bits(FINAL_MOD_BASE, 4), 8);
+        assert_eq!(floor_bits(LM_LAYER_PREFIX, 4), 8);
+        assert_eq!(floor_bits(FINAL_MOD_BASE, 8), 8);
+        assert_eq!(floor_bits(LM_LAYER_PREFIX, 8), 8);
+        assert_eq!(floor_bits("proj_out", 4), 4);
+        assert_eq!(floor_bits("model.language_model.embed_tokens", 4), 4);
+        assert_eq!(FINAL_MOD_MIN_BITS, Quant::Q8.bits());
+        assert_eq!(LM_LAYER_MIN_BITS, Quant::Q8.bits());
+        for (base, component) in [
+            (FINAL_MOD_BASE, PrecisionFloorComponent::TransformerHead),
+            (LM_LAYER_PREFIX, PrecisionFloorComponent::TextEncoder),
+        ] {
+            for selected in [Quant::Q4, Quant::Q8] {
+                let from_table =
+                    effective_component_quant(COMPONENT_PRECISION_FLOORS, component, selected)
+                        .bits();
+                assert_eq!(floor_bits(base, selected.bits()), from_table);
+                assert_eq!(
+                    crate::convert::quant_floor_bits(base, selected.bits()),
+                    from_table
+                );
+            }
+        }
+        assert!(COMPONENT_PRECISION_FLOORS
+            .iter()
+            .all(|floor| { floor.selected_tier == Quant::Q4 && floor.resident_tier == Quant::Q8 }));
+        assert_eq!(
+            active_component_precision_floors(Some(Quant::Q4)),
+            COMPONENT_PRECISION_FLOORS
+        );
+        assert!(active_component_precision_floors(Some(Quant::Q8)).is_empty());
+        assert!(active_component_precision_floors(None).is_empty());
+    }
 }

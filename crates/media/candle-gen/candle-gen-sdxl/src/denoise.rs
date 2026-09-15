@@ -24,17 +24,19 @@
 //! `eps = eps_uncond + cfg·(eps_cond − eps_uncond)` — so the caller must batch `conditioning` /
 //! `pooled` / `time_ids` / the face tokens in that order.
 
+use crate::SdxlVaeDecoder;
 use candle_core::{DType, Device, IndexOp, Tensor};
-use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::DiscreteModelSampling;
-use candle_gen::gen_core::{Image, Progress};
+use candle_gen::gen_core::{self, Image, Progress};
 use candle_gen::{CandleError, LatentDecoder, Result};
 
-use crate::pipeline::VAE_SCALE;
+use candle_gen::gen_core::tiling::TilingConfig;
+
+use crate::pipeline::SdxlLatentDecoder;
 use crate::sampler::EulerAncestralSampler;
 use crate::unet::{ControlNet, ControlResiduals, UNet2DConditionModel};
 
@@ -148,29 +150,55 @@ pub fn preprocess_control_image(
 /// post-process), reading the output size from the decoded tensor (never `latent·8`, since PiD emits a
 /// larger `[1, 3, 4H, 4W]`).
 ///
-/// **Latent convention (sc-7848 parity):** the native VAE path un-scales by `VAE_SCALE` (candle
-/// de-scales in the pipeline, not inside `vae.decode`), while the PiD `sdxl` student was trained on the
-/// **0.13025-normalized** latent — the scaled sampler output — so it receives `latents` unchanged.
-/// This mirrors `crate::pipeline::Pipeline::decode` exactly.
+/// **Latent convention (sc-7848 parity):** the seam receives the **0.13025-normalized** sampler
+/// latent. [`SdxlLatentDecoder`] owns the native VAE's `1 / VAE_SCALE` de-normalization, while the
+/// PiD `sdxl` student consumes the normalized latent unchanged. This mirrors
+/// `crate::pipeline::Pipeline::decode` exactly.
 ///
-/// The native VAE decode routes through the shared `crate::pipeline::tiled_vae_decode` (F-061 /
+/// The native VAE decode routes through the shared [`LatentDecoder::decode_tiled`] seam (F-061 /
 /// sc-9045), so every bespoke lane that calls this — the trainer preview, the IP / edit / InstantID
 /// providers — gets the same sc-4987 budgeted VAE tiling the registered
 /// `crate::pipeline::Pipeline::decode` path uses. The tiling only bounds peak VRAM on large latents
 /// (>512² output); ≤512² decodes are byte-identical to the prior monolithic path. `pid = None` is
 /// byte-identical to the pre-sc-8373 signature.
 pub fn decode_image(
-    vae: &AutoEncoderKL,
+    vae: &SdxlVaeDecoder,
     latents: &Tensor,
     pid: Option<&dyn LatentDecoder>,
+    cancel: Option<&CancelFlag>,
 ) -> Result<Image> {
-    let img = match pid {
-        // PiD decodes (and 4× super-resolves) the normalized latent directly — no VAE de-scale.
-        Some(pid) => pid.decode(latents)?,
-        None => {
-            let unscaled = (latents / VAE_SCALE)?;
-            crate::pipeline::tiled_vae_decode(vae, &unscaled)?
-        }
+    decode_image_with_tiling(vae, latents, pid, cancel, decode_tiling(None))
+}
+
+/// Resolve the bounded-decode geometry for one request from its selected memory plan.
+///
+/// `None` means "decode monolithically" — either the process-global tiling gate is off, or the
+/// selection did not engage the bounded-decode rung. Otherwise the tile edge and overlap are the
+/// ones the selector chose from the contract's published ranges, so declared, validated and
+/// executed are one value (sc-20799).
+pub fn decode_tiling(memory: Option<gen_core::GenerationMemory>) -> Option<TilingConfig> {
+    let enabled = memory
+        .map(|memory| memory.tile_vae_decode)
+        .unwrap_or_else(crate::vae_tiling_enabled);
+    enabled.then(|| crate::memory_strategy::decode_tiling_config(memory))
+}
+
+pub fn decode_image_with_tiling(
+    vae: &SdxlVaeDecoder,
+    latents: &Tensor,
+    pid: Option<&dyn LatentDecoder>,
+    cancel: Option<&CancelFlag>,
+    tiling: Option<TilingConfig>,
+) -> Result<Image> {
+    let native = SdxlLatentDecoder::new(vae);
+    let decoder: &dyn LatentDecoder = pid.unwrap_or(&native);
+    if cancel.is_some_and(CancelFlag::is_cancelled) {
+        return Err(CandleError::Canceled);
+    }
+    candle_gen::ensure_decoder_compatible(Some(&candle_gen::gen_core::SDXL_LATENT_SPACE), decoder)?;
+    let img = match &tiling {
+        Some(tiling) => decoder.decode_tiled(latents, tiling, cancel)?,
+        None => decoder.decode(latents)?,
     };
     let img = ((img / 2.)? + 0.5)?.clamp(0f32, 1f32)?;
     let scaled = (img * 255.)?;
@@ -237,6 +265,7 @@ pub fn denoise_ip_multi_control(
     rng: &mut StdRng,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
+    preview: &gen_core::PreviewSink,
     controls: &[ControlContext],
     controlnet_encoder: &Tensor,
 ) -> Result<Tensor> {
@@ -252,11 +281,20 @@ pub fn denoise_ip_multi_control(
         let (_, c, h, w) = latents.dims4()?;
         (c, h, w)
     };
+    // Per-step latent preview (epic 16948, sc-16954). A bespoke loop, so it numbers frames itself, on
+    // the STEP INDEX — this schedule is a `(t, t_prev)` timestep pair list, not a descending σ array.
+    // No renormalization is applied here and none is wanted: euler-ancestral folds the input scaling
+    // into its own step ("the UNet input is the raw latents", below), so `latents` is ALREADY in the
+    // domain the reused fit was measured in — this is the very lane it was measured on.
+    let preview_counter = candle_gen::preview::PreviewCounter::with_steps(steps.len());
 
     for (i, &(t, t_prev)) in steps.iter().enumerate() {
         if cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
+        candle_gen::preview::emit_preview_at(preview, &preview_counter, i, || {
+            crate::preview::project_spatial_latents(&latents)
+        });
         // Euler-ancestral folds the input renormalization into its step (the sampler's `step` applies
         // `rsqrt(σ_prev²+1)`), so the UNet input is the raw latents — no `scale_model_input`. CFG runs
         // the cond + uncond rows in one batched forward.
@@ -339,6 +377,7 @@ pub fn denoise_ip_control(
     rng: &mut StdRng,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
+    preview: &gen_core::PreviewSink,
     control: &ControlContext,
     controlnet_encoder: &Tensor,
 ) -> Result<Tensor> {
@@ -353,6 +392,7 @@ pub fn denoise_ip_control(
         rng,
         cancel,
         on_progress,
+        preview,
         std::slice::from_ref(control),
         controlnet_encoder,
     )
@@ -401,6 +441,7 @@ pub fn denoise_curated(
     seed: u64,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
+    preview: Option<&candle_gen::preview::PreviewHook<'_>>,
     controls: &[ControlContext],
     controlnet_encoder: &Tensor,
 ) -> Result<Tensor> {
@@ -413,6 +454,7 @@ pub fn denoise_curated(
         seed,
         cancel,
         on_progress,
+        preview,
         |x_in, timestep| -> Result<Tensor> {
             // `x_in` is the `1/√(σ²+1)`-scaled latent (f32 from the solver); cast to the UNet compute
             // dtype, then CFG-batch the single row to [uncond, cond].
@@ -659,6 +701,7 @@ mod tests {
                 &mut rng,
                 &cancel,
                 &mut prog,
+                &gen_core::PreviewSink::default(),
                 &[],
                 &c.text,
             )
@@ -695,6 +738,7 @@ mod tests {
             &mut rng,
             &cancel,
             &mut prog,
+            &gen_core::PreviewSink::default(),
             &[],
             &c.text,
         );
@@ -757,6 +801,7 @@ mod tests {
                 &mut rng,
                 &cancel,
                 &mut prog,
+                &gen_core::PreviewSink::default(),
                 &cc,
                 &c.text, // the face tokens are the ControlNet cross-attn conditioning
             )
@@ -834,6 +879,7 @@ mod tests {
                 3,
                 &cancel,
                 &mut prog,
+                None,
                 std::slice::from_ref(&cc),
                 &c.text, // the face/control cross-attn conditioning
             )
@@ -890,6 +936,7 @@ mod tests {
             3,
             &cancel,
             &mut prog,
+            None,
             &[],
             &c.text,
         );

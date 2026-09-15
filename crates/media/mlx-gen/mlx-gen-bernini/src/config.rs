@@ -223,11 +223,10 @@ mod tests {
     fn corrupt_sidecar_is_an_error_not_a_silent_revert() {
         // A PRESENT-but-corrupt sidecar must surface (F-097) rather than reverting every knob to
         // default. Write a garbage file into a temp dir and confirm `from_dir` errors.
-        let dir = std::env::temp_dir().join(format!("bernini_knobs_test_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         std::fs::write(dir.join("bernini_renderer.json"), b"{ not valid json").unwrap();
         let r = BerniniKnobs::from_dir(&dir);
-        std::fs::remove_dir_all(&dir).ok();
         assert!(r.is_err(), "corrupt sidecar must be an error");
     }
 

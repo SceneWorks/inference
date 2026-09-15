@@ -17,7 +17,7 @@
 //! `e2e_parity.rs`); the routing/structure gates stay exact.
 //!
 //! `#[ignore]`d: needs the real `ltx_2_3_base_q8` weights (~20 GB) + the golden's LoRA. Run:
-//! `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test av_lora_e2e_parity -- --ignored --nocapture`
+//! `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test integration av_lora_e2e_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, gt, max as max_op, subtract, sum};
 use mlx_rs::{Array, Dtype};

@@ -26,7 +26,6 @@
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
 
-use mlx_gen::adapters::loader::apply_adapters_strict_with_diff_patch;
 use mlx_gen::array::scalar;
 use mlx_gen::image::{decoded_to_image, validate_multiple_of};
 use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
@@ -34,17 +33,18 @@ use mlx_gen::media::Image;
 use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{
-    resolve_flow_schedule, run_flow_sampler, CancelFlag, LatentDecoder, Progress, Result,
-    TimestepConvention,
+    resolve_flow_schedule, run_flow_sampler, CancelFlag, Error, LatentDecoder, PreviewSink,
+    Progress, Result, TimestepConvention, WeightsSource,
 };
 
 use std::path::Path;
 
 use std::cell::RefCell;
-use std::path::PathBuf;
 
 use crate::control::Krea2ControlBranch;
-use crate::loader::{load_text_encoder, load_transformer, load_vision_tower};
+use crate::loader::{
+    load_text_encoder_from_source, load_transformer_with_stream, load_vision_tower_from_source,
+};
 use crate::multiphase::{PhaseSlice, ResolvedPhase};
 use crate::schedule::{dynamic_mu, krea_sigmas, turbo_sigmas, TURBO_MU};
 use crate::text_encoder::{
@@ -53,6 +53,63 @@ use crate::text_encoder::{
 use crate::transformer::{EditPrep, JointPrep, Krea2Transformer};
 use crate::vae::{load_vae, QwenVae};
 use mlx_gen_boogu::VisionTower;
+
+/// One Krea denoise trajectory's preview state. The Qwen provider owns the fitted projection;
+/// Krea owns schedule slicing and therefore the counter that numbers frames across this route.
+struct KreaPreview<'a> {
+    sink: &'a PreviewSink,
+    counter: mlx_gen::preview::PreviewCounter,
+    sigmas: &'a [f32],
+}
+
+impl<'a> KreaPreview<'a> {
+    fn new(sink: &'a PreviewSink, sigmas: &'a [f32]) -> Self {
+        Self {
+            sink,
+            counter: mlx_gen::preview::PreviewCounter::new(sigmas),
+            sigmas,
+        }
+    }
+
+    fn emit(&self, sigma: f32, latents: &Array) {
+        mlx_gen_qwen_image::preview::emit_spatial_preview(
+            self.sink,
+            &self.counter,
+            self.sigmas,
+            sigma,
+            latents,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_krea_sampler<F>(
+    sampler: Option<&str>,
+    sigmas: &[f32],
+    latents: Array,
+    seed: u64,
+    cancel: &CancelFlag,
+    preview: &KreaPreview<'_>,
+    on_progress: &mut dyn FnMut(Progress),
+    mut predict: F,
+) -> Result<Array>
+where
+    F: FnMut(&Array, f32) -> Result<Array>,
+{
+    run_flow_sampler(
+        sampler,
+        TimestepConvention::Sigma,
+        sigmas,
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        |x, timestep| {
+            preview.emit(timestep, x);
+            predict(x, timestep)
+        },
+    )
+}
 
 /// Turbo text-to-image knobs, resolved from the [`crate::model`] request. Dimensions are validated at
 /// the Generator layer (multiple-of-16, in the resolution range) before the pipeline runs.
@@ -65,6 +122,47 @@ pub struct TurboOptions {
     pub sampler: Option<String>,
     /// Curated scheduler override. `None` = the native exponential-mu schedule.
     pub scheduler: Option<String>,
+    /// MLX DiT blocks held at once. `None` keeps the resident straight-through path.
+    pub transformer_window_size: Option<usize>,
+    /// Request-scoped shared-ladder levers. The default preserves the historical unbounded paths.
+    pub memory: mlx_gen::gen_core::GenerationMemory,
+    /// Descriptor id of the provider driving this render. Names the provider in the decode-boundary
+    /// calibration fault (sc-22738), where the model layer's descriptor is out of scope.
+    pub provider_id: &'static str,
+}
+
+impl TurboOptions {
+    fn attention_plan<'a>(&self, cancel: &'a CancelFlag) -> mlx_gen::attention::AttentionPlan<'a> {
+        if self.memory.chunk_attention {
+            mlx_gen::attention::AttentionPlan::budgeted(
+                mlx_gen::attention::AttentionBudget::from_score_elements(
+                    self.memory
+                        .attention_chunk_size
+                        .unwrap_or(mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as u32)
+                        as u64,
+                    true,
+                ),
+            )
+            .with_cancel(cancel)
+        } else {
+            mlx_gen::attention::AttentionPlan::UNBOUNDED
+        }
+    }
+
+    fn decode_tiling(&self) -> Result<Option<TilingConfig>> {
+        if self.memory.tile_vae_decode {
+            Ok(Some(TilingConfig::spatial_only(
+                self.memory.decode_tile_edge.ok_or_else(|| {
+                    Error::Unsupported("krea: bounded decode requires a selected tile edge".into())
+                })? as i32,
+                self.memory.decode_overlap.ok_or_else(|| {
+                    Error::Unsupported("krea: bounded decode requires a selected overlap".into())
+                })? as i32,
+            )))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 /// The **text-encode phase** of a Krea 2 pipeline (epic 10834 Phase 1, sc-11101): tokenizer +
@@ -75,9 +173,9 @@ pub struct TurboOptions {
 pub struct KreaText {
     tok: KreaTokenizer,
     te: KreaTextEncoder,
-    /// Snapshot root, retained so the vision tower can be loaded lazily on the first grounded encode
-    /// (F-072) rather than eagerly for every variant.
-    root: PathBuf,
+    /// The checkpoint-coupled visual tower remains on the builtin multimodal source when the
+    /// language tower is substituted.
+    vision_encoder_source: mlx_gen::gen_core::ValidatedEncoderSource,
     /// Qwen3-VL vision tower for image-grounded (edit) encoding (epic 10871 P2). LAZY (F-072): `None`
     /// until the first `encode_grounded`/`run_vision`, so the Turbo/Raw t2i, img2img, and pose-control
     /// paths — which never ground on an image — pay neither its ~0.6 GB residency nor its load time,
@@ -92,10 +190,23 @@ impl KreaText {
     /// first grounded (edit) encode via [`Self::ensure_vision`].
     pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
+        let selected = crate::model::runtime_encoder_contract().source_for_load(
+            &mlx_gen::LoadSpec::new(WeightsSource::Dir(root.to_path_buf())),
+            root,
+        )?;
+        Self::from_snapshot_with_text_encoder(root, &selected)
+    }
+
+    pub(crate) fn from_snapshot_with_text_encoder(
+        root: &Path,
+        text_encoder_source: &mlx_gen::gen_core::ValidatedEncoderSource,
+    ) -> Result<Self> {
+        let vision_encoder_source = resolve_vision_encoder_source(root)?;
         Ok(Self {
-            tok: KreaTokenizer::from_snapshot(root)?,
-            te: load_text_encoder(root)?,
-            root: root.to_path_buf(),
+            tok: KreaTokenizer::from_validated_source(text_encoder_source)?,
+            te: text_encoder_source
+                .read_unchanged(|source| load_text_encoder_from_source(root, source))?,
+            vision_encoder_source,
             vision: RefCell::new(None),
         })
     }
@@ -105,6 +216,10 @@ impl KreaText {
     /// quant-target set — the monolithic `KreaPipeline::quantize` did `te` + `dit`, not the VAE/vision).
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         self.te.quantize(bits)
+    }
+
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        self.te.materialize_weights()
     }
 
     /// Encode a plain text prompt → the DiT text context `[1, n_tok, 12, 2560]` (the 12 selected
@@ -121,7 +236,10 @@ impl KreaText {
     /// never pay for it. Idempotent.
     pub fn ensure_vision(&self) -> Result<()> {
         if self.vision.borrow().is_none() {
-            let tower = load_vision_tower(&self.root)?;
+            let tower = read_validated_vision_source(
+                &self.vision_encoder_source,
+                load_vision_tower_from_source,
+            )?;
             *self.vision.borrow_mut() = Some(tower);
         }
         Ok(())
@@ -158,6 +276,24 @@ impl KreaText {
         let gv = self.run_vision(sources)?;
         self.encode_grounded_from_vision(&gv, prompt)
     }
+}
+
+fn resolve_vision_encoder_source(root: &Path) -> Result<mlx_gen::gen_core::ValidatedEncoderSource> {
+    crate::model::runtime_encoder_contract()
+        .validate_source(&WeightsSource::Dir(root.join("text_encoder")))
+        .map_err(Into::into)
+}
+
+/// Validate the edit-only vision config/header contract immediately before the lazy backend read.
+fn read_validated_vision_source<T>(
+    source: &mlx_gen::gen_core::ValidatedEncoderSource,
+    read: impl FnOnce(&WeightsSource) -> Result<T>,
+) -> Result<T> {
+    source.validate_vision(
+        &crate::model::runtime_vision_encoder_contract(),
+        &crate::model::runtime_encoder_contract(),
+    )?;
+    source.read_unchanged(read)
 }
 
 /// The **heavy render phase** of a Krea 2 pipeline (epic 10834 Phase 1, sc-11101): the single-stream
@@ -214,12 +350,227 @@ pub struct ControlPlan {
 }
 
 impl KreaHeavy {
+    #[allow(clippy::too_many_arguments)]
+    fn prepared_cfg_velocity(
+        dit: &Krea2Transformer,
+        latent: &Array,
+        timestep: &Array,
+        positive: &JointPrep,
+        negative: Option<&JointPrep>,
+        guidance: f32,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: mlx_gen::attention::AttentionPlan<'_>,
+    ) -> Result<Array> {
+        match negative {
+            Some(negative) => {
+                let (positive, negative) = dit.forward_prepared_pair_windowed_budgeted(
+                    latent, timestep, positive, negative, window, attention,
+                )?;
+                krea_cfg_combine(&positive, &negative, guidance)
+            }
+            None => dit
+                .forward_prepared_windowed_budgeted(latent, timestep, positive, window, attention),
+        }
+    }
+
+    #[cfg(test)]
+    fn base_t2i_velocity(
+        dit: &Krea2Transformer,
+        latent: &Array,
+        timestep: &Array,
+        plan: &T2iPlan,
+        guidance: f32,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<Array> {
+        Self::base_t2i_velocity_budgeted(
+            dit,
+            latent,
+            timestep,
+            plan,
+            guidance,
+            window,
+            mlx_gen::attention::AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    fn base_t2i_velocity_budgeted(
+        dit: &Krea2Transformer,
+        latent: &Array,
+        timestep: &Array,
+        plan: &T2iPlan,
+        guidance: f32,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: mlx_gen::attention::AttentionPlan<'_>,
+    ) -> Result<Array> {
+        Self::prepared_cfg_velocity(
+            dit,
+            latent,
+            timestep,
+            &plan.prep_pos,
+            plan.prep_neg.as_ref(),
+            guidance,
+            window,
+            attention,
+        )
+    }
+
+    #[cfg(test)]
+    fn multiphase_velocity(
+        dit: &Krea2Transformer,
+        latent: &Array,
+        timestep: &Array,
+        plan: &T2iPlan,
+        guidance: f32,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<Array> {
+        Self::multiphase_velocity_budgeted(
+            dit,
+            latent,
+            timestep,
+            plan,
+            guidance,
+            window,
+            mlx_gen::attention::AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    fn multiphase_velocity_budgeted(
+        dit: &Krea2Transformer,
+        latent: &Array,
+        timestep: &Array,
+        plan: &T2iPlan,
+        guidance: f32,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: mlx_gen::attention::AttentionPlan<'_>,
+    ) -> Result<Array> {
+        let negative = if guidance > 0.0 {
+            Some(plan.prep_neg.as_ref().ok_or_else(|| {
+                mlx_gen::Error::Msg(
+                    "krea_2 multi-phase: a CFG phase (guidance > 0) requires the \
+                     unconditional prep, but the plan was built without one"
+                        .into(),
+                )
+            })?)
+        } else {
+            None
+        };
+        Self::prepared_cfg_velocity(
+            dit,
+            latent,
+            timestep,
+            &plan.prep_pos,
+            negative,
+            guidance,
+            window,
+            attention,
+        )
+    }
+
+    #[cfg(test)]
+    fn base_img2img_velocity(
+        dit: &Krea2Transformer,
+        latent: &Array,
+        timestep: &Array,
+        plan: &Img2ImgPlan,
+        guidance: f32,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<Array> {
+        Self::base_img2img_velocity_budgeted(
+            dit,
+            latent,
+            timestep,
+            plan,
+            guidance,
+            window,
+            mlx_gen::attention::AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    fn base_img2img_velocity_budgeted(
+        dit: &Krea2Transformer,
+        latent: &Array,
+        timestep: &Array,
+        plan: &Img2ImgPlan,
+        guidance: f32,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: mlx_gen::attention::AttentionPlan<'_>,
+    ) -> Result<Array> {
+        Self::prepared_cfg_velocity(
+            dit,
+            latent,
+            timestep,
+            &plan.prep_pos,
+            plan.prep_neg.as_ref(),
+            guidance,
+            window,
+            attention,
+        )
+    }
+
+    #[cfg(test)]
+    fn edit_velocity(
+        dit: &Krea2Transformer,
+        latent: &Array,
+        timestep: &Array,
+        plan: &EditPlan,
+        guidance: f32,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<Array> {
+        Self::edit_velocity_budgeted(
+            dit,
+            latent,
+            timestep,
+            plan,
+            guidance,
+            window,
+            mlx_gen::attention::AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    fn edit_velocity_budgeted(
+        dit: &Krea2Transformer,
+        latent: &Array,
+        timestep: &Array,
+        plan: &EditPlan,
+        guidance: f32,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: mlx_gen::attention::AttentionPlan<'_>,
+    ) -> Result<Array> {
+        match &plan.prep_neg {
+            Some(negative) => {
+                let (positive, negative) = dit.forward_prepared_edit_pair_windowed_budgeted(
+                    latent,
+                    timestep,
+                    &plan.prep_pos,
+                    negative,
+                    window,
+                    attention,
+                )?;
+                krea_cfg_combine(&positive, &negative, guidance)
+            }
+            None => dit.forward_prepared_edit_windowed_budgeted(
+                latent,
+                timestep,
+                &plan.prep_pos,
+                window,
+                attention,
+            ),
+        }
+    }
+
     /// Load the single-stream DiT + Qwen-Image VAE from a Krea 2 snapshot's `transformer/` + `vae/`
     /// dirs.
     pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
+        Self::from_snapshot_with_stream(root, false)
+    }
+
+    pub(crate) fn from_snapshot_with_stream(
+        root: impl AsRef<Path>,
+        streamable: bool,
+    ) -> Result<Self> {
         let root = root.as_ref();
         Ok(Self {
-            dit: load_transformer(root)?,
+            dit: load_transformer_with_stream(root, streamable)?,
             vae: load_vae(root)?,
         })
     }
@@ -241,7 +592,8 @@ impl KreaHeavy {
     }
 
     /// Install Raw-trained LoRA/LoKr adapters onto the single-stream DiT (sc-7911). The shared
-    /// [`apply_adapters_strict_with_diff_patch`] seam parses PEFT/diffusers/kohya/LoKr files, folds
+    /// [`mlx_gen::adapters::loader::apply_adapters_strict_with_diff_patch`] parses
+    /// PEFT/diffusers/kohya/LoKr files, folds
     /// alpha/rank, and pushes a residual onto each matched `AdaptableLinear` — erroring (never silently
     /// dropping) on an adapter target that matches no module. The `Krea2Transformer` adapter host routes
     /// the trained `transformer_blocks.{i}.attn.{to_q,to_k,to_v,to_out.0}` paths (+ `text_fusion` +
@@ -254,8 +606,7 @@ impl KreaHeavy {
     /// low-rank residual pass, and dense on every tier (the projector is never quantized), so the fold
     /// survives the subsequent `quantize`.
     pub fn apply_adapters(&mut self, specs: &[AdapterSpec]) -> Result<()> {
-        apply_adapters_strict_with_diff_patch(&mut self.dit, specs, "krea_2")?;
-        Ok(())
+        self.dit.apply_adapters_strict(specs, true)
     }
 
     /// A **geometry-only** target latent `[1, 16, H/8, W/8]` of zeros (F-073). The step-invariant
@@ -292,6 +643,7 @@ impl KreaHeavy {
     /// **Turbo t2i render from a hoisted plan** (F-073) — one image at `opts.seed`, reusing the
     /// [`T2iPlan`] built once per request. Byte-identical to the pre-hoist [`Self::render_turbo`] (the
     /// prep only depended on the latent geometry, not the noise values).
+    #[allow(clippy::too_many_arguments)]
     pub fn render_turbo_from(
         &self,
         plan: &T2iPlan,
@@ -299,27 +651,39 @@ impl KreaHeavy {
         decoder: Option<&dyn LatentDecoder>,
         keep: usize,
         cancel: &CancelFlag,
+        preview: &PreviewSink,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
         let full = turbo_schedule(opts.steps, opts.scheduler.as_deref());
         let sigmas = &full[..keep.min(full.len())];
-        let lat = run_flow_sampler(
+        let block_window = self
+            .dit
+            .block_window(opts.transformer_window_size, cancel)?;
+        let attention = opts.attention_plan(cancel);
+        let previews = KreaPreview::new(preview, sigmas);
+        let lat = run_krea_sampler(
             opts.sampler.as_deref(),
-            TimestepConvention::Sigma,
             sigmas,
             noise,
             opts.seed,
             cancel,
+            &previews,
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let v = self.dit.forward_prepared(x, &t, &plan.prep_pos)?;
+                let v = self.dit.forward_prepared_windowed_budgeted(
+                    x,
+                    &t,
+                    &plan.prep_pos,
+                    block_window,
+                    attention,
+                )?;
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
         )?;
         on_progress(Progress::Decoding);
-        self.decode_latents(&lat, decoder)
+        self.decode_latents(&lat, decoder, opts, cancel)
     }
 
     /// **Turbo t2i render** — the denoise/decode body of [`KreaPipeline::generate_turbo_with_progress`]
@@ -339,7 +703,15 @@ impl KreaHeavy {
         // is shared across seeds.
         validate_multiple_of(opts.width, opts.height, crate::RES_MULTIPLE, "krea_2_turbo")?;
         let plan = self.prepare_t2i(context, None, opts.width, opts.height)?;
-        self.render_turbo_from(&plan, opts, decoder, keep, cancel, on_progress)
+        self.render_turbo_from(
+            &plan,
+            opts,
+            decoder,
+            keep,
+            cancel,
+            &PreviewSink::default(),
+            on_progress,
+        )
     }
 
     /// **Pose-ControlNet Turbo render** (sc-8465, epic 8459 S5) — the denoise/decode body of
@@ -363,15 +735,18 @@ impl KreaHeavy {
         // Single-image convenience; the count loop in [`crate::model_control`] calls `prepare_control`
         // + `render_control_from` directly so the pose encode + prep are shared across seeds (F-073).
         // This convenience path (KreaPipeline delegator + weight-gated tests) always decodes single-pass
-        // (`None`); the budget-gated tiled decode is threaded by the `Generator` seam (`model_control`).
+        // (`None`); a worker-selected bounded decode is threaded by the `Generator` seam
+        // (`model_control`).
         let plan = self.prepare_control(context, control_image, opts.width, opts.height)?;
         self.render_control_from(
             &plan,
             branch,
             control_scale,
             None,
+            None,
             opts,
             cancel,
+            &PreviewSink::default(),
             on_progress,
         )
     }
@@ -414,20 +789,27 @@ impl KreaHeavy {
         plan: &ControlPlan,
         branch: &Krea2ControlBranch,
         control_scale: f32,
+        decoder: Option<&dyn LatentDecoder>,
         decode_tiling: Option<&TilingConfig>,
         opts: &TurboOptions,
         cancel: &CancelFlag,
+        preview: &PreviewSink,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
         let sigmas = turbo_schedule(opts.steps, opts.scheduler.as_deref());
-        let lat = run_flow_sampler(
+        let block_window = self
+            .dit
+            .block_window(opts.transformer_window_size, cancel)?;
+        let attention = opts.attention_plan(cancel);
+        let previews = KreaPreview::new(preview, &sigmas);
+        let lat = run_krea_sampler(
             opts.sampler.as_deref(),
-            TimestepConvention::Sigma,
             &sigmas,
             noise,
             opts.seed,
             cancel,
+            &previews,
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
@@ -438,13 +820,25 @@ impl KreaHeavy {
                     &plan.prep,
                     &plan.ctrl_tokens,
                     control_scale,
+                    block_window,
+                    attention,
                 )?;
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
         )?;
 
+        // SC-15449/sc-22738: the pose-control denoise exit — `lat` is this image's produced latent —
+        // through the same authorized gate as every other Krea route (the former literal here
+        // honoured the phase without the harness authorization conjunct, so an unauthorized phase
+        // selection could refuse a real render).
+        denoise_exit_fault(&lat, opts)?;
         on_progress(Progress::Decoding);
-        self.decode_latents_native_tiled(&lat, decode_tiling, cancel)
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let image = self.decode_latents_with_tiling(&lat, decoder, decode_tiling, cancel)?;
+        decode_exit_fault(opts)?;
+        Ok(image)
     }
 
     /// **img2img latent-init Turbo render** (epic 8588 slice A; sc-8589/sc-8590) — the denoise/decode
@@ -476,6 +870,7 @@ impl KreaHeavy {
             decoder,
             usize::MAX,
             cancel,
+            &PreviewSink::default(),
             on_progress,
         )
     }
@@ -523,6 +918,7 @@ impl KreaHeavy {
         decoder: Option<&dyn LatentDecoder>,
         keep: usize,
         cancel: &CancelFlag,
+        preview: &PreviewSink,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
@@ -537,23 +933,34 @@ impl KreaHeavy {
         let end = keep.min(full.len());
         let sigmas = &full[start..end];
         let x_start = add_noise_by_interpolation(&plan.clean, &noise, full[start])?;
-        let lat = run_flow_sampler(
+        let block_window = self
+            .dit
+            .block_window(opts.transformer_window_size, cancel)?;
+        let attention = opts.attention_plan(cancel);
+        let previews = KreaPreview::new(preview, sigmas);
+        let lat = run_krea_sampler(
             opts.sampler.as_deref(),
-            TimestepConvention::Sigma,
             sigmas,
             x_start,
             opts.seed,
             cancel,
+            &previews,
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let v = self.dit.forward_prepared(x, &t, &plan.prep_pos)?;
+                let v = self.dit.forward_prepared_windowed_budgeted(
+                    x,
+                    &t,
+                    &plan.prep_pos,
+                    block_window,
+                    attention,
+                )?;
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
         )?;
 
         on_progress(Progress::Decoding);
-        self.decode_latents(&lat, decoder)
+        self.decode_latents(&lat, decoder, opts, cancel)
     }
 
     /// **Raw true-CFG t2i render** (`krea_2_raw`) — the denoise/decode body of
@@ -578,7 +985,16 @@ impl KreaHeavy {
         // `render_base_from` directly so the preps are shared across seeds (F-073).
         validate_multiple_of(opts.width, opts.height, crate::RES_MULTIPLE, "krea_2_raw")?;
         let plan = self.prepare_t2i(ctx_pos, ctx_neg, opts.width, opts.height)?;
-        self.render_base_from(&plan, guidance, opts, decoder, keep, cancel, on_progress)
+        self.render_base_from(
+            &plan,
+            guidance,
+            opts,
+            decoder,
+            keep,
+            cancel,
+            &PreviewSink::default(),
+            on_progress,
+        )
     }
 
     /// **Raw true-CFG t2i render from a hoisted plan** (F-073) — one image at `opts.seed`, reusing the
@@ -593,6 +1009,7 @@ impl KreaHeavy {
         decoder: Option<&dyn LatentDecoder>,
         keep: usize,
         cancel: &CancelFlag,
+        preview: &PreviewSink,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
@@ -606,30 +1023,36 @@ impl KreaHeavy {
             opts.scheduler.as_deref(),
         );
         let sigmas = &full[..keep.min(full.len())];
-        let lat = run_flow_sampler(
+        let block_window = self
+            .dit
+            .block_window(opts.transformer_window_size, cancel)?;
+        let attention = opts.attention_plan(cancel);
+        let previews = KreaPreview::new(preview, sigmas);
+        let lat = run_krea_sampler(
             opts.sampler.as_deref(),
-            TimestepConvention::Sigma,
             sigmas,
             noise,
             opts.seed,
             cancel,
+            &previews,
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let cond = self.dit.forward_prepared(x, &t, &plan.prep_pos)?;
-                let v = match &plan.prep_neg {
-                    Some(neg) => {
-                        let uncond = self.dit.forward_prepared(x, &t, neg)?;
-                        krea_cfg_combine(&cond, &uncond, guidance)?
-                    }
-                    None => cond,
-                };
+                let v = Self::base_t2i_velocity_budgeted(
+                    &self.dit,
+                    x,
+                    &t,
+                    plan,
+                    guidance,
+                    block_window,
+                    attention,
+                )?;
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
         )?;
 
         on_progress(Progress::Decoding);
-        self.decode_latents(&lat, decoder)
+        self.decode_latents(&lat, decoder, opts, cancel)
     }
 
     /// **Denoise ONE phase** of a multi-phase trajectory (epic 13879, sc-13884) — the reusable
@@ -651,35 +1074,34 @@ impl KreaHeavy {
         guidance: f32,
         sub_sigmas: &[f32],
         sampler: Option<&str>,
+        transformer_window_size: Option<usize>,
+        attention: mlx_gen::attention::AttentionPlan<'_>,
         latent: Array,
         seed: u64,
         cancel: &CancelFlag,
+        previews: &KreaPreview<'_>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
-        run_flow_sampler(
+        let block_window = dit.block_window(transformer_window_size, cancel)?;
+        run_krea_sampler(
             sampler,
-            TimestepConvention::Sigma,
             sub_sigmas,
             latent,
             seed,
             cancel,
+            previews,
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let cond = dit.forward_prepared(x, &t, &plan.prep_pos)?;
-                let v = if guidance > 0.0 {
-                    let neg = plan.prep_neg.as_ref().ok_or_else(|| {
-                        mlx_gen::Error::Msg(
-                            "krea_2 multi-phase: a CFG phase (guidance > 0) requires the \
-                             unconditional prep, but the plan was built without one"
-                                .into(),
-                        )
-                    })?;
-                    let uncond = dit.forward_prepared(x, &t, neg)?;
-                    krea_cfg_combine(&cond, &uncond, guidance)?
-                } else {
-                    cond
-                };
+                let v = Self::multiphase_velocity_budgeted(
+                    dit,
+                    x,
+                    &t,
+                    plan,
+                    guidance,
+                    block_window,
+                    attention,
+                )?;
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
         )
@@ -718,12 +1140,8 @@ impl KreaHeavy {
         let mut plans = Vec::with_capacity(phases.len());
         for phase in phases {
             // A cheap (refcounted) job-local clone whose adapter stack we own for this job.
-            let mut dit = self.dit.clone();
-            dit.clear_adapters();
             let specs = crate::multiphase::phase_spec_subset(phase, all_specs);
-            if !specs.is_empty() {
-                mlx_gen::adapters::loader::apply_adapters_strict(&mut dit, &specs, "krea_2")?;
-            }
+            let dit = self.dit.clone_for_multiphase(&specs)?;
             // Prep built from THIS phase's clone (an adapter may steer the text-fusion aggregator).
             let prep_pos = dit.prepare(ctx_pos, None, &geom)?;
             let prep_neg = if phase.guidance > 0.0 {
@@ -756,6 +1174,7 @@ impl KreaHeavy {
     /// running latent — so the latent and sigma flow continuously across every boundary (the crux: no
     /// per-phase schedule, hence no seam/reset), while the ACTIVE ADAPTERS and GUIDANCE change per phase.
     /// This is the full "*N* steps Raw (CFG on) + *M* steps Raw+turbo-LoRA (CFG off)" workflow.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_multiphase(
         &self,
         plans: &[MultiPhasePlan],
@@ -763,11 +1182,14 @@ impl KreaHeavy {
         opts: &TurboOptions,
         decoder: Option<&dyn LatentDecoder>,
         cancel: &CancelFlag,
+        preview: &PreviewSink,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         // Phase 0 starts from the initial noise at full[0]; each subsequent phase resumes from the
         // prior phase's output latent at the SHARED boundary sigma.
         let mut latent = init_noise(opts.height, opts.width, opts.seed)?;
+        let previews = KreaPreview::new(preview, full);
+        let attention = opts.attention_plan(cancel);
         for mp in plans {
             let end = mp.slice.end.min(full.len().saturating_sub(1));
             let start = mp.slice.start.min(end);
@@ -778,14 +1200,17 @@ impl KreaHeavy {
                 mp.guidance,
                 sub,
                 opts.sampler.as_deref(),
+                opts.transformer_window_size,
+                attention,
                 latent,
                 opts.seed,
                 cancel,
+                &previews,
                 on_progress,
             )?;
         }
         on_progress(Progress::Decoding);
-        self.decode_latents(&latent, decoder)
+        self.decode_latents(&latent, decoder, opts, cancel)
     }
 
     /// **img2img latent-init Raw true-CFG render** (`krea_2_raw`, epic 8588 slice A / sc-10224) — the
@@ -820,6 +1245,7 @@ impl KreaHeavy {
             decoder,
             usize::MAX,
             cancel,
+            &PreviewSink::default(),
             on_progress,
         )
     }
@@ -838,6 +1264,7 @@ impl KreaHeavy {
         decoder: Option<&dyn LatentDecoder>,
         keep: usize,
         cancel: &CancelFlag,
+        preview: &PreviewSink,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
@@ -857,31 +1284,37 @@ impl KreaHeavy {
         let end = keep.min(full.len());
         let sigmas = &full[start..end];
         let x_start = add_noise_by_interpolation(&plan.clean, &noise, full[start])?;
+        let block_window = self
+            .dit
+            .block_window(opts.transformer_window_size, cancel)?;
+        let attention = opts.attention_plan(cancel);
 
-        let lat = run_flow_sampler(
+        let previews = KreaPreview::new(preview, sigmas);
+        let lat = run_krea_sampler(
             opts.sampler.as_deref(),
-            TimestepConvention::Sigma,
             sigmas,
             x_start,
             opts.seed,
             cancel,
+            &previews,
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let cond = self.dit.forward_prepared(x, &t, &plan.prep_pos)?;
-                let v = match &plan.prep_neg {
-                    Some(neg) => {
-                        let uncond = self.dit.forward_prepared(x, &t, neg)?;
-                        krea_cfg_combine(&cond, &uncond, guidance)?
-                    }
-                    None => cond,
-                };
+                let v = Self::base_img2img_velocity_budgeted(
+                    &self.dit,
+                    x,
+                    &t,
+                    plan,
+                    guidance,
+                    block_window,
+                    attention,
+                )?;
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
         )?;
 
         on_progress(Progress::Decoding);
-        self.decode_latents(&lat, decoder)
+        self.decode_latents(&lat, decoder, opts, cancel)
     }
 
     /// **Kontext-style edit render** on the Krea 2 (true-CFG Raw or CFG-free Turbo) path (epic 10871,
@@ -923,6 +1356,7 @@ impl KreaHeavy {
             decoder,
             keep,
             cancel,
+            &PreviewSink::default(),
             on_progress,
         )
     }
@@ -981,6 +1415,7 @@ impl KreaHeavy {
         decoder: Option<&dyn LatentDecoder>,
         keep: usize,
         cancel: &CancelFlag,
+        preview: &PreviewSink,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         // Edit denoises from PURE NOISE — the source is in-context conditioning, not a noised init.
@@ -1002,62 +1437,139 @@ impl KreaHeavy {
             )
         };
         let sigmas = &full[..keep.min(full.len())];
-        let lat = run_flow_sampler(
+        let block_window = self
+            .dit
+            .block_window(opts.transformer_window_size, cancel)?;
+        let attention = opts.attention_plan(cancel);
+        let previews = KreaPreview::new(preview, sigmas);
+        let lat = run_krea_sampler(
             opts.sampler.as_deref(),
-            TimestepConvention::Sigma,
             sigmas,
             noise,
             opts.seed,
             cancel,
+            &previews,
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let cond = self.dit.forward_prepared_edit(x, &t, &plan.prep_pos)?;
-                let v = match &plan.prep_neg {
-                    Some(neg) => {
-                        let uncond = self.dit.forward_prepared_edit(x, &t, neg)?;
-                        krea_cfg_combine(&cond, &uncond, guidance)?
-                    }
-                    None => cond,
-                };
+                let v = Self::edit_velocity_budgeted(
+                    &self.dit,
+                    x,
+                    &t,
+                    plan,
+                    guidance,
+                    block_window,
+                    attention,
+                )?;
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
         )?;
 
         on_progress(Progress::Decoding);
-        self.decode_latents(&lat, decoder)
+        self.decode_latents(&lat, decoder, opts, cancel)
     }
 
     /// Decode a latent to an RGB image through the seam. `decoded_to_image` applies
     /// `clip(x·0.5 + 0.5, 0, 1)` — the algebraic equal of the reference `img.clamp(-1,1)·0.5 + 0.5` —
     /// and drops the singleton temporal axis when present (`QwenVae::decode` is NCTHW with T=1; PiD
     /// returns NCHW at 4× resolution). `decoder` is the native VAE when `None`.
-    fn decode_latents(&self, lat: &Array, decoder: Option<&dyn LatentDecoder>) -> Result<Image> {
-        let dec: &dyn LatentDecoder = decoder.unwrap_or(&self.vae);
-        let decoded = dec.decode(lat)?.as_dtype(Dtype::Float32)?;
-        decoded_to_image(&decoded)
-    }
-
-    /// Decode a latent through the **native Qwen-VAE**, memory-bounded by tiling when `decode_tiling` is
-    /// `Some` (sc-11747). The control lane never routes a PiD decoder (the pose lane is native-VAE only),
-    /// so this is the control decode seam: `Some(cfg)` runs [`QwenVae::decode_tiled`] (the tiled decode
-    /// selected by the budget gate), `None` the single-pass [`QwenVae::decode`]. Same
-    /// `decoded_to_image` post-step (`clip(x·0.5 + 0.5, 0, 1)`, dropping the singleton temporal axis) as
-    /// [`Self::decode_latents`], so a tiled and an untiled decode yield the same image up to the blend
-    /// tolerance. `cancel` lets the tiled decode abort between tiles.
-    fn decode_latents_native_tiled(
+    fn decode_latents(
         &self,
         lat: &Array,
+        decoder: Option<&dyn LatentDecoder>,
+        opts: &TurboOptions,
+        cancel: &CancelFlag,
+    ) -> Result<Image> {
+        // SC-15449/sc-22738: both phase EXITS for every t2i/img2img/edit/multi-phase route. `lat` is
+        // the denoise phase's produced tensor and every route calls this immediately after its
+        // `run_krea_sampler`, so this is the denoise exit; the decode exit follows the VAE below.
+        denoise_exit_fault(lat, opts)?;
+        let image =
+            self.decode_latents_with_tiling(lat, decoder, opts.decode_tiling()?.as_ref(), cancel)?;
+        decode_exit_fault(opts)?;
+        Ok(image)
+    }
+
+    /// Decode through the shared trait seam. The native Qwen VAE implements tiled decode; PiD inherits
+    /// the forwarding default and therefore does not accidentally consume native-VAE tile geometry.
+    /// The control lane passes no decoder override and reaches the native implementation through the
+    /// same seam.
+    fn decode_latents_with_tiling(
+        &self,
+        lat: &Array,
+        decoder: Option<&dyn LatentDecoder>,
         decode_tiling: Option<&TilingConfig>,
         cancel: &CancelFlag,
     ) -> Result<Image> {
-        let decoded = match decode_tiling {
-            Some(cfg) => self.vae.decode_tiled(lat, cfg, Some(cancel))?,
-            None => self.vae.decode(lat)?,
-        }
-        .as_dtype(Dtype::Float32)?;
-        decoded_to_image(&decoded)
+        decode_latents_via_seam(&self.vae, decoder, lat, decode_tiling, cancel)
     }
+}
+
+/// **Denoise phase EXIT** (sc-22738): the sampler has produced `lat`; materialize it and then raise
+/// an authorized calibration fault for [`mlx_gen::gen_core::MemoryPhase::Denoise`].
+///
+/// The exit convention is the FLUX/Chroma/Qwen one, not the entry convention. The SceneWorks memory
+/// adapter certifies an anchor's lifecycle by injecting an authorized fault at a phase boundary and
+/// then reading the engine's retained bytes, so the phase's real allocation must already exist when
+/// the fault is returned; faulting on the phase's *entry* would hand the adapter a pre-denoise heap
+/// and certify nothing. Mirrors `mlx-gen-chroma/src/model.rs` (`eval` of `final_latents`, then the
+/// `Denoise` fault).
+///
+/// The `eval` is armed-only, mirroring `mlx-gen-flux/src/model.rs`'s guarded force-eval of its lazy
+/// decode: an ordinary render (both controls unset) keeps its laziness byte-for-byte untouched.
+///
+/// `opts.memory` / `opts.provider_id` are the request-scoped selection threaded down from
+/// `model.rs`'s and `model_control.rs`'s `TurboOptions` construction — this is the only place the
+/// base-Krea render body reads them, so a request that loses its memory scope stops faulting.
+fn denoise_exit_fault(lat: &Array, opts: &TurboOptions) -> Result<()> {
+    if crate::memory_strategy::calibration_fault_armed(
+        Some(opts.memory),
+        mlx_gen::gen_core::MemoryPhase::Denoise,
+    ) {
+        mlx_rs::transforms::eval([lat])?;
+    }
+    crate::memory_strategy::calibration_fault_for_memory(
+        Some(opts.memory),
+        mlx_gen::gen_core::MemoryPhase::Denoise,
+        opts.provider_id,
+    )
+}
+
+/// **Decode phase EXIT** (sc-22738): the VAE decode has completed and `decoded_to_image` has read it
+/// back into a host RGB [`Image`], so the decode's allocation is already materialized — there is no
+/// lazy array left to force. Same convention and rationale as [`denoise_exit_fault`].
+fn decode_exit_fault(opts: &TurboOptions) -> Result<()> {
+    crate::memory_strategy::calibration_fault_for_memory(
+        Some(opts.memory),
+        mlx_gen::gen_core::MemoryPhase::Decode,
+        opts.provider_id,
+    )
+}
+
+/// Engine-level decode route shared by Krea's resident, sequential, control, img2img, and edit
+/// entry points. Kept independent of `KreaHeavy` so its dispatch and byte-preserving post-process can
+/// be regression-tested without constructing the multi-gigabyte model aggregate.
+fn decode_latents_via_seam(
+    native: &dyn LatentDecoder,
+    decoder: Option<&dyn LatentDecoder>,
+    lat: &Array,
+    decode_tiling: Option<&TilingConfig>,
+    cancel: &CancelFlag,
+) -> Result<Image> {
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    let decoder = decoder.unwrap_or(native);
+    mlx_gen::ensure_decoder_compatible(
+        Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
+        decoder,
+    )?;
+    let decoded = match decode_tiling {
+        Some(cfg) => decoder.decode_tiled(lat, cfg, Some(cancel))?,
+        None => decoder.decode(lat)?,
+    }
+    .as_dtype(Dtype::Float32)?;
+    decoded_to_image(&decoded)
 }
 
 /// The assembled Krea 2 Turbo pipeline: the [`KreaText`] encode phase + the [`KreaHeavy`] render phase.
@@ -1498,7 +2010,839 @@ fn init_noise(height: u32, width: u32, seed: u64) -> Result<Array> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+
+    #[test]
+    fn language_only_snapshot_is_admitted_until_the_edit_only_vision_read() {
+        let fixture = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &fixture.path().join("text_encoder"),
+            crate::model::test_encoder_contract(),
+        )
+        .unwrap();
+
+        let source = resolve_vision_encoder_source(fixture.path())
+            .expect("ordinary text construction must admit a language-valid vision-less snapshot");
+        let opened = Cell::new(false);
+        let error = read_validated_vision_source::<()>(&source, |_| {
+            opened.set(true);
+            Err(mlx_gen::Error::Msg(
+                "vision payload unexpectedly opened".into(),
+            ))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("vision_config"), "{error}");
+        assert!(
+            !opened.get(),
+            "edit admission must fail before the vision payload loader runs"
+        );
+    }
+
+    struct DecodeSpy {
+        output: Array,
+        calls: Cell<usize>,
+    }
+
+    impl DecodeSpy {
+        fn new(output: Array) -> Self {
+            Self {
+                output,
+                calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl LatentDecoder for DecodeSpy {
+        fn input_latent_space(&self) -> Option<&mlx_gen::gen_core::LatentSpace> {
+            Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE)
+        }
+
+        fn decode(&self, _latents: &Array) -> Result<Array> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(self.output.clone())
+        }
+    }
+
+    fn legacy_decode_latents(decoder: &dyn LatentDecoder, latents: &Array) -> Image {
+        let decoded = decoder
+            .decode(latents)
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        decoded_to_image(&decoded).unwrap()
+    }
+
+    /// SC-18309 N1: compare Krea's exact historical no-override decode expression with the engine
+    /// helper now used by every resident/sequential/base/control/edit route. Distinct channel/frame
+    /// values make the NCTHW singleton drop and RGB interleave observable. The PiD arm proves an
+    /// override still wins and ignores native tile geometry through the trait forwarding default.
+    #[test]
+    fn decode_engine_keeps_native_and_pid_dispatch_byte_exact() {
+        let latents = Array::from_slice(&[0.0f32; 16 * 2 * 3], &[1, 16, 2, 3]);
+        let native_output = Array::from_slice(
+            &[
+                -1.0f32, -0.5, 0.0, 0.5, 1.0, 0.25, 1.0, 0.5, 0.0, -0.5, -1.0, -0.25, -0.75, -0.25,
+                0.25, 0.75, -1.0, 1.0,
+            ],
+            &[1, 3, 1, 2, 3],
+        );
+        let legacy = DecodeSpy::new(native_output.clone());
+        let expected = legacy_decode_latents(&legacy, &latents);
+        let native = DecodeSpy::new(native_output);
+        let cancel = CancelFlag::new();
+        let got = decode_latents_via_seam(&native, None, &latents, None, &cancel).unwrap();
+        assert_eq!(got, expected);
+        assert_eq!(native.calls.get(), 1);
+
+        let native = DecodeSpy::new(Array::zeros::<f32>(&[1, 3, 1, 2, 3]).unwrap());
+        let pid_output = Array::from_slice(&vec![1.0f32; 3 * 4 * 5], &[1, 3, 4, 5]);
+        let legacy_pid = DecodeSpy::new(pid_output.clone());
+        let expected_pid = legacy_decode_latents(&legacy_pid, &latents);
+        let pid = DecodeSpy::new(pid_output);
+        let cfg = TilingConfig::spatial_only(16, 4);
+        let got =
+            decode_latents_via_seam(&native, Some(&pid), &latents, Some(&cfg), &cancel).unwrap();
+        assert_eq!(got, expected_pid);
+        assert_eq!(native.calls.get(), 0);
+        assert_eq!(pid.calls.get(), 1);
+    }
+
+    fn zero_velocity(x: &Array, _sigma: f32) -> Result<Array> {
+        Ok(Array::zeros::<f32>(x.shape())?)
+    }
+
+    #[test]
+    fn public_snapshot_text_phase_rejects_the_wrong_encoder_before_tokenizer_open() {
+        let fixture = tempfile::tempdir().unwrap();
+        let contract = crate::model::test_encoder_contract();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &fixture.path().join("text_encoder"),
+            mlx_gen::gen_core::EncoderContract {
+                hidden_size: contract.hidden_size + 1,
+                ..contract
+            },
+        )
+        .unwrap();
+
+        let error = KreaText::from_snapshot(fixture.path())
+            .err()
+            .expect("an incompatible public snapshot must fail before loading the tokenizer")
+            .to_string();
+        assert!(error.contains("field hidden_size"), "{error}");
+        assert!(!error.contains("tokenizer"), "{error}");
+    }
+
+    #[test]
+    fn edit_vision_contract_rejects_missing_and_wrong_visual_surface_at_admission() {
+        let vision_contract = crate::model::test_vision_encoder_contract();
+        let mut headers = vision_contract
+            .expected_headers()
+            .unwrap()
+            .into_iter()
+            .map(|(name, shape)| mlx_gen::gen_core::SafetensorsTensorHeader {
+                data_bytes: shape.iter().product::<usize>() as u64 * 2,
+                name,
+                dtype: mlx_gen::gen_core::weightsmeta::Dtype::F16,
+                shape,
+            })
+            .collect::<Vec<_>>();
+        headers.remove(0);
+        let error = vision_contract
+            .validate_tensor_headers(&headers, std::path::Path::new("missing-visual"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("visual.patch_embed.proj.weight"), "{error}");
+
+        let missing = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &missing.path().join("text_encoder"),
+            crate::model::test_encoder_contract(),
+        )
+        .unwrap();
+        let language_contract = crate::model::test_encoder_contract();
+        let source = language_contract
+            .validate_source(&WeightsSource::Dir(missing.path().join("text_encoder")))
+            .unwrap();
+        let error = source
+            .validate_vision(&vision_contract, &language_contract)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("vision_config"), "{error}");
+
+        let wrong = tempfile::tempdir().unwrap();
+        let component = wrong.path().join("text_encoder");
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &component,
+            language_contract,
+            vision_contract,
+        )
+        .unwrap();
+        let config_path = component.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["vision_config"]["out_hidden_size"] =
+            serde_json::json!(language_contract.hidden_size + 1);
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let source = language_contract
+            .validate_source(&WeightsSource::Dir(component))
+            .unwrap();
+        let error = source
+            .validate_vision(&vision_contract, &language_contract)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("out_hidden_size"), "{error}");
+    }
+
+    /// sc-22738 (coordinator decision): both render-side faults fire at their phase's EXIT — the
+    /// Denoise fault after the sampler produced the latent, the Decode fault after the VAE produced
+    /// the image — the FLUX/Chroma/Qwen convention (`mlx-gen-chroma/src/model.rs` evals
+    /// `final_latents` then faults; `mlx-gen-flux/src/model.rs` force-evals its lazy decode then
+    /// faults). `decode_latents` is the one denoise-exit/decode-exit pair for the
+    /// t2i/img2img/edit/multi-phase routes; the pose-control route decodes through
+    /// `decode_latents_with_tiling` directly and carries its own pair.
+    #[test]
+    fn both_render_faults_fire_at_their_phase_exit_on_every_route() {
+        let source = include_str!("pipeline.rs");
+        for (route, start, end) in [
+            (
+                "base routes",
+                "    fn decode_latents(\n",
+                "    /// Decode through the shared trait seam.",
+            ),
+            (
+                "pose control",
+                "    pub fn render_control_from(",
+                "    /// **img2img latent-init Turbo render**",
+            ),
+        ] {
+            let body = source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("missing {route} start"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("missing {route} end"))
+                .0;
+            let denoise = body
+                .find("denoise_exit_fault(")
+                .unwrap_or_else(|| panic!("{route} has no Denoise exit fault"));
+            let decode = body
+                .find("self.decode_latents_with_tiling(")
+                .unwrap_or_else(|| panic!("{route} has no decode call"));
+            let decode_fault = body
+                .find("decode_exit_fault(")
+                .unwrap_or_else(|| panic!("{route} has no Decode exit fault"));
+            assert!(
+                denoise < decode,
+                "{route}: the Denoise fault must precede the VAE decode"
+            );
+            assert!(
+                decode < decode_fault,
+                "{route}: the Decode fault must FOLLOW the VAE decode, not precede it"
+            );
+        }
+        // The pose-control route's Denoise fault must also FOLLOW its own sampler.
+        let control = source
+            .split_once("    pub fn render_control_from(")
+            .expect("render_control_from")
+            .1
+            .split_once("    /// **img2img latent-init Turbo render**")
+            .expect("render_control_from end")
+            .0;
+        assert!(
+            control
+                .find(concat!("run_krea_sampler", "("))
+                .expect("sampler")
+                < control.find("denoise_exit_fault(").expect("denoise exit"),
+            "pose control: the Denoise fault must FOLLOW the sampler, not precede it"
+        );
+    }
+
+    /// sc-22738: every non-control route reaches the exit pair, because each one calls the sampler
+    /// and then hands the produced latent straight to `decode_latents` — nothing between them.
+    #[test]
+    fn every_sampler_route_hands_its_latent_to_the_exit_pair() {
+        let source = include_str!("pipeline.rs");
+        for route in [
+            "    pub fn render_turbo_from(",
+            "    pub fn render_turbo_img2img_from(",
+            "    pub fn render_base_from(",
+            "    pub fn render_base_img2img_from(",
+            "    pub fn render_edit_from(",
+            "    pub fn render_multiphase(",
+        ] {
+            let body = source
+                .split_once(route)
+                .unwrap_or_else(|| panic!("missing {route}"))
+                .1
+                .split_once("\n    }\n")
+                .expect("function end")
+                .0;
+            let decode = body
+                .find("self.decode_latents(")
+                .unwrap_or_else(|| panic!("{route} must decode through `decode_latents`"));
+            // Split literals: `every_krea_sampler_site_flows_through_preview_wrapper` pins the exact
+            // occurrence count of the sampler call in this file, so these probes must not add to it.
+            let sampler = concat!("run_krea_sampler", "(");
+            let phase = concat!("Self::denoise_phase_from", "(");
+            assert!(
+                body[..decode].contains(sampler) || body[..decode].contains(phase),
+                "{route} must denoise before it reaches the exit pair"
+            );
+        }
+    }
+
+    /// sc-22738: the denoise exit helper materializes the produced latent before it raises the fault,
+    /// so the adapter reads a real allocation. The `eval` is armed-only (flux's guarded force-eval),
+    /// so an ordinary render keeps its laziness untouched.
+    #[test]
+    fn the_denoise_exit_fault_evaluates_the_latent_before_refusing() {
+        let source = include_str!("pipeline.rs");
+        let body = source
+            .split_once("fn denoise_exit_fault(")
+            .expect("denoise_exit_fault")
+            .1
+            .split_once("\n}\n")
+            .expect("function end")
+            .0;
+        let armed = body
+            .find("calibration_fault_armed(")
+            .expect("armed-only guard");
+        let eval = body.find("eval([lat])").expect("latent materialization");
+        let fault = body
+            .rfind("calibration_fault_for_memory(")
+            .expect("the fault itself");
+        assert!(armed < eval, "the eval must be gated on an armed fault");
+        assert!(
+            eval < fault,
+            "the latent must be evaluated before the fault"
+        );
+    }
+
+    #[test]
+    fn every_cfg_route_delegates_to_its_executable_velocity_seam() {
+        let source = include_str!("pipeline.rs");
+        let cases = [
+            (
+                "base t2i",
+                "    pub fn render_base_from(",
+                "    fn denoise_phase_from(",
+                "Self::base_t2i_velocity_budgeted(",
+            ),
+            (
+                "multi-phase CFG",
+                "    fn denoise_phase_from(",
+                "    pub fn prepare_multiphase(",
+                "Self::multiphase_velocity_budgeted(",
+            ),
+            (
+                "base img2img",
+                "    pub fn render_base_img2img_from(",
+                "    pub fn render_edit(",
+                "Self::base_img2img_velocity_budgeted(",
+            ),
+            (
+                "edit",
+                "    pub fn render_edit_from(",
+                "    fn decode_latents(",
+                "Self::edit_velocity_budgeted(",
+            ),
+        ];
+
+        for (route, start, end, seam) in cases {
+            let body = source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("missing {route} start"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("missing {route} end"))
+                .0;
+            assert_eq!(
+                body.matches(seam).count(),
+                1,
+                "{route} must call its tested velocity seam exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn all_four_velocity_seams_execute_cfg_and_non_cfg_in_resident_and_windowed_modes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let materializations = Arc::new(AtomicUsize::new(0));
+        let dit =
+            crate::transformer::executable_test_fixture(Arc::clone(&materializations)).unwrap();
+        let latent = Array::from_slice(
+            &(0..64)
+                .map(|index| index as f32 * 0.01 - 0.3)
+                .collect::<Vec<_>>(),
+            &[1, 16, 2, 2],
+        );
+        let timestep = Array::from_slice(&[0.37_f32], &[1]);
+        let positive_context = Array::from_slice(
+            &(0..16)
+                .map(|index| index as f32 * 0.025 - 0.2)
+                .collect::<Vec<_>>(),
+            &[1, 2, 1, 8],
+        );
+        let negative_context = Array::from_slice(
+            &(0..8)
+                .map(|index| 0.4 - index as f32 * 0.03)
+                .collect::<Vec<_>>(),
+            &[1, 1, 1, 8],
+        );
+        let t2i_plan = |with_negative: bool| -> Result<T2iPlan> {
+            Ok(T2iPlan {
+                prep_pos: dit.prepare(&positive_context, None, &latent)?,
+                prep_neg: with_negative
+                    .then(|| dit.prepare(&negative_context, None, &latent))
+                    .transpose()?,
+            })
+        };
+        let cfg_t2i = t2i_plan(true).unwrap();
+        let plain_t2i = t2i_plan(false).unwrap();
+        let cfg_img2img = Img2ImgPlan {
+            prep_pos: dit.prepare(&positive_context, None, &latent).unwrap(),
+            prep_neg: Some(dit.prepare(&negative_context, None, &latent).unwrap()),
+            clean: latent.clone(),
+        };
+        let plain_img2img = Img2ImgPlan {
+            prep_pos: dit.prepare(&positive_context, None, &latent).unwrap(),
+            prep_neg: None,
+            clean: latent.clone(),
+        };
+        let reference = Array::from_slice(
+            &(0..64)
+                .map(|index| 0.15 - index as f32 * 0.004)
+                .collect::<Vec<_>>(),
+            &[1, 16, 2, 2],
+        );
+        let cfg_edit = EditPlan {
+            prep_pos: dit
+                .prepare_edit(
+                    &positive_context,
+                    None,
+                    &latent,
+                    std::slice::from_ref(&reference),
+                )
+                .unwrap(),
+            prep_neg: Some(
+                dit.prepare_edit(
+                    &negative_context,
+                    None,
+                    &latent,
+                    std::slice::from_ref(&reference),
+                )
+                .unwrap(),
+            ),
+        };
+        let plain_edit = EditPlan {
+            prep_pos: dit
+                .prepare_edit(&positive_context, None, &latent, &[reference])
+                .unwrap(),
+            prep_neg: None,
+        };
+        let expected_positive = dit
+            .forward_prepared_windowed(&latent, &timestep, &cfg_t2i.prep_pos, None)
+            .unwrap();
+        let expected_negative = dit
+            .forward_prepared_windowed(&latent, &timestep, cfg_t2i.prep_neg.as_ref().unwrap(), None)
+            .unwrap();
+        let guidance = 0.75;
+        let expected_cfg =
+            krea_cfg_combine(&expected_positive, &expected_negative, guidance).unwrap();
+        let expected_edit_positive = dit
+            .forward_prepared_edit_windowed(&latent, &timestep, &cfg_edit.prep_pos, None)
+            .unwrap();
+        let expected_edit_negative = dit
+            .forward_prepared_edit_windowed(
+                &latent,
+                &timestep,
+                cfg_edit.prep_neg.as_ref().unwrap(),
+                None,
+            )
+            .unwrap();
+        let expected_edit_cfg =
+            krea_cfg_combine(&expected_edit_positive, &expected_edit_negative, guidance).unwrap();
+        let cancel = CancelFlag::new();
+        let window = dit.block_window(Some(1), &cancel).unwrap();
+
+        macro_rules! assert_route {
+            ($label:literal, $expected:expr, $resident:expr, $windowed:expr) => {{
+                materializations.store(0, Ordering::Relaxed);
+                let resident = $resident.unwrap();
+                mlx_rs::transforms::eval([&resident, $expected]).unwrap();
+                assert_eq!(
+                    resident.as_slice::<f32>(),
+                    $expected.as_slice::<f32>(),
+                    "{} resident parity",
+                    $label
+                );
+                assert_eq!(materializations.load(Ordering::Relaxed), 0);
+
+                materializations.store(0, Ordering::Relaxed);
+                let windowed = $windowed.unwrap();
+                mlx_rs::transforms::eval([&windowed, $expected]).unwrap();
+                assert_eq!(
+                    windowed.as_slice::<f32>(),
+                    $expected.as_slice::<f32>(),
+                    "{} windowed parity",
+                    $label
+                );
+                assert_eq!(
+                    materializations.load(Ordering::Relaxed),
+                    dit.num_blocks(),
+                    "{} must materialize every block exactly once",
+                    $label
+                );
+            }};
+        }
+
+        assert_route!(
+            "base t2i CFG",
+            &expected_cfg,
+            KreaHeavy::base_t2i_velocity(&dit, &latent, &timestep, &cfg_t2i, guidance, None),
+            KreaHeavy::base_t2i_velocity(&dit, &latent, &timestep, &cfg_t2i, guidance, window)
+        );
+        assert_route!(
+            "base t2i non-CFG",
+            &expected_positive,
+            KreaHeavy::base_t2i_velocity(&dit, &latent, &timestep, &plain_t2i, guidance, None),
+            KreaHeavy::base_t2i_velocity(&dit, &latent, &timestep, &plain_t2i, guidance, window)
+        );
+        assert_route!(
+            "multi-phase CFG",
+            &expected_cfg,
+            KreaHeavy::multiphase_velocity(&dit, &latent, &timestep, &cfg_t2i, guidance, None),
+            KreaHeavy::multiphase_velocity(&dit, &latent, &timestep, &cfg_t2i, guidance, window)
+        );
+        assert_route!(
+            "multi-phase non-CFG",
+            &expected_positive,
+            KreaHeavy::multiphase_velocity(&dit, &latent, &timestep, &plain_t2i, 0.0, None),
+            KreaHeavy::multiphase_velocity(&dit, &latent, &timestep, &plain_t2i, 0.0, window)
+        );
+        assert_route!(
+            "base img2img CFG",
+            &expected_cfg,
+            KreaHeavy::base_img2img_velocity(
+                &dit,
+                &latent,
+                &timestep,
+                &cfg_img2img,
+                guidance,
+                None
+            ),
+            KreaHeavy::base_img2img_velocity(
+                &dit,
+                &latent,
+                &timestep,
+                &cfg_img2img,
+                guidance,
+                window
+            )
+        );
+        assert_route!(
+            "base img2img non-CFG",
+            &expected_positive,
+            KreaHeavy::base_img2img_velocity(
+                &dit,
+                &latent,
+                &timestep,
+                &plain_img2img,
+                guidance,
+                None
+            ),
+            KreaHeavy::base_img2img_velocity(
+                &dit,
+                &latent,
+                &timestep,
+                &plain_img2img,
+                guidance,
+                window
+            )
+        );
+        assert_route!(
+            "edit CFG",
+            &expected_edit_cfg,
+            KreaHeavy::edit_velocity(&dit, &latent, &timestep, &cfg_edit, guidance, None),
+            KreaHeavy::edit_velocity(&dit, &latent, &timestep, &cfg_edit, guidance, window)
+        );
+        assert_route!(
+            "edit non-CFG",
+            &expected_edit_positive,
+            KreaHeavy::edit_velocity(&dit, &latent, &timestep, &plain_edit, guidance, None),
+            KreaHeavy::edit_velocity(&dit, &latent, &timestep, &plain_edit, guidance, window)
+        );
+
+        let cancelled = CancelFlag::new();
+        cancelled.cancel();
+        let bounded_attention = || {
+            mlx_gen::attention::AttentionPlan::budgeted(
+                mlx_gen::attention::AttentionBudget::from_score_elements(1, false),
+            )
+            .with_cancel(&cancelled)
+        };
+        macro_rules! assert_bounded_route_cancels {
+            ($label:literal, $route:expr) => {
+                assert!(
+                    matches!($route, Err(mlx_gen::Error::Canceled)),
+                    "{} must propagate the request-scoped bounded-attention cancellation boundary",
+                    $label
+                );
+            };
+        }
+
+        assert_bounded_route_cancels!(
+            "base t2i CFG",
+            KreaHeavy::base_t2i_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &cfg_t2i,
+                guidance,
+                None,
+                bounded_attention(),
+            )
+        );
+        assert_bounded_route_cancels!(
+            "base t2i non-CFG",
+            KreaHeavy::base_t2i_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &plain_t2i,
+                guidance,
+                None,
+                bounded_attention(),
+            )
+        );
+        assert_bounded_route_cancels!(
+            "multi-phase CFG",
+            KreaHeavy::multiphase_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &cfg_t2i,
+                guidance,
+                None,
+                bounded_attention(),
+            )
+        );
+        assert_bounded_route_cancels!(
+            "multi-phase non-CFG",
+            KreaHeavy::multiphase_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &plain_t2i,
+                0.0,
+                None,
+                bounded_attention(),
+            )
+        );
+        assert_bounded_route_cancels!(
+            "base img2img CFG",
+            KreaHeavy::base_img2img_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &cfg_img2img,
+                guidance,
+                None,
+                bounded_attention(),
+            )
+        );
+        assert_bounded_route_cancels!(
+            "base img2img non-CFG",
+            KreaHeavy::base_img2img_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &plain_img2img,
+                guidance,
+                None,
+                bounded_attention(),
+            )
+        );
+        assert_bounded_route_cancels!(
+            "edit CFG",
+            KreaHeavy::edit_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &cfg_edit,
+                guidance,
+                None,
+                bounded_attention(),
+            )
+        );
+        assert_bounded_route_cancels!(
+            "edit non-CFG",
+            KreaHeavy::edit_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &plain_edit,
+                guidance,
+                None,
+                bounded_attention(),
+            )
+        );
+    }
+
+    #[test]
+    fn active_preview_emits_one_numbered_frame_per_euler_step() {
+        let sigmas = [1.0_f32, 0.7, 0.3, 0.0];
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&frames);
+        let sink = PreviewSink::new(move |frame| captured.lock().unwrap().push(frame));
+        let previews = KreaPreview::new(&sink, &sigmas);
+        let latent = Array::zeros::<f32>(&[1, 16, 2, 2]).unwrap();
+
+        run_krea_sampler(
+            None,
+            &sigmas,
+            latent,
+            7,
+            &CancelFlag::new(),
+            &previews,
+            &mut |_| {},
+            zero_velocity,
+        )
+        .unwrap();
+
+        let frames = frames.lock().unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| (frame.current, frame.total))
+                .collect::<Vec<_>>(),
+            [(1, 3), (2, 3), (3, 3)]
+        );
+        assert!(frames
+            .iter()
+            .all(|frame| (frame.image.width, frame.image.height) == (2, 2)));
+    }
+
+    #[test]
+    fn active_preview_deduplicates_multieval_heun_steps() {
+        let sigmas = [1.0_f32, 0.7, 0.3, 0.0];
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&frames);
+        let sink = PreviewSink::new(move |frame| captured.lock().unwrap().push(frame));
+        let previews = KreaPreview::new(&sink, &sigmas);
+
+        run_krea_sampler(
+            Some("heun"),
+            &sigmas,
+            Array::zeros::<f32>(&[1, 16, 2, 2]).unwrap(),
+            7,
+            &CancelFlag::new(),
+            &previews,
+            &mut |_| {},
+            zero_velocity,
+        )
+        .unwrap();
+
+        let frames = frames.lock().unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames.last().map(|frame| frame.current), Some(3));
+        assert!(frames.iter().all(|frame| frame.total == 3));
+    }
+
+    #[test]
+    fn multiphase_preview_keeps_one_global_counter_across_slices() {
+        let full = [1.0_f32, 0.75, 0.5, 0.25, 0.0];
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&frames);
+        let sink = PreviewSink::new(move |frame| captured.lock().unwrap().push(frame));
+        let previews = KreaPreview::new(&sink, &full);
+        let cancel = CancelFlag::new();
+        let latent = Array::zeros::<f32>(&[1, 16, 2, 2]).unwrap();
+        let latent = run_krea_sampler(
+            None,
+            &full[..=2],
+            latent,
+            7,
+            &cancel,
+            &previews,
+            &mut |_| {},
+            zero_velocity,
+        )
+        .unwrap();
+        run_krea_sampler(
+            None,
+            &full[2..],
+            latent,
+            7,
+            &cancel,
+            &previews,
+            &mut |_| {},
+            zero_velocity,
+        )
+        .unwrap();
+
+        let frames = frames.lock().unwrap();
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| (frame.current, frame.total))
+                .collect::<Vec<_>>(),
+            [(1, 4), (2, 4), (3, 4), (4, 4)]
+        );
+    }
+
+    #[test]
+    fn inert_preview_preserves_fixed_seed_sampler_bytes() {
+        let sigmas = [1.0_f32, 0.6, 0.0];
+        let seed = 42;
+        let direct = run_flow_sampler(
+            None,
+            TimestepConvention::Sigma,
+            &sigmas,
+            init_noise(16, 16, seed).unwrap(),
+            seed,
+            &CancelFlag::new(),
+            &mut |_| {},
+            zero_velocity,
+        )
+        .unwrap();
+        let sink = PreviewSink::default();
+        let previews = KreaPreview::new(&sink, &sigmas);
+        let wrapped = run_krea_sampler(
+            None,
+            &sigmas,
+            init_noise(16, 16, seed).unwrap(),
+            seed,
+            &CancelFlag::new(),
+            &previews,
+            &mut |_| {},
+            zero_velocity,
+        )
+        .unwrap();
+        assert_eq!(direct.as_slice::<f32>(), wrapped.as_slice::<f32>());
+        assert_eq!(previews.counter.next(&sigmas, sigmas[0]), Some(1));
+    }
+
+    #[test]
+    fn every_krea_sampler_site_flows_through_preview_wrapper() {
+        let source = include_str!("pipeline.rs");
+        assert_eq!(
+            source.matches("run_flow_sampler(").count(),
+            3,
+            "only the wrapper and inert identity oracle may call the raw sampler (plus this literal)"
+        );
+        assert_eq!(
+            source.matches("run_krea_sampler(").count(),
+            13,
+            "seven production sites, five weight-free test calls, and this literal"
+        );
+    }
 
     /// The Krea CFG combine is the reference `cond + g·(cond − uncond)`, not the standard
     /// `uncond + g·Δ`. With cond = 2, uncond = 1 (Δ = 1): g = 1 → 3 (the standard form would give 2 —

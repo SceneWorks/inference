@@ -41,7 +41,7 @@ fn rel(a: &Array, b: &Array) -> f64 {
 // Always-on guard: with the kernels compiled at macOS >= 26.2 (sc-2772), 16-bit dense is correct
 // across the whole grid, so this asserts correctness on every build (NAX or non-NAX). On a NAX build
 // whose metal kernels were compiled below 26.2 it (rightly) FAILS. Run: `cargo test -p
-// mlx-gen-qwen-image --release --test bf16_matmul_sweep -- --nocapture`.
+// mlx-gen-qwen-image --release --test integration -- bf16_matmul_sweep:: --nocapture`.
 #[test]
 fn nax_16bit_dense_gemm_is_correct() {
     // Distinct keys for the two operands so no (M,K)==(K,N) cell degenerates to A == B.

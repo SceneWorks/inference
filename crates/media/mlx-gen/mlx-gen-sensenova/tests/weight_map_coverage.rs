@@ -7,7 +7,7 @@
 //! the downstream module loaders share) accounts for every checkpoint tensor and invents none.
 //!
 //! Run:
-//!   cargo test -p mlx-gen-sensenova --test weight_map_coverage -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sensenova --test integration weight_map_coverage:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 

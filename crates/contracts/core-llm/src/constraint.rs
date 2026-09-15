@@ -15,11 +15,47 @@
 use std::collections::HashSet;
 
 /// A requested output constraint.
+///
+/// A future variant may carry a payload (a JSON Schema, a grammar). When one does, it must be
+/// gated by its [`ConstraintKind`] and never by value — see that type's documentation for why.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Constraint {
     /// Output must be a single well-formed JSON value. (Object *shape* is not enforced — only that
     /// the emitted text parses.)
     Json,
+}
+
+/// The *discriminant* of a [`Constraint`] — what a provider advertises it can enforce.
+///
+/// # Why this exists separately
+///
+/// Capability gating asks "can this provider enforce this KIND of constraint?", which is not the
+/// same question as "is this provider's declared constraint equal to the requested one?". The
+/// distinction is invisible while every variant is payload-free, and becomes load-bearing the
+/// moment one is not: a provider cannot name, in advance, the specific JSON Schema a caller will
+/// send, so a value-equality gate would reject **every** schema request no matter how capable the
+/// provider is.
+///
+/// Keeping the discriminant in its own `Copy + Eq + Hash` type means a payload-carrying
+/// [`Constraint`] can stay non-`Copy` without disturbing the capability surface, which stays
+/// cheap to compare and usable as a map key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ConstraintKind {
+    /// Well-formed JSON, shape unenforced. See [`Constraint::Json`].
+    Json,
+}
+
+impl Constraint {
+    /// This constraint's discriminant.
+    ///
+    /// Deliberately an exhaustive `match` rather than a derive: adding a [`Constraint`] variant
+    /// must fail to compile here until its kind is declared, which is what stops a new variant
+    /// silently inheriting another's capability gate.
+    pub fn kind(&self) -> ConstraintKind {
+        match self {
+            Constraint::Json => ConstraintKind::Json,
+        }
+    }
 }
 
 /// Per-vocab decode table for constrained sampling: the literal text of each token id, plus the set
@@ -497,6 +533,49 @@ fn num_extend(part: NumPart, c: char) -> Option<NumPart> {
             '0'..='9' => Some(NumPart::ExpDigits),
             _ => None,
         },
+    }
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::*;
+    use crate::capabilities::TextLlmCapabilities;
+
+    #[test]
+    fn every_constraint_reports_its_kind() {
+        assert_eq!(Constraint::Json.kind(), ConstraintKind::Json);
+    }
+
+    #[test]
+    fn capability_gating_is_by_kind_not_by_value() {
+        // The property that makes payload-carrying constraints possible at all. A provider
+        // advertises the KIND it can enforce; the request carries a concrete Constraint. Under
+        // the previous design `supported_constraints` held `Constraint` values compared with
+        // `contains`, so a variant carrying a schema could never equal any declaration a provider
+        // could write in advance — every schema request would be rejected regardless of
+        // capability. This test does not merely pass today, it fails to COMPILE under that
+        // design, which is the regression protection.
+        let caps = TextLlmCapabilities {
+            supported_constraints: vec![ConstraintKind::Json],
+            ..Default::default()
+        };
+        assert!(caps.supports_constraint(&Constraint::Json));
+    }
+
+    #[test]
+    fn a_provider_declaring_nothing_supports_nothing() {
+        let caps = TextLlmCapabilities::default();
+        assert!(!caps.supports_constraint(&Constraint::Json));
+    }
+
+    #[test]
+    fn kinds_are_hashable_and_ordered_so_they_can_key_a_map() {
+        // Cheap to compare and usable as a map key is the reason the discriminant is a separate
+        // type rather than a method returning a string.
+        use std::collections::HashSet;
+        let mut s = HashSet::new();
+        s.insert(ConstraintKind::Json);
+        assert!(s.contains(&Constraint::Json.kind()));
     }
 }
 

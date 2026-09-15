@@ -11,6 +11,14 @@ Documentation for the SceneWorks inference workspace.
   platform, with the MLX/Candle deltas. Built from the committed exact-surface tests.
 - **[Mochi 1 tier strategy](reference/mochi-1-tier-strategy.md)** — the accepted quantization
   packaging decision for the native Mochi 1 port (pre-quantized per-tier artifacts, default q4).
+- **[LTX-2.5 access + component evidence baseline (sc-18756)](reference/sc-18756-ltx-2-5-evidence-baseline.md)** —
+  epic 18755 Phase 0: measured HF access state, the reference-impl pin, the full 2.3→2.5 component
+  inventory (14 safetensors files, header-only Range reads, authenticated capture), and the
+  pre-change `dump-engine-capabilities` baseline every later LTX-2.5 story cites instead of
+  re-deriving.
+- **[MiniMax-H3 withheld upstream components](reference/minimax-h3-withheld-upstream-components.md)**
+  — what `H3-Context-IR`, `H3-Regenerate-2K`, sparse-attention inference and the `<d>` dialogue
+  markers cost this port, what the crates do instead, and what would change if upstream publishes.
 
 ## Architecture
 
@@ -21,6 +29,26 @@ Documentation for the SceneWorks inference workspace.
 - **[Audio Backend Strategy](architecture/audio-backend-strategy.md)** — why audio generation
   is Candle-native on every platform (no ONNX/third backend), and how the runtime catalog's
   dedicated audio section carries a `candle` audio lane inside the mlx macOS bundle.
+
+## Licensing
+
+The [`licensing/`](licensing/) directory holds the primary-source evidence behind the model-weight
+licence surface — the canonical text URL, the verbatim upstream identifier, and a quoted operative
+clause for every term assigned to a licence family.
+
+- **[Licence family evidence pack (sc-16662)](licensing/sc-16662-licence-family-evidence.md)** —
+  the licence families, quote-checkable, with an explicit unresolved list. **Draft, unsigned.** It
+  records facts, not legal conclusions.
+- **[Media checkpoint census (sc-16665)](licensing/sc-16665-media-checkpoint-census.md)** — which
+  upstream checkpoints every registered media provider actually loads, read from the code. Records
+  component identity only: it assigns no families and asserts no licences, and marks every component
+  whose upstream the repository does not state as UNDETERMINED.
+- **[Checkpoint licence evidence (sc-16665)](licensing/sc-16665-checkpoint-licence-evidence.md)** —
+  the primary-source licence read for each of those checkpoints, and the sign-off document behind
+  `license::components`. **Draft, unsigned.** Its
+  [known holes](licensing/sc-16665-checkpoint-licence-evidence.md#known-holes--the-rows-sc-16665-deliberately-did-not-write)
+  section is the authoritative list of checkpoints that were left without a row rather than given a
+  guessed one.
 
 ## Migration records
 

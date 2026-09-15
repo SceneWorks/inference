@@ -2,7 +2,7 @@
 //! of the mlx lane's `process_parity`). Reads the shared `process_golden.safetensors` — integer /
 //! boolean outputs, so the match is **exact**. CPU, weight-free.
 
-mod common;
+use crate::common;
 
 use common::Golden;
 

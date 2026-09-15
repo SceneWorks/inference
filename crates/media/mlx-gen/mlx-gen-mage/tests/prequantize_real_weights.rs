@@ -8,7 +8,7 @@
 //! MAGE_SNAPSHOT=<dense flat microsoft/Mage-Flow-Base snapshot> \
 //! MAGE_TIER_ROOT=<the generated variant tier tree, holding bf16/ q8/ q4/> \
 //! MAGE_COMPONENTS_ROOT=<the generated shared components tree, holding bf16/ q8/ q4/> \
-//!   cargo test --locked -p mlx-gen-mage --test prequantize_real_weights -- --ignored --nocapture
+//!   cargo test --locked -p mlx-gen-mage --test integration prequantize_real_weights:: -- --ignored --nocapture
 //! ```
 //!
 //! `MAGE_TIER_ROOT` / `MAGE_COMPONENTS_ROOT` are produced by `examples/mage_prequant.rs`.
@@ -17,6 +17,20 @@ use std::path::{Path, PathBuf};
 
 use mlx_gen_mage::convert::{prequantize_shared_components, prequantize_variant_tier};
 use mlx_gen_mage::{MageComponentDirs, MageFlowPipeline};
+
+#[path = "../../tests/support/atomic_cache.rs"]
+#[allow(dead_code)] // this cache has no symlink components
+mod atomic_cache;
+
+/// Root for this suite's **deliberately persistent** artifacts. `MAGE_PREQUANT_DIR` points them
+/// somewhere durable; the `$TMPDIR` default is intentional and must NOT become a `tempfile`
+/// guard — these outputs outlive the test on purpose (a pre-quantized tree the NEXT run is meant to reuse), so a guard
+/// would delete the very thing the test exists to produce (sc-17791).
+fn prequant_root() -> PathBuf {
+    std::env::var("MAGE_PREQUANT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir())
+}
 
 fn env_dir(key: &str) -> Option<PathBuf> {
     std::env::var(key)
@@ -46,24 +60,27 @@ fn ensure_trees() -> (PathBuf, PathBuf) {
         return (t, c);
     }
     let src = snapshot();
-    let base = std::env::temp_dir().join("mage-prequant-test");
+    let base = prequant_root().join("mage-prequant-test");
     let (tiers, components) = (base.join("variant"), base.join("components"));
     // Both packed tiers, so the tier-mismatch test has a q8 artifact to point at even when the
     // caller did not pre-build a full tree. `bf16` is skipped here: it is a byte-exact copy of the
     // dense snapshot, and the tests that want it tolerate its absence.
     for tier in ["q8", "q4"] {
-        if !tiers.join(tier).exists() {
-            prequantize_variant_tier(
-                &src,
-                &tiers.join(tier),
-                tier,
-                "SceneWorks/Mage-Flow-Components-mlx",
-            )
-            .expect("prequantize_variant_tier");
+        let variant = tiers.join(tier);
+        if !variant.exists() {
+            let staging =
+                atomic_cache::prepare_staging(&variant).expect("prepare variant tier staging dir");
+            prequantize_variant_tier(&src, &staging, tier, "SceneWorks/Mage-Flow-Components-mlx")
+                .expect("prequantize_variant_tier");
+            atomic_cache::publish(&staging, &variant).expect("publish variant tier");
         }
-        if !components.join(tier).exists() {
-            prequantize_shared_components(&src, &components.join(tier), tier)
+        let shared = components.join(tier);
+        if !shared.exists() {
+            let staging = atomic_cache::prepare_staging(&shared)
+                .expect("prepare shared components staging dir");
+            prequantize_shared_components(&src, &staging, tier)
                 .expect("prequantize_shared_components");
+            atomic_cache::publish(&staging, &shared).expect("publish shared components");
         }
     }
     (tiers, components)

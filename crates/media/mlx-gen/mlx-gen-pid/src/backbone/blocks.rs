@@ -3,36 +3,52 @@
 //! the corresponding classes in `pixeldit_official.py`.
 
 use mlx_rs::fast::scaled_dot_product_attention;
-use mlx_rs::ops::{concatenate_axis, pad, split, split_sections};
+use mlx_rs::ops::{pad, split, split_sections};
 use mlx_rs::Array;
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::nn::{gated, modulate};
+use mlx_gen::qkv::{
+    self, AttnPrepSpec, NormDtype, QkNormSpec, QkvHeads, QkvSource, RopeSpec, RopeStyle,
+    RopeTables, RotationAxes, StreamOrder,
+};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
 use super::layers::{lin, rms, FeedForward, Mlp};
-use super::rope::apply_rope;
 
-/// `[B,S,3·H·Dh]` → q,k,v each `[B,S,H,Dh]` via the reference's `reshape(B,S,3,H,Dh).permute(2,...)`.
-fn split_qkv(qkv: &Array, heads: i32, head_dim: i32) -> Result<(Array, Array, Array)> {
-    let sh = qkv.shape();
-    let (b, s) = (sh[0], sh[1]);
-    let q5 = qkv.reshape(&[b, s, 3, heads, head_dim])?;
-    let parts = split(&q5, 3, 2)?;
-    let take = |a: &Array| -> Result<Array> { Ok(a.reshape(&[b, s, heads, head_dim])?) };
-    Ok((take(&parts[0])?, take(&parts[1])?, take(&parts[2])?))
-}
-
-/// `[B,H,S,Dh]` → `[B,S,H·Dh]`.
-fn merge_heads(x: &Array) -> Result<Array> {
-    let sh = x.shape();
-    let (b, h, s, d) = (sh[0], sh[1], sh[2], sh[3]);
-    Ok(x.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, h * d])?)
-}
-
-fn to_bhsd(x: &Array) -> Result<Array> {
-    Ok(x.transpose_axes(&[0, 2, 1, 3])?) // [B,S,H,Dh] -> [B,H,S,Dh]
+/// SC-18319 — PID's shared knob selection, applied to one stream: fused packed QKV (knob 9),
+/// per-head q/k RMSNorm after the head split (knob 1), adjacent-pair/interleaved-complex rotation
+/// (knob 2) applied **head-major** (after the SDPA transpose, exactly where `backbone::rope`'s
+/// `apply_rope` used to run it), and a shared q/k table.
+///
+/// The QK-norm runs under [`NormDtype::F32RoundTrip`], which is `backbone::layers::rms` verbatim:
+/// the reference PixDiT `RMSNorm` upcasts **both** the stream and the weight to f32, normalizes, and
+/// casts back to the input dtype. That is load-bearing on the real bf16 decode (a bf16-internal
+/// reduction drifts over the stack's ~60 norms) and a no-op on the f32 fixtures, so it is NOT
+/// interchangeable with the default `Native` policy.
+fn pid_prepare(
+    packed: &Array,
+    q_norm: &Array,
+    k_norm: &Array,
+    heads: i32,
+    head_dim: i32,
+    cos: &Array,
+    sin: &Array,
+) -> Result<QkvHeads> {
+    let spec = AttnPrepSpec::new(heads, head_dim)
+        .with_qk_norm(
+            QkNormSpec::per_head(q_norm, k_norm, super::layers::RMS_EPS)
+                .with_dtype(NormDtype::F32RoundTrip),
+        )
+        .with_rope(RopeSpec {
+            style: RopeStyle::AdjacentPair,
+            q: Some(RopeTables::new(cos, sin)),
+            k: Some(RopeTables::new(cos, sin)),
+            ..RopeSpec::default()
+        })
+        .with_rotation_axes(RotationAxes::HeadMajor);
+    qkv::prepare(QkvSource::Packed(packed), &spec)
 }
 
 /// Flash-attention entry that stays on MLX's *fused* full-attention kernel for any head_dim.
@@ -86,14 +102,18 @@ impl RotaryAttention {
 
     /// `x`: `[B, N, dim]`; `cos`/`sin`: `[N, head_dim/2]`.
     pub fn forward(&self, x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
-        let (q, k, v) = split_qkv(&self.qkv.forward(x)?, self.heads, self.head_dim)?;
-        let q = rms(&q, &self.q_norm)?;
-        let k = rms(&k, &self.k_norm)?;
-        let (q, k, v) = (to_bhsd(&q)?, to_bhsd(&k)?, to_bhsd(&v)?);
-        let (q, k) = apply_rope(&q, &k, cos, sin)?;
+        let heads = pid_prepare(
+            &self.qkv.forward(x)?,
+            &self.q_norm,
+            &self.k_norm,
+            self.heads,
+            self.head_dim,
+            cos,
+            sin,
+        )?;
         let scale = (self.head_dim as f32).powf(-0.5);
-        let o = flash_sdpa(&q, &k, &v, scale)?;
-        self.proj.forward(&merge_heads(&o)?)
+        let o = flash_sdpa(&heads.q, &heads.k, &heads.v, scale)?;
+        self.proj.forward(&qkv::merge_heads(&o)?)
     }
 }
 
@@ -140,31 +160,37 @@ impl MMDiTJointAttention {
     ) -> Result<(Array, Array)> {
         let ny = y.shape()[1];
 
-        let (qx, kx, vx) = split_qkv(&self.qkv_x.forward(x)?, self.heads, self.head_dim)?;
-        let qx = rms(&qx, &self.q_norm_x)?;
-        let kx = rms(&kx, &self.k_norm_x)?;
-        let (qy, ky, vy) = split_qkv(&self.qkv_y.forward(y)?, self.heads, self.head_dim)?;
-        let qy = rms(&qy, &self.q_norm_y)?;
-        let ky = rms(&ky, &self.k_norm_y)?;
-
-        let (qx, kx, vx) = (to_bhsd(&qx)?, to_bhsd(&kx)?, to_bhsd(&vx)?);
-        let (qy, ky, vy) = (to_bhsd(&qy)?, to_bhsd(&ky)?, to_bhsd(&vy)?);
-        let (qx, kx) = apply_rope(&qx, &kx, cos_img, sin_img)?;
-        let (qy, ky) = apply_rope(&qy, &ky, cos_txt, sin_txt)?;
-
-        // joint sequence [txt, img] along the token axis (axis 2 of [B,H,S,Dh])
-        let q = concatenate_axis(&[&qy, &qx], 2)?;
-        let k = concatenate_axis(&[&ky, &kx], 2)?;
-        let v = concatenate_axis(&[&vy, &vx], 2)?;
+        // SC-18319 — one shared prologue per stream (2-D RoPE on the image side, 1-D on the text
+        // side: knob 6's "separate q and k tables" degenerate case where the *streams* differ), then
+        // the `[txt, img]` join (knob 11).
+        let img = pid_prepare(
+            &self.qkv_x.forward(x)?,
+            &self.q_norm_x,
+            &self.k_norm_x,
+            self.heads,
+            self.head_dim,
+            cos_img,
+            sin_img,
+        )?;
+        let txt = pid_prepare(
+            &self.qkv_y.forward(y)?,
+            &self.q_norm_y,
+            &self.k_norm_y,
+            self.heads,
+            self.head_dim,
+            cos_txt,
+            sin_txt,
+        )?;
+        let joint = StreamOrder::TextFirst.join(&img, &txt)?;
         let scale = (self.head_dim as f32).powf(-0.5);
-        let out = flash_sdpa(&q, &k, &v, scale)?;
+        let out = flash_sdpa(&joint.q, &joint.k, &joint.v, scale)?;
 
         // Split the joint `[txt, img]` output back at the fixed `ny` boundary with a zero-copy strided
         // split (`[0..ny]` = txt, `[ny..ny+nx]` = img), vs. a pair of arange `take_axis` gathers run in
         // every one of the 14 patch blocks per step (F-152 — the qwen F-114/F-115 fix, now travelled).
         let mut parts = split_sections(&out, &[ny], 2)?; // [txt (0..ny), img (ny..end)]
-        let out_x = merge_heads(&parts.swap_remove(1))?; // img — remove index 1 before 0 (swap_remove reindexes)
-        let out_y = merge_heads(&parts.swap_remove(0))?; // txt
+        let out_x = qkv::merge_heads(&parts.swap_remove(1))?; // img — remove index 1 before 0 (swap_remove reindexes)
+        let out_y = qkv::merge_heads(&parts.swap_remove(0))?; // txt
         Ok((self.proj_x.forward(&out_x)?, self.proj_y.forward(&out_y)?))
     }
 }

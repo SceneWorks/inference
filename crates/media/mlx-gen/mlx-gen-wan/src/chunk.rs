@@ -5,7 +5,7 @@
 //! (sc-5445). These knobs bound the **DiT-denoise** per-step activation high-water:
 //! 1. **Lazy-graph depth.** The whole 40-block forward is one lazy graph evaluated once per denoise
 //!    step, so without intervention the peak is ~the **sum** of every block's transients rather than
-//!    one block's; [`DitMemoryConfig::eval_per_block`] caps it at one block.
+//!    one block's; [`DitMemoryConfig::eval_cadence`] caps it at every *n*-th block.
 //! 2. **The FFN intermediate.** The gated-GELU FFN materializes a `[L, ffn_dim]` (≈`dim`×2.7) tensor,
 //!    the largest single denoise transient; [`DitMemoryConfig::ffn_seq_chunk`] bounds it.
 //! 3. **The self-attention score matrix.** *If* MLX's `scaled_dot_product_attention` falls back from
@@ -19,7 +19,8 @@
 //! way the shared wan pipeline already does). These DiT levers are denoise *headroom* + the
 //! generalizable shared-layer "practice" for Wan/Bernini, not the thing that unblocked 832×480.
 //!
-//! **Equivalence.** `eval_per_block` is exactly bit-identical (it only forces materialization). The
+//! **Equivalence.** The evaluation cadence is exactly bit-identical (it only forces
+//! materialization). The
 //! sequence-chunking levers are *numerically* equivalent, not bit-identical: the FFN / QKV projections
 //! are per-token and attention softmax is per-query-row, so the math is unchanged, but MLX's Metal
 //! GEMM/SDPA kernels are tile-specialized by the row (M) dimension, so a `[chunk, k]` matmul rounds
@@ -41,6 +42,9 @@
 //!   Bernini / 5594 Wan), deliberately not done here to avoid unvalidated changes to Wan's
 //!   training/inference paths.
 
+use std::num::NonZeroU32;
+
+use mlx_gen::gen_core::{FfnChunk, GenerationMemory, GraphEvalCadence};
 use mlx_gen::Result;
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
@@ -52,15 +56,25 @@ use mlx_rs::Array;
 pub struct DitMemoryConfig {
     /// Run each block's FFN (`[L, ffn_dim]` intermediate) over sequence row-blocks of at most this
     /// many tokens. `None` ⇒ the whole sequence at once. A secondary transient (see the module doc).
-    pub ffn_seq_chunk: Option<usize>,
+    pub ffn_seq_chunk: Option<FfnChunk>,
     /// Run self-attention over query row-blocks of at most this many tokens, bounding the score
     /// matrix from `[heads, L, L]` to `[heads, chunk, L]` (K/V stay full, so the softmax is
     /// unchanged). `None` ⇒ the whole sequence at once. **The critical lever** at high resolution —
     /// MLX SDPA materializes the score matrix here (module doc).
+    ///
+    /// Deliberately **not** promoted to a shared request domain by sc-18317: bounding attention
+    /// scratch is already the memory ladder's rung 3
+    /// ([`GenerationMemory::chunk_attention`](mlx_gen::gen_core::GenerationMemory::chunk_attention) +
+    /// `attention_chunk_size`), and a second request-level control over the same mechanism would let a
+    /// selector and the ladder disagree about one request's attention budget.
     pub attn_query_chunk: Option<usize>,
-    /// Force-evaluate (and free) each transformer block's output before starting the next, so the
-    /// peak is ~one block's activations instead of the whole-depth lazy graph. Bit-exact.
-    pub eval_per_block: bool,
+    /// Force-evaluate (and free) every *n*-th transformer block's output before starting the next, so
+    /// the peak is ~that many blocks' activations instead of the whole-depth lazy graph. `None` ⇒ no
+    /// forced evaluation inside the forward. Bit-exact at every cadence.
+    ///
+    /// Generalized from the pre-sc-18317 `eval_per_block: bool`:
+    /// [`GraphEvalCadence::EVERY_BLOCK`] is that bool's `true`, `None` is its `false`.
+    pub eval_cadence: Option<GraphEvalCadence>,
 }
 
 impl DitMemoryConfig {
@@ -70,24 +84,61 @@ impl DitMemoryConfig {
     pub const OFF: Self = Self {
         ffn_seq_chunk: None,
         attn_query_chunk: None,
-        eval_per_block: false,
+        eval_cadence: None,
     };
 
     /// `true` if no lever is active (the [`OFF`](Self::OFF) fast path — skip the chunk plumbing).
     pub fn is_off(&self) -> bool {
-        self.ffn_seq_chunk.is_none() && self.attn_query_chunk.is_none() && !self.eval_per_block
+        self.ffn_seq_chunk.is_none()
+            && self.attn_query_chunk.is_none()
+            && self.eval_cadence.is_none()
+    }
+
+    /// The FFN chunk in the `usize` sequence rows [`map_seq_chunks`] takes.
+    pub fn ffn_chunk_rows(&self) -> Option<usize> {
+        self.ffn_seq_chunk.map(FfnChunk::rows_usize)
+    }
+
+    /// Whether the block at zero-based `index` within the trunk is an evaluation boundary — the one
+    /// decision point the consumer's block loop reads, so a cadence cannot be honoured in one place
+    /// and dropped in another.
+    pub fn evaluates_after_block(&self, index: usize) -> bool {
+        self.eval_cadence
+            .is_some_and(|cadence| cadence.evaluates_after_block(index))
+    }
+
+    /// Overlay one request's typed execution selections onto `base` (sc-18317).
+    ///
+    /// The only seam by which a request reaches these levers. A set field replaces the base value, an
+    /// unset field leaves it — which is what keeps a consumer's own production default (SCAIL-2 ships
+    /// a non-`OFF` one) intact for every request that selects nothing. Domain admission already
+    /// happened at the shared request floor against the consumer's declared
+    /// `Capabilities::execution`; re-deriving it here is how the two drift apart.
+    ///
+    /// [`Self::attn_query_chunk`] is untouched on purpose — see its field doc.
+    pub fn with_request(base: Self, memory: Option<&GenerationMemory>) -> Self {
+        let Some(memory) = memory else {
+            return base;
+        };
+        Self {
+            ffn_seq_chunk: memory.ffn_chunk.or(base.ffn_seq_chunk),
+            eval_cadence: memory.graph_eval_cadence.or(base.eval_cadence),
+            ..base
+        }
     }
 
     /// Overlay the environment onto `base` so a deployment can tune the memory/throughput tradeoff
     /// without a recompile (the sc-5681 acceptance asks for steerable chunk sizes):
     ///   * `MLX_GEN_WAN_FFN_SEQ_CHUNK` — FFN sequence chunk (`0` disables; unset keeps `base`).
     ///   * `MLX_GEN_WAN_ATTN_QUERY_CHUNK` — attention query chunk (`0` disables; unset keeps `base`).
-    ///   * `MLX_GEN_WAN_EVAL_PER_BLOCK` — `1`/`true`/`on` or `0`/`false`/`off` (unset keeps `base`).
+    ///   * `MLX_GEN_WAN_EVAL_PER_BLOCK` — the evaluation cadence. `0`/`false`/`off` disables;
+    ///     `1`/`true`/`on` is every block; a positive integer *n* is every *n*-th block (the
+    ///     sc-18317 generalization — the boolean spellings keep their exact previous meaning).
     pub fn from_env(base: Self) -> Self {
         Self {
-            ffn_seq_chunk: env_chunk("MLX_GEN_WAN_FFN_SEQ_CHUNK", base.ffn_seq_chunk),
+            ffn_seq_chunk: env_ffn_chunk("MLX_GEN_WAN_FFN_SEQ_CHUNK", base.ffn_seq_chunk),
             attn_query_chunk: env_chunk("MLX_GEN_WAN_ATTN_QUERY_CHUNK", base.attn_query_chunk),
-            eval_per_block: env_bool("MLX_GEN_WAN_EVAL_PER_BLOCK", base.eval_per_block),
+            eval_cadence: env_cadence("MLX_GEN_WAN_EVAL_PER_BLOCK", base.eval_cadence),
         }
     }
 }
@@ -111,14 +162,32 @@ fn env_chunk(var: &str, base: Option<usize>) -> Option<usize> {
     }
 }
 
-/// A boolean knob from `var` (`1`/`true`/`on` vs `0`/`false`/`off`, case-insensitive); unset /
-/// unrecognized keeps `base`.
-fn env_bool(var: &str, base: bool) -> bool {
+/// An [`FfnChunk`] knob from `var`: a positive integer enables, `0` disables (`None`), anything else
+/// (unset / unparseable) keeps `base`.
+fn env_ffn_chunk(var: &str, base: Option<FfnChunk>) -> Option<FfnChunk> {
+    match std::env::var(var) {
+        Ok(s) => match s.trim().parse::<u32>() {
+            Ok(0) => None,
+            Ok(n) => NonZeroU32::new(n).map(FfnChunk::from_nonzero),
+            Err(_) => base,
+        },
+        Err(_) => base,
+    }
+}
+
+/// A [`GraphEvalCadence`] knob from `var`. Accepts the historical boolean spellings
+/// (`1`/`true`/`on`/`yes` ⇒ every block, `0`/`false`/`off`/`no` ⇒ disabled) **and** a positive
+/// integer cadence; unset / unrecognized keeps `base`.
+fn env_cadence(var: &str, base: Option<GraphEvalCadence>) -> Option<GraphEvalCadence> {
     match std::env::var(var) {
         Ok(s) => match s.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "on" | "yes" => true,
-            "0" | "false" | "off" | "no" => false,
-            _ => base,
+            "true" | "on" | "yes" => Some(GraphEvalCadence::EVERY_BLOCK),
+            "false" | "off" | "no" => None,
+            other => match other.parse::<u32>() {
+                Ok(0) => None,
+                Ok(n) => NonZeroU32::new(n).map(GraphEvalCadence::from_nonzero),
+                Err(_) => base,
+            },
         },
         Err(_) => base,
     }
@@ -186,7 +255,7 @@ mod tests {
         assert!(DitMemoryConfig::OFF.is_off());
         assert!(DitMemoryConfig::default().is_off());
         assert!(!DitMemoryConfig {
-            eval_per_block: true,
+            eval_cadence: Some(GraphEvalCadence::EVERY_BLOCK),
             ..DitMemoryConfig::OFF
         }
         .is_off());
@@ -230,10 +299,65 @@ mod tests {
         }
     }
 
+    /// An unset variable keeps `base` for every knob — the property the provider's own production
+    /// default rests on. (Set cases are covered by the typed cadence/chunk unit tests; a `set_var`
+    /// in a library test leaks into every later test in the binary.)
     #[test]
-    fn env_helpers_parse() {
+    fn env_helpers_keep_the_base_when_unset() {
         assert_eq!(env_chunk("definitely_unset_var_xyz", Some(99)), Some(99));
-        assert!(env_bool("definitely_unset_var_xyz", true));
-        assert!(!env_bool("definitely_unset_var_xyz", false));
+        let chunk = Some(FfnChunk::new(8192).unwrap());
+        assert_eq!(env_ffn_chunk("definitely_unset_var_xyz", chunk), chunk);
+        let cadence = Some(GraphEvalCadence::new(4).unwrap());
+        assert_eq!(env_cadence("definitely_unset_var_xyz", cadence), cadence);
+        assert_eq!(env_cadence("definitely_unset_var_xyz", None), None);
+    }
+
+    /// **sc-18317 default preservation + reach at the request seam.** An unset selection must leave a
+    /// consumer's own non-`OFF` production default untouched (SCAIL-2 ships one); a set selection must
+    /// replace exactly its own field and must not disturb the attention query chunk, which stays the
+    /// memory ladder's business.
+    #[test]
+    fn with_request_overlays_only_what_the_request_selects() {
+        let production = DitMemoryConfig {
+            ffn_seq_chunk: Some(FfnChunk::new(8192).unwrap()),
+            attn_query_chunk: Some(1024),
+            eval_cadence: Some(GraphEvalCadence::EVERY_BLOCK),
+        };
+        assert_eq!(
+            DitMemoryConfig::with_request(production, Some(&GenerationMemory::default())),
+            production,
+            "an unset selection must leave the provider default alone"
+        );
+        assert_eq!(
+            DitMemoryConfig::with_request(production, None),
+            production,
+            "a request with no memory block must leave the provider default alone"
+        );
+
+        let selected = GenerationMemory {
+            graph_eval_cadence: Some(GraphEvalCadence::new(5).unwrap()),
+            ffn_chunk: Some(FfnChunk::new(2048).unwrap()),
+            // A ladder rung set alongside must not reach the attention query chunk through this seam.
+            chunk_attention: true,
+            attention_chunk_size: Some(64),
+            ..Default::default()
+        };
+        let overlaid = DitMemoryConfig::with_request(production, Some(&selected));
+        assert_eq!(overlaid.ffn_chunk_rows(), Some(2048));
+        assert_eq!(
+            overlaid.eval_cadence,
+            Some(GraphEvalCadence::new(5).unwrap())
+        );
+        assert_eq!(
+            overlaid.attn_query_chunk,
+            Some(1024),
+            "the attention query chunk is not a request domain"
+        );
+        let boundaries: Vec<usize> = (0..10)
+            .filter(|index| overlaid.evaluates_after_block(*index))
+            .collect();
+        assert_eq!(boundaries, vec![4, 9]);
+        assert!(!DitMemoryConfig::OFF.evaluates_after_block(0));
+        assert_eq!(DitMemoryConfig::OFF.ffn_chunk_rows(), None);
     }
 }

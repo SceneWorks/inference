@@ -7,7 +7,7 @@
 //! through the backbone (attention projections + SwiGLU, both paths); real-weight Q8≈bf16 e2e is the
 //! `#[ignore]` `quant_realweight` test.
 //!
-//! Run: `cargo test -p mlx-gen-sensenova --test quant_smoke -- --nocapture`
+//! Run: `cargo test -p mlx-gen-sensenova --test integration quant_smoke:: -- --nocapture`
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sensenova::{NeoChatConfig, Path, Qwen3Backbone};

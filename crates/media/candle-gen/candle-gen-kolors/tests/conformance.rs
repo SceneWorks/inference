@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! set KOLORS_SNAPSHOT=C:\Users\…\models--Kwai-Kolors--Kolors-diffusers\snapshots\<hash>
-//! cargo test -p candle-gen-kolors --features cuda --release --test conformance -- --ignored
+//! cargo test -p candle-gen-kolors --features cuda --release --test integration conformance:: -- --ignored
 //! ```
 //!
 //! The snapshot must carry the materialized `tokenizer/tokenizer.json` (ChatGLM3 ships only a slow SP

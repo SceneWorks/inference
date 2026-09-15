@@ -37,16 +37,23 @@
 //! wired: the klein weight-variant edits (`flux2_klein_9b_kv_edit`) and LoRA/LoKr. `backend =
 //! "candle"`, `mac_only = false`.
 
+pub mod caption_upsample;
 pub mod config;
 pub mod control_provider;
 pub mod convert;
 pub mod edit_provider;
+#[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
+pub mod memory_strategy;
+pub mod nvfp4_roles;
 pub mod pipeline;
 pub mod pos_embed;
+pub mod preview;
 pub mod quant;
+pub mod single_file;
 pub mod text_encoder;
 pub mod transformer;
 pub mod vae;
+pub mod vision;
 
 /// Re-export the pinned width/height stride at the crate root so SceneWorks can tie each advertised
 /// FLUX.2 image bucket to `candle_gen_flux2::SIZE_MULTIPLE` (sc-12612) instead of a hand-copied literal.
@@ -54,24 +61,31 @@ pub use config::SIZE_MULTIPLE;
 pub use control_provider::{Flux2Control, Flux2ControlPaths, Flux2ControlRequest};
 pub use convert::convert_and_assemble;
 pub use edit_provider::{Flux2Edit, Flux2EditPaths, Flux2EditRequest};
+pub use single_file::Flux2BflToDiffusersMapping;
 pub use transformer::{
     Flux2ControlBranch, Flux2ControlTransformer, Flux2Transformer, CONTROL_IN_DIM,
 };
+
+/// Content identity for the CUDA resident/staged real-weight calibration harness.
+pub const RESIDENCY_CALIBRATION_FINGERPRINT: &str = "flux2-cuda-residency-caption-upsample-v2";
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
-    ModelDescriptor, OffloadPolicy, PidWeights, Progress, Quant, WeightsSource,
+    ModelDescriptor, PidWeights, PinnedWeightsFile, Progress, Quant, WeightsSource,
+    BASE_SNAPSHOT_COMPONENT,
 };
 use candle_gen::{CandleError, LatentDecoder, Result as CResult};
 use candle_gen_pid::{PidDecoder, PidEngine};
 
+use caption_upsample::CaptionUpsampler;
 use config::{Flux2Config, Flux2Variant};
 use text_encoder::Flux2PromptEncoder;
 use vae::Flux2Vae;
@@ -96,9 +110,16 @@ struct Components {
     /// and reused across every prompt/branch encode (sc-8991 / F-011) instead of re-parsing
     /// `tokenizer.json` per request.
     tokenizer: Arc<TextTokenizer>,
+    upsampler: Option<Arc<CaptionUpsampler>>,
     /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853), loaded once when the model
     /// was loaded with `LoadSpec::pid`. `None` ⇒ the native `Flux2Vae::decode_packed` (the default path).
     pid: Option<Arc<PidEngine>>,
+}
+
+struct SeqText {
+    te: Flux2PromptEncoder,
+    tokenizer: TextTokenizer,
+    upsampler: Option<CaptionUpsampler>,
 }
 
 /// The just-loaded heavy phase owned by the sequential path — the DiT + VAE + the optional PiD engine,
@@ -116,7 +137,7 @@ struct SeqHeavy {
 
 enum TextPhase {
     Resident(Components),
-    Sequential(Box<(Flux2PromptEncoder, TextTokenizer)>),
+    Sequential(Box<SeqText>),
 }
 
 enum HeavyPhase {
@@ -126,6 +147,90 @@ enum HeavyPhase {
 
 type Flux2Residency = candle_gen::Residency<TextPhase, HeavyPhase>;
 
+#[derive(Clone)]
+enum TextEncoderSource {
+    Trusted(WeightsSource),
+    Validated(Box<gen_core::ValidatedEncoderSource>),
+}
+
+impl TextEncoderSource {
+    fn load_vb(&self, dtype: DType, device: &Device) -> CResult<VarBuilder<'static>> {
+        match self {
+            Self::Trusted(source) => load_text_encoder_source(source, dtype, device),
+            Self::Validated(source) => {
+                source.read_unchanged(|weights| load_text_encoder_source(weights, dtype, device))
+            }
+        }
+    }
+
+    fn read_config_unchanged(&self) -> CResult<(PathBuf, Option<String>)> {
+        let read = |source: &WeightsSource| {
+            let path = match source {
+                WeightsSource::Dir(path) => path.join("config.json"),
+                WeightsSource::File(path) => path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join("config.json"),
+            };
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => Some(text),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(CandleError::Msg(format!(
+                        "flux2: read {}: {error}",
+                        path.display()
+                    )))
+                }
+            };
+            Ok((path, text))
+        };
+        match self {
+            Self::Trusted(source) => read(source),
+            Self::Validated(source) => source.read_unchanged(read),
+        }
+    }
+}
+
+fn load_text_encoder_source(
+    source: &WeightsSource,
+    dtype: DType,
+    device: &Device,
+) -> CResult<VarBuilder<'static>> {
+    let path = match source {
+        WeightsSource::Dir(path) | WeightsSource::File(path) => path,
+    };
+    candle_gen::load_path_mmap(path, dtype, device, "flux2 text encoder")
+}
+
+#[cfg(test)]
+type ComfyuiDitLoadTestHook =
+    Box<dyn FnMut(&candle_gen::candle_core::safetensors::MmapedSafetensors) -> CResult<()>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Deterministic barrier inside the real FLUX.2 ComfyUI loader after one mmap-backed provider
+    /// tensor is consumed and before conversion/model assembly returns to the pin post-check.
+    static COMFYUI_DIT_LOAD_TEST_HOOK: std::cell::RefCell<Option<ComfyuiDitLoadTestHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn run_comfyui_dit_load_test_hook(
+    source: &candle_gen::candle_core::safetensors::MmapedSafetensors,
+) -> CResult<()> {
+    COMFYUI_DIT_LOAD_TEST_HOOK.with(|slot| match slot.borrow_mut().as_mut() {
+        Some(hook) => hook(source),
+        None => Ok(()),
+    })
+}
+
+fn sanitize_log_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect()
+}
+
 /// A txt2img pipeline handle: snapshot root + device + the f32 compute dtype. `pub(crate)` so the
 /// edit provider ([`edit_provider`]) reuses the snapshot mmap + prompt-encode scaffolding.
 #[derive(Clone)]
@@ -133,6 +238,7 @@ pub(crate) struct Pipeline {
     pub(crate) variant: Flux2Variant,
     pub(crate) cfg: Flux2Config,
     pub(crate) root: PathBuf,
+    text_encoder_source: TextEncoderSource,
     pub(crate) device: Device,
     pub(crate) dtype: DType,
     /// When `Some`, the DiT (and, for dev, the TE) is staged dense in CPU RAM and quantized onto
@@ -147,21 +253,41 @@ pub(crate) struct Pipeline {
     /// see [`convert::build_comfyui_dit_map`]) instead of the snapshot's `transformer/` dir; the text
     /// encoder / VAE / tokenizer still come from the resident snapshot `root`. `None` on every other
     /// path (registry txt2img, edit, control).
-    pub(crate) comfyui_dit: Option<PathBuf>,
+    pub(crate) comfyui_dit: Option<PinnedWeightsFile>,
+    /// A klein universal **single-file** DiT (epic 11037, sc-21485): a transformer-only BFL-keyed
+    /// `.safetensors` (dense bf16 or `.comfy_quant`-described NVFP4-mixed) consumed through the
+    /// shared logical-weight plan + declarative transforms instead of a provider-local converter.
+    /// The text encoder / VAE / tokenizer still come from the resident klein snapshot `root`.
+    /// `None` on every other path.
+    pub(crate) klein_dit: Option<PinnedWeightsFile>,
+    /// The klein single-file import's three correlated checkpoint facts (sc-21484 / epic E8),
+    /// bound to the verified source pin and published by [`Self::load_klein_planned_dit`] through
+    /// the shared provider-neutral [`gen_core::CheckpointFactsSink`] (sc-11045 fix round — one
+    /// pattern across providers, replacing a bespoke `Arc<OnceLock>`). The sink clones share one
+    /// cell, and it stays empty on every non-klein-file route — a directory load has no single
+    /// source to bind facts to. Read through the
+    /// [`gen_core::Generator::checkpoint_weight_facts`] trait surface on [`Flux2Generator`].
+    pub(crate) klein_facts: gen_core::CheckpointFactsSink,
+    pub(crate) adapters: Vec<gen_core::AdapterSpec>,
 }
 
 impl Pipeline {
+    #[cfg(test)]
     pub(crate) fn load(
         variant: Flux2Variant,
         quant: Option<Quant>,
         root: &Path,
         device: &Device,
         pid_spec: Option<PidWeights>,
+        adapters: Vec<gen_core::AdapterSpec>,
     ) -> Self {
         Self {
             variant,
             cfg: variant.config(),
             root: root.to_path_buf(),
+            text_encoder_source: TextEncoderSource::Trusted(WeightsSource::Dir(
+                root.join("text_encoder"),
+            )),
             device: device.clone(),
             // FLUX.2 runs the reference math in f32 (the TE + the MMDiT). The weights are large but
             // the math is parity-sensitive; a bf16 pass is a follow-up optimization.
@@ -169,6 +295,34 @@ impl Pipeline {
             quant,
             pid_spec,
             comfyui_dit: None,
+            klein_dit: None,
+            klein_facts: gen_core::CheckpointFactsSink::new(),
+            adapters,
+        }
+    }
+
+    pub(crate) fn load_with_text_encoder(
+        variant: Flux2Variant,
+        quant: Option<Quant>,
+        root: &Path,
+        text_encoder_source: gen_core::ValidatedEncoderSource,
+        device: &Device,
+        pid_spec: Option<PidWeights>,
+        adapters: Vec<gen_core::AdapterSpec>,
+    ) -> Self {
+        Self {
+            variant,
+            cfg: variant.config(),
+            root: root.to_path_buf(),
+            text_encoder_source: TextEncoderSource::Validated(Box::new(text_encoder_source)),
+            device: device.clone(),
+            dtype: DType::F32,
+            quant,
+            pid_spec,
+            comfyui_dit: None,
+            klein_dit: None,
+            klein_facts: gen_core::CheckpointFactsSink::new(),
+            adapters,
         }
     }
 
@@ -181,18 +335,81 @@ impl Pipeline {
         quant: Option<Quant>,
         root: &Path,
         device: &Device,
-        comfyui_dit: PathBuf,
-    ) -> Self {
-        Self {
+        comfyui_dit: PinnedWeightsFile,
+        pid_spec: Option<PidWeights>,
+        adapters: Vec<gen_core::AdapterSpec>,
+    ) -> CResult<Self> {
+        comfyui_dit.ensure_unchanged().map_err(|error| {
+            CandleError::Msg(format!(
+                "flux2 comfyui: validate transformer source: {error}"
+            ))
+        })?;
+        Ok(Self {
             variant: Flux2Variant::Dev,
             cfg: Flux2Variant::Dev.config(),
             root: root.to_path_buf(),
+            text_encoder_source: TextEncoderSource::Trusted(WeightsSource::Dir(
+                root.join("text_encoder"),
+            )),
             device: device.clone(),
             dtype: DType::F32,
             quant,
-            pid_spec: None,
+            pid_spec,
             comfyui_dit: Some(comfyui_dit),
-        }
+            klein_dit: None,
+            klein_facts: gen_core::CheckpointFactsSink::new(),
+            adapters,
+        })
+    }
+
+    /// Same as [`load_with_text_encoder`](Self::load_with_text_encoder) but sourcing the klein DiT
+    /// from a universal BFL-keyed single file (sc-21485). `root` is the resident FLUX.2-klein-9B
+    /// diffusers snapshot supplying the Qwen3 text encoder / VAE / tokenizer (the single DiT file
+    /// carries none of those). Load-time Q4/Q8 folding is rejected upstream
+    /// ([`validate_load_spec`]) — the NVFP4 rows are already quantized and refuse a re-fold by
+    /// contract.
+    pub(crate) fn load_klein_single_file_with_text_encoder(
+        root: &Path,
+        text_encoder_source: gen_core::ValidatedEncoderSource,
+        device: &Device,
+        klein_dit: PinnedWeightsFile,
+        pid_spec: Option<PidWeights>,
+        adapters: Vec<gen_core::AdapterSpec>,
+    ) -> CResult<Self> {
+        klein_dit.ensure_unchanged().map_err(|error| {
+            CandleError::Msg(format!(
+                "flux2 klein single-file: validate transformer source: {error}"
+            ))
+        })?;
+        Ok(Self {
+            variant: Flux2Variant::Klein9b,
+            cfg: Flux2Variant::Klein9b.config(),
+            root: root.to_path_buf(),
+            text_encoder_source: TextEncoderSource::Validated(Box::new(text_encoder_source)),
+            device: device.clone(),
+            dtype: DType::F32,
+            quant: None,
+            pid_spec,
+            comfyui_dit: None,
+            klein_dit: Some(klein_dit),
+            klein_facts: gen_core::CheckpointFactsSink::new(),
+            adapters,
+        })
+    }
+
+    pub(crate) fn load_comfyui_with_text_encoder(
+        quant: Option<Quant>,
+        root: &Path,
+        text_encoder_source: gen_core::ValidatedEncoderSource,
+        device: &Device,
+        comfyui_dit: PinnedWeightsFile,
+        pid_spec: Option<PidWeights>,
+        adapters: Vec<gen_core::AdapterSpec>,
+    ) -> CResult<Self> {
+        let mut pipeline =
+            Self::load_comfyui(quant, root, device, comfyui_dit, pid_spec, adapters)?;
+        pipeline.text_encoder_source = TextEncoderSource::Validated(Box::new(text_encoder_source));
+        Ok(pipeline)
     }
 
     /// mmap a VarBuilder over every `.safetensors` in the snapshot subdir `sub`, on `self.device`.
@@ -207,6 +424,9 @@ impl Pipeline {
         sub: &str,
         device: &Device,
     ) -> CResult<VarBuilder<'static>> {
+        if sub == "text_encoder" {
+            return self.text_encoder_source.load_vb(self.dtype, device);
+        }
         candle_gen::component_vb(&self.root, sub, self.dtype, device, "flux2")
     }
 
@@ -223,19 +443,23 @@ impl Pipeline {
     /// path (wrong tier / missing weights, no diagnostic). A well-formed config with no `quantization`
     /// block is simply a dense tier → `Ok(false)`. Mirrors the F-073 fix (sc-9010) in qwen-edit / krea.
     pub(crate) fn component_is_packed(&self, sub: &str) -> CResult<bool> {
-        let path = self.root.join(sub).join("config.json");
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            // No config.json at all → legitimate dense/fixture snapshot, not packed.
-            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            // Present but unreadable (permissions, partial download) → surface, don't swallow.
-            Err(e) => {
-                return Err(CandleError::Msg(format!(
-                    "flux2: read {}: {e}",
-                    path.display()
-                )))
-            }
+        let (path, text) = if sub == "text_encoder" {
+            self.text_encoder_source.read_config_unchanged()?
+        } else {
+            let path = self.root.join(sub).join("config.json");
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => Some(text),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(CandleError::Msg(format!(
+                        "flux2: read {}: {error}",
+                        path.display()
+                    )))
+                }
+            };
+            (path, text)
         };
+        let Some(text) = text else { return Ok(false) };
         // Present but malformed JSON → corrupt snapshot, error rather than fall to dense.
         let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
             CandleError::Msg(format!(
@@ -271,10 +495,17 @@ impl Pipeline {
     /// A staging-strategy change (e.g. pre-quantized snapshot consumption) now lives in one place. Use
     /// [`Self::load_quantizable`] directly only if a future caller needs non-default module builders.
     pub(crate) fn load_te_and_dit(&self) -> CResult<(Flux2PromptEncoder, Flux2Transformer)> {
-        self.load_quantizable(
+        let (te, mut dit) = self.load_quantizable(
             |cfg, vb| Ok(Flux2PromptEncoder::new(cfg, vb)?),
             |cfg, vb| Ok(Flux2Transformer::new(cfg, vb)?),
-        )
+        )?;
+        candle_gen::quant::install_dotted_adapters(
+            "flux2",
+            &self.adapters,
+            &self.device,
+            |visitor| dit.visit_adaptable_mut(visitor),
+        )?;
+        Ok((te, dit))
     }
 
     /// Load ONLY the text encoder for the sequential-residency path (epic 10765 Phase 1c, sc-10868) —
@@ -291,16 +522,37 @@ impl Pipeline {
         )
     }
 
+    fn load_caption_upsampler(&self, include_vision: bool) -> CResult<Option<CaptionUpsampler>> {
+        if !self.variant.is_dev() {
+            return Ok(None);
+        }
+        Ok(Some(CaptionUpsampler::new(
+            self.component_vb_on("text_encoder", &self.device)?,
+            include_vision,
+        )?))
+    }
+
     /// Load ONLY the DiT for the sequential path (sc-10868) — loaded after the text encoder was dropped,
     /// so it reuses the TE's freed allocator pool (capping peak at DiT+VAE, not TE+DiT+VAE). Same per-tier
     /// routing as the paired [`load_te_and_dit`](Self::load_te_and_dit) DiT half.
     pub(crate) fn load_dit_seq(&self) -> CResult<Flux2Transformer> {
-        self.load_one_quantizable(
-            "transformer",
-            self.quant,
-            |vb| Ok(Flux2Transformer::new(&self.cfg, vb)?),
-            |m, q, d| Ok(m.quantize(q, d)?),
-        )
+        let mut dit = match (&self.comfyui_dit, &self.klein_dit) {
+            (Some(dit_file), _) => self.load_comfyui_dit(dit_file),
+            (None, Some(dit_file)) => self.load_klein_planned_dit(dit_file),
+            (None, None) => self.load_one_quantizable(
+                "transformer",
+                self.quant,
+                |vb| Ok(Flux2Transformer::new(&self.cfg, vb)?),
+                |m, q, d| Ok(m.quantize(q, d)?),
+            ),
+        }?;
+        candle_gen::quant::install_dotted_adapters(
+            "flux2",
+            &self.adapters,
+            &self.device,
+            |visitor| dit.visit_adaptable_mut(visitor),
+        )?;
+        Ok(dit)
     }
 
     /// Which PiD spec [`load_pid`](Self::load_pid) should actually load: the spec the caller opted into
@@ -352,6 +604,66 @@ impl Pipeline {
         })
     }
 
+    pub(crate) fn load_dit_seq_with_memory(
+        &self,
+        stream_transformer_blocks: bool,
+    ) -> CResult<Flux2Transformer> {
+        if !stream_transformer_blocks {
+            return self.load_dit_seq();
+        }
+        if !self.adapters.is_empty() {
+            return Err(CandleError::Msg(
+                "FLUX.2 adapters require resident transformer blocks; disable block streaming"
+                    .into(),
+            ));
+        }
+        if self.comfyui_dit.is_some() || self.klein_dit.is_some() {
+            return Err(CandleError::Msg(format!(
+                "{}: streamed blocks require a directory-backed transformer tier",
+                self.variant.id()
+            )));
+        }
+        let packed = self.component_is_packed("transformer")?;
+        let source_device = if self.quant.is_some() && !packed {
+            Device::Cpu
+        } else {
+            self.device.clone()
+        };
+        Ok(Flux2Transformer::new_block_streamed(
+            &self.cfg,
+            self.component_vb_on("transformer", &source_device)?,
+            self.quant,
+            self.device.clone(),
+        )?)
+    }
+
+    fn load_heavy_seq_with_memory(
+        &self,
+        use_pid: bool,
+        stream_transformer_blocks: bool,
+        bounded_host_decode: bool,
+        cancel: &gen_core::CancelFlag,
+    ) -> CResult<SeqHeavy> {
+        if !stream_transformer_blocks && !bounded_host_decode {
+            return self.load_heavy_seq(use_pid);
+        }
+        candle_gen::check_cancel(cancel)?;
+        let transformer = self.load_dit_seq_with_memory(stream_transformer_blocks)?;
+        candle_gen::check_cancel(cancel)?;
+        let vae_device = if bounded_host_decode {
+            Device::Cpu
+        } else {
+            self.device.clone()
+        };
+        let vae = Flux2Vae::new(self.component_vb_on("vae", &vae_device)?)?;
+        candle_gen::check_cancel(cancel)?;
+        Ok(SeqHeavy {
+            transformer,
+            vae,
+            pid: self.load_pid(use_pid)?,
+        })
+    }
+
     /// Load the TE + DiT, routing each through the **packed** path (build straight from an MLX-packed
     /// tier on the GPU — sc-9087, no ~105 GB dense CPU staging) or the legacy **dense** path (stage
     /// dense in system RAM, then quantize each projection onto the GPU) per [`Self::component_is_packed`]
@@ -361,8 +673,8 @@ impl Pipeline {
     /// (`Flux2PromptEncoder::new` / `Flux2Transformer::new`).
     pub(crate) fn load_quantizable(
         &self,
-        mk_te: impl Fn(&Flux2Config, VarBuilder) -> CResult<Flux2PromptEncoder>,
-        mk_dit: impl Fn(&Flux2Config, VarBuilder) -> CResult<Flux2Transformer>,
+        mk_te: impl Fn(&Flux2Config, VarBuilder<'static>) -> CResult<Flux2PromptEncoder>,
+        mk_dit: impl Fn(&Flux2Config, VarBuilder<'static>) -> CResult<Flux2Transformer>,
     ) -> CResult<(Flux2PromptEncoder, Flux2Transformer)> {
         let te = self.load_one_quantizable(
             "text_encoder",
@@ -394,7 +706,7 @@ impl Pipeline {
         &self,
         sub: &str,
         quant: Option<Quant>,
-        build: impl FnOnce(VarBuilder) -> CResult<M>,
+        build: impl FnOnce(VarBuilder<'static>) -> CResult<M>,
         quantize: impl FnOnce(&mut M, Quant, &Device) -> CResult<()>,
     ) -> CResult<M> {
         match quant {
@@ -423,38 +735,101 @@ impl Pipeline {
     /// - **quant** (the 32B dev path): stage the dense f32 DiT in CPU RAM, then fold each projection onto
     ///   the GPU (`quantize`); the dense f32 32B never lands on the GPU (it would not fit).
     /// - **no quant** (small fixtures only): build dense on-device.
-    fn load_comfyui_dit(&self, dit_file: &Path) -> CResult<Flux2Transformer> {
-        // SAFETY: read-only mmap of a weight file; the standard candle loading path.
-        let mmap =
-            unsafe { candle_gen::candle_core::safetensors::MmapedSafetensors::new(dit_file) }
-                .map_err(|e| {
-                    CandleError::Msg(format!("flux2 comfyui: mmap {}: {e}", dit_file.display()))
+    fn load_comfyui_dit(&self, dit_file: &PinnedWeightsFile) -> CResult<Flux2Transformer> {
+        dit_file.read_unchanged(|dit_path| {
+            // SAFETY: read-only mmap of the pinned weight file; every tensor is remapped/materialized
+            // before the post-read fingerprint check runs.
+            let mmap =
+                unsafe { candle_gen::candle_core::safetensors::MmapedSafetensors::new(dit_path) }
+                    .map_err(|e| {
+                    CandleError::Msg(format!("flux2 comfyui: mmap {}: {e}", dit_path.display()))
                 })?;
-        let map = convert::build_comfyui_dit_map(&mmap, self.dtype)?;
-        match self.quant {
-            Some(q) => {
-                let vb = VarBuilder::from_tensors(map, self.dtype, &Device::Cpu);
-                let mut dit = Flux2Transformer::new(&self.cfg, vb)?;
-                dit.quantize(q, &self.device)?;
-                Ok(dit)
+            #[cfg(test)]
+            run_comfyui_dit_load_test_hook(&mmap)?;
+            let map = convert::build_comfyui_dit_map(&mmap, self.dtype)?;
+            match self.quant {
+                Some(q) => {
+                    let vb = VarBuilder::from_tensors(map, self.dtype, &Device::Cpu);
+                    let mut dit = Flux2Transformer::new(&self.cfg, vb)?;
+                    dit.quantize(q, &self.device)?;
+                    self.device.synchronize()?;
+                    Ok(dit)
+                }
+                None => {
+                    let vb = VarBuilder::from_tensors(map, self.dtype, &self.device);
+                    let dit = Flux2Transformer::new(&self.cfg, vb)?;
+                    self.device.synchronize()?;
+                    Ok(dit)
+                }
             }
-            None => {
-                let vb = VarBuilder::from_tensors(map, self.dtype, &self.device);
-                Ok(Flux2Transformer::new(&self.cfg, vb)?)
-            }
-        }
+        })
+    }
+
+    /// Build the klein DiT from a universal BFL-keyed single file through the shared logical-weight
+    /// seam (epic 11037, sc-21485): plan the file's own descriptors against the engine codec table
+    /// and this device's residency policy, open the shared reader over the compiled plan, and let
+    /// the one transformer constructor tree consume Dense / `PackedNvfp4` logical projections. The
+    /// fused-QKV row slices and the AdaLN half swap arrive as plan-declared transforms
+    /// ([`single_file::Flux2BflToDiffusersMapping`]) — no provider-local format parsing, no
+    /// re-classification, no load-time quant fold (the packed rows are already quantized).
+    ///
+    /// On success the import's three correlated checkpoint facts (sc-21484, epic E8) are bound to
+    /// the verified source pin and retained on the pipeline; read them back through
+    /// [`Flux2Generator::checkpoint_weight_facts`].
+    fn load_klein_planned_dit(&self, dit_file: &PinnedWeightsFile) -> CResult<Flux2Transformer> {
+        dit_file.read_unchanged(|dit_path| {
+            let mapping = single_file::Flux2BflToDiffusersMapping::new(&self.cfg);
+            // The one shared policy the fit gate prices under too (MAJOR 10: fp8 leg masked —
+            // this provider has no packed-fp8 consumer, so fp8 rows take the dense decode).
+            let residency = single_file::klein_import_residency(&self.device);
+            let plan =
+                candle_gen::logical_weights::plan_logical_weights(dit_path, &mapping, &residency)?;
+            let reader = candle_gen::logical_weights::LogicalWeightReader::open_with_capability(
+                dit_path,
+                plan,
+                &self.device,
+                residency.native_execution_capability(),
+            )?;
+            let ctx = candle_gen::quant::Nvfp4Context::new(&self.device)?;
+            let src = single_file::PlannedDitWeights::new(
+                reader,
+                self.device.clone(),
+                self.dtype,
+                ctx,
+                crate::nvfp4_roles::KleinRoleTable::new(&self.cfg),
+            );
+            let dit = Flux2Transformer::new_planned(&self.cfg, &src)?;
+            // The three correlated source/capability/receipt facts (sc-21484, epic E8): computed
+            // off the shared reader after the full materialization, so a contradiction between the
+            // stored codec inventory and what this run executed fails the load instead of shipping
+            // a dishonest report. Bound to the verified pin (`with_verified_source` re-verifies it,
+            // so facts are never reported about bytes that changed under the load) and RETAINED on
+            // the pipeline — the krea precedent — so a consumer reads them through
+            // [`Flux2Generator::checkpoint_weight_facts`] rather than scraping stderr.
+            let facts = src
+                .checkpoint_weight_facts()?
+                .with_verified_source(dit_file)
+                .map_err(|error| CandleError::Msg(error.to_string()))?;
+            // Last-write-wins through the shared sink (sc-11045 fix round): a staged provider that
+            // re-materializes reports the read that just finished, never a stale first one.
+            self.klein_facts.publish(facts);
+            self.device.synchronize()?;
+            Ok(dit)
+        })
     }
 
     fn load_components(&self) -> CResult<Components> {
-        let (te, transformer) = match &self.comfyui_dit {
-            // In-place ComfyUI DiT (sc-10680): the Mistral TE is NOT in the single DiT file, so it comes
-            // from the snapshot through the same per-tier quant path (`load_te_seq` is the TE-only
-            // quantizable loader); the DiT is dequanted + quantized from the in-place file.
-            Some(dit_file) => (self.load_te_seq()?, self.load_comfyui_dit(dit_file)?),
-            None => self.load_te_and_dit()?,
+        let (te, transformer) = if self.comfyui_dit.is_some() || self.klein_dit.is_some() {
+            // Single-file DiT (dev ComfyUI sc-10680, klein universal sc-21485): the TE is NOT in
+            // the single DiT file, so it comes from the snapshot through the same per-tier quant
+            // path (`load_te_seq` is the TE-only quantizable loader); the DiT comes from the file.
+            (self.load_te_seq()?, self.load_dit_seq()?)
+        } else {
+            self.load_te_and_dit()?
         };
         let vae = Flux2Vae::new(self.component_vb("vae")?)?;
         let tokenizer = self.build_tokenizer()?;
+        let upsampler = self.load_caption_upsampler(false)?.map(Arc::new);
         // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller
         // opted in via `LoadSpec::pid`; otherwise `None` and the render path uses the native Flux2Vae.
         // Resident: this set is cached across requests, so the overlay must be loaded for whichever later
@@ -465,6 +840,7 @@ impl Pipeline {
             transformer: Arc::new(transformer),
             vae: Arc::new(vae),
             tokenizer: Arc::new(tokenizer),
+            upsampler,
             pid,
         })
     }
@@ -479,16 +855,25 @@ impl Pipeline {
         } else {
             (QWEN_PAD_TOKEN_ID, ChatTemplate::QwenInstructNoThink)
         };
-        TextTokenizer::from_file(
-            self.root.join("tokenizer/tokenizer.json"),
-            TokenizerConfig {
-                max_length: self.cfg.max_sequence_length,
-                pad_token_id,
-                chat_template,
-                pad_to_max_length: true,
-            },
-        )
-        .map_err(|e| CandleError::Msg(format!("flux2: load tokenizer: {e}")))
+        let config = TokenizerConfig {
+            max_length: self.cfg.max_sequence_length,
+            pad_token_id,
+            chat_template,
+            pad_to_max_length: true,
+        };
+        let parse = |path: &Path| {
+            TextTokenizer::from_file(path, config)
+                .map_err(|e| CandleError::Msg(format!("flux2: load tokenizer: {e}")))
+        };
+        match &self.text_encoder_source {
+            TextEncoderSource::Validated(source) => source.read_tokenizer_unchanged(parse),
+            TextEncoderSource::Trusted(_) => self
+                .variant
+                .encoder_contract()
+                .tokenizer_for_base(&self.root)
+                .map_err(CandleError::from)?
+                .read_unchanged(parse),
+        }
     }
 
     /// Tokenize + encode the prompt to `prompt_embeds` `[1, 512, 3·hidden]` (f32). `tok` is the cached
@@ -535,18 +920,25 @@ impl Pipeline {
         req: &GenerationRequest,
     ) -> CResult<(Tensor, Option<Tensor>, f32)> {
         let guidance = req.guidance.unwrap_or(self.variant.default_guidance());
-        let encode = |te: &Flux2PromptEncoder, tok: &TextTokenizer| -> CResult<_> {
+        let encode = |te: &Flux2PromptEncoder,
+                      tok: &TextTokenizer,
+                      upsampler: Option<&CaptionUpsampler>|
+         -> CResult<_> {
+            let prompt = self.effective_prompt(te, tok, upsampler, req, &[])?;
+            candle_gen::check_cancel(&req.cancel)?;
             Ok((
-                self.encode(te, tok, &req.prompt)?,
+                self.encode(te, tok, &prompt)?,
                 self.encode_negative(te, tok, req, guidance)?,
                 guidance,
             ))
         };
         let encoded = match phase {
-            TextPhase::Resident(comps) => encode(&comps.te, &comps.tokenizer),
+            TextPhase::Resident(comps) => {
+                encode(&comps.te, &comps.tokenizer, comps.upsampler.as_deref())
+            }
             TextPhase::Sequential(text) => {
-                let (te, tokenizer) = text.as_ref();
-                encode(te, tokenizer)
+                let text = text.as_ref();
+                encode(&text.te, &text.tokenizer, text.upsampler.as_ref())
             }
         }?;
         // The sc-12195 post-encode boundary sync used to live here as a local `device.synchronize()`:
@@ -557,6 +949,84 @@ impl Pipeline {
         // and before the text phase drops, so every sequential consumer inherits it (sc-12453). Do
         // not re-add a local sync here; the seam is the single point of enforcement.
         Ok(encoded)
+    }
+
+    fn effective_prompt(
+        &self,
+        te: &Flux2PromptEncoder,
+        tokenizer: &TextTokenizer,
+        upsampler: Option<&CaptionUpsampler>,
+        req: &GenerationRequest,
+        references: &[Image],
+    ) -> CResult<String> {
+        if !req.enhance_prompt {
+            req.prompt_enhancement
+                .emit(gen_core::PromptEnhancementReport::absent(&req.prompt));
+            return Ok(req.prompt.clone());
+        }
+        let Some(upsampler) = upsampler else {
+            req.prompt_enhancement
+                .emit(gen_core::PromptEnhancementReport::fallback(
+                    &req.prompt,
+                    "component_unavailable",
+                ));
+            return Ok(req.prompt.clone());
+        };
+        let result = upsampler.upsample_prompt(
+            tokenizer,
+            te,
+            &req.prompt,
+            references,
+            req.enhance_temperature
+                .unwrap_or(caption_upsample::DEFAULT_TEMPERATURE),
+            req.enhance_max_tokens
+                .map(|value| value as usize)
+                .unwrap_or(caption_upsample::DEFAULT_MAX_NEW_TOKENS),
+            req.seed
+                .expect("caption enhancement request seed must be resolved"),
+            &req.cancel,
+        );
+        match result {
+            Ok(prompt) if !prompt.trim().is_empty() && prompt != req.prompt => {
+                eprintln!("ENHANCED_PROMPT:{}", sanitize_log_text(&prompt));
+                req.prompt_enhancement
+                    .emit(gen_core::PromptEnhancementReport::enhanced(
+                        &req.prompt,
+                        &prompt,
+                    ));
+                Ok(prompt)
+            }
+            Ok(prompt) => {
+                let reason = if prompt.trim().is_empty() {
+                    "empty_output"
+                } else {
+                    "unchanged_output"
+                };
+                eprintln!("ENHANCER_FALLBACK:{reason}");
+                req.prompt_enhancement
+                    .emit(gen_core::PromptEnhancementReport::fallback(
+                        &req.prompt,
+                        reason,
+                    ));
+                Ok(req.prompt.clone())
+            }
+            Err(CandleError::Canceled) => Err(CandleError::Canceled),
+            Err(error) => {
+                // A backend error can race with a cancel check. Cancellation wins over the safe
+                // original-prompt fallback so diffusion never begins after the caller cancelled.
+                candle_gen::check_cancel(&req.cancel)?;
+                eprintln!(
+                    "ENHANCER_FALLBACK:{}",
+                    sanitize_log_text(&error.to_string())
+                );
+                req.prompt_enhancement
+                    .emit(gen_core::PromptEnhancementReport::fallback(
+                        &req.prompt,
+                        "enhancer_error",
+                    ));
+                Ok(req.prompt.clone())
+            }
+        }
     }
 
     fn render_phase(
@@ -570,7 +1040,7 @@ impl Pipeline {
             .steps
             .map(|s| s as usize)
             .unwrap_or(self.variant.default_steps() as usize);
-        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let base_seed = req.seed.expect("request seed was resolved before phases");
         let (prompt_embeds, negative, guidance) = encoded;
         let (transformer, vae, pid) = match phase {
             HeavyPhase::Resident(comps) => (
@@ -618,6 +1088,28 @@ impl Pipeline {
         let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
         let img_ids = pipeline::prepare_grid_ids(lat_h, lat_w);
         let txt_ids = pipeline::prepare_text_ids(self.cfg.max_sequence_length);
+        let chunk_attention = req.memory.is_some_and(|memory| memory.chunk_attention);
+        let attention_budget = if chunk_attention {
+            req.memory
+                .and_then(|memory| memory.attention_chunk_size)
+                .unwrap_or(memory_strategy::ATTENTION_CHUNK_SIZE) as u64
+        } else {
+            candle_gen::ATTN_SCORES_BUDGET as u64
+        };
+        let attention_plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+            attention_budget,
+            false,
+        ));
+        let attention_plan = if chunk_attention {
+            attention_plan.with_cancel(&req.cancel)
+        } else {
+            attention_plan
+        };
+        let transformer_window = req
+            .memory
+            .and_then(|memory| memory.transformer_window_size)
+            .map(|window| window as usize)
+            .unwrap_or(memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
 
         // Curated sampler/scheduler routing (epic 7114 P4, sc-7123). The NATIVE schedule is the legacy
         // empirical-mu flow-match sigmas (descending, trailing 0.0); the same `mu` feeds the curated
@@ -633,6 +1125,13 @@ impl Pipeline {
             let latents =
                 pipeline::create_noise(&self.cfg, seed, req.width, req.height, &self.device)?;
 
+            // Per-step latent preview (epic 16948, sc-16955). The sampler's running latent is the packed
+            // 128-ch BN-normalized token sequence, so the hook unpacks it onto `(lat_h, lat_w)` — the same
+            // grid the decode tail below resolves — and runs the VAE's own de-normalize + unpatchify before
+            // projecting the raw 32-channel latent. Built per image so each seed's trajectory starts at
+            // frame 1. An inert sink is byte-identical to no hook at all.
+            let preview = preview::hook(&req.preview, vae, lat_h, lat_w);
+
             // The driver does cancel + progress + the euler/curated integrator step. The forward (and the
             // guidance>1 CFG blend) lives inside `predict` so a multi-eval solver re-runs it. FLUX.2 uses
             // the Sigma convention but the model embeds σ×1000, so feed `sigma * 1000.0` to the transformer.
@@ -644,31 +1143,47 @@ impl Pipeline {
                 seed,
                 &req.cancel,
                 on_progress,
+                Some(&preview),
                 |latents, sigma| -> CResult<Tensor> {
                     let ts = sigma * 1000.0;
                     let out = if embedded_guidance {
                         // dev: single forward feeding the embedded guidance scalar to the DiT.
-                        transformer.forward(
+                        transformer.forward_with_memory(
                             latents,
                             prompt_embeds,
                             &img_ids,
                             &txt_ids,
                             ts,
                             Some(guidance),
+                            attention_plan,
+                            transformer_window,
+                            &req.cancel,
                         )?
                     } else {
-                        let v = transformer.forward(
+                        let v = transformer.forward_with_memory(
                             latents,
                             prompt_embeds,
                             &img_ids,
                             &txt_ids,
                             ts,
                             None,
+                            attention_plan,
+                            transformer_window,
+                            &req.cancel,
                         )?;
                         match negative {
                             Some(neg) => {
-                                let vn = transformer
-                                    .forward(latents, neg, &img_ids, &txt_ids, ts, None)?;
+                                let vn = transformer.forward_with_memory(
+                                    latents,
+                                    neg,
+                                    &img_ids,
+                                    &txt_ids,
+                                    ts,
+                                    None,
+                                    attention_plan,
+                                    transformer_window,
+                                    &req.cancel,
+                                )?;
                                 // vn + guidance·(v − vn)
                                 (&vn + ((&v - &vn)? * guidance as f64)?)?
                             }
@@ -684,7 +1199,25 @@ impl Pipeline {
             let decoded = match pid_decoder {
                 // PiD consumes the packed BN-normalized [1,128,H/16,W/16] latent directly (the same
                 // tensor decode_packed BN-de-normalizes); returns [1,3,4H,4W].
-                Some(pid) => pid.decode(&packed)?,
+                Some(pid) => {
+                    candle_gen::ensure_decoder_layout(
+                        Some(&candle_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
+                        pid,
+                    )?;
+                    pid.decode(&packed)?
+                }
+                None if req.memory.is_some_and(|memory| memory.tile_vae_decode) => {
+                    let memory = req.memory.expect("guarded above");
+                    vae.decode_packed_tiled(
+                        &packed,
+                        memory
+                            .decode_tile_edge
+                            .unwrap_or(memory_strategy::DECODE_TILE_EDGE),
+                        memory
+                            .decode_overlap
+                            .unwrap_or(memory_strategy::DECODE_OVERLAP),
+                    )?
+                }
                 None => vae.decode_packed(&packed)?, // [1,3,H,W] in [-1,1]
             };
             to_image(&decoded)
@@ -709,17 +1242,113 @@ pub(crate) fn to_image(decoded: &Tensor) -> CResult<Image> {
     })
 }
 
+/// Serialize one bespoke-provider request and always synchronize its device before releasing the
+/// lifecycle lock. The request error wins when both execution and synchronization fail: callers
+/// must see cancellation/model failures, while a successful request still fails closed when its
+/// final device fence does not complete.
+pub(crate) fn run_bespoke_request<T>(
+    lifecycle: &std::sync::Mutex<()>,
+    run: impl FnOnce() -> CResult<T>,
+    synchronize: impl FnOnce() -> candle_gen::candle_core::Result<()>,
+) -> CResult<T> {
+    let _lifecycle = candle_gen::lock_recover(lifecycle);
+    let result = run();
+    let synchronized = synchronize().map_err(CandleError::Candle);
+    match (result, synchronized) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
+    }
+}
+
 /// A loaded candle FLUX.2 generator. The shared residency owner holds either the warm phase pair or
 /// the deferred per-request loaders.
 pub struct Flux2Generator {
     descriptor: ModelDescriptor,
     pipe: Pipeline,
     residency: Flux2Residency,
+    lifecycle: std::sync::Mutex<()>,
+    stream_cancel: Arc<std::sync::Mutex<gen_core::CancelFlag>>,
+    bounded_host_decode: Arc<std::sync::Mutex<bool>>,
+    loaded_quant: Option<Quant>,
+    memory_strategy: Option<gen_core::MemoryProviderContract>,
+    memory_admission: memory_strategy::Flux2AdmissionRegistry,
 }
 
 impl Generator for Flux2Generator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    /// The **three correlated facts** about a klein universal single-file import (sc-21484, epic
+    /// E8), tied to the verified source binding: what the source stores (per-codec tensor counts
+    /// and source bytes), what this host can execute natively, and what actually materialized —
+    /// split per execution representation and measured off the shared reader, never copied from the
+    /// plan.
+    ///
+    /// **This is the trait surface a worker holds** (sc-11045 fix round, BLOCKER 1): the previous
+    /// revision defined an *inherent* method of the same name and never overrode the trait, so a
+    /// `Box<dyn Generator>` got the default `None` while the inherent method shadowed the trait
+    /// for concrete-type calls — hiding the gap from naive tests. The inherent method is gone;
+    /// there is exactly one accessor, and the UFCS-pinned test calls it through the trait.
+    ///
+    /// `None` on every route with no single planned source file: the resident-directory load, the
+    /// dev ComfyUI single file (a provider-local converter, not the plan seam), and a klein
+    /// pipeline whose DiT has not been materialized yet.
+    fn checkpoint_weight_facts(&self) -> Option<gen_core::CheckpointWeightFacts> {
+        self.pipe.klein_facts.facts()
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let Some(contract) = self.memory_strategy.as_ref() else {
+            return gen_core::MemorySafetyDecision::Accept;
+        };
+        if let Err(error) = memory_strategy::validate_registered_generator_context(context) {
+            self.memory_admission.clear_approval();
+            return gen_core::MemorySafetyDecision::Reject {
+                reason: error.to_string(),
+            };
+        }
+        match memory_strategy::admission_safety_check(contract, context, self.loaded_quant) {
+            gen_core::MemorySafetyDecision::Accept => {
+                match self.memory_admission.approve(context) {
+                    Ok(()) => gen_core::MemorySafetyDecision::Accept,
+                    Err(error) => gen_core::MemorySafetyDecision::Reject {
+                        reason: error.to_string(),
+                    },
+                }
+            }
+            rejected @ gen_core::MemorySafetyDecision::Reject { .. } => {
+                self.memory_admission.clear_approval();
+                rejected
+            }
+        }
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let Some(contract) = self.memory_strategy.as_ref() else {
+            return Ok(None);
+        };
+        memory_strategy::validate_context(contract, context, self.loaded_quant)?;
+        memory_strategy::validate_registered_generator_context(context)?;
+        Ok(Some(Box::new(
+            memory_strategy::Flux2MemoryScope::new_bound(
+                self.pipe.device.clone(),
+                contract,
+                context,
+                self.memory_admission.clone(),
+            )?,
+        )))
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -750,14 +1379,67 @@ impl Generator for Flux2Generator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let images = self.residency.run(
+        // Admission binds the caller's request, including its address. Consume it before
+        // resolving defaults into an internal clone; that clone is not a second request.
+        let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
+        self.memory_admission.consume_for_generate(req)?;
+        // Resolve an omitted seed once for the whole request. The same value must drive both the
+        // autoregressive caption sampler and diffusion so the persisted recipe is reproducible.
+        let mut resolved_req = req.clone();
+        resolved_req.seed = Some(req.seed.unwrap_or_else(gen_core::default_seed));
+        let req = &resolved_req;
+        let stage_residency = req
+            .memory
+            .as_ref()
+            .is_some_and(|memory| memory.stage_residency);
+        let stream_transformer_blocks = req
+            .memory
+            .as_ref()
+            .is_some_and(|memory| memory.stream_transformer_blocks);
+        if req.memory.as_ref().is_some_and(|memory| {
+            memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks
+        }) && !stage_residency
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: constrained strategies require request-scoped staged residency",
+                self.descriptor.id
+            )));
+        }
+        if req.use_pid
+            && req.memory.is_some_and(|memory| {
+                memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks
+            })
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: optimized native-VAE strategies do not support PiD decode",
+                self.descriptor.id
+            )));
+        }
+        if stream_transformer_blocks && self.memory_strategy.is_none() {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: streamed blocks require the CUDA memory contract",
+                self.descriptor.id
+            )));
+        }
+        *candle_gen::lock_recover(&self.stream_cancel) = req.cancel.clone();
+        *candle_gen::lock_recover(&self.bounded_host_decode) =
+            req.memory.is_some_and(|memory| memory.tile_vae_decode);
+        let images = self.residency.run_request_scoped(
+            stage_residency,
+            stream_transformer_blocks,
             &req.cancel,
-            &self.pipe.device,
             req.use_pid,
             on_progress,
             |text| self.pipe.encode_phase(text, req),
-            |heavy, encoded, on_progress| self.pipe.render_phase(heavy, req, encoded, on_progress),
-        )?;
+            |_| Ok(self.pipe.device.synchronize()?),
+            |heavy, encoded, on_progress| {
+                let result = self.pipe.render_phase(heavy, req, encoded, on_progress);
+                candle_gen::synchronize_result(&self.pipe.device, result)
+            },
+        );
+        *candle_gen::lock_recover(&self.bounded_host_decode) = false;
+        *candle_gen::lock_recover(&self.stream_cancel) = gen_core::CancelFlag::default();
+        let images = images?;
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -768,6 +1450,9 @@ impl Generator for Flux2Generator {
 /// Both: txt2img only (edit/Reference deferred to epic 6564 story 4), no LoRA, no on-the-fly quant.
 fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: Some(variant.encoder_contract()),
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
+        control_kinds: None,
         required_components: &[],
         id: variant.id(),
         family: "flux2",
@@ -778,11 +1463,10 @@ fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
             // classifier-free negative pass when guidance > 1.
             supports_negative_prompt: !variant.uses_embedded_guidance(),
             supports_guidance: true,
-            supports_true_cfg: false,
             // txt2img only in this slice — the mlx edit/Reference surface is deferred.
             conditioning: vec![],
-            supports_lora: false,
-            supports_lokr: false,
+            supports_lora: true,
+            supports_lokr: true,
             // Curated sampler/scheduler menu (epic 7114 P4, sc-7123). The legacy `flow_match_euler`
             // scheduler alias is retained and falls back to the native schedule via the N3 path.
             samplers: candle_gen::curated_sampler_names(),
@@ -790,30 +1474,25 @@ fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
                 candle_gen::curated_scheduler_names(),
                 &["flow_match_euler"],
             ),
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,
-            mac_only: false,
             // Both quantize on-the-fly (CPU-stage → quantize-onto-GPU): dev folds the 32B DiT + Mistral
             // TE to fit the memory ceiling; klein (sc-11031) folds only the 9B DiT and keeps the Qwen3
             // TE dense bf16 (epic 8506 DENSE_TE, `Pipeline::te_quant`).
             supported_quants: &[Quant::Q4, Quant::Q8],
-            supports_kv_cache: false,
             // FLUX.2 uses the empirical-mu shifted flow-match schedule.
             requires_sigma_shift: true,
             supports_sequential_offload: true,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            // Per-step latent previews (epic 16948, sc-16955): every shipped FLUX.2 lane hands the
+            // shared sampler a `crate::preview` hook that projects the raw 32-channel latent through
+            // the epic-16624 fit. `candle-gen-catalog`'s `preview_advertising` guard derives this
+            // flag from the sources, so it cannot be set ahead of the wiring or left behind it.
+            supports_preview: true,
+            // FLUX.2-dev owns the native Mistral3/Pixtral caption-upsample path. Klein and strict
+            // control descriptors remain false and fail closed before loading weights.
+            supports_prompt_enhancement: variant.is_dev(),
+            ..Default::default()
         },
     }
 }
@@ -830,78 +1509,215 @@ pub fn descriptor_dev() -> ModelDescriptor {
 
 fn generator_from_pipeline(
     pipe: Pipeline,
-    policy: OffloadPolicy,
-) -> gen_core::Result<Box<dyn Generator>> {
+    memory_spec: Option<&LoadSpec>,
+) -> gen_core::Result<Flux2Generator> {
     let variant = pipe.variant;
     let resident_pipe = pipe.clone();
+    let resident_file_spec = memory_spec.cloned();
     let text_pipe = pipe.clone();
+    let text_file_spec = memory_spec.cloned();
     let heavy_pipe = pipe.clone();
-    let residency = Flux2Residency::from_policy_with_resident(
-        policy,
-        move || {
-            let comps = resident_pipe.load_components()?;
+    let heavy_file_spec = memory_spec.cloned();
+    let stream_cancel = Arc::new(std::sync::Mutex::new(gen_core::CancelFlag::default()));
+    let heavy_cancel = stream_cancel.clone();
+    let bounded_host_decode = Arc::new(std::sync::Mutex::new(false));
+    let heavy_bounded_host_decode = bounded_host_decode.clone();
+    let residency = Flux2Residency::request_scoped_with_resident(
+        move |_| {
+            let comps = match &resident_file_spec {
+                Some(spec) => spec.read_files_unchanged(spec.file_source_paths(), || {
+                    resident_pipe.load_components()
+                })?,
+                None => resident_pipe.load_components()?,
+            };
             Ok((
                 TextPhase::Resident(comps.clone()),
                 HeavyPhase::Resident(comps),
             ))
         },
-        move || {
-            Ok(TextPhase::Sequential(Box::new((
-                text_pipe.load_te_seq()?,
-                text_pipe.build_tokenizer()?,
-            ))))
+        move |_| {
+            let build = || {
+                Ok::<_, CandleError>(SeqText {
+                    te: text_pipe.load_te_seq()?,
+                    tokenizer: text_pipe.build_tokenizer()?,
+                    upsampler: text_pipe.load_caption_upsampler(false)?,
+                })
+            };
+            let text = match &text_file_spec {
+                Some(spec) => spec.read_files_unchanged(spec.file_source_paths(), build)?,
+                None => build()?,
+            };
+            Ok(TextPhase::Sequential(Box::new(text)))
         },
-        move |use_pid| {
-            Ok(HeavyPhase::Sequential(Box::new(
-                heavy_pipe.load_heavy_seq(use_pid)?,
-            )))
+        move |use_pid, stream_transformer_blocks| {
+            let heavy = match &heavy_file_spec {
+                Some(spec) => spec.read_files_unchanged(spec.file_source_paths(), || {
+                    heavy_pipe.load_heavy_seq_with_memory(
+                        use_pid,
+                        stream_transformer_blocks,
+                        *candle_gen::lock_recover(&heavy_bounded_host_decode),
+                        &candle_gen::lock_recover(&heavy_cancel),
+                    )
+                })?,
+                None => heavy_pipe.load_heavy_seq_with_memory(
+                    use_pid,
+                    stream_transformer_blocks,
+                    *candle_gen::lock_recover(&heavy_bounded_host_decode),
+                    &candle_gen::lock_recover(&heavy_cancel),
+                )?,
+            };
+            Ok(HeavyPhase::Sequential(Box::new(heavy)))
         },
-    )?;
-    Ok(Box::new(Flux2Generator {
+    );
+    let loaded_quant = match memory_spec {
+        Some(spec) => memory_strategy::resolved_quant(spec)?,
+        None => pipe.quant,
+    };
+    #[cfg(any(feature = "cuda", test))]
+    let memory_strategy = memory_spec
+        .map(|spec| memory_strategy::contract_for_variant(variant, spec))
+        .transpose()?;
+    #[cfg(not(any(feature = "cuda", test)))]
+    let memory_strategy = None;
+    Ok(Flux2Generator {
         descriptor: descriptor(variant),
         pipe,
         residency,
-    }))
+        lifecycle: std::sync::Mutex::new(()),
+        stream_cancel,
+        bounded_host_decode,
+        loaded_quant,
+        memory_strategy,
+        memory_admission: memory_strategy::Flux2AdmissionRegistry::new(variant.id()),
+    })
 }
 
-/// Construct a lazy candle FLUX.2 generator for `variant`. `spec.weights` must be a
-/// [`WeightsSource::Dir`] pointing at a diffusers snapshot (`text_encoder/`, `transformer/`, `vae/`,
-/// `tokenizer/`) — klein at `black-forest-labs/FLUX.2-klein-9B`, dev at `black-forest-labs/FLUX.2-dev`
-/// (whose `text_encoder/` is the Mistral3 checkpoint). Adapters / control overlays are rejected (not
-/// wired). `spec.quantize` (Q4/Q8) is honored by BOTH variants — each component staged dense in CPU RAM
+/// Construct a lazy candle FLUX.2 generator for `variant`. A [`WeightsSource::Dir`] points at the
+/// complete diffusers snapshot (`text_encoder/`, `transformer/`, `vae/`, `tokenizer/`). `flux2_dev`
+/// additionally accepts an imported ComfyUI DiT as [`WeightsSource::File`] when the companion snapshot
+/// is supplied under [`BASE_SNAPSHOT_COMPONENT`]. The same registry provider, cache identity, fit gate,
+/// PiD plumbing, and memory contract are used for both sources. `flux2_klein_9b` accepts a universal
+/// BFL-keyed transformer single file as [`WeightsSource::File`] (sc-21485), consumed through the shared
+/// logical-weight plan (dense bf16 or NVFP4-mixed; no load-time quant fold).
+/// `spec.quantize` (Q4/Q8) is honored by BOTH variants — each component staged dense in CPU RAM
 /// then folded onto the GPU: **dev** quantizes the 32B DiT + the ~24B Mistral TE (neither fits dense);
 /// **klein** (sc-11031) quantizes ONLY the 9B DiT and keeps its 8B Qwen3 TE dense bf16 (epic 8506
 /// DENSE_TE, `Pipeline::te_quant`). Without quant both load fully dense (klein's bf16 tier; dev is
 /// fixture-only there — the full 32B needs the quant).
 fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    // sc-11045 fix round (MAJOR 7, the krea `build()` precedent): refuse an adapter-bearing load
+    // against a descriptor that does not advertise adapter support — the shape an imported-model
+    // route takes when its binding declares `inherit_adapters = false` and the registry withdraws
+    // `supports_lora`/`supports_lokr`. A typed refusal here is the difference between a capability
+    // error and a silently un-adapted render, and it runs before the weights are touched because
+    // the answer does not depend on them.
+    let route_descriptor = descriptor(variant);
+    gen_core::reject_unsupported_adapters(
+        route_descriptor.id,
+        &route_descriptor.capabilities,
+        spec.adapters.len(),
+    )?;
+    Ok(Box::new(load_variant_concrete(variant, spec)?))
+}
+
+pub(crate) fn validate_load_spec(
+    variant: Flux2Variant,
+    spec: &LoadSpec,
+) -> gen_core::Result<Option<Quant>> {
+    spec.validate_prepared_file_pins()?;
     let id = variant.id();
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p.clone(),
-        WeightsSource::File(_) => {
-            return Err(gen_core::Error::Msg(format!(
-                "{id} expects a snapshot directory (text_encoder/ transformer/ vae/ tokenizer/), \
-                 not a single .safetensors file"
-            )));
+    let _ = gen_core::require_base_snapshot(spec, id)?;
+    match &spec.weights {
+        WeightsSource::Dir(_) => {
+            gen_core::reject_unknown_components(spec, &[], id)?;
         }
-    };
-    if !spec.adapters.is_empty() {
+        WeightsSource::File(_) => {
+            gen_core::reject_unknown_components(spec, &[BASE_SNAPSHOT_COMPONENT], id)?;
+        }
+    }
+    // NOTE: `spec.adapters` is deliberately NOT rejected here — sc-18477 wired candle LoRA/LoKr on
+    // this provider, and the specs are threaded through `Pipeline::{load,load_comfyui}` below.
+    // `spec.text_encoder` is likewise supported: it resolves through the variant's encoder contract.
+    if spec.identity.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
-            "candle {id} does not support LoRA/LoKr yet"
+            "candle {id} does not support identity weights"
         )));
     }
     // Both variants honor Q4/Q8 on-the-fly (CPU-stage dense → quantize-onto-GPU): dev folds the 32B DiT
     // + the ~24B Mistral TE (neither fits the GPU dense), klein (sc-11031) folds ONLY the 9B DiT and
     // keeps the 8B Qwen3 TE DENSE bf16 in every tier (epic 8506 DENSE_TE — see `Pipeline::te_quant`).
-    let quant = spec.quantize;
+    let quant = memory_strategy::resolved_quant(spec)?;
+    if quant == Some(Quant::Nvfp4) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "candle {id} does not support NVFP4 load-time folding"
+        )));
+    }
+    // The klein universal single-file source (sc-21485) carries its own quantization: its NVFP4
+    // rows are already packed and refuse a Q4/Q8 re-fold by contract (`AdaptLinear::quantize` on an
+    // NVFP4 base is a typed refusal), so a load-time fold request is rejected here by name rather
+    // than failing 100+ projections into the load.
+    if matches!(spec.weights, WeightsSource::File(_)) && !variant.is_dev() && quant.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id} single-file import is pre-quantized at the source (dense bf16 / NVFP4-mixed); \
+             load-time Q4/Q8 folding is not supported for this source"
+        )));
+    }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {id} does not support control / IP-adapter / edit yet (txt2img only)"
         )));
     }
+    Ok(quant)
+}
+
+fn load_variant_concrete(
+    variant: Flux2Variant,
+    spec: &LoadSpec,
+) -> gen_core::Result<Flux2Generator> {
+    let id = variant.id();
+    let quant = validate_load_spec(variant, spec)?;
+    let root = gen_core::require_base_snapshot(spec, id)?.to_path_buf();
+    let text_encoder_source = variant.encoder_contract().source_for_load(spec, &root)?;
+    let expected_text_encoder_bits = variant.is_dev().then_some(quant).flatten().map(Quant::bits);
+    text_encoder_source.load_time_quant_bits(expected_text_encoder_bits, id)?;
     let device = candle_gen::default_device()?;
-    let pipe = Pipeline::load(variant, quant, &root, &device, spec.pid.clone());
-    let policy = candle_gen::effective_offload_policy(spec.offload_policy);
-    generator_from_pipeline(pipe, policy)
+    let pipe = match &spec.weights {
+        WeightsSource::Dir(_) => Pipeline::load_with_text_encoder(
+            variant,
+            quant,
+            &root,
+            text_encoder_source,
+            &device,
+            spec.pid.clone(),
+            spec.adapters.clone(),
+        ),
+        WeightsSource::File(_) => {
+            let dit = spec
+                .weights_file_pin()?
+                .expect("File weights must resolve to a pin");
+            if variant.is_dev() {
+                Pipeline::load_comfyui_with_text_encoder(
+                    quant,
+                    &root,
+                    text_encoder_source,
+                    &device,
+                    dit,
+                    spec.pid.clone(),
+                    spec.adapters.clone(),
+                )?
+            } else {
+                Pipeline::load_klein_single_file_with_text_encoder(
+                    &root,
+                    text_encoder_source,
+                    &device,
+                    dit,
+                    spec.pid.clone(),
+                    spec.adapters.clone(),
+                )?
+            }
+        }
+    };
+    generator_from_pipeline(pipe, Some(spec))
 }
 
 /// Construct a lazy candle FLUX.2-**dev** generator that reads its **DiT** in place from an existing
@@ -912,16 +1728,26 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::Result<Box<
 /// FLUX.2-dev diffusers snapshot supplying the Mistral text encoder, VAE, and tokenizer (none of which
 /// are in the single DiT file). `quant` (Q4/Q8) folds the dequanted DiT + the Mistral TE onto the GPU —
 /// the 32B dev does not fit dense — matching the resident dev path; `None` is fixture-only. txt2img
-/// only; no adapters / control / edit / PiD.
+/// only; user LoRA/LoKr applies to the remapped DiT, while control / edit use their dedicated
+/// providers rather than this source-specific entry point. PiD, when requested in the registry
+/// `LoadSpec`, follows the same provider lifecycle as the directory-backed path.
 pub fn load_from_comfyui_dit(
     transformer_file: impl Into<PathBuf>,
     snapshot_dir: impl Into<PathBuf>,
     quant: Option<Quant>,
+    adapters: Vec<gen_core::AdapterSpec>,
 ) -> gen_core::Result<Box<dyn Generator>> {
-    let device = candle_gen::default_device()?;
-    let root = snapshot_dir.into();
-    let pipe = Pipeline::load_comfyui(quant, &root, &device, transformer_file.into());
-    generator_from_pipeline(pipe, OffloadPolicy::Resident)
+    let mut spec = LoadSpec::new(WeightsSource::File(transformer_file.into()))
+        .with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(snapshot_dir.into()),
+        )
+        .with_adapters(adapters);
+    if let Some(quant) = quant {
+        spec = spec.with_quant(quant);
+    }
+    spec.prepare_file_sources()?;
+    load_dev(&spec)
 }
 
 /// Registry load hook for `flux2_klein_9b`.
@@ -946,10 +1772,91 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_generator(KLEIN_REGISTRATION)
         .register_generator(DEV_REGISTRATION)
+        .register_encoder_contract_route(gen_core::EncoderContractRouteRegistration {
+            route_id: config::FLUX2_DEV_CONTROL_ID,
+            provider_id: config::FLUX2_DEV_ID,
+        })
+        .register_checkpoint_adapter(gen_core::CheckpointAdapterRegistration {
+            backend_bindings: &[
+                gen_core::CheckpointBackendBindingRegistration {
+                    backend: gen_core::CheckpointBackend::Candle,
+                    source: gen_core::ImportedModelSource::ComfyUiTree,
+                    operation: gen_core::ImportedModelOperation::Generate,
+                    provider_id: config::FLUX2_DEV_ID,
+                    required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                    inherit_adapters: true,
+                },
+                // The klein universal single file (sc-21485): a standalone transformer-only
+                // BFL-keyed `.safetensors` (the `bfl` dialect) binds to `flux2_klein_9b`, NOT to
+                // the dev Comfy-tree route above — the two artifact shapes keep separate provider
+                // identities.
+                gen_core::CheckpointBackendBindingRegistration {
+                    backend: gen_core::CheckpointBackend::Candle,
+                    source: gen_core::ImportedModelSource::TransformerFile,
+                    operation: gen_core::ImportedModelOperation::Generate,
+                    provider_id: config::FLUX2_KLEIN_9B_ID,
+                    required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                    inherit_adapters: true,
+                },
+            ],
+            ..gen_core::FLUX2_CHECKPOINT_ADAPTER
+        });
+    #[cfg(feature = "cuda")]
+    let registry = register_memory_contract_surfaces(registry)
+        .register_memory_behavior(KLEIN_MEMORY_BEHAVIOR)
+        .register_memory_behavior(DEV_MEMORY_BEHAVIOR);
+    registry
 }
+
+/// Register only weights-free memory-contract surfaces; safe on every build platform.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(KLEIN_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: config::FLUX2_KLEIN_9B_ID,
+            contract: memory_strategy::klein_provider_contract,
+        })
+        .register_memory_strategy(DEV_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: config::FLUX2_DEV_ID,
+            contract: memory_strategy::provider_contract,
+        })
+}
+
+const DEV_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: config::FLUX2_DEV_ID,
+    contract: memory_strategy::provider_contract,
+    safety_check: memory_strategy::registered_safety_check,
+};
+
+const KLEIN_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: config::FLUX2_KLEIN_9B_ID,
+    contract: memory_strategy::klein_provider_contract,
+    safety_check: memory_strategy::registered_safety_check,
+};
+
+#[cfg(feature = "cuda")]
+const DEV_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: config::FLUX2_DEV_ID,
+        valid_fixtures: memory_strategy::registered_valid_fixture,
+        begin_request: memory_strategy::registered_begin_request,
+    };
+
+#[cfg(feature = "cuda")]
+const KLEIN_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: config::FLUX2_KLEIN_9B_ID,
+        valid_fixtures: memory_strategy::registered_valid_fixture,
+        begin_request: memory_strategy::registered_begin_request,
+    };
 
 /// Build the complete explicit Candle FLUX.2 provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
@@ -967,6 +1874,18 @@ mod explicit_registry_tests {
             .collect();
 
         assert_eq!(explicit, ["flux2_klein_9b", "flux2_dev"]);
+        assert_eq!(
+            registry.provider_encoder_contract(super::config::FLUX2_DEV_ID),
+            Some(super::config::DEV_ENCODER_CONTRACT)
+        );
+        assert_eq!(
+            registry.provider_encoder_contract(super::config::FLUX2_DEV_CONTROL_ID),
+            Some(super::config::DEV_ENCODER_CONTRACT)
+        );
+        assert_eq!(
+            registry.provider_encoder_contract("flux2_dev_control_typo"),
+            None
+        );
     }
 }
 
@@ -975,6 +1894,443 @@ mod tests {
     use super::*;
     use crate::config::{FLUX2_DEV_ID, FLUX2_KLEIN_9B_ID};
     use candle_gen::gen_core::ConditioningKind;
+
+    fn write_valid_text_encoder(root: &Path, variant: Flux2Variant, quant: Option<Quant>) {
+        let quant_bits = if variant.is_dev() {
+            quant.map(|quant| quant.bits())
+        } else {
+            None
+        };
+        gen_core_testkit::write_encoder_contract_fixture_with_quant(
+            &root.join("text_encoder"),
+            variant.encoder_contract(),
+            quant_bits,
+        )
+        .unwrap();
+    }
+
+    fn valid_directory_spec(root: &Path, variant: Flux2Variant, quant: Option<Quant>) -> LoadSpec {
+        write_valid_text_encoder(root, variant, quant);
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()));
+        spec.quantize = quant;
+        spec
+    }
+
+    /// **sc-11045 fix round, BLOCKER 1: the klein facts cross the worker boundary.**
+    ///
+    /// The pre-fix code defined an *inherent* `Flux2Generator::checkpoint_weight_facts` and never
+    /// overrode the trait method, so a `Box<dyn Generator>` — the only handle a worker holds —
+    /// got the default `None` while the inherent method shadowed the trait for concrete-type
+    /// calls, hiding the gap from naive tests. This test therefore calls **through the trait,
+    /// UFCS** (the krea pattern): re-introducing the shadowing inherent method cannot satisfy it.
+    ///
+    /// # Mutation
+    ///
+    /// Make the trait impl return `None`, or re-add the inherent method and delete the trait
+    /// override: the `expect` below goes red.
+    #[test]
+    fn a_loaded_generator_exposes_the_klein_facts_through_the_trait_surface() {
+        use std::collections::HashMap;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Flux2Variant::Klein9b.config();
+        // The smallest planned klein source: the dense image-ingest embedder alone.
+        let path = tmp.path().join("klein-facts-fixture.safetensors");
+        candle_gen::candle_core::safetensors::save(
+            &HashMap::from([(
+                "img_in.weight".to_owned(),
+                Tensor::zeros(
+                    (cfg.inner_dim(), cfg.in_channels),
+                    candle_gen::candle_core::DType::BF16,
+                    &Device::Cpu,
+                )
+                .unwrap(),
+            )]),
+            &path,
+        )
+        .unwrap();
+        let mapping = single_file::Flux2BflToDiffusersMapping::new(&cfg);
+        let plan = candle_gen::logical_weights::plan_logical_weights(
+            &path,
+            &mapping,
+            &candle_gen::logical_weights::CandleCodecResidency::DENSE,
+        )
+        .expect("plan");
+        let reader =
+            candle_gen::logical_weights::LogicalWeightReader::open(&path, plan, &Device::Cpu)
+                .expect("open");
+        reader.read("x_embedder.weight").expect("materialize");
+        let facts = reader.checkpoint_weight_facts().expect("facts");
+
+        let pipe = Pipeline::load(
+            Flux2Variant::Klein9b,
+            None,
+            tmp.path(),
+            &Device::Cpu,
+            None,
+            Vec::new(),
+        );
+        let generator = generator_from_pipeline(pipe, None).expect("generator");
+        assert!(
+            Generator::checkpoint_weight_facts(&generator).is_none(),
+            "before anything publishes there is no measured receipt to report"
+        );
+        generator.pipe.klein_facts.publish(facts);
+        let seen = Generator::checkpoint_weight_facts(&generator)
+            .expect("the trait surface exposes what the klein load published");
+        assert!(seen
+            .source()
+            .declares(candle_gen::gen_core::checkpoint_codec::DENSE_BF16_CODEC.codec_id));
+        assert!(seen.is_complete());
+    }
+
+    #[test]
+    fn comfyui_dit_entrypoint_postchecks_after_provider_payload_consumption() {
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("flux2-comfyui.safetensors");
+        let replacement = tmp.path().join("flux2-comfyui.replacement.safetensors");
+        for (path, value) in [(&source, 0.25_f32), (&replacement, -0.25_f32)] {
+            candle_gen::candle_core::safetensors::save(
+                &HashMap::from([(
+                    "fixture.weight".to_owned(),
+                    Tensor::from_vec(vec![value; 64], (8, 8), &Device::Cpu).unwrap(),
+                )]),
+                path,
+            )
+            .unwrap();
+        }
+        let source_pin = PinnedWeightsFile::pin(&source).unwrap();
+        let pipeline =
+            Pipeline::load_comfyui(None, tmp.path(), &Device::Cpu, source_pin, None, Vec::new())
+                .unwrap();
+
+        let payload_consumed = Arc::new(AtomicBool::new(false));
+        let first_consumed = Arc::new(Barrier::new(2));
+        let replacement_done = Arc::new(Barrier::new(2));
+        let writer_first = Arc::clone(&first_consumed);
+        let writer_done = Arc::clone(&replacement_done);
+        let writer_source = source.clone();
+        let writer = std::thread::spawn(move || {
+            writer_first.wait();
+            // A replacing rename, on every platform. The loader is holding `source` mmapped, and
+            // Windows refuses to truncate or write a file with an open mapped section
+            // (ERROR_USER_MAPPED_FILE, 1224), so the read+write swap this used off-Unix could only
+            // ever fail here. Rename can do it, with the same meaning on both: the mapping keeps
+            // consuming the original object while the pinned path comes to name a new one. The
+            // fingerprint still catches it on Windows via the file id and change time, which differ
+            // even when the two files share a size and mtime.
+            let swapped = std::fs::rename(replacement, writer_source);
+            // Release the loader whatever the swap did. A writer that returns — or panics — ahead
+            // of this barrier strands the load hook on it and hangs the whole test binary; the
+            // outcome is asserted on `join` instead, so a failed swap reads as a red test.
+            writer_done.wait();
+            swapped
+        });
+
+        let hook_consumed = Arc::clone(&payload_consumed);
+        let hook_first = Arc::clone(&first_consumed);
+        let hook_done = Arc::clone(&replacement_done);
+        COMFYUI_DIT_LOAD_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |source| {
+                let first = source
+                    .load("fixture.weight", &Device::Cpu)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                assert!(first.iter().all(|value| *value == 0.25));
+                hook_consumed.store(true, Ordering::SeqCst);
+                hook_first.wait();
+                hook_done.wait();
+                Ok(())
+            }));
+        });
+
+        let result = pipeline.load_dit_seq();
+        COMFYUI_DIT_LOAD_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+        writer
+            .join()
+            .unwrap()
+            .expect("replace the pinned source mid-load");
+
+        assert!(payload_consumed.load(Ordering::SeqCst));
+        let error = result
+            .err()
+            .expect("mid-load replacement must invalidate the production FLUX.2 File entrypoint");
+        assert!(
+            matches!(
+                error,
+                CandleError::Msg(ref reason)
+                    if reason.starts_with("unsupported: artifact seal mismatch after load: ")
+            ),
+            "unexpected: {error:?}"
+        );
+    }
+
+    #[test]
+    fn bespoke_request_finalizes_success_cancellation_and_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let lifecycle = std::sync::Mutex::new(());
+        let syncs = AtomicUsize::new(0);
+        let success = run_bespoke_request(
+            &lifecycle,
+            || Ok(7),
+            || {
+                syncs.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(success, 7);
+
+        let canceled: CResult<()> = run_bespoke_request(
+            &lifecycle,
+            || Err(CandleError::Canceled),
+            || {
+                syncs.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        assert!(matches!(canceled, Err(CandleError::Canceled)));
+
+        let failed: CResult<()> = run_bespoke_request(
+            &lifecycle,
+            || Err(CandleError::Msg("fixture failure".to_owned())),
+            || {
+                syncs.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        assert!(matches!(failed, Err(CandleError::Msg(_))));
+        assert_eq!(syncs.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn bespoke_request_lifecycle_serializes_concurrent_generate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let lifecycle = Arc::new(std::sync::Mutex::new(()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let lifecycle = lifecycle.clone();
+            let active = active.clone();
+            let max_active = max_active.clone();
+            threads.push(std::thread::spawn(move || {
+                run_bespoke_request(
+                    &lifecycle,
+                    || {
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_active.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                    || Ok(()),
+                )
+                .unwrap();
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn auto_detected_packed_tier_is_the_generators_loaded_tier() {
+        for (bits, expected) in [(4, Quant::Q4), (8, Quant::Q8)] {
+            for (label, variant) in [("dev", Flux2Variant::Dev), ("klein", Flux2Variant::Klein9b)] {
+                let root_tmp = tempfile::tempdir().unwrap();
+                let root = root_tmp.path().to_path_buf();
+                write_valid_text_encoder(&root, variant, Some(expected));
+                let transformer = root.join("transformer");
+                std::fs::create_dir_all(&transformer).unwrap();
+                std::fs::write(
+                    transformer.join("config.json"),
+                    format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
+                )
+                .unwrap();
+                let mut spec = LoadSpec::new(WeightsSource::Dir(root));
+                spec.load_shape = gen_core::LoadShape::DeferredMaterialization;
+                assert_eq!(
+                    memory_strategy::resolved_quant(&spec).unwrap(),
+                    Some(expected)
+                );
+                let generator =
+                    load_variant_concrete(variant, &spec).expect("lazy FLUX.2 generator");
+                assert_eq!(
+                    generator.pipe.quant,
+                    Some(expected),
+                    "{label} execution pipeline must carry the auto-detected tier"
+                );
+                assert_eq!(
+                    generator.loaded_quant,
+                    Some(expected),
+                    "{label} admission identity must match execution"
+                );
+                let contract = generator.memory_strategy_contract().unwrap();
+                let context = gen_core::standard_memory_behavior_context(
+                    contract,
+                    gen_core::MemoryStrategy::Resident,
+                    memory_strategy::resolved_numeric_tier(&spec).unwrap(),
+                    gen_core::MemoryBehaviorRoute {
+                        mode: gen_core::MemoryMode::TextToImage,
+                        reference_count: 0,
+                        use_pid: false,
+                        has_phases: false,
+                        overlay: None,
+                    },
+                )
+                .unwrap();
+                assert!(
+                    matches!(
+                        generator.memory_strategy_safety_check(&context),
+                        gen_core::MemorySafetyDecision::Accept
+                    ),
+                    "{label} must admit the auto-detected packed tier"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn registered_generator_requires_exact_safety_begin_configure_handshake() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut spec = valid_directory_spec(fixture.path(), Flux2Variant::Dev, Some(Quant::Q4));
+        spec.load_shape = gen_core::LoadShape::DeferredMaterialization;
+        let generator = load_dev(&spec).expect("lazy dev generator");
+        let contract = generator.memory_strategy_contract().unwrap().clone();
+        let route = gen_core::MemoryBehaviorRoute {
+            mode: gen_core::MemoryMode::TextToImage,
+            reference_count: 0,
+            use_pid: false,
+            has_phases: false,
+            overlay: None,
+        };
+        let context = gen_core::standard_memory_behavior_context(
+            &contract,
+            gen_core::MemoryStrategy::BoundedDecode,
+            memory_strategy::resolved_numeric_tier(&spec).unwrap(),
+            route,
+        )
+        .unwrap();
+        let manual = GenerationRequest {
+            prompt: "manual".to_owned(),
+            memory: contract.generation_memory(&context.selection),
+            ..Default::default()
+        };
+        assert!(generator.generate(&manual, &mut |_| {}).is_err());
+        assert!(generator.begin_memory_strategy_request(&context).is_err());
+
+        assert!(matches!(
+            generator.memory_strategy_safety_check(&context),
+            gen_core::MemorySafetyDecision::Accept
+        ));
+        let mut unconfigured = generator
+            .begin_memory_strategy_request(&context)
+            .unwrap()
+            .unwrap();
+        assert!(generator
+            .generate(
+                &GenerationRequest {
+                    prompt: "unconfigured".to_owned(),
+                    ..Default::default()
+                },
+                &mut |_| {},
+            )
+            .is_err());
+        unconfigured
+            .finish(gen_core::MemoryRunOutcome::Canceled)
+            .unwrap();
+
+        let mut mutations = Vec::new();
+        let mut abi = context.clone();
+        abi.calibration_abi += 1;
+        mutations.push(abi);
+        let mut fingerprint = context.clone();
+        fingerprint.calibration_fingerprint.push_str("-stale");
+        mutations.push(fingerprint);
+        let mut phases = context.clone();
+        phases.has_phases = true;
+        mutations.push(phases);
+        let mut mode = context.clone();
+        mode.mode = gen_core::MemoryMode::Edit;
+        mode.geometry.reference_count = 1;
+        mode.has_reference = true;
+        mutations.push(mode);
+        let mut overlay = context.clone();
+        overlay.overlay = Some(memory_strategy::CONTROL_OVERLAY.to_owned());
+        mutations.push(overlay);
+        for mutated in mutations {
+            assert!(matches!(
+                generator.memory_strategy_safety_check(&context),
+                gen_core::MemorySafetyDecision::Accept
+            ));
+            assert!(generator.begin_memory_strategy_request(&mutated).is_err());
+        }
+
+        let alternate = gen_core::standard_memory_behavior_context(
+            &contract,
+            gen_core::MemoryStrategy::BoundedAttention,
+            memory_strategy::resolved_numeric_tier(&spec).unwrap(),
+            gen_core::MemoryBehaviorRoute {
+                mode: gen_core::MemoryMode::TextToImage,
+                reference_count: 0,
+                use_pid: false,
+                has_phases: false,
+                overlay: None,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            generator.memory_strategy_safety_check(&context),
+            gen_core::MemorySafetyDecision::Accept
+        ));
+        assert!(generator.begin_memory_strategy_request(&alternate).is_err());
+
+        assert!(matches!(
+            generator.memory_strategy_safety_check(&context),
+            gen_core::MemorySafetyDecision::Accept
+        ));
+        let mut scope = generator
+            .begin_memory_strategy_request(&context)
+            .unwrap()
+            .unwrap();
+        let mut configured = GenerationRequest {
+            prompt: "configured".to_owned(),
+            ..Default::default()
+        };
+        scope.configure_request(&mut configured).unwrap();
+        let copied = configured.clone();
+        assert!(generator.generate(&copied, &mut |_| {}).is_err());
+        configured.width /= 2;
+        assert!(generator.generate(&configured, &mut |_| {}).is_err());
+        configured.width *= 2;
+        // The admitted original must get past admission and reach cancellation,
+        // without materializing the full-size metadata fixture's weights.
+        configured.cancel.cancel();
+        let error = generator
+            .generate(&configured, &mut |_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(error.to_lowercase().contains("cancel"), "{error}");
+        let replay = generator
+            .generate(&configured, &mut |_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(replay.contains("already consumed"), "{replay}");
+        scope
+            .finish(gen_core::MemoryRunOutcome::Error {
+                message: "adversarial rejection".to_owned(),
+            })
+            .unwrap();
+    }
 
     /// F-177 (sc-12089): the PiD student is loaded only when the request will actually decode through it,
     /// so a `Sequential` generate that never asked for PiD does not pay for it — per generate, resident
@@ -990,8 +2346,22 @@ mod tests {
             gemma: WeightsSource::Dir("/gemma".into()),
         };
         let root = Path::new("/nonexistent");
-        let with = Pipeline::load(Flux2Variant::Klein9b, None, root, &Device::Cpu, Some(spec));
-        let without = Pipeline::load(Flux2Variant::Klein9b, None, root, &Device::Cpu, None);
+        let with = Pipeline::load(
+            Flux2Variant::Klein9b,
+            None,
+            root,
+            &Device::Cpu,
+            Some(spec),
+            Vec::new(),
+        );
+        let without = Pipeline::load(
+            Flux2Variant::Klein9b,
+            None,
+            root,
+            &Device::Cpu,
+            None,
+            Vec::new(),
+        );
 
         // Opted in at load AND wanted by this request → load it.
         assert!(with.pid_to_load(true).is_some());
@@ -1007,7 +2377,8 @@ mod tests {
 
     #[test]
     fn registers_and_resolves_as_candle() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path(), Flux2Variant::Klein9b, None);
         let g = crate::provider_registry()
             .unwrap()
             .load(FLUX2_KLEIN_9B_ID, &spec)
@@ -1028,8 +2399,9 @@ mod tests {
         assert!(d.capabilities.requires_sigma_shift);
         assert!(!d.capabilities.mac_only);
         assert!(d.capabilities.conditioning.is_empty());
-        assert!(!d.capabilities.supports_lora);
+        assert!(d.capabilities.supports_lora);
         assert!(!d.capabilities.supports_kv_cache);
+        assert!(!d.capabilities.supports_prompt_enhancement);
         // klein now quantizes its DiT on-the-fly (sc-11031); the Qwen3 TE stays dense (`te_quant`).
         assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         assert!(!d.capabilities.accepts(ConditioningKind::Reference));
@@ -1037,7 +2409,8 @@ mod tests {
 
     #[test]
     fn dev_registers_and_advertises_embedded_guidance_surface() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path(), Flux2Variant::Dev, None);
         let g = crate::provider_registry()
             .unwrap()
             .load(FLUX2_DEV_ID, &spec)
@@ -1054,6 +2427,7 @@ mod tests {
         assert!(!d.capabilities.mac_only);
         assert!(d.capabilities.conditioning.is_empty());
         assert!(d.capabilities.requires_sigma_shift);
+        assert!(d.capabilities.supports_prompt_enhancement);
         // dev and klein both advertise Q4/Q8 now (CPU-stage → quantize-onto-GPU); klein keeps its Qwen3
         // TE dense (`te_quant`), dev folds the Mistral TE with the DiT (sc-11031).
         assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
@@ -1065,7 +2439,8 @@ mod tests {
 
     #[test]
     fn validate_accepts_txt2img_and_rejects_unsupported() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path(), Flux2Variant::Klein9b, None);
         let g = crate::provider_registry()
             .unwrap()
             .load(FLUX2_KLEIN_9B_ID, &spec)
@@ -1117,24 +2492,108 @@ mod tests {
     }
 
     #[test]
+    fn prompt_enhancement_is_dev_only_and_validates_before_weights() {
+        // "Before weights" now means before the DiT/VAE are read, not before the filesystem is
+        // touched at all: the load path resolves the substitutable text encoder through the
+        // provider's `EncoderContract` first, so each variant needs its own contract fixture root.
+        // The bare nonexistent path this used to pass no longer reaches a generator.
+        let dev_fixture = tempfile::tempdir().unwrap();
+        let klein_fixture = tempfile::tempdir().unwrap();
+        let dev_spec = valid_directory_spec(dev_fixture.path(), Flux2Variant::Dev, None);
+        let klein_spec = valid_directory_spec(klein_fixture.path(), Flux2Variant::Klein9b, None);
+        let registry = crate::provider_registry().unwrap();
+        let dev = registry.load(FLUX2_DEV_ID, &dev_spec).unwrap();
+        let klein = registry.load(FLUX2_KLEIN_9B_ID, &klein_spec).unwrap();
+        let enhanced = GenerationRequest {
+            prompt: "a portrait".into(),
+            enhance_prompt: true,
+            enhance_max_tokens: Some(512),
+            enhance_temperature: Some(0.15),
+            ..Default::default()
+        };
+        assert!(dev.validate(&enhanced).is_ok());
+        let error = klein.validate(&enhanced).unwrap_err().to_string();
+        assert!(
+            error.contains("prompt enhancement is not supported"),
+            "{error}"
+        );
+
+        for request in [
+            GenerationRequest {
+                prompt: "a portrait".into(),
+                enhance_max_tokens: Some(512),
+                ..Default::default()
+            },
+            GenerationRequest {
+                prompt: "a portrait".into(),
+                enhance_prompt: true,
+                enhance_max_tokens: Some(0),
+                ..Default::default()
+            },
+            GenerationRequest {
+                prompt: "a portrait".into(),
+                enhance_prompt: true,
+                enhance_temperature: Some(f32::NAN),
+                ..Default::default()
+            },
+        ] {
+            assert!(dev.validate(&request).is_err(), "should reject {request:?}");
+        }
+    }
+
+    #[test]
     fn load_rejects_unwired_surfaces() {
-        use candle_gen::gen_core::{AdapterKind, AdapterSpec};
-        let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
-            AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
-        ]);
-        assert!(matches!(
-            load_klein(&lora).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
+        use candle_gen::gen_core::{AdapterKind, AdapterSpec, IdentityWeights};
+        // Adapters are a wired surface, so this spec must reach a generator — and reaching one now
+        // means clearing the eager encoder-contract admission, hence a real fixture root rather
+        // than a bare path. The rejecting specs below still fail on the unwired field first, so
+        // they keep proving rejection precedes any snapshot read.
+        let lora_fixture = tempfile::tempdir().unwrap();
+        let lora = valid_directory_spec(lora_fixture.path(), Flux2Variant::Klein9b, None)
+            .with_adapters(vec![AdapterSpec::new(
+                "/lora.safetensors".into(),
+                1.0,
+                AdapterKind::Lora,
+            )]);
+        assert!(load_klein(&lora).is_ok());
+        let mut identity = LoadSpec::new(WeightsSource::Dir("/snap".into()));
+        identity.identity = Some(IdentityWeights::default());
+        let named_component = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_component(
+            "unwired_component",
+            WeightsSource::File("/component.bin".into()),
+        );
+        for spec in [&identity, &named_component] {
+            assert!(matches!(
+                load_klein(spec).err().expect("unwired field must reject"),
+                gen_core::Error::Unsupported(_)
+            ));
+        }
         // klein (sc-11031) AND dev now accept Q4/Q8 on-the-fly (CPU-stage → quantize-onto-GPU): klein
         // folds only the 9B DiT (Qwen3 TE stays dense bf16, `te_quant`), dev folds the DiT + Mistral TE.
-        // The generator builds lazily, so load succeeds without touching the (nonexistent) weights.
-        let klein_q4 = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q4);
+        // The generator remains payload-lazy, but its selected encoder is admitted eagerly.
+        let klein_fixture = tempfile::tempdir().unwrap();
+        let klein_q4 =
+            valid_directory_spec(klein_fixture.path(), Flux2Variant::Klein9b, Some(Quant::Q4));
         assert!(load_klein(&klein_q4).is_ok());
-        let klein_q8 = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
+        let klein_q8 =
+            valid_directory_spec(klein_fixture.path(), Flux2Variant::Klein9b, Some(Quant::Q8));
         assert!(load_klein(&klein_q8).is_ok());
-        let dev_quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q4);
+        let dev_fixture = tempfile::tempdir().unwrap();
+        let dev_quant =
+            valid_directory_spec(dev_fixture.path(), Flux2Variant::Dev, Some(Quant::Q4));
         assert!(load_dev(&dev_quant).is_ok());
+
+        let selected_fixture = tempfile::tempdir().unwrap();
+        let selected = selected_fixture.path().join("selected");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &selected,
+            Flux2Variant::Klein9b.encoder_contract(),
+        )
+        .unwrap();
+        let mut external =
+            valid_directory_spec(selected_fixture.path(), Flux2Variant::Klein9b, None);
+        external.text_encoder = Some(WeightsSource::Dir(selected));
+        assert!(load_klein(&external).is_ok());
     }
 
     /// The loader's packed/dense routing decision (sc-9087): a component whose `config.json` carries a
@@ -1143,8 +2602,16 @@ mod tests {
     /// `Pipeline::load_one_quantizable`'s device choice.
     #[test]
     fn component_is_packed_reads_quantization_block() {
-        let dir = std::env::temp_dir().join(format!("sc9087_pkg_{}", std::process::id()));
-        let pipe = Pipeline::load(Flux2Variant::Dev, Some(Quant::Q4), &dir, &Device::Cpu, None);
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
+        let pipe = Pipeline::load(
+            Flux2Variant::Dev,
+            Some(Quant::Q4),
+            &dir,
+            &Device::Cpu,
+            None,
+            Vec::new(),
+        );
 
         let packed = dir.join("transformer");
         std::fs::create_dir_all(&packed).unwrap();
@@ -1180,8 +2647,37 @@ mod tests {
             format!("{err}").contains("config.json"),
             "the error should name the offending file, got: {err}"
         );
+    }
 
-        std::fs::remove_dir_all(&dir).ok();
+    #[test]
+    fn selected_text_encoder_config_read_retains_validation_receipt() {
+        let fixture = tempfile::tempdir().unwrap();
+        let selected_root = fixture.path().join("selected");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &selected_root,
+            Flux2Variant::Klein9b.encoder_contract(),
+        )
+        .unwrap();
+        let selected = Flux2Variant::Klein9b
+            .encoder_contract()
+            .validate_source(&WeightsSource::Dir(selected_root.clone()))
+            .unwrap();
+        let pipe = Pipeline::load_with_text_encoder(
+            Flux2Variant::Klein9b,
+            None,
+            fixture.path(),
+            selected,
+            &Device::Cpu,
+            None,
+            Vec::new(),
+        );
+
+        std::fs::write(selected_root.join("config.json"), b"{}\n").unwrap();
+        let error = pipe
+            .component_is_packed("text_encoder")
+            .expect_err("the packed/dense decision must not reopen a changed selected config")
+            .to_string();
+        assert!(error.contains("changed after load"), "{error}");
     }
 
     /// The shared quantizable-loader's three device/dtype-selection regimes (the F-024 de-dup home,
@@ -1207,8 +2703,8 @@ mod tests {
             quantized: std::cell::Cell<bool>,
         }
 
-        let dir = std::env::temp_dir().join(format!("sc9004_loader_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         // A one-tensor safetensors shard so `component_vb_on` mmaps successfully for either component.
         let write_shard = |sub: &str, packed: bool| {
             let comp = dir.join(sub);
@@ -1244,7 +2740,14 @@ mod tests {
 
         // no quant → configured device, no staging call.
         write_shard("text_encoder", false);
-        let pipe = Pipeline::load(Flux2Variant::Klein9b, None, &dir, &Device::Cpu, None);
+        let pipe = Pipeline::load(
+            Flux2Variant::Klein9b,
+            None,
+            &dir,
+            &Device::Cpu,
+            None,
+            Vec::new(),
+        );
         let p = pipe
             .load_one_quantizable("text_encoder", None, build, quantize)
             .unwrap();
@@ -1253,7 +2756,14 @@ mod tests {
         assert!(!p.quantized.get(), "no-quant path must not quantize");
 
         // dense tier + quant → the builder sees the CPU (staging), then quantize runs onto the device.
-        let dense = Pipeline::load(Flux2Variant::Dev, Some(Quant::Q4), &dir, &Device::Cpu, None);
+        let dense = Pipeline::load(
+            Flux2Variant::Dev,
+            Some(Quant::Q4),
+            &dir,
+            &Device::Cpu,
+            None,
+            Vec::new(),
+        );
         let p = dense
             .load_one_quantizable("text_encoder", Some(Quant::Q4), build, quantize)
             .unwrap();
@@ -1268,7 +2778,14 @@ mod tests {
 
         // packed tier + quant → the builder sees the configured device directly (no dense staging).
         write_shard("transformer", true);
-        let packed = Pipeline::load(Flux2Variant::Dev, Some(Quant::Q4), &dir, &Device::Cpu, None);
+        let packed = Pipeline::load(
+            Flux2Variant::Dev,
+            Some(Quant::Q4),
+            &dir,
+            &Device::Cpu,
+            None,
+            Vec::new(),
+        );
         let p = packed
             .load_one_quantizable("transformer", Some(Quant::Q4), build, quantize)
             .unwrap();
@@ -1280,8 +2797,6 @@ mod tests {
             p.quantized.get(),
             "packed-tier still runs the (no-op on projections) quantize to carry dense leaves"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// DENSE_TE invariant (epic 8506, sc-11031): klein quantizes ONLY its DiT and keeps the 8B Qwen3 TE
@@ -1289,11 +2804,19 @@ mod tests {
     /// TE with the DiT, so `te_quant` tracks `self.quant`.
     #[test]
     fn te_quant_keeps_klein_text_encoder_dense() {
-        let dir = std::env::temp_dir();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         for q in [None, Some(Quant::Q4), Some(Quant::Q8)] {
-            let klein = Pipeline::load(Flux2Variant::Klein9b, q, &dir, &Device::Cpu, None);
+            let klein = Pipeline::load(
+                Flux2Variant::Klein9b,
+                q,
+                &dir,
+                &Device::Cpu,
+                None,
+                Vec::new(),
+            );
             assert_eq!(klein.te_quant(), None, "klein TE stays dense at {q:?}");
-            let dev = Pipeline::load(Flux2Variant::Dev, q, &dir, &Device::Cpu, None);
+            let dev = Pipeline::load(Flux2Variant::Dev, q, &dir, &Device::Cpu, None, Vec::new());
             assert_eq!(dev.te_quant(), q, "dev folds its TE with the DiT at {q:?}");
         }
     }
@@ -1304,9 +2827,17 @@ mod tests {
     /// unchanged, confirming the delegation is wired without needing real 32B weights.
     #[test]
     fn load_te_and_dit_surfaces_missing_component() {
-        let dir = std::env::temp_dir().join(format!("sc9004_missing_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         // No component dirs written → the shared loader must error on the missing text_encoder/.
-        let pipe = Pipeline::load(Flux2Variant::Klein9b, None, &dir, &Device::Cpu, None);
+        let pipe = Pipeline::load(
+            Flux2Variant::Klein9b,
+            None,
+            &dir,
+            &Device::Cpu,
+            None,
+            Vec::new(),
+        );
         let err = pipe
             .load_te_and_dit()
             .err()
@@ -1319,17 +2850,38 @@ mod tests {
     }
 
     /// The in-place ComfyUI DiT entry point (epic 10451 Phase 2e, sc-10680) builds a lazy dev generator
-    /// without touching weights: it stamps the dev descriptor + carries the DiT file, and the resident
-    /// snapshot dir is the root supplying the TE/VAE/tokenizer. Loading is lazy, so this asserts the
-    /// plumbing on CPU with no weights (the render itself is GPU-validated separately).
+    /// without materializing weights: it stamps the dev descriptor + carries the DiT file, and the
+    /// resident snapshot dir is the root supplying the TE/VAE/tokenizer. Construction reads the small
+    /// safetensors headers for exact memory facts, but tensor payloads remain lazy (the render itself is
+    /// GPU-validated separately).
     #[test]
     fn load_from_comfyui_dit_builds_lazy_dev_generator() {
-        let g = load_from_comfyui_dit(
-            "/tree/diffusion_models/flux2_dev_fp8mixed.safetensors",
-            "/snap/flux2-dev",
-            Some(Quant::Q8),
+        use candle_gen::candle_core::safetensors;
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let snapshot = dir.path().join("snapshot");
+        write_valid_text_encoder(&snapshot, Flux2Variant::Dev, Some(Quant::Q8));
+        std::fs::create_dir_all(snapshot.join("vae")).unwrap();
+        safetensors::save(
+            &HashMap::from([(
+                "fixture.weight".to_string(),
+                Tensor::zeros((2, 32), DType::F32, &Device::Cpu).unwrap(),
+            )]),
+            snapshot.join("vae").join("model.safetensors"),
         )
-        .expect("comfyui dev generator builds lazily");
+        .unwrap();
+        let dit = dir.path().join("flux2_dev_fp8mixed.safetensors");
+        safetensors::save(
+            &HashMap::from([(
+                "double_blocks.0.img_mlp.0.weight".to_string(),
+                Tensor::zeros((2, 32), DType::F32, &Device::Cpu).unwrap(),
+            )]),
+            &dit,
+        )
+        .unwrap();
+        let g = load_from_comfyui_dit(&dit, &snapshot, Some(Quant::Q8), Vec::new())
+            .expect("comfyui dev generator builds lazily");
         assert_eq!(g.descriptor().id, FLUX2_DEV_ID);
         assert_eq!(g.descriptor().family, "flux2");
         assert_eq!(g.descriptor().backend, "candle");
@@ -1337,52 +2889,357 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_single_file_source() {
+    fn staged_comfyui_dit_loader_preserves_the_selected_single_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let selected = dir.path().join("flux2-comfyui.safetensors");
+        std::fs::write(&selected, b"not safetensors").expect("write pinned fixture");
+        let pipe = Pipeline::load_comfyui(
+            None,
+            Path::new("/missing-snapshot"),
+            &Device::Cpu,
+            PinnedWeightsFile::pin(&selected).unwrap(),
+            None,
+            Vec::new(),
+        )
+        .expect("pin selected file");
+        let error = pipe
+            .load_dit_seq()
+            .err()
+            .expect("the selected fixture path is deliberately absent")
+            .to_string();
+        assert!(
+            error.contains(&selected.display().to_string()),
+            "request staging must read the selected ComfyUI DiT, got: {error}"
+        );
+    }
+
+    #[test]
+    fn prepared_comfyui_dit_replacement_fails_before_provider_load() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dit = dir.path().join("flux2-dit.safetensors");
+        std::fs::write(&dit, b"prepared dit").unwrap();
+        let mut spec = LoadSpec::new(WeightsSource::File(dit.clone())).with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(dir.path().join("snapshot")),
+        );
+        spec.prepare_file_sources().unwrap();
+
+        std::fs::write(&dit, b"replacement dit bytes").unwrap();
+        let error = validate_load_spec(Flux2Variant::Dev, &spec)
+            .expect_err("provider must reject a changed prepared DiT");
+        assert!(
+            matches!(
+                error,
+                gen_core::Error::Unsupported(ref reason)
+                    if reason.starts_with("artifact seal mismatch after load: ")
+            ),
+            "got: {error:?}"
+        );
+    }
+
+    /// A klein single file still requires the companion base snapshot (the file has no TE / VAE /
+    /// tokenizer) — the generic base-snapshot gate, not a variant rejection (sc-21485: klein now
+    /// accepts single-file sources).
+    #[test]
+    fn klein_single_file_requires_base_snapshot() {
         let spec = LoadSpec::new(WeightsSource::File("/tmp/flux2.safetensors".into()));
         let err = load_klein(&spec)
             .err()
             .expect("expected an error")
             .to_string();
-        assert!(err.contains("snapshot directory"), "got: {err}");
+        assert!(err.contains(BASE_SNAPSHOT_COMPONENT), "got: {err}");
     }
 
-    /// The sequential-residency offload contract (epic 10765 Phase 1c, sc-10868): `with_offload_policy`
-    /// is captured at load (not rejected), and the env override + spec policy select the phased path.
-    /// Loading stays lazy, so this asserts the plumbing on CPU without any weights or a GPU: a
-    /// `Sequential` spec builds a generator (the shared residency route is selected at load,
-    /// exercised end-to-end by the cuda A/B below), and the default spec stays `Resident`.
+    /// The klein universal single file is pre-quantized at the source (dense bf16 / NVFP4-mixed):
+    /// a load-time Q4/Q8 fold request is a typed refusal at validation, by name, rather than a
+    /// per-projection failure deep in the load (sc-21485).
     #[test]
-    fn offload_policy_is_captured_not_rejected() {
-        // Default (no policy set) → Resident: the generator builds, the cached `render` path is default.
-        let spec = LoadSpec::new(WeightsSource::Dir("/snap".into()));
-        assert_eq!(spec.offload_policy, OffloadPolicy::Resident);
-        assert!(load_dev(&spec).is_ok());
-        assert!(load_klein(&spec).is_ok());
+    fn klein_single_file_rejects_load_time_quant_fold() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dit = dir.path().join("flux2-klein.safetensors");
+        std::fs::write(&dit, b"klein single file").unwrap();
+        let mut spec = LoadSpec::new(WeightsSource::File(dit))
+            .with_component(
+                BASE_SNAPSHOT_COMPONENT,
+                WeightsSource::Dir(dir.path().join("snapshot")),
+            )
+            .with_quant(Quant::Q8);
+        spec.prepare_file_sources().unwrap();
+        let err = validate_load_spec(Flux2Variant::Klein9b, &spec)
+            .expect_err("Q8 fold over a pre-quantized single file must refuse")
+            .to_string();
+        assert!(
+            err.contains("pre-quantized") && err.contains("flux2_klein_9b"),
+            "got: {err}"
+        );
+        // Without the fold request the same spec passes validation (quant resolves to None).
+        let mut plain = LoadSpec::new(WeightsSource::File(
+            dir.path().join("flux2-klein.safetensors"),
+        ))
+        .with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(dir.path().join("snapshot")),
+        );
+        plain.prepare_file_sources().unwrap();
+        assert_eq!(
+            validate_load_spec(Flux2Variant::Klein9b, &plain).expect("plain spec validates"),
+            None
+        );
+    }
 
-        // `Sequential` is honored, not rejected — for both variants (dev's Mistral TE is the big win; the
-        // klein path is wired identically). The weights are never touched (lazy build).
-        let seq = LoadSpec::new(WeightsSource::Dir("/snap".into()))
-            .with_offload_policy(OffloadPolicy::Sequential);
-        assert_eq!(seq.offload_policy, OffloadPolicy::Sequential);
-        assert!(load_dev(&seq).is_ok());
-        assert!(load_klein(&seq).is_ok());
+    /// Klein-versus-dev registry binding (sc-21485): the standalone transformer single file
+    /// (`TransformerFile`, the `bfl` dialect) routes to `flux2_klein_9b`, while the dev ComfyUI
+    /// tree import keeps `flux2_dev` — separate artifact shapes, separate provider identities,
+    /// both inheriting adapters and requiring the base snapshot.
+    #[test]
+    fn klein_single_file_and_dev_comfy_bind_to_their_own_providers() {
+        let registry = super::provider_registry().unwrap();
+        let klein = registry
+            .imported_model_descriptor(
+                "flux2",
+                gen_core::ImportedModelSource::TransformerFile,
+                gen_core::ImportedModelOperation::Generate,
+            )
+            .expect("the klein single-file route is registered");
+        assert_eq!(klein.id, config::FLUX2_KLEIN_9B_ID);
+        assert!(klein.capabilities.supports_lora && klein.capabilities.supports_lokr);
+        assert_eq!(klein.required_components, &[BASE_SNAPSHOT_COMPONENT]);
+        let dev = registry
+            .imported_model_descriptor(
+                "flux2",
+                gen_core::ImportedModelSource::ComfyUiTree,
+                gen_core::ImportedModelOperation::Generate,
+            )
+            .expect("the dev ComfyUI route is registered");
+        assert_eq!(dev.id, config::FLUX2_DEV_ID);
+        // And the adapter's portable metadata declares the `bfl` dialect with the plan-driven
+        // Candle mapping this crate ships.
+        let adapter = registry
+            .checkpoint_adapters()
+            .find(|adapter| adapter.adapter_id == "flux2-comfyui-v1")
+            .expect("the flux2 checkpoint adapter is registered");
+        let bfl = adapter
+            .canonical_mappings
+            .iter()
+            .find(|mapping| mapping.dialect == "bfl")
+            .expect("the bfl dialect has a canonical mapping");
+        assert_eq!(
+            bfl.mapping_id,
+            single_file::Flux2BflToDiffusersMapping::MAPPING_ID
+        );
+        assert_eq!(
+            bfl.plan_driven_backends,
+            &[gen_core::CheckpointBackend::Candle]
+        );
+    }
 
-        // The `CANDLE_GEN_OFFLOAD` override's semantics (spelling / case / whitespace) are asserted where
-        // the reader lives — `candle_gen::residency` — rather than re-tested per engine (sc-12089). This
-        // block used to set the process-global var here and `remove_var` it on the way out, which silently
-        // clobbered an ambient export rather than restoring it; the assertions moved, so the mutation goes
-        // with them.
+    /// Image construction is lazy and the legacy load policy no longer selects lifecycle behavior.
+    #[test]
+    fn load_policy_is_not_a_residency_authority() {
+        for variant in [Flux2Variant::Dev, Flux2Variant::Klein9b] {
+            let fixture = tempfile::tempdir().unwrap();
+            let resident = valid_directory_spec(fixture.path(), variant, None);
+            let legacy_staged = resident
+                .clone()
+                .with_offload_policy(gen_core::OffloadPolicy::Sequential);
+            for spec in [&resident, &legacy_staged] {
+                assert!(load_variant_concrete(variant, spec).is_ok());
+            }
+        }
+    }
+
+    const BOUNDED_DECODE_MAX_ABS_ERROR: f64 = 2.0;
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct RgbParityMetrics {
+        changed_fraction: f64,
+        maximum_error: u8,
+        mean_error: f64,
+        root_mean_square_error: f64,
+        psnr_db: f64,
+    }
+
+    fn rgb_parity_metrics(reference: &[u8], candidate: &[u8]) -> Result<RgbParityMetrics, String> {
+        if reference.len() != candidate.len() {
+            return Err(format!(
+                "RGB length mismatch: resident={} candidate={}",
+                reference.len(),
+                candidate.len()
+            ));
+        }
+        if reference.is_empty() {
+            return Err("RGB parity requires a non-empty output".to_owned());
+        }
+        let mut changed = 0u64;
+        let mut maximum = 0u8;
+        let mut absolute_sum = 0u64;
+        let mut square_sum = 0u64;
+        for (&resident, &bounded) in reference.iter().zip(candidate) {
+            let error = resident.abs_diff(bounded);
+            changed += u64::from(error != 0);
+            maximum = maximum.max(error);
+            absolute_sum += u64::from(error);
+            square_sum += u64::from(error) * u64::from(error);
+        }
+        let count = reference.len() as f64;
+        let mean_error = absolute_sum as f64 / count;
+        let root_mean_square_error = (square_sum as f64 / count).sqrt();
+        let psnr_db = if root_mean_square_error == 0.0 {
+            f64::INFINITY
+        } else {
+            20.0 * (255.0 / root_mean_square_error).log10()
+        };
+        Ok(RgbParityMetrics {
+            changed_fraction: changed as f64 / count,
+            maximum_error: maximum,
+            mean_error,
+            root_mean_square_error,
+            psnr_db,
+        })
+    }
+
+    fn output_parity_contract(
+        strategy: gen_core::MemoryStrategy,
+    ) -> gen_core::MemoryParityContract {
+        if strategy >= gen_core::MemoryStrategy::BoundedDecode {
+            gen_core::MemoryParityContract::Tolerance {
+                metric: "rgb8_max_abs_error".to_owned(),
+                maximum_error: BOUNDED_DECODE_MAX_ABS_ERROR,
+            }
+        } else {
+            gen_core::MemoryParityContract::Exact
+        }
+    }
+
+    fn assess_output_parity(
+        strategy: gen_core::MemoryStrategy,
+        reference: &[u8],
+        output: &[u8],
+    ) -> (
+        gen_core::MemoryParityContract,
+        gen_core::MemoryParityResult,
+        Option<RgbParityMetrics>,
+    ) {
+        let bounded = strategy >= gen_core::MemoryStrategy::BoundedDecode;
+        let contract = output_parity_contract(strategy);
+        let metrics = match rgb_parity_metrics(reference, output) {
+            Ok(metrics) => metrics,
+            Err(reason) => {
+                return (
+                    contract,
+                    gen_core::MemoryParityResult::Failed { reason },
+                    None,
+                );
+            }
+        };
+        let passed = if bounded {
+            f64::from(metrics.maximum_error) <= BOUNDED_DECODE_MAX_ABS_ERROR
+        } else {
+            metrics.maximum_error == 0
+        };
+        let result = if passed {
+            gen_core::MemoryParityResult::Passed
+        } else {
+            gen_core::MemoryParityResult::Failed {
+                reason: format!(
+                    "{} parity failed: max_abs={} mean_abs={:.12} rmse={:.12}",
+                    if bounded { "bounded decode" } else { "exact" },
+                    metrics.maximum_error,
+                    metrics.mean_error,
+                    metrics.root_mean_square_error,
+                ),
+            }
+        };
+        (contract, result, Some(metrics))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn measured_output_parity(
+        strategy: gen_core::MemoryStrategy,
+        output: &[u8],
+    ) -> (gen_core::MemoryParityContract, gen_core::MemoryParityResult) {
+        let contract = output_parity_contract(strategy);
+        let Ok(reference_path) = std::env::var("FLUX2_PARITY_REFERENCE") else {
+            return (contract, gen_core::MemoryParityResult::NotRun);
+        };
+        let reference = std::fs::read(&reference_path).unwrap_or_else(|error| {
+            panic!("read FLUX2_PARITY_REFERENCE={reference_path}: {error}")
+        });
+        let (contract, result, metrics) = assess_output_parity(strategy, &reference, output);
+        if let Some(metrics) = metrics {
+            eprintln!(
+                "MEMORY_PARITY_DIAGNOSTIC strategy={strategy:?} reference={} changed_fraction={:.12} max_abs={} mean_abs={:.12} rmse={:.12} psnr_db={:.12}",
+                reference_path,
+                metrics.changed_fraction,
+                metrics.maximum_error,
+                metrics.mean_error,
+                metrics.root_mean_square_error,
+                metrics.psnr_db,
+            );
+        }
+        (contract, result)
+    }
+
+    #[test]
+    fn rgb_parity_metrics_cover_exact_bounded_and_shape_failure() {
+        let exact = rgb_parity_metrics(&[0, 1, 255], &[0, 1, 255]).unwrap();
+        assert_eq!(exact.maximum_error, 0);
+        assert_eq!(exact.changed_fraction, 0.0);
+        assert!(exact.psnr_db.is_infinite());
+
+        let bounded = rgb_parity_metrics(&[0, 10, 255, 100], &[2, 9, 254, 100]).unwrap();
+        assert_eq!(bounded.maximum_error, 2);
+        assert_eq!(bounded.changed_fraction, 0.75);
+        assert_eq!(bounded.mean_error, 1.0);
+        assert!((bounded.root_mean_square_error - (1.5f64).sqrt()).abs() < 1e-12);
+        assert!(rgb_parity_metrics(&[0], &[0, 1]).is_err());
+
+        for strategy in [
+            gen_core::MemoryStrategy::Resident,
+            gen_core::MemoryStrategy::StagedResidency,
+        ] {
+            let (contract, result, _) = assess_output_parity(strategy, &[1, 2], &[1, 2]);
+            assert_eq!(contract, gen_core::MemoryParityContract::Exact);
+            assert_eq!(result, gen_core::MemoryParityResult::Passed);
+        }
+        let (contract, result, _) =
+            assess_output_parity(gen_core::MemoryStrategy::BoundedDecode, &[0, 10], &[2, 9]);
+        assert_eq!(
+            contract,
+            gen_core::MemoryParityContract::Tolerance {
+                metric: "rgb8_max_abs_error".to_owned(),
+                maximum_error: 2.0,
+            }
+        );
+        assert_eq!(result, gen_core::MemoryParityResult::Passed);
+        let (_, result, _) = assess_output_parity(
+            gen_core::MemoryStrategy::BoundedTransformerResidency,
+            &[0],
+            &[3],
+        );
+        assert!(matches!(
+            result,
+            gen_core::MemoryParityResult::Failed { .. }
+        ));
+        let (_, result, metrics) =
+            assess_output_parity(gen_core::MemoryStrategy::Resident, &[0], &[0, 1]);
+        assert!(matches!(
+            result,
+            gen_core::MemoryParityResult::Failed { .. }
+        ));
+        assert!(metrics.is_none());
     }
 
     /// Shared body for the FLUX.2 offload A/B harnesses (epic 10765 Phase 1c, sc-10868 dev / sc-11008
     /// klein). Loads `label`'s snapshot from the `dir_env` env var and runs ONE probed 1024²
-    /// generation whose residency mode is chosen by the same two seams `generate` reads —
-    /// `CANDLE_GEN_OFFLOAD=sequential` (the env override, sc-10769) or `FLUX2_OFFLOAD_MODE=spec-sequential`
-    /// → `LoadSpec::offload_policy` (the worker-facing contract, sc-10821, with `CANDLE_GEN_OFFLOAD`
-    /// UNSET) — then prints the device peak VRAM (`SEQ_AB` line) and writes the raw RGB pixels to
-    /// `FLUX2_OUT`. Run it TWICE in SEPARATE processes (resident vs sequential) and compare: the pixel
-    /// files must be byte-identical (parity) and the sequential peak materially lower (the dense text
-    /// encoder dropped before the DiT loads). Two processes are REQUIRED — candle's cudarc caching
+    /// generation whose residency mode is carried by `GenerationMemory::stage_residency`, calibrated
+    /// with `FLUX2_OFFLOAD_MODE=request-staged`; it prints one strict `MEMORY_EVIDENCE_V1` record and
+    /// writes the raw RGB pixels to `FLUX2_OUT`. Run each rung in a SEPARATE process, setting
+    /// `FLUX2_PARITY_REFERENCE` to the resident raw RGB after that first run. Staged residency must be
+    /// byte-exact; decode-composed rungs use the provider-owned `rgb8_max_abs_error <= 2` contract and
+    /// also print changed fraction, mean absolute error, RMSE, and PSNR. The staged peak must be
+    /// materially lower because the dense text encoder is dropped before the DiT loads. Separate
+    /// processes are REQUIRED — candle's cudarc caching
     /// allocator never returns pages to the driver, so a second in-process run reuses the first run's
     /// pool and reads the same peak. `honor_quant` reads `FLUX2_QUANT` (q4/q8) — set for both dev (folds
     /// the 32B DiT + Mistral TE) and klein (sc-11031: folds only the 9B DiT, Qwen3 TE stays dense);
@@ -1414,11 +3271,23 @@ mod tests {
                 _ => spec,
             };
         }
-        let spec_mode = std::env::var("FLUX2_OFFLOAD_MODE").unwrap_or_default();
-        if spec_mode == "spec-sequential" {
-            spec = spec.with_offload_policy(OffloadPolicy::Sequential);
-        }
-        let req = GenerationRequest {
+        spec.load_shape = gen_core::LoadShape::DeferredMaterialization;
+        let rung = std::env::var("FLUX2_MEMORY_RUNG").unwrap_or_else(|_| {
+            if std::env::var("FLUX2_OFFLOAD_MODE").is_ok_and(|mode| mode == "request-staged") {
+                "staged".to_owned()
+            } else {
+                "resident".to_owned()
+            }
+        });
+        let strategy = match rung.as_str() {
+            "resident" => gen_core::MemoryStrategy::Resident,
+            "staged" => gen_core::MemoryStrategy::StagedResidency,
+            "decode" => gen_core::MemoryStrategy::BoundedDecode,
+            "attention" => gen_core::MemoryStrategy::BoundedAttention,
+            "blocks" => gen_core::MemoryStrategy::BoundedTransformerResidency,
+            value => panic!("unsupported FLUX2_MEMORY_RUNG={value}"),
+        };
+        let mut req = GenerationRequest {
             prompt: "a rusty robot holding a lit candle, studio lighting".into(),
             width: 1024,
             height: 1024,
@@ -1427,36 +3296,107 @@ mod tests {
             count: 1,
             ..Default::default()
         };
+        assert!(
+            candle_gen::testkit::reset_cuda_mempool_high_water(0),
+            "reset CUDA live-allocation high-water"
+        );
         let mut probe = candle_gen::testkit::VramProbe::start_rendered();
         let load_phase = probe.phase();
         let g = load(&spec).unwrap_or_else(|e| panic!("load {label}: {e}"));
         probe.end_load(load_phase);
+        let contract = g
+            .memory_strategy_contract()
+            .expect("FLUX.2-dev memory contract");
+        let tier = memory_strategy::resolved_numeric_tier(&spec).expect("numeric tier");
+        let context = gen_core::standard_memory_behavior_context(
+            contract,
+            strategy,
+            tier,
+            gen_core::MemoryBehaviorRoute {
+                mode: gen_core::MemoryMode::TextToImage,
+                reference_count: 0,
+                use_pid: false,
+                has_phases: false,
+                overlay: None,
+            },
+        )
+        .expect("memory context");
+        assert!(matches!(
+            g.memory_strategy_safety_check(&context),
+            gen_core::MemorySafetyDecision::Accept
+        ));
+        let mut scope = g
+            .begin_memory_strategy_request(&context)
+            .expect("begin memory request")
+            .expect("memory request scope");
+        scope
+            .configure_request(&mut req)
+            .expect("configure memory request");
         let generate_phase = probe.phase();
         let output = g.generate(&req, &mut |_| {}).expect("generate");
         probe.end_gen(generate_phase);
-        let report = probe.report();
-        let peak_mib = (report.peak_gb * 1.0e9 / (1024.0 * 1024.0)).round() as u64;
+        scope
+            .finish(gen_core::MemoryRunOutcome::Complete)
+            .expect("finish memory request");
+        let report = probe.report().assert_trustworthy(1.0);
+        let live_peak_bytes = candle_gen::testkit::cuda_mempool_used_high_bytes(0)
+            .expect("read CUDA live-allocation high-water");
+        assert!(
+            live_peak_bytes > 0,
+            "CUDA live-allocation peak must be positive"
+        );
         let img = match output {
             GenerationOutput::Images(mut v) => v.remove(0),
             other => panic!("expected images, got {other:?}"),
         };
         std::fs::write(&out, &img.pixels).expect("write pixels");
-        let env_mode = std::env::var("CANDLE_GEN_OFFLOAD").unwrap_or_default();
-        let mode = if spec_mode == "spec-sequential" {
-            "spec-sequential"
-        } else if env_mode.eq_ignore_ascii_case("sequential") {
-            "env-sequential"
-        } else {
-            "resident"
+        let (parity, parity_result) = measured_output_parity(strategy, &img.pixels);
+        let parity_failure = match &parity_result {
+            gen_core::MemoryParityResult::Failed { reason } => Some(reason.clone()),
+            _ => None,
         };
         eprintln!(
-            "SEQ_AB model={label} mode={mode} gpu={} peak_mib={peak_mib} | {report} | bytes={} {}x{} out={out}",
+            "{}",
+            candle_gen::testkit::memory_evidence_v1_line_with_parity(
+                candle_gen::testkit::MemoryEvidenceProbe {
+                    resolved_route: label,
+                    declared_calibration: candle_gen::testkit::expected_memory_calibration(
+                        spec.load_shape,
+                    ),
+                    observed_calibration: contract.calibration.clone().expect("calibration"),
+                    tier: memory_strategy::resolved_numeric_tier(&spec)
+                        .expect("resolved numeric tier"),
+                    load_shape: spec.load_shape,
+                    mode: gen_core::MemoryMode::TextToImage,
+                    overlay: None,
+                    geometry: gen_core::MemoryGeometry {
+                        width: req.width,
+                        height: req.height,
+                        batch: req.count,
+                        frames: 1,
+                        reference_count: 0,
+                    },
+                    strategy,
+                    engaged_composition: contract.engaged_composition(strategy),
+                    parameters: context.selection.parameters,
+                    observed_peak_bytes: live_peak_bytes,
+                    harness_version: "candle-flux2-memory-ladder-v1",
+                    output_bytes: &img.pixels,
+                },
+                parity,
+                parity_result,
+            )
+        );
+        eprintln!(
+            "MEMORY_EVIDENCE_DIAGNOSTIC gpu={} {report} bytes={} {}x{} out={out}",
             candle_gen::testkit::probe_gpu(),
             img.pixels.len(),
             img.width,
             img.height
         );
-        report.assert_trustworthy(1.0);
+        if let Some(reason) = parity_failure {
+            panic!("FLUX.2 memory-ladder output parity failed: {reason}");
+        }
     }
 
     /// Sequential-residency GPU validation (epic 10765 Phase 1c, sc-10868) for FLUX.2-**dev** (Mistral
@@ -1484,5 +3424,181 @@ mod tests {
     #[ignore]
     fn flux2_klein_probed_generate_for_offload_ab() {
         run_probed_offload_ab("flux2_klein_9b", "FLUX2_KLEIN_DIR", load_klein, true, 4);
+    }
+
+    /// Reference-bearing companion to [`flux2_klein_probed_generate_for_offload_ab`]. One process
+    /// exercises one exact route/rung coordinate through the bespoke context-bearing loader. Set
+    /// `FLUX2_KLEIN_ROUTE` to `edit`, `reference`, `character`, or `style`; set
+    /// `FLUX2_MEMORY_RUNG` to `resident`, `staged`, `decode`, `attention`, or `blocks`. The reference
+    /// is any image format accepted by the `image` crate at `FLUX2_KLEIN_REF`; output/parity use the same `FLUX2_OUT` and
+    /// `FLUX2_PARITY_REFERENCE` protocol as the registered text route. Invoke the coordinates in
+    /// separate serial GPU0 processes because the CUDA allocator retains its pool.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs FLUX2_KLEIN_DIR + FLUX2_KLEIN_REF + FLUX2_OUT and a CUDA GPU"]
+    fn flux2_klein_reference_routes_probed_memory_ladder() {
+        use candle_gen::testkit::env_path;
+
+        let root = env_path("FLUX2_KLEIN_DIR");
+        let reference_path = env_path("FLUX2_KLEIN_REF");
+        let reference_rgb = image::open(&reference_path)
+            .unwrap_or_else(|error| panic!("decode {}: {error}", reference_path.display()))
+            .to_rgb8();
+        let reference = Image {
+            width: reference_rgb.width(),
+            height: reference_rgb.height(),
+            pixels: reference_rgb.into_raw(),
+        };
+        let out = std::env::var("FLUX2_OUT").expect("set FLUX2_OUT to the pixel-dump path");
+        let route = std::env::var("FLUX2_KLEIN_ROUTE").unwrap_or_else(|_| "edit".to_owned());
+        let (mode, route_label) = match route.as_str() {
+            "edit" => (gen_core::MemoryMode::Edit, "flux2_klein_9b_edit"),
+            "reference" => (gen_core::MemoryMode::Edit, "flux2_klein_9b_reference"),
+            "character" => (
+                gen_core::MemoryMode::Other("character_image".to_owned()),
+                "flux2_klein_9b_character",
+            ),
+            "style" => (
+                gen_core::MemoryMode::Other("style_variations".to_owned()),
+                "flux2_klein_9b_style",
+            ),
+            value => panic!("unsupported FLUX2_KLEIN_ROUTE={value}"),
+        };
+        let rung = std::env::var("FLUX2_MEMORY_RUNG").unwrap_or_else(|_| "resident".to_owned());
+        let strategy = match rung.as_str() {
+            "resident" => gen_core::MemoryStrategy::Resident,
+            "staged" => gen_core::MemoryStrategy::StagedResidency,
+            "decode" => gen_core::MemoryStrategy::BoundedDecode,
+            "attention" => gen_core::MemoryStrategy::BoundedAttention,
+            "blocks" => gen_core::MemoryStrategy::BoundedTransformerResidency,
+            value => panic!("unsupported FLUX2_MEMORY_RUNG={value}"),
+        };
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        spec = match std::env::var("FLUX2_QUANT")
+            .unwrap_or_default()
+            .to_lowercase()
+            .as_str()
+        {
+            "q4" => spec.with_quant(Quant::Q4),
+            "q8" => spec.with_quant(Quant::Q8),
+            _ => spec,
+        };
+        spec.load_shape = gen_core::LoadShape::DeferredMaterialization;
+        let contract = memory_strategy::klein_provider_contract(&spec).expect("Klein contract");
+        let tier = memory_strategy::resolved_numeric_tier(&spec).expect("numeric tier");
+        let context = gen_core::standard_memory_behavior_context(
+            &contract,
+            strategy,
+            tier,
+            gen_core::MemoryBehaviorRoute {
+                mode: mode.clone(),
+                reference_count: 1,
+                use_pid: false,
+                has_phases: false,
+                overlay: None,
+            },
+        )
+        .expect("reference-route memory context");
+        memory_strategy::validate_context(&contract, &context, tier.quant)
+            .expect("reference-route admission");
+        let req = Flux2EditRequest {
+            prompt: "turn the reference into a cinematic portrait with warm studio lighting".into(),
+            width: 1024,
+            height: 1024,
+            steps: 4,
+            guidance: 1.0,
+            seed: 42,
+            ..Default::default()
+        };
+
+        assert!(
+            candle_gen::testkit::reset_cuda_mempool_high_water(0),
+            "reset CUDA live-allocation high-water"
+        );
+        let mut probe = candle_gen::testkit::VramProbe::start_rendered();
+        let load_phase = probe.phase();
+        let model = Flux2Edit::load_klein_with_memory_context(
+            &Flux2EditPaths {
+                root,
+                adapters: Vec::new(),
+            },
+            &spec,
+            &context,
+        )
+        .expect("load context-bound Klein edit");
+        probe.end_load(load_phase);
+
+        let mut stale = context.clone();
+        stale.calibration_fingerprint.push_str("-stale");
+        assert!(
+            model
+                .generate_with_memory_context(
+                    &stale,
+                    &req,
+                    std::slice::from_ref(&reference),
+                    &mut |_| {}
+                )
+                .is_err(),
+            "fingerprint/context mutation must fail before generation"
+        );
+
+        let generate_phase = probe.phase();
+        let img = model
+            .generate_with_memory_context(
+                &context,
+                &req,
+                std::slice::from_ref(&reference),
+                &mut |_| {},
+            )
+            .expect("generate context-bound Klein reference route");
+        probe.end_gen(generate_phase);
+        let report = probe.report().assert_trustworthy(1.0);
+        let live_peak_bytes = candle_gen::testkit::cuda_mempool_used_high_bytes(0)
+            .expect("read CUDA live-allocation high-water");
+        assert!(
+            live_peak_bytes > 0,
+            "CUDA live-allocation peak must be positive"
+        );
+        std::fs::write(&out, &img.pixels).expect("write pixels");
+        let (parity, parity_result) = measured_output_parity(strategy, &img.pixels);
+        let parity_failure = match &parity_result {
+            gen_core::MemoryParityResult::Failed { reason } => Some(reason.clone()),
+            _ => None,
+        };
+        eprintln!(
+            "{}",
+            candle_gen::testkit::memory_evidence_v1_line_with_parity(
+                candle_gen::testkit::MemoryEvidenceProbe {
+                    resolved_route: "flux2_klein_9b",
+                    declared_calibration: candle_gen::testkit::expected_memory_calibration(
+                        spec.load_shape,
+                    ),
+                    observed_calibration: contract.calibration.clone().expect("calibration"),
+                    tier,
+                    load_shape: spec.load_shape,
+                    mode,
+                    overlay: None,
+                    geometry: context.geometry,
+                    strategy,
+                    engaged_composition: contract.engaged_composition(strategy),
+                    parameters: context.selection.parameters,
+                    observed_peak_bytes: live_peak_bytes,
+                    harness_version: "candle-flux2-klein-reference-memory-ladder-v1",
+                    output_bytes: &img.pixels,
+                },
+                parity,
+                parity_result,
+            )
+        );
+        eprintln!(
+            "MEMORY_EVIDENCE_DIAGNOSTIC route={route_label} gpu={} {report} bytes={} {}x{} out={out}",
+            candle_gen::testkit::probe_gpu(),
+            img.pixels.len(),
+            img.width,
+            img.height,
+        );
+        if let Some(reason) = parity_failure {
+            panic!("FLUX.2 reference memory-ladder output parity failed: {reason}");
+        }
     }
 }

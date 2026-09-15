@@ -11,8 +11,6 @@
 //!                                 GQA 16/8 head_dim 128, RoPE, SwiGLU MLP, RMSNorms)
 //!   lyric_encoder.norm         RMSNorm
 //!   timbre_encoder.embed_tokens Linear(64 → 2048, bias)   ← real timbre latents (audio-to-audio)
-//!   timbre_encoder.special_token [1, 1, 2048]             ← present in the checkpoint but UNUSED
-//!                                                          (the reference's forward never reads it)
 //!   timbre_encoder.layers.N     4× bidirectional block
 //!   timbre_encoder.norm         RMSNorm
 //!   silence_latent            [1, 15000, 64]               ← tiled/cropped to the src latents
@@ -22,6 +20,10 @@
 //! along the sequence, in the reference's pack order [lyric | timbre | text]. For pure
 //! text-to-music the timbre stream is a fixed 30 s slice of the encoded `silence_latent`
 //! (no reference audio); an absent lyric stream (instrumental) is simply omitted.
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 use candle_audio::candle_core::{Device, Result as CandleResult, Tensor};
 use candle_nn::{linear, linear_b, rms_norm, Linear, Module, RmsNorm, VarBuilder};
@@ -191,14 +193,9 @@ impl Encoder {
         })
     }
 
-    /// Run projected inputs through the stack. `project` selects whether to apply `embed_tokens`
-    /// (raw inputs) or feed an already-`hidden`-width tensor straight in (the timbre special token).
-    fn forward(&self, input: &Tensor, project: bool) -> CandleResult<Tensor> {
-        let mut x = if project {
-            self.embed_tokens.forward(input)?
-        } else {
-            input.clone()
-        };
+    /// Project raw inputs through `embed_tokens`, then run the contextual encoder stack.
+    fn forward(&self, input: &Tensor) -> CandleResult<Tensor> {
+        let mut x = self.embed_tokens.forward(input)?;
         for l in &self.layers {
             x = l.forward(&x)?;
         }
@@ -206,17 +203,34 @@ impl Encoder {
     }
 }
 
+/// Pinned ACE-Step 1.5 text-to-music timbre window: 30 seconds × 25 latent frames/second.
+pub const DEFAULT_FIXED_TIMBRE_FRAMES: usize = 750;
+
 /// The assembled condition encoder.
 pub struct ConditionEncoder {
     text_projector: Linear,
     lyric_encoder: Encoder,
     timbre_encoder: Encoder,
     silence_latent: Tensor, // [1, T0, acoustic]
+    fixed_timbre_frames: usize,
+    fixed_timbre_context: OnceLock<Tensor>,
+    #[cfg(test)]
+    fixed_timbre_compute_count: AtomicUsize,
     cfg: ConditionEncoderConfig,
 }
 
 impl ConditionEncoder {
+    /// Compatibility constructor using the pinned checkpoint's 30-second fixed timbre window.
     pub fn new(cfg: &ConditionEncoderConfig, vb: VarBuilder) -> CandleResult<Self> {
+        Self::new_with_fixed_timbre_frames(cfg, DEFAULT_FIXED_TIMBRE_FRAMES, vb)
+    }
+
+    /// Construct with the fixed timbre frame count bound to encoder state.
+    pub fn new_with_fixed_timbre_frames(
+        cfg: &ConditionEncoderConfig,
+        fixed_timbre_frames: usize,
+        vb: VarBuilder,
+    ) -> CandleResult<Self> {
         let h = cfg.hidden_size;
         let text_projector = linear_b(cfg.text_hidden_dim, h, false, vb.pp("text_projector"))?;
         let lyric_encoder = Encoder::new(
@@ -239,6 +253,10 @@ impl ConditionEncoder {
             lyric_encoder,
             timbre_encoder,
             silence_latent,
+            fixed_timbre_frames,
+            fixed_timbre_context: OnceLock::new(),
+            #[cfg(test)]
+            fixed_timbre_compute_count: AtomicUsize::new(0),
             cfg: cfg.clone(),
         })
     }
@@ -262,7 +280,7 @@ impl ConditionEncoder {
     }
 
     /// Build the DiT cross-attention context `[1, S, hidden]` from the prompt hidden states, the
-    /// lyric token embeddings (Qwen embedding lookup), and the text-to-music timbre special token.
+    /// lyric token embeddings (Qwen embedding lookup), and the pooled text-to-music timbre context.
     ///
     /// Stream order is the reference's `_pack_sequences` order — **lyric, then timbre, then
     /// text** — not text-first. Cross-attention itself is permutation-invariant over the context
@@ -271,18 +289,56 @@ impl ConditionEncoder {
     /// the maths; it is matched so the packed context is bit-comparable against the reference and
     /// so any future change that *does* become order-sensitive — a context RoPE, a positional
     /// bias, or attention-mask packing — starts from the correct layout.
-    /// `timbre_frames` is the reference's `timbre_fix_frame = ceil(30 · latents_per_second)` — the
-    /// fixed 30 s slice of silence latents the timbre encoder consumes when there is no reference
-    /// audio. The caller derives it from the VAE config.
+    /// Compatibility entry point retaining the original arbitrary `timbre_frames` argument. Calls
+    /// matching this encoder's bound fixed frame count use the cache; other frame counts preserve
+    /// the previous behavior by computing their timbre context without caching it.
     pub fn encode(
         &self,
         text_hidden: &Tensor,
         lyric_embeds: Option<&Tensor>,
         timbre_frames: usize,
     ) -> CandleResult<Tensor> {
+        if timbre_frames == self.fixed_timbre_frames {
+            return self.encode_cached(text_hidden, lyric_embeds);
+        }
+        let timbre = self.compute_timbre_context(timbre_frames, text_hidden.device())?;
+        self.fuse_context(text_hidden, lyric_embeds, &timbre)
+    }
+
+    /// Build the dynamic lyric/text context around the cached fixed pooled timbre row.
+    pub fn encode_cached(
+        &self,
+        text_hidden: &Tensor,
+        lyric_embeds: Option<&Tensor>,
+    ) -> CandleResult<Tensor> {
+        let timbre = get_or_compute(&self.fixed_timbre_context, || {
+            #[cfg(test)]
+            self.fixed_timbre_compute_count
+                .fetch_add(1, Ordering::Relaxed);
+            self.compute_timbre_context(self.fixed_timbre_frames, text_hidden.device())
+        })?;
+        self.fuse_context(text_hidden, lyric_embeds, timbre)
+    }
+
+    fn compute_timbre_context(
+        &self,
+        timbre_frames: usize,
+        device: &Device,
+    ) -> CandleResult<Tensor> {
+        let timbre_in = self.src_latents(timbre_frames, device)?;
+        let timbre = self.timbre_encoder.forward(&timbre_in)?;
+        timbre.narrow(1, 0, 1) // CLS-like pooling: first position.
+    }
+
+    fn fuse_context(
+        &self,
+        text_hidden: &Tensor,
+        lyric_embeds: Option<&Tensor>,
+        timbre: &Tensor,
+    ) -> CandleResult<Tensor> {
         let mut parts: Vec<Tensor> = Vec::new();
         if let Some(lyric) = lyric_embeds {
-            parts.push(self.lyric_encoder.forward(lyric, true)?);
+            parts.push(self.lyric_encoder.forward(lyric)?);
         }
         // Text-to-music timbre. The reference does NOT feed the learned `special_token` here — its
         // `AceStepTimbreEncoder::forward` never reads that parameter. It projects a fixed 30 s slice
@@ -291,9 +347,7 @@ impl ConditionEncoder {
         // distribution; the reference's own source notes that an OOD timbre input "produces
         // drone-like audio (observed on all text2music outputs)", which is exactly the broadband
         // drone this port emitted over every generated track.
-        let timbre_in = self.src_latents(timbre_frames, text_hidden.device())?;
-        let timbre = self.timbre_encoder.forward(&timbre_in, true)?;
-        parts.push(timbre.narrow(1, 0, 1)?); // CLS-like pooling: first position.
+        parts.push(timbre.clone());
         parts.push(self.text_projector.forward(text_hidden)?);
         let refs: Vec<&Tensor> = parts.iter().collect();
         Tensor::cat(&refs, 1)
@@ -301,5 +355,120 @@ impl ConditionEncoder {
 
     pub fn hidden_size(&self) -> usize {
         self.cfg.hidden_size
+    }
+}
+
+/// Stable fallible `OnceLock` pattern: inspect, compute with `?`, then publish without panicking.
+/// A lost initialization race may discard one computed value, while every later call reuses the
+/// published value.
+fn get_or_compute<T, E>(
+    cache: &OnceLock<T>,
+    compute: impl FnOnce() -> std::result::Result<T, E>,
+) -> std::result::Result<&T, E> {
+    if let Some(value) = cache.get() {
+        return Ok(value);
+    }
+    let built = compute()?;
+    Ok(cache.get_or_init(|| built))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_audio::candle_core::{DType, Device};
+    use std::collections::HashMap;
+
+    #[test]
+    fn repeated_encodes_compute_fixed_timbre_context_once() {
+        let device = Device::Cpu;
+        let cfg = ConditionEncoderConfig {
+            hidden_size: 2,
+            intermediate_size: 2,
+            head_dim: 2,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            num_lyric_encoder_hidden_layers: 0,
+            num_timbre_encoder_hidden_layers: 0,
+            text_hidden_dim: 2,
+            timbre_hidden_dim: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+            sliding_window: 8,
+        };
+        let mut weights = HashMap::new();
+        weights.insert(
+            "text_projector.weight".into(),
+            Tensor::from_vec(vec![1.0_f32, 0.0, 0.0, 1.0], (2, 2), &device).unwrap(),
+        );
+        weights.insert(
+            "lyric_encoder.embed_tokens.weight".into(),
+            Tensor::from_vec(vec![1.0_f32, 0.0, 0.0, 1.0], (2, 2), &device).unwrap(),
+        );
+        weights.insert(
+            "timbre_encoder.embed_tokens.weight".into(),
+            Tensor::from_vec(vec![1.0_f32, 2.0], (2, 1), &device).unwrap(),
+        );
+        for prefix in ["lyric_encoder", "timbre_encoder"] {
+            weights.insert(
+                format!("{prefix}.embed_tokens.bias"),
+                Tensor::zeros(2, DType::F32, &device).unwrap(),
+            );
+            weights.insert(
+                format!("{prefix}.norm.weight"),
+                Tensor::ones(2, DType::F32, &device).unwrap(),
+            );
+        }
+        weights.insert(
+            "silence_latent".into(),
+            Tensor::from_vec(vec![1.0_f32, 2.0, 3.0, 4.0], (1, 4, 1), &device).unwrap(),
+        );
+        let encoder = ConditionEncoder::new_with_fixed_timbre_frames(
+            &cfg,
+            3,
+            VarBuilder::from_tensors(weights, DType::F32, &device),
+        )
+        .unwrap();
+        let text_a = Tensor::from_vec(vec![1.0_f32, 0.0], (1, 1, 2), &device).unwrap();
+        let lyric_a = Tensor::from_vec(vec![1.0_f32, 0.0], (1, 1, 2), &device).unwrap();
+        let text_b = Tensor::from_vec(vec![0.0_f32, 1.0], (1, 1, 2), &device).unwrap();
+        let lyric_b = Tensor::from_vec(vec![0.0_f32, 1.0], (1, 1, 2), &device).unwrap();
+
+        // The compatibility API retains arbitrary frame behavior and does not poison the fixed
+        // cache when the caller asks for a different timbre window.
+        encoder.encode(&text_a, Some(&lyric_a), 2).unwrap();
+        assert_eq!(
+            encoder.fixed_timbre_compute_count.load(Ordering::Relaxed),
+            0
+        );
+
+        let first = encoder.encode_cached(&text_a, Some(&lyric_a)).unwrap();
+        let second = encoder.encode_cached(&text_b, Some(&lyric_b)).unwrap();
+        assert_eq!(first.dims3().unwrap(), (1, 3, 2));
+        assert_eq!(second.dims3().unwrap(), (1, 3, 2));
+        assert_eq!(
+            encoder.fixed_timbre_compute_count.load(Ordering::Relaxed),
+            1
+        );
+
+        let rows = |context: &Tensor, row: usize| {
+            context
+                .narrow(1, row, 1)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        assert_ne!(
+            rows(&first, 0),
+            rows(&second, 0),
+            "lyrics must stay dynamic"
+        );
+        assert_eq!(
+            rows(&first, 1),
+            rows(&second, 1),
+            "only pooled timbre is cached"
+        );
+        assert_ne!(rows(&first, 2), rows(&second, 2), "text must stay dynamic");
     }
 }

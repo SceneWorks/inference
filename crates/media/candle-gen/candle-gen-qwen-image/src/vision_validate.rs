@@ -17,6 +17,7 @@
 
 use candle_gen::candle_core::Tensor;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
+use candle_gen::gen_core::WeightsSource;
 use candle_gen::testkit::{env_path, read_ppm};
 
 use crate::config::TextEncoderConfig;
@@ -99,16 +100,23 @@ fn real_weight_vision_language() {
 
     // Tokenize an edit prompt and run the splice + LM.
     let cfg = TextEncoderConfig::qwen_image();
-    let tok = TextTokenizer::from_file(
-        base.join("tokenizer/tokenizer.json"),
-        TokenizerConfig {
-            max_length: cfg.max_length,
-            pad_token_id: cfg.pad_token_id,
-            chat_template: ChatTemplate::QwenImage,
-            pad_to_max_length: false,
-        },
-    )
-    .expect("load tokenizer");
+    let source = crate::ENCODER_CONTRACT
+        .validate_source_against_base(&WeightsSource::Dir(base.join("text_encoder")), &base)
+        .expect("validate text encoder and tokenizer receipt");
+    let tok = source
+        .read_tokenizer_unchanged(|path| {
+            TextTokenizer::from_file(
+                path,
+                TokenizerConfig {
+                    max_length: cfg.max_length,
+                    pad_token_id: cfg.pad_token_id,
+                    chat_template: ChatTemplate::QwenImage,
+                    pad_to_max_length: false,
+                },
+            )
+            .map_err(candle_gen::CandleError::from)
+        })
+        .expect("load validated tokenizer");
     let ids = tokenize_edit_text(
         &tok,
         "make the sky a vivid orange sunset",

@@ -21,12 +21,24 @@
 //! "audibly higher quality than `small_music`", and no metric in this file — or any objective metric
 //! that fits in a test — can carry that. `MR-STFT` and SNR measure *agreement with a reference*, and
 //! there is no reference: two different checkpoints rendering the same prompt are supposed to
-//! disagree. A perceptual claim needs a pinned blinded protocol (ABX or MOS-style, multiple
-//! listeners, held-out prompts), which is a separate piece of work with a separate deliverable and
-//! is not run here. **Nothing in sc-14545 claims medium is perceptually superior.** What is claimed
-//! is the capability difference, which is objective and enforced elsewhere: medium renders up to
-//! 380 s where the smalls stop at 120 s (`tests/conformance.rs`), it decodes through the 852M SAME-L
+//! disagree.
+//!
+//! That wording is now **retired** rather than merely unclaimed. `sc-15178` pins what a rigorous
+//! perceptual claim would take — `docs/migration/SC_15178_SA3_LISTENING_PROTOCOL.md`, with the
+//! stimulus generator in `tests/listening_stimuli.rs` and the blinding/analysis helper in
+//! `scripts/audio/sa3_listening_blind.py` — and the protocol is designed but **not executed**;
+//! running it needs a human panel and is tracked as `sc-15377`. Until that reports, the "audibly
+//! higher quality" wording stands retired in favour of the capability claim below, and it is
+//! reinstated only by a panel result, never by a metric.
+//!
+//! **Nothing in sc-14545 claims medium is perceptually superior.** What is claimed is the
+//! capability difference, which is objective and enforced elsewhere: medium renders up to 380 s
+//! where the smalls stop at 120 s (`tests/conformance.rs`), it decodes through the 852M SAME-L
 //! rather than the 108M SAME-S, and it serves both domains rather than one.
+//!
+//! The bound in this file must therefore never be re-read as a quality bar: it is a mis-wiring
+//! detector. See `SC_15178_SA3_LISTENING_PROTOCOL.md` §1 for why any agreement threshold wide
+//! enough to admit honest cross-checkpoint output also admits an unrelated take.
 
 use std::path::PathBuf;
 

@@ -10,15 +10,16 @@
 //! `quantized_matmul` f32 inputs (no bf16 upcast needed). LoRA over these bases = sc-2646.
 
 use mlx_rs::error::Exception;
-use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
+use mlx_rs::fast::{layer_norm, rms_norm};
 use mlx_rs::ops::{add, concatenate_axis, multiply, sigmoid, split};
-use mlx_rs::transforms::compile::compile;
+use mlx_rs::transforms::compile::{compile, compile_retained};
 use mlx_rs::{Array, Dtype};
 use std::f32::consts::LN_10;
 
 use mlx_gen::adapters::loader::{BflTarget, LoraRowSlice};
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::array::scalar;
+use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -42,6 +43,37 @@ const RMS_EPS: f32 = 1e-5;
 // FLUX.2's modulate keeps a strong f32 `1` via `one_matches_scale = false`. SwiGLU stays crate-specific.
 use mlx_gen::nn::compile_glue;
 pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
+
+const SITE_SWIGLU: &str = "flux2::transformer::swiglu";
+
+fn swiglu_impl((a, b): (&Array, &Array)) -> std::result::Result<Array, Exception> {
+    multiply(&multiply(a, &sigmoid(a)?)?, b)
+}
+
+thread_local! {
+    static RETAINED_SWIGLU: std::cell::RefCell<Option<mlx_gen::nn::RetainedBinary>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn retained_swiglu(args: (&Array, &Array)) -> std::result::Result<Array, mlx_rs::error::Exception> {
+    mlx_gen::nn::prepare_retained_compilation_thread();
+    RETAINED_SWIGLU.with(|slot| {
+        slot.borrow_mut()
+            .get_or_insert_with(|| {
+                mlx_gen::nn::RetainedBinary::new(compile_retained(swiglu_impl, true))
+            })
+            .call(SITE_SWIGLU, args)
+    })
+}
+
+/// Exercise this crate's production retained handle once for the release memory audit.
+#[doc(hidden)]
+pub fn exercise_retained_compile_inventory(input: &Array) -> Result<()> {
+    let output = retained_swiglu((input, input))?;
+    output.eval()?;
+    drop(output);
+    Ok(())
+}
 
 fn require_f32_input(x: &Array) -> Result<Array> {
     Ok(x.as_dtype(Dtype::Float32)?)
@@ -103,27 +135,40 @@ fn apply_rope(q: &Array, k: &Array, cos: &Array, sin: &Array) -> Result<(Array, 
 }
 
 /// SDPA over `[B,H,S,D]` → `[B,S,H·D]`.
-fn attention(q: &Array, k: &Array, v: &Array, head_dim: i32) -> Result<Array> {
+fn attention(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    head_dim: i32,
+    plan: AttentionPlan<'_>,
+) -> Result<Array> {
     let b = q.shape()[0];
     let scale = (head_dim as f32).powf(-0.5);
-    let o = scaled_dot_product_attention(q, k, v, scale, None, None)?;
+    let o = sdpa_budgeted_bhsd(q, k, v, scale, None, plan)?;
     Ok(o.transpose_axes(&[0, 2, 1, 3])?
         .reshape(&[b, -1, q.shape()[1] * head_dim])?)
 }
 
 /// SwiGLU: split last axis in half, `silu(x1) · x2`. The `split` runs eagerly (a shapeless
 /// `mx.compile` can't infer a split's output shapes); the fusable `silu(x1)·x2` arithmetic is
-/// compiled into one kernel when the sc-2963 glue toggle is on. Bit-exact to the eager
-/// `multiply(silu(x1), x2)` — the inline `a·sigmoid(a)` mirrors [`mlx_gen::nn::silu`] op-for-op.
+/// compiled into one kernel when the sc-2963 glue toggle is on. The inline `a·sigmoid(a)` mirrors
+/// [`mlx_gen::nn::silu`] op-for-op; under MLX 0.32 the compiled path remains exact to eager at bf16
+/// and may differ by 1-2 ULP at f32, within [`mlx_gen::nn::COMPILED_GLUE_F32_ULP_TOL`].
 fn swiglu(x: &Array) -> Result<Array> {
     let p = split(x, 2, -1)?;
-    let f = |(a, b): (&Array, &Array)| -> std::result::Result<Array, Exception> {
-        multiply(&multiply(a, &sigmoid(a)?)?, b) // silu(a)·b
-    };
     if compile_glue() {
-        Ok(compile(f, true)((&p[0], &p[1]))?)
+        if mlx_gen::nn::retained_compilation_requested() {
+            Ok(retained_swiglu((&p[0], &p[1]))?)
+        } else {
+            mlx_gen::diagnostics::record_compile(
+                SITE_SWIGLU,
+                mlx_gen::diagnostics::CompileDisposition::OneShot,
+            );
+            Ok(compile(swiglu_impl, true)((&p[0], &p[1]))?)
+        }
     } else {
-        Ok(f((&p[0], &p[1]))?)
+        mlx_gen::diagnostics::record_fallback(SITE_SWIGLU, "compiled_glue_disabled");
+        Ok(swiglu_impl((&p[0], &p[1]))?)
     }
 }
 
@@ -178,7 +223,7 @@ impl FeedForward {
     }
 }
 
-struct DoubleBlock {
+pub(crate) struct DoubleBlock {
     attn: DoubleAttention,
     ff: FeedForward,
     ff_context: FeedForward,
@@ -202,7 +247,7 @@ struct DoubleAttention {
 }
 
 impl DoubleAttention {
-    fn from_weights(
+    pub(crate) fn from_weights(
         w: &Weights,
         prefix: &str,
         heads: i32,
@@ -254,6 +299,7 @@ impl DoubleAttention {
         cos: &Array,
         sin: &Array,
         cache: CacheSlot<'_>,
+        attention_plan: AttentionPlan<'_>,
     ) -> Result<(Array, Array)> {
         let (iq, ik, iv) = process_qkv(
             img,
@@ -286,7 +332,7 @@ impl DoubleAttention {
             Some((c, idx)) => c.apply(Stream::Double, idx, k, v)?,
             None => (k, v),
         };
-        let o = attention(&q, &k, &v, self.head_dim)?;
+        let o = attention(&q, &k, &v, self.head_dim, attention_plan)?;
         let txt_seq = txt.shape()[1];
         // `[txt ; img]` is a contiguous split at `txt_seq`; split rather than gather two aranges (F-111).
         let parts = o.split_axis(&[txt_seq], 1)?;
@@ -297,7 +343,7 @@ impl DoubleAttention {
 }
 
 impl DoubleBlock {
-    fn from_weights(
+    pub(crate) fn from_weights(
         w: &Weights,
         prefix: &str,
         heads: i32,
@@ -338,6 +384,7 @@ impl DoubleBlock {
         sin: &Array,
         cache: CacheSlot<'_>,
         ffn_chunk: Option<usize>,
+        attention_plan: AttentionPlan<'_>,
     ) -> Result<(Array, Array)> {
         let (shift_msa, scale_msa, gate_msa) = &img_mod[0];
         let (shift_mlp, scale_mlp, gate_mlp) = &img_mod[1];
@@ -351,7 +398,9 @@ impl DoubleBlock {
             c_shift_msa,
         )?;
 
-        let (img_attn, txt_attn) = self.attn.forward(&norm_img, &norm_txt, cos, sin, cache)?;
+        let (img_attn, txt_attn) =
+            self.attn
+                .forward(&norm_img, &norm_txt, cos, sin, cache, attention_plan)?;
         img = gated(&img, gate_msa, &img_attn)?;
         txt = gated(&txt, c_gate_msa, &txt_attn)?;
 
@@ -374,7 +423,7 @@ impl DoubleBlock {
     }
 }
 
-struct SingleBlock {
+pub(crate) struct SingleBlock {
     to_qkv_mlp: AdaptableLinear,
     to_out: AdaptableLinear,
     norm_q: Array,
@@ -385,7 +434,7 @@ struct SingleBlock {
 }
 
 impl SingleBlock {
-    fn from_weights(
+    pub(crate) fn from_weights(
         w: &Weights,
         prefix: &str,
         heads: i32,
@@ -418,6 +467,7 @@ impl SingleBlock {
         cos: &Array,
         sin: &Array,
         cache: CacheSlot<'_>,
+        attention_plan: AttentionPlan<'_>,
     ) -> Result<Array> {
         let (shift, scale, gate) = m;
         let norm = modulate(&layer_norm(hidden, None, None, LN_EPS)?, scale, shift)?;
@@ -445,7 +495,7 @@ impl SingleBlock {
             Some((c, idx)) => c.apply(Stream::Single, idx, k, v)?,
             None => (k, v),
         };
-        let attn = attention(&q, &k, &v, self.head_dim)?;
+        let attn = attention(&q, &k, &v, self.head_dim, attention_plan)?;
 
         let mlp = swiglu(&mlp)?;
         let cat = concatenate_axis(&[&attn, &mlp], -1)?;
@@ -521,6 +571,7 @@ pub struct Flux2Transformer {
     norm_out_linear: AdaptableLinear,
     proj_out: AdaptableLinear,
     time_channels: usize,
+    block_stream: Option<crate::block_stream::Flux2BlockStream>,
 }
 
 /// The conditioning inputs every [`Flux2Transformer`] forward shares, grouped so the four entry
@@ -608,7 +659,34 @@ impl Flux2Transformer {
             norm_out_linear: lin(w, "norm_out.linear.weight", quant)?,
             proj_out: lin(w, "proj_out.weight", quant)?,
             time_channels: cfg.timestep_channels,
+            block_stream: None,
         })
+    }
+
+    /// Arm exact snapshot-backed reconstruction for Klein's double and single block stacks. The
+    /// caller must finalize only after quantization and adapter transforms have completed.
+    pub(crate) fn with_block_stream(
+        mut self,
+        inventory: crate::artifact_inventory::KleinArtifactInventory,
+        cfg: Flux2Config,
+        quant: Option<Flux2Quant>,
+    ) -> Self {
+        self.block_stream = Some(crate::block_stream::Flux2BlockStream::new(
+            inventory, cfg, quant,
+        ));
+        self
+    }
+
+    pub(crate) fn finalize_block_stream(&mut self) -> Result<()> {
+        let Some(stream) = self.block_stream.as_ref() else {
+            return Ok(());
+        };
+        crate::block_stream::evict_resident_blocks(
+            &mut self.double_blocks,
+            &mut self.single_blocks,
+            stream.double_blocks(),
+            stream.single_blocks(),
+        )
     }
 
     /// Quantize every transformer `nn.Linear` to Q4/Q8 (group_size 64) in place — the mlx-rs
@@ -706,6 +784,8 @@ impl Flux2Transformer {
             None,
             None,
             &MemoryConfig::OFF,
+            AttentionPlan::UNBOUNDED,
+            None,
         )
     }
 
@@ -730,6 +810,8 @@ impl Flux2Transformer {
             cache,
             None,
             &MemoryConfig::OFF,
+            AttentionPlan::UNBOUNDED,
+            None,
         )
     }
 
@@ -742,6 +824,8 @@ impl Flux2Transformer {
         inputs: &Flux2ForwardInputs,
         cache: Option<&Flux2KvCache>,
         mem: &MemoryConfig,
+        attention_plan: AttentionPlan<'_>,
+        block_window: Option<(usize, &mlx_gen::CancelFlag)>,
     ) -> Result<Array> {
         self.forward_inner(
             inputs.hidden_states,
@@ -753,6 +837,8 @@ impl Flux2Transformer {
             cache,
             None,
             mem,
+            attention_plan,
+            block_window,
         )
     }
 
@@ -768,6 +854,22 @@ impl Flux2Transformer {
         inputs: &Flux2ForwardInputs,
         control: (&Flux2ControlBranch, &Array, f32),
     ) -> Result<Array> {
+        self.forward_with_control_mem(inputs, control, &MemoryConfig::OFF)
+    }
+
+    /// As [`Self::forward_with_control`], with an explicit [`MemoryConfig`] (sc-18317).
+    ///
+    /// The control route shares the base double/single stacks, so it shares their activation levers;
+    /// it did not share the sc-6266 wiring because that story only gated the multi-reference edit
+    /// sequence. This is the seam the dev-control generate path threads the request's typed execution
+    /// selections through. `MemoryConfig::OFF` here is byte-identical to
+    /// [`Self::forward_with_control`], which is why that method remains the shim.
+    pub fn forward_with_control_mem(
+        &self,
+        inputs: &Flux2ForwardInputs,
+        control: (&Flux2ControlBranch, &Array, f32),
+        mem: &MemoryConfig,
+    ) -> Result<Array> {
         self.forward_inner(
             inputs.hidden_states,
             inputs.encoder_hidden_states,
@@ -777,7 +879,9 @@ impl Flux2Transformer {
             inputs.guidance,
             None,
             Some(control),
-            &MemoryConfig::OFF,
+            mem,
+            AttentionPlan::UNBOUNDED,
+            None,
         )
     }
 
@@ -797,6 +901,8 @@ impl Flux2Transformer {
         cache: Option<&Flux2KvCache>,
         control: Option<(&Flux2ControlBranch, &Array, f32)>,
         mem: &MemoryConfig,
+        attention_plan: AttentionPlan<'_>,
+        block_window: Option<(usize, &mlx_gen::CancelFlag)>,
     ) -> Result<Array> {
         let temb = self.temb(timestep, guidance)?;
         let mut img = self
@@ -840,39 +946,127 @@ impl Flux2Transformer {
             None => None,
         };
 
-        for (idx, block) in self.double_blocks.iter().enumerate() {
-            (txt, img) = block.forward(
-                img,
-                txt,
-                &img_mod,
-                &txt_mod,
-                &cos,
-                &sin,
-                cache.map(|c| (c, idx)),
-                mem.ffn_seq_chunk,
-            )?;
-            // Add the control hint into the base image stream (`img + hints[n]·scale`) at the mapped
-            // base double blocks. `scale = 0` → `+0` → byte-identical to the base forward.
-            if let (Some(hints), Some((branch, _, scale))) = (&hints, &control) {
-                if let Some(n) = branch.hint_index(idx) {
-                    img = add(&img, &multiply(&hints[n], scalar(*scale))?)?;
+        match block_window {
+            None => {
+                if self.block_stream.is_some() {
+                    return Err(Error::Unsupported(
+                        "flux2: a deferred transformer requires an explicit block window"
+                            .to_owned(),
+                    ));
+                }
+                for (idx, block) in self.double_blocks.iter().enumerate() {
+                    (txt, img) = block.forward(
+                        img,
+                        txt,
+                        &img_mod,
+                        &txt_mod,
+                        &cos,
+                        &sin,
+                        cache.map(|c| (c, idx)),
+                        mem.ffn_chunk_rows(),
+                        attention_plan,
+                    )?;
+                    if let (Some(hints), Some((branch, _, scale))) = (&hints, &control) {
+                        if let Some(n) = branch.hint_index(idx) {
+                            img = add(&img, &multiply(&hints[n], scalar(*scale))?)?;
+                        }
+                    }
+                    if mem.evaluates_after_block(idx) {
+                        mlx_rs::transforms::eval([&img, &txt])?;
+                    }
                 }
             }
-            // sc-6266: cap the per-step lazy-graph peak at ~one block's transients (bit-exact). Gated
-            // off (`mem.eval_per_block == false`) for every shipped path → no extra evals there.
-            if mem.eval_per_block {
-                mlx_rs::transforms::eval([&img, &txt])?;
+            Some((size, cancel)) => {
+                if control.is_some()
+                    || !self.double_blocks.is_empty()
+                    || !self.single_blocks.is_empty()
+                {
+                    return Err(Error::Unsupported(
+                        "flux2: deferred block streaming is available only for an evicted Klein base stack".to_owned(),
+                    ));
+                }
+                let source = self.block_stream.as_ref().ok_or_else(|| {
+                    Error::Unsupported("flux2: no snapshot-backed block stream".to_owned())
+                })?;
+                let plan = mlx_gen::block_residency::BlockPlan::new(source.double_blocks(), size)?;
+                (txt, img) = mlx_gen::block_residency::run_windowed(
+                    &plan,
+                    cancel,
+                    (txt, img),
+                    || source.open(),
+                    |(mut txt, mut img), view, range| {
+                        for idx in range {
+                            let block = source.materialize_double(view, idx)?;
+                            (txt, img) = block.forward(
+                                img,
+                                txt,
+                                &img_mod,
+                                &txt_mod,
+                                &cos,
+                                &sin,
+                                cache.map(|c| (c, idx)),
+                                mem.ffn_chunk_rows(),
+                                attention_plan,
+                            )?;
+                        }
+                        Ok((txt, img))
+                    },
+                    |(txt, img)| {
+                        mlx_rs::transforms::eval([txt, img])?;
+                        source.verify_materialized_window()
+                    },
+                )?;
             }
         }
 
         let txt_seq = txt.shape()[1];
         let mut hidden = concatenate_axis(&[&txt, &img], 1)?;
         let ms = self.mod_single.forward(&temb)?;
-        for (idx, block) in self.single_blocks.iter().enumerate() {
-            hidden = block.forward(&hidden, &ms[0], &cos, &sin, cache.map(|c| (c, idx)))?;
-            // sc-6266: per-block eval-to-free (bit-exact), gated off for shipped paths.
-            if mem.eval_per_block {
-                mlx_rs::transforms::eval([&hidden])?;
+        match block_window {
+            None => {
+                for (idx, block) in self.single_blocks.iter().enumerate() {
+                    hidden = block.forward(
+                        &hidden,
+                        &ms[0],
+                        &cos,
+                        &sin,
+                        cache.map(|c| (c, idx)),
+                        attention_plan,
+                    )?;
+                    if mem.evaluates_after_block(idx) {
+                        mlx_rs::transforms::eval([&hidden])?;
+                    }
+                }
+            }
+            Some((size, cancel)) => {
+                let source = self.block_stream.as_ref().ok_or_else(|| {
+                    Error::Unsupported("flux2: no snapshot-backed block stream".to_owned())
+                })?;
+                let plan = mlx_gen::block_residency::BlockPlan::new(source.single_blocks(), size)?;
+                hidden = mlx_gen::block_residency::run_windowed(
+                    &plan,
+                    cancel,
+                    hidden,
+                    || source.open(),
+                    |mut hidden, view, range| {
+                        for idx in range {
+                            let block = source.materialize_single(view, idx)?;
+                            hidden = block.forward(
+                                &hidden,
+                                &ms[0],
+                                &cos,
+                                &sin,
+                                cache.map(|c| (c, idx)),
+                                attention_plan,
+                            )?;
+                        }
+                        Ok(hidden)
+                    },
+                    |hidden| {
+                        mlx_rs::transforms::eval([hidden])?;
+                        source.verify_materialized_window()
+                    },
+                )?;
             }
         }
 
@@ -1061,9 +1255,17 @@ impl Flux2ControlBranch {
                 })?;
                 c = add(&bp.forward(&c)?, img_embed)?;
             }
-            let (new_txt, new_c) = block
-                .base
-                .forward(c, txt, img_mod, txt_mod, cos, sin, None, None)?;
+            let (new_txt, new_c) = block.base.forward(
+                c,
+                txt,
+                img_mod,
+                txt_mod,
+                cos,
+                sin,
+                None,
+                None,
+                AttentionPlan::UNBOUNDED,
+            )?;
             hints.push(block.after_proj.forward(&new_c)?);
             c = new_c;
             txt = new_txt;
@@ -1115,7 +1317,36 @@ impl Flux2ControlTransformer {
         control_context: &Array,
         control_context_scale: f32,
     ) -> Result<Array> {
-        self.base.forward_with_control(
+        self.forward_with_mem(
+            hidden_states,
+            encoder_hidden_states,
+            img_ids,
+            txt_ids,
+            timestep,
+            guidance,
+            control_context,
+            control_context_scale,
+            &MemoryConfig::OFF,
+        )
+    }
+
+    /// As [`Self::forward`], with an explicit [`MemoryConfig`] (sc-18317) so the dev-control generate
+    /// path can honour a request's typed graph-evaluation cadence / FFN chunk. `MemoryConfig::OFF` is
+    /// byte-identical to [`Self::forward`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_mem(
+        &self,
+        hidden_states: &Array,
+        encoder_hidden_states: &Array,
+        img_ids: &Array,
+        txt_ids: &Array,
+        timestep: f32,
+        guidance: Option<f32>,
+        control_context: &Array,
+        control_context_scale: f32,
+        mem: &MemoryConfig,
+    ) -> Result<Array> {
+        self.base.forward_with_control_mem(
             &Flux2ForwardInputs {
                 hidden_states,
                 encoder_hidden_states,
@@ -1125,6 +1356,7 @@ impl Flux2ControlTransformer {
                 guidance,
             },
             (&self.branch, control_context, control_context_scale),
+            mem,
         )
     }
 }
@@ -1473,6 +1705,108 @@ mod tests {
     use mlx_gen::adapters::{install_adapter, Adapter};
 
     #[test]
+    fn retained_binary_swiglu_matches_oneshot_and_preserves_numeric_contract() {
+        use mlx_gen::diagnostics::{
+            self, CompileDisposition, DiagnosticCounter, ToggleDisposition, RETAINED_COMPILATION,
+        };
+        use mlx_rs::Dtype::{Bfloat16, Float32};
+
+        for dtype in [Float32, Bfloat16] {
+            let x = Array::from_slice(&[1.0f32, -2.0, 0.5, 3.0, -0.25, 2.0, 4.0, -1.0], &[1, 1, 8])
+                .as_dtype(dtype)
+                .unwrap();
+            set_compile_glue(false);
+            let eager = swiglu(&x).unwrap();
+            eager.eval().unwrap();
+
+            mlx_rs::transforms::compile::clear_cache();
+            let scope =
+                diagnostics::begin_request(format!("flux2-oneshot-binary-{dtype:?}"), "test")
+                    .unwrap();
+            set_compile_glue(true);
+            let oneshot = swiglu(&x).unwrap();
+            oneshot.eval().unwrap();
+            let oneshot_report = scope.finish();
+            set_compile_glue(false);
+            assert_eq!(
+                oneshot_report.counters,
+                vec![DiagnosticCounter::Compile {
+                    site: SITE_SWIGLU,
+                    disposition: CompileDisposition::OneShot,
+                    count: 1,
+                }],
+                "no-toggle request must record only the one-shot compile"
+            );
+
+            mlx_rs::transforms::compile::clear_cache();
+            RETAINED_SWIGLU.with(|slot| *slot.borrow_mut() = None);
+            let scope = diagnostics::begin_request_with_toggles(
+                format!("flux2-retained-binary-{dtype:?}"),
+                "test",
+                &[RETAINED_COMPILATION],
+            )
+            .unwrap();
+            set_compile_glue(true);
+            let first = swiglu(&x).unwrap();
+            first.eval().unwrap();
+            let second = swiglu(&x).unwrap();
+            second.eval().unwrap();
+            let retained_report = scope.finish();
+            set_compile_glue(false);
+            assert_eq!(
+                retained_report.counters,
+                vec![
+                    DiagnosticCounter::Compile {
+                        site: SITE_SWIGLU,
+                        disposition: CompileDisposition::RetainedMiss,
+                        count: 1,
+                    },
+                    DiagnosticCounter::Compile {
+                        site: SITE_SWIGLU,
+                        disposition: CompileDisposition::RetainedHit,
+                        count: 1,
+                    },
+                    DiagnosticCounter::Toggle {
+                        toggle: RETAINED_COMPILATION,
+                        disposition: ToggleDisposition::Applied,
+                        count: 2,
+                    },
+                ],
+                "retained request must prove one miss, one hit, and two applied calls"
+            );
+
+            assert_eq!(eager.dtype(), dtype);
+            assert_eq!(oneshot.dtype(), dtype);
+            assert_eq!(first.dtype(), dtype);
+            assert_eq!(second.dtype(), dtype);
+            assert_eq!(
+                first, oneshot,
+                "retained miss must match one-shot {dtype:?}"
+            );
+            assert_eq!(
+                second, oneshot,
+                "retained hit must match one-shot {dtype:?}"
+            );
+
+            // MLX 0.32 fused f32 elementwise glue may round 1-2 ULP differently from eager, while
+            // bf16 remains bit-identical. Retention must not change either established contract.
+            let tol = if dtype == Float32 {
+                mlx_gen::nn::COMPILED_GLUE_F32_ULP_TOL
+            } else {
+                0.0
+            };
+            let rel = mlx_gen::nn::max_rel_diff(&oneshot, &eager);
+            assert!(
+                rel <= tol,
+                "swiglu one-shot vs eager {dtype:?}: rel|Δ|={rel:e} exceeds {tol:e}"
+            );
+            assert_eq!(mlx_gen::nn::max_rel_diff(&first, &eager), rel);
+            assert_eq!(mlx_gen::nn::max_rel_diff(&second, &eager), rel);
+        }
+        RETAINED_SWIGLU.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    #[test]
     fn timestep_embedding_shape_and_flip() {
         let t = Array::from_slice(&[1000.0f32], &[1]);
         let emb = timestep_embedding(&t, 256).unwrap();
@@ -1651,6 +1985,7 @@ mod tests {
             norm_out_linear: dummy_lin(),
             proj_out: dummy_lin(),
             time_channels: 256,
+            block_stream: None,
         }
     }
 
@@ -1695,8 +2030,10 @@ mod tests {
 
     // ---- sc-2618 kohya `lora_unet_` routing (no real weights) ---------------------------------
 
-    fn tmp(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join("mlx_gen_flux2_kohya_test");
+    fn scratch_file(tmp: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+        // Per-process scratch dir: two concurrent `cargo test` processes share `$TMPDIR`, so a fixed
+        // name lets one run's fixtures be rewritten under the other's feet.
+        let dir = tmp.path().join("mlx_gen_flux2_kohya_test");
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
     }
@@ -1747,6 +2084,7 @@ mod tests {
     /// A diffusers-named kohya file applies through the strict provider seam (every stem resolves).
     #[test]
     fn kohya_diffusers_applies() {
+        let tmp = tempfile::tempdir().unwrap();
         use crate::adapters::apply_flux2_adapters;
         use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 
@@ -1762,7 +2100,7 @@ mod tests {
             arrays.push((format!("lora_unet_{stem}.lora_up.weight"), &small));
         }
         let refs: Vec<(&str, &Array)> = arrays.iter().map(|(k, v)| (k.as_str(), *v)).collect();
-        let path = tmp("flux2_kohya_diffusers.safetensors");
+        let path = scratch_file(&tmp, "flux2_kohya_diffusers.safetensors");
         Array::save_safetensors(refs, meta, &path).unwrap();
         let report = apply_flux2_adapters(
             &mut t,
@@ -1825,6 +2163,7 @@ mod tests {
             norm_out_linear: dummy_lin(),
             proj_out: dummy_lin(),
             time_channels: 256,
+            block_stream: None,
         }
     }
 
@@ -1883,6 +2222,7 @@ mod tests {
     /// single × 2 = 200 (klein's is 8×13 + 24×2 = 152), proving the wider/deeper graph is covered.
     #[test]
     fn dev_kohya_full_surface_applies() {
+        let tmp = tempfile::tempdir().unwrap();
         use crate::adapters::apply_flux2_adapters;
         use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 
@@ -1899,7 +2239,7 @@ mod tests {
             arrays.push((format!("lora_unet_{stem}.lora_up.weight"), &small));
         }
         let refs: Vec<(&str, &Array)> = arrays.iter().map(|(k, v)| (k.as_str(), *v)).collect();
-        let path = tmp("flux2_dev_kohya_full.safetensors");
+        let path = scratch_file(&tmp, "flux2_dev_kohya_full.safetensors");
         Array::save_safetensors(refs, meta, &path).unwrap();
         let report = apply_flux2_adapters(
             &mut t,
@@ -1921,6 +2261,7 @@ mod tests {
     /// family-agnostic engine as LoRA, on the wider graph.
     #[test]
     fn dev_lokr_resolves_on_wider_graph() {
+        let tmp = tempfile::tempdir().unwrap();
         use crate::adapters::apply_flux2_adapters;
         use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 
@@ -1946,7 +2287,7 @@ mod tests {
         md.insert("networkType".to_string(), "lokr".to_string());
         md.insert("rank".to_string(), "1".to_string());
         md.insert("alpha".to_string(), "1".to_string());
-        let path = tmp("flux2_dev_lokr.safetensors");
+        let path = scratch_file(&tmp, "flux2_dev_lokr.safetensors");
         Array::save_safetensors(refs, Some(&md), &path).unwrap();
 
         let mut t = dev_transformer();
@@ -2047,6 +2388,7 @@ mod tests {
     /// (the diffusers path is fork-verified, sc-2646 → transitively the BFL path matches the fork).
     #[test]
     fn bfl_fused_qkv_resolves_and_splits_like_diffusers() {
+        let tmp = tempfile::tempdir().unwrap();
         use crate::adapters::apply_flux2_adapters;
         use mlx_gen::adapters::Adapter;
         use mlx_gen::runtime::{AdapterKind, AdapterSpec};
@@ -2067,7 +2409,7 @@ mod tests {
         let a = Array::from_slice(&[0.5f32, -0.5], &[r, inp]);
         let alpha = Array::from_slice(&[4.0f32], &[1]);
 
-        let bpath = tmp("flux2_bfl_qkv.safetensors");
+        let bpath = scratch_file(&tmp, "flux2_bfl_qkv.safetensors");
         Array::save_safetensors(
             vec![
                 (
@@ -2100,7 +2442,7 @@ mod tests {
         assert!(rb.unmatched_paths.is_empty());
 
         // Equivalent diffusers split-target file: per-head up, SHARED down, same alpha.
-        let ppath = tmp("flux2_bfl_split_peft.safetensors");
+        let ppath = scratch_file(&tmp, "flux2_bfl_split_peft.safetensors");
         Array::save_safetensors(
             vec![
                 (
@@ -2180,6 +2522,7 @@ mod tests {
     /// independent reconstruct-then-slice (LoKr can't be expressed as a per-split file the way LoRA can).
     #[test]
     fn bfl_named_lokr_resolves_on_real_transformer() {
+        let tmp = tempfile::tempdir().unwrap();
         use crate::adapters::apply_flux2_adapters;
         use mlx_gen::adapters::{reconstruct_lokr_delta, Adapter};
         use mlx_gen::runtime::{AdapterKind, AdapterSpec};
@@ -2196,7 +2539,7 @@ mod tests {
             ("alpha".to_string(), "1.0".to_string()),
             ("rank".to_string(), "1".to_string()),
         ]);
-        let path = tmp("flux2_bfl_lokr_diffmodel.safetensors");
+        let path = scratch_file(&tmp, "flux2_bfl_lokr_diffmodel.safetensors");
         Array::save_safetensors(
             vec![
                 (
@@ -2273,11 +2616,12 @@ mod tests {
     /// (`…linear1`→`to_qkv_mlp_proj`).
     #[test]
     fn bfl_renames_and_prefixes_resolve() {
+        let tmp = tempfile::tempdir().unwrap();
         use crate::adapters::apply_flux2_adapters;
         use mlx_gen::runtime::{AdapterKind, AdapterSpec};
         let meta = None as Option<&std::collections::HashMap<String, String>>;
         let s = Array::from_slice(&[0.01f32], &[1, 1]);
-        let path = tmp("flux2_bfl_renames.safetensors");
+        let path = scratch_file(&tmp, "flux2_bfl_renames.safetensors");
         Array::save_safetensors(
             vec![
                 ("base_model.model.img_in.lora_A.weight", &s),

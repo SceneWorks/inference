@@ -15,7 +15,7 @@
 //! the S3b DiT gate. The bf16-production px>8 verdict is S6. Honors "divergence is not rounding":
 //! stage-1 + final latents + frames are gated separately to localize any gap.
 //!
-//! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test pipeline_parity -- --ignored --nocapture`
+//! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test integration pipeline_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max as max_op, subtract, sum};
 use mlx_rs::{Array, Dtype};

@@ -2,7 +2,7 @@
 //!
 //! `#[ignore]`d — needs the real `Tongyi-MAI/Z-Image` snapshot (the 19 GB base weights, distinct from
 //! the `Z-Image-Turbo` snapshot the other real-weight tests use). Run with:
-//!   cargo test -p mlx-gen-z-image --release --test base_t2i_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-z-image --release --test integration base_t2i_real_weights:: -- --ignored --nocapture
 //!
 //! Unlike the Turbo golden tests (which compare against a fork dump), the base has no fork golden, so
 //! this is a **coherence smoke**: drive the public `load("z_image", spec).generate(req)` API at the

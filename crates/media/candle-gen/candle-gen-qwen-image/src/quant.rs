@@ -122,6 +122,7 @@ mod tests {
     /// bit-exactly. The shared `AdaptLinear` load path (sc-11091).
     #[test]
     fn linear_detect_fires_on_to_out_remap_and_leaves_dense_unchanged() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (64usize, 128usize);
         let (wq, s, b, grid) = q4_packed(out_dim, in_dim, 64);
@@ -144,8 +145,7 @@ mod tests {
             Tensor::zeros((out_dim,), DType::F32, &dev)?,
         );
 
-        let tmp =
-            std::env::temp_dir().join(format!("sc9415_detect_{}.safetensors", std::process::id()));
+        let tmp = tmp.path().join("sc9415_detect.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: we just wrote this file and nothing else touches it during the test.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -170,7 +170,6 @@ mod tests {
         let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "packed vs affine-grid cosine {cos:.6}");
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 
@@ -179,6 +178,7 @@ mod tests {
     /// end (Qwen-Image tiers are group 64, but the seam must not hard-code 64).
     #[test]
     fn linear_detect_gs_threads_group_size() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (32usize, 64usize);
         let (wq, s, b, grid) = q4_packed(out_dim, in_dim, 32);
@@ -187,8 +187,7 @@ mod tests {
         map.insert("p.scales".into(), s);
         map.insert("p.biases".into(), b);
 
-        let tmp =
-            std::env::temp_dir().join(format!("sc9415_gs_{}.safetensors", std::process::id()));
+        let tmp = tmp.path().join("sc9415_gs.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: freshly written, single-reader.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -205,7 +204,6 @@ mod tests {
         let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "group-32 packed vs grid cosine {cos:.6}");
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 
@@ -213,6 +211,7 @@ mod tests {
     /// no `.bias` sibling detects packed and reproduces the (un-biased) affine grid.
     #[test]
     fn linear_detect_no_bias_packed() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (64usize, 128usize);
         let (wq, s, b, grid) = q4_packed(out_dim, in_dim, 64);
@@ -221,8 +220,7 @@ mod tests {
         map.insert("linear.scales".into(), s);
         map.insert("linear.biases".into(), b);
 
-        let tmp =
-            std::env::temp_dir().join(format!("sc9415_nobias_{}.safetensors", std::process::id()));
+        let tmp = tmp.path().join("sc9415_nobias.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: freshly written, single-reader.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -239,7 +237,6 @@ mod tests {
         let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "bias-less packed vs grid cosine {cos:.6}");
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 
@@ -248,6 +245,7 @@ mod tests {
     /// reads bf16), and is a no-op on a genuinely-dense weight.
     #[test]
     fn guard_dense_errors_on_unexpected_scales() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let mut map: HashMap<String, Tensor> = HashMap::new();
         map.insert(
@@ -263,8 +261,7 @@ mod tests {
             Tensor::randn(0f32, 1f32, (8, 8), &dev)?,
         );
 
-        let tmp =
-            std::env::temp_dir().join(format!("sc9415_guard_{}.safetensors", std::process::id()));
+        let tmp = tmp.path().join("sc9415_guard.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: freshly written, single-reader.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -276,7 +273,6 @@ mod tests {
         );
         assert!(guard_dense(&vb, "visual.blocks.0.attn.proj").is_ok());
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 }

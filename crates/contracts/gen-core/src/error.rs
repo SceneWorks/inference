@@ -33,6 +33,19 @@ pub enum Error {
     #[error("cancelled")]
     Canceled,
 
+    /// The requested output geometry was measured infeasible before render. `alternative` is present
+    /// only when a current evidence record verifies that exact geometry; callers must never populate
+    /// it from an estimate or tier heuristic.
+    #[error(
+        "geometry refused: {reason}; requested {requested_width}x{requested_height}; verified alternative: {alternative:?}"
+    )]
+    GeometryRefused {
+        reason: String,
+        requested_width: u32,
+        requested_height: u32,
+        alternative: Option<(u32, u32)>,
+    },
+
     /// A contextual message (config/validation/adapter-shape errors).
     #[error("{0}")]
     Msg(String),
@@ -88,6 +101,14 @@ mod tests {
             Error::MissingTensor("unet.x".into()).to_string(),
             "missing tensor: unet.x"
         );
+        assert!(Error::GeometryRefused {
+            reason: "measured infeasible".into(),
+            requested_width: 1024,
+            requested_height: 768,
+            alternative: Some((768, 512)),
+        }
+        .to_string()
+        .contains("requested 1024x768"));
         assert_eq!(Error::Msg("boom".into()).to_string(), "boom");
     }
 

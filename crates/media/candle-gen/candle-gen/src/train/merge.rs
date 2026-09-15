@@ -879,8 +879,8 @@ mod tests {
     }
 
     /// A unique per-process temp path so parallel test binaries don't collide.
-    fn tmp_adapter(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
+    fn tmp_adapter(tmp: &tempfile::TempDir, tag: &str) -> std::path::PathBuf {
+        tmp.path().join(format!(
             "candle_gen_merge_{tag}_{}_{:?}.safetensors",
             std::process::id(),
             std::thread::current().id(),
@@ -898,7 +898,8 @@ mod tests {
     /// no-op for legitimate files — same bytes, same tensor map.
     #[test]
     fn read_adapter_loads_normal_file_under_cap() {
-        let path = tmp_adapter("normal");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp_adapter(&tmp, "normal");
         write_tiny_adapter(&path);
         // Real entry (8 GiB cap) and an explicit small-but-sufficient cap both load identically.
         let af = read_adapter(&path).unwrap();
@@ -913,7 +914,8 @@ mod tests {
     /// tiny (1-byte) cap against a small real file so no GBs are allocated.
     #[test]
     fn read_adapter_over_cap_errs_cleanly() {
-        let path = tmp_adapter("overcap");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp_adapter(&tmp, "overcap");
         write_tiny_adapter(&path);
         let size = std::fs::metadata(&path).unwrap().len();
         assert!(size > 1, "fixture must exceed the 1-byte test cap");
@@ -938,7 +940,8 @@ mod tests {
     /// A missing adapter path is a clean stat `Err`, not a panic (the cap check stats first).
     #[test]
     fn read_adapter_missing_path_errs() {
-        let path = tmp_adapter("does_not_exist_xyz");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp_adapter(&tmp, "does_not_exist_xyz");
         std::fs::remove_file(&path).ok();
         let err = match read_adapter(&path) {
             Ok(_) => panic!("missing adapter must error"),
@@ -992,8 +995,8 @@ mod tests {
     /// data-validating read would error instead).
     #[test]
     fn has_diff_patch_keys_reads_only_header() {
-        let dir = std::env::temp_dir().join(format!("merge_diffpatch_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
 
         let lightning = dir.join("lightning.safetensors");
         write_header_only_safetensors(
@@ -1043,8 +1046,6 @@ mod tests {
             vec!["blocks.0.self_attn.q.lora_down.weight".to_string()],
             "__metadata__ must be filtered out of the tensor-name set"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Malformed / truncated headers surface as a clean `Err`, not a panic: a file shorter than the
@@ -1052,8 +1053,8 @@ mod tests {
     #[test]
     fn has_diff_patch_keys_malformed_is_err_not_panic() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join(format!("merge_diffpatch_bad_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
 
         // (a) Fewer than 8 bytes total — cannot even read the header length.
         let too_short = dir.join("short.safetensors");
@@ -1073,7 +1074,5 @@ mod tests {
 
         // (c) A non-existent path.
         assert!(has_diff_patch_keys(&dir.join("nope.safetensors")).is_err());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

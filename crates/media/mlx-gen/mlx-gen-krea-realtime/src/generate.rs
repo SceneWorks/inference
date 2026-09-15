@@ -35,8 +35,9 @@ use crate::scheduler::{euler_x0, renoise_step, FewStepSchedule};
 pub struct ArGenParams {
     /// Deterministic seed: fixes the per-clip init noise and the per-step renoise noise.
     pub seed: u64,
-    /// Denoising-steps override — `None` uses the config's `denoising_step_list` (5 forwards for the
-    /// shipped 14B), `Some(n)` rebuilds an `n`-forward schedule. See [`FewStepSchedule::new`].
+    /// Denoising-steps override — `None` uses the config list's length; `Some(n)` uses `n`. Product
+    /// generation follows the pinned release server and derives a strength-1 float schedule from that
+    /// count rather than executing the config's integer values.
     pub steps: Option<usize>,
     /// Number of **latent** frames to generate (the caller derives this from the requested duration ×
     /// [`fps`](Self::fps) via the VAE's temporal compression, which S6 owns).
@@ -49,6 +50,17 @@ pub struct ArGenParams {
     /// Output frames-per-second — carried onto the assembled clip at the pipeline level (S6); it does
     /// not affect the latent sequence produced here.
     pub fps: u32,
+    /// Request-scoped shared-ladder levers. Carried here so the denoise and decode boundaries can
+    /// honour an authorized calibration fault (sc-22738); the default arms nothing.
+    pub memory: mlx_gen::gen_core::GenerationMemory,
+}
+
+fn t2v_schedule(
+    cfg: &KreaRealtimeConfig,
+    steps_override: Option<usize>,
+) -> Result<FewStepSchedule> {
+    let steps = steps_override.unwrap_or(cfg.ar.denoising_step_list.len());
+    FewStepSchedule::for_strength(cfg.ar.timestep_shift as f64, 1.0, steps)
 }
 
 /// Per-chunk latent-frame counts for `num_frames` at `frames_per_block`: full blocks then a
@@ -140,12 +152,9 @@ pub fn generate_latents_into(
         ));
     }
 
-    // The Self-Forcing few-step schedule (shift + denoising_step_list from the config; caller override).
-    let schedule = FewStepSchedule::new(
-        cfg.ar.timestep_shift as f64,
-        &cfg.ar.denoising_step_list,
-        params.steps,
-    )?;
+    // The online release server ignores the YAML's integer values, uses only their count, and selects
+    // float timesteps from the shifted table.
+    let schedule = t2v_schedule(cfg, params.steps)?;
 
     // DiT text embedding + per-prompt cross-attention K/V (position-independent; built once).
     let ctx = transformer.inner().embed_text(context)?;
@@ -313,17 +322,14 @@ pub fn generate_latents_conditioned_into(
         ));
     }
 
-    // v2v uses the strength-scaled schedule (max timestep = strength·1000); i2v/t2v use the config list.
+    // v2v uses the strength-scaled release schedule (max timetable index = strength·1000); i2v/t2v
+    // use its strength-1 form.
     let schedule = match &cond.source {
         Some((_, strength)) => {
             let steps = params.steps.unwrap_or(cfg.ar.denoising_step_list.len());
             FewStepSchedule::for_strength(cfg.ar.timestep_shift as f64, *strength as f64, steps)?
         }
-        None => FewStepSchedule::new(
-            cfg.ar.timestep_shift as f64,
-            &cfg.ar.denoising_step_list,
-            params.steps,
-        )?,
+        None => t2v_schedule(cfg, params.steps)?,
     };
 
     // DiT text embedding + per-prompt cross-attention K/V (position-independent; built once).
@@ -617,7 +623,42 @@ mod tests {
             latent_height: 4,
             latent_width: 4,
             fps: 16,
+            memory: Default::default(),
         }
+    }
+
+    /// Product-path activation oracle: generation uses the config list's count while ignoring its
+    /// integer values, matching the pinned online release server.
+    #[test]
+    fn product_schedule_uses_count_and_ignores_config_values() {
+        let cfg = KreaRealtimeConfig::krea_realtime_14b();
+        let release = t2v_schedule(&cfg, None).unwrap();
+        let want = [1000.0, 937.5, 833.333_312_988_281_2, 625.0, 0.0];
+        for (got, want) in release.step_timesteps().iter().zip(want) {
+            assert!((got - want).abs() < 1e-12, "{got} != {want}");
+        }
+        let model_timesteps: Vec<f32> =
+            release.step_timesteps().iter().map(|&t| t as f32).collect();
+        assert_eq!(
+            model_timesteps,
+            [1000.0, 937.5, 833.333_3, 625.0, 0.0],
+            "product paths must pass the release values into the DiT"
+        );
+
+        let three = t2v_schedule(&cfg, Some(3)).unwrap();
+        assert_eq!(three.num_steps(), 3);
+        assert_eq!(three.step_timesteps()[1], 833.333_312_988_281_2);
+
+        let mut custom = cfg;
+        custom.ar.denoising_step_list = vec![900, 700, 0];
+        let from_custom_count = t2v_schedule(&custom, None).unwrap();
+        assert_eq!(from_custom_count.num_steps(), 3);
+        assert_eq!(from_custom_count.step_timesteps()[1], 833.333_312_988_281_2);
+        assert_ne!(
+            from_custom_count.step_timesteps(),
+            &[900.0, 700.0, 0.0],
+            "product paths must not execute YAML timestep values"
+        );
     }
 
     #[test]
@@ -1201,5 +1242,109 @@ mod tests {
             n_steps,
             "progress counts denoise steps only, not the clean-context recompute forward"
         );
+    }
+
+    /// sc-17894's safety gate: the optimized cache and the exact pre-change eager-retention policy
+    /// must produce bit-identical real-weight latents. Three chunks are sufficient to cross the
+    /// shipped six-frame window: before chunk three the old cache holds six frames while the new one
+    /// keeps only the three cached frames that chunk reads.
+    #[test]
+    #[ignore = "real Krea snapshot; run on the rw-krea Metal lane"]
+    fn next_read_eviction_is_bit_identical_to_eager_max_window_retention() {
+        use crate::load_krea_realtime_transformer_with_quant;
+        use mlx_gen::weights::Weights;
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let root = PathBuf::from(
+            std::env::var("KREA_REALTIME_SNAPSHOT_DIR")
+                .expect("KREA_REALTIME_SNAPSHOT_DIR must name the q4 tier"),
+        );
+        assert!(root.join("dit.safetensors").is_file(), "missing real DiT");
+
+        let (width, height, latent_frames) = (832usize, 480usize, 9usize);
+        let (latent_h, latent_w) = (height / 8, width / 8);
+        let mut cfg = KreaRealtimeConfig::krea_realtime_14b();
+        cfg.ar.local_attn_size = cfg.ar.streaming_local_attn_frames() as i64;
+        cfg.ar.frame_seq_length =
+            (latent_h / cfg.wan.patch_size.1) * (latent_w / cfg.wan.patch_size.2);
+        cfg.ar.seq_length = latent_frames * cfg.ar.frame_seq_length;
+
+        let weights = Weights::from_file(root.join("dit.safetensors")).expect("open the real DiT");
+        let raw: HashMap<String, Array> = weights
+            .keys()
+            .map(|key| {
+                (
+                    key.to_string(),
+                    weights.get(key).expect("listed DiT key").clone(),
+                )
+            })
+            .collect();
+        let (dit, _) =
+            load_krea_realtime_transformer_with_quant(raw, &cfg).expect("load the real DiT");
+        let transformer = CausalKreaTransformer::new(dit, &cfg);
+        let context = Array::zeros::<f32>(&[cfg.wan.text_len as i32, cfg.wan.text_dim as i32])
+            .expect("zero text context");
+        let params = ArGenParams {
+            seed: 7,
+            steps: Some(2),
+            num_latent_frames: latent_frames,
+            latent_height: latent_h,
+            latent_width: latent_w,
+            fps: 24,
+            memory: Default::default(),
+        };
+
+        let mut optimized = transformer.new_cache();
+        let optimized_latents = generate_latents_into(
+            &transformer,
+            &cfg,
+            &context,
+            &params,
+            &mut optimized,
+            &CancelFlag::default(),
+            &mut |_| {},
+        )
+        .expect("optimized real-weight generation");
+        mlx_rs::transforms::eval([&optimized_latents]).expect("materialize optimized latents");
+        let optimized_values = optimized_latents.as_slice::<f32>().to_vec();
+        mlx_rs::memory::clear_cache();
+
+        let mut eager = CausalKvCache::new_eager_reference(
+            cfg.wan.num_layers,
+            cfg.ar.max_attention_size(),
+            cfg.ar.sink_tokens(),
+            cfg.ar.kv_cache_quant,
+        );
+        let eager_latents = generate_latents_into(
+            &transformer,
+            &cfg,
+            &context,
+            &params,
+            &mut eager,
+            &CancelFlag::default(),
+            &mut |_| {},
+        )
+        .expect("eager-reference real-weight generation");
+        mlx_rs::transforms::eval([&eager_latents]).expect("materialize eager-reference latents");
+
+        assert_eq!(optimized_latents.shape(), eager_latents.shape());
+        assert_eq!(
+            optimized_values,
+            eager_latents.as_slice::<f32>(),
+            "evicting only never-read KV must not change one latent bit"
+        );
+
+        let old_window = cfg.ar.max_attention_size();
+        assert_eq!(optimized.retained_tokens(), old_window);
+        assert_eq!(eager.retained_tokens(), old_window);
+        optimized
+            .window_prev(cfg.ar.block_size())
+            .expect("trim optimized cache to the next read");
+        eager
+            .window_prev(cfg.ar.block_size())
+            .expect("read eager-reference cache");
+        assert_eq!(optimized.retained_tokens() * 2, old_window);
+        assert_eq!(eager.retained_tokens(), old_window);
     }
 }

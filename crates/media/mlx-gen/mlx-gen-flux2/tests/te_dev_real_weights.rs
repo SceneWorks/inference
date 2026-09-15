@@ -3,7 +3,7 @@
 //! golden produced by `tools/dump_flux2_te_dev_real_golden.py` (gitignored, large, regenerable):
 //!
 //!   ~/mlx-flux-venv/bin/python ~/repos/mlx-gen/tools/dump_flux2_te_dev_real_golden.py
-//!   cargo test -p mlx-gen-flux2 --test te_dev_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux2 --test integration te_dev_real_weights:: -- --ignored --nocapture
 //!
 //! The committed `te_dev_parity.rs` proves the encoder *math* bit-tight in f32 on a tiny Mistral
 //! config; this proves the *loader* (sharded `language_model.model.*` keys, no-qk-norm path, the

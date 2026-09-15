@@ -1,15 +1,51 @@
 //! Mage dual-stream NR-MMDiT.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use candle_core::{DType, Device, Result, Tensor, D};
-use candle_gen::gen_core::Quant;
-use candle_gen::quant::QLinear;
+use candle_core::{DType, Device, Result, Tensor, Var, D};
+use candle_gen::gen_core::{PrecisionFloorComponent, Quant};
+use candle_gen::quant::{AdaptLinear as QLinear, PackedWeightSidecars};
 use candle_gen_boogu::loader::Weights;
 
 use crate::config::{HEAD_DIM, NORM_EPS};
 use crate::quant::{linear, move_onto, quantize_onto, tensor_onto};
 use crate::rope::{self, PackLayout, RopeTable};
+
+fn streamed_linear(
+    weights: &Weights,
+    base: &str,
+    bias: bool,
+    sidecars: Option<&PackedWeightSidecars>,
+) -> Result<QLinear> {
+    let Some(sidecars) = sidecars.filter(|_| weights.contains(&format!("{base}.scales"))) else {
+        return linear(weights, base, bias);
+    };
+    if !sidecars.contains(base) {
+        candle_core::bail!(
+            "mage streamed packed projection `{base}` has no prepared device-format sidecar"
+        );
+    }
+    let dense_bias = if bias {
+        Some(weights.get(&format!("{base}.bias"))?)
+    } else {
+        None
+    };
+    let base_linear = candle_gen::quant::QLinear::from_qtensor_dequant(
+        Arc::new(sidecars.load(base, weights.device())?),
+        dense_bias,
+    );
+    let scales = weights.get_f32(&format!("{base}.scales"))?;
+    let (out_dim, groups) = scales.dims2()?;
+    let group_size = weights
+        .packed()
+        .map_or(64, |config| config.group_size as usize);
+    Ok(QLinear::from_packed(
+        base_linear,
+        groups * group_size,
+        out_dim,
+    ))
+}
 
 fn rms(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
     let norm = x
@@ -87,10 +123,14 @@ struct FeedForward {
 }
 
 impl FeedForward {
-    fn load(w: &Weights, prefix: &str) -> Result<Self> {
+    fn load_with_sidecars(
+        w: &Weights,
+        prefix: &str,
+        sidecars: Option<&PackedWeightSidecars>,
+    ) -> Result<Self> {
         Ok(Self {
-            proj: linear(w, &format!("{prefix}.net.0.proj"), true)?,
-            out: linear(w, &format!("{prefix}.net.2"), true)?,
+            proj: streamed_linear(w, &format!("{prefix}.net.0.proj"), true, sidecars)?,
+            out: streamed_linear(w, &format!("{prefix}.net.2"), true, sidecars)?,
         })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -124,9 +164,96 @@ struct JointAttention {
     heads: usize,
 }
 
+#[cfg(any(test, feature = "testkit"))]
+pub mod attention_head_chunk_probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static MAX_CHUNK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn reset() {
+        MAX_CHUNK_COUNT.store(0, Ordering::Relaxed);
+    }
+
+    pub fn max_chunk_count() -> usize {
+        MAX_CHUNK_COUNT.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn record(count: usize) {
+        MAX_CHUNK_COUNT.fetch_max(count, Ordering::Relaxed);
+    }
+}
+
+#[cfg(any(test, feature = "testkit"))]
+fn record_attention_head_chunk_count(count: usize) {
+    attention_head_chunk_probe::record(count);
+}
+
+#[cfg(not(any(test, feature = "testkit")))]
+fn record_attention_head_chunk_count(_count: usize) {}
+
+/// Bound the score tensor over complete attention heads before falling back to query rows.
+///
+/// Mage repeatedly feeds BF16 attention output back through the diffusion trajectory. Query-row
+/// chunking changes GEMM's `M` dimension and can amplify otherwise-small rounding differences across
+/// steps. Complete heads are independent, and the shared planner can fit three full Mage heads in the
+/// 64 Mi score budget at 1024px. Splitting that axis keeps every query GEMM shape intact while the
+/// shared kernel remains the single-head fallback for shapes where one head itself exceeds budget.
+fn sdpa_planned_by_heads(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    plan: candle_gen::gen_core::attention_budget::AttentionPlan<'_>,
+) -> candle_gen::Result<Tensor> {
+    let (b, h, sq, _d) = q.dims4()?;
+    let sk = k.dim(2)?;
+    let head_plan = plan
+        .budget
+        .head_chunks(b as u64, h as u64, sq as u64, sk as u64);
+    if !head_plan.chunks_heads() {
+        record_attention_head_chunk_count(1);
+        return candle_gen::sdpa_planned_bhsd(
+            q,
+            k,
+            v,
+            scale,
+            None,
+            candle_nn::ops::softmax_last_dim,
+            plan,
+        );
+    }
+
+    let heads_per_chunk = head_plan.heads_per_chunk() as usize;
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < h {
+        if plan.is_cancelled() {
+            return Err(candle_gen::CandleError::Canceled);
+        }
+        let len = heads_per_chunk.min(h - start);
+        chunks.push(candle_gen::sdpa_planned_bhsd(
+            &q.narrow(1, start, len)?,
+            &k.narrow(1, start, len)?,
+            &v.narrow(1, start, len)?,
+            scale,
+            None,
+            candle_nn::ops::softmax_last_dim,
+            plan,
+        )?);
+        start += len;
+    }
+    record_attention_head_chunk_count(chunks.len());
+    Ok(Tensor::cat(&chunks, 1)?)
+}
+
 impl JointAttention {
-    fn load(w: &Weights, prefix: &str, heads: usize) -> Result<Self> {
-        let l = |name: &str| linear(w, &format!("{prefix}.{name}"), true);
+    fn load_with_sidecars(
+        w: &Weights,
+        prefix: &str,
+        heads: usize,
+        sidecars: Option<&PackedWeightSidecars>,
+    ) -> Result<Self> {
+        let l = |name: &str| streamed_linear(w, &format!("{prefix}.{name}"), true, sidecars);
         Ok(Self {
             to_q: l("to_q")?,
             to_k: l("to_k")?,
@@ -144,12 +271,14 @@ impl JointAttention {
         })
     }
 
-    fn forward(
+    fn forward_with_memory(
         &self,
         image: &Tensor,
         text: &Tensor,
         table: &RopeTable,
         layout: &PackLayout,
+        attention_budget: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
     ) -> Result<(Tensor, Tensor)> {
         let (_, ni, _) = image.dims3()?;
         let (_, nt, _) = text.dims3()?;
@@ -179,6 +308,9 @@ impl JointAttention {
         let mut image_parts = Vec::with_capacity(layout.segments());
         let mut text_parts = Vec::with_capacity(layout.segments());
         for s in 0..layout.segments() {
+            if cancel.is_cancelled() {
+                candle_core::bail!("mage canceled");
+            }
             let il = image_cu[s + 1] - image_cu[s];
             let tl = text_cu[s + 1] - text_cu[s];
             let joint = |t: &Tensor, i: &Tensor| -> Result<Tensor> {
@@ -192,18 +324,18 @@ impl JointAttention {
             let q = joint(&tq, &iq)?;
             let k = joint(&tk, &ik)?;
             let v = joint(&tv, &iv)?;
-            let o = candle_gen::sdpa_budgeted_bhsd(
-                &q,
-                &k,
-                &v,
-                (HEAD_DIM as f64).powf(-0.5),
-                None,
-                candle_nn::ops::softmax_last_dim,
-                candle_gen::ATTN_SCORES_BUDGET,
-            )?
-            .squeeze(0)?
-            .transpose(0, 1)?
-            .reshape((tl + il, self.heads * HEAD_DIM))?;
+            let plan = candle_gen::gen_core::attention_budget::AttentionPlan::budgeted(
+                candle_gen::gen_core::attention_budget::AttentionBudget::from_score_elements(
+                    attention_budget as u64,
+                    false,
+                ),
+            )
+            .with_cancel(cancel);
+            let o = sdpa_planned_by_heads(&q, &k, &v, (HEAD_DIM as f64).powf(-0.5), plan)
+                .map_err(|error| candle_core::Error::Msg(error.to_string()))?
+                .squeeze(0)?
+                .transpose(0, 1)?
+                .reshape((tl + il, self.heads * HEAD_DIM))?;
             text_parts.push(o.narrow(0, 0, tl)?);
             image_parts.push(o.narrow(0, tl, il)?);
         }
@@ -261,6 +393,44 @@ struct Block {
     text_ff: FeedForward,
 }
 
+enum MageBlocks {
+    Resident(Vec<Block>),
+    Streamed {
+        dir: PathBuf,
+        depth: usize,
+        heads: usize,
+        sidecars: Option<Arc<PackedWeightSidecars>>,
+        target_device: Device,
+    },
+}
+
+#[cfg(feature = "testkit")]
+pub mod block_window_probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static MATERIALIZED_WINDOWS: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn reset() {
+        MATERIALIZED_WINDOWS.store(0, Ordering::Relaxed);
+    }
+
+    pub fn materialized_windows() -> usize {
+        MATERIALIZED_WINDOWS.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn record() {
+        MATERIALIZED_WINDOWS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "testkit")]
+fn record_materialized_window() {
+    block_window_probe::record();
+}
+
+#[cfg(not(feature = "testkit"))]
+fn record_materialized_window() {}
+
 struct Mods {
     shift: Tensor,
     scale: Tensor,
@@ -269,12 +439,26 @@ struct Mods {
 
 impl Block {
     fn load(w: &Weights, prefix: &str, heads: usize) -> Result<Self> {
+        Self::load_with_sidecars(w, prefix, heads, None)
+    }
+
+    fn load_with_sidecars(
+        w: &Weights,
+        prefix: &str,
+        heads: usize,
+        sidecars: Option<&PackedWeightSidecars>,
+    ) -> Result<Self> {
         Ok(Self {
-            image_mod: linear(w, &format!("{prefix}.img_mod.1"), true)?,
-            text_mod: linear(w, &format!("{prefix}.txt_mod.1"), true)?,
-            attention: JointAttention::load(w, &format!("{prefix}.attn"), heads)?,
-            image_ff: FeedForward::load(w, &format!("{prefix}.img_mlp"))?,
-            text_ff: FeedForward::load(w, &format!("{prefix}.txt_mlp"))?,
+            image_mod: streamed_linear(w, &format!("{prefix}.img_mod.1"), true, sidecars)?,
+            text_mod: streamed_linear(w, &format!("{prefix}.txt_mod.1"), true, sidecars)?,
+            attention: JointAttention::load_with_sidecars(
+                w,
+                &format!("{prefix}.attn"),
+                heads,
+                sidecars,
+            )?,
+            image_ff: FeedForward::load_with_sidecars(w, &format!("{prefix}.img_mlp"), sidecars)?,
+            text_ff: FeedForward::load_with_sidecars(w, &format!("{prefix}.txt_mlp"), sidecars)?,
         })
     }
 
@@ -297,13 +481,16 @@ impl Block {
         Ok((one(0)?, one(3 * dim)?))
     }
 
-    fn forward(
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with_memory(
         &self,
         image: Tensor,
         text: Tensor,
         temb: &Tensor,
         table: &RopeTable,
         layout: &PackLayout,
+        attention_budget: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
     ) -> Result<(Tensor, Tensor)> {
         let image_ids = layout.image_segment_ids(image.device())?;
         let text_ids: Vec<u32> = layout
@@ -317,7 +504,14 @@ impl Block {
         let (tx1, tx2) = Self::mods(&self.text_mod, temb, &text_ids, layout.text_tokens())?;
         let imn = modulate(&layer_norm(&image)?, &im1.shift, &im1.scale)?;
         let txn = modulate(&layer_norm(&text)?, &tx1.shift, &tx1.scale)?;
-        let (ia, ta) = self.attention.forward(&imn, &txn, table, layout)?;
+        let (ia, ta) = self.attention.forward_with_memory(
+            &imn,
+            &txn,
+            table,
+            layout,
+            attention_budget,
+            cancel,
+        )?;
         let image = (&image + ia.broadcast_mul(&im1.gate)?)?;
         let text = (&text + ta.broadcast_mul(&tx1.gate)?)?;
         let iff =
@@ -354,15 +548,79 @@ pub struct MageTransformer {
     text_norm: Tensor,
     text_in: QLinear,
     timestep: TimestepEmbedder,
-    blocks: Vec<Block>,
+    blocks: MageBlocks,
     final_mod: QLinear,
     output: QLinear,
     dtype: DType,
 }
 
 impl MageTransformer {
+    pub fn visit_adaptable_mut(
+        &mut self,
+        visitor: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        visitor("img_in", &mut self.image_in)?;
+        visitor("txt_in", &mut self.text_in)?;
+        visitor(
+            "time_text_embed.timestep_embedder.linear_1",
+            &mut self.timestep.l1,
+        )?;
+        visitor(
+            "time_text_embed.timestep_embedder.linear_2",
+            &mut self.timestep.l2,
+        )?;
+        match &mut self.blocks {
+            MageBlocks::Resident(blocks) => {
+                for (index, block) in blocks.iter_mut().enumerate() {
+                    let prefix = format!("transformer_blocks.{index}");
+                    visitor(&format!("{prefix}.img_mod.1"), &mut block.image_mod)?;
+                    visitor(&format!("{prefix}.txt_mod.1"), &mut block.text_mod)?;
+                    for (name, linear) in [
+                        ("to_q", &mut block.attention.to_q),
+                        ("to_k", &mut block.attention.to_k),
+                        ("to_v", &mut block.attention.to_v),
+                        ("to_out.0", &mut block.attention.to_out),
+                        ("add_q_proj", &mut block.attention.add_q),
+                        ("add_k_proj", &mut block.attention.add_k),
+                        ("add_v_proj", &mut block.attention.add_v),
+                        ("to_add_out", &mut block.attention.add_out),
+                    ] {
+                        visitor(&format!("{prefix}.attn.{name}"), linear)?;
+                    }
+                    visitor(
+                        &format!("{prefix}.img_mlp.net.0.proj"),
+                        &mut block.image_ff.proj,
+                    )?;
+                    visitor(&format!("{prefix}.img_mlp.net.2"), &mut block.image_ff.out)?;
+                    visitor(
+                        &format!("{prefix}.txt_mlp.net.0.proj"),
+                        &mut block.text_ff.proj,
+                    )?;
+                    visitor(&format!("{prefix}.txt_mlp.net.2"), &mut block.text_ff.out)?;
+                }
+            }
+            MageBlocks::Streamed { .. } => {
+                candle_core::bail!(
+                    "Mage adapters require resident transformer blocks; disable block streaming"
+                )
+            }
+        }
+        visitor("norm_out.linear", &mut self.final_mod)?;
+        visitor("proj_out", &mut self.output)
+    }
+
     pub fn load(dir: &Path, cfg: &crate::config::MageConfig, device: &Device) -> Result<Self> {
         Self::load_with_quant(dir, cfg, None, device)
+    }
+
+    pub(crate) fn load_dtype(
+        dir: &Path,
+        cfg: &crate::config::MageConfig,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Self> {
+        let weights = Weights::from_dir(dir, device, dtype)?;
+        Self::from_resident_weights(&weights, cfg, dtype)
     }
 
     pub fn load_with_quant(
@@ -376,25 +634,14 @@ impl MageTransformer {
         } else {
             device.clone()
         };
-        let weights = Weights::from_dir(dir, &staging, DType::BF16)?;
-        let mut blocks = Vec::with_capacity(cfg.depth);
-        for i in 0..cfg.depth {
-            blocks.push(Block::load(
-                &weights,
-                &format!("transformer_blocks.{i}"),
-                cfg.num_heads,
-            )?);
+        let mut weights = Weights::from_dir(dir, &staging, DType::BF16)?;
+        // Dense snapshots stage on CPU and fold each projection directly onto the target. Physical
+        // q4/q8 tiers are already packed: reopen their mmap on the target so `from_packed_gs` builds
+        // each resident GGUF tensor there rather than leaving an idempotent packed projection on CPU.
+        if quant.is_some() && weights.packed().is_some() {
+            weights = Weights::from_dir(dir, device, DType::BF16)?;
         }
-        let mut transformer = Self {
-            image_in: linear(&weights, "img_in", true)?,
-            text_norm: weights.get("txt_norm.weight")?,
-            text_in: linear(&weights, "txt_in", true)?,
-            timestep: TimestepEmbedder::load(&weights)?,
-            blocks,
-            final_mod: linear(&weights, "norm_out.linear", true)?,
-            output: linear(&weights, "proj_out", true)?,
-            dtype: DType::BF16,
-        };
+        let mut transformer = Self::from_resident_weights(&weights, cfg, DType::BF16)?;
         if quant.is_some() {
             transformer.place(quant, device)?;
             let count = transformer.quantized_linear_count();
@@ -407,15 +654,118 @@ impl MageTransformer {
         Ok(transformer)
     }
 
+    /// Build the production transformer over a complete owned dense parameter map. Every returned
+    /// variable retains its original checkpoint key and is reachable by the same forward used by
+    /// inference; the full-base trainer optimizes this complete list rather than a curated subset.
+    pub(crate) fn load_trainable(
+        dir: &Path,
+        cfg: &crate::config::MageConfig,
+        device: &Device,
+    ) -> Result<(Self, Vec<(String, Var)>)> {
+        let (weights, named) = Weights::from_trainable_dir(dir, device, DType::F32)?;
+        let transformer = Self::from_resident_weights(&weights, cfg, DType::F32)?;
+        Ok((transformer, named))
+    }
+
+    fn from_resident_weights(
+        weights: &Weights,
+        cfg: &crate::config::MageConfig,
+        dtype: DType,
+    ) -> Result<Self> {
+        let mut blocks = Vec::with_capacity(cfg.depth);
+        for i in 0..cfg.depth {
+            blocks.push(Block::load(
+                weights,
+                &format!("transformer_blocks.{i}"),
+                cfg.num_heads,
+            )?);
+        }
+        Ok(Self {
+            image_in: linear(weights, "img_in", true)?,
+            text_norm: weights.get("txt_norm.weight")?,
+            text_in: linear(weights, "txt_in", true)?,
+            timestep: TimestepEmbedder::load(weights)?,
+            blocks: MageBlocks::Resident(blocks),
+            final_mod: linear(weights, "norm_out.linear", true)?,
+            output: linear(weights, "proj_out", true)?,
+            dtype,
+        })
+    }
+
+    /// Load the non-block shell once and retain only the host-backed transformer directory for the
+    /// shared block-window driver. Each window reopens a fresh mmap view and materializes exactly its
+    /// block range on the target device.
+    pub fn load_block_streamed(
+        dir: &Path,
+        cfg: &crate::config::MageConfig,
+        quant: Option<Quant>,
+        target_device: &Device,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> Result<Self> {
+        let mut weights = Weights::from_dir(dir, &Device::Cpu, DType::BF16)?;
+        let sidecars = if let Some(packed) = weights.packed() {
+            let files = candle_gen::sorted_safetensors(dir, "mage")
+                .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+            let (_, sidecars) = PackedWeightSidecars::open_and_prepare_prefix_cancelable(
+                &files,
+                dir,
+                packed,
+                target_device,
+                cancel,
+                "transformer_blocks.",
+            )?;
+            Some(Arc::new(sidecars))
+        } else {
+            None
+        };
+        if quant.is_some() && sidecars.is_none() {
+            candle_core::bail!(
+                "mage dense q4/q8 transformer snapshots do not provide prepared device-format block sidecars"
+            );
+        }
+        if quant.is_some() && sidecars.is_some() {
+            weights = Weights::from_dir(dir, target_device, DType::BF16)?;
+        }
+        let mut transformer = Self {
+            image_in: linear(&weights, "img_in", true)?,
+            text_norm: weights.get("txt_norm.weight")?,
+            text_in: linear(&weights, "txt_in", true)?,
+            timestep: TimestepEmbedder::load(&weights)?,
+            blocks: MageBlocks::Streamed {
+                dir: dir.to_path_buf(),
+                depth: cfg.depth,
+                heads: cfg.num_heads,
+                sidecars,
+                target_device: target_device.clone(),
+            },
+            final_mod: linear(&weights, "norm_out.linear", true)?,
+            output: linear(&weights, "proj_out", true)?,
+            dtype: DType::BF16,
+        };
+        transformer.place_non_blocks(quant, target_device)?;
+        Ok(transformer)
+    }
+
     fn place(&mut self, quant: Option<Quant>, device: &Device) -> Result<()> {
+        self.place_non_blocks(quant, device)?;
+        let MageBlocks::Resident(blocks) = &mut self.blocks else {
+            return Ok(());
+        };
+        for block in blocks {
+            block.place(quant, device)?;
+        }
+        Ok(())
+    }
+
+    fn place_non_blocks(&mut self, quant: Option<Quant>, device: &Device) -> Result<()> {
         place_linear(&mut self.image_in, quant, device)?;
         tensor_onto(&mut self.text_norm, device)?;
         place_linear(&mut self.text_in, quant, device)?;
         self.timestep.place(quant, device)?;
-        for block in &mut self.blocks {
-            block.place(quant, device)?;
-        }
-        place_linear(&mut self.final_mod, quant, device)?;
+        let final_mod_quant = quant.map(|selected| {
+            crate::quant::component_quant(PrecisionFloorComponent::TransformerHead, selected)
+        });
+        place_linear(&mut self.final_mod, final_mod_quant, device)?;
         place_linear(&mut self.output, quant, device)
     }
 
@@ -425,9 +775,9 @@ impl MageTransformer {
             + self.timestep.quantized_count()
             + self
                 .blocks
-                .iter()
-                .map(Block::quantized_count)
-                .sum::<usize>()
+                .resident()
+                .map(|blocks| blocks.iter().map(Block::quantized_count).sum::<usize>())
+                .unwrap_or(0)
             + usize::from(self.final_mod.is_quantized())
             + usize::from(self.output.is_quantized())
     }
@@ -441,17 +791,108 @@ impl MageTransformer {
         sigma: &Tensor,
         layout: &PackLayout,
     ) -> Result<Tensor> {
+        self.forward_with_memory(
+            image,
+            text,
+            sigma,
+            layout,
+            candle_gen::ATTN_SCORES_BUDGET,
+            usize::MAX,
+            &candle_gen::gen_core::CancelFlag::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_memory(
+        &self,
+        image: &Tensor,
+        text: &Tensor,
+        sigma: &Tensor,
+        layout: &PackLayout,
+        attention_budget: usize,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> Result<Tensor> {
         let table = RopeTable::build(layout, self.dtype, image.device())?;
-        let mut image = self.image_in.forward(&image.to_dtype(self.dtype)?)?;
-        let mut text = self
+        let image = self.image_in.forward(&image.to_dtype(self.dtype)?)?;
+        let text = self
             .text_in
             .forward(&rms(&text.to_dtype(self.dtype)?, &self.text_norm)?)?;
         let temb = self
             .timestep
             .forward(&sigma.to_dtype(self.dtype)?, self.dtype)?;
-        for block in &self.blocks {
-            (image, text) = block.forward(image, text, &temb, &table, layout)?;
-        }
+        let (next_image, next_text) = match &self.blocks {
+            MageBlocks::Resident(blocks) => {
+                let mut image = image;
+                let mut text = text;
+                for block in blocks {
+                    if cancel.is_cancelled() {
+                        candle_core::bail!("mage canceled");
+                    }
+                    (image, text) = block.forward_with_memory(
+                        image,
+                        text,
+                        &temb,
+                        &table,
+                        layout,
+                        attention_budget,
+                        cancel,
+                    )?;
+                }
+                (image, text)
+            }
+            MageBlocks::Streamed {
+                dir,
+                depth,
+                heads,
+                sidecars,
+                target_device,
+            } => {
+                let plan =
+                    candle_gen::block_window::BlockPlan::new(*depth, transformer_window.max(1))
+                        .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+                candle_gen::block_window::run_windowed(
+                    target_device,
+                    &plan,
+                    cancel,
+                    (image, text),
+                    || Weights::from_dir(dir, target_device, DType::BF16).map_err(Into::into),
+                    |(mut image, mut text), weights, range| {
+                        record_materialized_window();
+                        let blocks = range
+                            .map(|index| {
+                                Block::load_with_sidecars(
+                                    weights,
+                                    &format!("transformer_blocks.{index}"),
+                                    *heads,
+                                    sidecars.as_deref(),
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        for block in &blocks {
+                            if cancel.is_cancelled() {
+                                return Err(candle_gen::CandleError::Canceled);
+                            }
+                            (image, text) = block
+                                .forward_with_memory(
+                                    image,
+                                    text,
+                                    &temb,
+                                    &table,
+                                    layout,
+                                    attention_budget,
+                                    cancel,
+                                )
+                                .map_err(candle_gen::CandleError::from)?;
+                        }
+                        Ok((image, text))
+                    },
+                )
+                .map_err(|error| candle_core::Error::Msg(error.to_string()))?
+            }
+        };
+        let image = next_image;
+        let _text = next_text;
         let params = self.final_mod.forward(&temb.silu()?)?;
         let dim = params.dim(1)? / 2;
         let ids = layout.image_segment_ids(image.device())?;
@@ -471,6 +912,15 @@ impl MageTransformer {
     }
 }
 
+impl MageBlocks {
+    fn resident(&self) -> Option<&[Block]> {
+        match self {
+            Self::Resident(blocks) => Some(blocks),
+            Self::Streamed { .. } => None,
+        }
+    }
+}
+
 fn place_linear(linear: &mut QLinear, quant: Option<Quant>, device: &Device) -> Result<()> {
     match quant {
         Some(quant) => quantize_onto(linear, quant, device),
@@ -481,6 +931,8 @@ fn place_linear(linear: &mut QLinear, quant: Option<Quant>, device: &Device) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
+    use std::collections::HashMap;
 
     #[test]
     fn final_head_is_scale_then_shift() {
@@ -499,5 +951,94 @@ mod tests {
     #[test]
     fn quantized_projection_count_tracks_the_full_architecture() {
         assert_eq!(6 + crate::config::DEPTH * 14, 174);
+    }
+
+    #[test]
+    fn bounded_attention_chunks_complete_heads_without_query_fallback() -> Result<()> {
+        let device = Device::Cpu;
+        let q = Tensor::randn(0f32, 1f32, (1, 2, 7, 4), &device)?;
+        candle_gen::attention::chunk_probe::reset();
+        attention_head_chunk_probe::reset();
+        let full = sdpa_planned_by_heads(&q, &q, &q, 0.5, AttentionPlan::UNBOUNDED)
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+        assert_eq!(attention_head_chunk_probe::max_chunk_count(), 1);
+        assert_eq!(candle_gen::attention::chunk_probe::max_chunk_count(), 1);
+
+        candle_gen::attention::chunk_probe::reset();
+        attention_head_chunk_probe::reset();
+        let bounded = sdpa_planned_by_heads(
+            &q,
+            &q,
+            &q,
+            0.5,
+            AttentionPlan::budgeted(AttentionBudget::from_score_elements(7 * 7, false)),
+        )
+        .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+        assert_eq!(attention_head_chunk_probe::max_chunk_count(), 2);
+        assert_eq!(candle_gen::attention::chunk_probe::max_chunk_count(), 1);
+        assert_eq!(
+            full.flatten_all()?.to_vec1::<f32>()?,
+            bounded.flatten_all()?.to_vec1::<f32>()?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_head_chunks_honor_request_cancellation() {
+        let device = Device::Cpu;
+        let q = Tensor::randn(0f32, 1f32, (1, 2, 7, 4), &device).unwrap();
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+        cancel.cancel();
+        let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(7 * 7, false))
+            .with_cancel(&cancel);
+        let error = sdpa_planned_by_heads(&q, &q, &q, 0.5, plan).unwrap_err();
+        assert!(matches!(error, candle_gen::CandleError::Canceled));
+    }
+
+    #[test]
+    fn packed_streamed_projection_loads_prepared_device_format_sidecar() -> Result<()> {
+        let device = Device::Cpu;
+        let base = "transformer_blocks.0.attn.to_q";
+        let dense = Tensor::randn(0f32, 1f32, (64usize, 128usize), &device)?;
+        let (weight, scales, biases) = candle_gen::quant::pack_mlx_affine(&dense, 4, 64)?;
+        let mut tensors = HashMap::new();
+        tensors.insert(format!("{base}.weight"), weight);
+        tensors.insert(format!("{base}.scales"), scales);
+        tensors.insert(format!("{base}.biases"), biases);
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
+        candle_core::safetensors::save(&tensors, dir.join("model.safetensors"))?;
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"quantization":{"bits":4,"group_size":64}}"#,
+        )?;
+
+        let weights = Weights::from_dir(&dir, &device, DType::BF16)?;
+        let files = candle_gen::sorted_safetensors(&dir, "mage-test")
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+        let (_source, sidecars) = PackedWeightSidecars::open_and_prepare_prefix_cancelable(
+            &files,
+            &dir,
+            weights.packed().expect("packed fixture"),
+            &device,
+            &candle_gen::gen_core::CancelFlag::default(),
+            "transformer_blocks.",
+        )?;
+        assert_eq!(sidecars.created_count(), 1);
+        assert!(sidecars.contains(base));
+        let direct = linear(&weights, base, false)?;
+        let streamed = streamed_linear(&weights, base, false, Some(&sidecars))?;
+        let input = Tensor::randn(0f32, 1f32, (3usize, 128usize), &device)?;
+        assert_eq!(
+            direct.forward(&input)?.to_vec2::<f32>()?,
+            streamed.forward(&input)?.to_vec2::<f32>()?,
+            "device-format sidecar changed the packed projection"
+        );
+
+        drop(streamed);
+        drop(direct);
+        drop(sidecars);
+        drop(weights);
+        Ok(())
     }
 }

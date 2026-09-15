@@ -7,7 +7,7 @@
 //!
 //! Run:
 //!   ~/.dwpose-spike/venv/bin/python tools/convert_glintr100.py   # once, to produce the goldens
-//!   cargo test -p mlx-gen-face --release --test arcface_parity -- --ignored --nocapture
+//!   cargo test -p mlx-gen-face --release --test integration arcface_parity:: -- --ignored --nocapture
 
 use mlx_gen::weights::Weights;
 use mlx_gen_face::ArcFace;

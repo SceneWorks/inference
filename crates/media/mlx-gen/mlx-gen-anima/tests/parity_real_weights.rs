@@ -1,7 +1,7 @@
 //! Anima MLX-port parity goldens (sc-10524, epic 10512) — the **real-weights** stages. `#[ignore]`d +
 //! weights-gated (they need the licensed `circlestone-labs/Anima` snapshot in the HF cache + Metal), so
 //! they **never run in CI**. Run locally with:
-//!   cargo test -p mlx-gen-anima --release --test parity_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-anima --release --test integration parity_real_weights:: -- --ignored --nocapture
 //!
 //! Each test reads a committed golden JSON (computed by the `tests/fixtures/gen_anima_*.py` generators
 //! from the diffusers 0.39.0 reference; Apache-2.0) — **no Python at test time** — and runs the MLX port

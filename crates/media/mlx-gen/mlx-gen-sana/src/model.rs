@@ -82,6 +82,9 @@ const MAX_COUNT: u32 = 8;
 /// init latent. ControlNet conditioning is a separate, later variant.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::SANA_LATENT_SPACE),
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "sana",
@@ -96,7 +99,6 @@ pub fn descriptor() -> ModelDescriptor {
             conditioning: vec![ConditioningKind::Reference],
             // No SANA LoRA wiring yet (reserved for a later story).
             supports_lora: false,
-            supports_lokr: false,
             // Flow-match Euler over the unified curated sampler/scheduler framework (epic 7114); the
             // native loop (`req.sampler == None`) stays the byte-exact default. `"default"` is the
             // engine-default sentinel the manifest drift guard always allows.
@@ -110,7 +112,6 @@ pub fn descriptor() -> ModelDescriptor {
                 s.push("default");
                 s
             },
-            supported_guidance_methods: vec![],
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
@@ -124,7 +125,6 @@ pub fn descriptor() -> ModelDescriptor {
             // offline by `crate::convert` and self-describing on load, so a `spec.quantize` is
             // advisory (the resolved tier dir dictates the actual precision; see [`load`]).
             supported_quants: &[Quant::Q4, Quant::Q8],
-            supports_kv_cache: false,
             // Static flow-match shift 3.0, resolution-independent (handled by the unified sampler).
             requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam (epic 10834); honors Sequential offload (F-176).
@@ -132,17 +132,8 @@ pub fn descriptor() -> ModelDescriptor {
             // before the Linear-DiT trunk + DC-AE load — bounding peak to `max(Gemma-TE, DiT+DC-AE)`.
             // The Gemma encoder is comparable to (often ≥) the DiT, so the drop is a large win.
             supports_sequential_offload: true,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            supports_preview: true,
+            ..Default::default()
         },
     }
 }
@@ -157,6 +148,9 @@ pub fn descriptor() -> ModelDescriptor {
 /// is a dedicated few-step loop, so the curated epic-7114 sampler/scheduler menu is NOT advertised.
 pub fn sprint_descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::SANA_LATENT_SPACE),
+        control_kinds: None,
         required_components: &[],
         id: SPRINT_MODEL_ID,
         family: "sana",
@@ -166,12 +160,9 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             // Embedded guidance scalar — honored knob, but NOT classifier-free (no uncond forward).
             supports_negative_prompt: false,
             supports_guidance: true,
-            supports_true_cfg: false,
             // img2img (sc-10190): reference-seeded, via the SCM/TrigFlow renoise at the start angle.
             // Distilled/few-step → the strength window is narrow (validate on-device).
             conditioning: vec![ConditioningKind::Reference],
-            supports_lora: false,
-            supports_lokr: false,
             // The SCM/TrigFlow consistency loop is a dedicated few-step sampler, not a curated
             // epic-7114 `Solver`; only the engine-default sentinel is advertised.
             samplers: vec!["default"],
@@ -186,23 +177,12 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             // Gemma-2 TE are packed/packed-detected, DC-AE VAE dense. Advertise Q4/Q8 for standard
             // quant-tier routing; `spec.quantize` is advisory (resolved tier dir dictates precision).
             supported_quants: &[Quant::Q4, Quant::Q8],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam (epic 10834); honors Sequential offload (F-176).
             // Sprint drops the Gemma-2 CHI text encoder before the Sprint Linear-DiT trunk + DC-AE load,
             // bounding peak to `max(Gemma-TE, DiT+DC-AE)`.
             supports_sequential_offload: true,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            supports_preview: true,
+            ..Default::default()
         },
     }
 }
@@ -223,6 +203,8 @@ pub struct Sana {
     /// `true` for SANA-Sprint (CFG-free SCM few-step) — read at encode time (before the heavy bundle is
     /// available under `Sequential`) to gate the uncond forward and resolve the default guidance.
     sprint: bool,
+    loaded_spec: LoadSpec,
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
 }
 
 /// Construct a SANA generator from a [`LoadSpec`]. `spec.weights` must be a [`WeightsSource::Dir`]
@@ -255,10 +237,13 @@ fn load_from(
     // component build, but these overrides are still wrong, so reject them here).
     load_components(spec, id)?;
     let residency = build_residency(spec, sprint, id)?;
+    let memory_strategy = crate::memory_strategy::memory_strategy_contract(id, spec)?;
     Ok(Box::new(Sana {
         descriptor,
         residency,
         sprint,
+        loaded_spec: spec.clone(),
+        memory_strategy,
     }))
 }
 
@@ -278,10 +263,21 @@ pub(crate) fn build_residency(
 ) -> Result<Residency<SanaTextEncoder, SanaHeavy>> {
     let spec_text = spec.clone();
     let spec_heavy = spec.clone();
+    // SC-15523: rung 4 rebuilds trunk blocks from the snapshot per window, so the trunk carries a
+    // re-openable stream only for a load that can actually execute one. The same predicate decides
+    // the contract's declaration, so "declared" and "constructed" cannot drift.
+    let streamable = crate::memory_strategy::is_streamable(spec);
     Residency::from_policy(
         spec.offload_policy,
         move || load_text_encoder_component(load_components(&spec_text, id)?),
-        move |_use_pid| load_heavy(load_components(&spec_heavy, id)?, sprint),
+        move |needs_encoder| {
+            load_heavy(
+                load_components(&spec_heavy, id)?,
+                sprint,
+                needs_encoder,
+                streamable,
+            )
+        },
     )
 }
 
@@ -297,27 +293,59 @@ fn load_text_encoder_component(root: &Path) -> Result<SanaTextEncoder> {
 /// path builds the same bundle up front. Components are independent of the text encoder (separate weight
 /// files, packed-detected quant — no RNG), so both residencies are byte-identical. The trunk is loaded
 /// first (mirroring the pre-seam `build_pipeline` order), then the DC-AE from the shared `vae/` source.
-fn load_heavy(root: &Path, sprint: bool) -> Result<SanaHeavy> {
-    let trunk_w = Weights::from_dir(root.join("transformer"))?;
+fn load_heavy(
+    root: &Path,
+    sprint: bool,
+    needs_encoder: bool,
+    streamable: bool,
+) -> Result<SanaHeavy> {
+    let transformer_dir = root.join("transformer");
+    let trunk_w = Weights::from_dir(&transformer_dir)?;
     let dcfg = DcAeConfig::sana_f32c32();
     let vae_w = Weights::from_dir(root.join("vae"))?;
     // The `vae/` snapshot ships BOTH `encoder.*` and `decoder.*` — build both from the one source.
-    let encoder = DcAeEncoder::from_weights(&vae_w, dcfg.clone())?;
     let decoder = DcAeDecoder::from_weights(&vae_w, dcfg.clone())?;
+    let encoder = needs_encoder
+        .then(|| DcAeEncoder::from_weights(&vae_w, dcfg.clone()))
+        .transpose()?;
+    // The stream carries the SAME config the trunk was built with, so a windowed block cannot be
+    // built under a different config than its resident twin — the silent "present but wrong" class
+    // SANA-Sprint's `qk_norm` gate would otherwise expose (see `crate::block_stream`).
+    let with_stream = |trunk: SanaTransformer, cfg: &SanaTransformerConfig| {
+        if streamable {
+            trunk.with_block_stream(crate::block_stream::SanaBlockStream::new(
+                &transformer_dir,
+                cfg.clone(),
+            ))
+        } else {
+            trunk
+        }
+    };
     if sprint {
         let trunk_cfg = SanaTransformerConfig::sana_sprint_1600m();
         let guidance_embeds_scale = trunk_cfg.guidance_embeds_scale;
-        let trunk = SanaTransformer::from_weights(&trunk_w, trunk_cfg)?;
-        Ok(SanaHeavy::new_sprint(
-            trunk,
-            encoder,
-            decoder,
-            dcfg,
-            guidance_embeds_scale,
-        ))
+        let trunk = with_stream(
+            SanaTransformer::from_weights(&trunk_w, trunk_cfg.clone())?,
+            &trunk_cfg,
+        );
+        Ok(match encoder {
+            Some(encoder) => {
+                SanaHeavy::new_sprint(trunk, encoder, decoder, dcfg, guidance_embeds_scale)
+            }
+            None => {
+                SanaHeavy::new_sprint_text_to_image(trunk, decoder, dcfg, guidance_embeds_scale)
+            }
+        })
     } else {
-        let trunk = SanaTransformer::from_weights(&trunk_w, SanaTransformerConfig::sana_1600m())?;
-        Ok(SanaHeavy::new(trunk, encoder, decoder, dcfg))
+        let trunk_cfg = SanaTransformerConfig::sana_1600m();
+        let trunk = with_stream(
+            SanaTransformer::from_weights(&trunk_w, trunk_cfg.clone())?,
+            &trunk_cfg,
+        );
+        Ok(match encoder {
+            Some(encoder) => SanaHeavy::new(trunk, encoder, decoder, dcfg),
+            None => SanaHeavy::new_text_to_image(trunk, decoder, dcfg),
+        })
     }
 }
 
@@ -373,6 +401,56 @@ fn resolve_reference<'a>(req: &'a GenerationRequest, id: &str) -> Result<Option<
     Ok(reference)
 }
 
+/// SANA's true-CFG scale is the effective base-path guidance knob.  `guidance` remains the
+/// backwards-compatible spelling, but an explicit `true_cfg` wins just as it does on Candle.
+fn resolve_base_guidance(req: &GenerationRequest) -> Option<f32> {
+    req.true_cfg.or(req.guidance)
+}
+
+/// The base SANA adapter's complete request projection. Keeping the true-CFG precedence here makes
+/// the text-conditioning decision and the denoise request consume the same public knobs.
+fn base_sana_request<'a>(
+    req: &'a GenerationRequest,
+    seed: u64,
+    init_image: Option<&'a Image>,
+    strength: Option<f32>,
+    guidance_scale: Option<f32>,
+) -> SanaGenerateRequest<'a> {
+    SanaGenerateRequest {
+        prompt: &req.prompt,
+        negative_prompt: req.negative_prompt.as_deref(),
+        height: req.height,
+        width: req.width,
+        steps: req.steps.map(|steps| steps as usize),
+        guidance_scale,
+        seed: Some(seed),
+        sampler: req.sampler.as_deref(),
+        scheduler: req.scheduler.as_deref(),
+        init_image,
+        strength,
+    }
+}
+
+/// Prepare seed-independent reference state once, then fan the same borrowed value out across the
+/// request's seed sequence. Keeping preparation outside the loop is the work-count contract for both
+/// resident MLX SANA routes (base and Sprint).
+fn render_batch_with_prepared_reference<P, O>(
+    base_seed: u64,
+    count: u32,
+    prepare: impl FnOnce() -> Result<Option<P>>,
+    mut render: impl FnMut(u64, Option<&P>) -> Result<O>,
+) -> Result<Vec<O>> {
+    let prepared_reference = prepare()?;
+    let mut outputs = Vec::with_capacity(count as usize);
+    for offset in 0..count {
+        outputs.push(render(
+            base_seed.wrapping_add(offset as u64),
+            prepared_reference.as_ref(),
+        )?);
+    }
+    Ok(outputs)
+}
+
 /// Capability-driven request validation, factored out so it can be unit-tested without loaded
 /// weights. Delegates the shared size/count/guidance/negative/conditioning checks to the descriptor
 /// (`Capabilities::validate_request`) and adds SANA's `RES_MULTIPLE` (32×, DC-AE) divisor rule.
@@ -382,6 +460,16 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
         return Err(Error::Msg(format!("{id}: prompt must not be empty")));
     }
     desc.capabilities.validate_request(id, req)?;
+    if req.strength.is_some()
+        && !req
+            .conditioning
+            .iter()
+            .any(|conditioning| matches!(conditioning, Conditioning::Reference { .. }))
+    {
+        return Err(Error::Unsupported(format!(
+            "{id}: img2img strength requires Reference conditioning"
+        )));
+    }
     if req.steps == Some(0) {
         return Err(Error::Msg(format!("{id}: steps must be >= 1")));
     }
@@ -394,10 +482,47 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
     Ok(())
 }
 
-mlx_gen::impl_generator!(Sana {
-    validate: |s, req| validate_request(&s.descriptor, req),
-    generate: generate_impl,
-});
+impl Generator for Sana {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        validate_request(&self.descriptor, req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.loaded_spec, &self.memory_strategy, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        crate::memory_strategy::begin_request(
+            self.descriptor.id,
+            &self.loaded_spec,
+            &self.memory_strategy,
+            context,
+        )
+    }
+}
 
 impl Sana {
     /// The rich-`Result` body behind [`Generator::generate`] — kept on the crate's own
@@ -414,6 +539,17 @@ impl Sana {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         validate_request(&self.descriptor, req)?;
+        // SC-15523: a request-scoped memory selection is refused HERE, on the production path, not
+        // only at shared-contract admission — a caller that sets `req.memory` directly must not be
+        // able to execute an unmeasured tile edge, score budget or block cadence.
+        if let Some(memory) = &req.memory {
+            crate::memory_strategy::validate_request_memory(
+                self.descriptor.id,
+                &self.loaded_spec,
+                memory,
+            )
+            .map_err(|error| Error::Msg(error.to_string()))?;
+        }
 
         // img2img (sc-10190): a single `Reference` conditioning, with a per-reference strength
         // overriding `req.strength`. Both render paths (base flow-match + Sprint SCM) seed the denoise
@@ -426,19 +562,21 @@ impl Sana {
         };
 
         let base_seed = req.seed.unwrap_or_else(default_seed);
-        let steps = req.steps.map(|s| s as usize);
         // Resolve guidance against the variant default ONCE so the encode's uncond decision and the
         // render's denoise agree (base 4.5 true-CFG, Sprint's embedded 4.5).
-        let guidance = req.guidance.unwrap_or(if self.sprint {
+        let guidance_scale = resolve_base_guidance(req);
+        let guidance = guidance_scale.unwrap_or(if self.sprint {
             SPRINT_DEFAULT_GUIDANCE
         } else {
             DEFAULT_GUIDANCE
         });
+        let tiling =
+            crate::pipeline::resolve_decode_tiling(req.memory, self.residency.is_sequential());
 
-        self.residency.run(
+        self.residency.run_staged(
             &req.cancel,
-            // SANA has no PiD overlay; the heavy loader ignores `use_pid`.
-            false,
+            // The generic flag is free on SANA and selects the optional DC-AE encoder for img2img.
+            init_image.is_some(),
             on_progress,
             // ── Phase A: Gemma CHI conditioning. Seed-independent (no RNG) — encodes cond (+ uncond for
             // base SANA with CFG active; Sprint is CFG-free). Under `Sequential` the shared seam LOADS
@@ -457,7 +595,8 @@ impl Sana {
             // Materialize the CHI embedding + pad mask (and their uncond twins) while the encoder is
             // still alive (Sequential only) — MLX is lazy, so an un-evaluated output keeps the Gemma
             // encoder referenced through the graph and the drop would free nothing.
-            |cond: &SanaConditioning| {
+            |cond: Option<&SanaConditioning>| {
+                let Some(cond) = cond else { return Ok(()) };
                 let mut arrays = vec![&cond.cond, &cond.cond_mask];
                 if let Some((u, um)) = &cond.uncond {
                     arrays.push(u);
@@ -466,28 +605,42 @@ impl Sana {
                 mlx_rs::transforms::eval(arrays)?;
                 Ok(())
             },
-            // ── Phase B: denoise/decode from the heavy bundle (trunk + DC-AE), one image per seed.
-            // Runs identically for both residencies. `on_progress` is threaded through the seam (F-179).
+            // Phase B produces and materializes every latent while the DiT is alive. Sequential then
+            // sheds the DiT and optional encoder before phase-C decode; Resident borrows a warm view.
             |heavy: &SanaHeavy, cond, on_progress: &mut dyn FnMut(Progress)| {
-                let mut images = Vec::with_capacity(req.count as usize);
-                for n in 0..req.count {
-                    let seed = base_seed.wrapping_add(n as u64);
-                    let sana_req = SanaGenerateRequest {
-                        prompt: &req.prompt,
-                        negative_prompt: req.negative_prompt.as_deref(),
-                        height: req.height,
-                        width: req.width,
-                        steps,
-                        guidance_scale: req.guidance,
-                        seed: Some(seed),
-                        sampler: req.sampler.as_deref(),
-                        scheduler: req.scheduler.as_deref(),
-                        init_image,
-                        strength,
-                    };
-                    let img =
-                        heavy.render_one(&cond, &sana_req, guidance, &req.cancel, on_progress)?;
-                    images.push(img);
+                // Rungs 3 and 4, resolved against the trunk that will actually run them.
+                let plan =
+                    crate::pipeline::resolved_rung_plan(req.memory, heavy.transformer_blocks())?;
+                let prepare_req =
+                    base_sana_request(req, base_seed, init_image, strength, guidance_scale);
+                let latents = render_batch_with_prepared_reference(
+                    base_seed,
+                    req.count,
+                    || heavy.prepare_reference(&prepare_req, &req.cancel),
+                    |seed, prepared_reference| {
+                        let sana_req =
+                            base_sana_request(req, seed, init_image, strength, guidance_scale);
+                        heavy.denoise_one_with_prepared_reference(
+                            &cond,
+                            &sana_req,
+                            guidance,
+                            prepared_reference,
+                            &req.cancel,
+                            on_progress,
+                            &req.preview,
+                            plan,
+                        )
+                    },
+                )?;
+                mlx_rs::transforms::eval(latents.iter())?;
+                Ok(latents)
+            },
+            |latents: &Vec<mlx_rs::Array>| Ok(mlx_rs::transforms::eval(latents.iter())?),
+            |view: crate::pipeline::SanaDecodeView<'_>, latents, on_progress| {
+                on_progress(Progress::Decoding);
+                let mut images = Vec::with_capacity(latents.len());
+                for latent in &latents {
+                    images.push(view.decode_one(latent, &req.cancel, tiling.as_ref())?);
                 }
                 Ok(GenerationOutput::Images(images))
             },
@@ -512,6 +665,40 @@ mlx_gen::register_generators! {
     pub(crate) const BASE_REGISTRATION = descriptor => load;
     footprint = component_footprint
 }
+
+pub const BASE_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
+        safety_check: crate::memory_strategy::safety_check,
+    };
+pub const BASE_MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(MODEL_ID, spec, contract, context)
+        },
+    };
+pub const SPRINT_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: SPRINT_MODEL_ID,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(SPRINT_MODEL_ID, spec),
+        safety_check: crate::memory_strategy::safety_check,
+    };
+pub const SPRINT_MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: SPRINT_MODEL_ID,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(
+                SPRINT_MODEL_ID,
+                spec,
+                contract,
+                context,
+            )
+        },
+    };
 mlx_gen::register_generators! {
     pub(crate) const SPRINT_REGISTRATION = sprint_descriptor => load_sprint;
     footprint = component_footprint
@@ -522,6 +709,88 @@ mod tests {
     use super::*;
     use crate::pipeline::{DEFAULT_GUIDANCE, DEFAULT_STEPS};
     use mlx_gen::Quant;
+    use std::cell::{Cell, RefCell};
+
+    fn braced_item<'a>(source: &'a str, marker: &str) -> &'a str {
+        let start = source
+            .find(marker)
+            .unwrap_or_else(|| panic!("missing production item {marker}"));
+        let open = source[start..]
+            .find('{')
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| panic!("production item {marker} has no body"));
+        let mut depth = 0usize;
+        for (offset, byte) in source[open..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[start..open + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("production item {marker} has unbalanced braces")
+    }
+
+    fn check_registered_reference_path(source: &str) -> Result<()> {
+        let generate = braced_item(source, "    fn generate_impl(");
+        let prepare = "|| heavy.prepare_reference(&prepare_req, &req.cancel)";
+        let prepared_tail = "heavy.denoise_one_with_prepared_reference(";
+        if generate
+            .matches("render_batch_with_prepared_reference(")
+            .count()
+            != 1
+            || generate.matches(prepare).count() != 1
+            || generate.matches(prepared_tail).count() != 1
+            || generate.contains("heavy.denoise_one_with_preview(")
+        {
+            return Err(Error::Msg(
+                "registered MLX SANA must prepare once and select only the prepared-reference tail"
+                    .into(),
+            ));
+        }
+        let prepare_at = generate.find(prepare).unwrap();
+        let tail_at = generate.find(prepared_tail).unwrap();
+        if prepare_at >= tail_at
+            || generate[tail_at..].contains("heavy.prepare_reference(")
+            || !generate[tail_at..].contains("prepared_reference,")
+        {
+            return Err(Error::Msg(
+                "registered MLX SANA moved preparation into seed fanout or dropped its borrowed state"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn registered_generator_is_bound_to_the_prepared_reference_tail() {
+        let shipped = include_str!("model.rs");
+        check_registered_reference_path(shipped).unwrap();
+
+        let reverted = shipped.replacen(
+            "heavy.denoise_one_with_prepared_reference(",
+            "heavy.denoise_one_with_preview(",
+            1,
+        );
+        assert!(
+            check_registered_reference_path(&reverted).is_err(),
+            "reverting the real generator to per-seed preparation must fail"
+        );
+
+        let dropped = shipped.replacen(
+            "|| heavy.prepare_reference(&prepare_req, &req.cancel)",
+            "|| Ok(None)",
+            1,
+        );
+        assert!(
+            check_registered_reference_path(&dropped).is_err(),
+            "dropping request-scope preparation must fail"
+        );
+    }
 
     fn req(w: u32, h: u32) -> GenerationRequest {
         GenerationRequest {
@@ -529,6 +798,84 @@ mod tests {
             width: w,
             height: h,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn base_and_sprint_prepare_one_reference_before_count_fanout() {
+        for route in ["base", "sprint"] {
+            let request_preparations = Cell::new(0);
+            let encoder_calls = Cell::new(0);
+            let rendered = RefCell::new(Vec::new());
+            let outputs = render_batch_with_prepared_reference(
+                u64::MAX - 1,
+                4,
+                || {
+                    request_preparations.set(request_preparations.get() + 1);
+                    let call = encoder_calls.get() + 1;
+                    encoder_calls.set(call);
+                    Ok(Some(format!("{route}-{call}")))
+                },
+                |seed, prepared| {
+                    rendered.borrow_mut().push((
+                        seed,
+                        Some(prepared.expect("reference must be shared").clone()),
+                    ));
+                    Ok(seed)
+                },
+            )
+            .unwrap();
+
+            render_batch_with_prepared_reference(
+                9,
+                2,
+                || {
+                    request_preparations.set(request_preparations.get() + 1);
+                    Ok(None::<String>)
+                },
+                |seed, prepared| {
+                    rendered.borrow_mut().push((seed, prepared.cloned()));
+                    Ok(seed)
+                },
+            )
+            .unwrap();
+
+            render_batch_with_prepared_reference(
+                20,
+                2,
+                || {
+                    request_preparations.set(request_preparations.get() + 1);
+                    let call = encoder_calls.get() + 1;
+                    encoder_calls.set(call);
+                    Ok(Some(format!("{route}-{call}")))
+                },
+                |seed, prepared| {
+                    rendered.borrow_mut().push((
+                        seed,
+                        Some(prepared.expect("second request must prepare fresh").clone()),
+                    ));
+                    Ok(seed)
+                },
+            )
+            .unwrap();
+
+            assert_eq!(request_preparations.get(), 3, "{route} request preambles");
+            assert_eq!(encoder_calls.get(), 2, "{route} reference encode count");
+            assert_eq!(outputs, vec![u64::MAX - 1, u64::MAX, 0, 1]);
+            assert_eq!(
+                *rendered.borrow(),
+                vec![
+                    (u64::MAX - 1, Some(format!("{route}-1"))),
+                    (u64::MAX, Some(format!("{route}-1"))),
+                    (0, Some(format!("{route}-1"))),
+                    (1, Some(format!("{route}-1"))),
+                    (9, None),
+                    (10, None),
+                    (20, Some(format!("{route}-2"))),
+                    (21, Some(format!("{route}-2"))),
+                ],
+                "{route} must share one latent, skip txt2img encode, and prepare fresh next request"
+            );
         }
     }
 
@@ -542,6 +889,7 @@ mod tests {
         assert!(d.capabilities.supports_true_cfg);
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supports_negative_prompt);
+        assert!(d.capabilities.supports_preview);
         // sc-10190: img2img reference conditioning is now advertised.
         assert_eq!(
             d.capabilities.conditioning,
@@ -633,6 +981,52 @@ mod tests {
             mlx_gen::img2img::init_time_step(20, Some(resolve(Some(0.0), None))),
             0
         );
+    }
+
+    #[test]
+    fn base_conditioning_fixture_matches_candle_semantics() {
+        // This is the same discriminating base fixture as Candle's adapter test: true_cfg must win
+        // over the legacy guidance spelling, and request strength must feed the sole Reference.
+        let mut r = req(1024, 1024);
+        r.negative_prompt = Some("uncond".into());
+        r.guidance = Some(1.0);
+        r.true_cfg = Some(4.5);
+        r.strength = Some(0.6);
+        r.conditioning = vec![Conditioning::Reference {
+            image: ref_image(),
+            strength: None,
+        }];
+
+        assert!(validate_request(&descriptor(), &r).is_ok());
+        let (reference, strength) = resolve_reference(&r, MODEL_ID).unwrap().unwrap();
+        let sana_req = base_sana_request(
+            &r,
+            7,
+            Some(reference),
+            Some(strength),
+            resolve_base_guidance(&r),
+        );
+        assert_eq!(
+            sana_req.prompt,
+            "a red panda on a mossy log in a misty forest"
+        );
+        assert_eq!(sana_req.negative_prompt, Some("uncond"));
+        assert_eq!(sana_req.guidance_scale, Some(4.5));
+        assert!(sana_req.init_image.is_some());
+        assert_eq!(sana_req.strength, Some(0.6));
+    }
+
+    #[test]
+    fn refree_strength_is_a_typed_unsupported_knob() {
+        let mut r = req(1024, 1024);
+        r.strength = Some(0.6);
+        let error = validate_request(&descriptor(), &r).unwrap_err();
+        assert!(matches!(error, Error::Unsupported(_)));
+        assert!(error.to_string().contains("requires Reference"));
+
+        // Omitted reference and omitted strength remain the existing text-to-image request.
+        r.strength = None;
+        assert!(validate_request(&descriptor(), &r).is_ok());
     }
 
     #[test]
@@ -772,6 +1166,7 @@ mod tests {
         assert!(!d.capabilities.supports_true_cfg);
         assert!(!d.capabilities.supports_negative_prompt);
         assert!(d.capabilities.supports_guidance);
+        assert!(d.capabilities.supports_preview);
         assert!(d.capabilities.supported_guidance_methods.is_empty());
         // sc-10190: Sprint also advertises img2img reference conditioning.
         assert_eq!(

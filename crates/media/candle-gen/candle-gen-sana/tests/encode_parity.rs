@@ -14,7 +14,7 @@
 //!
 //! Run (CUDA):
 //!   SANA_DCAE_WEIGHTS=/path/diffusion_pytorch_model.safetensors \
-//!   cargo test -p candle-gen-sana --test encode_parity --features cuda --release -- --ignored --nocapture
+//!   cargo test -p candle-gen-sana --test integration encode_parity:: --features cuda --release -- --ignored --nocapture
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::Weights;

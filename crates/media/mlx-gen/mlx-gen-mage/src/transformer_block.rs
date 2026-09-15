@@ -26,7 +26,8 @@ use mlx_rs::fast::layer_norm;
 use mlx_rs::ops::split;
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, LinearFacts};
+use mlx_gen::attention::AttentionPlan;
 use mlx_gen::weights::Weights;
 use mlx_gen::{nn, Error, Result};
 
@@ -126,6 +127,16 @@ impl MageTransformerBlock {
         temb: &Array,
         ctx: &PackContext,
     ) -> Result<DualStream> {
+        self.forward_budgeted(stream, temb, ctx, AttentionPlan::UNBOUNDED)
+    }
+
+    pub fn forward_budgeted(
+        &self,
+        stream: &DualStream,
+        temb: &Array,
+        ctx: &PackContext,
+        plan: AttentionPlan<'_>,
+    ) -> Result<DualStream> {
         let dim = stream.img.shape()[2];
         let (img1, img2) = self.modulations(
             &self.img_mod,
@@ -149,7 +160,7 @@ impl MageTransformerBlock {
             img: modulate(&layer_norm(&stream.img, None, None, self.eps)?, &img1)?,
             txt: modulate(&layer_norm(&stream.txt, None, None, self.eps)?, &txt1)?,
         };
-        let attn = self.attn.forward(&modulated, ctx)?;
+        let attn = self.attn.forward_budgeted(&modulated, ctx, plan)?;
         let img = nn::gated(&stream.img, &img1.gate, &attn.img)?;
         let txt = nn::gated(&stream.txt, &txt1.gate, &attn.txt)?;
 
@@ -201,6 +212,16 @@ impl AdaptableHost for MageTransformerBlock {
             ["img_mlp", rest @ ..] => self.img_mlp.adaptable_mut(rest),
             ["txt_mlp", rest @ ..] => self.txt_mlp.adaptable_mut(rest),
             _ => None,
+        }
+    }
+
+    /// SC-18319 — an intermediate hop on the way to a fused leaf MUST forward the probe; the trait's
+    /// default would delegate to `adaptable_mut` here and unfuse the attention below it. This block
+    /// is walked path-by-path by `block_stream.rs`'s adapter capture on every window.
+    fn adaptable_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        match path {
+            ["attn", rest @ ..] => self.attn.adaptable_facts(rest),
+            _ => self.adaptable_mut(path).map(|l| LinearFacts::of(l)),
         }
     }
 

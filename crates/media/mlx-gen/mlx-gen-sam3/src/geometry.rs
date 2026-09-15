@@ -410,6 +410,13 @@ fn bilinear_acc(row: &mut [f32], h: i32, w: i32, y: f32, x: f32, weight: f32) {
 mod tests {
     use super::*;
 
+    mod box_prompt_cases {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../sam3_box_prompt_cases.rs"
+        ));
+    }
+
     #[test]
     fn roi_align_matrix_rows_are_normalized() {
         // A box covering the whole 4×4 feature → every output cell's weights sum to 1.
@@ -432,60 +439,37 @@ mod tests {
         assert!((total - 1.0).abs() < 1e-6);
     }
 
-    /// F-003: request-supplied box prompts with a wrong shape, mismatched label count, or
-    /// out-of-range coordinates must be typed errors, not OOB host indexing / a hung ROI loop.
+    /// Shared MLX/Candle table: malformed request prompts fail before any host ROI indexing, while
+    /// accepted values reach the geometry stages unchanged.
     #[test]
-    fn validate_box_prompts_rejects_malformed_prompts() {
-        // Wrong last dim ([1, 2, 2] instead of [1, n, 4]) — would make boxes_host shorter than 4·n.
-        let bad_shape = Array::from_slice(&[0.5f32; 4], &[1, 2, 2]);
-        let e = validate_box_prompts(&bad_shape, &[1, 1])
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("[1, n, 4]"), "unexpected error: {e}");
-
-        // Wrong ndim ([n, 4]).
-        let bad_ndim = Array::from_slice(&[0.5f32; 4], &[1, 4]);
-        assert!(validate_box_prompts(&bad_ndim, &[1]).is_err());
-
-        // Zero boxes.
-        let empty = Array::from_slice(&[] as &[f32], &[1, 0, 4]);
-        assert!(validate_box_prompts(&empty, &[]).is_err());
-
-        // Label count mismatch — would hard-panic `Array::from_slice(box_labels, &[n])`.
-        let ok_box = Array::from_slice(&[0.5f32, 0.5, 0.2, 0.2], &[1, 1, 4]);
-        let e = validate_box_prompts(&ok_box, &[1, 0])
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("label"), "unexpected error: {e}");
-
-        // Label outside {0, 1} — OOB gather from the [2, C] label-embed table (F-042).
-        let e = validate_box_prompts(&ok_box, &[2]).unwrap_err().to_string();
-        assert!(e.contains("label 2"), "unexpected error: {e}");
-        assert!(validate_box_prompts(&ok_box, &[-1]).is_err());
-
-        // Oversized extent (w = 1e6) — would spin a ~10⁷-wide host ROI grid loop.
-        let huge = Array::from_slice(&[0.5f32, 0.5, 1e6, 0.2], &[1, 1, 4]);
-        let e = validate_box_prompts(&huge, &[1]).unwrap_err().to_string();
-        assert!(e.contains("[0, 1]"), "unexpected error: {e}");
-
-        // Non-finite coordinate.
-        let nan = Array::from_slice(&[0.5f32, f32::NAN, 0.2, 0.2], &[1, 1, 4]);
-        assert!(validate_box_prompts(&nan, &[1]).is_err());
-
-        // Negative coordinate.
-        let neg = Array::from_slice(&[-0.1f32, 0.5, 0.2, 0.2], &[1, 1, 4]);
-        assert!(validate_box_prompts(&neg, &[1]).is_err());
-    }
-
-    /// The valid path passes and returns `n` plus the host cxcywh copy.
-    #[test]
-    fn validate_box_prompts_accepts_valid_prompts() {
-        let boxes = Array::from_slice(&[0.5f32, 0.5, 0.2, 0.2, 0.0, 1.0, 1.0, 0.0], &[1, 2, 4]);
-        let (n, host) = validate_box_prompts(&boxes, &[1, 0]).unwrap();
-        assert_eq!(n, 2);
-        assert_eq!(host.len(), 8);
-        assert_eq!(host[0], 0.5);
-        assert_eq!(host[5], 1.0);
+    fn validate_box_prompts_matches_backend_neutral_cases() {
+        for case in box_prompt_cases::BOX_PROMPT_CASES {
+            let shape: Vec<i32> = case.shape.iter().map(|&dim| dim as i32).collect();
+            let boxes = Array::from_slice(case.values, &shape);
+            match (&case.expected, validate_box_prompts(&boxes, case.labels)) {
+                (box_prompt_cases::ExpectedBoxPromptResult::Accept { n }, Ok((got_n, host))) => {
+                    assert_eq!(got_n, *n as i32, "{}: box count", case.name);
+                    assert_eq!(host, case.values, "{}: valid values changed", case.name);
+                }
+                (box_prompt_cases::ExpectedBoxPromptResult::Reject { message }, Err(error)) => {
+                    let error = error.to_string();
+                    assert!(
+                        error.contains(message),
+                        "{}: expected {message:?} in {error:?}",
+                        case.name
+                    );
+                }
+                (expected, result) => panic!(
+                    "{}: expected {} but got {result:?}",
+                    case.name,
+                    match expected {
+                        box_prompt_cases::ExpectedBoxPromptResult::Accept { .. } => "acceptance",
+                        box_prompt_cases::ExpectedBoxPromptResult::Reject { .. } =>
+                            "typed rejection",
+                    }
+                ),
+            }
+        }
     }
 
     #[test]

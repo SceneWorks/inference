@@ -730,10 +730,8 @@ mod tests {
             );
         }
 
-        let tmp = std::env::temp_dir().join(format!(
-            "sc11062_planner_packed_{}.safetensors",
-            std::process::id()
-        ));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().join("sc11062_planner_packed.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp).unwrap();
         // SAFETY: freshly written, single-reader for the test.
         let st = unsafe { MmapedSafetensors::new(&tmp).unwrap() };
@@ -806,10 +804,8 @@ mod tests {
             format!("{attn}.o_proj.weight"),
             Tensor::randn(0f32, 0.1f32, (h, qd), &dev).unwrap(),
         );
-        let dtmp = std::env::temp_dir().join(format!(
-            "sc11062_planner_dense_{}.safetensors",
-            std::process::id()
-        ));
+        let dtmp_tmp = tempfile::tempdir().unwrap();
+        let dtmp = dtmp_tmp.path().join("sc11062_planner_dense.safetensors");
         candle_gen::candle_core::safetensors::save(&dmap, &dtmp).unwrap();
         // SAFETY: freshly written, single-reader.
         let dst = unsafe { MmapedSafetensors::new(&dtmp).unwrap() };
@@ -818,7 +814,6 @@ mod tests {
         assert!(!da.q.is_packed(), "no `.scales` ⇒ dense q");
         assert!(!da.o.is_packed(), "no `.scales` ⇒ dense o");
 
-        std::fs::remove_file(&tmp).ok();
         std::fs::remove_file(&dtmp).ok();
     }
 }

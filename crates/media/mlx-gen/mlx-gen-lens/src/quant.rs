@@ -237,10 +237,13 @@ mod quant_tier_tests {
 
     /// Make a fresh temp snapshot root with `<component>/config.json` = `body` (skip the file when
     /// `body` is `None` — a dense snapshot with no quantization marker).
-    fn snapshot(component: &str, body: Option<&str>) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "lens-tier-{component}-{}-{:?}",
-            std::process::id(),
+    fn snapshot(
+        tmp: &tempfile::TempDir,
+        component: &str,
+        body: Option<&str>,
+    ) -> std::path::PathBuf {
+        let root = tmp.path().join(format!(
+            "lens-tier-{component}-{:?}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -255,11 +258,12 @@ mod quant_tier_tests {
 
     #[test]
     fn dense_snapshot_needs_load_time_quant() {
+        let tmp = tempfile::tempdir().unwrap();
         // No config.json at all, and a config with no `quantization` marker, both read as dense —
         // for both quantized components.
         for component in ["transformer", "text_encoder"] {
             for body in [None, Some("{}"), Some(r#"{"num_layers": 24}"#)] {
-                let root = snapshot(component, body);
+                let root = snapshot(&tmp, component, body);
                 assert!(
                     needs_load_time_quant(&root, component, 4, "lens").unwrap(),
                     "dense {component} snapshot must report a load-time quant"
@@ -271,8 +275,10 @@ mod quant_tier_tests {
 
     #[test]
     fn already_packed_at_requested_bits_skips_quant() {
+        let tmp = tempfile::tempdir().unwrap();
         for component in ["transformer", "text_encoder"] {
             let root = snapshot(
+                &tmp,
                 component,
                 Some(r#"{"quantization": {"bits": 8, "group_size": 64}}"#),
             );
@@ -286,8 +292,10 @@ mod quant_tier_tests {
 
     #[test]
     fn tier_mismatch_errors_and_names_the_component() {
+        let tmp = tempfile::tempdir().unwrap();
         for component in ["transformer", "text_encoder"] {
             let root = snapshot(
+                &tmp,
                 component,
                 Some(r#"{"quantization": {"bits": 8, "group_size": 64}}"#),
             );

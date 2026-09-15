@@ -6,6 +6,10 @@
 //!
 //! [`LATENT_CHANNELS`] 128, and [`VAE_DOWNSAMPLE_FACTOR`] 16 — fully convolutional. The CoD
 //! decoder does carry attention, but it is **local** (independent 32×32 latent tiles), not global.
+//! "Local" here means *bounded*, not *tile-invariant*: those windows are anchored at the latent
+//! origin, so a decode tile boundary re-cuts them. That, plus the CoD `GroupNorm(32)`s and the DiCo
+//! blocks' whole-extent squeeze-and-excite pools, is why [`MageVae::decode_tiled`] runs the whole
+//! latent-resolution half once and tiles only the per-latent-pixel tail (sc-19753).
 //!
 //! State-dict prefixes: [`ENCODER_PREFIX`] `student.dconv_encoder.*` (342 tensors) and
 //! [`DECODER_PREFIX`] `pipeline.*` (497), verified against the published checkpoint by
@@ -57,7 +61,7 @@ pub mod encoder;
 pub mod layers;
 pub mod timestep;
 
-use mlx_rs::ops::zeros_dtype;
+use mlx_rs::ops::{concatenate_axis, zeros_dtype};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
@@ -111,6 +115,15 @@ pub struct MageVae {
     denoiser: DConvDenoiser,
     dtype: Dtype,
     shape: MageVaeShape,
+}
+
+fn tiling_geometry(shape: MageVaeShape) -> mlx_gen::tiling::VaeTiling {
+    mlx_gen::tiling::VaeTiling {
+        spatial_scale: shape.patch,
+        temporal_scale: 1,
+        causal_temporal: false,
+        full_res_channels: shape.hidden_x,
+    }
 }
 
 impl MageVae {
@@ -204,6 +217,120 @@ impl MageVae {
     /// The dtype the codec runs in.
     pub fn dtype(&self) -> Dtype {
         self.dtype
+    }
+
+    /// Spatially tiled decode for the shared bounded-decode rung. Mage's codec maps one latent
+    /// pixel to 16 output pixels; the shared tiler owns partitioning, blending, cancellation, and
+    /// per-tile materialization while this closure executes the unchanged per-pixel tail.
+    ///
+    /// **Normalization semantics (sc-19753).** Only the *per-latent-pixel* half of the codec tiles.
+    /// Everything with a cross-position dependence runs once on the whole latent:
+    ///
+    /// - the CoD decoder ([`cod_decoder::CodDecoder`]) — its three resnets and its `norm_out` are
+    ///   `GroupNorm(32)` over the full latent, and its two `AttnBlock`s attend within fixed 32×32
+    ///   latent windows that a tile boundary would re-cut;
+    /// - the denoiser's conditioning stream
+    ///   ([`DConvDenoiser::conditioning_stream`](denoiser::DConvDenoiser::conditioning_stream)) —
+    ///   each of the 21 DiCo blocks gates on a squeeze-and-excite **average over the whole spatial
+    ///   extent**.
+    ///
+    /// Tiling the whole `decode`, as this did before, gave every crop its own GroupNorm statistics,
+    /// its own attention windows and its own SE gates — a different decode, not a blend artifact.
+    /// Both halves that now run whole are latent-resolution; the tiled tail is the
+    /// output-resolution one (`hidden_x` values per output pixel), so the memory bound is retained.
+    pub fn decode_tiled(
+        &self,
+        latents: &Array,
+        cfg: &mlx_gen::tiling::TilingConfig,
+        cancel: Option<&mlx_gen::CancelFlag>,
+    ) -> Result<Array> {
+        if cancel.is_some_and(mlx_gen::CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
+        let shape = latents.shape();
+        if shape.len() != 4 {
+            return Err(Error::Msg(format!(
+                "mage-vae tiled decode expects NCHW latents, got {shape:?}"
+            )));
+        }
+        // `SimpleMlpAdaLn` is the widest materialized output-resolution stage: its documented
+        // shape is `[B*latent_pixels, patch^2, hidden_x]`, i.e. `hidden_x` values per output pixel.
+        // The 384-wide CoD path is latent-resolution and therefore must not drive this cap.
+        let vae = tiling_geometry(self.shape);
+        if !cfg.needs_tiling(vae, 1, shape[2], shape[3]) {
+            return self.decode(latents);
+        }
+        if shape[1] != self.shape.bottleneck {
+            return Err(Error::Msg(format!(
+                "mage-vae tiled decode: expected {} latent channels, got {}",
+                self.shape.bottleneck, shape[1]
+            )));
+        }
+        let scale = self.shape.patch;
+
+        // --- globally-scoped halves, once on the whole latent -------------------------------
+        let z = latents
+            .transpose_axes(&[0, 2, 3, 1])?
+            .as_dtype(self.dtype)?; // NHWC
+        let cond = self.cod.forward(&z)?;
+        let folded = self.denoiser.is_decode_folded();
+        let noise = if folded {
+            None
+        } else {
+            Some(zeros_dtype(
+                &[
+                    shape[0],
+                    shape[2] * scale,
+                    shape[3] * scale,
+                    self.shape.in_channels,
+                ],
+                self.dtype,
+            )?)
+        };
+        let t = zeros_dtype(&[shape[0]], self.dtype)?;
+        let s = self
+            .denoiser
+            .conditioning_stream(noise.as_ref(), &t, &cond)?;
+
+        // --- per-latent-pixel tail, tiled ---------------------------------------------------
+        // `s` and `cond` share the latent grid, so they are carried through the shared tiler as one
+        // channel-concatenated array and split back apart inside the closure. The tail has no
+        // cross-position dependence, so each crop's result is exact and the partition-of-unity
+        // blend reproduces it.
+        let hidden = self.shape.hidden;
+        let paired = concatenate_axis(&[s, cond], -1)?;
+        let ps = paired.shape();
+        let lifted = paired.reshape(&[ps[0], 1, ps[1], ps[2], ps[3]])?;
+        let plan = cfg.plan(vae, 1, shape[2], shape[3]);
+        let decoded =
+            mlx_gen::vae_tiling::tiled_decode(&lifted, &plan, [1, 2, 3], cancel, |tile| {
+                let ts = tile.shape();
+                let flat = tile.reshape(&[ts[0], ts[2], ts[3], ts[4]])?;
+                let parts = flat.split_axis(&[hidden], -1)?;
+                let (s_tile, cond_tile) = (&parts[0], &parts[1]);
+                let (height, width) = (ts[2] * scale, ts[3] * scale);
+                let tile_noise = if folded {
+                    None
+                } else {
+                    Some(zeros_dtype(
+                        &[ts[0], height, width, self.shape.in_channels],
+                        self.dtype,
+                    )?)
+                };
+                let out = self.denoiser.per_pixel_tail(
+                    s_tile,
+                    cond_tile,
+                    tile_noise.as_ref(),
+                    height,
+                    width,
+                )?; // NHWC [B, H, W, 3]
+                let os = out.shape();
+                Ok(out.reshape(&[os[0], 1, os[1], os[2], os[3]])?)
+            })?;
+        let ds = decoded.shape();
+        Ok(decoded
+            .reshape(&[ds[0], ds[2], ds[3], ds[4]])?
+            .transpose_axes(&[0, 3, 1, 2])?) // NCHW
     }
 
     /// Encode an image to its deterministic posterior mean and clamped log-variance.
@@ -353,4 +480,24 @@ pub fn load(dir: impl AsRef<std::path::Path>, part: VaePart, dtype: Dtype) -> Re
         )));
     }
     Ok(model)
+}
+
+#[cfg(test)]
+mod tiling_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_decode_geometry_tracks_the_architectural_pixel_stage() {
+        let geometry = tiling_geometry(MageVaeShape::PUBLISHED);
+        assert_eq!(geometry.spatial_scale, MageVaeShape::PUBLISHED.patch);
+        assert_eq!(geometry.full_res_channels, MageVaeShape::PUBLISHED.hidden_x);
+        assert_eq!(geometry.full_res_channels, 32);
+
+        let mut mutated = MageVaeShape::PUBLISHED;
+        mutated.hidden_x = 48;
+        mutated.patch = 8;
+        let geometry = tiling_geometry(mutated);
+        assert_eq!(geometry.full_res_channels, 48);
+        assert_eq!(geometry.spatial_scale, 8);
+    }
 }

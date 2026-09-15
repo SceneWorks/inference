@@ -45,10 +45,23 @@ mlx-gen-catalog = { path = "crates/media/mlx-gen/mlx-gen-catalog" }
 candle-gen-catalog = { path = "crates/media/candle-gen/candle-gen-catalog" }
 candle-audio-catalog = { path = "crates/audio/candle-audio-catalog" }
 
-# MLX fork pinned by commit SHA. rev 932beb4e = MLX 0.32.0 bump + pad/concat >i32::MAX copy-gate fix
-# + regenerated patches (epic 12742). See crates/media/mlx-gen/Cargo.toml for the full SHA lineage.
-mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "932beb4e60db44d378ffa1fe648defea59b5cbd0" }
-mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "932beb4e60db44d378ffa1fe648defea59b5cbd0" }
+# MLX fork pinned by commit SHA. d5a7fc01 adds sc-23053 recoverable async read errors,
+# EINTR/partial-read handling, and per-array failure isolation. Its parent bd8f0e3c
+# is 7151a9b2 + the sc-21382 prebuilt
+# seam (build.rs links a prebuilt libmlx from PMETAL_MLX_PREBUILT_DIR after verifying its
+# manifest key, declares rerun-if-env-changed on the deployment target, and the fork's
+# prebuilt-mlx workflow publishes per-commit `prebuilt-<sha12>` releases —
+# scripts/fetch-prebuilt-mlx.sh here consumes them; libmlx bytes are unchanged). 7151a9b2 was
+# a858aaa1 + three tier-3 Apple cross-build fixes (mlx-sys bindgen stops binding the SDK's libc
+# malloc/realloc, which nightly build-std rejects under suspicious_runtime_symbol_definitions;
+# the cross-apple workflow asserts the emitted metallib triples and selects the completed build
+# output). Rust API and MLX core are
+# unchanged from a858aaa1, which adds P3's exact phase-1 epilogues, complete
+# Metal, CUDA, and no-GPU backend definitions, and fail-closed Metal ABI/index/dispatch admission on top of the
+# collision-free retained compiler leases and safe TLS teardown while preserving MLX 0.32.0.
+# See mlx-gen/Cargo.toml for lineage.
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "d5a7fc018d713a37091e1cd102873eab355a00c6" }
+mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "d5a7fc018d713a37091e1cd102873eab355a00c6" }
 
 # Candle pins are shared by media and LLM providers.
 # Upstream PR #3531 removes O(groups) launches from unit-stride depthwise convs (sc-12111).
@@ -61,6 +74,13 @@ thiserror = "2"
 serde_json = "1"
 safetensors = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Pure-Rust OpenEXR for the LTX-2.5 HDR lane (sc-18790). Scene-linear HDR frames are the render's
+# real output and EXR is the interchange format every compositor reads, so the codec belongs in the
+# tensor-free contract layer beside the colour math. Pure Rust (no OpenEXR/Imath C++ build) keeps
+# the Windows candle lane and the CUDA images buildable; BSD-3-Clause is already on the deny.toml
+# allow-list. A hand-rolled reader was rejected: conditioning EXRs come from third-party tools
+# (Nuke/Blender/Houdini) and may be tiled, PIZ- or DWA-compressed, or multi-part.
+exr = "1.74"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 rand = "0.9"
 rand_distr = "0.5"
@@ -69,6 +89,11 @@ sha2 = "0.10"
 # Audio validation harness (sc-12854): `getrusage(RUSAGE_SELF)` peak-RSS on macOS/Linux.
 # Already in the resolved graph transitively.
 libc = "0.2"
+# Test-only RAII temp directories (sc-17704). Test helpers that built their own
+# `env::temp_dir().join(format!("...-{pid}-{n}"))` fixture roots leaked one directory per call
+# forever; a `TempDir` guard removes the tree on `Drop`, including out of a panicking test, and
+# draws its uniqueness from OS randomness rather than a recyclable PID.
+tempfile = "3"
 
 # Preserve Candle's dependency optimization for debug/test parity suites.
 [profile.dev.package."*"]

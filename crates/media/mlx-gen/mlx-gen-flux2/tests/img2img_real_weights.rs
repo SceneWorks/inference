@@ -4,7 +4,7 @@
 //!
 //!   cd ~/repos/mflux && .venv/bin/python ~/repos/mlx-gen/tools/dump_flux2_img2img_golden.py
 //!   cd ~/repos/mflux && BITS=8 .venv/bin/python ~/repos/mlx-gen/tools/dump_flux2_img2img_quant_golden.py
-//!   cargo test -p mlx-gen-flux2 --test img2img_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux2 --test integration img2img_real_weights:: -- --ignored --nocapture
 //!
 //! Five gates (f32 activations):
 //!  1. **seeded noise** — `create_noise` reproduces the fork's `prepare_packed_latents` noise;

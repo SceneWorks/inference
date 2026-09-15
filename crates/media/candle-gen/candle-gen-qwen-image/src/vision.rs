@@ -17,9 +17,6 @@ use candle_gen::candle_nn::rotary_emb::rope;
 use candle_gen::candle_nn::{linear, rms_norm, Linear, Module, RmsNorm, VarBuilder};
 use candle_gen::Result;
 
-/// Qwen2.5-VL vision RMSNorm epsilon (fork default).
-const EPS: f64 = 1e-6;
-
 /// `(grid_t, grid_h, grid_w)` for one image, in **patch** units.
 pub type Grid = [i32; 3];
 
@@ -43,25 +40,35 @@ pub struct VisionConfig {
     pub window_size: i32,
     pub fullatt_block_indexes: Vec<i32>,
     pub rope_theta: f32,
+    pub norm_eps: f64,
 }
 
 impl VisionConfig {
     /// The Qwen-Image-Edit-2511 `vision_config` (depth 32, embed 1280, 16 heads × 80,
     /// mlp_ratio 2.671875 → 3420, out 3584, window 112, full-attn at `[7,15,23,31]`).
     pub fn qwen_image_edit() -> Self {
+        let contract = crate::VISION_ENCODER_CONTRACT;
         Self {
-            patch_size: 14,
-            temporal_patch_size: 2,
-            in_channels: 3,
-            embed_dim: 1280,
-            depth: 32,
-            num_heads: 16,
-            mlp_hidden: 3420,
-            out_hidden_size: 3584,
-            spatial_merge_size: 2,
-            window_size: 112,
-            fullatt_block_indexes: vec![7, 15, 23, 31],
-            rope_theta: 10000.0,
+            patch_size: contract.patch_size as i32,
+            temporal_patch_size: contract.temporal_patch_size as i32,
+            in_channels: contract.in_channels as i32,
+            embed_dim: contract.hidden_size as i32,
+            depth: contract.num_hidden_layers as i32,
+            num_heads: contract.num_attention_heads as i32,
+            mlp_hidden: contract.intermediate_size as i32,
+            out_hidden_size: contract.output_width as i32,
+            spatial_merge_size: contract.spatial_merge_size as i32,
+            window_size: contract
+                .window_size
+                .expect("Qwen2.5-VL contract requires windowed attention")
+                as i32,
+            fullatt_block_indexes: contract
+                .full_attention_block_indexes
+                .iter()
+                .map(|&index| index as i32)
+                .collect(),
+            rope_theta: contract.rope_theta.get() as f32,
+            norm_eps: contract.normalization_eps.get(),
         }
     }
 
@@ -322,8 +329,8 @@ impl VisionBlock {
     fn new(vb: VarBuilder, cfg: &VisionConfig) -> Result<Self> {
         let embed = cfg.embed_dim as usize;
         Ok(Self {
-            norm1: rms_norm(embed, EPS, vb.pp("norm1"))?,
-            norm2: rms_norm(embed, EPS, vb.pp("norm2"))?,
+            norm1: rms_norm(embed, cfg.norm_eps, vb.pp("norm1"))?,
+            norm2: rms_norm(embed, cfg.norm_eps, vb.pp("norm2"))?,
             attn: VisionAttention::new(vb.pp("attn"), embed, cfg.num_heads as usize)?,
             mlp: VisionMlp::new(vb.pp("mlp"), embed, cfg.mlp_hidden as usize)?,
         })
@@ -353,7 +360,7 @@ impl PatchMerger {
         let hidden_merged = embed * merge2;
         let out = cfg.out_hidden_size as usize;
         Ok(Self {
-            ln_q: rms_norm(embed, EPS, vb.pp("ln_q"))?,
+            ln_q: rms_norm(embed, cfg.norm_eps, vb.pp("ln_q"))?,
             // The diffusers `Sequential` is `mlp.0` (Linear) / `mlp.1` (GELU) / `mlp.2` (Linear).
             mlp0: linear(hidden_merged, hidden_merged, vb.pp("mlp").pp("0"))?,
             mlp1: linear(hidden_merged, out, vb.pp("mlp").pp("2"))?,
@@ -473,6 +480,19 @@ impl VisionTransformer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_config_consumes_the_provider_behavior_contract() {
+        let config = VisionConfig::qwen_image_edit();
+        assert_eq!(
+            config.rope_theta as f64,
+            crate::VISION_ENCODER_CONTRACT.rope_theta.get()
+        );
+        assert_eq!(
+            config.norm_eps,
+            crate::VISION_ENCODER_CONTRACT.normalization_eps.get()
+        );
+    }
 
     #[test]
     fn cu_seqlens_accumulates() {

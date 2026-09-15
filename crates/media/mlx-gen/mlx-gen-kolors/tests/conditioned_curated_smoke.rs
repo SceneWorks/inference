@@ -13,7 +13,7 @@
 //!   KOLORS_CONTROLNET=<Kolors-ControlNet-Pose snapshot dir> \
 //!   KOLORS_IP_ADAPTER=<Kolors-IP-Adapter-Plus snapshot dir> \
 //!   [KOLORS_POSE=<pose/control image>] [KOLORS_REF=<reference/identity image>] \
-//!   cargo test -p mlx-gen-kolors --release --test conditioned_curated_smoke -- --ignored --nocapture
+//!   cargo test -p mlx-gen-kolors --release --test integration conditioned_curated_smoke:: -- --ignored --nocapture
 //!
 //! Gate (directional): for each conditioned mode and each curated solver —
 //!   (1) the render is **coherent** (not collapsed to noise/flat — the destabilization failure mode), and
@@ -24,8 +24,7 @@
 use std::path::PathBuf;
 
 use mlx_gen::{
-    Conditioning, ControlKind, GenerationOutput, GenerationRequest, Image, LoadSpec, Precision,
-    WeightsSource,
+    Conditioning, ControlKind, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource,
 };
 use mlx_gen_kolors::MODEL_ID;
 
@@ -96,20 +95,10 @@ fn image_from(env: &str) -> Image {
 }
 
 fn spec(base: PathBuf, control: Option<PathBuf>, ip: Option<PathBuf>) -> LoadSpec {
-    LoadSpec {
-        weights: WeightsSource::Dir(base),
-        quantize: None,
-        precision: Precision::Bf16,
-        control: control.map(WeightsSource::Dir),
-        ip_adapter: ip.map(WeightsSource::Dir),
-        adapters: Vec::new(),
-        extra_controls: Vec::new(),
-        pid: None,
-        identity: None,
-        text_encoder: None,
-        offload_policy: Default::default(),
-        components: Default::default(),
-    }
+    let mut spec = LoadSpec::new(WeightsSource::Dir(base));
+    spec.control = control.map(WeightsSource::Dir);
+    spec.ip_adapter = ip.map(WeightsSource::Dir);
+    spec
 }
 
 fn req(

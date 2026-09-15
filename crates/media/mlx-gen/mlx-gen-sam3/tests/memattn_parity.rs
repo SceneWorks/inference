@@ -6,7 +6,7 @@
 //! Run:
 //!   SAM3_WEIGHTS=/path/to/models--facebook--sam3/snapshots/<rev>/model.safetensors \
 //!   SAM3_MEMATTN_FIXTURE=scripts/spikes/sam3_oracle/memattn_fixture.safetensors \
-//!     cargo test -p mlx-gen-sam3 --release --test memattn_parity -- --ignored --nocapture
+//!     cargo test -p mlx-gen-sam3 --release --test integration memattn_parity:: -- --ignored --nocapture
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sam3::Sam3Tracker;

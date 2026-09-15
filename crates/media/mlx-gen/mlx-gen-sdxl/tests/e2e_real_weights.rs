@@ -1,7 +1,7 @@
 //! sc-2400 S5: end-to-end SDXL T2I parity vs the vendored Apple reference.
 //!
 //! `#[ignore]`d — needs the real SDXL snapshot + the golden from `tools/dump_sdxl_golden.py`. Run:
-//!   cargo test -p mlx-gen-sdxl --release --test e2e_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sdxl --release --test integration e2e_real_weights:: -- --ignored --nocapture
 //!
 //! Gates:
 //! - `full_pipeline_generates_fox` drives the public `load("sdxl", spec).generate(req)` and confirms
@@ -13,7 +13,7 @@
 //!   to the reference draw-for-draw. These pinned the one-ULP prior-op-order bug behind an apparent
 //!   "chaotic" divergence (sc-2400 S5).
 
-mod common;
+use crate::common;
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource};

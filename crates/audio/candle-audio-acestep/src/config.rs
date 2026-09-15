@@ -393,8 +393,8 @@ mod tests {
 
     #[test]
     fn parses_and_cross_checks_the_pinned_snapshot_shape() {
-        let dir = std::env::temp_dir().join("acestep-config-parse");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         write_snapshot(&dir);
         let cfg = SnapshotConfig::from_snapshot(&dir).unwrap();
         assert_eq!(cfg.vae.hop_length(), 1920);
@@ -407,13 +407,12 @@ mod tests {
         assert_eq!(cfg.condition.num_lyric_encoder_hidden_layers, 8);
         assert_eq!(cfg.text_encoder.hidden_size, 1024);
         assert_eq!(cfg.scheduler.shift, 3.0);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn rejects_foreign_or_drifted_snapshots() {
-        let dir = std::env::temp_dir().join("acestep-config-reject");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         write_snapshot(&dir);
         std::fs::write(
             dir.join("model_index.json"),
@@ -433,6 +432,5 @@ mod tests {
         )
         .unwrap();
         assert!(SnapshotConfig::from_snapshot(&dir).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

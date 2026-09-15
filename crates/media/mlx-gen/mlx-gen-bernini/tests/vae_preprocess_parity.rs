@@ -5,7 +5,7 @@
 //! → `[-1,1]` on a fixed uint8 image — **bit-exact** (elementwise). The PIL-bicubic resize
 //! interpolation is excluded (the port uses the `image` crate; dims exact, pixels differ slightly).
 //!
-//! Run: `cargo test -p mlx-gen-bernini --test vae_preprocess_parity -- --nocapture`
+//! Run: `cargo test -p mlx-gen-bernini --test integration vae_preprocess_parity:: -- --nocapture`
 
 use mlx_gen::weights::Weights;
 use mlx_gen_bernini::vae_preprocess::{normalize_chw, resize_dims};

@@ -6,7 +6,7 @@
 //! continuity, and VAE-decode each segment back to pixels.
 //!
 //! Reuse map — the heavy components are `mlx-gen-wan`'s (SCAIL-2 *is* Wan2.1-14B I2V): the z16
-//! [`WanVae`] (encode/decode), the [`Umt5Encoder`] text encoder, and the flow-matching
+//! [`ProviderVae`] (encode/decode), the [`Umt5Encoder`] text encoder, and the flow-matching
 //! [`make_scheduler`] (UniPC/DPM++). SCAIL-2's own pieces are the [`Scail2Dit`] forward, the
 //! open-CLIP [`ScailClip`] image encode, the 28-channel [`extract_and_compress_mask_to_latent`] mask
 //! build, and the [`interpolate`]/[`downsample_half`] resizes — all already parity-gated.
@@ -22,12 +22,12 @@
 use std::path::Path;
 
 use mlx_gen::array::scalar;
+use mlx_gen::gen_core::{FfnChunk, GraphEvalCadence};
 use mlx_gen::weights::Weights;
 use mlx_gen::{AdapterSpec, CancelFlag, Error, GenerationOutput, Image, Progress, Quant, Result};
-use mlx_gen_wan::pipeline::auto_tiling_budgeted_z16;
+use mlx_gen_wan::pipeline::auto_tiling_budgeted_z16_quality_overlap;
 use mlx_gen_wan::{
     frames_to_images, load_tokenizer, make_scheduler, DitMemoryConfig, SolverKind, Umt5Encoder,
-    WanVae,
 };
 use mlx_rs::ops::{add, concatenate_axis, maximum, minimum, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
@@ -37,16 +37,25 @@ use crate::config::Scail2Config;
 use crate::model::{Scail2Dit, Scail2Inputs};
 use crate::preprocess::{extract_and_compress_mask_to_latent, TEMPORAL_STRIDE};
 use crate::resize::{clip_preprocess, downsample_half, interpolate, Interp};
+use crate::{ProviderVae, VAE_TILING};
 
 /// Wan2.1 flow-matching training horizon (upstream `config.num_train_timesteps`).
 const NUM_TRAIN_TIMESTEPS: usize = 1000;
+
+fn decode_tiling(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+) -> Result<Option<mlx_gen::tiling::TilingConfig>> {
+    auto_tiling_budgeted_z16_quality_overlap(height, width, out_frames)
+}
 /// SCAIL-2 DiT-denoise activation-memory defaults (sc-5681). NOTE: measurement showed the 832×480/5s
 /// high-resolution OOM is the **VAE decode** (see the per-segment decode), not the DiT denoise — MLX's
 /// `scaled_dot_product_attention` is flash here, so the 40-layer denoise fits even un-chunked. These
 /// levers therefore bound the *denoise* peak for headroom + the larger buckets (1280×704) and are the
 /// shared-layer "practice" the story carries to Wan/Bernini; they are not what unblocks 832×480.
 ///
-/// - `eval_per_block` — caps the peak at ~one block's activations instead of the whole 40-block lazy
+/// - `eval_cadence` — caps the peak at ~one block's activations instead of the whole 40-block lazy
 ///   graph. Bit-exact, near-zero cost.
 /// - `ffn_seq_chunk` — bounds the `[L, ffn_dim]` FFN intermediate (the largest denoise transient).
 /// - `attn_query_chunk` — OFF by default (SDPA is flash here, so chunking the query path only adds
@@ -57,13 +66,40 @@ const NUM_TRAIN_TIMESTEPS: usize = 1000;
 /// by Metal tile-rounding, cosine ≈ 1). Overridable via `MLX_GEN_WAN_*` env
 /// (see [`DitMemoryConfig::from_env`]).
 const SCAIL2_MEM_DEFAULT: DitMemoryConfig = DitMemoryConfig {
-    ffn_seq_chunk: Some(8192),
+    ffn_seq_chunk: Some(FfnChunk::from_nonzero(
+        match std::num::NonZeroU32::new(8192) {
+            Some(rows) => rows,
+            None => unreachable!(),
+        },
+    )),
     attn_query_chunk: None,
-    eval_per_block: true,
+    eval_cadence: Some(GraphEvalCadence::EVERY_BLOCK),
 };
+
+/// The execution-domain surface the SCAIL-2 descriptor advertises (sc-18317).
+///
+/// Both numeric domains accept any positive value by construction rather than a measured candidate
+/// set: [`mlx_gen_wan::map_seq_chunks`] degrades an over-large chunk to one whole-sequence call, and a
+/// cadence wider than the 40-block trunk simply forces no evaluation inside it (the step's own
+/// end-of-step evaluation is unchanged), so the mechanism is exact over the whole range and this
+/// declaration claims no per-value measurement. CFG batching stays
+/// `Unsupported`: SCAIL-2's guidance is the shared Wan solver's, with no selectable batching axis.
+///
+/// Note what is deliberately absent: the attention query chunk. Bounding attention scratch is the
+/// memory ladder's rung 3, and exposing a second request control over the same mechanism would let a
+/// selector and the ladder disagree about one request's attention budget.
+pub(crate) const EXECUTION_SURFACE: mlx_gen::gen_core::ExecutionSurface =
+    mlx_gen::gen_core::ExecutionSurface {
+        graph_eval_cadence_blocks: mlx_gen::gen_core::ExecutionValueDomain::ANY_POSITIVE,
+        ffn_chunk_rows: mlx_gen::gen_core::ExecutionValueDomain::ANY_POSITIVE,
+        cfg_batching: mlx_gen::gen_core::CfgBatchingDomain::Unsupported,
+    };
 /// Inputs must be divisible by 32: the pose path halves spatially (→ ÷16) before the ÷8 VAE stride,
 /// and the 28-channel mask pools 8×, so both the full and half grids must stay integer + even.
-const DIM_ALIGN: u32 = 32;
+///
+/// `pub(crate)` because the geometry gate in `pipeline.rs` (sc-16167) must judge the rendered
+/// geometry on the same lattice [`align`] snaps it to, not on the pre-alignment request.
+pub(crate) const DIM_ALIGN: u32 = VAE_TILING.spatial_scale as u32 * 4;
 
 /// One masked character reference (the primary subject or an extra character): an RGB image paired
 /// with its color-coded segmentation mask.
@@ -73,7 +109,9 @@ pub struct CharacterRef<'a> {
 }
 
 /// A fully-specified SCAIL-2 generation job (the engine-internal form the worker maps a
-/// `GenerationRequest` onto). All images are decoded + resized to `(width, height)` here.
+/// `GenerationRequest` onto). `width` and `height` must already be non-zero multiples of the
+/// 32-pixel render lattice; [`generate`] rejects an invalid job rather than silently changing its geometry.
+/// All images are decoded + resized to `(width, height)` here.
 pub struct Scail2Job<'a> {
     pub prompt: &'a str,
     pub negative_prompt: &'a str,
@@ -97,13 +135,21 @@ pub struct Scail2Job<'a> {
     pub fps: u32,
     pub segment_len: usize,
     pub segment_overlap: usize,
+    /// The request's typed execution/memory block (sc-18317), carried verbatim from
+    /// `GenerationRequest::memory` so the two knobs this provider consumes — the graph-evaluation
+    /// cadence and the FFN chunk — reach `DitMemoryConfig` through
+    /// [`DitMemoryConfig::with_request`]. `None` (the direct-caller default) leaves
+    /// `SCAIL2_MEM_DEFAULT` exactly as it was before this story.
+    pub memory: Option<mlx_gen::gen_core::GenerationMemory>,
 }
 
-/// Round a requested dim to a multiple of [`DIM_ALIGN`] (down, with a min-one-tile floor — this
-/// differs from wan/bernini's `align_dim`, which has no floor and would yield 0 for a sub-tile
-/// request). The adjustment is **surfaced** (sc-6983) rather than applied silently: a 720→704 crop
-/// is otherwise an invisible behavior change. The caller stays infallible (no reject).
-fn align(value: u32) -> usize {
+/// Align a **resolved driving-clip** dimension to [`DIM_ALIGN`] (down, with a min-one-tile floor —
+/// this differs from wan/bernini's `align_dim`, which has no floor and would yield 0 for a sub-tile
+/// value). Explicit sizes are rejected before reaching this function unless already on-grid
+/// ([`SizeFloor::ResolvedDownstreamExplicitGrid`](mlx_gen::SizeFloor::ResolvedDownstreamExplicitGrid),
+/// sc-16198); only source-media geometry the caller did not choose may be adjusted here. The
+/// adjustment remains announced for diagnostics.
+pub(crate) fn align(value: u32) -> usize {
     let aligned = (value / DIM_ALIGN).max(1) * DIM_ALIGN;
     if aligned != value {
         eprintln!(
@@ -112,6 +158,25 @@ fn align(value: u32) -> usize {
         );
     }
     aligned as usize
+}
+
+/// Validate the exact render geometry carried by the public [`Scail2Job`] API.
+///
+/// Provider requests are checked by their advertised capability floor, and auto-sized provider
+/// requests are aligned while their source-media origin is still known. Direct callers have neither
+/// context, so this lower-level API accepts exact render geometry only.
+fn validate_job_geometry(width: u32, height: u32) -> Result<(usize, usize)> {
+    if width < DIM_ALIGN
+        || height < DIM_ALIGN
+        || !width.is_multiple_of(DIM_ALIGN)
+        || !height.is_multiple_of(DIM_ALIGN)
+    {
+        return Err(Error::Msg(format!(
+            "scail2: Scail2Job width/height must be non-zero multiples of {DIM_ALIGN} \
+             (got {width}×{height})"
+        )));
+    }
+    Ok((width as usize, height as usize))
 }
 
 /// Decode an `Image` (RGB24 `u8`) → `[3, th, tw]` f32 in `[-1, 1]`, resizing if its native size
@@ -167,7 +232,7 @@ fn stack_masks(masks: &[Image], tw: usize, th: usize) -> Result<Array> {
 
 /// VAE-encode an `[3, T, H, W]` pixel clip (`[-1,1]`) → `[16, T_lat, H/8, W/8]` (drops the batch dim
 /// the `WanVae` API carries).
-fn vae_encode_cthw(vae: &WanVae, cthw: &Array) -> Result<Array> {
+fn vae_encode_cthw(vae: &ProviderVae, cthw: &Array) -> Result<Array> {
     let s = cthw.shape();
     let z = vae.encode(&cthw.reshape(&[1, s[0], s[1], s[2], s[3]])?)?;
     let zs = z.shape(); // [1,16,T_lat,h,w]
@@ -279,6 +344,10 @@ pub fn generate(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<GenerationOutput> {
+    // Validate before touching media, adapter files, or model weights. This is also the exact
+    // geometry all image and latent paths consume, so the public job API cannot fall back to
+    // `align` and snap.
+    let (tw, th) = validate_job_geometry(job.width, job.height)?;
     if job.driving_frames.is_empty() {
         return Err(Error::Msg("scail2: a driving video is required".into()));
     }
@@ -333,11 +402,10 @@ pub fn generate(
             residual.push(spec.clone());
         }
     }
-    let (tw, th) = (align(job.width), align(job.height));
     let cfg_disabled = job.guidance <= 1.0;
     // Experimental bf16 compute opt-in (sc-5681; see the DiT block below). Read once here so the
     // per-segment NaN guard (F-096) keys off the same flag.
-    let compute_bf16 = std::env::var("SCAIL2_COMPUTE_BF16").is_ok_and(|v| v == "1");
+    let compute_bf16 = crate::compute_bf16_opt_in();
 
     // --- decode + resize all pixel inputs to (tw, th) ---
     let ref_chw = image_to_chw(job.reference.image, tw, th, Interp::Bicubic)?; // [3,H,W]
@@ -348,7 +416,7 @@ pub fn generate(
     // --- VAE (kept resident: per-segment pose encode + final decode) ---
     let vae = {
         let w = Weights::from_file(root.join("vae.safetensors"))?;
-        WanVae::from_weights(&w)?
+        ProviderVae::from_weights(&w)?
     };
 
     // Reference char latent + its 28-ch mask (1 latent frame).
@@ -434,7 +502,14 @@ pub fn generate(
             Dtype::Float32
         });
         // sc-5681: bound the per-step activation peak so the high-resolution buckets don't OOM.
-        d.set_memory_config(DitMemoryConfig::from_env(SCAIL2_MEM_DEFAULT));
+        // sc-18317: the request's typed selections overlay LAST, so epic 18304's planner outranks both
+        // this provider's own default and the environment for the two knobs it selects — while a
+        // request that selects neither leaves `SCAIL2_MEM_DEFAULT` exactly as it was. The values are
+        // already domain-admitted by the shared request floor against `EXECUTION_SURFACE`.
+        d.set_memory_config(DitMemoryConfig::with_request(
+            DitMemoryConfig::from_env(SCAIL2_MEM_DEFAULT),
+            job.memory.as_ref(),
+        ));
         // Quantize the attention + FFN Linears in place (Q4 default in the SceneWorks worker). The
         // packed Q4/Q8 weights are what stays resident; the bf16 source is freed in `quantize`.
         if let Some(q) = quant {
@@ -621,9 +696,10 @@ pub fn generate(
         // single-pass reference, 18.5/255 mean abs err with 26.6% of a worst frame blown to white.
         // Content corruption with the period of the tile stride, not a seam the blend could fix.
         //
-        // It now goes through the SAME budgeted selector as the Wan z16 T2V/I2V/VACE decodes
-        // (`auto_tiling_budgeted_z16`), so there is exactly one z16 decode-tiling policy in the
-        // workspace. gen-core's `MIN_TEMPORAL_TILE_LATENT_FRAMES` floor makes a sub-8-latent-frame
+        // It now goes through the same budgeted core/cost model as the Wan z16 T2V/I2V/VACE decodes,
+        // but retains the quality-oriented overlap through
+        // `auto_tiling_budgeted_z16_quality_overlap`. gen-core's
+        // `MIN_TEMPORAL_TILE_LATENT_FRAMES` floor makes a sub-8-latent-frame
         // temporal tile unselectable at any budget, and memory pressure is relieved on the **spatial**
         // axis instead — which is affordable precisely because sc-5690 verified `tile_decode_accumulate`
         // reconstructs a combined spatial+temporal plan exactly on the real z16 VAE at this geometry,
@@ -635,10 +711,13 @@ pub fn generate(
         on_progress(Progress::Decoding);
         let zs = latent.shape();
         let z = latent.reshape(&[1, zs[0], zs[1], zs[2], zs[3]])?;
-        let out_frames = (seg_end - seg_start) as i32;
+        let z_shape = z.shape();
+        let out_frames = z_shape[2] * VAE_TILING.temporal_scale;
+        let out_height = z_shape[3] * VAE_TILING.spatial_scale;
+        let out_width = z_shape[4] * VAE_TILING.spatial_scale;
         let video = {
             // `Err` is the catchable over-budget signal (raised before the decode, not as a SIGKILL).
-            let cfg = auto_tiling_budgeted_z16(th as i32, tw as i32, out_frames)?;
+            let cfg = decode_tiling(out_height, out_width, out_frames)?;
             match cfg.as_ref() {
                 // [1,3,T_out,H,W]; `decode_tiled` also falls back to a single pass if it doesn't tile.
                 Some(cfg) => vae.decode_tiled(&z, cfg, Some(cancel))?,
@@ -749,5 +828,92 @@ mod tests {
         // short-clip job must not be newly rejected over fields it doesn't use.
         validate_segment_params(13, 81, 81).expect("single-window job ignores window params");
         validate_segment_params(10, 10, 3).expect("total == segment_len is single-window");
+    }
+
+    #[test]
+    fn public_job_geometry_is_exact_or_rejected() {
+        assert_eq!(
+            validate_job_geometry(1280, 704).expect("on-grid geometry is exact"),
+            (1280, 704)
+        );
+        for (width, height) in [(1280, 730), (730, 1280), (0, 704), (704, 0)] {
+            let err = validate_job_geometry(width, height)
+                .expect_err("the public low-level job must never be silently snapped")
+                .to_string();
+            assert!(
+                err.contains("non-zero multiples of 32")
+                    && err.contains(&format!("{width}×{height}")),
+                "got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_generate_rejects_geometry_before_adapter_io() {
+        let image = Image {
+            width: 1,
+            height: 1,
+            pixels: vec![0; 3],
+        };
+        let frames = [image.clone()];
+        let masks = [image.clone()];
+        let job = Scail2Job {
+            prompt: "p",
+            negative_prompt: "",
+            width: 1280,
+            height: 730,
+            reference: CharacterRef {
+                image: &image,
+                mask: &image,
+            },
+            additional: Vec::new(),
+            driving_frames: &frames,
+            driving_masks: &masks,
+            replace_flag: false,
+            seed: 0,
+            steps: 1,
+            shift: 5.0,
+            guidance: 1.0,
+            sampler: SolverKind::UniPC,
+            fps: 16,
+            segment_len: 81,
+            segment_overlap: 5,
+            memory: None,
+        };
+        let inaccessible = AdapterSpec::new(
+            std::path::PathBuf::from("/sc16198-missing/adapter.safetensors"),
+            1.0,
+            mlx_gen::AdapterKind::Lora,
+        );
+        let mut noop = |_: Progress| {};
+        let err = generate(
+            Path::new("/sc16198-missing/snapshot"),
+            &Scail2Config::default(),
+            &job,
+            None,
+            &[inaccessible],
+            &CancelFlag::default(),
+            &mut noop,
+        )
+        .expect_err("invalid public job geometry must fail before adapter or snapshot I/O")
+        .to_string();
+        assert!(
+            err.contains("non-zero multiples of 32") && err.contains("1280×730"),
+            "geometry must be the first error, got: {err}"
+        );
+    }
+
+    /// sc-15445: SCAIL-2 shares Krea's half-tile quality policy, not Wan's restored product overlap.
+    #[test]
+    fn decode_tiling_retains_scail2s_half_tile_overlap() {
+        std::env::set_var("WAN_VAE_BUDGET_GIB", "10");
+        let cfg = decode_tiling(384, 640, 84)
+            .unwrap()
+            .expect("the measured SCAIL-2 row must tile at 10 GiB");
+        std::env::remove_var("WAN_VAE_BUDGET_GIB");
+        assert_eq!(
+            cfg.temporal.map(|t| (t.tile_frames, t.overlap_frames)),
+            Some((32, 16)),
+        );
     }
 }

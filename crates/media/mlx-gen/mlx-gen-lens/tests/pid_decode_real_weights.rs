@@ -11,7 +11,7 @@
 //! ~20 B params, so this defaults to Q8 (quantizes the encoder's MoE experts at load).
 //!
 //! ```sh
-//! cargo test -p mlx-gen-lens --release --test pid_decode_real_weights -- --ignored --nocapture
+//! cargo test -p mlx-gen-lens --release --test integration pid_decode_real_weights:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;
@@ -38,7 +38,7 @@ fn first_snapshot_dir(repo: &str, what: &str) -> PathBuf {
 
 fn lens_dir() -> PathBuf {
     env_path("LENS_DIR")
-        .unwrap_or_else(|| first_snapshot_dir("models--microsoft--Lens-Turbo", "Lens-Turbo"))
+        .unwrap_or_else(|| first_snapshot_dir("models--SceneWorks--Lens-Turbo", "Lens-Turbo"))
 }
 
 fn pid_checkpoint() -> PathBuf {

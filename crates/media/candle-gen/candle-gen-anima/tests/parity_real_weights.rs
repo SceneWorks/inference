@@ -2,7 +2,7 @@
 //! candle's **CPU** backend (no NVIDIA GPU required). `#[ignore]`d + weights-gated (they need the
 //! licensed `circlestone-labs/Anima` single-file snapshot in the HF cache), so they never run in CI.
 //! Run locally with:
-//!   cargo test -p candle-gen-anima --release --test parity_real_weights -- --ignored --nocapture
+//!   cargo test -p candle-gen-anima --release --test integration parity_real_weights:: -- --ignored --nocapture
 //!
 //! Each test reads a committed golden JSON (computed by the MLX lane's diffusers 0.39.0 generators —
 //! framework-INDEPENDENT numbers) and runs the candle port on the single-file checkpoint on CPU, then

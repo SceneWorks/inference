@@ -9,7 +9,7 @@
 //!
 //! Run:
 //!   PYTHONPATH=/tmp/sam2-mlx/src ~/mlx-flux-venv/bin/python tools/dump_sam2_memory_golden.py --size large
-//!   cargo test -p mlx-gen-sam2 --release --test memory_parity -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sam2 --release --test integration memory_parity:: -- --ignored --nocapture
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sam2::{MemoryAttention, MemoryEncoder};

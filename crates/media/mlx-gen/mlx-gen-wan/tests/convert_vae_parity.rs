@@ -6,7 +6,7 @@
 //! pickle VM + storage decode), applies the Wan2.2 VAE sanitizer, and asserts the result reproduces
 //! the golden byte-for-byte.
 //!
-//! Run with: `cargo test -p mlx-gen-wan --test convert_vae_parity -- --ignored --nocapture`
+//! Run with: `cargo test -p mlx-gen-wan --test integration convert_vae_parity:: -- --ignored --nocapture`
 //! Override paths with `WAN_TI2V_5B_DIR` (golden) / `WAN_VAE_PTH` (source .pth).
 
 use std::collections::BTreeSet;
@@ -47,7 +47,8 @@ fn ti2v_5b_vae_convert_matches_golden() {
         source.display()
     );
 
-    let out = std::env::temp_dir().join("mlx_gen_wan_vae_parity.safetensors");
+    let out_tmp = tempfile::tempdir().unwrap();
+    let out = out_tmp.path().join("mlx_gen_wan_vae_parity.safetensors");
     let _ = std::fs::remove_file(&out);
     eprintln!("converting {} → {}", source.display(), out.display());
 

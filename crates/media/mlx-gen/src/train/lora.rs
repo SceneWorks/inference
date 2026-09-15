@@ -115,10 +115,12 @@ pub fn build_lora_targets<H: AdaptableHost>(
     let mut params: LoraParams = HashMap::new();
     for (i, path) in target_paths.iter().enumerate() {
         let segs: Vec<&str> = path.split('.').collect();
-        let lin = host.adaptable_mut(&segs).ok_or_else(|| -> crate::Error {
+        // SC-18319 — target *sizing* only reads the base shape, so it goes through the PROBE half.
+        // `bind_lora_params` below is the mutation that installs the trainable stack (and unfuses).
+        let facts = host.adaptable_facts(&segs).ok_or_else(|| -> crate::Error {
             format!("LoRA target does not resolve on the model: {path}").into()
         })?;
-        let shape = lin.base_shape(); // [out, in]
+        let shape = facts.base_shape; // [out, in]
         let (out_f, in_f) = (shape[0], shape[1]);
 
         let a_key: Rc<str> = Rc::from(format!("{path}.lora_a"));
@@ -189,7 +191,7 @@ pub fn install_training_lora_as<H: AdaptableHost>(
         let lin = host
             .adaptable_mut(&segs)
             .ok_or_else(|| Exception::custom(format!("LoRA target not found: {}", t.path)))?;
-        lin.set_adapters(vec![Adapter::Lora { a, b, scale: 1.0 }]);
+        lin.set_training_adapters(vec![Adapter::Lora { a, b, scale: 1.0 }]);
     }
     Ok(())
 }
@@ -323,10 +325,11 @@ pub fn build_lokr_targets<H: AdaptableHost>(
     };
     for (i, path) in target_paths.iter().enumerate() {
         let segs: Vec<&str> = path.split('.').collect();
-        let lin = host.adaptable_mut(&segs).ok_or_else(|| -> crate::Error {
+        // SC-18319 — factor sizing is shape-only, so the PROBE half; `bind_lokr_params` mutates.
+        let facts = host.adaptable_facts(&segs).ok_or_else(|| -> crate::Error {
             format!("LoKr target does not resolve on the model: {path}").into()
         })?;
-        let shape = lin.base_shape(); // [out, in]
+        let shape = facts.base_shape; // [out, in]
         let (out_a, out_b) = factorization(shape[0], factor);
         let (in_a, in_b) = factorization(shape[1], factor);
 
@@ -406,7 +409,7 @@ pub fn install_training_lokr<H: AdaptableHost>(
         let lin = host
             .adaptable_mut(&segs)
             .ok_or_else(|| Exception::custom(format!("LoKr target not found: {}", t.path)))?;
-        lin.set_adapters(vec![Adapter::Lokr { delta, scale: 1.0 }]);
+        lin.set_training_adapters(vec![Adapter::Lokr { delta, scale: 1.0 }]);
     }
     Ok(())
 }
@@ -646,8 +649,8 @@ mod tests {
                 vec!["to_q".to_string()]
             }
         }
-        let dir = std::env::temp_dir().join(format!("sc14057-meta-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let extra = [("family", "mage_flow"), ("networkType", "IGNORED")];
 
         for (kind, file) in [("lora", "a.safetensors"), ("lokr", "b.safetensors")] {
@@ -681,7 +684,6 @@ mod tests {
             );
             assert_eq!(w.metadata("rank"), Some("4"));
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

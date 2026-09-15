@@ -8,7 +8,7 @@
 //!
 //! CPU, no cuda/weights.
 
-mod common;
+use crate::common;
 
 use common::{errors, flat_f32, Golden};
 

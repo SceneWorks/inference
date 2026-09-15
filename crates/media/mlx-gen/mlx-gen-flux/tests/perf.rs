@@ -16,9 +16,9 @@
 //!
 //! Run it (schnell from the HF cache, or point at a snapshot):
 //! ```text
-//! cargo test --release -p mlx-gen-flux --test perf -- --ignored --nocapture
+//! cargo test --release -p mlx-gen-flux --test integration perf:: -- --ignored --nocapture
 //! FLUX_VARIANT=dev MLX_GEN_FLUX_SNAPSHOT=<snapshot> \
-//!   cargo test --release -p mlx-gen-flux --test perf -- --ignored --nocapture
+//!   cargo test --release -p mlx-gen-flux --test integration perf:: -- --ignored --nocapture
 //! ```
 //! Override geometry with `FLUX_PERF_WIDTH` / `FLUX_PERF_HEIGHT` (default 1024×1024).
 

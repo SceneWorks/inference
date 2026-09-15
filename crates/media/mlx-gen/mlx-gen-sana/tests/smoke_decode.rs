@@ -7,7 +7,7 @@
 //!
 //! Run:
 //!   SANA_DCAE_WEIGHTS=/path/diffusion_pytorch_model.safetensors \
-//!   cargo test -p mlx-gen-sana --test smoke_decode -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sana --test integration smoke_decode:: -- --ignored --nocapture
 
 use mlx_rs::ops::{max as max_op, min as min_op, sum};
 use mlx_rs::random::normal;

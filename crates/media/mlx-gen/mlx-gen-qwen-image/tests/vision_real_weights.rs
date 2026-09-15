@@ -8,7 +8,7 @@
 //!   exact-multiple edge, and multi-image.
 //!
 //! Run: `cd ~/repos/mflux && uv run python ~/repos/mlx-gen/tools/dump_qwen_vision_golden.py`, then
-//! `cargo test -p mlx-gen-qwen-image --release --test vision_real_weights -- --ignored --nocapture`
+//! `cargo test -p mlx-gen-qwen-image --release --test integration vision_real_weights:: -- --ignored --nocapture`
 
 use std::path::PathBuf;
 
@@ -135,6 +135,7 @@ fn small_vision_transformer_matches_fork() {
         window_size: 112,
         fullatt_block_indexes: vec![1, 3],
         rope_theta: 10000.0,
+        norm_eps: 1e-6,
     };
     let vt = VisionTransformer::from_weights(&g, "vt", &cfg).unwrap();
     let grids = grids_of(&g, "io");

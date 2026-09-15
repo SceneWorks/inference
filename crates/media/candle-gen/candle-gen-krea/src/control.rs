@@ -692,6 +692,44 @@ pub fn forward_with_control(
     Ok(dit.velocity_out(&x, &ctx)?)
 }
 
+/// Prepared-state twin of [`forward_with_control`]. The provider creates the plan once per request,
+/// so text fusion, joint RoPE, and pose-token embedding never repeat in the denoise loop.
+pub(crate) fn forward_with_prepared_control(
+    dit: &KreaTrainDit,
+    branch: &ControlBranch,
+    latent: &Tensor,
+    timestep: &Tensor,
+    prepared: &crate::train_dit::PreparedControlConditioning,
+    control_scale: f64,
+) -> Result<Tensor> {
+    if control_scale == 0.0 {
+        let (mut x, ctx) = dit.forward_pre_main_prepared(latent, timestep, prepared)?;
+        for blk in dit.blocks() {
+            x = blk.forward(&x, &ctx.tvec, &ctx.rcos, &ctx.rsin)?;
+        }
+        return Ok(dit.velocity_out(&x, &ctx)?);
+    }
+    let (combined, ctx) = dit.forward_pre_main_prepared(latent, timestep, prepared)?;
+    let residuals = branch.residuals(&combined, &prepared.ctrl_tokens, &ctx)?;
+
+    let mut x = combined;
+    for (j, blk) in dit.blocks().iter().enumerate() {
+        if let Some(r) = branch
+            .residual_index_for_main_block(j)
+            .and_then(|k| residuals.get(k))
+        {
+            let txt = x.narrow(1, 0, ctx.cap_len)?;
+            let img = x.narrow(1, ctx.cap_len, ctx.img_len)?;
+            let scaled = (r * control_scale)?.to_dtype(x.dtype())?;
+            let scaled = branch.apply_clamp(&scaled, &img)?;
+            let img = (img + scaled)?;
+            x = Tensor::cat(&[&txt, &img], 1)?;
+        }
+        x = blk.forward(&x, &ctx.tvec, &ctx.rcos, &ctx.rsin)?;
+    }
+    Ok(dit.velocity_out(&x, &ctx)?)
+}
+
 /// DIAGNOSTIC + TELEMETRY (sc-8460): the branched forward with per-injection-point norms. For each
 /// branch block `i` (injecting into main block `i + offset`) reports
 /// `(‖res_i‖₂ pre-clamp, ‖res_i‖₂ post-clamp, ‖main_img‖₂)` — the residual the branch WANTED to
@@ -887,7 +925,8 @@ mod tests {
     #[test]
     fn zero_init_branch_is_identity() {
         let dev = Device::Cpu;
-        let (dit, c, path) = tiny_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, c, path) = tiny_dit(&tmp);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
         let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
 
@@ -904,6 +943,55 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// The control request plan is produced once from the prompt and pose latent, then every denoise
+    /// step reuses it. This CPU fixture pins parity with the historical unprepared forward and the
+    /// fail-closed geometry check without a model download or CUDA device.
+    #[test]
+    fn prepared_control_conditioning_matches_the_unprepared_forward_and_rejects_stale_geometry() {
+        let dev = Device::Cpu;
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, c, path) = tiny_dit(&tmp);
+        let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
+        let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
+        let (x0, cap, _) = tiny_batch(&c);
+        let ctrl = Tensor::randn(0f32, 1f32, x0.dims(), &dev).unwrap();
+        let context = cap.unsqueeze(0).unwrap();
+        let prepared = dit.prepare_control_conditioning(&context, &ctrl).unwrap();
+
+        for sigma in [0.2_f32, 0.7] {
+            let t = Tensor::from_vec(vec![sigma], (1,), &dev).unwrap();
+            let expected =
+                forward_with_control(&dit, &branch, &x0, &t, &context, &ctrl, 0.6).unwrap();
+            let got =
+                forward_with_prepared_control(&dit, &branch, &x0, &t, &prepared, 0.6).unwrap();
+            assert_eq!(
+                expected.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                got.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                "prepared control parity at sigma={sigma}"
+            );
+        }
+
+        let stale = Tensor::zeros(
+            (
+                1,
+                x0.dim(1).unwrap(),
+                x0.dim(2).unwrap() * 2,
+                x0.dim(3).unwrap(),
+            ),
+            DType::F32,
+            &dev,
+        )
+        .unwrap();
+        let t = Tensor::from_vec(vec![0.5_f32], (1,), &dev).unwrap();
+        let error = forward_with_prepared_control(&dit, &branch, &stale, &t, &prepared, 0.6)
+            .expect_err("stale control geometry must be refused before branch execution");
+        assert!(
+            matches!(error, candle_gen::CandleError::Msg(ref message) if message.contains("prepared conditioning request identity")),
+            "expected a typed prepared-state error, got {error:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
     /// Activation-chunking parity (sc-11745): forcing the smallest possible scores budget (`1` →
     /// per-query-row chunks) on **both** the base single-stream stack and the control branch must
     /// reproduce the un-chunked forward — the sc-6217 query-row-independence invariant, at the Krea
@@ -914,7 +1002,8 @@ mod tests {
         let dev = Device::Cpu;
         // ≥2 main blocks + a nudged branch so both the base attention and the injected branch
         // attention actually contribute (a zero-init branch would leave only the base to compare).
-        let (mut dit, c, path) = tiny_dit_layers(2);
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut dit, c, path) = tiny_dit_layers(&tmp, 2);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
         let mut branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
         nudge_vars(&branch, &dev);
@@ -948,7 +1037,8 @@ mod tests {
     #[test]
     fn scale_zero_is_base_forward() {
         let dev = Device::Cpu;
-        let (dit, c, path) = tiny_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, c, path) = tiny_dit(&tmp);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
         let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
         nudge_vars(&branch, &dev);
@@ -981,7 +1071,8 @@ mod tests {
         // assert below). Seed is 10794-adjacent but distinct from the sibling tests so they don't
         // share a trajectory.
         let mut rng = StdRng::seed_from_u64(10795);
-        let (dit, c, path) = tiny_dit_seeded(&mut rng);
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, c, path) = tiny_dit_seeded(&tmp, &mut rng);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
         let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
         // Seeded twin of `nudge_vars`: nudge off the zero-init identity so there's a signal to
@@ -1054,7 +1145,8 @@ mod tests {
     #[test]
     fn dense_and_checkpoint_grads_match_control() {
         let dev = Device::Cpu;
-        let (dit, c, path) = tiny_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, c, path) = tiny_dit(&tmp);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
         let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
         nudge_vars(&branch, &dev);
@@ -1124,14 +1216,13 @@ mod tests {
     #[test]
     fn train_and_infer_branch_paths_match() {
         let dev = Device::Cpu;
-        let (dit, c, path) = tiny_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, c, path) = tiny_dit(&tmp);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
         let train_b = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
         nudge_vars(&train_b, &dev);
-        let ckpt = std::env::temp_dir().join(format!(
-            "krea_ctrl_parity_{}.safetensors",
-            std::process::id()
-        ));
+        let ckpt_tmp = tempfile::tempdir().unwrap();
+        let ckpt = ckpt_tmp.path().join("krea_ctrl_parity.safetensors");
         train_b.save(&ckpt).unwrap();
         let mut infer_b = ControlBranch::from_checkpoint(&ckpt, &c, &dev).unwrap();
         infer_b.freeze();
@@ -1162,7 +1253,6 @@ mod tests {
         assert!(report[0].0.is_finite() && report[0].1 > 0.0);
         // Nudged (nonzero) projections => the branched velocity differs from base.
         assert_ne!(flat(&v_base), v_infer);
-        let _ = std::fs::remove_file(ckpt);
         let _ = std::fs::remove_file(path);
     }
 
@@ -1173,7 +1263,8 @@ mod tests {
     #[test]
     fn residual_clamp_caps_swamping() {
         let dev = Device::Cpu;
-        let (dit, c, path) = tiny_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, c, path) = tiny_dit(&tmp);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
 
         // Blow the projections up: residuals many times the stream norm.
@@ -1273,13 +1364,14 @@ mod tests {
     #[test]
     fn checkpoint_roundtrip() {
         let dev = Device::Cpu;
-        let (dit, c, path) = tiny_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, c, path) = tiny_dit(&tmp);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
         let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
         nudge_vars(&branch, &dev);
 
-        let ckpt =
-            std::env::temp_dir().join(format!("krea_ctrl_ckpt_{}.safetensors", std::process::id()));
+        let ckpt_tmp = tempfile::tempdir().unwrap();
+        let ckpt = ckpt_tmp.path().join("krea_ctrl_parity.safetensors");
         branch.save(&ckpt).unwrap();
         let mut loaded = ControlBranch::from_checkpoint(&ckpt, &c, &dev).unwrap();
         // Inference mode (detached weight reads) must not change values — only graph tracking.
@@ -1315,14 +1407,13 @@ mod tests {
     #[test]
     fn checkpoint_empty_inject_offset_is_typed_error() {
         let dev = Device::Cpu;
-        let (_dit, c, path) = tiny_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dit, c, path) = tiny_dit(&tmp);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
         let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
 
-        let ckpt = std::env::temp_dir().join(format!(
-            "krea_ctrl_ckpt_empty_{}.safetensors",
-            std::process::id()
-        ));
+        let ckpt_tmp = tempfile::tempdir().unwrap();
+        let ckpt = ckpt_tmp.path().join("krea_ctrl_ckpt_empty.safetensors");
         branch.save(&ckpt).unwrap();
 
         // Corrupt just the scalar meta tensor to size-0, re-save, and reload.
@@ -1338,7 +1429,6 @@ mod tests {
             loaded.is_err(),
             "size-0 inject_offset must be a typed error, not a panic"
         );
-        let _ = std::fs::remove_file(ckpt);
         let _ = std::fs::remove_file(path);
     }
 
@@ -1350,7 +1440,8 @@ mod tests {
     #[test]
     fn inject_offset_topology() {
         let dev = Device::Cpu;
-        let (dit, c, path) = tiny_dit_layers(2);
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, c, path) = tiny_dit_layers(&tmp, 2);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
 
         // offset + n must fit in the main stack.
@@ -1409,8 +1500,8 @@ mod tests {
         }
 
         // The offset is persisted and the reloaded forward matches.
-        let ckpt =
-            std::env::temp_dir().join(format!("krea_ctrl_off_{}.safetensors", std::process::id()));
+        let ckpt_tmp = tempfile::tempdir().unwrap();
+        let ckpt = ckpt_tmp.path().join("krea_ctrl_ckpt_empty.safetensors");
         branch.save(&ckpt).unwrap();
         let loaded = ControlBranch::from_checkpoint(&ckpt, &c, &dev).unwrap();
         assert_eq!(loaded.inject_offset(), 1);
@@ -1435,7 +1526,8 @@ mod tests {
     fn from_checkpoint_quantized_preserves_branch_direction() {
         let dev = Device::Cpu;
         let mut rng = StdRng::seed_from_u64(11743);
-        let (dit, c, path) = tiny_dit_seeded(&mut rng);
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, c, path) = tiny_dit_seeded(&tmp, &mut rng);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
         let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
         // Nudge off the zero-init identity (seeded) so there is a residual to preserve.
@@ -1443,10 +1535,8 @@ mod tests {
             v.set(&randn_seeded(&mut rng, 0.0, 0.02, v.as_tensor().dims()))
                 .unwrap();
         }
-        let ckpt = std::env::temp_dir().join(format!(
-            "krea_ctrl_quant_{}.safetensors",
-            std::process::id()
-        ));
+        let ckpt_tmp = tempfile::tempdir().unwrap();
+        let ckpt = ckpt_tmp.path().join("krea_ctrl_quant.safetensors");
         branch.save(&ckpt).unwrap();
 
         let (x0, cap, _) = tiny_batch_seeded(&c, &mut rng);
@@ -1501,7 +1591,6 @@ mod tests {
             "Q4 branch residual must stay correlated with bf16: cos {c4}"
         );
 
-        let _ = std::fs::remove_file(ckpt);
         let _ = std::fs::remove_file(path);
     }
 
@@ -1511,12 +1600,13 @@ mod tests {
     #[test]
     fn quantized_zero_init_is_identity() {
         let dev = Device::Cpu;
-        let (dit, c, path) = tiny_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, c, path) = tiny_dit(&tmp);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
         // Zero-init branch (untouched `from_base` — proj_out zeros), saved and reloaded quantized.
         let zero = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
-        let ckpt =
-            std::env::temp_dir().join(format!("krea_ctrl_qid_{}.safetensors", std::process::id()));
+        let ckpt_tmp = tempfile::tempdir().unwrap();
+        let ckpt = ckpt_tmp.path().join("krea_ctrl_quant.safetensors");
         zero.save(&ckpt).unwrap();
         let q4 = ControlBranch::from_checkpoint_quantized(&ckpt, &c, &dev, Quant::Q4).unwrap();
 

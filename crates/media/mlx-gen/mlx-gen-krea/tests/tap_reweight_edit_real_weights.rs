@@ -17,7 +17,7 @@
 //!
 //! `#[ignore]` — needs the real Krea 2 Raw snapshot + the identity-edit LoRA (defaults to the HF cache):
 //! ```sh
-//! cargo test -p mlx-gen-krea --release --test tap_reweight_edit_real_weights -- --ignored --nocapture
+//! cargo test -p mlx-gen-krea --release --test integration tap_reweight_edit_real_weights:: -- --ignored --nocapture
 //! # or explicit: KREA_RAW_DIR=…/krea-2-raw-mlx/…/bf16 KREA_EDIT_LORA=…/krea2_identity_edit_v1_1.safetensors
 //! ```
 

@@ -3,9 +3,11 @@
 # default, which SIGSEGVs once more than one test touches MLX at the same time.
 # Force the libtest harness to a single thread for the whole crate so `cargo test`
 # (and CI) just work. Individual ops are still fast; tests run sequentially.
-# `force = true` is load-bearing (F-160): a plain `[env]` entry is only applied when the
+# `force = true` is load-bearing: a plain `[env]` entry is only applied when the
 # variable is UNSET, so without it anyone who already has `RUST_TEST_THREADS` exported would
 # silently run MLX tests in parallel and hit the exact SIGSEGV above. Forcing it overrides that.
+# (sc-4147 — filed as F-160 of the 2026-06-09 review, whose document is not in this repo; the
+# in-tree reviews reuse F-160 for an unrelated finding, so cite the story rather than the raw id.)
 [env]
 RUST_TEST_THREADS = { value = "1", force = true }
 
@@ -30,7 +32,8 @@ RUST_TEST_THREADS = { value = "1", force = true }
 # value because GitHub's hosted macOS runners cap at macos-15 / SDK 15 — they can't provide
 # SDK >= 26.2. CI therefore builds at Metal 320 to verify correctness; it cannot exercise the
 # NAX fast path at all (is_nax_available() is false there), so the lower target is harmless.
-# A macOS-26.2+ self-hosted runner is required to exercise/guard NAX. NB: build.rs has no
-# rerun-if-env-changed, so a clean rebuild of pmetal-mlx-sys is required for a change here to
-# take effect. Requires macOS 26.2 at runtime for the fast path. See sc-2352 / sc-2772.
+# A macOS-26.2+ self-hosted runner is required to exercise/guard NAX. Since the sc-21382 fork
+# rev build.rs declares rerun-if-env-changed on this variable, so a change here re-runs the
+# build script (and, with PMETAL_MLX_PREBUILT_DIR set, re-verifies the prebuilt's key).
+# Requires macOS 26.2 at runtime for the fast path. See sc-2352 / sc-2772.
 MACOSX_DEPLOYMENT_TARGET = "26.2"

@@ -20,17 +20,21 @@ use mlx_gen::{
     curated_scheduler_names, default_seed, schedule_sigmas, AlphaSchedule, Capabilities,
     Conditioning, ConditioningKind, ControlKind, DiscreteModelSampling, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, Modality, ModelDescriptor,
-    OffloadPolicy, Progress, Quant, Residency, Result, Scheduler, Solver, WeightsSource,
+    OffloadPolicy, Progress, Quant, Residency, Result, Scheduler, Solver, StepSupport,
+    WeightsSource,
 };
 
 use mlx_gen_pid::{resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_sdxl::{
-    decode_image, encode_init_latents, load_controlnet, ControlNet, IpImageEncoder, PID_BACKBONE,
+    decode_image_tiled, encode_init_latents, load_controlnet, ControlNet, IpImageEncoder,
+    SdxlBlockWindow, SdxlForwardPlan, PID_BACKBONE,
 };
 
 use crate::ip_adapter::load_kolors_ip_adapter;
 use crate::model::{KolorsHeavy, KolorsText, DEFAULT_IMG2IMG_STRENGTH, SPATIAL_SCALE};
 use crate::sampler::{KolorsEulerSampler, BETA_END, BETA_START, NUM_TRAIN_TIMESTEPS};
+
+type KolorsEncodedConditioning = ((Array, Array), Option<(Array, Array)>);
 
 /// Registry id — the SceneWorks worker's `payload.model` for the Kolors family.
 pub const MODEL_ID: &str = "kolors";
@@ -51,11 +55,10 @@ const DEFAULT_CONTROLNET_SCALE: f32 = 1.0;
 const POSE_IMG2IMG_STRENGTH: f32 = 1.0;
 /// The single Kolors sampler — diffusers `EulerDiscreteScheduler` (leading), see [`KolorsEulerSampler`].
 const SAMPLER: &str = "euler_discrete";
-/// Kolors' VAE downsamples by 8, so both image dims must be multiples of **8** for a clean latent
-/// shape. Exposed as the pinned-engine stride SceneWorks ties each advertised Kolors image bucket to
-/// (sc-12612). `validate_request` enforces exactly this value, so the const cannot drift from the
-/// check. (Distinct from the `i32` `model::SPATIAL_SCALE`, which is the same 8 in latent math.)
-pub const SIZE_MULTIPLE: u32 = 8;
+/// Kolors' `/8` VAE feeds an SDXL U-Net with two exact downsample/upsample skip joins, so both image
+/// dims must be multiples of **32**. Exposed as the pinned-engine stride SceneWorks ties each
+/// advertised Kolors image bucket to (sc-12612); the model and registry share the same constant.
+pub const SIZE_MULTIPLE: u32 = crate::model::PRODUCTION_SPATIAL_MULTIPLE as u32;
 
 /// Kolors' identity + capabilities — constructible without loading weights (registry
 /// introspection). Advertises **only** the wired + parity-proven surface (the false-capability
@@ -64,6 +67,9 @@ pub const SIZE_MULTIPLE: u32 = 8;
 /// [`crate::model::Kolors::apply_lora`], the inference complement to the Kolors trainer sc-4568).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::SDXL_LATENT_SPACE),
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "kolors",
@@ -73,7 +79,6 @@ pub fn descriptor() -> ModelDescriptor {
             // Kolors uses real classifier-free guidance over the ChatGLM3 conditioning.
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             // Reference = img2img init (sc-3095) OR the IP-Adapter image prompt when an IP-Adapter is
             // loaded (sc-3098); Control = the Kolors ControlNet-pose branch (sc-3097).
             conditioning: vec![ConditioningKind::Reference, ConditioningKind::Control],
@@ -106,14 +111,19 @@ pub fn descriptor() -> ModelDescriptor {
                 s.extend(curated_scheduler_names());
                 s
             },
-            supported_guidance_methods: vec![],
             min_size: 512,
             max_size: 2048,
             max_count: 8,
+            // Kolors' train-timestep count is a real upper bound: above it `step_ratio` floors to
+            // 0 and every timestep collapses to 1 — silent garbage, not an error (F-124). It was
+            // checked only inside `validate_request` below; declaring it makes it discoverable
+            // (sc-19559).
+            supported_steps: StepSupport::Range {
+                min: 1,
+                max: NUM_TRAIN_TIMESTEPS as u32,
+            },
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam (epic 10834, sc-10840); honors Sequential offload
             // (F-176). The monolithic `Kolors` was split into a droppable `KolorsText` (6B ChatGLM3 +
             // tokenizer) phase and a `KolorsHeavy` (SDXL U-Net + VAE) phase (`crate::model`): under
@@ -123,17 +133,19 @@ pub fn descriptor() -> ModelDescriptor {
             // DENSE at load, so a `Sequential` + `quantize` load re-quantizes each generate (F-181
             // advisory in `load`).
             supports_sequential_offload: true,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            supports_preview: true,
+            // sc-18317: Kolors' guidance is real classifier-free guidance, and the one convention it
+            // implements is the doubled `[cond, uncond]` batch every assembly in `model.rs` builds.
+            // Declaring the single mode — rather than leaving the domain `Unsupported` — is what makes
+            // a planner able to select it explicitly and makes `sequential` a refusal by name instead
+            // of a silently batched run.
+            execution: mlx_gen::gen_core::ExecutionSurface {
+                cfg_batching: mlx_gen::gen_core::CfgBatchingDomain::Modes(
+                    crate::model::CFG_BATCHING_MODES.to_vec(),
+                ),
+                ..mlx_gen::gen_core::ExecutionSurface::default()
+            },
+            ..Default::default()
         },
     }
 }
@@ -154,6 +166,15 @@ pub struct KolorsGenerator {
     /// Whether an IP-Adapter was requested (`spec.ip_adapter` is a dir). Same rationale as
     /// [`has_control`](Self::has_control).
     has_ip: bool,
+    /// The load-time `OffloadPolicy` verdict, kept as the DEFAULT for a request that names no
+    /// [`GenerationMemory::stage_residency`](mlx_gen::gen_core::GenerationMemory). Rung 1 is
+    /// request-scoped from SC-15521 onward; the policy is no longer the authority.
+    default_stage_residency: bool,
+    /// Whether THIS load can execute ladder rung 4 — see
+    /// [`memory_strategy::streamable`](crate::memory_strategy::streamable).
+    streamable: bool,
+    loaded_spec: LoadSpec,
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
     residency: Residency<KolorsText, KolorsHeavyOwned>,
 }
 
@@ -201,17 +222,37 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                 .into(),
         ));
     }
-    // F-181: Kolors quantizes the U-Net + ChatGLM3 DENSE at load, so a `Sequential` + `quantize` load
-    // re-quantizes each generate (repeated compute; the dense transient shrinks the memory win).
+    // F-181: a `Sequential` + `quantize` load over a **dense** snapshot re-quantizes each generate
+    // (repeated compute; the dense transient shrinks the memory win).
+    //
+    // SC-15521 narrowed the condition. The advisory used to fire on every staged quantized load,
+    // including the three shipped `SceneWorks/kolors-mlx` tiers whose weights are already packed —
+    // where nothing re-quantizes and the message is simply wrong. Staged residency is the ladder's
+    // rung 1 and therefore now the *normal* path, so an advisory that cried wolf on every default
+    // request would have trained readers to ignore it. These are the same predicates rung 4 gates
+    // on, so the warning and the rung cannot disagree about which loads pack at load time.
+    //
+    // **Both components are checked, not just the U-Net.** `load_leaves_blocks_lazy` inspects
+    // `unet/` alone, and a Sequential load re-runs the ENTIRE staged schedule per generate — encoder
+    // included. On a mixed snapshot (packed `unet/`, dense `text_encoder/`) a U-Net-only gate
+    // suppressed the advisory while the 6B ChatGLM3 tower genuinely re-quantized on every request,
+    // which is by far the larger of the two costs on this family.
     if let Some(q) = spec.quantize {
-        if matches!(spec.offload_policy, OffloadPolicy::Sequential) {
+        let repacks_each_generate = !crate::memory_strategy::load_leaves_blocks_lazy(spec)
+            || !crate::memory_strategy::text_encoder_leaves_blocks_lazy(spec);
+        if matches!(spec.offload_policy, OffloadPolicy::Sequential) && repacks_each_generate {
             mlx_gen::residency::warn_sequential_requantize(MODEL_ID, q.bits());
         }
     }
+    let memory_strategy = crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?;
     Ok(Box::new(KolorsGenerator {
         descriptor: descriptor(),
         has_control: spec.control.is_some(),
         has_ip: matches!(&spec.ip_adapter, Some(WeightsSource::Dir(_))),
+        default_stage_residency: crate::memory_strategy::default_stage_residency(spec),
+        streamable: crate::memory_strategy::streamable(spec),
+        loaded_spec: spec.clone(),
+        memory_strategy,
         residency: build_residency(spec)?,
     }))
 }
@@ -249,6 +290,13 @@ pub(crate) fn build_residency(spec: &LoadSpec) -> Result<Residency<KolorsText, K
             // quantizes in `load_heavy_owned`). Deterministic, so byte-identical across residencies.
             if let Some(q) = spec_text.quantize {
                 text.quantize(q.bits())?;
+            }
+            // Ladder rung 4's `TextEncoder` scope (SC-15521) — armed after the quantize, so the
+            // recorded tier is the one the resident blocks carry. Nothing is installed on a
+            // `GlmBlock` at load, so unlike the U-Net there is nothing to capture; see
+            // `crate::block_stream`.
+            if crate::memory_strategy::streamable(&spec_text) {
+                text.arm_block_stream(&root, spec_text.quantize.map(|q| q.bits()))?;
             }
             Ok(text)
         },
@@ -299,6 +347,20 @@ fn load_heavy_owned(
         None => None,
     };
 
+    // Ladder rung 4 (SC-15521) — armed LAST, and that ordering is the whole correctness argument.
+    // Each `Transformer2D`'s stream captures the installed IP-Adapter K/V projections and the
+    // forward-time residual adapters off its FINISHED resident blocks, so the streamed and resident
+    // paths cannot disagree about which state landed where. Arming before the LoRA merge, the
+    // quantize or the IP install would capture an empty state and silently render without the image
+    // prompt (`mlx_gen_sdxl::block_stream` fails loudly on the IP half rather than allowing that).
+    //
+    // `memory_strategy::streamable` is the single authority for whether this load may arm at all: it
+    // refuses an eager load shape, a load-time quantization over a dense snapshot that materializes
+    // the trunk, and an adapter load that merged its delta into weights the snapshot does not carry.
+    if crate::memory_strategy::streamable(spec) {
+        heavy.arm_block_streams(root, spec.quantize.map(|q| q.bits()))?;
+    }
+
     // PiD decoder overlay (epic 7840, sc-7848): load the `sdxl` student + Gemma caption encoder once
     // when the spec carries it AND this generate uses it (Kolors = SDXL VAE latent space).
     let pid = if use_pid {
@@ -318,10 +380,49 @@ fn load_heavy_owned(
     })
 }
 
-mlx_gen::impl_generator!(KolorsGenerator {
-    validate: |s, req| s.validate_impl(req),
-    generate: generate_impl,
-});
+// Written out rather than `mlx_gen::impl_generator!` because Kolors now answers the memory-strategy
+// hooks (SC-15521); the macro covers only `descriptor`/`validate`/`generate`.
+impl Generator for KolorsGenerator {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        self.validate_impl(req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.loaded_spec, &self.memory_strategy, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        crate::memory_strategy::begin_request(
+            self.descriptor.id,
+            &self.loaded_spec,
+            &self.memory_strategy,
+            context,
+        )
+    }
+}
 
 impl KolorsGenerator {
     /// The rich-`Result` body behind [`Generator::validate`]. Kept on the crate's own
@@ -422,7 +523,51 @@ impl KolorsGenerator {
             .unwrap_or(false);
         let use_curated = scheduler_curated || sampler_curated;
 
-        self.residency.run(
+        // ── Ladder request resolution (SC-15521) ────────────────────────────────────────────────
+        // Rung 1 is request-scoped from here on: the load-time `OffloadPolicy` is only the default a
+        // request that names nothing keeps.
+        let stage_residency =
+            crate::memory_strategy::stage_residency(req, self.default_stage_residency);
+        let window = crate::memory_strategy::transformer_window(req)?;
+        let dit_window = window.and_then(|w| w.dit());
+        let text_window = window.and_then(|w| w.text_encoder());
+        // Two fail-closed guards a calibration harness driving `generate` with a hand-built
+        // `GenerationMemory` must still cross — it never went through `safety_check`.
+        if window.is_some() && !self.streamable {
+            return Err(Error::Unsupported(
+                "kolors: bounded transformer residency needs a DeferredMaterialization load over a \
+                 snapshot directory whose U-Net AND ChatGLM3 blocks stay lazy (a pre-quantized tier, or dense with no \
+                 --quantize) and whose adapters (if any) are replayable; this generator cannot \
+                 stream its blocks"
+                    .into(),
+            ));
+        }
+        if window.is_some() && !stage_residency {
+            return Err(Error::Unsupported(
+                "kolors: bounded transformer residency requires staged residency engaged in the \
+                 same request — without the phase release the 6B ChatGLM3 encoder stays resident \
+                 through the denoise and the request peak does not move"
+                    .into(),
+            ));
+        }
+        let decode_tiling =
+            crate::memory_strategy::decode_tiling_for_contract(req, &self.memory_strategy)?;
+        let forward_plan =
+            SdxlForwardPlan::with_attention(crate::memory_strategy::attention_plan(req)?)
+                .with_window(dit_window.map(|size| SdxlBlockWindow {
+                    size,
+                    cancel: &req.cancel,
+                }));
+        // sc-18317: the request's typed CFG batching selection, resolved once for every mode so the
+        // six assemblies cannot disagree. An unset selection resolves to `Batched`, this family's own
+        // pre-story convention, which is what keeps every existing render byte-for-byte identical;
+        // any other mode was already refused by `Capabilities::validate_request` against the
+        // descriptor's declared `execution` surface before we got here.
+        let cfg_batching = crate::model::resolve_cfg_batching(req);
+
+        self.residency.run_request_scoped(
+            stage_residency,
+            false,
             &req.cancel,
             req.use_pid,
             on_progress,
@@ -431,10 +576,20 @@ impl KolorsGenerator {
             // ChatGLM3 encoder before the U-Net/VAE load — bounding peak to `max(ChatGLM3, U-Net+VAE)`.
             // The negative encode is skipped when guidance is off (F-005, sc-9091): the per-mode
             // assemblies build B=1 conditioning for `cfg <= 1.0` and never read the uncond stream.
+            // Ladder rung 4's `TextEncoder` scope (SC-15521) lands HERE, not in the denoise: the
+            // ChatGLM3-6B tower is the largest component in the model, and at the one advertised
+            // cell where the conditioning phase carries the request peak (`bf16` at `min_size`) a
+            // window over these 28 blocks is what moves it. `encode_windowed` is bit-identical to
+            // `encode` — same constructor, same replayed tier — so the negative encode is windowed
+            // too rather than left resident beside a windowed positive.
             |text: &KolorsText| {
-                let pos = text.encode(&req.prompt)?;
+                let encode = |prompt: &str| match text_window {
+                    Some(size) => text.encode_windowed(prompt, size, &req.cancel),
+                    None => text.encode(prompt),
+                };
+                let pos = encode(&req.prompt)?;
                 let neg = if cfg > 1.0 {
-                    Some(text.encode(negative)?)
+                    Some(encode(negative)?)
                 } else {
                     None
                 };
@@ -443,7 +598,10 @@ impl KolorsGenerator {
             // Materialize the (context, pooled) tuples while the encoder is still alive (Sequential
             // only) — MLX is lazy, so un-evaluated outputs keep the 6B encoder referenced and the drop
             // would free nothing.
-            |(pos, neg): &((Array, Array), Option<(Array, Array)>)| {
+            |encoded: Option<&KolorsEncodedConditioning>| {
+                let Some((pos, neg)) = encoded else {
+                    return Ok(());
+                };
                 let mut arrays = vec![&pos.0, &pos.1];
                 if let Some(n) = neg {
                     arrays.push(&n.0);
@@ -625,7 +783,7 @@ impl KolorsGenerator {
                             .clone()
                             .expect("curated_init is Some iff use_curated (computed above)");
 
-                        let latents = heavy.denoise_curated_latents(
+                        let latents = heavy.denoise_curated_latents_with_preview(
                             req.sampler.as_deref(),
                             req.scheduler.as_deref(),
                             init_opt.as_ref(),
@@ -643,6 +801,9 @@ impl KolorsGenerator {
                             run_steps,
                             &req.cancel,
                             on_progress,
+                            &req.preview,
+                            forward_plan,
+                            cfg_batching,
                         )?;
                         let latents = match &vp_plan {
                             Some(p) => {
@@ -651,7 +812,13 @@ impl KolorsGenerator {
                             None => latents,
                         };
                         on_progress(Progress::Decoding);
-                        images.push(decode_image(heavy.vae(), &latents, pid_ref)?);
+                        images.push(decode_image_tiled(
+                            heavy.vae(),
+                            &latents,
+                            pid_ref,
+                            decode_tiling.as_ref(),
+                            Some(&req.cancel),
+                        )?);
                         continue;
                     }
 
@@ -665,7 +832,7 @@ impl KolorsGenerator {
                                 "legacy_pose_init is Some in the non-curated combined-pose mode",
                             );
                             let strength = req.strength.unwrap_or(POSE_IMG2IMG_STRENGTH);
-                            heavy.denoise_controlnet_ip_latents(
+                            heavy.denoise_controlnet_ip_latents_with_preview(
                                 heavy_owned.control.as_ref().expect("validated above"),
                                 tokens,
                                 init_latents,
@@ -683,9 +850,12 @@ impl KolorsGenerator {
                                 run_steps,
                                 &req.cancel,
                                 on_progress,
+                                &req.preview,
+                                forward_plan,
+                                cfg_batching,
                             )?
                         } else if let Some((image, scale)) = control {
-                            heavy.denoise_controlnet_latents(
+                            heavy.denoise_controlnet_latents_with_preview(
                                 heavy_owned.control.as_ref().expect("validated above"),
                                 &noise,
                                 image,
@@ -699,9 +869,12 @@ impl KolorsGenerator {
                                 run_steps,
                                 &req.cancel,
                                 on_progress,
+                                &req.preview,
+                                forward_plan,
+                                cfg_batching,
                             )?
                         } else if let Some((tokens, scale)) = &ip {
-                            heavy.denoise_ip_latents(
+                            heavy.denoise_ip_latents_with_preview(
                                 tokens,
                                 &noise,
                                 &pos,
@@ -714,12 +887,15 @@ impl KolorsGenerator {
                                 run_steps,
                                 &req.cancel,
                                 on_progress,
+                                &req.preview,
+                                forward_plan,
+                                cfg_batching,
                             )?
                         } else if let Some((_image, strength)) = img2img {
                             let x0 = legacy_img2img_init.as_ref().expect(
                                 "legacy_img2img_init is Some in the non-curated img2img mode",
                             );
-                            heavy.denoise_img2img_latents(
+                            heavy.denoise_img2img_latents_with_preview(
                                 x0,
                                 &noise,
                                 &pos,
@@ -732,9 +908,12 @@ impl KolorsGenerator {
                                 run_steps,
                                 &req.cancel,
                                 on_progress,
+                                &req.preview,
+                                forward_plan,
+                                cfg_batching,
                             )?
                         } else {
-                            heavy.denoise_latents(
+                            heavy.denoise_latents_with_preview(
                                 &noise,
                                 &pos,
                                 neg.as_ref(),
@@ -745,6 +924,9 @@ impl KolorsGenerator {
                                 run_steps,
                                 &req.cancel,
                                 on_progress,
+                                &req.preview,
+                                forward_plan,
+                                cfg_batching,
                             )?
                         };
 
@@ -755,7 +937,13 @@ impl KolorsGenerator {
                         None => latents,
                     };
                     on_progress(Progress::Decoding);
-                    images.push(decode_image(heavy.vae(), &latents, pid_ref)?);
+                    images.push(decode_image_tiled(
+                        heavy.vae(),
+                        &latents,
+                        pid_ref,
+                        decode_tiling.as_ref(),
+                        Some(&req.cancel),
+                    )?);
                 }
                 Ok(GenerationOutput::Images(images))
             },
@@ -829,7 +1017,7 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
             )));
         }
     }
-    // Kolors VAE downsamples by 8; non-multiple-of-8 dims would mismatch latent shapes.
+    // The /8 VAE plus two exact U-Net downsample/upsample joins require SIZE_MULTIPLE.
     if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
         return Err(Error::Msg(format!(
             "kolors: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
@@ -841,16 +1029,79 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral
 // `gen_core::Result`.
+//
+/// Per-component bytes for this snapshot — **the decoder projected to its resident width, not its
+/// stored one** (sc-15839).
+///
+/// `text_encoder/` and `unet/` are priced from stored bytes because that is what they cost resident:
+/// the ChatGLM3 tower and the U-Net load at their snapshot precision (fp16, or already-packed q4/q8
+/// codes, which `PerComponentBytes` sums verbatim).
+///
+/// The VAE is different, and the difference is a factor of two. [`mlx_gen_sdxl::load_vae`] does
+/// `cast_all(Dtype::Float32)` **unconditionally** — the SDXL VAE is fp16-unstable, so it runs f32
+/// even when everything around it is fp16 — while every cached Kolors tier ships only
+/// `vae/diffusion_pytorch_model.fp16.safetensors` (159.56 MiB). A stored-bytes footprint therefore
+/// declared 159.56 MiB for a component that is 319.11 MiB resident, at **all three** tiers, and the
+/// worker sizes budgets off these facts. Projecting through the shared
+/// [`projected_safetensors_bytes`](mlx_gen::asset_facts::projected_safetensors_bytes) primitive —
+/// the same one z-image, krea, qwen-image and mage use — keeps that arithmetic out of this file.
+///
+/// The file is resolved by [`mlx_gen_sdxl::resolve_vae_weight_file`] rather than summed over `vae/`,
+/// so the footprint sizes exactly the file the resident load opens even on a snapshot that happens
+/// to cache both the f32 master and the fp16 variant.
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
-    mlx_gen::PerComponentBytes::from_spec_subdirs(spec, &["text_encoder"], &["unet"], &["vae"])
+    let mut components = mlx_gen::PerComponentBytes::from_spec_subdirs(
+        spec,
+        &["text_encoder"],
+        &["unet"],
+        &["vae"],
+    )?;
+    let WeightsSource::Dir(root) = &spec.weights else {
+        // Unreachable: `from_spec_subdirs` already rejected a single-file checkpoint.
+        return Ok(components);
+    };
+    components.vae = projected_vae_bytes(root)?;
+    Ok(components)
+}
+
+/// The VAE's **resident** bytes: every tensor of the file [`mlx_gen_sdxl::load_vae`] opens,
+/// materialized f32.
+pub(crate) fn projected_vae_bytes(root: &std::path::Path) -> mlx_gen::gen_core::Result<u64> {
+    let file = mlx_gen_sdxl::resolve_vae_weight_file(root)
+        .map_err(|e| mlx_gen::gen_core::Error::Msg(format!("kolors: {e}")))?;
+    mlx_gen::asset_facts::projected_safetensors_bytes(&file, |_| {
+        mlx_gen::asset_facts::ResidentProjection::Float32
+    })
 }
 
 mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load;
     footprint = component_footprint
 }
+
+/// The weights-free memory-strategy registration (SC-15521) — the shared registry conformance
+/// suite's entry point into this provider's declaration.
+pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID,
+        contract: |spec| {
+            crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
+        },
+        safety_check: crate::memory_strategy::safety_check,
+    };
+
+/// The weights-free **behavioral** registration: valid fixtures plus a request scope, so the shared
+/// suite can drive every declared rung's lifecycle without loading a 6 GB tier.
+pub const MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(MODEL_ID, spec, contract, context)
+        },
+    };
 
 #[cfg(test)]
 mod tests {
@@ -865,6 +1116,7 @@ mod tests {
         assert_eq!(d.modality, Modality::Image);
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supports_negative_prompt);
+        assert!(d.capabilities.supports_preview);
         assert!(
             d.capabilities.supports_lora,
             "Kolors LoRA is wired (sc-4733)"
@@ -877,20 +1129,7 @@ mod tests {
     #[test]
     fn registered_in_family_catalog() {
         // The family catalog resolves "kolors" and reaches the loader without real weights.
-        let spec = LoadSpec {
-            weights: WeightsSource::Dir("/nonexistent/kolors".into()),
-            quantize: None,
-            precision: mlx_gen::Precision::Bf16,
-            control: None,
-            ip_adapter: None,
-            adapters: Vec::new(),
-            extra_controls: Vec::new(),
-            pid: None,
-            identity: None,
-            text_encoder: None,
-            offload_policy: Default::default(),
-            components: Default::default(),
-        };
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/kolors".into()));
         let err = match crate::provider_registry().unwrap().load("kolors", &spec) {
             Ok(_) => panic!("bogus weights dir must fail to load"),
             Err(e) => e.to_string(),
@@ -903,10 +1142,11 @@ mod tests {
 
     #[test]
     fn validate_rejects_bad_steps() {
-        // `steps == 0` would divide by zero in the sampler — now rejected by the shared floor (F-007,
-        // message "steps must be >= 1"). `steps > NUM_TRAIN_TIMESTEPS` collapses every timestep to 1 —
-        // still Kolors' own upper-bound check (F-124). Both must be rejected; `None` and an in-range
-        // count pass.
+        // `steps == 0` would divide by zero in the sampler — rejected by the shared floor (F-007,
+        // message "steps must be >= 1"). `steps > NUM_TRAIN_TIMESTEPS` collapses every timestep to
+        // 1 — also the shared floor now, from the advertised range (sc-19559), which is derived
+        // from the same `NUM_TRAIN_TIMESTEPS` Kolors' own F-124 check uses. Both must be rejected;
+        // `None` and an in-range count pass.
         let caps = descriptor().capabilities;
         let base = GenerationRequest {
             prompt: "a fox".into(),
@@ -921,13 +1161,24 @@ mod tests {
         };
         let err = validate_request(&caps, &zero).unwrap_err().to_string();
         assert!(err.contains("steps must be >= 1"), "steps=0 got: {err}");
-        // steps > NUM_TRAIN_TIMESTEPS is rejected by Kolors' upper-bound check.
+        // steps > NUM_TRAIN_TIMESTEPS is now rejected by the SHARED floor, from the range this
+        // descriptor advertises (sc-19559) — the same constant Kolors' own check below uses, so
+        // the two cannot disagree. Asserting the shared message rather than the provider's is the
+        // point: the bound moved onto the advertised surface, where a consumer can read it.
         let over = GenerationRequest {
             steps: Some(NUM_TRAIN_TIMESTEPS as u32 + 1),
             ..base.clone()
         };
         let err = validate_request(&caps, &over).unwrap_err().to_string();
-        assert!(err.contains("steps must be in"), "over-max got: {err}");
+        // Asserted by the SHARED guard's own unique wording, not by `1..=1100`: BOTH messages
+        // contain that substring (`kolors: steps must be in 1..=1100 (got 1101)` is the provider's),
+        // so the short form would not say which one fired — and which one fires is the whole claim.
+        assert!(
+            err.contains(&format!(
+                "is outside this model's supported range 1..={NUM_TRAIN_TIMESTEPS}"
+            )),
+            "over-max must be refused by the SHARED range guard, got: {err}"
+        );
         for ok in [None, Some(1), Some(50), Some(NUM_TRAIN_TIMESTEPS as u32)] {
             let req = GenerationRequest {
                 steps: ok,
@@ -937,12 +1188,50 @@ mod tests {
         }
     }
 
+    /// Kolors' own F-124 over-max branch is **shadowed, not dead** — and this proves it still works.
+    ///
+    /// `validate_rejects_bad_steps` above shows the shared range guard now fires first for a real
+    /// `descriptor()`, which leaves the provider's `steps must be in 1..=N` branch unreachable from
+    /// that path and its wording asserted nowhere. Deleting it would be wrong: it is the backstop
+    /// for a descriptor whose advertised range regressed to `Unconstrained`, which is a one-line
+    /// edit away. `validate_request` takes `caps` by argument, so that exact regression is
+    /// constructible — and under it the request must STILL be refused, by Kolors' own message.
+    #[test]
+    fn the_provider_over_max_branch_still_refuses_when_the_advertised_range_regresses() {
+        let unadvertised = Capabilities {
+            supported_steps: StepSupport::Unconstrained,
+            ..descriptor().capabilities
+        };
+        let over = GenerationRequest {
+            prompt: "a fox".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(NUM_TRAIN_TIMESTEPS as u32 + 1),
+            ..Default::default()
+        };
+        let err = validate_request(&unadvertised, &over)
+            .expect_err("an over-max step count must be refused even with no advertised range")
+            .to_string();
+        assert!(
+            err.contains(&format!(
+                "kolors: steps must be in 1..={NUM_TRAIN_TIMESTEPS}"
+            )),
+            "the PROVIDER's F-124 branch must be what refuses this: {err}"
+        );
+        // And it must not over-reach: the same unadvertised caps still admit the boundary count.
+        let at_max = GenerationRequest {
+            steps: Some(NUM_TRAIN_TIMESTEPS as u32),
+            ..over.clone()
+        };
+        assert!(validate_request(&unadvertised, &at_max).is_ok());
+    }
+
     #[test]
     fn validate_ties_size_multiple_to_pinned_stride() {
         // sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised Kolors
-        // bucket to. Pin the value and mutation-check that a size which is a multiple of 4 but not
-        // SIZE_MULTIPLE (8) is still rejected with the stride error, and an on-stride size passes.
-        assert_eq!(SIZE_MULTIPLE, 8);
+        // bucket to. Pin the value and mutation-check that a VAE-valid size which is not the full
+        // U-Net multiple is rejected with the stride error, and an on-stride size passes.
+        assert_eq!(SIZE_MULTIPLE, 32);
         let caps = descriptor().capabilities;
         let base = GenerationRequest {
             prompt: "a fox".into(),
@@ -952,20 +1241,20 @@ mod tests {
         let off_stride = validate_request(
             &caps,
             &GenerationRequest {
-                width: 1020, // 255×4 — a multiple of 4 but not SIZE_MULTIPLE
+                width: 1000, // 125×8 — VAE-valid but not SIZE_MULTIPLE
                 ..base.clone()
             },
         )
         .unwrap_err()
         .to_string();
         assert!(
-            off_stride.contains("multiples of 8"),
+            off_stride.contains("multiples of 32"),
             "expected the stride error, got: {off_stride}"
         );
         assert!(validate_request(
             &caps,
             &GenerationRequest {
-                width: 1024, // 128×8 — on-stride
+                width: 1024, // 32×32 — on-stride
                 ..base.clone()
             },
         )
@@ -981,6 +1270,87 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("num_steps must be >= 1"), "got: {err}");
+    }
+
+    /// **sc-18317 — the declared CFG-batching domain is reachable, and the two domains this lane has
+    /// no mechanism for are refused.**
+    ///
+    /// The production `validate` delegates the shared contract to `Capabilities::validate_request`
+    /// (asserted separately), so admitting/refusing here is admitting/refusing on the `generate` path.
+    /// `Batched` is admitted because `model::cfg_conditioning` genuinely consumes it; `Sequential` is refused because the
+    /// ChatGLM3 assembly and the shared SDXL denoise runs guidance as one batch; and the cadence / FFN-chunk domains are refused because this
+    /// family has no such mechanism at all — the truthful state, not an oversight.
+    #[test]
+    fn execution_domains_are_declared_exactly_where_this_lane_consumes_them() {
+        let caps = descriptor().capabilities;
+        assert!(caps.execution.declaration_errors().is_empty());
+        assert!(caps.execution.cfg_batching.is_supported());
+        assert!(!caps.execution.graph_eval_cadence_blocks.is_supported());
+        assert!(!caps.execution.ffn_chunk_rows.is_supported());
+
+        let request = |memory| mlx_gen::gen_core::GenerationRequest {
+            prompt: "a fox".into(),
+            width: 1024,
+            height: 1024,
+            count: 1,
+            steps: Some(1),
+            memory: Some(memory),
+            ..Default::default()
+        };
+
+        caps.validate_request(
+            "kolors",
+            &request(mlx_gen::gen_core::GenerationMemory {
+                cfg_batching: Some(mlx_gen::gen_core::CfgBatching::Batched),
+                ..Default::default()
+            }),
+        )
+        .expect("the implemented mode must be admitted");
+
+        for (label, memory) in [
+            (
+                "cfg_batching",
+                mlx_gen::gen_core::GenerationMemory {
+                    cfg_batching: Some(mlx_gen::gen_core::CfgBatching::Sequential),
+                    ..Default::default()
+                },
+            ),
+            (
+                "graph_eval_cadence",
+                mlx_gen::gen_core::GenerationMemory {
+                    graph_eval_cadence: Some(mlx_gen::gen_core::GraphEvalCadence::EVERY_BLOCK),
+                    ..Default::default()
+                },
+            ),
+            (
+                "ffn_chunk",
+                mlx_gen::gen_core::GenerationMemory {
+                    ffn_chunk: Some(mlx_gen::gen_core::FfnChunk::new(2048).unwrap()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let error = caps
+                .validate_request("kolors", &request(memory))
+                .expect_err("an unimplemented execution selection must be refused");
+            assert!(
+                matches!(error, mlx_gen::gen_core::Error::Unsupported(_)),
+                "{label} must be a capability gap: {error:?}"
+            );
+            let message = error.to_string();
+            assert!(message.contains(label), "{label}: {message}");
+            assert!(
+                message.contains("unset"),
+                "{label} refusal must name the remedy: {message}"
+            );
+        }
+
+        // And an unset selection still validates — the default-preservation half.
+        caps.validate_request(
+            "kolors",
+            &request(mlx_gen::gen_core::GenerationMemory::default()),
+        )
+        .expect("an unset execution selection must validate");
     }
 
     #[test]

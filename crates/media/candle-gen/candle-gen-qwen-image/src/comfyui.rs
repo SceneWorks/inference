@@ -55,29 +55,34 @@ const COMFY_DIT_PREFIX: &str = "model.diffusion_model.";
 ///    `F8_E4M3`; the cast is a straight `to_dtype` with **no** scale companion (candle's CPU backend
 ///    upcasts `F8_E4M3 → bf16` directly). Integer buffers (if any) pass through unchanged.
 ///
-/// Errors if **no** tensor carries the `model.diffusion_model.` prefix — a file whose keys we cannot
-/// place is a wrong-file / wrong-family signal, surfaced rather than loaded as an empty transformer
-/// (no silent fallback). A checkpoint that mixes prefixed and bare keys keeps the bare ones as-is (the
-/// transformer's `VarBuilder` reads only the keys it needs); the guard only trips when *nothing*
-/// matched.
+/// Every tensor must carry the `model.diffusion_model.` prefix and map one-to-one onto a non-empty
+/// destination key. Foreign/bare keys and destination collisions fail closed rather than relying on
+/// `VarBuilder` to ignore an incomplete or mixed-family surface.
 pub fn remap_and_cast_comfyui_dit(
     src: HashMap<String, Tensor>,
     dtype: DType,
 ) -> Result<HashMap<String, Tensor>> {
     let mut out = HashMap::with_capacity(src.len());
-    let mut stripped = 0usize;
     for (key, tensor) in src {
-        let new_key = match key.strip_prefix(COMFY_DIT_PREFIX) {
-            Some(rest) => {
-                stripped += 1;
-                rest.to_string()
-            }
-            None => key,
+        let Some(rest) = key.strip_prefix(COMFY_DIT_PREFIX) else {
+            return Err(CandleError::Msg(format!(
+                "qwen-image ComfyUI DiT remap: tensor {key:?} is outside the required {COMFY_DIT_PREFIX:?} namespace"
+            )));
         };
+        if rest.is_empty() {
+            return Err(CandleError::Msg(
+                "qwen-image ComfyUI DiT remap: a source tensor maps to an empty key".into(),
+            ));
+        }
+        let new_key = rest.to_string();
         let tensor = cast_weight(&new_key, tensor, dtype)?;
-        out.insert(new_key, tensor);
+        if out.insert(new_key.clone(), tensor).is_some() {
+            return Err(CandleError::Msg(format!(
+                "qwen-image ComfyUI DiT remap: more than one source tensor maps to {new_key:?}"
+            )));
+        }
     }
-    if stripped == 0 {
+    if out.is_empty() {
         return Err(CandleError::Msg(format!(
             "qwen-image ComfyUI DiT remap: no {COMFY_DIT_PREFIX:?}-prefixed tensors found — not a \
              ComfyUI Qwen-Image DiT (wrong file/family?)"
@@ -153,17 +158,17 @@ mod tests {
     }
 
     #[test]
-    fn passes_bare_diffusers_keys_when_some_prefixed() {
-        // A checkpoint that carries a stray already-bare key alongside prefixed ones keeps the bare one.
+    fn rejects_bare_diffusers_keys_even_when_some_are_prefixed() {
         let mut src = HashMap::new();
         src.insert(
             "model.diffusion_model.img_in.weight".to_string(),
             t(DType::F8E4M3),
         );
         src.insert("txt_norm.weight".to_string(), t(DType::BF16));
-        let out = remap_and_cast_comfyui_dit(src, DType::BF16).unwrap();
-        assert!(out.contains_key("img_in.weight"));
-        assert!(out.contains_key("txt_norm.weight"));
+        let error = remap_and_cast_comfyui_dit(src, DType::BF16)
+            .expect_err("mixed namespaces must fail closed")
+            .to_string();
+        assert!(error.contains("outside the required"), "got: {error}");
     }
 
     #[test]

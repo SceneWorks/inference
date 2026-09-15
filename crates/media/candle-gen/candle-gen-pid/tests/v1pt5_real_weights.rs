@@ -8,7 +8,7 @@
 //! ```text
 //! PID_V1PT5_CKPT=/path/pid_flux_2kto4k_v1pt5.safetensors \
 //! PID_V1PT5_REF_DUMP=/path/ref_v1pt5_flux_forward.safetensors \
-//!   cargo test -p candle-gen-pid --test v1pt5_real_weights -- --ignored --nocapture
+//!   cargo test -p candle-gen-pid --test integration v1pt5_real_weights:: -- --ignored --nocapture
 //! ```
 
 use candle_gen::candle_core::{DType, Device, Tensor};

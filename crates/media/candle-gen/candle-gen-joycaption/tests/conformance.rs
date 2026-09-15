@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! set JOYCAPTION_SNAPSHOT=C:\Users\…\models--fancyfeast--llama-joycaption-beta-one-hf-llava\snapshots\<hash>
-//! cargo test -p candle-gen-joycaption --features cuda --release --test conformance -- --ignored
+//! cargo test -p candle-gen-joycaption --features cuda --release --test integration -- conformance:: --ignored
 //! ```
 #![cfg(feature = "cuda")]
 

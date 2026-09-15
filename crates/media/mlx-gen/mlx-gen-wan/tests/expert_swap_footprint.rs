@@ -23,7 +23,7 @@
 //! ```text
 //! WAN_A14B_MODEL_DIR=/path/to/models--SceneWorks--wan2.2-t2v-a14b-mlx/snapshots/<hash>/q8 \
 //! WAN_I2V_MODEL_DIR=/path/to/models--SceneWorks--wan2.2-i2v-a14b-mlx/snapshots/<hash>/q4 \
-//!   cargo test -p mlx-gen-wan --test expert_swap_footprint -- --ignored --nocapture
+//!   cargo test -p mlx-gen-wan --test integration expert_swap_footprint:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

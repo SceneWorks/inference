@@ -1,0 +1,193 @@
+{
+  "_provenance": {
+    "source_repo": "Lightricks/LTX-2.5",
+    "path": "vae/ltx-2.5-video-vae-bf16.safetensors",
+    "captured": "2026-08-18",
+    "authenticated_as": "SceneWorks (HF_HOME=/Volumes/Models/huggingface)",
+    "method": "Two HTTP Range requests per file against https://huggingface.co/Lightricks/LTX-2.5/resolve/main/<path>, Authorization: Bearer <SceneWorks token>: bytes=0-7 for the little-endian u64 safetensors header length, then bytes=8-{8+len-1} for the JSON header itself. Zero tensor payload bytes fetched for any file.",
+    "story": "sc-18756"
+  },
+  "total_size_bytes": 1472223346,
+  "header_len_bytes": 81544,
+  "tensor_count": 396,
+  "dtypes": [
+    "BF16"
+  ],
+  "metadata": {
+    "model_version": "2.5.0",
+    "config": {
+      "vae": {
+        "_class_name": "CausalDiffusionVAE",
+        "dims": 3,
+        "encoder": {
+          "_class_name": "Encoder",
+          "dims": 3,
+          "in_channels": 3,
+          "out_channels": 128,
+          "blocks": [
+            [
+              "res_x",
+              {
+                "num_layers": 4
+              }
+            ],
+            [
+              "compress_space_res",
+              {
+                "multiplier": 2
+              }
+            ],
+            [
+              "res_x",
+              {
+                "num_layers": 6
+              }
+            ],
+            [
+              "compress_time_res",
+              {
+                "multiplier": 2
+              }
+            ],
+            [
+              "res_x",
+              {
+                "num_layers": 4
+              }
+            ],
+            [
+              "compress_all_res",
+              {
+                "multiplier": 2
+              }
+            ],
+            [
+              "res_x",
+              {
+                "num_layers": 2
+              }
+            ],
+            [
+              "compress_all_res",
+              {
+                "multiplier": 1
+              }
+            ],
+            [
+              "res_x",
+              {
+                "num_layers": 2
+              }
+            ]
+          ],
+          "patch_size": 4,
+          "latent_log_var": "constant",
+          "latent_log_var_value": -7.824046010856292,
+          "norm_layer": "pixel_norm",
+          "base_channels": 128,
+          "spatial_padding_mode": "zeros"
+        },
+        "decoder": {
+          "_class_name": "NADiffusionDecoder",
+          "in_channels": 128,
+          "out_channels": 3,
+          "patch_size": 4,
+          "head_dim": 64,
+          "stage_channels": [
+            2048,
+            1024,
+            512,
+            512,
+            256
+          ],
+          "stage_depths": [
+            4,
+            6,
+            4,
+            2,
+            8
+          ],
+          "stage_kernels": [
+            [
+              3,
+              7,
+              7
+            ],
+            [
+              3,
+              7,
+              7
+            ],
+            [
+              3,
+              5,
+              5
+            ],
+            [
+              3,
+              5,
+              5
+            ],
+            [
+              11,
+              11,
+              11
+            ]
+          ],
+          "upsamples": [
+            [
+              [
+                1,
+                2,
+                2
+              ],
+              2
+            ],
+            [
+              [
+                2,
+                1,
+                1
+              ],
+              2
+            ],
+            [
+              [
+                2,
+                2,
+                2
+              ],
+              1
+            ],
+            [
+              [
+                2,
+                2,
+                2
+              ],
+              2
+            ]
+          ],
+          "spatial_padding_mode": "zeros",
+          "resampler_kind": "linear",
+          "stage5_kernel": [
+            11,
+            11,
+            11
+          ],
+          "timestep_scale_multiplier": 1000.0,
+          "default_num_inference_steps": 1
+        },
+        "model_output_type": "x0",
+        "spatial_padding_mode": "zeros"
+      }
+    },
+    "license": {
+      "_omitted": true,
+      "reason": "LTX-2.x Community License Agreement body, embedded verbatim in the upstream file's __metadata__. Excluded per the story's instruction to record __metadata__ 'minus the embedded license body'.",
+      "char_length": 34561,
+      "license_date": "August 11, 2026",
+      "canonical_text": "https://github.com/Lightricks/LTX-2/blob/main/LICENSE.md"
+    }
+  }
+}

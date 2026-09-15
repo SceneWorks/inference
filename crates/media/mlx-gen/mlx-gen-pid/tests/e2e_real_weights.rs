@@ -8,7 +8,7 @@
 //!
 //! ```sh
 //! PID_QWEN_SAFETENSORS=tools/golden/pid/qwenimage_2kto4k.safetensors \
-//!   cargo test -p mlx-gen-pid --release --test e2e_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-pid --release --test integration e2e_real_weights:: -- --ignored --nocapture
 //! ```
 
 use mlx_gen::weights::Weights;

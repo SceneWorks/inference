@@ -5,7 +5,7 @@
 //!
 //!   REF_PNG=~/.../anya_sq.png OUT_PNG=/tmp/imgcfg/s2.png FLUX2_IMG_GUIDANCE=2.0 \
 //!   PROMPT="a candid photo of a woman hiking on a rocky mountain trail at golden hour, red windbreaker" \
-//!   cargo test -p mlx-gen-flux2 --test img_guidance_spike -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux2 --test integration img_guidance_spike:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 

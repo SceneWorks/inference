@@ -15,7 +15,7 @@
 //! ```sh
 //! KREA_TURBO_DIR=/path/to/krea-2-turbo-mlx/snapshots/<rev>[/q8] \
 //! KREA_BYPASS_FILE=/path/to/krea2filterbypass3.safetensors \
-//!   cargo test -p mlx-gen-krea --release --test projector_bypass_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-krea --release --test integration projector_bypass_real_weights:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

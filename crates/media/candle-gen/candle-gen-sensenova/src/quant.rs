@@ -129,8 +129,13 @@ mod tests {
     /// `tag` names the file; it must be unique per call site (the crate has no `tempfile` dep, and
     /// adding one for three tests is not worth a new dependency). Scoped by pid so concurrent runs
     /// of the suite cannot collide.
-    fn vb_over(tag: &str, tensors: HashMap<String, Tensor>, dtype: DType) -> VarBuilder<'static> {
-        let dir = std::env::temp_dir().join(format!("sensenova-quant-{}", std::process::id()));
+    fn vb_over(
+        tmp: &tempfile::TempDir,
+        tag: &str,
+        tensors: HashMap<String, Tensor>,
+        dtype: DType,
+    ) -> VarBuilder<'static> {
+        let dir = tmp.path().join("sensenova-quant");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("{tag}.safetensors"));
         candle_gen::candle_core::safetensors::save(&tensors, &path).unwrap();
@@ -168,6 +173,7 @@ mod tests {
     /// is a stronger and cheaper gate than a cosine check on a real render.
     #[test]
     fn bf16_store_with_f32_compute_is_bit_identical_to_an_f32_store() {
+        let tmp = tempfile::tempdir().unwrap();
         let (out_dim, in_dim) = (16usize, 32usize);
         // A bf16 ON-DISK weight, exactly like the shipped checkpoint.
         let w = Tensor::from_vec(
@@ -191,8 +197,8 @@ mod tests {
         )
         .unwrap();
 
-        let narrow = vb_over("levera-narrow", tensors.clone(), DType::BF16);
-        let wide = vb_over("levera-wide", tensors, DType::F32);
+        let narrow = vb_over(&tmp, "levera-narrow", tensors.clone(), DType::BF16);
+        let wide = vb_over(&tmp, "levera-wide", tensors, DType::F32);
 
         let bf16_store = detect_linear(&narrow, "proj", false).unwrap();
         let f32_store = detect_linear(&wide, "proj", false).unwrap();
@@ -224,6 +230,7 @@ mod tests {
     /// garbage rather than fail — hence asserting the ARM, not just the output.
     #[test]
     fn detect_linear_takes_the_packed_arm_only_when_scales_are_present() {
+        let tmp = tempfile::tempdir().unwrap();
         let (out_dim, in_dim) = (8usize, PACKED_GROUP_SIZE);
         let dev = Device::Cpu;
         let groups = in_dim / PACKED_GROUP_SIZE;
@@ -250,7 +257,7 @@ mod tests {
         ]);
         // The VarBuilder is at the STORE dtype (bf16), as production is — the packed arm must still
         // read the u32 codes at their native dtype rather than reinterpreting the packed nibbles.
-        let vb = vb_over("packed-arm", packed, DType::BF16);
+        let vb = vb_over(&tmp, "packed-arm", packed, DType::BF16);
         let lin = detect_linear(&vb, "proj", false).unwrap();
         assert!(lin.is_quantized(), "a `.scales` sibling must load packed");
         // It reproduces the affine grid it encodes: every code here is `i % 16` at scale 0.0625,
@@ -269,7 +276,7 @@ mod tests {
             "proj.weight".to_owned(),
             Tensor::ones((out_dim, in_dim), DType::BF16, &dev).unwrap(),
         )]);
-        let vb = vb_over("dense-arm", dense, DType::BF16);
+        let vb = vb_over(&tmp, "dense-arm", dense, DType::BF16);
         assert!(!detect_linear(&vb, "proj", false).unwrap().is_quantized());
     }
 
@@ -405,7 +412,9 @@ mod tests {
     /// against an f32 hidden state is a dtype error.
     #[test]
     fn get_f32_widens_dense_leaves_under_a_bf16_store() {
+        let tmp = tempfile::tempdir().unwrap();
         let vb = vb_over(
+            &tmp,
             "leaf-widen",
             HashMap::from([(
                 "norm.weight".to_owned(),

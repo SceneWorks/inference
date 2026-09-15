@@ -163,9 +163,8 @@ fn write_peft_adapter(
     path
 }
 
-fn tmp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("sc14057-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+fn tmp_dir(tmp: &tempfile::TempDir, tag: &str) -> PathBuf {
+    let dir = tmp.path().join(format!("sc14057-{tag}"));
     dir
 }
 
@@ -181,6 +180,7 @@ fn tmp_dir(tag: &str) -> PathBuf {
 /// that strands the stream. Folding them into one function keeps that to a single arc.
 #[test]
 fn the_dit_exposes_its_whole_linear_surface_to_community_adapters() {
+    let tmp = tempfile::tempdir().unwrap();
     let (mut t, base) = model();
     let cfg = config(&fixture());
 
@@ -225,7 +225,7 @@ fn the_dit_exposes_its_whole_linear_surface_to_community_adapters() {
     // `["norm_out", ..] | ["proj_out", ..]` routing and `apply_mage_adapters` errors instead
     // ("adapter target(s) matched no module"), which is the pre-sc-14057 behaviour.
     let before = probe(&t, &cfg);
-    let dir = tmp_dir("adapters");
+    let dir = tmp_dir(&tmp, "adapters");
     let head_only = write_peft_adapter(&dir, "head.safetensors", &base, &COMMUNITY_ONLY_TARGETS);
     let report = apply_mage_adapters(
         &mut t,

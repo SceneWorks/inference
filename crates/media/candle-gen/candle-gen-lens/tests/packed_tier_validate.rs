@@ -19,7 +19,7 @@
 //! ```text
 //! set LENS_PACKED_Q4=D:\.cache\huggingface\hub\models--SceneWorks--lens-turbo-mlx\snapshots\<hash>\q4
 //! set LENS_PACKED_Q8=...\q8    (optional)
-//! cargo test -p candle-gen-lens --features cuda --release --test packed_tier_validate -- --ignored --nocapture
+//! cargo test -p candle-gen-lens --features cuda --release --test integration packed_tier_validate:: -- --ignored --nocapture
 //! ```
 #![cfg(feature = "cuda")]
 

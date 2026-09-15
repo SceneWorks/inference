@@ -24,7 +24,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
-use candle_gen::train::lora::{reconstruct_lokr_delta, reconstruct_lora_delta};
+use candle_gen::train::lora::{
+    parse_lokr_metadata, reconstruct_lokr_delta, reconstruct_lora_delta,
+};
 use candle_gen::train::merge::{
     merge_into, no_target_matched, read_adapter, read_scalar, AdapterFile, LoraTriple, MergeReport,
     Role,
@@ -154,16 +156,10 @@ fn merge_lokr_file(
     routed: &mut Vec<String>,
     unrouted: &mut Vec<String>,
 ) -> Result<()> {
-    let rank = af
-        .meta
-        .get("rank")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(1.0);
-    let alpha = af
-        .meta
-        .get("alpha")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(rank);
+    let (rank, alpha) = parse_lokr_metadata(
+        af.meta.get("rank").map(String::as_str),
+        af.meta.get("alpha").map(String::as_str),
+    )?;
 
     let mut grouped: BTreeMap<String, BTreeMap<&'static str, Tensor>> = BTreeMap::new();
     for (key, t) in &af.tensors {
@@ -362,16 +358,10 @@ fn resolve_lokr_file(
     pending: &mut BTreeMap<String, Vec<PendingLokr>>,
     skipped_keys: &mut usize,
 ) -> Result<()> {
-    let rank = af
-        .meta
-        .get("rank")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(1.0);
-    let alpha = af
-        .meta
-        .get("alpha")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(rank);
+    let (rank, alpha) = parse_lokr_metadata(
+        af.meta.get("rank").map(String::as_str),
+        af.meta.get("alpha").map(String::as_str),
+    )?;
     // FULL effective scale — mirrors `reconstruct_lokr_delta`'s `(alpha/rank)·scale`, but baked into the
     // structured factors rather than split across a delta (alpha/rank) + an Adapter scale (strength).
     let full = (alpha as f64 / rank as f64) * scale as f64;
@@ -522,7 +512,8 @@ pub fn install_anima_residuals(
                         report.skipped_keys += 1; // shape-mismatched factor for this projection
                         continue;
                     }
-                    lin.push_lora(p.a.to_device(device)?, p.b.to_device(device)?, p.scale);
+                    lin.push_lora(p.a.to_device(device)?, p.b.to_device(device)?, p.scale)
+                        .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
                     report.merged += 1;
                 }
             }
@@ -543,7 +534,10 @@ pub fn install_anima_residuals(
                         p.w2_b.as_ref(),
                     )? {
                         Some(f) => {
-                            lin.push_lokr_structured(f.to_device(device)?);
+                            lin.push_lokr_structured(f.to_device(device)?)
+                                .map_err(|error| {
+                                    candle_gen::candle_core::Error::Msg(error.to_string())
+                                })?;
                             report.merged += 1;
                         }
                         None => {
@@ -668,9 +662,8 @@ mod tests {
     #[test]
     fn lora_fold_is_base_plus_ba_for_all_three_target_classes() {
         let (out, inp, rank) = (8usize, 6usize, 2usize);
-        let dir = std::env::temp_dir().join(format!("anima_lora_fold_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let targets = [
             "blocks.0.self_attn.q_proj",
             "blocks.0.adaln_modulation_self_attn.1",
@@ -709,7 +702,6 @@ mod tests {
                 "{p}: merged != base + B·A (max abs diff {diff})"
             );
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Strict routing: a target whose base key is absent (a DiT-only base missing the `llm_adapter.*`
@@ -717,9 +709,8 @@ mod tests {
     #[test]
     fn unrouted_target_is_a_hard_error() {
         let (out, inp, rank) = (8usize, 6usize, 2usize);
-        let dir = std::env::temp_dir().join(format!("anima_lora_unrouted_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let lora_path = write_lora(
             &dir,
             &[
@@ -743,7 +734,6 @@ mod tests {
             err.to_string().contains("did not route"),
             "expected an unrouted-target error, got: {err}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A synthesized LoKr (no official Anima LoKr exists) loads + applies: `δ = kron(w1, w2)` folded
@@ -751,9 +741,8 @@ mod tests {
     #[test]
     fn synthesized_lokr_loads_and_stacks_with_lora() {
         let dev = Device::Cpu;
-        let dir = std::env::temp_dir().join(format!("anima_lokr_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let path_target = "blocks.0.self_attn.q_proj";
 
         // A full-factor LoKr: w1 [2,3], w2 [4,2] ⇒ kron = [8,6]. No metadata ⇒ rank = alpha = 1 (the
@@ -812,7 +801,6 @@ mod tests {
             added > 0.0,
             "stacked LoRA delta must add on top of the LoKr, not replace it"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `is_lokr` fires on `lokr_` factor keys and a declared `Lokr` kind (→ structured residual path);
@@ -820,9 +808,8 @@ mod tests {
     /// path). The three kinds are routed disjointly in `install_anima_residuals` (sc-10713).
     #[test]
     fn is_lokr_and_is_loha_route_the_three_adapter_kinds() {
-        let dir = std::env::temp_dir().join(format!("anima_islokr_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
 
         // A LoKr file (`lokr_` keys) → `is_lokr` true even when the spec kind is Lora (keys win); not LoHa.
         let mut lm = HashMap::new();
@@ -863,8 +850,6 @@ mod tests {
             is_lokr(&lora_af, AdapterKind::Lokr),
             "declared Lokr kind ⇒ is_lokr"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `resolve_lokr_file` groups a file's per-module factors and bakes the FULL `(alpha/rank)·strength`
@@ -905,9 +890,8 @@ mod tests {
     #[test]
     fn resolve_lora_file_factors_are_transposed_and_alpha_scaled() {
         let (out, inp, rank) = (8usize, 6usize, 2usize);
-        let dir = std::env::temp_dir().join(format!("anima_resolve_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let path = "blocks.0.self_attn.q_proj";
         let lora_path = write_lora(&dir, &[path], out, inp, rank);
         let af = read_adapter(&lora_path).unwrap();
@@ -974,7 +958,5 @@ mod tests {
             d2 < 1e-6,
             "b must equal upᵀ·(alpha/rank=2.0), max diff {d2}"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

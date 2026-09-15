@@ -20,7 +20,7 @@
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, Error, Quant, Result};
+use mlx_gen::{CancelFlag, Error, Quant, Result, WeightsSource};
 
 use crate::config::GptOssConfig;
 use crate::text_encoder::gpt_oss::{attention_mask, GptOssDecoderLayer};
@@ -45,6 +45,10 @@ pub struct LensTextEncoder {
     dtype: Dtype,
     /// `is_sliding` mapping is config-driven; kept for the per-layer mask choice.
     cfg: GptOssConfig,
+    /// Rung 4's Sequential-only, re-openable layer source. A streamable encoder deliberately owns no
+    /// resident layers; [`Self::encode`] dispatches through this source so an unscoped call cannot
+    /// silently return the bare token embedding.
+    stream: Option<super::stream::TextEncoderBlockStream>,
 }
 
 impl LensTextEncoder {
@@ -82,28 +86,7 @@ impl LensTextEncoder {
         selected_layers: Vec<usize>,
         quant: Option<Quant>,
     ) -> Result<Self> {
-        // Reachable from `Result`-returning public APIs, so error rather than panic the worker on a
-        // bad capture-index list (F-014).
-        let max_layer = *selected_layers
-            .iter()
-            .max()
-            .ok_or_else(|| Error::Msg("lens encoder: selected_layers must be non-empty".into()))?;
-        if max_layer >= cfg.num_layers {
-            return Err(Error::Msg(format!(
-                "lens encoder: selected layer {max_layer} out of range (model has {} layers)",
-                cfg.num_layers
-            )));
-        }
-        // Duplicates leave a capture slot unfilled in `encode` (`position` matches only the first
-        // occurrence), which would later panic on the `expect("every selected layer captured")`.
-        // Reject them here so a bad list is a typed error, not a mid-encode panic.
-        for (j, &layer) in selected_layers.iter().enumerate() {
-            if selected_layers[..j].contains(&layer) {
-                return Err(Error::Msg(format!(
-                    "lens encoder: selected_layers must be unique (layer {layer} repeated)"
-                )));
-            }
-        }
+        let max_layer = validate_selected_layers(cfg, &selected_layers)?;
 
         let embed_tokens = w.require("model.embed_tokens.weight")?.as_dtype(dtype)?;
         // Source is dropped from the map as each component is built (sc-11030) — the load transient
@@ -134,7 +117,50 @@ impl LensTextEncoder {
             sliding_window: cfg.sliding_window,
             dtype,
             cfg: *cfg,
+            stream: None,
         })
+    }
+
+    /// Build the Sequential-only rung-4 form: keep the token embedding resident and leave the
+    /// decoder stack in a re-openable source, materializing it through the shared block-window driver
+    /// during [`Self::encode_windowed`]. `quant` is replayed for every materialized layer so dense,
+    /// load-time Q4/Q8, and packed-turnkey paths use the same constructor as the resident encoder.
+    pub fn from_streamable_source(
+        mut w: Weights,
+        source: WeightsSource,
+        cfg: &GptOssConfig,
+        dtype: Dtype,
+        selected_layers: Vec<usize>,
+        quant: Option<Quant>,
+    ) -> Result<Self> {
+        validate_selected_layers(cfg, &selected_layers)?;
+        let embed_tokens = w.require("model.embed_tokens.weight")?.as_dtype(dtype)?;
+        // The view owns a refcounted handle to every tensor it returned. Drain the embedding handle
+        // before dropping the otherwise-lazy view; the layer views use the same load-bearing rule.
+        w.remove_accessed();
+        let (inv_freq, attn_scaling) = cfg.yarn_rope();
+        Ok(Self {
+            embed_tokens,
+            layers: Vec::new(),
+            inv_freq: Array::from_slice(&inv_freq, &[inv_freq.len() as i32]),
+            attn_scaling,
+            selected_layers: selected_layers.clone(),
+            sliding_window: cfg.sliding_window,
+            dtype,
+            cfg: *cfg,
+            stream: Some(super::stream::TextEncoderBlockStream::new(
+                source,
+                *cfg,
+                dtype,
+                selected_layers,
+                quant,
+            )),
+        })
+    }
+
+    /// Whether this encoder can execute rung 4's text-encoder component scope.
+    pub fn is_streamable(&self) -> bool {
+        self.stream.is_some()
     }
 
     /// The capture indices, in DiT order.
@@ -158,6 +184,18 @@ impl LensTextEncoder {
     /// materialized state and a cancel is honored within one layer's compute rather than the whole
     /// encode. The eval is skipped entirely when `cancel` is `None` (the graph stays lazy).
     pub fn encode(&self, input_ids: &Array, cancel: Option<&CancelFlag>) -> Result<Vec<Array>> {
+        // The streamable form intentionally has no resident layers. One full-width window preserves
+        // ordinary unscoped behavior and closes the empty-stack hazard: returning the embedding here
+        // would produce plausible images that silently ignore the prompt.
+        if self.layers.is_empty() {
+            if let Some(stream) = self.stream.as_ref() {
+                return self.encode_windowed(
+                    input_ids,
+                    stream.n_blocks(),
+                    cancel.unwrap_or(&CancelFlag::default()),
+                );
+            }
+        }
         let l = input_ids.shape()[1];
 
         // Both per-layer masks, built once for the sequence (full causal + sliding-window causal).
@@ -194,4 +232,59 @@ impl LensTextEncoder {
             .map(|c| c.expect("every selected layer captured"))
             .collect())
     }
+
+    /// Encode through the shared rung-4 block-window driver. Errors when the encoder has no
+    /// re-openable source rather than silently running the resident stack under a selected strategy.
+    pub fn encode_windowed(
+        &self,
+        input_ids: &Array,
+        window: usize,
+        cancel: &CancelFlag,
+    ) -> Result<Vec<Array>> {
+        let stream = self.stream.as_ref().ok_or_else(|| {
+            Error::Msg(
+                "lens: the rung-4 text-encoder scope needs a Sequential loader with a re-openable \
+                 snapshot source"
+                    .to_owned(),
+            )
+        })?;
+        let l = input_ids.shape()[1];
+        let full_mask = attention_mask(l, None, self.dtype)?;
+        let sliding_mask = attention_mask(l, Some(self.sliding_window), self.dtype)?;
+        let hidden = self.embed_tokens.take_axis(input_ids, 0)?;
+        let plan = mlx_gen::block_residency::BlockPlan::new(stream.n_blocks(), window)?;
+        super::stream::run_windowed_layers(
+            stream,
+            &plan,
+            cancel,
+            hidden,
+            &self.inv_freq,
+            self.attn_scaling,
+            &full_mask,
+            &sliding_mask,
+        )
+    }
+}
+
+fn validate_selected_layers(cfg: &GptOssConfig, selected_layers: &[usize]) -> Result<usize> {
+    // Reachable from `Result`-returning public APIs, so error rather than panic the worker on a bad
+    // capture list. Duplicates would otherwise leave a capture slot unfilled at the end of encode.
+    let max_layer = *selected_layers
+        .iter()
+        .max()
+        .ok_or_else(|| Error::Msg("lens encoder: selected_layers must be non-empty".into()))?;
+    if max_layer >= cfg.num_layers {
+        return Err(Error::Msg(format!(
+            "lens encoder: selected layer {max_layer} out of range (model has {} layers)",
+            cfg.num_layers
+        )));
+    }
+    for (j, &layer) in selected_layers.iter().enumerate() {
+        if selected_layers[..j].contains(&layer) {
+            return Err(Error::Msg(format!(
+                "lens encoder: selected_layers must be unique (layer {layer} repeated)"
+            )));
+        }
+    }
+    Ok(max_layer)
 }

@@ -92,6 +92,7 @@ pub mod adapters;
 pub mod config;
 pub mod convert;
 pub mod dit;
+pub mod memory_strategy;
 pub mod pipeline;
 pub(crate) mod quant;
 pub mod reasoner;
@@ -115,6 +116,30 @@ pub fn register_providers(
     registry
         .register_generator(registry::TURBO_REGISTRATION)
         .register_generator(registry::BASE_REGISTRATION)
+        .register_memory_strategy(registry::TURBO_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: registry::MODEL_ID_TURBO,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(
+                    registry::MODEL_ID_TURBO,
+                    spec,
+                )
+            },
+        })
+        .register_memory_behavior(registry::TURBO_MEMORY_BEHAVIOR)
+        .register_memory_strategy(registry::BASE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: registry::MODEL_ID_BASE,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(
+                    registry::MODEL_ID_BASE,
+                    spec,
+                )
+            },
+        })
+        .register_memory_behavior(registry::BASE_MEMORY_BEHAVIOR)
         .register_trainer(training::TRAINER_REGISTRATION)
 }
 
@@ -139,5 +164,31 @@ mod explicit_registry_tests {
 
         assert_eq!(explicit_generators, ["lens_turbo", "lens"]);
         assert_eq!(explicit_trainers, ["lens"]);
+        let preview_ids: Vec<_> = registry
+            .generators()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                descriptor
+                    .capabilities
+                    .supports_preview
+                    .then_some(descriptor.id)
+            })
+            .collect();
+        assert_eq!(
+            preview_ids, explicit_generators,
+            "every and only Lens route previews"
+        );
+
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(std::path::PathBuf::from(
+            "/nonexistent/sc15800-contract-fixture",
+        )))
+        .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+        .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
+        for id in ["lens_turbo", "lens"] {
+            assert!(registry
+                .memory_strategy_contract(id, &spec)
+                .unwrap()
+                .is_some());
+        }
     }
 }

@@ -12,7 +12,7 @@
 //! (net + gemma) runs separately so the two large weight sets never coexist. `#[ignore]`d.
 //!
 //! ```sh
-//! cargo test -p mlx-gen-qwen-image --release --test dump_runb_latents -- --ignored --nocapture
+//! cargo test -p mlx-gen-qwen-image --release --test integration dump_runb_latents:: -- --ignored --nocapture
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -32,7 +32,7 @@ const GUID: f32 = 4.0;
 const SEED: u64 = 0;
 
 fn snapshot() -> PathBuf {
-    let p = std::env::var("QWEN_IMAGE_SNAPSHOT").unwrap_or_else(|_| panic!("set QWEN_IMAGE_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    let p = std::env::var("MLX_GEN_QWEN_SNAPSHOT").unwrap_or_else(|_| panic!("set MLX_GEN_QWEN_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
     PathBuf::from(p)
 }
 
@@ -50,6 +50,14 @@ fn dump_runb_latents() {
     let sigmas = qwen_scheduler(STEPS, W, H).sigmas; // length STEPS+1, trailing 0.0
     let cancel = CancelFlag::default();
     let out_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../tools/golden/pid");
+    // `tools/golden/` is gitignored except README.md and CHECKSUMS.txt, so a fresh checkout has no
+    // `pid/` subdirectory and `save_safetensors` below fails with a bare "Failed to open file".
+    // This test never created it and only ever worked where an earlier PiD run had — which is why
+    // it passed locally for years and failed the first time CI ran it (sc-17284, run 30959809619:
+    // 1618 s of rendering discarded at the final write). Created HERE, before the denoise loop, so
+    // a bad path costs milliseconds instead of half an hour; `pid_decode_real_weights.rs` in both
+    // crates does the same thing at its own write site, which is why those lanes were unaffected.
+    std::fs::create_dir_all(out_dir).unwrap_or_else(|e| panic!("create {out_dir}: {e}"));
 
     // Segmented flow-match Euler: capturing x_t after step K == running the schedule slice
     // sigmas[cur..=K] from the current latent (deterministic ODE — no per-step noise), so the four
@@ -70,6 +78,7 @@ fn dump_runb_latents() {
             H,
             0,
             &cancel,
+            &mlx_gen::PreviewSink::default(),
             &mut |_| {},
         )
         .unwrap();

@@ -65,6 +65,7 @@ pub(crate) mod quant;
 
 // --- NR-MMDiT (sc-14040) -------------------------------------------------------------------
 pub mod attention;
+pub(crate) mod block_stream;
 pub mod feed_forward;
 pub mod final_layer;
 pub mod rope_embedder;
@@ -131,6 +132,16 @@ pub use training::{MageFlowTrainer, MODEL_ID as TRAINER_MODEL_ID};
 // `training` (LoRA + base fine-tune, sc-14055/sc-14056). They are not stubbed here because their
 // shape is decided by those stories, not by this one.
 
+/// sc-16209 Apple-Silicon warm sweep: Mage Flow bf16 peaked below 1.57 GiB at 1024².
+/// A two-step control set the published high-water mark.
+pub const ACTIVATION_MEMORY_REGISTRATION: mlx_gen::gen_core::ActivationMemoryRegistration =
+    mlx_gen::gen_core::ActivationMemoryRegistration {
+        provider_id: "mage_flow",
+        anchor: mlx_gen::ActivationMemoryAnchor {
+            bytes_1024: 1_685_774_664,
+        },
+    };
+
 /// Add every Mage-Flow MLX provider to an explicit media registry builder.
 ///
 pub fn register_providers(
@@ -138,11 +149,117 @@ pub fn register_providers(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::REGISTRATION)
+        .register_activation_memory(ACTIVATION_MEMORY_REGISTRATION)
         .register_generator(model::REGISTRATION_BASE)
+        .register_checkpoint_adapter(mlx_gen::gen_core::CheckpointAdapterRegistration {
+            backend_bindings: &[mlx_gen::gen_core::CheckpointBackendBindingRegistration {
+                backend: mlx_gen::gen_core::CheckpointBackend::Mlx,
+                source: mlx_gen::gen_core::ImportedModelSource::TransformerDirectory,
+                operation: mlx_gen::gen_core::ImportedModelOperation::Generate,
+                provider_id: "mage_flow_base",
+                required_components: Some(model::REQUIRED_COMPONENTS),
+                inherit_adapters: false,
+            }],
+            ..mlx_gen::gen_core::MAGE_FLOW_CHECKPOINT_ADAPTER
+        })
         .register_generator(model::REGISTRATION_TURBO)
         .register_generator(model::REGISTRATION_EDIT)
         .register_generator(model::REGISTRATION_EDIT_BASE)
         .register_generator(model::REGISTRATION_EDIT_TURBO)
+        .register_memory_strategy(model::MEMORY_REGISTRATION)
+        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: "mage_flow",
+            contract: |spec| model::weights_free_memory_strategy_contract("mage_flow", spec),
+        })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: "mage_flow",
+                contract: |surface| {
+                    model::weights_free_memory_surface_contract("mage_flow", surface)
+                },
+            },
+        )
+        .register_memory_strategy(model::MEMORY_REGISTRATION_BASE)
+        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION_BASE)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: "mage_flow_base",
+            contract: |spec| model::weights_free_memory_strategy_contract("mage_flow_base", spec),
+        })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: "mage_flow_base",
+                contract: |surface| {
+                    model::weights_free_memory_surface_contract("mage_flow_base", surface)
+                },
+            },
+        )
+        .register_memory_strategy(model::MEMORY_REGISTRATION_TURBO)
+        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION_TURBO)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: "mage_flow_turbo",
+            contract: |spec| model::weights_free_memory_strategy_contract("mage_flow_turbo", spec),
+        })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: "mage_flow_turbo",
+                contract: |surface| {
+                    model::weights_free_memory_surface_contract("mage_flow_turbo", surface)
+                },
+            },
+        )
+        .register_memory_strategy(model::MEMORY_REGISTRATION_EDIT)
+        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION_EDIT)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: "mage_flow_edit",
+            contract: |spec| model::weights_free_memory_strategy_contract("mage_flow_edit", spec),
+        })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: "mage_flow_edit",
+                contract: |surface| {
+                    model::weights_free_memory_surface_contract("mage_flow_edit", surface)
+                },
+            },
+        )
+        .register_memory_strategy(model::MEMORY_REGISTRATION_EDIT_BASE)
+        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION_EDIT_BASE)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: "mage_flow_edit_base",
+            contract: |spec| {
+                model::weights_free_memory_strategy_contract("mage_flow_edit_base", spec)
+            },
+        })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: "mage_flow_edit_base",
+                contract: |surface| {
+                    model::weights_free_memory_surface_contract("mage_flow_edit_base", surface)
+                },
+            },
+        )
+        .register_memory_strategy(model::MEMORY_REGISTRATION_EDIT_TURBO)
+        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION_EDIT_TURBO)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: "mage_flow_edit_turbo",
+            contract: |spec| {
+                model::weights_free_memory_strategy_contract("mage_flow_edit_turbo", spec)
+            },
+        })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: "mage_flow_edit_turbo",
+                contract: |surface| {
+                    model::weights_free_memory_surface_contract("mage_flow_edit_turbo", surface)
+                },
+            },
+        )
         // The rectified-flow LoRA/LoKr trainer targets the Base checkpoint (sc-14055).
         .register_trainer(training::REGISTRATION)
 }
@@ -154,10 +271,32 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::Provi
 
 #[cfg(test)]
 mod explicit_registry_tests {
+    fn write_minimal_safetensors(path: &std::path::Path) {
+        let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend([0_u8; 2]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn snapshot(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+        let root = tmp.path().join("mage-registry");
+        for component in ["text_encoder", "transformer", "vae"] {
+            let dir = root.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            write_minimal_safetensors(&dir.join("model.safetensors"));
+        }
+        root
+    }
+
     use super::*;
 
     #[test]
     fn explicit_catalog_has_stable_surface() {
+        let tmp = tempfile::tempdir().unwrap();
         let registry = provider_registry().unwrap();
         let generators: Vec<String> = registry
             .generators()
@@ -185,6 +324,28 @@ mod explicit_registry_tests {
             registry.descriptor_conformance_errors(),
             Vec::<String>::new()
         );
+        let root = snapshot(&tmp);
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(root.clone()));
+        for id in MODEL_IDS {
+            assert!(registry
+                .memory_strategy_contract(id, &spec)
+                .unwrap()
+                .is_some());
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn every_optimized_mage_route_registers_a_weights_free_behavior_seam() {
+        let registry = provider_registry().unwrap();
+        let mut ids = registry
+            .memory_behavior_registrations()
+            .map(|registration| registration.provider_id)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        let mut expected = MODEL_IDS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(ids, expected);
     }
 
     /// Every id is prefixed with the family id, matching the image-family convention
@@ -197,5 +358,38 @@ mod explicit_registry_tests {
                 "{id} does not carry the '{FAMILY}' family prefix"
             );
         }
+    }
+
+    #[test]
+    fn imported_transformer_directory_route_executes_the_finetuned_loader() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("config.json"), b"{}").unwrap();
+        write_minimal_safetensors(&root.path().join("diffusion_pytorch_model.safetensors"));
+        let registry = provider_registry().unwrap();
+        let descriptor = registry
+            .imported_model_descriptor(
+                "mage-flow",
+                mlx_gen::gen_core::ImportedModelSource::TransformerDirectory,
+                mlx_gen::gen_core::ImportedModelOperation::Generate,
+            )
+            .expect("exact Mage fine-tune route");
+        assert_eq!(descriptor.id, "mage_flow_base");
+        assert_eq!(descriptor.required_components, model::REQUIRED_COMPONENTS);
+        assert!(!descriptor.capabilities.supports_lora);
+        assert!(!descriptor.capabilities.supports_lokr);
+
+        let error = registry
+            .load(
+                descriptor.id,
+                &mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(root.path().to_path_buf())),
+            )
+            .err()
+            .expect("unstaged fine-tune must fail at its component gate")
+            .to_string();
+        assert!(
+            error.contains(model::COMPONENT_TEXT_ENCODER),
+            "the selected registry loader must enter the fine-tune component gate, got: {error}"
+        );
+        assert!(!error.contains("checkpoint fingerprint"), "{error}");
     }
 }

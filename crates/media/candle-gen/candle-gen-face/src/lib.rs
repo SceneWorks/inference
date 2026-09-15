@@ -45,6 +45,15 @@ const ARCFACE_FILE: &str = "arcface_iresnet100.safetensors";
 /// with the MLX `convert_bisenet.py` output).
 const BISENET_FILE: &str = "bisenet_parsing.safetensors";
 
+/// The exact checkpoints [`load_on`] materializes, relative to its `dir`, so a consumer pricing the
+/// stack for a memory contract charges the two files that actually load rather than whatever else
+/// the shared layout dir happens to hold (`bisenet_parsing.safetensors` loads only through
+/// [`load_with_parser_on`], and only for the routes that call it).
+///
+/// Both load through this crate's `Weights::from_file`, which coerces every tensor to `f32` — so a
+/// contract prices them at 4 bytes per float element, never at their stored width.
+pub const ANALYSIS_STACK_FILES: [&str; 2] = [SCRFD_FILE, ARCFACE_FILE];
+
 /// The candle face embedder: a thin `gen_core::FaceEmbedder` adapter over [`FaceAnalysis`].
 pub struct CandleFaceAnalysis {
     inner: FaceAnalysis,

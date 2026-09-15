@@ -4,7 +4,7 @@
 //! extraction), reused byte-for-byte. Validates the mask selection + the `for_gen` integration
 //! end-to-end. CPU, f32.
 
-mod common;
+use crate::common;
 
 use common::{errors, flat_f32, Golden};
 

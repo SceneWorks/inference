@@ -254,8 +254,8 @@ mod tests {
     #[test]
     fn from_dir_rejects_duplicate_tensor_names_across_files() {
         let dev = Device::Cpu;
-        let dir = std::env::temp_dir().join(format!("sc12513_duplicate_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
 
         let mut first = HashMap::new();
         first.insert(
@@ -286,8 +286,6 @@ mod tests {
             message.contains("model-00002-of-00002.safetensors"),
             "must name the offending file: {message}"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// **Packed-detect fires on the ideogram key layout WITHOUT a config block (sc-9412).** The real
@@ -310,7 +308,8 @@ mod tests {
         map.insert("layers.0.attention.qkv.biases".into(), b);
         map.insert("layers.0.attention.norm_q.weight".into(), dense_w);
 
-        let dir = std::env::temp_dir().join(format!("sc9412_detect_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         write_component(&dir, map, None); // NO config.json — real ideogram tier
         let w = Weights::from_dir(&dir, &dev, DType::F32)?;
         assert!(
@@ -332,7 +331,6 @@ mod tests {
         let cos = tensor_cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "group-64 packed vs grid cosine {cos:.6}");
 
-        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 
@@ -351,12 +349,12 @@ mod tests {
             "input_proj.bias".into(),
             Tensor::zeros((out_dim,), DType::F32, &dev)?,
         );
-        let dir = std::env::temp_dir().join(format!("sc9412_dense_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         write_component(&dir, map, None);
 
         let w = Weights::from_dir(&dir, &dev, DType::F32)?;
         assert!(!linear_detect(&w, "input_proj", true)?.is_packed());
-        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 
@@ -376,7 +374,8 @@ mod tests {
         map.insert("input_proj.scales".into(), s);
         map.insert("input_proj.biases".into(), b);
         map.insert("input_proj.bias".into(), dbias.clone());
-        let dir = std::env::temp_dir().join(format!("sc9412_bias_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         write_component(&dir, map, None);
         let w = Weights::from_dir(&dir, &dev, DType::F32)?;
 
@@ -389,7 +388,6 @@ mod tests {
             cos > 0.99999,
             "packed+bias vs dense-grid+bias cosine {cos:.6}"
         );
-        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 }

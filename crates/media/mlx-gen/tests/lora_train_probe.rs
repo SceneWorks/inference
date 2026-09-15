@@ -11,7 +11,7 @@
 //! collapses. GREEN here = the autograd + AdamW + grad-clip mechanism is sound; the spike can build
 //! the real Z-Image trainer on it.
 //!
-//!   cargo test -p mlx-gen --test lora_train_probe -- --nocapture
+//!   cargo test -p mlx-gen --test integration lora_train_probe:: -- --nocapture
 
 use std::collections::HashMap;
 use std::rc::Rc;

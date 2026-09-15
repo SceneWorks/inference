@@ -53,6 +53,7 @@ pub mod registry;
 pub mod request;
 pub mod schedule;
 pub mod speculative;
+pub mod starvector;
 pub mod stop;
 pub mod template;
 pub mod text_llm;
@@ -62,10 +63,12 @@ pub mod tool;
 
 pub use cancel::CancelFlag;
 pub use capabilities::{TextLlmCapabilities, TextLlmDescriptor};
-pub use constraint::{Constraint, ConstraintDecodeTable, JsonConstraint, JsonState};
+pub use constraint::{
+    Constraint, ConstraintDecodeTable, ConstraintKind, JsonConstraint, JsonState,
+};
 pub use detok::IncrementalDetok;
 pub use error::{Error, Result};
-pub use message::{Content, ImageRef, Message, Role, VideoRef};
+pub use message::{AudioRef, Content, ImageRef, Message, Role, VideoRef};
 pub use output::{Channel, FinishReason, StreamEvent, TextLlmOutput, Usage};
 pub use paging::BlockAllocator;
 pub use prefix::{InsertOutcome, PrefixId, PrefixIndex, PrefixMatch};
@@ -79,6 +82,12 @@ pub use registry::{
 pub use request::{LoadSpec, Quantize, Sampling, TextLlmRequest, ThinkingMode};
 pub use schedule::{Scheduler, SeqId, SeqSpec};
 pub use speculative::{accept_greedy_run, accept_token, ngram_propose, Acceptance};
+pub use starvector::{
+    DecoderArchitecture, ImagePreprocessing, ProjectionMetadata, StarVectorBoundedStream,
+    StarVectorDescriptor, StarVectorFinishReason, StarVectorOutput, StarVectorProvider,
+    StarVectorRequest, StarVectorStreamEvent, StarVectorStreamStatus, StarVectorTier,
+    VisionEncoderArchitecture,
+};
 pub use stop::{StopChunk, StopMatcher};
 pub use template::{
     ChatMlTemplate, ChatTemplate, JinjaChatTemplate, Llama3Template, RenderOptions,

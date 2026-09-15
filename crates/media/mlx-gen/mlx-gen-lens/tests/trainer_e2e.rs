@@ -2,7 +2,7 @@
 //! `microsoft/Lens` DiT), driven through the explicit provider registry.
 //!
 //! `#[ignore]`d — needs the real `SceneWorks/Lens` weights in the HF cache (or `LENS_SNAPSHOT`). Run:
-//!   cargo test -p mlx-gen-lens --release --test trainer_e2e -- --ignored --nocapture
+//!   cargo test -p mlx-gen-lens --release --test integration trainer_e2e:: -- --ignored --nocapture
 //!
 //! Proves the full prepare→load→cache→train→save lifecycle: a tiny captioned PNG dataset is
 //! VAE/caption-encoded and cached, AdamW training drives the flow-match loss down, and a PEFT adapter
@@ -46,6 +46,7 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
             image_path: path,
             caption: format!("a solid colour swatch number {i}"),
             control_image_path: None,
+            model_options: Default::default(),
         });
     }
     items
@@ -128,7 +129,8 @@ fn windowed_means(losses: &[f32]) -> (f32, f32) {
 #[ignore = "needs real microsoft/Lens weights (~20B gpt-oss encoder; loads Q8)"]
 fn lens_trainer_trains_and_writes_lora() {
     let root = snapshot();
-    let tmp = std::env::temp_dir().join("lens_trainer_lora_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
 
     assert_eq!(mlx_gen_lens::registry::MODEL_ID_BASE, "lens");
@@ -241,7 +243,8 @@ fn lens_trainer_trains_with_gradient_checkpointing() {
     // `checkpointed_grads_match_dense`), the run must train, converge, and round-trip exactly like the
     // dense LoRA run. This is the integration proof of the `train_impl` plumbing + the produced adapter.
     let root = snapshot();
-    let tmp = std::env::temp_dir().join("lens_trainer_ckpt_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
 
     let mut trainer = mlx_gen_lens::provider_registry()
@@ -326,7 +329,8 @@ fn lens_trainer_trains_with_gradient_checkpointing() {
 #[ignore = "needs real microsoft/Lens weights (~20B gpt-oss encoder; loads Q8)"]
 fn lens_trainer_trains_and_reloads_lokr() {
     let root = snapshot();
-    let tmp = std::env::temp_dir().join("lens_trainer_lokr_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
     assert_eq!(mlx_gen_lens::registry::MODEL_ID_BASE, "lens");
 
@@ -430,12 +434,13 @@ fn lens_trainer_trains_and_reloads_lokr() {
 
 /// sc-5637 — preview samples. Proves the Lens render path (install in-progress adapter → norm-rescaled
 /// CFG flow-match denoise → Flux.2 VAE decode → `Image`) on real weights. Run:
-///   cargo test -p mlx-gen-lens --release --test trainer_e2e -- --ignored --nocapture lens_trainer_emits_preview_samples
+///   cargo test -p mlx-gen-lens --release --test integration -- --ignored --nocapture trainer_e2e::lens_trainer_emits_preview_samples
 #[test]
 #[ignore = "needs real microsoft/Lens weights (~20B gpt-oss encoder; loads Q8)"]
 fn lens_trainer_emits_preview_samples() {
     let root = snapshot();
-    let tmp = std::env::temp_dir().join("lens_trainer_samples_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
     assert_eq!(mlx_gen_lens::registry::MODEL_ID_BASE, "lens");
     let mut trainer = mlx_gen_lens::provider_registry()

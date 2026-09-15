@@ -34,25 +34,35 @@ pub struct VisionConfig {
     pub window_size: i32,
     pub fullatt_block_indexes: Vec<i32>,
     pub rope_theta: f32,
+    pub norm_eps: f32,
 }
 
 impl VisionConfig {
     /// The Qwen-Image-Edit-2511 `vision_config` (depth 32, embed 1280, 16 heads × 80,
     /// mlp_ratio 2.671875 → 3420, out 3584, window 112, full-attn at `[7,15,23,31]`).
     pub fn qwen_image_edit() -> Self {
+        let contract = crate::VISION_ENCODER_CONTRACT;
         Self {
-            patch_size: 14,
-            temporal_patch_size: 2,
-            in_channels: 3,
-            embed_dim: 1280,
-            depth: 32,
-            num_heads: 16,
-            mlp_hidden: 3420,
-            out_hidden_size: 3584,
-            spatial_merge_size: 2,
-            window_size: 112,
-            fullatt_block_indexes: vec![7, 15, 23, 31],
-            rope_theta: 10000.0,
+            patch_size: contract.patch_size as i32,
+            temporal_patch_size: contract.temporal_patch_size as i32,
+            in_channels: contract.in_channels as i32,
+            embed_dim: contract.hidden_size as i32,
+            depth: contract.num_hidden_layers as i32,
+            num_heads: contract.num_attention_heads as i32,
+            mlp_hidden: contract.intermediate_size as i32,
+            out_hidden_size: contract.output_width as i32,
+            spatial_merge_size: contract.spatial_merge_size as i32,
+            window_size: contract
+                .window_size
+                .expect("Qwen2.5-VL contract requires windowed attention")
+                as i32,
+            fullatt_block_indexes: contract
+                .full_attention_block_indexes
+                .iter()
+                .map(|&index| index as i32)
+                .collect(),
+            rope_theta: contract.rope_theta.get() as f32,
+            norm_eps: contract.normalization_eps.get() as f32,
         }
     }
 
@@ -96,6 +106,7 @@ impl VisionTransformer {
                     &join(prefix, &format!("blocks.{i}")),
                     cfg.num_heads,
                     head_dim,
+                    cfg.norm_eps,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -104,6 +115,7 @@ impl VisionTransformer {
             &join(prefix, "merger"),
             cfg.embed_dim,
             cfg.spatial_merge_size,
+            cfg.norm_eps,
         )?;
         Ok(Self {
             patch_embed,
@@ -231,5 +243,16 @@ impl VisionTransformer {
             caps.push(("final", out.clone()));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn runtime_config_consumes_the_provider_behavior_contract() {
+        let config = super::VisionConfig::qwen_image_edit();
+        let contract = crate::VISION_ENCODER_CONTRACT;
+        assert_eq!(config.rope_theta, contract.rope_theta.get() as f32);
+        assert_eq!(config.norm_eps, contract.normalization_eps.get() as f32);
     }
 }

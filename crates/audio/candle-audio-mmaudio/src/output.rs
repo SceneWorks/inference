@@ -18,7 +18,7 @@
 use std::path::{Path, PathBuf};
 
 use candle_audio::candle_core::{DType, Device, Result as CResult, Tensor};
-use candle_audio::gen_core::{WeightLicense, WeightLicenseEntry, WeightsSource};
+use candle_audio::gen_core::{ComponentLicense, WeightsSource};
 use candle_audio::{AudioError, Result};
 use candle_nn::VarBuilder;
 
@@ -95,126 +95,85 @@ pub const FMAX_44K: f32 = 22_050.0;
 
 // ---- Weight licenses (sc-13332) ---------------------------------------------------------------
 
-/// Non-commercial restriction note shared by both 16k checkpoints (MMAudio releases every HF
-/// checkpoint under CC-BY-NC-4.0).
-const NC_RESTRICTION: &str = "Non-commercial only: MMAudio releases all ext_weights checkpoints \
-    under CC-BY-NC-4.0 (see the MMAudio README). Additionally the pretrained models were trained on \
-    AudioSet/VGGSound/Freesound/AudioCaps/WavCaps, whose dataset terms a downstream user must honor; \
-    MMAudio states it does not guarantee suitability for commercial use.";
+/// Component key for the pinned 16k mel-VAE checkpoint (`v1-16.pth`).
+pub const VAE_COMPONENT_KEY: &str = "mmaudio_vae_16k";
 
-/// License of the pinned 16k mel-VAE checkpoint (`v1-16.pth`).
-///
-/// **CC-BY-NC-4.0** — verified against MMAudio's README (the checkpoints are released on Hugging
-/// Face under CC-BY-NC-4.0). The VAE *architecture* originates from Make-An-Audio 2 (ByteDance, MIT
-/// code) and its EDM2 magnitude-preserving primitives derive from NVIDIA's EDM2 code
-/// (CC-BY-NC-SA-4.0); the distributed **weights** are governed by MMAudio's non-commercial
-/// checkpoint license. SceneWorks is non-commercial, so the weights are usable, but the restriction
-/// MUST be surfaced.
-pub const VAE_WEIGHT_LICENSE: WeightLicense = WeightLicense {
-    spdx_id: "CC-BY-NC-4.0",
-    name: "Creative Commons Attribution-NonCommercial 4.0 International",
+/// The schema-3 licence row for the pinned 16k mel-VAE checkpoint (`v1-16.pth`). `declared` was read from the `hkchengrex/MMAudio` model
+/// card on `retrieved`; the architecture credits in the attribution are provenance, not terms.
+pub const VAE_COMPONENT_LICENSE: ComponentLicense = ComponentLicense {
+    component: VAE_COMPONENT_KEY,
     source_url: "https://huggingface.co/hkchengrex/MMAudio",
+    gated: false,
+    declared: "cc-by-nc-4.0",
+    family: "cc-by-nc-4-0",
     attribution: Some(
         "MMAudio 16k mel-VAE (v1-16.pth) © Sony Research Inc. — released under CC-BY-NC-4.0; VAE \
          architecture from Make-An-Audio 2 (ByteDance, MIT); EDM2 magnitude-preserving primitives \
          © NVIDIA (CC-BY-NC-SA-4.0)",
     ),
-    commercial_use: false,
-    restriction: Some(NC_RESTRICTION),
+    retrieved: "2026-08-02",
 };
 
-/// License of the pinned 16k BigVGAN checkpoint (`best_netG.pt`).
-///
-/// **CC-BY-NC-4.0** — verified against MMAudio's README (checkpoints released under CC-BY-NC-4.0).
-/// This is the Make-An-Audio 2 16k BigVGAN; the BigVGAN *code* is NVIDIA MIT (adapted from HiFi-GAN,
-/// MIT), but the distributed **weights** are governed by MMAudio's non-commercial checkpoint
-/// license. Usable for the non-commercial product with the restriction surfaced.
-pub const BIGVGAN_WEIGHT_LICENSE: WeightLicense = WeightLicense {
-    spdx_id: "CC-BY-NC-4.0",
-    name: "Creative Commons Attribution-NonCommercial 4.0 International",
+/// Component key for the pinned 16k BigVGAN checkpoint (`best_netG.pt`).
+pub const BIGVGAN_COMPONENT_KEY: &str = "mmaudio_bigvgan_16k";
+
+/// The schema-3 licence row for the pinned 16k BigVGAN checkpoint (`best_netG.pt`). `declared` was read from the `hkchengrex/MMAudio` model
+/// card on `retrieved`; the architecture credits in the attribution are provenance, not terms.
+pub const BIGVGAN_COMPONENT_LICENSE: ComponentLicense = ComponentLicense {
+    component: BIGVGAN_COMPONENT_KEY,
     source_url: "https://huggingface.co/hkchengrex/MMAudio",
+    gated: false,
+    declared: "cc-by-nc-4.0",
+    family: "cc-by-nc-4-0",
     attribution: Some(
         "MMAudio 16k BigVGAN (best_netG.pt) © Sony Research Inc. — released under CC-BY-NC-4.0; 16k \
          BigVGAN pretrained model from Make-An-Audio 2 (ByteDance, MIT); BigVGAN code © NVIDIA \
          (MIT), adapted from HiFi-GAN (MIT)",
     ),
-    commercial_use: false,
-    restriction: Some(NC_RESTRICTION),
+    retrieved: "2026-08-02",
 };
 
-/// Weight-license entry for the 16k mel-VAE (keyed by [`VAE_MODEL_ID`]).
-pub const VAE_WEIGHT_LICENSE_ENTRY: WeightLicenseEntry = WeightLicenseEntry {
-    provider_id: VAE_MODEL_ID,
-    component: None,
-    license: VAE_WEIGHT_LICENSE,
-};
+/// Component key for the pinned 44k mel-VAE checkpoint (`v1-44.pth`).
+pub const VAE_COMPONENT_KEY_44K: &str = "mmaudio_vae_44k";
 
-/// Weight-license entry for the 16k BigVGAN (keyed by [`BIGVGAN_MODEL_ID`]).
-pub const BIGVGAN_WEIGHT_LICENSE_ENTRY: WeightLicenseEntry = WeightLicenseEntry {
-    provider_id: BIGVGAN_MODEL_ID,
-    component: None,
-    license: BIGVGAN_WEIGHT_LICENSE,
-};
-
-/// License of the pinned 44k mel-VAE checkpoint (`v1-44.pth`).
-///
-/// **CC-BY-NC-4.0** — the same MMAudio checkpoint license as the 16k VAE (all MMAudio HF
-/// `ext_weights` checkpoints are CC-BY-NC-4.0). The VAE architecture originates from Make-An-Audio 2
-/// (ByteDance, MIT code) with EDM2 magnitude-preserving primitives (NVIDIA, CC-BY-NC-SA-4.0); the
-/// distributed **weights** are governed by MMAudio's non-commercial checkpoint license.
-pub const VAE_WEIGHT_LICENSE_44K: WeightLicense = WeightLicense {
-    spdx_id: "CC-BY-NC-4.0",
-    name: "Creative Commons Attribution-NonCommercial 4.0 International",
+/// The schema-3 licence row for the pinned 44k mel-VAE checkpoint (`v1-44.pth`). `declared` was read from the `hkchengrex/MMAudio` model
+/// card on `retrieved`; the architecture credits in the attribution are provenance, not terms.
+pub const VAE_COMPONENT_LICENSE_44K: ComponentLicense = ComponentLicense {
+    component: VAE_COMPONENT_KEY_44K,
     source_url: "https://huggingface.co/hkchengrex/MMAudio",
+    gated: false,
+    declared: "cc-by-nc-4.0",
+    family: "cc-by-nc-4-0",
     attribution: Some(
         "MMAudio 44k mel-VAE (v1-44.pth) © Sony Research Inc. — released under CC-BY-NC-4.0; VAE \
          architecture from Make-An-Audio 2 (ByteDance, MIT); EDM2 magnitude-preserving primitives \
          © NVIDIA (CC-BY-NC-SA-4.0)",
     ),
-    commercial_use: false,
-    restriction: Some(NC_RESTRICTION),
+    retrieved: "2026-08-02",
 };
 
-/// License of the pinned NVIDIA **BigVGAN v2** 44k vocoder (`bigvgan_generator.pt`).
+/// Component key for the NVIDIA BigVGAN v2 44k vocoder artifact.
+pub const BIGVGAN_V2_COMPONENT_KEY: &str = "nvidia_bigvgan_v2_44khz_128band_512x";
+
+/// The schema-3 licence row for the pinned NVIDIA **BigVGAN v2** 44k vocoder
+/// (`bigvgan_generator.pt`).
 ///
-/// **MIT** — verified against the `nvidia/bigvgan_v2_44khz_128band_512x` model card (metadata
-/// `license: mit`, `license_link` → NVIDIA/BigVGAN `LICENSE`) and the repo `LICENSE` file (MIT
-/// License, © 2024 NVIDIA CORPORATION, adapted from HiFi-GAN, MIT). This is a **permissive** license
-/// with no additional usage restriction on the card — strictly MORE permissive than the MMAudio /
-/// Apple composite, so it neither blocks the 44k provider nor relaxes its research-only composite
-/// (see [`crate::generator_44k::WEIGHT_LICENSE`]). Recorded as a distinct entry per sc-13441's
-/// hard-gate requirement. The restriction note surfaces the training-data provenance that a
-/// downstream commercial use of the weights would warrant a legal read on.
-pub const BIGVGAN_V2_WEIGHT_LICENSE: WeightLicense = WeightLicense {
-    spdx_id: "MIT",
-    name: "MIT License",
+/// `declared` is the `nvidia/bigvgan_v2_44khz_128band_512x` model card's `license: mit`, read on
+/// `retrieved`. Note this resolves to the plain `mit` family and **not** to either NVIDIA-specific
+/// family in the table: the artifact declares MIT, and the NVIDIA Open Model / NSCLv1 texts govern
+/// other NVIDIA releases.
+pub const BIGVGAN_V2_COMPONENT_LICENSE: ComponentLicense = ComponentLicense {
+    component: BIGVGAN_V2_COMPONENT_KEY,
     source_url: "https://huggingface.co/nvidia/bigvgan_v2_44khz_128band_512x",
+    gated: false,
+    declared: "mit",
+    family: "mit",
     attribution: Some(
         "NVIDIA BigVGAN v2 (bigvgan_v2_44khz_128band_512x, bigvgan_generator.pt) © 2024 NVIDIA \
          CORPORATION — MIT License (model card license: mit); BigVGAN code adapted from HiFi-GAN \
          (jik876, MIT).",
     ),
-    commercial_use: true,
-    restriction: Some(
-        "Code + weights are MIT (permissive). BigVGAN v2 was trained by NVIDIA on large-scale \
-         diverse audio (speech in multiple languages, environmental sounds, instruments); those \
-         upstream training-data terms are NVIDIA's to honor, and a downstream commercial use of the \
-         weights warrants a legal read even though the MIT grant itself is unrestricted.",
-    ),
-};
-
-/// Weight-license entry for the 44k mel-VAE (keyed by [`VAE_MODEL_ID_44K`]).
-pub const VAE_WEIGHT_LICENSE_ENTRY_44K: WeightLicenseEntry = WeightLicenseEntry {
-    provider_id: VAE_MODEL_ID_44K,
-    component: None,
-    license: VAE_WEIGHT_LICENSE_44K,
-};
-
-/// Weight-license entry for the NVIDIA BigVGAN v2 44k vocoder (keyed by [`BIGVGAN_V2_MODEL_ID`]).
-pub const BIGVGAN_V2_WEIGHT_LICENSE_ENTRY: WeightLicenseEntry = WeightLicenseEntry {
-    provider_id: BIGVGAN_V2_MODEL_ID,
-    component: None,
-    license: BIGVGAN_V2_WEIGHT_LICENSE,
+    retrieved: "2026-08-02",
 };
 
 fn source_to_path(source: &WeightsSource, filename: &str, nested: &str) -> PathBuf {
@@ -426,17 +385,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn weight_licenses_are_well_formed_non_commercial() {
-        assert!(VAE_WEIGHT_LICENSE.is_well_formed());
-        assert!(BIGVGAN_WEIGHT_LICENSE.is_well_formed());
-        assert!(!VAE_WEIGHT_LICENSE.is_permissive());
-        assert!(!BIGVGAN_WEIGHT_LICENSE.is_permissive());
-        assert_eq!(VAE_WEIGHT_LICENSE.spdx_id, "CC-BY-NC-4.0");
-        assert_eq!(BIGVGAN_WEIGHT_LICENSE.spdx_id, "CC-BY-NC-4.0");
-        assert!(VAE_WEIGHT_LICENSE.restriction.is_some());
-        assert!(BIGVGAN_WEIGHT_LICENSE.restriction.is_some());
-        assert_eq!(VAE_WEIGHT_LICENSE_ENTRY.provider_id, VAE_MODEL_ID);
-        assert_eq!(BIGVGAN_WEIGHT_LICENSE_ENTRY.provider_id, BIGVGAN_MODEL_ID);
+    fn sixteen_k_component_licences_resolve_to_the_cc_by_nc_family() {
+        use candle_audio::gen_core::{resolve_family, LicenseTerm, LICENSE_FAMILIES};
+        for row in [VAE_COMPONENT_LICENSE, BIGVGAN_COMPONENT_LICENSE] {
+            assert!(row.is_well_formed(LICENSE_FAMILIES), "{row:?}");
+            assert_eq!(row.declared, "cc-by-nc-4.0");
+            let family = resolve_family(LICENSE_FAMILIES, row.family).unwrap();
+            assert_eq!(family.spdx_id, "CC-BY-NC-4.0");
+            assert!(family.imposes(LicenseTerm::NonCommercialWeights));
+        }
+        assert_eq!(VAE_COMPONENT_LICENSE.component, VAE_MODEL_ID);
+        assert_eq!(BIGVGAN_COMPONENT_LICENSE.component, BIGVGAN_MODEL_ID);
     }
 
     #[test]
@@ -471,30 +430,37 @@ mod tests {
     }
 
     #[test]
-    fn weight_licenses_44k_are_well_formed() {
-        // 44k VAE: MMAudio CC-BY-NC-4.0 (non-commercial, restriction present).
-        assert!(VAE_WEIGHT_LICENSE_44K.is_well_formed());
-        assert!(!VAE_WEIGHT_LICENSE_44K.is_permissive());
-        assert_eq!(VAE_WEIGHT_LICENSE_44K.spdx_id, "CC-BY-NC-4.0");
-        assert_eq!(VAE_WEIGHT_LICENSE_ENTRY_44K.provider_id, VAE_MODEL_ID_44K);
-        // NVIDIA BigVGAN v2: MIT (permissive, commercial_use true), its own recorded entry.
-        assert!(BIGVGAN_V2_WEIGHT_LICENSE.is_well_formed());
-        assert!(BIGVGAN_V2_WEIGHT_LICENSE.is_permissive());
-        assert_eq!(BIGVGAN_V2_WEIGHT_LICENSE.spdx_id, "MIT");
-        let bigvgan_v2_commercial = BIGVGAN_V2_WEIGHT_LICENSE.commercial_use;
-        assert!(
-            bigvgan_v2_commercial,
-            "NVIDIA BigVGAN v2 is MIT (permissive)"
-        );
-        assert_eq!(
-            BIGVGAN_V2_WEIGHT_LICENSE_ENTRY.provider_id,
-            BIGVGAN_V2_MODEL_ID
-        );
-        assert!(BIGVGAN_V2_WEIGHT_LICENSE
+    fn component_licence_rows_resolve_to_their_declared_families() {
+        use candle_audio::gen_core::{resolve_family, LicenseTerm, LICENSE_FAMILIES};
+        for row in [
+            VAE_COMPONENT_LICENSE,
+            BIGVGAN_COMPONENT_LICENSE,
+            VAE_COMPONENT_LICENSE_44K,
+            BIGVGAN_V2_COMPONENT_LICENSE,
+        ] {
+            assert!(row.is_well_formed(LICENSE_FAMILIES), "{row:?}");
+            assert!(resolve_family(LICENSE_FAMILIES, row.family).is_some());
+        }
+        // The three MMAudio checkpoints declare CC-BY-NC-4.0, whose text restricts the weights.
+        for row in [
+            VAE_COMPONENT_LICENSE,
+            BIGVGAN_COMPONENT_LICENSE,
+            VAE_COMPONENT_LICENSE_44K,
+        ] {
+            assert_eq!(row.family, "cc-by-nc-4-0");
+            let family = resolve_family(LICENSE_FAMILIES, row.family).unwrap();
+            assert!(family.imposes(LicenseTerm::NonCommercialWeights));
+        }
+        // NVIDIA BigVGAN v2 declares MIT — a different family, which states no such term. It neither
+        // relaxes nor tightens what the checkpoints beside it carry; the derived union is a set
+        // union, not a strictest-wins collapse.
+        assert_eq!(BIGVGAN_V2_COMPONENT_LICENSE.family, "mit");
+        let mit = resolve_family(LICENSE_FAMILIES, "mit").unwrap();
+        assert!(!mit.imposes(LicenseTerm::NonCommercialWeights));
+        assert!(BIGVGAN_V2_COMPONENT_LICENSE
             .source_url
             .starts_with("https://huggingface.co/"));
     }
-
     #[test]
     fn bigvgan_v2_hub_revision_is_a_full_commit_sha() {
         assert_eq!(BIGVGAN_V2_HUB_REVISION.len(), 40);

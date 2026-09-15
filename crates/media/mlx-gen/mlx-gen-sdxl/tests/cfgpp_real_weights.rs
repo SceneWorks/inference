@@ -6,9 +6,9 @@
 //! reproduce the plain path byte-for-byte).
 //!
 //! `#[ignore]`d — needs the real `stabilityai/stable-diffusion-xl-base-1.0` snapshot:
-//!   SDXL_SNAPSHOT=/path cargo test -p mlx-gen-sdxl --release --test cfgpp_real_weights -- --ignored --nocapture
+//!   SDXL_SNAPSHOT=/path cargo test -p mlx-gen-sdxl --release --test integration cfgpp_real_weights:: -- --ignored --nocapture
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 

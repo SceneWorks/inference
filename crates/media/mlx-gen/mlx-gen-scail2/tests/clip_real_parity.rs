@@ -14,7 +14,7 @@
 //! ```
 //!
 //! `#[ignore]` (needs the ~2.5 GB weights + fixtures, off CI). Run with
-//! `cargo test -p mlx-gen-scail2 --test clip_real_parity -- --ignored --nocapture`.
+//! `cargo test -p mlx-gen-scail2 --test integration clip_real_parity:: -- --ignored --nocapture`.
 //! `SCAIL2_SNAPSHOT_DIR` overrides the snapshot dir (default `~/.cache/scail2-mlx-convert`).
 
 use std::path::PathBuf;

@@ -96,7 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // INT8-ConvRot.
     let t2 = Instant::now();
-    let cr = pipeline::load_components_convrot(&snapshot, &convrot, &device)?;
+    let cr = pipeline::load_components_convrot(&snapshot, &convrot, &device, &[])?;
     let load_cr = t2.elapsed();
     let t3 = Instant::now();
     let img_cr = render(&cr, &req, &device);

@@ -47,7 +47,7 @@
 //!
 //! `hkchengrex/MMAudio` @ [`HUB_REVISION`], file [`WEIGHTS_PATH`]
 //! (`weights/mmaudio_small_16k.pth`, ~629 MB — the **network only**, not the 20 GB training
-//! checkpoint). License: **CC-BY-NC 4.0** ([`WEIGHT_LICENSE`], sc-13332). Left **UNREGISTERED** this
+//! checkpoint). Licence: **CC-BY-NC 4.0** ([`COMPONENT_LICENSE`]). Left **UNREGISTERED** this
 //! slice — the shipping generator that wires generator→VAE→waveform and registers is sc-12843.
 
 use std::path::{Path, PathBuf};
@@ -1155,60 +1155,50 @@ pub const MODEL_ID_44K: &str = "mmaudio_large_44k_v2";
 /// The large_44k_v2 **network** checkpoint (~4.12 GB) — the network only, NOT the training checkpoint.
 pub const WEIGHTS_PATH_44K: &str = "weights/mmaudio_large_44k_v2.pth";
 
-/// License of the pinned large_44k_v2 network weights (sc-13441) — **CC-BY-NC-4.0**, the same
-/// MMAudio checkpoint license as small_16k (all MMAudio HF checkpoints are CC-BY-NC-4.0). Surfaced
-/// for the product licenses page; folded into the 44k provider's composite restriction.
-pub const WEIGHT_LICENSE_44K: candle_audio::gen_core::WeightLicense =
-    candle_audio::gen_core::WeightLicense {
-        spdx_id: "CC-BY-NC-4.0",
-        name: "Creative Commons Attribution-NonCommercial 4.0 International",
+/// Component key for the large_44k_v2 MM-DiT artifact. Distinct from [`MODEL_ID_44K`], which names
+/// the network; the licence table is keyed by loaded artifact and must not collide with a provider
+/// id.
+pub const COMPONENT_KEY_44K: &str = "mmaudio_mmdit_large_44k_v2";
+
+/// The schema-3 licence row for the pinned large_44k_v2 network weights (sc-16663). `declared` was
+/// read from the `hkchengrex/MMAudio` model card on `retrieved`.
+pub const COMPONENT_LICENSE_44K: candle_audio::gen_core::ComponentLicense =
+    candle_audio::gen_core::ComponentLicense {
+        component: COMPONENT_KEY_44K,
         source_url: "https://huggingface.co/hkchengrex/MMAudio",
+        gated: false,
+        declared: "cc-by-nc-4.0",
+        family: "cc-by-nc-4-0",
         attribution: Some(
             "MMAudio large_44k_v2 network (mmaudio_large_44k_v2.pth) © 2024 Ho Kei Cheng et al. \
              (arXiv:2412.15322); weights distributed via hkchengrex/MMAudio under CC-BY-NC 4.0",
         ),
-        commercial_use: false,
-        restriction: Some(
-            "CC-BY-NC 4.0: non-commercial use only. The MMAudio code is MIT, but the released model \
-             weights are NonCommercial; a commercial use needs a separate license from the authors. \
-             Trained on VGGSound (research-oriented terms).",
-        ),
+        retrieved: "2026-08-02",
     };
 
-/// The large_44k_v2 network's weight-license entry (keyed by [`MODEL_ID_44K`]).
-pub const WEIGHT_LICENSE_ENTRY_44K: candle_audio::gen_core::WeightLicenseEntry =
-    candle_audio::gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID_44K,
-        component: None,
-        license: WEIGHT_LICENSE_44K,
-    };
+/// Component key for the small_16k MM-DiT artifact. Distinct from [`MODEL_ID`], which is also the
+/// registry id of the shipping provider — a licence row is keyed by artifact, and the two must not
+/// collide in the table.
+pub const COMPONENT_KEY: &str = "mmaudio_mmdit_small_16k";
 
-/// License of the pinned MMAudio network weights (sc-13332) — surfaced for the product licenses
-/// page. MMAudio's weights are released under **CC-BY-NC 4.0** (non-commercial); the code is MIT.
-pub const WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
-    candle_audio::gen_core::WeightLicense {
-        spdx_id: "CC-BY-NC-4.0",
-        name: "Creative Commons Attribution-NonCommercial 4.0 International",
-        source_url: "https://github.com/hkchengrex/MMAudio",
+/// The schema-3 licence row for the pinned small_16k network weights (sc-16663).
+///
+/// `source_url` points at the Hugging Face repository the weights are distributed from, which is what
+/// declares `cc-by-nc-4.0`. The v2 row pointed at `github.com/hkchengrex/MMAudio` instead — the
+/// **code** repository, which declares MIT — so its recorded source could not have evidenced its own
+/// SPDX id. Corrected here (sc-16663); the family is unchanged and no term moves.
+pub const COMPONENT_LICENSE: candle_audio::gen_core::ComponentLicense =
+    candle_audio::gen_core::ComponentLicense {
+        component: COMPONENT_KEY,
+        source_url: "https://huggingface.co/hkchengrex/MMAudio",
+        gated: false,
+        declared: "cc-by-nc-4.0",
+        family: "cc-by-nc-4-0",
         attribution: Some(
             "MMAudio © 2024 Ho Kei Cheng et al. (arXiv:2412.15322); weights distributed via \
              hkchengrex/MMAudio under CC-BY-NC 4.0",
         ),
-        commercial_use: false,
-        restriction: Some(
-            "CC-BY-NC 4.0: non-commercial use only. The MMAudio code is MIT, but the released \
-             model weights are NonCommercial; a commercial use needs a separate license from the \
-             authors. Trained on VGGSound (research-oriented terms).",
-        ),
-    };
-
-/// This network's weight-license entry (keyed by [`MODEL_ID`]) for catalog aggregation once a
-/// shipping MMAudio generator registers it (sc-12843).
-pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
-    candle_audio::gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: None,
-        license: WEIGHT_LICENSE,
+        retrieved: "2026-08-02",
     };
 
 /// Load a generator with an explicit [`Config`] from a `.pth` network state dict.
@@ -1389,21 +1379,33 @@ mod tests {
     }
 
     #[test]
-    fn weight_license_is_noncommercial_cc_by_nc() {
-        assert!(WEIGHT_LICENSE.is_well_formed());
-        assert_eq!(WEIGHT_LICENSE.spdx_id, "CC-BY-NC-4.0");
-        // Non-commercial: read through the shared helper (and a runtime binding so this stays a
-        // runtime assertion, not a const-folded one).
-        assert!(
-            !WEIGHT_LICENSE.is_permissive(),
-            "CC-BY-NC is not permissive"
+    fn component_licence_rows_resolve_to_the_non_commercial_cc_by_nc_family() {
+        for row in [COMPONENT_LICENSE, COMPONENT_LICENSE_44K] {
+            assert!(
+                row.is_well_formed(candle_audio::gen_core::LICENSE_FAMILIES),
+                "{row:?}"
+            );
+            assert_eq!(row.family, "cc-by-nc-4-0");
+            assert_eq!(row.declared, "cc-by-nc-4.0");
+            // The weights are distributed from the Hugging Face repository, which is what declares
+            // the identifier above. The code repository declares MIT and is a different artifact.
+            assert_eq!(row.source_url, "https://huggingface.co/hkchengrex/MMAudio");
+            let family = candle_audio::gen_core::resolve_family(
+                candle_audio::gen_core::LICENSE_FAMILIES,
+                row.family,
+            )
+            .expect("cc-by-nc-4-0 is a landed family");
+            // The CC-BY-NC text restricts the LICENSED MATERIAL and is silent on generated output,
+            // so the family states the weights term and not an outputs one (sc-16662).
+            assert!(family.imposes(candle_audio::gen_core::LicenseTerm::NonCommercialWeights));
+            assert!(!family.imposes(candle_audio::gen_core::LicenseTerm::NonCommercialOutputs));
+            assert!(family.requires_attribution() && row.attribution.is_some());
+        }
+        assert_ne!(
+            COMPONENT_LICENSE.component, MODEL_ID,
+            "artifact key must not be a provider id"
         );
-        let commercial_use = WEIGHT_LICENSE.commercial_use;
-        assert!(!commercial_use, "CC-BY-NC-4.0 forbids commercial use");
-        assert!(WEIGHT_LICENSE.restriction.is_some());
-        assert_eq!(WEIGHT_LICENSE_ENTRY.provider_id, MODEL_ID);
     }
-
     #[test]
     fn hub_revision_is_a_full_commit_sha() {
         assert_eq!(HUB_REVISION.len(), 40);

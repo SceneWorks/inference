@@ -210,8 +210,13 @@ impl AceStepPipeline {
         } else {
             root.join("condition_encoder/model.safetensors")
         };
-        let condition = ConditionEncoder::new(&config.condition, mmap_vb(&[ce_path], device)?)
-            .map_err(|e| AudioError::Msg(format!("build condition encoder: {e}")))?;
+        let timbre_frames = (30.0 * config.vae.latents_per_second()).ceil() as usize;
+        let condition = ConditionEncoder::new_with_fixed_timbre_frames(
+            &config.condition,
+            timbre_frames,
+            mmap_vb(&[ce_path], device)?,
+        )
+        .map_err(|e| AudioError::Msg(format!("build condition encoder: {e}")))?;
 
         let dit_shards = safetensors_shards(&root.join("transformer"), "diffusion_pytorch_model")?;
         let dit = DiT::new(&config.transformer, mmap_vb(&dit_shards, device)?)
@@ -323,9 +328,8 @@ impl AceStepPipeline {
         };
         // Text-to-music timbre: the reference's `timbre_fix_frame` — a fixed 30 s slice of the
         // encoded silence latent, independent of the requested duration.
-        let timbre_frames = (30.0 * self.config.vae.latents_per_second()).ceil() as usize;
         self.condition
-            .encode(&text_hidden, lyric_embeds.as_ref(), timbre_frames)
+            .encode_cached(&text_hidden, lyric_embeds.as_ref())
             .map_err(AudioError::from)
     }
 

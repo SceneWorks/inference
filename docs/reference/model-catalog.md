@@ -17,7 +17,7 @@ read the surface programmatically at runtime, call `catalog().snapshot()` (see t
 
 | Kind                | `runtime-macos` (MLX) | `runtime-cuda` / `runtime-cpu` (Candle) |
 | ------------------- | --------------------: | --------------------------------------: |
-| Generators          |                    57 |                                      43 |
+| Generators          |                    58 |                                      43 |
 | Trainers            |                    14 |                                       6 |
 | Transforms          |                     0 |                                       0 |
 | Captioners          |                     1 |                                       1 |
@@ -82,6 +82,7 @@ Grouped by provider family. `✓` = shipped on that platform; `—` = not shippe
 | | `lens` | ✓ | ✓ |
 | **ltx** (video + audio) | `ltx_2_3` | ✓ | — |
 | | `ltx_2_3_distilled` | — | ✓ |
+| **minimax-h3** (video + audio) | `minimax_h3` | ✓ | — |
 | **pulid** (identity, FLUX) | `pulid_flux` | ✓ | — · *(bespoke — see below)* |
 | **qwen-image** (Qwen-Image) | `qwen_image` | ✓ | ✓ |
 | | `qwen_image_control` | ✓ | — |
@@ -103,7 +104,7 @@ Grouped by provider family. `✓` = shipped on that platform; `—` = not shippe
 | | `wan2_2_t2v_14b` | ✓ | ✓ |
 | | `wan2_2_i2v_14b` | ✓ | ✓ |
 | | `wan_vace` | ✓ | ✓ |
-| | `wan2_2_vace_fun_14b` | ✓ | — |
+| | `wan2_2_vace_fun_14b` | ✓ | ✓ |
 | **z-image** | `z_image_turbo` | ✓ | ✓ |
 | | `z_image` | ✓ | ✓ |
 | | `z_image_control` | ✓ | — |
@@ -177,7 +178,7 @@ differ; each difference is pinned in the exact-surface tests rather than papered
   reference-edit and ControlNet variants that Candle does not yet: `flux1_dev_control`,
   the FLUX.2 `_edit` / `_kv_edit` / `_dev_control` set, `krea_2_turbo_edit` /
   `krea_2_turbo_control`, `qwen_image_control` / `qwen_image_edit`, `sana_sprint_1600m`,
-  `wan2_2_vace_fun_14b`, and `z_image_control` / `z_image_turbo_control`.
+  and `z_image_control` / `z_image_turbo_control`.
 - **PuLID is a registered generator on MLX, a bespoke utility on Candle.** MLX exposes
   `pulid_flux` as a loadable generator id; on Candle, `pulid` is a bespoke identity
   utility crate consumed through its own API (no registered generator id).

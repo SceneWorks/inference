@@ -13,7 +13,8 @@
 //!
 //! The decoder tree is the diffusers layout: `conv_in → mid(resnet, attn, resnet) → 4 up_blocks
 //! (3 resnets each, upsampler on all but the last) → groupnorm/silu → conv_out`. GroupNorm eps 1e-6,
-//! single-head mid attention. Runs in candle-native NCHW f32.
+//! single-head mid attention. The weights and internal activation stream stay at the builder dtype;
+//! the pipeline promotes the decoded image to f32 before RGB conversion.
 
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::{
@@ -23,8 +24,10 @@ use candle_gen::candle_nn::{
 
 const GN_GROUPS: usize = 32;
 const GN_EPS: f64 = 1e-6;
-const BLOCK_OUT: [usize; 4] = [128, 256, 512, 512];
-const LATENT_CHANNELS: usize = 16;
+/// Decoder stage channel widths. Four stages, so three x2 halvings: the x8 spatial scale the
+/// memory contract publishes as an architecture axis (epic SC-22657).
+pub(crate) const BLOCK_OUT: [usize; 4] = [128, 256, 512, 512];
+pub(crate) const LATENT_CHANNELS: usize = 16;
 /// Decoder up_blocks have `layers_per_block + 1 = 3` resnets each.
 const DECODER_RESNETS: usize = 3;
 /// FLUX AutoencoderKL scaling/shift (the Chroma `vae/config.json` values). The DiT works in the
@@ -172,8 +175,9 @@ impl UpBlock {
 }
 
 /// The Chroma/FLUX 16-channel AutoencoderKL — decode-only (txt2img). Build from a `vae/` VarBuilder
-/// (diffusers AutoencoderKL keys, f32).
+/// (diffusers AutoencoderKL keys) and keep the decoder activation stream at that builder's dtype.
 pub struct Vae {
+    dtype: DType,
     /// The `post_quant_conv` 1×1 conv, **when the snapshot ships one**. The real Chroma VAE
     /// (`lodestones/Chroma1-*`, mirrored verbatim into the `SceneWorks/chroma1-*-mlx` tiers) is a FLUX.1
     /// 16-ch AutoencoderKL that carries **no** `post_quant_conv` — matching the mlx parity reference
@@ -193,6 +197,7 @@ pub struct Vae {
 
 impl Vae {
     pub fn new(vb: VarBuilder) -> Result<Self> {
+        let dtype = vb.dtype();
         // Optional: the real Chroma/FLUX.1 16-ch VAE ships no `post_quant_conv` (see the field docs).
         let post_quant_conv = if vb.contains_tensor("post_quant_conv.weight") {
             Some(conv1x1(
@@ -237,6 +242,7 @@ impl Vae {
         let conv_out = conv3x3(prev, 3, dec.pp("conv_out"))?;
 
         Ok(Self {
+            dtype,
             post_quant_conv,
             conv_in,
             mid_resnet0,
@@ -252,7 +258,7 @@ impl Vae {
     /// image `[1, 3, H, W]` in `[-1, 1]`. Folds the diffusers pipeline un-scale (`z/scale + shift`)
     /// into the VAE decode (`post_quant_conv → decoder`), matching candle's `flux::autoencoder`.
     pub fn decode(&self, latents: &Tensor) -> Result<Tensor> {
-        let z = ((latents.to_dtype(DType::F32)? / SCALING_FACTOR)? + SHIFT_FACTOR)?;
+        let z = ((latents.to_dtype(self.dtype)? / SCALING_FACTOR)? + SHIFT_FACTOR)?;
         // `post_quant_conv` only when the snapshot ships it (the real Chroma VAE omits it — the mlx
         // parity reference likewise never applies one).
         let z = match &self.post_quant_conv {

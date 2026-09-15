@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! set Z_IMAGE_SNAPSHOT=C:\Users\…\models--Tongyi-MAI--Z-Image-Turbo\snapshots\<hash>
-//! cargo test -p candle-gen-z-image --features cuda --release --test conformance -- --ignored
+//! cargo test -p candle-gen-z-image --features cuda --release --test integration conformance:: -- --ignored
 //! ```
 //!
 //! Passing the suite is the parity evidence sc-3693 asks for: it locks **output dims** (request WxH
@@ -58,7 +58,7 @@ fn z_image_conformance() {
 /// ```text
 /// set Z_IMAGE_BASE_SNAPSHOT=C:\Users\…\models--Tongyi-MAI--Z-Image\snapshots\<hash>
 /// set CUDA_VISIBLE_DEVICES=1
-/// cargo test -p candle-gen-z-image --features cuda --release --test conformance base_z_image_smoke -- --ignored --nocapture
+/// cargo test -p candle-gen-z-image --features cuda --release --test integration conformance::base_z_image_smoke -- --ignored --nocapture
 /// ```
 #[test]
 #[ignore = "needs Z_IMAGE_BASE_SNAPSHOT (a Tongyi-MAI/Z-Image diffusers snapshot dir) + a CUDA GPU; run with --features cuda --ignored"]
@@ -141,7 +141,7 @@ fn base_z_image_smoke() {
 /// ```text
 /// set Z_IMAGE_BASE_SNAPSHOT=C:\Users\…\models--Tongyi-MAI--Z-Image\snapshots\<hash>
 /// set CUDA_VISIBLE_DEVICES=1
-/// cargo test -p candle-gen-z-image --features cuda --release --test conformance base_z_image_cfg_no_negative_smoke -- --ignored --nocapture
+/// cargo test -p candle-gen-z-image --features cuda --release --test integration conformance::base_z_image_cfg_no_negative_smoke -- --ignored --nocapture
 /// ```
 #[test]
 #[ignore = "needs Z_IMAGE_BASE_SNAPSHOT (a Tongyi-MAI/Z-Image diffusers snapshot dir) + a CUDA GPU; run with --features cuda --ignored"]

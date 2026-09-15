@@ -13,7 +13,7 @@
 //!   (2) the bare `quantized_matmul` kernel at the embedder shape (M=4096, K=64) with bias,
 //!   (3) the `AdaptableLinear` in-model forward wrapper.
 //!
-//! Run: cargo test -p mlx-gen-z-image --release --test q8_xemb_diag -- --ignored --nocapture
+//! Run: cargo test -p mlx-gen-z-image --release --test integration q8_xemb_diag:: -- --ignored --nocapture
 
 use mlx_gen::weights::Weights;
 use mlx_gen_z_image::load_transformer;
@@ -25,7 +25,7 @@ const PROBE: &str = concat!(
     "/../tools/golden/q8_xemb_probe.safetensors"
 );
 
-mod common;
+use crate::common;
 use common::{rel, snapshot};
 
 fn bf16(a: &Array) -> Array {

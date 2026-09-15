@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! MLX_LLM_QWEN35_MODEL=/path/to/Qwen3.6-27B-or-35B-A3B \
-//!   cargo test --test qwen35 -- --ignored --nocapture
+//!   cargo test --test integration -- qwen35:: --ignored --nocapture
 //! ```
 //!
 //! These are the acceptance gate for sc-7629 (27B dense) and sc-7630 (35B-A3B MoE): dispatch (family

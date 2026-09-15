@@ -35,7 +35,7 @@ use candle_gen::{CandleError, Result as CResult};
 
 use candle_gen_wan::config::{
     TextEncoderConfig, TransformerConfig, DEFAULT_FRAMES_14B, NEGATIVE_FALLBACK,
-    NUM_TRAIN_TIMESTEPS, VAE16_STRIDE_SPATIAL, VAE16_STRIDE_TEMPORAL,
+    NUM_TRAIN_TIMESTEPS,
 };
 use candle_gen_wan::pipeline::{create_noise, frames_to_images};
 use candle_gen_wan::scheduler::{flow_sigmas, FlowScheduler, Sampler};
@@ -46,6 +46,7 @@ use crate::config::{
 };
 use crate::forward::{guided_velocity, num_momentum_buffers, GuidanceParams, PackedForward};
 use crate::guidance::MomentumBuffer;
+use crate::latent_dims;
 use crate::preprocess::{encode_image, encode_videoclip};
 
 /// The experts run bf16 (the diffusers weights load as bf16, matching the 5B/14B regime); UMT5 + VAE f32.
@@ -67,6 +68,9 @@ pub const MODEL_ID: &str = "bernini_renderer";
 /// (pre-quantized; the loaders read the `.scales` siblings).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "bernini",
@@ -75,38 +79,21 @@ pub fn descriptor() -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             conditioning: vec![
                 ConditioningKind::Reference,
                 ConditioningKind::MultiReference,
                 ConditioningKind::VideoClip,
             ],
-            // LoRA/quant-adapter surface is a follow-on; the renderer ships dense bf16 / packed q4/q8.
-            supports_lora: false,
-            supports_lokr: false,
+            // User LoRA/LoKr stacks apply to both dense bf16 and packed q4/q8 renderer tiers.
+            supports_lora: true,
+            supports_lokr: true,
             // Curated `uni_pc` (sc-7296) → Wan's native UniPC; `euler` flow Euler. Legacy `unipc` alias.
             samplers: vec!["uni_pc", "euler", "unipc"],
-            schedulers: Vec::new(),
-            supported_guidance_methods: vec![],
             min_size: 16,
             max_size: 1280,
             max_count: 1,
-            mac_only: false,
             supported_quants: &[Quant::Q4, Quant::Q8],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            ..Default::default()
         },
     }
 }
@@ -118,17 +105,40 @@ pub struct BerniniRenderer {
     knobs: BerniniKnobs,
     root: PathBuf,
     device: Device,
+    adapters: Vec<candle_gen::gen_core::AdapterSpec>,
     components: Mutex<Option<Arc<RendererComponents>>>,
+    memory_strategy: Option<gen_core::MemoryProviderContract>,
+    memory_tier: Option<gen_core::MemoryNumericTier>,
+    /// Why this load has no sealed memory receipt. Present exactly when `memory_strategy` is
+    /// `None`; it is the refusal the memory seams return instead of admitting an unsealed artifact.
+    memory_refusal: String,
+    loaded_spec: LoadSpec,
 }
 
 impl BerniniRenderer {
     fn components(&self) -> CResult<Arc<RendererComponents>> {
         candle_gen::cached(&self.components, || {
-            Ok(Arc::new(RendererComponents::load(
-                &self.root,
-                &self.device,
-                MODEL_ID,
-            )?))
+            if let (Some(contract), Some(tier)) = (&self.memory_strategy, self.memory_tier) {
+                crate::memory_strategy::validate_loaded_contract(
+                    MODEL_ID,
+                    &self.loaded_spec,
+                    contract,
+                    tier,
+                )
+                .map_err(|error| CandleError::Msg(error.to_string()))?;
+            }
+            let components =
+                RendererComponents::load(&self.root, &self.device, MODEL_ID, &self.adapters)?;
+            if let (Some(contract), Some(tier)) = (&self.memory_strategy, self.memory_tier) {
+                crate::memory_strategy::validate_loaded_contract(
+                    MODEL_ID,
+                    &self.loaded_spec,
+                    contract,
+                    tier,
+                )
+                .map_err(|error| CandleError::Msg(error.to_string()))?;
+            }
+            Ok(Arc::new(components))
         })
     }
 
@@ -251,9 +261,7 @@ impl BerniniRenderer {
 
         // --- Latent geometry (z16 strides). RoPE is now built per token-segment inside `PackedForward`
         // (each source + the target gets its own source-id-shifted table), so no shared cos/sin here. ---
-        let t_lat = ((frames - 1) / VAE16_STRIDE_TEMPORAL + 1) as usize;
-        let h_lat = (height / VAE16_STRIDE_SPATIAL) as usize;
-        let w_lat = (width / VAE16_STRIDE_SPATIAL) as usize;
+        let (t_lat, h_lat, w_lat) = latent_dims(frames, width, height);
         let dit_cfg = TransformerConfig::t2v_14b();
 
         let mut latents = create_noise(seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
@@ -322,7 +330,12 @@ impl BerniniRenderer {
         }
 
         on_progress(Progress::Decoding);
-        let decoded = comps.vae.decode_with_cancel(&latents, &req.cancel)?;
+        let decode_cap = crate::memory_strategy::selected_decode_cap(req)?;
+        let decoded = comps.vae.decode_budgeted_with_cancel_and_tile_cap(
+            &latents,
+            &req.cancel,
+            decode_cap,
+        )?;
         let out_images = frames_to_images(&decoded)?;
 
         // num_frames == 1 ⇒ a still image (t2i). A single latent frame still decodes to one VAE
@@ -397,12 +410,31 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     // NOT reject here; both experts load through the sc-10025 packed-detect seam.
     let knobs = BerniniKnobs::from_dir(&root)?;
     let device = candle_gen::default_device()?;
+    // A crossed, corrupted, or unparseable snapshot yields no contract — but it must never yield a
+    // silent `Accept` at the memory seams, so carry the refusal with the load.
+    #[cfg(any(feature = "cuda", test))]
+    let (memory_strategy, memory_tier, memory_refusal) =
+        match crate::memory_strategy::contract_for_loaded(spec, MODEL_ID) {
+            Ok((contract, tier)) => (Some(contract), Some(tier), String::new()),
+            Err(reason) => (None, None, reason),
+        };
+    #[cfg(not(any(feature = "cuda", test)))]
+    let (memory_strategy, memory_tier, memory_refusal) = (
+        None,
+        None,
+        format!("{MODEL_ID}: this build has no Candle/CUDA memory-strategy support"),
+    );
     Ok(Box::new(BerniniRenderer {
         descriptor: descriptor(),
         knobs,
         root,
         device,
+        adapters: spec.adapters.clone(),
         components: Mutex::new(None),
+        memory_strategy,
+        memory_tier,
+        memory_refusal,
+        loaded_spec: spec.clone(),
     }))
 }
 
@@ -425,6 +457,9 @@ impl Generator for BerniniRenderer {
         }
         // Shared geometry guard (steps==0 / off-grid size / over-area / bad frame count), F-095.
         validate_bernini_geometry(id, req)?;
+        // sc-20264 — the same per-clip knob refusal the `bernini` id runs; both providers take the
+        // same conditioning through the same encode path, so they must give the same answer.
+        crate::bernini::reject_unimplemented_video_clip_knobs(id, req)?;
         // Reject a resolved-mode/conditioning mismatch before loading weights (F-096): a conditioning
         // mode with no source silently renders text-only; a text-only mode with a source drops it.
         let has_video = req
@@ -450,6 +485,32 @@ impl Generator for BerniniRenderer {
         self.validate(req)?;
         let comps = self.components()?;
         Ok(self.render(req, &comps, on_progress)?)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let (Some(contract), Some(tier)) = (&self.memory_strategy, self.memory_tier) else {
+            return gen_core::MemorySafetyDecision::Reject {
+                reason: self.memory_refusal.clone(),
+            };
+        };
+        crate::memory_strategy::safety_check(contract, tier, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let (Some(contract), Some(tier)) = (&self.memory_strategy, self.memory_tier) else {
+            return Err(gen_core::Error::Unsupported(self.memory_refusal.clone()));
+        };
+        crate::memory_strategy::begin_request(contract, tier, self.device.clone(), context)
     }
 }
 
@@ -477,6 +538,12 @@ mod tests {
     fn descriptor_surface() {
         let d = descriptor();
         assert_eq!(d.id, MODEL_ID);
+        assert!(!d.capabilities.supports_sequential_offload);
+        assert!(!d.capabilities.unconditionally_engages_staged_residency);
+        assert_eq!(
+            d.capabilities.staged_residency_availability(),
+            candle_gen::gen_core::StagedResidencyAvailability::Absent,
+        );
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supports_negative_prompt);
         assert!(!d.capabilities.supports_true_cfg);

@@ -35,7 +35,7 @@ use mlx_gen::Result;
 // The dtype flow (bf16 weights, f32 latents) is preserved unchanged.
 //
 // The toggle + its RAII [`CompileGlueGuard`] are hoisted into core (F-104); re-export core's so the
-// process-global is shared with the FLUX family rather than each crate hand-rolling its own `AtomicBool`.
+// request/thread-local setting is shared with the FLUX family.
 pub(crate) use mlx_gen::nn::compile_glue;
 pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
 

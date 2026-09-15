@@ -23,6 +23,22 @@ use gen_core_testkit::{check_progress_with, check_registry_roundtrip, check_vali
 use mlx_gen::{GenerationRequest, LoadSpec, WeightsSource};
 use mlx_gen_wan::convert::assemble_bernini_renderer_snapshot;
 
+/// The converted-snapshot store these tests assemble into.
+///
+/// `MLX_GEN_CONVERTED_ROOT` overrides it. The `$HOME` default stays because this is a **derived
+/// cache** the tests build themselves from a caller-provisioned HF snapshot — not a provided input,
+/// which is why it takes a fallback rather than the hard epic-13657 requirement `MLX_GEN_MODELS_ROOT`
+/// and the `*_SRC` variables carry. Without the override, pointing the suite at a real store did
+/// nothing: resolution read `$HOME` unconditionally and the rows skipped or mis-resolved while still
+/// reporting green.
+fn converted_root() -> PathBuf {
+    std::env::var("MLX_GEN_CONVERTED_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").expect("HOME")).join(".cache/mlx-gen-models")
+        })
+}
+
 fn hf_snapshot(repo: &str) -> Option<PathBuf> {
     let home = std::env::var("MLX_GEN_MODELS_ROOT").ok()?;
     let snaps = PathBuf::from(home)
@@ -37,12 +53,12 @@ fn hf_snapshot(repo: &str) -> Option<PathBuf> {
 /// Assemble the converted **renderer** snapshot once (mirrors
 /// `cancellation_conformance.rs::ensure_snapshot`).
 fn ensure_renderer_snapshot() -> PathBuf {
-    let home = PathBuf::from(std::env::var("HOME").unwrap());
-    let snapshot = home.join(".cache/mlx-gen-models/bernini_renderer_mlx_bf16");
+    let home = converted_root();
+    let snapshot = home.join("bernini_renderer_mlx_bf16");
     if !snapshot.join("high_noise_model.safetensors").is_file() {
         let pkg = hf_snapshot("ByteDance/Bernini-Diffusers")
             .expect("ByteDance/Bernini-Diffusers snapshot in the HF cache");
-        let base = home.join(".cache/mlx-gen-models/wan2_2_t2v_a14b_mlx_bf16");
+        let base = home.join("wan2_2_t2v_a14b_mlx_bf16");
         assert!(
             base.join("high_noise_model.safetensors").is_file(),
             "converted base Wan2.2-T2V-A14B snapshot required at {}",
@@ -56,14 +72,14 @@ fn ensure_renderer_snapshot() -> PathBuf {
 /// The combined **full-Bernini** (planner+renderer) snapshot once (mirrors
 /// `bernini_e2e.rs::ensure_snapshot`).
 fn ensure_full_snapshot() -> PathBuf {
-    let home = PathBuf::from(std::env::var("HOME").unwrap());
-    let snapshot = home.join(".cache/mlx-gen-models/bernini_full_mlx_bf16");
+    let home = converted_root();
+    let snapshot = home.join("bernini_full_mlx_bf16");
     let complete = snapshot.join("qwen2_5_vl.safetensors").is_file()
         && snapshot.join("high_noise_model.safetensors").is_file();
     if !complete {
         let pkg = hf_snapshot("ByteDance/Bernini-Diffusers")
             .expect("ByteDance/Bernini-Diffusers snapshot in the HF cache");
-        let base = home.join(".cache/mlx-gen-models/wan2_2_t2v_a14b_mlx_bf16");
+        let base = home.join("wan2_2_t2v_a14b_mlx_bf16");
         assert!(
             base.join("high_noise_model.safetensors").is_file(),
             "converted base Wan2.2-T2V-A14B snapshot required at {}",
@@ -135,4 +151,74 @@ fn bernini_full_pipeline_satisfies_gen_core_contract() {
     // 1..=27 with a constant total. Update the expected total if `FullDefaults::PLANNING_STEP`
     // ever changes.
     check_progress_with(g, &t2i_request("t2i", 2), Some(25 + 2)).expect("progress contract");
+}
+
+/// sc-22738 — the **ordered lifecycle boundary sequence** of the full pipeline.
+///
+/// The folded `Progress::Step` bar the test above checks says nothing about where each memory
+/// phase begins, and this engine emitted no `Progress::Loading(_)` at all: the conditioning stage
+/// (planner load → per-source ViT/VAE encodes → UMT5-XXL encode) and the renderer stage (two ~28 GB
+/// expert loads) both opened silently, so a consumer segmenting a run by phase — the SceneWorks
+/// memory-measurement adapter — could not place either boundary.
+///
+/// Expected sequence: `Loading(TextEncoder)` → the 25 planner steps → `Loading(Renderer)` → the
+/// renderer steps → `Decoding`. The still (`frames == 1`) and video routes share one body, so the
+/// 1-frame request here pins both.
+///
+/// The weights-free half of this — that the conditioning boundary precedes the planner load, on
+/// both routes — runs by default in the crate's unit tests.
+#[test]
+#[ignore = "real weights: loads the full Bernini (planner+renderer) snapshot and runs one short generate"]
+fn bernini_full_pipeline_emits_its_declared_phase_boundaries_in_order() {
+    use mlx_gen::gen_core::{LoadPhase, Progress};
+
+    let registry = mlx_gen_bernini::provider_registry().expect("provider registry should build");
+    let gen = registry
+        .load(
+            "bernini",
+            &LoadSpec::new(WeightsSource::Dir(ensure_full_snapshot())),
+        )
+        .expect("load bernini");
+
+    let mut marks: Vec<String> = Vec::new();
+    gen.generate(&t2i_request("t2i", 2), &mut |p| match p {
+        Progress::Loading(LoadPhase::TextEncoder) => marks.push("conditioning".into()),
+        Progress::Loading(LoadPhase::Renderer) => marks.push("renderer".into()),
+        Progress::Decoding => marks.push("decode".into()),
+        Progress::Step { current, .. } => marks.push(format!("step:{current}")),
+    })
+    .expect("generate");
+
+    let phases: Vec<&str> = marks
+        .iter()
+        .filter(|m| !m.starts_with("step:"))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        phases,
+        vec!["conditioning", "renderer", "decode"],
+        "declared phases must open once each, in contract order: {marks:?}"
+    );
+    let index = |name: &str| marks.iter().position(|m| m == name).unwrap();
+    assert_eq!(
+        index("conditioning"),
+        0,
+        "conditioning opens first: {marks:?}"
+    );
+    assert_eq!(
+        marks[index("renderer") - 1],
+        "step:25",
+        "the renderer phase opens after the last planner step, before the first renderer step: \
+         {marks:?}"
+    );
+    assert_eq!(
+        marks[index("renderer") + 1],
+        "step:26",
+        "the renderer phase opens before the first renderer step: {marks:?}"
+    );
+    assert_eq!(
+        marks.last().unwrap(),
+        "decode",
+        "decode closes the run: {marks:?}"
+    );
 }

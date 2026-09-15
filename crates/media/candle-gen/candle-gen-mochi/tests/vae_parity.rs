@@ -4,7 +4,7 @@
 //! `video` reproduces `mochi_vae_golden.safetensors` (pixel space).
 //!
 //! Windows run:
-//!   `MOCHI_SNAPSHOT=/path/to/mochi-1-preview cargo test -p candle-gen-mochi --features cuda --test vae_parity -- --ignored --nocapture`
+//!   `MOCHI_SNAPSHOT=/path/to/mochi-1-preview cargo test -p candle-gen-mochi --features cuda --test integration vae_parity:: -- --ignored --nocapture`
 #![cfg(feature = "cuda")]
 
 use std::path::{Path, PathBuf};

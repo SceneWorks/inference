@@ -94,6 +94,21 @@ impl ClipEncoderLayer {
         Ok(())
     }
 
+    fn materialize_weights(&self) -> Result<()> {
+        mlx_rs::transforms::eval([&self.ln1_w, &self.ln1_b, &self.ln2_w, &self.ln2_b])?;
+        for linear in [
+            &self.q,
+            &self.k,
+            &self.v,
+            &self.out,
+            &self.linear1,
+            &self.linear2,
+        ] {
+            linear.materialize_weights()?;
+        }
+        Ok(())
+    }
+
     fn activation(&self, x: &Array) -> Result<Array> {
         match self.act {
             // CLIP-L "quick_gelu" = `x · sigmoid(1.702·x)` — the vendored `mlx.nn.gelu_fast_approx`
@@ -198,6 +213,22 @@ impl ClipTextEncoder {
         Ok(())
     }
 
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        mlx_rs::transforms::eval([
+            &self.token_embedding,
+            &self.position_embedding,
+            &self.final_ln_w,
+            &self.final_ln_b,
+        ])?;
+        for layer in &self.layers {
+            layer.materialize_weights()?;
+        }
+        if let Some(projection) = &self.text_projection {
+            projection.materialize_weights()?;
+        }
+        Ok(())
+    }
+
     /// Run the encoder over `input_ids` `[B, N]` (int32). Returns the last hidden state, the
     /// per-layer hidden states, and the pooled EOS token (projected for TE2).
     pub fn forward(&self, input_ids: &Array) -> Result<ClipOutput> {
@@ -205,10 +236,13 @@ impl ClipTextEncoder {
         let (b, n) = (sh[0], sh[1]);
         let dim = self.token_embedding.shape()[1];
 
-        // Defensive bound: the position-embedding gather below indexes `0..n` into the `[max_len, D]`
+        // Hard bound: the position-embedding gather below indexes `0..n` into the `[max_len, D]`
         // table. MLX gathers are not bounds-checked, so `n` past the table would silently produce
-        // garbage embeddings. The tokenizer caps at `MAX_LENGTH`, but guard here too so any other
-        // caller surfaces a typed error instead (F-062).
+        // garbage embeddings (F-062). Since sc-20528 this is the ONLY thing enforcing the context
+        // window — the tokenizer no longer truncates; it splits an over-long prompt into windows
+        // (`ClipBpeTokenizer::tokenize_windows`) and each window is forwarded here on its own, so a
+        // long prompt reaches this guard as `n == max_len`, never past it. A caller that hands over
+        // an unwindowed batch gets a typed error rather than silent garbage.
         let max_pos = self.position_embedding.shape()[0];
         if n > max_pos {
             return Err(Error::Msg(format!(

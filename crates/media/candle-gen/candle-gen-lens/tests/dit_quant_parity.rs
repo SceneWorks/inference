@@ -14,7 +14,7 @@
 //!   LENS_DIT_DIR     — the Lens-Turbo `transformer` snapshot dir (config.json + model-*.safetensors)
 //!   LENS_DIT_GOLDENS — lens_dit_golden.safetensors (default: .scratch/lens-dit-goldens/…)
 //! Run with the `cuda` feature (absolute goldens path — cargo test cwd is the crate dir):
-//!   cargo test -p candle-gen-lens --features cuda --test dit_quant_parity -- --nocapture
+//!   cargo test -p candle-gen-lens --features cuda --test integration dit_quant_parity:: -- --nocapture
 
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
@@ -49,6 +49,7 @@ fn peak_rel(a: &Tensor, b: &Tensor) -> Result<f32> {
 }
 
 #[test]
+#[ignore = "needs the Lens-Turbo transformer snapshot (LENS_DIT_DIR) + goldens (LENS_DIT_GOLDENS)"]
 fn lens_dit_quant_matches_dense() -> Result<()> {
     let dit_dir = match std::env::var("LENS_DIT_DIR") {
         Ok(d) => d,

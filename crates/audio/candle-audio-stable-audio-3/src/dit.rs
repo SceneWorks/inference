@@ -155,6 +155,21 @@ pub struct DitInputs<'a> {
     pub padding_mask: Option<&'a Tensor>,
 }
 
+/// Repeat the local conditioning across the batch-2 CFG forward (sc-14548).
+///
+/// The conditional and unconditional branches see the **identical** `[inpaint_mask,
+/// inpaint_masked_input]` tensor: guidance varies the *prompt*, and only the prompt. Zeroing it on
+/// the negative half — the obvious "unconditional means no conditioning" mistake — would leave every
+/// shape intact, keep the model running, and drive the guided delta with a branch that never saw the
+/// source, so the edit would fight its own surroundings instead of continuing them.
+///
+/// Extracted from [`StableAudio3Dit::forward_guided`] purely so that rule is gateable: the guided
+/// forward itself needs multi-gigabyte weights, this does not. `tests/audio_edit.rs`
+/// `the_negative_cfg_branch_receives_the_same_local_conditioning` drives it directly.
+pub fn batch_cfg_local_conditioning(local_conditioning: &Tensor) -> Result<Tensor> {
+    Tensor::cat(&[local_conditioning, local_conditioning], 0)
+}
+
 /// Compact intermediate state for independent reference validation.
 #[derive(Default)]
 pub struct DitTrace {
@@ -606,7 +621,7 @@ impl StableAudio3Dit {
         let batch_timestep = Tensor::cat(&[timestep, timestep], 0)?;
         let batch_prompt = Tensor::cat(&[positive_prompt, &negative], 0)?;
         let batch_seconds = Tensor::cat(&[seconds_total, seconds_total], 0)?;
-        let batch_local = Tensor::cat(&[local_conditioning, local_conditioning], 0)?;
+        let batch_local = batch_cfg_local_conditioning(local_conditioning)?;
         let batch_mask = padding_mask
             .map(|mask| Tensor::cat(&[mask, mask], 0))
             .transpose()?;

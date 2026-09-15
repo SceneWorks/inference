@@ -11,7 +11,7 @@
 //!   LENS_VAE_DIR     — the Lens-Turbo `vae` snapshot dir (config.json + diffusion_pytorch_model.safetensors)
 //!   LENS_VAE_GOLDENS — lens_vae_golden.safetensors (default: .scratch/lens-vae-goldens/…)
 //! Run with the `cuda` feature (absolute goldens path — cargo test cwd is the crate dir):
-//!   cargo test -p candle-gen-lens --features cuda --test vae_parity -- --nocapture
+//!   cargo test -p candle-gen-lens --features cuda --test integration vae_parity:: -- --nocapture
 
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
@@ -45,6 +45,7 @@ fn peak_rel(a: &Tensor, b: &Tensor) -> Result<f32> {
 }
 
 #[test]
+#[ignore = "needs the Lens-Turbo vae snapshot (LENS_VAE_DIR) + goldens (LENS_VAE_GOLDENS)"]
 fn lens_vae_matches_reference() -> Result<()> {
     let vae_dir = match std::env::var("LENS_VAE_DIR") {
         Ok(d) => d,

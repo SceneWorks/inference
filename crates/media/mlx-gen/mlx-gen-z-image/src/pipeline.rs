@@ -8,14 +8,18 @@
 //! small Mac.
 
 use mlx_gen::array::host_i32;
+use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 // The img2img leaves (start-step / init-image preprocess / noise-interp blend) are shared in core;
 // re-export so the crate's public surface (`mlx_gen_z_image::…`) and internal callers are unchanged.
-pub use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
+use mlx_gen::gen_core::TransformerComponent;
+pub use mlx_gen::img2img::{
+    add_noise_by_interpolation, init_time_step, preprocess_init_image, resolve_reference,
+};
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::tokenizer::{TextTokenizer, TokenizerOutput};
 use mlx_gen::{
-    run_flow_sampler, CancelFlag, Conditioning, Error, FlowMatchEuler, GenerationRequest, Image,
-    LatentDecoder, Progress, Result, TimestepConvention,
+    run_flow_sampler_with_latent_hook, CancelFlag, Error, FlowMatchEuler, GenerationRequest, Image,
+    LatentDecoder, PreviewSink, Progress, Result, TimestepConvention,
 };
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{random, Array, Dtype};
@@ -77,6 +81,8 @@ pub fn slice_valid(encoder_out: &Array, num_valid: i32) -> Result<Array> {
 ///
 /// Mirrors the fork's loop: `timestep = 1 - sigma[t]` (the transformer applies its own
 /// `t_scale`), `latents += (sigma[t+1] - sigma[t]) * velocity`.
+/// `block_window` is ladder rung 4 (SC-15754): `Some(n)` streams the unified stack `n` blocks at a
+/// time instead of running the resident one; `None` is the historical forward, untouched.
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_with_progress(
     transformer: &ZImageTransformer,
@@ -86,7 +92,44 @@ pub fn denoise_with_progress(
     latents: Array,
     cap_feats: &Array,
     start_step: usize,
+    budget: AttentionBudget,
+    block_window: Option<usize>,
     cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
+    denoise_with_progress_and_preview(
+        transformer,
+        scheduler,
+        sampler_name,
+        seed,
+        latents,
+        cap_feats,
+        start_step,
+        budget,
+        block_window,
+        cancel,
+        &PreviewSink::default(),
+        on_progress,
+    )
+}
+
+/// [`denoise_with_progress`] with decorative per-step latent previews.
+///
+/// The legacy entry point remains an inert wrapper so existing callers retain the exact numerical
+/// path. Preview projection is attempted only for an active sink and never changes render success.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_with_progress_and_preview(
+    transformer: &ZImageTransformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
+    latents: Array,
+    cap_feats: &Array,
+    start_step: usize,
+    budget: AttentionBudget,
+    block_window: Option<usize>,
+    cancel: &CancelFlag,
+    preview: &PreviewSink,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
     // The patchify metadata + RoPE freqs depend only on the (loop-constant) latent dims and caption,
@@ -99,16 +142,26 @@ pub fn denoise_with_progress(
     // within the N1 tolerance, and the curated menu becomes selectable. Cancellation, the per-step
     // `eval` (sc-5522 / sc-5399), and progress live in `run_flow_sampler`. img2img slices the schedule
     // from `start_step` so the blended init latents are denoised from the matching sigma.
-    let predict = |x: &Array, timestep: f32| transformer.forward_with(&prep, x, timestep);
+    // The cancel flag joins the budget here so a bounded call can stop between chunks (SC-15615);
+    // the unbounded fast path has no boundary, so this is inert for every unselected request.
+    let plan = AttentionPlan::budgeted(budget).with_cancel(cancel);
+    // Rung 4 (SC-15754): the window is built once for the whole loop (it is loop-constant), and the
+    // per-window cancellation check inside `run_windowed` joins the per-step one below.
+    let window = transformer.block_window(block_window, cancel)?;
+    let predict =
+        |x: &Array, timestep: f32| transformer.forward_with_rungs(&prep, x, timestep, plan, window);
     let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
-    run_flow_sampler(
+    let sigmas = &scheduler.sigmas[start..];
+    let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
+    run_flow_sampler_with_latent_hook(
         sampler_name,
         TimestepConvention::OneMinusSigma,
-        &scheduler.sigmas[start..],
+        sigmas,
         latents,
         seed,
         cancel,
         on_progress,
+        |latents, sigma| crate::preview::emit_preview(preview, &previews, sigmas, sigma, latents),
         predict,
     )
 }
@@ -130,6 +183,8 @@ pub fn denoise(
         latents,
         cap_feats,
         0,
+        AttentionBudget::UNBOUNDED,
+        None,
         &CancelFlag::default(),
         &mut |_| {},
     )
@@ -166,7 +221,45 @@ pub fn denoise_cfg_with_progress(
     neg_cap_feats: Option<&Array>,
     guidance: f32,
     start_step: usize,
+    budget: AttentionBudget,
+    block_window: Option<usize>,
     cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
+    denoise_cfg_with_progress_and_preview(
+        transformer,
+        scheduler,
+        sampler_name,
+        seed,
+        latents,
+        cap_feats,
+        neg_cap_feats,
+        guidance,
+        start_step,
+        budget,
+        block_window,
+        cancel,
+        &PreviewSink::default(),
+        on_progress,
+    )
+}
+
+/// [`denoise_cfg_with_progress`] with decorative per-step latent previews.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_cfg_with_progress_and_preview(
+    transformer: &ZImageTransformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
+    latents: Array,
+    cap_feats: &Array,
+    neg_cap_feats: Option<&Array>,
+    guidance: f32,
+    start_step: usize,
+    budget: AttentionBudget,
+    block_window: Option<usize>,
+    cancel: &CancelFlag,
+    preview: &PreviewSink,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
     // Cond (and, when CFG is active, uncond) patchify metadata + RoPE freqs depend only on the
@@ -179,13 +272,17 @@ pub fn denoise_cfg_with_progress(
         _ => None,
     };
     let g = Array::from_slice(&[guidance], &[1]);
+    let plan = AttentionPlan::budgeted(budget).with_cancel(cancel);
+    // Rung 4 covers BOTH CFG forwards — the uncond pass runs the same 30 blocks and would otherwise
+    // re-materialize the whole stack resident, leaving the bound half-applied.
+    let window = transformer.block_window(block_window, cancel)?;
     // Same FLOW / `1 - sigma` convention + unified curated-sampler routing as the base loop; the only
     // delta is the per-step CFG combine of two velocities.
     let predict = |x: &Array, timestep: f32| -> Result<Array> {
-        let v_cond = transformer.forward_with(&prep, x, timestep)?;
+        let v_cond = transformer.forward_with_rungs(&prep, x, timestep, plan, window)?;
         match &neg_prep {
             Some(np) => {
-                let v_uncond = transformer.forward_with(np, x, timestep)?;
+                let v_uncond = transformer.forward_with_rungs(np, x, timestep, plan, window)?;
                 // v = v_uncond + guidance·(v_cond − v_uncond).
                 let delta = v_cond.subtract(&v_uncond)?;
                 Ok(v_uncond.add(&delta.multiply(&g)?)?)
@@ -194,14 +291,17 @@ pub fn denoise_cfg_with_progress(
         }
     };
     let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
-    run_flow_sampler(
+    let sigmas = &scheduler.sigmas[start..];
+    let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
+    run_flow_sampler_with_latent_hook(
         sampler_name,
         TimestepConvention::OneMinusSigma,
-        &scheduler.sigmas[start..],
+        sigmas,
         latents,
         seed,
         cancel,
         on_progress,
+        |latents, sigma| crate::preview::emit_preview(preview, &previews, sigmas, sigma, latents),
         predict,
     )
 }
@@ -222,7 +322,45 @@ pub fn denoise_control_with_progress(
     control_context: &Array,
     control_context_scale: f32,
     start_step: usize,
+    budget: AttentionBudget,
+    block_window: Option<usize>,
     cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
+    denoise_control_with_progress_and_preview(
+        transformer,
+        scheduler,
+        sampler_name,
+        seed,
+        latents,
+        cap_feats,
+        control_context,
+        control_context_scale,
+        start_step,
+        budget,
+        block_window,
+        cancel,
+        &PreviewSink::default(),
+        on_progress,
+    )
+}
+
+/// [`denoise_control_with_progress`] with decorative per-step latent previews.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_control_with_progress_and_preview(
+    transformer: &ZImageControlTransformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
+    latents: Array,
+    cap_feats: &Array,
+    control_context: &Array,
+    control_context_scale: f32,
+    start_step: usize,
+    budget: AttentionBudget,
+    block_window: Option<usize>,
+    cancel: &CancelFlag,
+    preview: &PreviewSink,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
     // Patchify metadata, RoPE freqs, and the embedded (constant) control context depend only on the
@@ -232,18 +370,31 @@ pub fn denoise_control_with_progress(
         transformer.prepare_control((sh[0], sh[1], sh[2], sh[3]), cap_feats, control_context)?;
     // Same unified-framework routing as the base loop (epic 7114 P3), with the control branch in the
     // `predict` closure (the fork's `ZImageControl._control_predict`).
+    let plan = AttentionPlan::budgeted(budget).with_cancel(cancel);
+    let window = transformer.control_block_window(block_window, cancel)?;
     let predict = |x: &Array, timestep: f32| {
-        transformer.forward_with_control(&prep, x, timestep, control_context_scale, None)
+        transformer.forward_with_control_rungs(
+            &prep,
+            x,
+            timestep,
+            control_context_scale,
+            None,
+            plan,
+            window,
+        )
     };
     let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
-    run_flow_sampler(
+    let sigmas = &scheduler.sigmas[start..];
+    let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
+    run_flow_sampler_with_latent_hook(
         sampler_name,
         TimestepConvention::OneMinusSigma,
-        &scheduler.sigmas[start..],
+        sigmas,
         latents,
         seed,
         cancel,
         on_progress,
+        |latents, sigma| crate::preview::emit_preview(preview, &previews, sigmas, sigma, latents),
         predict,
     )
 }
@@ -277,7 +428,49 @@ pub fn denoise_control_cfg_with_progress(
     control_context: &Array,
     control_context_scale: f32,
     start_step: usize,
+    budget: AttentionBudget,
+    block_window: Option<usize>,
     cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
+    denoise_control_cfg_with_progress_and_preview(
+        transformer,
+        scheduler,
+        sampler_name,
+        seed,
+        latents,
+        cap_feats,
+        neg_cap_feats,
+        guidance,
+        control_context,
+        control_context_scale,
+        start_step,
+        budget,
+        block_window,
+        cancel,
+        &PreviewSink::default(),
+        on_progress,
+    )
+}
+
+/// [`denoise_control_cfg_with_progress`] with decorative per-step latent previews.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_control_cfg_with_progress_and_preview(
+    transformer: &ZImageControlTransformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
+    latents: Array,
+    cap_feats: &Array,
+    neg_cap_feats: Option<&Array>,
+    guidance: f32,
+    control_context: &Array,
+    control_context_scale: f32,
+    start_step: usize,
+    budget: AttentionBudget,
+    block_window: Option<usize>,
+    cancel: &CancelFlag,
+    preview: &PreviewSink,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
     // Cond (and, when CFG is active, uncond) control prep — patchify metadata + RoPE freqs + the
@@ -294,20 +487,31 @@ pub fn denoise_control_cfg_with_progress(
         _ => None,
     };
     let g = Array::from_slice(&[guidance], &[1]);
+    let plan = AttentionPlan::budgeted(budget).with_cancel(cancel);
+    let window = transformer.control_block_window(block_window, cancel)?;
     // Same FLOW / `1 - sigma` convention + unified curated-sampler routing as the base CFG loop; the
     // delta vs `denoise_cfg_with_progress` is that each forward runs the control branch (constant
     // control context + scale threaded through every step, the fork's `ZImageControl._control_predict`).
     let predict = |x: &Array, timestep: f32| -> Result<Array> {
-        let v_cond =
-            transformer.forward_with_control(&prep, x, timestep, control_context_scale, None)?;
+        let v_cond = transformer.forward_with_control_rungs(
+            &prep,
+            x,
+            timestep,
+            control_context_scale,
+            None,
+            plan,
+            window,
+        )?;
         match &neg_prep {
             Some(np) => {
-                let v_uncond = transformer.forward_with_control(
+                let v_uncond = transformer.forward_with_control_rungs(
                     np,
                     x,
                     timestep,
                     control_context_scale,
                     None,
+                    plan,
+                    window,
                 )?;
                 // v = v_uncond + guidance·(v_cond − v_uncond).
                 let delta = v_cond.subtract(&v_uncond)?;
@@ -317,14 +521,17 @@ pub fn denoise_control_cfg_with_progress(
         }
     };
     let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
-    run_flow_sampler(
+    let sigmas = &scheduler.sigmas[start..];
+    let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
+    run_flow_sampler_with_latent_hook(
         sampler_name,
         TimestepConvention::OneMinusSigma,
-        &scheduler.sigmas[start..],
+        sigmas,
         latents,
         seed,
         cancel,
         on_progress,
+        |latents, sigma| crate::preview::emit_preview(preview, &previews, sigmas, sigma, latents),
         predict,
     )
 }
@@ -395,6 +602,7 @@ pub(crate) fn encode_prompt(
     text_encoder: &TextEncoder,
     prompt: &str,
     id: &str,
+    encoder_window: Option<EncoderWindow<'_>>,
 ) -> Result<Array> {
     let t = tokenizer.tokenize(prompt)?;
     let (input_ids, attention_mask) = mlx_gen::tokenizer::to_arrays(&t);
@@ -405,7 +613,7 @@ pub(crate) fn encode_prompt(
     if num_valid == 0 {
         return Err(Error::Msg(format!("{id}: empty prompt")));
     }
-    let enc = text_encoder.forward(&input_ids, &attention_mask)?;
+    let enc = EncoderWindow::encode(encoder_window, text_encoder, &input_ids, &attention_mask)?;
     slice_valid(&enc, num_valid)
 }
 
@@ -433,6 +641,7 @@ pub(crate) fn encode_uncond(
     tokenizer: &TextTokenizer,
     text_encoder: &TextEncoder,
     negative: &str,
+    encoder_window: Option<EncoderWindow<'_>>,
 ) -> Result<Array> {
     let t = if negative.is_empty() {
         // `add_special_tokens = true` mirrors `tokenize`'s `encode(text, true)` (Qwen adds no BOS/EOS,
@@ -455,39 +664,235 @@ pub(crate) fn encode_uncond(
             "z_image: negative conditioning has no valid tokens".into(),
         ));
     }
-    let enc = text_encoder.forward(&input_ids, &attention_mask)?;
+    let enc = EncoderWindow::encode(encoder_window, text_encoder, &input_ids, &attention_mask)?;
     slice_valid(&enc, num_valid)
 }
 
-/// Resolve the single img2img init image + its strength from the request's conditioning (F-035). The
-/// per-reference strength wins over `req.strength`. Z-Image conditions on exactly one init image, so
-/// more than one `Reference` is an error (multi-image is `MultiReference`, unadvertised here).
-pub(crate) fn resolve_reference<'a>(
+/// Request-scoped memory-ladder controls shared by every Z-Image variant.
+pub(crate) struct RequestRungs<'a> {
+    pub(crate) stage_residency: bool,
+    pub(crate) streamable: bool,
+    pub(crate) tiling: Option<TilingConfig>,
+    pub(crate) attention_budget: AttentionBudget,
+    pub(crate) block_window: Option<usize>,
+    pub(crate) encoder_window: Option<EncoderWindow<'a>>,
+}
+
+/// Resolve the family memory preamble once. Preview cadence/state deliberately remains outside this
+/// helper and outside the request scope core.
+pub(crate) fn resolve_request_rungs<'a>(
     req: &'a GenerationRequest,
-    id: &str,
-) -> Result<Option<(&'a Image, Option<f32>)>> {
-    let mut reference = None;
-    for c in &req.conditioning {
-        if let Conditioning::Reference { image, strength } = c {
-            if reference.is_some() {
-                return Err(Error::Msg(format!(
-                    "{id}: multiple reference images are not supported (single img2img init only)"
-                )));
-            }
-            reference = Some((image, strength.or(req.strength)));
-        }
-    }
-    Ok(reference)
+    contract: &mlx_gen::gen_core::MemoryProviderContract,
+    model_id: &str,
+) -> Result<RequestRungs<'a>> {
+    let stage_residency = req.memory.is_some_and(|memory| memory.stage_residency);
+    let streamable = contract.lifecycle.transformer_window_materialization;
+    Ok(RequestRungs {
+        stage_residency,
+        streamable,
+        tiling: decode_tiling(req, stage_residency),
+        attention_budget: attention_budget(req),
+        block_window: resolve_block_window(req, streamable, model_id)?,
+        encoder_window: EncoderWindow::resolve(req, streamable, model_id)?,
+    })
 }
 
 /// The decode-time tiling policy for a request (sc-13571, GitHub #1658). `is_sequential` is the
 /// fit-gate's memory-constrained-Mac signal (`OffloadPolicy::Sequential`): under it the VAE decode is
 /// tiled to bound its ~14 GiB 1024² transient; a large-memory `Resident` machine decodes EXACTLY
-/// (untiled, `None`), except for a very large output that would spike past even a big Mac. 512 px is the
-/// parity sweet spot for this GroupNorm VAE — visually seam-free at 1024²/1280², where smaller tiles
-/// would drift the per-tile norm statistics.
+/// (untiled, `None`), except for a very large output that would spike past even a big Mac. The 512 px
+/// default is the calibrated policy point. Since SC-19753 every GroupNorm retains full-activation
+/// statistics and only halo-expanded convolution work tiles, so smaller edges no longer introduce
+/// per-crop normalization drift.
 pub(crate) fn decode_tiling(req: &GenerationRequest, is_sequential: bool) -> Option<TilingConfig> {
-    (is_sequential || req.width.max(req.height) > 2048).then(|| TilingConfig::spatial_only(512, 64))
+    // SC-15615: the shared selector's explicit bounded-decode signal (`GenerationMemory::tile_vae_decode`)
+    // joins the two historical triggers. The ladder is cumulative — a selector that picks rung 3
+    // (bounded attention) also sets rung 2 — so without this a contract-driven rung-3 selection on a
+    // `Resident` load would silently decode untiled.
+    //
+    // SC-15510: the tile geometry is no longer hardcoded. A selection carries the exact edge/overlap
+    // it was calibrated at, from the ladder the contract publishes; the two historical triggers, and
+    // a selection that names no geometry, keep the 512/64 default this VAE was tuned at (sc-13571).
+    // Publishing a one-element candidate list was what blocked SC-15508's "a single-point pass cannot
+    // mark untested production parameters Verified".
+    let requested = req.memory.is_some_and(|m| m.tile_vae_decode);
+    (is_sequential || requested || req.width.max(req.height) > 2048).then(|| {
+        let (edge, overlap) = decode_tile_geometry(req);
+        TilingConfig::spatial_only(edge as i32, overlap as i32)
+    })
+}
+
+/// The (edge, overlap) a request decodes at: the selection's values when it names them, else the
+/// provider default. Pure, so the ladder's plumbing is unit-testable without a VAE.
+pub(crate) fn decode_tile_geometry(req: &GenerationRequest) -> (u32, u32) {
+    let memory = req.memory;
+    (
+        memory
+            .and_then(|m| m.decode_tile_edge)
+            .unwrap_or(crate::memory_strategy::DECODE_TILE_EDGE),
+        memory
+            .and_then(|m| m.decode_overlap)
+            .unwrap_or(crate::memory_strategy::DECODE_OVERLAP),
+    )
+}
+
+/// The transformer-residency window for one request (SC-15754, ladder rung 4).
+///
+/// [`GenerationMemory::stream_transformer_blocks`] is the shared selector's rung-4 signal and
+/// `transformer_window_size` its parameter; a selection that sets the flag without a size falls back
+/// to the provider's default window. `None` — every request that did not select rung 4 — is the
+/// historical resident stack, untouched.
+pub(crate) fn block_window_size(req: &GenerationRequest) -> Option<usize> {
+    let memory = req.memory?;
+    memory.stream_transformer_blocks.then(|| {
+        memory
+            .transformer_window_size
+            .unwrap_or(crate::memory_strategy::TRANSFORMER_WINDOW_SIZE) as usize
+    })
+}
+
+/// [`block_window_size`] plus the load-shape precondition, shared by all four generators.
+///
+/// **Why this rejects instead of degrading.** Streaming bounds transformer residency only if the
+/// resident `layers` are *not* also materialized. SC-15998 makes that an explicit deferred-
+/// materialization load shape independent from phase-level [`mlx_gen::OffloadPolicy`]. Both a
+/// Resident+Deferred generator (warm across requests) and a Sequential+Deferred generator (released
+/// between phases) satisfy it; an eager load does not.
+///
+/// A deferred generator must never fall back to its lazy resident stack merely because this request
+/// did not select DiT scope. Such a fallback would materialize and retain the stack, so a later
+/// rung-4 request on the same cached generator would stream blocks *in addition to* those retained
+/// weights. The all-covering window preserves the deferred load shape without claiming a memory
+/// bound; only the request-selected smaller window is rung 4.
+pub(crate) fn resolve_block_window(
+    req: &GenerationRequest,
+    supports_deferred_materialization: bool,
+    id: &str,
+) -> Result<Option<usize>> {
+    let requested = resolve_window_for(req, supports_deferred_materialization, id)?;
+    if !supports_deferred_materialization {
+        return Ok(None);
+    }
+    Ok(Some(
+        requested
+            .filter(|_| block_window_component(req).includes_dit())
+            .unwrap_or_else(|| crate::transformer::ZImageTransformerConfig::turbo().n_layers),
+    ))
+}
+
+/// The rung-4 **component scope** for this request (SC-15794). `None` ⇒ [`TransformerComponent::Dit`],
+/// the by-convention scope every request had before the component existed.
+pub(crate) fn block_window_component(req: &GenerationRequest) -> TransformerComponent {
+    req.memory
+        .and_then(|m| m.transformer_window_component)
+        .unwrap_or_default()
+}
+
+/// [`resolve_block_window`]'s text-encoder twin (SC-15794): the window to apply to the **conditioning**
+/// stack, or `None` when this request's component scope excludes the encoder.
+///
+/// Shares the deferred-load precondition for the same reason: an eager encoder already holds its
+/// layers, so adding a window would add memory rather than bound it.
+pub(crate) fn resolve_encoder_window(
+    req: &GenerationRequest,
+    supports_deferred_materialization: bool,
+    id: &str,
+) -> Result<Option<usize>> {
+    Ok(
+        resolve_window_for(req, supports_deferred_materialization, id)?
+            .filter(|_| block_window_component(req).includes_text_encoder()),
+    )
+}
+
+/// The requested window plus the shared load-shape precondition, before the component scope narrows it.
+fn resolve_window_for(
+    req: &GenerationRequest,
+    supports_deferred_materialization: bool,
+    id: &str,
+) -> Result<Option<usize>> {
+    let window = block_window_size(req);
+    if window.is_some() && !supports_deferred_materialization {
+        return Err(Error::Unsupported(format!(
+            "{id}: bounded transformer residency needs a deferred-materialization load shape — this \
+             generator eagerly materializes the trunk, so a window would add memory rather than \
+             bound it. Load with LoadShape::DeferredMaterialization."
+        )));
+    }
+    Ok(window)
+}
+
+/// One request's rung-4 text-encoder scope: the window, plus the cancel flag its boundaries are
+/// checked against. `Copy`, so it threads through the encode helpers as cheaply as the window alone.
+#[derive(Clone, Copy)]
+pub(crate) struct EncoderWindow<'a> {
+    pub(crate) window: usize,
+    pub(crate) cancel: &'a CancelFlag,
+}
+
+impl<'a> EncoderWindow<'a> {
+    /// The scope for this request, or `None` when the encoder is not in it.
+    pub(crate) fn resolve(
+        req: &'a GenerationRequest,
+        supports_deferred_materialization: bool,
+        id: &str,
+    ) -> Result<Option<Self>> {
+        Ok(
+            resolve_encoder_window(req, supports_deferred_materialization, id)?.map(|window| {
+                Self {
+                    window,
+                    cancel: &req.cancel,
+                }
+            }),
+        )
+    }
+
+    /// Run `text_encoder` under this scope, or resident when there is none.
+    fn encode(
+        scope: Option<Self>,
+        text_encoder: &TextEncoder,
+        input_ids: &Array,
+        attention_mask: &Array,
+    ) -> Result<Array> {
+        match scope {
+            Some(s) => text_encoder.forward_windowed(input_ids, attention_mask, s.window, s.cancel),
+            None => text_encoder.forward(input_ids, attention_mask),
+        }
+    }
+}
+
+/// Request-local, calibration-only fault injection at a physical phase boundary (SC-15449's
+/// [`GenerationMemory::calibration_error_phase`](mlx_gen::gen_core::GenerationMemory), the MLX twin of
+/// `candle_gen_krea`'s `maybe_inject_calibration_error`).
+///
+/// This is what lets the cross-backend conformance harness verify the story's **cleanup on error**
+/// requirement the same way it verifies cancellation: fail deterministically at a named boundary, then
+/// assert the next request is unaffected. Production selectors leave the field `None` (the default),
+/// so every ordinary request is untouched — the check is a `None` comparison.
+pub(crate) fn calibration_fault(
+    req: &GenerationRequest,
+    phase: mlx_gen::gen_core::MemoryPhase,
+    id: &str,
+) -> Result<()> {
+    match req.memory {
+        Some(memory) if memory.calibration_error_phase == Some(phase) => Err(Error::Msg(format!(
+            "{id}: injected memory-strategy calibration error at {phase:?}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// The attention rung for one request (SC-15615, ladder rung 3).
+///
+/// [`GenerationMemory::chunk_attention`] is the shared selector's rung-3 signal; the exact score
+/// budget is the single provider-declared [`mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET`],
+/// which is also the value published in the provider contract's `attention_chunk_sizes` and
+/// re-validated by the request scope's `configure_attention`. Anything else — including a warm
+/// request that carried a rung last time — is the unbounded, byte-identical forward.
+pub(crate) fn attention_budget(req: &GenerationRequest) -> AttentionBudget {
+    match req.memory {
+        Some(memory) if memory.chunk_attention => AttentionBudget::CONSTRAINED,
+        _ => AttentionBudget::UNBOUNDED,
+    }
 }
 
 /// Phase 1 of the staged render (sc-13571): the per-image denoise count loop → `Vec` of **evaluated**
@@ -532,25 +937,24 @@ pub(crate) fn denoise_batch(
 }
 
 /// Phase 2 of the staged render (sc-13571): decode each evaluated latent → RGB8 [`Image`]. Uses the
-/// memory-bounded [`Vae::decode_tiled`] when `tiling` is `Some` (small-Mac / large-image), else the
-/// exact single-pass [`Vae::decode`]; a PiD super-res decoder, when present, takes precedence (its own
-/// decode, untiled). `[16,1,H,W] → [1,16,H,W]`; the native VAE + PiD both accept the 4-D latent directly.
+/// memory-bounded [`LatentDecoder::decode_tiled`] when `tiling` is `Some` (small-Mac / large-image),
+/// else the exact single-pass [`LatentDecoder::decode`]. Native VAE and PiD now share this one entry;
+/// PiD inherits the forwarding default and retains its own tiling policy. `[16,1,H,W] → [1,16,H,W]`.
 pub(crate) fn decode_batch(
-    vae: &Vae,
-    pid_decoder: Option<&dyn LatentDecoder>,
+    decoder: &dyn LatentDecoder,
     tiling: Option<&TilingConfig>,
     latents: Vec<Array>,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
+    mlx_gen::ensure_decoder_compatible(Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE), decoder)?;
     let mut images = Vec::with_capacity(latents.len());
     for latent in latents {
         on_progress(Progress::Decoding);
         let unpacked = unpack_latents(&latent)?;
-        let decoded = match (pid_decoder, tiling) {
-            (Some(pid), _) => pid.decode(&unpacked)?,
-            (None, Some(cfg)) => vae.decode_tiled(&unpacked, cfg, Some(cancel))?,
-            (None, None) => vae.decode(&unpacked)?,
+        let decoded = match tiling {
+            Some(cfg) => decoder.decode_tiled(&unpacked, cfg, Some(cancel))?,
+            None => decoder.decode(&unpacked)?,
         };
         images.push(decoded_to_image(&decoded.as_dtype(Dtype::Float32)?)?);
     }
@@ -587,6 +991,9 @@ pub(crate) fn render_sample(
         noise,
         cap,
         0,
+        // Training previews never select a memory rung; keep the unbounded (byte-identical) forward.
+        AttentionBudget::UNBOUNDED,
+        None,
         cancel,
         &mut |_| {},
     )?;
@@ -604,7 +1011,98 @@ pub(crate) fn render_sample(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+    use mlx_gen::Conditioning;
+
+    struct DecodeSpy {
+        output: Array,
+        calls: Cell<usize>,
+    }
+
+    impl DecodeSpy {
+        fn new(output: Array) -> Self {
+            Self {
+                output,
+                calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl LatentDecoder for DecodeSpy {
+        fn input_latent_space(&self) -> Option<&mlx_gen::gen_core::LatentSpace> {
+            Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE)
+        }
+
+        fn decode(&self, _latents: &Array) -> Result<Array> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(self.output.clone())
+        }
+    }
+
+    fn legacy_decode_one(decoder: &dyn LatentDecoder, latent: &Array) -> Image {
+        let unpacked = unpack_latents(latent).unwrap();
+        let decoded = decoder
+            .decode(&unpacked)
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        decoded_to_image(&decoded).unwrap()
+    }
+
+    /// SC-18309 N1: compare the full Z-Image engine's latent-unpack/decode/RGB route with the exact
+    /// historical no-override expression. The PiD-shaped arm pins override output layout and the
+    /// trait's no-op handling of native tile geometry.
+    #[test]
+    fn decode_batch_keeps_native_and_override_bytes_exact() {
+        let latent = Array::from_slice(&[0.0f32; 16 * 2 * 3], &[16, 1, 2, 3]);
+        let native_output = Array::from_slice(
+            &[
+                -1.0f32, -0.5, 0.0, 0.5, 1.0, 0.25, 1.0, 0.5, 0.0, -0.5, -1.0, -0.25, -0.75, -0.25,
+                0.25, 0.75, -1.0, 1.0,
+            ],
+            &[1, 3, 1, 2, 3],
+        );
+        let legacy = DecodeSpy::new(native_output.clone());
+        let expected = legacy_decode_one(&legacy, &latent);
+        let native = DecodeSpy::new(native_output);
+        let cancel = CancelFlag::new();
+        let got = decode_batch(&native, None, vec![latent.clone()], &cancel, &mut |_| {}).unwrap();
+        assert_eq!(got, vec![expected]);
+        assert_eq!(native.calls.get(), 1);
+
+        let pid_output = Array::from_slice(&vec![1.0f32; 3 * 4 * 5], &[1, 3, 4, 5]);
+        let legacy_pid = DecodeSpy::new(pid_output.clone());
+        let expected_pid = legacy_decode_one(&legacy_pid, &latent);
+        let pid = DecodeSpy::new(pid_output);
+        let tiling = TilingConfig::spatial_only(16, 4);
+        let got = decode_batch(&pid, Some(&tiling), vec![latent], &cancel, &mut |_| {}).unwrap();
+        assert_eq!(got, vec![expected_pid]);
+        assert_eq!(pid.calls.get(), 1);
+    }
+
+    #[test]
+    fn every_variant_uses_the_canonical_request_rung_preamble() {
+        for (name, source) in [
+            ("turbo", include_str!("model.rs")),
+            ("base", include_str!("model_base.rs")),
+            ("turbo-control", include_str!("model_control.rs")),
+            ("base-control", include_str!("model_base_control.rs")),
+        ] {
+            assert_eq!(
+                source
+                    .matches("pipeline::resolve_request_rungs(req")
+                    .count(),
+                1,
+                "{name} must use the canonical preamble exactly once"
+            );
+            assert!(
+                !source.contains("pipeline::resolve_block_window(req"),
+                "{name} bypassed the canonical preamble"
+            );
+        }
+    }
 
     fn img(w: u32, h: u32) -> Image {
         Image {
@@ -612,6 +1110,157 @@ mod tests {
             height: h,
             pixels: vec![0u8; (w * h * 3) as usize],
         }
+    }
+
+    fn req(
+        w: u32,
+        h: u32,
+        memory: Option<mlx_gen::gen_core::GenerationMemory>,
+    ) -> GenerationRequest {
+        GenerationRequest {
+            prompt: "a fox".into(),
+            width: w,
+            height: h,
+            memory,
+            ..Default::default()
+        }
+    }
+
+    /// SC-15615: the shared selector's explicit bounded-decode signal is a THIRD trigger alongside the
+    /// two historical ones, so a contract-driven rung-2/3 selection tiles even on a `Resident` load.
+    #[test]
+    fn decode_tiling_honors_the_selector_signal_as_well_as_the_legacy_triggers() {
+        use mlx_gen::gen_core::GenerationMemory;
+
+        // Historical triggers, unchanged: Sequential, or an output edge above 2048.
+        assert!(decode_tiling(&req(1024, 1024, None), true).is_some());
+        assert!(decode_tiling(&req(2560, 1024, None), false).is_some());
+        let evidence_probe = decode_tiling(&req(512, 512, None), true)
+            .expect("sequential requests retain the historical tiling configuration");
+        assert!(
+            !evidence_probe.needs_tiling(mlx_gen::VaeTiling::QWEN_IMAGE, 1, 64, 64),
+            "the 512px residency A/B must fall back to the exact single-pass decode"
+        );
+        // The default resident 1024² render still decodes EXACTLY (untiled) — no behaviour change.
+        assert!(decode_tiling(&req(1024, 1024, None), false).is_none());
+        // A staged-only selection does not ask for tiling, so it must not get it.
+        assert!(
+            decode_tiling(&req(1024, 1024, Some(GenerationMemory::default())), false).is_none()
+        );
+        // The rung-2 signal does, on a Resident load.
+        let tiled = decode_tiling(
+            &req(
+                1024,
+                1024,
+                Some(GenerationMemory {
+                    tile_vae_decode: true,
+                    ..Default::default()
+                }),
+            ),
+            false,
+        )
+        .expect("the bounded-decode signal must engage tiling");
+        // And it is the same 512/64 spatial-only policy the contract advertises — not a new one.
+        let spatial = tiled.spatial.expect("spatial tiling");
+        assert_eq!(
+            (spatial.tile_px, spatial.overlap_px),
+            (
+                crate::memory_strategy::DECODE_TILE_EDGE as i32,
+                crate::memory_strategy::DECODE_OVERLAP as i32
+            ),
+            "the executed tile geometry must match the contract's advertised candidates"
+        );
+        assert!(tiled.temporal.is_none(), "z-image decode is spatial-only");
+    }
+
+    /// Calibration fault injection is inert unless a request explicitly names a phase, and fires at
+    /// exactly the named one. This is the hook the conformance harness uses to verify the story's
+    /// **cleanup on error** requirement.
+    #[test]
+    fn calibration_faults_fire_only_at_the_named_phase() {
+        use mlx_gen::gen_core::{GenerationMemory, MemoryPhase};
+
+        const PHASES: [MemoryPhase; 3] = [
+            MemoryPhase::Conditioning,
+            MemoryPhase::Denoise,
+            MemoryPhase::Decode,
+        ];
+
+        // No memory block, and a memory block with no named phase: every boundary passes.
+        for memory in [None, Some(GenerationMemory::default())] {
+            let r = req(1024, 1024, memory);
+            for phase in PHASES {
+                calibration_fault(&r, phase, "z_image_turbo").unwrap();
+            }
+        }
+
+        // A named phase fails at that phase and only that phase.
+        for named in PHASES {
+            let r = req(
+                1024,
+                1024,
+                Some(GenerationMemory {
+                    calibration_error_phase: Some(named),
+                    calibration_fault_harness_authorized: true,
+                    ..Default::default()
+                }),
+            );
+            for phase in PHASES {
+                let result = calibration_fault(&r, phase, "z_image_turbo");
+                if phase == named {
+                    let err = result.unwrap_err().to_string();
+                    assert!(
+                        err.contains("injected memory-strategy calibration error"),
+                        "{err}"
+                    );
+                    assert!(err.contains(&format!("{named:?}")), "{err}");
+                    assert!(err.contains("z_image_turbo"), "{err}");
+                } else {
+                    result.unwrap_or_else(|e| {
+                        panic!("fault named at {named:?} must not fire at {phase:?}: {e}")
+                    });
+                }
+            }
+        }
+    }
+
+    /// The rung-3 request knob maps onto exactly one budget, and nothing else engages it.
+    #[test]
+    fn attention_budget_engages_only_on_the_rung_three_signal() {
+        use mlx_gen::attention::AttentionBudget;
+        use mlx_gen::gen_core::GenerationMemory;
+
+        assert_eq!(
+            attention_budget(&req(1024, 1024, None)),
+            AttentionBudget::UNBOUNDED
+        );
+        assert_eq!(
+            attention_budget(&req(1024, 1024, Some(GenerationMemory::default()))),
+            AttentionBudget::UNBOUNDED
+        );
+        assert_eq!(
+            attention_budget(&req(
+                1024,
+                1024,
+                Some(GenerationMemory {
+                    tile_vae_decode: true,
+                    ..Default::default()
+                })
+            )),
+            AttentionBudget::UNBOUNDED
+        );
+        assert_eq!(
+            attention_budget(&req(
+                1024,
+                1024,
+                Some(GenerationMemory {
+                    tile_vae_decode: true,
+                    chunk_attention: true,
+                    ..Default::default()
+                })
+            )),
+            AttentionBudget::CONSTRAINED
+        );
     }
 
     #[test]

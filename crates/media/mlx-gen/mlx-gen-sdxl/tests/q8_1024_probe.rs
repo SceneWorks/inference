@@ -9,9 +9,9 @@
 //!
 //! A coherent SDXL render has high pixel variance; a collapsed one sits near-constant (std ~11).
 //! `#[ignore]`d — needs the SDXL base snapshot. Run:
-//!   cargo test -p mlx-gen-sdxl --release --test q8_1024_probe -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sdxl --release --test integration q8_1024_probe:: -- --ignored --nocapture
 
-mod common;
+use crate::common;
 
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, Quant, WeightsSource};
 

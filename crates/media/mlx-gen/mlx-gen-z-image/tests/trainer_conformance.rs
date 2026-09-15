@@ -6,7 +6,7 @@
 //! trainer will be held to identically. `#[ignore]` because it needs the real
 //! `Tongyi-MAI/Z-Image-Turbo` weights (`ZIMAGE_SNAPSHOT` or the HF cache); run on the self-hosted
 //! Apple-Silicon runner or a populated dev box:
-//!   cargo test -p mlx-gen-z-image --release --test trainer_conformance -- --ignored --nocapture
+//!   cargo test -p mlx-gen-z-image --release --test integration trainer_conformance:: -- --ignored --nocapture
 //!
 //! `trainer_conformance` constructs a fresh trainer per train()-invoking check (the cancellation
 //! paths + the progress run), because `train` is `&mut self` and the trainer is effectively
@@ -18,7 +18,7 @@ use std::path::Path;
 use gen_core_testkit::TrainerProfile;
 use mlx_gen::{LoadSpec, TrainingItem, WeightsSource};
 
-mod common;
+use crate::common;
 use common::snapshot;
 
 /// Two solid-colour swatch PNGs + captions in `dir` (mirrors the trainer e2e dataset).
@@ -37,6 +37,7 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
             image_path: path,
             caption: format!("a solid colour swatch number {i}"),
             control_image_path: None,
+            model_options: Default::default(),
         });
     }
     items
@@ -46,7 +47,8 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
 #[ignore = "needs real Z-Image-Turbo weights (ZIMAGE_SNAPSHOT or HF cache); macos-mlx / dev box only"]
 fn z_image_turbo_trainer_satisfies_gen_core_contract() {
     assert_eq!(mlx_gen_z_image::MODEL_ID, "z_image_turbo");
-    let tmp = std::env::temp_dir().join("z_image_trainer_conformance");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp.join("data"));
     let profile = TrainerProfile::cheap(items, tmp.join("out"));
     let snap = snapshot();

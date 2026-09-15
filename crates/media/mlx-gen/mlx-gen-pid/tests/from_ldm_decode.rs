@@ -13,7 +13,7 @@
 //!
 //! `#[ignore]`d (needs the PiD qwenimage ckpt + gemma + the `dump_runb_latents` outputs). Run:
 //! ```sh
-//! cargo test -p mlx-gen-pid --release --test from_ldm_decode -- --ignored --nocapture
+//! cargo test -p mlx-gen-pid --release --test integration from_ldm_decode:: -- --ignored --nocapture
 //! ```
 
 use mlx_gen::decoder::LatentDecoder;

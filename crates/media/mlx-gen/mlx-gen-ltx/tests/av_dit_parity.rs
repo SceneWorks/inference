@@ -10,7 +10,7 @@
 //! **The goldens MUST match the Rust build's MLX — now 0.32.0** (re-dumped sc-12896 on the non-NAX
 //! from-source env; see `dit_parity.rs` for the full 0.32.0 cross-stack contract rationale).
 //!
-//! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test av_dit_parity -- --ignored --nocapture`
+//! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test integration av_dit_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max as max_op, subtract, sum};
 use mlx_rs::{Array, Dtype};
@@ -90,6 +90,7 @@ fn run(bf16: bool, golden: &str) {
             None,
             g.require("audio_positions").unwrap(),
             None,
+            None,
         )
         .expect("av dit forward");
 
@@ -116,6 +117,7 @@ fn run(bf16: bool, golden: &str) {
             g.require("audio_context").unwrap(),
             None,
             g.require("audio_positions").unwrap(),
+            None,
             Some(dit.next_rope_epoch()),
         )
         .expect("av dit forward (epoch path)");

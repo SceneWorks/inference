@@ -363,8 +363,9 @@ mod tests {
     use mlx_rs::ops::{all_close, array_eq};
     use std::path::PathBuf;
 
-    fn tmp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("mlx_gen_scail2_lora_test");
+    fn scratch_file(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
+        // Per-process scratch dir — a fixed `$TMPDIR` name races a second concurrent `cargo test`.
+        let dir = tmp.path().join("mlx_gen_scail2_lora_test");
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
     }
@@ -378,8 +379,8 @@ mod tests {
     /// A small SCAIL-2-shaped dense weight map: one block projection (Linear + bias), one qk-RMSNorm
     /// (weight only), and a `patch_embedding` Conv stem (5-D weight + bias) standing in for the
     /// cross-architecture target — all the distinct diff-patch module shapes.
-    fn synthetic_dit() -> Weights {
-        let path = tmp("dit.safetensors");
+    fn synthetic_dit(tmp: &tempfile::TempDir) -> Weights {
+        let path = scratch_file(tmp, "dit.safetensors");
         let q_w = f32(
             (0..16 * 8).map(|i| i as f32 * 0.01 - 0.3).collect(),
             &[16, 8],
@@ -410,8 +411,8 @@ mod tests {
     /// A diff-patch LoRA over the synthetic DiT: the q projection gets low-rank factors + a `.diff_b`
     /// bias delta; norm_q gets a full-rank `.diff`; patch_embedding gets a shape-INCOMPATIBLE `.diff`
     /// (in_dim 6 vs 4) + a (shape-compatible) `.diff_b` — the cross-architecture case.
-    fn write_diff_patch(name: &str) -> PathBuf {
-        let path = tmp(name);
+    fn write_diff_patch(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
+        let path = scratch_file(tmp, name);
         let rank = 4;
         let down = f32(
             (0..rank * 8)
@@ -458,10 +459,11 @@ mod tests {
 
     #[test]
     fn detects_diff_patch_file() {
-        let dp = write_diff_patch("detect.safetensors");
+        let tmp = tempfile::tempdir().unwrap();
+        let dp = write_diff_patch(&tmp, "detect.safetensors");
         assert!(has_diff_patch_keys(&dp).unwrap());
         // A pure low-rank file (no .diff/.diff_b) is NOT a diff-patch file.
-        let plain = tmp("plain.safetensors");
+        let plain = scratch_file(&tmp, "plain.safetensors");
         let down = f32(vec![0.1; 4 * 8], &[4, 8]);
         let up = f32(vec![0.1; 16 * 4], &[16, 4]);
         Array::save_safetensors(
@@ -481,8 +483,9 @@ mod tests {
 
     #[test]
     fn merges_lora_diff_and_diffb_skips_cross_arch() {
-        let dp = write_diff_patch("merge.safetensors");
-        let mut w = synthetic_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let dp = write_diff_patch(&tmp, "merge.safetensors");
+        let mut w = synthetic_dit(&tmp);
         let report = merge_diff_patch_adapters(&mut w, &[&spec(dp.clone(), 1.0)]).unwrap();
 
         // sc-18198: ONLY the full-rank `.diff` folds here. q's low-rank factors are deferred to the
@@ -501,7 +504,7 @@ mod tests {
         assert!(report.skipped_unmatched.is_empty());
 
         // patch_embedding stays bit-identical (skipped entirely — weight AND bias).
-        let base = synthetic_dit();
+        let base = synthetic_dit(&tmp);
         for k in ["patch_embedding.weight", "patch_embedding.bias"] {
             assert!(
                 array_eq(w.require(k).unwrap(), base.require(k).unwrap(), false)
@@ -566,11 +569,12 @@ mod tests {
     /// projection for the residual pass, rather than failing the whole file.
     #[test]
     fn packed_projection_defers_low_rank_and_still_folds_dense_targets() {
-        let dp = write_diff_patch("packed.safetensors");
-        let mut w = synthetic_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let dp = write_diff_patch(&tmp, "packed.safetensors");
+        let mut w = synthetic_dit(&tmp);
         pack_q(&mut w);
         let before = {
-            let mut b = synthetic_dit();
+            let mut b = synthetic_dit(&tmp);
             pack_q(&mut b);
             b
         };
@@ -626,7 +630,8 @@ mod tests {
     /// silently half-applied patch, so it must be a hard error even though other targets applied.
     #[test]
     fn full_rank_diff_on_a_packed_target_is_a_hard_error() {
-        let path = tmp("packed_diff.safetensors");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = scratch_file(&tmp, "packed_diff.safetensors");
         // A `.diff` shaped like the DENSE q weight — on a packed base it cannot be folded.
         let q_diff = f32((0..16 * 8).map(|i| i as f32 * 0.001).collect(), &[16, 8]);
         let norm_diff = f32((0..8).map(|i| i as f32 * 0.01).collect(), &[8]);
@@ -640,7 +645,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut w = synthetic_dit();
+        let mut w = synthetic_dit(&tmp);
         pack_q(&mut w);
         let report = merge_diff_patch_adapters(&mut w, &[&spec(path, 1.0)]).unwrap();
         assert_eq!(
@@ -662,13 +667,14 @@ mod tests {
     /// `supports_lokr` — from the residual pass entirely, with no error. This pins all four shapes.
     #[test]
     fn residual_pass_membership_is_by_exclusion_not_an_allow_list() {
-        let hybrid = write_diff_patch("lowrank_hybrid.safetensors");
+        let tmp = tempfile::tempdir().unwrap();
+        let hybrid = write_diff_patch(&tmp, "lowrank_hybrid.safetensors");
         assert!(has_residual_installable_keys(&hybrid).unwrap());
         assert!(has_diff_patch_keys(&hybrid).unwrap());
 
         // Pure `.diff` (+ a bare `.alpha`, a scalar modifier and never a target on its own): nothing
         // for the strict installer to resolve, so it must stay OUT or it reads as "matched nothing".
-        let pure_diff = tmp("lowrank_pure_diff.safetensors");
+        let pure_diff = scratch_file(&tmp, "lowrank_pure_diff.safetensors");
         let d = f32((0..8).map(|i| i as f32 * 0.01).collect(), &[8]);
         let a = f32(vec![4.0], &[1]);
         Array::save_safetensors(
@@ -687,7 +693,7 @@ mod tests {
         );
 
         // PEFT spelling, not just the diffusers/ComfyUI one.
-        let peft = tmp("lowrank_peft.safetensors");
+        let peft = scratch_file(&tmp, "lowrank_peft.safetensors");
         let down = f32(vec![0.1; 4 * 8], &[4, 8]);
         let up = f32(vec![0.1; 16 * 4], &[16, 4]);
         Array::save_safetensors(
@@ -704,7 +710,7 @@ mod tests {
 
         // LoKr — the regression this test exists for. Its factor names share no suffix with the LoRA
         // spellings, so any allow-list of `lora_*` keys drops it silently.
-        let lokr = tmp("lowrank_lokr.safetensors");
+        let lokr = scratch_file(&tmp, "lowrank_lokr.safetensors");
         let w1 = f32(vec![0.1; 4 * 4], &[4, 4]);
         let w2 = f32(vec![0.1; 4 * 2], &[4, 2]);
         Array::save_safetensors(
@@ -725,9 +731,10 @@ mod tests {
 
     #[test]
     fn scale_zero_is_noop() {
-        let dp = write_diff_patch("zero.safetensors");
-        let mut w = synthetic_dit();
-        let base = synthetic_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let dp = write_diff_patch(&tmp, "zero.safetensors");
+        let mut w = synthetic_dit(&tmp);
+        let base = synthetic_dit(&tmp);
         let report = merge_diff_patch_adapters(&mut w, &[&spec(dp, 0.0)]).unwrap();
         // Still "merged" (folded a zero delta), but every touched weight is bit-identical to the base.
         // One weight, not two: q's low-rank factors are deferred rather than folded (sc-18198), so
@@ -757,8 +764,9 @@ mod tests {
 
     #[test]
     fn report_errors_when_nothing_matched() {
+        let tmp = tempfile::tempdir().unwrap();
         // A diff-patch file whose only target isn't in the checkpoint → matched-nothing error.
-        let path = tmp("nomatch.safetensors");
+        let path = scratch_file(&tmp, "nomatch.safetensors");
         let diff = f32(vec![0.1; 8], &[8]);
         Array::save_safetensors(
             vec![("diffusion_model.blocks.99.unknown.diff", &diff)],
@@ -766,7 +774,7 @@ mod tests {
             &path,
         )
         .unwrap();
-        let mut w = synthetic_dit();
+        let mut w = synthetic_dit(&tmp);
         let report = merge_diff_patch_adapters(&mut w, &[&spec(path, 1.0)]).unwrap();
         assert_eq!(report.merged_weights, 0);
         assert_eq!(

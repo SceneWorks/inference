@@ -7,7 +7,7 @@
 //! Run (CUDA build on the Blackwell box):
 //!   SAM3_WEIGHTS=<facebook/sam3 snapshot dir OR model.safetensors> \
 //!   SAM3_VISION_FIXTURE=<.../sam3_oracle/vision_fixture.safetensors> \
-//!     cargo test -p candle-gen-sam3 --release --features cuda --test vision_parity -- --ignored --nocapture
+//!     cargo test -p candle-gen-sam3 --release --features cuda --test integration vision_parity:: -- --ignored --nocapture
 
 use std::path::Path;
 

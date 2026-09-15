@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import tempfile
+import json
 import types
 import unittest
 from pathlib import Path
@@ -228,6 +229,26 @@ class MagePrimaryEditOracleTests(unittest.TestCase):
                 with self.assertRaises(self.module.InvalidOracle):
                     self.module._validate_manifest_file_record(mutated, path)
 
+    def test_bundle_verify_reuses_the_file_records_already_hashed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp)
+            records = [
+                {"name": name, "bytes": index + 1, "sha256": f"hash-{index}"}
+                for index, name in enumerate(self.module.EXPECTED_FILES)
+            ]
+            (output / self.module.MANIFEST).write_text(
+                json.dumps({"files": records}), encoding="utf-8"
+            )
+            with (
+                mock.patch.object(self.module, "_revision", return_value="a" * 40),
+                mock.patch.object(self.module, "_validate_manifest_header"),
+                mock.patch.object(self.module, "_validate_files", return_value=records),
+                mock.patch.object(self.module, "_sha256") as digest,
+                mock.patch("builtins.print"),
+            ):
+                self.module.verify(output, output, output)
+            digest.assert_not_called()
+
     def test_every_float_tensor_must_be_finite(self) -> None:
         class Tensor:
             dtype = "float32"
@@ -325,6 +346,39 @@ class MagePrimaryEditOracleTests(unittest.TestCase):
                 "MAGE_VAE_SIZES",
             },
         )
+
+    def test_production_environment_failure_precedes_every_side_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            snapshot = root / ("a" * 40)
+            edit_snapshot = root / ("b" * 40)
+            snapshot.mkdir()
+            edit_snapshot.mkdir()
+            output = root / "oracles"
+            with (
+                mock.patch.object(
+                    self.module,
+                    "_validate_reference_environment",
+                    side_effect=self.module.InvalidOracle("bad reference environment"),
+                ),
+                mock.patch.object(
+                    Path, "mkdir", side_effect=AssertionError("must not mutate output")
+                ),
+                mock.patch.object(
+                    Path, "unlink", side_effect=AssertionError("must not delete")
+                ),
+                mock.patch.object(
+                    Path, "write_text", side_effect=AssertionError("must not write manifest")
+                ),
+                mock.patch.object(
+                    self.module.subprocess,
+                    "run",
+                    side_effect=AssertionError("must not launch producer"),
+                ),
+                self.assertRaisesRegex(self.module.InvalidOracle, "bad reference environment"),
+            ):
+                self.module.provision(output, snapshot, edit_snapshot)
+            self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@
 //!
 //! Run (point at a converted checkpoint):
 //!   SCENEWORKS_SAM2_WEIGHTS=/path/to/sam2.1_hiera_large.safetensors \
-//!     cargo test -p mlx-gen-sam2 --release --test weights_load -- --ignored --nocapture
+//!     cargo test -p mlx-gen-sam2 --release --test integration weights_load:: -- --ignored --nocapture
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sam2::{Sam2ImageEncoderConfig, Sam2Segmenter};

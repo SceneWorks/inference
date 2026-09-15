@@ -281,11 +281,45 @@ pub enum Nvfp4Regime {
     ///
     /// So when the fused kernel is unavailable, W4A4-via-unfused is ~100× *worse than never having
     /// used NVFP4*, while W4A16 costs ~nothing. Routing the gate here is not a compromise; it is
-    /// ~100× the better answer, and the only thing it gives up is the packed footprint (0.28× → 1.00×,
-    /// itself a defect tracked by sc-12121, which makes W4A16 packed-resident). Correctness and
+    /// ~100× the better answer, and the only thing it gives up is the packed footprint (0.28× →
+    /// 1.00× — W4A16 holds a dense bf16 weight, so it is *reported* as dense bf16, never as a native
+    /// NVFP4 footprint). Correctness and
     /// quality are identical in both fallbacks — this is purely about not shipping a 100× cliff behind
     /// a silent `Err(_)`.
     DequantBf16,
+}
+
+/// Why an [`Nvfp4Linear`] is serving [`Nvfp4Regime::DequantBf16`] rather than the packed W4A4 leg
+/// (sc-12121).
+///
+/// The layer already *decides* this at construction; recording the decision costs one enum and lets a
+/// caller that **predicted** a representation say which construction-time fact overruled it, instead of
+/// having to re-derive it (which is impossible for the two runtime accidents,
+/// [`Self::DeviceMismatch`] and [`Self::StagingFailed`] — no plan-time capability probe can see either).
+///
+/// `None` on a layer built into [`Nvfp4Regime::Fp4W4A4`]: the W4A4 leg has no fallback cause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Nvfp4Fallback {
+    /// The caller asked for [`ActPrecision::W4A16`] — the outlier override / storage tier. Not a
+    /// capability miss at all: the packed leg was never attempted.
+    W4A16Requested,
+    /// The bound device is not a CUDA device (CPU, Metal), or this is a non-`cuda` build.
+    NotCudaDevice,
+    /// The packed grid is not one the cuBLASLt FP4 GEMM accepts (padded K not a multiple of
+    /// `NVFP4_K_ALIGN`, or N not a multiple of 16).
+    ShapeIneligible,
+    /// The shared [`Nvfp4Context`] carries no handle: the device is below the `sm_120` floor, or
+    /// handle creation failed.
+    NoDeviceHandle,
+    /// The shared [`Nvfp4Context`] holds a handle, but it is bound to a **different** device than
+    /// this layer's — staging through it would cross streams, so the layer falls back. A runtime
+    /// accident of context sharing, invisible to any per-key capability probe.
+    DeviceMismatch,
+    /// The fused NVFP4 activation quantizer will not compile on this device (sc-12078).
+    NoFusedQuantizer,
+    /// The FP4 weight stage failed on an otherwise-eligible device — an allocation or driver
+    /// accident. Also invisible to any per-key capability probe.
+    StagingFailed,
 }
 
 /// Emit the "fused quantizer unavailable → W4A16" note **once per process** (sc-12078).
@@ -428,16 +462,42 @@ impl Nvfp4Context {
         false
     }
 
+    /// True iff the **fused** NVFP4 activation quantizer compiles on this context's device
+    /// (sc-12121, gate policy sc-12078).
+    ///
+    /// Always `false` without a live handle — a context with no FP4 device has no quantizer either.
+    /// The compile is cached on the shared handle, so asking is free after the first call and the
+    /// first call is one the first W4A4 forward would have paid anyway. A provider uses this to
+    /// *report* the representation its layers will resolve to; [`Nvfp4Linear`] still settles the gate
+    /// itself at construction (`try_build_fp4`), so this is a read of the same fact, never a second
+    /// decider.
+    pub fn fused_quantizer_available(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            return self
+                .inner
+                .as_ref()
+                .is_some_and(|c| c.lt.nvfp4_fused_quantizer_available());
+        }
+        #[allow(unreachable_code)]
+        false
+    }
+
     /// The shared handle, **iff** it is bound to `device`.
     ///
     /// The device check is the one hazard sharing introduces that per-layer handles could not have: a
     /// context built on `cuda:0` handed to a layer on `cuda:1` would stage the weight through the
     /// wrong device's stream. Mismatch is loud and falls back rather than corrupting the layer.
     #[cfg(feature = "cuda")]
-    fn handle_for(&self, device: &Device) -> Option<&std::sync::Arc<super::cublaslt::CublasLt>> {
-        let c = self.inner.as_ref()?;
+    fn handle_for(
+        &self,
+        device: &Device,
+    ) -> std::result::Result<&std::sync::Arc<super::cublaslt::CublasLt>, Nvfp4Fallback> {
+        let Some(c) = self.inner.as_ref() else {
+            return Err(Nvfp4Fallback::NoDeviceHandle);
+        };
         if c.device.same_device(device) {
-            Some(&c.lt)
+            Ok(&c.lt)
         } else {
             eprintln!(
                 "[sc-12274] Nvfp4Linear: shared cuBLASLt context is bound to {:?} but this layer is on \
@@ -445,7 +505,7 @@ impl Nvfp4Context {
                 c.device.location(),
                 device.location()
             );
-            None
+            Err(Nvfp4Fallback::DeviceMismatch)
         }
     }
 }
@@ -471,6 +531,8 @@ pub struct Nvfp4Linear {
     /// The resident bf16 dense weight `[out, in]` for the [`Nvfp4Regime::DequantBf16`] path (dequantized
     /// once at construction). `None` in the FP4 regime.
     dequant_w: Option<Tensor>,
+    /// Why this layer is dense (sc-12121). `None` iff `regime == Fp4W4A4`.
+    fallback: Option<Nvfp4Fallback>,
     /// The resident FP4 compute leg (staged device weight + handle) for [`Nvfp4Regime::Fp4W4A4`].
     #[cfg(feature = "cuda")]
     fp4: Option<Fp4Resident>,
@@ -516,18 +578,28 @@ impl Nvfp4Linear {
         act: ActPrecision,
         ctx: &Nvfp4Context,
     ) -> Result<Self> {
+        // Why the packed leg was not taken — `W4A16Requested` when it was never attempted, else the
+        // construction-time fact `try_build_fp4` refused on (sc-12121).
+        #[allow(unused_mut)]
+        let mut cause = Nvfp4Fallback::W4A16Requested;
         #[cfg(feature = "cuda")]
         {
             if act == ActPrecision::W4A4 {
-                if let Some(built) = Self::try_build_fp4(&weight, &bias, device, ctx)? {
-                    return Ok(built);
+                match Self::try_build_fp4(&weight, &bias, device, ctx)? {
+                    Ok(built) => return Ok(built),
+                    Err(why) => cause = why,
                 }
             }
         }
         #[cfg(not(feature = "cuda"))]
-        let _ = ctx;
+        {
+            let _ = ctx;
+            if act == ActPrecision::W4A4 {
+                cause = Nvfp4Fallback::NotCudaDevice;
+            }
+        }
         // W4A16 override, or the <sm_120 / CPU / non-cuda / ineligible-shape fallback.
-        Self::new_dequant(weight, bias, device, act)
+        Self::new_dequant(weight, bias, device, act, cause)
     }
 
     /// Pack a dense `[out, in]` weight (bf16/f32, any device) to NVFP4 and build (see [`Self::from_packed`]).
@@ -572,11 +644,12 @@ impl Nvfp4Linear {
         )
     }
 
-    /// Attempt to build the resident FP4 (W4A4) compute leg **against a shared handle**. `Ok(None)`
-    /// when the device is not CUDA, the shape is ineligible for the cuBLASLt FP4 path, the fused
-    /// activation quantizer will not compile (sc-12078), or `ctx` carries no handle for this device
-    /// (not `sm_120`+, or handle creation failed) → caller falls back. A weight-staging failure also
-    /// degrades to `Ok(None)` (transparent fallback) with a note.
+    /// Attempt to build the resident FP4 (W4A4) compute leg **against a shared handle**.
+    /// `Ok(Err(cause))` — never a hard error — when the device is not CUDA, the shape is ineligible
+    /// for the cuBLASLt FP4 path, the fused activation quantizer will not compile (sc-12078), `ctx`
+    /// carries no handle for this device (not `sm_120`+, or handle creation failed), or the handle is
+    /// bound to a different device → caller falls back. A weight-staging failure also degrades to a
+    /// transparent fallback, with a note. Each `cause` names which of those it was (sc-12121).
     ///
     /// **sc-12274:** this used to call `CublasLt::new(device)` itself, giving every W4A4 layer its own
     /// 32 MiB workspace. The handle now arrives from [`Nvfp4Context`], which resolved the CUDA +
@@ -589,10 +662,10 @@ impl Nvfp4Linear {
         bias: &Option<Tensor>,
         device: &Device,
         ctx: &Nvfp4Context,
-    ) -> Result<Option<Self>> {
+    ) -> Result<std::result::Result<Self, Nvfp4Fallback>> {
         use super::cublaslt::NVFP4_K_ALIGN;
         if !matches!(device, Device::Cuda(_)) {
-            return Ok(None);
+            return Ok(Err(Nvfp4Fallback::NotCudaDevice));
         }
         // Shape gate: the cuBLASLt FP4 path needs padded-K a multiple of NVFP4_K_ALIGN and N a
         // multiple of 16 (sc-11039). An ineligible shape falls back rather than erroring at runtime.
@@ -602,10 +675,13 @@ impl Nvfp4Linear {
                  path (need K_pad % {NVFP4_K_ALIGN} == 0 and N % 16 == 0); using bf16 fallback",
                 weight.rows, weight.cols, weight.cols_padded
             );
-            return Ok(None);
+            return Ok(Err(Nvfp4Fallback::ShapeIneligible));
         }
-        let Some(lt) = ctx.handle_for(device) else {
-            return Ok(None); // no shared handle for this device (<sm_120 / unavailable) → fallback
+        // No shared handle for this device (<sm_120 / unavailable), or one bound to a different
+        // device — `handle_for` names which (sc-12121).
+        let lt = match ctx.handle_for(device) {
+            Ok(lt) => lt,
+            Err(why) => return Ok(Err(why)),
         };
         // The <sm_120 floor is already settled: `Nvfp4Context::new` probes `meets_nvfp4_floor` once per
         // device and holds NO handle below it (sc-12274), so reaching here with a handle means the
@@ -621,22 +697,23 @@ impl Nvfp4Linear {
         // (sc-12274), the whole trunk pays that compile once instead of once per projection.
         if !lt.nvfp4_fused_quantizer_available() {
             warn_fused_quantizer_unavailable();
-            return Ok(None);
+            return Ok(Err(Nvfp4Fallback::NoFusedQuantizer));
         }
         let w_staged = match lt.stage_nvfp4(weight) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("[sc-11041] Nvfp4Linear: FP4 weight stage failed ({e}); bf16 fallback");
-                return Ok(None);
+                return Ok(Err(Nvfp4Fallback::StagingFailed));
             }
         };
-        Ok(Some(Self {
+        Ok(Ok(Self {
             weight: weight.clone(),
             bias: bias.clone(),
             device: device.clone(),
             act: ActPrecision::W4A4,
             regime: Nvfp4Regime::Fp4W4A4,
             dequant_w: None,
+            fallback: None,
             fp4: Some(Fp4Resident {
                 // The Arc was always here — it just never had a second owner (sc-12274).
                 lt: std::sync::Arc::clone(lt),
@@ -653,6 +730,7 @@ impl Nvfp4Linear {
         bias: Option<Tensor>,
         device: &Device,
         act: ActPrecision,
+        fallback: Nvfp4Fallback,
     ) -> Result<Self> {
         // `Nvfp4Tensor::dequantize` returns a CPU f32 [rows, cols]; store it resident as bf16 on device.
         let w = weight
@@ -666,6 +744,7 @@ impl Nvfp4Linear {
             act,
             regime: Nvfp4Regime::DequantBf16,
             dequant_w: Some(w),
+            fallback: Some(fallback),
             #[cfg(feature = "cuda")]
             fp4: None,
         })
@@ -785,6 +864,18 @@ impl Nvfp4Linear {
         self.regime
     }
 
+    /// Why this layer is dense BF16, or `None` when it runs the packed W4A4 leg (sc-12121).
+    ///
+    /// This is the *decision this layer already made*, read back — not a re-derivation. A caller that
+    /// predicted [`Nvfp4Regime::Fp4W4A4`] from plan-time capability facts and got dense uses this to
+    /// say which construction-time fact overruled it; two of the causes
+    /// ([`Nvfp4Fallback::DeviceMismatch`], [`Nvfp4Fallback::StagingFailed`]) are runtime accidents no
+    /// plan-time probe can see, so without this accessor they are indistinguishable from a genuine
+    /// prediction bug.
+    pub fn fallback_cause(&self) -> Option<Nvfp4Fallback> {
+        self.fallback
+    }
+
     /// The requested activation-precision regime (W4A4 default / W4A16 override).
     pub fn act_precision(&self) -> ActPrecision {
         self.act
@@ -843,18 +934,57 @@ impl Nvfp4Linear {
             .map(|w| w.elem_count() * w.dtype().size_in_bytes())
     }
 
-    /// Total bytes this layer actually holds **resident on-device for its weight**, whatever regime it
-    /// resolved to: the staged E2M1 + UE4M3 buffers under [`Nvfp4Regime::Fp4W4A4`], or the dense bf16
-    /// tensor under [`Nvfp4Regime::DequantBf16`].
+    /// Total bytes this layer actually holds **resident on-device for its weight**, read from the leg
+    /// its **declared regime** owns: the staged E2M1 + UE4M3 buffers under [`Nvfp4Regime::Fp4W4A4`],
+    /// the dense bf16 tensor under [`Nvfp4Regime::DequantBf16`].
     ///
     /// Unlike [`Self::nvfp4_footprint_bytes`] (a property of the *format*), this is a property of the
-    /// **run** — it is what SC#6 is actually about.
-    pub fn resident_weight_bytes(&self) -> usize {
-        #[cfg(feature = "cuda")]
-        if let Some(b) = self.resident_device_bytes() {
-            return b;
+    /// **run** — it is what SC#6 is actually about, which is why a layer that cannot answer says so
+    /// instead of returning a number.
+    ///
+    /// # Why it dispatches on `self.regime`, and why the missing leg is an error (sc-20651 review)
+    ///
+    /// The previous body asked `resident_device_bytes()` first and, on `None`, fell through to the
+    /// bf16 leg and finally to `unwrap_or(0)`. Both fallbacks were regime-blind, and each is a
+    /// distinct defect:
+    ///
+    /// - **Regime mismatch.** A layer *declaring* `Fp4W4A4` whose staged FP4 leg was absent silently
+    ///   reported the **`DequantBf16`** quantity. The two regimes differ by ~3.6× (0.28× vs 1.00× of
+    ///   the bf16 baseline) and the answer carried no hint of which one it came from — the accessor
+    ///   read residency (`which Option is populated`) where the caller asked about regime.
+    /// - **Flattering default.** With neither leg present the answer was `0`. Zero is the *best
+    ///   possible* result a resident-VRAM gate can see: an SC#6 sum over N such layers reads as
+    ///   "nothing resident at all", i.e. a perfect footprint win, exactly when the accounting has
+    ///   broken. A gate cannot distinguish that from success.
+    ///
+    /// Each arm now reads only its own regime's leg, and a missing leg is a typed error naming the
+    /// regime rather than a number.
+    pub fn resident_weight_bytes(&self) -> Result<usize> {
+        match self.regime {
+            #[cfg(feature = "cuda")]
+            Nvfp4Regime::Fp4W4A4 => self.resident_device_bytes().ok_or_else(|| {
+                candle_core::Error::Msg(
+                    "Nvfp4Linear::resident_weight_bytes: regime is Fp4W4A4 but no FP4 weight is \
+                     staged on-device; the layer's resident footprint is unknown"
+                        .into(),
+                )
+            }),
+            // `Fp4W4A4` is only ever constructed by `try_build_fp4`, which is `cuda`-gated — so on a
+            // non-cuda build this is not a fallback, it is a broken invariant, and it says so.
+            #[cfg(not(feature = "cuda"))]
+            Nvfp4Regime::Fp4W4A4 => Err(candle_core::Error::Msg(
+                "Nvfp4Linear::resident_weight_bytes: regime is Fp4W4A4 on a non-cuda build, where \
+                 that regime is not constructible"
+                    .into(),
+            )),
+            Nvfp4Regime::DequantBf16 => self.resident_dequant_bf16_bytes().ok_or_else(|| {
+                candle_core::Error::Msg(
+                    "Nvfp4Linear::resident_weight_bytes: regime is DequantBf16 but no dequantized \
+                     bf16 weight is resident; the layer's resident footprint is unknown"
+                        .into(),
+                )
+            }),
         }
-        self.resident_dequant_bf16_bytes().unwrap_or(0)
     }
 }
 
@@ -950,6 +1080,47 @@ mod tests {
         assert!(
             rr < 0.02,
             "dequant fallback forward rel-RMS {rr} vs its own dequant ref"
+        );
+        Ok(())
+    }
+
+    /// sc-20651 review (minor). `resident_weight_bytes` must read the leg its **declared regime** owns
+    /// and must never answer `0`.
+    ///
+    /// A `DequantBf16` layer holds a dense bf16 `[out, in]` weight — 1.00× the bf16 baseline, 3.6× its
+    /// own packed container. That the two are far apart is what makes the old regime-blind fallback
+    /// chain (`device leg → bf16 leg → unwrap_or(0)`) a real defect rather than a tidiness point: a
+    /// wrong arm reports a *plausible* number, and the `0` floor reports the most flattering number an
+    /// SC#6 resident-VRAM sum can receive.
+    #[test]
+    fn resident_weight_bytes_reads_the_declared_regimes_leg() -> Result<()> {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim) = (64usize, 128usize);
+        let mut seed = 0x5C20_651Du64;
+        let w = Tensor::from_vec(
+            (0..out_dim * in_dim)
+                .map(|_| prng(&mut seed) * 0.4)
+                .collect::<Vec<_>>(),
+            (out_dim, in_dim),
+            &dev,
+        )?;
+        let lin = Nvfp4Linear::from_dense(&w, None, &dev, ActPrecision::W4A4)?;
+        assert_eq!(lin.regime(), Nvfp4Regime::DequantBf16);
+
+        let resident = lin
+            .resident_weight_bytes()
+            .expect("a DequantBf16 layer holds its bf16 leg and must report it");
+
+        // It is the DequantBf16 leg, byte for byte — not the FP4 one, and not zero.
+        assert_eq!(resident, lin.resident_dequant_bf16_bytes().unwrap());
+        assert_eq!(resident, lin.bf16_footprint_bytes());
+        assert_eq!(resident, out_dim * in_dim * 2);
+        assert_ne!(resident, 0, "the flattering default must be unreachable");
+        // ...and emphatically not the packed *format* size, the number the wrong arm would give.
+        assert!(
+            resident > lin.nvfp4_footprint_bytes() * 3,
+            "dense bf16 ({resident}) must dwarf the packed container ({})",
+            lin.nvfp4_footprint_bytes()
         );
         Ok(())
     }

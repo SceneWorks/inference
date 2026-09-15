@@ -11,13 +11,15 @@ use mlx_rs::ops::{add, concatenate_axis, divide, multiply, split_sections, subtr
 use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::array::scalar;
+use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 // The img2img leaves (start-step / init-image preprocess / noise-interp blend) are shared in core;
 // re-export so the crate's public surface and internal callers are unchanged.
 pub use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
+use mlx_gen::tiling::TilingConfig;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     curated_scheduler_names, default_seed, resolve_flow_schedule, run_flow_sampler, CancelFlag,
-    Error, FlowMatchEuler, GenerationRequest, Image, LatentDecoder, Progress, Result,
+    Error, FlowMatchEuler, GenerationRequest, Image, LatentDecoder, PreviewSink, Progress, Result,
     TimestepConvention,
 };
 
@@ -63,6 +65,41 @@ pub fn qwen_schedulers() -> Vec<&'static str> {
 }
 /// Default step count for the Lightning recipe.
 pub const LIGHTNING_DEFAULT_STEPS: u32 = 8;
+
+/// Request-scoped memory-ladder controls shared by T2I, Edit, and Control.
+pub(crate) struct RequestRungs {
+    pub(crate) block_window: Option<usize>,
+    pub(crate) attention_budget: AttentionBudget,
+    pub(crate) decode_tiling: Option<TilingConfig>,
+}
+
+/// Resolve the family memory preamble once so no Qwen variant can omit a rung. The post-encode
+/// calibration boundary is shared separately by [`finish_conditioning`]; preview cadence/state
+/// remains a separate request concern.
+pub(crate) fn resolve_request_rungs(
+    req: &GenerationRequest,
+    contract: &mlx_gen::gen_core::MemoryProviderContract,
+) -> Result<RequestRungs> {
+    Ok(RequestRungs {
+        block_window: crate::memory_strategy::resolve_window_size(req, contract)?,
+        attention_budget: attention_budget(req),
+        decode_tiling: decode_tiling(req),
+    })
+}
+
+/// Complete Qwen's shared conditioning boundary by forcing a provider's prompt/reference graph and
+/// only then checking the calibration fault. MLX arrays are lazy, so merely constructing the graph
+/// is not evidence that base/control text conditioning or Edit's vision+LM conditioning ran.
+/// [`mlx_gen::Residency`] still owns error cleanup and the next warm request.
+pub(crate) fn finish_conditioning(
+    req: &GenerationRequest,
+    model_id: &str,
+    materialize: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    materialize()?;
+    calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Conditioning, model_id)?;
+    Ok(())
+}
 
 /// Per-run scalars shared by all three Qwen generators: the Lightning flag, resolved step count and
 /// guidance, the per-batch base seed, the selected curated-solver name (epic 7114), and the
@@ -155,11 +192,17 @@ pub fn encode_prompt(
 /// returns its packed final latents; this helper handles the seed sequence, the `Decoding` progress
 /// tick, unpack + decode, and image collection identically for every variant.
 ///
-/// `decoder` is the latent→pixel decode seam (sc-7844): the native [`QwenVae`] by default, or a PiD
-/// decoder for this latent space once wired (sc-7845). PiD output may be larger than VAE-native, so
-/// downstream size is taken from the decoded tensor, not assumed.
+/// `pid_decoder` is the optional latent→pixel decode seam (sc-7844). The native [`QwenVae`] implements
+/// the same tiled trait entry point, so bounded decode no longer requires a concrete-type escape.
+/// PiD inherits the forwarding default (and keeps its own tile policy). Its output may be larger than
+/// VAE-native, so downstream size is taken from the decoded tensor, not assumed.
+#[allow(clippy::too_many_arguments)] // One explicit, shared decode seam preserves all variant inputs.
 pub fn decode_and_collect<F>(
-    decoder: &dyn LatentDecoder,
+    vae: &dyn LatentDecoder,
+    pid_decoder: Option<&dyn LatentDecoder>,
+    tiling: Option<&TilingConfig>,
+    req: &GenerationRequest,
+    model_id: &str,
     count: u32,
     base_seed: u64,
     width: u32,
@@ -170,16 +213,80 @@ pub fn decode_and_collect<F>(
 where
     F: FnMut(u64, &mut dyn FnMut(Progress)) -> Result<Array>,
 {
+    let decoder: &dyn LatentDecoder = pid_decoder.unwrap_or(vae);
+    mlx_gen::ensure_decoder_compatible(
+        Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
+        decoder,
+    )?;
     let mut images = Vec::with_capacity(count as usize);
     for i in 0..count {
         let seed = base_seed.wrapping_add(i as u64);
         let latents = denoise_one(seed, on_progress)?;
+        mlx_gen::diagnostics::record_phase_boundary(
+            mlx_gen::diagnostics::BenchmarkPhaseBoundary::DecodeStart,
+        );
         on_progress(Progress::Decoding);
         let unpacked = unpack_latents(&latents, width, height)?;
-        let decoded = decoder.decode(&unpacked)?.as_dtype(Dtype::Float32)?;
+        let decoded = match tiling {
+            Some(cfg) => decoder.decode_tiled(&unpacked, cfg, Some(&req.cancel))?,
+            None => decoder.decode(&unpacked)?,
+        }
+        .as_dtype(Dtype::Float32)?;
+        // Fire the conformance fault only after the selected decoder (including every native VAE
+        // tile) has executed. This makes the propagated error exercise the same residency cleanup
+        // path as a real decoder failure instead of failing before the rung begins.
+        calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Decode, model_id)?;
         images.push(decoded_to_image(&decoded)?);
     }
     Ok(images)
+}
+
+/// Request-local calibration fault at a completed physical phase boundary. Production requests
+/// leave the hidden selector field unset; conformance runs call this only after the selected phase
+/// has executed so the propagated error proves residency cleanup and a warm follow-up without a
+/// process-global switch.
+pub(crate) fn calibration_fault(
+    req: &GenerationRequest,
+    phase: mlx_gen::gen_core::MemoryPhase,
+    model_id: &str,
+) -> Result<()> {
+    match req.memory {
+        Some(memory) if memory.calibration_error_phase == Some(phase) => Err(Error::Msg(format!(
+            "{model_id}: injected memory-strategy calibration error at {phase:?}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Resolve the native Qwen VAE tile geometry selected by the shared ladder.
+///
+/// This is intentionally request-scoped. A warm generator cannot inherit a prior request's tile
+/// edge or overlap, and PiD remains a distinct decoder with its own geometry rather than silently
+/// receiving a Qwen-VAE tile.
+pub(crate) fn decode_tiling(req: &GenerationRequest) -> Option<TilingConfig> {
+    if let Some(control) = mlx_gen::diagnostics::benchmark_decode_control() {
+        return Some(control.tiling_config());
+    }
+    req.memory
+        .filter(|memory| memory.tile_vae_decode)
+        .map(|memory| {
+            TilingConfig::spatial_only(
+                memory
+                    .decode_tile_edge
+                    .unwrap_or(crate::memory_strategy::DECODE_TILE_EDGE) as i32,
+                memory
+                    .decode_overlap
+                    .unwrap_or(crate::memory_strategy::DECODE_OVERLAP) as i32,
+            )
+        })
+}
+
+/// The request-scoped rung-3 budget. Unselected requests retain the historical one-call SDPA path.
+pub(crate) fn attention_budget(req: &GenerationRequest) -> AttentionBudget {
+    match req.memory {
+        Some(memory) if memory.chunk_attention => AttentionBudget::CONSTRAINED,
+        _ => AttentionBudget::UNBOUNDED,
+    }
 }
 
 /// The PiD backbone (latent-space) tag for the Qwen-Image VAE — shared by all three Qwen generators
@@ -397,22 +504,92 @@ pub fn denoise_with_progress(
     height: u32,
     start_step: usize,
     cancel: &CancelFlag,
+    preview: &PreviewSink,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
+    denoise_with_progress_windowed(
+        transformer,
+        sampler_name,
+        sigmas,
+        seed,
+        latents,
+        pos_embeds,
+        neg_embeds,
+        guidance,
+        width,
+        height,
+        start_step,
+        AttentionBudget::UNBOUNDED,
+        None,
+        cancel,
+        preview,
+        on_progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_with_progress_windowed(
+    transformer: &QwenTransformer,
+    sampler_name: Option<&str>,
+    sigmas: &[f32],
+    seed: u64,
+    latents: Array,
+    pos_embeds: &Array,
+    neg_embeds: Option<&Array>,
+    guidance: f32,
+    width: u32,
+    height: u32,
+    start_step: usize,
+    attention_budget: AttentionBudget,
+    window_size: Option<usize>,
+    cancel: &CancelFlag,
+    preview: &PreviewSink,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
     // sc-2963 (rollout of sc-2957): run the MMDiT's fusable elementwise glue (adaLN affine, gated
     // residual, tanh-GELU FFN, RoPE rotation) through `mx.compile` — bit-exact (`max|Δ|=0`,
     // compile_parity.rs) and a per-step win at production geometry. Scoped + restored on drop by the
-    // RAII guard (F-006) instead of leaking the process-global toggle on.
+    // RAII guard (F-006) instead of leaking the render thread's setting into later work.
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
+    let sliced = &sigmas[start_step.min(sigmas.len().saturating_sub(1))..];
+    let block_window = transformer.block_window(window_size, cancel)?;
+    let attention = AttentionPlan::budgeted(attention_budget).with_cancel(cancel);
+    // Preview (`PreviewSink`): emitted from this closure rather than from the engine-agnostic
+    // sampler core, because only the provider knows the packed latent layout to project. The
+    // closure sees the PRE-step latent, so frame 1 is essentially pure noise — the develop starts
+    // grainy by construction. Numbering is by schedule position, not evaluation count; see
+    // `preview::PreviewCounter`.
+    let previews = mlx_gen::preview::PreviewCounter::new(sliced);
     // `None` joint mask: the prompt embeds carry no padding into the transformer, so parity is
     // proven maskless (see `build_joint_mask`). Qwen is flow-match (FLOW prediction) and feeds the
     // raw schedule sigma as the transformer timestep (Sigma convention).
     let predict = |latents: &Array, sigma: f32| -> Result<Array> {
-        let pos = transformer.forward(latents, pos_embeds, None, sigma, lh, lw, &[])?;
+        crate::preview::emit_preview(preview, &previews, sliced, sigma, latents, width, height);
+        let pos = transformer.forward_windowed(
+            latents,
+            pos_embeds,
+            None,
+            sigma,
+            lh,
+            lw,
+            &[],
+            attention,
+            block_window,
+        )?;
         match neg_embeds {
             Some(neg) => {
-                let neg = transformer.forward(latents, neg, None, sigma, lh, lw, &[])?;
+                let neg = transformer.forward_windowed(
+                    latents,
+                    neg,
+                    None,
+                    sigma,
+                    lh,
+                    lw,
+                    &[],
+                    attention,
+                    block_window,
+                )?;
                 compute_guided_noise(&pos, &neg, guidance)
             }
             None => Ok(pos),
@@ -424,7 +601,7 @@ pub fn denoise_with_progress(
     run_flow_sampler(
         sampler_name,
         TimestepConvention::Sigma,
-        &sigmas[start_step.min(sigmas.len().saturating_sub(1))..],
+        sliced,
         latents,
         seed,
         cancel,
@@ -459,16 +636,59 @@ pub fn denoise_control_with_progress(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_control_with_progress_windowed(
+        transformer,
+        controlnet,
+        sampler_name,
+        sigmas,
+        seed,
+        latents,
+        control_cond,
+        pos_embeds,
+        neg_embeds,
+        guidance,
+        control_scale,
+        width,
+        height,
+        AttentionBudget::UNBOUNDED,
+        None,
+        cancel,
+        on_progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_control_with_progress_windowed(
+    transformer: &QwenTransformer,
+    controlnet: &QwenFunControlBranch,
+    sampler_name: Option<&str>,
+    sigmas: &[f32],
+    seed: u64,
+    latents: Array,
+    control_cond: &Array,
+    pos_embeds: &Array,
+    neg_embeds: Option<&Array>,
+    guidance: f32,
+    control_scale: f32,
+    width: u32,
+    height: u32,
+    attention_budget: AttentionBudget,
+    window_size: Option<usize>,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
     // Compiled elementwise glue (sc-2963), as in `denoise_with_progress`. Scoped + restored on drop
-    // by the RAII guard (F-006) instead of leaking the process-global toggle on.
+    // by the RAII guard (F-006) instead of leaking the render thread's setting into later work.
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
+    let block_window = transformer.block_window(window_size, cancel)?;
+    let attention = AttentionPlan::budgeted(attention_budget).with_cancel(cancel);
     // Each step runs the base forward with the VACE control branch + the (constant) 132-ch control
     // context injected, scaled by `control_scale` (`= 0` reproduces base T2I). Under true CFG the
     // control forward runs once per guidance branch. Control is pose-only T2I (no img2img-with-control
     // path; F-122).
     let predict = |latents: &Array, sigma: f32| -> Result<Array> {
-        let pos = transformer.forward_control(
+        let pos = transformer.forward_control_windowed(
             latents,
             pos_embeds,
             None,
@@ -478,10 +698,12 @@ pub fn denoise_control_with_progress(
             &[],
             Some((controlnet, control_cond)),
             control_scale,
+            attention,
+            block_window,
         )?;
         match neg_embeds {
             Some(neg) => {
-                let neg = transformer.forward_control(
+                let neg = transformer.forward_control_windowed(
                     latents,
                     neg,
                     None,
@@ -491,6 +713,8 @@ pub fn denoise_control_with_progress(
                     &[],
                     Some((controlnet, control_cond)),
                     control_scale,
+                    attention,
+                    block_window,
                 )?;
                 compute_guided_noise(&pos, &neg, guidance)
             }
@@ -534,26 +758,94 @@ pub fn denoise_edit_with_progress(
     width: u32,
     height: u32,
     cancel: &CancelFlag,
+    preview: &PreviewSink,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
+    denoise_edit_with_progress_windowed(
+        transformer,
+        sampler_name,
+        sigmas,
+        seed,
+        latents,
+        static_image_latents,
+        cond_grids,
+        pos_embeds,
+        neg_embeds,
+        guidance,
+        width,
+        height,
+        AttentionBudget::UNBOUNDED,
+        None,
+        cancel,
+        preview,
+        on_progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_edit_with_progress_windowed(
+    transformer: &QwenTransformer,
+    sampler_name: Option<&str>,
+    sigmas: &[f32],
+    seed: u64,
+    latents: Array,
+    static_image_latents: &Array,
+    cond_grids: &[(usize, usize)],
+    pos_embeds: &Array,
+    neg_embeds: Option<&Array>,
+    guidance: f32,
+    width: u32,
+    height: u32,
+    attention_budget: AttentionBudget,
+    window_size: Option<usize>,
+    cancel: &CancelFlag,
+    preview: &PreviewSink,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
     // sc-2963 (rollout of sc-2957): compiled elementwise glue in the Edit denoise loop too — see
     // `denoise_with_progress`. Bit-exact; scoped + restored on drop by the RAII guard (F-006).
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
+    let block_window = transformer.block_window(window_size, cancel)?;
+    let attention = AttentionPlan::budgeted(attention_budget).with_cancel(cancel);
+    // Preview: identical to `denoise_with_progress`. The noise-prefix latent handed to this closure
+    // IS the developing image — the reference tail is static conditioning and is not projected.
+    let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
     // Each step concatenates the noise latents with the (static) packed reference latents so the RoPE
     // spans `[noise] + references`, then slices the velocity back to the noise prefix. `None` joint
     // mask (as in T2I): the spliced prompt embeds are full-valid.
     let predict = |latents: &Array, sigma: f32| -> Result<Array> {
+        crate::preview::emit_preview(preview, &previews, sigmas, sigma, latents, width, height);
         let noise_seq = latents.shape()[1];
         let hidden = concatenate_axis(&[latents, static_image_latents], 1)?;
         let pos = slice_seq(
-            &transformer.forward(&hidden, pos_embeds, None, sigma, lh, lw, cond_grids)?,
+            &transformer.forward_windowed(
+                &hidden,
+                pos_embeds,
+                None,
+                sigma,
+                lh,
+                lw,
+                cond_grids,
+                attention,
+                block_window,
+            )?,
             noise_seq,
         )?;
         match neg_embeds {
             Some(neg) => {
                 let neg = slice_seq(
-                    &transformer.forward(&hidden, neg, None, sigma, lh, lw, cond_grids)?,
+                    &transformer.forward_windowed(
+                        &hidden,
+                        neg,
+                        None,
+                        sigma,
+                        lh,
+                        lw,
+                        cond_grids,
+                        attention,
+                        block_window,
+                    )?,
                     noise_seq,
                 )?;
                 compute_guided_noise(&pos, &neg, guidance)
@@ -585,6 +877,155 @@ fn slice_seq(x: &Array, n: i32) -> Result<Array> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    struct DecodeSpy {
+        output: Array,
+        calls: Cell<usize>,
+    }
+
+    impl DecodeSpy {
+        fn new(output: Array) -> Self {
+            Self {
+                output,
+                calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl LatentDecoder for DecodeSpy {
+        fn input_latent_space(&self) -> Option<&mlx_gen::gen_core::LatentSpace> {
+            Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE)
+        }
+
+        fn decode(&self, _latents: &Array) -> Result<Array> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(self.output.clone())
+        }
+    }
+
+    fn decode_fixture() -> (Array, Array) {
+        let native_latent = Array::from_slice(
+            &(0..(16 * 4 * 6)).map(|i| i as f32).collect::<Vec<_>>(),
+            &[1, 16, 4, 6],
+        );
+        let packed = pack_latents(&native_latent, 48, 32).unwrap();
+        // NCTHW output makes the singleton-frame drop and NCHW→RGB interleave observable.
+        let decoded = Array::from_slice(
+            &[
+                -1.0f32, -0.5, 0.0, 0.5, 1.0, 0.25, // R
+                1.0, 0.5, 0.0, -0.5, -1.0, -0.25, // G
+                -0.75, -0.25, 0.25, 0.75, -1.0, 1.0, // B
+            ],
+            &[1, 3, 1, 2, 3],
+        );
+        (packed, decoded)
+    }
+
+    fn legacy_decode_one(decoder: &dyn LatentDecoder, packed: &Array) -> Image {
+        let unpacked = unpack_latents(packed, 48, 32).unwrap();
+        let decoded = decoder
+            .decode(&unpacked)
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        decoded_to_image(&decoded).unwrap()
+    }
+
+    /// SC-18309 N1: exercise the real Qwen engine's unpack→decoder→RGB route, comparing the exact
+    /// pre-seam native/no-override expression with `decode_and_collect`. The asymmetric per-channel
+    /// fixture catches a lost singleton frame, NCHW/NHWC swap, dtype/readback change, or accidental
+    /// selection of an override. The second arm pins the historical PiD precedence even when a
+    /// native tiling plan is present (PiD's trait default forwards to its own decode unchanged).
+    #[test]
+    fn decode_engine_keeps_default_and_override_bytes_exact() {
+        let (packed, decoded) = decode_fixture();
+        let legacy_native = DecodeSpy::new(decoded.clone());
+        let expected = legacy_decode_one(&legacy_native, &packed);
+
+        let native = DecodeSpy::new(decoded.clone());
+        let req = GenerationRequest {
+            prompt: "decode parity".into(),
+            width: 48,
+            height: 32,
+            ..Default::default()
+        };
+        let got = decode_and_collect(
+            &native,
+            None,
+            None,
+            &req,
+            "qwen-image-test",
+            1,
+            17,
+            48,
+            32,
+            &mut |_| {},
+            |seed, _| {
+                assert_eq!(seed, 17);
+                Ok(packed.clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(got, vec![expected]);
+        assert_eq!(native.calls.get(), 1, "native default must decode once");
+
+        let native = DecodeSpy::new(Array::zeros::<f32>(&[1, 3, 1, 2, 3]).unwrap());
+        let pid_output = Array::from_slice(&vec![1.0f32; 3 * 4 * 5], &[1, 3, 4, 5]);
+        let legacy_pid = DecodeSpy::new(pid_output.clone());
+        let expected_pid = legacy_decode_one(&legacy_pid, &packed);
+        let pid = DecodeSpy::new(pid_output);
+        let tiling = TilingConfig::spatial_only(16, 4);
+        let got = decode_and_collect(
+            &native,
+            Some(&pid),
+            Some(&tiling),
+            &req,
+            "qwen-image-test",
+            1,
+            17,
+            48,
+            32,
+            &mut |_| {},
+            |_, _| Ok(packed.clone()),
+        )
+        .unwrap();
+        assert_eq!(got, vec![expected_pid]);
+        assert_eq!(native.calls.get(), 0, "PiD override must bypass native VAE");
+        assert_eq!(pid.calls.get(), 1, "PiD override must decode once");
+    }
+
+    #[test]
+    fn every_variant_uses_the_canonical_preamble_and_conditioning_boundary() {
+        for (name, source) in [
+            ("t2i", include_str!("model.rs")),
+            ("control", include_str!("model_control.rs")),
+            ("edit", include_str!("model_edit.rs")),
+        ] {
+            assert_eq!(
+                source
+                    .matches("crate::pipeline::resolve_request_rungs(req")
+                    .count(),
+                1,
+                "{name} must use the canonical preamble exactly once"
+            );
+            assert!(
+                !source.contains("crate::memory_strategy::resolve_window_size(req"),
+                "{name} bypassed the canonical preamble"
+            );
+            assert_eq!(
+                source
+                    .matches("crate::pipeline::finish_conditioning(req")
+                    .count(),
+                1,
+                "{name} must finish its real encode before the shared conditioning fault"
+            );
+            assert!(
+                !source.contains("MemoryPhase::Conditioning"),
+                "{name} bypassed the shared post-encode conditioning boundary"
+            );
+        }
+    }
 
     #[test]
     fn slice_seq_matches_arange_gather() {
@@ -731,6 +1172,274 @@ mod tests {
             rp.guidance, DEFAULT_GUIDANCE,
             "both unset falls back to DEFAULT_GUIDANCE"
         );
+    }
+
+    #[test]
+    fn request_memory_selects_exact_native_decode_geometry() {
+        let none = GenerationRequest::default();
+        assert!(decode_tiling(&none).is_none());
+
+        let selected = GenerationRequest {
+            memory: Some(mlx_gen::gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: Some(384),
+                decode_overlap: Some(64),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let spatial = decode_tiling(&selected).unwrap().spatial.unwrap();
+        assert_eq!(spatial.tile_px, 384);
+        assert_eq!(spatial.overlap_px, 64);
+
+        let defaults = GenerationRequest {
+            memory: Some(mlx_gen::gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let spatial = decode_tiling(&defaults).unwrap().spatial.unwrap();
+        assert_eq!(
+            spatial.tile_px,
+            crate::memory_strategy::DECODE_TILE_EDGE as i32
+        );
+        assert_eq!(
+            spatial.overlap_px,
+            crate::memory_strategy::DECODE_OVERLAP as i32
+        );
+    }
+
+    #[test]
+    fn benchmark_scope_overrides_request_decode_geometry_without_leaking() {
+        let scope = mlx_gen::diagnostics::begin_benchmark_request(
+            "qwen-fixed-tile",
+            "image_dit",
+            &[],
+            Some(mlx_gen::diagnostics::BenchmarkDecodeControl {
+                spatial_tile_px: 256,
+                spatial_overlap_px: 64,
+                temporal_tile_frames: None,
+                temporal_overlap_frames: None,
+            }),
+            |_| {},
+        )
+        .unwrap();
+        let tiling = decode_tiling(&GenerationRequest::default()).unwrap();
+        let spatial = tiling.spatial.unwrap();
+        assert_eq!((spatial.tile_px, spatial.overlap_px), (256, 64));
+        assert!(tiling.temporal.is_none());
+        scope.finish();
+
+        assert!(decode_tiling(&GenerationRequest::default()).is_none());
+    }
+
+    #[test]
+    fn attention_budget_is_request_scoped() {
+        assert_eq!(
+            attention_budget(&GenerationRequest::default()).max_score_elements(),
+            u64::MAX
+        );
+        let selected = GenerationRequest {
+            memory: Some(mlx_gen::gen_core::GenerationMemory {
+                chunk_attention: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            attention_budget(&selected).max_score_elements(),
+            mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET
+        );
+        assert!(attention_budget(&selected).eval_per_chunk());
+    }
+
+    #[test]
+    fn calibration_fault_is_request_local_and_phase_exact() {
+        let plain = GenerationRequest::default();
+        for phase in [
+            mlx_gen::gen_core::MemoryPhase::Conditioning,
+            mlx_gen::gen_core::MemoryPhase::Denoise,
+            mlx_gen::gen_core::MemoryPhase::Decode,
+        ] {
+            assert!(calibration_fault(&plain, phase, "qwen_image").is_ok());
+        }
+
+        let injected = GenerationRequest {
+            memory: Some(mlx_gen::gen_core::GenerationMemory {
+                calibration_error_phase: Some(mlx_gen::gen_core::MemoryPhase::Denoise),
+                calibration_fault_harness_authorized: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(calibration_fault(
+            &injected,
+            mlx_gen::gen_core::MemoryPhase::Conditioning,
+            "qwen_image"
+        )
+        .is_ok());
+        let error = calibration_fault(
+            &injected,
+            mlx_gen::gen_core::MemoryPhase::Denoise,
+            "qwen_image",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("qwen_image"));
+        assert!(error.contains("Denoise"));
+    }
+
+    #[test]
+    fn conditioning_fault_runs_each_route_then_allows_cleanup_and_warm_follow_up() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct DropWitness(Arc<AtomicUsize>);
+        impl Drop for DropWitness {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let fault = GenerationRequest {
+            memory: Some(mlx_gen::gen_core::GenerationMemory {
+                calibration_error_phase: Some(mlx_gen::gen_core::MemoryPhase::Conditioning),
+                calibration_fault_harness_authorized: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let plain = GenerationRequest::default();
+
+        let failed_materializations = AtomicUsize::new(0);
+        let materialize_error = finish_conditioning(&fault, "qwen_image", || {
+            failed_materializations.fetch_add(1, Ordering::SeqCst);
+            Err(Error::Msg("injected materialization failure".into()))
+        })
+        .unwrap_err()
+        .to_string();
+        assert_eq!(failed_materializations.load(Ordering::SeqCst), 1);
+        assert_eq!(materialize_error, "injected materialization failure");
+        assert!(
+            !materialize_error.contains("Conditioning"),
+            "the calibration fault must not replace a real conditioning evaluation failure"
+        );
+
+        // Base and Control build prompt conditioning; Edit additionally consumes reference
+        // conditioning. Mutating both counters inside `finish_conditioning`'s materialization
+        // callback is the weight-free witness that the injected error is post-conditioning for
+        // every provider route.
+        for (model_id, references_per_encode) in [
+            ("qwen_image", 0),
+            ("qwen_image_edit", 2),
+            ("qwen_image_control", 0),
+        ] {
+            let prompts = AtomicUsize::new(0);
+            let references = AtomicUsize::new(0);
+            let text_drops = Arc::new(AtomicUsize::new(0));
+            let heavy_drops = Arc::new(AtomicUsize::new(0));
+            let text_drop_loader = Arc::clone(&text_drops);
+            let heavy_drop_loader = Arc::clone(&heavy_drops);
+            let residency: mlx_gen::Residency<DropWitness, DropWitness> =
+                mlx_gen::Residency::sequential(
+                    move || Ok(DropWitness(Arc::clone(&text_drop_loader))),
+                    move |_| Ok(DropWitness(Arc::clone(&heavy_drop_loader))),
+                );
+
+            let injected: Result<()> = residency.run(
+                &fault.cancel,
+                false,
+                &mut |_| {},
+                |_| {
+                    finish_conditioning(&fault, model_id, || {
+                        prompts.fetch_add(1, Ordering::SeqCst);
+                        references.fetch_add(references_per_encode, Ordering::SeqCst);
+                        Ok(())
+                    })
+                },
+                |_| Ok(()),
+                |_, _, _| panic!("conditioning fault must stop before heavy rendering"),
+            );
+            assert!(injected.unwrap_err().to_string().contains("Conditioning"));
+            assert_eq!(prompts.load(Ordering::SeqCst), 1);
+            assert_eq!(references.load(Ordering::SeqCst), references_per_encode);
+            assert_eq!(text_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(heavy_drops.load(Ordering::SeqCst), 0);
+
+            residency
+                .run(
+                    &plain.cancel,
+                    false,
+                    &mut |_| {},
+                    |_| {
+                        finish_conditioning(&plain, model_id, || {
+                            prompts.fetch_add(1, Ordering::SeqCst);
+                            references.fetch_add(references_per_encode, Ordering::SeqCst);
+                            Ok(())
+                        })
+                    },
+                    |_| Ok(()),
+                    |_, _, _| Ok(()),
+                )
+                .expect("a clean follow-up must succeed after the injected conditioning error");
+            assert_eq!(prompts.load(Ordering::SeqCst), 2);
+            assert_eq!(references.load(Ordering::SeqCst), references_per_encode * 2);
+            assert_eq!(text_drops.load(Ordering::SeqCst), 2);
+            assert_eq!(heavy_drops.load(Ordering::SeqCst), 1);
+        }
+
+        // Resident providers keep one warm pair. The same injected fault must leave that pair usable
+        // by the next request instead of poisoning or rebuilding it.
+        let text_loads = Arc::new(AtomicUsize::new(0));
+        let heavy_loads = Arc::new(AtomicUsize::new(0));
+        let materializations = AtomicUsize::new(0);
+        let text_loader = Arc::clone(&text_loads);
+        let heavy_loader = Arc::clone(&heavy_loads);
+        let warm: mlx_gen::Residency<u8, u8> = mlx_gen::Residency::request_scoped(
+            move |_| {
+                text_loader.fetch_add(1, Ordering::SeqCst);
+                Ok(1)
+            },
+            move |_, _| {
+                heavy_loader.fetch_add(1, Ordering::SeqCst);
+                Ok(2)
+            },
+        );
+        let injected: Result<()> = warm.run(
+            &fault.cancel,
+            false,
+            &mut |_| {},
+            |_| {
+                finish_conditioning(&fault, "qwen_image", || {
+                    materializations.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            },
+            |_| Ok(()),
+            |_, _, _| panic!("conditioning fault must stop before rendering"),
+        );
+        assert!(injected.is_err());
+        warm.run(
+            &plain.cancel,
+            false,
+            &mut |_| {},
+            |_| {
+                finish_conditioning(&plain, "qwen_image", || {
+                    materializations.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            },
+            |_| Ok(()),
+            |heavy, _, _| {
+                assert_eq!(*heavy, 2);
+                Ok(())
+            },
+        )
+        .expect("the already-warm pair must serve the follow-up request");
+        assert_eq!(text_loads.load(Ordering::SeqCst), 1);
+        assert_eq!(heavy_loads.load(Ordering::SeqCst), 1);
+        assert_eq!(materializations.load(Ordering::SeqCst), 2);
     }
 
     #[test]

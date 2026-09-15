@@ -15,6 +15,7 @@ import gc
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import platform
 import subprocess
@@ -22,7 +23,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 
 UPSTREAM_COMMIT = "124e8a799f57a1f665495ecb72e547d0a62867f1"
@@ -172,6 +173,41 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def portable_values(
+    torch: Any, shape: tuple[int, ...], stream: int, *, seed: int
+) -> Any:
+    """Build the portable u32 LCG tensor shared by the SA3 reference scripts."""
+    count = math.prod(shape)
+    index = torch.arange(count, dtype=torch.int64)
+    bits = (index * 1_664_525 + (seed + stream) * 1_013_904_223) & 0xFFFF_FFFF
+    return (
+        (bits.to(torch.float64) / 2_147_483_648.0 - 1.0)
+        .to(torch.float32)
+        .reshape(shape)
+    )
+
+
+def tensor_records(
+    torch: Any, tensors: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    """Describe tensor payloads using their exact safetensors bytes."""
+    from safetensors.torch import save
+
+    records = {}
+    for name, value in tensors.items():
+        value = value.detach().cpu().contiguous()
+        payload_bytes = value.numel() * value.element_size()
+        serialized = save({"x": value})
+        records[name] = {
+            "dtype": str(value.dtype).removeprefix("torch."),
+            "shape": list(value.shape),
+            "sha256": hashlib.sha256(
+                serialized[-payload_bytes:] if payload_bytes else b""
+            ).hexdigest(),
+        }
+    return records
+
+
 def snapshot_revision(path: Path) -> str:
     revision = path.resolve().name
     if len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):
@@ -227,7 +263,7 @@ def load_snapshot_lock(path: Path = SNAPSHOT_LOCK_PATH) -> dict[str, Any]:
 def _resolve_snapshot_paths(
     environ: dict[str, str] | None = None,
 ) -> dict[str, Path]:
-    environ = environ or os.environ
+    environ = os.environ if environ is None else environ
     missing_env = [spec.env for spec in SNAPSHOTS if not environ.get(spec.env)]
     if missing_env:
         raise InvalidReference(
@@ -419,9 +455,58 @@ def _torch_modules(upstream_root: Path) -> tuple[Any, Any, Any, Any, dict[str, s
     )
 
 
+def _checkout_status_entries(
+    upstream_root: Path, *, include_ignored: bool
+) -> list[tuple[str, str]]:
+    """Parse porcelain-v1's NUL format, including rename/copy source records."""
+    command = [
+        "git",
+        "-C",
+        str(upstream_root),
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+    ]
+    if include_ignored:
+        command.append("--ignored=matching")
+    raw = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    ).stdout
+    fields = raw.split("\0")
+    entries: list[tuple[str, str]] = []
+    index = 0
+    while index < len(fields):
+        field = fields[index]
+        index += 1
+        if not field:
+            continue
+        if len(field) < 4 or field[2] != " ":
+            raise InvalidReference(f"invalid git status entry: {field!r}")
+        status, path = field[:2], field[3:]
+        entries.append((status, path))
+        if "R" in status or "C" in status:
+            if index >= len(fields) or not fields[index]:
+                raise InvalidReference("truncated git rename/copy status entry")
+            index += 1
+    return entries
+
+
 def validate_upstream_checkout(
-    upstream_root: Path, expected_commit: str = UPSTREAM_COMMIT
+    upstream_root: Path,
+    expected_commit: str = UPSTREAM_COMMIT,
+    *,
+    error_type: type[Exception] = InvalidReference,
+    check_clean: bool = True,
+    allow_venv: bool = True,
+    allow_pycache: bool = False,
+    include_ignored: bool = True,
 ) -> str:
+    """Validate a pinned checkout under an explicit cleanliness policy."""
     revision = subprocess.run(
         ["git", "-C", str(upstream_root), "rev-parse", "HEAD"],
         check=True,
@@ -430,35 +515,28 @@ def validate_upstream_checkout(
         encoding="utf-8",
     ).stdout.strip()
     if revision != expected_commit:
-        raise InvalidReference(
+        raise error_type(
             f"upstream checkout mismatch: {revision}, expected {expected_commit}"
         )
-    checkout_status = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(upstream_root),
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--ignored=matching",
-            "--untracked-files=all",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    ).stdout
-    status_entries = [entry for entry in checkout_status.split("\0") if entry]
+    if not check_clean:
+        return revision
+    try:
+        status_entries = _checkout_status_entries(
+            upstream_root, include_ignored=include_ignored
+        )
+    except InvalidReference as error:
+        raise error_type(str(error)) from error
     disallowed_entries = []
-    for entry in status_entries:
-        status = entry[:2]
-        path = entry[3:] if len(entry) >= 4 and entry[2] == " " else ""
-        allowed_environment_path = path == ".venv/" or path.startswith(".venv/")
-        if status not in {"??", "!!"} or not allowed_environment_path:
-            disallowed_entries.append(entry)
+    for status, path in status_entries:
+        path_parts = Path(path).parts
+        allowed_environment_path = allow_venv and path_parts[:1] == (".venv",)
+        allowed_cache_path = allow_pycache and "__pycache__" in path_parts
+        if status not in {"??", "!!"} or not (
+            allowed_environment_path or allowed_cache_path
+        ):
+            disallowed_entries.append(f"{status} {path}")
     if disallowed_entries:
-        raise InvalidReference(
+        raise error_type(
             "upstream checkout is not clean: "
             + "; ".join(disallowed_entries)
         )
@@ -509,6 +587,8 @@ def _save_tensors(
     tensors: dict[str, Any],
     metadata: dict[str, str],
 ) -> dict[str, Any]:
+    from safetensors.torch import save as tensor_save
+
     path = output / f"{name}.safetensors"
     portable = {}
     tensor_records = {}
@@ -519,7 +599,6 @@ def _save_tensors(
         portable[key] = value
         # NumPy cannot represent bfloat16. A one-tensor safetensors
         # serialization exposes the exact portable payload bytes.
-        tensor_save = __import__("safetensors.torch", fromlist=["save"]).save
         raw = tensor_save({"tensor": value})
         raw_header, raw_data_start = _parse_safetensors_bytes(raw)
         tensor_records[key] = {
@@ -787,19 +866,11 @@ def generate(
     upstream_root: Path,
     output: Path,
     device: str,
-    selected: Iterable[str],
     environ: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     validate_upstream_checkout(upstream_root)
     paths = resolve_snapshots(environ)
-    selected_keys = list(selected)
-    unknown = sorted(set(selected_keys) - set(SPEC_BY_KEY))
-    if unknown:
-        raise InvalidReference(f"unknown components: {', '.join(unknown)}")
-    if len(selected_keys) != len(SPEC_BY_KEY) or set(selected_keys) != set(SPEC_BY_KEY):
-        raise InvalidReference(
-            "reference generation requires exactly all eight components"
-        )
+    selected_keys = tuple(SPEC_BY_KEY)
     output.mkdir(parents=True, exist_ok=True)
     torch, save_file, sample_diffusion, loaders, versions = _torch_modules(upstream_root)
     if device == "mps" and not torch.backends.mps.is_available():
@@ -1014,12 +1085,6 @@ def main() -> int:
     generate_parser.add_argument("--upstream-root", required=True, type=Path)
     generate_parser.add_argument("--output", required=True, type=Path)
     generate_parser.add_argument("--device", choices=("cpu", "mps", "cuda"), default="cpu")
-    generate_parser.add_argument(
-        "--components",
-        nargs="+",
-        choices=tuple(SPEC_BY_KEY),
-        default=tuple(SPEC_BY_KEY),
-    )
 
     verify_parser = subparsers.add_parser("verify-artifacts")
     verify_parser.add_argument("--output", required=True, type=Path)
@@ -1034,7 +1099,6 @@ def main() -> int:
                 args.upstream_root.resolve(),
                 args.output.resolve(),
                 args.device,
-                args.components,
             )
         else:
             verify_artifacts(args.output.resolve())

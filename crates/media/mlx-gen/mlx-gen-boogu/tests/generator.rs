@@ -7,7 +7,7 @@
 //! `#[ignore]` — needs the converted snapshots (128 GB Mac). Run:
 //!   BOOGU_BASE_DIR=<base snapshot> [BOOGU_TURBO_DIR=<turbo>] [BOOGU_EDIT_DIR=<edit>] \
 //!     CARGO_TARGET_DIR=~/Repos/mlx-gen/target \
-//!     cargo test -p mlx-gen-boogu --test generator -- --ignored --nocapture
+//!     cargo test -p mlx-gen-boogu --test integration generator:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 

@@ -169,8 +169,8 @@ mod tests {
 
     #[test]
     fn probe_recognizes_acestep_and_rejects_others() {
-        let dir = std::env::temp_dir().join("acestep-prepare-probe");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         std::fs::create_dir_all(dir.join("transformer")).unwrap();
         assert!(!can_prepare(&spec(&dir)));
         std::fs::write(
@@ -190,13 +190,12 @@ mod tests {
         )
         .unwrap();
         assert!(can_prepare(&spec(&dir)));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn prepare_refuses_quantization_typed() {
-        let dir = std::env::temp_dir().join("acestep-prepare-quant");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         std::fs::create_dir_all(dir.join("transformer")).unwrap();
         std::fs::write(
             dir.join(DIT_INDEX),
@@ -216,6 +215,5 @@ mod tests {
         let mut s = spec(&dir);
         s.quantize = Some(core_llm::Quantize::Q4);
         assert!(matches!(prepare(&s), Err(CoreError::Unsupported(_))));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -23,6 +23,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 use candle_core::{DType, Device, Tensor, Var};
 use candle_nn::{Linear, Module, VarBuilder};
@@ -30,7 +34,7 @@ use rand::distr::Uniform;
 use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::Distribution;
 
-use crate::quant::{LokrFactors, QLinear};
+use crate::quant::{AdaptLinear, DenseLinear, LokrFactors, QLinear};
 use crate::{CandleError, Result};
 
 /// PEFT gaussian-init standard deviation for the **LoRA** `A` factor (diffusers/PEFT
@@ -110,26 +114,72 @@ enum AdditiveResidual {
     /// `scale·((x·a)·b)`: `a` `[in, rank]` (= `downᵀ`), `b` `[rank, out]` (= `upᵀ` with `alpha/rank`
     /// folded in). The deferred two-matmul form — never the `[out,in]` product — so it stays memory-free
     /// on a packed base. Mirrors [`crate::quant::AdaptLinear`]'s `Lora` arm exactly.
-    Lora { a: Tensor, b: Tensor, scale: f64 },
-    /// The structured LoKr residual via the shared Kronecker vec-trick; the full `(alpha/rank)·strength`
-    /// scale is baked into the [`LokrFactors`], so `[out,in]` is never formed.
-    LokrStructured { factors: LokrFactors },
+    Lora {
+        a: Tensor,
+        b: Tensor,
+        /// One strength per distilled pass. A length-one vector is uniform over all passes.
+        scales: Vec<f64>,
+    },
+    /// The structured LoKr residual via the shared Kronecker vec-trick. `LokrFactors` carries the
+    /// alpha/rank scale while this overlay carries the selected user strength, so `[out,in]` is never
+    /// formed and the same factors serve each distilled pass.
+    LokrStructured {
+        factors: LokrFactors,
+        /// Multiplies the structured factors for the selected pass. This remains separate from
+        /// `LokrFactors`' baked alpha/rank scale so one adapter can truthfully serve two passes.
+        scales: Vec<f64>,
+    },
 }
 
 impl AdditiveResidual {
+    /// A zero user strength is an exact disabled adapter. Check it before evaluating the factors so
+    /// unused non-finite data cannot contaminate the host output.
+    fn scale_at(&self, pass: usize) -> candle_core::Result<f64> {
+        let scales = match self {
+            AdditiveResidual::Lora { scales, .. }
+            | AdditiveResidual::LokrStructured { scales, .. } => scales,
+        };
+        scales
+            .get(pass.min(scales.len().saturating_sub(1)))
+            .copied()
+            .ok_or_else(|| {
+                candle_core::Error::Msg("additive adapter pass scales must not be empty".into())
+            })
+    }
+
+    fn is_zero(&self, pass: usize) -> candle_core::Result<bool> {
+        let selected_scale = self.scale_at(pass)?;
+        // Structured LoKr keeps its alpha/rank component baked into the shared factors. The
+        // single-scale API can therefore be disabled either by that legacy effective scale or by
+        // the newly-added selected per-pass strength. Both checks must happen before evaluating
+        // the factors: `0 * NaN` is NaN, not an inert adapter.
+        Ok(selected_scale == 0.0
+            || matches!(self, AdditiveResidual::LokrStructured { factors, .. } if factors.scale == 0.0))
+    }
+
+    fn validate_scales(scales: &[f64]) -> Result<()> {
+        if scales.is_empty() || scales.iter().any(|scale| !scale.is_finite()) {
+            return Err(CandleError::Msg(
+                "additive adapter pass scales must be non-empty and finite".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// The residual this adapter contributes, in the activation dtype of `x` (factors are held f32 and
     /// cast per forward — they are tiny). Identical to [`crate::quant::AdaptLinear`]'s residual so the
     /// packed-additive SDXL path and the dense-fold path agree to f32 tolerance.
-    fn residual(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+    fn residual(&self, x: &Tensor, pass: usize) -> candle_core::Result<Tensor> {
+        let scale = self.scale_at(pass)?;
         match self {
-            AdditiveResidual::Lora { a, b, scale } => {
+            AdditiveResidual::Lora { a, b, .. } => {
                 let xd = x.dtype();
                 let r = x
                     .broadcast_matmul(&a.to_dtype(xd)?)?
                     .broadcast_matmul(&b.to_dtype(xd)?)?;
-                r * *scale
+                r * scale
             }
-            AdditiveResidual::LokrStructured { factors } => factors.residual(x),
+            AdditiveResidual::LokrStructured { factors, .. } => factors.residual(x)? * scale,
         }
     }
 }
@@ -200,6 +250,9 @@ pub struct LoraLinear {
     /// identical to before. Valid on a **packed** base — the SDXL packed-tier distill-LoRA path pushes
     /// these instead of dequant-folding, so the q4/q8 footprint survives.
     additive: Vec<AdditiveResidual>,
+    /// Active distilled denoise pass for additive inference residuals. `Arc<AtomicUsize>` keeps
+    /// `LoraLinear` cloneable and `Sync`, which Candle's shared `Arc<AvDiT>` requires.
+    additive_pass: Arc<AtomicUsize>,
 }
 
 impl LoraLinear {
@@ -219,6 +272,7 @@ impl LoraLinear {
             adapter: None,
             frozen: None,
             additive: Vec::new(),
+            additive_pass: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -240,6 +294,7 @@ impl LoraLinear {
             adapter: None,
             frozen: None,
             additive: Vec::new(),
+            additive_pass: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -247,6 +302,54 @@ impl LoraLinear {
     /// (sc-9416).
     pub fn is_packed(&self) -> bool {
         self.base.is_packed()
+    }
+
+    /// Fold only the frozen dense base to Q4/Q8, preserving trainable and forward-time residuals.
+    /// Already-packed bases are idempotent.
+    pub fn quantize_base(&mut self, quant: crate::gen_core::Quant) -> Result<()> {
+        let LoraBase::Dense(linear) = &self.base else {
+            return Ok(());
+        };
+        let mut packed = QLinear::from_dense(DenseLinear::Linear(linear.clone()));
+        packed.quantize(quant)?;
+        self.base = LoraBase::Packed(packed);
+        Ok(())
+    }
+
+    /// Fold the frozen dense base from a CPU-staged model directly onto `device`, preserving every
+    /// forward-time inference residual on that same device. This is intentionally unavailable while
+    /// a trainable/frozen preview adapter is installed: migrating those `Var`-backed factors would
+    /// break the optimizer's storage-sharing contract.
+    pub fn quantize_base_onto(
+        &mut self,
+        quant: crate::gen_core::Quant,
+        device: &Device,
+    ) -> Result<()> {
+        if self.adapter.is_some() || self.frozen.is_some() {
+            return Err(CandleError::Msg(
+                "cannot migrate a trainable LoRA/LoKr projection during load-time quantization"
+                    .into(),
+            ));
+        }
+        if let LoraBase::Dense(linear) = &self.base {
+            let mut packed = QLinear::from_dense(DenseLinear::Linear(linear.clone()));
+            // SDXL's established quantized forward uses the dequant-dense arm; only the destination
+            // changes here, so CPU staging is numerically identical to `quantize_base`.
+            packed.quantize_dequant_onto(quant, device)?;
+            self.base = LoraBase::Packed(packed);
+        }
+        for residual in &mut self.additive {
+            match residual {
+                AdditiveResidual::Lora { a, b, .. } => {
+                    *a = a.to_device(device)?;
+                    *b = b.to_device(device)?;
+                }
+                AdditiveResidual::LokrStructured { factors, .. } => {
+                    *factors = factors.to_device(device)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The PEFT module path (e.g. `down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q`),
@@ -296,7 +399,24 @@ impl LoraLinear {
     /// this is valid on **any** base including a **packed** [`QLinear`] — the base weight is never
     /// dequantized, so a q4/q8 tier keeps its footprint. Multiple pushes stack (applied in push order).
     pub fn push_additive_lora(&mut self, a: Tensor, b: Tensor, scale: f64) {
-        self.additive.push(AdditiveResidual::Lora { a, b, scale });
+        self.additive.push(AdditiveResidual::Lora {
+            a,
+            b,
+            scales: vec![scale],
+        });
+    }
+
+    /// Attach a LoRA residual with one scale per distilled denoise pass. A one-entry vector is
+    /// intentionally uniform; longer vectors select by [`set_additive_pass`](Self::set_additive_pass).
+    pub fn push_additive_lora_per_pass(
+        &mut self,
+        a: Tensor,
+        b: Tensor,
+        scales: Vec<f64>,
+    ) -> Result<()> {
+        AdditiveResidual::validate_scales(&scales)?;
+        self.additive.push(AdditiveResidual::Lora { a, b, scales });
+        Ok(())
     }
 
     /// Attach a forward-time **additive structured LoKr** inference residual via the shared Kronecker
@@ -304,8 +424,29 @@ impl LoraLinear {
     /// `[out,in]` delta is never formed and the residual is memory-free on a packed base. Valid on any
     /// base; multiple pushes stack and mix freely with additive LoRA residuals (push order).
     pub fn push_additive_lokr(&mut self, factors: LokrFactors) {
+        self.additive.push(AdditiveResidual::LokrStructured {
+            factors,
+            scales: vec![1.0],
+        });
+    }
+
+    /// Attach a structured LoKr residual with per-pass user strengths. Build `factors` with its
+    /// alpha/rank scale only; this method applies the selected user strength at forward time.
+    pub fn push_additive_lokr_per_pass(
+        &mut self,
+        factors: LokrFactors,
+        scales: Vec<f64>,
+    ) -> Result<()> {
+        AdditiveResidual::validate_scales(&scales)?;
         self.additive
-            .push(AdditiveResidual::LokrStructured { factors });
+            .push(AdditiveResidual::LokrStructured { factors, scales });
+        Ok(())
+    }
+
+    /// Select the active distilled denoise pass for additive residuals. Indexes past a residual's
+    /// final scale intentionally clamp, so a conventional scalar adapter remains uniform.
+    pub fn set_additive_pass(&self, pass: usize) {
+        self.additive_pass.store(pass, Ordering::Relaxed);
     }
 
     /// Whether any forward-time additive inference residual is attached (sc-11103) — distinct from
@@ -390,6 +531,7 @@ impl Module for LoraLinear {
         let y = self.base.forward(x)?;
         let mut y = match &self.adapter {
             None => y,
+            Some(Adapter::Lora { scale, .. }) if *scale == 0.0 => y,
             // Factors are f32; cast to the activation dtype for the matmul. The cast is
             // differentiable, so grads flow back to the f32 `Var`s (master-weights). The factor
             // tensors share storage with those `Var`s, so this reads the current optimizer-updated value.
@@ -398,8 +540,10 @@ impl Module for LoraLinear {
                 let down = down.to_dtype(xd)?;
                 let up = up.to_dtype(xd)?;
                 let lora = x.broadcast_matmul(&down.t()?)?.broadcast_matmul(&up.t()?)?;
-                (y + (lora * *scale)?)?
+                let residual = (lora * *scale)?.to_dtype(y.dtype())?;
+                (y + residual)?
             }
+            Some(Adapter::Lokr { scale, .. }) if *scale == 0.0 => y,
             Some(Adapter::Lokr {
                 w1,
                 w2,
@@ -416,13 +560,21 @@ impl Module for LoraLinear {
                 // dtype for the residual matmul x·ΔWᵀ.
                 let delta = kron2d(w1, &factor2)?.reshape((*out_f, *in_f))?;
                 let delta = (delta * *scale)?.to_dtype(x.dtype())?;
-                (y + x.broadcast_matmul(&delta.t()?)?)?
+                let residual = x.broadcast_matmul(&delta.t()?)?.to_dtype(y.dtype())?;
+                (y + residual)?
             }
         };
         // Forward-time additive inference residuals (sc-11103), applied in push order after the base +
-        // trainable adapter. Empty on the plain / trainable path, so this loop is a no-op there.
+        // trainable adapter. Disabled residuals are skipped; live residuals retain their x-dtype math
+        // and cast only to the current host output dtype at the add. Empty on the plain / trainable
+        // path, so this loop is a no-op there.
+        let pass = self.additive_pass.load(Ordering::Relaxed);
         for ar in &self.additive {
-            y = (y + ar.residual(x)?)?;
+            if ar.is_zero(pass)? {
+                continue;
+            }
+            let residual = ar.residual(x, pass)?.to_dtype(y.dtype())?;
+            y = (y + residual)?;
         }
         Ok(y)
     }
@@ -506,6 +658,17 @@ pub fn lora_linear_no_bias_detect(
 /// is needed.
 pub trait LoraHost {
     fn visit_lora_mut(&mut self, f: &mut dyn FnMut(&mut LoraLinear) -> Result<()>) -> Result<()>;
+}
+
+/// A model whose inference projections already use [`AdaptLinear`]. This parallel host seam lets a
+/// trainer attach live `Var`-backed LoRA/LoKr factors without duplicating the model into a second
+/// `LoraLinear`-only implementation. Paths are supplied by the host because `AdaptLinear` deliberately
+/// carries no model-specific naming.
+pub trait AdaptLoraHost {
+    fn visit_adapt_lora_mut(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut AdaptLinear) -> Result<()>,
+    ) -> Result<()>;
 }
 
 /// One installed target: its PEFT path plus the trainer-owned factor `Var`s keyed by their save-key
@@ -822,6 +985,115 @@ pub fn build_lokr_targets(
 /// sampler is chaos-sensitive and the merged forward `(W+ΔW)·x` differs from the residual form
 /// `W·x + ΔW·x` by ~1 ULP, which cascades to a visibly different image (see `candle-gen-sdxl`'s
 /// adapter merge). Holding both forms to the same f32 reconstruction keeps train and infer in lockstep.
+/// Install trainable LoRA factors on an [`AdaptLoraHost`]. The saved factor convention is identical
+/// to [`build_lora_targets`]; only the host projection type differs.
+pub fn build_adapt_lora_targets(
+    host: &mut dyn AdaptLoraHost,
+    target_suffixes: &[String],
+    rank: u32,
+    alpha: f32,
+    seed: u64,
+    device: &Device,
+) -> Result<LoraSet> {
+    if rank == 0 {
+        return Err(CandleError::Msg("lora rank must be >= 1".into()));
+    }
+    let r = rank as usize;
+    let scale = alpha as f64 / r as f64;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut vars = Vec::new();
+    let mut targets = Vec::new();
+    host.visit_adapt_lora_mut(&mut |path, lin| {
+        if !target_suffixes.is_empty()
+            && !target_suffixes
+                .iter()
+                .any(|suffix| path_matches(path, suffix))
+        {
+            return Ok(());
+        }
+        let (out_f, in_f) = lin.base_shape();
+        let down = gaussian_var(r, in_f, INIT_STD, &mut rng, device)?;
+        let up = zero_var(out_f, r, device)?;
+        lin.push_trainable_lora(down.as_tensor().clone(), up.as_tensor().clone(), scale);
+        vars.push(down.clone());
+        vars.push(up.clone());
+        targets.push(AdapterTarget {
+            path: path.to_string(),
+            factors: vec![("lora_A.weight", down), ("lora_B.weight", up)],
+        });
+        Ok(())
+    })?;
+    if targets.is_empty() {
+        return Err(CandleError::Msg(format!(
+            "no LoRA targets matched suffixes {target_suffixes:?} on the host"
+        )));
+    }
+    Ok(LoraSet {
+        kind: AdapterKind::Lora,
+        rank,
+        alpha,
+        decompose_factor: -1,
+        vars,
+        targets,
+    })
+}
+
+/// Install trainable full-factor LoKr residuals on an [`AdaptLoraHost`]. Keeping `w2` full avoids
+/// caching a stale eager `w2_a·w2_b` product between optimizer steps while preserving the standard
+/// LyCORIS `w1`/`w2` checkpoint format consumed by inference mergers.
+pub fn build_adapt_lokr_targets(
+    host: &mut dyn AdaptLoraHost,
+    target_suffixes: &[String],
+    rank: u32,
+    alpha: f32,
+    decompose_factor: i32,
+    seed: u64,
+    device: &Device,
+) -> Result<LoraSet> {
+    if rank == 0 {
+        return Err(CandleError::Msg("lokr rank must be >= 1".into()));
+    }
+    let scale = alpha as f64 / rank as f64;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut vars = Vec::new();
+    let mut targets = Vec::new();
+    host.visit_adapt_lora_mut(&mut |path, lin| {
+        if !target_suffixes.is_empty()
+            && !target_suffixes
+                .iter()
+                .any(|suffix| path_matches(path, suffix))
+        {
+            return Ok(());
+        }
+        let (out_f, in_f) = lin.base_shape();
+        let (out_a, out_b) = factorization(out_f, decompose_factor);
+        let (in_a, in_b) = factorization(in_f, decompose_factor);
+        let w1 = zero_var(out_a, in_a, device)?;
+        let w2 = kaiming_uniform_var(out_b, in_b, &mut rng, device)?;
+        lin.push_trainable_lokr(w1.as_tensor().clone(), w2.as_tensor().clone(), scale);
+        vars.push(w1.clone());
+        vars.push(w2.clone());
+        targets.push(AdapterTarget {
+            path: path.to_string(),
+            factors: vec![("lokr_w1", w1), ("lokr_w2", w2)],
+        });
+        Ok(())
+    })?;
+    if targets.is_empty() {
+        return Err(CandleError::Msg(format!(
+            "no LoKr targets matched suffixes {target_suffixes:?} on the host"
+        )));
+    }
+    Ok(LoraSet {
+        kind: AdapterKind::Lokr,
+        rank,
+        alpha,
+        decompose_factor,
+        vars,
+        targets,
+    })
+}
+
 pub fn reconstruct_lora_delta(
     down: &Tensor,
     up: &Tensor,
@@ -836,12 +1108,40 @@ pub fn reconstruct_lora_delta(
     Ok((ba * eff)?)
 }
 
+/// Parse PEFT LoKr `rank`/`alpha` metadata without collapsing a present malformed value to a default.
+/// Missing rank defaults to 1 and missing alpha defaults to rank; present values must match the same
+/// finite, positive-rank contract enforced by [`reconstruct_lokr_delta`].
+pub fn parse_lokr_metadata(rank: Option<&str>, alpha: Option<&str>) -> Result<(f32, f32)> {
+    let parse = |field: &str, raw: &str| {
+        raw.trim().parse::<f32>().map_err(|_| {
+            CandleError::Msg(format!(
+                "LoKr adapter metadata `{field}` = `{raw}` is not a valid number"
+            ))
+        })
+    };
+    let rank = match rank {
+        Some(raw) => parse("rank", raw)?,
+        None => 1.0,
+    };
+    let alpha = match alpha {
+        Some(raw) => parse("alpha", raw)?,
+        None => rank,
+    };
+    if !rank.is_finite() || rank <= 0.0 || !alpha.is_finite() {
+        return Err(CandleError::Msg(format!(
+            "LoKr: invalid metadata scale (rank = {rank}, alpha = {alpha}); rank must be finite and \
+             > 0 and alpha must be finite"
+        )));
+    }
+    Ok((rank, alpha))
+}
+
 /// Reconstruct the LoKr weight delta `ΔW = (alpha/rank)·scale·kron(w1, w2)` reshaped to `base_shape`
 /// (`[out, in]`), as **f32** — the inference-side merge counterpart to [`LoraLinear`]'s LoKr forward,
 /// using the *same* `kron2d` reconstruction. Each Kronecker leg is either a full factor (`w1`/`w2`)
 /// or a low-rank product (`w1_a·w1_b` / `w2_a·w2_b`, e.g. the trainer's zero-init `w2_a`/`w2_b` form).
-/// Errors if a leg is missing. Linear-only: pass 2-D factors (the SDXL trainer adapts Linears; Tucker /
-/// conv reconstruction is not handled here).
+/// Errors if a leg is missing or if metadata/user scaling is invalid. Linear-only: pass 2-D factors
+/// (the SDXL trainer adapts Linears; Tucker / conv reconstruction is not handled here).
 #[allow(clippy::too_many_arguments)]
 pub fn reconstruct_lokr_delta(
     w1: Option<&Tensor>,
@@ -855,6 +1155,23 @@ pub fn reconstruct_lokr_delta(
     scale: f32,
     base_shape: (usize, usize),
 ) -> Result<Tensor> {
+    if !scale.is_finite() {
+        return Err(CandleError::Msg(format!(
+            "LoKr: adapter scale must be finite (got {scale})"
+        )));
+    }
+    if !rank.is_finite() || rank <= 0.0 || !alpha.is_finite() {
+        return Err(CandleError::Msg(format!(
+            "LoKr: invalid metadata scale (rank = {rank}, alpha = {alpha}); rank must be finite and \
+             > 0 and alpha must be finite"
+        )));
+    }
+    let eff = (alpha as f64 / rank as f64) * scale as f64;
+    if !eff.is_finite() {
+        return Err(CandleError::Msg(format!(
+            "LoKr: derived (alpha/rank) * adapter scale must be finite (got {eff})"
+        )));
+    }
     let f32d = |t: &Tensor| t.to_dtype(DType::F32);
     let factor1 = match (w1, w1_a, w1_b) {
         (Some(w), _, _) => f32d(w)?,
@@ -876,7 +1193,6 @@ pub fn reconstruct_lokr_delta(
     };
     let (out_f, in_f) = base_shape;
     let delta = kron2d(&factor1, &factor2)?.reshape((out_f, in_f))?;
-    let eff = (alpha as f64 / rank as f64) * scale as f64;
     Ok((delta * eff)?)
 }
 
@@ -1115,11 +1431,279 @@ pub fn save_lokr(set: &LoraSet, extra_meta: &HashMap<String, String>, path: &Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quant::DenseLinear;
+    use crate::train::optim::TrainOptimizer;
     use candle_core::IndexOp;
+    use gen_core::Quant;
 
     fn fixed_linear(weight: &[f32], out_f: usize, in_f: usize) -> LoraLinear {
         let w = Tensor::from_vec(weight.to_vec(), (out_f, in_f), &Device::Cpu).unwrap();
         LoraLinear::from_linear(Linear::new(w, None), in_f, out_f, "test.to_q".into())
+    }
+
+    struct OneAdaptHost {
+        lin: AdaptLinear,
+    }
+
+    impl AdaptLoraHost for OneAdaptHost {
+        fn visit_adapt_lora_mut(
+            &mut self,
+            f: &mut dyn FnMut(&str, &mut AdaptLinear) -> Result<()>,
+        ) -> Result<()> {
+            f("block.to_q", &mut self.lin)
+        }
+    }
+
+    /// Standard LoRA initialization has B=0: the first loss must still build a graph to B, then an
+    /// optimizer update to B must make the next loss reach A. This pins the distinction between the
+    /// inference residual fast path and the trainable `AdaptLinear` residual seam.
+    #[test]
+    fn adapt_linear_zero_init_lora_trains_across_optimizer_steps() {
+        let device = Device::Cpu;
+        let base = Linear::new(Tensor::zeros((3, 4), DType::F32, &device).unwrap(), None);
+        let mut host = OneAdaptHost {
+            lin: AdaptLinear::from_dense(base, 4, 3),
+        };
+        let set =
+            build_adapt_lora_targets(&mut host, &["to_q".to_string()], 2, 2.0, 7, &device).unwrap();
+        let x = Tensor::from_vec(
+            vec![1.0f32, -2.0, 0.5, 3.0, -1.0, 0.25, 2.0, 1.5],
+            (2, 4),
+            &device,
+        )
+        .unwrap();
+        let target = Tensor::ones((2, 3), DType::F32, &device).unwrap();
+
+        let loss1 = (host.lin.forward(&x).unwrap() - &target)
+            .unwrap()
+            .sqr()
+            .unwrap()
+            .mean_all()
+            .unwrap();
+        let grads1 = loss1.backward().unwrap();
+        let up_grad = grads1
+            .get(set.vars[1].as_tensor())
+            .expect("zero-initialized B must receive the first-step gradient");
+        assert!(
+            up_grad
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap()
+                > 0.0
+        );
+
+        let mut optimizer =
+            TrainOptimizer::from_config("adam", set.vars.clone(), 0.05, 0.0).unwrap();
+        optimizer.step(&grads1).unwrap();
+        assert!(
+            set.vars[1]
+                .as_tensor()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap()
+                > 0.0,
+            "the optimizer must move B off zero"
+        );
+
+        let loss2 = (host.lin.forward(&x).unwrap() - target)
+            .unwrap()
+            .sqr()
+            .unwrap()
+            .mean_all()
+            .unwrap();
+        let grads2 = loss2.backward().unwrap();
+        let down_grad = grads2
+            .get(set.vars[0].as_tensor())
+            .expect("A must receive a gradient once B is nonzero");
+        assert!(
+            down_grad
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap()
+                > 0.0
+        );
+    }
+
+    fn deterministic_lora_weight(out_f: usize, in_f: usize) -> Tensor {
+        let values: Vec<f32> = (0..out_f * in_f)
+            .map(|i| ((i % 17) as f32 - 8.0) / 16.0)
+            .collect();
+        Tensor::from_vec(values, (out_f, in_f), &Device::Cpu).unwrap()
+    }
+
+    fn deterministic_lora_input(rows: usize, in_f: usize, dtype: DType) -> Tensor {
+        let values: Vec<f32> = (0..rows * in_f)
+            .map(|i| ((i % 11) as f32 + 1.0) / 8.0)
+            .collect();
+        Tensor::from_vec(values, (rows, in_f), &Device::Cpu)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap()
+    }
+
+    fn int8_fast_lora(quant: Quant, out_f: usize, in_f: usize) -> LoraLinear {
+        let mut base = QLinear::from_dense(DenseLinear::Linear(Linear::new(
+            deterministic_lora_weight(out_f, in_f),
+            None,
+        )));
+        base.quantize_int8_fast(quant, false, false, false).unwrap();
+        LoraLinear::from_qlinear(base, in_f, out_f, "test.to_q".into())
+    }
+
+    fn exact_lora_values(t: &Tensor) -> Vec<Vec<f32>> {
+        t.to_dtype(DType::F32).unwrap().to_vec2::<f32>().unwrap()
+    }
+
+    fn assert_lora_tensor_exact(actual: &Tensor, expected: &Tensor, context: &str) {
+        assert_eq!(actual.dtype(), expected.dtype(), "{context}: dtype differs");
+        assert_eq!(
+            exact_lora_values(actual),
+            exact_lora_values(expected),
+            "{context}: element values differ"
+        );
+    }
+
+    /// sc-15444 bypass audit: `LoraLinear` is the only Candle adapter host that hand-rolls the
+    /// residual addition instead of delegating to `AdaptLinear`. Both its trainable and inference
+    /// additive LoRA arms must skip a zero-strength residual without evaluating poisoned factors.
+    #[test]
+    fn lora_linear_scale_zero_skips_trainable_and_additive_residuals_exactly() {
+        let (out_f, in_f, rank) = (16usize, 32usize, 2usize);
+        let x = deterministic_lora_input(2, in_f, DType::F32);
+        let base = LoraLinear::from_linear(
+            Linear::new(deterministic_lora_weight(out_f, in_f), None),
+            in_f,
+            out_f,
+            "test.to_q".into(),
+        );
+        let expected = base.forward(&x).unwrap();
+
+        let poison_down =
+            Tensor::from_vec(vec![f32::INFINITY; rank * in_f], (rank, in_f), &Device::Cpu).unwrap();
+        let poison_up = Tensor::ones((out_f, rank), DType::F32, &Device::Cpu).unwrap();
+        let mut trainable = LoraLinear::from_linear(
+            Linear::new(deterministic_lora_weight(out_f, in_f), None),
+            in_f,
+            out_f,
+            "test.to_q".into(),
+        );
+        trainable.install_lora(poison_down, poison_up, 0.0);
+        assert_lora_tensor_exact(
+            &trainable.forward(&x).unwrap(),
+            &expected,
+            "trainable scale=0",
+        );
+
+        let poison_a =
+            Tensor::from_vec(vec![f32::INFINITY; in_f * rank], (in_f, rank), &Device::Cpu).unwrap();
+        let poison_b = Tensor::ones((rank, out_f), DType::F32, &Device::Cpu).unwrap();
+        let mut additive = LoraLinear::from_linear(
+            Linear::new(deterministic_lora_weight(out_f, in_f), None),
+            in_f,
+            out_f,
+            "test.to_q".into(),
+        );
+        additive.push_additive_lora(poison_a, poison_b, 0.0);
+        assert_lora_tensor_exact(
+            &additive.forward(&x).unwrap(),
+            &expected,
+            "additive scale=0",
+        );
+
+        let poison_w1 = Tensor::from_vec(vec![f32::INFINITY; 4 * 4], (4, 4), &Device::Cpu).unwrap();
+        let poison_w2 = Tensor::ones((4, 8), DType::F32, &Device::Cpu).unwrap();
+        let mut trainable_lokr = LoraLinear::from_linear(
+            Linear::new(deterministic_lora_weight(out_f, in_f), None),
+            in_f,
+            out_f,
+            "test.to_q".into(),
+        );
+        trainable_lokr.install_lokr(poison_w1.clone(), LokrW2::Full(poison_w2.clone()), 0.0);
+        assert_lora_tensor_exact(
+            &trainable_lokr.forward(&x).unwrap(),
+            &expected,
+            "trainable LoKr scale=0",
+        );
+
+        let factors = LokrFactors::build(
+            0.0,
+            (out_f, in_f),
+            Some(&poison_w1),
+            None,
+            None,
+            Some(&poison_w2),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let mut additive_lokr = LoraLinear::from_linear(
+            Linear::new(deterministic_lora_weight(out_f, in_f), None),
+            in_f,
+            out_f,
+            "test.to_q".into(),
+        );
+        additive_lokr.push_additive_lokr(factors);
+        assert_lora_tensor_exact(
+            &additive_lokr.forward(&x).unwrap(),
+            &expected,
+            "additive structured LoKr scale=0",
+        );
+    }
+
+    /// sc-15444 bypass audit: the SDXL `LoraLinear` path must follow its quantized host's f32 output
+    /// dtype rather than the activation dtype when adding either residual form. f64 is the CPU-executable
+    /// proxy for production bf16 input because Candle CPU has no bf16 matmul.
+    #[test]
+    fn lora_linear_quantized_hosts_cast_live_residuals_to_output_dtype_exactly() {
+        let (out_f, in_f, rank) = (32usize, 32usize, 2usize);
+        let x = deterministic_lora_input(2, in_f, DType::F64);
+        let down = Tensor::ones((rank, in_f), DType::F32, &Device::Cpu).unwrap();
+        let up = Tensor::ones((out_f, rank), DType::F32, &Device::Cpu).unwrap();
+        let a = down.t().unwrap().contiguous().unwrap();
+        let b = up.t().unwrap().contiguous().unwrap();
+        let residual = ((x
+            .broadcast_matmul(&a.to_dtype(DType::F64).unwrap())
+            .unwrap()
+            .broadcast_matmul(&b.to_dtype(DType::F64).unwrap())
+            .unwrap())
+            * 0.5)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+
+        for quant in [Quant::Q8, Quant::Q4] {
+            let bare = int8_fast_lora(quant, out_f, in_f);
+            let base_y = bare.forward(&x).unwrap();
+            assert_eq!(base_y.dtype(), DType::F32);
+            let expected = (&base_y + &residual).unwrap();
+
+            let mut trainable = int8_fast_lora(quant, out_f, in_f);
+            trainable.install_lora(down.clone(), up.clone(), 0.5);
+            assert_lora_tensor_exact(
+                &trainable.forward(&x).unwrap(),
+                &expected,
+                "quantized trainable live adapter",
+            );
+
+            let mut additive = int8_fast_lora(quant, out_f, in_f);
+            additive.push_additive_lora(a.clone(), b.clone(), 0.5);
+            assert_lora_tensor_exact(
+                &additive.forward(&x).unwrap(),
+                &expected,
+                "quantized additive live adapter",
+            );
+        }
     }
 
     // ---- packed base (sc-9416) ---------------------------------------------------------------
@@ -1288,6 +1872,39 @@ mod tests {
         assert!(dmax < 1e-4, "additive vs folded deviates by {dmax}");
     }
 
+    /// An explicit two-stage adapter must change the actual forward residual when the LTX pipeline
+    /// moves from stage one to stage two; merely accepting `[1.0, 0.4]` at load time is insufficient.
+    #[test]
+    fn additive_lora_selects_the_requested_distilled_pass_scale() {
+        let dev = Device::Cpu;
+        let base = Linear::new(Tensor::zeros((1, 1), DType::F32, &dev).unwrap(), None);
+        let mut lin = LoraLinear::from_linear(base, 1, 1, "ltx.pass_test".into());
+        lin.push_additive_lora_per_pass(
+            Tensor::ones((1, 1), DType::F32, &dev).unwrap(),
+            Tensor::ones((1, 1), DType::F32, &dev).unwrap(),
+            vec![1.0, 0.4],
+        )
+        .unwrap();
+        let x = Tensor::from_vec(vec![5.0f32], (1, 1), &dev).unwrap();
+
+        lin.set_additive_pass(0);
+        assert_eq!(
+            lin.forward(&x).unwrap().to_vec2::<f32>().unwrap(),
+            vec![vec![5.0]]
+        );
+        lin.set_additive_pass(1);
+        assert_eq!(
+            lin.forward(&x).unwrap().to_vec2::<f32>().unwrap(),
+            vec![vec![2.0]]
+        );
+        // A later pass clamps to the final explicit scale instead of silently reverting to stage one.
+        lin.set_additive_pass(9);
+        assert_eq!(
+            lin.forward(&x).unwrap().to_vec2::<f32>().unwrap(),
+            vec![vec![2.0]]
+        );
+    }
+
     /// A trainable residual is legal over an immutable packed base: the packed weights remain frozen
     /// and only the independent f32 factors participate in autograd (the LTX q4 trainer path).
     #[test]
@@ -1376,10 +1993,8 @@ mod tests {
             "to_q.weight".into(),
             Tensor::randn(0f32, 1f32, (out_f, in_f), &dev).unwrap(),
         );
-        let tmp = std::env::temp_dir().join(format!(
-            "sc9416_lora_detect_{}.safetensors",
-            std::process::id()
-        ));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().join("sc9416_lora_detect.safetensors");
         candle_core::safetensors::save(&map, &tmp).unwrap();
         // SAFETY: we just wrote this file and nothing else touches it during the test.
         let st = unsafe { MmapedSafetensors::new(&tmp).unwrap() };
@@ -1393,7 +2008,6 @@ mod tests {
         // The PEFT path is captured for both (the LoraHost visitor routes adapters by it).
         assert_eq!(packed.path(), "to_out.0");
         assert_eq!(dense.path(), "to_q");
-        std::fs::remove_file(&tmp).ok();
     }
 
     #[test]
@@ -1701,6 +2315,59 @@ mod tests {
         assert!(
             diff < 1e-5,
             "reconstruct_lokr_delta diverged from forward residual: {diff}"
+        );
+    }
+
+    #[test]
+    fn reconstruct_lokr_delta_rejects_invalid_metadata_and_user_scaling() {
+        let w1 = Tensor::ones((1, 1), DType::F32, &Device::Cpu).unwrap();
+        let w2 = Tensor::eye(2, DType::F32, &Device::Cpu).unwrap();
+        let reconstruct = |alpha, rank, scale| {
+            reconstruct_lokr_delta(
+                Some(&w1),
+                None,
+                None,
+                Some(&w2),
+                None,
+                None,
+                alpha,
+                rank,
+                scale,
+                (2, 2),
+            )
+        };
+
+        for scale in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let error = reconstruct(1.0, 1.0, scale)
+                .expect_err("a non-finite user scale must not produce a dense delta");
+            assert!(error.to_string().contains("adapter scale must be finite"));
+        }
+        for alpha in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let error = reconstruct(alpha, 1.0, 1.0)
+                .expect_err("a non-finite metadata alpha must not produce a dense delta");
+            assert!(error.to_string().contains("invalid metadata scale"));
+        }
+        for rank in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let error = reconstruct(1.0, rank, 1.0)
+                .expect_err("an invalid metadata rank must not produce a dense delta");
+            assert!(error.to_string().contains("invalid metadata scale"));
+        }
+
+        for (rank, alpha) in [
+            (Some("not-a-number"), None),
+            (Some("0"), None),
+            (Some("-2"), Some("1")),
+            (Some("1"), Some("inf")),
+        ] {
+            assert!(
+                parse_lokr_metadata(rank, alpha).is_err(),
+                "present malformed metadata must fail closed: rank={rank:?} alpha={alpha:?}"
+            );
+        }
+        assert_eq!(parse_lokr_metadata(None, None).unwrap(), (1.0, 1.0));
+        assert_eq!(
+            parse_lokr_metadata(Some("4"), Some("2")).unwrap(),
+            (4.0, 2.0)
         );
     }
 

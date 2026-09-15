@@ -673,3 +673,250 @@ mod tests {
         );
     }
 }
+
+/// sc-18763: pin exactly which Gemma hidden states [`GemmaModel::forward`] returns — the count and
+/// which slot carries the final norm. The LTX caption feature extractor concatenates ALL returned
+/// states (`flat_dim = hidden_size * (num_layers+1)`, `text_encoder.rs`'s `normed_hidden`); an
+/// off-by-one here (dropping/duplicating a layer, or skipping/misplacing the final norm) changes
+/// every downstream number by a small amount that a smoke render would not catch, exactly the
+/// hazard the story called out. Synthetic tiny weights only — no real Gemma checkpoint needed.
+#[cfg(test)]
+mod hidden_state_pinning_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn tiny_cfg(num_layers: usize) -> GemmaConfig {
+        GemmaConfig {
+            hidden_size: 8,
+            num_layers,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 4,
+            intermediate: 8,
+            rms_eps: 1e-6,
+            query_pre_attn_scalar: 4.0,
+            rope_local_base: 10_000.0,
+            rope_global_base: 1_000_000.0,
+            sliding_window_pattern: 6,
+            sliding_window: 1024,
+        }
+    }
+
+    /// Deterministic, non-degenerate (non-zero, non-uniform) fill so RMSNorm/attention behave
+    /// generically rather than hitting a zero-weight special case.
+    fn fill(n: usize, seed: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| ((i as f32 + seed) * 0.037).sin() * 0.1)
+            .collect()
+    }
+
+    fn put(m: &mut HashMap<String, Array>, key: &str, shape: &[i32], seed: f32) {
+        let n: usize = shape.iter().map(|&d| d as usize).product();
+        m.insert(
+            key.to_string(),
+            Array::from_slice(&fill(n, seed), shape)
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap(),
+        );
+    }
+
+    /// A tiny, fully-synthetic Gemma weight set (unprefixed keys — `from_weights_with_prefix(..,
+    /// "")`) covering every tensor `from_weights_with_prefix` requires.
+    fn tiny_weights(cfg: &GemmaConfig, vocab: i32, seed: f32) -> Weights {
+        let mut m: HashMap<String, Array> = HashMap::new();
+        put(
+            &mut m,
+            "embed_tokens.weight",
+            &[vocab, cfg.hidden_size],
+            seed,
+        );
+        for i in 0..cfg.num_layers {
+            let b = format!("layers.{i}.");
+            let s = seed + i as f32;
+            put(
+                &mut m,
+                &format!("{b}input_layernorm.weight"),
+                &[cfg.hidden_size],
+                s + 1.0,
+            );
+            put(
+                &mut m,
+                &format!("{b}post_attention_layernorm.weight"),
+                &[cfg.hidden_size],
+                s + 2.0,
+            );
+            put(
+                &mut m,
+                &format!("{b}pre_feedforward_layernorm.weight"),
+                &[cfg.hidden_size],
+                s + 3.0,
+            );
+            put(
+                &mut m,
+                &format!("{b}post_feedforward_layernorm.weight"),
+                &[cfg.hidden_size],
+                s + 4.0,
+            );
+            put(
+                &mut m,
+                &format!("{b}self_attn.q_proj.weight"),
+                &[cfg.num_heads * cfg.head_dim, cfg.hidden_size],
+                s + 5.0,
+            );
+            put(
+                &mut m,
+                &format!("{b}self_attn.k_proj.weight"),
+                &[cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size],
+                s + 6.0,
+            );
+            put(
+                &mut m,
+                &format!("{b}self_attn.v_proj.weight"),
+                &[cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size],
+                s + 7.0,
+            );
+            put(
+                &mut m,
+                &format!("{b}self_attn.o_proj.weight"),
+                &[cfg.hidden_size, cfg.num_heads * cfg.head_dim],
+                s + 8.0,
+            );
+            put(
+                &mut m,
+                &format!("{b}self_attn.q_norm.weight"),
+                &[cfg.head_dim],
+                s + 9.0,
+            );
+            put(
+                &mut m,
+                &format!("{b}self_attn.k_norm.weight"),
+                &[cfg.head_dim],
+                s + 10.0,
+            );
+            put(
+                &mut m,
+                &format!("{b}mlp.gate_proj.weight"),
+                &[cfg.intermediate, cfg.hidden_size],
+                s + 11.0,
+            );
+            put(
+                &mut m,
+                &format!("{b}mlp.up_proj.weight"),
+                &[cfg.intermediate, cfg.hidden_size],
+                s + 12.0,
+            );
+            put(
+                &mut m,
+                &format!("{b}mlp.down_proj.weight"),
+                &[cfg.hidden_size, cfg.intermediate],
+                s + 13.0,
+            );
+        }
+        put(&mut m, "norm.weight", &[cfg.hidden_size], seed + 100.0);
+        Weights::from_map(m)
+    }
+
+    fn max_abs_diff(a: &Array, b: &Array) -> f32 {
+        let a = a.as_dtype(Dtype::Float32).unwrap();
+        let b = b.as_dtype(Dtype::Float32).unwrap();
+        a.as_slice::<f32>()
+            .iter()
+            .zip(b.as_slice::<f32>())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn forward_returns_exactly_num_layers_plus_one_hidden_states() {
+        for num_layers in [1usize, 2, 3, 5] {
+            let cfg = tiny_cfg(num_layers);
+            let w = tiny_weights(&cfg, 6, 0.0);
+            let model = GemmaModel::from_weights_with_prefix(&w, cfg, None, "").unwrap();
+            let ids = Array::from_slice(&[0i32, 1, 2], &[1, 3]);
+            let mask = Array::from_slice(&[1i32, 1, 1], &[1, 3]);
+            let hiddens = model.forward(&ids, &mask).unwrap();
+            assert_eq!(
+                hiddens.len(),
+                num_layers + 1,
+                "num_layers={num_layers}: the LTX feature extractor concatenates ALL returned \
+                 hidden states (flat_dim = hidden_size · (num_layers+1)); an off-by-one here \
+                 silently drops or duplicates a layer's contribution with no visible failure in a \
+                 smoke render"
+            );
+        }
+    }
+
+    #[test]
+    fn hidden_state_zero_is_exactly_the_scaled_embedding_lookup() {
+        let cfg = tiny_cfg(2);
+        let w = tiny_weights(&cfg, 6, 0.0);
+        let model = GemmaModel::from_weights_with_prefix(&w, cfg, None, "").unwrap();
+        let ids = Array::from_slice(&[3i32, 1], &[1, 2]);
+        let mask = Array::from_slice(&[1i32, 1], &[1, 2]);
+        let hiddens = model.forward(&ids, &mask).unwrap();
+
+        let embed = w
+            .require("embed_tokens.weight")
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        let embed_slice = embed.as_slice::<f32>();
+        let hidden = cfg.hidden_size as usize;
+        let scale = (cfg.hidden_size as f32).sqrt();
+        let row = |id: usize| -> Vec<f32> {
+            embed_slice[id * hidden..(id + 1) * hidden]
+                .iter()
+                .map(|v| v * scale)
+                .collect()
+        };
+        let want: Vec<f32> = [row(3), row(1)].concat();
+        let want = Array::from_slice(&want, &[1, 2, cfg.hidden_size]);
+        assert!(
+            max_abs_diff(&hiddens[0], &want) < 5e-3,
+            "hidden_states[0] must be exactly the scaled embedding lookup (index 0 pinning)"
+        );
+    }
+
+    #[test]
+    fn only_the_last_hidden_state_carries_the_final_norm() {
+        // Two models identical except `norm.weight` (the FINAL norm, applied once after the last
+        // layer). If it's wired to exactly one slot (the last), perturbing it must change
+        // `hiddens.last()` and MUST NOT change any earlier slot — pinning both "is the final norm
+        // applied at all" and "is it applied to the right, and only the right, index".
+        let cfg = tiny_cfg(2);
+        let ids = Array::from_slice(&[0i32, 1], &[1, 2]);
+        let mask = Array::from_slice(&[1i32, 1], &[1, 2]);
+
+        let w_a = tiny_weights(&cfg, 6, 0.0);
+        let model_a = GemmaModel::from_weights_with_prefix(&w_a, cfg, None, "").unwrap();
+        let hiddens_a = model_a.forward(&ids, &mask).unwrap();
+
+        let mut w_b_map: HashMap<String, Array> = HashMap::new();
+        for k in w_a.keys() {
+            w_b_map.insert(k.to_string(), w_a.get(k).unwrap().clone());
+        }
+        // Perturb ONLY the final norm weight, far from its original small-magnitude value.
+        w_b_map.insert(
+            "norm.weight".to_string(),
+            Array::from_slice(&vec![9.0f32; cfg.hidden_size as usize], &[cfg.hidden_size])
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap(),
+        );
+        let w_b = Weights::from_map(w_b_map);
+        let model_b = GemmaModel::from_weights_with_prefix(&w_b, cfg, None, "").unwrap();
+        let hiddens_b = model_b.forward(&ids, &mask).unwrap();
+
+        assert_eq!(hiddens_a.len(), hiddens_b.len());
+        let last = hiddens_a.len() - 1;
+        for i in 0..last {
+            assert!(
+                max_abs_diff(&hiddens_a[i], &hiddens_b[i]) < 1e-6,
+                "perturbing the FINAL norm changed hidden_states[{i}], which is not the final index"
+            );
+        }
+        assert!(
+            max_abs_diff(&hiddens_a[last], &hiddens_b[last]) > 1e-3,
+            "perturbing the FINAL norm must change the LAST hidden state (the final-norm slot)"
+        );
+    }
+}

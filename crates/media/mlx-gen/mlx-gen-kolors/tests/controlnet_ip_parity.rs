@@ -15,7 +15,7 @@
 //! img2img base and renders coherently. (f32 for the byte-exact invariant — the same bf16-chaos
 //! caveat as the per-component ControlNet / IP gates.)
 //!
-//! Run: `cargo test -p mlx-gen-kolors --release --test controlnet_ip_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-kolors --release --test integration controlnet_ip_parity:: -- --ignored --nocapture`
 
 use std::path::PathBuf;
 

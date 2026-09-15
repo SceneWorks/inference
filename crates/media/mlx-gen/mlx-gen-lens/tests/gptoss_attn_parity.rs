@@ -9,7 +9,7 @@
 //! rotary embedding; (2) the f32 attention forward (GQA + sinks + RoPE) reproduces the reference
 //! attention output near-bit.
 //!
-//! Run: `cargo test -p mlx-gen-lens --test gptoss_attn_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-lens --test integration gptoss_attn_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max, subtract};
 use mlx_rs::{Array, Dtype};

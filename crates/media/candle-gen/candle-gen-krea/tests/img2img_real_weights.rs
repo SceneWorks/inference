@@ -11,7 +11,7 @@
 //! ```sh
 //! KREA_TURBO_DIR=D:\models\Krea-2-Turbo \
 //! KREA_IMG2IMG_SOURCE=D:\fixtures\photo.png \
-//!   cargo test -p candle-gen-krea --release --features cuda --test img2img_real_weights -- --ignored --nocapture
+//!   cargo test -p candle-gen-krea --release --features cuda --test integration img2img_real_weights:: -- --ignored --nocapture
 //! ```
 //! `KREA_IMG2IMG_SIZE=WxH` (multiples of 16) overrides the target resolution; else the reference's size
 //! rounded down to a multiple of 16. `KREA_IMG2IMG_STEPS` overrides the ~8-step Turbo budget.
@@ -24,6 +24,16 @@ use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::{GenerationRequest, Image};
 use candle_gen_krea::pipeline::{load_components, render_base_img2img, render_img2img};
 use candle_gen_krea::vae::load_vae_encoder;
+
+/// Root for this suite's **deliberately persistent** artifacts. `KREA_SMOKE_ARTIFACT_DIR` points them
+/// somewhere durable; the `$TMPDIR` default is intentional and must NOT become a `tempfile`
+/// guard — these outputs outlive the test on purpose (rendered PNGs you open afterwards), so a guard
+/// would delete the very thing the test exists to produce (sc-17791).
+fn artifact_root() -> PathBuf {
+    std::env::var("KREA_SMOKE_ARTIFACT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir())
+}
 
 /// (std, distinct-level-count, mean horizontal-adjacent-|Δ|) — a coherent natural image has a broad
 /// histogram AND spatial smoothness; pure noise has a high adjacent Δ and flat std.
@@ -135,7 +145,7 @@ fn resize_ref(im: &Image, w: u32, h: u32) -> Vec<u8> {
 }
 
 fn save(img: &Image, name: &str) {
-    let dir = std::env::temp_dir().join("krea_img2img_smoke");
+    let dir = artifact_root().join("krea_img2img_smoke");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("{name}.png"));
     image::save_buffer(
@@ -251,7 +261,7 @@ fn img2img_is_coherent_and_monotone_in_reference_fidelity() {
 /// ```sh
 /// KREA_RAW_DIR=D:\models\Krea-2-Raw \
 /// KREA_IMG2IMG_SOURCE=D:\fixtures\photo.png \
-///   cargo test -p candle-gen-krea --release --features cuda --test img2img_real_weights -- --ignored --nocapture
+///   cargo test -p candle-gen-krea --release --features cuda --test integration img2img_real_weights:: -- --ignored --nocapture
 /// ```
 /// `KREA_IMG2IMG_SIZE=WxH` (multiples of 16) overrides the resolution; `KREA_IMG2IMG_STEPS` the ~52-step
 /// Raw budget; `KREA_IMG2IMG_GUIDANCE` the CFG scale; `KREA_IMG2IMG_PROMPT` / `KREA_IMG2IMG_NEGATIVE` the

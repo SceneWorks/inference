@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! PID_V1PT5_CKPT=/path/pid_flux_2kto4k_v1pt5.safetensors \
-//!   cargo test -p mlx-gen-pid --test v1pt5_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-pid --test integration v1pt5_real_weights:: -- --ignored --nocapture
 //! ```
 //!
 //! This is the STRUCTURAL gate (correct topology consumed, finite output). Bit-level numeric parity vs
@@ -84,7 +84,7 @@ fn v1pt5_flux_loads_and_forwards() {
 /// ```text
 /// PID_V1PT5_CKPT=/path/pid_flux_2kto4k_v1pt5.safetensors \
 /// PID_V1PT5_REF_DUMP=/path/ref_v1pt5_flux_forward.safetensors \
-///   cargo test -p mlx-gen-pid --test v1pt5_real_weights -- --ignored --nocapture
+///   cargo test -p mlx-gen-pid --test integration v1pt5_real_weights:: -- --ignored --nocapture
 /// ```
 #[test]
 #[ignore = "needs PID_V1PT5_CKPT + PID_V1PT5_REF_DUMP (reference forward dump)"]

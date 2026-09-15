@@ -227,23 +227,20 @@ mod tests {
         candle_core::safetensors::save(&map, path).unwrap();
     }
 
-    fn tmp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "candle_gen_loader_test_{tag}_{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&d);
+    fn tmp_dir(tmp: &tempfile::TempDir, tag: &str) -> PathBuf {
+        let d = tmp.path().join(format!("candle_gen_loader_test_{tag}"));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
 
     #[test]
     fn sorted_is_lexical_not_numeric() {
+        let tmp = tempfile::tempdir().unwrap();
         // The sort must be lexical over the full path — the load-bearing shard order. With numeric
         // shard indices `2 < 10`, but lexically `"...-00010..." < "...-00002..."` is FALSE, so the
         // zero-padded diffusers names sort correctly; a *non*-padded scheme sorts lexically (10<2),
         // which is exactly the ordering `from_mmaped_safetensors` will see. Assert the raw sort order.
-        let dir = tmp_dir("lexical");
+        let dir = tmp_dir(&tmp, "lexical");
         for n in [
             "model-2.safetensors",
             "model-10.safetensors",
@@ -267,7 +264,7 @@ mod tests {
         );
 
         // Zero-padded shard names (the diffusers convention) sort into true numeric order.
-        let dir2 = tmp_dir("padded");
+        let dir2 = tmp_dir(&tmp, "padded");
         for n in [
             "model-00002-of-00010.safetensors",
             "model-00010-of-00010.safetensors",
@@ -294,7 +291,8 @@ mod tests {
 
     #[test]
     fn ignores_non_safetensors_and_errors_when_empty() {
-        let dir = tmp_dir("empty");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp_dir(&tmp, "empty");
         std::fs::write(dir.join("config.json"), b"{}").unwrap();
         std::fs::write(dir.join("model.bin"), b"x").unwrap();
         let err = sorted_safetensors(&dir, "myprov").unwrap_err();
@@ -306,8 +304,9 @@ mod tests {
 
     #[test]
     fn multi_shard_key_union_loads() {
+        let tmp = tempfile::tempdir().unwrap();
         // Two shards, disjoint keys — the union must be visible through the VarBuilder.
-        let dir = tmp_dir("union");
+        let dir = tmp_dir(&tmp, "union");
         write_st(
             &dir.join("model-00001-of-00002.safetensors"),
             "a.weight",
@@ -330,7 +329,8 @@ mod tests {
 
     #[test]
     fn resolve_weight_files_single_file_and_dir_and_missing() {
-        let dir = tmp_dir("fileordir");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp_dir(&tmp, "fileordir");
         // Single-file path.
         let single = dir.join("checkpoint.safetensors");
         write_st(&single, "w", 3.0);
@@ -357,9 +357,10 @@ mod tests {
 
     #[test]
     fn load_one_tensor_reads_named_only_and_errors_on_missing() {
+        let tmp = tempfile::tempdir().unwrap();
         // A multi-tensor file: the helper must return exactly the named tensor (byte-identical to a
         // full load + get + to_dtype) and never depend on the other tensors being materialized.
-        let dir = tmp_dir("one_tensor");
+        let dir = tmp_dir(&tmp, "one_tensor");
         let file = dir.join("checkpoint.safetensors");
         let mut map = std::collections::HashMap::new();
         map.insert(
@@ -408,9 +409,10 @@ mod tests {
 
     #[test]
     fn load_one_tensor_sharded_finds_the_owning_shard_and_errors_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
         // Two shards, each holding a different tensor: the helper probes headers and reads the named
         // tensor from whichever shard owns it — the resharded-snapshot path (F-037 × F-010).
-        let dir = tmp_dir("one_tensor_sharded");
+        let dir = tmp_dir(&tmp, "one_tensor_sharded");
         let a = dir.join("model-00001-of-00002.safetensors");
         let b = dir.join("model-00002-of-00002.safetensors");
         write_st(&a, "text_model.embed.weight", 1.0);
@@ -455,7 +457,8 @@ mod tests {
 
     #[test]
     fn component_vb_missing_subdir_errors() {
-        let dir = tmp_dir("component");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp_dir(&tmp, "component");
         match component_vb(&dir, "transformer", DType::F32, &Device::Cpu, "prov") {
             Err(CandleError::Msg(m)) => {
                 assert!(m.contains("prov") && m.contains("transformer/"), "got: {m}")
@@ -471,7 +474,8 @@ mod tests {
     /// Mac-authored zips and copied HF caches, so this is not a macOS-only concern.
     #[test]
     fn sorted_safetensors_skips_appledouble_sidecar() {
-        let dir = tmp_dir("appledouble");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp_dir(&tmp, "appledouble");
         write_st(&dir.join("model.safetensors"), "blk.weight", 1.0);
         // Real AppleDouble header: magic 0x00051607, version 0x00020000.
         std::fs::write(
@@ -494,7 +498,8 @@ mod tests {
     /// rather than a raw mmap failure on the sidecar's bogus header.
     #[test]
     fn sorted_safetensors_with_only_a_sidecar_errors() {
-        let dir = tmp_dir("only_sidecar");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp_dir(&tmp, "only_sidecar");
         std::fs::write(dir.join("._model.safetensors"), [0x00, 0x05, 0x16, 0x07]).unwrap();
 
         match sorted_safetensors(&dir, "prov") {

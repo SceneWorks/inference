@@ -4,7 +4,7 @@
 //! (the on-disk `model.*` layout maps onto the Rust tree under the `"model"` prefix) and the local
 //! golden from `tools/dump_qwen_text_encoder_golden.py` (gitignored: fixed inputs + the fork's f32
 //! encoder hidden states + drop-34 prompt embeds). Run:
-//!   cargo test -p mlx-gen-qwen-image --release --test text_encoder_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-qwen-image --release --test integration text_encoder_real_weights:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 
@@ -19,7 +19,7 @@ const GOLDEN: &str = concat!(
 
 /// Locate the Qwen-Image snapshot dir (env override, else the HF cache).
 fn snapshot() -> PathBuf {
-    let p = std::env::var("QWEN_IMAGE_SNAPSHOT").unwrap_or_else(|_| panic!("set QWEN_IMAGE_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    let p = std::env::var("MLX_GEN_QWEN_SNAPSHOT").unwrap_or_else(|_| panic!("set MLX_GEN_QWEN_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
     PathBuf::from(p)
 }
 

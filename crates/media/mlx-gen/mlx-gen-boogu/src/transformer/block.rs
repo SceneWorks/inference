@@ -13,16 +13,52 @@ use mlx_rs::Array;
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::nn::silu;
+use mlx_gen::qkv::{
+    self, AttnPrepSpec, FusedQkvProjection, QkNormSpec, QkvSource, RopeDtype, RopeSpec, RopeStyle,
+    RopeTables,
+};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
-use super::rope::apply_interleaved_rope;
-use super::{join, repeat_kv, slice_axis1};
+use super::{join, slice_axis1};
 use crate::quant::lin;
 
 /// diffusers `Attention(eps=1e-5)` — the per-head q/k RMSNorm epsilon (distinct from the block
 /// RMSNorm `norm_eps`, which is also 1e-5 here but conceptually separate).
 const QK_EPS: f32 = 1e-5;
+
+/// SC-18319 — **Boogu is knob 10's reference case**: 28 query heads / 7 kv heads, with the
+/// `repeat_interleave` placed AFTER the rotation, which is the reference's own order and is *not*
+/// interchangeable with repeating first (the RoPE table is indexed per kv head). The rest: separate
+/// q/k/v projections (knob 9), per-head QK-RMSNorm over `head_dim` (knob 1), adjacent-pair
+/// interleaved rotation (knob 2), token-major axes.
+///
+/// Boogu is also the family whose kv projections the fused-QKV packer refuses: `crate::quant`'s
+/// `GROUP_SIZE` is **32** (explicit, non-default, because the DiT hidden 3360 is not divisible by
+/// 64), and the kv `out = kv_heads · head_dim = 7 · 120 = 840` is not a multiple of 32. See
+/// `mlx_gen::qkv::NoFusion::OutFeaturesNotGroupAligned`.
+fn boogu_spec<'a>(
+    heads: i32,
+    kv_heads: i32,
+    head_dim: i32,
+    norm_q: &'a Array,
+    norm_k: &'a Array,
+    cos: &'a Array,
+    sin: &'a Array,
+) -> AttnPrepSpec<'a> {
+    AttnPrepSpec::new(heads, head_dim)
+        .with_kv_heads(kv_heads)
+        .with_qk_norm(QkNormSpec::per_head(norm_q, norm_k, QK_EPS))
+        .with_rope(RopeSpec {
+            style: RopeStyle::AdjacentPair,
+            q: Some(RopeTables::new(cos, sin)),
+            k: Some(RopeTables::new(cos, sin)),
+            // Knob 12 — the reference upcasts the stream for the rotation and casts BACK
+            // (`rope.rs`: `.as_dtype(dt)`), so a bf16 boogu keeps a bf16 SDPA.
+            dtype: RopeDtype::RestoreInput,
+            ..RopeSpec::default()
+        })
+}
 
 /// `1.0 + a`, broadcasting the scalar (used for the `(1 + scale)` modulation factors).
 fn plus1(a: &Array) -> Result<Array> {
@@ -30,10 +66,28 @@ fn plus1(a: &Array) -> Result<Array> {
 }
 
 // ── GQA self-attention (standard `BooguImageAttnProcessor`) ─────────────────────────────────
+/// Boogu is the tree's **production consumer of [`FusedQkvProjection`]**, and the family that proves
+/// both of its arms (SC-18319):
+///
+/// * **Dense, with fusion opted in** — `to_q`/`to_k`/`to_v` all read the same `[b, s, hidden]`
+///   activation with the same `in_features`, so they pack into one
+///   `[q_out + kv_out + kv_out, hidden]` matrix and the block runs one matmul instead of three.
+///   Residency is unchanged: the packed matrix *replaces* the three bases rather than shadowing
+///   them. Fusion is opt-in (`mlx_gen::qkv::set_fused_qkv` defaults to off), so a load with no
+///   `FusedQkvGuard::set(true)` in scope keeps the three projections — bit-identically to boogu's
+///   pre-P4 code.
+/// * **Quantized** — the pack is **refused**, with boogu's real numbers. `crate::quant::GROUP_SIZE`
+///   is 32 (explicit and non-default, because the DiT hidden 3360 is not divisible by 64) and the kv
+///   projections are `out = kv_heads · head_dim = 7 · 120 = 840`, with `840 % 32 = 8`. Concatenating
+///   a group-misaligned output axis would change effective bits, so
+///   [`NoFusion::OutFeaturesNotGroupAligned`](mlx_gen::qkv::NoFusion::OutFeaturesNotGroupAligned) is
+///   returned and the block keeps three separate quantized matmuls. Correct beats fast.
+///
+/// Boogu exposes no `AdaptableHost` routing, so no adapter can be installed behind the pack here;
+/// families that do route adapters keep their split projections (see `qkv::FusedQkvProjection`'s
+/// adapter contract).
 pub struct SelfAttention {
-    q: AdaptableLinear,
-    k: AdaptableLinear,
-    v: AdaptableLinear,
+    qkv: FusedQkvProjection,
     o: AdaptableLinear,
     norm_q: Array,
     norm_k: Array,
@@ -52,9 +106,11 @@ impl SelfAttention {
         head_dim: i32,
     ) -> Result<Self> {
         Ok(Self {
-            q: lin(w, &join(prefix, "to_q"), false)?,
-            k: lin(w, &join(prefix, "to_k"), false)?,
-            v: lin(w, &join(prefix, "to_v"), false)?,
+            qkv: FusedQkvProjection::new(
+                lin(w, &join(prefix, "to_q"), false)?,
+                lin(w, &join(prefix, "to_k"), false)?,
+                lin(w, &join(prefix, "to_v"), false)?,
+            ),
             o: lin(w, &join(prefix, "to_out.0"), false)?,
             norm_q: w.require(&join(prefix, "norm_q.weight"))?.clone(),
             norm_k: w.require(&join(prefix, "norm_k.weight"))?.clone(),
@@ -65,46 +121,51 @@ impl SelfAttention {
         })
     }
 
+    /// `true` when this block's q/k/v are backed by one packed matrix — dense boogu **with fusion
+    /// opted in**. Q4/Q8 boogu is refused by the group-32 rule above, which the crate's tests assert
+    /// at the real widths.
+    ///
+    /// `false` alone is ambiguous now that fusion is opt-in: it means either boogu's group-32
+    /// refusal or "nobody called `mlx_gen::qkv::set_fused_qkv(true)`". This module's tests
+    /// discriminate by reading `self.qkv.refusal()` directly.
+    pub fn fusion_engaged(&self) -> bool {
+        self.qkv.fusion_engaged()
+    }
+
+    /// Drop back to three separate projections — the P6 matrix's fused-off baseline arm, and what a
+    /// caller does before installing adapters. Bit-exact either way (asserted by this module's
+    /// tests); [`FusedQkvProjection::repack`] returns to the packed form.
+    pub fn unfuse(&mut self) -> Result<()> {
+        self.qkv.unfuse()
+    }
+
     /// `x`: `[b, s, hidden]`; `cos`/`sin`: `[1, s, head_dim/2]`. Unmasked (B=1 full sequence).
     pub fn forward(&self, x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
-        let sh = x.shape();
-        let (b, s) = (sh[0], sh[1]);
-        let q = self
-            .q
-            .forward(x)?
-            .reshape(&[b, s, self.heads, self.head_dim])?;
-        let k = self
-            .k
-            .forward(x)?
-            .reshape(&[b, s, self.kv_heads, self.head_dim])?;
-        let v = self
-            .v
-            .forward(x)?
-            .reshape(&[b, s, self.kv_heads, self.head_dim])?;
-
-        let q = rms_norm(&q, &self.norm_q, QK_EPS)?;
-        let k = rms_norm(&k, &self.norm_k, QK_EPS)?;
-        let q = apply_interleaved_rope(&q, cos, sin)?;
-        let k = apply_interleaved_rope(&k, cos, sin)?;
-
-        let groups = self.heads / self.kv_heads;
-        let k = repeat_kv(&k, groups)?;
-        let v = repeat_kv(&v, groups)?;
-
-        let q = q.transpose_axes(&[0, 2, 1, 3])?;
-        let k = k.transpose_axes(&[0, 2, 1, 3])?;
-        let v = v.transpose_axes(&[0, 2, 1, 3])?;
-        let o = scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?;
-        let o = o
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[b, s, self.heads * self.head_dim])?;
-        self.o.forward(&o)
+        let (q, k, v) = self.qkv.forward(x)?;
+        let heads = qkv::prepare(
+            QkvSource::Separate {
+                q: &q,
+                k: &k,
+                v: &v,
+            },
+            &boogu_spec(
+                self.heads,
+                self.kv_heads,
+                self.head_dim,
+                &self.norm_q,
+                &self.norm_k,
+                cos,
+                sin,
+            ),
+        )?;
+        let o = scaled_dot_product_attention(&heads.q, &heads.k, &heads.v, self.scale, None, None)?;
+        self.o.forward(&qkv::merge_heads(&o)?)
     }
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.q.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
-        self.k.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
-        self.v.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
+        // Unpacks, quantizes each part at boogu's group 32, then re-attempts the pack — which the
+        // safety predicate refuses on the misaligned kv `out`. See this type's doc.
+        self.qkv.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
         self.o.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
         Ok(())
     }
@@ -114,13 +175,12 @@ impl SelfAttention {
 /// Separate img/instruct QKV projections; the streams are concatenated **instruct-first**, attended
 /// jointly, split back, projected by separate `img_out`/`instruct_out`, re-merged, and run through
 /// the shared `to_out.0`. The block then re-splits the result into its instruct/img halves.
+///
+/// Both streams' QKV go through [`FusedQkvProjection`] on the same terms as [`SelfAttention`] —
+/// packed while dense, refused (group 32, kv `out = 840`) once quantized.
 pub struct JointAttention {
-    img_q: AdaptableLinear,
-    img_k: AdaptableLinear,
-    img_v: AdaptableLinear,
-    instruct_q: AdaptableLinear,
-    instruct_k: AdaptableLinear,
-    instruct_v: AdaptableLinear,
+    img_qkv: FusedQkvProjection,
+    instruct_qkv: FusedQkvProjection,
     img_out: AdaptableLinear,
     instruct_out: AdaptableLinear,
     to_out: AdaptableLinear,
@@ -142,12 +202,16 @@ impl JointAttention {
     ) -> Result<Self> {
         let p = |s: &str| join(prefix, s);
         Ok(Self {
-            img_q: lin(w, &p("processor.img_to_q"), false)?,
-            img_k: lin(w, &p("processor.img_to_k"), false)?,
-            img_v: lin(w, &p("processor.img_to_v"), false)?,
-            instruct_q: lin(w, &p("processor.instruct_to_q"), false)?,
-            instruct_k: lin(w, &p("processor.instruct_to_k"), false)?,
-            instruct_v: lin(w, &p("processor.instruct_to_v"), false)?,
+            img_qkv: FusedQkvProjection::new(
+                lin(w, &p("processor.img_to_q"), false)?,
+                lin(w, &p("processor.img_to_k"), false)?,
+                lin(w, &p("processor.img_to_v"), false)?,
+            ),
+            instruct_qkv: FusedQkvProjection::new(
+                lin(w, &p("processor.instruct_to_q"), false)?,
+                lin(w, &p("processor.instruct_to_k"), false)?,
+                lin(w, &p("processor.instruct_to_v"), false)?,
+            ),
             img_out: lin(w, &p("processor.img_out"), false)?,
             instruct_out: lin(w, &p("processor.instruct_out"), false)?,
             to_out: lin(w, &p("to_out.0"), false)?,
@@ -169,51 +233,37 @@ impl JointAttention {
         cos: &Array,
         sin: &Array,
     ) -> Result<Array> {
-        let b = img.shape()[0];
         let (li, lt) = (img.shape()[1], instruct.shape()[1]);
-        let to_heads = |x: &Array, proj: &AdaptableLinear, n: i32, l: i32| -> Result<Array> {
-            Ok(proj.forward(x)?.reshape(&[b, l, n, self.head_dim])?)
+
+        // Knob 8's concat-then-everything arm plus knob 11's `[instruct, img]` order: the two
+        // streams' PROJECTIONS are concatenated on the token axis before the shared QK-norm and
+        // rotation run over the joint sequence, so there is exactly one prologue here rather than
+        // two joined afterwards. (Concatenating `[b, l, n·hd]` on the token axis and then splitting
+        // heads is identical to splitting heads first and concatenating on axis 1, which is what
+        // this used to do.)
+        let (iq, ik, iv) = self.instruct_qkv.forward(instruct)?;
+        let (mq, mk, mv) = self.img_qkv.forward(img)?;
+        let joint = |instruct_proj: &Array, img_proj: &Array| -> Result<Array> {
+            Ok(concatenate_axis(&[instruct_proj, img_proj], 1)?)
         };
-
-        // Concatenate instruct-first along the sequence axis, then split into heads.
-        let q = concatenate_axis(
-            &[
-                &to_heads(instruct, &self.instruct_q, self.heads, lt)?,
-                &to_heads(img, &self.img_q, self.heads, li)?,
-            ],
-            1,
+        let heads = qkv::prepare(
+            QkvSource::Separate {
+                q: &joint(&iq, &mq)?,
+                k: &joint(&ik, &mk)?,
+                v: &joint(&iv, &mv)?,
+            },
+            &boogu_spec(
+                self.heads,
+                self.kv_heads,
+                self.head_dim,
+                &self.norm_q,
+                &self.norm_k,
+                cos,
+                sin,
+            ),
         )?;
-        let k = concatenate_axis(
-            &[
-                &to_heads(instruct, &self.instruct_k, self.kv_heads, lt)?,
-                &to_heads(img, &self.img_k, self.kv_heads, li)?,
-            ],
-            1,
-        )?;
-        let v = concatenate_axis(
-            &[
-                &to_heads(instruct, &self.instruct_v, self.kv_heads, lt)?,
-                &to_heads(img, &self.img_v, self.kv_heads, li)?,
-            ],
-            1,
-        )?;
-
-        let q = rms_norm(&q, &self.norm_q, QK_EPS)?;
-        let k = rms_norm(&k, &self.norm_k, QK_EPS)?;
-        let q = apply_interleaved_rope(&q, cos, sin)?;
-        let k = apply_interleaved_rope(&k, cos, sin)?;
-
-        let groups = self.heads / self.kv_heads;
-        let k = repeat_kv(&k, groups)?;
-        let v = repeat_kv(&v, groups)?;
-
-        let q = q.transpose_axes(&[0, 2, 1, 3])?;
-        let k = k.transpose_axes(&[0, 2, 1, 3])?;
-        let v = v.transpose_axes(&[0, 2, 1, 3])?;
-        let o = scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?;
-        let o =
-            o.transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[b, lt + li, self.heads * self.head_dim])?;
+        let o = scaled_dot_product_attention(&heads.q, &heads.k, &heads.v, self.scale, None, None)?;
+        let o = qkv::merge_heads(&o)?;
 
         // Split → separate output projections → re-merge → shared output projection.
         let instruct_part = slice_axis1(&o, 0, lt)?;
@@ -228,18 +278,23 @@ impl JointAttention {
         self.to_out.forward(&merged)
     }
 
+    /// `true` when both streams' q/k/v are backed by one packed matrix each — dense boogu only.
+    pub fn fusion_engaged(&self) -> bool {
+        self.img_qkv.fusion_engaged() && self.instruct_qkv.fusion_engaged()
+    }
+
+    /// Drop both streams back to separate projections — the P6 fused-off baseline arm.
+    pub fn unfuse(&mut self) -> Result<()> {
+        self.img_qkv.unfuse()?;
+        self.instruct_qkv.unfuse()
+    }
+
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        for p in [
-            &mut self.img_q,
-            &mut self.img_k,
-            &mut self.img_v,
-            &mut self.instruct_q,
-            &mut self.instruct_k,
-            &mut self.instruct_v,
-            &mut self.img_out,
-            &mut self.instruct_out,
-            &mut self.to_out,
-        ] {
+        self.img_qkv
+            .quantize(bits, Some(crate::quant::GROUP_SIZE))?;
+        self.instruct_qkv
+            .quantize(bits, Some(crate::quant::GROUP_SIZE))?;
+        for p in [&mut self.img_out, &mut self.instruct_out, &mut self.to_out] {
             p.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
         }
         Ok(())
@@ -357,6 +412,16 @@ impl PlainBlock {
         self.attn.quantize(bits)?;
         self.ff.quantize(bits)
     }
+
+    /// SC-18319's fused-off baseline arm — see `Transformer::unfuse_qkv`.
+    pub fn unfuse_qkv(&mut self) -> Result<()> {
+        self.attn.unfuse()
+    }
+
+    /// SC-18319 — see `Transformer::qkv_fusion_engaged`.
+    pub fn qkv_fusion_engaged(&self) -> bool {
+        self.attn.fusion_engaged()
+    }
 }
 
 // ── Modulated single-stream / noise-refiner block ───────────────────────────────────────────
@@ -416,6 +481,16 @@ impl ModBlock {
         self.attn.quantize(bits)?;
         self.ff.quantize(bits)?;
         self.norm1.quantize(bits)
+    }
+
+    /// SC-18319's fused-off baseline arm — see `Transformer::unfuse_qkv`.
+    pub fn unfuse_qkv(&mut self) -> Result<()> {
+        self.attn.unfuse()
+    }
+
+    /// SC-18319 — see `Transformer::qkv_fusion_engaged`.
+    pub fn qkv_fusion_engaged(&self) -> bool {
+        self.attn.fusion_engaged()
     }
 }
 
@@ -579,5 +654,203 @@ impl DoubleBlock {
         self.instruct_norm1.quantize(bits)?;
         self.instruct_norm2.quantize(bits)?;
         Ok(())
+    }
+
+    /// SC-18319's fused-off baseline arm — see `Transformer::unfuse_qkv`.
+    pub fn unfuse_qkv(&mut self) -> Result<()> {
+        self.joint_attn.unfuse()?;
+        self.self_attn.unfuse()
+    }
+
+    /// SC-18319 — see `Transformer::qkv_fusion_engaged`.
+    pub fn qkv_fusion_engaged(&self) -> bool {
+        self.joint_attn.fusion_engaged() && self.self_attn.fusion_engaged()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_rs::ops::array_eq;
+    use std::collections::HashMap;
+
+    /// Boogu's real attention geometry. Every divisibility fact that drives the fusion decision is
+    /// preserved exactly: 28 query heads / 7 kv heads at `head_dim = 120`, so the kv projections are
+    /// `out = 840`, and `crate::quant::GROUP_SIZE` is 32.
+    const HEADS: i32 = 28;
+    const KV_HEADS: i32 = 7;
+    const HEAD_DIM: i32 = 120;
+
+    fn det(shape: &[i32], scale: f32, offset: f32) -> Array {
+        let n: i32 = shape.iter().product();
+        let data: Vec<f32> = (0..n)
+            .map(|i| ((i as f32) * scale + offset).sin())
+            .collect();
+        Array::from_slice(&data, shape)
+    }
+
+    /// A synthetic `Weights` for one `SelfAttention` at the geometry above. `hidden` is narrowed to
+    /// a group-aligned 320 so the test stays cheap, while the kv `out` — the *only* reason the pack
+    /// is refused — keeps its real value.
+    fn self_attn_weights(hidden: i32) -> Weights {
+        let q_out = HEADS * HEAD_DIM;
+        let kv_out = KV_HEADS * HEAD_DIM;
+        let mut m: HashMap<String, Array> = HashMap::new();
+        m.insert("a.to_q.weight".into(), det(&[q_out, hidden], 0.0007, 0.1));
+        m.insert("a.to_k.weight".into(), det(&[kv_out, hidden], 0.0009, 0.2));
+        m.insert("a.to_v.weight".into(), det(&[kv_out, hidden], 0.0011, 0.3));
+        m.insert(
+            "a.to_out.0.weight".into(),
+            det(&[hidden, q_out], 0.0005, 0.4),
+        );
+        m.insert("a.norm_q.weight".into(), det(&[HEAD_DIM], 0.31, 1.0));
+        m.insert("a.norm_k.weight".into(), det(&[HEAD_DIM], 0.17, 0.5));
+        Weights::from_map(m)
+    }
+
+    fn build(hidden: i32) -> SelfAttention {
+        SelfAttention::from_weights(&self_attn_weights(hidden), "a", HEADS, KV_HEADS, HEAD_DIM)
+            .expect("synthetic weights")
+    }
+
+    /// Fused-vs-split comparison mirroring `mlx_gen::qkv`'s test helper `agree()`: bit-exact
+    /// whenever it holds (it does on the self-hosted macOS 26.2 NAX build), else a bounded
+    /// **relative** comparison. The two arms run differently shaped GEMMs over the same numbers —
+    /// the fused arm one `N = 5040` matmul, the split arm three at `N = 3360/840/840` — and MLX
+    /// picks its Metal GEMM tile shape (and therefore its accumulation order) from `(M, N, K)`, so
+    /// hosted CI (`macos-15-arm64`) compiles a kernel set that can land the arms a few ULP apart.
+    /// The bound is set far below what a slicing defect (a wrong row range, a stride misread)
+    /// would produce: that is an O(1) relative error, not O(ulp).
+    #[track_caller]
+    fn assert_arms_agree(a: &Array, b: &Array, what: &str) {
+        assert_eq!(a.shape(), b.shape(), "{what}: shape");
+        assert_eq!(a.dtype(), b.dtype(), "{what}: dtype");
+        assert_eq!(
+            a.dtype(),
+            mlx_rs::Dtype::Float32,
+            "{what}: this test's arrays are f32 (see `det`) — the 1e-5 bound below assumes it"
+        );
+        if array_eq(a, b, None).unwrap().item::<bool>() {
+            return;
+        }
+        let diff = mlx_rs::ops::abs(mlx_rs::ops::subtract(a, b).unwrap()).unwrap();
+        let max_abs = mlx_rs::ops::max(&diff, None).unwrap().item::<f32>();
+        let scale = mlx_rs::ops::max(mlx_rs::ops::abs(a).unwrap(), None)
+            .unwrap()
+            .item::<f32>()
+            .max(f32::MIN_POSITIVE);
+        let rel = max_abs / scale;
+        // One ULP of f32 is ~2^-23 relative; allow a handful of accumulation steps' worth, and
+        // nothing remotely close to "read the wrong rows".
+        assert!(
+            rel <= 1e-5,
+            "{what}: the fused and split arms disagree by rel={rel:e} (max|delta|={max_abs:e}, \
+             scale={scale:e}), far beyond Metal GEMM kernel variance — this is a SLICING defect \
+             (a wrong row range or a stride misread), not accumulation order"
+        );
+    }
+
+    /// SC-18319 — the production wiring, at boogu's own numbers.
+    ///
+    /// **Dense**: the three projections read the same activation at the same `in_features`, so they
+    /// pack into one matrix and the block runs one matmul instead of three. **Quantized**:
+    /// `GROUP_SIZE = 32` and the kv `out = 7 · 120 = 840` with `840 % 32 = 8`, so the pack is
+    /// refused rather than silently changing effective bits. Fusing must not change the numbers
+    /// beyond Metal GEMM tile-shape variance (see [`assert_arms_agree`]).
+    ///
+    /// Fusion is **opt-in** (`mlx_gen::qkv::set_fused_qkv` defaults to off), so this test holds a
+    /// guard across the whole build — otherwise every arm below would pass while exercising nothing,
+    /// and the quantized arm's refusal would be `Disabled` rather than the group-32 rule it exists
+    /// to prove. Both halves are asserted: the dense arm asserts it actually packed, and the
+    /// quantized arm asserts the refusal **by name**.
+    #[test]
+    fn self_attention_packs_while_dense_and_is_refused_once_quantized() {
+        // The divisibility facts the decision rests on, asserted as arithmetic so a constant drift
+        // fails here rather than silently re-enabling an unsafe pack.
+        assert_eq!(
+            crate::quant::GROUP_SIZE,
+            32,
+            "boogu's group size is explicit"
+        );
+        assert_eq!((KV_HEADS * HEAD_DIM) % crate::quant::GROUP_SIZE, 8);
+        assert_ne!(HEAD_DIM % crate::quant::GROUP_SIZE, 0);
+        assert_eq!(
+            (HEADS * HEAD_DIM) % crate::quant::GROUP_SIZE,
+            0,
+            "the query projection alone would align — a triple packs or it does not"
+        );
+
+        // The opt-in, held across construction AND the `quantize` re-pack below.
+        let _fused_qkv = mlx_gen::qkv::FusedQkvGuard::set(true);
+
+        let hidden = 320;
+        let mut fused = build(hidden);
+        assert!(
+            fused.fusion_engaged(),
+            "a dense boogu self-attention must pack its q/k/v into one matrix: {:?}",
+            fused.qkv.refusal()
+        );
+
+        let s = 4;
+        let x = det(&[1, s, hidden], 0.003, 0.25);
+        let cos = det(&[1, s, HEAD_DIM / 2], 0.05, 0.0);
+        let sin = det(&[1, s, HEAD_DIM / 2], 0.07, 0.6);
+        let packed_out = fused.forward(&x, &cos, &sin).expect("dense forward");
+
+        // The packed matrix is the row-wise concatenation of the three bases and a matmul's output
+        // rows are independent, so the two arms are ALGEBRAICALLY identical — but not bit-identical
+        // in general: MLX chooses its Metal GEMM tile shape (and with it the accumulation order)
+        // from `(M, N, K)`, and the arms differ in `N` by construction (one 5040-wide GEMM vs
+        // 3360/840/840). See `assert_arms_agree` for the bound that still catches a real slicing
+        // defect, and `mlx_gen::qkv::FusedQkvProjection::forward_packed`'s doc for the full story.
+        let mut split = build(hidden);
+        assert!(
+            split.fusion_engaged(),
+            "the baseline arm must START packed, or 'unfusing changed nothing' is vacuous"
+        );
+        split.unfuse().expect("unfuse");
+        assert!(!split.fusion_engaged(), "the baseline arm must be split");
+        assert_eq!(
+            split.qkv.refusal(),
+            Some(&mlx_gen::qkv::NoFusion::Unfused),
+            "split because it was unfused, not because nobody opted in"
+        );
+        let split_out = split.forward(&x, &cos, &sin).expect("split forward");
+        assert_eq!(packed_out.shape(), split_out.shape());
+        assert_arms_agree(
+            &packed_out,
+            &split_out,
+            "boogu fused vs split self-attention",
+        );
+
+        // Quantizing must REFUSE the pack on the misaligned kv output axis — and the toggle is
+        // still on, so the refusal cannot be `Disabled`.
+        fused.quantize(8).expect("q8");
+        assert!(
+            !fused.fusion_engaged(),
+            "boogu's kv out = {} is not a multiple of GROUP_SIZE {}, so the pack must be refused \
+             rather than papered over",
+            KV_HEADS * HEAD_DIM,
+            crate::quant::GROUP_SIZE
+        );
+        assert_eq!(
+            fused.qkv.refusal(),
+            Some(&mlx_gen::qkv::NoFusion::OutFeaturesNotGroupAligned {
+                out: KV_HEADS * HEAD_DIM,
+                group: crate::quant::GROUP_SIZE,
+            }),
+            "the refusal must be boogu's group-alignment rule, not the opt-in toggle"
+        );
+
+        // …and the by-construction claim is independent of the toggle: with fusion opted OUT the
+        // block is split too, for the other reason. Both arms of the refusal are reachable.
+        drop(_fused_qkv);
+        let off = build(hidden);
+        assert!(!off.fusion_engaged());
+        assert_eq!(
+            off.qkv.refusal(),
+            Some(&mlx_gen::qkv::NoFusion::Disabled),
+            "with no opt-in the block is split because fusion is off, and says so"
+        );
     }
 }

@@ -30,7 +30,7 @@
 //! e2e **pixel-exact**. Honors "divergence is not rounding": the gap was a real, named, fixed op — not
 //! irreducible f32 accumulation.
 //!
-//! Run: `LTX_BASE_DIR=… LTX_GEMMA_DIR=… cargo test -p mlx-gen-ltx --test e2e_parity -- --ignored --nocapture`
+//! Run: `LTX_BASE_DIR=… LTX_GEMMA_DIR=… cargo test -p mlx-gen-ltx --test integration e2e_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, gt, max as max_op, subtract, sum};
 use mlx_rs::{Array, Dtype};

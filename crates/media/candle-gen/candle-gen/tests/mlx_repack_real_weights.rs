@@ -6,7 +6,7 @@
 //! SC9085_Q4=<...>/q4/transformer/model.safetensors   (required)
 //! SC9085_BF16=<...>/bf16/transformer/model.safetensors  (optional: ground-truth order check)
 //! SC9085_Q8=<...>/q8/transformer/model.safetensors   (optional: Q8_0 re-quant error study)
-//! cargo test -p candle-gen --test mlx_repack_real_weights -- --ignored --nocapture
+//! cargo test -p candle-gen --test integration mlx_repack_real_weights:: -- --ignored --nocapture
 //! ```
 //!
 //! (The sc-9086 shared-load test `shared_qlinear_packed_load_matches_grid_on_real_tier` reuses the

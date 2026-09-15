@@ -37,7 +37,7 @@
 //! MAGE_EDIT_TIER_ROOT=<SceneWorks/Mage-Flow-Edit snapshot with q4/ q8/> \
 //! MAGE_COMPONENTS_ROOT=<SceneWorks/Mage-Flow-Components-mlx snapshot with q4/ q8/> \
 //! MAGE_EDIT_DUMP_DIR=/tmp/mage-edit \
-//!   cargo test -p mlx-gen-mage --release --test edit_quant_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-mage --release --test integration edit_quant_real_weights:: -- --ignored --nocapture
 //! ```
 //!
 //! `MAGE_EDIT_DUMP_DIR` is optional and writes each render as a PNG — the tiers must be **looked

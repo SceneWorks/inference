@@ -8,12 +8,12 @@
 //! bit-identical. The tiny vocab can't hold the real special-token ids, so the model is built with
 //! [`T2iModel::with_image_token_ids`] (10 / 11), mirroring the dump.
 //!
-//! Run: `cargo test -p mlx-gen-sensenova --test vqa_parity -- --nocapture`
+//! Run: `cargo test -p mlx-gen-sensenova --test integration vqa_parity:: -- --nocapture`
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sensenova::{NeoChatConfig, Sampler, T2iModel};
 
-const FIXTURE: &str = concat!(
+const CASE_FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/vqa_golden.safetensors"
 );
@@ -55,16 +55,16 @@ fn config_from_meta(w: &Weights) -> NeoChatConfig {
 
 #[test]
 fn vqa_greedy_matches_reference() {
-    let w = Weights::from_file(FIXTURE).expect("load fixture");
-    let cfg = config_from_meta(&w);
-    let img_context_id: i32 = w.metadata("img_context_id").unwrap().parse().unwrap();
-    let img_start_id: i32 = w.metadata("img_start_id").unwrap().parse().unwrap();
+    let (w, case) = crate::compact_fixture::load(CASE_FIXTURE);
+    let cfg = config_from_meta(&case);
+    let img_context_id: i32 = case.metadata("img_context_id").unwrap().parse().unwrap();
+    let img_start_id: i32 = case.metadata("img_start_id").unwrap().parse().unwrap();
     let model = T2iModel::from_weights(&w, &cfg)
         .expect("build")
         .with_image_token_ids(img_context_id, img_start_id, 12);
 
-    let src_gh: i32 = w.metadata("src_grid_h").unwrap().parse().unwrap();
-    let src_gw: i32 = w.metadata("src_grid_w").unwrap().parse().unwrap();
+    let src_gh: i32 = case.metadata("src_grid_h").unwrap().parse().unwrap();
+    let src_gw: i32 = case.metadata("src_grid_w").unwrap().parse().unwrap();
     let ids: Vec<i32> = w
         .require("prefix.input_ids")
         .unwrap()

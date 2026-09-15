@@ -6,7 +6,7 @@
 //!
 //! `#[ignore]`d — needs the real `stabilityai/stable-diffusion-3.5-large-turbo` snapshot in the HF
 //! cache (or `SD3_LARGE_TURBO_SNAPSHOT`) and Metal. Run with:
-//!   cargo test -p mlx-gen-sd3 --release --test e2e_turbo_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sd3 --release --test integration e2e_turbo_real_weights:: -- --ignored --nocapture
 //!
 //! The smoke drives the PUBLIC registry path (`provider_registry().load("sd3_5_large_turbo", spec).generate`),
 //! saves the PNG, and reports sanity signals (the coordinator can't view the image): per-channel

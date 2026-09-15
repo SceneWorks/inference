@@ -11,13 +11,13 @@
 //!
 //! `#[ignore]`d — needs a real `Kwai-Kolors/Kolors-diffusers` snapshot. Run per tier:
 //!   KOLORS_SNAPSHOT=<snap> KOLORS_BITS=4 KOLORS_TOKENIZER_JSON=<tok.json> \
-//!     cargo test -p mlx-gen-kolors --release --test prequantize_real_weights -- --ignored --nocapture
+//!     cargo test -p mlx-gen-kolors --release --test integration prequantize_real_weights:: -- --ignored --nocapture
 //!
 //! Env knobs: KOLORS_SNAPSHOT (source snapshot dir; else the newest HF-cache snapshot), KOLORS_OUT
 //! (tier output dir), KOLORS_BITS (4 default / 8), KOLORS_TOKENIZER_JSON (derived fast tokenizer.json;
 //! optional if the source `tokenizer/` already has one), KOLORS_KEEP (retain the built tier).
 
-mod common;
+use crate::common;
 
 use mlx_gen_kolors::Kolors;
 use mlx_rs::Dtype;
@@ -34,7 +34,7 @@ fn tokenizer_json() -> Option<PathBuf> {
 /// Build the packed tier + report each packed component's on-disk size — the hostable-tier producer
 /// for the epic-8506 rollout. Run per tier (Q4/Q8):
 ///   KOLORS_SNAPSHOT=<snap> KOLORS_OUT=<staging/q4> KOLORS_BITS=4 KOLORS_TOKENIZER_JSON=<tok.json> \
-///     cargo test -p mlx-gen-kolors --release --test prequantize_real_weights -- --ignored build_tier_only --nocapture
+///     cargo test -p mlx-gen-kolors --release --test integration -- --ignored prequantize_real_weights::build_tier_only --nocapture
 #[test]
 #[ignore = "build-only tier producer for hosting; set KOLORS_SNAPSHOT/OUT/BITS/TOKENIZER_JSON"]
 fn build_tier_only() {

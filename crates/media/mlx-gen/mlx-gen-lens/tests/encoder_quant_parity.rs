@@ -12,7 +12,7 @@
 //! it advertises (run under `/usr/bin/time -l` to confirm the peak RSS) rather than the `~40 GB`
 //! dense bf16 stack — the whole point of the story.
 //!
-//! Run: `cargo test -p mlx-gen-lens --test encoder_quant_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-lens --test integration encoder_quant_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{multiply, sum};
 use mlx_rs::{Array, Dtype};
@@ -33,7 +33,7 @@ const DENSE_FLOOR_COS: f32 = 0.9971;
 
 fn text_encoder_dir() -> std::path::PathBuf {
     let base = std::path::PathBuf::from(std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)"))
-        .join("models--microsoft--Lens-Turbo/snapshots");
+        .join("models--SceneWorks--Lens-Turbo/snapshots");
     let snap = std::fs::read_dir(&base)
         .unwrap_or_else(|_| panic!("snapshot dir {}", base.display()))
         .filter_map(|e| e.ok())

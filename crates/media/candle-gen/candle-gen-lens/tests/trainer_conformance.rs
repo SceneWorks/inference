@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! set LENS_BASE_SNAPSHOT=C:\Users\…\models--microsoft--Lens\snapshots\<hash>
-//! cargo test -p candle-gen-lens --features cuda --release --test trainer_conformance -- --ignored --nocapture
+//! cargo test -p candle-gen-lens --features cuda --release --test integration trainer_conformance:: -- --ignored --nocapture
 //! ```
 //!
 //! The profile is forced to **bf16** (the DiT's native dtype) and gradient-checkpointing on (the
@@ -44,6 +44,7 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
             image_path: path,
             caption: format!("a solid colour swatch number {i}"),
             control_image_path: None,
+            model_options: Default::default(),
         });
     }
     items
@@ -53,7 +54,8 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
 #[ignore = "needs real microsoft/Lens weights (LENS_BASE_SNAPSHOT or HF cache) + a CUDA GPU; run with --features cuda --ignored"]
 fn lens_trainer_satisfies_gen_core_contract() {
     assert_eq!(candle_gen_lens::MODEL_ID_BASE, "lens");
-    let tmp = std::env::temp_dir().join("candle_lens_trainer_conformance");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp.join("data"));
     let mut profile = TrainerProfile::cheap(items, tmp.join("out"));
     // The Lens DiT trains at its native bf16; the trainer always gradient-checkpoints the 48-block

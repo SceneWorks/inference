@@ -11,10 +11,10 @@
 //!
 //! `#[ignore]` — needs the real Krea 2 Turbo control weights (defaults to the HF cache):
 //! ```sh
-//! cargo test -p mlx-gen-krea --release --test tap_reweight_control_real_weights -- --ignored --nocapture
+//! cargo test -p mlx-gen-krea --release --test integration tap_reweight_control_real_weights:: -- --ignored --nocapture
 //! # or point at explicit tiers:
 //! KREA_CONTROL_DIR=…/krea-2-turbo-mlx/…/bf16 KREA_CONTROL_OVERLAY=…/control_step5000.safetensors \
-//!   cargo test -p mlx-gen-krea --release --test tap_reweight_control_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-krea --release --test integration tap_reweight_control_real_weights:: -- --ignored --nocapture
 //! ```
 
 use mlx_gen::{

@@ -22,6 +22,7 @@
 
 use candle_gen::candle_core::{DType, Device, Result as CResult, Tensor};
 use candle_gen::candle_nn::{ops, VarBuilder};
+use candle_gen::gen_core::attention_budget::AttentionPlan;
 use candle_gen::quant::QLinear;
 use candle_gen::Result;
 
@@ -176,31 +177,68 @@ impl Mlp {
 
 struct Layer {
     input_ln: Tensor,
-    input_ln_gen: Tensor,
     post_ln: Tensor,
-    post_ln_gen: Tensor,
     attn_und: AttnPath,
-    attn_gen: AttnPath,
     mlp_und: Mlp,
+    gen: Option<GenLayer>,
+}
+
+/// One generation-path decoder block. Deferred SenseNova loads construct only a bounded window of
+/// these at a time; the understanding half stays resident because VQA/text prefixes need it.
+struct GenLayer {
+    input_ln: Tensor,
+    post_ln: Tensor,
+    attn: AttnPath,
     mlp_gen: Mlp,
 }
 
 impl Layer {
-    fn from_weights(vb: &VarBuilder, prefix: &str) -> Result<Self> {
+    fn from_weights(vb: &VarBuilder, prefix: &str, defer_gen: bool) -> Result<Self> {
         let attn = format!("{prefix}.self_attn");
         Ok(Self {
             input_ln: get_f32(vb, &format!("{prefix}.input_layernorm.weight"))?,
-            input_ln_gen: get_f32(vb, &format!("{prefix}.input_layernorm_mot_gen.weight"))?,
             post_ln: get_f32(vb, &format!("{prefix}.post_attention_layernorm.weight"))?,
-            post_ln_gen: get_f32(
+            attn_und: AttnPath::from_weights(vb, &attn, "")?,
+            mlp_und: Mlp::from_weights(vb, &format!("{prefix}.mlp"))?,
+            gen: if defer_gen {
+                None
+            } else {
+                Some(GenLayer::from_weights(vb, prefix)?)
+            },
+        })
+    }
+}
+
+impl GenLayer {
+    fn from_weights(vb: &VarBuilder, prefix: &str) -> Result<Self> {
+        let attn = format!("{prefix}.self_attn");
+        Ok(Self {
+            input_ln: get_f32(vb, &format!("{prefix}.input_layernorm_mot_gen.weight"))?,
+            post_ln: get_f32(
                 vb,
                 &format!("{prefix}.post_attention_layernorm_mot_gen.weight"),
             )?,
-            attn_und: AttnPath::from_weights(vb, &attn, "")?,
-            attn_gen: AttnPath::from_weights(vb, &attn, "_mot_gen")?,
-            mlp_und: Mlp::from_weights(vb, &format!("{prefix}.mlp"))?,
+            attn: AttnPath::from_weights(vb, &attn, "_mot_gen")?,
             mlp_gen: Mlp::from_weights(vb, &format!("{prefix}.mlp_mot_gen"))?,
         })
+    }
+}
+
+/// Re-openable generation-path layer source. The retained VarBuilder is mmap/host-backed; a CUDA
+/// tensor is constructed only when a window calls [`GenLayer::from_weights`].
+struct GenBlockStream {
+    vb: VarBuilder<'static>,
+    model_prefix: String,
+    layers: usize,
+    inventory: crate::memory_strategy::CheckpointInventory,
+}
+
+impl GenBlockStream {
+    fn layer(&self, index: usize) -> Result<GenLayer> {
+        self.inventory
+            .ensure_unchanged()
+            .map_err(|error| candle_gen::CandleError::Msg(error.to_string()))?;
+        GenLayer::from_weights(&self.vb, &format!("{}.layers.{index}", self.model_prefix))
     }
 }
 
@@ -280,6 +318,7 @@ pub struct Qwen3Backbone {
     /// every shipped tier (the packer leaves it, `lm_head`, and the norms full-precision).
     lm_head: QLinear,
     layers: Vec<Layer>,
+    gen_stream: Option<GenBlockStream>,
     norm: Tensor,
     norm_gen: Tensor,
     num_heads: usize,
@@ -308,9 +347,37 @@ pub struct RopeMask {
 impl Qwen3Backbone {
     /// Build from a checkpoint, `prefix` = the `language_model` namespace (e.g. `"language_model"`).
     pub fn from_weights(vb: &VarBuilder, cfg: &NeoChatConfig, prefix: &str) -> Result<Self> {
+        Self::build(vb, cfg, prefix, None)
+    }
+
+    /// Build with an optional generation-path block stream. Understanding blocks, embeddings and
+    /// final norms remain resident; `_mot_gen` block weights stay absent until a forward window.
+    pub(crate) fn from_weights_with_deferred_gen(
+        vb: &VarBuilder<'static>,
+        cfg: &NeoChatConfig,
+        prefix: &str,
+        inventory: crate::memory_strategy::CheckpointInventory,
+    ) -> Result<Self> {
+        let model_prefix = format!("{prefix}.model");
+        let stream = GenBlockStream {
+            vb: vb.clone(),
+            model_prefix,
+            layers: cfg.llm.num_hidden_layers,
+            inventory,
+        };
+        Self::build(vb, cfg, prefix, Some(stream))
+    }
+
+    fn build(
+        vb: &VarBuilder,
+        cfg: &NeoChatConfig,
+        prefix: &str,
+        gen_stream: Option<GenBlockStream>,
+    ) -> Result<Self> {
         let model = format!("{prefix}.model");
+        let defer_gen = gen_stream.is_some();
         let layers = (0..cfg.llm.num_hidden_layers)
-            .map(|i| Layer::from_weights(vb, &format!("{model}.layers.{i}")))
+            .map(|i| Layer::from_weights(vb, &format!("{model}.layers.{i}"), defer_gen))
             .collect::<Result<Vec<_>>>()?;
         let embed_tokens = vb.get_unchecked(&format!("{model}.embed_tokens.weight"))?;
         // The 8B-MoT ships an untied `lm_head` (`{prefix}.lm_head.weight`); a tied config reuses the
@@ -328,6 +395,7 @@ impl Qwen3Backbone {
             embed_tokens,
             lm_head,
             layers,
+            gen_stream,
             norm: get_f32(vb, &format!("{model}.norm.weight"))?,
             norm_gen: get_f32(vb, &format!("{model}.norm_mot_gen.weight"))?,
             num_heads: cfg.llm.num_attention_heads,
@@ -368,12 +436,19 @@ impl Qwen3Backbone {
     /// SwiGLU (`*_mot_gen`); the understanding path is untouched. Returns the total linears merged
     /// (`7 · layers` when the LoRA carries every target).
     pub fn merge_distill_lora(&mut self, lora: &DistillLora, prefix: &str) -> Result<usize> {
+        if self.gen_stream.is_some() {
+            return Err(candle_gen::CandleError::Msg(
+                "sensenova: a deferred generation stack cannot merge a runtime distill LoRA; use a pre-merged fast tier"
+                    .into(),
+            ));
+        }
         let mut n = 0;
         for (i, layer) in self.layers.iter_mut().enumerate() {
             let attn = format!("{prefix}.model.layers.{i}.self_attn");
-            n += layer.attn_gen.merge_distill_lora(lora, &attn, "_mot_gen")?;
+            let gen = layer.gen.as_mut().expect("eager generation layer");
+            n += gen.attn.merge_distill_lora(lora, &attn, "_mot_gen")?;
             let mlp = format!("{prefix}.model.layers.{i}.mlp_mot_gen");
-            n += layer.mlp_gen.merge_distill_lora(lora, &mlp)?;
+            n += gen.mlp_gen.merge_distill_lora(lora, &mlp)?;
         }
         Ok(n)
     }
@@ -386,11 +461,10 @@ impl Qwen3Backbone {
         }
     }
 
-    /// The incremental-decode forward that backs prefill (Und, `append=true`) and the denoise loop
-    /// (Gen, `append=false`). `embeds` `[1, S_new, hidden]` are the new tokens; the `(t,h,w)` rows are
-    /// their positions. Returns the final-normed hidden states `[1, S_new, hidden]`.
+    /// Request-planned incremental decode. Bounded attention carries typed between-chunk
+    /// cancellation; `transformer_window` applies only to [`Path::Gen`].
     #[allow(clippy::too_many_arguments)]
-    pub fn forward_cached(
+    pub(crate) fn forward_cached_planned(
         &self,
         embeds: &Tensor,
         temporal: &[i32],
@@ -399,9 +473,19 @@ impl Qwen3Backbone {
         path: Path,
         cache: &mut KvCache,
         append: bool,
-    ) -> CResult<Tensor> {
+        attention: AttentionPlan<'_>,
+        transformer_window: Option<usize>,
+    ) -> Result<Tensor> {
         let rm = self.prepare_rope_mask(temporal, height, width, cache.len())?;
-        self.forward_prepared(embeds, &rm, path, cache, append)
+        self.forward_prepared_planned(
+            embeds,
+            &rm,
+            path,
+            cache,
+            append,
+            attention,
+            transformer_window,
+        )
     }
 
     /// Build the tri-axis RoPE tables + block mask for `(temporal, height, width)` at cache prefix
@@ -433,35 +517,85 @@ impl Qwen3Backbone {
 
     /// The decoder stack over `embeds` using a prebuilt [`RopeMask`]. The `RopeMask`'s `past` must
     /// match `cache.len()` (true within a denoise run — use-only `append = false` leaves it fixed).
-    pub fn forward_prepared(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_prepared_planned(
         &self,
         embeds: &Tensor,
         rm: &RopeMask,
         path: Path,
         cache: &mut KvCache,
         append: bool,
-    ) -> CResult<Tensor> {
+        attention: AttentionPlan<'_>,
+        transformer_window: Option<usize>,
+    ) -> Result<Tensor> {
         let mut hidden = embeds.clone();
-        for (i, layer) in self.layers.iter().enumerate() {
-            let (input_ln, post_ln, attn, mlp) = match path {
-                Path::Und => (
-                    &layer.input_ln,
-                    &layer.post_ln,
-                    &layer.attn_und,
-                    &layer.mlp_und,
-                ),
-                Path::Gen => (
-                    &layer.input_ln_gen,
-                    &layer.post_ln_gen,
-                    &layer.attn_gen,
-                    &layer.mlp_gen,
-                ),
-            };
-            let normed = rms_norm(&hidden, input_ln, self.eps)?;
-            let attn_out = self.attention_cached(&normed, attn, rm, cache, i, append)?;
-            hidden = (hidden + attn_out)?;
-            let normed = rms_norm(&hidden, post_ln, self.eps)?;
-            hidden = (hidden + mlp.forward(&normed)?)?;
+        match path {
+            Path::Und => {
+                for (i, layer) in self.layers.iter().enumerate() {
+                    hidden = self.apply_layer(
+                        hidden,
+                        &layer.input_ln,
+                        &layer.post_ln,
+                        &layer.attn_und,
+                        &layer.mlp_und,
+                        rm,
+                        cache,
+                        i,
+                        append,
+                        attention,
+                    )?;
+                }
+            }
+            Path::Gen => {
+                if let Some(stream) = &self.gen_stream {
+                    let window = transformer_window.unwrap_or(stream.layers).max(1);
+                    for first in (0..stream.layers).step_by(window) {
+                        if attention.is_cancelled() {
+                            return Err(candle_gen::CandleError::Canceled);
+                        }
+                        let count = window.min(stream.layers - first);
+                        let materialized = (first..first + count)
+                            .map(|index| stream.layer(index).map(|layer| (index, layer)))
+                            .collect::<Result<Vec<_>>>()?;
+                        for (i, layer) in &materialized {
+                            hidden = self.apply_layer(
+                                hidden,
+                                &layer.input_ln,
+                                &layer.post_ln,
+                                &layer.attn,
+                                &layer.mlp_gen,
+                                rm,
+                                cache,
+                                *i,
+                                append,
+                                attention,
+                            )?;
+                        }
+                        self.device.synchronize()?;
+                        drop(materialized);
+                    }
+                    stream
+                        .inventory
+                        .ensure_unchanged()
+                        .map_err(candle_gen::CandleError::from)?;
+                } else {
+                    for (i, layer) in self.layers.iter().enumerate() {
+                        let gen = layer.gen.as_ref().expect("eager generation layer");
+                        hidden = self.apply_layer(
+                            hidden,
+                            &gen.input_ln,
+                            &gen.post_ln,
+                            &gen.attn,
+                            &gen.mlp_gen,
+                            rm,
+                            cache,
+                            i,
+                            append,
+                            attention,
+                        )?;
+                    }
+                }
+            }
         }
         if append {
             cache.seq_len += rm.n_tokens;
@@ -470,10 +604,33 @@ impl Qwen3Backbone {
             Path::Und => &self.norm,
             Path::Gen => &self.norm_gen,
         };
-        rms_norm(&hidden, final_norm, self.eps)
+        Ok(rms_norm(&hidden, final_norm, self.eps)?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_layer(
+        &self,
+        hidden: Tensor,
+        input_ln: &Tensor,
+        post_ln: &Tensor,
+        attn: &AttnPath,
+        mlp: &Mlp,
+        rm: &RopeMask,
+        cache: &mut KvCache,
+        layer_idx: usize,
+        append: bool,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Tensor> {
+        let normed = rms_norm(&hidden, input_ln, self.eps)?;
+        let attn_out =
+            self.attention_cached(&normed, attn, rm, cache, layer_idx, append, attention)?;
+        let hidden = (hidden + attn_out)?;
+        let normed = rms_norm(&hidden, post_ln, self.eps)?;
+        Ok((hidden + mlp.forward(&normed)?)?)
     }
 
     /// Cached attention: project the new tokens, RoPE q/k, merge with the cache, GQA-expand, attend.
+    #[allow(clippy::too_many_arguments)]
     fn attention_cached(
         &self,
         x: &Tensor,
@@ -482,7 +639,8 @@ impl Qwen3Backbone {
         cache: &mut KvCache,
         layer_idx: usize,
         append: bool,
-    ) -> CResult<Tensor> {
+        plan: AttentionPlan<'_>,
+    ) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
         let hd = self.head_dim;
 
@@ -537,20 +695,20 @@ impl Qwen3Backbone {
         // answers. Chunk over the query rows via the shared helper; the additive mask is
         // `[1,1,S_new, past+S_new]` (dim-2 == the new-query length, narrowed per chunk). Single
         // un-chunked pass (byte-identical) below budget, exact fused `softmax_last_dim` preserved.
-        let out = candle_gen::sdpa_budgeted_bhsd(
+        let out = candle_gen::sdpa_planned_bhsd(
             &q,
             &k_all,
             &v_all,
             scale,
             Some(&rm.mask),
             ops::softmax_last_dim,
-            candle_gen::ATTN_SCORES_BUDGET,
+            plan,
         )?; // [B,H,S,D]
         let out = out
             .transpose(1, 2)?
             .contiguous()?
             .reshape((b, s, self.num_heads * hd))?;
-        a.o_proj.forward_upcast(&out)
+        Ok(a.o_proj.forward_upcast(&out)?)
     }
 
     /// Project→reshape→(temporal/spatial split)→norm halves→rope(t,h,w)→concat. `proj` is the

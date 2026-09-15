@@ -37,6 +37,40 @@ pub enum Error {
     #[error("unsupported: {0}")]
     Unsupported(String),
 
+    /// A pre-render refusal that preserves the requested geometry and carries only a verified
+    /// alternative geometry, if one exists.
+    #[error(
+        "geometry refused: {reason}; requested {requested_width}x{requested_height}; verified alternative: {alternative:?}"
+    )]
+    GeometryRefused {
+        reason: String,
+        requested_width: u32,
+        requested_height: u32,
+        alternative: Option<(u32, u32)>,
+    },
+
+    /// A freshly loaded weight buffer whose GPU view never converged on the bytes the CPU holds
+    /// (sc-22414). Typed so a consumer can tell "the host's Metal mapping is lagging" from a
+    /// generic failure; see [`crate::coherence`]. Bridges to [`gen_core::Error::Msg`] with its full
+    /// text — gen-core has no load-coherence variant and the worker only reports it.
+    #[error(
+        "GPU view of `{name}` ({bytes} bytes) never matched the CPU view after {attempts} reads \
+         (cpu checksum {cpu:#x}, gpu checksum {gpu:#x}): the Metal mapping of a freshly loaded \
+         buffer is stale — retry the load once the host's write-back pressure subsides (sc-22414)"
+    )]
+    IncoherentLoad {
+        /// The tensor key.
+        name: String,
+        /// Its byte size.
+        bytes: usize,
+        /// The CPU-stream checksum (the reference).
+        cpu: u64,
+        /// The last GPU-stream checksum observed.
+        gpu: u64,
+        /// GPU reads attempted.
+        attempts: u32,
+    },
+
     /// A contextual message (config/validation/adapter-shape errors).
     #[error("{0}")]
     Msg(String),
@@ -68,6 +102,20 @@ impl From<Error> for gen_core::Error {
             Error::Io(io) => gen_core::Error::Io(io),
             Error::Canceled => gen_core::Error::Canceled,
             Error::Unsupported(s) => gen_core::Error::Unsupported(s),
+            Error::GeometryRefused {
+                reason,
+                requested_width,
+                requested_height,
+                alternative,
+            } => gen_core::Error::GeometryRefused {
+                reason,
+                requested_width,
+                requested_height,
+                alternative,
+            },
+            incoherent @ Error::IncoherentLoad { .. } => {
+                gen_core::Error::Msg(incoherent.to_string())
+            }
             Error::Msg(s) => gen_core::Error::Msg(s),
         }
     }
@@ -87,6 +135,17 @@ impl From<gen_core::Error> for Error {
             gen_core::Error::MissingTensor(s) => Error::MissingTensor(s),
             gen_core::Error::Io(io) => Error::Io(io),
             gen_core::Error::Unsupported(s) => Error::Unsupported(s),
+            gen_core::Error::GeometryRefused {
+                reason,
+                requested_width,
+                requested_height,
+                alternative,
+            } => Error::GeometryRefused {
+                reason,
+                requested_width,
+                requested_height,
+                alternative,
+            },
             gen_core::Error::Canceled => Error::Canceled,
             gen_core::Error::Msg(s) => Error::Msg(s),
         }
@@ -126,5 +185,53 @@ mod tests {
         }
         let back: gen_core::Error = down.into();
         assert!(matches!(back, gen_core::Error::Unsupported(_)));
+    }
+
+    /// sc-22414: the load-coherence refusal crosses to gen-core as a message that still names the
+    /// tensor, both checksums and the story, so the worker's report is actionable.
+    #[test]
+    fn incoherent_load_bridges_with_its_full_text() {
+        let up: gen_core::Error = Error::IncoherentLoad {
+            name: "model.embed_tokens.weight".into(),
+            bytes: 2_013_265_920,
+            cpu: 0xdead_beef,
+            gpu: 0,
+            attempts: 13,
+        }
+        .into();
+        match up {
+            gen_core::Error::Msg(text) => {
+                for needle in [
+                    "model.embed_tokens.weight",
+                    "0xdeadbeef",
+                    "13 reads",
+                    "sc-22414",
+                ] {
+                    assert!(text.contains(needle), "{needle:?} missing from {text:?}");
+                }
+            }
+            other => panic!("expected Msg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn geometry_refusal_round_trips_with_telemetry_fields_intact() {
+        let up: gen_core::Error = Error::GeometryRefused {
+            reason: "measured infeasible".into(),
+            requested_width: 1536,
+            requested_height: 1024,
+            alternative: Some((1024, 1024)),
+        }
+        .into();
+        let down: Error = up.into();
+        assert!(matches!(
+            down,
+            Error::GeometryRefused {
+                requested_width: 1536,
+                requested_height: 1024,
+                alternative: Some((1024, 1024)),
+                ..
+            }
+        ));
     }
 }

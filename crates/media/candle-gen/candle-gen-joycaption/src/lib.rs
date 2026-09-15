@@ -29,7 +29,7 @@ use candle_gen::gen_core::core_llm::{
 };
 use candle_gen::gen_core::{
     CaptionFinishReason, CaptionOutput, CaptionRequest, Captioner, CaptionerDescriptor, Error,
-    LoadSpec, Progress, Result, WeightsSource,
+    Image, LoadSpec, Progress, Result, WeightsSource,
 };
 
 use prompt::{build_prompt, capabilities, JOY_CAPTION_FAMILY, JOY_CAPTION_MODEL_ID, SYSTEM_PROMPT};
@@ -102,17 +102,77 @@ pub struct JoyCaptioner {
     provider: Box<dyn TextLlm>,
 }
 
-/// Fill the request prompt from the caption options when the caller left it empty — the JoyCaption
-/// type/length template (or the custom-prompt override, which `build_prompt` returns as-is). Mirrors
-/// `mlx-gen-joycaption`'s `normalized_request` so both backends accept an options-only request
-/// (SceneWorks' worker sends `prompt = custom_prompt`, empty for the normal type/length flow).
-fn normalized_request(req: &CaptionRequest) -> CaptionRequest {
-    let mut out = req.clone();
-    if out.prompt.trim().is_empty() {
-        out.prompt = build_prompt(&out.options);
+/// The effective prompt for a request: the caller's prompt, or the rendered type/length/options
+/// template when it is empty. Returning only the prompt avoids cloning the full `CaptionRequest`
+/// (and its image pixels) merely to replace one field.
+fn effective_prompt(req: &CaptionRequest) -> String {
+    if req.prompt.trim().is_empty() {
+        build_prompt(&req.options)
+    } else {
+        req.prompt.clone()
     }
-    out
 }
+
+/// Validate `req` against the descriptor's capabilities using its effective prompt.
+/// `CaptionCapabilities::validate_request` reads image dimensions, not pixels, so its probe keeps
+/// the real dimensions while deliberately carrying no pixel buffer.
+fn validate_with_prompt(
+    descriptor: &CaptionerDescriptor,
+    req: &CaptionRequest,
+    prompt: &str,
+) -> Result<()> {
+    let probe = validation_probe(req, prompt);
+    descriptor
+        .capabilities
+        .validate_request(descriptor.id, &probe)
+}
+
+/// Build the metadata-only request used by capability validation.
+fn validation_probe(req: &CaptionRequest, prompt: &str) -> CaptionRequest {
+    CaptionRequest {
+        image: Image {
+            width: req.image.width,
+            height: req.image.height,
+            pixels: Vec::new(),
+        },
+        prompt: prompt.to_owned(),
+        options: req.options.clone(),
+        sampling: req.sampling,
+        trigger_words: req.trigger_words.clone(),
+        cancel: req.cancel.clone(),
+    }
+}
+
+/// Construct the one provider-owned image buffer required because the provider request outlives
+/// this borrowed caption request.
+fn provider_image(req: &CaptionRequest) -> Result<ImageRef> {
+    #[cfg(test)]
+    OWNED_PIXEL_BUFFER_CONSTRUCTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ImageRef::new(req.image.width, req.image.height, req.image.pixels.clone()).map_err(Error::Msg)
+}
+
+/// Build the generic LLaVA turns with JoyCaption's product-policy system prompt.
+fn provider_messages(req: &CaptionRequest, prompt: String) -> Result<Vec<Message>> {
+    let image = provider_image(req)?;
+    Ok(vec![
+        Message {
+            role: Role::System,
+            content: vec![Content::Text(SYSTEM_PROMPT.to_owned())],
+            thinking: None,
+            tool_calls: Vec::new(),
+        },
+        Message {
+            role: Role::User,
+            content: vec![Content::Image(image), Content::Text(prompt)],
+            thinking: None,
+            tool_calls: Vec::new(),
+        },
+    ])
+}
+
+#[cfg(test)]
+static OWNED_PIXEL_BUFFER_CONSTRUCTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 impl Captioner for JoyCaptioner {
     fn descriptor(&self) -> &CaptionerDescriptor {
@@ -120,10 +180,7 @@ impl Captioner for JoyCaptioner {
     }
 
     fn validate(&self, req: &CaptionRequest) -> Result<()> {
-        let req = normalized_request(req);
-        self.descriptor
-            .capabilities
-            .validate_request(self.descriptor.id, &req)
+        validate_with_prompt(&self.descriptor, req, &effective_prompt(req))
     }
 
     fn caption(
@@ -131,10 +188,8 @@ impl Captioner for JoyCaptioner {
         req: &CaptionRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<CaptionOutput> {
-        let req = normalized_request(req);
-        self.descriptor
-            .capabilities
-            .validate_request(self.descriptor.id, &req)?;
+        let prompt = effective_prompt(req);
+        validate_with_prompt(&self.descriptor, req, &prompt)?;
         // An already-cancelled request returns the typed `Canceled` before any inference runs — the
         // captioner cancellation contract (sc-4895 / the testkit pre-cancel check).
         if req.cancel.is_cancelled() {
@@ -146,22 +201,7 @@ impl Captioner for JoyCaptioner {
         // applied inside the provider, so the consumer passes plain text + an image and nothing
         // model-specific. (mlx-llm's dedicated provider injects this system prompt itself; the generic
         // candle-llava provider does not, so the shim supplies it here.)
-        let image = ImageRef::new(req.image.width, req.image.height, req.image.pixels.clone())
-            .map_err(Error::Msg)?;
-        let messages = vec![
-            Message {
-                role: Role::System,
-                content: vec![Content::Text(SYSTEM_PROMPT.to_owned())],
-                thinking: None,
-                tool_calls: Vec::new(),
-            },
-            Message {
-                role: Role::User,
-                content: vec![Content::Image(image), Content::Text(req.prompt.clone())],
-                thinking: None,
-                tool_calls: Vec::new(),
-            },
-        ];
+        let messages = provider_messages(req, prompt)?;
 
         // The provider polls its own `core_llm::CancelFlag`: it checks it once **before** the
         // prefill (the expensive vision-tower + prompt forward) and again at the top of every decode
@@ -344,36 +384,83 @@ mod tests {
     use super::*;
     use candle_gen::gen_core::{AdapterKind, AdapterSpec, CaptionOptions};
 
-    #[test]
-    fn normalize_builds_prompt_from_options_when_empty() {
-        // sc-5189: the normal type/length flow sends no prompt; the provider must derive it (else
-        // `caption` fails "prompt is required"), mirroring mlx-gen-joycaption.
-        let req = CaptionRequest {
-            options: CaptionOptions {
-                caption_type: "Descriptive".to_owned(),
-                caption_length: "long".to_owned(),
-                ..Default::default()
-            },
+    fn image() -> Image {
+        Image {
+            width: 4,
+            height: 3,
+            pixels: vec![127; 4 * 3 * 3],
+        }
+    }
+
+    fn request() -> CaptionRequest {
+        CaptionRequest {
+            image: image(),
+            prompt: "Write a short caption.".to_owned(),
             ..Default::default()
-        };
-        assert!(req.prompt.trim().is_empty());
-        let normalized = normalized_request(&req);
-        assert!(
-            !normalized.prompt.trim().is_empty(),
-            "empty prompt must be built from the caption options"
-        );
+        }
     }
 
     #[test]
-    fn normalize_preserves_an_explicit_prompt() {
+    fn effective_prompt_and_validation_match_options_and_explicit_prompt_requests() {
+        // The normal type/length flow sends no prompt; derive it exactly as the prior normalizing
+        // adapter did, while preserving an explicitly supplied prompt verbatim.
         let req = CaptionRequest {
-            prompt: "Describe the lighting only.".to_owned(),
-            ..Default::default()
+            prompt: String::new(),
+            options: CaptionOptions {
+                caption_type: "Straightforward".to_owned(),
+                caption_length: "short".to_owned(),
+                ..Default::default()
+            },
+            ..request()
         };
-        assert_eq!(
-            normalized_request(&req).prompt,
-            "Describe the lighting only."
+        let options_prompt = effective_prompt(&req);
+        assert!(req.prompt.trim().is_empty());
+        assert!(
+            !options_prompt.trim().is_empty(),
+            "empty prompt must be built from the caption options"
         );
+        assert_eq!(options_prompt, build_prompt(&req.options));
+        assert!(validate_with_prompt(&descriptor(), &req, &options_prompt).is_ok());
+
+        let explicit = CaptionRequest {
+            prompt: "Describe the lighting only.".to_owned(),
+            ..req
+        };
+        let explicit_prompt = effective_prompt(&explicit);
+        assert_eq!(explicit_prompt, "Describe the lighting only.");
+        assert!(validate_with_prompt(&descriptor(), &explicit, &explicit_prompt).is_ok());
+    }
+
+    #[test]
+    fn validation_probe_keeps_dimensions_without_owning_pixels() {
+        let req = request();
+        let prompt = effective_prompt(&req);
+        let probe = validation_probe(&req, &prompt);
+        assert_eq!(probe.image.width, req.image.width);
+        assert_eq!(probe.image.height, req.image.height);
+        assert!(probe.image.pixels.is_empty());
+        assert!(descriptor()
+            .capabilities
+            .validate_request(JOY_CAPTION_MODEL_ID, &probe)
+            .is_ok());
+    }
+
+    #[test]
+    fn provider_messages_construct_exactly_one_owned_pixel_buffer() {
+        OWNED_PIXEL_BUFFER_CONSTRUCTIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let req = request();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let captioner = test_captioner(calls.clone());
+        captioner
+            .caption(&req, &mut |_| {})
+            .expect("test provider accepts a valid caption request");
+
+        assert_eq!(
+            OWNED_PIXEL_BUFFER_CONSTRUCTIONS.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "one caption request must construct only its provider-owned pixel buffer"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -405,6 +492,60 @@ mod tests {
             load(&spec).err().expect("err"),
             Error::Unsupported(_)
         ));
+    }
+
+    struct TestProvider {
+        descriptor: core_llm::TextLlmDescriptor,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl core_llm::TextLlm for TestProvider {
+        fn descriptor(&self) -> &core_llm::TextLlmDescriptor {
+            &self.descriptor
+        }
+
+        fn validate(&self, _: &TextLlmRequest) -> core_llm::Result<()> {
+            Ok(())
+        }
+
+        fn generate(
+            &self,
+            _: &TextLlmRequest,
+            _: &mut dyn FnMut(StreamEvent),
+        ) -> core_llm::Result<core_llm::TextLlmOutput> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(Default::default())
+        }
+    }
+
+    fn test_captioner(calls: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> JoyCaptioner {
+        JoyCaptioner {
+            descriptor: descriptor(),
+            provider: Box::new(TestProvider {
+                descriptor: core_llm::TextLlmDescriptor {
+                    id: "test-provider".to_owned(),
+                    family: "test".to_owned(),
+                    backend: "test".to_owned(),
+                    capabilities: Default::default(),
+                },
+                calls,
+            }),
+        }
+    }
+
+    #[test]
+    fn pre_cancel_returns_typed_error_before_provider_inference() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let captioner = test_captioner(calls.clone());
+        let req = request();
+        req.cancel.cancel();
+
+        assert!(matches!(
+            captioner.caption(&req, &mut |_| {}),
+            Err(Error::Canceled)
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     // ---- sc-9020 / F-036: cancellation is observed without waiting for a token ----

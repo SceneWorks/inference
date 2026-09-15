@@ -26,7 +26,7 @@
 //! would need a bit-exact bf16 per-forward — the LTX sc-2842 pattern — which requires the A3
 //! transformer to run bf16 activations; out of A4 scope, tracked as a follow-on if desired.)
 //!
-//! Run: `MOCHI_SNAPSHOT=/path/to/mochi-1-preview cargo test -p mlx-gen-mochi --test e2e_parity -- --ignored --nocapture`
+//! Run: `MOCHI_SNAPSHOT=/path/to/mochi-1-preview cargo test -p mlx-gen-mochi --test integration e2e_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, add, max, mean, multiply, split, subtract};
 use mlx_rs::{Array, Dtype};

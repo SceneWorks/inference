@@ -4,9 +4,9 @@
 //!
 //! `#[ignore]` — needs the converted snapshot (~53 GB). Run:
 //!   IDEOGRAM4_MLX=~/.cache/ideogram4-mlx-convert \
-//!     cargo test -p mlx-gen-ideogram --test edit_smoke -- --ignored --nocapture
+//!     cargo test -p mlx-gen-ideogram --test integration edit_smoke:: -- --ignored --nocapture
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 
@@ -118,7 +118,8 @@ fn img2img_smoke() {
         )
         .expect("img2img generate");
     let px = assert_valid(&img, h, w);
-    let out = std::env::temp_dir().join("ideogram4_img2img.png");
+    let out_tmp = tempfile::tempdir().unwrap();
+    let out = out_tmp.path().to_path_buf();
     image::RgbImage::from_raw(w, h, px)
         .unwrap()
         .save(&out)
@@ -186,8 +187,9 @@ fn inpaint_mask_routes_keep_vs_repaint() {
         "inpaint mask did not pin the keep region (keep {keep_diff:.2} !< repaint {repaint_diff:.2})"
     );
 
-    for (tag, px) in [("keep_all", &keep_all), ("repaint_all", &repaint_all)] {
-        let out = std::env::temp_dir().join(format!("ideogram4_inpaint_{tag}.png"));
+    for px in [&keep_all, &repaint_all] {
+        let out_tmp = tempfile::tempdir().unwrap();
+        let out = out_tmp.path().to_path_buf();
         image::RgbImage::from_raw(w, h, px.clone())
             .unwrap()
             .save(&out)

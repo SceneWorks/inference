@@ -17,7 +17,7 @@
 //! $env:KOLORS_SNAPSHOT   = "<Kolors-diffusers snapshot dir>"
 //! $env:KOLORS_CONTROLNET = "<Kolors-ControlNet-Pose snapshot dir or .safetensors>"
 //! $env:KOLORS_IP_ADAPTER = "<Kolors-IP-Adapter-Plus snapshot dir>"
-//! cargo test -p candle-gen-kolors --features cuda --release --test conditioned_curated_smoke -- --ignored --nocapture
+//! cargo test -p candle-gen-kolors --features cuda --release --test integration conditioned_curated_smoke:: -- --ignored --nocapture
 //! ```
 //!
 //! Gate (directional): for each conditioned mode and each curated solver —
@@ -140,6 +140,7 @@ fn controlnet_curated_is_coherent_and_distinct() {
     let model = KolorsControl::load(&KolorsControlPaths {
         kolors_base: base,
         controlnet: cn,
+        adapters: Vec::new(),
     })
     .expect("load KolorsControl");
     let pose = synthetic_image();
@@ -183,6 +184,7 @@ fn ip_adapter_curated_is_coherent_and_distinct() {
     let mut model = IpAdapterKolors::load(&IpAdapterKolorsPaths {
         kolors_base: base,
         ip_adapter: ip,
+        adapters: Vec::new(),
     })
     .expect("load IpAdapterKolors");
     let reference = synthetic_image();

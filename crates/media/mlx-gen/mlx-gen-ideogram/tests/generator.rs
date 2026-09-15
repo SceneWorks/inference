@@ -6,9 +6,9 @@
 //!
 //! `#[ignore]` — needs the converted snapshot (~53 GB). Run:
 //!   IDEOGRAM4_MLX=~/.cache/ideogram4-mlx-convert \
-//!     cargo test -p mlx-gen-ideogram --test generator -- --ignored --nocapture
+//!     cargo test -p mlx-gen-ideogram --test integration generator:: -- --ignored --nocapture
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 
@@ -109,7 +109,8 @@ fn generates_via_registry() {
     assert_eq!(max_step, steps, "progress reached the final step");
     assert!(decoding_seen, "a Decoding progress event was emitted");
 
-    let out_path = std::env::temp_dir().join("ideogram4_generator.png");
+    let out_path_tmp = tempfile::tempdir().unwrap();
+    let out_path = out_path_tmp.path().join("ideogram4_generator.png");
     image::RgbImage::from_raw(res, res, im.pixels.clone())
         .unwrap()
         .save(&out_path)

@@ -46,16 +46,23 @@ use crate::scheduler::{make_scheduler, SolverKind, WanScheduler};
 use crate::text_encoder::encode_text_staged_for_tier;
 use crate::vace::{
     build_vace_control, denoise_vace, denoise_vace_moe, denoise_vace_range, prepare_masks,
-    prepare_video_latents, WanVaceTransformer,
+    prepare_video_latents, vace_control_scales, WanVaceTransformer,
 };
-use crate::vae::WanVae;
+
+/// Concrete z16 VAE assigned to both VACE routes.
+pub type ProviderVae = crate::vae::WanVae;
+
+/// Resolve either VACE route's load-bearing VAE geometry.
+pub fn vae_tiling(provider_id: &str) -> Option<mlx_gen::tiling::VaeTiling> {
+    matches!(provider_id, MODEL_ID_VACE | MODEL_ID_VACE_FUN).then_some(ProviderVae::VAE_TILING)
+}
 
 /// Public provider id: `"wan_vace"`.
 pub const MODEL_ID_VACE: &str = "wan_vace";
 
 /// The Wan z16 VAE strides (the VACE checkpoints are Wan2.1-based): temporal 4, spatial 8, patch 2.
-const VAE_T: usize = 4;
-const VAE_S: usize = 8;
+const VAE_T: usize = ProviderVae::VAE_TILING.temporal_scale as usize;
+const VAE_S: usize = ProviderVae::VAE_TILING.spatial_scale as usize;
 
 /// Upper bound on the control-clip frame count (sc-12459 / F-008): `vace_prep` sizes the control
 /// video, mask, control-latent, and init-noise tensors directly from `clip.frames.len()`, so an
@@ -181,7 +188,7 @@ fn vace_prep(
     // --- Stage 2: z16 VAE encode the control + mask → 96-ch control latent ---
     let control = {
         let w = Weights::from_file(root.join("vae.safetensors"))?;
-        let vae = WanVae::from_weights(&w)?;
+        let vae = ProviderVae::from_weights(&w)?;
         let video_latents = prepare_video_latents(&vae, &control_video, Some(&mask), &references)?;
         let mask_latents = prepare_masks(&mask, VAE_T, VAE_S, base.patch_size.1, num_ref)?;
         let c = build_vace_control(&video_latents, &mask_latents)?;
@@ -193,7 +200,19 @@ fn vace_prep(
     let (t_total, h_lat, w_lat) = (csh[1], csh[2], csh[3]);
     // Per-vace-layer control_hidden_states_scale (diffusers `conditioning_scale`), broadcast from
     // the request (sc-3441). `None` ⇒ the diffusers default 1.0.
-    let scales = vec![req.control_scale.unwrap_or(1.0); config.vace_layers.len()];
+    //
+    // sc-20261: `clip.masking_strength` is folded in here. VACE exposes ONE conditioning scale for
+    // the whole hint stack, so the requested masking strength weights the mask/video control by
+    // multiplying it — the mechanism the candle lane's dual-expert VACE-Fun route already used,
+    // now shared by both MLX routes because they both run this `vace_prep`. `masking_strength =
+    // 1.0` (the contract default) is the identity, so a default request is byte-identical to
+    // pre-sc-20261. The `[0,1]` range this depends on is enforced in `validate_vace_clip`.
+    //
+    // The whole vector is resolved by the shared `vace.rs` seam rather than being assembled here,
+    // so the honor wiring has one testable definition; `vace_prep_binds_scales_to_the_shared_
+    // resolver` pins this line to it (a call site that rebuilt the vec inline would silently
+    // un-honor the knob while every unit test on the seam stayed green).
+    let scales = vace_control_scales(req, config.vace_layers.len());
 
     // Seeded init noise [z16, T_lat(+num_ref), h, w].
     let key = random::key(seed)?;
@@ -238,11 +257,24 @@ fn vace_decode_tail(
     on_progress(Progress::Decoding);
     // sc-6894 — the z16 VAE is non-causal in time (out_f = T_lat·VAE_T, ×4), NOT the causal 4·T−3
     // (task 6897); only the tiling heuristic reads out_frames. Budgeted, catchable selector (F-009).
-    let out_frames = latents.shape()[1] * VAE_T as i32;
-    let tiling = auto_tiling_budgeted_z16(prep.height as i32, prep.width as i32, out_frames)?;
+    let latent_shape = latents.shape();
+    let out_frames = latent_shape[1] * ProviderVae::VAE_TILING.temporal_scale;
+    let out_height = latent_shape[2] * ProviderVae::VAE_TILING.spatial_scale;
+    let out_width = latent_shape[3] * ProviderVae::VAE_TILING.spatial_scale;
+    if (out_width, out_height) != (prep.width as i32, prep.height as i32) {
+        return Err(Error::Msg(format!(
+            "wan vace: z16 VAE geometry resolves {out_width}x{out_height}, expected {}x{}",
+            prep.width, prep.height
+        )));
+    }
+    let tiling = if req.memory.is_some_and(|memory| memory.tile_vae_decode) {
+        crate::i2v_memory_strategy::decode_tiling(req, prep.width, prep.height, out_frames as u32)?
+    } else {
+        auto_tiling_budgeted_z16(out_height, out_width, out_frames)?
+    };
     let frames_u8 = {
         let w = Weights::from_file(root.join("vae.safetensors"))?;
-        let vae = WanVae::from_weights(&w)?;
+        let vae = ProviderVae::from_weights(&w)?;
         decode_to_frames(&vae, &latents, tiling.as_ref(), Some(&req.cancel))?
     };
     let images = frames_to_images(&frames_u8)?;
@@ -258,6 +290,9 @@ fn vace_decode_tail(
 /// Stable identity + advertised capabilities for `wan_vace`.
 pub fn descriptor_vace() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID_VACE,
         family: "wan",
@@ -269,7 +304,6 @@ pub fn descriptor_vace() -> ModelDescriptor {
             // mode); optional `Reference` images become leading conditioning frames.
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             conditioning: vec![ConditioningKind::ControlClip, ConditioningKind::Reference],
             // Q4/Q8 is wired (sc-3440, `spec.quantize` → `WanVaceTransformer::quantize`, mirroring the
             // base Wan slice sc-2682). LoRA/LoKr is wired (sc-3439): `spec.adapters` merge onto the
@@ -281,28 +315,17 @@ pub fn descriptor_vace() -> ModelDescriptor {
             // sc-7296: curated gen-core vocabulary (`uni_pc`/`dpmpp_2m`) routed to Wan's native solvers
             // + legacy aliases; VACE advertises native solvers only (no `run_flow_sampler` fold-ins).
             samplers: crate::model::wan_native_samplers(),
-            schedulers: Vec::new(),
-            supported_guidance_methods: vec![],
             min_size: 16,
             max_size: 1280,
             max_count: 1,
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
             supports_sequential_offload: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            // The TE, scoped z16 VAE work, and VACE transformer are loaded/used/dropped as phases on
+            // every request even though this provider exposes no selectable Sequential control.
+            unconditionally_engages_staged_residency: true,
+            ..Default::default()
         },
     }
 }
@@ -320,6 +343,7 @@ pub struct WanVace {
     /// [`WanVace::generate`] **before** `from_weights` + quantize (the fork order). Empty for a plain
     /// load — the no-adapter path is byte-identical to pre-sc-3439.
     adapters: Vec<AdapterSpec>,
+    i2v_memory: Option<crate::i2v_memory_strategy::PreparedWanI2vMemory>,
 }
 
 impl WanVace {
@@ -381,12 +405,20 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         ));
     }
     let config = WanVaceConfig::from_model_dir(&root)?;
+    let i2v_memory = if spec.resolved_route.as_deref() == Some(MODEL_ID_VACE)
+        && spec.prepared_file_pins().is_prepared()
+    {
+        Some(crate::i2v_memory_strategy::prepare(spec, MODEL_ID_VACE).map_err(Error::from)?)
+    } else {
+        None
+    };
     Ok(Box::new(WanVace {
         descriptor: descriptor_vace(),
         config,
         root,
         quantize: spec.quantize,
         adapters: spec.adapters.clone(),
+        i2v_memory,
     }))
 }
 
@@ -406,10 +438,50 @@ fn preprocess_clip(frames: &[Image], width: u32, height: u32) -> Result<Array> {
 
 // F-072: `WanVace`'s validate body was byte-identical to the documented-shared `validate_vace_clip`
 // (with `id = MODEL_ID_VACE`), which the dual-expert `WanVaceFun` already uses — so point both at it.
-mlx_gen::impl_generator!(WanVace {
-    validate: |s, req| validate_vace_clip(&s.descriptor, MODEL_ID_VACE, &s.config, req),
-    generate: generate_impl,
-});
+impl Generator for WanVace {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        validate_vace_clip(&self.descriptor, MODEL_ID_VACE, &self.config, req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        self.i2v_memory.as_ref().map(|prepared| &prepared.contract)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        self.i2v_memory.as_ref().map_or_else(
+            || mlx_gen::gen_core::MemorySafetyDecision::Reject {
+                reason: "wan_vace loaded route has no sealed memory contract".to_owned(),
+            },
+            |prepared| crate::i2v_memory_strategy::safety_check(prepared, context),
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        match &self.i2v_memory {
+            Some(prepared) => crate::i2v_memory_strategy::begin_request(prepared, context),
+            None => Ok(None),
+        }
+    }
+}
 
 impl WanVace {
     /// The VACE pipeline (port of diffusers `WanVACEPipeline.__call__`): stage the phases to bound
@@ -423,6 +495,9 @@ impl WanVace {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+        if let Some(prepared) = &self.i2v_memory {
+            crate::i2v_memory_strategy::validate_active_request(prepared, req)?;
+        }
         let base = &self.config.base;
 
         // sc-4986 / sc-12459 (F-008) — fail fast (catchable) if the DiT-denoise stage won't fit,
@@ -572,6 +647,7 @@ pub struct WanVaceFun {
     quantize: Option<Quant>,
     adapters: Vec<AdapterSpec>,
     offload_policy: OffloadPolicy,
+    i2v_memory: Option<crate::i2v_memory_strategy::PreparedWanI2vMemory>,
 }
 
 impl WanVaceFun {
@@ -736,6 +812,13 @@ pub fn load_vace_fun(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         ));
     }
     let config = WanVaceConfig::vace_fun_from_model_dir(&root)?;
+    let i2v_memory = if spec.resolved_route.as_deref() == Some(MODEL_ID_VACE_FUN)
+        && spec.prepared_file_pins().is_prepared()
+    {
+        Some(crate::i2v_memory_strategy::prepare(spec, MODEL_ID_VACE_FUN).map_err(Error::from)?)
+    } else {
+        None
+    };
     Ok(Box::new(WanVaceFun {
         descriptor: descriptor_vace_fun(),
         config,
@@ -743,14 +826,49 @@ pub fn load_vace_fun(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         quantize: spec.quantize,
         adapters: spec.adapters.clone(),
         offload_policy: spec.offload_policy,
+        i2v_memory,
     }))
 }
 
-// Identical control-clip contract as single-expert VACE.
-mlx_gen::impl_generator!(WanVaceFun {
-    validate: |s, req| validate_vace_clip(&s.descriptor, MODEL_ID_VACE_FUN, &s.config, req),
-    generate: generate_impl,
-});
+impl Generator for WanVaceFun {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        validate_vace_clip(&self.descriptor, MODEL_ID_VACE_FUN, &self.config, req)
+            .map_err(Into::into)
+    }
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        self.i2v_memory.as_ref().map(|p| &p.contract)
+    }
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        self.i2v_memory.as_ref().map_or_else(
+            || mlx_gen::gen_core::MemorySafetyDecision::Reject {
+                reason: "wan2_2_vace_fun_14b loaded route has no sealed memory contract".to_owned(),
+            },
+            |p| crate::i2v_memory_strategy::safety_check(p, context),
+        )
+    }
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        self.i2v_memory.as_ref().map_or(Ok(None), |p| {
+            crate::i2v_memory_strategy::begin_request(p, context)
+        })
+    }
+}
 
 impl WanVaceFun {
     /// The dual-expert VACE pipeline: identical staging to [`WanVace::generate_impl`] (UMT5 encode →
@@ -762,8 +880,12 @@ impl WanVaceFun {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+        if let Some(prepared) = &self.i2v_memory {
+            crate::i2v_memory_strategy::validate_active_request(prepared, req)?;
+        }
         let base = &self.config.base;
-        let sequential = self.offload_policy == OffloadPolicy::Sequential;
+        let sequential = self.offload_policy == OffloadPolicy::Sequential
+            || crate::i2v_memory_strategy::staged(req);
 
         // sc-4986 / sc-12459 (F-008) — fail fast (catchable) if the DiT-denoise stage won't fit,
         // BEFORE the UMT5 encode, the VAE conditioning encode, and the 27–54 GB dual-expert load.
@@ -956,6 +1078,28 @@ fn validate_vace_clip(
              replace_person / pose-depth control / extend-bridge)"
         ))
     })?;
+    // sc-20261 — `masking_strength` and `start_frame` were silently dropped on BOTH MLX VACE routes.
+    // The candle lane's dual-expert sibling (`candle-gen-wan/src/model_vace_fun.rs`) already honored
+    // the first and refused the second; these are that sibling's checks verbatim. MLX has no
+    // separate `model_vace_fun.rs` — `WanVace` and `WanVaceFun` share this validator and `vace_prep`
+    // — so wiring it here converges all four VACE providers on one answer.
+    //
+    // The range is load-bearing, not cosmetic: `masking_strength` now multiplies the per-vace-layer
+    // conditioning scale (`weighted_control_scale`), so a negative or >1 value would invert or
+    // over-drive every hint injection instead of weighting it.
+    if !clip.masking_strength.is_finite() || !(0.0..=1.0).contains(&clip.masking_strength) {
+        return Err(Error::Msg(format!(
+            "{id}: masking_strength must be finite and in [0,1] (got {})",
+            clip.masking_strength
+        )));
+    }
+    if clip.start_frame != 0 {
+        return Err(Error::Unsupported(format!(
+            "{id} currently applies ControlClip only at start_frame=0"
+        )));
+    }
+    // `mode` is already realized in the worker-rasterized control mask; all replacement modes
+    // therefore use the same VACE mask path here (the sibling's rule, unchanged).
     if clip.frames.len() != clip.mask.len() {
         return Err(Error::Msg(format!(
             "{id}: control frames ({}) and mask frames ({}) length mismatch",
@@ -1007,6 +1151,7 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vace::weighted_control_scale;
     use mlx_gen::{Conditioning, OffloadPolicy, ReplacementMode};
 
     fn test_config() -> WanVaceConfig {
@@ -1017,6 +1162,22 @@ mod tests {
 
     #[test]
     fn only_dual_expert_vace_advertises_sequential_offload() {
+        assert!(!descriptor_vace().capabilities.supports_sequential_offload);
+        let fun = descriptor_vace_fun();
+        assert!(fun.capabilities.supports_sequential_offload);
+        assert_eq!(fun.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
+    }
+
+    #[test]
+    fn both_registered_vace_variants_declare_unconditional_phase_staging() {
+        for descriptor in [descriptor_vace(), descriptor_vace_fun()] {
+            assert_eq!(
+                descriptor.capabilities.staged_residency_availability(),
+                mlx_gen::StagedResidencyAvailability::UnconditionallyEngaged,
+                "{} always stages heavyweight phases",
+                descriptor.id
+            );
+        }
         assert!(!descriptor_vace().capabilities.supports_sequential_offload);
         assert!(
             descriptor_vace_fun()
@@ -1205,6 +1366,205 @@ mod tests {
         let err = validate_vace_clip(&descriptor_vace_fun(), MODEL_ID_VACE_FUN, &cfg, &req)
             .expect_err("dual-expert: 1029 frames must be rejected");
         assert!(err.to_string().contains("exceeds the maximum 1025"));
+    }
+
+    /// A `clip_request` with one ControlClip field overridden — the sc-20261 knobs.
+    fn clip_request_with(
+        masking_strength: f32,
+        start_frame: i32,
+        mode: ReplacementMode,
+    ) -> GenerationRequest {
+        let mut req = clip_request(5, 64, 64, 0);
+        if let Conditioning::ControlClip {
+            masking_strength: ms,
+            start_frame: sf,
+            mode: m,
+            ..
+        } = &mut req.conditioning[0]
+        {
+            *ms = masking_strength;
+            *sf = start_frame;
+            *m = mode;
+        }
+        req
+    }
+
+    /// sc-20261 — `masking_strength` is no longer silently dropped: `vace_prep` resolves the
+    /// per-vace-layer conditioning scale through [`weighted_control_scale`], the same seam and the
+    /// same arithmetic as the candle lane.
+    ///
+    /// The seam assertions use a **non-default** strength on purpose. `masking_strength = 1.0` is
+    /// the identity for this mechanism, so an assert at the default would also pass against the old
+    /// silently-dropping `req.control_scale.unwrap_or(1.0)` — a false green.
+    #[test]
+    fn masking_strength_weights_the_control_scale() {
+        assert!((weighted_control_scale(Some(0.5), 0.4) - 0.2).abs() < f32::EPSILON);
+        assert!((weighted_control_scale(None, 0.25) - 0.25).abs() < f32::EPSILON);
+        // The pre-sc-20261 expression was `control_scale.unwrap_or(1.0)` alone; a non-default
+        // strength must move the resolved scale off it, or the knob is still inert.
+        assert_ne!(weighted_control_scale(Some(0.5), 0.4), 0.5);
+        assert_ne!(weighted_control_scale(None, 0.25), 1.0);
+        // The contract default is the identity, so a default request renders byte-identically.
+        assert_eq!(weighted_control_scale(Some(0.75), 1.0), 0.75);
+        assert_eq!(weighted_control_scale(None, 1.0), 1.0);
+
+        // The range the seam depends on is enforced at validate rather than left to poison the
+        // hint stack, on BOTH routes (they share this validator).
+        let cfg = test_config();
+        for (descriptor, id) in [
+            (descriptor_vace(), MODEL_ID_VACE),
+            (descriptor_vace_fun(), MODEL_ID_VACE_FUN),
+        ] {
+            let v = |ms: f32| {
+                validate_vace_clip(
+                    &descriptor,
+                    id,
+                    &cfg,
+                    &clip_request_with(ms, 0, ReplacementMode::FaceOnly),
+                )
+            };
+            // Non-default but in-range strengths are HONORED, not refused.
+            assert!(v(0.4).is_ok(), "{id}: 0.4 must validate");
+            assert!(v(0.0).is_ok(), "{id}: 0.0 must validate");
+            for invalid in [-0.01, 1.01, f32::NAN, f32::INFINITY] {
+                let err = v(invalid).expect_err("out-of-range masking_strength must be rejected");
+                assert!(
+                    err.to_string().contains("masking_strength"),
+                    "{id} names the field: {err}"
+                );
+            }
+        }
+    }
+
+    /// sc-20261 (adversarial-review follow-up) — the same claim asserted at the **resolution
+    /// `vace_prep` actually binds**: request in, per-vace-layer `scales` vector out. The scalar
+    /// [`weighted_control_scale`] can be right while a call site bypasses it, so the seam under test
+    /// is the whole vector.
+    ///
+    /// Non-default strengths throughout: at `masking_strength = 1.0` the resolved vector equals the
+    /// pre-sc-20261 `req.control_scale.unwrap_or(1.0)` broadcast, so an assert at the default is a
+    /// false green.
+    #[test]
+    fn resolved_control_scales_move_with_a_non_default_masking_strength() {
+        let with = |control_scale: Option<f32>, strength: f32| {
+            let mut req = clip_request_with(strength, 0, ReplacementMode::FaceOnly);
+            req.control_scale = control_scale;
+            req
+        };
+        // The pre-sc-20261 vector, for contrast — what a call site that dropped the knob resolves.
+        let dropped = |req: &GenerationRequest, n: usize| vec![req.control_scale.unwrap_or(1.0); n];
+
+        // Explicit control_scale × non-default strength.
+        let req = with(Some(0.5), 0.4);
+        let got = vace_control_scales(&req, 3);
+        assert_eq!(got.len(), 3, "one scale per vace layer");
+        assert!(
+            got.iter().all(|s| (s - 0.2).abs() < f32::EPSILON),
+            "{got:?}"
+        );
+        assert_ne!(got, dropped(&req, 3), "the knob must move the whole vector");
+
+        // No explicit control_scale: the strength IS the scale, not the dropped 1.0.
+        let req = with(None, 0.25);
+        let got = vace_control_scales(&req, 2);
+        assert!(
+            got.iter().all(|s| (s - 0.25).abs() < f32::EPSILON),
+            "{got:?}"
+        );
+        assert_ne!(got, dropped(&req, 2));
+
+        // The contract default is the identity — a default request resolves byte-identically to
+        // the pre-sc-20261 expression, so nothing already rendering changes.
+        for cs in [Some(0.75_f32), None] {
+            let req = with(cs, 1.0);
+            assert_eq!(vace_control_scales(&req, 4), dropped(&req, 4));
+        }
+        // A request with no ControlClip at all falls back to the default strength.
+        let mut bare = with(Some(0.4), 0.4);
+        bare.conditioning.clear();
+        bare.control_scale = Some(0.6);
+        assert_eq!(vace_control_scales(&bare, 2), vec![0.6, 0.6]);
+    }
+
+    /// sc-20261 (adversarial-review follow-up) — bind the MLX VACE **call site** to
+    /// [`vace_control_scales`].
+    ///
+    /// A unit test on the resolver cannot observe the call site: reverting `vace_prep`'s `scales`
+    /// binding to the pre-sc-20261 `vec![req.control_scale.unwrap_or(1.0); n]` un-honors
+    /// `masking_strength` while every arithmetic assertion above stays green. `vace_prep` is not
+    /// drivable without real weights (the scales are resolved after the VAE encode), so the binding
+    /// is pinned in the source instead — the same shape as `mlx-llm`'s
+    /// `multi_frame_attention_has_no_quadratic_mask_allocation`. Both MLX VACE routes share this
+    /// one `vace_prep`, so this pins the wiring for `wan_vace` and `wan2_2_vace_fun_14b` together.
+    #[test]
+    fn vace_prep_binds_scales_to_the_shared_resolver() {
+        let source = include_str!("model_vace.rs");
+        let body = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production body precedes the test module");
+        assert!(
+            body.contains("vace_control_scales(req, config.vace_layers.len())"),
+            "`scales` must be resolved by the shared seam"
+        );
+        assert!(
+            !body.contains("control_scale.unwrap_or("),
+            "the pre-sc-20261 expression must not be reachable at the call site"
+        );
+    }
+
+    /// sc-20261 — `start_frame` was silently dropped on both MLX VACE routes while the candle
+    /// sibling refused it. Mirror the sibling: non-zero is the typed `Unsupported`, `0` validates.
+    #[test]
+    fn validate_refuses_non_zero_start_frame_like_the_sibling() {
+        let cfg = test_config();
+        for (descriptor, id) in [
+            (descriptor_vace(), MODEL_ID_VACE),
+            (descriptor_vace_fun(), MODEL_ID_VACE_FUN),
+        ] {
+            assert!(validate_vace_clip(
+                &descriptor,
+                id,
+                &cfg,
+                &clip_request_with(1.0, 0, ReplacementMode::FaceOnly)
+            )
+            .is_ok());
+            let err = validate_vace_clip(
+                &descriptor,
+                id,
+                &cfg,
+                &clip_request_with(1.0, 1, ReplacementMode::FaceOnly),
+            )
+            .expect_err("start_frame != 0 must be refused");
+            assert!(
+                matches!(err, Error::Unsupported(_)),
+                "{id}: typed Unsupported, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("start_frame"),
+                "{id} names it: {err}"
+            );
+        }
+    }
+
+    /// sc-20261 — `mode` is realized in the worker-rasterized mask, so every replacement mode keeps
+    /// taking the same VACE mask path (the sibling's documented rule). Not a refusal.
+    #[test]
+    fn every_replacement_mode_still_validates() {
+        let cfg = test_config();
+        for mode in [
+            ReplacementMode::FaceOnly,
+            ReplacementMode::FullPersonKeepOutfit,
+            ReplacementMode::FullPersonReplaceOutfit,
+        ] {
+            assert!(validate_vace_clip(
+                &descriptor_vace(),
+                MODEL_ID_VACE,
+                &cfg,
+                &clip_request_with(1.0, 0, mode)
+            )
+            .is_ok());
+        }
     }
 
     /// sc-12607 — VACE renders on the 14B family's `patch(2)·VAE_S(8)` = 16-px grid; candle rejects an

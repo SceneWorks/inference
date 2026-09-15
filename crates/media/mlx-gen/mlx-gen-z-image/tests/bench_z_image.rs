@@ -2,7 +2,7 @@
 //! Python mflux fork (`tools/bench_z_image_fork.py`).
 //!
 //! `#[ignore]`d — needs the real `Tongyi-MAI/Z-Image-Turbo` weights in the HF cache. Run with:
-//!   cargo test -p mlx-gen-z-image --release --test bench_z_image -- --ignored --nocapture
+//!   cargo test -p mlx-gen-z-image --release --test integration bench_z_image:: -- --ignored --nocapture
 //!
 //! Two metrics, mirroring the fork script so the numbers line up:
 //!   * end-to-end `generate()` wall-clock (encode + denoise + VAE), the latency a user feels;
@@ -29,7 +29,7 @@ const STEPS: usize = 4;
 const RUNS: usize = 3;
 const PROMPT: &str = "a fox";
 
-mod common;
+use crate::common;
 use common::snapshot;
 
 fn median(mut v: Vec<f64>) -> f64 {

@@ -10,9 +10,9 @@
 //!  - `kolors_quant_generate_runs`: a full Q8 **and** Q4 `generate` completes and renders coherently
 //!    (non-degenerate, brightness tracks the bf16 render). Records peak memory.
 //!
-//! Run: `cargo test -p mlx-gen-kolors --release --test quant_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-kolors --release --test integration quant_parity:: -- --ignored --nocapture`
 
-mod common;
+use crate::common;
 
 use mlx_gen::weights::Weights;
 use mlx_gen_kolors::chatglm3::{ChatGlmConfig, ChatGlmModel};

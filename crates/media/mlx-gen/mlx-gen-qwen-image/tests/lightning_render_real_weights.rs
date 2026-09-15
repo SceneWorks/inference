@@ -1,8 +1,10 @@
 //! sc-2909: Qwen-Image Lightning end-to-end render over the integrated public path (real weights).
 //!
 //! The Lightning schedule is bit-exact vs diffusers (`tests/lightning_parity.rs`), the Lightning LoRA
-//! loads cleanly (`adapter_real_weights::lightning_loras_apply_cleanly`, 840/840 modules), and the
-//! transformer + VAE + denoise loop are the SAME pixel-parity components as the production base path
+//! loads cleanly (`adapter_real_weights::lightning_loras_apply_cleanly`, 720 of the host's 840
+//! modules — the 12 per-block classes every published Lightning file trains; sc-17518 corrected a
+//! stale 840 that had never actually run), and the transformer + VAE + denoise loop are the SAME
+//! pixel-parity components as the production base path
 //! (`e2e_real_weights`, 0.000% px>8 vs the fork — itself a diffusers port). What this gate adds is the
 //! **integration** proof: `provider_registry().load("qwen_image", spec.with_adapters([lightning])).generate(req
 //! { sampler: "lightning", steps: 8 })` runs end-to-end and renders a coherent natural image (not
@@ -10,7 +12,7 @@
 //! reference (`tools/dump_qwen_lightning_golden.py render`) as PPMs for a side-by-side visual check.
 //!
 //! `#[ignore]`d — needs the real `Qwen/Qwen-Image` snapshot + the cached lightx2v Lightning LoRA:
-//!   cargo test -p mlx-gen-qwen-image --release --test lightning_render_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-qwen-image --release --test integration lightning_render_real_weights:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 
@@ -28,22 +30,43 @@ const SEED: u64 = 42;
 const PROMPT: &str = "a fox sitting in a forest, photorealistic";
 
 fn snapshot() -> PathBuf {
-    let p = std::env::var("QWEN_IMAGE_SNAPSHOT").unwrap_or_else(|_| panic!("set QWEN_IMAGE_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    let p = std::env::var("MLX_GEN_QWEN_SNAPSHOT").unwrap_or_else(|_| panic!("set MLX_GEN_QWEN_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
     PathBuf::from(p)
 }
 
-fn lightning_lora() -> PathBuf {
+/// The pinned lightx2v snapshot dir for `repo`, or the first cached one.
+///
+/// `env` wins when set. That matters for CI and not only for convenience: `ensure_model_snapshot.py`
+/// verifies ONE revision, while the fallback below takes whichever snapshot directory `read_dir`
+/// yields first — so without the override a lane can verify the pin and then load a different
+/// revision that happens to be cached beside it (sc-17284).
+fn lightx2v_file(env: &str, repo: &str, file: &str) -> PathBuf {
+    if let Ok(dir) = std::env::var(env) {
+        let p = PathBuf::from(dir).join(file);
+        assert!(p.exists(), "{env} is set but {} is missing", p.display());
+        return p;
+    }
     let home = std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)");
-    let snaps = PathBuf::from(home).join("models--lightx2v--Qwen-Image-Lightning/snapshots");
+    let snaps = PathBuf::from(home).join(repo).join("snapshots");
     std::fs::read_dir(&snaps)
-        .expect("download lightx2v/Qwen-Image-Lightning")
-        .filter_map(|e| e.ok())
-        .map(|e| {
-            e.path()
-                .join("Qwen-Image-Lightning-8steps-V1.1-bf16.safetensors")
+        .unwrap_or_else(|e| {
+            panic!(
+                "read {}: {e}; download {repo} or set {env}",
+                snaps.display()
+            )
         })
+        .filter_map(|e| e.ok())
+        .map(|e| e.path().join(file))
         .find(|p| p.exists())
-        .expect("Qwen-Image-Lightning-8steps-V1.1-bf16.safetensors not cached")
+        .unwrap_or_else(|| panic!("{file} not cached under {}; set {env}", snaps.display()))
+}
+
+fn lightning_lora() -> PathBuf {
+    lightx2v_file(
+        "QWEN_LIGHTNING_SNAPSHOT",
+        "models--lightx2v--Qwen-Image-Lightning",
+        "Qwen-Image-Lightning-8steps-V1.1-bf16.safetensors",
+    )
 }
 
 fn golden_dir() -> PathBuf {
@@ -160,33 +183,19 @@ fn edit_snapshot() -> PathBuf {
 }
 
 fn edit_lightning_lora() -> PathBuf {
-    let home = std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)");
-    let snaps =
-        PathBuf::from(home).join("models--lightx2v--Qwen-Image-Edit-2511-Lightning/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("download lightx2v/Qwen-Image-Edit-2511-Lightning")
-        .filter_map(|e| e.ok())
-        .map(|e| {
-            e.path()
-                .join("Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors")
-        })
-        .find(|p| p.exists())
-        .expect("Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors not cached")
+    lightx2v_file(
+        "QWEN_EDIT_LIGHTNING_SNAPSHOT",
+        "models--lightx2v--Qwen-Image-Edit-2511-Lightning",
+        "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors",
+    )
 }
 
 fn edit_lightning_lora_4step() -> PathBuf {
-    let home = std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)");
-    let snaps =
-        PathBuf::from(home).join("models--lightx2v--Qwen-Image-Edit-2511-Lightning/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("download lightx2v/Qwen-Image-Edit-2511-Lightning")
-        .filter_map(|e| e.ok())
-        .map(|e| {
-            e.path()
-                .join("Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors")
-        })
-        .find(|p| p.exists())
-        .expect("Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors not cached")
+    lightx2v_file(
+        "QWEN_EDIT_LIGHTNING_SNAPSHOT",
+        "models--lightx2v--Qwen-Image-Edit-2511-Lightning",
+        "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors",
+    )
 }
 
 fn load_ppm(path: PathBuf) -> Image {
@@ -312,8 +321,8 @@ fn edit_lightning_render_is_coherent() {
 /// Example:
 /// `QWEN_EDIT_REPRO_REF_PPM=/tmp/source_1024_crop.ppm \
 ///  QWEN_EDIT_REPRO_LORA=/path/to/user_lora.safetensors \
-///  cargo test -p mlx-gen-qwen-image --release --test lightning_render_real_weights \
-///    edit_lightning_user_lora_reference_repro -- --ignored --nocapture`
+///  cargo test -p mlx-gen-qwen-image --release --test integration \
+///    lightning_render_real_weights::edit_lightning_user_lora_reference_repro -- --ignored --nocapture`
 #[test]
 #[ignore = "needs real Qwen-Image-Edit-2511 weights, 4-step Lightning LoRA, reference PPM, and user LoRA"]
 fn edit_lightning_user_lora_reference_repro() {

@@ -23,11 +23,13 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use candle_gen::candle_core::{DType, Tensor};
+use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::weightsmeta as wmeta;
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
 use candle_gen::quant::LokrFactors;
-use candle_gen::train::lora::{reconstruct_lokr_delta, reconstruct_lora_delta, LoraAdapterMeta};
+use candle_gen::train::lora::{
+    parse_lokr_metadata, reconstruct_lokr_delta, reconstruct_lora_delta, LoraAdapterMeta,
+};
 // The shared adapter-merge skeleton (sc-8998 / F-018): the format-parsing + merge-report primitives
 // this crate previously hand-copied. Only the DiT-specific key→module resolution stays local below.
 use candle_gen::train::merge::{
@@ -186,16 +188,10 @@ fn merge_lokr_file(
     table: &BTreeMap<String, String>,
     report: &mut MergeReport,
 ) -> Result<()> {
-    let rank = af
-        .meta
-        .get("rank")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(1.0);
-    let alpha = af
-        .meta
-        .get("alpha")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(rank);
+    let (rank, alpha) = parse_lokr_metadata(
+        af.meta.get("rank").map(String::as_str),
+        af.meta.get("alpha").map(String::as_str),
+    )?;
 
     let mut grouped: BTreeMap<String, BTreeMap<&'static str, Tensor>> = BTreeMap::new();
     for (key, t) in &af.tensors {
@@ -250,6 +246,13 @@ pub fn merge_adapters(
     let mut report = MergeReport::default();
     for spec in specs {
         let af = read_adapter(&spec.path)?;
+        if spec.kind == AdapterKind::Lokr && !af.declares_lokr() {
+            return Err(CandleError::Msg(format!(
+                "z_image: adapter {} declared LoKr but does not declare networkType=lokr",
+                spec.path.display()
+            )));
+        }
+        let before = report.merged;
         match spec.kind {
             AdapterKind::Lokr => merge_lokr_file(map, &af, spec.scale, &table, &mut report)?,
             AdapterKind::Lora => {
@@ -263,6 +266,12 @@ pub fn merge_adapters(
                 }
                 merge_lora_file(map, &af, spec.scale, &table, &mut report)?;
             }
+        }
+        if report.merged == before {
+            return Err(CandleError::Msg(format!(
+                "z_image: selected adapter {} matched no Z-Image projection",
+                spec.path.display()
+            )));
         }
     }
     if report.merged == 0 {
@@ -291,15 +300,18 @@ pub fn merge_adapters(
 
 /// A resolved LoRA residual pending attachment: `a = downᵀ` `[in, rank]`, `b = upᵀ·(alpha/rank)`
 /// `[rank, out]`, `scale` the user strength. Read on CPU; moved to the DiT device at push.
+#[derive(Clone)]
 struct PendingLora {
     a: Tensor,
     b: Tensor,
     scale: f64,
+    source: usize,
 }
 
 /// A LoKr module's raw factors + the FULL `(alpha/rank)·strength` scale, pending the projection's
 /// `[out, in]` to build the structured Kronecker factors ([`LokrFactors`], the vec-trick — never the
 /// dense delta).
+#[derive(Clone)]
 struct PendingLokr {
     w1: Option<Tensor>,
     w1_a: Option<Tensor>,
@@ -308,6 +320,76 @@ struct PendingLokr {
     w2_a: Option<Tensor>,
     w2_b: Option<Tensor>,
     scale: f64,
+    source: usize,
+}
+
+/// Resolved host-side residuals retained by a block-streamed DiT. Each materialized window receives
+/// these residuals before its first forward, preserving adapter semantics without retaining every
+/// base transformer block on the accelerator.
+#[derive(Clone, Default)]
+pub(crate) struct AdditivePlan {
+    pending_lora: BTreeMap<String, Vec<PendingLora>>,
+    pending_lokr: BTreeMap<String, Vec<PendingLokr>>,
+}
+
+impl AdditivePlan {
+    pub(crate) fn apply_projection(
+        &self,
+        path: &str,
+        lin: &mut candle_gen::quant::AdaptLinear,
+        device: &Device,
+    ) -> Result<(usize, usize, bool)> {
+        let (out_f, in_f) = lin.base_shape();
+        let mut applied = 0;
+        let mut skipped = 0;
+        let mut matched = false;
+        if let Some(list) = self.pending_lora.get(path) {
+            matched = true;
+            for pending in list {
+                if pending.a.dims()[0] != in_f || pending.b.dims()[1] != out_f {
+                    skipped += 1;
+                    continue;
+                }
+                lin.push_lora(
+                    pending.a.to_device(device)?,
+                    pending.b.to_device(device)?,
+                    pending.scale,
+                )
+                .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
+                applied += 1;
+            }
+        }
+        if let Some(list) = self.pending_lokr.get(path) {
+            matched = true;
+            for pending in list {
+                match LokrFactors::build(
+                    pending.scale,
+                    (out_f, in_f),
+                    pending.w1.as_ref(),
+                    pending.w1_a.as_ref(),
+                    pending.w1_b.as_ref(),
+                    pending.w2.as_ref(),
+                    None,
+                    pending.w2_a.as_ref(),
+                    pending.w2_b.as_ref(),
+                )? {
+                    Some(factors) => {
+                        lin.push_lokr_structured(factors.to_device(device)?)
+                            .map_err(|error| {
+                                candle_gen::candle_core::Error::Msg(error.to_string())
+                            })?;
+                        applied += 1;
+                    }
+                    None => {
+                        return Err(CandleError::Msg(format!(
+                            "z_image: LoKr target `{path}` has no allocation-free structured form; use a dense bf16 snapshot"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok((applied, skipped, matched))
+    }
 }
 
 /// A report of a forward-time additive install (sc-11105) — the packed-tier analog of [`MergeReport`].
@@ -328,6 +410,7 @@ pub struct AdditiveReport {
 fn resolve_lora_file(
     af: &AdapterFile,
     scale: f32,
+    source: usize,
     table: &BTreeMap<String, String>,
     pending: &mut BTreeMap<String, Vec<PendingLora>>,
     skipped_keys: &mut usize,
@@ -368,6 +451,7 @@ fn resolve_lora_file(
             a,
             b,
             scale: scale as f64,
+            source,
         });
     }
     Ok(())
@@ -379,20 +463,15 @@ fn resolve_lora_file(
 fn resolve_lokr_file(
     af: &AdapterFile,
     scale: f32,
+    source: usize,
     table: &BTreeMap<String, String>,
     pending: &mut BTreeMap<String, Vec<PendingLokr>>,
     skipped_keys: &mut usize,
 ) -> Result<()> {
-    let rank = af
-        .meta
-        .get("rank")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(1.0);
-    let alpha = af
-        .meta
-        .get("alpha")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(rank);
+    let (rank, alpha) = parse_lokr_metadata(
+        af.meta.get("rank").map(String::as_str),
+        af.meta.get("alpha").map(String::as_str),
+    )?;
     let full = (alpha as f64 / rank as f64) * scale as f64;
     let mut grouped: BTreeMap<String, BTreeMap<&'static str, Tensor>> = BTreeMap::new();
     for (key, t) in &af.tensors {
@@ -412,6 +491,7 @@ fn resolve_lokr_file(
             w2_a: f.get("lokr_w2_a").cloned(),
             w2_b: f.get("lokr_w2_b").cloned(),
             scale: full,
+            source,
         });
     }
     Ok(())
@@ -433,7 +513,7 @@ pub fn install_additive(
     // rank-2), so a `lora_transformer_<flat>` key resolves exactly as the dense fold's
     // `build_kohya_table` would (the additive-path analog with no base tensor map at hand).
     let mut paths: Vec<String> = Vec::new();
-    dit.visit_adaptable_mut(&mut |path, _lin| {
+    dit.visit_adaptable_for_install(&mut |path, _lin| {
         paths.push(path.to_string());
         Ok(())
     })?;
@@ -445,8 +525,23 @@ pub fn install_additive(
     let mut pending_lora: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
     let mut pending_lokr: BTreeMap<String, Vec<PendingLokr>> = BTreeMap::new();
 
-    for spec in specs {
+    for (source, spec) in specs.iter().enumerate() {
         let af = read_adapter(&spec.path)?;
+        match (spec.kind, af.declares_lokr()) {
+            (AdapterKind::Lora, true) => {
+                return Err(CandleError::Msg(format!(
+                    "z_image: adapter {} declared LoRA but its metadata says networkType=lokr",
+                    spec.path.display()
+                )))
+            }
+            (AdapterKind::Lokr, false) => {
+                return Err(CandleError::Msg(format!(
+                    "z_image: adapter {} declared LoKr but does not declare networkType=lokr",
+                    spec.path.display()
+                )))
+            }
+            _ => {}
+        }
         if wmeta::keys_contain_loha(af.tensors.keys().map(String::as_str)) {
             return Err(CandleError::Msg(format!(
                 "z_image: a LoHa adapter cannot apply on a packed (q4/q8) tier — its Hadamard product \
@@ -471,10 +566,11 @@ pub fn install_additive(
                 spec.path.display()
             )));
         }
-        if spec.kind == AdapterKind::Lokr || af.declares_lokr() {
+        if spec.kind == AdapterKind::Lokr {
             resolve_lokr_file(
                 &af,
                 spec.scale,
+                source,
                 &table,
                 &mut pending_lokr,
                 &mut report.skipped_keys,
@@ -483,6 +579,7 @@ pub fn install_additive(
             resolve_lora_file(
                 &af,
                 spec.scale,
+                source,
                 &table,
                 &mut pending_lora,
                 &mut report.skipped_keys,
@@ -495,23 +592,30 @@ pub fn install_additive(
     // so they are moved onto it at push. A factor whose dims don't match the projection is surfaced as a
     // skipped key, never a crashing forward (the additive analog of the fold path's shape guard).
     let device = dit.device().clone();
+    let plan = AdditivePlan {
+        pending_lora,
+        pending_lokr,
+    };
     let mut matched: HashSet<String> = HashSet::new();
     let mut applied = 0usize;
+    let mut applied_sources = HashSet::new();
     let mut skipped_keys = 0usize;
-    dit.visit_adaptable_mut(&mut |path, lin| {
+    dit.visit_adaptable_for_install(&mut |path, lin| {
         let (out_f, in_f) = lin.base_shape();
-        if let Some(list) = pending_lora.get(path) {
+        if let Some(list) = plan.pending_lora.get(path) {
             matched.insert(path.to_string());
             for p in list {
                 if p.a.dims()[0] != in_f || p.b.dims()[1] != out_f {
                     skipped_keys += 1;
                     continue;
                 }
-                lin.push_lora(p.a.to_device(&device)?, p.b.to_device(&device)?, p.scale);
+                lin.push_lora(p.a.to_device(&device)?, p.b.to_device(&device)?, p.scale)
+                    .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
                 applied += 1;
+                applied_sources.insert(p.source);
             }
         }
-        if let Some(list) = pending_lokr.get(path) {
+        if let Some(list) = plan.pending_lokr.get(path) {
             matched.insert(path.to_string());
             for p in list {
                 match LokrFactors::build(
@@ -526,8 +630,10 @@ pub fn install_additive(
                     p.w2_b.as_ref(),
                 )? {
                     Some(factors) => {
-                        lin.push_lokr_structured(factors.to_device(&device)?);
+                        lin.push_lokr_structured(factors.to_device(&device)?)
+                        .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
                         applied += 1;
+                        applied_sources.insert(p.source);
                     }
                     None => {
                         return Err(CandleError::Msg(format!(
@@ -541,13 +647,22 @@ pub fn install_additive(
         }
         Ok(())
     })?;
+    dit.retain_streamed_adapter_plan(plan.clone());
     report.applied = applied;
     report.skipped_keys += skipped_keys;
 
     // Pending targets absent from the DiT surface are surfaced, never silently dropped.
-    for path in pending_lora.keys().chain(pending_lokr.keys()) {
+    for path in plan.pending_lora.keys().chain(plan.pending_lokr.keys()) {
         if !matched.contains(path) {
             report.skipped_targets.push(path.clone());
+        }
+    }
+    for (source, spec) in specs.iter().enumerate() {
+        if !applied_sources.contains(&source) {
+            return Err(CandleError::Msg(format!(
+                "z_image: selected adapter {} matched no Z-Image projection",
+                spec.path.display()
+            )));
         }
     }
     // A non-empty spec set that adapted nothing is a format/prefix misconfiguration — fail loudly rather
@@ -591,6 +706,41 @@ mod tests {
 
     fn t2(data: &[f32], r: usize, c: usize) -> Tensor {
         Tensor::from_vec(data.to_vec(), (r, c), &Device::Cpu).unwrap()
+    }
+
+    #[test]
+    fn dense_stack_rejects_a_later_zero_match_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let valid = tmp.path().join("valid.safetensors");
+        let missing = tmp.path().join("missing.safetensors");
+        for (file, target) in [
+            (&valid, "layers.0.attention.to_q"),
+            (&missing, "layers.99.attention.to_q"),
+        ] {
+            candle_gen::candle_core::safetensors::save(
+                &HashMap::from([
+                    (
+                        format!("{target}.lora_A.weight"),
+                        t2(&[1.0, 0.0, 0.0, 0.0], 1, 4),
+                    ),
+                    (
+                        format!("{target}.lora_B.weight"),
+                        t2(&[1.0, 0.0, 0.0, 0.0], 4, 1),
+                    ),
+                ]),
+                file,
+            )
+            .unwrap();
+        }
+        let error = merge_adapters(
+            &mut base_map(),
+            &[
+                AdapterSpec::new(valid, 1.0, AdapterKind::Lora),
+                AdapterSpec::new(missing.clone(), 1.0, AdapterKind::Lora),
+            ],
+        )
+        .expect_err("a valid first file must not hide a later dense zero-match");
+        assert!(error.to_string().contains(&missing.display().to_string()));
     }
 
     /// Bare dotted (the trainer's format), prefixed PEFT, and kohya flattened all resolve to the same
@@ -841,10 +991,10 @@ mod tests {
 
         // Write the real PEFT file the DiT trainer emits (empty prefix → bare dotted keys), then
         // merge it through the public entry point.
-        let file = std::env::temp_dir().join(format!(
-            "candle_zimage_lora_roundtrip_{}.safetensors",
-            std::process::id()
-        ));
+        let file_tmp = tempfile::tempdir().unwrap();
+        let file = file_tmp
+            .path()
+            .join("candle_zimage_lora_roundtrip.safetensors");
         save_lora_peft(&set, "", &HashMap::new(), &file).unwrap();
 
         let mut map = HashMap::new();
@@ -922,7 +1072,7 @@ mod tests {
         let table: BTreeMap<String, String> = BTreeMap::new();
         let mut pending: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
         let mut skipped = 0usize;
-        resolve_lora_file(&af, scale, &table, &mut pending, &mut skipped).unwrap();
+        resolve_lora_file(&af, scale, 0, &table, &mut pending, &mut skipped).unwrap();
         assert_eq!(skipped, 0, "clean LoRA resolves with no skipped keys");
         let p = &pending[path][0];
         assert_eq!(p.a.dims(), &[in_dim, rank], "a = downᵀ [in, rank]");
@@ -931,7 +1081,9 @@ mod tests {
         // Additive: base W + the resolved residual.
         let w = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev).unwrap();
         let mut additive = AdaptLinear::from_dense(Linear::new(w.clone(), None), in_dim, out_dim);
-        additive.push_lora(p.a.clone(), p.b.clone(), p.scale);
+        additive
+            .push_lora(p.a.clone(), p.b.clone(), p.scale)
+            .unwrap();
 
         // Folded: δ = (alpha/rank)·scale·(B·A); W_merged = W + δ.
         let delta = reconstruct_lora_delta(&down, &up, alpha, rank as f32, scale).unwrap();

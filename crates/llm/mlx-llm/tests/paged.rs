@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! MLX_LLM_TEST_MODEL=/path/to/SmolLM2-135M-Instruct \
-//!   cargo test --test paged -- --ignored --nocapture
+//!   cargo test --test integration -- paged:: --ignored --nocapture
 //! ```
 //!
 //! ## What these prove (the story-7169 acceptance, on real weights)

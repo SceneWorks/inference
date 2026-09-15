@@ -41,24 +41,26 @@ use mlx_rs::ops::concatenate_axis;
 use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array, Dtype};
 
+use mlx_gen::block_residency::BlockPlan;
 use mlx_gen::media::Image;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result, WeightsSource,
+    Generator, LoadPhase, LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result,
+    WeightsSource,
 };
 
 use mlx_gen_wan::config::WanModelConfig;
 use mlx_gen_wan::pipeline::{align_dim, decode_to_frames, frames_to_images, latent_shape};
 use mlx_gen_wan::text_encoder::{load_tokenizer, Umt5Encoder};
-use mlx_gen_wan::{WanTransformer, WanVae};
+use mlx_gen_wan::{WanBlockStream, WanTransformer};
 
 use crate::assembly::{concat_with_zero_init, format_mllm_inputs_embeds};
 use crate::clip_diff::DiffLossFm;
 use crate::config::{validate_bernini_geometry, BerniniKnobs};
 use crate::connector::MlpConnector;
-use crate::forward::{PackedForward, VitGuidanceParams, VitMode};
+use crate::forward::{PackedForward, Trunk, VitGuidanceParams, VitMode};
 use crate::mar::{
     mar_schedule, post_process_input_embeds, sample_vit_embed, SampledStreams, StreamState, VitCfg,
 };
@@ -76,6 +78,7 @@ use crate::vit_preprocess::{
     normalized_frame, pack_patches, preprocess_image, smart_resize, smart_video_nframes, FACTOR,
     IMAGE_MEAN, IMAGE_STD, MERGE_SIZE, PATCH_SIZE, TEMPORAL_PATCH_SIZE,
 };
+use crate::{decoded_output_geometry, ProviderVae, PROVIDER_VAE_STRIDE};
 
 pub const MODEL_ID: &str = "bernini";
 
@@ -301,14 +304,19 @@ fn vit_encode_video(planner: &BerniniPlanner, frames: &[RgbImage]) -> Result<(Ar
 }
 
 /// VAE-encode one image (`.mode()`, the Gaussian mean) → normalized `[16, T, H8, W8]`.
-fn vae_encode_image(vae: &WanVae, rgb: &RgbImage) -> Result<Array> {
+fn vae_encode_image(vae: &ProviderVae, rgb: &RgbImage) -> Result<Array> {
     let chw = vae_transform_image(rgb, VAE_MAX_SIZE, VAE_MIN_SIZE, VAE_STRIDE); // [3, H, W] in [-1,1]
     drop_batch(&image_vae_latent(vae, &chw)?)
 }
 
 /// VAE-encode a video clip (`.sample()`) → normalized `[16, T_lat, H8, W8]`. `eps` is generated for the
 /// latent shape so the encode is deterministic given the seed.
-fn vae_encode_video(vae: &WanVae, frames: &[RgbImage], z_dim: usize, key: &Array) -> Result<Array> {
+fn vae_encode_video(
+    vae: &ProviderVae,
+    frames: &[RgbImage],
+    z_dim: usize,
+    key: &Array,
+) -> Result<Array> {
     let mut chw_t = Vec::with_capacity(frames.len());
     for f in frames {
         let chw = vae_transform_image(f, VAE_MAX_SIZE, VAE_MIN_SIZE, VAE_STRIDE); // [3, H, W]
@@ -519,6 +527,9 @@ fn task_to_vit_mode(task: &str) -> Option<VitMode> {
 /// Stable identity + advertised capabilities for the full Bernini pipeline.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "bernini",
@@ -528,45 +539,31 @@ pub fn descriptor() -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             conditioning: vec![
                 ConditioningKind::Reference,
                 ConditioningKind::MultiReference,
                 ConditioningKind::VideoClip,
             ],
-            supports_lora: false,
-            supports_lokr: false,
             samplers: vec!["unipc"],
-            schedulers: Vec::new(),
-            supported_guidance_methods: vec![],
             min_size: 16,
             max_size: 1280,
             max_count: 1,
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: true,
-            requires_sigma_shift: false,
             // Bernini is structurally always-staged (epic 10834, sc-10840): `generate_impl` holds NO
             // component weights on the generator and loads per generate in phase order — planner
             // (Qwen2.5-VL-7B) → drop → UMT5-XXL T5 → drop → the two co-resident MoE experts + z16 VAE —
             // dropping BOTH encoders (+ `clear_cache()`) before the experts, so peak unified memory is
             // already bounded to the dominant expert phase. The per-component footprint reports the two
             // experts as the DiT phase (the peak; the planner is a smaller, earlier, dropped phase), so
-            // the fit-gate's staged estimate is sound. `OffloadPolicy` is not consumed — there is no
-            // Resident-warm mode to toggle. The one thing NOT split is the two experts, which the
+            // fit-gate's staged estimate is sound. `OffloadPolicy` is not consumed — there is no
+            // Resident-warm mode to toggle, so this is unconditional physical staging rather than a
+            // selectable offload control. The one thing NOT split is the two experts, which the
             // MoE-by-timestep denoise loop holds co-resident (see the BLOCKERS note in the PR).
-            supports_sequential_offload: true,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: true,
+            ..Default::default()
         },
     }
 }
@@ -578,6 +575,10 @@ pub struct Bernini {
     knobs: BerniniKnobs,
     root: PathBuf,
     quant: Option<Quant>,
+    /// The contract this LOAD publishes, and the spec it was built from (sc-18609) — see the
+    /// hand-written `Generator` impl below.
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
+    loaded_spec: LoadSpec,
 }
 
 /// Load the full Bernini pipeline from a combined snapshot dir
@@ -602,12 +603,15 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         )));
     }
     let knobs = BerniniKnobs::from_dir(&root)?;
+    let memory_strategy = crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?;
     Ok(Box::new(Bernini {
         descriptor: descriptor(),
         config,
         knobs,
         root,
         quant: spec.quantize,
+        memory_strategy,
+        loaded_spec: spec.clone(),
     }))
 }
 
@@ -618,10 +622,59 @@ mlx_gen::register_generators! {
     footprint = crate::pipeline::component_footprint
 }
 
-mlx_gen::impl_generator!(Bernini {
-    validate: |s, req| s.validate_impl(req),
-    generate: generate_impl,
-});
+// Hand-written for the same reason as `BerniniRenderer`'s (sc-18609): `mlx_gen::impl_generator!`
+// emits no memory-strategy hooks, so the declared ladder would stay unreachable through the loaded
+// generator. Audited independently of the renderer rather than inherited — the two variants differ in
+// modality, in conditioning footprint, and in which snapshot files they load — and the audit found
+// the same three hooks missing on both.
+impl Generator for Bernini {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        self.validate_impl(req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        crate::memory_strategy::loaded_safety_check(
+            MODEL_ID,
+            &self.loaded_spec,
+            &self.memory_strategy,
+            context,
+            self.config.num_layers,
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        crate::memory_strategy::loaded_begin_request(
+            MODEL_ID,
+            &self.loaded_spec,
+            &self.memory_strategy,
+            context,
+            self.config.num_layers,
+        )
+    }
+}
 
 impl Bernini {
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
@@ -634,6 +687,9 @@ impl Bernini {
         // request gets the same rejection on both backends.
         validate_bernini_geometry(self.descriptor.id, req)?;
         validate_conditioning_video_clips(req)?;
+        // sc-20264 — refuse the per-clip knobs this engine does not implement rather than reading
+        // them off the request and dropping them.
+        reject_unimplemented_video_clip_knobs(self.descriptor.id, req)?;
         Ok(())
     }
 
@@ -656,8 +712,8 @@ impl Bernini {
         // sc-12500 (F-040): `validate_impl` rejects any off-grid width/height, so the reference's
         // align-down is a no-op here — assert that instead of silently refitting the request
         // (1000×1000 used to render 992×992 with no diagnostic while candle errored).
-        let width = align_dim(req.width, cfg.patch_size.2, cfg.vae_stride.2);
-        let height = align_dim(req.height, cfg.patch_size.1, cfg.vae_stride.1);
+        let width = align_dim(req.width, cfg.patch_size.2, PROVIDER_VAE_STRIDE.2);
+        let height = align_dim(req.height, cfg.patch_size.1, PROVIDER_VAE_STRIDE.1);
         debug_assert_eq!(
             (width, height),
             (req.width, req.height),
@@ -687,6 +743,16 @@ impl Bernini {
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
+        // The conditioning phase the memory contract declares (`memory_strategy.rs`:
+        // `MemoryPhase::Conditioning`) opens HERE, at the planner load — not at the first
+        // `Progress::Step`, which the MAR loop only reaches once the ~15 GB planner is resident
+        // (sc-22738). Everything up to and including the UMT5-XXL encode below belongs to it: this
+        // engine has no single "text encoder" component, so the shared `LoadPhase::TextEncoder`
+        // boundary marks the whole conditioning stage, exactly as `residency::run_two_phase` uses
+        // it for the engines that do. Bernini cannot adopt that driver: it loads, uses and frees
+        // TWO conditioning components (planner, then UMT5) around a `clear_cache`, which the
+        // two-phase order (one text component, then the heavy one) cannot express.
+        on_progress(Progress::Loading(LoadPhase::TextEncoder));
         let planner = BerniniPlanner::load(&self.root, self.quant)?;
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
@@ -698,7 +764,7 @@ impl Bernini {
         let (videos_pix, images_pix) = collect_conditioning(req);
         {
             let vae_w = Weights::from_file(self.root.join("vae.safetensors"))?;
-            let vae = WanVae::from_weights(&vae_w)?;
+            let vae = ProviderVae::from_weights(&vae_w)?;
             for (vi, clip) in videos_pix.iter().enumerate() {
                 let rgb: Vec<RgbImage> = clip.iter().map(to_rgb).collect::<Result<_>>()?;
                 let vit_frames = sample_vit_frames(&rgb);
@@ -885,7 +951,7 @@ impl Bernini {
 
         // --- Stage 3: load both experts, ViT-conditioned APG denoise ---
         let key = random::key(seed)?;
-        let lat = latent_shape(frames, height, width, cfg.vae_z_dim, cfg.vae_stride)?;
+        let lat = latent_shape(frames, height, width, cfg.vae_z_dim, PROVIDER_VAE_STRIDE)?;
         let init_noise = random::normal::<f32>(&lat[..], None, None, Some(&key))?;
 
         let base_g = VitGuidanceParams {
@@ -899,11 +965,15 @@ impl Bernini {
 
         // Source ids (videos first, then images — mirrors `PackedForward::build_combos`/packing_vae).
         let (nv, ni) = (src_videos.len(), src_images.len());
-        let sids = assign_source_ids(
-            nv + ni,
-            self.knobs.max_trained_src_id,
-            self.knobs.interpolate_src_id,
-        );
+        // ADS2V is trained with its mandatory source-video/reference-video/first-image triplet;
+        // extra images interpolate over that three-source range. Keep this execution schedule in
+        // lockstep with the request receipt used for admission evidence.
+        let trained_sources = if req.video_mode.as_deref() == Some("ads2v") {
+            3.0
+        } else {
+            self.knobs.max_trained_src_id
+        };
+        let sids = assign_source_ids(nv + ni, trained_sources, self.knobs.interpolate_src_id);
         let video_srcs: Vec<(Array, f64)> = src_videos
             .iter()
             .enumerate()
@@ -918,20 +988,54 @@ impl Bernini {
         // Load each expert and (if quantizing) quantize-then-free it before loading the next, so only
         // one expert's bf16 transient is resident at a time (sc-5360 — `WanTransformer::quantize`
         // eval-frees the bf16 dequant). Without quant this just loads both bf16.
-        let load_expert = |name: &str| -> Result<WanTransformer> {
-            let w = Weights::from_file(self.root.join(name))?;
-            let mut dit = WanTransformer::from_weights(&w, cfg)?;
-            if let Some(q) = self.quant {
-                dit.quantize(q.bits(), None)?;
+        // ── Ladder rungs 3 + 4 (sc-15528) ────────────────────────────────────────────────────
+        // Rung 4 is per-request: when a window is selected the expert's block stack is NEVER
+        // materialized (`from_weights_deferred` holds zero blocks) and the stream rebuilds
+        // `plan.window()` blocks at a time. On a DUAL-expert config that is the whole point --
+        // sc-16354's finding is that a naive per-expert window leaves the idle expert's 40 blocks
+        // resident, and a stack that was never materialized has no idle half to pay for. Both
+        // experts are deferred here, so the bound is over the full 80-block trunk, not one expert.
+        let window = crate::memory_strategy::transformer_window_size(req)?;
+        let attn_budget = crate::memory_strategy::attention_budget(req);
+        let plan = window
+            .map(|size| BlockPlan::new(cfg.num_layers, size))
+            .transpose()?;
+        let load_expert = |name: &str| -> Result<(WanTransformer, Option<WanBlockStream>)> {
+            let path = self.root.join(name);
+            let w = Weights::from_file(&path)?;
+            if window.is_some() {
+                let dit = WanTransformer::from_weights_deferred(&w, cfg)?;
+                // No adapters can reach here (`supports_lora: false`), and the stream refuses an
+                // adapted load anyway -- Wan MERGES deltas at load, so a streamed block re-read from
+                // the snapshot would silently carry none of them.
+                let mut stream = WanBlockStream::new(WeightsSource::File(path), cfg.clone(), &[])?;
+                if let Some(q) = self.quant {
+                    // Replayed per materialized block so the streamed weights are byte-identical to
+                    // the resident ones. A pre-packed tier takes this through `cfg.quantization`
+                    // inside the block constructor instead, exactly as the resident path does.
+                    stream.set_quant_bits(q.bits());
+                }
+                stream.set_attention_budget(attn_budget);
+                Ok((dit, Some(stream)))
+            } else {
+                let mut dit = WanTransformer::from_weights(&w, cfg)?;
+                if let Some(q) = self.quant {
+                    dit.quantize(q.bits(), None)?;
+                }
+                dit.set_attention_budget(attn_budget);
+                Ok((dit, None))
             }
-            Ok(dit)
         };
+        // The denoise phase (`MemoryPhase::Denoise`) opens at the expert loads, not at the first
+        // renderer `Progress::Step` — which fires only once BOTH ~28 GB experts are resident
+        // (sc-22738).
+        on_progress(Progress::Loading(LoadPhase::Renderer));
         let latents = {
-            let low_dit = load_expert("low_noise_model.safetensors")?;
+            let (low_dit, low_stream) = load_expert("low_noise_model.safetensors")?;
             if req.cancel.is_cancelled() {
                 return Err(Error::Canceled);
             }
-            let high_dit = load_expert("high_noise_model.safetensors")?;
+            let (high_dit, high_stream) = load_expert("high_noise_model.safetensors")?;
             if req.cancel.is_cancelled() {
                 return Err(Error::Canceled);
             }
@@ -941,13 +1045,19 @@ impl Bernini {
                 &pe_wotxt_wvit,
                 &pe_wotxt_wovit,
             ];
-            let low = BVitExpert::build(&low_dit, streams4)?;
-            let high = BVitExpert::build(&high_dit, streams4)?;
+            let low = BVitExpert::build(
+                Trunk::for_load(&low_dit, low_stream.as_ref(), plan.as_ref(), &req.cancel),
+                streams4,
+            )?;
+            let high = BVitExpert::build(
+                Trunk::for_load(&high_dit, high_stream.as_ref(), plan.as_ref(), &req.cancel),
+                streams4,
+            )?;
             let pf = PackedForward::new(
                 cfg.dim / cfg.num_heads,
                 cfg.out_dim,
                 cfg.patch_size,
-                self.knobs.max_trained_src_id,
+                trained_sources,
                 self.knobs.interpolate_src_id,
             );
             let boundary = self.knobs.switch_dit_boundary * cfg.num_train_timesteps as f32;
@@ -980,11 +1090,19 @@ impl Bernini {
 
         // --- Stage 4: z16 VAE decode → image / video ---
         on_progress(Progress::Decoding);
-        let out_frames = lat[1] * cfg.vae_stride.0 as i32;
-        let tiling = TilingConfig::auto(height as i32, width as i32, out_frames);
+        let (out_frames, out_height, out_width) = decoded_output_geometry(lat[1], lat[2], lat[3])?;
+        // Ladder rung 2 (sc-15528): an explicit request geometry REPLACES the shipped `auto`
+        // heuristic. Note what the A/B is here -- `auto` already tiles a large decode, so rung 2 is
+        // "this tile edge" versus "the heuristic's tile edge", not "tiled" versus "untiled". A
+        // harness that compared against an untiled decode would be measuring a composition that
+        // never shipped.
+        let tiling = match crate::memory_strategy::decode_tiling(req)? {
+            Some(explicit) => Some(explicit),
+            None => TilingConfig::auto(out_height, out_width, out_frames),
+        };
         let frames_u8 = {
             let w = Weights::from_file(self.root.join("vae.safetensors"))?;
-            let vae = WanVae::from_weights(&w)?;
+            let vae = ProviderVae::from_weights(&w)?;
             decode_to_frames(&vae, &latents, tiling.as_ref(), Some(&req.cancel))?
         };
         let images_out = frames_to_images(&frames_u8)?;
@@ -1024,6 +1142,58 @@ fn validate_conditioning_video_clips(req: &GenerationRequest) -> Result<()> {
                     frames.len()
                 )));
             }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse the [`Conditioning::VideoClip`] knobs Bernini does not implement (sc-20264).
+///
+/// Bernini consumes a `VideoClip` as a **source clip to condition on**: `collect_conditioning` /
+/// `generate_impl` VAE-encode `frames` and hand the latents to the MAR sampler as conditioning
+/// tokens. Neither of the variant's two numeric fields has a mechanism here:
+///
+/// * `strength` is the `1 − strength` denoise mask of the LTX in-context append path. Bernini's
+///   conditioning enters through the guidance mode (`omega_vid` / `omega_img` / `omega_txt`) and the
+///   ViT/VAE conditioning stack, not through a per-clip denoise mask there is anything to weight.
+/// * `frame_idx` is the output latent frame the clip is appended at. Bernini conditions on the clip
+///   as a whole and renders its own `req.frames`-length timeline from scratch — the clip is never
+///   spliced in at an offset.
+///
+/// Until sc-20264 both were read off the request and thrown away — every construction site binds
+/// `Conditioning::VideoClip { frames, .. }`. The sc-19571 rule is that a control either works or is
+/// refused with a clear error, so this is the refusal, and it fires **only on a non-default value**:
+/// the contract defaults (`strength = 1.0`, `frame_idx = 0`) pass through unchanged, which is every
+/// request SceneWorks builds today.
+///
+/// Checked over **every** clip, not the first: Bernini's multi-video modes carry several, so
+/// guarding only clip one would leave the rest silently dropped.
+///
+/// Shared by BOTH providers this crate registers — `bernini` (here) and `bernini_renderer`
+/// (`pipeline.rs`) — since they take the same conditioning through the same encode path.
+///
+/// Typed [`Error::Unsupported`], not [`Error::Msg`]: the worker classifies `Unsupported` as a
+/// user-facing invalid-payload refusal and `Msg` as an opaque internal engine failure.
+pub(crate) fn reject_unimplemented_video_clip_knobs(
+    id: &str,
+    req: &GenerationRequest,
+) -> Result<()> {
+    for clip in req.video_clips() {
+        if clip.strength != 1.0 {
+            return Err(Error::Unsupported(format!(
+                "{id} does not implement VideoClip strength (got {}); remove it or leave it at the \
+                 default 1.0 — Bernini conditions through its guidance mode and has no per-clip \
+                 denoise mask to weight",
+                clip.strength
+            )));
+        }
+        if clip.frame_idx != 0 {
+            return Err(Error::Unsupported(format!(
+                "{id} does not implement VideoClip frame_idx (got {}); remove it or leave it at \
+                 the default 0 — Bernini conditions on the clip as a whole and renders its own \
+                 timeline, so there is no position to splice it at",
+                clip.frame_idx
+            )));
         }
     }
     Ok(())
@@ -1103,16 +1273,18 @@ fn seeded_step_noise(
 mod tests {
     use super::*;
 
-    /// Component residency (epic 10834, sc-10840): Bernini advertises `supports_sequential_offload`
-    /// because it is structurally always-staged — `generate_impl` drops the planner and the T5 encoder
+    /// Component residency (epic 10834, sc-10840): Bernini is structurally always-staged —
+    /// `generate_impl` drops the planner and the T5 encoder
     /// (each + `clear_cache()`) before loading the two co-resident MoE experts, so peak unified memory
     /// is already bounded to the dominant expert phase (which the footprint reports as the DiT split).
     #[test]
-    fn advertises_sequential_offload() {
-        assert!(
-            descriptor().capabilities.supports_sequential_offload,
-            "bernini is always-staged (planner + T5 dropped before the experts); it must advertise \
-             supports_sequential_offload so the fit-gate consumes the staged footprint"
+    fn declares_unconditional_staged_residency_without_a_selectable_control() {
+        let capabilities = descriptor().capabilities;
+        assert!(!capabilities.supports_sequential_offload);
+        assert!(capabilities.unconditionally_engages_staged_residency);
+        assert_eq!(
+            capabilities.staged_residency_availability(),
+            mlx_gen::StagedResidencyAvailability::UnconditionallyEngaged,
         );
     }
 
@@ -1190,6 +1362,160 @@ mod tests {
         assert!(validate_conditioning_video_clips(&req(vec![clip(5), clip(0)])).is_err());
     }
 
+    /// sc-20264 — `VideoClip.strength` and `frame_idx` were silently dropped (every construction
+    /// site binds `VideoClip { frames, .. }`). Each is now a typed `Unsupported` naming the field
+    /// and the model, on BOTH ids this crate registers.
+    ///
+    /// Non-default values throughout: at the contract defaults the refusal must not fire, which the
+    /// companion test pins.
+    #[test]
+    fn non_default_video_clip_knobs_are_refused_by_name() {
+        let clip = |frame_idx: i32, strength: f32| Conditioning::VideoClip {
+            frames: vec![Image {
+                width: 2,
+                height: 2,
+                pixels: vec![0u8; 2 * 2 * 3],
+            }],
+            frame_idx,
+            strength,
+        };
+        let req = |c: Conditioning| GenerationRequest {
+            conditioning: vec![c],
+            ..Default::default()
+        };
+        for id in [MODEL_ID, crate::pipeline::MODEL_ID] {
+            for (conditioning, field) in [(clip(0, 0.6), "strength"), (clip(4, 1.0), "frame_idx")] {
+                let err = reject_unimplemented_video_clip_knobs(id, &req(conditioning))
+                    .expect_err("a non-default knob must be refused");
+                assert!(
+                    matches!(err, Error::Unsupported(_)),
+                    "{id}/{field}: typed Unsupported, got {err:?}"
+                );
+                let msg = err.to_string();
+                assert!(msg.contains(field), "{id}/{field}: names the field: {msg}");
+                assert!(msg.contains(id), "{id}/{field}: names the model: {msg}");
+            }
+        }
+
+        // Every clip is inspected, not just the first — the multi-video modes carry several.
+        let two_clips = GenerationRequest {
+            conditioning: vec![clip(0, 1.0), clip(7, 1.0)],
+            ..Default::default()
+        };
+        let err = reject_unimplemented_video_clip_knobs(MODEL_ID, &two_clips)
+            .expect_err("clip two's frame_idx must be refused");
+        assert!(err.to_string().contains("frame_idx"), "got: {err}");
+    }
+
+    /// A weights-free snapshot root both MLX bernini ids will `load` from.
+    ///
+    /// Unlike candle, neither MLX `load` is lazy past its config: each reads `config.json` and
+    /// rejects a non-dual-expert model before constructing the Generator, so a bare `/nonexistent`
+    /// dir silently resolves to the 5B preset and fails. A dir holding only the two-key dual-expert
+    /// `config.json` is enough — `BerniniKnobs::from_dir` treats an absent sidecar as defaults, and
+    /// no safetensors is touched until `generate`. That makes the registered `Generator` drivable
+    /// through `validate` here with no weights at all.
+    fn weightless_snapshot_root() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"model_type": "t2v", "dim": 5120, "dual_model": true}"#,
+        )
+        .expect("write config.json");
+        dir
+    }
+
+    /// sc-20264 (adversarial-review follow-up) — the refusal is pinned **through
+    /// `Generator::validate`**, not by calling the helper.
+    ///
+    /// A helper-only test leaves the wiring unbound: deleting the
+    /// `reject_unimplemented_video_clip_knobs(...)` line from either provider's validate body keeps
+    /// every helper assertion green while the knobs go back to being silently dropped. Both MLX
+    /// bernini ids are drivable weights-free off [`weightless_snapshot_root`], so this pins the real
+    /// registered `Generator` the way the candle sibling does.
+    #[test]
+    fn generator_validate_refuses_non_default_video_clip_knobs_on_both_ids() {
+        let root = weightless_snapshot_root();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_path_buf()));
+        let registry = crate::provider_registry().unwrap();
+        // 5 frames: `1 + 4·k`, so the clip clears the shape guards that run first and the refusal
+        // is what the request actually trips.
+        let clip = |frame_idx: i32, strength: f32| Conditioning::VideoClip {
+            frames: (0..5)
+                .map(|_| Image {
+                    width: 16,
+                    height: 16,
+                    pixels: vec![0u8; 16 * 16 * 3],
+                })
+                .collect(),
+            frame_idx,
+            strength,
+        };
+        let req = |c: Conditioning| GenerationRequest {
+            prompt: "a cat walking across a sunny garden".into(),
+            width: 256,
+            height: 256,
+            frames: Some(5),
+            conditioning: vec![c],
+            ..Default::default()
+        };
+        for id in [MODEL_ID, crate::pipeline::MODEL_ID] {
+            let g = registry
+                .load(id, &spec)
+                .unwrap_or_else(|e| panic!("{id}: weights-free load: {e}"));
+            for (conditioning, field) in [(clip(0, 0.6), "strength"), (clip(4, 1.0), "frame_idx")] {
+                let err = g
+                    .validate(&req(conditioning))
+                    .expect_err("a non-default knob must be refused at validate");
+                assert!(
+                    matches!(err, mlx_gen::gen_core::Error::Unsupported(_)),
+                    "{id}/{field}: typed Unsupported, got {err:?}"
+                );
+                let msg = err.to_string();
+                assert!(msg.contains(field), "{id}/{field}: names the field: {msg}");
+                assert!(msg.contains(id), "{id}/{field}: names the model: {msg}");
+            }
+            // The contract defaults must NOT be refused by this check — whatever else validate
+            // decides about the request, it must not be these fields.
+            if let Err(e) = g.validate(&req(clip(0, 1.0))) {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("does not implement VideoClip"),
+                    "{id}: default knobs must pass the refusal: {msg}"
+                );
+            }
+        }
+    }
+
+    /// sc-20264 — the refusal fires only on a value a caller actually set. The contract defaults
+    /// (`strength = 1.0`, `frame_idx = 0`) — every request SceneWorks builds today — pass through,
+    /// as does a request carrying no clip at all.
+    #[test]
+    fn default_video_clip_knobs_still_pass_unchanged() {
+        let default_clip = Conditioning::VideoClip {
+            frames: vec![Image {
+                width: 2,
+                height: 2,
+                pixels: vec![0u8; 2 * 2 * 3],
+            }],
+            frame_idx: 0,
+            strength: 1.0,
+        };
+        for id in [MODEL_ID, crate::pipeline::MODEL_ID] {
+            assert!(reject_unimplemented_video_clip_knobs(
+                id,
+                &GenerationRequest {
+                    conditioning: vec![default_clip.clone()],
+                    ..Default::default()
+                }
+            )
+            .is_ok());
+            assert!(
+                reject_unimplemented_video_clip_knobs(id, &GenerationRequest::default()).is_ok()
+            );
+        }
+    }
+
     /// `grid_tokens` = t·h·w / merge².
     #[test]
     fn grid_token_count() {
@@ -1239,6 +1565,58 @@ mod tests {
         for (s, arr) in noise.iter().enumerate() {
             let np = (schedule[s].len() as i32).max(1);
             assert_eq!(arr.shape(), &[np, 3584], "step {s} noise shape");
+        }
+    }
+
+    /// sc-22738 — the conditioning phase opens **before the planner load**, on the production
+    /// `Generator::generate` entry point, for both the still and the video route.
+    ///
+    /// Bernini used to emit no `Progress::Loading(_)` at all: the first event a caller saw was the
+    /// MAR loop's `Progress::Step`, which fires only once the ~15 GB planner is already resident,
+    /// so the conditioning phase its memory contract declares had no observable start. Driving the
+    /// registered generator off [`weightless_snapshot_root`] pins exactly that ordering — the
+    /// boundary is recorded, then the planner load fails because there are no weights. Deleting
+    /// the emit, or moving it below the load, leaves this with an empty log.
+    ///
+    /// The renderer boundary cannot be reached without the ~56 GB dual-expert stack; it is asserted
+    /// in `tests/conformance.rs`, with the rest of the real-weight progress contract.
+    #[test]
+    fn the_conditioning_phase_opens_before_the_planner_load_on_both_routes() {
+        let root = weightless_snapshot_root();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_path_buf()));
+        let generator = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .expect("weights-free load");
+
+        for frames in [1u32, 49] {
+            let req = GenerationRequest {
+                prompt: "a cat walking across a sunny garden".into(),
+                width: 256,
+                height: 256,
+                frames: Some(frames),
+                steps: Some(1),
+                ..Default::default()
+            };
+            let mut events: Vec<Progress> = Vec::new();
+            let error = generator
+                .generate(&req, &mut |p| events.push(p))
+                .expect_err("no weights: the planner load must fail");
+            assert!(
+                !matches!(error, mlx_gen::gen_core::Error::Unsupported(_)),
+                "frames={frames}: the request must reach generate_impl, not bounce off validate: \
+                 {error}"
+            );
+            assert_eq!(
+                events.len(),
+                1,
+                "frames={frames}: expected exactly the conditioning boundary, got {events:?}"
+            );
+            assert!(
+                matches!(events[0], Progress::Loading(LoadPhase::TextEncoder)),
+                "frames={frames}: got {:?}",
+                events[0]
+            );
         }
     }
 }

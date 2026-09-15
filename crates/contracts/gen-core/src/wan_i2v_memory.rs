@@ -1,0 +1,5370 @@
+//! Sealed physical and request identity shared by the native Wan2.2 I2V providers.
+//!
+//! Backend crates own registration, safety hooks, and request-scoped execution. This module keeps
+//! the deliberately identical MLX/Candle artifact ABI in one place: canonical repository/revision,
+//! exact direct-file inventory, header-derived resident facts, and ordered adapter receipts.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
+
+use crate::{
+    AdapterKind, Conditioning, GenerationRequest, LoadSpec, MemoryAssetFacts,
+    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryGeometry, MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges,
+    MemoryPhase, MemoryProviderContract, MemoryRunContext, MemorySafetyDecision, MemorySelection,
+    MemoryStrategy, MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategySupport,
+    MoeExpert, OffloadPolicy, Precision, Quant, ResidentRequestMemory, WeightsSource,
+};
+
+/// Receipt spelling for the Wan video structural evidence revision.
+///
+/// `v5` (sc-20799) inserted the request frame rate as a **plain-text** field between the mode key
+/// and the artifact identity:
+/// `wan-video-structural-v5:<mode>:fps<fps>:<artifact_identity>:<selection_receipt>:<sha256>`.
+/// The rate was always hashed, but the hash is opaque to a capture record and to
+/// [`validate_context`], so a 16-fps and a 24-fps Ti2V-5B cell were indistinguishable at the
+/// receipt surface and admission had to OR both public rate menus. With the rate readable,
+/// admission pins the exact menu and an evidence collector can key the two cells apart.
+pub const RECEIPT_VERSION: &str = "wan-video-structural-v5";
+pub const LIGHTNING_REPOSITORY: &str = "lightx2v/Wan2.2-Lightning";
+pub const LIGHTNING_REVISION: &str = "18bccf8884ec0a078eed79785eb4ef13ea16ce1e";
+pub const NATIVE_SCHEDULE: &str = "wan-flow-match-native";
+pub const DECODE_TILE_EDGES: &[u32] = &[192, 256, 384];
+pub const DECODE_OVERLAPS: &[u32] = &[64];
+/// Immutable source receipt carried beside assembled Wan-VACE artifacts.  VACE repositories ship
+/// the control transformer only; the UMT5, z16 VAE and tokenizer are separate upstream sources.
+pub const VACE_SOURCE_RECEIPT_FILE: &str = "wan-vace-source-receipt.json";
+pub const VACE_FUN_SOURCE_RECEIPT_FILE: &str = "wan-vace-fun-source-receipt.json";
+const VACE_SOURCE_RECEIPT_VERSION: &str = "wan-vace-source-receipt-v1";
+const VACE_FUN_SOURCE_RECEIPT_VERSION: &str = "wan-vace-fun-source-receipt-v1";
+const VACE_FUN_REPOSITORY: &str = "linoyts/Wan2.2-VACE-Fun-14B-diffusers";
+const VACE_FUN_REVISION: &str = "1abfb95801b7bd8f952083ebf80b93448ddb0ce4";
+const WAN21_T2V_REPOSITORY: &str = "Wan-AI/Wan2.1-T2V-14B-Diffusers";
+const WAN21_T2V_REVISION: &str = "38ec498cb3208fb688890f8cc7e94ede2cbd7f68";
+const UMT5_REPOSITORY: &str = "google/umt5-xxl";
+const UMT5_REVISION: &str = "66cb9e7e85526fe440a945569e42c72fb6cbc0ad";
+
+fn vace_source_receipt(backend: WanI2vBackend) -> serde_json::Value {
+    let (transformer_repository, transformer_revision) = match backend {
+        WanI2vBackend::Mlx => (
+            "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
+            "ec4d2cb062b548996b179d493fdd05340de702a1",
+        ),
+        WanI2vBackend::Candle => (
+            "Wan-AI/Wan2.1-VACE-14B-diffusers",
+            "db79b90c60bbb45ceec9e41b9d5a4df934538ac4",
+        ),
+    };
+    serde_json::json!({
+        "version": VACE_SOURCE_RECEIPT_VERSION,
+        "backend": backend.key(),
+        "components": [
+            {
+                "component": "transformer",
+                "repository": transformer_repository,
+                "revision": transformer_revision,
+                "sourcePath": "transformer"
+            },
+            {
+                "component": "t5_encoder",
+                "repository": WAN21_T2V_REPOSITORY,
+                "revision": WAN21_T2V_REVISION,
+                "sourcePath": "text_encoder"
+            },
+            {
+                "component": "vae",
+                "repository": WAN21_T2V_REPOSITORY,
+                "revision": WAN21_T2V_REVISION,
+                "sourcePath": "vae"
+            },
+            {
+                "component": "tokenizer",
+                "repository": UMT5_REPOSITORY,
+                "revision": UMT5_REVISION,
+                "sourcePath": "tokenizer.json"
+            }
+        ]
+    })
+}
+
+fn vace_fun_source_receipt(backend: WanI2vBackend) -> serde_json::Value {
+    serde_json::json!({
+        "version": VACE_FUN_SOURCE_RECEIPT_VERSION,
+        "backend": backend.key(),
+        "components": [
+            {"component":"high_expert","repository":VACE_FUN_REPOSITORY,"revision":VACE_FUN_REVISION,"sourcePath":"transformer"},
+            {"component":"low_expert","repository":VACE_FUN_REPOSITORY,"revision":VACE_FUN_REVISION,"sourcePath":"transformer_2"},
+            {"component":"t5_encoder","repository":WAN21_T2V_REPOSITORY,"revision":WAN21_T2V_REVISION,"sourcePath":"text_encoder"},
+            {"component":"vae","repository":WAN21_T2V_REPOSITORY,"revision":WAN21_T2V_REVISION,"sourcePath":"vae"},
+            {"component":"tokenizer","repository":UMT5_REPOSITORY,"revision":UMT5_REVISION,"sourcePath":"tokenizer.json"}
+        ]
+    })
+}
+
+/// Materialize the fixed provenance receipt once when the worker assembles or resolves the
+/// artifact.  A pre-existing divergent receipt is a supply-chain error, never a value to replace.
+pub fn ensure_wan_vace_source_receipt(root: &Path, backend: WanI2vBackend) -> crate::Result<()> {
+    let expected = serde_json::to_vec_pretty(&vace_source_receipt(backend)).map_err(|error| {
+        crate::Error::Unsupported(format!("wan_vace: cannot encode source receipt: {error}"))
+    })?;
+    let path = root.join(VACE_SOURCE_RECEIPT_FILE);
+    match std::fs::read(&path) {
+        Ok(actual) if actual == expected => Ok(()),
+        Ok(_) => Err(crate::Error::Unsupported(format!(
+            "wan_vace: immutable source receipt at {} does not match the selected backend",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::write(&path, expected)?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn ensure_wan_vace_fun_source_receipt(
+    root: &Path,
+    backend: WanI2vBackend,
+) -> crate::Result<()> {
+    let expected =
+        serde_json::to_vec_pretty(&vace_fun_source_receipt(backend)).map_err(|error| {
+            crate::Error::Unsupported(format!(
+                "wan2_2_vace_fun_14b: cannot encode source receipt: {error}"
+            ))
+        })?;
+    let path = root.join(VACE_FUN_SOURCE_RECEIPT_FILE);
+    match std::fs::read(&path) {
+        Ok(actual) if actual == expected => Ok(()),
+        Ok(_) => Err(crate::Error::Unsupported(format!(
+            "wan2_2_vace_fun_14b: immutable source receipt at {} does not match the selected backend",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::write(&path, expected)?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn vace_source_receipt_revision(root: &Path, backend: WanI2vBackend) -> crate::Result<String> {
+    let path = root.join(VACE_SOURCE_RECEIPT_FILE);
+    let actual: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path)?).map_err(|error| {
+            crate::Error::Unsupported(format!(
+                "wan_vace: invalid source receipt {}: {error}",
+                path.display()
+            ))
+        })?;
+    if actual != vace_source_receipt(backend) {
+        return Err(crate::Error::Unsupported(format!(
+            "wan_vace: source receipt {} does not name the exact immutable transformer/T5/VAE/tokenizer origins",
+            path.display()
+        )));
+    }
+    sha256_file(&path)
+}
+
+fn vace_fun_source_receipt_revision(root: &Path, backend: WanI2vBackend) -> crate::Result<String> {
+    let path = root.join(VACE_FUN_SOURCE_RECEIPT_FILE);
+    let actual: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path)?).map_err(|error| {
+            crate::Error::Unsupported(format!(
+                "wan2_2_vace_fun_14b: invalid source receipt {}: {error}",
+                path.display()
+            ))
+        })?;
+    if actual != vace_fun_source_receipt(backend) {
+        return Err(crate::Error::Unsupported(format!(
+            "wan2_2_vace_fun_14b: source receipt {} does not name the exact immutable experts/T5/VAE/tokenizer origins",
+            path.display()
+        )));
+    }
+    sha256_file(&path)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WanI2vRoute {
+    Ti2v5b,
+    /// Dual-expert A14B **text**-to-video (`wan2_2_t2v_14b`).
+    ///
+    /// It is a member of this authority for its *physical* identity, which is the I2V-A14B's
+    /// exactly: one snapshot layout, one inventory, one repository policy family, one adapter
+    /// multiplicity rule. Its *request* surface is the one thing that differs — it carries no
+    /// image conditioning at all — so it admits [`WanPublicMode::TextToVideo`] and refuses every
+    /// image-conditioned carrier (`accepts_first_last_rate`, and the `image_to_video`
+    /// arms of `request_mode` / `contract_for_mode_key` / `validate_context`, all of which
+    /// exclude it by name).
+    T2v14b,
+    I2v14b,
+    Vace,
+    VaceFun,
+}
+
+impl WanI2vRoute {
+    /// Every route this authority seals, in a fixed order.
+    ///
+    /// Sweeps derive their cell count from this instead of freezing a literal, so adding a route
+    /// without giving it a repository policy, an inventory and its own calibration cell is a
+    /// compile error or a red test rather than a silently unswept row.
+    pub const ALL: [Self; 5] = [
+        Self::Ti2v5b,
+        Self::T2v14b,
+        Self::I2v14b,
+        Self::Vace,
+        Self::VaceFun,
+    ];
+
+    pub fn for_provider(provider_id: &str) -> crate::Result<Self> {
+        match provider_id {
+            "wan2_2_ti2v_5b" => Ok(Self::Ti2v5b),
+            "wan2_2_t2v_14b" => Ok(Self::T2v14b),
+            "wan2_2_i2v_14b" => Ok(Self::I2v14b),
+            "wan_vace" => Ok(Self::Vace),
+            "wan2_2_vace_fun_14b" => Ok(Self::VaceFun),
+            _ => Err(crate::Error::Unsupported(format!(
+                "{provider_id}: not a Wan I2V memory route"
+            ))),
+        }
+    }
+
+    pub fn provider_id(self) -> &'static str {
+        match self {
+            Self::Ti2v5b => "wan2_2_ti2v_5b",
+            Self::T2v14b => "wan2_2_t2v_14b",
+            Self::I2v14b => "wan2_2_i2v_14b",
+            Self::Vace => "wan_vace",
+            Self::VaceFun => "wan2_2_vace_fun_14b",
+        }
+    }
+
+    /// Whether this route's transformer is a dual-expert MoE pair (`transformer` +
+    /// `transformer_2`, or `high_noise_model` + `low_noise_model`).
+    fn dual_expert(self) -> bool {
+        matches!(self, Self::T2v14b | Self::I2v14b | Self::VaceFun)
+    }
+
+    pub fn public_geometries(self) -> &'static [(u32, u32)] {
+        match self {
+            Self::Ti2v5b => &[(832, 480), (1280, 704), (704, 1280)],
+            // `builtin.models.jsonc` gives `wan_2_2_t2v_14b` and `wan_2_2_i2v_14b` the same
+            // `resolutions` list; they are the same A14B geometry cap (`maxPixels` 921_600).
+            Self::T2v14b | Self::I2v14b => &[(832, 480), (480, 832), (1280, 720), (720, 1280)],
+            Self::Vace | Self::VaceFun => &[(832, 480), (480, 832), (1280, 720), (720, 1280)],
+        }
+    }
+
+    /// The public `(fps, frames)` rate menu this route admits.
+    ///
+    /// `pub` since sc-22736 so a measurement harness can validate a planned video geometry against
+    /// the ENGINE's own menu instead of restating the manifest's `fps` / `durations` lists in a
+    /// second place — the two would then be free to drift, and the drift would only ever surface as
+    /// a refused capture on a host that already holds the weights.
+    pub fn accepts_rate(self, fps: u32, frames: u32) -> bool {
+        match self {
+            Self::Ti2v5b => match fps {
+                16 => [65, 81, 97, 113, 129].contains(&frames),
+                24 => [97, 121, 145, 169, 193].contains(&frames),
+                _ => false,
+            },
+            // Same `fps: [16]` / `durations: [3, 4, 5]` manifest menu as the I2V-A14B.
+            Self::T2v14b | Self::I2v14b => fps == 16 && [45, 61, 77].contains(&frames),
+            Self::Vace | Self::VaceFun => fps == 16 && [45, 61, 77].contains(&frames),
+        }
+    }
+
+    /// The first/last-frame rate menu. Only Ti2V-5B has one.
+    ///
+    /// `T2v14b` is `false` for a structural reason, not an unimplemented one: a text-to-video
+    /// route has no frame to pin at either boundary, so a first/last carrier is not a rate this
+    /// route could ever accept.
+    fn accepts_first_last_rate(self, fps: u32, frames: u32) -> bool {
+        self == Self::Ti2v5b
+            && match fps {
+                16 => [61, 77, 93, 109, 125].contains(&frames),
+                24 => [93, 117, 141, 165, 189].contains(&frames),
+                _ => false,
+            }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WanPublicMode {
+    /// The one carrier-free public mode: a prompt and nothing else. Only [`WanI2vRoute::T2v14b`]
+    /// admits it, and it is the only mode that route admits.
+    TextToVideo,
+    ImageToVideo,
+    FirstLastFrame,
+    ExtendClip,
+    VideoBridge,
+    ReplacePerson,
+}
+
+impl WanPublicMode {
+    fn key(self) -> &'static str {
+        match self {
+            Self::TextToVideo => "text_to_video",
+            Self::ImageToVideo => "image_to_video",
+            Self::FirstLastFrame => "first_last_frame",
+            Self::ExtendClip => "extend_clip",
+            Self::VideoBridge => "video_bridge",
+            Self::ReplacePerson => "replace_person",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WanI2vBackend {
+    Mlx,
+    Candle,
+}
+
+impl WanI2vBackend {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Mlx => "mlx",
+            Self::Candle => "candle",
+        }
+    }
+
+    fn realization(self) -> MemoryBackendRealization {
+        match self {
+            Self::Mlx => MemoryBackendRealization::MlxMetal {
+                bounded_wired_residency: false,
+                lazy_or_mmap_materialization: true,
+                explicit_evaluation_and_synchronization: true,
+                cache_eviction: true,
+            },
+            Self::Candle => MemoryBackendRealization::CandleCuda {
+                device_residency: true,
+                host_backed_weights: false,
+                host_to_device_block_materialization: false,
+                block_materialization: crate::MemoryWindowMaterialization::DeviceFormatTransfer,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WanAdapterReceipt {
+    pub ordinal: u32,
+    pub path: PathBuf,
+    pub kind: &'static str,
+    pub scale_bits: u32,
+    pub pass_scale_bits: Vec<u32>,
+    pub expert: &'static str,
+    pub digest: String,
+    pub source_bytes: u64,
+    pub persistent_bytes: u64,
+    pub realization: &'static str,
+    pub stability: &'static str,
+}
+
+#[derive(Clone, Debug)]
+struct SealedFile {
+    relative: String,
+    absolute: PathBuf,
+    pin: crate::PinnedWeightsFile,
+    digest: String,
+    resident_bytes: u64,
+    tensor: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct PreparedWanI2vMemory {
+    pub contract: MemoryProviderContract,
+    pub artifact_identity: String,
+    pub adapter_identity: String,
+    pub repository: &'static str,
+    pub revision: String,
+    pub tier: MemoryNumericTier,
+    pub route: WanI2vRoute,
+    pub backend: WanI2vBackend,
+    pub adapters: Vec<WanAdapterReceipt>,
+    root: PathBuf,
+    files: Vec<SealedFile>,
+}
+
+fn sha256_file(path: &Path) -> crate::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn tier(spec: &LoadSpec, backend: WanI2vBackend) -> crate::Result<MemoryNumericTier> {
+    let quant = match spec.quantize {
+        None if backend == WanI2vBackend::Mlx => match &spec.weights {
+            WeightsSource::Dir(root) => match root.file_name().and_then(|name| name.to_str()) {
+                Some("q4") => Some(Quant::Q4),
+                Some("q8") => Some(Quant::Q8),
+                Some("bf16") => None,
+                _ => None,
+            },
+            WeightsSource::File(_) => None,
+        },
+        None => None,
+        Some(Quant::Q4) => Some(Quant::Q4),
+        Some(Quant::Q8) => Some(Quant::Q8),
+        Some(other) => {
+            return Err(crate::Error::Unsupported(format!(
+                "Wan I2V memory authority does not support {other:?}"
+            )))
+        }
+    };
+    Ok(MemoryNumericTier {
+        precision: Precision::Bf16,
+        quant,
+        component_precision_floors: &[],
+    })
+}
+
+/// Sentinel [`repository_policy`] revision for a repository the SceneWorks manifest downloads
+/// **without** a `revision` key.
+///
+/// [`repository_revision`] still requires an HF-cache-shaped
+/// `models--<owner>--<name>/snapshots/<40 lowercase hex>[/ <tier>]` path and still returns the
+/// concrete snapshot id it found, which the artifact identity hashes — so the seal stays bound to
+/// exact content. What it does not do is demand one *particular* id the manifest never promised.
+///
+/// Every Candle dense leg uses it (sc-22736 review): the manifest ships all three `Wan-AI/…-Diffusers`
+/// bf16 downloads (`Wan2.2-TI2V-5B`, `Wan2.2-T2V-A14B`, `Wan2.2-I2V-A14B`) with NO `revision` key
+/// and the SceneWorks resolver binds whichever snapshot is staged, so a hard pin here is a promise
+/// the manifest never made: the cell reports `runnable` and then fails inside
+/// [`repository_revision`] mid-campaign the moment the staged snapshot is any other commit. The
+/// content pin is the snapshot id the receipt hashes, exactly as on the T2V leg. The MLX legs and
+/// every packed `SceneWorks/…-candle` tier keep their hard revisions: those the manifest DOES pin.
+const UNPINNED_UPSTREAM_REVISION: &str = "unpinned-upstream-snapshot";
+
+/// The concrete 40-hex snapshot id a synthetic fixture tree must use for a route whose policy
+/// revision is [`UNPINNED_UPSTREAM_REVISION`] — the sentinel itself is not a valid snapshot id.
+#[doc(hidden)]
+pub const FIXTURE_UNPINNED_REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// The directory name a fixture (or any caller building a synthetic snapshot tree) must use for
+/// `revision`: itself when the policy pins one, and [`FIXTURE_UNPINNED_REVISION`] when it does not.
+#[doc(hidden)]
+pub fn fixture_revision(revision: &str) -> &str {
+    if revision == UNPINNED_UPSTREAM_REVISION {
+        FIXTURE_UNPINNED_REVISION
+    } else {
+        revision
+    }
+}
+
+/// The production calibration identity this authority publishes for a **sealed** receipt.
+///
+/// Returns `None` — an opaque, unmeasurable contract — for every route whose identity is owned
+/// elsewhere or which ships no tier ladder:
+///
+/// * [`WanI2vRoute::Ti2v5b`]'s production identity belongs to the per-crate `memory_strategy`
+///   modules (`sc-19236-…-mlx-…` in `mlx-gen-wan`, `sc-19223-…-candle-…` in `candle-gen-wan`),
+///   which are the registered `MemoryRegistration::contract` for `wan_2_2` on both lanes. Minting a
+///   second string here would give one manifest cell two production identities.
+/// * The VACE routes are sealed from an artifact *receipt* rather than a tier-suffixed snapshot;
+///   the manifest ships them no q4/q8/bf16 ladder, so there is no per-tier cell to name.
+///
+/// The tier this keys on is **proven against the artifact**, not requested: `repository_revision`
+/// refuses a root whose `snapshots/<rev>/<tier>` suffix disagrees with the selected tier (and
+/// refuses any suffix at all on a Candle dense root), and `physical_resident_bytes` refuses a
+/// packed marker that does not encode the selected Q4/Q8 group-64 layout. A caller cannot reach
+/// this function with a tier the on-disk snapshot does not carry.
+pub fn production_calibration_fingerprint(
+    route: WanI2vRoute,
+    backend: WanI2vBackend,
+    tier: MemoryNumericTier,
+) -> Option<String> {
+    let (route_token, backend_token, tier_token) = a14b_cell_tokens(route, backend, tier)?;
+    Some(format!(
+        "sc-22736-{route_token}-{backend_token}-{tier_token}-v1"
+    ))
+}
+
+/// The numeric tier a load spec names on `backend`, without opening anything.
+///
+/// This is the same `tier` resolution every sealed receipt runs — MLX reads the tier off the
+/// snapshot's own directory name when `quantize` is unset, Candle reads only `quantize` — exposed
+/// so a weights-free registry surface can key on the witness selector's tier rather than
+/// reimplementing that split (sc-22736).
+pub fn spec_numeric_tier(
+    spec: &LoadSpec,
+    backend: WanI2vBackend,
+) -> crate::Result<MemoryNumericTier> {
+    tier(spec, backend)
+}
+
+/// The `(route, backend, tier)` coordinate every A14B identity minted here is keyed on, or `None`
+/// for a cell this authority does not name. [`production_calibration_fingerprint`] documents why
+/// each token is part of the key and why the other three routes are silent.
+fn a14b_cell_tokens(
+    route: WanI2vRoute,
+    backend: WanI2vBackend,
+    tier: MemoryNumericTier,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    let route_token = match route {
+        WanI2vRoute::T2v14b => "wan2-2-t2v-a14b",
+        WanI2vRoute::I2v14b => "wan2-2-i2v-a14b",
+        WanI2vRoute::Ti2v5b | WanI2vRoute::Vace | WanI2vRoute::VaceFun => return None,
+    };
+    // The backend token is load-bearing: both lanes seal the same route from *different*
+    // repositories with different layouts and different resident arithmetic, so one string across
+    // both would let a measurement taken on one lane be read as evidence for the other.
+    let backend_token = match backend {
+        WanI2vBackend::Mlx => "mlx",
+        WanI2vBackend::Candle => "candle",
+    };
+    let tier_token = match tier.quant {
+        None => "dense",
+        Some(Quant::Q4) => "q4",
+        Some(Quant::Q8) => "q8",
+        // `tier` refuses every other quant before a receipt can seal.
+        Some(_) => return None,
+    };
+    Some((route_token, backend_token, tier_token))
+}
+
+/// The **weights-free** registry-conformance identity of one A14B cell (sc-22736).
+///
+/// A catalog walk reads no artifact, so it can never prove a tier and must never publish a
+/// measurable identity. The `-weights-free-conformance-` infix puts every string minted here in a
+/// namespace no production string can enter, and the disjointness is asserted over the derived cell
+/// grid rather than over a frozen list.
+pub fn weights_free_calibration_fingerprint(
+    route: WanI2vRoute,
+    backend: WanI2vBackend,
+    tier: MemoryNumericTier,
+) -> Option<String> {
+    let (route_token, backend_token, tier_token) = a14b_cell_tokens(route, backend, tier)?;
+    Some(format!(
+        "sc-22736-{route_token}-{backend_token}-{tier_token}-weights-free-conformance-v1"
+    ))
+}
+
+/// The contract a registry catalog walk resolves for an A14B route whose root is **not**
+/// materialized (sc-22736, epic sc-22723 E1).
+///
+/// Identical in shape to the sealed contract — same strategy support, same lifecycle, same formula,
+/// same load shape — with [`MemoryAssetFacts::default`] in place of the header-derived facts and the
+/// isolated [`weights_free_calibration_fingerprint`] in place of the production identity. It touches
+/// no filesystem at all, which is the whole point: a [`crate::MemoryContractFixtureRegistration`] is
+/// consulted exactly when the weights are unavailable.
+///
+/// Only the two A14B routes are served. Ti2V-5B's weights-free fixture belongs to the per-crate
+/// `memory_strategy` modules that own its production identity, and the VACE routes register no
+/// memory strategy at all, so answering for either here would publish a second fixture for a cell
+/// that already has one.
+pub fn weights_free_contract(
+    provider_id: &str,
+    backend: WanI2vBackend,
+    spec: &LoadSpec,
+) -> crate::Result<MemoryProviderContract> {
+    let route = WanI2vRoute::for_provider(provider_id)?;
+    if !matches!(route, WanI2vRoute::T2v14b | WanI2vRoute::I2v14b) {
+        return Err(crate::Error::Unsupported(format!(
+            "{provider_id}: this authority publishes no weights-free contract for it"
+        )));
+    }
+    let tier = tier(spec, backend)?;
+    let mut contract = contract(
+        provider_id,
+        route,
+        backend,
+        spec,
+        MemoryAssetFacts::default(),
+    );
+    contract.calibration = weights_free_calibration_fingerprint(route, backend, tier)
+        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape));
+    Ok(contract)
+}
+
+/// The one public mode an A14B route admits: T2V carries nothing, I2V carries one Reference.
+///
+/// Named here rather than at three call sites so the weights-free admission surface and the
+/// weights-free behavior fixtures cannot disagree about which carrier the route takes.
+pub fn a14b_public_mode_key(route: WanI2vRoute) -> Option<&'static str> {
+    match route {
+        WanI2vRoute::T2v14b => Some("text_to_video"),
+        WanI2vRoute::I2v14b => Some("image_to_video"),
+        WanI2vRoute::Ti2v5b | WanI2vRoute::Vace | WanI2vRoute::VaceFun => None,
+    }
+}
+
+/// The single frame rate the A14B manifest menu publishes (`fps: [16]` on both routes).
+///
+/// [`WanI2vRoute::accepts_rate`] is still the authority on the `(fps, frames)` pair; this only says
+/// which of the rates that authority might admit an A14B cell actually ships, and it is asserted
+/// against `accepts_rate` rather than trusted.
+pub const A14B_PUBLIC_FPS: u32 = 16;
+
+/// Admission for an A14B route whose weights are **not** materialized (sc-22736, epic sc-22723 E1).
+///
+/// This is [`validate_context`] with exactly the artifact-bound clauses removed, and nothing else:
+///
+/// * `ensure_unchanged`, the `artifact_identity` receipt-tail prefix and the `adapter_identity`
+///   overlay comparison are all statements about a sealed snapshot, and there is no snapshot here.
+///   A weights-free context therefore carries no overlay at all rather than an overlay this
+///   function cannot check.
+/// * the receipt's embedded frame rate is likewise unavailable, so the rate menu is asked at
+///   [`A14B_PUBLIC_FPS`] — which is the only rate either A14B route's manifest ships, and
+///   `accepts_rate` still owns whether the frame count belongs to it.
+///
+/// Everything else — mode, carrier, geometry bucket, batch, PiD/phase exclusion, the selected
+/// strategy, and the whole of [`crate::standard_memory_strategy_safety_check`] (calibration ABI,
+/// fingerprint, load shape and tier) — is the same check the sealed path runs, which is what makes
+/// a registry conformance walk's mutation probes bite.
+pub fn validate_weights_free_context(
+    provider_id: &str,
+    backend: WanI2vBackend,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> crate::Result<()> {
+    let route = WanI2vRoute::for_provider(provider_id)?;
+    let Some(mode_key) = a14b_public_mode_key(route) else {
+        return Err(crate::Error::Unsupported(format!(
+            "{provider_id}: this authority has no weights-free admission surface for it"
+        )));
+    };
+    let tier = tier(spec, backend)?;
+    let geometry = context.geometry;
+    let expected_references = u32::from(route == WanI2vRoute::I2v14b);
+    if context.mode.as_key() != mode_key
+        || geometry.batch != 1
+        || geometry.reference_count != expected_references
+        || context.has_reference != (expected_references > 0)
+        || context.use_pid
+        || context.has_phases
+        || context.overlay.is_some()
+        || !route
+            .public_geometries()
+            .contains(&(geometry.width, geometry.height))
+        || !route.accepts_rate(A14B_PUBLIC_FPS, geometry.frames)
+        || !matches!(
+            context.selection.strategy,
+            MemoryStrategy::Resident
+                | MemoryStrategy::StagedResidency
+                | MemoryStrategy::BoundedDecode
+        )
+    {
+        return Err(crate::Error::Unsupported(format!(
+            "{provider_id}: crossed weights-free Wan A14B memory context"
+        )));
+    }
+    match crate::standard_memory_strategy_safety_check(contract, context, Some(tier), None) {
+        MemorySafetyDecision::Accept => Ok(()),
+        MemorySafetyDecision::Reject { reason } => Err(crate::Error::Unsupported(reason)),
+    }
+}
+
+/// A geometry every A14B cell admits, for a weights-free behavior fixture: the manifest's own
+/// default resolution at its shortest published duration.
+///
+/// Read back through [`WanI2vRoute::public_geometries`] and [`WanI2vRoute::accepts_rate`] by
+/// `a14b_weights_free_fixture_geometry_is_admissible`, so a menu change cannot leave this naming a
+/// bucket the route stopped admitting.
+pub const A14B_FIXTURE_GEOMETRY: (u32, u32, u32) = (1280, 720, 45);
+
+fn repository_policy(
+    backend: WanI2vBackend,
+    route: WanI2vRoute,
+    tier: MemoryNumericTier,
+) -> (&'static str, &'static str) {
+    match (backend, route, tier.quant) {
+        (WanI2vBackend::Mlx, WanI2vRoute::Ti2v5b, _) => (
+            "SceneWorks/wan2.2-ti2v-5b-mlx",
+            "bb1b055249614cf9d7cf4373fbdbc184b77dee88",
+        ),
+        (WanI2vBackend::Mlx, WanI2vRoute::I2v14b, _) => (
+            "SceneWorks/wan2.2-i2v-a14b-mlx",
+            "c6c786170031eccc3a1fac0f98f1ad4ff988271e",
+        ),
+        (WanI2vBackend::Mlx, WanI2vRoute::T2v14b, _) => (
+            "SceneWorks/wan2.2-t2v-a14b-mlx",
+            "991eb255c544bbb2e1f1e07da4355c2f0a5337b7",
+        ),
+        (WanI2vBackend::Candle, WanI2vRoute::Ti2v5b, Some(_)) => (
+            "SceneWorks/wan2.2-ti2v-5b-candle",
+            "9b173dc8660334a87a11e67de58939afe68f8cb2",
+        ),
+        (WanI2vBackend::Candle, WanI2vRoute::I2v14b, Some(_)) => (
+            "SceneWorks/wan2.2-i2v-a14b-candle",
+            "d01bf1ea995c01a5bc545cefb977a320c9cb9fd0",
+        ),
+        (WanI2vBackend::Candle, WanI2vRoute::T2v14b, Some(_)) => (
+            "SceneWorks/wan2.2-t2v-a14b-candle",
+            "da1909b66b360e1ea8cdeb3e39e40dca172cfa32",
+        ),
+        // The manifest pins no revision for any of the three upstream dense snapshots, so the
+        // policy names the repository and lets the snapshot id itself be the content pin — see
+        // [`UNPINNED_UPSTREAM_REVISION`].
+        (WanI2vBackend::Candle, WanI2vRoute::Ti2v5b, None) => (
+            "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+            UNPINNED_UPSTREAM_REVISION,
+        ),
+        (WanI2vBackend::Candle, WanI2vRoute::I2v14b, None) => (
+            "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+            UNPINNED_UPSTREAM_REVISION,
+        ),
+        (WanI2vBackend::Candle, WanI2vRoute::T2v14b, None) => (
+            "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+            UNPINNED_UPSTREAM_REVISION,
+        ),
+        (WanI2vBackend::Mlx, WanI2vRoute::Vace, _) => (
+            "Wan-AI/Wan2.1-VACE-1.3B-diffusers+shared-wan-components",
+            "artifact-receipt",
+        ),
+        (WanI2vBackend::Candle, WanI2vRoute::Vace, None) => {
+            ("Wan-AI/Wan2.1-VACE-14B-diffusers", "artifact-receipt")
+        }
+        (WanI2vBackend::Candle, WanI2vRoute::Vace, Some(_)) => (
+            "Wan-AI/Wan2.1-VACE-14B-diffusers",
+            "unsupported-packed-tier",
+        ),
+        (WanI2vBackend::Mlx, WanI2vRoute::VaceFun, _) => (
+            "linoyts/Wan2.2-VACE-Fun-14B-diffusers+shared-wan-components",
+            "artifact-receipt",
+        ),
+        (WanI2vBackend::Candle, WanI2vRoute::VaceFun, None) => {
+            (VACE_FUN_REPOSITORY, "artifact-receipt")
+        }
+        (WanI2vBackend::Candle, WanI2vRoute::VaceFun, Some(_)) => {
+            (VACE_FUN_REPOSITORY, "unsupported-packed-tier")
+        }
+    }
+}
+
+fn repo_dir(repository: &str) -> String {
+    format!("models--{}", repository.replace('/', "--"))
+}
+
+/// Where a converted snapshot for `route` on `backend` must live under an HF-cache-shaped `base`
+/// for the dense (bf16) tier to pass [`PreparedWanI2vMemory::prepare`]'s repository/revision check:
+/// `<base>/models--<owner>--<name>/snapshots/<pinned revision>[/bf16]`.
+///
+/// The VACE routes carry an artifact receipt instead of a pinned revision, so any directory is a
+/// valid root for them and `base.join("vace")` is returned.
+///
+/// Test-support only: the backend crates' loaded-contract tests seal a receipt over a tiny synthetic
+/// snapshot, and this is the one piece of the layout they cannot express through the public API.
+#[doc(hidden)]
+pub fn fixture_snapshot_root(base: &Path, backend: WanI2vBackend, route: WanI2vRoute) -> PathBuf {
+    if matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) {
+        return base.join("vace");
+    }
+    let tier = MemoryNumericTier {
+        precision: Precision::Bf16,
+        quant: None,
+        component_precision_floors: &[],
+    };
+    let (repository, revision) = repository_policy(backend, route, tier);
+    let root = base
+        .join(repo_dir(repository))
+        .join("snapshots")
+        .join(fixture_revision(revision));
+    match backend {
+        WanI2vBackend::Mlx => root.join("bf16"),
+        WanI2vBackend::Candle => root,
+    }
+}
+
+fn repository_revision(
+    root: &Path,
+    repository: &str,
+    expected_revision: &str,
+    tier: MemoryNumericTier,
+    backend: WanI2vBackend,
+) -> crate::Result<String> {
+    let canonical = std::fs::canonicalize(root)?;
+    let parts = canonical
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let marker = repo_dir(repository);
+    let Some(index) = parts.iter().position(|part| part == &marker) else {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: weights are not from canonical repository {repository}",
+            root.display()
+        )));
+    };
+    if parts.get(index + 1).map(String::as_str) != Some("snapshots") {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: canonical repository path is not a snapshot",
+            root.display()
+        )));
+    }
+    let revision = parts.get(index + 2).cloned().unwrap_or_default();
+    // An unpinned upstream repository still has to be a well-formed HF snapshot; only the
+    // *identity* of the snapshot is left to the artifact rather than to this table.
+    let revision_matches =
+        expected_revision == UNPINNED_UPSTREAM_REVISION || revision == expected_revision;
+    if !revision_matches
+        || revision.len() != 40
+        || !revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: revision does not match immutable {repository}@{expected_revision}",
+            root.display()
+        )));
+    }
+    let expected_suffix = match tier.quant {
+        Some(Quant::Q4) => Some("q4"),
+        Some(Quant::Q8) => Some("q8"),
+        None if backend == WanI2vBackend::Mlx => Some("bf16"),
+        None => None,
+        _ => unreachable!("tier validated"),
+    };
+    let suffix = parts.get(index + 3).map(String::as_str);
+    if suffix != expected_suffix
+        || index + 3 + usize::from(expected_suffix.is_some()) != parts.len()
+    {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: snapshot suffix does not match selected {:?} tier",
+            root.display(),
+            tier.quant
+        )));
+    }
+    Ok(revision)
+}
+
+fn walk_safetensors(root: &Path) -> crate::Result<Vec<PathBuf>> {
+    fn walk(root: &Path, at: &Path, output: &mut Vec<PathBuf>) -> crate::Result<()> {
+        for entry in std::fs::read_dir(at)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            let path = entry.path();
+            if ty.is_symlink() && std::fs::metadata(&path)?.is_dir() {
+                return Err(crate::Error::Unsupported(format!(
+                    "directory symlink is not permitted in Wan inventory: {}",
+                    path.display()
+                )));
+            }
+            if std::fs::metadata(&path)?.is_dir() {
+                walk(root, &path, output)?;
+            } else if path.extension().and_then(|value| value.to_str()) == Some("safetensors") {
+                output.push(path.strip_prefix(root).unwrap_or(&path).to_path_buf());
+            }
+        }
+        Ok(())
+    }
+    let mut output = Vec::new();
+    walk(root, root, &mut output)?;
+    output.sort();
+    Ok(output)
+}
+
+fn validate_mlx_inventory(root: &Path, route: WanI2vRoute) -> crate::Result<Vec<PathBuf>> {
+    if matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) {
+        for required in [
+            "t5_encoder.safetensors",
+            "vae.safetensors",
+            "tokenizer.json",
+        ] {
+            if !root.join(required).is_file() {
+                return Err(crate::Error::Unsupported(format!(
+                    "wan_vace: missing required MLX component {required}"
+                )));
+            }
+        }
+        if !root.join("transformer/config.json").is_file() {
+            return Err(crate::Error::Unsupported(
+                "wan_vace: missing transformer/config.json".to_owned(),
+            ));
+        }
+        if route == WanI2vRoute::VaceFun && !root.join("transformer_2/config.json").is_file() {
+            return Err(crate::Error::Unsupported(
+                "wan2_2_vace_fun_14b: missing transformer_2/config.json".to_owned(),
+            ));
+        }
+        let actual = walk_safetensors(root)?;
+        let has_transformer = actual.iter().any(|relative| {
+            relative == Path::new("model.safetensors")
+                || relative == Path::new("high_noise_model.safetensors")
+                || relative.starts_with(Path::new("transformer"))
+        });
+        let has_low_expert = route != WanI2vRoute::VaceFun
+            || actual.iter().any(|relative| {
+                relative == Path::new("low_noise_model.safetensors")
+                    || relative.starts_with(Path::new("transformer_2"))
+            });
+        if !has_transformer
+            || !has_low_expert
+            || !actual.contains(&PathBuf::from("t5_encoder.safetensors"))
+            || !actual.contains(&PathBuf::from("vae.safetensors"))
+        {
+            return Err(crate::Error::Unsupported(
+                "wan_vace: incomplete MLX transformer/T5/VAE tensor inventory".to_owned(),
+            ));
+        }
+        return Ok(actual);
+    }
+    let expected: &[&str] = match route {
+        WanI2vRoute::Ti2v5b => &[
+            "model.safetensors",
+            "t5_encoder.safetensors",
+            "vae.safetensors",
+        ],
+        WanI2vRoute::T2v14b | WanI2vRoute::I2v14b => &[
+            "high_noise_model.safetensors",
+            "low_noise_model.safetensors",
+            "t5_encoder.safetensors",
+            "vae.safetensors",
+        ],
+        WanI2vRoute::Vace => unreachable!("handled above"),
+        WanI2vRoute::VaceFun => unreachable!("handled above"),
+    };
+    for required in ["config.json", "tokenizer.json"] {
+        if !root.join(required).is_file() {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: missing required direct file {required}",
+                route.provider_id()
+            )));
+        }
+    }
+    let actual = walk_safetensors(root)?;
+    let expected = expected.iter().map(PathBuf::from).collect::<Vec<_>>();
+    if actual != expected {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: incomplete or extra MLX tensor inventory (expected {expected:?}, got {actual:?})",
+            route.provider_id()
+        )));
+    }
+    Ok(actual)
+}
+
+fn validate_component_inventory(root: &Path, component: &str) -> crate::Result<Vec<PathBuf>> {
+    let dir = root.join(component);
+    if !dir.join("config.json").is_file() {
+        return Err(crate::Error::Unsupported(format!(
+            "Wan Candle inventory is missing {component}/config.json"
+        )));
+    }
+    let actual = walk_safetensors(&dir)?;
+    if actual.is_empty() {
+        return Err(crate::Error::Unsupported(format!(
+            "Wan Candle inventory has no tensors under {component}/"
+        )));
+    }
+    let indexes = std::fs::read_dir(&dir)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.ends_with(".safetensors.index.json"))
+        })
+        .collect::<Vec<_>>();
+    if indexes.len() > 1 {
+        return Err(crate::Error::Unsupported(format!(
+            "Wan Candle {component}/ has multiple shard indexes"
+        )));
+    }
+    if let Some(index) = indexes.first() {
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(index)?).map_err(|error| {
+                crate::Error::Unsupported(format!(
+                    "invalid shard index {}: {error}",
+                    index.display()
+                ))
+            })?;
+        let expected = value
+            .get("weight_map")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                crate::Error::Unsupported(format!("invalid shard index {}", index.display()))
+            })?
+            .values()
+            .filter_map(serde_json::Value::as_str)
+            .map(PathBuf::from)
+            .collect::<BTreeSet<_>>();
+        let actual_set = actual.iter().cloned().collect::<BTreeSet<_>>();
+        if expected != actual_set {
+            return Err(crate::Error::Unsupported(format!(
+                "Wan Candle {component}/ shard index does not cover its exact tensor inventory"
+            )));
+        }
+    } else if actual.len() != 1 {
+        return Err(crate::Error::Unsupported(format!(
+            "Wan Candle {component}/ has multiple tensors without one authoritative shard index"
+        )));
+    }
+    Ok(actual
+        .into_iter()
+        .map(|relative| PathBuf::from(component).join(relative))
+        .collect())
+}
+
+fn validate_candle_inventory(root: &Path, route: WanI2vRoute) -> crate::Result<Vec<PathBuf>> {
+    if !root.join("tokenizer/tokenizer.json").is_file()
+        || (!matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun)
+            && !root.join("model_index.json").is_file())
+    {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: incomplete Candle model/tokenizer inventory",
+            route.provider_id()
+        )));
+    }
+    let components: &[&str] = match route {
+        WanI2vRoute::Ti2v5b => &["text_encoder", "transformer", "vae"],
+        WanI2vRoute::T2v14b | WanI2vRoute::I2v14b => {
+            &["text_encoder", "transformer", "transformer_2", "vae"]
+        }
+        WanI2vRoute::Vace => &["text_encoder", "transformer", "vae"],
+        WanI2vRoute::VaceFun => &["text_encoder", "transformer", "transformer_2", "vae"],
+    };
+    let mut inventory = Vec::new();
+    for component in components {
+        inventory.extend(validate_component_inventory(root, component)?);
+    }
+    let actual = walk_safetensors(root)?;
+    inventory.sort();
+    if actual != inventory {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: incomplete or extra Candle tensor inventory",
+            route.provider_id()
+        )));
+    }
+    Ok(inventory)
+}
+
+fn structural_files(
+    root: &Path,
+    backend: WanI2vBackend,
+    route: WanI2vRoute,
+) -> crate::Result<Vec<PathBuf>> {
+    if matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) {
+        let mut files = match backend {
+            WanI2vBackend::Mlx => vec![
+                PathBuf::from("transformer/config.json"),
+                PathBuf::from("tokenizer.json"),
+            ],
+            WanI2vBackend::Candle => vec![
+                PathBuf::from("transformer/config.json"),
+                PathBuf::from("text_encoder/config.json"),
+                PathBuf::from("vae/config.json"),
+                PathBuf::from("tokenizer/tokenizer.json"),
+            ],
+        };
+        if route == WanI2vRoute::VaceFun {
+            files.push(PathBuf::from("transformer_2/config.json"));
+            files.push(PathBuf::from(VACE_FUN_SOURCE_RECEIPT_FILE));
+        } else {
+            files.push(PathBuf::from(VACE_SOURCE_RECEIPT_FILE));
+        }
+        fn collect_indexes(root: &Path, at: &Path, files: &mut Vec<PathBuf>) -> crate::Result<()> {
+            for entry in std::fs::read_dir(at)? {
+                let path = entry?.path();
+                if std::fs::metadata(&path)?.is_dir() {
+                    collect_indexes(root, &path, files)?;
+                } else if path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| name.ends_with(".safetensors.index.json"))
+                {
+                    files.push(path.strip_prefix(root).unwrap_or(&path).to_path_buf());
+                }
+            }
+            Ok(())
+        }
+        collect_indexes(root, root, &mut files)?;
+        files.sort();
+        files.dedup();
+        if let Some(missing) = files.iter().find(|relative| !root.join(relative).is_file()) {
+            return Err(crate::Error::Unsupported(format!(
+                "missing Wan VACE structural file {}",
+                missing.display()
+            )));
+        }
+        return Ok(files);
+    }
+    let mut files = match backend {
+        WanI2vBackend::Mlx => vec![
+            PathBuf::from("config.json"),
+            PathBuf::from("tokenizer.json"),
+        ],
+        WanI2vBackend::Candle => {
+            let components: &[&str] = match route {
+                WanI2vRoute::Ti2v5b => &["text_encoder", "transformer", "vae"],
+                WanI2vRoute::T2v14b | WanI2vRoute::I2v14b => {
+                    &["text_encoder", "transformer", "transformer_2", "vae"]
+                }
+                WanI2vRoute::Vace => unreachable!("handled above"),
+                WanI2vRoute::VaceFun => unreachable!("handled above"),
+            };
+            let mut paths = vec![
+                PathBuf::from("model_index.json"),
+                PathBuf::from("tokenizer/tokenizer.json"),
+            ];
+            paths.extend(
+                components
+                    .iter()
+                    .map(|component| PathBuf::from(component).join("config.json")),
+            );
+            paths
+        }
+    };
+    if backend == WanI2vBackend::Candle {
+        fn find_indexes(root: &Path, at: &Path, output: &mut Vec<PathBuf>) -> crate::Result<()> {
+            for entry in std::fs::read_dir(at)? {
+                let path = entry?.path();
+                if std::fs::metadata(&path)?.is_dir() {
+                    find_indexes(root, &path, output)?;
+                } else if path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| name.ends_with(".safetensors.index.json"))
+                {
+                    output.push(path.strip_prefix(root).unwrap_or(&path).to_path_buf());
+                }
+            }
+            Ok(())
+        }
+        find_indexes(root, root, &mut files)?;
+        if let Some(quant) = match root.file_name().and_then(|name| name.to_str()) {
+            Some("q4") => Some(Quant::Q4),
+            Some("q8") => Some(Quant::Q8),
+            _ => None,
+        } {
+            let components: &[&str] = match route {
+                WanI2vRoute::Ti2v5b => &["transformer"],
+                WanI2vRoute::T2v14b | WanI2vRoute::I2v14b => &["transformer", "transformer_2"],
+                WanI2vRoute::Vace => unreachable!("handled above"),
+                WanI2vRoute::VaceFun => unreachable!("handled above"),
+            };
+            for component in components {
+                let marker = PathBuf::from(component).join("quantize_config.json");
+                let value: serde_json::Value = serde_json::from_slice(&std::fs::read(
+                    root.join(&marker),
+                )?)
+                .map_err(|error| {
+                    crate::Error::Unsupported(format!(
+                        "invalid Wan packed marker {}: {error}",
+                        marker.display()
+                    ))
+                })?;
+                let bits = value.get("bits").and_then(serde_json::Value::as_u64);
+                let group = value
+                    .get("quantization")
+                    .and_then(|value| value.get("group_size"))
+                    .and_then(serde_json::Value::as_u64);
+                if bits != Some(quant.bits() as u64) || group != Some(64) {
+                    return Err(crate::Error::Unsupported(format!(
+                        "Wan packed marker {} does not match the selected Q{} group-64 tier",
+                        marker.display(),
+                        quant.bits()
+                    )));
+                }
+                files.push(marker);
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    if let Some(missing) = files.iter().find(|relative| !root.join(relative).is_file()) {
+        return Err(crate::Error::Unsupported(format!(
+            "missing Wan structural file {}",
+            missing.display()
+        )));
+    }
+    Ok(files)
+}
+
+fn component_for(route: WanI2vRoute, relative: &str) -> MemoryPhase {
+    if relative.contains("t5_encoder") || relative.starts_with("text_encoder/") {
+        MemoryPhase::Conditioning
+    } else if relative.contains("vae") {
+        MemoryPhase::Decode
+    } else {
+        let _ = route;
+        MemoryPhase::Denoise
+    }
+}
+
+fn tensor_elements(
+    path: &Path,
+    header: &crate::weightsmeta::SafetensorsTensorHeader,
+) -> crate::Result<u64> {
+    let elements = header.shape.iter().try_fold(1_u64, |total, &dimension| {
+        total
+            .checked_mul(u64::try_from(dimension).map_err(|_| {
+                crate::Error::Msg(format!(
+                    "{} tensor shape is not representable",
+                    path.display()
+                ))
+            })?)
+            .ok_or_else(|| crate::Error::Msg(format!("{} tensor shape overflows", path.display())))
+    })?;
+    let stored = elements
+        .checked_mul(header.dtype.size() as u64)
+        .ok_or_else(|| crate::Error::Msg(format!("{} tensor bytes overflow", path.display())))?;
+    if stored != header.data_bytes || stored == 0 {
+        return Err(crate::Error::Unsupported(format!(
+            "{} tensor {} has crossed dtype/shape/data geometry",
+            path.display(),
+            header.name
+        )));
+    }
+    Ok(elements)
+}
+
+fn projected_dense_bytes(path: &Path, resident_width: u64) -> crate::Result<u64> {
+    let headers = crate::weightsmeta::safetensors_path_tensor_headers(path)?;
+    if headers.is_empty() {
+        return Err(crate::Error::Unsupported(format!(
+            "{} contains no tensors",
+            path.display()
+        )));
+    }
+    headers.into_iter().try_fold(0_u64, |sum, header| {
+        if !header.is_float()
+            || header.name.ends_with(".scales")
+            || header.name.ends_with(".biases")
+        {
+            return Err(crate::Error::Unsupported(format!(
+                "{} dense tensor {} has unsupported packed/non-float storage",
+                path.display(),
+                header.name
+            )));
+        }
+        let bytes = tensor_elements(path, &header)?
+            .checked_mul(resident_width)
+            .ok_or_else(|| crate::Error::Msg("Wan projected tensor bytes overflow".to_owned()))?;
+        sum.checked_add(bytes)
+            .ok_or_else(|| crate::Error::Msg("Wan tensor byte total overflow".to_owned()))
+    })
+}
+
+fn stored_tensor_bytes(path: &Path) -> crate::Result<u64> {
+    let headers = crate::weightsmeta::safetensors_path_tensor_headers(path)?;
+    if headers.is_empty() {
+        return Err(crate::Error::Unsupported(format!(
+            "{} contains no tensors",
+            path.display()
+        )));
+    }
+    headers.into_iter().try_fold(0_u64, |total, header| {
+        tensor_elements(path, &header).and_then(|_| {
+            total
+                .checked_add(header.data_bytes)
+                .ok_or_else(|| crate::Error::Msg("Wan stored tensor bytes overflow".to_owned()))
+        })
+    })
+}
+
+fn packed_transformer_bytes(
+    path: &Path,
+    quant: Quant,
+    backend: WanI2vBackend,
+) -> crate::Result<u64> {
+    const GROUP: usize = 64;
+    let headers = crate::weightsmeta::safetensors_path_tensor_headers(path)?;
+    let tensors = headers
+        .into_iter()
+        .map(|header| (header.name.clone(), header))
+        .collect::<BTreeMap<_, _>>();
+    let mut packed_bases = BTreeSet::new();
+    let mut packed = 0_u64;
+    for weight in tensors
+        .values()
+        .filter(|header| header.name.ends_with(".weight") && header.shape.len() == 2)
+    {
+        let base = weight.name.strip_suffix(".weight").expect("suffix checked");
+        // A 2-D `.weight` that is stored float AND carries no quant metadata at all is dense by
+        // pipeline convention, not a packed tensor that lost its leaves: the converter leaves the
+        // output projection (`head.head`) dense BF16 on every packed tier of the shipped rehosts
+        // (`SceneWorks/wan2.2-i2v-a14b-mlx`, `wan2.2-t2v-a14b-mlx`). Skip it here and let the dense
+        // residual pass below price it at the resident float width, exactly as it already prices
+        // every non-2-D dense tensor.
+        //
+        // The discriminator is deliberately conjunctive so genuine corruption still fails closed:
+        // a `U32` weight is unambiguously packed storage and must carry both leaves, and a weight
+        // with a lone `.scales` or `.biases` sibling is a packed tensor missing metadata. Either
+        // case falls through to the errors below.
+        let has_scales = tensors.contains_key(&format!("{base}.scales"));
+        let has_biases = tensors.contains_key(&format!("{base}.biases"));
+        if weight.is_float() && !has_scales && !has_biases {
+            continue;
+        }
+        let scales = tensors.get(&format!("{base}.scales")).ok_or_else(|| {
+            crate::Error::Unsupported(format!("{} packed {base} lacks scales", path.display()))
+        })?;
+        let biases = tensors.get(&format!("{base}.biases")).ok_or_else(|| {
+            crate::Error::Unsupported(format!("{} packed {base} lacks biases", path.display()))
+        })?;
+        if weight.dtype != crate::weightsmeta::Dtype::U32
+            || !scales.is_float()
+            || !biases.is_float()
+            || scales.shape != biases.shape
+            || scales.shape.len() != 2
+            || scales.shape.first() != weight.shape.first()
+        {
+            return Err(crate::Error::Unsupported(format!(
+                "{} packed {base} has invalid typed geometry",
+                path.display()
+            )));
+        }
+        let input = scales.shape[1]
+            .checked_mul(GROUP)
+            .ok_or_else(|| crate::Error::Msg("Wan packed input overflow".to_owned()))?;
+        let packed_bits = weight.shape[1]
+            .checked_mul(32)
+            .and_then(|bits| bits.checked_div(input))
+            .ok_or_else(|| {
+                crate::Error::Unsupported("Wan packed width is inconsistent".to_owned())
+            })?;
+        if input == 0 || packed_bits != quant.bits() as usize {
+            return Err(crate::Error::Unsupported(format!(
+                "{} packed {base} does not encode Q{} group-64",
+                path.display(),
+                quant.bits()
+            )));
+        }
+        let elements = u64::try_from(weight.shape[0])
+            .ok()
+            .and_then(|rows| {
+                u64::try_from(input)
+                    .ok()
+                    .and_then(|cols| rows.checked_mul(cols))
+            })
+            .ok_or_else(|| crate::Error::Msg("Wan packed element count overflow".to_owned()))?;
+        if !elements.is_multiple_of(32) {
+            return Err(crate::Error::Unsupported(
+                "Wan packed element count is not block aligned".to_owned(),
+            ));
+        }
+        let bytes = match backend {
+            WanI2vBackend::Mlx => weight
+                .data_bytes
+                .checked_add(scales.data_bytes)
+                .and_then(|sum| sum.checked_add(biases.data_bytes)),
+            WanI2vBackend::Candle => elements
+                .checked_div(32)
+                .and_then(|blocks| blocks.checked_mul(if quant == Quant::Q4 { 20 } else { 34 })),
+        }
+        .ok_or_else(|| crate::Error::Msg("Wan packed resident bytes overflow".to_owned()))?;
+        packed = packed
+            .checked_add(bytes)
+            .ok_or_else(|| crate::Error::Msg("Wan packed resident total overflow".to_owned()))?;
+        packed_bases.insert(base.to_owned());
+    }
+    if packed_bases.is_empty() {
+        return Err(crate::Error::Unsupported(format!(
+            "{} has no packed transformer weights",
+            path.display()
+        )));
+    }
+    let dense = tensors.values().try_fold(0_u64, |total, header| {
+        if header.name.ends_with(".scales") || header.name.ends_with(".biases") {
+            let base = header
+                .name
+                .strip_suffix(".scales")
+                .or_else(|| header.name.strip_suffix(".biases"))
+                .expect("suffix checked");
+            if !packed_bases.contains(base) {
+                return Err(crate::Error::Unsupported(format!(
+                    "{} has orphan packed leaf {}",
+                    path.display(),
+                    header.name
+                )));
+            }
+            return Ok(total);
+        }
+        if header
+            .name
+            .strip_suffix(".weight")
+            .is_some_and(|base| packed_bases.contains(base))
+        {
+            return Ok(total);
+        }
+        if !header.is_float() {
+            return Err(crate::Error::Unsupported(format!(
+                "{} has unaccounted non-float tensor {}",
+                path.display(),
+                header.name
+            )));
+        }
+        let bytes = tensor_elements(path, header)?
+            .checked_mul(2)
+            .ok_or_else(|| crate::Error::Msg("Wan dense residual bytes overflow".to_owned()))?;
+        total
+            .checked_add(bytes)
+            .ok_or_else(|| crate::Error::Msg("Wan dense residual total overflow".to_owned()))
+    })?;
+    packed
+        .checked_add(dense)
+        .ok_or_else(|| crate::Error::Msg("Wan transformer resident bytes overflow".to_owned()))
+}
+
+fn physical_resident_bytes(
+    path: &Path,
+    backend: WanI2vBackend,
+    route: WanI2vRoute,
+    tier: MemoryNumericTier,
+    phase: MemoryPhase,
+) -> crate::Result<u64> {
+    if matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) && phase == MemoryPhase::Denoise {
+        // VACE's public q4/q8 tiers are selected at load but materialized from the sealed dense
+        // diffusers transformer after adapter folding. Charge the complete dense construction
+        // surface rather than pretending the on-disk artifact is prepacked.
+        //
+        // SC-22667: this arm is scoped to the **denoise** component, which is the only one the
+        // sentence above is about. It used to return for every phase of a VACE route, which routed
+        // the route's decoder past the `Decode` arm below and priced a VAE that `model_vace.rs` /
+        // `model_vace_fun.rs` open at `VAE_DTYPE = DType::F32` as if it were materialized bf16 —
+        // half the bytes the render actually holds.
+        return projected_dense_bytes(path, 2);
+    }
+    match (phase, tier.quant) {
+        (MemoryPhase::Denoise, Some(quant)) => packed_transformer_bytes(path, quant, backend),
+        // The UMT5 encoder is packed at load on every MLX-affine quantized tier (sc-12831): the
+        // seven attention/FFN projections per block go to the Q8 floor `model::effective_te_quant`
+        // resolves, while the token embedding, the per-block norms and position-bias tables and the
+        // final norm stay dense. Charging the dense bf16 projection stack here — which is what the
+        // `_` arm below did — over-declared the largest staged component of the 5B and 14B routes
+        // by the whole packing win (measured 11.83 -> 7.72 GiB on the 5B).
+        (MemoryPhase::Conditioning, Some(quant))
+            if backend == WanI2vBackend::Mlx && matches!(quant, Quant::Q4 | Quant::Q8) =>
+        {
+            mlx_text_encoder_bytes(path, Some(MLX_TE_QUANT_BITS))
+        }
+        // The dense MLX tier keeps the seven projections bf16, but `Umt5Block::from_weights` and
+        // `assemble` upcast the same leaves on BOTH paths (`text_encoder.rs`: `norm1`, `norm2`, the
+        // per-layer `pos_embedding` table and the final `norm` are `as_dtype(Float32)` regardless of
+        // quant), so the dense arm prices those four leaves f32 too (SC-22667 review).
+        (MemoryPhase::Conditioning, None) if backend == WanI2vBackend::Mlx => {
+            mlx_text_encoder_bytes(path, None)
+        }
+        (MemoryPhase::Decode, _) => projected_dense_bytes(
+            path,
+            if backend == WanI2vBackend::Candle && candle_decodes_f32(route) {
+                4
+            } else {
+                2
+            },
+        ),
+        _ => projected_dense_bytes(path, 2),
+    }
+}
+
+/// Whether the **candle** provider for `route` opens its video autoencoder f32.
+///
+/// Three of the four do — `lib.rs` (TI2V-5B), `model_vace.rs` and `model_vace_fun.rs` all pin
+/// `VAE_DTYPE = DType::F32` — while `wan14b.rs` pins bf16 for the I2V-14B route (sc-12818). The
+/// split is per crate module rather than per family, so it is enumerated rather than derived.
+fn candle_decodes_f32(route: WanI2vRoute) -> bool {
+    match route {
+        WanI2vRoute::Ti2v5b | WanI2vRoute::Vace | WanI2vRoute::VaceFun => true,
+        // `wan14b.rs` is the module behind BOTH A14B routes, and it pins bf16 for both.
+        WanI2vRoute::T2v14b | WanI2vRoute::I2v14b => false,
+    }
+}
+
+/// The width `mlx_gen_wan::model::effective_te_quant` floors the UMT5 encoder to whenever the DiT
+/// is on an MLX-affine quantized tier. It is deliberately **not** the DiT's own width: Q4 costs the
+/// encoder measurable prompt fidelity, so the encoder floors at Q8 for a Q4 DiT as well.
+const MLX_TE_QUANT_BITS: u64 = 8;
+
+/// MLX affine group size, the same 64 [`packed_transformer_bytes`] assumes.
+const MLX_GROUP: u64 = 64;
+
+/// Bytes the MLX loader materializes for the UMT5 text encoder — packed to `packed_bits` on a
+/// quantized tier, dense bf16 projections on the dense tier (`None`).
+///
+/// `mlx_gen_wan::text_encoder` packs exactly the seven bias-less projections of each block —
+/// `attn.{q,k,v,o}` and `ffn.{gate_proj,fc1,fc2}` — into an MLX affine triple on a quantized tier,
+/// and leaves everything else dense. The families are priced separately because they materialize at
+/// different widths, and the f32 family does so **on both tiers** (`Umt5Block::from_weights` and
+/// `assemble` upcast unconditionally, before `quantize` runs):
+///
+/// * a packed `[out, in]` projection becomes `out * in * bits / 8` code bytes plus a `scales` and a
+///   `biases` plane of `out * in / group` elements each, at the source tensor's own width; on the
+///   dense tier the same projection is the shared `quant::lin` dense arm — its stored bf16 bytes;
+/// * the per-block norms, the position-bias tables and the final `norm.weight` are upcast to **f32**
+///   by the loader (`as_dtype(Dtype::Float32)`), so they are priced at 4 bytes per element rather
+///   than at their stored bf16 width — on the dense tier as much as on a packed one;
+/// * `token_embedding.weight` is cloned as stored — the loader never casts it — so it contributes
+///   its stored bytes.
+///
+/// On a quantized tier this fails closed on any key outside those families, and on a packed
+/// projection whose input width is not a whole number of groups: either means the encoder layout
+/// moved and this pricing no longer describes what loads. The dense tier has no packing geometry to
+/// get wrong, so a leaf outside the families keeps the `projected_dense_bytes(path, 2)` treatment
+/// it always had (float at 2 B per element; packed/non-float storage refused).
+fn mlx_text_encoder_bytes(path: &Path, packed_bits: Option<u64>) -> crate::Result<u64> {
+    const PACKED_LEAVES: [&str; 7] = [
+        ".attn.q.weight",
+        ".attn.k.weight",
+        ".attn.v.weight",
+        ".attn.o.weight",
+        ".ffn.gate_proj.weight",
+        ".ffn.fc1.weight",
+        ".ffn.fc2.weight",
+    ];
+    const F32_LEAVES: [&str; 3] = [
+        ".norm1.weight",
+        ".norm2.weight",
+        ".pos_embedding.embedding.weight",
+    ];
+
+    let headers = crate::weightsmeta::safetensors_path_tensor_headers(path)?;
+    if headers.is_empty() {
+        return Err(crate::Error::Unsupported(format!(
+            "{} contains no tensors",
+            path.display()
+        )));
+    }
+    headers.iter().try_fold(0_u64, |sum, header| {
+        let name = header.name.as_str();
+        let projection =
+            name.starts_with("blocks.") && PACKED_LEAVES.iter().any(|leaf| name.ends_with(leaf));
+        let bytes = if let (true, Some(bits)) = (projection, packed_bits) {
+            let [out, input] = header.shape[..] else {
+                return Err(crate::Error::Unsupported(format!(
+                    "{} packed projection {name} is not a 2-D weight",
+                    path.display()
+                )));
+            };
+            let (out, input) = (out as u64, input as u64);
+            if input == 0 || !input.is_multiple_of(MLX_GROUP) {
+                return Err(crate::Error::Unsupported(format!(
+                    "{} projection {name} has {input} input columns, not a whole number of \
+                     {MLX_GROUP}-wide affine groups",
+                    path.display()
+                )));
+            }
+            let elements = tensor_elements(path, header)?;
+            let codes = elements
+                .checked_mul(bits)
+                .and_then(|bits| bits.checked_div(8))
+                .ok_or_else(|| {
+                    crate::Error::Msg("Wan packed encoder code bytes overflow".to_owned())
+                })?;
+            // One `scales` and one `biases` plane, each `[out, input / group]` at the source width.
+            let planes = out
+                .checked_mul(input / MLX_GROUP)
+                .and_then(|entries| entries.checked_mul(2))
+                .and_then(|entries| entries.checked_mul(header.dtype.size() as u64))
+                .ok_or_else(|| {
+                    crate::Error::Msg("Wan packed encoder scale bytes overflow".to_owned())
+                })?;
+            codes.checked_add(planes).ok_or_else(|| {
+                crate::Error::Msg("Wan packed encoder projection bytes overflow".to_owned())
+            })?
+        } else if projection {
+            // The dense tier: `quant::lin`'s dense arm loads the projection as stored (bf16).
+            header.data_bytes
+        } else if name == "norm.weight"
+            || (name.starts_with("blocks.") && F32_LEAVES.iter().any(|leaf| name.ends_with(leaf)))
+        {
+            tensor_elements(path, header)?
+                .checked_mul(4)
+                .ok_or_else(|| {
+                    crate::Error::Msg("Wan encoder f32 tensor bytes overflow".to_owned())
+                })?
+        } else if name == "token_embedding.weight" {
+            header.data_bytes
+        } else if packed_bits.is_none() {
+            // The dense tier has no packing geometry to get wrong, so a leaf outside the named
+            // families is what `projected_dense_bytes(path, 2)` always made of it: a float tensor
+            // at 2 B per element, and a refusal for packed/non-float storage.
+            if !header.is_float() || name.ends_with(".scales") || name.ends_with(".biases") {
+                return Err(crate::Error::Unsupported(format!(
+                    "{} dense tensor {name} has unsupported packed/non-float storage",
+                    path.display()
+                )));
+            }
+            tensor_elements(path, header)?
+                .checked_mul(2)
+                .ok_or_else(|| {
+                    crate::Error::Msg("Wan projected tensor bytes overflow".to_owned())
+                })?
+        } else {
+            return Err(crate::Error::Unsupported(format!(
+                "{} encoder tensor {name} is outside the packed UMT5 key surface",
+                path.display()
+            )));
+        };
+        sum.checked_add(bytes)
+            .ok_or_else(|| crate::Error::Msg("Wan encoder byte total overflow".to_owned()))
+    })
+}
+
+fn adapter_receipts(
+    spec: &LoadSpec,
+    route: WanI2vRoute,
+    tier: MemoryNumericTier,
+) -> crate::Result<(Vec<WanAdapterReceipt>, String, u64, Vec<SealedFile>)> {
+    let packed = tier.quant.is_some() && !matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun);
+    let vace_quantized =
+        tier.quant.is_some() && matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun);
+    let mut receipts = Vec::new();
+    let mut files = Vec::new();
+    let mut identity = Sha256::new();
+    identity.update(b"wan-adapters-v1");
+    let mut overlay_bytes = 0_u64;
+    for (ordinal, adapter) in spec.adapters.iter().enumerate() {
+        if !adapter.scale.is_finite() || adapter.scale < 0.0 || adapter.pass_scales.is_some() {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: adapter {ordinal} has unsupported scale/pass recipe",
+                route.provider_id()
+            )));
+        }
+        if matches!(route, WanI2vRoute::Ti2v5b | WanI2vRoute::Vace) && adapter.moe_expert.is_some()
+        {
+            return Err(crate::Error::Unsupported(
+                "Wan TI2V-5B accepts shared adapters only".to_owned(),
+            ));
+        }
+        let headers = crate::weightsmeta::safetensors_path_tensor_headers(&adapter.path)?;
+        if headers.is_empty() {
+            return Err(crate::Error::Unsupported(format!(
+                "adapter {} is empty",
+                adapter.path.display()
+            )));
+        }
+        let has_lokr_keys = crate::weightsmeta::keys_contain_lokr(
+            headers.iter().map(|header| header.name.as_str()),
+        );
+        let has_loha_keys = crate::weightsmeta::keys_contain_loha(
+            headers.iter().map(|header| header.name.as_str()),
+        );
+        if packed && has_loha_keys {
+            return Err(crate::Error::Unsupported(
+                "LoHa cannot be admitted on a packed Wan q4/q8 tier; select bf16".to_owned(),
+            ));
+        }
+        let source_bytes = headers.iter().try_fold(0_u64, |sum, header| {
+            sum.checked_add(header.data_bytes)
+                .ok_or_else(|| crate::Error::Msg("Wan adapter byte total overflow".to_owned()))
+        })?;
+        if source_bytes == 0 {
+            return Err(crate::Error::Unsupported(
+                "Wan adapter has zero tensor bytes".to_owned(),
+            ));
+        }
+        let multiplicity = if route.dual_expert() && adapter.moe_expert.is_none() {
+            2
+        } else {
+            1
+        };
+        let persistent_bytes = if packed {
+            source_bytes
+                .checked_mul(multiplicity)
+                .ok_or_else(|| crate::Error::Msg("Wan adapter residency overflow".to_owned()))?
+        } else if vace_quantized {
+            // The source factors coexist with the dense map during merge-before-quantize.
+            source_bytes
+        } else {
+            0
+        };
+        overlay_bytes = overlay_bytes
+            .checked_add(persistent_bytes)
+            .ok_or_else(|| crate::Error::Msg("Wan overlay byte total overflow".to_owned()))?;
+        let absolute = std::path::absolute(&adapter.path)?;
+        let pin = spec
+            .prepared_file_pins()
+            .get(&absolute)
+            .cloned()
+            .unwrap_or(crate::PinnedWeightsFile::pin(&adapter.path)?);
+        pin.ensure_unchanged()?;
+        let digest = sha256_file(&adapter.path)?;
+        let kind = if lightning_role(&adapter.path, route).is_some_and(|(_, exact)| exact) {
+            "lightning_lora"
+        } else if adapter.kind == AdapterKind::Lokr || has_lokr_keys {
+            "lokr"
+        } else if has_loha_keys {
+            // Wan's execution adapters classify third-party LyCORIS LoHa from `hada_*` tensor
+            // keys because the shared AdapterKind predates LoHa and has no LoHa variant. The
+            // physical receipt must use that same classification rather than relabeling an
+            // accepted dense LoHa file as LoRA.
+            "loha"
+        } else {
+            "lora"
+        };
+        let expert = match adapter.moe_expert {
+            None => "shared",
+            Some(MoeExpert::High) => "high",
+            Some(MoeExpert::Low) => "low",
+        };
+        let realization = if packed {
+            "packed_additive_factors"
+        } else if vace_quantized {
+            "dense_folded_then_quantized"
+        } else {
+            "dense_folded"
+        };
+        let stability = "pinned_digest_and_tensor_geometry";
+        identity.update((ordinal as u32).to_le_bytes());
+        identity.update(absolute.to_string_lossy().as_bytes());
+        identity.update(kind.as_bytes());
+        identity.update(adapter.scale.to_bits().to_le_bytes());
+        identity.update(0_u32.to_le_bytes());
+        identity.update(expert.as_bytes());
+        identity.update(digest.as_bytes());
+        identity.update(source_bytes.to_le_bytes());
+        identity.update(persistent_bytes.to_le_bytes());
+        identity.update(realization.as_bytes());
+        identity.update(stability.as_bytes());
+        receipts.push(WanAdapterReceipt {
+            ordinal: ordinal as u32,
+            path: absolute.clone(),
+            kind,
+            scale_bits: adapter.scale.to_bits(),
+            pass_scale_bits: Vec::new(),
+            expert,
+            digest: digest.clone(),
+            source_bytes,
+            persistent_bytes,
+            realization,
+            stability,
+        });
+        files.push(SealedFile {
+            relative: format!("adapter:{ordinal}"),
+            absolute,
+            pin,
+            digest,
+            resident_bytes: source_bytes,
+            tensor: true,
+        });
+    }
+    validate_lightning_recipe(spec, route)?;
+    Ok((
+        receipts,
+        format!("wan-adapters-v1:{:x}", identity.finalize()),
+        overlay_bytes,
+        files,
+    ))
+}
+
+/// The Lightning distill subdirectory `lightx2v/Wan2.2-Lightning` ships for `route`.
+///
+/// The two A14B recipes are **not** cross-compatible (the manifest says so where it declares the
+/// `coRequisite`), so the exact subdir is part of the recipe's identity: T2V is `Seko-V1.1`, I2V is
+/// `Seko-V1`. A route with no Lightning recipe returns `None`.
+fn lightning_subdir(route: WanI2vRoute) -> Option<&'static str> {
+    match route {
+        WanI2vRoute::T2v14b => Some("Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1.1"),
+        WanI2vRoute::I2v14b => Some("Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1"),
+        WanI2vRoute::Ti2v5b | WanI2vRoute::Vace | WanI2vRoute::VaceFun => None,
+    }
+}
+
+fn lightning_role(path: &Path, route: WanI2vRoute) -> Option<(MoeExpert, bool)> {
+    let canonical = std::fs::canonicalize(path).ok()?;
+    let marker = repo_dir(LIGHTNING_REPOSITORY);
+    let parts = canonical
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let index = parts.iter().position(|part| part == &marker)?;
+    if parts.get(index + 1).map(String::as_str) != Some("snapshots")
+        || parts.get(index + 2).map(String::as_str) != Some(LIGHTNING_REVISION)
+    {
+        return Some((MoeExpert::High, false));
+    }
+    let suffix = parts[index + 3..].join("/");
+    let Some(subdir) = lightning_subdir(route) else {
+        return Some((MoeExpert::High, false));
+    };
+    if suffix == format!("{subdir}/high_noise_model.safetensors") {
+        Some((MoeExpert::High, true))
+    } else if suffix == format!("{subdir}/low_noise_model.safetensors") {
+        Some((MoeExpert::Low, true))
+    } else {
+        Some((MoeExpert::High, false))
+    }
+}
+
+fn validate_lightning_recipe(spec: &LoadSpec, route: WanI2vRoute) -> crate::Result<()> {
+    let roles = spec
+        .adapters
+        .iter()
+        .enumerate()
+        .filter_map(|(index, adapter)| {
+            lightning_role(&adapter.path, route).map(|role| (index, adapter, role))
+        })
+        .collect::<Vec<_>>();
+    if matches!(route, WanI2vRoute::Ti2v5b | WanI2vRoute::Vace) && !roles.is_empty() {
+        return Err(crate::Error::Unsupported(
+            "TI2V-5B cannot use the A14B Lightning pair".to_owned(),
+        ));
+    }
+    if roles.is_empty() {
+        return Ok(());
+    }
+    let valid = roles.len() == 2
+        && roles[0].0 == 0
+        && roles[1].0 == 1
+        && roles[0].2 == (MoeExpert::High, true)
+        && roles[1].2 == (MoeExpert::Low, true)
+        && roles[0].1.moe_expert == Some(MoeExpert::High)
+        && roles[1].1.moe_expert == Some(MoeExpert::Low)
+        && roles[0].1.kind == AdapterKind::Lora
+        && roles[1].1.kind == AdapterKind::Lora
+        && roles[0].1.scale.to_bits() == 1.0_f32.to_bits()
+        && roles[1].1.scale.to_bits() == 1.0_f32.to_bits();
+    if !valid {
+        return Err(crate::Error::Unsupported(
+            "Wan I2V Lightning must be the exact ordered high/low Seko-V1 pair at scale 1"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_load_spec<'a>(spec: &'a LoadSpec, provider_id: &str) -> crate::Result<&'a Path> {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return Err(crate::Error::Unsupported(format!(
+            "{provider_id}: directory weights required"
+        )));
+    };
+    if spec.precision != Precision::Bf16
+        || spec.control.is_some()
+        || !spec.extra_controls.is_empty()
+        || spec.ip_adapter.is_some()
+        || spec.pid.is_some()
+        || spec.identity.is_some()
+        || spec.text_encoder.is_some()
+        || !spec.components.is_empty()
+        || spec.resolved_route.as_deref() != Some(provider_id)
+    {
+        return Err(crate::Error::Unsupported(format!(
+            "{provider_id}: load left the exact Wan I2V surface"
+        )));
+    }
+    crate::reject_unknown_components(spec, &[], provider_id)?;
+    spec.validate_load_shape_declaration()?;
+    Ok(root)
+}
+
+pub fn prepare_load_spec(
+    spec: &mut LoadSpec,
+    backend: WanI2vBackend,
+    provider_id: &str,
+) -> crate::Result<()> {
+    let route = WanI2vRoute::for_provider(provider_id)?;
+    let tier = tier(spec, backend)?;
+    // Wan-VACE constructors retain only metadata; components are built lazily for the request
+    // and the Candle cache warms its component bundle on first render.  Its receipt must not
+    // claim eager bulk materialization merely because the generic LoadSpec default is eager.
+    if matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) {
+        *spec = spec.clone().with_applied_load_shape_declaration();
+    }
+    if backend == WanI2vBackend::Candle
+        && ((route == WanI2vRoute::Vace && (tier.quant.is_some() || !spec.adapters.is_empty()))
+            || (route == WanI2vRoute::VaceFun && tier.quant.is_some()))
+    {
+        return Err(crate::Error::Unsupported(format!(
+            "candle {} does not admit the selected numeric tier or load recipe",
+            route.provider_id()
+        )));
+    }
+    let root = validate_load_spec(spec, provider_id)?.to_path_buf();
+    let (repository, revision) = repository_policy(backend, route, tier);
+    if !matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) {
+        repository_revision(&root, repository, revision, tier, backend)?;
+    } else if route == WanI2vRoute::VaceFun {
+        vace_fun_source_receipt_revision(&root, backend)?;
+    } else {
+        vace_source_receipt_revision(&root, backend)?;
+    }
+    let inventory = match backend {
+        WanI2vBackend::Mlx => validate_mlx_inventory(&root, route)?,
+        WanI2vBackend::Candle => validate_candle_inventory(&root, route)?,
+    };
+    let mut paths = inventory
+        .into_iter()
+        .map(|relative| root.join(relative))
+        .collect::<Vec<_>>();
+    paths.extend(
+        structural_files(&root, backend, route)?
+            .into_iter()
+            .map(|relative| root.join(relative)),
+    );
+    paths.extend(spec.adapters.iter().map(|adapter| adapter.path.clone()));
+    spec.prepare_with_file_pins(
+        paths
+            .into_iter()
+            .map(crate::PinnedWeightsFile::pin)
+            .collect::<crate::Result<Vec<_>>>()?,
+    )
+}
+
+impl PreparedWanI2vMemory {
+    pub fn prepare(
+        spec: &LoadSpec,
+        backend: WanI2vBackend,
+        provider_id: &str,
+    ) -> crate::Result<Self> {
+        let route = WanI2vRoute::for_provider(provider_id)?;
+        let tier = tier(spec, backend)?;
+        if backend == WanI2vBackend::Candle
+            && ((route == WanI2vRoute::Vace && (tier.quant.is_some() || !spec.adapters.is_empty()))
+                || (route == WanI2vRoute::VaceFun && tier.quant.is_some()))
+        {
+            return Err(crate::Error::Unsupported(format!(
+                "candle {} does not admit the selected numeric tier or load recipe",
+                route.provider_id()
+            )));
+        }
+        let root = validate_load_spec(spec, provider_id)?;
+        spec.validate_prepared_file_pins()?;
+        let (repository, expected_revision) = repository_policy(backend, route, tier);
+        let revision = if route == WanI2vRoute::Vace {
+            vace_source_receipt_revision(root, backend)?
+        } else if route == WanI2vRoute::VaceFun {
+            vace_fun_source_receipt_revision(root, backend)?
+        } else {
+            repository_revision(root, repository, expected_revision, tier, backend)?
+        };
+        let inventory = match backend {
+            WanI2vBackend::Mlx => validate_mlx_inventory(root, route)?,
+            WanI2vBackend::Candle => validate_candle_inventory(root, route)?,
+        };
+        let mut facts = MemoryAssetFacts::default();
+        let mut files = Vec::new();
+        let mut identity = Sha256::new();
+        identity.update(RECEIPT_VERSION.as_bytes());
+        identity.update(backend.key().as_bytes());
+        identity.update(provider_id.as_bytes());
+        identity.update(repository.as_bytes());
+        identity.update(revision.as_bytes());
+        identity.update(format!("{:?}", tier.quant).as_bytes());
+        for relative in inventory {
+            let path = root.join(&relative);
+            let absolute = std::path::absolute(&path)?;
+            let pin = spec
+                .prepared_file_pins()
+                .get(&absolute)
+                .cloned()
+                .ok_or_else(|| {
+                    crate::Error::Unsupported(format!(
+                        "{provider_id}: prepared receipt missing {}",
+                        relative.display()
+                    ))
+                })?;
+            pin.ensure_unchanged()?;
+            let digest = sha256_file(&path)?;
+            let relative_text = relative.to_string_lossy().replace('\\', "/");
+            let phase = component_for(route, &relative_text);
+            let resident_bytes = physical_resident_bytes(&path, backend, route, tier, phase)?;
+            identity.update(relative_text.as_bytes());
+            identity.update(digest.as_bytes());
+            identity.update(resident_bytes.to_le_bytes());
+            let component_total = match phase {
+                MemoryPhase::Conditioning => facts.conditioning_bytes.checked_add(resident_bytes),
+                MemoryPhase::Denoise => facts.transformer_bytes.checked_add(resident_bytes),
+                MemoryPhase::Decode => facts.decoder_bytes.checked_add(resident_bytes),
+            }
+            .ok_or_else(|| crate::Error::Msg("Wan component byte overflow".to_owned()))?;
+            match phase {
+                MemoryPhase::Conditioning => facts.conditioning_bytes = component_total,
+                MemoryPhase::Denoise => facts.transformer_bytes = component_total,
+                MemoryPhase::Decode => facts.decoder_bytes = component_total,
+            }
+            files.push(SealedFile {
+                relative: relative_text,
+                absolute,
+                pin,
+                digest,
+                resident_bytes,
+                tensor: true,
+            });
+        }
+        for relative in structural_files(root, backend, route)? {
+            let path = root.join(&relative);
+            let absolute = std::path::absolute(&path)?;
+            let pin = spec
+                .prepared_file_pins()
+                .get(&absolute)
+                .cloned()
+                .ok_or_else(|| {
+                    crate::Error::Unsupported(format!(
+                        "{provider_id}: prepared receipt missing {}",
+                        relative.display()
+                    ))
+                })?;
+            pin.ensure_unchanged()?;
+            let digest = sha256_file(&path)?;
+            let relative_text = relative.to_string_lossy().replace('\\', "/");
+            identity.update(relative_text.as_bytes());
+            identity.update(digest.as_bytes());
+            files.push(SealedFile {
+                relative: relative_text,
+                absolute,
+                pin,
+                digest,
+                resident_bytes: 0,
+                tensor: false,
+            });
+        }
+        let (adapters, adapter_identity, overlay_bytes, adapter_files) =
+            adapter_receipts(spec, route, tier)?;
+        facts.overlay_bytes = overlay_bytes;
+        facts.base_bytes = facts
+            .conditioning_bytes
+            .checked_add(facts.transformer_bytes)
+            .and_then(|sum| sum.checked_add(facts.decoder_bytes))
+            .ok_or_else(|| crate::Error::Msg("Wan base byte overflow".to_owned()))?;
+        if facts.conditioning_bytes == 0 || facts.transformer_bytes == 0 || facts.decoder_bytes == 0
+        {
+            return Err(crate::Error::Unsupported(format!(
+                "{provider_id}: incomplete nonzero physical facts"
+            )));
+        }
+        identity.update(adapter_identity.as_bytes());
+        let artifact_identity = format!("{:x}", identity.finalize());
+        files.extend(adapter_files);
+        let mut contract = contract(provider_id, route, backend, spec, facts);
+        // Published only now, after the whole receipt sealed: the tier is the artifact's, not the
+        // request's, and a snapshot that failed any inventory/marker check never reaches here.
+        contract.calibration = production_calibration_fingerprint(route, backend, tier)
+            .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape));
+        let prepared = Self {
+            contract,
+            artifact_identity,
+            adapter_identity,
+            repository,
+            revision,
+            tier,
+            route,
+            backend,
+            adapters,
+            root: root.to_path_buf(),
+            files,
+        };
+        prepared.ensure_unchanged()?;
+        Ok(prepared)
+    }
+
+    /// The materialized snapshot directory this receipt was sealed over — the same `WeightsSource::Dir`
+    /// root the backend loader parses its model config from.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Stamp the backend's architecture axes onto the sealed contract (epic SC-22657, E2).
+    ///
+    /// This module is backend-neutral and holds no model config, so its `contract` builder can only
+    /// publish `MemoryArchitectureFacts::default()`. The contract a loaded generator hands back through
+    /// `Generator::memory_strategy_contract()` **is** `self.contract`, so a backend that only
+    /// overlays its axes on the per-request contract leaves the loaded path publishing the empty
+    /// default. Each backend's `prepare` therefore stamps its route facts here, once, at seal time.
+    pub fn with_architecture_facts(mut self, facts: crate::MemoryArchitectureFacts) -> Self {
+        self.contract.architecture_facts = facts;
+        self
+    }
+
+    pub fn ensure_unchanged(&self) -> crate::Result<()> {
+        let current = match self.backend {
+            WanI2vBackend::Mlx => validate_mlx_inventory(&self.root, self.route)?,
+            WanI2vBackend::Candle => validate_candle_inventory(&self.root, self.route)?,
+        };
+        let expected = self
+            .files
+            .iter()
+            .filter(|file| file.tensor && !file.relative.starts_with("adapter:"))
+            .map(|file| PathBuf::from(&file.relative))
+            .collect::<Vec<_>>();
+        if current != expected {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: physical inventory changed after admission",
+                self.route.provider_id()
+            )));
+        }
+        for file in &self.files {
+            file.pin.ensure_unchanged()?;
+            if sha256_file(&file.absolute)? != file.digest {
+                return Err(crate::Error::Unsupported(format!(
+                    "{} changed after admission",
+                    file.absolute.display()
+                )));
+            }
+            if file.tensor
+                && if file.relative.starts_with("adapter:") {
+                    stored_tensor_bytes(&file.absolute)?
+                } else {
+                    physical_resident_bytes(
+                        &file.absolute,
+                        self.backend,
+                        self.route,
+                        self.tier,
+                        component_for(self.route, &file.relative),
+                    )?
+                } != file.resident_bytes
+            {
+                return Err(crate::Error::Unsupported(format!(
+                    "{} tensor geometry changed after admission",
+                    file.absolute.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn contract(
+    provider_id: &str,
+    route: WanI2vRoute,
+    backend: WanI2vBackend,
+    spec: &LoadSpec,
+    facts: MemoryAssetFacts,
+) -> MemoryProviderContract {
+    let phases = vec![
+        MemoryPhase::Conditioning,
+        MemoryPhase::Denoise,
+        MemoryPhase::Decode,
+    ];
+    MemoryProviderContract {
+        phase_facts: None,
+        architecture_facts: crate::MemoryArchitectureFacts::default(),
+        provider_id: provider_id.to_owned(),
+        backend: backend.realization(),
+        strategies: MemoryStrategy::ALL
+            .into_iter()
+            .map(|strategy| MemoryStrategyCapability {
+                strategy,
+                support: if matches!(
+                    strategy,
+                    MemoryStrategy::Resident | MemoryStrategy::BoundedDecode
+                ) || ((route != WanI2vRoute::Vace || backend == WanI2vBackend::Mlx)
+                    && strategy == MemoryStrategy::StagedResidency)
+                {
+                    MemoryStrategySupport::Implemented
+                } else {
+                    MemoryStrategySupport::Missing
+                },
+                parameters: if strategy == MemoryStrategy::BoundedDecode {
+                    MemoryParameterRanges {
+                        decode_tile_edges: DECODE_TILE_EDGES.to_vec(),
+                        decode_overlaps: DECODE_OVERLAPS.to_vec(),
+                        ..Default::default()
+                    }
+                } else {
+                    MemoryParameterRanges::default()
+                },
+            })
+            .collect(),
+        decode_geometry_policy_authoritative: false,
+        pid_decode_routes: None,
+        load_shape: spec.load_shape,
+        additional_prerequisites: Vec::new(),
+        default_engagement_exclusions: Vec::new(),
+        resident_request_memory: ResidentRequestMemory::ExplicitResident,
+        lifecycle: MemoryLifecycleCapabilities {
+            phases: phases.clone(),
+            synchronized_phase_release: true,
+            decode_tiling: true,
+            attention_chunking: false,
+            transformer_window_materialization: false,
+        },
+        formula: MemoryFormulaKind::PhaseEnvelope {
+            phases,
+            variables: vec![
+                MemoryFormulaVariable::AssetBytes,
+                MemoryFormulaVariable::OverlayBytes,
+                MemoryFormulaVariable::PixelCount,
+                MemoryFormulaVariable::FrameCount,
+                MemoryFormulaVariable::BatchCount,
+            ],
+        },
+        calibration: None,
+        asset_facts: facts,
+        runtime: crate::MemoryRuntimeSemantics::default(),
+    }
+}
+
+fn reference(request: &GenerationRequest) -> crate::Result<&crate::Image> {
+    if request.conditioning.len() != 1 {
+        return Err(crate::Error::Unsupported(
+            "Wan public I2V requires exactly one conditioning carrier".to_owned(),
+        ));
+    }
+    match &request.conditioning[0] {
+        Conditioning::Reference { image, strength }
+            if strength.is_none_or(|value| value.to_bits() == 1.0_f32.to_bits()) =>
+        {
+            Ok(image)
+        }
+        _ => Err(crate::Error::Unsupported(
+            "Wan public I2V requires one full-strength Reference".to_owned(),
+        )),
+    }
+}
+
+fn valid_rgb8_image(image: &crate::Image) -> bool {
+    image.width > 0
+        && image.height > 0
+        && image
+            .width
+            .checked_mul(image.height)
+            .and_then(|pixels| pixels.checked_mul(3))
+            .is_some_and(|bytes| bytes as usize == image.pixels.len())
+}
+
+fn first_last_keyframes(request: &GenerationRequest) -> crate::Result<[crate::KeyframeRef<'_>; 2]> {
+    let [Conditioning::Keyframe {
+        image: first_image,
+        frame_idx: first_index,
+        strength: first_strength,
+    }, Conditioning::Keyframe {
+        image: last_image,
+        frame_idx: last_index,
+        strength: last_strength,
+    }] = request.conditioning.as_slice()
+    else {
+        return Err(crate::Error::Unsupported(
+            "Wan public first_last_frame requires exactly two ordered Keyframes".to_owned(),
+        ));
+    };
+    if *first_index != 0
+        || *last_index != -1
+        || !first_strength.is_finite()
+        || !last_strength.is_finite()
+        || !(0.0..=1.0).contains(first_strength)
+        || !(0.0..=1.0).contains(last_strength)
+        || !valid_rgb8_image(first_image)
+        || !valid_rgb8_image(last_image)
+        || first_image.width != request.width
+        || first_image.height != request.height
+        || last_image.width != request.width
+        || last_image.height != request.height
+    {
+        return Err(crate::Error::Unsupported(
+            "Wan public first_last_frame requires ordered fitted RGB8 first@0/last@-1 Keyframes"
+                .to_owned(),
+        ));
+    }
+    Ok([
+        crate::KeyframeRef {
+            image: first_image,
+            frame_idx: *first_index,
+            strength: *first_strength,
+        },
+        crate::KeyframeRef {
+            image: last_image,
+            frame_idx: *last_index,
+            strength: *last_strength,
+        },
+    ])
+}
+
+fn extend_keyframe(request: &GenerationRequest) -> crate::Result<crate::KeyframeRef<'_>> {
+    let [Conditioning::Keyframe {
+        image,
+        frame_idx,
+        strength,
+    }] = request.conditioning.as_slice()
+    else {
+        return Err(crate::Error::Unsupported(
+            "Wan public extend_clip fallback requires exactly one boundary Keyframe".to_owned(),
+        ));
+    };
+    if *frame_idx != 0
+        || !strength.is_finite()
+        || !(0.0..=1.0).contains(strength)
+        || !valid_rgb8_image(image)
+        || image.width != request.width
+        || image.height != request.height
+    {
+        return Err(crate::Error::Unsupported(
+            "Wan public extend_clip fallback requires one fitted RGB8 Keyframe at frame 0"
+                .to_owned(),
+        ));
+    }
+    Ok(crate::KeyframeRef {
+        image,
+        frame_idx: *frame_idx,
+        strength: *strength,
+    })
+}
+
+fn bridge_keyframes(request: &GenerationRequest) -> crate::Result<[crate::KeyframeRef<'_>; 2]> {
+    first_last_keyframes(request).map_err(|_| {
+        crate::Error::Unsupported(
+            "Wan video_bridge fallback requires exactly two ordered fitted RGB8 Keyframes at 0/-1"
+                .to_owned(),
+        )
+    })
+}
+
+fn extend_control_clip(request: &GenerationRequest) -> crate::Result<crate::ControlClipRef<'_>> {
+    if request.conditioning.len() != 1 {
+        return Err(crate::Error::Unsupported(
+            "Wan VACE extend_clip requires exactly one ControlClip".to_owned(),
+        ));
+    }
+    let clip = request.control_clip().ok_or_else(|| {
+        crate::Error::Unsupported(
+            "Wan VACE extend_clip requires exactly one ControlClip".to_owned(),
+        )
+    })?;
+    let exact_image = |image: &crate::Image| {
+        valid_rgb8_image(image) && image.width == request.width && image.height == request.height
+    };
+    if clip.frames.len() != request.frames.unwrap_or_default() as usize
+        || clip.frames.len() != clip.mask.len()
+        || clip.frames.is_empty()
+        || !clip.frames.iter().all(exact_image)
+        || !clip.mask.iter().all(exact_image)
+        || !clip.masking_strength.is_finite()
+        || clip.masking_strength.to_bits() != 1.0_f32.to_bits()
+        || clip.start_frame != 0
+        || clip.mode != crate::ReplacementMode::default()
+    {
+        return Err(crate::Error::Unsupported(
+            "Wan VACE extend_clip ControlClip left the exact output-sized carrier envelope"
+                .to_owned(),
+        ));
+    }
+    Ok(clip)
+}
+
+/// The raw RGB value the Wan-VACE builder writes into a white-mask bridge gap.  The engine maps
+/// this mid-gray value to approximately zero before denoising; black is an anchor-mask value, not
+/// neutral generated content.
+const WAN_VACE_BRIDGE_NEUTRAL_RGB: u8 = 128;
+
+fn bridge_control_clip(request: &GenerationRequest) -> crate::Result<crate::ControlClipRef<'_>> {
+    let clip = extend_control_clip(request).map_err(|_| {
+        crate::Error::Unsupported(
+            "Wan VACE video_bridge requires one full output ControlClip with a fitted mask"
+                .to_owned(),
+        )
+    })?;
+    // A bridge owns two immutable source boundaries and generates only the middle.  ControlClip
+    // follows the VACE replacement convention: black keeps an anchor; white regenerates.  Require
+    // a non-empty left tail and right head (which may be asymmetric), plus an all-neutral generated
+    // gap, so an arbitrary edit control cannot masquerade as a bridge carrier.
+    let is_uniform = |image: &crate::Image, value| image.pixels.iter().all(|&pixel| pixel == value);
+    let left_anchor_len = clip
+        .mask
+        .iter()
+        .take_while(|mask| is_uniform(mask, 0))
+        .count();
+    let right_anchor_len = clip
+        .mask
+        .iter()
+        .rev()
+        .take_while(|mask| is_uniform(mask, 0))
+        .count();
+    let gap_end = clip.frames.len().saturating_sub(right_anchor_len);
+    if left_anchor_len == 0
+        || right_anchor_len == 0
+        || left_anchor_len >= gap_end
+        || !clip.mask[left_anchor_len..gap_end]
+            .iter()
+            .all(|mask| is_uniform(mask, 255))
+        || !clip.frames[left_anchor_len..gap_end]
+            .iter()
+            .all(|frame| is_uniform(frame, WAN_VACE_BRIDGE_NEUTRAL_RGB))
+    {
+        return Err(crate::Error::Unsupported(
+            "Wan VACE video_bridge requires black left-tail/right-head anchors and a white-mask neutral generated gap"
+                .to_owned(),
+        ));
+    }
+    Ok(clip)
+}
+
+fn replace_person_carrier(
+    request: &GenerationRequest,
+) -> crate::Result<(crate::ControlClipRef<'_>, Vec<&crate::Image>)> {
+    let Some((Conditioning::ControlClip { .. }, references)) = request.conditioning.split_first()
+    else {
+        return Err(crate::Error::Unsupported(
+            "Wan replace_person requires ControlClip first, followed by ordered References"
+                .to_owned(),
+        ));
+    };
+    if !(1..=4).contains(&references.len()) {
+        return Err(crate::Error::Unsupported(
+            "Wan replace_person requires one to four ordered References".to_owned(),
+        ));
+    }
+    let clip = request.control_clip().ok_or_else(|| {
+        crate::Error::Unsupported("Wan replace_person requires exactly one ControlClip".to_owned())
+    })?;
+    let exact_output = |image: &crate::Image| {
+        valid_rgb8_image(image) && image.width == request.width && image.height == request.height
+    };
+    if clip.frames.len() != request.frames.unwrap_or_default() as usize
+        || clip.frames.len() != clip.mask.len()
+        || clip.frames.is_empty()
+        || !clip.frames.iter().all(exact_output)
+        || !clip.mask.iter().all(exact_output)
+        || !clip.masking_strength.is_finite()
+        || !(0.0..=1.0).contains(&clip.masking_strength)
+        || clip.start_frame != 0
+    {
+        return Err(crate::Error::Unsupported(
+            "Wan replace_person ControlClip must be RGB8 output geometry for every output frame with an equal RGB8 mask and finite masking strength"
+                .to_owned(),
+        ));
+    }
+    let references = references
+        .iter()
+        .map(|conditioning| match conditioning {
+            Conditioning::Reference { image, strength: None } if valid_rgb8_image(image) => {
+                Ok(image)
+            }
+            _ => Err(crate::Error::Unsupported(
+                "Wan replace_person references must be ordered approved RGB8 References without per-reference strength"
+                    .to_owned(),
+            )),
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    Ok((clip, references))
+}
+
+/// The text-to-video carrier: a prompt and **nothing else**.
+///
+/// `T2v14b` is the only route that admits it, and it admits no other carrier — so this is where an
+/// image sneaked onto a text-only route is refused, rather than silently priced against a resident
+/// set that never materializes a VAE encoder.
+fn text_to_video_carrier(request: &GenerationRequest) -> crate::Result<()> {
+    if !request.conditioning.is_empty() || request.control_clip().is_some() {
+        return Err(crate::Error::Unsupported(
+            "Wan public text_to_video admits no conditioning carrier".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn request_mode(
+    prepared: &PreparedWanI2vMemory,
+    request: &GenerationRequest,
+) -> crate::Result<WanPublicMode> {
+    match request.video_mode.as_deref() {
+        // A text-only route publishes its mode either way: the worker may spell it, or leave
+        // `video_mode` unset the way the T2V generator's own request path does.
+        None | Some("text_to_video") if prepared.route == WanI2vRoute::T2v14b => {
+            text_to_video_carrier(request)?;
+            Ok(WanPublicMode::TextToVideo)
+        }
+        Some("image_to_video")
+            if prepared.route != WanI2vRoute::Vace && prepared.route != WanI2vRoute::T2v14b =>
+        {
+            reference(request)?;
+            Ok(WanPublicMode::ImageToVideo)
+        }
+        None if prepared.route == WanI2vRoute::Ti2v5b => {
+            first_last_keyframes(request)?;
+            Ok(WanPublicMode::FirstLastFrame)
+        }
+        Some("extend_clip")
+            if prepared.route == WanI2vRoute::Ti2v5b && prepared.backend == WanI2vBackend::Mlx =>
+        {
+            extend_keyframe(request)?;
+            Ok(WanPublicMode::ExtendClip)
+        }
+        Some("extend_clip") if prepared.route == WanI2vRoute::Vace => {
+            extend_control_clip(request)?;
+            Ok(WanPublicMode::ExtendClip)
+        }
+        Some("video_bridge")
+            if prepared.route == WanI2vRoute::Ti2v5b && prepared.backend == WanI2vBackend::Mlx =>
+        {
+            bridge_keyframes(request)?;
+            Ok(WanPublicMode::VideoBridge)
+        }
+        Some("video_bridge") if prepared.route == WanI2vRoute::Vace => {
+            bridge_control_clip(request)?;
+            Ok(WanPublicMode::VideoBridge)
+        }
+        Some(mode)
+            if mode
+                .strip_prefix("replace_person@")
+                .is_some_and(|identity| {
+                    identity.len() == 64 && identity.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                && matches!(prepared.route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) =>
+        {
+            replace_person_carrier(request)?;
+            Ok(WanPublicMode::ReplacePerson)
+        }
+        _ => Err(crate::Error::Unsupported(format!(
+            "{}: request matches no exact public Wan carrier — this route admits \
+             text_to_video/no carrier (T2V-A14B only), \
+             image_to_video/one Reference (non-VACE, non-T2V), first_last_frame/two ordered Keyframes \
+             (Ti2V-5B, no video_mode), extend_clip and video_bridge (Ti2V-5B MLX keyframes or \
+             VACE ControlClip), and replace_person@<64-hex identity> (VACE / VACE-Fun)",
+            prepared.route.provider_id()
+        ))),
+    }
+}
+
+fn request_contract_for_mode(
+    prepared: &PreparedWanI2vMemory,
+    mode: WanPublicMode,
+) -> MemoryProviderContract {
+    let mut contract = prepared.contract.clone();
+    if (mode == WanPublicMode::FirstLastFrame && prepared.backend == WanI2vBackend::Mlx)
+        || mode == WanPublicMode::ExtendClip
+        || mode == WanPublicMode::VideoBridge
+        || (mode == WanPublicMode::ReplacePerson && prepared.route == WanI2vRoute::Vace)
+    {
+        let staged = contract
+            .strategies
+            .iter_mut()
+            .find(|capability| capability.strategy == MemoryStrategy::StagedResidency)
+            .expect("Wan strategy table is complete");
+        staged.support = MemoryStrategySupport::Missing;
+        staged.parameters = MemoryParameterRanges::default();
+    }
+    contract
+}
+
+pub fn contract_for_mode_key(
+    prepared: &PreparedWanI2vMemory,
+    mode: &str,
+) -> crate::Result<MemoryProviderContract> {
+    let mode = match mode {
+        "text_to_video" if prepared.route == WanI2vRoute::T2v14b => WanPublicMode::TextToVideo,
+        "image_to_video"
+            if prepared.route != WanI2vRoute::Vace && prepared.route != WanI2vRoute::T2v14b =>
+        {
+            WanPublicMode::ImageToVideo
+        }
+        "first_last_frame" if prepared.route == WanI2vRoute::Ti2v5b => {
+            WanPublicMode::FirstLastFrame
+        }
+        "extend_clip"
+            if prepared.route == WanI2vRoute::Vace
+                || (prepared.route == WanI2vRoute::Ti2v5b
+                    && prepared.backend == WanI2vBackend::Mlx) =>
+        {
+            WanPublicMode::ExtendClip
+        }
+        "video_bridge"
+            if prepared.route == WanI2vRoute::Vace
+                || (prepared.route == WanI2vRoute::Ti2v5b
+                    && prepared.backend == WanI2vBackend::Mlx) =>
+        {
+            WanPublicMode::VideoBridge
+        }
+        "replace_person" if matches!(prepared.route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) => {
+            WanPublicMode::ReplacePerson
+        }
+        _ => {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: unsupported Wan memory mode {mode}",
+                prepared.route.provider_id()
+            )))
+        }
+    };
+    Ok(request_contract_for_mode(prepared, mode))
+}
+
+/// The request-specific ladder. Extend-clip exposes only Resident and BoundedDecode on both
+/// backends. MLX first/last-frame does the same; Candle first/last-frame additionally retains
+/// StagedResidency because its request-selected Sequential renderer is operationally distinct from
+/// Resident.
+pub fn request_contract(
+    prepared: &PreparedWanI2vMemory,
+    request: &GenerationRequest,
+) -> crate::Result<MemoryProviderContract> {
+    let mode = validate_request(prepared, request)?;
+    Ok(request_contract_for_mode(prepared, mode))
+}
+
+pub fn validate_request(
+    prepared: &PreparedWanI2vMemory,
+    request: &GenerationRequest,
+) -> crate::Result<WanPublicMode> {
+    let mode = request_mode(prepared, request)?;
+    let frames = request.frames.unwrap_or_default();
+    let fps = request.fps.unwrap_or_default();
+    let steps = request.steps.unwrap_or_default();
+    let unsupported_svd = request.motion_bucket_id.is_some()
+        || request.noise_aug_strength.is_some()
+        || request.decode_chunk_size.is_some()
+        || request.conditioning_fps.is_some();
+    let has_lightning = prepared.adapters.first().is_some_and(|receipt| {
+        receipt.kind == "lightning_lora"
+            && receipt.expert == "high"
+            && prepared
+                .adapters
+                .get(1)
+                .is_some_and(|low| low.kind == "lightning_lora" && low.expert == "low")
+    });
+    let lightning_sampling = if lightning_subdir(prepared.route).is_some()
+        && steps == 4
+        && request
+            .guidance
+            .is_some_and(|value| value.to_bits() == 1.0_f32.to_bits())
+    {
+        has_lightning
+    } else {
+        !has_lightning
+    };
+    let exact_rate = match mode {
+        WanPublicMode::TextToVideo | WanPublicMode::ImageToVideo => {
+            prepared.route.accepts_rate(fps, frames)
+        }
+        WanPublicMode::FirstLastFrame => prepared.route.accepts_first_last_rate(fps, frames),
+        WanPublicMode::ExtendClip => match prepared.route {
+            WanI2vRoute::Ti2v5b => prepared.route.accepts_first_last_rate(fps, frames),
+            WanI2vRoute::Vace => prepared.route.accepts_rate(fps, frames),
+            WanI2vRoute::T2v14b | WanI2vRoute::I2v14b | WanI2vRoute::VaceFun => false,
+        },
+        WanPublicMode::VideoBridge => match prepared.route {
+            WanI2vRoute::Ti2v5b => prepared.route.accepts_first_last_rate(fps, frames),
+            WanI2vRoute::Vace => prepared.route.accepts_rate(fps, frames),
+            WanI2vRoute::T2v14b | WanI2vRoute::I2v14b | WanI2vRoute::VaceFun => false,
+        },
+        WanPublicMode::ReplacePerson => {
+            matches!(prepared.route, WanI2vRoute::Vace | WanI2vRoute::VaceFun)
+                && prepared.route.accepts_rate(fps, frames)
+        }
+    };
+    let sampler_ok = match mode {
+        WanPublicMode::TextToVideo | WanPublicMode::ImageToVideo => true,
+        WanPublicMode::FirstLastFrame
+        | WanPublicMode::ExtendClip
+        | WanPublicMode::VideoBridge
+        | WanPublicMode::ReplacePerson => match request.sampler.as_deref() {
+            None | Some("uni_pc" | "euler") => true,
+            Some("dpmpp_2m") => prepared.backend == WanI2vBackend::Mlx,
+            Some(_) => false,
+        },
+    };
+    let boundary_axes_ok = !matches!(
+        mode,
+        WanPublicMode::FirstLastFrame
+            | WanPublicMode::ExtendClip
+            | WanPublicMode::VideoBridge
+            | WanPublicMode::ReplacePerson
+    ) || (request.strength.is_none()
+        && request.true_cfg.is_none()
+        && request.timestep_to_start_cfg.is_none()
+        && request.guidance_method.is_none()
+        && request.guidance_eta.is_none()
+        && request.guidance_momentum.is_none()
+        && request.guidance_norm_threshold.is_none()
+        && (request.control_scale.is_none()
+            || (matches!(prepared.route, WanI2vRoute::Vace | WanI2vRoute::VaceFun)
+                && request
+                    .control_scale
+                    .is_some_and(|value| value.is_finite() && value >= 0.0)))
+        && request.text_style_gain.is_none()
+        && request.image_guidance.is_none()
+        && request.duration.is_none()
+        && request.trim_first_frames.is_none()
+        && request.softness.is_none()
+        && request.pid_capture_sigma.is_none()
+        && request.approximation.is_none());
+    if request.count != 1
+        || !prepared
+            .route
+            .public_geometries()
+            .contains(&(request.width, request.height))
+        || !exact_rate
+        || !(1..=100).contains(&steps)
+        || request.seed.is_none()
+        || request.audio.is_some()
+        || request.phases.is_some()
+        || request.scheduler.is_some()
+        || request.scheduler_shift.is_some()
+        || request.use_pid
+        || request.enhance_prompt
+        || request.use_uncensored_enhancer
+        || unsupported_svd
+        || !lightning_sampling
+        || !sampler_ok
+        || !boundary_axes_ok
+    {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: request left the exact public {} envelope",
+            prepared.route.provider_id(),
+            mode.key()
+        )));
+    }
+    Ok(mode)
+}
+
+fn update_optional_u32(hash: &mut Sha256, value: Option<u32>) {
+    match value {
+        Some(value) => {
+            hash.update([1]);
+            hash.update(value.to_le_bytes());
+        }
+        None => hash.update([0]),
+    }
+}
+
+fn update_optional_f32(hash: &mut Sha256, value: Option<f32>) {
+    match value {
+        Some(value) => {
+            hash.update([1]);
+            hash.update(value.to_bits().to_le_bytes());
+        }
+        None => hash.update([0]),
+    }
+}
+
+fn update_optional_str(hash: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hash.update([1]);
+            hash.update((value.len() as u64).to_le_bytes());
+            hash.update(value.as_bytes());
+        }
+        None => hash.update([0]),
+    }
+}
+
+/// Stable digest of the complete selected execution carrier.
+///
+/// Keep every field explicit: `None` and `Some(0)` are distinct, and fields not currently supported
+/// by Wan remain identity-bearing so a future contract cannot add one without silently reusing an
+/// older receipt format.
+fn selection_receipt_digest(selection: &MemorySelection) -> String {
+    let parameters = selection.parameters;
+    let mut hash = Sha256::new();
+    hash.update(b"wan-i2v-selection-v1");
+    hash.update([selection.strategy as u8]);
+    update_optional_u32(&mut hash, parameters.decode_tile_edge);
+    update_optional_u32(&mut hash, parameters.decode_overlap);
+    update_optional_u32(&mut hash, parameters.attention_chunk_size);
+    update_optional_u32(&mut hash, parameters.transformer_window_size);
+    match parameters.transformer_window_component {
+        Some(component) => {
+            hash.update([1]);
+            hash.update([component as u8]);
+        }
+        None => hash.update([0]),
+    }
+    format!("{:x}", hash.finalize())
+}
+
+fn validate_selection(
+    prepared: &PreparedWanI2vMemory,
+    mode: WanPublicMode,
+    selection: &MemorySelection,
+) -> crate::Result<()> {
+    if selection.tier != prepared.tier {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: selected tier does not match the sealed physical tier",
+            prepared.route.provider_id()
+        )));
+    }
+    request_contract_for_mode(prepared, mode).validate_selection(selection)
+}
+
+fn request_evidence_revision_for_selection(
+    prepared: &PreparedWanI2vMemory,
+    request: &GenerationRequest,
+    selection: &MemorySelection,
+) -> crate::Result<String> {
+    let mode = validate_request(prepared, request)?;
+    validate_selection(prepared, mode, selection)?;
+    let selection_receipt = selection_receipt_digest(selection);
+    let mut hash = Sha256::new();
+    hash.update(RECEIPT_VERSION.as_bytes());
+    hash.update(prepared.artifact_identity.as_bytes());
+    hash.update(prepared.adapter_identity.as_bytes());
+    hash.update(prepared.backend.key().as_bytes());
+    hash.update(prepared.route.provider_id().as_bytes());
+    hash.update(mode.key().as_bytes());
+    hash.update(selection_receipt.as_bytes());
+    hash.update(request.width.to_le_bytes());
+    hash.update(request.height.to_le_bytes());
+    hash.update(request.frames.unwrap().to_le_bytes());
+    hash.update(request.fps.unwrap().to_le_bytes());
+    hash.update(request.steps.unwrap().to_le_bytes());
+    hash.update(request.seed.unwrap().to_le_bytes());
+    hash.update(request.prompt.as_bytes());
+    update_optional_str(&mut hash, request.negative_prompt.as_deref());
+    update_optional_f32(&mut hash, request.guidance);
+    update_optional_str(&mut hash, request.sampler.as_deref());
+    update_optional_f32(&mut hash, request.control_scale);
+    update_optional_str(&mut hash, request.video_mode.as_deref());
+    hash.update(NATIVE_SCHEDULE.as_bytes());
+    match mode {
+        WanPublicMode::TextToVideo => {
+            text_to_video_carrier(request)?;
+            // Named explicitly so a text-only receipt can never collide with an image-carrying one
+            // whose carrier happened to hash to nothing.
+            hash.update(b"text-only-no-carrier");
+        }
+        WanPublicMode::ImageToVideo => {
+            let image = reference(request)?;
+            hash.update(b"reference");
+            hash.update(image.width.to_le_bytes());
+            hash.update(image.height.to_le_bytes());
+            hash.update(Sha256::digest(&image.pixels));
+        }
+        WanPublicMode::FirstLastFrame => {
+            for (role, keyframe) in ["first", "last"]
+                .into_iter()
+                .zip(first_last_keyframes(request)?)
+            {
+                hash.update(role.as_bytes());
+                hash.update(keyframe.frame_idx.to_le_bytes());
+                hash.update(keyframe.strength.to_bits().to_le_bytes());
+                hash.update(keyframe.image.width.to_le_bytes());
+                hash.update(keyframe.image.height.to_le_bytes());
+                hash.update(Sha256::digest(&keyframe.image.pixels));
+            }
+        }
+        WanPublicMode::ExtendClip if prepared.route == WanI2vRoute::Ti2v5b => {
+            let keyframe = extend_keyframe(request)?;
+            hash.update(b"boundary-keyframe");
+            hash.update(keyframe.frame_idx.to_le_bytes());
+            hash.update(keyframe.strength.to_bits().to_le_bytes());
+            hash.update(keyframe.image.width.to_le_bytes());
+            hash.update(keyframe.image.height.to_le_bytes());
+            hash.update(Sha256::digest(&keyframe.image.pixels));
+        }
+        WanPublicMode::ExtendClip => {
+            let clip = extend_control_clip(request)?;
+            hash.update(b"vace-control-clip");
+            hash.update(clip.masking_strength.to_bits().to_le_bytes());
+            hash.update(clip.start_frame.to_le_bytes());
+            for (index, (frame, mask)) in clip.frames.iter().zip(clip.mask).enumerate() {
+                hash.update((index as u32).to_le_bytes());
+                hash.update(Sha256::digest(&frame.pixels));
+                hash.update(Sha256::digest(&mask.pixels));
+            }
+        }
+        WanPublicMode::VideoBridge if prepared.route == WanI2vRoute::Ti2v5b => {
+            for (role, keyframe) in ["left-tail", "right-head"]
+                .into_iter()
+                .zip(bridge_keyframes(request)?)
+            {
+                hash.update(role.as_bytes());
+                hash.update(keyframe.frame_idx.to_le_bytes());
+                hash.update(keyframe.strength.to_bits().to_le_bytes());
+                hash.update(keyframe.image.width.to_le_bytes());
+                hash.update(keyframe.image.height.to_le_bytes());
+                hash.update(Sha256::digest(&keyframe.image.pixels));
+            }
+        }
+        WanPublicMode::VideoBridge => {
+            let clip = bridge_control_clip(request)?;
+            hash.update(b"vace-bridge-control-clip");
+            hash.update(clip.masking_strength.to_bits().to_le_bytes());
+            hash.update(clip.start_frame.to_le_bytes());
+            for (index, (frame, mask)) in clip.frames.iter().zip(clip.mask).enumerate() {
+                hash.update((index as u32).to_le_bytes());
+                hash.update(Sha256::digest(&frame.pixels));
+                hash.update(Sha256::digest(&mask.pixels));
+            }
+        }
+        WanPublicMode::ReplacePerson => {
+            let (clip, references) = replace_person_carrier(request)?;
+            hash.update(b"vace-replace-person-control-clip");
+            hash.update([clip.mode as u8]);
+            hash.update(clip.masking_strength.to_bits().to_le_bytes());
+            hash.update(clip.start_frame.to_le_bytes());
+            for (index, (frame, mask)) in clip.frames.iter().zip(clip.mask).enumerate() {
+                hash.update((index as u32).to_le_bytes());
+                hash.update(Sha256::digest(&frame.pixels));
+                hash.update(Sha256::digest(&mask.pixels));
+            }
+            for (ordinal, reference) in references.into_iter().enumerate() {
+                hash.update((ordinal as u32).to_le_bytes());
+                hash.update(reference.width.to_le_bytes());
+                hash.update(reference.height.to_le_bytes());
+                hash.update(Sha256::digest(&reference.pixels));
+            }
+        }
+    }
+    Ok(format!(
+        "{RECEIPT_VERSION}:{}:fps{}:{}:{selection_receipt}:{:x}",
+        mode.key(),
+        request.fps.unwrap(),
+        prepared.artifact_identity,
+        hash.finalize()
+    ))
+}
+
+/// The public frame rate carried in plain text by a [`RECEIPT_VERSION`] evidence revision, together
+/// with the receipt tail that follows it.
+///
+/// Returned as `(fps, tail)` where `tail` is everything after `…:fps<fps>:` — the artifact identity,
+/// selection receipt and digest. `None` when the revision is not a receipt of this version and mode.
+fn receipt_rate_and_tail(evidence_revision: &str, mode: WanPublicMode) -> Option<(u32, &str)> {
+    let rest = evidence_revision.strip_prefix(RECEIPT_VERSION)?;
+    let rest = rest.strip_prefix(':')?;
+    let rest = rest.strip_prefix(mode.key())?;
+    let rest = rest.strip_prefix(':')?;
+    let (rate, tail) = rest.split_once(':')?;
+    let rate = rate.strip_prefix("fps")?;
+    // `parse` accepts a leading `+`; the emitter never writes one, so refuse a re-spelling that
+    // would let two distinct receipts claim the same rate.
+    if rate.is_empty() || !rate.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some((rate.parse().ok()?, tail))
+}
+
+pub fn validate_context(
+    prepared: &PreparedWanI2vMemory,
+    context: &MemoryRunContext,
+) -> crate::Result<()> {
+    prepared.ensure_unchanged()?;
+    let geometry = context.geometry;
+    let mode = match context.mode.as_key() {
+        // The VACE routes have no exact public I2V request contract (`request_mode` and
+        // `contract_for_mode_key` both refuse it), so admission must refuse it here too rather
+        // than admit a row no request can ever execute against.
+        "text_to_video" if prepared.route == WanI2vRoute::T2v14b => WanPublicMode::TextToVideo,
+        "image_to_video"
+            if prepared.route != WanI2vRoute::Vace && prepared.route != WanI2vRoute::T2v14b =>
+        {
+            WanPublicMode::ImageToVideo
+        }
+        "first_last_frame" if prepared.route == WanI2vRoute::Ti2v5b => {
+            WanPublicMode::FirstLastFrame
+        }
+        "extend_clip"
+            if prepared.route == WanI2vRoute::Vace
+                || (prepared.route == WanI2vRoute::Ti2v5b
+                    && prepared.backend == WanI2vBackend::Mlx) =>
+        {
+            WanPublicMode::ExtendClip
+        }
+        "video_bridge"
+            if prepared.route == WanI2vRoute::Vace
+                || (prepared.route == WanI2vRoute::Ti2v5b
+                    && prepared.backend == WanI2vBackend::Mlx) =>
+        {
+            WanPublicMode::VideoBridge
+        }
+        "replace_person" if matches!(prepared.route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) => {
+            WanPublicMode::ReplacePerson
+        }
+        _ => {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: crossed Wan public memory mode",
+                prepared.route.provider_id()
+            )))
+        }
+    };
+    let request_contract = request_contract_for_mode(prepared, mode);
+    let selection_receipt = selection_receipt_digest(&context.selection);
+    // The receipt carries its own frame rate (see [`RECEIPT_VERSION`]), so the exact public rate
+    // menu is pinned here instead of OR-ing 16 and 24 fps into one indistinguishable cell.
+    let Some((fps, tail)) = receipt_rate_and_tail(&context.evidence_revision, mode) else {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: crossed Wan I2V memory context",
+            prepared.route.provider_id()
+        )));
+    };
+    let tail_prefix = format!("{}:{selection_receipt}:", prepared.artifact_identity);
+    let rate_ok = match mode {
+        WanPublicMode::TextToVideo | WanPublicMode::ImageToVideo => {
+            prepared.route.accepts_rate(fps, geometry.frames)
+        }
+        WanPublicMode::FirstLastFrame => {
+            prepared.route.accepts_first_last_rate(fps, geometry.frames)
+        }
+        WanPublicMode::ExtendClip | WanPublicMode::VideoBridge => match prepared.route {
+            WanI2vRoute::Ti2v5b => prepared.route.accepts_first_last_rate(fps, geometry.frames),
+            WanI2vRoute::Vace => prepared.route.accepts_rate(fps, geometry.frames),
+            WanI2vRoute::T2v14b | WanI2vRoute::I2v14b | WanI2vRoute::VaceFun => false,
+        },
+        WanPublicMode::ReplacePerson => prepared.route.accepts_rate(fps, geometry.frames),
+    };
+    let carrier_ok = match mode {
+        WanPublicMode::TextToVideo => geometry.reference_count == 0,
+        WanPublicMode::ImageToVideo => geometry.reference_count == 1,
+        WanPublicMode::FirstLastFrame => geometry.reference_count == 2,
+        WanPublicMode::ExtendClip => geometry.reference_count == 1,
+        WanPublicMode::VideoBridge => geometry.reference_count == 0,
+        WanPublicMode::ReplacePerson => (1..=4).contains(&geometry.reference_count),
+    };
+    let selection_ok = match mode {
+        WanPublicMode::ExtendClip | WanPublicMode::VideoBridge => {
+            matches!(
+                context.selection.strategy,
+                MemoryStrategy::Resident | MemoryStrategy::BoundedDecode
+            )
+        }
+        WanPublicMode::ReplacePerson if prepared.route == WanI2vRoute::Vace => matches!(
+            context.selection.strategy,
+            MemoryStrategy::Resident | MemoryStrategy::BoundedDecode
+        ),
+        WanPublicMode::ReplacePerson => {
+            matches!(
+                context.selection.strategy,
+                MemoryStrategy::Resident
+                    | MemoryStrategy::StagedResidency
+                    | MemoryStrategy::BoundedDecode
+            )
+        }
+        WanPublicMode::FirstLastFrame if prepared.backend == WanI2vBackend::Mlx => matches!(
+            context.selection.strategy,
+            MemoryStrategy::Resident | MemoryStrategy::BoundedDecode
+        ),
+        WanPublicMode::TextToVideo
+        | WanPublicMode::ImageToVideo
+        | WanPublicMode::FirstLastFrame => matches!(
+            context.selection.strategy,
+            MemoryStrategy::Resident
+                | MemoryStrategy::StagedResidency
+                | MemoryStrategy::BoundedDecode
+        ),
+    };
+    // Which public modes carry a reference still, named rather than written as the negation of the
+    // two that do not: `has_reference != !matches!(..)` said the same thing and read as a typo, and
+    // `-D clippy::nonminimal_bool` refuses it on the CUDA lane.
+    let carries_reference = !matches!(
+        mode,
+        WanPublicMode::VideoBridge | WanPublicMode::TextToVideo
+    );
+    if !selection_ok
+        || geometry.batch != 1
+        || !carrier_ok
+        || context.has_reference != carries_reference
+        || !prepared
+            .route
+            .public_geometries()
+            .contains(&(geometry.width, geometry.height))
+        || !rate_ok
+        || context.overlay.as_deref() != Some(prepared.adapter_identity.as_str())
+        || context.use_pid
+        || context.has_phases
+        || !tail.starts_with(&tail_prefix)
+    {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: crossed Wan I2V memory context",
+            prepared.route.provider_id()
+        )));
+    }
+    match crate::standard_memory_strategy_safety_check(
+        &request_contract,
+        context,
+        Some(prepared.tier),
+        None,
+    ) {
+        MemorySafetyDecision::Accept => Ok(()),
+        MemorySafetyDecision::Reject { reason } => Err(crate::Error::Unsupported(reason)),
+    }
+}
+
+/// Reconstruct the exact selection carried by an executing request and verify that no request
+/// control was added, dropped, or relabeled after admission.
+pub fn selection_from_request(
+    prepared: &PreparedWanI2vMemory,
+    request: &GenerationRequest,
+) -> crate::Result<MemorySelection> {
+    let mode = validate_request(prepared, request)?;
+    let request_contract = request_contract_for_mode(prepared, mode);
+    let memory = request.memory.ok_or_else(|| {
+        crate::Error::Unsupported(format!(
+            "{}: admitted Wan I2V request is missing its explicit memory carrier",
+            prepared.route.provider_id()
+        ))
+    })?;
+    let strategy = if memory.stream_transformer_blocks {
+        MemoryStrategy::BoundedTransformerResidency
+    } else if memory.chunk_attention {
+        MemoryStrategy::BoundedAttention
+    } else if memory.tile_vae_decode {
+        MemoryStrategy::BoundedDecode
+    } else if memory.stage_residency {
+        MemoryStrategy::StagedResidency
+    } else {
+        MemoryStrategy::Resident
+    };
+    let selection = MemorySelection {
+        strategy,
+        parameters: MemoryStrategyParameters {
+            stage_residency: None,
+            decode_tile_edge: memory.decode_tile_edge,
+            decode_overlap: memory.decode_overlap,
+            attention_chunk_size: memory.attention_chunk_size,
+            transformer_window_size: memory.transformer_window_size,
+            transformer_window_component: memory.transformer_window_component,
+        },
+        tier: prepared.tier,
+    };
+    validate_selection(prepared, mode, &selection)?;
+    if request_contract.generation_memory(&selection) != Some(memory) {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: request memory controls do not match the selected Wan I2V rung",
+            prepared.route.provider_id()
+        )));
+    }
+    Ok(selection)
+}
+
+/// Provider-facing receipt minting after admission has installed the selected memory carrier.
+/// Retaining this two-argument surface keeps paired callers source-compatible while making the
+/// request's exact carrier authoritative for strategy/parameter identity.
+pub fn request_evidence_revision(
+    prepared: &PreparedWanI2vMemory,
+    request: &GenerationRequest,
+) -> crate::Result<String> {
+    let selection = selection_from_request(prepared, request)?;
+    request_evidence_revision_for_selection(prepared, request, &selection)
+}
+
+/// Configure-boundary validation: the request must carry the same exact rung/parameters as the
+/// admitted context, and the full selection-bound request receipt must still match byte-for-byte.
+pub fn validate_request_evidence(
+    prepared: &PreparedWanI2vMemory,
+    request: &GenerationRequest,
+    admitted_selection: &MemorySelection,
+    admitted_evidence: &str,
+) -> crate::Result<String> {
+    let request_selection = selection_from_request(prepared, request)?;
+    if request_selection != *admitted_selection {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: request rung/parameters crossed after admission",
+            prepared.route.provider_id()
+        )));
+    }
+    let actual = request_evidence_revision_for_selection(prepared, request, admitted_selection)?;
+    if actual != admitted_evidence {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: request axes crossed after admission",
+            prepared.route.provider_id()
+        )));
+    }
+    Ok(actual)
+}
+
+pub fn geometry_from_request(request: &GenerationRequest) -> MemoryGeometry {
+    MemoryGeometry {
+        width: request.width,
+        height: request.height,
+        batch: request.count,
+        frames: request.frames.unwrap_or_default(),
+        // Clip carriers are execution inputs, not semantic image references.  In particular a
+        // bridge has two endpoint carriers but zero conceptual references, so it cannot borrow
+        // a still-image/FLF memory row merely because it has conditioning entries.
+        //
+        // This is deliberately the *same* function both request-scope cores compare an executing
+        // request against ([`GenerationRequest::memory_reference_count`]).  Admission and execution
+        // previously counted the carriers with two separate rules, and they disagreed on the
+        // Wan-VACE `extend_clip` ControlClip (admission 1, execution 0) and on the Ti2V-5B
+        // `video_bridge` keyframe pair (admission 0, execution 2) — so neither mode could ever pass
+        // both gates.  One authority, no drift.
+        reference_count: request.memory_reference_count(),
+    }
+}
+
+pub fn load_policy_for_selection(selection: MemoryStrategy) -> OffloadPolicy {
+    if selection == MemoryStrategy::StagedResidency || selection == MemoryStrategy::BoundedDecode {
+        OffloadPolicy::Sequential
+    } else {
+        OffloadPolicy::Resident
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AdapterSpec, Image, MemoryStrategySupport};
+
+    fn write_safetensors(path: &Path, tensors: &[(&str, &str, &[usize])]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut offset = 0_u64;
+        let mut header = serde_json::Map::new();
+        let mut data = Vec::new();
+        for &(name, dtype, shape) in tensors {
+            let width = match dtype {
+                "F32" | "U32" => 4,
+                "F16" | "BF16" => 2,
+                _ => panic!("dtype"),
+            };
+            let bytes = shape.iter().product::<usize>() * width;
+            header.insert(
+                name.to_owned(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [offset, offset + bytes as u64],
+                }),
+            );
+            data.resize(data.len() + bytes, name.len() as u8);
+            offset += bytes as u64;
+        }
+        let mut json = serde_json::to_vec(&header).unwrap();
+        while !json.len().is_multiple_of(8) {
+            json.push(b' ');
+        }
+        let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(json);
+        bytes.extend(data);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Write a structurally real converted `t5_encoder.safetensors` (SC-22667).
+    ///
+    /// The MLX loader packs exactly the seven bias-less projections of each block and leaves the
+    /// token embedding, the per-block norms and position-bias tables and the final norm dense, so a
+    /// fixture carrying a single tensor named `weight` cannot exercise
+    /// [`mlx_text_encoder_bytes`] at all — every arm it distinguishes needs its own key.
+    /// `dim` is a whole number of MLX affine groups, as the real encoder's is.
+    fn write_umt5_encoder(path: &Path, blocks: usize, dim: usize) {
+        let square = vec![dim, dim];
+        let vector = vec![dim];
+        let mut owned: Vec<(String, &str, Vec<usize>)> = vec![
+            (
+                "token_embedding.weight".to_owned(),
+                "BF16",
+                vec![dim * 4, dim],
+            ),
+            ("norm.weight".to_owned(), "BF16", vector.clone()),
+        ];
+        for block in 0..blocks {
+            for leaf in [
+                "attn.q",
+                "attn.k",
+                "attn.v",
+                "attn.o",
+                "ffn.gate_proj",
+                "ffn.fc1",
+                "ffn.fc2",
+            ] {
+                owned.push((
+                    format!("blocks.{block}.{leaf}.weight"),
+                    "BF16",
+                    square.clone(),
+                ));
+            }
+            for leaf in ["norm1.weight", "norm2.weight"] {
+                owned.push((format!("blocks.{block}.{leaf}"), "BF16", vector.clone()));
+            }
+            owned.push((
+                format!("blocks.{block}.pos_embedding.embedding.weight"),
+                "BF16",
+                vec![32, 8],
+            ));
+        }
+        let tensors = owned
+            .iter()
+            .map(|(name, dtype, shape)| (name.as_str(), *dtype, shape.as_slice()))
+            .collect::<Vec<_>>();
+        write_safetensors(path, &tensors);
+    }
+
+    fn mlx_fixture(route: WanI2vRoute, quant: Option<Quant>) -> (tempfile::TempDir, LoadSpec) {
+        let tmp = tempfile::tempdir().unwrap();
+        let tier = MemoryNumericTier {
+            precision: Precision::Bf16,
+            quant,
+            component_precision_floors: &[],
+        };
+        let (repository, revision) = repository_policy(WanI2vBackend::Mlx, route, tier);
+        let tier_name = match quant {
+            Some(Quant::Q4) => "q4",
+            Some(Quant::Q8) => "q8",
+            None => "bf16",
+            _ => unreachable!(),
+        };
+        let root = tmp
+            .path()
+            .join(repo_dir(repository))
+            .join("snapshots")
+            .join(fixture_revision(revision))
+            .join(tier_name);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("config.json"),
+            format!(
+                "{{\"route\":\"{}\",\"tier\":\"{tier_name}\"}}",
+                route.provider_id()
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.join("tokenizer.json"), "{}").unwrap();
+        let files: &[(&str, usize)] = match route {
+            WanI2vRoute::Ti2v5b => &[
+                ("model.safetensors", 11),
+                ("t5_encoder.safetensors", 7),
+                ("vae.safetensors", 5),
+            ],
+            WanI2vRoute::T2v14b | WanI2vRoute::I2v14b => &[
+                ("high_noise_model.safetensors", 13),
+                ("low_noise_model.safetensors", 17),
+                ("t5_encoder.safetensors", 7),
+                ("vae.safetensors", 5),
+            ],
+            WanI2vRoute::Vace => panic!("use a dedicated VACE fixture"),
+            WanI2vRoute::VaceFun => panic!("use a dedicated VACE-Fun fixture"),
+        };
+        for &(name, logical) in files {
+            if quant.is_some() && name.contains("model") {
+                let packed_columns = if quant == Some(Quant::Q4) { 8 } else { 16 };
+                write_safetensors(
+                    &root.join(name),
+                    &[
+                        ("proj.weight", "U32", &[logical, packed_columns]),
+                        ("proj.scales", "BF16", &[logical, 1]),
+                        ("proj.biases", "BF16", &[logical, 1]),
+                    ],
+                );
+            } else if name == "t5_encoder.safetensors" {
+                write_umt5_encoder(&root.join(name), logical, 64);
+            } else {
+                write_safetensors(&root.join(name), &[("weight", "BF16", &[logical, 64])]);
+            }
+        }
+        let mut spec =
+            LoadSpec::new(WeightsSource::Dir(root)).with_resolved_route(route.provider_id());
+        spec.quantize = quant;
+        prepare_load_spec(&mut spec, WanI2vBackend::Mlx, route.provider_id()).unwrap();
+        (tmp, spec)
+    }
+
+    fn candle_fixture(route: WanI2vRoute, quant: Option<Quant>) -> (tempfile::TempDir, LoadSpec) {
+        let tmp = tempfile::tempdir().unwrap();
+        let tier = MemoryNumericTier {
+            precision: Precision::Bf16,
+            quant,
+            component_precision_floors: &[],
+        };
+        let (repository, revision) = repository_policy(WanI2vBackend::Candle, route, tier);
+        let mut root = tmp
+            .path()
+            .join(repo_dir(repository))
+            .join("snapshots")
+            .join(fixture_revision(revision));
+        if let Some(quant) = quant {
+            root = root.join(if quant == Quant::Q4 { "q4" } else { "q8" });
+        }
+        std::fs::create_dir_all(root.join("tokenizer")).unwrap();
+        std::fs::write(root.join("model_index.json"), "{}").unwrap();
+        std::fs::write(root.join("tokenizer/tokenizer.json"), "{}").unwrap();
+        let components: &[&str] = match route {
+            WanI2vRoute::Ti2v5b => &["text_encoder", "transformer", "vae"],
+            WanI2vRoute::T2v14b | WanI2vRoute::I2v14b => {
+                &["text_encoder", "transformer", "transformer_2", "vae"]
+            }
+            WanI2vRoute::Vace => panic!("use a dedicated VACE fixture"),
+            WanI2vRoute::VaceFun => panic!("use a dedicated VACE-Fun fixture"),
+        };
+        for (index, component) in components.iter().enumerate() {
+            std::fs::create_dir_all(root.join(component)).unwrap();
+            std::fs::write(root.join(component).join("config.json"), "{}").unwrap();
+            if let Some(quant) = quant.filter(|_| component.starts_with("transformer")) {
+                let packed_columns = if quant == Quant::Q4 { 8 } else { 16 };
+                write_safetensors(
+                    &root.join(component).join("model.safetensors"),
+                    &[
+                        ("proj.weight", "U32", &[index + 2, packed_columns]),
+                        ("proj.scales", "F32", &[index + 2, 1]),
+                        ("proj.biases", "F32", &[index + 2, 1]),
+                    ],
+                );
+                std::fs::write(
+                    root.join(component).join("quantize_config.json"),
+                    format!(
+                        "{{\"bits\":{},\"quantization\":{{\"group_size\":64}}}}",
+                        quant.bits()
+                    ),
+                )
+                .unwrap();
+            } else {
+                let shape = if component.starts_with("transformer") {
+                    vec![index + 2, 64]
+                } else {
+                    vec![index + 2, index + 3]
+                };
+                write_safetensors(
+                    &root.join(component).join("model.safetensors"),
+                    &[("weight", "F32", &shape)],
+                );
+            }
+        }
+        let mut spec =
+            LoadSpec::new(WeightsSource::Dir(root)).with_resolved_route(route.provider_id());
+        spec.quantize = quant;
+        prepare_load_spec(&mut spec, WanI2vBackend::Candle, route.provider_id()).unwrap();
+        (tmp, spec)
+    }
+
+    fn vace_route_fixture(
+        backend: WanI2vBackend,
+        quant: Option<Quant>,
+        route: WanI2vRoute,
+    ) -> (tempfile::TempDir, LoadSpec) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("vace");
+        match backend {
+            WanI2vBackend::Mlx => {
+                std::fs::create_dir_all(root.join("transformer")).unwrap();
+                std::fs::write(root.join("transformer/config.json"), "{}").unwrap();
+                if route == WanI2vRoute::VaceFun {
+                    std::fs::create_dir_all(root.join("transformer_2")).unwrap();
+                    std::fs::write(root.join("transformer_2/config.json"), "{}").unwrap();
+                    write_safetensors(
+                        &root.join("transformer_2/model.safetensors"),
+                        &[("blocks.0.self_attn.to_q.weight", "BF16", &[9, 8])],
+                    );
+                }
+                std::fs::write(root.join("tokenizer.json"), "{}").unwrap();
+                write_safetensors(
+                    &root.join("transformer/model.safetensors"),
+                    &[("blocks.0.self_attn.to_q.weight", "BF16", &[8, 8])],
+                );
+                write_umt5_encoder(&root.join("t5_encoder.safetensors"), 1, 64);
+                write_safetensors(
+                    &root.join("vae.safetensors"),
+                    &[("weight", "BF16", &[4, 4])],
+                );
+            }
+            WanI2vBackend::Candle => {
+                for component in ["transformer", "text_encoder", "vae"]
+                    .into_iter()
+                    .chain((route == WanI2vRoute::VaceFun).then_some("transformer_2"))
+                {
+                    std::fs::create_dir_all(root.join(component)).unwrap();
+                    std::fs::write(root.join(component).join("config.json"), "{}").unwrap();
+                    write_safetensors(
+                        &root.join(component).join("model.safetensors"),
+                        &[("weight", "BF16", &[4, 4])],
+                    );
+                }
+                std::fs::create_dir_all(root.join("tokenizer")).unwrap();
+                std::fs::write(root.join("tokenizer/tokenizer.json"), "{}").unwrap();
+            }
+        }
+        let mut spec =
+            LoadSpec::new(WeightsSource::Dir(root)).with_resolved_route(route.provider_id());
+        spec.quantize = quant;
+        let root = match &spec.weights {
+            WeightsSource::Dir(root) => root,
+            _ => unreachable!(),
+        };
+        if route == WanI2vRoute::VaceFun {
+            ensure_wan_vace_fun_source_receipt(root, backend)
+        } else {
+            ensure_wan_vace_source_receipt(root, backend)
+        }
+        .unwrap();
+        prepare_load_spec(&mut spec, backend, route.provider_id()).unwrap();
+        (tmp, spec)
+    }
+
+    fn vace_fixture(backend: WanI2vBackend, quant: Option<Quant>) -> (tempfile::TempDir, LoadSpec) {
+        vace_route_fixture(backend, quant, WanI2vRoute::Vace)
+    }
+
+    fn vace_fun_fixture(
+        backend: WanI2vBackend,
+        quant: Option<Quant>,
+    ) -> (tempfile::TempDir, LoadSpec) {
+        vace_route_fixture(backend, quant, WanI2vRoute::VaceFun)
+    }
+
+    fn vace_extend_request() -> GenerationRequest {
+        let image = Image {
+            width: 832,
+            height: 480,
+            pixels: vec![17; 832 * 480 * 3],
+        };
+        GenerationRequest {
+            prompt: "continue the source motion".to_owned(),
+            width: 832,
+            height: 480,
+            count: 1,
+            seed: Some(29),
+            steps: Some(50),
+            guidance: Some(5.0),
+            frames: Some(45),
+            fps: Some(16),
+            video_mode: Some("extend_clip".to_owned()),
+            control_scale: Some(1.0),
+            conditioning: vec![Conditioning::ControlClip {
+                frames: vec![image.clone(); 45],
+                mask: vec![image; 45],
+                masking_strength: 1.0,
+                start_frame: 0,
+                mode: crate::ReplacementMode::default(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn ti2v_extend_request() -> GenerationRequest {
+        GenerationRequest {
+            prompt: "continue from the exact source boundary".to_owned(),
+            negative_prompt: Some("camera cut".to_owned()),
+            width: 832,
+            height: 480,
+            count: 1,
+            seed: Some(31),
+            steps: Some(20),
+            guidance: Some(5.0),
+            frames: Some(61),
+            fps: Some(16),
+            video_mode: Some("extend_clip".to_owned()),
+            conditioning: vec![Conditioning::Keyframe {
+                image: Image {
+                    width: 832,
+                    height: 480,
+                    pixels: vec![23; 832 * 480 * 3],
+                },
+                frame_idx: 0,
+                strength: 0.75,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn bridge_keyframes_request() -> GenerationRequest {
+        let mut request = ti2v_extend_request();
+        request.prompt = "bridge the two clip boundaries".to_owned();
+        request.video_mode = Some("video_bridge".to_owned());
+        request.conditioning = vec![
+            Conditioning::Keyframe {
+                image: Image {
+                    width: 832,
+                    height: 480,
+                    pixels: vec![31; 832 * 480 * 3],
+                },
+                frame_idx: 0,
+                strength: 0.25,
+            },
+            Conditioning::Keyframe {
+                image: Image {
+                    width: 832,
+                    height: 480,
+                    pixels: vec![73; 832 * 480 * 3],
+                },
+                frame_idx: -1,
+                strength: 0.75,
+            },
+        ];
+        request
+    }
+
+    fn vace_bridge_request() -> GenerationRequest {
+        let mut request = vace_extend_request();
+        request.prompt = "bridge the two source clips through a neutral gap".to_owned();
+        request.video_mode = Some("video_bridge".to_owned());
+        if let Conditioning::ControlClip { frames, mask, .. } = &mut request.conditioning[0] {
+            frames[..1].fill(Image {
+                width: 832,
+                height: 480,
+                pixels: vec![11; 832 * 480 * 3],
+            });
+            // This is the exact mid-gray that SceneWorks' production
+            // `build_extend_bridge_vace_conditioning` writes for its generated span.  Do not use
+            // black here: black is reserved for the anchor-mask polarity.
+            frames[1..42].fill(Image {
+                width: 832,
+                height: 480,
+                pixels: vec![WAN_VACE_BRIDGE_NEUTRAL_RGB; 832 * 480 * 3],
+            });
+            frames[42..].fill(Image {
+                width: 832,
+                height: 480,
+                pixels: vec![89; 832 * 480 * 3],
+            });
+            mask[..1].fill(Image {
+                width: 832,
+                height: 480,
+                pixels: vec![0; 832 * 480 * 3],
+            });
+            mask[1..42].fill(Image {
+                width: 832,
+                height: 480,
+                pixels: vec![255; 832 * 480 * 3],
+            });
+            mask[42..].fill(Image {
+                width: 832,
+                height: 480,
+                pixels: vec![0; 832 * 480 * 3],
+            });
+        }
+        request
+    }
+
+    fn replace_person_request(
+        references: usize,
+        mode: crate::ReplacementMode,
+    ) -> GenerationRequest {
+        let frame = Image {
+            width: 832,
+            height: 480,
+            pixels: vec![37; 832 * 480 * 3],
+        };
+        let mask = Image {
+            width: 832,
+            height: 480,
+            pixels: vec![255; 832 * 480 * 3],
+        };
+        let mut conditioning = vec![Conditioning::ControlClip {
+            frames: vec![frame; 45],
+            mask: vec![mask; 45],
+            masking_strength: 0.625,
+            start_frame: 0,
+            mode,
+        }];
+        conditioning.extend((0..references).map(|ordinal| Conditioning::Reference {
+            image: Image {
+                width: 16,
+                height: 16,
+                pixels: vec![ordinal as u8 + 1; 16 * 16 * 3],
+            },
+            strength: None,
+        }));
+        GenerationRequest {
+            prompt: "replace the tracked person".to_owned(),
+            negative_prompt: Some("identity drift".to_owned()),
+            width: 832,
+            height: 480,
+            count: 1,
+            seed: Some(0x1234_5678),
+            steps: Some(40),
+            guidance: Some(5.0),
+            frames: Some(45),
+            fps: Some(16),
+            video_mode: Some(format!("replace_person@{}", "a".repeat(64))),
+            control_scale: Some(0.75),
+            conditioning,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn replace_person_seals_vace_and_vace_fun_routes_rungs_tiers_and_full_carrier() {
+        for (route, backend, quant) in [
+            (WanI2vRoute::Vace, WanI2vBackend::Mlx, Some(Quant::Q4)),
+            (WanI2vRoute::Vace, WanI2vBackend::Mlx, Some(Quant::Q8)),
+            (WanI2vRoute::Vace, WanI2vBackend::Mlx, None),
+            (WanI2vRoute::Vace, WanI2vBackend::Candle, None),
+            (WanI2vRoute::VaceFun, WanI2vBackend::Mlx, Some(Quant::Q4)),
+            (WanI2vRoute::VaceFun, WanI2vBackend::Mlx, Some(Quant::Q8)),
+            (WanI2vRoute::VaceFun, WanI2vBackend::Mlx, None),
+            (WanI2vRoute::VaceFun, WanI2vBackend::Candle, None),
+        ] {
+            let (_tmp, spec) = vace_route_fixture(backend, quant, route);
+            let prepared =
+                PreparedWanI2vMemory::prepare(&spec, backend, route.provider_id()).unwrap();
+            assert_eq!(prepared.tier.quant, quant);
+            assert_eq!(prepared.route, route);
+            assert_eq!(prepared.backend, backend);
+            assert_eq!(prepared.artifact_identity.len(), 64);
+            assert_eq!(prepared.revision.len(), 64);
+            for replacement in [
+                crate::ReplacementMode::FaceOnly,
+                crate::ReplacementMode::FullPersonKeepOutfit,
+                crate::ReplacementMode::FullPersonReplaceOutfit,
+            ] {
+                for references in 1..=4 {
+                    let mut request = replace_person_request(references, replacement);
+                    assert_eq!(
+                        validate_request(&prepared, &request).unwrap(),
+                        WanPublicMode::ReplacePerson
+                    );
+                    assert_eq!(
+                        geometry_from_request(&request).reference_count,
+                        references as u32
+                    );
+                    let contract = request_contract(&prepared, &request).unwrap();
+                    for strategy in MemoryStrategy::ALL {
+                        let expected = matches!(
+                            strategy,
+                            MemoryStrategy::Resident | MemoryStrategy::BoundedDecode
+                        ) || (route == WanI2vRoute::VaceFun
+                            && strategy == MemoryStrategy::StagedResidency);
+                        assert_eq!(
+                            contract.capability(strategy).unwrap().support,
+                            if expected {
+                                MemoryStrategySupport::Implemented
+                            } else {
+                                MemoryStrategySupport::Missing
+                            }
+                        );
+                        if expected {
+                            let selected = selection(&prepared, strategy);
+                            request.memory = contract.generation_memory(&selected);
+                            let evidence = request_evidence_revision(&prepared, &request).unwrap();
+                            let run_context = context(&prepared, &request, selected, evidence);
+                            validate_context(&prepared, &run_context).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+
+        let (_tmp, mut packed_candle) = vace_fun_fixture(WanI2vBackend::Candle, None);
+        packed_candle.quantize = Some(Quant::Q4);
+        assert!(prepare_load_spec(
+            &mut packed_candle,
+            WanI2vBackend::Candle,
+            WanI2vRoute::VaceFun.provider_id()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn replace_person_receipt_rejects_crossed_public_and_physical_identity() {
+        let (_tmp, spec) = vace_fun_fixture(WanI2vBackend::Mlx, Some(Quant::Q4));
+        let prepared = PreparedWanI2vMemory::prepare(
+            &spec,
+            WanI2vBackend::Mlx,
+            WanI2vRoute::VaceFun.provider_id(),
+        )
+        .unwrap();
+        let mut request = replace_person_request(2, crate::ReplacementMode::FaceOnly);
+        let resident = MemorySelection {
+            strategy: MemoryStrategy::Resident,
+            parameters: MemoryStrategyParameters::default(),
+            tier: prepared.tier,
+        };
+        request.memory = request_contract(&prepared, &request)
+            .unwrap()
+            .generation_memory(&resident);
+        let receipt = request_evidence_revision(&prepared, &request).unwrap();
+
+        request.conditioning.swap(1, 2);
+        assert_ne!(
+            request_evidence_revision(&prepared, &request).unwrap(),
+            receipt
+        );
+        request.conditioning.swap(1, 2);
+        if let Conditioning::ControlClip {
+            mask,
+            masking_strength,
+            mode,
+            ..
+        } = &mut request.conditioning[0]
+        {
+            mask[0].pixels[0] ^= 1;
+            *masking_strength = 0.5;
+            *mode = crate::ReplacementMode::FullPersonKeepOutfit;
+        }
+        assert_ne!(
+            request_evidence_revision(&prepared, &request).unwrap(),
+            receipt
+        );
+        request.video_mode = Some(format!("replace_person@{}", "b".repeat(64)));
+        assert_ne!(
+            request_evidence_revision(&prepared, &request).unwrap(),
+            receipt
+        );
+
+        let root = match &spec.weights {
+            WeightsSource::Dir(root) => root,
+            _ => unreachable!(),
+        };
+        assert!(ensure_wan_vace_fun_source_receipt(root, WanI2vBackend::Candle).is_err());
+        assert!(PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Mlx, "wan_vace").is_err());
+    }
+
+    #[test]
+    fn vace_fun_seals_exact_ordered_shared_and_expert_adapters_on_both_backends() {
+        for (backend, quant) in [
+            (WanI2vBackend::Mlx, Some(Quant::Q4)),
+            (WanI2vBackend::Candle, None),
+        ] {
+            let (tmp, fixture) = vace_fun_fixture(backend, quant);
+            let shared = tmp.path().join("shared-adapter.safetensors");
+            let high = tmp.path().join("high-adapter.safetensors");
+            let low = tmp.path().join("low-adapter.safetensors");
+            for path in [&shared, &high, &low] {
+                write_safetensors(path, &[("lora_A.weight", "F32", &[2, 3])]);
+            }
+
+            let mut ordered = LoadSpec::new(fixture.weights.clone())
+                .with_resolved_route(WanI2vRoute::VaceFun.provider_id());
+            ordered.quantize = quant;
+            ordered.adapters = vec![
+                AdapterSpec::new(shared.clone(), 0.5, AdapterKind::Lora),
+                AdapterSpec::new(high.clone(), 0.75, AdapterKind::Lora)
+                    .with_moe_expert(MoeExpert::High),
+                AdapterSpec::new(low.clone(), 1.0, AdapterKind::Lora)
+                    .with_moe_expert(MoeExpert::Low),
+            ];
+            prepare_load_spec(&mut ordered, backend, WanI2vRoute::VaceFun.provider_id()).unwrap();
+            let prepared = PreparedWanI2vMemory::prepare(
+                &ordered,
+                backend,
+                WanI2vRoute::VaceFun.provider_id(),
+            )
+            .unwrap();
+            assert_eq!(
+                prepared
+                    .adapters
+                    .iter()
+                    .map(|adapter| adapter.ordinal)
+                    .collect::<Vec<_>>(),
+                vec![0, 1, 2]
+            );
+            assert_eq!(
+                prepared
+                    .adapters
+                    .iter()
+                    .map(|adapter| adapter.expert)
+                    .collect::<Vec<_>>(),
+                vec!["shared", "high", "low"]
+            );
+            assert_eq!(prepared.adapters[0].scale_bits, 0.5_f32.to_bits());
+            assert_eq!(prepared.adapters[1].scale_bits, 0.75_f32.to_bits());
+            assert_eq!(prepared.adapters[2].scale_bits, 1.0_f32.to_bits());
+
+            let mut reversed = LoadSpec::new(fixture.weights.clone())
+                .with_resolved_route(WanI2vRoute::VaceFun.provider_id());
+            reversed.quantize = quant;
+            reversed.adapters = ordered.adapters.iter().cloned().rev().collect();
+            prepare_load_spec(&mut reversed, backend, WanI2vRoute::VaceFun.provider_id()).unwrap();
+            let reversed = PreparedWanI2vMemory::prepare(
+                &reversed,
+                backend,
+                WanI2vRoute::VaceFun.provider_id(),
+            )
+            .unwrap();
+            assert_ne!(prepared.adapter_identity, reversed.adapter_identity);
+            assert_ne!(prepared.artifact_identity, reversed.artifact_identity);
+            assert_eq!(prepared.revision, reversed.revision);
+        }
+    }
+
+    #[test]
+    fn vace_bridge_admission_requires_the_production_mid_gray_generated_gap() {
+        let (_tmp, spec) = vace_fixture(WanI2vBackend::Mlx, None);
+        let prepared =
+            PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Mlx, "wan_vace").unwrap();
+        let request = vace_bridge_request();
+        assert_eq!(
+            validate_request(&prepared, &request).unwrap(),
+            WanPublicMode::VideoBridge,
+            "the production builder's raw RGB 128 gap must be admitted before normalization"
+        );
+
+        let mut black_gap = request;
+        if let Conditioning::ControlClip { frames, .. } = &mut black_gap.conditioning[0] {
+            frames[1].pixels.fill(0);
+        }
+        assert!(
+            validate_request(&prepared, &black_gap).is_err(),
+            "black is not a neutral generated gap and must not be admitted as one"
+        );
+    }
+
+    #[test]
+    fn video_bridge_is_zero_reference_with_sealed_vace_and_keyframe_carriers() {
+        for (backend, quant) in [
+            (WanI2vBackend::Mlx, Some(Quant::Q4)),
+            (WanI2vBackend::Mlx, Some(Quant::Q8)),
+            (WanI2vBackend::Mlx, None),
+            (WanI2vBackend::Candle, None),
+        ] {
+            let (_tmp, spec) = vace_fixture(backend, quant);
+            let prepared = PreparedWanI2vMemory::prepare(&spec, backend, "wan_vace").unwrap();
+            let mut request = vace_bridge_request();
+            let contract = request_contract(&prepared, &request).unwrap();
+            for strategy in MemoryStrategy::ALL {
+                let expected = matches!(
+                    strategy,
+                    MemoryStrategy::Resident | MemoryStrategy::BoundedDecode
+                );
+                assert_eq!(
+                    contract.capability(strategy).unwrap().support,
+                    if expected {
+                        MemoryStrategySupport::Implemented
+                    } else {
+                        MemoryStrategySupport::Missing
+                    }
+                );
+            }
+            let strategy = MemoryStrategy::BoundedDecode;
+            let selection = selection(&prepared, strategy);
+            request.memory = contract.generation_memory(&selection);
+            let receipt = request_evidence_revision(&prepared, &request).unwrap();
+            let mut run_context = context(&prepared, &request, selection, receipt.clone());
+            run_context.has_reference = false;
+            assert_eq!(run_context.geometry.reference_count, 0);
+            assert!(validate_context(&prepared, &run_context).is_ok());
+            if let Conditioning::ControlClip { mask, .. } = &mut request.conditioning[0] {
+                mask[1].pixels[0] ^= 1;
+            }
+            assert!(request_evidence_revision(&prepared, &request).is_err());
+        }
+
+        for quant in [Some(Quant::Q4), Some(Quant::Q8), None] {
+            let (_tmp, spec) = mlx_fixture(WanI2vRoute::Ti2v5b, quant);
+            let prepared = PreparedWanI2vMemory::prepare(
+                &spec,
+                WanI2vBackend::Mlx,
+                WanI2vRoute::Ti2v5b.provider_id(),
+            )
+            .unwrap();
+            let mut request = bridge_keyframes_request();
+            let contract = request_contract(&prepared, &request).unwrap();
+            for strategy in MemoryStrategy::ALL {
+                let expected = matches!(
+                    strategy,
+                    MemoryStrategy::Resident | MemoryStrategy::BoundedDecode
+                );
+                assert_eq!(
+                    contract.capability(strategy).unwrap().support,
+                    if expected {
+                        MemoryStrategySupport::Implemented
+                    } else {
+                        MemoryStrategySupport::Missing
+                    }
+                );
+            }
+            let selection = selection(&prepared, MemoryStrategy::BoundedDecode);
+            request.memory = contract.generation_memory(&selection);
+            let receipt = request_evidence_revision(&prepared, &request).unwrap();
+            let mut run_context = context(&prepared, &request, selection, receipt.clone());
+            run_context.has_reference = false;
+            assert_eq!(run_context.geometry.reference_count, 0);
+            assert!(validate_context(&prepared, &run_context).is_ok());
+            request.conditioning.swap(0, 1);
+            assert!(request_evidence_revision(&prepared, &request).is_err());
+        }
+    }
+
+    #[test]
+    fn vace_extend_seals_all_mlx_tiers_and_dense_candle_with_only_resident_and_decode() {
+        for (backend, quants) in [
+            (
+                WanI2vBackend::Mlx,
+                vec![Some(Quant::Q4), Some(Quant::Q8), None],
+            ),
+            (WanI2vBackend::Candle, vec![None]),
+        ] {
+            for quant in quants {
+                let (_tmp, spec) = vace_fixture(backend, quant);
+                let prepared = PreparedWanI2vMemory::prepare(&spec, backend, "wan_vace").unwrap();
+                assert_eq!(prepared.tier.quant, quant);
+                assert_eq!(
+                    prepared.contract.load_shape,
+                    crate::LoadShape::DeferredMaterialization
+                );
+                assert_eq!(prepared.revision.len(), 64);
+                let contract = request_contract(&prepared, &vace_extend_request()).unwrap();
+                for strategy in MemoryStrategy::ALL {
+                    let expected = matches!(
+                        strategy,
+                        MemoryStrategy::Resident | MemoryStrategy::BoundedDecode
+                    );
+                    assert_eq!(
+                        contract.capability(strategy).unwrap().support,
+                        if expected {
+                            MemoryStrategySupport::Implemented
+                        } else {
+                            MemoryStrategySupport::Missing
+                        }
+                    );
+                }
+                let mut request = vace_extend_request();
+                let resident = selection(&prepared, MemoryStrategy::Resident);
+                request.memory = contract.generation_memory(&resident);
+                let evidence =
+                    request_evidence_revision_for_selection(&prepared, &request, &resident)
+                        .unwrap();
+                let staged_context = context(
+                    &prepared,
+                    &request,
+                    selection(&prepared, MemoryStrategy::StagedResidency),
+                    evidence,
+                );
+                assert!(validate_context(&prepared, &staged_context).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn vace_lazy_load_shape_is_declared_at_preparation_and_rejects_crossed_reuse() {
+        for backend in [WanI2vBackend::Mlx, WanI2vBackend::Candle] {
+            let (_tmp, mut spec) = vace_fixture(backend, None);
+            assert_eq!(spec.load_shape, crate::LoadShape::DeferredMaterialization);
+            assert_eq!(
+                spec.load_shape_declaration_result,
+                crate::LoadShapeDeclarationResult::Applied
+            );
+            let prepared = PreparedWanI2vMemory::prepare(&spec, backend, "wan_vace").unwrap();
+            assert_eq!(
+                prepared.contract.load_shape,
+                crate::LoadShape::DeferredMaterialization
+            );
+
+            // A warmed provider may reuse only the same declared shape.  Mutating the
+            // cached spec after preparation cannot relabel lazy VACE as eager.
+            spec.load_shape = crate::LoadShape::EagerMaterialization;
+            assert!(PreparedWanI2vMemory::prepare(&spec, backend, "wan_vace").is_err());
+        }
+    }
+
+    #[test]
+    fn vace_requires_the_exact_immutable_source_receipt() {
+        let (_tmp, mut spec) = vace_fixture(WanI2vBackend::Mlx, None);
+        let root = match &spec.weights {
+            WeightsSource::Dir(root) => root.clone(),
+            _ => unreachable!(),
+        };
+        std::fs::remove_file(root.join(VACE_SOURCE_RECEIPT_FILE)).unwrap();
+        assert!(prepare_load_spec(&mut spec, WanI2vBackend::Mlx, "wan_vace").is_err());
+
+        ensure_wan_vace_source_receipt(&root, WanI2vBackend::Mlx).unwrap();
+        let path = root.join(VACE_SOURCE_RECEIPT_FILE);
+        let mut crossed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        crossed["components"][0]["revision"] =
+            serde_json::json!("0000000000000000000000000000000000000000");
+        std::fs::write(path, serde_json::to_vec(&crossed).unwrap()).unwrap();
+        assert!(prepare_load_spec(&mut spec, WanI2vBackend::Mlx, "wan_vace").is_err());
+    }
+
+    #[test]
+    fn vace_extend_binds_control_pixels_masks_scale_and_exact_carrier() {
+        let (_tmp, spec) = vace_fixture(WanI2vBackend::Mlx, Some(Quant::Q4));
+        let prepared =
+            PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Mlx, "wan_vace").unwrap();
+        let mut request = vace_extend_request();
+        let selection = MemorySelection {
+            strategy: MemoryStrategy::Resident,
+            parameters: MemoryStrategyParameters::default(),
+            tier: prepared.tier,
+        };
+        request.memory = request_contract(&prepared, &request)
+            .unwrap()
+            .generation_memory(&selection);
+        let receipt = request_evidence_revision(&prepared, &request).unwrap();
+        if let Conditioning::ControlClip { frames, .. } = &mut request.conditioning[0] {
+            frames[0].pixels[0] ^= 1;
+        }
+        assert_ne!(
+            request_evidence_revision(&prepared, &request).unwrap(),
+            receipt
+        );
+        if let Conditioning::ControlClip { frames, mask, .. } = &mut request.conditioning[0] {
+            frames[0].pixels[0] ^= 1;
+            mask[0].pixels[0] ^= 1;
+        }
+        assert_ne!(
+            request_evidence_revision(&prepared, &request).unwrap(),
+            receipt
+        );
+        request.conditioning.push(Conditioning::Reference {
+            image: Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 3],
+            },
+            strength: None,
+        });
+        assert!(validate_request(&prepared, &request).is_err());
+    }
+
+    #[test]
+    fn ti2v_extend_is_an_mlx_only_single_boundary_keyframe_with_the_exact_frame_menu() {
+        for quant in [Some(Quant::Q4), Some(Quant::Q8), None] {
+            let (_tmp, spec) = mlx_fixture(WanI2vRoute::Ti2v5b, quant);
+            let prepared = PreparedWanI2vMemory::prepare(
+                &spec,
+                WanI2vBackend::Mlx,
+                WanI2vRoute::Ti2v5b.provider_id(),
+            )
+            .unwrap();
+            let mut request = ti2v_extend_request();
+            let contract = request_contract(&prepared, &request).unwrap();
+            for strategy in MemoryStrategy::ALL {
+                let expected = matches!(
+                    strategy,
+                    MemoryStrategy::Resident | MemoryStrategy::BoundedDecode
+                );
+                assert_eq!(
+                    contract.capability(strategy).unwrap().support,
+                    if expected {
+                        MemoryStrategySupport::Implemented
+                    } else {
+                        MemoryStrategySupport::Missing
+                    }
+                );
+            }
+            request.memory =
+                contract.generation_memory(&selection(&prepared, MemoryStrategy::Resident));
+            let receipt = request_evidence_revision(&prepared, &request).unwrap();
+            if let Conditioning::Keyframe {
+                image, strength, ..
+            } = &mut request.conditioning[0]
+            {
+                image.pixels[0] ^= 1;
+                *strength = 0.5;
+            }
+            assert_ne!(
+                request_evidence_revision(&prepared, &request).unwrap(),
+                receipt
+            );
+        }
+
+        let (_tmp, spec) = candle_fixture(WanI2vRoute::Ti2v5b, None);
+        let prepared = PreparedWanI2vMemory::prepare(
+            &spec,
+            WanI2vBackend::Candle,
+            WanI2vRoute::Ti2v5b.provider_id(),
+        )
+        .unwrap();
+        assert!(validate_request(&prepared, &ti2v_extend_request()).is_err());
+    }
+
+    /// Every Candle dense leg is bound to the snapshot it is STAGED at, not to a revision the
+    /// manifest never pinned (sc-22736 review): a well-formed snapshot id other than the fixture's
+    /// prepares and is the receipt's revision, and a malformed one is still refused. Mutation that
+    /// reds this: restoring a hard revision on any of the three `(Candle, route, None)` arms of
+    /// `repository_policy`.
+    #[test]
+    fn every_candle_dense_leg_accepts_the_staged_snapshot_and_refuses_a_malformed_one() {
+        const STAGED: &str = "fedcba9876543210fedcba9876543210fedcba98";
+        for route in [
+            WanI2vRoute::Ti2v5b,
+            WanI2vRoute::T2v14b,
+            WanI2vRoute::I2v14b,
+        ] {
+            let tier = MemoryNumericTier {
+                precision: Precision::Bf16,
+                quant: None,
+                component_precision_floors: &[],
+            };
+            let (repository, policy_revision) =
+                repository_policy(WanI2vBackend::Candle, route, tier);
+            assert_eq!(policy_revision, UNPINNED_UPSTREAM_REVISION, "{route:?}");
+            let (tmp, _spec) = candle_fixture(route, None);
+            let snapshots = tmp.path().join(repo_dir(repository)).join("snapshots");
+            for (staged, expected) in [
+                (STAGED, Ok(STAGED)),
+                (
+                    "FEDCBA9876543210FEDCBA9876543210FEDCBA98",
+                    Err("upper-case"),
+                ),
+                ("fedcba9876543210fedcba9876543210fedcba9", Err("39 chars")),
+            ] {
+                let root = snapshots.join(staged);
+                if root.exists() {
+                    std::fs::remove_dir_all(&root).unwrap();
+                }
+                std::fs::rename(snapshots.join(FIXTURE_UNPINNED_REVISION), &root).unwrap();
+                // A fresh spec over the moved root: the fixture's own pins name absolute paths
+                // under the directory that was just renamed away.
+                let mut moved = LoadSpec::new(WeightsSource::Dir(root.clone()))
+                    .with_resolved_route(route.provider_id());
+                moved.quantize = None;
+                let prepared =
+                    prepare_load_spec(&mut moved, WanI2vBackend::Candle, route.provider_id())
+                        .and_then(|()| {
+                            PreparedWanI2vMemory::prepare(
+                                &moved,
+                                WanI2vBackend::Candle,
+                                route.provider_id(),
+                            )
+                        });
+                match expected {
+                    Ok(revision) => {
+                        let prepared = prepared
+                            .unwrap_or_else(|error| panic!("{route:?} at {staged}: {error}"));
+                        assert_eq!(prepared.revision, revision, "{route:?}");
+                        assert_eq!(prepared.repository, repository, "{route:?}");
+                    }
+                    Err(why) => {
+                        let error = prepared
+                            .err()
+                            .unwrap_or_else(|| panic!("{route:?}: {why} must be refused"))
+                            .to_string();
+                        assert!(
+                            error.contains("does not match immutable"),
+                            "{route:?} {why}: {error}"
+                        );
+                    }
+                }
+                std::fs::rename(&root, snapshots.join(FIXTURE_UNPINNED_REVISION)).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn mlx_q4_q8_bf16_facts_are_nonzero_differentiated_and_rsd_only() {
+        let mut totals = Vec::new();
+        for quant in [Some(Quant::Q4), Some(Quant::Q8), None] {
+            let (_tmp, spec) = mlx_fixture(WanI2vRoute::I2v14b, quant);
+            let prepared =
+                PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Mlx, "wan2_2_i2v_14b").unwrap();
+            assert!(prepared.contract.asset_facts.conditioning_bytes > 0);
+            assert!(prepared.contract.asset_facts.transformer_bytes > 0);
+            assert!(prepared.contract.asset_facts.decoder_bytes > 0);
+            totals.push(prepared.contract.asset_facts.base_bytes);
+            for strategy in MemoryStrategy::ALL {
+                assert_eq!(
+                    prepared.contract.capability(strategy).unwrap().support,
+                    if matches!(
+                        strategy,
+                        MemoryStrategy::Resident
+                            | MemoryStrategy::StagedResidency
+                            | MemoryStrategy::BoundedDecode
+                    ) {
+                        MemoryStrategySupport::Implemented
+                    } else {
+                        MemoryStrategySupport::Missing
+                    }
+                );
+            }
+        }
+        assert!(totals[0] < totals[1] && totals[1] < totals[2], "{totals:?}");
+
+        let (_tmp, mut prepacked) = mlx_fixture(WanI2vRoute::Ti2v5b, Some(Quant::Q4));
+        prepacked.quantize = None;
+        let prepared = PreparedWanI2vMemory::prepare(
+            &prepacked,
+            WanI2vBackend::Mlx,
+            WanI2vRoute::Ti2v5b.provider_id(),
+        )
+        .expect("the production worker selects a prepacked MLX q4 directory with quantize=None");
+        assert_eq!(prepared.tier.quant, Some(Quant::Q4));
+    }
+
+    /// Feature-end review (SC-22667, E1). `mlx_gen_wan::text_encoder` packs the UMT5 encoder's seven
+    /// bias-less projections per block to the Q8 floor on **every** MLX-affine quantized tier, and
+    /// the sealed receipt must charge the packed encoder rather than the dense bf16 stack it was
+    /// built from — the largest staged component of both the 5B and 14B routes.
+    ///
+    /// The expected total is spelled out from the fixture's own geometry rather than captured, so
+    /// the test is an oracle and not a snapshot. Mutations that fail this: restoring the single
+    /// `_ => projected_dense_bytes(path, 2)` arm for the quantized `MemoryPhase::Conditioning`
+    /// case, which reports the 439_680 B shard sum on the quantized assertions; and dropping the
+    /// dense-MLX conditioning arm (SC-22667 review), which reports that same 439_680 B on the dense
+    /// assertion instead of the 445_184 B the f32 leaf upcasts make it.
+    #[test]
+    fn the_mlx_encoder_is_charged_packed_on_every_quantized_tier() {
+        // `write_umt5_encoder(_, blocks = 7, dim = 64)`, Q8 at MLX group 64:
+        //   token embedding  [256, 64] bf16, cloned as stored              = 32_768
+        //   final norm       [64]      upcast f32                          =    256
+        //   per block:  7 projections [64, 64]
+        //                 codes  4096 * 8 / 8                              =  4_096
+        //                 scales+biases  64 * (64/64) * 2 planes * 2 B     =    256
+        //               2 norms [64] upcast f32                            =    512
+        //               pos-bias [32, 8] upcast f32                        =  1_024
+        //                                                       per block  = 32_000
+        const PACKED_ENCODER_BYTES: u64 = 32_768 + 256 + 7 * 32_000;
+        // The dense tier (SC-22667 review): the seven projections stay bf16 as stored
+        // (7 * 4096 * 2 = 57_344 per block), but `Umt5Block::from_weights` / `assemble` upcast the
+        // same leaves on this path too — the final norm (256), the two block norms (512) and the
+        // pos-bias table (1_024) — so the dense figure is NOT the plain bf16 shard sum
+        // (32_768 + 128 + 7 * 58_112 = 439_680); it is 445_184.
+        const DENSE_ENCODER_BYTES: u64 = 32_768 + 256 + 7 * (57_344 + 512 + 1_024);
+
+        let mut dense_conditioning = 0;
+        for route in [WanI2vRoute::Ti2v5b, WanI2vRoute::I2v14b] {
+            for quant in [Some(Quant::Q4), Some(Quant::Q8), None] {
+                let (_tmp, spec) = mlx_fixture(route, quant);
+                let prepared =
+                    PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Mlx, route.provider_id())
+                        .unwrap();
+                let conditioning = prepared.contract.asset_facts.conditioning_bytes;
+                match quant {
+                    // Q4 and Q8 agree: `effective_te_quant` floors the encoder at Q8 for both.
+                    Some(_) => assert_eq!(
+                        conditioning, PACKED_ENCODER_BYTES,
+                        "{route:?} {quant:?} conditioning"
+                    ),
+                    None => {
+                        assert_eq!(
+                            conditioning, DENSE_ENCODER_BYTES,
+                            "{route:?} dense conditioning"
+                        );
+                        dense_conditioning = conditioning;
+                    }
+                }
+            }
+        }
+        assert!(
+            PACKED_ENCODER_BYTES < dense_conditioning,
+            "packing the encoder must reduce its charged residency"
+        );
+    }
+
+    /// Feature-end review (SC-22667, E1). Both candle VACE routes open their video autoencoder at
+    /// `VAE_DTYPE = DType::F32` (`model_vace.rs`, `model_vace_fun.rs`), so the sealed decoder bytes
+    /// are four per stored bf16 element, not two.
+    ///
+    /// Mutation that fails this: widening the VACE early return in `physical_resident_bytes` back to
+    /// every phase, which routes the decoder past the `Decode` arm and halves this number.
+    #[test]
+    fn candle_vace_decodes_f32_and_is_charged_at_that_width() {
+        for route in [WanI2vRoute::Vace, WanI2vRoute::VaceFun] {
+            let (_tmp, spec) = vace_route_fixture(WanI2vBackend::Candle, None, route);
+            let prepared =
+                PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Candle, route.provider_id())
+                    .unwrap();
+            // The fixture's `vae/model.safetensors` is one bf16 [4, 4] tensor: 16 elements.
+            assert_eq!(
+                prepared.contract.asset_facts.decoder_bytes,
+                16 * 4,
+                "{route:?} decoder is materialized f32"
+            );
+            // The conditioning encoder and the transformer stay bf16 on this route.
+            assert_eq!(
+                prepared.contract.asset_facts.conditioning_bytes,
+                16 * 2,
+                "{route:?} conditioning is materialized bf16"
+            );
+        }
+    }
+
+    #[test]
+    fn candle_routes_and_dense_commits_are_sealed() {
+        for route in [WanI2vRoute::Ti2v5b, WanI2vRoute::I2v14b] {
+            let mut totals = Vec::new();
+            for quant in [Some(Quant::Q4), Some(Quant::Q8), None] {
+                let (_tmp, spec) = candle_fixture(route, quant);
+                let prepared = PreparedWanI2vMemory::prepare(
+                    &spec,
+                    WanI2vBackend::Candle,
+                    route.provider_id(),
+                )
+                .unwrap();
+                assert_eq!(prepared.revision.len(), 40);
+                assert!(prepared.contract.asset_facts.base_bytes > 0);
+                totals.push(prepared.contract.asset_facts.base_bytes);
+            }
+            assert!(
+                totals[0] < totals[1] && totals[1] < totals[2],
+                "{route:?}: {totals:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_length_mutation_and_inventory_or_repository_crossing_fail_closed() {
+        let (_tmp, spec) = mlx_fixture(WanI2vRoute::Ti2v5b, Some(Quant::Q4));
+        let prepared =
+            PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Mlx, "wan2_2_ti2v_5b").unwrap();
+        let root = match &spec.weights {
+            WeightsSource::Dir(root) => root,
+            _ => unreachable!(),
+        };
+        let path = root.join("model.safetensors");
+        let mut bytes = std::fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(prepared.ensure_unchanged().is_err());
+
+        let (_tmp, spec) = mlx_fixture(WanI2vRoute::Ti2v5b, Some(Quant::Q4));
+        let root = match &spec.weights {
+            WeightsSource::Dir(root) => root,
+            _ => unreachable!(),
+        };
+        write_safetensors(&root.join("extra.safetensors"), &[("x", "F32", &[1])]);
+        assert!(
+            PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Mlx, "wan2_2_ti2v_5b").is_err()
+        );
+
+        let mut crossed = spec.clone();
+        crossed.weights = WeightsSource::Dir(
+            root.parent()
+                .unwrap()
+                .join("ffffffffffffffffffffffffffffffffffffffff/q4"),
+        );
+        assert!(
+            PreparedWanI2vMemory::prepare(&crossed, WanI2vBackend::Mlx, "wan2_2_ti2v_5b").is_err()
+        );
+    }
+
+    /// sc-22738 (defect B): every packed file of the shipped a14b rehosts
+    /// (`SceneWorks/wan2.2-i2v-a14b-mlx@c6c786170031eccc3a1fac0f98f1ad4ff988271e` and its t2v
+    /// sibling) leaves the output projection `head.head.weight` dense BF16 `[64, 5120]` with no
+    /// `.scales`/`.biases` — the standing converter convention. The first pass demanded scales for
+    /// every 2-D `.weight` and refused before the second pass, which already prices a dense
+    /// residual correctly.
+    #[test]
+    fn a_packed_file_prices_a_dense_output_head_but_still_refuses_stripped_quant_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shipped: &[(&str, &str, &[usize])] = &[
+            ("blocks.0.self_attn.q.weight", "U32", &[64, 8]),
+            ("blocks.0.self_attn.q.scales", "BF16", &[64, 1]),
+            ("blocks.0.self_attn.q.biases", "BF16", &[64, 1]),
+            ("blocks.0.norm1.weight", "BF16", &[64]),
+            // Dense by convention on every packed tier — no quant metadata at all.
+            ("head.head.weight", "BF16", &[64, 64]),
+            ("head.head.bias", "BF16", &[64]),
+        ];
+        let path = tmp.path().join("high_noise_model.safetensors");
+        write_safetensors(&path, shipped);
+
+        // Packed triple (MLX prices stored bytes): 64*8*4 + 64*2 + 64*2 = 2304.
+        // Dense residual at the bf16 resident width: (64*64 + 64 + 64) * 2 = 8448.
+        let mlx = packed_transformer_bytes(&path, Quant::Q4, WanI2vBackend::Mlx).unwrap();
+        assert_eq!(mlx, 2304 + 8448);
+        // Candle prices the packed block form (20 bytes / 32 Q4 elements) and the same residual.
+        let candle = packed_transformer_bytes(&path, Quant::Q4, WanI2vBackend::Candle).unwrap();
+        assert_eq!(candle, (64 * 64 / 32) * 20 + 8448);
+
+        // The discriminator is "float storage AND no quant metadata at all", so genuine corruption
+        // still fails closed: packed U32 storage that lost both leaves, that lost one of them, and
+        // a float weight carrying a lone leaf are each refused.
+        // Each case pairs the corruption with the message that has to name it, so a guard loosened
+        // to any one of its three conjuncts is caught rather than being absorbed by the second
+        // pass's orphan-leaf backstop.
+        let valid_triple: &[(&str, &str, &[usize])] = &[
+            ("blocks.0.self_attn.q.weight", "U32", &[64, 8]),
+            ("blocks.0.self_attn.q.scales", "BF16", &[64, 1]),
+            ("blocks.0.self_attn.q.biases", "BF16", &[64, 1]),
+        ];
+        for (corruption, expected) in [
+            // U32 storage with both leaves stripped, alongside a healthy packed sibling: packed
+            // storage is unambiguous, so this can never be read as dense by convention.
+            (
+                vec![
+                    ("blocks.0.ffn.0.weight", "U32", &[64, 8][..]),
+                    ("head.head.weight", "BF16", &[64, 64][..]),
+                ],
+                "packed blocks.0.ffn.0 lacks scales",
+            ),
+            // A float weight with a lone `.biases` leaf carries quant metadata, so it is a packed
+            // tensor missing its scales — not a dense head.
+            (
+                vec![
+                    ("head.head.weight", "BF16", &[64, 64][..]),
+                    ("head.head.biases", "BF16", &[64, 1][..]),
+                ],
+                "packed head.head lacks scales",
+            ),
+            // …and the mirror case, a lone `.scales` leaf.
+            (
+                vec![
+                    ("head.head.weight", "BF16", &[64, 64][..]),
+                    ("head.head.scales", "BF16", &[64, 1][..]),
+                ],
+                "packed head.head lacks biases",
+            ),
+        ] {
+            let mut mutated = valid_triple.to_vec();
+            mutated.extend(corruption.iter().copied());
+            let path = tmp.path().join("mutated.safetensors");
+            write_safetensors(&path, &mutated);
+            let error = packed_transformer_bytes(&path, Quant::Q4, WanI2vBackend::Mlx)
+                .expect_err("a packed tensor missing quant metadata must still be refused")
+                .to_string();
+            assert!(
+                error.contains(expected),
+                "expected {expected:?}, got {error:?}"
+            );
+        }
+
+        // A file whose only 2-D weight is the dense head has no packed weights at all and is not a
+        // packed tier — the emptiness guard must still catch it.
+        let path = tmp.path().join("dense_only.safetensors");
+        write_safetensors(&path, &[("head.head.weight", "BF16", &[64, 64])]);
+        assert!(packed_transformer_bytes(&path, Quant::Q4, WanI2vBackend::Mlx).is_err());
+    }
+
+    fn request(route: WanI2vRoute) -> GenerationRequest {
+        let (width, height, frames, fps, steps, guidance) = match route {
+            WanI2vRoute::Ti2v5b => (832, 480, 121, 24, 20, Some(5.0)),
+            WanI2vRoute::T2v14b | WanI2vRoute::I2v14b => (1280, 720, 77, 16, 40, None),
+            WanI2vRoute::Vace => panic!("use a dedicated VACE request"),
+            WanI2vRoute::VaceFun => panic!("use a dedicated VACE-Fun request"),
+        };
+        // T2V-A14B is the one carrier-free route: it spells `text_to_video` and carries no
+        // conditioning at all. Building it from the same helper keeps the two A14B routes' geometry
+        // in one place, which is the point — they differ only in the carrier.
+        if route == WanI2vRoute::T2v14b {
+            return GenerationRequest {
+                prompt: "a slow dolly across an empty room".to_owned(),
+                width,
+                height,
+                count: 1,
+                seed: Some(17),
+                steps: Some(steps),
+                guidance,
+                frames: Some(frames),
+                fps: Some(fps),
+                video_mode: Some("text_to_video".to_owned()),
+                conditioning: Vec::new(),
+                ..Default::default()
+            };
+        }
+        GenerationRequest {
+            prompt: "animate the still".to_owned(),
+            width,
+            height,
+            count: 1,
+            seed: Some(17),
+            steps: Some(steps),
+            guidance,
+            frames: Some(frames),
+            fps: Some(fps),
+            video_mode: Some("image_to_video".to_owned()),
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 16,
+                    height: 16,
+                    pixels: vec![7; 16 * 16 * 3],
+                },
+                strength: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn flf_request(backend: WanI2vBackend) -> GenerationRequest {
+        let image = |pixel| Image {
+            width: 832,
+            height: 480,
+            pixels: vec![pixel; 832 * 480 * 3],
+        };
+        GenerationRequest {
+            prompt: "move between the two exact endpoints".to_owned(),
+            negative_prompt: Some("camera cut".to_owned()),
+            width: 832,
+            height: 480,
+            count: 1,
+            seed: Some(23),
+            steps: Some(20),
+            guidance: Some(5.0),
+            sampler: (backend == WanI2vBackend::Mlx).then(|| "dpmpp_2m".to_owned()),
+            frames: Some(117),
+            fps: Some(24),
+            video_mode: None,
+            conditioning: vec![
+                Conditioning::Keyframe {
+                    image: image(17),
+                    frame_idx: 0,
+                    strength: 0.25,
+                },
+                Conditioning::Keyframe {
+                    image: image(91),
+                    frame_idx: -1,
+                    strength: 0.75,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn selection(prepared: &PreparedWanI2vMemory, strategy: MemoryStrategy) -> MemorySelection {
+        MemorySelection {
+            strategy,
+            parameters: if strategy == MemoryStrategy::BoundedDecode {
+                MemoryStrategyParameters {
+                    decode_tile_edge: Some(192),
+                    decode_overlap: Some(64),
+                    ..Default::default()
+                }
+            } else {
+                Default::default()
+            },
+            tier: prepared.tier,
+        }
+    }
+
+    fn context(
+        prepared: &PreparedWanI2vMemory,
+        request: &GenerationRequest,
+        selection: MemorySelection,
+        evidence_revision: String,
+    ) -> MemoryRunContext {
+        MemoryRunContext {
+            selection,
+            optimization_authority: if selection.strategy.is_optimized() {
+                crate::MemoryOptimizationAuthority::Estimated
+            } else {
+                crate::MemoryOptimizationAuthority::Resident
+            },
+            calibration_abi: crate::MEMORY_CALIBRATION_ABI,
+            calibration_fingerprint: String::new(),
+            load_shape: prepared.contract.load_shape,
+            mode: crate::MemoryMode::Other(
+                match request.video_mode.as_deref() {
+                    Some("image_to_video") => "image_to_video",
+                    Some("extend_clip") => "extend_clip",
+                    Some("video_bridge") => "video_bridge",
+                    Some(mode) if mode.starts_with("replace_person@") => "replace_person",
+                    _ => "first_last_frame",
+                }
+                .to_owned(),
+            ),
+            has_reference: request.video_mode.as_deref() != Some("video_bridge"),
+            use_pid: false,
+            has_phases: false,
+            geometry: geometry_from_request(request),
+            overlay: Some(prepared.adapter_identity.clone()),
+            budget: crate::MemoryBudget {
+                total_bytes: u64::MAX,
+                committed_bytes: 0,
+                reclaimable_bytes: 0,
+                reserved_headroom_bytes: 0,
+            },
+            predicted_peak_bytes: 1,
+            cache_state: crate::MemoryCacheState::Cold,
+            evidence_revision,
+        }
+    }
+
+    #[test]
+    fn request_identity_binds_reference_geometry_rate_seed_schedule_and_singular_carrier() {
+        let (_tmp, spec) = mlx_fixture(WanI2vRoute::Ti2v5b, Some(Quant::Q4));
+        let prepared =
+            PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Mlx, "wan2_2_ti2v_5b").unwrap();
+        let resident = selection(&prepared, MemoryStrategy::Resident);
+        let baseline = request_evidence_revision_for_selection(
+            &prepared,
+            &request(WanI2vRoute::Ti2v5b),
+            &resident,
+        )
+        .unwrap();
+        let mut crossed = request(WanI2vRoute::Ti2v5b);
+        crossed.seed = Some(18);
+        assert_ne!(
+            baseline,
+            request_evidence_revision_for_selection(&prepared, &crossed, &resident).unwrap()
+        );
+        let mut crossed = request(WanI2vRoute::Ti2v5b);
+        crossed.conditioning.push(crossed.conditioning[0].clone());
+        assert!(request_evidence_revision_for_selection(&prepared, &crossed, &resident).is_err());
+        for (width, height) in [(832, 480), (1280, 704), (704, 1280)] {
+            let mut accepted = request(WanI2vRoute::Ti2v5b);
+            (accepted.width, accepted.height) = (width, height);
+            assert!(validate_request(&prepared, &accepted).is_ok());
+        }
+        let mut off_menu = request(WanI2vRoute::Ti2v5b);
+        (off_menu.width, off_menu.height) = (480, 832);
+        assert!(validate_request(&prepared, &off_menu).is_err());
+    }
+
+    #[test]
+    fn selection_receipt_binds_strategy_and_every_parameter_field() {
+        let tier = MemoryNumericTier {
+            precision: Precision::Bf16,
+            quant: Some(Quant::Q4),
+            component_precision_floors: &[],
+        };
+        let baseline = MemorySelection {
+            strategy: MemoryStrategy::Resident,
+            parameters: Default::default(),
+            tier,
+        };
+        let mut variants = Vec::new();
+        let mut changed = baseline;
+        changed.strategy = MemoryStrategy::StagedResidency;
+        variants.push(changed);
+        let setters: &[fn(&mut MemoryStrategyParameters)] = &[
+            |parameters| parameters.decode_tile_edge = Some(192),
+            |parameters| parameters.decode_overlap = Some(64),
+            |parameters| parameters.attention_chunk_size = Some(1024),
+            |parameters| parameters.transformer_window_size = Some(2),
+            |parameters| {
+                parameters.transformer_window_component =
+                    Some(crate::TransformerComponent::TextEncoder)
+            },
+        ];
+        for setter in setters {
+            let mut changed = baseline;
+            setter(&mut changed.parameters);
+            variants.push(changed);
+        }
+        let baseline_digest = selection_receipt_digest(&baseline);
+        let digests = variants
+            .iter()
+            .map(selection_receipt_digest)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(digests.len(), variants.len());
+        assert!(digests.iter().all(|digest| digest != &baseline_digest));
+    }
+
+    #[test]
+    fn provider_and_configure_boundaries_reject_crossed_strategy_or_decode_parameters() {
+        let (_tmp, spec) = mlx_fixture(WanI2vRoute::Ti2v5b, Some(Quant::Q4));
+        let prepared =
+            PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Mlx, "wan2_2_ti2v_5b").unwrap();
+        let request = request(WanI2vRoute::Ti2v5b);
+        let resident = selection(&prepared, MemoryStrategy::Resident);
+        let resident_evidence =
+            request_evidence_revision_for_selection(&prepared, &request, &resident).unwrap();
+        let resident_context = context(&prepared, &request, resident, resident_evidence.clone());
+        assert!(validate_context(&prepared, &resident_context).is_ok());
+
+        let staged = selection(&prepared, MemoryStrategy::StagedResidency);
+        let mut crossed_context = resident_context.clone();
+        crossed_context.selection = staged;
+        crossed_context.optimization_authority = crate::MemoryOptimizationAuthority::Estimated;
+        assert!(validate_context(&prepared, &crossed_context).is_err());
+
+        let staged_evidence =
+            request_evidence_revision_for_selection(&prepared, &request, &staged).unwrap();
+        let staged_context = context(&prepared, &request, staged, staged_evidence.clone());
+        assert!(validate_context(&prepared, &staged_context).is_ok());
+        let mut staged_request = request.clone();
+        staged_request.memory = prepared.contract.generation_memory(&staged);
+        assert_eq!(
+            validate_request_evidence(&prepared, &staged_request, &staged, &staged_evidence,)
+                .unwrap(),
+            staged_evidence
+        );
+
+        let bounded = selection(&prepared, MemoryStrategy::BoundedDecode);
+        let bounded_evidence =
+            request_evidence_revision_for_selection(&prepared, &request, &bounded).unwrap();
+        let mut crossed_parameters = bounded;
+        crossed_parameters.parameters.decode_tile_edge = Some(256);
+        let mut crossed_context = context(
+            &prepared,
+            &request,
+            crossed_parameters,
+            bounded_evidence.clone(),
+        );
+        assert!(validate_context(&prepared, &crossed_context).is_err());
+        crossed_context.evidence_revision =
+            request_evidence_revision_for_selection(&prepared, &request, &crossed_parameters)
+                .unwrap();
+        assert!(validate_context(&prepared, &crossed_context).is_ok());
+
+        let mut crossed_request = request;
+        crossed_request.memory = prepared.contract.generation_memory(&crossed_parameters);
+        assert!(validate_request_evidence(
+            &prepared,
+            &crossed_request,
+            &bounded,
+            &bounded_evidence,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn first_last_frame_exact_menu_and_request_specific_rungs_cover_both_backends_and_tiers() {
+        for backend in [WanI2vBackend::Mlx, WanI2vBackend::Candle] {
+            for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+                let (_tmp, spec) = match backend {
+                    WanI2vBackend::Mlx => mlx_fixture(WanI2vRoute::Ti2v5b, quant),
+                    WanI2vBackend::Candle => candle_fixture(WanI2vRoute::Ti2v5b, quant),
+                };
+                let prepared = PreparedWanI2vMemory::prepare(
+                    &spec,
+                    backend,
+                    WanI2vRoute::Ti2v5b.provider_id(),
+                )
+                .unwrap();
+                let mut request = flf_request(backend);
+                let contract = request_contract(&prepared, &request).unwrap();
+                for strategy in MemoryStrategy::ALL {
+                    let expected = match strategy {
+                        MemoryStrategy::Resident | MemoryStrategy::BoundedDecode => {
+                            MemoryStrategySupport::Implemented
+                        }
+                        MemoryStrategy::StagedResidency if backend == WanI2vBackend::Candle => {
+                            MemoryStrategySupport::Implemented
+                        }
+                        _ => MemoryStrategySupport::Missing,
+                    };
+                    assert_eq!(contract.capability(strategy).unwrap().support, expected);
+                }
+                let bounded = selection(&prepared, MemoryStrategy::BoundedDecode);
+                let memory = contract.generation_memory(&bounded).unwrap();
+                assert!(memory.tile_vae_decode);
+                if backend == WanI2vBackend::Mlx {
+                    assert!(!memory.stage_residency);
+                }
+
+                for (fps, frames) in [(16, [61, 77, 93, 109, 125]), (24, [93, 117, 141, 165, 189])]
+                {
+                    request.fps = Some(fps);
+                    for frame_count in frames {
+                        request.frames = Some(frame_count);
+                        assert_eq!(
+                            validate_request(&prepared, &request).unwrap(),
+                            WanPublicMode::FirstLastFrame
+                        );
+                    }
+                }
+                request.fps = Some(24);
+                request.frames = Some(121);
+                assert!(validate_request(&prepared, &request).is_err(), "117 != 121");
+            }
+        }
+    }
+
+    #[test]
+    fn first_last_frame_receipt_binds_roles_indices_strengths_shapes_and_mode() {
+        let (_tmp, spec) = mlx_fixture(WanI2vRoute::Ti2v5b, Some(Quant::Q4));
+        let prepared =
+            PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Mlx, "wan2_2_ti2v_5b").unwrap();
+        let request = flf_request(WanI2vBackend::Mlx);
+        let resident = selection(&prepared, MemoryStrategy::Resident);
+        let baseline =
+            request_evidence_revision_for_selection(&prepared, &request, &resident).unwrap();
+        let mut changed = request.clone();
+        changed.conditioning.swap(0, 1);
+        assert!(request_evidence_revision_for_selection(&prepared, &changed, &resident).is_err());
+        let mut changed = request.clone();
+        if let Conditioning::Keyframe { frame_idx, .. } = &mut changed.conditioning[0] {
+            *frame_idx = 1;
+        }
+        assert!(request_evidence_revision_for_selection(&prepared, &changed, &resident).is_err());
+        let mut changed = request.clone();
+        if let Conditioning::Keyframe { strength, .. } = &mut changed.conditioning[1] {
+            *strength = 0.5;
+        }
+        assert_ne!(
+            baseline,
+            request_evidence_revision_for_selection(&prepared, &changed, &resident).unwrap()
+        );
+        let mut changed = request.clone();
+        if let Conditioning::Keyframe { image, .. } = &mut changed.conditioning[0] {
+            image.width = 480;
+        }
+        assert!(request_evidence_revision_for_selection(&prepared, &changed, &resident).is_err());
+        let mut changed = request.clone();
+        changed.video_mode = Some("image_to_video".to_owned());
+        assert!(request_evidence_revision_for_selection(&prepared, &changed, &resident).is_err());
+        let mut changed = request.clone();
+        changed.frames = Some(121);
+        assert!(request_evidence_revision_for_selection(&prepared, &changed, &resident).is_err());
+        let mut changed = request.clone();
+        changed.fps = Some(25);
+        assert!(request_evidence_revision_for_selection(&prepared, &changed, &resident).is_err());
+        let mut no_guidance = request.clone();
+        no_guidance.guidance = None;
+        let mut zero_guidance = request.clone();
+        zero_guidance.guidance = Some(0.0);
+        assert_ne!(
+            request_evidence_revision_for_selection(&prepared, &no_guidance, &resident).unwrap(),
+            request_evidence_revision_for_selection(&prepared, &zero_guidance, &resident).unwrap()
+        );
+        let mut changed = request.clone();
+        changed.width = 1280;
+        assert!(request_evidence_revision_for_selection(&prepared, &changed, &resident).is_err());
+    }
+
+    #[test]
+    fn first_last_frame_context_and_configure_refuse_crossed_mode_or_mlx_staged() {
+        let (_tmp, spec) = mlx_fixture(WanI2vRoute::Ti2v5b, Some(Quant::Q8));
+        let prepared =
+            PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Mlx, "wan2_2_ti2v_5b").unwrap();
+        let mut request = flf_request(WanI2vBackend::Mlx);
+        let contract = request_contract(&prepared, &request).unwrap();
+        let bounded = selection(&prepared, MemoryStrategy::BoundedDecode);
+        request.memory = contract.generation_memory(&bounded);
+        let evidence = request_evidence_revision(&prepared, &request).unwrap();
+        let valid = context(&prepared, &request, bounded, evidence.clone());
+        assert!(validate_context(&prepared, &valid).is_ok());
+
+        let mut crossed = valid.clone();
+        crossed.mode = crate::MemoryMode::Other("image_to_video".to_owned());
+        assert!(validate_context(&prepared, &crossed).is_err());
+        let staged = selection(&prepared, MemoryStrategy::StagedResidency);
+        let mut crossed = valid.clone();
+        crossed.selection = staged;
+        assert!(validate_context(&prepared, &crossed).is_err());
+        let mut crossed_request = request.clone();
+        crossed_request.memory = prepared.contract.generation_memory(&staged);
+        assert!(
+            validate_request_evidence(&prepared, &crossed_request, &bounded, &evidence,).is_err()
+        );
+    }
+
+    #[test]
+    fn first_last_frame_sampler_set_is_backend_truthful() {
+        for backend in [WanI2vBackend::Mlx, WanI2vBackend::Candle] {
+            let (_tmp, spec) = match backend {
+                WanI2vBackend::Mlx => mlx_fixture(WanI2vRoute::Ti2v5b, None),
+                WanI2vBackend::Candle => candle_fixture(WanI2vRoute::Ti2v5b, None),
+            };
+            let prepared =
+                PreparedWanI2vMemory::prepare(&spec, backend, WanI2vRoute::Ti2v5b.provider_id())
+                    .unwrap();
+            for sampler in [None, Some("uni_pc"), Some("euler")] {
+                let mut request = flf_request(backend);
+                request.sampler = sampler.map(str::to_owned);
+                assert!(validate_request(&prepared, &request).is_ok());
+            }
+            let mut dpm = flf_request(backend);
+            dpm.sampler = Some("dpmpp_2m".to_owned());
+            assert_eq!(
+                validate_request(&prepared, &dpm).is_ok(),
+                backend == WanI2vBackend::Mlx
+            );
+            let mut broad = flf_request(backend);
+            broad.sampler = Some("heun".to_owned());
+            assert!(validate_request(&prepared, &broad).is_err());
+        }
+    }
+
+    #[test]
+    fn adapter_residency_is_dense_zero_packed_shared_twice_targeted_once_and_loha_refuses() {
+        let make_adapter = |dir: &Path, name: &str, key: &str| {
+            let path = dir.join(name);
+            write_safetensors(&path, &[(key, "F32", &[2, 3])]);
+            path
+        };
+        let (tmp, dense_fixture) = mlx_fixture(WanI2vRoute::I2v14b, None);
+        let mut dense =
+            LoadSpec::new(dense_fixture.weights.clone()).with_resolved_route("wan2_2_i2v_14b");
+        let shared = make_adapter(tmp.path(), "shared.safetensors", "lora_A.weight");
+        let high = make_adapter(tmp.path(), "high.safetensors", "lora_A.weight");
+        dense.adapters = vec![
+            AdapterSpec::new(shared.clone(), 0.5, AdapterKind::Lora),
+            AdapterSpec::new(high.clone(), 0.75, AdapterKind::Lora)
+                .with_moe_expert(MoeExpert::High),
+        ];
+        let packed_adapters = dense.adapters.clone();
+        prepare_load_spec(&mut dense, WanI2vBackend::Mlx, "wan2_2_i2v_14b").unwrap();
+        let prepared =
+            PreparedWanI2vMemory::prepare(&dense, WanI2vBackend::Mlx, "wan2_2_i2v_14b").unwrap();
+        assert_eq!(prepared.contract.asset_facts.overlay_bytes, 0);
+        assert_eq!(
+            prepared.adapters[0].path,
+            std::path::absolute(&shared).unwrap()
+        );
+        assert_eq!(prepared.adapters[0].scale_bits, 0.5_f32.to_bits());
+        assert!(prepared.adapters[0].pass_scale_bits.is_empty());
+        assert_eq!(prepared.adapters[0].expert, "shared");
+        assert_eq!(prepared.adapters[0].realization, "dense_folded");
+        assert_eq!(
+            prepared.adapters[0].stability,
+            "pinned_digest_and_tensor_geometry"
+        );
+
+        let (_tmp, packed_fixture) = mlx_fixture(WanI2vRoute::I2v14b, Some(Quant::Q4));
+        let mut packed =
+            LoadSpec::new(packed_fixture.weights.clone()).with_resolved_route("wan2_2_i2v_14b");
+        packed.quantize = Some(Quant::Q4);
+        packed.adapters = packed_adapters;
+        prepare_load_spec(&mut packed, WanI2vBackend::Mlx, "wan2_2_i2v_14b").unwrap();
+        let prepared =
+            PreparedWanI2vMemory::prepare(&packed, WanI2vBackend::Mlx, "wan2_2_i2v_14b").unwrap();
+        assert_eq!(
+            prepared.adapters[0].persistent_bytes,
+            prepared.adapters[0].source_bytes * 2
+        );
+        assert_eq!(
+            prepared.adapters[1].persistent_bytes,
+            prepared.adapters[1].source_bytes
+        );
+        assert_eq!(prepared.adapters[0].realization, "packed_additive_factors");
+        assert_eq!(prepared.adapters[1].expert, "high");
+
+        let loha = make_adapter(tmp.path(), "loha.safetensors", "block.hada_w1_a");
+        let (_dense_loha_tmp, dense_loha_fixture) = mlx_fixture(WanI2vRoute::I2v14b, None);
+        let mut dense_loha =
+            LoadSpec::new(dense_loha_fixture.weights.clone()).with_resolved_route("wan2_2_i2v_14b");
+        dense_loha.adapters = vec![AdapterSpec::new(loha.clone(), 1.0, AdapterKind::Lora)];
+        prepare_load_spec(&mut dense_loha, WanI2vBackend::Mlx, "wan2_2_i2v_14b").unwrap();
+        let dense_loha =
+            PreparedWanI2vMemory::prepare(&dense_loha, WanI2vBackend::Mlx, "wan2_2_i2v_14b")
+                .unwrap();
+        assert_eq!(dense_loha.adapters[0].kind, "loha");
+        assert_eq!(dense_loha.adapters[0].persistent_bytes, 0);
+
+        let (_tmp, packed_loha_fixture) = mlx_fixture(WanI2vRoute::I2v14b, Some(Quant::Q4));
+        let mut packed_loha = LoadSpec::new(packed_loha_fixture.weights.clone())
+            .with_resolved_route("wan2_2_i2v_14b");
+        packed_loha.quantize = Some(Quant::Q4);
+        packed_loha.adapters = vec![AdapterSpec::new(loha, 1.0, AdapterKind::Lora)];
+        prepare_load_spec(&mut packed_loha, WanI2vBackend::Mlx, "wan2_2_i2v_14b").unwrap();
+        assert!(
+            PreparedWanI2vMemory::prepare(&packed_loha, WanI2vBackend::Mlx, "wan2_2_i2v_14b",)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn lightning_recipe_requires_the_exact_repository_revision_order_and_request_schedule() {
+        let (tmp, fixture) = mlx_fixture(WanI2vRoute::I2v14b, None);
+        let lightning = tmp
+            .path()
+            .join(repo_dir(LIGHTNING_REPOSITORY))
+            .join("snapshots")
+            .join(LIGHTNING_REVISION)
+            .join("Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1");
+        std::fs::create_dir_all(&lightning).unwrap();
+        let high = lightning.join("high_noise_model.safetensors");
+        let low = lightning.join("low_noise_model.safetensors");
+        write_safetensors(&high, &[("lora_A.weight", "F32", &[2, 3])]);
+        write_safetensors(&low, &[("lora_A.weight", "F32", &[2, 3])]);
+        let mut spec = LoadSpec::new(fixture.weights.clone()).with_resolved_route("wan2_2_i2v_14b");
+        spec.adapters = vec![
+            AdapterSpec::new(high, 1.0, AdapterKind::Lora).with_moe_expert(MoeExpert::High),
+            AdapterSpec::new(low, 1.0, AdapterKind::Lora).with_moe_expert(MoeExpert::Low),
+        ];
+        prepare_load_spec(&mut spec, WanI2vBackend::Mlx, "wan2_2_i2v_14b").unwrap();
+        let prepared =
+            PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Mlx, "wan2_2_i2v_14b").unwrap();
+        let mut lightning_request = request(WanI2vRoute::I2v14b);
+        lightning_request.steps = Some(4);
+        lightning_request.guidance = Some(1.0);
+        assert!(validate_request(&prepared, &lightning_request).is_ok());
+
+        let mut native = request(WanI2vRoute::I2v14b);
+        assert!(validate_request(&prepared, &native).is_err());
+        native.steps = Some(4);
+        native.guidance = Some(1.1);
+        assert!(validate_request(&prepared, &native).is_err());
+
+        let (_tmp, fixture) = mlx_fixture(WanI2vRoute::I2v14b, None);
+        let bogus_dir = tempfile::tempdir().unwrap();
+        let bogus_high = bogus_dir.path().join("high_noise_model.safetensors");
+        let bogus_low = bogus_dir.path().join("low_noise_model.safetensors");
+        write_safetensors(&bogus_high, &[("lora_A.weight", "F32", &[2, 3])]);
+        write_safetensors(&bogus_low, &[("lora_A.weight", "F32", &[2, 3])]);
+        let mut crossed =
+            LoadSpec::new(fixture.weights.clone()).with_resolved_route("wan2_2_i2v_14b");
+        crossed.adapters = vec![
+            AdapterSpec::new(bogus_high, 1.0, AdapterKind::Lora).with_moe_expert(MoeExpert::High),
+            AdapterSpec::new(bogus_low, 1.0, AdapterKind::Lora).with_moe_expert(MoeExpert::Low),
+        ];
+        prepare_load_spec(&mut crossed, WanI2vBackend::Mlx, "wan2_2_i2v_14b").unwrap();
+        let crossed =
+            PreparedWanI2vMemory::prepare(&crossed, WanI2vBackend::Mlx, "wan2_2_i2v_14b").unwrap();
+        assert!(validate_request(&crossed, &lightning_request).is_err());
+    }
+
+    /// sc-20799: the evidence receipt carries its own frame rate in plain text, so admission pins
+    /// the exact public rate menu instead of OR-ing 16 fps and 24 fps into one indistinguishable
+    /// cell, and a capture record can key the two Ti2V-5B cells apart.
+    #[test]
+    fn the_receipt_carries_its_frame_rate_and_admission_pins_the_exact_public_menu() {
+        let (_tmp, spec) = mlx_fixture(WanI2vRoute::Ti2v5b, Some(Quant::Q4));
+        let prepared =
+            PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Mlx, "wan2_2_ti2v_5b").unwrap();
+        let mut request = request(WanI2vRoute::Ti2v5b);
+        // 121 frames is on the 24 fps menu and NOT on the 16 fps menu.
+        assert_eq!(request.fps, Some(24));
+        assert!(prepared.route.accepts_rate(24, 121));
+        assert!(!prepared.route.accepts_rate(16, 121));
+
+        let selection = selection(&prepared, MemoryStrategy::Resident);
+        let contract = request_contract(&prepared, &request).unwrap();
+        request.memory = contract.generation_memory(&selection);
+        let receipt = request_evidence_revision(&prepared, &request).unwrap();
+        assert!(
+            receipt.starts_with(&format!("{RECEIPT_VERSION}:image_to_video:fps24:")),
+            "{receipt}"
+        );
+        let run_context = context(&prepared, &request, selection, receipt.clone());
+        validate_context(&prepared, &run_context).unwrap();
+
+        // Re-spelling the rate must move the cell, and the crossed cell must be refused because
+        // 121 frames is not on the 16 fps menu.
+        let mut forged = run_context.clone();
+        forged.evidence_revision = receipt.replacen(":fps24:", ":fps16:", 1);
+        assert_ne!(forged.evidence_revision, receipt);
+        assert!(validate_context(&prepared, &forged).is_err());
+
+        // A receipt with no rate field at all, or an unparsable one, fails closed.
+        for crossed in [
+            receipt.replacen(":fps24:", ":", 1),
+            receipt.replacen(":fps24:", ":fps:", 1),
+            receipt.replacen(":fps24:", ":fps+24:", 1),
+            receipt.replacen(":fps24:", ":24:", 1),
+        ] {
+            let mut forged = run_context.clone();
+            forged.evidence_revision = crossed.clone();
+            assert!(
+                validate_context(&prepared, &forged).is_err(),
+                "{crossed} must not be admitted"
+            );
+        }
+    }
+
+    /// sc-20799: the VACE routes have no exact public I2V request contract, so admission must not
+    /// hand out a row that `request_mode` and `contract_for_mode_key` both refuse.
+    #[test]
+    fn vace_admission_refuses_the_image_to_video_mode_no_vace_request_can_execute() {
+        let (_tmp, spec) = vace_fixture(WanI2vBackend::Candle, None);
+        let prepared =
+            PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Candle, "wan_vace").unwrap();
+        assert!(contract_for_mode_key(&prepared, "image_to_video").is_err());
+
+        let mut request = vace_extend_request();
+        let selection = selection(&prepared, MemoryStrategy::Resident);
+        let contract = request_contract(&prepared, &request).unwrap();
+        request.memory = contract.generation_memory(&selection);
+        let receipt = request_evidence_revision(&prepared, &request).unwrap();
+        let mut run_context = context(&prepared, &request, selection, receipt);
+        validate_context(&prepared, &run_context).unwrap();
+
+        run_context.mode = crate::MemoryMode::Other("image_to_video".to_owned());
+        let error = validate_context(&prepared, &run_context)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("crossed Wan public memory mode"), "{error}");
+
+        // The non-VACE VACE-Fun route keeps its public I2V contract.
+        let (_tmp, spec) = vace_fun_fixture(WanI2vBackend::Candle, None);
+        let fun = PreparedWanI2vMemory::prepare(
+            &spec,
+            WanI2vBackend::Candle,
+            WanI2vRoute::VaceFun.provider_id(),
+        )
+        .unwrap();
+        assert!(contract_for_mode_key(&fun, "image_to_video").is_ok());
+    }
+
+    /// sc-20799: the catch-all refusal must name the selector it actually enforces.
+    #[test]
+    fn the_unmatched_carrier_refusal_enumerates_every_public_wan_mode() {
+        let (_tmp, spec) = vace_fixture(WanI2vBackend::Candle, None);
+        let prepared =
+            PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Candle, "wan_vace").unwrap();
+        let mut request = vace_extend_request();
+        request.video_mode = Some("not_a_wan_mode".to_owned());
+        let error = validate_request(&prepared, &request)
+            .unwrap_err()
+            .to_string();
+        for mode in [
+            "image_to_video",
+            "first_last_frame",
+            "extend_clip",
+            "video_bridge",
+            "replace_person",
+        ] {
+            assert!(error.contains(mode), "{mode} missing from: {error}");
+        }
+    }
+
+    /// Every A14B cell this authority seals publishes its own production identity, and no two
+    /// cells share one.
+    ///
+    /// The cell set is **derived** from `WanI2vRoute::ALL` x both backends x the shipped tier
+    /// ladder rather than frozen as a count, so a new route or a new tier is swept the moment it
+    /// exists instead of silently sitting outside a literal.
+    #[test]
+    fn every_sealed_a14b_cell_publishes_a_distinct_production_identity() {
+        let mut seen: Vec<(String, String)> = Vec::new();
+        for route in WanI2vRoute::ALL {
+            for backend in [WanI2vBackend::Mlx, WanI2vBackend::Candle] {
+                for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+                    // Candle ships no dense tier under a tier suffix and MLX ships no untiered
+                    // root; the fixture writers mirror that, and VACE has its own receipt shape.
+                    if matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) {
+                        continue;
+                    }
+                    let (_tmp, spec) = match backend {
+                        WanI2vBackend::Mlx => mlx_fixture(route, quant),
+                        WanI2vBackend::Candle => candle_fixture(route, quant),
+                    };
+                    let prepared =
+                        PreparedWanI2vMemory::prepare(&spec, backend, route.provider_id())
+                            .unwrap_or_else(|error| {
+                                panic!("{:?} {} {quant:?}: {error}", backend, route.provider_id())
+                            });
+                    let expected =
+                        production_calibration_fingerprint(route, backend, prepared.tier);
+                    let published = prepared
+                        .contract
+                        .calibration
+                        .as_ref()
+                        .map(|identity| identity.fingerprint.clone());
+                    assert_eq!(
+                        published,
+                        expected,
+                        "{:?} {} {quant:?} publishes the wrong identity",
+                        backend,
+                        route.provider_id()
+                    );
+                    if route == WanI2vRoute::Ti2v5b {
+                        // Owned by the per-crate modules; this authority must stay silent.
+                        assert!(
+                            published.is_none(),
+                            "Ti2V-5B must not mint a second production identity here"
+                        );
+                        continue;
+                    }
+                    let fingerprint = published.expect("an A14B cell publishes an identity");
+                    let cell = format!("{backend:?}/{}/{quant:?}", route.provider_id());
+                    for (other_cell, other) in &seen {
+                        assert_ne!(
+                            &fingerprint, other,
+                            "{cell} and {other_cell} share one identity"
+                        );
+                    }
+                    seen.push((cell, fingerprint));
+                }
+            }
+        }
+        // Two A14B routes x two backends x three tiers, all derived above.
+        assert_eq!(seen.len(), 12, "swept cells: {seen:?}");
+    }
+
+    /// A root of one tier presented as another is refused, and the refusal names the tier.
+    #[test]
+    fn a_crossed_tier_root_is_refused_by_name() {
+        for route in [WanI2vRoute::T2v14b, WanI2vRoute::I2v14b] {
+            let (_tmp, q4) = mlx_fixture(route, Some(Quant::Q4));
+            let mut crossed = q4.clone();
+            crossed.quantize = Some(Quant::Q8);
+            let error =
+                PreparedWanI2vMemory::prepare(&crossed, WanI2vBackend::Mlx, route.provider_id())
+                    .expect_err("a q4 root selected as q8 must be refused")
+                    .to_string();
+            assert!(
+                error.contains("Q8") || error.contains("q8") || error.contains("Q8"),
+                "{}: refusal does not name the tier: {error}",
+                route.provider_id()
+            );
+        }
+    }
+
+    /// sc-22736 (epic sc-22723, E1): the weights-free registry surface is per-cell, and no string it
+    /// mints can ever be mistaken for a measured production identity.
+    ///
+    /// Both sets are DERIVED from the same route x backend x tier grid rather than frozen, so a new
+    /// route or a new tier is swept the moment `WanI2vRoute::ALL` or the tier ladder moves.
+    ///
+    /// Mutation that fails this: dropping the `-weights-free-conformance-` infix (the two sets then
+    /// collide cell for cell), or keying the weights-free string on fewer coordinates than the
+    /// production one (two cells then share one fixture identity).
+    #[test]
+    fn the_weights_free_a14b_namespace_is_per_cell_and_disjoint_from_production() {
+        let mut production = BTreeSet::new();
+        let mut weights_free = BTreeSet::new();
+        let mut cells = 0_usize;
+        for route in WanI2vRoute::ALL {
+            for backend in [WanI2vBackend::Mlx, WanI2vBackend::Candle] {
+                for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+                    let tier = MemoryNumericTier {
+                        precision: Precision::Bf16,
+                        quant,
+                        component_precision_floors: &[],
+                    };
+                    let Some(free) = weights_free_calibration_fingerprint(route, backend, tier)
+                    else {
+                        // A route this authority does not name has neither string.
+                        assert_eq!(
+                            production_calibration_fingerprint(route, backend, tier),
+                            None,
+                            "{} has a production string but no weights-free sibling",
+                            route.provider_id()
+                        );
+                        continue;
+                    };
+                    let named = production_calibration_fingerprint(route, backend, tier)
+                        .expect("a named cell has both strings");
+                    assert!(
+                        weights_free.insert(free.clone()),
+                        "{free} names more than one cell"
+                    );
+                    assert!(
+                        production.insert(named.clone()),
+                        "{named} names more than one cell"
+                    );
+                    cells += 1;
+                }
+            }
+        }
+        assert_eq!(cells, 12, "two A14B routes x two backends x three tiers");
+        assert!(
+            production.is_disjoint(&weights_free),
+            "the weights-free namespace overlaps production: {:?}",
+            production.intersection(&weights_free).collect::<Vec<_>>()
+        );
+    }
+
+    /// The weights-free contract touches no filesystem, keeps the route's declared shape, and
+    /// publishes the isolated identity at the spec's own load shape — which is exactly what a
+    /// registry catalog walk on a host with no weights consumes.
+    #[test]
+    fn the_weights_free_contract_is_filesystem_free_and_publishes_the_isolated_identity() {
+        for route in [WanI2vRoute::T2v14b, WanI2vRoute::I2v14b] {
+            for backend in [WanI2vBackend::Mlx, WanI2vBackend::Candle] {
+                for (quant, spec_of) in [
+                    (
+                        None,
+                        LoadSpec::new(WeightsSource::Dir(
+                            "/__sceneworks_memory_contract_surface__".into(),
+                        )),
+                    ),
+                    (
+                        Some(Quant::Q4),
+                        LoadSpec::new(WeightsSource::Dir(
+                            "/__sceneworks_memory_contract_surface__".into(),
+                        ))
+                        .with_quant(Quant::Q4),
+                    ),
+                    (
+                        Some(Quant::Q8),
+                        LoadSpec::new(WeightsSource::Dir(
+                            "/__sceneworks_memory_contract_surface__".into(),
+                        ))
+                        .with_quant(Quant::Q8),
+                    ),
+                ] {
+                    let contract = weights_free_contract(route.provider_id(), backend, &spec_of)
+                        .unwrap_or_else(|error| {
+                            panic!("{:?} {} {quant:?}: {error}", backend, route.provider_id())
+                        });
+                    assert_eq!(contract.provider_id, route.provider_id());
+                    assert_eq!(contract.backend, backend.realization());
+                    assert_eq!(contract.load_shape, spec_of.load_shape);
+                    assert_eq!(contract.asset_facts, MemoryAssetFacts::default());
+                    let tier = MemoryNumericTier {
+                        precision: Precision::Bf16,
+                        quant,
+                        component_precision_floors: &[],
+                    };
+                    let identity = contract
+                        .calibration
+                        .as_ref()
+                        .expect("a weights-free A14B contract is calibratable");
+                    assert_eq!(
+                        identity.fingerprint,
+                        weights_free_calibration_fingerprint(route, backend, tier).unwrap()
+                    );
+                    assert_eq!(identity.load_shape, spec_of.load_shape);
+                }
+            }
+        }
+        // Ti2V-5B and the VACE routes are owned elsewhere and must be refused rather than answered.
+        for route in [WanI2vRoute::Ti2v5b, WanI2vRoute::Vace, WanI2vRoute::VaceFun] {
+            let spec = LoadSpec::new(WeightsSource::Dir(
+                "/__sceneworks_memory_contract_surface__".into(),
+            ));
+            assert!(
+                weights_free_contract(route.provider_id(), WanI2vBackend::Mlx, &spec).is_err(),
+                "{} must not resolve a weights-free contract here",
+                route.provider_id()
+            );
+        }
+    }
+
+    /// The constants the weights-free surface hands a behavior fixture are READ BACK through the
+    /// route's own menus, so a manifest/menu change cannot leave them naming a bucket or a rate the
+    /// route stopped admitting.
+    #[test]
+    fn a14b_weights_free_fixture_geometry_is_admissible() {
+        let (width, height, frames) = A14B_FIXTURE_GEOMETRY;
+        for route in [WanI2vRoute::T2v14b, WanI2vRoute::I2v14b] {
+            assert!(
+                route.public_geometries().contains(&(width, height)),
+                "{}: {width}x{height} left the public bucket list",
+                route.provider_id()
+            );
+            assert!(
+                route.accepts_rate(A14B_PUBLIC_FPS, frames),
+                "{}: {frames}@{A14B_PUBLIC_FPS} left the public rate menu",
+                route.provider_id()
+            );
+            // The A14B menu really is single-rate; if that ever stops being true the weights-free
+            // surface has to carry the rate instead of assuming it.
+            for other in [8_u32, 24, 25, 30] {
+                assert!(
+                    !route.accepts_rate(other, frames),
+                    "{}: the A14B rate menu gained {other} fps",
+                    route.provider_id()
+                );
+            }
+            assert_eq!(
+                a14b_public_mode_key(route),
+                Some(if route == WanI2vRoute::T2v14b {
+                    "text_to_video"
+                } else {
+                    "image_to_video"
+                })
+            );
+        }
+    }
+}

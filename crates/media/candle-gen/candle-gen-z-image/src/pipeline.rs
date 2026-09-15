@@ -54,11 +54,11 @@ use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
 use candle_gen::gen_core::{
     self, AdapterSpec, CancelFlag, Conditioning, GenerationRequest, Image, LoadPhase, PidWeights,
-    Progress,
+    Progress, WeightsSource,
 };
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
 use candle_gen::{CandleError, Result};
@@ -74,16 +74,42 @@ use candle_transformers::models::z_image::scheduler::{
     BASE_SHIFT, MAX_IMAGE_SEQ_LEN, MAX_SHIFT,
 };
 use candle_transformers::models::z_image::text_encoder::{TextEncoderConfig, ZImageTextEncoder};
-use candle_transformers::models::z_image::transformer::{
-    Config as DitConfig, ZImageTransformer2DModel,
-};
+use candle_transformers::models::z_image::transformer::Config as DitConfig;
 use candle_transformers::models::z_image::vae::{AutoEncoderKL, Encoder as VaeEncoder, VaeConfig};
 
 use candle_gen::gen_core::tokenizer::TextTokenizer;
 
 use crate::common::{self, ResizePolicy};
+use crate::dit::ZImageTransformer2DModel as DenseDit;
 use crate::packed_dit::ZImageTransformer2DModel as PackedDit;
 use crate::packed_te::ZImageTextEncoder as PackedTe;
+
+/// Read a component's packed descriptor without constructing a pipeline. Registry admission and
+/// lazy generators use this same source of truth as component loading, so a tier-specific snapshot
+/// cannot be mislabeled from `LoadSpec::quantize` (which Z-Image deliberately forbids).
+pub(crate) fn packed_config_at(
+    root: &Path,
+    sub: &str,
+) -> Result<Option<candle_gen::quant::PackedConfig>> {
+    let path = root.join(sub).join("config.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(ref error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(CandleError::Msg(format!(
+                "z-image: read {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+        CandleError::Msg(format!(
+            "z-image: parse {} (corrupt snapshot?): {error}",
+            path.display()
+        ))
+    })?;
+    Ok(candle_gen::quant::PackedConfig::from_config(&value))
+}
 
 /// The DiT, loaded **dense** (the stock `candle-transformers` model — a dense bf16 tier or the
 /// adapter-merged path) or **packed** (the vendored [`PackedDit`] built straight from an MLX-packed tier
@@ -92,11 +118,62 @@ use crate::packed_te::ZImageTextEncoder as PackedTe;
 pub(crate) enum DiT {
     // Boxed to keep the two arms comparably sized (`large_enum_variant`) — both models are heavy and
     // the enum lives behind an `Arc` regardless.
-    Dense(Box<ZImageTransformer2DModel>),
+    Dense(Box<DenseDit>),
     Packed(Box<PackedDit>),
 }
 
+/// Per-request geometry conditioning. Dense stock models retain their compatibility path; every
+/// vendored packed DiT receives the explicit handle that removes repeated RoPE construction.
+pub(crate) enum PreparedDiT {
+    Dense(crate::dit::PreparedConditioning),
+    Packed(crate::packed_dit::PreparedConditioning),
+}
+
 impl DiT {
+    pub(crate) fn prepare_conditioning(
+        &self,
+        x: &Tensor,
+        cap_feats: &Tensor,
+        cap_mask: &Tensor,
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<PreparedDiT> {
+        match self {
+            Self::Dense(m) => Ok(PreparedDiT::Dense(
+                m.prepare_conditioning(x, cap_feats, cap_mask)?,
+            )),
+            Self::Packed(m) => Ok(PreparedDiT::Packed(m.prepare_conditioning(
+                x,
+                cap_feats,
+                cap_mask,
+                attention_plan,
+            )?)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_prepared_with_memory(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        _cap_feats: &Tensor,
+        _cap_mask: &Tensor,
+        prepared: &PreparedDiT,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+    ) -> candle_gen::Result<Tensor> {
+        match (self, prepared) {
+            (Self::Dense(m), PreparedDiT::Dense(prepared)) => {
+                Ok(m.forward_prepared(x, t, prepared)?)
+            }
+            (Self::Packed(m), PreparedDiT::Packed(prepared)) => {
+                m.forward_prepared_with_memory(x, t, prepared, attention_plan, transformer_window)
+            }
+            _ => Err(candle_gen::CandleError::Msg(
+                "z-image: prepared conditioning belongs to another DiT variant".into(),
+            )),
+        }
+    }
+    #[allow(dead_code)]
     pub(crate) fn forward(
         &self,
         x: &Tensor,
@@ -110,21 +187,47 @@ impl DiT {
         }
     }
 
-    pub(crate) fn forward_with_attention_budget(
+    #[cfg(test)]
+    pub(crate) fn forward_with_attention_plan(
         &self,
         x: &Tensor,
         t: &Tensor,
         cap_feats: &Tensor,
         cap_mask: &Tensor,
-        attention_scores_budget: usize,
-    ) -> candle_gen::candle_core::Result<Tensor> {
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<Tensor> {
+        self.forward_with_memory(
+            x,
+            t,
+            cap_feats,
+            cap_mask,
+            attention_plan,
+            crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn forward_with_memory(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        cap_feats: &Tensor,
+        cap_mask: &Tensor,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+    ) -> candle_gen::Result<Tensor> {
         match self {
-            // The dense stock model has no explicit budget seam. Its resident behavior stays
-            // unchanged; every sequential tier is loaded through the vendored arm below.
-            Self::Dense(m) => m.forward(x, t, cap_feats, cap_mask),
-            Self::Packed(m) => {
-                m.forward_with_attention_budget(x, t, cap_feats, cap_mask, attention_scores_budget)
-            }
+            // The stock dense DiT has no bounded-attention seam. It remains the unchunked fast path,
+            // so a cancel flag attached to the plan is intentionally not consulted here.
+            Self::Dense(m) => Ok(m.forward(x, t, cap_feats, cap_mask)?),
+            Self::Packed(m) => m.forward_with_memory(
+                x,
+                t,
+                cap_feats,
+                cap_mask,
+                attention_plan,
+                transformer_window,
+            ),
         }
     }
 }
@@ -149,22 +252,27 @@ impl TextEnc {
 /// `steps`. Matches `mlx-gen-z-image`'s `DEFAULT_STEPS`.
 pub(crate) const DEFAULT_STEPS: usize = 4;
 
-/// Z-Image's still-image AutoencoderKL geometry for the shared Candle tile planner. The decoder
-/// upsamples spatially by 8; the synthetic temporal axis stays at one. `full_res_channels` is
-/// conservative and is not used by this fixed 512/128 spatial plan.
-const Z_IMAGE_VAE_TILING: VaeTiling = VaeTiling {
-    spatial_scale: 8,
-    temporal_scale: 1,
-    causal_temporal: false,
-    full_res_channels: 128,
-};
+/// The constrained-rung attention score budget for the sequential packed tier: 64 Mi elements. At 1024²
+/// the normal 1e9-element i32-overflow guard is still a single pass; this lower quality-preserving
+/// budget chunks independent query rows and releases roughly a gigabyte of transient CUDA storage.
+///
+/// **Derived, not declared** (SC-15796). The value is
+/// [`candle_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET`], the shared rung-3 operating point that
+/// this backend (SC-15256) and MLX (SC-15615) measured independently and both landed on; it used to be
+/// written out once per backend with nothing tying the two together. The `as usize` is only the width
+/// candle's `budget: usize` kernels take — gen-core owns the number.
+const CONSTRAINED_ATTN_SCORES_BUDGET: usize =
+    candle_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as usize;
 
-/// Bound the sequential packed-tier attention scores working set to 64 Mi elements. At 1024² the
-/// normal 1e9-element guard is still a single pass; this lower quality-preserving budget chunks
-/// independent query rows and releases roughly a gigabyte of transient CUDA storage.
-const Z_IMAGE_CONSTRAINED_ATTN_SCORES_BUDGET: usize = 64 * 1024 * 1024;
+fn request_attention_plan(req: &GenerationRequest, max_score_elements: usize) -> AttentionPlan<'_> {
+    AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+        max_score_elements as u64,
+        false,
+    ))
+    .with_cancel(&req.cancel)
+}
 
-fn check_decode_tile(cancel: &CancelFlag) -> Result<()> {
+fn check_decode(cancel: &CancelFlag) -> Result<()> {
     candle_gen::check_cancel(cancel)
 }
 
@@ -232,12 +340,36 @@ pub(crate) fn base_scheduler_config() -> SchedulerConfig {
     }
 }
 
+#[derive(Clone)]
+enum TextEncoderSource {
+    #[cfg(test)]
+    Trusted(WeightsSource),
+    Validated(Box<gen_core::ValidatedEncoderSource>),
+}
+
+impl TextEncoderSource {
+    fn read_unchanged<T>(&self, read: impl FnOnce(&WeightsSource) -> Result<T>) -> Result<T> {
+        match self {
+            #[cfg(test)]
+            Self::Trusted(source) => read(source),
+            Self::Validated(source) => source
+                .read_unchanged(read)
+                .map_err(|error| CandleError::Msg(error.to_string())),
+        }
+    }
+}
+
 /// A txt2img pipeline handle: the snapshot `root` + the compute device/dtype (bf16) + any LoRA/LoKr
 /// adapters to merge into the DiT at component-load time (sc-5166). Loading the heavy components is
 /// done by [`load_components`](Self::load_components) and owned/cached by the generator, mirroring
 /// the SDXL provider's lazy split.
 pub(crate) struct Pipeline {
     root: PathBuf,
+    /// Contract-validated external or snapshot encoder component. `None` is reserved for a fused
+    /// ComfyUI checkpoint whose encoder tensors are split from the primary file in memory.
+    text_encoder_source: Option<TextEncoderSource>,
+    /// Exact base tokenizer identity retained across lazy/request-time component construction.
+    tokenizer_source: Option<gen_core::ValidatedTokenizerSource>,
     device: Device,
     dtype: DType,
     /// Adapters merged into the DiT weights at load. Empty ⇒ the stock mmap build (zero regression).
@@ -247,7 +379,8 @@ pub(crate) struct Pipeline {
     pid_spec: Option<PidWeights>,
     /// External ComfyUI component sources (epic 10451 Phase 2, sc-10668). `Some` ⇒ `load_components`
     /// builds the DiT/TE/VAE from the in-place ComfyUI files (DiT + VAE key-remapped in memory)
-    /// instead of a diffusers snapshot dir. Dense-only: no packed tier, no adapters, no PiD.
+    /// instead of a diffusers snapshot dir. Integer-packed sources and PiD are unavailable; adapters
+    /// select the existing adaptable dense DiT.
     comfyui: Option<std::sync::Arc<crate::comfyui::ComfyuiSources>>,
 }
 
@@ -270,8 +403,8 @@ pub(crate) struct Components {
 /// but owning it here gives the phase one unambiguous lifetime and avoids a process cache silently
 /// retaining an encoder handle after its embeddings have been materialized.
 pub(crate) struct TextPhase {
-    text_encoder: TextEnc,
-    tokenizer: TextTokenizer,
+    pub(crate) text_encoder: TextEnc,
+    pub(crate) tokenizer: TextTokenizer,
 }
 
 /// Execute the three accelerator-residency phases with explicit scopes. Synchronization happens
@@ -320,10 +453,51 @@ fn run_three_stage<Text, Encoded, Renderer, Latents, Decoder, Output>(
     Ok(output)
 }
 
+fn bounded_host_latent_transfer(
+    latents: &Tensor,
+    cancel: &CancelFlag,
+    tile_edge: u32,
+    overlap: u32,
+) -> Result<(Tensor, usize)> {
+    let output_stride = tile_edge.checked_sub(overlap).ok_or_else(|| {
+        CandleError::Msg(format!(
+            "z-image bounded host decode requires overlap below tile edge, got {tile_edge}/{overlap}"
+        ))
+    })?;
+    let latent_rows_per_transfer = usize::try_from(output_stride / 8).map_err(|_| {
+        CandleError::Msg("z-image bounded host decode transfer stride overflowed".into())
+    })?;
+    if latent_rows_per_transfer == 0 {
+        return Err(CandleError::Msg(
+            "z-image bounded host decode transfer stride must cover at least one latent row".into(),
+        ));
+    }
+    // Final Z-Image latents are (B,C,F,H,W); axis 2 is the singleton frame dimension and axis 3 is
+    // the spatial row dimension that the output-space tile tuple bounds.
+    let latent_height = latents.dim(3)?;
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    while start < latent_height {
+        check_decode(cancel)?;
+        let length = latent_rows_per_transfer.min(latent_height - start);
+        chunks.push(
+            latents
+                .narrow(3, start, length)?
+                .to_device(&Device::Cpu)?
+                .to_dtype(DType::F32)?,
+        );
+        start += length;
+    }
+    let transfer_count = chunks.len();
+    let chunk_refs = chunks.iter().collect::<Vec<_>>();
+    Ok((Tensor::cat(&chunk_refs, 3)?, transfer_count))
+}
+
 impl Pipeline {
     /// Build the (light) pipeline handle for the Z-Image snapshot `root` at the given device/dtype,
     /// with `adapters` to merge into the DiT. Does **no** weight I/O — components load lazily via
     /// [`load_components`](Self::load_components).
+    #[cfg(test)]
     pub(crate) fn load(
         root: &Path,
         device: &Device,
@@ -333,6 +507,31 @@ impl Pipeline {
     ) -> Self {
         Self {
             root: root.to_path_buf(),
+            text_encoder_source: Some(TextEncoderSource::Trusted(WeightsSource::Dir(
+                root.join("text_encoder"),
+            ))),
+            tokenizer_source: None,
+            device: device.clone(),
+            dtype,
+            adapters: adapters.to_vec(),
+            pid_spec,
+            comfyui: None,
+        }
+    }
+
+    pub(crate) fn load_with_text_encoder(
+        root: &Path,
+        text_encoder_source: gen_core::ValidatedEncoderSource,
+        device: &Device,
+        dtype: DType,
+        adapters: &[AdapterSpec],
+        pid_spec: Option<PidWeights>,
+    ) -> Self {
+        let tokenizer_source = text_encoder_source.tokenizer_source().cloned();
+        Self {
+            root: root.to_path_buf(),
+            text_encoder_source: Some(TextEncoderSource::Validated(Box::new(text_encoder_source))),
+            tokenizer_source,
             device: device.clone(),
             dtype,
             adapters: adapters.to_vec(),
@@ -345,42 +544,47 @@ impl Pipeline {
     /// and VAE are key-remapped from the ComfyUI single-file components in memory and the Qwen3 encoder
     /// loads verbatim, all at first [`load_components`](Self::load_components). `root` is set to the
     /// sources' `tokenizer_dir` so [`common::build_tokenizer`] finds `tokenizer/tokenizer.json`. Does no
-    /// weight I/O here. Dense-only (no packed tier / adapters / PiD).
-    pub(crate) fn load_comfyui(
+    /// weight I/O here. Integer-packed sources remain unavailable; adapters install additively on the
+    /// remapped dense DiT, and a PiD overlay follows the retained `pid_spec`.
+    pub(crate) fn load_comfyui_with_text_encoder(
         sources: std::sync::Arc<crate::comfyui::ComfyuiSources>,
+        text_encoder_source: Option<gen_core::ValidatedEncoderSource>,
+        tokenizer_source: gen_core::ValidatedTokenizerSource,
         device: &Device,
         dtype: DType,
+        adapters: &[AdapterSpec],
+        pid_spec: Option<PidWeights>,
     ) -> Self {
         Self {
             root: sources.tokenizer_dir.clone(),
+            text_encoder_source: text_encoder_source
+                .map(|source| TextEncoderSource::Validated(Box::new(source))),
+            tokenizer_source: Some(tokenizer_source),
             device: device.clone(),
             dtype,
-            adapters: Vec::new(),
-            pid_spec: None,
+            adapters: adapters.to_vec(),
+            pid_spec,
             comfyui: Some(sources),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn adapter_specs(&self) -> &[AdapterSpec] {
+        &self.adapters
     }
 
     /// Load only the tokenizer + Qwen3 text encoder. This is the first sequential-residency phase and
     /// is also reused by the resident aggregate loader so both policies build identical components.
     pub(crate) fn load_text_phase(&self) -> Result<TextPhase> {
-        if self.comfyui.is_some() {
-            return Err(CandleError::Msg(
-                "z-image sequential residency is unavailable for bespoke ComfyUI component loads"
-                    .into(),
-            ));
-        }
-        let text_encoder = if self.component_is_packed("text_encoder")? {
-            let vb = self.component_vb("text_encoder")?;
-            TextEnc::Packed(Box::new(PackedTe::new(&TextEncoderConfig::z_image(), vb)?))
-        } else {
-            let vb = self.component_vb("text_encoder")?;
-            TextEnc::Dense(Box::new(ZImageTextEncoder::new(
-                &TextEncoderConfig::z_image(),
-                vb,
-            )?))
-        };
-        let tokenizer = common::build_tokenizer(&self.root, "z-image")?;
+        let tokenizer_source = self.tokenizer_source.as_ref().ok_or_else(|| {
+            CandleError::Msg(
+                "z-image tokenizer parsing requires a retained validation receipt".into(),
+            )
+        })?;
+        let tokenizer = common::build_tokenizer(tokenizer_source, "z-image")?;
+        // Tokenizer identity is part of the selected encoder contract. Parse it before opening any
+        // tensor payload so a post-validation tokenizer replacement fails at the cheap receipt gate.
+        let text_encoder = self.load_text_encoder_component()?;
         Ok(TextPhase {
             text_encoder,
             tokenizer,
@@ -390,17 +594,87 @@ impl Pipeline {
     /// Load only the DiT denoiser through the vendored implementation. Unlike the resident aggregate,
     /// the sequential ladder must use this path for both packed and dense tiers so its explicit
     /// attention-score budget is honored by bf16 as well as q4/q8.
-    pub(crate) fn load_transformer(&self, use_accelerated_attn: bool) -> Result<DiT> {
-        if self.comfyui.is_some() {
-            return Err(CandleError::Msg(
-                "z-image sequential residency is unavailable for bespoke ComfyUI component loads"
-                    .into(),
-            ));
-        }
+    pub(crate) fn load_transformer(
+        &self,
+        use_accelerated_attn: bool,
+        stream_transformer_blocks: bool,
+    ) -> Result<DiT> {
+        self.load_transformer_cancelable(
+            use_accelerated_attn,
+            stream_transformer_blocks,
+            &CancelFlag::default(),
+        )
+    }
+
+    fn load_transformer_cancelable(
+        &self,
+        use_accelerated_attn: bool,
+        stream_transformer_blocks: bool,
+        cancel: &CancelFlag,
+    ) -> Result<DiT> {
         let mut dit_cfg = DitConfig::z_image_turbo();
         dit_cfg.set_use_accelerated_attn(use_accelerated_attn);
-        let vb = self.component_vb("transformer")?;
-        let mut dit = PackedDit::new(&dit_cfg, vb)?;
+        if let Some(sources) = &self.comfyui {
+            if stream_transformer_blocks {
+                return Err(CandleError::Msg(
+                    "z-image imported File transformer streaming has no promoted File-source rung-4 measurement; the evidence matrix has no load-source axis"
+                        .into(),
+                ));
+            }
+            candle_gen::check_cancel(cancel)?;
+            let map = crate::comfyui::normalize_fp8_map(
+                sources.transformer_map()?,
+                self.dtype,
+                "z-image transformer",
+            )?;
+            let map = crate::comfyui::remap_dit_comfyui_to_diffusers(map)?;
+            let mut dit = PackedDit::new(
+                &dit_cfg,
+                VarBuilder::from_tensors(map, self.dtype, &self.device),
+            )?;
+            if !self.adapters.is_empty() {
+                crate::adapters::install_additive(&mut dit, &self.adapters)?;
+            }
+            candle_gen::check_cancel(cancel)?;
+            return Ok(DiT::Packed(Box::new(dit)));
+        }
+        let packed = self.component_packed_config("transformer")?;
+        let (vb, sidecars) = if stream_transformer_blocks {
+            if let Some(packed) = packed {
+                use candle_gen::quant::PackedWeightSidecars;
+
+                let files = self.component_files("transformer")?;
+                let prepared = PackedWeightSidecars::open_and_prepare_prefix_cancelable(
+                    &files,
+                    &self.root.join("transformer"),
+                    packed,
+                    &self.device,
+                    cancel,
+                    "layers.",
+                );
+                // The shared cache layer reports cancellation through candle-core because it is
+                // reusable below provider boundaries. Restore the provider's typed cancellation
+                // before `?` can erase it into a generic backend error.
+                if cancel.is_cancelled() {
+                    return Err(CandleError::Canceled);
+                }
+                let (source, sidecars) = prepared?;
+                let vb =
+                    VarBuilder::from_backend(Box::new(source), self.dtype, self.device.clone());
+                (vb, Some(Arc::new(sidecars)))
+            } else {
+                (self.component_vb("transformer")?, None)
+            }
+        } else {
+            (self.component_vb("transformer")?, None)
+        };
+        let mut dit = if let Some(sidecars) = sidecars {
+            PackedDit::new_block_streamed_with_sidecars(&dit_cfg, vb, sidecars)?
+        } else if stream_transformer_blocks {
+            PackedDit::new_block_streamed(&dit_cfg, vb)?
+        } else {
+            PackedDit::new(&dit_cfg, vb)?
+        };
         if !self.adapters.is_empty() {
             crate::adapters::install_additive(&mut dit, &self.adapters)?;
         }
@@ -410,11 +684,14 @@ impl Pipeline {
     /// Load only the native AutoencoderKL decoder. Packed tiers dequantize their tiny mid-block
     /// attention projections exactly as the historical resident aggregate did.
     pub(crate) fn load_vae(&self) -> Result<AutoEncoderKL> {
-        if self.comfyui.is_some() {
-            return Err(CandleError::Msg(
-                "z-image sequential residency is unavailable for bespoke ComfyUI component loads"
-                    .into(),
-            ));
+        if let Some(sources) = &self.comfyui {
+            let map =
+                crate::comfyui::normalize_fp8_map(sources.vae_map()?, self.dtype, "z-image VAE")?;
+            let map = crate::comfyui::remap_vae_ldm_to_diffusers(map)?;
+            return Ok(AutoEncoderKL::new(
+                &VaeConfig::z_image(),
+                VarBuilder::from_tensors(map, self.dtype, &self.device),
+            )?);
         }
         if self.component_is_packed("vae")? {
             Ok(AutoEncoderKL::new(
@@ -427,6 +704,56 @@ impl Pipeline {
                 self.component_vb("vae")?,
             )?)
         }
+    }
+
+    /// Load the native decoder on host memory for the bounded-decode rung. Z-Image's VAE contains
+    /// spatial group normalization, so independently decoded CUDA tiles can change normalization
+    /// statistics and leave visible tile grids even after overlap blending. Whole-frame f32 host
+    /// decode preserves the model's global statistics while bounding CUDA residency to the final
+    /// latent transfer; this is slower, but it is the quality-preserving constrained path.
+    pub(crate) fn load_vae_cpu(&self) -> Result<AutoEncoderKL> {
+        if let Some(sources) = &self.comfyui {
+            let map =
+                crate::comfyui::normalize_fp8_map(sources.vae_map()?, DType::F32, "z-image VAE")?;
+            let map = crate::comfyui::remap_vae_ldm_to_diffusers(map)?;
+            return Ok(AutoEncoderKL::new(
+                &VaeConfig::z_image(),
+                VarBuilder::from_tensors(map, DType::F32, &Device::Cpu),
+            )?);
+        }
+        let device = Device::Cpu;
+        let vb = if self.component_is_packed("vae")? {
+            self.vae_vb_dequantized_on(DType::F32, &device)?
+        } else {
+            self.component_vb_on("vae", DType::F32, &device)?
+        };
+        Ok(AutoEncoderKL::new(&VaeConfig::z_image(), vb)?)
+    }
+
+    pub(crate) fn decode_cpu(
+        &self,
+        vae: &AutoEncoderKL,
+        latents: &Tensor,
+        cancel: &CancelFlag,
+        tile_edge: u32,
+        overlap: u32,
+    ) -> Result<Image> {
+        if tile_edge != crate::memory_strategy::DECODE_TILE_EDGE
+            || overlap != crate::memory_strategy::DECODE_OVERLAP
+        {
+            return Err(CandleError::Msg(format!(
+                "z-image bounded host decode supports only the calibrated {}/{} tuple, got {tile_edge}/{overlap}",
+                crate::memory_strategy::DECODE_TILE_EDGE,
+                crate::memory_strategy::DECODE_OVERLAP,
+            )));
+        }
+        check_decode(cancel)?;
+        // The legacy tile tuple now bounds the CUDA->host latent transfer rather than independently
+        // decoding VAE tiles. Both values are operational: their difference is the output-space
+        // stride, converted to latent rows. The host VAE still sees one reassembled tensor, preserving
+        // spatial group-normalization statistics and therefore output quality.
+        let (latents, _) = bounded_host_latent_transfer(latents, cancel, tile_edge, overlap)?;
+        common::decode(vae, None, &latents)
     }
 
     /// Load the three heavy components from the snapshot's diffusers component subdirs
@@ -448,16 +775,7 @@ impl Pipeline {
         // forces a full dense build.
         let packed = self.component_is_packed("transformer")?;
 
-        let text_encoder = if self.component_is_packed("text_encoder")? {
-            let vb = self.component_vb("text_encoder")?;
-            TextEnc::Packed(Box::new(PackedTe::new(&TextEncoderConfig::z_image(), vb)?))
-        } else {
-            let vb = self.component_vb("text_encoder")?;
-            TextEnc::Dense(Box::new(ZImageTextEncoder::new(
-                &TextEncoderConfig::z_image(),
-                vb,
-            )?))
-        };
+        let text_encoder = self.load_text_encoder_component()?;
 
         let mut dit_cfg = DitConfig::z_image_turbo();
         dit_cfg.set_use_accelerated_attn(use_accelerated_attn);
@@ -479,7 +797,7 @@ impl Pipeline {
             DiT::Packed(Box::new(dit))
         } else {
             // Dense tier, no adapters: the stock candle-transformers model (byte-identical fast path).
-            DiT::Dense(Box::new(ZImageTransformer2DModel::new(
+            DiT::Dense(Box::new(DenseDit::new(
                 &dit_cfg,
                 self.component_vb("transformer")?,
             )?))
@@ -495,7 +813,12 @@ impl Pipeline {
             AutoEncoderKL::new(&VaeConfig::z_image(), self.component_vb("vae")?)?
         };
 
-        let tokenizer = common::build_tokenizer(&self.root, "z-image")?;
+        let tokenizer_source = self.tokenizer_source.as_ref().ok_or_else(|| {
+            CandleError::Msg(
+                "z-image tokenizer parsing requires a retained validation receipt".into(),
+            )
+        })?;
+        let tokenizer = common::build_tokenizer(tokenizer_source, "z-image")?;
         // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller
         // opted in via `LoadSpec::pid`; Z-Image aliases the FLUX.1 latent space (`zimage-turbo` → the
         // shared `flux` student).
@@ -526,83 +849,106 @@ impl Pipeline {
         sources: &crate::comfyui::ComfyuiSources,
         use_accelerated_attn: bool,
     ) -> Result<Components> {
-        use candle_gen::candle_core::safetensors;
-
-        let mut combined = match &sources.weights {
-            crate::comfyui::ComfyuiWeights::Separate {
-                transformer_file: _,
-                text_encoder_file: _,
-                vae_file: _,
-            } => None,
-            crate::comfyui::ComfyuiWeights::Combined(file) => Some(
-                crate::comfyui::split_combined_checkpoint(safetensors::load(file, &Device::Cpu)?)?,
-            ),
-        };
-
-        // DiT: ComfyUI-native keys → diffusers/candle keys (fused-qkv split + renames), then build.
-        let dit_map = match (&sources.weights, combined.as_mut()) {
-            (
-                crate::comfyui::ComfyuiWeights::Separate {
-                    transformer_file, ..
-                },
-                None,
-            ) => safetensors::load(transformer_file, &Device::Cpu)?,
-            (crate::comfyui::ComfyuiWeights::Combined(_), Some(maps)) => {
-                std::mem::take(&mut maps.transformer)
-            }
-            _ => unreachable!("ComfyUI source variant and combined maps stay aligned"),
-        };
-        let dit_map =
-            crate::comfyui::normalize_fp8_map(dit_map, self.dtype, "z-image transformer")?;
-        let dit_map = crate::comfyui::remap_dit_comfyui_to_diffusers(dit_map)?;
-        let mut dit_cfg = DitConfig::z_image_turbo();
-        dit_cfg.set_use_accelerated_attn(use_accelerated_attn);
-        let dit_vb = VarBuilder::from_tensors(dit_map, self.dtype, &self.device);
-        let transformer = DiT::Dense(Box::new(ZImageTransformer2DModel::new(&dit_cfg, dit_vb)?));
-
-        // Text encoder: standard HF Qwen3 — loaded verbatim and normalized to the compute dtype.
-        let te_map = match (&sources.weights, combined.as_mut()) {
-            (
-                crate::comfyui::ComfyuiWeights::Separate {
-                    text_encoder_file, ..
-                },
-                None,
-            ) => safetensors::load(text_encoder_file, &Device::Cpu)?,
-            (crate::comfyui::ComfyuiWeights::Combined(_), Some(maps)) => {
-                std::mem::take(&mut maps.text_encoder)
-            }
-            _ => unreachable!("ComfyUI source variant and combined maps stay aligned"),
-        };
-        let te_map = crate::comfyui::normalize_fp8_map(te_map, self.dtype, "z-image text encoder")?;
-        let te_vb = VarBuilder::from_tensors(te_map, self.dtype, &self.device);
-        let text_encoder = TextEnc::Dense(Box::new(ZImageTextEncoder::new(
-            &TextEncoderConfig::z_image(),
-            te_vb,
-        )?));
-
-        // VAE: BFL/ldm keys → diffusers keys (incl. the up-block reversal + 1×1-conv→Linear squeeze).
-        let vae_map = match (&sources.weights, combined.as_mut()) {
-            (crate::comfyui::ComfyuiWeights::Separate { vae_file, .. }, None) => {
-                safetensors::load(vae_file, &Device::Cpu)?
-            }
-            (crate::comfyui::ComfyuiWeights::Combined(_), Some(maps)) => {
-                std::mem::take(&mut maps.vae)
-            }
-            _ => unreachable!("ComfyUI source variant and combined maps stay aligned"),
-        };
-        let vae_map = crate::comfyui::normalize_fp8_map(vae_map, self.dtype, "z-image VAE")?;
-        let vae_map = crate::comfyui::remap_vae_ldm_to_diffusers(vae_map)?;
-        let vae_vb = VarBuilder::from_tensors(vae_map, self.dtype, &self.device);
-        let vae = AutoEncoderKL::new(&VaeConfig::z_image(), vae_vb)?;
-
-        let tokenizer = common::build_tokenizer(&self.root, "z-image comfyui")?;
+        // The component loaders below are ComfyUI-aware (`load_transformer_cancelable` remaps the
+        // native keys and installs the ordered adapter stack additively; `load_text_encoder_component`
+        // reads the ComfyUI TE map), so this delegates rather than re-implementing the remap inline.
+        sources.ensure_unchanged()?;
+        let text = self.load_text_phase()?;
+        let transformer = self.load_transformer(use_accelerated_attn, false)?;
+        let vae = self.load_vae()?;
+        let pid = self
+            .pid_spec
+            .as_ref()
+            .map(|spec| PidEngine::from_spec(spec, PID_BACKBONE, &self.device).map(Arc::new))
+            .transpose()?;
         Ok(Components {
-            text_encoder: Arc::new(text_encoder),
+            text_encoder: Arc::new(text.text_encoder),
             transformer: Arc::new(transformer),
             vae: Arc::new(vae),
-            tokenizer: Arc::new(tokenizer),
-            pid: None,
+            tokenizer: Arc::new(text.tokenizer),
+            pid,
         })
+    }
+
+    fn load_text_encoder_component(&self) -> Result<TextEnc> {
+        let Some(source) = self.text_encoder_source.as_ref() else {
+            let sources = self.comfyui.as_ref().ok_or_else(|| {
+                CandleError::Msg("z-image text encoder source is unavailable".into())
+            })?;
+            let map = crate::comfyui::normalize_fp8_map(
+                sources.text_encoder_map()?,
+                self.dtype,
+                "z-image text encoder",
+            )?;
+            return Ok(TextEnc::Dense(Box::new(ZImageTextEncoder::new(
+                &TextEncoderConfig::z_image(),
+                VarBuilder::from_tensors(map, self.dtype, &self.device),
+            )?)));
+        };
+
+        source.read_unchanged(|source| self.load_text_encoder_from_source(source))
+    }
+
+    fn load_text_encoder_from_source(&self, source: &WeightsSource) -> Result<TextEnc> {
+        if self.text_encoder_is_packed(source)? {
+            return Ok(TextEnc::Packed(Box::new(PackedTe::new(
+                &TextEncoderConfig::z_image(),
+                self.text_encoder_vb(source, false)?,
+            )?)));
+        }
+        Ok(TextEnc::Dense(Box::new(ZImageTextEncoder::new(
+            &TextEncoderConfig::z_image(),
+            self.text_encoder_vb(source, true)?,
+        )?)))
+    }
+
+    fn text_encoder_is_packed(&self, source: &WeightsSource) -> Result<bool> {
+        let config = match source {
+            WeightsSource::Dir(path) => path.join("config.json"),
+            WeightsSource::File(path) => path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("config.json"),
+        };
+        let text = match std::fs::read_to_string(&config) {
+            Ok(text) => text,
+            Err(ref error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(CandleError::Msg(format!(
+                    "z-image: read {}: {error}",
+                    config.display()
+                )))
+            }
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+            CandleError::Msg(format!(
+                "z-image: parse {} (corrupt encoder?): {error}",
+                config.display()
+            ))
+        })?;
+        Ok(candle_gen::quant::PackedConfig::from_config(&value).is_some())
+    }
+
+    fn text_encoder_vb(
+        &self,
+        source: &WeightsSource,
+        normalize_dense_file: bool,
+    ) -> Result<VarBuilder<'static>> {
+        match source {
+            WeightsSource::Dir(path) => {
+                let files = candle_gen::sorted_safetensors(path, "z-image text encoder")?;
+                candle_gen::mmap_var_builder(&files, self.dtype, &self.device)
+            }
+            WeightsSource::File(path) if normalize_dense_file => {
+                let map = candle_gen::candle_core::safetensors::load(path, &Device::Cpu)?;
+                let map =
+                    crate::comfyui::normalize_fp8_map(map, self.dtype, "z-image text encoder")?;
+                Ok(VarBuilder::from_tensors(map, self.dtype, &self.device))
+            }
+            WeightsSource::File(path) => {
+                candle_gen::mmap_var_builder(std::slice::from_ref(path), self.dtype, &self.device)
+            }
+        }
     }
 
     /// Whether the snapshot component `sub/` is a **pre-quantized MLX-packed tier** — its `config.json`
@@ -616,27 +962,16 @@ impl Pipeline {
     /// missing weights, no diagnostic). A well-formed config with no `quantization` block is a dense tier
     /// → `Ok(false)` (sc-9426, F-073 sibling).
     pub(crate) fn component_is_packed(&self, sub: &str) -> Result<bool> {
-        let path = self.root.join(sub).join("config.json");
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            // No config.json at all → legitimate dense / fixture snapshot, not packed.
-            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            // Present but unreadable (permissions, partial download) → surface, don't swallow.
-            Err(e) => {
-                return Err(CandleError::Msg(format!(
-                    "z-image: read {}: {e}",
-                    path.display()
-                )))
-            }
-        };
-        // Present but malformed JSON → corrupt snapshot, error rather than fall to dense.
-        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-            CandleError::Msg(format!(
-                "z-image: parse {} (corrupt snapshot?): {e}",
-                path.display()
-            ))
-        })?;
-        Ok(candle_gen::quant::PackedConfig::from_config(&v).is_some())
+        Ok(self.component_packed_config(sub)?.is_some())
+    }
+
+    /// Read the full packed descriptor so sidecar preparation uses the tier's declared bit width and
+    /// group size instead of re-inferring either from tensor shapes.
+    fn component_packed_config(
+        &self,
+        sub: &str,
+    ) -> Result<Option<candle_gen::quant::PackedConfig>> {
+        packed_config_at(&self.root, sub)
     }
 
     /// Build a VAE [`VarBuilder`] for a **packed** tier by dequantizing the 8 packed mid-block attention
@@ -644,12 +979,12 @@ impl Pipeline {
     /// passing every other (already-dense) tensor through unchanged — so the stock `AutoEncoderKL` loads
     /// without seeing a `.weight` u32/`.scales`/`.biases` triple it can't read. The dequant is ~2 MB of
     /// one-time work (the sc-9408 pragmatic VAE path — see [`crate::quant::dequant_packed_to_dense`]).
-    fn vae_vb_dequantized(&self, dtype: DType) -> Result<VarBuilder<'static>> {
+    fn vae_vb_dequantized_on(&self, dtype: DType, device: &Device) -> Result<VarBuilder<'static>> {
         use candle_gen::candle_core::safetensors::MmapedSafetensors;
         let files = self.component_files("vae")?;
         // SAFETY: mmap of read-only weight files; standard candle loading path.
         let st = unsafe { MmapedSafetensors::multi(&files)? };
-        let src = VarBuilder::from_backend(Box::new(st), dtype, self.device.clone());
+        let src = VarBuilder::from_backend(Box::new(st), dtype, device.clone());
 
         // Collect every tensor, dequantizing the packed attention triples and dropping their
         // `.scales`/`.biases` siblings; pass all other tensors through at their native dtype.
@@ -668,17 +1003,20 @@ impl Pipeline {
             }
             if let Some(base) = key.strip_suffix(".weight") {
                 if packed_bases.contains(base) {
-                    let dense =
-                        crate::quant::dequant_packed_to_dense(&src, base, &self.device, dtype)?;
+                    let dense = crate::quant::dequant_packed_to_dense(&src, base, device, dtype)?;
                     tensors.insert(key.clone(), dense);
                     continue;
                 }
             }
             // Dense tensor — load it through at its stored dtype/device.
-            let t = st2.load(&key, &self.device)?;
+            let t = st2.load(&key, device)?;
             tensors.insert(key.clone(), t.to_dtype(dtype)?);
         }
-        Ok(VarBuilder::from_tensors(tensors, dtype, &self.device))
+        Ok(VarBuilder::from_tensors(tensors, dtype, device))
+    }
+
+    fn vae_vb_dequantized(&self, dtype: DType) -> Result<VarBuilder<'static>> {
+        self.vae_vb_dequantized_on(dtype, &self.device)
     }
 
     /// Resolve the sorted list of `.safetensors` files in the snapshot component subdir `sub`
@@ -705,6 +1043,16 @@ impl Pipeline {
         candle_gen::mmap_var_builder(&files, self.dtype, &self.device)
     }
 
+    fn component_vb_on(
+        &self,
+        sub: &str,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<VarBuilder<'static>> {
+        let files = self.component_files(sub)?;
+        candle_gen::mmap_var_builder(&files, dtype, device)
+    }
+
     /// Build the standalone f32 VAE **encoder** for the base img2img / `Reference` path (sc-8646). The
     /// decode `AutoEncoderKL` holds an encoder too, but (a) it is private and (b) its `encode` samples
     /// the diagonal-gaussian via the *device* RNG (not launch-portable — breaks sc-3673), so — exactly
@@ -712,7 +1060,12 @@ impl Pipeline {
     /// distribution **mean** deterministically. Only built on the first img2img request (cached by the
     /// generator), so the txt2img / Turbo path never pays for it.
     pub(crate) fn load_vae_encoder(&self) -> Result<VaeEncoder> {
-        let vb = if self.component_is_packed("vae")? {
+        let vb = if let Some(sources) = &self.comfyui {
+            let map =
+                crate::comfyui::normalize_fp8_map(sources.vae_map()?, ENC_DTYPE, "z-image VAE")?;
+            let map = crate::comfyui::remap_vae_ldm_to_diffusers(map)?;
+            VarBuilder::from_tensors(map, ENC_DTYPE, &self.device)
+        } else if self.component_is_packed("vae")? {
             self.vae_vb_dequantized(ENC_DTYPE)?
         } else {
             let files = self.component_files("vae")?;
@@ -791,13 +1144,14 @@ impl Pipeline {
     }
 
     /// Render the generic Turbo route under true three-stage sequential residency:
-    /// Qwen3 encode/drop, DiT denoise/drop, then seam-blended tiled VAE decode/drop. A reference
+    /// Qwen3 encode/drop, DiT denoise/drop, then whole-frame f32 host VAE decode/drop. A reference
     /// request gets one additional, explicitly-scoped VAE-encoder phase before prompt encoding.
     pub(crate) fn render_sequential(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
+        let memory = req.memory.unwrap_or_default();
         let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
         let reference = resolve_reference(req)?;
         let start_step = match &reference {
@@ -830,7 +1184,13 @@ impl Pipeline {
             |text| self.text_embeddings(&text.text_encoder, &text.tokenizer, &req.prompt),
             // sc-9032: accelerated attention is not currently wired; match the resident path's
             // effective false value exactly.
-            || self.load_transformer(false),
+            || {
+                self.load_transformer_cancelable(
+                    false,
+                    memory.stream_transformer_blocks,
+                    &req.cancel,
+                )
+            },
             |transformer, cap, on_progress| {
                 self.denoise_sequential(
                     req,
@@ -841,14 +1201,138 @@ impl Pipeline {
                     on_progress,
                 )
             },
-            || self.load_vae(),
+            || {
+                if memory.tile_vae_decode {
+                    self.load_vae_cpu()
+                } else {
+                    self.load_vae()
+                }
+            },
             |vae, latents, on_progress| {
                 latents
                     .iter()
                     .map(|latent| {
                         candle_gen::check_cancel(&req.cancel)?;
                         on_progress(Progress::Decoding);
-                        self.decode_tiled(vae, latent, &req.cancel)
+                        if memory.tile_vae_decode {
+                            self.decode_cpu(
+                                vae,
+                                latent,
+                                &req.cancel,
+                                memory
+                                    .decode_tile_edge
+                                    .unwrap_or(crate::memory_strategy::DECODE_TILE_EDGE),
+                                memory
+                                    .decode_overlap
+                                    .unwrap_or(crate::memory_strategy::DECODE_OVERLAP),
+                            )
+                        } else {
+                            self.decode(vae, None, latent)
+                        }
+                    })
+                    .collect()
+            },
+        )
+    }
+
+    /// Base/full-CFG twin of [`Self::render_sequential`]. It preserves the base schedule and both
+    /// conditional forwards while giving the same request-scoped memory controls authority over
+    /// bounded host decode, attention chunking, and transformer windows.
+    pub(crate) fn render_base_sequential(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<Image>> {
+        let memory = req.memory.unwrap_or_default();
+        let steps = req.steps.map(|s| s as usize).unwrap_or(BASE_DEFAULT_STEPS);
+        let reference = resolve_reference(req)?;
+        let start_step = match &reference {
+            Some((_, strength)) => init_time_step(steps, *strength),
+            None => 0,
+        };
+
+        let clean = if start_step > 0 {
+            candle_gen::check_cancel(&req.cancel)?;
+            on_progress(Progress::Loading(LoadPhase::Renderer));
+            let encoder = self.load_vae_encoder()?;
+            let encoded = match reference {
+                Some((image, _)) => self.encode_reference(&encoder, image, req.width, req.height),
+                None => unreachable!("start_step > 0 implies a reference"),
+            };
+            let sync = self.device.synchronize();
+            drop(encoder);
+            let encoded = encoded?;
+            sync?;
+            Some(encoded)
+        } else {
+            None
+        };
+
+        run_three_stage(
+            &req.cancel,
+            &self.device,
+            on_progress,
+            || self.load_text_phase(),
+            |text| {
+                let cap = self.text_embeddings(&text.text_encoder, &text.tokenizer, &req.prompt)?;
+                let guidance = req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE);
+                let neg_cap = if guidance != 1.0 {
+                    Some(self.uncond_embeddings(
+                        &text.text_encoder,
+                        &text.tokenizer,
+                        req.negative_prompt.as_deref().unwrap_or(""),
+                    )?)
+                } else {
+                    None
+                };
+                Ok((cap, neg_cap))
+            },
+            || {
+                self.load_transformer_cancelable(
+                    false,
+                    memory.stream_transformer_blocks,
+                    &req.cancel,
+                )
+            },
+            |transformer, (cap, neg_cap), on_progress| {
+                self.denoise_base_sequential(
+                    req,
+                    transformer,
+                    &cap,
+                    neg_cap.as_ref(),
+                    clean.as_ref(),
+                    start_step,
+                    on_progress,
+                )
+            },
+            || {
+                if memory.tile_vae_decode {
+                    self.load_vae_cpu()
+                } else {
+                    self.load_vae()
+                }
+            },
+            |vae, latents, on_progress| {
+                latents
+                    .iter()
+                    .map(|latent| {
+                        candle_gen::check_cancel(&req.cancel)?;
+                        on_progress(Progress::Decoding);
+                        if memory.tile_vae_decode {
+                            self.decode_cpu(
+                                vae,
+                                latent,
+                                &req.cancel,
+                                memory
+                                    .decode_tile_edge
+                                    .unwrap_or(crate::memory_strategy::DECODE_TILE_EDGE),
+                                memory
+                                    .decode_overlap
+                                    .unwrap_or(crate::memory_strategy::DECODE_OVERLAP),
+                            )
+                        } else {
+                            self.decode(vae, None, latent)
+                        }
                     })
                     .collect()
             },
@@ -866,12 +1350,23 @@ impl Pipeline {
         start_step: usize,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Tensor>> {
+        let memory = req.memory.unwrap_or_default();
+        let attention_budget = if memory.chunk_attention {
+            CONSTRAINED_ATTN_SCORES_BUDGET
+        } else {
+            candle_gen::ATTN_SCORES_BUDGET
+        };
+        let transformer_window = memory
+            .transformer_window_size
+            .map(|value| value as usize)
+            .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
         let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let lat_h = (req.height / SPATIAL_SCALE) as usize;
         let lat_w = (req.width / SPATIAL_SCALE) as usize;
 
         candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+            candle_gen::check_cancel(&req.cancel)?;
             let noise = common::seed_noise(seed, lat_h, lat_w, &self.device, self.dtype)?;
             let image_seq_len =
                 ((lat_h as u32 / PATCH_SIZE) * (lat_w as u32 / PATCH_SIZE)) as usize;
@@ -899,6 +1394,15 @@ impl Pipeline {
             let prepared = prepare_inputs(&x_t, std::slice::from_ref(cap), &self.device)?;
             let cap_feats = prepared.cap_feats;
             let cap_mask = prepared.cap_mask;
+            let dit_prepared = transformer.prepare_conditioning(
+                &prepared.latents,
+                &cap_feats,
+                &cap_mask,
+                request_attention_plan(req, attention_budget),
+            )?;
+            // Per-step latent preview (epic 16948, sc-16957). Built per image: each seed is its own
+            // driver call and must start a fresh trajectory at frame 1. The driver owns the counter.
+            let preview = crate::preview::hook(&req.preview);
             candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::OneMinusSigma,
@@ -907,15 +1411,18 @@ impl Pipeline {
                 seed,
                 &req.cancel,
                 on_progress,
+                Some(&preview),
                 |latents, t| -> Result<Tensor> {
                     let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
                     Ok(transformer
-                        .forward_with_attention_budget(
+                        .forward_prepared_with_memory(
                             latents,
                             &t_tensor,
                             &cap_feats,
                             &cap_mask,
-                            Z_IMAGE_CONSTRAINED_ATTN_SCORES_BUDGET,
+                            &dit_prepared,
+                            request_attention_plan(req, attention_budget),
+                            transformer_window,
                         )?
                         .neg()?)
                 },
@@ -923,29 +1430,130 @@ impl Pipeline {
         })
     }
 
-    /// Decode a final latent with 512 px tiles and 128 px overlap. The shared tile planner's
-    /// trapezoidal partition-of-unity blend preserves exact output dimensions and suppresses
-    /// boundary-convolution seams while bounding the CUDA working set to one tile.
-    fn decode_tiled(
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_base_sequential(
         &self,
-        vae: &AutoEncoderKL,
-        latents: &Tensor,
-        cancel: &CancelFlag,
-    ) -> Result<Image> {
-        let cfg = TilingConfig::spatial_only(512, 128);
-        let decoded = candle_gen::vae_tiling::decode_tiled(
-            Z_IMAGE_VAE_TILING,
-            "z-image AutoencoderKL",
-            latents,
-            &cfg,
-            |tile| -> Result<Tensor> {
-                check_decode_tile(cancel)?;
-                let tile = tile.squeeze(2)?;
-                let decoded = vae.decode(&tile)?.to_dtype(DType::F32)?;
-                Ok(decoded.unsqueeze(2)?)
-            },
-        )?;
-        common::decoded_to_image(&decoded.squeeze(2)?)
+        req: &GenerationRequest,
+        transformer: &DiT,
+        cap: &Tensor,
+        neg_cap: Option<&Tensor>,
+        clean: Option<&Tensor>,
+        start_step: usize,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<Tensor>> {
+        let memory = req.memory.unwrap_or_default();
+        let attention_budget = if memory.chunk_attention {
+            CONSTRAINED_ATTN_SCORES_BUDGET
+        } else {
+            candle_gen::ATTN_SCORES_BUDGET
+        };
+        let transformer_window = memory
+            .transformer_window_size
+            .map(|value| value as usize)
+            .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
+        let steps = req.steps.map(|s| s as usize).unwrap_or(BASE_DEFAULT_STEPS);
+        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let guidance = req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE);
+        let lat_h = (req.height / SPATIAL_SCALE) as usize;
+        let lat_w = (req.width / SPATIAL_SCALE) as usize;
+
+        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+            candle_gen::check_cancel(&req.cancel)?;
+            let noise = common::seed_noise(seed, lat_h, lat_w, &self.device, self.dtype)?;
+            let mut scheduler = FlowMatchEulerDiscreteScheduler::new(base_scheduler_config());
+            scheduler.set_timesteps(steps, None);
+            let native: Vec<f32> = scheduler.sigmas.iter().map(|&sigma| sigma as f32).collect();
+            let sigmas = candle_gen::resolve_flow_schedule(
+                req.scheduler.as_deref(),
+                (BASE_SCHEDULE_SHIFT as f32).ln(),
+                steps,
+                &native,
+            );
+            let start = start_step.min(sigmas.len().saturating_sub(1));
+            let x_t = match clean {
+                Some(clean) => {
+                    let sigma_start = sigmas[start] as f64;
+                    (clean.affine(1.0 - sigma_start, 0.0)? + noise.affine(sigma_start, 0.0)?)?
+                }
+                None => noise,
+            };
+            let prepared = prepare_inputs(&x_t, std::slice::from_ref(cap), &self.device)?;
+            let cap_feats = prepared.cap_feats;
+            let cap_mask = prepared.cap_mask;
+            let uncond = match neg_cap {
+                Some(neg) => {
+                    let prepared = prepare_inputs(&x_t, std::slice::from_ref(neg), &self.device)?;
+                    Some((prepared.cap_feats, prepared.cap_mask))
+                }
+                None => None,
+            };
+            let dit_prepared = transformer.prepare_conditioning(
+                &prepared.latents,
+                &cap_feats,
+                &cap_mask,
+                request_attention_plan(req, attention_budget),
+            )?;
+            let uncond_prepared = match uncond.as_ref() {
+                Some((neg_feats, neg_mask)) => Some(transformer.prepare_conditioning(
+                    &prepared.latents,
+                    neg_feats,
+                    neg_mask,
+                    request_attention_plan(req, attention_budget),
+                )?),
+                None => None,
+            };
+
+            // Per-step latent preview (epic 16948, sc-16957). Built per image: each seed is its own
+            // driver call and must start a fresh trajectory at frame 1. The CFG blend happens inside
+            // the predict closure below, so the hook only ever sees the conditional trajectory.
+            let preview = crate::preview::hook(&req.preview);
+            candle_gen::run_flow_sampler(
+                req.sampler.as_deref(),
+                TimestepConvention::OneMinusSigma,
+                &sigmas[start..],
+                prepared.latents,
+                seed,
+                &req.cancel,
+                on_progress,
+                Some(&preview),
+                |latents, t| -> Result<Tensor> {
+                    let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
+                    let plan = request_attention_plan(req, attention_budget);
+                    let v_cond = transformer
+                        .forward_prepared_with_memory(
+                            latents,
+                            &t_tensor,
+                            &cap_feats,
+                            &cap_mask,
+                            &dit_prepared,
+                            plan,
+                            transformer_window,
+                        )?
+                        .neg()?;
+                    match (uncond.as_ref(), uncond_prepared.as_ref()) {
+                        (Some((neg_feats, neg_mask)), Some(neg_prepared)) => {
+                            let v_uncond = transformer
+                                .forward_prepared_with_memory(
+                                    latents,
+                                    &t_tensor,
+                                    neg_feats,
+                                    neg_mask,
+                                    neg_prepared,
+                                    plan,
+                                    transformer_window,
+                                )?
+                                .neg()?;
+                            let delta = (&v_cond - &v_uncond)?;
+                            Ok((v_uncond + (delta * guidance as f64)?)?)
+                        }
+                        (None, None) => Ok(v_cond),
+                        _ => Err(CandleError::Msg(
+                            "z-image: CFG conditioning preparation mismatch".into(),
+                        )),
+                    }
+                },
+            )
+        })
     }
 
     /// Render `req` against pre-loaded `components`, emitting per-step progress and honoring
@@ -965,6 +1573,16 @@ impl Pipeline {
         start_step: usize,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
+        let memory = req.memory.unwrap_or_default();
+        let attention_budget = if memory.chunk_attention {
+            CONSTRAINED_ATTN_SCORES_BUDGET
+        } else {
+            candle_gen::ATTN_SCORES_BUDGET
+        };
+        let transformer_window = memory
+            .transformer_window_size
+            .map(|value| value as usize)
+            .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
         let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let lat_h = (req.height / SPATIAL_SCALE) as usize;
@@ -985,6 +1603,7 @@ impl Pipeline {
         )?;
 
         candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+            candle_gen::check_cancel(&req.cancel)?;
             // sc-3673 parity — deterministic, launch-portable initial noise (shared [`common::seed_noise`]).
             let noise = common::seed_noise(seed, lat_h, lat_w, &self.device, self.dtype)?;
 
@@ -1042,7 +1661,17 @@ impl Pipeline {
             let prepared = prepare_inputs(&x_t, std::slice::from_ref(&cap), &self.device)?;
             let cap_feats = prepared.cap_feats;
             let cap_mask = prepared.cap_mask;
+            let dit_prepared = components.transformer.prepare_conditioning(
+                &prepared.latents,
+                &cap_feats,
+                &cap_mask,
+                request_attention_plan(req, attention_budget),
+            )?;
 
+            // Per-step latent preview (epic 16948, sc-16957). Built per image: each seed is its own
+            // driver call and must start a fresh trajectory at frame 1. The driver owns the counter,
+            // so this route's numbering can only ever key off the schedule it is integrating.
+            let preview = crate::preview::hook(&req.preview);
             let latents = candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::OneMinusSigma,
@@ -1051,6 +1680,7 @@ impl Pipeline {
                 seed,
                 &req.cancel,
                 on_progress,
+                Some(&preview),
                 |latents, t| -> Result<Tensor> {
                     // `t` is the 1−σ conditioning (OneMinusSigma) the DiT embeds — the same value the
                     // reference scheduler's `current_timestep_normalized` returns. The embedder upcasts
@@ -1058,7 +1688,15 @@ impl Pipeline {
                     let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
                     let velocity = components
                         .transformer
-                        .forward(latents, &t_tensor, &cap_feats, &cap_mask)?
+                        .forward_prepared_with_memory(
+                            latents,
+                            &t_tensor,
+                            &cap_feats,
+                            &cap_mask,
+                            &dit_prepared,
+                            request_attention_plan(req, attention_budget),
+                            transformer_window,
+                        )?
                         .neg()?;
                     Ok(velocity)
                 },
@@ -1104,6 +1742,16 @@ impl Pipeline {
         start_step: usize,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
+        let memory = req.memory.unwrap_or_default();
+        let attention_budget = if memory.chunk_attention {
+            CONSTRAINED_ATTN_SCORES_BUDGET
+        } else {
+            candle_gen::ATTN_SCORES_BUDGET
+        };
+        let transformer_window = memory
+            .transformer_window_size
+            .map(|value| value as usize)
+            .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
         let steps = req.steps.map(|s| s as usize).unwrap_or(BASE_DEFAULT_STEPS);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let lat_h = (req.height / SPATIAL_SCALE) as usize;
@@ -1136,6 +1784,7 @@ impl Pipeline {
         )?;
 
         candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+            candle_gen::check_cancel(&req.cancel)?;
             // sc-3673 parity — deterministic, launch-portable initial noise (shared [`common::seed_noise`]).
             let noise = common::seed_noise(seed, lat_h, lat_w, &self.device, self.dtype)?;
 
@@ -1187,7 +1836,26 @@ impl Pipeline {
                 }
                 None => None,
             };
+            let dit_prepared = components.transformer.prepare_conditioning(
+                &prepared.latents,
+                &cap_feats,
+                &cap_mask,
+                request_attention_plan(req, attention_budget),
+            )?;
+            let uncond_prepared = match uncond.as_ref() {
+                Some((features, mask)) => Some(components.transformer.prepare_conditioning(
+                    &prepared.latents,
+                    features,
+                    mask,
+                    request_attention_plan(req, attention_budget),
+                )?),
+                None => None,
+            };
 
+            // Per-step latent preview (epic 16948, sc-16957). Built per image: each seed is its own
+            // driver call and must start a fresh trajectory at frame 1. The CFG blend happens inside
+            // the predict closure below, so the hook only ever sees the conditional trajectory.
+            let preview = crate::preview::hook(&req.preview);
             let latents = candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::OneMinusSigma,
@@ -1196,6 +1864,7 @@ impl Pipeline {
                 seed,
                 &req.cancel,
                 on_progress,
+                Some(&preview),
                 |latents, t| -> Result<Tensor> {
                     let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
                     // Conditional velocity (Z-Image sign convention: the DiT output is negated before
@@ -1203,19 +1872,40 @@ impl Pipeline {
                     // linear so the result is identical to combining-then-negating.
                     let v_cond = components
                         .transformer
-                        .forward(latents, &t_tensor, &cap_feats, &cap_mask)?
+                        .forward_prepared_with_memory(
+                            latents,
+                            &t_tensor,
+                            &cap_feats,
+                            &cap_mask,
+                            &dit_prepared,
+                            request_attention_plan(req, attention_budget),
+                            transformer_window,
+                        )?
                         .neg()?;
-                    let velocity = match uncond.as_ref() {
-                        Some((neg_feats, neg_mask)) => {
+                    let velocity = match (uncond.as_ref(), uncond_prepared.as_ref()) {
+                        (Some((neg_feats, neg_mask)), Some(neg_prepared)) => {
                             let v_uncond = components
                                 .transformer
-                                .forward(latents, &t_tensor, neg_feats, neg_mask)?
+                                .forward_prepared_with_memory(
+                                    latents,
+                                    &t_tensor,
+                                    neg_feats,
+                                    neg_mask,
+                                    neg_prepared,
+                                    request_attention_plan(req, attention_budget),
+                                    transformer_window,
+                                )?
                                 .neg()?;
                             // v = v_uncond + guidance·(v_cond − v_uncond)
                             let delta = (&v_cond - &v_uncond)?;
                             (v_uncond + (delta * guidance as f64)?)?
                         }
-                        None => v_cond,
+                        (None, None) => v_cond,
+                        _ => {
+                            return Err(CandleError::Msg(
+                                "z-image: CFG conditioning preparation mismatch".into(),
+                            ))
+                        }
                     };
                     Ok(velocity)
                 },
@@ -1244,6 +1934,208 @@ impl Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_text_phase_rejects_tokenizer_replacement_before_encoder_open() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
+        let spec = gen_core::LoadSpec::new(WeightsSource::Dir(root.to_path_buf()));
+        let source = crate::ENCODER_CONTRACT
+            .source_for_load(&spec, root)
+            .unwrap();
+        let pipeline =
+            Pipeline::load_with_text_encoder(root, source, &Device::Cpu, DType::F32, &[], None);
+        let tokenizer = root.join("tokenizer/tokenizer.json");
+        let replacement = root.join("tokenizer/replacement.json");
+        std::fs::copy(&tokenizer, &replacement).unwrap();
+        std::fs::rename(replacement, tokenizer).unwrap();
+
+        let error = pipeline
+            .load_text_phase()
+            .err()
+            .expect("request-time parse must reject the replaced tokenizer")
+            .to_string();
+        assert!(error.contains("pinned weights"), "{error}");
+    }
+
+    /// sc-18477: the ComfyUI route must retain the caller's adapter stack in EXACT order with each
+    /// scale and kind intact. `load_transformer_cancelable` installs them additively in this order,
+    /// so a reordering, a dropped scale, or a coerced kind silently renders a different image.
+    #[test]
+    fn comfyui_pipeline_preserves_ordered_adapter_stack() {
+        use candle_gen::gen_core::{AdapterKind, PinnedWeightsFile};
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        gen_core_testkit::write_encoder_contract_tokenizer_fixture(root, crate::ENCODER_CONTRACT)
+            .unwrap();
+        let transformer = root.join("transformer.safetensors");
+        let text_encoder = root.join("text_encoder.safetensors");
+        let vae = root.join("vae.safetensors");
+        for path in [&transformer, &text_encoder, &vae] {
+            std::fs::write(path, b"comfyui fixture").unwrap();
+        }
+        let sources = std::sync::Arc::new(
+            crate::comfyui::ComfyuiSources::separate(
+                PinnedWeightsFile::pin(&transformer).unwrap(),
+                Some(PinnedWeightsFile::pin(&text_encoder).unwrap()),
+                PinnedWeightsFile::pin(&vae).unwrap(),
+                root.to_path_buf(),
+            )
+            .unwrap(),
+        );
+        let tokenizer_source = crate::ENCODER_CONTRACT.tokenizer_for_base(root).unwrap();
+        let adapters = vec![
+            AdapterSpec::new(PathBuf::from("first.safetensors"), 0.25, AdapterKind::Lora),
+            AdapterSpec::new(PathBuf::from("second.safetensors"), 0.75, AdapterKind::Lokr),
+        ];
+
+        let pipeline = Pipeline::load_comfyui_with_text_encoder(
+            sources,
+            None,
+            tokenizer_source,
+            &Device::Cpu,
+            DType::F32,
+            &adapters,
+            None,
+        );
+        assert_eq!(pipeline.adapter_specs().len(), 2);
+        assert_eq!(pipeline.adapter_specs()[0].path, adapters[0].path);
+        assert_eq!(pipeline.adapter_specs()[0].scale, 0.25);
+        assert_eq!(pipeline.adapter_specs()[0].kind, AdapterKind::Lora);
+        assert_eq!(pipeline.adapter_specs()[1].path, adapters[1].path);
+        assert_eq!(pipeline.adapter_specs()[1].scale, 0.75);
+        assert_eq!(pipeline.adapter_specs()[1].kind, AdapterKind::Lokr);
+    }
+
+    #[test]
+    fn registered_reference_pipeline_preserves_adapter_stack_for_identity_init() {
+        use candle_gen::gen_core::AdapterKind;
+
+        let adapters = vec![AdapterSpec::new(
+            PathBuf::from("identity-style.safetensors"),
+            0.65,
+            AdapterKind::Lora,
+        )];
+        let pipeline = Pipeline::load(
+            Path::new("snapshot"),
+            &Device::Cpu,
+            DType::F32,
+            &adapters,
+            None,
+        );
+        let request = GenerationRequest {
+            prompt: "same person in a new setting".into(),
+            conditioning: vec![Conditioning::Reference {
+                image: Image::default(),
+                strength: Some(0.7),
+            }],
+            ..Default::default()
+        };
+
+        let (_, strength) = resolve_reference(&request)
+            .expect("registered Reference conditioning must resolve")
+            .expect("identity init carries one reference");
+        assert_eq!(strength, Some(0.7));
+        assert_eq!(pipeline.adapter_specs().len(), 1);
+        assert_eq!(pipeline.adapter_specs()[0].path, adapters[0].path);
+        assert_eq!(pipeline.adapter_specs()[0].scale, 0.65);
+        assert_eq!(pipeline.adapter_specs()[0].kind, AdapterKind::Lora);
+    }
+
+    #[test]
+    fn bounded_host_transfer_uses_spatial_rows_and_reassembles_exactly() {
+        let values = (0..256).map(|value| value as f32).collect::<Vec<_>>();
+        let latents = Tensor::from_vec(values.clone(), (1, 1, 1, 128, 2), &Device::Cpu).unwrap();
+        let cancel = CancelFlag::new();
+        let (transferred, transfers) =
+            bounded_host_latent_transfer(&latents, &cancel, 512, 128).unwrap();
+        assert_eq!(transfers, 3, "128 latent rows at a 48-row stride");
+        assert_eq!(transferred.dims(), latents.dims());
+        assert_eq!(
+            transferred.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            values
+        );
+
+        let canceled = CancelFlag::new();
+        canceled.cancel();
+        assert!(matches!(
+            bounded_host_latent_transfer(&latents, &canceled, 512, 128),
+            Err(CandleError::Canceled)
+        ));
+    }
+
+    /// **The rung-3 budget is the shared one (SC-15796).** [`CONSTRAINED_ATTN_SCORES_BUDGET`] no longer
+    /// declares 64 Mi here, so asserting its value would just restate an alias. What is worth pinning
+    /// is that this backend's *production geometry* plans the boundary the shared cross-backend table
+    /// declares — 1024² unified stack, B=1, H=30, Sq=Sk=4128 → 64 Mi / (30·4128) = **541 rows**, the
+    /// same boundary the MLX lane's rung-3 evidence (SC-15615) was taken at. Move the shared planner or
+    /// the shared budget and this goes red; that is what makes the two backends' calibration numbers
+    /// comparable rather than two coincidentally-equal literals.
+    #[test]
+    fn the_production_geometry_plans_the_shared_rung3_boundary() {
+        use candle_gen::attention::AttentionBudget;
+        let (h, sq) = (30u64, 4128u64);
+        let budget =
+            AttentionBudget::from_score_elements(CONSTRAINED_ATTN_SCORES_BUDGET as u64, false);
+        assert_eq!(budget.query_block_rows(h * sq, sq), 541);
+
+        let declared = gen_core::attention_budget::CROSS_BACKEND_CHUNK_CASES
+            .iter()
+            .find(|c| {
+                c.budget == candle_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET
+                    && c.rows_per_query == h * sq
+                    && c.sq == sq
+            })
+            .expect("the shared table must carry the production z-image 1024² geometry");
+        assert_eq!(budget.query_block_rows(h * sq, sq), declared.expect_rows);
+
+        // Below the threshold the rung is a no-op: an in-budget call stays one un-chunked pass.
+        assert_eq!(budget.query_block_rows(h * 32, 32), 32);
+    }
+
+    #[test]
+    fn constrained_request_pipeline_seam_returns_typed_canceled_without_output() {
+        use candle_gen::candle_core::Device;
+        use candle_gen::candle_nn::{VarBuilder, VarMap};
+
+        let device = Device::Cpu;
+        let mut cfg = DitConfig::z_image_turbo();
+        cfg.dim = 128;
+        cfg.n_heads = 1;
+        cfg.n_kv_heads = 1;
+        cfg.n_layers = 2;
+        cfg.n_refiner_layers = 1;
+        cfg.cap_feat_dim = 64;
+        cfg.set_use_accelerated_attn(false);
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &device);
+        let transformer = DiT::Packed(Box::new(PackedDit::new(&cfg, vb).unwrap()));
+
+        let latent = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 4, 4), &device).unwrap();
+        let cap = Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &device).unwrap();
+        let prepared = prepare_inputs(&latent, std::slice::from_ref(&cap), &device).unwrap();
+        let timestep = Tensor::from_vec(vec![0.5f32], (1,), &device).unwrap();
+
+        let request = GenerationRequest::default();
+        request.cancel.cancel();
+        let output = transformer.forward_with_attention_plan(
+            &prepared.latents,
+            &timestep,
+            &prepared.cap_feats,
+            &prepared.cap_mask,
+            request_attention_plan(&request, 2),
+        );
+        let error = output.expect_err("a canceled constrained request must produce no DiT output");
+        assert!(matches!(error, CandleError::Canceled));
+        let contract_error: gen_core::Error = error.into();
+        assert!(matches!(contract_error, gen_core::Error::Canceled));
+    }
 
     struct DropTag {
         name: &'static str,
@@ -1359,8 +2251,9 @@ mod tests {
         );
     }
 
-    /// Cancellation raised after one decode tile must stop before the next tile and still evict the
-    /// active decoder. This exercises the exact per-tile guard used by the production tiled VAE.
+    /// Cancellation raised at the host-decode boundary must stop decode and still evict the active
+    /// decoder. A convolution already running on the host is not interruptible, so the production
+    /// route checks this boundary immediately before transferring and decoding the latent.
     #[test]
     fn three_stage_runner_cleans_up_when_decode_is_canceled() {
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1392,50 +2285,18 @@ mod tests {
                 })
             },
             |_, (), _| {
-                check_decode_tile(&cancel_during_decode)?;
-                candle_gen::lock_recover(&events).push("decode_tile_0");
                 cancel_during_decode.cancel();
-                check_decode_tile(&cancel_during_decode)?;
-                candle_gen::lock_recover(&events).push("decode_tile_1");
+                check_decode(&cancel_during_decode)?;
+                candle_gen::lock_recover(&events).push("decode");
                 Ok(())
             },
         );
         assert!(result.is_err());
         assert_eq!(
             *candle_gen::lock_recover(&events),
-            [
-                "drop_text",
-                "drop_dit",
-                "load_vae",
-                "decode_tile_0",
-                "drop_vae",
-            ],
-            "cancel must prevent later tiles and evict the decoder"
+            ["drop_text", "drop_dit", "load_vae", "drop_vae",],
+            "cancel must prevent host decode and evict the decoder"
         );
-    }
-
-    /// The production 1024² decode plan must tile both axes, preserve exact dimensions, and form a
-    /// partition of unity across every overlap. This locks the Z-Image-specific geometry and blend
-    /// parameters independently of the shared tiling crate's own generic tests.
-    #[test]
-    fn sequential_vae_tile_plan_is_seam_blended_and_dimension_exact() {
-        let cfg = TilingConfig::spatial_only(512, 128);
-        let plan = cfg.plan(Z_IMAGE_VAE_TILING, 1, 128, 128);
-        assert_eq!((plan.out_h, plan.out_w), (1024, 1024));
-        assert!(plan.h.len() > 1 && plan.w.len() > 1);
-
-        for (axis, tiles) in [("height", &plan.h), ("width", &plan.w)] {
-            let mut weights = vec![0.0f32; 1024];
-            for tile in tiles {
-                for (offset, value) in tile.mask.iter().enumerate() {
-                    weights[tile.out_start as usize + offset] += value;
-                }
-            }
-            assert!(
-                weights.iter().all(|weight| (*weight - 1.0).abs() < 1e-5),
-                "{axis} blend weights must sum to one at every output pixel"
-            );
-        }
     }
 
     /// `component_is_packed` detects the `quantization` block a packed MLX tier writes into a component
@@ -1445,7 +2306,8 @@ mod tests {
     /// falling to the dense path (sc-9426, F-073 sibling). GPU-free (only reads a small JSON file).
     #[test]
     fn component_is_packed_detects_quantization_block() {
-        let dir = std::env::temp_dir().join(format!("sc9408_pipe_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let packed = dir.join("transformer");
         let dense = dir.join("vae");
         std::fs::create_dir_all(&packed).unwrap();
@@ -1484,8 +2346,42 @@ mod tests {
             format!("{err}").contains("config.json"),
             "the error should name the offending file, got: {err}"
         );
+    }
 
-        std::fs::remove_dir_all(&dir).ok();
+    #[test]
+    fn streamed_sidecar_preparation_preserves_typed_cancellation() {
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
+        let transformer = dir.join("transformer");
+        std::fs::create_dir_all(&transformer).unwrap();
+        std::fs::write(
+            transformer.join("config.json"),
+            r#"{"quantization": {"bits": 4, "group_size": 64}}"#,
+        )
+        .unwrap();
+        candle_gen::candle_core::safetensors::save(
+            &HashMap::from([(
+                "fixture".to_owned(),
+                Tensor::zeros(1, DType::F32, &Device::Cpu).unwrap(),
+            )]),
+            transformer.join("model.safetensors"),
+        )
+        .unwrap();
+
+        let pipeline = Pipeline::load(&dir, &Device::Cpu, DType::F32, &[], None);
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let error = match pipeline.load_transformer_cancelable(false, true, &cancel) {
+            Ok(_) => panic!("a canceled sidecar preparation must not construct a transformer"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, CandleError::Canceled));
+        let contract_error: gen_core::Error = error.into();
+        assert!(matches!(contract_error, gen_core::Error::Canceled));
+        assert!(
+            !transformer.join(".candle-device-format-v1").exists(),
+            "pre-cancellation must stop before creating the cache"
+        );
     }
 
     /// Parity anchors against `mlx-gen-z-image`: the distilled 4-step default and the /8 16-channel
@@ -1532,7 +2428,7 @@ mod tests {
         let root = std::path::Path::new(&snap);
         // The shared tokenizer (`common::build_tokenizer`) with the shared config — the same seam the
         // three entry points now use (sc-9002).
-        let tok = common::build_tokenizer(root, "z-image").expect("load tokenizer.json");
+        let tok = common::build_tokenizer_from_base(root, "z-image").expect("load tokenizer.json");
 
         // The trap: an empty prompt short-circuits to (1, 0) BEFORE the chat template is applied.
         assert!(
@@ -1557,7 +2453,7 @@ mod tests {
 
         // sc-8991 / F-011: the cached tokenizer must yield the SAME ids as a fresh `from_file` load —
         // caching removes the re-parse, never changes tokenization. Cover a real prompt + empty uncond.
-        let fresh = common::build_tokenizer(root, "z-image").expect("fresh tokenizer");
+        let fresh = common::build_tokenizer_from_base(root, "z-image").expect("fresh tokenizer");
         assert_eq!(
             common::uncond_ids(&tok, "", "z-image").unwrap(),
             common::uncond_ids(&fresh, "", "z-image").unwrap(),

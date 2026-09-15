@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 
 use candle_audio::gen_core::{
     self, AudioTrack, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
-    Modality, ModelDescriptor, Progress, WeightsSource,
+    Modality, ModelDescriptor, Progress, StepSupport, WeightsSource,
 };
 
 use crate::pipeline::{
@@ -50,25 +50,25 @@ pub const MODEL_ID: &str = "moss_sfx_v2";
 pub const HUB_REPO: &str = "OpenMOSS-Team/MOSS-SoundEffect-v2.0";
 pub const HUB_REVISION: &str = "e35df4d82fbe87fcd5d14e5d100e349c0c3c076d";
 
-/// The license of the pinned MOSS-SoundEffect v2.0 weight checkpoint (sc-13332) — surfaced for
-/// SceneWorks' end-product licenses page. Apache-2.0 (permissive), verified against the
-/// `OpenMOSS-Team/MOSS-SoundEffect-v2.0` model card.
-pub const WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
-    candle_audio::gen_core::WeightLicense {
-        spdx_id: "Apache-2.0",
-        name: "Apache License 2.0",
-        source_url: "https://huggingface.co/OpenMOSS-Team/MOSS-SoundEffect-v2.0",
-        attribution: Some("MOSS-SoundEffect-v2.0 © OpenMOSS Team — licensed under Apache-2.0"),
-        commercial_use: true,
-        restriction: None,
-    };
+/// Stable component key for the pinned MOSS-SoundEffect-v2.0 checkpoint — what `PROVIDER_COMPONENTS`
+/// resolves through, and the licence manifest's unique row key.
+pub const COMPONENT_KEY: &str = "moss_sound_effect_v2";
 
-/// This provider's weight-license entry (keyed by [`MODEL_ID`]) for catalog aggregation.
-pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
-    candle_audio::gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: None,
-        license: WEIGHT_LICENSE,
+/// The schema-3 licence row for the pinned MOSS-SoundEffect-v2.0 checkpoint (sc-16663).
+///
+/// **Disclosure only.** The row records what the upstream declares so a consumer can show it to a
+/// user; nothing here decides whether any use is permitted. `declared` and `gated` were read from
+/// the `OpenMOSS-Team/MOSS-SoundEffect-v2.0` model card on `retrieved`, and `family` normalizes that declaration onto
+/// [`candle_audio::gen_core::license::families::APACHE_2_0`].
+pub const COMPONENT_LICENSE: candle_audio::gen_core::ComponentLicense =
+    candle_audio::gen_core::ComponentLicense {
+        component: COMPONENT_KEY,
+        source_url: "https://huggingface.co/OpenMOSS-Team/MOSS-SoundEffect-v2.0",
+        gated: false,
+        declared: "apache-2.0",
+        family: "apache-2-0",
+        attribution: Some("MOSS-SoundEffect-v2.0 © OpenMOSS Team — licensed under Apache-2.0"),
+        retrieved: "2026-08-02",
     };
 
 /// Native output sample rate (Hz).
@@ -93,6 +93,9 @@ pub const LANGUAGES: &[&str] = &["en", "zh"];
 /// MOSS-SoundEffect's identity + capabilities — constructible without weights.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: None,
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "moss_soundeffect",
@@ -103,42 +106,31 @@ pub fn descriptor() -> ModelDescriptor {
             // `cfg_scale` pair).
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
-            conditioning: Vec::new(),
-            supports_lora: false,
-            supports_lokr: false,
             // The native flow-match Euler integrator is the only sampler; no selectable
             // sampler/scheduler surface is advertised (an explicit request is a typed
             // Unsupported via the shared floor).
             samplers: vec![],
-            schedulers: vec![],
-            supported_guidance_methods: vec![],
             // Audio models skip the size floor (validate_request_audio); these bounds are the
             // audio-lane convention for a size-less descriptor.
             // Pure audio: no width/height. The descriptor sweep exempts Audio from the size floor
             // (sc-13314) and `validate_request_audio` skips the range, so these stay at the natural
             // unused 0 rather than a nominal placeholder bound.
             min_size: 0,
-            max_size: 0,
             // One clip per request (GenerationOutput::Audio carries a single track).
             max_count: 1,
-            mac_only: false,
+            // The 1000-timestep training grid's ceiling, advertised rather than hidden
+            // (sc-19559).
+            supported_steps: StepSupport::Range {
+                min: 1,
+                max: MAX_STEPS,
+            },
             audio_sample_rates: vec![SAMPLE_RATE],
             max_audio_duration_secs: Some(MAX_DURATION_SECS),
             // No voice surface — this is SFX/ambience, not TTS; an explicit `audio.voice`
             // is rejected by the shared floor as Unsupported.
             audio_voices: vec![],
             audio_languages: LANGUAGES.to_vec(),
-            audio_edit_modes: vec![],
-            supported_quants: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
+            ..Default::default()
         },
     }
 }
@@ -423,7 +415,8 @@ mod tests {
 
     #[test]
     fn load_rejects_unsupported_spec_shapes() {
-        let dir = std::env::temp_dir();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let spec = LoadSpec::new(WeightsSource::File(dir.join("x.safetensors")));
         assert!(load(&spec).is_err());
         let mut spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
@@ -433,8 +426,8 @@ mod tests {
 
     #[test]
     fn pre_tripped_cancel_returns_typed_canceled_before_any_heavy_work() {
-        let dir = std::env::temp_dir().join("moss-sfx-missing-snapshot");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let g = load(&LoadSpec::new(WeightsSource::Dir(dir))).unwrap();
         let flag = CancelFlag::new();
         flag.cancel();
@@ -452,8 +445,8 @@ mod tests {
     #[test]
     fn generate_on_a_missing_snapshot_fails_cleanly() {
         // A generator over an empty dir: generate must error (no weights), never panic.
-        let dir = std::env::temp_dir().join("moss-sfx-missing-snapshot");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let g = load(&LoadSpec::new(WeightsSource::Dir(dir))).unwrap();
         let req = GenerationRequest {
             prompt: "rain".into(),

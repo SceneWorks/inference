@@ -8,7 +8,7 @@
 //! `transformer::tests::full_model_forward_shapes_and_determinism`.
 //!
 //! Run the real-weight gate:
-//!   `MOCHI_SNAPSHOT=/path/to/mochi-1-preview cargo test -p mlx-gen-mochi --test dit_parity -- --ignored --nocapture`
+//!   `MOCHI_SNAPSHOT=/path/to/mochi-1-preview cargo test -p mlx-gen-mochi --test integration dit_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max, mean, subtract};
 use mlx_rs::{Array, Dtype};

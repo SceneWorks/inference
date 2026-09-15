@@ -387,8 +387,16 @@ fn batched_throughput_beats_sequential() {
     }
     let seq_secs = t0.elapsed().as_secs_f64();
 
+    // Record which ROW each token event belongs to, in arrival order — the batched decode's
+    // step-by-step interleaving is what is asserted on below (sc-19556).
+    let row_order: std::cell::RefCell<Vec<usize>> = std::cell::RefCell::new(Vec::new());
     let t1 = Instant::now();
-    let out = generate_batch(&fx.model, &reqs, &CancelFlag::new(), &mut |_, _| {}).unwrap();
+    let out = generate_batch(&fx.model, &reqs, &CancelFlag::new(), &mut |ri, ev| {
+        if let StreamEvent::Token { .. } = ev {
+            row_order.borrow_mut().push(ri);
+        }
+    })
+    .unwrap();
     let batch_secs = t1.elapsed().as_secs_f64();
 
     let total_tokens = (n * budget) as f64;
@@ -404,8 +412,33 @@ fn batched_throughput_beats_sequential() {
         out.iter().all(|o| o.tokens.len() == budget),
         "every row must fill its budget"
     );
-    assert!(
-        batch_secs < seq_secs,
-        "batched ({batch_secs:.3}s) must beat sequential ({seq_secs:.3}s)"
+    // sc-19556: `batch_secs < seq_secs` was demoted to the throughput line above. It compared two
+    // `Instant::elapsed()` values with no margin at all, on a machine that routinely runs several
+    // builds at once — whichever arm happens to be descheduled loses, and the failure lands on
+    // whatever PR is in flight.
+    //
+    // What "batched" actually means is a STRUCTURAL claim, and it is directly observable in the
+    // stream: the rows advance TOGETHER, one decode step at a time, so their token events
+    // interleave. An implementation that quietly looped `generate` per row would return exactly
+    // these tokens, and might even be faster on a given run, but it would drain row 0 completely
+    // before row 1 emitted anything. That is the regression the wall clock was standing in for, and
+    // unlike the clock this reading does not move with host load.
+    let order = row_order.borrow();
+    assert_eq!(
+        order.len(),
+        n * budget,
+        "expected one token event per row per step"
     );
+    // Step `s` must emit each of the `n` rows exactly once before step `s + 1` begins.
+    for (step, window) in order.chunks(n).enumerate() {
+        let mut seen: Vec<usize> = window.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            n,
+            "decode step {step} emitted rows {window:?} — a batched step must advance every row \
+             exactly once; a per-row loop wearing a batch signature drains one row at a time"
+        );
+    }
 }

@@ -1,6 +1,6 @@
 //! Real Mage-VAE encoder parity and deterministic mean-latent round trip.
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 

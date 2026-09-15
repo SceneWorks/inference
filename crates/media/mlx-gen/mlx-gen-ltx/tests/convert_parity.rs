@@ -8,7 +8,7 @@
 //!   * the base `Lightricks/LTX-2.3` distilled checkpoint at Q4 **and** Q8 (`ltx_2_3_base_q4`/`q8`),
 //!   * a community fine-tune at Q4 (`TenStrip/LTX2.3-10Eros` → `ltx_2_3_eros`).
 //!
-//! Run with: `cargo test -p mlx-gen-ltx --test convert_parity -- --ignored --nocapture`
+//! Run with: `cargo test -p mlx-gen-ltx --test integration convert_parity:: -- --ignored --nocapture`
 //! Path overrides: `LTX_BASE_SRC`, `LTX_EROS_DIR` / `LTX_EROS_SRC`.
 
 use std::collections::BTreeSet;
@@ -17,6 +17,20 @@ use std::path::PathBuf;
 use mlx_gen::weights::Weights;
 use mlx_gen_ltx::convert::{convert_and_assemble, LtxConvertOpts};
 use mlx_rs::ops::array_eq;
+
+/// The SceneWorks app-support model store the parity goldens live in.
+///
+/// `LTX_GOLDEN_ROOT` overrides it, `$HOME` stays the default. Without an override
+/// `run_base_parity` read `$HOME` unconditionally, so pointing the suite at a real store did
+/// nothing — the row asserted `golden.is_dir()` against a path the caller could not move.
+fn golden_root() -> PathBuf {
+    std::env::var("LTX_GOLDEN_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").expect("HOME"))
+                .join("Library/Application Support/SceneWorks/data/models/mlx")
+        })
+}
 
 /// The eros golden split dir (`LTX_EROS_DIR` or the default SceneWorks data path).
 fn eros_golden_dir() -> PathBuf {
@@ -110,8 +124,8 @@ fn eros_q4_convert_matches_golden() {
         source.display()
     );
 
-    let out = std::env::temp_dir().join("mlx_gen_ltx_convert_parity_out");
-    let _ = std::fs::remove_dir_all(&out);
+    let out_tmp = tempfile::tempdir().unwrap();
+    let out = out_tmp.path().to_path_buf();
     eprintln!("converting {} → {}", source.display(), out.display());
 
     // No upscaler dir: validate the six core components + configs (the upsampler components are raw
@@ -152,9 +166,8 @@ fn eros_upscaler_roundtrip_matches_golden() {
     assert!(golden.is_dir(), "golden dir missing: {}", golden.display());
 
     // Stage a fake upscaler dir holding the golden's x2-1.1 component under the source filename.
-    let updir = std::env::temp_dir().join("mlx_gen_ltx_upscaler_src");
-    let _ = std::fs::remove_dir_all(&updir);
-    std::fs::create_dir_all(&updir).unwrap();
+    let updir_tmp = tempfile::tempdir().unwrap();
+    let updir = updir_tmp.path().to_path_buf();
     std::fs::copy(
         golden.join("spatial_upscaler_x2_v1_1.safetensors"),
         updir.join("ltx-2.3-spatial-upscaler-x2-1.1.safetensors"),
@@ -163,7 +176,8 @@ fn eros_upscaler_roundtrip_matches_golden() {
 
     // A tiny source file so the converter has a (trivial) transformer to emit; we only check the
     // upscaler components here.
-    let src = std::env::temp_dir().join("mlx_gen_ltx_tiny_src.safetensors");
+    let src_tmp = tempfile::tempdir().unwrap();
+    let src = src_tmp.path().join("mlx_gen_ltx_tiny_src.safetensors");
     let a = mlx_rs::Array::ones::<f32>(&[2, 2]).unwrap();
     mlx_rs::Array::save_safetensors(
         vec![("model.diffusion_model.proj_out.weight", &a)],
@@ -172,8 +186,8 @@ fn eros_upscaler_roundtrip_matches_golden() {
     )
     .unwrap();
 
-    let out = std::env::temp_dir().join("mlx_gen_ltx_upscaler_out");
-    let _ = std::fs::remove_dir_all(&out);
+    let out_tmp = tempfile::tempdir().unwrap();
+    let out = out_tmp.path().to_path_buf();
     let opts = LtxConvertOpts {
         include_audio: false,
         quantize: false,
@@ -196,16 +210,16 @@ fn base_source_file() -> PathBuf {
 /// Convert the base distilled checkpoint at `bits` and assert the six core components + configs match
 /// the golden `<id>` (the upsampler components are raw copies, exercised by the eros roundtrip test).
 fn run_base_parity(golden_id: &str, bits: i32) {
-    let home = std::env::var("HOME").unwrap();
-    let golden = PathBuf::from(&home).join(format!(
-        "Library/Application Support/SceneWorks/data/models/mlx/{golden_id}"
-    ));
+    // A ROOT override rather than a per-path one, unlike `LTX_BASE_DIR` / `LTX_EROS_DIR` above:
+    // `golden_id` is a parameter, so the path this resolves is not knowable when the variable is
+    // set. Its siblings keep their per-path variables — they name one path each and work today.
+    let golden = golden_root().join(golden_id);
     let source = base_source_file();
     assert!(golden.is_dir(), "golden dir missing: {}", golden.display());
     assert!(source.is_file(), "source missing: {}", source.display());
 
-    let out = std::env::temp_dir().join(format!("mlx_gen_ltx_{golden_id}_out"));
-    let _ = std::fs::remove_dir_all(&out);
+    let out_tmp = tempfile::tempdir().unwrap();
+    let out = out_tmp.path().to_path_buf();
     eprintln!(
         "converting {} (Q{bits}) → {}",
         source.display(),

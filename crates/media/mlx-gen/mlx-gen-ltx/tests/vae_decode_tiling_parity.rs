@@ -83,7 +83,7 @@
 //!
 //! ```text
 //! LTX_VAE_DIR=/path/to/ltx-2.3-mlx/q8 \
-//!   cargo test -p mlx-gen-ltx --release --test vae_decode_tiling_parity -- --ignored --nocapture
+//!   cargo test -p mlx-gen-ltx --release --test integration vae_decode_tiling_parity:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

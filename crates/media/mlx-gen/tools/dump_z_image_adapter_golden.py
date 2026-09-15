@@ -14,11 +14,17 @@ its render px>8 against this golden — so the adapter file is the shared input,
 variables.
 """
 
+import gc
 import math
 import os
 
 import mlx.core as mx
 import numpy as np
+from _adapter_parity_provenance import (
+    assert_frozen_mflux,
+    golden_metadata,
+    sha256,
+)
 from mflux.models.common.config.model_config import ModelConfig
 from mflux.models.common.schedulers.flow_match_euler_discrete_scheduler import (
     FlowMatchEulerDiscreteScheduler as S,
@@ -30,6 +36,18 @@ from mflux.utils.image_util import ImageUtil
 
 _GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golden")
 os.makedirs(_GOLDEN_DIR, exist_ok=True)
+MODEL_REPOSITORY = os.environ.get(
+    "ZIMAGE_REFERENCE_REPOSITORY", "SceneWorks/z-image-turbo-mlx"
+)
+MODEL_REVISION = os.environ.get(
+    "ZIMAGE_REFERENCE_REVISION", "bb2bc9893b3c49ae96c813350775f791a2e8bc80"
+)
+MODEL_SUBDIRECTORY = os.environ.get("ZIMAGE_REFERENCE_SUBDIRECTORY", "bf16")
+MODEL_REFERENCE = os.environ.get("ZIMAGE_REFERENCE_REF", "main")
+MODEL_PATH = os.environ.get("ZIMAGE_REFERENCE_MODEL", MODEL_REPOSITORY)
+MLX_CACHE_LIMIT_GB = float(os.environ.get("ZIMAGE_MLX_CACHE_LIMIT_GB", "2.5"))
+BUILD_ADAPTERS_ONLY = os.environ.get("BUILD_ADAPTERS_ONLY") == "1"
+assert_frozen_mflux()
 
 PROMPT = os.environ.get("ZIMAGE_PROMPT", "a fox")
 SEED = int(os.environ.get("ZIMAGE_SEED", "42"))
@@ -52,6 +70,39 @@ def _rng(seed):
     return np.random.default_rng(seed)
 
 
+def configure_low_peak():
+    if MLX_CACHE_LIMIT_GB <= 0:
+        raise ValueError("MLX cache limit must be positive")
+    cache_limit_bytes = int(MLX_CACHE_LIMIT_GB * (1000**3))
+    mx.set_cache_limit(cache_limit_bytes)
+    mx.clear_cache()
+    mx.reset_peak_memory()
+
+
+def release_text_encoder(model, cap_feats):
+    mx.eval(cap_feats)
+    if not hasattr(model, "text_encoder") or model.text_encoder is None:
+        raise RuntimeError("Z-Image text encoder was unavailable before prompt release")
+    model.text_encoder = None
+    gc.collect()
+    mx.clear_cache()
+
+
+def adapter_metadata(kind):
+    return {
+        "artifact_role": "adapter",
+        "adapter_kind": kind,
+        **golden_metadata(
+            script=__file__,
+            model_path=MODEL_PATH,
+            model_repository=MODEL_REPOSITORY,
+            model_revision=MODEL_REVISION,
+            model_subdirectory=MODEL_SUBDIRECTORY,
+            model_reference=MODEL_REFERENCE,
+        ),
+    }
+
+
 def build_lora(path):
     """peft-format LoRA: `transformer.<module>.lora_A/B.weight` [r,in]/[out,r] + `.alpha` (=rank)."""
     rng = _rng(20260602)
@@ -64,7 +115,7 @@ def build_lora(path):
             tensors[f"{base}.lora_A.weight"] = mx.array(a)
             tensors[f"{base}.lora_B.weight"] = mx.array(b)
             tensors[f"{base}.alpha"] = mx.array(np.array([float(RANK)], dtype=np.float32))
-    mx.save_safetensors(path, tensors)
+    mx.save_safetensors(path, tensors, adapter_metadata("lora"))
     return path
 
 
@@ -79,7 +130,12 @@ def build_lokr(path):
             w2 = rng.normal(0.0, LOKR_STD, size=(60, 60)).astype(np.float32)
             tensors[f"{base}.lokr_w1"] = mx.array(w1)
             tensors[f"{base}.lokr_w2"] = mx.array(w2)
-    meta = {"networkType": "lokr", "alpha": "1.0", "rank": "1"}
+    meta = {
+        "networkType": "lokr",
+        "alpha": "1.0",
+        "rank": "1",
+        **adapter_metadata("lokr"),
+    }
     mx.save_safetensors(path, tensors, meta)
     return path
 
@@ -89,17 +145,20 @@ def render(adapter_path):
         pass
 
     model = Holder()
+    configure_low_peak()
     ZImageInitializer.init(
         model,
         model_config=ModelConfig.z_image_turbo(),
         quantize=None,
         lora_paths=[adapter_path],
         lora_scales=[1.0],
+        model_path=MODEL_PATH,
     )
     tok = model.tokenizers["z_image"]
     tout = tok.tokenize(PROMPT)
     num_valid = int(mx.sum(tout.attention_mask[0]).item())
     cap_feats = PromptEncoder.encode_prompt(PROMPT, tok, model.text_encoder)
+    release_text_encoder(model, cap_feats)
 
     mu = math.log(3.0)
     sigmas = mx.linspace(1.0, 1.0 / STEPS, STEPS)
@@ -120,6 +179,9 @@ def render(adapter_path):
 for kind, builder in [("lora", build_lora), ("lokr", build_lokr)]:
     adapter_path = os.path.join(_GOLDEN_DIR, f"z_image_{kind}_adapter.safetensors")
     builder(adapter_path)
+    if BUILD_ADAPTERS_ONLY:
+        print(f"wrote deterministic {kind} adapter → {adapter_path}")
+        continue
     decoded, num_valid = render(adapter_path)
     img = ImageUtil._numpy_to_pil(ImageUtil._to_numpy(ImageUtil._denormalize(decoded)))
     png = os.path.join(_GOLDEN_DIR, f"z_image_{kind}_golden.png")
@@ -131,6 +193,15 @@ for kind, builder in [("lora", build_lora), ("lokr", build_lokr)]:
         {
             "prompt": PROMPT, "seed": str(SEED), "steps": str(STEPS), "w": str(W), "h": str(H),
             "num_valid": str(num_valid), "kind": kind, "scale": "1.0",
+            "adapter_sha256": sha256(adapter_path),
+            **golden_metadata(
+                script=__file__,
+                model_path=MODEL_PATH,
+                model_repository=MODEL_REPOSITORY,
+                model_revision=MODEL_REVISION,
+                model_subdirectory=MODEL_SUBDIRECTORY,
+                model_reference=MODEL_REFERENCE,
+            ),
         },
     )
     print(f"wrote {out} + {png} + {adapter_path}; decoded {tuple(decoded.shape)}")

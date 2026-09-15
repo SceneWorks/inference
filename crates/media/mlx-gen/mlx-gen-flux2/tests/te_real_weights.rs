@@ -3,7 +3,7 @@
 //! the golden produced by `tools/dump_flux2_te_real_golden.py` (gitignored, local):
 //!
 //!   cd ~/repos/mflux && .venv/bin/python ~/repos/mlx-gen/tools/dump_flux2_te_real_golden.py
-//!   cargo test -p mlx-gen-flux2 --test te_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux2 --test integration te_real_weights:: -- --ignored --nocapture
 //!
 //! The committed `te_parity.rs` proves the encoder *math* bit-tight in f32 on a tiny config; this
 //! proves the *loader* (shard reading + `model.` key mapping) and the *tokenizer* (chat template +

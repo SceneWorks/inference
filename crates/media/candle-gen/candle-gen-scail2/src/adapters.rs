@@ -51,7 +51,9 @@ use candle_gen::candle_core::DType;
 use candle_gen::candle_core::Tensor;
 use candle_gen::gen_core::weightsmeta as wmeta;
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
-use candle_gen::train::lora::{reconstruct_lokr_delta, reconstruct_lora_delta, LoraAdapterMeta};
+use candle_gen::train::lora::{
+    parse_lokr_metadata, reconstruct_lokr_delta, reconstruct_lora_delta, LoraAdapterMeta,
+};
 // The shared adapter-merge skeleton (sc-8998 / F-018): the format-parsing + merge-report + third-party
 // LyCORIS engine + the ComfyUI/lightx2v diff-patch fold this crate previously hand-copied. Only the
 // SCAIL-2-specific key→module resolution (bare/prefixed dotted paths, no kohya table) stays local below.
@@ -176,10 +178,10 @@ fn merge_lokr_file(
     scale: f32,
     report: &mut MergeReport,
 ) -> Result<()> {
-    let (rank, alpha) = wmeta::parse_rank_alpha(
+    let (rank, alpha) = parse_lokr_metadata(
         af.meta.get("rank").map(String::as_str),
         af.meta.get("alpha").map(String::as_str),
-    );
+    )?;
 
     let mut grouped: BTreeMap<String, BTreeMap<&'static str, Tensor>> = BTreeMap::new();
     for (key, t) in &af.tensors {
@@ -274,14 +276,42 @@ pub fn merge_adapters(
     let mut report = MergeReport::default();
     for spec in specs {
         let af = read_adapter(&spec.path)?;
+        let has_unstamped_lokr =
+            !af.declares_lokr() && wmeta::keys_contain_lokr(af.tensors.keys().map(String::as_str));
+        let has_unstamped_loha = wmeta::keys_contain_loha(af.tensors.keys().map(String::as_str));
+        if spec.kind == AdapterKind::Lora && af.declares_lokr() {
+            return Err(CandleError::Msg(format!(
+                "scail2: adapter {} declared LoRA but its metadata says networkType=lokr",
+                spec.path.display()
+            )));
+        }
+        if spec.kind == AdapterKind::Lokr && !af.declares_lokr() {
+            return Err(CandleError::Msg(format!(
+                "scail2: adapter {} declared LoKr but does not declare networkType=lokr",
+                spec.path.display()
+            )));
+        }
+        let before = report.merged;
         // Untagged LyCORIS: `lokr_*` / `hada_*` keys without a `networkType=lokr` stamp, so the
         // caller's declared `kind` can't label them — detect + route by keys before the kind match.
-        if !af.declares_lokr() && wmeta::keys_contain_lokr(af.tensors.keys().map(String::as_str)) {
+        if has_unstamped_lokr {
             merge_lokr_thirdparty(map, &af, spec.scale, &mut report)?;
+            if report.merged == before {
+                return Err(CandleError::Msg(format!(
+                    "scail2: selected adapter {} matched no SCAIL-2 projection",
+                    spec.path.display()
+                )));
+            }
             continue;
         }
-        if wmeta::keys_contain_loha(af.tensors.keys().map(String::as_str)) {
+        if has_unstamped_loha {
             merge_loha_thirdparty(map, &af, spec.scale, &mut report)?;
+            if report.merged == before {
+                return Err(CandleError::Msg(format!(
+                    "scail2: selected adapter {} matched no SCAIL-2 projection",
+                    spec.path.display()
+                )));
+            }
             continue;
         }
         match spec.kind {
@@ -307,6 +337,12 @@ pub fn merge_adapters(
             |s| strip_lora_prefix(s).to_string(),
             &mut report,
         )?;
+        if report.merged == before {
+            return Err(CandleError::Msg(format!(
+                "scail2: selected adapter {} matched no SCAIL-2 projection",
+                spec.path.display()
+            )));
+        }
     }
     if report.merged == 0 {
         return Err(no_target_matched(
@@ -364,6 +400,41 @@ mod tests {
 
     fn t2(data: &[f32], r: usize, c: usize) -> Tensor {
         Tensor::from_vec(data.to_vec(), (r, c), &Device::Cpu).unwrap()
+    }
+
+    #[test]
+    fn dense_stack_rejects_a_later_zero_match_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let valid = tmp.path().join("valid.safetensors");
+        let missing = tmp.path().join("missing.safetensors");
+        for (file, target) in [
+            (&valid, "blocks.0.self_attn.q"),
+            (&missing, "blocks.99.self_attn.q"),
+        ] {
+            candle_gen::candle_core::safetensors::save(
+                &HashMap::from([
+                    (
+                        format!("{target}.lora_A.weight"),
+                        t2(&[1.0, 0.0, 0.0, 0.0], 1, 4),
+                    ),
+                    (
+                        format!("{target}.lora_B.weight"),
+                        t2(&[1.0, 0.0, 0.0, 0.0], 4, 1),
+                    ),
+                ]),
+                file,
+            )
+            .unwrap();
+        }
+        let error = merge_adapters(
+            &mut base_map(),
+            &[
+                AdapterSpec::new(valid, 1.0, AdapterKind::Lora),
+                AdapterSpec::new(missing.clone(), 1.0, AdapterKind::Lora),
+            ],
+        )
+        .expect_err("a valid first file must not hide a later dense zero-match");
+        assert!(error.to_string().contains(&missing.display().to_string()));
     }
 
     /// LoRA naming resolves: bare down/up + per-module `.alpha`, the PEFT `lora_A/B` (+ namespace

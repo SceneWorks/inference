@@ -98,6 +98,32 @@ pub struct TokenizerOutput {
     pub mask: Vec<i32>,
 }
 
+/// Guarantee **exactly one** leading BOS on an already-truncated id sequence, then keep the result
+/// within `max_length` (sc-18762).
+///
+/// `ids` is prepended with `bos_id` only when it is empty or does not already start with it —
+/// upstream `LTXGemmaTokenizer.tokenize_with_weights`'s
+/// `if not input_ids or input_ids[0] != bos_id: input_ids = [bos_id, *input_ids][:max_length]`.
+/// Both halves of the condition are load-bearing and were separate upstream bugs:
+///
+/// * A tokenizer whose `post_processor` emits no BOS (measured: the Gemma 4 `tokenizer.json` packed
+///   into the LTX-2.5 text encoder has a pass-through `TemplateProcessing`) would otherwise be
+///   encoded with **no** BOS at all.
+/// * A tokenizer whose `post_processor` already emits BOS (Gemma 3) would be **double**-BOSed by an
+///   unconditional prepend.
+///
+/// Truncation happens only on the prepend branch — the caller has already right-truncated to
+/// `max_length`, so the sequence can exceed it only by the token this function just added.
+pub fn ensure_single_leading_bos(ids: &mut Vec<i32>, bos_id: i32, max_length: usize) {
+    if ids.first() == Some(&bos_id) {
+        return;
+    }
+    ids.insert(0, bos_id);
+    if ids.len() > max_length {
+        ids.truncate(max_length);
+    }
+}
+
 /// A loaded text tokenizer plus the model's tokenization policy.
 pub struct TextTokenizer {
     inner: Tokenizer,
@@ -164,6 +190,14 @@ impl TextTokenizer {
 
     pub fn config(&self) -> &TokenizerConfig {
         &self.config
+    }
+
+    /// The id of a literal token string, or `None` when it is not in the vocabulary. Callers that
+    /// must enforce a special-token invariant (e.g. the LTX Gemma exactly-one-BOS policy) resolve
+    /// the id through this rather than hard-coding a number that a re-tokenized checkpoint could
+    /// move.
+    pub fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.inner.token_to_id(token)
     }
 
     /// Tokenize one prompt → `(1, L)` int32 `input_ids` + `attention_mask`. An empty prompt returns

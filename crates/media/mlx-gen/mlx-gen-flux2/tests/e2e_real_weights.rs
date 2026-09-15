@@ -2,7 +2,7 @@
 //! real snapshot + the f32 golden from `tools/dump_flux2_e2e_golden.py` (gitignored):
 //!
 //!   cd ~/repos/mflux && .venv/bin/python ~/repos/mlx-gen/tools/dump_flux2_e2e_golden.py
-//!   cargo test -p mlx-gen-flux2 --test e2e_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux2 --test integration e2e_real_weights:: -- --ignored --nocapture
 //!
 //! Three gates, all f32 (golden forced `ModelConfig.precision=float32`, Rust runs f32):
 //!  1. **RNG** — `create_noise` byte-matches the fork's seeded packed noise (prerequisite).

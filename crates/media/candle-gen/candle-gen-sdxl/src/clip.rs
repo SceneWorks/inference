@@ -126,6 +126,31 @@ impl ClipTextEmbeddings {
             position_ids,
         })
     }
+
+    fn move_to_device(&mut self, device: &Device) -> Result<()> {
+        self.token_embedding = nn::Embedding::new(
+            self.token_embedding.embeddings().to_device(device)?,
+            self.token_embedding.hidden_size(),
+        );
+        self.position_embedding = nn::Embedding::new(
+            self.position_embedding.embeddings().to_device(device)?,
+            self.position_embedding.hidden_size(),
+        );
+        self.position_ids = self.position_ids.to_device(device)?;
+        Ok(())
+    }
+}
+
+fn layer_norm_to_device(norm: &mut nn::LayerNorm, device: &Device) -> Result<()> {
+    let weight = norm.weight().to_device(device)?;
+    let bias = norm.bias().map(|bias| bias.to_device(device)).transpose()?;
+    *norm = match (norm.remove_mean(), bias) {
+        (true, Some(bias)) => nn::LayerNorm::new(weight, bias, norm.eps()),
+        (true, None) => nn::LayerNorm::new_no_bias(weight, norm.eps()),
+        (false, None) => nn::LayerNorm::rms_norm(weight, norm.eps()),
+        (false, Some(_)) => unreachable!("RMSNorm cannot carry a bias"),
+    };
+    Ok(())
 }
 
 impl Module for ClipTextEmbeddings {
@@ -218,6 +243,18 @@ impl ClipAttention {
         self.out_proj.forward(&attn_output)
     }
 
+    fn quantize_onto(&mut self, quant: candle_gen::gen_core::Quant, device: &Device) -> Result<()> {
+        for projection in [
+            &mut self.q_proj,
+            &mut self.k_proj,
+            &mut self.v_proj,
+            &mut self.out_proj,
+        ] {
+            projection.quantize_dequant_onto(quant, device)?;
+        }
+        Ok(())
+    }
+
     /// Test-only: whether every attention projection loaded packed (a pre-quantized MLX tier).
     #[cfg(test)]
     fn all_packed(&self) -> bool {
@@ -266,6 +303,11 @@ impl ClipMlp {
         self.fc2.forward(&self.activation.forward(&xs)?)
     }
 
+    fn quantize_onto(&mut self, quant: candle_gen::gen_core::Quant, device: &Device) -> Result<()> {
+        self.fc1.quantize_dequant_onto(quant, device)?;
+        self.fc2.quantize_dequant_onto(quant, device)
+    }
+
     #[cfg(test)]
     fn all_packed(&self) -> bool {
         self.fc1.is_quantized() && self.fc2.is_quantized()
@@ -304,6 +346,13 @@ impl ClipEncoderLayer {
         let xs = self.layer_norm2.forward(&xs)?;
         let xs = self.mlp.forward(&xs)?;
         xs + residual
+    }
+
+    fn quantize_onto(&mut self, quant: candle_gen::gen_core::Quant, device: &Device) -> Result<()> {
+        self.self_attn.quantize_onto(quant, device)?;
+        self.mlp.quantize_onto(quant, device)?;
+        layer_norm_to_device(&mut self.layer_norm1, device)?;
+        layer_norm_to_device(&mut self.layer_norm2, device)
     }
 }
 
@@ -361,6 +410,20 @@ impl ClipTextTransformer {
             encoder,
             final_layer_norm,
         })
+    }
+
+    /// CPU-stage a fused CLIP tower, fold each projection directly onto `device`, and move only the
+    /// dense embeddings/norms. The quantized forward remains the established dequant-dense arm.
+    pub(crate) fn quantize_onto(
+        &mut self,
+        quant: candle_gen::gen_core::Quant,
+        device: &Device,
+    ) -> Result<()> {
+        self.embeddings.move_to_device(device)?;
+        for layer in &mut self.encoder.layers {
+            layer.quantize_onto(quant, device)?;
+        }
+        layer_norm_to_device(&mut self.final_layer_norm, device)
     }
 
     // https://github.com/huggingface/transformers/blob/674f750a57431222fa2832503a108df3badf1564/src/transformers/models/clip/modeling_clip.py#L678
@@ -670,13 +733,11 @@ mod tests {
     }
 
     fn vb_from_map(
+        tmp: &tempfile::TempDir,
         map: HashMap<String, Tensor>,
         tag: &str,
     ) -> (VarBuilder<'static>, std::path::PathBuf) {
-        let tmp = std::env::temp_dir().join(format!(
-            "sc9527_clip_{tag}_{}.safetensors",
-            std::process::id()
-        ));
+        let tmp = tmp.path().join(format!("sc9527_clip_{tag}.safetensors"));
         candle_core::safetensors::save(&map, &tmp).unwrap();
         // SAFETY: we just wrote this file and nothing else touches it during the test.
         let st = unsafe { MmapedSafetensors::new(&tmp).unwrap() };
@@ -691,6 +752,7 @@ mod tests {
     /// (CLIP-L `sdxl()` shape and bigG `sdxl2()` shape at tiny dims).
     #[test]
     fn packed_detect_fires_on_clip_layout() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         // A CLIP-L-shaped tiny config (QuickGelu, 4 heads, 2 layers) and a bigG-shaped one (Gelu, 8
         // heads, 3 layers) — the two encoders' distinct layer/head/activation layouts. `embed_dim` /
         // `intermediate_size` stay multiples of the group 64 so the synthetic pack tiles cleanly (the
@@ -702,14 +764,14 @@ mod tests {
             ..tiny_cfg()
         };
         for c in [tiny_cfg(), bigg] {
-            let (vb_p, tmp_p) = vb_from_map(build_checkpoint(&c, true), "detect_packed");
+            let (vb_p, tmp_p) = vb_from_map(&tmp, build_checkpoint(&c, true), "detect_packed");
             let packed = ClipTextTransformer::new_gs(vb_p, &c, GS)?;
             assert!(
                 packed.all_projections_packed(),
                 "every CLIP Linear must load packed on a `.scales` checkpoint"
             );
 
-            let (vb_d, tmp_d) = vb_from_map(build_checkpoint(&c, false), "detect_dense");
+            let (vb_d, tmp_d) = vb_from_map(&tmp, build_checkpoint(&c, false), "detect_dense");
             let dense = ClipTextTransformer::new_gs(vb_d, &c, GS)?;
             assert!(
                 !dense.all_projections_packed(),
@@ -728,9 +790,10 @@ mod tests {
     /// dequant-to-dense-matmul). Runs both the last-hidden and the penultimate paths.
     #[test]
     fn packed_vs_dense_encode_parity() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let c = tiny_cfg();
-        let (vb_p, tmp_p) = vb_from_map(build_checkpoint(&c, true), "parity_packed");
-        let (vb_d, tmp_d) = vb_from_map(build_checkpoint(&c, false), "parity_dense");
+        let (vb_p, tmp_p) = vb_from_map(&tmp, build_checkpoint(&c, true), "parity_packed");
+        let (vb_d, tmp_d) = vb_from_map(&tmp, build_checkpoint(&c, false), "parity_dense");
         let packed = ClipTextTransformer::new_gs(vb_p, &c, GS)?;
         let dense = ClipTextTransformer::new_gs(vb_d, &c, GS)?;
         assert!(packed.all_projections_packed());
@@ -766,13 +829,14 @@ mod tests {
     /// head packs too (sc-9527 AC: the bigG final text projection packed-detects).
     #[test]
     fn packed_text_projection_matches_dense() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let dim = 64usize;
         let mut mp = HashMap::new();
         pack(&mut mp, "text_projection", dim, dim, false);
-        let (vb_p, tmp_p) = vb_from_map(mp, "tp_packed");
+        let (vb_p, tmp_p) = vb_from_map(&tmp, mp, "tp_packed");
         let mut md = HashMap::new();
         dense_lin(&mut md, "text_projection", dim, dim, false);
-        let (vb_d, tmp_d) = vb_from_map(md, "tp_dense");
+        let (vb_d, tmp_d) = vb_from_map(&tmp, md, "tp_dense");
 
         let tp_p = text_projection(&vb_p, dim, GS)?;
         let tp_d = text_projection(&vb_d, dim, GS)?;

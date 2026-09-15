@@ -4,7 +4,7 @@
 //! candle UNet). The InstantID UNet ([`crate::UNet2DConditionModel::forward_instantid`]) needs the real
 //! SDXL micro-conditioning, so this assembles it exactly as diffusers does:
 //!
-//! - **cross-attention conditioning** `[B, 77, 2048]` = `cat(penultimate(CLIP-L)[768],
+//! - **cross-attention conditioning** `[B, n·77, 2048]` = `cat(penultimate(CLIP-L)[768],
 //!   penultimate(CLIP-bigG)[1280])` — the *second-to-last* encoder-layer hidden state (`hidden_states[-2]`,
 //!   pre-final-layer-norm) of each encoder, via candle's
 //!   [`ClipTextTransformer::forward_until_encoder_layer`] at `until_layer = -2`;
@@ -12,6 +12,11 @@
 //!   final-layer-norm hidden at the EOS position (the arg-max token, EOS being the highest id) projected
 //!   through `text_projection` (the `CLIPTextModelWithProjection` head candle's `ClipTextTransformer`
 //!   omits, loaded here from the same `text_encoder_2` checkpoint).
+//!
+//! **sc-20528:** a prompt past CLIP's architectural 77-token context is split into windows by the
+//! crate-private `long_prompt` chunker and the windows' hidden states are concatenated on the sequence axis
+//! (`n` = 1 for every prompt that fits, so those encodings are unchanged). The pooled embed stays
+//! single-window — it is taken from window 0's EOS.
 //!
 //! **CFG batch order is uncond-first** (`[negative, prompt]`) to match the candle txt2img +
 //! [`crate::denoise`] convention (`eps_uncond + cfg·(eps_cond − eps_uncond)`, chunk 0 = uncond) — NOT
@@ -30,21 +35,10 @@ use candle_gen::{CandleError, Result};
 // `stable_diffusion::clip` — a dense snapshot loads exactly as before, a packed MLX tier loads its
 // dual CLIP straight from the packed parts.
 use crate::clip::{self, ClipTextTransformer};
+// sc-20528: the shared CLIP long-prompt chunker (A1111/compel windows), so this conditioner and the
+// txt2img pipeline handle an over-long prompt identically instead of both hard-erroring.
+use crate::long_prompt::ChunkPlan;
 use crate::pipeline::{resolve_tokenizer_file, snapshot_file, Clip};
-
-/// Pad/truncate-check a token id list to exactly `max_len`: error if longer (parity with the txt2img
-/// path's hard reject — a silently truncated prompt drops conditioning), else right-pad with `pad_id`.
-/// Factored out (and the EOS pool below) so the token bookkeeping is unit-testable without CLIP weights.
-fn pad_tokens(mut ids: Vec<u32>, pad_id: u32, max_len: usize) -> Result<Vec<u32>> {
-    if ids.len() > max_len {
-        return Err(CandleError::Msg(format!(
-            "sdxl conditioning: prompt is {} tokens > the {max_len}-token CLIP limit",
-            ids.len()
-        )));
-    }
-    ids.resize(max_len, pad_id);
-    Ok(ids)
-}
 
 /// The EOS position of a CLIP token row = the arg-max token id (EOS = `<|endoftext|>` = 49407 is the
 /// highest id, and SDXL pads with `"!"` so there is exactly one EOS). diffusers pools the bigG hidden
@@ -192,28 +186,32 @@ impl SdxlConditioner {
         })
     }
 
-    /// Tokenize `text` through `tok`, padded to the encoder's `max_position_embeddings` with the config
-    /// pad token (`"!"` for SDXL; EOS otherwise — the candle txt2img rule). Returns the padded id row.
-    fn tokenize(&self, tok: &Tokenizer, cfg: &clip::Config, text: &str) -> Result<Vec<u32>> {
-        let pad_token = cfg
-            .pad_with
-            .clone()
-            .unwrap_or_else(|| "<|endoftext|>".into());
-        let pad_id = *tok
-            .get_vocab(true)
-            .get(pad_token.as_str())
-            .ok_or_else(|| CandleError::Msg(format!("pad token {pad_token:?} not in vocab")))?;
-        let ids = tok
-            .encode(text, true)
-            .map_err(|e| CandleError::Msg(format!("tokenize: {e}")))?
-            .get_ids()
-            .to_vec();
-        pad_tokens(ids, pad_id, cfg.max_position_embeddings)
+    /// The two encoders' [`ChunkPlan`]s (`pad_with` + `max_position_embeddings`), built per encode
+    /// call — no weights, no tensors.
+    fn chunk_plans(&self) -> Result<(ChunkPlan, ChunkPlan)> {
+        Ok((
+            ChunkPlan::new(
+                &self.tok_l,
+                self.cfg_l.pad_with.as_deref(),
+                self.cfg_l.max_position_embeddings,
+            )?,
+            ChunkPlan::new(
+                &self.tok_g,
+                self.cfg_g.pad_with.as_deref(),
+                self.cfg_g.max_position_embeddings,
+            )?,
+        ))
     }
 
-    /// Encode `prompt` (+ `negative` under CFG) into the SDXL conditioning `[B, 77, 2048]` and pooled
+    /// Encode `prompt` (+ `negative` under CFG) into the SDXL conditioning `[B, n·77, 2048]` and pooled
     /// text-embeds `[B, 1280]`. With CFG the batch is **uncond-first** (`[negative, prompt]`), matching
     /// [`crate::denoise`]. Without CFG (`cfg_on = false`) a single cond row.
+    ///
+    /// `n` is the number of CLIP windows the longest text in the request needs (sc-20528): `1` for
+    /// every prompt that fits CLIP's 77-token context — the byte-identical pre-sc-20528 encoding —
+    /// and `ceil(content / 75)` for a longer one, whose windows are concatenated on the sequence axis.
+    /// The pooled text-embeds always come from the **first** window, which is the only one whose EOS
+    /// is diffusers' pooled position.
     pub fn encode(&self, prompt: &str, negative: &str, cfg_on: bool) -> Result<(Tensor, Tensor)> {
         // Token rows, uncond-first under CFG.
         let texts: Vec<&str> = if cfg_on {
@@ -222,41 +220,68 @@ impl SdxlConditioner {
             vec![prompt]
         };
 
+        // One window count for BOTH encoders and BOTH CFG rows: the encoders are concatenated on the
+        // feature axis and the rows stacked on the batch axis, so every encoding must share a sequence
+        // length. A short negative is topped up with empty `BOS EOS pad…` windows.
+        let (plan_l, plan_g) = self.chunk_plans()?;
+        let chunks = crate::long_prompt::common_chunks(
+            &[(&plan_l, &self.tok_l), (&plan_g, &self.tok_g)],
+            &texts,
+        )?;
+
         // Encode **one row at a time** (batch 1) and stack along the batch dim afterwards — NOT a single
         // batched-2 CLIP forward. candle-transformers' stock CLIP builds its causal attention mask as
         // `[B, S, S]` and `broadcast_add`s it onto the per-head scores `[B, H, S, S]`; that only aligns
         // when `B == 1` (the mask's batch dim broadcasts against the head dim). At `B >= 2` it panics
         // (`shape mismatch in broadcast_add, lhs [2, H, 77, 77], rhs [2, 77, 77]`). The stock SD pipeline
-        // dodges this by running uncond/cond as separate passes, so do the same here.
+        // dodges this by running uncond/cond as separate passes, so do the same here. Each CLIP window
+        // is likewise its own batch-1 forward.
         let mut penult_rows: Vec<Tensor> = Vec::with_capacity(texts.len());
         let mut pooled_rows: Vec<Tensor> = Vec::with_capacity(texts.len());
         for text in &texts {
-            let row_l = self.tokenize(&self.tok_l, &self.cfg_l, text)?;
-            let row_g = self.tokenize(&self.tok_g, &self.cfg_g, text)?;
-            let ids_l = Tensor::new(row_l.as_slice(), &self.device)?
-                .reshape((1, self.cfg_l.max_position_embeddings))?;
-            let ids_g = Tensor::new(row_g.as_slice(), &self.device)?
-                .reshape((1, self.cfg_g.max_position_embeddings))?;
+            let rows_l = plan_l.rows_aligned(&self.tok_l, text, chunks)?;
+            let rows_g = plan_g.rows_aligned(&self.tok_g, text, chunks)?;
+            let mut penult_chunks: Vec<Tensor> = Vec::with_capacity(rows_l.len());
+            let mut pooled: Option<Tensor> = None;
+            for (i, (row_l, row_g)) in rows_l.iter().zip(rows_g.iter()).enumerate() {
+                let ids_l =
+                    Tensor::new(row_l.as_slice(), &self.device)?.reshape((1, plan_l.window()))?;
+                let ids_g =
+                    Tensor::new(row_g.as_slice(), &self.device)?.reshape((1, plan_g.window()))?;
 
-            // Penultimate hidden (`hidden_states[-2]`, pre-final-norm) from each encoder; the bigG `.0`
-            // is its final-norm hidden (for the pooled head). `usize::MAX` = the plain causal mask (no
-            // padding truncation), matching the txt2img path.
-            let (_final_l, penult_l) =
-                self.clip_l
-                    .forward_until_encoder_layer(&ids_l, usize::MAX, -2)?;
-            let (final_g, penult_g) =
-                self.clip_g
-                    .forward_until_encoder_layer(&ids_g, usize::MAX, -2)?;
-            penult_rows.push(Tensor::cat(&[&penult_l, &penult_g], D::Minus1)?); // [1, 77, 2048]
-                                                                                // pool the single-row bigG final hidden at its EOS, then project → [1, 1280].
-            pooled_rows.push(pool_eos(
-                &final_g,
-                std::slice::from_ref(&row_g),
-                &self.text_projection,
-            )?);
+                // Penultimate hidden (`hidden_states[-2]`, pre-final-norm) from each encoder; the bigG `.0`
+                // is its final-norm hidden (for the pooled head). `usize::MAX` = the plain causal mask (no
+                // padding truncation), matching the txt2img path.
+                let (_final_l, penult_l) =
+                    self.clip_l
+                        .forward_until_encoder_layer(&ids_l, usize::MAX, -2)?;
+                let (final_g, penult_g) =
+                    self.clip_g
+                        .forward_until_encoder_layer(&ids_g, usize::MAX, -2)?;
+                penult_chunks.push(Tensor::cat(&[&penult_l, &penult_g], D::Minus1)?); // [1, 77, 2048]
+                if i == 0 {
+                    // pool the FIRST window's bigG final hidden at its EOS, then project → [1, 1280].
+                    // Every later window carries its own EOS, so an arg-max over the concatenated ids
+                    // would be ambiguous; diffusers' pooled embed is defined on the first window and
+                    // that is what the add_embedding micro-conditioning expects.
+                    pooled = Some(pool_eos(
+                        &final_g,
+                        std::slice::from_ref(row_g),
+                        &self.text_projection,
+                    )?);
+                }
+            }
+            penult_rows.push(if penult_chunks.len() == 1 {
+                penult_chunks.remove(0)
+            } else {
+                Tensor::cat(&penult_chunks, 1)? // [1, n·77, 2048]
+            });
+            pooled_rows.push(pooled.ok_or_else(|| {
+                CandleError::Msg("sdxl conditioning: no CLIP window encoded".into())
+            })?);
         }
 
-        let conditioning = Tensor::cat(&penult_rows, 0)?; // [B, 77, 2048]
+        let conditioning = Tensor::cat(&penult_rows, 0)?; // [B, n·77, 2048]
         let pooled = Tensor::cat(&pooled_rows, 0)?; // [B, 1280]
         Ok((conditioning, pooled))
     }
@@ -266,18 +291,6 @@ impl SdxlConditioner {
 mod tests {
     use super::*;
     use candle_core::Device;
-
-    /// `pad_tokens`: right-pads to `max_len` with the pad id, and rejects an over-long prompt (no silent
-    /// truncation — a dropped tail loses conditioning).
-    #[test]
-    fn pad_tokens_pads_and_rejects_overflow() {
-        let p = pad_tokens(vec![1, 2, 3], 9, 6).unwrap();
-        assert_eq!(p, vec![1, 2, 3, 9, 9, 9]);
-        // Exactly max is fine.
-        assert_eq!(pad_tokens(vec![1, 2, 3], 9, 3).unwrap(), vec![1, 2, 3]);
-        // Over max errors.
-        assert!(pad_tokens(vec![1, 2, 3, 4], 9, 3).is_err());
-    }
 
     /// `eos_position` = the arg-max id (EOS is the highest CLIP id). Finds the EOS even with padding
     /// after it, and the BOS (id 49406) before it.

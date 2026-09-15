@@ -34,6 +34,7 @@
 //! byte-level details.
 
 pub mod repack;
+pub mod sidecar;
 
 // The NVFP4 (FP4) weight container + offline packer + CPU dequant reference (sc-11040, epic 11037):
 // E2M1 4-bit elements over 16-element blocks, one FP8-E4M3 micro-scale per block, plus a second-level
@@ -47,6 +48,7 @@ pub mod nvfp4;
 // on a packed q4/q8 tier. The one core that candle-gen-wan (sc-10094) + candle-gen-anima (sc-10640)
 // collapse into and that qwen-image-edit Lightning adopts. Pure candle ops → builds everywhere.
 pub mod adapt;
+pub mod adapters;
 
 // The ConvRot online rotation leg (sc-9601): the regular-Hadamard activation rotation `RHT(x) = x·R`
 // a community INT8-ConvRot checkpoint needs before the int8 IGEMM (its stored weight is `W·R`). Pure
@@ -76,6 +78,7 @@ pub mod nvfp4_linear;
 pub mod nvfp4_outlier;
 
 pub use adapt::{AdaptLinear, LokrFactors};
+pub use adapters::{install_dotted_adapters, AdditiveAdapterReport};
 pub use convrot::{convrot_rotate, is_power_of_four, regular_hadamard};
 pub use nvfp4::{
     e2m1_from_f32, e4m3_from_f32, e4m3_to_f32, Nvfp4Tensor, E2M1_LUT, E2M1_MAX, E4M3_MAX,
@@ -86,23 +89,31 @@ pub use repack::{
     f16_exact, mlx_packed_bits, mlx_packed_bits_gs, pack_mlx_affine, repack_mlx_q4_to_q4_1,
     repack_mlx_q4_to_q4_1_gs, MLX_GROUP_SIZE,
 };
+pub use sidecar::PackedWeightSidecars;
 
 pub use cublaslt::{
-    quantize_activation_fp8, quantize_activation_int8, quantize_weight_fp8, quantize_weight_int8,
+    compute_cap_meets_fp8_floor, compute_cap_meets_nvfp4_floor, quantize_activation_fp8,
+    quantize_activation_int8, quantize_weight_fp8, quantize_weight_int8,
     quantize_weight_int8_per_channel, Int8Context, PerChannelInt8Weight, QuantizedActivation,
-    F8E4M3_MAX, I8_MAX,
+    F8E4M3_MAX, FP8_COMPUTE_CAP_FLOOR, I8_MAX, NVFP4_COMPUTE_CAP_FLOOR, NVFP4_K_ALIGN,
+    NVFP4_N_ALIGN,
 };
 #[cfg(feature = "cuda")]
-pub use cublaslt::{CublasLt, DevNvfp4, NVFP4_K_ALIGN};
+pub use cublaslt::{CublasLt, DevNvfp4};
 #[cfg(feature = "cuda")]
 pub use eight_bit_linear::{Fp8Linear, Int8Linear};
 
 pub use nvfp4_linear::{
-    ActPrecision, Nvfp4Context, Nvfp4Linear, Nvfp4Partition, Nvfp4Regime, NVFP4_M_ALIGN,
+    ActPrecision, Nvfp4Context, Nvfp4Fallback, Nvfp4Linear, Nvfp4Partition, Nvfp4Regime,
+    NVFP4_M_ALIGN,
 };
 pub use nvfp4_outlier::{OutlierClass, OutlierSparsity};
 
-use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+use crate::Weights;
+use std::borrow::Cow;
+use std::collections::HashMap;
+
+use candle_core::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Embedding, Linear, Module, VarBuilder};
 use gen_core::Quant;
@@ -133,6 +144,93 @@ pub fn ggml_dtype(quant: Quant) -> Result<GgmlDType> {
 /// otherwise it stays dense — the reference predicate that leaves e.g. SeedVR2's `vid_in.proj` (in=132)
 /// and SAM3's `2→256`/`4→256`/`258→256` projections full-precision.
 pub const QUANT_BLOCK: usize = 32;
+
+/// Resident GGML bytes produced when Candle repacks one validated MLX affine triple. The source
+/// `{base}.weight/.scales/.biases` tensors are transient host inputs: Q4 lands as `Q4_1` (20 bytes
+/// per 32 values) and Q8 lands as `Q8_0` (34 bytes per 32 values). Memory admission must price this
+/// device-format tensor once, rather than either summing the source sidecars or treating the packed
+/// U32 weight's shortened last dimension as a dense/load-time-quantized matrix.
+pub fn mlx_packed_qtensor_resident_bytes(
+    weight: &gen_core::weightsmeta::SafetensorsTensorHeader,
+    scales: &gen_core::weightsmeta::SafetensorsTensorHeader,
+    biases: &gen_core::weightsmeta::SafetensorsTensorHeader,
+    group_size: usize,
+) -> gen_core::Result<u64> {
+    use gen_core::weightsmeta::Dtype as HeaderDtype;
+
+    let [out, packed_columns] = weight.shape.as_slice() else {
+        return Err(gen_core::Error::Unsupported(format!(
+            "packed weight {:?} must be rank 2, got {:?}",
+            weight.name, weight.shape
+        )));
+    };
+    let [scale_out, scale_columns] = scales.shape.as_slice() else {
+        return Err(gen_core::Error::Unsupported(format!(
+            "packed scales {:?} must be rank 2, got {:?}",
+            scales.name, scales.shape
+        )));
+    };
+    if biases.shape.as_slice() != [*scale_out, *scale_columns]
+        || out != scale_out
+        || weight.dtype != HeaderDtype::U32
+        || group_size == 0
+        || !group_size.is_multiple_of(QUANT_BLOCK)
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "packed affine triple {:?}/{:?}/{:?} has incompatible shapes, dtype, or group size {group_size}",
+            weight.name, scales.name, biases.name
+        )));
+    }
+    let input = scale_columns.checked_mul(group_size).ok_or_else(|| {
+        gen_core::Error::Msg(format!("packed input width overflow for {:?}", weight.name))
+    })?;
+    let encoded_bits = packed_columns.checked_mul(32).ok_or_else(|| {
+        gen_core::Error::Msg(format!("packed bit width overflow for {:?}", weight.name))
+    })?;
+    if input == 0 || !encoded_bits.is_multiple_of(input) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "packed affine triple {:?} cannot infer a Q4/Q8 bit width",
+            weight.name
+        )));
+    }
+    let bytes_per_block = match encoded_bits / input {
+        4 => 20_u64,
+        8 => 34_u64,
+        bits => {
+            return Err(gen_core::Error::Unsupported(format!(
+                "packed affine triple {:?} has unsupported Q{bits} width",
+                weight.name
+            )))
+        }
+    };
+    let elements = u64::try_from(*out)
+        .ok()
+        .and_then(|out| {
+            u64::try_from(input)
+                .ok()
+                .and_then(|input| out.checked_mul(input))
+        })
+        .ok_or_else(|| {
+            gen_core::Error::Msg(format!(
+                "packed element count overflow for {:?}",
+                weight.name
+            ))
+        })?;
+    if !elements.is_multiple_of(QUANT_BLOCK as u64) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "packed affine triple {:?} has {elements} elements, not a multiple of {QUANT_BLOCK}",
+            weight.name
+        )));
+    }
+    (elements / QUANT_BLOCK as u64)
+        .checked_mul(bytes_per_block)
+        .ok_or_else(|| {
+            gen_core::Error::Msg(format!(
+                "packed resident byte overflow for {:?}",
+                weight.name
+            ))
+        })
+}
 
 /// A component's `quantization` manifest block — the candle twin of `mlx_gen_flux2::config::Flux2Quant`
 /// (generalized out of the dormant per-crate `Flux2Quant`, sc-9086). An install-time convert job
@@ -814,16 +912,19 @@ impl Module for QLinear {
 }
 
 /// A token embedding that is **dense** (the loaded `[vocab, hidden]` table) or **GGUF-quantized**
-/// (the table stored as a `QTensor`, dequantized per forward). The TE `embed_tokens` is packed in the
-/// MLX tiers, so the packed-load path needs the embedding analogue of [`QLinear`]. The forward is the
-/// same index-select as `candle_nn::Embedding`.
+/// (the table stored as a `QTensor`, with only selected rows dequantized per forward). The TE
+/// `embed_tokens` is packed in the MLX tiers, so the packed-load path needs the embedding analogue of
+/// [`QLinear`]. The forward has the same index-select contract as `candle_nn::Embedding`.
 pub enum QEmbedding {
     Dense(Embedding),
     Quantized {
-        /// The GGUF-quantized `[vocab, hidden]` table; dequantized to `out_dtype` per forward, then
-        /// index-selected.
-        table: QTensor,
+        /// The one long-lived representation: host-resident quantized table bytes. Candle's
+        /// `QTensor` API has whole-table dequantization but no row view, so a forward copies only
+        /// selected rows from these bytes into a temporary device `QTensor`.
+        row_data: Vec<u8>,
+        vocab_size: usize,
         hidden_size: usize,
+        quant_dtype: GgmlDType,
         /// The dtype the dequantized table is cast to before index-select — the dense embedding
         /// table's dtype (i.e. `vb.dtype()`). Mirrors how [`QLinear::forward`] casts its dequantized
         /// weight to the activation dtype, so a packed bf16 text-encoder embedding yields bf16 rows
@@ -833,10 +934,44 @@ pub enum QEmbedding {
     },
 }
 
+/// The bounded dense work performed by one packed [`QEmbedding`] lookup. The resident quantized
+/// table is deliberately excluded: it already exists before the lookup. This probe is deterministic
+/// and lets callers/tests assert that a repeated-token prompt dequantizes each requested row once,
+/// rather than allocating a dense vocabulary-sized table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QEmbeddingWork {
+    /// Distinct vocabulary rows selected by the lookup.
+    pub selected_rows: usize,
+    /// Dense output bytes transiently dequantized before duplicate restoration.
+    pub dequantized_bytes: usize,
+}
+
+/// The long-lived packed representation retained by an installed [`QEmbedding`].
+///
+/// Row-selective lookup retains one host byte table and recreates a device-format `QTensor` only
+/// for the rows requested by a forward. `device_table_bytes` is therefore zero: retaining both
+/// representations would defeat the residency saving this path provides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QEmbeddingStorage {
+    /// Bytes in the host-resident quantized row source.
+    pub host_packed_bytes: usize,
+    /// Long-lived bytes in a device-format full-vocabulary table.
+    pub device_table_bytes: usize,
+}
+
 impl QEmbedding {
     /// A dense `[vocab, hidden]` embedding from `vb` (`{prefix}.weight`).
     pub fn embedding(vocab: usize, hidden: usize, vb: VarBuilder) -> Result<Self> {
         Ok(Self::Dense(candle_nn::embedding(vocab, hidden, vb)?))
+    }
+
+    /// Build from an already-device-format GGML table, as produced by
+    /// [`PackedWeightSidecars`]. This is the no-conversion twin of
+    /// [`Self::from_packed_dtype_gs`]: the caller has already validated and converted the source
+    /// affine triple ahead of the render. Installation also captures its compact quantized bytes once
+    /// so later forwards can assemble only selected rows without a whole-table device readback.
+    pub fn from_qtensor(table: QTensor, out_dtype: DType) -> Result<Self> {
+        Self::from_quantized_table(table, out_dtype)
     }
 
     /// Build a `Quantized` embedding directly from an MLX packed triple on `device` (Q4 lossless
@@ -863,13 +998,10 @@ impl QEmbedding {
         out_dtype: DType,
         group_size: usize,
     ) -> Result<Self> {
-        let table = repack_packed_weight(wq, scales, biases, group_size, device)?;
-        let hidden = table.shape().dims()[1];
-        Ok(Self::Quantized {
-            table,
-            hidden_size: hidden,
+        Self::from_quantized_table(
+            repack_packed_weight(wq, scales, biases, group_size, device)?,
             out_dtype,
-        })
+        )
     }
 
     /// As [`Self::from_packed`], but the forward dequantizes to `out_dtype` (the dense-path table
@@ -885,26 +1017,194 @@ impl QEmbedding {
         Self::from_packed_dtype_gs(wq, scales, biases, device, out_dtype, MLX_GROUP_SIZE)
     }
 
-    /// Index-select the embedding rows for `indexes`. Dense delegates to `candle_nn::Embedding`;
-    /// quantized dequantizes the table and casts it to `out_dtype` (the dense-path table dtype) once,
-    /// then index-selects — the same shape *and* dtype contract as the dense forward.
+    /// Returns the bounded dense work a packed lookup will perform. Repeated tokens share one
+    /// dequantized row; the public forward restores their original order and shape afterwards.
+    pub fn lookup_work(&self, indexes: &Tensor) -> Result<QEmbeddingWork> {
+        let Self::Quantized {
+            hidden_size,
+            out_dtype,
+            ..
+        } = self
+        else {
+            return Ok(QEmbeddingWork {
+                selected_rows: indexes.elem_count(),
+                dequantized_bytes: 0,
+            });
+        };
+        let (unique, _) = unique_embedding_indexes(indexes)?;
+        Ok(QEmbeddingWork {
+            selected_rows: unique.len(),
+            dequantized_bytes: unique
+                .len()
+                .saturating_mul(*hidden_size)
+                .saturating_mul(out_dtype.size_in_bytes()),
+        })
+    }
+
+    /// Returns the retained quantized storage for a packed embedding, if any. This deterministic
+    /// probe is intentionally about long-lived representation rather than temporary forward work;
+    /// use [`Self::lookup_work`] for the latter.
+    pub fn resident_storage(&self) -> Option<QEmbeddingStorage> {
+        match self {
+            Self::Dense(_) => None,
+            Self::Quantized { row_data, .. } => Some(QEmbeddingStorage {
+                host_packed_bytes: row_data.len(),
+                device_table_bytes: 0,
+            }),
+        }
+    }
+
+    /// Index-select the embedding rows for `indexes`. Dense delegates to `candle_nn::Embedding`.
+    /// The packed path first deduplicates the requested token IDs, constructs a temporary quantized
+    /// table containing only those rows, dequantizes that bounded table, then restores duplicate
+    /// positions. Its result has exactly the dense embedding shape and dtype.
     pub fn forward(&self, indexes: &Tensor) -> Result<Tensor> {
         match self {
             Self::Dense(e) => e.forward(indexes),
             Self::Quantized {
-                table,
+                row_data,
+                vocab_size,
                 hidden_size,
+                quant_dtype,
                 out_dtype,
-            } => {
-                let w = table.dequantize(indexes.device())?.to_dtype(*out_dtype)?;
-                Embedding::new(w, *hidden_size).forward(indexes)
-            }
+            } => forward_quantized_embedding(
+                row_data,
+                *vocab_size,
+                *hidden_size,
+                *quant_dtype,
+                *out_dtype,
+                indexes,
+            ),
         }
     }
 
     pub fn is_quantized(&self) -> bool {
         matches!(self, Self::Quantized { .. })
     }
+
+    fn from_quantized_table(table: QTensor, out_dtype: DType) -> Result<Self> {
+        let dims = table.shape().dims();
+        if dims.len() != 2 {
+            candle_core::bail!(
+                "packed embedding device-format table must be rank 2, got {:?}",
+                table.shape()
+            );
+        }
+        let vocab_size = dims[0];
+        let hidden_size = dims[1];
+        let quant_dtype = table.dtype();
+        let row_bytes = hidden_size
+            .checked_div(quant_dtype.block_size())
+            .and_then(|blocks| blocks.checked_mul(quant_dtype.type_size()))
+            .ok_or_else(|| {
+                candle_core::Error::Msg("invalid quantized embedding row layout".into())
+            })?;
+        let row_data = table.data()?.into_owned();
+        let expected_bytes = vocab_size.checked_mul(row_bytes).ok_or_else(|| {
+            candle_core::Error::Msg("quantized embedding storage size overflow".into())
+        })?;
+        if row_data.len() != expected_bytes {
+            candle_core::bail!(
+                "quantized embedding storage has {} bytes, expected {expected_bytes} for shape {:?}",
+                row_data.len(),
+                table.shape()
+            );
+        }
+        Ok(Self::Quantized {
+            row_data,
+            vocab_size,
+            hidden_size,
+            quant_dtype,
+            out_dtype,
+        })
+    }
+}
+
+/// Flatten `indexes` onto the CPU to identify the first occurrence of each token. Candle's native
+/// `Embedding` accepts U8/U32/I64 index tensors, so retain that surface while making the temporary
+/// inverse map U32 (all Candle index-select backends support it).
+fn unique_embedding_indexes(indexes: &Tensor) -> Result<(Vec<usize>, Vec<u32>)> {
+    let flat = indexes.flatten_all()?.to_device(&Device::Cpu)?;
+    let values: Vec<usize> = match flat.dtype() {
+        DType::U8 => flat.to_vec1::<u8>()?.into_iter().map(usize::from).collect(),
+        DType::U32 => flat
+            .to_vec1::<u32>()?
+            .into_iter()
+            .map(|value| value as usize)
+            .collect(),
+        DType::I64 => flat
+            .to_vec1::<i64>()?
+            .into_iter()
+            .map(|value| {
+                usize::try_from(value).map_err(|_| {
+                    candle_core::Error::Msg(format!("embedding index {value} cannot be negative"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+        dtype => candle_core::bail!("unsupported embedding index dtype {dtype:?}"),
+    };
+
+    let mut unique = Vec::new();
+    let mut inverse = Vec::with_capacity(values.len());
+    let mut positions = HashMap::new();
+    for value in values {
+        let next = unique.len() as u32;
+        let position = *positions.entry(value).or_insert_with(|| {
+            unique.push(value);
+            next
+        });
+        inverse.push(position);
+    }
+    Ok((unique, inverse))
+}
+
+fn forward_quantized_embedding(
+    row_data: &[u8],
+    vocab: usize,
+    hidden_size: usize,
+    quant_dtype: GgmlDType,
+    out_dtype: DType,
+    indexes: &Tensor,
+) -> Result<Tensor> {
+    let (unique, inverse) = unique_embedding_indexes(indexes)?;
+    let mut output_shape = indexes.dims().to_vec();
+    output_shape.push(hidden_size);
+    if unique.is_empty() {
+        return Tensor::zeros(output_shape, out_dtype, indexes.device());
+    }
+
+    let row_bytes = hidden_size
+        .checked_div(quant_dtype.block_size())
+        .and_then(|blocks| blocks.checked_mul(quant_dtype.type_size()))
+        .ok_or_else(|| candle_core::Error::Msg("invalid quantized embedding row layout".into()))?;
+    let mut selected = Vec::with_capacity(unique.len().saturating_mul(row_bytes));
+    for row in unique {
+        if row >= vocab {
+            candle_core::bail!("embedding index {row} out of bounds for vocabulary size {vocab}");
+        }
+        let start = row.checked_mul(row_bytes).ok_or_else(|| {
+            candle_core::Error::Msg("quantized embedding row offset overflow".into())
+        })?;
+        let end = start.checked_add(row_bytes).ok_or_else(|| {
+            candle_core::Error::Msg("quantized embedding row end overflow".into())
+        })?;
+        let bytes = row_data.get(start..end).ok_or_else(|| {
+            candle_core::Error::Msg("quantized embedding storage is shorter than its shape".into())
+        })?;
+        selected.extend_from_slice(bytes);
+    }
+    let selected = QTensor::new(
+        // `QStorage::from_data`'s typed view borrows from its Cow while cloning the blocks. Keep
+        // this row-only byte buffer alive across that call; an owned Cow would drop it too early.
+        QStorage::from_data(Cow::Borrowed(&selected), indexes.device(), quant_dtype)?,
+        (
+            inverse.iter().copied().max().unwrap_or_default() as usize + 1,
+            hidden_size,
+        ),
+    )?;
+    let rows = selected.dequantize(indexes.device())?.to_dtype(out_dtype)?;
+    let inverse = Tensor::from_vec(inverse, indexes.elem_count(), indexes.device())?;
+    rows.index_select(&inverse, 0)?.reshape(output_shape)
 }
 
 /// Repack an MLX packed triple into a resident [`QTensor`] on `device`: **Q4** via the lossless
@@ -943,8 +1243,8 @@ pub fn repack_packed_weight(
 /// **dense** (`{base}.weight`, path unchanged). `bias` additionally loads the dense `{base}.bias`
 /// (distinct from the packed path's own `{base}.biases`, which is always loaded packed). The candle
 /// twin of `mlx_gen::quant::lin`: one loader serves both a dense bf16 and a packed snapshot, with no
-/// `quantization` manifest to read. `vb`'s dtype is the dense-path weight dtype; the packed path
-/// builds on `vb`'s device.
+/// `quantization` manifest to read. `vb`'s dtype is the dense-path weight dtype; the packed path reads
+/// its source triple on the CPU and builds the device-format weight on `vb`'s device.
 pub fn lin(
     vb: &VarBuilder,
     base: &str,
@@ -970,9 +1270,12 @@ pub fn lin_gs(
         let device = vb.device().clone();
         // The u32 packed codes must load at their native `U32` (a cast to the vb's float dtype would
         // reinterpret the bit-packed nibbles); the scales/biases upcast bf16 → f32 exactly.
-        let wq = vb.get_unchecked_dtype(&format!("{base}.weight"), DType::U32)?;
-        let scales = vb.get_unchecked_dtype(&scales_key, DType::F32)?;
-        let biases = vb.get_unchecked_dtype(&format!("{base}.biases"), DType::F32)?;
+        // Repacking is host work. Read the affine triple directly on CPU so a CUDA VarBuilder does
+        // not upload the source tensors only for repack::q4_parts/q8_parts to pull them back again.
+        let host_vb = vb.clone().set_device(Device::Cpu);
+        let wq = host_vb.get_unchecked_dtype(&format!("{base}.weight"), DType::U32)?;
+        let scales = host_vb.get_unchecked_dtype(&scales_key, DType::F32)?;
+        let biases = host_vb.get_unchecked_dtype(&format!("{base}.biases"), DType::F32)?;
         let bias = if bias {
             Some(vb.get_unchecked_dtype(&format!("{base}.bias"), vb.dtype())?)
         } else {
@@ -985,6 +1288,61 @@ pub fn lin_gs(
     } else {
         QLinear::linear_no_bias(in_dim, out_dim, vb.pp(base))
     }
+}
+
+/// Load a raw-map projection from a [`Weights`] checkpoint. This is the `Weights` counterpart to
+/// [`lin_gs`]: the MLX affine `{base}.weight/.scales/.biases` triple is consumed directly when
+/// present, otherwise the original dense `Linear` is retained. Raw-map consumers must not interpret
+/// packed U32 codes as a dense float matrix merely because they do not use a `VarBuilder`.
+///
+/// The packed source parts are copied to host only for the repack operation. Q4 is repacked
+/// losslessly to `Q4_1`; Q8 follows the established per-projection affine-grid → `Q8_0` requant
+/// path. Neither route materializes a dense checkpoint or falls back to the dense loader.
+pub fn linear_from_weights_gs(
+    weights: &Weights,
+    base: &str,
+    bias: bool,
+    group_size: usize,
+) -> crate::Result<QLinear> {
+    let scales_key = format!("{base}.scales");
+    if weights.contains(&scales_key) {
+        let weight_key = format!("{base}.weight");
+        let device = weights.require(&weight_key)?.device().clone();
+        let host = Device::Cpu;
+        let wq = weights.require(&weight_key)?.to_device(&host)?;
+        let scales = weights.require(&scales_key)?.to_device(&host)?;
+        let biases = weights
+            .require(&format!("{base}.biases"))?
+            .to_device(&host)?;
+        let bias = if bias {
+            Some(weights.require(&format!("{base}.bias"))?)
+        } else {
+            None
+        };
+        return Ok(QLinear::from_packed_gs(
+            &wq, &scales, &biases, bias, group_size, &device,
+        )?);
+    }
+
+    let weight = weights.require(&format!("{base}.weight"))?;
+    if weight.dtype() == DType::U32 {
+        return Err(crate::CandleError::Msg(format!(
+            "packed MLX projection {base} has U32 codes but no {base}.scales sidecar; refusing to interpret packed codes as a dense weight"
+        )));
+    }
+    let bias = if bias {
+        Some(weights.require(&format!("{base}.bias"))?)
+    } else {
+        None
+    };
+    Ok(QLinear::from_dense(DenseLinear::Linear(Linear::new(
+        weight, bias,
+    ))))
+}
+
+/// [`linear_from_weights_gs`] at MLX's hosted group-64 affine layout.
+pub fn linear_from_weights(weights: &Weights, base: &str, bias: bool) -> crate::Result<QLinear> {
+    linear_from_weights_gs(weights, base, bias, MLX_GROUP_SIZE)
 }
 
 /// Load `{base}` as a [`QEmbedding`] — packed when `{base}.scales` is present, else dense (the
@@ -1036,9 +1394,10 @@ pub fn embedding_dtype_gs(
     let scales_key = format!("{base}.scales");
     if vb.contains_tensor(&scales_key) {
         let device = vb.device().clone();
-        let wq = vb.get_unchecked_dtype(&format!("{base}.weight"), DType::U32)?;
-        let scales = vb.get_unchecked_dtype(&scales_key, DType::F32)?;
-        let biases = vb.get_unchecked_dtype(&format!("{base}.biases"), DType::F32)?;
+        let host_vb = vb.clone().set_device(Device::Cpu);
+        let wq = host_vb.get_unchecked_dtype(&format!("{base}.weight"), DType::U32)?;
+        let scales = host_vb.get_unchecked_dtype(&scales_key, DType::F32)?;
+        let biases = host_vb.get_unchecked_dtype(&format!("{base}.biases"), DType::F32)?;
         return QEmbedding::from_packed_dtype_gs(
             &wq,
             &scales,
@@ -1193,6 +1552,126 @@ mod tests {
         Ok(())
     }
 
+    /// Both packed installation routes retain exactly one full-vocabulary representation: the host
+    /// byte table used for future row reads. The temporary device `QTensor` built by a lookup is not
+    /// retained after installation.
+    #[test]
+    fn packed_qembedding_resident_storage_is_host_rows_only() -> Result<()> {
+        let dev = Device::Cpu;
+        let (vocab, hidden) = (32, 128);
+        let (wq, s, b, _) = q4_fixture(vocab, hidden);
+        let packed =
+            QEmbedding::from_packed_dtype_gs(&wq, &s, &b, &dev, DType::BF16, MLX_GROUP_SIZE)?;
+        assert_eq!(
+            packed.resident_storage(),
+            Some(QEmbeddingStorage {
+                host_packed_bytes: vocab * hidden / GgmlDType::Q4_1.block_size()
+                    * GgmlDType::Q4_1.type_size(),
+                device_table_bytes: 0,
+            }),
+            "repacked MLX rows must not leave a duplicate device table resident"
+        );
+
+        let table = Tensor::randn(0f32, 1f32, (vocab, hidden), &dev)?;
+        let qtensor = QTensor::quantize(&table, GgmlDType::Q4_0)?;
+        let host_packed_bytes = qtensor.data()?.len();
+        let packed = QEmbedding::from_qtensor(qtensor, DType::F32)?;
+        assert_eq!(
+            packed.resident_storage(),
+            Some(QEmbeddingStorage {
+                host_packed_bytes,
+                device_table_bytes: 0,
+            }),
+            "already-device-format rows must also release their source table after installation"
+        );
+        Ok(())
+    }
+
+    /// Packed lookup dequantizes only the distinct selected rows, then uses its inverse map to
+    /// restore repeated tokens and the dense embedding's arbitrary index shape exactly.
+    #[test]
+    fn packed_qembedding_deduplicates_rows_and_restores_duplicates() -> Result<()> {
+        let dev = Device::Cpu;
+        let (vocab, hidden) = (256, 128);
+        let (wq, s, b, grid) = q4_fixture(vocab, hidden);
+        let packed = QEmbedding::from_packed(&wq, &s, &b, &dev)?;
+        let dense = QEmbedding::Dense(Embedding::new(
+            Tensor::from_vec(grid, (vocab, hidden), &dev)?,
+            hidden,
+        ));
+        let indexes = Tensor::from_vec(vec![7u32, 99, 7, 255, 99, 7], (2, 3), &dev)?;
+
+        let work = packed.lookup_work(&indexes)?;
+        assert_eq!(work.selected_rows, 3, "each duplicate must share one row");
+        assert_eq!(
+            work.dequantized_bytes,
+            3 * hidden * DType::F32.size_in_bytes(),
+            "the bounded dense allocation is exactly the selected rows"
+        );
+        assert!(
+            work.dequantized_bytes < vocab * hidden * DType::F32.size_in_bytes(),
+            "the lookup must not allocate a dense vocabulary table"
+        );
+
+        let (got, expected) = (packed.forward(&indexes)?, dense.forward(&indexes)?);
+        assert_eq!(got.dims(), expected.dims());
+        assert_eq!(got.dtype(), expected.dtype());
+        assert_eq!(
+            (got.sub(&expected)?).abs()?.max_all()?.to_scalar::<f32>()?,
+            0.0,
+            "row selection must restore every duplicate at its original position"
+        );
+        Ok(())
+    }
+
+    /// The allocation probe is intentionally independent of vocabulary size: same request, same
+    /// number of distinct rows, same transient dense bytes.
+    #[test]
+    fn packed_qembedding_work_scales_with_selected_rows_not_vocabulary() -> Result<()> {
+        let dev = Device::Cpu;
+        let hidden = 128;
+        let indexes = Tensor::from_vec(vec![3u32, 17, 3, 17, 42], (5,), &dev)?;
+        let make = |vocab| -> Result<QEmbedding> {
+            let (wq, s, b, _) = q4_fixture(vocab, hidden);
+            QEmbedding::from_packed(&wq, &s, &b, &dev)
+        };
+        let small = make(64)?.lookup_work(&indexes)?;
+        let large = make(1024)?.lookup_work(&indexes)?;
+        assert_eq!(small, large);
+        assert_eq!(small.selected_rows, 3);
+        Ok(())
+    }
+
+    /// The already-device-format sidecar route (used by Krea) takes the same row-selective path as
+    /// an MLX affine triple, rather than silently retaining the old whole-table dequantization.
+    #[test]
+    fn qtensor_qembedding_deduplicates_rows_with_dense_parity() -> Result<()> {
+        let dev = Device::Cpu;
+        let (vocab, hidden) = (128, 128);
+        let dense_table = Tensor::from_vec(
+            (0..vocab * hidden)
+                .map(|i| (i as f32 * 0.001 - 3.0).sin())
+                .collect::<Vec<_>>(),
+            (vocab, hidden),
+            &dev,
+        )?;
+        let qtensor = QTensor::quantize(&dense_table, GgmlDType::Q4_0)?;
+        let reference = qtensor.dequantize(&dev)?;
+        let packed = QEmbedding::from_qtensor(qtensor, DType::F32)?;
+        let dense = QEmbedding::Dense(Embedding::new(reference, hidden));
+        let indexes = Tensor::from_vec(vec![4u32, 4, 77, 12, 77], (5,), &dev)?;
+
+        assert_eq!(packed.lookup_work(&indexes)?.selected_rows, 3);
+        let (got, expected) = (packed.forward(&indexes)?, dense.forward(&indexes)?);
+        assert_eq!(got.dims(), expected.dims());
+        assert_eq!(got.dtype(), expected.dtype());
+        assert_eq!(
+            (got.sub(&expected)?).abs()?.max_all()?.to_scalar::<f32>()?,
+            0.0
+        );
+        Ok(())
+    }
+
     /// The packed `QEmbedding` forward output dtype matches the dense embedding path's — a bf16
     /// dense table yields bf16 rows, so the packed path (loaded with the same `vb.dtype()`) must too.
     /// The dense path here goes through the same VarBuilder-detect loader (`embedding`), so it holds
@@ -1214,10 +1693,8 @@ mod tests {
             Tensor::from_vec(grid, (vocab, hidden), &dev)?,
         );
 
-        let tmp = std::env::temp_dir().join(format!(
-            "sc9086_emb_dtype_{}.safetensors",
-            std::process::id()
-        ));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().join("sc9086_emb_dtype.safetensors");
         candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: we just wrote this file and nothing else touches it during the test.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -1241,7 +1718,6 @@ mod tests {
             "packed embedding forward dtype must match the dense path (dtype parity)"
         );
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 
@@ -1488,6 +1964,7 @@ mod tests {
     /// in-memory safetensors so no weights are needed.
     #[test]
     fn lin_and_embedding_packed_detect() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (64, 128);
         let (wq, s, b, _grid) = q4_fixture(out_dim, in_dim);
@@ -1501,8 +1978,7 @@ mod tests {
             Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?,
         );
 
-        let tmp =
-            std::env::temp_dir().join(format!("sc9086_detect_{}.safetensors", std::process::id()));
+        let tmp = tmp.path().join("sc9086_detect.safetensors");
         candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: we just wrote this file and nothing else touches it during the test.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -1516,7 +1992,6 @@ mod tests {
         let emb = embedding(&vb, "proj", out_dim, in_dim)?;
         assert!(emb.is_quantized(), "`.scales` present ⇒ packed embedding");
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 

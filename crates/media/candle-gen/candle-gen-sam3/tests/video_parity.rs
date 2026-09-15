@@ -3,7 +3,7 @@
 //! SAME torch oracle the MLX twin uses (`mlx-gen/scripts/spikes/sam3_oracle/dump_video_fixture.py`,
 //! a full `Sam3VideoModel` run). `#[ignore]` until weights + fixture are staged (sc-6248). Run:
 //!   SAM3_WEIGHTS=<snapshot> SAM3_VIDEO_FIXTURE=<video_fixture.safetensors> \
-//!     cargo test -p candle-gen-sam3 --release --features cuda --test video_parity -- --ignored --nocapture
+//!     cargo test -p candle-gen-sam3 --release --features cuda --test integration video_parity:: -- --ignored --nocapture
 
 use std::path::Path;
 
@@ -99,8 +99,8 @@ fn video_pcs_matches_oracle() {
 // full-readback-then-filter path — over a sweep of thresholds so a non-trivial (and varying)
 // kept-set is always exercised. Weights-only (no video fixture needed):
 //   SAM3_WEIGHTS=<snapshot> \
-//     cargo test -p candle-gen-sam3 --release --features cuda --test video_parity \
-//       on_device_mask_selection_matches_full_readback_gpu -- --ignored --nocapture
+//     cargo test -p candle-gen-sam3 --release --features cuda --test integration \
+//       video_parity::on_device_mask_selection_matches_full_readback_gpu -- --ignored --nocapture
 
 const LOW_RES: usize = 288;
 

@@ -58,7 +58,7 @@ impl NeoLlmConfig {
         self.model_type.to_lowercase().contains("moe") || self.num_experts.is_some_and(|n| n > 1)
     }
 
-    fn from_value(v: &Value) -> Self {
+    pub(crate) fn from_value(v: &Value) -> Self {
         Self {
             model_type: get_str(v, "model_type", "qwen3"),
             hidden_size: get_usize(v, "hidden_size", 4096),
@@ -83,6 +83,17 @@ impl NeoLlmConfig {
                 .and_then(Value::as_u64)
                 .map(|n| n as usize),
         }
+    }
+}
+
+impl Default for NeoLlmConfig {
+    /// The dense 8B-MoT backbone this crate ships against.
+    ///
+    /// Every field falls back to the shipped `config.json` value because this resolves through the
+    /// very same crate-private `from_value` parser [`NeoChatConfig::from_dir`] uses at load, so the
+    /// preset and a parsed snapshot config cannot drift apart.
+    fn default() -> Self {
+        Self::from_value(&Value::Null)
     }
 }
 
@@ -115,6 +126,11 @@ impl NeoVisionConfig {
         }
     }
 }
+
+/// The flow-matching head's pixel patch edge a `config.json` that omits `patch_size` resolves to —
+/// the shipped 8B-MoT value. The memory contract publishes this on the weights-free surface, where
+/// no config exists to read, so the parser and the contract cannot drift apart.
+pub const DEFAULT_PATCH_SIZE: usize = 16;
 
 /// The top-level NEO-Unify config (`config.json`, `model_type == "neo_chat"`): the dense Qwen3
 /// backbone + the vision embedder + the flow-matching image-generation knobs.
@@ -182,7 +198,7 @@ impl NeoChatConfig {
             pad_token_id: get_usize(v, "pad_token_id", 151_643) as u32,
             tie_word_embeddings: get_bool(v, "tie_word_embeddings", false),
             downsample_ratio: get_f32(v, "downsample_ratio", 0.5),
-            patch_size: get_usize(v, "patch_size", 16),
+            patch_size: get_usize(v, "patch_size", DEFAULT_PATCH_SIZE),
             timestep_shift: get_f32(v, "timestep_shift", 1.0),
             time_schedule: get_str(v, "time_schedule", "standard"),
             time_shift_type: get_str(v, "time_shift_type", "exponential"),
@@ -256,9 +272,10 @@ fn get_bool(v: &Value, key: &str, default: bool) -> bool {
 }
 
 /// A minimal `config.json` carrying the 8B-MoT structural values (the parser ignores the many
-/// fields it does not model — `min_pixels`, `P_mean`, …). Shared by the config and loader tests.
+/// fields it does not model — `min_pixels`, `P_mean`, …). Shared by the config, loader and
+/// memory-contract tests.
 #[cfg(test)]
-const MOT_8B_CONFIG: &str = r#"{
+pub(crate) const MOT_8B_CONFIG: &str = r#"{
       "model_type": "neo_chat",
       "template": "neo1_0",
       "tie_word_embeddings": false,

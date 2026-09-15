@@ -29,7 +29,9 @@ use std::path::PathBuf;
 use candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::imageops::{resize_lanczos_u8, resize_nearest_u8};
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{Image, Progress, WeightsSource};
+use candle_gen::gen_core::{
+    AdapterSpec, Image, LoadSpec, MemoryRunContext, PreviewSink, Progress, WeightsSource,
+};
 // Shared ancestral-step RNG salt (`seed + STEP_RNG_SALT`) — one home in `candle-gen` (sc-9043 / F-059).
 // `LatentDecoder` is the decode seam the optional PiD student implements (epic 7840, sc-8044).
 use candle_gen::gen_core::PidWeights;
@@ -40,11 +42,11 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 use crate::conditioning::SdxlConditioner;
-use crate::denoise::{decode_image, text_time_ids, SPATIAL_SCALE};
-use crate::loaders::{load_instantid_unet, load_sdxl_vae, load_sdxl_vae_encoder};
+use crate::denoise::{decode_image_with_tiling, text_time_ids, SPATIAL_SCALE};
+use crate::loaders::{load_instantid_unet_with_adapters, load_sdxl_vae, load_sdxl_vae_encoder};
 use crate::sampler::EulerAncestralSampler;
 use crate::unet::{UNet2DConditionModel, VaeMomentsEncoder};
-use crate::{AutoEncoderKL, PID_BACKBONE};
+use crate::{SdxlArtifactSeal, SdxlVaeDecoder, PID_BACKBONE};
 
 /// The edit compute dtype — fp16, matching the production SDXL path (the f16-stable VAE + UNet).
 const DTYPE: DType = DType::F16;
@@ -89,6 +91,10 @@ pub struct SdxlEditPaths {
     pub tokenizer_clip_bigg: WeightsSource,
     /// The fp16-stable VAE component (`vae_fp16_fix`) — the `.safetensors` file or its dir.
     pub vae_fp16_fix: WeightsSource,
+    /// User-selected SDXL LoRA/LoKr stack. The edit provider uses the same packed/dense additive
+    /// installer as the registered txt2img route, so a non-empty stack is either applied to the
+    /// UNet or rejected when no target matches.
+    pub adapters: Vec<AdapterSpec>,
 }
 
 /// One SDXL edit request.
@@ -113,6 +119,12 @@ pub struct SdxlEditRequest {
     pub use_pid: bool,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
+    /// The caller's live per-step latent preview sink (epic 16948, sc-16954). A name-driven provider,
+    /// so the sink travels on the request rather than on a `GenerationRequest`. The default (inert)
+    /// sink leaves the render byte-identical. Frames show the **whole** canvas as it denoises,
+    /// including the mask-pinned region, because the inpaint blend lands in latent space before the
+    /// next emission — see [`crate::preview`].
+    pub preview: PreviewSink,
 }
 
 impl Default for SdxlEditRequest {
@@ -128,6 +140,8 @@ impl Default for SdxlEditRequest {
             seed: 0,
             use_pid: false,
             cancel: CancelFlag::default(),
+            // Inert by default: a caller that never sets a sink gets exactly today's render.
+            preview: PreviewSink::default(),
         }
     }
 }
@@ -138,7 +152,7 @@ impl Default for SdxlEditRequest {
 pub struct SdxlEdit {
     conditioner: SdxlConditioner,
     unet: UNet2DConditionModel,
-    vae: AutoEncoderKL,
+    vae: SdxlVaeDecoder,
     vae_encoder: VaeMomentsEncoder,
     sampler: EulerAncestralSampler,
     /// Optional PiD super-resolving decoder (epic 7840, sc-8044), attached via [`with_pid`](Self::with_pid).
@@ -146,6 +160,7 @@ pub struct SdxlEdit {
     /// registered SDXL provider — no edit-specific PiD checkpoint.
     pid: Option<PidEngine>,
     device: Device,
+    memory_admission: Option<(SdxlArtifactSeal, MemoryRunContext)>,
 }
 
 impl SdxlEdit {
@@ -162,7 +177,7 @@ impl SdxlEdit {
             &paths.tokenizer_clip_l,
             &paths.tokenizer_clip_bigg,
         )?;
-        let unet = load_instantid_unet(root, &device, DTYPE)?;
+        let unet = load_instantid_unet_with_adapters(root, &device, DTYPE, &paths.adapters)?;
         let vae = load_sdxl_vae(&paths.vae_fp16_fix, &device, DTYPE)?;
         let vae_encoder = load_sdxl_vae_encoder(&paths.vae_fp16_fix, &device, DTYPE)?;
         Ok(Self {
@@ -173,7 +188,25 @@ impl SdxlEdit {
             sampler: EulerAncestralSampler::sdxl(),
             pid: None,
             device,
+            memory_admission: None,
         })
+    }
+
+    /// Load under an exact pre-load selector decision. The spec is independently sealed again here
+    /// and retained through every lazy/forward-time file use; crossed paths or context are refused
+    /// before any tensor construction.
+    pub fn load_admitted(
+        paths: &SdxlEditPaths,
+        spec: &LoadSpec,
+        context: MemoryRunContext,
+    ) -> Result<Self> {
+        crate::memory_strategy::validate_edit_spec(paths, spec)?;
+        let seal = SdxlArtifactSeal::capture_for(spec, crate::SdxlSurface::Bespoke)?;
+        crate::memory_strategy::validate_context(seal.contract(), &context, &seal)?;
+        crate::memory_strategy::validate_bespoke_context(&context)?;
+        let mut model = Self::load(paths)?;
+        model.memory_admission = Some((seal, context));
+        Ok(model)
     }
 
     /// Attach the optional PiD super-resolving decoder (epic 7840, sc-8044). `pid` is the same
@@ -240,6 +273,26 @@ impl SdxlEdit {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
+        let memory = if let Some((seal, context)) = &self.memory_admission {
+            seal.ensure_unchanged()?;
+            crate::memory_strategy::validate_bespoke_request(
+                seal,
+                context,
+                req.width,
+                req.height,
+                1,
+                req.use_pid,
+                if mask.is_some() {
+                    "image_inpaint"
+                } else {
+                    "edit"
+                },
+            )?;
+            seal.contract().generation_memory(&context.selection)
+        } else {
+            None
+        };
+        let _attention = crate::enter_attention_memory(memory);
         if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
             return Err(CandleError::Msg(format!(
                 "sdxl edit: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
@@ -289,13 +342,15 @@ impl SdxlEdit {
             &mut step_rng,
             &req.cancel,
             on_progress,
+            &req.preview,
         )?;
         on_progress(Progress::Decoding);
         // Decode the final (mask-blended) latent: native SDXL VAE by default, or the `sdxl` PiD student
         // (4× SR) when this generation opted in (`req.use_pid`) and `with_pid` loaded one (sc-8044).
         let pid_decoder = self.pid_decoder_for(req)?;
         let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
-        decode_image(&self.vae, &latents, pid_ref)
+        let tiling = crate::denoise::decode_tiling(memory);
+        decode_image_with_tiling(&self.vae, &latents, pid_ref, Some(&req.cancel), tiling)
     }
 
     /// VAE-encode `source` (resized to the render size, LANCZOS, normalized to `[-1,1]` NCHW) to the
@@ -343,6 +398,7 @@ impl SdxlEdit {
         rng: &mut StdRng,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewSink,
     ) -> Result<Tensor> {
         // An empty schedule (img2img at strength ≤ 1/steps) is a no-op: the lightly-noised source. For
         // inpaint that leaves the source untouched (no repaint), the honest result of a zero-step edit.
@@ -352,11 +408,19 @@ impl SdxlEdit {
         let cfg_on = cfg > 1.0;
         let total = steps.len() as u32;
         let (_, lat_c, lat_h, lat_w) = latents.dims4()?;
+        // Per-step latent preview (epic 16948, sc-16954). A bespoke ancestral loop, so it numbers its
+        // own frames on the step index — the schedule here is a `(t, t_prev)` timestep pair list, not
+        // a σ array. No renormalization: euler-ancestral folds the input scaling into its own step, so
+        // `latents` is already in the domain the reused fit was measured in.
+        let preview_counter = candle_gen::preview::PreviewCounter::with_steps(steps.len());
 
         for (i, &(t, t_prev)) in steps.iter().enumerate() {
             if cancel.is_cancelled() {
                 return Err(CandleError::Canceled);
             }
+            candle_gen::preview::emit_preview_at(preview, &preview_counter, i, || {
+                crate::preview::project_spatial_latents(&latents)
+            });
             let x_unet = if cfg_on {
                 Tensor::cat(&[&latents, &latents], 0)?
             } else {
@@ -471,6 +535,7 @@ mod tests {
                 "/nonexistent/clip_bigg/tokenizer.json".into(),
             ),
             vae_fp16_fix: WeightsSource::File("/nonexistent/vae.safetensors".into()),
+            adapters: Vec::new(),
         };
         let err = SdxlEdit::load(&paths)
             .err()

@@ -7,7 +7,7 @@
 //!
 //! Run:
 //!   PYTHONPATH=/tmp/sam2-mlx/src ~/mlx-flux-venv/bin/python tools/dump_sam2_encoder_golden.py --size large
-//!   cargo test -p mlx-gen-sam2 --release --test encoder_parity -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sam2 --release --test integration encoder_parity:: -- --ignored --nocapture
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sam2::{Sam2ImageEncoder, Sam2ImageEncoderConfig};

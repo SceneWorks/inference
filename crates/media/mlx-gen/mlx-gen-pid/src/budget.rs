@@ -162,6 +162,68 @@ pub fn plan_tile_edge(
     }
 }
 
+/// The production tile-edge candidates a PiD decode will accept, largest first (SC-15510).
+///
+/// Derived from the three constants that already bound the planner — [`TILE_ALIGN`] multiples from
+/// [`MIN_TILE_EDGE`] up to the Metal watchdog-safe [`WATCHDOG_SAFE_EDGE`] — rather than re-spelled, so
+/// a consumer's advertised domain cannot drift from what [`validate_tile`] enforces.
+///
+/// This exists because the shared memory-strategy contract (SC-15449) needs to publish *which* decode
+/// geometries a provider will honour. Before SC-15510 the PiD route had no answer: it planned its own
+/// tiling from [`plan_tile_edge`] and ignored any selection, so a contract-driven bounded-decode
+/// choice had to be refused outright rather than executed.
+pub fn tile_edge_candidates() -> Vec<i32> {
+    let mut edges: Vec<i32> = (MIN_TILE_EDGE..=WATCHDOG_SAFE_EDGE)
+        .step_by(TILE_ALIGN as usize)
+        .collect();
+    edges.reverse();
+    edges
+}
+
+/// Whether `edge` is one of [`tile_edge_candidates`] — the **single** legality predicate for the PiD
+/// tile domain (SC-15775).
+///
+/// [`validate_tile`] is the production gate, but three other places need the same yes/no without
+/// building a rejection message: the shared seam's mis-wiring assertion
+/// ([`selected_decode_tiling`](crate::engine::selected_decode_tiling)), a provider's route-domain
+/// conformance check ([`decode_routes`](crate::decode_routes)), and the tests of both. Answering it
+/// here rather than re-spelling `MIN_TILE_EDGE`/`TILE_ALIGN` arithmetic at each site is what keeps a
+/// consumer's idea of "legal" from drifting away from what [`validate_tile`] actually enforces.
+pub fn is_tile_edge_candidate(edge: i32) -> bool {
+    tile_edge_candidates().contains(&edge)
+}
+
+/// Accept or reject an externally chosen `(edge, overlap)` for a PiD decode of `th × tw` output.
+///
+/// The refusals are the planner's own invariants, made explicit so an out-of-domain selection is a
+/// typed rejection at admission instead of a watchdog abort or an OOM mid-decode:
+///
+/// 1. the edge must be one of [`tile_edge_candidates`] — alignment keeps tiles LQ-slice- and
+///    patch-aligned, and the [`MIN_TILE_EDGE`] floor keeps per-tile fixed overheads from dominating;
+/// 2. it must not exceed [`WATCHDOG_SAFE_EDGE`] — on Metal the failure above that is command-buffer
+///    **time**, not memory, so no amount of free RAM makes a bigger tile legal;
+/// 3. the overlap must be positive and smaller than the edge — an overlap ≥ edge makes the tile split
+///    degenerate.
+///
+/// `th`/`tw` are the super-resolved output dims, carried so the message can name the decode the
+/// selection was rejected for. `model_id` only labels the error. Pure — no device query.
+pub fn validate_tile(model_id: &str, edge: i32, overlap: i32, th: i32, tw: i32) -> Result<()> {
+    if !is_tile_edge_candidate(edge) {
+        let candidates = tile_edge_candidates();
+        return Err(Error::Msg(format!(
+            "{model_id}: PiD decode tile edge {edge} is not one of the production candidates \
+             {candidates:?} ({TILE_ALIGN}px-aligned, {MIN_TILE_EDGE}..={WATCHDOG_SAFE_EDGE}) for a \
+             {tw}×{th} output"
+        )));
+    }
+    if overlap <= 0 || overlap >= edge {
+        return Err(Error::Msg(format!(
+            "{model_id}: PiD decode overlap {overlap} must be in 1..{edge} (the tile edge)"
+        )));
+    }
+    Ok(())
+}
+
 /// The PiD decode budget backstop (F-013 + sc-10087): with tiling, a large output is *tiled* rather than
 /// refused, so this refuses only when even a [`MIN_TILE_EDGE`] tile plus the resident full-res buffers
 /// exceeds `safe_gib` — a machine too small to hold the output-resolution `x`/`noise`/ε at all. `model_id`
@@ -200,6 +262,58 @@ mod tests {
     // sr4x backbone dims (patch_size 16, hidden 1536) — the released students' geometry.
     const PATCH: i32 = 16;
     const HIDDEN: i32 = 1536;
+
+    /// SC-15510: the published candidates ARE the planner's invariants, derived rather than
+    /// re-spelled, so the advertised domain cannot drift from what the validator enforces.
+    #[test]
+    fn the_published_candidates_are_exactly_what_the_validator_accepts() {
+        let candidates = tile_edge_candidates();
+        assert_eq!(
+            candidates.first(),
+            Some(&WATCHDOG_SAFE_EDGE),
+            "largest first"
+        );
+        assert_eq!(candidates.last(), Some(&MIN_TILE_EDGE));
+        assert!(candidates.contains(&PREFERRED_TILE_EDGE));
+        for edge in &candidates {
+            assert_eq!(edge % TILE_ALIGN, 0, "{edge} must be tile-aligned");
+            validate_tile("t", *edge, DEFAULT_TILE_OVERLAP, 8192, 8192).unwrap();
+        }
+        // Everything the planner would refuse is refused: misaligned, below the floor, above the
+        // watchdog edge.
+        for edge in [
+            MIN_TILE_EDGE + 1,
+            MIN_TILE_EDGE - TILE_ALIGN,
+            WATCHDOG_SAFE_EDGE + TILE_ALIGN,
+            0,
+        ] {
+            assert!(
+                validate_tile("t", edge, DEFAULT_TILE_OVERLAP, 8192, 8192).is_err(),
+                "edge {edge} must be refused"
+            );
+        }
+    }
+
+    /// The native VAE's decode ladder lives in a different range of the same unit, so a selection
+    /// built for one route can never be mistaken for the other's.
+    #[test]
+    fn the_native_vae_ladder_is_disjoint_from_the_pid_ladder() {
+        for native in [768, 640, 512, 448, 384, 320, 256] {
+            assert!(
+                validate_tile("t", native, 64, 8192, 8192).is_err(),
+                "a native VAE tile edge ({native}) must not be a legal PiD tile"
+            );
+        }
+    }
+
+    #[test]
+    fn a_degenerate_overlap_is_refused() {
+        // An overlap at or above the edge makes the tile split degenerate.
+        assert!(validate_tile("t", PREFERRED_TILE_EDGE, PREFERRED_TILE_EDGE, 8192, 8192).is_err());
+        assert!(validate_tile("t", PREFERRED_TILE_EDGE, 0, 8192, 8192).is_err());
+        assert!(validate_tile("t", PREFERRED_TILE_EDGE, -1, 8192, 8192).is_err());
+        validate_tile("t", PREFERRED_TILE_EDGE, 1, 8192, 8192).unwrap();
+    }
 
     #[test]
     fn whole_peak_grows_with_area() {

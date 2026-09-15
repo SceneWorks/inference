@@ -19,8 +19,8 @@ pub const VAE_GB_PER_MEGAPIXEL: f64 = 2.039;
 ///
 /// **Q4 moved from 5.940 to 7.868 in sc-15071**, and the anchor had to move with it. The tier that
 /// measured 5.940 was the one that rendered a tiled texture instead of the prompt; the precision
-/// floors that make it render correctly (`crate::quant::FINAL_MOD_MIN_BITS`,
-/// `crate::quant::LM_LAYER_MIN_BITS`) put the Qwen3-VL LM's 36 decoder layers at 8 bits, which is
+/// floors in `crate::quant::COMPONENT_PRECISION_FLOORS` that make it render correctly put the
+/// Qwen3-VL LM's 36 decoder layers at 8 bits, which is
 /// ~1.9 GB of the difference. Leaving the old anchor in place would have been worse than a stale
 /// number: this gate is what stands between an over-large request and MLX's default allocation
 /// handler, which calls `exit(-1)` rather than returning a catchable error.
@@ -33,6 +33,13 @@ fn calibration_peak_gb(tier: Option<Quant>) -> f64 {
     }
 }
 
+/// Measured non-VAE portion of Mage's complete request peak. The caller uses this as a ceiling when
+/// attributing live MLX bytes to a cached Mage generator; process-global allocations above this
+/// envelope must remain charged to the request budget.
+pub fn generation_resident_gb(tier: Option<Quant>) -> f64 {
+    calibration_peak_gb(tier) - vae_peak_gb(512, 512)
+}
+
 pub fn vae_peak_gb(width: u32, height: u32) -> f64 {
     VAE_FIXED_GB + VAE_GB_PER_MEGAPIXEL * (width as f64 * height as f64 / 1e6)
 }
@@ -40,8 +47,7 @@ pub fn vae_peak_gb(width: u32, height: u32) -> f64 {
 /// Conservative complete-pipeline peak. Weight/DiT/TE residency is the tier's measured 512²
 /// anchor minus that anchor's VAE term; only the empirically resolution-linear VAE spike grows.
 pub fn generation_peak_gb(tier: Option<Quant>, width: u32, height: u32, count: u32) -> f64 {
-    let resident = calibration_peak_gb(tier) - vae_peak_gb(512, 512);
-    resident + vae_peak_gb(width, height) * count.max(1) as f64
+    generation_resident_gb(tier) + vae_peak_gb(width, height) * count.max(1) as f64
 }
 
 fn resolve_live_budget_gb(limit_bytes: usize, max_buffer_gib: Option<f64>) -> Result<f64> {

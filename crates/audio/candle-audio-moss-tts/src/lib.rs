@@ -57,11 +57,19 @@ pub mod sampling;
 
 pub use model::{
     descriptor, load, load_generator, provider_registry, register_providers, CODEC_CHECKPOINT_FILE,
-    CODEC_COMPONENT_ID, CODEC_HUB_REPO, CODEC_HUB_REVISION, HUB_REPO, HUB_REVISION, LANGUAGES,
-    MAX_DURATION_SECS, MAX_SPEAKERS, MODEL_ID, REGISTRATION, SAMPLE_RATE, WEIGHT_LICENSE,
-    WEIGHT_LICENSE_ENTRY,
+    CODEC_COMPONENT_ID, CODEC_HUB_REPO, CODEC_HUB_REVISION, COMPONENT_KEY, COMPONENT_LICENSE,
+    HUB_REPO, HUB_REVISION, LANGUAGES, MAX_DURATION_SECS, MAX_SPEAKERS, MODEL_ID, REGISTRATION,
+    SAMPLE_RATE,
 };
 
-/// This crate's model-weight-license entries — one row keyed by [`MODEL_ID`]. The audio catalog
-/// concatenates every registered provider's slice into the model-licenses manifest.
-pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[model::WEIGHT_LICENSE_ENTRY];
+/// This crate's schema-3 component licence rows — one per loaded artifact (sc-16663). The audio
+/// catalog concatenates every provider crate's slice into the licence table it ships.
+pub const COMPONENT_LICENSES: &[gen_core::ComponentLicense] = &[model::COMPONENT_LICENSE];
+
+/// The provider→component mapping this crate contributes. A provider's effective terms are
+/// **derived** from these components by [`gen_core::provider_terms`] — never hand-authored — so
+/// they cannot drift from the component rows they summarize.
+pub const PROVIDER_COMPONENTS: &[gen_core::ProviderComponents] = &[gen_core::ProviderComponents {
+    provider_id: model::MODEL_ID,
+    components: &[model::COMPONENT_KEY],
+}];

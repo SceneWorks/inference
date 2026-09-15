@@ -10,7 +10,7 @@
 //!   INSTANTID_IP_ADAPTER=<ip-adapter.safetensors> \
 //!   INSTANTID_SCRFD=<scrfd_10g.safetensors> INSTANTID_ARCFACE=<arcface_iresnet100.safetensors> \
 //!   INSTANTID_REF=<reference face image> \
-//!   cargo test -p mlx-gen-instantid --release --test instantid_curated_smoke -- --ignored --nocapture
+//!   cargo test -p mlx-gen-instantid --release --test integration instantid_curated_smoke:: -- --ignored --nocapture
 //!
 //! Gate (directional, per epic 3109): every sampler — the ancestral default AND each curated solver —
 //! must keep the ArcFace cosine well above 0 (identity preserved). A curated solver that destabilizes
@@ -67,7 +67,7 @@ fn curated_samplers_preserve_identity() {
     };
     let scrfd = Weights::from_file(env_path("INSTANTID_SCRFD")).expect("load scrfd");
     let arcface = Weights::from_file(env_path("INSTANTID_ARCFACE")).expect("load arcface");
-    let model = InstantId::load(&paths)
+    let mut model = InstantId::load(&paths)
         .expect("load InstantID")
         .with_face(&scrfd, &arcface)
         .expect("attach face stack");

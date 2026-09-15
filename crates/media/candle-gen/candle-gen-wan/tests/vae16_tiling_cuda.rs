@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! set WAN_VAE16_SNAPSHOT=E:\staged\12402\wan-t2v-q4
-//! cargo test -p candle-gen-wan --features cuda --release --test vae16_tiling_cuda -- --ignored --nocapture
+//! cargo test -p candle-gen-wan --features cuda --release --test integration vae16_tiling_cuda:: -- --ignored --nocapture
 //! ```
 //!
 //! NOTE: the z16 decoder has **global per-frame spatial attention** (`MidAttn` softmaxes over all H·W),

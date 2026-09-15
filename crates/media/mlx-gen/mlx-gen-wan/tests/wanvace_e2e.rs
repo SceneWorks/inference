@@ -22,7 +22,7 @@
 //! `transformer/` + a converted base-Wan snapshot's shared `t5_encoder.safetensors` +
 //! `vae.safetensors` + `tokenizer.json`). Point at an explicit dir with `WANVACE_DIR=/path/to/wan_vace`,
 //! or let the test assemble from the local HF cache + a `~/.cache/mlx-gen-models/wan2_2_*_a14b_*` base
-//! snapshot when `WANVACE_DIR` is unset. Run: `cargo test -p mlx-gen-wan --release --test wanvace_e2e
+//! snapshot when `WANVACE_DIR` is unset. Run: `cargo test -p mlx-gen-wan --release --test integration wanvace_e2e::
 //! -- --ignored`.
 
 use std::path::PathBuf;

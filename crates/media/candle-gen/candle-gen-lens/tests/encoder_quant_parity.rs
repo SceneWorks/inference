@@ -14,7 +14,7 @@
 //!
 //! Gated on env vars; skips cleanly when unset. Run with the `cuda` feature, single-threaded so the
 //! two encoders load sequentially (not 2× resident at once):
-//!   cargo test -p candle-gen-lens --features cuda --test encoder_quant_parity -- --nocapture --test-threads=1
+//!   cargo test -p candle-gen-lens --features cuda --test integration encoder_quant_parity:: -- --nocapture --test-threads=1
 //!   LENS_TEXT_ENCODER_DIR — the Lens `text_encoder` snapshot dir (config.json + model-*.safetensors)
 //!   LENS_GOLDENS          — gptoss_goldens.safetensors (default: .scratch/gptoss-goldens/…)
 
@@ -112,6 +112,7 @@ fn worst_capture_cosine(quant: GgmlDType) -> Result<Option<f32>> {
 }
 
 #[test]
+#[ignore = "needs the Lens text_encoder snapshot (LENS_TEXT_ENCODER_DIR) + goldens (LENS_GOLDENS)"]
 fn encoder_q8_matches_reference() -> Result<()> {
     // Q8 is near-lossless: it must essentially hold the dense bf16 floor (a hair under, for the added
     // 8-bit block rounding).
@@ -126,6 +127,7 @@ fn encoder_q8_matches_reference() -> Result<()> {
 }
 
 #[test]
+#[ignore = "needs the Lens text_encoder snapshot (LENS_TEXT_ENCODER_DIR) + goldens (LENS_GOLDENS)"]
 fn encoder_q4_matches_reference() -> Result<()> {
     // Q4 (the ~12 GB target) is lossier but must stay coherent — the captures still track the bf16
     // reference, not collapse.

@@ -1,0 +1,14 @@
+    Finished `release` profile [optimized] target(s) in 0.09s
+     Running tests/wan_overlap_ab.rs (target/release/deps/wan_overlap_ab-16ee93cde914ccb6)
+
+running 1 test
+test wan_overlap_wall_time_and_quality_ab ...
+=== sc-15445 Wan overlap A/B ===
+family=Z16 weights=/Users/michael/.cache/huggingface/hub/models--SceneWorks--wan2.2-t2v-a14b-mlx/snapshots/991eb255c544bbb2e1f1e07da4355c2f0a5337b7/bf16/vae.safetensors stimulus=normal(seed=15445)
+product=640x384x81 decoded=640x384x84 latent=[1, 16, 21, 48, 80]
+spatial=192/64 old=32/8 current=32/16 reference=96/48
+iterations temporal/all: old=4/60 current=5/75 reference=1/15 repeats=3
+RESULT family=Z16 bucket=640x384 product_frames=81 decoded_frames=84 tile=32 old_overlap=8 current_overlap=16 temporal_iterations=4=>5 all_iterations=60=>75 old_seconds_median=66.325 old_seconds_range=65.999..74.315 current_seconds_median=98.481 current_seconds_range=92.060..100.976 wall_ratio=1.4848 old_peak_gib=7.793 current_peak_gib=7.582 old_mae255=2.4579 current_mae255=1.8535 reference_clip_mean=0.0149 reference_clip_worst=0.2669 old_clip_mean=0.0155 old_clip_worst=0.2669 current_clip_mean=0.0139 current_clip_worst=0.2669 reference_seconds=51.563 reference_peak_gib=18.849
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 827.75s

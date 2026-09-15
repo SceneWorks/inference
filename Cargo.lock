@@ -106,6 +106,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
 
 [[package]]
+name = "bit_field"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e4b40c7323adcfc0a41c4b88143ed58346ff65a288fc144329c5c45e05d70c6"
+
+[[package]]
 name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -181,6 +187,7 @@ dependencies = [
  "libc",
  "sceneworks-gen-core",
  "sha2",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 
@@ -196,6 +203,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde",
  "serde_json",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -217,6 +225,7 @@ dependencies = [
  "candle-audio-stable-audio-3",
  "candle-audio-whisper",
  "candle-llm",
+ "tempfile",
 ]
 
 [[package]]
@@ -233,6 +242,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde",
  "serde_json",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -243,6 +253,7 @@ dependencies = [
  "candle-audio",
  "candle-audio-kokoro",
  "candle-nn",
+ "tempfile",
 ]
 
 [[package]]
@@ -254,6 +265,7 @@ dependencies = [
  "candle-nn",
  "core-llm",
  "serde_json",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -270,6 +282,7 @@ dependencies = [
  "rand_distr",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
  "zip 7.2.0",
 ]
 
@@ -284,6 +297,7 @@ dependencies = [
  "rand_distr",
  "regex",
  "sceneworks-gen-core-testkit",
+ "tempfile",
 ]
 
 [[package]]
@@ -298,6 +312,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde",
  "serde_json",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -312,6 +327,7 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde",
  "serde_json",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -321,12 +337,14 @@ version = "0.0.0"
 dependencies = [
  "candle-audio",
  "candle-audio-chatterbox",
+ "candle-audio-kokoro",
  "candle-audio-whisper",
  "candle-nn",
  "core-llm",
  "sceneworks-gen-core-testkit",
  "serde",
  "serde_json",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -341,6 +359,7 @@ dependencies = [
  "candle-nn",
  "core-llm",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -352,10 +371,12 @@ dependencies = [
  "core-llm",
  "rand",
  "rand_distr",
+ "safetensors 0.4.5",
  "sceneworks-gen-core-testkit",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -370,6 +391,7 @@ dependencies = [
  "core-llm",
  "rand",
  "serde_json",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -420,6 +442,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "float8",
+ "fs2",
  "half",
  "image",
  "rand",
@@ -428,7 +451,9 @@ dependencies = [
  "sceneworks-gen-core",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 2.0.18",
+ "windows-sys",
 ]
 
 [[package]]
@@ -437,10 +462,13 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "candle-gen-qwen-image",
+ "image",
  "rand",
  "rand_distr",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -453,6 +481,8 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -461,12 +491,16 @@ name = "candle-gen-boogu"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-flux",
  "candle-gen-pid",
  "candle-transformers",
  "image",
  "rand",
  "rand_distr",
+ "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -491,6 +525,7 @@ dependencies = [
  "candle-gen-lens",
  "candle-gen-ltx",
  "candle-gen-mage",
+ "candle-gen-minimax-h3",
  "candle-gen-mochi",
  "candle-gen-pid",
  "candle-gen-pulid",
@@ -505,6 +540,9 @@ dependencies = [
  "candle-gen-svd",
  "candle-gen-wan",
  "candle-gen-z-image",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -512,6 +550,7 @@ name = "candle-gen-chroma"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-flux",
  "candle-gen-pid",
  "candle-transformers",
  "image",
@@ -519,6 +558,8 @@ dependencies = [
  "rand_distr",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -531,6 +572,7 @@ dependencies = [
  "candle-gen-sdxl",
  "candle-nn",
  "candle-transformers",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -541,6 +583,7 @@ dependencies = [
  "candle-core",
  "candle-gen",
  "candle-nn",
+ "tempfile",
 ]
 
 [[package]]
@@ -568,6 +611,8 @@ dependencies = [
  "rand_distr",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -577,12 +622,16 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "candle-gen-pid",
+ "candle-llm",
  "candle-transformers",
  "image",
  "rand",
  "rand_distr",
+ "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -599,6 +648,8 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -609,8 +660,9 @@ dependencies = [
  "candle-gen-face",
  "candle-gen-pid",
  "candle-gen-sdxl",
- "image",
  "rand",
+ "sceneworks-gen-core-testkit",
+ "tempfile",
 ]
 
 [[package]]
@@ -636,6 +688,8 @@ dependencies = [
  "rand_distr",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -651,7 +705,10 @@ dependencies = [
  "rand",
  "rand_distr",
  "safetensors 0.7.0",
+ "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -667,6 +724,8 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -674,11 +733,16 @@ name = "candle-gen-ltx"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-llm",
  "image",
  "rand",
  "rand_distr",
+ "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
+ "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -693,9 +757,29 @@ dependencies = [
  "candle-transformers",
  "image",
  "rand",
+ "safetensors 0.7.0",
  "sceneworks-gen-core",
+ "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
+ "tempfile",
+ "tokenizers 0.22.2",
+]
+
+[[package]]
+name = "candle-gen-minimax-h3"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-gen-boogu",
+ "half",
+ "image",
+ "rand",
+ "safetensors 0.4.5",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -708,6 +792,7 @@ dependencies = [
  "image",
  "rand",
  "serde_json",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -732,9 +817,11 @@ dependencies = [
  "candle-gen-pid",
  "candle-nn",
  "candle-transformers",
+ "image",
  "rand",
  "rand_distr",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -749,6 +836,8 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -758,6 +847,7 @@ dependencies = [
  "candle-core",
  "candle-gen",
  "candle-nn",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -769,6 +859,10 @@ dependencies = [
  "candle-gen-pid",
  "image",
  "rand",
+ "safetensors 0.4.5",
+ "sceneworks-gen-core-testkit",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -783,6 +877,8 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -800,6 +896,8 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -818,6 +916,8 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokenizers 0.22.2",
  "tracing",
 ]
@@ -842,8 +942,11 @@ dependencies = [
  "image",
  "rand",
  "rand_distr",
+ "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -856,6 +959,9 @@ dependencies = [
  "rand",
  "rand_distr",
  "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -868,6 +974,8 @@ dependencies = [
  "rand_distr",
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
+ "serde_json",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -886,6 +994,8 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
@@ -906,6 +1016,7 @@ dependencies = [
  "core-llm",
  "core-llm-testkit",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 
@@ -1080,6 +1191,7 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
 ]
@@ -1388,6 +1500,23 @@ name = "esaxx-rs"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
+
+[[package]]
+name = "exr"
+version = "1.74.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "711fe42c9964295e01ee3fba3f9fe0e1d24b98886950d68efe81b1c76e21adf3"
+dependencies = [
+ "bit_field",
+ "half",
+ "lebe",
+ "miniz_oxide",
+ "num-complex",
+ "pulp 0.22.3",
+ "rayon-core",
+ "smallvec",
+ "zune-inflate",
+]
 
 [[package]]
 name = "fancy-regex"
@@ -1887,6 +2016,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "lebe"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2074,6 +2209,7 @@ dependencies = [
  "safetensors 0.4.5",
  "sceneworks-gen-core",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
 ]
@@ -2089,6 +2225,7 @@ dependencies = [
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2101,6 +2238,8 @@ dependencies = [
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokenizers 0.21.4",
 ]
 
@@ -2115,12 +2254,14 @@ dependencies = [
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
 name = "mlx-gen-catalog"
 version = "0.0.0"
 dependencies = [
+ "image",
  "mlx-gen",
  "mlx-gen-anima",
  "mlx-gen-bernini",
@@ -2140,6 +2281,7 @@ dependencies = [
  "mlx-gen-lens",
  "mlx-gen-ltx",
  "mlx-gen-mage",
+ "mlx-gen-minimax-h3",
  "mlx-gen-mochi",
  "mlx-gen-pid",
  "mlx-gen-pulid",
@@ -2155,6 +2297,8 @@ dependencies = [
  "mlx-gen-svd",
  "mlx-gen-wan",
  "mlx-gen-z-image",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
 ]
 
 [[package]]
@@ -2167,7 +2311,10 @@ dependencies = [
  "mlx-gen-pid",
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2206,7 +2353,11 @@ dependencies = [
  "mlx-gen-sdxl",
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
+ "safetensors 0.4.5",
+ "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2218,7 +2369,10 @@ dependencies = [
  "mlx-gen-pid",
  "mlx-llm",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2230,7 +2384,9 @@ dependencies = [
  "mlx-gen-flux2",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2243,6 +2399,8 @@ dependencies = [
  "mlx-gen-pid",
  "mlx-gen-sdxl",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
+ "tempfile",
 ]
 
 [[package]]
@@ -2263,6 +2421,11 @@ dependencies = [
  "mlx-gen-pid",
  "mlx-gen-sdxl",
  "pmetal-mlx-rs",
+ "safetensors 0.4.5",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2274,9 +2437,12 @@ dependencies = [
  "mlx-gen-boogu",
  "mlx-gen-pid",
  "mlx-gen-qwen-image",
+ "mlx-gen-wan",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2286,7 +2452,10 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-wan",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2298,7 +2467,9 @@ dependencies = [
  "mlx-gen-flux2",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2307,8 +2478,12 @@ version = "0.0.0"
 dependencies = [
  "image",
  "mlx-gen",
+ "mlx-llm",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2319,8 +2494,26 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-boogu",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "mlx-gen-minimax-h3"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "mlx-gen",
+ "mlx-gen-boogu",
+ "pmetal-mlx-rs",
+ "pmetal-mlx-sys",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokenizers 0.22.2",
 ]
 
 [[package]]
@@ -2332,6 +2525,7 @@ dependencies = [
  "mlx-gen-flux",
  "pmetal-mlx-rs",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2341,17 +2535,20 @@ dependencies = [
  "image",
  "mlx-gen",
  "pmetal-mlx-rs",
- "serde_json",
 ]
 
 [[package]]
 name = "mlx-gen-pulid"
 version = "0.0.0"
 dependencies = [
+ "image",
  "mlx-gen",
  "mlx-gen-face",
  "mlx-gen-flux",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2361,8 +2558,11 @@ dependencies = [
  "image",
  "mlx-gen",
  "mlx-gen-pid",
+ "mlx-gen-wan",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2371,6 +2571,7 @@ version = "0.0.0"
 dependencies = [
  "mlx-gen",
  "pmetal-mlx-rs",
+ "tempfile",
 ]
 
 [[package]]
@@ -2385,9 +2586,13 @@ dependencies = [
 name = "mlx-gen-sana"
 version = "0.0.0"
 dependencies = [
+ "image",
  "mlx-gen",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2397,8 +2602,11 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-wan",
  "pmetal-mlx-rs",
+ "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2411,7 +2619,10 @@ dependencies = [
  "mlx-gen-sdxl",
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2423,7 +2634,10 @@ dependencies = [
  "mlx-gen-pid",
  "pmetal-mlx-rs",
  "regex",
+ "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2432,8 +2646,10 @@ version = "0.0.0"
 dependencies = [
  "mlx-gen",
  "pmetal-mlx-rs",
+ "rayon",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2443,7 +2659,10 @@ dependencies = [
  "mlx-gen",
  "mlx-llm",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2455,6 +2674,9 @@ dependencies = [
  "mlx-gen-sdxl",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2464,7 +2686,9 @@ dependencies = [
  "image",
  "mlx-gen",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
  "unicode-normalization",
  "zip 8.6.0",
 ]
@@ -2477,14 +2701,17 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
+ "safetensors 0.4.5",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=932beb4e60db44d378ffa1fe648defea59b5cbd0#932beb4e60db44d378ffa1fe648defea59b5cbd0"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=d5a7fc018d713a37091e1cd102873eab355a00c6#d5a7fc018d713a37091e1cd102873eab355a00c6"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -2503,6 +2730,7 @@ dependencies = [
  "memmap2",
  "pmetal-mlx-rs",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 
@@ -2518,7 +2746,7 @@ dependencies = [
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=932beb4e60db44d378ffa1fe648defea59b5cbd0#932beb4e60db44d378ffa1fe648defea59b5cbd0"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=d5a7fc018d713a37091e1cd102873eab355a00c6#d5a7fc018d713a37091e1cd102873eab355a00c6"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
@@ -2814,7 +3042,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "pmetal-mlx-rs"
 version = "0.25.8"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=932beb4e60db44d378ffa1fe648defea59b5cbd0#932beb4e60db44d378ffa1fe648defea59b5cbd0"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=d5a7fc018d713a37091e1cd102873eab355a00c6#d5a7fc018d713a37091e1cd102873eab355a00c6"
 dependencies = [
  "dyn-clone",
  "half",
@@ -2837,11 +3065,12 @@ dependencies = [
 [[package]]
 name = "pmetal-mlx-sys"
 version = "0.2.4"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=932beb4e60db44d378ffa1fe648defea59b5cbd0#932beb4e60db44d378ffa1fe648defea59b5cbd0"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=d5a7fc018d713a37091e1cd102873eab355a00c6#d5a7fc018d713a37091e1cd102873eab355a00c6"
 dependencies = [
  "bindgen",
  "cc",
  "cmake",
+ "sha2",
 ]
 
 [[package]]
@@ -3102,6 +3331,7 @@ dependencies = [
  "candle-gen-catalog",
  "candle-llm",
  "runtime-catalog",
+ "sceneworks-gen-core-testkit",
 ]
 
 [[package]]
@@ -3109,9 +3339,16 @@ name = "runtime-macos"
 version = "0.0.0"
 dependencies = [
  "candle-audio-catalog",
+ "libc",
  "mlx-gen-catalog",
  "mlx-llm",
+ "pmetal-mlx-rs",
  "runtime-catalog",
+ "sceneworks-gen-core-testkit",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -3180,10 +3417,14 @@ name = "sceneworks-gen-core"
 version = "0.1.0"
 dependencies = [
  "core-llm",
+ "exr",
  "safetensors 0.4.5",
  "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
+ "windows-sys",
 ]
 
 [[package]]
@@ -3191,6 +3432,8 @@ name = "sceneworks-gen-core-testkit"
 version = "0.1.0"
 dependencies = [
  "sceneworks-gen-core",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -3378,6 +3621,19 @@ dependencies = [
  "libc",
  "thiserror 1.0.69",
  "walkdir",
+]
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom",
+ "once_cell",
+ "rustix",
+ "windows-sys",
 ]
 
 [[package]]
@@ -3891,6 +4147,15 @@ name = "zune-core"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb8a0807f7c01457d0379ba880ba6322660448ddebc890ce29bb64da71fb40f9"
+
+[[package]]
+name = "zune-inflate"
+version = "0.2.54"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73ab332fe2f6680068f3582b16a24f90ad7096d5d39b974d1c0aff0125116f02"
+dependencies = [
+ "simd-adler32",
+]
 
 [[package]]
 name = "zune-jpeg"

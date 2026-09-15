@@ -38,8 +38,23 @@
 use candle_core::{DType, Module, Result, Tensor, D};
 use candle_nn::{RmsNorm, VarBuilder};
 
+use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::train::gradient_checkpoint::Segment;
 use candle_gen::train::lora::{lora_linear_no_bias, LoraHost, LoraLinear};
+
+fn default_attention_plan() -> AttentionPlan<'static> {
+    AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+        candle_gen::ATTN_SCORES_BUDGET as u64,
+        false,
+    ))
+}
+
+fn into_candle_core(result: candle_gen::Result<Tensor>) -> Result<Tensor> {
+    result.map_err(|error| match error {
+        candle_gen::CandleError::Candle(error) => error,
+        other => candle_core::Error::Msg(other.to_string()),
+    })
+}
 
 // Reused verbatim from candle-transformers — frozen, non-adapter sub-modules + the patchify/RoPE
 // helpers. Vendoring these would add ~600 lines of drift surface for zero benefit (they hold no
@@ -147,6 +162,7 @@ impl ZImageAttention {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn forward(
         &self,
         hidden_states: &Tensor,
@@ -154,6 +170,23 @@ impl ZImageAttention {
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
+        into_candle_core(self.forward_with_attention_plan(
+            hidden_states,
+            attention_mask,
+            cos,
+            sin,
+            default_attention_plan(),
+        ))
+    }
+
+    pub fn forward_with_attention_plan(
+        &self,
+        hidden_states: &Tensor,
+        attention_mask: Option<&Tensor>,
+        cos: &Tensor,
+        sin: &Tensor,
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<Tensor> {
         let (b, seq_len, _) = hidden_states.dims3()?;
 
         // Project to Q, K, V (through the LoRA-adapted projections).
@@ -194,19 +227,19 @@ impl ZImageAttention {
             }
             None => None,
         };
-        let context = candle_gen::sdpa_budgeted_bhsd(
+        let context = candle_gen::sdpa_planned_bhsd(
             &q,
             &k,
             &v,
             scale,
             mask.as_ref(),
             |s| candle_nn::ops::softmax(s, D::Minus1),
-            candle_gen::ATTN_SCORES_BUDGET,
+            attention_plan,
         )?;
 
         // (B, n, seq, hd) -> (B, seq, dim)
         let context = context.transpose(1, 2)?.reshape((b, seq_len, ()))?;
-        context.apply(&self.to_out)
+        Ok(context.apply(&self.to_out)?)
     }
 }
 
@@ -276,6 +309,25 @@ impl ZImageTransformerBlock {
         sin: &Tensor,
         adaln_input: Option<&Tensor>,
     ) -> Result<Tensor> {
+        into_candle_core(self.forward_with_attention_plan(
+            x,
+            attn_mask,
+            cos,
+            sin,
+            adaln_input,
+            default_attention_plan(),
+        ))
+    }
+
+    pub fn forward_with_attention_plan(
+        &self,
+        x: &Tensor,
+        attn_mask: Option<&Tensor>,
+        cos: &Tensor,
+        sin: &Tensor,
+        adaln_input: Option<&Tensor>,
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<Tensor> {
         if let Some(ref adaln) = self.adaln_modulation {
             let adaln_input = adaln_input.expect("adaln_input required when modulation=true");
             let modulation = adaln_input.apply(adaln)?.unsqueeze(1)?;
@@ -291,7 +343,13 @@ impl ZImageTransformerBlock {
             // Attention block
             let normed = self.attention_norm1.forward_diff(x)?;
             let scaled = normed.broadcast_mul(&scale_msa)?;
-            let attn_out = self.attention.forward(&scaled, attn_mask, cos, sin)?;
+            let attn_out = self.attention.forward_with_attention_plan(
+                &scaled,
+                attn_mask,
+                cos,
+                sin,
+                attention_plan,
+            )?;
             let attn_out = self.attention_norm2.forward_diff(&attn_out)?;
             let x = (x + gate_msa.broadcast_mul(&attn_out)?)?;
 
@@ -300,17 +358,23 @@ impl ZImageTransformerBlock {
             let scaled = normed.broadcast_mul(&scale_mlp)?;
             let ffn_out = self.feed_forward.forward(&scaled)?;
             let ffn_out = self.ffn_norm2.forward_diff(&ffn_out)?;
-            x + gate_mlp.broadcast_mul(&ffn_out)?
+            Ok((x + gate_mlp.broadcast_mul(&ffn_out)?)?)
         } else {
             let normed = self.attention_norm1.forward_diff(x)?;
-            let attn_out = self.attention.forward(&normed, attn_mask, cos, sin)?;
+            let attn_out = self.attention.forward_with_attention_plan(
+                &normed,
+                attn_mask,
+                cos,
+                sin,
+                attention_plan,
+            )?;
             let attn_out = self.attention_norm2.forward_diff(&attn_out)?;
             let x = (x + attn_out)?;
 
             let normed = self.ffn_norm1.forward_diff(&x)?;
             let ffn_out = self.feed_forward.forward(&normed)?;
             let ffn_out = self.ffn_norm2.forward_diff(&ffn_out)?;
-            x + ffn_out
+            Ok((x + ffn_out)?)
         }
     }
 }
@@ -342,6 +406,8 @@ pub struct ZImageTransformer2DModel {
     pub(crate) layers: Vec<ZImageTransformerBlock>,
     pub(crate) rope_embedder: RopeEmbedder,
     pub(crate) cfg: Config,
+    #[cfg(test)]
+    prepare_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// The constant side tensors the **main** transformer layers and the final layer consume, produced
@@ -359,6 +425,22 @@ pub struct MainContext {
     unified_attn_mask: Tensor,
     img_seq_len: usize,
     orig_size: (usize, usize, usize),
+}
+
+/// Request-owned geometry and caption conditioning for dense/vendored Z-Image inference.
+pub(crate) struct PreparedConditioning {
+    geometry: (usize, usize, usize, usize, usize),
+    dtype: DType,
+    device: candle_core::DeviceLocation,
+    orig_size: (usize, usize, usize),
+    img_seq_len: usize,
+    x_cos: Tensor,
+    x_sin: Tensor,
+    x_attn_mask: Tensor,
+    cap: Tensor,
+    unified_cos: Tensor,
+    unified_sin: Tensor,
+    unified_attn_mask: Tensor,
 }
 
 impl ZImageTransformer2DModel {
@@ -441,7 +523,114 @@ impl ZImageTransformer2DModel {
             layers,
             rope_embedder,
             cfg: cfg.clone(),
+            #[cfg(test)]
+            prepare_calls: Default::default(),
         })
+    }
+
+    pub(crate) fn prepare_conditioning(
+        &self,
+        x: &Tensor,
+        cap_feats: &Tensor,
+        cap_mask: &Tensor,
+    ) -> Result<PreparedConditioning> {
+        #[cfg(test)]
+        self.prepare_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let device = x.device();
+        let (b, c, f, h, w) = x.dims5()?;
+        let patch_size = self.cfg.all_patch_size[0];
+        let f_patch_size = self.cfg.all_f_patch_size[0];
+        let (_patches, orig_size) = patchify(x, patch_size, f_patch_size)?;
+        let img_seq_len = (f / f_patch_size) * (h / patch_size) * (w / patch_size);
+        let text_len = cap_feats.dim(1)?;
+        let x_pos_ids = create_coordinate_grid(
+            (f / f_patch_size, h / patch_size, w / patch_size),
+            (text_len + 1, 0, 0),
+            device,
+        )?;
+        let (x_cos, x_sin) = self.rope_embedder.forward(&x_pos_ids)?;
+        let cap_pos_ids = create_coordinate_grid((text_len, 1, 1), (1, 0, 0), device)?;
+        let (cap_cos, cap_sin) = self.rope_embedder.forward(&cap_pos_ids)?;
+        let x_attn_mask = Tensor::ones((b, img_seq_len), DType::U8, device)?;
+        let cap_attn_mask = cap_mask.to_dtype(DType::U8)?;
+        let cap_normed = self.cap_embedder_norm.forward_diff(cap_feats)?;
+        let mut cap = cap_normed.apply(&self.cap_embedder_linear)?;
+        for layer in &self.context_refiner {
+            cap = layer.forward(&cap, Some(&cap_attn_mask), &cap_cos, &cap_sin, None)?;
+        }
+        let unified_pos_ids = Tensor::cat(&[&x_pos_ids, &cap_pos_ids], 0)?;
+        let (unified_cos, unified_sin) = self.rope_embedder.forward(&unified_pos_ids)?;
+        let unified_attn_mask = Tensor::cat(&[&x_attn_mask, &cap_attn_mask], 1)?;
+        Ok(PreparedConditioning {
+            geometry: (b, c, f, h, w),
+            dtype: x.dtype(),
+            device: device.location(),
+            orig_size,
+            img_seq_len,
+            x_cos,
+            x_sin,
+            x_attn_mask,
+            cap,
+            unified_cos,
+            unified_sin,
+            unified_attn_mask,
+        })
+    }
+
+    pub(crate) fn forward_prepared(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        prepared: &PreparedConditioning,
+    ) -> Result<Tensor> {
+        let geometry = x.dims5()?;
+        if geometry != prepared.geometry
+            || x.dtype() != prepared.dtype
+            || x.device().location() != prepared.device
+        {
+            candle_core::bail!(
+                "z-image: prepared conditioning geometry, dtype, or device does not match latent"
+            )
+        }
+        let t_scaled = (t * self.cfg.t_scale)?;
+        let adaln_input = self.t_embedder.forward(&t_scaled)?;
+        let (x_patches, _) = patchify(x, self.cfg.all_patch_size[0], self.cfg.all_f_patch_size[0])?;
+        let mut x = x_patches.apply(&self.x_embedder)?;
+        for layer in &self.noise_refiner {
+            x = layer.forward(
+                &x,
+                Some(&prepared.x_attn_mask),
+                &prepared.x_cos,
+                &prepared.x_sin,
+                Some(&adaln_input),
+            )?;
+        }
+        let mut unified = Tensor::cat(&[&x, &prepared.cap], 1)?;
+        for layer in &self.layers {
+            unified = layer.forward(
+                &unified,
+                Some(&prepared.unified_attn_mask),
+                &prepared.unified_cos,
+                &prepared.unified_sin,
+                Some(&adaln_input),
+            )?;
+        }
+        let x_out = unified.narrow(1, 0, prepared.img_seq_len)?;
+        let x_out = self.final_layer.forward(&x_out, &adaln_input)?;
+        unpatchify(
+            &x_out,
+            prepared.orig_size,
+            self.cfg.all_patch_size[0],
+            self.cfg.all_f_patch_size[0],
+            self.cfg.in_channels,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_calls(&self) -> usize {
+        self.prepare_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Forward pass — returns the **raw** DiT velocity `(B, C, F, H, W)` (no sign flip; the inference
@@ -689,6 +878,47 @@ mod parity_tests {
             .to_scalar::<f32>()
             .unwrap();
         assert!(diff < 1e-5, "vendored DiT diverged from stock by {diff}");
+    }
+
+    #[test]
+    fn prepared_dense_conditioning_is_reused_by_actual_forwards_and_rejects_stale_keys() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let model =
+            ZImageTransformer2DModel::new(&cfg, VarBuilder::from_varmap(&vm, DType::F32, &dev))
+                .unwrap();
+        let latent = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 4, 4), &dev).unwrap();
+        let cap = Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &dev).unwrap();
+        let inputs = prepare_inputs(&latent, std::slice::from_ref(&cap), &dev).unwrap();
+        let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
+        let mut prepared = model
+            .prepare_conditioning(&inputs.latents, &inputs.cap_feats, &inputs.cap_mask)
+            .unwrap();
+        assert_eq!(model.prepare_calls(), 1);
+        let first = model
+            .forward_prepared(&inputs.latents, &t, &prepared)
+            .unwrap();
+        let second = model
+            .forward_prepared(&inputs.latents, &t, &prepared)
+            .unwrap();
+        assert_eq!(
+            first.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            second.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+        assert_eq!(
+            model.prepare_calls(),
+            1,
+            "actual forwards must not reconstruct request conditioning"
+        );
+        let stale = Tensor::zeros((1, cfg.in_channels, 1, 6, 4), DType::F32, &dev).unwrap();
+        assert!(model.forward_prepared(&stale, &t, &prepared).is_err());
+        let wrong_dtype = inputs.latents.to_dtype(DType::F64).unwrap();
+        assert!(model.forward_prepared(&wrong_dtype, &t, &prepared).is_err());
+        prepared.device = candle_core::DeviceLocation::Metal { gpu_id: 5 };
+        assert!(model
+            .forward_prepared(&inputs.latents, &t, &prepared)
+            .is_err());
     }
 
     /// The [`LoraHost`] walk reaches exactly `4 × (n_refiner·2 + n_layers)` projections — the four

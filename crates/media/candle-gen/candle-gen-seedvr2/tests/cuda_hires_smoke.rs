@@ -11,7 +11,7 @@
 //! ```text
 //! set SEEDVR2_CKPT=D:\sceneworks-seedvr2-validate\ckpt
 //! set SEEDVR2_DTYPE=bf16
-//! cargo test -p candle-gen-seedvr2 --features cuda --release --test cuda_hires_smoke -- --ignored --nocapture
+//! cargo test -p candle-gen-seedvr2 --features cuda --release --test integration cuda_hires_smoke:: -- --ignored --nocapture
 //! ```
 
 use candle_gen::candle_core::DType;

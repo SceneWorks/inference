@@ -10,7 +10,7 @@
 //!
 //! Requires the converted snapshot's `mllm/tokenizer.json`; `#[ignore]` otherwise (the tokenizer is
 //! ~11 MB, not committed). Run:
-//!   `cargo test -p mlx-gen-bernini --test template_parity -- --ignored --nocapture`
+//!   `cargo test -p mlx-gen-bernini --test integration template_parity:: -- --ignored --nocapture`
 
 use std::path::PathBuf;
 
@@ -18,14 +18,39 @@ use mlx_gen::weights::Weights;
 use mlx_gen_bernini::process::generate_unified_inputs;
 use mlx_gen_bernini::template::{BerniniTemplate, TemplateOutput};
 
+use crate::common;
+
+use common::{
+    SHARED_FIXTURE_TEMPLATE_IMAGE_TOKEN_NUMS, SHARED_FIXTURE_TEMPLATE_INPUT_IMAGE_HW,
+    SHARED_FIXTURE_TEMPLATE_INPUT_VIDEO_COUNT, SHARED_FIXTURE_TEMPLATE_OUTPUT_H,
+    SHARED_FIXTURE_TEMPLATE_OUTPUT_T, SHARED_FIXTURE_TEMPLATE_OUTPUT_W,
+    SHARED_FIXTURE_TEMPLATE_PROMPTS, SHARED_FIXTURE_TEMPLATE_TASKS,
+    SHARED_FIXTURE_TEMPLATE_VIDEO_TOKEN_NUMS,
+};
+
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/template_golden.safetensors"
 );
 
+/// The converted-snapshot store these tests assemble into.
+///
+/// `MLX_GEN_CONVERTED_ROOT` overrides it. The `$HOME` default stays because this is a **derived
+/// cache** the tests build themselves from a caller-provisioned HF snapshot — not a provided input,
+/// which is why it takes a fallback rather than the hard epic-13657 requirement `MLX_GEN_MODELS_ROOT`
+/// and the `*_SRC` variables carry. Without the override, pointing the suite at a real store did
+/// nothing: resolution read `$HOME` unconditionally and the rows skipped or mis-resolved while still
+/// reporting green.
+fn converted_root() -> PathBuf {
+    std::env::var("MLX_GEN_CONVERTED_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").expect("HOME")).join(".cache/mlx-gen-models")
+        })
+}
+
 fn snapshot() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap())
-        .join(".cache/mlx-gen-models/bernini_planner_mlx_bf16")
+    converted_root().join("bernini_planner_mlx_bf16")
 }
 
 fn want_i32(w: &Weights, key: &str) -> Vec<i32> {
@@ -40,32 +65,23 @@ fn want_i32(w: &Weights, key: &str) -> Vec<i32> {
 /// token_num = t·(h/2)·(w/2).
 #[allow(clippy::type_complexity)]
 fn cases() -> Vec<(&'static str, Vec<serde_json::Value>, Vec<i64>, Vec<i64>)> {
-    vec![
-        (
-            "t2i",
-            generate_unified_inputs("a cat", &[], 0, 1, 64, 64),
-            vec![4],
-            vec![],
-        ),
-        (
-            "i2i",
-            generate_unified_inputs("edit", &[(48, 72)], 0, 1, 64, 64),
-            vec![6, 4],
-            vec![],
-        ),
-        (
-            "r2v",
-            generate_unified_inputs("subj", &[(72, 48)], 0, 9, 64, 64),
-            vec![6],
-            vec![12],
-        ),
-        (
-            "rv2v",
-            generate_unified_inputs("edit v", &[], 1, 9, 64, 64),
-            vec![],
-            vec![12, 20],
-        ),
-    ]
+    (0..SHARED_FIXTURE_TEMPLATE_TASKS.len())
+        .map(|i| {
+            (
+                SHARED_FIXTURE_TEMPLATE_TASKS[i],
+                generate_unified_inputs(
+                    SHARED_FIXTURE_TEMPLATE_PROMPTS[i],
+                    SHARED_FIXTURE_TEMPLATE_INPUT_IMAGE_HW[i],
+                    SHARED_FIXTURE_TEMPLATE_INPUT_VIDEO_COUNT[i],
+                    SHARED_FIXTURE_TEMPLATE_OUTPUT_T[i],
+                    SHARED_FIXTURE_TEMPLATE_OUTPUT_H,
+                    SHARED_FIXTURE_TEMPLATE_OUTPUT_W,
+                ),
+                SHARED_FIXTURE_TEMPLATE_IMAGE_TOKEN_NUMS[i].to_vec(),
+                SHARED_FIXTURE_TEMPLATE_VIDEO_TOKEN_NUMS[i].to_vec(),
+            )
+        })
+        .collect()
 }
 
 #[test]

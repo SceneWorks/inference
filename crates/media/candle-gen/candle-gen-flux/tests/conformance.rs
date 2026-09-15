@@ -11,7 +11,7 @@
 //! ```text
 //! set FLUX_SCHNELL_SNAPSHOT=C:\Users\…\models--black-forest-labs--FLUX.1-schnell\snapshots\<hash>
 //! set FLUX_DEV_SNAPSHOT=C:\Users\…\models--black-forest-labs--FLUX.1-dev\snapshots\<hash>
-//! cargo test -p candle-gen-flux --features cuda --release --test conformance -- --ignored
+//! cargo test -p candle-gen-flux --features cuda --release --test integration conformance:: -- --ignored
 //! ```
 //!
 //! Passing the suite is the parity evidence sc-3694 asks for: it locks **output dims** (request WxH

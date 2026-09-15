@@ -20,10 +20,12 @@
 //! mapped through this same LTX key→module table, and installed as a forward-time residual carrying
 //! the same per-pass strength as LoRA.
 //!
-//! **Skips, never errors-on-skip.** Mirrors the reference (`apply_loras_to_weights` counts skipped
-//! modules, never raises): audio / `av_ca` / `a2v` targets (the video-only port has no such modules)
-//! and the PixArt-spelled adaLN embedder (`linear_1/2` ≠ the checkpoint's `linear1/2`) resolve to no
-//! module and are reported, not dropped. We error only if a non-empty spec list matched *nothing*.
+//! **Skips, never errors-on-skip.** The LTX-2.3 route mirrors the reference
+//! (`apply_loras_to_weights` counts skipped modules, never raises): audio / `av_ca` / `a2v` targets
+//! (the video-only port has no such modules) and the PixArt-spelled adaLN embedder (`linear_1/2` ≠
+//! the checkpoint's `linear1/2`) resolve to no module and are reported, not dropped. LTX-2.5's
+//! stricter route aliases its published `linear_1/2` targets to the converted MLX base names and
+//! requires every pair to resolve. We error only if a non-empty 2.3 spec list matched *nothing*.
 
 use std::collections::BTreeMap;
 
@@ -44,8 +46,8 @@ use crate::transformer::LtxAdaptable;
 const PREFIXES: [&str; 3] = ["model.diffusion_model.", "diffusion_model.", "model."];
 
 /// Outcome of applying the LTX adapter specs: residuals installed and the LoRA module paths that
-/// resolved to no target (surfaced, never silently dropped — audio/av_ca/a2v and PixArt-spelled
-/// adaLN embedder leaves).
+/// resolved to no target (surfaced, never silently dropped — audio/av_ca/a2v and, on the 2.3
+/// compatibility route, PixArt-spelled adaLN embedder leaves).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct LtxLoraReport {
     pub applied: usize,
@@ -90,6 +92,25 @@ pub(crate) fn normalize_ltx_key(key: &str) -> String {
     t = t.replace(".audio_ff.net.2.", ".audio_ff.proj_out.");
     t = t.replace(".audio_ff.net.2", ".audio_ff.proj_out");
     t
+}
+
+/// Normalize the published LTX-2.5 LoRA namespace onto the converted MLX checkpoint namespace.
+///
+/// The public base checkpoint is converted from diffusers' `linear_1/linear_2` spelling to the
+/// provider's `linear1/linear2` spelling by `convert.rs`. The official distilled LoRA deliberately
+/// remains in diffusers spelling, including all eight video/audio/cross-stream timestep embedders.
+/// Keep this alias scoped to the strict 2.5 route: LTX-2.3 compatibility preserves the reference's
+/// historical skip/report behavior for third-party PixArt-spelled targets.
+fn normalize_ltx25_key(key: &str) -> String {
+    normalize_ltx_key(key)
+        .replace(
+            ".emb.timestep_embedder.linear_1",
+            ".emb.timestep_embedder.linear1",
+        )
+        .replace(
+            ".emb.timestep_embedder.linear_2",
+            ".emb.timestep_embedder.linear2",
+        )
 }
 
 /// Suffix → role, longest-first. PEFT `lora_A/B`, kohya `lora_down/up`, the peft-export `.default`
@@ -194,6 +215,16 @@ fn pass_strengths(spec: &AdapterSpec, num_passes: usize) -> Result<Vec<f32>> {
             spec.path.display()
         )));
     }
+    if let Some((pass, scale)) = scales
+        .iter()
+        .enumerate()
+        .find(|(_, scale)| !scale.is_finite())
+    {
+        return Err(Error::Msg(format!(
+            "ltx_2_3 adapter {}: effective scale for pass {pass} must be finite (got {scale})",
+            spec.path.display()
+        )));
+    }
     Ok(scales)
 }
 
@@ -203,10 +234,101 @@ fn pass_strengths(spec: &AdapterSpec, num_passes: usize) -> Result<Vec<f32>> {
 /// uses [`pass_strengths`] directly — no fold here.)
 fn pass_scales(spec: &AdapterSpec, alpha: f32, rank: f32, num_passes: usize) -> Result<Vec<f32>> {
     let eff = |strength: f32| ((alpha as f64 / rank as f64) * strength as f64) as f32;
-    Ok(pass_strengths(spec, num_passes)?
+    let scales: Vec<f32> = pass_strengths(spec, num_passes)?
         .into_iter()
         .map(eff)
-        .collect())
+        .collect();
+    if let Some((pass, scale)) = scales
+        .iter()
+        .enumerate()
+        .find(|(_, scale)| !scale.is_finite())
+    {
+        return Err(Error::Msg(format!(
+            "ltx_2_3 adapter {}: effective LoRA scale for pass {pass} must be finite (got {scale})",
+            spec.path.display()
+        )));
+    }
+    Ok(scales)
+}
+
+fn require_spec_applied(
+    spec: &AdapterSpec,
+    applied_before: usize,
+    applied_after: usize,
+) -> Result<()> {
+    if applied_after == applied_before {
+        return Err(Error::Msg(format!(
+            "ltx_2_3 adapter {} matched no target module — every selected adapter must apply",
+            spec.path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// LTX-2.5's published adapters carry a file-wide, explicit scale contract.  Unlike the older
+/// 2.3 community formats, the split provider must not guess a rank from a factor or quietly
+/// substitute a per-target default: doing so can make a formally accepted adapter inert or apply
+/// it at the wrong strength.
+#[derive(Clone, Copy, Debug)]
+struct Ltx25Scale {
+    rank: i32,
+    alpha: f32,
+}
+
+fn ltx25_scale(
+    rank: Option<&str>,
+    alpha: Option<&str>,
+    source: &std::path::Path,
+) -> Result<Ltx25Scale> {
+    let rank = rank.ok_or_else(|| {
+        Error::Msg(format!(
+            "ltx_2_5 adapter {} is missing required `lora_rank` safetensors metadata",
+            source.display()
+        ))
+    })?;
+    let rank = rank.parse::<i32>().map_err(|_| {
+        Error::Msg(format!(
+            "ltx_2_5 adapter {} has non-positive-integer `lora_rank` metadata `{rank}`",
+            source.display()
+        ))
+    })?;
+    if rank == 0 {
+        return Err(Error::Msg(format!(
+            "ltx_2_5 adapter {} has invalid `lora_rank` metadata 0",
+            source.display()
+        )));
+    }
+    let alpha = alpha.ok_or_else(|| {
+        Error::Msg(format!(
+            "ltx_2_5 adapter {} is missing required `lora_alpha` safetensors metadata",
+            source.display()
+        ))
+    })?;
+    let parse_alpha = |value: &str| -> Result<f32> {
+        let value = value.parse::<f32>().map_err(|_| {
+            Error::Msg(format!(
+                "ltx_2_5 adapter {} has non-numeric `lora_alpha` metadata `{value}`",
+                source.display()
+            ))
+        })?;
+        if !value.is_finite() || value <= 0.0 {
+            return Err(Error::Msg(format!(
+                "ltx_2_5 adapter {} has invalid `lora_alpha` metadata {value}",
+                source.display()
+            )));
+        }
+        Ok(value)
+    };
+    Ok(Ltx25Scale {
+        rank,
+        alpha: parse_alpha(alpha)?,
+    })
+}
+
+/// Published LTX-2.5 distilled factors use the declared decomposition rank until a projection
+/// dimension is smaller, at which point the physical factor width is capped to that dimension.
+fn ltx25_factor_rank(declared_rank: i32, in_features: i32, out_features: i32) -> i32 {
+    declared_rank.min(in_features).min(out_features)
 }
 
 /// Install one LoRA file's residuals onto `host` at `spec`'s strength, accumulating into `report`.
@@ -215,6 +337,7 @@ fn apply_one(
     w: &Weights,
     spec: &AdapterSpec,
     num_passes: usize,
+    strict_25: Option<Ltx25Scale>,
     report: &mut LtxLoraReport,
 ) -> Result<()> {
     // Group factors by normalized module path.
@@ -226,7 +349,11 @@ fn apply_one(
         else {
             continue; // not a LoRA factor key (base weight / bundled extra) — ignore.
         };
-        let path = normalize_ltx_key(stem);
+        let path = if strict_25.is_some() {
+            normalize_ltx25_key(stem)
+        } else {
+            normalize_ltx_key(stem)
+        };
         let parts = groups.entry(path).or_default();
         match role {
             Role::Down => parts.down = Some(w.require(&key)?.clone()),
@@ -246,16 +373,61 @@ fn apply_one(
             report.skipped.push(path);
             continue;
         };
+        if down.ndim() != 2 || up.ndim() != 2 || down.shape()[0] == 0 || up.shape()[0] == 0 {
+            return Err(Error::Msg(format!(
+                "ltx adapter {} target `{path}` must have non-empty rank-2 A/B factors",
+                spec.path.display()
+            )));
+        }
+        if down.shape()[0] != up.shape()[1] {
+            return Err(Error::Msg(format!(
+                "ltx adapter {} target `{path}` has incompatible A/B factor shapes {:?} / {:?}",
+                spec.path.display(),
+                down.shape(),
+                up.shape()
+            )));
+        }
         let segs: Vec<&str> = path.split('.').collect();
         // Effective scaling: per-target `.alpha` tensor → `alpha_pattern`/`lora_alpha` blob → factor
         // rank (today's default). The denominator honors the blob `r`/`rank_pattern` when given
         // (always `> 0`), else the stored `down` leading dim (which equals it for a well-formed file).
         let (cfg_alpha, cfg_rank) = cfg.as_ref().map_or((None, None), |c| c.effective(&path));
-        let rank = cfg_rank.unwrap_or(down.shape()[0] as f32);
-        let alpha = parts.alpha.or(cfg_alpha).unwrap_or(rank);
+        let (rank, alpha) = match strict_25 {
+            Some(contract) => {
+                let expected = ltx25_factor_rank(contract.rank, down.shape()[1], up.shape()[0]);
+                if down.shape()[0] != expected {
+                    return Err(Error::Msg(format!(
+                        "ltx_2_5 adapter {} target `{path}` has factor rank {} but declares lora_rank {}; projection [{}, {}] requires factor rank {expected}",
+                        spec.path.display(),
+                        down.shape()[0],
+                        contract.rank,
+                        up.shape()[0],
+                        down.shape()[1]
+                    )));
+                }
+                (contract.rank as f32, contract.alpha)
+            }
+            None => {
+                let rank = cfg_rank.unwrap_or(down.shape()[0] as f32);
+                let alpha = parts.alpha.or(cfg_alpha).unwrap_or(rank);
+                (rank, alpha)
+            }
+        };
         let scales = pass_scales(spec, alpha, rank, num_passes)?;
         match host.adaptable_mut(&segs) {
             Some(lin) => {
+                if strict_25.is_some() {
+                    let base = lin.base_shape();
+                    if down.shape()[1] != base[1] || up.shape()[0] != base[0] {
+                        return Err(Error::Msg(format!(
+                            "ltx_2_5 adapter {} target `{path}` factor shapes {:?} / {:?} do not match base {:?}",
+                            spec.path.display(),
+                            down.shape(),
+                            up.shape(),
+                            base
+                        )));
+                    }
+                }
                 // Residual form: a = Aᵀ [in, rank], b = Bᵀ [rank, out]; factors keep their loaded
                 // (bf16) dtype so the residual promotes against the activation like the reference.
                 lin.push_lora(down.t(), up.t(), scales);
@@ -332,8 +504,8 @@ fn apply_one_thirdparty<G>(
 /// Install every adapter in `specs` onto the LTX transformer, stacking in order (sc-2687 LoRA /
 /// sc-2393 LoKr). `num_passes` is the distilled pipeline's denoise-pass count (for validating +
 /// expanding `pass_scales`). LoRA (PEFT/kohya) and LoKr (`networkType=lokr`) are dispatched by the
-/// file's metadata / the spec kind. Errors only if a non-empty spec list matched no target module
-/// (a format/prefix misconfiguration); per-key skips are reported, not fatal.
+/// file's metadata / the spec kind. Every selected file must match at least one target module;
+/// a valid earlier file cannot mask a later zero-match file. Per-key skips are reported, not fatal.
 pub fn apply_ltx_adapters(
     host: &mut impl LtxAdaptable,
     specs: &[AdapterSpec],
@@ -341,7 +513,9 @@ pub fn apply_ltx_adapters(
 ) -> Result<LtxLoraReport> {
     let mut report = LtxLoraReport::default();
     for spec in specs {
+        let applied_before = report.applied;
         let w = Weights::from_file(&spec.path)?;
+        w.materialize()?;
         // The file's metadata is authoritative; the spec kind is an additional hint. A spec that
         // declares Lora but whose file says `networkType=lokr` is a caller error (the LoRA loader
         // would find no `lora_A/B` and apply nothing) — route by the file so it is never mis-applied.
@@ -369,16 +543,55 @@ pub fn apply_ltx_adapters(
                 &mut report,
             )?;
         } else {
-            apply_one(host, &w, spec, num_passes, &mut report)?;
+            apply_one(host, &w, spec, num_passes, None, &mut report)?;
         }
+        require_spec_applied(spec, applied_before, report.applied)?;
     }
-    if !specs.is_empty() && report.applied == 0 {
-        return Err(Error::Msg(format!(
-            "ltx_2_3 adapters: no target modules matched across {} file(s) — check the format \
-             (expected PEFT `lora_A/B` or kohya `lora_down/up`, or LoKr `lokr_w1/w2`, with \
-             `diffusion_model.` / `transformer_blocks.*` naming)",
-            specs.len()
-        )));
+    Ok(report)
+}
+
+/// Install a split LTX-2.5 LoRA stack.  This deliberately has a stricter contract than
+/// [`apply_ltx_adapters`]: every selected file must be a LoRA file, declare `lora_rank` and
+/// `lora_alpha`, have the exact factor rank implied by the declaration and projection dimensions,
+/// and resolve every factor pair to the loaded DiT. Keeping the policy at the provider seam
+/// prevents a valid 2.3 compatibility fallback from weakening the 2.5 route.
+pub fn apply_ltx25_adapters(
+    host: &mut impl LtxAdaptable,
+    specs: &[AdapterSpec],
+    num_passes: usize,
+) -> Result<LtxLoraReport> {
+    let mut report = LtxLoraReport::default();
+    for spec in specs {
+        if spec.kind != AdapterKind::Lora {
+            return Err(Error::Msg(format!(
+                "ltx_2_5 adapter {} must be declared LoRA; LoKr is not supported by this route",
+                spec.path.display()
+            )));
+        }
+        let w = Weights::from_file(&spec.path)?;
+        w.materialize()?;
+        if is_lokr(&w) || is_lokr_keys(&w) || is_loha_keys(&w) {
+            return Err(Error::Msg(format!(
+                "ltx_2_5 adapter {} is not a PEFT/Kohya LoRA file",
+                spec.path.display()
+            )));
+        }
+        let contract = ltx25_scale(
+            w.metadata("lora_rank"),
+            w.metadata("lora_alpha"),
+            &spec.path,
+        )?;
+        let applied_before = report.applied;
+        let skipped_before = report.skipped.len();
+        apply_one(host, &w, spec, num_passes, Some(contract), &mut report)?;
+        require_spec_applied(spec, applied_before, report.applied)?;
+        if report.skipped.len() != skipped_before {
+            return Err(Error::Msg(format!(
+                "ltx_2_5 adapter {} contains target(s) that do not resolve on the loaded DiT: {}",
+                spec.path.display(),
+                report.skipped[skipped_before..].join(", ")
+            )));
+        }
     }
     Ok(report)
 }
@@ -386,6 +599,64 @@ pub fn apply_ltx_adapters(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ltx25_header_requires_declared_450_rank_and_alpha_without_fallback() {
+        let source = std::path::Path::new("synthetic-450.safetensors");
+        let scale = ltx25_scale(Some("450"), Some("450"), source).unwrap();
+        assert_eq!(scale.rank, 450);
+        assert_eq!(scale.alpha, 450.0);
+
+        let missing_rank = ltx25_scale(None, Some("450"), source)
+            .unwrap_err()
+            .to_string();
+        assert!(missing_rank.contains("lora_rank"), "{missing_rank}");
+        let missing_alpha = ltx25_scale(Some("450"), None, source)
+            .unwrap_err()
+            .to_string();
+        assert!(missing_alpha.contains("lora_alpha"), "{missing_alpha}");
+
+        let fractional_rank = ltx25_scale(Some("450.5"), Some("450"), source)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            fractional_rank.contains("non-positive-integer `lora_rank`"),
+            "{fractional_rank}"
+        );
+    }
+
+    #[test]
+    fn ltx25_declared_rank_caps_to_projection_dimensions_exactly() {
+        assert_eq!(ltx25_factor_rank(450, 4096, 4096), 450);
+        assert_eq!(ltx25_factor_rank(450, 2048, 32), 32);
+        assert_eq!(ltx25_factor_rank(450, 256, 2048), 256);
+        assert_eq!(ltx25_factor_rank(450, 128, 4096), 128);
+    }
+
+    #[test]
+    fn ltx25_published_timestep_targets_alias_only_on_the_strict_route() {
+        for controller in [
+            "adaln_single",
+            "prompt_adaln_single",
+            "audio_adaln_single",
+            "audio_prompt_adaln_single",
+            "av_ca_video_scale_shift_adaln_single",
+            "av_ca_audio_scale_shift_adaln_single",
+            "av_ca_a2v_gate_adaln_single",
+            "av_ca_v2a_gate_adaln_single",
+        ] {
+            for (published, converted) in [("linear_1", "linear1"), ("linear_2", "linear2")] {
+                let published =
+                    format!("diffusion_model.{controller}.emb.timestep_embedder.{published}");
+                let converted = format!("{controller}.emb.timestep_embedder.{converted}");
+                assert_eq!(normalize_ltx25_key(&published), converted);
+                assert!(
+                    normalize_ltx_key(&published).contains("linear_"),
+                    "the LTX-2.3 normalizer must retain its established skip/report spelling"
+                );
+            }
+        }
+    }
 
     /// sc-13019: the file-derived inventory the `#[ignore]`d multi-surface gates assert against —
     /// synthetic keys so the pairing/normalization/classification logic itself runs in CI.
@@ -563,6 +834,32 @@ mod tests {
         // The default (no pass_scales) still yields the single uniform strength.
         let plain = AdapterSpec::new("x.safetensors".into(), 0.5, AdapterKind::Lora);
         assert_eq!(pass_strengths(&plain, 2).unwrap(), vec![0.5]);
+    }
+
+    #[test]
+    fn non_finite_spec_and_pass_scales_are_rejected() {
+        let nan = AdapterSpec::new("nan.safetensors".into(), f32::NAN, AdapterKind::Lora);
+        assert!(pass_strengths(&nan, 2).is_err());
+
+        let mut infinite = AdapterSpec::new("inf.safetensors".into(), 1.0, AdapterKind::Lora);
+        infinite.pass_scales = Some(vec![1.0, f32::INFINITY]);
+        assert!(pass_strengths(&infinite, 2).is_err());
+
+        let overflow = AdapterSpec::new("overflow.safetensors".into(), f32::MAX, AdapterKind::Lora);
+        assert!(pass_scales(&overflow, f32::MAX, 1.0, 2).is_err());
+    }
+
+    #[test]
+    fn valid_adapter_cannot_mask_later_zero_match_spec() {
+        let valid = AdapterSpec::new("valid.safetensors".into(), 1.0, AdapterKind::Lora);
+        let unmatched = AdapterSpec::new("unmatched.safetensors".into(), 1.0, AdapterKind::Lora);
+
+        require_spec_applied(&valid, 0, 1).unwrap();
+        let err = require_spec_applied(&unmatched, 1, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unmatched.safetensors"), "{err}");
+        assert!(err.contains("every selected adapter must apply"), "{err}");
     }
 
     /// sc-3671: the LTX crate reconstructs third-party LoKr/LoHa deltas (via the shared core pub

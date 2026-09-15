@@ -79,10 +79,10 @@ fn packed_linear_round_trips(bits: usize) -> Result<()> {
         dense(1, 128, 3.0),
     );
 
-    let tmp = std::env::temp_dir().join(format!(
-        "sc11990_seam_q{bits}_{}.safetensors",
-        std::process::id()
-    ));
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard
+        .path()
+        .join(format!("sc11990_seam_q{bits}.safetensors"));
     candle_gen::candle_core::safetensors::save(&map, &tmp)?;
     // SAFETY: freshly written, single-reader for the test.
     let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -104,7 +104,6 @@ fn packed_linear_round_trips(bits: usize) -> Result<()> {
         "Q{bits}: packed-load forward cosine {cos:.6} vs dense too low"
     );
 
-    std::fs::remove_file(&tmp).ok();
     Ok(())
 }
 
@@ -122,14 +121,14 @@ fn q8_packed_linear_round_trips_through_the_seam() -> Result<()> {
 /// current raw diffusers checkpoint keeps every DiT Linear dense, byte-identical to before.
 #[test]
 fn dense_leaf_stays_dense() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
     let dev = Device::Cpu;
     let (out_dim, in_dim) = (64usize, 128usize);
     let w = dense(out_dim, in_dim, 1.0);
     let mut map: HashMap<String, Tensor> = HashMap::new();
     map.insert("transformer_blocks.0.attn1.to_q.weight".into(), w);
 
-    let tmp =
-        std::env::temp_dir().join(format!("sc11990_dense_{}.safetensors", std::process::id()));
+    let tmp = tmp.path().join("sc11990_dense.safetensors");
     candle_gen::candle_core::safetensors::save(&map, &tmp)?;
     // SAFETY: freshly written, single-reader.
     let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -144,7 +143,6 @@ fn dense_leaf_stays_dense() -> Result<()> {
     )?;
     assert!(!lin.is_quantized(), "no `.scales` ⇒ dense arm");
 
-    std::fs::remove_file(&tmp).ok();
     Ok(())
 }
 

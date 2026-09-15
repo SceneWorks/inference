@@ -13,8 +13,8 @@
 //! is wired and parity-proven.
 
 use mlx_gen::{
-    curated_scheduler_names, default_seed, schedule_sigmas, AlphaSchedule, Capabilities,
-    Conditioning, ConditioningKind, DiffusionSampler, DiscreteModelSampling, Error,
+    curated_scheduler_names, default_seed, schedule_sigmas, ActivationMemoryAnchor, AlphaSchedule,
+    Capabilities, Conditioning, ConditioningKind, DiffusionSampler, DiscreteModelSampling, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder, LcmSampler,
     LightningSampler, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress,
     Quant, Residency, Result, Scheduler, Solver, TcdSampler, WeightsSource,
@@ -32,15 +32,19 @@ use crate::inpaint::{preprocess_mask, InpaintBlend};
 use crate::ip_adapter::IpImageEncoder;
 use crate::loader;
 use crate::pipeline::{
-    decode_image, denoise, denoise_cfgpp, denoise_curated, denoise_inpaint, denoise_ip,
-    denoise_multi_control, encode_conditioning, encode_init_latents, preprocess_control_image,
-    text_time_ids, ControlContext, Denoiser,
+    denoise_cfgpp_with_preview, denoise_curated_with_preview, denoise_inpaint_with_preview,
+    denoise_ip_with_preview, denoise_multi_control_with_preview, denoise_with_preview,
+    encode_conditioning_windows, encode_init_latents, preprocess_control_image, text_time_ids,
+    ControlContext, Denoiser,
 };
 use crate::sampler::{AncestralEuler, EulerSampler};
 use crate::text_encoder::ClipTextEncoder;
 use crate::tokenizer::ClipBpeTokenizer;
 use crate::unet::{ControlNet, UNet2DConditionModel};
 use crate::vae::Autoencoder;
+
+/// Caller-staged tokenizer snapshot used by the registry path for a fused imported checkpoint.
+pub const LDM_TOKENIZER_COMPONENT: &str = "ldm_tokenizer";
 
 /// img2img default strength (the vendored `generate_latents_from_image` default).
 const DEFAULT_STRENGTH: f32 = 0.8;
@@ -114,6 +118,34 @@ fn accel_defaults(sampler: &str) -> (u32, f32, f32) {
     }
 }
 
+/// ControlNet can share the CFG-free Lightning denoise loop: it builds a one-row control context,
+/// produces residuals for that same row, and [`crate::pipeline::forward_eps`] injects them before
+/// the U-Net prediction. The other acceleration profiles have not been validated with ControlNet,
+/// so keep that boundary explicit rather than accepting a combination just because the common loop
+/// happens to be mechanically capable of running it.
+///
+/// Lightning is distilled CFG-free. In particular, an omitted guidance value resolves to its normal
+/// `1.0` default; an explicitly larger value must be rejected rather than silently running a
+/// two-row CFG path against a checkpoint trained for a single conditioned prediction.
+fn validate_control_acceleration(sampler: &str, guidance: Option<f32>) -> Result<()> {
+    if !ACCEL_SAMPLERS.contains(&sampler) {
+        return Ok(());
+    }
+    if sampler != "lightning" {
+        return Err(Error::Msg(format!(
+            "sdxl: ControlNet is supported with the CFG-free `lightning` acceleration sampler only \
+             (got {sampler:?})"
+        )));
+    }
+    if guidance.is_some_and(|value| value > 1.0) {
+        return Err(Error::Msg(
+            "sdxl: ControlNet with the CFG-free `lightning` sampler requires guidance <= 1.0"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Registry id — matches the SceneWorks worker's `payload.model` (`MODEL_TARGETS["sdxl"]`).
 pub const MODEL_ID: &str = "sdxl";
 
@@ -129,6 +161,9 @@ pub const PID_BACKBONE: &str = "sdxl";
 /// [[false-green-gates-mask-descope]]).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::SDXL_LATENT_SPACE),
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "sdxl",
@@ -138,7 +173,6 @@ pub fn descriptor() -> ModelDescriptor {
             // SDXL uses real classifier-free guidance: honors the negative prompt + a CFG scale.
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             // img2img Reference (sc-2638) + masked inpaint/outpaint (Mask, sc-3057) + tile-ControlNet
             // detail (Control, sc-3058 — requires a control checkpoint via LoadSpec::control). LoRA
             // (kohya `lora_unet_` + PEFT, sc-2639) and LoKr (sc-2640 — Rust is more capable than the
@@ -189,21 +223,10 @@ pub fn descriptor() -> ModelDescriptor {
             // On-the-fly Q4/Q8 over the U-Net + CLIP encoders + IdentityNet, conv_shortcut kept
             // dense (sc-2769 / sc-3329). Read by the worker capability advertisement (sc-3723).
             supported_quants: &[Quant::Q4, Quant::Q8],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam (epic 10834); honors Sequential offload (F-176).
             supports_sequential_offload: true,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            supports_preview: true,
+            ..Default::default()
         },
     }
 }
@@ -232,7 +255,31 @@ pub struct Sdxl {
     /// [`Residency`] seam owns the eval/drop/clear discipline, the stage-boundary cancel checks, and
     /// the error-safe cache flush once for all providers.
     residency: Residency<(ClipTextEncoder, ClipTextEncoder), SdxlHeavyOwned>,
+    /// The load-time `OffloadPolicy` verdict, kept as the DEFAULT for a request that names no
+    /// [`GenerationMemory::stage_residency`](mlx_gen::gen_core::GenerationMemory). Rung 1 is
+    /// request-scoped from SC-15525 onward; the policy is no longer the authority.
+    default_stage_residency: bool,
+    /// Whether THIS load can execute ladder rung 4 — see
+    /// [`memory_strategy::streamable`](crate::memory_strategy::streamable).
+    streamable: bool,
+    loaded_spec: LoadSpec,
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
 }
+
+/// One correctness-only production-latent decode comparison.
+///
+/// This test seam deliberately carries no duration, allocator, peak-memory, or calibration field.
+/// The latent is captured from the normal [`Sdxl::generate_impl`] denoise path immediately before
+/// its production decode, then decoded once densely and once with the caller's candidate tiling.
+#[doc(hidden)]
+pub struct DecodeQualitySample {
+    pub production_latent: mlx_rs::Array,
+    pub dense: Image,
+    pub tiled: Image,
+}
+
+type FinalLatentObserver<'a> =
+    &'a mut dyn FnMut(&Autoencoder, &mlx_rs::Array, Option<&dyn LatentDecoder>) -> Result<()>;
 
 /// The heavy render-phase components (everything but the text encoders): the U-Net, its ControlNet
 /// branches / IP-Adapter, the VAE, and the optional PiD decoder. Owned by the `Resident` components
@@ -297,6 +344,38 @@ impl SdxlHeavyOwned {
 /// The lower-level `load_unet`/`load_text_encoder_*` keep an f32 path for the tight stage gates.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if spec.precision != Precision::Bf16 {
+        return Err(Error::Msg(
+            "sdxl: precision override is not wired; the dense path runs fp16 (the production \
+             reference dtype) — drop the precision override"
+                .into(),
+        ));
+    }
+    if matches!(spec.weights, WeightsSource::File(_)) {
+        mlx_gen::gen_core::reject_unknown_components(spec, &[LDM_TOKENIZER_COMPONENT], MODEL_ID)?;
+        let tokenizer_root = match spec.components.get(LDM_TOKENIZER_COMPONENT) {
+            Some(WeightsSource::Dir(path)) => path,
+            Some(WeightsSource::File(path)) => {
+                return Err(Error::Msg(format!(
+                    "sdxl: imported fused checkpoint component '{LDM_TOKENIZER_COMPONENT}' must be a directory, got {}",
+                    path.display()
+                )))
+            }
+            None => {
+                return Err(Error::Msg(format!(
+                    "sdxl: imported fused checkpoint requires caller-staged '{LDM_TOKENIZER_COMPONENT}' tokenizer assets"
+                )))
+            }
+        };
+        return load_from_ldm_file(spec, tokenizer_root);
+    }
+    Ok(Box::new(load_concrete(spec)?))
+}
+
+/// Construct the concrete generator for the correctness-only production-latent admission harness.
+/// Normal registry callers should use [`load`].
+#[doc(hidden)]
+pub fn load_concrete(spec: &LoadSpec) -> Result<Sdxl> {
+    if spec.precision != Precision::Bf16 {
         // `Precision::Bf16` is the registry's dense sentinel; the dense path runs fp16 (the
         // production dtype). A non-default precision flag is rejected rather than silently ignored.
         return Err(Error::Msg(
@@ -330,21 +409,29 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         }
     }
     let residency = build_residency(spec)?;
-    Ok(Box::new(Sdxl {
+    let memory_strategy = crate::memory_strategy::memory_strategy_contract(descriptor().id, spec)?;
+    Ok(Sdxl {
         descriptor: descriptor(),
+        default_stage_residency: crate::memory_strategy::default_stage_residency(spec),
+        streamable: crate::memory_strategy::streamable(spec),
+        loaded_spec: spec.clone(),
+        memory_strategy,
         tokenizer: loader::load_tokenizer(root)?,
         sampler: EulerSampler::new_with_dtype(&cfg, true, DTYPE)?,
         alpha_schedule,
         control_count,
         residency,
-    }))
+    })
 }
 
 /// Load a fused SDXL LDM/A1111 checkpoint in memory. The fused file supplies both text encoders,
 /// UNet, and VAE; only the model-agnostic tokenizer assets come from `tokenizer_root`.
 pub fn load_from_ldm_file(spec: &LoadSpec, tokenizer_root: &Path) -> Result<Box<dyn Generator>> {
-    let file = match &spec.weights {
-        WeightsSource::File(path) => path,
+    spec.validate_prepared_file_pins()?;
+    let file_pin = match &spec.weights {
+        WeightsSource::File(_) => spec
+            .weights_file_pin()?
+            .expect("File weights must resolve to a pin"),
         WeightsSource::Dir(_) => {
             return Err(Error::Msg(
                 "sdxl LDM loader expects a fused .safetensors file".into(),
@@ -356,36 +443,34 @@ pub fn load_from_ldm_file(spec: &LoadSpec, tokenizer_root: &Path) -> Result<Box<
             "sdxl: precision override is not wired; the dense path runs fp16".into(),
         ));
     }
-    let residency = match spec.offload_policy {
-        OffloadPolicy::Resident => {
-            let components = crate::ldm::split_ldm_checkpoint(file)?;
-            let text = build_ldm_text(&components, spec.quantize)?;
-            let heavy = build_ldm_heavy(spec, components, true)?;
-            Residency::resident(text, heavy)
-        }
-        OffloadPolicy::Sequential => {
-            let text_file = file.clone();
-            let heavy_file = file.clone();
-            let text_quant = spec.quantize;
-            let heavy_spec = spec.clone();
-            Residency::sequential(
-                move || {
-                    let components = crate::ldm::split_ldm_checkpoint(&text_file)?;
-                    build_ldm_text(&components, text_quant)
-                },
-                move |load_pid| {
-                    let components = crate::ldm::split_ldm_checkpoint(&heavy_file)?;
-                    build_ldm_heavy(&heavy_spec, components, load_pid)
-                },
-            )
-        }
-    };
+    let residency = build_ldm_residency(spec, &file_pin)?;
     let cfg = DiffusionConfig::sdxl_base();
     let alpha_schedule =
         AlphaSchedule::scaled_linear(cfg.num_train_steps, cfg.beta_start, cfg.beta_end);
+    // A fused LDM/A1111 checkpoint has no re-openable **per-component** source — every component is
+    // cut out of one file by `ldm::split_ldm_checkpoint` — so `memory_strategy::streamable` reports
+    // `false` for its `WeightsSource::File` and rung 4 is declared Missing for this load rather than
+    // silently executing resident. Rung 1 is a different question and is genuinely executable here:
+    // the fused *file* is re-openable through the retained pin, which is what
+    // [`build_ldm_residency`] keeps for both phase loaders (sc-18317).
+    // The public helper retains the same prepared identity guarantee as registry dispatch: contract
+    // projection reopens the fused header and tokenizer loading opens staged files, so complete both
+    // under the retained source + full prepared-file guards before exposing the generator.
+    let (memory_strategy, tokenizer) = spec.read_prepared_files_unchanged(|| {
+        file_pin.read_unchanged(|_| {
+            Ok::<_, Error>((
+                crate::memory_strategy::memory_strategy_contract(descriptor().id, spec)?,
+                loader::load_tokenizer(tokenizer_root)?,
+            ))
+        })
+    })?;
     Ok(Box::new(Sdxl {
         descriptor: descriptor(),
-        tokenizer: loader::load_tokenizer(tokenizer_root)?,
+        default_stage_residency: crate::memory_strategy::default_stage_residency(spec),
+        streamable: false,
+        loaded_spec: spec.clone(),
+        memory_strategy,
+        tokenizer,
         sampler: EulerSampler::new_with_dtype(&cfg, true, DTYPE)?,
         alpha_schedule,
         control_count: spec.control.is_some() as usize + spec.extra_controls.len(),
@@ -393,26 +478,115 @@ pub fn load_from_ldm_file(spec: &LoadSpec, tokenizer_root: &Path) -> Result<Box<
     }))
 }
 
+/// The fused-LDM policy→[`Residency`] dispatch, mirroring [`build_residency`]'s single-seam shape
+/// for the imported-checkpoint route (sc-18317).
+///
+/// **Every arm retains the pin and keeps reload loaders.** Before sc-18317 the `Resident` arm read
+/// the fused file once through a valid pin, dropped both, and built `Residency::resident` — a
+/// non-rebuildable owner whose loaders return errors. That made rung 1 a *declared but unexecutable*
+/// capability on this route: the descriptor publishes `supports_sequential_offload` (so
+/// `staged_residency_availability()` is `Selectable`), the contract builder declares
+/// `StagedResidency` `Implemented` (it derives only `load_shape` and rung 4 from the spec), rung 1
+/// declares no prerequisite for `validate_selection` to refuse, and the shared
+/// `Capabilities::validate_request` floor does not inspect `stage_residency` at all. A staged
+/// selection was therefore admitted everywhere and then refused inside `generate` by
+/// `Residency::ensure_rebuildable` — the epic's core defect class.
+///
+/// Nothing here is new machinery: the `Sequential` arm has always re-split the fused checkpoint
+/// through this same pin on every generate, and `PinnedWeightsFile::read_unchanged` documents
+/// repeated reopen as its intended use ("keep this same pin for every lazy or sequential reopen").
+/// The nearest neighbour agrees — `mlx-gen-z-image`'s fused ComfyUI `Checkpoint` source builds a
+/// request-scoped residency whose per-phase loaders re-split one pinned file. So the `Resident` arm
+/// now routes through [`Residency::from_policy_with_resident`], which keeps a **distinct warm
+/// aggregate**: the warm pair is still built by ONE fused read (byte-identical composition to the
+/// pre-sc-18317 eager build, `load_pid = true` for the reusable PiD superset), while the two staged
+/// phase loaders re-split the file per phase exactly as `Sequential` does.
+///
+/// One behavioural delta, and it is deliberate: under `Resident` the warm pair is now built on first
+/// use instead of at load. Structural validity of the checkpoint is still proven at load — the
+/// contract projection reads and classifies every tensor header through the pin
+/// (`model::fused_ldm_component_footprint`) and rejects a file missing a text encoder, U-Net or VAE
+/// — and `load` is only ever reached from the job that then calls `generate`, so a tensor-level
+/// failure surfaces in the same job either way. `Sequential` on this route already deferred
+/// everything.
+pub(crate) fn build_ldm_residency(
+    spec: &LoadSpec,
+    file_pin: &mlx_gen::gen_core::PinnedWeightsFile,
+) -> Result<Residency<(ClipTextEncoder, ClipTextEncoder), SdxlHeavyOwned>> {
+    let warm_file = file_pin.clone();
+    let warm_spec = spec.clone();
+    let text_file = file_pin.clone();
+    let text_quant = spec.quantize;
+    let heavy_file = file_pin.clone();
+    let heavy_spec = spec.clone();
+    Residency::from_policy_with_resident(
+        spec.offload_policy,
+        move || {
+            warm_spec.read_prepared_files_unchanged(|| {
+                warm_file.read_unchanged(|file| {
+                    let crate::ldm::LdmComponents {
+                        unet,
+                        clip_l,
+                        clip_bigg,
+                        vae,
+                    } = crate::ldm::split_ldm_checkpoint(file)?;
+                    let text = build_ldm_text(clip_l, clip_bigg, warm_spec.quantize)?;
+                    let heavy = build_ldm_heavy(&warm_spec, unet, vae, true)?;
+                    Ok::<_, Error>((text, heavy))
+                })
+            })
+        },
+        move || {
+            text_file.read_unchanged(|file| {
+                let crate::ldm::LdmComponents {
+                    clip_l, clip_bigg, ..
+                } = crate::ldm::split_ldm_checkpoint(file)?;
+                build_ldm_text(clip_l, clip_bigg, text_quant)
+            })
+        },
+        move |load_pid| {
+            heavy_spec.read_prepared_files_unchanged(|| {
+                heavy_file.read_unchanged(|file| {
+                    let crate::ldm::LdmComponents { unet, vae, .. } =
+                        crate::ldm::split_ldm_checkpoint(file)?;
+                    build_ldm_heavy(&heavy_spec, unet, vae, load_pid)
+                })
+            })
+        },
+    )
+}
+
 fn build_ldm_text(
-    components: &crate::ldm::LdmComponents,
+    clip_l: mlx_gen::weights::Weights,
+    clip_bigg: mlx_gen::weights::Weights,
     quantize: Option<Quant>,
 ) -> Result<(ClipTextEncoder, ClipTextEncoder)> {
-    let mut te1 = loader::load_text_encoder_1_from_weights(components.clip_l.clone(), DTYPE)?;
-    let mut te2 = loader::load_text_encoder_2_from_weights(components.clip_bigg.clone(), DTYPE)?;
+    // Build from lazy fused-file arrays first. The component maps are consumed and dropped by the
+    // loaders, leaving only the encoder-owned handles before quantization/materialization walks one
+    // projection at a time under the caller's immutable-file guard.
+    let mut te1 = loader::load_text_encoder_1_from_weights(clip_l, DTYPE)?;
+    let mut te2 = loader::load_text_encoder_2_from_weights(clip_bigg, DTYPE)?;
     if let Some(quant) = quantize {
         te1.quantize(quant.bits())?;
         te2.quantize(quant.bits())?;
     }
+    te1.materialize_weights()?;
+    te2.materialize_weights()?;
     Ok((te1, te2))
 }
 
 fn build_ldm_heavy(
     spec: &LoadSpec,
-    components: crate::ldm::LdmComponents,
+    unet_weights: mlx_gen::weights::Weights,
+    vae_weights: mlx_gen::weights::Weights,
     load_pid: bool,
 ) -> Result<SdxlHeavyOwned> {
-    let mut unet = loader::load_unet_from_weights(components.unet, DTYPE)?;
-    let vae = loader::load_vae_from_weights(components.vae)?;
+    // The U-Net component map is consumed by the constructor so no second full source map retains
+    // arrays while the packed model is walked below. The VAE intentionally stays dense and is
+    // materialized as its own bounded component under the same immutable-file guard.
+    let mut unet = loader::load_unet_from_weights(unet_weights, DTYPE)?;
+    vae_weights.materialize()?;
+    let vae = loader::load_vae_from_weights(vae_weights)?;
     if !spec.adapters.is_empty() {
         let coverage = if std::env::var_os("SDXL_LORA_VENDORED").is_some() {
             crate::adapters::LoraCoverage::Vendored
@@ -448,6 +622,7 @@ fn build_ldm_heavy(
             control.quantize(bits)?;
         }
     }
+    unet.materialize_weights()?;
     let pid = if load_pid {
         spec.pid
             .as_ref()
@@ -623,6 +798,25 @@ fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<SdxlHeavyO
         None
     };
 
+    // Ladder rung 4 (SC-15525, closing SC-16355) — armed LAST, and that ordering is the whole
+    // correctness argument. Each `Transformer2D`'s stream captures the installed IP-Adapter K/V
+    // projections and the forward-time residual adapters off its FINISHED resident blocks, so the
+    // streamed and resident paths cannot disagree about which state landed where. Arming before the
+    // IP install or the adapter merge would capture an empty state and silently render without the
+    // image prompt.
+    //
+    // `memory_strategy::streamable` is the single authority for whether this load may arm at all: it
+    // refuses a fused single file, an eager load shape, a load-time quantization that materializes
+    // the trunk, and an adapter load that merged its delta into weights the snapshot does not carry.
+    if crate::memory_strategy::streamable(spec) {
+        let unet_file =
+            loader::resolve_weight_file(root, "unet", "diffusion_pytorch_model", DTYPE)?;
+        unet.arm_block_streams(
+            &WeightsSource::File(unet_file),
+            spec.quantize.map(|q| q.bits()),
+        );
+    }
+
     Ok(SdxlHeavyOwned {
         unet,
         controls,
@@ -632,12 +826,89 @@ fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<SdxlHeavyO
     })
 }
 
-mlx_gen::impl_generator!(Sdxl {
-    validate: |s, req| validate_request(&s.descriptor.capabilities, req),
-    generate: generate_impl,
-});
+// Written out rather than `mlx_gen::impl_generator!` because SDXL now answers the memory-strategy
+// hooks (SC-15525); the macro covers only `descriptor`/`validate`/`generate`.
+impl mlx_gen::gen_core::Generator for Sdxl {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        validate_request(&self.descriptor.capabilities, req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.loaded_spec, &self.memory_strategy, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        crate::memory_strategy::begin_request(
+            self.descriptor.id,
+            &self.loaded_spec,
+            &self.memory_strategy,
+            context,
+        )
+    }
+}
 
 impl Sdxl {
+    /// Run the ordinary production denoise path and compare the exact final latent under dense and
+    /// candidate tiled decode. This is an explicit correctness-only seam for admission tooling; it
+    /// does not read clocks or allocator/memory counters and does not change the production output.
+    #[doc(hidden)]
+    pub fn generate_decode_quality(
+        &self,
+        req: &GenerationRequest,
+        tiling: &mlx_gen::tiling::TilingConfig,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<(GenerationOutput, Vec<DecodeQualitySample>)> {
+        let mut samples = Vec::new();
+        let output = {
+            let mut capture = |vae: &Autoencoder,
+                               latent: &mlx_rs::Array,
+                               pid: Option<&dyn LatentDecoder>|
+             -> Result<()> {
+                latent.eval()?;
+                let dense =
+                    crate::pipeline::decode_image_tiled(vae, latent, pid, None, Some(&req.cancel))?;
+                let tiled = crate::pipeline::decode_image_tiled(
+                    vae,
+                    latent,
+                    pid,
+                    Some(tiling),
+                    Some(&req.cancel),
+                )?;
+                samples.push(DecodeQualitySample {
+                    production_latent: latent.clone(),
+                    dense,
+                    tiled,
+                });
+                Ok(())
+            };
+            self.generate_impl_with_final_latent_observer(req, on_progress, Some(&mut capture))?
+        };
+        Ok((output, samples))
+    }
+
     /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
     /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
     /// helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
@@ -650,6 +921,15 @@ impl Sdxl {
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        self.generate_impl_with_final_latent_observer(req, on_progress, None)
+    }
+
+    fn generate_impl_with_final_latent_observer(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+        mut final_latent_observer: Option<FinalLatentObserver<'_>>,
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
 
@@ -724,14 +1004,12 @@ impl Sdxl {
         }
         // ControlNet (sc-3058; MultiControlNet sc-3378): each `Control` conditioning pairs, in order,
         // with a loaded control branch (`spec.control` + `spec.extra_controls`); their residuals are
-        // summed. Needs the ancestral path; not combined with an inpaint mask in this build.
+        // summed. The common denoiser correctly carries those residuals through Lightning's one-row,
+        // CFG-free loop; LCM/Hyper remain deliberately unsupported until separately characterized.
+        // Control still does not combine with an inpaint mask in this build.
         let control_reqs = self.resolve_control(req)?;
         if !control_reqs.is_empty() {
-            if is_accel {
-                return Err(Error::Msg(
-                    "sdxl: ControlNet is not supported with the acceleration samplers".into(),
-                ));
-            }
+            validate_control_acceleration(sampler_name, req.guidance)?;
             if control_reqs.len() != self.control_count {
                 return Err(Error::Msg(format!(
                     "sdxl: {} Control conditioning(s) passed but the model was loaded with {} control \
@@ -755,21 +1033,64 @@ impl Sdxl {
         // `clear_cache()` so their ~1 GB frees before the U-Net/control/IP bundle loads below —
         // bounding peak to `max(encoders, U-Net+VAE)`. Under `Resident` it borrows the warm encoders
         // (byte-identical to the pre-sc-10839 `encode_conditioning`).
+        // sc-20528: a prompt past CLIP's 77-token context is split into windows, not truncated. The
+        // window count is decided ONCE here, as the max over both CFG rows, so `[cond, uncond]` stay
+        // stackable and the negative prompt takes exactly the same path as the positive one. A
+        // request whose rows both fit is a single window that IS the pre-sc-20528 token batch.
         let tokens = self
             .tokenizer
-            .tokenize_batch(&req.prompt, if cfg_on { Some(negative) } else { None })?;
+            .tokenize_windows(&req.prompt, if cfg_on { Some(negative) } else { None })?;
 
-        self.residency.run(
+        // ── Ladder request resolution (SC-15525) ────────────────────────────────────────────────
+        // Rung 1 is request-scoped from here on: the load-time `OffloadPolicy` is only the default a
+        // request that names nothing keeps.
+        let stage_residency =
+            crate::memory_strategy::stage_residency(req, self.default_stage_residency);
+        let window_size = crate::memory_strategy::transformer_window_size(req)?;
+        // Two fail-closed guards a calibration harness driving `generate` with a hand-built
+        // `GenerationMemory` must still cross — it never went through `safety_check`.
+        if window_size.is_some() && !self.streamable {
+            return Err(Error::Unsupported(
+                "sdxl: bounded transformer residency needs a DeferredMaterialization load over a \
+                 snapshot directory whose U-Net stays lazy and whose adapters (if any) are \
+                 replayable; this generator cannot stream its blocks"
+                    .into(),
+            ));
+        }
+        if window_size.is_some() && !stage_residency {
+            return Err(Error::Unsupported(
+                "sdxl: bounded transformer residency requires staged residency engaged in the same \
+                 request — without the phase release both CLIP towers stay resident through the \
+                 denoise and the request peak does not move"
+                    .into(),
+            ));
+        }
+        let decode_tiling =
+            crate::memory_strategy::decode_tiling_for_contract(req, &self.memory_strategy)?;
+        let forward_plan = crate::plan::SdxlForwardPlan::with_attention(
+            crate::memory_strategy::attention_plan(req)?,
+        )
+        .with_window(window_size.map(|size| crate::plan::SdxlBlockWindow {
+            size,
+            cancel: &req.cancel,
+        }));
+
+        self.residency.run_request_scoped(
+            stage_residency,
+            false,
             &req.cancel,
             req.use_pid,
             on_progress,
             |text: &(ClipTextEncoder, ClipTextEncoder)| {
-                encode_conditioning(&text.0, &text.1, &tokens)
+                encode_conditioning_windows(&text.0, &text.1, &tokens)
             },
             // Materialize the conditioning + pooled while the encoders are still alive (Sequential
             // only) — MLX is lazy, so an un-evaluated output keeps the encoders referenced through the
             // graph and the drop would free nothing (cf. Wan's `encode_text_staged`).
-            |enc| Ok(mlx_rs::transforms::eval([&enc.0, &enc.1])?),
+            |enc| match enc {
+                Some(enc) => Ok(mlx_rs::transforms::eval([&enc.0, &enc.1])?),
+                None => Ok(()),
+            },
             // ── Establish the heavy render components (U-Net + control/IP + VAE + PiD) and run the
             // denoise/decode body once against the `heavy` borrow — identical for both residencies.
             // `on_progress` is threaded through the seam (F-179) and shadows the outer sink here.
@@ -914,6 +1235,9 @@ impl Sdxl {
         )?;
         let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
 
+        mlx_gen::diagnostics::record_phase_boundary(
+            mlx_gen::diagnostics::BenchmarkPhaseBoundary::DenoiseStart,
+        );
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             // One image per iteration (the vendored `_run_one`, n_images=1), each with its own seed.
@@ -968,7 +1292,7 @@ impl Sdxl {
                     && Solver::from_name(sampler_name)
                         .is_some_and(mlx_gen::gen_core::sampling::base_supports_cfgpp);
                 let latents = if want_cfgpp {
-                    denoise_cfgpp(
+                    denoise_cfgpp_with_preview(
                         heavy.unet,
                         Some(sampler_name),
                         &ms,
@@ -980,12 +1304,14 @@ impl Sdxl {
                         cfg,
                         &req.cancel,
                         on_progress,
+                        &req.preview,
                         &control_ctxs,
                         ip,
                         None,
+                        forward_plan,
                     )?
                 } else {
-                    denoise_curated(
+                    denoise_curated_with_preview(
                         heavy.unet,
                         Some(sampler_name),
                         &ms,
@@ -998,9 +1324,11 @@ impl Sdxl {
                         seed,
                         &req.cancel,
                         on_progress,
+                        &req.preview,
                         &control_ctxs,
                         ip,
                         None,
+                        forward_plan,
                     )?
                 };
                 // Curated latents live in RAW VE σ-space (`x0+σ·ε`); an early-stop leaves x_k at σ>0, so
@@ -1010,8 +1338,20 @@ impl Sdxl {
                     Some(p) => multiply(&latents, scalar(p.rescale))?,
                     None => latents,
                 };
+                if let Some(observer) = final_latent_observer.as_deref_mut() {
+                    observer(heavy.vae, &latents, pid_ref)?;
+                }
+                mlx_gen::diagnostics::record_phase_boundary(
+                    mlx_gen::diagnostics::BenchmarkPhaseBoundary::DecodeStart,
+                );
                 on_progress(Progress::Decoding);
-                images.push(decode_image(heavy.vae, &latents, pid_ref)?);
+                images.push(crate::pipeline::decode_image_tiled(
+                    heavy.vae,
+                    &latents,
+                    pid_ref,
+                    decode_tiling.as_ref(),
+                    Some(&req.cancel),
+                )?);
                 continue;
             }
 
@@ -1099,12 +1439,9 @@ impl Sdxl {
                 )
             };
 
-            let d = Denoiser {
-                unet: heavy.unet,
-                sampler: sampler.as_ref(),
-            };
+            let d = Denoiser::with_plan(heavy.unet, sampler.as_ref(), forward_plan);
             let latents = if let Some(tokens) = &ip_tokens {
-                denoise_ip(
+                denoise_ip_with_preview(
                     &d,
                     latents,
                     &conditioning,
@@ -1113,11 +1450,12 @@ impl Sdxl {
                     cfg,
                     &req.cancel,
                     on_progress,
+                    &req.preview,
                     tokens,
                     ip_scale,
                 )?
             } else if !control_ctxs.is_empty() {
-                denoise_multi_control(
+                denoise_multi_control_with_preview(
                     &d,
                     latents,
                     &conditioning,
@@ -1126,10 +1464,11 @@ impl Sdxl {
                     cfg,
                     &req.cancel,
                     on_progress,
+                    &req.preview,
                     &control_ctxs,
                 )?
             } else if let Some(b) = &blend {
-                denoise_inpaint(
+                denoise_inpaint_with_preview(
                     &d,
                     latents,
                     &conditioning,
@@ -1138,10 +1477,11 @@ impl Sdxl {
                     cfg,
                     &req.cancel,
                     on_progress,
+                    &req.preview,
                     b,
                 )?
             } else {
-                denoise(
+                denoise_with_preview(
                     &d,
                     latents,
                     &conditioning,
@@ -1150,11 +1490,25 @@ impl Sdxl {
                     cfg,
                     &req.cancel,
                     on_progress,
+                    &req.preview,
                 )?
             };
 
+            if let Some(observer) = final_latent_observer.as_deref_mut() {
+                observer(heavy.vae, &latents, pid_ref)?;
+            }
+
+            mlx_gen::diagnostics::record_phase_boundary(
+                mlx_gen::diagnostics::BenchmarkPhaseBoundary::DecodeStart,
+            );
             on_progress(Progress::Decoding);
-            images.push(decode_image(heavy.vae, &latents, pid_ref)?);
+            images.push(crate::pipeline::decode_image_tiled(
+                    heavy.vae,
+                    &latents,
+                    pid_ref,
+                    decode_tiling.as_ref(),
+                    Some(&req.cancel),
+                )?);
         }
                 Ok(GenerationOutput::Images(images))
             },
@@ -1262,11 +1616,12 @@ impl Sdxl {
     }
 }
 
-/// SDXL works in latent space at /8, so both request dims must be multiples of 8. Exposed as the
-/// pinned-engine stride SceneWorks ties each advertised SDXL image bucket to (sc-12612), mirroring
-/// `wan::config::SIZE_MULTIPLE_14B`. `validate_request` enforces exactly this value, so the const
-/// cannot drift from the check.
-pub const SIZE_MULTIPLE: u32 = 8;
+/// SDXL's VAE produces a `/8` latent and the three-block U-Net applies two stride-2 downsamplers
+/// before mirroring them through exact skip concatenations. Each image axis must therefore be a
+/// multiple of `8 * 2² = 32`; accepting only the VAE stride can produce an odd intermediate whose
+/// upsampled extent no longer matches its skip tensor. `validate_request` enforces this structural
+/// multiple before production denoise.
+pub const SIZE_MULTIPLE: u32 = 32;
 
 /// Capability-driven request validation, factored out so it can be unit-tested without loaded
 /// weights. Rejects unsupported guidance / negative prompt / conditioning / size / count.
@@ -1283,7 +1638,7 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
     if req.prompt.is_empty() {
         return Err(Error::Msg("sdxl: prompt must not be empty".into()));
     }
-    // SDXL works in latent space at /8; both dims must be multiples of SIZE_MULTIPLE.
+    // The /8 VAE plus two exact U-Net downsample/upsample joins require SIZE_MULTIPLE.
     if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
         return Err(Error::Msg(format!(
             "sdxl: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
@@ -1298,12 +1653,191 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
-    mlx_gen::PerComponentBytes::from_spec_subdirs(
-        spec,
+    match &spec.weights {
+        WeightsSource::Dir(root) => Ok(snapshot_component_footprint(root)),
+        WeightsSource::File(file) => fused_ldm_component_footprint(file, spec.quantize),
+    }
+}
+
+/// Header-only resident projection for a diffusers **snapshot tree** — the directory twin of
+/// the fused-checkpoint projection, and for the same two reasons (SC-22667).
+///
+/// `pub` for `mlx-gen-instantid` (SC-22667): InstantID layers its IdentityNet and face IP-Adapter
+/// onto a stock SDXL base loaded through this crate's own `load_unet_dtype` / `load_vae`, so it
+/// needs the same per-component resolution and dtype projection the resident load performs rather
+/// than a second derivation of the rule.
+///
+/// A plain `.safetensors` sum over `unet/`, `text_encoder*/` and `vae/` was wrong twice over:
+///
+/// * **The VAE was under-priced by exactly 2x, at every tier.** `loader::load_vae` does
+///   `w.cast_all(Dtype::Float32)` unconditionally — the SDXL VAE is fp16-unstable — while every
+///   SceneWorks SDXL-family tier ships only `diffusion_pytorch_model.fp16.safetensors`.
+///   `loader::resolve_vae_weight_file`'s own doc has named this since sc-15839, down to the
+///   `ResidentProjection::Float32` remedy; nothing had ever called it from a contract. The fused
+///   branch below already prices its VAE tensors at `materialized_bytes(4)`, so the two snapshot
+///   shapes disagreed with each other.
+/// * **Side-by-side dtype variants were counted twice.** A component directory holding both
+///   `<stem>.safetensors` and `<stem>.fp16.safetensors` contributed both, while
+///   `loader::resolve_weight_file` opens exactly one of them. gen-core's own
+///   `PerComponentBytes` doc names this hazard.
+///
+/// The two errors point in opposite directions and land on different components, so they never
+/// cancelled. Each component is now sized from the exact file the resident load resolves, at the
+/// width that load materializes it in: the VAE f32, the U-Net and the two CLIP towers 16-bit
+/// (`DTYPE`), which is the same width the fused branch charges them. The shared projection detects
+/// an existing affine pack by its `.scales` companion and leaves those tensors at stored width, so
+/// a turnkey packed snapshot is not re-inflated to dense.
+///
+/// A component whose file cannot be resolved or read keeps its previous directory sum. This runs at
+/// contract time, ahead of any deferred component load, so an incomplete tree must not become a
+/// contract-time refusal.
+pub fn snapshot_component_footprint(root: &Path) -> mlx_gen::PerComponentBytes {
+    use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
+
+    let mut footprint = mlx_gen::PerComponentBytes::from_root_subdirs(
+        root,
         &["text_encoder", "text_encoder_2"],
         &["unet"],
         &["vae"],
-    )
+    );
+    let projected =
+        |file: Option<std::path::PathBuf>, projection: ResidentProjection| -> Option<u64> {
+            projected_safetensors_bytes(file?, move |_| projection).ok()
+        };
+    let half = ResidentProjection::Bfloat16;
+
+    let clip_l = projected(
+        loader::resolve_weight_file(root, "text_encoder", "model", DTYPE).ok(),
+        half,
+    );
+    let clip_g = projected(
+        loader::resolve_weight_file(root, "text_encoder_2", "model", DTYPE).ok(),
+        half,
+    );
+    if let (Some(clip_l), Some(clip_g)) = (clip_l, clip_g) {
+        footprint.text_encoder = clip_l.saturating_add(clip_g);
+    }
+    if let Some(unet) = projected(loader::resolve_unet_weight_file(root, DTYPE).ok(), half) {
+        footprint.dit = unet;
+    }
+    if let Some(vae) = projected(
+        loader::resolve_vae_weight_file(root).ok(),
+        ResidentProjection::Float32,
+    ) {
+        footprint.vae = vae;
+    }
+    footprint
+}
+
+/// Header-only resident projection for a fused LDM/A1111 checkpoint.  Unlike a snapshot tree, a
+/// fused file must first be classified by the exact shared LDM key remapper.  Text/UNet values are
+/// retained at fp16 (or at the selected affine Q4/Q8 tier); VAE values are retained at f32.  Keys the
+/// executable splitter ignores are omitted here too.
+fn fused_ldm_component_footprint(
+    file: &Path,
+    quantize: Option<Quant>,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    use mlx_gen::gen_core::sdxl_ldm::{remap_sdxl_ldm_key, SdxlComponent, TensorRemap};
+
+    let headers = mlx_gen::gen_core::safetensors_path_tensor_headers(file)?;
+    if headers.is_empty() {
+        return Err(mlx_gen::gen_core::Error::Msg(
+            "sdxl fused checkpoint contains no tensor headers".to_owned(),
+        ));
+    }
+    let mut out = mlx_gen::PerComponentBytes::default();
+    for tensor in headers {
+        let Some(remap) = remap_sdxl_ldm_key(&tensor.name) else {
+            continue;
+        };
+        let (component, targets, source_shape_is_pack_shape) = match remap {
+            TensorRemap::Rename(component, target) => (component, vec![target], true),
+            // Row-wise Q/K/V packing is additive, so packing the fused row stack has the same byte
+            // total as packing the three remapped projections independently.
+            TensorRemap::SplitQkv(component, targets) => {
+                (component, targets.into_iter().collect(), true)
+            }
+            // Transpose/squeeze preserve element count but can change which axis is grouped. Keep
+            // them dense in the estimate rather than risk understating the exact packed footprint.
+            TensorRemap::Transpose(component, target) | TensorRemap::Squeeze(component, target) => {
+                (component, vec![target], false)
+            }
+        };
+        let bytes = match component {
+            SdxlComponent::Vae => tensor.materialized_bytes(4)?,
+            SdxlComponent::Unet | SdxlComponent::ClipL | SdxlComponent::ClipBigG => {
+                let target_is_packable = source_shape_is_pack_shape
+                    && tensor.shape.len() == 2
+                    && targets.iter().all(|target| {
+                        let Some(base) = target.strip_suffix(".weight") else {
+                            return false;
+                        };
+                        component == SdxlComponent::Unet
+                            || (!base.ends_with(".token_embedding")
+                                && !base.ends_with(".position_embedding"))
+                    });
+                match (quantize, target_is_packable) {
+                    (Some(quant), true) => {
+                        let group = crate::quant::GROUP_SIZE as usize;
+                        let [rows, columns] = tensor.shape.as_slice() else {
+                            unreachable!("target_is_packable requires a weight target; shape is checked below")
+                        };
+                        if *columns < group || *columns % group != 0 {
+                            tensor.materialized_bytes(2)?
+                        } else {
+                            let rows = u64::try_from(*rows).map_err(|_| {
+                                mlx_gen::gen_core::Error::Msg(
+                                    "sdxl fused projection row count overflow".to_owned(),
+                                )
+                            })?;
+                            let columns = u64::try_from(*columns).map_err(|_| {
+                                mlx_gen::gen_core::Error::Msg(
+                                    "sdxl fused projection column count overflow".to_owned(),
+                                )
+                            })?;
+                            let codes = rows
+                                .checked_mul(columns)
+                                .and_then(|elements| elements.checked_mul(quant.bits() as u64))
+                                .map(|bits| bits / 8)
+                                .ok_or_else(|| {
+                                    mlx_gen::gen_core::Error::Msg(
+                                        "sdxl fused quantized code size overflow".to_owned(),
+                                    )
+                                })?;
+                            let tables = rows
+                                .checked_mul(columns / group as u64)
+                                .and_then(|entries| entries.checked_mul(4))
+                                .ok_or_else(|| {
+                                    mlx_gen::gen_core::Error::Msg(
+                                        "sdxl fused quantization table size overflow".to_owned(),
+                                    )
+                                })?;
+                            codes.checked_add(tables).ok_or_else(|| {
+                                mlx_gen::gen_core::Error::Msg(
+                                    "sdxl fused quantized resident size overflow".to_owned(),
+                                )
+                            })?
+                        }
+                    }
+                    _ => tensor.materialized_bytes(2)?,
+                }
+            }
+        };
+        let slot = match component {
+            SdxlComponent::ClipL | SdxlComponent::ClipBigG => &mut out.text_encoder,
+            SdxlComponent::Unet => &mut out.dit,
+            SdxlComponent::Vae => &mut out.vae,
+        };
+        *slot = slot.checked_add(bytes).ok_or_else(|| {
+            mlx_gen::gen_core::Error::Msg("sdxl fused component byte sum overflow".to_owned())
+        })?;
+    }
+    if out.text_encoder == 0 || out.dit == 0 || out.vae == 0 {
+        return Err(mlx_gen::gen_core::Error::Msg(
+            "sdxl fused checkpoint is missing a text encoder, UNet, or VAE component".to_owned(),
+        ));
+    }
+    Ok(out)
 }
 
 mlx_gen::register_generators! {
@@ -1311,9 +1845,140 @@ mlx_gen::register_generators! {
     footprint = component_footprint
 }
 
+/// The weights-free memory-strategy registration (SC-15525) — the shared registry conformance
+/// suite's entry point into this provider's declaration.
+pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
+        safety_check: crate::memory_strategy::safety_check,
+    };
+
+/// The weights-free **behavioral** registration: valid fixtures plus a request scope, so the shared
+/// suite can drive every declared rung's lifecycle without loading 6.6 GB of weights.
+pub const MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(MODEL_ID, spec, contract, context)
+        },
+    };
+
+/// sc-16195 Apple-Silicon warm sweep: q8 and dense both peaked at 14.039 GiB at 1024².
+/// The 14.05 GiB family ceiling is deliberately upward-rounded.
+pub const ACTIVATION_MEMORY_REGISTRATION: mlx_gen::gen_core::ActivationMemoryRegistration =
+    mlx_gen::gen_core::ActivationMemoryRegistration {
+        provider_id: MODEL_ID,
+        anchor: ActivationMemoryAnchor {
+            bytes_1024: 15_086_072_628,
+        },
+    };
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Feature-end review (SC-22667, E1): the snapshot footprint must price the exact file each
+    /// component load resolves, at the width that load materializes it in.
+    ///
+    /// Two independent errors, in opposite directions, on different components:
+    /// `loader::load_vae` `cast_all(Dtype::Float32)`s unconditionally over the fp16 variant every
+    /// SceneWorks tier ships (2x under, named by `resolve_vae_weight_file`'s own doc since
+    /// sc-15839), while a directory sum counted BOTH `<stem>.safetensors` and
+    /// `<stem>.fp16.safetensors` when a snapshot carries the pair (over, on the U-Net).
+    ///
+    /// Mutation that fails this: restoring `PerComponentBytes::from_spec_subdirs` for the `Dir`
+    /// branch — `vae` halves to the stored 100 and `dit` inflates to the sum of both U-Net
+    /// variants plus their headers.
+    #[test]
+    fn snapshot_footprint_resolves_one_file_per_component_at_its_materialized_width() {
+        /// One-tensor safetensors file; `dtype` must agree with `width` because the shared header
+        /// reader refuses a payload length that is not `elements * dtype.size()`.
+        fn write_tensor(path: &std::path::Path, dtype: &str, elements: usize, width: usize) {
+            let data_bytes = elements * width;
+            let mut header = format!(
+                "{{\"weight\":{{\"dtype\":\"{dtype}\",\"shape\":[{elements}],\"data_offsets\":[0,{data_bytes}]}}}}"
+            )
+            .into_bytes();
+            while !header.len().is_multiple_of(8) {
+                header.push(b' ');
+            }
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend(header);
+            bytes.resize(bytes.len() + data_bytes, 0);
+            std::fs::write(path, bytes).unwrap();
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for component in ["unet", "vae", "text_encoder", "text_encoder_2"] {
+            std::fs::create_dir_all(root.join(component)).unwrap();
+        }
+        // The U-Net ships BOTH dtype variants side by side; only the fp16 one is opened at `DTYPE`.
+        write_tensor(
+            &root.join("unet/diffusion_pytorch_model.fp16.safetensors"),
+            "F16",
+            100,
+            2,
+        );
+        write_tensor(
+            &root.join("unet/diffusion_pytorch_model.safetensors"),
+            "F32",
+            100,
+            4,
+        );
+        // The VAE ships ONLY the fp16 variant — the shape every SceneWorks SDXL tier has — and is
+        // upcast to f32 on load regardless.
+        write_tensor(
+            &root.join("vae/diffusion_pytorch_model.fp16.safetensors"),
+            "F16",
+            50,
+            2,
+        );
+        write_tensor(
+            &root.join("text_encoder/model.fp16.safetensors"),
+            "F16",
+            20,
+            2,
+        );
+        write_tensor(
+            &root.join("text_encoder_2/model.fp16.safetensors"),
+            "F16",
+            30,
+            2,
+        );
+
+        let spec = mlx_gen::LoadSpec::new(WeightsSource::Dir(root.to_path_buf()));
+        let footprint = component_footprint(&spec).unwrap();
+        assert_eq!(
+            footprint.dit, 200,
+            "only the resolved fp16 U-Net may be counted, at 2 bytes per element"
+        );
+        assert_eq!(
+            footprint.vae, 200,
+            "the VAE is materialized f32: 50 elements at 4 bytes, not the 100 stored"
+        );
+        assert_eq!(footprint.text_encoder, 20 * 2 + 30 * 2);
+
+        // A directory sum would have been strictly larger on the U-Net and exactly half on the VAE.
+        let stored = mlx_gen::PerComponentBytes::from_root_subdirs(
+            root,
+            &["text_encoder", "text_encoder_2"],
+            &["unet"],
+            &["vae"],
+        );
+        assert!(stored.dit > footprint.dit, "{stored:?}");
+        assert!(stored.vae < footprint.vae, "{stored:?}");
+
+        // An incomplete tree keeps the previous directory sum rather than refusing at contract time.
+        let bare = tempfile::tempdir().unwrap();
+        let bare_spec = mlx_gen::LoadSpec::new(WeightsSource::Dir(bare.path().to_path_buf()));
+        let bare_footprint = component_footprint(&bare_spec).unwrap();
+        assert_eq!(bare_footprint.dit, 0);
+        assert_eq!(bare_footprint.vae, 0);
+        assert_eq!(bare_footprint.text_encoder, 0);
+    }
 
     #[test]
     fn strength_resolution_preserves_defaults_explicit_values_and_clamping() {
@@ -1345,6 +2010,30 @@ mod tests {
     }
 
     #[test]
+    fn control_acceleration_admission_is_lightning_only_and_cfg_free() {
+        // The ordinary no-ControlNet acceleration paths keep their established defaults. This
+        // contract applies only to the control-aware path, where a Lightning checkpoint must never
+        // be silently driven through CFG.
+        assert_eq!(accel_defaults("lightning"), (4, 1.0, 0.0));
+        assert!(validate_control_acceleration("euler_ancestral", Some(7.0)).is_ok());
+        assert!(validate_control_acceleration("lightning", None).is_ok());
+        assert!(validate_control_acceleration("lightning", Some(1.0)).is_ok());
+        assert!(validate_control_acceleration("lightning", Some(0.5)).is_ok());
+
+        let guidance = validate_control_acceleration("lightning", Some(1.01))
+            .unwrap_err()
+            .to_string();
+        assert!(guidance.contains("guidance <= 1.0"), "got: {guidance}");
+
+        for sampler in ["lcm", "hyper"] {
+            let err = validate_control_acceleration(sampler, None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("lightning"), "{sampler}: {err}");
+        }
+    }
+
+    #[test]
     fn curated_strength_schedule_matches_previous_tail_selection() {
         let full_sigmas = vec![14.0, 8.0, 4.0, 2.0, 1.0, 0.0];
         let steps = 5;
@@ -1370,6 +2059,7 @@ mod tests {
         assert_eq!(d.modality, Modality::Image);
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supports_negative_prompt);
+        assert!(d.capabilities.supports_preview);
     }
 
     #[test]
@@ -1394,24 +2084,24 @@ mod tests {
     }
 
     /// sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised SDXL bucket to.
-    /// Pin the value and mutation-check that a multiple of 4 which is not SIZE_MULTIPLE (8) is rejected
-    /// with the stride error, and an on-stride size passes.
+    /// Pin the value and mutation-check that a VAE-valid multiple of 8 which is not the full U-Net
+    /// multiple is rejected with the stride error, and an on-stride size passes.
     #[test]
     fn size_multiple_is_the_pinned_stride() {
-        assert_eq!(SIZE_MULTIPLE, 8);
+        assert_eq!(SIZE_MULTIPLE, 32);
         let caps = descriptor().capabilities;
         let off = validate_request(
             &caps,
             &GenerationRequest {
                 prompt: "a fox".into(),
-                width: 1020, // 255×4 — a multiple of 4 but not SIZE_MULTIPLE
+                width: 1000, // 125×8 — VAE-valid but not SIZE_MULTIPLE
                 height: 1024,
                 ..Default::default()
             },
         )
         .unwrap_err()
         .to_string();
-        assert!(off.contains("multiples of 8"), "got: {off}");
+        assert!(off.contains("multiples of 32"), "got: {off}");
         assert!(validate_request(
             &caps,
             &GenerationRequest {
@@ -1492,10 +2182,10 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_request(&caps, &req).is_ok());
-        // Non-multiple-of-8 size is rejected.
+        // VAE-valid but U-Net-invalid size is rejected.
         req = GenerationRequest {
             prompt: "a fox".into(),
-            width: 1020,
+            width: 1000,
             height: 1024,
             ..Default::default()
         };
@@ -1605,10 +2295,13 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_single_file_source() {
+    fn ordinary_load_does_not_treat_an_undeclared_file_as_a_snapshot() {
         let spec = LoadSpec::new(WeightsSource::File("/tmp/sdxl.safetensors".into()));
         let err = load(&spec).err().expect("expected an error").to_string();
-        assert!(err.contains("snapshot directory"), "got: {err}");
+        assert!(
+            err.contains("ldm_tokenizer") || err.contains("snapshot directory"),
+            "the file source must fail at an imported-route structural gate, not load as a snapshot: {err}"
+        );
     }
 
     // ── F-180 (sc-11126): weight-free, default-run proof that SDXL's dispatch HONORS `offload_policy`.
@@ -1646,6 +2339,152 @@ mod tests {
             !msg.contains("single .safetensors file") && !msg.contains("precision override"),
             "expected an eager-load failure, not the up-front guard: {msg}"
         );
+    }
+
+    // ── sc-18317: the fused-LDM route's rung-1 capability is EXECUTABLE, not merely declared.
+    //
+    // The defect these cover: `load_from_ldm_file` under `OffloadPolicy::Resident` used to obtain a
+    // valid file pin, read through it once, drop it, and build `Residency::resident` — whose loaders
+    // return errors and whose `rebuildable` flag is `false`. Nothing upstream refused a staged
+    // selection on that instance (the descriptor publishes `Selectable`, the contract declares rung 1
+    // `Implemented`, rung 1 has no prerequisite for `validate_selection` to check, and the shared
+    // `Capabilities::validate_request` floor never inspects `stage_residency`), so the composition was
+    // admitted everywhere and then refused inside `generate` by `Residency::ensure_rebuildable`.
+    //
+    // These run weight-free. A real fused SDXL checkpoint is ~7 GB, so the fixture is a structurally
+    // valid safetensors carrying one SDXL-irrelevant tensor: `Weights::from_file` opens it, the shared
+    // LDM key remapper classifies nothing, and `split_ldm_checkpoint` returns its own typed
+    // "missing the … component" error. That error arriving is the proof the staged phase loader
+    // re-opened the pinned fused file; the resident-only refusal arriving instead is the defect.
+    // Each test mints its fixture root with `tempfile::tempdir()` and holds the `TempDir` guard for
+    // its own duration: the guard IS the cleanup, including out of a panicking test (sc-17791).
+    //
+    /// One structurally valid safetensors file with a single F32 tensor and no SDXL/LDM keys.
+    ///
+    /// Deliberately valid rather than garbage: the point is to reach `split_ldm_checkpoint`'s key
+    /// classification through the pin, not to probe the safetensors reader's malformed-input path.
+    fn write_stub_fused_checkpoint(dir: &Path) -> std::path::PathBuf {
+        let path = dir.join("stub-fused.safetensors");
+        let mut header =
+            br#"{"not_an_sdxl_tensor":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#.to_vec();
+        // Pad to an 8-byte boundary so the payload starts aligned, as the format expects.
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        bytes.extend_from_slice(&2.0f32.to_le_bytes());
+        std::fs::write(&path, bytes).expect("write stub fused checkpoint");
+        path
+    }
+
+    fn stub_fused_spec(dir: &Path, policy: OffloadPolicy) -> LoadSpec {
+        LoadSpec::new(WeightsSource::File(write_stub_fused_checkpoint(dir)))
+            .with_offload_policy(policy)
+    }
+
+    /// The narrowest public reach into `ensure_rebuildable`: a resident-only owner refuses to evict.
+    #[test]
+    fn fused_ldm_resident_load_retains_its_reload_loaders() {
+        let dir = tempfile::tempdir().expect("fixture root");
+        let spec = stub_fused_spec(dir.path(), OffloadPolicy::Resident);
+        let pin = spec
+            .weights_file_pin()
+            .expect("pin the stub checkpoint")
+            .expect("a File source resolves to a pin");
+        let residency = build_ldm_residency(&spec, &pin)
+            .expect("the fused Resident arm must build a residency");
+        let evicted = residency
+            .evict_warm()
+            .expect("a fused Resident load must retain reload loaders");
+        assert!(
+            !evicted,
+            "the warm pair is built on first use, so there is nothing to evict yet"
+        );
+    }
+
+    /// The whole point: a staged selection on a fused `Resident` instance reaches the real pinned
+    /// phase loaders instead of being refused for having none.
+    #[test]
+    fn fused_ldm_staged_selection_reaches_the_real_pinned_phase_loaders() {
+        let dir = tempfile::tempdir().expect("fixture root");
+        let spec = stub_fused_spec(dir.path(), OffloadPolicy::Resident);
+        let pin = spec
+            .weights_file_pin()
+            .expect("pin the stub checkpoint")
+            .expect("a File source resolves to a pin");
+        let residency = build_ldm_residency(&spec, &pin)
+            .expect("the fused Resident arm must build a residency");
+        let cancel = mlx_gen::CancelFlag::new();
+        let err = residency
+            .run_request_scoped(
+                // The selection admission accepts today and used to refuse here.
+                true,
+                // Rung 4 is `Missing` on a fused file; `generate` always passes `false`.
+                false,
+                &cancel,
+                false,
+                &mut |_| {},
+                |_text: &(ClipTextEncoder, ClipTextEncoder)| Ok::<(), Error>(()),
+                |_| Ok(()),
+                |_heavy: &SdxlHeavyOwned, (), _: &mut dyn FnMut(Progress)| Ok::<(), Error>(()),
+            )
+            .expect_err("the stub checkpoint carries no SDXL tensors, so the text phase must fail");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("no reload loaders"),
+            "a staged selection must reach the pinned phase loaders, not the resident-only \
+             refusal: {msg}"
+        );
+        assert!(
+            msg.contains("sdxl LDM checkpoint is missing the"),
+            "the staged text phase must have re-split the pinned fused file: {msg}"
+        );
+    }
+
+    /// The reach half of the chain: every layer between a request and `generate` accepts a staged
+    /// selection on a fused `Resident` load, which is exactly why the instance has to back it.
+    #[test]
+    fn fused_ldm_staged_residency_is_declared_and_admitted_on_every_layer() {
+        use mlx_gen::gen_core::{
+            MemoryNumericTier, MemorySelection, MemoryStrategy, MemoryStrategySupport,
+            StagedResidencyAvailability,
+        };
+
+        assert_eq!(
+            descriptor().capabilities.staged_residency_availability(),
+            StagedResidencyAvailability::Selectable,
+            "the static descriptor publishes rung 1 as selectable for every SDXL route"
+        );
+
+        let dir = tempfile::tempdir().expect("fixture root");
+        let spec = stub_fused_spec(dir.path(), OffloadPolicy::Resident);
+        let contract =
+            crate::memory_strategy::weights_free_memory_strategy_contract(descriptor().id, &spec)
+                .expect("declaration-equivalent contract for a fused load");
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::StagedResidency)
+                .map(|capability| &capability.support),
+            Some(&MemoryStrategySupport::Implemented),
+            "rung 1 is declared Implemented on a fused File + Resident load"
+        );
+        assert!(
+            !crate::memory_strategy::streamable(&spec),
+            "rung 4 stays Missing on a fused file — only rung 1 is at issue here"
+        );
+        contract
+            .validate_selection(&MemorySelection {
+                strategy: MemoryStrategy::StagedResidency,
+                parameters: Default::default(),
+                tier: MemoryNumericTier {
+                    precision: Precision::Bf16,
+                    quant: None,
+                    component_precision_floors: &[],
+                },
+            })
+            .expect("admission accepts a staged selection on a fused load");
     }
 }
 #[test]

@@ -15,11 +15,11 @@
 //!
 //! Run it:
 //! ```text
-//! cargo test --release -p mlx-gen-sdxl --test perf -- --ignored --nocapture
+//! cargo test --release -p mlx-gen-sdxl --test integration perf:: -- --ignored --nocapture
 //! ```
 //! Override geometry with `SDXL_PERF_SIZE` (square px, default 1024) / `SDXL_PERF_BATCH` (default 2).
 
-mod common;
+use crate::common;
 
 use std::time::Instant;
 

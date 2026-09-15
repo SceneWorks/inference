@@ -5,7 +5,7 @@
 //! `Flux2-Klein-9B-True-V2` `*-bf16.safetensors` single file:
 //!
 //! ```text
-//! cargo test -p candle-gen-flux2 --test convert_real_weights -- --ignored --nocapture
+//! cargo test -p candle-gen-flux2 --test integration convert_real_weights:: -- --ignored --nocapture
 //! ```
 //!
 //! The committed `convert` unit tests prove the remap *structure* (qkv split order, adaLN half-swap,

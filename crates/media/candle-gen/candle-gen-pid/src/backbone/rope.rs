@@ -8,8 +8,122 @@
 //! rotate the interleaved `(real, imag)` pairs exactly as `apply_rotary_emb` does. The whole net runs
 //! f32, so the tables and the rotation are all f32 (no upcast dance).
 
+use std::collections::VecDeque;
+use std::sync::Mutex;
+
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::Result;
+
+/// A small per-decode cache retains the distinct whole-image/tile geometries a PiD render uses while
+/// bounding retained device tables. A normal whole-image decode needs three entries (image, text, pixel);
+/// tiled decodes commonly need a few additional edge geometries.
+const MAX_ROPE_TABLES: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RopeKey {
+    Image {
+        head_dim: i32,
+        hs: i32,
+        ws: i32,
+        ref_grid_h: i32,
+        ref_grid_w: i32,
+        theta_bits: u32,
+        scale_bits: u32,
+    },
+    Text {
+        head_dim: i32,
+        length: i32,
+        theta_bits: u32,
+    },
+}
+
+/// Bounded LRU cache for the host-built RoPE tables of one [`super::PixDiT`] decode.
+///
+/// PiD rebuilds the same host vectors and uploads them once per sampler step otherwise. The backbone is
+/// owned by the per-generation `PidNet`, so this cache never crosses model loads or decode requests.
+pub(super) struct RopeTableCache {
+    entries: Mutex<VecDeque<(RopeKey, (Tensor, Tensor))>>,
+}
+
+impl Default for RopeTableCache {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::new(VecDeque::with_capacity(MAX_ROPE_TABLES)),
+        }
+    }
+}
+
+impl RopeTableCache {
+    fn get_or_build(
+        &self,
+        key: RopeKey,
+        build: impl FnOnce() -> Result<(Tensor, Tensor)>,
+    ) -> Result<(Tensor, Tensor)> {
+        let mut entries = candle_gen::lock_recover(&self.entries);
+        if let Some(index) = entries.iter().position(|(cached, _)| *cached == key) {
+            let entry = entries
+                .remove(index)
+                .expect("RoPE cache index came from this deque");
+            let tables = entry.1.clone();
+            entries.push_back(entry);
+            return Ok(tables);
+        }
+
+        let tables = build()?;
+        if entries.len() == MAX_ROPE_TABLES {
+            entries.pop_front();
+        }
+        entries.push_back((key, tables.clone()));
+        Ok(tables)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn image(
+        &self,
+        head_dim: i32,
+        hs: i32,
+        ws: i32,
+        ref_grid_h: i32,
+        ref_grid_w: i32,
+        theta: f32,
+        scale: f32,
+        device: &Device,
+    ) -> Result<(Tensor, Tensor)> {
+        self.get_or_build(
+            RopeKey::Image {
+                head_dim,
+                hs,
+                ws,
+                ref_grid_h,
+                ref_grid_w,
+                theta_bits: theta.to_bits(),
+                scale_bits: scale.to_bits(),
+            },
+            || {
+                rope_2d_ntk(
+                    head_dim, hs, ws, ref_grid_h, ref_grid_w, theta, scale, device,
+                )
+            },
+        )
+    }
+
+    pub(super) fn text(
+        &self,
+        head_dim: i32,
+        length: i32,
+        theta: f32,
+        device: &Device,
+    ) -> Result<(Tensor, Tensor)> {
+        self.get_or_build(
+            RopeKey::Text {
+                head_dim,
+                length,
+                theta_bits: theta.to_bits(),
+            },
+            || rope_1d_text(head_dim, length, theta, device),
+        )
+    }
+}
 
 /// Host `(cos, sin)` tables `[L, head_dim/2]` (f32) for the 2-D NTK-aware image RoPE.
 ///
@@ -130,4 +244,69 @@ pub fn apply_rope(q: &Tensor, k: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<
         Ok(stacked.reshape((b, h, seq, hd))?)
     };
     Ok((one(q)?, one(k)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn cache_reuses_matching_geometry_and_evicts_oldest_entry() {
+        let cache = RopeTableCache::default();
+        let builds = Cell::new(0);
+        let key = RopeKey::Text {
+            head_dim: 64,
+            length: 8,
+            theta_bits: 10_000.0f32.to_bits(),
+        };
+
+        let first = cache
+            .get_or_build(key, || build_marker_pair(&builds))
+            .unwrap();
+        let repeated = cache
+            .get_or_build(key, || build_marker_pair(&builds))
+            .unwrap();
+        assert_eq!(builds.get(), 1, "same PiD RoPE geometry must not rebuild");
+        assert_eq!(
+            first.0.to_vec2::<f32>().unwrap(),
+            repeated.0.to_vec2::<f32>().unwrap()
+        );
+        assert_eq!(
+            first.1.to_vec2::<f32>().unwrap(),
+            repeated.1.to_vec2::<f32>().unwrap()
+        );
+
+        for length in 1..=MAX_ROPE_TABLES as i32 {
+            cache
+                .get_or_build(
+                    RopeKey::Text {
+                        head_dim: 64,
+                        length: length + 100,
+                        theta_bits: 10_000.0f32.to_bits(),
+                    },
+                    || build_marker_pair(&builds),
+                )
+                .unwrap();
+        }
+        assert_eq!(builds.get(), MAX_ROPE_TABLES as i32 + 1);
+        cache
+            .get_or_build(key, || build_marker_pair(&builds))
+            .unwrap();
+        assert_eq!(
+            builds.get(),
+            MAX_ROPE_TABLES as i32 + 2,
+            "the bounded cache evicts an old geometry instead of retaining unbounded tables"
+        );
+    }
+
+    fn build_marker_pair(builds: &Cell<i32>) -> Result<(Tensor, Tensor)> {
+        builds.set(builds.get() + 1);
+        let marker = builds.get() as f32;
+        let device = Device::Cpu;
+        Ok((
+            Tensor::from_vec(vec![marker], (1, 1), &device)?,
+            Tensor::from_vec(vec![-marker], (1, 1), &device)?,
+        ))
+    }
 }

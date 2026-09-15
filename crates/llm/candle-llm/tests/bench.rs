@@ -25,7 +25,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_llm::config::ModelConfig;
 use candle_llm::device::{compute_dtype, select_device};
 use candle_llm::models::CausalLm;
-use candle_llm::primitives::{input_ids, QuantSpec, Weights};
+use candle_llm::primitives::{input_ids, KvCache, QuantSpec, Weights};
 
 const PREFILL_TOKENS: usize = 256;
 const DECODE_STEPS: usize = 128;
@@ -92,9 +92,12 @@ fn bench_variant(dir: &str, device: &Device, v: &Variant) {
     }
     device.synchronize().unwrap();
     let t = Instant::now();
+    // Keep the LAST step's logits. The loop used to discard every result with `let _ =`, which left
+    // the decode half of this bench gated by nothing but its own clock (sc-19556).
+    let mut last_decode_logits = None;
     for _ in 0..DECODE_STEPS {
         let one = synth_ids(1, vocab, device);
-        let _ = model.decode_logits(&one, &mut cache, offset).unwrap();
+        last_decode_logits = Some(model.decode_logits(&one, &mut cache, offset).unwrap());
         offset += 1;
     }
     device.synchronize().unwrap();
@@ -104,9 +107,30 @@ fn bench_variant(dir: &str, device: &Device, v: &Variant) {
         "{:<12} prefill {:>9.1} tok/s   decode {:>8.1} tok/s",
         v.label, prefill_tps, decode_tps
     );
-    assert!(
-        prefill_tps > 0.0 && decode_tps > 0.0,
-        "{}: throughput must be positive",
+    // sc-19556: `prefill_tps > 0.0 && decode_tps > 0.0` was demoted to the report above. Both are
+    // `N / Instant::elapsed()`, so the condition could only fail on a non-monotonic clock — it was
+    // green for any implementation, including one that returned garbage.
+    //
+    // What this bench must still gate is that both halves actually produced usable output, which is
+    // observable directly and without a clock. Prefill is already covered by `assert_finite(&logits)`
+    // above; the decode half was covered by nothing, because it dropped every result.
+    //
+    // The width read below is `cache.offset()` — the CACHE's own accounting, which
+    // `ContiguousKvCache` derives from the sequence axis of the keys it actually holds. An earlier
+    // revision of this gate compared the test's LOCAL `offset` counter against
+    // `PREFILL_TOKENS + WARMUP_DECODE_STEPS + DECODE_STEPS`. That was arithmetic over three
+    // constants on a variable this test increments itself and the model never writes, so it could
+    // not fail for any implementation of `decode_logits` — exactly the kind of inert assertion
+    // sc-19556 exists to remove, and it would have been one more of them. Reading the cache instead
+    // discriminates: a decode that dropped its writes, restarted the cache, or double-appended
+    // reports a different width here.
+    let decoded = last_decode_logits.expect("DECODE_STEPS must be > 0");
+    assert_finite(&decoded);
+    assert_eq!(
+        cache.offset() as usize,
+        PREFILL_TOKENS + WARMUP_DECODE_STEPS + DECODE_STEPS,
+        "{}: the KV cache must hold every prefilled and decoded position — each decode step \
+         appends exactly one, continuing the prefilled cache rather than starting a new one",
         v.label
     );
 }

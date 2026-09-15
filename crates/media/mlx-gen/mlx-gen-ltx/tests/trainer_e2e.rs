@@ -4,7 +4,7 @@
 //! `#[ignore]`d — needs a real LTX-2.3 split-weight snapshot (`$LTX_BASE_DIR` or the SceneWorks
 //! `ltx_2_3_base_q8` cache) AND the Gemma-3-12B text-encoder snapshot (`$LTX_GEMMA_DIR` or the HF
 //! cache). Run:
-//!   cargo test -p mlx-gen-ltx --release --test trainer_e2e -- --ignored --nocapture
+//!   cargo test -p mlx-gen-ltx --release --test integration trainer_e2e:: -- --ignored --nocapture
 //!
 //! Proves the full prepare→load→cache→train→save lifecycle: a tiny captioned PNG dataset is
 //! VAE/Gemma-encoded and cached (then the 24 GB TE is freed), AdamW training drives the
@@ -49,6 +49,7 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
             image_path: path,
             caption: format!("a solid colour swatch number {i}"),
             control_image_path: None,
+            model_options: Default::default(),
         });
     }
     items
@@ -57,7 +58,8 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
 #[test]
 #[ignore = "needs real LTX-2.3 + Gemma weights"]
 fn ltx_trainer_trains_and_writes_lora_that_reloads() {
-    let tmp = std::env::temp_dir().join("ltx_trainer_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
     assert_eq!(mlx_gen_ltx::MODEL_ID, "ltx_2_3");
 
@@ -182,7 +184,8 @@ fn ltx_trainer_trains_and_writes_lora_that_reloads() {
 #[test]
 #[ignore = "needs real LTX-2.3 + Gemma weights"]
 fn ltx_trainer_trains_with_gradient_checkpointing() {
-    let tmp = std::env::temp_dir().join("ltx_trainer_e2e_ckpt");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
 
     let mut trainer = mlx_gen_ltx::provider_registry()
@@ -247,11 +250,12 @@ fn ltx_trainer_trains_with_gradient_checkpointing() {
 /// sc-5637 — preview samples (one still frame). Proves the LTX render path (install in-progress
 /// adapter → distilled single-stage Euler over the real `STAGE1_SIGMAS` → VAE decode → first frame as
 /// `Image`) on real weights. Run:
-///   cargo test -p mlx-gen-ltx --release --test trainer_e2e -- --ignored --nocapture ltx_trainer_emits_preview_samples
+///   cargo test -p mlx-gen-ltx --release --test integration -- --ignored --nocapture trainer_e2e::ltx_trainer_emits_preview_samples
 #[test]
 #[ignore = "needs real ltx_2_3_base_q8 weights (~20 GB) + the Gemma encoder"]
 fn ltx_trainer_emits_preview_samples() {
-    let tmp = std::env::temp_dir().join("ltx_trainer_samples_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
     assert_eq!(mlx_gen_ltx::MODEL_ID, "ltx_2_3");
     let mut trainer = mlx_gen_ltx::provider_registry()

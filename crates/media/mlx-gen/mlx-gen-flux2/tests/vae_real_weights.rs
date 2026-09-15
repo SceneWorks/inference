@@ -3,7 +3,7 @@
 //! `tools/dump_flux2_vae_golden.py` (gitignored):
 //!
 //!   cd ~/repos/mflux && .venv/bin/python ~/repos/mlx-gen/tools/dump_flux2_vae_golden.py
-//!   cargo test -p mlx-gen-flux2 --test vae_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux2 --test integration vae_real_weights:: -- --ignored --nocapture
 //!
 //! The fork golden is dumped at **f32** (the Rust VAE's precision); the gate is tight. Golden
 //! tensors are NCHW (fork-native); the Rust VAE is NHWC, so inputs/outputs are transposed here.

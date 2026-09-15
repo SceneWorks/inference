@@ -32,13 +32,15 @@ use mlx_rs::ops::{
 };
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::gen_core::{WAN_Z48_MEAN as VAE22_MEAN, WAN_Z48_STD as VAE22_STD};
 use mlx_gen::nn::{conv2d, conv3d, silu, upsample_nearest};
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, Error, Result};
+use mlx_gen::{CancelFlag, Error, LatentDecoder, Result};
 
 use crate::vae_common::{
-    contiguous, eval, last_t_axis, scalar, slice_axis, tile_decode_accumulate, FeatCache,
+    contiguous, eval, last_t_axis, scalar, slice_axis, tile_decode_accumulate,
+    validate_decoder_tiling, FeatCache,
 };
 
 /// Last-`CACHE_T` frames are carried across chunks as causal left-context during encode.
@@ -46,29 +48,365 @@ const CACHE_T: i32 = 2;
 /// Channel-L2 norm floor (reference `mx.maximum(l2_sq, 1e-24)`).
 const NORM_EPS: f32 = 1e-24;
 
-/// Per-channel latent normalization for z_dim=48 (reference `VAE22_MEAN`/`VAE22_STD`). These are
-/// architecture constants (not learned), hardcoded here and gated by the fixture.
-const VAE22_MEAN: [f32; 48] = [
-    -0.2289, -0.0052, -0.1323, -0.2339, -0.2799, 0.0174, 0.1838, 0.1557, -0.1382, 0.0542, 0.2813,
-    0.0891, 0.1570, -0.0098, 0.0375, -0.1825, -0.2246, -0.1207, -0.0698, 0.5109, 0.2665, -0.2108,
-    -0.2158, 0.2502, -0.2055, -0.0322, 0.1109, 0.1567, -0.0729, 0.0899, -0.2799, -0.1230, -0.0313,
-    -0.1649, 0.0117, 0.0723, -0.2839, -0.2083, -0.0520, 0.3748, 0.0152, 0.1957, 0.1433, -0.2944,
-    0.3573, -0.0548, -0.1681, -0.0667,
-];
-const VAE22_STD: [f32; 48] = [
-    0.4765, 1.0364, 0.4514, 1.1677, 0.5313, 0.4990, 0.4818, 0.5013, 0.8158, 1.0344, 0.5894, 1.0901,
-    0.6885, 0.6165, 0.8454, 0.4978, 0.5759, 0.3523, 0.7135, 0.6804, 0.5833, 1.4146, 0.8986, 0.5659,
-    0.7069, 0.5338, 0.4889, 0.4917, 0.4069, 0.4999, 0.6866, 0.4093, 0.5709, 0.6065, 0.6415, 0.4944,
-    0.5726, 1.2042, 0.5458, 1.6887, 0.3971, 1.0600, 0.3943, 0.5537, 0.5444, 0.4089, 0.7468, 0.7744,
-];
-
 /// vae22 fixed structure (dim_mult [1,2,4,4], 2 res-blocks/stage).
 const DIM_MULT_LEN: usize = 4;
 const NUM_RES_BLOCKS: usize = 2;
+const DIM_MULT: [usize; DIM_MULT_LEN] = [1, 2, 4, 4];
+const PRODUCTION_DEC_DIM: usize = 256;
+const PRODUCTION_ENC_DIM: usize = 160;
+const PRODUCTION_Z_DIM: usize = 48;
 /// Decoder temporal-upsample per stage (`upsample3d` vs `upsample2d`).
 const TEMPORAL_UPSAMPLE: [bool; 3] = [true, true, false];
 /// Encoder temporal-downsample per stage (`downsample3d` vs `downsample2d`).
 const TEMPORAL_DOWNSAMPLE: [bool; 3] = [false, true, true];
+
+/// One tensor consumed by the fixed Wan2.2 z48 VAE loader topology.
+///
+/// This is intentionally generated from the same stage widths/counts used by [`Wan22Vae`]'s
+/// constructors rather than maintained as a second flat checkpoint-key list. Header-only callers
+/// use it to prove a converted checkpoint is load-exact before publishing asset residency.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Wan22TensorSpec {
+    pub(crate) name: String,
+    pub(crate) shape: Vec<usize>,
+}
+
+/// The loader-owned decoder/encoder tensor topology for one Wan2.2 VAE width configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Wan22WeightSchema {
+    pub(crate) decoder: Vec<Wan22TensorSpec>,
+    pub(crate) encoder: Vec<Wan22TensorSpec>,
+}
+
+impl Wan22WeightSchema {
+    pub(crate) fn tensors(&self) -> impl Iterator<Item = &Wan22TensorSpec> {
+        self.decoder.iter().chain(self.encoder.iter())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Wan22Topology {
+    dec_dim: usize,
+    enc_dim: usize,
+    z_dim: usize,
+}
+
+impl Wan22Topology {
+    fn from_i32(dec_dim: i32, enc_dim: i32, z_dim: i32) -> Result<Self> {
+        let positive = |label: &str, value: i32| {
+            usize::try_from(value)
+                .ok()
+                .filter(|&value| value > 0)
+                .ok_or_else(|| Error::Msg(format!("vae22: {label} must be positive, got {value}")))
+        };
+        Ok(Self {
+            dec_dim: positive("decoder width", dec_dim)?,
+            enc_dim: positive("encoder width", enc_dim)?,
+            z_dim: positive("latent width", z_dim)?,
+        })
+    }
+
+    fn production() -> Self {
+        Self {
+            dec_dim: PRODUCTION_DEC_DIM,
+            enc_dim: PRODUCTION_ENC_DIM,
+            z_dim: PRODUCTION_Z_DIM,
+        }
+    }
+
+    fn decoder_stage_dims(self) -> [usize; DIM_MULT_LEN + 1] {
+        [
+            self.dec_dim * DIM_MULT[DIM_MULT_LEN - 1],
+            self.dec_dim * DIM_MULT[3],
+            self.dec_dim * DIM_MULT[2],
+            self.dec_dim * DIM_MULT[1],
+            self.dec_dim * DIM_MULT[0],
+        ]
+    }
+
+    fn encoder_stage_dims(self) -> [usize; DIM_MULT_LEN + 1] {
+        [
+            self.enc_dim,
+            self.enc_dim * DIM_MULT[0],
+            self.enc_dim * DIM_MULT[1],
+            self.enc_dim * DIM_MULT[2],
+            self.enc_dim * DIM_MULT[3],
+        ]
+    }
+
+    fn schema(self) -> Wan22WeightSchema {
+        let mut decoder = Vec::new();
+        push_conv3d(&mut decoder, "conv2", self.z_dim, self.z_dim, 1, 1, 1);
+
+        let decoder_dims = self.decoder_stage_dims();
+        let decoder_middle = decoder_dims[0];
+        push_conv3d(
+            &mut decoder,
+            "decoder.conv1",
+            decoder_middle,
+            self.z_dim,
+            3,
+            3,
+            3,
+        );
+        push_residual(
+            &mut decoder,
+            "decoder.middle.0",
+            decoder_middle,
+            decoder_middle,
+        );
+        push_attention(&mut decoder, "decoder.middle.1", decoder_middle);
+        push_residual(
+            &mut decoder,
+            "decoder.middle.2",
+            decoder_middle,
+            decoder_middle,
+        );
+        for stage in 0..DIM_MULT_LEN {
+            let input = decoder_dims[stage];
+            let output = decoder_dims[stage + 1];
+            let prefix = format!("decoder.upsamples.{stage}");
+            for block in 0..=NUM_RES_BLOCKS {
+                push_residual(
+                    &mut decoder,
+                    &format!("{prefix}.upsamples.{block}"),
+                    if block == 0 { input } else { output },
+                    output,
+                );
+            }
+            if stage != DIM_MULT_LEN - 1 {
+                let resample = format!("{prefix}.upsamples.{}", NUM_RES_BLOCKS + 1);
+                if TEMPORAL_UPSAMPLE.get(stage).copied().unwrap_or(false) {
+                    push_conv3d(
+                        &mut decoder,
+                        &format!("{resample}.time_conv"),
+                        output * 2,
+                        output,
+                        3,
+                        1,
+                        1,
+                    );
+                }
+                push_conv2d(&mut decoder, &resample, "resample", output, output, 3, 3);
+            }
+        }
+        push_head(&mut decoder, "decoder.head", decoder_dims[DIM_MULT_LEN], 12);
+
+        // `convert_ti2v_5b` always emits the full encoder. The top-level `conv1` consumes the
+        // encoder head's 2*z moments after sampling; it is part of the encoder half even though its
+        // key is not under `encoder.*`.
+        let mut encoder = Vec::new();
+        push_conv3d(
+            &mut encoder,
+            "conv1",
+            self.z_dim * 2,
+            self.z_dim * 2,
+            1,
+            1,
+            1,
+        );
+        let encoder_dims = self.encoder_stage_dims();
+        push_conv3d(&mut encoder, "encoder.conv1", encoder_dims[0], 12, 3, 3, 3);
+        for stage in 0..DIM_MULT_LEN {
+            let input = encoder_dims[stage];
+            let output = encoder_dims[stage + 1];
+            let prefix = format!("encoder.downsamples.{stage}");
+            for block in 0..NUM_RES_BLOCKS {
+                push_residual(
+                    &mut encoder,
+                    &format!("{prefix}.downsamples.{block}"),
+                    if block == 0 { input } else { output },
+                    output,
+                );
+            }
+            if stage < DIM_MULT_LEN - 1 {
+                let resample = format!("{prefix}.downsamples.{NUM_RES_BLOCKS}");
+                push_conv2d(&mut encoder, &resample, "resample", output, output, 3, 3);
+                if TEMPORAL_DOWNSAMPLE.get(stage).copied().unwrap_or(false) {
+                    push_conv3d(
+                        &mut encoder,
+                        &format!("{resample}.time_conv"),
+                        output,
+                        output,
+                        3,
+                        1,
+                        1,
+                    );
+                }
+            }
+        }
+        let encoder_middle = encoder_dims[DIM_MULT_LEN];
+        push_residual(
+            &mut encoder,
+            "encoder.middle.0",
+            encoder_middle,
+            encoder_middle,
+        );
+        push_attention(&mut encoder, "encoder.middle.1", encoder_middle);
+        push_residual(
+            &mut encoder,
+            "encoder.middle.2",
+            encoder_middle,
+            encoder_middle,
+        );
+        push_head(&mut encoder, "encoder.head", encoder_middle, self.z_dim * 2);
+
+        Wan22WeightSchema { decoder, encoder }
+    }
+
+    fn validate_loaded_shapes(self, weights: &Weights, include_encoder: bool) -> Result<()> {
+        let schema = self.schema();
+        let specs = schema.decoder.iter().chain(
+            include_encoder
+                .then_some(schema.encoder.iter())
+                .into_iter()
+                .flatten(),
+        );
+        for spec in specs {
+            let value = weights.require(&spec.name)?;
+            let expected: Vec<i32> = spec
+                .shape
+                .iter()
+                .map(|&dimension| {
+                    i32::try_from(dimension).map_err(|_| {
+                        Error::Msg(format!(
+                            "vae22: tensor {} dimension {dimension} exceeds MLX i32 shape range",
+                            spec.name
+                        ))
+                    })
+                })
+                .collect::<Result<_>>()?;
+            if value.shape() != expected {
+                return Err(Error::Msg(format!(
+                    "vae22: tensor {} has shape {:?}, expected {:?}",
+                    spec.name,
+                    value.shape(),
+                    expected
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn push_tensor(tensors: &mut Vec<Wan22TensorSpec>, name: impl Into<String>, shape: &[usize]) {
+    tensors.push(Wan22TensorSpec {
+        name: name.into(),
+        shape: shape.to_vec(),
+    });
+}
+
+fn push_conv3d(
+    tensors: &mut Vec<Wan22TensorSpec>,
+    prefix: &str,
+    output: usize,
+    input: usize,
+    kt: usize,
+    kh: usize,
+    kw: usize,
+) {
+    push_tensor(
+        tensors,
+        format!("{prefix}.weight"),
+        &[output, kt, kh, kw, input],
+    );
+    push_tensor(tensors, format!("{prefix}.bias"), &[output]);
+}
+
+fn push_conv2d(
+    tensors: &mut Vec<Wan22TensorSpec>,
+    prefix: &str,
+    leaf: &str,
+    output: usize,
+    input: usize,
+    kh: usize,
+    kw: usize,
+) {
+    push_tensor(
+        tensors,
+        format!("{prefix}.{leaf}_weight"),
+        &[output, kh, kw, input],
+    );
+    push_tensor(tensors, format!("{prefix}.{leaf}_bias"), &[output]);
+}
+
+fn push_residual(tensors: &mut Vec<Wan22TensorSpec>, prefix: &str, input: usize, output: usize) {
+    push_tensor(
+        tensors,
+        format!("{prefix}.residual.layer_0.gamma"),
+        &[input],
+    );
+    push_conv3d(
+        tensors,
+        &format!("{prefix}.residual.layer_2"),
+        output,
+        input,
+        3,
+        3,
+        3,
+    );
+    push_tensor(
+        tensors,
+        format!("{prefix}.residual.layer_3.gamma"),
+        &[output],
+    );
+    push_conv3d(
+        tensors,
+        &format!("{prefix}.residual.layer_6"),
+        output,
+        output,
+        3,
+        3,
+        3,
+    );
+    if input != output {
+        push_conv3d(
+            tensors,
+            &format!("{prefix}.shortcut"),
+            output,
+            input,
+            1,
+            1,
+            1,
+        );
+    }
+}
+
+fn push_attention(tensors: &mut Vec<Wan22TensorSpec>, prefix: &str, channels: usize) {
+    push_tensor(tensors, format!("{prefix}.norm.gamma"), &[channels]);
+    push_tensor(
+        tensors,
+        format!("{prefix}.to_qkv_weight"),
+        &[channels * 3, 1, 1, channels],
+    );
+    push_tensor(tensors, format!("{prefix}.to_qkv_bias"), &[channels * 3]);
+    push_tensor(
+        tensors,
+        format!("{prefix}.proj_weight"),
+        &[channels, 1, 1, channels],
+    );
+    push_tensor(tensors, format!("{prefix}.proj_bias"), &[channels]);
+}
+
+fn push_head(tensors: &mut Vec<Wan22TensorSpec>, prefix: &str, input: usize, output: usize) {
+    push_tensor(tensors, format!("{prefix}.layer_0.gamma"), &[input]);
+    push_conv3d(
+        tensors,
+        &format!("{prefix}.layer_2"),
+        output,
+        input,
+        3,
+        3,
+        3,
+    );
+}
+
+/// Complete production schema emitted by [`crate::convert::convert_ti2v_5b`] and consumed by
+/// [`Wan22Vae::from_weights`]. Both decoder and encoder are required for that canonical converter
+/// identity even when a particular request is plain T2V.
+pub(crate) fn production_weight_schema() -> Wan22WeightSchema {
+    Wan22Topology::production().schema()
+}
 
 /// `x / max(‖x‖₂ over last axis, 1e-24) · √C · γ` — channel-L2 norm over the **last** axis (vae22's
 /// `RMS_norm`). `gamma` carries `C` elements and broadcasts on the last axis.
@@ -712,18 +1050,14 @@ struct Decoder3d {
 impl Decoder3d {
     /// `dec_dim` is the decoder base width (256 in production); the latent channel count rides on
     /// the `conv1` weight, so it isn't needed here.
-    fn from_weights(w: &Weights, dec_dim: i32) -> Result<Self> {
+    fn from_weights(w: &Weights, topology: Wan22Topology) -> Result<Self> {
         let p = "decoder";
-        // dims = [dec_dim*dim_mult[-1]] + [dec_dim*m for m in reversed([1,2,4,4])]
-        let dim_mult = [1, 2, 4, 4];
-        let mut dims = vec![dec_dim * dim_mult[DIM_MULT_LEN - 1]];
-        for &m in dim_mult.iter().rev() {
-            dims.push(dec_dim * m);
-        }
+        // The same widths generate the header-only schema used by memory admission.
+        let dims = topology.decoder_stage_dims();
         let mut upsamples = Vec::new();
         for i in 0..DIM_MULT_LEN {
-            let in_c = dims[i];
-            let out_c = dims[i + 1];
+            let in_c = dims[i] as i32;
+            let out_c = dims[i + 1] as i32;
             let temporal = TEMPORAL_UPSAMPLE.get(i).copied().unwrap_or(false);
             let up_flag = i != DIM_MULT_LEN - 1;
             upsamples.push(UpResBlock::from_weights(
@@ -749,11 +1083,29 @@ impl Decoder3d {
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
+        self.forward_upsample_tail(&self.forward_middle(x)?)
+    }
+
+    /// The **globally-scoped** half: `conv1` → the three middle blocks, at latent resolution
+    /// (sc-19753).
+    ///
+    /// `middle.1` is an [`AttentionBlock`] whose softmax spans every `H·W` spatial token of a frame
+    /// ([`AttentionBlock::forward`]), so a spatial tile that runs it attends only to its own crop.
+    /// The channel-L2 [`rms_norm_last`] used throughout this VAE reduces only the last (channel)
+    /// axis and is genuinely tiling-invariant; the attention is the op that is not.
+    fn forward_middle(&self, x: &Array) -> Result<Array> {
         let mut x = self.conv1.forward(x, None)?;
         x = self.middle.0.forward(&x)?;
         x = self.middle.1.forward(&x)?;
         x = self.middle.2.forward(&x)?;
         eval(&x)?;
+        Ok(x)
+    }
+
+    /// The **spatially-local** half: the `UpResBlock` stack and the `Head22` epilogue. Convolutions,
+    /// nearest upsample, channel-duplicating shortcuts and the per-position channel-L2 norm only.
+    fn forward_upsample_tail(&self, middle: &Array) -> Result<Array> {
+        let mut x = middle.clone();
         for up in &self.upsamples {
             x = up.forward(&x, true)?;
             eval(&x)?;
@@ -773,19 +1125,15 @@ struct Encoder3d {
 
 impl Encoder3d {
     /// `enc_dim` is the encoder base width (160 in production), `z2` the head output (= z_dim·2).
-    fn from_weights(w: &Weights, enc_dim: i32) -> Result<Self> {
+    fn from_weights(w: &Weights, topology: Wan22Topology) -> Result<Self> {
         let p = "encoder";
-        let dim_mult = [1, 2, 4, 4];
-        // dims = [enc_dim*m for m in [1] + dim_mult] = [enc, enc, 2enc, 4enc, 4enc]
-        let mut dims = vec![enc_dim];
-        for &m in dim_mult.iter() {
-            dims.push(enc_dim * m);
-        }
+        // The same widths generate the header-only schema used by memory admission.
+        let dims = topology.encoder_stage_dims();
         let mut downsamples = Vec::new();
         let mut cache_slots = 1usize; // conv1
         for i in 0..DIM_MULT_LEN {
-            let in_c = dims[i];
-            let out_c = dims[i + 1];
+            let in_c = dims[i] as i32;
+            let out_c = dims[i + 1] as i32;
             let temporal = TEMPORAL_DOWNSAMPLE.get(i).copied().unwrap_or(false);
             let down_flag = i < DIM_MULT_LEN - 1;
             let stage = DownResBlock::from_weights(
@@ -870,11 +1218,65 @@ pub struct Wan22Vae {
     compute_dtype: Dtype,
 }
 
+/// Generic decode adapter for the Wan 2.2 z48 video VAE. The underlying implementation is
+/// channels-last; the trait boundary normalizes its decoded output to NCTHW like the other decoders.
+pub struct Wan22VideoDecoder<'a> {
+    vae: &'a Wan22Vae,
+}
+
+impl<'a> Wan22VideoDecoder<'a> {
+    pub fn new(vae: &'a Wan22Vae) -> Self {
+        Self { vae }
+    }
+
+    fn to_ncthw(decoded: &Array) -> Result<Array> {
+        let shape = decoded.shape();
+        if shape.len() != 5 || shape[4] != 3 {
+            return Err(Error::Msg(format!(
+                "Wan z48 decoder produced invalid [B,T,H,W,3] output {shape:?}"
+            )));
+        }
+        Ok(decoded.transpose_axes(&[0, 4, 1, 2, 3])?)
+    }
+}
+
+impl LatentDecoder for Wan22VideoDecoder<'_> {
+    fn input_latent_space(&self) -> Option<&mlx_gen::gen_core::LatentSpace> {
+        Some(&mlx_gen::gen_core::WAN_Z48_LATENT_SPACE)
+    }
+
+    fn decode(&self, latents: &Array) -> Result<Array> {
+        Self::to_ncthw(&self.vae.decode(latents)?)
+    }
+
+    fn decode_tiled(
+        &self,
+        latents: &Array,
+        tiling: &TilingConfig,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
+        let shape = latents.shape();
+        if shape.len() != 4 {
+            return Err(Error::Msg(format!(
+                "Wan z48 video decoder expects [C,T,H,W], got {shape:?}"
+            )));
+        }
+        validate_decoder_tiling(tiling, VaeTiling::WAN22, shape[1])?;
+        Self::to_ncthw(&self.vae.decode_tiled(latents, tiling, cancel)?)
+    }
+}
+
 impl Wan22Vae {
+    /// Geometry owned by the concrete causal z48 decoder.
+    pub const VAE_TILING: VaeTiling = VaeTiling::WAN22;
+
     /// Build from a weight map (`convert`-sanitized channels-last keys). Structure is fixed by the
     /// vae22 config; channel widths ride on the weights, so the same builder serves production (enc
-    /// 160 / dec 256) and the tiny parity fixture. The encoder is loaded only if its weights are
-    /// present (`encoder.conv1.weight`).
+    /// 160 / dec 256) and the tiny parity fixture. The encoder remains optional for decode-only
+    /// callers, but any top-level `conv1.*` or `encoder.*` leaf requires its complete topology.
     pub fn from_weights(w: &Weights) -> Result<Self> {
         Self::from_weights_dims(w, 256, 160, 48)
     }
@@ -882,18 +1284,26 @@ impl Wan22Vae {
     /// Build with explicit base widths + latent dim (the fixture uses tiny widths; `z_dim` stays 48
     /// in production so `VAE22_MEAN`/`STD` apply — a smaller `z_dim` fixture must inject its own).
     pub fn from_weights_dims(w: &Weights, dec_dim: i32, enc_dim: i32, z_dim: i32) -> Result<Self> {
+        let topology = Wan22Topology::from_i32(dec_dim, enc_dim, z_dim)?;
+        // Treat either the top-level encoder projection or any `encoder.*` leaf as the encoder
+        // discriminator. Once present, the complete encoder topology is required; a partially
+        // converted checkpoint must never build a deceptively decode-only VAE.
+        let has_encoder = w
+            .keys()
+            .any(|key| key == "conv1.weight" || key == "conv1.bias" || key.starts_with("encoder."));
+        topology.validate_loaded_shapes(w, has_encoder)?;
         let (mean, std) = Self::mean_std(w, z_dim)?;
-        let encoder = if w.get("encoder.conv1.weight").is_some() {
+        let encoder = if has_encoder {
             Some((
                 CausalConv3d22::from_weights(w, "conv1", 1, 0, 0, 0)?, // 1×1×1 pointwise
-                Encoder3d::from_weights(w, enc_dim)?,
+                Encoder3d::from_weights(w, topology)?,
             ))
         } else {
             None
         };
         Ok(Self {
             conv2: CausalConv3d22::from_weights(w, "conv2", 1, 0, 0, 0)?, // 1×1×1 pointwise
-            decoder: Decoder3d::from_weights(w, dec_dim)?,
+            decoder: Decoder3d::from_weights(w, topology)?,
             encoder,
             z_dim,
             mean,
@@ -950,33 +1360,51 @@ impl Wan22Vae {
         contiguous(&minimum(&maximum(&out, scalar(-1.0))?, scalar(1.0))?)
     }
 
-    /// Decode with **tiling** for memory-bounded large/long video. Splits the channels-last latent
-    /// `[1,T,H,W,z]` into overlapping tiles, decodes each (denorm + conv2 + decoder + unpatchify +
-    /// clamp), and trapezoidally blends. Falls back to single-pass [`Self::decode`] when `cfg` doesn't fire.
+    /// Decode with **tiling** for memory-bounded large/long video. Splits the channels-last middle
+    /// feature map into overlapping tiles, runs the upsample tail + unpatchify + clamp on each, and
+    /// trapezoidally blends. Falls back to single-pass [`Self::decode`] when `cfg` doesn't fire.
     /// vae22 upsamples 16× spatially, 4× temporally, **causally** ([`VaeTiling::WAN22`]).
+    ///
+    /// **Normalization semantics (sc-19753).** Denormalize, `conv2` and the decoder's middle blocks
+    /// — including the spatial self-attention — run **once** on the full latent
+    /// (`Decoder3d::forward_middle`); only the spatially-local tail is tiled. This previously ran
+    /// the whole decoder per tile, so every spatial tile's `middle.1` softmax attended over its own
+    /// crop's token set instead of the frame's. The middle blocks are shape-preserving at latent
+    /// resolution, so the tile plan is unchanged.
+    ///
+    /// **Memory cost of the dense head**, as for the z16 sibling: the middle feature map is
+    /// materialized whole, but at *latent* resolution and in `compute_dtype`, so it is a fraction of
+    /// the full-size output accumulator the tiling already required.
     pub fn decode_tiled(
         &self,
         latent_czthw: &Array,
         cfg: &TilingConfig,
         cancel: Option<&CancelFlag>,
     ) -> Result<Array> {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
         let z = self.to_channels_last(latent_czthw)?; // [1,T,H,W,z]
         let sh = z.shape();
         let (f, h, w) = (sh[1], sh[2], sh[3]);
-        if !cfg.needs_tiling(VaeTiling::WAN22, f, h, w) {
+        if !cfg.needs_tiling(Self::VAE_TILING, f, h, w) {
             return self.decode_cl(&z);
         }
         let denorm = add(&multiply(&z, &self.std)?, &self.mean)?;
-        let plan = cfg.plan(VaeTiling::WAN22, f, h, w);
+        // The attention-bearing middle blocks run once, in `compute_dtype`, on the full latent.
+        let middle = self.decoder.forward_middle(
+            &self
+                .conv2
+                .forward(&denorm.as_dtype(self.compute_dtype)?, None)?,
+        )?;
+        let plan = cfg.plan(Self::VAE_TILING, f, h, w);
 
-        // Channels-last: channel axis last, tiled axes [1, 2, 3]. Per-tile decode adds the 2× spatial
+        // Channels-last: channel axis last, tiled axes [1, 2, 3]. Per-tile work adds the 2× spatial
         // unpatchify (vae22 upsamples 16× via decoder×8 + patch×2) before the clamp. The per-tile
         // body runs in `compute_dtype` (bf16 halves its activation peak, sc-5039); the f32 blend
         // accumulators are unchanged (the clamp scalars promote each tile back to f32).
-        tile_decode_accumulate(&denorm, &plan, [1, 2, 3], cancel, |tile| {
-            let tile = tile.as_dtype(self.compute_dtype)?;
-            let x = self.conv2.forward(&tile, None)?;
-            let dec = self.decoder.forward(&x)?;
+        tile_decode_accumulate(&middle, &plan, [1, 2, 3], cancel, |tile| {
+            let dec = self.decoder.forward_upsample_tail(tile)?;
             let dec = unpatchify(&dec, 2)?;
             Ok(minimum(&maximum(&dec, scalar(-1.0))?, scalar(1.0))?)
         })

@@ -15,30 +15,24 @@
 //! `candle_gen_sdxl::IpAdapterSdxl`), not a gen-core-registered `Generator` — the
 //! registered `flux1_*` descriptors stay txt2img-only.
 
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-
-use crate::vae::native::AutoEncoder;
 use candle_core::{DType, Device, Tensor};
-use candle_transformers::models::clip::text_model::ClipTextTransformer;
 use candle_transformers::models::flux::sampling::{get_schedule, State};
-use candle_transformers::models::t5::T5EncoderModel;
+use std::path::{Path, PathBuf};
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{Image, Progress};
+use candle_gen::gen_core::{AdapterSpec, GenerationMemory, Image, PreviewSink, Progress};
+use candle_gen::preview::PreviewHook;
 use candle_gen::weights::Weights;
 use candle_gen::{CandleError, Result};
 
 use crate::flux1_load;
 use crate::ip_adapter::{FluxIpAdapter, FluxIpInjector};
-use crate::ip_dit::IpFlux;
 use crate::ip_image_encoder::FluxIpImageEncoder;
-use crate::pipeline::{decode_latents, encode_text, flow_mu, flux_config, BASE_SHIFT, MAX_SHIFT};
+use crate::pipeline::{flow_mu, BASE_SHIFT, MAX_SHIFT};
+use crate::ref_backbone::{FluxRefBackbone, FluxRefHeavy};
 use crate::Variant;
 
-/// The provider-specific error label for the shared [`crate::flux1_load`] diagnostics.
-const LABEL: &str = "flux ip-adapter";
 /// FLUX runs at bf16.
 const DTYPE: DType = DType::BF16;
 /// FLUX latent channel count (the raw VAE latent / initial noise; the DiT packs it 2×2 to 64).
@@ -66,6 +60,7 @@ pub struct IpAdapterFluxPaths {
     /// The CLIP ViT-L/14 image encoder (`openai/clip-vit-large-patch14`) — a dir (`model.safetensors`)
     /// or the file directly.
     pub image_encoder: PathBuf,
+    pub adapters: Vec<AdapterSpec>,
 }
 
 /// One FLUX IP-Adapter generation request.
@@ -80,6 +75,14 @@ pub struct IpAdapterFluxRequest {
     /// IP-Adapter scale (the decoupled-cross-attn weight on the reference image tokens).
     pub ip_adapter_scale: f32,
     pub seed: u64,
+    /// Shared FLUX memory ladder selected by worker admission.
+    pub memory: GenerationMemory,
+    /// Per-step latent-preview sink (epic 16948, sc-16956) — the bespoke-request twin of
+    /// [`gen_core::GenerationRequest::preview`](candle_gen::gen_core::GenerationRequest::preview),
+    /// which this provider cannot carry because it is worker-invoked by name rather than through a
+    /// registered descriptor. Default is inert, and an inert sink makes a seeded render byte-identical
+    /// to one with no preview at all.
+    pub preview: PreviewSink,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
 }
@@ -94,6 +97,8 @@ impl Default for IpAdapterFluxRequest {
             guidance: 3.5,
             ip_adapter_scale: DEFAULT_IP_SCALE,
             seed: 0,
+            memory: GenerationMemory::default(),
+            preview: PreviewSink::default(),
             cancel: CancelFlag::default(),
         }
     }
@@ -127,10 +132,34 @@ fn detect_variant(flux_base: &Path) -> Result<Variant> {
         .is_file()
     {
         Ok(Variant::Schnell)
+    } else if flux_base.join("transformer/config.json").is_file() {
+        let path = flux_base.join("transformer/config.json");
+        let bytes = std::fs::read(&path).map_err(|error| {
+            CandleError::Msg(format!(
+                "flux ip-adapter: read packed transformer config {}: {error}",
+                path.display()
+            ))
+        })?;
+        let config: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+            CandleError::Msg(format!(
+                "flux ip-adapter: parse packed transformer config {}: {error}",
+                path.display()
+            ))
+        })?;
+        Ok(
+            if config
+                .get("guidance_embeds")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                Variant::Dev
+            } else {
+                Variant::Schnell
+            },
+        )
     } else {
         Err(CandleError::Msg(format!(
-            "flux ip-adapter: no flux1-dev/flux1-schnell .safetensors in {} (expected a \
-             black-forest-labs FLUX.1 snapshot)",
+            "flux ip-adapter: no BFL checkpoint or packed transformer/config.json in {}",
             flux_base.display()
         )))
     }
@@ -140,17 +169,9 @@ fn detect_variant(flux_base: &Path) -> Result<Variant> {
 /// adapter, and the CLIP ViT-L image encoder.
 pub struct IpAdapterFlux {
     variant: Variant,
-    /// T5 + CLIP tokenizers, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
-    /// instead of re-parsing per prompt in `encode_text`.
-    toks: crate::pipeline::FluxTokenizers,
     device: Device,
     dtype: DType,
-    clip: ClipTextTransformer,
-    /// Behind a `Mutex` because `T5EncoderModel::forward` takes `&mut self` while `generate` is `&self`;
-    /// locked only for the once-per-request text encode.
-    t5: Mutex<T5EncoderModel>,
-    transformer: IpFlux,
-    vae: AutoEncoder,
+    backbone: FluxRefBackbone,
     ip_encoder: FluxIpImageEncoder,
     adapter: FluxIpAdapter,
 }
@@ -159,22 +180,27 @@ impl IpAdapterFlux {
     /// Load the FLUX backbone (text encoders + forked DiT + VAE) + the XLabs adapter + the CLIP ViT-L
     /// image encoder from a FLUX snapshot, the XLabs `ip_adapter.safetensors`, and a CLIP image encoder.
     pub fn load(paths: &IpAdapterFluxPaths) -> Result<Self> {
+        Self::load_with_memory(paths, GenerationMemory::default())
+    }
+
+    pub fn load_with_memory(paths: &IpAdapterFluxPaths, memory: GenerationMemory) -> Result<Self> {
         let device = candle_gen::default_device()?;
         let dtype = DTYPE;
         let root = paths.flux_base.clone();
         let variant = detect_variant(&root)?;
 
         // CLIP-L + T5-XXL text encoders (shared FLUX.1 backbone load, sc-9003).
-        let (clip, t5) = flux1_load::text_encoders(&root, dtype, &device, LABEL)?;
+        let backbone = FluxRefBackbone::load_with_memory(
+            &root,
+            variant,
+            &device,
+            dtype,
+            memory,
+            paths.adapters.clone(),
+        )?;
 
         // The forked FLUX DiT (the IP seam) from the root BFL checkpoint — the genuine per-provider drift
         // (IpFlux, not the stock Flux), so the wrapper choice stays here over the shared mmap.
-        let dit_vb = flux1_load::dit_vb(&root, variant, dtype, &device, LABEL)?;
-        let transformer = IpFlux::new(&flux_config(variant), dit_vb)?;
-
-        // FLUX AutoEncoder (`ae.safetensors`).
-        let (vae, _vae_vb) = flux1_load::vae(&root, variant, dtype, &device, LABEL)?;
-
         // XLabs adapter weights (`ip_adapter.safetensors`).
         let ipa = Weights::from_file(&paths.ip_adapter, &device, dtype).map_err(|e| {
             CandleError::Msg(format!(
@@ -183,11 +209,10 @@ impl IpAdapterFlux {
             ))
         })?;
         let adapter = FluxIpAdapter::from_weights(&ipa)?;
-        if adapter.num_blocks() != transformer.num_double_blocks() {
+        if adapter.num_blocks() != 19 {
             return Err(CandleError::Msg(format!(
-                "flux ip-adapter: adapter has {} double-block pairs but the DiT has {} double blocks",
+                "flux ip-adapter: adapter has {} double-block pairs but FLUX.1 has 19 double blocks",
                 adapter.num_blocks(),
-                transformer.num_double_blocks()
             )));
         }
 
@@ -200,16 +225,11 @@ impl IpAdapterFlux {
         })?;
         let ip_encoder = FluxIpImageEncoder::from_weights(&enc_w)?;
 
-        let toks = crate::pipeline::FluxTokenizers::load(&root)?;
         Ok(Self {
             variant,
-            toks,
             device,
             dtype,
-            clip,
-            t5: Mutex::new(t5),
-            transformer,
-            vae,
+            backbone,
             ip_encoder,
             adapter,
         })
@@ -229,21 +249,20 @@ impl IpAdapterFlux {
         validate_request(req)?;
 
         // Conditioning: text (T5 seq + CLIP pooled) and the reference image tokens (computed once).
-        let (t5_emb, clip_emb) = encode_text(
-            self.variant,
-            &self.toks,
-            &self.device,
-            self.dtype,
-            &self.clip,
-            &self.t5,
-            &req.prompt,
-        )?;
+        self.backbone
+            .validate_native_vae_request(false, &req.cancel)?;
+        let (t5_emb, clip_emb) = self
+            .backbone
+            .encode_text_with_memory(&req.prompt, &req.cancel)?;
+        candle_gen::check_cancel(&req.cancel)?;
         let embeds = self
             .ip_encoder
             .image_embeds(reference)?
             .to_dtype(self.dtype)?;
+        candle_gen::check_cancel(&req.cancel)?;
         let tokens = self.adapter.tokens(&embeds)?;
         let injector = FluxIpInjector::new(&self.adapter, tokens, req.ip_adapter_scale as f64);
+        let heavy = self.backbone.load_heavy(&req.cancel)?;
 
         // candle's get_noise geometry: latent is /8 of a multiple-of-16 request. sc-3673 parity:
         // deterministic, launch-portable CPU-seeded initial noise (shared FLUX.1 helper, sc-9003).
@@ -270,24 +289,31 @@ impl IpAdapterFlux {
             0.0
         };
 
+        // Per-step latent preview (epic 16948, sc-16956), bound to the SAME `(width, height)` the
+        // decode below is given. The XLabs reference tokens are injected inside the DiT forward and
+        // never join the running latent, so the strip shows the target image alone.
+        let preview = crate::preview::hook(&req.preview, req.width, req.height);
         let latents = self.denoise(
             &state,
             &timesteps,
             guidance,
             &injector,
+            heavy.as_ref(),
             req.seed,
+            &preview,
             &req.cancel,
             on_progress,
         )?;
         on_progress(Progress::Decoding);
         // IP-Adapter lane does not carry a PiD decoder (base txt2img is the shipping PiD path, epic 7840
         // / sc-7853); native FLUX VAE decode.
-        decode_latents(
-            &self.vae,
-            None,
+        self.backbone.decode_with_memory(
+            heavy.as_ref(),
             &latents,
             req.height as usize,
             req.width as usize,
+            None,
+            &req.cancel,
         )
     }
 
@@ -309,10 +335,13 @@ impl IpAdapterFlux {
         timesteps: &[f64],
         guidance: f64,
         injector: &FluxIpInjector,
+        heavy: Option<&FluxRefHeavy>,
         seed: u64,
+        preview: &PreviewHook<'_>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
+        candle_gen::check_cancel(cancel)?;
         let b_sz = state.img.dim(0)?;
         let guidance_t = Tensor::full(guidance as f32, b_sz, &self.device)?;
         // Native schedule = candle's verbatim `get_schedule(..)` (f32 descending, trailing 0.0); the
@@ -321,6 +350,13 @@ impl IpAdapterFlux {
         let mu = flow_mu(self.variant, state.img.dim(1)?);
         let steps = native.len().saturating_sub(1);
         let sigmas = candle_gen::resolve_flow_schedule(None, mu, steps, &native);
+        let prepared = self.backbone.prepare_conditioning(
+            heavy,
+            &state.img,
+            &state.img_ids,
+            &state.txt,
+            &state.txt_ids,
+        )?;
         candle_gen::run_flow_sampler(
             None,
             TimestepConvention::Sigma,
@@ -329,11 +365,13 @@ impl IpAdapterFlux {
             seed,
             cancel,
             on_progress,
+            Some(preview),
             |img, t| -> Result<Tensor> {
                 // The forked DiT forward returns a `candle_core::Result`; `?` bridges it into the
                 // driver's `CandleError`. The XLabs IP residual injection lives inside this closure.
                 let t_vec = Tensor::full(t, b_sz, &self.device)?;
-                Ok(self.transformer.forward(
+                self.backbone.forward_ip_prepared_with_memory(
+                    heavy,
                     img,
                     &state.img_ids,
                     &state.txt,
@@ -341,8 +379,10 @@ impl IpAdapterFlux {
                     &t_vec,
                     &state.vec,
                     Some(&guidance_t),
-                    Some(injector),
-                )?)
+                    injector,
+                    &prepared,
+                    cancel,
+                )
             },
         )
     }
@@ -452,28 +492,42 @@ mod tests {
     /// a direct file is used as-is.
     #[test]
     fn image_encoder_resolution() {
-        let dir = std::env::temp_dir().join(format!("flux_ip_enc_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         assert!(resolve_image_encoder(&dir).is_err());
         let f = dir.join("model.safetensors");
         std::fs::write(&f, b"x").unwrap();
         assert_eq!(resolve_image_encoder(&dir).unwrap(), f);
         assert_eq!(resolve_image_encoder(&f).unwrap(), f);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `detect_variant` keys off the DiT checkpoint filename and errors when neither is present.
     #[test]
     fn variant_detection() {
-        let dir = std::env::temp_dir().join(format!("flux_ip_var_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         assert!(detect_variant(&dir).is_err());
         std::fs::write(dir.join(Variant::Schnell.transformer_file()), b"x").unwrap();
         assert_eq!(detect_variant(&dir).unwrap(), Variant::Schnell);
         std::fs::write(dir.join(Variant::Dev.transformer_file()), b"x").unwrap();
         assert_eq!(detect_variant(&dir).unwrap(), Variant::Dev); // dev preferred if both
-        let _ = std::fs::remove_dir_all(&dir);
+
+        // Clear the checkpoint files so the next leg exercises the transformer/config.json
+        // route rather than re-reading the filenames above. A reset, not cleanup.
+        std::fs::remove_file(dir.join(Variant::Schnell.transformer_file())).unwrap();
+        std::fs::remove_file(dir.join(Variant::Dev.transformer_file())).unwrap();
+        std::fs::create_dir_all(dir.join("transformer")).unwrap();
+        std::fs::write(
+            dir.join("transformer/config.json"),
+            br#"{"guidance_embeds":false}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_variant(&dir).unwrap(), Variant::Schnell);
+        std::fs::write(
+            dir.join("transformer/config.json"),
+            br#"{"guidance_embeds":true}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_variant(&dir).unwrap(), Variant::Dev);
     }
 }

@@ -1,8 +1,8 @@
 //! Real-weight acceptance gate for sc-14043's variable-geometry public pipeline.
 //!
 //! Run alone on an authorized Metal host:
-//! `MAGE_SNAPSHOT=/path/to/Mage-Flow cargo test -p mlx-gen-mage --test
-//! variable_geometry_real_weights --release -- --ignored --nocapture`
+//! `MAGE_SNAPSHOT=/path/to/Mage-Flow cargo test -p mlx-gen-mage --release --test integration --
+//! variable_geometry_real_weights:: --ignored --nocapture`
 
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
 use mlx_gen_mage::model::{load, MageVariant, MAX_COUNT};

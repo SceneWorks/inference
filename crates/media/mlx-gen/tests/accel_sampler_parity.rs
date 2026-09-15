@@ -3,7 +3,7 @@
 //!
 //! `#[ignore]`d — needs the golden from `tools/dump_sdxl_accel_golden.py` (gitignored, regenerable):
 //!   /Users/michael/Repos/mflux/.venv/bin/python3 tools/dump_sdxl_accel_golden.py
-//!   cargo test -p mlx-gen --test accel_sampler_parity -- --ignored --nocapture
+//!   cargo test -p mlx-gen --test integration accel_sampler_parity:: -- --ignored --nocapture
 //!
 //! Each scheduler is fed the SAME synthetic `(model_output, sample)` tensors diffusers saw at each
 //! step; the Rust DETERMINISTIC output must match diffusers' to ~1e-5 (torch-f32 vs MLX-f32). This

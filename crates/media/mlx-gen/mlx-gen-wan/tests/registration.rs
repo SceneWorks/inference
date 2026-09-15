@@ -9,9 +9,10 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::gen_core::GenerationMemory;
 use mlx_gen::{
     AdapterKind, AdapterSpec, Conditioning, ConditioningKind, GenerationRequest, Image, LoadSpec,
-    Modality, Precision, Quant, ReplacementMode, WeightsSource,
+    Modality, OffloadPolicy, Precision, Quant, ReplacementMode, WeightsSource,
 };
 
 use mlx_gen_wan::{MODEL_ID, MODEL_ID_I2V_14B, MODEL_ID_T2V_14B, MODEL_ID_VACE, MODEL_ID_VACE_FUN};
@@ -112,12 +113,12 @@ const T2V_14B_Q4_CONFIG: &str = r#"{
 
 /// A throwaway model dir holding just `config.json` (`load` only reads config; `generate`'s heavy
 /// weights aren't touched until called).
-fn temp_model_dir(tag: &str) -> PathBuf {
-    temp_model_dir_with(tag, TI2V_5B_CONFIG)
+fn temp_model_dir(tmp: &tempfile::TempDir, tag: &str) -> PathBuf {
+    temp_model_dir_with(tmp, tag, TI2V_5B_CONFIG)
 }
 
-fn temp_model_dir_with(tag: &str, config: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("wan_s0_{}_{}", std::process::id(), tag));
+fn temp_model_dir_with(tmp: &tempfile::TempDir, tag: &str, config: &str) -> PathBuf {
+    let dir = tmp.path().join(format!("wan_s0_{}", tag));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("config.json"), config).unwrap();
     dir
@@ -165,10 +166,16 @@ fn wan_is_registered() {
 
 #[test]
 fn load_reads_config_and_wires_generate() {
-    let dir = temp_model_dir("load");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = temp_model_dir(&tmp, "load");
+    // This config-only fixture intentionally exercises the legacy loader without production assets;
+    // Sequential is outside SC-19236's calibrated Resident/Eager surface, so it keeps publishing no
+    // contract and defers the missing-weight error until generate as this test historically expects.
+    let load_spec = LoadSpec::new(WeightsSource::Dir(dir.clone()))
+        .with_offload_policy(OffloadPolicy::Sequential);
     let g = mlx_gen_wan::provider_registry()
         .unwrap()
-        .load(MODEL_ID, &LoadSpec::new(WeightsSource::Dir(dir.clone())))
+        .load(MODEL_ID, &load_spec)
         .expect("load should succeed (reads config.json)");
     assert_eq!(g.descriptor().id, MODEL_ID);
 
@@ -207,16 +214,55 @@ fn load_reads_config_and_wires_generate() {
 }
 
 #[test]
+fn bounded_decode_carrier_is_validated_before_stage_one_loads_weights() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = temp_model_dir(&tmp, "bounded-before-stage-one");
+    let load_spec =
+        LoadSpec::new(WeightsSource::Dir(dir)).with_offload_policy(OffloadPolicy::Sequential);
+    let generator = mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &load_spec)
+        .unwrap();
+    let request = GenerationRequest {
+        prompt: "carrier ordering probe".into(),
+        width: 480,
+        height: 480,
+        frames: Some(1),
+        memory: Some(GenerationMemory {
+            tile_vae_decode: true,
+            decode_tile_edge: Some(447),
+            decode_overlap: Some(64),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let error = generator
+        .generate(&request, &mut |_| {})
+        .expect_err("invalid selected carrier must fail before the absent T5 weights are opened");
+    assert!(
+        error.to_string().contains("decode tile-edge cap 447"),
+        "expected the pre-Stage-1 carrier error, got: {error}"
+    );
+}
+
+#[test]
 fn dense_wan_ids_enforce_the_shared_frame_ceiling() {
+    let tmp = tempfile::tempdir().unwrap();
     for (id, config, needs_reference) in [
         (MODEL_ID, TI2V_5B_CONFIG, false),
         (MODEL_ID_T2V_14B, T2V_14B_CONFIG, false),
         (MODEL_ID_I2V_14B, I2V_14B_CONFIG, true),
     ] {
-        let dir = temp_model_dir_with(&format!("{id}-frame-cap"), config);
+        let dir = temp_model_dir_with(&tmp, &format!("{id}-frame-cap"), config);
+        let load_spec = if id == MODEL_ID {
+            LoadSpec::new(WeightsSource::Dir(dir.clone()))
+                .with_offload_policy(OffloadPolicy::Sequential)
+        } else {
+            LoadSpec::new(WeightsSource::Dir(dir.clone()))
+        };
         let g = mlx_gen_wan::provider_registry()
             .unwrap()
-            .load(id, &LoadSpec::new(WeightsSource::Dir(dir.clone())))
+            .load(id, &load_spec)
             .unwrap();
         let conditioning = if needs_reference {
             vec![Conditioning::Reference {
@@ -251,7 +297,8 @@ fn dense_wan_ids_enforce_the_shared_frame_ceiling() {
 
 #[test]
 fn load_rejects_bad_source_and_precision() {
-    let dir = temp_model_dir("reject");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = temp_model_dir(&tmp, "reject");
     // Single-file source.
     assert!(mlx_gen_wan::provider_registry()
         .unwrap()
@@ -273,9 +320,10 @@ fn load_rejects_bad_source_and_precision() {
 
 #[test]
 fn load_accepts_quant_and_adapters() {
+    let tmp = tempfile::tempdir().unwrap();
     // Q4/Q8 (sc-2682) is now WIRED at load (the DiT is quantized lazily in generate); the e2e
     // numerics ride the shared WanTransformer::quantize path.
-    let dir = temp_model_dir("quant");
+    let dir = temp_model_dir(&tmp, "quant");
     assert!(mlx_gen_wan::provider_registry()
         .unwrap()
         .load(
@@ -338,7 +386,8 @@ fn wan_t2v_14b_is_registered() {
 
 #[test]
 fn load_t2v_14b_reads_dual_config_and_wires_generate() {
-    let dir = temp_model_dir_with("t2v14b", T2V_14B_CONFIG);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = temp_model_dir_with(&tmp, "t2v14b", T2V_14B_CONFIG);
     let g = mlx_gen_wan::provider_registry()
         .unwrap()
         .load(
@@ -398,8 +447,9 @@ fn load_t2v_14b_reads_dual_config_and_wires_generate() {
 
 #[test]
 fn load_t2v_14b_rejects_non_dual_config_and_unwired_features() {
+    let tmp = tempfile::tempdir().unwrap();
     // A single-model (Wan2.1) config is rejected by the dual-expert loader.
-    let single = temp_model_dir_with("t2v14b_single", TI2V_5B_CONFIG);
+    let single = temp_model_dir_with(&tmp, "t2v14b_single", TI2V_5B_CONFIG);
     assert!(mlx_gen_wan::provider_registry()
         .unwrap()
         .load(
@@ -409,7 +459,7 @@ fn load_t2v_14b_rejects_non_dual_config_and_unwired_features() {
         .is_err());
     std::fs::remove_dir_all(&single).ok();
 
-    let dir = temp_model_dir_with("t2v14b_reject", T2V_14B_CONFIG);
+    let dir = temp_model_dir_with(&tmp, "t2v14b_reject", T2V_14B_CONFIG);
     // Single-file source.
     assert!(mlx_gen_wan::provider_registry()
         .unwrap()
@@ -471,9 +521,10 @@ fn load_t2v_14b_rejects_non_dual_config_and_unwired_features() {
 
 #[test]
 fn load_t2v_14b_accepts_prequantized_snapshot_and_reconciles_spec() {
+    let tmp = tempfile::tempdir().unwrap();
     // A pre-quantized snapshot (config.json carries a `quantization` block) loads WITHOUT a
     // spec.quantize override — `from_weights` builds the experts from the on-disk packed weights.
-    let dir = temp_model_dir_with("t2v14b_q4", T2V_14B_Q4_CONFIG);
+    let dir = temp_model_dir_with(&tmp, "t2v14b_q4", T2V_14B_Q4_CONFIG);
     assert!(mlx_gen_wan::provider_registry()
         .unwrap()
         .load(
@@ -542,7 +593,8 @@ fn dummy_image() -> Image {
 
 #[test]
 fn load_i2v_14b_reads_config_validates_and_wires_generate() {
-    let dir = temp_model_dir_with("i2v14b", I2V_14B_CONFIG);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = temp_model_dir_with(&tmp, "i2v14b", I2V_14B_CONFIG);
     let g = mlx_gen_wan::provider_registry()
         .unwrap()
         .load(
@@ -602,8 +654,9 @@ fn load_i2v_14b_reads_config_validates_and_wires_generate() {
 
 #[test]
 fn load_i2v_14b_rejects_non_i2v_config_and_unwired_features() {
+    let tmp = tempfile::tempdir().unwrap();
     // A T2V (non-channel-concat) config is rejected by the i2v loader.
-    let t2v = temp_model_dir_with("i2v14b_t2v", T2V_14B_CONFIG);
+    let t2v = temp_model_dir_with(&tmp, "i2v14b_t2v", T2V_14B_CONFIG);
     assert!(mlx_gen_wan::provider_registry()
         .unwrap()
         .load(
@@ -613,7 +666,7 @@ fn load_i2v_14b_rejects_non_i2v_config_and_unwired_features() {
         .is_err());
     std::fs::remove_dir_all(&t2v).ok();
 
-    let dir = temp_model_dir_with("i2v14b_reject", I2V_14B_CONFIG);
+    let dir = temp_model_dir_with(&tmp, "i2v14b_reject", I2V_14B_CONFIG);
     // Single-file source.
     assert!(mlx_gen_wan::provider_registry()
         .unwrap()
@@ -757,7 +810,8 @@ fn wan_vace_is_registered() {
 
 #[test]
 fn wan_vace_load_reads_config_and_validates() {
-    let dir = temp_model_dir_with("vace", VACE_CONFIG);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = temp_model_dir_with(&tmp, "vace", VACE_CONFIG);
     let g = mlx_gen_wan::provider_registry()
         .unwrap()
         .load(
@@ -799,7 +853,8 @@ fn wan_vace_load_reads_config_and_validates() {
 /// LTX's `MAX_FRAMES`) — the gen-core capability floor alone only rejects a pathological 1 000 000.
 #[test]
 fn wan_vace_lanes_reject_over_cap_control_clip_frames() {
-    let dir = temp_model_dir_with("vace_frame_cap", VACE_CONFIG);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = temp_model_dir_with(&tmp, "vace_frame_cap", VACE_CONFIG);
     for id in [MODEL_ID_VACE, MODEL_ID_VACE_FUN] {
         let g = mlx_gen_wan::provider_registry()
             .unwrap()
@@ -821,7 +876,8 @@ fn wan_vace_lanes_reject_over_cap_control_clip_frames() {
 
 #[test]
 fn wan_vace_lanes_bound_combined_control_and_reference_latents() {
-    let dir = temp_model_dir_with("vace_combined_cap", VACE_CONFIG);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = temp_model_dir_with(&tmp, "vace_combined_cap", VACE_CONFIG);
     let reference = || Conditioning::Reference {
         image: mlx_gen::media::Image {
             width: 64,
@@ -865,8 +921,9 @@ fn wan_vace_lanes_bound_combined_control_and_reference_latents() {
 /// first (instead of the OS SIGKILL / Metal command-buffer abort mid-denoise, sc-4986).
 #[test]
 fn wan_vace_lanes_preflight_denoise_memory_before_any_load() {
+    let tmp = tempfile::tempdir().unwrap();
     use mlx_rs::memory::set_memory_limit;
-    let dir = temp_model_dir_with("vace_preflight", VACE_CONFIG);
+    let dir = temp_model_dir_with(&tmp, "vace_preflight", VACE_CONFIG);
     let mut req = control_clip_request(101);
     req.width = 640;
     req.height = 640;
@@ -894,7 +951,8 @@ fn wan_vace_lanes_preflight_denoise_memory_before_any_load() {
 
 #[test]
 fn wan_vace_rejects_bad_source_accepts_adapters() {
-    let dir = temp_model_dir_with("vace_bad", VACE_CONFIG);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = temp_model_dir_with(&tmp, "vace_bad", VACE_CONFIG);
     // A single-file source is rejected (expects a converted snapshot dir).
     assert!(mlx_gen_wan::provider_registry()
         .unwrap()

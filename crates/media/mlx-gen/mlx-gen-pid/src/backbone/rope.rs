@@ -7,11 +7,7 @@
 //! `2j+1` = y). We compute the `cos`/`sin` halves on the host (deterministic f32 functions of the
 //! grid) and rotate the interleaved `(real, imag)` pairs exactly as `apply_rotary_emb` does.
 
-use mlx_rs::ops::{concatenate_axis, split};
 use mlx_rs::Array;
-
-use mlx_gen::nn::rope_rotate;
-use mlx_gen::Result;
 
 /// Host `(cos, sin)` tables `[L, head_dim/2]` for the 2-D NTK-aware image RoPE.
 ///
@@ -106,27 +102,8 @@ pub fn rope_1d_text(head_dim: i32, length: i32, theta: f32) -> (Array, Array) {
     )
 }
 
-/// Apply interleaved RoPE to `q`/`k` in `[B, H, S, D]` with `cos`/`sin` `[S, D/2]`. Pairs
-/// `(x[2i], x[2i+1])` as `(real, imag)` and rotates by `cos/sin[i]` — bit-equivalent to
-/// `apply_rotary_emb`'s `_rotate` (the head axis is a pure broadcast, so applying after the
-/// `[B,H,S,D]` transpose is identical to the reference's pre-transpose `[B,S,H,D]` apply).
-pub fn apply_rope(q: &Array, k: &Array, cos: &Array, sin: &Array) -> Result<(Array, Array)> {
-    let s = cos.shape()[0];
-    let half = cos.shape()[1];
-    let cos = cos.reshape(&[1, 1, s, half])?;
-    let sin = sin.reshape(&[1, 1, s, half])?;
-    let one = |x: &Array| -> Result<Array> {
-        let sh = x.shape();
-        let (b, h, seq, hd) = (sh[0], sh[1], sh[2], sh[3]);
-        let x5 = x.reshape(&[b, h, seq, hd / 2, 2])?;
-        let p = split(&x5, 2, 4)?;
-        let real = p[0].reshape(&[b, h, seq, hd / 2])?;
-        let imag = p[1].reshape(&[b, h, seq, hd / 2])?;
-        let (out0, out1) = rope_rotate(&real, &imag, &cos, &sin)?;
-        Ok(
-            concatenate_axis(&[&out0.expand_dims(4)?, &out1.expand_dims(4)?], 4)?
-                .reshape(&[b, h, seq, hd])?,
-        )
-    };
-    Ok((one(q)?, one(k)?))
-}
+// The interleaved rotation that used to live here is now
+// `mlx_gen::qkv::apply_rope(.., RopeStyle::AdjacentPair, RotationAxes::HeadMajor, ..)` (SC-18319) —
+// the identical `(real, imag)` pairing over `nn::rope_rotate`, with the same head-axis broadcast
+// (applying after the `[B,H,S,D]` transpose is identical to the reference's pre-transpose apply).
+// Only the host-computed `(cos, sin)` table construction above is genuinely PID's.

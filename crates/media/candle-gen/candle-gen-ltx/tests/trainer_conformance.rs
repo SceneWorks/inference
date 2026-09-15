@@ -7,7 +7,7 @@
 //! ```text
 //! set LTX_TRAINING_TIER=E:\huggingface\hub\models--SceneWorks--ltx-2.3-mlx\snapshots\<hash>\q4
 //! set LTX_GEMMA_DIR=E:\huggingface\hub\models--SceneWorks--ltx-2.3-mlx\snapshots\<hash>\gemma
-//! cargo test -p candle-gen-ltx --features cuda --release --test trainer_conformance -- --ignored --nocapture
+//! cargo test -p candle-gen-ltx --features cuda --release --test integration trainer_conformance:: -- --ignored --nocapture
 //! ```
 #![cfg(feature = "cuda")]
 
@@ -57,10 +57,8 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
 #[ignore = "needs SceneWorks/ltx-2.3-mlx q4 + Gemma weights and a CUDA GPU"]
 fn ltx_trainer_satisfies_gen_core_contract() {
     assert_eq!(candle_gen_ltx::config::TRAINER_ID, "ltx_2_3");
-    let tmp = std::env::temp_dir().join(format!(
-        "candle_ltx_trainer_conformance_{}",
-        std::process::id()
-    ));
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp.join("data"));
     let mut profile = TrainerProfile::cheap(items, tmp.join("out"));
     profile.config.train_dtype = "f32".to_string();

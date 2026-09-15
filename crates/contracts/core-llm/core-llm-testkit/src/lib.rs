@@ -28,6 +28,13 @@ use core_llm::{
 };
 use std::path::PathBuf;
 
+pub mod starvector;
+pub use starvector::{
+    check_starvector_bounded_fixture, check_starvector_cancellation, check_starvector_descriptor,
+    check_starvector_streaming, check_starvector_validate, deterministic_svg_fixture,
+    starvector_conformance, StarVectorFixture, StarVectorProfile,
+};
+
 /// Configures the conformance run: the prompt, token budget, the sampling used for the determinism
 /// check, and an optional image for the multimodal check.
 #[derive(Clone, Debug)]

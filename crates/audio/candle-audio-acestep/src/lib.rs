@@ -68,22 +68,35 @@ pub use model::{
 pub use pipeline::{AceStepPipeline, CoverModules};
 
 pub use model::{
-    AUDIO_TOKENIZER_WEIGHT_LICENSE, AUDIO_TOKEN_DETOKENIZER_WEIGHT_LICENSE, SFT_HUB_REPO,
-    SFT_HUB_REVISION, WEIGHT_LICENSE, WEIGHT_LICENSE_ENTRY,
+    COMPONENT_KEY, COMPONENT_LICENSE, SFT_AUDIO_TOKENIZER_COMPONENT_LICENSE,
+    SFT_AUDIO_TOKEN_DETOKENIZER_COMPONENT_LICENSE, SFT_HUB_REPO, SFT_HUB_REVISION,
+    SFT_TRANSFORMER_COMPONENT_LICENSE, TEXT_ENCODER_COMPONENT_LICENSE,
 };
 
-/// This crate's model-weight-license entries for catalog aggregation (sc-13332, extended sc-13251).
-/// The ACE-Step provider is assembled from multiple MIT checkpoints, so it contributes the composite
-/// (effective-restriction) row keyed by [`MODEL_ID`] PLUS one per-checkpoint attribution row for
-/// each cover-only sft component: the two FSQ modules (`audio_tokenizer`, `audio_token_detokenizer`)
-/// and the non-distilled cover DiT (`transformer`). The audio catalog concatenates every provider's
-/// slice into the model-licenses manifest SceneWorks lists on its end-product licenses page.
-pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
-    model::WEIGHT_LICENSE_ENTRY,
-    model::WEIGHT_LICENSE_ENTRY_AUDIO_TOKENIZER,
-    model::WEIGHT_LICENSE_ENTRY_AUDIO_TOKEN_DETOKENIZER,
-    model::WEIGHT_LICENSE_ENTRY_SFT_TRANSFORMER,
+/// This crate's schema-3 component licence rows (sc-16663) — one per loaded artifact: the turbo
+/// primary, its bundled Qwen3-Embedding-0.6B `text_encoder`, and the three cover-only sft modules.
+pub const COMPONENT_LICENSES: &[gen_core::ComponentLicense] = &[
+    model::COMPONENT_LICENSE,
+    model::TEXT_ENCODER_COMPONENT_LICENSE,
+    model::SFT_AUDIO_TOKENIZER_COMPONENT_LICENSE,
+    model::SFT_AUDIO_TOKEN_DETOKENIZER_COMPONENT_LICENSE,
+    model::SFT_TRANSFORMER_COMPONENT_LICENSE,
 ];
+
+/// The provider→component mapping this crate contributes. The provider's effective terms are
+/// **derived** from these five rows by [`gen_core::provider_terms`], replacing v2's hand-authored
+/// composite row: that composite said "MIT" and carried the bundled Apache-2.0 encoder only as a
+/// prose note, so the Apache-2.0 notice and flow-down duties never reached a joinable field.
+pub const PROVIDER_COMPONENTS: &[gen_core::ProviderComponents] = &[gen_core::ProviderComponents {
+    provider_id: model::MODEL_ID,
+    components: &[
+        model::COMPONENT_KEY,
+        model::TEXT_ENCODER_COMPONENT_KEY,
+        model::SFT_AUDIO_TOKENIZER_COMPONENT_KEY,
+        model::SFT_AUDIO_TOKEN_DETOKENIZER_COMPONENT_KEY,
+        model::SFT_TRANSFORMER_COMPONENT_KEY,
+    ],
+}];
 
 /// Add the ACE-Step generator to an explicit audio registry builder (catalog composition).
 pub fn register_providers(

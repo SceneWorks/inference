@@ -4,7 +4,7 @@
 //! `tokenizer_matches_golden` needs the snapshot + the golden (`tools/golden_dump.py`); the e2e
 //! smoke additionally needs ~all of a 128 GB Mac. Run:
 //!   BOOGU_BASE_DIR=<snapshot> CARGO_TARGET_DIR=~/Repos/mlx-gen/target \
-//!     cargo test -p mlx-gen-boogu --test pipeline_e2e -- --ignored --nocapture
+//!     cargo test -p mlx-gen-boogu --test integration pipeline_e2e:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 

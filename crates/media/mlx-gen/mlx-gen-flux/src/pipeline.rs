@@ -57,15 +57,31 @@ pub fn create_noise(seed: u64, width: u32, height: u32) -> Result<Array> {
     Ok(random::normal::<f32>(&shape[..], None, None, Some(&key))?)
 }
 
+/// Latent channels the FLUX.1 autoencoder produces and [`pack_latents`] / [`unpack_latents`]
+/// reshape: the `16` of `[1, 16, height/8, width/8]`.
+pub const LATENT_CHANNELS: i32 = 16;
+/// The square latent neighbourhood one DiT token packs: the `2` of `[.., h, 2, w, 2]`.
+pub const LATENT_PATCH_SIZE: i32 = 2;
+/// Features per packed DiT token — `LATENT_CHANNELS * LATENT_PATCH_SIZE²`, the `64` of
+/// `[1, tokens, 64]`.
+pub const PACKED_TOKEN_WIDTH: i32 = LATENT_CHANNELS * LATENT_PATCH_SIZE * LATENT_PATCH_SIZE;
+
 /// Pack VAE latents `[1, 16, height/8, width/8]` into FLUX DiT tokens
 /// `[1, (height/16) * (width/16), 64]`.
 pub fn pack_latents(latents: &Array, width: u32, height: u32) -> Result<Array> {
     validate_multiple_of(width, height, crate::SIZE_MULTIPLE, "flux1")?;
     let h = (height / 16) as i32;
     let w = (width / 16) as i32;
-    let latents = latents.reshape(&[1, 16, h, 2, w, 2])?;
+    let latents = latents.reshape(&[
+        1,
+        LATENT_CHANNELS,
+        h,
+        LATENT_PATCH_SIZE,
+        w,
+        LATENT_PATCH_SIZE,
+    ])?;
     let latents = latents.transpose_axes(&[0, 2, 4, 1, 3, 5])?;
-    Ok(latents.reshape(&[1, h * w, 64])?)
+    Ok(latents.reshape(&[1, h * w, PACKED_TOKEN_WIDTH])?)
 }
 
 /// Unpack FLUX DiT tokens `[1, (height/16) * (width/16), 64]` back to VAE latents
@@ -74,9 +90,21 @@ pub fn unpack_latents(latents: &Array, width: u32, height: u32) -> Result<Array>
     validate_multiple_of(width, height, crate::SIZE_MULTIPLE, "flux1")?;
     let h = (height / 16) as i32;
     let w = (width / 16) as i32;
-    let latents = latents.reshape(&[1, h, w, 16, 2, 2])?;
+    let latents = latents.reshape(&[
+        1,
+        h,
+        w,
+        LATENT_CHANNELS,
+        LATENT_PATCH_SIZE,
+        LATENT_PATCH_SIZE,
+    ])?;
     let latents = latents.transpose_axes(&[0, 3, 1, 4, 2, 5])?;
-    Ok(latents.reshape(&[1, 16, h * 2, w * 2])?)
+    Ok(latents.reshape(&[
+        1,
+        LATENT_CHANNELS,
+        h * LATENT_PATCH_SIZE,
+        w * LATENT_PATCH_SIZE,
+    ])?)
 }
 
 /// Fork `LinearScheduler` sigmas. `requires_sigma_shift` is true for FLUX.1-dev and false for

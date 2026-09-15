@@ -3,7 +3,7 @@
 //! `#[ignore]`d — needs the golden from `tools/dump_instantid_resampler_golden.py` (which bundles the
 //! f32 `image_proj.*` weights from `InstantX/InstantID` `ip-adapter.bin`, so no separate weights file
 //! is required). Run with:
-//!   cargo test -p mlx-gen-sdxl --release --test instantid_resampler_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sdxl --release --test integration instantid_resampler_real_weights:: -- --ignored --nocapture
 //!
 //! InstantID's `image_proj_model` is the *same* Tencent `Resampler` already ported for the SDXL
 //! IP-Adapter (sc-3059); this only validates it under `ResamplerConfig::instantid_face()`

@@ -36,8 +36,8 @@ use crate::model::validate_request;
 use crate::model_base::{DEFAULT_GUIDANCE, DEFAULT_STEPS, SCHEDULE_SHIFT};
 use crate::model_control::{load_control_residency, ZImageControlHeavyOwned};
 use crate::pipeline::{
-    self, denoise_control_cfg_with_progress, encode_control_context, encode_init_latents,
-    init_time_step,
+    self, denoise_control_cfg_with_progress_and_preview, encode_control_context,
+    encode_init_latents, init_time_step,
 };
 use crate::text_encoder::TextEncoder;
 
@@ -50,12 +50,18 @@ pub const MODEL_ID: &str = "z_image_control";
 /// `Reference` (an optional img2img init — the fork's `generate_image` accepts both).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: Some(crate::ENCODER_CONTRACT),
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
+        control_kinds: Some(accepted_kinds()),
         required_components: &[],
         id: MODEL_ID,
         family: "z-image",
         backend: "mlx",
         modality: Modality::Image,
         capabilities: Capabilities {
+            // Advertised so a weights-free caller can reject a bad `kind` before
+            // paying for a load. Same expression the `ControlBranch` override
+            // returns, so the two cannot drift.
             supported_quants: &[Quant::Q4, Quant::Q8],
             // Base is undistilled → full classifier-free guidance + negative prompting (mirrors the
             // base `z_image` descriptor), unlike the guidance-distilled Turbo control variant.
@@ -70,40 +76,30 @@ pub fn descriptor() -> ModelDescriptor {
             samplers: curated_sampler_names(),
             // Curated scheduler menu (epic 7114), as the base variant — static-shift default.
             schedulers: curated_scheduler_names(),
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,
             mac_only: true,
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
             supports_sequential_offload: true,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            supports_preview: true,
+            ..Default::default()
         },
     }
 }
 
 /// A loaded base control generator: the cached descriptor, the (tiny, always-warm) tokenizer, and the
 /// component-residency strategy (base text encoder + control transformer + VAE), driven through the
-/// shared [`Residency`] seam so the base control variant honors [`LoadSpec::offload_policy`] family-wide
-/// (sc-11124, F-172). Same component set + seam as [`crate::model_control::ZImageTurboControl`]; only the
-/// generate-time schedule + CFG differ.
+/// shared request-scoped [`Residency`] seam. Same component set + seam as
+/// [`crate::model_control::ZImageTurboControl`]; only the generate-time schedule + CFG differ.
 pub struct ZImageControl {
     descriptor: ModelDescriptor,
     tokenizer: TextTokenizer,
-    /// Component-residency strategy (sc-11124), selected from [`LoadSpec::offload_policy`] via the
-    /// shared [`load_control_residency`] builder (reused from the Turbo control variant).
+    /// The provider's half of the shared memory-strategy handshake (SC-15449 / SC-15615), built from the
+    /// `LoadSpec` at load so its asset facts describe the snapshot this generator actually loaded.
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
+    loaded_tier: mlx_gen::gen_core::MemoryNumericTier,
+    /// Request-scoped residency shared with the Turbo control variant.
     residency: Residency<TextEncoder, ZImageControlHeavyOwned>,
 }
 
@@ -121,11 +117,14 @@ const PRECISION_MSG: &str = "z_image_control: only dense bf16 is wired (the text
 /// (base + control, group_size 64) plus the text encoder + VAE — the fork's whole-model quant, with the
 /// control patch embedder left dense (its in-features is not a multiple of 64). Byte-identical load path
 /// to [`crate::model_control::load`] (the control branch shape is identical — see the module doc) — it
-/// shares the same `load_control_residency` builder, so `offload_policy` is honored identically
-/// (sc-11124, F-172); only the generate-time schedule + CFG differ.
+/// shares the same request-scoped `load_control_residency` builder; only the generate-time schedule
+/// + CFG differ.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let (tokenizer, residency) = load_control_residency(spec, MODEL_ID, PRECISION_MSG)?;
+    let loaded_tier = crate::memory_strategy::loaded_tier(spec, MODEL_ID)?;
     Ok(Box::new(ZImageControl {
+        memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
+        loaded_tier,
         descriptor: descriptor(),
         tokenizer,
         residency,
@@ -153,10 +152,6 @@ pub(crate) fn accepted_kinds() -> AcceptedControlKinds {
 impl ControlBranch for ZImageControl {
     fn model_id(&self) -> &'static str {
         MODEL_ID
-    }
-
-    fn accepted_control_kinds(&self) -> AcceptedControlKinds {
-        accepted_kinds()
     }
 
     /// Fun-Union accepts pose/canny/depth; only the catch-all `Other` reaches this rejection, so the
@@ -198,8 +193,17 @@ impl ZImageControl {
         // [`Residency::run`] seam (sc-11124). Base-control delta vs the Turbo control variant: real CFG
         // (a negative-prompt uncond branch) and no bf16 cap cast.
         // sc-13571 / GitHub #1658: DiT-dropping staged decode (see `crate::model` for the turbo path).
-        let tiling = pipeline::decode_tiling(req, self.residency.is_sequential());
-        let images = self.residency.run_staged(
+        let pipeline::RequestRungs {
+            stage_residency,
+            streamable,
+            tiling,
+            attention_budget,
+            block_window,
+            encoder_window,
+        } = pipeline::resolve_request_rungs(req, &self.memory_strategy, MODEL_ID)?;
+        let images = self.residency.run_staged_request_scoped(
+            stage_residency,
+            streamable,
             &req.cancel,
             // No PiD overlay on the control path (sc-7846 is base-turbo-only); the heavy loader ignores
             // this flag.
@@ -211,20 +215,40 @@ impl ZImageControl {
             // weights. The control branch's f32 mixed-precision flow (sc-2720) is preserved inside the
             // denoise closure regardless.
             |text_encoder: &TextEncoder| {
-                let cap =
-                    pipeline::encode_prompt(&self.tokenizer, text_encoder, &req.prompt, MODEL_ID)?;
+                // Calibration-only fault injection at a physical phase boundary (SC-15449);
+                // `None` for every production request, so this is a `None` comparison.
+                pipeline::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::MemoryPhase::Conditioning,
+                    MODEL_ID,
+                )?;
+                let cap = pipeline::encode_prompt(
+                    &self.tokenizer,
+                    text_encoder,
+                    &req.prompt,
+                    MODEL_ID,
+                    encoder_window,
+                )?;
                 // Uncond conditioning = the negative prompt (empty string when unset), encoded only
                 // when CFG is active. Empty prompt is valid for the negative branch.
                 let neg_cap = if cfg_on {
                     let neg = req.negative_prompt.as_deref().unwrap_or("");
-                    Some(pipeline::encode_uncond(&self.tokenizer, text_encoder, neg)?)
+                    Some(pipeline::encode_uncond(
+                        &self.tokenizer,
+                        text_encoder,
+                        neg,
+                        encoder_window,
+                    )?)
                 } else {
                     None
                 };
                 Ok((cap, neg_cap))
             },
             // Materialize cap (+neg_cap) while the encoder is still alive (Sequential only).
-            |(cap, neg_cap)| {
+            |encoded| {
+                let Some((cap, neg_cap)) = encoded else {
+                    return Ok(());
+                };
                 match neg_cap {
                     Some(neg) => mlx_rs::transforms::eval([cap, neg])?,
                     None => mlx_rs::transforms::eval([cap])?,
@@ -233,6 +257,11 @@ impl ZImageControl {
             },
             // ── Phase B (denoise): heavy bundle + (cap, neg_cap) → evaluated latents.
             |heavy: &ZImageControlHeavyOwned, (cap, neg_cap), on_progress| {
+                pipeline::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::MemoryPhase::Denoise,
+                    MODEL_ID,
+                )?;
                 // Static shift=6.0 schedule (the base model's scheduler_config.json) — build once. An
                 // unset `req.scheduler` keeps it byte-exact (epic 7114 N1); a curated name re-shapes σ
                 // over shift=6.0.
@@ -271,7 +300,7 @@ impl ZImageControl {
                     req,
                     on_progress,
                     |latents, seed, op| {
-                        denoise_control_cfg_with_progress(
+                        denoise_control_cfg_with_progress_and_preview(
                             &heavy.transformer,
                             &scheduler,
                             sampler_name,
@@ -283,7 +312,10 @@ impl ZImageControl {
                             &control_context,
                             control_scale,
                             start_step,
+                            attention_budget,
+                            block_window,
                             &req.cancel,
+                            &req.preview,
                             op,
                         )
                     },
@@ -295,9 +327,9 @@ impl ZImageControl {
             // ── Phase C (decode): light (VAE) view + latents → images (no PiD on control). Tiled under
             // `Sequential`.
             |view, latents, on_progress| {
+                pipeline::calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Decode, MODEL_ID)?;
                 let images = pipeline::decode_batch(
                     view.vae,
-                    None,
                     tiling.as_ref(),
                     latents,
                     &req.cancel,
@@ -330,6 +362,29 @@ impl Generator for ZImageControl {
     ) -> gen_core::Result<GenerationOutput> {
         self.generate_impl(req, on_progress).map_err(Into::into)
     }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.memory_strategy, self.loaded_tier, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::begin_request(
+            MODEL_ID,
+            &self.memory_strategy,
+            self.loaded_tier,
+            context,
+        )
+    }
 }
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral
@@ -341,6 +396,23 @@ mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load;
     footprint = crate::model::component_footprint
 }
+
+/// The shared memory-strategy contract registration (SC-15449) — resolvable before any weights load, so
+/// the worker can select a strategy from the static declaration plus its own measured evidence.
+pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
+        safety_check: crate::memory_strategy::registered_safety_check,
+    };
+pub const MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(MODEL_ID, spec, contract, context)
+        },
+    };
 
 #[cfg(test)]
 mod tests {
@@ -408,54 +480,41 @@ mod tests {
         assert!(err.contains("base snapshot directory"), "got: {err}");
     }
 
-    // ── F-180 (sc-11126): weight-free, default-run proof that the Z-Image BASE-CONTROL dispatch
-    // HONORS `offload_policy`. Upgraded from the sc-11124 smoke test (which pointed a *single File*
-    // base at both arms, so both merely hit the shared up-front single-file rejection — an
-    // always-`Resident` impl passed it). This drives the shared `build_control_residency` seam with the
-    // base control variant's own `MODEL_ID`/`PRECISION_MSG` past that guard, using a non-existent base
-    // dir + control (so no weights load), and asserts the deferral discriminator:
-    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
-    //   * `Resident` eager-loads the text encoder from the missing base dir → `Err`.
-    // A `Sequential → Resident` regression (the exact F-172 bug this seam fixed) would eager-load under
-    // the Sequential request and fail the first assertion. The real-weight A/B in
-    // `tests/sequential_residency_real_weights.rs` is `#[ignore]`d; this runs by default.
-    fn missing_control_spec(policy: OffloadPolicy) -> LoadSpec {
-        LoadSpec::new(WeightsSource::Dir(
-            "/nonexistent/z-image-base-control-residency-test-base".into(),
-        ))
-        .with_control(WeightsSource::File(
-            "/nonexistent/z-image-base-control-residency-test-overlay.safetensors".into(),
-        ))
-        .with_offload_policy(policy)
+    // SC-15806: weight-free proof that BASE-CONTROL construction is request-scoped for both legacy
+    // policy values. Encoder/tokenizer admission is complete, while transformer, VAE, and control
+    // weights are deliberately absent; construction therefore succeeds only by retaining loaders.
+    fn incomplete_control_spec(policy: OffloadPolicy) -> (tempfile::TempDir, LoadSpec) {
+        let snapshot = tempfile::tempdir().expect("snapshot fixture dir");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &snapshot.path().join("text_encoder"),
+            crate::bounded_encoder_contract(),
+        )
+        .expect("bounded validation-complete encoder and tokenizer fixture");
+        let spec = LoadSpec::new(WeightsSource::Dir(snapshot.path().to_path_buf()))
+            .with_control(WeightsSource::File(
+                snapshot.path().join("control.safetensors"),
+            ))
+            .with_offload_policy(policy);
+        (snapshot, spec)
     }
 
     #[test]
-    fn build_control_residency_sequential_defers_all_component_loads() {
-        let res = crate::model_control::build_control_residency(
-            &missing_control_spec(OffloadPolicy::Sequential),
-            MODEL_ID,
-            PRECISION_MSG,
-        )
-        .expect("Sequential must defer loads and not touch the (missing) base/control weights");
-        assert!(
-            res.is_sequential(),
-            "Sequential policy must build a Sequential (deferred) control residency"
-        );
-    }
-
-    #[test]
-    fn build_control_residency_resident_eager_loads_and_fails() {
-        let err = crate::model_control::build_control_residency(
-            &missing_control_spec(OffloadPolicy::Resident),
-            MODEL_ID,
-            PRECISION_MSG,
-        )
-        .err()
-        .expect("Resident must eager-load and fail on the missing base snapshot");
-        let msg = err.to_string();
-        assert!(
-            !msg.contains("single .safetensors file") && !msg.contains("precision override"),
-            "expected an eager-load failure, not the up-front guard: {msg}"
-        );
+    fn build_control_residency_defers_for_both_legacy_offload_values() {
+        let _guard = crate::scoped_bounded_encoder_contract();
+        for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+            let (snapshot, spec) = incomplete_control_spec(policy);
+            assert!(!snapshot.path().join("transformer").exists());
+            assert!(!snapshot.path().join("vae").exists());
+            assert!(!snapshot.path().join("control.safetensors").exists());
+            let (_tokenizer, res) =
+                crate::model_control::load_control_residency(&spec, MODEL_ID, PRECISION_MSG)
+                    .unwrap_or_else(|error| {
+                        panic!("{policy:?} must defer absent heavy components: {error}")
+                    });
+            assert!(
+                res.with_resident_parts(|_, _| ()).unwrap().is_none(),
+                "{policy:?} must begin with no warm request-scoped pair"
+            );
+        }
     }
 }

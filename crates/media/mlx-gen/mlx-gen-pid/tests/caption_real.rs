@@ -5,7 +5,7 @@
 //! 2. caption_embs numeric (loose — MLX runs the gemma weights in bf16 vs the f32 golden).
 //!
 //! ```sh
-//! cargo test -p mlx-gen-pid --release --test caption_real -- --ignored --nocapture
+//! cargo test -p mlx-gen-pid --release --test integration caption_real:: -- --ignored --nocapture
 //! ```
 
 use mlx_gen::weights::Weights;

@@ -3,7 +3,7 @@
 //! `black-forest-labs/FLUX.2-klein-9b` snapshot AND the wikeeyang `Flux2-Klein-9B-True-V2`
 //! `*-bf16.safetensors` single file:
 //!
-//!   cargo test -p mlx-gen-flux2 --test convert_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux2 --test integration convert_real_weights:: -- --ignored --nocapture
 //!
 //! The committed `convert` unit tests prove the remap *math* (qkv split, adaLN half-swap, key
 //! renames) on synthetic tensors; this proves the *whole assembly* on the real fine-tune: the
@@ -37,7 +37,10 @@ fn true_v2_bf16_file() -> PathBuf {
 fn convert_assembles_loadable_diffusers_dir() {
     let base = base_snapshot();
     let source = true_v2_bf16_file();
-    let out = std::env::temp_dir().join("mlx_gen_flux2_true_v2_convert_out");
+    let out = std::env::temp_dir().join(format!(
+        "mlx_gen_flux2_true_v2_convert_out_{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&out); // idempotent: clear any prior run
 
     // Convert + assemble. The internal base-validation guard asserts produced keyset+shapes match
@@ -114,5 +117,7 @@ fn convert_assembles_loadable_diffusers_dir() {
         "flux2 true_v2 convert + assemble OK: loadable diffusers dir at {}",
         out.display()
     );
-    let _ = std::fs::remove_dir_all(&out);
+    if std::env::var_os("MLX_GEN_FLUX2_KEEP_CONVERTED").is_none() {
+        let _ = std::fs::remove_dir_all(&out);
+    }
 }

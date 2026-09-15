@@ -8,7 +8,7 @@
 //! ```text
 //! WAN_A14B_MODEL_DIR=/path/to/wan2.2-t2v-a14b/q4 \
 //! WANVACE_FUN_DIR=/path/to/assembled-vace-fun-a14b \
-//!   cargo test -p mlx-gen-wan --release --test a14b_vace_te_quant_measurement \
+//!   cargo test -p mlx-gen-wan --release --test integration a14b_vace_te_quant_measurement:: \
 //!     -- --ignored --nocapture --test-threads=1
 //! ```
 

@@ -131,11 +131,12 @@ pub const MEDIUM_DUAL_ATTENTION_LAYERS: usize = 13;
 /// converter / arch validation reuse this same scaffolding, parameterized by [`Sd3Arch::medium`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sd3Variant {
-    /// Stable Diffusion 3.5 Large (8.1B), true-CFG.
+    /// Stable Diffusion 3.5 Large (8.1B), classifier-free guidance.
     Large,
     /// Stable Diffusion 3.5 Large Turbo, ADD-distilled few-step (guidance 1.0, ~4 steps).
     LargeTurbo,
-    /// Stable Diffusion 3.5 Medium (2.5B), MMDiT-X (dual-attention first 13 blocks), true-CFG.
+    /// Stable Diffusion 3.5 Medium (2.5B), MMDiT-X (dual-attention first 13 blocks), classifier-free
+    /// guidance.
     Medium,
 }
 
@@ -172,10 +173,25 @@ impl Sd3Variant {
         }
     }
 
-    /// True-CFG: Large / Medium run a negative prompt + a guidance scale >1. Turbo is distilled to a
-    /// single (cond-only) forward — guidance 1.0, no negative prompt.
-    pub fn supports_true_cfg(self) -> bool {
+    /// Large / Medium run a negative prompt + a guidance scale >1. Turbo is distilled to a single
+    /// (cond-only) forward — guidance 1.0, no negative prompt.
+    ///
+    /// This is deliberately distinct from [`Capabilities::supports_true_cfg`], which describes the
+    /// separate [`mlx_gen::GenerationRequest::true_cfg`] request field. SD3.5's MLX render path
+    /// consumes `guidance` and `negative_prompt`, but never consumes `true_cfg`.
+    pub fn uses_classifier_free_guidance(self) -> bool {
         matches!(self, Self::Large | Self::Medium)
+    }
+
+    /// Compatibility alias for callers that used the old, ambiguous method name.
+    ///
+    /// This reports whether the variant runs its `guidance` + `negative_prompt` classifier-free
+    /// branch. It does **not** mean the descriptor accepts [`mlx_gen::GenerationRequest::true_cfg`].
+    #[deprecated(
+        note = "use uses_classifier_free_guidance; SD3.5 does not consume request.true_cfg"
+    )]
+    pub fn supports_true_cfg(self) -> bool {
+        self.uses_classifier_free_guidance()
     }
 
     /// The MMDiT arch for this variant. Large / Large-Turbo share one plain-MMDiT layout; Medium is
@@ -189,16 +205,19 @@ impl Sd3Variant {
 
     pub fn descriptor(self) -> ModelDescriptor {
         ModelDescriptor {
+            encoder_contract: None,
+            denoiser_output_latent_space: Some(&mlx_gen::gen_core::SD3_LATENT_SPACE),
+            control_kinds: None,
             required_components: &[],
             id: self.id(),
             family: "sd3",
             backend: "mlx",
             modality: Modality::Image,
             capabilities: Capabilities {
-                // Large is classic true-CFG (negative prompt + guidance); Turbo is guidance-free.
-                supports_negative_prompt: self.supports_true_cfg(),
-                supports_guidance: self.supports_true_cfg(),
-                supports_true_cfg: self.supports_true_cfg(),
+                // Large / Medium consume guidance + a negative prompt; Turbo is guidance-free. The
+                // separate request.true_cfg field is not read by any SD3.5 MLX render path.
+                supports_negative_prompt: self.uses_classifier_free_guidance(),
+                supports_guidance: self.uses_classifier_free_guidance(),
                 // Reference-image conditioning = img2img latent-init (epic 8588 slice A4, sc-10189):
                 // a single `Conditioning::Reference { image, strength }` seeds the flow-match denoise
                 // from the VAE-encoded reference (see model.rs `generate_impl` → pipeline
@@ -219,12 +238,10 @@ impl Sd3Variant {
                     s.push("linear");
                     s
                 },
-                supported_guidance_methods: vec![],
                 min_size: 256,
                 max_size: 1440,
                 max_count: 8,
                 mac_only: true,
-                supports_kv_cache: false,
                 // SD3.5 uses a STATIC flow-match shift of 3.0 (FlowMatchEulerDiscreteScheduler
                 // { shift: 3.0 }, no dynamic shifting) baked into the schedule — resolution-
                 // independent, identical to the Z-Image path. So this loader hint is false: a
@@ -236,17 +253,8 @@ impl Sd3Variant {
                 // encoded, materialized, then dropped before the MMDiT + VAE load — bounding peak to
                 // `max(triple-TE, MMDiT+VAE)`. T5-XXL alone is the biggest TE-drop in the family.
                 supports_sequential_offload: true,
-                supports_streaming: false,
-                supports_multi_speaker: false,
-                supports_conversation_history: false,
-                supports_conversation_session: false,
-                max_speakers: None,
-                // No audio surface (sc-12834): pure image/video model.
-                audio_sample_rates: vec![],
-                max_audio_duration_secs: None,
-                audio_voices: vec![],
-                audio_languages: vec![],
-                audio_edit_modes: vec![],
+                supports_preview: true,
+                ..Default::default()
             },
         }
     }

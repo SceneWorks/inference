@@ -9,8 +9,8 @@
 //!
 //! The candle deviations from the mlx descriptor are the two backend-correct ones the SDXL / FLUX /
 //! Z-Image candle slices already make: `backend = "candle"` and `mac_only = false`. Like those
-//! slices this v1 wires **txt2img only** — LoRA/LoKr and Q4/Q8 are NOT advertised (and are rejected
-//! at load rather than silently dropped); ControlNet / IP-Adapter are later ports.
+//! slices this v1 wires **txt2img + LoRA/LoKr**, including packed Q4/Q8 base tiers; ControlNet /
+//! IP-Adapter remain separate combinations.
 
 use candle_gen::gen_core::{Capabilities, Modality, ModelDescriptor};
 
@@ -18,7 +18,16 @@ pub const CHROMA1_HD_ID: &str = "chroma1_hd";
 pub const CHROMA1_BASE_ID: &str = "chroma1_base";
 pub const CHROMA1_FLASH_ID: &str = "chroma1_flash";
 
-/// The base flow-match sampler name (matches the mlx descriptor's advertised sampler).
+/// The base flow-match sampler name.
+///
+/// It does **not** match the mlx descriptor's advertised sampler, which this doc comment claimed
+/// until sc-19496: `mlx-gen-chroma`'s `DEFAULT_SAMPLER` is `"euler"`. Both menus carry `flow_match`
+/// as a legacy alias falling back to euler — candle via `menu_with_aliases` (the `samplers:` field
+/// below), mlx by pushing it onto `curated_sampler_names()` inline, which is why it never calls
+/// `menu_with_aliases` — so the advertised *strings* differ while the integrator does not.
+/// Which string is right against the released checkpoint is sc-19495; `check_cross_backend_geometry`
+/// carries an exemption naming that story rather than letting either backend's value be copied
+/// across to buy a green.
 pub const DEFAULT_SAMPLER: &str = "flow_match";
 
 /// Chroma works in the VAE's /8 latent and the DiT packs that 2×2, so both image dims must be
@@ -80,10 +89,12 @@ impl ChromaVariant {
     /// The candle descriptor for this variant — the txt2img surface sc-5484 actually wires. Chroma
     /// uses real classifier-free guidance with a true negative prompt (`supports_true_cfg` +
     /// `supports_negative_prompt`), and NO distilled guidance-scalar embedding
-    /// (`supports_guidance = false`). LoRA/LoKr and quantization are deferred (the Python fallback's
-    /// job until candle wires them), so they are not advertised and are rejected at load.
+    /// (`supports_guidance = false`). LoRA/LoKr apply through the shared dense/packed adapter stack.
     pub fn descriptor(self) -> ModelDescriptor {
         ModelDescriptor {
+            encoder_contract: None,
+            denoiser_output_latent_space: Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE),
+            control_kinds: None,
             required_components: &[],
             id: self.id(),
             family: "chroma",
@@ -91,12 +102,11 @@ impl ChromaVariant {
             modality: Modality::Image,
             capabilities: Capabilities {
                 supports_negative_prompt: true,
-                supports_guidance: false,
                 supports_true_cfg: true,
                 // v1 = T2I only. ControlNet / IP-Adapter / img2img are later ports.
                 conditioning: vec![],
-                supports_lora: false,
-                supports_lokr: false,
+                supports_lora: true,
+                supports_lokr: true,
                 // Unified curated sampler/scheduler menu (epic 7114 P4, sc-7123) plus the legacy
                 // aliases (`flow_match` / `linear`), which fall back to euler / the native per-variant
                 // schedule (N3) so a request the worker builds for either backend still validates.
@@ -108,29 +118,19 @@ impl ChromaVariant {
                     candle_gen::curated_scheduler_names(),
                     &["linear"],
                 ),
-                supported_guidance_methods: vec![],
                 min_size: 256,
                 max_size: 2048,
                 max_count: 8,
-                // candle is the Windows/CUDA backend — NOT Mac-only (the MLX provider sets this true).
-                mac_only: false,
-                supported_quants: &[],
-                supports_kv_cache: false,
                 // The static-shift / beta sigma schedule is applied inside the candle pipeline, so the
                 // worker needs no sigma-shift loader hint (matches the candle FLUX/Z-Image slices).
                 requires_sigma_shift: false,
-                supports_sequential_offload: false,
-                supports_streaming: false,
-                supports_multi_speaker: false,
-                supports_conversation_history: false,
-                supports_conversation_session: false,
-                max_speakers: None,
-                // No audio surface (sc-12834): pure image/video model.
-                audio_sample_rates: vec![],
-                max_audio_duration_secs: None,
-                audio_voices: vec![],
-                audio_languages: vec![],
-                audio_edit_modes: vec![],
+                // Per-step latent previews (epic 16948, sc-16956): the one registered render lane all
+                // three variants share hands `crate::preview::hook` — the FLUX.1 seam, reused because
+                // Chroma ships a byte-identical VAE — to the shared flow driver. `candle-gen-catalog`'s
+                // `preview_advertising` guard derives this from the sources and fails if the flag and
+                // the wiring ever disagree.
+                supports_preview: true,
+                ..Default::default()
             },
         }
     }
@@ -217,8 +217,8 @@ mod tests {
             assert!(!d.capabilities.supports_guidance);
             assert!(!d.capabilities.mac_only);
             assert!(d.capabilities.conditioning.is_empty());
-            assert!(!d.capabilities.supports_lora);
-            assert!(!d.capabilities.supports_lokr);
+            assert!(d.capabilities.supports_lora);
+            assert!(d.capabilities.supports_lokr);
             assert!(d.capabilities.supported_quants.is_empty());
             assert_eq!(d.capabilities.min_size, 256);
             assert_eq!(d.capabilities.max_size, 2048);

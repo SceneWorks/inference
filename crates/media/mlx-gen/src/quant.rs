@@ -51,7 +51,14 @@ pub fn packed_quant_bits(root: &Path, component: &str) -> Result<Option<i32>> {
         )));
     }
 
-    let config_path = root.join(component_path).join("config.json");
+    packed_quant_bits_at(&root.join(component_path))
+}
+
+/// [`packed_quant_bits`] against a component directory that is already resolved — for a caller
+/// holding the component path itself rather than a snapshot root plus a component name (the
+/// offline pre-quantize converters, which are handed `…/transformer` directly).
+pub fn packed_quant_bits_at(component_dir: &Path) -> Result<Option<i32>> {
+    let config_path = component_dir.join("config.json");
     let bytes = match std::fs::read(&config_path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
@@ -101,6 +108,62 @@ pub fn packed_quant_bits(root: &Path, component: &str) -> Result<Option<i32>> {
     Ok(Some(bits))
 }
 
+/// Read the affine quantization group size declared by a packed component's `config.json`.
+///
+/// Dense components return `None`. A packed marker must declare one of the group sizes implemented
+/// by MLX (`32`, `64`, or `128`); rejecting any other value here keeps corrupt or hand-edited
+/// manifests from failing later inside `quantized_matmul` with an opaque backend error.
+pub fn packed_quant_group_size_at(component_dir: &Path) -> Result<Option<i32>> {
+    let config_path = component_dir.join("config.json");
+    let bytes = match std::fs::read(&config_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(crate::Error::Msg(format!(
+                "packed quant: read {}: {err}",
+                config_path.display()
+            )))
+        }
+    };
+    let config: serde_json::Value = serde_json::from_slice(&bytes).map_err(|err| {
+        crate::Error::Msg(format!(
+            "packed quant: parse {}: {err}",
+            config_path.display()
+        ))
+    })?;
+    let Some(marker) = config.get("quantization") else {
+        return Ok(None);
+    };
+    let marker = marker.as_object().ok_or_else(|| {
+        crate::Error::Msg(format!(
+            "packed quant: {} `quantization` must be an object",
+            config_path.display()
+        ))
+    })?;
+    let group_size_i64 = marker
+        .get("group_size")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| {
+            crate::Error::Msg(format!(
+                "packed quant: {} `quantization.group_size` must be an integer",
+                config_path.display()
+            ))
+        })?;
+    let group_size = i32::try_from(group_size_i64).map_err(|_| {
+        crate::Error::Msg(format!(
+            "packed quant: {} `quantization.group_size` is out of range: {group_size_i64}",
+            config_path.display()
+        ))
+    })?;
+    if !matches!(group_size, 32 | 64 | 128) {
+        return Err(crate::Error::Msg(format!(
+            "packed quant: {} declares unsupported `quantization.group_size` {group_size}; expected 32, 64, or 128",
+            config_path.display()
+        )));
+    }
+    Ok(Some(group_size))
+}
+
 /// Decide whether a requested Q4/Q8 tier must be produced by load-time quantization.
 ///
 /// Packed turnkeys must match the request exactly; a mismatch is a hard error because provider
@@ -133,11 +196,11 @@ pub fn needs_load_time_quant(
 /// `bits = wq.cols·32/in`. Exact for any group-aligned Q4/Q8 pack, so the bit-width need not be
 /// carried in a side manifest.
 ///
-/// F-011: returns `Result` and validates the shapes a corrupt/mis-converted pre-quantized snapshot
-/// would otherwise mishandle: a 1-D `scales` (or `wq`) panics on the shape index; a `[out, 0]` scales
-/// tensor makes `in_dim == 0` → integer divide-by-zero; a mis-packed `wq` yields bits ∉ {4,8}. The
-/// shared load seam for every Group-B packed snapshot feeds straight off external `.safetensors`, so
-/// these shapes are untrusted.
+/// F-011: returns `Result` and validates the dtype and exact geometry a corrupt/mis-converted
+/// pre-quantized snapshot would otherwise mishandle: codes must be u32, scales floating point, rows
+/// must agree, and packed columns must divide exactly rather than truncating into an apparently valid
+/// Q4/Q8 width. The shared load seam for every Group-B packed snapshot feeds straight off external
+/// `.safetensors`, so these tensors are untrusted.
 pub fn packed_bits(wq: &Array, scales: &Array, group_size: i32) -> Result<i32> {
     let sshape = scales.shape();
     let wshape = wq.shape();
@@ -147,14 +210,52 @@ pub fn packed_bits(wq: &Array, scales: &Array, group_size: i32) -> Result<i32> {
             sshape, wshape
         )));
     }
-    let in_dim = sshape[1] * group_size;
+    if wq.dtype() != Dtype::Uint32 {
+        return Err(crate::Error::Msg(format!(
+            "packed quant: weight codes must be u32, got {:?}",
+            wq.dtype()
+        )));
+    }
+    if !matches!(
+        scales.dtype(),
+        Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
+    ) {
+        return Err(crate::Error::Msg(format!(
+            "packed quant: scales must be floating point, got {:?}",
+            scales.dtype()
+        )));
+    }
+    if sshape[0] != wshape[0] {
+        return Err(crate::Error::Msg(format!(
+            "packed quant: scales and weight rows differ ({} != {})",
+            sshape[0], wshape[0]
+        )));
+    }
+    let in_dim = sshape[1].checked_mul(group_size).ok_or_else(|| {
+        crate::Error::Msg(format!(
+            "packed quant: input dimension overflow (scales cols {} × group_size {group_size})",
+            sshape[1]
+        ))
+    })?;
     if in_dim == 0 {
         return Err(crate::Error::Msg(format!(
             "packed quant: zero input dim (scales cols {} × group_size {})",
             sshape[1], group_size
         )));
     }
-    let bits = wshape[1] * 32 / in_dim;
+    let packed_width = wshape[1].checked_mul(32).ok_or_else(|| {
+        crate::Error::Msg(format!(
+            "packed quant: packed width overflow (weight cols {} × 32)",
+            wshape[1]
+        ))
+    })?;
+    if packed_width % in_dim != 0 {
+        return Err(crate::Error::Msg(format!(
+            "packed quant: weight cols {} do not exactly encode scales cols {} × group_size {group_size}",
+            wshape[1], sshape[1]
+        )));
+    }
+    let bits = packed_width / in_dim;
     if !matches!(bits, 4 | 8) {
         // Name the assumed `group_size` (sc-15154). Every term here is derived FROM it, so a caller
         // that passes the wrong one gets an illegal width from a perfectly good artifact — Mage's q8
@@ -232,14 +333,18 @@ pub fn load_dir_map(dir: &Path) -> Result<HashMap<String, Array>> {
 
 /// Materialize (`eval`) + write a key→`Array` map to a single `path` safetensors (one file — a packed
 /// component is small enough not to need sharding; the loaders glob `*.safetensors`, so one file
-/// replaces the source's shards). The write side of the converters.
+/// replaces the source's shards). Keys are sorted before serialization so rebuilding an identical
+/// validated artifact produces byte-identical files that can be bound to publication by SHA-256.
+/// The write side of the converters.
 pub fn save_map(path: &Path, map: &HashMap<String, Array>) -> Result<()> {
     eval(map.values().collect::<Vec<_>>())?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let mut entries = map.iter().collect::<Vec<_>>();
+    entries.sort_unstable_by_key(|(key, _)| *key);
     Array::save_safetensors(
-        map.iter().map(|(k, v)| (k.as_str(), v)),
+        entries.into_iter().map(|(k, v)| (k.as_str(), v)),
         None::<&HashMap<String, String>>,
         path,
     )?;
@@ -302,10 +407,26 @@ pub const TURNKEY_ASSET_FILES: &[&str] = &[
 ];
 
 /// Copy `src/config.json` to `dst/config.json` with a `"quantization": {"bits", "group_size"}` block
-/// added (HF/diffusers-compat; the Rust loaders auto-detect packed weights via `{base}.scales` and
-/// ignore this block — it is provenance/informational). A missing source config starts from an empty
-/// object. The written bytes are `serde_json::to_string_pretty` of the merged value, byte-identical
-/// across every provider that packs per-component dirs.
+/// added. A missing source config starts from an empty object. The written bytes are
+/// `serde_json::to_string_pretty` of the merged value, byte-identical across every provider that
+/// packs per-component dirs.
+///
+/// **This block is load-bearing, not provenance.** An earlier version of this doc said the Rust
+/// loaders auto-detect packed weights via `{base}.scales` and "ignore this block" — true of the
+/// *loaders*, false of everything else, and the SC-15525 review traced a real coverage gap back to
+/// believing it. [`packed_quant_bits`] reads this marker and **only** this marker, so a packed
+/// component shipped without it is reported as dense and three separate decisions go the wrong way:
+///
+/// * [`needs_load_time_quant`] answers "yes", which is what the F-144 requested-vs-packed tier guard
+///   consults — so a Q4 request against an unmarked packed-Q8 component passes the guard and is then
+///   served Q8 by a `quantize()` that no-ops on already-packed weights;
+/// * a memory-strategy contract's "does this load leave the transformer lazy" predicate answers "no"
+///   and withholds rung 4. That is exactly why `illustrious_xl_v1`/`illustrious_xl_v2` at q8 publish
+///   no bounded transformer residency — see `mlx_gen_sdxl::memory_strategy::load_leaves_blocks_lazy`;
+/// * anything sizing a fit from the declared tier reads the wrong one.
+///
+/// A packing path that omits this call produces a snapshot that *works* and is *mislabelled*, which
+/// is the hardest kind to notice. Every packing path must write it.
 pub fn write_quantized_config(src: &Path, dst: &Path, bits: i32, group_size: i32) -> Result<()> {
     let src_cfg = src.join("config.json");
     let mut v: serde_json::Value = if src_cfg.exists() {
@@ -377,10 +498,9 @@ pub fn copy_turnkey_assets(src_root: &Path, dst_root: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn marker_fixture(body: Option<&str>) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "mlx-gen-quant-marker-{}-{:?}",
-            std::process::id(),
+    fn marker_fixture(tmp: &tempfile::TempDir, body: Option<&str>) -> std::path::PathBuf {
+        let root = tmp.path().join(format!(
+            "mlx-gen-quant-marker-{:?}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -395,8 +515,9 @@ mod tests {
 
     #[test]
     fn quant_tier_missing_or_unmarked_config_is_dense() {
+        let tmp = tempfile::tempdir().unwrap();
         for body in [None, Some("{}"), Some(r#"{"hidden_size": 64}"#)] {
-            let root = marker_fixture(body);
+            let root = marker_fixture(&tmp, body);
             assert_eq!(packed_quant_bits(&root, "transformer").unwrap(), None);
             assert!(needs_load_time_quant(&root, "transformer", 4, "model").unwrap());
             std::fs::remove_dir_all(root).ok();
@@ -405,7 +526,8 @@ mod tests {
 
     #[test]
     fn quant_tier_match_skips_and_mismatch_names_context() {
-        let root = marker_fixture(Some(r#"{"quantization":{"bits":8,"group_size":64}}"#));
+        let tmp = tempfile::tempdir().unwrap();
+        let root = marker_fixture(&tmp, Some(r#"{"quantization":{"bits":8,"group_size":64}}"#));
         assert!(!needs_load_time_quant(&root, "transformer", 8, "lens_turbo").unwrap());
         let error = needs_load_time_quant(&root, "transformer", 4, "lens_turbo")
             .unwrap_err()
@@ -417,7 +539,35 @@ mod tests {
     }
 
     #[test]
+    fn packed_group_size_accepts_only_mlx_affine_geometries() {
+        let tmp = tempfile::tempdir().unwrap();
+        for group_size in [32, 64, 128] {
+            let body = format!(r#"{{"quantization":{{"bits":8,"group_size":{group_size}}}}}"#);
+            let root = marker_fixture(&tmp, Some(&body));
+            assert_eq!(
+                packed_quant_group_size_at(&root.join("transformer")).unwrap(),
+                Some(group_size)
+            );
+            std::fs::remove_dir_all(root).ok();
+        }
+        for marker in [
+            r#"{"quantization":{"bits":8}}"#,
+            r#"{"quantization":{"bits":8,"group_size":"32"}}"#,
+            r#"{"quantization":{"bits":8,"group_size":16}}"#,
+            r#"{"quantization":{"bits":8,"group_size":2147483648}}"#,
+        ] {
+            let root = marker_fixture(&tmp, Some(marker));
+            assert!(
+                packed_quant_group_size_at(&root.join("transformer")).is_err(),
+                "group-size marker must fail: {marker}"
+            );
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
     fn quant_tier_rejects_every_present_but_malformed_marker() {
+        let tmp = tempfile::tempdir().unwrap();
         for body in [
             "{",
             r#"{"quantization":null}"#,
@@ -428,7 +578,7 @@ mod tests {
             r#"{"quantization":{"bits":3}}"#,
             r#"{"quantization":{"bits":2147483648}}"#,
         ] {
-            let root = marker_fixture(Some(body));
+            let root = marker_fixture(&tmp, Some(body));
             assert!(
                 packed_quant_bits(&root, "transformer").is_err(),
                 "marker must fail: {body}"
@@ -439,7 +589,8 @@ mod tests {
 
     #[test]
     fn quant_tier_only_swallows_not_found_and_rejects_unsafe_components() {
-        let root = marker_fixture(None);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = marker_fixture(&tmp, None);
         std::fs::create_dir(root.join("transformer/config.json")).unwrap();
         assert!(packed_quant_bits(&root, "transformer").is_err());
         for component in ["", "../transformer", "/transformer", "transformer/../vae"] {
@@ -493,5 +644,18 @@ mod tests {
         let wq = Array::zeros::<u32>(&[64, 24]).unwrap(); // bits 3
         let err = packed_bits(&wq, &scales, 64).unwrap_err().to_string();
         assert!(err.contains("∉ {4, 8}"), "{err}");
+    }
+
+    #[test]
+    fn packed_bits_rejects_truncated_width_wrong_rows_and_non_u32_codes() {
+        let scales = Array::zeros::<f32>(&[2, 2]).unwrap();
+        let truncated = Array::zeros::<u32>(&[2, 33]).unwrap();
+        assert!(packed_bits(&truncated, &scales, 64).is_err());
+
+        let wrong_rows = Array::zeros::<u32>(&[3, 32]).unwrap();
+        assert!(packed_bits(&wrong_rows, &scales, 64).is_err());
+
+        let float_codes = Array::zeros::<f32>(&[2, 32]).unwrap();
+        assert!(packed_bits(&float_codes, &scales, 64).is_err());
     }
 }

@@ -12,7 +12,7 @@
 //!
 //! `#[ignore]`d — needs a real Lens-family snapshot (`microsoft/Lens-Turbo` by default). Run per tier:
 //!   SC8763_SRC=<snap> SC8763_BITS=4 \
-//!     cargo test -p mlx-gen-lens --release --test prequantize_real_weights -- --ignored --nocapture
+//!     cargo test -p mlx-gen-lens --release --test integration prequantize_real_weights:: -- --ignored --nocapture
 //!
 //! Env knobs: SC8763_SRC (source snapshot dir; default first HF-cache Lens-Turbo snapshot),
 //! SC8763_OUT (tier output dir), SC8763_BITS (4 default / 8 / 0 = dense bf16 mirror), SC8763_MODEL
@@ -35,7 +35,7 @@ fn model_id() -> String {
 /// snapshot into `SC8763_OUT` and keep it — no load/generate. `SC8763_BITS=0` builds the dense bf16
 /// tier (a verbatim mirror of the source). Run per tier:
 ///   SC8763_SRC=<snap> SC8763_OUT=<staging/q4> SC8763_BITS=4 \
-///     cargo test -p mlx-gen-lens --release --test prequantize_real_weights -- --ignored build_tier_only --nocapture
+///     cargo test -p mlx-gen-lens --release --test integration -- --ignored prequantize_real_weights::build_tier_only --nocapture
 #[test]
 #[ignore = "build-only tier producer for hosting; set SC8763_SRC/OUT/BITS"]
 fn build_tier_only() {

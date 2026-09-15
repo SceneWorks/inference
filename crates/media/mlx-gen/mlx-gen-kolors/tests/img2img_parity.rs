@@ -11,9 +11,9 @@
 //! the strength-derived `begin_index`), `scale_model_input`, the U-Net, CFG, and the Euler step — and
 //! the full render (gate B) is a coherence + cross-backend-delta report.
 //!
-//! Run: `cargo test -p mlx-gen-kolors --release --test img2img_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-kolors --release --test integration img2img_parity:: -- --ignored --nocapture`
 
-mod common;
+use crate::common;
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{DiffusionSampler, Image};

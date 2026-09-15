@@ -10,6 +10,9 @@ categories = ["science"]
 
 [dependencies]
 candle-gen = { path = "../candle-gen" }
+# Boogu denoises in the same native 16-channel AutoencoderKL latent space as FLUX.1. Reuse the
+# measured FLUX.1 preview projector rather than carrying a second coefficient table (sc-17218).
+candle-gen-flux = { path = "../candle-gen-flux" }
 # NVIDIA PiD optional super-resolving decoder (epic 7840 / sc-7853). Boogu reuses the FLUX.1 / z-image
 # 16-ch VAE, so it shares the `flux` PiD latent-space student. Wired behind `req.use_pid` (default off
 # → the byte-exact native VAE decode).
@@ -24,15 +27,22 @@ candle-transformers = { workspace = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
 serde_json = "1"
+sha2 = { workspace = true }
 
 [features]
 default = []
-metal = ["candle-gen/metal", "candle-transformers/metal", "candle-gen-pid/metal"]
-cuda = ["candle-gen/cuda", "candle-transformers/cuda", "candle-gen-pid/cuda"]
+metal = ["candle-gen/metal", "candle-gen-flux/metal", "candle-transformers/metal", "candle-gen-pid/metal"]
+cuda = ["candle-gen/cuda", "candle-gen-flux/cuda", "candle-transformers/cuda", "candle-gen-pid/cuda"]
 
 [dev-dependencies]
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 # Shared test-support helpers (`candle_gen::testkit` — PPM IO / env-path / mean-abs-diff) for the
 # `#[ignore]`d img2img real-weight validation (sc-11786). Cargo unifies this with the `[dependencies]`
 # `candle-gen` entry, but the `testkit` feature is dev-only so it never reaches the shipped provider.
 candle-gen = { path = "../candle-gen", features = ["testkit"] }
+# Backend-neutral gen-core contract conformance — the SC-22657 architecture-facts honesty gate.
+sceneworks-gen-core-testkit = { workspace = true }

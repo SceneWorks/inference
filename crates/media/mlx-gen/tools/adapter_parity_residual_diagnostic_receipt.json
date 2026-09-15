@@ -1,0 +1,278 @@
+{
+  "proof": {
+    "artifacts_after": {
+      "flux_hyper_golden": "e24dc881bfc93f9f9465debacfcf3ef48435fe0115145ce75f1735cdcb6dece7",
+      "hyper_flux_lora": "e0ab0fdf569cd01a382f19bd87681f628879dea7ad51fe5a3799b6c18c7b2d03",
+      "qwen_base_golden": "5f810691d0b2768cc2d3e42a5e14885c3c2832234dc3f15b89453e28d07cc7b4",
+      "qwen_lokr_adapter": "f540e35a21c9478db39f80fedf619d3d4e218e6d7e731b9aa222d358a51a9d25",
+      "qwen_lokr_golden": "3c3337e6f3c167203831a4d7b87416d33ea283c140cbbf2f214ddb3e0de4eeed",
+      "qwen_lora_adapter": "1216a0ab9dfc1748e266de402a8fe0e51d842651511170496455c055f32567cd",
+      "qwen_lora_golden": "174ce5ab79f93e6d7d1d82a3bdcd1e85662acf27db5bcc1787e759b6d945dcda",
+      "z_image_base_golden": "b4169c698a34772248a1211280fdedc8755cac55b1196f4263208776a737c213",
+      "z_image_lokr_adapter": "a70b07001c05012bbd283d340f62202a857fccdcb5330bf8dbece9aa298ffc1c",
+      "z_image_lokr_golden": "38c8cc5c676e5a3636d1119fe48a23c2cbfab8cec593449295467b0c84b9c1e0",
+      "z_image_lora_adapter": "ff3712ae5ad2b3a319e9a4fd48aa199e9b03a8ba30023f793b5242bb5b7349bc",
+      "z_image_lora_golden": "b72d8c9b8714aa8f5fc26cc31c1c679a9e9e3de94efc7709968c378e4380f766"
+    },
+    "artifacts_before": {
+      "flux_hyper_golden": "e24dc881bfc93f9f9465debacfcf3ef48435fe0115145ce75f1735cdcb6dece7",
+      "hyper_flux_lora": "e0ab0fdf569cd01a382f19bd87681f628879dea7ad51fe5a3799b6c18c7b2d03",
+      "qwen_base_golden": "5f810691d0b2768cc2d3e42a5e14885c3c2832234dc3f15b89453e28d07cc7b4",
+      "qwen_lokr_adapter": "f540e35a21c9478db39f80fedf619d3d4e218e6d7e731b9aa222d358a51a9d25",
+      "qwen_lokr_golden": "3c3337e6f3c167203831a4d7b87416d33ea283c140cbbf2f214ddb3e0de4eeed",
+      "qwen_lora_adapter": "1216a0ab9dfc1748e266de402a8fe0e51d842651511170496455c055f32567cd",
+      "qwen_lora_golden": "174ce5ab79f93e6d7d1d82a3bdcd1e85662acf27db5bcc1787e759b6d945dcda",
+      "z_image_base_golden": "b4169c698a34772248a1211280fdedc8755cac55b1196f4263208776a737c213",
+      "z_image_lokr_adapter": "a70b07001c05012bbd283d340f62202a857fccdcb5330bf8dbece9aa298ffc1c",
+      "z_image_lokr_golden": "38c8cc5c676e5a3636d1119fe48a23c2cbfab8cec593449295467b0c84b9c1e0",
+      "z_image_lora_adapter": "ff3712ae5ad2b3a319e9a4fd48aa199e9b03a8ba30023f793b5242bb5b7349bc",
+      "z_image_lora_golden": "b72d8c9b8714aa8f5fc26cc31c1c679a9e9e3de94efc7709968c378e4380f766"
+    },
+    "execution": {
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "hardware": {
+        "logical_cpus": 18,
+        "machine": "arm64",
+        "processor": "arm"
+      },
+      "platform": {
+        "machine": "arm64",
+        "macos": "26.5.2",
+        "release": "25.5.0",
+        "system": "Darwin"
+      },
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: aarch64-apple-darwin\nrelease: 1.96.0\nLLVM version: 22.1.2"
+    },
+    "execution_after": {
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "hardware": {
+        "logical_cpus": 18,
+        "machine": "arm64",
+        "processor": "arm"
+      },
+      "platform": {
+        "machine": "arm64",
+        "macos": "26.5.2",
+        "release": "25.5.0",
+        "system": "Darwin"
+      },
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: aarch64-apple-darwin\nrelease: 1.96.0\nLLVM version: 22.1.2"
+    },
+    "mode": "residual_diagnostic",
+    "models_after": {
+      "flux_dev": {
+        "inventory_sha256": "413a16687377f7cf9322bf9d9b8bef0f73a461809bc89d8e99dc5bcd1eaecdc2",
+        "reference": "main",
+        "repository": "black-forest-labs/FLUX.1-dev",
+        "revision": "3de623fc3c33e44ffbe2bad470d0f45bccf2eb21",
+        "snapshot_path": "${HF_MODELS_ROOT}/models--black-forest-labs--FLUX.1-dev/snapshots/3de623fc3c33e44ffbe2bad470d0f45bccf2eb21",
+        "subdirectory": "."
+      },
+      "qwen_image": {
+        "inventory_sha256": "094c6a3b4ef5c509aaaa821f7a5aec360e839298f284d60b71166715f5ba2577",
+        "reference": "main",
+        "repository": "SceneWorks/qwen-image-mlx",
+        "revision": "8080a4171f1c8b7fca6c30491eafbe6ffab754bf",
+        "snapshot_path": "${HF_MODELS_ROOT}/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16",
+        "subdirectory": "bf16"
+      },
+      "z_image_turbo": {
+        "inventory_sha256": "21c5a5a566300d42dcd2295065dc74cef3862880638e027e74f7921bfa3e0f3e",
+        "reference": "main",
+        "repository": "SceneWorks/z-image-turbo-mlx",
+        "revision": "bb2bc9893b3c49ae96c813350775f791a2e8bc80",
+        "snapshot_path": "${HF_MODELS_ROOT}/models--SceneWorks--z-image-turbo-mlx/snapshots/bb2bc9893b3c49ae96c813350775f791a2e8bc80/bf16",
+        "subdirectory": "bf16"
+      }
+    },
+    "models_before": {
+      "flux_dev": {
+        "inventory_sha256": "413a16687377f7cf9322bf9d9b8bef0f73a461809bc89d8e99dc5bcd1eaecdc2",
+        "reference": "main",
+        "repository": "black-forest-labs/FLUX.1-dev",
+        "revision": "3de623fc3c33e44ffbe2bad470d0f45bccf2eb21",
+        "snapshot_path": "${HF_MODELS_ROOT}/models--black-forest-labs--FLUX.1-dev/snapshots/3de623fc3c33e44ffbe2bad470d0f45bccf2eb21",
+        "subdirectory": "."
+      },
+      "qwen_image": {
+        "inventory_sha256": "094c6a3b4ef5c509aaaa821f7a5aec360e839298f284d60b71166715f5ba2577",
+        "reference": "main",
+        "repository": "SceneWorks/qwen-image-mlx",
+        "revision": "8080a4171f1c8b7fca6c30491eafbe6ffab754bf",
+        "snapshot_path": "${HF_MODELS_ROOT}/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16",
+        "subdirectory": "bf16"
+      },
+      "z_image_turbo": {
+        "inventory_sha256": "21c5a5a566300d42dcd2295065dc74cef3862880638e027e74f7921bfa3e0f3e",
+        "reference": "main",
+        "repository": "SceneWorks/z-image-turbo-mlx",
+        "revision": "bb2bc9893b3c49ae96c813350775f791a2e8bc80",
+        "snapshot_path": "${HF_MODELS_ROOT}/models--SceneWorks--z-image-turbo-mlx/snapshots/bb2bc9893b3c49ae96c813350775f791a2e8bc80/bf16",
+        "subdirectory": "bf16"
+      }
+    },
+    "results": {
+      "qwen_lokr": {
+        "residual_samples_gt8": 69111,
+        "rgb_samples": 786432,
+        "zero_residual_samples_gt8": 50446
+      },
+      "qwen_lora": {
+        "residual_samples_gt8": 63030,
+        "rgb_samples": 786432,
+        "zero_residual_samples_gt8": 43903
+      },
+      "z_image_lokr": {
+        "residual_samples_gt8": 14028,
+        "rgb_samples": 786432,
+        "zero_residual_samples_gt8": 40120
+      },
+      "z_image_lora": {
+        "residual_samples_gt8": 12940,
+        "rgb_samples": 786432,
+        "zero_residual_samples_gt8": 26587
+      }
+    },
+    "runs": [
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--release",
+          "-p",
+          "mlx-gen-z-image",
+          "--test",
+          "integration",
+          "adapter_real_weights::residual_mutation_diagnostic",
+          "--",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "env": {
+          "CARGO_HOME": "${HOME}/.cargo",
+          "CARGO_NET_OFFLINE": "true",
+          "CARGO_TARGET_DIR": "${REPOSITORY}/target/sc-21781-adapter-parity",
+          "CARGO_TERM_COLOR": "never",
+          "HOME": "${HOME}",
+          "LANG": "C.UTF-8",
+          "LC_ALL": "C.UTF-8",
+          "PATH": "${HOME}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+          "RUSTUP_HOME": "${HOME}/.rustup",
+          "RUSTUP_TOOLCHAIN": "1.96.0",
+          "TMPDIR": "/private/tmp",
+          "ZIMAGE_SNAPSHOT": "${HF_MODELS_ROOT}/models--SceneWorks--z-image-turbo-mlx/snapshots/bb2bc9893b3c49ae96c813350775f791a2e8bc80/bf16"
+        },
+        "name": "z_image_residual_diagnostic",
+        "returncode": 0,
+        "stderr": "   Compiling core-llm v0.0.0 (${REPOSITORY}/crates/contracts/core-llm)\n   Compiling sceneworks-gen-core v0.1.0 (${REPOSITORY}/crates/contracts/gen-core)\n   Compiling mlx-gen v0.0.0 (${REPOSITORY}/crates/media/mlx-gen)\n   Compiling sceneworks-gen-core-testkit v0.1.0 (${REPOSITORY}/crates/contracts/gen-core-testkit)\n   Compiling mlx-gen-pid v0.0.0 (${REPOSITORY}/crates/media/mlx-gen/mlx-gen-pid)\n   Compiling mlx-gen-z-image v0.0.0 (${REPOSITORY}/crates/media/mlx-gen/mlx-gen-z-image)\n    Finished `release` profile [optimized] target(s) in 10.59s\n     Running tests/main.rs (target/sc-21781-adapter-parity/release/deps/integration-654ba508f5fe617a)\n",
+        "stdout": "\nrunning 1 test\ntest adapter_real_weights::residual_mutation_diagnostic ... \nSC15505_RESULT z_image_lora residual_samples_gt8=12940 zero_residual_samples_gt8=26587 rgb_samples=786432\nSC15505_RESULT z_image_lokr residual_samples_gt8=14028 zero_residual_samples_gt8=40120 rgb_samples=786432\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 146 filtered out; finished in 10.08s\n\n"
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--release",
+          "-p",
+          "mlx-gen-qwen-image",
+          "--test",
+          "integration",
+          "adapter_real_weights::residual_mutation_diagnostic",
+          "--",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "env": {
+          "CARGO_HOME": "${HOME}/.cargo",
+          "CARGO_NET_OFFLINE": "true",
+          "CARGO_TARGET_DIR": "${REPOSITORY}/target/sc-21781-adapter-parity",
+          "CARGO_TERM_COLOR": "never",
+          "HOME": "${HOME}",
+          "LANG": "C.UTF-8",
+          "LC_ALL": "C.UTF-8",
+          "MLX_GEN_QWEN_SNAPSHOT": "${HF_MODELS_ROOT}/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16",
+          "PATH": "${HOME}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+          "RUSTUP_HOME": "${HOME}/.rustup",
+          "RUSTUP_TOOLCHAIN": "1.96.0",
+          "TMPDIR": "/private/tmp"
+        },
+        "name": "qwen_residual_diagnostic",
+        "returncode": 0,
+        "stderr": "   Compiling core-llm v0.0.0 (${REPOSITORY}/crates/contracts/core-llm)\n   Compiling sceneworks-gen-core v0.1.0 (${REPOSITORY}/crates/contracts/gen-core)\n   Compiling mlx-gen v0.0.0 (${REPOSITORY}/crates/media/mlx-gen)\n   Compiling sceneworks-gen-core-testkit v0.1.0 (${REPOSITORY}/crates/contracts/gen-core-testkit)\n   Compiling mlx-gen-wan v0.0.0 (${REPOSITORY}/crates/media/mlx-gen/mlx-gen-wan)\n   Compiling mlx-gen-pid v0.0.0 (${REPOSITORY}/crates/media/mlx-gen/mlx-gen-pid)\n   Compiling mlx-gen-qwen-image v0.0.0 (${REPOSITORY}/crates/media/mlx-gen/mlx-gen-qwen-image)\n    Finished `release` profile [optimized] target(s) in 12.53s\n     Running tests/main.rs (target/sc-21781-adapter-parity/release/deps/integration-fd459ddee10cf22f)\n",
+        "stdout": "\nrunning 1 test\ntest adapter_real_weights::residual_mutation_diagnostic ... \nSC15505_RESULT qwen_lora residual_samples_gt8=63030 zero_residual_samples_gt8=43903 rgb_samples=786432\nSC15505_RESULT qwen_lokr residual_samples_gt8=69111 zero_residual_samples_gt8=50446 rgb_samples=786432\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 98 filtered out; finished in 450.03s\n\n"
+      }
+    ],
+    "schema": 2,
+    "source": {
+      "base_commit": "482f18e04b5fab3e3bae72b14682a40252b66dcc",
+      "changed_paths": [
+        "crates/media/mlx-gen/tools/adapter_parity_artifacts.json",
+        "crates/media/mlx-gen/tools/adapter_parity_qwen_effect_diagnostic_receipt.json",
+        "crates/media/mlx-gen/tools/adapter_parity_residual_diagnostic_receipt.json",
+        "crates/media/mlx-gen/tools/dump_qwen_adapter_golden.py",
+        "crates/media/mlx-gen/tools/golden/CHECKSUMS.txt",
+        "crates/media/mlx-gen/tools/golden/README.md",
+        "crates/media/mlx-gen/tools/record_adapter_parity_transcript.py",
+        "crates/media/mlx-gen/tools/verify_adapter_parity_artifacts.py",
+        "scripts/tests/test_adapter_parity_artifacts.py"
+      ],
+      "commit": "482f18e04b5fab3e3bae72b14682a40252b66dcc",
+      "files": {
+        "crates/media/mlx-gen/mlx-gen-flux/tests/hyper_flux_real_weights.rs": "6decbae89fa712f42227dead361eab969b04a37bcb891e896c9eff937d2652fe",
+        "crates/media/mlx-gen/mlx-gen-qwen-image/tests/adapter_real_weights.rs": "4f2fc366fd1ef192c5ca1a6d7fa9ec6d5213ce50d33a6592b307c7c3b69437d0",
+        "crates/media/mlx-gen/mlx-gen-z-image/tests/adapter_real_weights.rs": "af0b32915ebb4ea0c5f23559cd851a0c388766977e4e0128c48912e1b919d05f",
+        "crates/media/mlx-gen/src/adapters.rs": "05e18f24ffa6f72fc3a5d2e0fa92f959c1015b4d15906b1f0ad1c068ac04888c",
+        "crates/media/mlx-gen/tools/_adapter_parity_provenance.py": "32fcff87d1140a4d53d03a66ab8b8678e1029d03e9a8886f50b242dd3bd23bed",
+        "crates/media/mlx-gen/tools/dump_hyper_flux_golden.py": "3b2541078e074c30df682c05bb1e8b84d8c4335c2772eb48065dd391e09b8bd8",
+        "crates/media/mlx-gen/tools/dump_qwen_adapter_golden.py": "d6765dce833f7b8cbcc1ea34e7b136bde64c04a1dd2bfdcf00a63f0633986654",
+        "crates/media/mlx-gen/tools/dump_qwen_image_golden.py": "a08b4b8f1411b4401ccd461113928136741f35d14a6098ad8ac8d415fac7604f",
+        "crates/media/mlx-gen/tools/dump_z_image_adapter_golden.py": "df8e24798dbf09335a5edad92ef3b4de7d328a61e7dd13d7b77208c7c2d0bbc8",
+        "crates/media/mlx-gen/tools/dump_z_image_golden.py": "f7b4b872e282dfe97e4a8b1f3d5884cc3329a81f7689a8cc9550b194c0cb63b1",
+        "crates/media/mlx-gen/tools/record_adapter_parity_transcript.py": "f938fc6df9b87fc79a50ae796ebe11bdb14b87137351a4e498ffef2597ceb228"
+      },
+      "source_sha256": "de8cd7bc6f99a5221b52461b66571f6913fdde5549633534985615f63445f3be"
+    },
+    "source_after": {
+      "base_commit": "482f18e04b5fab3e3bae72b14682a40252b66dcc",
+      "changed_paths": [
+        "crates/media/mlx-gen/tools/adapter_parity_artifacts.json",
+        "crates/media/mlx-gen/tools/adapter_parity_qwen_effect_diagnostic_receipt.json",
+        "crates/media/mlx-gen/tools/adapter_parity_residual_diagnostic_receipt.json",
+        "crates/media/mlx-gen/tools/dump_qwen_adapter_golden.py",
+        "crates/media/mlx-gen/tools/golden/CHECKSUMS.txt",
+        "crates/media/mlx-gen/tools/golden/README.md",
+        "crates/media/mlx-gen/tools/record_adapter_parity_transcript.py",
+        "crates/media/mlx-gen/tools/verify_adapter_parity_artifacts.py",
+        "scripts/tests/test_adapter_parity_artifacts.py"
+      ],
+      "commit": "482f18e04b5fab3e3bae72b14682a40252b66dcc",
+      "files": {
+        "crates/media/mlx-gen/mlx-gen-flux/tests/hyper_flux_real_weights.rs": "6decbae89fa712f42227dead361eab969b04a37bcb891e896c9eff937d2652fe",
+        "crates/media/mlx-gen/mlx-gen-qwen-image/tests/adapter_real_weights.rs": "4f2fc366fd1ef192c5ca1a6d7fa9ec6d5213ce50d33a6592b307c7c3b69437d0",
+        "crates/media/mlx-gen/mlx-gen-z-image/tests/adapter_real_weights.rs": "af0b32915ebb4ea0c5f23559cd851a0c388766977e4e0128c48912e1b919d05f",
+        "crates/media/mlx-gen/src/adapters.rs": "05e18f24ffa6f72fc3a5d2e0fa92f959c1015b4d15906b1f0ad1c068ac04888c",
+        "crates/media/mlx-gen/tools/_adapter_parity_provenance.py": "32fcff87d1140a4d53d03a66ab8b8678e1029d03e9a8886f50b242dd3bd23bed",
+        "crates/media/mlx-gen/tools/dump_hyper_flux_golden.py": "3b2541078e074c30df682c05bb1e8b84d8c4335c2772eb48065dd391e09b8bd8",
+        "crates/media/mlx-gen/tools/dump_qwen_adapter_golden.py": "d6765dce833f7b8cbcc1ea34e7b136bde64c04a1dd2bfdcf00a63f0633986654",
+        "crates/media/mlx-gen/tools/dump_qwen_image_golden.py": "a08b4b8f1411b4401ccd461113928136741f35d14a6098ad8ac8d415fac7604f",
+        "crates/media/mlx-gen/tools/dump_z_image_adapter_golden.py": "df8e24798dbf09335a5edad92ef3b4de7d328a61e7dd13d7b77208c7c2d0bbc8",
+        "crates/media/mlx-gen/tools/dump_z_image_golden.py": "f7b4b872e282dfe97e4a8b1f3d5884cc3329a81f7689a8cc9550b194c0cb63b1",
+        "crates/media/mlx-gen/tools/record_adapter_parity_transcript.py": "f938fc6df9b87fc79a50ae796ebe11bdb14b87137351a4e498ffef2597ceb228"
+      },
+      "source_sha256": "de8cd7bc6f99a5221b52461b66571f6913fdde5549633534985615f63445f3be"
+    },
+    "story": "sc-15505"
+  },
+  "schema": 1,
+  "story": "sc-15505",
+  "transcript": {
+    "bytes": 16415,
+    "local_path": "${TOOLS}/golden/sc-15505-residual-diagnostic-transcript.json",
+    "sha256": "9815ad20c09b7f6396dece7de57d50c4f5e3fc26547ff625d09c6fb2716ebc32"
+  }
+}

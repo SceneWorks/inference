@@ -74,7 +74,11 @@ fn run_control_validation(
 
     let paths = ZImageControlPaths {
         snapshot: env_path("ZIMG_CTRL_BASE"),
+        text_encoder: std::env::var_os("ZIMG_CTRL_TEXT_ENCODER")
+            .map(std::path::PathBuf::from)
+            .map(candle_gen::gen_core::WeightsSource::Dir),
         control: env_path("ZIMG_CTRL_NET"),
+        adapters: Vec::new(),
         base,
     };
     let skeleton = read_ppm(&env_path("ZIMG_CTRL_POSE"));
@@ -98,7 +102,11 @@ fn run_control_validation(
         seed: 12345,
         // Native VAE: this harness validates the pose-control pipeline, not the optional PiD SR (sc-8044).
         use_pid: false,
+        memory: Default::default(),
         cancel: CancelFlag::new(),
+        // Inert: this harness validates the pose-control pipeline. The per-step preview stream
+        // (epic 16948, sc-16957) has its own real-weight harness, `tests/preview_real_weights.rs`.
+        preview: candle_gen::gen_core::PreviewSink::default(),
     };
 
     let mut noop = |_p: Progress| {};
@@ -113,6 +121,37 @@ fn run_control_validation(
         &out_dir.join(format!("zimage_control_{tag}.ppm")),
         &out_ctrl,
     );
+    if let Some(adapter) = std::env::var_os("ZIMG_CTRL_LORA") {
+        drop(model);
+        let adapted = ZImageControl::load(&ZImageControlPaths {
+            snapshot: env_path("ZIMG_CTRL_BASE"),
+            text_encoder: None,
+            control: env_path("ZIMG_CTRL_NET"),
+            adapters: vec![candle_gen::gen_core::AdapterSpec::new(
+                adapter.into(),
+                1.0,
+                candle_gen::gen_core::AdapterKind::Lora,
+            )],
+            base,
+        })
+        .expect("load adapter-conditioned Z-Image strict control");
+        let with_adapter = adapted
+            .generate(&req, &skeleton, &mut noop)
+            .expect("generate (control + LoRA)");
+        assert_eq!(
+            (with_adapter.width, with_adapter.height),
+            (out_ctrl.width, out_ctrl.height)
+        );
+        assert_ne!(
+            with_adapter.pixels, out_ctrl.pixels,
+            "selected Z-Image control adapter must change output"
+        );
+        write_ppm(
+            &out_dir.join(format!("zimage_control_{tag}_lora.ppm")),
+            &with_adapter,
+        );
+        return;
+    }
 
     // Without control (scale 0 → the VACE hints contribute zero → plain Z-Image at the same seed/prompt).
     let plain_req = ZImageControlRequest {
@@ -177,6 +216,15 @@ fn run_control_validation(
         "mid-cancel should stop right after step 3 (saw {steps_seen})"
     );
     println!("[{tag}][cancel:mid] Err(Canceled) after {steps_seen} steps ✓");
+
+    let after_cancel = model
+        .generate(&req, &skeleton, &mut noop)
+        .expect("warm render after mid-denoise cancellation");
+    assert_eq!(
+        after_cancel, out_ctrl,
+        "mid-denoise cancellation poisoned the warm provider"
+    );
+    println!("[{tag}][cancel:cleanup] fixed-seed warm follow-up matched ✓");
 
     // The gate: the control path meaningfully changes the output (it actually conditions the image).
     assert!(

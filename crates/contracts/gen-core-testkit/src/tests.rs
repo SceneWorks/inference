@@ -37,6 +37,14 @@ struct Behavior {
     typed_cancel: bool,
     /// Output pixels depend only on the seed (vs. drifting per call).
     deterministic: bool,
+    /// sc-17418: at `guidance = 1.0` (CFG off) the negative prompt is inert — the correct behaviour,
+    /// since the combine `uncond + 1·(cond − uncond)` reduces to `cond`. The broken variant folds the
+    /// negative into the output, which is exactly what an engine that narrows its conditioning to the
+    /// WRONG row does: it renders the negative prompt instead of the prompt.
+    cfg_off_ignores_negative: bool,
+    /// sc-17418: `generate` succeeds at `guidance = 1.0`. The broken variant is the literal sc-14195
+    /// shape — `validate` waves the request through and the engine then dies mid-denoise.
+    cfg_off_generates: bool,
 }
 
 impl Behavior {
@@ -50,6 +58,8 @@ impl Behavior {
             honor_cancel: true,
             typed_cancel: true,
             deterministic: true,
+            cfg_off_ignores_negative: true,
+            cfg_off_generates: true,
         }
     }
 }
@@ -61,6 +71,11 @@ struct Stub {
     /// (`Capabilities::validate_request_skip_size`) instead of the full `validate_request` — the
     /// audio-lane / auto-size stance where `width`/`height` are not range-checked (sc-13705).
     skip_size: bool,
+    /// sc-19502: when set, the honest `validate` runs the floor against a Capabilities whose
+    /// `supported_steps` has been CLEARED — so the descriptor advertises a fixed schedule that
+    /// `validate` never enforces. That is precisely the `mlx-gen-ltx` defect this story fixed
+    /// (advertised != enforced), and `check_validate_honesty` must catch it.
+    unenforced_steps: bool,
     /// Per-instance call counter — the nondeterministic variant fills pixels from this.
     runs: Cell<u32>,
 }
@@ -72,6 +87,26 @@ fn stub_caps() -> Capabilities {
         max_size: 512,
         max_count: 4,
         ..Default::default()
+    }
+}
+
+/// Capabilities for a **CFG-capable** stub (sc-17418): advertises the guidance + negative-prompt
+/// axes, which is what puts a model under [`check_cfg_off_render`]'s contract at all. The plain
+/// [`stub_caps`] leaves both `false`, so that stub is (correctly) skipped by the check.
+fn guided_stub_caps() -> Capabilities {
+    Capabilities {
+        supports_guidance: true,
+        supports_negative_prompt: true,
+        ..stub_caps()
+    }
+}
+
+fn guided_stub_desc(id: &'static str) -> ModelDescriptor {
+    ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: None,
+        capabilities: guided_stub_caps(),
+        ..stub_desc(id)
     }
 }
 
@@ -90,6 +125,9 @@ fn audio_stub_caps() -> Capabilities {
 
 fn stub_desc(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: None,
+        control_kinds: None,
         required_components: &[],
         id,
         family: "testkit",
@@ -101,6 +139,9 @@ fn stub_desc(id: &'static str) -> ModelDescriptor {
 
 fn audio_stub_desc(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: None,
+        control_kinds: None,
         required_components: &[],
         id,
         family: "testkit",
@@ -116,12 +157,25 @@ impl Stub {
             desc: stub_desc(id),
             behavior,
             skip_size: false,
+            unenforced_steps: false,
             runs: Cell::new(0),
         }
     }
 
     fn boxed(id: &'static str, behavior: Behavior) -> Box<dyn Generator> {
         Box::new(Self::new(id, behavior))
+    }
+
+    /// A **CFG-capable** stub (sc-17418): advertises guidance + negative prompt, so
+    /// [`check_cfg_off_render`] actually engages instead of skipping.
+    fn guided(id: &'static str, behavior: Behavior) -> Self {
+        Self {
+            desc: guided_stub_desc(id),
+            behavior,
+            skip_size: false,
+            unenforced_steps: false,
+            runs: Cell::new(0),
+        }
     }
 
     /// An **audio-lane** stub (sc-13705): `Modality::Audio`, no size bound (`max_size` 0), validating
@@ -132,12 +186,44 @@ impl Stub {
             desc: audio_stub_desc(id),
             behavior,
             skip_size: true,
+            unenforced_steps: false,
             runs: Cell::new(0),
         }
     }
 
     fn boxed_audio(id: &'static str, behavior: Behavior) -> Box<dyn Generator> {
         Box::new(Self::audio(id, behavior))
+    }
+
+    /// sc-19502: a stub advertising a fixed 8-step schedule. `enforced = false` is the
+    /// `mlx-gen-ltx` defect shape — the descriptor claims the constraint, `validate` never applies
+    /// it, and the engine silently renders its baked schedule for whatever count arrives.
+    fn fixed_schedule(id: &'static str, enforced: bool) -> Self {
+        let mut desc = stub_desc(id);
+        desc.capabilities.supported_steps = StepSupport::Exact(vec![8]);
+        Self {
+            desc,
+            behavior: Behavior::good(),
+            skip_size: false,
+            unenforced_steps: !enforced,
+            runs: Cell::new(0),
+        }
+    }
+
+    /// sc-19559: a stub advertising a step RANGE rather than an exact menu — SVD's shape. The
+    /// `enforced = false` twin is the same defect as [`Stub::fixed_schedule`]'s: the descriptor
+    /// declares the ceiling and `validate` never applies it, so a caller's over-ceiling `steps`
+    /// reaches the engine.
+    fn bounded_range(id: &'static str, enforced: bool) -> Self {
+        let mut desc = stub_desc(id);
+        desc.capabilities.supported_steps = StepSupport::Range { min: 1, max: 8 };
+        Self {
+            desc,
+            behavior: Behavior::good(),
+            skip_size: false,
+            unenforced_steps: !enforced,
+            runs: Cell::new(0),
+        }
     }
 
     /// An **image** stub that (wrongly) validates through the size-skipping floor while still
@@ -149,6 +235,7 @@ impl Stub {
             desc: stub_desc(id),
             behavior,
             skip_size: true,
+            unenforced_steps: false,
             runs: Cell::new(0),
         }
     }
@@ -164,6 +251,12 @@ impl Generator for Stub {
             return Ok(());
         }
         let caps = &self.desc.capabilities;
+        if self.unenforced_steps {
+            // Advertises the schedule, enforces everything BUT it (sc-19502).
+            let mut lax = caps.clone();
+            lax.supported_steps = StepSupport::Unconstrained;
+            return lax.validate_request(self.desc.id, req);
+        }
         if self.skip_size {
             // The audio-lane / auto-size floor: every shared check except the width/height range.
             caps.validate_request_skip_size(self.desc.id, req)
@@ -207,11 +300,29 @@ impl Generator for Stub {
         for _ in 0..self.behavior.decoding_events {
             on_progress(Progress::Decoding);
         }
-        let fill = if self.behavior.deterministic {
+        // sc-17418, the CFG-off contract. `cfg_off` is "this request has classifier-free guidance
+        // switched off" — the fork every engine hand-writes, and the one sc-14195 got wrong.
+        let cfg_off = req.guidance.is_some_and(|g| g <= 1.0);
+        if cfg_off && !self.behavior.cfg_off_generates {
+            // The literal sc-14195 shape: validate() waved it through, the engine dies mid-denoise.
+            return Err(Error::Msg(
+                "shape mismatch in matmul, lhs: [10, 4096, 64], rhs: [20, 64, 77]".into(),
+            ));
+        }
+        let mut fill = if self.behavior.deterministic {
             req.seed.unwrap_or(0) as u8
         } else {
             run as u8
         };
+        // The wrong-row narrow: at CFG-off the negative branch is gone, so a correct engine cannot
+        // let the negative prompt reach the output. This variant does, and must be caught.
+        if cfg_off && !self.behavior.cfg_off_ignores_negative {
+            let neg = req.negative_prompt.as_deref().unwrap_or("");
+            fill = fill.wrapping_add(neg.len() as u8).wrapping_add(
+                neg.bytes()
+                    .fold(0u8, |acc, b| acc.wrapping_mul(31).wrapping_add(b)),
+            );
+        }
         let img = Image {
             width: req.width,
             height: req.height,
@@ -328,6 +439,78 @@ fn image_provider_oversize_probe_still_fires_after_audio_exemption() {
     assert!(err.contains("above max_size"), "got: {err}");
 }
 
+/// sc-19502 — a descriptor that ADVERTISES a fixed step schedule but whose `validate` never
+/// enforces it must fail the honesty check.
+///
+/// This is the `mlx-gen-ltx` defect in miniature and the reason the sweep needs its negative half:
+/// a lane that ignores `req.steps` entirely satisfies the positive half trivially (every advertised
+/// count "validates", because everything validates). Only probing an OFF-menu count catches it.
+#[test]
+fn advertising_a_fixed_schedule_without_enforcing_it_fails_validate_honesty() {
+    // The profile's steps must sit ON the advertised menu, or the harness's first positive check
+    // would fail for an honest provider too — the LTX conformance profile already pins 8.
+    let profile = Profile {
+        steps: 8,
+        ..cheap()
+    };
+
+    let dishonest = Stub::fixed_schedule(STUB_ID, false);
+    let err = check_validate_honesty(&dishonest, &profile)
+        .expect_err("advertising a schedule it does not enforce must be caught");
+    assert!(
+        err.contains("advertised surface") && err.contains("silently ignores"),
+        "the failure must name the defect: {err}"
+    );
+
+    // …and the honest twin passes, so the check is not simply rejecting every declaring provider.
+    check_validate_honesty(&Stub::fixed_schedule(STUB_ID, true), &profile)
+        .expect("a provider that enforces what it advertises is honest");
+}
+
+/// sc-19559 — the same honesty contract for the RANGE shape. A provider that advertises a ceiling
+/// and does not enforce it is the SVD defect the story names: `MAX_STEPS = 200` was real inside
+/// the engine but invisible on the surface, and the mirror failure — a surface that claims a
+/// bound the engine ignores — is what this catches.
+///
+/// Deliberately its own test rather than an extra assertion in the exact-menu one above: the two
+/// shapes take different arms of `check_validate_honesty`'s probe construction, and a regression
+/// in the range arm alone would otherwise hide behind the menu arm still passing.
+#[test]
+fn advertising_a_step_range_without_enforcing_it_fails_validate_honesty() {
+    // Inside the advertised 1..=8, so an honest provider's positive probes all pass.
+    let profile = Profile {
+        steps: 4,
+        ..cheap()
+    };
+
+    let dishonest = Stub::bounded_range(STUB_ID, false);
+    let err = check_validate_honesty(&dishonest, &profile)
+        .expect_err("advertising a ceiling it does not enforce must be caught");
+    assert!(
+        err.contains("step count 9") && err.contains("Range") && err.contains("silently ignores"),
+        "the failure must name the over-ceiling count and the advertised range: {err}"
+    );
+
+    check_validate_honesty(&Stub::bounded_range(STUB_ID, true), &profile)
+        .expect("a provider that enforces its advertised range is honest");
+}
+
+/// sc-19502 — `check_cancellation` must not hand a fixed-schedule provider the profile's headroom
+/// `cancel_steps`, which is off its menu and would surface a step-count REJECTION as a cancellation
+/// defect. It falls back to the largest advertised count instead.
+#[test]
+fn cancellation_uses_an_advertised_step_count_for_a_fixed_schedule_provider() {
+    let profile = Profile {
+        steps: 8,
+        // 6 is the default headroom and is deliberately OFF the advertised [8] menu.
+        cancel_steps: 6,
+        ..cheap()
+    };
+    let g = Stub::fixed_schedule(STUB_ID, true);
+    check_cancellation(&g, &profile)
+        .expect("cancellation must run at an advertised count, not the off-menu headroom");
+}
+
 #[test]
 fn missing_progress_fails_progress_check() {
     let g = Stub::new(
@@ -441,6 +624,105 @@ fn unregistered_id_fails_registry_check() {
     assert!(check_registry_roundtrip(&registry(), &g).is_err());
 }
 
+/// sc-17418: a CFG-capable model that serves `guidance = 1.0` correctly — renders, and leaves the
+/// negative prompt inert — passes.
+#[test]
+fn correct_cfg_off_passes() {
+    let g = Stub::guided(STUB_ID, Behavior::good());
+    assert!(check_cfg_off_render(&g, &cheap()).is_ok());
+}
+
+/// sc-17418, the literal sc-14195 shape: `validate` accepts `guidance = 1.0` and the engine then
+/// dies mid-denoise on a batch mismatch. The check must fire, and must say so in terms that point
+/// at the CFG batch contract rather than just "generate failed".
+#[test]
+fn cfg_off_that_explodes_fails_check() {
+    let g = Stub::guided(
+        STUB_ID,
+        Behavior {
+            cfg_off_generates: false,
+            ..Behavior::good()
+        },
+    );
+    let err = check_cfg_off_render(&g, &cheap()).unwrap_err();
+    assert!(
+        err.contains("validate() accepted guidance = 1.0"),
+        "got: {err}"
+    );
+    assert!(err.contains("shape mismatch"), "got: {err}");
+}
+
+/// sc-17418, the mutation a liveness-only check CANNOT catch: the engine narrows its conditioning to
+/// the WRONG row, so CFG-off renders the negative prompt. It still returns an image — nothing
+/// errors — so only the negative-inertness assertion catches it.
+#[test]
+fn cfg_off_that_consumes_the_negative_fails_check() {
+    let g = Stub::guided(
+        STUB_ID,
+        Behavior {
+            cfg_off_ignores_negative: false,
+            ..Behavior::good()
+        },
+    );
+    // It really does render — this is not an error path.
+    let mut req = crate::base_request(&cheap());
+    req.guidance = Some(1.0);
+    req.negative_prompt = Some("anything".into());
+    assert!(g.generate(&req, &mut |_| {}).is_ok());
+
+    let err = check_cfg_off_render(&g, &cheap()).unwrap_err();
+    assert!(
+        err.contains("the negative prompt changed the output"),
+        "got: {err}"
+    );
+    assert!(err.contains("WRONG row"), "got: {err}");
+}
+
+/// sc-17418: a model with no guidance axis (the distilled/CFG-free families) is out of scope — the
+/// check skips rather than inventing a contract the descriptor never advertised. The plain stub
+/// leaves `supports_guidance` false, and would FAIL the broken behaviours above if it were graded.
+#[test]
+fn cfg_free_model_is_skipped_not_graded() {
+    let broken = Behavior {
+        cfg_off_generates: false,
+        cfg_off_ignores_negative: false,
+        ..Behavior::good()
+    };
+    let g = Stub::new(STUB_ID, broken);
+    assert!(!g.descriptor().capabilities.supports_guidance);
+    assert!(check_cfg_off_render(&g, &cheap()).is_ok());
+    // Mutation guard for the skip itself: the SAME broken behaviour on a guidance-advertising
+    // descriptor does fail, so the skip is driven by the capability, not by the check being inert.
+    assert!(check_cfg_off_render(&Stub::guided(STUB_ID, broken), &cheap()).is_err());
+}
+
+/// sc-17418: honest rejection is a legitimate stance. A model whose `validate` refuses
+/// `guidance = 1.0` is not obliged to render it — the check passes without calling `generate`.
+#[test]
+fn honest_rejection_of_cfg_off_passes() {
+    struct Rejecting(ModelDescriptor);
+    impl Generator for Rejecting {
+        fn descriptor(&self) -> &ModelDescriptor {
+            &self.0
+        }
+        fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+            if req.guidance.is_some_and(|g| g <= 1.0) {
+                return Err(Error::Msg("this model requires guidance > 1".into()));
+            }
+            Ok(())
+        }
+        fn generate(
+            &self,
+            _req: &GenerationRequest,
+            _on_progress: &mut dyn FnMut(Progress),
+        ) -> gen_core::Result<GenerationOutput> {
+            panic!("generate() must not be called once validate() has rejected the request");
+        }
+    }
+    let g = Rejecting(guided_stub_desc(STUB_ID));
+    assert!(check_cfg_off_render(&g, &cheap()).is_ok());
+}
+
 /// The weights-free descriptor sweep (sc-9098, F-009) is clean over the explicit fixture registry.
 /// Per-violation firing is unit-tested next to the checks in `gen_core::registry`.
 #[test]
@@ -547,4 +829,230 @@ fn conformance_panics_on_a_broken_stub() {
         },
         &cheap(),
     );
+}
+
+/// A qwen3-shaped encoder, sized like the ones the provider load-gate tests actually build. The
+/// dimensions are the point: they are what makes `write_encoder_contract_fixture` a ~7.3 GB writer,
+/// which is in turn why the payload has to be a hole rather than bytes.
+const SPARSE_FIXTURE_CONTRACT: gen_core::EncoderContract = gen_core::EncoderContract {
+    architecture: "qwen3",
+    hidden_size: 2560,
+    intermediate_size: 9728,
+    num_hidden_layers: 36,
+    num_attention_heads: 32,
+    num_key_value_heads: 8,
+    head_dim: 128,
+    vocab_size: 151_936,
+    output_width: 2560,
+    loaded_hidden_layers: 36,
+    requires_final_norm: false,
+    requires_lm_head: false,
+    hidden_activation: "silu",
+    attention_dropout: gen_core::EncoderConfigFloat::new(0.0),
+    rms_norm_eps: gen_core::EncoderConfigFloat::new(1e-6),
+    qk_norm_eps: Some(gen_core::EncoderConfigFloat::new(1e-6)),
+    rope_theta: gen_core::EncoderConfigFloat::new(1_000_000.0),
+    max_position_embeddings: 40_960,
+    attention_bias: gen_core::EncoderConfigBool::Required(false),
+    tie_word_embeddings: gen_core::EncoderConfigBool::Required(true),
+    tokenizer: gen_core::EncoderTokenizerContract {
+        family: "testkit",
+        binding: gen_core::EncoderTokenizerBinding::RetainBase,
+        artifact_candidates: &["tokenizer.json"],
+        required_tokens: &[],
+    },
+    prompt_executions: &[],
+    bos_token_id: Some(151_643),
+    eos_token_id: Some(151_645),
+    image_token_id: None,
+    vision_start_token_id: None,
+    vision_end_token_id: None,
+    mrope_section: &[],
+    mrope_interleaved: None,
+    selected_hidden_layers: &[35],
+    packing: None,
+    dense_storage_dtype_probe: None,
+};
+
+/// The fixture's tensor payload must be a **hole**, not written bytes.
+///
+/// Every gate this fixture feeds *stats* the file, so its logical length has to be the full nominal
+/// size — but nothing may read the payload. On APFS and ext4, extending past the end is sparse by
+/// construction, so this cost nothing and nobody noticed. NTFS allocates the clusters instead: these
+/// fixtures wrote ~7.3 GB apiece (~22 GB per run across the q4/q8/bf16 tiers), filled the Windows
+/// CUDA box's system drive twice, and failed a `candle-worker` run with `StorageFull` (os error 112).
+///
+/// Kills the mutation that matters: dropping the [`mark_sparse`] call from
+/// [`write_encoder_contract_fixture_with_quant`] — or moving it *before* the `File::create` that
+/// clears the attribute — leaves `FILE_ATTRIBUTE_SPARSE_FILE` unset and this red on Windows. The
+/// unflagged control below is what gives that assertion teeth.
+///
+/// The Linux `contracts` lane still runs the length and zero-payload halves, which pin the semantics
+/// the flag must not disturb.
+#[test]
+fn encoder_contract_fixture_payload_is_a_hole_not_seven_gigabytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Deliberately not named `text_encoder`: that spelling also emits a tokenizer artifact, which is
+    // irrelevant here and would only add a second file to reason about.
+    let root = tmp.path().join("encoder");
+    let expected_headers =
+        encoder_contract_fixture_tensor_headers(SPARSE_FIXTURE_CONTRACT, None).unwrap();
+    write_encoder_contract_fixture(&root, SPARSE_FIXTURE_CONTRACT).unwrap();
+
+    let weights = root.join("model.safetensors");
+    let actual_headers = gen_core::safetensors_path_tensor_headers(&weights).unwrap();
+    let by_name = |headers: Vec<gen_core::SafetensorsTensorHeader>| {
+        headers
+            .into_iter()
+            .map(|header| (header.name, (header.dtype, header.shape, header.data_bytes)))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    assert_eq!(
+        by_name(actual_headers),
+        by_name(expected_headers),
+        "in-memory header facts must be byte-exact with the sparse writer without reading payload"
+    );
+    let meta = std::fs::metadata(&weights).unwrap();
+    assert!(
+        meta.len() > 4 << 30,
+        "this writer must stay in the multi-GB class or the hole stops being load-bearing: {}",
+        meta.len()
+    );
+
+    // A hole reads back as zeros. Nothing may depend on whatever the filesystem last left there,
+    // which is exactly what flagging the file changes for a reader.
+    let mut file = std::fs::File::open(&weights).unwrap();
+    let mut declared = [0_u8; 8];
+    std::io::Read::read_exact(&mut file, &mut declared).unwrap();
+    let header_end = 8 + u64::from_le_bytes(declared);
+    assert!(
+        header_end < meta.len(),
+        "the fixture must have a payload span past its header"
+    );
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(meta.len() - 4096)).unwrap();
+    let mut tail = [0xAB_u8; 4096];
+    std::io::Read::read_exact(&mut file, &mut tail).unwrap();
+    assert!(
+        tail.iter().all(|&byte| byte == 0),
+        "the unwritten payload must read back as zeros"
+    );
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        /// `FILE_ATTRIBUTE_SPARSE_FILE`.
+        const SPARSE: u32 = 0x0000_0200;
+
+        // The control: the same create-then-extend shape with no flag. If NTFS ever started
+        // reporting *this* as sparse, the assertion below would have stopped meaning anything.
+        let dense = tmp.path().join("dense.safetensors");
+        std::fs::File::create(&dense)
+            .unwrap()
+            .set_len(1 << 20)
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&dense).unwrap().file_attributes() & SPARSE,
+            0,
+            "control: an unflagged extension must NOT report sparse"
+        );
+
+        assert_ne!(
+            meta.file_attributes() & SPARSE,
+            0,
+            "the fixture must carry FILE_ATTRIBUTE_SPARSE_FILE, or NTFS allocates all {} bytes",
+            meta.len()
+        );
+    }
+}
+
+#[test]
+fn in_memory_encoder_header_facts_reject_dense_only_packing() {
+    let error = encoder_contract_fixture_tensor_headers(SPARSE_FIXTURE_CONTRACT, Some(4))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("dense-only"), "{error}");
+}
+
+/// Copying a fixture must not be how the hole gets materialized.
+///
+/// `std::fs::copy` reads and writes every byte, so a test that copies a multi-GB fixture to say
+/// "another file appeared" pays for the whole payload on NTFS even when the source is a hole —
+/// which is precisely how one qwen-image test allocated 26 GB. The copy has to reproduce the header
+/// and the logical length onto a flagged destination instead.
+///
+/// Kills the mutation: swapping [`copy_sparse_fixture`] back to `std::fs::copy` drops
+/// `FILE_ATTRIBUTE_SPARSE_FILE` from the destination. The byte assertions here are what pin that the
+/// cheaper copy is still a faithful one.
+#[test]
+fn copying_a_fixture_reproduces_it_without_materializing_the_hole() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("encoder");
+    write_encoder_contract_fixture(&root, SPARSE_FIXTURE_CONTRACT).unwrap();
+    let source = root.join("model.safetensors");
+    let destination = root.join("added.safetensors");
+    copy_sparse_fixture(&source, &destination).unwrap();
+
+    let source_meta = std::fs::metadata(&source).unwrap();
+    let copy_meta = std::fs::metadata(&destination).unwrap();
+    assert_eq!(
+        copy_meta.len(),
+        source_meta.len(),
+        "the copy must stat the same as the original"
+    );
+
+    // Header bytes identical, payload still a hole reading as zeros — together that is exactly what
+    // `std::fs::copy` of this fixture would have produced.
+    let read_head = |path: &std::path::Path| {
+        let mut bytes = vec![0_u8; 64 << 10];
+        let mut file = std::fs::File::open(path).unwrap();
+        std::io::Read::read_exact(&mut file, &mut bytes).unwrap();
+        bytes
+    };
+    assert_eq!(
+        read_head(&source),
+        read_head(&destination),
+        "the copy must carry the original's header"
+    );
+    let mut file = std::fs::File::open(&destination).unwrap();
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(copy_meta.len() - 4096)).unwrap();
+    let mut tail = [0xAB_u8; 4096];
+    std::io::Read::read_exact(&mut file, &mut tail).unwrap();
+    assert!(
+        tail.iter().all(|&byte| byte == 0),
+        "the copy's payload must read back as zeros"
+    );
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        /// `FILE_ATTRIBUTE_SPARSE_FILE`.
+        const SPARSE: u32 = 0x0000_0200;
+        assert_ne!(
+            copy_meta.file_attributes() & SPARSE,
+            0,
+            "the copy must be a hole too, or it allocates all {} bytes",
+            copy_meta.len()
+        );
+    }
+}
+
+/// A truncated or corrupt fixture must be a typed error, not a panic or a silent empty copy.
+#[test]
+fn copying_rejects_a_header_that_runs_past_the_end_of_the_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("truncated.safetensors");
+    std::fs::write(&source, u64::MAX.to_le_bytes()).unwrap();
+    let error = copy_sparse_fixture(&source, &tmp.path().join("copy.safetensors"))
+        .expect_err("a header longer than the file must not be copied");
+    assert!(error.to_string().contains("runs past the end"), "{error}");
+}
+
+/// [`mark_sparse`] is best effort: a fixture that lands dense still holds exactly the right bytes,
+/// so nothing it does may become a test failure. An unwrapped `fsutil` invocation would turn an
+/// unwritable path, a locked file, or a runner image without `fsutil` into a failure of every
+/// fixture test in the workspace instead of a disk-space regression.
+#[test]
+fn mark_sparse_tolerates_a_path_that_does_not_exist() {
+    let tmp = tempfile::tempdir().unwrap();
+    mark_sparse(&tmp.path().join("no-such-fixture.safetensors"));
 }

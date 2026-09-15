@@ -9,18 +9,20 @@
 //! proven against the frozen Python fork (slices 1–3); the e2e bf16 path is gated by
 //! `tests/e2e_real_weights.rs`.
 
+use mlx_gen::img2img::resolve_reference;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
-    Generator, Image, LatentDecoder, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision,
-    Progress, Quant, Residency, Result, WeightsSource,
+    gen_core, Capabilities, ConditioningKind, Error, GenerationOutput, GenerationRequest,
+    Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision,
+    Progress, Quant, Residency, Result, WeightsSource, VAE_COMPONENT,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
+use mlx_gen_wan::OwnedWanSingleFrameDecoder;
 use std::path::Path;
 
 use crate::loader;
 use crate::pipeline::{
-    add_noise_by_interpolation, create_noise, decode_and_collect, denoise_with_progress,
+    add_noise_by_interpolation, create_noise, decode_and_collect, denoise_with_progress_windowed,
     encode_init_latents, encode_prompt, init_time_step, negative_or_fallback, qwen_samplers,
     qwen_schedulers, resolve_run_params, LIGHTNING_SAMPLER, PID_BACKBONE,
 };
@@ -44,6 +46,9 @@ pub const SIZE_MULTIPLE: u32 = 16;
 /// the `lightning` sampler (sc-2909); an unset sampler is the production flow-match path.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: Some(crate::ENCODER_CONTRACT),
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "qwen-image",
@@ -67,28 +72,17 @@ pub fn descriptor() -> ModelDescriptor {
             // Euler path; any name outside the menu is rejected in `validate_request`.
             samplers: qwen_samplers(),
             schedulers: qwen_schedulers(),
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
-            supports_kv_cache: false,
             // Flow-match schedule uses the resolution-dependent sigma shift.
             requires_sigma_shift: true,
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
             supports_sequential_offload: true,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            supports_preview: true,
+            ..Default::default()
         },
     }
 }
@@ -107,6 +101,9 @@ pub struct QwenImage {
     /// comparable to the 20 GB DiT: 36→20 GB). The [`Residency`] seam owns the eval/drop/clear
     /// discipline, the stage-boundary cancel checks, and the error-safe cache flush.
     residency: Residency<QwenTextEncoder, QwenHeavyOwned>,
+    memory_strategy: gen_core::MemoryProviderContract,
+    precision: Precision,
+    quant: Option<Quant>,
 }
 
 /// The heavy render-phase components (the MMDiT transformer, the VAE, and the optional PiD decoder) —
@@ -117,6 +114,7 @@ pub(crate) struct QwenHeavyOwned {
     /// Optional PiD super-resolving decoder (epic 7840, sc-7845), loaded when `spec.pid` is set;
     /// `req.use_pid` then routes decode through it instead of the VAE. `None` for the plain VAE path.
     pid: Option<PidEngine>,
+    alternate_decoder: Option<OwnedWanSingleFrameDecoder>,
 }
 
 /// A borrow of the heavy render-phase components, so the denoise/decode body runs identically
@@ -125,6 +123,7 @@ struct QwenHeavy<'a> {
     transformer: &'a QwenTransformer,
     vae: &'a QwenVae,
     pid: Option<&'a PidEngine>,
+    alternate_decoder: Option<&'a OwnedWanSingleFrameDecoder>,
 }
 
 impl QwenHeavyOwned {
@@ -133,6 +132,7 @@ impl QwenHeavyOwned {
             transformer: &self.transformer,
             vae: &self.vae,
             pid: self.pid.as_ref(),
+            alternate_decoder: self.alternate_decoder.as_ref(),
         }
     }
 }
@@ -152,6 +152,8 @@ impl QwenHeavyOwned {
 /// (encode → drop the text encoder → denoise/decode) to bound peak memory to `max(text-encoder,
 /// DiT+VAE)`. Both use the same per-phase loaders, so the components are byte-identical.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    mlx_gen::gen_core::reject_unknown_components(spec, &[VAE_COMPONENT], MODEL_ID)?;
+    mlx_gen_wan::validate_selected_single_frame_decoder(spec, &descriptor())?;
     // Resolve the snapshot dir up front — fail-fast for BOTH policies — then the always-warm
     // tokenizer, then the shared [`build_residency`] dispatch.
     let root = resolve_root(spec)?;
@@ -165,11 +167,16 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             mlx_gen::residency::warn_sequential_requantize(MODEL_ID, q.bits());
         }
     }
-    let tokenizer = loader::load_tokenizer(root)?;
+    let text_encoder_source = crate::active_encoder_contract().source_for_load(spec, root)?;
+    text_encoder_source.load_time_quant_bits(None, MODEL_ID)?;
+    let tokenizer = loader::load_validated_tokenizer(&text_encoder_source)?;
     Ok(Box::new(QwenImage {
         descriptor: descriptor(),
         tokenizer,
-        residency: build_residency(spec)?,
+        residency: build_residency_with_source(spec, text_encoder_source)?,
+        memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
+        precision: spec.precision,
+        quant: spec.quantize,
     }))
 }
 
@@ -182,16 +189,24 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// pre-seam one. The deferral is weight-free-testable: under `Sequential` this touches no component
 /// weights, so a dispatch that ignored `offload_policy` would eager-load and fail the "Sequential
 /// defers" unit test.
-pub(crate) fn build_residency(
+fn build_residency_with_source(
     spec: &LoadSpec,
+    text_encoder_source: mlx_gen::gen_core::ValidatedEncoderSource,
 ) -> Result<Residency<QwenTextEncoder, QwenHeavyOwned>> {
-    let spec_text = spec.clone();
     let spec_heavy = spec.clone();
-    Residency::from_policy(
-        spec.offload_policy,
-        move || load_text_encoder_only(resolve_root(&spec_text)?),
+    residency_from_spec(
+        spec,
+        move || load_text_encoder_only(&text_encoder_source),
         move |use_pid| load_heavy(&spec_heavy, resolve_root(&spec_heavy)?, use_pid),
     )
+}
+
+pub(crate) fn residency_from_spec<Text: Send + 'static, Heavy: Send + 'static>(
+    spec: &LoadSpec,
+    load_text: impl Fn() -> Result<Text> + Send + Sync + 'static,
+    load_heavy: impl Fn(bool) -> Result<Heavy> + Send + Sync + 'static,
+) -> Result<Residency<Text, Heavy>> {
+    Residency::from_policy(spec.offload_policy, load_text, load_heavy)
 }
 
 /// Precision guard (only dense bf16 is wired) + snapshot-dir resolution (rejecting a single-file
@@ -218,8 +233,10 @@ fn resolve_root(spec: &LoadSpec) -> Result<&Path> {
 /// `skip_quantization=True` — "Quantization causes significant semantic degradation"), so unlike
 /// Z-Image the encoder is never quantized; the `Resident` and `Sequential` paths build byte-identical
 /// encoders.
-fn load_text_encoder_only(root: &Path) -> Result<QwenTextEncoder> {
-    loader::load_text_encoder(root)
+fn load_text_encoder_only(
+    source: &mlx_gen::gen_core::ValidatedEncoderSource,
+) -> Result<QwenTextEncoder> {
+    source.read_unchanged(loader::load_text_encoder_from_source)
 }
 
 /// Load the heavy render-phase components — MMDiT transformer (+ Q4/Q8 + LoRA/LoKr residuals), VAE,
@@ -236,6 +253,10 @@ fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<QwenHeavyO
     // the only component with quantizable leaves. (Z-Image differs — its fork *does* quantize the
     // TE+VAE, hence sc-2532; do not generalize that here.)
     let mut transformer = loader::load_transformer(root)?;
+    if crate::memory_strategy::should_arm_block_stream(MODEL_ID, spec) {
+        transformer =
+            transformer.with_block_stream(WeightsSource::Dir(root.join("transformer")), "");
+    }
     if let Some(q) = spec.quantize {
         // F-076: reject a requested-vs-packed quant-tier mismatch instead of silently serving the
         // snapshot's tier; skip the no-op quantize when the turnkey is already packed at the
@@ -249,6 +270,7 @@ fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<QwenHeavyO
     if !spec.adapters.is_empty() {
         crate::adapters::apply_qwen_adapters(&mut transformer, &spec.adapters)?;
     }
+    transformer.capture_block_adapters();
     // Optional PiD decoder overlay (sc-7845): load the qwenimage student + Gemma-2 caption encoder
     // once when `spec.pid` is set AND this generate uses it (`load_pid`, F-177) — Resident passes
     // `true` (loaded once, reused), Sequential passes `req.use_pid` so a non-PiD generate skips the
@@ -262,43 +284,61 @@ fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<QwenHeavyO
         None
     };
     let vae = loader::load_vae(root)?;
+    let alternate_decoder = mlx_gen_wan::load_selected_single_frame_decoder(spec, &descriptor())?;
     Ok(QwenHeavyOwned {
         transformer,
         vae,
         pid,
+        alternate_decoder,
     })
 }
 
-impl QwenImage {
-    /// Extract the single img2img init image + its strength from the request's conditioning. The
-    /// per-reference strength wins over `req.strength`. Qwen-Image T2I img2img conditions on exactly
-    /// one init image, so more than one `Reference` is an error (the multi-image edit path is
-    /// `qwen_image_edit` + `MultiReference`, sc-2529). Returns `None` for pure txt2img.
-    fn resolve_reference<'a>(
+impl Generator for QwenImage {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        validate_request(self.descriptor.id, &self.descriptor.capabilities, req).map_err(Into::into)
+    }
+
+    fn generate(
         &self,
-        req: &'a GenerationRequest,
-    ) -> Result<Option<(&'a Image, Option<f32>)>> {
-        let mut reference = None;
-        for c in &req.conditioning {
-            if let Conditioning::Reference { image, strength } = c {
-                if reference.is_some() {
-                    return Err(Error::Msg(
-                        "qwen_image: multiple reference images are not supported (single img2img \
-                         init only)"
-                            .into(),
-                    ));
-                }
-                reference = Some((image, strength.or(req.strength)));
-            }
-        }
-        Ok(reference)
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(
+            &self.memory_strategy,
+            self.precision,
+            self.quant,
+            context,
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::begin_request(
+            MODEL_ID,
+            &self.memory_strategy,
+            self.precision,
+            self.quant,
+            context,
+        )
     }
 }
-
-mlx_gen::impl_generator!(QwenImage {
-    validate: |s, req| validate_request(s.descriptor.id, &s.descriptor.capabilities, req),
-    generate: generate_impl,
-});
 
 impl QwenImage {
     /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
@@ -315,14 +355,18 @@ impl QwenImage {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+        let crate::pipeline::RequestRungs {
+            block_window,
+            attention_budget,
+            decode_tiling,
+        } = crate::pipeline::resolve_request_rungs(req, &self.memory_strategy)?;
 
         // Shared step/sampler/guidance/seed resolution (F-117); `req.sampler == "lightning"` selects
         // the few-step recipe, else the production resolution-dependent schedule.
         let params = resolve_run_params(req, req.width, req.height);
-
         // img2img: a single `Reference` image, with a per-reference strength overriding `req.strength`.
         // `start_step = 0` for pure txt2img (the fork's `Config.init_time_step`).
-        let reference = self.resolve_reference(req)?;
+        let reference = resolve_reference(req, MODEL_ID)?;
         let start_step = match reference {
             Some((_, strength)) => init_time_step(params.steps, strength),
             None => 0,
@@ -357,23 +401,25 @@ impl QwenImage {
                         MODEL_ID,
                     )?)
                 };
-                Ok((pos, neg))
+                let encoded = (pos, neg);
+                crate::pipeline::finish_conditioning(req, MODEL_ID, || {
+                    match &encoded.1 {
+                        Some(neg) => mlx_rs::transforms::eval([&encoded.0, neg])?,
+                        None => mlx_rs::transforms::eval([&encoded.0])?,
+                    }
+                    Ok(())
+                })?;
+                Ok(encoded)
             },
-            // Materialize pos (+neg) while the encoder is still alive (Sequential only) — MLX is lazy,
-            // so an un-evaluated output keeps the encoder referenced and the drop would free nothing.
-            |(pos, neg)| {
-                match neg {
-                    Some(neg) => mlx_rs::transforms::eval([pos, neg])?,
-                    None => mlx_rs::transforms::eval([pos])?,
-                }
-                Ok(())
-            },
+            // The shared post-conditioning boundary above already forces the lazy arrays while the
+            // encoder is alive, for both Resident and Sequential. Nothing remains to materialize
+            // before the Sequential text drop.
+            |_| Ok(()),
             // ── Establish the heavy render components (DiT + VAE + PiD) and run the denoise/decode
             // body once against the `heavy` borrow — identical for both residencies.
             |heavy_owned, enc, on_progress| {
                 let heavy = heavy_owned.as_ref();
                 let (pos, neg) = enc;
-
                 // VAE-encode the init image to packed clean latents (f32) ONCE — it's seed-independent
                 // (LANCZOS resize + a full VAE encode), so doing it inside the per-image loop ran the encoder
                 // `count` times for identical output (F-118). Under `Sequential` this runs after the text
@@ -400,13 +446,24 @@ impl QwenImage {
                     MODEL_ID,
                     capture_sigma,
                 )?;
-                let decoder: &dyn LatentDecoder = match &pid_decoder {
-                    Some(d) => d,
-                    None => heavy.vae,
-                };
                 let denoise_sigmas = &params.sigmas[..keep];
+                mlx_gen::diagnostics::record_phase_boundary(
+                    mlx_gen::diagnostics::BenchmarkPhaseBoundary::DenoiseStart,
+                );
+                let decoder = pid_decoder
+                    .as_ref()
+                    .map(|decoder| decoder as &dyn LatentDecoder)
+                    .or_else(|| {
+                        heavy
+                            .alternate_decoder
+                            .map(|decoder| decoder as &dyn LatentDecoder)
+                    });
                 let images = decode_and_collect(
+                    heavy.vae,
                     decoder,
+                    decode_tiling.as_ref(),
+                    req,
+                    MODEL_ID,
                     req.count,
                     params.base_seed,
                     req.width,
@@ -425,7 +482,7 @@ impl QwenImage {
                             }
                             None => noise,
                         };
-                        denoise_with_progress(
+                        let latents = denoise_with_progress_windowed(
                             heavy.transformer,
                             params.sampler_name.as_deref(),
                             denoise_sigmas,
@@ -437,9 +494,18 @@ impl QwenImage {
                             req.width,
                             req.height,
                             start_step,
+                            attention_budget,
+                            block_window,
                             &req.cancel,
+                            &req.preview,
                             progress,
-                        )
+                        )?;
+                        crate::pipeline::calibration_fault(
+                            req,
+                            mlx_gen::gen_core::MemoryPhase::Denoise,
+                            MODEL_ID,
+                        )?;
+                        Ok(latents)
                     },
                 )?;
                 Ok(GenerationOutput::Images(images))
@@ -487,15 +553,75 @@ pub(crate) fn validate_request(
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral
 // `gen_core::Result`.
-pub(crate) fn component_footprint(
+pub(crate) fn component_footprint_for(
+    provider_id: &str,
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
-    mlx_gen::PerComponentBytes::from_spec_subdirs(
+    let root = match &spec.weights {
+        WeightsSource::Dir(root) => root.as_path(),
+        WeightsSource::File(_) => {
+            return Err(mlx_gen::gen_core::Error::Msg(
+                "qwen-image component footprint requires a snapshot directory".to_owned(),
+            ))
+        }
+    };
+    let encoder_contract = crate::active_encoder_contract();
+    let selected = encoder_contract.source_for_load(spec, root)?;
+    let language = selected.materialized_language_tensor_headers(&encoder_contract)?;
+    let vision = if provider_id == crate::model_edit::MODEL_ID {
+        let builtin = encoder_contract
+            .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+        Some(builtin.materialized_vision_tensor_headers(
+            &crate::active_vision_encoder_contract(),
+            &encoder_contract,
+        )?)
+    } else {
+        None
+    };
+    let text_encoder = projected_conditioning_headers(&language, vision.as_deref())?;
+    let mut footprint = mlx_gen::PerComponentBytes::from_spec_subdirs(
         spec,
         &["text_encoder"],
         &["transformer"],
         &["vae"],
-    )
+    )?;
+    footprint.text_encoder = text_encoder;
+    Ok(footprint)
+}
+
+pub(crate) fn projected_conditioning_headers(
+    language: &[mlx_gen::gen_core::SafetensorsTensorHeader],
+    vision: Option<&[mlx_gen::gen_core::SafetensorsTensorHeader]>,
+) -> mlx_gen::gen_core::Result<u64> {
+    let language = mlx_gen::asset_facts::projected_tensor_headers_bytes(language, |_| {
+        mlx_gen::asset_facts::ResidentProjection::Stored
+    })?;
+    let vision = vision.map_or(Ok(0), |headers| {
+        mlx_gen::asset_facts::projected_tensor_headers_bytes(headers, |_| {
+            mlx_gen::asset_facts::ResidentProjection::Stored
+        })
+    })?;
+    language.checked_add(vision).ok_or_else(|| {
+        mlx_gen::gen_core::Error::Msg("qwen-image conditioning byte sum overflow".into())
+    })
+}
+
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    component_footprint_for(MODEL_ID, spec)
+}
+
+pub(crate) fn edit_component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    component_footprint_for(crate::model_edit::MODEL_ID, spec)
+}
+
+pub(crate) fn control_component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    component_footprint_for(crate::model_control::MODEL_ID, spec)
 }
 
 mlx_gen::register_generators! {
@@ -503,9 +629,25 @@ mlx_gen::register_generators! {
     footprint = component_footprint
 }
 
+pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
+        safety_check: crate::memory_strategy::registered_safety_check,
+    };
+pub const MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(MODEL_ID, spec, contract, context)
+        },
+    };
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::Conditioning;
 
     /// Documents + guards the PiD `from_ldm` capture-index policy (sc-7993) on the **production
     /// flow-match** schedule — the 50-step trajectory the sc-7843 runB validation captured. A σ ceiling
@@ -728,13 +870,8 @@ mod tests {
 
     #[test]
     fn load_uses_shared_tier_guard_before_weights() {
-        let root = std::env::temp_dir().join(format!(
-            "qwen-shared-tier-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         std::fs::create_dir_all(root.join("transformer")).unwrap();
         std::fs::write(
             root.join("transformer/config.json"),
@@ -760,43 +897,45 @@ mod tests {
             error.contains("parse") && error.contains("config.json"),
             "{error}"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
-    // ── F-180 (sc-11126): weight-free, default-run proof that Qwen-Image's dispatch HONORS
-    // `offload_policy`. `build_residency` points at a non-existent snapshot *directory* (so the
-    // up-front precision/single-file guard in `resolve_root` passes) and the discriminator is deferral:
-    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
-    //   * `Resident` eager-loads the Qwen2.5-VL text encoder from the missing dir → `Err`.
-    // A dispatch that ignored `offload_policy` (always `Resident`) would eager-load under a `Sequential`
-    // request and fail the first assertion. The A/B real-weight test is `#[ignore]`d; this runs by
-    // default.
-    fn missing_snapshot_spec(policy: OffloadPolicy) -> LoadSpec {
-        LoadSpec::new(WeightsSource::Dir(
-            "/nonexistent/qwen-image-residency-test-snapshot".into(),
-        ))
-        .with_offload_policy(policy)
+    // F-180 (sc-11126): exercise the real Qwen-Image residency builder with a bounded sealed
+    // encoder. Mutating the source after admission makes eager loading fail at ArtifactSeal before
+    // MLX/Metal, while Sequential must retain the same production loader without opening it.
+    fn sealed_then_mutated_source(
+        policy: OffloadPolicy,
+    ) -> (
+        tempfile::TempDir,
+        LoadSpec,
+        mlx_gen::gen_core::ValidatedEncoderSource,
+    ) {
+        let fixture = tempfile::tempdir().unwrap();
+        let component = fixture.path().join("text_encoder");
+        let contract = crate::active_encoder_contract();
+        gen_core_testkit::write_encoder_contract_fixture(&component, contract).unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(fixture.path().to_path_buf()))
+            .with_offload_policy(policy);
+        let source = contract.source_for_load(&spec, fixture.path()).unwrap();
+        std::fs::write(component.join("config.json"), b"{}\n").unwrap();
+        (fixture, spec, source)
     }
 
     #[test]
     fn build_residency_sequential_defers_all_component_loads() {
-        let res = build_residency(&missing_snapshot_spec(OffloadPolicy::Sequential))
-            .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
-        assert!(
-            res.is_sequential(),
-            "Sequential policy must build a Sequential (deferred) residency"
-        );
+        let _guard = crate::scoped_bounded_encoder_contract();
+        let (_fixture, spec, source) = sealed_then_mutated_source(OffloadPolicy::Sequential);
+        let residency = build_residency_with_source(&spec, source).unwrap();
+        assert!(residency.is_sequential());
     }
 
     #[test]
-    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
-        let err = build_residency(&missing_snapshot_spec(OffloadPolicy::Resident))
+    fn build_residency_resident_eagerly_invokes_the_text_loader() {
+        let _guard = crate::scoped_bounded_encoder_contract();
+        let (_fixture, spec, source) = sealed_then_mutated_source(OffloadPolicy::Resident);
+        let error = build_residency_with_source(&spec, source)
             .err()
-            .expect("Resident must eager-load and fail on a missing snapshot dir");
-        let msg = err.to_string();
-        assert!(
-            !msg.contains("single .safetensors file") && !msg.contains("precision override"),
-            "expected an eager-load failure, not the up-front guard: {msg}"
-        );
+            .expect("Resident must eagerly invoke the production text loader")
+            .to_string();
+        assert!(error.contains("changed after load"), "{error}");
     }
 }

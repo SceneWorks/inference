@@ -14,16 +14,21 @@
 //! backend f32 floor is ~1e-3, see the parity tests). The masked T5 encode that *builds* the
 //! sequence mask is sc-3838; the generate path is sc-3839.
 
-use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, LinearFacts};
+use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
 use mlx_gen::nn::{gated, gelu_tanh, silu};
 /// Re-exported so the model's denoise loop can enable the shared `mx.compile` fusion of the DiT's
 /// elementwise glue (adaLN modulate + gated residuals), matching FLUX.1/FLUX.2 (F-101/F-102).
 /// [`CompileGlueGuard`] is the RAII form the production denoise binds so the toggle is restored on
-/// drop (F-007) instead of leaking the process-global on.
+/// drop (F-007) instead of leaking the render thread's setting into later work.
 pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
+use mlx_gen::qkv::{
+    self, AttnPrepSpec, FusedQkvProjection, NormDtype, QkNormSpec, QkvPart, QkvSource, RopeDtype,
+    RopeSpec, RopeStyle, RopeTables, RotationAxes, StreamOrder,
+};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
-use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
+use mlx_rs::fast::{layer_norm, rms_norm};
 use mlx_rs::ops::{add, broadcast_to, concatenate_axis, multiply};
 use mlx_rs::{Array, Dtype};
 
@@ -80,6 +85,13 @@ impl Lin {
     fn inner_mut(&mut self) -> &mut AdaptableLinear {
         &mut self.0
     }
+
+    /// Unwrap to the bare [`AdaptableLinear`], for the q/k/v triples that now live inside a
+    /// [`FusedQkvProjection`] (SC-18319). `Lin` adds no state over its inner linear, so this is the
+    /// whole of it.
+    fn into_inner(self) -> AdaptableLinear {
+        self.0
+    }
 }
 
 /// adaLN affine `normed·(1+scale) + shift`. `scale`/`shift` are `[B,1,inner]` (broadcast over seq).
@@ -125,52 +137,72 @@ fn build_rope(ids: &Array, axes: [usize; 3]) -> Result<RopeTable> {
     Ok(RopeTable { cos, sin })
 }
 
-/// Apply RoPE to `x [B,H,S,hd]` (adjacent-pair / interleaved convention), in f32.
-fn apply_rope_one(x: &Array, rope: &RopeTable) -> Result<Array> {
-    let sh = x.shape();
-    let (b, heads, seq, hd) = (sh[0], sh[1], sh[2], sh[3]);
-    let half = hd / 2;
-    let x5 = x
-        .as_dtype(Dtype::Float32)?
-        .reshape(&[b, heads, seq, half, 2])?;
-    let p = mlx_rs::ops::split(&x5, 2, 4)?;
-    let real = p[0].reshape(&[b, heads, seq, half])?;
-    let imag = p[1].reshape(&[b, heads, seq, half])?;
-    let c = rope.cos.reshape(&[1, 1, seq, half])?;
-    let s = rope.sin.reshape(&[1, 1, seq, half])?;
-    // Shared complex rotation (F-014): identical math to the prior open-coded subtract/add, but routed
-    // through the FLUX op so it picks up the `compile_glue` fusion (`real*c − imag*s`, `imag*c + real*s`).
-    let (out0, out1) = mlx_gen::nn::rope_rotate(&real, &imag, &c, &s)?;
-    Ok(
-        concatenate_axis(&[&out0.expand_dims(4)?, &out1.expand_dims(4)?], 4)?
-            .reshape(&[b, heads, seq, hd])?,
-    )
+/// SC-18319 — Chroma's row of the shared knob table, in one place so the single-stream and joint
+/// attentions provably select the same policy.
+///
+/// `rope` is `Some` only for the single-stream blocks, which rotate per stream; the joint blocks
+/// pass `None` and rotate the **already-joined** sequence afterwards (knob 8's concat-then-RoPE arm,
+/// via [`rotate_joint`]).
+fn chroma_spec<'a>(
+    heads: i32,
+    head_dim: i32,
+    norm_q: &'a Array,
+    norm_k: &'a Array,
+    rope: Option<&'a RopeTable>,
+) -> AttnPrepSpec<'a> {
+    let spec = AttnPrepSpec::new(heads, head_dim)
+        .with_qk_norm(
+            QkNormSpec::per_head(norm_q, norm_k, QK_RMS_EPS).with_dtype(NormDtype::PromoteToF32),
+        )
+        .with_rotation_axes(RotationAxes::HeadMajor);
+    match rope {
+        Some(r) => spec.with_rope(RopeSpec {
+            style: RopeStyle::AdjacentPair,
+            q: Some(RopeTables::new(&r.cos, &r.sin)),
+            k: Some(RopeTables::new(&r.cos, &r.sin)),
+            // Knob 12 — the removed `apply_rope_one` promoted and did NOT cast back. Chroma's
+            // whole prologue already runs f32 (`NormDtype::PromoteToF32` above), so this is a
+            // no-op here — stated rather than defaulted.
+            dtype: RopeDtype::Promoted,
+            ..RopeSpec::default()
+        }),
+        None => spec,
+    }
 }
 
-/// Project `x [B,S,inner]` to heads `[B,H,S,hd]`, optionally RMS-normed (QK-norm) over `hd` (f32).
-fn proj_heads(x: &Array, lin: &Lin, heads: i32, hd: i32, norm: Option<&Array>) -> Result<Array> {
-    let b = x.shape()[0];
-    let s = x.shape()[1];
-    let y = lin
-        .forward(x)?
-        .reshape(&[b, s, heads, hd])?
-        .transpose_axes(&[0, 2, 1, 3])?;
-    match norm {
-        Some(w) => Ok(rms_norm(&y.as_dtype(Dtype::Float32)?, w, QK_RMS_EPS)?),
-        None => Ok(y.as_dtype(Dtype::Float32)?),
-    }
+/// Rotate an already-joined `[B, H, S, hd]` stream — the second half of knob 8's concat-then-RoPE.
+fn rotate_joint(x: &Array, rope: &RopeTable) -> Result<Array> {
+    qkv::apply_rope(
+        x,
+        RopeTables::new(&rope.cos, &rope.sin),
+        RopeStyle::AdjacentPair,
+        RotationAxes::HeadMajor,
+        None,
+        RopeDtype::Promoted,
+    )
 }
 
 /// Scaled-dot-product attention over `[B,H,S,hd]` → `[B,S,inner]`. `mask` is the additive `[B,1,S,S]`
 /// MMDiT mask (Chroma adds the 0/1 mask to the scores) or `None`.
-fn sdpa(q: &Array, k: &Array, v: &Array, hd: i32, mask: Option<&Array>) -> Result<Array> {
+///
+/// Ladder rung 3 (SC-15520): `plan` is threaded down from the request. [`AttentionPlan::UNBOUNDED`]
+/// — the default every unselected request carries — makes
+/// [`sdpa_budgeted_bhsd`](mlx_gen::attention::sdpa_budgeted_bhsd) take its single-call fast path,
+/// which is byte-for-byte the historical `scaled_dot_product_attention` call. A bounded plan splits
+/// the query rows, each block attending over the **complete** k/v, and narrows the per-query
+/// `[B,1,S,S]` mask onto each block; precision, scale, seed and schedule are untouched.
+fn sdpa(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    hd: i32,
+    mask: Option<&Array>,
+    plan: AttentionPlan<'_>,
+) -> Result<Array> {
     let b = q.shape()[0];
     let scale = (hd as f32).powf(-0.5);
     // `&Array` is taken as an *additive* mask (Chroma's 0/1 mask is added to the scores).
-    let y = match mask {
-        Some(m) => scaled_dot_product_attention(q, k, v, scale, m, None)?,
-        None => scaled_dot_product_attention(q, k, v, scale, None, None)?,
-    };
+    let y = sdpa_budgeted_bhsd(q, k, v, scale, mask, plan)?;
     Ok(y.transpose_axes(&[0, 2, 1, 3])?
         .reshape(&[b, -1, q.shape()[1] * hd])?)
 }
@@ -268,13 +300,13 @@ impl Approximator {
 // ============================ blocks ============================
 
 struct DoubleAttn {
-    to_q: Lin,
-    to_k: Lin,
-    to_v: Lin,
+    /// SC-18319 P4: the image stream's `to_q`/`to_k`/`to_v` behind one adapter/quant-aware packed
+    /// matrix. All three read the SAME activation (`hidden`), which is the precondition for packing
+    /// them; the text triple is a second, independent projection because it reads `encoder`.
+    img_qkv: FusedQkvProjection,
     to_out: Lin,
-    add_q: Lin,
-    add_k: Lin,
-    add_v: Lin,
+    /// The text stream's `add_q_proj`/`add_k_proj`/`add_v_proj`, likewise packed.
+    txt_qkv: FusedQkvProjection,
     to_add_out: Lin,
     norm_q: Array,
     norm_k: Array,
@@ -287,13 +319,17 @@ struct DoubleAttn {
 impl DoubleAttn {
     fn load(w: &Weights, p: &str, cfg: &ChromaTransformerConfig) -> Result<Self> {
         Ok(Self {
-            to_q: Lin::load(w, &format!("{p}.to_q"))?,
-            to_k: Lin::load(w, &format!("{p}.to_k"))?,
-            to_v: Lin::load(w, &format!("{p}.to_v"))?,
+            img_qkv: FusedQkvProjection::new(
+                Lin::load(w, &format!("{p}.to_q"))?.into_inner(),
+                Lin::load(w, &format!("{p}.to_k"))?.into_inner(),
+                Lin::load(w, &format!("{p}.to_v"))?.into_inner(),
+            ),
             to_out: Lin::load(w, &format!("{p}.to_out.0"))?,
-            add_q: Lin::load(w, &format!("{p}.add_q_proj"))?,
-            add_k: Lin::load(w, &format!("{p}.add_k_proj"))?,
-            add_v: Lin::load(w, &format!("{p}.add_v_proj"))?,
+            txt_qkv: FusedQkvProjection::new(
+                Lin::load(w, &format!("{p}.add_q_proj"))?.into_inner(),
+                Lin::load(w, &format!("{p}.add_k_proj"))?.into_inner(),
+                Lin::load(w, &format!("{p}.add_v_proj"))?.into_inner(),
+            ),
             to_add_out: Lin::load(w, &format!("{p}.to_add_out"))?,
             norm_q: w.require(&format!("{p}.norm_q.weight"))?.clone(),
             norm_k: w.require(&format!("{p}.norm_k.weight"))?.clone(),
@@ -312,20 +348,30 @@ impl DoubleAttn {
         encoder: &Array,
         rope: &RopeTable,
         mask: Option<&Array>,
+        attention: AttentionPlan<'_>,
     ) -> Result<(Array, Array)> {
-        let (h, hd) = (self.heads, self.head_dim);
-        let q = proj_heads(hidden, &self.to_q, h, hd, Some(&self.norm_q))?;
-        let k = proj_heads(hidden, &self.to_k, h, hd, Some(&self.norm_k))?;
-        let v = proj_heads(hidden, &self.to_v, h, hd, None)?;
-        let eq = proj_heads(encoder, &self.add_q, h, hd, Some(&self.norm_added_q))?;
-        let ek = proj_heads(encoder, &self.add_k, h, hd, Some(&self.norm_added_k))?;
-        let ev = proj_heads(encoder, &self.add_v, h, hd, None)?;
-        let q = concatenate_axis(&[&eq, &q], 2)?;
-        let k = concatenate_axis(&[&ek, &k], 2)?;
-        let v = concatenate_axis(&[&ev, &v], 2)?;
-        let q = apply_rope_one(&q, rope)?;
-        let k = apply_rope_one(&k, rope)?;
-        let out = sdpa(&q, &k, &v, hd, mask)?; // [B, S, inner]
+        let hd = self.head_dim;
+        // SC-18319 — **knob 8's concat-then-RoPE arm**, and the reason that knob exists. Chroma joins
+        // `[text, image]` FIRST (knob 11) and rotates the joint sequence with one table, where FLUX.1
+        // rotates each stream and then concatenates. Both are expressed as a call-order choice over
+        // the same two primitives: `prepare` with `RopeStyle::None`, then `join`, then `apply_rope`.
+        let spec = chroma_spec(self.heads, hd, &self.norm_q, &self.norm_k, None);
+        // SC-18319 P4 — one matmul per stream when the pack is engaged, three concatenated forwards
+        // when it is not. `prepare` splits the packed result at the offsets a `Separate` source would
+        // have carried, and a matmul's output rows are independent, so the two arms are bit-identical.
+        let img = qkv::prepare(
+            QkvSource::Packed(&self.img_qkv.forward_packed(hidden)?),
+            &spec,
+        )?;
+        let txt_spec = chroma_spec(self.heads, hd, &self.norm_added_q, &self.norm_added_k, None);
+        let txt = qkv::prepare(
+            QkvSource::Packed(&self.txt_qkv.forward_packed(encoder)?),
+            &txt_spec,
+        )?;
+        let joint = StreamOrder::TextFirst.join(&img, &txt)?;
+        let q = rotate_joint(&joint.q, rope)?;
+        let k = rotate_joint(&joint.k, rope)?;
+        let out = sdpa(&q, &k, &joint.v, hd, mask, attention)?; // [B, S, inner]
         let st = encoder.shape()[1];
         let txt = seq_slice(&out, 0, st)?;
         let img = seq_slice(&out, st, hidden.shape()[1])?;
@@ -333,34 +379,45 @@ impl DoubleAttn {
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
-        for l in [
-            &mut self.to_q,
-            &mut self.to_k,
-            &mut self.to_v,
-            &mut self.to_out,
-            &mut self.add_q,
-            &mut self.add_k,
-            &mut self.add_v,
-            &mut self.to_add_out,
-        ] {
+        self.img_qkv.quantize(bits, None)?;
+        self.txt_qkv.quantize(bits, None)?;
+        for l in [&mut self.to_out, &mut self.to_add_out] {
             l.quantize(bits)?;
         }
         Ok(())
     }
 
-    /// Resolve a diffusers adapter sub-path (within `…attn.`) to its linear (sc-3842).
+    /// Resolve a diffusers adapter sub-path (within `…attn.`) to its linear (sc-3842) — the
+    /// **MUTATION** half. A q/k/v path goes through [`FusedQkvProjection::part_mut`], which unfuses
+    /// first, so an adapter installed here can never be stranded behind a stale packed matrix.
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         Some(match path {
-            ["to_q"] => self.to_q.inner_mut(),
-            ["to_k"] => self.to_k.inner_mut(),
-            ["to_v"] => self.to_v.inner_mut(),
+            ["to_q"] => return self.img_qkv.part_mut(QkvPart::Q).ok(),
+            ["to_k"] => return self.img_qkv.part_mut(QkvPart::K).ok(),
+            ["to_v"] => return self.img_qkv.part_mut(QkvPart::V).ok(),
             ["to_out", "0"] => self.to_out.inner_mut(),
-            ["add_q_proj"] => self.add_q.inner_mut(),
-            ["add_k_proj"] => self.add_k.inner_mut(),
-            ["add_v_proj"] => self.add_v.inner_mut(),
+            ["add_q_proj"] => return self.txt_qkv.part_mut(QkvPart::Q).ok(),
+            ["add_k_proj"] => return self.txt_qkv.part_mut(QkvPart::K).ok(),
+            ["add_v_proj"] => return self.txt_qkv.part_mut(QkvPart::V).ok(),
             ["to_add_out"] => self.to_add_out.inner_mut(),
             _ => return None,
         })
+    }
+
+    /// The **PROBE** half (SC-18319): the six fused paths answer from
+    /// [`FusedQkvProjection::part_facts`], reading the packed representation instead of dismantling
+    /// it. `block_stream.rs`'s capture and verify walks hit EVERY path in every block, so without
+    /// this a window scan would unfuse the whole stack.
+    fn adaptable_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        match path {
+            ["to_q"] => Some(self.img_qkv.part_facts(QkvPart::Q)),
+            ["to_k"] => Some(self.img_qkv.part_facts(QkvPart::K)),
+            ["to_v"] => Some(self.img_qkv.part_facts(QkvPart::V)),
+            ["add_q_proj"] => Some(self.txt_qkv.part_facts(QkvPart::Q)),
+            ["add_k_proj"] => Some(self.txt_qkv.part_facts(QkvPart::K)),
+            ["add_v_proj"] => Some(self.txt_qkv.part_facts(QkvPart::V)),
+            _ => self.adaptable_mut(path).map(|l| LinearFacts::of(l)),
+        }
     }
 }
 
@@ -387,14 +444,92 @@ impl FeedForward {
     }
 }
 
-struct DoubleBlock {
+/// The block-local adapter paths on a [`DoubleBlock`] — the enumeration the rung-4 stream captures
+/// and replays over. Kept beside [`DoubleBlock::adaptable_mut`] and pinned against it in both
+/// directions by `block_stream`'s `every_listed_adapter_path_resolves_and_nothing_else_does`: a path
+/// silently dropped here means a streamed block loses that adapter with no error.
+pub(crate) const DOUBLE_ADAPTER_PATHS: &[&str] = &[
+    "attn.to_q",
+    "attn.to_k",
+    "attn.to_v",
+    "attn.to_out.0",
+    "attn.add_q_proj",
+    "attn.add_k_proj",
+    "attn.add_v_proj",
+    "attn.to_add_out",
+    "ff.net.0.proj",
+    "ff.net.2",
+    "ff_context.net.0.proj",
+    "ff_context.net.2",
+];
+
+/// The [`SingleBlock`] analogue of [`DOUBLE_ADAPTER_PATHS`].
+pub(crate) const SINGLE_ADAPTER_PATHS: &[&str] = &[
+    "attn.to_q",
+    "attn.to_k",
+    "attn.to_v",
+    "proj_mlp",
+    "proj_out",
+];
+
+/// One windowable Chroma sub-stack block, as the rung-4 stream sees it: something that can be
+/// rebuilt from a snapshot view and whose adapter targets are enumerable.
+///
+/// A trait rather than two near-identical code paths, so the capture/replay/verify logic in
+/// [`crate::block_stream`] is written once and cannot drift between the double and single stacks.
+pub(crate) trait StreamBlock: Sized {
+    /// The block-local dotted adapter paths this block type exposes.
+    const ADAPTER_PATHS: &'static [&'static str];
+    /// Rebuild block `index` from a snapshot view.
+    fn from_view(view: &Weights, index: usize, cfg: &ChromaTransformerConfig) -> Result<Self>;
+    /// Resolve a block-local dotted path to its adapter carrier — the **MUTATION** half.
+    fn adapter_target(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear>;
+    /// The **PROBE** half of the same block-local surface (SC-18319). The block stream's capture and
+    /// verify walks visit every entry of [`ADAPTER_PATHS`](Self::ADAPTER_PATHS) on every window, so
+    /// they must ask through here rather than through `adapter_target`, which unfuses.
+    fn adapter_facts(&mut self, path: &[&str]) -> Option<LinearFacts>;
+}
+
+impl StreamBlock for DoubleBlock {
+    const ADAPTER_PATHS: &'static [&'static str] = DOUBLE_ADAPTER_PATHS;
+
+    fn from_view(view: &Weights, index: usize, cfg: &ChromaTransformerConfig) -> Result<Self> {
+        Self::load(view, index, cfg)
+    }
+
+    fn adapter_target(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        self.adaptable_mut(path)
+    }
+
+    fn adapter_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        self.adaptable_facts(path)
+    }
+}
+
+impl StreamBlock for SingleBlock {
+    const ADAPTER_PATHS: &'static [&'static str] = SINGLE_ADAPTER_PATHS;
+
+    fn from_view(view: &Weights, index: usize, cfg: &ChromaTransformerConfig) -> Result<Self> {
+        Self::load(view, index, cfg)
+    }
+
+    fn adapter_target(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        self.adaptable_mut(path)
+    }
+
+    fn adapter_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        self.adaptable_facts(path)
+    }
+}
+
+pub(crate) struct DoubleBlock {
     attn: DoubleAttn,
     ff: FeedForward,
     ff_context: FeedForward,
 }
 
 impl DoubleBlock {
-    fn load(w: &Weights, i: usize, cfg: &ChromaTransformerConfig) -> Result<Self> {
+    pub(crate) fn load(w: &Weights, i: usize, cfg: &ChromaTransformerConfig) -> Result<Self> {
         let p = format!("transformer_blocks.{i}");
         Ok(Self {
             attn: DoubleAttn::load(w, &format!("{p}.attn"), cfg)?,
@@ -412,6 +547,7 @@ impl DoubleBlock {
         temb: &Array,
         rope: &RopeTable,
         mask: Option<&Array>,
+        attention: AttentionPlan<'_>,
     ) -> Result<(Array, Array)> {
         let norm_hidden = modulate(
             &layer_norm(hidden, None, None, LN_EPS)?,
@@ -424,7 +560,9 @@ impl DoubleBlock {
             &row(temb, 6)?,
         )?;
 
-        let (attn_img, attn_txt) = self.attn.forward(&norm_hidden, &norm_encoder, rope, mask)?;
+        let (attn_img, attn_txt) =
+            self.attn
+                .forward(&norm_hidden, &norm_encoder, rope, mask, attention)?;
 
         // image stream.
         let hidden = gated(hidden, &row(temb, 2)?, &attn_img)?;
@@ -453,7 +591,7 @@ impl DoubleBlock {
         self.ff_context.quantize(bits)
     }
 
-    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+    pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         Some(match path {
             ["attn", rest @ ..] => return self.attn.adaptable_mut(rest),
             ["ff", "net", "0", "proj"] => self.ff.lin1.inner_mut(),
@@ -463,12 +601,21 @@ impl DoubleBlock {
             _ => return None,
         })
     }
+
+    /// SC-18319 — an intermediate hop to a fused leaf MUST forward the probe, or the `adaptable_mut`
+    /// fallback takes over here and unfuses the attention below it.
+    pub(crate) fn adaptable_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        match path {
+            ["attn", rest @ ..] => self.attn.adaptable_facts(rest),
+            _ => self.adaptable_mut(path).map(|l| LinearFacts::of(l)),
+        }
+    }
 }
 
 struct SingleAttn {
-    to_q: Lin,
-    to_k: Lin,
-    to_v: Lin,
+    /// SC-18319 P4: one packed q/k/v. The single-stream block is a true self-attention, so all three
+    /// read the same `x`.
+    qkv: FusedQkvProjection,
     norm_q: Array,
     norm_k: Array,
     heads: i32,
@@ -478,9 +625,11 @@ struct SingleAttn {
 impl SingleAttn {
     fn load(w: &Weights, p: &str, cfg: &ChromaTransformerConfig) -> Result<Self> {
         Ok(Self {
-            to_q: Lin::load(w, &format!("{p}.to_q"))?,
-            to_k: Lin::load(w, &format!("{p}.to_k"))?,
-            to_v: Lin::load(w, &format!("{p}.to_v"))?,
+            qkv: FusedQkvProjection::new(
+                Lin::load(w, &format!("{p}.to_q"))?.into_inner(),
+                Lin::load(w, &format!("{p}.to_k"))?.into_inner(),
+                Lin::load(w, &format!("{p}.to_v"))?.into_inner(),
+            ),
             norm_q: w.require(&format!("{p}.norm_q.weight"))?.clone(),
             norm_k: w.require(&format!("{p}.norm_k.weight"))?.clone(),
             heads: cfg.num_attention_heads as i32,
@@ -488,38 +637,62 @@ impl SingleAttn {
         })
     }
 
-    fn forward(&self, x: &Array, rope: &RopeTable, mask: Option<&Array>) -> Result<Array> {
-        let (h, hd) = (self.heads, self.head_dim);
-        let q = apply_rope_one(&proj_heads(x, &self.to_q, h, hd, Some(&self.norm_q))?, rope)?;
-        let k = apply_rope_one(&proj_heads(x, &self.to_k, h, hd, Some(&self.norm_k))?, rope)?;
-        let v = proj_heads(x, &self.to_v, h, hd, None)?;
-        sdpa(&q, &k, &v, hd, mask)
+    fn forward(
+        &self,
+        x: &Array,
+        rope: &RopeTable,
+        mask: Option<&Array>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Array> {
+        // SC-18319 — the shared prologue. Chroma's knob selection: separate q/k/v (knob 9), per-head
+        // QK-RMSNorm computed in f32 with the whole stream (including `v`) promoted, adjacent-pair
+        // rotation (knob 2) applied head-major, and a shared q/k table (knob 6 off).
+        let heads = qkv::prepare(
+            QkvSource::Packed(&self.qkv.forward_packed(x)?),
+            &chroma_spec(
+                self.heads,
+                self.head_dim,
+                &self.norm_q,
+                &self.norm_k,
+                Some(rope),
+            ),
+        )?;
+        sdpa(&heads.q, &heads.k, &heads.v, self.head_dim, mask, attention)
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.to_q.quantize(bits)?;
-        self.to_k.quantize(bits)?;
-        self.to_v.quantize(bits)
+        self.qkv.quantize(bits, None)
     }
 
+    /// The MUTATION half — see [`DoubleAttn::adaptable_mut`].
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
-        Some(match path {
-            ["to_q"] => self.to_q.inner_mut(),
-            ["to_k"] => self.to_k.inner_mut(),
-            ["to_v"] => self.to_v.inner_mut(),
-            _ => return None,
-        })
+        match path {
+            ["to_q"] => self.qkv.part_mut(QkvPart::Q).ok(),
+            ["to_k"] => self.qkv.part_mut(QkvPart::K).ok(),
+            ["to_v"] => self.qkv.part_mut(QkvPart::V).ok(),
+            _ => None,
+        }
+    }
+
+    /// The PROBE half — see [`DoubleAttn::adaptable_facts`].
+    fn adaptable_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        match path {
+            ["to_q"] => Some(self.qkv.part_facts(QkvPart::Q)),
+            ["to_k"] => Some(self.qkv.part_facts(QkvPart::K)),
+            ["to_v"] => Some(self.qkv.part_facts(QkvPart::V)),
+            _ => None,
+        }
     }
 }
 
-struct SingleBlock {
+pub(crate) struct SingleBlock {
     attn: SingleAttn,
     proj_mlp: Lin,
     proj_out: Lin,
 }
 
 impl SingleBlock {
-    fn load(w: &Weights, i: usize, cfg: &ChromaTransformerConfig) -> Result<Self> {
+    pub(crate) fn load(w: &Weights, i: usize, cfg: &ChromaTransformerConfig) -> Result<Self> {
         let p = format!("single_transformer_blocks.{i}");
         Ok(Self {
             attn: SingleAttn::load(w, &format!("{p}.attn"), cfg)?,
@@ -536,6 +709,7 @@ impl SingleBlock {
         temb: &Array,
         rope: &RopeTable,
         mask: Option<&Array>,
+        attention: AttentionPlan<'_>,
     ) -> Result<Array> {
         let norm_hidden = modulate(
             &layer_norm(hidden, None, None, LN_EPS)?,
@@ -543,7 +717,7 @@ impl SingleBlock {
             &row(temb, 0)?,
         )?;
         let mlp = gelu_tanh(&self.proj_mlp.forward(&norm_hidden)?)?;
-        let attn = self.attn.forward(&norm_hidden, rope, mask)?;
+        let attn = self.attn.forward(&norm_hidden, rope, mask, attention)?;
         let proj = self
             .proj_out
             .forward(&concatenate_axis(&[&attn, &mlp], 2)?)?;
@@ -556,13 +730,21 @@ impl SingleBlock {
         self.proj_out.quantize(bits)
     }
 
-    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+    pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         Some(match path {
             ["attn", rest @ ..] => return self.attn.adaptable_mut(rest),
             ["proj_mlp"] => self.proj_mlp.inner_mut(),
             ["proj_out"] => self.proj_out.inner_mut(),
             _ => return None,
         })
+    }
+
+    /// SC-18319 — see [`DoubleBlock::adaptable_facts`].
+    pub(crate) fn adaptable_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        match path {
+            ["attn", rest @ ..] => self.attn.adaptable_facts(rest),
+            _ => self.adaptable_mut(path).map(|l| LinearFacts::of(l)),
+        }
     }
 }
 
@@ -577,6 +759,10 @@ pub struct ChromaTransformer {
     double_blocks: Vec<DoubleBlock>,
     single_blocks: Vec<SingleBlock>,
     proj_out: Lin,
+    /// Ladder rung 4 (SC-15520): the reopenable snapshot description a windowed forward rebuilds
+    /// blocks from. `None` on every ordinary load, which keeps the resident path byte-for-byte
+    /// unchanged.
+    block_stream: Option<crate::block_stream::ChromaBlockStream>,
 }
 
 impl ChromaTransformer {
@@ -630,7 +816,70 @@ impl ChromaTransformer {
             single_blocks,
             proj_out: Lin::load(&w, "proj_out")?,
             cfg,
+            block_stream: None,
         })
+    }
+
+    /// Arm exact snapshot-backed reconstruction for both Chroma block stacks (rung 4).
+    ///
+    /// The caller must run [`Self::finalize_block_stream`] **after** every load-time transformation
+    /// (quantization, adapters) has completed, so the stream captures the state the resident blocks
+    /// actually ended up in rather than a second derivation of it.
+    pub(crate) fn with_block_stream(mut self, source: mlx_gen::WeightsSource) -> Self {
+        self.block_stream = Some(crate::block_stream::ChromaBlockStream::new(
+            source, self.cfg,
+        ));
+        self
+    }
+
+    /// Capture the resident stacks' adapters into the armed stream, then evict both stacks. The
+    /// embedders, Approximator, RoPE and `proj_out` remain resident.
+    pub(crate) fn finalize_block_stream(&mut self) -> Result<()> {
+        let Some(stream) = self.block_stream.as_mut() else {
+            return Ok(());
+        };
+        stream.capture_adapters(&mut self.double_blocks, &mut self.single_blocks);
+        let (double, single) = (stream.double_blocks(), stream.single_blocks());
+        crate::block_stream::evict_resident_blocks(
+            &mut self.double_blocks,
+            &mut self.single_blocks,
+            double,
+            single,
+        )
+    }
+
+    /// The resident block counts — `(0, 0)` once a stream has been finalized.
+    #[doc(hidden)]
+    pub fn resident_block_counts(&self) -> (usize, usize) {
+        (self.double_blocks.len(), self.single_blocks.len())
+    }
+
+    /// Whether this transformer can rebuild its blocks on demand.
+    #[doc(hidden)]
+    pub fn is_streamable(&self) -> bool {
+        self.block_stream.is_some()
+    }
+
+    /// Build the window plans for one denoise step, or `None` when rung 4 is unselected.
+    pub(crate) fn block_window<'a>(
+        &self,
+        size: Option<usize>,
+        cancel: &'a mlx_gen::CancelFlag,
+    ) -> Result<Option<crate::block_stream::ChromaBlockWindow<'a>>> {
+        let Some(size) = size else { return Ok(None) };
+        let stream = self.block_stream.as_ref().ok_or_else(|| {
+            Error::Unsupported(
+                "chroma: bounded transformer residency needs a snapshot-backed block stream — load \
+                 with a staged request and LoadShape::DeferredMaterialization on a clean base route"
+                    .to_owned(),
+            )
+        })?;
+        Ok(Some(crate::block_stream::ChromaBlockWindow::new(
+            stream.double_blocks(),
+            stream.single_blocks(),
+            size,
+            cancel,
+        )?))
     }
 
     /// Quantize the matmul-heavy block linears (double/single attention + FFN) to Q4/Q8 (sc-3841).
@@ -638,6 +887,17 @@ impl ChromaTransformer {
     /// distilled-guidance Approximator (which drives all modulation) — stay dense, mirroring the
     /// "quantize the big GEMMs" convention. T5/VAE are quantized separately by the loader (if at all).
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        // Quantizing AFTER the block stream is armed would pack nothing: both stacks are evicted, so
+        // the loops below are no-ops and every streamed block would be rebuilt dense from a snapshot
+        // the caller believes it quantized. The production order (quantize, adapt, then arm) is
+        // correct; this refuses the inverted one rather than documenting it (SC-15520).
+        if self.block_stream.is_some() && self.double_blocks.is_empty() {
+            return Err(Error::Unsupported(
+                "chroma: cannot quantize after the block stream is armed — both stacks are evicted, \
+                 so the block linears would be silently skipped. Quantize first, then arm the stream"
+                    .to_owned(),
+            ));
+        }
         for b in &mut self.double_blocks {
             b.quantize(bits)?;
         }
@@ -684,7 +944,15 @@ impl ChromaTransformer {
         let pooled = self.pooled_temb(timestep)?;
         let rope = self.build_rope_table(txt_ids, img_ids)?;
         let mask2d = Self::attention_mask2d(attention_mask)?;
-        self.forward_prepared(hidden, encoder, &pooled, &rope, mask2d.as_ref())
+        self.forward_prepared(
+            hidden,
+            encoder,
+            &pooled,
+            &rope,
+            mask2d.as_ref(),
+            AttentionPlan::UNBOUNDED,
+            None,
+        )
     }
 
     /// The RoPE table over `cat(txt_ids, img_ids)` — depends only on the token positions, so the
@@ -713,6 +981,7 @@ impl ChromaTransformer {
     /// Run the MMDiT given the pre-built step-invariant tensors: `pooled` (the Approximator modulation
     /// table — shared by both CFG branches at a step), `rope`, and the additive `mask2d`. `hidden`
     /// (latents) and `encoder` (text) are per-branch. Bit-identical to [`Self::forward`].
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_prepared(
         &self,
         hidden: &Array,
@@ -720,6 +989,8 @@ impl ChromaTransformer {
         pooled: &Array,
         rope: &RopeTable,
         mask_ref: Option<&Array>,
+        attention: AttentionPlan<'_>,
+        window: Option<crate::block_stream::ChromaBlockWindow<'_>>,
     ) -> Result<Array> {
         let hidden = self.x_embedder.forward(hidden)?;
         let encoder = self.context_embedder.forward(encoder)?;
@@ -728,23 +999,109 @@ impl ChromaTransformer {
         let n_single = self.cfg.num_single_layers as i32;
         let img_offset = 3 * n_single;
         let txt_offset = img_offset + 6 * self.cfg.num_layers as i32;
-
-        let mut hidden = hidden;
-        let mut encoder = encoder;
-        for (i, block) in self.double_blocks.iter().enumerate() {
+        // The modulation slice is derived from the block INDEX, so a windowed rewrite has to carry
+        // `i` through the window range rather than from an enumeration of a resident vector.
+        let double_temb = |i: usize| -> Result<Array> {
             let i = i as i32;
             let img = rows(pooled, img_offset + 6 * i, 6)?;
             let txt = rows(pooled, txt_offset + 6 * i, 6)?;
-            let temb = concatenate_axis(&[&img, &txt], 1)?; // [B,12,inner]
-            let (e, h) = block.forward(&hidden, &encoder, &temb, rope, mask_ref)?;
-            encoder = e;
-            hidden = h;
+            concatenate_axis(&[&img, &txt], 1) // [B,12,inner]
+                .map_err(Into::into)
+        };
+
+        let mut hidden = hidden;
+        let mut encoder = encoder;
+        match window {
+            None => {
+                if self.block_stream.is_some() && self.double_blocks.is_empty() {
+                    return Err(Error::Unsupported(
+                        "chroma: a deferred transformer requires an explicit block window"
+                            .to_owned(),
+                    ));
+                }
+                for (i, block) in self.double_blocks.iter().enumerate() {
+                    let temb = double_temb(i)?;
+                    let (e, h) =
+                        block.forward(&hidden, &encoder, &temb, rope, mask_ref, attention)?;
+                    encoder = e;
+                    hidden = h;
+                }
+            }
+            Some(window) => {
+                let source = self.stream_source()?;
+                if window.double.n_blocks() != source.double_blocks() {
+                    return Err(Error::Msg(
+                        "chroma: double block plan depth mismatch".to_owned(),
+                    ));
+                }
+                let (e, h) = mlx_gen::block_residency::run_windowed(
+                    &window.double,
+                    window.cancel,
+                    (encoder, hidden),
+                    || source.open(),
+                    |(mut encoder, mut hidden), view, range| {
+                        for i in range {
+                            let block = source.materialize_double(view, i)?;
+                            let temb = double_temb(i)?;
+                            (encoder, hidden) = block
+                                .forward(&hidden, &encoder, &temb, rope, mask_ref, attention)
+                                .map_err(|error| {
+                                    Error::Msg(format!(
+                                        "chroma block stream: double block {i} forward: {error}"
+                                    ))
+                                })?;
+                        }
+                        Ok((encoder, hidden))
+                    },
+                    // LOAD-BEARING: MLX is lazy, so the carried activation is an unevaluated graph
+                    // node still referencing the window's weights. Dropping before forcing
+                    // evaluation frees nothing and the bound silently does not hold.
+                    |(encoder, hidden)| {
+                        mlx_rs::transforms::eval([encoder, hidden]).map_err(Into::into)
+                    },
+                )?;
+                encoder = e;
+                hidden = h;
+            }
         }
 
         let mut joint = concatenate_axis(&[&encoder, &hidden], 1)?; // [B, S, inner]
-        for (i, block) in self.single_blocks.iter().enumerate() {
-            let temb = rows(pooled, 3 * i as i32, 3)?;
-            joint = block.forward(&joint, &temb, rope, mask_ref)?;
+        match window {
+            None => {
+                for (i, block) in self.single_blocks.iter().enumerate() {
+                    let temb = rows(pooled, 3 * i as i32, 3)?;
+                    joint = block.forward(&joint, &temb, rope, mask_ref, attention)?;
+                }
+            }
+            Some(window) => {
+                let source = self.stream_source()?;
+                if window.single.n_blocks() != source.single_blocks() {
+                    return Err(Error::Msg(
+                        "chroma: single block plan depth mismatch".to_owned(),
+                    ));
+                }
+                joint = mlx_gen::block_residency::run_windowed(
+                    &window.single,
+                    window.cancel,
+                    joint,
+                    || source.open(),
+                    |mut joint, view, range| {
+                        for i in range {
+                            let block = source.materialize_single(view, i)?;
+                            let temb = rows(pooled, 3 * i as i32, 3)?;
+                            joint = block
+                                .forward(&joint, &temb, rope, mask_ref, attention)
+                                .map_err(|error| {
+                                    Error::Msg(format!(
+                                        "chroma block stream: single block {i} forward: {error}"
+                                    ))
+                                })?;
+                        }
+                        Ok(joint)
+                    },
+                    |joint: &Array| mlx_rs::transforms::eval([joint]).map_err(Into::into),
+                )?;
+            }
         }
 
         // Drop the text tokens; pruned `norm_out` (shift, scale = pooled[-2:]); proj_out.
@@ -757,6 +1114,51 @@ impl ChromaTransformer {
             &row(&no, 0)?,
         )?;
         self.proj_out.forward(&hidden)
+    }
+
+    fn stream_source(&self) -> Result<&crate::block_stream::ChromaBlockStream> {
+        if !self.double_blocks.is_empty() || !self.single_blocks.is_empty() {
+            return Err(Error::Msg(
+                "chroma: a windowed forward ran against a transformer that still holds resident \
+                 blocks — the bound would not hold"
+                    .to_owned(),
+            ));
+        }
+        self.block_stream
+            .as_ref()
+            .ok_or_else(|| Error::Unsupported("chroma: no snapshot-backed block stream".to_owned()))
+    }
+
+    /// Evidence hook (SC-15520): [`Self::forward`] under an explicit rung-3 attention plan.
+    ///
+    /// `mlx_gen_chroma::memory_strategy::ATTENTION_SUPPORT` is `false`, so the production path
+    /// refuses every bounded-attention request — which is exactly why the *mechanism* needs a seam a
+    /// harness can still reach. Without one, the measurement behind that `Missing` verdict could
+    /// never be re-taken and the verdict would calcify into an unfalsifiable comment.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_attention_plan(
+        &self,
+        hidden: &Array,
+        encoder: &Array,
+        timestep: &Array,
+        img_ids: &Array,
+        txt_ids: &Array,
+        attention_mask: Option<&Array>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Array> {
+        let pooled = self.pooled_temb(timestep)?;
+        let rope = self.build_rope_table(txt_ids, img_ids)?;
+        let mask2d = Self::attention_mask2d(attention_mask)?;
+        self.forward_prepared(
+            hidden,
+            encoder,
+            &pooled,
+            &rope,
+            mask2d.as_ref(),
+            attention,
+            None,
+        )
     }
 
     /// Test hook: the Approximator input vector for a raw timestep `[B]` (pure elementwise — isolates
@@ -790,6 +1192,23 @@ impl AdaptableHost for ChromaTransformer {
             ["proj_out"] => Some(self.proj_out.inner_mut()),
             ["distilled_guidance_layer", rest @ ..] => self.approximator.adaptable_mut(rest),
             _ => None,
+        }
+    }
+
+    /// SC-18319 — forward the probe down to the two block stacks; see
+    /// the `DoubleBlock` twin below. Anything else falls through to the `adaptable_mut`
+    /// delegation, which is what the trait default does and is correct for a plain linear.
+    fn adaptable_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        match path {
+            ["transformer_blocks", n, rest @ ..] => self
+                .double_blocks
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_facts(rest),
+            ["single_transformer_blocks", n, rest @ ..] => self
+                .single_blocks
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_facts(rest),
+            _ => self.adaptable_mut(path).map(|l| LinearFacts::of(l)),
         }
     }
 

@@ -3,7 +3,7 @@
 //! `#[ignore]`d — needs the real FLUX.2-klein-9b snapshot (env `MLX_GEN_FLUX2_SNAPSHOT` or the HF
 //! cache) and the adapter goldens from `tools/dump_flux2_adapter_golden.py` (gitignored, local):
 //!   cd ~/repos/mflux && .venv/bin/python ~/repos/mlx-gen/tools/dump_flux2_adapter_golden.py
-//!   cargo test -p mlx-gen-flux2 --test adapter_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux2 --test integration adapter_real_weights:: -- --ignored --nocapture
 //!
 //! Gates: (1) the key→module map resolves the FULL fork `Flux2LoRAMapping` surface (globals + 8
 //! double × 12 + 24 single × 2) against the real module tree, and rejects off-surface; (2) the
@@ -281,8 +281,8 @@ fn kohya_matches_peft_on_real_tree() {
         peft.push((format!("transformer.{p}.lora_B.weight"), b));
         peft.push((format!("transformer.{p}.alpha"), alpha));
     }
-    let dir = std::env::temp_dir().join("mlx_gen_flux2_kohya_rw_test");
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_tmp = tempfile::tempdir().unwrap();
+    let dir = dir_tmp.path().to_path_buf();
     let (kpath, ppath) = (dir.join("kohya.safetensors"), dir.join("peft.safetensors"));
     Array::save_safetensors(
         kohya
@@ -412,8 +412,8 @@ fn bfl_resolves_and_matches_diffusers_split_on_real_tree() {
     );
     let alpha = Array::from_slice(&[4.0f32], &[1]);
 
-    let dir = std::env::temp_dir().join("mlx_gen_flux2_bfl_rw_test");
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_tmp = tempfile::tempdir().unwrap();
+    let dir = dir_tmp.path().to_path_buf();
 
     // Equivalent diffusers split-target file (per-head up, SHARED down, same alpha).
     let ppath = dir.join("bfl_split_peft.safetensors");

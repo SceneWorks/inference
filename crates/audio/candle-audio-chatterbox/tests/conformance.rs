@@ -117,7 +117,10 @@ fn staged_spec(dir: PathBuf) -> LoadSpec {
 /// read), so this needs no weights and no network and runs as an ordinary (non-`#[ignore]`d) test.
 #[test]
 fn chatterbox_gates_required_components_at_load() {
-    let base = LoadSpec::new(WeightsSource::Dir(std::env::temp_dir()))
+    // An empty guarded dir, not the shared `$TMPDIR`: another test's leftovers must not be able
+    // to change what this load sees.
+    let tmp = tempfile::tempdir().unwrap();
+    let base = LoadSpec::new(WeightsSource::Dir(tmp.path().to_path_buf()))
         .with_component(
             cb::COMPONENT_PERTH,
             WeightsSource::File(PathBuf::from("unused-perth.safetensors")),

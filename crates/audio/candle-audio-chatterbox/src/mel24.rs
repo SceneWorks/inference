@@ -21,7 +21,8 @@
 //! - project through the librosa Slaney 80-mel bank, then `log(clamp(·, 1e-5))`
 //!   (`spectral_normalize` / `dynamic_range_compression`).
 
-use candle_audio::candle_core::{Device, Result as CandleResult, Tensor};
+use candle_audio::candle_core::{Device, Tensor};
+use candle_audio::Result;
 
 use crate::config::{S3GenConfig, S3GEN_SR};
 
@@ -166,11 +167,14 @@ impl Mel24Extractor {
     /// Extract the log-mel of a waveform, resampling to 24 kHz if needed → `[n_frames, 80]`
     /// (matching the reference `mel_spectrogram(...).transpose(1, 2)` layout the flow's
     /// `prompt_feat` expects).
-    pub fn mel(&self, samples: &[f32], sample_rate: u32, device: &Device) -> CandleResult<Tensor> {
-        let wav = candle_audio::dsp::resample(samples, sample_rate, S3GEN_SR, 1)
-            .map_err(|error| candle_audio::candle_core::Error::Msg(error.to_string()))?;
+    pub fn mel(&self, samples: &[f32], sample_rate: u32, device: &Device) -> Result<Tensor> {
+        let wav = candle_audio::dsp::resample(samples, sample_rate, S3GEN_SR, 1)?;
         let (frames, n_frames) = self.log_mel_frame_major(&wav);
-        Tensor::from_vec(frames, (n_frames, self.cfg.mel_num_mels), device)
+        Ok(Tensor::from_vec(
+            frames,
+            (n_frames, self.cfg.mel_num_mels),
+            device,
+        )?)
     }
 
     /// The log-mel as frame-major `[n_frames * n_mels]` plus the frame count. Split out so the
@@ -272,5 +276,14 @@ mod tests {
         assert!((n as i64 - 50).abs() <= 1, "expected ≈50 frames, got {n}");
         assert_eq!(frames.len(), n * 80);
         assert!(frames.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn mel_preserves_typed_audio_resample_errors() {
+        let error = Mel24Extractor::default()
+            .mel(&[0.0], 0, &Device::Cpu)
+            .unwrap_err();
+        assert!(matches!(error, candle_audio::AudioError::Msg(_)));
+        assert!(error.to_string().contains("rates must be non-zero"));
     }
 }

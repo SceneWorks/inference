@@ -52,12 +52,19 @@ pub use model::{
 };
 pub use pipeline::MossSfxPipeline;
 
-pub use model::{WEIGHT_LICENSE, WEIGHT_LICENSE_ENTRY};
+pub use model::{COMPONENT_KEY, COMPONENT_LICENSE};
 
-/// This crate's model-weight-license entries for catalog aggregation (sc-13332) — one row keyed by
-/// [`MODEL_ID`]. The audio catalog concatenates every provider's slice into the model-licenses
-/// manifest SceneWorks lists on its end-product licenses page.
-pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[model::WEIGHT_LICENSE_ENTRY];
+/// This crate's schema-3 component licence rows — one per loaded artifact (sc-16663). The audio
+/// catalog concatenates every provider crate's slice into the licence table it ships.
+pub const COMPONENT_LICENSES: &[gen_core::ComponentLicense] = &[model::COMPONENT_LICENSE];
+
+/// The provider→component mapping this crate contributes. A provider's effective terms are
+/// **derived** from these components by [`gen_core::provider_terms`] — never hand-authored — so
+/// they cannot drift from the component rows they summarize.
+pub const PROVIDER_COMPONENTS: &[gen_core::ProviderComponents] = &[gen_core::ProviderComponents {
+    provider_id: model::MODEL_ID,
+    components: &[model::COMPONENT_KEY],
+}];
 
 /// Add the MOSS-SoundEffect generator to an explicit audio registry builder (catalog
 /// composition).

@@ -7,7 +7,7 @@
 //!
 //! Runs in CI on the tiny seeded S5 fixture (no real checkpoint).
 
-mod common;
+use crate::common;
 
 use mlx_gen::weights::Weights;
 use mlx_gen_wan::config::WanModelConfig;

@@ -88,6 +88,9 @@ pub(crate) const DEFAULT_FPS: u32 = 30;
 /// `spec.quantize` (honouring one only when it matches the tier dir's manifest, [`tier`]).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::MOCHI_VIDEO_LATENT_SPACE),
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "mochi",
@@ -100,33 +103,15 @@ pub fn descriptor() -> ModelDescriptor {
             supports_true_cfg: true,
             // Text-to-video only in the base preview (I2V = a follow-on).
             conditioning: Vec::new(),
-            supports_lora: false,
-            supports_lokr: false,
             // A single fixed flow-match Euler integrator is wired; no selectable sampler/scheduler axis.
             samplers: Vec::new(),
-            schedulers: Vec::new(),
-            supported_guidance_methods: Vec::new(),
             // Width/height must be divisible by SIZE_MULTIPLE (VAE 8× spatial × DiT patch 2). 480p target = 848×480.
             min_size: SIZE_MULTIPLE,
             max_size: 1280,
             max_count: 1,
-            mac_only: false,
             // Quant tiers are pre-quantized per-tier checkpoints (epic 1788 / A6) — NOT on-the-fly requant.
             supported_quants: &[] as &[Quant],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            ..Default::default()
         },
     }
 }

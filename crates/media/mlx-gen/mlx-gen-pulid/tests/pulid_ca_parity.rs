@@ -7,7 +7,7 @@
 //! FLUX).
 //!
 //! Run:
-//!   cargo test -p mlx-gen-pulid --release --test pulid_ca_parity -- --ignored --nocapture
+//!   cargo test -p mlx-gen-pulid --release --test integration pulid_ca_parity:: -- --ignored --nocapture
 
 use mlx_gen::weights::Weights;
 use mlx_gen_flux::transformer::DitImageInjector;

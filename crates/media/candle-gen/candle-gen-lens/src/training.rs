@@ -546,6 +546,11 @@ impl FlowMatchTrainer for LensTrainer {
         // `req.cancel` is only available in `cache`, not here).
         let cancel = CancelFlag::new();
         let mut on_progress = |_: Progress| {};
+        // Deliberately NO per-step latent preview hook (epic 16948, sc-16955): this is the trainer's
+        // periodic sample render, driven from a synthetic request that carries no PreviewSink, and its
+        // result is delivered as a finished `TrainingProgress::Sample` image rather than as a live
+        // denoise stream. `candle-gen-catalog`'s route inventory pins this exact site as dark with
+        // that reason — the same decision sc-16950 recorded for Krea's trainer and sc-16954 for SDXL's.
         let lat = candle_gen::run_flow_sampler(
             None,
             TimestepConvention::Sigma,
@@ -554,6 +559,7 @@ impl FlowMatchTrainer for LensTrainer {
             seed,
             &cancel,
             &mut on_progress,
+            None,
             |latents, sigma| -> Result<Tensor> {
                 // Joint CFG batch: duplicate the latent (cond/uncond share x_t), one DiT call over the
                 // pre-encoded `[2, S, 2880]` features + `[2, S]` mask (frame = 1).
@@ -818,6 +824,7 @@ mod tests {
                 image_path: "/img.png".into(),
                 caption: "x".into(),
                 control_image_path: None,
+                model_options: Default::default(),
             }],
             config: TrainingConfig::default(),
             output_dir: "/out".into(),

@@ -14,6 +14,7 @@ use mlx_rs::transforms::checkpoint;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
+use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -21,6 +22,24 @@ use mlx_gen::Result;
 use super::rope::apply_interleaved_rope;
 use super::{join, repeat_kv};
 use crate::quant::lin;
+
+fn materialize_host_adapters(host: &mut impl AdaptableHost) -> Result<()> {
+    for path in host.adaptable_paths() {
+        let parts: Vec<&str> = path.split('.').collect();
+        // SC-18319 — this walks EVERY projection, and `materialize_adapters` on an empty stack is a
+        // no-op, so the PROBE half decides and the `&mut` is taken only where there is a stack to
+        // evaluate. Resolving `&mut`-first would unfuse a whole model to evaluate nothing.
+        if host
+            .adaptable_facts(&parts)
+            .is_some_and(|f| f.adapter_count > 0)
+        {
+            host.adaptable_mut(&parts)
+                .expect("resolved through the probe above")
+                .materialize_adapters()?;
+        }
+    }
+    Ok(())
+}
 
 /// `1.0 + a`, broadcasting the scalar (the `(1 + scale)` modulation factor).
 fn plus1(a: &Array) -> Result<Array> {
@@ -64,6 +83,11 @@ impl RmsScale {
         let dt = x.dtype();
         let y = rms_norm(&x.as_dtype(Dtype::Float32)?, &self.weight, self.eps)?;
         Ok(y.as_dtype(dt)?)
+    }
+
+    pub(super) fn materialize_weights(&self) -> Result<()> {
+        mlx_rs::transforms::eval([&self.weight])?;
+        Ok(())
     }
 }
 
@@ -139,6 +163,17 @@ impl GatedAttention {
     /// `x`: `[b, s, hidden]`. `rope`: `Some((cos, sin))` (`[1, s, head_dim/2]`) for the single-stream
     /// blocks; `None` for the text-fusion blocks (no positional encoding). Unmasked (B=1 full sequence).
     pub fn forward(&self, x: &Array, rope: Option<(&Array, &Array)>) -> Result<Array> {
+        self.forward_budgeted(x, rope, AttentionPlan::UNBOUNDED)
+    }
+
+    /// Inference forward with request-scoped query-row chunking. Training keeps calling
+    /// [`Self::forward`], so checkpointed SDPA never evaluates inside an autograd trace.
+    pub fn forward_budgeted(
+        &self,
+        x: &Array,
+        rope: Option<(&Array, &Array)>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Array> {
         let sh = x.shape();
         let (b, s) = (sh[0], sh[1]);
         let q = self
@@ -186,7 +221,7 @@ impl GatedAttention {
                 mlx_gen::Error::Msg("krea: SDPA checkpoint produced no output".into())
             })?
         } else {
-            scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?
+            sdpa_budgeted_bhsd(&q, &k, &v, self.scale, None, attention)?
         };
         let o = o
             .transpose_axes(&[0, 2, 1, 3])?
@@ -208,6 +243,14 @@ impl GatedAttention {
             p.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
         }
         Ok(())
+    }
+
+    fn materialize_weights(&self) -> Result<()> {
+        for projection in [&self.q, &self.k, &self.v, &self.gate, &self.o] {
+            projection.materialize_weights()?;
+        }
+        self.norm_q.materialize_weights()?;
+        self.norm_k.materialize_weights()
     }
 }
 
@@ -262,6 +305,12 @@ impl SwiGlu {
         self.up.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
         self.down.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
         Ok(())
+    }
+
+    fn materialize_weights(&self) -> Result<()> {
+        self.gate.materialize_weights()?;
+        self.up.materialize_weights()?;
+        self.down.materialize_weights()
     }
 
     /// Cast the projection weights to the training compute `dtype` in place (sc-7577).
@@ -334,6 +383,13 @@ impl TextFusionBlock {
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         self.attn.quantize(bits)?;
         self.mlp.quantize(bits)
+    }
+
+    fn materialize_weights(&self) -> Result<()> {
+        self.prenorm.materialize_weights()?;
+        self.postnorm.materialize_weights()?;
+        self.attn.materialize_weights()?;
+        self.mlp.materialize_weights()
     }
 
     pub fn set_sdpa_checkpoint(&mut self, on: bool) {
@@ -412,6 +468,17 @@ impl SingleStreamBlock {
     /// `x`: `[b, s, hidden]`, `tvec`: `[b, 1, 6·hidden]` (shared `time_mod_proj` output), `cos`/`sin`:
     /// `[1, s, head_dim/2]`.
     pub fn forward(&self, x: &Array, tvec: &Array, cos: &Array, sin: &Array) -> Result<Array> {
+        self.forward_budgeted(x, tvec, cos, sin, AttentionPlan::UNBOUNDED)
+    }
+
+    pub(crate) fn forward_budgeted(
+        &self,
+        x: &Array,
+        tvec: &Array,
+        cos: &Array,
+        sin: &Array,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Array> {
         let m = add(tvec, &self.scale_shift_table)?; // [b, 1, 6·hidden]
         let m = split(&m, 6, 2)?; // 6 × [b, 1, hidden]
         let (prescale, preshift, pregate) = (&m[0], &m[1], &m[2]);
@@ -421,7 +488,9 @@ impl SingleStreamBlock {
             &multiply(&self.prenorm.forward(x)?, &plus1(prescale)?)?,
             preshift,
         )?;
-        let attn = self.attn.forward(&pre, Some((cos, sin)))?;
+        let attn = self
+            .attn
+            .forward_budgeted(&pre, Some((cos, sin)), attention)?;
         let x = add(x, &multiply(pregate, &attn)?)?;
 
         let post = add(
@@ -437,6 +506,14 @@ impl SingleStreamBlock {
         self.mlp.quantize(bits)
     }
 
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        mlx_rs::transforms::eval([&self.scale_shift_table])?;
+        self.prenorm.materialize_weights()?;
+        self.postnorm.materialize_weights()?;
+        self.attn.materialize_weights()?;
+        self.mlp.materialize_weights()
+    }
+
     pub fn set_sdpa_checkpoint(&mut self, on: bool) {
         self.attn.set_sdpa_checkpoint(on);
     }
@@ -447,6 +524,10 @@ impl SingleStreamBlock {
         }
         self.attn.cast_weights(dtype)?;
         self.mlp.cast_weights(dtype)
+    }
+
+    pub(crate) fn materialize_adapters(&mut self) -> Result<()> {
+        materialize_host_adapters(self)
     }
 }
 
@@ -549,6 +630,17 @@ impl TextFusionTransformer {
         Ok(())
     }
 
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        for block in &self.layerwise {
+            block.materialize_weights()?;
+        }
+        self.projector.materialize_weights()?;
+        for block in &self.refiner {
+            block.materialize_weights()?;
+        }
+        Ok(())
+    }
+
     pub fn set_sdpa_checkpoint(&mut self, on: bool) {
         for b in &mut self.layerwise {
             b.set_sdpa_checkpoint(on);
@@ -567,6 +659,13 @@ impl TextFusionTransformer {
             b.cast_weights(dtype)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn materialize_adapters(&mut self) -> Result<()> {
+        // `projector` is routable for explicit adapter files but is not enumerated by
+        // `adaptable_paths`; include it explicitly so its payload cannot escape the pin guard.
+        self.projector.materialize_adapters()?;
+        materialize_host_adapters(self)
     }
 }
 

@@ -3,8 +3,11 @@
 //! byte-identical across the two layouts live here; the per-file conv/norm leaves (which carry the
 //! channel axis at different positions) stay with their respective modules.
 
-use mlx_gen::tiling::TilePlan;
-use mlx_gen::{CancelFlag, Result};
+use mlx_gen::tiling::{
+    TilePlan, TilingConfig, VaeTiling, MIN_TEMPORAL_TILE_LATENT_FRAMES,
+    MIN_TEMPORAL_TILE_LATENT_OVERLAP,
+};
+use mlx_gen::{CancelFlag, Error, Result};
 use mlx_rs::Array;
 
 /// A length-1 `f32` array, used as a broadcastable scalar operand in MLX ops.
@@ -59,15 +62,23 @@ impl FeatCache {
 }
 
 /// The trapezoidally-blended tile-accumulate loop shared by both VAEs' `decode_tiled`. Slices each
-/// overlapping tile out of `denorm`, decodes it via the layout-specific `decode_tile` closure
-/// (conv2 → decoder → optional unpatchify → clamp), trapezoidally blends along the three tiled axes,
-/// and accumulates into the full output. `axes` are the `[t, h, w]` axis indices for the layout
-/// (`[2, 3, 4]` for NCTHW z16, `[1, 2, 3]` for channels-last z48).
+/// overlapping tile out of the tiled input, evaluates it via the layout-specific `decode_tile`
+/// closure, trapezoidally blends along the three tiled axes, and accumulates into the full output.
+/// `axes` are the `[t, h, w]` axis indices for the layout (`[2, 3, 4]` for NCTHW z16, `[1, 2, 3]`
+/// for channels-last z48).
 ///
 /// The slice/blend/pad/accumulate/normalize loop itself is the backend-shared
 /// [`mlx_gen::vae_tiling::tiled_decode`] (lifted there in sc-11747 so the Qwen-Image still-image VAE
-/// reuses the exact same seam-artifact-free implementation, not a per-crate copy); this thin wrapper
-/// keeps the wan call sites (`vae.rs`, `vae22.rs`) and their tests pointed at `crate::vae_common`.
+/// reuses the exact same implementation, not a per-crate copy); this thin wrapper keeps the wan call
+/// sites (`vae.rs`, `vae22.rs`) and their tests pointed at `crate::vae_common`.
+///
+/// **What "seam-free" does and does not mean here (sc-19753).** This loop's masks are a partition of
+/// unity, so it reconstructs a *tile-consistent* closure exactly — that is what its unit tests below
+/// pin, with a synthetic block-upsample decode. It says nothing about the closure: an op whose
+/// result depends on the whole spatial field (a GroupNorm, a global pool, or — as both wan decoders
+/// carry — a softmax attention over every `H·W` token) is **not** tile-consistent, and no blend
+/// width recovers it. Both callers therefore hoist their attention-bearing middle blocks into a
+/// dense head and pass only a spatially-local tail through here.
 pub(crate) fn tile_decode_accumulate(
     denorm: &Array,
     plan: &TilePlan,
@@ -76,6 +87,38 @@ pub(crate) fn tile_decode_accumulate(
     decode_tile: impl Fn(&Array) -> Result<Array>,
 ) -> Result<Array> {
     mlx_gen::vae_tiling::tiled_decode(denorm, plan, axes, cancel, decode_tile)
+}
+
+/// Validate a temporal tile policy before it crosses the generic [`mlx_gen::LatentDecoder`] seam.
+/// Production Wan plans already come from `budgeted_plan`, which enforces this floor; the seam is a
+/// new public route and must not let an arbitrary caller re-introduce the short-window temporal
+/// starvation corruption documented by sc-15325. Spatial-only plans and temporal policies that do
+/// not actually tile this latent are unaffected.
+pub(crate) fn validate_decoder_tiling(
+    cfg: &TilingConfig,
+    vae: VaeTiling,
+    latent_frames: i32,
+) -> Result<()> {
+    let Some(temporal) = cfg.temporal else {
+        return Ok(());
+    };
+    let scale = vae.temporal_scale.max(1);
+    let tile_latent = temporal.tile_frames / scale;
+    if latent_frames <= tile_latent {
+        return Ok(());
+    }
+    let overlap_latent = temporal.overlap_frames / scale;
+    if tile_latent < MIN_TEMPORAL_TILE_LATENT_FRAMES {
+        return Err(Error::Msg(format!(
+            "Wan tiled decoder requires at least {MIN_TEMPORAL_TILE_LATENT_FRAMES} latent frames per temporal tile; got {tile_latent}"
+        )));
+    }
+    if overlap_latent < MIN_TEMPORAL_TILE_LATENT_OVERLAP || overlap_latent >= tile_latent {
+        return Err(Error::Msg(format!(
+            "Wan tiled decoder requires temporal overlap in [{MIN_TEMPORAL_TILE_LATENT_OVERLAP}, {tile_latent}) latent frames; got {overlap_latent}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -170,6 +213,32 @@ mod tests {
         assert!(
             matches!(res, Err(mlx_gen::Error::Canceled)),
             "a pre-tripped cancel must abort the tiled decode with Error::Canceled"
+        );
+    }
+
+    #[test]
+    fn decoder_seam_rejects_temporal_starvation_but_keeps_spatial_only_and_single_pass() {
+        let starved = TilingConfig {
+            spatial: None,
+            temporal: Some(TemporalTiling {
+                tile_frames: 16,
+                overlap_frames: 8,
+            }),
+        };
+        assert!(validate_decoder_tiling(&starved, VaeTiling::WAN, 9).is_err());
+        assert!(validate_decoder_tiling(&starved, VaeTiling::WAN, 4).is_ok());
+
+        let safe = TilingConfig {
+            spatial: None,
+            temporal: Some(TemporalTiling {
+                tile_frames: 32,
+                overlap_frames: 16,
+            }),
+        };
+        assert!(validate_decoder_tiling(&safe, VaeTiling::WAN, 9).is_ok());
+        assert!(
+            validate_decoder_tiling(&TilingConfig::spatial_only(512, 64), VaeTiling::WAN, 257,)
+                .is_ok()
         );
     }
 

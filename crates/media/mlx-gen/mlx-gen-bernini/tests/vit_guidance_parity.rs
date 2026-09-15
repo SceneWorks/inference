@@ -5,12 +5,20 @@
 //! `rv2v_wapg` / `r2v_wapg`) over random `[1, n, C]` target-sliced packed-token predictions. Pure
 //! elementwise + a single-scalar projection per delta, so this matches to the f32 floor.
 //!
-//! Run: `cargo test -p mlx-gen-bernini --test vit_guidance_parity -- --nocapture`
+//! Run: `cargo test -p mlx-gen-bernini --test integration vit_guidance_parity:: -- --nocapture`
 
 use mlx_gen::weights::Weights;
 use mlx_gen_bernini::guidance::apg_delta;
 use mlx_gen_bernini::vit_guidance::{rv2v_chain, vae_txt_vit};
 use mlx_rs::Array;
+
+use crate::common;
+
+use common::{
+    SHARED_FIXTURE_VIT_GUIDANCE_APG_ETA, SHARED_FIXTURE_VIT_GUIDANCE_APG_NORM_THRESHOLD,
+    SHARED_FIXTURE_VIT_GUIDANCE_W_IMG, SHARED_FIXTURE_VIT_GUIDANCE_W_TGT,
+    SHARED_FIXTURE_VIT_GUIDANCE_W_TXT, SHARED_FIXTURE_VIT_GUIDANCE_W_VID,
+};
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -39,11 +47,22 @@ fn check(name: &str, got: &Array, want: &Array, tol: f32) {
 fn vit_guidance_matches_reference() {
     let w = Weights::from_file(FIXTURE).expect("load fixture");
     let g = |k: &str| w.require(k).unwrap().clone();
-    let (w_img, w_txt, w_tgt, w_vid) = (4.5, 4.0, 3.0, 1.25);
+    let (w_img, w_txt, w_tgt, w_vid) = (
+        SHARED_FIXTURE_VIT_GUIDANCE_W_IMG,
+        SHARED_FIXTURE_VIT_GUIDANCE_W_TXT,
+        SHARED_FIXTURE_VIT_GUIDANCE_W_TGT,
+        SHARED_FIXTURE_VIT_GUIDANCE_W_VID,
+    );
 
     // bare apg_delta (projection only): apg_delta(img - base, ref = img, 0.2, 1.0).
     let delta = mlx_rs::ops::subtract(g("io.img"), g("io.base")).unwrap();
-    let apg = apg_delta(&delta, &g("io.img"), 0.2, 1.0).expect("apg_delta");
+    let apg = apg_delta(
+        &delta,
+        &g("io.img"),
+        SHARED_FIXTURE_VIT_GUIDANCE_APG_ETA,
+        SHARED_FIXTURE_VIT_GUIDANCE_APG_NORM_THRESHOLD,
+    )
+    .expect("apg_delta");
     check("apg_only", &apg, w.require("out.apg_only").unwrap(), 1e-5);
 
     // vae_txt_vit (plain) + vae_txt_vit_wapg (apg, ref = "to" pred).

@@ -6,7 +6,7 @@
 //!
 //! `#[ignore]`d — each needs a converted bf16 snapshot (env-var override, else the SceneWorks /
 //! mlx-gen cache default). Run:
-//!   cargo test -p mlx-gen-wan --release --test trainer_e2e -- --ignored --nocapture
+//!   cargo test -p mlx-gen-wan --release --test integration trainer_e2e:: -- --ignored --nocapture
 //!
 //! Proves the full prepare→load→cache→train→save lifecycle: a tiny captioned PNG dataset is
 //! VAE/UMT5-encoded and cached (then the TE freed), the expert(s) train on their noise band(s), and
@@ -53,6 +53,7 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
             image_path: path,
             caption: format!("a solid colour swatch number {i}"),
             control_image_path: None,
+            model_options: Default::default(),
         });
     }
     items
@@ -107,12 +108,8 @@ fn run_trainer_e2e_cfg(
     optimizer: &str,
     gradient_checkpointing: bool,
 ) {
-    let tag = if gradient_checkpointing {
-        "ckpt"
-    } else {
-        optimizer
-    };
-    let tmp = std::env::temp_dir().join(format!("{model_id}_{tag}_trainer_e2e"));
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
 
     let mut trainer = mlx_gen_wan::provider_registry()
@@ -346,7 +343,8 @@ fn wan_ti2v_5b_trainer_prodigy_optimizer() {
 /// TI2V-5B] → VAE decode → first frame as `Image`) on real weights. Single frame (F=1) + one prompt
 /// keeps the per-cadence cost down on the heavy 14B/5B loads.
 fn run_sample_smoke(model_id: &str, snapshot: PathBuf) {
-    let tmp = std::env::temp_dir().join(format!("{model_id}_samples_e2e"));
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
     let mut trainer = mlx_gen_wan::provider_registry()
         .unwrap()

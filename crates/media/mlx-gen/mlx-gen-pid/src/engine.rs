@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use mlx_rs::Dtype;
 
+use mlx_gen::gen_core::LatentSpace;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     flow_capture_plan, CancelFlag, Error, GenerationRequest, PidWeights, Result, WeightsSource,
@@ -23,12 +24,16 @@ use crate::config::{PidConfig, SamplerConfig};
 use crate::decoder::PidDecoder;
 use crate::gemma2::{Gemma2, Gemma2Config};
 use crate::lq::PidNet;
-use crate::registry::lookup;
+use crate::registry::{lookup, BackboneSpec};
 use crate::sampler::Sampler;
 
 /// Filename of the merged Gemma-2-2b-it checkpoint inside the gemma snapshot dir; falls back to
 /// loading every `*.safetensors` shard in the dir when absent.
-const GEMMA_MERGED_FILE: &str = "gemma-2-2b-it.safetensors";
+///
+/// `pub` so a provider pricing the PiD overlay in its memory contract (sc-15839) resolves the same
+/// source [`PidEngine::load`] opens instead of re-spelling the filename — a duplicated spelling here
+/// silently sizes the shard dir instead of the merged file.
+pub const GEMMA_MERGED_FILE: &str = "gemma-2-2b-it.safetensors";
 
 /// A loaded PiD decoder engine for one latent space — built once, reused across generations.
 pub struct PidEngine {
@@ -37,6 +42,8 @@ pub struct PidEngine {
     weights: Weights,
     /// Per-latent-space backbone config (`sr4x` topology + the space's LQ latent-channel count).
     cfg: PidConfig,
+    /// Exact latent contract selected by the backbone registry.
+    input_latent_space: LatentSpace,
     /// The released 4-step SDE distill sampler config.
     sampler_cfg: SamplerConfig,
     /// The Gemma-2-2b caption encoder (loaded once; the projection runs per caption).
@@ -58,22 +65,11 @@ impl PidEngine {
         })?;
         let weights = Weights::from_file(checkpoint)?;
 
-        // The released students share the sr4x PixDiT topology; only the LQ latent-channel count and
-        // the latent grid's spatial compression differ per latent space: 16-ch / 8× for qwen/flux/sd3,
-        // 4-ch / 8× for sdxl, and **128-ch / 16×** for flux2 (the packed BN latent — see the registry
-        // `FLUX2` note, sc-7847). Both fields drive the LQ adapter geometry + `PidDecoder` output size.
-        //
         // PiD v1.5 (sc-12142) ships a different LQ topology (wider trunk, per-token scalar gate,
         // replicate padding, PiT injection, 2048 RoPE ref) under the SAME per-space checkpoint slot, so
         // the worker may hand us either a v1.0 or v1.5 file (and fall back v1.5→v1.0 when v1.5 isn't
         // downloaded — sc-12145). Pick the config by sniffing the WEIGHTS, not the filename.
-        let mut cfg = if detect_v1pt5(&weights)? {
-            PidConfig::sr4x_v1pt5()
-        } else {
-            PidConfig::sr4x()
-        };
-        cfg.lq_latent_channels = spec.latent_channels;
-        cfg.latent_spatial_down_factor = spec.latent_spatial_down_factor;
+        let cfg = config_for_spec(&spec, detect_v1pt5(&weights)?);
 
         // Gemma: prefer the merged single-file checkpoint, else load the snapshot dir's shards.
         let merged = gemma_dir.join(GEMMA_MERGED_FILE);
@@ -88,6 +84,7 @@ impl PidEngine {
         Ok(Self {
             weights,
             cfg,
+            input_latent_space: spec.input_latent_space,
             sampler_cfg: SamplerConfig::distill_4step(),
             caption,
             ckpt_prefix: "",
@@ -134,7 +131,8 @@ impl PidEngine {
             self.cfg.sr_scale,
             self.cfg.latent_spatial_down_factor,
             seed,
-        ))
+        )
+        .with_input_latent_space(self.input_latent_space))
     }
 }
 
@@ -196,7 +194,7 @@ pub fn resolve_pid_decoder_at_sigma(
             "{model_id}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)"
         ))
     })?;
-    Ok(Some(mint_planned_decoder(
+    Ok(Some(mint_planned_decoder_with_tiling(
         engine,
         model_id,
         &req.prompt,
@@ -205,7 +203,73 @@ pub fn resolve_pid_decoder_at_sigma(
         capture_sigma,
         base_seed,
         req.cancel.clone(),
+        selected_decode_tiling(req),
     )?))
+}
+
+/// The decode tile geometry a request explicitly selected, or `None` for the auto-plan (SC-15510).
+///
+/// This is the request half of the PiD reconciliation: before it, the student always planned its own
+/// tiling and a bounded-decode selection had to be refused at admission because honouring it was
+/// impossible. `Some` requires **both** the rung-2 signal and an explicit edge — the boolean is the
+/// switch and the parameter is only the value, so a request that turned the rung on without naming a
+/// geometry still gets the auto-plan rather than a fabricated one.
+///
+/// Pure, so the (easy to get subtly wrong) precedence is unit-testable without weights.
+///
+/// # Obligation on the adopting provider — read before wiring rung 2 with a PiD overlay
+///
+/// This is a **shared, provider-agnostic** seam: [`resolve_pid_decoder_at_sigma`] is reached by every
+/// PiD-eligible MLX provider. Today only `mlx-gen-z-image` populates
+/// [`GenerationMemory::decode_tile_edge`](mlx_gen::gen_core::GenerationMemory), so this returns `None`
+/// everywhere else and every other provider keeps the auto-plan byte-for-byte.
+///
+/// That changes the moment a second provider's memory-strategy adoption starts emitting **its native VAE
+/// ladder** into that field. Native VAE tiles (Z-Image's are 512-768 output px; Qwen's probe ladder
+/// runs 256-768) are **not legal PiD tiles** — the student decodes a `scale×` super-resolved output
+/// and its edges are [`TILE_ALIGN`](crate::budget::TILE_ALIGN)-aligned multiples from
+/// [`MIN_TILE_EDGE`](crate::budget::MIN_TILE_EDGE) up. So a `use_pid` + rung-2 request on such a
+/// provider would flip from "auto-plan, works" to a hard
+/// [`validate_tile`](crate::budget::validate_tile) rejection.
+///
+/// **The provider owns that, and it is deliberate that this seam does not paper over it.** Silently
+/// falling back to the auto-plan when the selected edge is not a legal PiD tile would execute a
+/// different strategy than the selector chose, which is the exact failure the shared contract forbids
+/// — so an out-of-domain edge must be loud. What an adopting provider has to do is refuse the
+/// combination at *admission*, where it has the route in hand.
+///
+/// That obligation is **enforced rather than described** (SC-15775): declare the routes with
+/// [`DecodeRoutes::new`](crate::decode_routes::DecodeRoutes::new), which cannot be handed a PiD-route
+/// ladder at all *and* refuses a native ladder that reaches into the PiD domain, so an overlapping
+/// declaration never becomes a value; gate admission on
+/// [`DecodeRoutes::validate`](crate::decode_routes::DecodeRoutes::validate); and run
+/// [`assert_decode_routes`](crate::decode_routes::assert_decode_routes) in the provider's test suite so
+/// a `const` ladder's defect lands in CI rather than at load. A provider that bypasses all of that
+/// still trips the `debug_assert` below the first time any test drives a native geometry into a
+/// `use_pid` request, so the mis-wiring surfaces in CI instead of in a user's generate call.
+pub fn selected_decode_tiling(req: &GenerationRequest) -> Option<(i32, i32)> {
+    let memory = req.memory?;
+    if !memory.tile_vae_decode {
+        return None;
+    }
+    let edge = memory.decode_tile_edge?;
+    // SC-15775. `req.use_pid` is already true for every caller of this function (the sole path in is
+    // `resolve_pid_decoder_at_sigma`, which returns early otherwise), so an edge here is bound for the
+    // super-resolving student. Release behaviour is deliberately unchanged — `validate_tile` in
+    // `mint_planned_decoder_with_tiling` still rejects, typed, and still never re-plans — but a debug
+    // build fails loudly and names the fix, which turns a production rejection into a CI failure.
+    debug_assert!(
+        crate::budget::is_tile_edge_candidate(edge as i32),
+        "PiD decode seam received tile edge {edge}, which is not one of the student's candidates \
+         {:?}: the provider emitted a NATIVE VAE geometry into the `use_pid` route. Declare both \
+         routes with `mlx_gen_pid::decode_routes::DecodeRoutes` and reject the combination at \
+         admission (SC-15775).",
+        crate::budget::tile_edge_candidates(),
+    );
+    let overlap = memory
+        .decode_overlap
+        .unwrap_or(crate::budget::DEFAULT_TILE_OVERLAP as u32);
+    Some((edge as i32, overlap as i32))
 }
 
 /// Mint a per-generation [`PidDecoder`] with the F-013/sc-10087 decode policy — budget `guard` →
@@ -237,6 +301,49 @@ pub fn mint_planned_decoder(
     seed: u64,
     cancel: CancelFlag,
 ) -> Result<PidDecoder> {
+    mint_planned_decoder_with_tiling(
+        engine,
+        model_id,
+        prompt,
+        width,
+        height,
+        capture_sigma,
+        seed,
+        cancel,
+        None,
+    )
+}
+
+/// [`mint_planned_decoder`] with an optional **externally selected** `(tile_edge, overlap)` —
+/// SC-15510's reconciliation of the PiD planner with the shared memory-strategy contract.
+///
+/// `None` is the historical behaviour, unchanged: the auto-plan decides, and a whole-image decode
+/// stays whole. `Some((edge, overlap))` is a bounded-decode selection the worker made from the
+/// provider's published candidates, so it is **honoured rather than re-derived**:
+///
+/// - the geometry is validated against the planner's own invariants
+///   ([`budget::validate_tile`](crate::budget::validate_tile)) — an out-of-domain edge is a typed
+///   rejection, never a silent fallback to a different plan, because "executed a different strategy
+///   than the selector chose" is exactly what the contract forbids;
+/// - the budget [`guard`](crate::budget::guard) still runs, so a machine that cannot hold the
+///   output-resolution buffers at all is still refused;
+/// - tiling is **forced** even when the whole output would fit, mirroring
+///   [`GenerationMemory::tile_vae_decode`](mlx_gen::gen_core::GenerationMemory)'s documented meaning
+///   ("force the bounded decode even below its automatic tiling threshold"). A selection that asked
+///   for a bounded decode and silently got an unbounded one would be a false green in the calibration
+///   evidence.
+#[allow(clippy::too_many_arguments)]
+pub fn mint_planned_decoder_with_tiling(
+    engine: &PidEngine,
+    model_id: &str,
+    prompt: &str,
+    width: u32,
+    height: u32,
+    capture_sigma: f32,
+    seed: u64,
+    cancel: CancelFlag,
+    selected: Option<(i32, i32)>,
+) -> Result<PidDecoder> {
     let safe_gib = mlx_gen::memory::safe_budget_gib();
     let scale = engine.scale();
     let cfg = engine.config();
@@ -245,12 +352,21 @@ pub fn mint_planned_decoder(
         (height * scale as u32) as i32,
         (width * scale as u32) as i32,
     );
-    let plan = crate::budget::plan_tile_edge(1, th, tw, cfg.patch_size, cfg.hidden_size, safe_gib);
     let mut decoder = engine
         .decoder(prompt, capture_sigma, seed)?
         .with_cancel(cancel);
-    if !plan.whole_fits {
-        decoder = decoder.with_tiling(plan.edge, plan.overlap);
+    match selected {
+        Some((edge, overlap)) => {
+            crate::budget::validate_tile(model_id, edge, overlap, th, tw)?;
+            decoder = decoder.with_tiling(edge, overlap);
+        }
+        None => {
+            let plan =
+                crate::budget::plan_tile_edge(1, th, tw, cfg.patch_size, cfg.hidden_size, safe_gib);
+            if !plan.whole_fits {
+                decoder = decoder.with_tiling(plan.edge, plan.overlap);
+            }
+        }
     }
     Ok(decoder)
 }
@@ -277,6 +393,26 @@ pub fn flow_capture_for_request(
         Some(c) if c.keep > start_step + 1 => (c.sigma, c.keep),
         _ => (0.0, sigmas.len()),
     }
+}
+
+/// Assemble the per-latent-space [`PidConfig`] for a resolved backbone spec. The released students
+/// share the `sr4x` PixDiT topology; only the LQ latent-channel count, the latent grid's spatial
+/// compression, and the SR scale differ per latent space (16-ch/8× for qwen/flux/sd3, 4-ch/8× for
+/// sdxl, 128-ch/16× for flux2 — see the registry `FLUX2` note, sc-7847).
+///
+/// `sr_scale` is threaded from [`BackboneSpec::pid_scale`] (F-141, sc-21702) rather than left at the
+/// hard-coded `sr4x()` `4`. Every released student is 4× today, so this preserves their output exactly;
+/// a future 8× student now sizes its decoder output and LQ upsample ratio from the registry contract.
+fn config_for_spec(spec: &BackboneSpec, v1pt5: bool) -> PidConfig {
+    let mut cfg = if v1pt5 {
+        PidConfig::sr4x_v1pt5()
+    } else {
+        PidConfig::sr4x()
+    };
+    cfg.lq_latent_channels = spec.latent_channels;
+    cfg.latent_spatial_down_factor = spec.latent_spatial_down_factor;
+    cfg.sr_scale = spec.pid_scale;
+    cfg
 }
 
 /// Sniff whether a loaded PiD checkpoint is a **v1.5** student (sc-12141/sc-12142) vs a base `sr4x`
@@ -334,6 +470,43 @@ mod tests {
             Ok(_) => panic!("expected an error"),
             Err(e) => e.to_string(),
         }
+    }
+
+    #[test]
+    fn config_threads_pid_scale_and_preserves_released_4x_geometry() {
+        let baseline = PidConfig::sr4x();
+        for backbone in ["qwenimage", "flux", "sd3", "sdxl", "flux2"] {
+            let spec = lookup(backbone).unwrap();
+            let cfg = config_for_spec(&spec, false);
+            assert_eq!(cfg.sr_scale, spec.pid_scale, "{backbone}: registry scale");
+            assert_eq!(
+                cfg.sr_scale, baseline.sr_scale,
+                "{backbone}: released 4x geometry stays identical"
+            );
+            assert_eq!(cfg.lq_latent_channels, spec.latent_channels);
+            assert_eq!(
+                cfg.latent_spatial_down_factor,
+                spec.latent_spatial_down_factor
+            );
+        }
+    }
+
+    #[test]
+    fn hypothetical_4x_and_8x_specs_produce_candle_matching_geometry() {
+        // Candle assembles the same spec fields before passing them to PidDecoder. Keep this arithmetic
+        // explicit so a future asymmetric 8x student cannot quietly inherit sr4x()'s hard-coded 4x.
+        let mut spec = lookup("flux").unwrap();
+        spec.pid_scale = 4;
+        let cfg4 = config_for_spec(&spec, false);
+        spec.pid_scale = 8;
+        let cfg8 = config_for_spec(&spec, false);
+
+        let latent_side = 32;
+        let out4 = latent_side * cfg4.latent_spatial_down_factor * cfg4.sr_scale;
+        let out8 = latent_side * cfg8.latent_spatial_down_factor * cfg8.sr_scale;
+        assert_eq!(out4, 1024, "4x output geometry");
+        assert_eq!(out8, 2048, "8x output geometry");
+        assert_eq!(out8, out4 * 2, "pid_scale changes the decoder target");
     }
 
     #[test]
@@ -425,5 +598,134 @@ mod tests {
         assert!(resolve_pid_decoder(None, &req, 0, "flux")
             .unwrap()
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod selected_tiling_tests {
+    use super::*;
+    use mlx_gen::gen_core::GenerationMemory;
+
+    fn req(memory: Option<GenerationMemory>) -> GenerationRequest {
+        GenerationRequest {
+            prompt: "a fox".to_owned(),
+            use_pid: true,
+            memory,
+            ..Default::default()
+        }
+    }
+
+    /// The auto-plan is the default and stays the default: no memory block, a staged-only selection,
+    /// and a rung-2 selection that names no geometry all leave the planner in charge. This is what
+    /// keeps every pre-SC-15510 PiD render byte-identical.
+    #[test]
+    fn the_auto_plan_survives_everything_that_does_not_name_a_geometry() {
+        assert_eq!(selected_decode_tiling(&req(None)), None);
+        assert_eq!(
+            selected_decode_tiling(&req(Some(GenerationMemory::default()))),
+            None
+        );
+        assert_eq!(
+            selected_decode_tiling(&req(Some(GenerationMemory {
+                tile_vae_decode: true,
+                ..Default::default()
+            }))),
+            None,
+            "the rung-2 signal without an edge must not fabricate one"
+        );
+        // An edge WITHOUT the rung-2 signal is inert too — the boolean is the switch.
+        assert_eq!(
+            selected_decode_tiling(&req(Some(GenerationMemory {
+                decode_tile_edge: Some(2048),
+                ..Default::default()
+            }))),
+            None
+        );
+    }
+
+    #[test]
+    fn a_named_geometry_is_honoured_and_the_overlap_defaults_to_the_students_own() {
+        assert_eq!(
+            selected_decode_tiling(&req(Some(GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: Some(2048),
+                decode_overlap: Some(256),
+                ..Default::default()
+            }))),
+            Some((2048, 256))
+        );
+        assert_eq!(
+            selected_decode_tiling(&req(Some(GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: Some(1536),
+                ..Default::default()
+            }))),
+            Some((1536, crate::budget::DEFAULT_TILE_OVERLAP)),
+            "an unnamed overlap falls back to the student's own default, not to zero"
+        );
+    }
+
+    /// A geometry from the *native VAE* route is **refused**, never quietly re-planned — executing a
+    /// different strategy than the selector chose is exactly what the shared contract forbids.
+    ///
+    /// This is the release-build half: the geometry travels to
+    /// [`budget::validate_tile`](crate::budget::validate_tile) as-is and is rejected there, typed,
+    /// with no fallback to the auto-plan. The debug-build half is
+    /// [`the_seam_asserts_when_a_provider_emits_a_native_vae_edge`].
+    #[test]
+    fn a_native_vae_geometry_is_refused_by_the_validator_not_silently_replanned() {
+        // Deliberately NOT through `selected_decode_tiling` — in a debug build the SC-15775 assertion
+        // fires there first, which the `#[should_panic]` test below is what covers.
+        assert!(crate::budget::validate_tile("t", 512, 64, 4096, 4096).is_err());
+        assert!(crate::budget::validate_tile("t", 768, 64, 4096, 4096).is_err());
+        // Nothing about the refusal is a re-plan: the auto-plan for the same output is a legal tile,
+        // and the rejected selection did not become it.
+        let plan = crate::budget::plan_tile_edge(1, 4096, 4096, 16, 1536, 8.0);
+        assert!(crate::budget::is_tile_edge_candidate(plan.edge));
+        assert_ne!(plan.edge, 512);
+    }
+
+    /// SC-15775, the mis-wiring net: a provider that emits its **native** VAE ladder into the
+    /// `use_pid` route trips the shared seam's assertion, so the defect lands in CI rather than in a
+    /// user's generate call.
+    ///
+    /// `debug_assertions`-gated because that is exactly the contract — the assertion costs nothing in
+    /// release, where [`budget::validate_tile`](crate::budget::validate_tile) is still the (typed)
+    /// rejection.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "NATIVE VAE geometry")]
+    fn the_seam_asserts_when_a_provider_emits_a_native_vae_edge() {
+        let _ = selected_decode_tiling(&req(Some(GenerationMemory {
+            tile_vae_decode: true,
+            decode_tile_edge: Some(512),
+            decode_overlap: Some(64),
+            ..Default::default()
+        })));
+    }
+
+    /// Every candidate the student actually publishes passes the seam untouched — the assertion
+    /// guards the domain, it does not narrow it.
+    #[test]
+    fn every_pid_candidate_passes_the_seam_unchanged() {
+        for edge in crate::budget::tile_edge_candidates() {
+            assert_eq!(
+                selected_decode_tiling(&req(Some(GenerationMemory {
+                    tile_vae_decode: true,
+                    decode_tile_edge: Some(edge as u32),
+                    decode_overlap: Some(crate::budget::DEFAULT_TILE_OVERLAP as u32),
+                    ..Default::default()
+                }))),
+                Some((edge, crate::budget::DEFAULT_TILE_OVERLAP))
+            );
+            assert!(crate::budget::validate_tile(
+                "t",
+                edge,
+                crate::budget::DEFAULT_TILE_OVERLAP,
+                8192,
+                8192
+            )
+            .is_ok());
+        }
     }
 }

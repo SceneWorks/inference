@@ -20,10 +20,10 @@
 //! 512² (→ 2048² PiD) by default.
 //!
 //! ```sh
-//! cargo test -p mlx-gen-sdxl --release --test pid_decode_real_weights -- --ignored --nocapture
+//! cargo test -p mlx-gen-sdxl --release --test integration pid_decode_real_weights:: -- --ignored --nocapture
 //! # RealVisXL leg:
 //! SDXL_DIR=/path/to/models--SG161222--RealVisXL_V5.0/snapshots/<rev> \
-//!   cargo test -p mlx-gen-sdxl --release --test pid_decode_real_weights sdxl_pid_decode_vs_vae -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sdxl --release --test integration pid_decode_real_weights::sdxl_pid_decode_vs_vae -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

@@ -65,7 +65,7 @@ use candle_gen::train::flow_match::{
 };
 use candle_gen::train::gradient_checkpoint::checkpointed_backward;
 use candle_gen::train::lora::LoraSet;
-use candle_gen::{CandleError, Result};
+use candle_gen::{CandleError, LatentDecoder, Result};
 
 use candle_gen_qwen_image::vae::{QwenVae, QwenVaeEncoder};
 use rand::{rngs::StdRng, SeedableRng};
@@ -213,7 +213,7 @@ fn sample_noise_latent(edge: u32, seed: u64, device: &Device) -> Result<Tensor> 
 /// [`crate::pipeline`]'s `decode` (`QwenVae::decode` de-normalizes internally and returns `[1, 3, H, W]`
 /// in `[-1, 1]`; the `(x+1)·127.5` is the reference `clamp(-1,1)·0.5 + 0.5` denormalize) (sc-8650).
 fn decode_preview(vae: &QwenVae, lat: &Tensor) -> Result<Image> {
-    let decoded = vae.decode(lat)?.to_dtype(DType::F32)?; // [1, 3, H, W] in [-1, 1]
+    let decoded = LatentDecoder::decode(vae, lat)?.to_dtype(DType::F32)?; // [1, 3, H, W] in [-1, 1]
     let scaled = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?;
     let img = candle_gen::round_rgb8(&scaled)?;
     let img = img.i(0)?.to_device(&Device::Cpu)?;
@@ -485,6 +485,7 @@ impl FlowMatchTrainer for KreaTrainer {
             seed,
             &cancel,
             &mut on_progress,
+            None,
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                 let v_cond = dit.forward(x, &t, &ctx_pos)?;
@@ -543,7 +544,8 @@ mod tests {
     #[test]
     fn backward_reaches_lora_factors() {
         let dev = Device::Cpu;
-        let (mut dit, c, path) = tiny_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut dit, c, path) = tiny_dit(&tmp);
         let suffixes: Vec<String> = KREA_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
         let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
         // Move B off zero so both A and B grads are nonzero (a no-op-init adapter zeros A's grad).
@@ -593,7 +595,8 @@ mod tests {
     #[test]
     fn dense_and_checkpoint_grads_match() {
         let dev = Device::Cpu;
-        let (mut dit, c, path) = tiny_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut dit, c, path) = tiny_dit(&tmp);
         let suffixes: Vec<String> = KREA_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
         let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
         for v in &set.vars {
@@ -676,7 +679,8 @@ mod tests {
         // budget then buys an unambiguous drop (see the relative-floor assert below). Seed is
         // 10794-adjacent but distinct from the sibling tests so they don't share a trajectory.
         let mut rng = StdRng::seed_from_u64(10796);
-        let (mut dit, c, path) = tiny_dit_seeded(&mut rng);
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut dit, c, path) = tiny_dit_seeded(&tmp, &mut rng);
         let suffixes: Vec<String> = KREA_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
         let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
         for v in &set.vars {
@@ -774,6 +778,7 @@ mod tests {
             image_path: "/img.png".into(),
             caption: "x".into(),
             control_image_path: None,
+            model_options: Default::default(),
         };
         let base = TrainingRequest {
             items: vec![item],

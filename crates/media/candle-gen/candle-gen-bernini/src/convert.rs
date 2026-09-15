@@ -948,14 +948,8 @@ mod tests {
     /// clear `Err`; both present yields `Ok` with the two source paths.
     #[test]
     fn require_planner_sources_errs_on_missing() {
-        let tmp = std::env::temp_dir().join(format!(
-            "bernini_req_src_test_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         let mllm = tmp.join("mllm");
         std::fs::create_dir_all(&mllm).unwrap();
 
@@ -976,8 +970,6 @@ mod tests {
         let (cfg, tok) = require_planner_sources(&mllm).unwrap();
         assert!(cfg.ends_with("config.json"));
         assert!(tok.ends_with(PLANNER_TOKENIZER_FILE));
-
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// sc-11631 required base-Wan-sources guard: a base snapshot missing any REQUIRED renderer
@@ -985,14 +977,8 @@ mod tests {
     /// layout passes. Optional diffusers artifacts (`scheduler/` / `model_index.json`) are NOT required.
     #[test]
     fn require_base_wan_sources_errs_on_missing_vae() {
-        let tmp = std::env::temp_dir().join(format!(
-            "bernini_base_wan_src_test_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         let base = tmp.join("base_wan");
         std::fs::create_dir_all(&base).unwrap();
 
@@ -1022,8 +1008,6 @@ mod tests {
             require_base_wan_sources(&base).is_ok(),
             "complete required layout must pass without scheduler/model_index.json"
         );
-
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     // --- sc-11169 / F-099: streaming-converter byte-identity tests ---------------------------------
@@ -1036,10 +1020,9 @@ mod tests {
     // (dtype, name) order, insertion order does not matter, so equal tensor sets ⇒ equal bytes.
 
     /// Unique temp dir for a streaming test.
-    fn stream_tmp(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "bernini_stream_{tag}_{}_{}",
-            std::process::id(),
+    fn stream_tmp(tmp: &tempfile::TempDir, tag: &str) -> std::path::PathBuf {
+        let d = tmp.path().join(format!(
+            "bernini_stream_{tag}_{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -1077,6 +1060,7 @@ mod tests {
     /// with the component's tensors split across two shards (proving cross-shard streaming).
     #[test]
     fn streamed_expert_write_is_byte_identical() {
+        let tmp = tempfile::tempdir().unwrap();
         // A representative mix: a packable rank-2 `.weight`, a rank-1 norm `.weight` (dense — rank ≠ 2),
         // a `.bias`, a rank-2 non-`.weight` (`scale_shift_table`, dense), and a rank-4 conv `.weight`
         // (dense — rank ≠ 2). in_dim 128 is a multiple of the group size so the packer accepts it.
@@ -1088,7 +1072,7 @@ mod tests {
             ("patch_embedding.weight", f32_tensor(&[2, 3, 2, 2], 5.0)),
         ];
         for bits in [0usize, 4, 8] {
-            let tmp = stream_tmp(&format!("expert_{bits}"));
+            let tmp = stream_tmp(&tmp, &format!("expert_{bits}"));
             // Split the tensors across two shards.
             let mut s0: HashMap<String, Tensor> = HashMap::new();
             let mut s1: HashMap<String, Tensor> = HashMap::new();
@@ -1126,7 +1110,6 @@ mod tests {
                 a, b,
                 "streamed expert output must be byte-identical to whole-map (bits={bits})"
             );
-            std::fs::remove_dir_all(&tmp).ok();
         }
     }
 
@@ -1134,6 +1117,7 @@ mod tests {
     /// component split across two shards.
     #[test]
     fn streamed_planner_write_is_byte_identical() {
+        let tmp = tempfile::tempdir().unwrap();
         let tensors: Vec<(&str, Tensor)> = vec![
             (
                 "model.layers.0.self_attn.q_proj.weight",
@@ -1142,7 +1126,7 @@ mod tests {
             ("model.norm.weight", f32_tensor(&[4], 2.0)),
             ("visual.patch_embed.proj.weight", f32_tensor(&[6, 3], 3.0)),
         ];
-        let tmp = stream_tmp("planner");
+        let tmp = stream_tmp(&tmp, "planner");
         let mut s0: HashMap<String, Tensor> = HashMap::new();
         let mut s1: HashMap<String, Tensor> = HashMap::new();
         for (i, (k, v)) in tensors.iter().enumerate() {
@@ -1183,7 +1167,6 @@ mod tests {
             a, b,
             "streamed planner output must be byte-identical to whole-map"
         );
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     // --- sc-11062: packed planner (mllm LLM linears) --------------------------------------------
@@ -1225,6 +1208,7 @@ mod tests {
     /// bf16 — emitting a `quantize_config.json`. `bits == 0` packs nothing and writes no config.
     #[test]
     fn planner_mllm_packs_only_llm_linears() {
+        let tmp = tempfile::tempdir().unwrap();
         // in-dims are group-64 multiples (64 / 128) so the packer accepts the LLM linears.
         let tensors: Vec<(&str, Tensor)> = vec![
             ("model.embed_tokens.weight", f32_tensor(&[64, 64], 1.0)),
@@ -1254,7 +1238,7 @@ mod tests {
                 f32_tensor(&[192, 64], 8.0),
             ),
         ];
-        let tmp = stream_tmp("mllm_pack");
+        let tmp = stream_tmp(&tmp, "mllm_pack");
         let p0 = tmp.join("shard0.safetensors");
         let mut s0: HashMap<String, Tensor> = HashMap::new();
         for (k, v) in &tensors {
@@ -1326,8 +1310,6 @@ mod tests {
             !dst0.join("quantize_config.json").exists(),
             "bits=0 writes no quantize_config"
         );
-
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// On-device tier build (`#[ignore]`d — needs the ByteDance/Bernini-Diffusers package + a base

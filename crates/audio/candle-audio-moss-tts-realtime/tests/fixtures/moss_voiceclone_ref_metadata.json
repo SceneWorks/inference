@@ -1,0 +1,20 @@
+{
+  "story": "sc-17264",
+  "generator": "crates/audio/candle-audio-moss-tts-realtime/examples/voiceclone_ref_clip.rs",
+  "source": {
+    "model": "hexgrad/Kokoro-82M",
+    "license": "Apache-2.0",
+    "voice": "af_heart",
+    "text": "The northern lights shimmered above the quiet harbour that evening, and every sailor paused to watch. She counted seven boats returning, their lanterns swaying gently against a cold blue sky.",
+    "rendered": true,
+    "third_party_audio": false
+  },
+  "clip": {
+    "format": "raw f32 little-endian, mono",
+    "sample_rate": 24000,
+    "samples": 291000,
+    "seconds": 12.125,
+    "peak": 0.9,
+    "sha256": "3c7239bb4a2749ad61bbd188434728af79f5a48239cc6ace21832bfc0f3717b6"
+  }
+}

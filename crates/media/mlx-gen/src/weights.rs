@@ -48,6 +48,71 @@ impl Weights {
         })
     }
 
+    /// Evaluate every retained array before a mutation-sensitive source read is considered complete.
+    ///
+    /// MLX safetensors loads and the remap/cast operations layered on top of them are lazy. A caller
+    /// that only constructs a [`Weights`] value inside `PinnedWeightsFile::read_unchanged` would
+    /// otherwise run the post-read fingerprint check before the file-backed graph had consumed its
+    /// payload. Provider loaders call this after their final normalization so both source arrays and
+    /// derived casts/dequantizations are materialized while the pin guard is still active.
+    ///
+    /// Materializing is also the load boundary at which the GPU's view of every fresh buffer is
+    /// verified against the CPU's ([`crate::coherence`], sc-22414), before any graph consumes it.
+    ///
+    /// Evaluation is batched at [`Self::MATERIALIZE_BATCH_BYTES`] in sorted-key order so a cold
+    /// multi-gigabyte checkpoint never becomes one submission.
+    pub fn materialize(&self) -> Result<()> {
+        let mut named: Vec<(&str, &Array)> = self
+            .tensors
+            .iter()
+            .map(|(key, array)| (key.as_str(), array))
+            .collect();
+        Self::materialize_and_verify(&mut named)
+    }
+
+    /// Upper bound on the bytes one [`Self::materialize`] / [`Self::materialize_accessed`] batch
+    /// evaluates at once.
+    pub const MATERIALIZE_BATCH_BYTES: usize = 512 * 1024 * 1024;
+
+    fn materialize_and_verify(named: &mut [(&str, &Array)]) -> Result<()> {
+        named.sort_unstable_by_key(|(key, _)| *key);
+        let mut start = 0;
+        let mut bytes = 0usize;
+        for end in 0..named.len() {
+            bytes = bytes.saturating_add(named[end].1.nbytes());
+            if bytes >= Self::MATERIALIZE_BATCH_BYTES {
+                Self::materialize_batch(&named[start..=end])?;
+                start = end + 1;
+                bytes = 0;
+            }
+        }
+        if start < named.len() {
+            Self::materialize_batch(&named[start..])?;
+        }
+        Ok(())
+    }
+
+    fn materialize_batch(batch: &[(&str, &Array)]) -> Result<()> {
+        mlx_rs::transforms::eval(batch.iter().map(|(_, array)| *array))?;
+        crate::coherence::verify_gpu_view(batch.iter().copied())
+    }
+
+    /// Evaluate only tensors read through [`Self::get`] / [`Self::require`] since the last drain.
+    /// Block-window loaders use this before [`Self::remove_accessed`] so the source bytes for the
+    /// current window are consumed under its immutable-file guard without evaluating the rest of the
+    /// checkpoint and defeating bounded residency.
+    ///
+    /// Like [`Self::materialize`], this verifies the GPU's view of each window's fresh buffers
+    /// against the CPU's before the window's blocks consume them (sc-22414).
+    pub fn materialize_accessed(&self) -> Result<()> {
+        let accessed = self.accessed.borrow();
+        let mut named: Vec<(&str, &Array)> = accessed
+            .iter()
+            .filter_map(|key| self.tensors.get(key).map(|array| (key.as_str(), array)))
+            .collect();
+        Self::materialize_and_verify(&mut named)
+    }
+
     /// Load a safetensors file while decoding `F8_E4M3` payloads to bf16.
     ///
     /// MLX has no fp8 storage dtype, but does expose byte-accurate E4M3
@@ -55,6 +120,18 @@ impl Weights {
     /// provider can normalize them; this opt-in loader preserves the ordinary
     /// path for all other dtypes and converts only fp8 tensor views.
     pub fn from_file_with_fp8(path: impl AsRef<Path>) -> Result<Self> {
+        Self::from_file_with_fp8_filter(path, |_| true)
+    }
+
+    /// Load only the selected tensors from an fp8-capable safetensors file.
+    ///
+    /// Filtering happens on tensor names before any MLX array is created. Component-staged loaders
+    /// use this for fused checkpoints so a text-only phase never transiently materializes the
+    /// transformer or VAE.
+    pub fn from_file_with_fp8_filter(
+        path: impl AsRef<Path>,
+        mut include: impl FnMut(&str) -> bool,
+    ) -> Result<Self> {
         let file = std::fs::File::open(path.as_ref())?;
         // SAFETY: the mapping is read-only and remains alive until every borrowed
         // TensorView has been copied into MLX-owned array storage below.
@@ -64,6 +141,9 @@ impl Weights {
         })?;
         let mut tensors = HashMap::new();
         for (name, view) in safe.tensors() {
+            if !include(&name) {
+                continue;
+            }
             let shape: Vec<i32> = view
                 .shape()
                 .iter()
@@ -245,6 +325,27 @@ impl Weights {
         self.tensors.keys().map(String::as_str)
     }
 
+    /// Every stored key that has **not** been read through [`get`](Self::get)/[`require`](Self::require)
+    /// so far — the complement of `remove_accessed`'s tracking set. A loader-conformance test builds a
+    /// candidate weight map, constructs the model against it, then asserts this is empty to prove no
+    /// tensor was silently ignored (sc-18758: e.g. a config that says `ff_bias:false` must not merely
+    /// skip *requiring* the bias — a test wants to also confirm nothing else in the map went unread).
+    pub fn unused_keys(&self) -> Vec<&str> {
+        let accessed = self.accessed.borrow();
+        self.tensors
+            .keys()
+            .map(String::as_str)
+            .filter(|k| !accessed.contains(*k))
+            .collect()
+    }
+
+    /// Consume the container into its raw tensor map (drops metadata and access bookkeeping).
+    /// The logical-weight reader uses this to unify the ordinary lazy loader with its fp8-view
+    /// loader, which never has metadata to begin with.
+    pub fn into_tensors(self) -> HashMap<String, Array> {
+        self.tensors
+    }
+
     pub fn len(&self) -> usize {
         self.tensors.len()
     }
@@ -317,8 +418,10 @@ mod tests {
 
     #[test]
     fn round_trip_file_with_metadata() {
-        let dir = std::env::temp_dir().join("mlx_gen_weights_test");
-        std::fs::create_dir_all(&dir).unwrap();
+        // Per-process scratch dir (matching `mlx_gen_appledouble_{pid}` below) — a fixed `$TMPDIR`
+        // name races a second concurrent `cargo test`.
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let path = dir.join("w.safetensors");
 
         let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
@@ -332,6 +435,29 @@ mod tests {
         assert!(w.require("blk.weight").is_ok());
         assert!(w.require("missing").is_err());
         assert_eq!(w.metadata("networkType"), Some("lokr"));
+    }
+
+    #[test]
+    fn fp8_capable_filter_materializes_only_selected_tensor_names() {
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
+        let path = dir.join("components.safetensors");
+        let text = Array::from_slice(&[1.0f32], &[1]);
+        let transformer = Array::from_slice(&[2.0f32], &[1]);
+        Array::save_safetensors(
+            vec![
+                ("text_encoder.weight", &text),
+                ("transformer.weight", &transformer),
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+
+        let weights =
+            Weights::from_file_with_fp8_filter(&path, |name| name.starts_with("text_encoder"))
+                .unwrap();
+        assert_eq!(weights.keys().collect::<Vec<_>>(), ["text_encoder.weight"]);
     }
 
     #[test]
@@ -378,8 +504,8 @@ mod tests {
     /// `[load_safetensors] Invalid json header length`. The sidecar must be skipped.
     #[test]
     fn from_dir_skips_appledouble_sidecar() {
-        let dir = std::env::temp_dir().join(format!("mlx_gen_appledouble_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
 
         let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
         Array::save_safetensors(
@@ -398,16 +524,14 @@ mod tests {
         let w = Weights::from_dir(&dir).expect("sidecar must be skipped, not loaded");
         assert_eq!(w.len(), 1);
         assert!(w.get("blk.weight").is_some());
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A genuinely corrupt *shard* still errors — and the message now names the file, which the bare
     /// mlx-c error (a C++ source location) did not.
     #[test]
     fn from_dir_error_names_the_offending_shard() {
-        let dir = std::env::temp_dir().join(format!("mlx_gen_bad_shard_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         std::fs::write(dir.join("model.safetensors"), [0x00, 0x05, 0x16, 0x07]).unwrap();
 
         let err = match Weights::from_dir(&dir) {
@@ -415,8 +539,6 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("model.safetensors"), "unexpected: {err}");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

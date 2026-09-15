@@ -2,7 +2,7 @@
 //!
 //! `#[ignore]`d — needs a real `stabilityai/stable-diffusion-3.5-large` snapshot (`SD3_LARGE_SNAPSHOT`,
 //! else the HF cache). Run:
-//!   cargo test -p mlx-gen-sd3 --release --test sequential_residency_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sd3 --release --test integration sequential_residency_real_weights:: -- --ignored --nocapture
 //!
 //! Same two claims as the SDXL / Z-Image A/Bs: (1) `Sequential` peaks LOWER than `Resident` because the
 //! TRIPLE text encoder (CLIP-L + CLIP-G + T5-XXL) is dropped (+ `clear_cache()`) before the MMDiT + VAE

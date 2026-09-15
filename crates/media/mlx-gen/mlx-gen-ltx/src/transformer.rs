@@ -30,21 +30,34 @@ use std::collections::HashMap;
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::fast::{layer_norm, rms_norm as fast_rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{
-    add, concatenate_axis, dequantize, divide, matmul, multiply, power, quantized_matmul, sigmoid,
-    subtract, tanh,
+    add, concatenate_axis, dequantize, divide, matmul, multiply, power, sigmoid, subtract, tanh,
 };
 use mlx_rs::transforms::checkpoint;
-use mlx_rs::transforms::compile::compile;
+use mlx_rs::transforms::compile::{compile, compile_retained};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::train::lora::LoraParams;
+use mlx_gen::attention::{AttentionBudget, AttentionPlan};
+use mlx_gen::block_residency::BlockPlan;
 
-use mlx_gen::nn::{gelu_tanh, linear};
+/// sc-18797's rung-4 loader-identity and bit-identity suite. A `#[path]` submodule rather than a
+/// `tests/` file because it observes the private loader surface (`AvBlocks`, `AvBlock`'s attentions)
+/// that AC2's output-invisible failure mode can only be caught on.
+#[cfg(test)]
+#[path = "transformer_rung4_tests.rs"]
+pub(crate) mod rung4_block_window_tests;
+use mlx_gen::train::lora::LoraParams;
+use mlx_gen::CancelFlag;
+
+use mlx_gen::nn::{gelu_tanh, linear, quantized_matmul_with_bias};
+use mlx_gen::qkv::{
+    self, AttnPrepSpec, QkNormSpec, QkvSource, RopeDtype, RopeSpec, RopeStyle, RopeTables,
+    RotationAxes,
+};
 use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{Error, Result};
 
 use crate::config::LtxConfig;
-use crate::rope::{apply_split_rotary_emb, precompute_split_freqs_cis};
+use crate::rope::precompute_split_freqs_cis;
 
 /// adaLN-single sinusoidal timestep projection width (PixArt `Timesteps`).
 const TIME_PROJ_DIM: i32 = 256;
@@ -102,7 +115,7 @@ impl Precision {
         }
     }
 
-    fn dtype(self) -> Dtype {
+    pub(crate) fn dtype(self) -> Dtype {
         match self.mode {
             Mode::DenseF32 | Mode::QuantF32 => Dtype::Float32,
             Mode::QuantBf16 => Dtype::Bfloat16,
@@ -118,7 +131,7 @@ impl Precision {
     /// cast). bf16 → `QuantBf16`; f32 preserves whether the base was kept packed (`QuantF32`) or
     /// dequantized to dense (`DenseF32`). Used by [`LtxDiT::cast_weights`] to flip the whole forward
     /// to bf16 activations once the leaves are cast.
-    fn with_compute_dtype(self, dtype: Dtype) -> Self {
+    pub(crate) fn with_compute_dtype(self, dtype: Dtype) -> Self {
         let mode = match dtype {
             Dtype::Bfloat16 => Mode::QuantBf16,
             _ if self.keep_quant() => Mode::QuantF32,
@@ -132,38 +145,155 @@ fn scalar(v: f32) -> Array {
     Array::from_slice(&[v], &[1])
 }
 
+const SITE_MODULATE: &str = "ltx::transformer::modulate";
+const SITE_GATED: &str = "ltx::transformer::gated";
+const SITE_GELU_FFN: &str = "ltx::transformer::gelu_ffn";
+
+fn modulate_impl(
+    (x, scale, shift): (&Array, &Array, &Array),
+) -> std::result::Result<Array, Exception> {
+    add(
+        &multiply(x, &add(scale, &scalar(1.0).as_dtype(scale.dtype())?)?)?,
+        shift,
+    )
+}
+
+fn gated_impl((x, out, gate): (&Array, &Array, &Array)) -> std::result::Result<Array, Exception> {
+    add(x, &multiply(out, gate)?)
+}
+
+fn gelu_ffn_impl(x: &Array) -> std::result::Result<Array, Exception> {
+    let dt = x.dtype();
+    let s = |v: f32| -> std::result::Result<Array, Exception> { scalar(v).as_dtype(dt) };
+    let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
+    let x3 = power(x, Array::from_int(3))?;
+    let inner = multiply(&add(x, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
+    let gate = add(&tanh(&inner)?, &s(1.0)?)?;
+    multiply(&multiply(x, &s(0.5)?)?, &gate)
+}
+
+struct LtxRetainedCompileGlue {
+    modulate: mlx_gen::nn::RetainedTernary,
+    gated: mlx_gen::nn::RetainedTernary,
+    gelu_ffn: mlx_gen::nn::RetainedUnary,
+}
+
+impl LtxRetainedCompileGlue {
+    fn new() -> Self {
+        Self {
+            modulate: mlx_gen::nn::RetainedTernary::new(compile_retained(modulate_impl, true)),
+            gated: mlx_gen::nn::RetainedTernary::new(compile_retained(gated_impl, true)),
+            gelu_ffn: mlx_gen::nn::RetainedUnary::new(compile_retained(gelu_ffn_impl, true)),
+        }
+    }
+}
+
+thread_local! {
+    static RETAINED_COMPILE_GLUE: RefCell<Option<LtxRetainedCompileGlue>> =
+        const { RefCell::new(None) };
+}
+
+fn with_retained_compile_glue<T>(
+    f: impl FnOnce(&mut LtxRetainedCompileGlue) -> std::result::Result<T, Exception>,
+) -> std::result::Result<T, Exception> {
+    mlx_gen::nn::prepare_retained_compilation_thread();
+    RETAINED_COMPILE_GLUE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        f(slot.get_or_insert_with(LtxRetainedCompileGlue::new))
+    })
+}
+
+/// Exercise every retained handle owned by the LTX transformer once for the release memory audit.
+#[doc(hidden)]
+pub fn exercise_retained_compile_inventory(input: &Array) -> Result<()> {
+    let output = with_retained_compile_glue(|compiled| {
+        compiled.modulate.call(SITE_MODULATE, (input, input, input))
+    })?;
+    output.eval()?;
+    drop(output);
+
+    let output = with_retained_compile_glue(|compiled| {
+        compiled.gated.call(SITE_GATED, (input, input, input))
+    })?;
+    output.eval()?;
+    drop(output);
+
+    let output =
+        with_retained_compile_glue(|compiled| compiled.gelu_ffn.call(SITE_GELU_FFN, input))?;
+    output.eval()?;
+    drop(output);
+    Ok(())
+}
+
 /// Load a non-Linear param (norm weight, scale-shift table) cast to the compute dtype.
 fn param(w: &Weights, key: &str, prec: Precision) -> Result<Array> {
     to_dtype(w.require(key)?, prec.dtype())
+}
+
+/// Add the learned keyframe absolute-position marker to single-pixel generated-keyframe tokens
+/// (sc-18758; reference `apply_keyframes_absolute_embedding`). Applied to the patchified video
+/// hidden states, immediately after `patchify_proj`. `embedding` is the model's `(1, inner_dim)`
+/// `keyframes_abs_pos_embedding` parameter (`None` for a model built without
+/// `use_keyframes_abs_pos_embedding`, matching `LTXModel._keyframes_embedding()`); `keyframes_mask`
+/// is `(B, T, 1)`, `> 0` marking a keyframe token (`None` = no token marked). Either `None` makes this
+/// an exact no-op — as does an embedding that is still zero-initialized (the loaded-but-untrained
+/// state). The DFR token loops (sc-18789, [`crate::dfr`] / the token-native pipeline paths) thread
+/// a real mask marking generated-keyframe slot tokens; grid paths with no slots pass `None`.
+fn apply_keyframes_embedding(
+    x: &Array,
+    embedding: Option<&Array>,
+    keyframes_mask: Option<&Array>,
+) -> Result<Array> {
+    let (Some(embedding), Some(mask)) = (embedding, keyframes_mask) else {
+        return Ok(x.clone());
+    };
+    let gate = mask
+        .gt(scalar(0.0f32).as_dtype(mask.dtype())?)?
+        .as_dtype(x.dtype())?;
+    let marker = multiply(&gate, &embedding.as_dtype(x.dtype())?)?;
+    Ok(add(x, &marker)?)
 }
 
 /// `x · (1 + scale) + shift` (adaLN modulation), broadcasting `scale`/`shift` `(B, S', dim)` over the
 /// token axis. One fused kernel when the sc-2963 glue toggle is on (the `1` is cast to `scale`'s dtype
 /// inside, as before — bit-identical and dtype-preserving).
 fn modulate(x: &Array, scale: &Array, shift: &Array) -> Result<Array> {
-    let f = |(x, sc, sh): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
-        add(
-            &multiply(x, &add(sc, &scalar(1.0).as_dtype(sc.dtype())?)?)?,
-            sh,
-        )
-    };
     if crate::compile_glue() {
-        Ok(compile(f, true)((x, scale, shift))?)
+        if mlx_gen::nn::retained_compilation_requested() {
+            Ok(with_retained_compile_glue(|compiled| {
+                compiled.modulate.call(SITE_MODULATE, (x, scale, shift))
+            })?)
+        } else {
+            mlx_gen::diagnostics::record_compile(
+                SITE_MODULATE,
+                mlx_gen::diagnostics::CompileDisposition::OneShot,
+            );
+            Ok(compile(modulate_impl, true)((x, scale, shift))?)
+        }
     } else {
-        Ok(f((x, scale, shift))?)
+        mlx_gen::diagnostics::record_fallback(SITE_MODULATE, "compiled_glue_disabled");
+        Ok(modulate_impl((x, scale, shift))?)
     }
 }
 
 /// Gated residual `x + out·gate` — one fused kernel (multiply + add) when the sc-2963 glue toggle is
 /// on; bit-identical to the eager `add(x, out·gate)`, dtype-preserving.
 fn gated(x: &Array, out: &Array, gate: &Array) -> Result<Array> {
-    let f = |(x, o, g): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
-        add(x, &multiply(o, g)?)
-    };
     if crate::compile_glue() {
-        Ok(compile(f, true)((x, out, gate))?)
+        if mlx_gen::nn::retained_compilation_requested() {
+            Ok(with_retained_compile_glue(|compiled| {
+                compiled.gated.call(SITE_GATED, (x, out, gate))
+            })?)
+        } else {
+            mlx_gen::diagnostics::record_compile(
+                SITE_GATED,
+                mlx_gen::diagnostics::CompileDisposition::OneShot,
+            );
+            Ok(compile(gated_impl, true)((x, out, gate))?)
+        }
     } else {
-        Ok(f((x, out, gate))?)
+        mlx_gen::diagnostics::record_fallback(SITE_GATED, "compiled_glue_disabled");
+        Ok(gated_impl((x, out, gate))?)
     }
 }
 
@@ -174,32 +304,37 @@ fn gated(x: &Array, out: &Array, gate: &Array) -> Result<Array> {
 /// `gelu_tanh`, so the eager path is byte-for-byte the previous behaviour.
 fn gelu_ffn(x: &Array) -> Result<Array> {
     if !crate::compile_glue() {
+        mlx_gen::diagnostics::record_fallback(SITE_GELU_FFN, "compiled_glue_disabled");
         return gelu_tanh(x);
     }
-    let f = |x_: &Array| -> std::result::Result<Array, Exception> {
-        let dt = x_.dtype();
-        let s = |v: f32| -> std::result::Result<Array, Exception> { scalar(v).as_dtype(dt) };
-        let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
-        let x3 = power(x_, Array::from_int(3))?;
-        let inner = multiply(&add(x_, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
-        let gate = add(&tanh(&inner)?, &s(1.0)?)?;
-        multiply(&multiply(x_, &s(0.5)?)?, &gate)
-    };
-    Ok(compile(f, true)(x)?)
+    if mlx_gen::nn::retained_compilation_requested() {
+        Ok(with_retained_compile_glue(|compiled| {
+            compiled.gelu_ffn.call(SITE_GELU_FFN, x)
+        })?)
+    } else {
+        mlx_gen::diagnostics::record_compile(
+            SITE_GELU_FFN,
+            mlx_gen::diagnostics::CompileDisposition::OneShot,
+        );
+        Ok(compile(gelu_ffn_impl, true)(x)?)
+    }
 }
 
-/// A Linear's base weight — dense or Q8-quantized, selected by [`Precision`] at load.
+/// A Linear's base weight — dense or Q8-quantized, selected by [`Precision`] at load. `b` is `None`
+/// only for the LTX-2.5 `ff_bias:false` FFN Linears (sc-18758) — every other Linear in the checkpoint
+/// (attention, patchify/proj_out, adaLN) always carries a bias in both 2.3 and 2.5 (the reference
+/// `attention_bias` check is hardcoded `True`), so `None` never appears there.
 #[derive(Clone)]
 enum LinearKind {
     Dense {
-        w: Array, // [out, in]
-        b: Array, // [out]
+        w: Array,         // [out, in]
+        b: Option<Array>, // [out]
     },
     Quant {
         q: Array,      // [out, in_packed] U32
         scales: Array, // [out, in/group]
         biases: Array,
-        b: Array,
+        b: Option<Array>,
         group: i32,
         bits: i32,
     },
@@ -208,7 +343,8 @@ enum LinearKind {
 impl LinearKind {
     fn forward(&self, x: &Array) -> Result<Array> {
         match self {
-            LinearKind::Dense { w, b } => linear(x, w, b),
+            LinearKind::Dense { w, b: Some(b) } => linear(x, w, b),
+            LinearKind::Dense { w, b: None } => Ok(matmul(x, w.t())?),
             LinearKind::Quant {
                 q,
                 scales,
@@ -216,10 +352,7 @@ impl LinearKind {
                 b,
                 group,
                 bits,
-            } => Ok(add(
-                &quantized_matmul(x, q, scales, biases, true, *group, *bits)?,
-                b,
-            )?),
+            } => quantized_matmul_with_bias(x, q, scales, biases, b.as_ref(), *group, *bits),
         }
     }
 
@@ -253,14 +386,18 @@ impl LinearKind {
         match self {
             LinearKind::Dense { w, b } => {
                 *w = to_dtype(w, dtype)?;
-                *b = to_dtype(b, dtype)?;
+                if let Some(b) = b {
+                    *b = to_dtype(b, dtype)?;
+                }
             }
             LinearKind::Quant {
                 scales, biases, b, ..
             } => {
                 *scales = to_dtype(scales, dtype)?;
                 *biases = to_dtype(biases, dtype)?;
-                *b = to_dtype(b, dtype)?;
+                if let Some(b) = b {
+                    *b = to_dtype(b, dtype)?;
+                }
             }
         }
         Ok(())
@@ -332,9 +469,27 @@ pub struct Linear {
 }
 
 impl Linear {
-    fn load(w: &Weights, prefix: &str, prec: Precision) -> Result<Self> {
+    /// Every Linear except the LTX-2.5 `ff_bias:false` FFN Linears carries a bias — see
+    /// [`load_with_bias`](Self::load_with_bias).
+    pub(crate) fn load(w: &Weights, prefix: &str, prec: Precision) -> Result<Self> {
+        Self::load_with_bias(w, prefix, prec, true)
+    }
+
+    /// Load with the bias tensor optionally absent (sc-18758: LTX-2.5's `ff_bias:false` FFN Linears
+    /// carry no `{prefix}.bias`). `has_bias:false` must not `require` a bias key that legitimately
+    /// doesn't exist in the checkpoint — and must not silently zero-fill a *missing* bias it should
+    /// have found, so this only ever skips the read when the caller (the FFN construction, gated on
+    /// `LtxConfig::ff_bias`/`audio_ff_bias`/`connector_ff_bias`) says the tensor was never shipped.
+    pub(crate) fn load_with_bias(
+        w: &Weights,
+        prefix: &str,
+        prec: Precision,
+        has_bias: bool,
+    ) -> Result<Self> {
         let dt = prec.dtype();
-        let b = to_dtype(w.require(&format!("{prefix}.bias"))?, dt)?;
+        let b = has_bias
+            .then(|| to_dtype(w.require(&format!("{prefix}.bias"))?, dt))
+            .transpose()?;
         let kind = match w.get(&format!("{prefix}.scales")) {
             Some(scales) => {
                 let q = w.require(&format!("{prefix}.weight"))?;
@@ -372,7 +527,7 @@ impl Linear {
         Ok(Linear { kind, lora: None })
     }
 
-    fn forward(&self, x: &Array) -> Result<Array> {
+    pub(crate) fn forward(&self, x: &Array) -> Result<Array> {
         let mut out = self.kind.forward(x)?;
         if let Some(stack) = &self.lora {
             let pass = stack.pass.get();
@@ -381,7 +536,6 @@ impl Linear {
                 // activation dtype (MLX promotes a bf16 factor against an f32 activation), the scale
                 // through a dtype-matched scalar so the multiply preserves the residual dtype (the
                 // reference's weak Python-float `scale·…`).
-                let r = ad.residual(x)?;
                 let ps = ad.pass_scale();
                 // A malformed adapter with an empty `pass_scale` would underflow `ps.len() - 1`
                 // (usize) into an out-of-bounds index → panic; use a checked access and surface a
@@ -394,7 +548,31 @@ impl Linear {
                             "ltx adapter: pass_scale must have at least one entry".to_string(),
                         )
                     })?;
-                out = add(&out, &multiply(&r, &scalar(s).as_dtype(r.dtype())?)?)?;
+                // sc-15265: LTX carries its own adapter stack rather than `AdaptableLinear`, so it
+                // needs the same two rules the shared seam now enforces (see
+                // `mlx_gen::adapters::AdaptableLinear::apply_adapters`):
+                //   * a `scale == 0` pass contributes nothing — skip it, so a disabled adapter (or a
+                //     pass the schedule turns off) leaves `out` byte-identical to the unadapted base;
+                //   * the residual is narrowed to `out`'s dtype BEFORE the add, so f32 factors over a
+                //     bf16 host cannot widen this Linear — and every op downstream of it — to f32.
+                // Unlike the shared seam, this loop carries NO training exemption (rule 0 there),
+                // even though the training factors installed by `set_train_lora` (`training.rs`'s
+                // `install_train_lora`, and the checkpointed block closure below) flow through here
+                // too. That is safe only because LTX training is **f32-only today**: `train_impl`
+                // hardcodes `let compute_dtype = Dtype::Float32` (sc-4942 — a bf16 activation cast
+                // was measured to decorrelate the gradient, so the worker's `train_dtype=bf16` is
+                // deliberately ignored), both install paths derive their factor dtype from it, and
+                // the only `cast_weights(Bfloat16)` callers are `#[cfg(test)]` harnesses. Host and
+                // factors are therefore both f32 and the narrowing cast is a no-op. Enabling the
+                // sc-4942 bf16 compute lever REQUIRES revisiting this: f32 factors would then meet
+                // a bf16 host here and the training residual would be narrowed — exactly what
+                // `AdaptableLinear::apply_adapters` exempts training from.
+                if s == 0.0 {
+                    continue;
+                }
+                let r = ad.residual(x)?;
+                let r = multiply(&r, &scalar(s).as_dtype(r.dtype())?)?;
+                out = add(&out, &r.as_dtype(out.dtype())?)?;
             }
         }
         Ok(out)
@@ -545,6 +723,11 @@ struct Attention {
     /// probability matrix. Training-only knob, set by [`set_sdpa_checkpoint`](Self::set_sdpa_checkpoint);
     /// `false` on the inference path (byte-identical to the pre-sc-4942 forward).
     ckpt_sdpa: bool,
+    /// Ladder rung 3 — bounded attention (sc-18797). [`AttentionBudget::UNBOUNDED`] is the load
+    /// default and takes the single fused-SDPA call, byte-identical to the pre-rung forward; the
+    /// chunk boundaries under a real budget come from the SHARED planner
+    /// (`gen_core::attention_budget`) via `mlx_gen::attention`, never from arithmetic here.
+    attn_budget: AttentionBudget,
 }
 
 impl Attention {
@@ -576,12 +759,18 @@ impl Attention {
             dim_head,
             eps,
             ckpt_sdpa: false,
+            attn_budget: AttentionBudget::UNBOUNDED,
         })
     }
 
     /// Toggle SDPA-segment gradient checkpointing (sc-4942). Training-only — see `ckpt_sdpa`.
     fn set_sdpa_checkpoint(&mut self, on: bool) {
         self.ckpt_sdpa = on;
+    }
+
+    /// Select ladder rung 3's score budget for this attention.
+    fn set_attention_budget(&mut self, budget: AttentionBudget) {
+        self.attn_budget = budget;
     }
 
     /// Cast the attention's frozen weights (q/k/v/out projections, optional gate, q/k RMSNorm
@@ -599,13 +788,9 @@ impl Attention {
         Ok(())
     }
 
-    /// `(B, S, inner)` → `(B, H, S, head_dim)`.
-    fn to_heads(&self, x: &Array) -> Result<Array> {
-        let sh = x.shape();
-        let (b, s) = (sh[0], sh[1]);
-        Ok(x.reshape(&[b, s, self.heads, self.dim_head])?
-            .transpose_axes(&[0, 2, 1, 3])?)
-    }
+    // The `(B, S, inner) → (B, H, S, head_dim)` head split that used to live here is now
+    // `qkv::prepare`'s stages 3 and 5 (SC-18319) — the identical `reshape → transpose_axes`, with
+    // the full-dim QK-norm placed before it and the rotation after it, exactly as below.
 
     /// `pe` rotates the query (and the key if `k_pe` is `None`); `k_pe` rotates the key separately
     /// (cross-modal: video-positioned q, audio-positioned k, or vice-versa). `pe == None` ⇒ no RoPE
@@ -619,18 +804,59 @@ impl Attention {
         k_pe: Option<(&Array, &Array)>,
     ) -> Result<Array> {
         let ctx = context.unwrap_or(x);
-        let q = fast_rms_norm(&self.to_q.forward(x)?, &self.q_norm, self.eps)?;
-        let k = fast_rms_norm(&self.to_k.forward(ctx)?, &self.k_norm, self.eps)?;
-        let v = self.to_v.forward(ctx)?;
 
-        let mut qh = self.to_heads(&q)?;
-        let mut kh = self.to_heads(&k)?;
-        let vh = self.to_heads(&v)?;
-        if let Some((cos, sin)) = pe {
-            qh = apply_split_rotary_emb(&qh, cos, sin)?;
-            let (kc, ks) = k_pe.unwrap_or((cos, sin));
-            kh = apply_split_rotary_emb(&kh, kc, ks)?;
-        }
+        // SC-18319 — the shared prologue. LTX is the family that forced two of the knobs to exist:
+        //
+        // * **knob 1's `FullDimPreSplit` arm** — `q_norm`/`k_norm` are RMSNorms over the whole
+        //   `heads · dim_head` projection, applied BEFORE the head split, not per-head after it.
+        //   Everything else in this tree except Wan normalizes per head, and the two reduce over
+        //   different widths, so this is not a placement detail.
+        // * **knob 6** — `k_pe` is an independent key position table (cross-modal attention
+        //   positions the query on the video stream and the key on the audio stream, or vice
+        //   versa); `k_pe == None` falls back to the query's table, exactly as before.
+        //
+        // Plus **knob 3** (`pe == None` ⇒ no rotation on either stream — text cross-attention) and
+        // **knob 2's `HalvesPaired` arm**, which is `rope::apply_split_rotary_emb` verbatim: the
+        // GPT-NeoX rotate-halves form over a **half**-width `[B, H, T, dim_head/2]` table through
+        // the shared `nn::rope_rotate`, computed in f32 and cast back.
+        //
+        // **Adapters.** LTX carries its LoRA on its OWN stack rather than the shared
+        // `AdaptableLinear` seam, so it is deliberately NOT routed through
+        // `qkv::FusedQkvProjection`: `to_q`/`to_k`/`to_v` stay three separate `forward` calls and
+        // every installed residual is applied exactly where it was before. The prologue below reads
+        // the three projection OUTPUTS, so it cannot observe — let alone drop — an adapter.
+        let spec = AttnPrepSpec::new(self.heads, self.dim_head)
+            .with_qk_norm(QkNormSpec::full_dim_pre_split(
+                &self.q_norm,
+                &self.k_norm,
+                self.eps,
+            ))
+            .with_rope(match pe {
+                Some((cos, sin)) => {
+                    let (kc, ks) = k_pe.unwrap_or((cos, sin));
+                    RopeSpec {
+                        style: RopeStyle::HalvesPaired,
+                        q: Some(RopeTables::new(cos, sin)),
+                        k: Some(RopeTables::new(kc, ks)),
+                        // Knob 12 — `rope::apply_split_rotary_emb` promotes the stream and the
+                        // tables to f32 and casts the RESULT back to the input dtype, so a bf16
+                        // DiT (production) keeps a bf16 SDPA.
+                        dtype: RopeDtype::RestoreInput,
+                        ..RopeSpec::default()
+                    }
+                }
+                None => RopeSpec::default(),
+            })
+            .with_rotation_axes(RotationAxes::HeadMajor);
+        let heads = qkv::prepare(
+            QkvSource::Separate {
+                q: &self.to_q.forward(x)?,
+                k: &self.to_k.forward(ctx)?,
+                v: &self.to_v.forward(ctx)?,
+            },
+            &spec,
+        )?;
+        let (qh, kh, vh) = (heads.q, heads.k, heads.v);
 
         // Match the reference's Python `1.0 / math.sqrt(dim_head)` (f64 → f32), not `d^-0.5` in f32.
         let scale = (1.0f64 / (self.dim_head as f64).sqrt()) as f32;
@@ -656,11 +882,24 @@ impl Attention {
                 .into_iter()
                 .next()
                 .ok_or_else(|| Error::Msg("ltx: checkpoint SDPA produced no output".into()))?
-        } else {
+        } else if self.attn_budget.is_unbounded() {
             match mask {
                 Some(m) => scaled_dot_product_attention(&qh, &kh, &vh, scale, m, None)?,
                 None => scaled_dot_product_attention(&qh, &kh, &vh, scale, None, None)?,
             }
+        } else {
+            // Ladder rung 3 (sc-18797). On MLX the saving is NOT a bounded score tensor — `fast::sdpa`
+            // is a fused Metal kernel that already streams them — it is the per-chunk `eval` cutting
+            // the lazy graph. See `mlx_gen::attention`'s module docs; the Candle magnitude (-32% on
+            // the denoise phase against -1.7% here) must NOT be carried across.
+            mlx_gen::attention::sdpa_budgeted_bhsd(
+                &qh,
+                &kh,
+                &vh,
+                scale,
+                mask,
+                AttentionPlan::budgeted(self.attn_budget),
+            )?
         };
         let sh = x.shape();
         let (b, s) = (sh[0], sh[1]);
@@ -710,10 +949,16 @@ struct FeedForward {
 }
 
 impl FeedForward {
-    fn load(w: &Weights, prefix: &str, prec: Precision) -> Result<Self> {
+    /// `bias` is the caller's [`LtxConfig::ff_bias`]/`audio_ff_bias`/`connector_ff_bias` — `true`
+    /// keeps both Linears biased (byte-identical to pre-sc-18758; this is 2.3 for all three, and 2.5
+    /// for `audio_ff_bias`/`connector_ff_bias` — the real 2.5 header carries no `audio_ff_bias` key,
+    /// so it stays the reference absent-key default `True`). `false` (2.5's **video** `ff_bias` only)
+    /// means neither `proj_in` nor `proj_out` carries a bias; see reference `FeedForward.__init__`,
+    /// which threads a single `bias` flag to both `net.0.proj` and `net.2`.
+    fn load(w: &Weights, prefix: &str, prec: Precision, bias: bool) -> Result<Self> {
         Ok(Self {
-            proj_in: Linear::load(w, &format!("{prefix}.proj_in"), prec)?,
-            proj_out: Linear::load(w, &format!("{prefix}.proj_out"), prec)?,
+            proj_in: Linear::load_with_bias(w, &format!("{prefix}.proj_in"), prec, bias)?,
+            proj_out: Linear::load_with_bias(w, &format!("{prefix}.proj_out"), prec, bias)?,
         })
     }
 
@@ -791,7 +1036,7 @@ impl VideoBlock {
         Ok(Self {
             attn1: Attention::load(w, &format!("{prefix}.attn1"), h, dh, eps, prec)?,
             attn2: Attention::load(w, &format!("{prefix}.attn2"), h, dh, eps, prec)?,
-            ff: FeedForward::load(w, &format!("{prefix}.ff"), prec)?,
+            ff: FeedForward::load(w, &format!("{prefix}.ff"), prec, cfg.ff_bias)?,
             scale_shift_table: param(w, &format!("{prefix}.scale_shift_table"), prec)?,
             prompt_scale_shift_table: param(
                 w,
@@ -938,10 +1183,10 @@ impl AdaLayerNormSingle {
         Ok((scale_shift, embedded))
     }
 
-    /// LoRA targets in diffusers naming: `emb.timestep_embedder.linear1/linear2` and `linear`. (A
-    /// trained file spelling the embedder `linear_1`/`linear_2` — the PixArt convention — does NOT
-    /// resolve here and is reported skipped, matching the reference `_normalize_ltx_lora_key`, which
-    /// has no such rename; the base checkpoint names them `linear1`/`linear2`.)
+    /// LoRA targets in the converted MLX naming: `emb.timestep_embedder.linear1/linear2` and
+    /// `linear`. The LTX-2.3 loader leaves PixArt-spelled `linear_1/linear_2` targets unresolved to
+    /// preserve its reference compatibility behavior; the strict LTX-2.5 loader aliases the
+    /// official published spellings to these base names before routing.
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut Linear> {
         match path {
             ["emb", "timestep_embedder", "linear1"] => Some(&mut self.ts_lin1),
@@ -1034,6 +1279,9 @@ pub struct LtxDiT {
     blocks: Vec<VideoBlock>,
     scale_shift_table: Array, // (2, inner)
     proj_out: Linear,
+    /// `(1, inner_dim)` keyframe absolute-position marker (sc-18758), `Some` only when
+    /// `cfg.use_keyframes_abs_pos_embedding` — the checkpoint carries no such tensor otherwise.
+    keyframes_embedding: Option<Array>,
     cfg: LtxConfig,
     prec: Precision,
     /// Per-stage SPLIT-RoPE table cache (F-048): the tables are constant across denoise steps.
@@ -1058,6 +1306,13 @@ impl LtxDiT {
             blocks,
             scale_shift_table: param(w, "scale_shift_table", prec)?,
             proj_out: Linear::load(w, "proj_out", prec)?,
+            // sc-18758: the checkpoint carries `keyframes_abs_pos_embedding` (1, inner_dim) iff the
+            // config flag is set — `require`, not `get`, so a config that says `true` but a checkpoint
+            // that omits the tensor is a load error, not a silent None.
+            keyframes_embedding: cfg
+                .use_keyframes_abs_pos_embedding
+                .then(|| param(w, "keyframes_abs_pos_embedding", prec))
+                .transpose()?,
             cfg: cfg.clone(),
             prec,
             rope_memo: RopeMemo::default(),
@@ -1139,6 +1394,9 @@ impl LtxDiT {
             b.cast_weights(dtype)?;
         }
         self.scale_shift_table = to_dtype(&self.scale_shift_table, dtype)?;
+        if let Some(kf) = &self.keyframes_embedding {
+            self.keyframes_embedding = Some(to_dtype(kf, dtype)?);
+        }
         self.prec = self.prec.with_compute_dtype(dtype);
         Ok(())
     }
@@ -1167,6 +1425,10 @@ impl LtxDiT {
         let coeff = self.cfg.adaln_embedding_coefficient;
 
         let x = self.patchify_proj.forward(&latent.as_dtype(dt)?)?;
+        // sc-18758/sc-18789: the DFR keyframe-slot marker. This video-only (2.3) preprocess never
+        // carries generated slots, so no mask — the AV token loops are the mask-threading path
+        // (see `apply_keyframes_embedding`).
+        let x = apply_keyframes_embedding(&x, self.keyframes_embedding.as_ref(), None)?;
 
         // adaLN-single timestep projection. The `× timestep_scale_multiplier` runs in the **input
         // dtype** (matching `denoise_av`, which feeds a latent-dtype timestep): the adaLN sinusoid
@@ -1456,6 +1718,10 @@ struct Stream {
     cross_gate_adaln: AdaLayerNormSingle,
     scale_shift_table: Array, // (2, inner) output head
     proj_out: Linear,
+    /// `(1, inner)` keyframe absolute-position marker (sc-18758) — the **video** stream only
+    /// (`_init_video`; the reference never builds this for the audio stream), `Some` only when
+    /// `cfg.use_keyframes_abs_pos_embedding`.
+    keyframes_embedding: Option<Array>,
     inner: i32,
     heads: i32,
     coeff: i32, // adaLN row count (9 gated)
@@ -1527,6 +1793,7 @@ impl Stream {
         timestep: &Array,
         context: &Array,
         positions: &Array,
+        keyframes_mask: Option<&Array>,
         rope_epoch: Option<u64>,
     ) -> Result<StreamPrep> {
         let dt = self.prec.dtype();
@@ -1534,6 +1801,11 @@ impl Stream {
         let (inner, coeff) = (self.inner, self.coeff);
 
         let x = self.patchify.forward(&latent.as_dtype(dt)?)?;
+        // sc-18758/sc-18789: the DFR keyframe-slot marker (video stream only;
+        // `self.keyframes_embedding` is always `None` for the audio stream). The DFR token loops
+        // thread a real `(B, S, 1)` mask marking generated-keyframe slot tokens; every other path
+        // passes `None`, which keeps this an exact no-op.
+        let x = apply_keyframes_embedding(&x, self.keyframes_embedding.as_ref(), keyframes_mask)?;
 
         // adaLN-single timestep projection (the `× ts_mult` runs in the input dtype; see the
         // video-only path's note — bf16 must round `bf16(σ·1000)` first).
@@ -1654,10 +1926,96 @@ fn av_ca_ada(
     ))
 }
 
+/// Attention controls for one AV-DiT evaluation.
+///
+/// STG perturbs only the two self-attention calls of selected blocks.  In
+/// particular, it must not turn a selected block into a no-op: text attention,
+/// cross-modal attention, and both feed-forward paths still run.  The modality
+/// pass takes the complementary form and suppresses only the two inter-modality
+/// attention calls at every block.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AvPerturbation {
+    skip_self_mask: u64,
+    isolate_modalities: bool,
+}
+
+impl AvPerturbation {
+    /// The ordinary, unperturbed AV-DiT evaluation.
+    pub const NONE: Self = Self {
+        skip_self_mask: 0,
+        isolate_modalities: false,
+    };
+
+    /// STG evaluation: skip video and audio self-attention at precisely these
+    /// transformer block indices.
+    pub const fn stg(skip_self_blocks: &'static [usize]) -> Self {
+        let mut mask = 0_u64;
+        let mut index = 0;
+        while index < skip_self_blocks.len() {
+            let block = skip_self_blocks[index];
+            if block < u64::BITS as usize {
+                mask |= 1_u64 << block;
+            }
+            index += 1;
+        }
+        Self {
+            skip_self_mask: mask,
+            isolate_modalities: false,
+        }
+    }
+
+    /// Runtime STG sibling used by typed validation overrides. LTX-2.5 has 48 blocks, so a u64
+    /// mask preserves the cheap `Copy` perturbation value while accepting a request-owned block
+    /// list instead of leaking it to manufacture a `'static` slice.
+    pub fn stg_blocks(skip_self_blocks: &[usize]) -> Result<Self> {
+        let mut mask = 0_u64;
+        for &block in skip_self_blocks {
+            if block >= u64::BITS as usize {
+                return Err(Error::Msg(format!(
+                    "LTX STG block {block} is outside the supported 0..{} range",
+                    u64::BITS
+                )));
+            }
+            mask |= 1_u64 << block;
+        }
+        Ok(Self {
+            skip_self_mask: mask,
+            isolate_modalities: false,
+        })
+    }
+
+    /// A modality-isolated evaluation, retaining self/text/FF processing while
+    /// suppressing both audio-to-video and video-to-audio attention calls.
+    pub const fn modality_isolated() -> Self {
+        Self {
+            skip_self_mask: 0,
+            isolate_modalities: true,
+        }
+    }
+
+    #[must_use]
+    const fn attention_plan(self, block_index: usize) -> AvAttentionPlan {
+        AvAttentionPlan {
+            run_self: block_index >= u64::BITS as usize
+                || self.skip_self_mask & (1_u64 << block_index) == 0,
+            run_cross_modal: !self.isolate_modalities,
+        }
+    }
+}
+
+/// The four attention calls that an [`AvBlock`] may execute.  Text attention
+/// and feed-forward are deliberately not represented because neither control
+/// is allowed to suppress them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AvAttentionPlan {
+    run_self: bool,
+    run_cross_modal: bool,
+}
+
 /// One AudioVideo transformer block: the video stack + the audio stack + bidirectional cross-modal
 /// attention (`BasicAVTransformerBlock`). Per-block order: video self+text-CA → audio self+text-CA →
 /// cross-modal (a2v updates video, v2a updates audio) → video FF → audio FF.
-struct AvBlock {
+pub(crate) struct AvBlock {
     // Video.
     attn1: Attention,
     attn2: Attention,
@@ -1681,7 +2039,12 @@ struct AvBlock {
 }
 
 impl AvBlock {
-    fn load(w: &Weights, prefix: &str, cfg: &LtxConfig, prec: Precision) -> Result<Self> {
+    pub(crate) fn load(
+        w: &Weights,
+        prefix: &str,
+        cfg: &LtxConfig,
+        prec: Precision,
+    ) -> Result<Self> {
         let eps = cfg.norm_eps as f32;
         let (vh, vdh) = (cfg.num_attention_heads, cfg.attention_head_dim);
         let (ah, adh) = (cfg.audio_num_attention_heads, cfg.audio_attention_head_dim);
@@ -1697,12 +2060,12 @@ impl AvBlock {
         Ok(Self {
             attn1: Attention::load(w, &format!("{prefix}.attn1"), vh, vdh, eps, prec)?,
             attn2: Attention::load(w, &format!("{prefix}.attn2"), vh, vdh, eps, prec)?,
-            ff: FeedForward::load(w, &format!("{prefix}.ff"), prec)?,
+            ff: FeedForward::load(w, &format!("{prefix}.ff"), prec, cfg.ff_bias)?,
             v_sst: param(w, &format!("{prefix}.scale_shift_table"), prec)?,
             v_pst: param(w, &format!("{prefix}.prompt_scale_shift_table"), prec)?,
             a_attn1: Attention::load(w, &format!("{prefix}.audio_attn1"), ah, adh, eps, prec)?,
             a_attn2: Attention::load(w, &format!("{prefix}.audio_attn2"), ah, adh, eps, prec)?,
-            a_ff: FeedForward::load(w, &format!("{prefix}.audio_ff"), prec)?,
+            a_ff: FeedForward::load(w, &format!("{prefix}.audio_ff"), prec, cfg.audio_ff_bias)?,
             a_sst: param(w, &format!("{prefix}.audio_scale_shift_table"), prec)?,
             a_pst: param(w, &format!("{prefix}.audio_prompt_scale_shift_table"), prec)?,
             // Cross-modal attns run at the audio inner dim (heads 32 × head_dim 64 = 2048).
@@ -1741,11 +2104,15 @@ impl AvBlock {
         sst: &Array,
         pst: &Array,
         a: &StreamArgs,
+        run_self: bool,
     ) -> Result<Array> {
-        let msa = ada_values(sst, a.ts_emb, 0, 3)?;
-        let norm = modulate(&rms_norm_noweight(x, self.eps)?, &msa[1], &msa[0])?;
-        let attn = attn1.forward(&norm, None, None, Some((a.cos, a.sin)), None)?;
-        let mut x = gated(x, &attn, &msa[2])?;
+        let mut x = x.clone();
+        if run_self {
+            let msa = ada_values(sst, a.ts_emb, 0, 3)?;
+            let norm = modulate(&rms_norm_noweight(&x, self.eps)?, &msa[1], &msa[0])?;
+            let attn = attn1.forward(&norm, None, None, Some((a.cos, a.sin)), None)?;
+            x = gated(&x, &attn, &msa[2])?;
+        }
 
         let p = ada_values(pst, a.prompt_ts, 0, 2)?;
         let context = modulate(a.context, &p[1], &p[0])?;
@@ -1771,17 +2138,26 @@ impl AvBlock {
         gated(x, &ff_out, &mlp[2])
     }
 
-    /// Joint forward: `(vx, ax)` in, `(vx, ax)` out.
-    fn forward(
+    /// Joint forward with the attention-level controls used by the dev sampler.
+    /// This controls calls inside a block, never whether an entire block runs.
+    fn forward_controlled(
         &self,
         vx: &Array,
         ax: &Array,
         v: &StreamArgs,
         a: &StreamArgs,
+        control: AvAttentionPlan,
     ) -> Result<(Array, Array)> {
         // Video / audio self-attention + text cross-attention.
-        let mut vx =
-            self.self_and_text(vx, &self.attn1, &self.attn2, &self.v_sst, &self.v_pst, v)?;
+        let mut vx = self.self_and_text(
+            vx,
+            &self.attn1,
+            &self.attn2,
+            &self.v_sst,
+            &self.v_pst,
+            v,
+            control.run_self,
+        )?;
         let mut ax = self.self_and_text(
             ax,
             &self.a_attn1,
@@ -1789,48 +2165,88 @@ impl AvBlock {
             &self.a_sst,
             &self.a_pst,
             a,
+            control.run_self,
         )?;
 
-        // Cross-modal attention — both directions read the pre-update rms_norm snapshots.
-        let vx_n3 = rms_norm_noweight(&vx, self.eps)?;
-        let ax_n3 = rms_norm_noweight(&ax, self.eps)?;
-        let (sca_a2v, sha_a2v, sca_v2a, sha_v2a, gate_v2a) = av_ca_ada(
-            &self.ca_audio_ss,
-            &self.ca_audio_gate,
-            a.cross_ss_ts,
-            a.cross_gate_ts,
-        )?;
-        let (scv_a2v, shv_a2v, scv_v2a, shv_v2a, gate_a2v) = av_ca_ada(
-            &self.ca_video_ss,
-            &self.ca_video_gate,
-            v.cross_ss_ts,
-            v.cross_gate_ts,
-        )?;
+        if control.run_cross_modal {
+            // Cross-modal attention — both directions read the pre-update rms_norm snapshots.
+            let vx_n3 = rms_norm_noweight(&vx, self.eps)?;
+            let ax_n3 = rms_norm_noweight(&ax, self.eps)?;
+            let (sca_a2v, sha_a2v, sca_v2a, sha_v2a, gate_v2a) = av_ca_ada(
+                &self.ca_audio_ss,
+                &self.ca_audio_gate,
+                a.cross_ss_ts,
+                a.cross_gate_ts,
+            )?;
+            let (scv_a2v, shv_a2v, scv_v2a, shv_v2a, gate_a2v) = av_ca_ada(
+                &self.ca_video_ss,
+                &self.ca_video_gate,
+                v.cross_ss_ts,
+                v.cross_gate_ts,
+            )?;
 
-        // Audio-to-Video: Q from video (video cross-PE), K/V from audio (audio cross-PE).
-        let a2v = self.a2v.forward(
-            &modulate(&vx_n3, &scv_a2v, &shv_a2v)?,
-            Some(&modulate(&ax_n3, &sca_a2v, &sha_a2v)?),
-            None,
-            Some((v.cross_cos, v.cross_sin)),
-            Some((a.cross_cos, a.cross_sin)),
-        )?;
-        vx = gated(&vx, &a2v, &gate_a2v)?;
+            // Audio-to-Video: Q from video (video cross-PE), K/V from audio (audio cross-PE).
+            let a2v = self.a2v.forward(
+                &modulate(&vx_n3, &scv_a2v, &shv_a2v)?,
+                Some(&modulate(&ax_n3, &sca_a2v, &sha_a2v)?),
+                None,
+                Some((v.cross_cos, v.cross_sin)),
+                Some((a.cross_cos, a.cross_sin)),
+            )?;
+            vx = gated(&vx, &a2v, &gate_a2v)?;
 
-        // Video-to-Audio: Q from audio (audio cross-PE), K/V from video (video cross-PE).
-        let v2a = self.v2a.forward(
-            &modulate(&ax_n3, &sca_v2a, &sha_v2a)?,
-            Some(&modulate(&vx_n3, &scv_v2a, &shv_v2a)?),
-            None,
-            Some((a.cross_cos, a.cross_sin)),
-            Some((v.cross_cos, v.cross_sin)),
-        )?;
-        ax = gated(&ax, &v2a, &gate_v2a)?;
+            // Video-to-Audio: Q from audio (audio cross-PE), K/V from video (video cross-PE).
+            let v2a = self.v2a.forward(
+                &modulate(&ax_n3, &sca_v2a, &sha_v2a)?,
+                Some(&modulate(&vx_n3, &scv_v2a, &shv_v2a)?),
+                None,
+                Some((a.cross_cos, a.cross_sin)),
+                Some((v.cross_cos, v.cross_sin)),
+            )?;
+            ax = gated(&ax, &v2a, &gate_v2a)?;
+        }
 
         // FeedForward.
         vx = self.feed_forward(&vx, &self.ff, &self.v_sst, v.ts_emb)?;
         ax = self.feed_forward(&ax, &self.a_ff, &self.a_sst, a.ts_emb)?;
         Ok((vx, ax))
+    }
+
+    /// The absent-audio block body (sc-18789): video self-attention + text cross-attention +
+    /// feed-forward. Per the reference block's `run_a2v = run_vx and audio is not None`, the
+    /// cross-modal attention (and its adaLN gate) is skipped entirely when the audio modality is
+    /// absent — not run against a placeholder stream.
+    fn forward_video_only_controlled(
+        &self,
+        vx: &Array,
+        v: &StreamArgs,
+        run_self: bool,
+    ) -> Result<Array> {
+        let vx = self.self_and_text(
+            vx,
+            &self.attn1,
+            &self.attn2,
+            &self.v_sst,
+            &self.v_pst,
+            v,
+            run_self,
+        )?;
+        self.feed_forward(&vx, &self.ff, &self.v_sst, v.ts_emb)
+    }
+
+    /// Audio-only sibling of [`Self::forward_video_only_controlled`]. With no video modality the cross-modal
+    /// attentions are absent, while audio self/text attention and audio FF remain executable.
+    fn forward_audio_only(&self, ax: &Array, a: &StreamArgs) -> Result<Array> {
+        let ax = self.self_and_text(
+            ax,
+            &self.a_attn1,
+            &self.a_attn2,
+            &self.a_sst,
+            &self.a_pst,
+            a,
+            true,
+        )?;
+        self.feed_forward(&ax, &self.a_ff, &self.a_sst, a.ts_emb)
     }
 
     /// LoRA key→module map for one AV block: the video self/text attns + ff, the audio analogues, and
@@ -1864,14 +2280,90 @@ impl AvBlock {
         self.ff.set_lora_pass(pass);
         self.a_ff.set_lora_pass(pass);
     }
+
+    fn set_sdpa_checkpoint(&mut self, on: bool) {
+        for attention in [
+            &mut self.attn1,
+            &mut self.attn2,
+            &mut self.a_attn1,
+            &mut self.a_attn2,
+            &mut self.a2v,
+            &mut self.v2a,
+        ] {
+            attention.set_sdpa_checkpoint(on);
+        }
+    }
+
+    /// Select ladder rung 3's score budget across **all six** attentions this block runs: the video
+    /// and audio self+text attentions and both cross-modal attentions. Bounding only the video half
+    /// would leave the audio branch's scores unbounded while the contract claimed the rung.
+    pub(crate) fn set_attention_budget(&mut self, budget: AttentionBudget) {
+        for attn in [
+            &mut self.attn1,
+            &mut self.attn2,
+            &mut self.a_attn1,
+            &mut self.a_attn2,
+            &mut self.a2v,
+            &mut self.v2a,
+        ] {
+            attn.set_attention_budget(budget);
+        }
+    }
+
+    /// The budget this block's attentions carry. Read from the video self-attention; the six are
+    /// written together by [`Self::set_attention_budget`], and
+    /// `every_attention_in_a_block_carries_the_selected_budget` pins that they stay in step.
+    pub(crate) fn attention_budget(&self) -> AttentionBudget {
+        self.attn1.attn_budget
+    }
 }
 
 /// The LTX-2.3 **AudioVideo** DiT (`LTXModel` with both stacks). Predicts `(video_velocity,
 /// audio_velocity)` from the two latent token streams + shared text conditioning.
+/// How the AvDiT's 48-block trunk is held — the intra-phase materialization axis
+/// ([`LoadShape`](mlx_gen::LoadShape)), independent of phase-level component residency.
+///
+/// This enum, not a boolean flag, is what the forward branches on. That is deliberate: rung 4's
+/// failure mode is output-invisible, so the streamed path must be **unrepresentable** alongside a
+/// resident stack rather than merely unselected. `Streamed` holds zero blocks, which is the entire
+/// rung — a variant that kept the `Vec` "just in case" would bound nothing while looking correct.
+pub(crate) enum AvBlocks {
+    /// The historical fast path: all `num_layers` blocks materialized and retained.
+    Resident(Vec<AvBlock>),
+    /// Rung 4: no blocks retained; each window rebuilds its own out of a fresh component view.
+    Streamed(crate::block_stream::LtxBlockStream),
+}
+
+impl AvBlocks {
+    /// Blocks actually held resident. `0` for a streamed stack — the property rung 4 buys.
+    pub(crate) fn resident_len(&self) -> usize {
+        match self {
+            Self::Resident(blocks) => blocks.len(),
+            Self::Streamed(_) => 0,
+        }
+    }
+
+    /// Blocks the stack RUNS, which a streamed stack still does in full.
+    pub(crate) fn n_blocks(&self) -> usize {
+        match self {
+            Self::Resident(blocks) => blocks.len(),
+            Self::Streamed(stream) => stream.n_blocks(),
+        }
+    }
+}
+
 pub struct AvDiT {
     video: Stream,
     audio: Stream,
-    blocks: Vec<AvBlock>,
+    blocks: AvBlocks,
+    /// Rung 4's window schedule. Unused by a resident stack. Carried as a `Cell` because `forward`
+    /// takes `&self` and the selected window is a per-request value, not a load-time one — the
+    /// selected value must be the executed one, or the calibration evidence describes a run that
+    /// never happened.
+    block_plan: Cell<BlockPlan>,
+    /// Checked at every window boundary by the shared driver, which reports a cancelled render as
+    /// [`Error::Canceled`] rather than a generic failure.
+    cancel: CancelFlag,
     /// Monotonic source of per-stage RoPE epoch tokens (sc-7141); see [`Self::next_rope_epoch`]. One
     /// counter for the whole joint DiT — the same token keys all four stream memos (video/audio ×
     /// self/cross), which are each constant across a stage's denoise steps.
@@ -1879,7 +2371,12 @@ pub struct AvDiT {
 }
 
 impl AvDiT {
-    pub fn from_weights(w: &Weights, cfg: &LtxConfig, prec: Precision) -> Result<Self> {
+    /// Build the two per-modality streams — the patchify/adaLN/output-head surface that stays
+    /// resident under every load shape. Split out of [`Self::from_weights`] so the deferred
+    /// constructor builds the **same** objects rather than a second transcription of them: a
+    /// streamed AvDiT must differ from a resident one in the block axis alone, or the bit-identity
+    /// AC would be comparing two different models.
+    fn streams(w: &Weights, cfg: &LtxConfig, prec: Precision) -> Result<(Stream, Stream)> {
         let video = Stream {
             patchify: Linear::load(w, "patchify_proj", prec)?,
             adaln: AdaLayerNormSingle::load(w, "adaln_single", prec)?,
@@ -1892,6 +2389,12 @@ impl AvDiT {
             cross_gate_adaln: AdaLayerNormSingle::load(w, "av_ca_a2v_gate_adaln_single", prec)?,
             scale_shift_table: param(w, "scale_shift_table", prec)?,
             proj_out: Linear::load(w, "proj_out", prec)?,
+            // sc-18758: video-stream-only marker; `require`d (not `get`) so a config that sets the
+            // flag but a checkpoint that omits the tensor is a load error, not a silent None.
+            keyframes_embedding: cfg
+                .use_keyframes_abs_pos_embedding
+                .then(|| param(w, "keyframes_abs_pos_embedding", prec))
+                .transpose()?,
             inner: cfg.inner_dim(),
             heads: cfg.num_attention_heads,
             coeff: cfg.adaln_embedding_coefficient,
@@ -1918,6 +2421,8 @@ impl AvDiT {
             cross_gate_adaln: AdaLayerNormSingle::load(w, "av_ca_v2a_gate_adaln_single", prec)?,
             scale_shift_table: param(w, "audio_scale_shift_table", prec)?,
             proj_out: Linear::load(w, "audio_proj_out", prec)?,
+            // The reference never builds a keyframe marker for the audio stream (`_init_video` only).
+            keyframes_embedding: None,
             inner: cfg.audio_inner_dim(),
             heads: cfg.audio_num_attention_heads,
             coeff: cfg.adaln_embedding_coefficient,
@@ -1932,15 +2437,143 @@ impl AvDiT {
             self_rope_memo: RopeMemo::default(),
             cross_rope_memo: RopeMemo::default(),
         };
+        Ok((video, audio))
+    }
+
+    /// The historical eager load: every block materialized and retained.
+    pub fn from_weights(w: &Weights, cfg: &LtxConfig, prec: Precision) -> Result<Self> {
+        let (video, audio) = Self::streams(w, cfg, prec)?;
         let blocks = (0..cfg.num_layers)
             .map(|i| AvBlock::load(w, &format!("transformer_blocks.{i}"), cfg, prec))
             .collect::<Result<Vec<_>>>()?;
+        let plan = BlockPlan::resident(blocks.len().max(1))?;
         Ok(Self {
             video,
             audio,
-            blocks,
+            blocks: AvBlocks::Resident(blocks),
+            block_plan: Cell::new(plan),
+            cancel: CancelFlag::default(),
             rope_epoch: Cell::new(0),
         })
+    }
+
+    /// Rung 4's load: build the resident stream surface from `w`, hold **zero** blocks, and rebuild
+    /// each one per window out of `stream` during the forward.
+    ///
+    /// `w` is still read for the patchify/adaLN/output-head tensors, which are small, are used on
+    /// every forward, and would cost a re-read per window for no residency saving. The 48-block
+    /// trunk — the part rung 4 exists to bound — is the only thing deferred.
+    pub fn from_weights_streamed(
+        w: &Weights,
+        cfg: &LtxConfig,
+        prec: Precision,
+        stream: crate::block_stream::LtxBlockStream,
+    ) -> Result<Self> {
+        if stream.n_blocks() != cfg.num_layers as usize {
+            return Err(Error::Msg(format!(
+                "ltx: the block stream declares {} blocks but the config declares {} — a plan built \
+                 from a desynchronized depth would silently skip or repeat layers",
+                stream.n_blocks(),
+                cfg.num_layers
+            )));
+        }
+        let (video, audio) = Self::streams(w, cfg, prec)?;
+        // Default to the tightest bound. A caller that selected a window carries it in the request
+        // and calls `set_transformer_window`; defaulting to `resident()` here would make an
+        // unconfigured streamed load silently run one all-covering window, which bounds nothing.
+        let plan = BlockPlan::new(stream.n_blocks(), 1)?;
+        Ok(Self {
+            video,
+            audio,
+            blocks: AvBlocks::Streamed(stream),
+            block_plan: Cell::new(plan),
+            cancel: CancelFlag::default(),
+            rope_epoch: Cell::new(0),
+        })
+    }
+
+    /// Select rung 4's window size for the requests that follow.
+    ///
+    /// Rejected on a resident stack rather than ignored: silently accepting a window on a stack that
+    /// cannot honour it is how a calibration record comes to describe a run that never happened.
+    pub fn set_transformer_window(&self, window: usize) -> Result<()> {
+        let AvBlocks::Streamed(stream) = &self.blocks else {
+            return Err(Error::Unsupported(
+                "ltx: a transformer window was selected on a resident block stack — rung 4 requires \
+                 a deferred-materialization load"
+                    .into(),
+            ));
+        };
+        self.block_plan
+            .set(BlockPlan::new(stream.n_blocks(), window)?);
+        Ok(())
+    }
+
+    /// The window plan the next forward will execute. Reported so a caller can prove the selected
+    /// window is the executed one.
+    pub fn block_plan(&self) -> BlockPlan {
+        self.block_plan.get()
+    }
+
+    /// Attach the request's cancel flag, checked at every window boundary.
+    pub fn set_cancel(&mut self, cancel: CancelFlag) {
+        self.cancel = cancel;
+    }
+
+    /// Select ladder rung 3's attention budget for the whole trunk.
+    ///
+    /// Both arms are load-bearing. On a resident stack the budget is written into the blocks that
+    /// already exist; on a streamed stack there are no blocks yet, so it is recorded on the stream
+    /// and replayed onto every block a window materializes. Setting only the first would leave the
+    /// rung-3 + rung-4 composition — the one the cost-order default actually produces, since rung 4
+    /// engages rung 3 — running unbounded attention with identical output.
+    pub fn set_attention_budget(&mut self, budget: mlx_gen::attention::AttentionBudget) {
+        match &mut self.blocks {
+            AvBlocks::Resident(blocks) => {
+                for block in blocks {
+                    block.set_attention_budget(budget);
+                }
+            }
+            AvBlocks::Streamed(stream) => stream.set_attention_budget(budget),
+        }
+    }
+
+    /// Training-only attention-segment checkpoint switch over the complete resident AV trunk.
+    /// Streamed trunks are inference-only and cannot carry trainable adapters.
+    pub(crate) fn set_sdpa_checkpoint(&mut self, on: bool) {
+        if let AvBlocks::Resident(blocks) = &mut self.blocks {
+            for block in blocks {
+                block.set_sdpa_checkpoint(on);
+            }
+        }
+    }
+
+    /// The budget the next forward will execute, read back from wherever it actually lives.
+    pub fn attention_budget(&self) -> mlx_gen::attention::AttentionBudget {
+        match &self.blocks {
+            AvBlocks::Resident(blocks) => blocks
+                .first()
+                .map(|block| block.attention_budget())
+                .unwrap_or(AttentionBudget::UNBOUNDED),
+            AvBlocks::Streamed(stream) => stream.attention_budget(),
+        }
+    }
+
+    /// Whether this AvDiT defers its block trunk. The loader-identity predicate: rung 4's failure is
+    /// invisible in output, so a caller that needs to know *which* loader it got asks here rather
+    /// than inferring it from a request flag it passed in.
+    pub fn is_block_streamed(&self) -> bool {
+        matches!(self.blocks, AvBlocks::Streamed(_))
+    }
+
+    /// Blocks held resident. `0` on a streamed stack — that is the entire rung.
+    pub fn resident_blocks(&self) -> usize {
+        self.blocks.resident_len()
+    }
+
+    /// Blocks the stack runs, streamed or not.
+    pub fn num_blocks(&self) -> usize {
+        self.blocks.n_blocks()
     }
 
     /// Issue a fresh per-stage RoPE epoch token (sc-7141). Call once at the top of a joint denoise loop
@@ -1958,14 +2591,21 @@ impl AvDiT {
     /// text attns, the two cross-modal attns, both stacks' feed-forwards, and every stream-global
     /// projection / adaLN-single (video + audio + the four `av_ca_*` cross modules). The module name
     /// itself selects the stream (`audio_*` / `av_ca_audio_*` / `av_ca_v2a_*` → audio). A target that
-    /// names no module (e.g. the PixArt-spelled adaLN embedder `linear_1/2`, or an out-of-range block)
-    /// resolves to `None` → reported skipped, never silently dropped.
+    /// names no module (e.g. an unnormalized PixArt-spelled adaLN embedder `linear_1/2`, or an
+    /// out-of-range block) resolves to `None` → reported skipped, never silently dropped. The strict
+    /// LTX-2.5 loader normalizes its official `linear_1/2` spellings before calling this resolver.
     pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut Linear> {
         match path {
-            ["transformer_blocks", n, rest @ ..] => self
-                .blocks
-                .get_mut(n.parse::<usize>().ok()?)?
-                .adaptable_mut(rest),
+            // A streamed trunk holds no blocks to adapt. `LtxBlockStream::new` already refuses to
+            // construct over a non-empty adapter set, so this arm is the second half of the same
+            // guarantee rather than a silent drop: there is no block object here that an adapter
+            // could be installed onto and then be rebuilt away by the next window.
+            ["transformer_blocks", n, rest @ ..] => match &mut self.blocks {
+                AvBlocks::Resident(blocks) => blocks
+                    .get_mut(n.parse::<usize>().ok()?)?
+                    .adaptable_mut(rest),
+                AvBlocks::Streamed(_) => None,
+            },
             // Video-stream globals.
             ["patchify_proj"] => Some(&mut self.video.patchify),
             ["proj_out"] => Some(&mut self.video.proj_out),
@@ -1998,23 +2638,19 @@ impl AvDiT {
     pub fn set_lora_pass(&self, pass: usize) {
         self.video.set_lora_pass(pass);
         self.audio.set_lora_pass(pass);
-        for b in &self.blocks {
-            b.set_lora_pass(pass);
+        // A streamed trunk carries no adapters (refused at `LtxBlockStream::new`), so there is no
+        // per-pass strength to select on it.
+        if let AvBlocks::Resident(blocks) = &self.blocks {
+            for b in blocks {
+                b.set_lora_pass(pass);
+            }
         }
     }
 
-    /// Joint velocity forward.
+    /// Ordinary, unperturbed joint velocity forward.
     ///
-    /// * `*_latent` — `(B, S, in_channels)` patchified tokens (video 128, audio 128).
-    /// * `*_timestep` — `(B, S)` per-token sigma.
-    /// * `*_context` — text embeddings (video 4096, audio 2048); `*_mask` their additive masks.
-    /// * `*_positions` — the position grids (video `(B,3,T,2)`, audio `(B,1,T,2)`).
-    ///
-    /// Returns `(video_velocity (B, S_v, 128), audio_velocity (B, S_a, 128))`.
-    ///
-    /// * `rope_epoch` — per-stage RoPE cache token (sc-7141): `Some(epoch)` from a denoise loop (see
-    ///   [`Self::next_rope_epoch`]) takes the O(1) memo fast path for all four stream tables; `None`
-    ///   falls back to the `positions`-content compare (behavior unchanged).
+    /// This is the compatibility path for distilled inference. Guided dev
+    /// evaluations opt into [`Self::forward_controlled`] explicitly.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -2028,13 +2664,61 @@ impl AvDiT {
         audio_context: &Array,
         audio_mask: Option<&Array>,
         audio_positions: &Array,
+        video_keyframes_mask: Option<&Array>,
         rope_epoch: Option<u64>,
+    ) -> Result<(Array, Array)> {
+        self.forward_controlled(
+            video_latent,
+            video_timestep,
+            video_context,
+            video_mask,
+            video_positions,
+            audio_latent,
+            audio_timestep,
+            audio_context,
+            audio_mask,
+            audio_positions,
+            video_keyframes_mask,
+            rope_epoch,
+            AvPerturbation::NONE,
+        )
+    }
+
+    /// Controlled joint velocity forward for STG and modality guidance.
+    ///
+    /// * `*_latent` — `(B, S, in_channels)` patchified tokens (video 128, audio 128).
+    /// * `*_timestep` — `(B, S)` per-token sigma.
+    /// * `*_context` — text embeddings (video 4096, audio 2048); `*_mask` their additive masks.
+    /// * `*_positions` — the position grids (video `(B,3,T,2)`, audio `(B,1,T,2)`).
+    ///
+    /// Returns `(video_velocity (B, S_v, 128), audio_velocity (B, S_a, 128))`.
+    ///
+    /// * `rope_epoch` — per-stage RoPE cache token (sc-7141): `Some(epoch)` from a denoise loop (see
+    ///   [`Self::next_rope_epoch`]) takes the O(1) memo fast path for all four stream tables; `None`
+    ///   falls back to the `positions`-content compare (behavior unchanged).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_controlled(
+        &self,
+        video_latent: &Array,
+        video_timestep: &Array,
+        video_context: &Array,
+        video_mask: Option<&Array>,
+        video_positions: &Array,
+        audio_latent: &Array,
+        audio_timestep: &Array,
+        audio_context: &Array,
+        audio_mask: Option<&Array>,
+        audio_positions: &Array,
+        video_keyframes_mask: Option<&Array>,
+        rope_epoch: Option<u64>,
+        perturbation: AvPerturbation,
     ) -> Result<(Array, Array)> {
         let vp = self.video.prepare(
             video_latent,
             video_timestep,
             video_context,
             video_positions,
+            video_keyframes_mask,
             rope_epoch,
         )?;
         let ap = self.audio.prepare(
@@ -2042,24 +2726,327 @@ impl AvDiT {
             audio_timestep,
             audio_context,
             audio_positions,
+            None,
             rope_epoch,
         )?;
-        let (mut vx, mut ax) = (vp.x.clone(), ap.x.clone());
+        let (vx0, ax0) = (vp.x.clone(), ap.x.clone());
         let (va, aa) = (vp.args(video_mask), ap.args(audio_mask));
-        for block in &self.blocks {
-            let (nv, na) = block.forward(&vx, &ax, &va, &aa)?;
-            vx = nv;
-            ax = na;
-        }
+        let (vx, ax) = match &self.blocks {
+            AvBlocks::Resident(blocks) => {
+                let (mut vx, mut ax) = (vx0, ax0);
+                for (index, block) in blocks.iter().enumerate() {
+                    let (nv, na) = block.forward_controlled(
+                        &vx,
+                        &ax,
+                        &va,
+                        &aa,
+                        perturbation.attention_plan(index),
+                    )?;
+                    vx = nv;
+                    ax = na;
+                }
+                (vx, ax)
+            }
+            AvBlocks::Streamed(stream) => {
+                // Rung 4. The schedule is the SHARED driver — window arithmetic, loop order,
+                // release discipline and the cancellation contract all live in
+                // `gen_core::block_window` via MLX's binding. Only the "rebuild AvBlock n" step is
+                // this family's, and it lives in `crate::block_stream`.
+                let plan = self.block_plan.get();
+                mlx_gen::block_residency::run_windowed(
+                    &plan,
+                    &self.cancel,
+                    (vx0, ax0),
+                    || stream.open(),
+                    |(mut vx, mut ax), view, range| {
+                        for index in range {
+                            let block = stream.materialize(view, index)?;
+                            let (nv, na) = block.forward_controlled(
+                                &vx,
+                                &ax,
+                                &va,
+                                &aa,
+                                perturbation.attention_plan(index),
+                            )?;
+                            vx = nv;
+                            ax = na;
+                            // `block` drops here: a window holds `window_size` blocks, never the
+                            // whole range's worth.
+                        }
+                        Ok((vx, ax))
+                    },
+                    // LOAD-BEARING on MLX: the carried activations are unevaluated graph nodes that
+                    // still reference this window's weights, so dropping before forcing evaluation
+                    // frees nothing — identical output, zero saving, silently.
+                    |(vx, ax): &(Array, Array)| {
+                        mlx_rs::transforms::eval([vx, ax]).map_err(Error::from)
+                    },
+                )?
+            }
+        };
         let v_vel = self.video.output_head(&vx, &vp.emb_ts)?;
         let a_vel = self.audio.output_head(&ax, &ap.emb_ts)?;
         Ok((v_vel, a_vel))
+    }
+
+    /// **Video-only** forward through the AV stack — the reference `LTXModel` called with
+    /// `audio=None` (the DFR temporal-round tile denoise, `dfr_pipeline`'s `audio=None` stage
+    /// call): the audio stream is skipped entirely and, per the reference block
+    /// (`run_a2v = run_vx and audio is not None`), the cross-modal attentions do not run — each
+    /// block reduces to video self-attention + text cross-attention + feed-forward.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_video_only(
+        &self,
+        video_latent: &Array,
+        video_timestep: &Array,
+        video_context: &Array,
+        video_mask: Option<&Array>,
+        video_positions: &Array,
+        video_keyframes_mask: Option<&Array>,
+        rope_epoch: Option<u64>,
+    ) -> Result<Array> {
+        self.forward_video_only_controlled(
+            video_latent,
+            video_timestep,
+            video_context,
+            video_mask,
+            video_positions,
+            video_keyframes_mask,
+            rope_epoch,
+            AvPerturbation::NONE,
+        )
+    }
+
+    /// Video-only Dev validation forward with STG self-attention controls. Modality isolation is a
+    /// no-op when audio is absent, while the supplied STG block mask remains fully executable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_video_only_controlled(
+        &self,
+        video_latent: &Array,
+        video_timestep: &Array,
+        video_context: &Array,
+        video_mask: Option<&Array>,
+        video_positions: &Array,
+        video_keyframes_mask: Option<&Array>,
+        rope_epoch: Option<u64>,
+        perturbation: AvPerturbation,
+    ) -> Result<Array> {
+        let vp = self.video.prepare(
+            video_latent,
+            video_timestep,
+            video_context,
+            video_positions,
+            video_keyframes_mask,
+            rope_epoch,
+        )?;
+        let va = vp.args(video_mask);
+        let vx = match &self.blocks {
+            AvBlocks::Resident(blocks) => {
+                let mut vx = vp.x.clone();
+                for (index, block) in blocks.iter().enumerate() {
+                    vx = block.forward_video_only_controlled(
+                        &vx,
+                        &va,
+                        perturbation.attention_plan(index).run_self,
+                    )?;
+                }
+                vx
+            }
+            AvBlocks::Streamed(stream) => {
+                let plan = self.block_plan.get();
+                mlx_gen::block_residency::run_windowed(
+                    &plan,
+                    &self.cancel,
+                    vp.x.clone(),
+                    || stream.open(),
+                    |mut vx, view, range| {
+                        for index in range {
+                            let block = stream.materialize(view, index)?;
+                            vx = block.forward_video_only_controlled(
+                                &vx,
+                                &va,
+                                perturbation.attention_plan(index).run_self,
+                            )?;
+                        }
+                        Ok(vx)
+                    },
+                    |vx: &Array| mlx_rs::transforms::eval([vx]).map_err(Error::from),
+                )?
+            }
+        };
+        self.video.output_head(&vx, &vp.emb_ts)
+    }
+
+    /// Audio-only flexible-training forward. The video stream and both cross-modal attentions are
+    /// skipped exactly as the upstream model does when `video=None`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_audio_only(
+        &self,
+        audio_latent: &Array,
+        audio_timestep: &Array,
+        audio_context: &Array,
+        audio_mask: Option<&Array>,
+        audio_positions: &Array,
+        rope_epoch: Option<u64>,
+    ) -> Result<Array> {
+        let ap = self.audio.prepare(
+            audio_latent,
+            audio_timestep,
+            audio_context,
+            audio_positions,
+            None,
+            rope_epoch,
+        )?;
+        let aa = ap.args(audio_mask);
+        let ax = match &self.blocks {
+            AvBlocks::Resident(blocks) => {
+                let mut ax = ap.x.clone();
+                for block in blocks {
+                    ax = block.forward_audio_only(&ax, &aa)?;
+                }
+                ax
+            }
+            AvBlocks::Streamed(stream) => {
+                let plan = self.block_plan.get();
+                mlx_gen::block_residency::run_windowed(
+                    &plan,
+                    &self.cancel,
+                    ap.x.clone(),
+                    || stream.open(),
+                    |mut ax, view, range| {
+                        for index in range {
+                            let block = stream.materialize(view, index)?;
+                            ax = block.forward_audio_only(&ax, &aa)?;
+                        }
+                        Ok(ax)
+                    },
+                    |ax: &Array| mlx_rs::transforms::eval([ax]).map_err(Error::from),
+                )?
+            }
+        };
+        self.audio.output_head(&ax, &ap.emb_ts)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stg_control_selects_only_configured_self_attention_block() {
+        // Mutation-sensitive for the SC-18759 block-28 row: changing either the
+        // actual block index passed by a resident/streamed loop or the selected
+        // index makes this fail. STG suppresses self attention only.
+        let control = AvPerturbation::stg(&[28]);
+        let before = control.attention_plan(27);
+        let target = control.attention_plan(28);
+        let after = control.attention_plan(29);
+
+        assert_eq!(
+            before,
+            AvAttentionPlan {
+                run_self: true,
+                run_cross_modal: true,
+            }
+        );
+        assert_eq!(
+            target,
+            AvAttentionPlan {
+                run_self: false,
+                run_cross_modal: true,
+            }
+        );
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn runtime_stg_override_selects_every_requested_block() {
+        let control = AvPerturbation::stg_blocks(&[3, 7]).unwrap();
+        assert!(!control.attention_plan(3).run_self);
+        assert!(!control.attention_plan(7).run_self);
+        assert!(control.attention_plan(28).run_self);
+    }
+
+    #[test]
+    fn modality_isolation_suppresses_only_cross_modal_attention() {
+        // This must remain distinct from STG: self/text/FF still execute at
+        // every block, while both A2V and V2A calls are skipped.
+        let normal = AvPerturbation::NONE.attention_plan(28);
+        let isolated = AvPerturbation::modality_isolated().attention_plan(28);
+        assert_eq!(
+            normal,
+            AvAttentionPlan {
+                run_self: true,
+                run_cross_modal: true,
+            }
+        );
+        assert_eq!(
+            isolated,
+            AvAttentionPlan {
+                run_self: true,
+                run_cross_modal: false,
+            }
+        );
+        assert_ne!(normal, isolated);
+    }
+
+    #[test]
+    fn controlled_path_uses_actual_indices_for_resident_and_streamed_blocks() {
+        // Structural mutation proof: the resident and streamed loops for both AV and video-only
+        // execution must derive their per-block calls from the materialized/enumerated `index`,
+        // not a fixed STG layer or a mode that silently becomes a whole-block skip.
+        let source = include_str!("transformer.rs");
+        // The literal appears once in this assertion itself; subtract that self-reference so the
+        // production count remains exact even though this file has multiple earlier test modules.
+        let production_index_uses = source
+            .matches("perturbation.attention_plan(index)")
+            .count()
+            .saturating_sub(1);
+        assert_eq!(
+            production_index_uses, 4,
+            "resident and streamed AV/video-only loops must all apply the actual block index"
+        );
+        assert!(
+            source.contains("if run_self {") && source.contains("if control.run_cross_modal {"),
+            "self and cross-modal calls must be independently controlled inside AvBlock"
+        );
+        assert!(
+            source.contains("let cross = attn2.forward") && source.contains("self.feed_forward"),
+            "STG/modality controls must retain text cross-attention and feed-forward"
+        );
+    }
+
+    /// sc-18789: the keyframe absolute-position marker lands on exactly the tokens the mask
+    /// marks — marked tokens shift by the embedding, unmarked tokens are bit-identical, and an
+    /// absent mask (or absent embedding) is an exact no-op.
+    #[test]
+    fn keyframes_embedding_applies_only_to_marked_tokens() {
+        use mlx_rs::ops::indexing::IndexOp;
+        struct CpuGuard(mlx_rs::Device);
+        impl Drop for CpuGuard {
+            fn drop(&mut self) {
+                mlx_rs::Device::set_default(&self.0);
+            }
+        }
+        let _cpu = CpuGuard(mlx_rs::Device::try_default().expect("default device"));
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[1, 3, 2]);
+        let emb = Array::from_slice(&[10.0f32, 20.0], &[1, 2]);
+        let mask = Array::from_slice(&[0.0f32, 1.0, 0.0], &[1, 3, 1]);
+        let out = apply_keyframes_embedding(&x, Some(&emb), Some(&mask)).unwrap();
+        let got: Vec<f32> = (0..3)
+            .flat_map(|t| (0..2).map(move |c| (t, c)))
+            .map(|(t, c)| out.index((0, t, c)).item::<f32>())
+            .collect();
+        assert_eq!(got, vec![1.0, 2.0, 13.0, 24.0, 5.0, 6.0]);
+        for out in [
+            apply_keyframes_embedding(&x, Some(&emb), None).unwrap(),
+            apply_keyframes_embedding(&x, None, Some(&mask)).unwrap(),
+        ] {
+            let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(&out, &x).unwrap()).unwrap();
+            assert_eq!(mlx_rs::ops::max(&d, None).unwrap().item::<f32>(), 0.0);
+        }
+    }
 
     #[test]
     fn rms_norm_noweight_matches_fresh_ones_and_caches() {
@@ -2296,13 +3283,37 @@ mod tests {
     /// A bare dense Linear (no bias contribution) for the residual-math gates.
     fn dense(w: Array) -> Linear {
         let out = w.shape()[0];
+        let dt = w.dtype();
         Linear {
             kind: LinearKind::Dense {
+                b: Some(Array::zeros::<f32>(&[out]).unwrap().as_dtype(dt).unwrap()),
                 w,
-                b: Array::zeros::<f32>(&[out]).unwrap(),
             },
             lora: None,
         }
+    }
+
+    /// The sc-15265 contract this crate's `Linear::forward` implements, spelled out independently
+    /// of the implementation: the residual is scaled in its own (promoted) dtype and then **cast to
+    /// the host output's dtype before the add**, so the host's dtype is what comes out.
+    fn want_adapted(base: &Array, resid: &Array, s: f32) -> Array {
+        let r = multiply(resid, scalar(s).as_dtype(resid.dtype()).unwrap()).unwrap();
+        add(base, r.as_dtype(base.dtype()).unwrap()).unwrap()
+    }
+
+    /// Bit-pattern (not value) equality — `array_eq` would accept `-0.0 == +0.0`.
+    fn bit_exact(got: &Array, want: &Array) -> bool {
+        if got.dtype() != want.dtype() || got.shape() != want.shape() {
+            return false;
+        }
+        let bits = |a: &Array| match a.dtype() {
+            Dtype::Bfloat16 | Dtype::Float16 => a.view::<u16>().unwrap(),
+            Dtype::Float32 => a.view::<u32>().unwrap(),
+            _ => a.clone(),
+        };
+        array_eq(bits(got), bits(want), false)
+            .unwrap()
+            .item::<bool>()
     }
 
     #[test]
@@ -2315,23 +3326,116 @@ mod tests {
         let b = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75], &[2, 2]);
         let base = dense(w.clone()).forward(&x).unwrap();
 
-        // scale 0 → bit-exact no-op (`out + 0·residual`).
+        // scale 0 → bit-exact no-op. sc-15265: the residual is SKIPPED, not added-as-zero (that
+        // stronger claim is what `disabled_ltx_adapters_residual_is_never_evaluated` gates; this
+        // fixture is all-f32 and so cannot tell the two apart on its own).
         let mut lin0 = dense(w.clone());
         lin0.push_lora(a.clone(), b.clone(), vec![0.0]);
-        assert!(array_eq(lin0.forward(&x).unwrap(), &base, false)
-            .unwrap()
-            .item::<bool>());
+        assert!(bit_exact(&lin0.forward(&x).unwrap(), &base));
 
-        // scale 0.5 → differs from base and equals `base + 0.5·(x·a)·b` exactly.
+        // scale 0.5 → differs from base and equals the sc-15265 contract exactly:
+        // `base + host_dtype(0.5 · (x·a)·b)`. NOT the pre-fix `add(&base, &resid)`, which promotes
+        // whenever the factors are wider than the host (this all-f32 fixture makes the two
+        // coincide — `dtype_narrowing_*` below is the leg that separates them).
         let mut lin1 = dense(w);
         lin1.push_lora(a.clone(), b.clone(), vec![0.5]);
         let got = lin1.forward(&x).unwrap();
         assert!(!array_eq(&got, &base, false).unwrap().item::<bool>());
-        let resid = multiply(matmul(matmul(&x, &a).unwrap(), &b).unwrap(), scalar(0.5)).unwrap();
-        let want = add(&base, &resid).unwrap();
+        let resid = matmul(matmul(&x, &a).unwrap(), &b).unwrap();
+        let want = want_adapted(&base, &resid, 0.5);
+        assert_eq!(got.dtype(), base.dtype());
         assert!(all_close(&got, &want, 1e-6, 1e-6, false)
             .unwrap()
             .item::<bool>());
+    }
+
+    // ── sc-15265: LTX carries its own adapter stack, so the shared seam's two rules are
+    // DUPLICATED in `Linear::forward`. The pair below is the runnable gate for that copy — the
+    // only other test that touches a zero pass-scale on real factors is
+    // `tests/lora_real_weights.rs::…`, which is `#[ignore]`d behind a 20 GB checkpoint. Both use
+    // cheap synthetic fixtures and no weights.
+
+    #[test]
+    fn dtype_narrowing_keeps_a_bf16_ltx_linear_bf16_under_f32_factors() {
+        // Rule 2. A bf16 host with f32 LoRA factors: `add(bf16, f32)` promotes, so pre-sc-15265
+        // this Linear — and every op downstream of it — silently became f32 the moment a LoRA was
+        // installed. Delete the `.as_dtype(out.dtype())` in `Linear::forward` and the dtype
+        // assertion below fails.
+        let w = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6], &[2, 3])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let x = Array::from_slice(&[1.0f32, -2.0, 0.5], &[1, 3])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        // f32 factors, left f32 on purpose — this is what the golden LoRA files ship.
+        let a = Array::from_slice(&[0.1f32, 0.2, 0.3, -0.1, -0.2, 0.4], &[3, 2]);
+        let b = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75], &[2, 2]);
+
+        let base = dense(w.clone()).forward(&x).unwrap();
+        assert_eq!(base.dtype(), Dtype::Bfloat16, "host output is bf16");
+
+        let mut lin = dense(w);
+        lin.push_lora(a.clone(), b.clone(), vec![0.75]);
+        let got = lin.forward(&x).unwrap();
+        assert_eq!(
+            got.dtype(),
+            Dtype::Bfloat16,
+            "installing an LTX adapter must not widen the host Linear's output dtype"
+        );
+        assert!(
+            !bit_exact(&got, &base),
+            "fixture check: the adapter must actually be live"
+        );
+        // The residual itself still promotes — only the hand-off to the host is narrowed.
+        let resid = matmul(matmul(&x, &a).unwrap(), &b).unwrap();
+        assert_eq!(resid.dtype(), Dtype::Float32);
+        assert!(
+            bit_exact(&got, &want_adapted(&base, &resid, 0.75)),
+            "forward must be base + bf16(0.75·residual)"
+        );
+    }
+
+    #[test]
+    fn disabled_ltx_adapters_residual_is_never_evaluated() {
+        // Rule 1. A pass whose scale is exactly 0 must be SKIPPED, not added as a zero — the
+        // distinction the all-f32 fixtures above cannot see, because casting an exact-zero
+        // residual is already bit-exact. An `INFINITY` factor makes the residual non-finite, so
+        // `Inf · 0.0 = NaN`: staying bit-exact to the unadapted base proves the residual was never
+        // formed. Delete the `if s == 0.0 { continue; }` in `Linear::forward` and this fails.
+        let w = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6], &[2, 3]);
+        let x = Array::from_slice(&[1.0f32, -2.0, 0.5], &[1, 3]);
+        let b = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75], &[2, 2]);
+        let base = dense(w.clone()).forward(&x).unwrap();
+
+        // LoRA with an Inf in `a`.
+        let a_inf = Array::from_slice(&[f32::INFINITY; 6], &[3, 2]);
+        let mut lin = dense(w.clone());
+        lin.push_lora(a_inf, b, vec![0.0]);
+        assert!(
+            bit_exact(&lin.forward(&x).unwrap(), &base),
+            "a zero-scale LTX LoRA pass must not evaluate its residual"
+        );
+
+        // LoKr with an Inf delta, and a per-pass schedule whose OFF pass must also skip.
+        let delta_inf = Array::from_slice(&[f32::INFINITY; 6], &[2, 3]);
+        let mut lin = dense(w);
+        lin.push_lokr(delta_inf, vec![0.0, 1.0]);
+        lin.set_lora_pass(0);
+        assert!(
+            bit_exact(&lin.forward(&x).unwrap(), &base),
+            "an OFF pass in a per-pass schedule must not evaluate its residual either"
+        );
+        lin.set_lora_pass(1);
+        assert!(
+            !lin.forward(&x)
+                .unwrap()
+                .is_finite()
+                .unwrap()
+                .all(None)
+                .unwrap()
+                .item::<bool>(),
+            "fixture check: the ON pass DOES evaluate the poisoned residual"
+        );
     }
 
     #[test]
@@ -2401,20 +3505,19 @@ mod tests {
         let delta = Array::from_slice(&[0.05f32, -0.1, 0.2, 0.15, -0.25, 0.3], &[2, 3]);
         let base = dense(w.clone()).forward(&x).unwrap();
 
-        // scale 0 → bit-exact no-op.
+        // scale 0 → bit-exact no-op (skipped outright, sc-15265).
         let mut lin0 = dense(w.clone());
         lin0.push_lokr(delta.clone(), vec![0.0]);
-        assert!(array_eq(lin0.forward(&x).unwrap(), &base, false)
-            .unwrap()
-            .item::<bool>());
+        assert!(bit_exact(&lin0.forward(&x).unwrap(), &base));
 
-        // scale 0.5 → `base + 0.5·x·ΔWᵀ` exactly, and differs from base.
+        // scale 0.5 → `base + host_dtype(0.5·x·ΔWᵀ)` (sc-15265), and differs from base.
         let mut lin = dense(w.clone());
         lin.push_lokr(delta.clone(), vec![0.5]);
         let got = lin.forward(&x).unwrap();
         assert!(!array_eq(&got, &base, false).unwrap().item::<bool>());
-        let resid = multiply(matmul(&x, delta.t()).unwrap(), scalar(0.5)).unwrap();
-        let want = add(&base, &resid).unwrap();
+        let resid = matmul(&x, delta.t()).unwrap();
+        let want = want_adapted(&base, &resid, 0.5);
+        assert_eq!(got.dtype(), base.dtype());
         assert!(all_close(&got, &want, 1e-6, 1e-6, false)
             .unwrap()
             .item::<bool>());
@@ -2447,11 +3550,144 @@ mod tests {
         lin.push_lokr(delta.clone(), vec![0.25]);
         let got = lin.forward(&x).unwrap();
 
-        let lora_r = multiply(matmul(matmul(&x, &a).unwrap(), &b).unwrap(), scalar(0.5)).unwrap();
-        let lokr_r = multiply(matmul(&x, delta.t()).unwrap(), scalar(0.25)).unwrap();
-        let want = add(add(&base, &lora_r).unwrap(), &lokr_r).unwrap();
+        // sc-15265: each residual is narrowed to the running output's dtype before ITS add, so the
+        // contract composes per-adapter (not "sum the residuals, then add once").
+        let after_lora = want_adapted(&base, &matmul(matmul(&x, &a).unwrap(), &b).unwrap(), 0.5);
+        let want = want_adapted(&after_lora, &matmul(&x, delta.t()).unwrap(), 0.25);
+        assert_eq!(got.dtype(), base.dtype());
         assert!(all_close(&got, &want, 1e-6, 1e-6, false)
             .unwrap()
             .item::<bool>());
+    }
+
+    // --- sc-18758: ff_bias / audio_ff_bias / connector_ff_bias, keyframes_abs_pos_embedding ---------
+
+    /// A minimal 2-linear FeedForward-shaped weights map: `proj_in`/`proj_out`, each `[4,4]` weight +
+    /// `[4]` bias — `with_bias:false` also skips inserting the bias tensors, matching a real LTX-2.5
+    /// checkpoint (the tensor is genuinely absent, not merely unread).
+    fn ff_weights(with_bias: bool) -> Weights {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "ff.proj_in.weight".to_string(),
+            Array::from_slice(
+                &[
+                    0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5,
+                    1.6,
+                ],
+                &[4, 4],
+            ),
+        );
+        m.insert(
+            "ff.proj_out.weight".to_string(),
+            Array::from_slice(
+                &[
+                    0.2f32, -0.1, 0.05, 0.15, -0.2, 0.3, 0.1, -0.05, 0.25, -0.15, 0.2, -0.1, 0.05,
+                    0.1, -0.2, 0.15,
+                ],
+                &[4, 4],
+            ),
+        );
+        if with_bias {
+            m.insert(
+                "ff.proj_in.bias".to_string(),
+                Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]),
+            );
+            m.insert(
+                "ff.proj_out.bias".to_string(),
+                Array::from_slice(&[0.5f32, -0.5, 0.25, -0.25], &[4]),
+            );
+        }
+        Weights::from_map(m)
+    }
+
+    /// Mutation test (sc-18758): flipping `ff_bias` genuinely changes the constructed parameter set —
+    /// not merely a defaulted-past flag. With a checkpoint that carries bias tensors, `bias:true` reads
+    /// and applies them (the forward differs from the bias-free result); `bias:false` never reads
+    /// `.bias` at all, so its `LinearKind` structurally omits the bias term (`Dense { b: None, .. }`)
+    /// even though the tensor was present in the source map — proving the flag, not the checkpoint
+    /// content, decides whether the bias parameter exists in the built module.
+    #[test]
+    fn ff_bias_flag_changes_constructed_params_and_forward() {
+        let prec = Precision::dense_f32(4, 64);
+        let w = ff_weights(true);
+        let x = Array::from_slice(&[1.0f32, -1.0, 0.5, 2.0], &[1, 4]);
+
+        let ff_biased = FeedForward::load(&w, "ff", prec, true).expect("bias:true loads");
+        let ff_unbiased = FeedForward::load(&w, "ff", prec, false).expect("bias:false loads");
+
+        // Structural: bias:false never installs a bias term, regardless of the source map.
+        assert!(matches!(
+            &ff_unbiased.proj_in.kind,
+            LinearKind::Dense { b: None, .. }
+        ));
+        assert!(matches!(
+            &ff_biased.proj_in.kind,
+            LinearKind::Dense { b: Some(_), .. }
+        ));
+
+        // Forward: the two constructions produce numerically different output on the same input —
+        // the flag is exercised, not defaulted past.
+        let out_biased = ff_biased.forward(&x).unwrap();
+        let out_unbiased = ff_unbiased.forward(&x).unwrap();
+        mlx_rs::transforms::eval([&out_biased, &out_unbiased]).unwrap();
+        assert!(
+            !array_eq(&out_biased, &out_unbiased, None)
+                .unwrap()
+                .item::<bool>(),
+            "ff_bias:true vs false must produce different output on a checkpoint with real bias values"
+        );
+    }
+
+    /// The other half of the mutation proof: `bias:false` on a checkpoint that genuinely carries no
+    /// `.bias` tensor (the real LTX-2.5 shape) must NOT `require` it — and `bias:true` on that same
+    /// checkpoint must error, proving the strict-loader contract (never silently zero-fill a bias that
+    /// was never shipped, never silently skip one the config says must be there).
+    #[test]
+    fn ff_bias_false_never_requires_an_absent_bias_tensor() {
+        let prec = Precision::dense_f32(4, 64);
+        let w = ff_weights(false);
+
+        FeedForward::load(&w, "ff", prec, false).expect("bias:false must not require the tensor");
+        let err = FeedForward::load(&w, "ff", prec, true);
+        assert!(
+            err.is_err(),
+            "bias:true against a checkpoint with no `.bias` tensor must error, not silently proceed"
+        );
+    }
+
+    #[test]
+    fn apply_keyframes_embedding_is_a_no_op_without_embedding_or_mask() {
+        let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[1, 2, 2]);
+        let embedding = Array::from_slice(&[10.0f32, 20.0], &[1, 2]);
+        let mask = Array::from_slice(&[1.0f32, 0.0], &[1, 2, 1]);
+
+        // No embedding configured (a pre-sc-18758 / 2.3 model) → exact passthrough.
+        let got = apply_keyframes_embedding(&x, None, Some(&mask)).unwrap();
+        mlx_rs::transforms::eval([&got, &x]).unwrap();
+        assert!(array_eq(&got, &x, None).unwrap().item::<bool>());
+
+        // Embedding configured but no mask supplied (a grid path with no generated slots) → exact
+        // passthrough.
+        let got2 = apply_keyframes_embedding(&x, Some(&embedding), None).unwrap();
+        mlx_rs::transforms::eval([&got2]).unwrap();
+        assert!(array_eq(&got2, &x, None).unwrap().item::<bool>());
+    }
+
+    #[test]
+    fn apply_keyframes_embedding_marks_only_gated_tokens() {
+        // (1, 2, 2): token 0 marked (mask>0), token 1 not.
+        let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[1, 2, 2]);
+        let embedding = Array::from_slice(&[10.0f32, 20.0], &[1, 2]);
+        let mask = Array::from_slice(&[1.0f32, 0.0], &[1, 2, 1]);
+
+        let got = apply_keyframes_embedding(&x, Some(&embedding), Some(&mask)).unwrap();
+        mlx_rs::transforms::eval([&got]).unwrap();
+        let out = got.as_slice::<f32>();
+        // Token 0 gets `x + embedding`.
+        assert!((out[0] - 11.0).abs() < 1e-6);
+        assert!((out[1] - 22.0).abs() < 1e-6);
+        // Token 1 (mask == 0) is untouched.
+        assert!((out[2] - 3.0).abs() < 1e-6);
+        assert!((out[3] - 4.0).abs() < 1e-6);
     }
 }

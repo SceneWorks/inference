@@ -12,7 +12,7 @@
 //! KREA_EDIT_LORA=D:\models\krea2-identity-edit.safetensors \
 //! KREA_EDIT_SOURCE=D:\fixtures\person.png \
 //! KREA_EDIT_DISTILLED=1 \
-//!   cargo test -p candle-gen-krea --release --features cuda --test edit_real_weights -- --ignored --nocapture
+//!   cargo test -p candle-gen-krea --release --features cuda --test integration edit_real_weights:: -- --ignored --nocapture
 //! ```
 //! `KREA_EDIT_DISTILLED=1` drives the CFG-free distilled **Turbo** edit (`krea_2_turbo_edit`, sc-11640:
 //! guidance forced to 0, ~8-step `turbo_schedule`) against the Turbo turnkey; unset (or `0`) drives the
@@ -24,6 +24,16 @@ use std::time::Instant;
 
 use candle_gen::gen_core::{AdapterKind, AdapterSpec, GenerationRequest, Image};
 use candle_gen_krea::pipeline::{load_components, load_edit_components, render_edit};
+
+/// Root for this suite's **deliberately persistent** artifacts. `KREA_SMOKE_ARTIFACT_DIR` points them
+/// somewhere durable; the `$TMPDIR` default is intentional and must NOT become a `tempfile`
+/// guard — these outputs outlive the test on purpose (rendered PNGs you open afterwards), so a guard
+/// would delete the very thing the test exists to produce (sc-17791).
+fn artifact_root() -> PathBuf {
+    std::env::var("KREA_SMOKE_ARTIFACT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir())
+}
 
 /// (std, distinct-level-count, mean horizontal-adjacent-|Δ|) — a coherent natural image has a broad
 /// histogram AND spatial smoothness; pure noise has a high adjacent Δ and flat std.
@@ -110,7 +120,7 @@ fn read_source(path: &PathBuf) -> Image {
 }
 
 fn save(img: &Image, name: &str) {
-    let dir = std::env::temp_dir().join("krea_edit_smoke");
+    let dir = artifact_root().join("krea_edit_smoke");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("{name}.png"));
     image::save_buffer(

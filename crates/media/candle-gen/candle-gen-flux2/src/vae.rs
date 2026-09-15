@@ -25,8 +25,11 @@ use candle_gen::candle_nn::{
 const GN_GROUPS: usize = 32;
 const GN_EPS: f64 = 1e-6;
 const BN_EPS: f64 = 1e-4;
-const BLOCK_OUT: [usize; 4] = [128, 256, 512, 512];
-const LATENT_CHANNELS: usize = 32;
+/// Channel width of each encoder/decoder stage. Public so a provider that decodes through this VAE
+/// (Lens) can publish its spatial scale from the stage count the decoder is actually built with.
+pub const BLOCK_OUT: [usize; 4] = [128, 256, 512, 512];
+/// Latent channels this autoencoder produces and consumes. Public for the same reason.
+pub const LATENT_CHANNELS: usize = 32;
 /// Decoder up_blocks have `layers_per_block + 1 = 3` resnets each.
 const DECODER_RESNETS: usize = 3;
 /// Encoder down_blocks have `layers_per_block = 2` resnets each.
@@ -389,18 +392,59 @@ impl Flux2Vae {
         })
     }
 
+    /// Recover the **raw 32-channel VAE latent** `[B, 32, 2h, 2w]` from packed transformer latents
+    /// `[B, 128, h, w]` (NCHW), using this VAE's own bn stats. Thin binding of
+    /// [`raw_latent_from_packed`] — see it for why the seam exists as a function at all.
+    pub fn raw_latent_from_packed(&self, packed: &Tensor) -> Result<Tensor> {
+        let packed = packed.to_device(self.bn_mean.device())?;
+        raw_latent_from_packed(&packed, &self.bn_std, &self.bn_mean)
+    }
+
     /// Decode packed transformer latents `[1, 128, lat_h, lat_w]` (NCHW) → RGB image `[1, 3, H, W]`
     /// in `[-1, 1]`. De-normalizes the bn-stats space, unpatchifies 128→32 (doubling spatial), then
     /// runs the standard AutoencoderKL decode.
     pub fn decode_packed(&self, packed: &Tensor) -> Result<Tensor> {
-        let packed = packed.to_dtype(DType::F32)?;
-        // De-normalize: x·std + mean (broadcast over [1,128,1,1]).
-        let denorm = packed
-            .broadcast_mul(&self.bn_std)?
-            .broadcast_add(&self.bn_mean)?;
-        let latents = unpatchify(&denorm)?; // [1, 32, 2h, 2w]
+        let latents = self.raw_latent_from_packed(packed)?; // [1, 32, 2h, 2w]
         let z = self.post_quant_conv.forward(&latents)?;
         self.decode(&z)
+    }
+
+    /// Decode with a bounded, overlap-blended upsampling tail. The attention-bearing middle is run
+    /// once over the complete latent (so the result preserves the full-image receptive field); only
+    /// the spatially-local upsampling tail is split into output-pixel tiles.
+    pub fn decode_packed_tiled(
+        &self,
+        packed: &Tensor,
+        tile_edge: u32,
+        overlap: u32,
+    ) -> Result<Tensor> {
+        let latents = self.raw_latent_from_packed(packed)?;
+        let z = self.post_quant_conv.forward(&latents)?;
+        let mut mid = self.conv_in.forward(&z)?;
+        mid = self.mid_resnet0.forward(&mid)?;
+        mid = self.mid_attn.forward(&mid)?;
+        mid = self.mid_resnet1.forward(&mid)?;
+
+        let cfg = candle_gen::gen_core::tiling::TilingConfig::spatial_only(
+            tile_edge as i32,
+            overlap as i32,
+        );
+        let mid = mid.unsqueeze(2)?;
+        let decoded = candle_gen::vae_tiling::decode_tiled(
+            candle_gen::gen_core::tiling::VaeTiling::QWEN_IMAGE,
+            "flux2 vae",
+            &mid,
+            &cfg,
+            |tile| -> candle_gen::candle_core::Result<Tensor> {
+                let mut h = tile.squeeze(2)?;
+                for block in &self.up_blocks {
+                    h = block.forward(&h)?;
+                }
+                let h = self.conv_norm_out.forward(&h)?.silu()?;
+                self.conv_out.forward(&h)?.unsqueeze(2)
+            },
+        )?;
+        decoded.squeeze(2)
     }
 
     fn decode(&self, z: &Tensor) -> Result<Tensor> {
@@ -470,6 +514,76 @@ impl Flux2Vae {
             .forward(&latent.to_dtype(DType::F32)?)?;
         self.decode(&z)
     }
+
+    /// Decode an already-unpatchified raw latent with the same bounded upsampling-tail plan as
+    /// [`Self::decode_packed_tiled`]. This seam is for providers such as Ideogram whose transformer
+    /// owns a different 128-channel packing order: they must unpatchify themselves, but can still use
+    /// the FLUX.2 VAE's native, overlap-blended bounded decode without repacking through FLUX.2 order.
+    pub fn decode_latent_tiled(
+        &self,
+        latent: &Tensor,
+        tile_edge: u32,
+        overlap: u32,
+    ) -> Result<Tensor> {
+        let z = self
+            .post_quant_conv
+            .forward(&latent.to_dtype(DType::F32)?)?;
+        let mut mid = self.conv_in.forward(&z)?;
+        mid = self.mid_resnet0.forward(&mid)?;
+        mid = self.mid_attn.forward(&mid)?;
+        mid = self.mid_resnet1.forward(&mid)?;
+        let cfg = candle_gen::gen_core::tiling::TilingConfig::spatial_only(
+            tile_edge as i32,
+            overlap as i32,
+        );
+        let mid = mid.unsqueeze(2)?;
+        candle_gen::vae_tiling::decode_tiled(
+            candle_gen::gen_core::tiling::VaeTiling::QWEN_IMAGE,
+            "flux2 vae raw latent",
+            &mid,
+            &cfg,
+            |tile| -> candle_gen::candle_core::Result<Tensor> {
+                let mut h = tile.squeeze(2)?;
+                for block in &self.up_blocks {
+                    h = block.forward(&h)?;
+                }
+                let h = self.conv_norm_out.forward(&h)?.silu()?;
+                self.conv_out.forward(&h)?.unsqueeze(2)
+            },
+        )?
+        .squeeze(2)
+    }
+}
+
+/// Recover the **raw 32-channel VAE latent** `[B, 32, 2h, 2w]` from packed transformer latents
+/// `[B, 128, h, w]` (NCHW) and a pair of bn stats: de-normalize (`x·std + mean`, broadcast over
+/// `[1, 128, 1, 1]`) then 2×2 unpatchify.
+///
+/// This is the VAE-owned seam separating the transformer's normalized, patchified 128-channel working
+/// space from the true latent space the encoder/decoder are defined over — the two transforms the
+/// module docs list as FLUX.2's only departures from a plain AutoencoderKL.
+///
+/// It is a **free function over explicit stats**, rather than only a method, because a second consumer
+/// needs exactly this tensor and nothing after it: `crate::preview` projects the raw 32-channel latent
+/// to RGB, and the epic-16624 fit it reuses is defined over this space and no other. Sharing one
+/// implementation is what keeps the preview's geometry from drifting from the decode's — a preview
+/// that de-normalized or unpatchified differently would produce a plausible but *wrong* picture rather
+/// than an error. Taking the stats as arguments additionally lets the seam be exercised weights-free:
+/// a `Flux2Vae` carries a ~55M-parameter decoder that a geometry test has no use for, while the stats
+/// are two `[1, 128, 1, 1]` tensors.
+///
+/// [`Flux2Vae::raw_latent_from_packed`] binds this to a loaded VAE's own stats and is what production
+/// calls; [`Flux2Vae::bn_stats`] is how a provider in a non-FLUX channel order gets the same pair.
+pub fn raw_latent_from_packed(
+    packed: &Tensor,
+    bn_std: &Tensor,
+    bn_mean: &Tensor,
+) -> Result<Tensor> {
+    let denorm = packed
+        .to_dtype(DType::F32)?
+        .broadcast_mul(bn_std)?
+        .broadcast_add(bn_mean)?;
+    unpatchify(&denorm) // [B, 32, 2h, 2w]
 }
 
 /// 2×2 unpatchify (NCHW): `[B, 128, h, w] → [B, 32, 2h, 2w]`. The 128 channel axis splits as

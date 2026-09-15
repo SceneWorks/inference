@@ -207,12 +207,8 @@ mod tests {
         candle_core::safetensors::save(&m, path).unwrap();
     }
 
-    fn scratch_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "candle_gen_weights_test_{tag}_{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&d);
+    fn scratch_dir(tmp: &tempfile::TempDir, tag: &str) -> PathBuf {
+        let d = tmp.path().join(format!("candle_gen_weights_test_{tag}"));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -221,7 +217,8 @@ mod tests {
     /// shard-aware path for F-037).
     #[test]
     fn from_files_merges_disjoint_shards() {
-        let dir = scratch_dir("merge");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = scratch_dir(&tmp, "merge");
         let a = dir.join("model-00001-of-00002.safetensors");
         let b = dir.join("model-00002-of-00002.safetensors");
         write_st(&a, "a.weight", 1.0);
@@ -243,7 +240,8 @@ mod tests {
     /// sam3/depth loaders enforce). A stray or mis-sharded file must not silently shadow real weights.
     #[test]
     fn from_files_errors_on_duplicate() {
-        let dir = scratch_dir("dup");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = scratch_dir(&tmp, "dup");
         let first = dir.join("a.safetensors");
         let last = dir.join("b.safetensors");
         write_st(&first, "shared", 10.0);
@@ -264,9 +262,8 @@ mod tests {
     #[test]
     fn from_file_filtered_keeps_only_matching_prefixes() {
         let dev = Device::Cpu;
-        let dir = std::env::temp_dir().join(format!("sdxl_weights_filter_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let file = dir.join("model.safetensors");
 
         let mut map = HashMap::new();
@@ -303,15 +300,14 @@ mod tests {
         );
         // Dropped: the unused text tower is never materialized.
         assert!(!w.contains("text_model.embeddings.token_embedding.weight"));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `from_files_filtered` unions the prefix-matched keys across shards (F-037 × F-010) and still
     /// drops the unmatched tower; a cross-shard duplicate is the same hard error as `from_files`.
     #[test]
     fn from_files_filtered_unions_shards_and_drops_unmatched() {
-        let dir = scratch_dir("filter_shards");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = scratch_dir(&tmp, "filter_shards");
         let a = dir.join("model-00001-of-00002.safetensors");
         let b = dir.join("model-00002-of-00002.safetensors");
         // Vision tensors split across two shards; a text-tower tensor (co-resident in shard b) that
@@ -351,7 +347,8 @@ mod tests {
     /// (sc-9050) policy `from_files` enforces, extended to the filtered/header-only path.
     #[test]
     fn from_files_filtered_errors_on_cross_shard_duplicate() {
-        let dir = scratch_dir("filter_dup");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = scratch_dir(&tmp, "filter_dup");
         let a = dir.join("model-00001-of-00002.safetensors");
         let b = dir.join("model-00002-of-00002.safetensors");
         // Same matched-prefix key in BOTH shards → must not silently last-file-wins.

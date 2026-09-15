@@ -1124,6 +1124,7 @@ mod tests {
                     image_path: PathBuf::from(format!("img{i}.png")),
                     caption: "1girl, silver hair".into(),
                     control_image_path: None,
+                    model_options: Default::default(),
                 })
                 .collect(),
             config: TrainingConfig {
@@ -2139,9 +2140,10 @@ mod tests {
         opt.step(&mut p, &grads).unwrap();
         eval(p.values()).unwrap();
 
-        let dir = std::env::temp_dir().join("mlxgen_anima_resume_roundtrip");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        // Per-process scratch dir: the `remove_dir_all` below would otherwise wipe a second
+        // concurrent `cargo test` process's fixtures out of the shared `$TMPDIR`.
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let stem = "anima_style";
         checkpoint::save_resume(&dir, stem, 4, 2, &opt, &p).unwrap();
 
@@ -2188,7 +2190,6 @@ mod tests {
             m <= 1e-6,
             "restored optimizer's next step diverged: max_rel {m:e}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The sc-10522 restore assertion. The guard passes when the checkpoint's factor surface matches the

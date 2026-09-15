@@ -71,9 +71,17 @@ impl QwenRope3d {
         // Step-cache hit: the same `(shapes, txt_seq)` as the previous call (every step of a denoise).
         if let Some((k_shapes, k_txt, tables)) = self.cache.borrow().as_ref() {
             if k_shapes.as_slice() == shapes && *k_txt == txt_seq {
+                mlx_gen::diagnostics::record_cache(
+                    "qwen_image::rope3d",
+                    mlx_gen::diagnostics::CacheDisposition::Hit,
+                );
                 return Ok(tables.clone());
             }
         }
+        mlx_gen::diagnostics::record_cache(
+            "qwen_image::rope3d",
+            mlx_gen::diagnostics::CacheDisposition::Miss,
+        );
         let (o0, o1, o2) = (
             self.omega(self.axes_dim[0]),
             self.omega(self.axes_dim[1]),

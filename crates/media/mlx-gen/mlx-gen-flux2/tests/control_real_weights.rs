@@ -2,7 +2,7 @@
 //! — needs the real `black-forest-labs/FLUX.2-dev` snapshot (~105 GB) **and** the
 //! `alibaba-pai/FLUX.2-dev-Fun-Controlnet-Union` checkpoint (~8 GB), both in the HF cache:
 //!
-//!   cargo test -p mlx-gen-flux2 --release --test control_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux2 --release --test integration control_real_weights:: -- --ignored --nocapture
 //!
 //! Proves the dev control vertical end to end: assemble a pre-quantized Q4 dev snapshot (shared with
 //! `dev_e2e_real_weights`), load it through the registry as `flux2_dev_control` with the control
@@ -22,8 +22,20 @@ use mlx_gen::{
 };
 use mlx_gen_flux2::{quantize_flux2_dit, quantize_flux2_text_encoder_dir};
 
+use crate::atomic_cache;
+
 const BITS: i32 = 4;
 const GROUP_SIZE: i32 = 64;
+
+/// Root for this suite's **deliberately persistent** artifacts. `MLX_GEN_FLUX2_PREQUANT_DIR` points them
+/// somewhere durable; the `$TMPDIR` default is intentional and must NOT become a `tempfile`
+/// guard — these outputs outlive the test on purpose (a pre-quantized snapshot the NEXT run is meant to reuse), so a guard
+/// would delete the very thing the test exists to produce (sc-17791).
+fn prequant_root() -> PathBuf {
+    std::env::var("MLX_GEN_FLUX2_PREQUANT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir())
+}
 
 fn snapshot() -> PathBuf {
     let p = std::env::var("MLX_GEN_FLUX2_DEV_SNAPSHOT").unwrap_or_else(|_| panic!("set MLX_GEN_FLUX2_DEV_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
@@ -41,36 +53,32 @@ fn control_checkpoint() -> PathBuf {
 /// pre-quantize the DiT + Mistral TE, symlink the unchanged VAE + tokenizer from the source.
 fn prequantized_dev_snapshot() -> PathBuf {
     let src = snapshot();
-    let dst = std::env::temp_dir().join(format!("mlx_gen_flux2_dev_prequant_q{BITS}"));
+    let dst = prequant_root().join(format!("mlx_gen_flux2_dev_prequant_q{BITS}"));
     if !dst
         .join("transformer/diffusion_pytorch_model.safetensors")
         .exists()
     {
         println!("pre-quantizing dev DiT → Q{BITS}…");
-        quantize_flux2_dit(
-            &src.join("transformer"),
-            &dst.join("transformer"),
-            BITS,
-            GROUP_SIZE,
-        )
-        .expect("pre-quantize dev DiT");
+        let final_dir = dst.join("transformer");
+        let staging =
+            atomic_cache::prepare_staging(&final_dir).expect("prepare dev DiT staging dir");
+        quantize_flux2_dit(&src.join("transformer"), &staging, BITS, GROUP_SIZE)
+            .expect("pre-quantize dev DiT");
+        atomic_cache::publish(&staging, &final_dir).expect("publish dev DiT");
     }
     if !dst.join("text_encoder/model.safetensors").exists() {
         println!("pre-quantizing dev Mistral TE → Q{BITS}…");
-        quantize_flux2_text_encoder_dir(
-            &src.join("text_encoder"),
-            &dst.join("text_encoder"),
-            BITS,
-            GROUP_SIZE,
-        )
-        .expect("pre-quantize dev TE");
+        let final_dir = dst.join("text_encoder");
+        let staging =
+            atomic_cache::prepare_staging(&final_dir).expect("prepare dev TE staging dir");
+        quantize_flux2_text_encoder_dir(&src.join("text_encoder"), &staging, BITS, GROUP_SIZE)
+            .expect("pre-quantize dev TE");
+        atomic_cache::publish(&staging, &final_dir).expect("publish dev TE");
     }
     for sub in ["vae", "tokenizer"] {
         let link = dst.join(sub);
-        if !link.exists() {
-            std::os::unix::fs::symlink(std::fs::canonicalize(src.join(sub)).unwrap(), &link)
-                .expect("symlink component");
-        }
+        let source = std::fs::canonicalize(src.join(sub)).expect("canonicalize component");
+        atomic_cache::symlink_or_reuse(&source, &link).expect("publish component symlink");
     }
     dst
 }

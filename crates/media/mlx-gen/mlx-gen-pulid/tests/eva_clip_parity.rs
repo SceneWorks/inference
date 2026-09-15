@@ -8,7 +8,7 @@
 //!   3. The EVA input transform (512²→336² float bicubic + normalize) matches torchvision.
 //!
 //! Run:
-//!   cargo test -p mlx-gen-pulid --release --test eva_clip_parity -- --ignored --nocapture
+//!   cargo test -p mlx-gen-pulid --release --test integration eva_clip_parity:: -- --ignored --nocapture
 
 use mlx_gen::weights::Weights;
 use mlx_gen_pulid::eva_clip::{transform, EvaConfig, EvaVisionTransformer};

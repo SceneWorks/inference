@@ -6,7 +6,7 @@
 //! metadata). The fast test validates the template against those strings without any model; the
 //! ignored test validates real encoding.
 //!
-//! Run the encoding check: `cargo test -p mlx-gen-sensenova --test tokenizer_parity -- --ignored`
+//! Run the encoding check: `cargo test -p mlx-gen-sensenova --test integration tokenizer_parity:: -- --ignored`
 
 use std::path::PathBuf;
 

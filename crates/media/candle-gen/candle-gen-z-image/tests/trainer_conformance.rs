@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! set Z_IMAGE_SNAPSHOT=C:\Users\…\models--Tongyi-MAI--Z-Image-Turbo\snapshots\<hash>
-//! cargo test -p candle-gen-z-image --features cuda --release --test trainer_conformance -- --ignored --nocapture
+//! cargo test -p candle-gen-z-image --features cuda --release --test integration trainer_conformance:: -- --ignored --nocapture
 //! ```
 //!
 //! `trainer_conformance` constructs a fresh trainer per `train()`-invoking check (the cancellation
@@ -44,6 +44,7 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
             image_path: path,
             caption: format!("a solid colour swatch number {i}"),
             control_image_path: None,
+            model_options: Default::default(),
         });
     }
     items
@@ -53,7 +54,8 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
 #[ignore = "needs real Z-Image-Turbo weights (Z_IMAGE_SNAPSHOT or HF cache) + a CUDA GPU; run with --features cuda --ignored"]
 fn z_image_turbo_trainer_satisfies_gen_core_contract() {
     assert_eq!(candle_gen_z_image::MODEL_ID, "z_image_turbo");
-    let tmp = std::env::temp_dir().join("candle_z_image_trainer_conformance");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp.join("data"));
     let profile = TrainerProfile::cheap(items, tmp.join("out"));
     let snap = snapshot();

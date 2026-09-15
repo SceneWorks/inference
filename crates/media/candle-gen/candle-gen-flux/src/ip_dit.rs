@@ -19,7 +19,8 @@
 //! loads the same `flux1-{dev,schnell}.safetensors` the stock model does.
 
 use candle_core::{DType, IndexOp, Result, Tensor, D};
-use candle_nn::{LayerNorm, Linear, RmsNorm, VarBuilder};
+use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
+use candle_nn::{LayerNorm, RmsNorm, VarBuilder};
 
 pub use candle_transformers::models::flux::model::Config;
 
@@ -58,10 +59,33 @@ fn layer_norm(dim: usize, vb: VarBuilder) -> Result<LayerNorm> {
 /// [`candle_gen::sdpa_budgeted_flat`] (sc-9570) — which chunks once the `[N,Sq,Sk]` scores tensor would
 /// exceed [`candle_gen::ATTN_SCORES_BUDGET`] (the candle CUDA i32-index limit) — then reshapes back.
 /// scale = `1/sqrt(head_dim)`, `softmax_last_dim` closure keeps the exact fused softmax; each query row's
-/// softmax is independent, so the chunked result is byte-identical to the single pass. The FLUX.1 joint
+/// softmax is independent, so the chunked result is *mathematically* equal to the single pass — not
+/// bitwise equal, since narrowing the query axis changes the GEMM `M` and so may change the f32
+/// accumulation order (SC-15943). The FLUX.1 joint
 /// `[txt, img]` sequence at the largest advertised sizes trips the guard; the common sizes stay a single
 /// un-chunked pass. The vendored upstream SDPA is otherwise unchanged.
 pub(crate) fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+    scaled_dot_product_attention_planned(
+        q,
+        k,
+        v,
+        AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+            candle_gen::ATTN_SCORES_BUDGET as u64,
+            false,
+        )),
+    )
+    .map_err(|error| match error {
+        candle_gen::CandleError::Candle(error) => error,
+        other => candle_core::Error::Msg(other.to_string()),
+    })
+}
+
+pub(crate) fn scaled_dot_product_attention_planned(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    plan: AttentionPlan<'_>,
+) -> candle_gen::Result<Tensor> {
     let dim = q.dim(D::Minus1)?;
     let scale_factor = 1.0 / (dim as f64).sqrt();
     let mut batch_dims = q.dims().to_vec();
@@ -71,17 +95,17 @@ pub(crate) fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -
     let k = k.flatten_to(batch_dims.len() - 1)?;
     let v = v.flatten_to(batch_dims.len() - 1)?;
 
-    let attn = candle_gen::sdpa_budgeted_flat(
+    let attn = candle_gen::sdpa_planned_flat(
         &q,
         &k,
         &v,
         scale_factor,
         candle_nn::ops::softmax_last_dim,
-        candle_gen::ATTN_SCORES_BUDGET,
+        plan,
     )?; // [N, Sq, dim_v]
     batch_dims.push(attn.dim(D::Minus2)?);
     batch_dims.push(attn.dim(D::Minus1)?);
-    attn.reshape(batch_dims)
+    Ok(attn.reshape(batch_dims)?)
 }
 
 fn rope(pos: &Tensor, dim: usize, theta: usize) -> Result<Tensor> {
@@ -116,11 +140,17 @@ pub(crate) fn apply_rope(x: &Tensor, freq_cis: &Tensor) -> Result<Tensor> {
     (fr0.broadcast_mul(&x0)? + fr1.broadcast_mul(&x1)?)?.reshape(dims.to_vec())
 }
 
-pub(crate) fn attention(q: &Tensor, k: &Tensor, v: &Tensor, pe: &Tensor) -> Result<Tensor> {
+pub(crate) fn attention_planned(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    pe: &Tensor,
+    plan: AttentionPlan<'_>,
+) -> candle_gen::Result<Tensor> {
     let q = apply_rope(q, pe)?.contiguous()?;
     let k = apply_rope(k, pe)?.contiguous()?;
-    let x = scaled_dot_product_attention(&q, &k, v)?;
-    x.transpose(1, 2)?.flatten_from(2)
+    let x = scaled_dot_product_attention_planned(&q, &k, v, plan)?;
+    Ok(x.transpose(1, 2)?.flatten_from(2)?)
 }
 
 pub(crate) fn timestep_embedding(t: &Tensor, dim: usize, dtype: DType) -> Result<Tensor> {
@@ -148,6 +178,8 @@ pub(crate) struct EmbedNd {
     dim: usize,
     theta: usize,
     axes_dim: Vec<usize>,
+    #[cfg(test)]
+    forward_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl EmbedNd {
@@ -156,12 +188,23 @@ impl EmbedNd {
             dim,
             theta,
             axes_dim,
+            #[cfg(test)]
+            forward_calls: Default::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forward_calls(&self) -> usize {
+        self.forward_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
 impl candle_core::Module for EmbedNd {
     fn forward(&self, ids: &Tensor) -> Result<Tensor> {
+        #[cfg(test)]
+        self.forward_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let n_axes = ids.dim(D::Minus1)?;
         let mut emb = Vec::with_capacity(n_axes);
         for idx in 0..n_axes {
@@ -177,16 +220,61 @@ impl candle_core::Module for EmbedNd {
     }
 }
 
+/// Request-owned FLUX positional conditioning. The denoise latent changes every evaluation, but its
+/// token geometry and the text/image position ids do not.
+pub(crate) struct PreparedConditioning {
+    pub(crate) img_shape: Vec<usize>,
+    pub(crate) img_ids_shape: Vec<usize>,
+    pub(crate) txt_shape: Vec<usize>,
+    pub(crate) txt_ids_shape: Vec<usize>,
+    pub(crate) dtype: DType,
+    pub(crate) img_ids_dtype: DType,
+    pub(crate) txt_dtype: DType,
+    pub(crate) txt_ids_dtype: DType,
+    pub(crate) device: candle_core::DeviceLocation,
+    pub(crate) pe: Tensor,
+}
+
+impl PreparedConditioning {
+    pub(crate) fn validate(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+    ) -> candle_gen::Result<()> {
+        let matches = img.dims() == self.img_shape
+            && img_ids.dims() == self.img_ids_shape
+            && txt.dims() == self.txt_shape
+            && txt_ids.dims() == self.txt_ids_shape
+            && img.dtype() == self.dtype
+            && img_ids.dtype() == self.img_ids_dtype
+            && txt.dtype() == self.txt_dtype
+            && txt_ids.dtype() == self.txt_ids_dtype
+            && img.device().location() == self.device
+            && img_ids.device().location() == self.device
+            && txt.device().location() == self.device
+            && txt_ids.device().location() == self.device;
+        if !matches {
+            return Err(candle_gen::CandleError::Msg(
+                "flux: prepared conditioning geometry, dtype, or device does not match inputs"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct MlpEmbedder {
-    in_layer: Linear,
-    out_layer: Linear,
+    in_layer: QLinear,
+    out_layer: QLinear,
 }
 
 impl MlpEmbedder {
     fn new(in_sz: usize, h_sz: usize, vb: VarBuilder) -> Result<Self> {
-        let in_layer = candle_nn::linear(in_sz, h_sz, vb.pp("in_layer"))?;
-        let out_layer = candle_nn::linear(h_sz, h_sz, vb.pp("out_layer"))?;
+        let in_layer = QLinear::linear(in_sz, h_sz, vb.pp("in_layer"))?;
+        let out_layer = QLinear::linear(h_sz, h_sz, vb.pp("out_layer"))?;
         Ok(Self {
             in_layer,
             out_layer,
@@ -196,7 +284,7 @@ impl MlpEmbedder {
 
 impl candle_core::Module for MlpEmbedder {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        xs.apply(&self.in_layer)?.silu()?.apply(&self.out_layer)
+        self.out_layer.forward(&self.in_layer.forward(xs)?.silu()?)
     }
 }
 
@@ -238,12 +326,12 @@ impl ModulationOut {
 
 #[derive(Debug, Clone)]
 struct Modulation1 {
-    lin: Linear,
+    lin: QLinear,
 }
 
 impl Modulation1 {
     fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
-        let lin = candle_nn::linear(dim, 3 * dim, vb.pp("lin"))?;
+        let lin = QLinear::linear(dim, 3 * dim, vb.pp("lin"))?;
         Ok(Self { lin })
     }
 
@@ -266,12 +354,12 @@ impl Modulation1 {
 
 #[derive(Debug, Clone)]
 struct Modulation2 {
-    lin: Linear,
+    lin: QLinear,
 }
 
 impl Modulation2 {
     fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
-        let lin = candle_nn::linear(dim, 6 * dim, vb.pp("lin"))?;
+        let lin = QLinear::linear(dim, 6 * dim, vb.pp("lin"))?;
         Ok(Self { lin })
     }
 
@@ -408,7 +496,8 @@ impl DoubleStreamBlock {
         vec_: &Tensor,
         pe: &Tensor,
         ip: Option<(&FluxIpInjector, usize)>,
-    ) -> Result<(Tensor, Tensor)> {
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<(Tensor, Tensor)> {
         let (img_mod1, img_mod2) = self.img_mod.forward(vec_)?; // shift, scale, gate
         let (txt_mod1, txt_mod2) = self.txt_mod.forward(vec_)?; // shift, scale, gate
         let img_modulated = img.apply(&self.img_norm1)?;
@@ -426,7 +515,7 @@ impl DoubleStreamBlock {
         let k = Tensor::cat(&[txt_k, img_k], 2)?;
         let v = Tensor::cat(&[txt_v, img_v], 2)?;
 
-        let attn = attention(&q, &k, &v, pe)?;
+        let attn = attention_planned(&q, &k, &v, pe, attention_plan)?;
         let txt_attn = attn.narrow(1, 0, txt.dim(1)?)?;
         let img_attn = attn.narrow(1, txt.dim(1)?, attn.dim(1)? - txt.dim(1)?)?;
 
@@ -495,7 +584,13 @@ impl SingleStreamBlock {
         })
     }
 
-    fn forward(&self, xs: &Tensor, vec_: &Tensor, pe: &Tensor) -> Result<Tensor> {
+    fn forward(
+        &self,
+        xs: &Tensor,
+        vec_: &Tensor,
+        pe: &Tensor,
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<Tensor> {
         let mod_ = self.modulation.forward(vec_)?;
         let x_mod = mod_.scale_shift(&xs.apply(&self.pre_norm)?)?;
         let x_mod = self.linear1.forward(&x_mod)?;
@@ -508,11 +603,11 @@ impl SingleStreamBlock {
         let mlp = x_mod.narrow(D::Minus1, 3 * self.h_sz, self.mlp_sz)?;
         let q = q.apply(&self.norm.query_norm)?;
         let k = k.apply(&self.norm.key_norm)?;
-        let attn = attention(&q, &k, &v, pe)?;
+        let attn = attention_planned(&q, &k, &v, pe, attention_plan)?;
         let output = self
             .linear2
             .forward(&Tensor::cat(&[attn, mlp.gelu()?], 2)?)?;
-        xs + mod_.gate(&output)
+        Ok((xs + mod_.gate(&output)?)?)
     }
 }
 
@@ -520,14 +615,14 @@ impl SingleStreamBlock {
 struct LastLayer {
     norm_final: LayerNorm,
     linear: QLinear,
-    ada_ln_modulation: Linear,
+    ada_ln_modulation: QLinear,
 }
 
 impl LastLayer {
     fn new(h_sz: usize, p_sz: usize, out_c: usize, vb: VarBuilder) -> Result<Self> {
         let norm_final = layer_norm(h_sz, vb.pp("norm_final"))?;
         let linear = QLinear::linear_detect(h_sz, p_sz * p_sz * out_c, &vb, "linear", true)?;
-        let ada_ln_modulation = candle_nn::linear(h_sz, 2 * h_sz, vb.pp("adaLN_modulation.1"))?;
+        let ada_ln_modulation = QLinear::linear(h_sz, 2 * h_sz, vb.pp("adaLN_modulation.1"))?;
         Ok(Self {
             norm_final,
             linear,
@@ -549,7 +644,7 @@ impl LastLayer {
 /// The vendored FLUX DiT with the XLabs IP-Adapter seam — a fork of candle-transformers'
 /// `flux::model::Flux`. [`forward`](Self::forward) is the upstream `WithForward::forward` plus an
 /// optional [`FluxIpInjector`] threaded into the 19 double blocks.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IpFlux {
     img_in: QLinear,
     txt_in: QLinear,
@@ -557,33 +652,142 @@ pub struct IpFlux {
     vector_in: MlpEmbedder,
     guidance_in: Option<MlpEmbedder>,
     pe_embedder: EmbedNd,
-    double_blocks: Vec<DoubleStreamBlock>,
-    single_blocks: Vec<SingleStreamBlock>,
+    blocks: FluxBlocks,
     final_layer: LastLayer,
+    device: candle_core::Device,
+}
+
+#[derive(Clone)]
+enum FluxBlocks {
+    Resident {
+        double: Vec<DoubleStreamBlock>,
+        single: Vec<SingleStreamBlock>,
+    },
+    Streamed {
+        weights: VarBuilder<'static>,
+        config: Config,
+    },
 }
 
 impl IpFlux {
-    /// The number of XLabs-adapted double blocks (the IP adapter carries exactly this many K/V pairs).
-    pub fn num_double_blocks(&self) -> usize {
-        self.double_blocks.len()
+    pub(crate) fn prepare_conditioning(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+    ) -> candle_gen::Result<PreparedConditioning> {
+        let ids = Tensor::cat(&[txt_ids, img_ids], 1)?;
+        let pe = ids.apply(&self.pe_embedder)?;
+        Ok(PreparedConditioning {
+            img_shape: img.dims().to_vec(),
+            img_ids_shape: img_ids.dims().to_vec(),
+            txt_shape: txt.dims().to_vec(),
+            txt_ids_shape: txt_ids.dims().to_vec(),
+            dtype: img.dtype(),
+            img_ids_dtype: img_ids.dtype(),
+            txt_dtype: txt.dtype(),
+            txt_ids_dtype: txt_ids.dtype(),
+            device: img.device().location(),
+            pe,
+        })
     }
 
-    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    /// The number of XLabs-adapted double blocks (the IP adapter carries exactly this many K/V pairs).
+    pub fn num_double_blocks(&self) -> usize {
+        match &self.blocks {
+            FluxBlocks::Resident { double, .. } => double.len(),
+            FluxBlocks::Streamed { config, .. } => config.depth,
+        }
+    }
+
+    /// Walk the native BFL-layout FLUX.1 adapter surface. This includes the fused qkv/linear1
+    /// projections used by native BFL/ComfyUI LoRAs and all global embedders/modulation projections.
+    pub fn visit_adaptable_mut(
+        &mut self,
+        visitor: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        visitor("img_in", &mut self.img_in)?;
+        visitor("txt_in", &mut self.txt_in)?;
+        for (prefix, embedder) in [
+            ("time_in", &mut self.time_in),
+            ("vector_in", &mut self.vector_in),
+        ] {
+            visitor(&format!("{prefix}.in_layer"), &mut embedder.in_layer)?;
+            visitor(&format!("{prefix}.out_layer"), &mut embedder.out_layer)?;
+        }
+        if let Some(embedder) = &mut self.guidance_in {
+            visitor("guidance_in.in_layer", &mut embedder.in_layer)?;
+            visitor("guidance_in.out_layer", &mut embedder.out_layer)?;
+        }
+        match &mut self.blocks {
+            FluxBlocks::Resident { double, single } => {
+                for (index, block) in double.iter_mut().enumerate() {
+                    let prefix = format!("double_blocks.{index}");
+                    visitor(&format!("{prefix}.img_mod.lin"), &mut block.img_mod.lin)?;
+                    visitor(&format!("{prefix}.img_attn.qkv"), &mut block.img_attn.qkv)?;
+                    visitor(&format!("{prefix}.img_attn.proj"), &mut block.img_attn.proj)?;
+                    visitor(&format!("{prefix}.img_mlp.0"), &mut block.img_mlp.lin1)?;
+                    visitor(&format!("{prefix}.img_mlp.2"), &mut block.img_mlp.lin2)?;
+                    visitor(&format!("{prefix}.txt_mod.lin"), &mut block.txt_mod.lin)?;
+                    visitor(&format!("{prefix}.txt_attn.qkv"), &mut block.txt_attn.qkv)?;
+                    visitor(&format!("{prefix}.txt_attn.proj"), &mut block.txt_attn.proj)?;
+                    visitor(&format!("{prefix}.txt_mlp.0"), &mut block.txt_mlp.lin1)?;
+                    visitor(&format!("{prefix}.txt_mlp.2"), &mut block.txt_mlp.lin2)?;
+                }
+                for (index, block) in single.iter_mut().enumerate() {
+                    let prefix = format!("single_blocks.{index}");
+                    visitor(&format!("{prefix}.linear1"), &mut block.linear1)?;
+                    visitor(&format!("{prefix}.linear2"), &mut block.linear2)?;
+                    visitor(
+                        &format!("{prefix}.modulation.lin"),
+                        &mut block.modulation.lin,
+                    )?;
+                }
+            }
+            FluxBlocks::Streamed { .. } => {
+                candle_core::bail!(
+                    "FLUX adapters require resident transformer blocks; disable block streaming"
+                )
+            }
+        }
+        visitor("final_layer.linear", &mut self.final_layer.linear)?;
+        visitor(
+            "final_layer.adaLN_modulation.1",
+            &mut self.final_layer.ada_ln_modulation,
+        )
+    }
+
+    pub fn new(cfg: &Config, vb: VarBuilder<'static>) -> Result<Self> {
+        Self::new_with_blocks(cfg, vb, false)
+    }
+
+    pub(crate) fn new_block_streamed(cfg: &Config, vb: VarBuilder<'static>) -> Result<Self> {
+        Self::new_with_blocks(cfg, vb, true)
+    }
+
+    fn new_with_blocks(cfg: &Config, vb: VarBuilder<'static>, stream_blocks: bool) -> Result<Self> {
         let img_in = QLinear::linear_detect(cfg.in_channels, cfg.hidden_size, &vb, "img_in", true)?;
         let txt_in =
             QLinear::linear_detect(cfg.context_in_dim, cfg.hidden_size, &vb, "txt_in", true)?;
-        let mut double_blocks = Vec::with_capacity(cfg.depth);
-        let vb_d = vb.pp("double_blocks");
-        for idx in 0..cfg.depth {
-            let db = DoubleStreamBlock::new(cfg, vb_d.pp(idx))?;
-            double_blocks.push(db)
-        }
-        let mut single_blocks = Vec::with_capacity(cfg.depth_single_blocks);
-        let vb_s = vb.pp("single_blocks");
-        for idx in 0..cfg.depth_single_blocks {
-            let sb = SingleStreamBlock::new(cfg, vb_s.pp(idx))?;
-            single_blocks.push(sb)
-        }
+        let blocks = if stream_blocks {
+            FluxBlocks::Streamed {
+                weights: vb.clone(),
+                config: cfg.clone(),
+            }
+        } else {
+            let mut double = Vec::with_capacity(cfg.depth);
+            let vb_d = vb.pp("double_blocks");
+            for idx in 0..cfg.depth {
+                double.push(DoubleStreamBlock::new(cfg, vb_d.pp(idx))?);
+            }
+            let mut single = Vec::with_capacity(cfg.depth_single_blocks);
+            let vb_s = vb.pp("single_blocks");
+            for idx in 0..cfg.depth_single_blocks {
+                single.push(SingleStreamBlock::new(cfg, vb_s.pp(idx))?);
+            }
+            FluxBlocks::Resident { double, single }
+        };
         let time_in = MlpEmbedder::new(256, cfg.hidden_size, vb.pp("time_in"))?;
         let vector_in = MlpEmbedder::new(cfg.vec_in_dim, cfg.hidden_size, vb.pp("vector_in"))?;
         let guidance_in = if cfg.guidance_embed {
@@ -603,9 +807,9 @@ impl IpFlux {
             vector_in,
             guidance_in,
             pe_embedder,
-            double_blocks,
-            single_blocks,
+            blocks,
             final_layer,
+            device: vb.device().clone(),
         })
     }
 
@@ -629,8 +833,98 @@ impl IpFlux {
         guidance: Option<&Tensor>,
         ip: Option<&FluxIpInjector>,
     ) -> Result<Tensor> {
+        self.forward_with_memory(
+            img,
+            img_ids,
+            txt,
+            txt_ids,
+            timesteps,
+            y,
+            guidance,
+            ip,
+            AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+                candle_gen::ATTN_SCORES_BUDGET as u64,
+                false,
+            )),
+            self.num_double_blocks()
+                + match &self.blocks {
+                    FluxBlocks::Resident { single, .. } => single.len(),
+                    FluxBlocks::Streamed { config, .. } => config.depth_single_blocks,
+                },
+            &candle_gen::gen_core::CancelFlag::default(),
+        )
+        .map_err(|error| match error {
+            candle_gen::CandleError::Candle(error) => error,
+            other => candle_core::Error::Msg(other.to_string()),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_with_memory(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        y: &Tensor,
+        guidance: Option<&Tensor>,
+        ip: Option<&FluxIpInjector>,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> candle_gen::Result<Tensor> {
         self.forward_core(
-            img, img_ids, txt, txt_ids, timesteps, y, guidance, ip, None, None,
+            img,
+            img_ids,
+            txt,
+            txt_ids,
+            timesteps,
+            y,
+            guidance,
+            ip,
+            None,
+            None,
+            attention_plan,
+            transformer_window,
+            cancel,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_prepared_with_memory(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        y: &Tensor,
+        guidance: Option<&Tensor>,
+        ip: Option<&FluxIpInjector>,
+        injector: Option<&dyn DitImageInjector>,
+        control: Option<(&[Tensor], f64)>,
+        prepared: &PreparedConditioning,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> candle_gen::Result<Tensor> {
+        self.forward_core(
+            img,
+            img_ids,
+            txt,
+            txt_ids,
+            timesteps,
+            y,
+            guidance,
+            ip,
+            injector,
+            control,
+            attention_plan,
+            transformer_window,
+            cancel,
+            Some(prepared),
         )
     }
 
@@ -659,7 +953,60 @@ impl IpFlux {
         injector: Option<&dyn DitImageInjector>,
     ) -> Result<Tensor> {
         self.forward_core(
-            img, img_ids, txt, txt_ids, timesteps, y, guidance, None, injector, None,
+            img,
+            img_ids,
+            txt,
+            txt_ids,
+            timesteps,
+            y,
+            guidance,
+            None,
+            injector,
+            None,
+            AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+                candle_gen::ATTN_SCORES_BUDGET as u64,
+                false,
+            )),
+            usize::MAX,
+            &candle_gen::gen_core::CancelFlag::default(),
+            None,
+        )
+        .map_err(|error| match error {
+            candle_gen::CandleError::Candle(error) => error,
+            other => candle_core::Error::Msg(other.to_string()),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_injected_with_memory(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        y: &Tensor,
+        guidance: Option<&Tensor>,
+        injector: Option<&dyn DitImageInjector>,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> candle_gen::Result<Tensor> {
+        self.forward_core(
+            img,
+            img_ids,
+            txt,
+            txt_ids,
+            timesteps,
+            y,
+            guidance,
+            None,
+            injector,
+            None,
+            attention_plan,
+            transformer_window,
+            cancel,
+            None,
         )
     }
 
@@ -694,7 +1041,61 @@ impl IpFlux {
         control: Option<(&[Tensor], f64)>,
     ) -> Result<Tensor> {
         self.forward_core(
-            img, img_ids, txt, txt_ids, timesteps, y, guidance, None, injector, control,
+            img,
+            img_ids,
+            txt,
+            txt_ids,
+            timesteps,
+            y,
+            guidance,
+            None,
+            injector,
+            control,
+            AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+                candle_gen::ATTN_SCORES_BUDGET as u64,
+                false,
+            )),
+            usize::MAX,
+            &candle_gen::gen_core::CancelFlag::default(),
+            None,
+        )
+        .map_err(|error| match error {
+            candle_gen::CandleError::Candle(error) => error,
+            other => candle_core::Error::Msg(other.to_string()),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_control_with_memory(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        y: &Tensor,
+        guidance: Option<&Tensor>,
+        injector: Option<&dyn DitImageInjector>,
+        control: Option<(&[Tensor], f64)>,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> candle_gen::Result<Tensor> {
+        self.forward_core(
+            img,
+            img_ids,
+            txt,
+            txt_ids,
+            timesteps,
+            y,
+            guidance,
+            None,
+            injector,
+            control,
+            attention_plan,
+            transformer_window,
+            cancel,
+            None,
         )
     }
 
@@ -728,17 +1129,33 @@ impl IpFlux {
         ip: Option<&FluxIpInjector>,
         injector: Option<&dyn DitImageInjector>,
         control: Option<(&[Tensor], f64)>,
-    ) -> Result<Tensor> {
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+        prepared: Option<&PreparedConditioning>,
+    ) -> candle_gen::Result<Tensor> {
         if txt.rank() != 3 {
-            candle_core::bail!("unexpected shape for txt {:?}", txt.shape())
+            return Err(candle_gen::CandleError::Msg(format!(
+                "unexpected shape for txt {:?}",
+                txt.shape()
+            )));
         }
         if img.rank() != 3 {
-            candle_core::bail!("unexpected shape for img {:?}", img.shape())
+            return Err(candle_gen::CandleError::Msg(format!(
+                "unexpected shape for img {:?}",
+                img.shape()
+            )));
         }
         let dtype = img.dtype();
-        let pe = {
-            let ids = Tensor::cat(&[txt_ids, img_ids], 1)?;
-            ids.apply(&self.pe_embedder)?
+        let pe = match prepared {
+            Some(prepared) => {
+                prepared.validate(img, img_ids, txt, txt_ids)?;
+                prepared.pe.clone()
+            }
+            None => {
+                let ids = Tensor::cat(&[txt_ids, img_ids], 1)?;
+                ids.apply(&self.pe_embedder)?
+            }
         };
         let mut txt = self.txt_in.forward(txt)?;
         let mut img = self.img_in.forward(img)?;
@@ -759,7 +1176,7 @@ impl IpFlux {
         let control = control.filter(|(res, _)| !res.is_empty());
         let scaled_control = match control {
             Some((res, scale)) => {
-                let interval = control_residual_interval(self.double_blocks.len(), res.len());
+                let interval = control_residual_interval(self.num_double_blocks(), res.len());
                 let scaled = res
                     .iter()
                     .map(|r| r.to_dtype(dtype)? * scale)
@@ -769,12 +1186,107 @@ impl IpFlux {
             None => None,
         };
 
+        if let FluxBlocks::Streamed { weights, config } = &self.blocks {
+            let window = transformer_window.max(1);
+            let double_plan = candle_gen::block_window::BlockPlan::new(config.depth, window)?;
+            let (img, txt) = candle_gen::block_window::run_windowed(
+                &self.device,
+                &double_plan,
+                cancel,
+                (img, txt),
+                || Ok(weights.clone()),
+                |(mut img, mut txt), view, range| {
+                    let blocks = range
+                        .map(|index| {
+                            DoubleStreamBlock::new(config, view.pp("double_blocks").pp(index))
+                                .map(|block| (index, block))
+                                .map_err(candle_gen::CandleError::from)
+                        })
+                        .collect::<candle_gen::Result<Vec<_>>>()?;
+                    for (index, block) in &blocks {
+                        candle_gen::check_cancel(cancel)?;
+                        (img, txt) = block.forward(
+                            &img,
+                            &txt,
+                            &vec_,
+                            &pe,
+                            ip.map(|inj| (inj, *index)),
+                            attention_plan,
+                        )?;
+                        if let Some(inj) = injector {
+                            if let Some(r) = inj.after_double(*index, &img)? {
+                                img = (&img + r.to_dtype(img.dtype())?)?;
+                            }
+                        }
+                        if let Some((res, interval)) = &scaled_control {
+                            let idx = (*index / interval).min(res.len() - 1);
+                            img = (&img + &res[idx])?;
+                        }
+                    }
+                    Ok((img, txt))
+                },
+            )?;
+            let txt_len = txt.dim(1)?;
+            let joint = Tensor::cat(&[&txt, &img], 1)?;
+            let single_plan =
+                candle_gen::block_window::BlockPlan::new(config.depth_single_blocks, window)?;
+            let joint = candle_gen::block_window::run_windowed(
+                &self.device,
+                &single_plan,
+                cancel,
+                joint,
+                || Ok(weights.clone()),
+                |mut joint, view, range| {
+                    let blocks = range
+                        .map(|index| {
+                            SingleStreamBlock::new(config, view.pp("single_blocks").pp(index))
+                                .map(|block| (index, block))
+                                .map_err(candle_gen::CandleError::from)
+                        })
+                        .collect::<candle_gen::Result<Vec<_>>>()?;
+                    for (index, block) in &blocks {
+                        candle_gen::check_cancel(cancel)?;
+                        joint = block.forward(&joint, &vec_, &pe, attention_plan)?;
+                        if let Some(inj) = injector {
+                            if inj.injects_after_single(*index) {
+                                let seq = joint.dim(1)?;
+                                let img_part = joint.narrow(1, txt_len, seq - txt_len)?;
+                                if let Some(r) = inj.after_single(*index, &img_part)? {
+                                    let added = (img_part + r.to_dtype(joint.dtype())?)?;
+                                    let txt_part = joint.narrow(1, 0, txt_len)?;
+                                    joint = Tensor::cat(&[&txt_part, &added], 1)?;
+                                }
+                            }
+                        }
+                    }
+                    Ok(joint)
+                },
+            )?;
+            let img = joint.i((.., txt_len..))?;
+            return Ok(self.final_layer.forward(&img, &vec_)?);
+        }
+        let FluxBlocks::Resident {
+            double: double_blocks,
+            single: single_blocks,
+        } = &self.blocks
+        else {
+            unreachable!("streamed FLUX blocks returned above")
+        };
+
         // Double blocks: the XLabs IP seam is consulted INSIDE each block (`ip`, the image-query seam);
         // the post-block `injector` residual and then the control residual are added to the image stream
         // afterwards. Each seam is inert when its argument is `None`, so a single-seam caller reduces to
         // exactly its former body.
-        for (i, block) in self.double_blocks.iter().enumerate() {
-            (img, txt) = block.forward(&img, &txt, &vec_, &pe, ip.map(|inj| (inj, i)))?;
+        for (i, block) in double_blocks.iter().enumerate() {
+            candle_gen::check_cancel(cancel)?;
+            (img, txt) = block.forward(
+                &img,
+                &txt,
+                &vec_,
+                &pe,
+                ip.map(|inj| (inj, i)),
+                attention_plan,
+            )?;
             // Identity injector (PuLID / IP-Adapter) first — composes with control below.
             if let Some(inj) = injector {
                 if let Some(r) = inj.after_double(i, &img)? {
@@ -796,8 +1308,9 @@ impl IpFlux {
         // consulted here.
         let txt_len = txt.dim(1)?;
         let mut joint = Tensor::cat(&[&txt, &img], 1)?;
-        for (i, block) in self.single_blocks.iter().enumerate() {
-            joint = block.forward(&joint, &vec_, &pe)?;
+        for (i, block) in single_blocks.iter().enumerate() {
+            candle_gen::check_cancel(cancel)?;
+            joint = block.forward(&joint, &vec_, &pe, attention_plan)?;
             if let Some(inj) = injector {
                 if inj.injects_after_single(i) {
                     let seq = joint.dim(1)?;
@@ -811,7 +1324,7 @@ impl IpFlux {
             }
         }
         let img = joint.i((.., txt_len..))?;
-        self.final_layer.forward(&img, &vec_)
+        Ok(self.final_layer.forward(&img, &vec_)?)
     }
 }
 
@@ -829,6 +1342,7 @@ mod tests {
     use super::*;
     use candle_core::Device;
     use candle_nn::VarMap;
+    use std::cell::RefCell;
 
     fn assert_close(a: &Tensor, b: &Tensor) {
         assert_eq!(a.dims(), b.dims());
@@ -905,10 +1419,15 @@ mod tests {
     /// Build a tiny random-weight [`IpFlux`] on CPU. VarMap zero-init is randomized so the forward is a
     /// non-degenerate function (a zero DiT would make the wrapper-vs-wrapper parity vacuous).
     fn tiny_ipflux(dev: &Device) -> IpFlux {
+        tiny_ipflux_pair(dev).0
+    }
+
+    fn tiny_ipflux_pair(dev: &Device) -> (IpFlux, IpFlux) {
         let cfg = tiny_cfg();
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, dev);
-        let model = IpFlux::new(&cfg, vb).expect("tiny IpFlux");
+        let resident = IpFlux::new(&cfg, vb.clone()).expect("tiny resident IpFlux");
+        let streamed = IpFlux::new_block_streamed(&cfg, vb).expect("tiny block-streamed IpFlux");
         // Randomize every parameter (deterministic seed) — otherwise every weight is 0 and the forward
         // collapses to a constant, hiding any drift between the wrappers.
         let mut seed = 9003u64;
@@ -928,7 +1447,113 @@ mod tests {
             let t = Tensor::from_vec(data, var.shape(), dev).expect("randomize");
             var.set(&t).expect("set var");
         }
-        model
+        (resident, streamed)
+    }
+
+    struct RecordingInjector {
+        double: RefCell<Vec<usize>>,
+        single: RefCell<Vec<usize>>,
+    }
+
+    impl RecordingInjector {
+        fn new() -> Self {
+            Self {
+                double: RefCell::new(Vec::new()),
+                single: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn residual(like: &Tensor, scale: f64) -> Result<Tensor> {
+            let (b, s, c) = like.dims3()?;
+            Tensor::arange(0u32, c as u32, like.device())?
+                .to_dtype(like.dtype())?
+                .affine(scale / c as f64, scale)?
+                .reshape((1, 1, c))?
+                .broadcast_as((b, s, c))?
+                .contiguous()
+        }
+    }
+
+    impl DitImageInjector for RecordingInjector {
+        fn after_double(&self, block_idx: usize, img_hidden: &Tensor) -> Result<Option<Tensor>> {
+            self.double.borrow_mut().push(block_idx);
+            Ok(Some(Self::residual(img_hidden, 0.03)?))
+        }
+
+        fn injects_after_single(&self, _block_idx: usize) -> bool {
+            true
+        }
+
+        fn after_single(&self, block_idx: usize, img_tokens: &Tensor) -> Result<Option<Tensor>> {
+            self.single.borrow_mut().push(block_idx);
+            Ok(Some(Self::residual(img_tokens, 0.02)?))
+        }
+    }
+
+    #[test]
+    fn streamed_window_one_preserves_injector_indices_and_control_order() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let (resident, streamed) = tiny_ipflux_pair(&dev);
+        let (img, img_ids, txt, txt_ids, timesteps, y) = tiny_inputs(&dev, &cfg);
+        let guidance = Tensor::from_vec(vec![3.5f32], (1,), &dev).unwrap();
+        let control = [
+            Tensor::full(0.01f32, (1, 4, cfg.hidden_size), &dev).unwrap(),
+            Tensor::full(0.02f32, (1, 4, cfg.hidden_size), &dev).unwrap(),
+        ];
+        let expected_injector = RecordingInjector::new();
+        let actual_injector = RecordingInjector::new();
+        let plan =
+            || AttentionPlan::budgeted(AttentionBudget::from_score_elements(u64::MAX, false));
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+        let expected = resident
+            .forward_control_with_memory(
+                &img,
+                &img_ids,
+                &txt,
+                &txt_ids,
+                &timesteps,
+                &y,
+                Some(&guidance),
+                Some(&expected_injector),
+                Some((&control, 0.7)),
+                plan(),
+                1,
+                &cancel,
+            )
+            .unwrap();
+        let actual = streamed
+            .forward_control_with_memory(
+                &img,
+                &img_ids,
+                &txt,
+                &txt_ids,
+                &timesteps,
+                &y,
+                Some(&guidance),
+                Some(&actual_injector),
+                Some((&control, 0.7)),
+                plan(),
+                1,
+                &cancel,
+            )
+            .unwrap();
+
+        assert_close(&expected, &actual);
+        assert_eq!(*actual_injector.double.borrow(), vec![0, 1, 2]);
+        assert_eq!(*actual_injector.single.borrow(), vec![0, 1, 2, 3]);
+        assert_eq!(
+            *actual_injector.double.borrow(),
+            *expected_injector.double.borrow()
+        );
+        assert_eq!(
+            *actual_injector.single.borrow(),
+            *expected_injector.single.borrow()
+        );
+        // Two residuals over three double blocks retain diffusers' idx=min(i/ceil(3/2), 1):
+        // blocks 0/1 use residual 0 and block 2 uses residual 1. Exact resident parity above is the
+        // mutation guard for applying control before the injector or resetting indices per window.
+        assert_eq!(control_residual_interval(3, 2), 2);
     }
 
     /// The FLUX DiT `img`/`img_ids`/`txt`/`txt_ids`/`timesteps`/`y` inputs for a tiny 2×2-token image and
@@ -952,6 +1577,105 @@ mod tests {
         let timesteps = Tensor::from_vec(vec![0.7f32], (1,), dev).unwrap();
         let y = fill((1, 1, cfg.vec_in_dim), 1.0).squeeze(1).unwrap(); // (1, vec_in_dim)
         (img, img_ids, txt, txt_ids, timesteps, y)
+    }
+
+    #[test]
+    fn prepared_ipflux_conditioning_is_reused_by_base_and_control_forwards() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let model = tiny_ipflux(&dev);
+        let (img, img_ids, txt, txt_ids, timesteps, y) = tiny_inputs(&dev, &cfg);
+        let guidance = Tensor::from_vec(vec![3.5f32], (1,), &dev).unwrap();
+        let mut prepared = model
+            .prepare_conditioning(&img, &img_ids, &txt, &txt_ids)
+            .unwrap();
+        assert_eq!(model.pe_embedder.forward_calls(), 1);
+        let plan =
+            || AttentionPlan::budgeted(AttentionBudget::from_score_elements(u64::MAX, false));
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+        let first = model
+            .forward_prepared_with_memory(
+                &img,
+                &img_ids,
+                &txt,
+                &txt_ids,
+                &timesteps,
+                &y,
+                Some(&guidance),
+                None,
+                None,
+                None,
+                &prepared,
+                plan(),
+                usize::MAX,
+                &cancel,
+            )
+            .unwrap();
+        let residual = Tensor::zeros((1, 4, cfg.hidden_size), DType::F32, &dev).unwrap();
+        let control = model
+            .forward_prepared_with_memory(
+                &img,
+                &img_ids,
+                &txt,
+                &txt_ids,
+                &timesteps,
+                &y,
+                Some(&guidance),
+                None,
+                None,
+                Some((std::slice::from_ref(&residual), 0.7)),
+                &prepared,
+                plan(),
+                usize::MAX,
+                &cancel,
+            )
+            .unwrap();
+        assert_close(&first, &control);
+        assert_eq!(
+            model.pe_embedder.forward_calls(),
+            1,
+            "base/control forwards must not reconstruct PE"
+        );
+        let stale = Tensor::zeros((1, 5, cfg.in_channels), DType::F32, &dev).unwrap();
+        assert!(model
+            .forward_prepared_with_memory(
+                &stale,
+                &Tensor::zeros((1, 5, 3), DType::F32, &dev).unwrap(),
+                &txt,
+                &txt_ids,
+                &timesteps,
+                &y,
+                Some(&guidance),
+                None,
+                None,
+                None,
+                &prepared,
+                plan(),
+                usize::MAX,
+                &cancel,
+            )
+            .is_err());
+        let wrong_dtype = img.to_dtype(DType::F64).unwrap();
+        assert!(model
+            .forward_prepared_with_memory(
+                &wrong_dtype,
+                &img_ids,
+                &txt,
+                &txt_ids,
+                &timesteps,
+                &y,
+                Some(&guidance),
+                None,
+                None,
+                None,
+                &prepared,
+                plan(),
+                usize::MAX,
+                &cancel,
+            )
+            .is_err());
+        prepared.device = candle_core::DeviceLocation::Cuda { gpu_id: 7 };
+        assert!(prepared.validate(&img, &img_ids, &txt, &txt_ids).is_err());
     }
 
     /// sc-9003 / F-023: the three public forwards were consolidated onto one `forward_core`. Each is a

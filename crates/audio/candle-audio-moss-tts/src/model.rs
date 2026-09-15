@@ -65,22 +65,24 @@ pub const CODEC_CHECKPOINT_FILE: &str = "xy_tokenizer.ckpt";
 /// [`gen_core::require_component`]; the codec is then built lazily from the staged path.
 pub const CODEC_COMPONENT_ID: &str = "codec";
 
-/// The license of the pinned MOSS-TTSD-v0.5 weight checkpoint (Apache-2.0, permissive) — surfaced for
-/// SceneWorks' end-product licenses page. Verified against the `OpenMOSS-Team/MOSS-TTSD-v0.5` card.
-pub const WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "Apache-2.0",
-    name: "Apache License 2.0",
-    source_url: "https://huggingface.co/OpenMOSS-Team/MOSS-TTSD-v0.5",
-    attribution: Some("MOSS-TTSD-v0.5 © OpenMOSS Team — licensed under Apache-2.0"),
-    commercial_use: true,
-    restriction: None,
-};
+/// Stable component key for the pinned MOSS-TTSD-v0.5 checkpoint — what `PROVIDER_COMPONENTS`
+/// resolves through, and the licence manifest's unique row key.
+pub const COMPONENT_KEY: &str = "moss_ttsd_v05";
 
-/// This provider's weight-license entry (keyed by [`MODEL_ID`]) for catalog aggregation.
-pub const WEIGHT_LICENSE_ENTRY: gen_core::WeightLicenseEntry = gen_core::WeightLicenseEntry {
-    provider_id: MODEL_ID,
-    component: None,
-    license: WEIGHT_LICENSE,
+/// The schema-3 licence row for the pinned MOSS-TTSD-v0.5 checkpoint (sc-16663).
+///
+/// **Disclosure only.** The row records what the upstream declares so a consumer can show it to a
+/// user; nothing here decides whether any use is permitted. `declared` and `gated` were read from
+/// the `OpenMOSS-Team/MOSS-TTSD-v0.5` model card on `retrieved`, and `family` normalizes that declaration onto
+/// [`gen_core::license::families::APACHE_2_0`].
+pub const COMPONENT_LICENSE: gen_core::ComponentLicense = gen_core::ComponentLicense {
+    component: COMPONENT_KEY,
+    source_url: "https://huggingface.co/OpenMOSS-Team/MOSS-TTSD-v0.5",
+    gated: false,
+    declared: "apache-2.0",
+    family: "apache-2-0",
+    attribution: Some("MOSS-TTSD-v0.5 © OpenMOSS Team — licensed under Apache-2.0"),
+    retrieved: "2026-08-02",
 };
 
 /// Native output sample rate of the XY_Tokenizer codec (Hz).
@@ -115,39 +117,22 @@ pub const LANGUAGES: &[&str] = &[
 /// at the token level), with `max_speakers = 2`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: None,
+        control_kinds: None,
         required_components: &[CODEC_COMPONENT_ID],
         id: MODEL_ID,
         family: "moss_ttsd",
         backend: "candle",
         modality: Modality::Audio,
         capabilities: Capabilities {
-            supports_negative_prompt: false,
-            supports_guidance: false,
-            supports_true_cfg: false,
-            conditioning: Vec::new(),
-            supports_lora: false,
-            supports_lokr: false,
-            samplers: vec![],
-            schedulers: vec![],
-            supported_guidance_methods: vec![],
-            min_size: 0,
-            max_size: 0,
             max_count: 1,
-            mac_only: false,
             audio_sample_rates: vec![SAMPLE_RATE],
             max_audio_duration_secs: Some(MAX_DURATION_SECS),
-            audio_voices: vec![],
             audio_languages: LANGUAGES.to_vec(),
-            audio_edit_modes: vec![],
-            supported_quants: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            supports_streaming: false,
             supports_multi_speaker: true,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
             max_speakers: Some(MAX_SPEAKERS),
+            ..Default::default()
         },
     }
 }
@@ -603,9 +588,8 @@ mod tests {
         // generate() now renders real audio (the XY_Tokenizer codec is ported, sc-13518). With no
         // weights on disk it must surface a typed error while loading the AR snapshot — never panic,
         // never fabricate audio.
-        let dir = std::env::temp_dir().join("moss-ttsd-no-weights");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let g = load_generator(&spec_with_codec(dir)).unwrap();
         let req = audio_req(AudioParams {
             sample_rate: Some(24_000),
@@ -619,8 +603,8 @@ mod tests {
 
     #[test]
     fn pre_tripped_cancel_returns_typed_canceled() {
-        let dir = std::env::temp_dir().join("moss-ttsd-cancel");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let g = load_generator(&spec_with_codec(dir)).unwrap();
         let flag = CancelFlag::new();
         flag.cancel();
@@ -636,7 +620,8 @@ mod tests {
 
     #[test]
     fn load_rejects_unsupported_spec_shapes() {
-        let dir = std::env::temp_dir();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let spec = LoadSpec::new(WeightsSource::File(dir.join("x.safetensors")));
         assert!(load(&spec).is_err());
         let mut spec = spec_with_codec(dir.clone());
@@ -649,8 +634,8 @@ mod tests {
     /// never fetched mid-render (epic 13657). Driven through the real `load` by the shared testkit.
     #[test]
     fn missing_codec_component_fails_at_load() {
-        let dir = std::env::temp_dir().join("moss-ttsd-load-gate");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let base = spec_with_codec(dir);
         // The fully-provisioned spec loads (the codec is lazy — no path read yet).
         assert!(
@@ -662,10 +647,13 @@ mod tests {
     }
 
     #[test]
-    fn weight_license_is_apache() {
-        let lic = WEIGHT_LICENSE;
-        assert_eq!(lic.spdx_id, "Apache-2.0");
-        assert!(lic.commercial_use);
-        assert_eq!(WEIGHT_LICENSE_ENTRY.provider_id, MODEL_ID);
+    fn component_licence_resolves_to_the_apache_family() {
+        use gen_core::{resolve_family, LicenseTerm, LICENSE_FAMILIES};
+        assert!(COMPONENT_LICENSE.is_well_formed(LICENSE_FAMILIES));
+        assert_eq!(COMPONENT_LICENSE.declared, "apache-2.0");
+        let family = resolve_family(LICENSE_FAMILIES, COMPONENT_LICENSE.family).unwrap();
+        assert_eq!(family.spdx_id, "Apache-2.0");
+        assert!(family.imposes(LicenseTerm::AttributionRequired));
+        assert!(family.imposes(LicenseTerm::NoticeFileRequired));
     }
 }

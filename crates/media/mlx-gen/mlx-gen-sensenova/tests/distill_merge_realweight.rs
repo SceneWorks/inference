@@ -4,7 +4,7 @@
 //! merged bf16 weight to the torch reference merged weight on real tensors.
 //!
 //! `#[ignore]` — needs `tools/`-dumped `distill_realweight_merge.safetensors` (gitignored).
-//! Run: cargo test -p mlx-gen-sensenova --test distill_merge_realweight -- --ignored --nocapture
+//! Run: cargo test -p mlx-gen-sensenova --test integration distill_merge_realweight:: -- --ignored --nocapture
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;

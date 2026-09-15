@@ -4,7 +4,7 @@
 //! `#[ignore]` — needs the Base snapshot (`mllm/`) and the golden file. Run:
 //!   BOOGU_BASE_DIR=<snapshot> BOOGU_GOLDEN=<...>/boogu_golden.safetensors \
 //!     CARGO_TARGET_DIR=~/Repos/mlx-gen/target \
-//!     cargo test -p mlx-gen-boogu --test te_parity -- --ignored --nocapture
+//!     cargo test -p mlx-gen-boogu --test integration te_parity:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 
@@ -63,7 +63,7 @@ fn te_matches_reference_last_hidden() {
 /// forward and compares to the reference `dit_out_velocity_chw`. Run:
 ///   BOOGU_BASE_DIR=<snapshot> BOOGU_GOLDEN=<...>/boogu_golden.safetensors \
 ///     CARGO_TARGET_DIR=~/Repos/mlx-gen/target \
-///     cargo test -p mlx-gen-boogu --test te_parity dit_matches -- --ignored --nocapture
+///     cargo test -p mlx-gen-boogu --test integration te_parity::dit_matches -- --ignored --nocapture
 #[test]
 #[ignore = "needs real weights + golden (tools/golden_dump.py)"]
 fn dit_matches_reference_velocity() {

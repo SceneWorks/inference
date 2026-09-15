@@ -58,6 +58,14 @@ impl Qwen3Attention {
         Ok(())
     }
 
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        for projection in [&self.q_w, &self.k_w, &self.v_w, &self.o_w] {
+            projection.materialize_weights()?;
+        }
+        mlx_rs::transforms::eval([&self.q_norm, &self.k_norm])?;
+        Ok(())
+    }
+
     /// `x`: `[b, s, hidden]`; `cos`/`sin`: `[1, s, head_dim]`; `mask`: additive `[b,1,s,s]`.
     pub fn forward(&self, x: &Array, cos: &Array, sin: &Array, mask: &Array) -> Result<Array> {
         let sh = x.shape();

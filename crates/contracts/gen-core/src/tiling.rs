@@ -21,17 +21,18 @@
 /// **This is operation- and runtime-specific, not a universal "any tensor over 2^31 is wrong" law**
 /// (sc-12438 corrected the earlier universal framing). It stood in for several distinct 0.31.2 failures
 /// sharing the 2^31-element (`i32`) threshold — but **sc-12748: on this repo's current pin (MLX 0.32.0
-/// via `pmetal-mlx-rs 932beb4e` + the sc-12746 pad/concat copy-gate patch) every op the tiled/untiled
-/// video decode touches above the bound is now int64-safe.** Measured at `128×D×480×848` (`D=41` →
+/// via `pmetal-mlx-rs eb76c4ba` + the sc-12746 pad/concat copy-gate patch) every operation the
+/// tiled/untiled video decode actually uses above the bound is now int64-safe.** Re-probed on this
+/// exact pin on 2026-08-11 at `128×D×480×848` (`D=41` →
 /// 2,136,145,920 = 0.995×; `D=42` → 2,188,247,040 = 1.019×) with position-dependent data compared only
 /// on sub-bound slices (`mlx-gen/tests/mlx_write_bound_probe.rs`):
 ///
-/// | operation | on 0.31.2 | on this pin (0.32.0 fork `932beb4e` + patch) |
+/// | operation | on 0.31.2 | on this pin (0.32.0 fork `eb76c4ba` + patch) |
 /// |---|---|---|
 /// | `conv3d` 8→128, output over the bound | **wrong** from ~1.007× (per-thread output offset in the Metal steel-conv kernel overflows `int32`) | **EXACT** — MLX PR #3524 promoted those offsets to `size_t` (probe-verified, `first_bad=-1`) |
 /// | `pad` to a full output over the bound (the tiled accumulator's placement op) | **wrong** from ~1.003× | **EXACT** — the sc-12746 `pad-copy-int64.patch` gates the copy on the addressable span (probe-verified) |
 /// | `concatenate` over the bound (same `copy_gpu_inplace` path) | **wrong** | **EXACT** — same copy-gate patch (probe-verified) |
-/// | `reshape(-1)` / `flatten` at over-bound size | **overflow** (flat `i32` shape-product) | **works** (probe-verified `reshape(-1)_ok=true` at 2.19e9) |
+/// | reshape at over-bound size | **overflow** (flat `i32` shape-product) | **mixed** — a single `reshape(-1)` dimension still raises, while a multi-dimensional reshape whose individual dimensions fit `i32` is exact above the bound; `contiguous` uses that verified multi-dimensional path |
 /// | `from_slice` (host `Vec` → over-bound `Array`) | **overflow** — mlx-rs asserts `len == shape.product::<i32>()` (MLX #3327) | **still i32-capped** — a fork-side mlx-rs bug, unfixed; the one residual (the decode paths read back via `as_slice`, never `from_slice` the full output) |
 /// | reading back (`as_slice`) an over-bound array | correct | correct |
 ///
@@ -45,9 +46,11 @@
 ///    future MLX regression re-breaking conv or a future full-res op the probes don't cover).
 ///  - **Assembled-output write** (`mlx_gen::vae_tiling::check_output_writable`): the full
 ///    `output`/`weights` accumulators a tiled decode builds by `pad`-and-add and reads back via
-///    `reshape`+`as_slice`. Every one of those ops is now int64-safe (rows above), so the sc-12438
-///    **refusal is lifted** — an over-bound assembled output now RENDERS. `check_output_writable` is kept
-///    as a narrow backstop for the one residual, a `from_slice` host materialization the decode never
+///    `contiguous`'s multi-dimensional `reshape`+`as_slice` path. Every operation in that path is now
+///    int64-safe (rows above), so the sc-12438
+///    **refusal is lifted** — an over-bound assembled output now RENDERS. A single-dimension flatten
+///    remains rejected but is not used by this path. `check_output_writable` is kept as a narrow
+///    backstop for the remaining possible host-materialization hazard, a `from_slice` the decode never
 ///    does — a retained latent tripwire with **no production caller** today (sc-12926), ready to wire
 ///    if future code from_slices an output-scale host buffer.
 ///  - **Mochi's decode guard** (`mlx-gen-mochi`'s `decode_body`): its over-bound write is `block_out`'s
@@ -147,16 +150,89 @@ impl VaeTiling {
     /// exceeds it (only reachable at resolutions far beyond any shipped bucket).
     ///
     /// On MLX 0.31.2 exceeding this returned **wrong pixels, silently** (the widest write is a conv3d).
-    /// **sc-12748: on the current pin (0.32.0, #3524) that conv is int64-safe** (see
-    /// [`MAX_WRITABLE_ELEMS`]), so this is no longer a correctness bound — it is retained as a
-    /// defense-in-depth tiling trigger (tiling yields correct output regardless) and is still used by
-    /// callers that want a conservative single-pass ceiling.
+    /// sc-12748 recorded that on the current pin (0.32.0, #3524) that conv is int64-safe (see
+    /// [`MAX_WRITABLE_ELEMS`]), and concluded this is no longer a correctness bound — retained as a
+    /// defense-in-depth tiling trigger and a conservative single-pass ceiling.
+    ///
+    /// ⚠️ **That conclusion is contradicted by observation and by this module's own
+    /// [`budgeted_plan`] doc, which still calls it "the correctness bound that memory cannot see".**
+    /// During sc-8446 an 84-output-frame single-pass z16 decode at 832×480 — 1.5× over this cap —
+    /// produced a washed-out result that diverges from every tiled decode of the same latents **at
+    /// frame 0** (saturation 0.068 vs 0.329; the two agree at 0.293 when the same comparison is run at
+    /// 36 frames, under the cap). A correct decode's first frame cannot depend on the clip length, so
+    /// this is the silently-wrong-wide-write signature, not a tiling artifact.
+    ///
+    /// ⚠️ Scope of that evidence: it is **one over-cap and one under-cap point**. It establishes a
+    /// *length-dependent* correctness failure; it does **not** establish that the threshold is exactly
+    /// this cap. A bisection belongs in the story before this doc is rewritten rather than annotated.
+    /// Tracked as **sc-15402** (which also links the prior sc-12438 / sc-12748 work); until it is
+    /// settled, treat exceeding this cap as unsafe.
     pub fn writable_frame_cap(&self, out_h: i32, out_w: i32) -> i64 {
         let per_frame = self.full_res_channels as i64 * out_h as i64 * out_w as i64;
         if per_frame <= 0 {
             return i64::MAX;
         }
         MAX_WRITABLE_ELEMS / per_frame
+    }
+}
+
+/// A backend-neutral, composable conservative VAE decode-phase memory profile.
+///
+/// `resident_decoder_bytes_included` is the portion of `working_set_bytes` substitutable by decoder
+/// resident bytes already charged in a model contract. It is part of, not additional to, the working
+/// set, and the checked constructor enforces `included <= working_set`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VideoDecodeMemoryProfile {
+    /// Conservative decode-phase working set, including any resident decoder bytes identified below.
+    working_set_bytes: u64,
+    /// Portion of `working_set_bytes` substitutable by decoder bytes already present in a contract.
+    resident_decoder_bytes_included: u64,
+}
+
+impl VideoDecodeMemoryProfile {
+    /// Build a valid profile, returning `None` when the included resident portion exceeds the total.
+    pub fn new(working_set_bytes: u64, resident_decoder_bytes_included: u64) -> Option<Self> {
+        (resident_decoder_bytes_included <= working_set_bytes).then_some(Self {
+            working_set_bytes,
+            resident_decoder_bytes_included,
+        })
+    }
+
+    /// Conservative decode-phase working set in bytes.
+    pub const fn working_set_bytes(self) -> u64 {
+        self.working_set_bytes
+    }
+
+    /// Portion of the working set substitutable by decoder bytes already charged in a contract.
+    pub const fn resident_decoder_bytes_included(self) -> u64 {
+        self.resident_decoder_bytes_included
+    }
+
+    /// Bytes to add to a composition that already includes `contract_decoder_bytes`.
+    ///
+    /// If the contract decoder is below the included floor, the uncovered portion remains. If it is
+    /// above the floor, the contract decoder is charged once and only non-resident decode work is
+    /// added. Arithmetic overflow returns `None`.
+    pub fn incremental_above_contract_decoder_bytes(
+        self,
+        contract_decoder_bytes: u64,
+    ) -> Option<u64> {
+        self.working_set_bytes
+            .checked_sub(contract_decoder_bytes.min(self.resident_decoder_bytes_included))
+    }
+
+    /// Add this profile to an already-accounted contract composition with checked arithmetic.
+    /// Returns `None` when the declared decoder component exceeds the composition that contains it.
+    pub fn checked_composed_peak(
+        self,
+        composition_bytes: u64,
+        contract_decoder_bytes: u64,
+    ) -> Option<u64> {
+        if contract_decoder_bytes > composition_bytes {
+            return None;
+        }
+        composition_bytes
+            .checked_add(self.incremental_above_contract_decoder_bytes(contract_decoder_bytes)?)
     }
 }
 
@@ -632,16 +708,15 @@ pub const MIN_TEMPORAL_TILE_LATENT_FRAMES: i32 = 8;
 /// The minimum temporal **overlap**, in *latent* frames, stamped onto a selected temporal tile
 /// (sc-15325). Overlap is the secondary term above, and it is **free in peak**: the tiled decode
 /// `eval`s per tile, so the peak is one tile's transient plus the output accumulators and the overlap
-/// enters neither — a shorter stride is more passes (wall time), not a bigger graph. So there is no
-/// reason to buy a large tile and leave the blend at one latent frame.
+/// enters neither — a shorter stride is more passes (wall time), not a bigger graph.
 ///
 /// ## ⚠️ This raise is a separate change from the tile-size fix — here is its bound
 ///
 /// sc-15325's defect was tile *size*. Raising the overlap is a distinct, **beneficial but
-/// independently-motivated** change that rides along on it, and it touches two already-shipping
-/// engines (Wan z16 and z48). [`temporal_overlap_for`] raises every Wan candidate:
+/// independently-motivated** change. [`temporal_overlap_for`] raises the shared quality-oriented
+/// policy's candidates to half a latent tile:
 /// `(96, 24) → (96, 48)` (stride 72 → 48), `(64, 24) → (64, 32)`, `(48, 16) → (48, 24)`,
-/// `(32, 8) → (32, 16)`. Two things bound the risk:
+/// `(32, 8) → (32, 16)`.
 ///
 ///  * **Memory and plan selection are provably unchanged.** Overlap enters neither `peak_cost` (whose
 ///    tile term is `tile_f · tile_h · tile_w`) nor [`budgeted_plan`]'s selection key (`voxels`, the
@@ -663,8 +738,15 @@ pub const MIN_TEMPORAL_TILE_LATENT_FRAMES: i32 = 8;
 /// 9.7 %/26.6 % the starved latent-2 window produced. Tile *size* is what governs clipping; the
 /// overlap barely moves it in either direction.
 ///
-/// Quantifying the wall-time cost on the shipping Wan buckets (rather than bounding it, as here) is
-/// tracked as **sc-15445**.
+/// sc-15445 then measured that bound on both real Wan VAEs at the 640×384×81 and 832×480×121
+/// shipping points. The half-tile policy cost **31.8–48.5 %** on z16 and **21.1–39.3 %** on z48 for
+/// only **0.30–0.60/255** and **0.10–0.15/255** less error respectively, with unchanged clipping and
+/// peak. That is material wall time for a marginal Wan gain, so the Wan product selectors now choose
+/// [`TemporalOverlapPolicy::Candidate`]. Krea Realtime and SCAIL-2 deliberately retain
+/// [`TemporalOverlapPolicy::HalfTile`]: their sc-15325 correction is quality-oriented, and they share
+/// the z16 VAE while entering through a separate selector. LTX also retains half-tile overlap under
+/// its separately measured cost/benefit argument above. The full A/B, hashes, and environment are in
+/// `docs/migration/SC_15445_WAN_OVERLAP_AB.md`.
 pub const MIN_TEMPORAL_TILE_LATENT_OVERLAP: i32 = 2;
 
 /// The smallest **output**-frame temporal tile that satisfies [`MIN_TEMPORAL_TILE_LATENT_FRAMES`] for
@@ -681,10 +763,38 @@ pub fn min_temporal_tile_frames(vae: VaeTiling) -> i32 {
 /// Public so a consumer can reason about — and a test can gate — the policy without re-deriving the
 /// arithmetic.
 pub fn temporal_overlap_for(vae: VaeTiling, tile_frames: i32, candidate_overlap: i32) -> i32 {
+    temporal_overlap_for_policy(
+        TemporalOverlapPolicy::HalfTile,
+        vae,
+        tile_frames,
+        candidate_overlap,
+    )
+}
+
+/// How a selected temporal candidate's overlap is finalized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TemporalOverlapPolicy {
+    /// Preserve the VAE/provider candidate grid's measured overlap, enforcing only the shared
+    /// two-latent-frame floor. This is the Wan product policy after sc-15445.
+    Candidate,
+    /// Raise overlap to at least half the latent tile. This remains the quality-oriented policy for
+    /// Krea Realtime, SCAIL-2, and LTX.
+    HalfTile,
+}
+
+fn temporal_overlap_for_policy(
+    policy: TemporalOverlapPolicy,
+    vae: VaeTiling,
+    tile_frames: i32,
+    candidate_overlap: i32,
+) -> i32 {
     let scale = vae.temporal_scale.max(1);
     let tile_latent = (tile_frames / scale).max(1);
-    let want_latent = (tile_latent / 2)
-        .max(MIN_TEMPORAL_TILE_LATENT_OVERLAP)
+    let policy_floor = match policy {
+        TemporalOverlapPolicy::Candidate => MIN_TEMPORAL_TILE_LATENT_OVERLAP,
+        TemporalOverlapPolicy::HalfTile => (tile_latent / 2).max(MIN_TEMPORAL_TILE_LATENT_OVERLAP),
+    };
+    let want_latent = policy_floor
         .max(candidate_overlap / scale)
         // `split_spatial` clamps the latent overlap to `tile − 1`; emitting more would be inert, and
         // silently-inert config is how the original defect hid (`overlap = 4` at a latent tile of 2
@@ -704,6 +814,8 @@ pub struct TileCandidates<'a> {
     pub spatial_overlap_px: i32,
     /// Candidate temporal tiles `(tile_frames, overlap_frames)` in output frames.
     pub temporal: &'a [(i32, i32)],
+    /// Whether the selected temporal candidate keeps its own overlap or is raised to half a tile.
+    pub temporal_overlap_policy: TemporalOverlapPolicy,
 }
 
 /// Why [`budgeted_plan`] could not fit a decode within the safe budget even with tiling. Carries the
@@ -826,7 +938,12 @@ pub fn budgeted_plan(
         .iter()
         .copied()
         .filter(|&(t, _)| (t as i64) < f && t >= min_tile_frames)
-        .map(|(t, o)| (t, temporal_overlap_for(vae, t, o)))
+        .map(|(t, o)| {
+            (
+                t,
+                temporal_overlap_for_policy(candidates.temporal_overlap_policy, vae, t, o),
+            )
+        })
         .collect();
     temporal.push((f as i32, 0)); // full temporal extent = no temporal tiling
 
@@ -881,6 +998,33 @@ pub fn budgeted_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_memory_profile_composes_contract_decoder_exactly_once() {
+        assert_eq!(VideoDecodeMemoryProfile::new(399, 400), None);
+
+        let profile = VideoDecodeMemoryProfile::new(1_000, 400).unwrap();
+        assert_eq!(
+            profile.incremental_above_contract_decoder_bytes(0),
+            Some(1_000)
+        );
+        assert_eq!(
+            profile.incremental_above_contract_decoder_bytes(250),
+            Some(750)
+        );
+        assert_eq!(profile.checked_composed_peak(1_250, 250), Some(2_000));
+        assert_eq!(
+            profile.incremental_above_contract_decoder_bytes(400),
+            Some(600)
+        );
+        assert_eq!(
+            profile.incremental_above_contract_decoder_bytes(600),
+            Some(600)
+        );
+        assert_eq!(profile.checked_composed_peak(1_600, 600), Some(2_200));
+        assert_eq!(profile.checked_composed_peak(399, 400), None);
+        assert_eq!(profile.checked_composed_peak(u64::MAX, 600), None);
+    }
 
     #[test]
     fn trapezoid_no_ramp_is_all_ones() {
@@ -1066,6 +1210,7 @@ mod tests {
             spatial_px: &T_SPATIAL,
             spatial_overlap_px: 64,
             temporal: &T_TEMPORAL,
+            temporal_overlap_policy: TemporalOverlapPolicy::HalfTile,
         }
     }
 
@@ -1335,6 +1480,67 @@ mod tests {
         assert_eq!(temporal_overlap_for(VaeTiling::WAN, 4, 8), 0);
     }
 
+    /// sc-15445: the policy split must remain explicit. Wan's product candidates keep their measured
+    /// overlap, while quality-oriented consumers keep the half-tile raise. Every row discriminates
+    /// against deleting the policy branch or swapping either variant.
+    #[test]
+    fn wan_candidate_and_quality_overlap_policies_discriminate_every_shipping_row() {
+        for (tile, candidate, half) in [(96, 24, 48), (64, 24, 32), (48, 16, 24), (32, 8, 16)] {
+            assert_eq!(
+                temporal_overlap_for_policy(
+                    TemporalOverlapPolicy::Candidate,
+                    VaeTiling::WAN,
+                    tile,
+                    candidate,
+                ),
+                candidate,
+            );
+            assert_eq!(
+                temporal_overlap_for_policy(
+                    TemporalOverlapPolicy::HalfTile,
+                    VaeTiling::WAN,
+                    tile,
+                    candidate,
+                ),
+                half,
+            );
+        }
+
+        // The exact two A/B geometries: overlap alone raises temporal/all VAE tile calls by 25 %.
+        for (vae, latent, h, w, tile, candidate, expected) in [
+            (VaeTiling::WAN, 21, 48, 80, 32, 8, (4, 5, 60, 75)),
+            (VaeTiling::WAN, 31, 60, 104, 48, 16, (4, 5, 96, 120)),
+            (VaeTiling::WAN22, 21, 24, 40, 32, 8, (4, 5, 60, 75)),
+            (VaeTiling::WAN22, 31, 30, 52, 48, 16, (4, 5, 96, 120)),
+        ] {
+            let iterations = |policy| {
+                let cfg = TilingConfig {
+                    spatial: Some(SpatialTiling {
+                        tile_px: 192,
+                        overlap_px: 64,
+                    }),
+                    temporal: Some(TemporalTiling {
+                        tile_frames: tile,
+                        overlap_frames: temporal_overlap_for_policy(policy, vae, tile, candidate),
+                    }),
+                };
+                let plan = cfg.plan(vae, latent, h, w);
+                (plan.t.len(), plan.t.len() * plan.h.len() * plan.w.len())
+            };
+            let candidate_iters = iterations(TemporalOverlapPolicy::Candidate);
+            let half_iters = iterations(TemporalOverlapPolicy::HalfTile);
+            assert_eq!(
+                (
+                    candidate_iters.0,
+                    half_iters.0,
+                    candidate_iters.1,
+                    half_iters.1
+                ),
+                expected,
+            );
+        }
+    }
+
     /// The floor must not make a previously-feasible decode impossible at a realistic budget: the
     /// savings move to the spatial axis. This is the affordability claim sc-15325's operating point
     /// rests on, checked against the real z16 cost coefficients (64 B/out-voxel accumulators,
@@ -1351,6 +1557,7 @@ mod tests {
             spatial_px: &SPATIAL,
             spatial_overlap_px: 64,
             temporal: &TEMPORAL,
+            temporal_overlap_policy: TemporalOverlapPolicy::HalfTile,
         };
         // Every bucket the pre-fix krea/scail2 window collapsed at, plus the one it did not, at a
         // 12 GiB budget — well under the ~21 GiB the old fixed 8-frame full-frame window actually cost.

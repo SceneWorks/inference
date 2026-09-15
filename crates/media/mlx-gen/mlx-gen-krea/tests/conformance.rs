@@ -7,7 +7,7 @@
 //! because it needs the real `krea/Krea-2-Turbo` weights; run on the macos-mlx lane / a dev box:
 //! ```sh
 //! KREA_TURBO_DIR=/path/to/models--krea--Krea-2-Turbo/snapshots/<rev> \
-//!   cargo test -p mlx-gen-krea --release --test conformance -- --ignored --nocapture
+//!   cargo test -p mlx-gen-krea --release --test integration conformance:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

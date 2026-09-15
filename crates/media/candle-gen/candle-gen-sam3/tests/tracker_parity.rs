@@ -4,7 +4,7 @@
 //!
 //! `#[ignore]` until `facebook/sam3` (gated) + the fixture are staged on the box (sc-6248). Run:
 //!   SAM3_WEIGHTS=<facebook/sam3 snapshot> SAM3_TRACKER_FIXTURE=<tracker_fixture.safetensors> \
-//!     cargo test -p candle-gen-sam3 --release --features cuda --test tracker_parity -- --ignored --nocapture
+//!     cargo test -p candle-gen-sam3 --release --features cuda --test integration tracker_parity:: -- --ignored --nocapture
 
 use std::path::Path;
 

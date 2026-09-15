@@ -1,0 +1,8 @@
+version = 1
+
+[[ignore]]
+advisory = "RUSTSEC-2024-0436"
+reason = "The pinned Candle revision still depends on paste through GEMM, and no compatible in-place replacement is available."
+reachability = "Compile-time only: paste is a proc-macro dependency of GEMM and pmetal-mlx-rs and is not linked into the shipped runtime."
+owner = "@michaeltrefry"
+expires = 2026-11-30

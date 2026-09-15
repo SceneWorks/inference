@@ -4,7 +4,7 @@
 //!
 //! Both tests are `#[ignore]`d and stage the five pinned checkpoints as named `LoadSpec` components
 //! (sc-13666) resolved from env-pointed per-repo snapshot paths, falling back to the audio lane's
-//! F-029 hub path (~6 GB across `hkchengrex/MMAudio` + `apple/DFN5B-CLIP-ViT-H-14-384` into the
+//! F-029 hub path (~6 GB across `hkchengrex/MMAudio` + `apple/DFN5B-CLIP-ViT-H-14-378` into the
 //! ordinary HF cache on first run) — see [`common`] for the env vars.
 //!
 //! ```text

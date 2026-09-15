@@ -34,7 +34,7 @@ use candle_audio::candle_core::{Device, Result as CResult, Tensor};
 use candle_audio::gen_core::{
     self, reject_unknown_components, require_component, AudioTrack, Capabilities, Conditioning,
     ConditioningKind, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
-    ModelDescriptor, Progress, WeightsSource,
+    ModelDescriptor, Progress, StepSupport, WeightsSource,
 };
 use candle_audio::{AudioError, Result as AudioResult};
 use rand::rngs::StdRng;
@@ -85,54 +85,10 @@ pub const GUIDANCE_RANGE: (f32, f32) = (1.0, 20.0);
 /// Prompt language the CLIP text tower was trained on (English; the prompt is advisory and optional).
 pub const LANGUAGES: &[&str] = &["en"];
 
-/// The **composite** model-weight license for the shipping `mmaudio_small_16k` provider (sc-13332).
-///
-/// MMAudio's assembled pipeline pulls **five** checkpoints across two repos, under three different
-/// licenses — the crate's per-component [`crate::WEIGHT_LICENSES`] records each in full. The
-/// `candle-audio-catalog` ship-gate keys exactly one license row per *registered* provider id, so the
-/// governing license the provider ships under is surfaced here as one entry keyed by [`MODEL_ID`]: the
-/// **intersection** of all five, i.e. the strictest terms. That is **research / non-commercial only** —
-/// the DFN5B-CLIP conditioner's Apple ML Research Model License limits use to scientific research and
-/// academic development (excluding commercial products), and the MM-DiT / mel-VAE / BigVGAN checkpoints
-/// add CC-BY-NC-4.0 (non-commercial); the Synchformer visual encoder is MIT. SceneWorks is
-/// non-commercial, so the weights are usable, but the composite restriction MUST be surfaced.
-pub const WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-MMAudio-small-16k-composite",
-    name: "MMAudio small_16k composite (Apple ML Research + CC-BY-NC-4.0 + MIT)",
-    source_url: "https://huggingface.co/hkchengrex/MMAudio",
-    attribution: Some(
-        "MMAudio video→audio (mmaudio_small_16k) assembles five checkpoints: the MM-DiT network + 16k \
-         mel-VAE + 16k BigVGAN (© Sony Research Inc. / MMAudio — CC-BY-NC-4.0), the DFN5B-CLIP \
-         ViT-H/14-384 conditioner (© Apple Inc. — Apple ML Research Model License, research-only), and \
-         the Synchformer visual encoder (© 2024 Vladimir Iashin — MIT).",
-    ),
-    commercial_use: false,
-    restriction: Some(
-        "Research / non-commercial only — the intersection of five component licenses. The strictest, \
-         the Apple ML Research Model License on the DFN5B-CLIP conditioner, limits use to scientific \
-         research and academic development and excludes any commercial product or service; the MMAudio \
-         MM-DiT / mel-VAE / BigVGAN checkpoints add CC-BY-NC-4.0 (non-commercial); the Synchformer \
-         encoder is MIT. See candle-audio-mmaudio::WEIGHT_LICENSES for each checkpoint's full terms. A \
-         legal read is warranted before any commercial use.",
-    ),
-};
-
-/// This provider's single composite weight-license entry (keyed by [`MODEL_ID`]) — what
-/// `candle-audio-catalog` aggregates into the model-licenses manifest (one row per registered
-/// provider). The five per-component entries live in [`crate::WEIGHT_LICENSES`].
-pub const WEIGHT_LICENSE_ENTRY: gen_core::WeightLicenseEntry = gen_core::WeightLicenseEntry {
-    provider_id: MODEL_ID,
-    // The composite / effective-restriction row (component == None) — the at-a-glance
-    // "can we use this provider" signal. The per-checkpoint attribution rows live in
-    // `crate::SHIPPED_WEIGHT_LICENSES` beside it (sc-13493).
-    component: None,
-    license: WEIGHT_LICENSE,
-};
-
 /// The five named model components (epic 13657) `mmaudio_small_16k` requires, provisioned by the
 /// caller in [`LoadSpec::components`] and read at [`load`] via [`require_component`]. The composite
 /// assembles five checkpoints across two repos: `clip` (the DFN5B-CLIP ViT-H/14 conditioner, from
-/// `apple/DFN5B-CLIP-ViT-H-14-384`) and `synchformer` / `dit` / `vae` / `vocoder` (the Synchformer
+/// `apple/DFN5B-CLIP-ViT-H-14-378`) and `synchformer` / `dit` / `vae` / `vocoder` (the Synchformer
 /// visual encoder, the small_16k MM-DiT, the 16k mel-VAE, and the 16k BigVGAN vocoder, all from
 /// `hkchengrex/MMAudio`). Advertised weights-free on the descriptor so a consumer knows what to stage.
 pub const REQUIRED_COMPONENTS: &[&str] = &["clip", "synchformer", "dit", "vae", "vocoder"];
@@ -140,6 +96,9 @@ pub const REQUIRED_COMPONENTS: &[&str] = &["clip", "synchformer", "dit", "vae", 
 /// MMAudio's identity + capabilities — constructible without weights.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: None,
+        control_kinds: None,
         required_components: REQUIRED_COMPONENTS,
         id: MODEL_ID,
         family: FAMILY,
@@ -148,35 +107,24 @@ pub fn descriptor() -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             // The one video→audio conditioning: a silent clip's RGB frames (the Foley condition).
             conditioning: vec![ConditioningKind::VideoSync],
-            supports_lora: false,
-            supports_lokr: false,
-            samplers: vec![],
-            schedulers: vec![],
-            supported_guidance_methods: vec![],
             // Pure audio: no visual size floor (the audio descriptor sweep exempts Audio, sc-13314).
             min_size: 0,
-            max_size: 0,
             // One clip per request (GenerationOutput::Audio carries a single track).
             max_count: 1,
-            mac_only: false,
+            // The Euler flow-matching ladder's 500-step bound, advertised rather than hidden
+            // (sc-19559).
+            supported_steps: StepSupport::Range {
+                min: 1,
+                max: MAX_STEPS,
+            },
             audio_sample_rates: vec![SAMPLE_RATE],
             max_audio_duration_secs: Some(MAX_DURATION_SECS),
             // No voice / edit-mode / speaker surface — this is video-conditioned Foley.
             audio_voices: vec![],
             audio_languages: LANGUAGES.to_vec(),
-            audio_edit_modes: vec![],
-            supported_quants: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
+            ..Default::default()
         },
     }
 }
@@ -848,8 +796,8 @@ mod tests {
     /// A weights-free [`LoadSpec`] that stages every required component (placeholder paths — `load`
     /// is lazy and reads no file, so the pipeline is not built here). `weights` is an ignored
     /// placeholder (mmaudio is a pure assembly of the five named components).
-    fn staged_spec() -> LoadSpec {
-        let dir = std::env::temp_dir().join("mmaudio-16k-staged");
+    fn staged_spec(tmp: &tempfile::TempDir) -> LoadSpec {
+        let dir = tmp.path().join("mmaudio-16k-staged");
         LoadSpec::new(WeightsSource::Dir(dir))
             .with_component("clip", WeightsSource::File("/nonexistent/clip.bin".into()))
             .with_component(
@@ -866,6 +814,7 @@ mod tests {
 
     #[test]
     fn load_requires_every_component_and_rejects_unsupported_spec_shapes() {
+        let tmp = tempfile::tempdir().unwrap();
         // Bare spec (no components) → load fails at the first missing component gate.
         let bare = LoadSpec::new(WeightsSource::Dir(std::env::temp_dir()));
         let err = match load(&bare) {
@@ -875,19 +824,20 @@ mod tests {
         assert!(err.to_string().contains("clip"), "got: {err}");
 
         // Every required component staged → load succeeds (lazy; no weight read).
-        assert!(load(&staged_spec()).is_ok());
+        assert!(load(&staged_spec(&tmp)).is_ok());
 
         // Quantization is still rejected as Unsupported even with components staged.
-        let mut spec = staged_spec();
+        let mut spec = staged_spec(&tmp);
         spec.quantize = Some(gen_core::Quant::Q4);
         assert!(matches!(load(&spec), Err(gen_core::Error::Unsupported(_))));
     }
 
     #[test]
     fn pre_tripped_cancel_returns_typed_canceled_before_any_heavy_work() {
+        let tmp = tempfile::tempdir().unwrap();
         // Components point at nonexistent files, but a pre-tripped cancel must return `Canceled`
         // before the lazy pipeline build ever touches them.
-        let g = load(&staged_spec()).unwrap();
+        let g = load(&staged_spec(&tmp)).unwrap();
         let flag = CancelFlag::new();
         flag.cancel();
         let mut req = foley_req(foley_frames(8, 16, 16, 0), 8);
@@ -898,9 +848,10 @@ mod tests {
 
     #[test]
     fn generate_on_missing_component_weights_fails_cleanly() {
+        let tmp = tempfile::tempdir().unwrap();
         // Components staged but their files do not exist → the lazy pipeline build fails with a
         // non-`Canceled` error (not a mid-render surprise).
-        let g = load(&staged_spec()).unwrap();
+        let g = load(&staged_spec(&tmp)).unwrap();
         let req = foley_req(foley_frames(8, 16, 16, 0), 8);
         let err = g.generate(&req, &mut |_| {}).unwrap_err();
         assert!(!matches!(err, gen_core::Error::Canceled));

@@ -24,6 +24,7 @@ pub mod config;
 pub mod conv3d;
 pub mod embeddings;
 pub mod image_encoder;
+pub mod memory_strategy;
 pub mod pipeline;
 pub mod preprocess;
 pub mod scheduler;
@@ -40,12 +41,9 @@ use candle_gen::gen_core::runtime::LoadPhase;
 use candle_gen::gen_core::{
     self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
     Generator, Image, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, PerComponentBytes,
-    Progress, WeightsSource,
+    Progress, StepSupport, WeightsSource,
 };
-use candle_gen::{
-    check_cancel, effective_offload_policy, run_three_stage_sequential, CandleError,
-    Result as CResult,
-};
+use candle_gen::{check_cancel, run_three_stage_sequential, CandleError, Result as CResult};
 
 use config::{
     ImageEncoderConfig, SchedulerConfig, UnetConfig, VaeConfig, MODEL_ID, SIZE_ALIGN, VAE_SCALE,
@@ -54,7 +52,10 @@ use image_encoder::SvdImageEncoder;
 use pipeline::SvdParams;
 use scheduler::EdmSchedule;
 use unet::SvdUnet;
-use vae::SvdVae;
+/// The concrete VAE assigned to the SVD-XT route.
+pub type ProviderVae = vae::SvdVae;
+/// Provider-facing SVD geometry, derived from the decoder implementation.
+pub const VAE_TILING: candle_gen::gen_core::tiling::VaeTiling = ProviderVae::VAE_TILING;
 
 /// OpenCLIP ViT-H image-normalization mean/std (the SVD `feature_extractor`).
 #[allow(clippy::excessive_precision)]
@@ -68,13 +69,13 @@ const CLIP_SIZE: usize = 224;
 #[derive(Clone)]
 struct Components {
     image_encoder: Arc<SvdImageEncoder>,
-    vae: Arc<SvdVae>,
+    vae: Arc<ProviderVae>,
     unet: Arc<SvdUnet>,
 }
 
 struct ConditioningComponents {
     image_encoder: SvdImageEncoder,
-    vae: SvdVae,
+    vae: ProviderVae,
 }
 
 fn load_image_encoder(root: &Path, device: &Device) -> CResult<SvdImageEncoder> {
@@ -85,8 +86,8 @@ fn load_image_encoder(root: &Path, device: &Device) -> CResult<SvdImageEncoder> 
     .map_err(Into::into)
 }
 
-fn load_vae(root: &Path, device: &Device) -> CResult<SvdVae> {
-    SvdVae::new(
+fn load_vae(root: &Path, device: &Device) -> CResult<ProviderVae> {
+    ProviderVae::new(
         &VaeConfig::default(),
         component_vb(root, "vae", "diffusion_pytorch_model", DType::F32, device)?,
     )
@@ -244,7 +245,7 @@ pub(crate) fn component_footprint(spec: &LoadSpec) -> gen_core::Result<PerCompon
 
 /// Upper bound on a `Reference` image's dimensions (caps host allocations on the input buffer + the
 /// resize's f32 intermediates). 8192 is far above any real photo (F-164).
-const MAX_REFERENCE_DIM: u32 = 8192;
+pub(crate) const MAX_REFERENCE_DIM: u32 = 8192;
 /// Upper bound on requested output `frames` — SVD-XT is the 25-frame variant; per-frame latents +
 /// `added_time_ids` scale linearly, so cap the allocation.
 const MAX_FRAMES: u32 = 64;
@@ -255,43 +256,32 @@ const MAX_STEPS: u32 = 200;
 /// (`req.guidance` overrides the ceiling), no negative prompt / sampler / scheduler / LoRA / quant.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::SVD_LATENT_SPACE),
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "svd",
         backend: "candle",
         modality: Modality::Video,
         capabilities: Capabilities {
-            supports_negative_prompt: false,
             supports_guidance: true,
-            supports_true_cfg: false,
             conditioning: vec![ConditioningKind::Reference],
-            supports_lora: false,
-            supports_lokr: false,
             // Unified curated SAMPLER menu (epic 7114 P4, sc-7125, decision 3b: sampler-only, NO
             // scheduler axis — SVD keeps its native Karras EDM σ schedule). SVD is EDM v-prediction;
             // the default `euler` over `EdmModelSampling` reproduces the native v-pred Euler loop (N1).
             samplers: candle_gen::curated_sampler_names(),
-            schedulers: Vec::new(),
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 1024,
             max_count: 1,
-            mac_only: false,
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
+            // SVD-XT's engine bound, advertised rather than hidden (sc-19559) — the candle twin
+            // of `mlx-gen-svd`'s declaration, from this lane's own `MAX_STEPS` (both 200).
+            supported_steps: StepSupport::Range {
+                min: 1,
+                max: MAX_STEPS,
+            },
             supports_sequential_offload: true,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            supported_quants: &[],
+            ..Default::default()
         },
     }
 }
@@ -306,6 +296,7 @@ pub struct SvdGenerator {
     /// conditioner → UNet → VAE in disjoint phases through the shared Candle lifecycle.
     offload: OffloadPolicy,
     components: Mutex<Option<Components>>,
+    memory: Option<memory_strategy::PreparedSvdMemory>,
 }
 
 /// The SVD-specific request validation the core `Capabilities::validate_request` leaves to each model
@@ -370,19 +361,22 @@ fn validate_reference_image(img: &Image) -> gen_core::Result<()> {
 impl SvdGenerator {
     /// Resolve the single conditioning reference image (image→video input).
     fn reference<'a>(&self, req: &'a GenerationRequest) -> gen_core::Result<&'a Image> {
-        req.conditioning
-            .iter()
-            .find_map(|c| match c {
-                Conditioning::Reference { image, .. } => Some(image),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                gen_core::Error::Msg("svd_xt: image→video requires a Reference image".into())
-            })
+        match req.conditioning.as_slice() {
+            [Conditioning::Reference {
+                image,
+                strength: None,
+            }] => Ok(image),
+            _ => Err(gen_core::Error::Msg(
+                "svd_xt: image→video requires exactly one strength-free Reference image".into(),
+            )),
+        }
     }
 
     /// Lazily load + cache the SVD components. `cached` recovers a poisoned lock (sc-9015) internally.
     fn components(&self) -> CResult<Components> {
+        if let Some(memory) = &self.memory {
+            memory.ensure_unchanged()?;
+        }
         candle_gen::cached(&self.components, || {
             Components::load(&self.root, &self.device)
         })
@@ -419,7 +413,7 @@ impl SvdGenerator {
     #[allow(clippy::too_many_arguments)]
     fn image_latents(
         &self,
-        vae: &SvdVae,
+        vae: &ProviderVae,
         img: &Image,
         height: u32,
         width: u32,
@@ -495,6 +489,15 @@ impl Generator for SvdGenerator {
         validate_output_params(req)?;
         let img = self.reference(req)?;
         validate_reference_image(img)?;
+        if req.memory.is_some() {
+            let memory = self.memory.as_ref().ok_or_else(|| {
+                gen_core::Error::Unsupported(
+                    "svd_xt: memory request requires a sealed physical receipt".into(),
+                )
+            })?;
+            memory_strategy::validate_memory_request(req)?;
+            memory_strategy::validate_active_request(memory, req)?;
+        }
         Ok(())
     }
 
@@ -723,9 +726,42 @@ impl Generator for SvdGenerator {
             audio: None,
         })
     }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory.as_ref().map(|prepared| &prepared.contract)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        self.memory.as_ref().map_or_else(
+            || gen_core::MemorySafetyDecision::Reject {
+                reason: "svd_xt: loaded generator has no sealed memory receipt".into(),
+            },
+            |prepared| memory_strategy::safety_check(prepared, context),
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let memory = self.memory.as_ref().ok_or_else(|| {
+            gen_core::Error::Unsupported(
+                "svd_xt: loaded generator has no sealed memory receipt".into(),
+            )
+        })?;
+        memory_strategy::begin_request(memory, self.device.clone(), context)
+    }
 }
 
 fn load_generator(spec: &LoadSpec) -> gen_core::Result<SvdGenerator> {
+    let memory = if spec.prepared_file_pins().is_prepared() {
+        Some(memory_strategy::PreparedSvdMemory::prepare(spec)?)
+    } else {
+        None
+    };
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
         WeightsSource::File(_) => {
@@ -746,18 +782,38 @@ fn load_generator(spec: &LoadSpec) -> gen_core::Result<SvdGenerator> {
             "candle svd does not support quantization".into(),
         ));
     }
-    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
+    if spec.control.is_some()
+        || !spec.extra_controls.is_empty()
+        || spec.ip_adapter.is_some()
+        || spec.pid.is_some()
+        || spec.identity.is_some()
+        || spec.text_encoder.is_some()
+        || !spec.components.is_empty()
+    {
         return Err(gen_core::Error::Unsupported(
             "candle svd does not support control / IP-adapter overlays".into(),
         ));
     }
     let device = candle_gen::default_device()?;
+    // The public prepared route advertises request-scoped Resident authority. Materialize its
+    // sealed components inside the admitted cache load transaction so the cache's before/after
+    // device snapshots attribute the actual F32 residency. Direct callers without a prepared
+    // receipt retain the historical lazy Resident/Sequential behavior.
+    let components = if memory.is_some() {
+        Some(Components::load(&root, &device)?)
+    } else {
+        None
+    };
+    if let Some(memory) = &memory {
+        memory.ensure_unchanged()?;
+    }
     Ok(SvdGenerator {
         descriptor: descriptor(),
         root,
         device,
-        offload: effective_offload_policy(spec.offload_policy),
-        components: Mutex::new(None),
+        offload: spec.offload_policy,
+        components: Mutex::new(components),
+        memory,
     })
 }
 
@@ -777,12 +833,34 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(REGISTRATION)
+    register_memory_contract_surfaces(registry.register_generator(REGISTRATION))
+}
+
+/// Register SVD-XT's dense Resident memory route and its explicit weights-free witness.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_resident_only_memory_contract(memory_strategy::RESIDENT_ONLY_WITNESS)
 }
 
 /// Build the complete explicit Candle SVD provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
     register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+/// Resolve the load-bearing VAE geometry for the Candle SVD generator id.
+///
+/// The write cap applies to one actual VAE decode pass. With the library default, the 25-frame clip
+/// is one 25-frame decode pass and therefore exceeds the 14-frame cap at both shipped 1024x576 and
+/// 576x1024 geometries. SceneWorks, however, resolves both product lanes to an 8-frame chunk, which
+/// is below this write cap (although the live-memory budget can still require spatial tiling).
+/// Consumers must therefore classify the pass using
+/// `min(request_frames, max(1, decode_chunk_size))`, not the whole clip length. Neither "the
+/// shipped default is always tiled" nor "an SVD clip is always single-pass" is a truthful model.
+pub fn vae_tiling(provider_id: &str) -> Option<candle_gen::gen_core::tiling::VaeTiling> {
+    (provider_id == MODEL_ID).then_some(VAE_TILING)
 }
 
 #[cfg(test)]
@@ -795,6 +873,23 @@ mod explicit_registry_tests {
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
         assert_eq!(explicit, ["svd_xt"]);
+    }
+
+    #[test]
+    fn provider_id_resolves_to_the_concrete_decoder_geometry() {
+        assert_eq!(super::VAE_TILING, super::ProviderVae::VAE_TILING);
+        assert_eq!(
+            super::vae_tiling(super::MODEL_ID),
+            Some(super::ProviderVae::VAE_TILING)
+        );
+        assert_eq!(super::vae_tiling("not_svd"), None);
+        for (width, height) in [(1024, 576), (576, 1024)] {
+            assert_eq!(
+                super::VAE_TILING.writable_frame_cap(height, width),
+                14,
+                "{width}x{height}"
+            );
+        }
     }
 }
 
@@ -831,6 +926,47 @@ mod tests {
         assert!(
             d.capabilities.supports_sequential_offload,
             "svd_xt must advertise the staged conditioner → UNet → VAE lifecycle"
+        );
+    }
+
+    /// sc-19559 — the candle twin of `mlx-gen-svd`'s ceiling test. The bound both lanes have
+    /// always enforced privately is now readable off the descriptor and rejected by the SHARED
+    /// floor, so the two lanes refuse the same counts from the same declaration.
+    ///
+    /// Reading `ceiling()` alone would pass against a descriptor nothing enforces; asserting only
+    /// the refusal would pass against a bound that stays undiscoverable. Both are asserted.
+    #[test]
+    fn the_step_ceiling_is_advertised_and_enforced_by_the_shared_floor() {
+        let caps = descriptor().capabilities;
+        assert_eq!(
+            caps.supported_steps.ceiling(),
+            Some(MAX_STEPS),
+            "the descriptor must advertise the engine's own ceiling, weights-free"
+        );
+        assert_eq!(caps.supported_steps.floor(), Some(1));
+
+        let at = |steps: u32| {
+            caps.validate_request(
+                MODEL_ID,
+                &GenerationRequest {
+                    width: 512,
+                    height: 512,
+                    count: 1,
+                    steps: Some(steps),
+                    ..Default::default()
+                },
+            )
+        };
+        assert!(
+            at(MAX_STEPS).is_ok(),
+            "the advertised ceiling itself must be renderable"
+        );
+        let err = at(MAX_STEPS + 1)
+            .expect_err("the shared floor must refuse an over-ceiling count")
+            .to_string();
+        assert!(
+            err.contains(MODEL_ID) && err.contains(&format!("1..={MAX_STEPS}")),
+            "the refusal must name the model and the advertised range: {err}"
         );
     }
 
@@ -1028,12 +1164,8 @@ mod tests {
     /// makes every field here read `full + fp16` and the assert fails.
     #[test]
     fn component_footprint_sizes_the_selected_file_not_the_whole_dir() {
-        let root = std::env::temp_dir().join(format!(
-            "sc12397_svd_footprint_{}_{}",
-            std::process::id(),
-            line!()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         // Both dtype variants side by side, as the real snapshot ships them.
         for (sub, stem, full, fp16) in [
             ("unet", "diffusion_pytorch_model", 6_000_u64, 3_000_u64),
@@ -1061,8 +1193,6 @@ mod tests {
         assert_eq!(fp.text_encoder, 2_500, "image_encoder: the f32 file");
         // …so the total is the load, not the directory. A dir sum would read 13_350.
         assert_eq!(fp.text_encoder + fp.dit + fp.vae, 8_900);
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A component the loader cannot resolve contributes `0`, and never errors: the footprint is a

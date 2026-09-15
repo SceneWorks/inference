@@ -11,12 +11,17 @@
 //!
 //! The candle deviations from the mlx descriptor are the two backend-correct ones the SDXL / FLUX /
 //! Z-Image / Chroma candle slices already make: `backend = "candle"` and `mac_only = false`. This lane
-//! wires **txt2img + packed q4/q8 tiers** (sc-10819, epic 9083 — the `SceneWorks/kolors-mlx` tier is
-//! packed-detected from disk); LoRA/LoKr, ControlNet-pose, and IP-Adapter (all wired in the mlx
-//! provider) are NOT advertised here, and are rejected at load rather than silently dropped (the
-//! false-capability trap).
+//! wires **txt2img + single-reference img2img + packed q4/q8 tiers** (sc-10819, epic 9083 — the
+//! `SceneWorks/kolors-mlx` tier is packed-detected from disk). LoRA/LoKr are applied through the
+//! shared SDXL-family UNet adapter loader;
+//! ControlNet-pose and IP-Adapter stay on their existing bespoke Candle providers and are rejected
+//! by this registered generator rather than silently dropped (the false-capability trap).
 
-use candle_gen::gen_core::{Capabilities, Modality, ModelDescriptor, Quant};
+use candle_gen::gen_core::{
+    Capabilities, ConditioningKind, Modality, ModelDescriptor, Quant, StepSupport,
+};
+
+use crate::sampler::NUM_TRAIN_TIMESTEPS;
 
 /// Registry id — matches the SceneWorks worker's `payload.model` for the Kolors family.
 pub const MODEL_ID: &str = "kolors";
@@ -34,10 +39,10 @@ pub const DEFAULT_SAMPLER: &str = "euler_discrete";
 pub const SIZE_MULTIPLE: u32 = 8;
 
 /// Kolors' identity + the surface this candle lane wires: real classifier-free guidance (negative
-/// prompt + CFG scale), txt2img, and packed **Q4/Q8** MLX-tier inference (sc-10819). No conditioning /
-/// LoRA is advertised — those remain the Python fallback's job until candle wires them, so the
-/// descriptor never promises a path `generate` can't serve. Two backend-correct deviations from
-/// `mlx-gen-kolors`: `backend = "candle"` and `mac_only = false`.
+/// prompt + CFG scale), txt2img, single-reference img2img, and packed **Q4/Q8** MLX-tier inference
+/// (sc-10819). User LoRA/LoKr applies at load; ControlNet-pose and IP-Adapter retain separate Candle
+/// providers, so this descriptor never promises a path `generate` cannot serve. Two backend-correct
+/// deviations from `mlx-gen-kolors`: `backend = "candle"` and `mac_only = false`.
 ///
 /// epic 7114 P4 (sc-7124): the native leading `euler_discrete` is the byte-exact DEFAULT, but the
 /// curated ε/DDPM sampler menu (euler / euler_ancestral / heun / dpmpp_2m / dpmpp_sde / uni_pc / lcm /
@@ -47,6 +52,9 @@ pub const SIZE_MULTIPLE: u32 = 8;
 /// `discrete` scheduler alias is retained.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::SDXL_LATENT_SPACE),
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "kolors",
@@ -57,15 +65,12 @@ pub fn descriptor() -> ModelDescriptor {
             // Kolors uses real classifier-free guidance over the ChatGLM3 conditioning.
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
-            // txt2img only in this slice — img2img (Reference) / ControlNet-pose (Control) / IP-Adapter
-            // land later (Phase 3, epic 5480). Advertising none means the shared `validate_request`
-            // rejects any conditioning, and the worker keeps those shapes on the Python path.
-            conditioning: vec![],
-            // LoRA/LoKr merge into the SDXL-family UNet at load in the mlx provider (sc-4733), but the
-            // candle merge is not wired in this slice — not advertised, rejected at load.
-            supports_lora: false,
-            supports_lokr: false,
+            // The registered generator accepts one Reference as a deterministic latent-init img2img.
+            // ControlNet-pose and IP-Adapter remain separate, already-wired bespoke providers.
+            conditioning: vec![ConditioningKind::Reference],
+            // LoRA/LoKr merge into the vendored SDXL-family UNet on dense and packed tiers.
+            supports_lora: true,
+            supports_lokr: true,
             // epic 7114 P4 (sc-7124): the native leading EulerDiscrete (`euler_discrete`) stays the
             // byte-exact DEFAULT (N1), but the curated ε/DDPM menu (euler / euler_ancestral / heun /
             // dpmpp_2m / dpmpp_sde / uni_pc / lcm / ddim) is ADDED over `DiscreteModelSampling`, plus the
@@ -80,32 +85,38 @@ pub fn descriptor() -> ModelDescriptor {
                 candle_gen::curated_scheduler_names(),
                 &["discrete"],
             ),
-            supported_guidance_methods: vec![],
             min_size: 512,
             max_size: 2048,
             max_count: 8,
-            // candle is the Windows/CUDA backend — NOT Mac-only (the MLX provider sets this true).
-            mac_only: false,
+            // Kolors' train-timestep count is a real upper bound (see the mlx twin and F-124):
+            // above it every timestep collapses to 1 and the render is silent garbage. Declared
+            // so a consumer can read the bound without dispatching a job (sc-19559).
+            supported_steps: StepSupport::Range {
+                min: 1,
+                max: NUM_TRAIN_TIMESTEPS as u32,
+            },
             // Packed q4/q8 MLX-tier inference (sc-10819, epic 9083): the `SceneWorks/kolors-mlx` tier
             // packs the SDXL-family UNet + the four ChatGLM3 projections (VAE dense), and the candle
             // loader packed-detects it from disk (`pipeline::load_components`). Advertise Q4/Q8; the
             // `LoadSpec::quantize` overlay is an advisory no-op on an already-packed tier (as with
             // sdxl/boogu/flux2-dev). bf16 tiers stay dense (Quant::None).
             supported_quants: &[Quant::Q4, Quant::Q8],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            // Per-step latent previews (epic 16948, sc-16954): both lanes of this registered route
+            // emit -- the curated driver lane and the native leading-Euler loop -- as do the
+            // name-driven pose-control and IP-Adapter providers. Kolors adds no fit of its own; it
+            // projects through `candle_gen_sdxl::preview` (one byte-identical VAE file).
+            supports_preview: true,
+            // sc-18317: Kolors runs real classifier-free guidance, and the one convention this lane
+            // implements is the doubled `[uncond, cond]` batch `common::cfg_batch_context` builds.
+            // Declaring the single mode makes it planner-selectable and makes `sequential` a refusal
+            // by name at the shared floor rather than a silently batched run.
+            execution: candle_gen::gen_core::ExecutionSurface {
+                cfg_batching: candle_gen::gen_core::CfgBatchingDomain::Modes(
+                    crate::common::CFG_BATCHING_MODES.to_vec(),
+                ),
+                ..candle_gen::gen_core::ExecutionSurface::default()
+            },
+            ..Default::default()
         },
     }
 }
@@ -159,8 +170,89 @@ impl ChatGlmConfig {
 mod tests {
     use super::*;
 
+    /// **sc-18317 — the declared CFG-batching domain is reachable, and the two domains this lane has
+    /// no mechanism for are refused.**
+    ///
+    /// The production `validate` delegates the shared contract to `Capabilities::validate_request`
+    /// (asserted separately), so admitting/refusing here is admitting/refusing on the `generate` path.
+    /// `Batched` is admitted because `common::cfg_batch_context` genuinely consumes it; `Sequential` is refused because the
+    /// ChatGLM3 conditioning and the vendored SDXL denoise runs guidance as one batch; and the cadence / FFN-chunk domains are refused because this
+    /// family has no such mechanism at all — the truthful state, not an oversight.
     #[test]
-    fn descriptor_advertises_only_wired_txt2img_surface() {
+    fn execution_domains_are_declared_exactly_where_this_lane_consumes_them() {
+        let caps = descriptor().capabilities;
+        assert!(caps.execution.declaration_errors().is_empty());
+        assert!(caps.execution.cfg_batching.is_supported());
+        assert!(!caps.execution.graph_eval_cadence_blocks.is_supported());
+        assert!(!caps.execution.ffn_chunk_rows.is_supported());
+
+        let request = |memory| candle_gen::gen_core::GenerationRequest {
+            prompt: "a fox".into(),
+            width: 1024,
+            height: 1024,
+            count: 1,
+            steps: Some(1),
+            memory: Some(memory),
+            ..Default::default()
+        };
+
+        caps.validate_request(
+            "kolors",
+            &request(candle_gen::gen_core::GenerationMemory {
+                cfg_batching: Some(candle_gen::gen_core::CfgBatching::Batched),
+                ..Default::default()
+            }),
+        )
+        .expect("the implemented mode must be admitted");
+
+        for (label, memory) in [
+            (
+                "cfg_batching",
+                candle_gen::gen_core::GenerationMemory {
+                    cfg_batching: Some(candle_gen::gen_core::CfgBatching::Sequential),
+                    ..Default::default()
+                },
+            ),
+            (
+                "graph_eval_cadence",
+                candle_gen::gen_core::GenerationMemory {
+                    graph_eval_cadence: Some(candle_gen::gen_core::GraphEvalCadence::EVERY_BLOCK),
+                    ..Default::default()
+                },
+            ),
+            (
+                "ffn_chunk",
+                candle_gen::gen_core::GenerationMemory {
+                    ffn_chunk: Some(candle_gen::gen_core::FfnChunk::new(2048).unwrap()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let error = caps
+                .validate_request("kolors", &request(memory))
+                .expect_err("an unimplemented execution selection must be refused");
+            assert!(
+                matches!(error, candle_gen::gen_core::Error::Unsupported(_)),
+                "{label} must be a capability gap: {error:?}"
+            );
+            let message = error.to_string();
+            assert!(message.contains(label), "{label}: {message}");
+            assert!(
+                message.contains("unset"),
+                "{label} refusal must name the remedy: {message}"
+            );
+        }
+
+        // And an unset selection still validates — the default-preservation half.
+        caps.validate_request(
+            "kolors",
+            &request(candle_gen::gen_core::GenerationMemory::default()),
+        )
+        .expect("an unset execution selection must validate");
+    }
+
+    #[test]
+    fn descriptor_advertises_txt2img_and_reference_img2img() {
         let d = descriptor();
         assert_eq!(d.id, "kolors");
         assert_eq!(d.family, "kolors");
@@ -169,11 +261,15 @@ mod tests {
         assert!(d.capabilities.supports_negative_prompt);
         assert!(d.capabilities.supports_guidance);
         assert!(!d.capabilities.supports_true_cfg);
+        assert!(d.capabilities.accepts(ConditioningKind::Reference));
         assert!(!d.capabilities.mac_only);
-        // txt2img: no conditioning / LoRA advertised on the candle lane.
-        assert!(d.capabilities.conditioning.is_empty());
-        assert!(!d.capabilities.supports_lora);
-        assert!(!d.capabilities.supports_lokr);
+        assert_eq!(
+            d.capabilities.conditioning,
+            vec![ConditioningKind::Reference]
+        );
+        // User adapter stacks remain outside this registered base/img2img lane.
+        assert!(d.capabilities.supports_lora);
+        assert!(d.capabilities.supports_lokr);
         // sc-10819: packed q4/q8 MLX-tier inference is wired end-to-end, so Q4/Q8 are advertised.
         assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         // sc-7124: the curated ε/DDPM sampler menu + the native `euler_discrete` alias; the curated

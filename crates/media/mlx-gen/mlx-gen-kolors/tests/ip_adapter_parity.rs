@@ -13,7 +13,7 @@
 //!    non-destructive); `ip_scale>0` perturbs the output and renders coherently. (f32 for the
 //!    byte-exact invariant — same bf16-chaos caveat as the ControlNet gate.)
 //!
-//! Run: `cargo test -p mlx-gen-kolors --release --test ip_adapter_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-kolors --release --test integration ip_adapter_parity:: -- --ignored --nocapture`
 
 use std::path::PathBuf;
 

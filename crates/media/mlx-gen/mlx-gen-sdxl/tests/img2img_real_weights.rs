@@ -1,7 +1,7 @@
 //! sc-2638: SDXL img2img parity vs the vendored `generate_latents_from_image` reference.
 //!
 //! `#[ignore]`d — needs the real SDXL snapshot + the golden from `tools/dump_sdxl_img2img_golden.py`.
-//! Run: cargo test -p mlx-gen-sdxl --release --test img2img_real_weights -- --ignored --nocapture
+//! Run: cargo test -p mlx-gen-sdxl --release --test integration img2img_real_weights:: -- --ignored --nocapture
 //!
 //! Two gates:
 //! - `img2img_components_match_reference` — the init pipeline (preprocess → VAE-encode mean `x_0`,
@@ -14,7 +14,7 @@
 //!   divergence (sc-2400 S6 — NOT a code bug; the components above are bit-exact, and strength=1.0,
 //!   like 8-step T2I, is pixel-exact).
 
-mod common;
+use crate::common;
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};

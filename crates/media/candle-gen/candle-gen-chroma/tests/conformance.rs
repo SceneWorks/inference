@@ -11,7 +11,7 @@
 //! ```text
 //! set CHROMA_HD_SNAPSHOT=C:\Users\…\models--lodestones--Chroma1-HD\snapshots\<hash>
 //! set CHROMA_FLASH_SNAPSHOT=C:\Users\…\models--lodestones--Chroma1-Flash\snapshots\<hash>
-//! cargo test -p candle-gen-chroma --features cuda --release --test conformance -- --ignored
+//! cargo test -p candle-gen-chroma --features cuda --release --test integration conformance:: -- --ignored
 //! ```
 //!
 //! As with the SDXL/FLUX/Z-Image slices: same-backend determinism only; cross-backend pixel equality

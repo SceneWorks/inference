@@ -37,7 +37,7 @@ fn tiny_medium_arch() -> Sd3Arch {
     }
 }
 
-fn synthetic_weights(arch: &Sd3Arch) -> Weights {
+fn synthetic_weights(tmp: &tempfile::TempDir, arch: &Sd3Arch) -> Weights {
     let entries: Vec<(String, Array)> = expected_transformer_tensors(arch)
         .into_iter()
         .map(|e| {
@@ -45,9 +45,10 @@ fn synthetic_weights(arch: &Sd3Arch) -> Weights {
             (e.key, Array::ones::<f32>(&dims).unwrap())
         })
         .collect();
-    let path = std::env::temp_dir().join(format!(
-        "mlx_gen_sd3_medium_synthetic_{}.safetensors",
-        entries.len()
+    let path = tmp.path().join(format!(
+        "mlx_gen_sd3_medium_synthetic_{}_{}.safetensors",
+        entries.len(),
+        std::process::id()
     ));
     Array::save_safetensors(
         entries.iter().map(|(k, v)| (k.as_str(), v)),
@@ -93,14 +94,18 @@ fn medium_variant_descriptor_and_schedule() {
     assert_eq!(v.id(), SD3_5_MEDIUM_ID);
     assert_eq!(v.hf_model(), "stabilityai/stable-diffusion-3.5-medium");
     assert_eq!(v.arch(), Sd3Arch::medium());
-    // Medium is true-CFG (negative prompt + guidance), unlike Turbo.
-    assert!(v.supports_true_cfg());
+    // Medium uses classifier-free guidance (negative prompt + guidance), unlike Turbo.
+    assert!(v.uses_classifier_free_guidance());
     assert!(v.default_guidance() > 1.0);
     assert!(v.default_steps() >= 20);
     let d = v.descriptor();
     assert_eq!(d.id, SD3_5_MEDIUM_ID);
     assert!(d.capabilities.supports_negative_prompt);
     assert!(d.capabilities.supports_guidance);
+    assert!(
+        !d.capabilities.supports_true_cfg,
+        "request.true_cfg is not consumed"
+    );
     // pos_embed_max 384 → 1440²-capable; descriptor advertises max_size 1440.
     assert!(d.capabilities.max_size >= 1440);
 }
@@ -293,8 +298,9 @@ fn medium_expected_table_has_no_duplicate_keys() {
 
 #[test]
 fn build_target_state_dict_round_trips_medium_layout() {
+    let tmp = tempfile::tempdir().unwrap();
     let arch = tiny_medium_arch();
-    let src = synthetic_weights(&arch);
+    let src = synthetic_weights(&tmp, &arch);
     let out = build_target_state_dict(&src, &arch).unwrap();
 
     assert_eq!(out.len(), expected_tensor_count(&arch));
@@ -357,6 +363,7 @@ fn validate_arch_rejects_large_set_against_medium_arch() {
 
 #[test]
 fn quantize_keeps_attn2_norms_dense_and_packs_attn2_linears() {
+    let tmp = tempfile::tempdir().unwrap();
     // Build a tiny dense map and quantize; attn2 Linears must pack (gain .scales), attn2 norms must
     // stay dense (no .scales), mirroring the joint-attention norm handling. MLX `quantize` only
     // supports group sizes 32/64/128, so the fixture's Linear inner dim (hidden) must be ≥ and a
@@ -375,7 +382,7 @@ fn quantize_keeps_attn2_norms_dense_and_packs_attn2_linears() {
         time_proj_dim: 64,
         dual_attention_layers: 2,
     };
-    let src = synthetic_weights(&arch);
+    let src = synthetic_weights(&tmp, &arch);
     let dense = build_target_state_dict(&src, &arch).unwrap();
     let q = quantize_sd3_transformer(dense, 8, 32).unwrap();
 

@@ -22,7 +22,12 @@
 
 mod beta;
 mod config;
+mod memory_strategy;
 mod pipeline;
+// Per-step latent previews (epic 16948, sc-16956). A re-export of `candle_gen_flux::preview`: Chroma
+// packs, unpacks and decodes the same 16-channel `AutoencoderKL` bytes as FLUX.1, so it shares that
+// crate's committed fit rather than restating it. See the module docs for the tensor-byte provenance.
+pub mod preview;
 mod quant;
 mod rope;
 mod text;
@@ -32,15 +37,31 @@ mod vae;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use candle_gen::candle_core::Device;
+use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
-    self, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor, PidWeights,
-    Progress, WeightsSource,
+    self, AdapterSpec, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor,
+    PidWeights, Progress, WeightsSource,
 };
 
 pub use config::{ChromaVariant, CHROMA1_BASE_ID, CHROMA1_FLASH_ID, CHROMA1_HD_ID, SIZE_MULTIPLE};
 
 use pipeline::{Components, Pipeline};
+
+/// Dense Chroma components that retain their checkpoint-native width.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NativeComponent {
+    T5,
+    Vae,
+}
+
+/// Chroma publishes its dense T5-XXL and FLUX.1 VAE tensors as BF16. Keeping the selections explicit
+/// makes either loader's precision policy independently testable.
+pub(crate) fn native_component_dtype(component: NativeComponent) -> DType {
+    match component {
+        NativeComponent::T5 => DType::BF16,
+        NativeComponent::Vae => DType::BF16,
+    }
+}
 
 /// A loaded candle Chroma generator (one per variant). Loading is **lazy**: `load` does no file I/O,
 /// and the heavy components (T5 + DiT + VAE) are built on the first [`generate`](Generator::generate)
@@ -53,7 +74,12 @@ pub struct ChromaGenerator {
     /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
     /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
     pid_spec: Option<PidWeights>,
+    adapters: Vec<AdapterSpec>,
     components: Mutex<Option<Components>>,
+    lifecycle: Mutex<()>,
+    memory_contract: gen_core::MemoryProviderContract,
+    load_receipt: Option<memory_strategy::ChromaLoadReceipt>,
+    memory_admission: memory_strategy::AdmissionRegistry,
 }
 
 impl ChromaGenerator {
@@ -65,9 +91,103 @@ impl ChromaGenerator {
     }
 }
 
+fn evict_warm_for_staged<T>(slot: &Mutex<Option<T>>) -> Option<T> {
+    candle_gen::lock_recover(slot).take()
+}
+
+fn release_warm_after_synchronize<T>(device: &Device, component: T) -> gen_core::Result<()> {
+    match device.synchronize() {
+        Ok(()) => {
+            drop(component);
+            Ok(())
+        }
+        Err(error) => {
+            // Releasing storage while queued work may still reference it is unsafe. A failed device
+            // synchronization is already terminal for the generator, so retain the allocation.
+            std::mem::forget(component);
+            Err(gen_core::Error::backend(error))
+        }
+    }
+}
+
 impl Generator for ChromaGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_contract)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        if let Some(receipt) = &self.load_receipt {
+            if let Err(error) = receipt.ensure_unchanged() {
+                self.memory_admission.clear_approval();
+                return gen_core::MemorySafetyDecision::Reject {
+                    reason: error.to_string(),
+                };
+            }
+        }
+        if context.use_pid
+            && self
+                .load_receipt
+                .as_ref()
+                .is_none_or(|receipt| receipt.pid.is_none())
+        {
+            self.memory_admission.clear_approval();
+            return gen_core::MemorySafetyDecision::Reject {
+                reason: format!(
+                    "{}: PiD was requested without the loaded PiD artifact receipt",
+                    self.descriptor.id
+                ),
+            };
+        }
+        match memory_strategy::validate_context(
+            self.descriptor.id,
+            &self.memory_contract,
+            context,
+            self.load_receipt.as_ref().and_then(|receipt| receipt.tier),
+        ) {
+            Ok(()) => match self.memory_admission.approve(context) {
+                Ok(()) => gen_core::MemorySafetyDecision::Accept,
+                Err(error) => gen_core::MemorySafetyDecision::Reject {
+                    reason: error.to_string(),
+                },
+            },
+            Err(error) => {
+                self.memory_admission.clear_approval();
+                gen_core::MemorySafetyDecision::Reject {
+                    reason: error.to_string(),
+                }
+            }
+        }
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        if let Some(receipt) = &self.load_receipt {
+            receipt.ensure_unchanged()?;
+        }
+        memory_strategy::validate_context(
+            self.descriptor.id,
+            &self.memory_contract,
+            context,
+            self.load_receipt.as_ref().and_then(|receipt| receipt.tier),
+        )?;
+        Ok(Some(Box::new(
+            memory_strategy::ChromaMemoryScope::new_bound(
+                self.descriptor.id,
+                self.device.clone(),
+                &self.memory_contract,
+                context,
+                self.memory_admission.clone(),
+            )?,
+        )))
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -102,14 +222,41 @@ impl Generator for ChromaGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
+        self.memory_admission.consume_for_generate(req)?;
+        if let Some(receipt) = &self.load_receipt {
+            receipt.ensure_unchanged()?;
+        }
+        let memory = req.memory.unwrap_or_default();
+        if memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: bounded decode, attention, and transformer residency are Missing",
+                self.descriptor.id
+            )));
+        }
         let pipe = Pipeline::load(
             self.variant,
             &self.root,
             &self.device,
             self.pid_spec.clone(),
+            self.adapters.clone(),
         );
-        let components = self.components(&pipe)?;
-        let images = pipe.render(req, &components, on_progress)?;
+        let images = if memory.stage_residency {
+            // A staged request is authoritative over the warm cache. Evict before opening T5 and
+            // never repopulate this slot from request-local phase components. The removed cache
+            // value remains owned until all queued work has synchronized.
+            if let Some(warm) = evict_warm_for_staged(&self.components) {
+                release_warm_after_synchronize(&self.device, warm)?;
+            } else {
+                self.device
+                    .synchronize()
+                    .map_err(gen_core::Error::backend)?;
+            }
+            pipe.render_staged(req, on_progress)?
+        } else {
+            let components = self.components(&pipe)?;
+            pipe.render(req, &components, on_progress)?
+        };
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -127,8 +274,8 @@ pub fn descriptor_flash() -> ModelDescriptor {
 
 /// Construct a lazy candle Chroma generator for `variant`. `spec.weights` must be a
 /// [`WeightsSource::Dir`] pointing at a Chroma diffusers snapshot (`tokenizer/`, `text_encoder/`,
-/// `transformer/`, `vae/`). LoRA adapters, quantization, and control/IP-adapter overlays are rejected
-/// — none are wired in this slice, so refusing is more honest than silently dropping them.
+/// `transformer/`, `vae/`). Ordered LoRA/LoKr adapters and the optional PiD decoder are admitted and
+/// receipt-pinned; control/IP-adapter overlays and on-the-fly quantization remain unsupported.
 fn load_variant(variant: ChromaVariant, spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let id = variant.id();
     let root = match &spec.weights {
@@ -140,11 +287,6 @@ fn load_variant(variant: ChromaVariant, spec: &LoadSpec) -> gen_core::Result<Box
             )));
         }
     };
-    if !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "candle {id} does not support LoRA/LoKr yet — refusing to silently drop the adapters"
-        )));
-    }
     if spec.quantize.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {id} does not support on-the-fly Q4/Q8 quantization yet"
@@ -156,6 +298,23 @@ fn load_variant(variant: ChromaVariant, spec: &LoadSpec) -> gen_core::Result<Box
         )));
     }
     let device = candle_gen::default_device()?;
+    let (load_receipt, memory_contract) =
+        match memory_strategy::ChromaLoadReceipt::capture(id, spec) {
+            Ok(receipt) => {
+                let contract = memory_strategy::contract_from_receipt(id, spec, &receipt);
+                (Some(receipt), contract)
+            }
+            #[cfg(test)]
+            Err(_) if !root.exists() => {
+                let mut fixture_spec = spec.clone();
+                fixture_spec.resolved_route = Some(id.to_owned());
+                (
+                    None,
+                    memory_strategy::uncalibrated_contract(id, &fixture_spec)?,
+                )
+            }
+            Err(error) => return Err(error),
+        };
     Ok(Box::new(ChromaGenerator {
         variant,
         descriptor: variant.descriptor(),
@@ -165,7 +324,12 @@ fn load_variant(variant: ChromaVariant, spec: &LoadSpec) -> gen_core::Result<Box
         // any) so the lazy component build loads the engine once. Unlike adapters/quant/control above,
         // it is not rejected — `None` simply keeps the byte-exact native-VAE path.
         pid_spec: spec.pid.clone(),
+        adapters: spec.adapters.clone(),
         components: Mutex::new(None),
+        lifecycle: Mutex::new(()),
+        memory_contract,
+        load_receipt,
+        memory_admission: memory_strategy::AdmissionRegistry::new(id),
     }))
 }
 
@@ -194,10 +358,129 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_generator(HD_REGISTRATION)
         .register_generator(BASE_REGISTRATION)
-        .register_generator(FLASH_REGISTRATION)
+        .register_generator(FLASH_REGISTRATION);
+    register_memory_contract_surfaces(registry)
+        .register_memory_behavior(HD_MEMORY_BEHAVIOR)
+        .register_memory_behavior(BASE_MEMORY_BEHAVIOR)
+        .register_memory_behavior(FLASH_MEMORY_BEHAVIOR)
+}
+
+fn hd_memory_contract(spec: &LoadSpec) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::provider_contract(CHROMA1_HD_ID, spec)
+}
+fn base_memory_contract(spec: &LoadSpec) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::provider_contract(CHROMA1_BASE_ID, spec)
+}
+fn flash_memory_contract(spec: &LoadSpec) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::provider_contract(CHROMA1_FLASH_ID, spec)
+}
+
+fn hd_weights_free_contract(spec: &LoadSpec) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::weights_free_contract(CHROMA1_HD_ID, spec)
+}
+fn base_weights_free_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::weights_free_contract(CHROMA1_BASE_ID, spec)
+}
+fn flash_weights_free_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::weights_free_contract(CHROMA1_FLASH_ID, spec)
+}
+
+fn hd_surface_contract(
+    surface: &gen_core::MemoryContractSurfaceSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::weights_free_surface_contract(CHROMA1_HD_ID, surface)
+}
+fn base_surface_contract(
+    surface: &gen_core::MemoryContractSurfaceSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::weights_free_surface_contract(CHROMA1_BASE_ID, surface)
+}
+fn flash_surface_contract(
+    surface: &gen_core::MemoryContractSurfaceSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::weights_free_surface_contract(CHROMA1_FLASH_ID, surface)
+}
+
+const HD_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: CHROMA1_HD_ID,
+    contract: hd_memory_contract,
+    safety_check: memory_strategy::registered_safety_check,
+};
+const BASE_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: CHROMA1_BASE_ID,
+    contract: base_memory_contract,
+    safety_check: memory_strategy::registered_safety_check,
+};
+const FLASH_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: CHROMA1_FLASH_ID,
+    contract: flash_memory_contract,
+    safety_check: memory_strategy::registered_safety_check,
+};
+
+macro_rules! memory_behavior {
+    ($name:ident, $id:expr) => {
+        const $name: gen_core::MemoryBehaviorRegistration = gen_core::MemoryBehaviorRegistration {
+            provider_id: $id,
+            valid_fixtures: memory_strategy::registered_valid_fixture,
+            begin_request: |spec, contract, context| {
+                memory_strategy::registered_begin_request($id, spec, contract, context)
+            },
+        };
+    };
+}
+
+memory_behavior!(HD_MEMORY_BEHAVIOR, CHROMA1_HD_ID);
+memory_behavior!(BASE_MEMORY_BEHAVIOR, CHROMA1_BASE_ID);
+memory_behavior!(FLASH_MEMORY_BEHAVIOR, CHROMA1_FLASH_ID);
+
+/// Register Chroma's exhaustive weights-free q4/q8/bf16 contract surfaces on every platform.
+pub fn register_memory_contract_surfaces(
+    registry: gen_core::ProviderRegistryBuilder,
+) -> gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(HD_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            provider_id: CHROMA1_HD_ID,
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            contract: hd_weights_free_contract,
+        })
+        .register_memory_contract_surface_resolver(
+            gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: CHROMA1_HD_ID,
+                contract: hd_surface_contract,
+            },
+        )
+        .register_memory_strategy(BASE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            provider_id: CHROMA1_BASE_ID,
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            contract: base_weights_free_contract,
+        })
+        .register_memory_contract_surface_resolver(
+            gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: CHROMA1_BASE_ID,
+                contract: base_surface_contract,
+            },
+        )
+        .register_memory_strategy(FLASH_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            provider_id: CHROMA1_FLASH_ID,
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            contract: flash_weights_free_contract,
+        })
+        .register_memory_contract_surface_resolver(
+            gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: CHROMA1_FLASH_ID,
+                contract: flash_surface_contract,
+            },
+        )
 }
 
 /// Build the complete explicit Candle Chroma provider catalog.
@@ -207,6 +490,20 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
 
 #[cfg(test)]
 mod explicit_registry_tests {
+    use candle_gen::candle_core::DType;
+
+    #[test]
+    fn dense_t5_and_vae_stay_at_their_native_bf16_width() {
+        assert_eq!(
+            super::native_component_dtype(super::NativeComponent::T5),
+            DType::BF16
+        );
+        assert_eq!(
+            super::native_component_dtype(super::NativeComponent::Vae),
+            DType::BF16
+        );
+    }
+
     #[test]
     fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
@@ -217,12 +514,47 @@ mod explicit_registry_tests {
 
         assert_eq!(explicit, ["chroma1_hd", "chroma1_base", "chroma1_flash"]);
     }
+
+    /// The registry-level memory lifecycle seams must be reachable on a build with no CUDA
+    /// feature: building the provider catalog is contract-only (no device, no weights), so
+    /// `register_providers` publishes the memory-strategy, weights-free contract-fixture and
+    /// memory-behavior rows on every platform. Gating these behind `cuda` left registry
+    /// lifecycle conformance running on no CPU CI configuration at all.
+    #[test]
+    fn register_providers_publishes_memory_lifecycle_seams_without_cuda() {
+        let registry = super::provider_registry().unwrap();
+
+        let strategies: Vec<&str> = registry
+            .memory_strategy_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+        let fixtures: Vec<&str> = registry
+            .memory_contract_fixture_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+        let behaviors: Vec<&str> = registry
+            .memory_behavior_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+
+        assert_eq!(strategies, ["chroma1_hd", "chroma1_base", "chroma1_flash"]);
+        assert_eq!(fixtures, ["chroma1_hd", "chroma1_base", "chroma1_flash"]);
+        assert_eq!(behaviors, ["chroma1_hd", "chroma1_base", "chroma1_flash"]);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use candle_gen::gen_core::{Conditioning, Image, Modality};
+
+    #[test]
+    fn staged_warm_eviction_never_repopulates_the_generator_cache() {
+        let cache = Mutex::new(Some(7_u8));
+        assert_eq!(evict_warm_for_staged(&cache), Some(7));
+        assert!(candle_gen::lock_recover(&cache).is_none());
+        assert_eq!(evict_warm_for_staged(&cache), None);
+    }
 
     #[test]
     fn all_three_variants_register_and_resolve_as_candle() {
@@ -311,24 +643,41 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_unwired_surfaces_and_single_file() {
+    fn load_accepts_adapters_and_rejects_unwired_quant_and_single_file() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec, Quant};
-        for load in [load_hd, load_base, load_flash] {
-            let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
-                AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
-            ]);
-            assert!(matches!(
-                load(&lora).err().expect("err"),
-                gen_core::Error::Unsupported(_)
-            ));
+        let temp = tempfile::tempdir().unwrap();
+        for (route, load) in memory_strategy::ROUTES
+            .iter()
+            .zip([load_hd, load_base, load_flash])
+        {
+            // `/snap` exists on Ubuntu hosts, which accidentally turns this weights-free loader
+            // fixture into a physical-receipt probe. Use a guaranteed-missing path that still
+            // carries the exact repository/revision/tier and resolved provider identity.
+            let root = temp
+                .path()
+                .join(format!("models--SceneWorks--{}", route.repository))
+                .join("snapshots")
+                .join(route.revision)
+                .join("bf16");
+            let lora = LoadSpec::new(WeightsSource::Dir(root.clone()))
+                .with_resolved_route(route.provider)
+                .with_adapters(vec![AdapterSpec::new(
+                    "/lora.safetensors".into(),
+                    1.0,
+                    AdapterKind::Lora,
+                )]);
+            assert!(load(&lora).is_ok());
 
-            let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
+            let quant = LoadSpec::new(WeightsSource::Dir(root))
+                .with_resolved_route(route.provider)
+                .with_quant(Quant::Q8);
             assert!(matches!(
                 load(&quant).err().expect("err"),
                 gen_core::Error::Unsupported(_)
             ));
 
-            let single = LoadSpec::new(WeightsSource::File("/x.safetensors".into()));
+            let single = LoadSpec::new(WeightsSource::File("/x.safetensors".into()))
+                .with_resolved_route(route.provider);
             let err = load(&single).err().expect("err").to_string();
             assert!(err.contains("snapshot directory"), "got: {err}");
         }

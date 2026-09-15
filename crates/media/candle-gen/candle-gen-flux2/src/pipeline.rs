@@ -54,6 +54,23 @@ pub fn pack_nchw(x: &Tensor) -> Result<Tensor> {
 /// Unpack packed latents `[1, seq, C]` back to `[1, C, lat_h, lat_w]` (NCHW) for the VAE.
 pub fn unpack_latents(packed: &Tensor, width: u32, height: u32) -> Result<Tensor> {
     let (lat_h, lat_w) = latent_dims(width, height);
+    unpack_latents_at(packed, lat_h, lat_w)
+}
+
+/// [`unpack_latents`] against an **explicit** token grid rather than an image size.
+///
+/// The **grid** is the primitive, not the image size, because that is what the preview seam is
+/// parameterised by: [`crate::preview::hook`] is built from the `(lat_h, lat_w)` pair its route also
+/// hands its decode tail, and deriving both from one pair is what keeps the preview's geometry and the
+/// render's geometry from diverging (see [`crate::preview`]). It therefore has to unpack against that
+/// pair directly. `candle-gen-lens` drives the same seam from the grid it has already resolved for its
+/// own decode, so it needs the same entry point. [`unpack_latents`] — which resolves the pair through
+/// [`latent_dims`] first — is a thin wrapper over this, not a second implementation.
+///
+/// Lens's grid is *numerically* the same as [`latent_dims`]': its `VAE_SCALE_FACTOR` is the same 16,
+/// and its aspect-bucket table fixes the image dimensions upstream rather than changing this formula.
+/// The reason for the grid-keyed form is the shared-pair discipline above, not a divergent one.
+pub fn unpack_latents_at(packed: &Tensor, lat_h: usize, lat_w: usize) -> Result<Tensor> {
     let (b, _seq, c) = packed.dims3()?;
     packed
         .reshape((b, lat_h, lat_w, c))?

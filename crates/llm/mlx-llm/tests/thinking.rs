@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! MLX_LLM_QWEN3_MODEL=/tmp/qwen3-0.6b MLX_LLM_TEST_MODEL=/tmp/smollm2-135m \
-//!   cargo test --test thinking -- --ignored --nocapture
+//!   cargo test --test integration -- thinking:: --ignored --nocapture
 //! ```
 
 use core_llm::{

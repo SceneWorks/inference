@@ -33,16 +33,19 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use candle_audio::candle_core::Device;
 use candle_audio::gen_core::{
-    self, AudioTrack, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
-    Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, WeightsSource,
+    self, AdapterSpec, AudioEditMode, AudioTrack, Capabilities, Conditioning, ConditioningKind,
+    GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor,
+    OffloadPolicy, Precision, Progress, StepSupport, WeightsSource,
 };
 use sha2::{Digest, Sha256};
 
 use crate::config::DiffusionObjective;
 use crate::dit::Guidance;
 use crate::pipeline::{
-    StableAudio3Pipeline, SynthesisParameters, VariantGeometry, BASE_DEFAULT_GUIDANCE,
+    AudioEdit, EditRegionSecs, ForwardedConditioning, ReferenceAudio, StableAudio3Pipeline,
+    SynthesisParameters, ValidatedForwardedConditioning, VariantGeometry, BASE_DEFAULT_GUIDANCE,
     BASE_DEFAULT_STEPS, CHANNELS, DEFAULT_GUIDANCE, DEFAULT_STEPS, SAMPLE_RATE,
 };
 use crate::sampler::SamplerKind;
@@ -378,10 +381,11 @@ impl Variant {
     /// # The cost of that on medium, stated plainly
     ///
     /// It means a request that omits `audio.target_duration` renders **380 s** — a 6.3-minute track.
-    /// Measured on an M5 Max: ≈ 57–92 s on Metal depending on machine load, and extrapolating this
-    /// crate's own CPU-vs-Metal ratio, ≈ 10–16 minutes on CPU. The smalls' unspecified-duration render
-    /// is 120 s / ≈ 10 s on Metal, so this is an order of magnitude more expensive for the same
-    /// omission.
+    /// Measured on an M5 Max: ≈ 57–92 s on Metal depending on machine load. The ≈ 10–16 minute CPU
+    /// figure is an estimate inferred from short-duration medium CPU runs, not a measured 380 s
+    /// render.
+    /// The smalls' unspecified-duration render is 120 s / ≈ 10 s on Metal, so this is an order of
+    /// magnitude more expensive for the same omission.
     ///
     /// It is kept anyway. A shorter default only for medium would make three ids in one family obey
     /// two different rules for the same missing field, which is a worse contract than an expensive
@@ -401,9 +405,9 @@ impl Variant {
     /// `stable_audio_3_medium_base` inherits the same 380 s default *and* the base operating point
     /// of 50 Euler steps at guidance 7, which is a batch-2 CFG forward per step. That is 100 DiT
     /// forwards where post-trained medium does 8 — **12.5x** the example-work, on the same 380 s of
-    /// audio. Extrapolating medium's measured 92 s Metal render at 380 s / 8 steps, an omitted
-    /// `audio.target_duration` on this id is on the order of **20 minutes** of Metal compute, and
-    /// correspondingly worse on CPU. The default is still not special-cased, for the reason above:
+    /// audio. Extrapolating medium's measured 92 s Metal render at 380 s / 8 steps gives an
+    /// **estimated, not measured**, **20 minutes** of Metal compute when `audio.target_duration` is
+    /// omitted, and correspondingly worse on CPU. The default is still not special-cased, for the reason above:
     /// six ids in one family obeying two rules for the same missing field is a worse contract than
     /// one expensive uniform rule, and no shorter number follows from anything but taste.
     pub const fn default_duration_secs(self) -> f32 {
@@ -444,16 +448,28 @@ impl Variant {
         }
     }
 
-    /// Every weight-license row this registration contributes to the catalog: the composite
-    /// effective-restriction row, the root checkpoint row, and the bundled T5Gemma component row.
-    pub const fn weight_licenses(self) -> &'static [gen_core::WeightLicenseEntry] {
+    /// The two schema-3 component licence rows this registration loads: the root artifact and the
+    /// bundled T5Gemma stack. The provider's effective terms are derived from them, not listed here.
+    pub const fn component_licenses(self) -> [gen_core::ComponentLicense; 2] {
         match self {
-            Self::SmallMusic => MUSIC_WEIGHT_LICENSES,
-            Self::SmallSfx => SFX_WEIGHT_LICENSES,
-            Self::Medium => MEDIUM_WEIGHT_LICENSES,
-            Self::SmallMusicBase => MUSIC_BASE_WEIGHT_LICENSES,
-            Self::SmallSfxBase => SFX_BASE_WEIGHT_LICENSES,
-            Self::MediumBase => MEDIUM_BASE_WEIGHT_LICENSES,
+            Self::SmallMusic => [MUSIC_ROOT_COMPONENT_LICENSE, MUSIC_GEMMA_COMPONENT_LICENSE],
+            Self::SmallSfx => [SFX_ROOT_COMPONENT_LICENSE, SFX_GEMMA_COMPONENT_LICENSE],
+            Self::Medium => [
+                MEDIUM_ROOT_COMPONENT_LICENSE,
+                MEDIUM_GEMMA_COMPONENT_LICENSE,
+            ],
+            Self::SmallMusicBase => [
+                MUSIC_BASE_ROOT_COMPONENT_LICENSE,
+                MUSIC_BASE_GEMMA_COMPONENT_LICENSE,
+            ],
+            Self::SmallSfxBase => [
+                SFX_BASE_ROOT_COMPONENT_LICENSE,
+                SFX_BASE_GEMMA_COMPONENT_LICENSE,
+            ],
+            Self::MediumBase => [
+                MEDIUM_BASE_ROOT_COMPONENT_LICENSE,
+                MEDIUM_BASE_GEMMA_COMPONENT_LICENSE,
+            ],
         }
     }
 
@@ -697,269 +713,270 @@ const MEDIUM_BASE_SNAPSHOT_FILE_PINS: &[SnapshotFilePin] = &[
     },
 ];
 
-pub const ROOT_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-Stability-AI-Community",
-    name: "Stability AI Community License",
-    source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-music/blob/0fef1392cd842149a2b6d445e181c97608faac06/LICENSE.md",
-    attribution: Some("Stable Audio 3 Small Music © Stability AI"),
-    commercial_use: false,
-    restriction: Some(
-        "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms.",
-    ),
+// -------------------------------------------------------------------------------------------------
+// Schema-3 licence rows (sc-16663). Two loaded artifacts per registered variant: the single root
+// safetensors (DiT + SAME pretransform + learned conditioner, all governed by the repository's
+// Stability AI Community License) and the bundled T5Gemma stack, which ships its own LICENSE_GEMMA.md
+// and is therefore a separately licensed artifact.
+//
+// v2 additionally carried a hand-authored composite row per variant, duplicating the root row's
+// fields. Schema 3 DERIVES the provider view from these components instead, so there is no second
+// place to be wrong. `commercial_use: false` is gone with it: the Stability text does not forbid
+// commercial use, it names a revenue threshold and a registration — which the family records as
+// facts a consumer evaluates against its own situation.
+//
+// The two `source_url` shapes below are one rule, not two conventions: `ComponentLicense::source_url`
+// names the document `declared` was transcribed from, so it follows the declaration. Each `*_root`
+// row therefore points at the bare model card, where the `stable-audio-community` tag is published
+// and re-readable — deliberately dropping v2's revision-pinned `.../blob/<sha>/LICENSE.md`, which
+// addressed licence *text* (schema 3 keeps that once, on the family) and, being frozen, could never
+// show a re-licensing. `retrieved` is the as-of anchor the pin used to stand in for. Each `*_gemma`
+// row keeps a pinned LICENSE_GEMMA.md blob because that file is the only place the "Gemma Terms of
+// Use" declaration exists for this bundled copy; the repository tag says something else.
+//
+// DISCLOSURE ONLY. Nothing here decides whether any use is permitted.
+// -------------------------------------------------------------------------------------------------
+
+/// Component key for the Stable Audio 3 Small Music root safetensors artifact.
+pub const MUSIC_ROOT_COMPONENT_KEY: &str = "stable_audio_3_small_music_root";
+/// Component key for the T5Gemma stack bundled with Stable Audio 3 Small Music.
+pub const MUSIC_GEMMA_COMPONENT_KEY: &str = "stable_audio_3_small_music_t5gemma";
+
+/// The schema-3 licence row for the Stable Audio 3 Small Music root artifact. `declared` and `gated` were read from the
+/// `stabilityai/stable-audio-3-small-music` model card on `retrieved`.
+pub const MUSIC_ROOT_COMPONENT_LICENSE: gen_core::ComponentLicense = gen_core::ComponentLicense {
+    component: MUSIC_ROOT_COMPONENT_KEY,
+    source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-music",
+    gated: true,
+    declared: "stable-audio-community",
+    family: "stability-ai-community",
+    attribution: Some("Stable Audio 3 Small Music © Stability AI — Powered by Stability AI"),
+    retrieved: "2026-08-02",
 };
 
-pub const GEMMA_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-Gemma-Terms",
-    name: "Gemma Terms of Use",
+/// The schema-3 licence row for the T5Gemma stack bundled with Stable Audio 3 Small Music. `source_url` is the
+/// revision-pinned `LICENSE_GEMMA.md` shipped beside the weights, whose title — "Gemma Terms of
+/// Use" — is the declaration this row transcribes.
+pub const MUSIC_GEMMA_COMPONENT_LICENSE: gen_core::ComponentLicense = gen_core::ComponentLicense {
+    component: MUSIC_GEMMA_COMPONENT_KEY,
     source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-music/blob/0fef1392cd842149a2b6d445e181c97608faac06/LICENSE_GEMMA.md",
+    gated: true,
+    declared: "Gemma Terms of Use",
+    family: "gemma-terms",
     attribution: Some("T5Gemma model weights © Google"),
-    commercial_use: true,
-    restriction: Some("Use is governed by the Gemma Terms of Use and Prohibited Use Policy."),
+    retrieved: "2026-08-02",
 };
 
-pub const SFX_ROOT_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-Stability-AI-Community",
-    name: "Stability AI Community License",
-    source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-sfx/blob/ae12755283df9d62ca39a9b050a39a0b607b8c20/LICENSE.md",
-    attribution: Some("Stable Audio 3 Small SFX © Stability AI"),
-    commercial_use: false,
-    restriction: Some(
-        "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms.",
-    ),
+/// Component key for the Stable Audio 3 Small SFX root safetensors artifact.
+pub const SFX_ROOT_COMPONENT_KEY: &str = "stable_audio_3_small_sfx_root";
+/// Component key for the T5Gemma stack bundled with Stable Audio 3 Small SFX.
+pub const SFX_GEMMA_COMPONENT_KEY: &str = "stable_audio_3_small_sfx_t5gemma";
+
+/// The schema-3 licence row for the Stable Audio 3 Small SFX root artifact. `declared` and `gated` were read from the
+/// `stabilityai/stable-audio-3-small-sfx` model card on `retrieved`.
+pub const SFX_ROOT_COMPONENT_LICENSE: gen_core::ComponentLicense = gen_core::ComponentLicense {
+    component: SFX_ROOT_COMPONENT_KEY,
+    source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-sfx",
+    gated: true,
+    declared: "stable-audio-community",
+    family: "stability-ai-community",
+    attribution: Some("Stable Audio 3 Small SFX © Stability AI — Powered by Stability AI"),
+    retrieved: "2026-08-02",
 };
 
-pub const SFX_GEMMA_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-Gemma-Terms",
-    name: "Gemma Terms of Use",
+/// The schema-3 licence row for the T5Gemma stack bundled with Stable Audio 3 Small SFX. `source_url` is the
+/// revision-pinned `LICENSE_GEMMA.md` shipped beside the weights, whose title — "Gemma Terms of
+/// Use" — is the declaration this row transcribes.
+pub const SFX_GEMMA_COMPONENT_LICENSE: gen_core::ComponentLicense = gen_core::ComponentLicense {
+    component: SFX_GEMMA_COMPONENT_KEY,
     source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-sfx/blob/ae12755283df9d62ca39a9b050a39a0b607b8c20/LICENSE_GEMMA.md",
+    gated: true,
+    declared: "Gemma Terms of Use",
+    family: "gemma-terms",
     attribution: Some("T5Gemma model weights © Google"),
-    commercial_use: true,
-    restriction: Some("Use is governed by the Gemma Terms of Use and Prohibited Use Policy."),
+    retrieved: "2026-08-02",
 };
 
-pub const MEDIUM_ROOT_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-Stability-AI-Community",
-    name: "Stability AI Community License",
-    source_url: "https://huggingface.co/stabilityai/stable-audio-3-medium/blob/27b5a21b791b1b033d193a9e1e3ce78493f102f9/LICENSE.md",
-    attribution: Some("Stable Audio 3 Medium © Stability AI"),
-    commercial_use: false,
-    restriction: Some(
-        "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms.",
-    ),
+/// Component key for the Stable Audio 3 Medium root safetensors artifact.
+pub const MEDIUM_ROOT_COMPONENT_KEY: &str = "stable_audio_3_medium_root";
+/// Component key for the T5Gemma stack bundled with Stable Audio 3 Medium.
+pub const MEDIUM_GEMMA_COMPONENT_KEY: &str = "stable_audio_3_medium_t5gemma";
+
+/// The schema-3 licence row for the Stable Audio 3 Medium root artifact. `declared` and `gated` were read from the
+/// `stabilityai/stable-audio-3-medium` model card on `retrieved`.
+pub const MEDIUM_ROOT_COMPONENT_LICENSE: gen_core::ComponentLicense = gen_core::ComponentLicense {
+    component: MEDIUM_ROOT_COMPONENT_KEY,
+    source_url: "https://huggingface.co/stabilityai/stable-audio-3-medium",
+    gated: true,
+    declared: "stable-audio-community",
+    family: "stability-ai-community",
+    attribution: Some("Stable Audio 3 Medium © Stability AI — Powered by Stability AI"),
+    retrieved: "2026-08-02",
 };
 
-pub const MEDIUM_GEMMA_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-Gemma-Terms",
-    name: "Gemma Terms of Use",
+/// The schema-3 licence row for the T5Gemma stack bundled with Stable Audio 3 Medium. `source_url` is the
+/// revision-pinned `LICENSE_GEMMA.md` shipped beside the weights, whose title — "Gemma Terms of
+/// Use" — is the declaration this row transcribes.
+pub const MEDIUM_GEMMA_COMPONENT_LICENSE: gen_core::ComponentLicense = gen_core::ComponentLicense {
+    component: MEDIUM_GEMMA_COMPONENT_KEY,
     source_url: "https://huggingface.co/stabilityai/stable-audio-3-medium/blob/27b5a21b791b1b033d193a9e1e3ce78493f102f9/LICENSE_GEMMA.md",
+    gated: true,
+    declared: "Gemma Terms of Use",
+    family: "gemma-terms",
     attribution: Some("T5Gemma model weights © Google"),
-    commercial_use: true,
-    restriction: Some("Use is governed by the Gemma Terms of Use and Prohibited Use Policy."),
+    retrieved: "2026-08-02",
 };
 
-/// The `-base` repositories are **ungated** on the Hub, unlike the three post-trained ones.
-///
-/// That changes acquisition, not terms: each base repository ships the same `LICENSE.md` (Stability
-/// AI Community License) and `LICENSE_GEMMA.md` (Gemma Terms of Use) as its post-trained sibling, so
-/// the rows below carry exactly the same restrictions. "No click-through" is not "no license".
-pub const MUSIC_BASE_ROOT_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-Stability-AI-Community",
-    name: "Stability AI Community License",
-    source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-music-base/blob/eab5ceee5ad9c1ed38800aff30a8e49d1161c539/LICENSE.md",
-    attribution: Some("Stable Audio 3 Small Music Base © Stability AI"),
-    commercial_use: false,
-    restriction: Some(
-        "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms.",
-    ),
-};
+/// Component key for the Stable Audio 3 Small Music Base root safetensors artifact.
+pub const MUSIC_BASE_ROOT_COMPONENT_KEY: &str = "stable_audio_3_small_music_base_root";
+/// Component key for the T5Gemma stack bundled with Stable Audio 3 Small Music Base.
+pub const MUSIC_BASE_GEMMA_COMPONENT_KEY: &str = "stable_audio_3_small_music_base_t5gemma";
 
-pub const MUSIC_BASE_GEMMA_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-Gemma-Terms",
-    name: "Gemma Terms of Use",
+/// The schema-3 licence row for the Stable Audio 3 Small Music Base root artifact. `declared` and `gated` were read from the
+/// `stabilityai/stable-audio-3-small-music-base` model card on `retrieved`.
+pub const MUSIC_BASE_ROOT_COMPONENT_LICENSE: gen_core::ComponentLicense =
+    gen_core::ComponentLicense {
+        component: MUSIC_BASE_ROOT_COMPONENT_KEY,
+        source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-music-base",
+        gated: false,
+        declared: "stable-audio-community",
+        family: "stability-ai-community",
+        attribution: Some(
+            "Stable Audio 3 Small Music Base © Stability AI — Powered by Stability AI",
+        ),
+        retrieved: "2026-08-02",
+    };
+
+/// The schema-3 licence row for the T5Gemma stack bundled with Stable Audio 3 Small Music Base. `source_url` is the
+/// revision-pinned `LICENSE_GEMMA.md` shipped beside the weights, whose title — "Gemma Terms of
+/// Use" — is the declaration this row transcribes.
+pub const MUSIC_BASE_GEMMA_COMPONENT_LICENSE: gen_core::ComponentLicense = gen_core::ComponentLicense {
+    component: MUSIC_BASE_GEMMA_COMPONENT_KEY,
     source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-music-base/blob/eab5ceee5ad9c1ed38800aff30a8e49d1161c539/LICENSE_GEMMA.md",
+    gated: false,
+    declared: "Gemma Terms of Use",
+    family: "gemma-terms",
     attribution: Some("T5Gemma model weights © Google"),
-    commercial_use: true,
-    restriction: Some("Use is governed by the Gemma Terms of Use and Prohibited Use Policy."),
+    retrieved: "2026-08-02",
 };
 
-pub const SFX_BASE_ROOT_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-Stability-AI-Community",
-    name: "Stability AI Community License",
-    source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-sfx-base/blob/cc5ddb990e30daa68336ac61c140c37c7033ab7c/LICENSE.md",
-    attribution: Some("Stable Audio 3 Small SFX Base © Stability AI"),
-    commercial_use: false,
-    restriction: Some(
-        "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms.",
-    ),
-};
+/// Component key for the Stable Audio 3 Small SFX Base root safetensors artifact.
+pub const SFX_BASE_ROOT_COMPONENT_KEY: &str = "stable_audio_3_small_sfx_base_root";
+/// Component key for the T5Gemma stack bundled with Stable Audio 3 Small SFX Base.
+pub const SFX_BASE_GEMMA_COMPONENT_KEY: &str = "stable_audio_3_small_sfx_base_t5gemma";
 
-pub const SFX_BASE_GEMMA_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-Gemma-Terms",
-    name: "Gemma Terms of Use",
+/// The schema-3 licence row for the Stable Audio 3 Small SFX Base root artifact. `declared` and `gated` were read from the
+/// `stabilityai/stable-audio-3-small-sfx-base` model card on `retrieved`.
+pub const SFX_BASE_ROOT_COMPONENT_LICENSE: gen_core::ComponentLicense =
+    gen_core::ComponentLicense {
+        component: SFX_BASE_ROOT_COMPONENT_KEY,
+        source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-sfx-base",
+        gated: false,
+        declared: "stable-audio-community",
+        family: "stability-ai-community",
+        attribution: Some("Stable Audio 3 Small SFX Base © Stability AI — Powered by Stability AI"),
+        retrieved: "2026-08-02",
+    };
+
+/// The schema-3 licence row for the T5Gemma stack bundled with Stable Audio 3 Small SFX Base. `source_url` is the
+/// revision-pinned `LICENSE_GEMMA.md` shipped beside the weights, whose title — "Gemma Terms of
+/// Use" — is the declaration this row transcribes.
+pub const SFX_BASE_GEMMA_COMPONENT_LICENSE: gen_core::ComponentLicense = gen_core::ComponentLicense {
+    component: SFX_BASE_GEMMA_COMPONENT_KEY,
     source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-sfx-base/blob/cc5ddb990e30daa68336ac61c140c37c7033ab7c/LICENSE_GEMMA.md",
+    gated: false,
+    declared: "Gemma Terms of Use",
+    family: "gemma-terms",
     attribution: Some("T5Gemma model weights © Google"),
-    commercial_use: true,
-    restriction: Some("Use is governed by the Gemma Terms of Use and Prohibited Use Policy."),
+    retrieved: "2026-08-02",
 };
 
-pub const MEDIUM_BASE_ROOT_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-Stability-AI-Community",
-    name: "Stability AI Community License",
-    source_url: "https://huggingface.co/stabilityai/stable-audio-3-medium-base/blob/b32993f73c3bdc3864043a72d8032606bba737c8/LICENSE.md",
-    attribution: Some("Stable Audio 3 Medium Base © Stability AI"),
-    commercial_use: false,
-    restriction: Some(
-        "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms.",
-    ),
-};
+/// Component key for the Stable Audio 3 Medium Base root safetensors artifact.
+pub const MEDIUM_BASE_ROOT_COMPONENT_KEY: &str = "stable_audio_3_medium_base_root";
+/// Component key for the T5Gemma stack bundled with Stable Audio 3 Medium Base.
+pub const MEDIUM_BASE_GEMMA_COMPONENT_KEY: &str = "stable_audio_3_medium_base_t5gemma";
 
-pub const MEDIUM_BASE_GEMMA_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
-    spdx_id: "LicenseRef-Gemma-Terms",
-    name: "Gemma Terms of Use",
+/// The schema-3 licence row for the Stable Audio 3 Medium Base root artifact. `declared` and `gated` were read from the
+/// `stabilityai/stable-audio-3-medium-base` model card on `retrieved`.
+pub const MEDIUM_BASE_ROOT_COMPONENT_LICENSE: gen_core::ComponentLicense =
+    gen_core::ComponentLicense {
+        component: MEDIUM_BASE_ROOT_COMPONENT_KEY,
+        source_url: "https://huggingface.co/stabilityai/stable-audio-3-medium-base",
+        gated: false,
+        declared: "stable-audio-community",
+        family: "stability-ai-community",
+        attribution: Some("Stable Audio 3 Medium Base © Stability AI — Powered by Stability AI"),
+        retrieved: "2026-08-02",
+    };
+
+/// The schema-3 licence row for the T5Gemma stack bundled with Stable Audio 3 Medium Base. `source_url` is the
+/// revision-pinned `LICENSE_GEMMA.md` shipped beside the weights, whose title — "Gemma Terms of
+/// Use" — is the declaration this row transcribes.
+pub const MEDIUM_BASE_GEMMA_COMPONENT_LICENSE: gen_core::ComponentLicense = gen_core::ComponentLicense {
+    component: MEDIUM_BASE_GEMMA_COMPONENT_KEY,
     source_url: "https://huggingface.co/stabilityai/stable-audio-3-medium-base/blob/b32993f73c3bdc3864043a72d8032606bba737c8/LICENSE_GEMMA.md",
+    gated: false,
+    declared: "Gemma Terms of Use",
+    family: "gemma-terms",
     attribution: Some("T5Gemma model weights © Google"),
-    commercial_use: true,
-    restriction: Some("Use is governed by the Gemma Terms of Use and Prohibited Use Policy."),
+    retrieved: "2026-08-02",
 };
 
-const MUSIC_WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
-    gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: None,
-        license: ROOT_WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: Some("root"),
-        license: ROOT_WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: Some("t5gemma"),
-        license: GEMMA_WEIGHT_LICENSE,
-    },
-];
-
-const SFX_WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
-    gen_core::WeightLicenseEntry {
-        provider_id: SFX_MODEL_ID,
-        component: None,
-        license: SFX_ROOT_WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: SFX_MODEL_ID,
-        component: Some("root"),
-        license: SFX_ROOT_WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: SFX_MODEL_ID,
-        component: Some("t5gemma"),
-        license: SFX_GEMMA_WEIGHT_LICENSE,
-    },
-];
-
-const MEDIUM_WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
-    gen_core::WeightLicenseEntry {
-        provider_id: MEDIUM_MODEL_ID,
-        component: None,
-        license: MEDIUM_ROOT_WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: MEDIUM_MODEL_ID,
-        component: Some("root"),
-        license: MEDIUM_ROOT_WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: MEDIUM_MODEL_ID,
-        component: Some("t5gemma"),
-        license: MEDIUM_GEMMA_WEIGHT_LICENSE,
-    },
-];
-
-const MUSIC_BASE_WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
-    gen_core::WeightLicenseEntry {
-        provider_id: MUSIC_BASE_MODEL_ID,
-        component: None,
-        license: MUSIC_BASE_ROOT_WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: MUSIC_BASE_MODEL_ID,
-        component: Some("root"),
-        license: MUSIC_BASE_ROOT_WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: MUSIC_BASE_MODEL_ID,
-        component: Some("t5gemma"),
-        license: MUSIC_BASE_GEMMA_WEIGHT_LICENSE,
-    },
-];
-
-const SFX_BASE_WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
-    gen_core::WeightLicenseEntry {
-        provider_id: SFX_BASE_MODEL_ID,
-        component: None,
-        license: SFX_BASE_ROOT_WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: SFX_BASE_MODEL_ID,
-        component: Some("root"),
-        license: SFX_BASE_ROOT_WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: SFX_BASE_MODEL_ID,
-        component: Some("t5gemma"),
-        license: SFX_BASE_GEMMA_WEIGHT_LICENSE,
-    },
-];
-
-const MEDIUM_BASE_WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
-    gen_core::WeightLicenseEntry {
-        provider_id: MEDIUM_BASE_MODEL_ID,
-        component: None,
-        license: MEDIUM_BASE_ROOT_WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: MEDIUM_BASE_MODEL_ID,
-        component: Some("root"),
-        license: MEDIUM_BASE_ROOT_WEIGHT_LICENSE,
-    },
-    gen_core::WeightLicenseEntry {
-        provider_id: MEDIUM_BASE_MODEL_ID,
-        component: Some("t5gemma"),
-        license: MEDIUM_BASE_GEMMA_WEIGHT_LICENSE,
-    },
-];
-
-/// Every Stable Audio 3 weight-license row, in registration order.
+/// Every Stable Audio 3 component licence row, in registration order — two per registered variant.
 ///
-/// The DiT, SAME pretransform, and learned conditioner all live inside the single
-/// `model.safetensors` root artifact and are covered by the `root` row; the bundled T5Gemma stack
-/// is a separately licensed component and carries its own row. Three rows per registration, not
-/// four: medium's SAME-L is not a separate artifact, it is a namespace inside the same file.
-///
-/// Eighteen rows since sc-14546 (six registrations x three). The `-base` repositories are ungated on
-/// the Hub, which is an acquisition difference and nothing else — they ship the same Stability
-/// Community and Gemma license files, so their rows carry the same restrictions and the same
-/// `commercial_use: false` on the root.
-pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
-    MUSIC_WEIGHT_LICENSES[0],
-    MUSIC_WEIGHT_LICENSES[1],
-    MUSIC_WEIGHT_LICENSES[2],
-    SFX_WEIGHT_LICENSES[0],
-    SFX_WEIGHT_LICENSES[1],
-    SFX_WEIGHT_LICENSES[2],
-    MEDIUM_WEIGHT_LICENSES[0],
-    MEDIUM_WEIGHT_LICENSES[1],
-    MEDIUM_WEIGHT_LICENSES[2],
-    MUSIC_BASE_WEIGHT_LICENSES[0],
-    MUSIC_BASE_WEIGHT_LICENSES[1],
-    MUSIC_BASE_WEIGHT_LICENSES[2],
-    SFX_BASE_WEIGHT_LICENSES[0],
-    SFX_BASE_WEIGHT_LICENSES[1],
-    SFX_BASE_WEIGHT_LICENSES[2],
-    MEDIUM_BASE_WEIGHT_LICENSES[0],
-    MEDIUM_BASE_WEIGHT_LICENSES[1],
-    MEDIUM_BASE_WEIGHT_LICENSES[2],
+/// The DiT, SAME pretransform and learned conditioner all live inside the single `model.safetensors`
+/// root artifact and are covered by its row; medium's SAME-L is a namespace inside that same file,
+/// not a separate artifact, so it adds no row. The `-base` repositories are **ungated** on the Hub,
+/// which is an acquisition difference and nothing else — they ship the same Stability Community and
+/// Gemma licence files, so their rows resolve to exactly the same families.
+pub const COMPONENT_LICENSES: &[gen_core::ComponentLicense] = &[
+    MUSIC_ROOT_COMPONENT_LICENSE,
+    MUSIC_GEMMA_COMPONENT_LICENSE,
+    SFX_ROOT_COMPONENT_LICENSE,
+    SFX_GEMMA_COMPONENT_LICENSE,
+    MEDIUM_ROOT_COMPONENT_LICENSE,
+    MEDIUM_GEMMA_COMPONENT_LICENSE,
+    MUSIC_BASE_ROOT_COMPONENT_LICENSE,
+    MUSIC_BASE_GEMMA_COMPONENT_LICENSE,
+    SFX_BASE_ROOT_COMPONENT_LICENSE,
+    SFX_BASE_GEMMA_COMPONENT_LICENSE,
+    MEDIUM_BASE_ROOT_COMPONENT_LICENSE,
+    MEDIUM_BASE_GEMMA_COMPONENT_LICENSE,
+];
+
+/// The provider→component mapping for all six registrations. Terms are **derived** from the rows
+/// above by [`gen_core::provider_terms`], never hand-authored.
+pub const PROVIDER_COMPONENTS: &[gen_core::ProviderComponents] = &[
+    gen_core::ProviderComponents {
+        provider_id: MODEL_ID,
+        components: &[MUSIC_ROOT_COMPONENT_KEY, MUSIC_GEMMA_COMPONENT_KEY],
+    },
+    gen_core::ProviderComponents {
+        provider_id: SFX_MODEL_ID,
+        components: &[SFX_ROOT_COMPONENT_KEY, SFX_GEMMA_COMPONENT_KEY],
+    },
+    gen_core::ProviderComponents {
+        provider_id: MEDIUM_MODEL_ID,
+        components: &[MEDIUM_ROOT_COMPONENT_KEY, MEDIUM_GEMMA_COMPONENT_KEY],
+    },
+    gen_core::ProviderComponents {
+        provider_id: MUSIC_BASE_MODEL_ID,
+        components: &[
+            MUSIC_BASE_ROOT_COMPONENT_KEY,
+            MUSIC_BASE_GEMMA_COMPONENT_KEY,
+        ],
+    },
+    gen_core::ProviderComponents {
+        provider_id: SFX_BASE_MODEL_ID,
+        components: &[SFX_BASE_ROOT_COMPONENT_KEY, SFX_BASE_GEMMA_COMPONENT_KEY],
+    },
+    gen_core::ProviderComponents {
+        provider_id: MEDIUM_BASE_MODEL_ID,
+        components: &[
+            MEDIUM_BASE_ROOT_COMPONENT_KEY,
+            MEDIUM_BASE_GEMMA_COMPONENT_KEY,
+        ],
+    },
 ];
 
 /// Build the descriptor for one registered variant.
@@ -1007,6 +1024,9 @@ pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
 /// tracked with the other additive descriptor gaps as `sc-15041`.
 pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: None,
+        control_kinds: None,
         required_components: &[],
         id: variant.model_id(),
         family: "stable_audio_3",
@@ -1015,31 +1035,63 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
-            conditioning: Vec::new(),
-            supports_lora: false,
-            supports_lokr: false,
+            // Audio→audio restyle (sc-14547) and bounded source editing (sc-14548), on all six
+            // checkpoints. Advertising a kind is what makes `Capabilities::validate_request_audio`
+            // *stop* rejecting the variant; both are consumed identically by every id, because the
+            // seams are the shared SAME encoder, the shared partial-strength schedule, and the
+            // shared `[inpaint_mask, inpaint_masked_input]` local conditioner — none of which is
+            // variant-specific.
+            conditioning: vec![
+                ConditioningKind::ReferenceAudio,
+                ConditioningKind::AudioEdit,
+                // Multi-region editing (sc-14549) is its **own** kind, not a flag on the one
+                // above, and advertising it here is the entire opt-in. A family that did not add
+                // this line keeps rejecting multi-region requests as typed `Unsupported` through
+                // the shared allowlist with no code of its own — which is why no capability flag
+                // and no other descriptor in the repository needed to change.
+                ConditioningKind::AudioEditRegions,
+            ],
+            // sc-14550. The full eight-type native adapter family — `lora`, `dora-rows`,
+            // `dora-cols`, `bora` and their four `-xs` siblings — plus the legacy `dora` alias,
+            // stacked in request order and folded at load time. See [`crate::adapters`].
+            //
+            // `supports_lokr` stays false and `AdapterKind::Lokr` is refused as typed
+            // `Unsupported`: no published Stable Audio 3 adapter is a Kronecker factorization, and
+            // accepting one would mean guessing a decomposition this family does not have.
+            supports_lora: true,
             samplers: vec!["pingpong", "euler", "rk4", "dpmpp"],
-            schedulers: vec![],
             supported_guidance_methods: vec!["cfg", "apg", "cfg_rescale"],
-            min_size: 0,
-            max_size: 0,
             max_count: 1,
-            mac_only: false,
+            // The provider's 500-step model limit, advertised rather than hidden (sc-19559).
+            supported_steps: StepSupport::Range {
+                min: 1,
+                max: MAX_STEPS,
+            },
             audio_sample_rates: vec![SAMPLE_RATE],
             max_audio_duration_secs: Some(variant.max_duration_secs()),
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            supported_quants: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
+            // sc-14548. Three modes, and `AudioEditMode::Cover` is deliberately **not** among them.
+            //
+            // Upstream Stable Audio 3 exposes three paths in total — text-to-audio, audio-to-audio
+            // (`init_audio`), and inpaint — and every one of the six checkpoints pins its complete
+            // conditioner surface in config: `global = [seconds_total]`,
+            // `local = [inpaint_mask, inpaint_masked_input]`. There is no style/cover conditioner in
+            // any of them, so `Cover` has nothing to map onto here; gen-core's own doc for that mode
+            // names ACE-Step, which does ship it. Leaving it off removes no capability: the thing a
+            // caller means by "cover" is a whole-clip restyle, and that is
+            // `Conditioning::ReferenceAudio` above, advertised on all six ids with a retention
+            // `strength` knob this surface does not have.
+            //
+            // `Inpaint` and `Repaint` are listed separately because gen-core defines them
+            // separately, but for this family they are **aliases**: gen-core's distinction
+            // (silence-substituted vs context-conditioned) describes ACE-Step's two native tasks,
+            // and SA3 has one mechanism. They are byte-identical for the same request and seed —
+            // structurally, because `pipeline::AudioEdit` carries no mode field at all.
+            audio_edit_modes: vec![
+                AudioEditMode::Inpaint,
+                AudioEditMode::Repaint,
+                AudioEditMode::Extend,
+            ],
+            ..Default::default()
         },
     }
 }
@@ -1139,6 +1191,288 @@ fn verify_snapshot_identity(
     Ok(())
 }
 
+/// The `Conditioning::ReferenceAudio` strength assumed when the caller omits it (sc-14547).
+///
+/// `0.1` retention, i.e. an init noise level of `0.9`, which is the operating point upstream's own
+/// audio→audio entry point defaults to. Stated in **contract** units: see
+/// [`reference_noise_level`] for why the two orientations are not interchangeable.
+pub const DEFAULT_REFERENCE_STRENGTH: f32 = 0.1;
+
+/// The accepted inclusive range for an explicit `Conditioning::ReferenceAudio` strength.
+///
+/// gen-core's request floor enforces finiteness only (it has no per-model range for this field), so
+/// without this gate a `strength` of `-3.0` or `40.0` would reach `build_schedule` and surface as a
+/// sampler-internal message about a value the caller never typed.
+pub const REFERENCE_STRENGTH_RANGE: (f32, f32) = (0.0, 1.0);
+
+/// Convert the contract's **retention** strength into the sampler's **init noise level**.
+///
+/// # This is the one place the two orientations meet, on purpose
+///
+/// Two same-named `strength` parameters with opposite meanings collide on this seam:
+///
+/// * `Conditioning::ReferenceAudio.strength` documents itself as mirroring the per-reference
+///   img2img strength, and this workspace's img2img strength is mflux-derived and **retention**
+///   oriented — it is the loop *start* index, so a higher value runs fewer steps and preserves
+///   **more** of the source. (That is the inverse of diffusers' convention, which is why the
+///   collision is easy to miss.)
+/// * Stable Audio 3's sampler `strength` is upstream's `init_noise_level`: `1.0` replaces the
+///   source with pure noise, `0.0` returns it untouched.
+///
+/// So the mapping is the complement, and the contract keeps the retention reading:
+///
+/// | contract `strength` | init noise level | result |
+/// |---|---|---|
+/// | `0.0` | `1.0` | pure generation; the source has no influence |
+/// | `0.1` (default) | `0.9` | a loose restyle |
+/// | `1.0` | `0.0` | the prepared source, returned without a single DiT forward |
+///
+/// A silent inversion here would still run, still emit plausible audio, and do the opposite of what
+/// the caller asked, which is why the sign is gated by a mutation test at the contract endpoint
+/// (`tests/reference_audio.rs`) rather than only by this table.
+///
+/// # A caller-visible consequence of the `1.0` row
+///
+/// At contract `strength = 1.0` the init noise level is `0.0`, which trips the sampler's
+/// `skip_model` short circuit: the DiT never runs, so **no `Progress::Step` is ever emitted**. A
+/// caller driving a progress bar sees zero steps and then `Progress::Decoding`. That is correct —
+/// there is genuinely nothing to step through — but it is user-visible behaviour of a documented
+/// endpoint, so it is stated here and in `docs/migration/SC_14547_REFERENCE_AUDIO_RESTYLE.md`
+/// rather than left to be discovered.
+pub fn reference_noise_level(strength: Option<f32>) -> f32 {
+    1.0 - strength.unwrap_or(DEFAULT_REFERENCE_STRENGTH)
+}
+
+/// One request's resolved reference-audio conditioning, borrowed from the request (sc-14547).
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedReference<'a> {
+    pub track: &'a AudioTrack,
+    /// The contract-facing **retention** strength actually in force, explicit or defaulted.
+    pub strength: f32,
+    /// The sampler-facing init noise level, `1.0 - strength`.
+    pub noise_level: f32,
+}
+
+/// Extract the single `Conditioning::ReferenceAudio` item, if the request carries one.
+///
+/// Returns the *first* item without complaint about duplicates: [`validate_request_for`] has already
+/// rejected a second one, and every generation path validates first.
+pub fn resolve_reference_audio(request: &GenerationRequest) -> Option<ResolvedReference<'_>> {
+    request
+        .conditioning
+        .iter()
+        .find_map(|conditioning| match conditioning {
+            Conditioning::ReferenceAudio { audio, strength } => Some(ResolvedReference {
+                track: audio,
+                strength: strength.unwrap_or(DEFAULT_REFERENCE_STRENGTH),
+                noise_level: reference_noise_level(*strength),
+            }),
+            _ => None,
+        })
+}
+
+/// Build the pipeline-facing [`ReferenceAudio`] a request implies — the single site where the
+/// contract's retention `strength` becomes the sampler's `init_noise_level` (sc-14547).
+///
+/// Extracted out of [`StableAudio3Generator::generate`] deliberately. `generate` needs
+/// multi-gigabyte weights, so while this construction lived inside it the **field selection** here
+/// (`noise_level`, not `strength`) was reachable only from the real-weight lane — and picking the
+/// wrong field is the exact shape of the sign inversion this feature's entire risk budget is spent
+/// on. It is now gated weight-free by `tests/reference_audio.rs`
+/// `the_request_surface_hands_the_pipeline_the_converted_noise_level`.
+pub fn reference_audio_for(request: &GenerationRequest) -> Option<ReferenceAudio<'_>> {
+    resolve_reference_audio(request).map(|reference| ReferenceAudio {
+        samples: &reference.track.samples,
+        sample_rate: reference.track.sample_rate,
+        channels: reference.track.channels,
+        noise_level: reference.noise_level,
+    })
+}
+
+/// How far a mode's implied timing may sit from the number the caller supplied: one output frame
+/// (sc-14548).
+///
+/// `AudioParams::target_duration` and `TimeRegion` are `f32` seconds, and one 44.1 kHz frame is
+/// `2.3e-5` s — well inside `f32`'s own resolution at 380 s, where an ulp is roughly `1.4` frames.
+/// So "the extend region starts exactly at the source's end" cannot be an equality on seconds; it is
+/// an equality on frames, expressed as this tolerance.
+pub const EDIT_TIMING_TOLERANCE_SECS: f32 = 1.0 / SAMPLE_RATE as f32;
+
+/// One request's resolved audio-edit conditioning, borrowed from the request (sc-14548).
+///
+/// Every field is on the **post-resample** 44.1 kHz timeline. `mode` is carried here and consumed
+/// by [`audio_edit_for`]; nothing past that point can see it, which is what makes
+/// `Inpaint` ≡ `Repaint` structural rather than merely tested.
+#[derive(Debug, Clone)]
+pub struct ResolvedEdit<'a> {
+    pub track: &'a AudioTrack,
+    pub mode: AudioEditMode,
+    /// The source clip's duration once resampled to 44.1 kHz.
+    pub source_duration_secs: f32,
+    /// Every requested span, ends resolved, in the caller's own order (sc-14549). Non-empty for a
+    /// well-formed request; the single-region carrier resolves to exactly **one** entry, which is
+    /// what keeps both carriers on one path instead of a legacy path plus a parallel copy.
+    ///
+    /// Deliberately *not* normalized here: the union is computed once, in
+    /// [`crate::pipeline::edit_geometry`], so validation errors can name the span the caller
+    /// actually wrote rather than a merged one they never typed.
+    pub regions: Vec<EditRegionSecs>,
+    /// Whether the request used the multi-region carrier
+    /// ([`Conditioning::AudioEditRegions`]). Read only by validation — for the mode gate and for
+    /// error wording. The *geometry* is identical either way, which is the point.
+    pub multi_region: bool,
+    /// The output duration this mode implies: the source's own duration for an inpaint/repaint, the
+    /// region's end for an extend.
+    pub output_duration_secs: f32,
+}
+
+/// The source clip's duration once resampled onto the model's own 44.1 kHz timeline.
+fn source_duration_secs(audio: &AudioTrack) -> f32 {
+    let channels = (audio.channels as usize).max(1);
+    let source_frames = audio.samples.len() / channels;
+    crate::pipeline::resampled_frame_count(source_frames, audio.sample_rate.max(1)) as f32
+        / SAMPLE_RATE as f32
+}
+
+/// Extract the request's single audio-edit carrier, if it has one (sc-14548, extended to the
+/// multi-region carrier by sc-14549).
+///
+/// Total by construction — it resolves whatever it is given rather than reporting problems, because
+/// [`synthesis_parameters`] needs the output duration and every generation path validates first.
+/// `validate_audio_edit` is where a missing region, a misplaced extend boundary, a multi-region
+/// `Extend`, or a conflicting `target_duration` is refused; the fallbacks below exist only so this
+/// cannot panic on input that validation has already rejected.
+///
+/// # Both carriers resolve here, into the same shape
+///
+/// [`Conditioning::AudioEdit`] and [`Conditioning::AudioEditRegions`] differ only in how many spans
+/// they carry and in whether an end may be elided. Past this function they are indistinguishable: a
+/// single-region edit is the one-element list. Nothing downstream branches on which carrier arrived,
+/// so there is no second code path for the multi-region case to drift away from — and, conversely,
+/// no way for the multi-region case to quietly reuse only the machinery the single-region case
+/// happened to exercise.
+///
+/// Returns the *first* carrier without complaint about duplicates, for the same reason
+/// [`resolve_reference_audio`] does: two edits are already refused by `validate_audio_edit`, which
+/// counts **both** kinds together.
+pub fn resolve_audio_edit(request: &GenerationRequest) -> Option<ResolvedEdit<'_>> {
+    request
+        .conditioning
+        .iter()
+        .find_map(|conditioning| match conditioning {
+            Conditioning::AudioEdit {
+                audio,
+                mode,
+                region,
+                ..
+            } => {
+                let source = source_duration_secs(audio);
+                let start_secs = region.map_or(0.0, |region| region.start_secs);
+                // The one place `end_secs: None` still means "to the end of the clip" — the
+                // single-region shorthand, unchanged. The multi-region carrier refuses `None`
+                // outright at the gen-core floor, because with an unordered region list "the end of
+                // the clip" has no unambiguous owner.
+                let end_secs = region.and_then(|region| region.end_secs).unwrap_or(source);
+                let output_duration_secs = match mode {
+                    AudioEditMode::Extend => end_secs,
+                    _ => source,
+                };
+                Some(ResolvedEdit {
+                    track: audio,
+                    mode: *mode,
+                    source_duration_secs: source,
+                    regions: vec![EditRegionSecs {
+                        start_secs,
+                        end_secs,
+                    }],
+                    multi_region: false,
+                    output_duration_secs,
+                })
+            }
+            Conditioning::AudioEditRegions {
+                audio,
+                mode,
+                regions,
+                ..
+            } => {
+                let source = source_duration_secs(audio);
+                Some(ResolvedEdit {
+                    track: audio,
+                    mode: *mode,
+                    source_duration_secs: source,
+                    regions: regions
+                        .iter()
+                        .map(|region| EditRegionSecs {
+                            start_secs: region.start_secs,
+                            // Every end is `Some` on this carrier (the gen-core floor refuses
+                            // `None`); the fallback exists only so this stays total on input
+                            // validation has already rejected.
+                            end_secs: region.end_secs.unwrap_or(source),
+                        })
+                        .collect(),
+                    multi_region: true,
+                    // Multi-region is bounded-interior only — `Extend` is refused in
+                    // `validate_audio_edit` — so the output is always exactly the source's length.
+                    output_duration_secs: source,
+                })
+            }
+            _ => None,
+        })
+}
+
+/// Build the pipeline-facing [`AudioEdit`] a request implies — the single site where a gen-core
+/// `AudioEditMode` plus an `Option<TimeRegion>` becomes a concrete `[start, end)` (sc-14548).
+///
+/// Extracted out of [`StableAudio3Generator::generate`] for the same reason
+/// [`reference_audio_for`] was, and it is the same lesson: `generate` needs multi-gigabyte weights,
+/// so a field selection made inside it is reachable only from a real-weight lane. The mistakes this
+/// site can make are all silent — handing the pipeline the caller's `end_secs` where the source's
+/// end belongs, swapping the two endpoints, or letting the mode leak past here — and none of them
+/// changes a shape. It is gated weight-free by `tests/audio_edit.rs`
+/// `the_request_surface_hands_the_pipeline_the_resolved_region`.
+///
+/// The mode is consumed **here**: `Extend` and `Inpaint`/`Repaint` differ only in which numbers come
+/// out, and [`AudioEdit`] has no mode field for anything downstream to branch on.
+pub fn audio_edit_for(request: &GenerationRequest) -> Option<AudioEdit<'_>> {
+    resolve_audio_edit(request).map(|edit| AudioEdit {
+        samples: &edit.track.samples,
+        sample_rate: edit.track.sample_rate,
+        channels: edit.track.channels,
+        regions: edit.regions,
+    })
+}
+
+/// Bundle conditioning for the production synthesis entry after [`validate_request`] succeeds.
+///
+/// The wrapper type is accepted only by `synthesize_conditioned_validated`; the public defensive
+/// entry takes the unwrapped receipt. That makes routing a validated provider request back through
+/// the duplicate source scan a compile-time type mismatch.
+fn validated_conditioning_for(request: &GenerationRequest) -> ValidatedForwardedConditioning<'_> {
+    ValidatedForwardedConditioning::new(ForwardedConditioning {
+        request_has_reference: request
+            .conditioning
+            .iter()
+            .any(|item| matches!(item, Conditioning::ReferenceAudio { .. })),
+        request_has_edit: request.conditioning.iter().any(|item| {
+            matches!(
+                item,
+                Conditioning::AudioEdit { .. } | Conditioning::AudioEditRegions { .. }
+            )
+        }),
+        reference: reference_audio_for(request),
+        edit: audio_edit_for(request),
+    })
+}
+
+/// Validate a request against one variant's own descriptor, without a snapshot.
+///
+/// `Generator::validate` needs a loaded generator, which needs multi-gigabyte weights; every
+/// request-shaping rule this family owns is weight-free, so exposing the pair lets the whole
+/// rejection surface be gated in the PR lane instead of only on a real-weight runner.
+pub fn validate_request_for(variant: Variant, request: &GenerationRequest) -> gen_core::Result<()> {
+    validate_request(variant, &descriptor_for(variant), request)
+}
+
 pub(crate) fn validate_request(
     variant: Variant,
     descriptor: &ModelDescriptor,
@@ -1188,6 +1522,13 @@ pub(crate) fn validate_request(
         )));
     }
     let method = request.guidance_method.as_deref();
+    if let Some(eta) = request.guidance_eta {
+        if !eta.is_finite() || !(0.0..=1.0).contains(&eta) {
+            return Err(gen_core::Error::Msg(format!(
+                "{model_id}: guidance_eta {eta} outside the finite inclusive range 0..=1"
+            )));
+        }
+    }
     if request.guidance_eta.is_some() && method != Some("apg") {
         return Err(gen_core::Error::Unsupported(format!(
             "{model_id}: guidance_eta is only supported with guidance_method=apg"
@@ -1198,10 +1539,365 @@ pub(crate) fn validate_request(
             "{model_id}: guidance_norm_threshold is only supported with guidance_method=apg"
         )));
     }
+    reject_reference_and_edit_combination(model_id, request)?;
+    validate_reference_audio(model_id, request)?;
+    validate_audio_edit(variant, model_id, request)?;
     Ok(())
 }
 
-/// Map the backend-neutral request onto this variant's runtime parameters.
+/// A source clip may play one role per request, never two (sc-14547 / sc-14548).
+///
+/// `ReferenceAudio` hands its clip to the sampler as `init_data`; `AudioEdit` hands its clip to the
+/// DiT as masked local input and starts from pure noise. A request carrying both is asking for two
+/// contradictory treatments of the source, so it is refused rather than silently resolved by
+/// whichever branch runs first.
+///
+/// # This check only became reachable in sc-14548
+///
+/// sc-14547 shipped it as defence in depth and said so: `audio_edit_modes` was empty and `AudioEdit`
+/// was not in `conditioning`, so `Capabilities::validate_request_audio`'s generic allowlist refused
+/// any `AudioEdit` item on its own and this never fired. Advertising the kind is exactly what turns
+/// it on, which is why it is hoisted here — called **once**, before both per-kind validators, so
+/// the caller sees the same message regardless of which conditioning item is written first. Left
+/// inside `validate_reference_audio` it would have been reachable only via the reference arm, and a
+/// duplicate copy in the edit arm would have been dead code that could disagree.
+fn reject_reference_and_edit_combination(
+    model_id: &str,
+    request: &GenerationRequest,
+) -> gen_core::Result<()> {
+    let has_reference = request
+        .conditioning
+        .iter()
+        .any(|conditioning| matches!(conditioning, Conditioning::ReferenceAudio { .. }));
+    // Both edit carriers count (sc-14549): the rule is about the *role* the source clip plays, and
+    // a multi-region edit hands its clip to the DiT exactly as a single-region one does.
+    let has_edit = request.conditioning.iter().any(|conditioning| {
+        matches!(
+            conditioning,
+            Conditioning::AudioEdit { .. } | Conditioning::AudioEditRegions { .. }
+        )
+    });
+    if has_reference && has_edit {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{model_id}: reference audio and audio editing cannot be combined in one request"
+        )));
+    }
+    Ok(())
+}
+
+/// Gate the bounded source-edit conditioning (sc-14548).
+///
+/// The generic floor above has already admitted the kind, rejected any mode outside
+/// [`descriptor_for`]'s three (which is where `AudioEditMode::Cover` dies), enforced finiteness on
+/// every float, and checked `start >= 0` / `end > start` in isolation. Everything that needs to know
+/// what a *Stable Audio 3* edit is — arity, the strength refusal, the source clip's shape, where a
+/// region may sit relative to the clip, and which output duration each mode implies — is this
+/// family's own contract and lives here.
+fn validate_audio_edit(
+    variant: Variant,
+    model_id: &str,
+    request: &GenerationRequest,
+) -> gen_core::Result<()> {
+    // **Both** carriers, counted together (sc-14549). Two legacy edits, two multi-region edits, or
+    // one of each are all the same mistake: `GenerationRequest::audio_edit()` and
+    // `audio_edit_regions()` are each first-match-only and neither sees the other, so without this
+    // the second carrier would be silently ignored rather than refused. Counting the kinds
+    // separately would leave the *mixed* case — one of each — passing both counts at one apiece.
+    let edits = request
+        .conditioning
+        .iter()
+        .filter(|conditioning| {
+            matches!(
+                conditioning,
+                Conditioning::AudioEdit { .. } | Conditioning::AudioEditRegions { .. }
+            )
+        })
+        .count();
+    if edits == 0 {
+        return Ok(());
+    }
+    // Typed `Unsupported`, matching the reference arity refusal: "one edit per request" is a
+    // statement about what this family can do. Note this is arity of *carriers*, not of regions —
+    // several regions inside one `AudioEditRegions` are exactly what sc-14549 added.
+    if edits > 1 {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{model_id}: exactly one audio edit is supported per request, got {edits}; several \
+             spans belong in the regions list of a single Conditioning::AudioEditRegions, which \
+             regenerates them in one pass"
+        )));
+    }
+    let strength = request
+        .conditioning
+        .iter()
+        .find_map(|conditioning| match conditioning {
+            Conditioning::AudioEdit { strength, .. }
+            | Conditioning::AudioEditRegions { strength, .. } => Some(strength),
+            _ => None,
+        })
+        .expect("a nonzero edit count finds one");
+    // Refused, never ignored. Stable Audio 3's inpaint conditioner is a hard binary mask times the
+    // encoded source, concatenated as channels: there is no scalar anywhere on this path a
+    // "strength" could modulate, so honouring it would mean inventing a semantic. gen-core treats
+    // `AudioEdit.strength` as a first-class float, so accepting and discarding it is the
+    // "appears to work, does nothing" failure mode — the shipped idiom is to refuse
+    // (`candle-gen-mage/src/lib.rs` does the same for per-reference strength inside its
+    // conditioning walk). The one Stable Audio 3 scalar that *does* read like a strength is
+    // `init_noise_level`, and that belongs to `Conditioning::ReferenceAudio`, named here so the
+    // caller is pointed at the knob that exists rather than told "no".
+    if let Some(strength) = strength {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{model_id}: audio edit strength ({strength}) is not supported — this family's inpaint \
+             conditioning is a hard binary mask with no blend parameter; use \
+             Conditioning::ReferenceAudio, whose strength controls how much of the source is \
+             retained across the whole clip"
+        )));
+    }
+    let Some(edit) = resolve_audio_edit(request) else {
+        unreachable!("a nonzero edit count resolves");
+    };
+    let track = edit.track;
+    // The gen-core finiteness floor does not walk `AudioTrack::samples`, so the provider must.
+    if track.samples.is_empty() {
+        return Err(gen_core::Error::Msg(format!(
+            "{model_id}: audio edit source must contain at least one frame"
+        )));
+    }
+    if let Some(value) = track
+        .samples
+        .iter()
+        .copied()
+        .find(|value| !value.is_finite())
+    {
+        return Err(gen_core::Error::Msg(format!(
+            "{model_id}: audio edit source contains the non-finite sample {value}"
+        )));
+    }
+    if track.sample_rate == 0 {
+        return Err(gen_core::Error::Msg(format!(
+            "{model_id}: audio edit source must declare a non-zero sample rate"
+        )));
+    }
+    if track.channels == 0 {
+        return Err(gen_core::Error::Msg(format!(
+            "{model_id}: audio edit source must declare at least one channel"
+        )));
+    }
+    if !track.samples.len().is_multiple_of(track.channels as usize) {
+        return Err(gen_core::Error::Msg(format!(
+            "{model_id}: audio edit source has {} samples, not a whole number of {}-channel frames",
+            track.samples.len(),
+            track.channels
+        )));
+    }
+    // Every advertised mode is a *bounded* region mode, so a region is mandatory on all three.
+    // (`Cover`, the one gen-core mode that ignores it, is not advertised — see `descriptor_for`.)
+    // On the single-region carrier that means `region: Some(..)`; on the multi-region carrier the
+    // gen-core floor has already refused an empty list, and this catches it either way.
+    let carries_region =
+        match request
+            .conditioning
+            .iter()
+            .find_map(|conditioning| match conditioning {
+                Conditioning::AudioEdit { region, .. } => Some(region.is_some()),
+                Conditioning::AudioEditRegions { regions, .. } => Some(!regions.is_empty()),
+                _ => None,
+            }) {
+            Some(present) => present,
+            None => unreachable!("a nonzero edit count finds one"),
+        };
+    if !carries_region {
+        return Err(gen_core::Error::Msg(format!(
+            "{model_id}: {:?} requires an audio edit region",
+            edit.mode
+        )));
+    }
+    let source = edit.source_duration_secs;
+    // `Extend` is a **single-tail** operation and stays on the single-region carrier. Multi-region
+    // means "regenerate these interior spans in one pass": there is exactly one tail, so a list of
+    // them has no meaning, and the output length an extend implies is the region's end — which is
+    // not well-defined when region order is not significant. Refused as a typed capability gap
+    // rather than silently reinterpreted as an inpaint.
+    if edit.multi_region && edit.mode == AudioEditMode::Extend {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{model_id}: {:?} is a single-tail operation and is not supported on the multi-region \
+             carrier; use Conditioning::AudioEdit with one region to continue past the source's \
+             end",
+            edit.mode
+        )));
+    }
+    for (index, region) in edit.regions.iter().enumerate() {
+        // Only the single-region carrier can reach the Extend arm (guarded above), so `regions`
+        // holds exactly one entry there and this loop states the tail rule once.
+        match edit.mode {
+            AudioEditMode::Extend => {
+                // The appended tail must start where the prepared source ends: an extend that
+                // begins before the source's end is an inpaint the caller has mislabelled, and one
+                // that begins after it asks the model to invent a gap it is given no context for.
+                if (region.start_secs - source).abs() > EDIT_TIMING_TOLERANCE_SECS {
+                    return Err(gen_core::Error::Msg(format!(
+                        "{model_id}: an Extend region must start at the source's end ({source}s), \
+                         got {}s",
+                        region.start_secs
+                    )));
+                }
+                // `end_secs = None` resolved to the source's end, which for an extend is a no-op.
+                if region.end_secs <= source {
+                    return Err(gen_core::Error::Msg(format!(
+                        "{model_id}: an Extend region must end past the source ({source}s), got \
+                         {}s — name the new total length as end_secs",
+                        region.end_secs
+                    )));
+                }
+            }
+            _ => {
+                if region.start_secs >= source {
+                    return Err(gen_core::Error::Msg(format!(
+                        "{model_id}: audio edit region {index} start {}s is at or past the \
+                         source's end ({source}s); use AudioEditMode::Extend to continue past it",
+                        region.start_secs
+                    )));
+                }
+                if region.end_secs > source + EDIT_TIMING_TOLERANCE_SECS {
+                    return Err(gen_core::Error::Msg(format!(
+                        "{model_id}: audio edit region {index} end {}s is past the source's end \
+                         ({source}s); use AudioEditMode::Extend to continue past it",
+                        region.end_secs
+                    )));
+                }
+            }
+        }
+        // A region narrower than one latent frame masks nothing: `[ceil(start/4096),
+        // ceil(end/4096))` is empty, the local conditioner is the unedited source there, and the
+        // render silently comes back identical to the input. Refuse instead of returning a no-op
+        // that looks like success — checked on **every** requested region, so a caller who names
+        // one usable span and one degenerate one is told about the degenerate one rather than
+        // having it quietly disappear from the union.
+        let (start_sample, end_sample) =
+            crate::pipeline::edit_region_samples(region.start_secs, region.end_secs);
+        let (start_latent, end_latent) =
+            crate::pipeline::edit_region_latents(start_sample, end_sample);
+        if end_latent <= start_latent {
+            return Err(gen_core::Error::Msg(format!(
+                "{model_id}: audio edit region {index} [{}s, {}s) spans no latent frame (positions \
+                 {}..{}); it must cover at least one {}-sample frame (~{:.3}s)",
+                region.start_secs,
+                region.end_secs,
+                start_latent,
+                end_latent,
+                crate::sampler::LATENT_DOWNSAMPLING,
+                crate::sampler::LATENT_DOWNSAMPLING as f32 / SAMPLE_RATE as f32
+            )));
+        }
+    }
+    // The mode decides the output length, so a `target_duration` that disagrees is a request the
+    // provider would have to silently overrule. Refuse it instead — and note the generic floor's
+    // duration cap was applied to `target_duration`, which an extend need not carry, so the
+    // resolved length is capped here too.
+    let audio = request.audio.clone().unwrap_or_default();
+    if let Some(target) = audio.target_duration {
+        if (target - edit.output_duration_secs).abs() > EDIT_TIMING_TOLERANCE_SECS {
+            return Err(gen_core::Error::Msg(format!(
+                "{model_id}: audio.target_duration {target}s conflicts with the {:?} output length \
+                 {}s implied by the source and region",
+                edit.mode, edit.output_duration_secs
+            )));
+        }
+    }
+    let cap = variant.max_duration_secs();
+    if edit.output_duration_secs > cap {
+        return Err(gen_core::Error::Msg(format!(
+            "{model_id}: the {:?} output length {}s exceeds the supported maximum {cap}s",
+            edit.mode, edit.output_duration_secs
+        )));
+    }
+    if edit.output_duration_secs < 1.0 / SAMPLE_RATE as f32 {
+        return Err(gen_core::Error::Msg(format!(
+            "{model_id}: the {:?} output length {}s must contain at least one 44.1 kHz frame",
+            edit.mode, edit.output_duration_secs
+        )));
+    }
+    Ok(())
+}
+
+/// Gate the audio→audio restyle conditioning (sc-14547).
+///
+/// The generic floor above admits `ReferenceAudio` (the descriptor now advertises it) and enforces
+/// exactly one thing about it: that an explicit `strength` is finite. Everything a source clip can
+/// be wrong about — arity, PCM shape, declared rate/channels, and the strength *range* — is this
+/// family's own contract and is enforced here, before any of it reaches the resampler or
+/// `build_schedule`, where the message would name an internal value the caller never typed.
+fn validate_reference_audio(model_id: &str, request: &GenerationRequest) -> gen_core::Result<()> {
+    let references = request
+        .conditioning
+        .iter()
+        .filter(|conditioning| matches!(conditioning, Conditioning::ReferenceAudio { .. }))
+        .count();
+    if references == 0 {
+        return Ok(());
+    }
+    // Typed `Unsupported`, not `Msg`: "one clip only" is a statement about what this family *can
+    // do*, the same category as the `AudioEdit`-combination refusal, and this epic frames
+    // conditioning refusals as typed. The malformed-clip rejections further down stay `Msg` —
+    // those are about the caller's data, not about the model's capability. Both sides of that
+    // split are asserted by type in `tests/reference_audio.rs`.
+    if references > 1 {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{model_id}: exactly one reference audio clip is supported, got {references}"
+        )));
+    }
+    // The `ReferenceAudio` + `AudioEdit` combination is refused by
+    // `reject_reference_and_edit_combination`, which `validate_request` calls **before** this and
+    // before `validate_audio_edit`. sc-14547 had that check here, where it was unreachable (the
+    // generic floor refused any `AudioEdit` item on its own because the kind was not advertised);
+    // sc-14548 advertises the kind, so it is now live and was hoisted to one call site so both
+    // orderings produce the same message.
+    let Some(reference) = resolve_reference_audio(request) else {
+        unreachable!("a nonzero reference count resolves");
+    };
+    let track = reference.track;
+    if track.samples.is_empty() {
+        return Err(gen_core::Error::Msg(format!(
+            "{model_id}: reference audio must contain at least one frame"
+        )));
+    }
+    if let Some(value) = track
+        .samples
+        .iter()
+        .copied()
+        .find(|value| !value.is_finite())
+    {
+        return Err(gen_core::Error::Msg(format!(
+            "{model_id}: reference audio contains the non-finite sample {value}"
+        )));
+    }
+    if track.sample_rate == 0 {
+        return Err(gen_core::Error::Msg(format!(
+            "{model_id}: reference audio must declare a non-zero sample rate"
+        )));
+    }
+    if track.channels == 0 {
+        return Err(gen_core::Error::Msg(format!(
+            "{model_id}: reference audio must declare at least one channel"
+        )));
+    }
+    if !track.samples.len().is_multiple_of(track.channels as usize) {
+        return Err(gen_core::Error::Msg(format!(
+            "{model_id}: reference audio has {} samples, not a whole number of {}-channel frames",
+            track.samples.len(),
+            track.channels
+        )));
+    }
+    let strength = reference.strength;
+    if !(REFERENCE_STRENGTH_RANGE.0..=REFERENCE_STRENGTH_RANGE.1).contains(&strength) {
+        return Err(gen_core::Error::Msg(format!(
+            "{model_id}: reference audio strength {strength} outside {}..={}",
+            REFERENCE_STRENGTH_RANGE.0, REFERENCE_STRENGTH_RANGE.1
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve one request onto this variant's own runtime synthesis parameters.
 ///
 /// Every "omitted" default is variant-bound (sc-14546): the post-trained ids resolve to upstream's
 /// 8-step Pingpong at `cfg_scale = 1.0`, the `-base` ids to [`BASE_DEFAULT_STEPS`] Euler steps at
@@ -1212,7 +1908,15 @@ pub(crate) fn validate_request(
 /// the three post-trained ids and is wrong for all three base ids, and it also meant
 /// [`SamplerKind::recommended`] — the port of upstream's own rule — was dead code on the provider
 /// path.
-fn synthesis_parameters(variant: Variant, request: &GenerationRequest) -> SynthesisParameters {
+///
+/// `pub` (and hidden) so the weight-free lane can assert the seam that decides this path's
+/// geometry: `duration_secs` comes from `audio.target_duration`, or this variant's default, and
+/// **never** from the reference clip's extent. Everything downstream — the adapted sample size, the
+/// padded length `prepare_reference_pcm` conforms to, and the attention mask — is derived from that
+/// one number, so a source-extent leak here would be invisible in `prepare_reference_pcm`'s own
+/// output.
+#[doc(hidden)]
+pub fn synthesis_parameters(variant: Variant, request: &GenerationRequest) -> SynthesisParameters {
     let audio = request.audio.clone().unwrap_or_default();
     let method = request.guidance_method.as_deref();
     let guidance = Guidance {
@@ -1233,9 +1937,20 @@ fn synthesis_parameters(variant: Variant, request: &GenerationRequest) -> Synthe
         },
     };
     SynthesisParameters {
-        duration_secs: audio
-            .target_duration
-            .unwrap_or_else(|| variant.default_duration_secs()),
+        // An `AudioEdit` **decides** the output length rather than merely constraining it: an
+        // inpaint's output is exactly as long as its source, and an extend's is exactly its
+        // region's end. `target_duration` is not consulted on that path — `validate_audio_edit`
+        // has already refused any value that disagrees, so this is the same number, resolved from
+        // the side that owns it. Without this an extend whose caller omitted `target_duration`
+        // would render the variant's 120 s / 380 s default.
+        duration_secs: resolve_audio_edit(request).map_or_else(
+            || {
+                audio
+                    .target_duration
+                    .unwrap_or_else(|| variant.default_duration_secs())
+            },
+            |edit| edit.output_duration_secs,
+        ),
         steps: request.steps.unwrap_or(variant.default_steps() as u32) as usize,
         sampler: match request.sampler.as_deref() {
             None => variant.recommended_sampler(),
@@ -1255,6 +1970,12 @@ pub struct StableAudio3Generator {
     variant: Variant,
     descriptor: ModelDescriptor,
     root: PathBuf,
+    /// The caller's adapter stack, parsed and matched exactly once on the host at load time.
+    ///
+    /// The lazy pipeline copies this plan's tensors to the selected compute device. Retaining the
+    /// plan rather than the [`AdapterSpec`] paths preserves fail-fast key-mismatch rejection while
+    /// ensuring cold start cannot re-read adapter files or rebuild their target matching.
+    adapter_plan: crate::adapters::AdapterPlan,
     pipeline: Mutex<Option<Arc<StableAudio3Pipeline>>>,
     generation: Mutex<()>,
 }
@@ -1290,10 +2011,12 @@ impl StableAudio3Generator {
         // window observes it between pins instead of after the full load.
         verify_snapshot_identity(self.variant, &layout.root, Some(cancel))?;
         let device = resolve_device(DevicePolicy::Default)?;
-        let pipeline = Arc::new(StableAudio3Pipeline::from_layout(
+        let plan = self.adapter_plan.to_device(&device)?;
+        let pipeline = Arc::new(StableAudio3Pipeline::from_layout_with_adapters(
             &layout,
             self.variant.geometry(),
             &device,
+            &plan,
         )?);
         *guard = Some(pipeline.clone());
         Ok(pipeline)
@@ -1322,7 +2045,6 @@ pub fn load_variant(expected: Variant, spec: &LoadSpec) -> gen_core::Result<Stab
     };
     if spec.quantize.is_some()
         || spec.precision != Precision::Bf16
-        || !spec.adapters.is_empty()
         || spec.control.is_some()
         || !spec.extra_controls.is_empty()
         || spec.ip_adapter.is_some()
@@ -1336,17 +2058,53 @@ pub fn load_variant(expected: Variant, spec: &LoadSpec) -> gen_core::Result<Stab
             "{model_id} accepts only its native dense self-contained snapshot"
         )));
     }
+    // Judged before the snapshot is opened: a `Lokr` request, or one carrying LTX's `pass_scales`
+    // or Wan's `moe_expert`, is a statement about the request that reading the checkpoint cannot
+    // change. `load_adapter` calls the identical function, so the two paths cannot drift.
+    for adapter in &spec.adapters {
+        crate::adapters::validate_spec_shape(adapter).map_err(crate::adapters::into_unsupported)?;
+    }
     let layout = SnapshotLayout::from_dir(&root)?;
     crate::pipeline::validate_layout(&layout, expected.geometry())?;
     // No request is in flight on the load path, so there is no cancel flag to honour here.
     verify_snapshot_identity(expected, &layout.root, None)?;
+    // Resolve the adapter stack against this checkpoint *now*, on the host, and retain the result.
+    // The lazy pipeline only moves this plan's tensors to the compute device; it never re-opens the
+    // adapter paths or rebuilds target matching. Resolving here is what makes a malformed,
+    // mistyped, pickle-format, or key-mismatched adapter fail
+    // at `load_variant` — the moment the caller can still act on it — instead of at the first
+    // generate, minutes later, behind a snapshot hash and a cold start.
+    let adapter_plan = resolve_adapter_plan(&layout, &spec.adapters, &Device::Cpu)?;
     Ok(StableAudio3Generator {
         variant: expected,
         descriptor: descriptor_for(expected),
         root,
+        adapter_plan,
         pipeline: Mutex::new(None),
         generation: Mutex::new(()),
     })
+}
+
+/// Resolve a `LoadSpec` adapter stack against one snapshot, or return the empty plan.
+///
+/// Separated from both call sites so the load-time refusal and the device-time fold read the
+/// *same* function rather than two spellings of it — a divergence between them would be a load
+/// that accepts an adapter the fold then cannot apply, discovered only under weights.
+///
+/// The target set comes from the checkpoint's safetensors header alone, so nothing is materialized
+/// to decide whether an adapter matches.
+fn resolve_adapter_plan(
+    layout: &SnapshotLayout,
+    specs: &[AdapterSpec],
+    device: &Device,
+) -> gen_core::Result<crate::adapters::AdapterPlan> {
+    if specs.is_empty() {
+        return Ok(crate::adapters::AdapterPlan::default());
+    }
+    let header = crate::weights::safetensors_shapes(&layout.weights_path)
+        .map_err(crate::adapters::into_unsupported)?;
+    let targets = crate::adapters::adaptable_targets(&header);
+    crate::adapters::plan_for(specs, &targets, device).map_err(crate::adapters::into_unsupported)
 }
 
 pub fn load_generator(spec: &LoadSpec) -> gen_core::Result<StableAudio3Generator> {
@@ -1433,10 +2191,25 @@ impl Generator for StableAudio3Generator {
             });
         };
         let mut decoding = || (progress.borrow_mut())(Progress::Decoding);
-        let samples = pipeline.synthesize(
+        // Both conditioning paths resolve through a function that is reachable — and gated —
+        // without weights, because `generate` is not: `reference_audio_for` carries the one
+        // retention → `init_noise_level` conversion (sc-14547), `audio_edit_for` carries the one
+        // mode + region → `[start, end)` resolution (sc-14548). The combination is refused in
+        // `validate` above, so at most one of these is `Some`.
+        // Each `..._for(request)` below is one token wide, and substituting either for `None` is a
+        // silent, complete feature deletion that no weight-free lane can see, because this method
+        // needs weights. So the resolved values travel bundled with the request facts they were
+        // resolved from, and `synthesize_conditioned` re-checks the pair on the far side of the
+        // boundary — an earlier revision checked them here and left the call's own argument list
+        // unguarded, which is the same shape one seam further along. There is deliberately no
+        // `match` selecting a synthesis method: that one entry point takes the whole receipt and
+        // decides internally, so there is no arm for an edit to be routed into.
+        let conditioning = validated_conditioning_for(request);
+        let samples = pipeline.synthesize_conditioned_validated(
             &request.prompt,
             request.negative_prompt.as_deref(),
             parameters,
+            conditioning,
             &mut step_progress,
             &mut decoding,
             &|| cancel.is_cancelled(),
@@ -1903,35 +2676,45 @@ mod tests {
             .map(|variant| by_name(variant.pins(), "model.safetensors").bytes)
             .collect();
         assert_eq!(lengths.len(), 2, "{lengths:?}");
+        assert_eq!(
+            Variant::Medium
+                .pins()
+                .iter()
+                .map(|pin| pin.bytes)
+                .sum::<u64>(),
+            10_443_755_936,
+            "the documented medium artifact pin set must remain exact"
+        );
     }
 
     #[test]
-    fn every_variant_contributes_composite_and_component_license_rows() {
-        // Six registered variants x (composite, root, t5gemma). sc-14545 added the medium trio;
-        // sc-14546 the three `-base` trios. The base repositories are ungated on the Hub but ship
-        // the same Stability Community and Gemma license files, so the rows are not weaker.
-        assert_eq!(WEIGHT_LICENSES.len(), 18);
+    fn every_variant_contributes_a_root_and_a_t5gemma_component_row() {
+        // Six registered variants x (root, t5gemma) = twelve rows. v2 carried an extra hand-authored
+        // composite row per variant; schema 3 derives the provider view instead (sc-16663).
+        assert_eq!(COMPONENT_LICENSES.len(), 12);
         assert_eq!(VARIANTS.len(), 6);
+        assert_eq!(PROVIDER_COMPONENTS.len(), 6);
         for variant in VARIANTS {
-            let rows = variant.weight_licenses();
-            assert_eq!(rows.len(), 3);
-            assert!(rows.iter().all(|row| row.provider_id == variant.model_id()));
-            assert_eq!(rows[0].component, None);
-            assert_eq!(rows[1].component, Some("root"));
-            assert_eq!(rows[2].component, Some("t5gemma"));
-            assert_eq!(rows[0].license.spdx_id, "LicenseRef-Stability-AI-Community");
-            assert!(!rows[0].license.commercial_use);
-            assert!(rows[0].license.restriction.is_some());
-            assert_eq!(rows[2].license.spdx_id, "LicenseRef-Gemma-Terms");
-            assert!(rows[1].license.source_url.contains(variant.hub_revision()));
-            assert!(rows[2].license.source_url.contains(variant.hub_revision()));
-            assert!(
-                WEIGHT_LICENSES
-                    .iter()
-                    .filter(|row| row.provider_id == variant.model_id())
-                    .count()
-                    == 3
-            );
+            let [root, gemma] = variant.component_licenses();
+            assert_eq!(root.family, "stability-ai-community");
+            assert_eq!(root.declared, "stable-audio-community");
+            assert_eq!(gemma.family, "gemma-terms");
+            // The `-base` repositories are ungated; the three post-trained ones are not. That is an
+            // acquisition difference recorded on the row, not a licence difference (sc-14546).
+            assert_eq!(root.gated, !variant.model_id().ends_with("_base"));
+            assert_eq!(gemma.gated, root.gated);
+            // The T5Gemma row still points at the revision-pinned licence file shipped with the
+            // weights, which is the evidence behind its `declared` string.
+            assert!(gemma.source_url.contains(variant.hub_revision()));
+            let mapping = PROVIDER_COMPONENTS
+                .iter()
+                .find(|p| p.provider_id == variant.model_id())
+                .expect("every variant maps to components");
+            assert_eq!(mapping.components, &[root.component, gemma.component]);
+            for row in [root, gemma] {
+                assert!(COMPONENT_LICENSES.contains(&row));
+                assert!(row.is_well_formed(gen_core::LICENSE_FAMILIES), "{row:?}");
+            }
         }
     }
 
@@ -2012,6 +2795,42 @@ mod tests {
     }
 
     #[test]
+    fn guidance_eta_requires_a_finite_inclusive_unit_interval() {
+        for variant in VARIANTS {
+            let descriptor = descriptor_for(variant);
+            for endpoint in [0.0, 1.0] {
+                let mut valid = request();
+                valid.guidance_method = Some("apg".into());
+                valid.guidance_eta = Some(endpoint);
+                validate_request(variant, &descriptor, &valid).unwrap_or_else(|error| {
+                    panic!(
+                        "{} must accept guidance_eta endpoint {endpoint}: {error}",
+                        variant.model_id()
+                    )
+                });
+            }
+            for invalid in [
+                f32::NAN,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                -f32::EPSILON,
+                1.0 + f32::EPSILON,
+            ] {
+                let mut request = request();
+                request.guidance_method = Some("apg".into());
+                request.guidance_eta = Some(invalid);
+                let error = validate_request(variant, &descriptor, &request)
+                    .expect_err("non-finite and out-of-range guidance_eta values must be refused");
+                assert!(
+                    error.to_string().contains("guidance_eta"),
+                    "{} guidance_eta {invalid}: {error}",
+                    variant.model_id()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn guidance_methods_map_to_frozen_cfg_apg_endpoints() {
         let mut cfg = request();
         cfg.guidance = Some(4.0);
@@ -2080,11 +2899,28 @@ mod tests {
             precision.precision = Precision::Fp32;
             specs.push(precision);
 
+            // sc-14550: a `Lora` adapter is no longer refused *as a shape* — the family is
+            // supported — but `Lokr` still is, and it is refused **before** the snapshot is opened,
+            // which is what this loop tests. The accepted-`Lora` half is gated weight-free in
+            // `tests/adapters.rs`; here the point is only that the pre-snapshot guard still names
+            // the kinds this provider cannot serve.
+            specs.push(dense().with_adapters(vec![AdapterSpec::new(
+                missing.clone(),
+                1.0,
+                AdapterKind::Lokr,
+            )]));
             specs.push(dense().with_adapters(vec![AdapterSpec::new(
                 missing.clone(),
                 1.0,
                 AdapterKind::Lora,
-            )]));
+            )
+            .with_pass_scales(vec![1.0, 0.5])]));
+            specs.push(dense().with_adapters(vec![AdapterSpec::new(
+                missing.clone(),
+                1.0,
+                AdapterKind::Lora,
+            )
+            .with_moe_expert(gen_core::MoeExpert::High)]));
             specs.push(dense().with_control(WeightsSource::File(missing.clone())));
             specs.push(dense().with_extra_control(WeightsSource::File(missing.clone())));
             specs.push(dense().with_ip_adapter(WeightsSource::Dir(missing.clone())));
@@ -2114,18 +2950,16 @@ mod tests {
 
     #[test]
     fn pinned_file_authentication_rejects_size_and_payload_drift() {
-        // `ThreadId`, not `Thread::name()`: under libtest the thread name *is* the test path
-        // (`model::tests::pinned_file_authentication_rejects_size_and_payload_drift`), and `:` is
-        // an illegal character in a Windows path component, so `create_dir_all` returned
-        // `InvalidFilename` (os error 123) on the Windows CUDA runner the moment this crate's unit
-        // tests were first run there. `weights.rs` already uses the id for the same reason.
-        let root = std::env::temp_dir().join(format!(
-            "sa3-provider-pin-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        // sc-17755: a `TempDir` guard. The old `(pid, ThreadId)` path was unique per test *thread*,
+        // not per call, and the `remove_dir_all` prelude only made it idempotent within one process —
+        // so every new PID left another tree behind. `TempDir` also sidesteps the `ThreadId` reason
+        // for that naming: its suffix is generated, so no illegal Windows path character (`:` from a
+        // libtest thread name) can reach `create_dir_all` in the first place.
+        let guard = tempfile::Builder::new()
+            .prefix("sa3-provider-pin-")
+            .tempdir()
+            .expect("fixture temp dir");
+        let root = guard.path();
         let path = root.join("fixture");
         std::fs::write(&path, b"exact").unwrap();
         let exact = SnapshotFilePin {
@@ -2140,6 +2974,5 @@ mod tests {
         std::fs::write(&path, b"short").unwrap();
         let wrong_size = SnapshotFilePin { bytes: 4, ..exact };
         assert!(verify_file_pin(MODEL_ID, HUB_REPO, HUB_REVISION, &path, &wrong_size).is_err());
-        let _ = std::fs::remove_dir_all(root);
     }
 }

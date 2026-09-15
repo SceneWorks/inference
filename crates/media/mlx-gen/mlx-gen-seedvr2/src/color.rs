@@ -8,6 +8,7 @@
 
 use mlx_gen::Result;
 use mlx_rs::{Array, Dtype};
+use rayon::prelude::*;
 
 const KERNEL: [[f32; 3]; 3] = [
     [0.0625, 0.125, 0.0625],
@@ -21,6 +22,10 @@ fn clampi(v: i64, lo: i64, hi: i64) -> usize {
 }
 
 /// Dilated 3×3 wavelet blur of one `H×W` channel (edge/clamp padding), dilation = `radius`.
+///
+/// Every output pixel is independent, so rows can be computed in parallel. Each output element
+/// retains the serial accumulation order, keeping the numerical result unchanged while removing
+/// this host-only post-process from the single-threaded video critical path (F-165 / sc-21704).
 fn wavelet_blur(img: &[f32], h: i32, w: i32, radius: i32) -> Vec<f32> {
     let mut r = radius.max(1);
     let max_safe = (h.min(w) / 8).max(1);
@@ -28,20 +33,25 @@ fn wavelet_blur(img: &[f32], h: i32, w: i32, radius: i32) -> Vec<f32> {
         r = max_safe;
     }
     let (hh, ww) = (h as i64, w as i64);
+    let wu = w as usize;
     let mut out = vec![0f32; (h * w) as usize];
-    for y in 0..h as i64 {
-        for x in 0..w as i64 {
-            let mut acc = 0f32;
-            for (ky, dy) in [-1i64, 0, 1].iter().enumerate() {
-                let yy = clampi(y + dy * r as i64, 0, hh - 1);
-                for (kx, dx) in [-1i64, 0, 1].iter().enumerate() {
-                    let xx = clampi(x + dx * r as i64, 0, ww - 1);
-                    acc += KERNEL[ky][kx] * img[yy * w as usize + xx];
+    out.par_chunks_mut(wu)
+        .enumerate()
+        .for_each(|(row_idx, row)| {
+            let y = row_idx as i64;
+            for (x, dst) in row.iter_mut().enumerate() {
+                let x = x as i64;
+                let mut acc = 0f32;
+                for (ky, dy) in [-1i64, 0, 1].iter().enumerate() {
+                    let yy = clampi(y + dy * r as i64, 0, hh - 1);
+                    for (kx, dx) in [-1i64, 0, 1].iter().enumerate() {
+                        let xx = clampi(x + dx * r as i64, 0, ww - 1);
+                        acc += KERNEL[ky][kx] * img[yy * wu + xx];
+                    }
                 }
+                *dst = acc;
             }
-            out[(y * ww + x) as usize] = acc;
-        }
-    }
+        });
     out
 }
 
@@ -153,50 +163,80 @@ pub fn apply_color_correction(
     let c = c.as_slice::<f32>();
     let s = s.as_slice::<f32>();
 
-    // 1. wavelet reconstruction: content high-freq + style low-freq, per channel
+    // 1. Wavelet reconstruction: channels are independent, and each decomposition's rows are
+    // parallel above. Per-element arithmetic remains unchanged.
     let mut recon = vec![0f32; 3 * n];
-    for ch in 0..3 {
+    recon.par_chunks_mut(n).enumerate().for_each(|(ch, dst)| {
         let (chigh, _) = wavelet_decomp(&c[ch * n..(ch + 1) * n], h, w);
         let (_, slow) = wavelet_decomp(&s[ch * n..(ch + 1) * n], h, w);
-        for k in 0..n {
-            recon[ch * n + k] = (chigh[k] + slow[k]).clamp(-1.0, 1.0);
+        for (out, (high, low)) in dst.iter_mut().zip(chigh.iter().zip(slow.iter())) {
+            *out = (high + low).clamp(-1.0, 1.0);
         }
-    }
+    });
 
-    // 2. to LAB (content from `recon`, style from the original)
+    // 2. To LAB (content from `recon`, style from the original). LAB conversion is per-pixel;
+    // retain the channel-major buffers expected by histogram matching after parallel conversion.
     let to01 = |v: f32| ((v + 1.0) * 0.5).clamp(0.0, 1.0);
-    let (mut c_l, mut c_a, mut c_b) = (vec![0f32; n], vec![0f32; n], vec![0f32; n]);
-    let (mut s_l, mut s_a, mut s_b) = (vec![0f32; n], vec![0f32; n], vec![0f32; n]);
-    for p in 0..n {
-        let (l, a, b) = rgb_to_lab(to01(recon[p]), to01(recon[n + p]), to01(recon[2 * n + p]));
-        c_l[p] = l;
-        c_a[p] = a;
-        c_b[p] = b;
-        let (l, a, b) = rgb_to_lab(to01(s[p]), to01(s[n + p]), to01(s[2 * n + p]));
-        s_l[p] = l;
-        s_a[p] = a;
-        s_b[p] = b;
-    }
-
-    // 3. histogram-match chroma; partial L blend
-    let matched_a = hist_match(&c_a, &s_a);
-    let matched_b = hist_match(&c_b, &s_b);
-    let out_l: Vec<f32> = if luminance_weight < 1.0 {
-        let matched_l = hist_match(&c_l, &s_l);
-        (0..n)
-            .map(|p| luminance_weight * c_l[p] + (1.0 - luminance_weight) * matched_l[p])
-            .collect()
-    } else {
-        c_l
+    let lab_of = |src: &[f32]| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let interleaved: Vec<[f32; 3]> = (0..n)
+            .into_par_iter()
+            .map(|p| {
+                let (l, a, b) = rgb_to_lab(to01(src[p]), to01(src[n + p]), to01(src[2 * n + p]));
+                [l, a, b]
+            })
+            .collect();
+        let (mut l, mut a, mut b) = (vec![0f32; n], vec![0f32; n], vec![0f32; n]);
+        for (p, &[lp, ap, bp]) in interleaved.iter().enumerate() {
+            l[p] = lp;
+            a[p] = ap;
+            b[p] = bp;
+        }
+        (l, a, b)
     };
+    let (c_l, c_a, c_b) = lab_of(&recon);
+    let (s_l, s_a, s_b) = lab_of(s);
 
-    // 4. back to RGB → [-1,1], (3,H,W)
+    // 3. Histogram matches sort independently, so retain each match's serial rank arithmetic but
+    // run the separate channels concurrently.
+    let (matched_a, (matched_b, out_l)) = rayon::join(
+        || hist_match(&c_a, &s_a),
+        || {
+            rayon::join(
+                || hist_match(&c_b, &s_b),
+                || {
+                    if luminance_weight < 1.0 {
+                        let matched_l = hist_match(&c_l, &s_l);
+                        (0..n)
+                            .map(|p| {
+                                luminance_weight * c_l[p] + (1.0 - luminance_weight) * matched_l[p]
+                            })
+                            .collect()
+                    } else {
+                        c_l.clone()
+                    }
+                },
+            )
+        },
+    );
+
+    // 4. Back to RGB → [-1,1], (3,H,W), again parallelizing independent pixels while preserving
+    // the channel-major public layout.
+    let rgb: Vec<[f32; 3]> = (0..n)
+        .into_par_iter()
+        .map(|p| {
+            let (r, g, b) = lab_to_rgb(out_l[p], matched_a[p], matched_b[p]);
+            [
+                r.clamp(0.0, 1.0) * 2.0 - 1.0,
+                g.clamp(0.0, 1.0) * 2.0 - 1.0,
+                b.clamp(0.0, 1.0) * 2.0 - 1.0,
+            ]
+        })
+        .collect();
     let mut out = vec![0f32; 3 * n];
-    for p in 0..n {
-        let (r, g, b) = lab_to_rgb(out_l[p], matched_a[p], matched_b[p]);
-        out[p] = r.clamp(0.0, 1.0) * 2.0 - 1.0;
-        out[n + p] = g.clamp(0.0, 1.0) * 2.0 - 1.0;
-        out[2 * n + p] = b.clamp(0.0, 1.0) * 2.0 - 1.0;
+    for (p, &[r, g, b]) in rgb.iter().enumerate() {
+        out[p] = r;
+        out[n + p] = g;
+        out[2 * n + p] = b;
     }
     Ok(Array::from_slice(&out, &[1, 3, h, w]).as_dtype(content.dtype())?)
 }

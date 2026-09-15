@@ -18,16 +18,20 @@
 //! text-encoder (S1), VAE (S2), and transformer (S3) modules land.
 
 pub mod adapters;
+mod artifact_inventory;
+mod block_stream;
 pub mod caption_upsample;
 pub mod chunk;
 pub mod config;
 pub mod convert;
 pub mod kv_cache;
 pub mod loader;
+pub mod memory_strategy;
 pub mod model;
 pub mod model_control;
 pub mod pipeline;
 pub mod pos_embed;
+pub mod preview;
 pub mod text_encoder;
 pub mod transformer;
 pub mod vae;
@@ -75,17 +79,103 @@ pub use transformer::{
 pub use vae::Flux2Vae;
 pub use vision::{Mistral3Projector, PixtralVisionConfig, PixtralVisionTower};
 
+/// sc-16209 Apple-Silicon warm sweep: FLUX.2 Klein 9B bf16 peaked below 14.07 GiB at 1024².
+pub const KLEIN_ACTIVATION_MEMORY_REGISTRATION: mlx_gen::gen_core::ActivationMemoryRegistration =
+    mlx_gen::gen_core::ActivationMemoryRegistration {
+        provider_id: FLUX2_KLEIN_9B_ID,
+        anchor: mlx_gen::ActivationMemoryAnchor {
+            bytes_1024: 15_107_547_464,
+        },
+    };
+
 /// Add all MLX FLUX.2 providers to an explicit media registry builder.
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::KLEIN_REGISTRATION)
+        .register_activation_memory(KLEIN_ACTIVATION_MEMORY_REGISTRATION)
+        .register_memory_strategy(model::KLEIN_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: FLUX2_KLEIN_9B_ID,
+            contract: |spec| memory_strategy::weights_free_klein_contract(FLUX2_KLEIN_9B_ID, spec),
+        })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: FLUX2_KLEIN_9B_ID,
+                contract: |surface| {
+                    memory_strategy::weights_free_klein_surface_contract(FLUX2_KLEIN_9B_ID, surface)
+                },
+            },
+        )
+        .register_memory_behavior(model::KLEIN_MEMORY_BEHAVIOR)
         .register_generator(model::KLEIN_EDIT_REGISTRATION)
+        .register_memory_strategy(model::KLEIN_EDIT_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: FLUX2_KLEIN_9B_EDIT_ID,
+            contract: |spec| {
+                memory_strategy::weights_free_klein_contract(FLUX2_KLEIN_9B_EDIT_ID, spec)
+            },
+        })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: FLUX2_KLEIN_9B_EDIT_ID,
+                contract: |surface| {
+                    memory_strategy::weights_free_klein_surface_contract(
+                        FLUX2_KLEIN_9B_EDIT_ID,
+                        surface,
+                    )
+                },
+            },
+        )
+        .register_memory_behavior(model::KLEIN_EDIT_MEMORY_BEHAVIOR)
         .register_generator(model::KLEIN_KV_EDIT_REGISTRATION)
+        .register_memory_strategy(model::KLEIN_KV_EDIT_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: FLUX2_KLEIN_9B_KV_EDIT_ID,
+            contract: |spec| {
+                memory_strategy::weights_free_klein_contract(FLUX2_KLEIN_9B_KV_EDIT_ID, spec)
+            },
+        })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: FLUX2_KLEIN_9B_KV_EDIT_ID,
+                contract: |surface| {
+                    memory_strategy::weights_free_klein_surface_contract(
+                        FLUX2_KLEIN_9B_KV_EDIT_ID,
+                        surface,
+                    )
+                },
+            },
+        )
+        .register_memory_behavior(model::KLEIN_KV_EDIT_MEMORY_BEHAVIOR)
         .register_generator(model::DEV_REGISTRATION)
+        .register_memory_strategy(model::DEV_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: FLUX2_DEV_ID,
+            contract: memory_strategy::registered_dev_t2i_contract,
+        })
+        .register_memory_behavior(model::DEV_MEMORY_BEHAVIOR)
         .register_generator(model::DEV_EDIT_REGISTRATION)
+        .register_memory_strategy(model::DEV_EDIT_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: FLUX2_DEV_EDIT_ID,
+            contract: memory_strategy::registered_dev_contract,
+        })
+        .register_memory_behavior(model::DEV_EDIT_MEMORY_BEHAVIOR)
         .register_generator(model_control::DEV_CONTROL_REGISTRATION)
+        .register_memory_strategy(model_control::DEV_CONTROL_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: FLUX2_DEV_CONTROL_ID,
+            contract: memory_strategy::registered_dev_control_contract,
+        })
+        .register_memory_behavior(model_control::DEV_CONTROL_MEMORY_BEHAVIOR)
 }
 
 /// Build the complete explicit MLX FLUX.2 provider catalog.
@@ -114,5 +204,81 @@ mod explicit_registry_tests {
                 "flux2_dev_control",
             ]
         );
+
+        let preview_ids: Vec<_> = registry
+            .generators()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                descriptor
+                    .capabilities
+                    .supports_preview
+                    .then_some(descriptor.id)
+            })
+            .collect();
+        assert_eq!(
+            preview_ids, explicit,
+            "every and only FLUX.2 route previews"
+        );
+    }
+
+    #[test]
+    fn dev_edit_exposes_the_provider_memory_safety_contract() {
+        let registry = super::provider_registry().unwrap();
+        let contract = registry
+            .memory_strategy_contract(
+                super::FLUX2_DEV_EDIT_ID,
+                &mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(Default::default())),
+            )
+            .unwrap()
+            .expect("FLUX.2-dev edit memory contract");
+        assert_eq!(contract.provider_id, super::FLUX2_DEV_EDIT_ID);
+        assert!(contract.conformance_errors().is_empty());
+    }
+
+    #[test]
+    fn dev_t2i_exposes_its_own_provider_memory_safety_contract() {
+        let registry = super::provider_registry().unwrap();
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(Default::default()))
+            .with_quant(mlx_gen::Quant::Q4);
+        let t2i = registry
+            .memory_strategy_contract(super::FLUX2_DEV_ID, &spec)
+            .unwrap()
+            .expect("FLUX.2-dev T2I memory contract");
+        let edit = registry
+            .memory_strategy_contract(super::FLUX2_DEV_EDIT_ID, &spec)
+            .unwrap()
+            .expect("FLUX.2-dev edit memory contract");
+
+        assert_eq!(t2i.provider_id, super::FLUX2_DEV_ID);
+        assert_eq!(edit.provider_id, super::FLUX2_DEV_EDIT_ID);
+        assert_ne!(t2i.calibration, edit.calibration);
+        assert!(t2i.conformance_errors().is_empty());
+        assert_eq!(
+            registry
+                .memory_strategy_registrations()
+                .filter(|registration| registration.provider_id == super::FLUX2_DEV_ID)
+                .count(),
+            1,
+            "the T2I provider must have exactly one memory registration"
+        );
+    }
+
+    #[test]
+    fn klein_shared_ladder_passes_the_weights_free_behavior_oracle() {
+        let registry = super::provider_registry().unwrap();
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
+            .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
+            .with_pid(
+                mlx_gen::WeightsSource::File("/nonexistent/pid.safetensors".into()),
+                mlx_gen::WeightsSource::Dir("/nonexistent/gemma".into()),
+            );
+        gen_core_testkit::memory_strategy::memory_strategy_registry_conformance(&registry, &spec);
+        assert!(registry
+            .memory_strategy_registrations()
+            .any(|registration| registration.provider_id == super::FLUX2_KLEIN_9B_KV_EDIT_ID));
+        assert!(registry
+            .memory_behavior_registrations()
+            .any(|registration| registration.provider_id == super::FLUX2_KLEIN_9B_KV_EDIT_ID));
     }
 }

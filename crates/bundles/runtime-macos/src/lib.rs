@@ -2,10 +2,61 @@
 
 #[cfg(feature = "audio")]
 pub use candle_audio_catalog::audio;
+#[cfg(feature = "perf-bench")]
+pub use mlx_gen_catalog::benchmark_toggle_capabilities;
 #[cfg(feature = "media")]
 pub use mlx_gen_catalog::media;
+#[cfg(feature = "media")]
+pub use mlx_gen_catalog::{vae_tiling, vae_tiling_unmodelled_reason};
 pub use mlx_llm as llm;
-pub use runtime_catalog::{core_llm, gen_core, RuntimeCatalog, RuntimeCatalogSnapshot};
+pub use runtime_catalog::{
+    core_llm, gen_core, memory_strategy, RuntimeCatalog, RuntimeCatalogSnapshot,
+    VideoDecodeMemoryProfile,
+};
+
+/// Stable P6 workload/result schemas and fail-closed validation for the real-weight MLX harness.
+#[cfg(feature = "perf-bench")]
+pub mod perf_bench;
+
+#[cfg(feature = "media")]
+/// Resolve a provider-owned conservative VAE decode profile for contract-safe memory composition.
+pub fn conservative_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<VideoDecodeMemoryProfile> {
+    mlx_gen_catalog::conservative_video_decode_memory_profile(provider_id, width, height, frames)
+}
+
+#[cfg(feature = "media")]
+/// Resolve the load-exact provider numeric tier used by calibrated video memory admission.
+pub fn resolved_video_memory_numeric_tier(
+    provider_id: &str,
+    spec: &gen_core::LoadSpec,
+) -> gen_core::Result<Option<gen_core::MemoryNumericTier>> {
+    mlx_gen_catalog::resolved_video_memory_numeric_tier(provider_id, spec)
+}
+
+#[cfg(feature = "media")]
+/// Resolve the provider-owned profile for the exact selected bounded-decode carrier.
+pub fn selected_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+    tile_edge: u32,
+    overlap: u32,
+) -> gen_core::Result<Option<VideoDecodeMemoryProfile>> {
+    mlx_gen_catalog::selected_video_decode_memory_profile(
+        provider_id,
+        width,
+        height,
+        frames,
+        tile_edge,
+        overlap,
+    )
+}
 
 /// The MLX backend crates this platform owns, re-exported from the media catalog
 /// (available under the default `media` feature).
@@ -43,6 +94,19 @@ fn media_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
     }
 }
 
+/// Complete weights-free memory-contract surface for capability generation and reconciliation.
+pub fn memory_contract_surface_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
+    #[cfg(feature = "media")]
+    {
+        mlx_gen_catalog::provider_registry()
+    }
+
+    #[cfg(not(feature = "media"))]
+    {
+        gen_core::ProviderRegistryBuilder::new().build()
+    }
+}
+
 /// The bundle's explicit audio lane (sc-12835): the complete Candle audio catalog from the audio
 /// composition root — never `mlx-gen-catalog` — plus the lane's **candle** snapshot preparer
 /// carried in the lane. The main preparer registry stays mlx-only (the single-backend invariant
@@ -68,7 +132,7 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
             PLATFORM,
             BACKEND,
             media_registry(),
-            mlx_llm::text_registry(),
+            mlx_llm::catalog_text_registry(),
             mlx_llm::snapshot_preparer_registry(),
             audio_lane(),
         )
@@ -81,7 +145,7 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
             PLATFORM,
             BACKEND,
             media_registry(),
-            mlx_llm::text_registry(),
+            mlx_llm::catalog_text_registry(),
             mlx_llm::snapshot_preparer_registry(),
         )
     }
@@ -89,6 +153,93 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
 
 #[cfg(test)]
 mod tests {
+    /// Epic SC-22657 (E1 + E2), story SC-22662: the registry-wide acceptance skeleton for the MLX
+    /// bundle. Every memory-contract surface this platform registers — every provider, at every
+    /// tier and materialization selector — must publish an honest byte decomposition *and* declare
+    /// at least one architecture axis.
+    ///
+    /// The walk is the shared, backend-keyed
+    /// `gen_core_testkit::check_memory_contract_surface_registry_facts` rather than a per-surface
+    /// `check_memory_contract_facts` loop (the SC-22661 reconciliation). The rule for a
+    /// weights-free surface differs by backend, and this bundle is the MLX arm: an MLX provider
+    /// mirrors its family's reference component `config.json` as Rust constants (see
+    /// `mlx_gen::architecture_facts`), so its geometry exists before any snapshot does and a
+    /// surface declaring *nothing* is withholding facts it already holds. Deferring to the gate
+    /// rather than restating a rule here is what keeps this bundle and that single source of truth
+    /// from drifting apart.
+    ///
+    /// No materialized-root lookup is supplied: that arm exists for a backend whose axes appear
+    /// only once a snapshot is on disk, and this registry composes no such provider.
+    ///
+    /// The coverage floors keep the walk from passing vacuously. `mlx_gen_catalog` pins the exact
+    /// shape — 54 memory-strategy registrations and `49 * 12 + 6 + 3` surfaces — so those numbers
+    /// are asserted here as floors: a provider or a selector silently dropping out of the macOS
+    /// composition reds here instead of quietly shrinking what this gate covers.
+    #[cfg(feature = "media")]
+    #[test]
+    fn every_registered_memory_contract_surface_publishes_honest_facts() {
+        let registry = super::memory_contract_surface_registry().unwrap();
+        let coverage =
+            gen_core_testkit::memory_contract_surface_registry_facts_conformance(&registry, None);
+        assert!(
+            coverage.surfaces_checked >= 49 * 12 + 6 + 3,
+            "the macOS registry walked only {} contract surfaces; mlx-gen-catalog pins {}",
+            coverage.surfaces_checked,
+            49 * 12 + 6 + 3
+        );
+
+        let providers: std::collections::BTreeSet<&str> = registry
+            .memory_strategy_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+        assert!(
+            providers.len() >= 54,
+            "the macOS registry composes only {} memory-strategy providers; mlx-gen-catalog pins 54",
+            providers.len()
+        );
+    }
+
+    #[cfg(feature = "media")]
+    #[test]
+    fn bundle_exposes_narrow_selected_video_memory_apis() {
+        let spec = super::gen_core::LoadSpec::new(super::gen_core::WeightsSource::Dir(
+            "/nonexistent".into(),
+        ));
+        assert_eq!(
+            super::resolved_video_memory_numeric_tier("unknown", &spec).unwrap(),
+            None
+        );
+        assert_eq!(
+            super::selected_video_decode_memory_profile("unknown", 480, 480, 1, 448, 64).unwrap(),
+            None
+        );
+        assert!(super::resolved_video_memory_numeric_tier("bernini", &spec).is_err());
+    }
+
+    #[cfg(feature = "media")]
+    #[test]
+    fn bundle_exposes_engine_id_vae_geometry() {
+        let tiling: super::gen_core::tiling::VaeTiling =
+            super::vae_tiling("bernini").expect("modelled video id");
+        assert_eq!(tiling.full_res_channels, 96);
+        assert!(!tiling.causal_temporal);
+        assert_eq!(
+            super::conservative_video_decode_memory_profile("bernini", 64, 64, 9).map(|profile| (
+                profile.working_set_bytes(),
+                profile.resident_decoder_bytes_included(),
+            )),
+            Some((322_633_728, 0))
+        );
+
+        assert_eq!(super::vae_tiling("svd_xt"), None);
+        assert_eq!(
+            super::vae_tiling_unmodelled_reason("svd_xt"),
+            Some(super::providers::svd::VAE_TILING_UNMODELLED_REASON),
+            "the shipped MLX SVD route must remain explicitly unmodelled until its decoder has a \
+             load-bearing spatial planner"
+        );
+    }
+
     #[test]
     fn smoke_catalog_is_explicit_and_machine_readable() {
         let snapshot = super::catalog().unwrap().snapshot();
@@ -98,7 +249,15 @@ mod tests {
         assert!(snapshot.generator_ids.len() > 50);
         #[cfg(not(feature = "media"))]
         assert!(snapshot.generator_ids.is_empty());
-        assert_eq!(snapshot.text_llm_ids, ["mlx-llama", "mlx-joycaption"]);
+        assert_eq!(
+            snapshot.text_llm_ids,
+            [
+                "mlx-llama",
+                "mlx-joycaption",
+                "mlx-starvector-1b",
+                "mlx-starvector-8b",
+            ]
+        );
         assert_eq!(snapshot.snapshot_preparer_backends, ["mlx"]);
         // The audio lane is declared Candle-native on this mlx bundle (sc-12901) — the
         // sanctioned cross-backend seam. Its ordered id surface is the audio catalog's —
@@ -173,6 +332,9 @@ mod tests {
 
         fn dummy_audio_descriptor() -> gen_core::ModelDescriptor {
             gen_core::ModelDescriptor {
+                encoder_contract: None,
+                denoiser_output_latent_space: None,
+                control_kinds: None,
                 required_components: &[],
                 id: "dummy-audio",
                 family: "test-audio",

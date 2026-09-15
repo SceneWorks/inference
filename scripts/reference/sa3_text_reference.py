@@ -10,13 +10,17 @@ without installing PyTorch or Transformers.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib.metadata
 import json
 import platform
-import subprocess
+import sys
 from pathlib import Path
 from typing import Any
+
+try:
+    from sa3_reference import sha256_file, validate_upstream_checkout
+except ModuleNotFoundError:
+    from scripts.reference.sa3_reference import sha256_file, validate_upstream_checkout
 
 
 UPSTREAM_REPOSITORY = "https://github.com/Stability-AI/stable-audio-3.git"
@@ -135,27 +139,16 @@ class InvalidReference(RuntimeError):
     """Reference provenance or payload did not match the frozen contract."""
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _git(path: Path, *args: str) -> str:
-    return subprocess.check_output(
-        ["git", "-C", str(path), *args], text=True
-    ).strip()
-
-
 def verify_sources(upstream: Path, snapshot: Path) -> dict[str, Any]:
     upstream = upstream.resolve()
     snapshot = snapshot.resolve()
-    if _git(upstream, "rev-parse", "HEAD") != UPSTREAM_COMMIT:
-        raise InvalidReference("Stable Audio 3 checkout is not at the frozen commit")
-    if _git(upstream, "status", "--porcelain"):
-        raise InvalidReference("Stable Audio 3 checkout must be clean")
+    validate_upstream_checkout(
+        upstream,
+        UPSTREAM_COMMIT,
+        error_type=InvalidReference,
+        allow_venv=False,
+        include_ignored=False,
+    )
     uv_lock = upstream / "uv.lock"
     if sha256_file(uv_lock) != UPSTREAM_UV_LOCK_SHA256:
         raise InvalidReference("Stable Audio 3 uv.lock hash mismatch")
@@ -402,6 +395,8 @@ def generate(upstream: Path, snapshot: Path, output_dir: Path) -> None:
 def verify(output_dir: Path) -> None:
     manifest_path = output_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise InvalidReference("text manifest must be a JSON object")
     if manifest.get("schemaVersion") != 1 or manifest.get("story") != "sc-14537":
         raise InvalidReference("manifest identity mismatch")
     if manifest.get("runtime") != EXPECTED_RUNTIME:
@@ -522,7 +517,7 @@ def verify(output_dir: Path) -> None:
             raise InvalidReference(f"CPU {key} dtype mismatch")
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
     generate_parser = subparsers.add_parser("generate")
@@ -532,11 +527,16 @@ def main() -> None:
     verify_parser = subparsers.add_parser("verify")
     verify_parser.add_argument("--output-dir", required=True, type=Path)
     args = parser.parse_args()
-    if args.command == "generate":
-        generate(args.upstream, args.snapshot, args.output_dir)
-    else:
-        verify(args.output_dir)
+    try:
+        if args.command == "generate":
+            generate(args.upstream, args.snapshot, args.output_dir)
+        else:
+            verify(args.output_dir)
+    except (InvalidReference, OSError, json.JSONDecodeError) as error:
+        print(f"SA3 text reference error: {error}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

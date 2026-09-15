@@ -2,7 +2,7 @@
 //! — needs the real snapshot + the f32 golden from `tools/dump_flux2_edit_golden.py`:
 //!
 //!   cd ~/repos/mflux && .venv/bin/python ~/repos/mlx-gen/tools/dump_flux2_edit_golden.py
-//!   cargo test -p mlx-gen-flux2 --test edit_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux2 --test integration edit_real_weights:: -- --ignored --nocapture
 //!
 //! Two gates (f32):
 //!  1. **reference encoding** — the NEW edit chain (preprocess → VAE-encode → 2×2 patchify →

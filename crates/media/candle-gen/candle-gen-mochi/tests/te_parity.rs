@@ -5,7 +5,7 @@
 //! reproduce `mochi_te_golden.safetensors`.
 //!
 //! Windows run:
-//!   `MOCHI_SNAPSHOT=/path/to/mochi-1-preview cargo test -p candle-gen-mochi --features cuda --test te_parity -- --ignored --nocapture`
+//!   `MOCHI_SNAPSHOT=/path/to/mochi-1-preview cargo test -p candle-gen-mochi --features cuda --test integration te_parity:: -- --ignored --nocapture`
 #![cfg(feature = "cuda")]
 
 use std::path::{Path, PathBuf};

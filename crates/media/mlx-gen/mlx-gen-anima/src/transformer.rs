@@ -16,8 +16,12 @@ use mlx_rs::ops::{add, concatenate_axis, multiply, split, zeros_dtype};
 use mlx_rs::transforms::checkpoint;
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, Adapter};
-use mlx_gen::nn::{apply_text_rope, gelu_exact, modulate, silu, timestep_sincos};
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, Adapter, LinearFacts};
+use mlx_gen::nn::{gelu_exact, modulate, silu, timestep_sincos};
+use mlx_gen::qkv::{
+    self, AttnPrepSpec, FusedQkvProjection, QkNormSpec, QkvPart, QkvSource, RopeSpec, RopeStyle,
+    RopeTables,
+};
 use mlx_gen::train::lora::LoraParams;
 use mlx_gen::weights::{join, Weights};
 use mlx_gen::Result;
@@ -136,13 +140,107 @@ impl AdaLayerNorm {
     }
 }
 
+/// **How one attention's q/k/v are represented** — the structural self-vs-cross split SC-18319 P4
+/// needs, chosen once at construction.
+///
+/// [`FusedQkvProjection`] computes all three projections from **one** activation. That is exactly
+/// right for a self-attention and catastrophic for a cross-attention, where `q` reads the query
+/// stream and `k`/`v` read the encoder stream: packing a cross triple would compute the keys and
+/// values from the query stream, producing a running model with garbage cross-attention and no
+/// error anywhere.
+///
+/// The pack predicate cannot catch that. `try_pack` compares `in_features`, never provenance, and
+/// the conditioner's `cross_attn` has `source_dim == model_dim == 1024`, so all three widths match,
+/// every part shares `bits`/`group_size`, and 1024 = 64 · 16 is group-aligned on both axes. (The
+/// DiT's `cross_attn` happens to be saved by `InputWidthMismatch` — q reads 2048, k/v read 1024 —
+/// but that is an accident of Anima's geometry, not a guard.) So the refusal is encoded here, in
+/// the type: a cross-attention has no fused representation to reach for.
+#[derive(Clone)]
+pub(crate) enum Qkv {
+    /// Self-attention — all three read one activation, so they are packed.
+    SelfFused(FusedQkvProjection),
+    /// Cross-attention — `q` reads the query stream, `k`/`v` the encoder stream. Never packed.
+    Cross {
+        q: AdaptableLinear,
+        k: AdaptableLinear,
+        v: AdaptableLinear,
+    },
+}
+
+/// The projected q/k/v, owned so [`Projected::source`] can hand out a borrowing
+/// [`QkvSource`].
+pub(crate) enum Projected {
+    Packed(Array),
+    Separate(Array, Array, Array),
+}
+
+impl Projected {
+    pub(crate) fn source(&self) -> QkvSource<'_> {
+        match self {
+            Projected::Packed(p) => QkvSource::Packed(p),
+            Projected::Separate(q, k, v) => QkvSource::Separate { q, k, v },
+        }
+    }
+}
+
+impl Qkv {
+    pub(crate) fn self_attn(q: AdaptableLinear, k: AdaptableLinear, v: AdaptableLinear) -> Self {
+        Qkv::SelfFused(FusedQkvProjection::new(q, k, v))
+    }
+
+    pub(crate) fn cross_attn(q: AdaptableLinear, k: AdaptableLinear, v: AdaptableLinear) -> Self {
+        Qkv::Cross { q, k, v }
+    }
+
+    /// `true` for a self-attention, i.e. the representation that assumes ONE input stream. The
+    /// forwards assert this against the presence of an `encoder` argument, so a mis-constructed
+    /// attention fails loudly rather than silently reading k/v off the query stream.
+    pub(crate) fn is_self(&self) -> bool {
+        matches!(self, Qkv::SelfFused(_))
+    }
+
+    /// One matmul on the fused arm, three on the cross arm.
+    pub(crate) fn project(&self, q_src: &Array, kv_src: &Array) -> Result<Projected> {
+        match self {
+            Qkv::SelfFused(p) => Ok(Projected::Packed(p.forward_packed(q_src)?)),
+            Qkv::Cross { q, k, v } => Ok(Projected::Separate(
+                q.forward(q_src)?,
+                k.forward(kv_src)?,
+                v.forward(kv_src)?,
+            )),
+        }
+    }
+
+    /// The MUTATION half of a host's q/k/v routing — unfuses first on the fused arm.
+    pub(crate) fn part_mut(&mut self, part: QkvPart) -> Option<&mut AdaptableLinear> {
+        match self {
+            Qkv::SelfFused(p) => p.part_mut(part).ok(),
+            Qkv::Cross { q, k, v } => Some(match part {
+                QkvPart::Q => q,
+                QkvPart::K => k,
+                QkvPart::V => v,
+            }),
+        }
+    }
+
+    /// The PROBE half — facts without unfusing.
+    pub(crate) fn part_facts(&self, part: QkvPart) -> LinearFacts {
+        match self {
+            Qkv::SelfFused(p) => p.part_facts(part),
+            Qkv::Cross { q, k, v } => LinearFacts::of(match part {
+                QkvPart::Q => q,
+                QkvPart::K => k,
+                QkvPart::V => v,
+            }),
+        }
+    }
+}
+
 /// `CosmosAttention` — self (attn1: q/k/v from hidden, RoPE) or cross (attn2: q from hidden, k/v from
 /// text, no RoPE). Per-head q/k RMSNorm; heads == kv_heads (no GQA repeat for Anima).
 #[derive(Clone)]
 struct Attention {
-    to_q: AdaptableLinear,
-    to_k: AdaptableLinear,
-    to_v: AdaptableLinear,
+    qkv: Qkv,
     to_out: AdaptableLinear,
     norm_q: Array,
     norm_k: Array,
@@ -161,12 +259,27 @@ struct Attention {
 }
 
 impl Attention {
-    fn from_weights(w: &Weights, prefix: &str, cfg: &DitConfig) -> Result<Self> {
+    /// `self_attention` selects the q/k/v representation (SC-18319 P4) — see [`Qkv`]. It is a
+    /// construction-time fact, not a per-call one: `attn1` always reads one stream, `attn2` always
+    /// reads two.
+    fn from_weights(
+        w: &Weights,
+        prefix: &str,
+        cfg: &DitConfig,
+        self_attention: bool,
+    ) -> Result<Self> {
         let hd = cfg.attention_head_dim as i32;
+        let (q, k, v) = (
+            lin(w, &join(prefix, "q_proj"))?,
+            lin(w, &join(prefix, "k_proj"))?,
+            lin(w, &join(prefix, "v_proj"))?,
+        );
         Ok(Self {
-            to_q: lin(w, &join(prefix, "q_proj"))?,
-            to_k: lin(w, &join(prefix, "k_proj"))?,
-            to_v: lin(w, &join(prefix, "v_proj"))?,
+            qkv: if self_attention {
+                Qkv::self_attn(q, k, v)
+            } else {
+                Qkv::cross_attn(q, k, v)
+            },
             to_out: lin(w, &join(prefix, "output_proj"))?,
             norm_q: w.require(&join(prefix, "q_norm.weight"))?.clone(),
             norm_k: w.require(&join(prefix, "k_norm.weight"))?.clone(),
@@ -184,46 +297,57 @@ impl Attention {
 
     /// `hidden`: `[B, Sq, H]`. `encoder`: `Some([B, Sk, Ctx])` for cross-attn (else self-attn on
     /// `hidden`). `rope`: `Some((cos,sin))` applies half-split RoPE (self-attn only).
+    ///
+    /// `plan` is ladder rung 3 (SC-15524). [`AttentionPlan::UNBOUNDED`] is exactly the historical
+    /// single fused call; a bounded plan splits the QUERY rows into chunks that each attend over the
+    /// COMPLETE k/v and concatenates the outputs back along the query axis. That is bit-exact — it
+    /// changes when score rows are materialized, never what they contain — so precision, seed,
+    /// schedule and conditioning are untouched. It applies to BOTH attentions: self-attn (`Sq = Sk =`
+    /// the image token count, the quadratic one) and cross-attn into the conditioner's 512 tokens.
     fn forward(
         &self,
         hidden: &Array,
         encoder: Option<&Array>,
         rope: Option<(&Array, &Array)>,
+        plan: mlx_gen::attention::AttentionPlan<'_>,
     ) -> Result<Array> {
-        let hsh = hidden.shape();
-        let (b, sq) = (hsh[0], hsh[1]);
         let kv_src = encoder.unwrap_or(hidden);
-        let sk = kv_src.shape()[1];
+        // SC-18319 P4 — the fused representation projects from ONE stream, so a self-attention that
+        // was handed an encoder would silently read k/v off the query stream. Refuse loudly.
+        if self.qkv.is_self() && encoder.is_some() {
+            return Err(mlx_gen::Error::Msg(
+                "anima: a self-attention (fused q/k/v) was given a cross-attention encoder stream"
+                    .into(),
+            ));
+        }
 
-        let q = self
-            .to_q
-            .forward(hidden)?
-            .reshape(&[b, sq, self.heads, self.head_dim])?;
-        let k = self
-            .to_k
-            .forward(kv_src)?
-            .reshape(&[b, sk, self.heads, self.head_dim])?;
-        let v = self
-            .to_v
-            .forward(kv_src)?
-            .reshape(&[b, sk, self.heads, self.head_dim])?;
-
-        // per-head q/k RMSNorm (over the head_dim).
-        let q = rms_norm(&q, &self.norm_q, ATTN_QK_NORM_EPS)?;
-        let k = rms_norm(&k, &self.norm_k, ATTN_QK_NORM_EPS)?;
-
-        let (q, k) = match rope {
-            Some((cos, sin)) => (
-                apply_text_rope(&q, cos, sin)?,
-                apply_text_rope(&k, cos, sin)?,
-            ),
-            None => (q, k),
-        };
-
-        // [b,s,h,hd] -> [b,h,s,hd]
-        let q = q.transpose_axes(&[0, 2, 1, 3])?;
-        let k = k.transpose_axes(&[0, 2, 1, 3])?;
-        let v = v.transpose_axes(&[0, 2, 1, 3])?;
+        // SC-18319 — the shared prologue. The DiT attention is **knob 3's reference case**: the
+        // SAME code path runs self-attention with RoPE and cross-attention with none, so "RoPE
+        // optional" is a per-call knob rather than a per-family one. `RopeStyle::None` skips the
+        // rotation outright (it is not an identity table, which would still cost two multiplies and
+        // an add over the whole q/k stream in all 28 blocks). The rest: separate q/k/v (knob 9),
+        // per-head RMSNorm over `head_dim` after the head split (knob 1), half-split `rotate_half`
+        // rotation over full-width `[1, S, head_dim]` tables (knob 2 — `nn::apply_text_rope`
+        // verbatim), token-major axes, one shared q/k table (knob 6 off — the conditioner is where
+        // the tables differ).
+        let spec = AttnPrepSpec::new(self.heads, self.head_dim)
+            .with_qk_norm(QkNormSpec::per_head(
+                &self.norm_q,
+                &self.norm_k,
+                ATTN_QK_NORM_EPS,
+            ))
+            .with_rope(match rope {
+                Some((cos, sin)) => RopeSpec {
+                    style: RopeStyle::RotateHalf,
+                    q: Some(RopeTables::new(cos, sin)),
+                    k: Some(RopeTables::new(cos, sin)),
+                    ..RopeSpec::default()
+                },
+                None => RopeSpec::default(),
+            });
+        let projected = self.qkv.project(hidden, kv_src)?;
+        let heads = qkv::prepare(projected.source(), &spec)?;
+        let (q, k, v) = (heads.q, heads.k, heads.v);
         let o = if self.ckpt_sdpa {
             // sc-10576: checkpoint just the SDPA. q/k/v are the threaded inputs (grads to the QKV
             // projections — and their LoRA — flow back through them); only the f32 scale is captured.
@@ -239,12 +363,9 @@ impl Attention {
                 mlx_gen::Error::Msg("anima: checkpoint SDPA produced no output".into())
             })?
         } else {
-            scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?
+            mlx_gen::attention::sdpa_budgeted_bhsd(&q, &k, &v, self.scale, None, plan)?
         };
-        let o = o
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[b, sq, self.heads * self.head_dim])?;
-        self.to_out.forward(&o)
+        self.to_out.forward(&qkv::merge_heads(&o)?)
     }
 }
 
@@ -270,8 +391,12 @@ impl FeedForward {
 }
 
 /// `CosmosTransformerBlock`: gated self-attn → gated cross-attn → gated FF.
+///
+/// `pub(crate)` so ladder rung 4 ([`crate::block_stream`]) can rebuild one from the checkpoint with
+/// the SAME constructor the resident stack used. A second, stream-local block constructor would be a
+/// second way to build a block, which is the divergence hazard the shared ladder exists to remove.
 #[derive(Clone)]
-struct Block {
+pub(crate) struct Block {
     norm1: AdaLayerNormZero,
     attn1: Attention,
     norm2: AdaLayerNormZero,
@@ -281,12 +406,12 @@ struct Block {
 }
 
 impl Block {
-    fn from_weights(w: &Weights, prefix: &str, cfg: &DitConfig) -> Result<Self> {
+    pub(crate) fn from_weights(w: &Weights, prefix: &str, cfg: &DitConfig) -> Result<Self> {
         Ok(Self {
             norm1: AdaLayerNormZero::from_weights(w, &join(prefix, "adaln_modulation_self_attn"))?,
-            attn1: Attention::from_weights(w, &join(prefix, "self_attn"), cfg)?,
+            attn1: Attention::from_weights(w, &join(prefix, "self_attn"), cfg, true)?,
             norm2: AdaLayerNormZero::from_weights(w, &join(prefix, "adaln_modulation_cross_attn"))?,
-            attn2: Attention::from_weights(w, &join(prefix, "cross_attn"), cfg)?,
+            attn2: Attention::from_weights(w, &join(prefix, "cross_attn"), cfg, false)?,
             norm3: AdaLayerNormZero::from_weights(w, &join(prefix, "adaln_modulation_mlp"))?,
             ff: FeedForward::from_weights(w, &join(prefix, "mlp"))?,
         })
@@ -298,17 +423,18 @@ impl Block {
         self.attn2.set_sdpa_checkpoint(on);
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &self,
         hidden: &Array,
         encoder: &Array,
         embedded: &Array,
         temb: &Array,
         rope: (&Array, &Array),
+        plan: mlx_gen::attention::AttentionPlan<'_>,
     ) -> Result<Array> {
         // 1. self attention (RoPE)
         let (normed, gate) = self.norm1.forward(hidden, embedded, temb)?;
-        let attn = self.attn1.forward(&normed, None, Some(rope))?;
+        let attn = self.attn1.forward(&normed, None, Some(rope), plan)?;
         let hidden = add(hidden, &multiply(&gate, &attn)?)?;
         // 2. cross attention (no RoPE). No attention mask over the conditioner's 512-token output: the
         // diffusers reference leaves the zero-padded positions UNMASKED too — `AnimaTextConditioner`
@@ -317,7 +443,7 @@ impl Block {
         // are zero vectors, not −inf, so they share logit 0; matching the reference means no mask here.
         // Do NOT "fix" this into a mask — that would introduce a conditioning divergence, not remove one.
         let (normed, gate) = self.norm2.forward(&hidden, embedded, temb)?;
-        let attn = self.attn2.forward(&normed, Some(encoder), None)?;
+        let attn = self.attn2.forward(&normed, Some(encoder), None, plan)?;
         let hidden = add(&hidden, &multiply(&gate, &attn)?)?;
         // 3. feed forward
         let (normed, gate) = self.norm3.forward(&hidden, embedded, temb)?;
@@ -331,6 +457,11 @@ pub struct CosmosDiT {
     patch_embed: AdaptableLinear, // x_embedder.proj.1
     time_embed: TimeEmbed,
     blocks: Vec<Block>,
+    /// Ladder rung 4 (SC-15524): how to rebuild the 28 `blocks` from the checkpoint one window at a
+    /// time. `None` when the load did not select [`mlx_gen::LoadShape::DeferredMaterialization`], so
+    /// a rung-4 request on an eagerly materialized generator is a typed rejection rather than a
+    /// silent resident execution. See [`crate::block_stream`].
+    block_stream: Option<crate::block_stream::AnimaBlockStream>,
     norm_out: AdaLayerNorm,
     proj_out: AdaptableLinear, // final_layer.linear
     cfg: DitConfig,
@@ -351,6 +482,7 @@ impl CosmosDiT {
             patch_embed: lin(w, &join(prefix, "x_embedder.proj.1"))?,
             time_embed: TimeEmbed::from_weights(w, prefix, &cfg)?,
             blocks,
+            block_stream: None,
             norm_out: AdaLayerNorm::from_weights(
                 w,
                 &join(prefix, "final_layer.adaln_modulation"),
@@ -363,6 +495,73 @@ impl CosmosDiT {
 
     pub fn config(&self) -> &DitConfig {
         &self.cfg
+    }
+
+    /// Arm ladder rung 4 (SC-15524) by recording where `blocks` can be re-read from.
+    ///
+    /// `source` must be the exact variant checkpoint the resident stack was built from and `prefix`
+    /// the detected DiT root, so a streamed block reads the identical keys. Called by
+    /// [`crate::loader::load_heavy_phase_streamable`]; deliberately not called for an eager load,
+    /// whose blocks are already committed and would pay a second copy.
+    pub(crate) fn with_block_stream(
+        mut self,
+        source: mlx_gen::WeightsSource,
+        prefix: &str,
+    ) -> Self {
+        self.block_stream = Some(crate::block_stream::AnimaBlockStream::new(
+            source, prefix, self.cfg,
+        ));
+        self
+    }
+
+    /// Whether rung 4 can execute on this DiT (a re-openable checkpoint was recorded).
+    pub fn can_stream_blocks(&self) -> bool {
+        self.block_stream.is_some()
+    }
+
+    /// Capture the adapters installed on `blocks` so a streamed block reproduces them. A no-op when
+    /// rung 4 is not armed. Called by the heavy loader *after*
+    /// [`crate::adapters::apply_anima_adapters`], so the resident and streamed paths cannot disagree
+    /// about which adapters landed where.
+    pub(crate) fn capture_block_adapters(&mut self) {
+        if let Some(stream) = self.block_stream.as_mut() {
+            stream.capture_adapters(&mut self.blocks);
+        }
+    }
+
+    /// Turn a request's window size into the plan the windowed forward runs under, or `None` for the
+    /// historical resident stack. Errors when a window is asked for but this DiT has no re-openable
+    /// checkpoint, so a rung-4 request can never silently execute the resident path.
+    pub(crate) fn block_window<'a>(
+        &self,
+        window_size: Option<usize>,
+        cancel: &'a mlx_gen::CancelFlag,
+    ) -> Result<Option<crate::block_stream::BlockWindow<'a>>> {
+        let Some(size) = window_size else {
+            return Ok(None);
+        };
+        if self.block_stream.is_none() {
+            return Err(mlx_gen::Error::Unsupported(
+                "anima: bounded transformer residency needs a deferred-materialization load with a \
+                 re-openable checkpoint; this generator materialized its blocks eagerly"
+                    .to_owned(),
+            ));
+        }
+        Ok(Some(crate::block_stream::BlockWindow {
+            plan: mlx_gen::block_residency::BlockPlan::new(self.blocks.len(), size)?,
+            cancel,
+        }))
+    }
+
+    /// Disarm rung 4 after an in-place mutation a re-materialized block could not reproduce.
+    ///
+    /// The stream's contract is that a materialized block is byte-identical to its resident twin,
+    /// kept by replaying the captured adapters. The training-only SDPA-checkpoint flag is per-block
+    /// state with NO on-disk representation, so a streamed forward after it would silently run a
+    /// different backward. The rung is turned off instead: `block_window` then returns a typed error
+    /// for a window request. Inference never calls the mutator, so this is inert on every render.
+    fn disarm_block_stream(&mut self) {
+        self.block_stream = None;
     }
 
     /// Patchify a `[B, C, 1, Hl, Wl]` latent (`C=17` after mask concat) to `[B, seq, C·ph·pw]`.
@@ -398,7 +597,7 @@ impl CosmosDiT {
     /// hidden state and returns `(hidden [B, seq, hidden], (pe_t, pe_h, pe_w), embedded, temb)`. The
     /// per-op math is identical to a full [`forward`]; only the number of blocks run is parameterized —
     /// so [`forward`] and the stage-4 golden hook [`forward_hidden`] share ONE copy of the block math.
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn run_blocks(
         &self,
         latents: &Array,
@@ -406,6 +605,8 @@ impl CosmosDiT {
         encoder: &Array,
         dtype: Dtype,
         num_blocks: Option<usize>,
+        plan: mlx_gen::attention::AttentionPlan<'_>,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
     ) -> Result<(Array, (i32, i32, i32), Array, Array)> {
         let latents = latents.as_dtype(dtype)?;
         let sh = latents.shape();
@@ -432,11 +633,90 @@ impl CosmosDiT {
 
         // 5. transformer blocks (all, or the first `num_blocks` for the stage-4 localization golden).
         let take = num_blocks.unwrap_or(self.blocks.len());
-        let mut hidden = hidden;
-        for block in self.blocks.iter().take(take) {
-            hidden = block.forward(&hidden, encoder, &embedded, &temb, (&rope.cos, &rope.sin))?;
-        }
+        let hidden = match window {
+            // Rung 4: rebuild the stack from the checkpoint one window at a time. The lifecycle —
+            // one fresh lazy view per window, materialize before release, `clear_cache` after, and a
+            // cancellation check at every window boundary — belongs entirely to
+            // `mlx_gen::block_residency::run_windowed`; nothing here re-implements it.
+            Some(window) => {
+                if take != self.blocks.len() {
+                    return Err(mlx_gen::Error::Unsupported(
+                        "anima: the partial-stack golden hook cannot be windowed".to_owned(),
+                    ));
+                }
+                self.run_windowed_blocks(hidden, encoder, &embedded, &temb, &rope, plan, window)?
+            }
+            None => {
+                let mut hidden = hidden;
+                for block in self.blocks.iter().take(take) {
+                    hidden = block.forward(
+                        &hidden,
+                        encoder,
+                        &embedded,
+                        &temb,
+                        (&rope.cos, &rope.sin),
+                        plan,
+                    )?;
+                }
+                hidden
+            }
+        };
         Ok((hidden, (pe_t, pe_h, pe_w), embedded, temb))
+    }
+
+    /// Rung 4's block loop: walk the 28 blocks in windows, materializing each window's weights from
+    /// the checkpoint and releasing them before the next window opens.
+    ///
+    /// The `materialize` callback is the MLX-specific trap SC-15750 measured and pinned: MLX is
+    /// lazy, so the carried hidden state is an unevaluated graph node still referencing the window's
+    /// weights, and dropping before forcing evaluation frees NOTHING (correct output either way —
+    /// silent, not loud). Forcing the carried activation is what makes the window's release real.
+    #[allow(clippy::too_many_arguments)]
+    fn run_windowed_blocks(
+        &self,
+        hidden: Array,
+        encoder: &Array,
+        embedded: &Array,
+        temb: &Array,
+        rope: &crate::rope::CosmosRope,
+        plan: mlx_gen::attention::AttentionPlan<'_>,
+        window: crate::block_stream::BlockWindow<'_>,
+    ) -> Result<Array> {
+        let stream = self.block_stream.as_ref().ok_or_else(|| {
+            mlx_gen::Error::Unsupported(
+                "anima: a transformer window was planned without a re-openable checkpoint"
+                    .to_owned(),
+            )
+        })?;
+        if window.plan.n_blocks() != self.blocks.len() || stream.n_blocks() != self.blocks.len() {
+            return Err(mlx_gen::Error::Msg(format!(
+                "anima: block-window plan covers {} blocks and the stream {}, but the stack has {}",
+                window.plan.n_blocks(),
+                stream.n_blocks(),
+                self.blocks.len()
+            )));
+        }
+        mlx_gen::block_residency::run_windowed(
+            &window.plan,
+            window.cancel,
+            hidden,
+            || stream.open(),
+            |mut hidden, view, range| {
+                for index in range {
+                    let block = stream.materialize(view, index)?;
+                    hidden = block.forward(
+                        &hidden,
+                        encoder,
+                        embedded,
+                        temb,
+                        (&rope.cos, &rope.sin),
+                        plan,
+                    )?;
+                }
+                Ok(hidden)
+            },
+            |hidden| Ok(mlx_rs::transforms::eval([hidden])?),
+        )
     }
 
     /// Denoise forward. `latents`: `[B, 16, 1, Hl, Wl]` (any dtype — cast to `dtype`). `sigma`: `[B]`.
@@ -448,8 +728,33 @@ impl CosmosDiT {
         encoder: &Array,
         dtype: Dtype,
     ) -> Result<Array> {
+        self.forward_bounded(
+            latents,
+            sigma,
+            encoder,
+            dtype,
+            mlx_gen::attention::AttentionPlan::UNBOUNDED,
+            None,
+        )
+    }
+
+    /// [`forward`](Self::forward) under an explicit memory plan — ladder rungs 3 and 4 (SC-15524).
+    ///
+    /// `plan` bounds the attention scratch; `window` rebuilds the block stack from the checkpoint one
+    /// window at a time instead of reading the resident `blocks`. Both are execution-shape choices
+    /// only: the same arithmetic, in the same order, over the same weights. `UNBOUNDED` + `None` is
+    /// exactly [`forward`](Self::forward).
+    pub(crate) fn forward_bounded(
+        &self,
+        latents: &Array,
+        sigma: &Array,
+        encoder: &Array,
+        dtype: Dtype,
+        plan: mlx_gen::attention::AttentionPlan<'_>,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<Array> {
         let (hidden, (pe_t, pe_h, pe_w), embedded, temb) =
-            self.run_blocks(latents, sigma, encoder, dtype, None)?;
+            self.run_blocks(latents, sigma, encoder, dtype, None, plan, window)?;
         // 6. output norm + projection + unpatchify.
         let hidden = self.norm_out.forward(&hidden, &embedded, &temb)?;
         let hidden = self.proj_out.forward(&hidden)?;
@@ -465,6 +770,9 @@ impl CosmosDiT {
         for b in &mut self.blocks {
             b.set_sdpa_checkpoint(on);
         }
+        // The flag has no on-disk representation, so a re-materialized block could not reproduce it.
+        // Disarm rung 4 rather than let a streamed forward run a silently different backward.
+        self.disarm_block_stream();
     }
 
     /// Training forward with **per-block gradient checkpointing** (sc-10576). Numerically identical to
@@ -603,7 +911,7 @@ impl CosmosDiT {
                         .ok_or_else(|| {
                             Exception::custom(format!("checkpoint LoRA target not found: {local}"))
                         })?
-                        .set_adapters(vec![Adapter::Lora {
+                        .set_training_adapters(vec![Adapter::Lora {
                             a,
                             b: bmat,
                             scale: 1.0,
@@ -617,7 +925,16 @@ impl CosmosDiT {
                         .expect("enc_captured is Some on the capture path")
                 };
                 let out = blk
-                    .forward(&inp[0], enc_ref, &emb_c, &temb_c, (&cos_c, &sin_c))
+                    .forward(
+                        &inp[0],
+                        enc_ref,
+                        &emb_c,
+                        &temb_c,
+                        (&cos_c, &sin_c),
+                        // Training never selects a bounded rung: `eval` is invalid inside an autograd
+                        // trace, and `AttentionBudget::CONSTRAINED` sets `eval_per_chunk`.
+                        mlx_gen::attention::AttentionPlan::UNBOUNDED,
+                    )
                     .map_err(|e| Exception::custom(e.to_string()))?;
                 Ok(vec![out])
             });
@@ -673,7 +990,15 @@ impl CosmosDiT {
         num_blocks: Option<usize>,
     ) -> Result<Array> {
         Ok(self
-            .run_blocks(latents, sigma, encoder, dtype, num_blocks)?
+            .run_blocks(
+                latents,
+                sigma,
+                encoder,
+                dtype,
+                num_blocks,
+                mlx_gen::attention::AttentionPlan::UNBOUNDED,
+                None,
+            )?
             .0)
     }
 }
@@ -691,11 +1016,24 @@ impl CosmosDiT {
 impl AdaptableHost for Attention {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
-            ["q_proj"] => Some(&mut self.to_q),
-            ["k_proj"] => Some(&mut self.to_k),
-            ["v_proj"] => Some(&mut self.to_v),
+            ["q_proj"] => self.qkv.part_mut(QkvPart::Q),
+            ["k_proj"] => self.qkv.part_mut(QkvPart::K),
+            ["v_proj"] => self.qkv.part_mut(QkvPart::V),
             ["output_proj"] => Some(&mut self.to_out),
             _ => None,
+        }
+    }
+
+    /// The PROBE half (SC-18319) — q/k/v answer from [`Qkv::part_facts`], which reads the packed
+    /// representation instead of dismantling it. `block_stream.rs`'s adapter capture walks EVERY
+    /// path on EVERY resident block, so without this a load-time capture would unfuse the whole
+    /// stack.
+    fn adaptable_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        match path {
+            ["q_proj"] => Some(self.qkv.part_facts(QkvPart::Q)),
+            ["k_proj"] => Some(self.qkv.part_facts(QkvPart::K)),
+            ["v_proj"] => Some(self.qkv.part_facts(QkvPart::V)),
+            _ => self.adaptable_mut(path).map(|l| LinearFacts::of(l)),
         }
     }
 
@@ -833,10 +1171,12 @@ mod structural {
         pub(crate) fn structural(cfg: DitConfig) -> Self {
             let heads = cfg.num_attention_heads as i32;
             let head_dim = cfg.attention_head_dim as i32;
-            let attn = || Attention {
-                to_q: ph_lin(),
-                to_k: ph_lin(),
-                to_v: ph_lin(),
+            let attn = |self_attention: bool| Attention {
+                qkv: if self_attention {
+                    Qkv::self_attn(ph_lin(), ph_lin(), ph_lin())
+                } else {
+                    Qkv::cross_attn(ph_lin(), ph_lin(), ph_lin())
+                },
                 to_out: ph_lin(),
                 norm_q: ph_norm(),
                 norm_k: ph_norm(),
@@ -852,9 +1192,9 @@ mod structural {
             let blocks = (0..cfg.num_layers)
                 .map(|_| Block {
                     norm1: adaln0(),
-                    attn1: attn(),
+                    attn1: attn(true),
                     norm2: adaln0(),
-                    attn2: attn(),
+                    attn2: attn(false),
                     norm3: adaln0(),
                     ff: FeedForward {
                         proj_in: ph_lin(),
@@ -871,6 +1211,7 @@ mod structural {
                     hidden: cfg.hidden_size(),
                 },
                 blocks,
+                block_stream: None,
                 norm_out: AdaLayerNorm {
                     linear_1: ph_lin(),
                     linear_2: ph_lin(),
@@ -915,12 +1256,26 @@ pub(crate) mod synthetic {
             Array::ones::<f32>(&[d]).unwrap()
         }
 
-        fn attn(&mut self, heads: i32, head_dim: i32, q_in: i32, kv_in: i32) -> Attention {
+        fn attn(
+            &mut self,
+            heads: i32,
+            head_dim: i32,
+            q_in: i32,
+            kv_in: i32,
+            self_attention: bool,
+        ) -> Attention {
             let inner = heads * head_dim;
+            let (q, k, v) = (
+                self.lin(inner, q_in),
+                self.lin(inner, kv_in),
+                self.lin(inner, kv_in),
+            );
             Attention {
-                to_q: self.lin(inner, q_in),
-                to_k: self.lin(inner, kv_in),
-                to_v: self.lin(inner, kv_in),
+                qkv: if self_attention {
+                    Qkv::self_attn(q, k, v)
+                } else {
+                    Qkv::cross_attn(q, k, v)
+                },
                 to_out: self.lin(q_in, inner),
                 norm_q: self.norm(head_dim),
                 norm_k: self.norm(head_dim),
@@ -958,9 +1313,10 @@ pub(crate) mod synthetic {
             let blocks = (0..cfg.num_layers)
                 .map(|_| Block {
                     norm1: r.adaln0(h, adaln),
-                    attn1: r.attn(heads, head_dim, h, h), // self-attn: kv from hidden
+                    attn1: r.attn(heads, head_dim, h, h, true), // self-attn: kv from hidden
                     norm2: r.adaln0(h, adaln),
-                    attn2: r.attn(heads, head_dim, h, text), // cross-attn: kv from encoder (text_dim)
+                    // cross-attn: kv from encoder (text_dim)
+                    attn2: r.attn(heads, head_dim, h, text, false),
                     norm3: r.adaln0(h, adaln),
                     ff: FeedForward {
                         proj_in: r.lin(ff, h),
@@ -977,6 +1333,7 @@ pub(crate) mod synthetic {
                     hidden: cfg.hidden_size(),
                 },
                 blocks,
+                block_stream: None,
                 norm_out: AdaLayerNorm {
                     linear_1: r.lin(adaln, h),
                     linear_2: r.lin(2 * h, adaln), // shift|scale (2·hidden)
@@ -986,5 +1343,207 @@ pub(crate) mod synthetic {
                 cfg,
             }
         }
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Ladder rung 3 — bounded attention, weight-free (SC-15524)
+// -------------------------------------------------------------------------------------------------
+
+/// The MLX twin of `mlx_gen_z_image`'s `tests/attention_budget_dit.rs`, on the synthetic DiT so it
+/// runs in ordinary CI rather than only on a Mac holding the licensed 4.18 GB checkpoint.
+///
+/// ## Why a tripped cancel flag is the assertion
+///
+/// An equivalence check alone — "chunked output == unbounded output" — is a **false green**: it
+/// passes trivially if the plan never reaches an attention, or if the budget never chunks. Deleting
+/// the whole rung leaves it green, and that is exactly the hole this module closes.
+///
+/// So each equivalence check is paired with a plan whose cancel flag is **already tripped**. Between
+/// chunks, [`mlx_gen::attention::sdpa_budgeted_bhsd`] consults that flag and returns
+/// [`mlx_gen::Error::Canceled`]; the unbounded fast path has no chunk boundary and never looks at
+/// it. A forward that returns `Ok` under a tripped-cancel *chunking* plan therefore proves one of:
+/// the plan was dropped somewhere in the call chain, or the budget did not chunk.
+///
+/// ## Why two budgets rather than one
+///
+/// Every Anima block runs **two** attentions — self-attn over the image tokens and cross-attn into
+/// the conditioner output — and `Block::forward` hands the same plan to both. One tripped-cancel
+/// case cannot distinguish "the plan reached both" from "the plan reached whichever one runs first".
+/// The budget is a score-element cap, and the two attentions have different key lengths, so a budget
+/// can be sized to chunk exactly one of them: with 2 heads, `Sq = 16` image tokens and an encoder of
+/// `Sk` tokens, self-attn chunks iff `budget < 2·16·16 = 512` and cross-attn iff `budget < 2·16·Sk`.
+/// A short encoder (`Sk = 4`) isolates the self-attn; a long one (`Sk = 64`) isolates the cross.
+#[cfg(test)]
+mod bounded_attention_tests {
+    use super::*;
+    use mlx_gen::attention::{AttentionBudget, AttentionPlan};
+    use mlx_gen::{CancelFlag, Error};
+    use mlx_rs::random;
+
+    /// 2 heads × 8 = hidden 16, 2 blocks. `max_size` is post-`patch_size` (1,2,2), so an 8×8 latent
+    /// grid patchifies to 4×4 = **16 image tokens** — the `Sq` both attentions see.
+    fn cfg() -> DitConfig {
+        DitConfig {
+            in_channels: 4,
+            out_channels: 4,
+            num_attention_heads: 2,
+            attention_head_dim: 8,
+            num_layers: 2,
+            mlp_ratio: 2.0,
+            text_embed_dim: 16,
+            adaln_lora_dim: 8,
+            max_size: (4, 16, 16),
+            patch_size: (1, 2, 2),
+            rope_scale: (1.0, 4.0, 4.0),
+            concat_padding_mask: true,
+        }
+    }
+
+    const IMAGE_TOKENS: i32 = 16;
+    const HEADS: u64 = 2;
+
+    /// `[1, C, 1, 8, 8]` latents, a `[1]` sigma and a `[1, encoder_tokens, 16]` conditioner output.
+    fn inputs(cfg: &DitConfig, encoder_tokens: i32) -> (Array, Array, Array) {
+        let key = random::key(7).unwrap();
+        let latents = random::normal::<f32>(
+            &[1, cfg.in_channels as i32, 1, 8, 8][..],
+            None,
+            None,
+            Some(&key),
+        )
+        .unwrap();
+        let sigma = Array::from_slice(&[0.7f32], &[1]);
+        let key = random::key(9).unwrap();
+        let encoder = random::normal::<f32>(
+            &[1, encoder_tokens, cfg.text_embed_dim as i32][..],
+            None,
+            None,
+            Some(&key),
+        )
+        .unwrap();
+        (latents, sigma, encoder)
+    }
+
+    /// The largest budget that still chunks a `[1, HEADS, IMAGE_TOKENS, D] × [.., sk, D]` call is
+    /// `HEADS · sk · (IMAGE_TOKENS - 1)`; one element above `HEADS · sk · IMAGE_TOKENS` never does.
+    /// Derived rather than hardcoded so a config change cannot silently turn a chunking case into a
+    /// single-call one and leave the tripped-cancel assertion unreachable.
+    fn chunks_at(sk: i32) -> u64 {
+        HEADS * sk as u64 * (IMAGE_TOKENS as u64 - 1)
+    }
+    fn single_call_at(sk: i32) -> u64 {
+        HEADS * sk as u64 * IMAGE_TOKENS as u64
+    }
+
+    fn peak_relative_delta(a: &Array, b: &Array) -> f32 {
+        let n: i32 = b.shape().iter().product();
+        let a = a.as_dtype(Dtype::Float32).unwrap().reshape(&[n]).unwrap();
+        let b = b.as_dtype(Dtype::Float32).unwrap().reshape(&[n]).unwrap();
+        let (xs, ys) = (a.as_slice::<f32>(), b.as_slice::<f32>());
+        let peak = ys.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-12);
+        xs.iter()
+            .zip(ys)
+            .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()))
+            / peak
+    }
+
+    /// Chunking changes the query GEMM's `M` dimension, so the two forwards are tolerance-equivalent
+    /// rather than bit-identical (the same 1e-3 bound the sibling families use over a whole forward).
+    const TOLERANCE: f32 = 1e-3;
+
+    /// The plan reaches BOTH DiT attentions, and it really chunks at each of them.
+    #[test]
+    fn the_attention_plan_reaches_both_dit_attentions_and_chunks() {
+        let cfg = cfg();
+        let model = CosmosDiT::synthetic(cfg, 11);
+        let cancel = CancelFlag::default();
+        cancel.cancel();
+
+        for (label, encoder_tokens, budget) in [
+            // A short encoder: cross-attn already fits, so ONLY the self-attn can chunk. An abort
+            // therefore proves the plan reached the self-attention.
+            ("self-attn", 4, chunks_at(IMAGE_TOKENS)),
+            // A long encoder: the budget is above the self-attn's whole score matrix, so only the
+            // cross-attn chunks. An abort proves the plan reached the cross-attention.
+            ("cross-attn", 64, single_call_at(IMAGE_TOKENS)),
+        ] {
+            let (latents, sigma, encoder) = inputs(&cfg, encoder_tokens);
+            // The isolation this case claims, asserted rather than assumed: exactly one of the two
+            // attentions is over its budget at this (budget, encoder) pair.
+            let self_chunks = budget < single_call_at(IMAGE_TOKENS);
+            let cross_chunks = budget < single_call_at(encoder_tokens);
+            assert!(
+                self_chunks ^ cross_chunks,
+                "{label}: the budget must isolate ONE attention (self={self_chunks}, \
+                 cross={cross_chunks}), else an abort cannot attribute the plan to it"
+            );
+
+            let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(budget, true))
+                .with_cancel(&cancel);
+            match model.forward_bounded(&latents, &sigma, &encoder, Dtype::Float32, plan, None) {
+                Err(Error::Canceled) => {}
+                other => panic!(
+                    "{label}: a tripped cancel under a plan that chunks the {label} must abort the \
+                     forward between chunks — got {:?}. Either the plan is not threaded to that \
+                     attention, or the budget did not chunk there, which would make rung 3 \
+                     unfalsifiable on this route.",
+                    other.map(|v| v.shape().to_vec())
+                ),
+            }
+
+            // ...and the unbounded fast path has no chunk boundary, so the same tripped flag cannot
+            // affect it. This is what makes the abort above attributable to CHUNKING.
+            let plan = AttentionPlan::UNBOUNDED.with_cancel(&cancel);
+            assert!(
+                model
+                    .forward_bounded(&latents, &sigma, &encoder, Dtype::Float32, plan, None)
+                    .is_ok(),
+                "{label}: a tripped cancel must not affect the unbounded (default) forward"
+            );
+        }
+    }
+
+    /// Bounded attention is a memory-shape choice, not a numeric one: a plan that chunks BOTH
+    /// attentions must reproduce the unbounded velocity, and the default `forward` must be
+    /// **exactly** the explicitly-unbounded one.
+    #[test]
+    fn the_chunked_forward_matches_the_unbounded_forward() {
+        let cfg = cfg();
+        let model = CosmosDiT::synthetic(cfg, 11);
+        let encoder_tokens = 16;
+        let (latents, sigma, encoder) = inputs(&cfg, encoder_tokens);
+
+        // Under the smaller of the two ceilings, both attentions chunk.
+        let budget = chunks_at(IMAGE_TOKENS).min(chunks_at(encoder_tokens));
+        assert!(budget < single_call_at(IMAGE_TOKENS) && budget < single_call_at(encoder_tokens));
+        let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(budget, true));
+
+        let unbounded = model
+            .forward(&latents, &sigma, &encoder, Dtype::Float32)
+            .unwrap();
+        let chunked = model
+            .forward_bounded(&latents, &sigma, &encoder, Dtype::Float32, plan, None)
+            .unwrap();
+        assert_eq!(chunked.shape(), unbounded.shape(), "output shape");
+        let delta = peak_relative_delta(&chunked, &unbounded);
+        assert!(
+            delta < TOLERANCE,
+            "bounded attention changed the DiT velocity: peak-relative delta {delta:e}"
+        );
+
+        // The historical path is untouched: `forward` and an explicitly UNBOUNDED `forward_bounded`
+        // agree EXACTLY, not within a tolerance.
+        let explicit = model
+            .forward_bounded(
+                &latents,
+                &sigma,
+                &encoder,
+                Dtype::Float32,
+                AttentionPlan::UNBOUNDED,
+                None,
+            )
+            .unwrap();
+        assert_eq!(peak_relative_delta(&unbounded, &explicit), 0.0);
     }
 }

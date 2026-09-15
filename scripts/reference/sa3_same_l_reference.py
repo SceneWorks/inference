@@ -20,6 +20,21 @@ import sys
 from pathlib import Path
 from unittest import mock
 
+try:
+    from sa3_reference import (
+        portable_values as _portable_values,
+        sha256_file,
+        tensor_records,
+        validate_upstream_checkout,
+    )
+except ModuleNotFoundError:
+    from .sa3_reference import (
+        portable_values as _portable_values,
+        sha256_file,
+        tensor_records,
+        validate_upstream_checkout,
+    )
+
 
 UPSTREAM_COMMIT = "124e8a799f57a1f665495ecb72e547d0a62867f1"
 UPSTREAM_REPOSITORY = "https://github.com/Stability-AI/stable-audio-3.git"
@@ -62,14 +77,6 @@ EXPECTED_RESOURCE_EVIDENCE_BYTES = 1_229
 
 class InvalidReference(RuntimeError):
     pass
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def canonical_json_sha256(value) -> str:
@@ -131,36 +138,18 @@ def require_revision(path: Path, revision: str, label: str) -> None:
 
 
 def validate_upstream(path: Path) -> None:
-    revision = subprocess.run(
-        ["git", "-C", str(path), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    ).stdout.strip()
-    if revision != UPSTREAM_COMMIT:
-        raise InvalidReference(f"upstream revision mismatch: {revision}")
-    status = subprocess.run(
-        ["git", "-C", str(path), "status", "--porcelain=v1", "--untracked-files=all"],
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    ).stdout.splitlines()
-    if any(not line.endswith(" .venv/") for line in status):
-        raise InvalidReference(f"upstream checkout is not clean: {status}")
+    validate_upstream_checkout(
+        path,
+        UPSTREAM_COMMIT,
+        error_type=InvalidReference,
+        allow_venv=True,
+        include_ignored=False,
+    )
 
 
 def portable_values(torch, shape, stream: int):
     """Exact u32 LCG values mapped to [-1,1]; deliberately not a Gaussian distribution."""
-    count = 1
-    for dim in shape:
-        count *= dim
-    index = torch.arange(count, dtype=torch.int64)
-    bits = (index * 1_664_525 + (SEED + stream) * 1_013_904_223) & 0xFFFF_FFFF
-    return (bits.to(torch.float64) / 2_147_483_648.0 - 1.0).to(
-        torch.float32
-    ).reshape(shape)
+    return _portable_values(torch, tuple(shape), stream, seed=SEED)
 
 
 def fixed_audio(torch, samples: int):
@@ -254,24 +243,6 @@ def run_case(
         ),
         "noiseStreams": [0, 1, 2],
     }
-
-
-def tensor_records(torch, tensors):
-    from safetensors.torch import save
-
-    records = {}
-    for name, value in tensors.items():
-        value = value.detach().cpu().contiguous()
-        payload_bytes = value.numel() * value.element_size()
-        serialized = save({"x": value})
-        records[name] = {
-            "dtype": str(value.dtype).removeprefix("torch."),
-            "shape": list(value.shape),
-            "sha256": hashlib.sha256(
-                serialized[-payload_bytes:] if payload_bytes else b""
-            ).hexdigest(),
-        }
-    return records
 
 
 def inspect_safetensors(path: Path):

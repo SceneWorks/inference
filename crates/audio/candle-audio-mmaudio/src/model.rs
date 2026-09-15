@@ -21,39 +21,28 @@ pub const HUB_REVISION: &str = "eb13a1a98fdbec91753775c57b074ccdfc60587c";
 /// The Synchformer visual-encoder state dict (~907 MB pickle) inside the pinned repo.
 pub const WEIGHTS_PATH: &str = "ext_weights/synchformer_state_dict.pth";
 
-/// The license of the pinned Synchformer weight checkpoint (sc-13332 framework) — surfaced for
-/// SceneWorks' end-product licenses page.
+/// The schema-3 licence row for the pinned Synchformer visual-encoder checkpoint (sc-16663).
 ///
-/// The Synchformer **code** (`v-iashin/Synchformer`, vendored under MMAudio's
-/// `mmaudio/ext/synchformer/LICENSE`) is **MIT**, © 2024 Vladimir Iashin — verified against the
-/// repository `LICENSE` file. The released checkpoints ship alongside the MIT code with no separate
-/// weights license; the restriction note records the training-data provenance
-/// (VGGSound/AudioSet/LRS3) whose dataset terms a downstream *commercial* use would need a legal
-/// read on, so the fact is surfaced rather than buried even though MIT itself is permissive.
-pub const WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
-    candle_audio::gen_core::WeightLicense {
-        spdx_id: "MIT",
-        name: "MIT License",
+/// **Disclosure only.** The Synchformer repository declares MIT, © 2024 Vladimir Iashin, read from
+/// the GitHub licence API on `retrieved`; the checkpoint ships beside that MIT code with no separate
+/// weights licence, and is distributed via MMAudio's `ext_weights`.
+///
+/// The v2 row additionally carried a prose note about the training-data provenance
+/// (VGGSound/AudioSet/LRS3). That is a fact about datasets, not a term the MIT text states, and this
+/// surface transcribes licence texts — so it is not re-encoded as a term here. The note lives in this
+/// doc comment, where it informs a reader without pretending to be a joinable obligation.
+pub const COMPONENT_LICENSE: candle_audio::gen_core::ComponentLicense =
+    candle_audio::gen_core::ComponentLicense {
+        component: MODEL_ID,
         source_url: "https://github.com/v-iashin/Synchformer",
+        gated: false,
+        declared: "mit",
+        family: "mit",
         attribution: Some(
             "Synchformer © 2024 Vladimir Iashin — MIT License; checkpoint distributed via MMAudio \
              (hkchengrex/MMAudio) ext_weights",
         ),
-        commercial_use: true,
-        restriction: Some(
-            "Code is MIT. Released weights were trained on VGGSound/AudioSet/LRS3; those datasets \
-             carry their own (YouTube/BBC-sourced, research-oriented) terms — a legal read is \
-             warranted before any commercial redistribution of the weights.",
-        ),
-    };
-
-/// This encoder's weight-license entry (keyed by [`MODEL_ID`]) for catalog aggregation once a
-/// shipping MMAudio generator registers it in a later slice.
-pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
-    candle_audio::gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: None,
-        license: WEIGHT_LICENSE,
+        retrieved: "2026-08-02",
     };
 
 /// Load the Synchformer visual encoder from a `synchformer_state_dict.pth` file path.
@@ -95,10 +84,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn weight_license_is_well_formed_mit() {
-        assert!(WEIGHT_LICENSE.is_well_formed());
-        assert_eq!(WEIGHT_LICENSE.spdx_id, "MIT");
-        assert_eq!(WEIGHT_LICENSE_ENTRY.provider_id, MODEL_ID);
+    fn component_licence_resolves_to_the_mit_family() {
+        use candle_audio::gen_core::{resolve_family, LICENSE_FAMILIES};
+        assert!(COMPONENT_LICENSE.is_well_formed(LICENSE_FAMILIES));
+        assert_eq!(COMPONENT_LICENSE.component, MODEL_ID);
+        assert_eq!(COMPONENT_LICENSE.declared, "mit");
+        let family = resolve_family(LICENSE_FAMILIES, COMPONENT_LICENSE.family).unwrap();
+        assert_eq!(family.spdx_id, "MIT");
+        // Both MMAudio providers load this one artifact, so it is one row, not two (sc-16663).
+        assert_eq!(
+            crate::PROVIDER_COMPONENTS
+                .iter()
+                .filter(|p| p.components.contains(&MODEL_ID))
+                .count(),
+            2
+        );
     }
 
     #[test]

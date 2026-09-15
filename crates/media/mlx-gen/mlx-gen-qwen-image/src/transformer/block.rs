@@ -5,10 +5,11 @@
 use mlx_rs::error::Exception;
 use mlx_rs::fast::layer_norm;
 use mlx_rs::ops::{add, multiply, split, which};
-use mlx_rs::transforms::compile::compile;
+use mlx_rs::transforms::compile::{compile, compile_retained};
 use mlx_rs::Array;
 
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
+use mlx_gen::attention::AttentionPlan;
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -16,6 +17,67 @@ use mlx_gen::Result;
 use super::{compile_glue, join, linear_from, FeedForward, QwenJointAttention};
 
 const LN_EPS: f32 = 1e-6;
+const SITE_MODULATE: &str = "qwen_image::block::modulate";
+const SITE_GATED: &str = "qwen_image::block::gated";
+
+fn modulate_impl(
+    (x, scale, shift): (&Array, &Array, &Array),
+) -> std::result::Result<Array, Exception> {
+    add(
+        &multiply(x, &add(scale, Array::from_slice(&[1.0f32], &[1]))?)?,
+        shift,
+    )
+}
+
+fn gated_impl((x, gate, y): (&Array, &Array, &Array)) -> std::result::Result<Array, Exception> {
+    add(x, &multiply(gate, y)?)
+}
+
+struct QwenRetainedBlockGlue {
+    modulate: mlx_gen::nn::RetainedTernary,
+    gated: mlx_gen::nn::RetainedTernary,
+}
+
+impl QwenRetainedBlockGlue {
+    fn new() -> Self {
+        Self {
+            modulate: mlx_gen::nn::RetainedTernary::new(compile_retained(modulate_impl, true)),
+            gated: mlx_gen::nn::RetainedTernary::new(compile_retained(gated_impl, true)),
+        }
+    }
+}
+
+thread_local! {
+    static RETAINED_BLOCK_GLUE: std::cell::RefCell<Option<QwenRetainedBlockGlue>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn with_retained_block_glue<T>(
+    f: impl FnOnce(&mut QwenRetainedBlockGlue) -> std::result::Result<T, Exception>,
+) -> std::result::Result<T, Exception> {
+    mlx_gen::nn::prepare_retained_compilation_thread();
+    RETAINED_BLOCK_GLUE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        f(slot.get_or_insert_with(QwenRetainedBlockGlue::new))
+    })
+}
+
+/// Exercise every retained handle owned by the Qwen block once for the release memory audit.
+#[doc(hidden)]
+pub fn exercise_retained_compile_inventory(input: &Array) -> Result<()> {
+    let output = with_retained_block_glue(|compiled| {
+        compiled.modulate.call(SITE_MODULATE, (input, input, input))
+    })?;
+    output.eval()?;
+    drop(output);
+
+    let output = with_retained_block_glue(|compiled| {
+        compiled.gated.call(SITE_GATED, (input, input, input))
+    })?;
+    output.eval()?;
+    drop(output);
+    Ok(())
+}
 
 pub struct QwenTransformerBlock {
     img_mod: AdaptableLinear,
@@ -88,6 +150,35 @@ impl QwenTransformerBlock {
         mask: Option<&Array>,
         modulate_index: Option<&Array>,
     ) -> Result<(Array, Array)> {
+        self.forward_budgeted(
+            hidden_states,
+            encoder_hidden_states,
+            text_embeddings,
+            img_cos,
+            img_sin,
+            txt_cos,
+            txt_sin,
+            mask,
+            modulate_index,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    /// [`Self::forward`] with the shared request-scoped bounded-attention plan.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_budgeted(
+        &self,
+        hidden_states: &Array,
+        encoder_hidden_states: &Array,
+        text_embeddings: &Array,
+        img_cos: &Array,
+        img_sin: &Array,
+        txt_cos: &Array,
+        txt_sin: &Array,
+        mask: Option<&Array>,
+        modulate_index: Option<&Array>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<(Array, Array)> {
         // SiLU'd timestep embedding. Under zero_cond_t this is [2B, dim]; the image modulation uses
         // the whole thing, the text modulation only the real-timestep half. SiLU is elementwise, so
         // `act[:B] == silu(temb[:B])` — slicing here is bit-identical to slicing the temb first.
@@ -111,7 +202,7 @@ impl QwenTransformerBlock {
             &txt_mod[0],
         )?;
 
-        let (img_attn, txt_attn) = self.attn.forward(
+        let (img_attn, txt_attn) = self.attn.forward_budgeted(
             &img_modulated,
             &txt_modulated,
             img_cos,
@@ -119,6 +210,7 @@ impl QwenTransformerBlock {
             txt_cos,
             txt_sin,
             mask,
+            attention,
         )?;
 
         let hidden_states = gated(hidden_states, &img_gate1, &img_attn)?;
@@ -153,16 +245,21 @@ fn modulate(x: &Array, mod_params: &Array) -> Result<(Array, Array)> {
     let shift = p[0].expand_dims(1)?; // [B, 1, dim]
     let scale = p[1].expand_dims(1)?;
     let gate = p[2].expand_dims(1)?;
-    let f = |(x, sc, sh): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
-        add(
-            &multiply(x, &add(sc, Array::from_slice(&[1.0f32], &[1]))?)?,
-            sh,
-        )
-    };
     let out = if compile_glue() {
-        compile(f, true)((x, &scale, &shift))?
+        if mlx_gen::nn::retained_compilation_requested() {
+            with_retained_block_glue(|compiled| {
+                compiled.modulate.call(SITE_MODULATE, (x, &scale, &shift))
+            })?
+        } else {
+            mlx_gen::diagnostics::record_compile(
+                SITE_MODULATE,
+                mlx_gen::diagnostics::CompileDisposition::OneShot,
+            );
+            compile(modulate_impl, true)((x, &scale, &shift))?
+        }
     } else {
-        f((x, &scale, &shift))?
+        mlx_gen::diagnostics::record_fallback(SITE_MODULATE, "compiled_glue_disabled");
+        modulate_impl((x, &scale, &shift))?
     };
     Ok((out, gate))
 }
@@ -202,13 +299,21 @@ fn modulate_maybe_indexed(
 /// Gated residual `x + gate·y` — one fused kernel when the sc-2963 glue toggle is on; bit-identical
 /// to the eager `add(x, gate·y)`.
 fn gated(x: &Array, gate: &Array, y: &Array) -> Result<Array> {
-    let f = |(x, g, y): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
-        add(x, &multiply(g, y)?)
-    };
     if compile_glue() {
-        Ok(compile(f, true)((x, gate, y))?)
+        if mlx_gen::nn::retained_compilation_requested() {
+            Ok(with_retained_block_glue(|compiled| {
+                compiled.gated.call(SITE_GATED, (x, gate, y))
+            })?)
+        } else {
+            mlx_gen::diagnostics::record_compile(
+                SITE_GATED,
+                mlx_gen::diagnostics::CompileDisposition::OneShot,
+            );
+            Ok(compile(gated_impl, true)((x, gate, y))?)
+        }
     } else {
-        Ok(f((x, gate, y))?)
+        mlx_gen::diagnostics::record_fallback(SITE_GATED, "compiled_glue_disabled");
+        Ok(gated_impl((x, gate, y))?)
     }
 }
 
@@ -244,6 +349,79 @@ mod sc2963 {
         let c = gated(&x, &gate, &y).unwrap();
         set_compile_glue(false);
         assert_eq!(max_abs(&c, &e), 0.0, "gated");
+    }
+
+    #[test]
+    fn retained_modulate_and_gated_report_miss_then_hit() {
+        use mlx_gen::diagnostics::{
+            self, CompileDisposition, DiagnosticCounter, ToggleDisposition, RETAINED_COMPILATION,
+        };
+
+        RETAINED_BLOCK_GLUE.with(|slot| *slot.borrow_mut() = None);
+        let x = rnd(&[1, 4, 16], Float32);
+        let params = rnd(&[1, 48], Bfloat16);
+        let gate = rnd(&[1, 1, 16], Bfloat16);
+        let y = rnd(&[1, 4, 16], Float32);
+        set_compile_glue(false);
+        let eager_modulate = modulate(&x, &params).unwrap().0;
+        let eager_gated = gated(&x, &gate, &y).unwrap();
+
+        set_compile_glue(true);
+        let scope = diagnostics::begin_request_with_toggles(
+            "qwen-retained-block",
+            "qwen_image",
+            &[RETAINED_COMPILATION],
+        )
+        .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                max_abs(&modulate(&x, &params).unwrap().0, &eager_modulate),
+                0.0
+            );
+            assert_eq!(max_abs(&gated(&x, &gate, &y).unwrap(), &eager_gated), 0.0);
+        }
+        let report = scope.finish();
+        for site in [SITE_MODULATE, SITE_GATED] {
+            for disposition in [
+                CompileDisposition::RetainedMiss,
+                CompileDisposition::RetainedHit,
+            ] {
+                assert!(report.counters.iter().any(|counter| matches!(
+                    counter,
+                    DiagnosticCounter::Compile {
+                        site: recorded_site,
+                        disposition: recorded,
+                        count: 1,
+                    } if *recorded_site == site && *recorded == disposition
+                )));
+            }
+        }
+        assert!(report.counters.iter().any(|counter| matches!(
+            counter,
+            DiagnosticCounter::Toggle {
+                toggle: RETAINED_COMPILATION,
+                disposition: ToggleDisposition::Applied,
+                count: 4,
+            }
+        )));
+
+        let baseline = diagnostics::begin_request("qwen-oneshot-block", "qwen_image").unwrap();
+        let _ = modulate(&x, &params).unwrap();
+        let _ = gated(&x, &gate, &y).unwrap();
+        let baseline = baseline.finish();
+        for site in [SITE_MODULATE, SITE_GATED] {
+            assert!(baseline.counters.iter().any(|counter| matches!(
+                counter,
+                DiagnosticCounter::Compile {
+                    site: recorded_site,
+                    disposition: CompileDisposition::OneShot,
+                    count: 1,
+                } if *recorded_site == site
+            )));
+        }
+
+        set_compile_glue(false);
+        RETAINED_BLOCK_GLUE.with(|slot| *slot.borrow_mut() = None);
     }
 }
 
