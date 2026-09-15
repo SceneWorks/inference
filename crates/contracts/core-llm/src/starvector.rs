@@ -395,6 +395,43 @@ impl<'a> StarVectorBoundedStream<'a> {
         }
     }
 
+    /// Accept stable text released at final detokenizer flush for an already-counted token.
+    ///
+    /// Stateful tokenizers can retain a split UTF-8 suffix until generation ends. The token that
+    /// produced this text already passed [`push`](Self::push), often with an empty fragment, so the
+    /// suffix must recheck time, cancellation, byte, and root bounds without charging a second
+    /// generated token.
+    pub fn push_decoded_suffix(
+        &mut self,
+        fragment: &str,
+        elapsed: Duration,
+    ) -> Result<StarVectorStreamStatus> {
+        if self.finish_reason.is_some() || self.generated_tokens == 0 {
+            return Err(Error::InvalidRequest(
+                "StarVector final decoded suffix has no pending generated token".into(),
+            ));
+        }
+        if self.request.text_request.cancel.is_cancelled() {
+            return Ok(self.stop(StarVectorFinishReason::Cancelled));
+        }
+        if elapsed >= self.request.max_wall_time {
+            return Ok(self.stop(StarVectorFinishReason::WallTimeLimit));
+        }
+        let next_bytes = self
+            .source
+            .len()
+            .checked_add(fragment.len())
+            .ok_or_else(|| Error::InvalidRequest("StarVector source byte count overflow".into()))?;
+        if next_bytes > self.request.max_svg_bytes {
+            return Ok(self.stop(StarVectorFinishReason::ByteLimit));
+        }
+        self.source.push_str(fragment);
+        match scan_svg_root(&self.source)? {
+            SvgRootState::Incomplete => Ok(StarVectorStreamStatus::Continue),
+            SvgRootState::Complete => Ok(self.stop(StarVectorFinishReason::CompleteRoot)),
+        }
+    }
+
     /// Accepted decoder tokens so far, including hidden tokens passed as empty fragments.
     pub fn generated_tokens(&self) -> u32 {
         self.generated_tokens
@@ -690,6 +727,38 @@ mod tests {
             limited.push_static_prefix("<svg").unwrap(),
             StarVectorStreamStatus::Stop(StarVectorFinishReason::ByteLimit)
         );
+        assert_eq!(limited.output().unwrap().svg, None);
+    }
+
+    #[test]
+    fn final_decoded_suffix_reuses_the_pending_token_and_keeps_bounds() {
+        let req = request(1, 32, TEST_LIMIT);
+        let mut stream = StarVectorBoundedStream::new(&req);
+        assert_eq!(
+            stream.push_static_prefix("<svg").unwrap(),
+            StarVectorStreamStatus::Continue
+        );
+        assert_eq!(
+            push(&mut stream, "", STEP).unwrap(),
+            StarVectorStreamStatus::Continue
+        );
+        assert_eq!(
+            stream.push_decoded_suffix("></svg>", STEP).unwrap(),
+            StarVectorStreamStatus::Stop(StarVectorFinishReason::CompleteRoot)
+        );
+        let output = stream.output().unwrap();
+        assert_eq!(output.svg.as_deref(), Some("<svg></svg>"));
+        assert_eq!(output.generated_tokens, 1);
+
+        let limited_req = request(1, 8, TEST_LIMIT);
+        let mut limited = StarVectorBoundedStream::new(&limited_req);
+        limited.push_static_prefix("<svg").unwrap();
+        push(&mut limited, "", STEP).unwrap();
+        assert_eq!(
+            limited.push_decoded_suffix("></svg>", STEP).unwrap(),
+            StarVectorStreamStatus::Stop(StarVectorFinishReason::ByteLimit)
+        );
+        assert_eq!(limited.generated_tokens(), 1);
         assert_eq!(limited.output().unwrap().svg, None);
     }
 

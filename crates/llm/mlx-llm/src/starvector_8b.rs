@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use core_llm::{
     Channel, Content, DecoderArchitecture, Error as CoreError, FinishReason, ImagePreprocessing,
-    IncrementalDetok, LoadSpec, ProjectionMetadata, Result as CoreResult, StarVectorBoundedStream,
+    LoadSpec, ProjectionMetadata, Result as CoreResult, StarVectorBoundedStream,
     StarVectorDescriptor, StarVectorFinishReason, StarVectorOutput, StarVectorProvider,
     StarVectorRequest, StarVectorStreamEvent, StarVectorStreamStatus, StarVectorTier, StreamEvent,
     TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, Tokenizer,
@@ -241,23 +241,20 @@ impl StarVector8bProvider {
             seed: request.text_request.seed,
             stop_tokens: vec![EOS_TOKEN_ID],
         };
-        let mut tokens = Vec::new();
-        let mut detok = IncrementalDetok::new();
+        let mut detok = self.tokenizer.decode_stream(true);
         let stopped = Cell::new(false);
         let stream_error = RefCell::new(None);
-        let tokenizer = &self.tokenizer;
         let mut decode_event = |event: DecodeEvent| {
             if let DecodeEvent::Token { id, step } = event {
-                tokens.push(id as u32);
-                let text = match tokenizer.decode(&tokens, true) {
-                    Ok(text) => text,
+                let delta = match detok.step(id as u32) {
+                    Ok(delta) => delta,
                     Err(error) => {
                         *stream_error.borrow_mut() = Some(error);
                         stopped.set(true);
                         return;
                     }
                 };
-                let delta = detok.push(&text).unwrap_or("");
+                let delta = delta.as_deref().unwrap_or("");
                 let status = match guard.push(delta, began.elapsed()) {
                     Ok(status) => status,
                     Err(error) => {
@@ -298,6 +295,22 @@ impl StarVector8bProvider {
         .map_err(to_core)?;
         if let Some(error) = stream_error.into_inner() {
             return Err(error);
+        }
+        if !stopped.get() {
+            if let Some(delta) = detok.finish()? {
+                let status = guard.push_decoded_suffix(&delta, began.elapsed())?;
+                match status {
+                    StarVectorStreamStatus::Continue
+                    | StarVectorStreamStatus::Stop(StarVectorFinishReason::CompleteRoot) => {
+                        on_event(StarVectorStreamEvent::Source {
+                            text: delta,
+                            index: generated.tokens.len() as u32,
+                        });
+                    }
+                    StarVectorStreamStatus::Stop(_) => {}
+                }
+                stopped.set(!matches!(status, StarVectorStreamStatus::Continue));
+            }
         }
         if !stopped.get() {
             match generated.finish_reason {
