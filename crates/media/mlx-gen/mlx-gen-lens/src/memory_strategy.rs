@@ -493,6 +493,9 @@ fn memory_strategy_contract_with_surface_facts(
         },
     );
     contract.load_shape = spec.load_shape;
+    contract.phase_facts = Some(mlx_gen::gen_core::MemoryPhaseFacts::staged(
+        mlx_gen::gen_core::StagedWeightSchedule::ThreeStage,
+    ));
     contract.architecture_facts = architecture_facts(spec.precision);
     let mut formula_variables = vec![
         MemoryFormulaVariable::AssetBytes,
@@ -1630,6 +1633,7 @@ mod tests {
             selection: MemorySelection {
                 strategy: MemoryStrategy::BoundedTransformerResidency,
                 parameters: MemoryStrategyParameters {
+                    stage_residency: None,
                     decode_tile_edge: Some(DECODE_TILE_EDGE),
                     decode_overlap: Some(DECODE_OVERLAP),
                     attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),

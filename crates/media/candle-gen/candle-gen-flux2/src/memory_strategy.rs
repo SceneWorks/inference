@@ -748,6 +748,7 @@ pub(crate) fn composed_provider_contract_for(
         .collect();
 
     Ok(MemoryProviderContract {
+        phase_facts: None,
         architecture_facts: architecture_facts(variant, spec),
         provider_id: profile.provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {

@@ -427,6 +427,9 @@ pub struct MemoryPidDecodeRoutes {
 /// Concrete parameters selected for one request.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryStrategyParameters {
+    /// Add phase eviction to an otherwise independent bounded request. None preserves the
+    /// historical composition; this never disables a declared staging prerequisite.
+    pub stage_residency: Option<bool>,
     pub decode_tile_edge: Option<u32>,
     pub decode_overlap: Option<u32>,
     pub attention_chunk_size: Option<u32>,
@@ -1387,6 +1390,8 @@ pub struct MemoryProviderContract {
     /// the compatibility state for a provider that has not adopted the axis yet, and the honest
     /// state for a weights-free contract built with no snapshot on disk.
     pub architecture_facts: MemoryArchitectureFacts,
+    /// Phase lifetimes and workspace topology from the actual provider loader.
+    pub phase_facts: Option<crate::MemoryPhaseFacts>,
     pub runtime: MemoryRuntimeSemantics,
 }
 
@@ -1423,6 +1428,7 @@ impl MemoryProviderContract {
             formula: MemoryFormulaKind::AssetBytesPlusHeadroom,
             calibration: None,
             asset_facts: MemoryAssetFacts::default(),
+            phase_facts: None,
             architecture_facts: MemoryArchitectureFacts::default(),
             runtime: MemoryRuntimeSemantics::default(),
         }
@@ -1767,6 +1773,11 @@ impl MemoryProviderContract {
     /// `decode_* = None` on off-grid/refused requests, while an exact admitted pair composes bounded
     /// decode as before. Selecting `BoundedDecode` itself never makes its own mechanism optional.
     pub fn engages_selection(&self, selection: &MemorySelection, rung: MemoryStrategy) -> bool {
+        if rung == MemoryStrategy::StagedResidency
+            && selection.parameters.stage_residency == Some(true)
+        {
+            return matches!(self.support(rung), Some(MemoryStrategySupport::Implemented));
+        }
         let engaged = self.engages(selection.strategy, rung);
         if !engaged || rung != MemoryStrategy::BoundedDecode {
             return engaged;
@@ -2241,6 +2252,29 @@ impl MemoryProviderContract {
 
     /// Validate a worker-owned selection against static provider capability and parameter ranges.
     pub fn validate_selection(&self, selection: &MemorySelection) -> Result<()> {
+        if selection.strategy == MemoryStrategy::Resident
+            && selection.parameters.stage_residency.is_some()
+        {
+            return Err(Error::Unsupported(
+                "a resident selection cannot request phase eviction".to_owned(),
+            ));
+        }
+        if selection.parameters.stage_residency == Some(false) {
+            return Err(Error::Unsupported(
+                "explicit staging can enable phase eviction, not disable a prerequisite".to_owned(),
+            ));
+        }
+        if selection.parameters.stage_residency == Some(true)
+            && !matches!(
+                self.support(MemoryStrategy::StagedResidency),
+                Some(MemoryStrategySupport::Implemented)
+            )
+        {
+            return Err(Error::Unsupported(format!(
+                "{} does not implement staged residency",
+                self.provider_id
+            )));
+        }
         let capability = self.capability(selection.strategy).ok_or_else(|| {
             Error::Unsupported(format!(
                 "{} does not declare {:?}",
@@ -3982,7 +4016,7 @@ fn evidence_key_json(key: &MemoryEvidenceKey) -> serde_json::Value {
             })
         })
         .collect::<Vec<_>>();
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "model_family": key.model_family,
         "resolved_route": key.resolved_route,
         "backend": key.backend.as_key(),
@@ -4012,7 +4046,12 @@ fn evidence_key_json(key: &MemoryEvidenceKey) -> serde_json::Value {
             "transformer_window_size": key.parameters.transformer_window_size,
             "transformer_window_component": key.parameters.transformer_window_component.map(transformer_component_key),
         },
-    })
+    });
+    // Preserve the byte identity of every retained legacy evidence key.
+    if let Some(staged) = key.parameters.stage_residency {
+        value["parameters"]["stage_residency"] = serde_json::json!(staged);
+    }
+    value
 }
 
 fn parity_contract_json(parity: &MemoryParityContract) -> serde_json::Value {
@@ -4316,6 +4355,7 @@ mod tests {
         strategies[3].parameters.attention_chunk_sizes = vec![256, 128];
         strategies[4].parameters.transformer_window_sizes = vec![2, 1];
         MemoryProviderContract {
+            phase_facts: None,
             architecture_facts: crate::MemoryArchitectureFacts::default(),
             provider_id: "test-provider".to_owned(),
             backend: mlx_backend(),
@@ -6034,6 +6074,7 @@ mod tests {
         let mut selection = MemorySelection {
             strategy: MemoryStrategy::BoundedAttention,
             parameters: MemoryStrategyParameters {
+                stage_residency: None,
                 decode_tile_edge: Some(512),
                 decode_overlap: Some(64),
                 attention_chunk_size: Some(128),
@@ -6191,6 +6232,7 @@ mod tests {
         let select = |component| MemorySelection {
             strategy: MemoryStrategy::BoundedTransformerResidency,
             parameters: MemoryStrategyParameters {
+                stage_residency: None,
                 // Rung 4 is cumulative, so the lower rungs' parameters are required too; these are
                 // `adopted_contract`'s own declared candidates.
                 decode_tile_edge: Some(512),
@@ -6316,6 +6358,51 @@ mod tests {
     /// SC-15998: the graph itself, asserted edge by edge so a regression to the old rung-1 edge
     /// cannot pass.
     #[test]
+    fn optional_staging_changes_execution_without_changing_the_default() {
+        let mut contract = adopted_contract();
+        let mut selection = contract
+            .representative_selection(
+                MemoryStrategy::BoundedDecode,
+                MemoryNumericTier {
+                    precision: Precision::Bf16,
+                    quant: Some(Quant::Q4),
+                    component_precision_floors: &[],
+                },
+                false,
+            )
+            .unwrap();
+        assert!(!contract.engages_selection(&selection, MemoryStrategy::StagedResidency));
+        assert!(
+            !contract
+                .generation_memory(&selection)
+                .unwrap()
+                .stage_residency
+        );
+        selection.parameters.stage_residency = Some(true);
+        contract.validate_selection(&selection).unwrap();
+        assert!(
+            contract
+                .generation_memory(&selection)
+                .unwrap()
+                .stage_residency
+        );
+        assert!(contract
+            .engaged_composition_for_selection(&selection)
+            .contains(&MemoryStrategy::StagedResidency));
+        contract
+            .strategies
+            .iter_mut()
+            .find(|cap| cap.strategy == MemoryStrategy::StagedResidency)
+            .unwrap()
+            .support = MemoryStrategySupport::Missing;
+        assert!(contract.validate_selection(&selection).is_err());
+        selection.parameters.stage_residency = None;
+        contract.validate_selection(&selection).unwrap();
+        selection.parameters.stage_residency = Some(false);
+        assert!(contract.validate_selection(&selection).is_err());
+    }
+
+    #[test]
     fn rung_four_requires_deferred_materialization_not_rung_one() {
         assert_eq!(MemoryStrategy::Resident.requires(), &[]);
         assert_eq!(MemoryStrategy::StagedResidency.requires(), &[]);
@@ -6379,6 +6466,7 @@ mod tests {
             contract.validate_selection(&MemorySelection {
                 strategy: MemoryStrategy::BoundedTransformerResidency,
                 parameters: MemoryStrategyParameters {
+                    stage_residency: None,
                     decode_tile_edge: Some(512),
                     decode_overlap: Some(64),
                     attention_chunk_size: Some(256),
@@ -6418,6 +6506,7 @@ mod tests {
             .validate_selection(&MemorySelection {
                 strategy: MemoryStrategy::BoundedTransformerResidency,
                 parameters: MemoryStrategyParameters {
+                    stage_residency: None,
                     decode_tile_edge: Some(512),
                     decode_overlap: Some(64),
                     attention_chunk_size: Some(256),
@@ -6446,6 +6535,7 @@ mod tests {
             .validate_selection(&MemorySelection {
                 strategy: MemoryStrategy::BoundedTransformerResidency,
                 parameters: MemoryStrategyParameters {
+                    stage_residency: None,
                     decode_tile_edge: Some(512),
                     decode_overlap: Some(64),
                     attention_chunk_size: Some(256),
@@ -6465,6 +6555,7 @@ mod tests {
             .validate_selection(&MemorySelection {
                 strategy: MemoryStrategy::BoundedTransformerResidency,
                 parameters: MemoryStrategyParameters {
+                    stage_residency: None,
                     decode_tile_edge: Some(512),
                     decode_overlap: Some(64),
                     attention_chunk_size: Some(256),
@@ -6508,6 +6599,7 @@ mod tests {
             .validate_selection(&MemorySelection {
                 strategy: MemoryStrategy::BoundedTransformerResidency,
                 parameters: MemoryStrategyParameters {
+                    stage_residency: None,
                     decode_tile_edge: Some(512),
                     decode_overlap: Some(64),
                     attention_chunk_size: Some(256),
@@ -6569,6 +6661,7 @@ mod tests {
         let mut selection = MemorySelection {
             strategy: MemoryStrategy::BoundedTransformerResidency,
             parameters: MemoryStrategyParameters {
+                stage_residency: None,
                 decode_tile_edge: None,
                 decode_overlap: None,
                 attention_chunk_size: Some(256),
@@ -6667,6 +6760,36 @@ mod tests {
             parity: MemoryParityContract::Exact,
             parity_result: MemoryParityResult::Passed,
         }
+    }
+
+    #[test]
+    fn optional_staging_keeps_legacy_key_bytes_and_names_the_new_composition() {
+        let mut key = evidence_log_record().key;
+        key.strategy = MemoryStrategy::BoundedDecode;
+        key.engaged_composition = vec![MemoryStrategy::Resident, MemoryStrategy::BoundedDecode];
+        let legacy = evidence_key_json(&key);
+        assert_eq!(
+            legacy["parameters"],
+            serde_json::json!({
+                "decode_tile_edge":null,"decode_overlap":null,"attention_chunk_size":null,
+                "transformer_window_size":null,"transformer_window_component":null
+            })
+        );
+        key.parameters.stage_residency = Some(true);
+        key.engaged_composition
+            .insert(1, MemoryStrategy::StagedResidency);
+        let staged = evidence_key_json(&key);
+        assert_eq!(staged["parameters"]["stage_residency"], true);
+        assert_ne!(
+            serde_json::to_vec(&legacy).unwrap(),
+            serde_json::to_vec(&staged).unwrap()
+        );
+        key.parameters.stage_residency = None;
+        key.engaged_composition.remove(1);
+        assert_eq!(
+            serde_json::to_vec(&legacy).unwrap(),
+            serde_json::to_vec(&evidence_key_json(&key)).unwrap()
+        );
     }
 
     #[test]

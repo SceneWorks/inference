@@ -421,6 +421,9 @@ fn build_contract(
         },
     );
     contract.load_shape = spec.load_shape;
+    contract.phase_facts = Some(mlx_gen::gen_core::MemoryPhaseFacts::staged(
+        mlx_gen::gen_core::StagedWeightSchedule::TwoStage,
+    ));
     contract.architecture_facts = architecture_facts();
     contract.calibration = calibration;
     // SC-22667 (E1): the contract has always declared `OverlayBytes` as a formula variable and never

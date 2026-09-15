@@ -40,6 +40,7 @@ pub mod ltx_checkpoint;
 pub mod ltx_dfr;
 mod macros;
 pub mod media;
+pub mod memory_phases;
 pub mod memory_strategy;
 pub mod registry;
 pub mod residency;
@@ -166,6 +167,10 @@ pub use license::{
     CeilingBoundary, ComponentLicense, LicenseFamily, LicenseTerm, ProviderComponents,
 };
 pub use media::{AudioChunk, AudioStem, AudioTrack, HdrFrame, Image};
+pub use memory_phases::{
+    DecoderTilingRealization, DecoderWorkspaceFacts, ImagePipelineArchitecture, MemoryPhaseFacts,
+    StagedWeightSchedule, StreamedWeightFacts,
+};
 pub use memory_strategy::{
     adapter_stack_identity, adapter_stack_resident_bytes, default_memory_strategy_safety_check,
     default_registered_memory_strategy_safety_check, standard_memory_behavior_context,

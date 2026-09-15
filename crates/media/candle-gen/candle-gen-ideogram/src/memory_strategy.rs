@@ -1326,6 +1326,7 @@ fn build_contract(
             total.saturating_add(component.resident_bytes)
         });
     MemoryProviderContract {
+        phase_facts: None,
         architecture_facts: architecture_facts(spec),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
@@ -2658,6 +2659,7 @@ mod tests {
         let selection = MemorySelection {
             strategy: MemoryStrategy::BoundedTransformerResidency,
             parameters: MemoryStrategyParameters {
+                stage_residency: None,
                 decode_tile_edge: Some(DECODE_TILE_EDGE),
                 decode_overlap: Some(DECODE_OVERLAP),
                 attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),

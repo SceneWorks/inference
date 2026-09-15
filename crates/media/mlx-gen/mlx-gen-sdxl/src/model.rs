@@ -1850,9 +1850,7 @@ mlx_gen::register_generators! {
 pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
     mlx_gen::gen_core::MemoryRegistration {
         provider_id: MODEL_ID,
-        contract: |spec| {
-            crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
-        },
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
         safety_check: crate::memory_strategy::safety_check,
     };
 

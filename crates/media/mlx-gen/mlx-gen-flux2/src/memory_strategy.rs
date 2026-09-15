@@ -192,6 +192,9 @@ fn build_contract_for_spec(spec: &LoadSpec) -> MemoryProviderContract {
             cache_eviction: true,
         },
     );
+    contract.phase_facts = Some(mlx_gen::gen_core::MemoryPhaseFacts::staged(
+        mlx_gen::gen_core::StagedWeightSchedule::TwoStage,
+    ));
     contract.architecture_facts = architecture_facts(&crate::config::Flux2Config::dev());
     // The only base/edit calibration receipts are eager-load captures.  A sequential lifecycle
     // releases phases after that eager assembly; it is not deferred-materialization evidence.
@@ -221,6 +224,9 @@ fn build_dev_t2i_contract_for_spec(spec: &LoadSpec) -> MemoryProviderContract {
             cache_eviction: true,
         },
     );
+    contract.phase_facts = Some(mlx_gen::gen_core::MemoryPhaseFacts::staged(
+        mlx_gen::gen_core::StagedWeightSchedule::TwoStage,
+    ));
     contract.architecture_facts = architecture_facts(&crate::config::Flux2Config::dev());
     // See the edit contract above: this fingerprint remains bound to the measured eager load.
     contract.load_shape = LoadShape::EagerMaterialization;
@@ -320,6 +326,9 @@ fn build_dev_control_contract(spec: &LoadSpec) -> MemoryProviderContract {
             cache_eviction: true,
         },
     );
+    contract.phase_facts = Some(mlx_gen::gen_core::MemoryPhaseFacts::staged(
+        mlx_gen::gen_core::StagedWeightSchedule::TwoStage,
+    ));
     contract.architecture_facts = architecture_facts(&crate::config::Flux2Config::dev());
     contract.load_shape = spec.load_shape;
     contract.asset_facts = dev_asset_facts_with(
@@ -908,6 +917,9 @@ fn build_klein_contract(
             cache_eviction: true,
         },
     );
+    contract.phase_facts = Some(mlx_gen::gen_core::MemoryPhaseFacts::staged(
+        mlx_gen::gen_core::StagedWeightSchedule::TwoStage,
+    ));
     contract.architecture_facts = architecture_facts(&crate::config::Flux2Config::klein_9b());
     contract.load_shape = spec.load_shape;
     contract.calibration = calibration;
