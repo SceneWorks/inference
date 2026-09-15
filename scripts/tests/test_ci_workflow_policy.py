@@ -696,7 +696,7 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             errors.append(f"{prefix}: unexpected argument after requirement lock")
 
     expected_lock_counts = {
-        # 35 since SC-22261 added the StarVector terminal MLX lane;
+        # 34 since SC-22261 made StarVector preflight verify installed snapshots only;
         # 34 since sc-18932's `mlx-minimax-h3` merged alongside main's 33
         # (33 since sc-18325 added the three correctness-only decode-quality jobs;
         # 30 since sc-18315 added pinned Krea license materialization;
@@ -705,10 +705,10 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 27 since sc-17284 added the `mlx-qwen-image`, `mlx-qwen-image-pid` and
         # `mlx-qwen-image-producers` jobs; 24 since sc-17250 added the JoyCaption and
         # MOSS-TTS-Realtime jobs; 22 before).
-        MACOS_HUB_LOCK: 35,
-        # 12 since SC-22261 added the StarVector terminal Candle lane;
+        MACOS_HUB_LOCK: 34,
+        # 11 since SC-22261 removed acquisition from StarVector Candle preflight;
         # 11 since sc-18932 added the `candle-minimax-h3` job.
-        WINDOWS_HUB_LOCK: 12,
+        WINDOWS_HUB_LOCK: 11,
         # `candle-scail2-shared` is the only lane on the py314 Windows lock.
         WINDOWS_SCAIL_HUB_LOCK: 1,
         WINDOWS_MAGE_LOCK: 1,
@@ -992,13 +992,13 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def test_real_weight_python_installs_are_binary_hash_locked(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
-        # 35 / 12 after SC-22261 added the serialized StarVector terminal pair on top of
-        # sc-18932's `mlx-minimax-h3` and `candle-minimax-h3` materialization lanes. These counts
+        # 34 / 11 after SC-22261 made the StarVector terminal pair verify-only.
+        # The remaining jobs retain their materialization lanes. These counts
         # are the anti-drift half of the policy above: the shape checks pass on a job that installs
         # nothing, so only a count notices a lane that quietly stopped materializing its snapshot.
         # Bump them when you add or remove a lane.
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 35)
-        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 12)
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 34)
+        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 11)
         self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(
