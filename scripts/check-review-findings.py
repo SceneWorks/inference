@@ -106,6 +106,18 @@ def registry_at_revision(revision: str) -> str | None:
     if resolution.returncode == 1:
         raise BaseRevisionUnavailable(revision, resolution.returncode)
     resolution.check_returncode()
+    # Release branches can predate the registry's introduction. Only a successful
+    # tree lookup proving absence permits bootstrap; Git read failures stay fatal.
+    tree = subprocess.run(
+        ["git", "ls-tree", "--name-only", revision, "--", REGISTRY.as_posix()],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    if not tree.stdout:
+        return None
     result = subprocess.run(
         ["git", "show", f"{revision}:{REGISTRY.as_posix()}"],
         cwd=ROOT,
