@@ -122,6 +122,63 @@ impl StarVectorDescriptor {
     }
 }
 
+/// Return the largest generated-token budget that fits after a model's exact prefill.
+///
+/// StarVector inserts image embeddings and a fixed decoder prefix before the first sampled token.
+/// Those positions consume the same decoder context as generated tokens, so a provider must derive
+/// its advertised generation bound from the loaded prefill rather than treating context and output
+/// limits as independent numbers.
+pub fn generated_token_budget(max_context_tokens: usize, prefill_tokens: usize) -> Result<u32> {
+    let available = max_context_tokens
+        .checked_sub(prefill_tokens)
+        .ok_or_else(|| {
+            Error::InvalidRequest(format!(
+            "StarVector prefill of {prefill_tokens} tokens exhausts context of {max_context_tokens}"
+        ))
+        })?;
+    u32::try_from(available).map_err(|_| {
+        Error::InvalidRequest(format!(
+            "StarVector available generation budget {available} does not fit u32"
+        ))
+    })
+}
+
+/// Require a request to fit after the exact prefill that the loaded provider will materialize.
+pub fn validate_generated_token_budget(
+    requested_tokens: u32,
+    max_context_tokens: usize,
+    prefill_tokens: usize,
+) -> Result<u32> {
+    let available = generated_token_budget(max_context_tokens, prefill_tokens)?;
+    if requested_tokens > available {
+        return Err(Error::InvalidRequest(format!(
+            "StarVector max_new_tokens {requested_tokens} exceeds context-derived cap {available} \
+             after {prefill_tokens} prefill tokens in context {max_context_tokens}"
+        )));
+    }
+    Ok(available)
+}
+
+/// Verify that a provider's public cap is exactly the capacity left by its loaded prefill.
+///
+/// This is intentionally equality, rather than an upper-bound check: advertising less would
+/// recreate an artificial generation ceiling, while advertising more would let the cache cross
+/// its model context.
+pub fn validate_advertised_generated_token_cap(
+    advertised_tokens: u32,
+    max_context_tokens: usize,
+    prefill_tokens: usize,
+) -> Result<()> {
+    let available = generated_token_budget(max_context_tokens, prefill_tokens)?;
+    if advertised_tokens != available {
+        return Err(Error::InvalidRequest(format!(
+            "StarVector advertised max_new_tokens {advertised_tokens} disagrees with context-derived cap \
+             {available} after {prefill_tokens} prefill tokens in context {max_context_tokens}"
+        )));
+    }
+    Ok(())
+}
+
 /// A request to generate one SVG document. Image and text are independently optional, but a request
 /// needs at least one non-empty conditioning input. This allows image-to-SVG, disclosed
 /// image-plus-text guidance, and future text-to-SVG providers without overloading raster contracts.
@@ -578,6 +635,16 @@ mod tests {
 
     fn assert_status(actual: StarVectorStreamStatus, expected: StarVectorStreamStatus) {
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn generated_budget_reserves_the_entire_loaded_prefill() {
+        assert_eq!(generated_token_budget(8_192, 259).unwrap(), 7_933);
+        assert_eq!(generated_token_budget(16_000, 578).unwrap(), 15_422);
+        assert!(validate_generated_token_budget(7_934, 8_192, 259).is_err());
+        assert!(validate_advertised_generated_token_cap(4_000, 8_192, 259).is_err());
+        assert!(validate_advertised_generated_token_cap(7_933, 8_192, 259).is_ok());
+        assert!(generated_token_budget(259, 260).is_err());
     }
 
     #[test]

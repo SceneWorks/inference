@@ -18,6 +18,8 @@ const MAX_SOURCE_ARTIFACTS = 32;
 const MAX_CONTENT_INVENTORY_ENTRIES = 20000;
 const MAX_MANIFEST_ENTRIES = 100000;
 export const MAX_RECEIPT_BYTES = 8 * 1024 * 1024;
+export const OUTCOME_PARITY_PROFILE_SHA256 = "fc11cf850f46ed6553a387dd2b6e7b3471a729f40e5116bd39c8fec2c6899e35";
+const OUTCOME_PARITY_PROFILE_ID = "https://sceneworks.dev/schemas/starvector-terminal-receipt-v2-outcome-parity.json";
 const MAX_CORPUS_BYTES = 1024 * 1024;
 const FAILURE_PHASES = new Set(["admission", "setup", "provisioning", "execution", "collection", "validation", "publication", "cleanup", "workflow"]);
 const FAILURE_TUPLES = new Set(["mlx:1b", "mlx:8b", "candle-cuda:1b", "candle-cuda:8b"]);
@@ -41,6 +43,20 @@ const keys = (value, expected, label) => { if (!value || typeof value !== "objec
 const sha = (value, label) => { if (typeof value !== "string" || !SHA.test(value)) fail(`${label} must be SHA-256`); };
 const positive = (value, label) => { if (!Number.isInteger(value) || value < 1) fail(`${label} must be positive integer`); };
 const number = (value, label, min = 0, max = 1) => { if (typeof value !== "number" || !Number.isFinite(value) || value < min || value > max) fail(`${label} out of range`); };
+function normalizedRejection(reason, stage, declaredCode) {
+  if (stage === "generation_limit") {
+    if (!["token_limit", "byte_limit", "wall_time_limit"].includes(declaredCode) || typeof reason !== "string" || !reason.endsWith(` at the ${declaredCode}`)) fail("generation-limit rejection is not typed");
+    return declaredCode;
+  }
+  if (stage !== "sanitizer" || typeof reason !== "string" || !reason.startsWith("provider SVG ")) fail("sanitizer rejection is not a typed SVG policy outcome");
+  const value = reason.toLowerCase();
+  if (value.includes("malformed") || value.includes("not valid utf-8") || value.includes("not utf-8")) return "malformed_svg";
+  if (value.includes("<animate") || value.includes("<set>") || value.includes("animation")) return "animation";
+  if (value.includes("<text>")) return "text";
+  if (["external", "data:", "file:", "http:", "https:", "@import"].some((token) => value.includes(token))) return "external_io";
+  if (value.includes("<use>") || value.includes("href")) return "unsafe_href_use";
+  return "svg_policy";
+}
 const median = (values) => { const sorted = [...values].sort((a, b) => a - b); return sorted.length % 2 ? sorted[Math.floor(sorted.length / 2)] : (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2; };
 const p95 = (values) => [...values].sort((a, b) => a - b)[Math.ceil(values.length * .95) - 1];
 export function hostilePayload(index) { const n = index % 10, kind = HOSTILE[Math.floor(index / 10)], long = (char, length) => char.repeat(length + n); const payloads = { "structure-variants": [() => `noise-${n}<svg/>`, () => `<svg/>tail-${n}`, () => `<svg/><svg id="${n}"/>`, () => `<svg><path d="M${n}"`][n % 4](), "doctype-entity": n % 2 ? `<!DOCTYPE svg [<!ENTITY x "${n}">]><svg>&x;</svg>` : `<!DOCTYPE svg SYSTEM "https://invalid/${n}.dtd"><svg/>`, "pi-cdata": n % 2 ? `<?xml-stylesheet href="https://invalid/${n}"?><svg/>` : `<svg><![CDATA[<script>${n}</script>]]></svg>`, script: `<svg><script>x${n}()</script></svg>`, "foreign-object": `<svg><foreignObject>${n}</foreignObject></svg>`, "event-handler": `<svg onload="x${n}()"/>`, "css-import": `<svg><style>@import url(https://invalid/${n})</style></svg>`, animation: `<svg><animate attributeName="x" values="0;${n}"/></svg>`, "external-href": `<svg><a href="https://invalid/${n}"><path/></a></svg>`, "data-href": `<svg><image href="data:image/svg+xml,${n}"/></svg>`, "file-href": `<svg><image href="file:///tmp/${n}"/></svg>`, use: `<svg><use href="https://invalid/${n}.svg#x"/></svg>`, text: `<svg><text>${n}</text></svg>`, "byte-overrun": `<svg>${long("x", 262145)}</svg>`, "node-overrun": `<svg>${"<g/>".repeat(2001 + n)}</svg>`, "depth-overrun": `<svg>${"<g>".repeat(33 + n)}${"</g>".repeat(33 + n)}</svg>`, "attribute-total-value-overrun": n % 2 ? `<svg><path id="${long("x", 262145)}"/></svg>` : `<svg><path id="${long("i", 70000)}" class="${long("c", 70000)}" fill="${long("f", 70000)}" stroke="${long("s", 70000)}"/></svg>`, "path-command-number-overrun": n % 2 ? `<svg><path d="${"M0 0 ".repeat(100001 + n)}"/></svg>` : `<svg><path d="M${"1 ".repeat(200001 + n)}0"/></svg>`, "points-transform-overrun": n % 2 ? `<svg><polygon points="${"0,0 ".repeat(100001 + n)}"/></svg>` : `<svg><path transform="${"translate(1 1) ".repeat(100001 + n)}"/></svg>`, "coordinate-dimension-viewbox-overrun": [() => `<svg width="${1000000 + n}"/>`, () => `<svg height="${1000000 + n}"/>`, () => `<svg viewBox="0 0 ${1000000 + n} ${1000000 + n}"/>`, () => `<svg><path d="M${1000000 + n} ${1000000 + n}"/></svg>`, () => `<svg viewBox="${1000000 + n} ${1000000 + n} 10 10"/>`][n % 5]() }; return payloads[kind]; }
@@ -88,7 +104,7 @@ function run(value, refs, version = 1) {
   keys(value, ["backend", "provider_id", "tier", "device", "model", "hardware", "image_quality", "deterministic_parity", "lifecycle", "limits", "lifecycle_memory_transcript_sha256"], "run"); const runKey = `${value.backend}:${value.tier}`; if (RUNS.get(runKey) !== value.provider_id || typeof value.device !== "string" || !value.device) fail(`provider identity ${runKey}`); const model = MODELS.get(value.tier); keys(value.model, ["key", "repository", "revision", "inventory_sha256"], `${runKey} model`); if (!model || value.model.key !== model[0] || value.model.repository !== model[1] || value.model.revision !== model[2]) fail(`${runKey} model identity`); ref(refs, `runs/${runKey}/lifecycle-memory`, value.lifecycle_memory_transcript_sha256); hardware(value.hardware, runKey, value.tier, refs);
   keys(value.image_quality, ["cases"], `${runKey} quality`); if (!Array.isArray(value.image_quality.cases) || value.image_quality.cases.length !== 120) fail(`${runKey} needs 120 ordered cases`); const accepted = [], latencies = [];
   value.image_quality.cases.forEach((record, index) => { keys(record, ["case_index", "source", "source_svg_sha256", "input_png_sha256", "provider_transcript_sha256", "finish_reason", "canonical_svg_sha256", "preview_png_sha256", "accepted", "ssim", "lpips", "latency_seconds"], `${runKey} case`); const expected = sourceFor(index); keys(record.source, ["dataset", "revision", "row_index"], `${runKey} source`); if (!FINISH_REASONS.includes(record.finish_reason) || record.case_index !== index || record.source.dataset !== expected.dataset || record.source.revision !== expected.revision || record.source.row_index !== expected.row_index || typeof record.accepted !== "boolean") fail(`${runKey} case order/identity invalid`); ["source_svg_sha256", "input_png_sha256", "provider_transcript_sha256"].forEach((key) => ref(refs, `runs/${runKey}/cases/${index}/${key}`, record[key])); if (typeof record.latency_seconds !== "number" || record.latency_seconds < 0) fail(`${runKey} latency invalid`); if (record.accepted) { if (!["complete_root", "eos"].includes(record.finish_reason)) fail(`${runKey} accepted case has non-complete finish`); number(record.ssim, `${runKey} SSIM`); number(record.lpips, `${runKey} LPIPS`); ref(refs, `runs/${runKey}/cases/${index}/canonical`, record.canonical_svg_sha256); ref(refs, `runs/${runKey}/cases/${index}/preview`, record.preview_png_sha256); accepted.push(record); } else if (record.ssim !== null || record.lpips !== null || record.canonical_svg_sha256 !== null || record.preview_png_sha256 !== null) fail(`${runKey} rejected case carries output`); latencies.push(record.latency_seconds); });
-  if (accepted.length < 114 || median(accepted.map((item) => item.ssim)) < .85 || median(accepted.map((item) => item.lpips)) > .20 || ((version === 1 || value.tier === "1b") && p95(latencies) > 120)) fail(`${runKey} image threshold failed`); if (version === 2) upstreamParity(value, refs); else { keys(value.deterministic_parity, ["case_count", "cases"], `${runKey} parity`); if (value.deterministic_parity.case_count !== 20 || !Array.isArray(value.deterministic_parity.cases) || value.deterministic_parity.cases.length !== 20) fail(`${runKey} parity count`); value.deterministic_parity.cases.forEach((record, index) => { keys(record, ["case_index", "seed", "first_preview_png_sha256", "second_preview_png_sha256", "rendered_ssim"], `${runKey} parity case`); if (record.case_index !== index || !Number.isInteger(record.seed) || record.seed < 0) fail(`${runKey} parity identity`); ref(refs, `runs/${runKey}/parity/${index}/first`, record.first_preview_png_sha256); ref(refs, `runs/${runKey}/parity/${index}/second`, record.second_preview_png_sha256); number(record.rendered_ssim, `${runKey} parity SSIM`); if (record.rendered_ssim < .995) fail(`${runKey} parity threshold`); }); } keys(value.lifecycle, ["load", "unload", "reload", "memory_reported"], `${runKey} lifecycle`); if (Object.values(value.lifecycle).some((item) => item !== true)) fail(`${runKey} lifecycle incomplete`); keys(value.limits, LIMITS, `${runKey} limits`); if (Object.values(value.limits).some((item) => item !== true)) fail(`${runKey} limits incomplete`); return { runKey, inventory: value.model.inventory_sha256, validity: accepted.length / 120, median_lpips: median(accepted.map((item) => item.lpips)), cases: value.image_quality.cases };
+  if (accepted.length < 114 || median(accepted.map((item) => item.ssim)) < .85 || median(accepted.map((item) => item.lpips)) > .20 || ((version === 1 || value.tier === "1b") && p95(latencies) > 120)) fail(`${runKey} image threshold failed`); if (version === 2) { if (value.deterministic_parity?.contract_version === 2) outcomeParity(value, refs); else upstreamParity(value, refs); } else { keys(value.deterministic_parity, ["case_count", "cases"], `${runKey} parity`); if (value.deterministic_parity.case_count !== 20 || !Array.isArray(value.deterministic_parity.cases) || value.deterministic_parity.cases.length !== 20) fail(`${runKey} parity count`); value.deterministic_parity.cases.forEach((record, index) => { keys(record, ["case_index", "seed", "first_preview_png_sha256", "second_preview_png_sha256", "rendered_ssim"], `${runKey} parity case`); if (record.case_index !== index || !Number.isInteger(record.seed) || record.seed < 0) fail(`${runKey} parity identity`); ref(refs, `runs/${runKey}/parity/${index}/first`, record.first_preview_png_sha256); ref(refs, `runs/${runKey}/parity/${index}/second`, record.second_preview_png_sha256); number(record.rendered_ssim, `${runKey} parity SSIM`); if (record.rendered_ssim < .995) fail(`${runKey} parity threshold`); }); } keys(value.lifecycle, ["load", "unload", "reload", "memory_reported"], `${runKey} lifecycle`); if (Object.values(value.lifecycle).some((item) => item !== true)) fail(`${runKey} lifecycle incomplete`); keys(value.limits, LIMITS, `${runKey} limits`); if (Object.values(value.limits).some((item) => item !== true)) fail(`${runKey} limits incomplete`); return { runKey, inventory: value.model.inventory_sha256, validity: accepted.length / 120, median_lpips: median(accepted.map((item) => item.lpips)), cases: value.image_quality.cases };
 }
 // Current acceptance compares native inference to an independently executed frozen upstream.
 function upstreamParity(value, refs) {
@@ -107,6 +123,45 @@ function upstreamParity(value, refs) {
     for (const [key, role] of [["input_png_sha256", "input"], ["native_preview_png_sha256", "native-preview"], ["upstream_svg_sha256", "upstream-svg"], ["upstream_preview_png_sha256", "upstream-preview"]]) ref(refs, `runs/${runKey}/parity/${index}/${role}`, record[key]);
     number(record.rendered_ssim, `${runKey} upstream parity SSIM`);
     if (record.rendered_ssim < .995) fail(`${runKey} upstream parity threshold`);
+  });
+}
+function outcomeParity(value, refs) {
+  const parity = value.deterministic_parity, runKey = `${value.backend}:${value.tier}`;
+  keys(parity, ["contract_version", "case_count", "cases", "upstream_reference"], `${runKey} parity`);
+  if (parity.contract_version !== 2) fail(`${runKey} parity contract version`);
+  const upstream = parity.upstream_reference;
+  keys(upstream, ["implementation_repository", "implementation_revision", "checkpoint_repository", "checkpoint_revision", "checkpoint_inventory_sha256", "config_sha256", "processor_sha256", "transcript_sha256"], `${runKey} upstream reference`);
+  if (upstream.implementation_repository !== "https://github.com/joanrod/star-vector" || upstream.implementation_revision !== "0e083c1911760aa31bc576ca7f337a7f8ee605ec" || upstream.checkpoint_repository !== value.model.repository || upstream.checkpoint_revision !== value.model.revision || upstream.checkpoint_inventory_sha256 !== value.model.inventory_sha256) fail(`${runKey} upstream implementation/checkpoint identity`);
+  sha(upstream.checkpoint_inventory_sha256, `${runKey} upstream inventory`);
+  for (const [key, role] of [["config_sha256", "upstream-config"], ["processor_sha256", "upstream-processor"], ["transcript_sha256", "upstream-transcript"]]) ref(refs, `runs/${runKey}/parity/${role}`, upstream[key]);
+  if (parity.case_count !== 20 || !Array.isArray(parity.cases) || parity.cases.length !== 20) fail(`${runKey} parity count`);
+  parity.cases.forEach((record, index) => {
+    const common = ["case_index", "seed", "input_png_sha256", "native_outcome", "upstream_outcome", "native_provider_transcript_sha256"];
+    const accepted = [...common, "native_preview_png_sha256", "upstream_svg_sha256", "upstream_preview_png_sha256", "rendered_ssim"];
+    const rejected = [...accepted, "native_rejection_stage", "native_rejection_code", "native_rejection_reason", "native_raw_svg_sha256", "upstream_rejection_stage", "upstream_rejection_code", "upstream_rejection_reason", "upstream_raw_svg_sha256", "upstream_sanitizer_stdout_sha256", "upstream_sanitizer_stderr_sha256"];
+    keys(record, record.native_outcome === "accepted" ? accepted : rejected, `${runKey} outcome parity case`);
+    const qualityIndex = Math.floor(index / 5) * 30 + index % 5;
+    if (record.case_index !== index || record.seed !== index || record.input_png_sha256 !== value.image_quality.cases[qualityIndex].input_png_sha256 || record.native_outcome !== record.upstream_outcome || !["accepted", "rejected"].includes(record.native_outcome)) fail(`${runKey} outcome parity decision/input/seed identity`);
+    ref(refs, `runs/${runKey}/parity/${index}/input`, record.input_png_sha256);
+    ref(refs, `runs/${runKey}/parity/${index}/native-transcript`, record.native_provider_transcript_sha256);
+    if (record.native_outcome === "accepted") {
+      for (const [key, role] of [["native_preview_png_sha256", "native-preview"], ["upstream_svg_sha256", "upstream-svg"], ["upstream_preview_png_sha256", "upstream-preview"]]) ref(refs, `runs/${runKey}/parity/${index}/${role}`, record[key]);
+      number(record.rendered_ssim, `${runKey} outcome parity SSIM`);
+      if (record.rendered_ssim < .995) fail(`${runKey} outcome parity threshold`);
+      return;
+    }
+    const stages = new Set(["sanitizer", "generation_limit"]), sanitizerCodes = new Set(["malformed_svg", "animation", "text", "external_io", "unsafe_href_use", "svg_policy"]), limitCodes = new Set(["token_limit", "byte_limit", "wall_time_limit"]);
+    if (!stages.has(record.native_rejection_stage) || record.native_rejection_stage !== record.upstream_rejection_stage || record.native_rejection_code !== record.upstream_rejection_code || !(record.native_rejection_stage === "sanitizer" ? sanitizerCodes : limitCodes).has(record.native_rejection_code)) fail(`${runKey} outcome parity rejection class mismatch`);
+    boundedString(record.native_rejection_reason, `${runKey} native rejection reason`, 4096);
+    boundedString(record.upstream_rejection_reason, `${runKey} upstream rejection reason`, 4096);
+    if (normalizedRejection(record.native_rejection_reason, record.native_rejection_stage, record.native_rejection_code) !== record.native_rejection_code || normalizedRejection(record.upstream_rejection_reason, record.upstream_rejection_stage, record.upstream_rejection_code) !== record.upstream_rejection_code) fail(`${runKey} outcome parity rejection reason mismatch`);
+    if (record.native_preview_png_sha256 !== null || record.upstream_svg_sha256 !== null || record.upstream_preview_png_sha256 !== null || record.rendered_ssim !== null) fail(`${runKey} rejected outcome parity carries render output`);
+    ref(refs, `runs/${runKey}/parity/${index}/upstream-raw-svg`, record.upstream_raw_svg_sha256);
+    if (record.native_rejection_stage === "sanitizer") {
+      ref(refs, `runs/${runKey}/parity/${index}/native-rejected-svg`, record.native_raw_svg_sha256);
+      ref(refs, `runs/${runKey}/parity/${index}/upstream-sanitizer-stdout`, record.upstream_sanitizer_stdout_sha256);
+      ref(refs, `runs/${runKey}/parity/${index}/upstream-sanitizer-stderr`, record.upstream_sanitizer_stderr_sha256);
+    } else if (record.native_raw_svg_sha256 !== null || record.upstream_sanitizer_stdout_sha256 !== null || record.upstream_sanitizer_stderr_sha256 !== null) fail(`${runKey} generation-limit parity carries sanitizer evidence`);
   });
 }
 function hostile(value, corpus, refs) { keys(value, ["corpus_sha256", "sanitizer_version", "cases"], "hostile"); const suite = corpus.sceneworks_owned_suites.hostile_sanitizer; if (value.corpus_sha256 !== suite.content_identity_sha256 || typeof value.sanitizer_version !== "string" || !value.sanitizer_version || !Array.isArray(value.cases) || value.cases.length !== 200) fail("hostile corpus/count invalid"); value.cases.forEach((record, index) => { keys(record, ["case_index", "case_id", "input_sha256", "expected_policy", "outcome", "error_code", "canonical_svg_sha256", "preview_png_sha256", "published_paths", "staging_residue", "result_contains_inline_svg"], "hostile case"); const expected = owned("hostile")[index]; if (record.case_index !== index || record.case_id !== expected.case_id || record.input_sha256 !== expected.input_sha256 || record.expected_policy !== "reject_or_sanitize_inert" || !["rejected", "sanitized_inert"].includes(record.outcome) || typeof record.error_code !== "string" || record.result_contains_inline_svg !== false || !Array.isArray(record.published_paths) || !Array.isArray(record.staging_residue)) fail("hostile evidence invalid"); ref(refs, `hostile/${index}/input`, record.input_sha256); if (record.outcome === "rejected") { if (record.canonical_svg_sha256 !== null || record.preview_png_sha256 !== null || record.published_paths.length !== 0 || record.staging_residue.length !== 0) fail("hostile rejected artifact"); } else { if (record.published_paths.join("|") !== "canonical.svg|preview.png" || record.staging_residue.length !== 0) fail("hostile inert publication invalid"); ref(refs, `hostile/${index}/canonical`, record.canonical_svg_sha256); ref(refs, `hostile/${index}/preview`, record.preview_png_sha256); } }); }
@@ -319,7 +374,19 @@ export function validateReceipt(receipt, corpusHash, inferenceRevision, scenewor
   const expected = buildArtifactManifest(receipt, corpus, currentArtifactByteSizes);
   if (receipt.producer.artifact_manifest_sha256 !== strictV2Manifest(receipt.artifact_manifest, expected)) fail("producer manifest does not bind receipt");
 }
+export function validateReceiptProfile(receipt, profilePath, expectedSha256) {
+  if (expectedSha256 !== OUTCOME_PARITY_PROFILE_SHA256) fail("selected receipt profile hash is not the current outcome-parity contract");
+  const info = lstatSync(profilePath);
+  if (!info.isFile() || info.isSymbolicLink() || info.size < 1 || info.size > MAX_CORPUS_BYTES) fail("selected receipt profile is not a bounded regular file");
+  const bytes = readFileSync(profilePath);
+  if (hash(bytes) !== expectedSha256) fail("selected receipt profile digest mismatch");
+  const profile = JSON.parse(bytes.toString("utf8"));
+  if (profile?.$id !== OUTCOME_PARITY_PROFILE_ID || profile?.properties?.schema_version?.const !== 2 || profile?.$defs?.upstream_parity?.properties?.contract_version?.const !== 2) fail("selected receipt profile identity is not outcome parity V2");
+  if (receipt?.schema_version !== 2 || !Array.isArray(receipt.runs) || receipt.runs.some((entry) => entry?.deterministic_parity?.contract_version !== 2)) fail("selected outcome-parity profile requires receipt V2 and parity contract version 2");
+  return expectedSha256;
+}
 function option(name) { const index = process.argv.indexOf(name); if (index < 0 || !process.argv[index + 1]) fail(`missing ${name}`); return process.argv[index + 1]; }
+function optional(name) { const index = process.argv.indexOf(name); return index < 0 ? undefined : process.argv[index + 1]; }
 function readBoundedJson(path, label, maximumBytes) { const info = statSync(path); if (!info.isFile() || info.size > maximumBytes) fail(`${label} exceeds ${maximumBytes} byte input limit`); const bytes = readFileSync(path); if (bytes.byteLength > maximumBytes) fail(`${label} exceeds ${maximumBytes} byte input limit`); return JSON.parse(bytes.toString("utf8")); }
 function main() {
   const command = process.argv[2];
@@ -327,6 +394,9 @@ function main() {
   if (command === "validate-receipt") {
     const corpus = readBoundedJson(option("--corpus"), "corpus", MAX_CORPUS_BYTES);
     const receipt = readBoundedJson(option("--receipt"), "receipt", MAX_RECEIPT_BYTES);
+    const profilePath = optional("--profile-schema"), profileSha256 = optional("--profile-sha256");
+    if ((profilePath === undefined) !== (profileSha256 === undefined)) fail("selected receipt profile path and hash must be provided together");
+    if (profilePath !== undefined) validateReceiptProfile(receipt, profilePath, profileSha256);
     const evidenceRoot = receipt.schema_version === 2 ? option("--evidence-root") : undefined;
     const sizes = evidenceRoot === undefined ? undefined : artifactByteSizesFromFiles(evidenceRoot, currentArtifactReferences(receipt, corpus));
     validateReceipt(receipt, validatePlan(corpus), option("--inference-revision"), option("--sceneworks-revision"), corpus, sizes);
