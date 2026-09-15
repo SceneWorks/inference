@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use core_llm::{
     Channel, Content, DecoderArchitecture, Error as CoreError, FinishReason, ImagePreprocessing,
-    IncrementalDetok, LoadSpec, ProjectionMetadata, Result as CoreResult, StarVectorBoundedStream,
+    LoadSpec, ProjectionMetadata, Result as CoreResult, StarVectorBoundedStream,
     StarVectorDescriptor, StarVectorFinishReason, StarVectorOutput, StarVectorProvider,
     StarVectorRequest, StarVectorStreamEvent, StarVectorStreamStatus, StarVectorTier, StreamEvent,
     TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, Tokenizer,
@@ -146,6 +146,13 @@ pub struct CandleStarVector8bProvider {
     memory: StarVectorCandleMemory,
 }
 
+fn decode_generated_svg_token(
+    detok: &mut core_llm::TokenizerDecodeStream,
+    id: i32,
+) -> CoreResult<Option<String>> {
+    detok.step(id as u32)
+}
+
 impl CandleStarVector8bProvider {
     pub fn load(spec: &LoadSpec) -> CoreResult<Self> {
         if spec.quantize.is_some() {
@@ -220,26 +227,23 @@ impl CandleStarVector8bProvider {
             seed: request.text_request.seed,
             stop_tokens: vec![EOS_TOKEN_ID],
         };
-        let tokens = RefCell::new(Vec::<u32>::new());
-        let mut detok = IncrementalDetok::new();
+        let mut detok = self.tokenizer.decode_stream(true);
         let stopped = Cell::new(false);
         let failure = RefCell::new(None);
-        let tokenizer = &self.tokenizer;
         let mut decode = |event: DecodeEvent| {
             if let DecodeEvent::Token { id, step } = event {
                 if stopped.get() {
                     return;
                 }
-                tokens.borrow_mut().push(id as u32);
-                let text = match tokenizer.decode(&tokens.borrow(), true) {
-                    Ok(text) => text,
+                let delta = match decode_generated_svg_token(&mut detok, id) {
+                    Ok(delta) => delta,
                     Err(error) => {
                         *failure.borrow_mut() = Some(error);
                         stopped.set(true);
                         return;
                     }
                 };
-                let delta = detok.push(&text).unwrap_or("");
+                let delta = delta.as_deref().unwrap_or("");
                 match stream.push(delta, began.elapsed()) {
                     Ok(status @ StarVectorStreamStatus::Continue)
                     | Ok(
@@ -279,14 +283,31 @@ impl CandleStarVector8bProvider {
         if let Some(error) = failure.into_inner() {
             return Err(error);
         }
-        if stream.output().is_err() {
+        if !stopped.get() {
+            if let Some(delta) = detok.finish()? {
+                let status = stream.push_decoded_suffix(&delta, began.elapsed())?;
+                if matches!(
+                    status,
+                    StarVectorStreamStatus::Continue
+                        | StarVectorStreamStatus::Stop(StarVectorFinishReason::CompleteRoot)
+                ) {
+                    on_event(StarVectorStreamEvent::Source {
+                        text: delta,
+                        index: generated.tokens.len() as u32,
+                    });
+                }
+                stopped.set(!matches!(status, StarVectorStreamStatus::Continue));
+            }
+        }
+        if !stopped.get() {
             match generated.finish_reason {
                 DecodeFinish::StopToken => {
                     stream.finish_eos()?;
                 }
-                DecodeFinish::MaxTokens | DecodeFinish::Stopped | DecodeFinish::Cancelled => {
+                DecodeFinish::MaxTokens | DecodeFinish::Cancelled => {
                     let _ = stream.push("", began.elapsed())?;
                 }
+                DecodeFinish::Stopped => {}
             }
         }
         emit_done(stream.output()?, on_event)
@@ -563,6 +584,20 @@ mod tests {
     use super::*;
     use core_llm_testkit::{check_starvector_bounded_fixture, StarVectorProfile};
     use serde_json::json;
+
+    const STREAM_TOKENIZER_JSON: &str = r#"{
+        "version": "1.0",
+        "added_tokens": [],
+        "normalizer": null,
+        "pre_tokenizer": { "type": "Whitespace" },
+        "post_processor": null,
+        "decoder": { "type": "Sequence", "decoders": [{ "type": "Fuse" }] },
+        "model": {
+            "type": "WordLevel",
+            "vocab": { "x": 0, "y": 1 },
+            "unk_token": "x"
+        }
+    }"#;
     fn config() -> Value {
         json!({"model_type":"starvector","starcoder_model_name":"bigcode/starcoder2-7b","image_encoder_type":"siglip_384","adapter_norm":"layer_norm","image_size":384,"hidden_size":4608,"num_attention_heads":36,"num_hidden_layers":32,"num_kv_heads":4,"vocab_size":49152})
     }
@@ -639,6 +674,25 @@ mod tests {
             &core_llm_testkit::deterministic_svg_fixture(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn continuation_decode_matches_full_decode_for_a_long_sequence() {
+        let tokenizer = Tokenizer::from_json(STREAM_TOKENIZER_JSON).unwrap();
+        let ids: Vec<u32> = [0, 1].into_iter().cycle().take(4_096).collect();
+        let expected = tokenizer.decode(&ids, true).unwrap();
+        let mut detok = tokenizer.decode_stream(true);
+        let mut actual = String::new();
+        for id in ids {
+            if let Some(delta) = decode_generated_svg_token(&mut detok, id as i32).unwrap() {
+                actual.push_str(&delta);
+            }
+        }
+        if let Some(delta) = detok.finish().unwrap() {
+            actual.push_str(&delta);
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 4_096);
     }
     #[test]
     #[ignore = "sc-22261 terminal real-weight StarVector-8B CUDA campaign only"]
