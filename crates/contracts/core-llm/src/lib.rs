@@ -95,7 +95,7 @@ pub use template::{
 };
 pub use text_llm::TextLlm;
 pub use thinking::{ThinkingSegmenter, ThinkingSpan};
-pub use tokenizer::Tokenizer;
+pub use tokenizer::{Tokenizer, TokenizerDecodeStream};
 pub use tool::{ToolCall, ToolCallSegmenter, ToolSpec};
 
 /// The crate version, surfaced in conformance / diagnostic messages.

@@ -18,6 +18,21 @@ pub struct Tokenizer {
     inner: tokenizers::Tokenizer,
 }
 
+/// Stateful tokenizer decoder that emits only newly stable text for each token id.
+///
+/// Hugging Face decoders may need a small amount of surrounding token context to resolve spaces
+/// and split UTF-8 sequences. This keeps that bounded decoder state instead of re-decoding the
+/// entire generated prefix after every token.
+pub struct TokenizerDecodeStream {
+    tokenizer: Tokenizer,
+    skip_special_tokens: bool,
+    all_ids: Vec<u32>,
+    ids: Vec<u32>,
+    prefix: String,
+    prefix_index: usize,
+    emitted: String,
+}
+
 impl std::fmt::Debug for Tokenizer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Tokenizer")
@@ -158,6 +173,19 @@ impl Tokenizer {
             .map_err(|e| Error::Msg(format!("decode: {e}")))
     }
 
+    /// Start a bounded stateful decode stream for generated token ids.
+    pub fn decode_stream(&self, skip_special_tokens: bool) -> TokenizerDecodeStream {
+        TokenizerDecodeStream {
+            tokenizer: self.clone(),
+            skip_special_tokens,
+            all_ids: Vec::new(),
+            ids: Vec::new(),
+            prefix: String::new(),
+            prefix_index: 0,
+            emitted: String::new(),
+        }
+    }
+
     /// Total vocabulary size (including added tokens).
     pub fn vocab_size(&self) -> usize {
         self.inner.get_vocab_size(true)
@@ -169,6 +197,47 @@ impl Tokenizer {
     /// decode-table policy in the workspace.
     pub fn constraint_decode_table(&self) -> ConstraintDecodeTable {
         build_constraint_decode_table(&self.inner)
+    }
+}
+
+impl TokenizerDecodeStream {
+    /// Decode one token id and return only the newly stable text, when any is available.
+    pub fn step(&mut self, id: u32) -> Result<Option<String>> {
+        self.all_ids.push(id);
+        let delta = tokenizers::tokenizer::step_decode_stream(
+            &self.tokenizer.inner,
+            id,
+            self.skip_special_tokens,
+            &mut self.ids,
+            &mut self.prefix,
+            &mut self.prefix_index,
+        )
+        .map_err(|e| Error::Msg(format!("decode stream: {e}")))?;
+        if let Some(delta) = &delta {
+            self.emitted.push_str(delta);
+        }
+        Ok(delta)
+    }
+
+    /// Finish with one full-prefix decode and return any stable suffix the stream retained.
+    ///
+    /// This preserves the previous end-of-generation behavior for EOS and split UTF-8: a trailing
+    /// replacement-character run remains withheld, while all stable decoded bytes are emitted.
+    pub fn finish(&mut self) -> Result<Option<String>> {
+        let decoded = self
+            .tokenizer
+            .decode(&self.all_ids, self.skip_special_tokens)?;
+        let stable = decoded.trim_end_matches(char::REPLACEMENT_CHARACTER);
+        let Some(delta) = stable.strip_prefix(&self.emitted) else {
+            return Err(Error::Msg(
+                "decode stream: final decode rewrote emitted text".into(),
+            ));
+        };
+        if delta.is_empty() {
+            return Ok(None);
+        }
+        self.emitted.push_str(delta);
+        Ok(Some(delta.to_owned()))
     }
 }
 
@@ -243,6 +312,26 @@ mod tests {
     }
 
     #[test]
+    fn decode_stream_matches_full_decode_without_quadratic_prefix_storage() {
+        let t = Tokenizer::from_json(ADDED_TOKENS_JSON).unwrap();
+        let ids: Vec<u32> = [1, 2, 4, 3, 5].into_iter().cycle().take(5_000).collect();
+        let expected = t.decode(&ids, true).unwrap();
+        let mut stream = t.decode_stream(true);
+        let mut actual = String::new();
+        for id in ids {
+            if let Some(delta) = stream.step(id).unwrap() {
+                actual.push_str(&delta);
+            }
+        }
+        if let Some(delta) = stream.finish().unwrap() {
+            actual.push_str(&delta);
+        }
+        assert_eq!(actual, expected);
+        assert!(std::str::from_utf8(actual.as_bytes()).is_ok());
+        assert!(!actual.contains("<eos>"));
+    }
+
+    #[test]
     fn constraint_table_covers_vocab() {
         let t = tiny();
         let table = t.constraint_decode_table();
@@ -267,6 +356,31 @@ mod tests {
         assert_eq!(tokenizer.vocab_size(), 2);
         assert_eq!(tokenizer.encode("<|endoftext|>", false).unwrap(), vec![0]);
         assert_eq!(tokenizer.decode(&[0], true).unwrap(), "");
+    }
+
+    #[test]
+    fn decode_stream_resolves_split_utf8_and_drops_an_incomplete_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let vocab = dir.path().join("vocab.json");
+        let merges = dir.path().join("merges.txt");
+        let config = dir.path().join("tokenizer_config.json");
+        fs::write(&vocab, r#"{"<|endoftext|>":0,"Ã":1,"©":2}"#).unwrap();
+        fs::write(&merges, "#version: 0.2\n").unwrap();
+        fs::write(
+            &config,
+            r#"{"added_tokens_decoder":{"0":{"content":"<|endoftext|>","lstrip":false,"normalized":false,"rstrip":false,"single_word":false,"special":true}}}"#,
+        )
+        .unwrap();
+        let tokenizer = Tokenizer::from_hf_byte_level_bpe(vocab, merges, config).unwrap();
+
+        let mut complete = tokenizer.decode_stream(true);
+        assert_eq!(complete.step(1).unwrap(), None);
+        assert_eq!(complete.step(2).unwrap().as_deref(), Some("é"));
+        assert_eq!(complete.finish().unwrap(), None);
+
+        let mut incomplete = tokenizer.decode_stream(true);
+        assert_eq!(incomplete.step(1).unwrap(), None);
+        assert_eq!(incomplete.finish().unwrap(), None);
     }
 
     // Like TINY_JSON but with added tokens: id 4 is a special added token (an EOS marker), id 5 is
