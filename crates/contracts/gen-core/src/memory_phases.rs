@@ -75,6 +75,11 @@ pub enum ImagePipelineArchitecture {
     SdxlUnetWithDualClip,
     /// ZImage transformer uses fused SDPA; its live tensor workspace grows with image tokens.
     ZImageDit,
+    /// SANA 1.6B Linear-DiT, fixed-length Gemma conditioning and the six-stage DC-AE.
+    /// Base CFG can retain two forward graphs; Sprint uses one embedded-guidance forward.
+    SanaLinearDit {
+        classifier_free_guidance: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
