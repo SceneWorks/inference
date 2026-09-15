@@ -525,9 +525,22 @@ fn contract_with_asset_facts(
         },
     );
     contract.load_shape = spec.load_shape;
-    contract.phase_facts = Some(mlx_gen::gen_core::MemoryPhaseFacts::staged(
-        mlx_gen::gen_core::StagedWeightSchedule::ThreeStage,
-    ));
+    contract.phase_facts = Some(mlx_gen::gen_core::MemoryPhaseFacts {
+        architecture: Some(
+            mlx_gen::gen_core::ImagePipelineArchitecture::SanaLinearDit {
+                classifier_free_guidance: provider_id == crate::model::MODEL_ID,
+            },
+        ),
+        staged_weights: mlx_gen::gen_core::StagedWeightSchedule::ThreeStage,
+        transformer_stream: None,
+        decoder_workspace: Some(mlx_gen::gen_core::DecoderWorkspaceFacts {
+            tiling: mlx_gen::gen_core::DecoderTilingRealization::WholeTail,
+            activation_dtype_width: 4,
+            channels: vec![1024, 1024, 512, 512, 256, 128],
+            input_channels: vec![32, 1024, 1024, 512, 512, 256],
+            spatial_divisors: vec![32, 16, 8, 4, 2, 1],
+        }),
+    });
     contract.architecture_facts = architecture_facts(provider_id);
     let staged = matches!(spec.offload_policy, OffloadPolicy::Sequential);
     // Rung 4 needs BOTH load-time facts AND rung 1, whose own availability IS the `Sequential`
@@ -1468,6 +1481,28 @@ mod tests {
                         let label = format!("{provider} {quant:?} {policy:?} {shape:?}");
                         assert_eq!(resolved_artifact_tier(&spec).unwrap(), quant, "{label}");
                         let contract = memory_strategy_contract(provider, &spec).unwrap();
+                        let phase = contract.phase_facts.as_ref().unwrap();
+                        assert_eq!(
+                            phase.architecture,
+                            Some(
+                                mlx_gen::gen_core::ImagePipelineArchitecture::SanaLinearDit {
+                                    classifier_free_guidance: provider == crate::MODEL_ID,
+                                }
+                            ),
+                            "{label}"
+                        );
+                        let decoder = phase.decoder_workspace.as_ref().unwrap();
+                        assert_eq!(
+                            decoder.channels,
+                            crate::config::DcAeConfig::sana_f32c32()
+                                .block_out_channels
+                                .iter()
+                                .rev()
+                                .map(|c| *c as u32)
+                                .collect::<Vec<_>>()
+                        );
+                        assert_eq!(decoder.activation_dtype_width, 4);
+
                         let identity = contract
                             .calibration
                             .as_ref()
