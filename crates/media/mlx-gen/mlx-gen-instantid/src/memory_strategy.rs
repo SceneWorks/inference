@@ -79,6 +79,9 @@ pub fn provider_contract(tier: MemoryNumericTier) -> MemoryProviderContract {
     // IP tokens onto a stock SDXL base, loaded through `mlx_gen_sdxl::load_unet_dtype` with
     // `UNetConfig::sdxl_base()` and `mlx_gen_sdxl::load_vae`. The axes are therefore the shared SDXL
     // derivation's, at this crate's own `DTYPE = Dtype::Float16` activation width.
+    contract.phase_facts = Some(mlx_gen::gen_core::MemoryPhaseFacts::staged(
+        mlx_gen::gen_core::StagedWeightSchedule::ThreeStage,
+    ));
     contract.architecture_facts = mlx_gen_sdxl::config::architecture_facts(
         &mlx_gen_sdxl::UNetConfig::sdxl_base(),
         &mlx_gen_sdxl::VaeConfig::sdxl_base(),

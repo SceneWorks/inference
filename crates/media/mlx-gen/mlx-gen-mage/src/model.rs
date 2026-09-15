@@ -609,6 +609,9 @@ fn memory_strategy_contract_with_adapters(
         MemoryFormulaKind::PhaseEnvelope { phases, variables }
     };
     contract.load_shape = load_shape;
+    contract.phase_facts = Some(mlx_gen::gen_core::MemoryPhaseFacts::staged(
+        mlx_gen::gen_core::StagedWeightSchedule::ThreeStage,
+    ));
     contract.architecture_facts = architecture_facts(spec);
     // Decided by the caller, never here: a loaded route binds its identity to the artifact it
     // opened (`production_calibration_identity`), a weights-free surface publishes the conformance

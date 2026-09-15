@@ -1280,6 +1280,7 @@ fn evidence(
             // The exact parameters the measured row RAN with, taken from the request block rather
             // than from the declared defaults, so a record can never claim a cell it did not drive.
             parameters: MemoryStrategyParameters {
+                stage_residency: None,
                 decode_tile_edge: memory.tile_vae_decode.then(|| {
                     memory
                         .decode_tile_edge

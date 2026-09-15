@@ -395,6 +395,9 @@ fn contract_with_asset_facts(
         },
     );
     contract.load_shape = spec.load_shape;
+    contract.phase_facts = Some(mlx_gen::gen_core::MemoryPhaseFacts::staged(
+        mlx_gen::gen_core::StagedWeightSchedule::ThreeStage,
+    ));
     contract.architecture_facts = architecture_facts();
     contract.calibration = Some(MemoryCalibrationIdentity::new(
         MEMORY_CALIBRATION_FINGERPRINT,
@@ -813,6 +816,7 @@ pub(crate) fn stage_residency(req: &GenerationRequest, default_staged: bool) -> 
 /// value (the conformance tests and the SceneWorks evidence writer both key off this).
 pub fn declared_parameters() -> mlx_gen::gen_core::MemoryStrategyParameters {
     mlx_gen::gen_core::MemoryStrategyParameters {
+        stage_residency: None,
         decode_tile_edge: Some(DECODE_TILE_EDGE),
         decode_overlap: Some(DECODE_OVERLAP),
         attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),

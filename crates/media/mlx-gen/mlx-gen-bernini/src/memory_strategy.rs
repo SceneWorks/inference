@@ -2423,6 +2423,7 @@ const _RUNG_ONE_IS_UNCONDITIONAL: () = ();
 /// value (the conformance tests and the SceneWorks evidence writer both key off this).
 pub fn declared_parameters() -> mlx_gen::gen_core::MemoryStrategyParameters {
     mlx_gen::gen_core::MemoryStrategyParameters {
+        stage_residency: None,
         decode_tile_edge: Some(DECODE_TILE_EDGE),
         decode_overlap: Some(DECODE_OVERLAP),
         attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),

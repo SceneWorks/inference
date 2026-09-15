@@ -2254,6 +2254,7 @@ fn build_krea_turbo_memory_strategy_contract(spec: &LoadSpec) -> gen_core::Memor
     // real imported-file run is measured rather than silently relabeling Dir evidence.
     let streamable = spec.adapters.is_empty() && matches!(spec.weights, WeightsSource::Dir(_));
     MemoryProviderContract {
+        phase_facts: None,
         architecture_facts: architecture_facts(spec),
         provider_id: KREA_2_TURBO_ID.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
@@ -5325,6 +5326,7 @@ mod tests {
             component_precision_floors: &[],
         };
         let parameters = gen_core::MemoryStrategyParameters {
+            stage_residency: None,
             decode_tile_edge: Some(512),
             decode_overlap: Some(128),
             attention_chunk_size: Some(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32),
