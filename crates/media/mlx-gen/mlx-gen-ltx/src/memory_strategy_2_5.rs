@@ -501,6 +501,7 @@ fn build_contract(
         ));
     }
     Ok(MemoryProviderContract {
+        phase_facts: None,
         architecture_facts: architecture_facts(spec),
         provider_id: LTX_2_5_MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {

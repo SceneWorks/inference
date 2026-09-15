@@ -673,6 +673,46 @@ pub fn memory_strategy_contract(
     )
 }
 
+fn phase_facts(spec: &LoadSpec) -> CoreResult<mlx_gen::gen_core::MemoryPhaseFacts> {
+    use mlx_gen::asset_facts::{
+        indexed_block_key, projected_safetensors_tensors, streamed_weight_facts, ResidentProjection,
+    };
+    use mlx_gen::gen_core::{
+        DecoderTilingRealization, DecoderWorkspaceFacts, MemoryPhaseFacts, StagedWeightSchedule,
+    };
+    let config = crate::config::VaeConfig::sdxl_base();
+    let mut facts = MemoryPhaseFacts {
+        architecture: Some(mlx_gen::gen_core::ImagePipelineArchitecture::SdxlUnetWithDualClip),
+        staged_weights: StagedWeightSchedule::TwoStage,
+        transformer_stream: None,
+        // load_vae casts to f32; the upsampling constructor uses this same preset.
+        decoder_workspace: Some(DecoderWorkspaceFacts {
+            tiling: DecoderTilingRealization::LayerwiseConvolution,
+            activation_dtype_width: 4,
+            channels: config
+                .block_out_channels
+                .iter()
+                .rev()
+                .map(|value| *value as u32)
+                .collect(),
+            input_channels: vec![512, 512, 512, 256],
+            spatial_divisors: vec![8, 4, 2, 1],
+        }),
+    };
+    let Some(root) = mlx_gen::architecture_facts::materialized_root(spec) else {
+        return Ok(facts);
+    };
+    // Resolve the same one file as load_unet, never both dtype alternatives.
+    if let Ok(file) = crate::loader::resolve_unet_weight_file(root, mlx_rs::Dtype::Float16) {
+        let tensors = projected_safetensors_tensors(file, |_| ResidentProjection::Bfloat16)?;
+        facts.transformer_stream = streamed_weight_facts(&tensors, |key| {
+            let (parent, _) = key.split_once(".transformer_blocks.")?;
+            indexed_block_key(key, &format!("{parent}.transformer_blocks."))
+        })?;
+    }
+    Ok(facts)
+}
+
 /// Provider-local identities of the auxiliary networks an SDXL load can keep resident.
 const CONTROL_COMPONENT_ID: &str = "sdxl.control.branches";
 const IP_ADAPTER_COMPONENT_ID: &str = "sdxl.ip_adapter.image_encoder_resampler_and_kv";
@@ -959,6 +999,7 @@ fn contract_with_asset_facts_and_streamability(
             cache_eviction: true,
         },
     );
+    contract.phase_facts = Some(phase_facts(spec)?);
     contract.load_shape = spec.load_shape;
     // Epic SC-22657 (E2): the axes this crate's own U-Net and VAE constants declare. `model.rs`
     // pins `DTYPE = Dtype::Float16` for the U-Net and both CLIP towers, so fp16 is the real
@@ -1454,6 +1495,7 @@ pub(crate) fn default_stage_residency(spec: &LoadSpec) -> bool {
 /// value (the conformance tests and the SceneWorks evidence writer both key off this).
 pub fn declared_parameters() -> mlx_gen::gen_core::MemoryStrategyParameters {
     mlx_gen::gen_core::MemoryStrategyParameters {
+        stage_residency: None,
         decode_tile_edge: None,
         decode_overlap: None,
         // Rungs 2 and 3 are `Missing`, so this provider declares no decode or attention parameter.

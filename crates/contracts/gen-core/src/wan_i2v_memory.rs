@@ -2127,6 +2127,7 @@ fn contract(
         MemoryPhase::Decode,
     ];
     MemoryProviderContract {
+        phase_facts: None,
         architecture_facts: crate::MemoryArchitectureFacts::default(),
         provider_id: provider_id.to_owned(),
         backend: backend.realization(),
@@ -3083,6 +3084,7 @@ pub fn selection_from_request(
     let selection = MemorySelection {
         strategy,
         parameters: MemoryStrategyParameters {
+            stage_residency: None,
             decode_tile_edge: memory.decode_tile_edge,
             decode_overlap: memory.decode_overlap,
             attention_chunk_size: memory.attention_chunk_size,

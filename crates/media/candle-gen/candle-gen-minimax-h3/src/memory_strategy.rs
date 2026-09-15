@@ -830,6 +830,7 @@ fn production_calibration_fingerprint(components: &ComponentBytes) -> Option<Str
 
 fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
     MemoryProviderContract {
+        phase_facts: None,
         architecture_facts: architecture_facts(components),
         provider_id: MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {

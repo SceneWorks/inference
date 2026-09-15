@@ -540,6 +540,7 @@ fn memory_strategy_contract_with_asset_facts(
         }
     };
     Ok(MemoryProviderContract {
+        phase_facts: Some(phase_facts(spec)?),
         architecture_facts: architecture_facts(),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
@@ -616,6 +617,43 @@ fn memory_strategy_contract_with_asset_facts(
         asset_facts,
         runtime: MemoryRuntimeSemantics::default(),
     })
+}
+
+fn phase_facts(spec: &LoadSpec) -> CoreResult<mlx_gen::gen_core::MemoryPhaseFacts> {
+    use mlx_gen::asset_facts::{
+        indexed_block_key, layerwise_decoder_workspace, projected_safetensors_tensors,
+        streamed_weight_facts, ResidentProjection,
+    };
+    let mut facts = mlx_gen::gen_core::MemoryPhaseFacts {
+        architecture: Some(mlx_gen::gen_core::ImagePipelineArchitecture::ZImageDit),
+        staged_weights: mlx_gen::gen_core::StagedWeightSchedule::ThreeStage,
+        transformer_stream: None,
+        decoder_workspace: None,
+    };
+    let Some(root) = mlx_gen::architecture_facts::materialized_root(spec) else {
+        return Ok(facts);
+    };
+    let projection = |_: &mlx_gen::gen_core::SafetensorsTensorHeader| match spec.quantize {
+        Some(quant) => ResidentProjection::GroupQuantized {
+            bits: quant.bits(),
+            group_size: crate::quant::GROUP_SIZE as usize,
+        },
+        None => ResidentProjection::Stored,
+    };
+    if let Ok(tensors) = projected_safetensors_tensors(root.join("transformer"), projection) {
+        // Only the main stack is rematerialized by ZImageBlockStream; refiners and projections stay.
+        facts.transformer_stream =
+            streamed_weight_facts(&tensors, |key| indexed_block_key(key, "layers."))?;
+    }
+    if let Ok(headers) =
+        mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(root.join("vae"))
+    {
+        // decode/decoded_tiled promote latents with f32 scaling and shift arrays. The shared
+        // decoder tail has three 2x upsamplers, regardless of stored VAE weight precision.
+        facts.decoder_workspace =
+            layerwise_decoder_workspace(&headers, "decoder.up_blocks.", &[8, 4, 2, 1], 4);
+    }
+    Ok(facts)
 }
 
 /// Component `.safetensors` sums for the spec's snapshot root. A [`WeightsSource::File`] base source
@@ -1030,6 +1068,7 @@ fn z_image_generation_memory(
 /// value (the conformance tests and the SceneWorks evidence writer both key off this).
 pub fn declared_parameters() -> MemoryStrategyParameters {
     MemoryStrategyParameters {
+        stage_residency: None,
         decode_tile_edge: Some(DECODE_TILE_EDGE),
         decode_overlap: Some(DECODE_OVERLAP),
         attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),

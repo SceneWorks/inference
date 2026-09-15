@@ -1395,6 +1395,7 @@ fn build_lens_memory_strategy_contract_with_eligibility(
         .collect();
 
     MemoryProviderContract {
+        phase_facts: None,
         architecture_facts: architecture_facts(spec),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
@@ -4357,6 +4358,7 @@ mod integration_tests {
             selection: gen_core::MemorySelection {
                 strategy: gen_core::MemoryStrategy::BoundedTransformerResidency,
                 parameters: gen_core::MemoryStrategyParameters {
+                    stage_residency: None,
                     decode_tile_edge: Some(DECODE_TILE_EDGE),
                     decode_overlap: Some(DECODE_OVERLAP),
                     attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),
@@ -4455,6 +4457,7 @@ mod integration_tests {
         let selection = select(
             gen_core::MemoryStrategy::BoundedTransformerResidency,
             gen_core::MemoryStrategyParameters {
+                stage_residency: None,
                 decode_tile_edge: Some(DECODE_TILE_EDGE),
                 decode_overlap: Some(DECODE_OVERLAP),
                 attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),

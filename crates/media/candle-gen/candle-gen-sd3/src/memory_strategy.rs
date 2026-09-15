@@ -1040,6 +1040,7 @@ fn build_contract(
             total.saturating_add(component.resident_bytes)
         });
     MemoryProviderContract {
+        phase_facts: None,
         architecture_facts: architecture_facts(route, spec),
         provider_id: route.provider_id().to_owned(),
         backend: MemoryBackendRealization::CandleCuda {

@@ -1062,6 +1062,9 @@ fn contract_with_asset_facts(
     // added-conditioning projection widens ([`mlx_gen_sdxl::UNetConfig::kolors`]) — so the axes come
     // from the shared SDXL derivation rather than a second, driftable copy here. `registry.rs`
     // builds the residency at `Dtype::Float16`, which is the denoiser's real activation width.
+    contract.phase_facts = Some(mlx_gen::gen_core::MemoryPhaseFacts::staged(
+        mlx_gen::gen_core::StagedWeightSchedule::TwoStage,
+    ));
     contract.architecture_facts = mlx_gen_sdxl::config::architecture_facts(
         &mlx_gen_sdxl::UNetConfig::kolors(),
         &mlx_gen_sdxl::VaeConfig::sdxl_base(),
@@ -1590,6 +1593,7 @@ pub(crate) fn default_stage_residency(spec: &LoadSpec) -> bool {
 /// value (the conformance tests and the SceneWorks evidence writer both key off this).
 pub fn declared_parameters() -> mlx_gen::gen_core::MemoryStrategyParameters {
     mlx_gen::gen_core::MemoryStrategyParameters {
+        stage_residency: None,
         decode_tile_edge: None,
         decode_overlap: None,
         // Rungs 2 and 3 are `Missing`, so this provider declares no decode or attention parameter.

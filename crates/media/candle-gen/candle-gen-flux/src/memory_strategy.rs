@@ -428,6 +428,7 @@ pub fn reference_backbone_contract(
         .collect();
 
     Ok(MemoryProviderContract {
+        phase_facts: None,
         architecture_facts: architecture_facts(provider_id, spec),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {

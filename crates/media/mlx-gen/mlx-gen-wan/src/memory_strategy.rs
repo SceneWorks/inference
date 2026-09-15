@@ -761,6 +761,7 @@ fn build_contract(
         MemoryPhase::Decode,
     ];
     Ok(MemoryProviderContract {
+        phase_facts: None,
         architecture_facts: architecture_facts(spec),
         provider_id: MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {

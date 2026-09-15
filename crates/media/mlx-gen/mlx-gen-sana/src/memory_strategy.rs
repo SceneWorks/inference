@@ -525,6 +525,9 @@ fn contract_with_asset_facts(
         },
     );
     contract.load_shape = spec.load_shape;
+    contract.phase_facts = Some(mlx_gen::gen_core::MemoryPhaseFacts::staged(
+        mlx_gen::gen_core::StagedWeightSchedule::ThreeStage,
+    ));
     contract.architecture_facts = architecture_facts(provider_id);
     let staged = matches!(spec.offload_policy, OffloadPolicy::Sequential);
     // Rung 4 needs BOTH load-time facts AND rung 1, whose own availability IS the `Sequential`
@@ -869,6 +872,7 @@ fn begin_with_cleanup(
 
 pub fn declared_parameters() -> mlx_gen::gen_core::MemoryStrategyParameters {
     mlx_gen::gen_core::MemoryStrategyParameters {
+        stage_residency: None,
         decode_tile_edge: Some(DECODE_TILE_EDGE as u32),
         decode_overlap: Some(DECODE_OVERLAP as u32),
         attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),

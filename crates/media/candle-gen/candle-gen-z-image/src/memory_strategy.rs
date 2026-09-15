@@ -1004,6 +1004,7 @@ pub(crate) fn provider_contract(
             decoder_bytes: components.vae,
             overlay_bytes: reference_encoder,
         },
+        phase_facts: None,
         architecture_facts: architecture_facts(spec),
         runtime: gen_core::MemoryRuntimeSemantics::default(),
     })

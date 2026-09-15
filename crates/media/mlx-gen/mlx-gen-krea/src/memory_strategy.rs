@@ -275,6 +275,9 @@ fn memory_strategy_contract_with_asset_facts(
         MemoryFormulaVariable::TransformerWindowSize,
     ];
     Ok(MemoryProviderContract {
+        phase_facts: Some(mlx_gen::gen_core::MemoryPhaseFacts::staged(
+            mlx_gen::gen_core::StagedWeightSchedule::TwoStage,
+        )),
         architecture_facts: crate::block_memory_strategy::architecture_facts(spec),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {

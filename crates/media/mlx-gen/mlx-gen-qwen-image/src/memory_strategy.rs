@@ -336,6 +336,9 @@ fn contract_with_asset_facts_and_streamability(
         },
     );
     contract.load_shape = spec.load_shape;
+    contract.phase_facts = Some(mlx_gen::gen_core::MemoryPhaseFacts::staged(
+        mlx_gen::gen_core::StagedWeightSchedule::TwoStage,
+    ));
     contract.architecture_facts = architecture_facts(provider_id);
     let phases = vec![
         MemoryPhase::Conditioning,

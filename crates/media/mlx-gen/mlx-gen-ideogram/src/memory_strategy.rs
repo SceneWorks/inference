@@ -422,6 +422,9 @@ fn contract_with_asset_facts(
         },
     );
     contract.load_shape = spec.load_shape;
+    contract.phase_facts = Some(mlx_gen::gen_core::MemoryPhaseFacts::staged(
+        mlx_gen::gen_core::StagedWeightSchedule::TwoStage,
+    ));
     contract.architecture_facts = architecture_facts();
     // Decided by the CALLER, never here: production binds the artifact-proven
     // `production_calibration_identity`, the weights-free surface binds `static_behavior_identity`,

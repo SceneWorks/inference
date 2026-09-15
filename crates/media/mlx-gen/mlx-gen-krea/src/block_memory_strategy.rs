@@ -530,6 +530,9 @@ fn memory_strategy_contract_with_components(
             cache_eviction: true,
         },
     );
+    contract.phase_facts = Some(mlx_gen::gen_core::MemoryPhaseFacts::staged(
+        mlx_gen::gen_core::StagedWeightSchedule::TwoStage,
+    ));
     contract.load_shape = spec.load_shape;
     contract.architecture_facts = architecture_facts(spec);
     contract.formula = MemoryFormulaKind::PhaseEnvelope {

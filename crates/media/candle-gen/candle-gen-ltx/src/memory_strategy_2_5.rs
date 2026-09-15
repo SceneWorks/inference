@@ -385,6 +385,7 @@ fn build_contract(
         variables.push(MemoryFormulaVariable::DecodeTileArea);
     }
     Ok(MemoryProviderContract {
+        phase_facts: None,
         architecture_facts: architecture_facts(spec, bundle),
         provider_id: LTX_2_5_DISTILLED_MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {

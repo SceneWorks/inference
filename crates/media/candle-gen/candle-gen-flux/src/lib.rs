@@ -918,6 +918,7 @@ mod tests {
         let selection = gen_core::MemorySelection {
             strategy,
             parameters: gen_core::MemoryStrategyParameters {
+                stage_residency: None,
                 decode_tile_edge: memory.decode_tile_edge,
                 decode_overlap: memory.decode_overlap,
                 attention_chunk_size: memory.attention_chunk_size,

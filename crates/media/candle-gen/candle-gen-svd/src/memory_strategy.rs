@@ -428,6 +428,7 @@ fn build_contract(spec: &LoadSpec, facts: MemoryAssetFacts) -> MemoryProviderCon
         MemoryPhase::Decode,
     ];
     MemoryProviderContract {
+        phase_facts: None,
         architecture_facts: architecture_facts(spec),
         provider_id: crate::MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
