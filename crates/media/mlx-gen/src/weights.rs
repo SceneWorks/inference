@@ -113,6 +113,33 @@ impl Weights {
         Self::materialize_and_verify(&mut named)
     }
 
+    /// [`Self::materialize`]'s evaluate-and-verify pass over arrays that have already **left** a
+    /// map — the same batching and the same sc-22414 GPU-view check, for a loader whose source
+    /// handles must be verified later than its build (a resident DiT verifies its block bodies only
+    /// after the AdaLN eviction, so the check never raises the phase peak).
+    pub fn materialize_named<'a>(named: &mut [(&'a str, &'a Array)]) -> Result<()> {
+        Self::materialize_and_verify(named)
+    }
+
+    /// Handle copies of every tensor read through [`Self::get`] / [`Self::require`] so far that is
+    /// still in the map, in sorted-key order. `Array` is refcounted, so these are the **same
+    /// buffers** the built model holds — retaining them adds no bytes, and a loader can hand them
+    /// to [`Self::materialize_named`] at the point in its residency schedule where the load must be
+    /// verified without changing what is resident.
+    pub fn accessed_entries(&self) -> Vec<(String, Array)> {
+        let accessed = self.accessed.borrow();
+        let mut named: Vec<(String, Array)> = accessed
+            .iter()
+            .filter_map(|key| {
+                self.tensors
+                    .get(key)
+                    .map(|array| (key.clone(), array.clone()))
+            })
+            .collect();
+        named.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        named
+    }
+
     /// Load a safetensors file while decoding `F8_E4M3` payloads to bf16.
     ///
     /// MLX has no fp8 storage dtype, but does expose byte-accurate E4M3
@@ -539,6 +566,30 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("model.safetensors"), "unexpected: {err}");
+    }
+
+    /// `accessed_entries` returns exactly the read keys that are still mapped — a key read and then
+    /// removed is not reported, an unread key never is — as refcounted handles of the same buffers.
+    /// MUTATION: report every key (drop the `accessed` filter) — RED on the unread key.
+    #[test]
+    fn accessed_entries_are_the_read_keys_still_in_the_map() {
+        let mut w = Weights::empty();
+        w.insert("b.weight", Array::from_slice(&[1.0f32, 2.0], &[2]));
+        w.insert("a.weight", Array::from_slice(&[3.0f32], &[1]));
+        w.insert("unread.weight", Array::from_f32(9.0));
+        w.insert("gone.weight", Array::from_f32(4.0));
+        w.require("b.weight").unwrap();
+        w.get("a.weight").unwrap();
+        w.require("gone.weight").unwrap();
+        w.remove("gone.weight");
+
+        let entries = w.accessed_entries();
+        let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["a.weight", "b.weight"], "sorted, read, still mapped");
+        assert_eq!(entries[1].1.as_slice::<f32>(), &[1.0, 2.0]);
+
+        let mut named: Vec<(&str, &Array)> = entries.iter().map(|(k, a)| (k.as_str(), a)).collect();
+        Weights::materialize_named(&mut named).unwrap();
     }
 
     #[test]
