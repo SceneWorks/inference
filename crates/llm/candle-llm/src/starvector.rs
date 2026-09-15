@@ -92,26 +92,16 @@ enum DecodedSvgToken {
     Source(String),
 }
 
-/// Decode one sampled continuation token against the complete generated-token history.
-///
-/// The prompt is intentionally absent from `generated_ids`: it is seeded into the bounded source
-/// exactly once by the provider. Re-decoding the growing continuation is required for byte-level
-/// BPE fragments, while `skip_special_tokens = true` prevents genuine tokenizer controls from
-/// becoming SVG source. Non-special added vocabulary remains ordinary model output and therefore
-/// still reaches the fail-closed SVG boundary.
+/// Decode one sampled continuation token with bounded tokenizer state.
 fn decode_generated_svg_token(
-    tokenizer: &core_llm::Tokenizer,
-    generated_ids: &mut Vec<u32>,
-    detok: &mut core_llm::IncrementalDetok,
+    detok: &mut core_llm::TokenizerDecodeStream,
     id: i32,
 ) -> core_llm::Result<DecodedSvgToken> {
     if id == EOS_TOKEN_ID {
         return Ok(DecodedSvgToken::Eos);
     }
-    generated_ids.push(id as u32);
-    let decoded = tokenizer.decode(generated_ids, true)?;
-    Ok(match detok.push(&decoded) {
-        Some(delta) => DecodedSvgToken::Source(delta.to_owned()),
+    Ok(match detok.step(id as u32)? {
+        Some(delta) => DecodedSvgToken::Source(delta),
         None => DecodedSvgToken::Hidden,
     })
 }
@@ -571,8 +561,7 @@ impl core_llm::StarVectorProvider for CandleStarVectorProvider {
             }
             let mut history = self.prompt.clone();
             let mut rng = SplitMix64::new(req.text_request.seed.unwrap_or_else(default_seed));
-            let mut generated_ids = Vec::new();
-            let mut detok = core_llm::IncrementalDetok::new();
+            let mut detok = self.tokenizer.decode_stream(true);
             for index in 0..req.text_request.max_new_tokens {
                 if req.text_request.cancel.is_cancelled() {
                     break;
@@ -580,12 +569,24 @@ impl core_llm::StarVectorProvider for CandleStarVectorProvider {
                 let id = next_token_id(&logits, &history, &req.text_request.sampling, &mut rng)
                     .map_err(to_core)?;
                 history.push(id);
-                let decoded = decode_generated_svg_token(
-                    &self.tokenizer,
-                    &mut generated_ids,
-                    &mut detok,
-                    id,
-                )?;
+                if id == EOS_TOKEN_ID {
+                    if let Some(delta) = detok.finish()? {
+                        let status = stream.push_decoded_suffix(&delta, started.elapsed())?;
+                        if matches!(
+                            status,
+                            core_llm::StarVectorStreamStatus::Continue
+                                | core_llm::StarVectorStreamStatus::Stop(
+                                    core_llm::StarVectorFinishReason::CompleteRoot
+                                )
+                        ) {
+                            events(core_llm::StarVectorStreamEvent::Source { text: delta, index });
+                        }
+                        if matches!(status, core_llm::StarVectorStreamStatus::Stop(_)) {
+                            break;
+                        }
+                    }
+                }
+                let decoded = decode_generated_svg_token(&mut detok, id)?;
                 let status = push_decoded_svg_token(
                     &mut stream,
                     decoded,
@@ -606,6 +607,23 @@ impl core_llm::StarVectorProvider for CandleStarVectorProvider {
                         IMAGE_TOKEN_COUNT + self.prompt.len() + index as usize,
                     )
                     .map_err(to_core)?;
+            }
+            if stream.output().is_err() {
+                if let Some(delta) = detok.finish()? {
+                    let status = stream.push_decoded_suffix(&delta, started.elapsed())?;
+                    if matches!(
+                        status,
+                        core_llm::StarVectorStreamStatus::Continue
+                            | core_llm::StarVectorStreamStatus::Stop(
+                                core_llm::StarVectorFinishReason::CompleteRoot
+                            )
+                    ) {
+                        events(core_llm::StarVectorStreamEvent::Source {
+                            text: delta,
+                            index: stream.generated_tokens(),
+                        });
+                    }
+                }
             }
             if stream.output().is_err() {
                 // Convert a loop boundary (token budget or mid-stream cancellation) into the
@@ -852,34 +870,91 @@ mod tests {
     #[test]
     fn continuation_decode_skips_special_controls_but_not_added_source_vocabulary() {
         let tokenizer = source_tokenizer();
-        let mut ids = Vec::new();
-        let mut detok = core_llm::IncrementalDetok::new();
+        let mut detok = tokenizer.decode_stream(true);
 
         assert_eq!(
-            decode_generated_svg_token(&tokenizer, &mut ids, &mut detok, 5).unwrap(),
+            decode_generated_svg_token(&mut detok, 5).unwrap(),
             DecodedSvgToken::Hidden
         );
         assert_eq!(
-            decode_generated_svg_token(&tokenizer, &mut ids, &mut detok, 1).unwrap(),
+            decode_generated_svg_token(&mut detok, 1).unwrap(),
             DecodedSvgToken::Source(">".into())
         );
         assert_eq!(
-            decode_generated_svg_token(&tokenizer, &mut ids, &mut detok, 2).unwrap(),
+            decode_generated_svg_token(&mut detok, 2).unwrap(),
             DecodedSvgToken::Source("</svg>".into())
         );
         assert_eq!(
-            decode_generated_svg_token(&tokenizer, &mut ids, &mut detok, 0).unwrap(),
+            decode_generated_svg_token(&mut detok, 0).unwrap(),
             DecodedSvgToken::Eos
         );
-        assert_eq!(ids, [5, 1, 2], "EOS must not enter decoded source history");
-
-        let mut added_ids = Vec::new();
-        let mut added_detok = core_llm::IncrementalDetok::new();
+        let mut added_detok = tokenizer.decode_stream(true);
         assert_eq!(
-            decode_generated_svg_token(&tokenizer, &mut added_ids, &mut added_detok, 6).unwrap(),
+            decode_generated_svg_token(&mut added_detok, 6).unwrap(),
             DecodedSvgToken::Source("<svg-start>".into()),
             "non-special added vocabulary is model output, not a control to silently trim"
         );
+    }
+
+    #[test]
+    fn continuation_decode_matches_full_decode_for_a_long_sequence() {
+        let tokenizer = source_tokenizer();
+        let ids: Vec<u32> = [1, 2].into_iter().cycle().take(4_096).collect();
+        let expected = tokenizer.decode(&ids, true).unwrap();
+        let mut detok = tokenizer.decode_stream(true);
+        let mut actual = String::new();
+        for id in ids {
+            if let DecodedSvgToken::Source(delta) =
+                decode_generated_svg_token(&mut detok, id as i32).unwrap()
+            {
+                actual.push_str(&delta);
+            }
+        }
+        if let Some(delta) = detok.finish().unwrap() {
+            actual.push_str(&delta);
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 14_336);
+    }
+
+    #[test]
+    fn continuation_decode_resolves_split_utf8_and_drops_an_incomplete_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("vocab.json"),
+            r#"{"<|endoftext|>":0,"Ã":1,"©":2}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("merges.txt"), "#version: 0.2\n").unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"added_tokens_decoder":{"0":{"content":"<|endoftext|>","lstrip":false,"normalized":false,"rstrip":false,"single_word":false,"special":true}}}"#,
+        )
+        .unwrap();
+        let tokenizer = core_llm::Tokenizer::from_hf_byte_level_bpe(
+            dir.path().join("vocab.json"),
+            dir.path().join("merges.txt"),
+            dir.path().join("tokenizer_config.json"),
+        )
+        .unwrap();
+
+        let mut complete = tokenizer.decode_stream(true);
+        assert_eq!(
+            decode_generated_svg_token(&mut complete, 1).unwrap(),
+            DecodedSvgToken::Hidden
+        );
+        assert_eq!(
+            decode_generated_svg_token(&mut complete, 2).unwrap(),
+            DecodedSvgToken::Source("é".into())
+        );
+        assert_eq!(complete.finish().unwrap(), None);
+
+        let mut incomplete = tokenizer.decode_stream(true);
+        assert_eq!(
+            decode_generated_svg_token(&mut incomplete, 1).unwrap(),
+            DecodedSvgToken::Hidden
+        );
+        assert_eq!(incomplete.finish().unwrap(), None);
     }
 
     #[test]
@@ -891,8 +966,7 @@ mod tests {
         }
         .request();
         let tokenizer = source_tokenizer();
-        let mut ids = Vec::new();
-        let mut detok = core_llm::IncrementalDetok::new();
+        let mut detok = tokenizer.decode_stream(true);
         let mut stream = StarVectorBoundedStream::new(&request);
         let mut events = Vec::new();
         assert_eq!(
@@ -901,7 +975,7 @@ mod tests {
         );
 
         for (index, id) in [5, 1, 2].into_iter().enumerate() {
-            let decoded = decode_generated_svg_token(&tokenizer, &mut ids, &mut detok, id).unwrap();
+            let decoded = decode_generated_svg_token(&mut detok, id).unwrap();
             if matches!(
                 push_decoded_svg_token(
                     &mut stream,
