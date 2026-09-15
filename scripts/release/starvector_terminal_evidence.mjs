@@ -3,6 +3,7 @@
 import { createHash } from "node:crypto";
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const SHA = /^[0-9a-f]{64}$/;
 const REV = /^[0-9a-f]{40}$/;
@@ -405,4 +406,4 @@ function main() {
   }
   fail("usage: validate-plan|validate-receipt (V2 requires --evidence-root)");
 }
-if (import.meta.url === `file://${process.argv[1]}`) { try { main(); } catch (error) { console.error(error.message); process.exitCode = 1; } }
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) { try { main(); } catch (error) { console.error(error.message); process.exitCode = 1; } }
