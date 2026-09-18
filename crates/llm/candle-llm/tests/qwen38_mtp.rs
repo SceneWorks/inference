@@ -21,8 +21,10 @@ const HIDDEN: usize = 8;
 const INTERMEDIATE: usize = 16;
 const EOS: usize = 248_046;
 
-fn frozen_tokenizer() -> Option<std::path::PathBuf> {
-    std::env::var_os("QWEN38_TOKENIZER_JSON").map(Into::into)
+fn frozen_tokenizer() -> std::path::PathBuf {
+    std::env::var_os("QWEN38_TOKENIZER_JSON")
+        .map(Into::into)
+        .expect("QWEN38_TOKENIZER_JSON must point to the frozen tokenizer.json")
 }
 
 fn oracle() -> Value {
@@ -82,11 +84,9 @@ fn assert_oracle_case(
 }
 
 #[test]
+#[ignore = "requires QWEN38_TOKENIZER_JSON from the frozen Qwen3.8 snapshot"]
 fn frozen_template_and_tokenizer_match_all_request_controls() {
-    let Some(tokenizer_path) = frozen_tokenizer() else {
-        eprintln!("skipping: set QWEN38_TOKENIZER_JSON to the frozen tokenizer.json");
-        return;
-    };
+    let tokenizer_path = frozen_tokenizer();
     let template = JinjaChatTemplate::from_tokenizer_config_file(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../../docs/reference/qwen38/tokenizer_config.json"
@@ -289,11 +289,9 @@ fn request(prompt: &str, max_new_tokens: u32) -> TextLlmRequest {
 }
 
 #[test]
+#[ignore = "requires QWEN38_TOKENIZER_JSON from the frozen Qwen3.8 snapshot"]
 fn frozen_qwen38_provider_executes_ar_mtp_tools_and_stops() {
-    let Some(tokenizer_path) = frozen_tokenizer() else {
-        eprintln!("skipping: set QWEN38_TOKENIZER_JSON to the frozen tokenizer.json");
-        return;
-    };
+    let tokenizer_path = frozen_tokenizer();
     let snapshot = write_snapshot(&tokenizer_path, false);
     let provider = LlamaProvider::load(&LoadSpec::dense(snapshot.path().display().to_string()))
         .expect("load tiny Qwen3.8 Candle provider");
