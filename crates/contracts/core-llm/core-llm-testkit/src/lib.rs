@@ -28,6 +28,7 @@ use core_llm::{
 };
 use std::path::PathBuf;
 
+pub mod comparison;
 pub mod starvector;
 pub use starvector::{
     check_starvector_bounded_fixture, check_starvector_cancellation, check_starvector_descriptor,
