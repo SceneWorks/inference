@@ -667,6 +667,86 @@ impl LlamaProvider {
     /// metadata; the chat template prefers a sibling `tokenizer_config.json`, then the GGUF's own
     /// `chat_template`, then the typed Llama-3 default.
     fn load_gguf(path: &Path, device: &Device, requested: Option<QuantSpec>) -> CoreResult<Self> {
+        if crate::prism_checkpoint::PrismGgufCheckpoint::is_prism(path).map_err(to_core)? {
+            if requested.is_some() {
+                return Err(CoreError::Load(
+                    "Prism/Bonsai GGUF is already packed; Q4/Q8 repacking would expand the model"
+                        .into(),
+                ));
+            }
+            let ck = crate::prism_checkpoint::PrismGgufCheckpoint::open(path, device)
+                .map_err(to_core)?;
+            let qcfg = Qwen35Config::from_json(&ck.config_json).map_err(to_core)?;
+            let mut descriptor = descriptor_for_qwen35(&qcfg);
+            let model = Qwen35Model::from_prism_weights(
+                &ck.weights,
+                "language_model.model",
+                qcfg,
+                &ck.registry,
+                crate::device::compute_dtype(device),
+            )
+            .map_err(to_core)?;
+            let dir = path.parent().unwrap_or_else(|| Path::new("."));
+            let sibling_tokenizer = dir.join("tokenizer.json");
+            let tokenizer = if sibling_tokenizer.is_file() {
+                Tokenizer::from_file(sibling_tokenizer)?
+            } else {
+                ck.tokenizer().map_err(to_core)?
+            };
+            let (template, thinking, effort, preserve, tools): (
+                Box<dyn ChatTemplate>,
+                bool,
+                bool,
+                bool,
+                bool,
+            ) = if let Ok(t) =
+                JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json"))
+            {
+                let src = t.source();
+                let flags = (
+                    src.contains("enable_thinking"),
+                    src.contains("reasoning_effort"),
+                    src.contains("preserve_thinking"),
+                    src.contains("tool_call"),
+                );
+                (Box::new(t), flags.0, flags.1, flags.2, flags.3)
+            } else if let Some(src) = ck.chat_template.as_ref() {
+                let flags = (
+                    src.contains("enable_thinking"),
+                    src.contains("reasoning_effort"),
+                    src.contains("preserve_thinking"),
+                    src.contains("tool_call"),
+                );
+                (
+                    Box::new(JinjaChatTemplate::with_tokens(
+                        src.clone(),
+                        ck.bos_token.clone().unwrap_or_default(),
+                        ck.eos_token.clone().unwrap_or_default(),
+                    )),
+                    flags.0,
+                    flags.1,
+                    flags.2,
+                    flags.3,
+                )
+            } else {
+                (Box::new(Llama3Template), false, false, false, false)
+            };
+            descriptor.capabilities.supports_thinking = thinking;
+            descriptor.capabilities.supports_reasoning_effort = effort;
+            descriptor.capabilities.supports_preserve_thinking = preserve;
+            descriptor.capabilities.supports_tools = tools;
+            return Ok(Self {
+                descriptor,
+                model: Decoder::Qwen35(model),
+                mtp: None,
+                tokenizer,
+                template,
+                stop_tokens: ck.stop_tokens,
+                constraint_table: OnceCell::new(),
+                vision: None,
+                gemma4: None,
+            });
+        }
         let ck = GgufCheckpoint::open(path, device).map_err(to_core)?;
         let mut descriptor = descriptor_for(&ck.config);
         let quant = requested.or(ck.config.quantization);

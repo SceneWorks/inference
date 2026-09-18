@@ -33,7 +33,7 @@ pub struct GdnRowMap {
 }
 
 impl GdnRowMap {
-    fn source_row(self, logical_row: usize) -> Result<usize> {
+    pub(crate) fn source_row(self, logical_row: usize) -> Result<usize> {
         if logical_row < self.prefix {
             return Ok(logical_row);
         }
@@ -56,7 +56,7 @@ impl GdnRowMap {
         Ok(self.prefix + (repetition * self.groups + group) * self.unit + lane)
     }
 
-    fn validate(self, rows: usize) -> Result<()> {
+    pub(crate) fn validate(self, rows: usize) -> Result<()> {
         let span = self
             .groups
             .checked_mul(self.repetitions)
@@ -73,19 +73,20 @@ impl GdnRowMap {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)] // Device tensors are consumed only in `cfg(feature = "cuda")` builds.
 enum PackedStorage {
     /// MLX affine 2-bit: 16 two-bit codes per u32 plus one scale per group. Published biases are
     /// validated as `-scale` at load and are therefore not retained separately.
     MlxAffine2 {
-        words: Tensor,
-        scales: Tensor,
+        words: Option<Tensor>,
+        scales: Option<Tensor>,
         host_words: Arc<[u32]>,
         host_scales: Arc<[f32]>,
     },
     /// Native GGUF PQ2_0/PTQ1_0 blocks, retained byte-for-byte.
     Gguf {
         kind: PrismPackedKind,
-        bytes: Tensor,
+        bytes: Option<Tensor>,
         host_bytes: Arc<[u8]>,
     },
 }
@@ -131,6 +132,12 @@ impl PrismPackedWeight {
         gdn: Option<GdnLayout>,
     ) -> Result<Self> {
         let name = name.into();
+        if words.device().location() != scales.device().location() {
+            return Err(Error::Config(format!(
+                "Prism MLX affine-2 {name} stores codes and scales on different devices"
+            )));
+        }
+        let device = words.device().clone();
         let (rows, packed_cols) = words.dims2()?;
         let (scale_rows, scale_cols) = scales.dims2()?;
         let input_width = packed_cols
@@ -179,14 +186,19 @@ impl PrismPackedWeight {
             rows,
             input_width,
             PackedStorage::MlxAffine2 {
-                words,
-                scales: scales.to_dtype(DType::F32)?,
+                words: (!device.is_cpu()).then_some(words),
+                scales: if device.is_cpu() {
+                    None
+                } else {
+                    Some(scales.to_dtype(DType::F32)?)
+                },
                 host_words: word_host.into(),
                 host_scales: scale_host.into(),
             },
             metadata,
             row_map,
             gdn,
+            device,
         )
     }
 
@@ -207,11 +219,15 @@ impl PrismPackedWeight {
         let rows = matrix.output_rows();
         let input_width = matrix.input_width();
         let host_bytes: Arc<[u8]> = data.into();
-        let bytes = Tensor::from_vec(
-            host_bytes.to_vec(),
-            (rows * input_width / PRISM_GROUP_SIZE * kind.block_bytes(),),
-            device,
-        )?;
+        let bytes = if device.is_cpu() {
+            None
+        } else {
+            Some(Tensor::from_vec(
+                host_bytes.to_vec(),
+                (rows * input_width / PRISM_GROUP_SIZE * kind.block_bytes(),),
+                device,
+            )?)
+        };
         Self::new(
             name,
             rows,
@@ -224,6 +240,7 @@ impl PrismPackedWeight {
             metadata,
             row_map,
             gdn,
+            device.clone(),
         )
     }
 
@@ -235,6 +252,7 @@ impl PrismPackedWeight {
         metadata: &PrismHadamardMetadata,
         row_map: Option<GdnRowMap>,
         gdn: Option<GdnLayout>,
+        device: Device,
     ) -> Result<Self> {
         metadata
             .validate()
@@ -250,17 +268,6 @@ impl PrismPackedWeight {
                 "Prism GDN activation reorder on {name} requires a forward Hadamard transform"
             )));
         }
-        let device = match &storage {
-            PackedStorage::MlxAffine2 { words, scales, .. } => {
-                if words.device().location() != scales.device().location() {
-                    return Err(Error::Config(format!(
-                        "Prism MLX affine-2 {name} stores codes and scales on different devices"
-                    )));
-                }
-                words.device().clone()
-            }
-            PackedStorage::Gguf { bytes, .. } => bytes.device().clone(),
-        };
         Ok(Self {
             name,
             rows,
@@ -939,8 +946,12 @@ mod cuda {
         let tokens = x.dim(0)?;
         match &weight.storage {
             PackedStorage::MlxAffine2 { words, scales, .. } => Ok(x.apply_op3_no_bwd(
-                words,
-                scales,
+                words
+                    .as_ref()
+                    .ok_or_else(|| Error::Config("missing Prism CUDA codes".into()))?,
+                scales
+                    .as_ref()
+                    .ok_or_else(|| Error::Config("missing Prism CUDA scales".into()))?,
                 &MlxMatmul {
                     tokens,
                     rows: weight.rows,
@@ -949,7 +960,9 @@ mod cuda {
                 },
             )?),
             PackedStorage::Gguf { kind, bytes, .. } => Ok(x.apply_op2_no_bwd(
-                bytes,
+                bytes
+                    .as_ref()
+                    .ok_or_else(|| Error::Config("missing Prism CUDA bytes".into()))?,
                 &GgufMatmul {
                     kind: *kind,
                     tokens,
@@ -966,8 +979,12 @@ mod cuda {
         let count = ids.elem_count();
         match &weight.storage {
             PackedStorage::MlxAffine2 { words, scales, .. } => Ok(ids.apply_op3_no_bwd(
-                words,
-                scales,
+                words
+                    .as_ref()
+                    .ok_or_else(|| Error::Config("missing Prism CUDA codes".into()))?,
+                scales
+                    .as_ref()
+                    .ok_or_else(|| Error::Config("missing Prism CUDA scales".into()))?,
                 &MlxEmbedding {
                     count,
                     rows: weight.rows,
@@ -975,7 +992,9 @@ mod cuda {
                 },
             )?),
             PackedStorage::Gguf { kind, bytes, .. } => Ok(ids.apply_op2_no_bwd(
-                bytes,
+                bytes
+                    .as_ref()
+                    .ok_or_else(|| Error::Config("missing Prism CUDA bytes".into()))?,
                 &GgufEmbedding {
                     kind: *kind,
                     count,

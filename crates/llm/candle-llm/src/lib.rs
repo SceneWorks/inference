@@ -33,6 +33,7 @@ pub mod models;
 pub mod prepare;
 pub mod primitives;
 mod prism_checkpoint;
+mod prism_gguf;
 pub mod provider;
 pub mod starvector;
 pub mod starvector_8b;
