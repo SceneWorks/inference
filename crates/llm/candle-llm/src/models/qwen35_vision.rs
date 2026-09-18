@@ -26,11 +26,15 @@
 //! Compute follows the SigLIP path — the bf16 checkpoint weights are promoted to **f32** on load and
 //! the tower runs in f32 against the f32-preprocessed patches.
 
+use std::collections::HashMap;
+
+use candle_core::quantized::QTensor;
 use candle_core::{DType, Device, Tensor};
 
 use crate::error::{Error, Result};
 use crate::primitives::attention::{sdpa, AttnMask};
 use crate::primitives::nn::{gelu, gelu_erf, layer_norm, linear};
+use crate::primitives::projection::Projection;
 use crate::primitives::rope::apply_rope;
 use crate::primitives::Weights;
 
@@ -41,6 +45,12 @@ const ROPE_THETA: f32 = 10000.0;
 /// Disallowed-attention fill for the block-diagonal mask (a large finite negative; matches the
 /// attention primitive's convention — avoids `-inf` through the softmax).
 const MASK_NEG: f32 = -1e30;
+
+#[derive(Clone, Copy)]
+enum PatchWeightLayout {
+    ChannelsFirst,
+    MlxChannelsLast,
+}
 
 /// Geometry of the Qwen-VL vision tower (`vision_config`). Shared by Qwen3.6 (`qwen3_5`) and
 /// Qwen3-VL (`qwen3_vl`); the latter additionally taps intermediate encoder layers for DeepStack.
@@ -136,14 +146,10 @@ struct VisionBlock {
     n1_b: Tensor,
     n2_w: Tensor,
     n2_b: Tensor,
-    qkv_w: Tensor,
-    qkv_b: Option<Tensor>,
-    proj_w: Tensor,
-    proj_b: Option<Tensor>,
-    fc1_w: Tensor,
-    fc1_b: Option<Tensor>,
-    fc2_w: Tensor,
-    fc2_b: Option<Tensor>,
+    qkv: Projection,
+    proj: Projection,
+    fc1: Projection,
+    fc2: Projection,
 }
 
 impl VisionBlock {
@@ -174,8 +180,7 @@ impl VisionBlock {
         let n = x.dim(0)?;
         let hidden = num_heads * head_dim;
         // Fused QKV → [n, 3, heads, head_dim] → three [1, n, heads, head_dim].
-        let qkv =
-            linear(x, &self.qkv_w, self.qkv_b.as_ref())?.reshape((n, 3, num_heads, head_dim))?;
+        let qkv = self.qkv.forward(x)?.reshape((n, 3, num_heads, head_dim))?;
         let pick = |i: usize| -> Result<Tensor> {
             Ok(qkv
                 .narrow(1, i, 1)?
@@ -193,13 +198,13 @@ impl VisionBlock {
         let scale = (head_dim as f32).powf(-0.5);
         let out = sdpa(&q, &k, &v, scale, None, mask)?;
         let out = out.transpose(1, 2)?.contiguous()?.reshape((n, hidden))?;
-        linear(&out, &self.proj_w, self.proj_b.as_ref())
+        self.proj.forward(&out)
     }
 
     fn mlp(&self, x: &Tensor) -> Result<Tensor> {
         // `gelu_pytorch_tanh` — candle's `gelu` is the tanh approximation.
-        let h = gelu(&linear(x, &self.fc1_w, self.fc1_b.as_ref())?)?;
-        linear(&h, &self.fc2_w, self.fc2_b.as_ref())
+        let h = gelu(&self.fc1.forward(x)?)?;
+        self.fc2.forward(&h)
     }
 }
 
@@ -209,10 +214,8 @@ impl VisionBlock {
 struct PatchMerger {
     norm_w: Tensor,
     norm_b: Tensor,
-    fc1_w: Tensor,
-    fc1_b: Option<Tensor>,
-    fc2_w: Tensor,
-    fc2_b: Option<Tensor>,
+    fc1: Projection,
+    fc2: Projection,
     merge_dim: usize,
     use_postshuffle_norm: bool,
 }
@@ -229,8 +232,8 @@ impl PatchMerger {
             layer_norm(x, &self.norm_w, &self.norm_b, LN_EPS)?.reshape(((), self.merge_dim))?
         };
         // `nn.GELU()` default = exact erf — candle's `gelu_erf`.
-        let m = gelu_erf(&linear(&m, &self.fc1_w, self.fc1_b.as_ref())?)?;
-        linear(&m, &self.fc2_w, self.fc2_b.as_ref())
+        let m = gelu_erf(&self.fc1.forward(&m)?)?;
+        self.fc2.forward(&m)
     }
 }
 
@@ -258,6 +261,49 @@ impl Qwen35VisionModel {
     /// Load from a checkpoint. `prefix` points at the visual tower module — `model.visual` for the
     /// `qwen3_5` checkpoint. Weights are promoted to f32 (the SigLIP vision path).
     pub fn from_weights(w: &Weights, prefix: &str, cfg: Qwen35VisionConfig) -> Result<Self> {
+        Self::from_weights_layout(w, prefix, cfg, PatchWeightLayout::ChannelsFirst, None)
+    }
+
+    /// Load the dense Bonsai MLX vision tower. MLX stores its Conv3d kernel channels-last as
+    /// `[out, temporal, height, width, channels]`; the processor flattens patches in the upstream
+    /// PyTorch `[channels, temporal, height, width]` order, so the one layout conversion happens at
+    /// load time before the kernel is reshaped into a matrix.
+    pub fn from_mlx_weights(w: &Weights, prefix: &str, cfg: Qwen35VisionConfig) -> Result<Self> {
+        Self::from_weights_layout(w, prefix, cfg, PatchWeightLayout::MlxChannelsLast, None)
+    }
+
+    /// Construct from a strict GGUF projector mapping. Block-quantized matrices are removed from
+    /// `packed` and remain compact behind `QMatMul`; dense matrices have already been placed in
+    /// `weights`. Every supplied packed key must be consumed, making an incomplete or misspelled
+    /// mapping fail closed rather than silently substituting a dense path.
+    pub(crate) fn from_gguf_weights(
+        w: &Weights,
+        prefix: &str,
+        cfg: Qwen35VisionConfig,
+        packed: &mut HashMap<String, QTensor>,
+    ) -> Result<Self> {
+        let model = Self::from_weights_layout(
+            w,
+            prefix,
+            cfg,
+            PatchWeightLayout::ChannelsFirst,
+            Some(packed),
+        )?;
+        if let Some(name) = packed.keys().next() {
+            return Err(Error::Config(format!(
+                "unused quantized vision projector tensor {name}"
+            )));
+        }
+        Ok(model)
+    }
+
+    fn from_weights_layout(
+        w: &Weights,
+        prefix: &str,
+        cfg: Qwen35VisionConfig,
+        patch_layout: PatchWeightLayout,
+        mut packed: Option<&mut HashMap<String, QTensor>>,
+    ) -> Result<Self> {
         let p = |leaf: &str| join(prefix, leaf);
         let req = |k: String| -> Result<Tensor> { Ok(w.require(&k)?.to_dtype(DType::F32)?) };
         let opt = |k: String| -> Result<Option<Tensor>> {
@@ -266,11 +312,23 @@ impl Qwen35VisionModel {
                 None => Ok(None),
             }
         };
+        let mut projection = |weight_name: String, bias_name: String| -> Result<Projection> {
+            let bias = opt(bias_name)?;
+            if let Some(qtensor) = packed.as_deref_mut().and_then(|p| p.remove(&weight_name)) {
+                Projection::load_qtensor(qtensor, bias)
+            } else {
+                Projection::load_with_bias(req(weight_name)?, bias, None)
+            }
+        };
 
         // Conv3d weight `[hidden, C, T, P, P]` → reshaped `[hidden, C·T·P·P]` linear.
+        let patch_weight = req(p("patch_embed.proj.weight"))?;
+        let patch_weight = match patch_layout {
+            PatchWeightLayout::ChannelsFirst => patch_weight,
+            PatchWeightLayout::MlxChannelsLast => patch_weight.permute((0, 4, 1, 2, 3))?,
+        };
         let patch_embed = PatchEmbed {
-            weight: req(p("patch_embed.proj.weight"))?
-                .reshape((cfg.hidden_size as usize, cfg.patch_in() as usize))?,
+            weight: patch_weight.reshape((cfg.hidden_size as usize, cfg.patch_in() as usize))?,
             bias: opt(p("patch_embed.proj.bias"))?,
         };
         let pos_embed = req(p("pos_embed.weight"))?;
@@ -283,28 +341,22 @@ impl Qwen35VisionModel {
                     n1_b: req(b("norm1.bias"))?,
                     n2_w: req(b("norm2.weight"))?,
                     n2_b: req(b("norm2.bias"))?,
-                    qkv_w: req(b("attn.qkv.weight"))?,
-                    qkv_b: opt(b("attn.qkv.bias"))?,
-                    proj_w: req(b("attn.proj.weight"))?,
-                    proj_b: opt(b("attn.proj.bias"))?,
-                    fc1_w: req(b("mlp.linear_fc1.weight"))?,
-                    fc1_b: opt(b("mlp.linear_fc1.bias"))?,
-                    fc2_w: req(b("mlp.linear_fc2.weight"))?,
-                    fc2_b: opt(b("mlp.linear_fc2.bias"))?,
+                    qkv: projection(b("attn.qkv.weight"), b("attn.qkv.bias"))?,
+                    proj: projection(b("attn.proj.weight"), b("attn.proj.bias"))?,
+                    fc1: projection(b("mlp.linear_fc1.weight"), b("mlp.linear_fc1.bias"))?,
+                    fc2: projection(b("mlp.linear_fc2.weight"), b("mlp.linear_fc2.bias"))?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
 
         let merge_dim = cfg.merge_dim() as usize;
-        let load_merger = |stem: String, use_postshuffle_norm: bool| -> Result<PatchMerger> {
+        let mut load_merger = |stem: String, use_postshuffle_norm: bool| -> Result<PatchMerger> {
             let m = |leaf: &str| format!("{stem}.{leaf}");
             Ok(PatchMerger {
                 norm_w: req(m("norm.weight"))?,
                 norm_b: req(m("norm.bias"))?,
-                fc1_w: req(m("linear_fc1.weight"))?,
-                fc1_b: opt(m("linear_fc1.bias"))?,
-                fc2_w: req(m("linear_fc2.weight"))?,
-                fc2_b: opt(m("linear_fc2.bias"))?,
+                fc1: projection(m("linear_fc1.weight"), m("linear_fc1.bias"))?,
+                fc2: projection(m("linear_fc2.weight"), m("linear_fc2.bias"))?,
                 merge_dim,
                 use_postshuffle_norm,
             })
@@ -329,6 +381,19 @@ impl Qwen35VisionModel {
     /// The tower geometry.
     pub fn config(&self) -> &Qwen35VisionConfig {
         &self.cfg
+    }
+
+    pub(crate) fn has_quantized_projections(&self) -> bool {
+        self.blocks.iter().any(|block| {
+            block.qkv.is_quantized()
+                || block.proj.is_quantized()
+                || block.fc1.is_quantized()
+                || block.fc2.is_quantized()
+        }) || self.merger.fc1.is_quantized()
+            || self.merger.fc2.is_quantized()
+            || self.deepstack_mergers.iter().any(|merger| {
+                merger.fc1.is_quantized() || merger.fc2.is_quantized()
+            })
     }
 
     /// Encode preprocessed `pixel_values` `[total_patches, C·T·P·P]` for the images described by

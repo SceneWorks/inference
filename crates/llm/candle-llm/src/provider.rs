@@ -494,8 +494,18 @@ impl LlamaProvider {
         });
         let device = select_device().map_err(to_core)?;
         if crate::gguf::is_gguf_path(&spec.source) {
-            Self::load_gguf(Path::new(&spec.source), &device, requested)
+            Self::load_gguf(
+                Path::new(&spec.source),
+                spec.projector_source.as_deref().map(Path::new),
+                &device,
+                requested,
+            )
         } else {
+            if spec.projector_source.is_some() {
+                return Err(CoreError::Load(
+                    "an external projector is only valid with a GGUF language checkpoint; safetensors vision must be embedded".into(),
+                ));
+            }
             Self::load_dir(Path::new(&spec.source), &device, requested)
         }
     }
@@ -571,13 +581,19 @@ impl LlamaProvider {
         // VLM) and the config exposes a `vision_config`. Covers Qwen3.6 (`qwen3_5`) and Qwen3-VL
         // (`qwen3_vl`), which share the identical Qwen3-VL ViT tower (Qwen3-VL adds DeepStack taps).
         // Absent → a text-only checkpoint.
+        let dense_vision = weights.contains("model.visual.patch_embed.proj.weight");
+        let prism_vision = is_prism && weights.contains("vision_tower.patch_embed.proj.weight");
         let vision = if (arch == Architecture::Qwen35 || arch == Architecture::Qwen3Vl)
             && cfg_value.get("vision_config").is_some()
-            && weights.contains("model.visual.patch_embed.proj.weight")
+            && (dense_vision || prism_vision)
         {
             let vcfg = Qwen35VisionConfig::from_json(&cfg_value).map_err(to_core)?;
-            let tower = Qwen35VisionModel::from_weights(&weights, "model.visual", vcfg.clone())
-                .map_err(to_core)?;
+            let tower = if prism_vision {
+                Qwen35VisionModel::from_mlx_weights(&weights, "vision_tower", vcfg.clone())
+            } else {
+                Qwen35VisionModel::from_weights(&weights, "model.visual", vcfg.clone())
+            }
+            .map_err(to_core)?;
             // Both real configs carry `image_token_id`; the fallback is the family's canonical id
             // (Qwen3.6 248056, Qwen3-VL 151655) so a hand-rolled config still resolves.
             let image_token_id = cfg_value
@@ -666,7 +682,12 @@ impl LlamaProvider {
     /// `tokenizer.json`, falling back to a reconstruction from the GGUF's embedded tokenizer
     /// metadata; the chat template prefers a sibling `tokenizer_config.json`, then the GGUF's own
     /// `chat_template`, then the typed Llama-3 default.
-    fn load_gguf(path: &Path, device: &Device, requested: Option<QuantSpec>) -> CoreResult<Self> {
+    fn load_gguf(
+        path: &Path,
+        projector_path: Option<&Path>,
+        device: &Device,
+        requested: Option<QuantSpec>,
+    ) -> CoreResult<Self> {
         if crate::prism_checkpoint::PrismGgufCheckpoint::is_prism(path).map_err(to_core)? {
             if requested.is_some() {
                 return Err(CoreError::Load(
@@ -677,6 +698,7 @@ impl LlamaProvider {
             let ck = crate::prism_checkpoint::PrismGgufCheckpoint::open(path, device)
                 .map_err(to_core)?;
             let qcfg = Qwen35Config::from_json(&ck.config_json).map_err(to_core)?;
+            let language_hidden_size = qcfg.hidden_size as usize;
             let mut descriptor = descriptor_for_qwen35(&qcfg);
             let model = Qwen35Model::from_prism_weights(
                 &ck.weights,
@@ -735,6 +757,39 @@ impl LlamaProvider {
             descriptor.capabilities.supports_reasoning_effort = effort;
             descriptor.capabilities.supports_preserve_thinking = preserve;
             descriptor.capabilities.supports_tools = tools;
+            let vision = if let Some(projector_path) = projector_path {
+                let loaded = crate::prism_vision_gguf::PrismVisionGguf::open(
+                    projector_path,
+                    device,
+                    language_hidden_size,
+                )
+                .map_err(to_core)?;
+                let one_token = |text: &str| -> CoreResult<i32> {
+                    let ids = tokenizer.encode(text, false)?;
+                    if ids.len() != 1 {
+                        return Err(CoreError::Load(format!(
+                            "Bonsai GGUF tokenizer must encode {text:?} as one special token, got {ids:?}"
+                        )));
+                    }
+                    i32::try_from(ids[0]).map_err(|_| {
+                        CoreError::Load(format!("Bonsai GGUF token id for {text:?} overflows i32"))
+                    })
+                };
+                let image_token_id = one_token("<|image_pad|>")?;
+                let video_token_id = one_token("<|video_pad|>")?;
+                descriptor.capabilities.supports_vision = true;
+                descriptor.capabilities.supports_video = true;
+                Some(Qwen35Vision {
+                    tower: loaded.model,
+                    processor: Qwen35ImageProcessor::default(),
+                    image_token_id,
+                    video_token_id,
+                    spatial_merge_size: loaded.config.spatial_merge_size,
+                    device: device.clone(),
+                })
+            } else {
+                None
+            };
             return Ok(Self {
                 descriptor,
                 model: Decoder::Qwen35(model),
@@ -743,9 +798,14 @@ impl LlamaProvider {
                 template,
                 stop_tokens: ck.stop_tokens,
                 constraint_table: OnceCell::new(),
-                vision: None,
+                vision,
                 gemma4: None,
             });
+        }
+        if projector_path.is_some() {
+            return Err(CoreError::Load(
+                "external qwen3vl_merger projectors are supported only for Prism/Bonsai GGUF language checkpoints".into(),
+            ));
         }
         let ck = GgufCheckpoint::open(path, device).map_err(to_core)?;
         let mut descriptor = descriptor_for(&ck.config);

@@ -29,6 +29,16 @@ enum QuantizedWeight {
 }
 
 impl QuantizedLinear {
+    /// Wrap a tensor which was already stored in a GGUF quantized representation. This preserves
+    /// the compact resident payload and lets [`QMatMul`] dispatch the matching CPU/CUDA kernel;
+    /// loading a Q8 projector must not materialize a second dense copy of the matrix.
+    pub fn from_qtensor(weight: QTensor, bias: Option<Tensor>) -> Result<Self> {
+        Ok(Self {
+            inner: QuantizedWeight::Matmul(QMatMul::from_qtensor(weight)?),
+            bias,
+        })
+    }
+
     /// Quantize a dense `[out, in]` weight (the input dim must be a multiple of `dtype`'s block
     /// size). `bias`, if present, is added after the matmul.
     pub fn quantize(weight: &Tensor, dtype: GgmlDType, bias: Option<Tensor>) -> Result<Self> {
