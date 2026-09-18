@@ -50,9 +50,10 @@ strictly positive; no producer-supplied bootstrap, median, validity, or p95 fiel
 
 V1 remains an immutable historical format. V2 deliberately replaced its two-native-run
 repeatability check with 20 native-to-upstream comparisons per backend/tier. Historical V2 receipts
-and the exact `starvector-terminal-receipt-v2.schema.json` bytes remain unchanged. The separate
-`starvector-terminal-receipt-v2-outcome-parity.schema.json` profile validates new receipts. Receipts
-without a parity sub-contract version keep their original rule: every case binds two rendered
+and the exact `starvector-terminal-receipt-v2.schema.json` and
+`starvector-terminal-receipt-v2-outcome-parity.schema.json` bytes remain unchanged. The current
+`starvector-terminal-receipt-v2-outcome-parity-limit-behaviors.schema.json` profile validates new
+receipts. Receipts without a parity sub-contract version keep their original rule: every case binds two rendered
 previews and requires SSIM >= 0.995. New V2 receipts set `deterministic_parity.contract_version` to
 `2`. They must match the upstream accept/reject decision on all 20 cases. Accepted pairs bind the
 native preview, upstream SVG and upstream preview and still require rendered SSIM >= 0.995. Rejected
@@ -62,9 +63,21 @@ rejections also bind the retained native raw SVG. Rejections carry no preview or
 count toward the separate 120-case image-quality conversion rate.
 
 The current campaign passes the selected profile path and SHA-256 to the production validator.
-That selection requires receipt schema V2 and parity contract version 2 on every run. Omitting the
-profile flags is supported only for archived V1/V2 recovery validation; it cannot validate a new
-outcome-parity campaign.
+That selection requires receipt schema V2 and parity contract version 2 on every run. It also
+requires six observed product behaviors per backend/tier: one accepted completion (`complete_root`
+or `eos`), token/byte/wall-time termination, queued cancellation, and cancellation after the worker
+has entered generation. The completion behavior deliberately does not demand a distinct `eos`
+result: native providers stop decoding as soon as the bounded stream observes a complete SVG root.
+Queued cancellation has no worker metrics or provider result, and neither cancellation behavior may
+invent them. Omitting the profile flags is supported only for archived V1/V2 recovery validation;
+it cannot validate a new outcome-parity campaign.
+
+The new profile may retain a native preflight captured at an earlier inference revision only when
+the caller has independently verified that the selected validator revision descends from that
+capture and differs solely in the receipt-tooling paths. In that case the receipt still records the
+current permanent inference pin, preserves the authentic preflight `head_sha`, and passes that
+verified capture revision explicitly as `--preflight-inference-revision`. Historical profiles keep
+requiring the preflight and receipt inference revisions to be identical.
 
 The cases are the first five rows of each selected source (quality indices 0–4, 30–34, 60–64, 90–94),
 with seed equal to parity index. `upstream_reference` binds the official StarVector implementation at
@@ -97,8 +110,9 @@ node scripts/release/starvector_terminal_evidence.mjs validate-receipt \
   --corpus release/starvector-terminal-corpus-v1.json --receipt receipt.json \
   --inference-revision <main-revision> --sceneworks-revision <head> \
   --evidence-root <canonical-evidence-directory> \
-  --profile-schema release/starvector-terminal-receipt-v2-outcome-parity.schema.json \
-  --profile-sha256 fc11cf850f46ed6553a387dd2b6e7b3471a729f40e5116bd39c8fec2c6899e35
+  --profile-schema release/starvector-terminal-receipt-v2-outcome-parity-limit-behaviors.schema.json \
+  --profile-sha256 829c941e076aefeccbdc3c79eaa7ae05889447766dd2defadfa392ca2eb08320 \
+  --preflight-inference-revision <verified-capture-revision>
 ```
 
 The current receipt, producer, actual workflow/API provenance, and files must be reconciled together
