@@ -15,9 +15,9 @@ use core_llm::{
     AudioRef, Channel, ChatTemplate, Constraint, ConstraintDecodeTable, ConstraintKind, Content,
     Error as CoreError, FinishReason as CoreFinish, GenerationTimings, ImageRef, IncrementalDetok,
     JinjaChatTemplate, JsonConstraint, Llama3Template, LoadSpec, Message, MtpCapabilities, MtpMode,
-    MtpStats, Quantize, RenderOptions, Result as CoreResult, Sampling, StreamEvent as CoreEvent,
-    TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest,
-    ThinkingSegmenter, Tokenizer, ToolCallSegmenter, Usage, VideoRef,
+    MtpStats, Quantize, ReasoningEffort, RenderOptions, Result as CoreResult, Sampling,
+    StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
+    TextLlmRequest, ThinkingSegmenter, Tokenizer, ToolCallSegmenter, Usage, VideoRef,
 };
 use serde_json::Value;
 
@@ -325,6 +325,32 @@ fn merged_frame_timestamps(timestamps: &[f32], temporal_patch_size: usize) -> Ve
         .collect()
 }
 
+fn validate_video_timestamps(timestamps: &[f32]) -> CoreResult<()> {
+    if let Some((index, value)) = timestamps
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite() || *value < 0.0)
+    {
+        return Err(CoreError::InvalidRequest(format!(
+            "video timestamp {index} must be finite and non-negative, got {value}"
+        )));
+    }
+    if let Some((index, pair)) = timestamps
+        .windows(2)
+        .enumerate()
+        .find(|(_, pair)| pair[1] < pair[0])
+    {
+        return Err(CoreError::InvalidRequest(format!(
+            "video timestamps must preserve sampled-frame order: index {} is {} after {}",
+            index + 1,
+            pair[1],
+            pair[0]
+        )));
+    }
+    Ok(())
+}
+
 /// The Text–Timestamp-Alignment placeholder text for one video: per merged frame, a
 /// `<{t:.1f} seconds>` timestamp tag followed by `<|vision_start|><|video_pad|><|vision_end|>`
 /// (exactly `Qwen3VLProcessor.replace_video_token`). The single `<|video_pad|>` per frame is expanded
@@ -356,12 +382,13 @@ fn substitute_vision_placeholders(
             let content = m
                 .content
                 .iter()
-                .map(|c| match c {
+                .map(|c| {
+                    match c {
                     Content::Image(_) => Ok(Content::text(IMAGE_PLACEHOLDER)),
-                    Content::Video(v) => Ok(Content::text(video_placeholder_text(
-                        v,
-                        temporal_patch_size,
-                    ))),
+                    Content::Video(v) => {
+                        validate_video_timestamps(&v.timestamps)?;
+                        Ok(Content::text(video_placeholder_text(v, temporal_patch_size)))
+                    }
                     Content::Text(t) => Ok(Content::Text(t.clone())),
                     // The Qwen-VL path has no audio projector, and this provider's `supports_audio`
                     // is false for every Qwen checkpoint, so `validate` rejects an audio-carrying
@@ -373,6 +400,7 @@ fn substitute_vision_placeholders(
                          placeholder substitution, which the capability gate should have rejected"
                             .to_string(),
                     )),
+                }
                 })
                 .collect::<CoreResult<Vec<_>>>()?;
             Ok(Message {
@@ -543,7 +571,10 @@ impl LlamaProvider {
             // Qwen3.6 hybrid decoder: its own config, the VLM-nested `model.language_model` prefix, and
             // a top-level untied `lm_head`.
             let qcfg = Qwen35Config::from_json(&cfg_value).map_err(to_core)?;
-            let descriptor = descriptor_for_qwen35(&qcfg);
+            let mut descriptor = descriptor_for_qwen35(&qcfg);
+            if is_prism {
+                descriptor.family = "prism_hadamard_qwen35".into();
+            }
             let m = if let Some(registry) = prism.as_ref() {
                 Qwen35Model::from_prism_weights(
                     &weights,
@@ -663,6 +694,17 @@ impl LlamaProvider {
         ) = load_chat_template(dir);
         descriptor.capabilities.supports_thinking = supports_thinking;
         descriptor.capabilities.supports_reasoning_effort = supports_reasoning_effort;
+        if supports_reasoning_effort && arch == Architecture::Qwen35 {
+            descriptor.capabilities.reasoning_efforts = if is_prism {
+                vec![ReasoningEffort::XHigh, ReasoningEffort::Medium]
+            } else {
+                vec![
+                    ReasoningEffort::XHigh,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::Low,
+                ]
+            };
+        }
         descriptor.capabilities.supports_preserve_thinking = supports_preserve_thinking;
         descriptor.capabilities.supports_tools = supports_tools;
         Ok(Self {
@@ -755,6 +797,10 @@ impl LlamaProvider {
             };
             descriptor.capabilities.supports_thinking = thinking;
             descriptor.capabilities.supports_reasoning_effort = effort;
+            if effort {
+                descriptor.capabilities.reasoning_efforts =
+                    vec![ReasoningEffort::XHigh, ReasoningEffort::Medium];
+            }
             descriptor.capabilities.supports_preserve_thinking = preserve;
             descriptor.capabilities.supports_tools = tools;
             let vision = if let Some(projector_path) = projector_path {
@@ -1460,6 +1506,11 @@ impl TextLlm for LlamaProvider {
             .map(|m| m.expanded_ids.len())
             .or_else(|| g4.as_ref().map(|m| m.expanded_ids.len()))
             .unwrap_or(prompt_ids.len());
+        validate_context_window(
+            self.descriptor.capabilities.max_context_tokens,
+            prompt_len,
+            req.max_new_tokens,
+        )?;
 
         let config = GenerationConfig {
             max_new_tokens: req.max_new_tokens as usize,
@@ -1887,6 +1938,25 @@ impl TextLlm for LlamaProvider {
     }
 }
 
+fn validate_context_window(
+    cap: usize,
+    prompt_tokens: usize,
+    max_new_tokens: u32,
+) -> CoreResult<()> {
+    if cap == 0 {
+        return Ok(());
+    }
+    let total = prompt_tokens
+        .checked_add(max_new_tokens as usize)
+        .ok_or_else(|| CoreError::InvalidRequest("prompt + generation length overflow".into()))?;
+    if total > cap {
+        return Err(CoreError::InvalidRequest(format!(
+            "expanded prompt ({prompt_tokens} tokens) + requested generation ({max_new_tokens}) exceeds context window {cap}"
+        )));
+    }
+    Ok(())
+}
+
 /// The descriptor for the `candle-llama` provider (constructible without loading weights; used for
 /// explicit catalog composition and inspection).
 pub fn provider_descriptor() -> TextLlmDescriptor {
@@ -2043,9 +2113,21 @@ fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
 /// embedder loads alongside the decoder, sc-18772). Reads only `config.json` — never a weight shard.
 /// GGUF is declined (candle's GGUF path is dense text-only).
 pub fn can_load_vision(spec: &LoadSpec) -> bool {
+    if crate::gguf::is_gguf_path(&spec.source) {
+        return crate::prism_checkpoint::PrismGgufCheckpoint::is_prism(Path::new(&spec.source))
+            .unwrap_or(false)
+            && spec.projector_source.as_deref().is_some_and(|path| {
+                crate::prism_vision_gguf::PrismVisionGguf::is_qwen3vl_merger(Path::new(path))
+            });
+    }
     let Some(v) = probe_config(spec) else {
         return false;
     };
+    if v.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35") {
+        return spec.projector_source.is_none()
+            && v.get("vision_config").is_some()
+            && v.pointer("/components/vision").and_then(Value::as_bool) == Some(true);
+    }
     let qwen_vl = v.get("vision_config").is_some()
         && matches!(
             Architecture::from_config(&v),
@@ -2121,6 +2203,16 @@ fn gemma4_multimodal(v: &serde_json::Value, block: &str, token_key: &str) -> boo
 /// end-to-end: Qwen3.6, Qwen3-VL, and Gemma 4 unified.
 pub fn can_load(spec: &LoadSpec) -> bool {
     if crate::gguf::is_gguf_path(&spec.source) {
+        let prism = crate::prism_checkpoint::PrismGgufCheckpoint::is_prism(Path::new(&spec.source))
+            .unwrap_or(false);
+        if prism {
+            return spec.projector_source.as_deref().is_none_or(|path| {
+                crate::prism_vision_gguf::PrismVisionGguf::is_qwen3vl_merger(Path::new(path))
+            });
+        }
+        if spec.projector_source.is_some() {
+            return false;
+        }
         // Confirm the GGUF's architecture from its header alone (weightless) — accept iff the loader
         // can actually reconstruct it. A `.gguf` that is missing/corrupt or names an unsupported arch
         // resolves to `None` and is declined.
@@ -2141,6 +2233,9 @@ pub fn can_load(spec: &LoadSpec) -> bool {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
         return false;
     };
+    if v.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35") {
+        return spec.projector_source.is_none();
+    }
     // A multimodal snapshot (a `vision_config` block) is normally declined so a vision provider claims
     // it — EXCEPT the families this provider serves directly: Qwen3.6 (`qwen3_5`) and Qwen3-VL
     // (`qwen3_vl`), whose checkpoints are VLM-wrapped but whose matching ViT tower loads here, and
@@ -2159,10 +2254,43 @@ pub fn can_load(spec: &LoadSpec) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        eos_token_ids, expand_vision_placeholders, merged_frame_timestamps, prompt_opens_thinking,
-        video_placeholder_text,
+        can_load, can_load_vision, eos_token_ids, expand_vision_placeholders,
+        merged_frame_timestamps, prompt_opens_thinking, substitute_vision_placeholders,
+        validate_context_window, video_placeholder_text,
     };
-    use core_llm::{ImageRef, VideoRef};
+    use core_llm::{Content, ImageRef, LoadSpec, Message, Role, VideoRef};
+
+    #[test]
+    fn prism_mlx_weightless_probe_requires_declared_embedded_vision() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = |vision: bool| {
+            serde_json::json!({
+                "model_type": "prism_hadamard_qwen35",
+                "components": {"text": true, "vision": vision, "mtp": false},
+                "vision_config": {"depth": 1}
+            })
+        };
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&config(true)).unwrap(),
+        )
+        .unwrap();
+        let spec = LoadSpec::dense(dir.path().to_string_lossy());
+        assert!(can_load(&spec));
+        assert!(can_load_vision(&spec));
+
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&config(false)).unwrap(),
+        )
+        .unwrap();
+        assert!(can_load(&spec), "text Bonsai remains loadable");
+        assert!(!can_load_vision(&spec));
+
+        let associated = spec.clone().with_projector("external.gguf");
+        assert!(!can_load(&associated));
+        assert!(!can_load_vision(&associated));
+    }
 
     #[test]
     fn frozen_qwen38_generation_config_uses_both_official_stop_tokens() {
@@ -2272,6 +2400,32 @@ mod tests {
         for (g, w) in got.iter().zip(&want) {
             assert!((g - w).abs() < 1e-5, "merged timestamp {g} vs HF {w}");
         }
+    }
+
+    #[test]
+    fn invalid_video_timestamps_fail_before_prompt_rendering() {
+        let frame = || ImageRef::new(1, 1, vec![0, 0, 0]).unwrap();
+        for timestamps in [vec![0.0, f32::NAN], vec![0.5, 0.25], vec![-0.1, 0.0]] {
+            let video = VideoRef::new(vec![frame(), frame()], timestamps).unwrap();
+            let messages = vec![Message {
+                role: Role::User,
+                content: vec![Content::Video(video)],
+                thinking: None,
+                tool_calls: Vec::new(),
+            }];
+            let error = substitute_vision_placeholders(&messages, 2)
+                .expect_err("invalid timestamp sequence accepted");
+            assert!(error.to_string().contains("timestamp"));
+        }
+    }
+
+    #[test]
+    fn expanded_media_tokens_count_against_context_window() {
+        validate_context_window(64, 48, 16).unwrap();
+        let error = validate_context_window(64, 49, 16)
+            .expect_err("expanded prompt over context was accepted");
+        assert!(error.to_string().contains("expanded prompt (49 tokens)"));
+        assert!(error.to_string().contains("context window 64"));
     }
 
     /// **The per-frame `<|video_pad|>` expansion matches the HF id stream.** Tokenizing the reference

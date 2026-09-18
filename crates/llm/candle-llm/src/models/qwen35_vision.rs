@@ -391,9 +391,10 @@ impl Qwen35VisionModel {
                 || block.fc2.is_quantized()
         }) || self.merger.fc1.is_quantized()
             || self.merger.fc2.is_quantized()
-            || self.deepstack_mergers.iter().any(|merger| {
-                merger.fc1.is_quantized() || merger.fc2.is_quantized()
-            })
+            || self
+                .deepstack_mergers
+                .iter()
+                .any(|merger| merger.fc1.is_quantized() || merger.fc2.is_quantized())
     }
 
     /// Encode preprocessed `pixel_values` `[total_patches, C·T·P·P]` for the images described by
@@ -868,12 +869,32 @@ mod tests {
         );
         put("model.visual.merger.linear_fc2.bias", "mg_fc2_b", &[out_h]);
 
+        // The published Bonsai MLX artifact stores only the Conv3d kernel channels-last and uses
+        // the `vision_tower.*` namespace. Build that exact alternate view from the same oracle so
+        // the two native loaders must produce identical features.
+        let mut mlx_map = HashMap::new();
+        for (name, value) in &m {
+            let target = name.replacen("model.visual", "vision_tower", 1);
+            let value = if name == "model.visual.patch_embed.proj.weight" {
+                value.permute((0, 2, 3, 4, 1)).unwrap()
+            } else {
+                value.clone()
+            };
+            mlx_map.insert(target, value);
+        }
+
         let w = Weights::from_map(m, dev.clone());
         let model = Qwen35VisionModel::from_weights(&w, "model.visual", cfg.clone()).unwrap();
+        let mlx_weights = Weights::from_map(mlx_map, dev.clone());
+        let mlx_model =
+            Qwen35VisionModel::from_mlx_weights(&mlx_weights, "vision_tower", cfg.clone()).unwrap();
 
         let pixel = Tensor::from_vec(arr(&j, "pixel"), (n, cfg.patch_in() as usize), &dev).unwrap();
         let out = model.forward(&pixel, &grid).unwrap();
+        let mlx_out = mlx_model.forward(&pixel, &grid).unwrap();
         assert_eq!(out.dims(), &[n / 4, out_h]);
+
+        let mlx_got = mlx_out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
 
         let got = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let exp = arr(&j, "expected_output");
@@ -888,6 +909,7 @@ mod tests {
             rel < 3e-3,
             "vision encoder vs reference: rel err {rel} (max|Δ| {max_abs}, max|exp| {max_mag})"
         );
+        assert_eq!(got, mlx_got, "MLX Conv3d layout conversion drifted");
     }
 
     fn qwen3vl_oracle() -> serde_json::Value {
