@@ -15,7 +15,7 @@ use std::path::Path;
 use core_llm::{
     AudioRef, Channel, ChatTemplate, Constraint, ConstraintDecodeTable, ConstraintKind, Content,
     Error as CoreError, FinishReason as CoreFinish, ImageRef, IncrementalDetok, JinjaChatTemplate,
-    JsonConstraint, Llama3Template, LoadSpec, Message, Quantize, RenderOptions,
+    JsonConstraint, Llama3Template, LoadSpec, Message, MtpMode, Quantize, RenderOptions,
     Result as CoreResult, Sampling, StopMatcher, StreamEvent as CoreEvent, TextLlm,
     TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter,
     Tokenizer, ToolCallSegmenter, Usage, VideoRef,
@@ -23,8 +23,8 @@ use core_llm::{
 
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
-    generate_from_prefill, generate_with, ConstraintMask, Decode, FinishReason, GenerationConfig,
-    StreamEvent,
+    generate_from_prefill, generate_qwen35_mtp, generate_with, ConstraintMask, Decode,
+    FinishReason, GenerationConfig, RewindableConstraintMask, StreamEvent,
 };
 use crate::image::Qwen35ImageProcessor;
 use crate::models::gemma4_mm;
@@ -820,14 +820,46 @@ impl LlamaProvider {
 }
 
 /// Adapts a `core_llm::JsonConstraint` to the engine's [`ConstraintMask`] decode seam.
-struct JsonMask<'a>(JsonConstraint<'a>);
+struct JsonMask<'a> {
+    inner: JsonConstraint<'a>,
+    table: &'a ConstraintDecodeTable,
+    stop_ids: Vec<u32>,
+    accepted: Vec<i32>,
+}
+
+impl<'a> JsonMask<'a> {
+    fn new(table: &'a ConstraintDecodeTable, stop_ids: impl IntoIterator<Item = u32>) -> Self {
+        let stop_ids = stop_ids.into_iter().collect::<Vec<_>>();
+        Self {
+            inner: JsonConstraint::new(table, stop_ids.iter().copied()),
+            table,
+            stop_ids,
+            accepted: Vec::new(),
+        }
+    }
+}
 
 impl ConstraintMask for JsonMask<'_> {
     fn allowed(&mut self) -> &[bool] {
-        self.0.allowed()
+        self.inner.allowed()
     }
     fn accept(&mut self, token: i32) {
-        self.0.accept(token as u32);
+        self.inner.accept(token as u32);
+        self.accepted.push(token);
+    }
+}
+
+impl RewindableConstraintMask for JsonMask<'_> {
+    fn checkpoint(&self) -> usize {
+        self.accepted.len()
+    }
+
+    fn rewind(&mut self, checkpoint: usize) {
+        self.accepted.truncate(checkpoint);
+        self.inner = JsonConstraint::new(self.table, self.stop_ids.iter().copied());
+        for &token in &self.accepted {
+            self.inner.accept(token as u32);
+        }
     }
 }
 
@@ -1037,16 +1069,37 @@ impl TextLlm for LlamaProvider {
             stop_tokens: self.stop_tokens.clone(),
         };
 
+        let mut mtp_draft_tokens = match req.mtp {
+            MtpMode::Off => None,
+            MtpMode::Auto => self
+                .descriptor
+                .capabilities
+                .mtp
+                .map(|caps| caps.recommended_draft_tokens as usize),
+            MtpMode::Enabled { draft_tokens } => Some(draft_tokens as usize),
+        };
+        // The current MTP seeding contract is text-only: multimodal prompts require fused visual
+        // rows and M-RoPE positions. Auto safely falls back to AR; explicit enablement rejects the
+        // unsupported combination rather than silently changing the request.
+        if mtp_draft_tokens.is_some() && (multimodal || gemma4_mm_request) {
+            if matches!(req.mtp, MtpMode::Enabled { .. }) {
+                return Err(CoreError::Unsupported(
+                    "[mlx-llama] native MTP currently supports text prompts only".into(),
+                ));
+            }
+            mtp_draft_tokens = None;
+        }
+
         // Structured-output constraint (story 7166): build a JSON mask over the cached decode table.
         let mut json_mask = match req.constraint {
             Some(Constraint::Json) => {
                 let table = self
                     .constraint_table
                     .get_or_init(|| self.tokenizer.constraint_decode_table());
-                Some(JsonMask(JsonConstraint::new(
+                Some(JsonMask::new(
                     table,
                     self.stop_tokens.iter().map(|&i| i as u32),
-                )))
+                ))
             }
             None => None,
         };
@@ -1103,7 +1156,7 @@ impl TextLlm for LlamaProvider {
         // The segmenter (when active) splits each delta into reasoning vs answer; answer text then
         // feeds the stop matcher so a stop string is trimmed and halts generation.
         let tokenizer = &self.tokenizer;
-        let out = {
+        let (out, mtp_stats) = {
             let mut acc: Vec<u32> = Vec::new();
             let mut detok = IncrementalDetok::new();
             let mut sink = |ev: StreamEvent| {
@@ -1167,7 +1220,6 @@ impl TextLlm for LlamaProvider {
                     }
                 }
             };
-            let constraint = json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask);
             let should_stop = || halt.get();
             let should_stop_opt = stop_active.then_some(&should_stop as &dyn Fn() -> bool);
             match &mm {
@@ -1192,7 +1244,7 @@ impl TextLlm for LlamaProvider {
                         model,
                         delta: *delta,
                     };
-                    generate_from_prefill(
+                    let out = generate_from_prefill(
                         &shifted,
                         cache.as_mut(),
                         first,
@@ -1200,10 +1252,11 @@ impl TextLlm for LlamaProvider {
                         &config,
                         &req.cancel,
                         &mut sink,
-                        constraint,
+                        json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask),
                         should_stop_opt,
                     )
-                    .map_err(to_core)?
+                    .map_err(to_core)?;
+                    (out, None)
                 }
                 // Gemma 4 multimodal: prefill the spliced embeds on ordinary causal 1-D positions
                 // (no M-RoPE, so no position shift for the continuation), then decode through the
@@ -1224,7 +1277,7 @@ impl TextLlm for LlamaProvider {
                         let first = model
                             .decode_logits_from_embeds(&m.embeds, &mut cache, 0)
                             .map_err(to_core)?;
-                        generate_from_prefill(
+                        let out = generate_from_prefill(
                             &self.model,
                             &mut cache,
                             first,
@@ -1232,21 +1285,43 @@ impl TextLlm for LlamaProvider {
                             &config,
                             &req.cancel,
                             &mut sink,
-                            constraint,
+                            json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask),
                             should_stop_opt,
                         )
-                        .map_err(to_core)?
+                        .map_err(to_core)?;
+                        (out, None)
                     }
-                    None => generate_with(
-                        &self.model,
-                        &prompt_ids,
-                        &config,
-                        &req.cancel,
-                        &mut sink,
-                        constraint,
-                        should_stop_opt,
-                    )
-                    .map_err(to_core)?,
+                    None => match (&self.model, mtp_draft_tokens) {
+                        (Decoder::Qwen35(model), Some(num_draft)) => {
+                            let (out, stats) = generate_qwen35_mtp(
+                                model,
+                                &prompt_ids,
+                                &config,
+                                num_draft,
+                                &req.cancel,
+                                &mut sink,
+                                json_mask
+                                    .as_mut()
+                                    .map(|m| m as &mut dyn RewindableConstraintMask),
+                                should_stop_opt,
+                            )
+                            .map_err(to_core)?;
+                            (out, Some(stats))
+                        }
+                        _ => {
+                            let out = generate_with(
+                                &self.model,
+                                &prompt_ids,
+                                &config,
+                                &req.cancel,
+                                &mut sink,
+                                json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask),
+                                should_stop_opt,
+                            )
+                            .map_err(to_core)?;
+                            (out, None)
+                        }
+                    },
                 },
             }
         };
@@ -1344,6 +1419,11 @@ impl TextLlm for LlamaProvider {
             thinking,
             tool_calls,
             usage,
+            mtp: mtp_stats.map(|stats| core_llm::MtpStats {
+                proposed_tokens: u32::try_from(stats.proposed).unwrap_or(u32::MAX),
+                accepted_tokens: u32::try_from(stats.accepted).unwrap_or(u32::MAX),
+                target_forwards: u32::try_from(stats.forwards).unwrap_or(u32::MAX),
+            }),
             finish_reason: Some(finish),
         })
     }
@@ -1374,6 +1454,7 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             // Weightless default: conservative. The load path flips this on when the loaded model's
             // chat template renders tool calls (sc-7636).
             supports_tools: false,
+            mtp: None,
             // JSON-constrained decoding (sc-7166).
             supported_constraints: vec![ConstraintKind::Json],
         },
@@ -1395,6 +1476,12 @@ fn descriptor_for_qwen35(cfg: &Qwen35Config) -> TextLlmDescriptor {
     let mut d = provider_descriptor();
     d.family = Architecture::Qwen35.family().to_string();
     d.capabilities.max_context_tokens = cfg.max_position_embeddings.max(0) as usize;
+    if cfg.mtp_num_hidden_layers > 0 {
+        d.capabilities.mtp = Some(core_llm::MtpCapabilities {
+            max_draft_tokens: u32::MAX,
+            recommended_draft_tokens: 3,
+        });
+    }
     d
 }
 

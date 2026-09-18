@@ -12,11 +12,12 @@
 //! model's own chat template.
 
 use core_llm::{
-    Channel, LoadSpec, Message, Quantize, Sampling, StreamEvent, TextLlm, TextLlmOutput,
-    TextLlmRequest, ThinkingMode,
+    Channel, LoadSpec, Message, MtpMode, Quantize, Sampling, StreamEvent, TextLlm, TextLlmOutput,
+    TextLlmRequest, ThinkingMode, ToolSpec,
 };
 use mlx_llm::provider::PROVIDER_ID;
 use mlx_llm::LlamaProvider;
+use mlx_rs::Array;
 
 fn req(prompt: &str, mode: ThinkingMode, max_new_tokens: u32) -> TextLlmRequest {
     TextLlmRequest {
@@ -47,6 +48,144 @@ fn run(p: &dyn TextLlm, r: &TextLlmRequest) -> (TextLlmOutput, String, String) {
 
 fn model_dir() -> String {
     std::env::var("MLX_LLM_QWEN35_MODEL").expect("set MLX_LLM_QWEN35_MODEL")
+}
+
+/// A tiny Qwen3.8-shaped snapshot using the exact frozen tokenizer/template. Set
+/// `QWEN38_TOKENIZER_JSON` to the pinned tokenizer file; weights are synthetic and small except for
+/// the shared 248,320-row vocabulary tables.
+fn write_tiny_qwen38_snapshot() -> Option<tempfile::TempDir> {
+    let tokenizer = std::env::var_os("QWEN38_TOKENIZER_JSON")?;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(tokenizer, dir.path().join("tokenizer.json")).unwrap();
+    std::fs::write(
+        dir.path().join("tokenizer_config.json"),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../docs/reference/qwen38/tokenizer_config.json"
+        )),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("generation_config.json"),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../docs/reference/qwen38/generation_config.json"
+        )),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("config.json"),
+        r#"{
+          "architectures":["Qwen3_5ForConditionalGeneration"], "model_type":"qwen3_5",
+          "text_config":{
+            "model_type":"qwen3_5_text", "hidden_size":8, "num_hidden_layers":1,
+            "intermediate_size":16, "num_attention_heads":2, "num_key_value_heads":1,
+            "head_dim":4, "vocab_size":248320, "rms_norm_eps":0.000001,
+            "rope_theta":10000000.0, "partial_rotary_factor":1.0,
+            "max_position_embeddings":512, "tie_word_embeddings":false,
+            "full_attention_interval":1, "linear_num_value_heads":2,
+            "linear_num_key_heads":1, "linear_key_head_dim":4,
+            "linear_value_head_dim":4, "linear_conv_kernel_dim":4,
+            "mtp_num_hidden_layers":1, "mtp_use_dedicated_embeddings":false
+          }
+        }"#,
+    )
+    .unwrap();
+
+    let z = |shape: &[i32]| Array::zeros::<f32>(shape).unwrap();
+    let (h, vocab, inter, q, kv) = (8, 248_320, 16, 16, 4);
+    let mut tensors: Vec<(String, Array)> = vec![
+        (
+            "model.language_model.embed_tokens.weight".into(),
+            z(&[vocab, h]),
+        ),
+        ("model.language_model.norm.weight".into(), z(&[h])),
+        ("lm_head.weight".into(), z(&[vocab, h])),
+    ];
+    let mut layer = |prefix: &str| {
+        tensors.extend([
+            (format!("{prefix}.input_layernorm.weight"), z(&[h])),
+            (format!("{prefix}.post_attention_layernorm.weight"), z(&[h])),
+            (format!("{prefix}.self_attn.q_proj.weight"), z(&[q, h])),
+            (format!("{prefix}.self_attn.k_proj.weight"), z(&[kv, h])),
+            (format!("{prefix}.self_attn.v_proj.weight"), z(&[kv, h])),
+            (format!("{prefix}.self_attn.o_proj.weight"), z(&[h, 8])),
+            (format!("{prefix}.self_attn.q_norm.weight"), z(&[4])),
+            (format!("{prefix}.self_attn.k_norm.weight"), z(&[4])),
+            (format!("{prefix}.mlp.gate_proj.weight"), z(&[inter, h])),
+            (format!("{prefix}.mlp.up_proj.weight"), z(&[inter, h])),
+            (format!("{prefix}.mlp.down_proj.weight"), z(&[h, inter])),
+        ]);
+    };
+    layer("model.language_model.layers.0");
+    layer("mtp.layers.0");
+    tensors.extend([
+        ("mtp.fc.weight".into(), z(&[h, 2 * h])),
+        ("mtp.pre_fc_norm_embedding.weight".into(), z(&[h])),
+        ("mtp.pre_fc_norm_hidden.weight".into(), z(&[h])),
+        ("mtp.norm.weight".into(), z(&[h])),
+    ]);
+    let refs: Vec<(&str, &Array)> = tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    Array::save_safetensors(refs, None, dir.path().join("model.safetensors")).unwrap();
+    Some(dir)
+}
+
+#[test]
+fn frozen_qwen38_tokenizer_runs_tiny_native_text_and_mtp() {
+    let Some(dir) = write_tiny_qwen38_snapshot() else {
+        eprintln!("skipping: set QWEN38_TOKENIZER_JSON to the frozen tokenizer.json");
+        return;
+    };
+    let provider = LlamaProvider::load(&LoadSpec::dense(dir.path().display().to_string())).unwrap();
+    let mtp = provider.descriptor().capabilities.mtp.unwrap();
+    assert_eq!(mtp.recommended_draft_tokens, 3);
+    assert_eq!(mtp.max_draft_tokens, u32::MAX);
+
+    let ar = provider
+        .generate(
+            &req("ordinary autoregressive route", ThinkingMode::Disabled, 1),
+            &mut |_| {},
+        )
+        .unwrap();
+    assert!(ar.mtp.is_none(), "MTP must remain opt-in by default");
+
+    let mut request = req("What is 2+2?", ThinkingMode::Disabled, 4);
+    request.mtp = MtpMode::Enabled { draft_tokens: 3 };
+    let (output, thinking, content) = run(&provider, &request);
+    assert_eq!(output.usage.generated_tokens, 4);
+    assert!(thinking.is_empty());
+    assert_eq!(content, output.text);
+    let stats = output.mtp.expect("MTP stats");
+    assert!(stats.proposed_tokens > 0);
+    assert!(stats.accepted_tokens <= stats.proposed_tokens);
+    assert!(stats.target_forwards >= 2);
+
+    // The same native provider route accepts the frozen template's tool prompt while MTP is active.
+    let mut with_tool = req("weather in Paris?", ThinkingMode::Disabled, 2);
+    with_tool.mtp = MtpMode::Auto;
+    with_tool.tools = vec![ToolSpec::new(
+        "get_weather",
+        "Get the weather",
+        serde_json::json!({"type":"object","properties":{"location":{"type":"string"}}}),
+    )];
+    let out = provider.generate(&with_tool, &mut |_| {}).unwrap();
+    assert!(out.mtp.is_some());
+
+    let mut constrained = req("return json", ThinkingMode::Disabled, 2);
+    constrained.mtp = MtpMode::Enabled { draft_tokens: 1 };
+    constrained.constraint = Some(core_llm::Constraint::Json);
+    let constrained_mtp = provider.generate(&constrained, &mut |_| {}).unwrap();
+    assert!(
+        constrained_mtp.mtp.is_some(),
+        "explicit MTP must preserve native JSON-constrained generation"
+    );
+
+    constrained.mtp = MtpMode::Auto;
+    let auto = provider.generate(&constrained, &mut |_| {}).unwrap();
+    assert!(
+        auto.mtp.is_some(),
+        "Auto must retain MTP for native JSON-constrained generation"
+    );
 }
 
 #[test]
