@@ -13,19 +13,19 @@ use std::path::Path;
 use candle_core::{DType, Device, Tensor};
 use core_llm::{
     AudioRef, Channel, ChatTemplate, Constraint, ConstraintDecodeTable, ConstraintKind, Content,
-    Error as CoreError, FinishReason as CoreFinish, ImageRef, IncrementalDetok, JinjaChatTemplate,
-    JsonConstraint, Llama3Template, LoadSpec, Message, MtpCapabilities, MtpMode, MtpStats,
-    Quantize, RenderOptions, Result as CoreResult, Sampling, StreamEvent as CoreEvent, TextLlm,
-    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter,
-    Tokenizer, ToolCallSegmenter, Usage, VideoRef,
+    Error as CoreError, FinishReason as CoreFinish, GenerationTimings, ImageRef, IncrementalDetok,
+    JinjaChatTemplate, JsonConstraint, Llama3Template, LoadSpec, Message, MtpCapabilities, MtpMode,
+    MtpStats, Quantize, RenderOptions, Result as CoreResult, Sampling, StreamEvent as CoreEvent,
+    TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest,
+    ThinkingSegmenter, Tokenizer, ToolCallSegmenter, Usage, VideoRef,
 };
 use serde_json::Value;
 
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
-    generate_from_prefill, generate_qwen35_mtp, generate_qwen35_mtp_multimodal, generate_with,
-    ConstraintMask, Decode, FinishReason, GenerationConfig, Qwen35MtpMultimodalPrompt,
-    RewindableConstraintMask, StreamEvent,
+    generate_from_prefill, generate_qwen35_mtp_multimodal, generate_qwen35_mtp_timed,
+    generate_with, ConstraintMask, Decode, FinishReason, GenerationConfig,
+    Qwen35MtpMultimodalPrompt, RewindableConstraintMask, StreamEvent,
 };
 use crate::device::select_device;
 use crate::gguf::GgufCheckpoint;
@@ -1470,6 +1470,7 @@ impl TextLlm for LlamaProvider {
         // The segmenter (when active) splits each delta into reasoning vs answer.
         let tokenizer = &self.tokenizer;
         let mut mtp_stats = None;
+        let mut generation_timings = None;
         let out = {
             let mut acc: Vec<u32> = Vec::new();
             let mut detok = IncrementalDetok::new();
@@ -1581,17 +1582,44 @@ impl TextLlm for LlamaProvider {
                         )
                         .map_err(to_core)?
                     }
-                    None => generate_qwen35_mtp(
-                        target,
-                        mtp,
-                        &prompt_ids,
-                        &config,
-                        draft_tokens,
-                        &req.cancel,
-                        &mut sink,
-                        constraint,
-                    )
-                    .map_err(to_core)?,
+                    None => {
+                        target
+                            .device()
+                            .synchronize()
+                            .map_err(|e| to_core(e.into()))?;
+                        let prefill_started = std::time::Instant::now();
+                        let mut prefill = None;
+                        let mut decode_started = None;
+                        let mut boundary = || -> crate::error::Result<()> {
+                            target.device().synchronize()?;
+                            prefill = Some(prefill_started.elapsed());
+                            decode_started = Some(std::time::Instant::now());
+                            Ok(())
+                        };
+                        let result = generate_qwen35_mtp_timed(
+                            target,
+                            mtp,
+                            &prompt_ids,
+                            &config,
+                            draft_tokens,
+                            &req.cancel,
+                            &mut sink,
+                            constraint,
+                            &mut boundary,
+                        )
+                        .map_err(to_core)?;
+                        target
+                            .device()
+                            .synchronize()
+                            .map_err(|e| to_core(e.into()))?;
+                        generation_timings = Some(GenerationTimings {
+                            prefill: prefill.unwrap_or_default(),
+                            decode: decode_started
+                                .map(|start| start.elapsed())
+                                .unwrap_or_default(),
+                        });
+                        result
+                    }
                 };
                 mtp_stats = Some(MtpStats {
                     proposed_tokens: u32::try_from(stats.proposed).unwrap_or(u32::MAX),
@@ -1663,15 +1691,55 @@ impl TextLlm for LlamaProvider {
                             )
                             .map_err(to_core)?
                         }
-                        None => generate_with(
-                            &self.model,
-                            &prompt_ids,
-                            &config,
-                            &req.cancel,
-                            &mut sink,
-                            constraint,
-                        )
-                        .map_err(to_core)?,
+                        None => match &self.model {
+                            Decoder::Qwen35(_) => {
+                                self.model
+                                    .device()
+                                    .synchronize()
+                                    .map_err(|e| to_core(e.into()))?;
+                                let prefill_started = std::time::Instant::now();
+                                let mut cache = self.model.make_cache();
+                                let ids =
+                                    input_ids(&prompt_ids, self.model.device()).map_err(to_core)?;
+                                let first =
+                                    self.model.step(&ids, &mut *cache, 0).map_err(to_core)?;
+                                self.model
+                                    .device()
+                                    .synchronize()
+                                    .map_err(|e| to_core(e.into()))?;
+                                let prefill = prefill_started.elapsed();
+                                let decode_started = std::time::Instant::now();
+                                let result = generate_from_prefill(
+                                    &self.model,
+                                    &mut *cache,
+                                    first,
+                                    prompt_ids.clone(),
+                                    &config,
+                                    &req.cancel,
+                                    &mut sink,
+                                    constraint,
+                                )
+                                .map_err(to_core)?;
+                                self.model
+                                    .device()
+                                    .synchronize()
+                                    .map_err(|e| to_core(e.into()))?;
+                                generation_timings = Some(GenerationTimings {
+                                    prefill,
+                                    decode: decode_started.elapsed(),
+                                });
+                                result
+                            }
+                            Decoder::Causal(_) => generate_with(
+                                &self.model,
+                                &prompt_ids,
+                                &config,
+                                &req.cancel,
+                                &mut sink,
+                                constraint,
+                            )
+                            .map_err(to_core)?,
+                        },
                     },
                 }
             }
@@ -1748,7 +1816,7 @@ impl TextLlm for LlamaProvider {
             usage,
         });
         Ok(TextLlmOutput {
-            timings: None,
+            timings: generation_timings,
             text,
             thinking,
             tool_calls,

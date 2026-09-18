@@ -62,7 +62,35 @@ pub fn generate_qwen35_mtp(
     constraint: Option<&mut dyn RewindableConstraintMask>,
 ) -> Result<(GenerationOutput, SpeculativeStats)> {
     generate_qwen35_mtp_inner(
-        target, mtp, prompt_ids, None, config, num_draft, cancel, on_event, constraint,
+        target, mtp, prompt_ids, None, config, num_draft, cancel, on_event, constraint, None,
+    )
+}
+
+/// Timed-provider seam: invokes `on_prefill_complete` only after both target and MTP prompt caches
+/// are populated. The callback may synchronize an asynchronous device before recording the split.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_qwen35_mtp_timed(
+    target: &Qwen35Model,
+    mtp: &Qwen35Mtp,
+    prompt_ids: &[i32],
+    config: &GenerationConfig,
+    num_draft: u32,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    constraint: Option<&mut dyn RewindableConstraintMask>,
+    on_prefill_complete: &mut dyn FnMut() -> Result<()>,
+) -> Result<(GenerationOutput, SpeculativeStats)> {
+    generate_qwen35_mtp_inner(
+        target,
+        mtp,
+        prompt_ids,
+        None,
+        config,
+        num_draft,
+        cancel,
+        on_event,
+        constraint,
+        Some(on_prefill_complete),
     )
 }
 
@@ -90,6 +118,7 @@ pub fn generate_qwen35_mtp_multimodal(
         cancel,
         on_event,
         constraint,
+        None,
     )
 }
 
@@ -104,6 +133,7 @@ fn generate_qwen35_mtp_inner(
     cancel: &CancelFlag,
     on_event: &mut dyn FnMut(StreamEvent),
     mut constraint: Option<&mut dyn RewindableConstraintMask>,
+    mut prefill_boundary: Option<&mut dyn FnMut() -> Result<()>>,
 ) -> Result<(GenerationOutput, SpeculativeStats)> {
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
@@ -183,6 +213,9 @@ fn generate_qwen35_mtp_inner(
                 let _ = mtp.forward_sequence(&prompt_ids[1..], &previous, 1, &mut mtp_cache)?;
             }
         }
+    }
+    if let Some(boundary) = prefill_boundary.as_mut() {
+        boundary()?;
     }
 
     let mut history = prompt_ids.to_vec();

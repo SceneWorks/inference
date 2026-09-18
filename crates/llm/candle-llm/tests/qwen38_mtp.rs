@@ -310,6 +310,10 @@ fn frozen_qwen38_provider_executes_ar_mtp_tools_and_stops() {
         .generate(&request("ordinary autoregressive route", 2), &mut |_| {})
         .unwrap();
     assert!(ar.mtp.is_none(), "MTP remains opt-in by default");
+    assert!(
+        ar.timings.is_some(),
+        "native Qwen AR reports synchronized phase timings"
+    );
     assert_eq!(ar.usage.generated_tokens, 2);
 
     let mut mtp_request = request("What is 2+2?", 4);
@@ -325,6 +329,10 @@ fn frozen_qwen38_provider_executes_ar_mtp_tools_and_stops() {
             }
         })
         .unwrap();
+    assert!(
+        mtp.timings.is_some(),
+        "native Qwen MTP reports synchronized phase timings"
+    );
     assert!(thinking.is_empty());
     assert_eq!(content, mtp.text);
     assert_eq!(mtp.usage.generated_tokens, 4);

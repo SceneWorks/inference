@@ -22,8 +22,8 @@ pub use cancel::CancelFlag;
 pub use continuous::{generate_continuous, BatchExactness, ContinuousConfig};
 pub use prefix::{generate_cached, PrefixCache, PrefixStats};
 pub use qwen_mtp::{
-    generate_qwen35_mtp, generate_qwen35_mtp_multimodal, Qwen35MtpMultimodalPrompt,
-    RewindableConstraintMask,
+    generate_qwen35_mtp, generate_qwen35_mtp_multimodal, generate_qwen35_mtp_timed,
+    Qwen35MtpMultimodalPrompt, RewindableConstraintMask,
 };
 pub use speculative::{
     generate_draft_speculative, generate_prompt_lookup, SpeculativeConfig, SpeculativeStats,
