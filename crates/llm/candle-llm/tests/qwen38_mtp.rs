@@ -297,6 +297,8 @@ fn frozen_qwen38_provider_executes_ar_mtp_tools_and_stops() {
         .expect("load tiny Qwen3.8 Candle provider");
     let capabilities = &provider.descriptor().capabilities;
     assert!(capabilities.supports_thinking);
+    assert!(capabilities.supports_reasoning_effort);
+    assert!(capabilities.supports_preserve_thinking);
     assert!(capabilities.supports_tools);
     assert_eq!(
         capabilities.mtp,
