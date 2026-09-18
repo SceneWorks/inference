@@ -633,6 +633,8 @@ fn gguf_row_map(name: &str, inner: usize, rank: usize, groups: usize) -> Option<
     } else if name.ends_with(".attn_gate.weight")
         || name.ends_with(".ssm_alpha.weight")
         || name.ends_with(".ssm_beta.weight")
+        || name.ends_with(".ssm_a")
+        || name.ends_with(".ssm_dt.bias")
     {
         Some(GdnRowMap {
             prefix: 0,
@@ -664,12 +666,20 @@ fn decode_plain(ty: u32, data: &[u8]) -> Result<Vec<f32>> {
 }
 
 fn reorder_dense_rows(values: &mut Vec<f32>, shape: &[usize], map: GdnRowMap) -> Result<()> {
-    if shape.len() != 2 {
+    let (rows, cols) = match shape {
+        [rows] => (*rows, 1),
+        [rows, cols] => (*rows, *cols),
+        _ => {
+            return Err(Error::Config(
+                "GGUF row permutation requires a 1-D or 2-D tensor".into(),
+            ))
+        }
+    };
+    if values.len() != rows * cols {
         return Err(Error::Config(
-            "GGUF row permutation requires 2-D tensor".into(),
+            "GGUF row permutation tensor shape does not match its data".into(),
         ));
     }
-    let (rows, cols) = (shape[0], shape[1]);
     map.validate(rows)?;
     let old = values.clone();
     for dst in 0..rows {
@@ -894,7 +904,9 @@ mod tests {
             unit: 1,
         };
         let mut values = vec![0., 1., 2., 3., 4., 5.];
-        reorder_dense_rows(&mut values, &[6, 1], map).unwrap();
+        reorder_dense_rows(&mut values, &[6], map).unwrap();
         assert_eq!(values, vec![0., 2., 4., 1., 3., 5.]);
+        assert!(gguf_row_map("blk.7.ssm_a", 6, 6, 2).is_some());
+        assert!(gguf_row_map("blk.7.ssm_dt.bias", 6, 6, 2).is_some());
     }
 }
