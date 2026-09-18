@@ -71,7 +71,9 @@ pub use constraint::{
 pub use detok::IncrementalDetok;
 pub use error::{Error, Result};
 pub use message::{AudioRef, Content, ImageRef, Message, Role, VideoRef};
-pub use output::{Channel, FinishReason, MtpStats, StreamEvent, TextLlmOutput, Usage};
+pub use output::{
+    Channel, FinishReason, GenerationTimings, MtpStats, StreamEvent, TextLlmOutput, Usage,
+};
 pub use paging::BlockAllocator;
 pub use prefix::{InsertOutcome, PrefixId, PrefixIndex, PrefixMatch};
 pub use prepare::{

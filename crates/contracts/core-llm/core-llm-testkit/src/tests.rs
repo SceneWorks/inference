@@ -126,6 +126,7 @@ impl TextLlm for StubTextLlm {
                     tool_calls: Vec::new(),
                     usage,
                     mtp: None,
+                    timings: None,
                     finish_reason: Some(FinishReason::Cancelled),
                 });
             }
@@ -165,6 +166,7 @@ impl TextLlm for StubTextLlm {
             tool_calls: Vec::new(),
             usage,
             mtp: None,
+            timings: None,
             finish_reason: Some(FinishReason::Length),
         })
     }

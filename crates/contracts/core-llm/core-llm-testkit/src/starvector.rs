@@ -380,6 +380,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage,
                 mtp: None,
+                timings: None,
                 finish_reason: Some(core_llm::FinishReason::Stop),
             })
         }
