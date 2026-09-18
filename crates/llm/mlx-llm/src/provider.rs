@@ -36,6 +36,7 @@ use crate::primitives::kv_cache::KvCache;
 use crate::primitives::projection::QuantSpec;
 use crate::primitives::sampler::SamplingParams;
 use crate::primitives::{input_ids, Weights};
+use crate::prism::PrismMlxPack;
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
 
@@ -409,6 +410,9 @@ pub struct LlamaProvider {
     /// checkpoint that actually ships them (sc-18772). Independent of [`vision`](Self::vision):
     /// Gemma 4 does not use the Qwen-VL ViT/M-RoPE/DeepStack machinery at all.
     gemma4: Option<Gemma4Runtime>,
+    /// Dense Prism `vision_tower.*` tensors retained verbatim for the native multimodal adapter.
+    /// Text loading must not discard them merely because sc-23937 constructs only the decoder.
+    _prism_vision_weights: Option<Weights>,
 }
 
 impl LlamaProvider {
@@ -417,6 +421,9 @@ impl LlamaProvider {
     /// quantizes the projections on load per `spec.quantize`.
     pub fn load(spec: &LoadSpec) -> CoreResult<Self> {
         let dir = Path::new(&spec.source);
+        if dir.extension().and_then(|v| v.to_str()) == Some("gguf") {
+            return Self::load_prism_gguf(spec, dir);
+        }
         let quant = spec.quantize.map(|q| match q {
             Quantize::Q4 => QuantSpec::q4(),
             Quantize::Q8 => QuantSpec::q8(),
@@ -426,13 +433,41 @@ impl LlamaProvider {
         let cfg_value = read_config_value(dir)?;
         let arch = Architecture::from_config(&cfg_value).map_err(to_core)?;
         let weights = Weights::from_dir(dir).map_err(to_core)?;
+        let is_prism =
+            cfg_value.get("model_type").and_then(|v| v.as_str()) == Some("prism_hadamard_qwen35");
+        if is_prism && quant.is_some() {
+            return Err(CoreError::Load(
+                "Prism snapshots are already packed 2-bit and reject load-time Q4/Q8".into(),
+            ));
+        }
 
+        let mut prism_vision_weights = None;
         let (model, mut descriptor) = if arch == Architecture::Qwen35 {
             let qcfg = Qwen35Config::from_json(&cfg_value).map_err(to_core)?;
-            let descriptor = descriptor_for_qwen35(&qcfg);
-            // The text decoder nests under `model.language_model` in the VLM-wrapped checkpoint.
-            let m = Qwen35Model::from_weights_with(&weights, "model.language_model", qcfg, quant)
-                .map_err(to_core)?;
+            let mut descriptor = descriptor_for_qwen35(&qcfg);
+            let m = if is_prism {
+                let pack = PrismMlxPack::from_dir(dir, &cfg_value, &weights).map_err(to_core)?;
+                descriptor.family = "prism_hadamard_qwen35".into();
+                let model =
+                    Qwen35Model::from_prism_weights(&weights, qcfg, &pack).map_err(to_core)?;
+                if pack.has_vision_tower {
+                    let keys = weights
+                        .keys()
+                        .filter(|key| key.starts_with("vision_tower."))
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>();
+                    let retained = keys
+                        .into_iter()
+                        .filter_map(|key| weights.get(&key).cloned().map(|value| (key, value)))
+                        .collect();
+                    prism_vision_weights = Some(Weights::from_map(retained));
+                }
+                model
+            } else {
+                // The text decoder nests under `model.language_model` in the VLM-wrapped checkpoint.
+                Qwen35Model::from_weights_with(&weights, "model.language_model", qcfg, quant)
+                    .map_err(to_core)?
+            };
             (Decoder::Qwen35(m), descriptor)
         } else {
             let cfg = ModelConfig::from_json(&cfg_value).map_err(to_core)?;
@@ -521,12 +556,49 @@ impl LlamaProvider {
             constraint_table: OnceCell::new(),
             vision,
             gemma4,
+            _prism_vision_weights: prism_vision_weights,
+        })
+    }
+
+    fn load_prism_gguf(spec: &LoadSpec, path: &Path) -> CoreResult<Self> {
+        if spec.quantize.is_some() {
+            return Err(CoreError::Load(
+                "Prism GGUF is already packed and rejects load-time Q4/Q8".into(),
+            ));
+        }
+        let file = crate::gguf::GgufFile::open(path).map_err(to_core)?;
+        let loaded = crate::prism_gguf::load(&file).map_err(to_core)?;
+        let qcfg = Qwen35Config::from_json(&loaded.config).map_err(to_core)?;
+        let mut descriptor = descriptor_for_qwen35(&qcfg);
+        descriptor.family = "prism_hadamard_qwen35".into();
+        let (thinking, reasoning, preserve, tools) = loaded.template_capabilities;
+        descriptor.capabilities.supports_thinking = thinking;
+        descriptor.capabilities.supports_reasoning_effort = reasoning;
+        descriptor.capabilities.supports_preserve_thinking = preserve;
+        descriptor.capabilities.supports_tools = tools;
+        let model = Qwen35Model::from_prism_weights(&loaded.weights, qcfg, &loaded.pack)
+            .map_err(to_core)?;
+        Ok(Self {
+            descriptor,
+            model: Decoder::Qwen35(model),
+            tokenizer: loaded.tokenizer,
+            template: loaded.template,
+            stop_tokens: loaded.stop_tokens,
+            constraint_table: OnceCell::new(),
+            vision: None,
+            gemma4: None,
+            _prism_vision_weights: None,
         })
     }
 
     /// Whether the loaded model's projections are quantized.
     pub fn is_quantized(&self) -> bool {
         self.model.is_quantized()
+    }
+
+    /// Whether a Prism VLM's dense vision tensors were retained for the multimodal adapter.
+    pub fn has_deferred_prism_vision(&self) -> bool {
+        self._prism_vision_weights.is_some()
     }
 
     /// Assemble a provider from already-loaded parts with a default Llama-3 template (used by tests
@@ -541,6 +613,7 @@ impl LlamaProvider {
             constraint_table: OnceCell::new(),
             vision: None,
             gemma4: None,
+            _prism_vision_weights: None,
         }
     }
 
@@ -1628,6 +1701,12 @@ fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
 /// (its nested text decoder) so it no longer misroutes to JoyCaption (sc-7626).
 pub fn can_load(spec: &LoadSpec) -> bool {
     let dir = Path::new(&spec.source);
+    if dir.extension().and_then(|v| v.to_str()) == Some("gguf") {
+        return crate::gguf::GgufFile::open(dir).ok().is_some_and(|g| {
+            g.meta_str("general.architecture") == Some("qwen35")
+                && g.meta("prism.hadamard.version").is_some()
+        });
+    }
     let path = if dir.is_dir() {
         dir.join("config.json")
     } else {
@@ -1748,6 +1827,32 @@ fn gemma4_multimodal(v: &serde_json::Value, block: &str, token_key: &str) -> boo
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn reasoning_controls_are_advertised_only_when_template_names_them() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "{{ enable_thinking }} {{ tool_call }}",
+        )
+        .unwrap();
+        let (_, thinking, effort, preserve, tools) = load_chat_template(dir.path());
+        assert!(thinking);
+        assert!(!effort);
+        assert!(!preserve);
+        assert!(tools);
+
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "{{ enable_thinking }} {{ reasoning_effort }} {{ preserve_thinking }}",
+        )
+        .unwrap();
+        let (_, thinking, effort, preserve, tools) = load_chat_template(dir.path());
+        assert!(thinking);
+        assert!(effort);
+        assert!(preserve);
+        assert!(!tools);
+    }
 
     #[test]
     fn frozen_qwen38_generation_config_uses_both_official_stop_tokens() {

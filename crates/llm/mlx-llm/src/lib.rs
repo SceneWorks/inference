@@ -49,6 +49,8 @@ pub mod joycaption;
 pub mod models;
 pub mod prepare;
 pub mod primitives;
+pub mod prism;
+pub mod prism_gguf;
 pub mod provider;
 pub mod residency;
 pub mod snapshot;

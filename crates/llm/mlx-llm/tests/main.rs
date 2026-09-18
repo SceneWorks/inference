@@ -71,6 +71,9 @@ mod prefix;
 #[path = "prepare_snapshot.rs"]
 mod prepare_snapshot;
 
+#[path = "prism.rs"]
+mod prism;
+
 #[path = "qwen35.rs"]
 mod qwen35;
 

@@ -30,9 +30,11 @@ use crate::primitives::gated_delta::{
 };
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::nn::{embed, linear, rms_norm, silu};
+use crate::primitives::prism::PrismEmbedding;
 use crate::primitives::projection::{Projection, QuantSpec};
 use crate::primitives::rope::{apply_rope, Rope};
 use crate::primitives::Weights;
+use crate::prism::PrismMlxPack;
 
 /// Cached decode runs in bf16 (matching the rest of the engine); the delta recurrence accumulates in
 /// f32 (matching the reference GPU kernel) for stability.
@@ -121,7 +123,9 @@ impl Qwen35Config {
             .or_else(|| int("moe_intermediate_size"))
             .unwrap_or(0);
         let nested_quant = parse_quantization(c.get("quantization"), "text_config.quantization")?;
-        let top_quant = if std::ptr::eq(c, v) {
+        let is_prism =
+            v.get("model_type").and_then(|x| x.as_str()) == Some("prism_hadamard_qwen35");
+        let top_quant = if std::ptr::eq(c, v) || is_prism {
             None
         } else {
             parse_quantization(v.get("quantization"), "quantization")?
@@ -614,15 +618,30 @@ impl Qwen35Cache {
 /// A loaded Qwen3.6 (`qwen3_5`) hybrid decoder.
 #[derive(Debug)]
 pub struct Qwen35Model {
-    embed_tokens: Array,
+    embed_tokens: TokenEmbedding,
     layers: Vec<DecoderLayer>,
     norm: Array,
-    lm_head: Array,
+    lm_head: Projection,
     rope: Rope,
     mtp: Option<MtpPredictor>,
     cfg: Qwen35Config,
     eps: f32,
     quantized: bool,
+}
+
+#[derive(Debug)]
+enum TokenEmbedding {
+    Dense(Array),
+    Prism(PrismEmbedding),
+}
+
+impl TokenEmbedding {
+    fn forward(&self, input_ids: &Array) -> Result<Array> {
+        match self {
+            Self::Dense(weight) => embed(weight, input_ids),
+            Self::Prism(embedding) => embedding.forward(input_ids),
+        }
+    }
 }
 
 /// Cache for Qwen3.8's in-checkpoint multi-token predictor. Each predictor layer owns a full-
@@ -686,7 +705,10 @@ impl Qwen35Model {
     /// Run the decoder stack over `input_ids` `[B, S]` at sequence `offset`, returning the final
     /// hidden states `[B, S, hidden]` (before the final norm / lm_head).
     fn hidden(&self, input_ids: &Array, cache: &mut Qwen35Cache, offset: i32) -> Result<Array> {
-        let h = embed(&self.embed_tokens, input_ids)?.as_dtype(COMPUTE_DTYPE)?;
+        let h = self
+            .embed_tokens
+            .forward(input_ids)?
+            .as_dtype(COMPUTE_DTYPE)?;
         let s = h.shape()[1];
         let (cos, sin) = self.rope.cos_sin(s, offset, COMPUTE_DTYPE)?;
         self.hidden_from_embeds(&h, &cos, &sin, cache)
@@ -702,7 +724,7 @@ impl Qwen35Model {
     ) -> Result<(Array, Array)> {
         let h = self.hidden(input_ids, cache, offset)?;
         let normalized = rms_norm(&h, &self.norm, self.eps)?;
-        let logits = linear(&normalized, &self.lm_head, None)?;
+        let logits = self.lm_head.forward(&normalized)?;
         Ok((normalized, logits))
     }
 
@@ -723,7 +745,10 @@ impl Qwen35Model {
                 "qwen3_5 MTP currently requires exactly one predictor layer".into(),
             ));
         }
-        let embeds = embed(&self.embed_tokens, input_ids)?.as_dtype(COMPUTE_DTYPE)?;
+        let embeds = self
+            .embed_tokens
+            .forward(input_ids)?
+            .as_dtype(COMPUTE_DTYPE)?;
         if embeds.shape() != hidden_states.shape() {
             return Err(Error::Msg(format!(
                 "qwen3_5 MTP token/hidden shape mismatch: {:?} vs {:?}",
@@ -745,7 +770,7 @@ impl Qwen35Model {
         };
         cache.steps += s as usize;
         let normalized = rms_norm(&out, &mtp.norm, self.eps)?;
-        let logits = linear(&normalized, &self.lm_head, None)?;
+        let logits = self.lm_head.forward(&normalized)?;
         let last = logits.take_axis(Array::from_slice(&[s - 1], &[1]), 1)?;
         Ok((
             normalized,
@@ -773,7 +798,7 @@ impl Qwen35Model {
     /// Final RMSNorm + `lm_head` over hidden states `[B, n, hidden]` → logits `[B, n, vocab]`.
     fn project(&self, h: &Array) -> Result<Array> {
         let normed = rms_norm(h, &self.norm, self.eps)?;
-        linear(&normed, &self.lm_head, None)
+        self.lm_head.forward(&normed)
     }
 
     /// Project the **last** position of `h` `[B, S, hidden]` → logits `[B, vocab]`.
@@ -812,7 +837,10 @@ impl Qwen35Model {
     /// multimodal path overwrites image-token rows with the encoder's projected patch features
     /// ([`Self::splice_image_features`]).
     pub fn embed_input_ids(&self, input_ids: &Array) -> Result<Array> {
-        Ok(embed(&self.embed_tokens, input_ids)?.as_dtype(COMPUTE_DTYPE)?)
+        Ok(self
+            .embed_tokens
+            .forward(input_ids)?
+            .as_dtype(COMPUTE_DTYPE)?)
     }
 
     /// Replace the `image_token_id` rows of `embeds` `[1, S, hidden]` with `image_features`
@@ -987,6 +1015,21 @@ impl Qwen35Model {
         cfg: Qwen35Config,
         quant: Option<QuantSpec>,
     ) -> Result<Self> {
+        Self::from_weights_layout(w, prefix, cfg, quant, None)
+    }
+
+    /// Build the Qwen3.5 decoder directly over a validated Prism MLX 2-bit pack.
+    pub fn from_prism_weights(w: &Weights, cfg: Qwen35Config, pack: &PrismMlxPack) -> Result<Self> {
+        Self::from_weights_layout(w, "language_model.model", cfg, None, Some(pack))
+    }
+
+    fn from_weights_layout(
+        w: &Weights,
+        prefix: &str,
+        cfg: Qwen35Config,
+        quant: Option<QuantSpec>,
+        prism: Option<&PrismMlxPack>,
+    ) -> Result<Self> {
         let eps = cfg.rms_norm_eps;
         let req = |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?) };
         // Qwen3.6 RMSNorm weights are stored zero-centered → fold in the +1 (the (1 + weight)
@@ -996,6 +1039,11 @@ impl Qwen35Model {
             Ok(add(&t, &Array::from_f32(1.0).as_dtype(t.dtype())?)?)
         };
         let stored_quant = cfg.quantization;
+        if prism.is_some() && (stored_quant.is_some() || quant.is_some()) {
+            return Err(Error::Config(
+                "Prism packed weights cannot be combined with generic Q4/Q8 quantization".into(),
+            ));
+        }
         if stored_quant.is_some() && quant.is_some() {
             return Err(Error::Config(
                 "qwen3_5 cannot combine stored quantized weights with load-time quantization"
@@ -1004,6 +1052,9 @@ impl Qwen35Model {
         }
         let saw_stored = Cell::new(false);
         let proj_q = |key: String| -> Result<Projection> {
+            if let Some(pack) = prism {
+                return Ok(Projection::Prism(pack.linear(w, &key)?));
+            }
             let base = key.strip_suffix(".weight").unwrap_or(&key);
             let scales_key = format!("{base}.scales");
             let biases_key = format!("{base}.biases");
@@ -1081,12 +1132,30 @@ impl Qwen35Model {
         };
         let dp = |s: &str| format!("{prefix}.{s}");
 
-        let embed_tokens = req(dp("embed_tokens.weight"))?;
+        let embed_key = dp("embed_tokens.weight");
+        let embed_weight = if prism.is_none() {
+            Some(req(embed_key.clone())?)
+        } else {
+            None
+        };
+        let embed_tokens = if let Some(pack) = prism {
+            TokenEmbedding::Prism(pack.embedding(w, &embed_key)?)
+        } else {
+            TokenEmbedding::Dense(embed_weight.clone().expect("dense embedding"))
+        };
         let norm = norm_w(dp("norm.weight"))?;
         let lm_head = if cfg.tie_word_embeddings {
-            embed_tokens.clone()
+            if prism.is_some() {
+                return Err(Error::Config(
+                    "Prism requires an explicit packed lm_head; tied embeddings are unsupported"
+                        .into(),
+                ));
+            }
+            Projection::load(embed_weight.expect("dense embedding"), None)?
+        } else if let Some(pack) = prism {
+            Projection::Prism(pack.linear(w, "language_model.lm_head.weight")?)
         } else {
-            req("lm_head.weight".to_string())?
+            Projection::load(req("lm_head.weight".to_string())?, None)?
         };
 
         let key_dim = cfg.linear_key_head_dim * cfg.linear_num_key_heads;
@@ -1270,7 +1339,7 @@ impl Qwen35Model {
             mtp,
             eps,
             cfg,
-            quantized: quant.is_some() || saw_stored.get(),
+            quantized: prism.is_some() || quant.is_some() || saw_stored.get(),
         };
         w.verify_accessed_gpu_view()?;
         Ok(model)
