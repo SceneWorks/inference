@@ -41,6 +41,14 @@ pub struct TextLlmCapabilities {
     /// `enable_thinking` kwarg). `false` ⇒ the model never reasons, and an explicit
     /// [`ThinkingMode::Enabled`](crate::request::ThinkingMode::Enabled) request is rejected.
     pub supports_thinking: bool,
+    /// Whether the model supports Qwen's `reasoning_effort` chat-template kwarg. This is separate
+    /// from [`supports_thinking`](Self::supports_thinking): a generic thinking template can honor
+    /// `enable_thinking` without recognizing Qwen's effort levels.
+    pub supports_reasoning_effort: bool,
+    /// Whether the model supports Qwen's `preserve_thinking` chat-template kwarg. This is separate
+    /// from [`supports_thinking`](Self::supports_thinking): generic thinking history handling must
+    /// not be advertised as Qwen-compatible preservation control.
+    pub supports_preserve_thinking: bool,
     /// Whether the model supports tool / function calling — i.e. its chat template renders a `tools`
     /// section and it emits parseable `<tool_call>` blocks. `false` ⇒ a request carrying
     /// [`tools`](crate::TextLlmRequest::tools) is rejected (never silently dropped).
@@ -114,11 +122,15 @@ impl TextLlmCapabilities {
             )));
         }
 
-        if !self.supports_thinking
-            && (req.reasoning_effort.is_some() || req.preserve_thinking.is_some())
-        {
+        if req.reasoning_effort.is_some() && !self.supports_reasoning_effort {
             return Err(Error::Unsupported(format!(
-                "[{id}] provider does not support reasoning template controls"
+                "[{id}] provider does not support the reasoning_effort template control"
+            )));
+        }
+
+        if req.preserve_thinking.is_some() && !self.supports_preserve_thinking {
+            return Err(Error::Unsupported(format!(
+                "[{id}] provider does not support the preserve_thinking template control"
             )));
         }
 
@@ -202,21 +214,40 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_controls_require_thinking_capability() {
-        let caps = TextLlmCapabilities::default();
-        let mut req = request();
-        req.reasoning_effort = Some(ReasoningEffort::Low);
-        assert!(matches!(
-            caps.validate_request("test", &req),
-            Err(Error::Unsupported(_))
-        ));
+    fn qwen_template_controls_are_not_implied_by_generic_thinking() {
+        let generic_thinking = TextLlmCapabilities {
+            supports_thinking: true,
+            ..Default::default()
+        };
+        let mut effort = request();
+        effort.reasoning_effort = Some(ReasoningEffort::Low);
+        let err = generic_thinking
+            .validate_request("test", &effort)
+            .unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)));
+        assert!(err.to_string().contains("reasoning_effort"));
 
+        let mut preserve = request();
+        preserve.preserve_thinking = Some(false);
+        let err = generic_thinking
+            .validate_request("test", &preserve)
+            .unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)));
+        assert!(err.to_string().contains("preserve_thinking"));
+    }
+
+    #[test]
+    fn qwen_thinking_controls_validate_when_explicitly_advertised() {
+        let qwen = TextLlmCapabilities {
+            supports_thinking: true,
+            supports_reasoning_effort: true,
+            supports_preserve_thinking: true,
+            ..Default::default()
+        };
         let mut req = request();
-        req.preserve_thinking = Some(false);
-        assert!(matches!(
-            caps.validate_request("test", &req),
-            Err(Error::Unsupported(_))
-        ));
+        req.reasoning_effort = Some(ReasoningEffort::XHigh);
+        req.preserve_thinking = Some(true);
+        qwen.validate_request("qwen38", &req).unwrap();
     }
 
     #[test]
@@ -262,6 +293,7 @@ mod tests {
     fn reasoning_effort_is_rejected_when_thinking_is_disabled() {
         let caps = TextLlmCapabilities {
             supports_thinking: true,
+            supports_reasoning_effort: true,
             ..Default::default()
         };
         let mut req = request();

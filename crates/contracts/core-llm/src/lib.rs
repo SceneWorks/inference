@@ -22,7 +22,8 @@
 //! - [`IncrementalDetok`] — backend-neutral streaming-detokenization delta guard (holds back
 //!   lossy U+FFFD placeholders for multi-byte characters split across BPE tokens).
 //! - [`ThinkingSegmenter`] — backend-neutral reasoning/answer segmentation (`<think>…</think>`),
-//!   paired with the [`ThinkingMode`] request control and `supports_thinking` capability.
+//!   paired with the [`ThinkingMode`] request control and `supports_thinking` capability. Qwen-specific
+//!   `reasoning_effort` and `preserve_thinking` controls require their own advertised capabilities.
 //! - [`ToolSpec`] / [`ToolCall`] / [`ToolCallSegmenter`] — backend-neutral tool ("function") calling:
 //!   offered tools render into the chat template (`tools` context), and the model's `<tool_call>`
 //!   output (Qwen3.6 XML or JSON/Hermes) is parsed back into structure; paired with the request

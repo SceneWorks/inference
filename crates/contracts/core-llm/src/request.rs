@@ -159,10 +159,13 @@ pub struct TextLlmRequest {
     /// [`supports_thinking`](crate::TextLlmCapabilities::supports_thinking); [`ThinkingMode::Auto`]
     /// (the default) leaves the model's template default in place.
     pub thinking: ThinkingMode,
-    /// Optional reasoning budget passed to templates that support it. `None` omits the kwarg and
-    /// preserves the model's own default (Qwen3.8 resolves that to `xhigh`).
+    /// Optional Qwen `reasoning_effort` passed only to providers advertising
+    /// [`supports_reasoning_effort`](crate::TextLlmCapabilities::supports_reasoning_effort).
+    /// `None` omits the kwarg and preserves the model's own default (Qwen3.8 resolves that to `xhigh`).
     pub reasoning_effort: Option<ReasoningEffort>,
-    /// Whether prior assistant reasoning should be retained when the template re-renders history.
+    /// Qwen `preserve_thinking` control for retaining prior assistant reasoning during history
+    /// rendering. Honored only by providers advertising
+    /// [`supports_preserve_thinking`](crate::TextLlmCapabilities::supports_preserve_thinking).
     /// `None` omits the kwarg and preserves the model's default (Qwen3.8 defaults to `true`).
     pub preserve_thinking: Option<bool>,
     /// Optional in-checkpoint multi-token prediction policy. [`MtpMode::Off`] preserves the ordinary
