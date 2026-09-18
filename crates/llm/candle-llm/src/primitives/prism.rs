@@ -896,7 +896,8 @@ mod cuda {
         }
     }
 
-    fn contiguous_cuda<'a,
+    fn contiguous_cuda<
+        'a,
         T: candle_core::cuda_backend::cudarc::driver::DeviceRepr
             + candle_core::cuda_backend::CudaDType,
     >(
