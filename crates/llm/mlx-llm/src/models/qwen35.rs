@@ -1837,8 +1837,8 @@ mod tests {
     #[test]
     fn mtp_generation_covers_verification_rollback_stop_and_cancel() {
         use crate::decode::{
-            generate, generate_qwen35_mtp, CancelFlag, ConstraintMask, FinishReason,
-            GenerationConfig, RewindableConstraintMask,
+            generate, generate_qwen35_mtp, generate_qwen35_mtp_with_timings, CancelFlag,
+            ConstraintMask, FinishReason, GenerationConfig, RewindableConstraintMask,
         };
         use crate::primitives::sampler::SamplingParams;
 
@@ -1888,7 +1888,7 @@ mod tests {
         };
         let target_only =
             generate(&model, &[1, 2, 3], &greedy, &CancelFlag::new(), &mut |_| {}).unwrap();
-        let (speculative, stats) = generate_qwen35_mtp(
+        let (timed, stats) = generate_qwen35_mtp_with_timings(
             &model,
             &[1, 2, 3],
             &greedy,
@@ -1899,6 +1899,8 @@ mod tests {
             None,
         )
         .unwrap();
+        let speculative = timed.output;
+        let _timings = timed.timer.finish();
         assert_eq!(
             speculative.tokens, target_only.tokens,
             "adversarial MTP drafts must not change greedy target output"

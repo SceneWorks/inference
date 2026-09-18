@@ -5,6 +5,7 @@
 //! Qwen35's DeltaNet cache cannot be truncated, so partial rejection restores a cloned pre-verify
 //! cache and replays only the committed prefix.
 
+use mlx_rs::transforms::eval;
 use mlx_rs::Array;
 
 use core_llm::speculative::{accept_token, sample_weighted, Acceptance};
@@ -12,7 +13,8 @@ use core_llm::speculative::{accept_token, sample_weighted, Acceptance};
 use crate::decode::cancel::CancelFlag;
 use crate::decode::speculative::{decide_greedy, decide_stochastic, logits_row, SpeculativeStats};
 use crate::decode::stream::{
-    default_seed, ConstraintMask, FinishReason, GenerationConfig, GenerationOutput, StreamEvent,
+    default_seed, ConstraintMask, FinishReason, GenerationConfig, GenerationOutput,
+    GenerationTimer, StreamEvent, TimedGenerationOutput,
 };
 use crate::error::{Error, Result};
 use crate::models::qwen35::Qwen35Model;
@@ -45,9 +47,68 @@ pub fn generate_qwen35_mtp(
     num_draft: usize,
     cancel: &CancelFlag,
     on_event: &mut dyn FnMut(StreamEvent),
-    mut constraint: Option<&mut dyn RewindableConstraintMask>,
+    constraint: Option<&mut dyn RewindableConstraintMask>,
     should_stop: Option<&dyn Fn() -> bool>,
 ) -> Result<(GenerationOutput, SpeculativeStats)> {
+    let (output, stats, _) = generate_qwen35_mtp_inner(
+        model,
+        prompt_ids,
+        config,
+        num_draft,
+        cancel,
+        on_event,
+        constraint,
+        should_stop,
+        false,
+    )?;
+    Ok((output, stats))
+}
+
+/// Synchronized two-phase Qwen3.8 MTP generation. The returned timer stays live until the provider
+/// finishes detokenization and stream dispatch.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_qwen35_mtp_with_timings(
+    model: &Qwen35Model,
+    prompt_ids: &[i32],
+    config: &GenerationConfig,
+    num_draft: usize,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    constraint: Option<&mut dyn RewindableConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
+) -> Result<(TimedGenerationOutput, SpeculativeStats)> {
+    let (output, stats, timer) = generate_qwen35_mtp_inner(
+        model,
+        prompt_ids,
+        config,
+        num_draft,
+        cancel,
+        on_event,
+        constraint,
+        should_stop,
+        true,
+    )?;
+    Ok((
+        TimedGenerationOutput {
+            output,
+            timer: timer.expect("timed MTP generation preserves its phase timer"),
+        },
+        stats,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_qwen35_mtp_inner(
+    model: &Qwen35Model,
+    prompt_ids: &[i32],
+    config: &GenerationConfig,
+    num_draft: usize,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    mut constraint: Option<&mut dyn RewindableConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
+    timed: bool,
+) -> Result<(GenerationOutput, SpeculativeStats, Option<GenerationTimer>)> {
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
@@ -69,6 +130,10 @@ pub fn generate_qwen35_mtp(
     let mut generated = Vec::new();
     let mut finish = FinishReason::MaxTokens;
     if config.max_new_tokens == 0 {
+        let mut timer = timed.then(GenerationTimer::start);
+        if let Some(timer) = timer.as_mut() {
+            timer.finish_prefill(std::iter::empty())?;
+        }
         on_event(StreamEvent::Done {
             reason: finish,
             generated: 0,
@@ -79,12 +144,16 @@ pub fn generate_qwen35_mtp(
                 finish_reason: finish,
             },
             stats,
+            timer,
         ));
     }
 
     let mut rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
     let greedy = config.sampling.temperature <= 0.0;
     let mut target_cache = model.new_cache();
+    // Validation, RNG setup, and empty-cache allocation are outside the measured backend phases.
+    // Start immediately before the first target/predictor prompt-cache work.
+    let mut timer = timed.then(GenerationTimer::start);
     let (prompt_hidden, prompt_logits) =
         model.hidden_and_logits(&input_ids(prompt_ids), &mut target_cache, 0)?;
     stats.forwards += 1;
@@ -95,10 +164,19 @@ pub fn generate_qwen35_mtp(
     let mut mtp_cache = model
         .new_mtp_cache()
         .expect("has_mtp guarantees a predictor cache");
-    if prompt_len > 1 {
+    let mtp_seed = if prompt_len > 1 {
         let shifted = input_ids(&prompt_ids[1..]);
         let aligned = seq_rows(&prompt_hidden, 0, prompt_len - 1)?;
-        model.mtp_step(&shifted, &aligned, &mut mtp_cache, 1)?;
+        Some(model.mtp_step(&shifted, &aligned, &mut mtp_cache, 1)?)
+    } else {
+        None
+    };
+    if let Some(timer) = timer.as_mut() {
+        let mut arrays = vec![&prompt_hidden, &prompt_logits];
+        if let Some((hidden, logits)) = mtp_seed.as_ref() {
+            arrays.extend([hidden, logits]);
+        }
+        timer.finish_prefill(arrays)?;
     }
     let mut last_target_hidden = seq_rows(&prompt_hidden, prompt_len - 1, 1)?;
     let first_logits = logits_row(&prompt_logits, prompt_len - 1)?;
@@ -119,6 +197,7 @@ pub fn generate_qwen35_mtp(
                 finish_reason: finish,
             },
             stats,
+            timer,
         ));
     }
     if let Some(c) = constraint.as_mut() {
@@ -154,6 +233,9 @@ pub fn generate_qwen35_mtp(
                 &mut mtp_cache,
                 base_target,
             )?;
+            if timer.is_some() {
+                eval([&mtp_hidden, &draft_logits])?;
+            }
             mtp_after_cur = Some(mtp_cache.clone());
 
             for i in 0..k {
@@ -199,6 +281,9 @@ pub fn generate_qwen35_mtp(
                         &mut mtp_cache,
                         base_target + 1 + i as i32,
                     )?;
+                    if timer.is_some() {
+                        eval([&h, &q])?;
+                    }
                     mtp_hidden = h;
                     draft_logits = q;
                 }
@@ -216,6 +301,9 @@ pub fn generate_qwen35_mtp(
         verify.extend_from_slice(&drafts);
         let (verify_hidden, target_logits) =
             model.hidden_and_logits(&input_ids(&verify), &mut target_cache, base_target)?;
+        if timer.is_some() {
+            eval([&verify_hidden, &target_logits])?;
+        }
         stats.forwards += 1;
         let (committed, accepted) = if constraint.is_some() {
             decide_constrained(
@@ -252,8 +340,11 @@ pub fn generate_qwen35_mtp(
         } else {
             target_cache = target_base;
             let kept = &verify[..1 + accepted];
-            let (hidden, _) =
+            let (hidden, logits) =
                 model.hidden_and_logits(&input_ids(kept), &mut target_cache, base_target)?;
+            if timer.is_some() {
+                eval([&hidden, &logits])?;
+            }
             stats.forwards += 1;
             hidden
         };
@@ -266,12 +357,15 @@ pub fn generate_qwen35_mtp(
             mtp_cache = after_cur;
             for (i, &draft) in drafts[..accepted].iter().enumerate() {
                 let predecessor = seq_rows(&kept_hidden, i as i32, 1)?;
-                model.mtp_step(
+                let (hidden, logits) = model.mtp_step(
                     &input_ids(&[draft]),
                     &predecessor,
                     &mut mtp_cache,
                     base_target + 1 + i as i32,
                 )?;
+                if timer.is_some() {
+                    eval([&hidden, &logits])?;
+                }
             }
         }
 
@@ -311,6 +405,7 @@ pub fn generate_qwen35_mtp(
             finish_reason: finish,
         },
         stats,
+        timer,
     ))
 }
 

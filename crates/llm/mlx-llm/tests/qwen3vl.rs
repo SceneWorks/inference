@@ -164,6 +164,10 @@ fn qwen3vl_round_trips_through_core_llm_contract() {
     assert!(out.usage.generated_tokens > 0);
     assert!(out.usage.prompt_tokens > 0);
     assert!(
+        out.timings.is_some(),
+        "native Qwen3-VL text generation must report measured phases"
+    );
+    assert!(
         out.text.to_lowercase().contains("paris"),
         "coherent contract answer must name Paris, got: {:?}",
         out.text
@@ -263,6 +267,10 @@ fn run_vision(p: &dyn TextLlm, req: &TextLlmRequest) -> (String, core_llm::Usage
             }
         })
         .expect("generate");
+    assert!(
+        out.timings.is_some(),
+        "native Qwen3-VL visual generation must report measured phases"
+    );
     (content, out.usage)
 }
 

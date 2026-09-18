@@ -11,6 +11,7 @@
 
 use std::cell::OnceCell;
 use std::path::Path;
+use std::time::Instant;
 
 use core_llm::{
     AudioRef, Channel, ChatTemplate, Constraint, ConstraintDecodeTable, ConstraintKind, Content,
@@ -23,8 +24,9 @@ use core_llm::{
 
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
-    generate_from_prefill, generate_qwen35_mtp, generate_with, ConstraintMask, Decode,
-    FinishReason, GenerationConfig, RewindableConstraintMask, StreamEvent,
+    generate_from_prefill, generate_from_prefill_with_timings, generate_qwen35_mtp_with_timings,
+    generate_with_timings, ConstraintMask, Decode, FinishReason, GenerationConfig,
+    RewindableConstraintMask, StreamEvent,
 };
 use crate::image::Qwen35ImageProcessor;
 use crate::models::gemma4_mm;
@@ -1143,6 +1145,7 @@ impl TextLlm for LlamaProvider {
 
         // Encode + splice the visuals and compute M-RoPE positions (the placeholder-expanded prompt
         // becomes the effective sequence). `None` on the text-only path.
+        let qwen_prefill_started = (multimodal && !gemma4_mm_request).then(Instant::now);
         let mm = if multimodal && !gemma4_mm_request {
             Some(self.prepare_multimodal(&prompt_ids, &req.messages)?)
         } else {
@@ -1253,7 +1256,7 @@ impl TextLlm for LlamaProvider {
         // The segmenter (when active) splits each delta into reasoning vs answer; answer text then
         // feeds the stop matcher so a stop string is trimmed and halts generation.
         let tokenizer = &self.tokenizer;
-        let (out, mtp_stats) = {
+        let (out, mtp_stats, timing) = {
             let mut acc: Vec<u32> = Vec::new();
             let mut detok = IncrementalDetok::new();
             let mut sink = |ev: StreamEvent| {
@@ -1341,7 +1344,7 @@ impl TextLlm for LlamaProvider {
                         model,
                         delta: *delta,
                     };
-                    let out = generate_from_prefill(
+                    let timed = generate_from_prefill_with_timings(
                         &shifted,
                         cache.as_mut(),
                         first,
@@ -1351,9 +1354,11 @@ impl TextLlm for LlamaProvider {
                         &mut sink,
                         json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask),
                         should_stop_opt,
+                        qwen_prefill_started
+                            .expect("Qwen multimodal preparation starts the prefill clock"),
                     )
                     .map_err(to_core)?;
-                    (out, None)
+                    (timed.output, None, Some(timed.timer))
                 }
                 // Gemma 4 multimodal: prefill the spliced embeds on ordinary causal 1-D positions
                 // (no M-RoPE, so no position shift for the continuation), then decode through the
@@ -1386,11 +1391,11 @@ impl TextLlm for LlamaProvider {
                             should_stop_opt,
                         )
                         .map_err(to_core)?;
-                        (out, None)
+                        (out, None, None)
                     }
                     None => match (&self.model, mtp_draft_tokens) {
                         (Decoder::Qwen35(model), Some(num_draft)) => {
-                            let (out, stats) = generate_qwen35_mtp(
+                            let (timed, stats) = generate_qwen35_mtp_with_timings(
                                 model,
                                 &prompt_ids,
                                 &config,
@@ -1403,10 +1408,10 @@ impl TextLlm for LlamaProvider {
                                 should_stop_opt,
                             )
                             .map_err(to_core)?;
-                            (out, Some(stats))
+                            (timed.output, Some(stats), Some(timed.timer))
                         }
                         _ => {
-                            let out = generate_with(
+                            let timed = generate_with_timings(
                                 &self.model,
                                 &prompt_ids,
                                 &config,
@@ -1416,7 +1421,7 @@ impl TextLlm for LlamaProvider {
                                 should_stop_opt,
                             )
                             .map_err(to_core)?;
-                            (out, None)
+                            (timed.output, None, Some(timed.timer))
                         }
                     },
                 },
@@ -1511,8 +1516,9 @@ impl TextLlm for LlamaProvider {
             finish_reason: finish,
             usage,
         });
+        let timings = timing.map(|timer| timer.finish());
         Ok(TextLlmOutput {
-            timings: None,
+            timings,
             text,
             thinking,
             tool_calls,

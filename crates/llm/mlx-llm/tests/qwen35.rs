@@ -53,8 +53,9 @@ fn model_dir() -> String {
 /// A tiny Qwen3.8-shaped snapshot using the exact frozen tokenizer/template. Set
 /// `QWEN38_TOKENIZER_JSON` to the pinned tokenizer file; weights are synthetic and small except for
 /// the shared 248,320-row vocabulary tables.
-fn write_tiny_qwen38_snapshot() -> Option<tempfile::TempDir> {
-    let tokenizer = std::env::var_os("QWEN38_TOKENIZER_JSON")?;
+fn write_tiny_qwen38_snapshot() -> tempfile::TempDir {
+    let tokenizer = std::env::var_os("QWEN38_TOKENIZER_JSON")
+        .expect("set QWEN38_TOKENIZER_JSON to the frozen Qwen3.8 tokenizer.json");
     let dir = tempfile::tempdir().unwrap();
     std::fs::copy(tokenizer, dir.path().join("tokenizer.json")).unwrap();
     std::fs::write(
@@ -127,15 +128,13 @@ fn write_tiny_qwen38_snapshot() -> Option<tempfile::TempDir> {
     ]);
     let refs: Vec<(&str, &Array)> = tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
     Array::save_safetensors(refs, None, dir.path().join("model.safetensors")).unwrap();
-    Some(dir)
+    dir
 }
 
 #[test]
+#[ignore = "requires frozen Qwen3.8 tokenizer via QWEN38_TOKENIZER_JSON"]
 fn frozen_qwen38_tokenizer_runs_tiny_native_text_and_mtp() {
-    let Some(dir) = write_tiny_qwen38_snapshot() else {
-        eprintln!("skipping: set QWEN38_TOKENIZER_JSON to the frozen tokenizer.json");
-        return;
-    };
+    let dir = write_tiny_qwen38_snapshot();
     let provider = LlamaProvider::load(&LoadSpec::dense(dir.path().display().to_string())).unwrap();
     let mtp = provider.descriptor().capabilities.mtp.unwrap();
     assert_eq!(mtp.recommended_draft_tokens, 3);
@@ -148,6 +147,10 @@ fn frozen_qwen38_tokenizer_runs_tiny_native_text_and_mtp() {
         )
         .unwrap();
     assert!(ar.mtp.is_none(), "MTP must remain opt-in by default");
+    assert!(
+        ar.timings.is_some(),
+        "native AR must report measured phases"
+    );
 
     let mut request = req("What is 2+2?", ThinkingMode::Disabled, 4);
     request.mtp = MtpMode::Enabled { draft_tokens: 3 };
@@ -156,6 +159,10 @@ fn frozen_qwen38_tokenizer_runs_tiny_native_text_and_mtp() {
     assert!(thinking.is_empty());
     assert_eq!(content, output.text);
     let stats = output.mtp.expect("MTP stats");
+    assert!(
+        output.timings.is_some(),
+        "native MTP must report measured phases"
+    );
     assert!(stats.proposed_tokens > 0);
     assert!(stats.accepted_tokens <= stats.proposed_tokens);
     assert!(stats.target_forwards >= 2);
