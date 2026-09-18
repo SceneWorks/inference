@@ -507,6 +507,7 @@ impl TextLlm for JoyCaptionProvider {
             usage,
         });
         Ok(TextLlmOutput {
+            timings: None,
             text,
             thinking: None,
             tool_calls: Vec::new(),

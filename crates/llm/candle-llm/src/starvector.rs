@@ -497,6 +497,7 @@ impl core_llm::TextLlm for CandleStarVectorProvider {
             usage,
         });
         Ok(core_llm::TextLlmOutput {
+            timings: None,
             text: out.svg.unwrap_or_default(),
             thinking: None,
             tool_calls: vec![],

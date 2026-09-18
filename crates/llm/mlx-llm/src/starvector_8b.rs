@@ -411,6 +411,7 @@ impl TextLlm for StarVector8bProvider {
             }
         })?;
         Ok(TextLlmOutput {
+            timings: None,
             text: output.svg.unwrap_or_default(),
             thinking: None,
             tool_calls: Vec::new(),

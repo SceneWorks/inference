@@ -1439,6 +1439,7 @@ impl TextLlm for LlamaProvider {
             usage,
         });
         Ok(TextLlmOutput {
+            timings: None,
             text,
             thinking,
             tool_calls,

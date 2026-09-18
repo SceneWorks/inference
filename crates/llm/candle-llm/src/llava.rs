@@ -583,6 +583,7 @@ impl TextLlm for LlavaProvider {
             usage,
         });
         Ok(TextLlmOutput {
+            timings: None,
             text,
             thinking: None,
             // No tool calling on the vision path (its chat template renders captions, not tools).
