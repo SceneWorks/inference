@@ -72,6 +72,10 @@ pub struct Sampling {
     pub top_p: f32,
     /// Keep only the `top_k` highest-logit tokens; `0` disables it.
     pub top_k: usize,
+    /// OpenAI/HF presence penalty: subtract this value once from every token logit whose token has
+    /// appeared in the prompt or generated history. `0.0` disables it. Unlike
+    /// [`repetition_penalty`](Self::repetition_penalty), this is additive and independent of count.
+    pub presence_penalty: f32,
     /// CTRL/HF repetition penalty; `1.0` disables it.
     pub repetition_penalty: f32,
     /// History window the repetition penalty looks back over.
@@ -85,6 +89,7 @@ impl Default for Sampling {
             temperature: 0.7,
             top_p: 0.9,
             top_k: 0,
+            presence_penalty: 0.0,
             repetition_penalty: 1.0,
             repetition_context: 0,
         }
@@ -128,6 +133,7 @@ impl Sampling {
             temperature: 0.0,
             top_p: 1.0,
             top_k: 0,
+            presence_penalty: 0.0,
             repetition_penalty: 1.0,
             repetition_context: 0,
         }
@@ -227,6 +233,7 @@ mod tests {
 
         assert_eq!(request.sampling.temperature, 0.7);
         assert_eq!(request.sampling.top_p, 0.9);
+        assert_eq!(request.sampling.presence_penalty, 0.0);
         assert!(!request.sampling.is_greedy());
         assert_eq!(request.reasoning_effort, None);
         assert_eq!(request.preserve_thinking, None);

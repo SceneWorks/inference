@@ -2,7 +2,7 @@
 
 use crate::constraint::{Constraint, ConstraintKind};
 use crate::error::{Error, Result};
-use crate::request::{ReasoningEffort, TextLlmRequest};
+use crate::request::{ReasoningEffort, Sampling, TextLlmRequest};
 
 /// Limits advertised by a loaded model with an in-checkpoint multi-token predictor (MTP).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11,6 +11,15 @@ pub struct MtpCapabilities {
     pub max_draft_tokens: u32,
     /// Upstream-recommended draft-token count used by [`MtpMode::Auto`](crate::MtpMode::Auto).
     pub recommended_draft_tokens: u32,
+}
+
+/// Upstream-recommended sampling presets for a model whose thinking and non-thinking modes use
+/// different distributions. These are discovery metadata: a client may initialize controls from
+/// the applicable preset, then sends an ordinary explicit [`Sampling`] request.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ModelSamplingDefaults {
+    pub thinking: Sampling,
+    pub non_thinking: Sampling,
 }
 
 /// What a provider supports. Used both for honest advertisement and to validate requests up front.
@@ -49,6 +58,9 @@ pub struct TextLlmCapabilities {
     /// surface, not the parser's compatibility set: a provider may accept a legacy effort as an
     /// alias while omitting it here when the model does not implement that effort distinctly.
     pub reasoning_efforts: Vec<ReasoningEffort>,
+    /// Model-card sampling recommendations, when the loaded artifact publishes them. Providers do
+    /// not silently replace an explicit request with these values.
+    pub model_sampling_defaults: Option<ModelSamplingDefaults>,
     /// Whether the model supports Qwen's `preserve_thinking` chat-template kwarg. This is separate
     /// from [`supports_thinking`](Self::supports_thinking): generic thinking history handling must
     /// not be advertised as Qwen-compatible preservation control.
@@ -250,6 +262,7 @@ mod tests {
                 ReasoningEffort::Medium,
                 ReasoningEffort::Low,
             ],
+            model_sampling_defaults: None,
             supports_preserve_thinking: true,
             ..Default::default()
         };
@@ -312,6 +325,7 @@ mod tests {
             supports_thinking: true,
             supports_reasoning_effort: true,
             reasoning_efforts: Vec::new(),
+            model_sampling_defaults: None,
             ..Default::default()
         };
         let mut req = request();

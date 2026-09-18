@@ -372,6 +372,11 @@ pub fn run_environment(
                 "supports_video":caps.supports_video,"supports_thinking":caps.supports_thinking,
                 "supports_reasoning_effort":caps.supports_reasoning_effort,
                 "reasoning_efforts":caps.reasoning_efforts.iter().map(|e|e.as_str()).collect::<Vec<_>>(),
+                "model_sampling_defaults":caps.model_sampling_defaults.map(|d|json!({
+                    "thinking":{"temperature":d.thinking.temperature,"top_p":d.thinking.top_p,
+                        "top_k":d.thinking.top_k,"presence_penalty":d.thinking.presence_penalty},
+                    "non_thinking":{"temperature":d.non_thinking.temperature,"top_p":d.non_thinking.top_p,
+                        "top_k":d.non_thinking.top_k,"presence_penalty":d.non_thinking.presence_penalty}})),
                 "supports_preserve_thinking":caps.supports_preserve_thinking,
                 "mtp":caps.mtp.map(|mtp|json!({"max_draft_tokens":mtp.max_draft_tokens,"recommended_draft_tokens":mtp.recommended_draft_tokens}))});
             report["native_memory_after_load"] = memory();

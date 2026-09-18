@@ -613,6 +613,7 @@ pub fn descriptor() -> TextLlmDescriptor {
             supports_thinking: false,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
+            model_sampling_defaults: None,
             supports_preserve_thinking: false,
             // Vision/caption path only; no tool calling (mirrors the mlx JoyCaption provider).
             supports_tools: false,

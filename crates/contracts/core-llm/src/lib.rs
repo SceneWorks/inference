@@ -64,7 +64,9 @@ pub mod tokenizer;
 pub mod tool;
 
 pub use cancel::CancelFlag;
-pub use capabilities::{MtpCapabilities, TextLlmCapabilities, TextLlmDescriptor};
+pub use capabilities::{
+    ModelSamplingDefaults, MtpCapabilities, TextLlmCapabilities, TextLlmDescriptor,
+};
 pub use constraint::{
     Constraint, ConstraintDecodeTable, ConstraintKind, JsonConstraint, JsonState,
 };
