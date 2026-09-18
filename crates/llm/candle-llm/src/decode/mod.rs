@@ -13,6 +13,7 @@ pub mod batch;
 pub mod cancel;
 pub mod continuous;
 pub mod prefix;
+pub mod qwen_mtp;
 pub mod speculative;
 pub mod stream;
 
@@ -20,6 +21,10 @@ pub use batch::{generate_batch, BatchRequest};
 pub use cancel::CancelFlag;
 pub use continuous::{generate_continuous, BatchExactness, ContinuousConfig};
 pub use prefix::{generate_cached, PrefixCache, PrefixStats};
+pub use qwen_mtp::{
+    generate_qwen35_mtp, generate_qwen35_mtp_multimodal, Qwen35MtpMultimodalPrompt,
+    RewindableConstraintMask,
+};
 pub use speculative::{
     generate_draft_speculative, generate_prompt_lookup, SpeculativeConfig, SpeculativeStats,
 };

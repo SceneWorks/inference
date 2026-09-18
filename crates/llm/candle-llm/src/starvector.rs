@@ -406,6 +406,7 @@ pub fn descriptor() -> core_llm::TextLlmDescriptor {
             supports_audio: false,
             supports_thinking: false,
             supports_tools: false,
+            mtp: None,
             supported_constraints: vec![],
         },
     }
@@ -500,6 +501,7 @@ impl core_llm::TextLlm for CandleStarVectorProvider {
             thinking: None,
             tool_calls: vec![],
             usage,
+            mtp: None,
             finish_reason: Some(finish),
         })
     }

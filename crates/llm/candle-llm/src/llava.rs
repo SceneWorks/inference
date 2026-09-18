@@ -588,6 +588,7 @@ impl TextLlm for LlavaProvider {
             // No tool calling on the vision path (its chat template renders captions, not tools).
             tool_calls: Vec::new(),
             usage,
+            mtp: None,
             finish_reason: Some(finish),
         })
     }
@@ -611,6 +612,7 @@ pub fn descriptor() -> TextLlmDescriptor {
             supports_thinking: false,
             // Vision/caption path only; no tool calling (mirrors the mlx JoyCaption provider).
             supports_tools: false,
+            mtp: None,
             supported_constraints: Vec::new(),
         },
     }

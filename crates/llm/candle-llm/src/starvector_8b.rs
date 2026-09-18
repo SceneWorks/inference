@@ -375,6 +375,7 @@ impl TextLlm for CandleStarVector8bProvider {
                 prompt_tokens: IMAGE_TOKENS as u32 + prompt_tokens,
                 generated_tokens: output.generated_tokens,
             },
+            mtp: None,
             finish_reason: Some(map_finish(output.finish_reason)),
         })
     }
@@ -407,6 +408,7 @@ pub fn descriptor() -> TextLlmDescriptor {
             supports_audio: false,
             supports_thinking: false,
             supports_tools: false,
+            mtp: None,
             supported_constraints: Vec::new(),
         },
     }

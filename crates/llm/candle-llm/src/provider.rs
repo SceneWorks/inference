@@ -14,23 +14,24 @@ use candle_core::{DType, Device, Tensor};
 use core_llm::{
     AudioRef, Channel, ChatTemplate, Constraint, ConstraintDecodeTable, ConstraintKind, Content,
     Error as CoreError, FinishReason as CoreFinish, ImageRef, IncrementalDetok, JinjaChatTemplate,
-    JsonConstraint, Llama3Template, LoadSpec, Message, Quantize, RenderOptions,
-    Result as CoreResult, Sampling, StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities,
-    TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter, Tokenizer,
-    ToolCallSegmenter, Usage, VideoRef,
+    JsonConstraint, Llama3Template, LoadSpec, Message, MtpCapabilities, MtpMode, MtpStats,
+    Quantize, RenderOptions, Result as CoreResult, Sampling, StreamEvent as CoreEvent, TextLlm,
+    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter,
+    Tokenizer, ToolCallSegmenter, Usage, VideoRef,
 };
 
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
-    generate_from_prefill, generate_with, ConstraintMask, Decode, FinishReason, GenerationConfig,
-    StreamEvent,
+    generate_from_prefill, generate_qwen35_mtp, generate_qwen35_mtp_multimodal, generate_with,
+    ConstraintMask, Decode, FinishReason, GenerationConfig, Qwen35MtpMultimodalPrompt,
+    RewindableConstraintMask, StreamEvent,
 };
 use crate::device::select_device;
 use crate::gguf::GgufCheckpoint;
 use crate::image::Qwen35ImageProcessor;
 use crate::models::gemma4_mm;
 use crate::models::{
-    CausalLm, Gemma4Layout, Gemma4Mm, Gemma4MmConfig, Qwen35Config, Qwen35Model,
+    CausalLm, Gemma4Layout, Gemma4Mm, Gemma4MmConfig, Qwen35Config, Qwen35Model, Qwen35Mtp,
     Qwen35VisionConfig, Qwen35VisionModel, VlmDecode,
 };
 use crate::primitives::nn::input_ids;
@@ -423,6 +424,9 @@ fn expand_vision_placeholders(
 pub struct LlamaProvider {
     descriptor: TextLlmDescriptor,
     model: Decoder,
+    /// Complete checkpoint-native Qwen3.8 MTP predictor. Its absence never affects ordinary
+    /// autoregressive inference and is reflected by an absent MTP capability.
+    mtp: Option<Qwen35Mtp>,
     tokenizer: Tokenizer,
     template: Box<dyn ChatTemplate>,
     stop_tokens: Vec<i32>,
@@ -505,7 +509,7 @@ impl LlamaProvider {
             .ok_or_else(|| CoreError::Load(format!("read config.json in {}", dir.display())))?;
         let arch = Architecture::from_config(&cfg_value).map_err(to_core)?;
         let weights = Weights::from_dir(dir, device).map_err(to_core)?;
-        let (model, mut descriptor) = if arch == Architecture::Qwen35 {
+        let (model, mut descriptor, mtp) = if arch == Architecture::Qwen35 {
             // Qwen3.6 hybrid decoder: its own config, the VLM-nested `model.language_model` prefix, and
             // a top-level untied `lm_head`.
             let qcfg = Qwen35Config::from_json(&cfg_value).map_err(to_core)?;
@@ -513,14 +517,25 @@ impl LlamaProvider {
             let m =
                 Qwen35Model::from_weights_with(&weights, "model.language_model", qcfg, requested)
                     .map_err(to_core)?;
-            (Decoder::Qwen35(m), descriptor)
+            let mtp = if Qwen35Mtp::complete_in(&weights, m.config()) {
+                Some(Qwen35Mtp::from_weights_with(&weights, &m, requested).map_err(to_core)?)
+            } else {
+                None
+            };
+            (Decoder::Qwen35(m), descriptor, mtp)
         } else {
             let cfg = ModelConfig::from_dir(dir).map_err(to_core)?;
             let descriptor = descriptor_for(&cfg);
             let quant = requested.or(cfg.quantization);
             let m = CausalLm::from_weights_with(&weights, "", cfg, quant).map_err(to_core)?;
-            (Decoder::Causal(m), descriptor)
+            (Decoder::Causal(m), descriptor, None)
         };
+        if mtp.is_some() {
+            descriptor.capabilities.mtp = Some(MtpCapabilities {
+                max_draft_tokens: u32::MAX,
+                recommended_draft_tokens: 3,
+            });
+        }
 
         // Qwen-VL vision: load the ViT tower when the checkpoint carries `model.visual.*` (a wrapped
         // VLM) and the config exposes a `vision_config`. Covers Qwen3.6 (`qwen3_5`) and Qwen3-VL
@@ -599,6 +614,7 @@ impl LlamaProvider {
         Ok(Self {
             descriptor,
             model,
+            mtp,
             tokenizer,
             template,
             stop_tokens,
@@ -642,6 +658,7 @@ impl LlamaProvider {
         Ok(Self {
             descriptor,
             model,
+            mtp: None,
             tokenizer,
             template,
             stop_tokens,
@@ -664,6 +681,7 @@ impl LlamaProvider {
         Self {
             descriptor: provider_descriptor(),
             model: Decoder::Causal(model),
+            mtp: None,
             tokenizer,
             template: Box::new(Llama3Template),
             stop_tokens,
@@ -957,14 +975,46 @@ impl LlamaProvider {
 }
 
 /// Adapts a `core_llm::JsonConstraint` to the engine's [`ConstraintMask`] decode seam.
-struct JsonMask<'a>(JsonConstraint<'a>);
+struct JsonMask<'a> {
+    inner: JsonConstraint<'a>,
+    table: &'a ConstraintDecodeTable,
+    stop_ids: Vec<u32>,
+    accepted: Vec<i32>,
+}
+
+impl<'a> JsonMask<'a> {
+    fn new(table: &'a ConstraintDecodeTable, stop_ids: impl IntoIterator<Item = u32>) -> Self {
+        let stop_ids = stop_ids.into_iter().collect::<Vec<_>>();
+        Self {
+            inner: JsonConstraint::new(table, stop_ids.iter().copied()),
+            table,
+            stop_ids,
+            accepted: Vec::new(),
+        }
+    }
+}
 
 impl ConstraintMask for JsonMask<'_> {
     fn allowed(&mut self) -> &[bool] {
-        self.0.allowed()
+        self.inner.allowed()
     }
     fn accept(&mut self, token: i32) {
-        self.0.accept(token as u32);
+        self.inner.accept(token as u32);
+        self.accepted.push(token);
+    }
+}
+
+impl RewindableConstraintMask for JsonMask<'_> {
+    fn checkpoint(&self) -> usize {
+        self.accepted.len()
+    }
+
+    fn rewind(&mut self, checkpoint: usize) {
+        self.accepted.truncate(checkpoint);
+        self.inner = JsonConstraint::new(self.table, self.stop_ids.iter().copied());
+        for &token in &self.accepted {
+            self.inner.accept(token as u32);
+        }
     }
 }
 
@@ -1202,6 +1252,15 @@ impl TextLlm for LlamaProvider {
             seed: req.seed,
             stop_tokens: self.stop_tokens.clone(),
         };
+        let mtp_drafts = match req.mtp {
+            MtpMode::Off => None,
+            MtpMode::Auto => self
+                .descriptor
+                .capabilities
+                .mtp
+                .map(|cap| cap.recommended_draft_tokens),
+            MtpMode::Enabled { draft_tokens } => Some(draft_tokens),
+        };
 
         // Structured-output constraint: build a JSON mask over the cached decode table.
         let mut json_mask = match req.constraint {
@@ -1209,10 +1268,10 @@ impl TextLlm for LlamaProvider {
                 let table = self
                     .constraint_table
                     .get_or_init(|| self.tokenizer.constraint_decode_table());
-                Some(JsonMask(JsonConstraint::new(
+                Some(JsonMask::new(
                     table,
                     self.stop_tokens.iter().map(|&i| i as u32),
-                )))
+                ))
             }
             None => None,
         };
@@ -1255,6 +1314,7 @@ impl TextLlm for LlamaProvider {
         // split across BPE tokens streams intact (and never panics a mid-char slice) — sc-12452.
         // The segmenter (when active) splits each delta into reasoning vs answer.
         let tokenizer = &self.tokenizer;
+        let mut mtp_stats = None;
         let out = {
             let mut acc: Vec<u32> = Vec::new();
             let mut detok = IncrementalDetok::new();
@@ -1329,60 +1389,85 @@ impl TextLlm for LlamaProvider {
                     }
                 }
             };
-            let constraint = json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask);
-            match &mm {
-                // Multimodal: prefill the spliced embeds with interleaved M-RoPE, then decode the
-                // continuation (text positions shifted by `mrope_delta`) through the shared loop.
-                Some(m) => {
-                    let model = self.model.as_vlm();
-                    let mut cache = model.make_cache();
-                    let (t, h, w, delta) = &m.positions;
-                    let first = model
-                        .prefill_with_deepstack(
-                            &m.embeds,
-                            [t.as_slice(), h.as_slice(), w.as_slice()],
-                            &mut *cache,
-                            &m.visual_pos_mask,
-                            &m.deepstack,
+            if let Some(draft_tokens) = mtp_drafts {
+                let target = match &self.model {
+                    Decoder::Qwen35(model) => model,
+                    Decoder::Causal(_) => {
+                        return Err(CoreError::Load(
+                            "MTP was advertised for a non-Qwen target decoder".into(),
+                        ))
+                    }
+                };
+                let mtp = self.mtp.as_ref().ok_or_else(|| {
+                    CoreError::Load("MTP was advertised without a loaded predictor".into())
+                })?;
+                let constraint = json_mask
+                    .as_mut()
+                    .map(|m| m as &mut dyn RewindableConstraintMask);
+                let (generated, stats) = match &mm {
+                    Some(m) => {
+                        let (t, h, w, delta) = &m.positions;
+                        generate_qwen35_mtp_multimodal(
+                            target,
+                            mtp,
+                            Qwen35MtpMultimodalPrompt {
+                                input_ids: &m.expanded_ids,
+                                embeddings: &m.embeds,
+                                positions: [t.as_slice(), h.as_slice(), w.as_slice()],
+                                visual_pos_mask: &m.visual_pos_mask,
+                                deepstack: &m.deepstack,
+                                continuation_delta: *delta,
+                            },
+                            &config,
+                            draft_tokens,
+                            &req.cancel,
+                            &mut sink,
+                            constraint,
                         )
-                        .map_err(to_core)?;
-                    let shifted = Shifted {
-                        model,
-                        delta: *delta,
-                    };
-                    generate_from_prefill(
-                        &shifted,
-                        &mut *cache,
-                        first,
-                        m.expanded_ids.clone(),
+                        .map_err(to_core)?
+                    }
+                    None => generate_qwen35_mtp(
+                        target,
+                        mtp,
+                        &prompt_ids,
                         &config,
+                        draft_tokens,
                         &req.cancel,
                         &mut sink,
                         constraint,
                     )
-                    .map_err(to_core)?
-                }
-                // Gemma 4 multimodal: prefill the spliced embeds on ordinary causal 1-D positions
-                // (no M-RoPE, so no position shift for the continuation), then decode through the
-                // shared loop against the unwrapped decoder.
-                None => match &g4 {
+                    .map_err(to_core)?,
+                };
+                mtp_stats = Some(MtpStats {
+                    proposed_tokens: u32::try_from(stats.proposed).unwrap_or(u32::MAX),
+                    accepted_tokens: u32::try_from(stats.accepted).unwrap_or(u32::MAX),
+                    target_forwards: u32::try_from(stats.forwards).unwrap_or(u32::MAX),
+                });
+                generated
+            } else {
+                let constraint = json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask);
+                match &mm {
+                    // Multimodal: prefill the spliced embeds with interleaved M-RoPE, then decode the
+                    // continuation (text positions shifted by `mrope_delta`) through the shared loop.
                     Some(m) => {
-                        let model = match &self.model {
-                            Decoder::Causal(c) => c,
-                            Decoder::Qwen35(_) => {
-                                return Err(CoreError::Load(
-                                    "gemma 4: the multimodal path requires the generic causal \
-                                     decoder"
-                                        .into(),
-                                ))
-                            }
-                        };
+                        let model = self.model.as_vlm();
                         let mut cache = model.make_cache();
+                        let (t, h, w, delta) = &m.positions;
                         let first = model
-                            .decode_logits_from_embeds(&m.embeds, &mut *cache, 0)
+                            .prefill_with_deepstack(
+                                &m.embeds,
+                                [t.as_slice(), h.as_slice(), w.as_slice()],
+                                &mut *cache,
+                                &m.visual_pos_mask,
+                                &m.deepstack,
+                            )
                             .map_err(to_core)?;
+                        let shifted = Shifted {
+                            model,
+                            delta: *delta,
+                        };
                         generate_from_prefill(
-                            &self.model,
+                            &shifted,
                             &mut *cache,
                             first,
                             m.expanded_ids.clone(),
@@ -1393,16 +1478,47 @@ impl TextLlm for LlamaProvider {
                         )
                         .map_err(to_core)?
                     }
-                    None => generate_with(
-                        &self.model,
-                        &prompt_ids,
-                        &config,
-                        &req.cancel,
-                        &mut sink,
-                        constraint,
-                    )
-                    .map_err(to_core)?,
-                },
+                    // Gemma 4 multimodal: prefill the spliced embeds on ordinary causal 1-D positions
+                    // (no M-RoPE, so no position shift for the continuation), then decode through the
+                    // shared loop against the unwrapped decoder.
+                    None => match &g4 {
+                        Some(m) => {
+                            let model =
+                                match &self.model {
+                                    Decoder::Causal(c) => c,
+                                    Decoder::Qwen35(_) => return Err(CoreError::Load(
+                                        "gemma 4: the multimodal path requires the generic causal \
+                                     decoder"
+                                            .into(),
+                                    )),
+                                };
+                            let mut cache = model.make_cache();
+                            let first = model
+                                .decode_logits_from_embeds(&m.embeds, &mut *cache, 0)
+                                .map_err(to_core)?;
+                            generate_from_prefill(
+                                &self.model,
+                                &mut *cache,
+                                first,
+                                m.expanded_ids.clone(),
+                                &config,
+                                &req.cancel,
+                                &mut sink,
+                                constraint,
+                            )
+                            .map_err(to_core)?
+                        }
+                        None => generate_with(
+                            &self.model,
+                            &prompt_ids,
+                            &config,
+                            &req.cancel,
+                            &mut sink,
+                            constraint,
+                        )
+                        .map_err(to_core)?,
+                    },
+                }
             }
         };
 
@@ -1481,6 +1597,7 @@ impl TextLlm for LlamaProvider {
             thinking,
             tool_calls,
             usage,
+            mtp: mtp_stats,
             finish_reason: Some(finish),
         })
     }
@@ -1510,6 +1627,7 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             // Weightless default: conservative. The load path flips this on when the loaded model's
             // chat template renders tool calls (story 7636).
             supports_tools: false,
+            mtp: None,
             // JSON-constrained decoding.
             supported_constraints: vec![ConstraintKind::Json],
         },

@@ -26,7 +26,7 @@ pub use gemma4_mm::{
 };
 pub use llama::{shard_plan, CausalLm, RopeTables};
 pub mod starvector;
-pub use qwen35::{Qwen35Cache, Qwen35Config, Qwen35Model};
+pub use qwen35::{Qwen35Cache, Qwen35Config, Qwen35Model, Qwen35Mtp, Qwen35MtpCache};
 pub use qwen35_vision::{Qwen35VisionConfig, Qwen35VisionModel, Qwen35VisionOutput};
 pub use siglip::{
     select_vision_feature, SiglipVisionConfig, SiglipVisionOutput, SiglipVisionTower,
