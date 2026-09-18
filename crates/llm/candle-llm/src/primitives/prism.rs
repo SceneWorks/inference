@@ -640,7 +640,7 @@ mod cuda {
     use super::*;
     use candle_core::backend::BackendStorage;
     use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
-    use candle_core::cuda_backend::{CudaStorageSlice, WrapErr};
+    use candle_core::cuda_backend::WrapErr;
     use candle_core::{CpuStorage, CudaStorage, CustomOp2, CustomOp3, Layout, Shape};
 
     const SOURCE: &str = include_str!("prism_cuda.cu");
@@ -896,13 +896,13 @@ mod cuda {
         }
     }
 
-    fn contiguous_cuda<
+    fn contiguous_cuda<'a,
         T: candle_core::cuda_backend::cudarc::driver::DeviceRepr
             + candle_core::cuda_backend::CudaDType,
     >(
-        storage: &CudaStorage,
+        storage: &'a CudaStorage,
         layout: &Layout,
-    ) -> candle_core::Result<candle_core::cuda_backend::cudarc::driver::CudaView<'_, T>> {
+    ) -> candle_core::Result<candle_core::cuda_backend::cudarc::driver::CudaView<'a, T>> {
         let slice = storage.as_cuda_slice::<T>()?;
         let (start, end) = layout
             .contiguous_offsets()
