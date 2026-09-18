@@ -1556,6 +1556,7 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             // when the loaded model's own chat template gates an `enable_thinking` kwarg (sc-7585).
             supports_thinking: false,
             supports_reasoning_effort: false,
+            reasoning_efforts: Vec::new(),
             supports_preserve_thinking: false,
             // Weightless default: conservative. The load path flips this on when the loaded model's
             // chat template renders tool calls (sc-7636).

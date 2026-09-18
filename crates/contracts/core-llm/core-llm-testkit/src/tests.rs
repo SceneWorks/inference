@@ -46,6 +46,7 @@ fn stub_caps() -> TextLlmCapabilities {
         supports_audio: false,
         supports_thinking: false,
         supports_reasoning_effort: false,
+        reasoning_efforts: Vec::new(),
         supports_preserve_thinking: false,
         supports_tools: false,
         mtp: None,

@@ -2,7 +2,7 @@
 
 use crate::constraint::{Constraint, ConstraintKind};
 use crate::error::{Error, Result};
-use crate::request::TextLlmRequest;
+use crate::request::{ReasoningEffort, TextLlmRequest};
 
 /// Limits advertised by a loaded model with an in-checkpoint multi-token predictor (MTP).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +45,10 @@ pub struct TextLlmCapabilities {
     /// from [`supports_thinking`](Self::supports_thinking): a generic thinking template can honor
     /// `enable_thinking` without recognizing Qwen's effort levels.
     pub supports_reasoning_effort: bool,
+    /// Reasoning efforts a UI should offer for this loaded model. This is an advertised selection
+    /// surface, not the parser's compatibility set: a provider may accept a legacy effort as an
+    /// alias while omitting it here when the model does not implement that effort distinctly.
+    pub reasoning_efforts: Vec<ReasoningEffort>,
     /// Whether the model supports Qwen's `preserve_thinking` chat-template kwarg. This is separate
     /// from [`supports_thinking`](Self::supports_thinking): generic thinking history handling must
     /// not be advertised as Qwen-compatible preservation control.
@@ -241,6 +245,11 @@ mod tests {
         let qwen = TextLlmCapabilities {
             supports_thinking: true,
             supports_reasoning_effort: true,
+            reasoning_efforts: vec![
+                ReasoningEffort::XHigh,
+                ReasoningEffort::Medium,
+                ReasoningEffort::Low,
+            ],
             supports_preserve_thinking: true,
             ..Default::default()
         };
@@ -248,6 +257,14 @@ mod tests {
         req.reasoning_effort = Some(ReasoningEffort::XHigh);
         req.preserve_thinking = Some(true);
         qwen.validate_request("qwen38", &req).unwrap();
+        assert_eq!(
+            qwen.reasoning_efforts,
+            [
+                ReasoningEffort::XHigh,
+                ReasoningEffort::Medium,
+                ReasoningEffort::Low
+            ]
+        );
     }
 
     #[test]
@@ -294,6 +311,7 @@ mod tests {
         let caps = TextLlmCapabilities {
             supports_thinking: true,
             supports_reasoning_effort: true,
+            reasoning_efforts: Vec::new(),
             ..Default::default()
         };
         let mut req = request();

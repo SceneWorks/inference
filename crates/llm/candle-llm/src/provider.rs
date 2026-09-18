@@ -1849,6 +1849,7 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             // explicit enable-thinking request to be rejected, which validate_request enforces.
             supports_thinking: false,
             supports_reasoning_effort: false,
+            reasoning_efforts: Vec::new(),
             supports_preserve_thinking: false,
             // Weightless default: conservative. The load path flips this on when the loaded model's
             // chat template renders tool calls (story 7636).

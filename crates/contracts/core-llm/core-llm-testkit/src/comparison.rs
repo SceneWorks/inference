@@ -371,6 +371,7 @@ pub fn run_environment(
                 "max_context_tokens":caps.max_context_tokens,"supports_vision":caps.supports_vision,
                 "supports_video":caps.supports_video,"supports_thinking":caps.supports_thinking,
                 "supports_reasoning_effort":caps.supports_reasoning_effort,
+                "reasoning_efforts":caps.reasoning_efforts.iter().map(|e|e.as_str()).collect::<Vec<_>>(),
                 "supports_preserve_thinking":caps.supports_preserve_thinking,
                 "mtp":caps.mtp.map(|mtp|json!({"max_draft_tokens":mtp.max_draft_tokens,"recommended_draft_tokens":mtp.recommended_draft_tokens}))});
             report["native_memory_after_load"] = memory();
@@ -477,8 +478,12 @@ mod tests {
         assert_eq!(measure_case(&stub(), case)["evidence_complete"], true);
         let mut provider = stub();
         provider.timings = false;
+        let output = provider.generate(&case.request, &mut |_| {}).unwrap();
+        assert!(
+            output.timings.is_none(),
+            "the provider output itself must report missing native phase timings"
+        );
         let record = measure_case(&provider, case);
-        assert!(record["prefill_seconds"].is_null());
         assert_eq!(record["evidence_complete"], false);
         provider.timings = true;
         provider.broken = true;
