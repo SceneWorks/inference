@@ -298,6 +298,7 @@ fn qwen35_quantize_on_load_q8() {
     let dir = model_dir();
     let q8 = LlamaProvider::load(&LoadSpec {
         source: dir,
+        projector_source: None,
         quantize: Some(Quantize::Q8),
     })
     .expect("load q8");

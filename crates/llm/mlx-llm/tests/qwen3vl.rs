@@ -462,6 +462,7 @@ fn qwen3vl_vision_q4_q8_import_path() {
     ] {
         let spec = LoadSpec {
             source: source.clone(),
+            projector_source: None,
             quantize: Some(q),
         };
 

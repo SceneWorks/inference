@@ -253,6 +253,14 @@ mod tests {
         assert!(matches!(err, crate::Error::InvalidRequest(_)));
         assert!(err.to_string().contains("expected xhigh, medium, or low"));
     }
+
+    #[test]
+    fn projector_association_is_explicit() {
+        let spec = LoadSpec::dense("model.gguf").with_projector("projector.gguf");
+        assert_eq!(spec.source, "model.gguf");
+        assert_eq!(spec.projector_source.as_deref(), Some("projector.gguf"));
+        assert!(spec.quantize.is_none());
+    }
 }
 
 /// How a provider should load a model. Backend-neutral: the provider interprets `source` (a
@@ -261,6 +269,10 @@ mod tests {
 pub struct LoadSpec {
     /// A snapshot directory path or a model identifier the provider understands.
     pub source: String,
+    /// Optional explicitly-associated multimodal projector artifact. GGUF language files do not
+    /// embed this association and a directory may contain several valid projectors, so providers
+    /// must never guess between siblings. `None` keeps a separable model text-only.
+    pub projector_source: Option<String>,
     /// Optional load-time **weight** quantization (the model projection weights).
     pub quantize: Option<Quantize>,
 }
@@ -279,7 +291,14 @@ impl LoadSpec {
     pub fn dense(source: impl Into<String>) -> Self {
         Self {
             source: source.into(),
+            projector_source: None,
             quantize: None,
         }
+    }
+
+    /// Associate an exact multimodal projector artifact with this model load.
+    pub fn with_projector(mut self, source: impl Into<String>) -> Self {
+        self.projector_source = Some(source.into());
+        self
     }
 }
