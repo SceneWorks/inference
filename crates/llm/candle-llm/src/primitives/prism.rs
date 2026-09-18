@@ -80,14 +80,14 @@ enum PackedStorage {
     MlxAffine2 {
         words: Option<Tensor>,
         scales: Option<Tensor>,
-        host_words: Arc<[u32]>,
-        host_scales: Arc<[f32]>,
+        host_words: Option<Arc<[u32]>>,
+        host_scales: Option<Arc<[f32]>>,
     },
     /// Native GGUF PQ2_0/PTQ1_0 blocks, retained byte-for-byte.
     Gguf {
         kind: PrismPackedKind,
         bytes: Option<Tensor>,
-        host_bytes: Arc<[u8]>,
+        host_bytes: Option<Arc<[u8]>>,
     },
 }
 
@@ -177,10 +177,11 @@ impl PrismPackedWeight {
                 "Prism MLX affine-2 {name} requires finite biases exactly equal to -scales"
             )));
         }
-        let word_host = words
-            .to_device(&Device::Cpu)?
-            .flatten_all()?
-            .to_vec1::<u32>()?;
+        let word_host = if device.is_cpu() {
+            Some(Arc::from(words.flatten_all()?.to_vec1::<u32>()?))
+        } else {
+            None
+        };
         Self::new(
             name,
             rows,
@@ -192,8 +193,8 @@ impl PrismPackedWeight {
                 } else {
                     Some(scales.to_dtype(DType::F32)?)
                 },
-                host_words: word_host.into(),
-                host_scales: scale_host.into(),
+                host_words: word_host,
+                host_scales: device.is_cpu().then(|| Arc::from(scale_host)),
             },
             metadata,
             row_map,
@@ -218,15 +219,17 @@ impl PrismPackedWeight {
             .map_err(|e| prism_err(&format!("GGUF matrix {name}"), e))?;
         let rows = matrix.output_rows();
         let input_width = matrix.input_width();
-        let host_bytes: Arc<[u8]> = data.into();
-        let bytes = if device.is_cpu() {
-            None
+        let (bytes, host_bytes) = if device.is_cpu() {
+            (None, Some(Arc::from(data)))
         } else {
-            Some(Tensor::from_vec(
-                host_bytes.to_vec(),
-                (rows * input_width / PRISM_GROUP_SIZE * kind.block_bytes(),),
-                device,
-            )?)
+            (
+                Some(Tensor::from_vec(
+                    data,
+                    (rows * input_width / PRISM_GROUP_SIZE * kind.block_bytes(),),
+                    device,
+                )?),
+                None,
+            )
         };
         Self::new(
             name,
@@ -486,6 +489,12 @@ impl PrismPackedWeight {
                 host_scales,
                 ..
             } => {
+                let host_words = host_words
+                    .as_deref()
+                    .ok_or_else(|| Error::Config("Prism CPU codes are unavailable".into()))?;
+                let host_scales = host_scales
+                    .as_deref()
+                    .ok_or_else(|| Error::Config("Prism CPU scales are unavailable".into()))?;
                 let packed_cols = self.input_width / 16;
                 let scale_cols = self.input_width / PRISM_GROUP_SIZE;
                 let words = &host_words[row * packed_cols..(row + 1) * packed_cols];
@@ -498,6 +507,9 @@ impl PrismPackedWeight {
             PackedStorage::Gguf {
                 kind, host_bytes, ..
             } => {
+                let host_bytes = host_bytes
+                    .as_deref()
+                    .ok_or_else(|| Error::Config("Prism CPU GGUF bytes are unavailable".into()))?;
                 PrismPackedMatrixRef::from_gguf(*kind, &[self.input_width, self.rows], host_bytes)
                     .and_then(|matrix| matrix.decode_row_into(row, output))
                     .map_err(|e| prism_err(&format!("decode {}", self.name), e))?;
