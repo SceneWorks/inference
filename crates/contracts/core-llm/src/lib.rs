@@ -49,6 +49,7 @@ pub mod output;
 pub mod paging;
 pub mod prefix;
 pub mod prepare;
+pub mod prism;
 pub mod registry;
 pub mod request;
 pub mod schedule;
@@ -75,6 +76,14 @@ pub use prefix::{InsertOutcome, PrefixId, PrefixIndex, PrefixMatch};
 pub use prepare::{
     detect_format, ModelFormat, PrepareReport, PrepareSpec, SnapshotPreparerRegistration,
     SnapshotPreparerRegistry, SnapshotPreparerRegistryBuilder,
+};
+pub use prism::{
+    apply_hadamard_forward_in_place, apply_hadamard_inverse_in_place, decode_block_into,
+    gdn_reorder_last_axis_in_place, gguf_weight_name, is_gdn_ssm_out_weight,
+    normalized_fwht_in_place, transcode_block_to_affine, GdnLayout, PrismError,
+    PrismHadamardMetadata, PrismPackedKind, PrismPackedMatrixRef, PrismTransformRole,
+    PrismWeightTransform, PRISM_AFFINE_WORDS_PER_BLOCK, PRISM_GROUP_SIZE, PRISM_PQ2_0_GGML_TYPE,
+    PRISM_PTQ1_0_GGML_TYPE,
 };
 pub use registry::{
     ModelRequirements, TextLlmRegistration, TextLlmRegistry, TextLlmRegistryBuilder,
