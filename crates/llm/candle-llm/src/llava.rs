@@ -611,6 +611,8 @@ pub fn descriptor() -> TextLlmDescriptor {
             // Text+vision captioner; no audio path at all.
             supports_audio: false,
             supports_thinking: false,
+            supports_reasoning_effort: false,
+            supports_preserve_thinking: false,
             // Vision/caption path only; no tool calling (mirrors the mlx JoyCaption provider).
             supports_tools: false,
             mtp: None,

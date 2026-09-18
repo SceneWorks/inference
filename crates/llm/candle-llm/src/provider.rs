@@ -638,8 +638,16 @@ impl LlamaProvider {
 
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         let stop_tokens = eos_token_ids(dir);
-        let (template, supports_thinking, supports_tools) = load_chat_template(dir);
+        let (
+            template,
+            supports_thinking,
+            supports_reasoning_effort,
+            supports_preserve_thinking,
+            supports_tools,
+        ) = load_chat_template(dir);
         descriptor.capabilities.supports_thinking = supports_thinking;
+        descriptor.capabilities.supports_reasoning_effort = supports_reasoning_effort;
+        descriptor.capabilities.supports_preserve_thinking = supports_preserve_thinking;
         descriptor.capabilities.supports_tools = supports_tools;
         Ok(Self {
             descriptor,
@@ -682,8 +690,16 @@ impl LlamaProvider {
             ck.stop_tokens.clone()
         };
 
-        let (template, supports_thinking, supports_tools) = gguf_chat_template(dir, &ck);
+        let (
+            template,
+            supports_thinking,
+            supports_reasoning_effort,
+            supports_preserve_thinking,
+            supports_tools,
+        ) = gguf_chat_template(dir, &ck);
         descriptor.capabilities.supports_thinking = supports_thinking;
+        descriptor.capabilities.supports_reasoning_effort = supports_reasoning_effort;
+        descriptor.capabilities.supports_preserve_thinking = supports_preserve_thinking;
         descriptor.capabilities.supports_tools = supports_tools;
         Ok(Self {
             descriptor,
@@ -1056,20 +1072,36 @@ impl RewindableConstraintMask for JsonMask<'_> {
 /// - **tools** — the template renders tool calls (its source mentions `tool_call`), so it has a
 ///   `tools` section and the model emits parseable `<tool_call>` blocks (story 7636). Covers the
 ///   Qwen3.6 XML and the Qwen2.5/Hermes JSON tool templates alike.
-fn load_chat_template(dir: &Path) -> (Box<dyn ChatTemplate>, bool, bool) {
+fn load_chat_template(dir: &Path) -> (Box<dyn ChatTemplate>, bool, bool, bool, bool) {
     // The sidecar `chat_template.jinja` wins over the embedded key — see `sidecar_chat_template`.
     if let Some(t) = sidecar_chat_template(dir) {
         let supports_thinking = t.source().contains("enable_thinking");
         let supports_tools = t.source().contains("tool_call");
-        return (Box::new(t), supports_thinking, supports_tools);
+        let supports_reasoning_effort = t.source().contains("reasoning_effort");
+        let supports_preserve_thinking = t.source().contains("preserve_thinking");
+        return (
+            Box::new(t),
+            supports_thinking,
+            supports_reasoning_effort,
+            supports_preserve_thinking,
+            supports_tools,
+        );
     }
     match JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json")) {
         Ok(t) => {
             let supports_thinking = t.source().contains("enable_thinking");
             let supports_tools = t.source().contains("tool_call");
-            (Box::new(t), supports_thinking, supports_tools)
+            let supports_reasoning_effort = t.source().contains("reasoning_effort");
+            let supports_preserve_thinking = t.source().contains("preserve_thinking");
+            (
+                Box::new(t),
+                supports_thinking,
+                supports_reasoning_effort,
+                supports_preserve_thinking,
+                supports_tools,
+            )
         }
-        Err(_) => (Box::new(Llama3Template), false, false),
+        Err(_) => (Box::new(Llama3Template), false, false, false, false),
     }
 }
 
@@ -1117,12 +1149,23 @@ fn tokenizer_special_tokens(dir: &Path) -> (String, String) {
 /// own embedded `chat_template` metadata, then the typed Llama-3 default. Also reports
 /// `supports_thinking` (the chosen template's source gates `enable_thinking`) and `supports_tools`
 /// (its source renders tool calls — it mentions `tool_call`).
-fn gguf_chat_template(dir: &Path, ck: &GgufCheckpoint) -> (Box<dyn ChatTemplate>, bool, bool) {
+fn gguf_chat_template(
+    dir: &Path,
+    ck: &GgufCheckpoint,
+) -> (Box<dyn ChatTemplate>, bool, bool, bool, bool) {
     if let Ok(t) = JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json"))
     {
         let supports_thinking = t.source().contains("enable_thinking");
         let supports_tools = t.source().contains("tool_call");
-        return (Box::new(t), supports_thinking, supports_tools);
+        let supports_reasoning_effort = t.source().contains("reasoning_effort");
+        let supports_preserve_thinking = t.source().contains("preserve_thinking");
+        return (
+            Box::new(t),
+            supports_thinking,
+            supports_reasoning_effort,
+            supports_preserve_thinking,
+            supports_tools,
+        );
     }
     if let Some(src) = &ck.chat_template {
         let supports_thinking = src.contains("enable_thinking");
@@ -1132,10 +1175,12 @@ fn gguf_chat_template(dir: &Path, ck: &GgufCheckpoint) -> (Box<dyn ChatTemplate>
         return (
             Box::new(JinjaChatTemplate::with_tokens(src.clone(), bos, eos)),
             supports_thinking,
+            src.contains("reasoning_effort"),
+            src.contains("preserve_thinking"),
             supports_tools,
         );
     }
-    (Box::new(Llama3Template), false, false)
+    (Box::new(Llama3Template), false, false, false, false)
 }
 
 /// Whether a rendered prompt ends with an **unclosed** `<think>` block — i.e. the chat template
@@ -1655,6 +1700,8 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             // No controllable reasoning mode yet (a separate story); the contract requires an
             // explicit enable-thinking request to be rejected, which validate_request enforces.
             supports_thinking: false,
+            supports_reasoning_effort: false,
+            supports_preserve_thinking: false,
             // Weightless default: conservative. The load path flips this on when the loaded model's
             // chat template renders tool calls (story 7636).
             supports_tools: false,
