@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v2-outcome-parity-limit-behaviors.json",
+  "title": "SC-22261 StarVector terminal receipt V2 outcome parity and executable limit behavior profile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "campaign_run_id",
+    "inference_revision",
+    "sceneworks_revision",
+    "corpus_sha256",
+    "execution",
+    "producer",
+    "metric_identity",
+    "inference_preflight",
+    "runs",
+    "hostile_sanitizer",
+    "prompt_composition",
+    "campaign_lineage",
+    "artifact_manifest"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "campaign_run_id": {
+      "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v2-outcome-parity.json#/$defs/campaign_id"
+    },
+    "inference_revision": {
+      "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v2-outcome-parity.json#/$defs/rev"
+    },
+    "sceneworks_revision": {
+      "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v2-outcome-parity.json#/$defs/rev"
+    },
+    "corpus_sha256": {
+      "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/sha"
+    },
+    "execution": {
+      "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v2-outcome-parity.json#/properties/execution"
+    },
+    "producer": {
+      "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v2-outcome-parity.json#/$defs/producer"
+    },
+    "metric_identity": {
+      "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/metric_identity"
+    },
+    "inference_preflight": {
+      "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v2-outcome-parity.json#/properties/inference_preflight"
+    },
+    "runs": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": { "$ref": "#/$defs/run" }
+    },
+    "hostile_sanitizer": {
+      "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/hostile"
+    },
+    "prompt_composition": {
+      "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/prompt"
+    },
+    "campaign_lineage": {
+      "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v2-outcome-parity.json#/$defs/campaign_lineage"
+    },
+    "artifact_manifest": {
+      "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v2-outcome-parity.json#/$defs/artifact_manifest"
+    }
+  },
+  "$defs": {
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backend",
+        "provider_id",
+        "tier",
+        "device",
+        "model",
+        "hardware",
+        "image_quality",
+        "deterministic_parity",
+        "lifecycle",
+        "limits",
+        "lifecycle_memory_transcript_sha256"
+      ],
+      "properties": {
+        "backend": { "enum": ["mlx", "candle-cuda"] },
+        "provider_id": { "type": "string" },
+        "tier": { "enum": ["1b", "8b"] },
+        "device": { "type": "string" },
+        "model": {
+          "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/model"
+        },
+        "hardware": {
+          "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/hardware"
+        },
+        "image_quality": {
+          "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/image_quality"
+        },
+        "deterministic_parity": {
+          "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v2-outcome-parity.json#/$defs/upstream_parity"
+        },
+        "lifecycle": {
+          "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/lifecycle"
+        },
+        "limits": { "$ref": "#/$defs/limit_behaviors" },
+        "lifecycle_memory_transcript_sha256": {
+          "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/sha"
+        }
+      }
+    },
+    "limit_behaviors": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "completion",
+        "token",
+        "byte",
+        "wall_time",
+        "queued_cancellation",
+        "in_flight_cancellation"
+      ],
+      "properties": {
+        "completion": { "const": true },
+        "token": { "const": true },
+        "byte": { "const": true },
+        "wall_time": { "const": true },
+        "queued_cancellation": { "const": true },
+        "in_flight_cancellation": { "const": true }
+      }
+    }
+  }
+}

@@ -5,10 +5,10 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, tr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { artifactByteSizesFromFiles, buildArtifactManifest, campaignLineageSha256, currentArtifactReferences, hostilePayload, MAX_RECEIPT_BYTES, OUTCOME_PARITY_PROFILE_SHA256, pairedBootstrapLowerBound, validatePlan, validateReceipt, validateReceiptProfile } from "../release/starvector_terminal_evidence.mjs";
+import { artifactByteSizesFromFiles, buildArtifactManifest, campaignLineageSha256, currentArtifactReferences, hostilePayload, LIMIT_BEHAVIOR_PROFILE_SHA256, MAX_RECEIPT_BYTES, OUTCOME_PARITY_PROFILE_SHA256, pairedBootstrapLowerBound, validatePlan, validateReceipt, validateReceiptProfile } from "../release/starvector_terminal_evidence.mjs";
 
 const corpus = JSON.parse(readFileSync("release/starvector-terminal-corpus-v1.json", "utf8"));
-const INFERENCE = "1".repeat(40), SCENEWORKS = "2".repeat(40), EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", h = (value) => createHash("sha256").update(value).digest("hex"), d = (label) => h(`fixture:${label}`);
+const INFERENCE = "1".repeat(40), PREFLIGHT_INFERENCE = "3".repeat(40), SCENEWORKS = "2".repeat(40), EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", h = (value) => createHash("sha256").update(value).digest("hex"), d = (label) => h(`fixture:${label}`);
 const stable = (value) => Array.isArray(value) ? `[${value.map(stable).join(",")}]` : value && typeof value === "object" ? `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable(value[key])}`).join(",")}}` : JSON.stringify(value);
 const source = (index) => [["starvector/svg-stack-simple","1d2a96a17cc0c4c1f337b7631adc8c5885bc72ea"],["starvector/svg-icons-simple","e1918a27ba6649e856e5db0710d8a6c7046762c1"],["starvector/svg-emoji-simple","fa75b3617872ae57e6f3cb450aee65dbccbd69e0"],["starvector/svg-fonts-simple","453c739ea13ad2685127f721c333f14d99485299"]][Math.floor(index / 30)];
 const prompts = ["geometric badge","isometric folder","rounded calendar","minimal rocket","layered landscape","abstract flower"];
@@ -85,9 +85,15 @@ function outcomeParityReceipt() {
   }
   return resealV2(value);
 }
+function limitBehaviorReceipt() {
+  const value = outcomeParityReceipt();
+  for (const run of value.runs) run.limits = { completion: true, token: true, byte: true, wall_time: true, queued_cancellation: true, in_flight_cancellation: true };
+  return resealV2(value);
+}
 function resealLineage(value) { value.producer.campaign_lineage_sha256=campaignLineageSha256(value.campaign_lineage); }
 function resealManifest(value) { value.artifact_manifest.aggregate_sha256=h(stable({campaign_run_id:value.artifact_manifest.campaign_run_id,entries:value.artifact_manifest.entries}));value.producer.artifact_manifest_sha256=value.artifact_manifest.aggregate_sha256; }
 function resealV2(value) { resealLineage(value);value.artifact_manifest=buildManifest(value);value.producer.artifact_manifest_sha256=value.artifact_manifest.aggregate_sha256;return value; }
+function resealV2WithPreflight(value, expectedPreflightRevision) { resealLineage(value);value.artifact_manifest=buildArtifactManifest(value,corpus,fixtureByteSize,expectedPreflightRevision);value.producer.artifact_manifest_sha256=value.artifact_manifest.aggregate_sha256;return value; }
 function addHistoricalOwnedInputs(value, kind) {
   const predecessor=value.campaign_lineage.failed_predecessors[0],artifact=predecessor.source_artifacts[0];
   const cases=kind==="hostile"?value.hostile_sanitizer.cases:value.prompt_composition.cases;
@@ -247,6 +253,23 @@ test("selected outcome-parity profile rejects missing contract version, legacy V
   assert.throws(()=>validateReceiptProfile(missing,profile,OUTCOME_PARITY_PROFILE_SHA256),/requires receipt V2 and parity contract version 2/);
   assert.throws(()=>validateReceiptProfile(v2Receipt(),profile,OUTCOME_PARITY_PROFILE_SHA256),/requires receipt V2 and parity contract version 2/);
   assert.throws(()=>validateReceiptProfile(current,profile,"0".repeat(64)),/profile hash/);
+});
+test("versioned limit-behavior profile accepts only the six executable product behaviors",()=>{
+  const profile="release/starvector-terminal-receipt-v2-outcome-parity-limit-behaviors.schema.json";
+  const current=limitBehaviorReceipt();
+  assert.equal(validateReceiptProfile(current,profile,LIMIT_BEHAVIOR_PROFILE_SHA256),LIMIT_BEHAVIOR_PROFILE_SHA256);
+  validateReceipt(current,validatePlan(corpus),INFERENCE,SCENEWORKS,corpus,fixtureByteSize,LIMIT_BEHAVIOR_PROFILE_SHA256);
+  assert.throws(()=>validateReceiptProfile(outcomeParityReceipt(),profile,LIMIT_BEHAVIOR_PROFILE_SHA256),/selected profile limits/);
+  assert.throws(()=>validateReceipt(current,validatePlan(corpus),INFERENCE,SCENEWORKS,corpus,fixtureByteSize,OUTCOME_PARITY_PROFILE_SHA256),/limits.*keys differ/);
+  assert.throws(()=>validateReceiptProfile(current,"release/starvector-terminal-receipt-v2-outcome-parity.schema.json",LIMIT_BEHAVIOR_PROFILE_SHA256),/digest mismatch/);
+});
+test("only the new profile accepts an explicitly verified historical preflight revision",()=>{
+  const current=limitBehaviorReceipt();current.inference_preflight.head_sha=PREFLIGHT_INFERENCE;resealV2WithPreflight(current,PREFLIGHT_INFERENCE);
+  validateReceipt(current,validatePlan(corpus),INFERENCE,SCENEWORKS,corpus,fixtureByteSize,LIMIT_BEHAVIOR_PROFILE_SHA256,PREFLIGHT_INFERENCE);
+  assert.throws(()=>validateReceipt(current,validatePlan(corpus),INFERENCE,SCENEWORKS,corpus,fixtureByteSize,LIMIT_BEHAVIOR_PROFILE_SHA256),/preflight invalid/);
+  const historical=outcomeParityReceipt();historical.inference_preflight.head_sha=PREFLIGHT_INFERENCE;resealV2WithPreflight(historical,PREFLIGHT_INFERENCE);
+  assert.throws(()=>validateReceipt(historical,validatePlan(corpus),INFERENCE,SCENEWORKS,corpus,fixtureByteSize,OUTCOME_PARITY_PROFILE_SHA256,PREFLIGHT_INFERENCE),/historical receipt profiles require preflight and inference revisions to match/);
+  assert.throws(()=>validateReceipt(receipt(),validatePlan(corpus),INFERENCE,SCENEWORKS,corpus,undefined,LIMIT_BEHAVIOR_PROFILE_SHA256,PREFLIGHT_INFERENCE),/limit-behavior profile requires receipt V2/);
 });
 test("production validator CLI selects outcome parity before legacy V2 evidence recovery",()=>{
   const directory=mkdtempSync(join(tmpdir(),"starvector-profile-cli-"));
