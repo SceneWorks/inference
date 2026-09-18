@@ -9,6 +9,7 @@ use candle_core::Tensor;
 use candle_nn::{Linear, Module};
 
 use crate::error::Result;
+use crate::primitives::prism::PrismPackedWeight;
 use crate::primitives::quant::QuantizedLinear;
 
 /// Group-wise quantization spec, mapped to a Candle GGML dtype.
@@ -82,6 +83,8 @@ pub enum Projection {
     Dense(Linear),
     /// A group-wise quantized weight.
     Quantized(QuantizedLinear),
+    /// A compact Prism/Bonsai affine-2 or native ternary weight.
+    Prism(std::sync::Arc<PrismPackedWeight>),
 }
 
 impl Projection {
@@ -103,6 +106,11 @@ impl Projection {
                 &weight, q.dtype, bias,
             )?)),
         }
+    }
+
+    /// Wrap a resident compact Prism weight. Prism projections do not carry an additive bias.
+    pub fn load_prism(weight: std::sync::Arc<PrismPackedWeight>) -> Self {
+        Self::Prism(weight)
     }
 
     /// Load a pre-quantized MLX affine Q8 triple without interpreting its shortened U32 code
@@ -137,12 +145,13 @@ impl Projection {
         match self {
             Projection::Dense(l) => Ok(l.forward(x)?),
             Projection::Quantized(q) => q.forward(x),
+            Projection::Prism(weight) => weight.forward(x),
         }
     }
 
     /// Whether this projection is quantized.
     pub fn is_quantized(&self) -> bool {
-        matches!(self, Projection::Quantized(_))
+        matches!(self, Projection::Quantized(_) | Projection::Prism(_))
     }
 }
 

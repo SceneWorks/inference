@@ -14,6 +14,7 @@ pub mod gated_delta;
 pub mod kv_cache;
 pub mod nn;
 pub mod paged_kv_cache;
+pub mod prism;
 pub mod projection;
 pub mod quant;
 pub mod rope;
@@ -30,6 +31,7 @@ pub use nn::{
     rms_norm_unscaled, silu, soft_cap,
 };
 pub use paged_kv_cache::{BlockPool, PagedKvCache};
+pub use prism::{GdnRowMap, PrismPackedWeight, PrismRegistry};
 pub use projection::{KvProjection, Projection, QuantSpec};
 pub use quant::QuantizedLinear;
 pub use rope::{apply_rope, Rope};
