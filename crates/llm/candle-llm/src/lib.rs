@@ -32,6 +32,7 @@ pub mod llava;
 pub mod models;
 pub mod prepare;
 pub mod primitives;
+mod prism_checkpoint;
 pub mod provider;
 pub mod starvector;
 pub mod starvector_8b;

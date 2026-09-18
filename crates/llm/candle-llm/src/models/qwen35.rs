@@ -31,10 +31,25 @@ use crate::primitives::attention::{repeat_kv, sdpa, AttnMask};
 use crate::primitives::gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
 };
-use crate::primitives::nn::{embed, linear, rms_norm, silu};
+use crate::primitives::nn::{embed, rms_norm, silu};
 use crate::primitives::projection::{Projection, QuantSpec};
 use crate::primitives::rope::{apply_rope, Rope};
-use crate::primitives::{KvCache, Weights};
+use crate::primitives::{KvCache, PrismRegistry, Weights};
+
+#[derive(Clone)]
+enum QwenEmbedding {
+    Dense(Tensor),
+    Prism(std::sync::Arc<crate::primitives::PrismPackedWeight>),
+}
+
+impl QwenEmbedding {
+    fn forward(&self, ids: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Dense(weight) => embed(weight, ids),
+            Self::Prism(weight) => weight.embedding(ids),
+        }
+    }
+}
 
 /// Interleaved M-RoPE output of [`Qwen35Model::mrope_positions`]: the temporal / height / width
 /// position rows (each length `S`) plus the `mrope_delta` (`max_position + 1 − len`) for continuing
@@ -559,10 +574,10 @@ impl Qwen35Cache {
 
 /// A loaded Qwen3.6 (`qwen3_5`) hybrid decoder.
 pub struct Qwen35Model {
-    embed_tokens: Tensor,
+    embed_tokens: QwenEmbedding,
     layers: Vec<DecoderLayer>,
     norm: Tensor,
-    lm_head: Tensor,
+    lm_head: std::sync::Arc<Projection>,
     rope: Rope,
     cfg: Qwen35Config,
     eps: f64,
@@ -579,8 +594,8 @@ pub struct Qwen35Model {
 /// RMS norm, and the shared head. vLLM cycles the published layer when more drafts are requested
 /// than the checkpoint's layer count, so `step_idx` selects `layers[step_idx % layers.len()]`.
 pub struct Qwen35Mtp {
-    embed_tokens: Tensor,
-    lm_head: Tensor,
+    embed_tokens: QwenEmbedding,
+    lm_head: std::sync::Arc<Projection>,
     pre_fc_norm_embedding: Tensor,
     pre_fc_norm_hidden: Tensor,
     fc: Projection,
@@ -760,7 +775,7 @@ impl Qwen35Mtp {
             return Err(Error::Msg("qwen3_5 MTP has no predictor layers".into()));
         }
         let ids = Tensor::from_vec(vec![input_id as i64], (1, 1), &self.device)?;
-        let embeddings = embed(&self.embed_tokens, &ids)?.to_dtype(self.dtype)?;
+        let embeddings = self.embed_tokens.forward(&ids)?.to_dtype(self.dtype)?;
         self.step_from_embeddings(&embeddings, previous_hidden, step_idx, position, cache)
     }
 
@@ -807,7 +822,7 @@ impl Qwen35Mtp {
         }
         let ids: Vec<i64> = input_ids.iter().map(|&id| id as i64).collect();
         let ids = Tensor::from_vec(ids, (1, input_ids.len()), &self.device)?;
-        let embeddings = embed(&self.embed_tokens, &ids)?.to_dtype(self.dtype)?;
+        let embeddings = self.embed_tokens.forward(&ids)?.to_dtype(self.dtype)?;
         self.forward_sequence_from_embeddings(&embeddings, previous_hidden, 0, position, cache)
     }
 
@@ -872,7 +887,7 @@ impl Qwen35Mtp {
         };
         cache.layers[layer_idx] = updated;
         let hidden = rms_norm(&hidden, &self.norm, self.eps)?;
-        let logits = linear(&hidden, &self.lm_head, None)?;
+        let logits = self.lm_head.forward(&hidden)?;
         Ok((logits, hidden))
     }
 }
@@ -910,7 +925,7 @@ impl Qwen35Model {
     /// Run the decoder stack over `input_ids` `[B, S]` at sequence `offset`, returning the final
     /// hidden states `[B, S, hidden]` (before the final norm / lm_head).
     fn hidden(&self, input_ids: &Tensor, cache: &mut Qwen35Cache, offset: i32) -> Result<Tensor> {
-        let h = embed(&self.embed_tokens, input_ids)?.to_dtype(self.dtype)?;
+        let h = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
         let s = h.dim(1)? as i32;
         let (cos, sin) = self.rope.cos_sin(s, offset, self.dtype, &self.device)?;
         self.hidden_from_embeds(&h, &cos, &sin, cache)
@@ -941,7 +956,7 @@ impl Qwen35Model {
 
     /// Shared `lm_head` projection over already normalized hidden states.
     fn project_normalized(&self, h: &Tensor) -> Result<Tensor> {
-        linear(h, &self.lm_head, None)
+        self.lm_head.forward(h)
     }
 
     /// Final RMSNorm + `lm_head` over hidden states `[B, n, hidden]` → logits `[B, n, vocab]`.
@@ -998,7 +1013,7 @@ impl Qwen35Model {
     /// multimodal path overwrites image-token rows with the encoder's projected patch features
     /// ([`Self::splice_image_features`]).
     pub fn embed_input_ids(&self, input_ids: &Tensor) -> Result<Tensor> {
-        Ok(embed(&self.embed_tokens, input_ids)?.to_dtype(self.dtype)?)
+        Ok(self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?)
     }
 
     /// Replace the `image_token_id` rows of `embeds` `[1, S, hidden]` with `image_features`
@@ -1225,6 +1240,29 @@ impl Qwen35Model {
         quant: Option<QuantSpec>,
         dtype: DType,
     ) -> Result<Self> {
+        Self::from_weights_dtype_impl(w, prefix, cfg, quant, dtype, None)
+    }
+
+    /// Build Qwen3.5/3.8 with compact Prism matrices while retaining ordinary tensors for norms,
+    /// convolution and recurrent parameters. Registry keys are the exact checkpoint tensor names.
+    pub fn from_prism_weights(
+        w: &Weights,
+        prefix: &str,
+        cfg: Qwen35Config,
+        prism: &PrismRegistry,
+        dtype: DType,
+    ) -> Result<Self> {
+        Self::from_weights_dtype_impl(w, prefix, cfg, None, dtype, Some(prism))
+    }
+
+    fn from_weights_dtype_impl(
+        w: &Weights,
+        prefix: &str,
+        cfg: Qwen35Config,
+        quant: Option<QuantSpec>,
+        dtype: DType,
+        prism: Option<&PrismRegistry>,
+    ) -> Result<Self> {
         let device = w.device().clone();
         let eps = cfg.rms_norm_eps as f64;
         let join = |s: &str| -> String {
@@ -1238,16 +1276,46 @@ impl Qwen35Model {
         // Qwen3.6 RMSNorm weights are stored zero-centered → fold in the +1 (the (1 + weight)
         // convention). The gated DeltaNet norm is the exception: it is ones-centered, loaded raw.
         let norm_w = |key: String| -> Result<Tensor> { Ok(req(key)?.affine(1.0, 1.0)?) };
-        let proj_q = |key: String| -> Result<Projection> { Projection::load(req(key)?, quant) };
-        let proj_dense = |key: String| -> Result<Projection> { Projection::load(req(key)?, None) };
-
-        let embed_tokens = req(join("embed_tokens.weight"))?;
-        let norm = norm_w(join("norm.weight"))?;
-        let lm_head = if cfg.tie_word_embeddings {
-            embed_tokens.clone()
-        } else {
-            req("lm_head.weight".to_string())?
+        let proj_q = |key: String| -> Result<Projection> {
+            match prism.and_then(|registry| registry.get(&key)) {
+                Some(weight) => Ok(Projection::load_prism(weight.clone())),
+                None => Projection::load(req(key)?, quant),
+            }
         };
+        let proj_dense = |key: String| -> Result<Projection> {
+            match prism.and_then(|registry| registry.get(&key)) {
+                Some(weight) => Ok(Projection::load_prism(weight.clone())),
+                None => Projection::load(req(key)?, None),
+            }
+        };
+
+        let embed_key = join("embed_tokens.weight");
+        let embed_tokens = match prism.and_then(|registry| registry.get(&embed_key)) {
+            Some(weight) => QwenEmbedding::Prism(weight.clone()),
+            None => QwenEmbedding::Dense(req(embed_key)?),
+        };
+        let norm = norm_w(join("norm.weight"))?;
+        let head_key = if prism.is_some() {
+            prefix
+                .strip_suffix(".model")
+                .map(|root| format!("{root}.lm_head.weight"))
+                .unwrap_or_else(|| "lm_head.weight".to_string())
+        } else {
+            "lm_head.weight".to_string()
+        };
+        let lm_head = if let Some(weight) = prism.and_then(|registry| registry.get(&head_key)) {
+            Projection::load_prism(weight.clone())
+        } else if cfg.tie_word_embeddings {
+            let QwenEmbedding::Dense(weight) = &embed_tokens else {
+                return Err(Error::Config(
+                    "Prism tied embeddings require an explicit lm_head packed tensor".into(),
+                ));
+            };
+            Projection::load(weight.clone(), quant)?
+        } else {
+            Projection::load(req(head_key)?, quant)?
+        };
+        let lm_head = std::sync::Arc::new(lm_head);
 
         let key_dim = (cfg.linear_key_head_dim * cfg.linear_num_key_heads) as usize;
         let value_dim = (cfg.linear_value_head_dim * cfg.linear_num_value_heads) as usize;
@@ -1357,7 +1425,7 @@ impl Qwen35Model {
             cfg,
             dtype,
             device,
-            quantized: quant.is_some(),
+            quantized: quant.is_some() || prism.is_some(),
         })
     }
 }

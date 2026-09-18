@@ -19,6 +19,7 @@ use core_llm::{
     TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter,
     Tokenizer, ToolCallSegmenter, Usage, VideoRef,
 };
+use serde_json::Value;
 
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
@@ -507,16 +508,45 @@ impl LlamaProvider {
     fn load_dir(dir: &Path, device: &Device, requested: Option<QuantSpec>) -> CoreResult<Self> {
         let cfg_value = read_json(dir, "config.json")
             .ok_or_else(|| CoreError::Load(format!("read config.json in {}", dir.display())))?;
-        let arch = Architecture::from_config(&cfg_value).map_err(to_core)?;
-        let weights = Weights::from_dir(dir, device).map_err(to_core)?;
+        let is_prism =
+            cfg_value.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35");
+        if is_prism && requested.is_some() {
+            return Err(CoreError::Load(
+                "Prism/Bonsai is already packed affine-2; Q4/Q8 repacking would expand the model"
+                    .into(),
+            ));
+        }
+        let arch = if is_prism {
+            Architecture::Qwen35
+        } else {
+            Architecture::from_config(&cfg_value).map_err(to_core)?
+        };
+        let (weights, prism) = if is_prism {
+            let checkpoint =
+                crate::prism_checkpoint::PrismMlxCheckpoint::open(dir, device, &cfg_value)
+                    .map_err(to_core)?;
+            (checkpoint.weights, Some(checkpoint.registry))
+        } else {
+            (Weights::from_dir(dir, device).map_err(to_core)?, None)
+        };
         let (model, mut descriptor, mtp) = if arch == Architecture::Qwen35 {
             // Qwen3.6 hybrid decoder: its own config, the VLM-nested `model.language_model` prefix, and
             // a top-level untied `lm_head`.
             let qcfg = Qwen35Config::from_json(&cfg_value).map_err(to_core)?;
             let descriptor = descriptor_for_qwen35(&qcfg);
-            let m =
+            let m = if let Some(registry) = prism.as_ref() {
+                Qwen35Model::from_prism_weights(
+                    &weights,
+                    "language_model.model",
+                    qcfg,
+                    registry,
+                    crate::device::compute_dtype(device),
+                )
+                .map_err(to_core)?
+            } else {
                 Qwen35Model::from_weights_with(&weights, "model.language_model", qcfg, requested)
-                    .map_err(to_core)?;
+                    .map_err(to_core)?
+            };
             let mtp = if Qwen35Mtp::complete_in(&weights, m.config()) {
                 Some(Qwen35Mtp::from_weights_with(&weights, &m, requested).map_err(to_core)?)
             } else {
