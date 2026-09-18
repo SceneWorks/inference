@@ -4,6 +4,15 @@ use crate::constraint::{Constraint, ConstraintKind};
 use crate::error::{Error, Result};
 use crate::request::TextLlmRequest;
 
+/// Limits advertised by a loaded model with an in-checkpoint multi-token predictor (MTP).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MtpCapabilities {
+    /// Maximum draft-token count the native provider supports per verification pass.
+    pub max_draft_tokens: u32,
+    /// Upstream-recommended draft-token count used by [`MtpMode::Auto`](crate::MtpMode::Auto).
+    pub recommended_draft_tokens: u32,
+}
+
 /// What a provider supports. Used both for honest advertisement and to validate requests up front.
 #[derive(Clone, Debug, Default)]
 pub struct TextLlmCapabilities {
@@ -36,6 +45,8 @@ pub struct TextLlmCapabilities {
     /// section and it emits parseable `<tool_call>` blocks. `false` ⇒ a request carrying
     /// [`tools`](crate::TextLlmRequest::tools) is rejected (never silently dropped).
     pub supports_tools: bool,
+    /// Native in-checkpoint MTP support and limits. `None` means an explicit MTP request is rejected.
+    pub mtp: Option<MtpCapabilities>,
     /// The output constraint KINDS this provider can enforce (empty = none).
     ///
     /// Kinds, not [`Constraint`] values: a provider cannot know in advance which schema or
@@ -123,6 +134,23 @@ impl TextLlmCapabilities {
             )));
         }
 
+        if let crate::MtpMode::Enabled { draft_tokens } = req.mtp {
+            let Some(mtp) = self.mtp else {
+                return Err(Error::Unsupported(format!(
+                    "[{id}] provider does not support multi-token prediction (MTP)"
+                )));
+            };
+            if draft_tokens == 0 {
+                return reject("MTP draft_tokens must be >= 1".into());
+            }
+            if draft_tokens > mtp.max_draft_tokens {
+                return reject(format!(
+                    "MTP draft_tokens {draft_tokens} exceeds cap {}",
+                    mtp.max_draft_tokens
+                ));
+            }
+        }
+
         if let Some(c) = &req.constraint {
             if !self.supports_constraint(c) {
                 return Err(Error::Unsupported(format!(
@@ -167,7 +195,7 @@ pub struct TextLlmDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Message, ReasoningEffort, ThinkingMode};
+    use crate::{Message, MtpMode, ReasoningEffort, ThinkingMode};
 
     fn request() -> TextLlmRequest {
         TextLlmRequest::new(vec![Message::user("hello")], 8)
@@ -189,6 +217,45 @@ mod tests {
             caps.validate_request("test", &req),
             Err(Error::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn explicit_mtp_requires_capability_and_valid_draft_count() {
+        let mut req = request();
+        req.mtp = MtpMode::Enabled { draft_tokens: 3 };
+        let err = TextLlmCapabilities::default()
+            .validate_request("test", &req)
+            .unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)));
+
+        let caps = TextLlmCapabilities {
+            mtp: Some(MtpCapabilities {
+                max_draft_tokens: 4,
+                recommended_draft_tokens: 3,
+            }),
+            ..Default::default()
+        };
+        caps.validate_request("test", &req).unwrap();
+
+        req.mtp = MtpMode::Enabled { draft_tokens: 0 };
+        assert!(matches!(
+            caps.validate_request("test", &req),
+            Err(Error::InvalidRequest(_))
+        ));
+        req.mtp = MtpMode::Enabled { draft_tokens: 5 };
+        assert!(matches!(
+            caps.validate_request("test", &req),
+            Err(Error::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn auto_mtp_is_a_safe_fallback_without_capability() {
+        let mut req = request();
+        req.mtp = MtpMode::Auto;
+        TextLlmCapabilities::default()
+            .validate_request("test", &req)
+            .unwrap();
     }
 
     #[test]

@@ -29,6 +29,24 @@ impl ReasoningEffort {
     }
 }
 
+/// Request policy for an in-checkpoint multi-token predictor (MTP).
+///
+/// MTP is an optional speculative decoder: the base autoregressive distribution remains valid
+/// without it, while enabled runs use target-model verification to preserve that distribution.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MtpMode {
+    /// Use the ordinary autoregressive path. This is the compatibility-preserving default.
+    #[default]
+    Off,
+    /// Use MTP when the loaded model advertises it, otherwise use ordinary autoregressive decode.
+    Auto,
+    /// Require MTP and propose at most `draft_tokens` tokens per target verification pass.
+    Enabled {
+        /// Number of speculative draft tokens. Must be within the provider's advertised limit.
+        draft_tokens: u32,
+    },
+}
+
 impl std::str::FromStr for ReasoningEffort {
     type Err = crate::Error;
 
@@ -147,6 +165,9 @@ pub struct TextLlmRequest {
     /// Whether prior assistant reasoning should be retained when the template re-renders history.
     /// `None` omits the kwarg and preserves the model's default (Qwen3.8 defaults to `true`).
     pub preserve_thinking: Option<bool>,
+    /// Optional in-checkpoint multi-token prediction policy. [`MtpMode::Off`] preserves the ordinary
+    /// autoregressive path; explicit enablement is rejected unless the loaded model advertises MTP.
+    pub mtp: MtpMode,
     /// Tools / functions offered to the model (matching `transformers` `tools=`). Rendered into the
     /// prompt by the chat template and used to type-coerce the model's parsed tool calls. Honored only
     /// by providers advertising [`supports_tools`](crate::TextLlmCapabilities::supports_tools); a
@@ -206,6 +227,7 @@ mod tests {
         assert!(!request.sampling.is_greedy());
         assert_eq!(request.reasoning_effort, None);
         assert_eq!(request.preserve_thinking, None);
+        assert_eq!(request.mtp, MtpMode::Off);
     }
 
     #[test]

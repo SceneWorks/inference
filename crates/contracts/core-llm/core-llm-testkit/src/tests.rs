@@ -46,6 +46,7 @@ fn stub_caps() -> TextLlmCapabilities {
         supports_audio: false,
         supports_thinking: false,
         supports_tools: false,
+        mtp: None,
         supported_constraints: Vec::new(),
     }
 }
@@ -122,6 +123,7 @@ impl TextLlm for StubTextLlm {
                     thinking: None,
                     tool_calls: Vec::new(),
                     usage,
+                    mtp: None,
                     finish_reason: Some(FinishReason::Cancelled),
                 });
             }
@@ -160,6 +162,7 @@ impl TextLlm for StubTextLlm {
             thinking: None,
             tool_calls: Vec::new(),
             usage,
+            mtp: None,
             finish_reason: Some(FinishReason::Length),
         })
     }

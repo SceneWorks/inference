@@ -62,14 +62,14 @@ pub mod tokenizer;
 pub mod tool;
 
 pub use cancel::CancelFlag;
-pub use capabilities::{TextLlmCapabilities, TextLlmDescriptor};
+pub use capabilities::{MtpCapabilities, TextLlmCapabilities, TextLlmDescriptor};
 pub use constraint::{
     Constraint, ConstraintDecodeTable, ConstraintKind, JsonConstraint, JsonState,
 };
 pub use detok::IncrementalDetok;
 pub use error::{Error, Result};
 pub use message::{AudioRef, Content, ImageRef, Message, Role, VideoRef};
-pub use output::{Channel, FinishReason, StreamEvent, TextLlmOutput, Usage};
+pub use output::{Channel, FinishReason, MtpStats, StreamEvent, TextLlmOutput, Usage};
 pub use paging::BlockAllocator;
 pub use prefix::{InsertOutcome, PrefixId, PrefixIndex, PrefixMatch};
 pub use prepare::{
@@ -79,7 +79,9 @@ pub use prepare::{
 pub use registry::{
     ModelRequirements, TextLlmRegistration, TextLlmRegistry, TextLlmRegistryBuilder,
 };
-pub use request::{LoadSpec, Quantize, ReasoningEffort, Sampling, TextLlmRequest, ThinkingMode};
+pub use request::{
+    LoadSpec, MtpMode, Quantize, ReasoningEffort, Sampling, TextLlmRequest, ThinkingMode,
+};
 pub use schedule::{Scheduler, SeqId, SeqSpec};
 pub use speculative::{accept_greedy_run, accept_token, ngram_propose, Acceptance};
 pub use starvector::{

@@ -426,6 +426,7 @@ mod tests {
             supports_audio: false,
             supports_thinking: false,
             supports_tools: false,
+            mtp: None,
             supported_constraints: constraints.iter().map(Constraint::kind).collect(),
         }
     }

@@ -9,6 +9,17 @@ pub struct Usage {
     pub generated_tokens: u32,
 }
 
+/// Per-request evidence from native MTP speculative decoding.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MtpStats {
+    /// Draft tokens proposed by the MTP head.
+    pub proposed_tokens: u32,
+    /// Proposed tokens accepted by target-model verification.
+    pub accepted_tokens: u32,
+    /// Target forward passes, including prompt prefill and verification passes.
+    pub target_forwards: u32,
+}
+
 impl Usage {
     /// Total tokens processed (prompt + generated).
     pub fn total_tokens(&self) -> u32 {
@@ -93,6 +104,8 @@ pub struct TextLlmOutput {
     pub tool_calls: Vec<crate::tool::ToolCall>,
     /// Token usage.
     pub usage: Usage,
+    /// MTP speculative-decoding counters when MTP ran; `None` on ordinary autoregressive decode.
+    pub mtp: Option<MtpStats>,
     /// Why generation stopped (`None` only on a default-constructed value).
     pub finish_reason: Option<FinishReason>,
 }

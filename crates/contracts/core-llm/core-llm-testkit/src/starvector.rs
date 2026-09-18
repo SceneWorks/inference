@@ -308,6 +308,7 @@ mod tests {
                 supports_audio: false,
                 supports_thinking: false,
                 supports_tools: false,
+                mtp: None,
                 supported_constraints: Vec::new(),
             },
         };
@@ -376,6 +377,7 @@ mod tests {
                 thinking: None,
                 tool_calls: Vec::new(),
                 usage,
+                mtp: None,
                 finish_reason: Some(core_llm::FinishReason::Stop),
             })
         }
