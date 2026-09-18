@@ -501,8 +501,16 @@ impl LlamaProvider {
 
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         let stop_tokens = eos_token_ids(dir);
-        let (template, supports_thinking, supports_tools) = load_chat_template(dir);
+        let (
+            template,
+            supports_thinking,
+            supports_reasoning_effort,
+            supports_preserve_thinking,
+            supports_tools,
+        ) = load_chat_template(dir);
         descriptor.capabilities.supports_thinking = supports_thinking;
+        descriptor.capabilities.supports_reasoning_effort = supports_reasoning_effort;
+        descriptor.capabilities.supports_preserve_thinking = supports_preserve_thinking;
         descriptor.capabilities.supports_tools = supports_tools;
         Ok(Self {
             descriptor,
@@ -870,20 +878,36 @@ impl RewindableConstraintMask for JsonMask<'_> {
 /// - **tools** — the template renders tool calls (it mentions `tool_call`), so it has a `tools`
 ///   section and the model emits parseable `<tool_call>` blocks (sc-7636). Covers the Qwen3.6 XML and
 ///   the Qwen2.5/Hermes JSON tool templates alike.
-fn load_chat_template(dir: &Path) -> (Box<dyn ChatTemplate>, bool, bool) {
+fn load_chat_template(dir: &Path) -> (Box<dyn ChatTemplate>, bool, bool, bool, bool) {
     // The sidecar `chat_template.jinja` wins over the embedded key — see `sidecar_chat_template`.
     if let Some(t) = sidecar_chat_template(dir) {
         let supports_thinking = t.source().contains("enable_thinking");
+        let supports_reasoning_effort = t.source().contains("reasoning_effort");
+        let supports_preserve_thinking = t.source().contains("preserve_thinking");
         let supports_tools = t.source().contains("tool_call");
-        return (Box::new(t), supports_thinking, supports_tools);
+        return (
+            Box::new(t),
+            supports_thinking,
+            supports_reasoning_effort,
+            supports_preserve_thinking,
+            supports_tools,
+        );
     }
     match JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json")) {
         Ok(t) => {
             let supports_thinking = t.source().contains("enable_thinking");
+            let supports_reasoning_effort = t.source().contains("reasoning_effort");
+            let supports_preserve_thinking = t.source().contains("preserve_thinking");
             let supports_tools = t.source().contains("tool_call");
-            (Box::new(t), supports_thinking, supports_tools)
+            (
+                Box::new(t),
+                supports_thinking,
+                supports_reasoning_effort,
+                supports_preserve_thinking,
+                supports_tools,
+            )
         }
-        Err(_) => (Box::new(Llama3Template), false, false),
+        Err(_) => (Box::new(Llama3Template), false, false, false, false),
     }
 }
 
@@ -1451,6 +1475,8 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             // Weightless default: conservative. The load path (descriptor_for + load) flips this on
             // when the loaded model's own chat template gates an `enable_thinking` kwarg (sc-7585).
             supports_thinking: false,
+            supports_reasoning_effort: false,
+            supports_preserve_thinking: false,
             // Weightless default: conservative. The load path flips this on when the loaded model's
             // chat template renders tool calls (sc-7636).
             supports_tools: false,
@@ -1884,7 +1910,7 @@ mod tests {
         assert_eq!(cfg.architecture, Architecture::Qwen3Vl);
         assert_eq!(cfg.max_position_embeddings, 262144, "256K context");
 
-        let (template, _, _) = load_chat_template(&dir);
+        let (template, _, _, _, _) = load_chat_template(&dir);
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).expect("load tokenizer");
 
         for (case, expected) in oracle["cases"].as_object().unwrap() {
