@@ -4,6 +4,46 @@ use crate::cancel::CancelFlag;
 use crate::constraint::Constraint;
 use crate::message::Message;
 
+/// Qwen3.8 reasoning budgets accepted by its frozen official chat template.
+///
+/// The spellings deliberately match the template kwargs. Keeping this typed prevents callers from
+/// passing a value the model would otherwise reject only while rendering the prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    /// The template default and most thorough reasoning budget.
+    XHigh,
+    /// The template's middle reasoning budget (no extra budget instruction is injected).
+    Medium,
+    /// The brief, focused reasoning budget.
+    Low,
+}
+
+impl ReasoningEffort {
+    /// The exact `reasoning_effort` chat-template kwarg.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::XHigh => "xhigh",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
+}
+
+impl std::str::FromStr for ReasoningEffort {
+    type Err = crate::Error;
+
+    fn from_str(value: &str) -> crate::Result<Self> {
+        match value {
+            "xhigh" => Ok(Self::XHigh),
+            "medium" => Ok(Self::Medium),
+            "low" => Ok(Self::Low),
+            unsupported => Err(crate::Error::InvalidRequest(format!(
+                "unsupported reasoning_effort `{unsupported}`; expected xhigh, medium, or low"
+            ))),
+        }
+    }
+}
+
 /// Backend-neutral sampling policy. The backend's sampler consumes these knobs; `core-llm` owns the
 /// policy so it is identical across MLX and Candle.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -101,6 +141,12 @@ pub struct TextLlmRequest {
     /// [`supports_thinking`](crate::TextLlmCapabilities::supports_thinking); [`ThinkingMode::Auto`]
     /// (the default) leaves the model's template default in place.
     pub thinking: ThinkingMode,
+    /// Optional reasoning budget passed to templates that support it. `None` omits the kwarg and
+    /// preserves the model's own default (Qwen3.8 resolves that to `xhigh`).
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Whether prior assistant reasoning should be retained when the template re-renders history.
+    /// `None` omits the kwarg and preserves the model's default (Qwen3.8 defaults to `true`).
+    pub preserve_thinking: Option<bool>,
     /// Tools / functions offered to the model (matching `transformers` `tools=`). Rendered into the
     /// prompt by the chat template and used to type-coerce the model's parsed tool calls. Honored only
     /// by providers advertising [`supports_tools`](crate::TextLlmCapabilities::supports_tools); a
@@ -158,6 +204,29 @@ mod tests {
         assert_eq!(request.sampling.temperature, 0.7);
         assert_eq!(request.sampling.top_p, 0.9);
         assert!(!request.sampling.is_greedy());
+        assert_eq!(request.reasoning_effort, None);
+        assert_eq!(request.preserve_thinking, None);
+    }
+
+    #[test]
+    fn reasoning_effort_accepts_only_the_frozen_qwen38_values() {
+        use std::str::FromStr;
+
+        assert_eq!(
+            ReasoningEffort::from_str("xhigh").unwrap(),
+            ReasoningEffort::XHigh
+        );
+        assert_eq!(
+            ReasoningEffort::from_str("medium").unwrap(),
+            ReasoningEffort::Medium
+        );
+        assert_eq!(
+            ReasoningEffort::from_str("low").unwrap(),
+            ReasoningEffort::Low
+        );
+        let err = ReasoningEffort::from_str("high").unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidRequest(_)));
+        assert!(err.to_string().contains("expected xhigh, medium, or low"));
     }
 }
 

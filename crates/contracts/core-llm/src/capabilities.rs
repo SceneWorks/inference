@@ -103,6 +103,19 @@ impl TextLlmCapabilities {
             )));
         }
 
+        if !self.supports_thinking
+            && (req.reasoning_effort.is_some() || req.preserve_thinking.is_some())
+        {
+            return Err(Error::Unsupported(format!(
+                "[{id}] provider does not support reasoning template controls"
+            )));
+        }
+
+        if req.thinking == crate::request::ThinkingMode::Disabled && req.reasoning_effort.is_some()
+        {
+            return reject("reasoning_effort cannot be set when thinking is disabled".to_string());
+        }
+
         // Offered tools the provider cannot render/parse are rejected, not silently dropped.
         if !self.supports_tools && !req.tools.is_empty() {
             return Err(Error::Unsupported(format!(
@@ -149,4 +162,46 @@ pub struct TextLlmDescriptor {
     pub backend: String,
     /// Declared capabilities.
     pub capabilities: TextLlmCapabilities,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Message, ReasoningEffort, ThinkingMode};
+
+    fn request() -> TextLlmRequest {
+        TextLlmRequest::new(vec![Message::user("hello")], 8)
+    }
+
+    #[test]
+    fn reasoning_controls_require_thinking_capability() {
+        let caps = TextLlmCapabilities::default();
+        let mut req = request();
+        req.reasoning_effort = Some(ReasoningEffort::Low);
+        assert!(matches!(
+            caps.validate_request("test", &req),
+            Err(Error::Unsupported(_))
+        ));
+
+        let mut req = request();
+        req.preserve_thinking = Some(false);
+        assert!(matches!(
+            caps.validate_request("test", &req),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn reasoning_effort_is_rejected_when_thinking_is_disabled() {
+        let caps = TextLlmCapabilities {
+            supports_thinking: true,
+            ..Default::default()
+        };
+        let mut req = request();
+        req.thinking = ThinkingMode::Disabled;
+        req.reasoning_effort = Some(ReasoningEffort::Medium);
+        let err = caps.validate_request("test", &req).unwrap_err();
+        assert!(matches!(err, Error::InvalidRequest(_)));
+        assert!(err.to_string().contains("thinking is disabled"));
+    }
 }

@@ -1166,6 +1166,8 @@ impl TextLlm for LlamaProvider {
             &RenderOptions {
                 add_generation_prompt: true,
                 enable_thinking: req.enable_thinking_kwarg(),
+                reasoning_effort: req.reasoning_effort,
+                preserve_thinking: req.preserve_thinking,
                 tools: &req.tools,
             },
         )?;
@@ -1751,10 +1753,25 @@ pub fn can_load(spec: &LoadSpec) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        expand_vision_placeholders, merged_frame_timestamps, prompt_opens_thinking,
+        eos_token_ids, expand_vision_placeholders, merged_frame_timestamps, prompt_opens_thinking,
         video_placeholder_text,
     };
     use core_llm::{ImageRef, VideoRef};
+
+    #[test]
+    fn frozen_qwen38_generation_config_uses_both_official_stop_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../docs/reference/qwen38/generation_config.json"
+            )),
+        )
+        .unwrap();
+
+        assert_eq!(eos_token_ids(dir.path()), vec![248046, 248044]);
+    }
 
     #[test]
     fn prompt_opens_thinking_matches_template_modes() {

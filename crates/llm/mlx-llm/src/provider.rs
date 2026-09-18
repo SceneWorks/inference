@@ -1000,6 +1000,8 @@ impl TextLlm for LlamaProvider {
             &RenderOptions {
                 add_generation_prompt: true,
                 enable_thinking: req.enable_thinking_kwarg(),
+                reasoning_effort: req.reasoning_effort,
+                preserve_thinking: req.preserve_thinking,
                 tools: &req.tools,
             },
         )?;
@@ -1633,6 +1635,21 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn frozen_qwen38_generation_config_uses_both_official_stop_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../docs/reference/qwen38/generation_config.json"
+            )),
+        )
+        .unwrap();
+
+        assert_eq!(eos_token_ids(dir.path()), vec![248046, 248044]);
+    }
+
     fn qwen36_wrapper() -> serde_json::Value {
         json!({
             "architectures": ["Qwen3_5ForConditionalGeneration"],
@@ -1802,6 +1819,8 @@ mod tests {
                     &RenderOptions {
                         add_generation_prompt: true,
                         enable_thinking: None,
+                        reasoning_effort: None,
+                        preserve_thinking: None,
                         tools: &[],
                     },
                 )

@@ -79,7 +79,7 @@ pub use prepare::{
 pub use registry::{
     ModelRequirements, TextLlmRegistration, TextLlmRegistry, TextLlmRegistryBuilder,
 };
-pub use request::{LoadSpec, Quantize, Sampling, TextLlmRequest, ThinkingMode};
+pub use request::{LoadSpec, Quantize, ReasoningEffort, Sampling, TextLlmRequest, ThinkingMode};
 pub use schedule::{Scheduler, SeqId, SeqSpec};
 pub use speculative::{accept_greedy_run, accept_token, ngram_propose, Acceptance};
 pub use starvector::{

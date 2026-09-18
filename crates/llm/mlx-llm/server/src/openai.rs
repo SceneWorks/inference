@@ -165,6 +165,8 @@ impl ChatRequest {
             // This shim does not yet surface request-level thinking/tools controls; leave thinking
             // at the template default (Auto) and offer no tools (no behavior change).
             thinking: Default::default(),
+            reasoning_effort: None,
+            preserve_thinking: None,
             tools: Vec::new(),
             stop: self.stop.map(StringOrVec::into_vec).unwrap_or_default(),
             cancel: Default::default(),

@@ -1311,6 +1311,29 @@ mod tests {
         })
     }
 
+    #[test]
+    fn frozen_qwen38_dense_config_matches_qwen35_decoder() {
+        let value: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../docs/reference/qwen38/config.json"
+        )))
+        .unwrap();
+        let cfg = Qwen35Config::from_json(&value).unwrap();
+
+        assert_eq!(cfg.hidden_size, 5120);
+        assert_eq!(cfg.num_layers, 64);
+        assert_eq!(cfg.intermediate_size, 17408);
+        assert_eq!(cfg.num_heads, 24);
+        assert_eq!(cfg.num_kv_heads, 4);
+        assert_eq!(cfg.head_dim, 256);
+        assert_eq!(cfg.vocab_size, 248320);
+        assert_eq!(cfg.full_attention_interval, 4);
+        assert_eq!(cfg.max_position_embeddings, 262144);
+        assert_eq!(cfg.mrope_section_resolved(), [11, 11, 10]);
+        assert!(cfg.moe.is_none());
+        assert!(cfg.quantization.is_none());
+    }
+
     /// A deterministic small tensor `[shape]` (finite, non-degenerate).
     fn t(map: &mut HashMap<String, Array>, key: &str, shape: &[i32]) {
         let n: i32 = shape.iter().product();
