@@ -1,5 +1,6 @@
 """Regression tests for trust boundaries around persistent self-hosted CI runners."""
 
+import copy
 import functools
 import json
 import ntpath
@@ -3760,6 +3761,11 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         workflow = yaml.safe_load(workflow_text)
         options = workflow[True]["workflow_dispatch"]["inputs"]["profile"]["options"]
         self.assertIn("qwen38-bonsai", options)
+        preflight_input = workflow[True]["workflow_dispatch"]["inputs"][
+            "qwen38_bonsai_preflight_only"
+        ]
+        self.assertEqual(preflight_input["type"], "boolean")
+        self.assertFalse(preflight_input["default"])
         jobs = workflow["jobs"]
         mlx = jobs["qwen38-bonsai-mlx"]
         candle = jobs["qwen38-bonsai-candle"]
@@ -3769,6 +3775,20 @@ class CiWorkflowPolicyTests(unittest.TestCase):
 
         mlx_commands = "\n".join(step.get("run", "") for step in mlx["steps"])
         candle_commands = "\n".join(step.get("run", "") for step in candle["steps"])
+        snapshot_reference = re.compile(r"(?:\$|%)(BONSAI_[A-Z0-9_]+_SNAPSHOT)(?:\b|%)")
+
+        def missing_job_snapshot_env(job: dict) -> set[str]:
+            commands = "\n".join(step.get("run", "") for step in job["steps"])
+            referenced = set(snapshot_reference.findall(commands))
+            return referenced - set(job.get("env", {}))
+
+        self.assertEqual(missing_job_snapshot_env(mlx), set())
+        self.assertEqual(missing_job_snapshot_env(candle), set())
+        candle_without_mlx = copy.deepcopy(candle)
+        del candle_without_mlx["env"]["BONSAI_MLX_SNAPSHOT"]
+        self.assertEqual(
+            missing_job_snapshot_env(candle_without_mlx), {"BONSAI_MLX_SNAPSHOT"}
+        )
         for commands in (mlx_commands, candle_commands):
             self.assertIn("qwen38_bonsai_terminal.py hardware", commands)
             self.assertIn("qwen38_bonsai_terminal.py preflight", commands)
@@ -3798,6 +3818,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn('call "%VCVARS%" || exit /b 1', cuda_oracle["run"])
         self.assertIn(cuda_oracle_command, cuda_oracle["run"])
         self.assertIn('findstr /C:"test result: ok. 1 passed"', cuda_oracle["run"])
+        self.assertIn("check-gpu-reservation --gpu-index 0", cuda_oracle["run"])
         self.assertNotIn("continue-on-error", cuda_oracle)
         self.assertLess(
             candle_commands.index(cuda_oracle_command),
@@ -3808,6 +3829,29 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("qwen38_bonsai_terminal.py matrix-status", candle_commands)
         self.assertIn("--candle-device auto", candle_commands)
         self.assertIn("--candle-device cpu", candle_commands)
+        self.assertEqual((mlx_commands + candle_commands).count("--preflight"), 19)
+        self.assertEqual(candle_commands.count("--reservation-token"), 16)
+        self.assertIn("reserve-gpu --gpu-index 0", candle_commands)
+        self.assertIn("release-gpu --gpu-index 0", candle_commands)
+        self.assertIn('matrix-status --runtime-sha "%GITHUB_SHA%"', candle_commands)
+        self.assertIn('verify-matrix-seal --runtime-sha "%GITHUB_SHA%"', candle_commands)
+
+        for job in (mlx, candle):
+            for step in job["steps"]:
+                name = step.get("name", "")
+                is_materialization = name.startswith(
+                    ("Resolve runner-local", "Install pinned snapshot", "Verify immutable", "Build one native", "Run MLX", "Run Candle")
+                ) or step.get("uses", "").startswith("actions/download-artifact")
+                if is_materialization:
+                    self.assertIn(
+                        "inputs.qwen38_bonsai_preflight_only != true",
+                        step.get("if", ""),
+                        name or step.get("uses"),
+                    )
+        self.assertNotIn(
+            "qwen38_bonsai_preflight_only",
+            cuda_oracle.get("if", ""),
+        )
 
         matrix = json.loads(
             (WORKFLOW.parents[2] / "release" / "qwen38-bonsai-matrix.json").read_text(

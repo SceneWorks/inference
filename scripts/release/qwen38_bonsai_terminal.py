@@ -33,6 +33,56 @@ except ImportError:
 
 SCHEMA_VERSION = 1
 SUITE = "qwen38-bonsai-native-v1"
+CUDA_DEVICE_INDEX = 0
+LOAD_PROFILES: dict[str, dict[str, Any]] = {
+    "mlx-unified": {
+        "backend": "mlx",
+        "device": "unified",
+        "command_device": None,
+        "host_weight_copies": 1,
+        "gpu_weight_copies": None,
+        "basis": "MLX safetensors pread into one Metal shared buffer; CPU and GPU share residency",
+    },
+    "candle-packed-cuda": {
+        "backend": "candle",
+        "device": "cuda",
+        "command_device": "auto",
+        "host_weight_copies": 1,
+        "gpu_weight_copies": 1,
+        "basis": "compact host tensor staging plus compact CUDA-resident Prism weights",
+    },
+    "candle-packed-cpu": {
+        "backend": "candle",
+        "device": "cpu",
+        "command_device": "cpu",
+        "host_weight_copies": 1,
+        "gpu_weight_copies": None,
+        "basis": "compact host-resident Prism weights with bounded row decode",
+    },
+    "candle-dense-cpu": {
+        "backend": "candle",
+        "device": "cpu",
+        "command_device": "cpu",
+        "host_weight_copies": 3,
+        "gpu_weight_copies": None,
+        "basis": "audited peak: one BF16 source copy plus one F32 constructed copy",
+    },
+    "candle-dense-cuda": {
+        "backend": "candle",
+        "device": "cuda",
+        "command_device": "auto",
+        "host_weight_copies": 1,
+        "gpu_weight_copies": 1,
+        "basis": "host source staging plus dtype-preserving CUDA weights",
+    },
+}
+
+
+def checked_sha(value: str, label: str) -> str:
+    value = value.lower()
+    if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
+        raise ValueError(f"{label} must be a lowercase 40-character commit")
+    return value
 
 
 def sha256(path: Path) -> str:
@@ -250,6 +300,101 @@ def nvidia_hardware() -> tuple[list[dict[str, Any]], list[dict[str, Any]], str |
     return gpus, processes, None
 
 
+def selected_gpu_state(
+    gpus: list[dict[str, Any]], processes: list[dict[str, Any]], gpu_index: int
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    matches = [gpu for gpu in gpus if gpu.get("index") == gpu_index]
+    if len(matches) != 1:
+        return None, []
+    selected = matches[0]
+    uuid = selected.get("uuid")
+    tenants = [process for process in processes if process.get("gpu_uuid") == uuid]
+    return selected, tenants
+
+
+def reservation_token_sha256(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def load_reservation(path: Path, token: str, gpu_index: int) -> dict[str, Any]:
+    reservation = json.loads(path.read_text(encoding="utf-8"))
+    if reservation.get("schema_version") != 1:
+        raise ValueError("unsupported GPU reservation schema")
+    if reservation.get("token_sha256") != reservation_token_sha256(token):
+        raise ValueError("GPU reservation token does not match campaign owner")
+    if reservation.get("gpu_index") != gpu_index:
+        raise ValueError("GPU reservation selects a different device")
+    return reservation
+
+
+def current_cuda_admission(
+    *,
+    gpu_index: int,
+    required_bytes: int,
+    expected_uuid: str | None = None,
+) -> dict[str, Any]:
+    gpus, processes, unavailable_reason = nvidia_hardware()
+    selected, tenants = selected_gpu_state(gpus, processes, gpu_index)
+    selected_uuid = selected.get("uuid") if selected else None
+    available = selected.get("free_bytes") if selected else None
+    admitted = (
+        selected is not None
+        and isinstance(available, int)
+        and available >= required_bytes
+        and not tenants
+        and (expected_uuid is None or selected_uuid == expected_uuid)
+    )
+    return {
+        "gpu_index": gpu_index,
+        "selected_gpu": selected,
+        "selected_gpu_uuid": selected_uuid,
+        "selected_gpu_available_bytes": available,
+        "selected_gpu_compute_processes": tenants,
+        "all_gpus": gpus,
+        "all_compute_processes": processes,
+        "gpu_unavailable_reason": unavailable_reason,
+        "required_available_bytes": required_bytes,
+        "expected_gpu_uuid": expected_uuid,
+        "admitted": admitted,
+    }
+
+
+def acquire_gpu_reservation(args: argparse.Namespace) -> int:
+    state = current_cuda_admission(gpu_index=args.gpu_index, required_bytes=0)
+    if not state["admitted"]:
+        raise ValueError("selected CUDA device is unavailable or has an active compute process")
+    reservation = {
+        "schema_version": 1,
+        "captured_unix_seconds": time.time(),
+        "token_sha256": reservation_token_sha256(args.token),
+        "gpu_index": args.gpu_index,
+        "gpu_uuid": state["selected_gpu_uuid"],
+    }
+    write_new(args.reservation, reservation)
+    write_new(args.evidence, reservation)
+    return 0
+
+
+def check_gpu_reservation(args: argparse.Namespace) -> int:
+    reservation = load_reservation(args.reservation, args.token, args.gpu_index)
+    state = current_cuda_admission(
+        gpu_index=args.gpu_index,
+        required_bytes=args.required_bytes,
+        expected_uuid=reservation["gpu_uuid"],
+    )
+    if not state["admitted"]:
+        raise ValueError("selected CUDA device changed, lacks capacity, or has an active co-tenant")
+    if args.output is not None:
+        write_new(args.output, state)
+    return 0
+
+
+def release_gpu_reservation(args: argparse.Namespace) -> int:
+    load_reservation(args.reservation, args.token, args.gpu_index)
+    args.reservation.unlink()
+    return 0
+
+
 def safetensor_sizes(path: Path) -> tuple[int, int]:
     with path.open("rb") as handle:
         raw = handle.read(8)
@@ -387,12 +532,87 @@ def artifact_manifest(root: Path, names: list[str]) -> dict[str, Any]:
     return {"files": files}
 
 
+def validate_preflight_record(
+    preflight: dict[str, Any],
+    *,
+    model: dict[str, Any],
+    load_profile: str,
+    language_variant: str | None,
+    vision_variant: str | None,
+) -> None:
+    policy = LOAD_PROFILES[load_profile]
+    sizes = pinned_admission_sizes(model, language_variant, vision_variant)
+    weight_bytes = sizes["language_weight_bytes"] + sizes["vision_weight_bytes"]
+    reserve = preflight.get("reserve_bytes")
+    if not isinstance(reserve, int) or reserve < 0:
+        raise ValueError("preflight reserve bytes are invalid")
+    host_required = weight_bytes * policy["host_weight_copies"] + reserve
+    gpu_copies = policy["gpu_weight_copies"]
+    gpu_required = weight_bytes * gpu_copies + reserve if gpu_copies else None
+    identity = {
+        "model_key": model["key"],
+        "model_revision": model["revision"],
+        "language_variant": language_variant,
+        "vision_variant": vision_variant,
+        "artifact_sizes": sizes,
+        "load_profile": load_profile,
+        "host_weight_copies": policy["host_weight_copies"],
+        "gpu_weight_copies": gpu_copies,
+        "host_required_available_bytes": host_required,
+        "gpu_required_available_bytes": gpu_required,
+    }
+    for field, expected in identity.items():
+        if preflight.get(field) != expected:
+            raise ValueError(f"preflight {field} does not match pinned admission contract")
+    available = preflight.get("available_memory_bytes")
+    host_admitted = isinstance(available, int) and available >= host_required
+    if preflight.get("host_admitted") is not host_admitted:
+        raise ValueError("preflight host admission verdict is inconsistent")
+    if gpu_required is None:
+        gpu_admitted = True
+        if any(
+            preflight.get(field) is not None
+            for field in (
+                "selected_gpu_index",
+                "selected_gpu_uuid",
+                "selected_gpu_available_bytes",
+                "selected_gpu_compute_processes",
+            )
+        ):
+            raise ValueError("non-CUDA preflight unexpectedly selects an NVIDIA device")
+    else:
+        selected_index = preflight.get("selected_gpu_index")
+        selected_uuid = preflight.get("selected_gpu_uuid")
+        selected_available = preflight.get("selected_gpu_available_bytes")
+        tenants = preflight.get("selected_gpu_compute_processes")
+        selected, derived_tenants = selected_gpu_state(
+            preflight.get("gpus", []), preflight.get("compute_processes", []), CUDA_DEVICE_INDEX
+        )
+        if (
+            selected_index != CUDA_DEVICE_INDEX
+            or selected is None
+            or selected_uuid != selected.get("uuid")
+            or selected_available != selected.get("free_bytes")
+            or tenants != derived_tenants
+        ):
+            raise ValueError("preflight selected-device evidence is inconsistent")
+        if not isinstance(preflight.get("reservation_token_sha256"), str):
+            raise ValueError("CUDA preflight lacks campaign reservation identity")
+        gpu_admitted = (
+            isinstance(selected_available, int)
+            and selected_available >= gpu_required
+            and tenants == []
+        )
+    if preflight.get("gpu_admitted") is not gpu_admitted:
+        raise ValueError("preflight GPU admission verdict is inconsistent")
+    if preflight.get("admitted") is not (host_admitted and gpu_admitted):
+        raise ValueError("preflight aggregate admission verdict is inconsistent")
+
+
 def run(args: argparse.Namespace) -> int:
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
-    runtime_sha = args.runtime_sha.lower()
-    if len(runtime_sha) != 40 or any(c not in "0123456789abcdef" for c in runtime_sha):
-        raise ValueError("runtime SHA must be a lowercase 40-character commit")
+    runtime_sha = checked_sha(args.runtime_sha, "runtime SHA")
     source = source_identity(runtime_sha, args.allow_dirty)
     model = load_model(args.manifest, args.model_key)
     if model["revision"] != args.model_revision:
@@ -406,6 +626,39 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError(
             f"selected weight bytes {measured_sizes} do not match pinned admission bytes {pinned_sizes}"
         )
+    preflight_path = args.preflight.resolve(strict=True)
+    preflight = json.loads(preflight_path.read_text(encoding="utf-8"))
+    load_profile = preflight.get("load_profile")
+    if load_profile not in LOAD_PROFILES:
+        raise ValueError("run preflight has an unknown load profile")
+    validate_preflight_record(
+        preflight,
+        model=model,
+        load_profile=load_profile,
+        language_variant=args.language_variant,
+        vision_variant=args.vision_variant,
+    )
+    policy = LOAD_PROFILES[load_profile]
+    if args.candle_device != policy["command_device"]:
+        raise ValueError("wrapper device selection does not match preflight load profile")
+    gpu_recheck = None
+    if policy["device"] == "cuda":
+        if args.reservation is None or args.reservation_token is None:
+            raise ValueError("CUDA run requires the active campaign reservation")
+        reservation = load_reservation(
+            args.reservation, args.reservation_token, CUDA_DEVICE_INDEX
+        )
+        if reservation["token_sha256"] != preflight.get("reservation_token_sha256"):
+            raise ValueError("run reservation does not match its preflight")
+        gpu_recheck = current_cuda_admission(
+            gpu_index=CUDA_DEVICE_INDEX,
+            required_bytes=preflight["gpu_required_available_bytes"],
+            expected_uuid=preflight["selected_gpu_uuid"],
+        )
+        if not gpu_recheck["admitted"]:
+            raise ValueError(
+                "selected CUDA device changed, lacks capacity, or gained an active co-tenant"
+            )
     binary = args.binary.resolve(strict=True)
     provider_path = output / "provider.json"
     stdout_path = output / "stdout.log"
@@ -487,6 +740,9 @@ def run(args: argparse.Namespace) -> int:
             "argv": command,
             "binary_sha256": sha256(binary),
             "candle_device": args.candle_device,
+            "load_profile": load_profile,
+            "preflight_path": str(preflight_path),
+            "preflight_sha256": sha256(preflight_path),
         },
         "runtime": source,
         "host": {
@@ -531,6 +787,7 @@ def run(args: argparse.Namespace) -> int:
             "unavailable_reason": None if gpu_samples else (gpu_reasons[-1] if gpu_reasons else "no samples"),
             "samples": gpu_samples,
             "peak_bytes": max((sample["bytes"] for sample in gpu_samples), default=None),
+            "admission_recheck": gpu_recheck,
         },
         "provider_evidence": "provider.json" if provider_path.is_file() else None,
         "artifact_manifest_sha256": sha256(output / "artifact-manifest.json"),
@@ -547,7 +804,12 @@ def run(args: argparse.Namespace) -> int:
     return 0 if completed else 1
 
 
-def validate_receipt(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+def validate_receipt(
+    root: Path,
+    *,
+    expected_backend: str | None = None,
+    expected_device: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     receipt_path = root / "receipt.json"
     seal_path = root / "seal.json"
     manifest_path = root / "artifact-manifest.json"
@@ -596,6 +858,14 @@ def validate_receipt(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     provider = json.loads((root / provider_name).read_text(encoding="utf-8"))
     if provider.get("status") != "completed":
         raise ValueError(f"provider evidence incomplete in {root}")
+    runtime_sha = receipt.get("runtime", {}).get("head_sha")
+    for field, expected in (
+        ("model_id", model.get("id")),
+        ("model_revision", model.get("revision")),
+        ("runtime_sha", runtime_sha),
+    ):
+        if provider.get(field) != expected:
+            raise ValueError(f"provider {field} does not match enclosing receipt in {root}")
     if provider.get("context_admission", {}).get("evidence_complete") is not True:
         raise ValueError(f"provider lacks a genuine context admission rejection in {root}")
     memory_points = [
@@ -605,7 +875,18 @@ def validate_receipt(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     ]
     if any(not isinstance(point, dict) or not point for point in memory_points):
         raise ValueError(f"provider native memory evidence is missing in {root}")
-    backend = memory_points[0].get("backend")
+    native_runtimes = [
+        (point.get("backend"), point.get("device")) for point in memory_points
+    ]
+    if len(set(native_runtimes)) != 1:
+        raise ValueError(f"native runtime identity changed during run in {root}")
+    backend, device = native_runtimes[0]
+    if provider.get("provider", {}).get("backend") != backend:
+        raise ValueError(f"provider descriptor backend does not match native runtime in {root}")
+    if expected_backend is not None and backend != expected_backend:
+        raise ValueError(f"native backend does not match matrix cell in {root}")
+    if expected_device is not None and device != expected_device:
+        raise ValueError(f"native device does not match matrix cell in {root}")
     if backend == "mlx":
         if any(not isinstance(point.get("peak_active_bytes"), int) for point in memory_points):
             raise ValueError(f"MLX allocator peak is unavailable in {root}")
@@ -636,6 +917,16 @@ def validate_receipt(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
 
 def validate(args: argparse.Namespace) -> int:
     rows = [validate_receipt(path.resolve()) for path in args.run]
+    expected_runtime_sha = checked_sha(args.runtime_sha, "expected runtime SHA")
+    for receipt, provider in rows:
+        if receipt.get("runtime", {}).get("head_sha") != expected_runtime_sha:
+            raise ValueError(
+                f"runtime SHA mismatch for {receipt.get('model', {}).get('id')}"
+            )
+        if provider.get("runtime_sha") != expected_runtime_sha:
+            raise ValueError(
+                f"provider runtime SHA mismatch for {receipt.get('model', {}).get('id')}"
+            )
     expected = args.expected_model
     ids = [receipt["model"]["id"] for receipt, _ in rows]
     if sorted(ids) != sorted(expected) or len(ids) != len(set(ids)):
@@ -711,6 +1002,7 @@ def validate(args: argparse.Namespace) -> int:
 
 
 def matrix_status(args: argparse.Namespace) -> int:
+    expected_runtime_sha = checked_sha(args.runtime_sha, "expected runtime SHA")
     spec = json.loads(args.matrix.read_text(encoding="utf-8"))
     if spec.get("schema_version") != 1 or spec.get("suite") != SUITE:
         raise ValueError("unsupported comparison matrix schema")
@@ -724,55 +1016,141 @@ def matrix_status(args: argparse.Namespace) -> int:
     if any(not isinstance(cell_id, str) or not cell_id for cell_id in ids) or len(ids) != len(set(ids)):
         raise ValueError("comparison matrix cell ids must be nonempty and unique")
     roots = [root.resolve() for root in args.root]
+    hardware_paths = [root / "hardware-before.json" for root in roots]
+    if any(not path.is_file() for path in hardware_paths):
+        raise ValueError("every evidence root requires hardware-before.json")
+    for path in hardware_paths:
+        validate_hardware_record(path)
     rows = []
     complete_runs: dict[str, list[Path]] = {group: [] for group in groups}
+    sealed_files: list[tuple[int, Path]] = [
+        (index, path) for index, path in enumerate(hardware_paths)
+    ]
+    cuda_reservation_hashes: set[str] = set()
     for cell in cells:
         cell_id = cell["id"]
-        preflights = [root / f"{cell_id}-preflight.json" for root in roots]
-        run_roots = [root / cell_id for root in roots]
-        preflight_path = next((path for path in preflights if path.is_file()), None)
-        run_root = next((path for path in run_roots if path.is_dir()), None)
-        row = {**cell, "status": "pending", "reason": None}
         group = cell.get("group")
         if group not in groups:
             raise ValueError(f"comparison matrix cell {cell_id} names unknown group {group!r}")
-        if preflight_path is None:
+        load_profile = cell.get("load_profile")
+        if load_profile not in LOAD_PROFILES:
+            raise ValueError(f"comparison matrix cell {cell_id} has unknown load profile")
+        policy = LOAD_PROFILES[load_profile]
+        if cell.get("backend") != policy["backend"] or cell.get("device") != policy["device"]:
+            raise ValueError(f"comparison matrix cell {cell_id} contradicts its load profile")
+        model = load_model(args.manifest, cell["model_key"])
+        preflight_locations = [
+            (index, root / f"{cell_id}-preflight.json") for index, root in enumerate(roots)
+        ]
+        present_preflights = [item for item in preflight_locations if item[1].is_file()]
+        row = {**cell, "status": "pending", "reason": None}
+        if len(present_preflights) > 1:
+            row.update(status="incomplete", reason="duplicate preflight evidence")
+        elif not present_preflights:
             row.update(status="incomplete", reason="missing preflight evidence")
         else:
+            root_index, preflight_path = present_preflights[0]
+            sealed_files.append((root_index, preflight_path))
             preflight = json.loads(preflight_path.read_text(encoding="utf-8"))
             row["preflight"] = preflight
-            if preflight.get("model_key") != cell.get("model_key") or preflight.get(
-                "load_profile"
-            ) != cell.get("load_profile") or preflight.get("language_variant") != cell.get(
-                "language_variant"
-            ) or preflight.get("vision_variant") != cell.get("vision_variant"):
-                row.update(status="incomplete", reason="preflight identity does not match matrix")
-            elif preflight.get("admitted") is not True:
-                row.update(status="not_admitted", reason="live capacity preflight rejected this cell")
-            elif run_root is None:
-                row.update(status="incomplete", reason="admitted cell has no run evidence")
-            else:
-                try:
-                    receipt, provider = validate_receipt(run_root)
-                    if receipt.get("model", {}).get("id") != cell_id:
-                        raise ValueError("run model id does not match matrix cell")
-                    model = receipt.get("model", {})
-                    if model.get("manifest_key") != cell.get("model_key"):
-                        raise ValueError("run model key does not match matrix cell")
-                    if model.get("language_variant") != cell.get("language_variant") or model.get(
-                        "vision_variant"
-                    ) != cell.get("vision_variant"):
-                        raise ValueError("run format variants do not match matrix cell")
-                    if [case.get("case_id") for case in provider["cases"]] != groups[group].get(
-                        "case_ids"
+            try:
+                validate_preflight_record(
+                    preflight,
+                    model=model,
+                    load_profile=load_profile,
+                    language_variant=cell.get("language_variant"),
+                    vision_variant=cell.get("vision_variant"),
+                )
+                if policy["device"] == "cuda":
+                    reservation_path = roots[root_index] / "gpu-reservation.json"
+                    if not reservation_path.is_file():
+                        raise ValueError("CUDA evidence root lacks campaign reservation")
+                    reservation = json.loads(reservation_path.read_text(encoding="utf-8"))
+                    if (
+                        reservation.get("gpu_index") != CUDA_DEVICE_INDEX
+                        or reservation.get("gpu_uuid") != preflight.get("selected_gpu_uuid")
+                        or reservation.get("token_sha256")
+                        != preflight.get("reservation_token_sha256")
                     ):
-                        raise ValueError("run cases do not match matrix workload group")
-                    row.update(status="completed", reason=None)
-                    complete_runs[group].append(run_root)
-                except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
-                    row.update(status="incomplete", reason=str(error))
+                        raise ValueError("CUDA preflight does not match campaign reservation")
+                    sealed_files.append((root_index, reservation_path))
+                    cuda_reservation_hashes.add(reservation["token_sha256"])
+                if preflight.get("admitted") is not True:
+                    row.update(
+                        status="not_admitted",
+                        reason="live capacity preflight rejected this cell",
+                    )
+                else:
+                    run_root = roots[root_index] / cell_id
+                    if not run_root.is_dir():
+                        row.update(status="incomplete", reason="admitted cell has no run evidence")
+                    else:
+                        receipt, provider = validate_receipt(
+                            run_root,
+                            expected_backend=cell["backend"],
+                            expected_device=cell["device"],
+                        )
+                        receipt_model = receipt.get("model", {})
+                        if receipt_model.get("id") != cell_id:
+                            raise ValueError("run model id does not match matrix cell")
+                        if receipt_model.get("manifest_key") != cell.get("model_key"):
+                            raise ValueError("run model key does not match matrix cell")
+                        if receipt_model.get("revision") != model["revision"]:
+                            raise ValueError("run revision does not match pinned manifest")
+                        if receipt_model.get("artifact_sizes") != pinned_admission_sizes(
+                            model,
+                            cell.get("language_variant"),
+                            cell.get("vision_variant"),
+                        ):
+                            raise ValueError("run artifact sizes do not match pinned manifest")
+                        if receipt_model.get("language_variant") != cell.get(
+                            "language_variant"
+                        ) or receipt_model.get("vision_variant") != cell.get("vision_variant"):
+                            raise ValueError("run format variants do not match matrix cell")
+                        if receipt.get("runtime", {}).get("head_sha") != expected_runtime_sha:
+                            raise ValueError("run runtime SHA does not match workflow SHA")
+                        command = receipt.get("command", {})
+                        if command.get("load_profile") != load_profile:
+                            raise ValueError("run load profile does not match matrix cell")
+                        if command.get("candle_device") != policy["command_device"]:
+                            raise ValueError("run device selector does not match matrix cell")
+                        if command.get("preflight_sha256") != sha256(preflight_path):
+                            raise ValueError("run is not bound to its preflight evidence")
+                        recheck = receipt.get("gpu", {}).get("admission_recheck")
+                        if policy["device"] == "cuda":
+                            if (
+                                not isinstance(recheck, dict)
+                                or recheck.get("admitted") is not True
+                                or recheck.get("gpu_index") != CUDA_DEVICE_INDEX
+                                or recheck.get("selected_gpu_uuid")
+                                != preflight.get("selected_gpu_uuid")
+                                or recheck.get("selected_gpu_compute_processes") != []
+                            ):
+                                raise ValueError("CUDA run lacks a clean selected-device recheck")
+                        elif recheck is not None:
+                            raise ValueError("non-CUDA run unexpectedly contains a CUDA recheck")
+                        if [case.get("case_id") for case in provider["cases"]] != groups[
+                            group
+                        ].get("case_ids"):
+                            raise ValueError("run cases do not match matrix workload group")
+                        row.update(status="completed", reason=None)
+                        complete_runs[group].append(run_root)
+                        sealed_files.append((root_index, run_root / "seal.json"))
+            except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+                row.update(status="incomplete", reason=str(error))
         rows.append(row)
     complete = all(row["status"] == "completed" for row in rows)
+    if len(cuda_reservation_hashes) > 1:
+        complete = False
+        rows.append(
+            {
+                "id": "cuda-reservation-consistency",
+                "backend": "candle",
+                "device": "cuda",
+                "status": "incomplete",
+                "reason": "CUDA cells use different campaign reservations",
+            }
+        )
     comparison = {}
     if complete:
         for group, runs in complete_runs.items():
@@ -783,6 +1161,7 @@ def matrix_status(args: argparse.Namespace) -> int:
                     argparse.Namespace(
                         run=runs,
                         expected_model=group_ids,
+                        runtime_sha=expected_runtime_sha,
                         output=temp / "comparison.json",
                         markdown=temp / "comparison.md",
                     )
@@ -793,6 +1172,7 @@ def matrix_status(args: argparse.Namespace) -> int:
     report = {
         "schema_version": 1,
         "suite": SUITE,
+        "runtime_sha": expected_runtime_sha,
         "evidence_complete": complete,
         "required_cells": rows,
         "comparison": comparison,
@@ -829,7 +1209,123 @@ def matrix_status(args: argparse.Namespace) -> int:
     args.markdown.parent.mkdir(parents=True, exist_ok=True)
     with args.markdown.open("x", encoding="utf-8", newline="\n") as handle:
         handle.write("\n".join(markdown) + "\n")
+    if complete:
+        unique_files = sorted(set(sealed_files), key=lambda item: (item[0], str(item[1])))
+        entries = []
+        for root_index, path in unique_files:
+            entries.append(
+                {
+                    "root_index": root_index,
+                    "path": path.relative_to(roots[root_index]).as_posix(),
+                    "bytes": path.stat().st_size,
+                    "sha256": sha256(path),
+                }
+            )
+        for role, path in (("matrix_report", args.output), ("matrix_markdown", args.markdown)):
+            entries.append(
+                {
+                    "role": role,
+                    "path": path.name,
+                    "bytes": path.stat().st_size,
+                    "sha256": sha256(path),
+                }
+            )
+        write_new(
+            args.seal,
+            {
+                "schema_version": 1,
+                "suite": SUITE,
+                "runtime_sha": expected_runtime_sha,
+                "matrix_sha256": sha256(args.matrix),
+                "manifest_sha256": sha256(args.manifest),
+                "files": entries,
+            },
+        )
     return 0 if complete else 1
+
+
+def verify_matrix_seal(args: argparse.Namespace) -> int:
+    seal = json.loads(args.seal.read_text(encoding="utf-8"))
+    expected_runtime_sha = checked_sha(args.runtime_sha, "expected runtime SHA")
+    if (
+        seal.get("schema_version") != 1
+        or seal.get("suite") != SUITE
+        or seal.get("runtime_sha") != expected_runtime_sha
+        or seal.get("matrix_sha256") != sha256(args.matrix)
+        or seal.get("manifest_sha256") != sha256(args.manifest)
+    ):
+        raise ValueError("matrix seal identity does not match this campaign")
+    roots = [root.resolve() for root in args.root]
+    report = json.loads(args.output.read_text(encoding="utf-8"))
+    if (
+        report.get("suite") != SUITE
+        or report.get("runtime_sha") != expected_runtime_sha
+        or report.get("evidence_complete") is not True
+    ):
+        raise ValueError("sealed matrix report is not complete for this campaign")
+    spec = json.loads(args.matrix.read_text(encoding="utf-8"))
+    expected_root_files = {
+        (index, "hardware-before.json") for index in range(len(roots))
+    }
+    for cell in spec["cells"]:
+        locations = [
+            (index, root / f"{cell['id']}-preflight.json")
+            for index, root in enumerate(roots)
+        ]
+        present = [item for item in locations if item[1].is_file()]
+        if len(present) != 1:
+            raise ValueError(f"sealed cell {cell['id']} does not have one preflight")
+        root_index, _ = present[0]
+        expected_root_files.add((root_index, f"{cell['id']}-preflight.json"))
+        expected_root_files.add((root_index, f"{cell['id']}/seal.json"))
+        receipt, provider = validate_receipt(
+            roots[root_index] / cell["id"],
+            expected_backend=cell["backend"],
+            expected_device=cell["device"],
+        )
+        if (
+            receipt.get("runtime", {}).get("head_sha") != expected_runtime_sha
+            or provider.get("runtime_sha") != expected_runtime_sha
+        ):
+            raise ValueError(f"sealed cell {cell['id']} has a different runtime SHA")
+        if cell["device"] == "cuda":
+            expected_root_files.add((root_index, "gpu-reservation.json"))
+    entries = seal.get("files")
+    if not isinstance(entries, list):
+        raise ValueError("matrix seal has no artifact list")
+    actual_root_files = {
+        (entry.get("root_index"), entry.get("path"))
+        for entry in entries
+        if "root_index" in entry
+    }
+    if actual_root_files != expected_root_files or len(actual_root_files) != sum(
+        1 for entry in entries if "root_index" in entry
+    ):
+        raise ValueError("matrix seal does not cover the exact required evidence set")
+    roles = [entry.get("role") for entry in entries if "root_index" not in entry]
+    if sorted(roles) != ["matrix_markdown", "matrix_report"]:
+        raise ValueError("matrix seal does not cover the exact aggregate reports")
+    for entry in entries:
+        if "root_index" in entry:
+            index = entry["root_index"]
+            if not isinstance(index, int) or index < 0 or index >= len(roots):
+                raise ValueError("matrix seal names an invalid evidence root")
+            path = roots[index] / entry["path"]
+        else:
+            role_paths = {
+                "matrix_report": args.output,
+                "matrix_markdown": args.markdown,
+            }
+            path = role_paths.get(entry.get("role"))
+            if path is None or path.name != entry.get("path"):
+                raise ValueError("matrix seal names an unknown aggregate artifact")
+        if (
+            not path.is_file()
+            or path.stat().st_size != entry.get("bytes")
+            or sha256(path) != entry.get("sha256")
+        ):
+            raise ValueError(f"matrix seal artifact mismatch for {path}")
+    return 0
 
 
 def resolve_binary(args: argparse.Namespace) -> int:
@@ -860,44 +1356,37 @@ def preflight(args: argparse.Namespace) -> int:
     model = load_model(args.manifest, args.model_key)
     sizes = pinned_admission_sizes(model, args.language_variant, args.vision_variant)
     weight_bytes = sizes["language_weight_bytes"] + sizes["vision_weight_bytes"]
-    policies = {
-        "mlx-unified": {
-            "host_weight_copies": 1,
-            "gpu_weight_copies": None,
-            "basis": "MLX safetensors pread into one Metal shared buffer; CPU and GPU share residency",
-        },
-        "candle-packed-cuda": {
-            "host_weight_copies": 1,
-            "gpu_weight_copies": 1,
-            "basis": "compact host tensor staging plus compact CUDA-resident Prism weights",
-        },
-        "candle-packed-cpu": {
-            "host_weight_copies": 1,
-            "gpu_weight_copies": None,
-            "basis": "compact host-resident Prism weights with bounded row decode",
-        },
-        "candle-dense-cpu": {
-            "host_weight_copies": 3,
-            "gpu_weight_copies": None,
-            "basis": "audited peak: one BF16 source copy plus one F32 constructed copy",
-        },
-        "candle-dense-cuda": {
-            "host_weight_copies": 1,
-            "gpu_weight_copies": 1,
-            "basis": "host source staging plus dtype-preserving CUDA weights",
-        },
-    }
-    policy = policies[args.load_profile]
+    policy = LOAD_PROFILES[args.load_profile]
     host_required = weight_bytes * policy["host_weight_copies"] + args.reserve_bytes
     gpu_copies = policy["gpu_weight_copies"]
     gpu_required = weight_bytes * gpu_copies + args.reserve_bytes if gpu_copies else None
     total, available, reason = physical_memory()
     gpus, processes, gpu_reason = nvidia_hardware()
-    gpu_available = max((gpu["free_bytes"] for gpu in gpus), default=None)
     host_admitted = available is not None and available >= host_required
-    gpu_admitted = gpu_required is None or (
-        gpu_available is not None and gpu_available >= gpu_required
-    )
+    selected_gpu = None
+    selected_processes = None
+    reservation_hash = None
+    if gpu_required is None:
+        gpu_available = None
+        gpu_admitted = True
+    else:
+        if args.reservation is None or args.reservation_token is None:
+            raise ValueError("CUDA preflight requires an active campaign reservation")
+        reservation = load_reservation(
+            args.reservation, args.reservation_token, CUDA_DEVICE_INDEX
+        )
+        selected_gpu, selected_processes = selected_gpu_state(
+            gpus, processes, CUDA_DEVICE_INDEX
+        )
+        gpu_available = selected_gpu.get("free_bytes") if selected_gpu else None
+        reservation_hash = reservation["token_sha256"]
+        gpu_admitted = (
+            selected_gpu is not None
+            and selected_gpu.get("uuid") == reservation.get("gpu_uuid")
+            and isinstance(gpu_available, int)
+            and gpu_available >= gpu_required
+            and selected_processes == []
+        )
     record = {
         "schema_version": 1,
         "model_key": args.model_key,
@@ -923,7 +1412,11 @@ def preflight(args: argparse.Namespace) -> int:
         "gpus": gpus,
         "compute_processes": processes,
         "gpu_unavailable_reason": gpu_reason,
-        "gpu_available_bytes": gpu_available,
+        "selected_gpu_index": CUDA_DEVICE_INDEX if gpu_required is not None else None,
+        "selected_gpu_uuid": selected_gpu.get("uuid") if selected_gpu else None,
+        "selected_gpu_available_bytes": gpu_available,
+        "selected_gpu_compute_processes": selected_processes,
+        "reservation_token_sha256": reservation_hash,
         "host_admitted": host_admitted,
         "gpu_admitted": gpu_admitted,
         "admitted": host_admitted and gpu_admitted,
@@ -957,6 +1450,22 @@ def hardware(args: argparse.Namespace) -> int:
     return 0
 
 
+def validate_hardware_record(path: Path) -> dict[str, Any]:
+    record = json.loads(path.read_text(encoding="utf-8"))
+    if record.get("schema_version") != 1:
+        raise ValueError(f"unsupported hardware evidence schema in {path}")
+    if not isinstance(record.get("captured_unix_seconds"), (int, float)):
+        raise ValueError(f"hardware evidence lacks capture time in {path}")
+    host = record.get("host")
+    if not isinstance(host, dict) or not isinstance(host.get("system"), str):
+        raise ValueError(f"hardware evidence lacks host identity in {path}")
+    if not isinstance(record.get("gpus"), list) or not isinstance(
+        record.get("compute_processes"), list
+    ):
+        raise ValueError(f"hardware evidence lacks GPU/process inventory in {path}")
+    return record
+
+
 def parser() -> argparse.ArgumentParser:
     out = argparse.ArgumentParser()
     sub = out.add_subparsers(dest="command", required=True)
@@ -972,6 +1481,9 @@ def parser() -> argparse.ArgumentParser:
     run_p.add_argument("--language-variant")
     run_p.add_argument("--vision-variant")
     run_p.add_argument("--runtime-sha", required=True)
+    run_p.add_argument("--preflight", type=Path, required=True)
+    run_p.add_argument("--reservation", type=Path)
+    run_p.add_argument("--reservation-token")
     run_p.add_argument("--cases", required=True)
     run_p.add_argument("--output", type=Path, required=True)
     run_p.add_argument("--manifest", type=Path, default=Path("release/real-weight-models.toml"))
@@ -982,6 +1494,7 @@ def parser() -> argparse.ArgumentParser:
     val = sub.add_parser("validate")
     val.add_argument("--run", type=Path, action="append", required=True)
     val.add_argument("--expected-model", action="append", required=True)
+    val.add_argument("--runtime-sha", required=True)
     val.add_argument("--output", type=Path, required=True)
     val.add_argument("--markdown", type=Path, required=True)
     val.set_defaults(func=validate)
@@ -990,9 +1503,23 @@ def parser() -> argparse.ArgumentParser:
     matrix.add_argument(
         "--matrix", type=Path, default=Path("release/qwen38-bonsai-matrix.json")
     )
+    matrix.add_argument("--manifest", type=Path, default=Path("release/real-weight-models.toml"))
+    matrix.add_argument("--runtime-sha", required=True)
     matrix.add_argument("--output", type=Path, required=True)
     matrix.add_argument("--markdown", type=Path, required=True)
+    matrix.add_argument("--seal", type=Path, required=True)
     matrix.set_defaults(func=matrix_status)
+    verify = sub.add_parser("verify-matrix-seal")
+    verify.add_argument("--root", type=Path, action="append", required=True)
+    verify.add_argument(
+        "--matrix", type=Path, default=Path("release/qwen38-bonsai-matrix.json")
+    )
+    verify.add_argument("--manifest", type=Path, default=Path("release/real-weight-models.toml"))
+    verify.add_argument("--runtime-sha", required=True)
+    verify.add_argument("--output", type=Path, required=True)
+    verify.add_argument("--markdown", type=Path, required=True)
+    verify.add_argument("--seal", type=Path, required=True)
+    verify.set_defaults(func=verify_matrix_seal)
     resolve = sub.add_parser("resolve-binary")
     resolve.add_argument("--target", required=True)
     resolve.set_defaults(func=resolve_binary)
@@ -1013,11 +1540,31 @@ def parser() -> argparse.ArgumentParser:
         required=True,
     )
     admit.add_argument("--reserve-bytes", type=int, default=4 * 1024**3)
+    admit.add_argument("--reservation", type=Path)
+    admit.add_argument("--reservation-token")
     admit.add_argument("--output", type=Path, required=True)
     admit.set_defaults(func=preflight)
     hw = sub.add_parser("hardware")
     hw.add_argument("--output", type=Path, required=True)
     hw.set_defaults(func=hardware)
+    reserve = sub.add_parser("reserve-gpu")
+    reserve.add_argument("--reservation", type=Path, required=True)
+    reserve.add_argument("--evidence", type=Path, required=True)
+    reserve.add_argument("--token", required=True)
+    reserve.add_argument("--gpu-index", type=int, default=CUDA_DEVICE_INDEX)
+    reserve.set_defaults(func=acquire_gpu_reservation)
+    check = sub.add_parser("check-gpu-reservation")
+    check.add_argument("--reservation", type=Path, required=True)
+    check.add_argument("--token", required=True)
+    check.add_argument("--gpu-index", type=int, default=CUDA_DEVICE_INDEX)
+    check.add_argument("--required-bytes", type=int, default=0)
+    check.add_argument("--output", type=Path)
+    check.set_defaults(func=check_gpu_reservation)
+    release = sub.add_parser("release-gpu")
+    release.add_argument("--reservation", type=Path, required=True)
+    release.add_argument("--token", required=True)
+    release.add_argument("--gpu-index", type=int, default=CUDA_DEVICE_INDEX)
+    release.set_defaults(func=release_gpu_reservation)
     return out
 
 
@@ -1025,7 +1572,7 @@ def main() -> int:
     args = parser().parse_args()
     try:
         return args.func(args)
-    except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+    except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as error:
         print(f"qwen38-bonsai-terminal: {error}", file=sys.stderr)
         return 2
 

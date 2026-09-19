@@ -15,6 +15,7 @@ fn native_comparison() {
         || {
             serde_json::json!({
                 "backend":"mlx",
+                "device":"unified",
                 "active_bytes":mlx_rs::memory::get_active_memory(),
                 "cache_bytes":mlx_rs::memory::get_cache_memory(),
                 "peak_active_bytes":mlx_rs::memory::get_peak_memory(),
