@@ -145,6 +145,24 @@ class AssetTests(unittest.TestCase):
         self.assertEqual(result, 1)
         fetch.assert_not_called()
 
+    def test_mlx_admission_uses_native_header_upper_bounds(self):
+        manifest = Path('release/real-weight-models.toml')
+        for key, expected in [('bonsai-qwen38-parent', 55572906808),
+                              ('bonsai-mlx-2bit', 9514891750),
+                              ('bonsai-qwen3vl-baseline', 17542650296)]:
+            model = terminal.load_model(manifest, key)
+            sizes = terminal.pinned_admission_sizes(model)
+            self.assertEqual(terminal.host_load_bound(model, 'mlx-unified', sizes, None, None), expected)
+            del model['admission_mlx_load_upper_bound_bytes']
+            with self.assertRaisesRegex(ValueError, 'missing pinned MLX'):
+                terminal.host_load_bound(model, 'mlx-unified', sizes, None, None)
+        model = terminal.load_model(manifest, 'bonsai-gguf')
+        for language, language_bound in [('pq2', 17061529952), ('ptq1', 15802009952)]:
+            for vision, vision_bound in [('bf16', 2868438080), ('q8', 2566539200)]:
+                sizes = terminal.pinned_admission_sizes(model, language, vision)
+                self.assertEqual(terminal.host_load_bound(model, 'mlx-unified', sizes, language, vision),
+                                 language_bound + vision_bound)
+
     def test_qualification_phases_are_mutually_exclusive(self):
         for preflight, provision in [('true', 'false'), ('false', 'true'), ('false', 'false')]:
             self.assertEqual(terminal.validate_phase(argparse.Namespace(preflight_only=preflight, provision_only=provision)), 0)

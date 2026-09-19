@@ -2363,6 +2363,8 @@ expected_files = [
 
 [[models]]
 key = "bonsai-qwen38-parent"
+# Header-derived native loading upper bound; runtime reserve is added separately.
+admission_mlx_load_upper_bound_bytes = 55572906808
 repository = "Qwen/Qwen3.8-27B"
 revision = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
 license = "Apache-2.0"
@@ -2375,6 +2377,8 @@ admission_vision_weight_bytes = 921460192
 
 [[models]]
 key = "bonsai-mlx-2bit"
+# Header-derived native loading upper bound; runtime reserve is added separately.
+admission_mlx_load_upper_bound_bytes = 9514891750
 repository = "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit"
 revision = "3f926b415992eaa2ae9dd7b573706494d6bbf787"
 license = "Apache-2.0"
@@ -2387,6 +2391,9 @@ admission_vision_weight_bytes = 921460192
 
 [[models]]
 key = "bonsai-gguf"
+# Header-derived native loading upper bound; runtime reserve is added separately.
+admission_mlx_language_load_bounds = { pq2 = 17061529952, ptq1 = 15802009952 }
+admission_mlx_vision_load_bounds = { bf16 = 2868438080, q8 = 2566539200 }
 repository = "prism-ml/Ternary-Bonsai-2-27B-gguf"
 revision = "6ed5e12bf84b7a63069882c91dd9e9218647d17b"
 license = "Apache-2.0"
@@ -2400,6 +2407,8 @@ admission_vision_variants = { bf16 = 931145856, q8 = 629246976 }
 
 [[models]]
 key = "bonsai-qwen3vl-baseline"
+# Header-derived native loading upper bound; runtime reserve is added separately.
+admission_mlx_load_upper_bound_bytes = 17542650296
 repository = "Qwen/Qwen3-VL-8B-Instruct"
 revision = "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
 license = "Apache-2.0"

@@ -70,7 +70,7 @@ LOAD_PROFILES: dict[str, dict[str, Any]] = {
         "command_device": None,
         "host_weight_copies": 1,
         "gpu_weight_copies": None,
-        "basis": "MLX safetensors pread into one Metal shared buffer; CPU and GPU share residency",
+        "basis": "MLX pinned header-derived source, conversion and staging upper bounds; CPU and GPU share residency",
     },
     "candle-packed-cuda": {
         "backend": "candle",
@@ -520,6 +520,22 @@ def pinned_admission_sizes(
     return sizes
 
 
+def host_load_bound(model: dict[str, Any], load_profile: str, sizes: dict[str, int],
+                    language_variant: str | None, vision_variant: str | None) -> int:
+    if load_profile == "mlx-unified" and model["key"].startswith("bonsai-"):
+        if model["key"] == "bonsai-gguf":
+            language = model.get("admission_mlx_language_load_bounds", {}).get(language_variant)
+            vision = model.get("admission_mlx_vision_load_bounds", {}).get(vision_variant)
+            if not all(isinstance(value, int) and value > 0 for value in (language, vision)):
+                raise ValueError("missing pinned MLX GGUF load upper bound")
+            return language + vision
+        bound = model.get("admission_mlx_load_upper_bound_bytes")
+        if not isinstance(bound, int) or bound <= 0:
+            raise ValueError("missing pinned MLX safetensors load upper bound")
+        return bound
+    return (sizes["language_weight_bytes"] + sizes["vision_weight_bytes"]) * LOAD_PROFILES[load_profile]["host_weight_copies"]
+
+
 def selected_artifact(path: Path, snapshot: Path, inventory: dict[str, Any]) -> dict[str, Any]:
     absolute = lexical_absolute(path)
     snapshot_root = lexical_absolute(snapshot)
@@ -590,7 +606,7 @@ def validate_preflight_record(
     reserve = preflight.get("reserve_bytes")
     if not isinstance(reserve, int) or reserve < 0:
         raise ValueError("preflight reserve bytes are invalid")
-    host_required = weight_bytes * policy["host_weight_copies"] + reserve
+    host_required = host_load_bound(model, load_profile, sizes, language_variant, vision_variant) + reserve
     gpu_copies = policy["gpu_weight_copies"]
     gpu_required = weight_bytes * gpu_copies + reserve if gpu_copies else None
     identity = {
@@ -1586,7 +1602,7 @@ def preflight(args: argparse.Namespace) -> int:
     sizes = pinned_admission_sizes(model, args.language_variant, args.vision_variant)
     weight_bytes = sizes["language_weight_bytes"] + sizes["vision_weight_bytes"]
     policy = LOAD_PROFILES[args.load_profile]
-    host_required = weight_bytes * policy["host_weight_copies"] + args.reserve_bytes
+    host_required = host_load_bound(model, args.load_profile, sizes, args.language_variant, args.vision_variant) + args.reserve_bytes
     gpu_copies = policy["gpu_weight_copies"]
     gpu_required = weight_bytes * gpu_copies + args.reserve_bytes if gpu_copies else None
     total, available, reason = physical_memory()
@@ -1625,7 +1641,9 @@ def preflight(args: argparse.Namespace) -> int:
         "artifact_sizes": sizes,
         "load_profile": args.load_profile,
         "admission_basis": policy["basis"],
-        "host_admission_formula": "exact_pinned_weight_bytes * host_weight_copies + reserve_bytes",
+        "host_admission_formula": ("pinned_header_derived_load_upper_bound_bytes + reserve_bytes"
+            if args.load_profile == "mlx-unified" and model["key"].startswith("bonsai-")
+            else "exact_pinned_weight_bytes * host_weight_copies + reserve_bytes"),
         "gpu_admission_formula": None
         if gpu_copies is None
         else "exact_pinned_weight_bytes * gpu_weight_copies + reserve_bytes",
