@@ -4,11 +4,12 @@
 //! choice with no decoder changes: a dense `[out, in]` weight either stays dense (a
 //! [`candle_nn::Linear`]) or is quantized to Q4/Q8 ([`QuantizedLinear`]) via Candle's quant.
 
-use candle_core::quantized::GgmlDType;
+use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::Tensor;
 use candle_nn::{Linear, Module};
 
 use crate::error::Result;
+use crate::primitives::prism::PrismPackedWeight;
 use crate::primitives::quant::QuantizedLinear;
 
 /// Group-wise quantization spec, mapped to a Candle GGML dtype.
@@ -82,6 +83,8 @@ pub enum Projection {
     Dense(Linear),
     /// A group-wise quantized weight.
     Quantized(QuantizedLinear),
+    /// A compact Prism/Bonsai affine-2 or native ternary weight.
+    Prism(std::sync::Arc<PrismPackedWeight>),
 }
 
 impl Projection {
@@ -103,6 +106,20 @@ impl Projection {
                 &weight, q.dtype, bias,
             )?)),
         }
+    }
+
+    /// Wrap a resident compact Prism weight. Prism projections do not carry an additive bias.
+    pub fn load_prism(weight: std::sync::Arc<PrismPackedWeight>) -> Self {
+        Self::Prism(weight)
+    }
+
+    /// Wrap a pre-quantized GGUF matrix without expanding it. Plain F16/BF16/F32 GGUF matrices are
+    /// dequantized by the caller and use [`Self::load_with_bias`]; block-quantized matrices stay in
+    /// this representation for their full resident lifetime.
+    pub fn load_qtensor(weight: QTensor, bias: Option<Tensor>) -> Result<Self> {
+        Ok(Self::Quantized(QuantizedLinear::from_qtensor(
+            weight, bias,
+        )?))
     }
 
     /// Load a pre-quantized MLX affine Q8 triple without interpreting its shortened U32 code
@@ -137,12 +154,13 @@ impl Projection {
         match self {
             Projection::Dense(l) => Ok(l.forward(x)?),
             Projection::Quantized(q) => q.forward(x),
+            Projection::Prism(weight) => weight.forward(x),
         }
     }
 
     /// Whether this projection is quantized.
     pub fn is_quantized(&self) -> bool {
-        matches!(self, Projection::Quantized(_))
+        matches!(self, Projection::Quantized(_) | Projection::Prism(_))
     }
 }
 

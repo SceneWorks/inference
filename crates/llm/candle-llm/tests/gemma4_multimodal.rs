@@ -561,6 +561,7 @@ fn gemma4_generates_dense_and_at_each_quantized_tier() {
     for quantize in [None, Some(Quantize::Q4), Some(Quantize::Q8)] {
         let spec = LoadSpec {
             source: src.clone(),
+            projector_source: None,
             quantize,
         };
         let p = LlamaProvider::load(&spec)

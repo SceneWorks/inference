@@ -22,7 +22,8 @@
 //! - [`IncrementalDetok`] — backend-neutral streaming-detokenization delta guard (holds back
 //!   lossy U+FFFD placeholders for multi-byte characters split across BPE tokens).
 //! - [`ThinkingSegmenter`] — backend-neutral reasoning/answer segmentation (`<think>…</think>`),
-//!   paired with the [`ThinkingMode`] request control and `supports_thinking` capability.
+//!   paired with the [`ThinkingMode`] request control and `supports_thinking` capability. Qwen-specific
+//!   `reasoning_effort` and `preserve_thinking` controls require their own advertised capabilities.
 //! - [`ToolSpec`] / [`ToolCall`] / [`ToolCallSegmenter`] — backend-neutral tool ("function") calling:
 //!   offered tools render into the chat template (`tools` context), and the model's `<tool_call>`
 //!   output (Qwen3.6 XML or JSON/Hermes) is parsed back into structure; paired with the request
@@ -49,8 +50,10 @@ pub mod output;
 pub mod paging;
 pub mod prefix;
 pub mod prepare;
+pub mod prism;
 pub mod registry;
 pub mod request;
+pub mod resource;
 pub mod schedule;
 pub mod speculative;
 pub mod starvector;
@@ -62,24 +65,43 @@ pub mod tokenizer;
 pub mod tool;
 
 pub use cancel::CancelFlag;
-pub use capabilities::{TextLlmCapabilities, TextLlmDescriptor};
+pub use capabilities::{
+    ModelSamplingDefaults, MtpCapabilities, TextLlmCapabilities, TextLlmDescriptor,
+};
 pub use constraint::{
     Constraint, ConstraintDecodeTable, ConstraintKind, JsonConstraint, JsonState,
 };
 pub use detok::IncrementalDetok;
 pub use error::{Error, Result};
 pub use message::{AudioRef, Content, ImageRef, Message, Role, VideoRef};
-pub use output::{Channel, FinishReason, StreamEvent, TextLlmOutput, Usage};
+pub use output::{
+    Channel, FinishReason, GenerationTimings, MtpStats, StreamEvent, TextLlmOutput, Usage,
+};
 pub use paging::BlockAllocator;
 pub use prefix::{InsertOutcome, PrefixId, PrefixIndex, PrefixMatch};
 pub use prepare::{
     detect_format, ModelFormat, PrepareReport, PrepareSpec, SnapshotPreparerRegistration,
     SnapshotPreparerRegistry, SnapshotPreparerRegistryBuilder,
 };
+pub use prism::{
+    apply_hadamard_forward_in_place, apply_hadamard_inverse_in_place, decode_block_into,
+    gdn_reorder_last_axis_in_place, gguf_weight_name, is_gdn_ssm_out_weight,
+    normalized_fwht_in_place, transcode_block_to_affine, GdnLayout, PrismError,
+    PrismHadamardMetadata, PrismPackedKind, PrismPackedMatrixRef, PrismTransformRole,
+    PrismWeightTransform, PRISM_AFFINE_WORDS_PER_BLOCK, PRISM_GROUP_SIZE, PRISM_PQ2_0_GGML_TYPE,
+    PRISM_PTQ1_0_GGML_TYPE,
+};
 pub use registry::{
     ModelRequirements, TextLlmRegistration, TextLlmRegistry, TextLlmRegistryBuilder,
 };
-pub use request::{LoadSpec, Quantize, Sampling, TextLlmRequest, ThinkingMode};
+pub use request::{
+    LoadSpec, MtpMode, Quantize, ReasoningEffort, Sampling, TextLlmRequest, ThinkingMode,
+};
+pub use resource::{
+    admit_request_memory, available_host_memory_bytes, checkpoint_payload_bytes,
+    effective_memory_budget, estimate_request_bytes, operational_memory_override,
+    LlmMemoryGeometry, AVAILABLE_MEMORY_OVERRIDE,
+};
 pub use schedule::{Scheduler, SeqId, SeqSpec};
 pub use speculative::{accept_greedy_run, accept_token, ngram_propose, Acceptance};
 pub use starvector::{

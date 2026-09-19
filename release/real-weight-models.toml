@@ -2358,3 +2358,63 @@ expected_files = [
   "q4/transformer_ref/config.json",
   "q4/transformer_ref/diffusion_pytorch_model.safetensors.index.json",
 ]
+
+# SC-23935: explicit terminal profile only; not the scheduled LLM sweep.
+
+[[models]]
+key = "bonsai-qwen38-parent"
+# Header-derived native loading upper bound; runtime reserve is added separately.
+admission_mlx_load_upper_bound_bytes = 55572906808
+repository = "Qwen/Qwen3.8-27B"
+revision = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["qwen38-bonsai"]
+environment = ["BONSAI_QWEN38_SNAPSHOT"]
+expected_files = ["config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "generation_config.json", "preprocessor_config.json", "video_preprocessor_config.json", "model.safetensors.index.json"]
+admission_language_weight_bytes = 54641395712
+admission_vision_weight_bytes = 921460192
+
+[[models]]
+key = "bonsai-mlx-2bit"
+# Header-derived native loading upper bound; runtime reserve is added separately.
+admission_mlx_load_upper_bound_bytes = 9514891750
+repository = "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit"
+revision = "3f926b415992eaa2ae9dd7b573706494d6bbf787"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["qwen38-bonsai"]
+environment = ["BONSAI_MLX_SNAPSHOT"]
+expected_files = ["config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "generation_config.json", "preprocessor_config.json", "hadamard.json", "PACK-RUNTIME.md", "model.safetensors", "LICENSE", "NOTICE.txt", "runtime/LICENSE"]
+admission_language_weight_bytes = 7673714688
+admission_vision_weight_bytes = 921460192
+
+[[models]]
+key = "bonsai-gguf"
+# Header-derived native loading upper bound; runtime reserve is added separately.
+admission_mlx_language_load_bounds = { pq2 = 17061529952, ptq1 = 15802009952 }
+admission_mlx_vision_load_bounds = { bf16 = 2868438080, q8 = 2566539200 }
+repository = "prism-ml/Ternary-Bonsai-2-27B-gguf"
+revision = "6ed5e12bf84b7a63069882c91dd9e9218647d17b"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["qwen38-bonsai"]
+environment = ["BONSAI_GGUF_SNAPSHOT"]
+expected_files = ["Ternary-Bonsai-2-27B-PQ2_0.gguf", "Ternary-Bonsai-2-27B-PTQ1_0.gguf", "Ternary-Bonsai-2-27B-mmproj-BF16.gguf", "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf", "LICENSE", "NOTICE.txt"]
+download_files = [".gitattributes", "LICENSE", "NOTICE.txt", "README.md", "Ternary-Bonsai-2-27B-PQ2_0.gguf", "Ternary-Bonsai-2-27B-PTQ1_0.gguf", "Ternary-Bonsai-2-27B-mmproj-BF16.gguf", "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf", "assets/bonsai-logo.svg"]
+admission_language_variants = { pq2 = 7206168928, ptq1 = 5946648928 }
+admission_vision_variants = { bf16 = 931145856, q8 = 629246976 }
+
+[[models]]
+key = "bonsai-qwen3vl-baseline"
+# Header-derived native loading upper bound; runtime reserve is added separately.
+admission_mlx_load_upper_bound_bytes = 17542650296
+repository = "Qwen/Qwen3-VL-8B-Instruct"
+revision = "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["qwen38-bonsai"]
+environment = ["BONSAI_BASELINE_SNAPSHOT"]
+expected_files = ["config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.json", "generation_config.json", "preprocessor_config.json", "video_preprocessor_config.json", "model.safetensors.index.json"]
+admission_language_weight_bytes = 16381470720
+admission_vision_weight_bytes = 1152776672

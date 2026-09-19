@@ -75,6 +75,10 @@ pub enum GgmlType {
     Iq1M,
     /// bfloat16 (tag 30).
     BF16,
+    /// Prism packed ternary affine PQ2_0 (tag 142).
+    PrismPq2,
+    /// Prism packed ternary PTQ1_0 (tag 143).
+    PrismPtq1,
 }
 
 /// The fixed 16-entry non-linear codebook shared by `IQ4_NL`/`IQ4_XS` (llama.cpp `kvalues_iq4nl`).
@@ -108,6 +112,8 @@ impl GgmlType {
             23 => GgmlType::Iq4Xs,
             29 => GgmlType::Iq1M,
             30 => GgmlType::BF16,
+            142 => GgmlType::PrismPq2,
+            143 => GgmlType::PrismPtq1,
             other => return Err(Error::Unsupported(format!("GGUF type tag {other}"))),
         })
     }
@@ -136,6 +142,8 @@ impl GgmlType {
             GgmlType::Iq3S => (QK_K, 2 + QK_K / 4 + QK_K / 32 + QK_K / 8 + QK_K / 64), // d+qs+qh+signs+scales = 110
             GgmlType::Iq1S => (QK_K, 2 + QK_K / 8 + QK_K / 32 * 2), // d + qs + qh(u16) = 50
             GgmlType::Iq1M => (QK_K, QK_K / 8 + QK_K / 16 + QK_K / 32), // qs + qh + scales = 56 (scale packed in scales)
+            GgmlType::PrismPq2 => (128, 34),
+            GgmlType::PrismPtq1 => (128, 28),
         }
     }
 }
@@ -155,6 +163,11 @@ pub fn tensor_byte_len(tag: u32, num_elements: usize) -> Result<usize> {
 /// Dequantize a tensor's raw block bytes to dense `f32` of length `num_elements`.
 pub fn dequantize(tag: u32, data: &[u8], num_elements: usize) -> Result<Vec<f32>> {
     let ty = GgmlType::from_tag(tag)?;
+    if matches!(ty, GgmlType::PrismPq2 | GgmlType::PrismPtq1) {
+        return Err(Error::Unsupported(
+            "Prism PQ2/PTQ1 must use the native packed operator path".into(),
+        ));
+    }
     let (be, bb) = ty.block();
     if !num_elements.is_multiple_of(be) {
         return Err(Error::Msg(format!(
@@ -205,6 +218,7 @@ pub fn dequantize(tag: u32, data: &[u8], num_elements: usize) -> Result<Vec<f32>
         GgmlType::Iq3S => blocks(data, &mut out, be, bb, dequant_iq3_s),
         GgmlType::Iq1S => blocks(data, &mut out, be, bb, dequant_iq1_s),
         GgmlType::Iq1M => blocks(data, &mut out, be, bb, dequant_iq1_m),
+        GgmlType::PrismPq2 | GgmlType::PrismPtq1 => unreachable!("rejected above"),
     }
     Ok(out)
 }
@@ -784,6 +798,14 @@ mod tests {
         assert_eq!(GgmlType::from_tag(21).unwrap(), GgmlType::Iq3S);
         assert_eq!(GgmlType::from_tag(22).unwrap(), GgmlType::Iq2S);
         assert_eq!(GgmlType::from_tag(29).unwrap(), GgmlType::Iq1M);
+        assert_eq!(GgmlType::from_tag(142).unwrap(), GgmlType::PrismPq2);
+        assert_eq!(GgmlType::from_tag(143).unwrap(), GgmlType::PrismPtq1);
+        assert_eq!(GgmlType::PrismPq2.block(), (128, 34));
+        assert_eq!(GgmlType::PrismPtq1.block(), (128, 28));
+        assert!(matches!(
+            dequantize(142, &[0; 34], 128),
+            Err(Error::Unsupported(message)) if message.contains("native packed")
+        ));
         assert_eq!(tensor_byte_len(16, 256).unwrap(), 66);
         // Intermediate/quantization-only types stay unsupported.
         assert!(matches!(GgmlType::from_tag(9), Err(Error::Unsupported(_)))); // Q8_1 (intermediate)

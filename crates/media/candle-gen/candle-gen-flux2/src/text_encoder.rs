@@ -529,6 +529,7 @@ impl Flux2PromptEncoder {
             top_k: 0,
             repetition_penalty: 1.0,
             repetition_context: 0,
+            presence_penalty: 0.0,
         };
         let mut logits = self.decode_logits_from_embeds(prompt_embeds, &mut cache, 0)?;
         let mut generated = Vec::new();

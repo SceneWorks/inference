@@ -364,6 +364,7 @@ impl TextLlm for StarVector1bProvider {
             }
         })?;
         Ok(TextLlmOutput {
+            timings: None,
             text: output.svg.unwrap_or_default(),
             thinking: None,
             tool_calls: Vec::new(),
@@ -371,6 +372,7 @@ impl TextLlm for StarVector1bProvider {
                 prompt_tokens: IMAGE_TOKENS as u32 + 1,
                 generated_tokens: output.generated_tokens,
             },
+            mtp: None,
             finish_reason: Some(map_finish(output.finish_reason)),
         })
     }
@@ -403,7 +405,12 @@ pub fn descriptor() -> TextLlmDescriptor {
             supports_video: false,
             supports_audio: false,
             supports_thinking: false,
+            supports_reasoning_effort: false,
+            reasoning_efforts: Vec::new(),
+            model_sampling_defaults: None,
+            supports_preserve_thinking: false,
             supports_tools: false,
+            mtp: None,
             supported_constraints: Vec::new(),
         },
     }
@@ -529,6 +536,7 @@ fn sampling(value: &core_llm::Sampling) -> SamplingParams {
         temperature: value.temperature,
         top_p: value.top_p,
         top_k: value.top_k,
+        presence_penalty: value.presence_penalty,
         repetition_penalty: value.repetition_penalty,
         repetition_context: value.repetition_context,
     }

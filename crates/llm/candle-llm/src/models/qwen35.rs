@@ -31,10 +31,33 @@ use crate::primitives::attention::{repeat_kv, sdpa, AttnMask};
 use crate::primitives::gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
 };
-use crate::primitives::nn::{embed, linear, rms_norm, silu};
+use crate::primitives::nn::{embed, rms_norm, silu};
 use crate::primitives::projection::{Projection, QuantSpec};
 use crate::primitives::rope::{apply_rope, Rope};
-use crate::primitives::{KvCache, Weights};
+use crate::primitives::{KvCache, PrismRegistry, Weights};
+
+fn checkpoint_norm_weight(weight: Tensor, prism: bool) -> Result<Tensor> {
+    if prism {
+        Ok(weight)
+    } else {
+        Ok(weight.affine(1.0, 1.0)?)
+    }
+}
+
+#[derive(Clone)]
+enum QwenEmbedding {
+    Dense(Tensor),
+    Prism(std::sync::Arc<crate::primitives::PrismPackedWeight>),
+}
+
+impl QwenEmbedding {
+    fn forward(&self, ids: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Dense(weight) => embed(weight, ids),
+            Self::Prism(weight) => weight.embedding(ids),
+        }
+    }
+}
 
 /// Interleaved M-RoPE output of [`Qwen35Model::mrope_positions`]: the temporal / height / width
 /// position rows (each length `S`) plus the `mrope_delta` (`max_position + 1 − len`) for continuing
@@ -82,6 +105,12 @@ pub struct Qwen35Config {
     /// `rotary_dim/2`); `None` ⇒ the even split from [`Qwen35Config::mrope_section_resolved`]. Drives
     /// the per-channel axis assignment for image (3-D) positions; irrelevant to the text path.
     pub mrope_section: Option<[i32; 3]>,
+    /// Number of checkpoint-native multi-token-prediction layers. Zero means the checkpoint has no
+    /// auxiliary MTP predictor and ordinary autoregressive decoding remains fully valid.
+    pub mtp_num_hidden_layers: usize,
+    /// Whether the MTP predictor owns an embedding table rather than sharing the target embedding.
+    /// Qwen3.8-27B publishes `false` and carries no `mtp.embed_tokens.weight` tensor.
+    pub mtp_use_dedicated_embeddings: bool,
 }
 
 impl Qwen35Config {
@@ -148,6 +177,11 @@ impl Qwen35Config {
                     let g = |i: usize| a[i].as_i64().unwrap_or(0) as i32;
                     [g(0), g(1), g(2)]
                 }),
+            mtp_num_hidden_layers: int("mtp_num_hidden_layers").unwrap_or(0).max(0) as usize,
+            mtp_use_dedicated_embeddings: c
+                .get("mtp_use_dedicated_embeddings")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
         })
     }
 
@@ -548,16 +582,322 @@ impl Qwen35Cache {
 
 /// A loaded Qwen3.6 (`qwen3_5`) hybrid decoder.
 pub struct Qwen35Model {
-    embed_tokens: Tensor,
+    embed_tokens: QwenEmbedding,
     layers: Vec<DecoderLayer>,
     norm: Tensor,
-    lm_head: Tensor,
+    lm_head: std::sync::Arc<Projection>,
     rope: Rope,
     cfg: Qwen35Config,
     eps: f64,
     dtype: DType,
     device: Device,
     quantized: bool,
+}
+
+/// The checkpoint-native Qwen3.8 multi-token predictor.
+///
+/// This is an auxiliary draft model only: the target decoder never consults it during ordinary
+/// autoregressive inference. Qwen3.8 shares the target token embedding and LM head, then applies
+/// `fc([RMS(embed(next_token)), RMS(previous_hidden)])`, one full-attention decoder layer, a final
+/// RMS norm, and the shared head. vLLM cycles the published layer when more drafts are requested
+/// than the checkpoint's layer count, so `step_idx` selects `layers[step_idx % layers.len()]`.
+pub struct Qwen35Mtp {
+    embed_tokens: QwenEmbedding,
+    lm_head: std::sync::Arc<Projection>,
+    pre_fc_norm_embedding: Tensor,
+    pre_fc_norm_hidden: Tensor,
+    fc: Projection,
+    layers: Vec<DecoderLayer>,
+    norm: Tensor,
+    rope: Rope,
+    mrope_section: [usize; 3],
+    eps: f64,
+    dtype: DType,
+    device: Device,
+    vocab_size: usize,
+}
+
+/// Persistent full-attention state for each published MTP layer.
+#[derive(Clone, Debug)]
+pub struct Qwen35MtpCache {
+    layers: Vec<AttnKv>,
+}
+
+impl Qwen35MtpCache {
+    /// Clear every MTP layer's speculative attention state.
+    pub fn reset(&mut self) {
+        for layer in &mut self.layers {
+            layer.kv = None;
+        }
+    }
+}
+
+impl Qwen35Mtp {
+    /// All tensors required by the frozen Qwen3.8 MTP layout. A checkpoint is advertised as MTP
+    /// capable only when every key is present; a partial auxiliary head is never used.
+    pub fn required_keys(num_layers: usize) -> Vec<String> {
+        let mut keys = vec![
+            "mtp.fc.weight".to_string(),
+            "mtp.norm.weight".to_string(),
+            "mtp.pre_fc_norm_embedding.weight".to_string(),
+            "mtp.pre_fc_norm_hidden.weight".to_string(),
+        ];
+        for i in 0..num_layers {
+            for suffix in [
+                "input_layernorm.weight",
+                "post_attention_layernorm.weight",
+                "self_attn.q_proj.weight",
+                "self_attn.k_proj.weight",
+                "self_attn.v_proj.weight",
+                "self_attn.o_proj.weight",
+                "self_attn.q_norm.weight",
+                "self_attn.k_norm.weight",
+                "mlp.gate_proj.weight",
+                "mlp.up_proj.weight",
+                "mlp.down_proj.weight",
+            ] {
+                keys.push(format!("mtp.layers.{i}.{suffix}"));
+            }
+        }
+        keys
+    }
+
+    /// Whether the complete configured MTP tensor set is present.
+    pub fn complete_in(w: &Weights, cfg: &Qwen35Config) -> bool {
+        cfg.mtp_num_hidden_layers == 1
+            && !cfg.mtp_use_dedicated_embeddings
+            && Self::required_keys(cfg.mtp_num_hidden_layers)
+                .iter()
+                .all(|key| w.contains(key))
+    }
+
+    /// Load the native MTP predictor, sharing the already loaded target embedding and LM head.
+    pub fn from_weights_with(
+        w: &Weights,
+        target: &Qwen35Model,
+        quant: Option<QuantSpec>,
+    ) -> Result<Self> {
+        let cfg = &target.cfg;
+        if cfg.mtp_num_hidden_layers != 1 {
+            return Err(Error::Config(
+                "the native Qwen3.8 MTP layout requires exactly one stored predictor layer".into(),
+            ));
+        }
+        if cfg.mtp_use_dedicated_embeddings {
+            return Err(Error::Config(
+                "qwen3_5 dedicated MTP embeddings are not represented by the frozen Qwen3.8 layout"
+                    .into(),
+            ));
+        }
+        let missing: Vec<String> = Self::required_keys(cfg.mtp_num_hidden_layers)
+            .into_iter()
+            .filter(|key| !w.contains(key))
+            .collect();
+        if !missing.is_empty() {
+            return Err(Error::Msg(format!(
+                "qwen3_5 MTP tensor set is incomplete; missing {}",
+                missing.join(", ")
+            )));
+        }
+        if cfg.moe.is_some() {
+            return Err(Error::Config(
+                "qwen3_5 MoE MTP loading requires the checkpoint's sparse MTP FFN layout".into(),
+            ));
+        }
+
+        let dtype = target.dtype;
+        let eps = cfg.rms_norm_eps as f64;
+        let req = |key: &str| -> Result<Tensor> { Ok(w.require(key)?.to_dtype(dtype)?) };
+        // Qwen3.5/Qwen3.8 RMSNorm parameters are zero-centered (`1 + weight`).
+        let norm_w = |key: &str| -> Result<Tensor> { Ok(req(key)?.affine(1.0, 1.0)?) };
+        let proj_q = |key: &str| -> Result<Projection> { Projection::load(req(key)?, quant) };
+        let groups = (cfg.num_heads / cfg.num_kv_heads) as usize;
+        let mut layers = Vec::with_capacity(cfg.mtp_num_hidden_layers);
+        for i in 0..cfg.mtp_num_hidden_layers {
+            let lp = |suffix: &str| format!("mtp.layers.{i}.{suffix}");
+            layers.push(DecoderLayer {
+                input_ln: norm_w(&lp("input_layernorm.weight"))?,
+                post_ln: norm_w(&lp("post_attention_layernorm.weight"))?,
+                mixer: Mixer::Attn(Qwen35Attention {
+                    q_proj: proj_q(&lp("self_attn.q_proj.weight"))?,
+                    k_proj: proj_q(&lp("self_attn.k_proj.weight"))?,
+                    v_proj: proj_q(&lp("self_attn.v_proj.weight"))?,
+                    o_proj: proj_q(&lp("self_attn.o_proj.weight"))?,
+                    q_norm: norm_w(&lp("self_attn.q_norm.weight"))?,
+                    k_norm: norm_w(&lp("self_attn.k_norm.weight"))?,
+                    num_heads: cfg.num_heads as usize,
+                    num_kv_heads: cfg.num_kv_heads as usize,
+                    head_dim: cfg.head_dim as usize,
+                    groups,
+                    scale: (cfg.head_dim as f32).powf(-0.5),
+                    eps,
+                }),
+                ffn: Ffn::Dense(Mlp {
+                    gate: proj_q(&lp("mlp.gate_proj.weight"))?,
+                    up: proj_q(&lp("mlp.up_proj.weight"))?,
+                    down: proj_q(&lp("mlp.down_proj.weight"))?,
+                }),
+                eps,
+            });
+        }
+
+        Ok(Self {
+            embed_tokens: target.embed_tokens.clone(),
+            lm_head: target.lm_head.clone(),
+            pre_fc_norm_embedding: norm_w("mtp.pre_fc_norm_embedding.weight")?,
+            pre_fc_norm_hidden: norm_w("mtp.pre_fc_norm_hidden.weight")?,
+            fc: proj_q("mtp.fc.weight")?,
+            layers,
+            norm: norm_w("mtp.norm.weight")?,
+            rope: Rope::partial(cfg.rotary_dim(), cfg.rope_theta, false),
+            mrope_section: cfg.mrope_section_resolved(),
+            eps,
+            dtype,
+            device: target.device.clone(),
+            vocab_size: cfg.vocab_size as usize,
+        })
+    }
+
+    /// A fresh cache for the auxiliary full-attention layers.
+    pub fn new_cache(&self) -> Qwen35MtpCache {
+        Qwen35MtpCache {
+            layers: (0..self.layers.len()).map(|_| AttnKv::default()).collect(),
+        }
+    }
+
+    /// Run one autoregressive draft step.
+    ///
+    /// `input_id` is the token one position to the right of `previous_hidden`; `position` is that
+    /// token's absolute text position. The returned hidden state is fed into the next speculative
+    /// step, while the logits define the proposal distribution `q` used by exact sampling
+    /// acceptance.
+    pub fn step(
+        &self,
+        input_id: i32,
+        previous_hidden: &Tensor,
+        step_idx: usize,
+        position: i32,
+        cache: &mut Qwen35MtpCache,
+    ) -> Result<(Tensor, Tensor)> {
+        if self.layers.is_empty() {
+            return Err(Error::Msg("qwen3_5 MTP has no predictor layers".into()));
+        }
+        let ids = Tensor::from_vec(vec![input_id as i64], (1, 1), &self.device)?;
+        let embeddings = self.embed_tokens.forward(&ids)?.to_dtype(self.dtype)?;
+        self.step_from_embeddings(&embeddings, previous_hidden, step_idx, position, cache)
+    }
+
+    /// Embedding-input twin of [`Self::step`], used when the shifted MTP input row is a fused visual
+    /// embedding rather than the image/video placeholder token embedding.
+    pub fn step_from_embeddings(
+        &self,
+        embeddings: &Tensor,
+        previous_hidden: &Tensor,
+        step_idx: usize,
+        position: i32,
+        cache: &mut Qwen35MtpCache,
+    ) -> Result<(Tensor, Tensor)> {
+        let (logits, hidden) = self.forward_sequence_from_embeddings(
+            embeddings,
+            previous_hidden,
+            step_idx,
+            position,
+            cache,
+        )?;
+        Ok((
+            logits
+                .narrow(1, logits.dim(1)? - 1, 1)?
+                .reshape((1, self.vocab_size))?,
+            hidden.narrow(1, hidden.dim(1)? - 1, 1)?,
+        ))
+    }
+
+    /// Process a contiguous sequence of target-validated token/hidden pairs. This is used both for
+    /// prompt prefill and to replace speculative MTP state with target-confirmed state after
+    /// acceptance. The frozen Qwen3.8 checkpoint has one MTP layer, so the whole sequence advances
+    /// that layer in one causal forward.
+    pub fn forward_sequence(
+        &self,
+        input_ids: &[i32],
+        previous_hidden: &Tensor,
+        position: i32,
+        cache: &mut Qwen35MtpCache,
+    ) -> Result<(Tensor, Tensor)> {
+        if input_ids.is_empty() {
+            return Err(Error::Msg(
+                "qwen3_5 MTP sequence input must not be empty".into(),
+            ));
+        }
+        let ids: Vec<i64> = input_ids.iter().map(|&id| id as i64).collect();
+        let ids = Tensor::from_vec(ids, (1, input_ids.len()), &self.device)?;
+        let embeddings = self.embed_tokens.forward(&ids)?.to_dtype(self.dtype)?;
+        self.forward_sequence_from_embeddings(&embeddings, previous_hidden, 0, position, cache)
+    }
+
+    /// Process target-validated fused prompt embeddings with the prompt's explicit interleaved
+    /// M-RoPE positions. Qwen3.8 is multimodal, so shifted vision rows must remain vision features
+    /// rather than being re-embedded from their placeholder token ids.
+    pub fn forward_embeddings_mrope(
+        &self,
+        embeddings: &Tensor,
+        previous_hidden: &Tensor,
+        positions: [&[i32]; 3],
+        cache: &mut Qwen35MtpCache,
+    ) -> Result<(Tensor, Tensor)> {
+        let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
+            positions,
+            self.mrope_section,
+            self.dtype,
+            &self.device,
+        )?;
+        self.forward_sequence_with_rope(embeddings, previous_hidden, 0, &cos, &sin, cache)
+    }
+
+    fn forward_sequence_from_embeddings(
+        &self,
+        embeddings: &Tensor,
+        previous_hidden: &Tensor,
+        step_idx: usize,
+        position: i32,
+        cache: &mut Qwen35MtpCache,
+    ) -> Result<(Tensor, Tensor)> {
+        let seq = embeddings.dim(1)?;
+        if previous_hidden.dim(1)? != seq {
+            return Err(Error::Msg(format!(
+                "qwen3_5 MTP embedding/hidden sequence mismatch: {} != {}",
+                seq,
+                previous_hidden.dim(1)?
+            )));
+        }
+        let (cos, sin) = self
+            .rope
+            .cos_sin(seq as i32, position, self.dtype, &self.device)?;
+        self.forward_sequence_with_rope(embeddings, previous_hidden, step_idx, &cos, &sin, cache)
+    }
+
+    fn forward_sequence_with_rope(
+        &self,
+        embeddings: &Tensor,
+        previous_hidden: &Tensor,
+        step_idx: usize,
+        cos: &Tensor,
+        sin: &Tensor,
+        cache: &mut Qwen35MtpCache,
+    ) -> Result<(Tensor, Tensor)> {
+        let en = rms_norm(embeddings, &self.pre_fc_norm_embedding, self.eps)?;
+        let hn = rms_norm(previous_hidden, &self.pre_fc_norm_hidden, self.eps)?;
+        let fused = self.fc.forward(&Tensor::cat(&[&en, &hn], 2)?)?;
+        let layer_idx = step_idx % self.layers.len();
+        let mut slot = Qwen35LayerCache::Attn(cache.layers[layer_idx].clone());
+        let hidden = self.layers[layer_idx].forward(&fused, cos, sin, &mut slot)?;
+        let Qwen35LayerCache::Attn(updated) = slot else {
+            unreachable!("MTP layers are always full attention")
+        };
+        cache.layers[layer_idx] = updated;
+        let hidden = rms_norm(&hidden, &self.norm, self.eps)?;
+        let logits = self.lm_head.forward(&hidden)?;
+        Ok((logits, hidden))
+    }
 }
 
 impl Qwen35Model {
@@ -593,7 +933,7 @@ impl Qwen35Model {
     /// Run the decoder stack over `input_ids` `[B, S]` at sequence `offset`, returning the final
     /// hidden states `[B, S, hidden]` (before the final norm / lm_head).
     fn hidden(&self, input_ids: &Tensor, cache: &mut Qwen35Cache, offset: i32) -> Result<Tensor> {
-        let h = embed(&self.embed_tokens, input_ids)?.to_dtype(self.dtype)?;
+        let h = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
         let s = h.dim(1)? as i32;
         let (cos, sin) = self.rope.cos_sin(s, offset, self.dtype, &self.device)?;
         self.hidden_from_embeds(&h, &cos, &sin, cache)
@@ -616,10 +956,20 @@ impl Qwen35Model {
         Ok(h)
     }
 
+    /// Final target RMSNorm. Its output is both the LM-head input and the target hidden state paired
+    /// with the next token embedding by Qwen3.8's MTP predictor.
+    fn normalize(&self, h: &Tensor) -> Result<Tensor> {
+        rms_norm(h, &self.norm, self.eps)
+    }
+
+    /// Shared `lm_head` projection over already normalized hidden states.
+    fn project_normalized(&self, h: &Tensor) -> Result<Tensor> {
+        self.lm_head.forward(h)
+    }
+
     /// Final RMSNorm + `lm_head` over hidden states `[B, n, hidden]` → logits `[B, n, vocab]`.
     fn project(&self, h: &Tensor) -> Result<Tensor> {
-        let normed = rms_norm(h, &self.norm, self.eps)?;
-        linear(&normed, &self.lm_head, None)
+        self.project_normalized(&self.normalize(h)?)
     }
 
     /// Project the **last** position of `h` `[B, S, hidden]` → logits `[B, vocab]`.
@@ -642,6 +992,19 @@ impl Qwen35Model {
         self.project(&h)
     }
 
+    /// Target verification output for Qwen3.8 MTP: logits and final-normalized target hidden states
+    /// for every input position. Both tensors retain the `[B, S, ...]` sequence axis.
+    pub fn forward_with_hidden(
+        &self,
+        input_ids: &Tensor,
+        cache: &mut Qwen35Cache,
+        offset: i32,
+    ) -> Result<(Tensor, Tensor)> {
+        let hidden = self.normalize(&self.hidden(input_ids, cache, offset)?)?;
+        let logits = self.project_normalized(&hidden)?;
+        Ok((logits, hidden))
+    }
+
     /// Run the decoder and return logits for the **last** position only, `[B, vocab]` — the decode
     /// contract (prefill + single-token decode).
     pub fn decode_logits(
@@ -658,7 +1021,7 @@ impl Qwen35Model {
     /// multimodal path overwrites image-token rows with the encoder's projected patch features
     /// ([`Self::splice_image_features`]).
     pub fn embed_input_ids(&self, input_ids: &Tensor) -> Result<Tensor> {
-        Ok(embed(&self.embed_tokens, input_ids)?.to_dtype(self.dtype)?)
+        Ok(self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?)
     }
 
     /// Replace the `image_token_id` rows of `embeds` `[1, S, hidden]` with `image_features`
@@ -824,6 +1187,36 @@ impl Qwen35Model {
         self.project_last(&h)
     }
 
+    /// Multimodal target prefill for MTP: the ordinary all-position logits plus the final-normalized
+    /// hidden row for every fused prompt position. DeepStack fusion and M-RoPE match the regular
+    /// multimodal prefill exactly.
+    pub fn forward_from_embeds_deepstack_with_hidden(
+        &self,
+        embeds: &Tensor,
+        positions: [&[i32]; 3],
+        cache: &mut Qwen35Cache,
+        visual_pos_mask: &[bool],
+        deepstack: &[Tensor],
+    ) -> Result<(Tensor, Tensor)> {
+        let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
+            positions,
+            self.cfg.mrope_section_resolved(),
+            self.dtype,
+            &self.device,
+        )?;
+        let h0 = embeds.to_dtype(self.dtype)?;
+        let hidden = deepstack_fused_decoder_layers(
+            &h0,
+            visual_pos_mask,
+            deepstack,
+            self.layers.len(),
+            |i, h| self.layers[i].forward(h, &cos, &sin, &mut cache.layers[i]),
+        )?;
+        let hidden = self.normalize(&hidden)?;
+        let logits = self.project_normalized(&hidden)?;
+        Ok((logits, hidden))
+    }
+
     /// Build from a loaded checkpoint (dense). See [`Qwen35Model::from_weights_dtype`].
     pub fn from_weights(w: &Weights, prefix: &str, cfg: Qwen35Config) -> Result<Self> {
         Self::from_weights_with(w, prefix, cfg, None)
@@ -855,6 +1248,29 @@ impl Qwen35Model {
         quant: Option<QuantSpec>,
         dtype: DType,
     ) -> Result<Self> {
+        Self::from_weights_dtype_impl(w, prefix, cfg, quant, dtype, None)
+    }
+
+    /// Build Qwen3.5/3.8 with compact Prism matrices while retaining ordinary tensors for norms,
+    /// convolution and recurrent parameters. Registry keys are the exact checkpoint tensor names.
+    pub fn from_prism_weights(
+        w: &Weights,
+        prefix: &str,
+        cfg: Qwen35Config,
+        prism: &PrismRegistry,
+        dtype: DType,
+    ) -> Result<Self> {
+        Self::from_weights_dtype_impl(w, prefix, cfg, None, dtype, Some(prism))
+    }
+
+    fn from_weights_dtype_impl(
+        w: &Weights,
+        prefix: &str,
+        cfg: Qwen35Config,
+        quant: Option<QuantSpec>,
+        dtype: DType,
+        prism: Option<&PrismRegistry>,
+    ) -> Result<Self> {
         let device = w.device().clone();
         let eps = cfg.rms_norm_eps as f64;
         let join = |s: &str| -> String {
@@ -865,19 +1281,52 @@ impl Qwen35Model {
             }
         };
         let req = |key: String| -> Result<Tensor> { Ok(w.require(&key)?.to_dtype(dtype)?) };
-        // Qwen3.6 RMSNorm weights are stored zero-centered → fold in the +1 (the (1 + weight)
-        // convention). The gated DeltaNet norm is the exception: it is ones-centered, loaded raw.
-        let norm_w = |key: String| -> Result<Tensor> { Ok(req(key)?.affine(1.0, 1.0)?) };
-        let proj_q = |key: String| -> Result<Projection> { Projection::load(req(key)?, quant) };
-        let proj_dense = |key: String| -> Result<Projection> { Projection::load(req(key)?, None) };
-
-        let embed_tokens = req(join("embed_tokens.weight"))?;
-        let norm = norm_w(join("norm.weight"))?;
-        let lm_head = if cfg.tie_word_embeddings {
-            embed_tokens.clone()
-        } else {
-            req("lm_head.weight".to_string())?
+        // Dense HF Qwen3.6 norms are zero-centered. Frozen Prism/Bonsai artifacts have already
+        // converted every ordinary RMSNorm tensor to its direct multiplier and must remain raw.
+        let norm_w = |key: String| -> Result<Tensor> {
+            let weight = req(key)?;
+            checkpoint_norm_weight(weight, prism.is_some())
         };
+        let proj_q = |key: String| -> Result<Projection> {
+            match prism.and_then(|registry| registry.get(&key)) {
+                Some(weight) => Ok(Projection::load_prism(weight.clone())),
+                None => Projection::load(req(key)?, quant),
+            }
+        };
+        let proj_dense = |key: String| -> Result<Projection> {
+            match prism.and_then(|registry| registry.get(&key)) {
+                Some(weight) => Ok(Projection::load_prism(weight.clone())),
+                None => Projection::load(req(key)?, None),
+            }
+        };
+
+        let embed_key = join("embed_tokens.weight");
+        let embed_tokens = match prism.and_then(|registry| registry.get(&embed_key)) {
+            Some(weight) => QwenEmbedding::Prism(weight.clone()),
+            None => QwenEmbedding::Dense(req(embed_key)?),
+        };
+        let norm = norm_w(join("norm.weight"))?;
+        let head_key = if prism.is_some() {
+            prefix
+                .strip_suffix(".model")
+                .map(|root| format!("{root}.lm_head.weight"))
+                .unwrap_or_else(|| "lm_head.weight".to_string())
+        } else {
+            "lm_head.weight".to_string()
+        };
+        let lm_head = if let Some(weight) = prism.and_then(|registry| registry.get(&head_key)) {
+            Projection::load_prism(weight.clone())
+        } else if cfg.tie_word_embeddings {
+            let QwenEmbedding::Dense(weight) = &embed_tokens else {
+                return Err(Error::Config(
+                    "Prism tied embeddings require an explicit lm_head packed tensor".into(),
+                ));
+            };
+            Projection::load(weight.clone(), quant)?
+        } else {
+            Projection::load(req(head_key)?, quant)?
+        };
+        let lm_head = std::sync::Arc::new(lm_head);
 
         let key_dim = (cfg.linear_key_head_dim * cfg.linear_num_key_heads) as usize;
         let value_dim = (cfg.linear_value_head_dim * cfg.linear_num_value_heads) as usize;
@@ -987,7 +1436,7 @@ impl Qwen35Model {
             cfg,
             dtype,
             device,
-            quantized: quant.is_some(),
+            quantized: quant.is_some() || prism.is_some(),
         })
     }
 }
@@ -1125,6 +1574,45 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
 
+    #[test]
+    fn published_prism_norm_multiplier_matches_independent_rms_oracle() {
+        let source = vec![1.0583496f32, 0.9418945, 1.3125, 1.957_031_3];
+        let x = vec![0.25f32, -0.5, 1.25, -2.0];
+        let weight = checkpoint_norm_weight(
+            Tensor::from_vec(source.clone(), 4, &Device::Cpu).unwrap(),
+            true,
+        )
+        .unwrap();
+        let got = rms_norm(
+            &Tensor::from_vec(x.clone(), (1, 4), &Device::Cpu).unwrap(),
+            &weight,
+            1e-6,
+        )
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+        let inv = (x.iter().map(|v| v * v).sum::<f32>() / 4.0 + 1e-6)
+            .sqrt()
+            .recip();
+        for (i, value) in got.iter().enumerate() {
+            let expected = x[i] * inv * source[i];
+            assert!(
+                (value - expected).abs() < 1e-5,
+                "lane {i}: {value} != {expected}"
+            );
+        }
+        let dense = checkpoint_norm_weight(
+            Tensor::from_vec(vec![0.0583496f32], 1, &Device::Cpu).unwrap(),
+            false,
+        )
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+        assert!((dense[0] - source[0]).abs() < 1e-6);
+    }
+
     fn cfg_json() -> Value {
         // 4 layers → schedule (interval 4): layers 0,1,2 linear, layer 3 full attention.
         json!({
@@ -1140,6 +1628,78 @@ mod tests {
             },
             "vision_config": { "model_type": "qwen3_5" }
         })
+    }
+
+    #[test]
+    fn frozen_qwen38_dense_config_matches_qwen35_decoder() {
+        let value: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../docs/reference/qwen38/config.json"
+        )))
+        .unwrap();
+        let cfg = Qwen35Config::from_json(&value).unwrap();
+
+        assert_eq!(cfg.hidden_size, 5120);
+        assert_eq!(cfg.num_layers, 64);
+        assert_eq!(cfg.intermediate_size, 17408);
+        assert_eq!(cfg.num_heads, 24);
+        assert_eq!(cfg.num_kv_heads, 4);
+        assert_eq!(cfg.head_dim, 256);
+        assert_eq!(cfg.vocab_size, 248320);
+        assert_eq!(cfg.full_attention_interval, 4);
+        assert_eq!(cfg.max_position_embeddings, 262144);
+        assert_eq!(cfg.mrope_section_resolved(), [11, 11, 10]);
+        assert_eq!(cfg.mtp_num_hidden_layers, 1);
+        assert!(!cfg.mtp_use_dedicated_embeddings);
+        assert!(cfg.moe.is_none());
+    }
+
+    #[test]
+    fn frozen_qwen38_mtp_inventory_is_exact_and_fail_closed() {
+        let value: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../docs/reference/qwen38/config.json"
+        )))
+        .unwrap();
+        let cfg = Qwen35Config::from_json(&value).unwrap();
+        let mut keys = Qwen35Mtp::required_keys(cfg.mtp_num_hidden_layers);
+        keys.sort();
+        let expected = [
+            "mtp.fc.weight",
+            "mtp.layers.0.input_layernorm.weight",
+            "mtp.layers.0.mlp.down_proj.weight",
+            "mtp.layers.0.mlp.gate_proj.weight",
+            "mtp.layers.0.mlp.up_proj.weight",
+            "mtp.layers.0.post_attention_layernorm.weight",
+            "mtp.layers.0.self_attn.k_norm.weight",
+            "mtp.layers.0.self_attn.k_proj.weight",
+            "mtp.layers.0.self_attn.o_proj.weight",
+            "mtp.layers.0.self_attn.q_norm.weight",
+            "mtp.layers.0.self_attn.q_proj.weight",
+            "mtp.layers.0.self_attn.v_proj.weight",
+            "mtp.norm.weight",
+            "mtp.pre_fc_norm_embedding.weight",
+            "mtp.pre_fc_norm_hidden.weight",
+        ];
+        assert_eq!(keys, expected);
+
+        let scalar = || Tensor::zeros(1, DType::F32, &Device::Cpu).unwrap();
+        let complete = Weights::from_map(
+            expected
+                .iter()
+                .map(|key| ((*key).to_string(), scalar()))
+                .collect(),
+            Device::Cpu,
+        );
+        assert!(Qwen35Mtp::complete_in(&complete, &cfg));
+        let incomplete = Weights::from_map(
+            expected[..expected.len() - 1]
+                .iter()
+                .map(|key| ((*key).to_string(), scalar()))
+                .collect(),
+            Device::Cpu,
+        );
+        assert!(!Qwen35Mtp::complete_in(&incomplete, &cfg));
     }
 
     /// A deterministic small tensor of shape `dims` (finite, non-degenerate), on CPU.

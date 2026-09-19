@@ -425,7 +425,12 @@ mod tests {
             supports_video: false,
             supports_audio: false,
             supports_thinking: false,
+            supports_reasoning_effort: false,
+            reasoning_efforts: Vec::new(),
+            model_sampling_defaults: None,
+            supports_preserve_thinking: false,
             supports_tools: false,
+            mtp: None,
             supported_constraints: constraints.iter().map(Constraint::kind).collect(),
         }
     }

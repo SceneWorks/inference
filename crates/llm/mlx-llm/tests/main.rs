@@ -62,6 +62,9 @@ mod joycaption;
 #[path = "ltx_2_5_te_tier_quality.rs"]
 mod ltx_2_5_te_tier_quality;
 
+#[path = "native_composition.rs"]
+mod native_composition;
+
 #[path = "paged.rs"]
 mod paged;
 
@@ -71,6 +74,9 @@ mod prefix;
 #[path = "prepare_snapshot.rs"]
 mod prepare_snapshot;
 
+#[path = "prism.rs"]
+mod prism;
+
 #[path = "qwen35.rs"]
 mod qwen35;
 
@@ -79,6 +85,9 @@ mod qwen35_tools;
 
 #[path = "qwen35_vision.rs"]
 mod qwen35_vision;
+
+#[path = "qwen38_bonsai.rs"]
+mod qwen38_bonsai;
 
 #[path = "qwen3vl.rs"]
 mod qwen3vl;

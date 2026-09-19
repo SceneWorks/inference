@@ -13,24 +13,27 @@ use std::path::Path;
 use candle_core::{DType, Device, Tensor};
 use core_llm::{
     AudioRef, Channel, ChatTemplate, Constraint, ConstraintDecodeTable, ConstraintKind, Content,
-    Error as CoreError, FinishReason as CoreFinish, ImageRef, IncrementalDetok, JinjaChatTemplate,
-    JsonConstraint, Llama3Template, LoadSpec, Message, Quantize, RenderOptions,
-    Result as CoreResult, Sampling, StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities,
-    TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter, Tokenizer,
-    ToolCallSegmenter, Usage, VideoRef,
+    Error as CoreError, FinishReason as CoreFinish, GenerationTimings, ImageRef, IncrementalDetok,
+    JinjaChatTemplate, JsonConstraint, Llama3Template, LlmMemoryGeometry, LoadSpec, Message,
+    ModelSamplingDefaults, MtpCapabilities, MtpMode, MtpStats, Quantize, ReasoningEffort,
+    RenderOptions, Result as CoreResult, Sampling, StopMatcher, StreamEvent as CoreEvent, TextLlm,
+    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter,
+    Tokenizer, ToolCallSegmenter, Usage, VideoRef,
 };
+use serde_json::Value;
 
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
-    generate_from_prefill, generate_with, ConstraintMask, Decode, FinishReason, GenerationConfig,
-    StreamEvent,
+    generate_from_prefill_with_stop, generate_qwen35_mtp_multimodal_with_stop,
+    generate_qwen35_mtp_timed_with_stop, ConstraintMask, Decode, FinishReason, GenerationConfig,
+    Qwen35MtpMultimodalPrompt, RewindableConstraintMask, StreamEvent,
 };
 use crate::device::select_device;
 use crate::gguf::GgufCheckpoint;
 use crate::image::Qwen35ImageProcessor;
 use crate::models::gemma4_mm;
 use crate::models::{
-    CausalLm, Gemma4Layout, Gemma4Mm, Gemma4MmConfig, Qwen35Config, Qwen35Model,
+    CausalLm, Gemma4Layout, Gemma4Mm, Gemma4MmConfig, Qwen35Config, Qwen35Model, Qwen35Mtp,
     Qwen35VisionConfig, Qwen35VisionModel, VlmDecode,
 };
 use crate::primitives::nn::input_ids;
@@ -78,6 +81,55 @@ impl Decode for Decoder {
 }
 
 impl Decoder {
+    fn memory_geometry(&self) -> LlmMemoryGeometry {
+        let (query_heads, kv_heads, head_dim, layers, hidden, intermediate, vocab, recurrent) =
+            match self {
+                Decoder::Causal(m) => {
+                    let c = m.config();
+                    (
+                        c.num_heads,
+                        c.num_kv_heads,
+                        c.head_dim,
+                        c.num_layers,
+                        c.hidden_size,
+                        c.intermediate_size,
+                        c.vocab_size,
+                        0,
+                    )
+                }
+                Decoder::Qwen35(m) => {
+                    let c = m.config();
+                    (
+                        c.num_heads,
+                        c.num_kv_heads,
+                        c.head_dim,
+                        c.num_layers,
+                        c.hidden_size,
+                        c.intermediate_size,
+                        c.vocab_size,
+                        (c.num_layers as u64)
+                            .saturating_mul(c.linear_num_value_heads as u64)
+                            .saturating_mul(c.linear_value_head_dim as u64)
+                            .saturating_mul(
+                                (c.linear_key_head_dim + c.linear_conv_kernel_dim) as u64,
+                            )
+                            .saturating_mul(4),
+                    )
+                }
+            };
+        LlmMemoryGeometry {
+            query_heads: query_heads.max(0) as u64,
+            kv_heads: kv_heads.max(0) as u64,
+            head_dim: head_dim.max(0) as u64,
+            layers: layers as u64,
+            element_bytes: 4,
+            hidden_size: hidden as u64,
+            intermediate_size: intermediate as u64,
+            vocab_size: vocab as u64,
+            recurrent_bytes: recurrent,
+        }
+    }
+
     fn is_quantized(&self) -> bool {
         match self {
             Decoder::Causal(m) => m.is_quantized(),
@@ -114,6 +166,90 @@ struct Qwen35Vision {
 }
 
 impl Qwen35Vision {
+    fn estimate_workspace(
+        &self,
+        images: &[&ImageRef],
+        videos: &[&VideoRef],
+    ) -> CoreResult<(usize, u64)> {
+        let cfg = self.tower.config();
+        let patch = cfg.patch_size.max(1) as usize;
+        let merge = self.spatial_merge_size.max(1) as usize;
+        let temporal = self.processor.temporal_patch_size.max(1);
+        let mut tokens = 0usize;
+        let mut pixels = 0u64;
+        for image in images {
+            let (h, w) = self
+                .processor
+                .smart_resize(image.height as usize, image.width as usize)
+                .map_err(to_core)?;
+            tokens = tokens
+                .checked_add((h / patch) * (w / patch) / (merge * merge))
+                .ok_or_else(|| {
+                    CoreError::InvalidRequest("visual token geometry overflow".into())
+                })?;
+            pixels = pixels.saturating_add((h as u64).saturating_mul(w as u64).saturating_mul(12));
+        }
+        for video in videos {
+            let frame = video
+                .frames
+                .first()
+                .ok_or_else(|| CoreError::InvalidRequest("video has no frames".into()))?;
+            let t = video.frames.len().div_ceil(temporal);
+            let (h, w) = self
+                .processor
+                .smart_resize_with(
+                    frame.height as usize,
+                    frame.width as usize,
+                    t,
+                    self.processor.video_min_pixels,
+                    self.processor.video_max_pixels,
+                )
+                .map_err(to_core)?;
+            tokens = tokens
+                .checked_add(t * (h / patch) * (w / patch) / (merge * merge))
+                .ok_or_else(|| {
+                    CoreError::InvalidRequest("visual token geometry overflow".into())
+                })?;
+            pixels = pixels.saturating_add(
+                (t as u64)
+                    .saturating_mul(temporal as u64)
+                    .saturating_mul(h as u64)
+                    .saturating_mul(w as u64)
+                    .saturating_mul(12),
+            );
+        }
+        let activations = (tokens as u64)
+            .checked_mul(cfg.hidden_size.max(0) as u64)
+            .and_then(|v| {
+                v.checked_mul((cfg.depth + cfg.deepstack_visual_indexes.len() + 2) as u64)
+            })
+            .and_then(|v| v.checked_mul(4))
+            .ok_or_else(|| CoreError::InvalidRequest("visual workspace overflow".into()))?;
+        // The tower attends over unmerged patches, not the merged language tokens.
+        // Pricing all frames together is conservative even when attention is frame-local.
+        let patches = (tokens as u64)
+            .checked_mul(merge as u64)
+            .and_then(|v| v.checked_mul(merge as u64))
+            .ok_or_else(|| CoreError::InvalidRequest("visual patch geometry overflow".into()))?;
+        let attention = patches
+            .checked_mul(patches)
+            .and_then(|v| v.checked_mul(cfg.num_heads.max(0) as u64))
+            .and_then(|v| v.checked_mul(12))
+            .ok_or_else(|| {
+                CoreError::InvalidRequest("visual attention workspace overflow".into())
+            })?;
+        let mlp = patches
+            .checked_mul(cfg.intermediate_size.max(0) as u64)
+            .and_then(|v| v.checked_mul(12))
+            .ok_or_else(|| CoreError::InvalidRequest("visual MLP workspace overflow".into()))?;
+        let required = pixels
+            .checked_add(activations)
+            .and_then(|v| v.checked_add(attention))
+            .and_then(|v| v.checked_add(mlp))
+            .ok_or_else(|| CoreError::InvalidRequest("visual workspace overflow".into()))?;
+        Ok((tokens, required))
+    }
+
     /// Encode one image to its merged patch rows `[n_tokens, hidden]` (the merger output is already
     /// the language hidden size — no separate projector), the per-tap **DeepStack** feature sets
     /// (each `[n_tokens, hidden]`, one per `deepstack_visual_indexes` tap — empty for a Qwen3.6
@@ -253,6 +389,24 @@ fn collect_audio(messages: &[Message]) -> Vec<&AudioRef> {
         .collect()
 }
 
+fn request_media_workspace_bytes(messages: &[Message]) -> CoreResult<u64> {
+    messages.iter().try_fold(0u64, |total, message| {
+        message.content.iter().try_fold(total, |total, content| {
+            let bytes = match content {
+                Content::Image(image) => (image.pixels.len() as u64).saturating_mul(4),
+                Content::Video(video) => video.frames.iter().fold(0u64, |sum, frame| {
+                    sum.saturating_add((frame.pixels.len() as u64).saturating_mul(4))
+                }),
+                Content::Audio(audio) => (audio.samples.len() as u64).saturating_mul(16),
+                Content::Text(_) => 0,
+            };
+            total
+                .checked_add(bytes)
+                .ok_or_else(|| CoreError::InvalidRequest("media workspace overflow".into()))
+        })
+    })
+}
+
 /// Gemma 4's rendered image marker — the single token its chat template emits for an image part,
 /// which the processor (here, [`LlamaProvider::prepare_gemma4`]) expands into
 /// `boi` + N soft tokens + `eoi`.
@@ -354,12 +508,13 @@ fn substitute_vision_placeholders(
             let content = m
                 .content
                 .iter()
-                .map(|c| match c {
+                .map(|c| {
+                    match c {
                     Content::Image(_) => Ok(Content::text(IMAGE_PLACEHOLDER)),
-                    Content::Video(v) => Ok(Content::text(video_placeholder_text(
-                        v,
-                        temporal_patch_size,
-                    ))),
+                    Content::Video(v) => {
+                        v.validate().map_err(CoreError::InvalidRequest)?;
+                        Ok(Content::text(video_placeholder_text(v, temporal_patch_size)))
+                    }
                     Content::Text(t) => Ok(Content::Text(t.clone())),
                     // The Qwen-VL path has no audio projector, and this provider's `supports_audio`
                     // is false for every Qwen checkpoint, so `validate` rejects an audio-carrying
@@ -371,6 +526,7 @@ fn substitute_vision_placeholders(
                          placeholder substitution, which the capability gate should have rejected"
                             .to_string(),
                     )),
+                }
                 })
                 .collect::<CoreResult<Vec<_>>>()?;
             Ok(Message {
@@ -423,6 +579,9 @@ fn expand_vision_placeholders(
 pub struct LlamaProvider {
     descriptor: TextLlmDescriptor,
     model: Decoder,
+    /// Complete checkpoint-native Qwen3.8 MTP predictor. Its absence never affects ordinary
+    /// autoregressive inference and is reflected by an absent MTP capability.
+    mtp: Option<Qwen35Mtp>,
     tokenizer: Tokenizer,
     template: Box<dyn ChatTemplate>,
     stop_tokens: Vec<i32>,
@@ -483,14 +642,57 @@ impl LlamaProvider {
     /// shards). Either way the decoder architecture is dispatched (Llama / Mistral / Qwen3) and the
     /// projections are optionally quantized on load per `spec.quantize`.
     pub fn load(spec: &LoadSpec) -> CoreResult<Self> {
+        if spec.projector_source.is_some() && !crate::gguf::is_gguf_path(&spec.source) {
+            return Err(CoreError::Load("an external projector is only valid with a GGUF language checkpoint; safetensors vision must be embedded".into()));
+        }
+        let device = select_device().map_err(to_core)?;
+        let payload = core_llm::checkpoint_payload_bytes(Path::new(&spec.source))?;
+        let projector = spec
+            .projector_source
+            .as_ref()
+            .map(|p| core_llm::checkpoint_payload_bytes(Path::new(p)))
+            .transpose()?
+            .unwrap_or(0);
+        let packed = crate::gguf::is_gguf_path(&spec.source)
+            || read_json(Path::new(&spec.source), "config.json").is_some_and(|c| {
+                c.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35")
+            });
+        // CPU dense conversion retains source BF16 plus F32 tensors. Packed weights stay packed;
+        // projector conversion is bounded separately at four times its stored payload.
+        let host_factor = if packed || device.is_cuda() { 2 } else { 3 };
+        let host_required = payload
+            .checked_mul(host_factor)
+            .and_then(|v| v.checked_add(projector.checked_mul(4)?))
+            .ok_or_else(|| CoreError::Load("load memory estimate overflow".into()))?;
+        let budget = core_llm::operational_memory_override()?;
+        let host_available =
+            core_llm::effective_memory_budget(core_llm::available_host_memory_bytes(), budget)?;
+        core_llm::admit_request_memory(host_required, host_available)?;
+        if device.is_cuda() {
+            let device_required = payload
+                .checked_add(payload / 4)
+                .and_then(|v| v.checked_add(projector.checked_mul(4)?))
+                .ok_or_else(|| CoreError::Load("device load memory estimate overflow".into()))?;
+            core_llm::admit_request_memory(device_required, request_available_memory(&device)?)?;
+        }
+
         let requested = spec.quantize.map(|q| match q {
             Quantize::Q4 => QuantSpec::q4(),
             Quantize::Q8 => QuantSpec::q8(),
         });
-        let device = select_device().map_err(to_core)?;
         if crate::gguf::is_gguf_path(&spec.source) {
-            Self::load_gguf(Path::new(&spec.source), &device, requested)
+            Self::load_gguf(
+                Path::new(&spec.source),
+                spec.projector_source.as_deref().map(Path::new),
+                &device,
+                requested,
+            )
         } else {
+            if spec.projector_source.is_some() {
+                return Err(CoreError::Load(
+                    "an external projector is only valid with a GGUF language checkpoint; safetensors vision must be embedded".into(),
+                ));
+            }
             Self::load_dir(Path::new(&spec.source), &device, requested)
         }
     }
@@ -503,36 +705,92 @@ impl LlamaProvider {
     fn load_dir(dir: &Path, device: &Device, requested: Option<QuantSpec>) -> CoreResult<Self> {
         let cfg_value = read_json(dir, "config.json")
             .ok_or_else(|| CoreError::Load(format!("read config.json in {}", dir.display())))?;
-        let arch = Architecture::from_config(&cfg_value).map_err(to_core)?;
-        let weights = Weights::from_dir(dir, device).map_err(to_core)?;
-        let (model, mut descriptor) = if arch == Architecture::Qwen35 {
+        let is_prism =
+            cfg_value.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35");
+        if is_prism && requested.is_some() {
+            return Err(CoreError::Load(
+                "Prism/Bonsai is already packed affine-2; Q4/Q8 repacking would expand the model"
+                    .into(),
+            ));
+        }
+        let arch = if is_prism {
+            Architecture::Qwen35
+        } else {
+            Architecture::from_config(&cfg_value).map_err(to_core)?
+        };
+        let (weights, prism) = if is_prism {
+            let checkpoint =
+                crate::prism_checkpoint::PrismMlxCheckpoint::open(dir, device, &cfg_value)
+                    .map_err(to_core)?;
+            (checkpoint.weights, Some(checkpoint.registry))
+        } else {
+            (Weights::from_dir(dir, device).map_err(to_core)?, None)
+        };
+        let (model, mut descriptor, mtp) = if arch == Architecture::Qwen35 {
             // Qwen3.6 hybrid decoder: its own config, the VLM-nested `model.language_model` prefix, and
             // a top-level untied `lm_head`.
             let qcfg = Qwen35Config::from_json(&cfg_value).map_err(to_core)?;
-            let descriptor = descriptor_for_qwen35(&qcfg);
-            let m =
+            let mut descriptor = descriptor_for_qwen35(&qcfg);
+            if is_prism {
+                descriptor.family = "prism_hadamard_qwen35".into();
+                descriptor.capabilities.model_sampling_defaults = Some(bonsai_sampling_defaults());
+            }
+            let m = if let Some(registry) = prism.as_ref() {
+                Qwen35Model::from_prism_weights(
+                    &weights,
+                    "language_model.model",
+                    qcfg,
+                    registry,
+                    crate::device::compute_dtype(device),
+                )
+                .map_err(to_core)?
+            } else {
                 Qwen35Model::from_weights_with(&weights, "model.language_model", qcfg, requested)
-                    .map_err(to_core)?;
-            (Decoder::Qwen35(m), descriptor)
+                    .map_err(to_core)?
+            };
+            let configured_layers = m.config().mtp_num_hidden_layers;
+            let has_mtp_tensors = weights.keys().any(|key| key.starts_with("mtp."));
+            let mtp = if configured_layers > 0 {
+                Some(Qwen35Mtp::from_weights_with(&weights, &m, requested).map_err(to_core)?)
+            } else if has_mtp_tensors {
+                return Err(CoreError::Load(
+                    "qwen3_5 checkpoint carries MTP tensors while config disables MTP".into(),
+                ));
+            } else {
+                None
+            };
+            (Decoder::Qwen35(m), descriptor, mtp)
         } else {
             let cfg = ModelConfig::from_dir(dir).map_err(to_core)?;
             let descriptor = descriptor_for(&cfg);
             let quant = requested.or(cfg.quantization);
             let m = CausalLm::from_weights_with(&weights, "", cfg, quant).map_err(to_core)?;
-            (Decoder::Causal(m), descriptor)
+            (Decoder::Causal(m), descriptor, None)
         };
+        if mtp.is_some() {
+            descriptor.capabilities.mtp = Some(MtpCapabilities {
+                max_draft_tokens: u32::MAX,
+                recommended_draft_tokens: 3,
+            });
+        }
 
         // Qwen-VL vision: load the ViT tower when the checkpoint carries `model.visual.*` (a wrapped
         // VLM) and the config exposes a `vision_config`. Covers Qwen3.6 (`qwen3_5`) and Qwen3-VL
         // (`qwen3_vl`), which share the identical Qwen3-VL ViT tower (Qwen3-VL adds DeepStack taps).
         // Absent → a text-only checkpoint.
+        let dense_vision = weights.contains("model.visual.patch_embed.proj.weight");
+        let prism_vision = is_prism && weights.contains("vision_tower.patch_embed.proj.weight");
         let vision = if (arch == Architecture::Qwen35 || arch == Architecture::Qwen3Vl)
             && cfg_value.get("vision_config").is_some()
-            && weights.contains("model.visual.patch_embed.proj.weight")
+            && (dense_vision || prism_vision)
         {
             let vcfg = Qwen35VisionConfig::from_json(&cfg_value).map_err(to_core)?;
-            let tower = Qwen35VisionModel::from_weights(&weights, "model.visual", vcfg.clone())
-                .map_err(to_core)?;
+            let tower = if prism_vision {
+                Qwen35VisionModel::from_mlx_weights(&weights, "vision_tower", vcfg.clone())
+            } else {
+                Qwen35VisionModel::from_weights(&weights, "model.visual", vcfg.clone())
+            }
+            .map_err(to_core)?;
             // Both real configs carry `image_token_id`; the fallback is the family's canonical id
             // (Qwen3.6 248056, Qwen3-VL 151655) so a hand-rolled config still resolves.
             let image_token_id = cfg_value
@@ -593,12 +851,32 @@ impl LlamaProvider {
 
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         let stop_tokens = eos_token_ids(dir);
-        let (template, supports_thinking, supports_tools) = load_chat_template(dir);
+        let (
+            template,
+            supports_thinking,
+            supports_reasoning_effort,
+            supports_preserve_thinking,
+            supports_tools,
+        ) = load_chat_template(dir);
         descriptor.capabilities.supports_thinking = supports_thinking;
+        descriptor.capabilities.supports_reasoning_effort = supports_reasoning_effort;
+        if supports_reasoning_effort && arch == Architecture::Qwen35 {
+            descriptor.capabilities.reasoning_efforts = if is_prism {
+                vec![ReasoningEffort::XHigh, ReasoningEffort::Medium]
+            } else {
+                vec![
+                    ReasoningEffort::XHigh,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::Low,
+                ]
+            };
+        }
+        descriptor.capabilities.supports_preserve_thinking = supports_preserve_thinking;
         descriptor.capabilities.supports_tools = supports_tools;
         Ok(Self {
             descriptor,
             model,
+            mtp,
             tokenizer,
             template,
             stop_tokens,
@@ -612,7 +890,136 @@ impl LlamaProvider {
     /// `tokenizer.json`, falling back to a reconstruction from the GGUF's embedded tokenizer
     /// metadata; the chat template prefers a sibling `tokenizer_config.json`, then the GGUF's own
     /// `chat_template`, then the typed Llama-3 default.
-    fn load_gguf(path: &Path, device: &Device, requested: Option<QuantSpec>) -> CoreResult<Self> {
+    fn load_gguf(
+        path: &Path,
+        projector_path: Option<&Path>,
+        device: &Device,
+        requested: Option<QuantSpec>,
+    ) -> CoreResult<Self> {
+        if crate::prism_checkpoint::PrismGgufCheckpoint::is_prism(path).map_err(to_core)? {
+            if requested.is_some() {
+                return Err(CoreError::Load(
+                    "Prism/Bonsai GGUF is already packed; Q4/Q8 repacking would expand the model"
+                        .into(),
+                ));
+            }
+            let ck = crate::prism_checkpoint::PrismGgufCheckpoint::open(path, device)
+                .map_err(to_core)?;
+            let qcfg = Qwen35Config::from_json(&ck.config_json).map_err(to_core)?;
+            let language_hidden_size = qcfg.hidden_size as usize;
+            let mut descriptor = descriptor_for_qwen35(&qcfg);
+            descriptor.capabilities.model_sampling_defaults = Some(bonsai_sampling_defaults());
+            let model = Qwen35Model::from_prism_weights(
+                &ck.weights,
+                "language_model.model",
+                qcfg,
+                &ck.registry,
+                crate::device::compute_dtype(device),
+            )
+            .map_err(to_core)?;
+            let dir = path.parent().unwrap_or_else(|| Path::new("."));
+            let sibling_tokenizer = dir.join("tokenizer.json");
+            let tokenizer = if sibling_tokenizer.is_file() {
+                Tokenizer::from_file(sibling_tokenizer)?
+            } else {
+                ck.tokenizer().map_err(to_core)?
+            };
+            let (template, thinking, effort, preserve, tools): (
+                Box<dyn ChatTemplate>,
+                bool,
+                bool,
+                bool,
+                bool,
+            ) = if let Ok(t) =
+                JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json"))
+            {
+                let src = t.source();
+                let flags = (
+                    src.contains("enable_thinking"),
+                    src.contains("reasoning_effort"),
+                    src.contains("preserve_thinking"),
+                    src.contains("tool_call"),
+                );
+                (Box::new(t), flags.0, flags.1, flags.2, flags.3)
+            } else if let Some(src) = ck.chat_template.as_ref() {
+                let flags = (
+                    src.contains("enable_thinking"),
+                    src.contains("reasoning_effort"),
+                    src.contains("preserve_thinking"),
+                    src.contains("tool_call"),
+                );
+                (
+                    Box::new(JinjaChatTemplate::with_tokens(
+                        src.clone(),
+                        ck.bos_token.clone().unwrap_or_default(),
+                        ck.eos_token.clone().unwrap_or_default(),
+                    )),
+                    flags.0,
+                    flags.1,
+                    flags.2,
+                    flags.3,
+                )
+            } else {
+                (Box::new(Llama3Template), false, false, false, false)
+            };
+            descriptor.capabilities.supports_thinking = thinking;
+            descriptor.capabilities.supports_reasoning_effort = effort;
+            if effort {
+                descriptor.capabilities.reasoning_efforts =
+                    vec![ReasoningEffort::XHigh, ReasoningEffort::Medium];
+            }
+            descriptor.capabilities.supports_preserve_thinking = preserve;
+            descriptor.capabilities.supports_tools = tools;
+            let vision = if let Some(projector_path) = projector_path {
+                let loaded = crate::prism_vision_gguf::PrismVisionGguf::open(
+                    projector_path,
+                    device,
+                    language_hidden_size,
+                )
+                .map_err(to_core)?;
+                let one_token = |text: &str| -> CoreResult<i32> {
+                    let ids = tokenizer.encode(text, false)?;
+                    if ids.len() != 1 {
+                        return Err(CoreError::Load(format!(
+                            "Bonsai GGUF tokenizer must encode {text:?} as one special token, got {ids:?}"
+                        )));
+                    }
+                    i32::try_from(ids[0]).map_err(|_| {
+                        CoreError::Load(format!("Bonsai GGUF token id for {text:?} overflows i32"))
+                    })
+                };
+                let image_token_id = one_token("<|image_pad|>")?;
+                let video_token_id = one_token("<|video_pad|>")?;
+                descriptor.capabilities.supports_vision = true;
+                descriptor.capabilities.supports_video = true;
+                Some(Qwen35Vision {
+                    tower: loaded.model,
+                    processor: Qwen35ImageProcessor::default(),
+                    image_token_id,
+                    video_token_id,
+                    spatial_merge_size: loaded.config.spatial_merge_size,
+                    device: device.clone(),
+                })
+            } else {
+                None
+            };
+            return Ok(Self {
+                descriptor,
+                model: Decoder::Qwen35(model),
+                mtp: None,
+                tokenizer,
+                template,
+                stop_tokens: ck.stop_tokens,
+                constraint_table: OnceCell::new(),
+                vision,
+                gemma4: None,
+            });
+        }
+        if projector_path.is_some() {
+            return Err(CoreError::Load(
+                "external qwen3vl_merger projectors are supported only for Prism/Bonsai GGUF language checkpoints".into(),
+            ));
+        }
         let ck = GgufCheckpoint::open(path, device).map_err(to_core)?;
         let mut descriptor = descriptor_for(&ck.config);
         let quant = requested.or(ck.config.quantization);
@@ -636,12 +1043,21 @@ impl LlamaProvider {
             ck.stop_tokens.clone()
         };
 
-        let (template, supports_thinking, supports_tools) = gguf_chat_template(dir, &ck);
+        let (
+            template,
+            supports_thinking,
+            supports_reasoning_effort,
+            supports_preserve_thinking,
+            supports_tools,
+        ) = gguf_chat_template(dir, &ck);
         descriptor.capabilities.supports_thinking = supports_thinking;
+        descriptor.capabilities.supports_reasoning_effort = supports_reasoning_effort;
+        descriptor.capabilities.supports_preserve_thinking = supports_preserve_thinking;
         descriptor.capabilities.supports_tools = supports_tools;
         Ok(Self {
             descriptor,
             model,
+            mtp: None,
             tokenizer,
             template,
             stop_tokens,
@@ -664,6 +1080,7 @@ impl LlamaProvider {
         Self {
             descriptor: provider_descriptor(),
             model: Decoder::Causal(model),
+            mtp: None,
             tokenizer,
             template: Box::new(Llama3Template),
             stop_tokens,
@@ -956,15 +1373,130 @@ impl LlamaProvider {
     }
 }
 
+fn request_available_memory(device: &Device) -> CoreResult<u64> {
+    let capacity = if device.is_cuda() {
+        #[cfg(feature = "cuda")]
+        {
+            device.as_cuda_device().ok().and_then(|d| {
+                d.cuda_stream()
+                    .context()
+                    .mem_get_info()
+                    .ok()
+                    .map(|(free, _)| free as u64)
+            })
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    } else {
+        core_llm::available_host_memory_bytes()
+    };
+    core_llm::effective_memory_budget(capacity, core_llm::operational_memory_override()?)
+}
+
 /// Adapts a `core_llm::JsonConstraint` to the engine's [`ConstraintMask`] decode seam.
-struct JsonMask<'a>(JsonConstraint<'a>);
+struct JsonMask<'a> {
+    inner: JsonConstraint<'a>,
+    table: &'a ConstraintDecodeTable,
+    stop_ids: Vec<u32>,
+    accepted: Vec<i32>,
+    initial_reasoning: bool,
+    reasoning: bool,
+    reasoning_tail: String,
+    allow: Vec<bool>,
+}
+
+impl<'a> JsonMask<'a> {
+    fn new(
+        table: &'a ConstraintDecodeTable,
+        stop_ids: impl IntoIterator<Item = u32>,
+        reasoning: bool,
+    ) -> Self {
+        let stop_ids = stop_ids.into_iter().collect::<Vec<_>>();
+        Self {
+            inner: JsonConstraint::new(table, stop_ids.iter().copied()),
+            table,
+            stop_ids,
+            accepted: Vec::new(),
+            initial_reasoning: reasoning,
+            reasoning,
+            reasoning_tail: String::new(),
+            allow: vec![false; table.pieces.len()],
+        }
+    }
+
+    fn accept_reasoning_piece(&mut self, piece: &str) {
+        self.reasoning_tail.push_str(piece);
+        if let Some(end) = self.reasoning_tail.find("</think>") {
+            let answer = self.reasoning_tail[end + "</think>".len()..].to_string();
+            self.reasoning = false;
+            self.reasoning_tail.clear();
+            let accepted = self.inner.accept_text(&answer);
+            debug_assert!(accepted);
+            return;
+        }
+        let keep = (1.."</think>".len())
+            .rev()
+            .find(|&n| self.reasoning_tail.ends_with(&"</think>"[..n]))
+            .unwrap_or(0);
+        if self.reasoning_tail.len() > keep {
+            self.reasoning_tail
+                .drain(..self.reasoning_tail.len() - keep);
+        }
+    }
+}
 
 impl ConstraintMask for JsonMask<'_> {
     fn allowed(&mut self) -> &[bool] {
-        self.0.allowed()
+        if !self.reasoning {
+            return self.inner.allowed();
+        }
+        for (id, slot) in self.allow.iter_mut().enumerate() {
+            if self.stop_ids.contains(&(id as u32)) {
+                *slot = false;
+                continue;
+            }
+            let mut candidate = self.reasoning_tail.clone();
+            candidate.push_str(&self.table.pieces[id]);
+            *slot = candidate
+                .find("</think>")
+                .is_none_or(|end| self.inner.allows_text(&candidate[end + "</think>".len()..]));
+        }
+        &self.allow
     }
     fn accept(&mut self, token: i32) {
-        self.0.accept(token as u32);
+        if self.reasoning {
+            let piece = self
+                .table
+                .pieces
+                .get(token as usize)
+                .cloned()
+                .unwrap_or_default();
+            self.accept_reasoning_piece(&piece);
+        } else {
+            self.inner.accept(token as u32);
+        }
+        self.accepted.push(token);
+    }
+}
+
+impl RewindableConstraintMask for JsonMask<'_> {
+    fn checkpoint(&self) -> usize {
+        self.accepted.len()
+    }
+
+    fn rewind(&mut self, checkpoint: usize) {
+        self.accepted.truncate(checkpoint);
+        self.inner = JsonConstraint::new(self.table, self.stop_ids.iter().copied());
+        self.reasoning_tail.clear();
+        self.reasoning = self.initial_reasoning;
+        // Replay committed tokens to restore both the reasoning phase and JSON grammar.
+        let accepted = self.accepted.clone();
+        for token in accepted {
+            self.accept(token);
+        }
+        self.accepted.truncate(checkpoint);
     }
 }
 
@@ -976,20 +1508,36 @@ impl ConstraintMask for JsonMask<'_> {
 /// - **tools** — the template renders tool calls (its source mentions `tool_call`), so it has a
 ///   `tools` section and the model emits parseable `<tool_call>` blocks (story 7636). Covers the
 ///   Qwen3.6 XML and the Qwen2.5/Hermes JSON tool templates alike.
-fn load_chat_template(dir: &Path) -> (Box<dyn ChatTemplate>, bool, bool) {
+fn load_chat_template(dir: &Path) -> (Box<dyn ChatTemplate>, bool, bool, bool, bool) {
     // The sidecar `chat_template.jinja` wins over the embedded key — see `sidecar_chat_template`.
     if let Some(t) = sidecar_chat_template(dir) {
         let supports_thinking = t.source().contains("enable_thinking");
         let supports_tools = t.source().contains("tool_call");
-        return (Box::new(t), supports_thinking, supports_tools);
+        let supports_reasoning_effort = t.source().contains("reasoning_effort");
+        let supports_preserve_thinking = t.source().contains("preserve_thinking");
+        return (
+            Box::new(t),
+            supports_thinking,
+            supports_reasoning_effort,
+            supports_preserve_thinking,
+            supports_tools,
+        );
     }
     match JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json")) {
         Ok(t) => {
             let supports_thinking = t.source().contains("enable_thinking");
             let supports_tools = t.source().contains("tool_call");
-            (Box::new(t), supports_thinking, supports_tools)
+            let supports_reasoning_effort = t.source().contains("reasoning_effort");
+            let supports_preserve_thinking = t.source().contains("preserve_thinking");
+            (
+                Box::new(t),
+                supports_thinking,
+                supports_reasoning_effort,
+                supports_preserve_thinking,
+                supports_tools,
+            )
         }
-        Err(_) => (Box::new(Llama3Template), false, false),
+        Err(_) => (Box::new(Llama3Template), false, false, false, false),
     }
 }
 
@@ -1037,12 +1585,23 @@ fn tokenizer_special_tokens(dir: &Path) -> (String, String) {
 /// own embedded `chat_template` metadata, then the typed Llama-3 default. Also reports
 /// `supports_thinking` (the chosen template's source gates `enable_thinking`) and `supports_tools`
 /// (its source renders tool calls — it mentions `tool_call`).
-fn gguf_chat_template(dir: &Path, ck: &GgufCheckpoint) -> (Box<dyn ChatTemplate>, bool, bool) {
+fn gguf_chat_template(
+    dir: &Path,
+    ck: &GgufCheckpoint,
+) -> (Box<dyn ChatTemplate>, bool, bool, bool, bool) {
     if let Ok(t) = JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json"))
     {
         let supports_thinking = t.source().contains("enable_thinking");
         let supports_tools = t.source().contains("tool_call");
-        return (Box::new(t), supports_thinking, supports_tools);
+        let supports_reasoning_effort = t.source().contains("reasoning_effort");
+        let supports_preserve_thinking = t.source().contains("preserve_thinking");
+        return (
+            Box::new(t),
+            supports_thinking,
+            supports_reasoning_effort,
+            supports_preserve_thinking,
+            supports_tools,
+        );
     }
     if let Some(src) = &ck.chat_template {
         let supports_thinking = src.contains("enable_thinking");
@@ -1052,10 +1611,12 @@ fn gguf_chat_template(dir: &Path, ck: &GgufCheckpoint) -> (Box<dyn ChatTemplate>
         return (
             Box::new(JinjaChatTemplate::with_tokens(src.clone(), bos, eos)),
             supports_thinking,
+            src.contains("reasoning_effort"),
+            src.contains("preserve_thinking"),
             supports_tools,
         );
     }
-    (Box::new(Llama3Template), false, false)
+    (Box::new(Llama3Template), false, false, false, false)
 }
 
 /// Whether a rendered prompt ends with an **unclosed** `<think>` block — i.e. the chat template
@@ -1086,22 +1647,33 @@ fn tool_pieces(seg: &mut Option<ToolCallSegmenter>, text: &str) -> Vec<String> {
 /// the contract's token index stays gap-free across stripped reasoning markers and lifted-out
 /// tool-call blocks.
 fn emit_content(
-    piece: String,
+    piece: &str,
     id: u32,
+    stop: (&mut StopMatcher, &std::cell::Cell<bool>),
     streamed: &mut String,
     emit_index: &mut usize,
     last_id: &mut u32,
     on_event: &mut dyn FnMut(CoreEvent),
 ) {
-    streamed.push_str(&piece);
-    *last_id = id;
-    on_event(CoreEvent::Token {
-        id,
-        text: piece,
-        index: *emit_index,
-        channel: Channel::Content,
-    });
-    *emit_index += 1;
+    let (stop_matcher, halt) = stop;
+    if halt.get() {
+        return;
+    }
+    let chunk = stop_matcher.push(piece);
+    if !chunk.emit.is_empty() {
+        streamed.push_str(&chunk.emit);
+        *last_id = id;
+        on_event(CoreEvent::Token {
+            id,
+            text: chunk.emit,
+            index: *emit_index,
+            channel: Channel::Content,
+        });
+        *emit_index += 1;
+    }
+    if chunk.stop {
+        halt.set(true);
+    }
 }
 
 impl TextLlm for LlamaProvider {
@@ -1166,6 +1738,8 @@ impl TextLlm for LlamaProvider {
             &RenderOptions {
                 add_generation_prompt: true,
                 enable_thinking: req.enable_thinking_kwarg(),
+                reasoning_effort: req.reasoning_effort,
+                preserve_thinking: req.preserve_thinking,
                 tools: &req.tools,
             },
         )?;
@@ -1175,6 +1749,44 @@ impl TextLlm for LlamaProvider {
             .into_iter()
             .map(|id| id as i32)
             .collect();
+
+        // Price the request before image/video preprocessing or any model forward allocates native
+        // tensors. The visual geometry path is pure integer math over request dimensions.
+        let (visual_tokens, vision_workspace) = match &self.vision {
+            Some(vision) if multimodal => vision.estimate_workspace(&images, &videos)?,
+            _ => (0, 0),
+        };
+        let vision_workspace = vision_workspace
+            .checked_add(request_media_workspace_bytes(&req.messages)?)
+            .ok_or_else(|| CoreError::InvalidRequest("media workspace overflow".into()))?;
+        let admitted_prompt = prompt_ids
+            .len()
+            .checked_add(visual_tokens)
+            .ok_or_else(|| CoreError::InvalidRequest("expanded prompt geometry overflow".into()))?;
+        let required = core_llm::estimate_request_bytes(
+            admitted_prompt,
+            req.max_new_tokens,
+            self.model.memory_geometry(),
+            vision_workspace,
+            match req.mtp {
+                MtpMode::Off => 0,
+                MtpMode::Auto => self
+                    .descriptor
+                    .capabilities
+                    .mtp
+                    .map_or(0, |c| c.recommended_draft_tokens),
+                MtpMode::Enabled { draft_tokens } => draft_tokens,
+            },
+        )
+        .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
+        let available = request_available_memory(self.model.device())?;
+        core_llm::admit_request_memory(required, available)?;
+
+        self.model
+            .device()
+            .synchronize()
+            .map_err(|e| to_core(e.into()))?;
+        let generation_started = std::time::Instant::now();
 
         // Encode + splice the visuals and compute M-RoPE positions (the placeholder-expanded prompt
         // becomes the effective sequence). `None` on the text-only path.
@@ -1193,6 +1805,11 @@ impl TextLlm for LlamaProvider {
             .map(|m| m.expanded_ids.len())
             .or_else(|| g4.as_ref().map(|m| m.expanded_ids.len()))
             .unwrap_or(prompt_ids.len());
+        validate_context_window(
+            self.descriptor.capabilities.max_context_tokens,
+            prompt_len,
+            req.max_new_tokens,
+        )?;
 
         let config = GenerationConfig {
             max_new_tokens: req.max_new_tokens as usize,
@@ -1200,20 +1817,36 @@ impl TextLlm for LlamaProvider {
             seed: req.seed,
             stop_tokens: self.stop_tokens.clone(),
         };
+        let mtp_drafts = match req.mtp {
+            MtpMode::Off => None,
+            MtpMode::Auto => self
+                .descriptor
+                .capabilities
+                .mtp
+                .map(|cap| cap.recommended_draft_tokens),
+            MtpMode::Enabled { draft_tokens } => Some(draft_tokens),
+        };
 
         // Structured-output constraint: build a JSON mask over the cached decode table.
+        let constraint_starts_in_reasoning =
+            self.descriptor.capabilities.supports_thinking && prompt_opens_thinking(&prompt);
         let mut json_mask = match req.constraint {
             Some(Constraint::Json) => {
                 let table = self
                     .constraint_table
                     .get_or_init(|| self.tokenizer.constraint_decode_table());
-                Some(JsonMask(JsonConstraint::new(
+                Some(JsonMask::new(
                     table,
                     self.stop_tokens.iter().map(|&i| i as u32),
-                )))
+                    constraint_starts_in_reasoning,
+                ))
             }
             None => None,
         };
+
+        let mut stop_matcher = StopMatcher::new(req.stop.iter().cloned());
+        let stop_active = !stop_matcher.is_empty();
+        let halt = std::cell::Cell::new(false);
 
         // A reasoning segmenter when the model advertises a thinking mode: it splits the decoded
         // stream into `<think>…</think>` reasoning vs answer (markers stripped) across the Thinking /
@@ -1227,7 +1860,7 @@ impl TextLlm for LlamaProvider {
         // feeding it that already-rendered opening marker (stripped, emits nothing); a Disabled
         // request renders a *closed* `<think></think>`, so this correctly does not prime.
         if let Some(seg) = segmenter.as_mut() {
-            if prompt_opens_thinking(&prompt) {
+            if constraint_starts_in_reasoning {
                 let _ = seg.push("<think>");
             }
         }
@@ -1253,6 +1886,9 @@ impl TextLlm for LlamaProvider {
         // split across BPE tokens streams intact (and never panics a mid-char slice) — sc-12452.
         // The segmenter (when active) splits each delta into reasoning vs answer.
         let tokenizer = &self.tokenizer;
+        let mut mtp_stats = None;
+        let phase_prefill;
+        let phase_decode_started;
         let out = {
             let mut acc: Vec<u32> = Vec::new();
             let mut detok = IncrementalDetok::new();
@@ -1285,8 +1921,9 @@ impl TextLlm for LlamaProvider {
                                                 for piece in tool_pieces(&mut tool_seg, &span.text)
                                                 {
                                                     emit_content(
-                                                        piece,
+                                                        &piece,
                                                         id,
+                                                        (&mut stop_matcher, &halt),
                                                         &mut streamed,
                                                         &mut emit_index,
                                                         &mut last_id,
@@ -1297,13 +1934,14 @@ impl TextLlm for LlamaProvider {
                                         }
                                     }
                                 }
-                                None if tool_seg.is_some() => {
+                                None if tool_seg.is_some() || stop_active => {
                                     // No reasoning split, but tools are active: route the whole delta
                                     // through the tool segmenter (the answer is the only channel).
                                     for piece in tool_pieces(&mut tool_seg, &delta) {
                                         emit_content(
-                                            piece,
+                                            &piece,
                                             id,
+                                            (&mut stop_matcher, &halt),
                                             &mut streamed,
                                             &mut emit_index,
                                             &mut last_id,
@@ -1327,60 +1965,136 @@ impl TextLlm for LlamaProvider {
                     }
                 }
             };
-            let constraint = json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask);
-            match &mm {
-                // Multimodal: prefill the spliced embeds with interleaved M-RoPE, then decode the
-                // continuation (text positions shifted by `mrope_delta`) through the shared loop.
-                Some(m) => {
-                    let model = self.model.as_vlm();
-                    let mut cache = model.make_cache();
-                    let (t, h, w, delta) = &m.positions;
-                    let first = model
-                        .prefill_with_deepstack(
-                            &m.embeds,
-                            [t.as_slice(), h.as_slice(), w.as_slice()],
-                            &mut *cache,
-                            &m.visual_pos_mask,
-                            &m.deepstack,
+            let should_stop = || halt.get();
+            let should_stop_opt = stop_active.then_some(&should_stop as &dyn Fn() -> bool);
+            if let Some(draft_tokens) = mtp_drafts {
+                let target = match &self.model {
+                    Decoder::Qwen35(model) => model,
+                    Decoder::Causal(_) => {
+                        return Err(CoreError::Load(
+                            "MTP was advertised for a non-Qwen target decoder".into(),
+                        ))
+                    }
+                };
+                let mtp = self.mtp.as_ref().ok_or_else(|| {
+                    CoreError::Load("MTP was advertised without a loaded predictor".into())
+                })?;
+                let constraint = json_mask
+                    .as_mut()
+                    .map(|m| m as &mut dyn RewindableConstraintMask);
+                let (generated, stats) = match &mm {
+                    Some(m) => {
+                        let mut prefill = None;
+                        let mut decode_started = None;
+                        let mut boundary = || -> crate::error::Result<()> {
+                            target.device().synchronize()?;
+                            prefill = Some(generation_started.elapsed());
+                            decode_started = Some(std::time::Instant::now());
+                            Ok(())
+                        };
+                        let (t, h, w, delta) = &m.positions;
+                        let result = generate_qwen35_mtp_multimodal_with_stop(
+                            target,
+                            mtp,
+                            Qwen35MtpMultimodalPrompt {
+                                input_ids: &m.expanded_ids,
+                                embeddings: &m.embeds,
+                                positions: [t.as_slice(), h.as_slice(), w.as_slice()],
+                                visual_pos_mask: &m.visual_pos_mask,
+                                deepstack: &m.deepstack,
+                                continuation_delta: *delta,
+                            },
+                            &config,
+                            draft_tokens,
+                            &req.cancel,
+                            &mut sink,
+                            constraint,
+                            should_stop_opt,
+                            Some(&mut boundary),
                         )
                         .map_err(to_core)?;
-                    let shifted = Shifted {
-                        model,
-                        delta: *delta,
-                    };
-                    generate_from_prefill(
-                        &shifted,
-                        &mut *cache,
-                        first,
-                        m.expanded_ids.clone(),
-                        &config,
-                        &req.cancel,
-                        &mut sink,
-                        constraint,
-                    )
-                    .map_err(to_core)?
-                }
-                // Gemma 4 multimodal: prefill the spliced embeds on ordinary causal 1-D positions
-                // (no M-RoPE, so no position shift for the continuation), then decode through the
-                // shared loop against the unwrapped decoder.
-                None => match &g4 {
-                    Some(m) => {
-                        let model = match &self.model {
-                            Decoder::Causal(c) => c,
-                            Decoder::Qwen35(_) => {
-                                return Err(CoreError::Load(
-                                    "gemma 4: the multimodal path requires the generic causal \
-                                     decoder"
-                                        .into(),
-                                ))
-                            }
+                        target
+                            .device()
+                            .synchronize()
+                            .map_err(|e| to_core(e.into()))?;
+                        phase_prefill = prefill.unwrap_or_else(|| generation_started.elapsed());
+                        phase_decode_started =
+                            decode_started.unwrap_or_else(std::time::Instant::now);
+                        result
+                    }
+                    None => {
+                        target
+                            .device()
+                            .synchronize()
+                            .map_err(|e| to_core(e.into()))?;
+                        let prefill_started = generation_started;
+                        let mut prefill = None;
+                        let mut decode_started = None;
+                        let mut boundary = || -> crate::error::Result<()> {
+                            target.device().synchronize()?;
+                            prefill = Some(prefill_started.elapsed());
+                            decode_started = Some(std::time::Instant::now());
+                            Ok(())
                         };
+                        let result = generate_qwen35_mtp_timed_with_stop(
+                            target,
+                            mtp,
+                            &prompt_ids,
+                            &config,
+                            draft_tokens,
+                            &req.cancel,
+                            &mut sink,
+                            constraint,
+                            should_stop_opt,
+                            &mut boundary,
+                        )
+                        .map_err(to_core)?;
+                        target
+                            .device()
+                            .synchronize()
+                            .map_err(|e| to_core(e.into()))?;
+                        phase_prefill = prefill.unwrap_or_else(|| generation_started.elapsed());
+                        phase_decode_started =
+                            decode_started.unwrap_or_else(std::time::Instant::now);
+                        result
+                    }
+                };
+                mtp_stats = Some(MtpStats {
+                    proposed_tokens: u32::try_from(stats.proposed).unwrap_or(u32::MAX),
+                    accepted_tokens: u32::try_from(stats.accepted).unwrap_or(u32::MAX),
+                    target_forwards: u32::try_from(stats.forwards).unwrap_or(u32::MAX),
+                });
+                generated
+            } else {
+                let constraint = json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask);
+                match &mm {
+                    // Multimodal: prefill the spliced embeds with interleaved M-RoPE, then decode the
+                    // continuation (text positions shifted by `mrope_delta`) through the shared loop.
+                    Some(m) => {
+                        let model = self.model.as_vlm();
                         let mut cache = model.make_cache();
+                        let (t, h, w, delta) = &m.positions;
                         let first = model
-                            .decode_logits_from_embeds(&m.embeds, &mut *cache, 0)
+                            .prefill_with_deepstack(
+                                &m.embeds,
+                                [t.as_slice(), h.as_slice(), w.as_slice()],
+                                &mut *cache,
+                                &m.visual_pos_mask,
+                                &m.deepstack,
+                            )
                             .map_err(to_core)?;
-                        generate_from_prefill(
-                            &self.model,
+                        model
+                            .device()
+                            .synchronize()
+                            .map_err(|e| to_core(e.into()))?;
+                        let prefill = generation_started.elapsed();
+                        let decode_started = std::time::Instant::now();
+                        let shifted = Shifted {
+                            model,
+                            delta: *delta,
+                        };
+                        let result = generate_from_prefill_with_stop(
+                            &shifted,
                             &mut *cache,
                             first,
                             m.expanded_ids.clone(),
@@ -1388,19 +2102,133 @@ impl TextLlm for LlamaProvider {
                             &req.cancel,
                             &mut sink,
                             constraint,
+                            should_stop_opt,
                         )
-                        .map_err(to_core)?
+                        .map_err(to_core)?;
+                        model
+                            .device()
+                            .synchronize()
+                            .map_err(|e| to_core(e.into()))?;
+                        phase_prefill = prefill;
+                        phase_decode_started = decode_started;
+                        result
                     }
-                    None => generate_with(
-                        &self.model,
-                        &prompt_ids,
-                        &config,
-                        &req.cancel,
-                        &mut sink,
-                        constraint,
-                    )
-                    .map_err(to_core)?,
-                },
+                    // Gemma 4 multimodal: prefill the spliced embeds on ordinary causal 1-D positions
+                    // (no M-RoPE, so no position shift for the continuation), then decode through the
+                    // shared loop against the unwrapped decoder.
+                    None => match &g4 {
+                        Some(m) => {
+                            let model =
+                                match &self.model {
+                                    Decoder::Causal(c) => c,
+                                    Decoder::Qwen35(_) => return Err(CoreError::Load(
+                                        "gemma 4: the multimodal path requires the generic causal \
+                                     decoder"
+                                            .into(),
+                                    )),
+                                };
+                            let mut cache = model.make_cache();
+                            let first = model
+                                .decode_logits_from_embeds(&m.embeds, &mut *cache, 0)
+                                .map_err(to_core)?;
+                            self.model
+                                .device()
+                                .synchronize()
+                                .map_err(|e| to_core(e.into()))?;
+                            let prefill = generation_started.elapsed();
+                            let decode_started = std::time::Instant::now();
+                            let result = generate_from_prefill_with_stop(
+                                &self.model,
+                                &mut *cache,
+                                first,
+                                m.expanded_ids.clone(),
+                                &config,
+                                &req.cancel,
+                                &mut sink,
+                                constraint,
+                                should_stop_opt,
+                            )
+                            .map_err(to_core)?;
+                            self.model
+                                .device()
+                                .synchronize()
+                                .map_err(|e| to_core(e.into()))?;
+                            phase_prefill = prefill;
+                            phase_decode_started = decode_started;
+                            result
+                        }
+                        None => match &self.model {
+                            Decoder::Qwen35(_) => {
+                                self.model
+                                    .device()
+                                    .synchronize()
+                                    .map_err(|e| to_core(e.into()))?;
+                                let mut cache = self.model.make_cache();
+                                let ids =
+                                    input_ids(&prompt_ids, self.model.device()).map_err(to_core)?;
+                                let first =
+                                    self.model.step(&ids, &mut *cache, 0).map_err(to_core)?;
+                                self.model
+                                    .device()
+                                    .synchronize()
+                                    .map_err(|e| to_core(e.into()))?;
+                                let prefill = generation_started.elapsed();
+                                let decode_started = std::time::Instant::now();
+                                let result = generate_from_prefill_with_stop(
+                                    &self.model,
+                                    &mut *cache,
+                                    first,
+                                    prompt_ids.clone(),
+                                    &config,
+                                    &req.cancel,
+                                    &mut sink,
+                                    constraint,
+                                    should_stop_opt,
+                                )
+                                .map_err(to_core)?;
+                                self.model
+                                    .device()
+                                    .synchronize()
+                                    .map_err(|e| to_core(e.into()))?;
+                                phase_prefill = prefill;
+                                phase_decode_started = decode_started;
+                                result
+                            }
+                            Decoder::Causal(_) => {
+                                let mut cache = self.model.make_cache();
+                                let ids =
+                                    input_ids(&prompt_ids, self.model.device()).map_err(to_core)?;
+                                let first =
+                                    self.model.step(&ids, &mut *cache, 0).map_err(to_core)?;
+                                self.model
+                                    .device()
+                                    .synchronize()
+                                    .map_err(|e| to_core(e.into()))?;
+                                let prefill = generation_started.elapsed();
+                                let decode_started = std::time::Instant::now();
+                                let result = generate_from_prefill_with_stop(
+                                    &self.model,
+                                    &mut *cache,
+                                    first,
+                                    prompt_ids.clone(),
+                                    &config,
+                                    &req.cancel,
+                                    &mut sink,
+                                    constraint,
+                                    should_stop_opt,
+                                )
+                                .map_err(to_core)?;
+                                self.model
+                                    .device()
+                                    .synchronize()
+                                    .map_err(|e| to_core(e.into()))?;
+                                phase_prefill = prefill;
+                                phase_decode_started = decode_started;
+                                result
+                            }
+                        },
+                    },
+                }
             }
         };
 
@@ -1424,8 +2252,9 @@ impl TextLlm for LlamaProvider {
                     Channel::Content => {
                         for piece in tool_pieces(&mut tool_seg, &span.text) {
                             emit_content(
-                                piece,
+                                &piece,
                                 last_id,
+                                (&mut stop_matcher, &halt),
                                 &mut streamed,
                                 &mut emit_index,
                                 &mut last_id,
@@ -1439,13 +2268,27 @@ impl TextLlm for LlamaProvider {
         if let Some(ts) = tool_seg.as_mut() {
             for piece in ts.flush() {
                 emit_content(
-                    piece,
+                    &piece,
                     last_id,
+                    (&mut stop_matcher, &halt),
                     &mut streamed,
                     &mut emit_index,
                     &mut last_id,
                     &mut *on_event,
                 );
+            }
+        }
+
+        if stop_active && !halt.get() {
+            let tail = stop_matcher.flush();
+            if !tail.is_empty() {
+                streamed.push_str(&tail);
+                on_event(CoreEvent::Token {
+                    id: last_id,
+                    text: tail,
+                    index: emit_index,
+                    channel: Channel::Content,
+                });
             }
         }
 
@@ -1457,7 +2300,7 @@ impl TextLlm for LlamaProvider {
         // rather than surfaced as U+FFFD (sc-12452).
         // Reasoning and tool calls, if the model produced any, are reported separately (their markup
         // excluded from `text`).
-        let text = if thinking_active || tools_active {
+        let text = if stop_active || thinking_active || tools_active {
             streamed
         } else {
             let gen_u32: Vec<u32> = out.tokens.iter().map(|&i| i as u32).collect();
@@ -1465,7 +2308,11 @@ impl TextLlm for LlamaProvider {
         };
         let thinking = (!thinking_buf.is_empty()).then_some(thinking_buf);
         let tool_calls = tool_seg.map(|mut ts| ts.take_calls()).unwrap_or_default();
-        let finish = map_finish(out.finish_reason);
+        let finish = if halt.get() {
+            core_llm::FinishReason::Stop
+        } else {
+            map_finish(out.finish_reason)
+        };
         let usage = Usage {
             prompt_tokens: prompt_len as u32,
             generated_tokens: out.tokens.len() as u32,
@@ -1475,13 +2322,37 @@ impl TextLlm for LlamaProvider {
             usage,
         });
         Ok(TextLlmOutput {
+            timings: Some(GenerationTimings {
+                prefill: phase_prefill,
+                decode: phase_decode_started.elapsed(),
+            }),
             text,
             thinking,
             tool_calls,
             usage,
+            mtp: mtp_stats,
             finish_reason: Some(finish),
         })
     }
+}
+
+fn validate_context_window(
+    cap: usize,
+    prompt_tokens: usize,
+    max_new_tokens: u32,
+) -> CoreResult<()> {
+    if cap == 0 {
+        return Ok(());
+    }
+    let total = prompt_tokens
+        .checked_add(max_new_tokens as usize)
+        .ok_or_else(|| CoreError::InvalidRequest("prompt + generation length overflow".into()))?;
+    if total > cap {
+        return Err(CoreError::InvalidRequest(format!(
+            "expanded prompt ({prompt_tokens} tokens) + requested generation ({max_new_tokens}) exceeds context window {cap}"
+        )));
+    }
+    Ok(())
 }
 
 /// The descriptor for the `candle-llama` provider (constructible without loading weights; used for
@@ -1505,9 +2376,14 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             // No controllable reasoning mode yet (a separate story); the contract requires an
             // explicit enable-thinking request to be rejected, which validate_request enforces.
             supports_thinking: false,
+            supports_reasoning_effort: false,
+            reasoning_efforts: Vec::new(),
+            model_sampling_defaults: None,
+            supports_preserve_thinking: false,
             // Weightless default: conservative. The load path flips this on when the loaded model's
             // chat template renders tool calls (story 7636).
             supports_tools: false,
+            mtp: None,
             // JSON-constrained decoding.
             supported_constraints: vec![ConstraintKind::Json],
         },
@@ -1582,8 +2458,32 @@ fn map_sampling(s: &Sampling) -> SamplingParams {
         temperature: s.temperature,
         top_p: s.top_p,
         top_k: s.top_k,
+        presence_penalty: s.presence_penalty,
         repetition_penalty: s.repetition_penalty,
         repetition_context: s.repetition_context,
+    }
+}
+
+/// Official Bonsai source presets exposed as discovery metadata. The card also explicitly sets
+/// `min_p = 0.0` in both modes; that disabled no-op needs no sampler field or runtime operator.
+fn bonsai_sampling_defaults() -> ModelSamplingDefaults {
+    ModelSamplingDefaults {
+        thinking: Sampling {
+            temperature: 1.0,
+            top_p: 0.95,
+            top_k: 20,
+            presence_penalty: 0.0,
+            repetition_penalty: 1.0,
+            repetition_context: 0,
+        },
+        non_thinking: Sampling {
+            temperature: 0.7,
+            top_p: 0.8,
+            top_k: 20,
+            presence_penalty: 1.5,
+            repetition_penalty: 1.0,
+            repetition_context: 0,
+        },
     }
 }
 
@@ -1635,9 +2535,21 @@ fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
 /// embedder loads alongside the decoder, sc-18772). Reads only `config.json` — never a weight shard.
 /// GGUF is declined (candle's GGUF path is dense text-only).
 pub fn can_load_vision(spec: &LoadSpec) -> bool {
+    if crate::gguf::is_gguf_path(&spec.source) {
+        return crate::prism_checkpoint::PrismGgufCheckpoint::is_prism(Path::new(&spec.source))
+            .unwrap_or(false)
+            && spec.projector_source.as_deref().is_some_and(|path| {
+                crate::prism_vision_gguf::PrismVisionGguf::is_qwen3vl_merger(Path::new(path))
+            });
+    }
     let Some(v) = probe_config(spec) else {
         return false;
     };
+    if v.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35") {
+        return spec.projector_source.is_none()
+            && v.get("vision_config").is_some()
+            && v.pointer("/components/vision").and_then(Value::as_bool) == Some(true);
+    }
     let qwen_vl = v.get("vision_config").is_some()
         && matches!(
             Architecture::from_config(&v),
@@ -1713,6 +2625,16 @@ fn gemma4_multimodal(v: &serde_json::Value, block: &str, token_key: &str) -> boo
 /// end-to-end: Qwen3.6, Qwen3-VL, and Gemma 4 unified.
 pub fn can_load(spec: &LoadSpec) -> bool {
     if crate::gguf::is_gguf_path(&spec.source) {
+        let prism = crate::prism_checkpoint::PrismGgufCheckpoint::is_prism(Path::new(&spec.source))
+            .unwrap_or(false);
+        if prism {
+            return spec.projector_source.as_deref().is_none_or(|path| {
+                crate::prism_vision_gguf::PrismVisionGguf::is_qwen3vl_merger(Path::new(path))
+            });
+        }
+        if spec.projector_source.is_some() {
+            return false;
+        }
         // Confirm the GGUF's architecture from its header alone (weightless) — accept iff the loader
         // can actually reconstruct it. A `.gguf` that is missing/corrupt or names an unsupported arch
         // resolves to `None` and is declined.
@@ -1733,6 +2655,9 @@ pub fn can_load(spec: &LoadSpec) -> bool {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
         return false;
     };
+    if v.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35") {
+        return spec.projector_source.is_none();
+    }
     // A multimodal snapshot (a `vision_config` block) is normally declined so a vision provider claims
     // it — EXCEPT the families this provider serves directly: Qwen3.6 (`qwen3_5`) and Qwen3-VL
     // (`qwen3_vl`), whose checkpoints are VLM-wrapped but whose matching ViT tower loads here, and
@@ -1751,10 +2676,201 @@ pub fn can_load(spec: &LoadSpec) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
+        bonsai_sampling_defaults, can_load, can_load_vision, emit_content, eos_token_ids,
         expand_vision_placeholders, merged_frame_timestamps, prompt_opens_thinking,
-        video_placeholder_text,
+        substitute_vision_placeholders, validate_context_window, video_placeholder_text, JsonMask,
     };
-    use core_llm::{ImageRef, VideoRef};
+    use crate::decode::{ConstraintMask, RewindableConstraintMask};
+    use core_llm::{ConstraintDecodeTable, Content, ImageRef, LoadSpec, Message, Role, VideoRef};
+
+    #[test]
+    fn reasoning_boundary_commits_same_token_json_in_release_builds() {
+        let table = core_llm::ConstraintDecodeTable {
+            pieces: vec!["</think>{}".into(), String::new(), "{".into()],
+            special: [1].into_iter().collect(),
+        };
+        let mut mask = JsonMask::new(&table, [1], true);
+        assert!(mask.allowed()[0]);
+        mask.accept(0);
+        assert!(
+            mask.allowed()[1],
+            "same-token answer must commit even with debug assertions off"
+        );
+        assert!(
+            !mask.allowed()[2],
+            "completed answer cannot begin a second JSON value"
+        );
+        let mark = mask.checkpoint();
+        mask.rewind(mark);
+        assert!(
+            mask.allowed()[1],
+            "MTP rewind must replay phase and same-token JSON"
+        );
+    }
+
+    #[test]
+    fn json_constraint_waits_for_split_reasoning_close_and_rewinds_phase() {
+        let table = ConstraintDecodeTable {
+            pieces: vec![
+                "reason".into(),
+                "</thi".into(),
+                "nk>".into(),
+                "{".into(),
+                "x".into(),
+                "</think>x".into(),
+                String::new(),
+            ],
+            special: [6].into_iter().collect(),
+        };
+        let mut mask = JsonMask::new(&table, [6], true);
+        assert!(mask.allowed()[0]);
+        assert!(
+            !mask.allowed()[5],
+            "invalid same-token JSON suffix is masked"
+        );
+        assert!(!mask.allowed()[6], "EOS cannot end an open reasoning block");
+        mask.accept(0);
+        let checkpoint = mask.checkpoint();
+        mask.accept(1);
+        mask.accept(2);
+        assert!(mask.allowed()[3], "JSON begins only after split </think>");
+        assert!(!mask.allowed()[4]);
+        mask.rewind(checkpoint);
+        assert!(mask.allowed()[1], "rewind restores the reasoning phase");
+        assert!(!mask.allowed()[6]);
+
+        let mut disabled = JsonMask::new(&table, [6], false);
+        assert!(disabled.allowed()[3], "disabled thinking starts in JSON");
+        assert!(!disabled.allowed()[0]);
+    }
+
+    #[test]
+    fn stop_matches_utf8_after_incremental_detokenization_and_never_leaks_tail() {
+        let mut matcher = core_llm::StopMatcher::new(["βγ".to_string(), "βγmore".to_string()]);
+        let mut detok = core_llm::IncrementalDetok::default();
+        let halt = std::cell::Cell::new(false);
+        let (mut text, mut index, mut last) = (String::new(), 0, 0);
+        for decoded in ["α", "α�", "αβ", "αβ�", "αβγleak"] {
+            if let Some(delta) = detok.push(decoded) {
+                emit_content(
+                    delta,
+                    1,
+                    (&mut matcher, &halt),
+                    &mut text,
+                    &mut index,
+                    &mut last,
+                    &mut |_| {},
+                );
+            }
+        }
+        emit_content(
+            "more leak",
+            2,
+            (&mut matcher, &halt),
+            &mut text,
+            &mut index,
+            &mut last,
+            &mut |_| {},
+        );
+        assert_eq!(text, "α");
+        assert!(halt.get());
+    }
+
+    #[test]
+    fn content_stop_is_trimmed_across_token_boundaries() {
+        let mut matcher = core_llm::StopMatcher::new(["<STOP>".to_string()]);
+        let halt = std::cell::Cell::new(false);
+        let mut streamed = String::new();
+        let mut index = 0;
+        let mut last_id = 0;
+        let mut events = Vec::new();
+        emit_content(
+            "answer<ST",
+            1,
+            (&mut matcher, &halt),
+            &mut streamed,
+            &mut index,
+            &mut last_id,
+            &mut |event| events.push(event),
+        );
+        emit_content(
+            "OP>leak",
+            2,
+            (&mut matcher, &halt),
+            &mut streamed,
+            &mut index,
+            &mut last_id,
+            &mut |event| events.push(event),
+        );
+        assert_eq!(streamed, "answer");
+        assert!(halt.get());
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn bonsai_sampling_defaults_match_official_thinking_modes() {
+        let defaults = bonsai_sampling_defaults();
+        assert_eq!(defaults.thinking.temperature, 1.0);
+        assert_eq!(defaults.thinking.top_p, 0.95);
+        assert_eq!(defaults.thinking.top_k, 20);
+        assert_eq!(defaults.thinking.presence_penalty, 0.0);
+        assert_eq!(defaults.thinking.repetition_penalty, 1.0);
+        assert_eq!(defaults.thinking.repetition_context, 0);
+
+        assert_eq!(defaults.non_thinking.temperature, 0.7);
+        assert_eq!(defaults.non_thinking.top_p, 0.8);
+        assert_eq!(defaults.non_thinking.top_k, 20);
+        assert_eq!(defaults.non_thinking.presence_penalty, 1.5);
+        assert_eq!(defaults.non_thinking.repetition_penalty, 1.0);
+        assert_eq!(defaults.non_thinking.repetition_context, 0);
+    }
+
+    #[test]
+    fn prism_mlx_weightless_probe_requires_declared_embedded_vision() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = |vision: bool| {
+            serde_json::json!({
+                "model_type": "prism_hadamard_qwen35",
+                "components": {"text": true, "vision": vision, "mtp": false},
+                "vision_config": {"depth": 1}
+            })
+        };
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&config(true)).unwrap(),
+        )
+        .unwrap();
+        let spec = LoadSpec::dense(dir.path().to_string_lossy());
+        assert!(can_load(&spec));
+        assert!(can_load_vision(&spec));
+
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&config(false)).unwrap(),
+        )
+        .unwrap();
+        assert!(can_load(&spec), "text Bonsai remains loadable");
+        assert!(!can_load_vision(&spec));
+
+        let associated = spec.clone().with_projector("external.gguf");
+        assert!(!can_load(&associated));
+        assert!(!can_load_vision(&associated));
+    }
+
+    #[test]
+    fn frozen_qwen38_generation_config_uses_both_official_stop_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../docs/reference/qwen38/generation_config.json"
+            )),
+        )
+        .unwrap();
+
+        assert_eq!(eos_token_ids(dir.path()), vec![248046, 248044]);
+    }
 
     #[test]
     fn prompt_opens_thinking_matches_template_modes() {
@@ -1849,6 +2965,35 @@ mod tests {
         for (g, w) in got.iter().zip(&want) {
             assert!((g - w).abs() < 1e-5, "merged timestamp {g} vs HF {w}");
         }
+    }
+
+    #[test]
+    fn invalid_video_timestamps_fail_before_prompt_rendering() {
+        let frame = || ImageRef::new(1, 1, vec![0, 0, 0]).unwrap();
+        for timestamps in [vec![0.0, f32::NAN], vec![0.5, 0.25], vec![-0.1, 0.0]] {
+            let video = VideoRef {
+                frames: vec![frame(), frame()],
+                timestamps,
+            };
+            let messages = vec![Message {
+                role: Role::User,
+                content: vec![Content::Video(video)],
+                thinking: None,
+                tool_calls: Vec::new(),
+            }];
+            let error = substitute_vision_placeholders(&messages, 2)
+                .expect_err("invalid timestamp sequence accepted");
+            assert!(error.to_string().contains("timestamp"));
+        }
+    }
+
+    #[test]
+    fn expanded_media_tokens_count_against_context_window() {
+        validate_context_window(64, 48, 16).unwrap();
+        let error = validate_context_window(64, 49, 16)
+            .expect_err("expanded prompt over context was accepted");
+        assert!(error.to_string().contains("expanded prompt (49 tokens)"));
+        assert!(error.to_string().contains("context window 64"));
     }
 
     /// **The per-frame `<|video_pad|>` expansion matches the HF id stream.** Tokenizing the reference
