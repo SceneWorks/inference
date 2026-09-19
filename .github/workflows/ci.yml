@@ -61,6 +61,7 @@ jobs:
             $cmd = Join-Path $root "$name.cmd"
             @"
           @echo off
+          setlocal EnableDelayedExpansion
           call "%VCVARS%"
           if errorlevel 1 exit /b 90
           cd /d "$tree"
@@ -72,9 +73,13 @@ jobs:
           set PROBE_FAILED=0
           for %%R in (1 2) do (
             cargo test --locked -p candle-llm --features cuda --test architecture_forward every_architecture_forward_is_bit_identical_to_the_base_branch -- --exact --nocapture > "$logs\$name-original-%%R.log" 2>&1
-            if errorlevel 1 set PROBE_FAILED=1
+            set RESULT=!errorlevel!
+            echo !RESULT!>> "$logs\$name-exit-codes.txt"
+            if not !RESULT!==0 set PROBE_FAILED=1
             cargo test --locked -p candle-llm --features cuda --test architecture_forward diagnostic_full_forward_bits -- --exact --nocapture > "$logs\$name-bits-%%R.log" 2>&1
-            if errorlevel 1 set PROBE_FAILED=1
+            set RESULT=!errorlevel!
+            echo !RESULT!>> "$logs\$name-exit-codes.txt"
+            if not !RESULT!==0 set PROBE_FAILED=1
           )
           exit /b %PROBE_FAILED%
           "@ | Set-Content $cmd
