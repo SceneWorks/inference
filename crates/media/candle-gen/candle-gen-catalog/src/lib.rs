@@ -5972,21 +5972,26 @@ mod tests {
     #[test]
     fn krea_cuda_memory_contract_is_not_exposed_by_the_cpu_catalog() {
         let registry = super::provider_registry().expect("catalog");
+        let registered = registry
+            .memory_strategy_registrations()
+            .any(|registration| registration.provider_id == "krea_2_turbo");
+        assert_eq!(registered, cfg!(feature = "cuda"));
+    }
+
+    #[test]
+    fn krea_catalog_rejects_missing_assets_when_cuda_contract_is_registered() {
+        let registry = super::provider_registry().expect("catalog");
+        let directory = tempfile::tempdir().unwrap();
         let spec = super::media::gen_core::LoadSpec::new(
-            super::media::gen_core::WeightsSource::Dir("/nonexistent".into()),
+            super::media::gen_core::WeightsSource::Dir(directory.path().join("missing")),
         );
-        let contract = registry
-            .memory_strategy_contract("krea_2_turbo", &spec)
-            .expect("known Krea generator");
+        let contract = registry.memory_strategy_contract("krea_2_turbo", &spec);
         #[cfg(feature = "cuda")]
         assert!(
-            contract.is_some(),
-            "CUDA catalog must expose the Krea CUDA contract"
+            contract.is_err(),
+            "CUDA production admission requires real assets"
         );
         #[cfg(not(feature = "cuda"))]
-        assert!(
-            contract.is_none(),
-            "CPU catalog must leave Krea on its compatibility default"
-        );
+        assert!(contract.expect("known Krea generator").is_none());
     }
 }
