@@ -2039,6 +2039,9 @@ fn the_render_seam_folds_the_staged_adapter_onto_the_dit() {
         .unwrap()
         .forward(&adapted_x)
         .unwrap();
+    // Separate loads can own distinct CUDA contexts even on the same GPU.
+    let y0 = y0.to_device(&Device::Cpu).unwrap();
+    let y1 = y1.to_device(&Device::Cpu).unwrap();
     let residual = max_abs(&(y1 - y0).unwrap());
     assert!(
         residual > 1e-4,

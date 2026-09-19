@@ -50,7 +50,7 @@ const DECODE_STEPS: [i32; 2] = [6, 7];
 // Rust 1.96.0 is pinned in the repository; provenance records compiler/dependencies and both repeats.
 fn golden_file(os: &str, arch: &str, target_env: &str, cuda: bool) -> &'static str {
     match (os, arch, target_env, cuda) {
-        ("windows", "x86_64", "msvc", true) => "forward_candle_windows_x86_64_msvc_cuda.json",
+        ("windows", "x86_64", "msvc", true) => "forward_candle_x86_64-pc-windows-msvc_cuda.json",
         _ => "forward_candle.json",
     }
 }
@@ -84,8 +84,10 @@ fn assert_forward_equal(name: &str, got: &[f32], want: &[f32]) {
 
 #[test]
 fn windows_golden_selection_is_limited_to_the_measured_configuration() {
-    let windows = "forward_candle_windows_x86_64_msvc_cuda.json";
-    assert_eq!(golden_file("windows", "x86_64", "msvc", true), windows);
+    assert_eq!(
+        golden_file("windows", "x86_64", "msvc", true),
+        "forward_candle_x86_64-pc-windows-msvc_cuda.json"
+    );
     for (os, arch, env, cuda) in [
         ("windows", "x86_64", "msvc", false),
         ("windows", "aarch64", "msvc", true),
@@ -100,7 +102,7 @@ fn windows_golden_selection_is_limited_to_the_measured_configuration() {
 #[test]
 fn windows_golden_rejects_a_single_changed_bit_in_every_architecture() {
     let golden: Value = serde_json::from_str(include_str!(
-        "../../testdata/architectures/forward_candle_windows_x86_64_msvc_cuda.json"
+        "../../testdata/architectures/forward_candle_x86_64-pc-windows-msvc_cuda.json"
     ))
     .unwrap();
     for case in cases() {

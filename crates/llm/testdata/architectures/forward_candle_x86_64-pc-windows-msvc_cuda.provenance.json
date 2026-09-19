@@ -60,7 +60,7 @@
   },
   "dependency_package_versions_identical": true,
   "dependency_package_version_count": 151,
-  "golden_file": "forward_candle_windows_x86_64_msvc_cuda.json",
+  "golden_file": "forward_candle_x86_64-pc-windows-msvc_cuda.json",
   "golden_file_sha256": "76734fcc1ee37dcdc46ff761e5fb0aca06bc76dd3b7f2b6d22a69175d9d1accd",
   "target": "x86_64-pc-windows-msvc",
   "source_toolchain_pin": "1.96.0",
