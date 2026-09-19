@@ -31,20 +31,34 @@ jobs:
           test "$(hostname -s)" = Michael-MBP
           grep -Fx 'Xcode 27.0' "$evidence/xcode-version.txt"
           grep -Fx 'Build version 27A266a' "$evidence/xcode-version.txt"
+          # Apple's xcrun help documents --no-cache and --kill-cache. Only invalidate
+          # lookup entries when bypassing them proves the installed tool can run.
+          xcodebuild -showComponent MetalToolchain -json > "$evidence/component-before.json" 2>&1 || true
+          xcrun --find metal > "$evidence/metal-path.txt" 2>&1 || true
+          hdiutil info > "$evidence/mounted-images.txt"
           if xcrun metal --version > "$evidence/metal-before.txt" 2>&1; then
             cat "$evidence/metal-before.txt"
-            echo 'Metal Toolchain already available; no provisioning performed.'
+            echo 'Metal Toolchain already available; no activation performed.'
+          elif xcrun --no-cache metal --version > "$evidence/metal-no-cache.txt" 2>&1; then
+            cat "$evidence/metal-no-cache.txt"
+            xcrun --kill-cache
           else
-            cat "$evidence/metal-before.txt"
+            cat "$evidence/metal-before.txt" "$evidence/metal-no-cache.txt"
             grep -F 'missing Metal Toolchain' "$evidence/metal-before.txt"
-            # Conservative 15 GiB headroom on each relevant filesystem for download/unpack.
-            # Do not delete caches or change the selected Xcode to obtain space.
+            # Download completed in run35458077207. Apple documents importing a
+            # downloaded component; use the installed xcodebuild help's -importPath syntax.
+            asset='/System/Library/AssetsV2/com_apple_MobileAsset_MetalToolchain/389a215aea89fda945178f9fb8bcdc6aa0e20570.asset/AssetData/Restore/022-20184-410.dmg'
+            test -r "$asset"
+            ls -l "$asset"
+            xcodebuild -help > "$evidence/xcodebuild-help.txt" 2>&1
+            grep -F -- '-importComponent <componenttype> -importPath <bundlepath>' "$evidence/xcodebuild-help.txt"
             for volume_path in "$developer_dir" "$HOME" "$RUNNER_TEMP"; do
               free_kib="$(df -Pk "$volume_path" | awk 'NR == 2 { print $4 }')"
               case "$free_kib" in ''|*[!0-9]*) echo 'Cannot establish free disk'; exit 1;; esac
               test "$free_kib" -ge 15728640
             done
-            xcodebuild -downloadComponent MetalToolchain < /dev/null
+            xcodebuild -importComponent MetalToolchain -importPath "$asset" < /dev/null
+            xcodebuild -showComponent MetalToolchain -json > "$evidence/component-after.json" 2>&1
           fi
           # No compiler invocation, model load, or GPU execution: version query only.
           xcrun metal --version | tee "$evidence/metal-after.txt"
