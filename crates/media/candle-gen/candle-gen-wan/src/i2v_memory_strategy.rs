@@ -347,11 +347,8 @@ fn a14b_weights_free_contract(
     spec: &LoadSpec,
     provider_id: &'static str,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
-    let route = a14b_route(provider_id)?;
-    let mut contract =
-        gen_core::wan_i2v_memory::weights_free_contract(provider_id, WanI2vBackend::Candle, spec)?;
-    contract.architecture_facts = architecture_facts(route);
-    Ok(contract)
+    a14b_route(provider_id)?;
+    gen_core::wan_i2v_memory::weights_free_contract(provider_id, WanI2vBackend::Candle, spec)
 }
 
 fn a14b_tier(
@@ -630,6 +627,28 @@ pub fn selected_offload_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a14b_surface_has_no_axes_until_snapshot_admission() {
+        use gen_core::wan_i2v_memory::WanI2vRoute;
+
+        let missing = tempfile::tempdir().unwrap();
+        let spec = LoadSpec::new(gen_core::WeightsSource::Dir(missing.path().join("missing")));
+        for route in [WanI2vRoute::T2v14b, WanI2vRoute::I2v14b] {
+            let surface = a14b_weights_free_contract(&spec, route.provider_id()).unwrap();
+            assert_eq!(
+                surface.architecture_facts,
+                gen_core::MemoryArchitectureFacts::default()
+            );
+            assert!(a14b_contract(&spec, route.provider_id()).is_err());
+
+            let snapshot = tempfile::tempdir().unwrap();
+            let admitted = gen_core_testkit::wan_i2v::write_candle_snapshot(snapshot.path(), route);
+            let contract = a14b_contract(&admitted, route.provider_id()).unwrap();
+            assert_eq!(contract.architecture_facts, architecture_facts(route));
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
+        }
+    }
 
     /// AC (SC-22662, review follow-up): the Candle I2V routes publish their own trunk and VAE axes
     /// rather than `MemoryArchitectureFacts::default()`. `gen_core::wan_i2v_memory` has no model
