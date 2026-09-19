@@ -167,6 +167,7 @@ impl ChatRequest {
             thinking: Default::default(),
             reasoning_effort: None,
             preserve_thinking: None,
+            mtp: Default::default(),
             tools: Vec::new(),
             stop: self.stop.map(StringOrVec::into_vec).unwrap_or_default(),
             cancel: Default::default(),

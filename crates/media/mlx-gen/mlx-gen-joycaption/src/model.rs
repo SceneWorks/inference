@@ -56,6 +56,7 @@ pub fn load_joycaption(spec: &LoadSpec) -> Result<JoyCaption> {
         .load_for_model_with(
             &CoreLoadSpec {
                 source: root.to_string_lossy().into_owned(),
+                projector_source: None,
                 quantize: None,
             },
             &ModelRequirements::default().with_vision(),
