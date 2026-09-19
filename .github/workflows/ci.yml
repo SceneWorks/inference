@@ -20,9 +20,34 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
           fetch-depth: 0
+      - name: Preserve setup evidence and select Git Bash
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $logs = Join-Path $env:GITHUB_WORKSPACE 'diagnostic-artifacts'
+          New-Item -ItemType Directory -Force $logs | Out-Null
+          Start-Transcript -Path "$logs/setup.log"
+          try {
+            $bash = 'C:\Program Files\Git\bin\bash.exe'
+            if (-not (Test-Path $bash)) { throw "Required Git Bash missing: $bash" }
+            & $bash --version
+            if ($LASTEXITCODE -ne 0) { throw 'Git Bash failed' }
+            'C:\Program Files\Git\bin' | Out-File $env:GITHUB_PATH -Append -Encoding utf8
+            'Required Rust: 1.96.0 (ac68faa20 2026-05-25), matching original CUDA run 35450123941'
+          } finally { Stop-Transcript }
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        id: rust_setup
         with:
           toolchain: 1.96.0
+      - name: Preserve toolchain setup outcome
+        if: always()
+        shell: pwsh
+        run: |
+          $logs = Join-Path $env:GITHUB_WORKSPACE 'diagnostic-artifacts'
+          New-Item -ItemType Directory -Force $logs | Out-Null
+          'rust_setup=${{ steps.rust_setup.outcome }}' | Set-Content "$logs/toolchain-setup.txt"
+          & rustc +1.96.0 -Vv 2>&1 | Out-File "$logs/toolchain-setup.txt" -Append
+          if ($LASTEXITCODE -ne 0) { throw 'Required compiler not available' }
       - name: Compare immutable baseline and candidate (CPU tensors only)
         shell: pwsh
         run: |
