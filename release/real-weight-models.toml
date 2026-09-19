@@ -2358,3 +2358,45 @@ expected_files = [
   "q4/transformer_ref/config.json",
   "q4/transformer_ref/diffusion_pytorch_model.safetensors.index.json",
 ]
+
+# SC-23935: explicit terminal profile only; not the scheduled LLM sweep.
+
+[[models]]
+key = "bonsai-qwen38-parent"
+repository = "Qwen/Qwen3.8-27B"
+revision = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["qwen38-bonsai"]
+environment = ["BONSAI_QWEN38_SNAPSHOT"]
+expected_files = ["config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "generation_config.json", "preprocessor_config.json", "video_preprocessor_config.json", "model.safetensors.index.json"]
+
+[[models]]
+key = "bonsai-mlx-2bit"
+repository = "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit"
+revision = "3f926b415992eaa2ae9dd7b573706494d6bbf787"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["qwen38-bonsai"]
+environment = ["BONSAI_MLX_SNAPSHOT"]
+expected_files = ["config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "generation_config.json", "preprocessor_config.json", "hadamard.json", "PACK-RUNTIME.md", "model.safetensors", "LICENSE", "NOTICE.txt", "runtime/LICENSE"]
+
+[[models]]
+key = "bonsai-gguf"
+repository = "prism-ml/Ternary-Bonsai-2-27B-gguf"
+revision = "6ed5e12bf84b7a63069882c91dd9e9218647d17b"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["qwen38-bonsai"]
+environment = ["BONSAI_GGUF_SNAPSHOT"]
+expected_files = ["Ternary-Bonsai-2-27B-PQ2_0.gguf", "Ternary-Bonsai-2-27B-PTQ1_0.gguf", "Ternary-Bonsai-2-27B-mmproj-BF16.gguf", "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf", "LICENSE", "NOTICE.txt"]
+
+[[models]]
+key = "bonsai-qwen3vl-baseline"
+repository = "Qwen/Qwen3-VL-8B-Instruct"
+revision = "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["qwen38-bonsai"]
+environment = ["BONSAI_BASELINE_SNAPSHOT"]
+expected_files = ["config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.json", "generation_config.json", "preprocessor_config.json", "video_preprocessor_config.json", "model.safetensors.index.json"]

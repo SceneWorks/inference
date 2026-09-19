@@ -83,6 +83,9 @@ mod qwen35_tools;
 #[path = "qwen35_vision.rs"]
 mod qwen35_vision;
 
+#[path = "qwen38_bonsai.rs"]
+mod qwen38_bonsai;
+
 #[path = "qwen3vl.rs"]
 mod qwen3vl;
 
