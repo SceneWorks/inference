@@ -3766,6 +3766,9 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         ]
         self.assertEqual(preflight_input["type"], "boolean")
         self.assertFalse(preflight_input["default"])
+        provision_input = workflow[True]["workflow_dispatch"]["inputs"]["qwen38_bonsai_provision_only"]
+        self.assertEqual(provision_input["type"], "boolean")
+        self.assertFalse(provision_input["default"])
         jobs = workflow["jobs"]
         mlx = jobs["qwen38-bonsai-mlx"]
         candle = jobs["qwen38-bonsai-candle"]
@@ -3826,11 +3829,11 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             self.assertIn(case_id, candle["env"]["QWEN38_ACCEPTANCE_CASES"])
         self.assertLess(
             mlx_commands.index("qwen38_bonsai_terminal.py preflight"),
-            mlx_commands.index("ensure_model_snapshot.py"),
+            mlx_commands.index("qwen38_bonsai_terminal.py provision-assets"),
         )
         self.assertLess(
             candle_commands.index("qwen38_bonsai_terminal.py preflight"),
-            candle_commands.index("ensure_model_snapshot.py"),
+            candle_commands.index("qwen38_bonsai_terminal.py provision-assets"),
         )
         cuda_oracle = next(
             step
@@ -3850,19 +3853,37 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertNotIn("continue-on-error", cuda_oracle)
         self.assertLess(
             candle_commands.index(cuda_oracle_command),
-            candle_commands.index("ensure_model_snapshot.py"),
+            candle_commands.index("qwen38_bonsai_terminal.py provision-assets"),
         )
         self.assertIn("--load-profile mlx-unified", mlx_commands)
         self.assertIn("--load-profile candle-packed-cuda", candle_commands)
         self.assertIn("qwen38_bonsai_terminal.py matrix-status", candle_commands)
         self.assertIn("--candle-device auto", candle_commands)
         self.assertIn("--candle-device cpu", candle_commands)
-        self.assertEqual((mlx_commands + candle_commands).count("--preflight"), 19)
+        self.assertEqual((mlx_commands + candle_commands).count("--preflight "), 19)
         self.assertEqual(candle_commands.count("--reservation-token"), 16)
         self.assertIn("reserve-gpu --gpu-index 0", candle_commands)
         self.assertIn("release-gpu --gpu-index 0", candle_commands)
         self.assertIn('matrix-status --runtime-sha "%GITHUB_SHA%"', candle_commands)
         self.assertIn('verify-matrix-seal --runtime-sha "%GITHUB_SHA%"', candle_commands)
+
+        for job in (mlx, candle):
+            steps = job["steps"]
+            phase = next(step for step in steps if step.get("name") == "Validate exclusive qualification phase")
+            self.assertIn("--preflight-only", phase["run"])
+            self.assertIn("--provision-only", phase["run"])
+            provision = next(step for step in steps if " provision-assets " in step.get("run", ""))
+            self.assertIn("inputs.qwen38_bonsai_preflight_only != true", provision["if"])
+            self.assertNotIn("continue-on-error", provision)
+            for step in steps:
+                name = step.get("name", "")
+                if name.startswith(("Build one native", "Run MLX", "Run Candle")) or "matrix-status" in step.get("run", ""):
+                    self.assertIn("inputs.qwen38_bonsai_provision_only != true", step.get("if", ""), name)
+                    self.assertLess(steps.index(provision), steps.index(step), name)
+            metadata = next(step for step in steps if " qualify-snapshots " in step.get("run", ""))
+            self.assertIn("snapshot-metadata-before.json", metadata["run"])
+            self.assertLess(steps.index(phase), steps.index(metadata))
+        self.assertIn("inputs.qwen38_bonsai_provision_only != true", cuda_oracle["if"])
 
         # Expanding a leading ~/ is metadata preparation, not model materialization. It must
         # also precede qualification in preflight-only runs so the inspected path is real.
@@ -3875,7 +3896,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             for step in job["steps"]:
                 name = step.get("name", "")
                 is_materialization = name.startswith(
-                    ("Install pinned snapshot", "Verify immutable", "Build one native", "Run MLX", "Run Candle")
+                    ("Install pinned snapshot", "Provision admitted", "Build one native", "Run MLX", "Run Candle")
                 ) or step.get("uses", "").startswith("actions/download-artifact")
                 if is_materialization:
                     self.assertIn(

@@ -32,6 +32,12 @@ except ImportError:
     from verify_model_snapshot import load_model, snapshot_inventory, verify_snapshot
 
 
+try:
+    from scripts.release import qwen38_bonsai_assets as assets
+except ImportError:
+    import qwen38_bonsai_assets as assets
+
+
 SCHEMA_VERSION = 1
 SUITE = "qwen38-bonsai-native-v1"
 CUDA_DEVICE_INDEX = 0
@@ -658,6 +664,8 @@ def run(args: argparse.Namespace) -> int:
     validate_variant_paths(args, model)
     verify_snapshot(model, args.snapshot)
     before = snapshot_inventory(model, args.snapshot)
+    if model["key"].startswith("bonsai-"):
+        assets.verify_inventory(model, before)
     measured_sizes = artifact_sizes(args.model_path, args.projector_path)
     pinned_sizes = pinned_admission_sizes(model, args.language_variant, args.vision_variant)
     if any(measured_sizes[key] != pinned_sizes[key] for key in pinned_sizes if key != "auxiliary_bytes"):
@@ -1179,10 +1187,18 @@ def matrix_status(args: argparse.Namespace) -> int:
             if (
                 metadata.get("schema_version") != SCHEMA_VERSION
                 or metadata.get("all_metadata_qualified") is not True
-                or "no payload hashing" not in metadata.get("scope", "")
+                or metadata.get("publisher_verified_all") is not True
+                or metadata.get("runtime_sha") != expected_runtime_sha
+                or metadata.get("publisher_closure_sha256") != sha256(assets.DEFAULT_CLOSURE)
             ):
                 raise ValueError("platform snapshot metadata is incomplete or malformed")
-            sealed_files.append((index, metadata_path))
+            provision_path = root / "provision-report.json"
+            provision = json.loads(provision_path.read_text(encoding="utf-8"))
+            if (provision.get("complete") is not True or provision.get("runtime_sha") != expected_runtime_sha
+                or provision.get("publisher_closure_sha256") != sha256(assets.DEFAULT_CLOSURE)
+                or provision.get("model_execution_performed") is not False):
+                raise ValueError("platform publisher verification is incomplete or unbound")
+            sealed_files.extend(((index, metadata_path), (index, provision_path)))
     cuda_reservation_hashes: set[str] = set()
     for cell in cells:
         cell_id = cell["id"]
@@ -1477,7 +1493,8 @@ def verify_matrix_seal(args: argparse.Namespace) -> int:
     }
     if spec.get("acceptance_contract") == FULL_ACCEPTANCE_CONTRACT:
         expected_root_files.update(
-            (index, "snapshot-metadata.json") for index in range(len(roots))
+            (index, name) for index in range(len(roots))
+            for name in ("snapshot-metadata.json", "provision-report.json")
         )
     for cell in spec["cells"]:
         locations = [
@@ -1765,6 +1782,132 @@ def qualify_snapshots(args: argparse.Namespace) -> int:
     return 0 if record["all_metadata_qualified"] else 1
 
 
+def validate_phase(args: argparse.Namespace) -> int:
+    if args.preflight_only == "true" and args.provision_only == "true":
+        raise ValueError("preflight-only and provision-only are mutually exclusive")
+    return 0
+
+
+def provision_assets(args: argparse.Namespace) -> int:
+    """Admit each pinned model before downloading, verify publisher bytes, then refresh metadata."""
+    runtime_sha = checked_sha(args.runtime_sha, "runtime SHA")
+    source_identity(runtime_sha, False)
+    spec = json.loads(args.matrix.read_text(encoding="utf-8"))
+    validate_full_acceptance_contract(spec)
+    backend = "mlx" if args.platform == "macos" else "candle"
+    cells = [cell for cell in spec["cells"] if cell["backend"] == backend]
+    plans = {}
+    # Validate the complete platform admission/configuration plan before any network or mutation.
+    for cell in cells:
+        path = args.evidence_root / f"{cell['id']}-preflight.json"
+        preflight = json.loads(path.read_text(encoding="utf-8"))
+        model = load_model(args.manifest, cell["model_key"])
+        validate_preflight_record(preflight, model=model, load_profile=cell["load_profile"],
+                                  language_variant=cell.get("language_variant"), vision_variant=cell.get("vision_variant"))
+        plan = plans.setdefault(cell["model_key"], {"model": model, "cells": [], "preflights": []})
+        if preflight["admitted"]:
+            plan["cells"].append(cell)
+            plan["preflights"].append((path, preflight))
+    for plan in plans.values():
+        model = plan["model"]
+        environment = model["environment"][0]
+        configured = os.environ.get(environment, "").strip()
+        if plan["cells"] and not configured:
+            raise ValueError(f"admitted model has no configured snapshot: {environment}")
+        plan["snapshot"] = lexical_absolute(Path(configured)) if configured else None
+        plan["frozen"] = assets.frozen_model(model, args.closure)
+    # Account for every planned missing file on each destination filesystem before the first
+    # transfer. One largest-file staging reserve is explicit, not a measured disk peak.
+    disks = {}
+    for plan in plans.values():
+        if not plan["cells"]:
+            continue
+        snapshot = plan["snapshot"]
+        model = plan["model"]
+        if (snapshot.name != model["revision"] or snapshot.parent.name != "snapshots"
+            or snapshot.parent.parent.name != "models--" + model["repository"].replace("/", "--")):
+            raise ValueError("provisioning requires the exact publisher repository/revision HF cache path")
+        existing = snapshot
+        while not existing.exists():
+            existing = existing.parent
+        disk = disks.setdefault(existing.stat().st_dev, {
+            "existing_path": str(existing), "missing_payload_bytes": 0,
+            "staging_reserve_bytes": 0, "available_bytes": shutil.disk_usage(existing).free,
+        })
+        for item in assets.selected_files(plan["frozen"], plan["cells"]):
+            if not (snapshot / item["path"]).exists():
+                disk["missing_payload_bytes"] += item["bytes"]
+                disk["staging_reserve_bytes"] = max(disk["staging_reserve_bytes"], item["bytes"])
+    for disk in disks.values():
+        disk["required_available_bytes"] = disk["missing_payload_bytes"] + disk["staging_reserve_bytes"]
+        disk["admitted"] = disk["available_bytes"] >= disk["required_available_bytes"]
+    write_new(args.evidence_root / "disk-admission.json", {
+        "schema_version": 1, "runtime_sha": runtime_sha,
+        "basis": "sum of selected missing publisher payload sizes plus one largest-file staging reserve",
+        "is_measured_peak": False, "filesystems": list(disks.values()),
+    })
+    if any(not disk["admitted"] for disk in disks.values()):
+        raise ValueError("insufficient disk capacity for the complete admitted provisioning plan")
+    rows = []
+    for key, plan in plans.items():
+        row = {"model_key": key, "status": "not_admitted", "files": [],
+               "preflight_sha256": [sha256(path) for path, _ in plan["preflights"]]}
+        if plan["cells"]:
+            try:
+                # Recheck current capacity immediately before fetching; never use a rejected
+                # preflight or another GPU's free bytes to authorize asset materialization.
+                _, available, reason = physical_memory()
+                viable = []
+                for cell, (_, preflight) in zip(plan["cells"], plan["preflights"]):
+                    if available is None or available < preflight["host_required_available_bytes"]:
+                        continue
+                    if cell["device"] == "cuda":
+                        reservation = load_reservation(Path(os.environ["BONSAI_GPU_RESERVATION"]),
+                                                       os.environ["BONSAI_RESERVATION_TOKEN"], CUDA_DEVICE_INDEX)
+                        if reservation["token_sha256"] != preflight["reservation_token_sha256"]:
+                            raise ValueError("provision reservation differs from admission")
+                        current = current_cuda_admission(gpu_index=CUDA_DEVICE_INDEX,
+                            required_bytes=preflight["gpu_required_available_bytes"],
+                            expected_uuid=preflight["selected_gpu_uuid"])
+                        if not current["admitted"]:
+                            continue
+                    viable.append(cell)
+                if not viable:
+                    raise ValueError(f"no selected model cell remains admitted before fetch: {reason}")
+                files = assets.selected_files(plan["frozen"], viable)
+                # This import occurs only after admission; metadata-only qualification never
+                # imports a network client, downloads an asset, or creates a model process.
+                from huggingface_hub import hf_hub_download
+                row["files"] = assets.provision_snapshot(plan["model"], plan["snapshot"], files, hf_hub_download)
+                row["status"] = "publisher_verified"
+                row["full_snapshot_verified"] = len(row["files"]) == len(plan["frozen"]["files"])
+                row["admitted_cells"] = [cell["id"] for cell in viable]
+            except Exception as error:
+                row.update(status="failed", error=str(error))
+        rows.append(row)
+    metadata_path = args.evidence_root / "snapshot-metadata.json"
+    qualify_snapshots(argparse.Namespace(platform=args.platform, manifest=args.manifest,
+        binding=[f"{plan['model']['environment'][0]}={key}" for key, plan in plans.items()],
+        output=metadata_path))
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    complete = all(row["status"] == "publisher_verified" and row.get("full_snapshot_verified") is True for row in rows) and metadata["all_metadata_qualified"]
+    metadata.update(scope="post-provision publisher Git/LFS hash verification; no model load",
+                    runtime_sha=runtime_sha, publisher_closure_sha256=sha256(args.closure),
+                    publisher_verified_all=complete)
+    for binding in metadata["snapshots"]:
+        row = next(row for row in rows if row["model_key"] == binding["model_key"])
+        binding["artifact_identity_verified"] = row.get("full_snapshot_verified") is True
+    # The output was created exclusively by this invocation. Replace only our just-written
+    # metadata record with its publisher-verification fields; no cached model files are rewritten.
+    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_new(args.evidence_root / "provision-report.json", {
+        "schema_version": 1, "runtime_sha": runtime_sha,
+        "publisher_closure_sha256": sha256(args.closure), "complete": complete,
+        "models": rows, "model_execution_performed": False,
+    })
+    return 0 if complete else 1
+
+
 def validate_hardware_record(path: Path) -> dict[str, Any]:
     record = json.loads(path.read_text(encoding="utf-8"))
     if record.get("schema_version") != 1:
@@ -1859,6 +2002,18 @@ def parser() -> argparse.ArgumentParser:
     admit.add_argument("--reservation-token")
     admit.add_argument("--output", type=Path, required=True)
     admit.set_defaults(func=preflight)
+    phase = sub.add_parser("validate-phase")
+    phase.add_argument("--preflight-only", choices=("true", "false"), required=True)
+    phase.add_argument("--provision-only", choices=("true", "false"), required=True)
+    phase.set_defaults(func=validate_phase)
+    provision = sub.add_parser("provision-assets")
+    provision.add_argument("--platform", choices=("macos", "windows"), required=True)
+    provision.add_argument("--runtime-sha", required=True)
+    provision.add_argument("--evidence-root", type=Path, required=True)
+    provision.add_argument("--matrix", type=Path, default=Path("release/qwen38-bonsai-matrix.json"))
+    provision.add_argument("--manifest", type=Path, default=Path("release/real-weight-models.toml"))
+    provision.add_argument("--closure", type=Path, default=assets.DEFAULT_CLOSURE)
+    provision.set_defaults(func=provision_assets)
     hw = sub.add_parser("hardware")
     hw.add_argument("--output", type=Path, required=True)
     hw.set_defaults(func=hardware)
