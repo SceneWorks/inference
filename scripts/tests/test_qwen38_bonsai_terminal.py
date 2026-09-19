@@ -452,6 +452,66 @@ class TerminalEvidenceTests(unittest.TestCase):
                 }
             )
 
+    def test_macos_memory_header_and_overlapping_purgeable_pages(self) -> None:
+        output = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                                  1024.
+Pages active:                                4096.
+Pages inactive:                              2048.
+Pages speculative:                            512.
+Pages purgeable:                             1000.
+"Translation faults":                      999999.
+"""
+        with mock.patch.object(terminal.sys, "platform", "darwin"), mock.patch.object(
+            terminal.subprocess, "check_output", side_effect=[str(1024**3), "16384", output]
+        ):
+            total, available, reason = terminal.physical_memory()
+        self.assertEqual(total, 1024**3)
+        self.assertEqual(available, (1024 + 2048 + 512) * 16384)
+        self.assertIsNone(reason)
+        for malformed in (
+            output.replace("1024.", "broken."),
+            output.replace("1024.", "-1."),
+            output.replace("Pages speculative:", "Unknown counter:"),
+            output + "Pages free: 1.\n",
+            output.replace("1024.", "999999999999."),
+        ):
+            with self.subTest(output=malformed), mock.patch.object(terminal.sys, "platform", "darwin"), mock.patch.object(
+                terminal.subprocess, "check_output", side_effect=[str(1024**3), "16384", malformed]
+            ):
+                total, available, reason = terminal.physical_memory()
+                self.assertEqual(total, 1024**3, "retain independently known physical capacity")
+                self.assertIsNone(available)
+                self.assertIn("macOS memory query failed", reason)
+
+    def test_snapshot_candidates_are_exact_bounded_and_never_automatically_selected(self) -> None:
+        revision = "a" * 40
+        home = self.root / "home"
+        hf_home = self.root / "hf-home"
+        hub = self.root / "explicit-hub"
+        suffix = Path("models--example--fixture") / "snapshots" / revision
+        snapshot = hf_home / "hub" / suffix
+        snapshot.mkdir(parents=True)
+        (snapshot / "config.json").write_text("{}\n", encoding="utf-8")
+        manifest = self.root / "candidate-models.toml"
+        manifest.write_text(f'[[models]]\nkey="fixture"\nrepository="example/fixture"\nrevision="{revision}"\nexpected_files=["config.json"]\n', encoding="utf-8")
+        args = argparse.Namespace(binding=["MISSING_SNAPSHOT=fixture"], manifest=manifest,
+                                  platform="windows", output=self.root / "candidate-metadata.json")
+        with mock.patch.dict("os.environ", {"HF_HOME": str(hf_home), "HF_HUB_CACHE": str(hub)}, clear=True), \
+                mock.patch.object(terminal.Path, "home", return_value=home), \
+                mock.patch.object(terminal, "sha256", side_effect=AssertionError("payload hashing forbidden")), \
+                mock.patch.object(terminal.Path, "rglob", side_effect=AssertionError("recursive search forbidden")):
+            self.assertEqual(terminal.qualify_snapshots(args), 1)
+        record = json.loads(args.output.read_text(encoding="utf-8"))
+        binding = record["snapshots"][0]
+        self.assertIsNone(binding["configured_path"])
+        self.assertFalse(record["all_metadata_qualified"])
+        candidates = binding["candidate_snapshots"]
+        self.assertEqual([row["configured_path"] for row in candidates], [
+            str(home / ".cache" / "huggingface" / "hub" / suffix), str(snapshot), str(hub / suffix)
+        ])
+        self.assertEqual([row["metadata_qualified"] for row in candidates], [False, True, False])
+        self.assertTrue(all(row["artifact_identity_verified"] is False for row in candidates))
+
     def test_snapshot_metadata_qualification_is_read_only_and_revision_bound(self) -> None:
         revision = "a" * 40
         snapshot = self.root / revision

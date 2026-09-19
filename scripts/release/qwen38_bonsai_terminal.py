@@ -165,22 +165,37 @@ def physical_memory() -> tuple[int | None, int | None, str | None]:
             return int(status.total_phys), int(status.avail_phys), None
         return None, None, "GlobalMemoryStatusEx failed"
     if sys.platform == "darwin":
+        total = None
         try:
             total = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True))
             page_size = int(subprocess.check_output(["sysctl", "-n", "hw.pagesize"], text=True))
+            if total <= 0 or page_size <= 0:
+                raise ValueError("nonpositive physical memory or page size")
             output = subprocess.check_output(["vm_stat"], text=True)
+            # vm_stat's first line also has a colon, but its value is a descriptive header.
+            # Only these counters form our conservative reclaimable-memory estimate. Purgeable
+            # pages overlap active/inactive queues and must not be added a second time.
+            required = {"Pages free", "Pages inactive", "Pages speculative"}
             pages: dict[str, int] = {}
             for line in output.splitlines():
-                if ":" in line:
-                    key, value = line.split(":", 1)
-                    pages[key] = int(value.strip().rstrip("."))
-            available = page_size * sum(
-                pages.get(key, 0)
-                for key in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable")
-            )
+                if ":" not in line:
+                    continue
+                key, value = line.split(":", 1)
+                key = key.strip()
+                if key not in required:
+                    continue
+                value = value.strip().removesuffix(".")
+                if key in pages or not value.isascii() or not value.isdecimal():
+                    raise ValueError(f"invalid or duplicate vm_stat counter {key}")
+                pages[key] = int(value)
+            if pages.keys() != required:
+                raise ValueError("required vm_stat memory counters are missing")
+            available = page_size * sum(pages.values())
+            if available > total:
+                raise ValueError("vm_stat available estimate exceeds physical memory")
             return total, available, None
         except (OSError, subprocess.SubprocessError, ValueError) as error:
-            return None, None, f"macOS memory query failed: {error}"
+            return total, None, f"macOS memory query failed: {error}"
     try:
         values = {}
         for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
@@ -1605,6 +1620,7 @@ def preflight(args: argparse.Namespace) -> int:
         "gpu_required_available_bytes": gpu_required,
         "physical_memory_bytes": total,
         "available_memory_bytes": available,
+        "available_memory_basis": "free + inactive + speculative pages; conservative reclaimable estimate" if sys.platform == "darwin" else "operating-system available physical memory",
         "unavailable_reason": reason,
         "gpus": gpus,
         "compute_processes": processes,
@@ -1637,6 +1653,7 @@ def hardware(args: argparse.Namespace) -> int:
                 "processor": platform.processor(),
                 "physical_memory_bytes": total,
                 "available_memory_bytes": available,
+                "available_memory_basis": "free + inactive + speculative pages; conservative reclaimable estimate" if sys.platform == "darwin" else "operating-system available physical memory",
                 "memory_unavailable_reason": memory_reason,
             },
             "gpus": gpus,
@@ -1647,8 +1664,56 @@ def hardware(args: argparse.Namespace) -> int:
     return 0
 
 
+def snapshot_metadata(path: Path | None, model: dict[str, Any]) -> dict[str, Any]:
+    """Inspect only the manifest-named files and lightweight shard index; never hash payloads."""
+    expected_files = []
+    if path is not None and path.is_dir():
+        relatives = list(model.get("expected_files", []))
+        for relative in list(relatives):
+            index_path = path / relative
+            if relative.endswith(".index.json") and index_path.is_file():
+                index = json.loads(index_path.read_text(encoding="utf-8"))
+                for shard in sorted(set(index.get("weight_map", {}).values())):
+                    if not isinstance(shard, str) or Path(shard).is_absolute() or ".." in Path(shard).parts:
+                        raise ValueError("snapshot index contains an invalid shard path")
+                    if shard not in relatives:
+                        relatives.append(shard)
+        for relative in relatives:
+            item = path / relative
+            expected_files.append({"path": relative, "present": item.is_file(),
+                                   "bytes": item.stat().st_size if item.is_file() else None})
+    revision = path.name.lower() if path is not None else None
+    revision_matches = revision == model["revision"]
+    complete = bool(expected_files) and all(
+        item["present"] and isinstance(item["bytes"], int) and item["bytes"] > 0
+        for item in expected_files
+    )
+    return {
+        "configured_path": str(path) if path is not None else None,
+        "directory_present": bool(path is not None and path.is_dir()),
+        "revision_from_snapshot_path": revision,
+        "revision_matches": revision_matches,
+        "expected_file_metadata": expected_files,
+        "metadata_qualified": bool(path is not None and complete and revision_matches),
+        "artifact_identity_verified": False,
+    }
+
+
 def qualify_snapshots(args: argparse.Namespace) -> int:
-    """Record cheap snapshot metadata before provisioning, hashing payloads, or model loading."""
+    """Record cheap metadata at configured paths and exact pinned candidates in known HF roots."""
+    home = Path.home()
+    candidate_roots = [("HOME", home),
+                       ("default_huggingface_hub", home / ".cache" / "huggingface" / "hub")]
+    hub_roots = [candidate_roots[1]]
+    for name in ("HF_HOME", "HF_HUB_CACHE"):
+        value = os.environ.get(name)
+        if value:
+            path = lexical_absolute(Path(value))
+            candidate_roots.append((name, path))
+            if name == "HF_HOME":
+                path = path / "hub"
+                candidate_roots.append(("HF_HOME_hub", path))
+            hub_roots.append((name, path))
     bindings = []
     for value in args.binding:
         if "=" not in value:
@@ -1659,62 +1724,27 @@ def qualify_snapshots(args: argparse.Namespace) -> int:
         model = load_model(args.manifest, model_key)
         configured = os.environ.get(environment, "").strip()
         path = lexical_absolute(Path(configured)) if configured else None
-        expected_files = []
-        if path is not None and path.is_dir():
-            relatives = list(model.get("expected_files", []))
-            for relative in list(relatives):
-                index_path = path / relative
-                if relative.endswith(".index.json") and index_path.is_file():
-                    index = json.loads(index_path.read_text(encoding="utf-8"))
-                    for shard in sorted(set(index.get("weight_map", {}).values())):
-                        if not isinstance(shard, str) or Path(shard).is_absolute() or ".." in Path(shard).parts:
-                            raise ValueError("snapshot index contains an invalid shard path")
-                        if shard not in relatives:
-                            relatives.append(shard)
-            for relative in relatives:
-                item = path / relative
-                expected_files.append(
-                    {
-                        "path": relative,
-                        "present": item.is_file(),
-                        "bytes": item.stat().st_size if item.is_file() else None,
-                    }
-                )
-        revision_from_path = (
-            path.name.lower()
-            if path is not None
-            and len(path.name) == 40
-            and all(character in "0123456789abcdefABCDEF" for character in path.name)
-            else None
-        )
-        headers_present = bool(expected_files) and all(
-            item["present"] and isinstance(item["bytes"], int) and item["bytes"] > 0
-            for item in expected_files
-        )
-        revision_matches = revision_from_path == model["revision"]
-        bindings.append(
-            {
-                "environment": environment,
-                "model_key": model_key,
-                "repository": model["repository"],
-                "expected_revision": model["revision"],
-                "configured_path": str(path) if path is not None else None,
-                "directory_present": bool(path is not None and path.is_dir()),
-                "revision_from_snapshot_path": revision_from_path,
-                "revision_matches": revision_matches,
-                "expected_file_metadata": expected_files,
-                "metadata_qualified": bool(path is not None and headers_present and revision_matches),
-            }
-        )
-    home = Path.home()
-    candidate_roots = [
-        ("HOME", home),
-        ("default_huggingface_hub", home / ".cache" / "huggingface" / "hub"),
-    ]
-    for name in ("HF_HOME", "HF_HUB_CACHE"):
-        value = os.environ.get(name)
-        if value:
-            candidate_roots.append((name, lexical_absolute(Path(value))))
+        repository_parts = model["repository"].split("/")
+        if len(repository_parts) != 2 or any(part in ("", ".", "..") or "\\" in part for part in repository_parts):
+            raise ValueError("manifest repository must be an owner/name pair")
+        suffix = Path("models--" + "--".join(repository_parts)) / "snapshots" / model["revision"]
+        candidates = []
+        seen = set()
+        for source, hub in hub_roots:
+            candidate = hub / suffix
+            if str(candidate) in seen:
+                continue
+            seen.add(str(candidate))
+            candidates.append({"cache_root_source": source, **snapshot_metadata(candidate, model)})
+        bindings.append({
+            "environment": environment,
+            "model_key": model_key,
+            "repository": model["repository"],
+            "expected_revision": model["revision"],
+            **snapshot_metadata(path, model),
+            "candidate_snapshots": candidates,
+            "candidate_scope": "exact pinned repository/revision paths only; no recursive discovery or automatic selection",
+        })
     record = {
         "schema_version": SCHEMA_VERSION,
         "scope": "metadata-only; no payload hashing, provisioning, or model load",
