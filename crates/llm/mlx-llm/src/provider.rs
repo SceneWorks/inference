@@ -585,17 +585,7 @@ impl LlamaProvider {
                     .into(),
             ));
         }
-        let payload = core_llm::checkpoint_payload_bytes(Path::new(&spec.source))?;
-        let projector = spec
-            .projector_source
-            .as_ref()
-            .map(|p| core_llm::checkpoint_payload_bytes(Path::new(p)))
-            .transpose()?
-            .unwrap_or(0);
-        let required = payload
-            .checked_mul(2)
-            .and_then(|v| v.checked_add(projector.checked_mul(4)?))
-            .ok_or_else(|| CoreError::Load("load memory estimate overflow".into()))?;
+        let required = crate::load_memory::required_bytes(spec)?;
         let available = core_llm::effective_memory_budget(
             core_llm::available_host_memory_bytes(),
             core_llm::operational_memory_override()?,

@@ -14,12 +14,32 @@ own context; host RAM is never substituted for VRAM. Load admission checks host 
 CUDA device capacity. Request estimates apply to *additional* request memory against current free
 capacity, so loaded weights are not charged twice.
 
-Load upper bounds use stored checkpoint payload sizes without reading weights. Dense Candle CPU
-reserves three times the payload for source tensors plus conversion; packed Candle and MLX reserve
-two copies for staging/conversion. CUDA device load reserves the payload plus 25 percent temporary
-space. External projectors reserve four times their payload for dense conversion. These conservative
-bounds can reject a load that a more specialized streaming loader could fit; they do not silently
-assume that such a loader exists. Packed language weights are not priced as a dense 27B tensor.
+Load upper bounds use checkpoint headers without evaluating tensor payloads. Dense Candle CPU
+reserves three times stored payload for source tensors plus conversion; packed Candle reserves two
+copies. CUDA device load reserves payload plus 25 percent temporary space. Candle external
+projectors reserve four times their stored payload.
+
+MLX safetensors follow a different allocation path. In the pinned mlx-rs dependency, upstream
+`mlx/io/safetensors.cpp` creates lazy Load arrays from headers. `mlx/backend/common/load.cpp`
+allocates the output buffer and reads directly into it; the Metal allocator uses
+`ResourceStorageModeShared`. `mlx/ops.cpp::astype` returns the same array when its dtype already
+matches. Rust `Weights` and model clones share array handles. Thus BF16 Qwen language weights and
+vision weights do not need separate full host and GPU copies.
+
+`mlx-llm/src/load_memory.rs` counts the stored safetensors payload once, plus additional BF16 casts
+for non-BF16 language tensors, vector/norm intermediates and a possible vision patch transpose.
+Other architectures and explicit quantization retain the prior conservative two-copy bound.
+For GGUF it counts the source mapping, retained affine words and both intermediate/final scales,
+dense conversion arrays, and the largest per-tensor host conversion/reordering buffers. Projectors
+are priced separately from their headers because MLX decodes them to F32. This remains conservative
+when mapped source pages are reclaimed; it does not price compact language weights as dense 27B.
+
+The pinned parent safetensors bound is 55,572,906,808 bytes; Bonsai safetensors is 9,514,891,750;
+the baseline is 17,542,650,296. GGUF language bounds are 17,061,529,952 (PQ2) and 15,802,009,952
+(PTQ1), plus 2,868,438,080 for BF16 projector or 2,566,539,200 for Q8 projector. These are computed
+upper bounds, not measured residency. Terminal admission adds its separately named operational
+reserve to these bounds. The ignored `pinned_header_only_load_admission_bounds` audit can compare
+native estimates against a JSON list of pinned paths and expected bounds without loading a model.
 
 Request bounds include expanded visual tokens, eager attention scores/mask/softmax, full-length
 K/V storage, recurrent state, projection/MLP/logit buffers, MTP cache/rollback and draft-width
