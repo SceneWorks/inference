@@ -77,6 +77,7 @@ fn next_token_id(
             temperature: sampling.temperature,
             top_p: sampling.top_p,
             top_k: sampling.top_k,
+            presence_penalty: sampling.presence_penalty,
             repetition_penalty: sampling.repetition_penalty,
             repetition_context: sampling.repetition_context,
         },

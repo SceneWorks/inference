@@ -383,6 +383,7 @@ impl Qwen35VisionModel {
         &self.cfg
     }
 
+    #[cfg(test)]
     pub(crate) fn has_quantized_projections(&self) -> bool {
         self.blocks.iter().any(|block| {
             block.qkv.is_quantized()

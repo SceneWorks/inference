@@ -14,10 +14,11 @@ use candle_core::{DType, Device, Tensor};
 use core_llm::{
     AudioRef, Channel, ChatTemplate, Constraint, ConstraintDecodeTable, ConstraintKind, Content,
     Error as CoreError, FinishReason as CoreFinish, GenerationTimings, ImageRef, IncrementalDetok,
-    JinjaChatTemplate, JsonConstraint, Llama3Template, LoadSpec, Message, MtpCapabilities, MtpMode,
-    MtpStats, Quantize, ReasoningEffort, RenderOptions, Result as CoreResult, Sampling,
-    StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
-    TextLlmRequest, ThinkingSegmenter, Tokenizer, ToolCallSegmenter, Usage, VideoRef,
+    JinjaChatTemplate, JsonConstraint, Llama3Template, LoadSpec, Message, ModelSamplingDefaults,
+    MtpCapabilities, MtpMode, MtpStats, Quantize, ReasoningEffort, RenderOptions,
+    Result as CoreResult, Sampling, StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities,
+    TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter, Tokenizer,
+    ToolCallSegmenter, Usage, VideoRef,
 };
 use serde_json::Value;
 
@@ -574,6 +575,7 @@ impl LlamaProvider {
             let mut descriptor = descriptor_for_qwen35(&qcfg);
             if is_prism {
                 descriptor.family = "prism_hadamard_qwen35".into();
+                descriptor.capabilities.model_sampling_defaults = Some(bonsai_sampling_defaults());
             }
             let m = if let Some(registry) = prism.as_ref() {
                 Qwen35Model::from_prism_weights(
@@ -742,6 +744,7 @@ impl LlamaProvider {
             let qcfg = Qwen35Config::from_json(&ck.config_json).map_err(to_core)?;
             let language_hidden_size = qcfg.hidden_size as usize;
             let mut descriptor = descriptor_for_qwen35(&qcfg);
+            descriptor.capabilities.model_sampling_defaults = Some(bonsai_sampling_defaults());
             let model = Qwen35Model::from_prism_weights(
                 &ck.weights,
                 "language_model.model",
@@ -2060,8 +2063,32 @@ fn map_sampling(s: &Sampling) -> SamplingParams {
         temperature: s.temperature,
         top_p: s.top_p,
         top_k: s.top_k,
+        presence_penalty: s.presence_penalty,
         repetition_penalty: s.repetition_penalty,
         repetition_context: s.repetition_context,
+    }
+}
+
+/// Official Bonsai source presets exposed as discovery metadata. The card also explicitly sets
+/// `min_p = 0.0` in both modes; that disabled no-op needs no sampler field or runtime operator.
+fn bonsai_sampling_defaults() -> ModelSamplingDefaults {
+    ModelSamplingDefaults {
+        thinking: Sampling {
+            temperature: 1.0,
+            top_p: 0.95,
+            top_k: 20,
+            presence_penalty: 0.0,
+            repetition_penalty: 1.0,
+            repetition_context: 0,
+        },
+        non_thinking: Sampling {
+            temperature: 0.7,
+            top_p: 0.8,
+            top_k: 20,
+            presence_penalty: 1.5,
+            repetition_penalty: 1.0,
+            repetition_context: 0,
+        },
     }
 }
 
@@ -2254,11 +2281,29 @@ pub fn can_load(spec: &LoadSpec) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        can_load, can_load_vision, eos_token_ids, expand_vision_placeholders,
-        merged_frame_timestamps, prompt_opens_thinking, substitute_vision_placeholders,
-        validate_context_window, video_placeholder_text,
+        bonsai_sampling_defaults, can_load, can_load_vision, eos_token_ids,
+        expand_vision_placeholders, merged_frame_timestamps, prompt_opens_thinking,
+        substitute_vision_placeholders, validate_context_window, video_placeholder_text,
     };
     use core_llm::{Content, ImageRef, LoadSpec, Message, Role, VideoRef};
+
+    #[test]
+    fn bonsai_sampling_defaults_match_official_thinking_modes() {
+        let defaults = bonsai_sampling_defaults();
+        assert_eq!(defaults.thinking.temperature, 1.0);
+        assert_eq!(defaults.thinking.top_p, 0.95);
+        assert_eq!(defaults.thinking.top_k, 20);
+        assert_eq!(defaults.thinking.presence_penalty, 0.0);
+        assert_eq!(defaults.thinking.repetition_penalty, 1.0);
+        assert_eq!(defaults.thinking.repetition_context, 0);
+
+        assert_eq!(defaults.non_thinking.temperature, 0.7);
+        assert_eq!(defaults.non_thinking.top_p, 0.8);
+        assert_eq!(defaults.non_thinking.top_k, 20);
+        assert_eq!(defaults.non_thinking.presence_penalty, 1.5);
+        assert_eq!(defaults.non_thinking.repetition_penalty, 1.0);
+        assert_eq!(defaults.non_thinking.repetition_context, 0);
+    }
 
     #[test]
     fn prism_mlx_weightless_probe_requires_declared_embedded_vision() {

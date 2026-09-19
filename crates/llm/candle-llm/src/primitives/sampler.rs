@@ -1,14 +1,14 @@
 //! Token sampling.
 //!
 //! The Candle port of `mlx-llm`'s sampler (the union of the mlx-gen samplers): temperature + top-p +
-//! top-k + repetition penalty, with greedy as the default. The math is host-side and identical to
+//! top-k + repetition/presence penalties, with greedy as the default. The math is host-side and identical to
 //! the reference — a stabilised, **unnormalised** `exp((logit - max)/T)` weight per token, heap-based
 //! nucleus selection, and a categorical inverse-CDF draw from the pluggable [`TokenRng`]. Greedy
 //! (`temperature <= 0`) with no penalty and no constraint takes the on-device argmax fast path
 //! (a single-element host transfer); otherwise logits are pulled to host f32.
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 
 use candle_core::{DType, Tensor};
 
@@ -64,6 +64,8 @@ pub struct SamplingParams {
     pub repetition_penalty: f32,
     /// How many recent history tokens the repetition penalty looks back over.
     pub repetition_context: usize,
+    /// Additive penalty subtracted once from every token present anywhere in the history.
+    pub presence_penalty: f32,
 }
 
 impl Default for SamplingParams {
@@ -74,6 +76,7 @@ impl Default for SamplingParams {
             top_k: 0,
             repetition_penalty: 1.0,
             repetition_context: 0,
+            presence_penalty: 0.0,
         }
     }
 }
@@ -82,7 +85,7 @@ impl SamplingParams {
     /// True when this configuration is pure greedy with no penalty and (caller-checked) no
     /// constraint mask — eligible for the on-device argmax fast path.
     fn is_plain_greedy(&self) -> bool {
-        self.temperature <= 0.0 && self.repetition_penalty == 1.0
+        self.temperature <= 0.0 && self.repetition_penalty == 1.0 && self.presence_penalty == 0.0
     }
 }
 
@@ -145,8 +148,9 @@ pub fn shaped_candidates(
         .collect())
 }
 
-/// Pull `logits` to host f32 and apply the constraint mask + repetition penalty (the position-shaping
-/// shared by [`sample`] and [`shaped_candidates`]).
+/// Pull `logits` to host f32 and apply the constraint mask plus repetition and presence penalties
+/// (the position-shaping shared by [`sample`] and [`shaped_candidates`]). Repetition is applied
+/// first, then presence, matching the MLX backend's combined-penalty order.
 fn penalized_logits(
     logits: &Tensor,
     history: &[i32],
@@ -177,6 +181,20 @@ fn penalized_logits(
                 } else {
                     *slot / params.repetition_penalty
                 };
+            }
+        }
+    }
+
+    // Presence penalty is additive and count-independent. It covers the full prompt + generated
+    // history, unlike the independently windowed CTRL repetition penalty. Invalid token ids are
+    // ignored, and a repeated id is adjusted exactly once.
+    if params.presence_penalty != 0.0 {
+        let mut seen = HashSet::with_capacity(history.len());
+        for &tok in history {
+            if seen.insert(tok) {
+                if let Some(slot) = usize::try_from(tok).ok().and_then(|i| v.get_mut(i)) {
+                    *slot -= params.presence_penalty;
+                }
             }
         }
     }
@@ -401,5 +419,35 @@ mod tests {
         let mut rng = SplitMix64::new(0);
         let t = sample(&l, &history, &params, &mut rng, Some(&[true, true, true])).unwrap();
         assert_eq!(t, 1);
+    }
+
+    #[test]
+    fn presence_penalty_is_additive_once_per_seen_token() {
+        let params = SamplingParams {
+            presence_penalty: 0.75,
+            ..Default::default()
+        };
+        let l = logits(&[2.0, 1.5, 0.5]);
+        let adjusted = penalized_logits(&l, &[0, 0, 0, 2, -1, 99], &params, None).unwrap();
+        assert_eq!(adjusted, vec![1.25, 1.5, -0.25]);
+
+        // Token 0 began as the argmax. A single presence subtraction makes token 1 win even
+        // though token 0 appears three times; its count does not multiply the penalty.
+        let mut rng = SplitMix64::new(0);
+        assert_eq!(sample(&l, &[0, 0, 0], &params, &mut rng, None).unwrap(), 1);
+    }
+
+    #[test]
+    fn presence_and_repetition_use_backend_parity_order() {
+        let params = SamplingParams {
+            repetition_penalty: 2.0,
+            repetition_context: 8,
+            presence_penalty: 0.5,
+            ..Default::default()
+        };
+        let l = logits(&[4.0, -2.0]);
+        let adjusted = penalized_logits(&l, &[0, 1], &params, None).unwrap();
+        // CTRL transform first: [4 / 2, -2 * 2], then additive presence: [-.5, -.5].
+        assert_eq!(adjusted, vec![1.5, -4.5]);
     }
 }
