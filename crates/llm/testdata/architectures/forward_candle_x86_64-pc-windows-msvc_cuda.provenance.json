@@ -1,0 +1,100 @@
+{
+  "run": 35452737841,
+  "classification": "Preexisting Windows CPU golden mismatch reproduced at baseline and head",
+  "compiler": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "cuda_feature": true,
+  "fixture_device": "CPU",
+  "complete_vectors_identical_across_all_four_runs": true,
+  "architecture_counts": {
+    "llama": 144,
+    "qwen3": 144,
+    "phi3": 144,
+    "qwen2_moe": 144,
+    "gemma2": 144,
+    "glm4": 144,
+    "deepseek_v2": 144,
+    "qwen3_vl": 144
+  },
+  "total_values_per_run": 1152,
+  "evidence": [
+    {
+      "ref": "0b084cbf46b5b4f4f561305ef116268b57eecf7f",
+      "source_matches_commit": true,
+      "patch_sha256": "CE4E45C213317C67F2F4DCFA40D5A39ABC11177F0C8090C9051D14FB2E8D560B",
+      "golden_sha256": "C7D7847A616798202EA6EE1FE0D63CC224C72D0E9AAF532999D8FF3C5C238C25",
+      "golden_checks": 5,
+      "original_exit_codes": [
+        101,
+        101
+      ],
+      "dump_exit_codes": [
+        0,
+        0
+      ]
+    },
+    {
+      "ref": "62dab79527efc8263793243c82cfaa61a203fd69",
+      "source_matches_commit": true,
+      "patch_sha256": "CE4E45C213317C67F2F4DCFA40D5A39ABC11177F0C8090C9051D14FB2E8D560B",
+      "golden_sha256": "C7D7847A616798202EA6EE1FE0D63CC224C72D0E9AAF532999D8FF3C5C238C25",
+      "golden_checks": 5,
+      "original_exit_codes": [
+        101,
+        101
+      ],
+      "dump_exit_codes": [
+        0,
+        0
+      ]
+    }
+  ],
+  "limitations": [
+    "results.json process exit_code is null; exact cause not independently proven. Per-invocation cmd exit-code files and Rust summaries are complete and agree.",
+    "Probe enables candle-llm cuda; does not reproduce full media package feature unification"
+  ],
+  "first_mismatch": {
+    "architecture": "llama",
+    "index": 1,
+    "observed_bits": "0xbf80e46b",
+    "golden_bits": "0xbf80e46c"
+  },
+  "dependency_package_versions_identical": true,
+  "dependency_package_version_count": 151,
+  "golden_file": "forward_candle_x86_64-pc-windows-msvc_cuda.json",
+  "golden_file_sha256": "76734fcc1ee37dcdc46ff761e5fb0aca06bc76dd3b7f2b6d22a69175d9d1accd",
+  "target": "x86_64-pc-windows-msvc",
+  "source_toolchain_pin": "1.96.0",
+  "scope": "CPU fixture with candle-llm cuda feature; exact equality, no tolerance; other targets retain the original golden.",
+  "artifact_sha256": {
+    "base-dependencies.txt": "8dbbfb4424a574f63f3b2ed322a51f7c2f2f9a343f903e4643649e6c5bc19c3a",
+    "head-original-2.log": "21f7e29a74e22dd42a794982c3656ef356a62870073b4c4a4c0696a43d0d3fe6",
+    "head-stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "base-bits-2.log": "0d3cc2708ebcfbd2b1ba6947a0b584c564c59bd9674599a921a56c9c0977a834",
+    "head-original-1.log": "581ae3aa62829a7697a50c5f6acba8384f5cc1a07656827037474930903c0a61",
+    "base-stdout.log": "9719c1ccf23d52f64dc0be8b05ad93faed73c41fc082389ad53912de514a4a57",
+    "base-bits-1.log": "498748c196abc69050be80da14c99e00581252991ebc0d1cab1b26f19fe41514",
+    "head-golden-hashes.txt": "b1d161f241006d726138ded3dd4f88b9ed0192e772186d8e80f2adb64812fbea",
+    "head-exit-codes.txt": "bb6dbca0dbb3c193dfcc57b22763c755edfa7365a10e4caf093d6562e5c7292a",
+    "head-dependencies.txt": "13f2e488be80489e8edf5e1b015cb25d42b170b179870e65c658ebb17e18a751",
+    "toolchain-setup.txt": "7a75849404758754a6e6636540791fb92b80829828f973d61561a3acf0d627fb",
+    "results.json": "c4cb167d37c53467d40327e9683224dff098d8a34e2dc7cccab9991220f1e9a3",
+    "base-golden-hashes.txt": "b1d161f241006d726138ded3dd4f88b9ed0192e772186d8e80f2adb64812fbea",
+    "head-Cargo.lock": "9a60a929691abd0930be84d3dbcb6234c0593c5966ceebf37221ee3fed1626a7",
+    "setup.log": "904970826a6ebebccf700b6598b79949bdf4595a93abc1c489bf246dada1d260",
+    "head-architecture_forward.rs": "14dbe7ffb6aadf47c52e0611d9d52e24f74dc28e0a8ea5424043a6ddad6f7f63",
+    "head-bits-2.log": "ff7172eb9f7655b543ab2729dc26424b0d197b4b64504433357e26df958e973b",
+    "base-stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "head-diagnostic.patch": "ce4e45c213317c67f2f4dcfa40d5a39abc11177f0c8090c9051d14fb2e8d560b",
+    "head-patch-sha256.txt": "15eb20d5a74bc1b3a9042e0d61218e6b41760a7289baf40c9d27d3cd1a78ed6d",
+    "head-bits-1.log": "c5c98041182fd54ebc0915f3045cd77609fd1cccce7645a47506ba72e7908cc3",
+    "base-exit-codes.txt": "bb6dbca0dbb3c193dfcc57b22763c755edfa7365a10e4caf093d6562e5c7292a",
+    "head-stdout.log": "9719c1ccf23d52f64dc0be8b05ad93faed73c41fc082389ad53912de514a4a57",
+    "base-original-2.log": "a7cf5b224784c49e32645e789039f6c165356acb4f336aada9b3fdba37dfefaa",
+    "base-original-1.log": "896f69dce62fff651466abb4cbc5f85079cc8bc6175e636ad9629282a0a4a7a1",
+    "bootstrap.log": "984a67fa5368ac9b9ef32ee6a31e46106c4d842c3c3e60af60452d74634de02d",
+    "base-diagnostic.patch": "ce4e45c213317c67f2f4dcfa40d5a39abc11177f0c8090c9051d14fb2e8d560b",
+    "base-patch-sha256.txt": "b7c1bb6d436b432de6d8ec3272b8cc8d3e79163002987ed235607bc1d06d9e05",
+    "base-architecture_forward.rs": "14dbe7ffb6aadf47c52e0611d9d52e24f74dc28e0a8ea5424043a6ddad6f7f63",
+    "base-Cargo.lock": "bb0a4b1158736d04baedce77243020938d342922ec6f4f457e4cd021e28c4157"
+  }
+}

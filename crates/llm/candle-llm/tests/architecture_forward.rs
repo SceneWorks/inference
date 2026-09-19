@@ -14,8 +14,9 @@
 //! into the uniform architectures fails here.
 //!
 //! Assertions are **exact** — not a tolerance. These are the same kernels running the same graph on
-//! the same device, so anything other than bit-equality is a real change in what the decoder
-//! computes.
+//! the same device and platform configuration. Windows x86_64 MSVC with the CUDA feature uses
+//! its own historical CPU baseline: cross-platform CPU kernels can differ by one ULP. Within each
+//! recorded configuration, anything other than bit-equality is a regression.
 //!
 //! Regenerate (only ever against a known-good tree, and say so in the commit):
 //!
@@ -45,9 +46,80 @@ const INTER: usize = 64;
 const PROMPT: [i32; 5] = [1, 2, 3, 4, 5];
 const DECODE_STEPS: [i32; 2] = [6, 7];
 
+// The Windows baseline was measured at the historical source, not regenerated from this PR.
+// Rust 1.96.0 is pinned in the repository; provenance records compiler/dependencies and both repeats.
+fn golden_file(os: &str, arch: &str, target_env: &str, cuda: bool) -> &'static str {
+    match (os, arch, target_env, cuda) {
+        ("windows", "x86_64", "msvc", true) => "forward_candle_x86_64-pc-windows-msvc_cuda.json",
+        _ => "forward_candle.json",
+    }
+}
+
 fn golden_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../testdata/architectures/forward_candle.json")
+        .join("../testdata/architectures")
+        .join(golden_file(
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            if cfg!(target_env = "msvc") {
+                "msvc"
+            } else {
+                "other"
+            },
+            cfg!(feature = "cuda"),
+        ))
+}
+
+fn assert_forward_equal(name: &str, got: &[f32], want: &[f32]) {
+    assert_eq!(got.len(), want.len(), "{name}: logit count");
+    if let Some((i, (g, w))) = got
+        .iter()
+        .zip(want)
+        .enumerate()
+        .find(|(_, (g, w))| g.to_bits() != w.to_bits())
+    {
+        panic!("{name}: forward output moved at index {i}: got {g} ({:#x}), the base branch produced {w} ({:#x}). The shared decoder or config changed this architecture's numerics.", g.to_bits(), w.to_bits());
+    }
+}
+
+#[test]
+fn windows_golden_selection_is_limited_to_the_measured_configuration() {
+    assert_eq!(
+        golden_file("windows", "x86_64", "msvc", true),
+        "forward_candle_x86_64-pc-windows-msvc_cuda.json"
+    );
+    for (os, arch, env, cuda) in [
+        ("windows", "x86_64", "msvc", false),
+        ("windows", "aarch64", "msvc", true),
+        ("windows", "x86_64", "gnu", true),
+        ("linux", "x86_64", "gnu", true),
+        ("macos", "aarch64", "other", false),
+    ] {
+        assert_eq!(golden_file(os, arch, env, cuda), "forward_candle.json");
+    }
+}
+
+#[test]
+fn windows_golden_rejects_a_single_changed_bit_in_every_architecture() {
+    let golden: Value = serde_json::from_str(include_str!(
+        "../../testdata/architectures/forward_candle_x86_64-pc-windows-msvc_cuda.json"
+    ))
+    .unwrap();
+    for case in cases() {
+        let want: Vec<f32> = golden[case.name]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap() as f32)
+            .collect();
+        assert_eq!(want.len(), VOCAB * (1 + DECODE_STEPS.len()));
+        assert_forward_equal(case.name, &want, &want);
+        let mut mutated = want.clone();
+        mutated[1] = f32::from_bits(mutated[1].to_bits() ^ 1);
+        assert!(
+            std::panic::catch_unwind(|| assert_forward_equal(case.name, &mutated, &want)).is_err()
+        );
+    }
 }
 
 /// Small deterministic `[out, in]` weight. Identical draw sequence on both branches, so the built
@@ -704,6 +776,8 @@ fn every_architecture_forward_is_bit_identical_to_the_base_branch() {
     let cases = cases();
 
     if std::env::var("SC18769_WRITE_FORWARD_GOLDEN").is_ok() {
+        assert_eq!(golden_path().file_name().unwrap(), "forward_candle.json",
+            "the qualified Windows golden must be captured from the historical baseline with provenance");
         let mut doc = Map::new();
         doc.insert(
             "_note".into(),
@@ -738,23 +812,7 @@ fn every_architecture_forward_is_bit_identical_to_the_base_branch() {
             .map(|x| x.as_f64().unwrap() as f32)
             .collect();
         let got = run_forward(case);
-        assert_eq!(got.len(), want.len(), "{}: logit count", case.name);
-        // Exact, not approximate: same kernels, same graph, same device.
-        if let Some((i, (g, w))) = got
-            .iter()
-            .zip(&want)
-            .enumerate()
-            .find(|(_, (g, w))| g.to_bits() != w.to_bits())
-        {
-            panic!(
-                "{name}: forward output moved at index {i}: got {g} ({got_bits:#x}), the base \
-                 branch produced {w} ({want_bits:#x}). The shared decoder or config changed this \
-                 architecture's numerics.",
-                name = case.name,
-                got_bits = g.to_bits(),
-                want_bits = w.to_bits(),
-            );
-        }
+        assert_forward_equal(case.name, &got, &want);
     }
 }
 
