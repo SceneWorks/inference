@@ -43,6 +43,11 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def lexical_absolute(path: Path) -> Path:
+    """Make a path absolute without resolving HF snapshot symlinks into extensionless blobs."""
+    return Path(os.path.abspath(path))
+
+
 def write_new(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("x", encoding="utf-8", newline="\n") as handle:
@@ -327,25 +332,26 @@ def pinned_admission_sizes(
 
 
 def selected_artifact(path: Path, snapshot: Path, inventory: dict[str, Any]) -> dict[str, Any]:
-    resolved = path.resolve()
-    if resolved.is_file():
+    absolute = lexical_absolute(path)
+    snapshot_root = lexical_absolute(snapshot)
+    if absolute.is_file():
         try:
-            relative = resolved.relative_to(snapshot.resolve()).as_posix()
+            relative = absolute.relative_to(snapshot_root).as_posix()
         except ValueError as error:
-            raise ValueError(f"selected artifact is outside the pinned snapshot: {resolved}") from error
+            raise ValueError(f"selected artifact is outside the pinned snapshot: {absolute}") from error
         matches = [item for item in inventory["files"] if item["path"] == relative]
         if len(matches) != 1:
             raise ValueError(f"selected artifact is absent from snapshot inventory: {relative}")
         return {
-            "path": str(resolved),
+            "path": str(absolute),
             "kind": "file",
             "bytes": matches[0]["size"],
             "sha256": matches[0]["sha256"],
         }
-    if resolved != snapshot.resolve():
-        raise ValueError(f"selected snapshot path does not equal the pinned snapshot: {resolved}")
+    if absolute != snapshot_root:
+        raise ValueError(f"selected snapshot path does not equal the pinned snapshot: {absolute}")
     return {
-        "path": str(resolved),
+        "path": str(absolute),
         "kind": "snapshot",
         "bytes": None,
         "sha256": inventory["inventory_sha256"],
@@ -408,7 +414,7 @@ def run(args: argparse.Namespace) -> int:
     env = os.environ.copy()
     env.update(
         {
-            "BONSAI_COMPARISON_MODEL_PATH": str(args.model_path.resolve()),
+            "BONSAI_COMPARISON_MODEL_PATH": str(lexical_absolute(args.model_path)),
             "BONSAI_COMPARISON_MODEL_ID": args.model_id,
             "BONSAI_COMPARISON_MODEL_REVISION": args.model_revision,
             "BONSAI_COMPARISON_RUNTIME_SHA": runtime_sha,
@@ -419,7 +425,7 @@ def run(args: argparse.Namespace) -> int:
     if args.candle_device is not None:
         env["CANDLE_LLM_DEVICE"] = args.candle_device
     if args.projector_path is not None:
-        env["BONSAI_COMPARISON_PROJECTOR"] = str(args.projector_path.resolve())
+        env["BONSAI_COMPARISON_PROJECTOR"] = str(lexical_absolute(args.projector_path))
 
     started_wall = time.time()
     started = time.monotonic()
@@ -496,9 +502,11 @@ def run(args: argparse.Namespace) -> int:
             "id": args.model_id,
             "manifest_key": args.model_key,
             "revision": args.model_revision,
-            "snapshot": str(args.snapshot.resolve()),
-            "model_path": str(args.model_path.resolve()),
-            "projector_path": str(args.projector_path.resolve()) if args.projector_path else None,
+            "snapshot": str(lexical_absolute(args.snapshot)),
+            "model_path": str(lexical_absolute(args.model_path)),
+            "projector_path": str(lexical_absolute(args.projector_path))
+            if args.projector_path
+            else None,
             "language_variant": args.language_variant,
             "vision_variant": args.vision_variant,
             "selected_model_artifact": selected_artifact(args.model_path, args.snapshot, before),

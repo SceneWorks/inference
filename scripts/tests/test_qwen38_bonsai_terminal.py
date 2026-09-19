@@ -197,6 +197,33 @@ class TerminalEvidenceTests(unittest.TestCase):
         self.assertEqual(sizes["language_weight_bytes"], 8)
         self.assertEqual(sizes["vision_weight_bytes"], 12)
 
+    def test_selected_hf_symlink_keeps_snapshot_filename_and_inventory_identity(self) -> None:
+        snapshot = self.root / "snapshot"
+        blobs = self.root / "blobs"
+        snapshot.mkdir()
+        blobs.mkdir()
+        blob = blobs / "deadbeef"
+        blob.write_bytes(b"gguf")
+        selected = snapshot / "model.gguf"
+        selected.symlink_to(blob)
+        identity = terminal.selected_artifact(
+            selected,
+            snapshot,
+            {
+                "inventory_sha256": "a" * 64,
+                "files": [
+                    {
+                        "path": "model.gguf",
+                        "kind": "symlink",
+                        "size": 4,
+                        "sha256": "b" * 64,
+                    }
+                ],
+            },
+        )
+        self.assertEqual(Path(identity["path"]).name, "model.gguf")
+        self.assertEqual(identity["sha256"], "b" * 64)
+
     def test_pinned_admission_rejects_missing_or_nonpositive_bytes(self) -> None:
         with self.assertRaisesRegex(ValueError, "lacks positive pinned"):
             terminal.pinned_admission_sizes({"key": "broken"})
