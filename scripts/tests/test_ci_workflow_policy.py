@@ -1,6 +1,7 @@
 """Regression tests for trust boundaries around persistent self-hosted CI runners."""
 
 import functools
+import json
 import ntpath
 import os
 import re
@@ -696,7 +697,7 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             errors.append(f"{prefix}: unexpected argument after requirement lock")
 
     expected_lock_counts = {
-        # 34 since SC-22261 made StarVector preflight verify installed snapshots only;
+        # 35 since SC-23942 added the Qwen/Bonsai MLX materialization lane;
         # 34 since sc-18932's `mlx-minimax-h3` merged alongside main's 33
         # (33 since sc-18325 added the three correctness-only decode-quality jobs;
         # 30 since sc-18315 added pinned Krea license materialization;
@@ -705,10 +706,10 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 27 since sc-17284 added the `mlx-qwen-image`, `mlx-qwen-image-pid` and
         # `mlx-qwen-image-producers` jobs; 24 since sc-17250 added the JoyCaption and
         # MOSS-TTS-Realtime jobs; 22 before).
-        MACOS_HUB_LOCK: 34,
-        # 11 since SC-22261 removed acquisition from StarVector Candle preflight;
+        MACOS_HUB_LOCK: 35,
+        # 12 since SC-23942 added the Qwen/Bonsai Candle materialization lane;
         # 11 since sc-18932 added the `candle-minimax-h3` job.
-        WINDOWS_HUB_LOCK: 11,
+        WINDOWS_HUB_LOCK: 12,
         # `candle-scail2-shared` is the only lane on the py314 Windows lock.
         WINDOWS_SCAIL_HUB_LOCK: 1,
         WINDOWS_MAGE_LOCK: 1,
@@ -992,13 +993,13 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def test_real_weight_python_installs_are_binary_hash_locked(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
-        # 34 / 11 after SC-22261 made the StarVector terminal pair verify-only.
+        # 35 / 12 after SC-23942 added one pinned materialization lane per native backend.
         # The remaining jobs retain their materialization lanes. These counts
         # are the anti-drift half of the policy above: the shape checks pass on a job that installs
         # nothing, so only a count notices a lane that quietly stopped materializing its snapshot.
         # Bump them when you add or remove a lane.
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 34)
-        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 11)
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 35)
+        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 12)
         self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(
@@ -2408,7 +2409,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def test_memory_evidence_v1_lane_is_artifact_bound_tolerance_pinned_and_operator_dispatched(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         start = workflow.index("  mlx-memory-evidence-v1:")
-        end = workflow.index("\n  mlx-llm:", start)
+        end = min(
+            workflow.index("\n  qwen38-bonsai-mlx:", start),
+            workflow.index("\n  mlx-llm:", start),
+        )
         job = workflow[start:end]
 
         self.assertIn("memory-evidence-v1", workflow.split("jobs:", 1)[0])
@@ -3750,6 +3754,76 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("success|skipped)", step["run"])
         self.assertIn("exit 1", step["run"])
         self.assertIn("join(needs.*.result", step["env"]["RESULTS"])
+
+    def test_qwen38_bonsai_terminal_profile_is_explicit_serial_and_sealed(self) -> None:
+        workflow_text = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = yaml.safe_load(workflow_text)
+        options = workflow[True]["workflow_dispatch"]["inputs"]["profile"]["options"]
+        self.assertIn("qwen38-bonsai", options)
+        jobs = workflow["jobs"]
+        mlx = jobs["qwen38-bonsai-mlx"]
+        candle = jobs["qwen38-bonsai-candle"]
+        self.assertEqual(candle["needs"], "qwen38-bonsai-mlx")
+        self.assertIn("inputs.profile == 'qwen38-bonsai'", mlx["if"])
+        self.assertIn("inputs.profile == 'qwen38-bonsai'", candle["if"])
+
+        mlx_commands = "\n".join(step.get("run", "") for step in mlx["steps"])
+        candle_commands = "\n".join(step.get("run", "") for step in candle["steps"])
+        for commands in (mlx_commands, candle_commands):
+            self.assertIn("qwen38_bonsai_terminal.py hardware", commands)
+            self.assertIn("qwen38_bonsai_terminal.py preflight", commands)
+            self.assertIn("qwen38_bonsai_terminal.py run ", commands)
+            self.assertIn("--binary", commands)
+            self.assertIn("--runtime-sha", commands)
+            self.assertNotIn("cargo test -- --ignored", commands)
+        self.assertLess(
+            mlx_commands.index("qwen38_bonsai_terminal.py preflight"),
+            mlx_commands.index("ensure_model_snapshot.py"),
+        )
+        self.assertLess(
+            candle_commands.index("qwen38_bonsai_terminal.py preflight"),
+            candle_commands.index("ensure_model_snapshot.py"),
+        )
+        self.assertIn("--load-profile mlx-unified", mlx_commands)
+        self.assertIn("--load-profile candle-packed-cuda", candle_commands)
+        self.assertIn("qwen38_bonsai_terminal.py matrix-status", candle_commands)
+        self.assertIn("--candle-device auto", candle_commands)
+        self.assertIn("--candle-device cpu", candle_commands)
+
+        matrix = json.loads(
+            (WORKFLOW.parents[2] / "release" / "qwen38-bonsai-matrix.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        cells = {cell["id"]: cell for cell in matrix["cells"]}
+        self.assertEqual(len(cells), 19)
+        combined_commands = mlx_commands + candle_commands
+        for cell_id in cells:
+            self.assertIn(cell_id, combined_commands)
+        for cell in (
+            "candle-cuda-qwen38-parent",
+            "candle-cuda-qwen3vl-baseline",
+            "candle-cpu-qwen38-parent",
+            "candle-cpu-bonsai-gguf",
+            "candle-cpu-qwen3vl-baseline",
+        ):
+            self.assertIn(cell, cells)
+        for backend in ("mlx", "candle"):
+            for language in ("pq2", "ptq1"):
+                for vision in ("bf16", "q8"):
+                    self.assertIn(f"functional-{backend}-{language}-{vision}", cells)
+        self.assertIn("functional-mlx-bonsai-mlx", cells)
+        self.assertIn("functional-candle-bonsai-mlx", cells)
+
+        manifest = tomllib.loads(MODEL_MANIFEST.read_text(encoding="utf-8"))
+        rows = {row["key"]: row for row in manifest["models"]}
+        for key in (
+            "bonsai-qwen38-parent",
+            "bonsai-mlx-2bit",
+            "bonsai-gguf",
+            "bonsai-qwen3vl-baseline",
+        ):
+            self.assertEqual(rows[key]["profiles"], ["qwen38-bonsai"])
 
 
 if __name__ == "__main__":

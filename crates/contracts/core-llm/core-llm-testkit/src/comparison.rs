@@ -101,7 +101,8 @@ pub fn request_evidence(request: &TextLlmRequest) -> Value {
     };
     json!({"messages":messages, "max_new_tokens":request.max_new_tokens, "seed":request.seed,
         "sampling":{"temperature":request.sampling.temperature,"top_p":request.sampling.top_p,
-            "top_k":request.sampling.top_k,"repetition_penalty":request.sampling.repetition_penalty,
+            "top_k":request.sampling.top_k,"presence_penalty":request.sampling.presence_penalty,
+            "repetition_penalty":request.sampling.repetition_penalty,
             "repetition_context":request.sampling.repetition_context},
         "thinking":format!("{:?}",request.thinking),
         "reasoning_effort":request.reasoning_effort.map(|effort|effort.as_str()),
@@ -204,9 +205,9 @@ fn solid(color: [u8; 3]) -> ImageRef {
 pub fn diagnostic_cases() -> Vec<ComparisonCase> {
     let mut cases = vec![
         text_case("arithmetic","math","Calculate 17 times 23. Reply with only the integer.","391"),
-        text_case("logic","reasoning","All squares are rectangles. Does that imply all rectangles are squares? Reply with only No or Yes.","No"),
+        text_case("logic","reasoning","Four sealed boxes are labeled A, B, C, and D. The key is not in A. If the key is in B, then it is also in C, which is impossible because exactly one box contains it. The key is not in D. Which box contains the key? Reply with only the letter.","C"),
         text_case("ordering","instructions","Sort these names alphabetically: Cy, Ava, Bo. Reply with only the comma-separated names, with no spaces.","Ava,Bo,Cy"),
-        text_case("python","code","What integer does Python sum(n*n for n in range(1,6)) return? Reply with only the integer.","55"),
+        text_case("code","code","What integer does the expression sum(n*n for n in range(1,6)) return? Reply with only the integer.","55"),
     ];
     let mut structured = text_case(
         "json",
@@ -233,6 +234,19 @@ pub fn diagnostic_cases() -> Vec<ComparisonCase> {
         arguments: json!({"city":"Paris"}),
     };
     cases.push(tool);
+    let mut multi_turn = text_case(
+        "multi_turn",
+        "conversation",
+        "What project codename did I give you? Reply with only the codename.",
+        "ORCHID-9",
+    );
+    multi_turn.request.messages = vec![
+        Message::system("Retain exact user-provided identifiers across turns."),
+        Message::user("The project codename is ORCHID-9."),
+        Message::assistant("Understood."),
+        Message::user("What project codename did I give you? Reply with only the codename."),
+    ];
+    cases.push(multi_turn);
     for (id, colors) in [
         ("image", vec![[255, 0, 0]]),
         ("multi_image", vec![[255, 0, 0], [0, 0, 255]]),
@@ -354,7 +368,10 @@ pub fn run_environment(
     let mut report = json!({"schema_version":1,"suite":"bonsai-native-diagnostic-v1",
         "model_id":model_id,"model_revision":revision,"model_path":model_path,
         "runtime_sha":runtime_sha,"case_ids":selected,"status":"running",
-        "vendor_benchmark_reproduction":false,"native_memory_before_load":memory()});
+        "claims":{"vendor_benchmark_reproduction":false,
+            "vendor_quality_retention":false,
+            "scope":"fixed native diagnostic cases only"},
+        "native_memory_before_load":memory()});
     let start = Instant::now();
     let loaded = load(&core_llm::LoadSpec::dense(&model_path));
     report["load_seconds"] = json!(start.elapsed().as_secs_f64());
@@ -386,10 +403,36 @@ pub fn run_environment(
                 record["native_memory_after_case"] = memory();
                 records.push(record);
             }
+            // Exercise the provider's real context admission boundary without estimating token
+            // count from text repetitions. A one-turn prompt plus a generation budget equal to the
+            // declared complete window must be rejected before model execution because their sum
+            // cannot fit. Successful context rows above retain the provider's exact prompt count.
+            let context_admission = if caps.max_context_tokens == 0
+                || caps.max_context_tokens > u32::MAX as usize
+            {
+                json!({"evidence_complete":false,"reason":"provider has no representable context limit"})
+            } else {
+                let mut probe = text_case(
+                    "context_admission",
+                    "context_admission",
+                    "Reply with only OK.",
+                    "OK",
+                );
+                probe.request.max_new_tokens = caps.max_context_tokens as u32;
+                let record = measure_case(provider.as_ref(), &probe);
+                let rejected = record["status"] == "failed"
+                    && record["error"]
+                        .as_str()
+                        .is_some_and(|error| error.to_lowercase().contains("context"));
+                json!({"evidence_complete":rejected,"declared_context_tokens":caps.max_context_tokens,
+                    "requested_max_new_tokens":probe.request.max_new_tokens,"record":record})
+            };
             let complete = records
                 .iter()
-                .all(|record| record["evidence_complete"] == true);
+                .all(|record| record["evidence_complete"] == true)
+                && context_admission["evidence_complete"] == true;
             report["cases"] = json!(records);
+            report["context_admission"] = context_admission;
             report["status"] = json!(if complete { "completed" } else { "incomplete" });
             drop(provider);
             report["native_memory_after_unload"] = memory();
