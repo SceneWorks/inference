@@ -3649,6 +3649,17 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     expected,
                 )
 
+    def test_manual_cuda_package_tests_collect_all_failures_without_masking_exit(self) -> None:
+        jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
+        job = jobs["windows-cuda"]
+        step = next(step for step in job["steps"] if step.get("name") == "Test Candle CUDA packages")
+        command = step["run"].strip().splitlines()[-1]
+        self.assertIn("cargo test --locked --lib --tests", command)
+        self.assertIn("--no-fail-fast", command)
+        self.assertNotIn("||", command)
+        self.assertFalse(step.get("continue-on-error", False))
+        self.assertFalse(job.get("continue-on-error", False))
+
     def test_windows_cuda_jobs_cap_cargo_parallelism_for_shared_host(self) -> None:
         jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
 

@@ -1004,7 +1004,7 @@ jobs:
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked --lib --tests -p candle-llm -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda
+          cargo test --locked --lib --tests -p candle-llm -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-fail-fast
       - name: Test LLM-only CUDA bundle
         shell: cmd
         run: |
