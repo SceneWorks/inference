@@ -34,6 +34,7 @@ jobs:
           $env:TEMP = Join-Path $root 'tmp'
           $env:TMP = $env:TEMP
           New-Item -ItemType Directory -Force $env:TEMP | Out-Null
+          Remove-Item Env:SC18769_WRITE_FORWARD_GOLDEN -ErrorAction SilentlyContinue
           $results = @()
           foreach ($case in @(@{name='base';ref='0b084cbf'}, @{name='head';ref='62dab79527efc8263793243c82cfaa61a203fd69'})) {
             $name = $case.name
@@ -58,10 +59,22 @@ jobs:
           '@ | Add-Content $source
             git -C $tree diff -- crates/llm/candle-llm/tests/architecture_forward.rs | Set-Content "$logs\$name-diagnostic.patch"
             Get-FileHash "$logs\$name-diagnostic.patch" -Algorithm SHA256 | Format-List | Out-File "$logs\$name-patch-sha256.txt"
+            $golden = Join-Path $tree 'crates/llm/testdata/architectures/forward_candle.json'
+            $goldenHash = (Get-FileHash $golden -Algorithm SHA256).Hash
+            "initial $goldenHash" | Set-Content "$logs\$name-golden-hashes.txt"
+            $guard = Join-Path $root "$name-golden-guard.ps1"
+            @'
+          param([string]$Path, [string]$Expected, [string]$Evidence, [string]$Label)
+          $ErrorActionPreference = 'Stop'
+          $actual = (Get-FileHash $Path -Algorithm SHA256).Hash
+          "$Label $actual" | Add-Content $Evidence
+          if ($actual -ne $Expected) { throw "Golden changed during $Label" }
+          '@ | Set-Content $guard
             $cmd = Join-Path $root "$name.cmd"
             @"
           @echo off
           setlocal EnableDelayedExpansion
+          set SC18769_WRITE_FORWARD_GOLDEN=
           call "%VCVARS%"
           if errorlevel 1 exit /b 90
           cd /d "$tree"
@@ -76,10 +89,14 @@ jobs:
             set RESULT=!errorlevel!
             echo !RESULT!>> "$logs\$name-exit-codes.txt"
             if not !RESULT!==0 set PROBE_FAILED=1
+            pwsh -NoProfile -File "$guard" -Path "$golden" -Expected "$goldenHash" -Evidence "$logs\$name-golden-hashes.txt" -Label "original-%%R"
+            if errorlevel 1 set PROBE_FAILED=1
             cargo test --locked -p candle-llm --features cuda --test architecture_forward diagnostic_full_forward_bits -- --exact --nocapture > "$logs\$name-bits-%%R.log" 2>&1
             set RESULT=!errorlevel!
             echo !RESULT!>> "$logs\$name-exit-codes.txt"
             if not !RESULT!==0 set PROBE_FAILED=1
+            pwsh -NoProfile -File "$guard" -Path "$golden" -Expected "$goldenHash" -Evidence "$logs\$name-golden-hashes.txt" -Label "bits-%%R"
+            if errorlevel 1 set PROBE_FAILED=1
           )
           exit /b %PROBE_FAILED%
           "@ | Set-Content $cmd
