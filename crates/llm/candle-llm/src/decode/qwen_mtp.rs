@@ -62,7 +62,7 @@ pub fn generate_qwen35_mtp(
     constraint: Option<&mut dyn RewindableConstraintMask>,
 ) -> Result<(GenerationOutput, SpeculativeStats)> {
     generate_qwen35_mtp_inner(
-        target, mtp, prompt_ids, None, config, num_draft, cancel, on_event, constraint, None,
+        target, mtp, prompt_ids, None, config, num_draft, cancel, on_event, constraint, None, None,
     )
 }
 
@@ -80,6 +80,33 @@ pub fn generate_qwen35_mtp_timed(
     constraint: Option<&mut dyn RewindableConstraintMask>,
     on_prefill_complete: &mut dyn FnMut() -> Result<()>,
 ) -> Result<(GenerationOutput, SpeculativeStats)> {
+    generate_qwen35_mtp_timed_with_stop(
+        target,
+        mtp,
+        prompt_ids,
+        config,
+        num_draft,
+        cancel,
+        on_event,
+        constraint,
+        None,
+        on_prefill_complete,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn generate_qwen35_mtp_timed_with_stop(
+    target: &Qwen35Model,
+    mtp: &Qwen35Mtp,
+    prompt_ids: &[i32],
+    config: &GenerationConfig,
+    num_draft: u32,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    constraint: Option<&mut dyn RewindableConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
+    on_prefill_complete: &mut dyn FnMut() -> Result<()>,
+) -> Result<(GenerationOutput, SpeculativeStats)> {
     generate_qwen35_mtp_inner(
         target,
         mtp,
@@ -90,6 +117,7 @@ pub fn generate_qwen35_mtp_timed(
         cancel,
         on_event,
         constraint,
+        should_stop,
         Some(on_prefill_complete),
     )
 }
@@ -108,6 +136,24 @@ pub fn generate_qwen35_mtp_multimodal(
     on_event: &mut dyn FnMut(StreamEvent),
     constraint: Option<&mut dyn RewindableConstraintMask>,
 ) -> Result<(GenerationOutput, SpeculativeStats)> {
+    generate_qwen35_mtp_multimodal_with_stop(
+        target, mtp, prompt, config, num_draft, cancel, on_event, constraint, None, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn generate_qwen35_mtp_multimodal_with_stop(
+    target: &Qwen35Model,
+    mtp: &Qwen35Mtp,
+    prompt: Qwen35MtpMultimodalPrompt<'_>,
+    config: &GenerationConfig,
+    num_draft: u32,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    constraint: Option<&mut dyn RewindableConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
+    on_prefill_complete: Option<&mut dyn FnMut() -> Result<()>>,
+) -> Result<(GenerationOutput, SpeculativeStats)> {
     generate_qwen35_mtp_inner(
         target,
         mtp,
@@ -118,7 +164,8 @@ pub fn generate_qwen35_mtp_multimodal(
         cancel,
         on_event,
         constraint,
-        None,
+        should_stop,
+        on_prefill_complete,
     )
 }
 
@@ -133,6 +180,7 @@ fn generate_qwen35_mtp_inner(
     cancel: &CancelFlag,
     on_event: &mut dyn FnMut(StreamEvent),
     mut constraint: Option<&mut dyn RewindableConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
     mut prefill_boundary: Option<&mut dyn FnMut() -> Result<()>>,
 ) -> Result<(GenerationOutput, SpeculativeStats)> {
     if cancel.is_cancelled() {
@@ -244,10 +292,17 @@ fn generate_qwen35_mtp_inner(
     generated.push(first);
     history.push(first);
     let mut cur = first;
+    if should_stop.is_some_and(|stop| stop()) {
+        finish = FinishReason::Stopped;
+    }
 
-    'outer: while generated.len() < config.max_new_tokens {
+    'outer: while generated.len() < config.max_new_tokens && finish != FinishReason::Stopped {
         if cancel.is_cancelled() {
             finish = FinishReason::Cancelled;
+            break;
+        }
+        if should_stop.is_some_and(|stop| stop()) {
+            finish = FinishReason::Stopped;
             break;
         }
         let remaining = config.max_new_tokens - generated.len();
@@ -423,6 +478,10 @@ fn generate_qwen35_mtp_inner(
             generated.push(token);
             history.push(token);
             cur = token;
+            if should_stop.is_some_and(|stop| stop()) {
+                finish = FinishReason::Stopped;
+                break 'outer;
+            }
             if cancel.is_cancelled() {
                 finish = FinishReason::Cancelled;
                 break 'outer;
@@ -876,5 +935,31 @@ mod tests {
         .unwrap();
         assert_eq!(cancelled.tokens, vec![1]);
         assert_eq!(cancelled.finish_reason, FinishReason::Cancelled);
+    }
+
+    #[test]
+    fn host_stop_halts_mtp_before_another_target_step() {
+        let (target, mtp) = fixture(false);
+        let halted = std::cell::Cell::new(false);
+        let mut boundary = || Ok(());
+        let (out, _) = generate_qwen35_mtp_timed_with_stop(
+            &target,
+            &mtp,
+            &[2, 3],
+            &config(),
+            3,
+            &CancelFlag::new(),
+            &mut |event| {
+                if matches!(event, StreamEvent::Token { .. }) {
+                    halted.set(true);
+                }
+            },
+            None,
+            Some(&|| halted.get()),
+            &mut boundary,
+        )
+        .unwrap();
+        assert_eq!(out.tokens.len(), 1);
+        assert_eq!(out.finish_reason, FinishReason::Stopped);
     }
 }

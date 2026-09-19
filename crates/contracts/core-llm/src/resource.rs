@@ -1,0 +1,241 @@
+//! Request-scoped memory admission for local LLM providers.
+
+use crate::{Error, Result};
+
+/// Deterministic operational override used by CI and by discrete-device launchers.
+pub const AVAILABLE_MEMORY_OVERRIDE: &str = "SCENEWORKS_LLM_AVAILABLE_MEMORY_BYTES";
+
+/// Loaded decoder geometry used to price KV and eager-attention workspaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LlmMemoryGeometry {
+    pub query_heads: u64,
+    pub kv_heads: u64,
+    pub head_dim: u64,
+    pub layers: u64,
+    pub element_bytes: u64,
+    pub hidden_size: u64,
+    pub intermediate_size: u64,
+    pub vocab_size: u64,
+    pub recurrent_bytes: u64,
+}
+
+/// Conservative checked estimate for request-owned native memory.
+pub fn estimate_request_bytes(
+    prompt_tokens: usize,
+    max_new_tokens: u32,
+    geometry: LlmMemoryGeometry,
+    vision_workspace_bytes: u64,
+    mtp_width: u32,
+) -> Option<u64> {
+    let prompt = u64::try_from(prompt_tokens).ok()?;
+    let total = prompt.checked_add(u64::from(max_new_tokens))?;
+    // Eager prefill materializes scores, the additive mask, and softmax weights.
+    let attention = prompt
+        .checked_mul(prompt)?
+        .checked_mul(geometry.query_heads)?
+        .checked_mul(geometry.element_bytes)?
+        .checked_mul(3)?;
+    // K and V caches for every layer through the requested terminal position.
+    let kv = total
+        .checked_mul(geometry.layers)?
+        .checked_mul(geometry.kv_heads)?
+        .checked_mul(geometry.head_dim)?
+        .checked_mul(geometry.element_bytes)?
+        .checked_mul(2)?;
+    // Include predictor cache, draft verification positions, and clone/replay rollback state.
+    let mtp = if mtp_width > 0 {
+        kv.checked_mul(2)?.checked_add(
+            u64::from(mtp_width)
+                .checked_mul(geometry.hidden_size.checked_add(geometry.vocab_size)?)?
+                .checked_mul(geometry.element_bytes)?,
+        )?
+    } else {
+        0
+    };
+    // Projection/MLP intermediates and logits are materialized during eager prefill.
+    let activations = prompt
+        .checked_mul(
+            geometry
+                .intermediate_size
+                .checked_mul(3)?
+                .checked_add(geometry.hidden_size.checked_mul(8)?)?
+                .checked_add(geometry.vocab_size)?,
+        )?
+        .checked_mul(geometry.element_bytes)?;
+    attention
+        .checked_add(kv)?
+        .checked_add(mtp)?
+        .checked_add(vision_workspace_bytes)?
+        .checked_add(activations)?
+        .checked_add(
+            geometry
+                .recurrent_bytes
+                .checked_mul(if mtp_width > 0 { 3 } else { 1 })?,
+        )
+}
+
+/// Reject an estimated request before native tensor allocation.
+pub fn admit_request_memory(required: u64, available: u64) -> Result<()> {
+    if required > available {
+        return Err(Error::InvalidRequest(format!(
+            "request requires an estimated {required} bytes of native workspace but only {available} bytes are available; reduce prompt/media length or max_new_tokens"
+        )));
+    }
+    Ok(())
+}
+
+/// An operational budget caps measured availability; it never substitutes for capacity.
+pub fn operational_memory_override() -> Result<Option<u64>> {
+    match std::env::var(AVAILABLE_MEMORY_OVERRIDE) {
+        Ok(value) => parse_memory_budget(Some(&value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(_) => Err(Error::InvalidRequest(
+            "memory budget is not valid Unicode".into(),
+        )),
+    }
+}
+
+fn parse_memory_budget(value: Option<&str>) -> Result<Option<u64>> {
+    value
+        .map(|value| {
+            value.parse::<u64>().map_err(|_| {
+                Error::InvalidRequest(format!(
+                    "{AVAILABLE_MEMORY_OVERRIDE} must be an unsigned byte count"
+                ))
+            })
+        })
+        .transpose()
+}
+
+/// Fail closed when capacity is unknown, and cap a valid budget by current capacity.
+pub fn effective_memory_budget(capacity: Option<u64>, budget: Option<u64>) -> Result<u64> {
+    let capacity = capacity.ok_or_else(|| {
+        Error::InvalidRequest(
+            "request admission could not read current device/host available memory".into(),
+        )
+    })?;
+    Ok(budget.map_or(capacity, |budget| capacity.min(budget)))
+}
+
+/// Fresh host/unified-memory availability snapshot. This is never used as CUDA capacity.
+pub fn available_host_memory_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let kib = text.lines().find_map(|line| {
+            line.strip_prefix("MemAvailable:")?
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })?;
+        return kib.checked_mul(1024);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("vm_stat").output().ok()?;
+        let text = String::from_utf8(output.stdout).ok()?;
+        let page_size = text
+            .lines()
+            .next()?
+            .split("page size of ")
+            .nth(1)?
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()?;
+        let pages = text
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                matches!(name, "Pages free" | "Pages inactive" | "Pages speculative")
+                    .then(|| value.trim().trim_end_matches('.').parse::<u64>().ok())?
+            })
+            .sum::<u64>();
+        return pages.checked_mul(page_size);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let output = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        return String::from_utf8(output.stdout)
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()?
+            .checked_mul(1024);
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// Sum only checkpoint payload files without reading weights into memory.
+pub fn checkpoint_payload_bytes(source: &std::path::Path) -> Result<u64> {
+    let io_error = |error: std::io::Error| Error::Load(format!("checkpoint admission: {error}"));
+    if source.is_file() {
+        return source.metadata().map(|m| m.len()).map_err(io_error);
+    }
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(source).map_err(io_error)? {
+        let path = entry.map_err(io_error)?.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("safetensors") {
+            total = total
+                .checked_add(path.metadata().map_err(io_error)?.len())
+                .ok_or_else(|| Error::Load("checkpoint byte count overflow".into()))?;
+        }
+    }
+    Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn estimate_is_checked_and_prices_quadratic_prefill() {
+        let geometry = LlmMemoryGeometry {
+            query_heads: 24,
+            kv_heads: 4,
+            head_dim: 128,
+            layers: 40,
+            element_bytes: 4,
+            hidden_size: 5120,
+            intermediate_size: 17408,
+            vocab_size: 248320,
+            recurrent_bytes: 1024,
+        };
+        let short = estimate_request_bytes(1024, 16, geometry, 0, 0).unwrap();
+        let long = estimate_request_bytes(131_072, 16, geometry, 0, 0).unwrap();
+        assert!(long > short * 1_000);
+        assert!(estimate_request_bytes(usize::MAX, u32::MAX, geometry, 0, 3).is_none());
+    }
+
+    #[test]
+    fn budgets_cannot_inflate_capacity_or_hide_unknown_capacity() {
+        assert_eq!(effective_memory_budget(Some(100), Some(1000)).unwrap(), 100);
+        assert_eq!(effective_memory_budget(Some(100), Some(1)).unwrap(), 1);
+        assert!(effective_memory_budget(None, Some(1000)).is_err());
+        assert!(parse_memory_budget(Some("not-bytes")).is_err());
+        assert!(parse_memory_budget(Some("-1")).is_err());
+        assert_eq!(parse_memory_budget(Some("0")).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn rejection_is_actionable_and_names_estimate() {
+        let error = admit_request_memory(200, 100).unwrap_err().to_string();
+        assert!(error.contains("estimated 200 bytes"));
+        assert!(error.contains("only 100 bytes are available"));
+        assert!(error.contains("reduce prompt/media length or max_new_tokens"));
+    }
+}

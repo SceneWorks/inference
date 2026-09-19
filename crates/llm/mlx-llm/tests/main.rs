@@ -62,6 +62,9 @@ mod joycaption;
 #[path = "ltx_2_5_te_tier_quality.rs"]
 mod ltx_2_5_te_tier_quality;
 
+#[path = "native_composition.rs"]
+mod native_composition;
+
 #[path = "paged.rs"]
 mod paged;
 

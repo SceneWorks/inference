@@ -53,6 +53,7 @@ pub mod prepare;
 pub mod prism;
 pub mod registry;
 pub mod request;
+pub mod resource;
 pub mod schedule;
 pub mod speculative;
 pub mod starvector;
@@ -95,6 +96,11 @@ pub use registry::{
 };
 pub use request::{
     LoadSpec, MtpMode, Quantize, ReasoningEffort, Sampling, TextLlmRequest, ThinkingMode,
+};
+pub use resource::{
+    admit_request_memory, available_host_memory_bytes, checkpoint_payload_bytes,
+    effective_memory_budget, estimate_request_bytes, operational_memory_override,
+    LlmMemoryGeometry, AVAILABLE_MEMORY_OVERRIDE,
 };
 pub use schedule::{Scheduler, SeqId, SeqSpec};
 pub use speculative::{accept_greedy_run, accept_token, ngram_propose, Acceptance};

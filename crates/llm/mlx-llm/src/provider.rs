@@ -16,8 +16,8 @@ use std::time::Instant;
 use core_llm::{
     AudioRef, Channel, ChatTemplate, Constraint, ConstraintDecodeTable, ConstraintKind, Content,
     Error as CoreError, FinishReason as CoreFinish, ImageRef, IncrementalDetok, JinjaChatTemplate,
-    JsonConstraint, Llama3Template, LoadSpec, Message, ModelSamplingDefaults, MtpMode, Quantize,
-    ReasoningEffort, RenderOptions, Result as CoreResult, Sampling, StopMatcher,
+    JsonConstraint, Llama3Template, LlmMemoryGeometry, LoadSpec, Message, ModelSamplingDefaults,
+    MtpMode, Quantize, ReasoningEffort, RenderOptions, Result as CoreResult, Sampling, StopMatcher,
     StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
     TextLlmRequest, ThinkingSegmenter, Tokenizer, ToolCallSegmenter, Usage, VideoRef,
 };
@@ -76,6 +76,55 @@ impl Decode for Decoder {
 }
 
 impl Decoder {
+    fn memory_geometry(&self) -> LlmMemoryGeometry {
+        let (query_heads, kv_heads, head_dim, layers, hidden, intermediate, vocab, recurrent) =
+            match self {
+                Decoder::Causal(m) => {
+                    let c = m.config();
+                    (
+                        c.num_heads,
+                        c.num_kv_heads,
+                        c.head_dim,
+                        c.num_layers,
+                        c.hidden_size,
+                        c.intermediate_size,
+                        c.vocab_size,
+                        0,
+                    )
+                }
+                Decoder::Qwen35(m) => {
+                    let c = m.config();
+                    (
+                        c.num_heads,
+                        c.num_kv_heads,
+                        c.head_dim,
+                        c.num_layers,
+                        c.hidden_size,
+                        c.intermediate_size,
+                        c.vocab_size,
+                        (c.num_layers as u64)
+                            .saturating_mul(c.linear_num_value_heads as u64)
+                            .saturating_mul(c.linear_value_head_dim as u64)
+                            .saturating_mul(
+                                (c.linear_key_head_dim + c.linear_conv_kernel_dim) as u64,
+                            )
+                            .saturating_mul(4),
+                    )
+                }
+            };
+        LlmMemoryGeometry {
+            query_heads: query_heads.max(0) as u64,
+            kv_heads: kv_heads.max(0) as u64,
+            head_dim: head_dim.max(0) as u64,
+            layers: layers as u64,
+            element_bytes: 4,
+            hidden_size: hidden as u64,
+            intermediate_size: intermediate as u64,
+            vocab_size: vocab as u64,
+            recurrent_bytes: recurrent,
+        }
+    }
+
     fn is_quantized(&self) -> bool {
         match self {
             Decoder::Causal(m) => m.is_quantized(),
@@ -111,6 +160,90 @@ struct Qwen35Vision {
 }
 
 impl Qwen35Vision {
+    fn estimate_workspace(
+        &self,
+        images: &[&ImageRef],
+        videos: &[&VideoRef],
+    ) -> CoreResult<(usize, u64)> {
+        let cfg = self.tower.config();
+        let patch = cfg.patch_size.max(1) as usize;
+        let merge = self.spatial_merge_size.max(1) as usize;
+        let temporal = self.processor.temporal_patch_size.max(1);
+        let mut tokens = 0usize;
+        let mut pixels = 0u64;
+        for image in images {
+            let (h, w) = self
+                .processor
+                .smart_resize(image.height as usize, image.width as usize)
+                .map_err(to_core)?;
+            tokens = tokens
+                .checked_add((h / patch) * (w / patch) / (merge * merge))
+                .ok_or_else(|| {
+                    CoreError::InvalidRequest("visual token geometry overflow".into())
+                })?;
+            pixels = pixels.saturating_add((h as u64).saturating_mul(w as u64).saturating_mul(12));
+        }
+        for video in videos {
+            let frame = video
+                .frames
+                .first()
+                .ok_or_else(|| CoreError::InvalidRequest("video has no frames".into()))?;
+            let t = video.frames.len().div_ceil(temporal);
+            let (h, w) = self
+                .processor
+                .smart_resize_with(
+                    frame.height as usize,
+                    frame.width as usize,
+                    t,
+                    self.processor.video_min_pixels,
+                    self.processor.video_max_pixels,
+                )
+                .map_err(to_core)?;
+            tokens = tokens
+                .checked_add(t * (h / patch) * (w / patch) / (merge * merge))
+                .ok_or_else(|| {
+                    CoreError::InvalidRequest("visual token geometry overflow".into())
+                })?;
+            pixels = pixels.saturating_add(
+                (t as u64)
+                    .saturating_mul(temporal as u64)
+                    .saturating_mul(h as u64)
+                    .saturating_mul(w as u64)
+                    .saturating_mul(12),
+            );
+        }
+        let activations = (tokens as u64)
+            .checked_mul(cfg.hidden_size.max(0) as u64)
+            .and_then(|v| {
+                v.checked_mul((cfg.depth + cfg.deepstack_visual_indexes.len() + 2) as u64)
+            })
+            .and_then(|v| v.checked_mul(4))
+            .ok_or_else(|| CoreError::InvalidRequest("visual workspace overflow".into()))?;
+        // The tower attends over unmerged patches, not the merged language tokens.
+        // Pricing all frames together is conservative even when attention is frame-local.
+        let patches = (tokens as u64)
+            .checked_mul(merge as u64)
+            .and_then(|v| v.checked_mul(merge as u64))
+            .ok_or_else(|| CoreError::InvalidRequest("visual patch geometry overflow".into()))?;
+        let attention = patches
+            .checked_mul(patches)
+            .and_then(|v| v.checked_mul(cfg.num_heads.max(0) as u64))
+            .and_then(|v| v.checked_mul(12))
+            .ok_or_else(|| {
+                CoreError::InvalidRequest("visual attention workspace overflow".into())
+            })?;
+        let mlp = patches
+            .checked_mul(cfg.intermediate_size.max(0) as u64)
+            .and_then(|v| v.checked_mul(12))
+            .ok_or_else(|| CoreError::InvalidRequest("visual MLP workspace overflow".into()))?;
+        let required = pixels
+            .checked_add(activations)
+            .and_then(|v| v.checked_add(attention))
+            .and_then(|v| v.checked_add(mlp))
+            .ok_or_else(|| CoreError::InvalidRequest("visual workspace overflow".into()))?;
+        Ok((tokens, required))
+    }
+
     /// Encode one image to its merged patch rows `[n_tokens, hidden]` (the merger output is already
     /// the language hidden size — no separate projector), the per-tap **DeepStack** feature sets
     /// (each `[n_tokens, hidden]`, one per `deepstack_visual_indexes` tap), plus the image's
@@ -275,6 +408,24 @@ fn collect_audio(messages: &[Message]) -> Vec<&AudioRef> {
         .collect()
 }
 
+fn request_media_workspace_bytes(messages: &[Message]) -> CoreResult<u64> {
+    messages.iter().try_fold(0u64, |total, message| {
+        message.content.iter().try_fold(total, |total, content| {
+            let bytes = match content {
+                Content::Image(image) => (image.pixels.len() as u64).saturating_mul(4),
+                Content::Video(video) => video.frames.iter().fold(0u64, |sum, frame| {
+                    sum.saturating_add((frame.pixels.len() as u64).saturating_mul(4))
+                }),
+                Content::Audio(audio) => (audio.samples.len() as u64).saturating_mul(16),
+                Content::Text(_) => 0,
+            };
+            total
+                .checked_add(bytes)
+                .ok_or_else(|| CoreError::InvalidRequest("media workspace overflow".into()))
+        })
+    })
+}
+
 /// Gemma 4's rendered image marker — the single token its chat template emits for an image part,
 /// which the processor (here, [`LlamaProvider::prepare_gemma4`]) expands into
 /// `boi` + N soft tokens + `eoi`.
@@ -425,16 +576,35 @@ impl LlamaProvider {
     /// the decoder architecture from `config.json` (Llama / Mistral / Qwen3) and optionally
     /// quantizes the projections on load per `spec.quantize`.
     pub fn load(spec: &LoadSpec) -> CoreResult<Self> {
-        let dir = Path::new(&spec.source);
-        if dir.extension().and_then(|v| v.to_str()) == Some("gguf") {
-            return Self::load_prism_gguf(spec, dir);
-        }
-        if spec.projector_source.is_some() {
+        if spec.projector_source.is_some()
+            && Path::new(&spec.source).extension().and_then(|v| v.to_str()) != Some("gguf")
+        {
             return Err(CoreError::Unsupported(
                 "[mlx-llama] projector_source is only valid for a separable Prism GGUF model; \
                  safetensors snapshots carry their vision tower in the snapshot"
                     .into(),
             ));
+        }
+        let payload = core_llm::checkpoint_payload_bytes(Path::new(&spec.source))?;
+        let projector = spec
+            .projector_source
+            .as_ref()
+            .map(|p| core_llm::checkpoint_payload_bytes(Path::new(p)))
+            .transpose()?
+            .unwrap_or(0);
+        let required = payload
+            .checked_mul(2)
+            .and_then(|v| v.checked_add(projector.checked_mul(4)?))
+            .ok_or_else(|| CoreError::Load("load memory estimate overflow".into()))?;
+        let available = core_llm::effective_memory_budget(
+            core_llm::available_host_memory_bytes(),
+            core_llm::operational_memory_override()?,
+        )?;
+        core_llm::admit_request_memory(required, available)?;
+
+        let dir = Path::new(&spec.source);
+        if dir.extension().and_then(|v| v.to_str()) == Some("gguf") {
+            return Self::load_prism_gguf(spec, dir);
         }
         let quant = spec.quantize.map(|q| match q {
             Quantize::Q4 => QuantSpec::q4(),
@@ -969,26 +1139,82 @@ struct JsonMask<'a> {
     table: &'a ConstraintDecodeTable,
     stop_ids: Vec<u32>,
     accepted: Vec<i32>,
+    initial_reasoning: bool,
+    reasoning: bool,
+    reasoning_tail: String,
+    allow: Vec<bool>,
 }
 
 impl<'a> JsonMask<'a> {
-    fn new(table: &'a ConstraintDecodeTable, stop_ids: impl IntoIterator<Item = u32>) -> Self {
+    fn new(
+        table: &'a ConstraintDecodeTable,
+        stop_ids: impl IntoIterator<Item = u32>,
+        reasoning: bool,
+    ) -> Self {
         let stop_ids = stop_ids.into_iter().collect::<Vec<_>>();
         Self {
             inner: JsonConstraint::new(table, stop_ids.iter().copied()),
             table,
             stop_ids,
             accepted: Vec::new(),
+            initial_reasoning: reasoning,
+            reasoning,
+            reasoning_tail: String::new(),
+            allow: vec![false; table.pieces.len()],
+        }
+    }
+
+    fn accept_reasoning_piece(&mut self, piece: &str) {
+        self.reasoning_tail.push_str(piece);
+        if let Some(end) = self.reasoning_tail.find("</think>") {
+            let answer = self.reasoning_tail[end + "</think>".len()..].to_string();
+            self.reasoning = false;
+            self.reasoning_tail.clear();
+            let accepted = self.inner.accept_text(&answer);
+            debug_assert!(accepted);
+            return;
+        }
+        let keep = (1.."</think>".len())
+            .rev()
+            .find(|&n| self.reasoning_tail.ends_with(&"</think>"[..n]))
+            .unwrap_or(0);
+        if self.reasoning_tail.len() > keep {
+            self.reasoning_tail
+                .drain(..self.reasoning_tail.len() - keep);
         }
     }
 }
 
 impl ConstraintMask for JsonMask<'_> {
     fn allowed(&mut self) -> &[bool] {
-        self.inner.allowed()
+        if !self.reasoning {
+            return self.inner.allowed();
+        }
+        for (id, slot) in self.allow.iter_mut().enumerate() {
+            if self.stop_ids.contains(&(id as u32)) {
+                *slot = false;
+                continue;
+            }
+            let mut candidate = self.reasoning_tail.clone();
+            candidate.push_str(&self.table.pieces[id]);
+            *slot = candidate
+                .find("</think>")
+                .is_none_or(|end| self.inner.allows_text(&candidate[end + "</think>".len()..]));
+        }
+        &self.allow
     }
     fn accept(&mut self, token: i32) {
-        self.inner.accept(token as u32);
+        if self.reasoning {
+            let piece = self
+                .table
+                .pieces
+                .get(token as usize)
+                .cloned()
+                .unwrap_or_default();
+            self.accept_reasoning_piece(&piece);
+        } else {
+            self.inner.accept(token as u32);
+        }
         self.accepted.push(token);
     }
 }
@@ -1001,9 +1227,13 @@ impl RewindableConstraintMask for JsonMask<'_> {
     fn rewind(&mut self, checkpoint: usize) {
         self.accepted.truncate(checkpoint);
         self.inner = JsonConstraint::new(self.table, self.stop_ids.iter().copied());
-        for &token in &self.accepted {
-            self.inner.accept(token as u32);
+        self.reasoning_tail.clear();
+        self.reasoning = self.initial_reasoning;
+        let accepted = self.accepted.clone();
+        for token in accepted {
+            self.accept(token);
         }
+        self.accepted.truncate(checkpoint);
     }
 }
 
@@ -1207,6 +1437,41 @@ impl TextLlm for LlamaProvider {
             .map(|id| id as i32)
             .collect();
 
+        // MLX uses unified memory. Admit from a fresh host availability snapshot before visual
+        // preprocessing or model execution, using pure request geometry for visual expansion.
+        let (visual_tokens, vision_workspace) = match &self.vision {
+            Some(vision) if multimodal => vision.estimate_workspace(&images, &videos)?,
+            _ => (0, 0),
+        };
+        let vision_workspace = vision_workspace
+            .checked_add(request_media_workspace_bytes(&req.messages)?)
+            .ok_or_else(|| CoreError::InvalidRequest("media workspace overflow".into()))?;
+        let admitted_prompt = prompt_ids
+            .len()
+            .checked_add(visual_tokens)
+            .ok_or_else(|| CoreError::InvalidRequest("expanded prompt geometry overflow".into()))?;
+        let required = core_llm::estimate_request_bytes(
+            admitted_prompt,
+            req.max_new_tokens,
+            self.model.memory_geometry(),
+            vision_workspace,
+            match req.mtp {
+                MtpMode::Off => 0,
+                MtpMode::Auto => self
+                    .descriptor
+                    .capabilities
+                    .mtp
+                    .map_or(0, |c| c.recommended_draft_tokens),
+                MtpMode::Enabled { draft_tokens } => draft_tokens,
+            },
+        )
+        .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
+        let available = core_llm::effective_memory_budget(
+            core_llm::available_host_memory_bytes(),
+            core_llm::operational_memory_override()?,
+        )?;
+        core_llm::admit_request_memory(required, available)?;
+
         // Encode + splice the visuals and compute M-RoPE positions (the placeholder-expanded prompt
         // becomes the effective sequence). `None` on the text-only path.
         let qwen_prefill_started = (multimodal && !gemma4_mm_request).then(Instant::now);
@@ -1259,6 +1524,8 @@ impl TextLlm for LlamaProvider {
         }
 
         // Structured-output constraint (story 7166): build a JSON mask over the cached decode table.
+        let constraint_starts_in_reasoning =
+            self.descriptor.capabilities.supports_thinking && prompt_opens_thinking(&prompt);
         let mut json_mask = match req.constraint {
             Some(Constraint::Json) => {
                 let table = self
@@ -1267,6 +1534,7 @@ impl TextLlm for LlamaProvider {
                 Some(JsonMask::new(
                     table,
                     self.stop_tokens.iter().map(|&i| i as u32),
+                    constraint_starts_in_reasoning,
                 ))
             }
             None => None,
@@ -1304,7 +1572,7 @@ impl TextLlm for LlamaProvider {
         // otherwise the reasoning would be misclassified as answer. Disabled mode renders a *closed*
         // `<think>\n\n</think>`, so this correctly does not prime.
         if let Some(seg) = segmenter.as_mut() {
-            if prompt_opens_thinking(&prompt) {
+            if constraint_starts_in_reasoning {
                 let _ = seg.push("<think>");
                 debug_assert!(seg.in_thinking());
             }
@@ -1991,6 +2259,67 @@ fn gemma4_multimodal(v: &serde_json::Value, block: &str, token_key: &str) -> boo
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn reasoning_boundary_commits_same_token_json_in_release_builds() {
+        let table = core_llm::ConstraintDecodeTable {
+            pieces: vec!["</think>{}".into(), String::new(), "{".into()],
+            special: [1].into_iter().collect(),
+        };
+        let mut mask = JsonMask::new(&table, [1], true);
+        assert!(mask.allowed()[0]);
+        mask.accept(0);
+        assert!(
+            mask.allowed()[1],
+            "same-token answer must commit even with debug assertions off"
+        );
+        assert!(
+            !mask.allowed()[2],
+            "completed answer cannot begin a second JSON value"
+        );
+        let mark = mask.checkpoint();
+        mask.rewind(mark);
+        assert!(
+            mask.allowed()[1],
+            "MTP rewind must replay phase and same-token JSON"
+        );
+    }
+
+    #[test]
+    fn json_constraint_waits_for_split_reasoning_close_and_rewinds_phase() {
+        let table = ConstraintDecodeTable {
+            pieces: vec![
+                "reason".into(),
+                "</thi".into(),
+                "nk>".into(),
+                "{".into(),
+                "x".into(),
+                "</think>x".into(),
+                String::new(),
+            ],
+            special: [6].into_iter().collect(),
+        };
+        let mut mask = JsonMask::new(&table, [6], true);
+        assert!(mask.allowed()[0]);
+        assert!(
+            !mask.allowed()[5],
+            "invalid same-token JSON suffix is masked"
+        );
+        assert!(!mask.allowed()[6], "EOS cannot end an open reasoning block");
+        mask.accept(0);
+        let checkpoint = mask.checkpoint();
+        mask.accept(1);
+        mask.accept(2);
+        assert!(mask.allowed()[3], "JSON begins only after split </think>");
+        assert!(!mask.allowed()[4]);
+        mask.rewind(checkpoint);
+        assert!(mask.allowed()[1], "rewind restores the reasoning phase");
+        assert!(!mask.allowed()[6]);
+
+        let mut disabled = JsonMask::new(&table, [6], false);
+        assert!(disabled.allowed()[3], "disabled thinking starts in JSON");
+        assert!(!disabled.allowed()[0]);
+    }
 
     #[test]
     fn reasoning_controls_are_advertised_only_when_template_names_them() {
