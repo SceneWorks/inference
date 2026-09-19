@@ -20,8 +20,17 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
           fetch-depth: 0
+      - name: Initialize evidence using the known Windows command shell
+        shell: cmd
+        run: |
+          if not exist "%GITHUB_WORKSPACE%\diagnostic-artifacts" mkdir "%GITHUB_WORKSPACE%\diagnostic-artifacts"
+          echo Diagnostic setup started>"%GITHUB_WORKSPACE%\diagnostic-artifacts\bootstrap.log"
+          where powershell.exe >>"%GITHUB_WORKSPACE%\diagnostic-artifacts\bootstrap.log" 2>&1
+          if errorlevel 1 exit /b 1
+          if not exist E:\ (echo Required E drive missing>>"%GITHUB_WORKSPACE%\diagnostic-artifacts\bootstrap.log" & exit /b 1)
+          if not exist "%VCVARS%" (echo Required VCVARS missing>>"%GITHUB_WORKSPACE%\diagnostic-artifacts\bootstrap.log" & exit /b 1)
       - name: Preserve setup evidence and select Git Bash
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           $logs = Join-Path $env:GITHUB_WORKSPACE 'diagnostic-artifacts'
@@ -41,7 +50,7 @@ jobs:
           toolchain: 1.96.0
       - name: Preserve toolchain setup outcome
         if: always()
-        shell: pwsh
+        shell: powershell
         run: |
           $logs = Join-Path $env:GITHUB_WORKSPACE 'diagnostic-artifacts'
           New-Item -ItemType Directory -Force $logs | Out-Null
@@ -49,7 +58,7 @@ jobs:
           & rustc +1.96.0 -Vv 2>&1 | Out-File "$logs/toolchain-setup.txt" -Append
           if ($LASTEXITCODE -ne 0) { throw 'Required compiler not available' }
       - name: Compare immutable baseline and candidate (CPU tensors only)
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           $root = "E:\Codex-diagnostics\sc-23935\$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
@@ -94,7 +103,7 @@ jobs:
           $actual = (Get-FileHash $Path -Algorithm SHA256).Hash
           "$Label $actual" | Add-Content $Evidence
           if ($actual -ne $Expected) { throw "Golden changed during $Label" }
-          '@ | Set-Content $guard
+          '@ | Set-Content $guard -Encoding ascii
             $cmd = Join-Path $root "$name.cmd"
             @"
           @echo off
@@ -114,17 +123,17 @@ jobs:
             set RESULT=!errorlevel!
             echo !RESULT!>> "$logs\$name-exit-codes.txt"
             if not !RESULT!==0 set PROBE_FAILED=1
-            pwsh -NoProfile -File "$guard" -Path "$golden" -Expected "$goldenHash" -Evidence "$logs\$name-golden-hashes.txt" -Label "original-%%R"
+            powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$guard" -Path "$golden" -Expected "$goldenHash" -Evidence "$logs\$name-golden-hashes.txt" -Label "original-%%R"
             if errorlevel 1 set PROBE_FAILED=1
             cargo test --locked -p candle-llm --features cuda --test architecture_forward diagnostic_full_forward_bits -- --exact --nocapture > "$logs\$name-bits-%%R.log" 2>&1
             set RESULT=!errorlevel!
             echo !RESULT!>> "$logs\$name-exit-codes.txt"
             if not !RESULT!==0 set PROBE_FAILED=1
-            pwsh -NoProfile -File "$guard" -Path "$golden" -Expected "$goldenHash" -Evidence "$logs\$name-golden-hashes.txt" -Label "bits-%%R"
+            powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$guard" -Path "$golden" -Expected "$goldenHash" -Evidence "$logs\$name-golden-hashes.txt" -Label "bits-%%R"
             if errorlevel 1 set PROBE_FAILED=1
           )
           exit /b %PROBE_FAILED%
-          "@ | Set-Content $cmd
+          "@ | Set-Content $cmd -Encoding ascii
             $process = Start-Process cmd.exe -ArgumentList @('/d','/c', $cmd) -PassThru -RedirectStandardOutput "$logs\$name-stdout.log" -RedirectStandardError "$logs\$name-stderr.log"
             $timedOut = -not $process.WaitForExit(1500000)
             if ($timedOut) {
