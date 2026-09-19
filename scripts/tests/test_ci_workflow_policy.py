@@ -3864,11 +3864,18 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn('matrix-status --runtime-sha "%GITHUB_SHA%"', candle_commands)
         self.assertIn('verify-matrix-seal --runtime-sha "%GITHUB_SHA%"', candle_commands)
 
+        # Expanding a leading ~/ is metadata preparation, not model materialization. It must
+        # also precede qualification in preflight-only runs so the inspected path is real.
+        resolver = next(step for step in mlx["steps"] if step.get("name") == "Resolve runner-local snapshot paths")
+        qualification = next(step for step in mlx["steps"] if step.get("id") == "mlx_snapshot_metadata")
+        self.assertNotIn("if", resolver)
+        self.assertLess(mlx["steps"].index(resolver), mlx["steps"].index(qualification))
+        self.assertIn("scripts/release/resolve_snapshot_paths.py", resolver["run"])
         for job in (mlx, candle):
             for step in job["steps"]:
                 name = step.get("name", "")
                 is_materialization = name.startswith(
-                    ("Resolve runner-local", "Install pinned snapshot", "Verify immutable", "Build one native", "Run MLX", "Run Candle")
+                    ("Install pinned snapshot", "Verify immutable", "Build one native", "Run MLX", "Run Candle")
                 ) or step.get("uses", "").startswith("actions/download-artifact")
                 if is_materialization:
                     self.assertIn(

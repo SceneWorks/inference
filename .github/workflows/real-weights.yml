@@ -1722,6 +1722,10 @@ jobs:
           mkdir -p "$RUNNER_TEMP/qwen38-bonsai-mlx"
           python3.12 scripts/release/qwen38_bonsai_terminal.py hardware --output "$RUNNER_TEMP/qwen38-bonsai-mlx/hardware-before.json"
           cat "$RUNNER_TEMP/qwen38-bonsai-mlx/hardware-before.json"
+      - name: Resolve runner-local snapshot paths
+        run: >-
+          python3.12 scripts/release/resolve_snapshot_paths.py
+          BONSAI_QWEN38_SNAPSHOT BONSAI_MLX_SNAPSHOT BONSAI_GGUF_SNAPSHOT BONSAI_BASELINE_SNAPSHOT
       - name: Qualify configured macOS snapshot metadata without provisioning
         id: mlx_snapshot_metadata
         continue-on-error: true
@@ -1768,11 +1772,6 @@ jobs:
             done
           done
           exit 0
-      - name: Resolve runner-local snapshot paths
-        if: inputs.qwen38_bonsai_preflight_only != true
-        run: >-
-          python3.12 scripts/release/resolve_snapshot_paths.py
-          BONSAI_QWEN38_SNAPSHOT BONSAI_MLX_SNAPSHOT BONSAI_GGUF_SNAPSHOT BONSAI_BASELINE_SNAPSHOT
       - name: Report runner disk headroom
         if: inputs.qwen38_bonsai_preflight_only != true
         continue-on-error: true
