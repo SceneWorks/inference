@@ -1,19 +1,20 @@
 {
   "schema_version": 1,
   "suite": "qwen38-bonsai-native-v1",
+  "acceptance_contract": "qwen38-bonsai-full-v1",
   "groups": {
     "matched": {"case_ids": ["arithmetic", "logic", "ordering", "code", "json", "tool", "multi_turn", "image", "multi_image", "video_forward", "video_reverse", "context_64", "context_512", "context_2048"]},
-    "format-functional": {"case_ids": ["image"]}
+    "format-functional": {"case_ids": ["image", "video_forward", "video_reverse"], "functional_acceptance": true}
   },
   "cells": [
-    {"id": "mlx-qwen38-parent", "group": "matched", "backend": "mlx", "device": "unified", "model_key": "bonsai-qwen38-parent", "load_profile": "mlx-unified"},
-    {"id": "mlx-bonsai-mlx-2bit", "group": "matched", "backend": "mlx", "device": "unified", "model_key": "bonsai-mlx-2bit", "load_profile": "mlx-unified"},
+    {"id": "mlx-qwen38-parent", "group": "matched", "backend": "mlx", "device": "unified", "model_key": "bonsai-qwen38-parent", "load_profile": "mlx-unified", "functional_acceptance": true, "acceptance_case_ids": ["reasoning_low", "reasoning_medium", "reasoning_xhigh", "preserve_thinking", "tool_roundtrip", "json_thinking", "mtp_greedy", "mtp_json", "mtp_image", "mtp_video"]},
+    {"id": "mlx-bonsai-mlx-2bit", "group": "matched", "backend": "mlx", "device": "unified", "model_key": "bonsai-mlx-2bit", "load_profile": "mlx-unified", "functional_acceptance": true, "acceptance_case_ids": ["reasoning_low", "reasoning_medium", "reasoning_xhigh", "preserve_thinking", "tool_roundtrip", "json_thinking"]},
     {"id": "mlx-qwen3vl-baseline", "group": "matched", "backend": "mlx", "device": "unified", "model_key": "bonsai-qwen3vl-baseline", "load_profile": "mlx-unified"},
-    {"id": "candle-cuda-qwen38-parent", "group": "matched", "backend": "candle", "device": "cuda", "model_key": "bonsai-qwen38-parent", "load_profile": "candle-dense-cuda"},
-    {"id": "candle-cuda-bonsai-gguf", "group": "matched", "backend": "candle", "device": "cuda", "model_key": "bonsai-gguf", "load_profile": "candle-packed-cuda", "language_variant": "ptq1", "vision_variant": "q8"},
+    {"id": "candle-cuda-qwen38-parent", "group": "matched", "backend": "candle", "device": "cuda", "model_key": "bonsai-qwen38-parent", "load_profile": "candle-dense-cuda", "functional_acceptance": true, "acceptance_case_ids": ["reasoning_low", "reasoning_medium", "reasoning_xhigh", "preserve_thinking", "tool_roundtrip", "json_thinking", "mtp_greedy", "mtp_json", "mtp_image", "mtp_video"]},
+    {"id": "candle-cuda-bonsai-gguf", "group": "matched", "backend": "candle", "device": "cuda", "model_key": "bonsai-gguf", "load_profile": "candle-packed-cuda", "language_variant": "ptq1", "vision_variant": "q8", "functional_acceptance": true, "acceptance_case_ids": ["reasoning_low", "reasoning_medium", "reasoning_xhigh", "preserve_thinking", "tool_roundtrip", "json_thinking"]},
     {"id": "candle-cuda-qwen3vl-baseline", "group": "matched", "backend": "candle", "device": "cuda", "model_key": "bonsai-qwen3vl-baseline", "load_profile": "candle-dense-cuda"},
-    {"id": "candle-cpu-qwen38-parent", "group": "matched", "backend": "candle", "device": "cpu", "model_key": "bonsai-qwen38-parent", "load_profile": "candle-dense-cpu"},
-    {"id": "candle-cpu-bonsai-gguf", "group": "matched", "backend": "candle", "device": "cpu", "model_key": "bonsai-gguf", "load_profile": "candle-packed-cpu", "language_variant": "ptq1", "vision_variant": "q8"},
+    {"id": "candle-cpu-qwen38-parent", "group": "matched", "backend": "candle", "device": "cpu", "model_key": "bonsai-qwen38-parent", "load_profile": "candle-dense-cpu", "functional_acceptance": true, "acceptance_case_ids": ["reasoning_low", "reasoning_medium", "reasoning_xhigh", "preserve_thinking", "tool_roundtrip", "json_thinking", "mtp_greedy", "mtp_json", "mtp_image", "mtp_video"]},
+    {"id": "candle-cpu-bonsai-gguf", "group": "matched", "backend": "candle", "device": "cpu", "model_key": "bonsai-gguf", "load_profile": "candle-packed-cpu", "language_variant": "ptq1", "vision_variant": "q8", "functional_acceptance": true, "acceptance_case_ids": ["reasoning_low", "reasoning_medium", "reasoning_xhigh", "preserve_thinking", "tool_roundtrip", "json_thinking"]},
     {"id": "candle-cpu-qwen3vl-baseline", "group": "matched", "backend": "candle", "device": "cpu", "model_key": "bonsai-qwen3vl-baseline", "load_profile": "candle-dense-cpu"},
     {"id": "functional-mlx-bonsai-mlx", "group": "format-functional", "backend": "mlx", "device": "unified", "model_key": "bonsai-mlx-2bit", "load_profile": "mlx-unified"},
     {"id": "functional-candle-bonsai-mlx", "group": "format-functional", "backend": "candle", "device": "cuda", "model_key": "bonsai-mlx-2bit", "load_profile": "candle-packed-cuda"},

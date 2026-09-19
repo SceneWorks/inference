@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import tempfile
 import tomllib
@@ -22,13 +23,19 @@ HARNESS = ROOT / "scripts/release/starvector_terminal_evidence.mjs"
 PREFLIGHT_ASSEMBLER = ROOT / "scripts/release/starvector_terminal_preflight.mjs"
 
 
+def job_bounds(workflow: str, name: str) -> tuple[int, int]:
+    start = workflow.index(f"  {name}:")
+    following = re.search(r"(?m)^  [a-zA-Z0-9_-]+:\s*$", workflow[start + 1 :])
+    end = len(workflow) if following is None else start + 1 + following.start()
+    return start, end
+
+
 def terminal_workflow_errors(workflow: str) -> list[str]:
     """Return the terminal-lane omissions that must never silently join all/scheduled sweeps."""
     errors = []
     if "starvector-terminal" not in workflow.split("options:", 1)[1].split("sceneworks_revision:", 1)[0]:
         errors.append("dispatcher profile missing")
-    start = workflow.find("  starvector-terminal-mlx:")
-    end = workflow.find("\n  starvector-terminal-candle:", start)
+    start, end = job_bounds(workflow, "starvector-terminal-mlx")
     mlx = workflow[start:end]
     if "github.event_name == 'workflow_dispatch'" not in mlx or "inputs.profile == 'starvector-terminal'" not in mlx:
         errors.append("MLX terminal lane is not dispatch-only")
@@ -67,8 +74,7 @@ def terminal_workflow_errors(workflow: str) -> list[str]:
     ):
         if artifact not in mlx:
             errors.append(f"MLX terminal provenance missing {artifact}")
-    candle_start = workflow.find("  starvector-terminal-candle:")
-    candle_end = workflow.find("\n  mlx-llm:", candle_start)
+    candle_start, candle_end = job_bounds(workflow, "starvector-terminal-candle")
     candle = workflow[candle_start:candle_end]
     if "needs: starvector-terminal-mlx" not in candle:
         errors.append("Candle lane no longer serializes after MLX")
@@ -151,9 +157,8 @@ class StarVectorTerminalPolicyTests(unittest.TestCase):
 
     def test_terminal_workflow_policy_detects_dispatch_serial_and_exact_command_mutations(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
-        mlx_start = workflow.index("  starvector-terminal-mlx:")
-        candle_start = workflow.index("  starvector-terminal-candle:")
-        candle_end = workflow.index("\n  mlx-llm:", candle_start)
+        mlx_start, _ = job_bounds(workflow, "starvector-terminal-mlx")
+        candle_start, candle_end = job_bounds(workflow, "starvector-terminal-candle")
 
         def mutate(start: int, end: int, old: str) -> str:
             return workflow[:start] + workflow[start:end].replace(old, "MUTATED", 1) + workflow[end:]

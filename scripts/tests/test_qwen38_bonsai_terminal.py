@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.util
 import json
 import struct
@@ -57,6 +58,19 @@ class TerminalEvidenceTests(unittest.TestCase):
             "status": "completed",
             "provider": {"backend": backend},
             "context_admission": {"evidence_complete": True},
+            "resource_admission": {
+                "evidence_complete": True,
+                "architecturally_within_context": True,
+                "available_memory_override_bytes": 1,
+                "paired_case_id": "arithmetic",
+                "paired_prompt_tokens": 10,
+                "declared_context_tokens": 262144,
+                "record": {
+                    "status": "failed",
+                    "request": request,
+                    "error": "request requires an estimated 256 bytes of native workspace but only 1 bytes are available",
+                },
+            },
             "native_memory_before_load": {
                 "backend": backend,
                 "device": device,
@@ -86,6 +100,7 @@ class TerminalEvidenceTests(unittest.TestCase):
                     "status": "completed",
                     "evidence_complete": complete,
                     "quality_passed": quality,
+                    "functional_acceptance_passed": quality,
                     "prefill_seconds": 0.004 if complete else None,
                     "decode_seconds": 0.002 if complete else None,
                     "output": {
@@ -354,6 +369,25 @@ class TerminalEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "provider model_revision"):
             terminal.validate_receipt(run)
 
+    def test_resource_admission_requires_a_matching_within_window_workload(self) -> None:
+        mutations = {
+            "different-request": lambda resource: resource["record"].update(request={}),
+            "architectural-rejection": lambda resource: resource["record"].update(error="context limit exceeded"),
+            "outside-window": lambda resource: resource.update(declared_context_tokens=10),
+            "invented-token-count": lambda resource: resource.update(paired_prompt_tokens=999),
+            "missing-pair": lambda resource: resource.update(paired_case_id="absent"),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                run = self.make_run(name)
+                path = run / "provider.json"
+                provider = json.loads(path.read_text(encoding="utf-8"))
+                mutate(provider["resource_admission"])
+                path.write_text(json.dumps(provider), encoding="utf-8")
+                self.reseal_run(run)
+                with self.assertRaisesRegex(ValueError, "resource rejection"):
+                    terminal.validate_receipt(run)
+
     def test_tampered_or_truncated_artifact_is_rejected(self) -> None:
         run = self.make_run("tampered")
         (run / "provider.json").write_text("{}\n", encoding="utf-8")
@@ -417,6 +451,132 @@ class TerminalEvidenceTests(unittest.TestCase):
                     "admission_vision_weight_bytes": 0,
                 }
             )
+
+    def test_snapshot_metadata_qualification_is_read_only_and_revision_bound(self) -> None:
+        revision = "a" * 40
+        snapshot = self.root / revision
+        snapshot.mkdir()
+        (snapshot / "config.json").write_text("{}\n", encoding="utf-8")
+        manifest = self.root / "metadata-models.toml"
+        manifest.write_text(
+            "\n".join(
+                [
+                    "schema_version = 1",
+                    "[[models]]",
+                    'key = "fixture"',
+                    'repository = "example/fixture"',
+                    f'revision = "{revision}"',
+                    'expected_files = ["config.json"]',
+                ]
+            ),
+            encoding="utf-8",
+        )
+        output = self.root / "snapshot-metadata.json"
+        args = argparse.Namespace(
+            binding=["FIXTURE_SNAPSHOT=fixture"],
+            manifest=manifest,
+            platform="macos",
+            output=output,
+        )
+        with mock.patch.dict("os.environ", {"FIXTURE_SNAPSHOT": str(snapshot)}):
+            self.assertEqual(terminal.qualify_snapshots(args), 0)
+        record = json.loads(output.read_text(encoding="utf-8"))
+        self.assertTrue(record["all_metadata_qualified"])
+        self.assertIn("no payload hashing", record["scope"])
+        self.assertEqual(record["snapshots"][0]["revision_from_snapshot_path"], revision)
+
+    def test_snapshot_metadata_requires_all_indexed_shards_without_hashing_payloads(self) -> None:
+        revision = "a" * 40
+        snapshot = self.root / revision
+        snapshot.mkdir()
+        (snapshot / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"weight": "model-00001.safetensors"}}), encoding="utf-8"
+        )
+        manifest = self.root / "indexed.toml"
+        manifest.write_text(
+            f'[[models]]\nkey="fixture"\nrepository="example/fixture"\nrevision="{revision}"\n'
+            'expected_files=["model.safetensors.index.json"]\n', encoding="utf-8"
+        )
+        args = argparse.Namespace(binding=["FIXTURE_SNAPSHOT=fixture"], manifest=manifest,
+                                  platform="macos", output=self.root / "indexed-metadata.json")
+        with mock.patch.dict("os.environ", {"FIXTURE_SNAPSHOT": str(snapshot)}), \
+                mock.patch.object(terminal, "sha256", side_effect=AssertionError("payload hashing forbidden")):
+            self.assertEqual(terminal.qualify_snapshots(args), 1)
+            (snapshot / "model-00001.safetensors").write_bytes(b"fixture payload")
+            args.output = self.root / "complete-indexed-metadata.json"
+            self.assertEqual(terminal.qualify_snapshots(args), 0)
+        record = json.loads(args.output.read_text(encoding="utf-8"))
+        self.assertEqual(len(record["snapshots"][0]["expected_file_metadata"]), 2)
+
+    def test_snapshot_metadata_qualification_records_missing_configuration(self) -> None:
+        manifest = self.root / "metadata-models.toml"
+        manifest.write_text(
+            "\n".join(
+                [
+                    "schema_version = 1",
+                    "[[models]]",
+                    'key = "fixture"',
+                    'repository = "example/fixture"',
+                    f'revision = "{"a" * 40}"',
+                    'expected_files = ["config.json"]',
+                ]
+            ),
+            encoding="utf-8",
+        )
+        args = argparse.Namespace(
+            binding=["ABSENT_FIXTURE_SNAPSHOT=fixture"],
+            manifest=manifest,
+            platform="windows",
+            output=self.root / "missing-metadata.json",
+        )
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(terminal.qualify_snapshots(args), 1)
+        record = json.loads(args.output.read_text(encoding="utf-8"))
+        self.assertFalse(record["all_metadata_qualified"])
+        self.assertIsNone(record["snapshots"][0]["configured_path"])
+
+    def test_full_acceptance_contract_resists_case_and_route_deletion(self) -> None:
+        matrix = json.loads(
+            (SCRIPT.parents[2] / "release" / "qwen38-bonsai-matrix.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        terminal.validate_full_acceptance_contract(matrix)
+        mutants = []
+        mutant = copy.deepcopy(matrix)
+        del mutant["acceptance_contract"]
+        mutants.append(mutant)
+        for cell in matrix["cells"]:
+            mutant = copy.deepcopy(matrix)
+            mutant["cells"] = [row for row in mutant["cells"] if row["id"] != cell["id"]]
+            mutants.append(mutant)
+            if cell.get("functional_acceptance"):
+                mutant = copy.deepcopy(matrix)
+                next(row for row in mutant["cells"] if row["id"] == cell["id"])["functional_acceptance"] = False
+                mutants.append(mutant)
+        for case_id in terminal.QWEN38_ACCEPTANCE_CASES:
+            mutant = copy.deepcopy(matrix)
+            parent = next(cell for cell in mutant["cells"] if cell["id"] == "mlx-qwen38-parent")
+            parent["acceptance_case_ids"].remove(case_id)
+            mutants.append(mutant)
+        for case_id in terminal.BONSAI_ACCEPTANCE_CASES:
+            mutant = copy.deepcopy(matrix)
+            bonsai = next(cell for cell in mutant["cells"] if cell["id"] == "mlx-bonsai-mlx-2bit")
+            bonsai["acceptance_case_ids"].remove(case_id)
+            mutants.append(mutant)
+        for case_id in terminal.FORMAT_ACCEPTANCE_CASES:
+            mutant = copy.deepcopy(matrix)
+            mutant["groups"]["format-functional"]["case_ids"].remove(case_id)
+            mutants.append(mutant)
+        mutant = copy.deepcopy(matrix)
+        mutant["cells"] = [
+            cell for cell in mutant["cells"] if cell["id"] != "functional-candle-ptq1-q8"
+        ]
+        mutants.append(mutant)
+        for mutant in mutants:
+            with self.subTest(mutant=mutant):
+                with self.assertRaises(ValueError):
+                    terminal.validate_full_acceptance_contract(mutant)
 
     def test_matrix_status_lists_every_missing_or_unadmitted_cell(self) -> None:
         self.write_hardware()
@@ -547,6 +707,60 @@ class TerminalEvidenceTests(unittest.TestCase):
         hardware.write_text("{}\n", encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "matrix seal artifact mismatch"):
             terminal.verify_matrix_seal(verify)
+
+    def test_functional_acceptance_is_distinct_from_complete_evidence(self) -> None:
+        self.write_hardware()
+        manifest = self.write_manifest([("functional", "c" * 40)])
+        preflight = self.make_preflight(
+            "functional",
+            model_key="functional",
+            revision="c" * 40,
+            load_profile="candle-dense-cpu",
+        )
+        self.make_run(
+            "functional",
+            quality=False,
+            manifest_key="functional",
+            preflight_sha256=terminal.sha256(preflight),
+        )
+        matrix = self.root / "functional-matrix.json"
+        terminal.write_new(
+            matrix,
+            {
+                "schema_version": 1,
+                "suite": terminal.SUITE,
+                "groups": {
+                    "functional": {
+                        "case_ids": ["arithmetic"],
+                        "functional_acceptance": True,
+                    }
+                },
+                "cells": [
+                    {
+                        "id": "functional",
+                        "group": "functional",
+                        "backend": "candle",
+                        "device": "cpu",
+                        "model_key": "functional",
+                        "load_profile": "candle-dense-cpu",
+                    }
+                ],
+            },
+        )
+        args = argparse.Namespace(
+            root=[self.root],
+            matrix=matrix,
+            manifest=manifest,
+            runtime_sha=self.runtime_sha,
+            output=self.root / "functional-report.json",
+            markdown=self.root / "functional-report.md",
+            seal=self.root / "functional-seal.json",
+        )
+        self.assertEqual(terminal.matrix_status(args), 1)
+        report = json.loads(args.output.read_text(encoding="utf-8"))
+        self.assertTrue(report["evidence_complete"])
+        self.assertFalse(report["functional_acceptance"]["passed"])
+        self.assertTrue(args.seal.is_file(), "complete failing evidence must remain sealed")
 
     def make_single_matrix(self, label: str) -> tuple[argparse.Namespace, Path, Path]:
         evidence = self.root / label

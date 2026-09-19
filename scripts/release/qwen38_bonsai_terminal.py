@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import getpass
 import hashlib
 import json
 import os
@@ -34,6 +35,28 @@ except ImportError:
 SCHEMA_VERSION = 1
 SUITE = "qwen38-bonsai-native-v1"
 CUDA_DEVICE_INDEX = 0
+FULL_ACCEPTANCE_CONTRACT = "qwen38-bonsai-full-v1"
+FORMAT_ACCEPTANCE_CASES = ["image", "video_forward", "video_reverse"]
+QWEN38_ACCEPTANCE_CASES = [
+    "reasoning_low",
+    "reasoning_medium",
+    "reasoning_xhigh",
+    "preserve_thinking",
+    "tool_roundtrip",
+    "json_thinking",
+    "mtp_greedy",
+    "mtp_json",
+    "mtp_image",
+    "mtp_video",
+]
+BONSAI_ACCEPTANCE_CASES = [
+    "reasoning_low",
+    "reasoning_medium",
+    "reasoning_xhigh",
+    "preserve_thinking",
+    "tool_roundtrip",
+    "json_thinking",
+]
 LOAD_PROFILES: dict[str, dict[str, Any]] = {
     "mlx-unified": {
         "backend": "mlx",
@@ -677,6 +700,10 @@ def run(args: argparse.Namespace) -> int:
     )
     if args.candle_device is not None:
         env["CANDLE_LLM_DEVICE"] = args.candle_device
+    if policy["device"] == "cuda":
+        env["SCENEWORKS_LLM_AVAILABLE_MEMORY_BYTES"] = str(
+            gpu_recheck["selected_gpu_available_bytes"]
+        )
     if args.projector_path is not None:
         env["BONSAI_COMPARISON_PROJECTOR"] = str(lexical_absolute(args.projector_path))
 
@@ -868,6 +895,33 @@ def validate_receipt(
             raise ValueError(f"provider {field} does not match enclosing receipt in {root}")
     if provider.get("context_admission", {}).get("evidence_complete") is not True:
         raise ValueError(f"provider lacks a genuine context admission rejection in {root}")
+    resource = provider.get("resource_admission", {})
+    if (
+        resource.get("evidence_complete") is not True
+        or resource.get("architecturally_within_context") is not True
+        or resource.get("available_memory_override_bytes") != 1
+    ):
+        raise ValueError(f"provider lacks a genuine low-budget resource rejection in {root}")
+    paired_cases = [case for case in provider.get("cases", []) if case.get("case_id") == resource.get("paired_case_id")]
+    if len(paired_cases) != 1:
+        raise ValueError(f"resource rejection lacks its identical normal-budget workload in {root}")
+    paired = paired_cases[0]
+    probe = resource.get("record", {})
+    prompt_tokens = paired.get("output", {}).get("prompt_tokens")
+    output_budget = paired.get("request", {}).get("max_new_tokens")
+    context_tokens = resource.get("declared_context_tokens")
+    if (
+        probe.get("status") != "failed"
+        or probe.get("request") != paired.get("request")
+        or "request requires an estimated" not in probe.get("error", "")
+        or "bytes of native workspace but only 1 bytes are available" not in probe.get("error", "")
+        or not isinstance(prompt_tokens, int)
+        or prompt_tokens != resource.get("paired_prompt_tokens")
+        or not isinstance(output_budget, int)
+        or not isinstance(context_tokens, int)
+        or prompt_tokens + output_budget > context_tokens
+    ):
+        raise ValueError(f"resource rejection is not bound within the architectural window in {root}")
     memory_points = [
         provider.get("native_memory_before_load"),
         provider.get("native_memory_after_load"),
@@ -931,16 +985,30 @@ def validate(args: argparse.Namespace) -> int:
     ids = [receipt["model"]["id"] for receipt, _ in rows]
     if sorted(ids) != sorted(expected) or len(ids) != len(set(ids)):
         raise ValueError(f"model rows {ids!r} do not equal required rows {expected!r}")
-    baseline_cases = rows[0][1]["cases"]
+    selected_case_ids = getattr(args, "case_ids", None)
+
+    def selected_cases(provider: dict[str, Any]) -> list[dict[str, Any]]:
+        cases = provider["cases"]
+        if selected_case_ids is None:
+            return cases
+        by_id = {case.get("case_id"): case for case in cases}
+        if len(by_id) != len(cases) or any(case_id not in by_id for case_id in selected_case_ids):
+            raise ValueError("comparison row does not contain the exact selected cases")
+        return [by_id[case_id] for case_id in selected_case_ids]
+
+    baseline_cases = selected_cases(rows[0][1])
     identity = [(case["case_id"], case["category"], case["request"]) for case in baseline_cases]
     for receipt, provider in rows[1:]:
-        actual = [(case["case_id"], case["category"], case["request"]) for case in provider["cases"]]
+        actual = [
+            (case["case_id"], case["category"], case["request"])
+            for case in selected_cases(provider)
+        ]
         if actual != identity:
             raise ValueError(f"unequal requests or budgets for {receipt['model']['id']}")
     categories: dict[str, list[dict[str, Any]]] = {}
     raw_outputs: list[dict[str, Any]] = []
     for receipt, provider in rows:
-        for case in provider["cases"]:
+        for case in selected_cases(provider):
             row = {
                 "model_id": receipt["model"]["id"],
                 "case_id": case["case_id"],
@@ -1001,11 +1069,71 @@ def validate(args: argparse.Namespace) -> int:
     return 0
 
 
+def validate_full_acceptance_contract(spec: dict[str, Any]) -> None:
+    """Reject deletion or weakening of any capability or format acceptance route."""
+    if spec.get("acceptance_contract") != FULL_ACCEPTANCE_CONTRACT:
+        if any(str(cell.get("model_key", "")).startswith("bonsai-") for cell in spec.get("cells", [])):
+            raise ValueError("native matrix requires the full acceptance contract")
+        return
+    groups = spec.get("groups", {})
+    format_group = groups.get("format-functional", {})
+    if format_group.get("case_ids") != FORMAT_ACCEPTANCE_CASES:
+        raise ValueError(
+            "full acceptance requires image and both ordered video cases on every format route"
+        )
+    if format_group.get("functional_acceptance") is not True:
+        raise ValueError("format-functional must remain a functional acceptance group")
+    cells = spec.get("cells", [])
+    expected_matched_ids = {
+        f"{backend}-{model}"
+        for backend, models in (
+            ("mlx", ("qwen38-parent", "bonsai-mlx-2bit", "qwen3vl-baseline")),
+            ("candle-cuda", ("qwen38-parent", "bonsai-gguf", "qwen3vl-baseline")),
+            ("candle-cpu", ("qwen38-parent", "bonsai-gguf", "qwen3vl-baseline")),
+        )
+        for model in models
+    }
+    if {cell.get("id") for cell in cells if cell.get("group") == "matched"} != expected_matched_ids:
+        raise ValueError("full acceptance matched model/backend routes are incomplete")
+    required_format_ids = {
+        "functional-mlx-bonsai-mlx",
+        "functional-candle-bonsai-mlx",
+        "functional-mlx-pq2-bf16",
+        "functional-mlx-pq2-q8",
+        "functional-mlx-ptq1-bf16",
+        "functional-mlx-ptq1-q8",
+        "functional-candle-pq2-bf16",
+        "functional-candle-pq2-q8",
+        "functional-candle-ptq1-bf16",
+        "functional-candle-ptq1-q8",
+    }
+    actual_format_ids = {
+        cell.get("id") for cell in cells if cell.get("group") == "format-functional"
+    }
+    if actual_format_ids != required_format_ids:
+        raise ValueError("full acceptance format/backend/projector routes are incomplete")
+    for cell in cells:
+        expected = None
+        if cell.get("group") == "matched" and cell.get("model_key") == "bonsai-qwen38-parent":
+            expected = QWEN38_ACCEPTANCE_CASES
+        elif cell.get("group") == "matched" and cell.get("model_key") in {
+            "bonsai-mlx-2bit",
+            "bonsai-gguf",
+        }:
+            expected = BONSAI_ACCEPTANCE_CASES
+        if expected is not None:
+            if cell.get("acceptance_case_ids") != expected:
+                raise ValueError(f"full acceptance cases are incomplete for {cell.get('id')}")
+            if cell.get("functional_acceptance") is not True:
+                raise ValueError(f"native capability acceptance is disabled for {cell.get('id')}")
+
+
 def matrix_status(args: argparse.Namespace) -> int:
     expected_runtime_sha = checked_sha(args.runtime_sha, "expected runtime SHA")
     spec = json.loads(args.matrix.read_text(encoding="utf-8"))
     if spec.get("schema_version") != 1 or spec.get("suite") != SUITE:
         raise ValueError("unsupported comparison matrix schema")
+    validate_full_acceptance_contract(spec)
     cells = spec.get("cells")
     groups = spec.get("groups")
     if not isinstance(cells, list) or not cells:
@@ -1023,9 +1151,23 @@ def matrix_status(args: argparse.Namespace) -> int:
         validate_hardware_record(path)
     rows = []
     complete_runs: dict[str, list[Path]] = {group: [] for group in groups}
+    acceptance_rows: list[dict[str, Any]] = []
     sealed_files: list[tuple[int, Path]] = [
         (index, path) for index, path in enumerate(hardware_paths)
     ]
+    if spec.get("acceptance_contract") == FULL_ACCEPTANCE_CONTRACT:
+        for index, root in enumerate(roots):
+            metadata_path = root / "snapshot-metadata.json"
+            if not metadata_path.is_file():
+                raise ValueError("full acceptance requires snapshot metadata for every platform")
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if (
+                metadata.get("schema_version") != SCHEMA_VERSION
+                or metadata.get("all_metadata_qualified") is not True
+                or "no payload hashing" not in metadata.get("scope", "")
+            ):
+                raise ValueError("platform snapshot metadata is incomplete or malformed")
+            sealed_files.append((index, metadata_path))
     cuda_reservation_hashes: set[str] = set()
     for cell in cells:
         cell_id = cell["id"]
@@ -1129,10 +1271,34 @@ def matrix_status(args: argparse.Namespace) -> int:
                                 raise ValueError("CUDA run lacks a clean selected-device recheck")
                         elif recheck is not None:
                             raise ValueError("non-CUDA run unexpectedly contains a CUDA recheck")
-                        if [case.get("case_id") for case in provider["cases"]] != groups[
-                            group
-                        ].get("case_ids"):
+                        group_case_ids = groups[group].get("case_ids")
+                        acceptance_case_ids = cell.get("acceptance_case_ids", [])
+                        if not isinstance(group_case_ids, list) or not isinstance(
+                            acceptance_case_ids, list
+                        ):
+                            raise ValueError("matrix cases must be string arrays")
+                        expected_case_ids = group_case_ids + acceptance_case_ids
+                        if [case.get("case_id") for case in provider["cases"]] != expected_case_ids:
                             raise ValueError("run cases do not match matrix workload group")
+                        accepted_ids = (
+                            expected_case_ids
+                            if groups[group].get("functional_acceptance") is True
+                            or cell.get("functional_acceptance") is True
+                            else acceptance_case_ids
+                        )
+                        by_id = {case["case_id"]: case for case in provider["cases"]}
+                        acceptance_rows.extend(
+                            {
+                                "cell_id": cell_id,
+                                "case_id": case_id,
+                                "category": by_id[case_id].get("category"),
+                                "passed": by_id[case_id].get("functional_acceptance_passed") is True,
+                                "request": by_id[case_id].get("request"),
+                                "oracle": by_id[case_id].get("oracle"),
+                                "output": by_id[case_id].get("output"),
+                            }
+                            for case_id in accepted_ids
+                        )
                         row.update(status="completed", reason=None)
                         complete_runs[group].append(run_root)
                         sealed_files.append((root_index, run_root / "seal.json"))
@@ -1162,6 +1328,7 @@ def matrix_status(args: argparse.Namespace) -> int:
                         run=runs,
                         expected_model=group_ids,
                         runtime_sha=expected_runtime_sha,
+                        case_ids=groups[group]["case_ids"],
                         output=temp / "comparison.json",
                         markdown=temp / "comparison.md",
                     )
@@ -1169,6 +1336,11 @@ def matrix_status(args: argparse.Namespace) -> int:
                 comparison[group] = json.loads(
                     (temp / "comparison.json").read_text(encoding="utf-8")
                 )
+    acceptance_complete = complete and (
+        all(row["passed"] for row in acceptance_rows)
+        if acceptance_rows
+        else spec.get("acceptance_contract") != FULL_ACCEPTANCE_CONTRACT
+    )
     report = {
         "schema_version": 1,
         "suite": SUITE,
@@ -1176,6 +1348,10 @@ def matrix_status(args: argparse.Namespace) -> int:
         "evidence_complete": complete,
         "required_cells": rows,
         "comparison": comparison,
+        "functional_acceptance": {
+            "passed": acceptance_complete,
+            "rows": acceptance_rows,
+        },
         "claims": {
             "vendor_benchmark_reproduction": False,
             "vendor_quality_retention": False,
@@ -1187,6 +1363,7 @@ def matrix_status(args: argparse.Namespace) -> int:
         "# Qwen3.8 and Bonsai native matrix status",
         "",
         f"Evidence complete: **{complete}**",
+        f"Functional acceptance passed: **{acceptance_complete}**",
         "",
         "| Cell | Backend | Device | Status | Reason |",
         "|---|---|---|---|---|",
@@ -1195,6 +1372,16 @@ def matrix_status(args: argparse.Namespace) -> int:
         markdown.append(
             f"| {row['id']} | {row['backend']} | {row['device']} | {row['status']} | {row['reason'] or ''} |"
         )
+    markdown.extend(
+        [
+            "",
+            "## Functional acceptance raw outcomes",
+            "",
+            "```json",
+            json.dumps(acceptance_rows, indent=2, sort_keys=True),
+            "```",
+        ]
+    )
     for group, result in comparison.items():
         markdown.extend(
             [
@@ -1241,7 +1428,7 @@ def matrix_status(args: argparse.Namespace) -> int:
                 "files": entries,
             },
         )
-    return 0 if complete else 1
+    return 0 if complete and acceptance_complete else 1
 
 
 def verify_matrix_seal(args: argparse.Namespace) -> int:
@@ -1264,9 +1451,19 @@ def verify_matrix_seal(args: argparse.Namespace) -> int:
     ):
         raise ValueError("sealed matrix report is not complete for this campaign")
     spec = json.loads(args.matrix.read_text(encoding="utf-8"))
+    validate_full_acceptance_contract(spec)
+    if (
+        spec.get("acceptance_contract") == FULL_ACCEPTANCE_CONTRACT
+        and report.get("functional_acceptance", {}).get("passed") is not True
+    ):
+        raise ValueError("sealed matrix report did not pass functional acceptance")
     expected_root_files = {
         (index, "hardware-before.json") for index in range(len(roots))
     }
+    if spec.get("acceptance_contract") == FULL_ACCEPTANCE_CONTRACT:
+        expected_root_files.update(
+            (index, "snapshot-metadata.json") for index in range(len(roots))
+        )
     for cell in spec["cells"]:
         locations = [
             (index, root / f"{cell['id']}-preflight.json")
@@ -1450,6 +1647,94 @@ def hardware(args: argparse.Namespace) -> int:
     return 0
 
 
+def qualify_snapshots(args: argparse.Namespace) -> int:
+    """Record cheap snapshot metadata before provisioning, hashing payloads, or model loading."""
+    bindings = []
+    for value in args.binding:
+        if "=" not in value:
+            raise ValueError("snapshot binding must be ENVIRONMENT_VARIABLE=model-key")
+        environment, model_key = value.split("=", 1)
+        if not environment or not model_key:
+            raise ValueError("snapshot binding must name both an environment variable and model")
+        model = load_model(args.manifest, model_key)
+        configured = os.environ.get(environment, "").strip()
+        path = lexical_absolute(Path(configured)) if configured else None
+        expected_files = []
+        if path is not None and path.is_dir():
+            relatives = list(model.get("expected_files", []))
+            for relative in list(relatives):
+                index_path = path / relative
+                if relative.endswith(".index.json") and index_path.is_file():
+                    index = json.loads(index_path.read_text(encoding="utf-8"))
+                    for shard in sorted(set(index.get("weight_map", {}).values())):
+                        if not isinstance(shard, str) or Path(shard).is_absolute() or ".." in Path(shard).parts:
+                            raise ValueError("snapshot index contains an invalid shard path")
+                        if shard not in relatives:
+                            relatives.append(shard)
+            for relative in relatives:
+                item = path / relative
+                expected_files.append(
+                    {
+                        "path": relative,
+                        "present": item.is_file(),
+                        "bytes": item.stat().st_size if item.is_file() else None,
+                    }
+                )
+        revision_from_path = (
+            path.name.lower()
+            if path is not None
+            and len(path.name) == 40
+            and all(character in "0123456789abcdefABCDEF" for character in path.name)
+            else None
+        )
+        headers_present = bool(expected_files) and all(
+            item["present"] and isinstance(item["bytes"], int) and item["bytes"] > 0
+            for item in expected_files
+        )
+        revision_matches = revision_from_path == model["revision"]
+        bindings.append(
+            {
+                "environment": environment,
+                "model_key": model_key,
+                "repository": model["repository"],
+                "expected_revision": model["revision"],
+                "configured_path": str(path) if path is not None else None,
+                "directory_present": bool(path is not None and path.is_dir()),
+                "revision_from_snapshot_path": revision_from_path,
+                "revision_matches": revision_matches,
+                "expected_file_metadata": expected_files,
+                "metadata_qualified": bool(path is not None and headers_present and revision_matches),
+            }
+        )
+    home = Path.home()
+    candidate_roots = [
+        ("HOME", home),
+        ("default_huggingface_hub", home / ".cache" / "huggingface" / "hub"),
+    ]
+    for name in ("HF_HOME", "HF_HUB_CACHE"):
+        value = os.environ.get(name)
+        if value:
+            candidate_roots.append((name, lexical_absolute(Path(value))))
+    record = {
+        "schema_version": SCHEMA_VERSION,
+        "scope": "metadata-only; no payload hashing, provisioning, or model load",
+        "captured_unix_seconds": time.time(),
+        "requested_platform": args.platform,
+        "actual_platform": platform.system(),
+        "account": getpass.getuser(),
+        "hostname": platform.node(),
+        "candidate_cache_roots": [
+            {"name": name, "path": str(path), "present": path.is_dir()}
+            for name, path in candidate_roots
+        ],
+        "snapshots": bindings,
+        "all_metadata_qualified": bool(bindings)
+        and all(binding["metadata_qualified"] for binding in bindings),
+    }
+    write_new(args.output, record)
+    return 0 if record["all_metadata_qualified"] else 1
+
+
 def validate_hardware_record(path: Path) -> dict[str, Any]:
     record = json.loads(path.read_text(encoding="utf-8"))
     if record.get("schema_version") != 1:
@@ -1547,6 +1832,14 @@ def parser() -> argparse.ArgumentParser:
     hw = sub.add_parser("hardware")
     hw.add_argument("--output", type=Path, required=True)
     hw.set_defaults(func=hardware)
+    qualify = sub.add_parser("qualify-snapshots")
+    qualify.add_argument("--platform", choices=("macos", "windows"), required=True)
+    qualify.add_argument("--binding", action="append", required=True)
+    qualify.add_argument(
+        "--manifest", type=Path, default=Path("release/real-weight-models.toml")
+    )
+    qualify.add_argument("--output", type=Path, required=True)
+    qualify.set_defaults(func=qualify_snapshots)
     reserve = sub.add_parser("reserve-gpu")
     reserve.add_argument("--reservation", type=Path, required=True)
     reserve.add_argument("--evidence", type=Path, required=True)

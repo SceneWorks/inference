@@ -165,7 +165,19 @@ pub fn measure_case(provider: &dyn TextLlm, case: &ComparisonCase) -> Value {
                 && Some(terminal[0].0) == output.finish_reason
                 && terminal[0].1 == output.usage;
             record["status"] = json!("completed");
-            record["quality_passed"] = json!(case.oracle.matches(&output));
+            let quality_passed = case.oracle.matches(&output);
+            record["quality_passed"] = json!(quality_passed);
+            let reasoning_observed = case.request.thinking != ThinkingMode::Enabled
+                || output
+                    .thinking
+                    .as_deref()
+                    .is_some_and(|text| !text.trim().is_empty());
+            let mtp_observed = !matches!(case.request.mtp, MtpMode::Enabled { .. })
+                || output
+                    .mtp
+                    .is_some_and(|stats| stats.proposed_tokens > 0 && stats.target_forwards > 0);
+            record["functional_acceptance_passed"] =
+                json!(quality_passed && stream_ok && reasoning_observed && mtp_observed);
             record["stream_contract_passed"] = json!(stream_ok);
             record["evidence_complete"] = json!(stream_ok && output.timings.is_some());
             record["output"] = json!({"text":output.text,"thinking":output.thinking,
@@ -181,6 +193,89 @@ pub fn measure_case(provider: &dyn TextLlm, case: &ComparisonCase) -> Value {
         }
     }
     record
+}
+
+/// Execute a complete tool exchange: the model must emit the call, the harness feeds a result tied
+/// to that emitted call, and the model must then produce the final answer.
+pub fn measure_tool_roundtrip(provider: &dyn TextLlm, case: &ComparisonCase) -> Value {
+    let initial = measure_case(provider, case);
+    let calls = initial["output"]["tool_calls"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if initial["evidence_complete"] != true || calls.len() != 1 {
+        let mut failed = initial.clone();
+        failed["quality_passed"] = json!(false);
+        failed["functional_acceptance_passed"] = json!(false);
+        failed["functional_failure"] =
+            json!("initial generation did not produce one complete structured tool call");
+        failed["roundtrip_steps"] = json!([initial]);
+        return failed;
+    }
+    let call = &calls[0];
+    let name = call["name"].as_str().unwrap_or_default().to_owned();
+    let arguments = call["arguments"].as_object().cloned().unwrap_or_default();
+    let city = arguments
+        .get("city")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    let mut follow_up = text_case(
+        "tool_roundtrip_follow_up",
+        "tool_roundtrip_acceptance",
+        "Use the completed tool result and reply with only the integer temperature.",
+        "18",
+    );
+    follow_up.request.tools = case.request.tools.clone();
+    follow_up.request.messages = case.request.messages.clone();
+    let mut assistant = Message::assistant(initial["output"]["text"].as_str().unwrap_or_default())
+        .with_tool_calls(vec![core_llm::ToolCall::new(name, arguments)]);
+    if let Some(thinking) = initial["output"]["thinking"].as_str() {
+        assistant = assistant.with_thinking(thinking);
+    }
+    follow_up.request.messages.extend([
+        assistant,
+        Message::text(
+            Role::Tool,
+            json!({"city":city,"temperature_c":18}).to_string(),
+        ),
+        Message::user("Use the completed tool result and reply with only the integer temperature."),
+    ]);
+    let final_step = measure_case(provider, &follow_up);
+    let evidence_complete =
+        initial["evidence_complete"] == true && final_step["evidence_complete"] == true;
+    let quality_passed = initial["quality_passed"] == true && final_step["quality_passed"] == true;
+    json!({
+        "schema_version": 1,
+        "case_id": case.id,
+        "category": case.category,
+        "request": {
+            "initial": initial["request"].clone(),
+            "follow_up": final_step["request"].clone(),
+        },
+        "status": if evidence_complete { "completed" } else { "incomplete" },
+        "evidence_complete": evidence_complete,
+        "quality_passed": quality_passed,
+        "functional_acceptance_passed": initial["functional_acceptance_passed"] == true
+            && final_step["functional_acceptance_passed"] == true,
+        "oracle": {"kind":"tool_roundtrip", "initial":initial["oracle"].clone(), "final":final_step["oracle"].clone()},
+        "stream_contract_passed": initial["stream_contract_passed"] == true
+            && final_step["stream_contract_passed"] == true,
+        "time_to_first_token_seconds": initial["time_to_first_token_seconds"].clone(),
+        "time_to_first_token_unavailable_reason": initial["time_to_first_token_unavailable_reason"].clone(),
+        "total_seconds": initial["total_seconds"].as_f64().unwrap_or(0.0)
+            + final_step["total_seconds"].as_f64().unwrap_or(0.0),
+        "prefill_seconds": initial["prefill_seconds"].as_f64().unwrap_or(0.0)
+            + final_step["prefill_seconds"].as_f64().unwrap_or(0.0),
+        "decode_seconds": initial["decode_seconds"].as_f64().unwrap_or(0.0)
+            + final_step["decode_seconds"].as_f64().unwrap_or(0.0),
+        "events": {
+            "initial": initial["events"].clone(),
+            "follow_up": final_step["events"].clone(),
+        },
+        "output": final_step["output"].clone(),
+        "roundtrip_steps": [initial, final_step],
+    })
 }
 
 fn text_case(id: &str, category: &str, prompt: &str, answer: &str) -> ComparisonCase {
@@ -294,6 +389,106 @@ pub fn diagnostic_cases() -> Vec<ComparisonCase> {
     cases
 }
 
+/// Capability acceptance cases that are selected only for models advertising the corresponding
+/// controls. They stay outside [`diagnostic_cases`] so the matched comparison workload remains
+/// byte-for-byte equal across the parent, compressed model, and baseline.
+pub fn capability_acceptance_cases() -> Vec<ComparisonCase> {
+    let diagnostics = diagnostic_cases();
+    let by_id = |id: &str| {
+        diagnostics
+            .iter()
+            .find(|case| case.id == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("missing fixed diagnostic case {id}"))
+    };
+    let mut cases = Vec::new();
+    for (id, effort) in [
+        ("reasoning_low", core_llm::ReasoningEffort::Low),
+        ("reasoning_medium", core_llm::ReasoningEffort::Medium),
+        ("reasoning_xhigh", core_llm::ReasoningEffort::XHigh),
+    ] {
+        let mut case = by_id("arithmetic");
+        case.id = id.into();
+        case.category = "reasoning_acceptance".into();
+        case.request.thinking = ThinkingMode::Enabled;
+        case.request.reasoning_effort = Some(effort);
+        case.request.max_new_tokens = 512;
+        cases.push(case);
+    }
+
+    let mut preserve = text_case(
+        "preserve_thinking",
+        "reasoning_history_acceptance",
+        "What exact code appeared in the prior assistant reasoning? Reply with only the code.",
+        "PRESERVE-OMEGA",
+    );
+    preserve.request.messages = vec![
+        Message::user("Privately retain the code I provide."),
+        Message::assistant("I retained it.").with_thinking("The code is PRESERVE-OMEGA."),
+        Message::user(
+            "What exact code appeared in the prior assistant reasoning? Reply with only the code.",
+        ),
+    ];
+    preserve.request.thinking = ThinkingMode::Enabled;
+    preserve.request.reasoning_effort = Some(core_llm::ReasoningEffort::Medium);
+    preserve.request.preserve_thinking = Some(true);
+    preserve.request.max_new_tokens = 512;
+    cases.push(preserve);
+
+    let weather = core_llm::ToolSpec::new(
+        "lookup_weather",
+        "Look up weather for a city",
+        json!({"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}),
+    );
+    let mut tool_roundtrip = text_case(
+        "tool_roundtrip",
+        "tool_roundtrip_acceptance",
+        "Use lookup_weather to look up the weather for Paris.",
+        "",
+    );
+    tool_roundtrip.request.tools = vec![weather];
+    tool_roundtrip.oracle = AnswerOracle::Tool {
+        name: "lookup_weather".into(),
+        arguments: json!({"city":"Paris"}),
+    };
+    cases.push(tool_roundtrip);
+
+    let mut json_thinking = by_id("json");
+    json_thinking.id = "json_thinking".into();
+    json_thinking.category = "structured_reasoning_acceptance".into();
+    json_thinking.request.thinking = ThinkingMode::Enabled;
+    json_thinking.request.reasoning_effort = Some(core_llm::ReasoningEffort::Medium);
+    json_thinking.request.max_new_tokens = 512;
+    cases.push(json_thinking);
+
+    let mut mtp = by_id("arithmetic");
+    mtp.id = "mtp_greedy".into();
+    mtp.category = "mtp_acceptance".into();
+    mtp.request.mtp = MtpMode::Enabled { draft_tokens: 3 };
+    cases.push(mtp);
+
+    let mut mtp_json = by_id("json");
+    mtp_json.id = "mtp_json".into();
+    mtp_json.category = "mtp_structured_acceptance".into();
+    mtp_json.request.mtp = MtpMode::Enabled { draft_tokens: 3 };
+    mtp_json.request.thinking = ThinkingMode::Enabled;
+    mtp_json.request.reasoning_effort = Some(core_llm::ReasoningEffort::Medium);
+    mtp_json.request.max_new_tokens = 512;
+    cases.push(mtp_json);
+
+    for (source, id, category) in [
+        ("image", "mtp_image", "mtp_vision_acceptance"),
+        ("video_forward", "mtp_video", "mtp_video_acceptance"),
+    ] {
+        let mut case = by_id(source);
+        case.id = id.into();
+        case.category = category.into();
+        case.request.mtp = MtpMode::Enabled { draft_tokens: 3 };
+        cases.push(case);
+    }
+    cases
+}
+
 /// Controlled context-growth case. Repetitions are not claimed to be tokens: actual prompt-token
 /// counts must come from the provider's returned usage and the declared context limit is recorded.
 pub fn context_case(repetitions: usize) -> ComparisonCase {
@@ -332,18 +527,7 @@ pub fn run_environment(
     for repetitions in [64, 512, 2048] {
         cases.push(context_case(repetitions));
     }
-    let mut reasoning = cases[0].clone();
-    reasoning.id = "reasoning_low".into();
-    reasoning.category = "reasoning_enabled".into();
-    reasoning.request.thinking = ThinkingMode::Enabled;
-    reasoning.request.reasoning_effort = Some(core_llm::ReasoningEffort::Low);
-    reasoning.request.max_new_tokens = 512;
-    cases.push(reasoning);
-    let mut mtp = cases[0].clone();
-    mtp.id = "mtp_greedy".into();
-    mtp.category = "mtp".into();
-    mtp.request.mtp = MtpMode::Enabled { draft_tokens: 3 };
-    cases.push(mtp);
+    cases.extend(capability_acceptance_cases());
     let selected: Vec<String> = serde_json::from_str(&required("BONSAI_COMPARISON_CASES")?)
         .map_err(|error| format!("comparison cases must be a JSON string array: {error}"))?;
     if selected.is_empty()
@@ -397,12 +581,59 @@ pub fn run_environment(
                 "supports_preserve_thinking":caps.supports_preserve_thinking,
                 "mtp":caps.mtp.map(|mtp|json!({"max_draft_tokens":mtp.max_draft_tokens,"recommended_draft_tokens":mtp.recommended_draft_tokens}))});
             report["native_memory_after_load"] = memory();
+            let memory_override = "SCENEWORKS_LLM_AVAILABLE_MEMORY_BYTES";
+            let previous_override = std::env::var_os(memory_override);
+            // SAFETY: this explicitly selected ignored entrypoint runs with one test thread and no
+            // provider work in parallel. The prior process value is restored before any other case.
+            unsafe { std::env::set_var(memory_override, "1") };
+            let resource_case = &selected_cases[0];
+            let resource_record = measure_case(provider.as_ref(), resource_case);
+            match previous_override {
+                Some(value) => {
+                    // SAFETY: same single-threaded scope described above.
+                    unsafe { std::env::set_var(memory_override, value) };
+                }
+                None => {
+                    // SAFETY: same single-threaded scope described above.
+                    unsafe { std::env::remove_var(memory_override) };
+                }
+            }
+            let resource_rejected = resource_record["status"] == "failed"
+                && resource_record["error"].as_str().is_some_and(|error| {
+                    error.contains("request requires an estimated")
+                        && error
+                            .contains("bytes of native workspace but only 1 bytes are available")
+                });
+            report["resource_admission"] = json!({
+                "evidence_complete": resource_rejected,
+                "paired_case_id": resource_case.id,
+                "available_memory_override_bytes": 1,
+                "record": resource_record,
+            });
             let mut records = Vec::new();
             for case in &selected_cases {
-                let mut record = measure_case(provider.as_ref(), case);
+                let mut record = if case.id == "tool_roundtrip" {
+                    measure_tool_roundtrip(provider.as_ref(), case)
+                } else {
+                    measure_case(provider.as_ref(), case)
+                };
                 record["native_memory_after_case"] = memory();
                 records.push(record);
             }
+            // Bind the low-budget rejection to the identical workload's actual expanded token
+            // count at the ordinary operational budget, rather than claiming bytes are tokens.
+            let paired_prompt_tokens = records[0]["output"]["prompt_tokens"].as_u64();
+            let within_context = paired_prompt_tokens.is_some_and(|tokens| {
+                tokens
+                    .checked_add(u64::from(resource_case.request.max_new_tokens))
+                    .is_some_and(|total| total <= caps.max_context_tokens as u64)
+            });
+            report["resource_admission"]["paired_prompt_tokens"] = json!(paired_prompt_tokens);
+            report["resource_admission"]["declared_context_tokens"] =
+                json!(caps.max_context_tokens);
+            report["resource_admission"]["architecturally_within_context"] = json!(within_context);
+            report["resource_admission"]["evidence_complete"] =
+                json!(resource_rejected && within_context);
             // Exercise the provider's real context admission boundary without estimating token
             // count from text repetitions. A one-turn prompt plus a generation budget equal to the
             // declared complete window must be rejected before model execution because their sum
@@ -430,7 +661,8 @@ pub fn run_environment(
             let complete = records
                 .iter()
                 .all(|record| record["evidence_complete"] == true)
-                && context_admission["evidence_complete"] == true;
+                && context_admission["evidence_complete"] == true
+                && report["resource_admission"]["evidence_complete"] == true;
             report["cases"] = json!(records);
             report["context_admission"] = context_admission;
             report["status"] = json!(if complete { "completed" } else { "incomplete" });
@@ -457,6 +689,7 @@ pub fn run_environment(
 mod tests {
     use super::*;
     use core_llm::{FinishReason, GenerationTimings, TextLlmDescriptor, TextLlmOutput, Usage};
+    use std::sync::Mutex;
     use std::time::Duration;
 
     struct Stub {
@@ -576,5 +809,190 @@ mod tests {
             request["messages"][0]["content"][0]["timestamps"],
             json!([0.0, 0.5, 1.0, 1.5])
         );
+    }
+
+    struct ToolStub {
+        descriptor: TextLlmDescriptor,
+        requests: Mutex<Vec<TextLlmRequest>>,
+    }
+
+    impl TextLlm for ToolStub {
+        fn descriptor(&self) -> &TextLlmDescriptor {
+            &self.descriptor
+        }
+
+        fn validate(&self, _: &TextLlmRequest) -> core_llm::Result<()> {
+            Ok(())
+        }
+
+        fn generate(
+            &self,
+            request: &TextLlmRequest,
+            emit: &mut dyn FnMut(StreamEvent),
+        ) -> core_llm::Result<TextLlmOutput> {
+            self.requests.lock().unwrap().push(request.clone());
+            let usage = Usage {
+                prompt_tokens: 10,
+                generated_tokens: 1,
+            };
+            let mut output = TextLlmOutput {
+                usage,
+                finish_reason: Some(FinishReason::Stop),
+                timings: Some(GenerationTimings {
+                    prefill: Duration::from_millis(1),
+                    decode: Duration::from_millis(1),
+                }),
+                ..Default::default()
+            };
+            if request
+                .messages
+                .iter()
+                .any(|message| message.role == Role::Tool)
+            {
+                output.text = "18".into();
+                emit(StreamEvent::Token {
+                    id: 18,
+                    text: "18".into(),
+                    index: 0,
+                    channel: Channel::Content,
+                });
+            } else {
+                let mut arguments = serde_json::Map::new();
+                arguments.insert("city".into(), json!("Paris"));
+                output.tool_calls = vec![core_llm::ToolCall::new("lookup_weather", arguments)];
+            }
+            emit(StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+                usage,
+            });
+            Ok(output)
+        }
+    }
+
+    #[test]
+    fn tool_roundtrip_uses_the_models_call_before_final_generation() {
+        let provider = ToolStub {
+            descriptor: stub().descriptor,
+            requests: Mutex::new(Vec::new()),
+        };
+        let case = capability_acceptance_cases()
+            .into_iter()
+            .find(|case| case.id == "tool_roundtrip")
+            .unwrap();
+        let record = measure_tool_roundtrip(&provider, &case);
+        assert_eq!(record["evidence_complete"], true);
+        assert_eq!(record["quality_passed"], true);
+        assert_eq!(record["output"]["text"], "18");
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1]
+            .messages
+            .iter()
+            .any(|message| message.role == Role::Assistant && !message.tool_calls.is_empty()));
+        assert!(requests[1]
+            .messages
+            .iter()
+            .any(|message| message.role == Role::Tool));
+    }
+
+    #[test]
+    fn correct_answers_cannot_hide_ignored_reasoning_or_mtp_controls() {
+        let cases = capability_acceptance_cases();
+        for id in [
+            "reasoning_low",
+            "reasoning_medium",
+            "reasoning_xhigh",
+            "mtp_greedy",
+        ] {
+            let case = cases.iter().find(|case| case.id == id).unwrap();
+            let record = measure_case(&stub(), case);
+            assert_eq!(record["quality_passed"], true);
+            assert_eq!(record["evidence_complete"], true);
+            assert_eq!(record["functional_acceptance_passed"], false, "{id}");
+        }
+        let tool = cases
+            .iter()
+            .find(|case| case.id == "tool_roundtrip")
+            .unwrap();
+        let record = measure_tool_roundtrip(&stub(), tool);
+        assert_eq!(record["evidence_complete"], true);
+        assert_eq!(record["functional_acceptance_passed"], false);
+    }
+
+    #[test]
+    fn capability_acceptance_cases_cover_reasoning_json_mtp_and_media() {
+        let cases = capability_acceptance_cases();
+        let ids = cases
+            .iter()
+            .map(|case| case.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            [
+                "reasoning_low",
+                "reasoning_medium",
+                "reasoning_xhigh",
+                "preserve_thinking",
+                "tool_roundtrip",
+                "json_thinking",
+                "mtp_greedy",
+                "mtp_json",
+                "mtp_image",
+                "mtp_video",
+            ]
+        );
+        for (id, effort) in [
+            ("reasoning_low", core_llm::ReasoningEffort::Low),
+            ("reasoning_medium", core_llm::ReasoningEffort::Medium),
+            ("reasoning_xhigh", core_llm::ReasoningEffort::XHigh),
+        ] {
+            let case = cases.iter().find(|case| case.id == id).unwrap();
+            assert_eq!(case.request.thinking, ThinkingMode::Enabled);
+            assert_eq!(case.request.reasoning_effort, Some(effort));
+        }
+        let preserve = cases
+            .iter()
+            .find(|case| case.id == "preserve_thinking")
+            .unwrap();
+        assert_eq!(preserve.request.preserve_thinking, Some(true));
+        assert!(preserve
+            .request
+            .messages
+            .iter()
+            .any(|message| message.thinking.is_some()));
+        for id in ["mtp_greedy", "mtp_json", "mtp_image", "mtp_video"] {
+            assert!(matches!(
+                cases.iter().find(|case| case.id == id).unwrap().request.mtp,
+                MtpMode::Enabled { draft_tokens: 3 }
+            ));
+        }
+        let json = cases
+            .iter()
+            .find(|case| case.id == "json_thinking")
+            .unwrap();
+        assert_eq!(json.request.thinking, ThinkingMode::Enabled);
+        assert!(json.request.constraint.is_some());
+        let mtp_json = cases.iter().find(|case| case.id == "mtp_json").unwrap();
+        assert!(matches!(mtp_json.request.mtp, MtpMode::Enabled { .. }));
+        assert_eq!(mtp_json.request.thinking, ThinkingMode::Enabled);
+        assert!(mtp_json.request.constraint.is_some());
+        assert!(cases
+            .iter()
+            .find(|case| case.id == "mtp_image")
+            .unwrap()
+            .request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|content| matches!(content, Content::Image(_))));
+        assert!(cases
+            .iter()
+            .find(|case| case.id == "mtp_video")
+            .unwrap()
+            .request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|content| matches!(content, Content::Video(_))));
     }
 }

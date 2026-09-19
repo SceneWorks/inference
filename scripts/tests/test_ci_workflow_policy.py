@@ -3784,18 +3784,46 @@ class CiWorkflowPolicyTests(unittest.TestCase):
 
         self.assertEqual(missing_job_snapshot_env(mlx), set())
         self.assertEqual(missing_job_snapshot_env(candle), set())
+        for name in (
+            "BONSAI_QWEN38_SNAPSHOT",
+            "BONSAI_MLX_SNAPSHOT",
+            "BONSAI_GGUF_SNAPSHOT",
+            "BONSAI_BASELINE_SNAPSHOT",
+        ):
+            self.assertEqual(mlx["env"][name], f"${{{{ vars.{name} }}}}")
+            self.assertEqual(candle["env"][name], f"${{{{ vars.CANDLE_{name} }}}}")
         candle_without_mlx = copy.deepcopy(candle)
         del candle_without_mlx["env"]["BONSAI_MLX_SNAPSHOT"]
         self.assertEqual(
             missing_job_snapshot_env(candle_without_mlx), {"BONSAI_MLX_SNAPSHOT"}
         )
-        for commands in (mlx_commands, candle_commands):
+        for job, commands in ((mlx, mlx_commands), (candle, candle_commands)):
             self.assertIn("qwen38_bonsai_terminal.py hardware", commands)
+            self.assertIn("qwen38_bonsai_terminal.py qualify-snapshots", commands)
             self.assertIn("qwen38_bonsai_terminal.py preflight", commands)
             self.assertIn("qwen38_bonsai_terminal.py run ", commands)
             self.assertIn("--binary", commands)
             self.assertIn("--runtime-sha", commands)
             self.assertNotIn("cargo test -- --ignored", commands)
+            self.assertEqual(
+                commands.count("scripts/ci/report_runner_disk_headroom.sh"),
+                1 if job is mlx else 0,
+            )
+            configured_cases = "\n".join(str(value) for value in job["env"].values())
+            for case_id in (
+                "reasoning_low",
+                "reasoning_medium",
+                "reasoning_xhigh",
+                "preserve_thinking",
+                "json_thinking",
+                "tool_roundtrip",
+                "video_forward",
+                "video_reverse",
+            ):
+                self.assertIn(case_id, configured_cases)
+        for case_id in ("mtp_greedy", "mtp_json", "mtp_image", "mtp_video"):
+            self.assertIn(case_id, mlx["env"]["QWEN38_ACCEPTANCE_CASES"])
+            self.assertIn(case_id, candle["env"]["QWEN38_ACCEPTANCE_CASES"])
         self.assertLess(
             mlx_commands.index("qwen38_bonsai_terminal.py preflight"),
             mlx_commands.index("ensure_model_snapshot.py"),
