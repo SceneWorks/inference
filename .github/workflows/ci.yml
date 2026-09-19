@@ -46,6 +46,18 @@ jobs:
             Copy-Item (Join-Path $tree 'Cargo.lock') (Join-Path $logs "$name-Cargo.lock")
             $text = Get-Content $source -Raw
             if (-not $text.Contains('Weights::from_map(case.weights.clone(), Device::Cpu)') -or -not $text.Contains('input_ids(&PROMPT, &Device::Cpu)')) { throw 'CPU fixture provenance changed' }
+            # Append a separate diagnostic test; leave the original golden gate unchanged.
+            @'
+          #[test]
+          fn diagnostic_full_forward_bits() {
+              for case in &cases() {
+                  let bits: Vec<u32> = run_forward(case).into_iter().map(f32::to_bits).collect();
+                  println!("DIAGNOSTIC_BITS {} {:?}", case.name, bits);
+              }
+          }
+          '@ | Add-Content $source
+            git -C $tree diff -- crates/llm/candle-llm/tests/architecture_forward.rs | Set-Content "$logs\$name-diagnostic.patch"
+            Get-FileHash "$logs\$name-diagnostic.patch" -Algorithm SHA256 | Format-List | Out-File "$logs\$name-patch-sha256.txt"
             $cmd = Join-Path $root "$name.cmd"
             @"
           @echo off
@@ -57,8 +69,14 @@ jobs:
           nvcc --version
           cargo tree --locked -p candle-llm --features cuda -e features > "$logs\$name-dependencies.txt" 2>&1
           if errorlevel 1 exit /b 91
-          cargo test --locked -p candle-llm --features cuda --test architecture_forward every_architecture_forward_is_bit_identical_to_the_base_branch -- --exact --nocapture
-          exit /b %errorlevel%
+          set PROBE_FAILED=0
+          for %%R in (1 2) do (
+            cargo test --locked -p candle-llm --features cuda --test architecture_forward every_architecture_forward_is_bit_identical_to_the_base_branch -- --exact --nocapture > "$logs\$name-original-%%R.log" 2>&1
+            if errorlevel 1 set PROBE_FAILED=1
+            cargo test --locked -p candle-llm --features cuda --test architecture_forward diagnostic_full_forward_bits -- --exact --nocapture > "$logs\$name-bits-%%R.log" 2>&1
+            if errorlevel 1 set PROBE_FAILED=1
+          )
+          exit /b %PROBE_FAILED%
           "@ | Set-Content $cmd
             $process = Start-Process cmd.exe -ArgumentList @('/d','/c', $cmd) -PassThru -RedirectStandardOutput "$logs\$name-stdout.log" -RedirectStandardError "$logs\$name-stderr.log"
             $timedOut = -not $process.WaitForExit(1500000)
