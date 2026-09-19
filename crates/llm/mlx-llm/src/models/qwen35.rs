@@ -728,6 +728,39 @@ impl Qwen35Model {
         Ok((normalized, logits))
     }
 
+    /// Final-normalized target hidden states and logits for a fused multimodal prompt.
+    ///
+    /// The returned hidden rows are the authoritative target states used to seed Qwen3.8's MTP
+    /// predictor. Keeping this beside the ordinary token-id path prevents visual placeholders from
+    /// being re-embedded as token ids while building the predictor cache.
+    pub(crate) fn hidden_and_logits_from_embeds_with_deepstack(
+        &self,
+        embeds: &Array,
+        positions: [&[i32]; 3],
+        cache: &mut Qwen35Cache,
+        visual_pos_mask: &[bool],
+        deepstack: &[Array],
+    ) -> Result<(Array, Array)> {
+        let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
+            positions,
+            self.cfg.mrope_section_resolved(),
+            COMPUTE_DTYPE,
+        )?;
+        let h0 = embeds.as_dtype(COMPUTE_DTYPE)?;
+        let layers = &self.layers;
+        let cache_layers = &mut cache.layers;
+        let h = deepstack_fused_decoder_layers(
+            &h0,
+            visual_pos_mask,
+            deepstack,
+            layers.len(),
+            |i, h| layers[i].forward(h, &cos, &sin, &mut cache_layers[i]),
+        )?;
+        let normalized = rms_norm(&h, &self.norm, self.eps)?;
+        let logits = self.lm_head.forward(&normalized)?;
+        Ok((normalized, logits))
+    }
+
     /// Advance the in-checkpoint predictor from a token embedding plus its aligned target/previous
     /// hidden state. Returns the predictor hidden state and next-token logits for the last position.
     pub(crate) fn mtp_step(
@@ -737,6 +770,29 @@ impl Qwen35Model {
         cache: &mut MtpCache,
         offset: i32,
     ) -> Result<(Array, Array)> {
+        let embeds = self
+            .embed_tokens
+            .forward(input_ids)?
+            .as_dtype(COMPUTE_DTYPE)?;
+        let s = embeds.shape()[1];
+        let positions = (offset..offset + s).collect::<Vec<_>>();
+        self.mtp_step_from_embeds(
+            &embeds,
+            hidden_states,
+            cache,
+            [&positions, &positions, &positions],
+        )
+    }
+
+    /// Advance the predictor from already-fused token/visual embeddings at explicit M-RoPE
+    /// positions. This is the visual-prompt counterpart of [`Self::mtp_step`].
+    pub(crate) fn mtp_step_from_embeds(
+        &self,
+        embeds: &Array,
+        hidden_states: &Array,
+        cache: &mut MtpCache,
+        positions: [&[i32]; 3],
+    ) -> Result<(Array, Array)> {
         let mtp = self.mtp.as_ref().ok_or_else(|| {
             Error::Msg("qwen3_5 MTP requested but predictor is not loaded".into())
         })?;
@@ -745,10 +801,6 @@ impl Qwen35Model {
                 "qwen3_5 MTP currently requires exactly one predictor layer".into(),
             ));
         }
-        let embeds = self
-            .embed_tokens
-            .forward(input_ids)?
-            .as_dtype(COMPUTE_DTYPE)?;
         if embeds.shape() != hidden_states.shape() {
             return Err(Error::Msg(format!(
                 "qwen3_5 MTP token/hidden shape mismatch: {:?} vs {:?}",
@@ -756,12 +808,25 @@ impl Qwen35Model {
                 hidden_states.shape()
             )));
         }
+        let embeds = embeds.as_dtype(COMPUTE_DTYPE)?;
         let e = rms_norm(&embeds, &mtp.pre_fc_norm_embedding, self.eps)?;
         let h = rms_norm(hidden_states, &mtp.pre_fc_norm_hidden, self.eps)?;
         let fused = concatenate_axis(&[&e, &h], 2)?;
         let x = mtp.fc.forward(&fused)?;
         let s = x.shape()[1];
-        let (cos, sin) = self.rope.cos_sin(s, offset, COMPUTE_DTYPE)?;
+        if positions.iter().any(|row| row.len() != s as usize) {
+            return Err(Error::Msg(format!(
+                "qwen3_5 MTP position length mismatch: sequence {s}, positions [{}, {}, {}]",
+                positions[0].len(),
+                positions[1].len(),
+                positions[2].len()
+            )));
+        }
+        let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
+            positions,
+            self.cfg.mrope_section_resolved(),
+            COMPUTE_DTYPE,
+        )?;
         let mut slot = Qwen35LayerCache::Attn(std::mem::take(&mut cache.layers[0]));
         let out = mtp.layers[0].forward(&x, &cos, &sin, &mut slot)?;
         cache.layers[0] = match slot {
@@ -1880,6 +1945,7 @@ mod tests {
                 temperature: 0.0,
                 top_p: 1.0,
                 top_k: 0,
+                presence_penalty: 0.0,
                 repetition_penalty: 1.0,
                 repetition_context: 0,
             },
@@ -1977,6 +2043,7 @@ mod tests {
                 temperature: 0.8,
                 top_p: 0.95,
                 top_k: 20,
+                presence_penalty: 0.0,
                 repetition_penalty: 1.0,
                 repetition_context: 0,
             },
@@ -2018,6 +2085,142 @@ mod tests {
             "a permissive transactional constraint must preserve stochastic p/q sampling"
         );
         assert_eq!(sampled_constraint.accepted, constrained_sampled.tokens);
+    }
+
+    #[test]
+    fn multimodal_mtp_seed_uses_fused_embeddings_and_matches_text_equivalent() {
+        use std::time::Instant;
+
+        use crate::decode::{
+            generate_qwen35_mtp_multimodal_with_timings, generate_qwen35_mtp_with_timings,
+            CancelFlag, GenerationConfig, Qwen35MtpMultimodalPrompt,
+        };
+        use crate::primitives::sampler::SamplingParams;
+
+        let cfg = Qwen35Config::from_json(&cfg_json_mtp()).unwrap();
+        let model =
+            Qwen35Model::from_weights(&synthetic_weights(&cfg), "model.language_model", cfg)
+                .unwrap();
+        let ids = [1, 2, 3];
+        let embeds = model
+            .embed_input_ids(&crate::primitives::input_ids(&ids))
+            .unwrap();
+        let positions = [0, 1, 2];
+        let prompt = Qwen35MtpMultimodalPrompt {
+            input_ids: &ids,
+            embeddings: &embeds,
+            positions: [&positions, &positions, &positions],
+            visual_pos_mask: &[false, false, false],
+            deepstack: &[],
+            continuation_delta: 0,
+        };
+        let config = GenerationConfig {
+            max_new_tokens: 6,
+            sampling: SamplingParams {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 0,
+                presence_penalty: 0.0,
+                repetition_penalty: 1.0,
+                repetition_context: 0,
+            },
+            seed: Some(17),
+            stop_tokens: Vec::new(),
+        };
+        let (text, text_stats) = generate_qwen35_mtp_with_timings(
+            &model,
+            &ids,
+            &config,
+            2,
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+            None,
+        )
+        .unwrap();
+        let (visual, visual_stats) = generate_qwen35_mtp_multimodal_with_timings(
+            &model,
+            &prompt,
+            &config,
+            2,
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+            None,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(visual.output.tokens, text.output.tokens);
+        assert_eq!(visual_stats, text_stats);
+        let _ = text.timer.finish();
+        let _ = visual.timer.finish();
+
+        // Alter the middle row as an encoded visual feature. Both the target prefill and shifted
+        // MTP seed must consume that fused row rather than re-embedding placeholder token id 2.
+        let shape = embeds.shape().to_vec();
+        let hidden = shape[2] as usize;
+        let mut fused_values = embeds
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        for (i, value) in fused_values[hidden..2 * hidden].iter_mut().enumerate() {
+            *value += 0.25 + i as f32 * 0.01;
+        }
+        let fused = Array::from_slice(&fused_values, &shape);
+        let mut text_target_cache = model.new_cache();
+        let (text_hidden, _) = model
+            .hidden_and_logits(
+                &crate::primitives::input_ids(&ids),
+                &mut text_target_cache,
+                0,
+            )
+            .unwrap();
+        let mut fused_target_cache = model.new_cache();
+        let (fused_hidden, _) = model
+            .hidden_and_logits_from_embeds_with_deepstack(
+                &fused,
+                [&positions, &positions, &positions],
+                &mut fused_target_cache,
+                &[false, true, false],
+                &[],
+            )
+            .unwrap();
+        let seed_indices = Array::from_slice(&[0i32, 1], &[2]);
+        let shifted_indices = Array::from_slice(&[1i32, 2], &[2]);
+        let text_aligned = text_hidden.take_axis(&seed_indices, 1).unwrap();
+        let fused_aligned = fused_hidden.take_axis(&seed_indices, 1).unwrap();
+        let fused_shifted = fused.take_axis(&shifted_indices, 1).unwrap();
+        let mut text_mtp_cache = model.new_mtp_cache().unwrap();
+        let (_, text_mtp_logits) = model
+            .mtp_step(
+                &crate::primitives::input_ids(&ids[1..]),
+                &text_aligned,
+                &mut text_mtp_cache,
+                1,
+            )
+            .unwrap();
+        let mut fused_mtp_cache = model.new_mtp_cache().unwrap();
+        let seed_positions = [1, 2];
+        let (_, fused_mtp_logits) = model
+            .mtp_step_from_embeds(
+                &fused_shifted,
+                &fused_aligned,
+                &mut fused_mtp_cache,
+                [&seed_positions, &seed_positions, &seed_positions],
+            )
+            .unwrap();
+        let text_logits_f32 = text_mtp_logits.as_dtype(Dtype::Float32).unwrap();
+        let fused_logits_f32 = fused_mtp_logits.as_dtype(Dtype::Float32).unwrap();
+        let text_logits = text_logits_f32.as_slice::<f32>();
+        let fused_logits = fused_logits_f32.as_slice::<f32>();
+        assert!(
+            text_logits
+                .iter()
+                .zip(fused_logits)
+                .any(|(text, fused)| (text - fused).abs() > 1.0e-5),
+            "an encoded visual row must change the MTP seed distribution"
+        );
     }
 
     #[test]

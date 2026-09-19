@@ -586,6 +586,7 @@ fn sampling(value: &core_llm::Sampling) -> SamplingParams {
         temperature: value.temperature,
         top_p: value.top_p,
         top_k: value.top_k,
+        presence_penalty: value.presence_penalty,
         repetition_penalty: value.repetition_penalty,
         repetition_context: value.repetition_context,
     }

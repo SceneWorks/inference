@@ -7,6 +7,7 @@
 
 use mlx_rs::transforms::eval;
 use mlx_rs::Array;
+use std::time::Instant;
 
 use core_llm::speculative::{accept_token, sample_weighted, Acceptance};
 
@@ -20,6 +21,18 @@ use crate::error::{Error, Result};
 use crate::models::qwen35::Qwen35Model;
 use crate::primitives::input_ids;
 use crate::primitives::sampler::{sample, shaped_candidates, SplitMix64, TokenRng};
+
+/// A Qwen3.8 multimodal prompt whose visual rows have already been encoded and fused into the
+/// decoder input embeddings. MTP must seed from these embeddings and the explicit three-axis
+/// M-RoPE positions; re-embedding the placeholder ids would change the target distribution.
+pub struct Qwen35MtpMultimodalPrompt<'a> {
+    pub input_ids: &'a [i32],
+    pub embeddings: &'a Array,
+    pub positions: [&'a [i32]; 3],
+    pub visual_pos_mask: &'a [bool],
+    pub deepstack: &'a [Array],
+    pub continuation_delta: i32,
+}
 
 /// Constraint state that can be rewound after speculative exploration. Only emitted tokens remain
 /// accepted after verification.
@@ -59,6 +72,8 @@ pub fn generate_qwen35_mtp(
         on_event,
         constraint,
         should_stop,
+        None,
+        None,
         false,
     )?;
     Ok((output, stats))
@@ -86,12 +101,49 @@ pub(crate) fn generate_qwen35_mtp_with_timings(
         on_event,
         constraint,
         should_stop,
+        None,
+        None,
         true,
     )?;
     Ok((
         TimedGenerationOutput {
             output,
             timer: timer.expect("timed MTP generation preserves its phase timer"),
+        },
+        stats,
+    ))
+}
+
+/// Synchronized Qwen3.8 MTP generation from a fused image/video prompt.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_qwen35_mtp_multimodal_with_timings(
+    model: &Qwen35Model,
+    prompt: &Qwen35MtpMultimodalPrompt<'_>,
+    config: &GenerationConfig,
+    num_draft: usize,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    constraint: Option<&mut dyn RewindableConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
+    prefill_started: Instant,
+) -> Result<(TimedGenerationOutput, SpeculativeStats)> {
+    let (output, stats, timer) = generate_qwen35_mtp_inner(
+        model,
+        prompt.input_ids,
+        config,
+        num_draft,
+        cancel,
+        on_event,
+        constraint,
+        should_stop,
+        Some(prompt),
+        Some(prefill_started),
+        true,
+    )?;
+    Ok((
+        TimedGenerationOutput {
+            output,
+            timer: timer.expect("timed multimodal MTP preserves its phase timer"),
         },
         stats,
     ))
@@ -107,6 +159,8 @@ fn generate_qwen35_mtp_inner(
     on_event: &mut dyn FnMut(StreamEvent),
     mut constraint: Option<&mut dyn RewindableConstraintMask>,
     should_stop: Option<&dyn Fn() -> bool>,
+    multimodal: Option<&Qwen35MtpMultimodalPrompt<'_>>,
+    prefill_started: Option<Instant>,
     timed: bool,
 ) -> Result<(GenerationOutput, SpeculativeStats, Option<GenerationTimer>)> {
     if cancel.is_cancelled() {
@@ -130,7 +184,9 @@ fn generate_qwen35_mtp_inner(
     let mut generated = Vec::new();
     let mut finish = FinishReason::MaxTokens;
     if config.max_new_tokens == 0 {
-        let mut timer = timed.then(GenerationTimer::start);
+        let mut timer = timed.then(|| {
+            prefill_started.map_or_else(GenerationTimer::start, GenerationTimer::start_at)
+        });
         if let Some(timer) = timer.as_mut() {
             timer.finish_prefill(std::iter::empty())?;
         }
@@ -153,9 +209,18 @@ fn generate_qwen35_mtp_inner(
     let mut target_cache = model.new_cache();
     // Validation, RNG setup, and empty-cache allocation are outside the measured backend phases.
     // Start immediately before the first target/predictor prompt-cache work.
-    let mut timer = timed.then(GenerationTimer::start);
-    let (prompt_hidden, prompt_logits) =
-        model.hidden_and_logits(&input_ids(prompt_ids), &mut target_cache, 0)?;
+    let mut timer = timed
+        .then(|| prefill_started.map_or_else(GenerationTimer::start, GenerationTimer::start_at));
+    let (prompt_hidden, prompt_logits) = match multimodal {
+        Some(prompt) => model.hidden_and_logits_from_embeds_with_deepstack(
+            prompt.embeddings,
+            prompt.positions,
+            &mut target_cache,
+            prompt.visual_pos_mask,
+            prompt.deepstack,
+        )?,
+        None => model.hidden_and_logits(&input_ids(prompt_ids), &mut target_cache, 0)?,
+    };
     stats.forwards += 1;
 
     // Seed MTP with shifted prompt pairs: embed(x[j+1]) + final-normalized target H[j], at
@@ -165,9 +230,28 @@ fn generate_qwen35_mtp_inner(
         .new_mtp_cache()
         .expect("has_mtp guarantees a predictor cache");
     let mtp_seed = if prompt_len > 1 {
-        let shifted = input_ids(&prompt_ids[1..]);
+        let shifted = match multimodal {
+            Some(prompt) => seq_rows(prompt.embeddings, 1, prompt_len - 1)?,
+            None => model.embed_input_ids(&input_ids(&prompt_ids[1..]))?,
+        };
         let aligned = seq_rows(&prompt_hidden, 0, prompt_len - 1)?;
-        Some(model.mtp_step(&shifted, &aligned, &mut mtp_cache, 1)?)
+        let simple_positions;
+        let positions = match multimodal {
+            Some(prompt) => [
+                &prompt.positions[0][1..],
+                &prompt.positions[1][1..],
+                &prompt.positions[2][1..],
+            ],
+            None => {
+                simple_positions = (1..prompt_len).collect::<Vec<_>>();
+                [
+                    simple_positions.as_slice(),
+                    simple_positions.as_slice(),
+                    simple_positions.as_slice(),
+                ]
+            }
+        };
+        Some(model.mtp_step_from_embeds(&shifted, &aligned, &mut mtp_cache, positions)?)
     } else {
         None
     };
@@ -210,6 +294,7 @@ fn generate_qwen35_mtp_inner(
         finish = FinishReason::Stopped;
     }
     let mut cur = first;
+    let continuation_delta = multimodal.map_or(0, |prompt| prompt.continuation_delta);
 
     'outer: while generated.len() < config.max_new_tokens && finish != FinishReason::Stopped {
         if cancel.is_cancelled() {
@@ -231,7 +316,7 @@ fn generate_qwen35_mtp_inner(
                 &input_ids(&[cur]),
                 &last_target_hidden,
                 &mut mtp_cache,
-                base_target,
+                base_target + continuation_delta,
             )?;
             if timer.is_some() {
                 eval([&mtp_hidden, &draft_logits])?;
@@ -279,7 +364,7 @@ fn generate_qwen35_mtp_inner(
                         &input_ids(&[d]),
                         &mtp_hidden,
                         &mut mtp_cache,
-                        base_target + 1 + i as i32,
+                        base_target + continuation_delta + 1 + i as i32,
                     )?;
                     if timer.is_some() {
                         eval([&h, &q])?;
@@ -299,8 +384,11 @@ fn generate_qwen35_mtp_inner(
         let mut verify = Vec::with_capacity(1 + drafts.len());
         verify.push(cur);
         verify.extend_from_slice(&drafts);
-        let (verify_hidden, target_logits) =
-            model.hidden_and_logits(&input_ids(&verify), &mut target_cache, base_target)?;
+        let (verify_hidden, target_logits) = model.hidden_and_logits(
+            &input_ids(&verify),
+            &mut target_cache,
+            base_target + continuation_delta,
+        )?;
         if timer.is_some() {
             eval([&verify_hidden, &target_logits])?;
         }
@@ -340,8 +428,11 @@ fn generate_qwen35_mtp_inner(
         } else {
             target_cache = target_base;
             let kept = &verify[..1 + accepted];
-            let (hidden, logits) =
-                model.hidden_and_logits(&input_ids(kept), &mut target_cache, base_target)?;
+            let (hidden, logits) = model.hidden_and_logits(
+                &input_ids(kept),
+                &mut target_cache,
+                base_target + continuation_delta,
+            )?;
             if timer.is_some() {
                 eval([&hidden, &logits])?;
             }
@@ -361,7 +452,7 @@ fn generate_qwen35_mtp_inner(
                     &input_ids(&[draft]),
                     &predecessor,
                     &mut mtp_cache,
-                    base_target + 1 + i as i32,
+                    base_target + continuation_delta + 1 + i as i32,
                 )?;
                 if timer.is_some() {
                     eval([&hidden, &logits])?;

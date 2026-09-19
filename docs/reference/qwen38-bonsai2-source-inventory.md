@@ -96,6 +96,16 @@ Confirmed from the frozen MLX config/runtime metadata:
 - The frozen packed inventory contains 402 packed modules, 401 forward transform matrices, and one
   inverse embedding transform. Packaged Gated DeltaNet tensors are already grouped/reordered, so a
   native loader must preserve that layout instead of applying the upstream conversion twice.
+- The frozen template accepts `low`, `medium`, and `xhigh` and renders a distinct instruction for
+  `low`. The official Bonsai model card says low effort is not effectively supported and behaves
+  close to xhigh. Runtime compatibility therefore continues to pass an explicit `low` request to
+  the frozen template, while capability discovery recommends only `medium` and `xhigh`; `low` is
+  neither rejected as invalid syntax nor rewritten. The card's generation recommendations are
+  temperature 1.0, top-p 0.95, top-k 20, min-p 0.0, presence penalty 0, repetition penalty 1 for
+  thinking, and temperature 0.7, top-p 0.8, top-k 20, min-p 0.0, presence penalty 1.5, repetition
+  penalty 1 for non-thinking. The explicit min-p value is disabled and therefore needs no nonzero
+  filtering behavior. These remain discoverable source recommendations rather than hidden provider
+  overrides of an explicit request.
 
 Confirmed current gaps and story ownership:
 
@@ -105,7 +115,7 @@ Confirmed current gaps and story ownership:
 | Qwen MTP | Native tensor load and exact speculative execution are implemented in sc-23936; matched throughput/acceptance and frozen real-weight behavior remain unproven | evidence sc-23942/sc-23943 |
 | Bonsai MLX packed text | sc-23937 adds strict native MLX affine-2-bit projection, inverse embedding, Hadamard metadata validation, and direct PQ2_0/PTQ1_0 GGUF loading without dense expansion. Tiny numerical and provider execution cover both packed GGUF tensor types and the MLX safetensors route. Frozen real-weight behavior remains unproven. | sc-23937; real weights sc-23943 |
 | Bonsai Candle CPU/CUDA packed text | Same primitive/loader gap; GGUF PQ2_0/PTQ1_0 need explicit routing | sc-23938 |
-| Native images and video for both models/backends | Existing Qwen path needs exact Qwen3.8 proof; Bonsai packages 333 `vision_tower.*` tensors but namespace/projector integration and video parity are absent | sc-23939 |
+| Native images and video for both models/backends | sc-23939 constructs the packaged Bonsai `vision_tower.*` directly, requires an explicit `LoadSpec.projector_source` for separable GGUF, validates and maps both mixed-dtype projector layouts, and carries fused visual rows plus M-RoPE through Qwen MTP. Tiny/native conformance is implementation evidence; frozen real-weight acceptance remains sc-23943. | sc-23939; real weights sc-23943 |
 | ChatWorks import, controls, streaming, tools, lifecycle | Consumer/runtime integration is not in this repository slice | sc-23940 |
 | ChatWorks image/video ingestion | End-to-end file/URL and lifecycle flow remains open | sc-23941 |
 | Matched capability/quality/performance evidence | No stationary matched runner or results yet | sc-23942 |

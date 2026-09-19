@@ -16,17 +16,18 @@ use std::time::Instant;
 use core_llm::{
     AudioRef, Channel, ChatTemplate, Constraint, ConstraintDecodeTable, ConstraintKind, Content,
     Error as CoreError, FinishReason as CoreFinish, ImageRef, IncrementalDetok, JinjaChatTemplate,
-    JsonConstraint, Llama3Template, LoadSpec, Message, MtpMode, Quantize, RenderOptions,
-    Result as CoreResult, Sampling, StopMatcher, StreamEvent as CoreEvent, TextLlm,
-    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter,
-    Tokenizer, ToolCallSegmenter, Usage, VideoRef,
+    JsonConstraint, Llama3Template, LoadSpec, Message, ModelSamplingDefaults, MtpMode, Quantize,
+    ReasoningEffort, RenderOptions, Result as CoreResult, Sampling, StopMatcher,
+    StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
+    TextLlmRequest, ThinkingSegmenter, Tokenizer, ToolCallSegmenter, Usage, VideoRef,
 };
 
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
-    generate_from_prefill, generate_from_prefill_with_timings, generate_qwen35_mtp_with_timings,
+    generate_from_prefill, generate_from_prefill_with_timings,
+    generate_qwen35_mtp_multimodal_with_timings, generate_qwen35_mtp_with_timings,
     generate_with_timings, ConstraintMask, Decode, FinishReason, GenerationConfig,
-    RewindableConstraintMask, StreamEvent,
+    Qwen35MtpMultimodalPrompt, RewindableConstraintMask, StreamEvent,
 };
 use crate::image::Qwen35ImageProcessor;
 use crate::models::gemma4_mm;
@@ -426,6 +427,13 @@ impl LlamaProvider {
         if dir.extension().and_then(|v| v.to_str()) == Some("gguf") {
             return Self::load_prism_gguf(spec, dir);
         }
+        if spec.projector_source.is_some() {
+            return Err(CoreError::Unsupported(
+                "[mlx-llama] projector_source is only valid for a separable Prism GGUF model; \
+                 safetensors snapshots carry their vision tower in the snapshot"
+                    .into(),
+            ));
+        }
         let quant = spec.quantize.map(|q| match q {
             Quantize::Q4 => QuantSpec::q4(),
             Quantize::Q8 => QuantSpec::q8(),
@@ -481,15 +489,21 @@ impl LlamaProvider {
         // Qwen-VL vision: load the ViT tower when the checkpoint carries `model.visual.*` (a wrapped
         // VLM) and the config exposes a `vision_config`. Covers Qwen3.6 (`qwen3_5`) and Qwen3-VL
         // (`qwen3_vl`), which share the identical Qwen3-VL ViT tower. Absent → a text-only checkpoint.
-        let vision = if (arch == Architecture::Qwen35 || arch == Architecture::Qwen3Vl)
-            && cfg_value.get("vision_config").is_some()
-            && weights
-                .get("model.visual.patch_embed.proj.weight")
-                .is_some()
-        {
+        let vision_prefix = if weights.contains("model.visual.patch_embed.proj.weight") {
+            Some("model.visual")
+        } else if is_prism && weights.contains("vision_tower.patch_embed.proj.weight") {
+            Some("vision_tower")
+        } else {
+            None
+        };
+        let vision = if let (true, Some(prefix)) = (
+            (arch == Architecture::Qwen35 || arch == Architecture::Qwen3Vl)
+                && cfg_value.get("vision_config").is_some(),
+            vision_prefix,
+        ) {
             let vcfg = Qwen35VisionConfig::from_json(&cfg_value).map_err(to_core)?;
-            let tower = Qwen35VisionModel::from_weights(&weights, "model.visual", vcfg.clone())
-                .map_err(to_core)?;
+            let tower =
+                Qwen35VisionModel::from_weights(&weights, prefix, vcfg.clone()).map_err(to_core)?;
             let image_token_id = cfg_value
                 .get("image_token_id")
                 .and_then(|x| x.as_i64())
@@ -547,6 +561,20 @@ impl LlamaProvider {
         ) = load_chat_template(dir);
         descriptor.capabilities.supports_thinking = supports_thinking;
         descriptor.capabilities.supports_reasoning_effort = supports_reasoning_effort;
+        if supports_reasoning_effort {
+            descriptor.capabilities.reasoning_efforts = if is_prism {
+                vec![ReasoningEffort::XHigh, ReasoningEffort::Medium]
+            } else {
+                vec![
+                    ReasoningEffort::XHigh,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::Low,
+                ]
+            };
+        }
+        if is_prism {
+            descriptor.capabilities.model_sampling_defaults = Some(bonsai_sampling_defaults());
+        }
         descriptor.capabilities.supports_preserve_thinking = supports_preserve_thinking;
         descriptor.capabilities.supports_tools = supports_tools;
         Ok(Self {
@@ -576,10 +604,37 @@ impl LlamaProvider {
         let (thinking, reasoning, preserve, tools) = loaded.template_capabilities;
         descriptor.capabilities.supports_thinking = thinking;
         descriptor.capabilities.supports_reasoning_effort = reasoning;
+        if reasoning {
+            descriptor.capabilities.reasoning_efforts =
+                vec![ReasoningEffort::XHigh, ReasoningEffort::Medium];
+        }
+        descriptor.capabilities.model_sampling_defaults = Some(bonsai_sampling_defaults());
         descriptor.capabilities.supports_preserve_thinking = preserve;
         descriptor.capabilities.supports_tools = tools;
         let model = Qwen35Model::from_prism_weights(&loaded.weights, qcfg, &loaded.pack)
             .map_err(to_core)?;
+        let vision = match spec.projector_source.as_deref() {
+            Some(source) => {
+                let projector = crate::gguf::GgufFile::open(source).map_err(to_core)?;
+                let loaded_vision = crate::prism_vision_gguf::load(&projector).map_err(to_core)?;
+                let tower = Qwen35VisionModel::from_weights(
+                    &loaded_vision.weights,
+                    "vision_tower",
+                    loaded_vision.config.clone(),
+                )
+                .map_err(to_core)?;
+                descriptor.capabilities.supports_vision = true;
+                descriptor.capabilities.supports_video = true;
+                Some(Qwen35Vision {
+                    tower,
+                    processor: Qwen35ImageProcessor::default(),
+                    image_token_id: 248056,
+                    video_token_id: 248057,
+                    spatial_merge_size: loaded_vision.config.spatial_merge_size,
+                })
+            }
+            None => None,
+        };
         Ok(Self {
             descriptor,
             model: Decoder::Qwen35(model),
@@ -587,7 +642,7 @@ impl LlamaProvider {
             template: loaded.template,
             stop_tokens: loaded.stop_tokens,
             constraint_table: OnceCell::new(),
-            vision: None,
+            vision,
             gemma4: None,
             _prism_vision_weights: None,
         })
@@ -1131,6 +1186,9 @@ impl TextLlm for LlamaProvider {
             &RenderOptions {
                 add_generation_prompt: true,
                 enable_thinking: req.enable_thinking_kwarg(),
+                // Bonsai's official model card does not recommend `low` as an effective distinct
+                // level, so it is omitted from the selectable capability list. The frozen template
+                // still accepts and renders `low`; preserve that compatibility input verbatim.
                 reasoning_effort: req.reasoning_effort,
                 preserve_thinking: req.preserve_thinking,
                 tools: &req.tools,
@@ -1178,13 +1236,12 @@ impl TextLlm for LlamaProvider {
                 .map(|caps| caps.recommended_draft_tokens as usize),
             MtpMode::Enabled { draft_tokens } => Some(draft_tokens as usize),
         };
-        // The current MTP seeding contract is text-only: multimodal prompts require fused visual
-        // rows and M-RoPE positions. Auto safely falls back to AR; explicit enablement rejects the
-        // unsupported combination rather than silently changing the request.
-        if mtp_draft_tokens.is_some() && (multimodal || gemma4_mm_request) {
+        // Gemma 4 has no Qwen predictor. Qwen multimodal prompts use the fused-embedding MTP route
+        // below, including their explicit three-axis positions and continuation delta.
+        if mtp_draft_tokens.is_some() && gemma4_mm_request {
             if matches!(req.mtp, MtpMode::Enabled { .. }) {
                 return Err(CoreError::Unsupported(
-                    "[mlx-llama] native MTP currently supports text prompts only".into(),
+                    "[mlx-llama] native Qwen MTP is unavailable for Gemma 4 prompts".into(),
                 ));
             }
             mtp_draft_tokens = None;
@@ -1329,36 +1386,65 @@ impl TextLlm for LlamaProvider {
                 Some(m) => {
                     let (t, h, w, delta) = &m.positions;
                     let pos = [t.as_slice(), h.as_slice(), w.as_slice()];
-                    let model = self.model.as_vlm();
-                    let mut cache = model.make_cache();
-                    let first = model
-                        .prefill_with_deepstack(
-                            &m.embeds,
-                            pos,
-                            cache.as_mut(),
-                            &m.visual_pos_mask,
-                            &m.deepstack,
+                    if let (Decoder::Qwen35(model), Some(num_draft)) =
+                        (&self.model, mtp_draft_tokens)
+                    {
+                        let prompt = Qwen35MtpMultimodalPrompt {
+                            input_ids: &m.expanded_ids,
+                            embeddings: &m.embeds,
+                            positions: pos,
+                            visual_pos_mask: &m.visual_pos_mask,
+                            deepstack: &m.deepstack,
+                            continuation_delta: *delta,
+                        };
+                        let (timed, stats) = generate_qwen35_mtp_multimodal_with_timings(
+                            model,
+                            &prompt,
+                            &config,
+                            num_draft,
+                            &req.cancel,
+                            &mut sink,
+                            json_mask
+                                .as_mut()
+                                .map(|m| m as &mut dyn RewindableConstraintMask),
+                            should_stop_opt,
+                            qwen_prefill_started
+                                .expect("Qwen multimodal preparation starts the prefill clock"),
                         )
                         .map_err(to_core)?;
-                    let shifted = Shifted {
-                        model,
-                        delta: *delta,
-                    };
-                    let timed = generate_from_prefill_with_timings(
-                        &shifted,
-                        cache.as_mut(),
-                        first,
-                        m.expanded_ids.clone(),
-                        &config,
-                        &req.cancel,
-                        &mut sink,
-                        json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask),
-                        should_stop_opt,
-                        qwen_prefill_started
-                            .expect("Qwen multimodal preparation starts the prefill clock"),
-                    )
-                    .map_err(to_core)?;
-                    (timed.output, None, Some(timed.timer))
+                        (timed.output, Some(stats), Some(timed.timer))
+                    } else {
+                        let model = self.model.as_vlm();
+                        let mut cache = model.make_cache();
+                        let first = model
+                            .prefill_with_deepstack(
+                                &m.embeds,
+                                pos,
+                                cache.as_mut(),
+                                &m.visual_pos_mask,
+                                &m.deepstack,
+                            )
+                            .map_err(to_core)?;
+                        let shifted = Shifted {
+                            model,
+                            delta: *delta,
+                        };
+                        let timed = generate_from_prefill_with_timings(
+                            &shifted,
+                            cache.as_mut(),
+                            first,
+                            m.expanded_ids.clone(),
+                            &config,
+                            &req.cancel,
+                            &mut sink,
+                            json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask),
+                            should_stop_opt,
+                            qwen_prefill_started
+                                .expect("Qwen multimodal preparation starts the prefill clock"),
+                        )
+                        .map_err(to_core)?;
+                        (timed.output, None, Some(timed.timer))
+                    }
                 }
                 // Gemma 4 multimodal: prefill the spliced embeds on ordinary causal 1-D positions
                 // (no M-RoPE, so no position shift for the continuation), then decode through the
@@ -1659,8 +1745,30 @@ fn map_sampling(s: &Sampling) -> SamplingParams {
         temperature: s.temperature,
         top_p: s.top_p,
         top_k: s.top_k,
+        presence_penalty: s.presence_penalty,
         repetition_penalty: s.repetition_penalty,
         repetition_context: s.repetition_context,
+    }
+}
+
+fn bonsai_sampling_defaults() -> ModelSamplingDefaults {
+    ModelSamplingDefaults {
+        thinking: Sampling {
+            temperature: 1.0,
+            top_p: 0.95,
+            top_k: 20,
+            presence_penalty: 0.0,
+            repetition_penalty: 1.0,
+            repetition_context: 0,
+        },
+        non_thinking: Sampling {
+            temperature: 0.7,
+            top_p: 0.8,
+            top_k: 20,
+            presence_penalty: 1.5,
+            repetition_penalty: 1.0,
+            repetition_context: 0,
+        },
     }
 }
 
@@ -1710,10 +1818,21 @@ fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
 pub fn can_load(spec: &LoadSpec) -> bool {
     let dir = Path::new(&spec.source);
     if dir.extension().and_then(|v| v.to_str()) == Some("gguf") {
-        return crate::gguf::GgufFile::open(dir).ok().is_some_and(|g| {
+        let language_is_prism = crate::gguf::GgufFile::open(dir).ok().is_some_and(|g| {
             g.meta_str("general.architecture") == Some("qwen35")
                 && g.meta("prism.hadamard.version").is_some()
         });
+        if !language_is_prism {
+            return false;
+        }
+        return spec.projector_source.as_deref().is_none_or(|source| {
+            crate::gguf::GgufFile::open(source)
+                .ok()
+                .is_some_and(|projector| crate::prism_vision_gguf::validate(&projector).is_ok())
+        });
+    }
+    if spec.projector_source.is_some() {
+        return false;
     }
     let path = if dir.is_dir() {
         dir.join("config.json")
@@ -1742,7 +1861,8 @@ fn can_load_value(v: &serde_json::Value) -> bool {
 }
 
 /// **Weightless** per-snapshot vision probe (sc-8077): does `mlx-llama` serve the snapshot at
-/// `spec.source` *with* vision? Reads **only** `config.json` (never a weight shard), mirroring
+/// `spec.source` *with* vision? Reads only `config.json` for safetensors snapshots, or the GGUF
+/// language and explicitly-associated projector headers (never their tensor payloads), mirroring
 /// [`can_load`]. It drives core-llm's pre-load capability gate so a *model-first* vision-required
 /// load (`load_for_model_with(spec, with_vision())`) resolves a Qwen-VL wrapper here.
 ///
@@ -1752,6 +1872,12 @@ fn can_load_value(v: &serde_json::Value) -> bool {
 /// per-snapshot probe a genuine Qwen3-VL snapshot would be rejected at the gate (the story-D gap).
 pub fn weightless_vision(spec: &LoadSpec) -> bool {
     let dir = Path::new(&spec.source);
+    if dir.extension().and_then(|v| v.to_str()) == Some("gguf") {
+        return spec.projector_source.is_some() && can_load(spec);
+    }
+    if spec.projector_source.is_some() {
+        return false;
+    }
     let path = if dir.is_dir() {
         dir.join("config.json")
     } else {

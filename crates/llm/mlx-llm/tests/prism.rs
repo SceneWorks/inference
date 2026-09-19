@@ -64,6 +64,13 @@ fn write_fixture() -> Fixture {
         "requires_runtime":"runtime/artifact.py","hadamard_config":"hadamard.json",
         "gdn_activation_layout":"grouped","components":{"text":true,"vision":true,"mtp":false},
         "quantization":{"bits":2,"group_size":128,"mode":"affine"},
+        "image_token_id":248056,"video_token_id":248057,
+        "vision_config":{
+            "depth":1,"hidden_size":8,"num_heads":2,"intermediate_size":16,
+            "in_channels":3,"patch_size":2,"temporal_patch_size":2,
+            "spatial_merge_size":2,"out_hidden_size":128,
+            "num_position_embeddings":16,"deepstack_visual_indexes":[]
+        },
         "text_config":{
             "model_type":"qwen3_5_text","hidden_size":128,"num_hidden_layers":1,
             "intermediate_size":128,"num_attention_heads":2,"num_key_value_heads":1,
@@ -106,19 +113,45 @@ fn write_fixture() -> Fixture {
     let z = |shape: &[i32]| Array::zeros::<f32>(shape).unwrap();
     let p = "language_model.model.layers.0";
     let mut tensors = vec![
-        (
-            "vision_tower.fixture.weight".into(),
-            Array::zeros::<f32>(&[1])
-                .unwrap()
-                .as_dtype(Dtype::Float16)
-                .unwrap(),
-        ),
         ("language_model.model.norm.weight".into(), z(&[128])),
         (format!("{p}.input_layernorm.weight"), z(&[128])),
         (format!("{p}.post_attention_layernorm.weight"), z(&[128])),
         (format!("{p}.self_attn.q_norm.weight"), z(&[64])),
         (format!("{p}.self_attn.k_norm.weight"), z(&[64])),
     ];
+    let v = "vision_tower";
+    tensors.extend([
+        (format!("{v}.patch_embed.proj.weight"), z(&[8, 3, 2, 2, 2])),
+        (format!("{v}.patch_embed.proj.bias"), z(&[8])),
+        (format!("{v}.pos_embed.weight"), z(&[16, 8])),
+        (
+            format!("{v}.blocks.0.norm1.weight"),
+            Array::ones::<f32>(&[8]).unwrap(),
+        ),
+        (format!("{v}.blocks.0.norm1.bias"), z(&[8])),
+        (
+            format!("{v}.blocks.0.norm2.weight"),
+            Array::ones::<f32>(&[8]).unwrap(),
+        ),
+        (format!("{v}.blocks.0.norm2.bias"), z(&[8])),
+        (format!("{v}.blocks.0.attn.qkv.weight"), z(&[24, 8])),
+        (format!("{v}.blocks.0.attn.qkv.bias"), z(&[24])),
+        (format!("{v}.blocks.0.attn.proj.weight"), z(&[8, 8])),
+        (format!("{v}.blocks.0.attn.proj.bias"), z(&[8])),
+        (format!("{v}.blocks.0.mlp.linear_fc1.weight"), z(&[16, 8])),
+        (format!("{v}.blocks.0.mlp.linear_fc1.bias"), z(&[16])),
+        (format!("{v}.blocks.0.mlp.linear_fc2.weight"), z(&[8, 16])),
+        (format!("{v}.blocks.0.mlp.linear_fc2.bias"), z(&[8])),
+        (
+            format!("{v}.merger.norm.weight"),
+            Array::ones::<f32>(&[8]).unwrap(),
+        ),
+        (format!("{v}.merger.norm.bias"), z(&[8])),
+        (format!("{v}.merger.linear_fc1.weight"), z(&[32, 32])),
+        (format!("{v}.merger.linear_fc1.bias"), z(&[32])),
+        (format!("{v}.merger.linear_fc2.weight"), z(&[128, 32])),
+        (format!("{v}.merger.linear_fc2.bias"), z(&[128])),
+    ]);
     for (path, _, rows, width) in paths {
         packed(&mut tensors, &format!("language_model.{path}"), rows, width);
     }
@@ -133,6 +166,20 @@ fn provider_loads_and_generates_with_native_packed_operators() {
     let provider = LlamaProvider::load(&LoadSpec::dense(dir.to_str().unwrap())).unwrap();
     assert!(provider.is_quantized());
     assert!(provider.has_deferred_prism_vision());
+    assert!(provider.descriptor().capabilities.supports_vision);
+    assert!(provider.descriptor().capabilities.supports_video);
+    let sampling = provider
+        .descriptor()
+        .capabilities
+        .model_sampling_defaults
+        .expect("Bonsai model-card sampling presets");
+    assert_eq!(sampling.thinking.temperature, 1.0);
+    assert_eq!(sampling.thinking.top_p, 0.95);
+    assert_eq!(sampling.thinking.top_k, 20);
+    assert_eq!(sampling.non_thinking.temperature, 0.7);
+    assert_eq!(sampling.non_thinking.top_p, 0.8);
+    assert_eq!(sampling.non_thinking.top_k, 20);
+    assert_eq!(sampling.non_thinking.presence_penalty, 1.5);
     assert_eq!(provider.descriptor().family, "prism_hadamard_qwen35");
     let request = TextLlmRequest {
         messages: vec![Message::user("hello world")],
@@ -150,6 +197,25 @@ fn provider_loads_and_generates_with_native_packed_operators() {
         .unwrap();
     assert_eq!(output.usage.generated_tokens, 2);
     assert_eq!(streamed, 2);
+    assert_fixture_is_self_removing(dir);
+}
+
+#[test]
+fn embedded_vision_snapshot_rejects_external_projector_association() {
+    let dir = write_fixture();
+    let plain = LoadSpec::dense(dir.to_str().unwrap());
+    assert!(mlx_llm::provider::can_load(&plain));
+    assert!(mlx_llm::provider::weightless_vision(&plain));
+
+    let paired = plain.with_projector(dir.join("projector.gguf").to_str().unwrap());
+    assert!(!mlx_llm::provider::can_load(&paired));
+    assert!(!mlx_llm::provider::weightless_vision(&paired));
+    let error = LlamaProvider::load(&paired)
+        .err()
+        .expect("embedded snapshots must fail closed instead of ignoring a projector");
+    assert!(error
+        .to_string()
+        .contains("projector_source is only valid for a separable Prism GGUF"));
     assert_fixture_is_self_removing(dir);
 }
 

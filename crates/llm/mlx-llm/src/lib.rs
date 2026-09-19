@@ -51,6 +51,7 @@ pub mod prepare;
 pub mod primitives;
 pub mod prism;
 pub mod prism_gguf;
+mod prism_vision_gguf;
 pub mod provider;
 pub mod residency;
 pub mod snapshot;
