@@ -11,20 +11,23 @@
 
 use std::cell::OnceCell;
 use std::path::Path;
+use std::time::Instant;
 
 use core_llm::{
     AudioRef, Channel, ChatTemplate, Constraint, ConstraintDecodeTable, ConstraintKind, Content,
     Error as CoreError, FinishReason as CoreFinish, ImageRef, IncrementalDetok, JinjaChatTemplate,
-    JsonConstraint, Llama3Template, LoadSpec, Message, Quantize, RenderOptions,
-    Result as CoreResult, Sampling, StopMatcher, StreamEvent as CoreEvent, TextLlm,
-    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter,
-    Tokenizer, ToolCallSegmenter, Usage, VideoRef,
+    JsonConstraint, Llama3Template, LlmMemoryGeometry, LoadSpec, Message, ModelSamplingDefaults,
+    MtpMode, Quantize, ReasoningEffort, RenderOptions, Result as CoreResult, Sampling, StopMatcher,
+    StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
+    TextLlmRequest, ThinkingSegmenter, Tokenizer, ToolCallSegmenter, Usage, VideoRef,
 };
 
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
-    generate_from_prefill, generate_with, ConstraintMask, Decode, FinishReason, GenerationConfig,
-    StreamEvent,
+    generate_from_prefill, generate_from_prefill_with_timings,
+    generate_qwen35_mtp_multimodal_with_timings, generate_qwen35_mtp_with_timings,
+    generate_with_timings, ConstraintMask, Decode, FinishReason, GenerationConfig,
+    Qwen35MtpMultimodalPrompt, RewindableConstraintMask, StreamEvent,
 };
 use crate::image::Qwen35ImageProcessor;
 use crate::models::gemma4_mm;
@@ -36,6 +39,7 @@ use crate::primitives::kv_cache::KvCache;
 use crate::primitives::projection::QuantSpec;
 use crate::primitives::sampler::SamplingParams;
 use crate::primitives::{input_ids, Weights};
+use crate::prism::PrismMlxPack;
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
 
@@ -72,6 +76,55 @@ impl Decode for Decoder {
 }
 
 impl Decoder {
+    fn memory_geometry(&self) -> LlmMemoryGeometry {
+        let (query_heads, kv_heads, head_dim, layers, hidden, intermediate, vocab, recurrent) =
+            match self {
+                Decoder::Causal(m) => {
+                    let c = m.config();
+                    (
+                        c.num_heads,
+                        c.num_kv_heads,
+                        c.head_dim,
+                        c.num_layers,
+                        c.hidden_size,
+                        c.intermediate_size,
+                        c.vocab_size,
+                        0,
+                    )
+                }
+                Decoder::Qwen35(m) => {
+                    let c = m.config();
+                    (
+                        c.num_heads,
+                        c.num_kv_heads,
+                        c.head_dim,
+                        c.num_layers,
+                        c.hidden_size,
+                        c.intermediate_size,
+                        c.vocab_size,
+                        (c.num_layers as u64)
+                            .saturating_mul(c.linear_num_value_heads as u64)
+                            .saturating_mul(c.linear_value_head_dim as u64)
+                            .saturating_mul(
+                                (c.linear_key_head_dim + c.linear_conv_kernel_dim) as u64,
+                            )
+                            .saturating_mul(4),
+                    )
+                }
+            };
+        LlmMemoryGeometry {
+            query_heads: query_heads.max(0) as u64,
+            kv_heads: kv_heads.max(0) as u64,
+            head_dim: head_dim.max(0) as u64,
+            layers: layers as u64,
+            element_bytes: 4,
+            hidden_size: hidden as u64,
+            intermediate_size: intermediate as u64,
+            vocab_size: vocab as u64,
+            recurrent_bytes: recurrent,
+        }
+    }
+
     fn is_quantized(&self) -> bool {
         match self {
             Decoder::Causal(m) => m.is_quantized(),
@@ -107,6 +160,90 @@ struct Qwen35Vision {
 }
 
 impl Qwen35Vision {
+    fn estimate_workspace(
+        &self,
+        images: &[&ImageRef],
+        videos: &[&VideoRef],
+    ) -> CoreResult<(usize, u64)> {
+        let cfg = self.tower.config();
+        let patch = cfg.patch_size.max(1) as usize;
+        let merge = self.spatial_merge_size.max(1) as usize;
+        let temporal = self.processor.temporal_patch_size.max(1);
+        let mut tokens = 0usize;
+        let mut pixels = 0u64;
+        for image in images {
+            let (h, w) = self
+                .processor
+                .smart_resize(image.height as usize, image.width as usize)
+                .map_err(to_core)?;
+            tokens = tokens
+                .checked_add((h / patch) * (w / patch) / (merge * merge))
+                .ok_or_else(|| {
+                    CoreError::InvalidRequest("visual token geometry overflow".into())
+                })?;
+            pixels = pixels.saturating_add((h as u64).saturating_mul(w as u64).saturating_mul(12));
+        }
+        for video in videos {
+            let frame = video
+                .frames
+                .first()
+                .ok_or_else(|| CoreError::InvalidRequest("video has no frames".into()))?;
+            let t = video.frames.len().div_ceil(temporal);
+            let (h, w) = self
+                .processor
+                .smart_resize_with(
+                    frame.height as usize,
+                    frame.width as usize,
+                    t,
+                    self.processor.video_min_pixels,
+                    self.processor.video_max_pixels,
+                )
+                .map_err(to_core)?;
+            tokens = tokens
+                .checked_add(t * (h / patch) * (w / patch) / (merge * merge))
+                .ok_or_else(|| {
+                    CoreError::InvalidRequest("visual token geometry overflow".into())
+                })?;
+            pixels = pixels.saturating_add(
+                (t as u64)
+                    .saturating_mul(temporal as u64)
+                    .saturating_mul(h as u64)
+                    .saturating_mul(w as u64)
+                    .saturating_mul(12),
+            );
+        }
+        let activations = (tokens as u64)
+            .checked_mul(cfg.hidden_size.max(0) as u64)
+            .and_then(|v| {
+                v.checked_mul((cfg.depth + cfg.deepstack_visual_indexes.len() + 2) as u64)
+            })
+            .and_then(|v| v.checked_mul(4))
+            .ok_or_else(|| CoreError::InvalidRequest("visual workspace overflow".into()))?;
+        // The tower attends over unmerged patches, not the merged language tokens.
+        // Pricing all frames together is conservative even when attention is frame-local.
+        let patches = (tokens as u64)
+            .checked_mul(merge as u64)
+            .and_then(|v| v.checked_mul(merge as u64))
+            .ok_or_else(|| CoreError::InvalidRequest("visual patch geometry overflow".into()))?;
+        let attention = patches
+            .checked_mul(patches)
+            .and_then(|v| v.checked_mul(cfg.num_heads.max(0) as u64))
+            .and_then(|v| v.checked_mul(12))
+            .ok_or_else(|| {
+                CoreError::InvalidRequest("visual attention workspace overflow".into())
+            })?;
+        let mlp = patches
+            .checked_mul(cfg.intermediate_size.max(0) as u64)
+            .and_then(|v| v.checked_mul(12))
+            .ok_or_else(|| CoreError::InvalidRequest("visual MLP workspace overflow".into()))?;
+        let required = pixels
+            .checked_add(activations)
+            .and_then(|v| v.checked_add(attention))
+            .and_then(|v| v.checked_add(mlp))
+            .ok_or_else(|| CoreError::InvalidRequest("visual workspace overflow".into()))?;
+        Ok((tokens, required))
+    }
+
     /// Encode one image to its merged patch rows `[n_tokens, hidden]` (the merger output is already
     /// the language hidden size — no separate projector), the per-tap **DeepStack** feature sets
     /// (each `[n_tokens, hidden]`, one per `deepstack_visual_indexes` tap), plus the image's
@@ -271,6 +408,24 @@ fn collect_audio(messages: &[Message]) -> Vec<&AudioRef> {
         .collect()
 }
 
+fn request_media_workspace_bytes(messages: &[Message]) -> CoreResult<u64> {
+    messages.iter().try_fold(0u64, |total, message| {
+        message.content.iter().try_fold(total, |total, content| {
+            let bytes = match content {
+                Content::Image(image) => (image.pixels.len() as u64).saturating_mul(4),
+                Content::Video(video) => video.frames.iter().fold(0u64, |sum, frame| {
+                    sum.saturating_add((frame.pixels.len() as u64).saturating_mul(4))
+                }),
+                Content::Audio(audio) => (audio.samples.len() as u64).saturating_mul(16),
+                Content::Text(_) => 0,
+            };
+            total
+                .checked_add(bytes)
+                .ok_or_else(|| CoreError::InvalidRequest("media workspace overflow".into()))
+        })
+    })
+}
+
 /// Gemma 4's rendered image marker — the single token its chat template emits for an image part,
 /// which the processor (here, [`LlamaProvider::prepare_gemma4`]) expands into
 /// `boi` + N soft tokens + `eoi`.
@@ -363,23 +518,25 @@ fn substitute_vision_placeholders(
             let content = m
                 .content
                 .iter()
-                .map(|c| match c {
-                    Content::Image(_) => Ok(Content::text(IMAGE_PLACEHOLDER)),
-                    Content::Video(v) => Ok(Content::text(video_placeholder_text(
-                        v,
-                        temporal_patch_size,
-                    ))),
-                    Content::Text(t) => Ok(Content::Text(t.clone())),
-                    // The Qwen-VL path has no audio projector, and this provider's `supports_audio`
-                    // is false for every Qwen checkpoint, so `validate` rejects an audio-carrying
-                    // request before substitution. Erroring here rather than dropping the block
-                    // means that if that invariant ever breaks, the request fails loudly instead of
-                    // being answered from its text alone.
-                    Content::Audio(_) => Err(CoreError::Unsupported(
-                        "[mlx-llama] the Qwen-VL path carries no audio; an audio block reached \
-                         placeholder substitution, which the capability gate should have rejected"
-                            .to_string(),
-                    )),
+                .map(|c| -> CoreResult<Content> {
+                    match c {
+                        Content::Image(_) => Ok(Content::text(IMAGE_PLACEHOLDER)),
+                        Content::Video(v) => {
+                            v.validate().map_err(CoreError::InvalidRequest)?;
+                            Ok(Content::text(video_placeholder_text(v, temporal_patch_size)))
+                        }
+                        Content::Text(t) => Ok(Content::Text(t.clone())),
+                        // The Qwen-VL path has no audio projector, and this provider's
+                        // `supports_audio` is false for every Qwen checkpoint, so `validate`
+                        // rejects an audio-carrying request before substitution. Erroring here
+                        // rather than dropping the block means that if that invariant ever breaks,
+                        // the request fails loudly instead of being answered from its text alone.
+                        Content::Audio(_) => Err(CoreError::Unsupported(
+                            "[mlx-llama] the Qwen-VL path carries no audio; an audio block reached \
+                             placeholder substitution, which the capability gate should have rejected"
+                                .to_string(),
+                        )),
+                    }
                 })
                 .collect::<CoreResult<Vec<_>>>()?;
             Ok(Message {
@@ -409,6 +566,9 @@ pub struct LlamaProvider {
     /// checkpoint that actually ships them (sc-18772). Independent of [`vision`](Self::vision):
     /// Gemma 4 does not use the Qwen-VL ViT/M-RoPE/DeepStack machinery at all.
     gemma4: Option<Gemma4Runtime>,
+    /// Dense Prism `vision_tower.*` tensors retained verbatim for the native multimodal adapter.
+    /// Text loading must not discard them merely because sc-23937 constructs only the decoder.
+    _prism_vision_weights: Option<Weights>,
 }
 
 impl LlamaProvider {
@@ -416,7 +576,26 @@ impl LlamaProvider {
     /// the decoder architecture from `config.json` (Llama / Mistral / Qwen3) and optionally
     /// quantizes the projections on load per `spec.quantize`.
     pub fn load(spec: &LoadSpec) -> CoreResult<Self> {
+        if spec.projector_source.is_some()
+            && Path::new(&spec.source).extension().and_then(|v| v.to_str()) != Some("gguf")
+        {
+            return Err(CoreError::Unsupported(
+                "[mlx-llama] projector_source is only valid for a separable Prism GGUF model; \
+                 safetensors snapshots carry their vision tower in the snapshot"
+                    .into(),
+            ));
+        }
+        let required = crate::load_memory::required_bytes(spec)?;
+        let available = core_llm::effective_memory_budget(
+            core_llm::available_host_memory_bytes(),
+            core_llm::operational_memory_override()?,
+        )?;
+        core_llm::admit_request_memory(required, available)?;
+
         let dir = Path::new(&spec.source);
+        if dir.extension().and_then(|v| v.to_str()) == Some("gguf") {
+            return Self::load_prism_gguf(spec, dir);
+        }
         let quant = spec.quantize.map(|q| match q {
             Quantize::Q4 => QuantSpec::q4(),
             Quantize::Q8 => QuantSpec::q8(),
@@ -426,13 +605,41 @@ impl LlamaProvider {
         let cfg_value = read_config_value(dir)?;
         let arch = Architecture::from_config(&cfg_value).map_err(to_core)?;
         let weights = Weights::from_dir(dir).map_err(to_core)?;
+        let is_prism =
+            cfg_value.get("model_type").and_then(|v| v.as_str()) == Some("prism_hadamard_qwen35");
+        if is_prism && quant.is_some() {
+            return Err(CoreError::Load(
+                "Prism snapshots are already packed 2-bit and reject load-time Q4/Q8".into(),
+            ));
+        }
 
+        let mut prism_vision_weights = None;
         let (model, mut descriptor) = if arch == Architecture::Qwen35 {
             let qcfg = Qwen35Config::from_json(&cfg_value).map_err(to_core)?;
-            let descriptor = descriptor_for_qwen35(&qcfg);
-            // The text decoder nests under `model.language_model` in the VLM-wrapped checkpoint.
-            let m = Qwen35Model::from_weights_with(&weights, "model.language_model", qcfg, quant)
-                .map_err(to_core)?;
+            let mut descriptor = descriptor_for_qwen35(&qcfg);
+            let m = if is_prism {
+                let pack = PrismMlxPack::from_dir(dir, &cfg_value, &weights).map_err(to_core)?;
+                descriptor.family = "prism_hadamard_qwen35".into();
+                let model =
+                    Qwen35Model::from_prism_weights(&weights, qcfg, &pack).map_err(to_core)?;
+                if pack.has_vision_tower {
+                    let keys = weights
+                        .keys()
+                        .filter(|key| key.starts_with("vision_tower."))
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>();
+                    let retained = keys
+                        .into_iter()
+                        .filter_map(|key| weights.get(&key).cloned().map(|value| (key, value)))
+                        .collect();
+                    prism_vision_weights = Some(Weights::from_map(retained));
+                }
+                model
+            } else {
+                // The text decoder nests under `model.language_model` in the VLM-wrapped checkpoint.
+                Qwen35Model::from_weights_with(&weights, "model.language_model", qcfg, quant)
+                    .map_err(to_core)?
+            };
             (Decoder::Qwen35(m), descriptor)
         } else {
             let cfg = ModelConfig::from_json(&cfg_value).map_err(to_core)?;
@@ -444,15 +651,25 @@ impl LlamaProvider {
         // Qwen-VL vision: load the ViT tower when the checkpoint carries `model.visual.*` (a wrapped
         // VLM) and the config exposes a `vision_config`. Covers Qwen3.6 (`qwen3_5`) and Qwen3-VL
         // (`qwen3_vl`), which share the identical Qwen3-VL ViT tower. Absent → a text-only checkpoint.
-        let vision = if (arch == Architecture::Qwen35 || arch == Architecture::Qwen3Vl)
-            && cfg_value.get("vision_config").is_some()
-            && weights
-                .get("model.visual.patch_embed.proj.weight")
-                .is_some()
-        {
+        let vision_prefix = if weights.contains("model.visual.patch_embed.proj.weight") {
+            Some("model.visual")
+        } else if is_prism && weights.contains("vision_tower.patch_embed.proj.weight") {
+            Some("vision_tower")
+        } else {
+            None
+        };
+        let vision = if let (true, Some(prefix)) = (
+            (arch == Architecture::Qwen35 || arch == Architecture::Qwen3Vl)
+                && cfg_value.get("vision_config").is_some(),
+            vision_prefix,
+        ) {
             let vcfg = Qwen35VisionConfig::from_json(&cfg_value).map_err(to_core)?;
-            let tower = Qwen35VisionModel::from_weights(&weights, "model.visual", vcfg.clone())
-                .map_err(to_core)?;
+            let tower = if is_prism {
+                Qwen35VisionModel::from_mlx_weights(&weights, prefix, vcfg.clone())
+            } else {
+                Qwen35VisionModel::from_weights(&weights, prefix, vcfg.clone())
+            }
+            .map_err(to_core)?;
             let image_token_id = cfg_value
                 .get("image_token_id")
                 .and_then(|x| x.as_i64())
@@ -501,8 +718,30 @@ impl LlamaProvider {
 
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         let stop_tokens = eos_token_ids(dir);
-        let (template, supports_thinking, supports_tools) = load_chat_template(dir);
+        let (
+            template,
+            supports_thinking,
+            supports_reasoning_effort,
+            supports_preserve_thinking,
+            supports_tools,
+        ) = load_chat_template(dir);
         descriptor.capabilities.supports_thinking = supports_thinking;
+        descriptor.capabilities.supports_reasoning_effort = supports_reasoning_effort;
+        if supports_reasoning_effort {
+            descriptor.capabilities.reasoning_efforts = if is_prism {
+                vec![ReasoningEffort::XHigh, ReasoningEffort::Medium]
+            } else {
+                vec![
+                    ReasoningEffort::XHigh,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::Low,
+                ]
+            };
+        }
+        if is_prism {
+            descriptor.capabilities.model_sampling_defaults = Some(bonsai_sampling_defaults());
+        }
+        descriptor.capabilities.supports_preserve_thinking = supports_preserve_thinking;
         descriptor.capabilities.supports_tools = supports_tools;
         Ok(Self {
             descriptor,
@@ -513,12 +752,76 @@ impl LlamaProvider {
             constraint_table: OnceCell::new(),
             vision,
             gemma4,
+            _prism_vision_weights: prism_vision_weights,
+        })
+    }
+
+    fn load_prism_gguf(spec: &LoadSpec, path: &Path) -> CoreResult<Self> {
+        if spec.quantize.is_some() {
+            return Err(CoreError::Load(
+                "Prism GGUF is already packed and rejects load-time Q4/Q8".into(),
+            ));
+        }
+        let file = crate::gguf::GgufFile::open(path).map_err(to_core)?;
+        let loaded = crate::prism_gguf::load(&file).map_err(to_core)?;
+        let qcfg = Qwen35Config::from_json(&loaded.config).map_err(to_core)?;
+        let mut descriptor = descriptor_for_qwen35(&qcfg);
+        descriptor.family = "prism_hadamard_qwen35".into();
+        let (thinking, reasoning, preserve, tools) = loaded.template_capabilities;
+        descriptor.capabilities.supports_thinking = thinking;
+        descriptor.capabilities.supports_reasoning_effort = reasoning;
+        if reasoning {
+            descriptor.capabilities.reasoning_efforts =
+                vec![ReasoningEffort::XHigh, ReasoningEffort::Medium];
+        }
+        descriptor.capabilities.model_sampling_defaults = Some(bonsai_sampling_defaults());
+        descriptor.capabilities.supports_preserve_thinking = preserve;
+        descriptor.capabilities.supports_tools = tools;
+        let model = Qwen35Model::from_prism_weights(&loaded.weights, qcfg, &loaded.pack)
+            .map_err(to_core)?;
+        let vision = match spec.projector_source.as_deref() {
+            Some(source) => {
+                let projector = crate::gguf::GgufFile::open(source).map_err(to_core)?;
+                let loaded_vision = crate::prism_vision_gguf::load(&projector).map_err(to_core)?;
+                let tower = Qwen35VisionModel::from_weights(
+                    &loaded_vision.weights,
+                    "vision_tower",
+                    loaded_vision.config.clone(),
+                )
+                .map_err(to_core)?;
+                descriptor.capabilities.supports_vision = true;
+                descriptor.capabilities.supports_video = true;
+                Some(Qwen35Vision {
+                    tower,
+                    processor: Qwen35ImageProcessor::default(),
+                    image_token_id: 248056,
+                    video_token_id: 248057,
+                    spatial_merge_size: loaded_vision.config.spatial_merge_size,
+                })
+            }
+            None => None,
+        };
+        Ok(Self {
+            descriptor,
+            model: Decoder::Qwen35(model),
+            tokenizer: loaded.tokenizer,
+            template: loaded.template,
+            stop_tokens: loaded.stop_tokens,
+            constraint_table: OnceCell::new(),
+            vision,
+            gemma4: None,
+            _prism_vision_weights: None,
         })
     }
 
     /// Whether the loaded model's projections are quantized.
     pub fn is_quantized(&self) -> bool {
         self.model.is_quantized()
+    }
+
+    /// Whether a Prism VLM's dense vision tensors were retained for the multimodal adapter.
+    pub fn has_deferred_prism_vision(&self) -> bool {
+        self._prism_vision_weights.is_some()
     }
 
     /// Assemble a provider from already-loaded parts with a default Llama-3 template (used by tests
@@ -533,6 +836,7 @@ impl LlamaProvider {
             constraint_table: OnceCell::new(),
             vision: None,
             gemma4: None,
+            _prism_vision_weights: None,
         }
     }
 
@@ -820,14 +1124,106 @@ impl LlamaProvider {
 }
 
 /// Adapts a `core_llm::JsonConstraint` to the engine's [`ConstraintMask`] decode seam.
-struct JsonMask<'a>(JsonConstraint<'a>);
+struct JsonMask<'a> {
+    inner: JsonConstraint<'a>,
+    table: &'a ConstraintDecodeTable,
+    stop_ids: Vec<u32>,
+    accepted: Vec<i32>,
+    initial_reasoning: bool,
+    reasoning: bool,
+    reasoning_tail: String,
+    allow: Vec<bool>,
+}
+
+impl<'a> JsonMask<'a> {
+    fn new(
+        table: &'a ConstraintDecodeTable,
+        stop_ids: impl IntoIterator<Item = u32>,
+        reasoning: bool,
+    ) -> Self {
+        let stop_ids = stop_ids.into_iter().collect::<Vec<_>>();
+        Self {
+            inner: JsonConstraint::new(table, stop_ids.iter().copied()),
+            table,
+            stop_ids,
+            accepted: Vec::new(),
+            initial_reasoning: reasoning,
+            reasoning,
+            reasoning_tail: String::new(),
+            allow: vec![false; table.pieces.len()],
+        }
+    }
+
+    fn accept_reasoning_piece(&mut self, piece: &str) {
+        self.reasoning_tail.push_str(piece);
+        if let Some(end) = self.reasoning_tail.find("</think>") {
+            let answer = self.reasoning_tail[end + "</think>".len()..].to_string();
+            self.reasoning = false;
+            self.reasoning_tail.clear();
+            let accepted = self.inner.accept_text(&answer);
+            debug_assert!(accepted);
+            return;
+        }
+        let keep = (1.."</think>".len())
+            .rev()
+            .find(|&n| self.reasoning_tail.ends_with(&"</think>"[..n]))
+            .unwrap_or(0);
+        if self.reasoning_tail.len() > keep {
+            self.reasoning_tail
+                .drain(..self.reasoning_tail.len() - keep);
+        }
+    }
+}
 
 impl ConstraintMask for JsonMask<'_> {
     fn allowed(&mut self) -> &[bool] {
-        self.0.allowed()
+        if !self.reasoning {
+            return self.inner.allowed();
+        }
+        for (id, slot) in self.allow.iter_mut().enumerate() {
+            if self.stop_ids.contains(&(id as u32)) {
+                *slot = false;
+                continue;
+            }
+            let mut candidate = self.reasoning_tail.clone();
+            candidate.push_str(&self.table.pieces[id]);
+            *slot = candidate
+                .find("</think>")
+                .is_none_or(|end| self.inner.allows_text(&candidate[end + "</think>".len()..]));
+        }
+        &self.allow
     }
     fn accept(&mut self, token: i32) {
-        self.0.accept(token as u32);
+        if self.reasoning {
+            let piece = self
+                .table
+                .pieces
+                .get(token as usize)
+                .cloned()
+                .unwrap_or_default();
+            self.accept_reasoning_piece(&piece);
+        } else {
+            self.inner.accept(token as u32);
+        }
+        self.accepted.push(token);
+    }
+}
+
+impl RewindableConstraintMask for JsonMask<'_> {
+    fn checkpoint(&self) -> usize {
+        self.accepted.len()
+    }
+
+    fn rewind(&mut self, checkpoint: usize) {
+        self.accepted.truncate(checkpoint);
+        self.inner = JsonConstraint::new(self.table, self.stop_ids.iter().copied());
+        self.reasoning_tail.clear();
+        self.reasoning = self.initial_reasoning;
+        let accepted = self.accepted.clone();
+        for token in accepted {
+            self.accept(token);
+        }
+        self.accepted.truncate(checkpoint);
     }
 }
 
@@ -838,20 +1234,36 @@ impl ConstraintMask for JsonMask<'_> {
 /// - **tools** — the template renders tool calls (it mentions `tool_call`), so it has a `tools`
 ///   section and the model emits parseable `<tool_call>` blocks (sc-7636). Covers the Qwen3.6 XML and
 ///   the Qwen2.5/Hermes JSON tool templates alike.
-fn load_chat_template(dir: &Path) -> (Box<dyn ChatTemplate>, bool, bool) {
+fn load_chat_template(dir: &Path) -> (Box<dyn ChatTemplate>, bool, bool, bool, bool) {
     // The sidecar `chat_template.jinja` wins over the embedded key — see `sidecar_chat_template`.
     if let Some(t) = sidecar_chat_template(dir) {
         let supports_thinking = t.source().contains("enable_thinking");
+        let supports_reasoning_effort = t.source().contains("reasoning_effort");
+        let supports_preserve_thinking = t.source().contains("preserve_thinking");
         let supports_tools = t.source().contains("tool_call");
-        return (Box::new(t), supports_thinking, supports_tools);
+        return (
+            Box::new(t),
+            supports_thinking,
+            supports_reasoning_effort,
+            supports_preserve_thinking,
+            supports_tools,
+        );
     }
     match JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json")) {
         Ok(t) => {
             let supports_thinking = t.source().contains("enable_thinking");
+            let supports_reasoning_effort = t.source().contains("reasoning_effort");
+            let supports_preserve_thinking = t.source().contains("preserve_thinking");
             let supports_tools = t.source().contains("tool_call");
-            (Box::new(t), supports_thinking, supports_tools)
+            (
+                Box::new(t),
+                supports_thinking,
+                supports_reasoning_effort,
+                supports_preserve_thinking,
+                supports_tools,
+            )
         }
-        Err(_) => (Box::new(Llama3Template), false, false),
+        Err(_) => (Box::new(Llama3Template), false, false, false, false),
     }
 }
 
@@ -1000,6 +1412,11 @@ impl TextLlm for LlamaProvider {
             &RenderOptions {
                 add_generation_prompt: true,
                 enable_thinking: req.enable_thinking_kwarg(),
+                // Bonsai's official model card does not recommend `low` as an effective distinct
+                // level, so it is omitted from the selectable capability list. The frozen template
+                // still accepts and renders `low`; preserve that compatibility input verbatim.
+                reasoning_effort: req.reasoning_effort,
+                preserve_thinking: req.preserve_thinking,
                 tools: &req.tools,
             },
         )?;
@@ -1010,8 +1427,44 @@ impl TextLlm for LlamaProvider {
             .map(|id| id as i32)
             .collect();
 
+        // MLX uses unified memory. Admit from a fresh host availability snapshot before visual
+        // preprocessing or model execution, using pure request geometry for visual expansion.
+        let (visual_tokens, vision_workspace) = match &self.vision {
+            Some(vision) if multimodal => vision.estimate_workspace(&images, &videos)?,
+            _ => (0, 0),
+        };
+        let vision_workspace = vision_workspace
+            .checked_add(request_media_workspace_bytes(&req.messages)?)
+            .ok_or_else(|| CoreError::InvalidRequest("media workspace overflow".into()))?;
+        let admitted_prompt = prompt_ids
+            .len()
+            .checked_add(visual_tokens)
+            .ok_or_else(|| CoreError::InvalidRequest("expanded prompt geometry overflow".into()))?;
+        let required = core_llm::estimate_request_bytes(
+            admitted_prompt,
+            req.max_new_tokens,
+            self.model.memory_geometry(),
+            vision_workspace,
+            match req.mtp {
+                MtpMode::Off => 0,
+                MtpMode::Auto => self
+                    .descriptor
+                    .capabilities
+                    .mtp
+                    .map_or(0, |c| c.recommended_draft_tokens),
+                MtpMode::Enabled { draft_tokens } => draft_tokens,
+            },
+        )
+        .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
+        let available = core_llm::effective_memory_budget(
+            core_llm::available_host_memory_bytes(),
+            core_llm::operational_memory_override()?,
+        )?;
+        core_llm::admit_request_memory(required, available)?;
+
         // Encode + splice the visuals and compute M-RoPE positions (the placeholder-expanded prompt
         // becomes the effective sequence). `None` on the text-only path.
+        let qwen_prefill_started = (multimodal && !gemma4_mm_request).then(Instant::now);
         let mm = if multimodal && !gemma4_mm_request {
             Some(self.prepare_multimodal(&prompt_ids, &req.messages)?)
         } else {
@@ -1027,6 +1480,11 @@ impl TextLlm for LlamaProvider {
             .map(|m| m.expanded_ids.len())
             .or_else(|| g4.as_ref().map(|m| m.expanded_ids.len()))
             .unwrap_or(prompt_ids.len());
+        validate_context_window(
+            self.descriptor.capabilities.max_context_tokens,
+            prompt_len,
+            req.max_new_tokens,
+        )?;
 
         let config = GenerationConfig {
             max_new_tokens: req.max_new_tokens as usize,
@@ -1035,16 +1493,39 @@ impl TextLlm for LlamaProvider {
             stop_tokens: self.stop_tokens.clone(),
         };
 
+        let mut mtp_draft_tokens = match req.mtp {
+            MtpMode::Off => None,
+            MtpMode::Auto => self
+                .descriptor
+                .capabilities
+                .mtp
+                .map(|caps| caps.recommended_draft_tokens as usize),
+            MtpMode::Enabled { draft_tokens } => Some(draft_tokens as usize),
+        };
+        // Gemma 4 has no Qwen predictor. Qwen multimodal prompts use the fused-embedding MTP route
+        // below, including their explicit three-axis positions and continuation delta.
+        if mtp_draft_tokens.is_some() && gemma4_mm_request {
+            if matches!(req.mtp, MtpMode::Enabled { .. }) {
+                return Err(CoreError::Unsupported(
+                    "[mlx-llama] native Qwen MTP is unavailable for Gemma 4 prompts".into(),
+                ));
+            }
+            mtp_draft_tokens = None;
+        }
+
         // Structured-output constraint (story 7166): build a JSON mask over the cached decode table.
+        let constraint_starts_in_reasoning =
+            self.descriptor.capabilities.supports_thinking && prompt_opens_thinking(&prompt);
         let mut json_mask = match req.constraint {
             Some(Constraint::Json) => {
                 let table = self
                     .constraint_table
                     .get_or_init(|| self.tokenizer.constraint_decode_table());
-                Some(JsonMask(JsonConstraint::new(
+                Some(JsonMask::new(
                     table,
                     self.stop_tokens.iter().map(|&i| i as u32),
-                )))
+                    constraint_starts_in_reasoning,
+                ))
             }
             None => None,
         };
@@ -1081,7 +1562,7 @@ impl TextLlm for LlamaProvider {
         // otherwise the reasoning would be misclassified as answer. Disabled mode renders a *closed*
         // `<think>\n\n</think>`, so this correctly does not prime.
         if let Some(seg) = segmenter.as_mut() {
-            if prompt_opens_thinking(&prompt) {
+            if constraint_starts_in_reasoning {
                 let _ = seg.push("<think>");
                 debug_assert!(seg.in_thinking());
             }
@@ -1101,7 +1582,7 @@ impl TextLlm for LlamaProvider {
         // The segmenter (when active) splits each delta into reasoning vs answer; answer text then
         // feeds the stop matcher so a stop string is trimmed and halts generation.
         let tokenizer = &self.tokenizer;
-        let out = {
+        let (out, mtp_stats, timing) = {
             let mut acc: Vec<u32> = Vec::new();
             let mut detok = IncrementalDetok::new();
             let mut sink = |ev: StreamEvent| {
@@ -1165,7 +1646,6 @@ impl TextLlm for LlamaProvider {
                     }
                 }
             };
-            let constraint = json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask);
             let should_stop = || halt.get();
             let should_stop_opt = stop_active.then_some(&should_stop as &dyn Fn() -> bool);
             match &mm {
@@ -1175,33 +1655,65 @@ impl TextLlm for LlamaProvider {
                 Some(m) => {
                     let (t, h, w, delta) = &m.positions;
                     let pos = [t.as_slice(), h.as_slice(), w.as_slice()];
-                    let model = self.model.as_vlm();
-                    let mut cache = model.make_cache();
-                    let first = model
-                        .prefill_with_deepstack(
-                            &m.embeds,
-                            pos,
-                            cache.as_mut(),
-                            &m.visual_pos_mask,
-                            &m.deepstack,
+                    if let (Decoder::Qwen35(model), Some(num_draft)) =
+                        (&self.model, mtp_draft_tokens)
+                    {
+                        let prompt = Qwen35MtpMultimodalPrompt {
+                            input_ids: &m.expanded_ids,
+                            embeddings: &m.embeds,
+                            positions: pos,
+                            visual_pos_mask: &m.visual_pos_mask,
+                            deepstack: &m.deepstack,
+                            continuation_delta: *delta,
+                        };
+                        let (timed, stats) = generate_qwen35_mtp_multimodal_with_timings(
+                            model,
+                            &prompt,
+                            &config,
+                            num_draft,
+                            &req.cancel,
+                            &mut sink,
+                            json_mask
+                                .as_mut()
+                                .map(|m| m as &mut dyn RewindableConstraintMask),
+                            should_stop_opt,
+                            qwen_prefill_started
+                                .expect("Qwen multimodal preparation starts the prefill clock"),
                         )
                         .map_err(to_core)?;
-                    let shifted = Shifted {
-                        model,
-                        delta: *delta,
-                    };
-                    generate_from_prefill(
-                        &shifted,
-                        cache.as_mut(),
-                        first,
-                        m.expanded_ids.clone(),
-                        &config,
-                        &req.cancel,
-                        &mut sink,
-                        constraint,
-                        should_stop_opt,
-                    )
-                    .map_err(to_core)?
+                        (timed.output, Some(stats), Some(timed.timer))
+                    } else {
+                        let model = self.model.as_vlm();
+                        let mut cache = model.make_cache();
+                        let first = model
+                            .prefill_with_deepstack(
+                                &m.embeds,
+                                pos,
+                                cache.as_mut(),
+                                &m.visual_pos_mask,
+                                &m.deepstack,
+                            )
+                            .map_err(to_core)?;
+                        let shifted = Shifted {
+                            model,
+                            delta: *delta,
+                        };
+                        let timed = generate_from_prefill_with_timings(
+                            &shifted,
+                            cache.as_mut(),
+                            first,
+                            m.expanded_ids.clone(),
+                            &config,
+                            &req.cancel,
+                            &mut sink,
+                            json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask),
+                            should_stop_opt,
+                            qwen_prefill_started
+                                .expect("Qwen multimodal preparation starts the prefill clock"),
+                        )
+                        .map_err(to_core)?;
+                        (timed.output, None, Some(timed.timer))
+                    }
                 }
                 // Gemma 4 multimodal: prefill the spliced embeds on ordinary causal 1-D positions
                 // (no M-RoPE, so no position shift for the continuation), then decode through the
@@ -1222,7 +1734,7 @@ impl TextLlm for LlamaProvider {
                         let first = model
                             .decode_logits_from_embeds(&m.embeds, &mut cache, 0)
                             .map_err(to_core)?;
-                        generate_from_prefill(
+                        let out = generate_from_prefill(
                             &self.model,
                             &mut cache,
                             first,
@@ -1230,21 +1742,43 @@ impl TextLlm for LlamaProvider {
                             &config,
                             &req.cancel,
                             &mut sink,
-                            constraint,
+                            json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask),
                             should_stop_opt,
                         )
-                        .map_err(to_core)?
+                        .map_err(to_core)?;
+                        (out, None, None)
                     }
-                    None => generate_with(
-                        &self.model,
-                        &prompt_ids,
-                        &config,
-                        &req.cancel,
-                        &mut sink,
-                        constraint,
-                        should_stop_opt,
-                    )
-                    .map_err(to_core)?,
+                    None => match (&self.model, mtp_draft_tokens) {
+                        (Decoder::Qwen35(model), Some(num_draft)) => {
+                            let (timed, stats) = generate_qwen35_mtp_with_timings(
+                                model,
+                                &prompt_ids,
+                                &config,
+                                num_draft,
+                                &req.cancel,
+                                &mut sink,
+                                json_mask
+                                    .as_mut()
+                                    .map(|m| m as &mut dyn RewindableConstraintMask),
+                                should_stop_opt,
+                            )
+                            .map_err(to_core)?;
+                            (timed.output, Some(stats), Some(timed.timer))
+                        }
+                        _ => {
+                            let timed = generate_with_timings(
+                                &self.model,
+                                &prompt_ids,
+                                &config,
+                                &req.cancel,
+                                &mut sink,
+                                json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask),
+                                should_stop_opt,
+                            )
+                            .map_err(to_core)?;
+                            (timed.output, None, Some(timed.timer))
+                        }
+                    },
                 },
             }
         };
@@ -1337,11 +1871,18 @@ impl TextLlm for LlamaProvider {
             finish_reason: finish,
             usage,
         });
+        let timings = timing.map(|timer| timer.finish());
         Ok(TextLlmOutput {
+            timings,
             text,
             thinking,
             tool_calls,
             usage,
+            mtp: mtp_stats.map(|stats| core_llm::MtpStats {
+                proposed_tokens: u32::try_from(stats.proposed).unwrap_or(u32::MAX),
+                accepted_tokens: u32::try_from(stats.accepted).unwrap_or(u32::MAX),
+                target_forwards: u32::try_from(stats.forwards).unwrap_or(u32::MAX),
+            }),
             finish_reason: Some(finish),
         })
     }
@@ -1369,9 +1910,14 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             // Weightless default: conservative. The load path (descriptor_for + load) flips this on
             // when the loaded model's own chat template gates an `enable_thinking` kwarg (sc-7585).
             supports_thinking: false,
+            supports_reasoning_effort: false,
+            reasoning_efforts: Vec::new(),
+            model_sampling_defaults: None,
+            supports_preserve_thinking: false,
             // Weightless default: conservative. The load path flips this on when the loaded model's
             // chat template renders tool calls (sc-7636).
             supports_tools: false,
+            mtp: None,
             // JSON-constrained decoding (sc-7166).
             supported_constraints: vec![ConstraintKind::Json],
         },
@@ -1393,6 +1939,12 @@ fn descriptor_for_qwen35(cfg: &Qwen35Config) -> TextLlmDescriptor {
     let mut d = provider_descriptor();
     d.family = Architecture::Qwen35.family().to_string();
     d.capabilities.max_context_tokens = cfg.max_position_embeddings.max(0) as usize;
+    if cfg.mtp_num_hidden_layers > 0 {
+        d.capabilities.mtp = Some(core_llm::MtpCapabilities {
+            max_draft_tokens: u32::MAX,
+            recommended_draft_tokens: 3,
+        });
+    }
     d
 }
 
@@ -1462,8 +2014,49 @@ fn map_sampling(s: &Sampling) -> SamplingParams {
         temperature: s.temperature,
         top_p: s.top_p,
         top_k: s.top_k,
+        presence_penalty: s.presence_penalty,
         repetition_penalty: s.repetition_penalty,
         repetition_context: s.repetition_context,
+    }
+}
+
+fn validate_context_window(
+    cap: usize,
+    prompt_tokens: usize,
+    max_new_tokens: u32,
+) -> CoreResult<()> {
+    if cap == 0 {
+        return Ok(());
+    }
+    let total = prompt_tokens
+        .checked_add(max_new_tokens as usize)
+        .ok_or_else(|| CoreError::InvalidRequest("prompt + generation length overflow".into()))?;
+    if total > cap {
+        return Err(CoreError::InvalidRequest(format!(
+            "expanded prompt ({prompt_tokens} tokens) + requested generation ({max_new_tokens}) exceeds context window {cap}"
+        )));
+    }
+    Ok(())
+}
+
+fn bonsai_sampling_defaults() -> ModelSamplingDefaults {
+    ModelSamplingDefaults {
+        thinking: Sampling {
+            temperature: 1.0,
+            top_p: 0.95,
+            top_k: 20,
+            presence_penalty: 0.0,
+            repetition_penalty: 1.0,
+            repetition_context: 0,
+        },
+        non_thinking: Sampling {
+            temperature: 0.7,
+            top_p: 0.8,
+            top_k: 20,
+            presence_penalty: 1.5,
+            repetition_penalty: 1.0,
+            repetition_context: 0,
+        },
     }
 }
 
@@ -1512,6 +2105,23 @@ fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
 /// (its nested text decoder) so it no longer misroutes to JoyCaption (sc-7626).
 pub fn can_load(spec: &LoadSpec) -> bool {
     let dir = Path::new(&spec.source);
+    if dir.extension().and_then(|v| v.to_str()) == Some("gguf") {
+        let language_is_prism = crate::gguf::GgufFile::open(dir).ok().is_some_and(|g| {
+            g.meta_str("general.architecture") == Some("qwen35")
+                && g.meta("prism.hadamard.version").is_some()
+        });
+        if !language_is_prism {
+            return false;
+        }
+        return spec.projector_source.as_deref().is_none_or(|source| {
+            crate::gguf::GgufFile::open(source)
+                .ok()
+                .is_some_and(|projector| crate::prism_vision_gguf::validate(&projector).is_ok())
+        });
+    }
+    if spec.projector_source.is_some() {
+        return false;
+    }
     let path = if dir.is_dir() {
         dir.join("config.json")
     } else {
@@ -1539,7 +2149,8 @@ fn can_load_value(v: &serde_json::Value) -> bool {
 }
 
 /// **Weightless** per-snapshot vision probe (sc-8077): does `mlx-llama` serve the snapshot at
-/// `spec.source` *with* vision? Reads **only** `config.json` (never a weight shard), mirroring
+/// `spec.source` *with* vision? Reads only `config.json` for safetensors snapshots, or the GGUF
+/// language and explicitly-associated projector headers (never their tensor payloads), mirroring
 /// [`can_load`]. It drives core-llm's pre-load capability gate so a *model-first* vision-required
 /// load (`load_for_model_with(spec, with_vision())`) resolves a Qwen-VL wrapper here.
 ///
@@ -1549,6 +2160,12 @@ fn can_load_value(v: &serde_json::Value) -> bool {
 /// per-snapshot probe a genuine Qwen3-VL snapshot would be rejected at the gate (the story-D gap).
 pub fn weightless_vision(spec: &LoadSpec) -> bool {
     let dir = Path::new(&spec.source);
+    if dir.extension().and_then(|v| v.to_str()) == Some("gguf") {
+        return spec.projector_source.is_some() && can_load(spec);
+    }
+    if spec.projector_source.is_some() {
+        return false;
+    }
     let path = if dir.is_dir() {
         dir.join("config.json")
     } else {
@@ -1632,6 +2249,108 @@ fn gemma4_multimodal(v: &serde_json::Value, block: &str, token_key: &str) -> boo
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn reasoning_boundary_commits_same_token_json_in_release_builds() {
+        let table = core_llm::ConstraintDecodeTable {
+            pieces: vec!["</think>{}".into(), String::new(), "{".into()],
+            special: [1].into_iter().collect(),
+        };
+        let mut mask = JsonMask::new(&table, [1], true);
+        assert!(mask.allowed()[0]);
+        mask.accept(0);
+        assert!(
+            mask.allowed()[1],
+            "same-token answer must commit even with debug assertions off"
+        );
+        assert!(
+            !mask.allowed()[2],
+            "completed answer cannot begin a second JSON value"
+        );
+        let mark = mask.checkpoint();
+        mask.rewind(mark);
+        assert!(
+            mask.allowed()[1],
+            "MTP rewind must replay phase and same-token JSON"
+        );
+    }
+
+    #[test]
+    fn json_constraint_waits_for_split_reasoning_close_and_rewinds_phase() {
+        let table = ConstraintDecodeTable {
+            pieces: vec![
+                "reason".into(),
+                "</thi".into(),
+                "nk>".into(),
+                "{".into(),
+                "x".into(),
+                "</think>x".into(),
+                String::new(),
+            ],
+            special: [6].into_iter().collect(),
+        };
+        let mut mask = JsonMask::new(&table, [6], true);
+        assert!(mask.allowed()[0]);
+        assert!(
+            !mask.allowed()[5],
+            "invalid same-token JSON suffix is masked"
+        );
+        assert!(!mask.allowed()[6], "EOS cannot end an open reasoning block");
+        mask.accept(0);
+        let checkpoint = mask.checkpoint();
+        mask.accept(1);
+        mask.accept(2);
+        assert!(mask.allowed()[3], "JSON begins only after split </think>");
+        assert!(!mask.allowed()[4]);
+        mask.rewind(checkpoint);
+        assert!(mask.allowed()[1], "rewind restores the reasoning phase");
+        assert!(!mask.allowed()[6]);
+
+        let mut disabled = JsonMask::new(&table, [6], false);
+        assert!(disabled.allowed()[3], "disabled thinking starts in JSON");
+        assert!(!disabled.allowed()[0]);
+    }
+
+    #[test]
+    fn reasoning_controls_are_advertised_only_when_template_names_them() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "{{ enable_thinking }} {{ tool_call }}",
+        )
+        .unwrap();
+        let (_, thinking, effort, preserve, tools) = load_chat_template(dir.path());
+        assert!(thinking);
+        assert!(!effort);
+        assert!(!preserve);
+        assert!(tools);
+
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "{{ enable_thinking }} {{ reasoning_effort }} {{ preserve_thinking }}",
+        )
+        .unwrap();
+        let (_, thinking, effort, preserve, tools) = load_chat_template(dir.path());
+        assert!(thinking);
+        assert!(effort);
+        assert!(preserve);
+        assert!(!tools);
+    }
+
+    #[test]
+    fn frozen_qwen38_generation_config_uses_both_official_stop_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../docs/reference/qwen38/generation_config.json"
+            )),
+        )
+        .unwrap();
+
+        assert_eq!(eos_token_ids(dir.path()), vec![248046, 248044]);
+    }
 
     fn qwen36_wrapper() -> serde_json::Value {
         json!({
@@ -1780,7 +2499,7 @@ mod tests {
         assert_eq!(cfg.architecture, Architecture::Qwen3Vl);
         assert_eq!(cfg.max_position_embeddings, 262144, "256K context");
 
-        let (template, _, _) = load_chat_template(&dir);
+        let (template, _, _, _, _) = load_chat_template(&dir);
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).expect("load tokenizer");
 
         for (case, expected) in oracle["cases"].as_object().unwrap() {
@@ -1802,6 +2521,8 @@ mod tests {
                     &RenderOptions {
                         add_generation_prompt: true,
                         enable_thinking: None,
+                        reasoning_effort: None,
+                        preserve_thinking: None,
                         tools: &[],
                     },
                 )
@@ -1873,6 +2594,54 @@ mod tests {
         for (g, w) in got.iter().zip(&want) {
             assert!((g - w).abs() < 1e-5, "merged timestamp {g} vs HF {w}");
         }
+    }
+
+    #[test]
+    fn invalid_public_video_timestamps_fail_before_prompt_rendering() {
+        let frame = || ImageRef::new(1, 1, vec![0, 0, 0]).unwrap();
+        for timestamps in [vec![0.0, f32::NAN], vec![0.5, 0.25], vec![-0.1, 0.0]] {
+            let video = VideoRef {
+                frames: vec![frame(), frame()],
+                timestamps,
+            };
+            let messages = vec![Message {
+                role: core_llm::Role::User,
+                content: vec![Content::Video(video)],
+                thinking: None,
+                tool_calls: Vec::new(),
+            }];
+            let error = substitute_vision_placeholders(&messages, 2)
+                .expect_err("invalid timestamp sequence accepted");
+            assert!(error.to_string().contains("timestamp"));
+        }
+        let count_mismatch = vec![Message {
+            role: core_llm::Role::User,
+            content: vec![Content::Video(VideoRef {
+                frames: vec![frame(), frame()],
+                timestamps: vec![0.0],
+            })],
+            thinking: None,
+            tool_calls: Vec::new(),
+        }];
+        assert!(substitute_vision_placeholders(&count_mismatch, 2)
+            .unwrap_err()
+            .to_string()
+            .contains("one timestamp per frame"));
+    }
+
+    #[test]
+    fn expanded_text_image_video_and_mtp_budgets_share_the_context_gate() {
+        for expanded_prompt in [48usize, 52, 60] {
+            validate_context_window(64, expanded_prompt, (64 - expanded_prompt) as u32).unwrap();
+            let error =
+                validate_context_window(64, expanded_prompt, (64 - expanded_prompt + 1) as u32)
+                    .expect_err("one-token context overflow accepted");
+            assert!(error.to_string().contains("exceeds context window 64"));
+        }
+        assert!(validate_context_window(usize::MAX, usize::MAX, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("overflow"));
     }
 
     /// **The per-frame placeholder string matches `Qwen3VLProcessor.replace_video_token` (collapsed

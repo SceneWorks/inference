@@ -169,6 +169,7 @@ fn qwen35_thinking_and_nothink() {
 fn qwen35_quantize_on_load_q8() {
     let q8 = LlamaProvider::load(&LoadSpec {
         source: model_dir(),
+        projector_source: None,
         quantize: Some(Quantize::Q8),
     })
     .expect("load q8");
@@ -201,6 +202,7 @@ fn qwen35_profile() -> TextLlmProfile {
         temperature: 1.0,
         top_p: 0.95,
         top_k: 0,
+        presence_penalty: 0.0,
         repetition_penalty: 1.0,
         repetition_context: 0,
     };

@@ -8,6 +8,7 @@ use mlx_rs::Array;
 
 use crate::error::Result;
 use crate::primitives::nn::linear;
+use crate::primitives::prism::PrismLinear;
 use crate::primitives::quant::QuantizedLinear;
 
 /// Group-wise affine quantization parameters.
@@ -50,6 +51,8 @@ pub enum Projection {
     },
     /// A group-wise quantized weight.
     Quantized(QuantizedLinear),
+    /// Prism ternary affine weight with a folded Hadamard activation rotation.
+    Prism(PrismLinear),
 }
 
 impl Projection {
@@ -95,12 +98,13 @@ impl Projection {
         match self {
             Projection::Dense { weight, bias } => linear(x, weight, bias.as_ref()),
             Projection::Quantized(q) => q.forward(x),
+            Projection::Prism(p) => p.forward(x),
         }
     }
 
     /// Whether this projection is quantized.
     pub fn is_quantized(&self) -> bool {
-        matches!(self, Projection::Quantized(_))
+        matches!(self, Projection::Quantized(_) | Projection::Prism(_))
     }
 }
 

@@ -11,6 +11,17 @@ use crate::error::Result;
 /// The process-default compute device, selected at compile time by feature:
 /// CUDA (`cuda`) → Metal (`metal`) → CPU (default).
 pub fn select_device() -> Result<Device> {
+    if let Some(selection) = std::env::var_os("CANDLE_LLM_DEVICE") {
+        let selection = selection.to_string_lossy();
+        if selection.eq_ignore_ascii_case("cpu") {
+            return Ok(Device::Cpu);
+        }
+        if !selection.eq_ignore_ascii_case("auto") {
+            return Err(crate::error::Error::Config(format!(
+                "unsupported CANDLE_LLM_DEVICE={selection:?}; expected `auto` or `cpu`"
+            )));
+        }
+    }
     #[cfg(feature = "cuda")]
     let dev = Device::new_cuda(0)?;
     #[cfg(all(feature = "metal", not(feature = "cuda")))]

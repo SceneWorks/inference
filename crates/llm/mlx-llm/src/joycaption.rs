@@ -507,10 +507,12 @@ impl TextLlm for JoyCaptionProvider {
             usage,
         });
         Ok(TextLlmOutput {
+            timings: None,
             text,
             thinking: None,
             tool_calls: Vec::new(),
             usage,
+            mtp: None,
             finish_reason: Some(finish),
         })
     }
@@ -531,7 +533,12 @@ pub fn descriptor() -> TextLlmDescriptor {
             // Text+vision captioner; no audio path at all.
             supports_audio: false,
             supports_thinking: false,
+            supports_reasoning_effort: false,
+            reasoning_efforts: Vec::new(),
+            model_sampling_defaults: None,
+            supports_preserve_thinking: false,
             supports_tools: false,
+            mtp: None,
             supported_constraints: Vec::new(),
         },
     }
@@ -542,6 +549,7 @@ fn map_sampling(s: &Sampling) -> SamplingParams {
         temperature: s.temperature,
         top_p: s.top_p,
         top_k: s.top_k,
+        presence_penalty: s.presence_penalty,
         repetition_penalty: s.repetition_penalty,
         repetition_context: s.repetition_context,
     }

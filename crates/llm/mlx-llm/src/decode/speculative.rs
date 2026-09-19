@@ -386,7 +386,7 @@ pub fn generate_draft_speculative(
 /// Greedy acceptance: the target's argmax at each verify position (penalty-aware, via the sampler),
 /// accept the longest matching draft prefix, bonus = the argmax at the divergence point. Returns
 /// `(committed tokens, accepted draft count)`.
-fn decide_greedy(
+pub(crate) fn decide_greedy(
     logits_all: &Array,
     drafts: &[i32],
     history: &[i32],
@@ -414,7 +414,7 @@ fn decide_greedy(
 /// distribution-preserving. `draft_dists[i]` is the proposal distribution `q` the draft sampled
 /// `drafts[i]` from — a point mass `[(drafts[i], 1.0)]` for prompt-lookup, the draft model's shaped
 /// distribution for draft-model speculation. Returns `(committed tokens, accepted draft count)`.
-fn decide_stochastic(
+pub(crate) fn decide_stochastic(
     logits_all: &Array,
     drafts: &[i32],
     draft_dists: &[Vec<(i32, f32)>],
@@ -460,7 +460,7 @@ fn point_mass_dists(drafts: &[i32]) -> Vec<Vec<(i32, f32)>> {
 }
 
 /// Extract position `i`'s logits row `[batch, vocab]` from an all-positions `[batch, seq, vocab]`.
-fn logits_row(all: &Array, i: i32) -> Result<Array> {
+pub(crate) fn logits_row(all: &Array, i: i32) -> Result<Array> {
     let idx = Array::from_slice(&[i], &[1]);
     let sh = all.shape();
     Ok(all.take_axis(&idx, 1)?.reshape(&[sh[0], sh[2]])?)

@@ -69,6 +69,8 @@ pub struct SamplingParams {
     pub top_p: f32,
     /// Keep only the `top_k` highest-logit tokens before nucleus selection. `0` disables top-k.
     pub top_k: usize,
+    /// Additive once-per-seen-token presence penalty over the full prompt + generated history.
+    pub presence_penalty: f32,
     /// CTRL/HF repetition penalty. `1.0` disables it.
     pub repetition_penalty: f32,
     /// How many recent history tokens the repetition penalty looks back over.
@@ -81,6 +83,7 @@ impl Default for SamplingParams {
             temperature: 0.0,
             top_p: 1.0,
             top_k: 0,
+            presence_penalty: 0.0,
             repetition_penalty: 1.0,
             repetition_context: 0,
         }
@@ -91,7 +94,7 @@ impl SamplingParams {
     /// True when this configuration is pure greedy with no penalty and (caller-checked) no
     /// constraint mask — eligible for the on-device argmax fast path.
     fn is_plain_greedy(&self) -> bool {
-        self.temperature <= 0.0 && self.repetition_penalty == 1.0
+        self.temperature <= 0.0 && self.presence_penalty == 0.0 && self.repetition_penalty == 1.0
     }
 }
 
@@ -185,6 +188,18 @@ fn penalized_logits(
                 } else {
                     *slot / params.repetition_penalty
                 };
+            }
+        }
+    }
+    // Presence penalty is additive and count-independent: every id seen anywhere in the prompt or
+    // generated history is adjusted exactly once, even when it occurs repeatedly.
+    if params.presence_penalty != 0.0 {
+        let mut seen = std::collections::HashSet::with_capacity(history.len());
+        for &tok in history {
+            if seen.insert(tok) {
+                if let Some(slot) = usize::try_from(tok).ok().and_then(|i| v.get_mut(i)) {
+                    *slot -= params.presence_penalty;
+                }
             }
         }
     }
@@ -426,6 +441,40 @@ mod tests {
         let mut rng = SplitMix64::new(0);
         let t = sample(&l, &history, &params, &mut rng, Some(&[true, true, true])).unwrap();
         assert_eq!(t, 1);
+    }
+
+    #[test]
+    fn presence_penalty_applies_once_to_every_seen_token() {
+        let params = SamplingParams {
+            temperature: 0.0,
+            presence_penalty: 0.75,
+            ..Default::default()
+        };
+        let l = logits(&[2.0, 1.5, 0.5]);
+        let mut rng = SplitMix64::new(0);
+        assert_eq!(sample(&l, &[0], &params, &mut rng, None).unwrap(), 1);
+        assert_eq!(
+            sample(&l, &[0, 0, 0], &params, &mut rng, None).unwrap(),
+            1,
+            "repeat count must not multiply a presence penalty"
+        );
+    }
+
+    #[test]
+    fn repetition_transform_precedes_additive_presence_penalty() {
+        let params = SamplingParams {
+            temperature: 0.0,
+            presence_penalty: 0.75,
+            repetition_penalty: 2.0,
+            repetition_context: 1,
+            ..Default::default()
+        };
+        // Repetition-first transforms token 0 from 2.0 -> 1.0, then presence subtracts to 0.25,
+        // so token 1 wins at 0.5. Additive-first would produce (2.0 - 0.75) / 2 = 0.625 and
+        // incorrectly keep token 0.
+        let l = logits(&[2.0, 0.5]);
+        let mut rng = SplitMix64::new(0);
+        assert_eq!(sample(&l, &[0], &params, &mut rng, None).unwrap(), 1);
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub mod gated_delta;
 pub mod kv_cache;
 pub mod nn;
 pub mod paged_kv_cache;
+pub mod prism;
 pub mod projection;
 pub mod quant;
 pub mod rope;

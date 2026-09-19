@@ -307,7 +307,12 @@ mod tests {
                 supports_video: false,
                 supports_audio: false,
                 supports_thinking: false,
+                supports_reasoning_effort: false,
+                reasoning_efforts: Vec::new(),
+                model_sampling_defaults: None,
+                supports_preserve_thinking: false,
                 supports_tools: false,
+                mtp: None,
                 supported_constraints: Vec::new(),
             },
         };
@@ -376,6 +381,8 @@ mod tests {
                 thinking: None,
                 tool_calls: Vec::new(),
                 usage,
+                mtp: None,
+                timings: None,
                 finish_reason: Some(core_llm::FinishReason::Stop),
             })
         }

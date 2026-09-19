@@ -9,6 +9,32 @@ pub struct Usage {
     pub generated_tokens: u32,
 }
 
+/// Per-request evidence from native MTP speculative decoding.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MtpStats {
+    /// Draft tokens proposed by the MTP head.
+    pub proposed_tokens: u32,
+    /// Proposed tokens accepted by target-model verification.
+    pub accepted_tokens: u32,
+    /// Target forward passes, including prompt prefill and verification passes.
+    pub target_forwards: u32,
+}
+
+/// Synchronized native generation phase durations, distinct from time to first emitted token.
+///
+/// Prefill includes prompt conditioning (including visual encoding/fusion) and initial target and
+/// MTP cache population. Decode includes generated-token sampling, target/draft/verification passes,
+/// cache recovery and stream dispatch. Tokenization/template rendering and model loading are outside
+/// these phases. Backends must evaluate/synchronize accelerator work at phase boundaries; otherwise
+/// these measurements would describe submission time rather than completed work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GenerationTimings {
+    /// Completed prompt-conditioning and cache-initialization wall time.
+    pub prefill: std::time::Duration,
+    /// Completed generation-loop wall time after prefill.
+    pub decode: std::time::Duration,
+}
+
 impl Usage {
     /// Total tokens processed (prompt + generated).
     pub fn total_tokens(&self) -> u32 {
@@ -93,6 +119,11 @@ pub struct TextLlmOutput {
     pub tool_calls: Vec<crate::tool::ToolCall>,
     /// Token usage.
     pub usage: Usage,
+    /// MTP speculative-decoding counters when MTP ran; `None` on ordinary autoregressive decode.
+    pub mtp: Option<MtpStats>,
+    /// Synchronized backend phase measurements, when implemented by this provider.
+    /// `None` is unavailable evidence, never zero latency.
+    pub timings: Option<GenerationTimings>,
     /// Why generation stopped (`None` only on a default-constructed value).
     pub finish_reason: Option<FinishReason>,
 }

@@ -432,4 +432,38 @@ mod tests {
         assert!(!table.special.contains(&1));
         assert_eq!(table.pieces[1], "hello");
     }
+
+    #[test]
+    fn frozen_qwen38_tokenizer_matches_checked_in_prompt_oracle() {
+        let Some(path) = std::env::var_os("QWEN38_TOKENIZER_JSON") else {
+            eprintln!("skipping: set QWEN38_TOKENIZER_JSON to the frozen tokenizer.json");
+            return;
+        };
+        let tokenizer = Tokenizer::from_file(path).unwrap();
+        let oracle: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../docs/reference/qwen38/tokenizer_oracle.json"
+        )))
+        .unwrap();
+        assert_eq!(
+            oracle["source_revision"],
+            "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+        );
+        assert_eq!(
+            oracle["tokenizer_sha256"],
+            "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+        );
+        for (name, case) in oracle["cases"].as_object().unwrap() {
+            let expected: Vec<u32> = case["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| id.as_u64().unwrap() as u32)
+                .collect();
+            let actual = tokenizer
+                .encode(case["text"].as_str().unwrap(), false)
+                .unwrap();
+            assert_eq!(actual, expected, "frozen Qwen3.8 tokenizer case {name}");
+        }
+    }
 }

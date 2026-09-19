@@ -13,6 +13,7 @@ pub mod batch;
 pub mod cancel;
 pub mod continuous;
 pub mod prefix;
+pub mod qwen35_mtp;
 pub mod speculative;
 pub mod stream;
 
@@ -20,6 +21,10 @@ pub use batch::{generate_batch, BatchRequest};
 pub use cancel::CancelFlag;
 pub use continuous::{generate_continuous, BatchExactness, ContinuousConfig};
 pub use prefix::{generate_cached, generate_cached_with, PrefixCache, PrefixStats};
+pub use qwen35_mtp::{generate_qwen35_mtp, Qwen35MtpMultimodalPrompt, RewindableConstraintMask};
+pub(crate) use qwen35_mtp::{
+    generate_qwen35_mtp_multimodal_with_timings, generate_qwen35_mtp_with_timings,
+};
 pub use speculative::{
     generate_draft_speculative, generate_prompt_lookup, SpeculativeConfig, SpeculativeStats,
 };
@@ -27,6 +32,7 @@ pub use stream::{
     generate, generate_from_prefill, generate_with, generate_with_cache, ConstraintMask, Decode,
     FinishReason, GenerationConfig, GenerationOutput, StreamEvent,
 };
+pub(crate) use stream::{generate_from_prefill_with_timings, generate_with_timings};
 
 pub(super) enum LaneStep {
     Continue,

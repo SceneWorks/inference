@@ -77,6 +77,7 @@ fn next_token_id(
             temperature: sampling.temperature,
             top_p: sampling.top_p,
             top_k: sampling.top_k,
+            presence_penalty: sampling.presence_penalty,
             repetition_penalty: sampling.repetition_penalty,
             repetition_context: sampling.repetition_context,
         },
@@ -405,7 +406,12 @@ pub fn descriptor() -> core_llm::TextLlmDescriptor {
             supports_video: false,
             supports_audio: false,
             supports_thinking: false,
+            supports_reasoning_effort: false,
+            reasoning_efforts: Vec::new(),
+            model_sampling_defaults: None,
+            supports_preserve_thinking: false,
             supports_tools: false,
+            mtp: None,
             supported_constraints: vec![],
         },
     }
@@ -496,10 +502,12 @@ impl core_llm::TextLlm for CandleStarVectorProvider {
             usage,
         });
         Ok(core_llm::TextLlmOutput {
+            timings: None,
             text: out.svg.unwrap_or_default(),
             thinking: None,
             tool_calls: vec![],
             usage,
+            mtp: None,
             finish_reason: Some(finish),
         })
     }

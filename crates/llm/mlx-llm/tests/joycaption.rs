@@ -236,6 +236,7 @@ fn joycaption_model_matches_golden_tokens() {
         temperature: 0.0,
         top_p: 1.0,
         top_k: 0,
+        presence_penalty: 0.0,
         repetition_penalty: 1.0,
         repetition_context: 0,
     };
@@ -298,6 +299,7 @@ fn joycaption_resize_path_matches_golden() {
         temperature: 0.0,
         top_p: 1.0,
         top_k: 0,
+        presence_penalty: 0.0,
         repetition_penalty: 1.0,
         repetition_context: 0,
     };

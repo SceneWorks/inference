@@ -126,7 +126,17 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, starvector-terminal, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+        options: [all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+      qwen38_bonsai_preflight_only:
+        description: Qualify Qwen/Bonsai host capacity and CUDA operators without provisioning or loading models
+        type: boolean
+        required: false
+        default: false
+      qwen38_bonsai_provision_only:
+        description: Provision admitted pinned Qwen/Bonsai assets and verify publisher hashes without model execution
+        type: boolean
+        required: false
+        default: false
       sceneworks_revision:
         description: Exact lowercase SceneWorks commit paired with memory-evidence-v1
         type: string
@@ -1693,6 +1703,397 @@ jobs:
           if-no-files-found: error
           retention-days: 30
           path: ${{ runner.temp }}\\starvector-terminal-preflight
+
+  # SC-23942 is dispatch-only. These jobs serialize MLX then CUDA and launch prebuilt native test
+  # executables directly, giving the sampler exact process ownership for RSS/GPU evidence.
+  qwen38-bonsai-mlx:
+    name: Qwen3.8/Bonsai matched diagnostics (MLX)
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen38-bonsai'
+    runs-on: [self-hosted, macOS, ARM64, rw-llm]
+    timeout-minutes: 360
+    env:
+      BONSAI_QWEN38_SNAPSHOT: ${{ vars.BONSAI_QWEN38_SNAPSHOT }}
+      BONSAI_MLX_SNAPSHOT: ${{ vars.BONSAI_MLX_SNAPSHOT }}
+      BONSAI_GGUF_SNAPSHOT: ${{ vars.BONSAI_GGUF_SNAPSHOT }}
+      BONSAI_BASELINE_SNAPSHOT: ${{ vars.BONSAI_BASELINE_SNAPSHOT }}
+      BONSAI_CASES: arithmetic,logic,ordering,code,json,tool,multi_turn,image,multi_image,video_forward,video_reverse,context_64,context_512,context_2048
+      QWEN38_ACCEPTANCE_CASES: reasoning_low,reasoning_medium,reasoning_xhigh,preserve_thinking,tool_roundtrip,json_thinking,mtp_greedy,mtp_json,mtp_image,mtp_video
+      BONSAI_ACCEPTANCE_CASES: reasoning_low,reasoning_medium,reasoning_xhigh,preserve_thinking,tool_roundtrip,json_thinking
+      BONSAI_FORMAT_CASES: image,video_forward,video_reverse
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Validate exclusive qualification phase
+        run: python3.12 scripts/release/qwen38_bonsai_terminal.py validate-phase --preflight-only "${{ inputs.qwen38_bonsai_preflight_only }}" --provision-only "${{ inputs.qwen38_bonsai_provision_only }}"
+      - name: Capture hardware before provisioning or model load
+        run: |
+          mkdir -p "$RUNNER_TEMP/qwen38-bonsai-mlx"
+          python3.12 scripts/release/qwen38_bonsai_terminal.py hardware --output "$RUNNER_TEMP/qwen38-bonsai-mlx/hardware-before.json"
+          cat "$RUNNER_TEMP/qwen38-bonsai-mlx/hardware-before.json"
+      - name: Resolve runner-local snapshot paths
+        run: >-
+          python3.12 scripts/release/resolve_snapshot_paths.py
+          BONSAI_QWEN38_SNAPSHOT BONSAI_MLX_SNAPSHOT BONSAI_GGUF_SNAPSHOT BONSAI_BASELINE_SNAPSHOT
+      - name: Qualify configured macOS snapshot metadata without provisioning
+        id: mlx_snapshot_metadata
+        continue-on-error: true
+        run: |
+          if python3.12 scripts/release/qwen38_bonsai_terminal.py qualify-snapshots --platform macos \
+            --binding BONSAI_QWEN38_SNAPSHOT=bonsai-qwen38-parent \
+            --binding BONSAI_MLX_SNAPSHOT=bonsai-mlx-2bit \
+            --binding BONSAI_GGUF_SNAPSHOT=bonsai-gguf \
+            --binding BONSAI_BASELINE_SNAPSHOT=bonsai-qwen3vl-baseline \
+            --output "$RUNNER_TEMP/qwen38-bonsai-mlx/snapshot-metadata-before.json"; then
+            STATUS=0
+          else
+            STATUS=$?
+          fi
+          cat "$RUNNER_TEMP/qwen38-bonsai-mlx/snapshot-metadata-before.json"
+          exit "$STATUS"
+      - name: Preflight MLX parent before provisioning
+        id: mlx_parent_preflight
+        continue-on-error: true
+        run: python3.12 scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-qwen38-parent --load-profile mlx-unified --output "$RUNNER_TEMP/qwen38-bonsai-mlx/mlx-qwen38-parent-preflight.json"
+      - name: Preflight MLX Bonsai before provisioning
+        id: mlx_bonsai_preflight
+        continue-on-error: true
+        run: python3.12 scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-mlx-2bit --load-profile mlx-unified --output "$RUNNER_TEMP/qwen38-bonsai-mlx/mlx-bonsai-mlx-2bit-preflight.json"
+      - name: Preflight MLX baseline before provisioning
+        id: mlx_baseline_preflight
+        continue-on-error: true
+        run: python3.12 scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-qwen3vl-baseline --load-profile mlx-unified --output "$RUNNER_TEMP/qwen38-bonsai-mlx/mlx-qwen3vl-baseline-preflight.json"
+      - name: Preflight MLX format routes before provisioning
+        id: mlx_format_preflight
+        run: |
+          if python3.12 scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-mlx-2bit --load-profile mlx-unified --output "$RUNNER_TEMP/qwen38-bonsai-mlx/functional-mlx-bonsai-mlx-preflight.json"; then
+            echo "bonsai=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "bonsai=false" >> "$GITHUB_OUTPUT"
+          fi
+          for language in pq2 ptq1; do
+            for vision in bf16 q8; do
+              if python3.12 scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-gguf --language-variant "$language" --vision-variant "$vision" --load-profile mlx-unified --output "$RUNNER_TEMP/qwen38-bonsai-mlx/functional-mlx-${language}-${vision}-preflight.json"; then
+                echo "${language}_${vision}=true" >> "$GITHUB_OUTPUT"
+              else
+                echo "${language}_${vision}=false" >> "$GITHUB_OUTPUT"
+              fi
+            done
+          done
+          exit 0
+      - name: Report runner disk headroom
+        if: inputs.qwen38_bonsai_preflight_only != true
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          BONSAI_QWEN38_SNAPSHOT BONSAI_MLX_SNAPSHOT BONSAI_GGUF_SNAPSHOT BONSAI_BASELINE_SNAPSHOT
+      - name: Install pinned snapshot verifier dependencies
+        if: inputs.qwen38_bonsai_preflight_only != true
+        run: |
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+      - name: Provision admitted MLX assets and verify publisher identities
+        if: inputs.qwen38_bonsai_preflight_only != true
+        run: |
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/qwen38_bonsai_terminal.py provision-assets --platform macos --runtime-sha "$GITHUB_SHA" --evidence-root "$RUNNER_TEMP/qwen38-bonsai-mlx"
+      - name: Build one native MLX comparison executable
+        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true
+        run: |
+          set -o pipefail
+          cargo test --locked --release -p mlx-llm --test integration --no-run --message-format=json 2>"$RUNNER_TEMP/qwen38-bonsai-mlx/build.stderr" | tee "$RUNNER_TEMP/qwen38-bonsai-mlx/build.jsonl" | python3.12 scripts/release/qwen38_bonsai_terminal.py resolve-binary --target integration > "$RUNNER_TEMP/qwen38-bonsai-mlx/binary.txt"
+          test -x "$(cat "$RUNNER_TEMP/qwen38-bonsai-mlx/binary.txt")"
+      - name: Run MLX Bonsai row
+        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true && (steps.mlx_bonsai_preflight.outcome == 'success')
+        continue-on-error: true
+        run: |
+          BINARY="$(cat "$RUNNER_TEMP/qwen38-bonsai-mlx/binary.txt")"
+          python3.12 scripts/release/qwen38_bonsai_terminal.py run --binary "$BINARY" --test-name qwen38_bonsai::native_comparison --model-id mlx-bonsai-mlx-2bit --model-key bonsai-mlx-2bit --model-revision 3f926b415992eaa2ae9dd7b573706494d6bbf787 --snapshot "$BONSAI_MLX_SNAPSHOT" --model-path "$BONSAI_MLX_SNAPSHOT" --runtime-sha "$GITHUB_SHA" --cases "$BONSAI_CASES,$BONSAI_ACCEPTANCE_CASES" --preflight "$RUNNER_TEMP/qwen38-bonsai-mlx/mlx-bonsai-mlx-2bit-preflight.json" --output "$RUNNER_TEMP/qwen38-bonsai-mlx/mlx-bonsai-mlx-2bit"
+      - name: Run MLX baseline row
+        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true && (steps.mlx_baseline_preflight.outcome == 'success')
+        continue-on-error: true
+        run: |
+          BINARY="$(cat "$RUNNER_TEMP/qwen38-bonsai-mlx/binary.txt")"
+          python3.12 scripts/release/qwen38_bonsai_terminal.py run --binary "$BINARY" --test-name qwen38_bonsai::native_comparison --model-id mlx-qwen3vl-baseline --model-key bonsai-qwen3vl-baseline --model-revision 0c351dd01ed87e9c1b53cbc748cba10e6187ff3b --snapshot "$BONSAI_BASELINE_SNAPSHOT" --model-path "$BONSAI_BASELINE_SNAPSHOT" --runtime-sha "$GITHUB_SHA" --cases "$BONSAI_CASES" --preflight "$RUNNER_TEMP/qwen38-bonsai-mlx/mlx-qwen3vl-baseline-preflight.json" --output "$RUNNER_TEMP/qwen38-bonsai-mlx/mlx-qwen3vl-baseline"
+      - name: Run MLX parent row
+        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true && (steps.mlx_parent_preflight.outcome == 'success')
+        continue-on-error: true
+        run: |
+          BINARY="$(cat "$RUNNER_TEMP/qwen38-bonsai-mlx/binary.txt")"
+          python3.12 scripts/release/qwen38_bonsai_terminal.py run --binary "$BINARY" --test-name qwen38_bonsai::native_comparison --model-id mlx-qwen38-parent --model-key bonsai-qwen38-parent --model-revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 --snapshot "$BONSAI_QWEN38_SNAPSHOT" --model-path "$BONSAI_QWEN38_SNAPSHOT" --runtime-sha "$GITHUB_SHA" --cases "$BONSAI_CASES,$QWEN38_ACCEPTANCE_CASES" --preflight "$RUNNER_TEMP/qwen38-bonsai-mlx/mlx-qwen38-parent-preflight.json" --output "$RUNNER_TEMP/qwen38-bonsai-mlx/mlx-qwen38-parent"
+      - name: Run MLX Bonsai safetensors format route
+        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true && (steps.mlx_format_preflight.outputs.bonsai == 'true')
+        continue-on-error: true
+        run: |
+          BINARY="$(cat "$RUNNER_TEMP/qwen38-bonsai-mlx/binary.txt")"
+          python3.12 scripts/release/qwen38_bonsai_terminal.py run --binary "$BINARY" --test-name qwen38_bonsai::native_comparison --model-id functional-mlx-bonsai-mlx --model-key bonsai-mlx-2bit --model-revision 3f926b415992eaa2ae9dd7b573706494d6bbf787 --snapshot "$BONSAI_MLX_SNAPSHOT" --model-path "$BONSAI_MLX_SNAPSHOT" --runtime-sha "$GITHUB_SHA" --cases "$BONSAI_FORMAT_CASES" --preflight "$RUNNER_TEMP/qwen38-bonsai-mlx/functional-mlx-bonsai-mlx-preflight.json" --output "$RUNNER_TEMP/qwen38-bonsai-mlx/functional-mlx-bonsai-mlx"
+      - name: Run MLX PQ2/BF16 format route
+        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true && (steps.mlx_format_preflight.outputs.pq2_bf16 == 'true')
+        continue-on-error: true
+        run: |
+          BINARY="$(cat "$RUNNER_TEMP/qwen38-bonsai-mlx/binary.txt")"
+          python3.12 scripts/release/qwen38_bonsai_terminal.py run --binary "$BINARY" --test-name qwen38_bonsai::native_comparison --model-id functional-mlx-pq2-bf16 --model-key bonsai-gguf --language-variant pq2 --vision-variant bf16 --model-revision 6ed5e12bf84b7a63069882c91dd9e9218647d17b --snapshot "$BONSAI_GGUF_SNAPSHOT" --model-path "$BONSAI_GGUF_SNAPSHOT/Ternary-Bonsai-2-27B-PQ2_0.gguf" --projector-path "$BONSAI_GGUF_SNAPSHOT/Ternary-Bonsai-2-27B-mmproj-BF16.gguf" --runtime-sha "$GITHUB_SHA" --cases "$BONSAI_FORMAT_CASES" --preflight "$RUNNER_TEMP/qwen38-bonsai-mlx/functional-mlx-pq2-bf16-preflight.json" --output "$RUNNER_TEMP/qwen38-bonsai-mlx/functional-mlx-pq2-bf16"
+      - name: Run MLX PQ2/Q8 format route
+        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true && (steps.mlx_format_preflight.outputs.pq2_q8 == 'true')
+        continue-on-error: true
+        run: |
+          BINARY="$(cat "$RUNNER_TEMP/qwen38-bonsai-mlx/binary.txt")"
+          python3.12 scripts/release/qwen38_bonsai_terminal.py run --binary "$BINARY" --test-name qwen38_bonsai::native_comparison --model-id functional-mlx-pq2-q8 --model-key bonsai-gguf --language-variant pq2 --vision-variant q8 --model-revision 6ed5e12bf84b7a63069882c91dd9e9218647d17b --snapshot "$BONSAI_GGUF_SNAPSHOT" --model-path "$BONSAI_GGUF_SNAPSHOT/Ternary-Bonsai-2-27B-PQ2_0.gguf" --projector-path "$BONSAI_GGUF_SNAPSHOT/Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf" --runtime-sha "$GITHUB_SHA" --cases "$BONSAI_FORMAT_CASES" --preflight "$RUNNER_TEMP/qwen38-bonsai-mlx/functional-mlx-pq2-q8-preflight.json" --output "$RUNNER_TEMP/qwen38-bonsai-mlx/functional-mlx-pq2-q8"
+      - name: Run MLX PTQ1/BF16 format route
+        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true && (steps.mlx_format_preflight.outputs.ptq1_bf16 == 'true')
+        continue-on-error: true
+        run: |
+          BINARY="$(cat "$RUNNER_TEMP/qwen38-bonsai-mlx/binary.txt")"
+          python3.12 scripts/release/qwen38_bonsai_terminal.py run --binary "$BINARY" --test-name qwen38_bonsai::native_comparison --model-id functional-mlx-ptq1-bf16 --model-key bonsai-gguf --language-variant ptq1 --vision-variant bf16 --model-revision 6ed5e12bf84b7a63069882c91dd9e9218647d17b --snapshot "$BONSAI_GGUF_SNAPSHOT" --model-path "$BONSAI_GGUF_SNAPSHOT/Ternary-Bonsai-2-27B-PTQ1_0.gguf" --projector-path "$BONSAI_GGUF_SNAPSHOT/Ternary-Bonsai-2-27B-mmproj-BF16.gguf" --runtime-sha "$GITHUB_SHA" --cases "$BONSAI_FORMAT_CASES" --preflight "$RUNNER_TEMP/qwen38-bonsai-mlx/functional-mlx-ptq1-bf16-preflight.json" --output "$RUNNER_TEMP/qwen38-bonsai-mlx/functional-mlx-ptq1-bf16"
+      - name: Run MLX PTQ1/Q8 format route
+        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true && (steps.mlx_format_preflight.outputs.ptq1_q8 == 'true')
+        continue-on-error: true
+        run: |
+          BINARY="$(cat "$RUNNER_TEMP/qwen38-bonsai-mlx/binary.txt")"
+          python3.12 scripts/release/qwen38_bonsai_terminal.py run --binary "$BINARY" --test-name qwen38_bonsai::native_comparison --model-id functional-mlx-ptq1-q8 --model-key bonsai-gguf --language-variant ptq1 --vision-variant q8 --model-revision 6ed5e12bf84b7a63069882c91dd9e9218647d17b --snapshot "$BONSAI_GGUF_SNAPSHOT" --model-path "$BONSAI_GGUF_SNAPSHOT/Ternary-Bonsai-2-27B-PTQ1_0.gguf" --projector-path "$BONSAI_GGUF_SNAPSHOT/Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf" --runtime-sha "$GITHUB_SHA" --cases "$BONSAI_FORMAT_CASES" --preflight "$RUNNER_TEMP/qwen38-bonsai-mlx/functional-mlx-ptq1-q8-preflight.json" --output "$RUNNER_TEMP/qwen38-bonsai-mlx/functional-mlx-ptq1-q8"
+      - name: Upload MLX qualification or sealed row evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qwen38-bonsai-mlx-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/qwen38-bonsai-mlx
+          if-no-files-found: error
+          retention-days: 30
+
+  qwen38-bonsai-candle:
+    name: Qwen3.8/Bonsai matched diagnostics (Candle/CUDA)
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen38-bonsai'
+    needs: qwen38-bonsai-mlx
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 360
+    env:
+      BONSAI_GGUF_SNAPSHOT: ${{ vars.CANDLE_BONSAI_GGUF_SNAPSHOT }}
+      BONSAI_MLX_SNAPSHOT: ${{ vars.CANDLE_BONSAI_MLX_SNAPSHOT }}
+      BONSAI_QWEN38_SNAPSHOT: ${{ vars.CANDLE_BONSAI_QWEN38_SNAPSHOT }}
+      BONSAI_BASELINE_SNAPSHOT: ${{ vars.CANDLE_BONSAI_BASELINE_SNAPSHOT }}
+      BONSAI_CASES: arithmetic,logic,ordering,code,json,tool,multi_turn,image,multi_image,video_forward,video_reverse,context_64,context_512,context_2048
+      QWEN38_ACCEPTANCE_CASES: reasoning_low,reasoning_medium,reasoning_xhigh,preserve_thinking,tool_roundtrip,json_thinking,mtp_greedy,mtp_json,mtp_image,mtp_video
+      BONSAI_ACCEPTANCE_CASES: reasoning_low,reasoning_medium,reasoning_xhigh,preserve_thinking,tool_roundtrip,json_thinking
+      BONSAI_FORMAT_CASES: image,video_forward,video_reverse
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
+      - name: Validate exclusive qualification phase
+        shell: cmd
+        run: '"%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py validate-phase --preflight-only "${{ inputs.qwen38_bonsai_preflight_only }}" --provision-only "${{ inputs.qwen38_bonsai_provision_only }}" || exit /b 1'
+      - name: Capture hardware before provisioning or model load
+        shell: cmd
+        run: |
+          if not exist "%RUNNER_TEMP%\qwen38-bonsai-candle" mkdir "%RUNNER_TEMP%\qwen38-bonsai-candle" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py hardware --output "%RUNNER_TEMP%\qwen38-bonsai-candle\hardware-before.json" || exit /b 1
+          type "%RUNNER_TEMP%\qwen38-bonsai-candle\hardware-before.json"
+      - name: Qualify configured Windows snapshot metadata without provisioning
+        id: candle_snapshot_metadata
+        continue-on-error: true
+        shell: cmd
+        run: |
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py qualify-snapshots --platform windows --binding BONSAI_QWEN38_SNAPSHOT=bonsai-qwen38-parent --binding BONSAI_MLX_SNAPSHOT=bonsai-mlx-2bit --binding BONSAI_GGUF_SNAPSHOT=bonsai-gguf --binding BONSAI_BASELINE_SNAPSHOT=bonsai-qwen3vl-baseline --output "%RUNNER_TEMP%\qwen38-bonsai-candle\snapshot-metadata-before.json"
+          set "STATUS=%ERRORLEVEL%"
+          type "%RUNNER_TEMP%\qwen38-bonsai-candle\snapshot-metadata-before.json"
+          exit /b %STATUS%
+      - name: Reserve CUDA device 0 for the complete Candle campaign
+        shell: cmd
+        run: |
+          set "BONSAI_GPU_RESERVATION=%LOCALAPPDATA%\SceneWorks\inference-reservations\cuda-device-0.json"
+          set "BONSAI_RESERVATION_TOKEN=%GITHUB_RUN_ID%-%GITHUB_RUN_ATTEMPT%"
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py reserve-gpu --gpu-index 0 --reservation "%BONSAI_GPU_RESERVATION%" --evidence "%RUNNER_TEMP%\qwen38-bonsai-candle\gpu-reservation.json" --token "%BONSAI_RESERVATION_TOKEN%" || exit /b 1
+          echo BONSAI_GPU_RESERVATION=%BONSAI_GPU_RESERVATION%>>"%GITHUB_ENV%"
+          echo BONSAI_RESERVATION_TOKEN=%BONSAI_RESERVATION_TOKEN%>>"%GITHUB_ENV%"
+      - name: Preflight Candle CUDA parent before provisioning
+        id: candle_cuda_parent_preflight
+        continue-on-error: true
+        shell: cmd
+        run: '"%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-qwen38-parent --load-profile candle-dense-cuda --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cuda-qwen38-parent-preflight.json"'
+      - name: Preflight Candle CUDA Bonsai before provisioning
+        id: candle_cuda_bonsai_preflight
+        continue-on-error: true
+        shell: cmd
+        run: '"%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-gguf --language-variant ptq1 --vision-variant q8 --load-profile candle-packed-cuda --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cuda-bonsai-gguf-preflight.json"'
+      - name: Preflight Candle CUDA baseline before provisioning
+        id: candle_cuda_baseline_preflight
+        continue-on-error: true
+        shell: cmd
+        run: '"%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-qwen3vl-baseline --load-profile candle-dense-cuda --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cuda-qwen3vl-baseline-preflight.json"'
+      - name: Preflight Candle CPU parent before provisioning
+        id: candle_cpu_parent_preflight
+        continue-on-error: true
+        shell: cmd
+        run: '"%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-qwen38-parent --load-profile candle-dense-cpu --output "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cpu-qwen38-parent-preflight.json"'
+      - name: Preflight Candle CPU Bonsai before provisioning
+        id: candle_cpu_bonsai_preflight
+        continue-on-error: true
+        shell: cmd
+        run: '"%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-gguf --language-variant ptq1 --vision-variant q8 --load-profile candle-packed-cpu --output "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cpu-bonsai-gguf-preflight.json"'
+      - name: Preflight Candle CPU baseline before provisioning
+        id: candle_cpu_baseline_preflight
+        continue-on-error: true
+        shell: cmd
+        run: '"%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-qwen3vl-baseline --load-profile candle-dense-cpu --output "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cpu-qwen3vl-baseline-preflight.json"'
+      - name: Preflight Candle format routes before provisioning
+        id: candle_format_preflight
+        shell: cmd
+        run: |
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-mlx-2bit --load-profile candle-packed-cuda --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\functional-candle-bonsai-mlx-preflight.json"
+          if errorlevel 1 (echo bonsai=false>>"%GITHUB_OUTPUT%") else (echo bonsai=true>>"%GITHUB_OUTPUT%")
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-gguf --language-variant pq2 --vision-variant bf16 --load-profile candle-packed-cuda --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\functional-candle-pq2-bf16-preflight.json"
+          if errorlevel 1 (echo pq2_bf16=false>>"%GITHUB_OUTPUT%") else (echo pq2_bf16=true>>"%GITHUB_OUTPUT%")
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-gguf --language-variant pq2 --vision-variant q8 --load-profile candle-packed-cuda --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\functional-candle-pq2-q8-preflight.json"
+          if errorlevel 1 (echo pq2_q8=false>>"%GITHUB_OUTPUT%") else (echo pq2_q8=true>>"%GITHUB_OUTPUT%")
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-gguf --language-variant ptq1 --vision-variant bf16 --load-profile candle-packed-cuda --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\functional-candle-ptq1-bf16-preflight.json"
+          if errorlevel 1 (echo ptq1_bf16=false>>"%GITHUB_OUTPUT%") else (echo ptq1_bf16=true>>"%GITHUB_OUTPUT%")
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-gguf --language-variant ptq1 --vision-variant q8 --load-profile candle-packed-cuda --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\functional-candle-ptq1-q8-preflight.json"
+          if errorlevel 1 (echo ptq1_q8=false>>"%GITHUB_OUTPUT%") else (echo ptq1_q8=true>>"%GITHUB_OUTPUT%")
+          exit /b 0
+      - name: Execute Candle packed CUDA operator oracles before provisioning
+        if: inputs.qwen38_bonsai_provision_only != true
+        shell: cmd
+        run: |
+          call "%VCVARS%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py check-gpu-reservation --gpu-index 0 --reservation "%BONSAI_GPU_RESERVATION%" --token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\cuda-oracle-device-recheck.json" || exit /b 1
+          set "CUDA_ORACLE_LOG=%RUNNER_TEMP%\qwen38-bonsai-candle\cuda-packed-operator-oracles.log"
+          cargo test --locked -p candle-llm --features cuda --lib primitives::prism::tests::cuda_packed_operator_oracles_compile_and_execute_nvrtc -- --exact --nocapture > "%CUDA_ORACLE_LOG%" 2>&1 || (type "%CUDA_ORACLE_LOG%" & exit /b 1)
+          type "%CUDA_ORACLE_LOG%"
+          findstr /C:"test result: ok. 1 passed" "%CUDA_ORACLE_LOG%" >nul || exit /b 1
+      - name: Install pinned snapshot verifier dependencies
+        if: inputs.qwen38_bonsai_preflight_only != true
+        shell: cmd
+        run: |
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
+      - name: Provision admitted Candle assets and verify publisher identities
+        if: inputs.qwen38_bonsai_preflight_only != true
+        shell: cmd
+        run: |
+          set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py provision-assets --platform windows --runtime-sha "%GITHUB_SHA%" --evidence-root "%RUNNER_TEMP%\qwen38-bonsai-candle" || exit /b 1
+      - name: Build one native Candle CUDA comparison executable
+        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true
+        shell: cmd
+        run: |
+          call "%VCVARS%" || exit /b 1
+          cargo test --locked --release -p candle-llm --features cuda --test qwen38_bonsai --no-run --message-format=json > "%RUNNER_TEMP%\qwen38-bonsai-candle\build.jsonl" 2> "%RUNNER_TEMP%\qwen38-bonsai-candle\build.stderr" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py resolve-binary --target qwen38_bonsai < "%RUNNER_TEMP%\qwen38-bonsai-candle\build.jsonl" > "%RUNNER_TEMP%\qwen38-bonsai-candle\binary.txt" || exit /b 1
+      - name: Run Candle CUDA parent row
+        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true && (steps.candle_cuda_parent_preflight.outcome == 'success')
+        continue-on-error: true
+        shell: cmd
+        run: |
+          set /p BINARY=<"%RUNNER_TEMP%\qwen38-bonsai-candle\binary.txt"
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py run --candle-device auto --binary "%BINARY%" --test-name native_comparison --model-id candle-cuda-qwen38-parent --model-key bonsai-qwen38-parent --model-revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 --snapshot "%BONSAI_QWEN38_SNAPSHOT%" --model-path "%BONSAI_QWEN38_SNAPSHOT%" --runtime-sha "%GITHUB_SHA%" --cases "%BONSAI_CASES%,%QWEN38_ACCEPTANCE_CASES%" --preflight "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cuda-qwen38-parent-preflight.json" --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cuda-qwen38-parent" || exit /b 1
+      - name: Run Candle CUDA Bonsai row
+        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true && (steps.candle_cuda_bonsai_preflight.outcome == 'success')
+        continue-on-error: true
+        shell: cmd
+        run: |
+          set /p BINARY=<"%RUNNER_TEMP%\qwen38-bonsai-candle\binary.txt"
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py run --candle-device auto --binary "%BINARY%" --test-name native_comparison --model-id candle-cuda-bonsai-gguf --model-key bonsai-gguf --language-variant ptq1 --vision-variant q8 --model-revision 6ed5e12bf84b7a63069882c91dd9e9218647d17b --snapshot "%BONSAI_GGUF_SNAPSHOT%" --model-path "%BONSAI_GGUF_SNAPSHOT%\Ternary-Bonsai-2-27B-PTQ1_0.gguf" --projector-path "%BONSAI_GGUF_SNAPSHOT%\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf" --runtime-sha "%GITHUB_SHA%" --cases "%BONSAI_CASES%,%BONSAI_ACCEPTANCE_CASES%" --preflight "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cuda-bonsai-gguf-preflight.json" --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cuda-bonsai-gguf" || exit /b 1
+      - name: Run Candle CUDA baseline row
+        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true && (steps.candle_cuda_baseline_preflight.outcome == 'success')
+        continue-on-error: true
+        shell: cmd
+        run: |
+          set /p BINARY=<"%RUNNER_TEMP%\qwen38-bonsai-candle\binary.txt"
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py run --candle-device auto --binary "%BINARY%" --test-name native_comparison --model-id candle-cuda-qwen3vl-baseline --model-key bonsai-qwen3vl-baseline --model-revision 0c351dd01ed87e9c1b53cbc748cba10e6187ff3b --snapshot "%BONSAI_BASELINE_SNAPSHOT%" --model-path "%BONSAI_BASELINE_SNAPSHOT%" --runtime-sha "%GITHUB_SHA%" --cases "%BONSAI_CASES%" --preflight "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cuda-qwen3vl-baseline-preflight.json" --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cuda-qwen3vl-baseline" || exit /b 1
+      - name: Run Candle CPU parent row
+        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true && (steps.candle_cpu_parent_preflight.outcome == 'success')
+        continue-on-error: true
+        shell: cmd
+        run: |
+          set /p BINARY=<"%RUNNER_TEMP%\qwen38-bonsai-candle\binary.txt"
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py run --candle-device cpu --binary "%BINARY%" --test-name native_comparison --model-id candle-cpu-qwen38-parent --model-key bonsai-qwen38-parent --model-revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 --snapshot "%BONSAI_QWEN38_SNAPSHOT%" --model-path "%BONSAI_QWEN38_SNAPSHOT%" --runtime-sha "%GITHUB_SHA%" --cases "%BONSAI_CASES%,%QWEN38_ACCEPTANCE_CASES%" --preflight "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cpu-qwen38-parent-preflight.json" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cpu-qwen38-parent" || exit /b 1
+      - name: Run Candle CPU Bonsai row
+        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true && (steps.candle_cpu_bonsai_preflight.outcome == 'success')
+        continue-on-error: true
+        shell: cmd
+        run: |
+          set /p BINARY=<"%RUNNER_TEMP%\qwen38-bonsai-candle\binary.txt"
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py run --candle-device cpu --binary "%BINARY%" --test-name native_comparison --model-id candle-cpu-bonsai-gguf --model-key bonsai-gguf --language-variant ptq1 --vision-variant q8 --model-revision 6ed5e12bf84b7a63069882c91dd9e9218647d17b --snapshot "%BONSAI_GGUF_SNAPSHOT%" --model-path "%BONSAI_GGUF_SNAPSHOT%\Ternary-Bonsai-2-27B-PTQ1_0.gguf" --projector-path "%BONSAI_GGUF_SNAPSHOT%\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf" --runtime-sha "%GITHUB_SHA%" --cases "%BONSAI_CASES%,%BONSAI_ACCEPTANCE_CASES%" --preflight "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cpu-bonsai-gguf-preflight.json" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cpu-bonsai-gguf" || exit /b 1
+      - name: Run Candle CPU baseline row
+        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true && (steps.candle_cpu_baseline_preflight.outcome == 'success')
+        continue-on-error: true
+        shell: cmd
+        run: |
+          set /p BINARY=<"%RUNNER_TEMP%\qwen38-bonsai-candle\binary.txt"
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py run --candle-device cpu --binary "%BINARY%" --test-name native_comparison --model-id candle-cpu-qwen3vl-baseline --model-key bonsai-qwen3vl-baseline --model-revision 0c351dd01ed87e9c1b53cbc748cba10e6187ff3b --snapshot "%BONSAI_BASELINE_SNAPSHOT%" --model-path "%BONSAI_BASELINE_SNAPSHOT%" --runtime-sha "%GITHUB_SHA%" --cases "%BONSAI_CASES%" --preflight "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cpu-qwen3vl-baseline-preflight.json" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cpu-qwen3vl-baseline" || exit /b 1
+      - name: Run Candle Bonsai safetensors format route
+        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true && (steps.candle_format_preflight.outputs.bonsai == 'true')
+        continue-on-error: true
+        shell: cmd
+        run: |
+          set /p BINARY=<"%RUNNER_TEMP%\qwen38-bonsai-candle\binary.txt"
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py run --candle-device auto --binary "%BINARY%" --test-name native_comparison --model-id functional-candle-bonsai-mlx --model-key bonsai-mlx-2bit --model-revision 3f926b415992eaa2ae9dd7b573706494d6bbf787 --snapshot "%BONSAI_MLX_SNAPSHOT%" --model-path "%BONSAI_MLX_SNAPSHOT%" --runtime-sha "%GITHUB_SHA%" --cases "%BONSAI_FORMAT_CASES%" --preflight "%RUNNER_TEMP%\qwen38-bonsai-candle\functional-candle-bonsai-mlx-preflight.json" --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\functional-candle-bonsai-mlx" || exit /b 1
+      - name: Run Candle PQ2/BF16 format route
+        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true && (steps.candle_format_preflight.outputs.pq2_bf16 == 'true')
+        continue-on-error: true
+        shell: cmd
+        run: |
+          set /p BINARY=<"%RUNNER_TEMP%\qwen38-bonsai-candle\binary.txt"
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py run --candle-device auto --binary "%BINARY%" --test-name native_comparison --model-id functional-candle-pq2-bf16 --model-key bonsai-gguf --language-variant pq2 --vision-variant bf16 --model-revision 6ed5e12bf84b7a63069882c91dd9e9218647d17b --snapshot "%BONSAI_GGUF_SNAPSHOT%" --model-path "%BONSAI_GGUF_SNAPSHOT%\Ternary-Bonsai-2-27B-PQ2_0.gguf" --projector-path "%BONSAI_GGUF_SNAPSHOT%\Ternary-Bonsai-2-27B-mmproj-BF16.gguf" --runtime-sha "%GITHUB_SHA%" --cases "%BONSAI_FORMAT_CASES%" --preflight "%RUNNER_TEMP%\qwen38-bonsai-candle\functional-candle-pq2-bf16-preflight.json" --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\functional-candle-pq2-bf16" || exit /b 1
+      - name: Run Candle PQ2/Q8 format route
+        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true && (steps.candle_format_preflight.outputs.pq2_q8 == 'true')
+        continue-on-error: true
+        shell: cmd
+        run: |
+          set /p BINARY=<"%RUNNER_TEMP%\qwen38-bonsai-candle\binary.txt"
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py run --candle-device auto --binary "%BINARY%" --test-name native_comparison --model-id functional-candle-pq2-q8 --model-key bonsai-gguf --language-variant pq2 --vision-variant q8 --model-revision 6ed5e12bf84b7a63069882c91dd9e9218647d17b --snapshot "%BONSAI_GGUF_SNAPSHOT%" --model-path "%BONSAI_GGUF_SNAPSHOT%\Ternary-Bonsai-2-27B-PQ2_0.gguf" --projector-path "%BONSAI_GGUF_SNAPSHOT%\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf" --runtime-sha "%GITHUB_SHA%" --cases "%BONSAI_FORMAT_CASES%" --preflight "%RUNNER_TEMP%\qwen38-bonsai-candle\functional-candle-pq2-q8-preflight.json" --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\functional-candle-pq2-q8" || exit /b 1
+      - name: Run Candle PTQ1/BF16 format route
+        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true && (steps.candle_format_preflight.outputs.ptq1_bf16 == 'true')
+        continue-on-error: true
+        shell: cmd
+        run: |
+          set /p BINARY=<"%RUNNER_TEMP%\qwen38-bonsai-candle\binary.txt"
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py run --candle-device auto --binary "%BINARY%" --test-name native_comparison --model-id functional-candle-ptq1-bf16 --model-key bonsai-gguf --language-variant ptq1 --vision-variant bf16 --model-revision 6ed5e12bf84b7a63069882c91dd9e9218647d17b --snapshot "%BONSAI_GGUF_SNAPSHOT%" --model-path "%BONSAI_GGUF_SNAPSHOT%\Ternary-Bonsai-2-27B-PTQ1_0.gguf" --projector-path "%BONSAI_GGUF_SNAPSHOT%\Ternary-Bonsai-2-27B-mmproj-BF16.gguf" --runtime-sha "%GITHUB_SHA%" --cases "%BONSAI_FORMAT_CASES%" --preflight "%RUNNER_TEMP%\qwen38-bonsai-candle\functional-candle-ptq1-bf16-preflight.json" --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\functional-candle-ptq1-bf16" || exit /b 1
+      - name: Run Candle PTQ1/Q8 format route
+        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true && (steps.candle_format_preflight.outputs.ptq1_q8 == 'true')
+        continue-on-error: true
+        shell: cmd
+        run: |
+          set /p BINARY=<"%RUNNER_TEMP%\qwen38-bonsai-candle\binary.txt"
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py run --candle-device auto --binary "%BINARY%" --test-name native_comparison --model-id functional-candle-ptq1-q8 --model-key bonsai-gguf --language-variant ptq1 --vision-variant q8 --model-revision 6ed5e12bf84b7a63069882c91dd9e9218647d17b --snapshot "%BONSAI_GGUF_SNAPSHOT%" --model-path "%BONSAI_GGUF_SNAPSHOT%\Ternary-Bonsai-2-27B-PTQ1_0.gguf" --projector-path "%BONSAI_GGUF_SNAPSHOT%\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf" --runtime-sha "%GITHUB_SHA%" --cases "%BONSAI_FORMAT_CASES%" --preflight "%RUNNER_TEMP%\qwen38-bonsai-candle\functional-candle-ptq1-q8-preflight.json" --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\functional-candle-ptq1-q8" || exit /b 1
+      - name: Release the Candle campaign CUDA reservation
+        if: always()
+        shell: cmd
+        run: |
+          if exist "%BONSAI_GPU_RESERVATION%" "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py release-gpu --gpu-index 0 --reservation "%BONSAI_GPU_RESERVATION%" --token "%BONSAI_RESERVATION_TOKEN%" || exit /b 1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: always() && inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true
+        with:
+          name: qwen38-bonsai-mlx-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}\qwen38-bonsai-mlx
+      - name: Validate the required backend/device matrix
+        if: always() && inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true
+        shell: cmd
+        run: |
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py matrix-status --runtime-sha "%GITHUB_SHA%" --root "%RUNNER_TEMP%\qwen38-bonsai-mlx" --root "%RUNNER_TEMP%\qwen38-bonsai-candle" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\matrix-report.json" --markdown "%RUNNER_TEMP%\qwen38-bonsai-candle\matrix-report.md" --seal "%RUNNER_TEMP%\qwen38-bonsai-candle\matrix-seal.json"
+          set "STATUS=%ERRORLEVEL%"
+          type "%RUNNER_TEMP%\qwen38-bonsai-candle\matrix-report.md"
+          if not "%STATUS%"=="0" exit /b %STATUS%
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py verify-matrix-seal --runtime-sha "%GITHUB_SHA%" --root "%RUNNER_TEMP%\qwen38-bonsai-mlx" --root "%RUNNER_TEMP%\qwen38-bonsai-candle" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\matrix-report.json" --markdown "%RUNNER_TEMP%\qwen38-bonsai-candle\matrix-report.md" --seal "%RUNNER_TEMP%\qwen38-bonsai-candle\matrix-seal.json" || exit /b 1
+          exit /b %STATUS%
+      - name: Upload Candle qualification or terminal evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qwen38-bonsai-terminal-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            ${{ runner.temp }}\qwen38-bonsai-mlx
+            ${{ runner.temp }}\qwen38-bonsai-candle
 
   mlx-llm:
     name: MLX LLM real weights

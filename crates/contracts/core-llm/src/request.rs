@@ -4,6 +4,64 @@ use crate::cancel::CancelFlag;
 use crate::constraint::Constraint;
 use crate::message::Message;
 
+/// Qwen3.8 reasoning budgets accepted by its frozen official chat template.
+///
+/// The spellings deliberately match the template kwargs. Keeping this typed prevents callers from
+/// passing a value the model would otherwise reject only while rendering the prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    /// The template default and most thorough reasoning budget.
+    XHigh,
+    /// The template's middle reasoning budget (no extra budget instruction is injected).
+    Medium,
+    /// The brief, focused reasoning budget.
+    Low,
+}
+
+impl ReasoningEffort {
+    /// The exact `reasoning_effort` chat-template kwarg.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::XHigh => "xhigh",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
+}
+
+/// Request policy for an in-checkpoint multi-token predictor (MTP).
+///
+/// MTP is an optional speculative decoder: the base autoregressive distribution remains valid
+/// without it, while enabled runs use target-model verification to preserve that distribution.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MtpMode {
+    /// Use the ordinary autoregressive path. This is the compatibility-preserving default.
+    #[default]
+    Off,
+    /// Use MTP when the loaded model advertises it, otherwise use ordinary autoregressive decode.
+    Auto,
+    /// Require MTP and propose at most `draft_tokens` tokens per target verification pass.
+    Enabled {
+        /// Number of speculative draft tokens. Must be within the provider's advertised limit.
+        draft_tokens: u32,
+    },
+}
+
+impl std::str::FromStr for ReasoningEffort {
+    type Err = crate::Error;
+
+    fn from_str(value: &str) -> crate::Result<Self> {
+        match value {
+            "xhigh" => Ok(Self::XHigh),
+            "medium" => Ok(Self::Medium),
+            "low" => Ok(Self::Low),
+            unsupported => Err(crate::Error::InvalidRequest(format!(
+                "unsupported reasoning_effort `{unsupported}`; expected xhigh, medium, or low"
+            ))),
+        }
+    }
+}
+
 /// Backend-neutral sampling policy. The backend's sampler consumes these knobs; `core-llm` owns the
 /// policy so it is identical across MLX and Candle.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -14,6 +72,10 @@ pub struct Sampling {
     pub top_p: f32,
     /// Keep only the `top_k` highest-logit tokens; `0` disables it.
     pub top_k: usize,
+    /// OpenAI/HF presence penalty: subtract this value once from every token logit whose token has
+    /// appeared in the prompt or generated history. `0.0` disables it. Unlike
+    /// [`repetition_penalty`](Self::repetition_penalty), this is additive and independent of count.
+    pub presence_penalty: f32,
     /// CTRL/HF repetition penalty; `1.0` disables it.
     pub repetition_penalty: f32,
     /// History window the repetition penalty looks back over.
@@ -27,6 +89,7 @@ impl Default for Sampling {
             temperature: 0.7,
             top_p: 0.9,
             top_k: 0,
+            presence_penalty: 0.0,
             repetition_penalty: 1.0,
             repetition_context: 0,
         }
@@ -70,6 +133,7 @@ impl Sampling {
             temperature: 0.0,
             top_p: 1.0,
             top_k: 0,
+            presence_penalty: 0.0,
             repetition_penalty: 1.0,
             repetition_context: 0,
         }
@@ -101,6 +165,18 @@ pub struct TextLlmRequest {
     /// [`supports_thinking`](crate::TextLlmCapabilities::supports_thinking); [`ThinkingMode::Auto`]
     /// (the default) leaves the model's template default in place.
     pub thinking: ThinkingMode,
+    /// Optional Qwen `reasoning_effort` passed only to providers advertising
+    /// [`supports_reasoning_effort`](crate::TextLlmCapabilities::supports_reasoning_effort).
+    /// `None` omits the kwarg and preserves the model's own default (Qwen3.8 resolves that to `xhigh`).
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Qwen `preserve_thinking` control for retaining prior assistant reasoning during history
+    /// rendering. Honored only by providers advertising
+    /// [`supports_preserve_thinking`](crate::TextLlmCapabilities::supports_preserve_thinking).
+    /// `None` omits the kwarg and preserves the model's default (Qwen3.8 defaults to `true`).
+    pub preserve_thinking: Option<bool>,
+    /// Optional in-checkpoint multi-token prediction policy. [`MtpMode::Off`] preserves the ordinary
+    /// autoregressive path; explicit enablement is rejected unless the loaded model advertises MTP.
+    pub mtp: MtpMode,
     /// Tools / functions offered to the model (matching `transformers` `tools=`). Rendered into the
     /// prompt by the chat template and used to type-coerce the model's parsed tool calls. Honored only
     /// by providers advertising [`supports_tools`](crate::TextLlmCapabilities::supports_tools); a
@@ -157,7 +233,40 @@ mod tests {
 
         assert_eq!(request.sampling.temperature, 0.7);
         assert_eq!(request.sampling.top_p, 0.9);
+        assert_eq!(request.sampling.presence_penalty, 0.0);
         assert!(!request.sampling.is_greedy());
+        assert_eq!(request.reasoning_effort, None);
+        assert_eq!(request.preserve_thinking, None);
+        assert_eq!(request.mtp, MtpMode::Off);
+    }
+
+    #[test]
+    fn reasoning_effort_accepts_only_the_frozen_qwen38_values() {
+        use std::str::FromStr;
+
+        assert_eq!(
+            ReasoningEffort::from_str("xhigh").unwrap(),
+            ReasoningEffort::XHigh
+        );
+        assert_eq!(
+            ReasoningEffort::from_str("medium").unwrap(),
+            ReasoningEffort::Medium
+        );
+        assert_eq!(
+            ReasoningEffort::from_str("low").unwrap(),
+            ReasoningEffort::Low
+        );
+        let err = ReasoningEffort::from_str("high").unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidRequest(_)));
+        assert!(err.to_string().contains("expected xhigh, medium, or low"));
+    }
+
+    #[test]
+    fn projector_association_is_explicit() {
+        let spec = LoadSpec::dense("model.gguf").with_projector("projector.gguf");
+        assert_eq!(spec.source, "model.gguf");
+        assert_eq!(spec.projector_source.as_deref(), Some("projector.gguf"));
+        assert!(spec.quantize.is_none());
     }
 }
 
@@ -167,6 +276,10 @@ mod tests {
 pub struct LoadSpec {
     /// A snapshot directory path or a model identifier the provider understands.
     pub source: String,
+    /// Optional explicitly-associated multimodal projector artifact. GGUF language files do not
+    /// embed this association and a directory may contain several valid projectors, so providers
+    /// must never guess between siblings. `None` keeps a separable model text-only.
+    pub projector_source: Option<String>,
     /// Optional load-time **weight** quantization (the model projection weights).
     pub quantize: Option<Quantize>,
 }
@@ -185,7 +298,14 @@ impl LoadSpec {
     pub fn dense(source: impl Into<String>) -> Self {
         Self {
             source: source.into(),
+            projector_source: None,
             quantize: None,
         }
+    }
+
+    /// Associate an exact multimodal projector artifact with this model load.
+    pub fn with_projector(mut self, source: impl Into<String>) -> Self {
+        self.projector_source = Some(source.into());
+        self
     }
 }

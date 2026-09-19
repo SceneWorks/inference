@@ -36,6 +36,8 @@ serde_json = { workspace = true }
 core-llm-testkit = { workspace = true }
 # Self-removing fixture roots for the test suites (sc-17755).
 tempfile = { workspace = true }
+# CUDA operator tests encode fixture scales as IEEE f16 bytes.
+half = "2"
 
 [features]
 # Default works with NO extra features: candle-core defaults to the CPU backend (builds anywhere).

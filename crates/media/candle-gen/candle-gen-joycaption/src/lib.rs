@@ -83,6 +83,7 @@ pub fn load_joycaption(spec: &LoadSpec) -> Result<JoyCaptioner> {
         .load_for_model_with(
             &CoreLoadSpec {
                 source: root.to_string_lossy().into_owned(),
+                projector_source: None,
                 quantize: None,
             },
             &ModelRequirements::default().with_vision(),
@@ -220,6 +221,7 @@ impl Captioner for JoyCaptioner {
                 top_p: req.sampling.top_p,
                 // CaptionSampling exposes no top-k; disabled (0) matches the prior engine sampler.
                 top_k: 0,
+                presence_penalty: 0.0,
                 repetition_penalty: req.sampling.repetition_penalty,
                 repetition_context: req.sampling.repetition_context,
             },
