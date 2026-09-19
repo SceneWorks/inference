@@ -36,6 +36,17 @@ use crate::primitives::rope::{apply_rope, Rope};
 use crate::primitives::Weights;
 use crate::prism::PrismMlxPack;
 
+fn checkpoint_norm_weight(weight: Array, prism: bool) -> Result<Array> {
+    if prism {
+        Ok(weight)
+    } else {
+        Ok(add(
+            &weight,
+            &Array::from_f32(1.0).as_dtype(weight.dtype())?,
+        )?)
+    }
+}
+
 /// Cached decode runs in bf16 (matching the rest of the engine); the delta recurrence accumulates in
 /// f32 (matching the reference GPU kernel) for stability.
 const COMPUTE_DTYPE: Dtype = Dtype::Bfloat16;
@@ -1097,11 +1108,11 @@ impl Qwen35Model {
     ) -> Result<Self> {
         let eps = cfg.rms_norm_eps;
         let req = |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?) };
-        // Qwen3.6 RMSNorm weights are stored zero-centered → fold in the +1 (the (1 + weight)
-        // convention). The gated DeltaNet norm is the exception: it is ones-centered, loaded raw.
+        // Dense HF Qwen3.6 norms are zero-centered. Frozen Prism/Bonsai artifacts have already
+        // converted every ordinary RMSNorm tensor to its direct multiplier and must remain raw.
         let norm_w = |key: String| -> Result<Array> {
             let t = req(key)?;
-            Ok(add(&t, &Array::from_f32(1.0).as_dtype(t.dtype())?)?)
+            checkpoint_norm_weight(t, prism.is_some())
         };
         let stored_quant = cfg.quantization;
         if prism.is_some() && (stored_quant.is_some() || quant.is_some()) {
@@ -1593,6 +1604,29 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn published_prism_norm_multiplier_matches_independent_rms_oracle() {
+        let source = vec![1.0583496f32, 0.9418945, 1.3125, 1.957_031_3];
+        let x = vec![0.25f32, -0.5, 1.25, -2.0];
+        let weight = checkpoint_norm_weight(Array::from_slice(&source, &[4]), true).unwrap();
+        let got = rms_norm(&Array::from_slice(&x, &[1, 4]), &weight, 1e-6).unwrap();
+        mlx_rs::transforms::eval([&got]).unwrap();
+        let inv = (x.iter().map(|v| v * v).sum::<f32>() / 4.0 + 1e-6)
+            .sqrt()
+            .recip();
+        for (i, value) in got.as_slice::<f32>().iter().enumerate() {
+            let expected = x[i] * inv * source[i];
+            assert!(
+                (value - expected).abs() < 1e-5,
+                "lane {i}: {value} != {expected}"
+            );
+        }
+        let dense =
+            checkpoint_norm_weight(Array::from_slice(&[0.0583496f32], &[1]), false).unwrap();
+        mlx_rs::transforms::eval([&dense]).unwrap();
+        assert!((dense.item::<f32>() - source[0]).abs() < 1e-6);
+    }
 
     fn cfg_json() -> serde_json::Value {
         // 4 layers → schedule (interval 4): layers 0,1,2 linear, layer 3 full attention.

@@ -35,6 +35,39 @@ pub struct LoadedPrismGguf {
     pub stop_tokens: Vec<i32>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct GdnRowMap {
+    prefix: usize,
+    groups: usize,
+    repetitions: usize,
+    unit: usize,
+}
+
+impl GdnRowMap {
+    fn source_row(self, logical_row: usize, rows: usize) -> Result<usize> {
+        let span = self
+            .groups
+            .checked_mul(self.repetitions)
+            .and_then(|n| n.checked_mul(self.unit))
+            .ok_or_else(|| Error::Config("GGUF Prism GDN row-map overflow".into()))?;
+        if self.prefix.checked_add(span) != Some(rows) {
+            return Err(Error::Config(format!(
+                "GGUF Prism GDN row-map geometry {} + {span} != {rows}",
+                self.prefix
+            )));
+        }
+        if logical_row < self.prefix {
+            return Ok(logical_row);
+        }
+        let logical = logical_row - self.prefix;
+        let group = logical / (self.repetitions * self.unit);
+        let rem = logical % (self.repetitions * self.unit);
+        let repetition = rem / self.unit;
+        let lane = rem % self.unit;
+        Ok(self.prefix + (repetition * self.groups + group) * self.unit + lane)
+    }
+}
+
 /// Load a published Qwen35 Prism GGUF directly, without the generic dense conversion pipeline.
 pub fn load(file: &GgufFile) -> Result<LoadedPrismGguf> {
     if file.meta_str("general.architecture") != Some("qwen35") {
@@ -58,10 +91,16 @@ pub fn load(file: &GgufFile) -> Result<LoadedPrismGguf> {
     let mut tensors = std::collections::HashMap::new();
     let mut module_specs = Vec::new();
     let mut seen_packed = BTreeSet::new();
+    let group_count = meta_usize(file, "qwen35.ssm.group_count")?;
+    let time_step_rank = meta_usize(file, "qwen35.ssm.time_step_rank")?;
+    let inner = meta_usize(file, "qwen35.ssm.inner_size")?;
+    validate_gdn_geometry(inner, time_step_rank, group_count)?;
     for info in &file.tensors {
         let canonical = map_weight_name(&info.name)?;
         if matches!(info.ggml_type, 142 | 143) {
-            let parts = transcode_tensor(file, info, &info.name, &raw_hadamard)?;
+            let row_map = gguf_row_map(&info.name, inner, time_step_rank, group_count);
+            let parts =
+                transcode_tensor_with_row_map(file, info, &info.name, &raw_hadamard, row_map)?;
             let base = canonical.strip_suffix(".weight").ok_or_else(|| {
                 Error::Config(format!("packed GGUF tensor `{canonical}` is not a weight"))
             })?;
@@ -78,7 +117,7 @@ pub fn load(file: &GgufFile) -> Result<LoadedPrismGguf> {
             ));
             seen_packed.insert(info.name.clone());
         } else {
-            let values = crate::gguf::dequantize(
+            let mut values = crate::gguf::dequantize(
                 info.ggml_type,
                 file.tensor_data(info)?,
                 info.num_elements(),
@@ -90,6 +129,12 @@ pub fn load(file: &GgufFile) -> Result<LoadedPrismGguf> {
                     i32::try_from(n).map_err(|_| Error::Config("GGUF dimension overflow".into()))
                 })
                 .collect::<Result<Vec<_>>>()?;
+            if let Some(row_map) = gguf_row_map(&info.name, inner, time_step_rank, group_count) {
+                reorder_dense_rows(&mut values, &info.shape, row_map)?;
+            }
+            if info.name.ends_with(".ssm_a") {
+                convert_ssm_a_to_log(&mut values, &info.name)?;
+            }
             tensors.insert(canonical, Array::from_slice(&values, &shape));
         }
     }
@@ -229,11 +274,7 @@ fn reconstruct_config(
         .iter()
         .map(|v| v.as_u64().unwrap_or(0))
         .collect::<Vec<_>>();
-    if section.len() != 3 {
-        return Err(Error::Config(
-            "GGUF Qwen35 rope sections must have length 3".into(),
-        ));
-    }
+    let section = active_rope_sections(&section)?;
     Ok(serde_json::json!({
         "model_type":"prism_hadamard_qwen35",
         "text_config":{
@@ -263,6 +304,15 @@ fn reconstruct_config(
             }
         }
     }))
+}
+
+fn active_rope_sections(section: &[u64]) -> Result<[u64; 3]> {
+    match section {
+        [time, height, width, 0] => Ok([*time, *height, *width]),
+        _ => Err(Error::Config(
+            "GGUF Qwen35 rope sections must be [time, height, width, 0]".into(),
+        )),
+    }
 }
 
 /// Validated Hadamard contract embedded in a published Prism GGUF.
@@ -388,6 +438,16 @@ pub fn transcode_tensor(
     name: &str,
     metadata: &PrismHadamardMetadata,
 ) -> Result<PrismAffineParts> {
+    transcode_tensor_with_row_map(file, info, name, metadata, None)
+}
+
+fn transcode_tensor_with_row_map(
+    file: &GgufFile,
+    info: &TensorInfo,
+    name: &str,
+    metadata: &PrismHadamardMetadata,
+    row_map: Option<GdnRowMap>,
+) -> Result<PrismAffineParts> {
     if info.shape.len() != 2 {
         return Err(Error::Config(format!(
             "GGUF Prism `{}` must be a matrix, got {:?}",
@@ -412,9 +472,13 @@ pub fn transcode_tensor(
     let mut scales = vec![0f32; rows * groups];
     let mut biases = vec![0f32; rows * groups];
     for row in 0..rows {
+        let source_row = match row_map {
+            Some(map) => map.source_row(row, rows)?,
+            None => row,
+        };
         matrix
             .transcode_affine_row_into(
-                row,
+                source_row,
                 &mut words[row * width / 16..(row + 1) * width / 16],
                 &mut scales[row * groups..(row + 1) * groups],
                 &mut biases[row * groups..(row + 1) * groups],
@@ -441,6 +505,88 @@ pub fn transcode_tensor(
             .map_err(|_| Error::Config("Prism block size overflow".into()))?,
         role: transform.role,
     })
+}
+
+fn meta_usize(file: &GgufFile, key: &str) -> Result<usize> {
+    file.meta_u64(key)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| Error::Config(format!("GGUF missing or invalid `{key}`")))
+}
+
+fn validate_gdn_geometry(inner: usize, rank: usize, groups: usize) -> Result<()> {
+    if groups == 0 || rank == 0 || !rank.is_multiple_of(groups) || !inner.is_multiple_of(rank) {
+        return Err(Error::Config("GGUF Prism has invalid GDN geometry".into()));
+    }
+    Ok(())
+}
+
+fn gguf_row_map(name: &str, inner: usize, rank: usize, groups: usize) -> Option<GdnRowMap> {
+    let repetitions = rank / groups;
+    let value_unit = inner / rank;
+    if name.ends_with(".attn_qkv.weight") || name.ends_with(".ssm_conv1d.weight") {
+        Some(GdnRowMap {
+            prefix: 2 * groups * value_unit,
+            groups,
+            repetitions,
+            unit: value_unit,
+        })
+    } else if name.ends_with(".attn_gate.weight") {
+        Some(GdnRowMap {
+            prefix: 0,
+            groups,
+            repetitions,
+            unit: value_unit,
+        })
+    } else if name.ends_with(".ssm_alpha.weight")
+        || name.ends_with(".ssm_beta.weight")
+        || name.ends_with(".ssm_a")
+        || name.ends_with(".ssm_dt.bias")
+    {
+        Some(GdnRowMap {
+            prefix: 0,
+            groups,
+            repetitions,
+            unit: 1,
+        })
+    } else {
+        None
+    }
+}
+
+fn reorder_dense_rows(values: &mut [f32], shape: &[usize], map: GdnRowMap) -> Result<()> {
+    let (rows, cols) = match shape {
+        [rows] => (*rows, 1),
+        [rows, cols] => (*rows, *cols),
+        _ => {
+            return Err(Error::Config(
+                "GGUF Prism row permutation requires a 1-D or 2-D tensor".into(),
+            ))
+        }
+    };
+    if values.len() != rows * cols {
+        return Err(Error::Config(
+            "GGUF Prism row permutation shape does not match its data".into(),
+        ));
+    }
+    let old = values.to_vec();
+    for row in 0..rows {
+        let source = map.source_row(row, rows)?;
+        values[row * cols..(row + 1) * cols]
+            .copy_from_slice(&old[source * cols..(source + 1) * cols]);
+    }
+    Ok(())
+}
+
+fn convert_ssm_a_to_log(values: &mut [f32], name: &str) -> Result<()> {
+    for value in values {
+        if !value.is_finite() || *value >= 0.0 {
+            return Err(Error::Config(format!(
+                "GGUF Prism `{name}` must contain finite, strictly negative SSM A values"
+            )));
+        }
+        *value = (-*value).ln();
+    }
+    Ok(())
 }
 
 fn required<'a>(file: &'a GgufFile, key: &str) -> Result<&'a MetaValue> {
@@ -492,6 +638,66 @@ fn string_values(value: &MetaValue) -> Result<BTreeSet<String>> {
 mod tests {
     use super::*;
     use core_llm::{LoadSpec, Message, Sampling, TextLlm, TextLlmRequest};
+
+    #[test]
+    fn frozen_four_entry_rope_sections_drop_only_the_zero_sentinel() {
+        assert_eq!(
+            active_rope_sections(&[11, 11, 10, 0]).unwrap(),
+            [11, 11, 10]
+        );
+        assert!(active_rope_sections(&[11, 11, 10]).is_err());
+        assert!(active_rope_sections(&[11, 11, 10, 1]).is_err());
+    }
+
+    #[test]
+    fn frozen_gdn_scalar_rows_are_permuted_then_converted_to_a_log() {
+        let map = gguf_row_map("blk.0.ssm_a", 768, 48, 16).unwrap();
+        let mut values = (0..48)
+            .map(|row| -((row + 1) as f32) / 100.0)
+            .collect::<Vec<_>>();
+        let stored = values.clone();
+        reorder_dense_rows(&mut values, &[48], map).unwrap();
+        convert_ssm_a_to_log(&mut values, "blk.0.ssm_a").unwrap();
+        for (logical, actual) in values.iter().enumerate() {
+            let source = map.source_row(logical, 48).unwrap();
+            let expected = (-stored[source]).ln();
+            assert!((*actual - expected).abs() < 1e-7, "head {logical}");
+        }
+        assert_eq!(map.source_row(0, 48).unwrap(), 0);
+        assert_eq!(map.source_row(1, 48).unwrap(), 16);
+        assert_eq!(map.source_row(2, 48).unwrap(), 32);
+        for invalid in [0.0, 1.0, f32::NAN, f32::INFINITY] {
+            assert!(convert_ssm_a_to_log(&mut [invalid], "blk.0.ssm_a").is_err());
+        }
+    }
+
+    #[test]
+    fn gdn_row_maps_cover_packed_value_gate_conv_and_scalar_layouts() {
+        let packed = gguf_row_map("blk.0.attn_qkv.weight", 768, 48, 16).unwrap();
+        assert_eq!(packed.prefix, 512);
+        assert_eq!(packed.unit, 16);
+        let gate = gguf_row_map("blk.0.attn_gate.weight", 768, 48, 16).unwrap();
+        assert_eq!((gate.prefix, gate.unit), (0, 16));
+        let conv = gguf_row_map("blk.0.ssm_conv1d.weight", 768, 48, 16).unwrap();
+        assert_eq!((conv.prefix, conv.unit), (512, 16));
+        for name in [
+            "blk.0.ssm_alpha.weight",
+            "blk.0.ssm_beta.weight",
+            "blk.0.ssm_dt.bias",
+        ] {
+            let scalar = gguf_row_map(name, 768, 48, 16).unwrap();
+            assert_eq!(
+                (
+                    scalar.prefix,
+                    scalar.groups,
+                    scalar.repetitions,
+                    scalar.unit
+                ),
+                (0, 16, 3, 1)
+            );
+            assert_eq!(scalar.source_row(1, 48).unwrap(), 16);
+        }
+    }
 
     fn string(out: &mut Vec<u8>, value: &str) {
         out.extend_from_slice(&(value.len() as u64).to_le_bytes());
@@ -763,7 +969,7 @@ mod tests {
         metadata.extend([
             meta_f32("qwen35.attention.layer_norm_rms_epsilon", 1e-6),
             meta_f32("qwen35.rope.freq_base", 10_000_000.0),
-            meta_u32s("qwen35.rope.dimension_sections", &[11, 11, 10]),
+            meta_u32s("qwen35.rope.dimension_sections", &[11, 11, 10, 0]),
             meta_string("tokenizer.ggml.model", "gpt2"),
             meta_string("tokenizer.ggml.pre", "qwen35"),
             meta_strings(

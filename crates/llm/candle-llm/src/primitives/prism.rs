@@ -1153,7 +1153,7 @@ mod tests {
     }
 
     #[test]
-    fn gdn_reorder_precedes_sign_and_hadamard() {
+    fn optional_ungrouped_gdn_reorder_precedes_sign_and_hadamard() {
         let name = "model.layers.0.linear_attn.ssm_out.weight";
         let codes = (0..128)
             .map(|i| if i % 7 == 0 { 2u8 } else { 1u8 })
@@ -1185,6 +1185,46 @@ mod tests {
         let input = (0..128).map(|i| i as f32 - 60.0).collect::<Vec<_>>();
         let mut transformed = input.clone();
         apply_hadamard_forward_in_place(&mut transformed, &signs, 128, Some(layout)).unwrap();
+        let expected = transformed
+            .iter()
+            .zip(&codes)
+            .map(|(&x, &code)| x * (f32::from(code) - 1.0))
+            .sum::<f32>();
+        let actual = weight
+            .forward(&Tensor::from_vec(input, (1, 128), &device).unwrap())
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap()[0][0];
+        assert!((actual - expected).abs() < 2e-3, "{actual} != {expected}");
+    }
+
+    #[test]
+    fn published_grouped_ssm_out_does_not_permute_activation() {
+        let name = "model.layers.0.linear_attn.ssm_out.weight";
+        let codes = (0..128)
+            .map(|i| if i % 7 == 0 { 2u8 } else { 1u8 })
+            .collect::<Vec<_>>();
+        let signs = (0..128)
+            .map(|i| if i % 5 == 0 { -1i8 } else { 1 })
+            .collect::<Vec<_>>();
+        let mut words = vec![0u32; 8];
+        for (lane, &code) in codes.iter().enumerate() {
+            words[lane / 16] |= u32::from(code) << (2 * (lane % 16));
+        }
+        let device = Device::Cpu;
+        let weight = PrismPackedWeight::from_mlx_affine2(
+            name,
+            Tensor::from_vec(words, (1, 8), &device).unwrap(),
+            Tensor::from_vec(vec![1f32], (1, 1), &device).unwrap(),
+            &Tensor::from_vec(vec![-1f32], (1, 1), &device).unwrap(),
+            &metadata(name, PrismTransformRole::Forward, signs.clone()),
+            None,
+            None,
+        )
+        .unwrap();
+        let input = (0..128).map(|i| i as f32 - 60.0).collect::<Vec<_>>();
+        let mut transformed = input.clone();
+        apply_hadamard_forward_in_place(&mut transformed, &signs, 128, None).unwrap();
         let expected = transformed
             .iter()
             .zip(&codes)
@@ -1260,5 +1300,255 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("row-map geometry"));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_packed_operator_oracles_compile_and_execute_nvrtc() {
+        fn rotate(mut values: Vec<f32>, signs: &[i8], inverse: bool) -> Vec<f32> {
+            if !inverse {
+                for (value, sign) in values.iter_mut().zip(signs) {
+                    *value *= f32::from(*sign);
+                }
+            }
+            let mut step = 1;
+            while step < values.len() {
+                for base in (0..values.len()).step_by(step * 2) {
+                    for lane in 0..step {
+                        let a = values[base + lane];
+                        let b = values[base + step + lane];
+                        values[base + lane] = a + b;
+                        values[base + step + lane] = a - b;
+                    }
+                }
+                step *= 2;
+            }
+            let scale = (values.len() as f32).sqrt().recip();
+            for value in &mut values {
+                *value *= scale;
+            }
+            if inverse {
+                for (value, sign) in values.iter_mut().zip(signs) {
+                    *value *= f32::from(*sign);
+                }
+            }
+            values
+        }
+        fn gguf_rows(kind: PrismPackedKind, rows: usize) -> (Vec<u8>, Vec<Vec<f32>>) {
+            let mut bytes = Vec::new();
+            let mut dense = Vec::new();
+            for row in 0..rows {
+                let scale = 0.125 * (row + 1) as f32;
+                let mut block = vec![0u8; kind.block_bytes()];
+                match kind {
+                    PrismPackedKind::Pq2_0 => {
+                        block[..2]
+                            .copy_from_slice(&half::f16::from_f32(scale).to_bits().to_le_bytes());
+                        for (i, value) in block[2..].iter_mut().enumerate() {
+                            *value = (i as u8).wrapping_mul(29).wrapping_add(row as u8 * 7);
+                        }
+                    }
+                    PrismPackedKind::Ptq1_0 => {
+                        for (i, value) in block[..26].iter_mut().enumerate() {
+                            *value = (i as u8).wrapping_mul(37).wrapping_add(row as u8 * 11);
+                        }
+                        block[26..]
+                            .copy_from_slice(&half::f16::from_f32(scale).to_bits().to_le_bytes());
+                    }
+                }
+                let mut decoded = vec![0.0f32; 128];
+                match kind {
+                    PrismPackedKind::Pq2_0 => {
+                        for (lane, value) in decoded.iter_mut().enumerate() {
+                            let code = (block[2 + lane / 4] >> (2 * (lane % 4))) & 3;
+                            *value = (f32::from(code) - 1.0) * scale;
+                        }
+                    }
+                    PrismPackedKind::Ptq1_0 => {
+                        const POW3: [u16; 5] = [1, 3, 9, 27, 81];
+                        let mut lane = 0;
+                        for &(lo, hi, trits) in &[(0, 16, 5), (16, 24, 5), (24, 26, 4)] {
+                            for &power in POW3.iter().take(trits) {
+                                for &byte in &block[lo..hi] {
+                                    let code =
+                                        ((((u16::from(byte) * power) & 255) * 3) >> 8) as f32;
+                                    decoded[lane] = (code - 1.0) * scale;
+                                    lane += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                bytes.extend_from_slice(&block);
+                dense.push(decoded);
+            }
+            (bytes, dense)
+        }
+        fn expected_matmul(
+            inputs: &[Vec<f32>],
+            dense: &[Vec<f32>],
+            signs: &[i8],
+            map: GdnRowMap,
+        ) -> Vec<Vec<f32>> {
+            inputs
+                .iter()
+                .map(|input| {
+                    let rotated = rotate(input.clone(), signs, false);
+                    (0..dense.len())
+                        .map(|logical| {
+                            let stored = map.source_row(logical).unwrap();
+                            rotated.iter().zip(&dense[stored]).map(|(a, b)| a * b).sum()
+                        })
+                        .collect()
+                })
+                .collect()
+        }
+        fn assert_close(actual: &[Vec<f32>], expected: &[Vec<f32>]) {
+            for (row, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                for (col, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+                    assert!(
+                        (actual - expected).abs() < 3e-3,
+                        "[{row},{col}] {actual} != {expected}"
+                    );
+                }
+            }
+        }
+
+        let device = Device::new_cuda(0).expect("CUDA is required for the Prism NVRTC fixture");
+        let rows = 4usize;
+        let width = 128usize;
+        let signs = (0..width)
+            .map(|i| if i % 5 == 0 || i % 11 == 0 { -1i8 } else { 1 })
+            .collect::<Vec<_>>();
+        let map = GdnRowMap {
+            prefix: 0,
+            groups: 2,
+            repetitions: 2,
+            unit: 1,
+        };
+        let inputs = vec![
+            (0..width)
+                .map(|i| i as f32 / 71.0 - 0.8)
+                .collect::<Vec<_>>(),
+            (0..width)
+                .map(|i| (i % 13) as f32 / 9.0 - 0.4)
+                .collect::<Vec<_>>(),
+        ];
+        let flat_inputs = inputs.iter().flatten().copied().collect::<Vec<_>>();
+
+        let name = "cuda.forward.weight";
+        let mut words = vec![0u32; rows * width / 16];
+        let scales = (0..rows)
+            .map(|row| 0.125 * (row + 1) as f32)
+            .collect::<Vec<_>>();
+        let mut dense = vec![vec![0.0f32; width]; rows];
+        for row in 0..rows {
+            for col in 0..width {
+                let code = ((row * 3 + col * 5) % 4) as u32;
+                words[row * width / 16 + col / 16] |= code << (2 * (col % 16));
+                dense[row][col] = (code as f32 - 1.0) * scales[row];
+            }
+        }
+        let affine = PrismPackedWeight::from_mlx_affine2(
+            name,
+            Tensor::from_vec(words.clone(), (rows, width / 16), &device).unwrap(),
+            Tensor::from_vec(scales.clone(), (rows, 1), &device).unwrap(),
+            &Tensor::from_vec(
+                scales.iter().map(|s| -*s).collect::<Vec<_>>(),
+                (rows, 1),
+                &device,
+            )
+            .unwrap(),
+            &metadata(name, PrismTransformRole::Forward, signs.clone()),
+            Some(map),
+            None,
+        )
+        .unwrap();
+        let actual = affine
+            .forward(&Tensor::from_vec(flat_inputs.clone(), (2, width), &device).unwrap())
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        assert_close(&actual, &expected_matmul(&inputs, &dense, &signs, map));
+
+        let embed_name = "cuda.embedding.weight";
+        let embedding = PrismPackedWeight::from_mlx_affine2(
+            embed_name,
+            Tensor::from_vec(words, (rows, width / 16), &device).unwrap(),
+            Tensor::from_vec(scales.clone(), (rows, 1), &device).unwrap(),
+            &Tensor::from_vec(
+                scales.iter().map(|s| -*s).collect::<Vec<_>>(),
+                (rows, 1),
+                &device,
+            )
+            .unwrap(),
+            &metadata(embed_name, PrismTransformRole::Inverse, signs.clone()),
+            None,
+            None,
+        )
+        .unwrap();
+        let actual = embedding
+            .embedding(&Tensor::from_vec(vec![3u32, 1], (2,), &device).unwrap())
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        let expected = vec![
+            rotate(dense[3].clone(), &signs, true),
+            rotate(dense[1].clone(), &signs, true),
+        ];
+        assert_close(&actual, &expected);
+
+        for kind in [PrismPackedKind::Pq2_0, PrismPackedKind::Ptq1_0] {
+            let (bytes, dense) = gguf_rows(kind, rows);
+            let forward_name = format!("cuda.{kind:?}.forward.weight");
+            let forward = PrismPackedWeight::from_gguf(
+                &forward_name,
+                kind,
+                &[width, rows],
+                bytes.clone(),
+                &metadata(&forward_name, PrismTransformRole::Forward, signs.clone()),
+                Some(map),
+                None,
+                &device,
+            )
+            .unwrap();
+            let actual = forward
+                .forward(&Tensor::from_vec(flat_inputs.clone(), (2, width), &device).unwrap())
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap();
+            assert_close(&actual, &expected_matmul(&inputs, &dense, &signs, map));
+
+            let inverse_name = format!("cuda.{kind:?}.embedding.weight");
+            let inverse = PrismPackedWeight::from_gguf(
+                &inverse_name,
+                kind,
+                &[width, rows],
+                bytes,
+                &metadata(&inverse_name, PrismTransformRole::Inverse, signs.clone()),
+                None,
+                None,
+                &device,
+            )
+            .unwrap();
+            let actual = inverse
+                .embedding(&Tensor::from_vec(vec![2u32, 0], (2,), &device).unwrap())
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap();
+            let expected = vec![
+                rotate(dense[2].clone(), &signs, true),
+                rotate(dense[0].clone(), &signs, true),
+            ];
+            assert_close(&actual, &expected);
+        }
     }
 }

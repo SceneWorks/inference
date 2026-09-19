@@ -98,7 +98,7 @@ impl PrismGgufCheckpoint {
                         PrismPackedKind::Ptq1_0
                     };
                     let row_map = gguf_row_map(&source_name, inner, time_step_rank, group_count);
-                    let activation_gdn = source_name.ends_with(".ssm_out.weight").then_some(gdn);
+                    let activation_gdn = gguf_activation_gdn(&source_name, &metadata, gdn)?;
                     let weight = PrismPackedWeight::from_gguf(
                         target.clone(),
                         kind,
@@ -120,6 +120,9 @@ impl PrismGgufCheckpoint {
                     {
                         reorder_dense_rows(&mut values, &shape, map)?;
                     }
+                    if source_name.ends_with(".ssm_a") {
+                        convert_ssm_a_to_log(&mut values, &source_name)?;
+                    }
                     dense.insert(
                         target,
                         candle_core::Tensor::from_vec(values, shape, device)?,
@@ -132,13 +135,16 @@ impl PrismGgufCheckpoint {
                 }
             }
         }
-        if packed.len() != metadata.forward_weight_names.len() + metadata.inverse_weight_names.len()
-        {
-            return Err(Error::Config(format!(
-                "Prism GGUF packed count {} does not match transform metadata {}",
-                packed.len(),
-                metadata.forward_weight_names.len() + metadata.inverse_weight_names.len()
-            )));
+        let seen = packed.keys().cloned().collect::<BTreeSet<_>>();
+        let declared = metadata
+            .forward_weight_names
+            .union(&metadata.inverse_weight_names)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if seen != declared {
+            return Err(Error::Config(
+                "Prism GGUF packed tensor set does not match transform metadata".into(),
+            ));
         }
         Ok(Self {
             weights: Weights::from_map(dense, device.clone()),
@@ -158,6 +164,21 @@ impl PrismGgufCheckpoint {
     }
 }
 
+fn gguf_activation_gdn(
+    name: &str,
+    metadata: &PrismHadamardMetadata,
+    _layout: GdnLayout,
+) -> Result<Option<GdnLayout>> {
+    if name.ends_with(".ssm_out.weight") && !metadata.gdn_v_grouped {
+        return Err(Error::Config(
+            "Prism GGUF ssm_out requires grouped GDN activation metadata".into(),
+        ));
+    }
+    // Published GGUF matrices are already folded for grouped decoder activations. The transform
+    // therefore starts at signs/Hadamard and must not permute the activation a second time.
+    Ok(None)
+}
+
 impl PrismMlxCheckpoint {
     pub fn open(dir: &Path, device: &Device, config: &Value) -> Result<Self> {
         validate_config(config)?;
@@ -170,6 +191,7 @@ impl PrismMlxCheckpoint {
         let mut tensors = loaded.into_map();
         let mut packed = HashMap::with_capacity(modules.len());
         let mut declared = BTreeSet::new();
+        let mut declared_weights = BTreeSet::new();
         for module in modules {
             let path = module
                 .get("path")
@@ -189,6 +211,7 @@ impl PrismMlxCheckpoint {
             let weight_key = format!("{base}.weight");
             let scales_key = format!("{base}.scales");
             let biases_key = format!("{base}.biases");
+            let signs_key = format!("{base}.signs");
             let words = tensors
                 .remove(&weight_key)
                 .ok_or_else(|| Error::MissingTensor(weight_key.clone()))?;
@@ -198,6 +221,44 @@ impl PrismMlxCheckpoint {
             let biases = tensors
                 .remove(&biases_key)
                 .ok_or_else(|| Error::MissingTensor(biases_key.clone()))?;
+            let signs = tensors
+                .remove(&signs_key)
+                .ok_or_else(|| Error::MissingTensor(signs_key.clone()))?;
+            let input_width = words
+                .dim(1)?
+                .checked_mul(16)
+                .ok_or_else(|| Error::Config("Prism input width overflow".into()))?;
+            let expected_signs = metadata
+                .signs(input_width)
+                .map_err(|error| Error::Config(format!("Prism module {path}: {error}")))?;
+            if signs.dtype() != DType::F32 || signs.dims1()? != input_width {
+                return Err(Error::Config(format!(
+                    "Prism module {path} signs must be F32 with width {input_width}"
+                )));
+            }
+            let actual_signs = signs.to_vec1::<f32>()?;
+            if actual_signs
+                .iter()
+                .zip(expected_signs)
+                .any(|(&actual, &expected)| !actual.is_finite() || actual != f32::from(expected))
+            {
+                return Err(Error::Config(format!(
+                    "Prism module {path} signs differ from the declared width vector"
+                )));
+            }
+            let embedding = module
+                .get("embedding")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let role = metadata.role(&weight_key);
+            if (embedding && role != core_llm::PrismTransformRole::Inverse)
+                || (!embedding && role != core_llm::PrismTransformRole::Forward)
+            {
+                return Err(Error::Config(format!(
+                    "Prism module {path} embedding role disagrees with Hadamard metadata"
+                )));
+            }
+            declared_weights.insert(weight_key.clone());
             let weight = PrismPackedWeight::from_mlx_affine2(
                 weight_key.clone(),
                 words,
@@ -209,17 +270,20 @@ impl PrismMlxCheckpoint {
             )?;
             packed.insert(weight_key, Arc::new(weight));
         }
-        if packed.len() != metadata.forward_weight_names.len() + metadata.inverse_weight_names.len()
-        {
-            return Err(Error::Config(format!(
-                "Prism module count {} != Hadamard tensor count {}",
-                packed.len(),
-                metadata.forward_weight_names.len() + metadata.inverse_weight_names.len()
-            )));
+        let transform_weights = metadata
+            .forward_weight_names
+            .union(&metadata.inverse_weight_names)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if declared_weights != transform_weights {
+            return Err(Error::Config(
+                "Prism module set differs from Hadamard transform membership".into(),
+            ));
         }
         if let Some(name) = tensors.keys().find(|name| {
             name.ends_with(".scales")
                 || name.ends_with(".biases")
+                || name.ends_with(".signs")
                 || tensors
                     .get(*name)
                     .is_some_and(|tensor| tensor.dtype() == DType::U32)
@@ -339,6 +403,11 @@ fn read_metadata(dir: &Path) -> Result<PrismHadamardMetadata> {
             .and_then(Value::as_bool)
             .ok_or_else(|| Error::Config("Prism metadata missing gdn_v_grouped".into()))?,
     };
+    if !metadata.gdn_v_grouped {
+        return Err(Error::Config(
+            "published Prism requires grouped GDN tensors; refusing an ungrouped pack".into(),
+        ));
+    }
     metadata
         .validate()
         .map_err(|error| Error::Config(format!("Prism Hadamard metadata: {error}")))?;
@@ -579,6 +648,11 @@ fn gguf_hadamard(raw: &RawGguf) -> Result<PrismHadamardMetadata> {
             .and_then(RawValue::bool)
             .ok_or_else(|| Error::Config("missing gdn_v_grouped".into()))?,
     };
+    if !metadata.gdn_v_grouped {
+        return Err(Error::Config(
+            "published Prism GGUF requires grouped GDN tensors; refusing an ungrouped pack".into(),
+        ));
+    }
     metadata
         .validate()
         .map_err(|e| Error::Config(format!("Prism GGUF Hadamard metadata: {e}")))?;
@@ -640,7 +714,11 @@ fn gguf_row_map(name: &str, inner: usize, rank: usize, groups: usize) -> Option<
             prefix: 0,
             groups,
             repetitions: reps,
-            unit: if name.contains("ssm_alpha") || name.contains("ssm_beta") {
+            unit: if name.contains("ssm_alpha")
+                || name.contains("ssm_beta")
+                || name.ends_with(".ssm_a")
+                || name.ends_with(".ssm_dt.bias")
+            {
                 1
             } else {
                 unit
@@ -649,6 +727,18 @@ fn gguf_row_map(name: &str, inner: usize, rank: usize, groups: usize) -> Option<
     } else {
         None
     }
+}
+
+fn convert_ssm_a_to_log(values: &mut [f32], name: &str) -> Result<()> {
+    for value in values {
+        if !value.is_finite() || *value >= 0.0 {
+            return Err(Error::Config(format!(
+                "Prism GGUF {name} must contain finite, strictly negative SSM A values"
+            )));
+        }
+        *value = (-*value).ln();
+    }
+    Ok(())
 }
 
 fn decode_plain(ty: u32, data: &[u8]) -> Result<Vec<f32>> {
@@ -723,6 +813,10 @@ mod tests {
             format!("{base}.biases"),
             Tensor::full(if bad_bias { 0f32 } else { -1f32 }, (2, 1), &device).unwrap(),
         );
+        tensors.insert(
+            format!("{base}.signs"),
+            Tensor::ones(128, DType::F32, &device).unwrap(),
+        );
         candle_core::safetensors::save(&tensors, dir.join("model.safetensors")).unwrap();
         std::fs::write(
             dir.join("hadamard.json"),
@@ -764,6 +858,53 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("biases exactly equal"));
+    }
+
+    #[test]
+    fn strict_mlx_checkpoint_rejects_sign_and_transform_membership_mutations() {
+        let load_error = |dir: &Path, config: &Value| {
+            PrismMlxCheckpoint::open(dir, &Device::Cpu, config)
+                .err()
+                .expect("mutation must fail")
+                .to_string()
+        };
+
+        let missing = tempfile::tempdir().unwrap();
+        write_fixture(missing.path(), false);
+        let model_path = missing.path().join("model.safetensors");
+        let mut tensors = candle_core::safetensors::load(&model_path, &Device::Cpu).unwrap();
+        tensors.remove("language_model.model.embed_tokens.signs");
+        candle_core::safetensors::save(&tensors, &model_path).unwrap();
+        assert!(load_error(missing.path(), &config()).contains("signs"));
+
+        let changed = tempfile::tempdir().unwrap();
+        write_fixture(changed.path(), false);
+        let model_path = changed.path().join("model.safetensors");
+        let mut tensors = candle_core::safetensors::load(&model_path, &Device::Cpu).unwrap();
+        let mut signs = vec![1.0f32; 128];
+        signs[17] = -1.0;
+        tensors.insert(
+            "language_model.model.embed_tokens.signs".into(),
+            Tensor::from_vec(signs, 128, &Device::Cpu).unwrap(),
+        );
+        candle_core::safetensors::save(&tensors, &model_path).unwrap();
+        assert!(load_error(changed.path(), &config()).contains("signs differ"));
+
+        let swapped = tempfile::tempdir().unwrap();
+        write_fixture(swapped.path(), false);
+        let metadata_path = swapped.path().join("hadamard.json");
+        let mut metadata: Value =
+            serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
+        metadata["prism.hadamard.inverse_weight_names"] =
+            json!(["language_model.model.other.weight"]);
+        std::fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        assert!(load_error(swapped.path(), &config()).contains("embedding role"));
+
+        let flipped = tempfile::tempdir().unwrap();
+        write_fixture(flipped.path(), false);
+        let mut wrong_role = config();
+        wrong_role["modules"][0]["embedding"] = json!(false);
+        assert!(load_error(flipped.path(), &wrong_role).contains("embedding role"));
     }
 
     #[test]
@@ -819,6 +960,10 @@ mod tests {
                 format!("{base}.biases"),
                 Tensor::full(-1f32, (rows, 1), &device).unwrap(),
             );
+            tensors.insert(
+                format!("{base}.signs"),
+                Tensor::ones(128, DType::F32, &device).unwrap(),
+            );
         }
         let embed = "language_model.model.embed_tokens";
         tensors.insert(
@@ -832,6 +977,10 @@ mod tests {
         tensors.insert(
             format!("{embed}.biases"),
             Tensor::full(-1f32, (128, 1), &device).unwrap(),
+        );
+        tensors.insert(
+            format!("{embed}.signs"),
+            Tensor::ones(128, DType::F32, &device).unwrap(),
         );
         for name in [
             "language_model.model.norm.weight",
@@ -908,5 +1057,40 @@ mod tests {
         assert_eq!(values, vec![0., 2., 4., 1., 3., 5.]);
         assert!(gguf_row_map("blk.7.ssm_a", 6, 6, 2).is_some());
         assert!(gguf_row_map("blk.7.ssm_dt.bias", 6, 6, 2).is_some());
+        let frozen_scalar = gguf_row_map("blk.7.ssm_a", 768, 48, 16).unwrap();
+        assert_eq!(frozen_scalar.unit, 1);
+        frozen_scalar.validate(48).unwrap();
+        assert_eq!(frozen_scalar.source_row(1).unwrap(), 16);
+        let mut a = (0..48)
+            .map(|row| -((row + 1) as f32) / 100.0)
+            .collect::<Vec<_>>();
+        let stored = a.clone();
+        reorder_dense_rows(&mut a, &[48], frozen_scalar).unwrap();
+        convert_ssm_a_to_log(&mut a, "blk.7.ssm_a").unwrap();
+        for (logical, actual) in a.iter().enumerate() {
+            let source = frozen_scalar.source_row(logical).unwrap();
+            assert!((*actual - (-stored[source]).ln()).abs() < 1e-7);
+        }
+        for invalid in [0.0, 1.0, f32::NAN, f32::INFINITY] {
+            assert!(convert_ssm_a_to_log(&mut [invalid], "blk.7.ssm_a").is_err());
+        }
+        let metadata = PrismHadamardMetadata {
+            block_size: 128,
+            signs_by_width: [(128, vec![1; 128])].into_iter().collect(),
+            forward_weight_names: [
+                "language_model.model.layers.7.linear_attn.out_proj.weight".into()
+            ]
+            .into_iter()
+            .collect(),
+            inverse_weight_names: BTreeSet::new(),
+            gdn_v_grouped: true,
+        };
+        assert!(gguf_activation_gdn(
+            "blk.7.ssm_out.weight",
+            &metadata,
+            GdnLayout::from_ssm_out(768, 48, 16).unwrap(),
+        )
+        .unwrap()
+        .is_none());
     }
 }

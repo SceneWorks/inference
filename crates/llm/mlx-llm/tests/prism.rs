@@ -121,7 +121,8 @@ fn write_fixture() -> Fixture {
     ];
     let v = "vision_tower";
     tensors.extend([
-        (format!("{v}.patch_embed.proj.weight"), z(&[8, 3, 2, 2, 2])),
+        // Published MLX artifact layout is [out, temporal, height, width, channels].
+        (format!("{v}.patch_embed.proj.weight"), z(&[8, 2, 2, 2, 3])),
         (format!("{v}.patch_embed.proj.bias"), z(&[8])),
         (format!("{v}.pos_embed.weight"), z(&[16, 8])),
         (
@@ -230,4 +231,35 @@ fn malformed_explicit_sign_metadata_fails_closed() {
         .err()
         .expect("malformed metadata must fail");
     assert!(error.to_string().contains("signs must be -1 or +1"));
+}
+
+#[test]
+fn expanded_provider_context_budget_fails_before_text_or_media_prefill() {
+    // The fixture's rendered "hello world" prompt is 20 tokens; reserve two generated tokens.
+    for (max_context, should_pass) in [(22, true), (21, false)] {
+        let dir = write_fixture();
+        let config_path = dir.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["text_config"]["max_position_embeddings"] = json!(max_context);
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let provider = LlamaProvider::load(&LoadSpec::dense(dir.to_str().unwrap())).unwrap();
+        let request = TextLlmRequest {
+            messages: vec![Message::user("hello world")],
+            sampling: Sampling::greedy(),
+            max_new_tokens: 2,
+            ..Default::default()
+        };
+        let result = provider.generate(&request, &mut |_| {});
+        if should_pass {
+            result.expect("exact prompt plus output context boundary");
+        } else {
+            let error = result.expect_err("one-token provider context overflow must fail");
+            assert!(
+                error.to_string().contains("exceeds context window 21"),
+                "{error}"
+            );
+        }
+        assert_fixture_is_self_removing(dir);
+    }
 }

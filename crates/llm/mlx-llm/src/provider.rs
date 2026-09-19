@@ -367,23 +367,25 @@ fn substitute_vision_placeholders(
             let content = m
                 .content
                 .iter()
-                .map(|c| match c {
-                    Content::Image(_) => Ok(Content::text(IMAGE_PLACEHOLDER)),
-                    Content::Video(v) => Ok(Content::text(video_placeholder_text(
-                        v,
-                        temporal_patch_size,
-                    ))),
-                    Content::Text(t) => Ok(Content::Text(t.clone())),
-                    // The Qwen-VL path has no audio projector, and this provider's `supports_audio`
-                    // is false for every Qwen checkpoint, so `validate` rejects an audio-carrying
-                    // request before substitution. Erroring here rather than dropping the block
-                    // means that if that invariant ever breaks, the request fails loudly instead of
-                    // being answered from its text alone.
-                    Content::Audio(_) => Err(CoreError::Unsupported(
-                        "[mlx-llama] the Qwen-VL path carries no audio; an audio block reached \
-                         placeholder substitution, which the capability gate should have rejected"
-                            .to_string(),
-                    )),
+                .map(|c| -> CoreResult<Content> {
+                    match c {
+                        Content::Image(_) => Ok(Content::text(IMAGE_PLACEHOLDER)),
+                        Content::Video(v) => {
+                            v.validate().map_err(CoreError::InvalidRequest)?;
+                            Ok(Content::text(video_placeholder_text(v, temporal_patch_size)))
+                        }
+                        Content::Text(t) => Ok(Content::Text(t.clone())),
+                        // The Qwen-VL path has no audio projector, and this provider's
+                        // `supports_audio` is false for every Qwen checkpoint, so `validate`
+                        // rejects an audio-carrying request before substitution. Erroring here
+                        // rather than dropping the block means that if that invariant ever breaks,
+                        // the request fails loudly instead of being answered from its text alone.
+                        Content::Audio(_) => Err(CoreError::Unsupported(
+                            "[mlx-llama] the Qwen-VL path carries no audio; an audio block reached \
+                             placeholder substitution, which the capability gate should have rejected"
+                                .to_string(),
+                        )),
+                    }
                 })
                 .collect::<CoreResult<Vec<_>>>()?;
             Ok(Message {
@@ -502,8 +504,12 @@ impl LlamaProvider {
             vision_prefix,
         ) {
             let vcfg = Qwen35VisionConfig::from_json(&cfg_value).map_err(to_core)?;
-            let tower =
-                Qwen35VisionModel::from_weights(&weights, prefix, vcfg.clone()).map_err(to_core)?;
+            let tower = if is_prism {
+                Qwen35VisionModel::from_mlx_weights(&weights, prefix, vcfg.clone())
+            } else {
+                Qwen35VisionModel::from_weights(&weights, prefix, vcfg.clone())
+            }
+            .map_err(to_core)?;
             let image_token_id = cfg_value
                 .get("image_token_id")
                 .and_then(|x| x.as_i64())
@@ -1219,6 +1225,11 @@ impl TextLlm for LlamaProvider {
             .map(|m| m.expanded_ids.len())
             .or_else(|| g4.as_ref().map(|m| m.expanded_ids.len()))
             .unwrap_or(prompt_ids.len());
+        validate_context_window(
+            self.descriptor.capabilities.max_context_tokens,
+            prompt_len,
+            req.max_new_tokens,
+        )?;
 
         let config = GenerationConfig {
             max_new_tokens: req.max_new_tokens as usize,
@@ -1751,6 +1762,25 @@ fn map_sampling(s: &Sampling) -> SamplingParams {
     }
 }
 
+fn validate_context_window(
+    cap: usize,
+    prompt_tokens: usize,
+    max_new_tokens: u32,
+) -> CoreResult<()> {
+    if cap == 0 {
+        return Ok(());
+    }
+    let total = prompt_tokens
+        .checked_add(max_new_tokens as usize)
+        .ok_or_else(|| CoreError::InvalidRequest("prompt + generation length overflow".into()))?;
+    if total > cap {
+        return Err(CoreError::InvalidRequest(format!(
+            "expanded prompt ({prompt_tokens} tokens) + requested generation ({max_new_tokens}) exceeds context window {cap}"
+        )));
+    }
+    Ok(())
+}
+
 fn bonsai_sampling_defaults() -> ModelSamplingDefaults {
     ModelSamplingDefaults {
         thinking: Sampling {
@@ -2245,6 +2275,54 @@ mod tests {
         for (g, w) in got.iter().zip(&want) {
             assert!((g - w).abs() < 1e-5, "merged timestamp {g} vs HF {w}");
         }
+    }
+
+    #[test]
+    fn invalid_public_video_timestamps_fail_before_prompt_rendering() {
+        let frame = || ImageRef::new(1, 1, vec![0, 0, 0]).unwrap();
+        for timestamps in [vec![0.0, f32::NAN], vec![0.5, 0.25], vec![-0.1, 0.0]] {
+            let video = VideoRef {
+                frames: vec![frame(), frame()],
+                timestamps,
+            };
+            let messages = vec![Message {
+                role: core_llm::Role::User,
+                content: vec![Content::Video(video)],
+                thinking: None,
+                tool_calls: Vec::new(),
+            }];
+            let error = substitute_vision_placeholders(&messages, 2)
+                .expect_err("invalid timestamp sequence accepted");
+            assert!(error.to_string().contains("timestamp"));
+        }
+        let count_mismatch = vec![Message {
+            role: core_llm::Role::User,
+            content: vec![Content::Video(VideoRef {
+                frames: vec![frame(), frame()],
+                timestamps: vec![0.0],
+            })],
+            thinking: None,
+            tool_calls: Vec::new(),
+        }];
+        assert!(substitute_vision_placeholders(&count_mismatch, 2)
+            .unwrap_err()
+            .to_string()
+            .contains("one timestamp per frame"));
+    }
+
+    #[test]
+    fn expanded_text_image_video_and_mtp_budgets_share_the_context_gate() {
+        for expanded_prompt in [48usize, 52, 60] {
+            validate_context_window(64, expanded_prompt, (64 - expanded_prompt) as u32).unwrap();
+            let error =
+                validate_context_window(64, expanded_prompt, (64 - expanded_prompt + 1) as u32)
+                    .expect_err("one-token context overflow accepted");
+            assert!(error.to_string().contains("exceeds context window 64"));
+        }
+        assert!(validate_context_window(usize::MAX, usize::MAX, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("overflow"));
     }
 
     /// **The per-frame placeholder string matches `Qwen3VLProcessor.replace_video_token` (collapsed

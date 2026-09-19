@@ -193,6 +193,16 @@ fn frozen_qwen38_tokenizer_runs_tiny_native_text_and_mtp() {
         auto.mtp.is_some(),
         "Auto must retain MTP for native JSON-constrained generation"
     );
+
+    let mut over_context = req("context gate", ThinkingMode::Disabled, 513);
+    over_context.mtp = MtpMode::Enabled { draft_tokens: 3 };
+    let error = provider
+        .generate(&over_context, &mut |_| {})
+        .expect_err("MTP request beyond the expanded context must fail before prefill");
+    assert!(
+        error.to_string().contains("exceeds context window 512"),
+        "{error}"
+    );
 }
 
 #[test]

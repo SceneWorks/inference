@@ -290,6 +290,51 @@ fn request(prompt: &str, max_new_tokens: u32) -> TextLlmRequest {
 
 #[test]
 #[ignore = "requires QWEN38_TOKENIZER_JSON from the frozen Qwen3.8 snapshot"]
+fn configured_mtp_rejects_every_partial_tensor_set_and_disabled_config_contradiction() {
+    let tokenizer_path = frozen_tokenizer();
+    let required = [
+        "mtp.fc.weight",
+        "mtp.norm.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+        "mtp.layers.0.input_layernorm.weight",
+        "mtp.layers.0.post_attention_layernorm.weight",
+        "mtp.layers.0.self_attn.q_proj.weight",
+        "mtp.layers.0.self_attn.k_proj.weight",
+        "mtp.layers.0.self_attn.v_proj.weight",
+        "mtp.layers.0.self_attn.o_proj.weight",
+        "mtp.layers.0.self_attn.q_norm.weight",
+        "mtp.layers.0.self_attn.k_norm.weight",
+        "mtp.layers.0.mlp.gate_proj.weight",
+        "mtp.layers.0.mlp.up_proj.weight",
+        "mtp.layers.0.mlp.down_proj.weight",
+    ];
+    for missing in required {
+        let snapshot = write_snapshot(&tokenizer_path, false);
+        let model_path = snapshot.path().join("model.safetensors");
+        let mut tensors = candle_core::safetensors::load(&model_path, &Device::Cpu).unwrap();
+        tensors.remove(missing).expect("required fixture tensor");
+        candle_core::safetensors::save(&tensors, &model_path).unwrap();
+        let error = LlamaProvider::load(&LoadSpec::dense(snapshot.path().display().to_string()))
+            .err()
+            .unwrap_or_else(|| panic!("provider accepted configured MTP without {missing}"));
+        assert!(error.to_string().contains(missing), "{missing}: {error}");
+    }
+
+    let contradictory = write_snapshot(&tokenizer_path, false);
+    let config_path = contradictory.path().join("config.json");
+    let config = std::fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("\"mtp_num_hidden_layers\":1", "\"mtp_num_hidden_layers\":0");
+    std::fs::write(config_path, config).unwrap();
+    let error = LlamaProvider::load(&LoadSpec::dense(contradictory.path().display().to_string()))
+        .err()
+        .expect("MTP tensors with disabled config must fail");
+    assert!(error.to_string().contains("config disables MTP"), "{error}");
+}
+
+#[test]
+#[ignore = "requires QWEN38_TOKENIZER_JSON from the frozen Qwen3.8 snapshot"]
 fn frozen_qwen38_provider_executes_ar_mtp_tools_and_stops() {
     let tokenizer_path = frozen_tokenizer();
     let snapshot = write_snapshot(&tokenizer_path, false);

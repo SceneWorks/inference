@@ -36,6 +36,14 @@ use crate::primitives::projection::{Projection, QuantSpec};
 use crate::primitives::rope::{apply_rope, Rope};
 use crate::primitives::{KvCache, PrismRegistry, Weights};
 
+fn checkpoint_norm_weight(weight: Tensor, prism: bool) -> Result<Tensor> {
+    if prism {
+        Ok(weight)
+    } else {
+        Ok(weight.affine(1.0, 1.0)?)
+    }
+}
+
 #[derive(Clone)]
 enum QwenEmbedding {
     Dense(Tensor),
@@ -1273,9 +1281,12 @@ impl Qwen35Model {
             }
         };
         let req = |key: String| -> Result<Tensor> { Ok(w.require(&key)?.to_dtype(dtype)?) };
-        // Qwen3.6 RMSNorm weights are stored zero-centered → fold in the +1 (the (1 + weight)
-        // convention). The gated DeltaNet norm is the exception: it is ones-centered, loaded raw.
-        let norm_w = |key: String| -> Result<Tensor> { Ok(req(key)?.affine(1.0, 1.0)?) };
+        // Dense HF Qwen3.6 norms are zero-centered. Frozen Prism/Bonsai artifacts have already
+        // converted every ordinary RMSNorm tensor to its direct multiplier and must remain raw.
+        let norm_w = |key: String| -> Result<Tensor> {
+            let weight = req(key)?;
+            checkpoint_norm_weight(weight, prism.is_some())
+        };
         let proj_q = |key: String| -> Result<Projection> {
             match prism.and_then(|registry| registry.get(&key)) {
                 Some(weight) => Ok(Projection::load_prism(weight.clone())),
@@ -1562,6 +1573,45 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn published_prism_norm_multiplier_matches_independent_rms_oracle() {
+        let source = vec![1.0583496f32, 0.9418945, 1.3125, 1.957_031_3];
+        let x = vec![0.25f32, -0.5, 1.25, -2.0];
+        let weight = checkpoint_norm_weight(
+            Tensor::from_vec(source.clone(), 4, &Device::Cpu).unwrap(),
+            true,
+        )
+        .unwrap();
+        let got = rms_norm(
+            &Tensor::from_vec(x.clone(), (1, 4), &Device::Cpu).unwrap(),
+            &weight,
+            1e-6,
+        )
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+        let inv = (x.iter().map(|v| v * v).sum::<f32>() / 4.0 + 1e-6)
+            .sqrt()
+            .recip();
+        for (i, value) in got.iter().enumerate() {
+            let expected = x[i] * inv * source[i];
+            assert!(
+                (value - expected).abs() < 1e-5,
+                "lane {i}: {value} != {expected}"
+            );
+        }
+        let dense = checkpoint_norm_weight(
+            Tensor::from_vec(vec![0.0583496f32], 1, &Device::Cpu).unwrap(),
+            false,
+        )
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+        assert!((dense[0] - source[0]).abs() < 1e-6);
+    }
 
     fn cfg_json() -> Value {
         // 4 layers → schedule (interval 4): layers 0,1,2 linear, layer 3 full attention.

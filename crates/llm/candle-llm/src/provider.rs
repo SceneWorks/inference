@@ -326,32 +326,6 @@ fn merged_frame_timestamps(timestamps: &[f32], temporal_patch_size: usize) -> Ve
         .collect()
 }
 
-fn validate_video_timestamps(timestamps: &[f32]) -> CoreResult<()> {
-    if let Some((index, value)) = timestamps
-        .iter()
-        .copied()
-        .enumerate()
-        .find(|(_, value)| !value.is_finite() || *value < 0.0)
-    {
-        return Err(CoreError::InvalidRequest(format!(
-            "video timestamp {index} must be finite and non-negative, got {value}"
-        )));
-    }
-    if let Some((index, pair)) = timestamps
-        .windows(2)
-        .enumerate()
-        .find(|(_, pair)| pair[1] < pair[0])
-    {
-        return Err(CoreError::InvalidRequest(format!(
-            "video timestamps must preserve sampled-frame order: index {} is {} after {}",
-            index + 1,
-            pair[1],
-            pair[0]
-        )));
-    }
-    Ok(())
-}
-
 /// The Text–Timestamp-Alignment placeholder text for one video: per merged frame, a
 /// `<{t:.1f} seconds>` timestamp tag followed by `<|vision_start|><|video_pad|><|vision_end|>`
 /// (exactly `Qwen3VLProcessor.replace_video_token`). The single `<|video_pad|>` per frame is expanded
@@ -387,7 +361,7 @@ fn substitute_vision_placeholders(
                     match c {
                     Content::Image(_) => Ok(Content::text(IMAGE_PLACEHOLDER)),
                     Content::Video(v) => {
-                        validate_video_timestamps(&v.timestamps)?;
+                        v.validate().map_err(CoreError::InvalidRequest)?;
                         Ok(Content::text(video_placeholder_text(v, temporal_patch_size)))
                     }
                     Content::Text(t) => Ok(Content::Text(t.clone())),
@@ -590,8 +564,14 @@ impl LlamaProvider {
                 Qwen35Model::from_weights_with(&weights, "model.language_model", qcfg, requested)
                     .map_err(to_core)?
             };
-            let mtp = if Qwen35Mtp::complete_in(&weights, m.config()) {
+            let configured_layers = m.config().mtp_num_hidden_layers;
+            let has_mtp_tensors = weights.keys().any(|key| key.starts_with("mtp."));
+            let mtp = if configured_layers > 0 {
                 Some(Qwen35Mtp::from_weights_with(&weights, &m, requested).map_err(to_core)?)
+            } else if has_mtp_tensors {
+                return Err(CoreError::Load(
+                    "qwen3_5 checkpoint carries MTP tensors while config disables MTP".into(),
+                ));
             } else {
                 None
             };
@@ -2451,7 +2431,10 @@ mod tests {
     fn invalid_video_timestamps_fail_before_prompt_rendering() {
         let frame = || ImageRef::new(1, 1, vec![0, 0, 0]).unwrap();
         for timestamps in [vec![0.0, f32::NAN], vec![0.5, 0.25], vec![-0.1, 0.0]] {
-            let video = VideoRef::new(vec![frame(), frame()], timestamps).unwrap();
+            let video = VideoRef {
+                frames: vec![frame(), frame()],
+                timestamps,
+            };
             let messages = vec![Message {
                 role: Role::User,
                 content: vec![Content::Video(video)],

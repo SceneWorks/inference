@@ -98,6 +98,18 @@ impl<'a> PrismPackedMatrixRef<'a> {
                 actual: data.len(),
             });
         }
+        // Validate every compressed block at admission time. CPU decoding also checks this scale,
+        // but device kernels consume the retained bytes directly, so a successful load must carry
+        // the same finite-scale guarantee on every backend.
+        for block in data.chunks_exact(kind.block_bytes()) {
+            let scale_at = match kind {
+                PrismPackedKind::Pq2_0 => 0,
+                PrismPackedKind::Ptq1_0 => 26,
+            };
+            if !f16(block[scale_at], block[scale_at + 1]).is_finite() {
+                return Err(PrismError::NonFiniteScale);
+            }
+        }
         Ok(Self {
             kind,
             input_width,
@@ -555,10 +567,20 @@ mod tests {
         );
         let mut nonfinite = [0u8; 34];
         nonfinite[..2].copy_from_slice(&[0, 124]);
+        assert!(matches!(
+            PrismPackedMatrixRef::from_gguf(PrismPackedKind::Pq2_0, &[128, 1], &nonfinite),
+            Err(PrismError::NonFiniteScale)
+        ));
         assert_eq!(
             decode_block_into(PrismPackedKind::Pq2_0, &nonfinite, &mut [0.; 128]),
             Err(PrismError::NonFiniteScale)
         );
+        let mut ptq_nonfinite = [0u8; 28];
+        ptq_nonfinite[26..].copy_from_slice(&[0, 124]);
+        assert!(matches!(
+            PrismPackedMatrixRef::from_gguf(PrismPackedKind::Ptq1_0, &[128, 1], &ptq_nonfinite,),
+            Err(PrismError::NonFiniteScale)
+        ));
     }
     #[test]
     fn fwht_and_gdn_order() {
