@@ -3784,6 +3784,25 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             candle_commands.index("qwen38_bonsai_terminal.py preflight"),
             candle_commands.index("ensure_model_snapshot.py"),
         )
+        cuda_oracle = next(
+            step
+            for step in candle["steps"]
+            if step.get("name")
+            == "Execute Candle packed CUDA operator oracles before provisioning"
+        )
+        cuda_oracle_command = (
+            "cargo test --locked -p candle-llm --features cuda --lib "
+            "primitives::prism::tests::cuda_packed_operator_oracles_compile_and_execute_nvrtc "
+            "-- --exact --nocapture"
+        )
+        self.assertIn('call "%VCVARS%" || exit /b 1', cuda_oracle["run"])
+        self.assertIn(cuda_oracle_command, cuda_oracle["run"])
+        self.assertIn('findstr /C:"test result: ok. 1 passed"', cuda_oracle["run"])
+        self.assertNotIn("continue-on-error", cuda_oracle)
+        self.assertLess(
+            candle_commands.index(cuda_oracle_command),
+            candle_commands.index("ensure_model_snapshot.py"),
+        )
         self.assertIn("--load-profile mlx-unified", mlx_commands)
         self.assertIn("--load-profile candle-packed-cuda", candle_commands)
         self.assertIn("qwen38_bonsai_terminal.py matrix-status", candle_commands)
