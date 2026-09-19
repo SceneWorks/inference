@@ -1302,6 +1302,22 @@ mod tests {
         assert!(error.to_string().contains("row-map geometry"));
     }
 
+    #[test]
+    fn runtime_cuda_source_requires_no_host_or_sdk_headers() {
+        // Production NVRTC compilation intentionally supplies no include directories. Keep this
+        // invariant test available on CPU CI; the CUDA oracle separately compiles and runs every
+        // packed operator on the actual device.
+        let source = include_str!("prism_cuda.cu");
+        assert!(!source.lines().any(|line| {
+            let directive = line
+                .trim_start()
+                .strip_prefix('#')
+                .unwrap_or("")
+                .trim_start();
+            directive.starts_with("include")
+        }));
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     fn cuda_packed_operator_oracles_compile_and_execute_nvrtc() {

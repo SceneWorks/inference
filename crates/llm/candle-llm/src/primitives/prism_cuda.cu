@@ -1,7 +1,17 @@
 // Native compact Prism/Bonsai CUDA kernels. The packed source is decoded inside each dot product or
 // selected embedding row; no dense checkpoint-sized buffer is ever allocated.
 
-#include <stdint.h>
+// NVRTC is invoked with no SDK or host compiler include paths. Keep the runtime source
+// self-contained; these CUDA ABI types match the Rust u8/u16/u32/i64 launch buffers on
+// both Windows (LLP64) and Unix (LP64). In particular, `long` is not a portable i64.
+typedef unsigned char uint8_t;
+typedef unsigned short uint16_t;
+typedef unsigned int uint32_t;
+typedef long long int64_t;
+static_assert(sizeof(uint8_t) == 1, "packed byte ABI");
+static_assert(sizeof(uint16_t) == 2, "packed half bits ABI");
+static_assert(sizeof(uint32_t) == 4, "packed word ABI");
+static_assert(sizeof(int64_t) == 8, "embedding index ABI");
 
 __device__ __forceinline__ float prism_half_to_float(uint16_t h) {
     uint32_t sign = ((uint32_t)h & 0x8000u) << 16;
