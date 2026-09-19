@@ -29,6 +29,14 @@ pub(crate) struct PrismGgufCheckpoint {
     tokenizer_json: String,
 }
 
+struct GgufTokenizer {
+    json: String,
+    stop_tokens: Vec<i32>,
+    chat_template: Option<String>,
+    bos_token: Option<String>,
+    eos_token: Option<String>,
+}
+
 impl PrismGgufCheckpoint {
     pub fn is_prism(path: &Path) -> Result<bool> {
         let raw = RawGguf::open(path)?;
@@ -56,8 +64,7 @@ impl PrismGgufCheckpoint {
             ));
         }
         let config_json = gguf_config(&raw)?;
-        let (tokenizer_json, stop_tokens, chat_template, bos_token, eos_token) =
-            gguf_tokenizer(&raw)?;
+        let tokenizer = gguf_tokenizer(&raw)?;
         let group_count = meta_u(&raw, "qwen35.ssm.group_count")? as usize;
         let time_step_rank = meta_u(&raw, "qwen35.ssm.time_step_rank")? as usize;
         let inner = meta_u(&raw, "qwen35.ssm.inner_size")? as usize;
@@ -137,11 +144,11 @@ impl PrismGgufCheckpoint {
             weights: Weights::from_map(dense, device.clone()),
             registry: PrismRegistry::new(packed)?,
             config_json,
-            stop_tokens,
-            chat_template,
-            bos_token,
-            eos_token,
-            tokenizer_json,
+            stop_tokens: tokenizer.stop_tokens,
+            chat_template: tokenizer.chat_template,
+            bos_token: tokenizer.bos_token,
+            eos_token: tokenizer.eos_token,
+            tokenizer_json: tokenizer.json,
         })
     }
 
@@ -407,15 +414,7 @@ fn gguf_config(raw: &RawGguf) -> Result<Value> {
     }))
 }
 
-fn gguf_tokenizer(
-    raw: &RawGguf,
-) -> Result<(
-    String,
-    Vec<i32>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-)> {
+fn gguf_tokenizer(raw: &RawGguf) -> Result<GgufTokenizer> {
     let string_array = |key: &str| -> Result<Vec<String>> {
         raw.metadata
             .get(key)
@@ -484,16 +483,17 @@ fn gguf_tokenizer(
         id.and_then(|v| usize::try_from(v).ok())
             .and_then(|v| tokens.get(v).cloned())
     };
-    Ok((
-        doc.to_string(),
-        stop,
-        raw.metadata
+    Ok(GgufTokenizer {
+        json: doc.to_string(),
+        stop_tokens: stop,
+        chat_template: raw
+            .metadata
             .get("tokenizer.chat_template")
             .and_then(RawValue::string)
             .map(str::to_string),
-        token_at(id("tokenizer.ggml.bos_token_id")),
-        token_at(eos),
-    ))
+        bos_token: token_at(id("tokenizer.ggml.bos_token_id")),
+        eos_token: token_at(eos),
+    })
 }
 
 fn gguf_hadamard(raw: &RawGguf) -> Result<PrismHadamardMetadata> {
@@ -665,7 +665,7 @@ fn decode_plain(ty: u32, data: &[u8]) -> Result<Vec<f32>> {
     }
 }
 
-fn reorder_dense_rows(values: &mut Vec<f32>, shape: &[usize], map: GdnRowMap) -> Result<()> {
+fn reorder_dense_rows(values: &mut [f32], shape: &[usize], map: GdnRowMap) -> Result<()> {
     let (rows, cols) = match shape {
         [rows] => (*rows, 1),
         [rows, cols] => (*rows, *cols),
@@ -681,7 +681,7 @@ fn reorder_dense_rows(values: &mut Vec<f32>, shape: &[usize], map: GdnRowMap) ->
         ));
     }
     map.validate(rows)?;
-    let old = values.clone();
+    let old = values.to_owned();
     for dst in 0..rows {
         let src = map.source_row(dst)?;
         values[dst * cols..(dst + 1) * cols].copy_from_slice(&old[src * cols..(src + 1) * cols]);

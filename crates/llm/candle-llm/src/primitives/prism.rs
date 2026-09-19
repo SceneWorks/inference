@@ -91,6 +91,14 @@ enum PackedStorage {
     },
 }
 
+#[derive(Clone, Copy)]
+struct PackedGeometry {
+    rows: usize,
+    input_width: usize,
+    row_map: Option<GdnRowMap>,
+    gdn: Option<GdnLayout>,
+}
+
 /// One compact resident `[output_rows, input_width]` matrix.
 #[derive(Clone)]
 pub struct PrismPackedWeight {
@@ -184,8 +192,12 @@ impl PrismPackedWeight {
         };
         Self::new(
             name,
-            rows,
-            input_width,
+            PackedGeometry {
+                rows,
+                input_width,
+                row_map,
+                gdn,
+            },
             PackedStorage::MlxAffine2 {
                 words: (!device.is_cpu()).then_some(words),
                 scales: if device.is_cpu() {
@@ -197,8 +209,6 @@ impl PrismPackedWeight {
                 host_scales: device.is_cpu().then(|| Arc::from(scale_host)),
             },
             metadata,
-            row_map,
-            gdn,
             device,
         )
     }
@@ -233,30 +243,35 @@ impl PrismPackedWeight {
         };
         Self::new(
             name,
-            rows,
-            input_width,
+            PackedGeometry {
+                rows,
+                input_width,
+                row_map,
+                gdn,
+            },
             PackedStorage::Gguf {
                 kind,
                 bytes,
                 host_bytes,
             },
             metadata,
-            row_map,
-            gdn,
             device.clone(),
         )
     }
 
     fn new(
         name: String,
-        rows: usize,
-        input_width: usize,
+        geometry: PackedGeometry,
         storage: PackedStorage,
         metadata: &PrismHadamardMetadata,
-        row_map: Option<GdnRowMap>,
-        gdn: Option<GdnLayout>,
         device: Device,
     ) -> Result<Self> {
+        let PackedGeometry {
+            rows,
+            input_width,
+            row_map,
+            gdn,
+        } = geometry;
         metadata
             .validate()
             .map_err(|e| prism_err("Hadamard metadata", e))?;
