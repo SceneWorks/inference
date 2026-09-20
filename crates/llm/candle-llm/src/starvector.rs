@@ -241,7 +241,8 @@ impl StarVectorConfig {
     }
 }
 
-/// Read and validate `config.json` only.  This deliberately never opens a safetensors shard.
+/// Read and validate `config.json` only. This accepts either a snapshot directory or a direct
+/// config path and deliberately never opens a safetensors shard.
 pub fn read_config(dir: impl AsRef<Path>) -> Result<StarVectorConfig> {
     let source = dir.as_ref();
     let path = if source.is_dir() {
@@ -255,9 +256,13 @@ pub fn read_config(dir: impl AsRef<Path>) -> Result<StarVectorConfig> {
     StarVectorConfig::from_json(&value)
 }
 
-/// Weightless registry probe for the exact 1B snapshot.
+/// Weightless registry probe for the exact 1B snapshot directory.
 pub fn can_load_path(dir: impl AsRef<Path>) -> bool {
-    read_config(dir).is_ok()
+    can_load_path_with(dir.as_ref(), |path| read_config(path).is_ok())
+}
+
+fn can_load_path_with(dir: &Path, read_config: impl FnOnce(&Path) -> bool) -> bool {
+    dir.is_dir() && read_config(dir)
 }
 
 /// StarVector's published image processor: pad RGB to a white square, bicubic-resize to 224, and
@@ -668,6 +673,7 @@ mod tests {
     use core_llm::{StarVectorBoundedStream, StarVectorProvider, StarVectorStreamEvent, TextLlm};
     use core_llm_testkit::{starvector_conformance, StarVectorProfile};
     use serde_json::json;
+    use std::cell::Cell;
 
     fn exact_config() -> Value {
         json!({
@@ -1184,5 +1190,25 @@ mod tests {
         std::fs::write(root.path().join("config.json"), wrong.to_string()).unwrap();
         assert!(!can_load_path(root.path()));
         assert!(crate::text_registry().unwrap().find(PROVIDER_ID).is_some());
+    }
+
+    #[test]
+    fn model_probe_rejects_file_sources_before_reading_them() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), exact_config().to_string()).unwrap();
+        assert!(
+            read_config(file.path()).is_ok(),
+            "direct config parsing remains supported"
+        );
+
+        let read_attempted = Cell::new(false);
+        let result = can_load_path_with(file.path(), |_| {
+            read_attempted.set(true);
+            true
+        });
+
+        assert!(!result);
+        assert!(!read_attempted.get(), "file payload must not be read");
+        assert!(!can_load_path(file.path()));
     }
 }

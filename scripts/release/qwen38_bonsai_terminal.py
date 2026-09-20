@@ -13,6 +13,7 @@ import ctypes
 import getpass
 import hashlib
 import json
+import math
 import os
 import platform
 import shutil
@@ -281,6 +282,99 @@ def nvidia_sample(pid: int) -> tuple[int | None, str | None]:
         total += int(fields[1]) * 1024 * 1024
         found = True
     return (total, None) if found else (None, "process not reported by nvidia-smi")
+
+
+def bounded_interval_samples(
+    samples: list[dict[str, Any]],
+    interval: dict[str, Any],
+    *,
+    run_id: str,
+    process_id: int,
+    scope: str,
+    unavailable_reason: str,
+) -> dict[str, Any]:
+    """Retain only complete same-process samples captured inside one selected-case interval."""
+    started = interval["started_unix_seconds"]
+    ended = interval["ended_unix_seconds"]
+    contained = [
+        sample
+        for sample in samples
+        if sample.get("run_id") == run_id
+        and sample.get("process_id") == process_id
+        and sample.get("started_unix_seconds", math.inf) >= started
+        and sample.get("ended_unix_seconds", -math.inf) <= ended
+    ]
+    if not contained:
+        return {
+            "available": False,
+            "scope": scope,
+            "samples": [],
+            "peak_bytes": None,
+            "first_sample_bytes": None,
+            "observed_growth_from_first_sample_bytes": None,
+            "unavailable_reason": unavailable_reason,
+        }
+    values = [sample["bytes"] for sample in contained]
+    peak = max(values)
+    first = contained[0]["bytes"]
+    return {
+        "available": True,
+        "scope": scope,
+        "samples": contained,
+        "peak_bytes": peak,
+        "first_sample_bytes": first,
+        "observed_growth_from_first_sample_bytes": peak - first,
+        "unavailable_reason": None,
+    }
+
+
+def case_memory_evidence(
+    provider: dict[str, Any],
+    rss_samples: list[dict[str, Any]],
+    gpu_samples: list[dict[str, Any]],
+    *,
+    run_id: str,
+    process_id: int,
+) -> list[dict[str, Any]]:
+    evidence = []
+    for case in provider.get("cases", []):
+        interval = case.get("measurement_interval", {})
+        eligible = case.get("request_peak_claim_eligible") is True
+        evidence.append(
+            {
+                "case_id": case.get("case_id"),
+                "model_id": provider.get("model_id"),
+                "run_id": run_id,
+                "process_id": process_id,
+                "measurement_interval": interval,
+                "request_peak_claim_eligible": eligible,
+                "rss": bounded_interval_samples(
+                    rss_samples,
+                    interval,
+                    run_id=run_id,
+                    process_id=process_id,
+                    scope=(
+                        "sampled_process_working_set_within_selected_request_lower_bound"
+                        if eligible
+                        else "sampled_process_working_set_within_selected_case_including_recovery_lower_bound"
+                    ),
+                    unavailable_reason="no complete RSS sample fell within the selected case interval",
+                ),
+                "gpu": bounded_interval_samples(
+                    gpu_samples,
+                    interval,
+                    run_id=run_id,
+                    process_id=process_id,
+                    scope=(
+                        "sampled_per_process_gpu_within_selected_request_lower_bound"
+                        if eligible
+                        else "sampled_per_process_gpu_within_selected_case_including_recovery_lower_bound"
+                    ),
+                    unavailable_reason="no complete per-process GPU sample fell within the selected case interval",
+                ),
+            }
+        )
+    return evidence
 
 
 def nvidia_hardware() -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
@@ -748,6 +842,8 @@ def run(args: argparse.Namespace) -> int:
 
     started_wall = time.time()
     started = time.monotonic()
+    run_id = hashlib.sha256(os.urandom(32)).hexdigest()
+    env["BONSAI_COMPARISON_RUN_ID"] = run_id
     rss_samples: list[dict[str, Any]] = []
     gpu_samples: list[dict[str, Any]] = []
     gpu_reasons: list[str] = []
@@ -768,12 +864,34 @@ def run(args: argparse.Namespace) -> int:
             proc = subprocess.Popen(command, stdout=stdout, stderr=stderr, env=env)
             while proc.poll() is None:
                 elapsed = time.monotonic() - started
+                rss_started = time.time()
                 rss = rss_bytes(proc.pid)
+                rss_ended = time.time()
                 if rss is not None:
-                    rss_samples.append({"seconds": elapsed, "bytes": rss})
+                    rss_samples.append(
+                        {
+                            "seconds": elapsed,
+                            "started_unix_seconds": rss_started,
+                            "ended_unix_seconds": rss_ended,
+                            "run_id": run_id,
+                            "process_id": proc.pid,
+                            "bytes": rss,
+                        }
+                    )
+                gpu_started = time.time()
                 gpu, reason = nvidia_sample(proc.pid)
+                gpu_ended = time.time()
                 if gpu is not None:
-                    gpu_samples.append({"seconds": elapsed, "bytes": gpu})
+                    gpu_samples.append(
+                        {
+                            "seconds": elapsed,
+                            "started_unix_seconds": gpu_started,
+                            "ended_unix_seconds": gpu_ended,
+                            "run_id": run_id,
+                            "process_id": proc.pid,
+                            "bytes": gpu,
+                        }
+                    )
                 elif reason:
                     gpu_reasons.append(reason)
                 time.sleep(args.sample_interval)
@@ -784,6 +902,18 @@ def run(args: argparse.Namespace) -> int:
     verify_snapshot(model, args.snapshot)
     after = snapshot_inventory(model, args.snapshot)
     provider = json.loads(provider_path.read_text(encoding="utf-8")) if provider_path.is_file() else None
+    selected_process_id = proc.pid if proc is not None else None
+    per_case_memory = (
+        case_memory_evidence(
+            provider,
+            rss_samples,
+            gpu_samples,
+            run_id=run_id,
+            process_id=selected_process_id,
+        )
+        if provider is not None and selected_process_id is not None
+        else []
+    )
     completed = (
         interrupted is None
         and exit_code == 0
@@ -842,12 +972,16 @@ def run(args: argparse.Namespace) -> int:
         "process": {
             "exit_code": exit_code,
             "interrupted_by": interrupted,
+            "run_id": run_id,
+            "process_id": selected_process_id,
             "rss_scope": "sampled_process_working_set_lower_bound",
             "sample_interval_seconds": args.sample_interval,
             "rss_samples": rss_samples,
             "peak_rss_bytes": max((sample["bytes"] for sample in rss_samples), default=None),
         },
         "gpu": {
+            "run_id": run_id,
+            "process_id": selected_process_id,
             "scope": "nvidia_smi_per_process_sampled_lower_bound",
             "available": bool(gpu_samples),
             "unavailable_reason": None if gpu_samples else (gpu_reasons[-1] if gpu_reasons else "no samples"),
@@ -855,6 +989,7 @@ def run(args: argparse.Namespace) -> int:
             "peak_bytes": max((sample["bytes"] for sample in gpu_samples), default=None),
             "admission_recheck": gpu_recheck,
         },
+        "case_memory": per_case_memory,
         "provider_evidence": "provider.json" if provider_path.is_file() else None,
         "artifact_manifest_sha256": sha256(output / "artifact-manifest.json"),
     }
@@ -954,6 +1089,87 @@ def validate_preserve_thinking_evidence(case: dict[str, Any], root: Path) -> Non
         raise ValueError(f"preserve_thinking aggregate evidence is inconsistent in {root}")
 
 
+def request_has_media(request: dict[str, Any]) -> bool:
+    messages = request.get("messages", []) if isinstance(request, dict) else []
+    return any(
+        part.get("type") in {"image", "video"}
+        for message in messages
+        if isinstance(message, dict)
+        for part in message.get("content", [])
+        if isinstance(part, dict)
+    )
+
+
+def valid_interval_identity(
+    interval: dict[str, Any], *, run_id: str, process_id: int, model_id: str
+) -> bool:
+    started = interval.get("started_unix_seconds")
+    ended = interval.get("ended_unix_seconds")
+    return (
+        interval.get("run_id") == run_id
+        and interval.get("process_id") == process_id
+        and interval.get("model_id") == model_id
+        and isinstance(started, (int, float))
+        and isinstance(ended, (int, float))
+        and math.isfinite(started)
+        and math.isfinite(ended)
+        and started <= ended
+    )
+
+
+def validate_sample_set(
+    evidence: dict[str, Any],
+    interval: dict[str, Any],
+    *,
+    run_id: str,
+    process_id: int,
+    allowed_scopes: set[str],
+    root: Path,
+) -> None:
+    if evidence.get("scope") not in allowed_scopes:
+        raise ValueError(f"sampled memory scope is unknown in {root}")
+    samples = evidence.get("samples")
+    if not isinstance(samples, list):
+        raise ValueError(f"sampled memory rows are missing in {root}")
+    for sample in samples:
+        if (
+            not isinstance(sample, dict)
+            or sample.get("run_id") != run_id
+            or sample.get("process_id") != process_id
+            or type(sample.get("bytes")) is not int
+            or sample["bytes"] < 0
+            or not isinstance(sample.get("started_unix_seconds"), (int, float))
+            or not isinstance(sample.get("ended_unix_seconds"), (int, float))
+            or not math.isfinite(sample["started_unix_seconds"])
+            or not math.isfinite(sample["ended_unix_seconds"])
+            or sample["started_unix_seconds"] < interval["started_unix_seconds"]
+            or sample["ended_unix_seconds"] > interval["ended_unix_seconds"]
+            or sample["started_unix_seconds"] > sample["ended_unix_seconds"]
+        ):
+            raise ValueError(f"sampled memory row crosses its request identity or interval in {root}")
+    if evidence.get("available") is True:
+        if not samples:
+            raise ValueError(f"sampled memory is marked available without samples in {root}")
+        values = [sample["bytes"] for sample in samples]
+        if (
+            evidence.get("peak_bytes") != max(values)
+            or evidence.get("first_sample_bytes") != values[0]
+            or evidence.get("observed_growth_from_first_sample_bytes")
+            != max(values) - values[0]
+            or evidence.get("unavailable_reason") is not None
+        ):
+            raise ValueError(f"sampled memory aggregate is inconsistent in {root}")
+    elif (
+        evidence.get("available") is not False
+        or samples
+        or evidence.get("peak_bytes") is not None
+        or evidence.get("first_sample_bytes") is not None
+        or evidence.get("observed_growth_from_first_sample_bytes") is not None
+        or not evidence.get("unavailable_reason")
+    ):
+        raise ValueError(f"unavailable sampled memory fabricates a value in {root}")
+
+
 def validate_receipt(
     root: Path,
     *,
@@ -997,11 +1213,71 @@ def validate_receipt(
             selected_projector["sha256"]
         ) != 64:
             raise ValueError(f"selected GGUF projector identity is missing in {root}")
-    if receipt.get("process", {}).get("peak_rss_bytes") is None:
+    process = receipt.get("process", {})
+    run_id = process.get("run_id")
+    process_id = process.get("process_id")
+    if (
+        not isinstance(run_id, str)
+        or len(run_id) != 64
+        or any(character not in "0123456789abcdef" for character in run_id)
+        or type(process_id) is not int
+        or process_id <= 0
+        or process.get("rss_scope") != "sampled_process_working_set_lower_bound"
+        or process.get("peak_rss_bytes") is None
+    ):
         raise ValueError(f"missing sampled process RSS in {root}")
+    rss_samples = process.get("rss_samples")
+    if not isinstance(rss_samples, list) or not rss_samples:
+        raise ValueError(f"missing raw process RSS samples in {root}")
+    for sample in rss_samples:
+        if (
+            not isinstance(sample, dict)
+            or sample.get("run_id") != run_id
+            or sample.get("process_id") != process_id
+            or type(sample.get("bytes")) is not int
+            or sample["bytes"] < 0
+            or not isinstance(sample.get("started_unix_seconds"), (int, float))
+            or not isinstance(sample.get("ended_unix_seconds"), (int, float))
+            or not math.isfinite(sample["started_unix_seconds"])
+            or not math.isfinite(sample["ended_unix_seconds"])
+            or sample["started_unix_seconds"] > sample["ended_unix_seconds"]
+        ):
+            raise ValueError(f"process RSS sample identity is invalid in {root}")
+    if process["peak_rss_bytes"] != max(sample["bytes"] for sample in rss_samples):
+        raise ValueError(f"process RSS peak does not match raw samples in {root}")
     gpu = receipt.get("gpu", {})
+    if (
+        gpu.get("run_id") != run_id
+        or gpu.get("process_id") != process_id
+        or gpu.get("scope") != "nvidia_smi_per_process_sampled_lower_bound"
+    ):
+        raise ValueError(f"GPU sample identity or scope is invalid in {root}")
     if not gpu.get("available") and not gpu.get("unavailable_reason"):
         raise ValueError(f"GPU counter is neither measured nor explicitly unavailable: {root}")
+    gpu_samples = gpu.get("samples")
+    if not isinstance(gpu_samples, list):
+        raise ValueError(f"GPU raw samples are missing in {root}")
+    for sample in gpu_samples:
+        if (
+            not isinstance(sample, dict)
+            or sample.get("run_id") != run_id
+            or sample.get("process_id") != process_id
+            or type(sample.get("bytes")) is not int
+            or sample["bytes"] < 0
+            or not isinstance(sample.get("started_unix_seconds"), (int, float))
+            or not isinstance(sample.get("ended_unix_seconds"), (int, float))
+            or not math.isfinite(sample["started_unix_seconds"])
+            or not math.isfinite(sample["ended_unix_seconds"])
+            or sample["started_unix_seconds"] > sample["ended_unix_seconds"]
+        ):
+            raise ValueError(f"GPU sample identity is invalid in {root}")
+    if gpu.get("available") is True:
+        if not gpu_samples or gpu.get("peak_bytes") != max(
+            sample["bytes"] for sample in gpu_samples
+        ) or gpu.get("unavailable_reason") is not None:
+            raise ValueError(f"GPU peak does not match raw samples in {root}")
+    elif gpu_samples or gpu.get("peak_bytes") is not None:
+        raise ValueError(f"unavailable GPU samples fabricate a value in {root}")
     provider_name = receipt.get("provider_evidence")
     if not provider_name:
         raise ValueError(f"missing provider evidence link in {root}")
@@ -1016,6 +1292,8 @@ def validate_receipt(
     ):
         if provider.get(field) != expected:
             raise ValueError(f"provider {field} does not match enclosing receipt in {root}")
+    if provider.get("run_id") != run_id or provider.get("process_id") != process_id:
+        raise ValueError(f"provider process identity does not match enclosing receipt in {root}")
     if provider.get("context_admission", {}).get("evidence_complete") is not True:
         raise ValueError(f"provider lacks a genuine context admission rejection in {root}")
     resource = provider.get("resource_admission", {})
@@ -1048,6 +1326,7 @@ def validate_receipt(
     memory_points = [
         provider.get("native_memory_before_load"),
         provider.get("native_memory_after_load"),
+        provider.get("native_memory_before_unload"),
         provider.get("native_memory_after_unload"),
     ]
     if any(not isinstance(point, dict) or not point for point in memory_points):
@@ -1065,12 +1344,28 @@ def validate_receipt(
     if expected_device is not None and device != expected_device:
         raise ValueError(f"native device does not match matrix cell in {root}")
     if backend == "mlx":
-        if any(not isinstance(point.get("peak_active_bytes"), int) for point in memory_points):
+        expected_scopes = (
+            "pre_load_interval_since_explicit_reset",
+            "load_interval_since_explicit_reset",
+            "preceding_interval_since_explicit_reset",
+            "unload_interval_since_explicit_reset",
+        )
+        if any(
+            type(point.get("peak_active_bytes")) is not int
+            or point["peak_active_bytes"] < 0
+            or point.get("peak_metric") != "native_active_allocator_bytes"
+            or point.get("peak_scope") != scope
+            for point, scope in zip(memory_points, expected_scopes)
+        ):
             raise ValueError(f"MLX allocator peak is unavailable in {root}")
     elif backend == "candle":
         if any(
             point.get("native_allocator_counters_available") is not False
             or not point.get("memory_evidence")
+            or point.get("peak_active_bytes") is not None
+            or point.get("peak_scope") != "unavailable"
+            or point.get("peak_metric") is not None
+            or not point.get("peak_unavailable_reason")
             for point in memory_points
         ):
             raise ValueError(f"Candle memory gap is not explicit in {root}")
@@ -1079,18 +1374,312 @@ def validate_receipt(
     cases = provider.get("cases")
     if not isinstance(cases, list) or not cases:
         raise ValueError(f"provider evidence has no cases in {root}")
-    for case in cases:
-        if case.get("case_id") == "preserve_thinking":
-            validate_preserve_thinking_evidence(case, root)
+    context_ids = {"context_64": 64, "context_512": 512, "context_2048": 2048}
+    completed_context = False
+    summary = provider.get("native_memory_summary", {})
+    expected_summary_scope = (
+        "maximum_of_explicitly_reset_intervals" if backend == "mlx" else "unavailable"
+    )
+    expected_coverage = [
+        {"kind": "pre_load"},
+        {"kind": "load"},
+        {"kind": "forced_budget_probe"},
+        *[
+            {
+                "kind": "selected_case_including_recovery"
+                if case.get("status") == "resource_declined"
+                else "selected_case",
+                "case_id": case.get("case_id"),
+            }
+            for case in cases
+        ],
+        {"kind": "context_admission_probe"},
+        {"kind": "unload"},
+    ]
+    if (
+        summary.get("peak_scope") != expected_summary_scope
+        or summary.get("coverage") != expected_coverage
+        or not summary.get("coverage_note")
+    ):
+        raise ValueError(f"native whole-row memory scope is incomplete in {root}")
+    if backend == "mlx":
+        if (
+            type(summary.get("peak_active_bytes")) is not int
+            or summary["peak_active_bytes"] < 0
+            or summary.get("peak_metric") != "native_active_allocator_bytes"
+            or summary.get("unavailable_reason") is not None
+        ):
+            raise ValueError(f"MLX whole-row peak is malformed in {root}")
+    elif (
+        summary.get("peak_active_bytes") is not None
+        or summary.get("peak_metric") is not None
+        or not summary.get("unavailable_reason")
+    ):
+        raise ValueError(f"Candle whole-row peak fabricates native evidence in {root}")
+    case_memory_rows = receipt.get("case_memory")
+    if not isinstance(case_memory_rows, list):
+        raise ValueError(f"receipt lacks per-case sampled memory in {root}")
+    case_memory_by_id = {row.get("case_id"): row for row in case_memory_rows if isinstance(row, dict)}
+    if len(case_memory_by_id) != len(case_memory_rows):
+        raise ValueError(f"receipt per-case sampled memory identities are duplicated in {root}")
+
+    def validate_native_point(point: Any, expected_scope: str) -> int | None:
+        if (
+            not isinstance(point, dict)
+            or point.get("backend") != backend
+            or point.get("device") != device
+        ):
+            raise ValueError(f"native case memory identity changed in {root}")
+        if backend == "mlx":
+            if (
+                point.get("peak_scope") != expected_scope
+                or point.get("peak_metric") != "native_active_allocator_bytes"
+                or type(point.get("peak_active_bytes")) is not int
+                or point["peak_active_bytes"] < 0
+                or type(point.get("active_bytes")) is not int
+                or point["active_bytes"] < 0
+                or type(point.get("cache_bytes")) is not int
+                or point["cache_bytes"] < 0
+            ):
+                raise ValueError(f"MLX case peak scope or counters are malformed in {root}")
+            return point["peak_active_bytes"]
+        if (
+            point.get("peak_scope") != "unavailable"
+            or point.get("peak_metric") is not None
+            or point.get("peak_active_bytes") is not None
+            or point.get("native_allocator_counters_available") is not False
+            or not point.get("peak_unavailable_reason")
+        ):
+            raise ValueError(f"Candle case memory gap is not explicit in {root}")
+        return None
+
+    observed_native_peaks = [
+        peak
+        for point, scope in zip(
+            memory_points,
+            (
+                "pre_load_interval_since_explicit_reset",
+                "load_interval_since_explicit_reset",
+                "preceding_interval_since_explicit_reset",
+                "unload_interval_since_explicit_reset",
+            ),
+        )
+        if (peak := validate_native_point(point, scope)) is not None
+    ]
+
+    def validate_interval_record(
+        record: dict[str, Any], expected_kind: str, after_scope: str
+    ) -> None:
+        interval = record.get("measurement_interval")
+        if not isinstance(interval, dict) or not valid_interval_identity(
+            interval, run_id=run_id, process_id=process_id, model_id=model.get("id")
+        ) or interval.get("kind") != expected_kind:
+            raise ValueError(f"native measurement interval identity is invalid in {root}")
+        before_peak = validate_native_point(
+            record.get("native_memory_before_case"),
+            "preceding_interval_since_explicit_reset",
+        )
+        after_peak = validate_native_point(record.get("native_memory_after_case"), after_scope)
+        if before_peak is not None:
+            observed_native_peaks.append(before_peak)
+        if after_peak is not None:
+            observed_native_peaks.append(after_peak)
+
+    validate_interval_record(
+        probe,
+        "forced_budget_probe",
+        "forced_budget_probe_interval_since_explicit_reset",
+    )
+    validate_interval_record(
+        provider.get("context_admission", {}),
+        "context_admission_probe",
+        "context_admission_probe_interval_since_explicit_reset",
+    )
+
+    def validate_completed_case(case: dict[str, Any], label: str) -> None:
         if case.get("status") != "completed" or case.get("evidence_complete") is not True:
-            raise ValueError(f"case {case.get('case_id')} has broken evidence in {root}")
+            raise ValueError(f"{label} has broken evidence in {root}")
         for phase in ("prefill_seconds", "decode_seconds"):
             value = case.get(phase)
             if not isinstance(value, (int, float)) or value < 0:
-                raise ValueError(f"case {case.get('case_id')} lacks {phase} in {root}")
+                raise ValueError(f"{label} lacks {phase} in {root}")
         output = case.get("output", {})
         if not isinstance(output.get("prompt_tokens"), int) or output["prompt_tokens"] <= 0:
-            raise ValueError(f"case {case.get('case_id')} lacks exact prompt tokens in {root}")
+            raise ValueError(f"{label} lacks exact prompt tokens in {root}")
+
+    for case in cases:
+        case_id = case.get("case_id")
+        includes_recovery = case.get("status") == "resource_declined"
+        expected_kind = (
+            "selected_case_including_recovery" if includes_recovery else "selected_case"
+        )
+        if case.get("request_peak_claim_eligible") is not (not includes_recovery):
+            raise ValueError(f"case {case_id} has an invalid request-peak claim in {root}")
+        validate_interval_record(
+            case,
+            expected_kind,
+            (
+                "selected_case_including_recovery_interval_since_explicit_reset"
+                if includes_recovery
+                else "selected_case_interval_since_explicit_reset"
+            ),
+        )
+        sampled = case_memory_by_id.get(case_id)
+        interval = case.get("measurement_interval", {})
+        if (
+            not isinstance(sampled, dict)
+            or sampled.get("model_id") != model.get("id")
+            or sampled.get("run_id") != run_id
+            or sampled.get("process_id") != process_id
+            or sampled.get("measurement_interval") != interval
+            or sampled.get("request_peak_claim_eligible") is not (not includes_recovery)
+        ):
+            raise ValueError(f"case {case_id} sampled memory identity is invalid in {root}")
+        validate_sample_set(
+            sampled.get("rss", {}),
+            interval,
+            run_id=run_id,
+            process_id=process_id,
+            allowed_scopes={
+                "sampled_process_working_set_within_selected_request_lower_bound"
+                if not includes_recovery
+                else "sampled_process_working_set_within_selected_case_including_recovery_lower_bound"
+            },
+            root=root,
+        )
+        validate_sample_set(
+            sampled.get("gpu", {}),
+            interval,
+            run_id=run_id,
+            process_id=process_id,
+            allowed_scopes={
+                "sampled_per_process_gpu_within_selected_request_lower_bound"
+                if not includes_recovery
+                else "sampled_per_process_gpu_within_selected_case_including_recovery_lower_bound"
+            },
+            root=root,
+        )
+        if case.get("case_id") == "preserve_thinking":
+            validate_preserve_thinking_evidence(case, root)
+        if case.get("status") == "completed":
+            validate_completed_case(case, f"case {case_id}")
+            requires_e7_memory = case.get("category") == "context" or request_has_media(
+                case.get("request", {})
+            )
+            native_request_peak = case.get("native_memory_after_case", {}).get(
+                "peak_active_bytes"
+            )
+            has_native_request_peak = (
+                backend == "mlx"
+                and type(native_request_peak) is int
+                and case.get("native_memory_after_case", {}).get("peak_scope")
+                == "selected_case_interval_since_explicit_reset"
+            )
+            if requires_e7_memory and not (
+                has_native_request_peak or sampled.get("rss", {}).get("available") is True
+            ):
+                raise ValueError(f"required E7 case {case_id} lacks bounded memory evidence in {root}")
+            completed_context |= case_id in context_ids and case.get("category") == "context"
+            continue
+        if case.get("status") != "resource_declined":
+            raise ValueError(f"case {case_id} has broken evidence in {root}")
+        if case_id not in context_ids or case.get("category") != "context":
+            raise ValueError(f"non-context case {case_id} cannot be resource declined in {root}")
+        admission = case.get("resource_admission")
+        request = case.get("request", {})
+        descriptor_limit = provider.get("provider", {}).get("max_context_tokens")
+        integer_fields = (
+            "prompt_tokens",
+            "max_new_tokens",
+            "max_context_tokens",
+            "required_bytes",
+            "available_bytes",
+        )
+        if (
+            case.get("evidence_complete") is not True
+            or not isinstance(admission, dict)
+            or admission.get("preallocation_rejected") is not True
+            or any(
+                type(admission.get(field)) is not int or admission[field] < 0
+                for field in integer_fields
+            )
+            or admission["prompt_tokens"] <= 0
+            or admission["max_new_tokens"] != request.get("max_new_tokens")
+            or admission["max_context_tokens"] != descriptor_limit
+            or admission["prompt_tokens"] + admission["max_new_tokens"]
+            > admission["max_context_tokens"]
+            or admission["required_bytes"] <= admission["available_bytes"]
+        ):
+            raise ValueError(f"context resource decline is malformed in {root}")
+        expected_error = (
+            f"estimated {admission['required_bytes']} bytes of native workspace but only "
+            f"{admission['available_bytes']} bytes are available"
+        )
+        if expected_error not in case.get("error", ""):
+            raise ValueError(f"context resource decline error is unbound in {root}")
+        forbidden = (
+            "output",
+            "quality_passed",
+            "functional_acceptance_passed",
+            "stream_contract_passed",
+            "total_seconds",
+            "time_to_first_token_seconds",
+            "time_to_first_token_unavailable_reason",
+            "prefill_seconds",
+            "decode_seconds",
+        )
+        if any(field in case for field in forbidden) or case.get("events") != []:
+            raise ValueError(f"context resource decline fabricates execution evidence in {root}")
+        recovery = case.get("recovery")
+        if not isinstance(recovery, dict):
+            raise ValueError(f"context resource decline lacks recovery in {root}")
+        recovery_id = recovery.get("case_id")
+        matching = [
+            candidate
+            for candidate in cases
+            if candidate.get("case_id") == recovery_id
+            and candidate.get("category") == "context"
+        ]
+        if (
+            recovery_id not in context_ids
+            or context_ids[recovery_id] >= context_ids[case_id]
+            or len(matching) != 1
+            or recovery.get("request") != matching[0].get("request")
+        ):
+            raise ValueError(f"context resource decline recovery is not a selected shorter row in {root}")
+        validate_completed_case(recovery, f"context recovery {recovery_id}")
+        output = recovery["output"]
+        events = recovery.get("events")
+        if not isinstance(output, dict) or not isinstance(events, list) or any(
+            not isinstance(event, dict) for event in events
+        ):
+            raise ValueError(f"context resource decline recovery is incomplete in {root}")
+        tokens = [event for event in events if event.get("event") == "token"]
+        done = [event for event in events if event.get("event") == "done"]
+        content = "".join(event.get("text", "") for event in tokens if event.get("channel") == "Content")
+        thinking = "".join(event.get("text", "") for event in tokens if event.get("channel") == "Thinking")
+        indexes = [event.get("index") for event in tokens]
+        exact_stream = (
+            recovery.get("stream_contract_passed") is True
+            and type(output.get("generated_tokens")) is int
+            and len(done) == 1
+            and done[0].get("prompt_tokens") == output.get("prompt_tokens")
+            and done[0].get("generated_tokens") == output.get("generated_tokens")
+            and done[0].get("finish_reason") == output.get("finish_reason")
+            and all(type(index) is int for index in indexes)
+            and indexes == sorted(indexes)
+            and len(indexes) == len(set(indexes))
+            and content == output.get("text", "")
+            and thinking == (output.get("thinking") or "")
+        )
+        if not exact_stream or output["prompt_tokens"] >= admission["prompt_tokens"]:
+            raise ValueError(f"context resource decline recovery is incomplete in {root}")
+    if any(case.get("category") == "context" for case in cases) and not completed_context:
+        raise ValueError(f"provider lacks a successful real context row in {root}")
+    if set(case_memory_by_id) != {case.get("case_id") for case in cases}:
+        raise ValueError(f"receipt per-case sampled memory rows do not match provider cases in {root}")
+    if backend == "mlx" and summary.get("peak_active_bytes") != max(observed_native_peaks):
+        raise ValueError(f"MLX whole-row peak does not match interval maxima in {root}")
     return receipt, provider
 
 
@@ -1132,8 +1721,87 @@ def validate(args: argparse.Namespace) -> int:
             raise ValueError(f"unequal requests or budgets for {receipt['model']['id']}")
     categories: dict[str, list[dict[str, Any]]] = {}
     raw_outputs: list[dict[str, Any]] = []
+    resource_declines: list[dict[str, Any]] = []
+    e7_memory_rows: list[dict[str, Any]] = []
+
+    def memory_report(
+        receipt: dict[str, Any], provider: dict[str, Any], case: dict[str, Any]
+    ) -> dict[str, Any]:
+        sampled = next(
+            row for row in receipt["case_memory"] if row["case_id"] == case["case_id"]
+        )
+        before = case["native_memory_before_case"]
+        after = case["native_memory_after_case"]
+        eligible = case["request_peak_claim_eligible"] is True
+        if provider["provider"]["backend"] == "mlx" and eligible:
+            peak = after["peak_active_bytes"]
+            active_before = before["active_bytes"]
+            increment = peak - active_before if peak >= active_before else None
+            native = {
+                "available": True,
+                "metric": "native_active_allocator_bytes",
+                "scope": "selected_case_interval_since_explicit_reset",
+                "peak_bytes": peak,
+                "active_bytes_before": active_before,
+                "active_bytes_after": after["active_bytes"],
+                "cache_bytes_before": before["cache_bytes"],
+                "cache_bytes_after": after["cache_bytes"],
+                "peak_increment_over_before_active_bytes": increment,
+                "increment_unavailable_reason": None
+                if increment is not None
+                else "request interval peak did not reach the point-in-time pre-case active bytes",
+            }
+        else:
+            combined_peak = (
+                after.get("peak_active_bytes")
+                if provider["provider"]["backend"] == "mlx" and not eligible
+                else None
+            )
+            native = {
+                "available": False,
+                "metric": None,
+                "scope": "unavailable",
+                "peak_bytes": None,
+                "active_bytes_before": before.get("active_bytes"),
+                "active_bytes_after": after.get("active_bytes"),
+                "cache_bytes_before": before.get("cache_bytes"),
+                "cache_bytes_after": after.get("cache_bytes"),
+                "peak_increment_over_before_active_bytes": None,
+                "combined_interval_peak_bytes": combined_peak,
+                "combined_interval_scope": (
+                    after.get("peak_scope") if combined_peak is not None else None
+                ),
+                "increment_unavailable_reason": (
+                    "selected case includes a resource-declined request and its recovery"
+                    if not eligible
+                    else after.get("peak_unavailable_reason")
+                ),
+            }
+        return {
+            "request_peak_claim_eligible": eligible,
+            "measurement_interval": case["measurement_interval"],
+            "native": native,
+            "sampled_process_rss": sampled["rss"],
+            "sampled_process_gpu": sampled["gpu"],
+        }
+
     for receipt, provider in rows:
         for case in selected_cases(provider):
+            memory = memory_report(receipt, provider, case)
+            if case["status"] == "resource_declined":
+                resource_declines.append(
+                    {
+                        "model_id": receipt["model"]["id"],
+                        "case_id": case["case_id"],
+                        "category": case["category"],
+                        "request": case["request"],
+                        "resource_admission": case["resource_admission"],
+                        "recovery": case["recovery"],
+                        "combined_case_memory": memory,
+                        "memory_limitation": "memory interval includes the declined request and immediate recovery; it is not a declined-request peak",
+                    }
+                )
+                continue
             row = {
                 "model_id": receipt["model"]["id"],
                 "case_id": case["case_id"],
@@ -1144,9 +1812,21 @@ def validate(args: argparse.Namespace) -> int:
                 "prefill_seconds": case["prefill_seconds"],
                 "decode_seconds": case["decode_seconds"],
                 "output": case["output"],
+                "memory": memory,
             }
             categories.setdefault(case["category"], []).append(row)
             raw_outputs.append(row)
+            if case.get("category") == "context" or request_has_media(case.get("request", {})):
+                e7_memory_rows.append(
+                    {
+                        "model_id": row["model_id"],
+                        "case_id": row["case_id"],
+                        "category": row["category"],
+                        "prompt_tokens": row["prompt_tokens"],
+                        "request": case["request"],
+                        "memory": memory,
+                    }
+                )
     report = {
         "schema_version": 1,
         "suite": SUITE,
@@ -1164,13 +1844,18 @@ def validate(args: argparse.Namespace) -> int:
                 "runtime_sha": receipt["runtime"]["head_sha"],
                 "artifact_sizes": receipt["model"]["artifact_sizes"],
                 "peak_rss_bytes": receipt["process"]["peak_rss_bytes"],
+                "peak_rss_scope": receipt["process"]["rss_scope"],
                 "peak_gpu_bytes": receipt["gpu"]["peak_bytes"],
+                "peak_gpu_scope": receipt["gpu"]["scope"],
                 "gpu_unavailable_reason": receipt["gpu"]["unavailable_reason"],
+                "native_memory_summary": provider["native_memory_summary"],
             }
             for receipt, _ in rows
         ],
         "categories": categories,
         "raw_outputs": raw_outputs,
+        "e7_memory_rows": e7_memory_rows,
+        "resource_declines": resource_declines,
     }
     write_new(args.output, report)
     markdown = [
@@ -1187,7 +1872,38 @@ def validate(args: argparse.Namespace) -> int:
             f"{row['quality_passed']} | {row['prompt_tokens']} | {row['generated_tokens']} | "
             f"{row['prefill_seconds']:.6f} | {row['decode_seconds']:.6f} |"
         )
-    markdown.extend(["", "## Raw outputs", "", "```json", json.dumps(raw_outputs, indent=2, sort_keys=True), "```", ""])
+    if resource_declines:
+        markdown.extend(
+            [
+                "",
+                "## Resource limitations",
+                "",
+                "These architecturally valid context requests were rejected before native allocation and are not quality or latency samples.",
+                "",
+                "```json",
+                json.dumps(resource_declines, indent=2, sort_keys=True),
+                "```",
+            ]
+        )
+    markdown.extend(
+        [
+            "",
+            "## E7 memory evidence",
+            "",
+            "Native MLX peaks cover an explicitly reset selected-case interval. Candle rows use sampled process lower bounds; unavailable samples remain null with a reason. Resource-declined context rows are listed as limitations because their interval includes immediate recovery.",
+            "",
+            "```json",
+            json.dumps(e7_memory_rows, indent=2, sort_keys=True),
+            "```",
+            "",
+            "## Raw outputs",
+            "",
+            "```json",
+            json.dumps(raw_outputs, indent=2, sort_keys=True),
+            "```",
+            "",
+        ]
+    )
     args.markdown.parent.mkdir(parents=True, exist_ok=True)
     with args.markdown.open("x", encoding="utf-8", newline="\n") as handle:
         handle.write("\n".join(markdown))
@@ -1413,6 +2129,13 @@ def matrix_status(args: argparse.Namespace) -> int:
                         expected_case_ids = group_case_ids + acceptance_case_ids
                         if [case.get("case_id") for case in provider["cases"]] != expected_case_ids:
                             raise ValueError("run cases do not match matrix workload group")
+                        if group != "matched" and any(
+                            case.get("status") == "resource_declined"
+                            for case in provider["cases"]
+                        ):
+                            raise ValueError(
+                                "resource declines are only valid in the matched context ladder"
+                            )
                         accepted_ids = []
                         if groups[group].get("functional_acceptance") is True:
                             accepted_ids.extend(group_case_ids)

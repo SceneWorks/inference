@@ -72,7 +72,7 @@ pub use constraint::{
     Constraint, ConstraintDecodeTable, ConstraintKind, JsonConstraint, JsonState,
 };
 pub use detok::IncrementalDetok;
-pub use error::{Error, Result};
+pub use error::{Error, RequestResourceExhausted, Result};
 pub use message::{AudioRef, Content, ImageRef, Message, Role, VideoRef};
 pub use output::{
     Channel, FinishReason, GenerationTimings, MtpStats, StreamEvent, TextLlmOutput, Usage,
@@ -98,10 +98,10 @@ pub use request::{
     LoadSpec, MtpMode, Quantize, ReasoningEffort, Sampling, TextLlmRequest, ThinkingMode,
 };
 pub use resource::{
-    admit_request_memory, available_host_memory_bytes, checkpoint_payload_bytes,
-    checkpoint_staging_bytes, effective_memory_budget, estimate_chunked_request_bytes,
-    estimate_request_bytes, operational_memory_override, LlmMemoryGeometry,
-    AVAILABLE_MEMORY_OVERRIDE,
+    admit_request_memory, admit_request_memory_with_geometry, available_host_memory_bytes,
+    checkpoint_payload_bytes, checkpoint_staging_bytes, effective_memory_budget,
+    estimate_chunked_request_bytes, estimate_request_bytes, operational_memory_override,
+    LlmMemoryGeometry, AVAILABLE_MEMORY_OVERRIDE,
 };
 pub use schedule::{Scheduler, SeqId, SeqSpec};
 pub use speculative::{accept_greedy_run, accept_token, ngram_propose, Acceptance};

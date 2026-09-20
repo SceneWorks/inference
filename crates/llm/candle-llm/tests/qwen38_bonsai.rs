@@ -27,10 +27,13 @@ fn native_comparison() {
             serde_json::json!({
                 "backend":"candle",
                 "device":native_device,
+                "peak_active_bytes":null,
                 "native_allocator_counters_available":false,
+                "peak_unavailable_reason":"Candle exposes no portable native active-allocator peak counter",
                 "memory_evidence":"external process RSS and per-process CUDA samples required",
             })
         },
+        || false,
     )
     .expect("complete native comparison evidence");
 }
