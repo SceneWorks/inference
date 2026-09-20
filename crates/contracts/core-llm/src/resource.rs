@@ -198,6 +198,26 @@ pub fn checkpoint_payload_bytes(source: &std::path::Path) -> Result<u64> {
     Ok(total)
 }
 
+/// Largest checkpoint payload file loaded into a host buffer at one time.
+///
+/// Candle's safetensors loader processes a sharded directory sequentially: `std::fs::read` owns one
+/// shard buffer, its tensors are copied to the target device, and that buffer is dropped before the
+/// next shard. A single-file checkpoint has that file's full size as its staging requirement.
+pub fn checkpoint_staging_bytes(source: &std::path::Path) -> Result<u64> {
+    let io_error = |error: std::io::Error| Error::Load(format!("checkpoint admission: {error}"));
+    if source.is_file() {
+        return source.metadata().map(|m| m.len()).map_err(io_error);
+    }
+    let mut largest = 0u64;
+    for entry in std::fs::read_dir(source).map_err(io_error)? {
+        let path = entry.map_err(io_error)?.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("safetensors") {
+            largest = largest.max(path.metadata().map_err(io_error)?.len());
+        }
+    }
+    Ok(largest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,6 +238,10 @@ mod tests {
         let short = estimate_request_bytes(1024, 16, geometry, 0, 0).unwrap();
         let long = estimate_request_bytes(131_072, 16, geometry, 0, 0).unwrap();
         assert!(long > short * 1_000);
+        assert!(
+            admit_request_memory(long, 102_171_148_288).is_err(),
+            "architecturally valid long context must still fail closed when current capacity is insufficient"
+        );
         assert!(estimate_request_bytes(usize::MAX, u32::MAX, geometry, 0, 3).is_none());
     }
 
@@ -237,5 +261,16 @@ mod tests {
         assert!(error.contains("estimated 200 bytes"));
         assert!(error.contains("only 100 bytes are available"));
         assert!(error.contains("reduce prompt/media length or max_new_tokens"));
+    }
+
+    #[test]
+    fn checkpoint_counts_total_residency_and_peak_shard_staging_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("model-1.safetensors"), [0u8; 7]).unwrap();
+        std::fs::write(dir.path().join("model-2.safetensors"), [0u8; 11]).unwrap();
+        std::fs::write(dir.path().join("config.json"), [0u8; 23]).unwrap();
+
+        assert_eq!(checkpoint_payload_bytes(dir.path()).unwrap(), 18);
+        assert_eq!(checkpoint_staging_bytes(dir.path()).unwrap(), 11);
     }
 }

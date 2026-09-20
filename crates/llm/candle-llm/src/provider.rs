@@ -647,6 +647,7 @@ impl LlamaProvider {
         }
         let device = select_device().map_err(to_core)?;
         let payload = core_llm::checkpoint_payload_bytes(Path::new(&spec.source))?;
+        let staging = core_llm::checkpoint_staging_bytes(Path::new(&spec.source))?;
         let projector = spec
             .projector_source
             .as_ref()
@@ -657,22 +658,18 @@ impl LlamaProvider {
             || read_json(Path::new(&spec.source), "config.json").is_some_and(|c| {
                 c.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35")
             });
-        // CPU dense conversion retains source BF16 plus F32 tensors. Packed weights stay packed;
-        // projector conversion is bounded separately at four times its stored payload.
-        let host_factor = if packed || device.is_cuda() { 2 } else { 3 };
-        let host_required = payload
-            .checked_mul(host_factor)
-            .and_then(|v| v.checked_add(projector.checked_mul(4)?))
-            .ok_or_else(|| CoreError::Load("load memory estimate overflow".into()))?;
+        let (host_required, device_required) =
+            load_memory_requirements(payload, staging, projector, packed, device.is_cuda())
+                .ok_or_else(|| CoreError::Load("load memory estimate overflow".into()))?;
         let budget = core_llm::operational_memory_override()?;
-        let host_available =
-            core_llm::effective_memory_budget(core_llm::available_host_memory_bytes(), budget)?;
+        // A discrete CUDA launcher's override describes device headroom. Host staging is a separate
+        // allocation domain and must be checked against host capacity rather than GPU capacity.
+        let host_available = core_llm::effective_memory_budget(
+            core_llm::available_host_memory_bytes(),
+            host_load_budget(device.is_cuda(), budget),
+        )?;
         core_llm::admit_request_memory(host_required, host_available)?;
-        if device.is_cuda() {
-            let device_required = payload
-                .checked_add(payload / 4)
-                .and_then(|v| v.checked_add(projector.checked_mul(4)?))
-                .ok_or_else(|| CoreError::Load("device load memory estimate overflow".into()))?;
+        if let Some(device_required) = device_required {
             core_llm::admit_request_memory(device_required, request_available_memory(&device)?)?;
         }
 
@@ -1371,6 +1368,49 @@ impl LlamaProvider {
             deepstack,
         })
     }
+}
+
+/// Conservative load bounds for the two independent allocation domains.
+///
+/// Candle reads one safetensors shard into a host `Vec`, copies each tensor directly to CUDA at its
+/// stored dtype, and drops the shard buffer before reading the next shard. The dense Qwen3.8
+/// checkpoint is BF16 and `Tensor::to_dtype(BF16)` shares storage, so CUDA construction does not
+/// retain a second expanded language-weight copy. The largest shard is therefore the host staging
+/// bound; 25 percent device headroom covers constructor casts such as the BF16-to-F32 vision tower
+/// while source tensors are still alive. CPU dense conversion retains source tensors plus
+/// constructed F32 tensors. Packed CPU paths keep their existing two-copy upper bound, and external
+/// projectors retain the audited four-copy conversion allowance.
+fn load_memory_requirements(
+    payload: u64,
+    staging: u64,
+    projector: u64,
+    packed: bool,
+    cuda: bool,
+) -> Option<(u64, Option<u64>)> {
+    let projector_bound = projector.checked_mul(4)?;
+    let host = if cuda && !packed {
+        staging.checked_add(projector_bound)?
+    } else if packed {
+        payload.checked_mul(2)?.checked_add(projector_bound)?
+    } else {
+        payload.checked_mul(3)?.checked_add(projector_bound)?
+    };
+    let device = if cuda {
+        Some(
+            payload
+                .checked_add(payload / 4)?
+                .checked_add(projector_bound)?,
+        )
+    } else {
+        None
+    };
+    Some((host, device))
+}
+
+/// The process-wide override caps the execution-memory domain. On a discrete CUDA device, host
+/// source staging has its own measured capacity and must not be capped by a VRAM snapshot.
+fn host_load_budget(cuda: bool, budget: Option<u64>) -> Option<u64> {
+    (!cuda).then_some(budget).flatten()
 }
 
 fn request_available_memory(device: &Device) -> CoreResult<u64> {
@@ -2677,11 +2717,42 @@ pub fn can_load(spec: &LoadSpec) -> bool {
 mod tests {
     use super::{
         bonsai_sampling_defaults, can_load, can_load_vision, emit_content, eos_token_ids,
-        expand_vision_placeholders, merged_frame_timestamps, prompt_opens_thinking,
-        substitute_vision_placeholders, validate_context_window, video_placeholder_text, JsonMask,
+        expand_vision_placeholders, host_load_budget, load_memory_requirements,
+        merged_frame_timestamps, prompt_opens_thinking, substitute_vision_placeholders,
+        validate_context_window, video_placeholder_text, JsonMask,
     };
     use crate::decode::{ConstraintMask, RewindableConstraintMask};
     use core_llm::{ConstraintDecodeTable, Content, ImageRef, LoadSpec, Message, Role, VideoRef};
+
+    #[test]
+    fn dense_cuda_load_admission_separates_host_staging_from_current_vram() {
+        // Frozen Qwen3.8 parent inventory from release/qwen38-bonsai-artifacts.json. Candle reads
+        // the 18 shards serially; this is the total payload and the largest individual shard.
+        let payload = 55_563_006_776;
+        let largest_shard = 3_988_973_152;
+        let (host_required, device_required) =
+            load_memory_requirements(payload, largest_shard, 0, false, true).unwrap();
+
+        assert_eq!(host_required, largest_shard);
+        assert_eq!(device_required, Some(69_453_758_470));
+        assert_eq!(host_load_budget(true, Some(102_171_148_288)), None);
+
+        // A launch-time snapshot can cap but never inflate the current post-load CUDA capacity.
+        let current_free = 60_000_000_000;
+        let available =
+            core_llm::effective_memory_budget(Some(current_free), Some(102_171_148_288)).unwrap();
+        let error = core_llm::admit_request_memory(device_required.unwrap(), available)
+            .expect_err("current CUDA shortfall must fail closed");
+        assert!(error
+            .to_string()
+            .contains("only 60000000000 bytes are available"));
+    }
+
+    #[test]
+    fn load_memory_requirements_remain_checked() {
+        assert!(load_memory_requirements(u64::MAX, 1, 0, false, true).is_none());
+        assert!(load_memory_requirements(1, 1, u64::MAX, false, true).is_none());
+    }
 
     #[test]
     fn reasoning_boundary_commits_same_token_json_in_release_builds() {

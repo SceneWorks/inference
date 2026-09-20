@@ -99,8 +99,8 @@ pub use request::{
 };
 pub use resource::{
     admit_request_memory, available_host_memory_bytes, checkpoint_payload_bytes,
-    effective_memory_budget, estimate_request_bytes, operational_memory_override,
-    LlmMemoryGeometry, AVAILABLE_MEMORY_OVERRIDE,
+    checkpoint_staging_bytes, effective_memory_budget, estimate_request_bytes,
+    operational_memory_override, LlmMemoryGeometry, AVAILABLE_MEMORY_OVERRIDE,
 };
 pub use schedule::{Scheduler, SeqId, SeqSpec};
 pub use speculative::{accept_greedy_run, accept_token, ngram_propose, Acceptance};
