@@ -1414,16 +1414,81 @@ fn host_load_budget(cuda: bool, budget: Option<u64>) -> Option<u64> {
     (!cuda).then_some(budget).flatten()
 }
 
+/// Combine CUDA driver-free bytes with idle bytes retained by cudarc's asynchronous allocator.
+///
+/// `cuMemGetInfo` excludes memory reserved by the current CUDA memory pool, even when part of that
+/// reservation is unused and immediately reusable by this process. Admission must include that
+/// idle reservation without counting live pool allocations a second time. Invalid or internally
+/// inconsistent snapshots fail closed.
+#[cfg(any(feature = "cuda", test))]
+fn cuda_usable_memory_bytes(
+    driver_free: u64,
+    device_total: u64,
+    pool_usage: Option<(u64, u64)>,
+) -> Option<u64> {
+    if driver_free > device_total {
+        return None;
+    }
+    let Some((reserved, used)) = pool_usage else {
+        return Some(driver_free);
+    };
+    if used > reserved || reserved > device_total {
+        return None;
+    }
+    let free_plus_reserved = driver_free.checked_add(reserved)?;
+    if free_plus_reserved > device_total {
+        return None;
+    }
+    free_plus_reserved.checked_sub(used)
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_pool_usage(
+    context: &candle_core::cuda_backend::cudarc::driver::CudaContext,
+) -> Option<(u64, u64)> {
+    use candle_core::cuda_backend::cudarc::driver::{result, sys};
+
+    context.bind_to_thread().ok()?;
+    // SAFETY: the live context is bound to this thread, `cu_device` remains owned by it,
+    // `get_mem_pool` returns that device's live current pool, and both output pointers have the u64
+    // type required by these two CUDA attributes.
+    unsafe {
+        let pool = result::device::get_mem_pool(context.cu_device()).ok()?;
+        let mut reserved = 0_u64;
+        result::mem_pool::get_attribute(
+            pool,
+            sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
+            (&mut reserved as *mut u64).cast(),
+        )
+        .ok()?;
+        let mut used = 0_u64;
+        result::mem_pool::get_attribute(
+            pool,
+            sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+            (&mut used as *mut u64).cast(),
+        )
+        .ok()?;
+        Some((reserved, used))
+    }
+}
+
 fn request_available_memory(device: &Device) -> CoreResult<u64> {
     let capacity = if device.is_cuda() {
         #[cfg(feature = "cuda")]
         {
+            // Candle frees asynchronous allocations on this device's stream. Complete those frees
+            // before sampling the pool so admission observes the reusable post-load/request state.
+            device.synchronize().map_err(|e| to_core(e.into()))?;
             device.as_cuda_device().ok().and_then(|d| {
-                d.cuda_stream()
-                    .context()
-                    .mem_get_info()
-                    .ok()
-                    .map(|(free, _)| free as u64)
+                let stream = d.cuda_stream();
+                let context = stream.context();
+                let (free, total) = context.mem_get_info().ok()?;
+                let pool_usage = if context.has_async_alloc() {
+                    Some(cuda_pool_usage(context)?)
+                } else {
+                    None
+                };
+                cuda_usable_memory_bytes(free as u64, total as u64, pool_usage)
             })
         }
         #[cfg(not(feature = "cuda"))]
@@ -2739,10 +2804,11 @@ pub fn can_load(spec: &LoadSpec) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        bonsai_sampling_defaults, can_load, can_load_vision, emit_content, eos_token_ids,
-        expand_vision_placeholders, host_load_budget, load_memory_requirements,
-        merged_frame_timestamps, prompt_opens_thinking, substitute_vision_placeholders,
-        validate_context_window, video_placeholder_text, JsonMask, EAGER_ATTN_QUERY_CHUNK_SIZE,
+        bonsai_sampling_defaults, can_load, can_load_vision, cuda_usable_memory_bytes,
+        emit_content, eos_token_ids, expand_vision_placeholders, host_load_budget,
+        load_memory_requirements, merged_frame_timestamps, prompt_opens_thinking,
+        substitute_vision_placeholders, validate_context_window, video_placeholder_text, JsonMask,
+        EAGER_ATTN_QUERY_CHUNK_SIZE,
     };
     use crate::decode::{ConstraintMask, RewindableConstraintMask};
     use core_llm::{
@@ -2799,6 +2865,41 @@ mod tests {
         assert!(error
             .to_string()
             .contains("only 60000000000 bytes are available"));
+    }
+
+    #[test]
+    fn cuda_request_admission_counts_idle_async_pool_memory() {
+        // Reproduce the observed zero-driver-free shape with a synthetic pool snapshot. The pool
+        // counters were not captured by RC3, so this test deliberately makes no claim about their
+        // exact campaign values.
+        let total = 100;
+        let reserved = total;
+        let used = 60;
+        let available = cuda_usable_memory_bytes(0, total, Some((reserved, used))).unwrap();
+        assert_eq!(available, 40);
+        core_llm::admit_request_memory(36, available)
+            .expect("reusable pool memory must remain available to the owning allocator");
+    }
+
+    #[test]
+    fn cuda_request_admission_rejects_real_pool_shortfall() {
+        let gib = 1_u64 << 30;
+        let available =
+            cuda_usable_memory_bytes(gib / 2, 8 * gib, Some((4 * gib, 7 * gib / 2))).unwrap();
+        assert_eq!(available, gib);
+        let error = core_llm::admit_request_memory(gib + 1, available)
+            .expect_err("live allocations and external use must remain unavailable");
+        assert!(error
+            .to_string()
+            .contains("only 1073741824 bytes are available"));
+    }
+
+    #[test]
+    fn cuda_request_admission_fails_closed_on_invalid_pool_snapshot() {
+        assert_eq!(cuda_usable_memory_bytes(9, 8, None), None);
+        assert_eq!(cuda_usable_memory_bytes(0, 8, Some((7, 8))), None);
+        assert_eq!(cuda_usable_memory_bytes(0, 8, Some((9, 0))), None);
+        assert_eq!(cuda_usable_memory_bytes(1, 8, Some((8, 0))), None);
     }
 
     #[test]
