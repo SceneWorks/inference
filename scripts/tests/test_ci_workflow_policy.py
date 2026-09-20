@@ -3797,6 +3797,41 @@ class CiWorkflowPolicyTests(unittest.TestCase):
 
         mlx_commands = "\n".join(step.get("run", "") for step in mlx["steps"])
         candle_commands = "\n".join(step.get("run", "") for step in candle["steps"])
+        external_root = (
+            "/Volumes/Models/Codex-builds/sc-23935/"
+            "ci-${{ github.run_id }}-${{ github.run_attempt }}"
+        )
+        self.assertEqual(mlx["env"]["QWEN_BONSAI_RUN_DIR"], external_root)
+        self.assertEqual(
+            mlx["env"]["QWEN_BONSAI_OUTPUT_DIR"], f"{external_root}/evidence"
+        )
+        self.assertEqual(
+            mlx["env"]["QWEN_BONSAI_TOOLS_DIR"], f"{external_root}/tools"
+        )
+        self.assertEqual(mlx["env"]["CARGO_TARGET_DIR"], f"{external_root}/cargo-target")
+        self.assertEqual(mlx["env"]["TMPDIR"], f"{external_root}/tmp")
+        storage = next(
+            step
+            for step in mlx["steps"]
+            if step.get("name") == "Prepare external campaign storage"
+        )
+        checkout = next(
+            step
+            for step in mlx["steps"]
+            if step.get("uses", "").startswith("actions/checkout@")
+        )
+        self.assertLess(mlx["steps"].index(storage), mlx["steps"].index(checkout))
+        self.assertIn('test ! -e "$QWEN_BONSAI_RUN_DIR"', storage["run"])
+        for path_variable in (
+            "QWEN_BONSAI_OUTPUT_DIR",
+            "QWEN_BONSAI_TOOLS_DIR",
+            "CARGO_TARGET_DIR",
+            "TMPDIR",
+        ):
+            self.assertIn(f'"${path_variable}"', storage["run"])
+        serialized_mlx = json.dumps(mlx)
+        self.assertNotIn("RUNNER_TEMP", serialized_mlx)
+        self.assertNotIn("${{ runner.temp }}", serialized_mlx)
         snapshot_reference = re.compile(r"(?:\$|%)(BONSAI_[A-Z0-9_]+_SNAPSHOT)(?:\b|%)")
 
         def missing_job_snapshot_env(job: dict) -> set[str]:
@@ -3890,13 +3925,40 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             for step in candle["steps"]
             if step.get("name") == "Release the Candle campaign CUDA reservation"
         )
+        mlx_upload = next(
+            step
+            for step in mlx["steps"]
+            if step.get("name") == "Upload MLX qualification or sealed row evidence"
+        )
         upload = next(
             step
             for step in candle["steps"]
             if step.get("name") == "Upload Candle qualification or terminal evidence"
         )
+        self.assertEqual(
+            mlx_upload["with"]["path"], "${{ env.QWEN_BONSAI_OUTPUT_DIR }}"
+        )
+        self.assertEqual(mlx_upload["if"], "always()")
         self.assertEqual(release["if"], "always()")
         self.assertEqual(upload["if"], "always()")
+
+        verifier = next(
+            step
+            for step in mlx["steps"]
+            if step.get("name") == "Install pinned snapshot verifier dependencies"
+        )
+        provision_mlx = next(
+            step
+            for step in mlx["steps"]
+            if step.get("name")
+            == "Provision admitted MLX assets and verify publisher identities"
+        )
+        self.assertIn('$QWEN_BONSAI_TOOLS_DIR/huggingface-hub', verifier["run"])
+        self.assertIn(
+            'PYTHONPATH="$QWEN_BONSAI_TOOLS_DIR/huggingface-hub"',
+            provision_mlx["run"],
+        )
+        self.assertIn('--evidence-root "$QWEN_BONSAI_OUTPUT_DIR"', provision_mlx["run"])
 
         for job in (mlx, candle):
             steps = job["steps"]
