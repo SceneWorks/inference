@@ -1709,7 +1709,7 @@ jobs:
   qwen38-bonsai-mlx:
     name: Qwen3.8/Bonsai matched diagnostics (MLX)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen38-bonsai'
-    runs-on: [self-hosted, macOS, ARM64, rw-llm]
+    runs-on: [self-hosted, macOS, ARM64, nax, real-weights]
     timeout-minutes: 360
     env:
       BONSAI_QWEN38_SNAPSHOT: ${{ vars.BONSAI_QWEN38_SNAPSHOT }}
@@ -1733,6 +1733,14 @@ jobs:
         run: >-
           python3.12 scripts/release/resolve_snapshot_paths.py
           BONSAI_QWEN38_SNAPSHOT BONSAI_MLX_SNAPSHOT BONSAI_GGUF_SNAPSHOT BONSAI_BASELINE_SNAPSHOT
+      - name: Select preserved local campaign snapshots
+        if: runner.name == 'nax-macos'
+        run: |
+          GGUF=/Volumes/Models/Codex-models/sc-23935/hf/hub/models--prism-ml--Ternary-Bonsai-2-27B-gguf/snapshots/6ed5e12bf84b7a63069882c91dd9e9218647d17b
+          BASELINE=/Volumes/Models/Codex-models/sc-23935/hf/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b
+          test -d "$GGUF"
+          test -d "$BASELINE"
+          printf 'BONSAI_GGUF_SNAPSHOT=%s\nBONSAI_BASELINE_SNAPSHOT=%s\n' "$GGUF" "$BASELINE" >> "$GITHUB_ENV"
       - name: Qualify configured macOS snapshot metadata without provisioning
         id: mlx_snapshot_metadata
         continue-on-error: true

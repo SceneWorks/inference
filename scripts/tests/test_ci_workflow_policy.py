@@ -3783,6 +3783,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         jobs = workflow["jobs"]
         mlx = jobs["qwen38-bonsai-mlx"]
         candle = jobs["qwen38-bonsai-candle"]
+        self.assertEqual(
+            mlx["runs-on"], ["self-hosted", "macOS", "ARM64", "nax", "real-weights"]
+        )
+        self.assertEqual(
+            candle["runs-on"], ["self-hosted", "windows", "cuda", "real-weights"]
+        )
         self.assertEqual(candle["needs"], "qwen38-bonsai-mlx")
         self.assertIn("inputs.profile == 'qwen38-bonsai'", mlx["if"])
         self.assertIn("inputs.profile == 'qwen38-bonsai'", candle["if"])
@@ -3913,10 +3919,23 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # Expanding a leading ~/ is metadata preparation, not model materialization. It must
         # also precede qualification in preflight-only runs so the inspected path is real.
         resolver = next(step for step in mlx["steps"] if step.get("name") == "Resolve runner-local snapshot paths")
+        local_snapshots = next(
+            step
+            for step in mlx["steps"]
+            if step.get("name") == "Select preserved local campaign snapshots"
+        )
         qualification = next(step for step in mlx["steps"] if step.get("id") == "mlx_snapshot_metadata")
         self.assertNotIn("if", resolver)
-        self.assertLess(mlx["steps"].index(resolver), mlx["steps"].index(qualification))
+        self.assertEqual(local_snapshots["if"], "runner.name == 'nax-macos'")
+        self.assertLess(mlx["steps"].index(resolver), mlx["steps"].index(local_snapshots))
+        self.assertLess(mlx["steps"].index(local_snapshots), mlx["steps"].index(qualification))
         self.assertIn("scripts/release/resolve_snapshot_paths.py", resolver["run"])
+        self.assertIn("/Volumes/Models/Codex-models/sc-23935/hf/hub/", local_snapshots["run"])
+        self.assertIn("test -d \"$GGUF\"", local_snapshots["run"])
+        self.assertIn("test -d \"$BASELINE\"", local_snapshots["run"])
+        self.assertIn("BONSAI_GGUF_SNAPSHOT=%s", local_snapshots["run"])
+        self.assertIn("BONSAI_BASELINE_SNAPSHOT=%s", local_snapshots["run"])
+        self.assertIn(">> \"$GITHUB_ENV\"", local_snapshots["run"])
         for job in (mlx, candle):
             for step in job["steps"]:
                 name = step.get("name", "")
