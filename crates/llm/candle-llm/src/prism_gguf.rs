@@ -20,6 +20,7 @@ impl RawValue {
     pub fn u64(&self) -> Option<u64> {
         match self {
             Self::U(v) => Some(*v),
+            Self::I(v) => u64::try_from(*v).ok(),
             _ => None,
         }
     }
@@ -44,6 +45,14 @@ impl RawValue {
     pub fn array(&self) -> Option<&[RawValue]> {
         match self {
             Self::Array(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn exact_sign(&self) -> Option<i8> {
+        match self {
+            Self::U(1) | Self::I(1) | Self::F(1.0) => Some(1),
+            Self::I(-1) | Self::F(-1.0) => Some(-1),
             _ => None,
         }
     }
@@ -265,5 +274,35 @@ mod tests {
             .tensors
             .values()
             .any(|t| matches!(t.ggml_type, 142 | 143)));
+        let sections = gguf.metadata["qwen35.rope.dimension_sections"]
+            .array()
+            .unwrap();
+        assert_eq!(
+            sections
+                .iter()
+                .map(RawValue::u64)
+                .collect::<Option<Vec<_>>>(),
+            Some(vec![11, 11, 10, 0])
+        );
+        let signs = gguf.metadata["prism.hadamard.sign_values"].array().unwrap();
+        assert!(signs.iter().all(|value| value.exact_sign().is_some()));
+    }
+
+    #[test]
+    fn exact_numeric_coercions_preserve_strict_metadata_validation() {
+        assert_eq!(RawValue::I(11).u64(), Some(11));
+        assert_eq!(RawValue::I(-1).u64(), None);
+        assert_eq!(RawValue::I(-1).exact_sign(), Some(-1));
+        assert_eq!(RawValue::F(-1.0).exact_sign(), Some(-1));
+        assert_eq!(RawValue::U(1).exact_sign(), Some(1));
+        for value in [
+            RawValue::F(0.999),
+            RawValue::F(f64::NAN),
+            RawValue::I(0),
+            RawValue::I(2),
+            RawValue::U(2),
+        ] {
+            assert_eq!(value.exact_sign(), None);
+        }
     }
 }
