@@ -1,6 +1,7 @@
-# NEVER MERGE: read-only SC-23935 evidence from the active RC3 Candle campaign.
-# No checkout, build, model execution, CUDA context, process signal, or service mutation is permitted.
-name: SC-23935 RC3 active Candle health diagnostic (NEVER MERGE)
+# NEVER MERGE: preserve and release only SC-23935's cancelled RC3 Candle reservation.
+# This workflow does not checkout code, build, access models, create a CUDA context, signal a
+# process, or restart a service. Remove the temporary runner label after its artifact is retained.
+name: SC-23935 RC3 Candle evidence preservation (NEVER MERGE)
 
 on:
   workflow_dispatch:
@@ -9,164 +10,396 @@ permissions:
   contents: read
 
 concurrency:
-  group: sc23935-rc3-active-candle-health
+  group: sc23935-rc3-candle-evidence-preservation
   cancel-in-progress: false
 
 jobs:
-  collect-windows:
-    name: Read-only active Candle process and GPU metadata
-    runs-on: [self-hosted, Windows, X64, cuda, real-weights]
+  preserve-and-release:
+    name: Preserve cancelled Candle evidence and release its stale reservation
+    runs-on: [self-hosted, Windows, X64, cuda, sc23935-evidence-peer]
     timeout-minutes: 5
     steps:
-      - name: Assert idle peer and collect two bounded snapshots
+      - name: Preserve evidence and conditionally release the exact owned reservation
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          $evidenceName = "sc23935-rc3-cuda-active-health-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $expectedRunner = 'cuda-windows'
+          $campaignRunId = '35512066450'
+          $campaignRunAttempt = '1'
+          $ownerToken = "$campaignRunId-$campaignRunAttempt"
+          $expectedGpuUuid = 'GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0'
+          $campaignRoot = 'D:\actions-runner-2\_work\_temp\qwen38-bonsai-candle'
+          $reservationPath = Join-Path $env:LOCALAPPDATA 'SceneWorks\inference-reservations\cuda-device-0.json'
+          $maximumEvidenceBytes = 100MB
+          $evidenceName = "sc23935-rc3-candle-preservation-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           $evidence = Join-Path $env:RUNNER_TEMP $evidenceName
-          New-Item -ItemType Directory -Path $evidence | Out-Null
+          $preserved = Join-Path $evidence 'preserved-campaign'
+          New-Item -ItemType Directory -Path $preserved -Force | Out-Null
 
-          [ordered]@{
+          function Write-Json {
+            param([object]$Value, [string]$Path, [int]$Depth = 10)
+            $Value | ConvertTo-Json -Depth $Depth |
+              Set-Content -LiteralPath $Path -Encoding utf8
+          }
+
+          function Get-Sha256Text {
+            param([string]$Text)
+            $bytes = [Text.Encoding]::UTF8.GetBytes($Text)
+            $sha256 = [Security.Cryptography.SHA256]::Create()
+            try {
+              return ([BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant()
+            } finally {
+              $sha256.Dispose()
+            }
+          }
+
+          $identity = [ordered]@{
             github_sha = $env:GITHUB_SHA
             github_run_id = $env:GITHUB_RUN_ID
             github_run_attempt = $env:GITHUB_RUN_ATTEMPT
+            source_campaign_run_id = $campaignRunId
+            source_campaign_run_attempt = $campaignRunAttempt
             runner_name = $env:RUNNER_NAME
             runner_os = $env:RUNNER_OS
             runner_arch = $env:RUNNER_ARCH
             captured_utc = [DateTime]::UtcNow.ToString('o')
-          } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $evidence 'identity.json') -Encoding utf8
-
-          if ($env:RUNNER_NAME -ne 'cuda-windows') {
-            "refused_runner=$env:RUNNER_NAME expected=cuda-windows" |
+            temporary_runner_label = 'sc23935-evidence-peer'
+            required_followup = 'Remove sc23935-evidence-peer from runner 2313 after this artifact and cleanup result are retained.'
+          }
+          Write-Json -Value $identity -Path (Join-Path $evidence 'identity.json')
+          if ($env:RUNNER_NAME -ne $expectedRunner) {
+            "refused_runner=$env:RUNNER_NAME expected=$expectedRunner" |
               Set-Content -LiteralPath (Join-Path $evidence 'refused-runner.txt') -Encoding ascii
             exit 64
           }
 
-          function Write-ProcessSnapshot {
-            param([string]$Destination)
-            $capturedTime = [DateTime]::UtcNow
-            $processes = @(Get-CimInstance Win32_Process | ForEach-Object {
-              $started = $null
-              $elapsed = $null
-              try { $started = $_.CreationDate.ToUniversalTime().ToString('o') } catch {}
-              try { $elapsed = ($capturedTime - $_.CreationDate.ToUniversalTime()).TotalSeconds } catch {}
-              [ordered]@{
-                pid = $_.ProcessId
-                parent_pid = $_.ParentProcessId
-                process_name = $_.Name
-                rss_bytes = [uint64]$_.WorkingSetSize
-                cpu_seconds = ([uint64]$_.KernelModeTime + [uint64]$_.UserModeTime) / 10000000.0
-                started_utc = $started
-                elapsed_seconds = $elapsed
-              }
-            })
-            $operatingSystem = Get-CimInstance Win32_OperatingSystem
-            [ordered]@{
-              captured_utc = $capturedTime.ToString('o')
-              host_memory = [ordered]@{
-                total_visible_kib = [uint64]$operatingSystem.TotalVisibleMemorySize
-                free_physical_kib = [uint64]$operatingSystem.FreePhysicalMemory
-                total_virtual_kib = [uint64]$operatingSystem.TotalVirtualMemorySize
-                free_virtual_kib = [uint64]$operatingSystem.FreeVirtualMemory
-              }
-              processes = $processes
-            } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Destination -Encoding utf8
-          }
+          $failures = [Collections.Generic.List[string]]::new()
+          $preservationRecords = [Collections.Generic.List[object]]::new()
+          $preservationSucceeded = $true
+          $copiedCount = 0
 
-          function Write-GpuSnapshot {
-            param([string]$Prefix)
-            $timestamp = [DateTime]::UtcNow.ToString('o')
-            $gpuOutput = & nvidia-smi --id=0 --query-gpu=index,uuid,memory.total,memory.free,memory.used,utilization.gpu --format=csv,noheader,nounits 2>&1
-            $gpuExit = $LASTEXITCODE
-            $computeOutput = & nvidia-smi --id=0 --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader,nounits 2>&1
-            $computeExit = $LASTEXITCODE
-            [ordered]@{
-              captured_utc = $timestamp
-              gpu_query_exit_code = $gpuExit
-              compute_query_exit_code = $computeExit
-              gpu_query = @($gpuOutput | ForEach-Object { $_.ToString() })
-              compute_apps_query = @($computeOutput | ForEach-Object { $_.ToString() })
-            } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath "$Prefix.json" -Encoding utf8
-            if ($gpuExit -ne 0 -or $computeExit -ne 0) {
-              throw "nvidia-smi read-only metadata query failed: gpu=$gpuExit compute=$computeExit"
-            }
-          }
+          # Preserve the old runner's evidence before inspecting processes or considering cleanup.
+          if (-not (Test-Path -LiteralPath $campaignRoot -PathType Container)) {
+            $preservationSucceeded = $false
+            [void]$failures.Add("campaign evidence root is absent: $campaignRoot")
+          } else {
+            $canonicalRoot = [IO.Path]::GetFullPath($campaignRoot).TrimEnd('\')
+            $sourceFiles = @(Get-ChildItem -LiteralPath $campaignRoot -Recurse -File -Force)
+            foreach ($file in $sourceFiles) {
+              $canonicalFile = [IO.Path]::GetFullPath($file.FullName)
+              $relative = $canonicalFile.Substring($canonicalRoot.Length).TrimStart('\')
+              $extension = $file.Extension.ToLowerInvariant()
+              $record = [ordered]@{
+                relative_path = $relative
+                source_size_bytes = [uint64]$file.Length
+                source_last_write_utc = $file.LastWriteTimeUtc.ToString('o')
+                disposition = $null
+                source_sha256 = $null
+                preserved_sha256 = $null
+                error = $null
+              }
 
-          function Copy-BoundedTail {
-            param(
-              [string]$Source,
-              [string]$Destination,
-              [int64]$MaximumBytes = 65536
-            )
-            if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
-              return [ordered]@{ path = $Source; exists = $false }
-            }
-            $item = Get-Item -LiteralPath $Source
-            $take = [Math]::Min($MaximumBytes, $item.Length)
-            $buffer = New-Object byte[] ([int]$take)
-            $stream = [System.IO.File]::Open($Source, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-            try {
-              if ($take -gt 0) {
-                [void]$stream.Seek(-$take, [System.IO.SeekOrigin]::End)
-                $read = 0
-                while ($read -lt $take) {
-                  $count = $stream.Read($buffer, $read, [int]($take - $read))
-                  if ($count -eq 0) { break }
-                  $read += $count
-                }
-                if ($read -gt 0) {
-                  [System.IO.File]::WriteAllBytes($Destination, $buffer[0..($read - 1)])
-                } else {
-                  [System.IO.File]::WriteAllBytes($Destination, [byte[]]@())
-                }
+              if (-not $canonicalFile.StartsWith("$canonicalRoot\", [StringComparison]::OrdinalIgnoreCase)) {
+                $record.disposition = 'excluded-path-escape'
+              } elseif (($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                $record.disposition = 'excluded-reparse-point'
+              } elseif ($extension -notin @('.json', '.log', '.txt')) {
+                $record.disposition = 'excluded-extension'
+              } elseif ($file.Length -gt $maximumEvidenceBytes) {
+                $record.disposition = 'excluded-over-100MiB'
+              } elseif ($relative -match '(?i)(^|[\\/])(\.env($|\.)|credentials?($|\.)|secrets?($|\.))') {
+                $record.disposition = 'excluded-sensitive-name'
               } else {
-                $read = 0
-                [System.IO.File]::WriteAllBytes($Destination, [byte[]]@())
+                try {
+                  $destination = Join-Path $preserved $relative
+                  $destinationParent = Split-Path -Parent $destination
+                  New-Item -ItemType Directory -Path $destinationParent -Force | Out-Null
+                  $sourceHash = (Get-FileHash -LiteralPath $canonicalFile -Algorithm SHA256).Hash.ToLowerInvariant()
+                  Copy-Item -LiteralPath $canonicalFile -Destination $destination
+                  $preservedHash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+                  if ($sourceHash -ne $preservedHash) {
+                    throw 'SHA-256 mismatch after copy'
+                  }
+                  $record.disposition = 'preserved'
+                  $record.source_sha256 = $sourceHash
+                  $record.preserved_sha256 = $preservedHash
+                  $copiedCount += 1
+                } catch {
+                  $preservationSucceeded = $false
+                  $record.disposition = 'copy-failed'
+                  $record.error = $_.Exception.Message
+                  [void]$failures.Add("failed to preserve ${relative}: $($_.Exception.Message)")
+                }
               }
-            } finally {
-              $stream.Dispose()
+              [void]$preservationRecords.Add([pscustomobject]$record)
             }
-            return [ordered]@{
-              path = $Source
-              exists = $true
-              length_bytes = $item.Length
-              copied_tail_bytes = $read
-              last_write_utc = $item.LastWriteTimeUtc.ToString('o')
-              tail_sha256 = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($copiedCount -eq 0) {
+              $preservationSucceeded = $false
+              [void]$failures.Add('campaign evidence root contained no eligible JSON, log, or text files')
             }
           }
 
-          Write-ProcessSnapshot -Destination (Join-Path $evidence 'processes-1.json')
-          Write-GpuSnapshot -Prefix (Join-Path $evidence 'gpu-1')
-          Start-Sleep -Seconds 10
-          Write-ProcessSnapshot -Destination (Join-Path $evidence 'processes-2.json')
-          Write-GpuSnapshot -Prefix (Join-Path $evidence 'gpu-2')
+          $preservationInventory = [ordered]@{
+            source_root = $campaignRoot
+            maximum_file_bytes = [uint64]$maximumEvidenceBytes
+            allowed_extensions = @('.json', '.log', '.txt')
+            copied_file_count = $copiedCount
+            succeeded = $preservationSucceeded
+            files = @($preservationRecords)
+          }
+          Write-Json -Value $preservationInventory -Path (Join-Path $evidence 'campaign-inventory.json') -Depth 12
+          @($preservationRecords |
+              Where-Object disposition -eq 'preserved' |
+              Sort-Object relative_path |
+              ForEach-Object { "$($_.preserved_sha256)  $($_.relative_path)" }) |
+            Set-Content -LiteralPath (Join-Path $evidence 'campaign-sha256.txt') -Encoding ascii
 
-          $campaign = 'D:\actions-runner-2\_work\_temp\qwen38-bonsai-candle'
-          $row = Join-Path $campaign 'candle-cuda-bonsai-gguf'
-          $stdout = Join-Path $row 'stdout.log'
-          $stderr = Join-Path $row 'stderr.log'
-          $tailRecords = @(
-            Copy-BoundedTail -Source $stdout -Destination (Join-Path $evidence 'active-row-stdout.tail.log')
-            Copy-BoundedTail -Source $stderr -Destination (Join-Path $evidence 'active-row-stderr.tail.log')
+          # Preserve the reservation before reading ownership fields or possibly removing it.
+          $reservationBeforeHash = $null
+          $reservation = $null
+          $reservationExists = Test-Path -LiteralPath $reservationPath -PathType Leaf
+          if ($reservationExists) {
+            try {
+              $reservationItem = Get-Item -LiteralPath $reservationPath
+              if ($reservationItem.Length -gt 1MB) {
+                throw 'reservation is unexpectedly larger than 1 MiB'
+              }
+              $reservationCopy = Join-Path $evidence 'gpu-reservation-before.json'
+              $reservationBeforeHash = (Get-FileHash -LiteralPath $reservationPath -Algorithm SHA256).Hash.ToLowerInvariant()
+              Copy-Item -LiteralPath $reservationPath -Destination $reservationCopy
+              $reservationCopyHash = (Get-FileHash -LiteralPath $reservationCopy -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($reservationBeforeHash -ne $reservationCopyHash) {
+                throw 'reservation SHA-256 mismatch after preservation'
+              }
+              $reservation = Get-Content -LiteralPath $reservationCopy -Raw | ConvertFrom-Json
+            } catch {
+              [void]$failures.Add("reservation preservation failed: $($_.Exception.Message)")
+            }
+          }
+
+          # The process identities come from read-only run 35514160244. A reused PID is safe only
+          # when its executable name or creation time differs from that recorded identity.
+          $expectedProcesses = @(
+            [pscustomobject]@{
+              role = 'native'
+              pid = 11588
+              process_name = 'qwen38_bonsai-43e5bf287022e75e.exe'
+              started_utc = [DateTime]'2026-09-20T13:18:07.0031230Z'
+            },
+            [pscustomobject]@{
+              role = 'wrapper'
+              pid = 46624
+              process_name = 'python.exe'
+              started_utc = [DateTime]'2026-09-20T13:17:56.2829410Z'
+            },
+            [pscustomobject]@{
+              role = 'runner-worker'
+              pid = 40848
+              process_name = 'Runner.Worker.exe'
+              started_utc = [DateTime]'2026-09-20T13:13:54.4733550Z'
+            }
           )
-          [ordered]@{
-            campaign_root = $campaign
-            row = 'candle-cuda-bonsai-gguf'
-            row_path = $row
-            row_exists = (Test-Path -LiteralPath $row -PathType Container)
-            files = $tailRecords
-          } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $evidence 'active-row-metadata.json') -Encoding utf8
+          $processRecords = [Collections.Generic.List[object]]::new()
+          $ownedProcessPresent = $false
+          foreach ($expected in $expectedProcesses) {
+            $matches = @(Get-CimInstance Win32_Process -Filter "ProcessId=$($expected.pid)")
+            if ($matches.Count -eq 0) {
+              [void]$processRecords.Add([pscustomobject][ordered]@{
+                role = $expected.role
+                pid = $expected.pid
+                status = 'absent'
+                expected_process_name = $expected.process_name
+                expected_started_utc = $expected.started_utc.ToUniversalTime().ToString('o')
+              })
+              continue
+            }
+            if ($matches.Count -ne 1) {
+              $ownedProcessPresent = $true
+              [void]$failures.Add("PID $($expected.pid) returned an ambiguous process count")
+              continue
+            }
+            $process = $matches[0]
+            $started = $null
+            try { $started = $process.CreationDate.ToUniversalTime() } catch {}
+            $sameName = $process.Name -ceq $expected.process_name
+            $sameStart = $null -ne $started -and
+              [Math]::Abs(($started - $expected.started_utc.ToUniversalTime()).TotalMilliseconds) -lt 1
+            $sameIdentity = $sameName -and $sameStart
+            $identityAmbiguous = $sameName -and $null -eq $started
+            if ($sameIdentity) {
+              $ownedProcessPresent = $true
+              [void]$failures.Add("owned $($expected.role) process still exists at PID $($expected.pid)")
+            } elseif ($identityAmbiguous) {
+              $ownedProcessPresent = $true
+              [void]$failures.Add("PID $($expected.pid) has the expected process name but its creation time is unavailable")
+            }
+            [void]$processRecords.Add([pscustomobject][ordered]@{
+              role = $expected.role
+              pid = $expected.pid
+              status = $(if ($sameIdentity) {
+                  'owned-process-still-present'
+                } elseif ($identityAmbiguous) {
+                  'identity-ambiguous'
+                } else {
+                  'pid-reused'
+                })
+              expected_process_name = $expected.process_name
+              actual_process_name = $process.Name
+              expected_started_utc = $expected.started_utc.ToUniversalTime().ToString('o')
+              actual_started_utc = $(if ($null -ne $started) { $started.ToString('o') } else { $null })
+              parent_pid = $process.ParentProcessId
+            })
+          }
+          Write-Json -Value ([ordered]@{
+              captured_utc = [DateTime]::UtcNow.ToString('o')
+              owned_process_present = $ownedProcessPresent
+              processes = @($processRecords)
+            }) -Path (Join-Path $evidence 'known-processes.json')
 
-          Get-ChildItem -LiteralPath $evidence -File |
-            Select-Object Name,Length,LastWriteTimeUtc |
-            ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $evidence 'file-list.json') -Encoding utf8
+          # Query metadata only. nvidia-smi does not create a CUDA context.
+          $gpuValid = $false
+          $gpuTenants = [Collections.Generic.List[object]]::new()
+          $gpuState = [ordered]@{
+            captured_utc = [DateTime]::UtcNow.ToString('o')
+            expected_index = 0
+            expected_uuid = $expectedGpuUuid
+            selected_gpu = $null
+            selected_gpu_compute_processes = @()
+            gpu_query_exit_code = $null
+            compute_query_exit_code = $null
+          }
+          try {
+            $gpuOutput = @(& nvidia-smi --id=0 --query-gpu=index,uuid,memory.total,memory.free,memory.used --format=csv,noheader,nounits 2>&1)
+            $gpuExit = $LASTEXITCODE
+            $processOutput = @(& nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader,nounits 2>&1)
+            $processExit = $LASTEXITCODE
+            $gpuState.gpu_query_exit_code = $gpuExit
+            $gpuState.compute_query_exit_code = $processExit
+            if ($gpuExit -ne 0 -or $processExit -ne 0) {
+              throw "nvidia-smi query failed: gpu=$gpuExit compute=$processExit"
+            }
+            if ($gpuOutput.Count -ne 1) {
+              throw "GPU index 0 query returned $($gpuOutput.Count) rows"
+            }
+            $gpuFields = @($gpuOutput[0].ToString().Split(',') | ForEach-Object { $_.Trim() })
+            if ($gpuFields.Count -ne 5) {
+              throw 'GPU index 0 query returned an invalid row'
+            }
+            $selectedGpu = [ordered]@{
+              index = [int]::Parse($gpuFields[0])
+              uuid = $gpuFields[1]
+              total_bytes = [uint64]::Parse($gpuFields[2]) * 1MB
+              free_bytes = [uint64]::Parse($gpuFields[3]) * 1MB
+              used_bytes = [uint64]::Parse($gpuFields[4]) * 1MB
+            }
+            $gpuState.selected_gpu = $selectedGpu
+            foreach ($lineObject in $processOutput) {
+              $line = $lineObject.ToString().Trim()
+              if (-not $line -or $line -eq 'No running processes found') { continue }
+              $fields = @($line.Split(',') | ForEach-Object { $_.Trim() })
+              if ($fields.Count -ne 4) {
+                throw 'compute-process query returned an invalid row'
+              }
+              if ($fields[0] -ceq $expectedGpuUuid) {
+                [void]$gpuTenants.Add([pscustomobject][ordered]@{
+                  gpu_uuid = $fields[0]
+                  pid = $fields[1]
+                  process_name = $fields[2]
+                  used_memory_mib = $fields[3]
+                })
+              }
+            }
+            $gpuState.selected_gpu_compute_processes = @($gpuTenants)
+            if ($selectedGpu.index -ne 0 -or $selectedGpu.uuid -cne $expectedGpuUuid) {
+              throw "GPU identity mismatch: index=$($selectedGpu.index) uuid=$($selectedGpu.uuid)"
+            }
+            if ($gpuTenants.Count -ne 0) {
+              throw "GPU 0 has $($gpuTenants.Count) active compute tenant(s)"
+            }
+            $gpuValid = $true
+          } catch {
+            [void]$failures.Add("GPU verification failed: $($_.Exception.Message)")
+          }
+          $gpuState.verified_idle_exact_device = $gpuValid
+          Write-Json -Value $gpuState -Path (Join-Path $evidence 'gpu-state.json')
 
-      - name: Upload bounded read-only evidence
+          # Mirror release-gpu's exact schema/token/index ownership checks and additionally bind the
+          # cleanup to the observed UUID. Do not remove anything if any earlier gate failed.
+          $expectedTokenHash = Get-Sha256Text -Text $ownerToken
+          $reservationOwned = $false
+          $releaseDisposition = if ($reservationExists) { 'preserved-not-released' } else { 'already-absent' }
+          if ($reservationExists -and $null -ne $reservation) {
+            $reservationOwned =
+              $reservation.schema_version -eq 1 -and
+              $reservation.token_sha256 -ceq $expectedTokenHash -and
+              $reservation.gpu_index -eq 0 -and
+              $reservation.gpu_uuid -ceq $expectedGpuUuid
+            if (-not $reservationOwned) {
+              [void]$failures.Add('reservation ownership, device index, or UUID did not exactly match the cancelled campaign')
+              $releaseDisposition = 'refused-owner-or-device-mismatch'
+            }
+          }
+
+          $allReleaseGatesPassed =
+            $preservationSucceeded -and
+            (-not $ownedProcessPresent) -and
+            $gpuValid -and
+            ($failures.Count -eq 0)
+          if ($reservationExists -and $reservationOwned -and $allReleaseGatesPassed) {
+            try {
+              $currentHash = (Get-FileHash -LiteralPath $reservationPath -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($currentHash -cne $reservationBeforeHash) {
+                throw 'reservation changed after preservation and validation'
+              }
+              [IO.File]::Delete($reservationPath)
+              if (Test-Path -LiteralPath $reservationPath) {
+                throw 'reservation still exists after exact release'
+              }
+              $releaseDisposition = 'released-exact-owned-stale-reservation'
+            } catch {
+              [void]$failures.Add("exact reservation release failed: $($_.Exception.Message)")
+              $releaseDisposition = 'release-failed'
+            }
+          } elseif ($reservationExists -and $reservationOwned -and -not $allReleaseGatesPassed) {
+            $releaseDisposition = 'refused-precondition-failure'
+          }
+
+          $cleanupResult = [ordered]@{
+            captured_utc = [DateTime]::UtcNow.ToString('o')
+            campaign_evidence_preserved = $preservationSucceeded
+            reservation_path = $reservationPath
+            reservation_existed_before = $reservationExists
+            reservation_before_sha256 = $reservationBeforeHash
+            expected_token_sha256 = $expectedTokenHash
+            exact_campaign_owner = $reservationOwned
+            owned_process_present = $ownedProcessPresent
+            exact_gpu_idle = $gpuValid
+            release_disposition = $releaseDisposition
+            failures = @($failures)
+          }
+          Write-Json -Value $cleanupResult -Path (Join-Path $evidence 'cleanup-result.json')
+
+          Get-ChildItem -LiteralPath $evidence -Recurse -File |
+            Where-Object Name -ne 'artifact-inventory.json' |
+            Sort-Object FullName |
+            ForEach-Object {
+              [pscustomobject][ordered]@{
+                relative_path = $_.FullName.Substring($evidence.Length).TrimStart('\')
+                size_bytes = [uint64]$_.Length
+                sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              }
+            } | ConvertTo-Json -Depth 4 |
+            Set-Content -LiteralPath (Join-Path $evidence 'artifact-inventory.json') -Encoding utf8
+
+          if ($failures.Count -ne 0) {
+            throw "preservation/cleanup refused with $($failures.Count) failure(s); see cleanup-result.json"
+          }
+
+      - name: Upload preservation and cleanup evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: sc23935-rc3-cuda-active-health-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}\sc23935-rc3-cuda-active-health-${{ github.run_id }}-${{ github.run_attempt }}
+          name: sc23935-rc3-candle-preservation-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}\sc23935-rc3-candle-preservation-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: error
           retention-days: 14
