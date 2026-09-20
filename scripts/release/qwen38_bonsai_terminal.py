@@ -870,6 +870,90 @@ def run(args: argparse.Namespace) -> int:
     return 0 if completed else 1
 
 
+def validate_preserve_thinking_evidence(case: dict[str, Any], root: Path) -> None:
+    """Fail closed unless paired native history evidence proves the template control."""
+    request = case.get("request")
+    if not isinstance(request, dict):
+        raise ValueError(f"preserve_thinking request evidence is missing in {root}")
+    preserved_request = request.get("preserved")
+    stripped_request = request.get("stripped")
+    if not isinstance(preserved_request, dict) or not isinstance(stripped_request, dict):
+        raise ValueError(f"preserve_thinking paired requests are missing in {root}")
+    if (
+        preserved_request.get("preserve_thinking") is not True
+        or stripped_request.get("preserve_thinking") is not False
+    ):
+        raise ValueError(f"preserve_thinking paired controls are malformed in {root}")
+    preserved_without_control = dict(preserved_request)
+    stripped_without_control = dict(stripped_request)
+    preserved_without_control.pop("preserve_thinking", None)
+    stripped_without_control.pop("preserve_thinking", None)
+    if preserved_without_control != stripped_without_control:
+        raise ValueError(f"preserve_thinking paired requests differ beyond the control in {root}")
+    messages = preserved_request.get("messages")
+    history_covered = (
+        isinstance(messages, list)
+        and len(messages) >= 3
+        and any(
+            isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and isinstance(message.get("thinking"), str)
+            and bool(message["thinking"].strip())
+            for message in messages
+        )
+    )
+    if case.get("history_coverage_passed") is not True or not history_covered:
+        raise ValueError(f"preserve_thinking history coverage is missing in {root}")
+
+    steps = case.get("paired_steps")
+    if not isinstance(steps, dict):
+        raise ValueError(f"preserve_thinking paired native steps are missing in {root}")
+    preserved = steps.get("preserved")
+    stripped = steps.get("stripped")
+    if not isinstance(preserved, dict) or not isinstance(stripped, dict):
+        raise ValueError(f"preserve_thinking paired native steps are malformed in {root}")
+    if preserved.get("request") != preserved_request or stripped.get("request") != stripped_request:
+        raise ValueError(f"preserve_thinking steps are not bound to their requests in {root}")
+    for label, step in (("preserved", preserved), ("stripped", stripped)):
+        if step.get("status") != "completed" or step.get("evidence_complete") is not True:
+            raise ValueError(f"preserve_thinking {label} step is incomplete in {root}")
+        if not isinstance(step.get("stream_contract_passed"), bool):
+            raise ValueError(f"preserve_thinking {label} stream evidence is missing in {root}")
+
+    proof = case.get("prompt_token_proof")
+    if not isinstance(proof, dict):
+        raise ValueError(f"preserve_thinking prompt-token proof is missing in {root}")
+    preserved_tokens = preserved.get("output", {}).get("prompt_tokens")
+    stripped_tokens = stripped.get("output", {}).get("prompt_tokens")
+    if (
+        not isinstance(preserved_tokens, int)
+        or not isinstance(stripped_tokens, int)
+        or preserved_tokens <= 0
+        or stripped_tokens <= 0
+        or proof.get("preserved_prompt_tokens") != preserved_tokens
+        or proof.get("stripped_prompt_tokens") != stripped_tokens
+    ):
+        raise ValueError(f"preserve_thinking prompt-token counts are unbound in {root}")
+    delta = preserved_tokens - stripped_tokens if preserved_tokens >= stripped_tokens else None
+    passed = delta is not None and delta > 0
+    if proof.get("additional_preserved_tokens") != delta or proof.get("passed") is not passed:
+        raise ValueError(f"preserve_thinking prompt-token proof is inconsistent in {root}")
+
+    stream_passed = (
+        preserved.get("stream_contract_passed") is True
+        and stripped.get("stream_contract_passed") is True
+    )
+    quality_passed = preserved.get("quality_passed") is True and stripped.get("quality_passed") is True
+    functional_passed = quality_passed and stream_passed and history_covered and passed
+    if (
+        case.get("stream_contract_passed") is not stream_passed
+        or case.get("quality_passed") is not quality_passed
+        or case.get("functional_acceptance_passed") is not functional_passed
+        or case.get("output") != preserved.get("output")
+    ):
+        raise ValueError(f"preserve_thinking aggregate evidence is inconsistent in {root}")
+
+
 def validate_receipt(
     root: Path,
     *,
@@ -996,6 +1080,8 @@ def validate_receipt(
     if not isinstance(cases, list) or not cases:
         raise ValueError(f"provider evidence has no cases in {root}")
     for case in cases:
+        if case.get("case_id") == "preserve_thinking":
+            validate_preserve_thinking_evidence(case, root)
         if case.get("status") != "completed" or case.get("evidence_complete") is not True:
             raise ValueError(f"case {case.get('case_id')} has broken evidence in {root}")
         for phase in ("prefill_seconds", "decode_seconds"):
@@ -1327,12 +1413,11 @@ def matrix_status(args: argparse.Namespace) -> int:
                         expected_case_ids = group_case_ids + acceptance_case_ids
                         if [case.get("case_id") for case in provider["cases"]] != expected_case_ids:
                             raise ValueError("run cases do not match matrix workload group")
-                        accepted_ids = (
-                            expected_case_ids
-                            if groups[group].get("functional_acceptance") is True
-                            or cell.get("functional_acceptance") is True
-                            else acceptance_case_ids
-                        )
+                        accepted_ids = []
+                        if groups[group].get("functional_acceptance") is True:
+                            accepted_ids.extend(group_case_ids)
+                        if cell.get("functional_acceptance") is True:
+                            accepted_ids.extend(acceptance_case_ids)
                         by_id = {case["case_id"]: case for case in provider["cases"]}
                         acceptance_rows.extend(
                             {
@@ -1343,6 +1428,10 @@ def matrix_status(args: argparse.Namespace) -> int:
                                 "request": by_id[case_id].get("request"),
                                 "oracle": by_id[case_id].get("oracle"),
                                 "output": by_id[case_id].get("output"),
+                                "evidence_complete": by_id[case_id].get("evidence_complete"),
+                                "stream_contract_passed": by_id[case_id].get("stream_contract_passed"),
+                                "history_coverage_passed": by_id[case_id].get("history_coverage_passed"),
+                                "prompt_token_proof": by_id[case_id].get("prompt_token_proof"),
                             }
                             for case_id in accepted_ids
                         )

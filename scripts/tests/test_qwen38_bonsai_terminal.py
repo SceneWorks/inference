@@ -822,6 +822,144 @@ Pages purgeable:                             1000.
         self.assertFalse(report["functional_acceptance"]["passed"])
         self.assertTrue(args.seal.is_file(), "complete failing evidence must remain sealed")
 
+    def test_cell_acceptance_does_not_promote_diagnostic_quality(self) -> None:
+        self.write_hardware()
+        manifest = self.write_manifest([("functional", "c" * 40)])
+        preflight = self.make_preflight(
+            "functional",
+            model_key="functional",
+            revision="c" * 40,
+            load_profile="candle-dense-cpu",
+        )
+        run = self.make_run(
+            "functional",
+            quality=False,
+            manifest_key="functional",
+            preflight_sha256=terminal.sha256(preflight),
+        )
+        provider_path = run / "provider.json"
+        provider = json.loads(provider_path.read_text(encoding="utf-8"))
+        capability = copy.deepcopy(provider["cases"][0])
+        capability.update(
+            case_id="capability",
+            category="capability_acceptance",
+            quality_passed=True,
+            functional_acceptance_passed=True,
+        )
+        capability["output"]["text"] = "391"
+        provider["cases"].append(capability)
+        provider_path.write_text(json.dumps(provider), encoding="utf-8")
+        self.reseal_run(run)
+        matrix = self.root / "cell-functional-matrix.json"
+        terminal.write_new(
+            matrix,
+            {
+                "schema_version": 1,
+                "suite": terminal.SUITE,
+                "groups": {"matched": {"case_ids": ["arithmetic"]}},
+                "cells": [
+                    {
+                        "id": "functional",
+                        "group": "matched",
+                        "backend": "candle",
+                        "device": "cpu",
+                        "model_key": "functional",
+                        "load_profile": "candle-dense-cpu",
+                        "functional_acceptance": True,
+                        "acceptance_case_ids": ["capability"],
+                    }
+                ],
+            },
+        )
+        args = argparse.Namespace(
+            root=[self.root],
+            matrix=matrix,
+            manifest=manifest,
+            runtime_sha=self.runtime_sha,
+            output=self.root / "cell-functional-report.json",
+            markdown=self.root / "cell-functional-report.md",
+            seal=self.root / "cell-functional-seal.json",
+        )
+        self.assertEqual(terminal.matrix_status(args), 0)
+        report = json.loads(args.output.read_text(encoding="utf-8"))
+        self.assertTrue(report["evidence_complete"])
+        self.assertTrue(report["functional_acceptance"]["passed"])
+        self.assertEqual(
+            [row["case_id"] for row in report["functional_acceptance"]["rows"]],
+            ["capability"],
+        )
+        self.assertFalse(
+            report["comparison"]["matched"]["raw_outputs"][0]["quality_passed"]
+        )
+
+    def test_preserve_thinking_evidence_mutations_fail_closed(self) -> None:
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": "setup"}], "thinking": None},
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "ack"}],
+                "thinking": "private marker",
+            },
+            {"role": "user", "content": [{"type": "text", "text": "OK"}], "thinking": None},
+        ]
+        preserved_request = {
+            "messages": messages,
+            "max_new_tokens": 32,
+            "preserve_thinking": True,
+        }
+        stripped_request = {**preserved_request, "preserve_thinking": False}
+
+        def step(request: dict, prompt_tokens: int) -> dict:
+            return {
+                "status": "completed",
+                "evidence_complete": True,
+                "quality_passed": True,
+                "stream_contract_passed": True,
+                "request": request,
+                "output": {
+                    "text": "OK",
+                    "prompt_tokens": prompt_tokens,
+                    "generated_tokens": 1,
+                },
+            }
+
+        record = {
+            "case_id": "preserve_thinking",
+            "request": {"preserved": preserved_request, "stripped": stripped_request},
+            "status": "completed",
+            "evidence_complete": True,
+            "quality_passed": True,
+            "functional_acceptance_passed": True,
+            "stream_contract_passed": True,
+            "history_coverage_passed": True,
+            "prompt_token_proof": {
+                "preserved_prompt_tokens": 14,
+                "stripped_prompt_tokens": 10,
+                "additional_preserved_tokens": 4,
+                "passed": True,
+            },
+            "output": {
+                "text": "OK",
+                "prompt_tokens": 14,
+                "generated_tokens": 1,
+            },
+            "paired_steps": {
+                "preserved": step(preserved_request, 14),
+                "stripped": step(stripped_request, 10),
+            },
+        }
+        terminal.validate_preserve_thinking_evidence(record, self.root)
+        for field in (
+            "request",
+            "prompt_token_proof",
+            "stream_contract_passed",
+            "history_coverage_passed",
+        ):
+            mutant = copy.deepcopy(record)
+            del mutant[field]
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                terminal.validate_preserve_thinking_evidence(mutant, self.root)
+
     def make_single_matrix(self, label: str) -> tuple[argparse.Namespace, Path, Path]:
         evidence = self.root / label
         evidence.mkdir()
