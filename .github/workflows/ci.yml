@@ -1,6 +1,6 @@
-# NEVER MERGE: read-only SC-23935 health collection after nax-macos-2 lost communication.
-# No checkout, build, model access, Metal command, process signal, or service mutation is permitted.
-name: SC-23935 RC3 MLX runner health diagnostic (NEVER MERGE)
+# NEVER MERGE: read-only SC-23935 evidence from the active RC3 Candle campaign.
+# No checkout, build, model execution, CUDA context, process signal, or service mutation is permitted.
+name: SC-23935 RC3 active Candle health diagnostic (NEVER MERGE)
 
 on:
   workflow_dispatch:
@@ -9,324 +9,164 @@ permissions:
   contents: read
 
 concurrency:
-  group: sc23935-rc3-mlx-runner-health
+  group: sc23935-rc3-active-candle-health
   cancel-in-progress: false
 
 jobs:
-  collect:
-    name: Read-only health evidence from online peer listener
-    runs-on: [self-hosted, macOS, ARM64, nax, rw-starvector]
-    timeout-minutes: 5
-    steps:
-      - name: Assert exact peer listener and collect bounded read-only evidence
-        shell: bash
-        run: |
-          set -u
-          evidence="$RUNNER_TEMP/sc23935-rc3-mlx-runner-health"
-          mkdir -p "$evidence/campaign-files"
-          {
-            printf 'github_sha=%s\n' "$GITHUB_SHA"
-            printf 'github_run_id=%s\n' "$GITHUB_RUN_ID"
-            printf 'runner_name=%s\n' "$RUNNER_NAME"
-            printf 'runner_os=%s\n' "$RUNNER_OS"
-            printf 'runner_arch=%s\n' "$RUNNER_ARCH"
-            printf 'captured_utc='; date -u '+%Y-%m-%dT%H:%M:%SZ'
-          } > "$evidence/identity.txt"
-          if [[ "$RUNNER_NAME" != "nax-macos" ]]; then
-            printf 'refused_runner=%s expected=nax-macos\n' "$RUNNER_NAME" > "$evidence/refused-runner.txt"
-            exit 64
-          fi
-
-          {
-            date -u
-            hostname
-            id -un
-            uptime
-            sw_vers
-            uname -a
-          } > "$evidence/system.txt" 2>&1
-
-          {
-            printf '%s\n' '## df -h'
-            df -h
-            printf '%s\n' '## df -k'
-            df -k
-            printf '%s\n' '## diskutil info /'
-            diskutil info /
-          } > "$evidence/storage.txt" 2>&1 || true
-
-          {
-            printf '%s\n' '## memory_pressure'
-            memory_pressure
-            printf '%s\n' '## vm_stat'
-            vm_stat
-            printf '%s\n' '## memory and swap sysctls'
-            sysctl hw.memsize vm.swapusage kern.boottime
-          } > "$evidence/memory.txt" 2>&1 || true
-
-          # Deliberately collect only executable names, PIDs, parent PIDs, RSS, and elapsed time.
-          # Command arguments and environments can contain secrets and are excluded.
-          ps -axo pid=,ppid=,rss=,etime=,comm= > "$evidence/processes.txt" 2>&1 || true
-
-          {
-            printf '%s\n' '## network state'
-            scutil --nwi
-            printf '%s\n' '## default route'
-            route -n get default
-            printf '%s\n' '## interface counters'
-            netstat -ibdn
-            printf '%s\n' '## bounded GitHub HTTPS reachability'
-            curl --fail --silent --show-error --max-time 15 --output /dev/null \
-              --write-out 'http_code=%{http_code} remote_ip=%{remote_ip} connect_seconds=%{time_connect} tls_seconds=%{time_appconnect} total_seconds=%{time_total}\n' \
-              https://github.com/
-          } > "$evidence/network.txt" 2>&1 || true
-
-          {
-            printf '%s\n' '## power assertions'
-            pmset -g assertions
-            printf '%s\n' '## recent sleep, wake, shutdown, and thermal records'
-            pmset -g log | grep -E ' Sleep | Wake | DarkWake |Shutdown|Restart|thermal|Previous Sleep Cause' | tail -n 400
-          } > "$evidence/power.txt" 2>&1 || true
-
-          {
-            printf '%s\n' '## recent memory-pressure and termination messages'
-            log show --last 2h --style compact --info \
-              --predicate '(eventMessage CONTAINS[c] "jetsam" OR eventMessage CONTAINS[c] "memorystatus" OR eventMessage CONTAINS[c] "out of memory" OR eventMessage CONTAINS[c] "memory pressure" OR eventMessage CONTAINS[c] "killed process")' \
-              | tail -n 1000
-          } > "$evidence/memory-events.txt" 2>&1 || true
-
-          EVIDENCE_ROOT="$evidence" python3 - <<'PY'
-          import datetime
-          import json
-          import os
-          import pathlib
-          import re
-          import shutil
-
-          evidence = pathlib.Path(os.environ["EVIDENCE_ROOT"])
-          cutoff = datetime.datetime(2026, 9, 20, 12, 45, tzinfo=datetime.timezone.utc).timestamp()
-          failed_runner = pathlib.Path("/Users/MTrefry/actions-runner-nax")
-          current_runner = pathlib.Path(os.environ["RUNNER_TEMP"]).resolve().parents[1]
-
-          roots = []
-          for root in (failed_runner, current_runner):
-              if root not in roots:
-                  roots.append(root)
-          (evidence / "runner-roots.json").write_text(
-              json.dumps([str(root) for root in roots], indent=2) + "\n", encoding="utf-8"
-          )
-
-          # Runner diagnostics can contain endpoint query strings or credentials. Preserve only
-          # relevant error/connection lines and redact URLs and credential-like assignments.
-          relevant = re.compile(
-              r"lost communication|disconnect|connection|error|exception|timeout|cancel|orphan|heartbeat",
-              re.IGNORECASE,
-          )
-          redact_url = re.compile(r"https?://\S+", re.IGNORECASE)
-          redact_secret = re.compile(
-              r"(?i)(authorization|bearer|token|password|secret|signature)(\s*[:=]\s*)\S+"
-          )
-          diag_records = []
-          matched_lines = []
-          for root in roots:
-              diag = root / "_diag"
-              if not diag.is_dir():
-                  diag_records.append({"path": str(diag), "exists": False})
-                  continue
-              for path in sorted(diag.glob("*.log")):
-                  try:
-                      stat = path.stat()
-                  except OSError as error:
-                      diag_records.append({"path": str(path), "error": str(error)})
-                      continue
-                  if stat.st_mtime < cutoff:
-                      continue
-                  diag_records.append(
-                      {"path": str(path), "size": stat.st_size, "mtime_unix": stat.st_mtime}
-                  )
-                  try:
-                      for number, line in enumerate(path.open(errors="replace"), 1):
-                          if not relevant.search(line):
-                              continue
-                          line = redact_url.sub("[URL_REDACTED]", line.rstrip())
-                          line = redact_secret.sub(r"\1\2[REDACTED]", line)
-                          matched_lines.append(f"{path.name}:{number}:{line}")
-                          if len(matched_lines) >= 1500:
-                              break
-                  except OSError as error:
-                      matched_lines.append(f"{path.name}:READ_ERROR:{error}")
-                  if len(matched_lines) >= 1500:
-                      break
-          (evidence / "runner-diag-files.json").write_text(
-              json.dumps(diag_records, indent=2) + "\n", encoding="utf-8"
-          )
-          (evidence / "runner-diag-relevant-redacted.txt").write_text(
-              "\n".join(matched_lines) + ("\n" if matched_lines else ""), encoding="utf-8"
-          )
-
-          campaign = failed_runner / "_work" / "_temp" / "qwen38-bonsai-mlx"
-          campaign_inventory = []
-          allowed_suffixes = {".json", ".log", ".txt", ".stdout", ".stderr"}
-          if campaign.is_dir():
-              for path in sorted(campaign.rglob("*")):
-                  if not path.is_file():
-                      continue
-                  try:
-                      stat = path.stat()
-                  except OSError as error:
-                      campaign_inventory.append({"path": str(path), "error": str(error)})
-                      continue
-                  record = {
-                      "path": str(path),
-                      "relative": str(path.relative_to(campaign)),
-                      "size": stat.st_size,
-                      "mtime_unix": stat.st_mtime,
-                  }
-                  campaign_inventory.append(record)
-                  if path.suffix.lower() in allowed_suffixes and stat.st_size <= 50 * 1024 * 1024:
-                      destination = evidence / "campaign-files" / path.relative_to(campaign)
-                      destination.parent.mkdir(parents=True, exist_ok=True)
-                      shutil.copyfile(path, destination)
-          (evidence / "campaign-files-inventory.json").write_text(
-              json.dumps(
-                  {"root": str(campaign), "exists": campaign.is_dir(), "files": campaign_inventory},
-                  indent=2,
-              ) + "\n",
-              encoding="utf-8",
-          )
-
-          crash_roots = [
-              pathlib.Path("/Users/MTrefry/Library/Logs/DiagnosticReports"),
-              pathlib.Path("/Library/Logs/DiagnosticReports"),
-          ]
-          crash_metadata = []
-          for root in crash_roots:
-              if not root.is_dir():
-                  crash_metadata.append({"root": str(root), "exists": False})
-                  continue
-              for path in sorted(root.iterdir()):
-                  if not path.is_file():
-                      continue
-                  try:
-                      stat = path.stat()
-                  except OSError as error:
-                      crash_metadata.append({"path": str(path), "error": str(error)})
-                      continue
-                  if stat.st_mtime >= cutoff:
-                      crash_metadata.append(
-                          {"path": str(path), "size": stat.st_size, "mtime_unix": stat.st_mtime}
-                      )
-          (evidence / "crash-report-metadata.json").write_text(
-              json.dumps(crash_metadata, indent=2) + "\n", encoding="utf-8"
-          )
-          PY
-
-          find "$evidence" -type f -print | sort > "$evidence/file-list.txt"
-
-      - name: Upload read-only health evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: sc23935-rc3-mlx-runner-health-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/sc23935-rc3-mlx-runner-health
-          if-no-files-found: error
-          retention-days: 14
-
   collect-windows:
-    name: Read-only health and completed receipts from idle Windows peer
+    name: Read-only active Candle process and GPU metadata
     runs-on: [self-hosted, Windows, X64, cuda, real-weights]
     timeout-minutes: 5
     steps:
-      - name: Assert exact idle listener and collect bounded read-only evidence
+      - name: Assert idle peer and collect two bounded snapshots
         shell: powershell
         run: |
-          $evidence = Join-Path $env:RUNNER_TEMP 'sc23935-rc3-candle-peer-health'
-          $copied = Join-Path $evidence 'completed-rows'
-          New-Item -ItemType Directory -Path $copied -Force | Out-Null
+          $ErrorActionPreference = 'Stop'
+          $evidenceName = "sc23935-rc3-cuda-active-health-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $evidence = Join-Path $env:RUNNER_TEMP $evidenceName
+          New-Item -ItemType Directory -Path $evidence | Out-Null
+
           [ordered]@{
             github_sha = $env:GITHUB_SHA
             github_run_id = $env:GITHUB_RUN_ID
+            github_run_attempt = $env:GITHUB_RUN_ATTEMPT
             runner_name = $env:RUNNER_NAME
             runner_os = $env:RUNNER_OS
             runner_arch = $env:RUNNER_ARCH
             captured_utc = [DateTime]::UtcNow.ToString('o')
           } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $evidence 'identity.json') -Encoding utf8
+
           if ($env:RUNNER_NAME -ne 'cuda-windows') {
             "refused_runner=$env:RUNNER_NAME expected=cuda-windows" |
               Set-Content -LiteralPath (Join-Path $evidence 'refused-runner.txt') -Encoding ascii
             exit 64
           }
 
-          Get-CimInstance Win32_OperatingSystem |
-            Select-Object Caption,Version,LastBootUpTime,TotalVisibleMemorySize,FreePhysicalMemory,TotalVirtualMemorySize,FreeVirtualMemory |
-            ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $evidence 'memory.json') -Encoding utf8
-          Get-CimInstance Win32_LogicalDisk |
-            Select-Object DeviceID,DriveType,FileSystem,Size,FreeSpace,VolumeName |
-            ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $evidence 'storage.json') -Encoding utf8
-
-          # Deliberately exclude executable paths, command lines, environments, and handles.
-          Get-Process | ForEach-Object {
-            $started = $null
-            try { $started = $_.StartTime.ToUniversalTime().ToString('o') } catch {}
+          function Write-ProcessSnapshot {
+            param([string]$Destination)
+            $capturedTime = [DateTime]::UtcNow
+            $processes = @(Get-CimInstance Win32_Process | ForEach-Object {
+              $started = $null
+              $elapsed = $null
+              try { $started = $_.CreationDate.ToUniversalTime().ToString('o') } catch {}
+              try { $elapsed = ($capturedTime - $_.CreationDate.ToUniversalTime()).TotalSeconds } catch {}
+              [ordered]@{
+                pid = $_.ProcessId
+                parent_pid = $_.ParentProcessId
+                process_name = $_.Name
+                rss_bytes = [uint64]$_.WorkingSetSize
+                cpu_seconds = ([uint64]$_.KernelModeTime + [uint64]$_.UserModeTime) / 10000000.0
+                started_utc = $started
+                elapsed_seconds = $elapsed
+              }
+            })
+            $operatingSystem = Get-CimInstance Win32_OperatingSystem
             [ordered]@{
-              pid = $_.Id
-              process_name = $_.ProcessName
-              rss_bytes = $_.WorkingSet64
-              cpu_seconds = $_.CPU
-              started_utc = $started
-            }
-          } | ConvertTo-Json -Depth 3 |
-            Set-Content -LiteralPath (Join-Path $evidence 'processes.json') -Encoding utf8
-
-          try {
-            Get-NetAdapter |
-              Select-Object Name,InterfaceDescription,Status,LinkSpeed,MediaConnectionState |
-              ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $evidence 'network-adapters.json') -Encoding utf8
-            Get-NetAdapterStatistics |
-              Select-Object Name,ReceivedBytes,SentBytes,ReceivedDiscardedPackets,OutboundDiscardedPackets,ReceivedPacketErrors,OutboundPacketErrors |
-              ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $evidence 'network-counters.json') -Encoding utf8
-          } catch {
-            $_.Exception.Message | Set-Content -LiteralPath (Join-Path $evidence 'network-query-error.txt') -Encoding utf8
+              captured_utc = $capturedTime.ToString('o')
+              host_memory = [ordered]@{
+                total_visible_kib = [uint64]$operatingSystem.TotalVisibleMemorySize
+                free_physical_kib = [uint64]$operatingSystem.FreePhysicalMemory
+                total_virtual_kib = [uint64]$operatingSystem.TotalVirtualMemorySize
+                free_virtual_kib = [uint64]$operatingSystem.FreeVirtualMemory
+              }
+              processes = $processes
+            } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Destination -Encoding utf8
           }
-          Test-NetConnection github.com -Port 443 -InformationLevel Detailed |
-            Select-Object ComputerName,RemoteAddress,RemotePort,NameResolutionResults,InterfaceAlias,SourceAddress,TcpTestSucceeded |
-            ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $evidence 'github-connectivity.json') -Encoding utf8
+
+          function Write-GpuSnapshot {
+            param([string]$Prefix)
+            $timestamp = [DateTime]::UtcNow.ToString('o')
+            $gpuOutput = & nvidia-smi --id=0 --query-gpu=index,uuid,memory.total,memory.free,memory.used,utilization.gpu --format=csv,noheader,nounits 2>&1
+            $gpuExit = $LASTEXITCODE
+            $computeOutput = & nvidia-smi --id=0 --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader,nounits 2>&1
+            $computeExit = $LASTEXITCODE
+            [ordered]@{
+              captured_utc = $timestamp
+              gpu_query_exit_code = $gpuExit
+              compute_query_exit_code = $computeExit
+              gpu_query = @($gpuOutput | ForEach-Object { $_.ToString() })
+              compute_apps_query = @($computeOutput | ForEach-Object { $_.ToString() })
+            } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath "$Prefix.json" -Encoding utf8
+            if ($gpuExit -ne 0 -or $computeExit -ne 0) {
+              throw "nvidia-smi read-only metadata query failed: gpu=$gpuExit compute=$computeExit"
+            }
+          }
+
+          function Copy-BoundedTail {
+            param(
+              [string]$Source,
+              [string]$Destination,
+              [int64]$MaximumBytes = 65536
+            )
+            if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
+              return [ordered]@{ path = $Source; exists = $false }
+            }
+            $item = Get-Item -LiteralPath $Source
+            $take = [Math]::Min($MaximumBytes, $item.Length)
+            $buffer = New-Object byte[] ([int]$take)
+            $stream = [System.IO.File]::Open($Source, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            try {
+              if ($take -gt 0) {
+                [void]$stream.Seek(-$take, [System.IO.SeekOrigin]::End)
+                $read = 0
+                while ($read -lt $take) {
+                  $count = $stream.Read($buffer, $read, [int]($take - $read))
+                  if ($count -eq 0) { break }
+                  $read += $count
+                }
+                if ($read -gt 0) {
+                  [System.IO.File]::WriteAllBytes($Destination, $buffer[0..($read - 1)])
+                } else {
+                  [System.IO.File]::WriteAllBytes($Destination, [byte[]]@())
+                }
+              } else {
+                $read = 0
+                [System.IO.File]::WriteAllBytes($Destination, [byte[]]@())
+              }
+            } finally {
+              $stream.Dispose()
+            }
+            return [ordered]@{
+              path = $Source
+              exists = $true
+              length_bytes = $item.Length
+              copied_tail_bytes = $read
+              last_write_utc = $item.LastWriteTimeUtc.ToString('o')
+              tail_sha256 = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+          }
+
+          Write-ProcessSnapshot -Destination (Join-Path $evidence 'processes-1.json')
+          Write-GpuSnapshot -Prefix (Join-Path $evidence 'gpu-1')
+          Start-Sleep -Seconds 10
+          Write-ProcessSnapshot -Destination (Join-Path $evidence 'processes-2.json')
+          Write-GpuSnapshot -Prefix (Join-Path $evidence 'gpu-2')
 
           $campaign = 'D:\actions-runner-2\_work\_temp\qwen38-bonsai-candle'
-          $inventory = @()
-          if (Test-Path -LiteralPath $campaign -PathType Container) {
-            $inventory = @(Get-ChildItem -LiteralPath $campaign -Recurse -File -ErrorAction SilentlyContinue |
-              Select-Object FullName,Length,LastWriteTimeUtc)
-            foreach ($receipt in Get-ChildItem -LiteralPath $campaign -Recurse -File -Filter 'receipt.json' -ErrorAction SilentlyContinue) {
-              if ($receipt.Length -gt 20971520) { continue }
-              $relativeDirectory = $receipt.DirectoryName.Substring($campaign.Length).TrimStart('\')
-              if (-not $relativeDirectory) { continue }
-              $destination = Join-Path $copied $relativeDirectory
-              New-Item -ItemType Directory -Path $destination -Force | Out-Null
-              foreach ($name in @('receipt.json', 'provider.json', 'stderr.log')) {
-                $source = Join-Path $receipt.DirectoryName $name
-                if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { continue }
-                $file = Get-Item -LiteralPath $source
-                if ($file.Length -le 20971520) {
-                  Copy-Item -LiteralPath $source -Destination (Join-Path $destination $name)
-                }
-              }
-            }
-          }
+          $row = Join-Path $campaign 'candle-cuda-bonsai-gguf'
+          $stdout = Join-Path $row 'stdout.log'
+          $stderr = Join-Path $row 'stderr.log'
+          $tailRecords = @(
+            Copy-BoundedTail -Source $stdout -Destination (Join-Path $evidence 'active-row-stdout.tail.log')
+            Copy-BoundedTail -Source $stderr -Destination (Join-Path $evidence 'active-row-stderr.tail.log')
+          )
           [ordered]@{
-            root = $campaign
-            exists = (Test-Path -LiteralPath $campaign -PathType Container)
-            files = $inventory
-          } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $evidence 'campaign-files-inventory.json') -Encoding utf8
-          Get-ChildItem -LiteralPath $evidence -Recurse -File |
-            Select-Object FullName,Length,LastWriteTimeUtc |
+            campaign_root = $campaign
+            row = 'candle-cuda-bonsai-gguf'
+            row_path = $row
+            row_exists = (Test-Path -LiteralPath $row -PathType Container)
+            files = $tailRecords
+          } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $evidence 'active-row-metadata.json') -Encoding utf8
+
+          Get-ChildItem -LiteralPath $evidence -File |
+            Select-Object Name,Length,LastWriteTimeUtc |
             ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $evidence 'file-list.json') -Encoding utf8
 
-      - name: Upload read-only Windows peer evidence
+      - name: Upload bounded read-only evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: sc23935-rc3-candle-peer-health-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}\sc23935-rc3-candle-peer-health
+          name: sc23935-rc3-cuda-active-health-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}\sc23935-rc3-cuda-active-health-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: error
           retention-days: 14
