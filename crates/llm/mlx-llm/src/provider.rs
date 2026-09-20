@@ -126,16 +126,24 @@ impl Decoder {
         }
     }
 
-    /// Whether ordinary generation stays on MLX's fused/chunked SDPA path. Gemma-2 score
-    /// soft-capping and DeepSeek MLA require the eager score matrix, while Gemma 4 materializes a
-    /// full sliding-window mask before fused dispatch. Keep those paths on the shared quadratic
-    /// estimate; Qwen/Llama-style fused attention is bounded to the runtime's query-chunk limit.
-    fn uses_bounded_attention_workspace(&self) -> bool {
+    /// Select the request-memory contract matching the complete decoder implementation.
+    fn workspace_contract(&self) -> MlxWorkspaceContract<'_> {
         match self {
-            Decoder::Qwen35(_) => true,
+            Decoder::Qwen35(m) if m.config().moe.is_none() => MlxWorkspaceContract::Qwen35 {
+                config: m.config(),
+                prism: m.is_prism(),
+            },
+            // The MoE expert gather/scatter lifetime differs from the dense path below and has no
+            // complete-model allocator calibration yet. Retain the safe eager estimate rather than
+            // applying a dense-Qwen envelope to a different execution graph.
+            Decoder::Qwen35(_) => MlxWorkspaceContract::Eager,
             Decoder::Causal(m) => {
                 let c = m.config();
-                c.attn_logit_softcap.is_none() && !c.is_mla() && c.gemma4.is_none()
+                if c.attn_logit_softcap.is_none() && !c.is_mla() && c.gemma4.is_none() {
+                    MlxWorkspaceContract::Chunked
+                } else {
+                    MlxWorkspaceContract::Eager
+                }
             }
         }
     }
@@ -1488,7 +1496,7 @@ impl TextLlm for LlamaProvider {
                     .map_or(0, |c| c.recommended_draft_tokens),
                 MtpMode::Enabled { draft_tokens } => draft_tokens,
             },
-            self.model.uses_bounded_attention_workspace(),
+            self.model.workspace_contract(),
         )
         .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
         let available = core_llm::effective_memory_budget(
@@ -2055,34 +2063,204 @@ fn map_sampling(s: &Sampling) -> SamplingParams {
     }
 }
 
-/// Select the estimate matching the decoder's actual attention implementation. Eager fallbacks keep
-/// the quadratic model; ordinary MLX fused SDPA receives at most
-/// [`SDPA_MAX_FUSED_QLEN`] query rows at a time.
+#[derive(Clone, Copy)]
+enum MlxWorkspaceContract<'a> {
+    Eager,
+    Chunked,
+    Qwen35 {
+        config: &'a Qwen35Config,
+        prism: bool,
+    },
+}
+
+/// MLX permits ten completed command buffers to remain in flight and can be building the next
+/// buffer before applying backpressure. Price that current buffer plus the in-flight set.
+const MLX_EVAL_BUFFER_WINDOW: u64 = 11;
+/// Apple-Silicon Metal allocations are rounded to 16-KiB VM pages. Gated DeltaNet retains one
+/// independently allocated output row per prompt token until its final concatenate.
+const MLX_ALLOCATION_PAGE_BYTES: u64 = 16 * 1024;
+/// The recurrence creates five one-element index buffers per step and evaluates every 256 steps.
+const QWEN35_RECURRENCE_EVAL_CHUNK: u64 = 256;
+const QWEN35_RECURRENCE_INDEX_BUFFERS: u64 = 5;
+/// The input/decayed state, two state products, outer product, and updated state can coexist across
+/// the evaluator window while one recurrence chunk is being materialized.
+const QWEN35_RECURRENCE_STATE_BUFFERS: u64 = 6;
+
+fn checked_sum(values: impl IntoIterator<Item = u64>) -> Option<u64> {
+    values
+        .into_iter()
+        .try_fold(0u64, |sum, value| sum.checked_add(value))
+}
+
+fn checked_product(values: impl IntoIterator<Item = u64>) -> Option<u64> {
+    values
+        .into_iter()
+        .try_fold(1u64, |product, value| product.checked_mul(value))
+}
+
+fn round_up(value: u64, alignment: u64) -> Option<u64> {
+    value
+        .checked_add(alignment.checked_sub(1)?)?
+        .checked_div(alignment)?
+        .checked_mul(alignment)
+}
+
+/// Extra complete-decoder workspace above the generic chunked-attention estimate for dense
+/// Qwen3.5. Every term corresponds to a prompt-sized tensor retained by the Rust graph or by the
+/// pinned MLX evaluator; all tensor elements are charged at four bytes even when the runtime value
+/// is BF16.
+fn estimate_qwen35_workspace_extra_bytes(
+    prompt_tokens: usize,
+    config: &Qwen35Config,
+    prism: bool,
+) -> Option<u64> {
+    let prompt = u64::try_from(prompt_tokens).ok()?;
+    let nonnegative = |value: i32| u64::try_from(value).ok();
+    let hidden = nonnegative(config.hidden_size)?;
+    let intermediate = nonnegative(config.intermediate_size)?;
+    let query_heads = nonnegative(config.num_heads)?;
+    let head_dim = nonnegative(config.head_dim)?;
+    let key_heads = nonnegative(config.linear_num_key_heads)?;
+    let value_heads = nonnegative(config.linear_num_value_heads)?;
+    let key_head_dim = nonnegative(config.linear_key_head_dim)?;
+    let value_head_dim = nonnegative(config.linear_value_head_dim)?;
+    let conv_kernel = nonnegative(config.linear_conv_kernel_dim)?;
+    let key_width = key_heads.checked_mul(key_head_dim)?;
+    let value_width = value_heads.checked_mul(value_head_dim)?;
+    let conv_width = key_width.checked_mul(2)?.checked_add(value_width)?;
+    let attention_width = query_heads.checked_mul(head_dim)?;
+
+    // PrismLinear builds cast -> sign multiply -> Hadamard -> cast graphs independently for each
+    // projection. The full-attention block has the wider simultaneous input-width sum; the linear
+    // block uses two mixer input rotations plus its output rotation. Four buffers per input width
+    // safely covers the F32 chain and the BF16 result even when donation is unavailable.
+    let packed_rotation_elements = if prism {
+        let linear_widths = checked_sum([hidden.checked_mul(4)?, value_width, intermediate])?;
+        let attention_widths =
+            checked_sum([hidden.checked_mul(5)?, attention_width, intermediate])?;
+        linear_widths.max(attention_widths).checked_mul(4)?
+    } else {
+        0
+    };
+
+    // The ops recurrence expands Q/K from key heads to value heads, casts Q/K/V to F32, and keeps
+    // every F32 Y row until concatenate. Count two Q/K tensors plus V and Y.
+    let recurrence_elements = checked_sum([
+        value_heads.checked_mul(key_head_dim)?.checked_mul(2)?,
+        value_width.checked_mul(2)?,
+    ])?;
+
+    // Bound the lazy linear-mixer graph through the four-term depthwise convolution, normalized
+    // Q/K, gates, and projection outputs. `(2*K + 3)` covers K products, K-1 additions, the
+    // concatenated input, convolution output, and activation output.
+    let mixer_elements = checked_sum([
+        conv_width.checked_mul(conv_kernel.checked_mul(2)?.checked_add(3)?)?,
+        value_width,
+        key_width.checked_mul(2)?,
+        value_heads.checked_mul(2)?,
+    ])?;
+
+    // Completed Metal command buffers retain primitive inputs until their callbacks run. Bound one
+    // largest prompt-sized output for each possible in-flight/current buffer.
+    let largest_output = [
+        hidden,
+        intermediate,
+        conv_width,
+        attention_width.checked_mul(2)?,
+        value_width,
+    ]
+    .into_iter()
+    .max()?;
+    let evaluator_elements = largest_output.checked_mul(MLX_EVAL_BUFFER_WINDOW)?;
+
+    let per_token_elements = checked_sum([
+        packed_rotation_elements,
+        recurrence_elements,
+        mixer_elements,
+        evaluator_elements,
+    ])?;
+    let prompt_workspace = checked_product([prompt, per_token_elements, 4])?;
+    // The shared tiled estimate prices one score/mask/softmax set. MLX can retain the same three
+    // buffers for the rest of its evaluator window, so price those additional tiles here.
+    let attention_window = checked_product([
+        prompt,
+        prompt.min(SDPA_MAX_FUSED_QLEN as u64),
+        query_heads,
+        3,
+        MLX_EVAL_BUFFER_WINDOW.checked_sub(1)?,
+        4,
+    ])?;
+
+    // Each retained recurrence row owns a separate allocator buffer; price its VM-page rounding.
+    let y_row_bytes = value_width.checked_mul(4)?;
+    let row_padding = round_up(y_row_bytes, MLX_ALLOCATION_PAGE_BYTES)?
+        .checked_sub(y_row_bytes)?
+        .checked_mul(prompt)?;
+    // Index buffers are created eagerly for all five slices in a 256-step recurrence chunk.
+    let index_buffers = checked_product([
+        QWEN35_RECURRENCE_EVAL_CHUNK,
+        QWEN35_RECURRENCE_INDEX_BUFFERS,
+        MLX_ALLOCATION_PAGE_BYTES,
+    ])?;
+    let recurrent_state_buffers = checked_product([
+        value_width,
+        key_head_dim,
+        4,
+        QWEN35_RECURRENCE_STATE_BUFFERS,
+        MLX_EVAL_BUFFER_WINDOW,
+    ])?;
+
+    checked_sum([
+        prompt_workspace,
+        attention_window,
+        row_padding,
+        index_buffers,
+        recurrent_state_buffers,
+    ])
+}
+
+/// Select the estimate matching the complete decoder execution graph. Generic fused attention uses
+/// the shared tiled estimate. Dense Qwen3.5 adds its F32 recurrence, packed-Hadamard, allocator, and
+/// lazy-evaluator lifetimes; eager/otherwise-unbounded implementations retain the quadratic model.
 fn estimate_mlx_request_bytes(
     prompt_tokens: usize,
     max_new_tokens: u32,
     geometry: LlmMemoryGeometry,
     vision_workspace_bytes: u64,
     mtp_width: u32,
-    bounded_attention: bool,
+    contract: MlxWorkspaceContract<'_>,
 ) -> Option<u64> {
-    if bounded_attention {
-        core_llm::estimate_chunked_request_bytes(
+    match contract {
+        MlxWorkspaceContract::Eager => core_llm::estimate_request_bytes(
+            prompt_tokens,
+            max_new_tokens,
+            geometry,
+            vision_workspace_bytes,
+            mtp_width,
+        ),
+        MlxWorkspaceContract::Chunked => core_llm::estimate_chunked_request_bytes(
             prompt_tokens,
             max_new_tokens,
             geometry,
             vision_workspace_bytes,
             mtp_width,
             SDPA_MAX_FUSED_QLEN as usize,
-        )
-    } else {
-        core_llm::estimate_request_bytes(
-            prompt_tokens,
-            max_new_tokens,
-            geometry,
-            vision_workspace_bytes,
-            mtp_width,
-        )
+        ),
+        MlxWorkspaceContract::Qwen35 { config, prism } => {
+            let base = core_llm::estimate_chunked_request_bytes(
+                prompt_tokens,
+                max_new_tokens,
+                geometry,
+                vision_workspace_bytes,
+                mtp_width,
+                SDPA_MAX_FUSED_QLEN as usize,
+            )?;
+            base.checked_add(estimate_qwen35_workspace_extra_bytes(
+                prompt_tokens,
+                config,
+                prism,
+            )?)
+        }
     }
 }
 
@@ -2316,6 +2494,26 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn frozen_dense_qwen35_config() -> Qwen35Config {
+        Qwen35Config::from_json(&json!({
+            "model_type": "qwen3_5_text",
+            "hidden_size": 5120,
+            "num_hidden_layers": 64,
+            "intermediate_size": 17_408,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+            "vocab_size": 248_320,
+            "linear_num_value_heads": 48,
+            "linear_num_key_heads": 16,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+            "full_attention_interval": 4
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn fused_request_estimate_tracks_chunked_attention_and_last_row_logits() {
         // Frozen Qwen3.8 parent geometry. This prompt size reproduces the campaign's long-context
@@ -2332,8 +2530,12 @@ mod tests {
             vocab_size: 248_320,
             recurrent_bytes: 0,
         };
-        let fused = estimate_mlx_request_bytes(29_600, 128, geometry, 0, 0, true).unwrap();
-        let eager = estimate_mlx_request_bytes(29_600, 128, geometry, 0, 0, false).unwrap();
+        let fused =
+            estimate_mlx_request_bytes(29_600, 128, geometry, 0, 0, MlxWorkspaceContract::Chunked)
+                .unwrap();
+        let eager =
+            estimate_mlx_request_bytes(29_600, 128, geometry, 0, 0, MlxWorkspaceContract::Eager)
+                .unwrap();
         assert!(fused < 36_000_000_000, "bounded MLX peak: {fused}");
         assert!(eager > 400_000_000_000, "quadratic eager peak: {eager}");
         assert_eq!(
@@ -2356,12 +2558,96 @@ mod tests {
             vocab_size: 1024,
             recurrent_bytes: 4096,
         };
-        let plain = estimate_mlx_request_bytes(128, 16, geometry, 0, 0, true).unwrap();
-        let media = estimate_mlx_request_bytes(128, 16, geometry, 123_456, 0, true).unwrap();
-        let mtp = estimate_mlx_request_bytes(128, 16, geometry, 0, 3, true).unwrap();
+        let plain =
+            estimate_mlx_request_bytes(128, 16, geometry, 0, 0, MlxWorkspaceContract::Chunked)
+                .unwrap();
+        let media = estimate_mlx_request_bytes(
+            128,
+            16,
+            geometry,
+            123_456,
+            0,
+            MlxWorkspaceContract::Chunked,
+        )
+        .unwrap();
+        let mtp =
+            estimate_mlx_request_bytes(128, 16, geometry, 0, 3, MlxWorkspaceContract::Chunked)
+                .unwrap();
         assert_eq!(media - plain, 123_456);
         assert!(mtp > plain);
-        assert!(estimate_mlx_request_bytes(usize::MAX, u32::MAX, geometry, 0, 3, true).is_none());
+        assert!(estimate_mlx_request_bytes(
+            usize::MAX,
+            u32::MAX,
+            geometry,
+            0,
+            3,
+            MlxWorkspaceContract::Chunked,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn qwen35_prism_estimate_covers_frozen_allocator_peaks_and_rejects_remote_long_context() {
+        let config = frozen_dense_qwen35_config();
+        let geometry = LlmMemoryGeometry {
+            query_heads: 24,
+            kv_heads: 4,
+            head_dim: 256,
+            layers: 64,
+            element_bytes: 4,
+            hidden_size: 5120,
+            intermediate_size: 17_408,
+            vocab_size: 248_320,
+            recurrent_bytes: 207_618_048,
+        };
+        let contract = MlxWorkspaceContract::Qwen35 {
+            config: &config,
+            prism: true,
+        };
+        let context_64 = estimate_mlx_request_bytes(1_187, 128, geometry, 0, 0, contract).unwrap();
+        let context_512 = estimate_mlx_request_bytes(9_251, 128, geometry, 0, 0, contract).unwrap();
+        let context_2048 =
+            estimate_mlx_request_bytes(36_899, 128, geometry, 0, 0, contract).unwrap();
+
+        // Frozen campaign 35461924246: subtract the stable loaded-model active residency
+        // (8,551,959,848) from each new process-global allocator high-water mark.
+        assert!(context_64 >= 4_091_010_468, "estimate: {context_64}");
+        assert!(context_512 >= 22_885_373_536, "estimate: {context_512}");
+        assert_eq!(context_64, 4_152_141_184);
+        assert_eq!(context_512, 28_934_038_912);
+        assert_eq!(context_2048, 113_900_545_408);
+        assert!(context_64 < context_512 && context_512 < context_2048);
+        assert!(
+            core_llm::admit_request_memory(context_2048, 47_922_610_176).is_err(),
+            "the 36,899-token request must not be admitted on the failed remote's observed budget"
+        );
+    }
+
+    #[test]
+    fn qwen35_workspace_estimate_is_checked_and_keeps_ordinary_requests_available() {
+        let config = frozen_dense_qwen35_config();
+        let geometry = LlmMemoryGeometry {
+            query_heads: 24,
+            kv_heads: 4,
+            head_dim: 256,
+            layers: 64,
+            element_bytes: 4,
+            hidden_size: 5120,
+            intermediate_size: 17_408,
+            vocab_size: 248_320,
+            recurrent_bytes: 207_618_048,
+        };
+        let contract = MlxWorkspaceContract::Qwen35 {
+            config: &config,
+            prism: true,
+        };
+        let ordinary = estimate_mlx_request_bytes(128, 128, geometry, 0, 0, contract).unwrap();
+        assert!(ordinary < 2_000_000_000, "ordinary estimate: {ordinary}");
+        assert!(core_llm::admit_request_memory(ordinary, 8_000_000_000).is_ok());
+        assert!(
+            estimate_mlx_request_bytes(usize::MAX, u32::MAX, geometry, u64::MAX, 3, contract,)
+                .is_none()
+        );
     }
 
     #[test]

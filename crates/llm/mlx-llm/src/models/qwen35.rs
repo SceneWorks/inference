@@ -638,6 +638,7 @@ pub struct Qwen35Model {
     cfg: Qwen35Config,
     eps: f32,
     quantized: bool,
+    prism: bool,
 }
 
 #[derive(Debug)]
@@ -683,6 +684,11 @@ impl Qwen35Model {
     /// Whether the large projections were quantized on load.
     pub fn is_quantized(&self) -> bool {
         self.quantized
+    }
+
+    /// Whether projections use the packed Prism Hadamard path.
+    pub fn is_prism(&self) -> bool {
+        self.prism
     }
 
     /// Whether this snapshot loaded a complete native multi-token predictor.
@@ -1416,6 +1422,7 @@ impl Qwen35Model {
             eps,
             cfg,
             quantized: prism.is_some() || quant.is_some() || saw_stored.get(),
+            prism: prism.is_some(),
         };
         w.verify_accessed_gpu_view()?;
         Ok(model)
