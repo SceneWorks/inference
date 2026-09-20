@@ -1,6 +1,6 @@
 //! Request-scoped memory admission for local LLM providers.
 
-use crate::{Error, Result};
+use crate::{Error, RequestResourceExhausted, Result};
 
 /// Deterministic operational override used by CI and by discrete-device launchers.
 pub const AVAILABLE_MEMORY_OVERRIDE: &str = "SCENEWORKS_LLM_AVAILABLE_MEMORY_BYTES";
@@ -145,6 +145,26 @@ pub fn admit_request_memory(required: u64, available: u64) -> Result<()> {
         return Err(Error::InvalidRequest(format!(
             "request requires an estimated {required} bytes of native workspace but only {available} bytes are available; reduce prompt/media length or max_new_tokens"
         )));
+    }
+    Ok(())
+}
+
+/// Reject an architecturally valid generation request with typed preallocation evidence.
+pub fn admit_request_memory_with_geometry(
+    prompt_tokens: usize,
+    max_new_tokens: u32,
+    max_context_tokens: usize,
+    required_bytes: u64,
+    available_bytes: u64,
+) -> Result<()> {
+    if required_bytes > available_bytes {
+        return Err(Error::RequestResourceExhausted(RequestResourceExhausted {
+            prompt_tokens,
+            max_new_tokens,
+            max_context_tokens,
+            required_bytes,
+            available_bytes,
+        }));
     }
     Ok(())
 }
@@ -348,6 +368,28 @@ mod tests {
         assert!(error.contains("estimated 200 bytes"));
         assert!(error.contains("only 100 bytes are available"));
         assert!(error.contains("reduce prompt/media length or max_new_tokens"));
+    }
+
+    #[test]
+    fn request_rejection_retains_exact_geometry_and_compatible_display() {
+        let error = admit_request_memory_with_geometry(80, 16, 128, 200, 100).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            admit_request_memory(200, 100).unwrap_err().to_string()
+        );
+        let Error::RequestResourceExhausted(evidence) = error else {
+            panic!("request admission must remain typed");
+        };
+        assert_eq!(
+            evidence,
+            RequestResourceExhausted {
+                prompt_tokens: 80,
+                max_new_tokens: 16,
+                max_context_tokens: 128,
+                required_bytes: 200,
+                available_bytes: 100,
+            }
+        );
     }
 
     #[test]

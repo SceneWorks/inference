@@ -1503,7 +1503,13 @@ impl TextLlm for LlamaProvider {
             core_llm::available_host_memory_bytes(),
             core_llm::operational_memory_override()?,
         )?;
-        core_llm::admit_request_memory(required, available)?;
+        core_llm::admit_request_memory_with_geometry(
+            admitted_prompt,
+            req.max_new_tokens,
+            self.descriptor.capabilities.max_context_tokens,
+            required,
+            available,
+        )?;
 
         // Encode + splice the visuals and compute M-RoPE positions (the placeholder-expanded prompt
         // becomes the effective sequence). `None` on the text-only path.

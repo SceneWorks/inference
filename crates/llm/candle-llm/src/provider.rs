@@ -1908,7 +1908,13 @@ impl TextLlm for LlamaProvider {
         )
         .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
         let available = request_available_memory(self.model.device())?;
-        core_llm::admit_request_memory(required, available)?;
+        core_llm::admit_request_memory_with_geometry(
+            admitted_prompt,
+            req.max_new_tokens,
+            self.descriptor.capabilities.max_context_tokens,
+            required,
+            available,
+        )?;
 
         self.model
             .device()

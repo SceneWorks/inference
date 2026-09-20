@@ -1079,18 +1079,123 @@ def validate_receipt(
     cases = provider.get("cases")
     if not isinstance(cases, list) or not cases:
         raise ValueError(f"provider evidence has no cases in {root}")
-    for case in cases:
-        if case.get("case_id") == "preserve_thinking":
-            validate_preserve_thinking_evidence(case, root)
+    context_ids = {"context_64": 64, "context_512": 512, "context_2048": 2048}
+    completed_context = False
+
+    def validate_completed_case(case: dict[str, Any], label: str) -> None:
         if case.get("status") != "completed" or case.get("evidence_complete") is not True:
-            raise ValueError(f"case {case.get('case_id')} has broken evidence in {root}")
+            raise ValueError(f"{label} has broken evidence in {root}")
         for phase in ("prefill_seconds", "decode_seconds"):
             value = case.get(phase)
             if not isinstance(value, (int, float)) or value < 0:
-                raise ValueError(f"case {case.get('case_id')} lacks {phase} in {root}")
+                raise ValueError(f"{label} lacks {phase} in {root}")
         output = case.get("output", {})
         if not isinstance(output.get("prompt_tokens"), int) or output["prompt_tokens"] <= 0:
-            raise ValueError(f"case {case.get('case_id')} lacks exact prompt tokens in {root}")
+            raise ValueError(f"{label} lacks exact prompt tokens in {root}")
+
+    for case in cases:
+        if case.get("case_id") == "preserve_thinking":
+            validate_preserve_thinking_evidence(case, root)
+        case_id = case.get("case_id")
+        if case.get("status") == "completed":
+            validate_completed_case(case, f"case {case_id}")
+            completed_context |= case_id in context_ids and case.get("category") == "context"
+            continue
+        if case.get("status") != "resource_declined":
+            raise ValueError(f"case {case_id} has broken evidence in {root}")
+        if case_id not in context_ids or case.get("category") != "context":
+            raise ValueError(f"non-context case {case_id} cannot be resource declined in {root}")
+        admission = case.get("resource_admission")
+        request = case.get("request", {})
+        descriptor_limit = provider.get("provider", {}).get("max_context_tokens")
+        integer_fields = (
+            "prompt_tokens",
+            "max_new_tokens",
+            "max_context_tokens",
+            "required_bytes",
+            "available_bytes",
+        )
+        if (
+            case.get("evidence_complete") is not True
+            or not isinstance(admission, dict)
+            or admission.get("preallocation_rejected") is not True
+            or any(
+                type(admission.get(field)) is not int or admission[field] < 0
+                for field in integer_fields
+            )
+            or admission["prompt_tokens"] <= 0
+            or admission["max_new_tokens"] != request.get("max_new_tokens")
+            or admission["max_context_tokens"] != descriptor_limit
+            or admission["prompt_tokens"] + admission["max_new_tokens"]
+            > admission["max_context_tokens"]
+            or admission["required_bytes"] <= admission["available_bytes"]
+        ):
+            raise ValueError(f"context resource decline is malformed in {root}")
+        expected_error = (
+            f"estimated {admission['required_bytes']} bytes of native workspace but only "
+            f"{admission['available_bytes']} bytes are available"
+        )
+        if expected_error not in case.get("error", ""):
+            raise ValueError(f"context resource decline error is unbound in {root}")
+        forbidden = (
+            "output",
+            "quality_passed",
+            "functional_acceptance_passed",
+            "stream_contract_passed",
+            "total_seconds",
+            "time_to_first_token_seconds",
+            "time_to_first_token_unavailable_reason",
+            "prefill_seconds",
+            "decode_seconds",
+        )
+        if any(field in case for field in forbidden) or case.get("events") != []:
+            raise ValueError(f"context resource decline fabricates execution evidence in {root}")
+        recovery = case.get("recovery")
+        if not isinstance(recovery, dict):
+            raise ValueError(f"context resource decline lacks recovery in {root}")
+        recovery_id = recovery.get("case_id")
+        matching = [
+            candidate
+            for candidate in cases
+            if candidate.get("case_id") == recovery_id
+            and candidate.get("category") == "context"
+        ]
+        if (
+            recovery_id not in context_ids
+            or context_ids[recovery_id] >= context_ids[case_id]
+            or len(matching) != 1
+            or recovery.get("request") != matching[0].get("request")
+        ):
+            raise ValueError(f"context resource decline recovery is not a selected shorter row in {root}")
+        validate_completed_case(recovery, f"context recovery {recovery_id}")
+        output = recovery["output"]
+        events = recovery.get("events")
+        if not isinstance(output, dict) or not isinstance(events, list) or any(
+            not isinstance(event, dict) for event in events
+        ):
+            raise ValueError(f"context resource decline recovery is incomplete in {root}")
+        tokens = [event for event in events if event.get("event") == "token"]
+        done = [event for event in events if event.get("event") == "done"]
+        content = "".join(event.get("text", "") for event in tokens if event.get("channel") == "Content")
+        thinking = "".join(event.get("text", "") for event in tokens if event.get("channel") == "Thinking")
+        indexes = [event.get("index") for event in tokens]
+        exact_stream = (
+            recovery.get("stream_contract_passed") is True
+            and type(output.get("generated_tokens")) is int
+            and len(done) == 1
+            and done[0].get("prompt_tokens") == output.get("prompt_tokens")
+            and done[0].get("generated_tokens") == output.get("generated_tokens")
+            and done[0].get("finish_reason") == output.get("finish_reason")
+            and all(type(index) is int for index in indexes)
+            and indexes == sorted(indexes)
+            and len(indexes) == len(set(indexes))
+            and content == output.get("text", "")
+            and thinking == (output.get("thinking") or "")
+        )
+        if not exact_stream or output["prompt_tokens"] >= admission["prompt_tokens"]:
+            raise ValueError(f"context resource decline recovery is incomplete in {root}")
+    if any(case.get("category") == "context" for case in cases) and not completed_context:
+        raise ValueError(f"provider lacks a successful real context row in {root}")
     return receipt, provider
 
 
@@ -1132,8 +1237,21 @@ def validate(args: argparse.Namespace) -> int:
             raise ValueError(f"unequal requests or budgets for {receipt['model']['id']}")
     categories: dict[str, list[dict[str, Any]]] = {}
     raw_outputs: list[dict[str, Any]] = []
+    resource_declines: list[dict[str, Any]] = []
     for receipt, provider in rows:
         for case in selected_cases(provider):
+            if case["status"] == "resource_declined":
+                resource_declines.append(
+                    {
+                        "model_id": receipt["model"]["id"],
+                        "case_id": case["case_id"],
+                        "category": case["category"],
+                        "request": case["request"],
+                        "resource_admission": case["resource_admission"],
+                        "recovery": case["recovery"],
+                    }
+                )
+                continue
             row = {
                 "model_id": receipt["model"]["id"],
                 "case_id": case["case_id"],
@@ -1171,6 +1289,7 @@ def validate(args: argparse.Namespace) -> int:
         ],
         "categories": categories,
         "raw_outputs": raw_outputs,
+        "resource_declines": resource_declines,
     }
     write_new(args.output, report)
     markdown = [
@@ -1186,6 +1305,19 @@ def validate(args: argparse.Namespace) -> int:
             f"| {row['model_id']} | {row['case_id']} | {row['category']} | "
             f"{row['quality_passed']} | {row['prompt_tokens']} | {row['generated_tokens']} | "
             f"{row['prefill_seconds']:.6f} | {row['decode_seconds']:.6f} |"
+        )
+    if resource_declines:
+        markdown.extend(
+            [
+                "",
+                "## Resource limitations",
+                "",
+                "These architecturally valid context requests were rejected before native allocation and are not quality or latency samples.",
+                "",
+                "```json",
+                json.dumps(resource_declines, indent=2, sort_keys=True),
+                "```",
+            ]
         )
     markdown.extend(["", "## Raw outputs", "", "```json", json.dumps(raw_outputs, indent=2, sort_keys=True), "```", ""])
     args.markdown.parent.mkdir(parents=True, exist_ok=True)
@@ -1413,6 +1545,13 @@ def matrix_status(args: argparse.Namespace) -> int:
                         expected_case_ids = group_case_ids + acceptance_case_ids
                         if [case.get("case_id") for case in provider["cases"]] != expected_case_ids:
                             raise ValueError("run cases do not match matrix workload group")
+                        if group != "matched" and any(
+                            case.get("status") == "resource_declined"
+                            for case in provider["cases"]
+                        ):
+                            raise ValueError(
+                                "resource declines are only valid in the matched context ladder"
+                            )
                         accepted_ids = []
                         if groups[group].get("functional_acceptance") is True:
                             accepted_ids.extend(group_case_ids)

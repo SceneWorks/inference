@@ -201,6 +201,64 @@ class TerminalEvidenceTests(unittest.TestCase):
             },
         )
 
+    def add_context_decline(self, root: Path, *, available_bytes: int = 100) -> None:
+        path = root / "provider.json"
+        provider = json.loads(path.read_text(encoding="utf-8"))
+        provider["provider"]["max_context_tokens"] = 262144
+        short = copy.deepcopy(provider["cases"][0])
+        short.update(case_id="context_64", category="context")
+        short["stream_contract_passed"] = True
+        short["request"] = {"max_new_tokens": 128, "sampling": {"temperature": 0.0}}
+        short["output"]["prompt_tokens"] = 1187
+        short["output"]["finish_reason"] = "Stop"
+        short["events"] = [
+            {
+                "event": "token",
+                "seconds": 0.1,
+                "id": 7,
+                "index": 0,
+                "channel": "Content",
+                "text": "391",
+            },
+            {
+                "event": "done",
+                "seconds": 0.2,
+                "finish_reason": "Stop",
+                "prompt_tokens": 1187,
+                "generated_tokens": 1,
+            },
+        ]
+        recovery = copy.deepcopy(short)
+        long_request = {"max_new_tokens": 128, "sampling": {"temperature": 0.0}}
+        required_bytes = 113_900_545_408
+        decline = {
+            "schema_version": 1,
+            "case_id": "context_2048",
+            "category": "context",
+            "request": long_request,
+            "oracle": {"kind": "exact", "value": "NEBULA-47"},
+            "status": "resource_declined",
+            "error": (
+                f"invalid request: request requires an estimated {required_bytes} bytes of "
+                f"native workspace but only {available_bytes} bytes are available; reduce "
+                "prompt/media length or max_new_tokens"
+            ),
+            "evidence_complete": True,
+            "resource_admission": {
+                "preallocation_rejected": True,
+                "prompt_tokens": 36899,
+                "max_new_tokens": 128,
+                "max_context_tokens": 262144,
+                "required_bytes": required_bytes,
+                "available_bytes": available_bytes,
+            },
+            "events": [],
+            "recovery": recovery,
+        }
+        provider["cases"].extend([short, decline])
+        path.write_text(json.dumps(provider), encoding="utf-8")
+        self.reseal_run(root)
+
     def write_manifest(self, rows: list[tuple[str, str]], name: str = "models.toml") -> Path:
         manifest = self.root / name
         content = ["schema_version = 1", ""]
@@ -387,6 +445,83 @@ class TerminalEvidenceTests(unittest.TestCase):
                 self.reseal_run(run)
                 with self.assertRaisesRegex(ValueError, "resource rejection"):
                     terminal.validate_receipt(run)
+
+    def test_context_resource_decline_is_a_limitation_with_real_recovery(self) -> None:
+        first = self.make_run("decline-a")
+        second = self.make_run("decline-b")
+        self.add_context_decline(first, available_bytes=0)
+        self.add_context_decline(second)
+        terminal.validate_receipt(first)
+        args = argparse.Namespace(
+            run=[first, second],
+            expected_model=["decline-a", "decline-b"],
+            runtime_sha=self.runtime_sha,
+            case_ids=["arithmetic", "context_64", "context_2048"],
+            output=self.root / "comparison.json",
+            markdown=self.root / "comparison.md",
+        )
+        self.assertEqual(terminal.validate(args), 0)
+        report = json.loads(args.output.read_text(encoding="utf-8"))
+        self.assertEqual(len(report["resource_declines"]), 2)
+        self.assertNotIn("context_2048", {row["case_id"] for row in report["raw_outputs"]})
+        self.assertIn("not quality or latency samples", args.markdown.read_text(encoding="utf-8"))
+
+    def test_context_resource_decline_mutations_fail_closed(self) -> None:
+        mutations = {
+            "missing-field": lambda case, provider: case["resource_admission"].pop("prompt_tokens"),
+            "not-exhausted": lambda case, provider: case["resource_admission"].update(
+                required_bytes=100, available_bytes=100
+            ),
+            "architecture-overflow": lambda case, provider: case["resource_admission"].update(
+                prompt_tokens=262100
+            ),
+            "fabricated-output": lambda case, provider: case.update(output={"prompt_tokens": 36899}),
+            "fabricated-timing": lambda case, provider: case.update(prefill_seconds=0.0),
+            "fabricated-stream": lambda case, provider: case["events"].append(
+                {"event": "token", "index": 0, "channel": "Content", "text": "fake"}
+            ),
+            "non-context": lambda case, provider: case.update(
+                case_id="arithmetic", category="math"
+            ),
+            "missing-recovery": lambda case, provider: case.pop("recovery"),
+            "failed-recovery": lambda case, provider: case["recovery"].update(status="failed"),
+            "zero-available-failed-recovery": lambda case, provider: (
+                case["resource_admission"].update(available_bytes=0),
+                case.update(
+                    error=(
+                        "invalid request: request requires an estimated 113900545408 bytes of "
+                        "native workspace but only 0 bytes are available; reduce prompt/media "
+                        "length or max_new_tokens"
+                    )
+                ),
+                case["recovery"].update(status="failed"),
+            ),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                run = self.make_run(f"decline-{name}")
+                self.add_context_decline(run)
+                path = run / "provider.json"
+                provider = json.loads(path.read_text(encoding="utf-8"))
+                decline = provider["cases"][-1]
+                mutate(decline, provider)
+                path.write_text(json.dumps(provider), encoding="utf-8")
+                self.reseal_run(run)
+                with self.assertRaisesRegex(ValueError, "context|non-context"):
+                    terminal.validate_receipt(run)
+
+    def test_comparison_rejects_a_dropped_requested_case(self) -> None:
+        run = self.make_run("dropped-case")
+        args = argparse.Namespace(
+            run=[run],
+            expected_model=["dropped-case"],
+            runtime_sha=self.runtime_sha,
+            case_ids=["arithmetic", "context_64"],
+            output=self.root / "dropped-comparison.json",
+            markdown=self.root / "dropped-comparison.md",
+        )
+        with self.assertRaisesRegex(ValueError, "exact selected cases"):
+            terminal.validate(args)
 
     def test_tampered_or_truncated_artifact_is_rejected(self) -> None:
         run = self.make_run("tampered")

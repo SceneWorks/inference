@@ -118,6 +118,60 @@ pub fn request_evidence(request: &TextLlmRequest) -> Value {
 /// native instrumentation. Absent native phase measurements make evidence incomplete; a run that
 /// emits no token events (for example, only a structured tool call) has explicitly unavailable TTFT.
 pub fn measure_case(provider: &dyn TextLlm, case: &ComparisonCase) -> Value {
+    measure_case_inner(provider, case, false)
+}
+
+fn context_repetitions(case: &ComparisonCase) -> Option<usize> {
+    (case.category == "context")
+        .then(|| case.id.strip_prefix("context_")?.parse().ok())
+        .flatten()
+        .filter(|value| [64, 512, 2048].contains(value))
+}
+
+fn measure_context_case(provider: &dyn TextLlm, case: &ComparisonCase) -> Value {
+    measure_case_inner(provider, case, context_repetitions(case).is_some())
+}
+
+fn measure_context_with_recovery(
+    provider: &dyn TextLlm,
+    case: &ComparisonCase,
+    selected_cases: &[ComparisonCase],
+) -> Value {
+    let mut record = measure_context_case(provider, case);
+    if record["status"] != "resource_declined" {
+        return record;
+    }
+    let recovery_case = selected_cases
+        .iter()
+        .filter(|candidate| {
+            context_repetitions(candidate)
+                .zip(context_repetitions(case))
+                .is_some_and(|(candidate, declined)| candidate < declined)
+        })
+        .min_by_key(|candidate| context_repetitions(candidate));
+    if let Some(recovery_case) = recovery_case {
+        let recovery = measure_case(provider, recovery_case);
+        let declined_tokens = record["resource_admission"]["prompt_tokens"].as_u64();
+        let recovery_tokens = recovery["output"]["prompt_tokens"].as_u64();
+        let recovered = recovery["status"] == "completed"
+            && recovery["evidence_complete"] == true
+            && recovery["stream_contract_passed"] == true
+            && declined_tokens
+                .zip(recovery_tokens)
+                .is_some_and(|(declined, recovered)| recovered < declined);
+        record["recovery"] = recovery;
+        record["evidence_complete"] = json!(recovered);
+    } else {
+        record["evidence_complete"] = json!(false);
+    }
+    record
+}
+
+fn measure_case_inner(
+    provider: &dyn TextLlm,
+    case: &ComparisonCase,
+    allow_resource_decline: bool,
+) -> Value {
     let mut record = json!({"schema_version":1,"case_id":case.id,"category":case.category,
         "request":request_evidence(&case.request),"oracle":case.oracle.as_json()});
     let started = Instant::now();
@@ -146,18 +200,49 @@ pub fn measure_case(provider: &dyn TextLlm, case: &ComparisonCase) -> Value {
             }
         }
     }));
-    record["total_seconds"] = json!(started.elapsed().as_secs_f64());
-    record["time_to_first_token_seconds"] = json!(first_token);
-    record["time_to_first_token_unavailable_reason"] =
-        json!(first_token.is_none().then_some("no_token_event_emitted"));
-    record["events"] = json!(events);
     match result {
+        Err(core_llm::Error::RequestResourceExhausted(evidence)) if allow_resource_decline => {
+            let within_context = evidence
+                .prompt_tokens
+                .checked_add(evidence.max_new_tokens as usize)
+                .is_some_and(|total| total <= evidence.max_context_tokens);
+            let valid = events.is_empty()
+                && evidence.prompt_tokens > 0
+                && evidence.max_new_tokens == case.request.max_new_tokens
+                && evidence.max_context_tokens
+                    == provider.descriptor().capabilities.max_context_tokens
+                && within_context
+                && evidence.required_bytes > evidence.available_bytes;
+            record["status"] = json!(if valid { "resource_declined" } else { "failed" });
+            record["error"] =
+                json!(core_llm::Error::RequestResourceExhausted(evidence).to_string());
+            record["evidence_complete"] = json!(valid);
+            record["resource_admission"] = json!({
+                "preallocation_rejected": true,
+                "prompt_tokens": evidence.prompt_tokens,
+                "max_new_tokens": evidence.max_new_tokens,
+                "max_context_tokens": evidence.max_context_tokens,
+                "required_bytes": evidence.required_bytes,
+                "available_bytes": evidence.available_bytes,
+            });
+            record["events"] = json!(events);
+        }
         Err(error) => {
+            record["total_seconds"] = json!(started.elapsed().as_secs_f64());
+            record["time_to_first_token_seconds"] = json!(first_token);
+            record["time_to_first_token_unavailable_reason"] =
+                json!(first_token.is_none().then_some("no_token_event_emitted"));
+            record["events"] = json!(events);
             record["status"] = json!("failed");
             record["error"] = json!(error.to_string());
             record["evidence_complete"] = json!(false);
         }
         Ok(output) => {
+            record["total_seconds"] = json!(started.elapsed().as_secs_f64());
+            record["time_to_first_token_seconds"] = json!(first_token);
+            record["time_to_first_token_unavailable_reason"] =
+                json!(first_token.is_none().then_some("no_token_event_emitted"));
+            record["events"] = json!(events);
             let stream_ok = event_order_valid
                 && text == output.text
                 && thinking == output.thinking.as_deref().unwrap_or("")
@@ -700,6 +785,8 @@ pub fn run_environment(
                     measure_tool_roundtrip(provider.as_ref(), case)
                 } else if case.id == "preserve_thinking" {
                     measure_preserve_thinking(provider.as_ref(), case)
+                } else if context_repetitions(case).is_some() {
+                    measure_context_with_recovery(provider.as_ref(), case, &selected_cases)
                 } else {
                     measure_case(provider.as_ref(), case)
                 };
@@ -744,9 +831,18 @@ pub fn run_environment(
                 json!({"evidence_complete":rejected,"declared_context_tokens":caps.max_context_tokens,
                     "requested_max_new_tokens":probe.request.max_new_tokens,"record":record})
             };
-            let complete = records
-                .iter()
-                .all(|record| record["evidence_complete"] == true)
+            let context_selected = records.iter().any(|record| record["category"] == "context");
+            let completed_context = records.iter().any(|record| {
+                record["category"] == "context"
+                    && record["status"] == "completed"
+                    && record["evidence_complete"] == true
+            });
+            let complete = records.iter().all(|record| {
+                record["evidence_complete"] == true
+                    && (record["status"] == "completed"
+                        || (record["category"] == "context"
+                            && record["status"] == "resource_declined"))
+            }) && (!context_selected || completed_context)
                 && context_admission["evidence_complete"] == true
                 && report["resource_admission"]["evidence_complete"] == true;
             report["cases"] = json!(records);
@@ -870,6 +966,126 @@ mod tests {
         assert_eq!(record["evidence_complete"], true);
         assert_eq!(record["quality_passed"], false);
         assert_eq!(record["output"]["text"], "391");
+    }
+
+    struct ResourceStub {
+        inner: Stub,
+        decline_at_chars: usize,
+        prompt_tokens: usize,
+        required_bytes: u64,
+        available_bytes: u64,
+        emit_before_error: bool,
+        fail_short: bool,
+    }
+
+    impl TextLlm for ResourceStub {
+        fn descriptor(&self) -> &TextLlmDescriptor {
+            &self.inner.descriptor
+        }
+
+        fn validate(&self, _: &TextLlmRequest) -> core_llm::Result<()> {
+            Ok(())
+        }
+
+        fn generate(
+            &self,
+            request: &TextLlmRequest,
+            emit: &mut dyn FnMut(StreamEvent),
+        ) -> core_llm::Result<TextLlmOutput> {
+            let chars = request
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .map(|content| match content {
+                    Content::Text(text) => text.len(),
+                    _ => 0,
+                })
+                .sum::<usize>();
+            if chars >= self.decline_at_chars {
+                if self.emit_before_error {
+                    emit(StreamEvent::Token {
+                        id: 1,
+                        text: "x".into(),
+                        index: 0,
+                        channel: Channel::Content,
+                    });
+                }
+                return Err(core_llm::Error::RequestResourceExhausted(
+                    core_llm::RequestResourceExhausted {
+                        prompt_tokens: self.prompt_tokens,
+                        max_new_tokens: request.max_new_tokens,
+                        max_context_tokens: self.inner.descriptor.capabilities.max_context_tokens,
+                        required_bytes: self.required_bytes,
+                        available_bytes: self.available_bytes,
+                    },
+                ));
+            }
+            if self.fail_short {
+                return Err(core_llm::Error::InvalidRequest("recovery failure".into()));
+            }
+            self.inner.generate(request, emit)
+        }
+    }
+
+    fn resource_stub() -> ResourceStub {
+        let mut inner = stub();
+        inner.descriptor.capabilities.max_context_tokens = 262_144;
+        ResourceStub {
+            inner,
+            decline_at_chars: 10_000,
+            prompt_tokens: 9_251,
+            required_bytes: 200,
+            available_bytes: 100,
+            emit_before_error: false,
+            fail_short: false,
+        }
+    }
+
+    #[test]
+    fn only_frozen_context_declines_with_immediate_shorter_recovery() {
+        let selected = [context_case(64), context_case(512), context_case(2048)];
+        let record = measure_context_with_recovery(&resource_stub(), &selected[1], &selected);
+        assert_eq!(record["status"], "resource_declined");
+        assert_eq!(record["evidence_complete"], true);
+        assert_eq!(record["resource_admission"]["prompt_tokens"], 9_251);
+        assert_eq!(record["events"], json!([]));
+        assert!(record.get("total_seconds").is_none());
+        assert!(record.get("output").is_none());
+        assert!(record.get("quality_passed").is_none());
+        assert_eq!(record["recovery"]["case_id"], "context_64");
+        assert_eq!(record["recovery"]["stream_contract_passed"], true);
+
+        let ordinary = measure_case(&resource_stub(), &selected[1]);
+        assert_eq!(ordinary["status"], "failed");
+        assert_eq!(ordinary["evidence_complete"], false);
+    }
+
+    #[test]
+    fn malformed_decline_or_failed_recovery_cannot_complete() {
+        let selected = [context_case(64), context_case(512)];
+        let mut provider = resource_stub();
+        provider.required_bytes = provider.available_bytes;
+        assert_eq!(
+            measure_context_with_recovery(&provider, &selected[1], &selected)["status"],
+            "failed"
+        );
+        provider.required_bytes = 200;
+        provider.prompt_tokens = 262_100;
+        assert_eq!(
+            measure_context_with_recovery(&provider, &selected[1], &selected)["status"],
+            "failed"
+        );
+        provider.prompt_tokens = 9_251;
+        provider.emit_before_error = true;
+        assert_eq!(
+            measure_context_with_recovery(&provider, &selected[1], &selected)["status"],
+            "failed"
+        );
+        provider.emit_before_error = false;
+        provider.fail_short = true;
+        let record = measure_context_with_recovery(&provider, &selected[1], &selected);
+        assert_eq!(record["status"], "resource_declined");
+        assert_eq!(record["evidence_complete"], false);
     }
     #[test]
     fn frozen_cases_retain_discriminating_media_order_and_raw_pixels() {
