@@ -1858,7 +1858,7 @@ jobs:
 
   qwen38-bonsai-candle:
     name: Qwen3.8/Bonsai matched diagnostics (Candle/CUDA)
-    if: always() && github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen38-bonsai'
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen38-bonsai' }}
     needs: qwen38-bonsai-mlx
     runs-on: [self-hosted, windows, cuda, real-weights]
     timeout-minutes: 360

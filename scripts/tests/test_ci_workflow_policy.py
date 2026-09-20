@@ -3786,6 +3786,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(candle["needs"], "qwen38-bonsai-mlx")
         self.assertIn("inputs.profile == 'qwen38-bonsai'", mlx["if"])
         self.assertIn("inputs.profile == 'qwen38-bonsai'", candle["if"])
+        self.assertIn("!cancelled()", candle["if"])
+        self.assertNotIn("always()", candle["if"])
 
         mlx_commands = "\n".join(step.get("run", "") for step in mlx["steps"])
         candle_commands = "\n".join(step.get("run", "") for step in candle["steps"])
@@ -3877,6 +3879,18 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("release-gpu --gpu-index 0", candle_commands)
         self.assertIn('matrix-status --runtime-sha "%GITHUB_SHA%"', candle_commands)
         self.assertIn('verify-matrix-seal --runtime-sha "%GITHUB_SHA%"', candle_commands)
+        release = next(
+            step
+            for step in candle["steps"]
+            if step.get("name") == "Release the Candle campaign CUDA reservation"
+        )
+        upload = next(
+            step
+            for step in candle["steps"]
+            if step.get("name") == "Upload Candle qualification or terminal evidence"
+        )
+        self.assertEqual(release["if"], "always()")
+        self.assertEqual(upload["if"], "always()")
 
         for job in (mlx, candle):
             steps = job["steps"]
