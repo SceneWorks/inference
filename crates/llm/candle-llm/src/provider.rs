@@ -36,6 +36,7 @@ use crate::models::{
     CausalLm, Gemma4Layout, Gemma4Mm, Gemma4MmConfig, Qwen35Config, Qwen35Model, Qwen35Mtp,
     Qwen35VisionConfig, Qwen35VisionModel, VlmDecode,
 };
+use crate::primitives::attention::EAGER_ATTN_QUERY_CHUNK_SIZE;
 use crate::primitives::nn::input_ids;
 use crate::primitives::projection::QuantSpec;
 use crate::primitives::sampler::SamplingParams;
@@ -647,6 +648,7 @@ impl LlamaProvider {
         }
         let device = select_device().map_err(to_core)?;
         let payload = core_llm::checkpoint_payload_bytes(Path::new(&spec.source))?;
+        let staging = core_llm::checkpoint_staging_bytes(Path::new(&spec.source))?;
         let projector = spec
             .projector_source
             .as_ref()
@@ -657,22 +659,18 @@ impl LlamaProvider {
             || read_json(Path::new(&spec.source), "config.json").is_some_and(|c| {
                 c.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35")
             });
-        // CPU dense conversion retains source BF16 plus F32 tensors. Packed weights stay packed;
-        // projector conversion is bounded separately at four times its stored payload.
-        let host_factor = if packed || device.is_cuda() { 2 } else { 3 };
-        let host_required = payload
-            .checked_mul(host_factor)
-            .and_then(|v| v.checked_add(projector.checked_mul(4)?))
-            .ok_or_else(|| CoreError::Load("load memory estimate overflow".into()))?;
+        let (host_required, device_required) =
+            load_memory_requirements(payload, staging, projector, packed, device.is_cuda())
+                .ok_or_else(|| CoreError::Load("load memory estimate overflow".into()))?;
         let budget = core_llm::operational_memory_override()?;
-        let host_available =
-            core_llm::effective_memory_budget(core_llm::available_host_memory_bytes(), budget)?;
+        // A discrete CUDA launcher's override describes device headroom. Host staging is a separate
+        // allocation domain and must be checked against host capacity rather than GPU capacity.
+        let host_available = core_llm::effective_memory_budget(
+            core_llm::available_host_memory_bytes(),
+            host_load_budget(device.is_cuda(), budget),
+        )?;
         core_llm::admit_request_memory(host_required, host_available)?;
-        if device.is_cuda() {
-            let device_required = payload
-                .checked_add(payload / 4)
-                .and_then(|v| v.checked_add(projector.checked_mul(4)?))
-                .ok_or_else(|| CoreError::Load("device load memory estimate overflow".into()))?;
+        if let Some(device_required) = device_required {
             core_llm::admit_request_memory(device_required, request_available_memory(&device)?)?;
         }
 
@@ -1373,6 +1371,49 @@ impl LlamaProvider {
     }
 }
 
+/// Conservative load bounds for the two independent allocation domains.
+///
+/// Candle reads one safetensors shard into a host `Vec`, copies each tensor directly to CUDA at its
+/// stored dtype, and drops the shard buffer before reading the next shard. The dense Qwen3.8
+/// checkpoint is BF16 and `Tensor::to_dtype(BF16)` shares storage, so CUDA construction does not
+/// retain a second expanded language-weight copy. The largest shard is therefore the host staging
+/// bound; 25 percent device headroom covers constructor casts such as the BF16-to-F32 vision tower
+/// while source tensors are still alive. CPU dense conversion retains source tensors plus
+/// constructed F32 tensors. Packed CPU paths keep their existing two-copy upper bound, and external
+/// projectors retain the audited four-copy conversion allowance.
+fn load_memory_requirements(
+    payload: u64,
+    staging: u64,
+    projector: u64,
+    packed: bool,
+    cuda: bool,
+) -> Option<(u64, Option<u64>)> {
+    let projector_bound = projector.checked_mul(4)?;
+    let host = if cuda && !packed {
+        staging.checked_add(projector_bound)?
+    } else if packed {
+        payload.checked_mul(2)?.checked_add(projector_bound)?
+    } else {
+        payload.checked_mul(3)?.checked_add(projector_bound)?
+    };
+    let device = if cuda {
+        Some(
+            payload
+                .checked_add(payload / 4)?
+                .checked_add(projector_bound)?,
+        )
+    } else {
+        None
+    };
+    Some((host, device))
+}
+
+/// The process-wide override caps the execution-memory domain. On a discrete CUDA device, host
+/// source staging has its own measured capacity and must not be capped by a VRAM snapshot.
+fn host_load_budget(cuda: bool, budget: Option<u64>) -> Option<u64> {
+    (!cuda).then_some(budget).flatten()
+}
+
 fn request_available_memory(device: &Device) -> CoreResult<u64> {
     let capacity = if device.is_cuda() {
         #[cfg(feature = "cuda")]
@@ -1759,11 +1800,32 @@ impl TextLlm for LlamaProvider {
         let vision_workspace = vision_workspace
             .checked_add(request_media_workspace_bytes(&req.messages)?)
             .ok_or_else(|| CoreError::InvalidRequest("media workspace overflow".into()))?;
+        let replaced_visual_placeholders =
+            self.vision
+                .as_ref()
+                .filter(|_| multimodal)
+                .map_or(0, |vision| {
+                    prompt_ids
+                        .iter()
+                        .filter(|&&id| id == vision.image_token_id || id == vision.video_token_id)
+                        .count()
+                });
         let admitted_prompt = prompt_ids
             .len()
-            .checked_add(visual_tokens)
+            .checked_sub(replaced_visual_placeholders)
+            .and_then(|n| n.checked_add(visual_tokens))
             .ok_or_else(|| CoreError::InvalidRequest("expanded prompt geometry overflow".into()))?;
-        let required = core_llm::estimate_request_bytes(
+        // Pure prompt/visual geometry is known before native preprocessing. Architectural context
+        // overflow must win over a transient capacity failure on the current host or CUDA device.
+        validate_context_window(
+            self.descriptor.capabilities.max_context_tokens,
+            admitted_prompt,
+            req.max_new_tokens,
+        )?;
+        // Every portable eager-attention mask variant is query-tiled; CUDA flash attention is
+        // bounded more tightly. Use the runtime's exact maximum tile so admission prices the same
+        // peak score/mask/weight lifetime the implementation enforces.
+        let required = core_llm::estimate_chunked_request_bytes(
             admitted_prompt,
             req.max_new_tokens,
             self.model.memory_geometry(),
@@ -1777,6 +1839,7 @@ impl TextLlm for LlamaProvider {
                     .map_or(0, |c| c.recommended_draft_tokens),
                 MtpMode::Enabled { draft_tokens } => draft_tokens,
             },
+            EAGER_ATTN_QUERY_CHUNK_SIZE,
         )
         .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
         let available = request_available_memory(self.model.device())?;
@@ -2677,11 +2740,72 @@ pub fn can_load(spec: &LoadSpec) -> bool {
 mod tests {
     use super::{
         bonsai_sampling_defaults, can_load, can_load_vision, emit_content, eos_token_ids,
-        expand_vision_placeholders, merged_frame_timestamps, prompt_opens_thinking,
-        substitute_vision_placeholders, validate_context_window, video_placeholder_text, JsonMask,
+        expand_vision_placeholders, host_load_budget, load_memory_requirements,
+        merged_frame_timestamps, prompt_opens_thinking, substitute_vision_placeholders,
+        validate_context_window, video_placeholder_text, JsonMask, EAGER_ATTN_QUERY_CHUNK_SIZE,
     };
     use crate::decode::{ConstraintMask, RewindableConstraintMask};
-    use core_llm::{ConstraintDecodeTable, Content, ImageRef, LoadSpec, Message, Role, VideoRef};
+    use core_llm::{
+        ConstraintDecodeTable, Content, ImageRef, LlmMemoryGeometry, LoadSpec, Message, Role,
+        VideoRef,
+    };
+
+    #[test]
+    fn request_estimate_uses_the_eager_attention_runtime_tile() {
+        let geometry = LlmMemoryGeometry {
+            query_heads: 40,
+            kv_heads: 4,
+            head_dim: 128,
+            layers: 64,
+            element_bytes: 4,
+            hidden_size: 5120,
+            intermediate_size: 17_408,
+            vocab_size: 248_320,
+            recurrent_bytes: 0,
+        };
+        let chunked = core_llm::estimate_chunked_request_bytes(
+            29_600,
+            128,
+            geometry,
+            0,
+            0,
+            EAGER_ATTN_QUERY_CHUNK_SIZE,
+        )
+        .unwrap();
+        let eager = core_llm::estimate_request_bytes(29_600, 128, geometry, 0, 0).unwrap();
+        assert!(chunked < eager);
+        assert!(chunked < 36_000_000_000, "bounded Candle peak: {chunked}");
+    }
+
+    #[test]
+    fn dense_cuda_load_admission_separates_host_staging_from_current_vram() {
+        // Frozen Qwen3.8 parent inventory from release/qwen38-bonsai-artifacts.json. Candle reads
+        // the 18 shards serially; this is the total payload and the largest individual shard.
+        let payload = 55_563_006_776;
+        let largest_shard = 3_988_973_152;
+        let (host_required, device_required) =
+            load_memory_requirements(payload, largest_shard, 0, false, true).unwrap();
+
+        assert_eq!(host_required, largest_shard);
+        assert_eq!(device_required, Some(69_453_758_470));
+        assert_eq!(host_load_budget(true, Some(102_171_148_288)), None);
+
+        // A launch-time snapshot can cap but never inflate the current post-load CUDA capacity.
+        let current_free = 60_000_000_000;
+        let available =
+            core_llm::effective_memory_budget(Some(current_free), Some(102_171_148_288)).unwrap();
+        let error = core_llm::admit_request_memory(device_required.unwrap(), available)
+            .expect_err("current CUDA shortfall must fail closed");
+        assert!(error
+            .to_string()
+            .contains("only 60000000000 bytes are available"));
+    }
+
+    #[test]
+    fn load_memory_requirements_remain_checked() {
+        assert!(load_memory_requirements(u64::MAX, 1, 0, false, true).is_none());
+        assert!(load_memory_requirements(1, 1, u64::MAX, false, true).is_none());
+    }
 
     #[test]
     fn reasoning_boundary_commits_same_token_json_in_release_builds() {

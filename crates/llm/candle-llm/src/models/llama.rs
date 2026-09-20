@@ -35,7 +35,7 @@ use crate::config::{Architecture, LayerAttentionType, ModelConfig};
 use crate::device::compute_dtype;
 use crate::error::{Error, Result};
 use crate::models::deepstack::{self, deepstack_fused_decoder_layers, MropePositions};
-use crate::primitives::attention::{sdpa, sliding_causal_mask, AttnMask};
+use crate::primitives::attention::{sdpa, AttnMask};
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::nn::{embed, gelu, rms_norm, rms_norm_unscaled, silu, soft_cap};
 use crate::primitives::projection::{KvProjection, Projection, QuantSpec};
@@ -688,7 +688,7 @@ impl CausalLm {
     /// them — is wrong, while staying finite, non-zero and correctly shaped. Pass
     /// [`AttnMask::Additive`] carrying `valid(i, j) = j <= i && mask01[j] != 0` (LTX's
     /// `causal_padding_mask`) to mask both at once; a `sliding_attention` layer still narrows it to
-    /// its own window on top (see `LlamaLayer::combined_sliding_mask`).
+    /// its own window on top (see `LlamaLayer::layer_mask`).
     ///
     /// The mask must be in the model's [`CausalLm::compute_dtype`]: the eager kernel adds it to the
     /// scores, and candle does not implicitly promote across dtypes.
@@ -1063,7 +1063,9 @@ impl CausalLm {
         // Untouched (and never allocated into) by every model without a sharing tail.
         let mut shared_kv = SharedKv::default();
         let mut mask_d: Option<Tensor> = match mask {
-            AttnMask::Additive(m) => Some(m.clone()),
+            AttnMask::Additive(m) | AttnMask::AdditiveSliding { additive: m, .. } => {
+                Some(m.clone())
+            }
             _ => None,
         };
         for (i, layer) in self.layers.iter().enumerate() {
@@ -1080,6 +1082,10 @@ impl CausalLm {
                 AttnMask::Causal => AttnMask::Causal,
                 AttnMask::None => AttnMask::None,
                 AttnMask::Additive(_) => AttnMask::Additive(mask_d.as_ref().unwrap()),
+                AttnMask::AdditiveSliding { window, .. } => AttnMask::AdditiveSliding {
+                    additive: mask_d.as_ref().unwrap(),
+                    window,
+                },
                 // Rebuilt per layer from `(q_len, k_len)` on whichever device the layer sits on,
                 // so there is nothing to carry across the device hop.
                 AttnMask::SlidingCausal { window } => AttnMask::SlidingCausal { window },
@@ -1646,44 +1652,29 @@ impl LlamaAttention {
             .contiguous()?)
     }
 
-    /// The window band this layer adds to an **explicit additive** mask, or `None` when the layer is
-    /// not windowed / the mask is not additive.
-    ///
-    /// A `sliding_attention` layer under a batched decode has to honour *both* the caller's
-    /// left-padding + causality mask and its own window, so the two additive masks are summed (both
-    /// use the same large-finite-negative block fill, and a doubled block is still `-inf` to the
-    /// softmax while staying finite).
-    fn combined_sliding_mask(
-        &self,
-        mask: AttnMask<'_>,
-        q_len: usize,
-        k_len: usize,
-    ) -> Result<Option<Tensor>> {
-        match (self.sliding_window, mask) {
-            (Some(window), AttnMask::Additive(m)) => {
-                let band = sliding_causal_mask(q_len, k_len, window, m.dtype(), m.device())?;
-                Ok(Some(m.broadcast_add(&band)?))
-            }
-            _ => Ok(None),
-        }
-    }
-
     /// The mask this layer actually attends under: the forward's mask, narrowed by the layer's
     /// sliding window when it has one.
-    fn layer_mask<'m>(&self, mask: AttnMask<'m>, combined: &'m Option<Tensor>) -> AttnMask<'m> {
+    fn layer_mask<'m>(&self, mask: AttnMask<'m>) -> AttnMask<'m> {
         let Some(window) = self.sliding_window else {
             return mask;
         };
-        match (combined, mask) {
-            (Some(c), _) => AttnMask::Additive(c),
-            (None, AttnMask::Causal) => AttnMask::SlidingCausal { window },
+        match mask {
+            AttnMask::Additive(additive) => AttnMask::AdditiveSliding { additive, window },
+            AttnMask::AdditiveSliding {
+                additive,
+                window: outer,
+            } => AttnMask::AdditiveSliding {
+                additive,
+                window: outer.min(window),
+            },
+            AttnMask::Causal => AttnMask::SlidingCausal { window },
             // Already windowed by the caller: take the tighter of the two.
-            (None, AttnMask::SlidingCausal { window: w }) => AttnMask::SlidingCausal {
+            AttnMask::SlidingCausal { window: w } => AttnMask::SlidingCausal {
                 window: w.min(window),
             },
             // A deliberately unmasked (bidirectional) forward is not a causal one — a window would
             // be a different model, not a narrowing, so it is left alone.
-            (None, m) => m,
+            m => m,
         }
     }
 
@@ -1739,11 +1730,9 @@ impl LlamaAttention {
                 (q, k_all, v_all)
             }
         };
-        let (q_len, k_len) = (q.dim(2)?, k_all.dim(2)?);
         let k_all = repeat_kv(&k_all, self.groups)?;
         let v_all = repeat_kv(&v_all, self.groups)?;
-        let combined = self.combined_sliding_mask(mask, q_len, k_len)?;
-        let mask = self.layer_mask(mask, &combined);
+        let mask = self.layer_mask(mask);
         let out = sdpa(&q, &k_all, &v_all, self.scale, self.softcap, mask)?; // [b, heads, s, head_dim]
         self.output(&out)
     }

@@ -379,10 +379,10 @@ fn read_metadata(dir: &Path) -> Result<PrismHadamardMetadata> {
             .ok_or_else(|| Error::Config("truncated Prism sign values".into()))?;
         let signs = slice
             .iter()
-            .map(|sign| {
-                sign.as_i64()
-                    .and_then(|v| i8::try_from(v).ok())
-                    .ok_or_else(|| Error::Config("invalid Prism sign value".into()))
+            .map(|sign| match sign.as_f64() {
+                Some(-1.0) => Ok(-1),
+                Some(1.0) => Ok(1),
+                _ => Err(Error::Config("invalid Prism sign value".into())),
             })
             .collect::<Result<Vec<_>>>()?;
         if signs_by_width.insert(width, signs).is_some() {
@@ -624,11 +624,10 @@ fn gguf_hadamard(raw: &RawGguf) -> Result<PrismHadamardMetadata> {
             .get(offset..end)
             .ok_or_else(|| Error::Config("truncated signs".into()))?
             .iter()
-            .map(|v| match v {
-                RawValue::I(x) => {
-                    i8::try_from(*x).map_err(|_| Error::Config("invalid sign".into()))
-                }
-                _ => Err(Error::Config("invalid sign".into())),
+            .map(|value| {
+                value
+                    .exact_sign()
+                    .ok_or_else(|| Error::Config("invalid sign".into()))
             })
             .collect::<Result<Vec<_>>>()?;
         signs_by_width.insert(width, signs);
@@ -829,7 +828,8 @@ mod tests {
                 "prism.hadamard.weight_names": [],
                 "prism.hadamard.inverse_weight_names": [format!("{base}.weight")],
                 "prism.hadamard.sign_widths": [128],
-                "prism.hadamard.sign_values": vec![1; 128],
+                // The frozen publisher emits JSON floating-point signs.
+                "prism.hadamard.sign_values": vec![1.0; 128],
                 "prism.hadamard.gdn_v_grouped": true
             }))
             .unwrap(),
@@ -905,6 +905,79 @@ mod tests {
         let mut wrong_role = config();
         wrong_role["modules"][0]["embedding"] = json!(false);
         assert!(load_error(flipped.path(), &wrong_role).contains("embedding role"));
+
+        let fractional = tempfile::tempdir().unwrap();
+        write_fixture(fractional.path(), false);
+        let metadata_path = fractional.path().join("hadamard.json");
+        let mut metadata: Value =
+            serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
+        metadata["prism.hadamard.sign_values"][17] = json!(0.5);
+        std::fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        assert!(load_error(fractional.path(), &config()).contains("invalid Prism sign value"));
+    }
+
+    #[test]
+    #[ignore = "requires frozen Bonsai MLX snapshot via BONSAI_MLX_SNAPSHOT"]
+    fn frozen_mlx_hadamard_metadata_accepts_publisher_float_signs() {
+        let snapshot = std::env::var_os("BONSAI_MLX_SNAPSHOT")
+            .map(std::path::PathBuf::from)
+            .expect("BONSAI_MLX_SNAPSHOT must point to the frozen snapshot");
+        let metadata = read_metadata(&snapshot).unwrap();
+        assert_eq!(metadata.block_size, 1024);
+        assert_eq!(
+            metadata.signs_by_width.keys().copied().collect::<Vec<_>>(),
+            vec![5120, 6144, 17408]
+        );
+        assert_eq!(metadata.forward_weight_names.len(), 401);
+        assert_eq!(metadata.inverse_weight_names.len(), 1);
+    }
+
+    #[test]
+    #[ignore = "requires frozen Bonsai GGUF via BONSAI_GGUF"]
+    fn frozen_gguf_metadata_accepts_signed_sections_and_signs() {
+        let path = std::env::var_os("BONSAI_GGUF")
+            .map(std::path::PathBuf::from)
+            .expect("BONSAI_GGUF must point to the frozen PQ2_0 or PTQ1_0 file");
+        let raw = RawGguf::open(&path).unwrap();
+        let config = gguf_config(&raw).unwrap();
+        assert_eq!(
+            config["text_config"]["rope_parameters"]["mrope_section"],
+            json!([11, 11, 10])
+        );
+        let metadata = gguf_hadamard(&raw).unwrap();
+        assert_eq!(metadata.block_size, 1024);
+        assert_eq!(metadata.forward_weight_names.len(), 401);
+        assert_eq!(metadata.inverse_weight_names.len(), 1);
+    }
+
+    #[test]
+    #[ignore = "loads the complete frozen Bonsai MLX snapshot on CPU"]
+    fn frozen_mlx_checkpoint_keeps_all_402_matrices_packed() {
+        let snapshot = std::env::var_os("BONSAI_MLX_SNAPSHOT")
+            .map(std::path::PathBuf::from)
+            .expect("BONSAI_MLX_SNAPSHOT must point to the frozen snapshot");
+        let config: Value =
+            serde_json::from_slice(&std::fs::read(snapshot.join("config.json")).unwrap()).unwrap();
+        let checkpoint = PrismMlxCheckpoint::open(&snapshot, &Device::Cpu, &config).unwrap();
+        assert_eq!(checkpoint.registry.len(), 402);
+        assert!(
+            !checkpoint.weights.is_empty(),
+            "dense vision and recurrent tensors remain resident"
+        );
+    }
+
+    #[test]
+    #[ignore = "loads the complete frozen Bonsai GGUF on CPU"]
+    fn frozen_gguf_checkpoint_keeps_all_402_matrices_packed() {
+        let path = std::env::var_os("BONSAI_GGUF")
+            .map(std::path::PathBuf::from)
+            .expect("BONSAI_GGUF must point to the frozen PQ2_0 or PTQ1_0 file");
+        let checkpoint = PrismGgufCheckpoint::open(&path, &Device::Cpu).unwrap();
+        assert_eq!(checkpoint.registry.len(), 402);
+        assert!(
+            !checkpoint.weights.is_empty(),
+            "dense recurrent tensors remain resident"
+        );
     }
 
     #[test]

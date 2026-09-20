@@ -35,6 +35,7 @@ use crate::models::{
     CausalLm, Gemma4Layout, Gemma4Mm, Gemma4MmConfig, Qwen35Config, Qwen35Model,
     Qwen35VisionConfig, Qwen35VisionModel, VlmDecode,
 };
+use crate::primitives::attention::SDPA_MAX_FUSED_QLEN;
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::projection::QuantSpec;
 use crate::primitives::sampler::SamplingParams;
@@ -122,6 +123,20 @@ impl Decoder {
             intermediate_size: intermediate as u64,
             vocab_size: vocab as u64,
             recurrent_bytes: recurrent,
+        }
+    }
+
+    /// Whether ordinary generation stays on MLX's fused/chunked SDPA path. Gemma-2 score
+    /// soft-capping and DeepSeek MLA require the eager score matrix, while Gemma 4 materializes a
+    /// full sliding-window mask before fused dispatch. Keep those paths on the shared quadratic
+    /// estimate; Qwen/Llama-style fused attention is bounded to the runtime's query-chunk limit.
+    fn uses_bounded_attention_workspace(&self) -> bool {
+        match self {
+            Decoder::Qwen35(_) => true,
+            Decoder::Causal(m) => {
+                let c = m.config();
+                c.attn_logit_softcap.is_none() && !c.is_mla() && c.gemma4.is_none()
+            }
         }
     }
 
@@ -1436,11 +1451,30 @@ impl TextLlm for LlamaProvider {
         let vision_workspace = vision_workspace
             .checked_add(request_media_workspace_bytes(&req.messages)?)
             .ok_or_else(|| CoreError::InvalidRequest("media workspace overflow".into()))?;
+        let replaced_visual_placeholders =
+            self.vision
+                .as_ref()
+                .filter(|_| multimodal)
+                .map_or(0, |vision| {
+                    prompt_ids
+                        .iter()
+                        .filter(|&&id| id == vision.image_token_id || id == vision.video_token_id)
+                        .count()
+                });
         let admitted_prompt = prompt_ids
             .len()
-            .checked_add(visual_tokens)
+            .checked_sub(replaced_visual_placeholders)
+            .and_then(|n| n.checked_add(visual_tokens))
             .ok_or_else(|| CoreError::InvalidRequest("expanded prompt geometry overflow".into()))?;
-        let required = core_llm::estimate_request_bytes(
+        // The tokenized prompt plus pure visual expansion geometry is known before any native
+        // preprocessing. Reject architectural overflow before consulting transient capacity so a
+        // valid context error cannot be masked by the machine's current memory pressure.
+        validate_context_window(
+            self.descriptor.capabilities.max_context_tokens,
+            admitted_prompt,
+            req.max_new_tokens,
+        )?;
+        let required = estimate_mlx_request_bytes(
             admitted_prompt,
             req.max_new_tokens,
             self.model.memory_geometry(),
@@ -1454,6 +1488,7 @@ impl TextLlm for LlamaProvider {
                     .map_or(0, |c| c.recommended_draft_tokens),
                 MtpMode::Enabled { draft_tokens } => draft_tokens,
             },
+            self.model.uses_bounded_attention_workspace(),
         )
         .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
         let available = core_llm::effective_memory_budget(
@@ -2020,6 +2055,37 @@ fn map_sampling(s: &Sampling) -> SamplingParams {
     }
 }
 
+/// Select the estimate matching the decoder's actual attention implementation. Eager fallbacks keep
+/// the quadratic model; ordinary MLX fused SDPA receives at most
+/// [`SDPA_MAX_FUSED_QLEN`] query rows at a time.
+fn estimate_mlx_request_bytes(
+    prompt_tokens: usize,
+    max_new_tokens: u32,
+    geometry: LlmMemoryGeometry,
+    vision_workspace_bytes: u64,
+    mtp_width: u32,
+    bounded_attention: bool,
+) -> Option<u64> {
+    if bounded_attention {
+        core_llm::estimate_chunked_request_bytes(
+            prompt_tokens,
+            max_new_tokens,
+            geometry,
+            vision_workspace_bytes,
+            mtp_width,
+            SDPA_MAX_FUSED_QLEN as usize,
+        )
+    } else {
+        core_llm::estimate_request_bytes(
+            prompt_tokens,
+            max_new_tokens,
+            geometry,
+            vision_workspace_bytes,
+            mtp_width,
+        )
+    }
+}
+
 fn validate_context_window(
     cap: usize,
     prompt_tokens: usize,
@@ -2249,6 +2315,54 @@ fn gemma4_multimodal(v: &serde_json::Value, block: &str, token_key: &str) -> boo
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn fused_request_estimate_tracks_chunked_attention_and_last_row_logits() {
+        // Frozen Qwen3.8 parent geometry. This prompt size reproduces the campaign's long-context
+        // scale: eager prompt-squared scores dominate hundreds of GB, while MLX runs eight query
+        // rows per fused call and projects one final row to the vocabulary.
+        let geometry = LlmMemoryGeometry {
+            query_heads: 40,
+            kv_heads: 4,
+            head_dim: 128,
+            layers: 64,
+            element_bytes: 4,
+            hidden_size: 5120,
+            intermediate_size: 17_408,
+            vocab_size: 248_320,
+            recurrent_bytes: 0,
+        };
+        let fused = estimate_mlx_request_bytes(29_600, 128, geometry, 0, 0, true).unwrap();
+        let eager = estimate_mlx_request_bytes(29_600, 128, geometry, 0, 0, false).unwrap();
+        assert!(fused < 36_000_000_000, "bounded MLX peak: {fused}");
+        assert!(eager > 400_000_000_000, "quadratic eager peak: {eager}");
+        assert_eq!(
+            eager,
+            core_llm::estimate_request_bytes(29_600, 128, geometry, 0, 0).unwrap(),
+            "non-fused paths retain the shared fail-closed estimate"
+        );
+    }
+
+    #[test]
+    fn fused_request_estimate_is_checked_and_preserves_mtp_and_media_costs() {
+        let geometry = LlmMemoryGeometry {
+            query_heads: 8,
+            kv_heads: 2,
+            head_dim: 64,
+            layers: 4,
+            element_bytes: 4,
+            hidden_size: 256,
+            intermediate_size: 512,
+            vocab_size: 1024,
+            recurrent_bytes: 4096,
+        };
+        let plain = estimate_mlx_request_bytes(128, 16, geometry, 0, 0, true).unwrap();
+        let media = estimate_mlx_request_bytes(128, 16, geometry, 123_456, 0, true).unwrap();
+        let mtp = estimate_mlx_request_bytes(128, 16, geometry, 0, 3, true).unwrap();
+        assert_eq!(media - plain, 123_456);
+        assert!(mtp > plain);
+        assert!(estimate_mlx_request_bytes(usize::MAX, u32::MAX, geometry, 0, 3, true).is_none());
+    }
 
     #[test]
     fn reasoning_boundary_commits_same_token_json_in_release_builds() {

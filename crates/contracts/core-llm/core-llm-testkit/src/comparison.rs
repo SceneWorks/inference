@@ -195,6 +195,92 @@ pub fn measure_case(provider: &dyn TextLlm, case: &ComparisonCase) -> Value {
     record
 }
 
+/// Prove that `preserve_thinking` changes native history serialization without asking the model
+/// to disclose hidden reasoning. The requests differ only in the template control; both must run
+/// through the provider, stream a benign exact answer, and report exact prompt-token usage. A
+/// larger preserved prompt is the observable native proof that assistant reasoning history was
+/// retained.
+pub fn measure_preserve_thinking(provider: &dyn TextLlm, case: &ComparisonCase) -> Value {
+    let mut preserved_case = case.clone();
+    preserved_case.request.preserve_thinking = Some(true);
+    let mut stripped_case = case.clone();
+    stripped_case.request.preserve_thinking = Some(false);
+
+    let preserved = measure_case(provider, &preserved_case);
+    let stripped = measure_case(provider, &stripped_case);
+    let preserved_request = request_evidence(&preserved_case.request);
+    let stripped_request = request_evidence(&stripped_case.request);
+    let history_coverage_passed = preserved_case.request.messages.len() >= 3
+        && preserved_case.request.messages == stripped_case.request.messages
+        && preserved_case.request.messages.iter().any(|message| {
+            message.role == Role::Assistant
+                && message
+                    .thinking
+                    .as_deref()
+                    .is_some_and(|thinking| !thinking.trim().is_empty())
+        });
+    let preserved_prompt_tokens = preserved["output"]["prompt_tokens"].as_u64();
+    let stripped_prompt_tokens = stripped["output"]["prompt_tokens"].as_u64();
+    let additional_preserved_tokens = preserved_prompt_tokens
+        .zip(stripped_prompt_tokens)
+        .and_then(|(preserved, stripped)| preserved.checked_sub(stripped));
+    let token_proof_passed = additional_preserved_tokens.is_some_and(|delta| delta > 0);
+    let evidence_complete =
+        preserved["evidence_complete"] == true && stripped["evidence_complete"] == true;
+    let quality_passed = preserved["quality_passed"] == true && stripped["quality_passed"] == true;
+    let stream_contract_passed =
+        preserved["stream_contract_passed"] == true && stripped["stream_contract_passed"] == true;
+    let functional_acceptance_passed = evidence_complete
+        && quality_passed
+        && stream_contract_passed
+        && history_coverage_passed
+        && token_proof_passed;
+
+    json!({
+        "schema_version": 1,
+        "case_id": case.id,
+        "category": case.category,
+        "request": {
+            "preserved": preserved_request,
+            "stripped": stripped_request,
+        },
+        "oracle": {
+            "kind": "preserve_thinking_history",
+            "preserved": preserved["oracle"].clone(),
+            "stripped": stripped["oracle"].clone(),
+        },
+        "status": if evidence_complete { "completed" } else { "incomplete" },
+        "evidence_complete": evidence_complete,
+        "quality_passed": quality_passed,
+        "functional_acceptance_passed": functional_acceptance_passed,
+        "stream_contract_passed": stream_contract_passed,
+        "history_coverage_passed": history_coverage_passed,
+        "prompt_token_proof": {
+            "preserved_prompt_tokens": preserved_prompt_tokens,
+            "stripped_prompt_tokens": stripped_prompt_tokens,
+            "additional_preserved_tokens": additional_preserved_tokens,
+            "passed": token_proof_passed,
+        },
+        "time_to_first_token_seconds": preserved["time_to_first_token_seconds"].clone(),
+        "time_to_first_token_unavailable_reason": preserved["time_to_first_token_unavailable_reason"].clone(),
+        "total_seconds": preserved["total_seconds"].as_f64().unwrap_or(0.0)
+            + stripped["total_seconds"].as_f64().unwrap_or(0.0),
+        "prefill_seconds": preserved["prefill_seconds"].as_f64().unwrap_or(0.0)
+            + stripped["prefill_seconds"].as_f64().unwrap_or(0.0),
+        "decode_seconds": preserved["decode_seconds"].as_f64().unwrap_or(0.0)
+            + stripped["decode_seconds"].as_f64().unwrap_or(0.0),
+        "events": {
+            "preserved": preserved["events"].clone(),
+            "stripped": stripped["events"].clone(),
+        },
+        "output": preserved["output"].clone(),
+        "paired_steps": {
+            "preserved": preserved,
+            "stripped": stripped,
+        },
+    })
+}
+
 /// Execute a complete tool exchange: the model must emit the call, the harness feeds a result tied
 /// to that emitted call, and the model must then produce the final answer.
 pub fn measure_tool_roundtrip(provider: &dyn TextLlm, case: &ComparisonCase) -> Value {
@@ -419,20 +505,18 @@ pub fn capability_acceptance_cases() -> Vec<ComparisonCase> {
     let mut preserve = text_case(
         "preserve_thinking",
         "reasoning_history_acceptance",
-        "What exact code appeared in the prior assistant reasoning? Reply with only the code.",
-        "PRESERVE-OMEGA",
+        "Reply with only OK.",
+        "OK",
     );
     preserve.request.messages = vec![
-        Message::user("Privately retain the code I provide."),
-        Message::assistant("I retained it.").with_thinking("The code is PRESERVE-OMEGA."),
-        Message::user(
-            "What exact code appeared in the prior assistant reasoning? Reply with only the code.",
-        ),
+        Message::user("Acknowledge this setup for a later turn."),
+        Message::assistant("Acknowledged.")
+            .with_thinking("This private history marker must stay in serialized reasoning."),
+        Message::user("Reply with only OK."),
     ];
-    preserve.request.thinking = ThinkingMode::Enabled;
-    preserve.request.reasoning_effort = Some(core_llm::ReasoningEffort::Medium);
+    preserve.request.thinking = ThinkingMode::Disabled;
     preserve.request.preserve_thinking = Some(true);
-    preserve.request.max_new_tokens = 512;
+    preserve.request.max_new_tokens = 32;
     cases.push(preserve);
 
     let weather = core_llm::ToolSpec::new(
@@ -614,6 +698,8 @@ pub fn run_environment(
             for case in &selected_cases {
                 let mut record = if case.id == "tool_roundtrip" {
                     measure_tool_roundtrip(provider.as_ref(), case)
+                } else if case.id == "preserve_thinking" {
+                    measure_preserve_thinking(provider.as_ref(), case)
                 } else {
                     measure_case(provider.as_ref(), case)
                 };
@@ -919,6 +1005,92 @@ mod tests {
         assert_eq!(record["functional_acceptance_passed"], false);
     }
 
+    struct PreserveStub {
+        descriptor: TextLlmDescriptor,
+        honor_control: bool,
+    }
+
+    impl TextLlm for PreserveStub {
+        fn descriptor(&self) -> &TextLlmDescriptor {
+            &self.descriptor
+        }
+
+        fn validate(&self, _: &TextLlmRequest) -> core_llm::Result<()> {
+            Ok(())
+        }
+
+        fn generate(
+            &self,
+            request: &TextLlmRequest,
+            emit: &mut dyn FnMut(StreamEvent),
+        ) -> core_llm::Result<TextLlmOutput> {
+            let preserved = request.preserve_thinking == Some(true) && self.honor_control;
+            let usage = Usage {
+                prompt_tokens: if preserved { 14 } else { 10 },
+                generated_tokens: 1,
+            };
+            emit(StreamEvent::Token {
+                id: 1,
+                text: "OK".into(),
+                index: 0,
+                channel: Channel::Content,
+            });
+            emit(StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+                usage,
+            });
+            Ok(TextLlmOutput {
+                text: "OK".into(),
+                usage,
+                finish_reason: Some(FinishReason::Stop),
+                timings: Some(GenerationTimings {
+                    prefill: Duration::from_millis(1),
+                    decode: Duration::from_millis(1),
+                }),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[test]
+    fn preserve_thinking_acceptance_uses_paired_native_prompt_token_proof() {
+        let case = capability_acceptance_cases()
+            .into_iter()
+            .find(|case| case.id == "preserve_thinking")
+            .unwrap();
+        let provider = PreserveStub {
+            descriptor: stub().descriptor,
+            honor_control: true,
+        };
+        let record = measure_preserve_thinking(&provider, &case);
+        assert_eq!(record["status"], "completed");
+        assert_eq!(record["quality_passed"], true);
+        assert_eq!(record["stream_contract_passed"], true);
+        assert_eq!(record["history_coverage_passed"], true);
+        assert_eq!(record["prompt_token_proof"]["preserved_prompt_tokens"], 14);
+        assert_eq!(record["prompt_token_proof"]["stripped_prompt_tokens"], 10);
+        assert_eq!(
+            record["prompt_token_proof"]["additional_preserved_tokens"],
+            4
+        );
+        assert_eq!(record["prompt_token_proof"]["passed"], true);
+        assert_eq!(record["functional_acceptance_passed"], true);
+        assert_eq!(record["request"]["preserved"]["preserve_thinking"], true);
+        assert_eq!(record["request"]["stripped"]["preserve_thinking"], false);
+        assert_eq!(record["paired_steps"]["preserved"]["output"]["text"], "OK");
+        assert_eq!(record["paired_steps"]["stripped"]["output"]["text"], "OK");
+
+        let ignored = PreserveStub {
+            descriptor: stub().descriptor,
+            honor_control: false,
+        };
+        let ignored_record = measure_preserve_thinking(&ignored, &case);
+        assert_eq!(ignored_record["evidence_complete"], true);
+        assert_eq!(ignored_record["quality_passed"], true);
+        assert_eq!(ignored_record["prompt_token_proof"]["passed"], false);
+        assert_eq!(ignored_record["functional_acceptance_passed"], false);
+    }
+
     #[test]
     fn capability_acceptance_cases_cover_reasoning_json_mtp_and_media() {
         let cases = capability_acceptance_cases();
@@ -955,6 +1127,11 @@ mod tests {
             .find(|case| case.id == "preserve_thinking")
             .unwrap();
         assert_eq!(preserve.request.preserve_thinking, Some(true));
+        assert_eq!(preserve.request.thinking, ThinkingMode::Disabled);
+        assert_eq!(
+            preserve.oracle.as_json(),
+            json!({"kind":"exact","value":"OK"})
+        );
         assert!(preserve
             .request
             .messages

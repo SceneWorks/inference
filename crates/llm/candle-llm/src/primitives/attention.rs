@@ -5,13 +5,12 @@
 //! broadcast (the Candle port of `mlx-llm`'s `repeat_kv`, matching `candle-gen-sensenova`).
 //!
 //! Candle has no portable fused causal SDPA across CPU/CUDA (flash-attn is a separate, CUDA-only
-//! crate), so [`sdpa`] is the eager path — `softmax(scale · QKᵀ + mask) · V` — with the causal mask
-//! built explicitly. The mask aligns the `q_len` queries to the bottom-right of the `k_len` cached
-//! keys (query row `r` attends keys `0..=offset+r`, where `offset = k_len - q_len`), so cached decode
-//! is correct without threading an offset through every call. The mask is cheap to *ask* for but not
-//! to build (host vec fill + upload), so the eager path skips it entirely for the all-zeros decode
-//! shape (`q_len == 1`) and memoizes the prefill mask per `(q_len, k_len, dtype, device)` — one build
-//! per forward instead of one per decoder layer (sc-12458).
+//! crate), so [`sdpa`] has an eager fallback — `softmax(scale · QKᵀ + mask) · V`. That fallback
+//! processes at most `EAGER_ATTN_QUERY_CHUNK_SIZE` query rows at a time, bounding scores, masks,
+//! and weights at `O(heads · query_chunk · k_len)` rather than materializing three full
+//! `O(heads · q_len · k_len)` tensors. Chunk masks retain the full query's bottom-right alignment:
+//! global query row `r` attends keys `0..=(k_len - total_q_len) + r`. A single-query decode still
+//! skips its provably all-zero causal mask.
 //!
 //! With the `flash-attn` feature, [`sdpa`] first tries the fused FlashAttention-2 kernel
 //! (`candle_flash_attn::flash_attn`) for the dense causal/bidirectional path and falls back to the
@@ -30,8 +29,6 @@
 //! It is grouped-query-native (K/V passed un-expanded) and bottom-right causal; the eager per-sequence
 //! loop stays the fallback for the cases varlen cannot serve (soft-cap, f32/CPU, no `flash-attn`).
 
-use std::sync::Mutex;
-
 use candle_core::{DType, Device, Tensor};
 use candle_nn::ops::softmax_last_dim;
 
@@ -40,6 +37,15 @@ use crate::error::{Error, Result};
 /// Disallowed-attention fill for the additive mask: a large finite negative (matching the
 /// candle-gen slices — avoids `-inf` propagation through the softmax kernel).
 const MASK_NEG: f32 = -1e30;
+
+/// Maximum query rows in one portable eager-attention tile.
+///
+/// The resource estimator imports this exact constant. At the Qwen3-VL shape (32 heads), a tile
+/// keeps every score-like CUDA allocation below signed 32-bit element indexing even when the key
+/// run exceeds 8K tokens, and bounds CPU prefill workspace without changing attention semantics.
+/// [`sdpa_eager_with_query_chunk_size`] lowers it further when batch/head/key dimensions require
+/// that to keep the flattened tile within `i32::MAX`.
+pub(crate) const EAGER_ATTN_QUERY_CHUNK_SIZE: usize = 256;
 
 /// How attention should be masked.
 #[derive(Debug, Clone, Copy)]
@@ -50,6 +56,14 @@ pub enum AttnMask<'a> {
     Causal,
     /// An explicit additive mask broadcast over the score tensor (`0` keep, large-negative block).
     Additive(&'a Tensor),
+    /// An explicit additive mask narrowed by a sliding causal band. This represents Gemma 4's
+    /// padded-batch sliding layers without first materializing a full combined square mask.
+    AdditiveSliding {
+        /// Caller-provided additive mask, broadcastable over `[batch, heads, q_len, k_len]`.
+        additive: &'a Tensor,
+        /// Number of recent keys visible to each query, including its own position.
+        window: i32,
+    },
     /// **Sliding-window** causal mask (Gemma 4's `sliding_attention` layers): causal *and* limited
     /// to the `window` most recent keys, so query `q` sees key `j` iff `0 <= q - j < window` (the
     /// query's own position counts toward the window). Queries are bottom-right aligned over the
@@ -81,19 +95,40 @@ pub fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
 
 /// Build the additive causal mask `[1, 1, q_len, k_len]` (`0` keep / [`MASK_NEG`] block) for keys
 /// that include `offset = k_len - q_len` cached positions before the new queries.
-fn causal_mask(q_len: usize, k_len: usize, dtype: DType, device: &Device) -> Result<Tensor> {
+fn causal_mask_chunk(
+    query_start: usize,
+    query_len: usize,
+    total_query_len: usize,
+    k_len: usize,
+    dtype: DType,
+    device: &Device,
+) -> Result<Tensor> {
     #[cfg(test)]
-    CAUSAL_MASK_BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let offset = k_len - q_len;
-    let mut data = vec![0f32; q_len * k_len];
-    for r in 0..q_len {
+    {
+        CAUSAL_MASK_BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        MAX_CAUSAL_MASK_ROWS.fetch_max(query_len, std::sync::atomic::Ordering::SeqCst);
+    }
+    let offset = k_len.checked_sub(total_query_len).ok_or_else(|| {
+        Error::Msg(format!(
+            "causal attention needs k_len >= q_len, got {k_len} keys and {total_query_len} queries"
+        ))
+    })?;
+    let mut data = vec![0f32; query_len * k_len];
+    for r in 0..query_len {
         for j in 0..k_len {
-            if j > offset + r {
+            if j > offset + query_start + r {
                 data[r * k_len + j] = MASK_NEG;
             }
         }
     }
-    Ok(Tensor::from_vec(data, (1, 1, q_len, k_len), device)?.to_dtype(dtype)?)
+    Ok(Tensor::from_vec(data, (1, 1, query_len, k_len), device)?.to_dtype(dtype)?)
+}
+
+/// Build a complete bottom-right causal mask. Production eager attention uses bounded
+/// [`causal_mask_chunk`] tiles; this wrapper remains the small-shape reference used by tests.
+#[cfg(test)]
+fn causal_mask(q_len: usize, k_len: usize, dtype: DType, device: &Device) -> Result<Tensor> {
+    causal_mask_chunk(0, q_len, q_len, k_len, dtype, device)
 }
 
 /// The additive **sliding-window** causal mask `[1, 1, q_len, k_len]` (`0` keep / a large finite
@@ -104,13 +139,20 @@ fn causal_mask(q_len: usize, k_len: usize, dtype: DType, device: &Device) -> Res
 /// `0 <= (offset + r) - j < window`: causal, *and* no further back than `window - 1` positions. A
 /// `window >= k_len` degenerates to the plain causal mask; a `window <= 0` is rejected rather than
 /// silently producing an all-blocked row (whose softmax is a uniform distribution over garbage).
-///
-/// Deliberately **not** routed through the single-entry causal-mask memo: that key is
-/// `(q_len, k_len, dtype, device)`, which a window would alias into. A Gemma 4 forward alternates
-/// sliding and full layers at identical `(q_len, k_len)`, so sharing the memo would hand a full
-/// layer the sliding mask.
 pub fn sliding_causal_mask(
     q_len: usize,
+    k_len: usize,
+    window: i32,
+    dtype: DType,
+    device: &Device,
+) -> Result<Tensor> {
+    sliding_causal_mask_chunk(0, q_len, q_len, k_len, window, dtype, device)
+}
+
+fn sliding_causal_mask_chunk(
+    query_start: usize,
+    query_len: usize,
+    total_query_len: usize,
     k_len: usize,
     window: i32,
     dtype: DType,
@@ -122,10 +164,14 @@ pub fn sliding_causal_mask(
         )));
     }
     let window = window as i64;
-    let offset = (k_len - q_len) as i64;
-    let mut data = vec![0f32; q_len * k_len];
-    for r in 0..q_len {
-        let pos = offset + r as i64;
+    let offset = k_len.checked_sub(total_query_len).ok_or_else(|| {
+        Error::Msg(format!(
+            "sliding causal attention needs k_len >= q_len, got {k_len} keys and {total_query_len} queries"
+        ))
+    })? as i64;
+    let mut data = vec![0f32; query_len * k_len];
+    for r in 0..query_len {
+        let pos = offset + query_start as i64 + r as i64;
         for j in 0..k_len {
             let delta = pos - j as i64;
             if !(0..window).contains(&delta) {
@@ -133,106 +179,16 @@ pub fn sliding_causal_mask(
             }
         }
     }
-    Ok(Tensor::from_vec(data, (1, 1, q_len, k_len), device)?.to_dtype(dtype)?)
+    Ok(Tensor::from_vec(data, (1, 1, query_len, k_len), device)?.to_dtype(dtype)?)
 }
 
-/// Number of host-side [`causal_mask`] builds — lets tests pin "decode builds no mask" and "prefill
-/// builds the mask once per forward, not once per layer" (sc-12458).
+/// Number of host-side causal-mask tiles built, used to pin the decode fast path and tile bound.
 #[cfg(test)]
 static CAUSAL_MASK_BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// The one memoized **sliding-window** causal mask — sc-12458's memo, keyed to include the window.
-///
-/// A Gemma 4 stack has 40 `sliding_attention` layers that all ask for the identical
-/// `(q_len, k_len, window)` mask within one forward, so without a memo the host-side fill + upload
-/// in [`sliding_causal_mask`] runs 40 times per prefill. It is a **separate** entry from
-/// [`CAUSAL_MASK_CACHE`] on purpose: that key has no window field, so sharing one slot would let a
-/// `full_attention` layer collect a sliding mask (and vice versa) at the same `(q_len, k_len)` —
-/// the exact aliasing [`sliding_causal_mask`]'s doc warns about. Two slots also mean the alternating
-/// stack never thrashes a single one.
-struct SlidingMaskEntry {
-    q_len: usize,
-    k_len: usize,
-    window: i32,
-    dtype: DType,
-    device: Device,
-    mask: Tensor,
-}
-
-static SLIDING_MASK_CACHE: Mutex<Option<SlidingMaskEntry>> = Mutex::new(None);
-
-/// [`sliding_causal_mask`] behind its own single-entry memo: bit-identical values (same builder),
-/// built once per distinct `(q_len, k_len, window, dtype, device)`.
-fn cached_sliding_causal_mask(
-    q_len: usize,
-    k_len: usize,
-    window: i32,
-    dtype: DType,
-    device: &Device,
-) -> Result<Tensor> {
-    let mut guard = SLIDING_MASK_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(e) = guard.as_ref() {
-        if e.q_len == q_len
-            && e.k_len == k_len
-            && e.window == window
-            && e.dtype == dtype
-            && e.device.same_device(device)
-        {
-            return Ok(e.mask.clone());
-        }
-    }
-    let mask = sliding_causal_mask(q_len, k_len, window, dtype, device)?;
-    *guard = Some(SlidingMaskEntry {
-        q_len,
-        k_len,
-        window,
-        dtype,
-        device: device.clone(),
-        mask: mask.clone(),
-    });
-    Ok(mask)
-}
-
-/// The one memoized causal mask (sc-12458). Every decoder layer of a forward asks [`sdpa_eager`] for
-/// the identical `AttnMask::Causal` mask, so without memoization the host-side vec fill + upload in
-/// [`causal_mask`] ran once **per layer** per forward. A single entry suffices: within one forward
-/// the key `(q_len, k_len, dtype, device)` is constant across layers (it changes at most at a shard
-/// boundary on a multi-device model), so a prefill builds the mask once and every later layer clones
-/// the cached handle. Decode steps (`q_len == 1`) never reach this — see [`sdpa_eager`].
-struct CausalMaskEntry {
-    q_len: usize,
-    k_len: usize,
-    dtype: DType,
-    device: Device,
-    mask: Tensor,
-}
-
-static CAUSAL_MASK_CACHE: Mutex<Option<CausalMaskEntry>> = Mutex::new(None);
-
-/// [`causal_mask`] behind the single-entry memo: returns the cached tensor when the key matches,
-/// else builds (bit-identical values — same builder) and replaces the entry.
-fn cached_causal_mask(q_len: usize, k_len: usize, dtype: DType, device: &Device) -> Result<Tensor> {
-    let mut guard = CAUSAL_MASK_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(e) = guard.as_ref() {
-        if e.q_len == q_len && e.k_len == k_len && e.dtype == dtype && e.device.same_device(device)
-        {
-            return Ok(e.mask.clone());
-        }
-    }
-    let mask = causal_mask(q_len, k_len, dtype, device)?;
-    *guard = Some(CausalMaskEntry {
-        q_len,
-        k_len,
-        dtype,
-        device: device.clone(),
-        mask: mask.clone(),
-    });
-    Ok(mask)
-}
+#[cfg(test)]
+static MAX_CAUSAL_MASK_ROWS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Eager scaled-dot-product attention over `[batch, heads, seq, head_dim]` tensors.
 ///
@@ -265,35 +221,137 @@ fn sdpa_eager(
     softcap: Option<f32>,
     mask: AttnMask<'_>,
 ) -> Result<Tensor> {
-    let (_b, _h, q_len, _d) = queries.dims4()?;
-    let k_len = keys.dim(2)?;
-    let mut scores = (queries
-        .contiguous()?
-        .matmul(&keys.transpose(2, 3)?.contiguous()?)?
-        * scale as f64)?;
-    if let Some(c) = softcap {
-        scores = crate::primitives::nn::soft_cap(&scores, c)?;
+    sdpa_eager_with_query_chunk_size(
+        queries,
+        keys,
+        values,
+        scale,
+        softcap,
+        mask,
+        EAGER_ATTN_QUERY_CHUNK_SIZE,
+    )
+}
+
+fn additive_mask_chunk(
+    mask: &Tensor,
+    query_start: usize,
+    query_len: usize,
+    total_query_len: usize,
+) -> Result<Tensor> {
+    let dims = mask.dims();
+    if dims.len() < 2 {
+        return Err(Error::Msg(format!(
+            "additive attention mask must have at least two dimensions, got {dims:?}"
+        )));
     }
-    let scores = match mask {
-        AttnMask::None => scores,
-        // A single-query bottom-right-aligned causal mask is provably all zeros (its one row `r = 0`
-        // blocks `j > (k_len - 1) + 0`, unsatisfiable for `j < k_len`), so the decode step skips the
-        // mask build entirely — no host allocation, no upload, no broadcast_add of zeros (sc-12458).
-        // Softmax is invariant to adding exact zeros, so this is bit-identical to the masked path.
-        AttnMask::Causal if q_len == 1 => scores,
-        AttnMask::Causal => {
-            let m = cached_causal_mask(q_len, k_len, scores.dtype(), scores.device())?;
-            scores.broadcast_add(&m)?
+    let query_axis = dims.len() - 2;
+    match dims[query_axis] {
+        1 => Ok(mask.clone()),
+        len if len == total_query_len => Ok(mask.narrow(query_axis, query_start, query_len)?),
+        len => Err(Error::Msg(format!(
+            "additive attention mask query dimension must be 1 or {total_query_len}, got {len}"
+        ))),
+    }
+}
+
+fn sdpa_eager_with_query_chunk_size(
+    queries: &Tensor,
+    keys: &Tensor,
+    values: &Tensor,
+    scale: f32,
+    softcap: Option<f32>,
+    mask: AttnMask<'_>,
+    query_chunk_size: usize,
+) -> Result<Tensor> {
+    if query_chunk_size == 0 {
+        return Err(Error::Msg(
+            "eager attention query chunk size must be positive".into(),
+        ));
+    }
+    let (b, h, q_len, _d) = queries.dims4()?;
+    let k_len = keys.dim(2)?;
+    let elements_per_query_row = b
+        .checked_mul(h)
+        .and_then(|elements| elements.checked_mul(k_len))
+        .ok_or_else(|| Error::Msg("eager attention tile size overflow".into()))?;
+    if elements_per_query_row == 0 {
+        return Err(Error::Msg(
+            "eager attention requires non-empty batch, heads, and keys".into(),
+        ));
+    }
+    let indexable_query_rows = (i32::MAX as usize) / elements_per_query_row;
+    if indexable_query_rows == 0 {
+        return Err(Error::Msg(format!(
+            "eager attention cannot index one query row with batch={b}, heads={h}, k_len={k_len}"
+        )));
+    }
+    let query_chunk_size = query_chunk_size.min(indexable_query_rows);
+    let queries = queries.contiguous()?;
+    let keys_t = keys.transpose(2, 3)?.contiguous()?;
+    let values = values.contiguous()?;
+    let mut chunks = Vec::with_capacity(q_len.div_ceil(query_chunk_size));
+    for query_start in (0..q_len).step_by(query_chunk_size) {
+        let query_len = query_chunk_size.min(q_len - query_start);
+        let query = queries.narrow(2, query_start, query_len)?.contiguous()?;
+        let mut scores = (query.matmul(&keys_t)? * scale as f64)?;
+        if let Some(c) = softcap {
+            scores = crate::primitives::nn::soft_cap(&scores, c)?;
         }
-        AttnMask::Additive(a) => scores.broadcast_add(a)?,
-        AttnMask::SlidingCausal { window } => {
-            let m =
-                cached_sliding_causal_mask(q_len, k_len, window, scores.dtype(), scores.device())?;
-            scores.broadcast_add(&m)?
-        }
-    };
-    let weights = softmax_last_dim(&scores)?;
-    Ok(weights.matmul(&values.contiguous()?)?)
+        let scores = match mask {
+            AttnMask::None => scores,
+            // A single-query bottom-right-aligned causal mask is provably all zeros (its one row
+            // blocks `j > k_len - 1`, impossible for `j < k_len`), so decode skips the mask build.
+            AttnMask::Causal if q_len == 1 => scores,
+            AttnMask::Causal => {
+                let tile = causal_mask_chunk(
+                    query_start,
+                    query_len,
+                    q_len,
+                    k_len,
+                    scores.dtype(),
+                    scores.device(),
+                )?;
+                scores.broadcast_add(&tile)?
+            }
+            AttnMask::Additive(additive) => {
+                let tile = additive_mask_chunk(additive, query_start, query_len, q_len)?;
+                scores.broadcast_add(&tile)?
+            }
+            AttnMask::SlidingCausal { window } => {
+                let tile = sliding_causal_mask_chunk(
+                    query_start,
+                    query_len,
+                    q_len,
+                    k_len,
+                    window,
+                    scores.dtype(),
+                    scores.device(),
+                )?;
+                scores.broadcast_add(&tile)?
+            }
+            AttnMask::AdditiveSliding { additive, window } => {
+                let additive = additive_mask_chunk(additive, query_start, query_len, q_len)?;
+                let band = sliding_causal_mask_chunk(
+                    query_start,
+                    query_len,
+                    q_len,
+                    k_len,
+                    window,
+                    scores.dtype(),
+                    scores.device(),
+                )?;
+                let combined = additive.broadcast_add(&band)?;
+                scores.broadcast_add(&combined)?
+            }
+        };
+        let weights = softmax_last_dim(&scores)?;
+        chunks.push(weights.matmul(&values)?);
+    }
+    if chunks.len() == 1 {
+        Ok(chunks.pop().expect("one eager attention output chunk"))
+    } else {
+        Ok(Tensor::cat(&chunks.iter().collect::<Vec<_>>(), 2)?)
+    }
 }
 
 /// Convenience: causal attention with no soft-cap (the decode default).
@@ -324,7 +382,9 @@ fn try_flash_attn(
         AttnMask::None => false,
         AttnMask::Causal => true,
         // The wrapper exposes no left-window argument, so sliding layers take the eager path.
-        AttnMask::Additive(_) | AttnMask::SlidingCausal { .. } => return Ok(None),
+        AttnMask::Additive(_)
+        | AttnMask::AdditiveSliding { .. }
+        | AttnMask::SlidingCausal { .. } => return Ok(None),
     };
     // The kernel is CUDA-only and f16/bf16-only.
     if !queries.device().is_cuda() {
@@ -456,13 +516,11 @@ mod tests {
         assert_eq!(out.dims(), &[1, 1, 2, 4]);
     }
 
-    /// Reset the sc-12458 memo + build counter so a test observes only its own builds. Tests run
-    /// single-threaded here (`RUST_TEST_THREADS=1` is forced), so this is race-free.
+    /// Reset mask accounting so a test observes only its own builds. Tests run single-threaded here
+    /// (`RUST_TEST_THREADS=1` is forced), so this is race-free.
     fn reset_mask_accounting() {
-        *CAUSAL_MASK_CACHE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         CAUSAL_MASK_BUILDS.store(0, std::sync::atomic::Ordering::SeqCst);
+        MAX_CAUSAL_MASK_ROWS.store(0, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn mask_builds() -> usize {
@@ -492,6 +550,17 @@ mod tests {
             .collect()
     }
 
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        (a - b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    }
+
     /// sc-12458: the decode shape (`q_len == 1`, bottom-right causal) must build **no** mask — and be
     /// bit-identical to the old always-mask path (the mask it skips is provably all zeros).
     #[test]
@@ -512,49 +581,36 @@ mod tests {
         assert_eq!(bits(&got), bits(&want), "decode skip must be bit-identical");
     }
 
-    /// sc-12458: repeated same-shape causal SDPA calls (the per-layer loop of one prefill forward)
-    /// build the mask **once**, and every call is bit-identical to the explicitly masked path.
+    /// Production shapes at or below the bound stay on one eager operation and therefore retain the
+    /// exact small-shape output of the pre-chunk implementation.
     #[test]
-    fn prefill_builds_mask_once_across_layers() {
+    fn small_prefill_is_bit_identical_to_unchunked_eager() {
         let (b, h, q_len, d) = (1, 2, 5, 4);
         let k_len = 8; // chunked/continuation prefill: cached positions ahead of the new queries
         let q = varied4(b, h, q_len, d, 0.4);
         let k = varied4(b, h, k_len, d, 2.2);
         let v = varied4(b, h, k_len, d, 4.9);
-
-        let m = causal_mask(q_len, k_len, DType::F32, &Device::Cpu).unwrap();
-        let want = bits(&sdpa_eager(&q, &k, &v, 0.5, None, AttnMask::Additive(&m)).unwrap());
-
-        reset_mask_accounting();
-        for layer in 0..4 {
-            let got = sdpa_eager(&q, &k, &v, 0.5, None, AttnMask::Causal).unwrap();
-            assert_eq!(bits(&got), want, "layer {layer} must match the masked path");
-        }
-        assert_eq!(mask_builds(), 1, "one mask build for the whole forward");
+        let want =
+            sdpa_eager_with_query_chunk_size(&q, &k, &v, 0.5, None, AttnMask::Causal, usize::MAX)
+                .unwrap();
+        let got = sdpa_eager(&q, &k, &v, 0.5, None, AttnMask::Causal).unwrap();
+        assert_eq!(bits(&got), bits(&want));
     }
 
-    /// sc-12458: a different `(q_len, k_len)` (e.g. the next request's prefill, or a speculative
-    /// `q_len > 1` continuation at a moved offset) must rebuild rather than reuse a stale mask.
     #[test]
-    fn cached_mask_rebuilds_on_shape_change() {
+    fn causal_prefill_never_builds_more_than_the_query_chunk() {
+        let q_len = EAGER_ATTN_QUERY_CHUNK_SIZE + 1;
+        let q = varied4(1, 1, q_len, 2, 0.1);
+        let k = varied4(1, 1, q_len + 3, 2, 0.2);
+        let v = varied4(1, 1, q_len + 3, 2, 0.3);
         reset_mask_accounting();
-        let a = cached_causal_mask(3, 3, DType::F32, &Device::Cpu).unwrap();
-        let _ = cached_causal_mask(3, 3, DType::F32, &Device::Cpu).unwrap();
-        assert_eq!(mask_builds(), 1, "same key is served from the memo");
-
-        let b = cached_causal_mask(3, 7, DType::F32, &Device::Cpu).unwrap();
-        assert_eq!(mask_builds(), 2, "new key must rebuild");
-        assert_eq!(a.dims(), &[1, 1, 3, 3]);
-        assert_eq!(b.dims(), &[1, 1, 3, 7]);
-        // And the rebuilt mask carries the correct bottom-right alignment (offset = 4).
-        let rows = b.reshape((3, 7)).unwrap().to_vec2::<f32>().unwrap();
-        assert_eq!(rows[0][4], 0.0); // j == offset + r: attended
-        assert_eq!(rows[0][5], MASK_NEG); // j > offset + r: blocked
-        assert_eq!(rows[2][6], 0.0); // last row attends everything
-
-        let c = cached_causal_mask(3, 7, DType::F16, &Device::Cpu).unwrap();
-        assert_eq!(mask_builds(), 3, "dtype is part of the key");
-        assert_eq!(c.dtype(), DType::F16);
+        let out = sdpa_eager(&q, &k, &v, 0.5, None, AttnMask::Causal).unwrap();
+        assert_eq!(out.dims(), &[1, 1, q_len, 2]);
+        assert_eq!(mask_builds(), 2);
+        assert_eq!(
+            MAX_CAUSAL_MASK_ROWS.load(std::sync::atomic::Ordering::SeqCst),
+            EAGER_ATTN_QUERY_CHUNK_SIZE
+        );
     }
 
     #[test]
@@ -569,6 +625,113 @@ mod tests {
         assert_eq!(m[0][1], MASK_NEG); // future blocked
         assert_eq!(m[1][0], 0.0); // past attended
         assert_eq!(m[2][2], 0.0); // self attended
+    }
+
+    #[test]
+    fn chunked_eager_matches_unchunked_across_masks_softcap_and_strides() {
+        let (b, h, q_len, k_len, d) = (1, 2, 7, 10, 4);
+        // Transposing head/query produces the production shape with a deliberately non-contiguous
+        // layout; eager attention must make each query tile contiguous before matmul.
+        let q = varied4(b, q_len, h, d, 0.2).transpose(1, 2).unwrap();
+        let k = varied4(b, k_len, h, d, 1.4).transpose(1, 2).unwrap();
+        let v = varied4(b, k_len, h, d, 3.7).transpose(1, 2).unwrap();
+        assert!(!q.is_contiguous());
+
+        // Start from `[1, 1, k, q]` and transpose to a non-contiguous `[1, 1, q, k]` additive
+        // mask, exercising query-axis narrowing without requiring the caller to copy it first.
+        let additive = varied4(1, 1, k_len, q_len, 0.9).transpose(2, 3).unwrap();
+        assert!(!additive.is_contiguous());
+
+        for (name, mask, softcap) in [
+            ("none", AttnMask::None, None),
+            ("causal", AttnMask::Causal, None),
+            ("sliding", AttnMask::SlidingCausal { window: 4 }, None),
+            ("additive", AttnMask::Additive(&additive), None),
+            (
+                "additive_sliding",
+                AttnMask::AdditiveSliding {
+                    additive: &additive,
+                    window: 4,
+                },
+                None,
+            ),
+            ("causal_softcap", AttnMask::Causal, Some(2.5)),
+        ] {
+            let want = sdpa_eager_with_query_chunk_size(&q, &k, &v, 0.5, softcap, mask, usize::MAX)
+                .unwrap();
+            let got = sdpa_eager_with_query_chunk_size(&q, &k, &v, 0.5, softcap, mask, 3).unwrap();
+            let diff = max_abs_diff(&got, &want);
+            assert!(
+                diff <= 1e-6,
+                "{name}: chunked vs unchunked max|delta| = {diff}"
+            );
+        }
+    }
+
+    #[test]
+    fn chunked_causal_mask_keeps_global_bottom_right_alignment() {
+        let total_q = EAGER_ATTN_QUERY_CHUNK_SIZE + 1;
+        let k_len = total_q + 3;
+        let first = causal_mask_chunk(
+            0,
+            EAGER_ATTN_QUERY_CHUNK_SIZE,
+            total_q,
+            k_len,
+            DType::F32,
+            &Device::Cpu,
+        )
+        .unwrap()
+        .reshape((EAGER_ATTN_QUERY_CHUNK_SIZE, k_len))
+        .unwrap()
+        .to_vec2::<f32>()
+        .unwrap();
+        let last = causal_mask_chunk(
+            EAGER_ATTN_QUERY_CHUNK_SIZE,
+            1,
+            total_q,
+            k_len,
+            DType::F32,
+            &Device::Cpu,
+        )
+        .unwrap()
+        .reshape((1, k_len))
+        .unwrap()
+        .to_vec2::<f32>()
+        .unwrap();
+        // `offset = 3`: global row 255 sees through key 258; global row 256 sees key 259 too.
+        assert_eq!(first[EAGER_ATTN_QUERY_CHUNK_SIZE - 1][258], 0.0);
+        assert_eq!(first[EAGER_ATTN_QUERY_CHUNK_SIZE - 1][259], MASK_NEG);
+        assert_eq!(last[0][259], 0.0);
+    }
+
+    /// Exact attention shape from the frozen Qwen3-VL campaign `context_512` request. RC2's
+    /// unchunked `[1, 32, 9247, 9247]` softmax has 2,736,224,288 elements; Candle's CUDA kernel
+    /// indexes it with signed `int`, so it crosses `INT_MAX` and faults. The production query tile
+    /// keeps every softmax launch below that limit. This is ignored because it requires CUDA and
+    /// allocates several hundred MiB, but it uses no model weights.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires CUDA; exact Qwen3-VL context_512 attention-shape regression"]
+    fn cuda_qwen3vl_context_512_shape_uses_bounded_eager_attention() {
+        eprintln!("stage=device");
+        let device = Device::new_cuda(0).expect("cuda device");
+        let (b, h, s, d) = (1usize, 32usize, 9_247usize, 128usize);
+        assert!(b * h * s * s > i32::MAX as usize);
+        assert!(b * h * EAGER_ATTN_QUERY_CHUNK_SIZE * s < i32::MAX as usize);
+        eprintln!("stage=allocate_qkv");
+        let q = Tensor::zeros((b, h, s, d), DType::BF16, &device).unwrap();
+        let k = Tensor::zeros((b, h, s, d), DType::BF16, &device).unwrap();
+        let v = Tensor::zeros((b, h, s, d), DType::BF16, &device).unwrap();
+        device.synchronize().unwrap();
+        eprintln!("stage=qkv_ready");
+        eprintln!("stage=production_sdpa");
+        let out = sdpa_eager(&q, &k, &v, (d as f32).powf(-0.5), None, AttnMask::Causal).unwrap();
+        assert_eq!(out.dims(), &[b, h, s, d]);
+        device.synchronize().unwrap();
+        eprintln!("stage=sdpa_ready");
+        let sum = out.sum_all().unwrap().to_scalar::<half::bf16>().unwrap();
+        eprintln!("stage=readback sum={}", sum.to_f32());
+        assert_eq!(sum, half::bf16::ZERO);
     }
 
     /// On CUDA, the fused FlashAttention-2 kernel must agree with the eager path within a few

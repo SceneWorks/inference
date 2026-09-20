@@ -9,15 +9,21 @@ remain unchanged.
 fresh available capacity; it cannot enlarge it. Invalid or non-Unicode values fail closed. Missing
 capacity also fails closed, even when a budget was supplied. CPU capacity comes from current host
 availability (Linux MemAvailable, macOS reclaimable/free vm_stat pages, Windows FreePhysicalMemory).
-MLX uses that unified-memory capacity. Candle CUDA reads free memory from the loaded CUDA device's
-own context; host RAM is never substituted for VRAM. Load admission checks host staging as well as
-CUDA device capacity. Request estimates apply to *additional* request memory against current free
-capacity, so loaded weights are not charged twice.
+MLX uses that unified-memory capacity. Candle CUDA applies the operational cap to VRAM and reads
+current free memory from the loaded CUDA device's own context; host RAM is never substituted for
+VRAM, and a launch-time GPU snapshot never substitutes for current post-load free VRAM. CUDA load
+admission checks host staging independently against current host capacity. Request estimates apply
+to *additional* request memory against current free capacity, so loaded weights are not charged
+twice.
 
-Load upper bounds use checkpoint headers without evaluating tensor payloads. Dense Candle CPU
+Load upper bounds use checkpoint files without evaluating tensor payloads. Dense Candle CPU
 reserves three times stored payload for source tensors plus conversion; packed Candle reserves two
-copies. CUDA device load reserves payload plus 25 percent temporary space. Candle external
-projectors reserve four times their stored payload.
+copies. Dense Candle CUDA's pinned loader reads one safetensors shard into a host buffer, copies its
+tensors directly to CUDA at their stored dtype, then drops that buffer before reading the next
+shard. Its host bound is therefore the largest shard rather than two complete checkpoint copies.
+Qwen3.8 is BF16 and same-dtype model construction shares the loaded storage. CUDA device admission
+reserves the complete payload plus 25 percent temporary space, covering construction-time casts
+such as the F32 vision tower. Candle external projectors reserve four times their stored payload.
 
 MLX safetensors follow a different allocation path. In the pinned mlx-rs dependency, upstream
 `mlx/io/safetensors.cpp` creates lazy Load arrays from headers. `mlx/backend/common/load.cpp`

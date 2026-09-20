@@ -24,7 +24,7 @@ const MASK_NEG: f32 = -1e30;
 /// `q_len <= 8` kernel is correct for ANY cache length, so [`sdpa`] never hands the fused kernel more
 /// than this many query rows on the affected shapes; it chunks prefill instead. When the
 /// `sc7430_*` tripwire test starts failing, the fork is fixed and this whole mitigation can go.
-const SDPA_MAX_FUSED_QLEN: i32 = 8;
+pub(crate) const SDPA_MAX_FUSED_QLEN: i32 = 8;
 
 /// How attention should be masked.
 #[derive(Debug, Clone, Copy)]

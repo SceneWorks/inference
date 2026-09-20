@@ -347,11 +347,7 @@ pub fn hadamard_metadata(file: &GgufFile) -> Result<PrismHadamardMetadata> {
             .get(at..end)
             .ok_or_else(|| Error::Config("GGUF Prism signs are truncated".into()))?
             .iter()
-            .map(|v| match v.as_f64() {
-                Some(-1.0) => Ok(-1),
-                Some(1.0) => Ok(1),
-                _ => Err(Error::Config("GGUF Prism signs must be -1 or +1".into())),
-            })
+            .map(exact_sign)
             .collect::<Result<Vec<_>>>()?;
         if signs_by_width.insert(width, signs).is_some() {
             return Err(Error::Config(
@@ -384,6 +380,14 @@ pub fn hadamard_metadata(file: &GgufFile) -> Result<PrismHadamardMetadata> {
         .validate()
         .map_err(|e| Error::Config(e.to_string()))?;
     Ok(metadata)
+}
+
+fn exact_sign(value: &MetaValue) -> Result<i8> {
+    match (value.as_i64(), value.as_f64()) {
+        (Some(-1), _) | (_, Some(-1.0)) => Ok(-1),
+        (Some(1), _) | (_, Some(1.0)) => Ok(1),
+        _ => Err(Error::Config("GGUF Prism signs must be -1 or +1".into())),
+    }
 }
 
 /// Transcode one packed GGUF matrix to an MLX-native packed linear operator.
@@ -647,6 +651,39 @@ mod tests {
         );
         assert!(active_rope_sections(&[11, 11, 10]).is_err());
         assert!(active_rope_sections(&[11, 11, 10, 1]).is_err());
+    }
+
+    #[test]
+    fn exact_sign_accepts_publisher_integer_encodings_and_rejects_mutations() {
+        assert_eq!(exact_sign(&MetaValue::I8(-1)).unwrap(), -1);
+        assert_eq!(exact_sign(&MetaValue::U8(1)).unwrap(), 1);
+        assert_eq!(exact_sign(&MetaValue::F32(-1.0)).unwrap(), -1);
+        for value in [
+            MetaValue::I8(0),
+            MetaValue::I8(2),
+            MetaValue::F32(0.999),
+            MetaValue::F32(f32::NAN),
+            MetaValue::Bool(true),
+        ] {
+            assert!(exact_sign(&value).is_err());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires frozen Bonsai GGUF via BONSAI_GGUF"]
+    fn frozen_gguf_hadamard_accepts_publisher_integer_signs() {
+        let path = std::env::var_os("BONSAI_GGUF")
+            .map(std::path::PathBuf::from)
+            .expect("BONSAI_GGUF must point to the frozen PQ2_0 or PTQ1_0 file");
+        let file = GgufFile::open(&path).unwrap();
+        let metadata = hadamard_metadata(&file).unwrap();
+        assert_eq!(metadata.block_size, 1024);
+        assert_eq!(
+            metadata.signs_by_width.keys().copied().collect::<Vec<_>>(),
+            vec![5120, 6144, 17408]
+        );
+        assert_eq!(metadata.forward_weight_names.len(), 401);
+        assert_eq!(metadata.inverse_weight_names.len(), 1);
     }
 
     #[test]
