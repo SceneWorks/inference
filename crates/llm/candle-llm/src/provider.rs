@@ -1799,10 +1799,28 @@ impl TextLlm for LlamaProvider {
         let vision_workspace = vision_workspace
             .checked_add(request_media_workspace_bytes(&req.messages)?)
             .ok_or_else(|| CoreError::InvalidRequest("media workspace overflow".into()))?;
+        let replaced_visual_placeholders =
+            self.vision
+                .as_ref()
+                .filter(|_| multimodal)
+                .map_or(0, |vision| {
+                    prompt_ids
+                        .iter()
+                        .filter(|&&id| id == vision.image_token_id || id == vision.video_token_id)
+                        .count()
+                });
         let admitted_prompt = prompt_ids
             .len()
-            .checked_add(visual_tokens)
+            .checked_sub(replaced_visual_placeholders)
+            .and_then(|n| n.checked_add(visual_tokens))
             .ok_or_else(|| CoreError::InvalidRequest("expanded prompt geometry overflow".into()))?;
+        // Pure prompt/visual geometry is known before native preprocessing. Architectural context
+        // overflow must win over a transient capacity failure on the current host or CUDA device.
+        validate_context_window(
+            self.descriptor.capabilities.max_context_tokens,
+            admitted_prompt,
+            req.max_new_tokens,
+        )?;
         let required = core_llm::estimate_request_bytes(
             admitted_prompt,
             req.max_new_tokens,

@@ -74,6 +74,71 @@ pub fn estimate_request_bytes(
         )
 }
 
+/// Conservative checked estimate for a request whose attention implementation bounds the number
+/// of simultaneously materialized query rows and whose prefill projects only the final hidden row
+/// to vocabulary logits.
+///
+/// `max_attention_query_tokens` must be the same non-zero tile bound enforced by the backend's
+/// attention runtime. KV, speculative rollback, media, decoder activation, and recurrent-state
+/// costs remain fully priced; only the two prompt-scaled tensors proven absent from that runtime
+/// path differ from [`estimate_request_bytes`].
+pub fn estimate_chunked_request_bytes(
+    prompt_tokens: usize,
+    max_new_tokens: u32,
+    geometry: LlmMemoryGeometry,
+    vision_workspace_bytes: u64,
+    mtp_width: u32,
+    max_attention_query_tokens: usize,
+) -> Option<u64> {
+    if max_attention_query_tokens == 0 {
+        return None;
+    }
+    let prompt = u64::try_from(prompt_tokens).ok()?;
+    let total = prompt.checked_add(u64::from(max_new_tokens))?;
+    let attention_rows = prompt.min(u64::try_from(max_attention_query_tokens).ok()?);
+    let attention = prompt
+        .checked_mul(attention_rows)?
+        .checked_mul(geometry.query_heads)?
+        .checked_mul(geometry.element_bytes)?
+        .checked_mul(3)?;
+    let kv = total
+        .checked_mul(geometry.layers)?
+        .checked_mul(geometry.kv_heads)?
+        .checked_mul(geometry.head_dim)?
+        .checked_mul(geometry.element_bytes)?
+        .checked_mul(2)?;
+    let mtp = if mtp_width > 0 {
+        kv.checked_mul(2)?.checked_add(
+            u64::from(mtp_width)
+                .checked_mul(geometry.hidden_size.checked_add(geometry.vocab_size)?)?
+                .checked_mul(geometry.element_bytes)?,
+        )?
+    } else {
+        0
+    };
+    // One decoder layer's live projections, MLP tensors, and residuals. The vocabulary projection
+    // is one row because the backend narrows the final hidden state before applying lm_head.
+    let activations = prompt
+        .checked_mul(
+            geometry
+                .intermediate_size
+                .checked_mul(3)?
+                .checked_add(geometry.hidden_size.checked_mul(8)?)?,
+        )?
+        .checked_mul(geometry.element_bytes)?
+        .checked_add(geometry.vocab_size.checked_mul(geometry.element_bytes)?)?;
+    attention
+        .checked_add(kv)?
+        .checked_add(mtp)?
+        .checked_add(vision_workspace_bytes)?
+        .checked_add(activations)?
+        .checked_add(
+            geometry
+                .recurrent_bytes
+                .checked_mul(if mtp_width > 0 { 3 } else { 1 })?,
+        )
+}
+
 /// Reject an estimated request before native tensor allocation.
 pub fn admit_request_memory(required: u64, available: u64) -> Result<()> {
     if required > available {
@@ -243,6 +308,28 @@ mod tests {
             "architecturally valid long context must still fail closed when current capacity is insufficient"
         );
         assert!(estimate_request_bytes(usize::MAX, u32::MAX, geometry, 0, 3).is_none());
+    }
+
+    #[test]
+    fn chunked_estimate_prices_runtime_tile_and_last_row_logits() {
+        let geometry = LlmMemoryGeometry {
+            query_heads: 40,
+            kv_heads: 4,
+            head_dim: 128,
+            layers: 64,
+            element_bytes: 4,
+            hidden_size: 5120,
+            intermediate_size: 17_408,
+            vocab_size: 248_320,
+            recurrent_bytes: 0,
+        };
+        let chunked = estimate_chunked_request_bytes(29_600, 128, geometry, 0, 0, 8).unwrap();
+        let eager = estimate_request_bytes(29_600, 128, geometry, 0, 0).unwrap();
+        assert_eq!(chunked, 18_940_659_712);
+        assert!(chunked < 36_000_000_000);
+        assert!(eager > 400_000_000_000);
+        assert!(estimate_chunked_request_bytes(128, 16, geometry, 0, 0, 0).is_none());
+        assert!(estimate_chunked_request_bytes(usize::MAX, u32::MAX, geometry, 0, 3, 8).is_none());
     }
 
     #[test]

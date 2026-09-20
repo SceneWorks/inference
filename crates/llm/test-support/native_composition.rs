@@ -321,6 +321,22 @@ fn native_resource_rejects_within_window_before_allocating() {
             !error.contains("context window"),
             "must reject a within-window request by memory"
         );
+        let mut over_context = request.clone();
+        over_context.max_new_tokens = 4096;
+        let error = provider
+            .generate(&over_context, &mut |_| {
+                panic!("context-rejected request emitted a token")
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("exceeds context window 4096"),
+            "architectural context rejection must precede the 1-byte memory budget: {error}"
+        );
+        assert!(
+            !error.contains("bytes of native workspace"),
+            "context overflow was masked by resource admission: {error}"
+        );
         let error = LlamaProvider::load(&LoadSpec::dense(dir.path().display().to_string()))
             .err()
             .unwrap()
