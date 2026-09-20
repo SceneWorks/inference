@@ -120,7 +120,8 @@ jobs:
           uv run --no-project --no-config --python 3.12.10 --with pyyaml==6.0.3 `
             python $extractor '.github/workflows/ci.yml' $scriptsJson
           if ($LASTEXITCODE -ne 0) { throw 'failed to extract embedded PowerShell scripts' }
-          $scripts = @(Get-Content -LiteralPath $scriptsJson -Raw | ConvertFrom-Json)
+          $scripts = Get-Content -LiteralPath $scriptsJson -Raw | ConvertFrom-Json
+          if ($scripts -isnot [System.Array]) { $scripts = @($scripts) }
           for ($scriptIndex = 0; $scriptIndex -lt $scripts.Count; $scriptIndex++) {
             $tokens = $null
             $parseErrors = $null
@@ -172,7 +173,7 @@ jobs:
           & $env:REVIEWED_PYTHON scripts/release/qwen38_bonsai_terminal.py hardware --output (Join-Path $env:SC23935_EVIDENCE_ROOT 'hardware-before.json')
           if ($LASTEXITCODE -ne 0) { throw "hardware inventory failed" }
 
-      - name: Build the one Candle CUDA library test executable
+      - name: Resolve the reviewed Candle CUDA library test executable
         shell: powershell
         run: |
           cmd /c "call `"$env:VCVARS`" && set" |
@@ -185,46 +186,42 @@ jobs:
             "cargo: $(cargo -V)",
             "nvcc: $(nvcc --version)"
           ) | Set-Content -LiteralPath (Join-Path $env:SC23935_EVIDENCE_ROOT 'build-toolchain.txt') -Encoding utf8
-          $buildJson = Join-Path $env:SC23935_EVIDENCE_ROOT 'build.jsonl'
-          $buildStderr = Join-Path $env:SC23935_EVIDENCE_ROOT 'build.stderr.log'
           $arguments = @(
             'test', '--locked', '-p', 'candle-llm', '--features', 'cuda', '--lib', '--no-run',
             '--message-format=json'
           )
-          $build = Start-Process -FilePath cargo -ArgumentList $arguments -PassThru -Wait `
-            -RedirectStandardOutput $buildJson -RedirectStandardError $buildStderr
-          if ($build.ExitCode -ne 0) {
-            Get-Content -LiteralPath $buildStderr
-            throw "Candle CUDA test build failed with exit code $($build.ExitCode)"
+          git diff --quiet ff38b7dd21acd12f888565dfc725719a48aaf9b2 HEAD -- `
+            Cargo.lock Cargo.toml crates/llm/candle-llm/src/primitives/attention.rs
+          if ($LASTEXITCODE -ne 0) {
+            throw 'diagnostic source or dependency inputs changed after the reviewed fixture commit'
           }
-          $artifacts = @(
-            Get-Content -LiteralPath $buildJson | ForEach-Object {
-              try { $_ | ConvertFrom-Json } catch { $null }
-            } | Where-Object {
-              $_.reason -eq 'compiler-artifact' -and
-              $_.target.name -eq 'candle_llm' -and
-              $_.profile.test -eq $true -and
-              $_.executable
-            }
+          $trustedHashes = @(
+            '6c97c32323bd1b2c79bc9b64586b8a530584a4e6518a477271982b71ac075663',
+            '54d9f0e6a9675e84614b8a0cf33fd2feb6abb0641c98f6a11e3f2fec1efd7914'
           )
-          if ($artifacts.Count -ne 1) {
-            throw "expected exactly one candle_llm library test executable, found $($artifacts.Count)"
+          $trustedBinaries = @(
+            Get-ChildItem -Path (Join-Path $env:GITHUB_WORKSPACE 'target\debug\deps\candle_llm-*.exe') `
+              -File -ErrorAction SilentlyContinue | Where-Object {
+                $trustedHashes -contains (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant()
+              }
+          )
+          if ($trustedBinaries.Count -ne 1) {
+            throw "expected exactly one cached executable with a reviewed SHA-256, found $($trustedBinaries.Count); refusing an unreviewed rebuild"
           }
-          $testBinary = [string]$artifacts[0].executable
-          if (-not (Test-Path -LiteralPath $testBinary -PathType Leaf)) {
-            throw "resolved test executable does not exist: $testBinary"
-          }
-          $binary = Get-Item -LiteralPath $testBinary
+          $binary = $trustedBinaries[0]
           [ordered]@{
             path = $binary.FullName
             size_bytes = $binary.Length
             sha256 = (Get-FileHash -Algorithm SHA256 $binary.FullName).Hash.ToLowerInvariant()
             cargo_arguments = $arguments
+            resolution = 'reviewed-cache-reuse'
+            source_fixture_commit = 'ff38b7dd21acd12f888565dfc725719a48aaf9b2'
+            reviewed_runs = @(35506125396, 35507197926)
           } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $env:SC23935_EVIDENCE_ROOT 'test-binary.json') -Encoding utf8
           "SC23935_TEST_BINARY=$($binary.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      # Compilation creates no CUDA context. Acquire physical ownership only after the binary is
-      # ready, then retain it across all three short fresh-process probes.
+      # Resolving and hashing the reviewed executable creates no CUDA context. Acquire physical
+      # ownership only after the binary is ready, then retain it across all three short probes.
       - name: Reserve physical CUDA device 0
         shell: powershell
         run: |
@@ -264,6 +261,7 @@ jobs:
             $stdout = Join-Path $env:SC23935_EVIDENCE_ROOT "$label.stdout.log"
             $stderr = Join-Path $env:SC23935_EVIDENCE_ROOT "$label.stderr.log"
             $exitCodePath = Join-Path $env:SC23935_EVIDENCE_ROOT "$label.exit-code.txt"
+            $commandPath = Join-Path $env:SC23935_EVIDENCE_ROOT "$label-command.json"
             $arguments = @($testName, '--exact', '--ignored', '--nocapture', '--test-threads=1')
             [ordered]@{
               executable = $env:SC23935_TEST_BINARY
@@ -276,21 +274,45 @@ jobs:
                 RUST_BACKTRACE = $env:RUST_BACKTRACE
                 RUST_TEST_THREADS = $env:RUST_TEST_THREADS
               }
-            } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $env:SC23935_EVIDENCE_ROOT "$label-command.json") -Encoding utf8
+            } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $commandPath -Encoding utf8
 
-            # Start exactly the resolved test executable. A timeout kills only this owned PID; no
-            # process-tree sweep can terminate another runner's processes.
-            $process = Start-Process -FilePath $env:SC23935_TEST_BINARY -ArgumentList $arguments -PassThru `
-              -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-            if (-not $process.WaitForExit(600000)) {
-              Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-              $process.WaitForExit()
-              'timed-out-after-600-seconds' | Set-Content -LiteralPath $exitCodePath -Encoding ascii
-              throw "$label exceeded its 10-minute process limit"
+            $probeRunner = Join-Path $env:RUNNER_TEMP 'sc23935-run-probe.py'
+            if (-not (Test-Path -LiteralPath $probeRunner -PathType Leaf)) {
+              @'
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import sys
+
+          command_path, stdout_path, stderr_path, exit_path = map(pathlib.Path, sys.argv[1:])
+          command = json.loads(command_path.read_text(encoding="utf-8-sig"))
+          environment = os.environ.copy()
+          for name, expected in command["environment"].items():
+              if environment.get(name) != expected:
+                  raise SystemExit(f"environment mismatch for {name}")
+          with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+              process = subprocess.Popen(
+                  [command["executable"], *command["arguments"]],
+                  stdout=stdout,
+                  stderr=stderr,
+                  env=environment,
+              )
+              try:
+                  return_code = process.wait(timeout=command["timeout_seconds"])
+              except subprocess.TimeoutExpired:
+                  process.kill()
+                  process.wait()
+                  exit_path.write_text("timed-out-after-600-seconds\n", encoding="ascii")
+                  print(f"SC23935_PROCESS pid={process.pid} timed_out=true")
+                  raise SystemExit(124)
+          exit_path.write_text(f"{return_code}\n", encoding="ascii")
+          print(f"SC23935_PROCESS pid={process.pid} exit_code={return_code}")
+          '@ | Set-Content -LiteralPath $probeRunner -Encoding utf8
             }
-            $process.Refresh()
-            [string]$process.ExitCode | Set-Content -LiteralPath $exitCodePath -Encoding ascii
-            Write-Host "SC23935_PROCESS label=$label pid=$($process.Id) exit_code=$($process.ExitCode)"
+            & $env:REVIEWED_PYTHON $probeRunner $commandPath $stdout $stderr $exitCodePath
+            if ($LASTEXITCODE -eq 124) { throw "$label exceeded its 10-minute process limit" }
+            if ($LASTEXITCODE -ne 0) { throw "$label probe runner failed with exit code $LASTEXITCODE" }
             Get-Content -LiteralPath $stdout
             Get-Content -LiteralPath $stderr
           }
