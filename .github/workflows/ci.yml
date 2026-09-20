@@ -92,6 +92,48 @@ jobs:
           "SC23935_GPU_RESERVATION=$reservation" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "SC23935_RESERVATION_TOKEN=$token" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+      # GitHub materializes each `run:` block separately, so a syntax error late in the workflow
+      # would otherwise be discovered only after the cold CUDA build. Use a real YAML parser to
+      # extract every PowerShell body, then parse each exact body with Windows PowerShell 5.
+      - name: Parse every embedded Windows PowerShell script
+        shell: powershell
+        run: |
+          $extractor = Join-Path $env:RUNNER_TEMP 'sc23935-extract-powershell.py'
+          $scriptsJson = Join-Path $env:RUNNER_TEMP 'sc23935-powershell-scripts.json'
+          @'
+          import json
+          import pathlib
+          import sys
+          import yaml
+
+          workflow = yaml.safe_load(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          scripts = [
+              step["run"]
+              for job in workflow["jobs"].values()
+              for step in job.get("steps", [])
+              if step.get("shell") == "powershell"
+          ]
+          if not scripts or not all(isinstance(script, str) and script.strip() for script in scripts):
+              raise SystemExit("workflow has a missing or empty PowerShell run block")
+          pathlib.Path(sys.argv[2]).write_text(json.dumps(scripts), encoding="utf-8")
+          '@ | Set-Content -LiteralPath $extractor -Encoding utf8
+          uv run --no-project --no-config --python 3.12.10 --with pyyaml==6.0.3 `
+            python $extractor '.github/workflows/ci.yml' $scriptsJson
+          if ($LASTEXITCODE -ne 0) { throw 'failed to extract embedded PowerShell scripts' }
+          $scripts = @(Get-Content -LiteralPath $scriptsJson -Raw | ConvertFrom-Json)
+          for ($scriptIndex = 0; $scriptIndex -lt $scripts.Count; $scriptIndex++) {
+            $tokens = $null
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseInput(
+              $scripts[$scriptIndex], [ref]$tokens, [ref]$parseErrors
+            ) | Out-Null
+            if ($parseErrors.Count -ne 0) {
+              $parseErrors | ForEach-Object { Write-Error $_.Message }
+              throw "embedded PowerShell script $($scriptIndex + 1) has parser errors"
+            }
+          }
+          Write-Host "SC23935_POWERSHELL_PARSE scripts=$($scripts.Count) passed=true"
+
       - name: Record source, lockfile, and hardware provenance
         shell: powershell
         run: |
@@ -213,7 +255,7 @@ jobs:
               --required-bytes 34359738368 `
               --output $output
             if ($LASTEXITCODE -ne 0) {
-              throw "reservation recheck failed before $label: device changed, has a co-tenant, or has less than 32 GiB free"
+              throw "reservation recheck failed before ${label}: device changed, has a co-tenant, or has less than 32 GiB free"
             }
           }
 
