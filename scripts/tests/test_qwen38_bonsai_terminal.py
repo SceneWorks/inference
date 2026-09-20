@@ -51,13 +51,57 @@ class TerminalEvidenceTests(unittest.TestCase):
         request = request or {"max_new_tokens": 128, "sampling": {"temperature": 0.0}}
         runtime_sha = runtime_sha or self.runtime_sha
         manifest_key = manifest_key or name
+        run_id = "1" * 64
+        process_id = 123
+
+        def memory(scope: str, peak: int = 1) -> dict:
+            if backend == "mlx":
+                return {
+                    "backend": backend,
+                    "device": device,
+                    "active_bytes": 1,
+                    "cache_bytes": 0,
+                    "peak_active_bytes": peak,
+                    "peak_scope": scope,
+                    "peak_metric": "native_active_allocator_bytes",
+                }
+            return {
+                "backend": backend,
+                "device": device,
+                "peak_active_bytes": None,
+                "peak_scope": "unavailable",
+                "peak_metric": None,
+                "native_allocator_counters_available": False,
+                "peak_unavailable_reason": "native allocator counter unavailable",
+                "memory_evidence": "external samples",
+            }
+
+        interval = {
+            "run_id": run_id,
+            "process_id": process_id,
+            "model_id": name,
+            "kind": "selected_case",
+            "started_unix_seconds": 100.0,
+            "ended_unix_seconds": 200.0,
+        }
         provider = {
             "model_id": name,
             "model_revision": revision,
             "runtime_sha": runtime_sha,
+            "run_id": run_id,
+            "process_id": process_id,
             "status": "completed",
             "provider": {"backend": backend},
-            "context_admission": {"evidence_complete": True},
+            "context_admission": {
+                "evidence_complete": True,
+                "measurement_interval": {**interval, "kind": "context_admission_probe"},
+                "native_memory_before_case": memory(
+                    "preceding_interval_since_explicit_reset"
+                ),
+                "native_memory_after_case": memory(
+                    "context_admission_probe_interval_since_explicit_reset"
+                ),
+            },
             "resource_admission": {
                 "evidence_complete": True,
                 "architecturally_within_context": True,
@@ -69,28 +113,45 @@ class TerminalEvidenceTests(unittest.TestCase):
                     "status": "failed",
                     "request": request,
                     "error": "request requires an estimated 256 bytes of native workspace but only 1 bytes are available",
+                    "measurement_interval": {**interval, "kind": "forced_budget_probe"},
+                    "native_memory_before_case": memory(
+                        "preceding_interval_since_explicit_reset"
+                    ),
+                    "native_memory_after_case": memory(
+                        "forced_budget_probe_interval_since_explicit_reset"
+                    ),
                 },
             },
-            "native_memory_before_load": {
-                "backend": backend,
-                "device": device,
-                "peak_active_bytes": 1,
-                "native_allocator_counters_available": False,
-                "memory_evidence": "external samples",
-            },
-            "native_memory_after_load": {
-                "backend": backend,
-                "device": device,
-                "peak_active_bytes": 1,
-                "native_allocator_counters_available": False,
-                "memory_evidence": "external samples",
-            },
-            "native_memory_after_unload": {
-                "backend": backend,
-                "device": device,
-                "peak_active_bytes": 1,
-                "native_allocator_counters_available": False,
-                "memory_evidence": "external samples",
+            "native_memory_before_load": memory(
+                "pre_load_interval_since_explicit_reset"
+            ),
+            "native_memory_after_load": memory("load_interval_since_explicit_reset"),
+            "native_memory_before_unload": memory(
+                "preceding_interval_since_explicit_reset"
+            ),
+            "native_memory_after_unload": memory(
+                "unload_interval_since_explicit_reset"
+            ),
+            "native_memory_summary": {
+                "peak_active_bytes": 1 if backend == "mlx" else None,
+                "peak_scope": "maximum_of_explicitly_reset_intervals"
+                if backend == "mlx"
+                else "unavailable",
+                "peak_metric": "native_active_allocator_bytes"
+                if backend == "mlx"
+                else None,
+                "coverage": [
+                    {"kind": "pre_load"},
+                    {"kind": "load"},
+                    {"kind": "forced_budget_probe"},
+                    {"kind": "selected_case", "case_id": "arithmetic"},
+                    {"kind": "context_admission_probe"},
+                    {"kind": "unload"},
+                ],
+                "coverage_note": "complete interval coverage",
+                "unavailable_reason": None
+                if backend == "mlx"
+                else "native allocator counter unavailable",
             },
             "cases": [
                 {
@@ -103,6 +164,14 @@ class TerminalEvidenceTests(unittest.TestCase):
                     "functional_acceptance_passed": quality,
                     "prefill_seconds": 0.004 if complete else None,
                     "decode_seconds": 0.002 if complete else None,
+                    "measurement_interval": interval,
+                    "native_memory_before_case": memory(
+                        "preceding_interval_since_explicit_reset"
+                    ),
+                    "native_memory_after_case": memory(
+                        "selected_case_interval_since_explicit_reset"
+                    ),
+                    "request_peak_claim_eligible": True,
                     "output": {
                         "text": "391" if quality else "392",
                         "thinking": None,
@@ -121,6 +190,17 @@ class TerminalEvidenceTests(unittest.TestCase):
         )
         terminal.write_new(root / "artifact-manifest.json", manifest)
         inventory = {"inventory_sha256": "a" * 64}
+        rss_samples = [
+            {
+                "seconds": 1.0,
+                "started_unix_seconds": 120.0,
+                "ended_unix_seconds": 121.0,
+                "run_id": run_id,
+                "process_id": process_id,
+                "bytes": 4096,
+            }
+        ]
+        gpu_samples: list[dict] = []
         receipt = {
             "schema_version": 1,
             "suite": terminal.SUITE,
@@ -147,9 +227,21 @@ class TerminalEvidenceTests(unittest.TestCase):
                     "auxiliary_bytes": 0,
                 },
             },
-            "process": {"exit_code": 0, "peak_rss_bytes": 4096},
+            "process": {
+                "exit_code": 0,
+                "run_id": run_id,
+                "process_id": process_id,
+                "rss_scope": "sampled_process_working_set_lower_bound",
+                "sample_interval_seconds": 0.1,
+                "rss_samples": rss_samples,
+                "peak_rss_bytes": 4096,
+            },
             "gpu": {
+                "run_id": run_id,
+                "process_id": process_id,
+                "scope": "nvidia_smi_per_process_sampled_lower_bound",
                 "available": False,
+                "samples": gpu_samples,
                 "peak_bytes": None,
                 "unavailable_reason": "WDDM counter unavailable",
                 "admission_recheck": {
@@ -161,6 +253,13 @@ class TerminalEvidenceTests(unittest.TestCase):
                 if device == "cuda"
                 else None,
             },
+            "case_memory": terminal.case_memory_evidence(
+                provider,
+                rss_samples,
+                gpu_samples,
+                run_id=run_id,
+                process_id=process_id,
+            ),
             "provider_evidence": "provider.json",
             "artifact_manifest_sha256": terminal.sha256(root / "artifact-manifest.json"),
         }
@@ -254,9 +353,48 @@ class TerminalEvidenceTests(unittest.TestCase):
             },
             "events": [],
             "recovery": recovery,
+            "measurement_interval": {
+                **short["measurement_interval"],
+                "kind": "selected_case_including_recovery",
+            },
+            "native_memory_before_case": copy.deepcopy(
+                short["native_memory_before_case"]
+            ),
+            "native_memory_after_case": copy.deepcopy(short["native_memory_after_case"]),
+            "request_peak_claim_eligible": False,
         }
+        if decline["native_memory_after_case"]["peak_scope"] != "unavailable":
+            decline["native_memory_after_case"]["peak_scope"] = (
+                "selected_case_including_recovery_interval_since_explicit_reset"
+            )
         provider["cases"].extend([short, decline])
+        provider["native_memory_summary"]["coverage"] = [
+            {"kind": "pre_load"},
+            {"kind": "load"},
+            {"kind": "forced_budget_probe"},
+            *[
+                {
+                    "kind": "selected_case_including_recovery"
+                    if case["status"] == "resource_declined"
+                    else "selected_case",
+                    "case_id": case["case_id"],
+                }
+                for case in provider["cases"]
+            ],
+            {"kind": "context_admission_probe"},
+            {"kind": "unload"},
+        ]
         path.write_text(json.dumps(provider), encoding="utf-8")
+        receipt_path = root / "receipt.json"
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["case_memory"] = terminal.case_memory_evidence(
+            provider,
+            receipt["process"]["rss_samples"],
+            receipt["gpu"]["samples"],
+            run_id=receipt["process"]["run_id"],
+            process_id=receipt["process"]["process_id"],
+        )
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
         self.reseal_run(root)
 
     def write_manifest(self, rows: list[tuple[str, str]], name: str = "models.toml") -> Path:
@@ -480,6 +618,9 @@ class TerminalEvidenceTests(unittest.TestCase):
             "fabricated-stream": lambda case, provider: case["events"].append(
                 {"event": "token", "index": 0, "channel": "Content", "text": "fake"}
             ),
+            "fabricated-request-peak": lambda case, provider: case.update(
+                request_peak_claim_eligible=True
+            ),
             "non-context": lambda case, provider: case.update(
                 case_id="arithmetic", category="math"
             ),
@@ -509,6 +650,129 @@ class TerminalEvidenceTests(unittest.TestCase):
                 self.reseal_run(run)
                 with self.assertRaisesRegex(ValueError, "context|non-context"):
                     terminal.validate_receipt(run)
+
+    def test_memory_evidence_scopes_identity_and_interval_fail_closed(self) -> None:
+        mlx = self.make_run(
+            "mlx-memory",
+            backend="mlx",
+            device="unified",
+            load_profile="mlx-unified",
+        )
+        terminal.validate_receipt(mlx)
+        args = argparse.Namespace(
+            run=[mlx],
+            expected_model=["mlx-memory"],
+            runtime_sha=self.runtime_sha,
+            case_ids=["arithmetic"],
+            output=self.root / "memory-comparison.json",
+            markdown=self.root / "memory-comparison.md",
+        )
+        self.assertEqual(terminal.validate(args), 0)
+        report = json.loads(args.output.read_text(encoding="utf-8"))
+        model = report["models"][0]
+        self.assertEqual(
+            model["peak_rss_scope"], "sampled_process_working_set_lower_bound"
+        )
+        self.assertEqual(
+            model["peak_gpu_scope"], "nvidia_smi_per_process_sampled_lower_bound"
+        )
+        native = report["raw_outputs"][0]["memory"]["native"]
+        self.assertEqual(native["scope"], "selected_case_interval_since_explicit_reset")
+        self.assertEqual(native["peak_bytes"], 1)
+
+        for label, target, mutate, expected in (
+            (
+                "missing-scope",
+                "provider",
+                lambda value: value["cases"][0]["native_memory_after_case"].pop(
+                    "peak_scope"
+                ),
+                "scope",
+            ),
+            (
+                "wrong-pid",
+                "receipt",
+                lambda value: value["case_memory"][0]["rss"]["samples"][0].update(
+                    process_id=999
+                ),
+                "identity|interval",
+            ),
+            (
+                "crossed-boundary",
+                "receipt",
+                lambda value: value["case_memory"][0]["rss"]["samples"][0].update(
+                    ended_unix_seconds=201.0
+                ),
+                "crosses",
+            ),
+        ):
+            with self.subTest(label=label):
+                run = self.make_run(
+                    label,
+                    backend="mlx",
+                    device="unified",
+                    load_profile="mlx-unified",
+                )
+                path = run / f"{target}.json"
+                value = json.loads(path.read_text(encoding="utf-8"))
+                mutate(value)
+                path.write_text(json.dumps(value), encoding="utf-8")
+                self.reseal_run(run)
+                with self.assertRaisesRegex(ValueError, expected):
+                    terminal.validate_receipt(run)
+
+    def test_sampled_zero_is_preserved_and_unavailable_is_null(self) -> None:
+        interval = {"started_unix_seconds": 1.0, "ended_unix_seconds": 2.0}
+        zero = terminal.bounded_interval_samples(
+            [
+                {
+                    "run_id": "r",
+                    "process_id": 7,
+                    "started_unix_seconds": 1.1,
+                    "ended_unix_seconds": 1.2,
+                    "bytes": 0,
+                }
+            ],
+            interval,
+            run_id="r",
+            process_id=7,
+            scope="sampled-test-lower-bound",
+            unavailable_reason="missing",
+        )
+        self.assertTrue(zero["available"])
+        self.assertEqual(zero["peak_bytes"], 0)
+        self.assertEqual(zero["observed_growth_from_first_sample_bytes"], 0)
+        missing = terminal.bounded_interval_samples(
+            [],
+            interval,
+            run_id="r",
+            process_id=7,
+            scope="sampled-test-lower-bound",
+            unavailable_reason="missing",
+        )
+        self.assertFalse(missing["available"])
+        self.assertIsNone(missing["peak_bytes"])
+        self.assertEqual(missing["unavailable_reason"], "missing")
+
+        run = self.make_run("missing-e7-sample")
+        self.add_context_decline(run)
+        receipt_path = run / "receipt.json"
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        context = next(
+            row for row in receipt["case_memory"] if row["case_id"] == "context_64"
+        )
+        context["rss"] = terminal.bounded_interval_samples(
+            [],
+            context["measurement_interval"],
+            run_id=receipt["process"]["run_id"],
+            process_id=receipt["process"]["process_id"],
+            scope="sampled_process_working_set_within_selected_request_lower_bound",
+            unavailable_reason="no complete RSS sample fell within the selected case interval",
+        )
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        self.reseal_run(run)
+        with self.assertRaisesRegex(ValueError, "required E7 case"):
+            terminal.validate_receipt(run)
 
     def test_comparison_rejects_a_dropped_requested_case(self) -> None:
         run = self.make_run("dropped-case")
@@ -983,7 +1247,20 @@ Pages purgeable:                             1000.
         )
         capability["output"]["text"] = "391"
         provider["cases"].append(capability)
+        provider["native_memory_summary"]["coverage"].insert(
+            -2, {"kind": "selected_case", "case_id": "capability"}
+        )
         provider_path.write_text(json.dumps(provider), encoding="utf-8")
+        receipt_path = run / "receipt.json"
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["case_memory"] = terminal.case_memory_evidence(
+            provider,
+            receipt["process"]["rss_samples"],
+            receipt["gpu"]["samples"],
+            run_id=receipt["process"]["run_id"],
+            process_id=receipt["process"]["process_id"],
+        )
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
         self.reseal_run(run)
         matrix = self.root / "cell-functional-matrix.json"
         terminal.write_new(

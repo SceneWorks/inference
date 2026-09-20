@@ -3,7 +3,6 @@
 #[test]
 #[ignore = "requires a frozen model and complete BONSAI_COMPARISON_* evidence environment"]
 fn native_comparison() {
-    mlx_rs::memory::reset_peak_memory();
     core_llm_testkit::comparison::run_environment(
         |spec| {
             let spec = match std::env::var("BONSAI_COMPARISON_PROJECTOR") {
@@ -20,6 +19,10 @@ fn native_comparison() {
                 "cache_bytes":mlx_rs::memory::get_cache_memory(),
                 "peak_active_bytes":mlx_rs::memory::get_peak_memory(),
             })
+        },
+        || {
+            mlx_rs::memory::reset_peak_memory();
+            true
         },
     )
     .expect("complete native comparison evidence");
