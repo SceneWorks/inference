@@ -1049,7 +1049,15 @@ mod tests {
         assert_eq!(record["evidence_complete"], true);
         assert_eq!(record["resource_admission"]["prompt_tokens"], 9_251);
         assert_eq!(record["events"], json!([]));
-        assert!(record.get("total_seconds").is_none());
+        let has_timing_claim = [
+            "total_seconds",
+            "time_to_first_token_seconds",
+            "prefill_seconds",
+            "decode_seconds",
+        ]
+        .iter()
+        .any(|field| record.get(*field).is_some());
+        assert!(!has_timing_claim);
         assert!(record.get("output").is_none());
         assert!(record.get("quality_passed").is_none());
         assert_eq!(record["recovery"]["case_id"], "context_64");
