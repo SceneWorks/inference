@@ -36,6 +36,7 @@ use crate::models::{
     CausalLm, Gemma4Layout, Gemma4Mm, Gemma4MmConfig, Qwen35Config, Qwen35Model, Qwen35Mtp,
     Qwen35VisionConfig, Qwen35VisionModel, VlmDecode,
 };
+use crate::primitives::attention::EAGER_ATTN_QUERY_CHUNK_SIZE;
 use crate::primitives::nn::input_ids;
 use crate::primitives::projection::QuantSpec;
 use crate::primitives::sampler::SamplingParams;
@@ -1821,7 +1822,10 @@ impl TextLlm for LlamaProvider {
             admitted_prompt,
             req.max_new_tokens,
         )?;
-        let required = core_llm::estimate_request_bytes(
+        // Every portable eager-attention mask variant is query-tiled; CUDA flash attention is
+        // bounded more tightly. Use the runtime's exact maximum tile so admission prices the same
+        // peak score/mask/weight lifetime the implementation enforces.
+        let required = core_llm::estimate_chunked_request_bytes(
             admitted_prompt,
             req.max_new_tokens,
             self.model.memory_geometry(),
@@ -1835,6 +1839,7 @@ impl TextLlm for LlamaProvider {
                     .map_or(0, |c| c.recommended_draft_tokens),
                 MtpMode::Enabled { draft_tokens } => draft_tokens,
             },
+            EAGER_ATTN_QUERY_CHUNK_SIZE,
         )
         .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
         let available = request_available_memory(self.model.device())?;
@@ -2737,10 +2742,40 @@ mod tests {
         bonsai_sampling_defaults, can_load, can_load_vision, emit_content, eos_token_ids,
         expand_vision_placeholders, host_load_budget, load_memory_requirements,
         merged_frame_timestamps, prompt_opens_thinking, substitute_vision_placeholders,
-        validate_context_window, video_placeholder_text, JsonMask,
+        validate_context_window, video_placeholder_text, JsonMask, EAGER_ATTN_QUERY_CHUNK_SIZE,
     };
     use crate::decode::{ConstraintMask, RewindableConstraintMask};
-    use core_llm::{ConstraintDecodeTable, Content, ImageRef, LoadSpec, Message, Role, VideoRef};
+    use core_llm::{
+        ConstraintDecodeTable, Content, ImageRef, LlmMemoryGeometry, LoadSpec, Message, Role,
+        VideoRef,
+    };
+
+    #[test]
+    fn request_estimate_uses_the_eager_attention_runtime_tile() {
+        let geometry = LlmMemoryGeometry {
+            query_heads: 40,
+            kv_heads: 4,
+            head_dim: 128,
+            layers: 64,
+            element_bytes: 4,
+            hidden_size: 5120,
+            intermediate_size: 17_408,
+            vocab_size: 248_320,
+            recurrent_bytes: 0,
+        };
+        let chunked = core_llm::estimate_chunked_request_bytes(
+            29_600,
+            128,
+            geometry,
+            0,
+            0,
+            EAGER_ATTN_QUERY_CHUNK_SIZE,
+        )
+        .unwrap();
+        let eager = core_llm::estimate_request_bytes(29_600, 128, geometry, 0, 0).unwrap();
+        assert!(chunked < eager);
+        assert!(chunked < 36_000_000_000, "bounded Candle peak: {chunked}");
+    }
 
     #[test]
     fn dense_cuda_load_admission_separates_host_staging_from_current_vram() {

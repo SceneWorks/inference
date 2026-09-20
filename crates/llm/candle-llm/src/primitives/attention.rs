@@ -6,7 +6,7 @@
 //!
 //! Candle has no portable fused causal SDPA across CPU/CUDA (flash-attn is a separate, CUDA-only
 //! crate), so [`sdpa`] has an eager fallback — `softmax(scale · QKᵀ + mask) · V`. That fallback
-//! processes at most [`EAGER_ATTN_QUERY_CHUNK_SIZE`] query rows at a time, bounding scores, masks,
+//! processes at most `EAGER_ATTN_QUERY_CHUNK_SIZE` query rows at a time, bounding scores, masks,
 //! and weights at `O(heads · query_chunk · k_len)` rather than materializing three full
 //! `O(heads · q_len · k_len)` tensors. Chunk masks retain the full query's bottom-right alignment:
 //! global query row `r` attends keys `0..=(k_len - total_q_len) + r`. A single-query decode still
