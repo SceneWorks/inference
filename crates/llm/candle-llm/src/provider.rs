@@ -671,7 +671,10 @@ impl LlamaProvider {
         )?;
         core_llm::admit_request_memory(host_required, host_available)?;
         if let Some(device_required) = device_required {
-            core_llm::admit_request_memory(device_required, request_available_memory(&device)?)?;
+            core_llm::admit_request_memory(
+                device_required,
+                request_available_memory(&device, "load")?,
+            )?;
         }
 
         let requested = spec.quantize.map(|q| match q {
@@ -1472,7 +1475,8 @@ fn cuda_pool_usage(
     }
 }
 
-fn request_available_memory(device: &Device) -> CoreResult<u64> {
+fn request_available_memory(device: &Device, _phase: &'static str) -> CoreResult<u64> {
+    let operational_override = core_llm::operational_memory_override()?;
     let capacity = if device.is_cuda() {
         #[cfg(feature = "cuda")]
         {
@@ -1483,12 +1487,39 @@ fn request_available_memory(device: &Device) -> CoreResult<u64> {
                 let stream = d.cuda_stream();
                 let context = stream.context();
                 let (free, total) = context.mem_get_info().ok()?;
-                let pool_usage = if context.has_async_alloc() {
-                    Some(cuda_pool_usage(context)?)
+                let async_pool = context.has_async_alloc();
+                let pool_query = if async_pool {
+                    cuda_pool_usage(context).map(Some)
                 } else {
-                    None
+                    Some(None)
                 };
-                cuda_usable_memory_bytes(free as u64, total as u64, pool_usage)
+                let pool_usage = pool_query.flatten();
+                let usable = pool_query
+                    .and_then(|usage| cuda_usable_memory_bytes(free as u64, total as u64, usage));
+                if std::env::var("SCENEWORKS_CUDA_ADMISSION_DIAGNOSTICS").as_deref() == Ok("1") {
+                    let (pool_reserved, pool_used) = pool_usage.unzip();
+                    let effective = usable.map(|bytes| {
+                        operational_override.map_or(bytes, |budget| bytes.min(budget))
+                    });
+                    eprintln!(
+                        "SCENEWORKS_CUDA_ADMISSION {}",
+                        serde_json::json!({
+                            "schema_version": 1,
+                            "pid": std::process::id(),
+                            "phase": _phase,
+                            "async_pool": async_pool,
+                            "pool_query_succeeded": pool_query.is_some(),
+                            "driver_free_bytes": free,
+                            "device_total_bytes": total,
+                            "pool_reserved_bytes": pool_reserved,
+                            "pool_used_bytes": pool_used,
+                            "usable_capacity_bytes": usable,
+                            "operational_override_bytes": operational_override,
+                            "effective_capacity_bytes": effective,
+                        })
+                    );
+                }
+                usable
             })
         }
         #[cfg(not(feature = "cuda"))]
@@ -1498,7 +1529,7 @@ fn request_available_memory(device: &Device) -> CoreResult<u64> {
     } else {
         core_llm::available_host_memory_bytes()
     };
-    core_llm::effective_memory_budget(capacity, core_llm::operational_memory_override()?)
+    core_llm::effective_memory_budget(capacity, operational_override)
 }
 
 /// Adapts a `core_llm::JsonConstraint` to the engine's [`ConstraintMask`] decode seam.
@@ -1907,7 +1938,7 @@ impl TextLlm for LlamaProvider {
             EAGER_ATTN_QUERY_CHUNK_SIZE,
         )
         .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
-        let available = request_available_memory(self.model.device())?;
+        let available = request_available_memory(self.model.device(), "request")?;
         core_llm::admit_request_memory(required, available)?;
 
         self.model
