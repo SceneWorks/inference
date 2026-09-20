@@ -261,45 +261,142 @@ class ReportHeadroomWiringTests(unittest.TestCase):
                 )
 
 
-class WeightSetLabelTests(unittest.TestCase):
-    """Every macOS job must select exactly one `rw-*` weight-set label.
+KNOWN_WEIGHT_SET_LABELS = {
+    "rw-mage",
+    "rw-sa3",
+    "rw-krea",
+    "rw-audio",
+    "rw-llm",
+    "rw-chroma",
+    "rw-starvector",
+}
+PRESERVED_LOCAL_JOB = "qwen38-bonsai-mlx"
+PRESERVED_LOCAL_RUNS_ON = ["self-hosted", "macOS", "ARM64", "nax", "real-weights"]
+PRESERVED_LOCAL_JOB_IF = (
+    "github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen38-bonsai'"
+)
+PRESERVED_LOCAL_STEP = "Select preserved local campaign snapshots"
+PRESERVED_LOCAL_SNAPSHOT_MARKERS = (
+    "/Volumes/Models/Codex-models/sc-23935/hf/hub/"
+    "models--prism-ml--Ternary-Bonsai-2-27B-gguf/snapshots/"
+    "6ed5e12bf84b7a63069882c91dd9e9218647d17b",
+    "/Volumes/Models/Codex-models/sc-23935/hf/hub/"
+    "models--Qwen--Qwen3-VL-8B-Instruct/snapshots/"
+    "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
+)
 
-    A job left on the old shared `real-weights` label is the failure this guards: no macOS runner
-    carries that label any more, so the job does not fail — it QUEUES, silently, until someone
-    cancels the run. On a weekly scheduled lane that is a week of missing coverage that still
-    looks green at a glance, so it is asserted rather than reviewed.
-    """
 
-    KNOWN = {
-        "rw-mage",
-        "rw-sa3",
-        "rw-krea",
-        "rw-audio",
-        "rw-llm",
-        "rw-chroma",
-        "rw-starvector",
+def weight_set_label_errors(workflow: dict) -> list[str]:
+    """Return weight-set routing violations, including drift in the one local exception."""
+    errors: list[str] = []
+    macos = {
+        name: job
+        for name, job in workflow["jobs"].items()
+        if "macOS" in (job.get("runs-on") or [])
     }
+    if not macos:
+        return ["found no macOS jobs — the label scheme moved"]
+    if PRESERVED_LOCAL_JOB not in macos:
+        errors.append(f"{PRESERVED_LOCAL_JOB} is no longer an exact macOS route")
+
+    for name, job in macos.items():
+        runs_on = job.get("runs-on") or []
+        if name == PRESERVED_LOCAL_JOB:
+            if runs_on != PRESERVED_LOCAL_RUNS_ON:
+                errors.append(f"{name} changed its exact local runner selector")
+            if job.get("if") != PRESERVED_LOCAL_JOB_IF:
+                errors.append(f"{name} is no longer dispatch-only for its exact profile")
+            selectors = [
+                step
+                for step in job.get("steps", [])
+                if step.get("name") == PRESERVED_LOCAL_STEP
+            ]
+            if len(selectors) != 1:
+                errors.append(f"{name} must carry exactly one {PRESERVED_LOCAL_STEP!r} step")
+                continue
+            selector = selectors[0]
+            if selector.get("if") != "runner.name == 'nax-macos'":
+                errors.append(f"{name} does not guard its aliases by exact runner identity")
+            command = selector.get("run", "")
+            for marker in PRESERVED_LOCAL_SNAPSHOT_MARKERS:
+                if marker not in command:
+                    errors.append(f"{name} no longer binds preserved snapshot {marker}")
+            continue
+
+        selected = KNOWN_WEIGHT_SET_LABELS.intersection(runs_on)
+        if len(selected) != 1:
+            errors.append(f"{name} selects {sorted(selected) or 'no'} weight-set label")
+        if "real-weights" in runs_on:
+            errors.append(
+                f"{name} carries the retired shared macOS label instead of a weight set"
+            )
+    return errors
+
+
+class WeightSetLabelTests(unittest.TestCase):
+    """Every macOS job selects one weight set or the exact preserved-snapshot route.
+
+    A job left on the old shared `real-weights` label is the failure this guards: that label no
+    longer identifies a generally schedulable macOS weight set, so an ordinary lane can queue
+    silently until someone cancels it. The one exception is a dispatch-only recovery campaign
+    pinned to a named runner and exact frozen paths; the mutation test keeps it from widening.
+    """
 
     def setUp(self) -> None:
         self.workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
 
     def test_every_macos_job_selects_exactly_one_known_weight_set(self) -> None:
-        macos = {
-            n: j for n, j in self.workflow["jobs"].items() if "macOS" in (j.get("runs-on") or [])
+        self.assertEqual(weight_set_label_errors(self.workflow), [])
+
+    def test_preserved_local_route_exception_discriminates_mutations(self) -> None:
+        """The campaign route is an exact exception, not a second shared-label policy."""
+        import copy
+
+        def doctor(mutate) -> dict:
+            workflow = copy.deepcopy(self.workflow)
+            job = workflow["jobs"][PRESERVED_LOCAL_JOB]
+            selector = next(
+                step
+                for step in job["steps"]
+                if step.get("name") == PRESERVED_LOCAL_STEP
+            )
+            mutate(workflow, job, selector)
+            return workflow
+
+        def remove_host(_workflow, job, _selector):
+            job["runs-on"].remove("nax")
+
+        def remove_platform(_workflow, job, _selector):
+            job["runs-on"].remove("macOS")
+
+        def widen_dispatch(_workflow, job, _selector):
+            job["if"] = "github.event_name == 'workflow_dispatch'"
+
+        def change_runner(_workflow, _job, selector):
+            selector["if"] = "runner.name == 'nax-macos-2'"
+
+        def change_snapshot_root(_workflow, _job, selector):
+            selector["run"] = selector["run"].replace(
+                "/Volumes/Models/Codex-models/sc-23935", "/tmp/sc-23935"
+            )
+
+        def copy_exception(workflow, job, _selector):
+            workflow["jobs"]["another-local-campaign"] = copy.deepcopy(job)
+
+        mutations = {
+            "exact host label removed": remove_host,
+            "macOS platform label removed": remove_platform,
+            "dispatch profile widened": widen_dispatch,
+            "runner identity changed": change_runner,
+            "frozen snapshot root changed": change_snapshot_root,
+            "exception copied to another job": copy_exception,
         }
-        self.assertTrue(macos, "found no macOS jobs — the label scheme moved")
-        for name, job in macos.items():
-            with self.subTest(job=name):
-                selected = self.KNOWN.intersection(job["runs-on"])
-                self.assertEqual(
-                    len(selected),
-                    1,
-                    f"{name} selects {sorted(selected) or 'no'} weight-set label",
-                )
-                self.assertNotIn(
-                    "real-weights",
-                    job["runs-on"],
-                    f"{name} still carries the retired shared macOS label; it would queue forever",
+        for mutation, mutate in mutations.items():
+            with self.subTest(mutation=mutation):
+                self.assertNotEqual(
+                    weight_set_label_errors(doctor(mutate)),
+                    [],
+                    f"the gate accepted a workflow where {mutation}",
                 )
 
     def test_every_declared_label_is_documented_with_its_host(self) -> None:

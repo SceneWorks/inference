@@ -23,6 +23,14 @@ name: Real-weight validation
 #   rw-chroma   none stored; materializes from the Hub per run       ~0        BOTH boxes
 #   rw-starvector StarVector 1B + 8B terminal snapshots              ~19 GiB   nax-macos
 #
+# `qwen38-bonsai-mlx` is the one campaign-local exception to this reusable weight-set scheme.
+# It is dispatch-only, selects the exact `nax` runner capability, verifies `runner.name ==
+# 'nax-macos'`, and then binds two SC-23935 preserved snapshot aliases before qualification. Those
+# frozen campaign paths are not a portable weight set, so assigning them a permanent `rw-*` label
+# would misrepresent their lifecycle. StarVector remains on `rw-starvector` because its terminal
+# snapshots are a reusable provisioned set. The workflow-policy tests pin every part of this
+# exception and continue to reject `real-weights` on every other macOS job.
+#
 # `rw-chroma` carries no stored bytes, so it is registered on both boxes and its jobs land on
 # whichever is free — verified 2026-08-04 by mapping `runner_name` across the last 40 runs, where
 # all three `Chroma packed auxiliaries` matrix legs are observed on `nax-macos` AND `nax-macos-2`.
