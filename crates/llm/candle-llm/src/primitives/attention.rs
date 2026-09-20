@@ -561,6 +561,84 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(feature = "cuda")]
+    fn sc23935_stage(stage: &str) {
+        use std::io::Write;
+
+        let mut stderr = std::io::stderr().lock();
+        writeln!(stderr, "SC23935_STAGE={stage}").unwrap();
+        stderr.flush().unwrap();
+    }
+
+    #[cfg(feature = "cuda")]
+    fn sc23935_softmax_signed_index_boundary(sequence: usize) {
+        let label = sequence.to_string();
+        sc23935_stage(&format!("softmax-{label}-allocation-start"));
+        let device = Device::new_cuda(0).expect("cuda device");
+        let input = Tensor::zeros((1, 32, sequence, sequence), DType::BF16, &device).unwrap();
+        device.synchronize().unwrap();
+        sc23935_stage(&format!("softmax-{label}-allocation-synchronized"));
+
+        sc23935_stage(&format!("softmax-{label}-launch"));
+        let output = softmax_last_dim(&input).unwrap();
+        assert_eq!(output.dims(), &[1, 32, sequence, sequence]);
+        device.synchronize().unwrap();
+        sc23935_stage(&format!("softmax-{label}-synchronized"));
+
+        let read_row = |head, row| {
+            output
+                .narrow(1, head, 1)
+                .unwrap()
+                .narrow(2, row, 1)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<half::bf16>()
+                .unwrap()
+        };
+        let first = read_row(0, 0);
+        let final_row = read_row(31, sequence - 1);
+        let expected = 1.0f32 / sequence as f32;
+        let tolerance = expected * 0.01;
+        for value in first.iter().chain(&final_row) {
+            let value = value.to_f32();
+            assert!(value.is_finite(), "softmax readback must be finite");
+            assert!(
+                (value - expected).abs() <= tolerance,
+                "softmax readback {value} differs from {expected} by more than {tolerance}"
+            );
+        }
+        eprintln!(
+            "SC23935_READBACK sequence={sequence} output_shape=[1,32,{sequence},{sequence}] first={} final={} expected={expected} finite=true",
+            first[0].to_f32(),
+            final_row[sequence - 1].to_f32()
+        );
+        sc23935_stage(&format!("softmax-{label}-readback-passed"));
+    }
+
+    /// The largest softmax geometry whose final flattened element has signed index `INT_MAX` in
+    /// Candle's pinned CUDA kernel. This diagnostic is ignored because its output alone occupies
+    /// 4 GiB of device memory; the SC-23935 workflow runs it in a dedicated fresh process.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires a reserved CUDA device with at least 32 GiB free"]
+    fn cuda_softmax_signed_index_boundary_8192_control() {
+        assert_eq!(32usize * 8_192 * 8_192, i32::MAX as usize + 1);
+        sc23935_softmax_signed_index_boundary(8_192);
+    }
+
+    /// The first sequence length beyond the pinned CUDA softmax kernel's signed flat-index limit.
+    /// The SC-23935 workflow requires this process to fail specifically with
+    /// `CUDA_ERROR_ILLEGAL_ADDRESS`; a clean exit or any other error invalidates the diagnostic.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "diagnostic intentionally triggers the pinned CUDA softmax indexing fault"]
+    fn cuda_softmax_signed_index_boundary_8193_fault_probe() {
+        assert_eq!(32usize * 8_193 * 8_193, 2_148_007_968);
+        assert!(2_148_007_968usize > i32::MAX as usize + 1);
+        sc23935_softmax_signed_index_boundary(8_193);
+    }
+
     /// sc-12458: the decode shape (`q_len == 1`, bottom-right causal) must build **no** mask — and be
     /// bit-identical to the old always-mask path (the mask it skips is provably all zeros).
     #[test]
@@ -713,25 +791,32 @@ mod tests {
     #[test]
     #[ignore = "requires CUDA; exact Qwen3-VL context_512 attention-shape regression"]
     fn cuda_qwen3vl_context_512_shape_uses_bounded_eager_attention() {
-        eprintln!("stage=device");
         let device = Device::new_cuda(0).expect("cuda device");
         let (b, h, s, d) = (1usize, 32usize, 9_247usize, 128usize);
-        assert!(b * h * s * s > i32::MAX as usize);
+        assert_eq!(b * h * s * s, 2_736_224_288);
+        assert!(2_736_224_288usize > i32::MAX as usize);
+        assert_eq!(EAGER_ATTN_QUERY_CHUNK_SIZE, 256);
+        assert_eq!(b * h * EAGER_ATTN_QUERY_CHUNK_SIZE * s, 75_751_424);
         assert!(b * h * EAGER_ATTN_QUERY_CHUNK_SIZE * s < i32::MAX as usize);
-        eprintln!("stage=allocate_qkv");
+        sc23935_stage("qwen3vl-9247-qkv-allocation-start");
         let q = Tensor::zeros((b, h, s, d), DType::BF16, &device).unwrap();
         let k = Tensor::zeros((b, h, s, d), DType::BF16, &device).unwrap();
         let v = Tensor::zeros((b, h, s, d), DType::BF16, &device).unwrap();
         device.synchronize().unwrap();
-        eprintln!("stage=qkv_ready");
-        eprintln!("stage=production_sdpa");
+        sc23935_stage("qwen3vl-9247-qkv-synchronized");
+        sc23935_stage("qwen3vl-9247-production-sdpa-start");
         let out = sdpa_eager(&q, &k, &v, (d as f32).powf(-0.5), None, AttnMask::Causal).unwrap();
         assert_eq!(out.dims(), &[b, h, s, d]);
         device.synchronize().unwrap();
-        eprintln!("stage=sdpa_ready");
+        sc23935_stage("qwen3vl-9247-production-sdpa-synchronized");
         let sum = out.sum_all().unwrap().to_scalar::<half::bf16>().unwrap();
-        eprintln!("stage=readback sum={}", sum.to_f32());
-        assert_eq!(sum, half::bf16::ZERO);
+        let sum = sum.to_f32();
+        assert!(sum.is_finite(), "production SDPA readback must be finite");
+        eprintln!(
+            "SC23935_READBACK output_shape=[1,32,9247,128] sum={sum} finite=true expected=0 max_score_tile_elements=75751424"
+        );
+        assert_eq!(sum, 0.0);
+        sc23935_stage("qwen3vl-9247-readback-passed");
     }
 
     /// On CUDA, the fused FlashAttention-2 kernel must agree with the eager path within a few
