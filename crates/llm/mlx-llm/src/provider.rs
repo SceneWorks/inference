@@ -2088,9 +2088,10 @@ const MLX_ALLOCATION_PAGE_BYTES: u64 = 16 * 1024;
 /// The recurrence creates five one-element index buffers per step and evaluates every 256 steps.
 const QWEN35_RECURRENCE_EVAL_CHUNK: u64 = 256;
 const QWEN35_RECURRENCE_INDEX_BUFFERS: u64 = 5;
-/// The input/decayed state, two state products, outer product, and updated state can coexist across
-/// the evaluator window while one recurrence chunk is being materialized.
-const QWEN35_RECURRENCE_STATE_BUFFERS: u64 = 6;
+/// Each lazy recurrence step creates five state-shaped arrays: the decayed state, the state-key
+/// product, the delta outer product, the updated state, and the updated-state/query product. None
+/// can be released before that chunk's explicit evaluation.
+const QWEN35_RECURRENCE_STATE_ARRAYS_PER_STEP: u64 = 5;
 
 fn checked_sum(values: impl IntoIterator<Item = u64>) -> Option<u64> {
     values
@@ -2202,19 +2203,21 @@ fn estimate_qwen35_workspace_extra_bytes(
     let row_padding = round_up(y_row_bytes, MLX_ALLOCATION_PAGE_BYTES)?
         .checked_sub(y_row_bytes)?
         .checked_mul(prompt)?;
-    // Index buffers are created eagerly for all five slices in a 256-step recurrence chunk.
+    // Index buffers are created eagerly for all five slices in the current recurrence chunk.
+    let recurrence_steps = prompt.min(QWEN35_RECURRENCE_EVAL_CHUNK);
     let index_buffers = checked_product([
-        QWEN35_RECURRENCE_EVAL_CHUNK,
+        recurrence_steps,
         QWEN35_RECURRENCE_INDEX_BUFFERS,
         MLX_ALLOCATION_PAGE_BYTES,
     ])?;
-    let recurrent_state_buffers = checked_product([
-        value_width,
-        key_head_dim,
-        4,
-        QWEN35_RECURRENCE_STATE_BUFFERS,
-        MLX_EVAL_BUFFER_WINDOW,
-    ])?;
+    // `gated_delta_recurrence` builds a complete lazy graph until its 256-step `eval`. Price every
+    // state-shaped node in that graph plus the input state. The shared base estimate separately
+    // prices the retained recurrent caches for all decoder layers.
+    let recurrence_state_arrays = recurrence_steps
+        .checked_mul(QWEN35_RECURRENCE_STATE_ARRAYS_PER_STEP)?
+        .checked_add(1)?;
+    let recurrent_state_buffers =
+        checked_product([value_width, key_head_dim, 4, recurrence_state_arrays])?;
 
     checked_sum([
         prompt_workspace,
@@ -2610,19 +2613,25 @@ mod tests {
             config: &config,
             prism: true,
         };
+        let arithmetic = estimate_mlx_request_bytes(27, 128, geometry, 0, 0, contract).unwrap();
         let context_64 = estimate_mlx_request_bytes(1_187, 128, geometry, 0, 0, contract).unwrap();
         let context_512 = estimate_mlx_request_bytes(9_251, 128, geometry, 0, 0, contract).unwrap();
         let context_2048 =
             estimate_mlx_request_bytes(36_899, 128, geometry, 0, 0, contract).unwrap();
 
-        // Frozen campaign 35461924246: subtract the stable loaded-model active residency
-        // (8,551,959,848) from each new process-global allocator high-water mark.
+        // Frozen local probe at 02ed7e958: arithmetic raised the process-global allocator peak to
+        // 9,321,652,712 from a captured post-load active 8,602,141,760 (a 719,510,952-byte lower
+        // bound). Subtracting the stable post-request residency 8,548,422,952 gives 773,229,760;
+        // price that stricter observed bound even though it is not an immediately-pre-request
+        // sample. Frozen campaign 35461924246 supplies the two longer-context deltas below.
+        assert!(arithmetic >= 773_229_760, "estimate: {arithmetic}");
         assert!(context_64 >= 4_091_010_468, "estimate: {context_64}");
         assert!(context_512 >= 22_885_373_536, "estimate: {context_512}");
-        assert_eq!(context_64, 4_152_141_184);
-        assert_eq!(context_512, 28_934_038_912);
-        assert_eq!(context_2048, 113_900_545_408);
-        assert!(context_64 < context_512 && context_512 < context_2048);
+        assert_eq!(arithmetic, 788_726_144);
+        assert_eq!(context_64, 7_974_200_704);
+        assert_eq!(context_512, 32_756_098_432);
+        assert_eq!(context_2048, 117_722_604_928);
+        assert!(arithmetic < context_64 && context_64 < context_512 && context_512 < context_2048);
         assert!(
             core_llm::admit_request_memory(context_2048, 47_922_610_176).is_err(),
             "the 36,899-token request must not be admitted on the failed remote's observed budget"
@@ -2647,8 +2656,13 @@ mod tests {
             config: &config,
             prism: true,
         };
+        // A one-token request exercises the pre-evaluation recurrence branch without applying a
+        // 256-step floor. A normal 128-token prompt remains admitted on an 8-GB machine.
+        let scalar = estimate_mlx_request_bytes(1, 1, geometry, 0, 0, contract).unwrap();
         let ordinary = estimate_mlx_request_bytes(128, 128, geometry, 0, 0, contract).unwrap();
-        assert!(ordinary < 2_000_000_000, "ordinary estimate: {ordinary}");
+        assert_eq!(scalar, 231_142_880);
+        assert_eq!(ordinary, 2_695_981_056);
+        assert!(scalar < ordinary);
         assert!(core_llm::admit_request_memory(ordinary, 8_000_000_000).is_ok());
         assert!(
             estimate_mlx_request_bytes(usize::MAX, u32::MAX, geometry, u64::MAX, 3, contract,)
