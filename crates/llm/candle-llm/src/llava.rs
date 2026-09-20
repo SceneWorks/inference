@@ -679,20 +679,22 @@ fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
 }
 
 /// Weightless model-first probe (story 7406): can the `candle-llava` vision provider serve the
-/// snapshot at `spec.source`? Reads **only** `config.json` and keys on the LLaVA structural
+/// snapshot directory at `spec.source`? Reads **only** `config.json` and keys on the LLaVA structural
 /// signature — a nested `text_config` (the language decoder) plus a `vision_config` (the SigLIP
 /// tower) — which [`LlavaConfig::from_json`] requires. Never opens a safetensors shard.
 pub fn can_load(spec: &LoadSpec) -> bool {
-    let dir = Path::new(&spec.source);
-    let path = if dir.is_dir() {
-        dir.join("config.json")
-    } else {
-        dir.to_path_buf()
-    };
-    let Ok(text) = std::fs::read_to_string(path) else {
+    can_load_with(Path::new(&spec.source), |path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+    })
+}
+
+fn can_load_with(source: &Path, read_config: impl FnOnce(&Path) -> Option<Value>) -> bool {
+    if !source.is_dir() {
         return false;
-    };
-    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+    }
+    let Some(v) = read_config(&source.join("config.json")) else {
         return false;
     };
     // LLaVA = a SigLIP/CLIP vision tower + a `text_config` decoder. Decline Qwen3.6 (`qwen3_5`): its
@@ -707,6 +709,7 @@ pub fn can_load(spec: &LoadSpec) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     const IMG: i32 = 128077;
 
@@ -779,5 +782,30 @@ mod tests {
         let d = descriptor();
         assert_eq!(d.id, PROVIDER_ID);
         assert!(d.capabilities.supports_vision);
+    }
+
+    #[test]
+    fn model_probe_rejects_file_sources_before_reading_them() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            serde_json::json!({
+                "text_config": {"model_type": "llama"},
+                "vision_config": {"model_type": "clip_vision_model"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let read_attempted = Cell::new(false);
+        let result = can_load_with(file.path(), |_| {
+            read_attempted.set(true);
+            Some(Value::Null)
+        });
+
+        assert!(!result);
+        assert!(!read_attempted.get(), "file payload must not be read");
+        assert!(!can_load(&LoadSpec::dense(
+            file.path().display().to_string()
+        )));
     }
 }
