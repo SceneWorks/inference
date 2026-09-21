@@ -47,6 +47,9 @@ jobs:
           $apps = Invoke-Capture 'compute-apps-csv' $smi.Source @('--query-compute-apps=gpu_uuid,pid,process_name,used_memory', '--format=csv,noheader,nounits')
           $table = Invoke-Capture 'nvidia-smi-table' $smi.Source @()
           $xml = Invoke-Capture 'nvidia-smi-xml' $smi.Source @('-q', '-x')
+          $sessions = Invoke-Capture 'query-session' 'query.exe' @('session')
+          $users = Invoke-Capture 'quser' 'quser.exe' @()
+          Get-CimInstance -ClassName Win32_Process -Filter 'ProcessId = 29444' | Select-Object Name,ProcessId,SessionId,CreationDate | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 (Join-Path $root 'lmstudio-session.json')
           $gpuRows = @()
           $appRows = @()
           if ($gpu.exit_code -eq 0) {
