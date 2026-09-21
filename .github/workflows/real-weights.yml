@@ -1735,6 +1735,8 @@ jobs:
       TMPDIR: /Volumes/Models/Codex-builds/sc-23935/ci-${{ github.run_id }}-${{ github.run_attempt }}/tmp
     steps:
       - name: Prepare external campaign storage
+        # A pending macOS volume permission must not consume the model-test budget.
+        timeout-minutes: 2
         run: |
           test ! -e "$QWEN_BONSAI_RUN_DIR"
           mkdir -p "$QWEN_BONSAI_OUTPUT_DIR" "$QWEN_BONSAI_TOOLS_DIR" "$CARGO_TARGET_DIR" "$TMPDIR"

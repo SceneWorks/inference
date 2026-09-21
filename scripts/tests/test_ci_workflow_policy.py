@@ -3844,6 +3844,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             if step.get("uses", "").startswith("actions/checkout@")
         )
         self.assertLess(mlx["steps"].index(storage), mlx["steps"].index(checkout))
+        self.assertEqual(storage.get("timeout-minutes"), 2)
         self.assertIn('test ! -e "$QWEN_BONSAI_RUN_DIR"', storage["run"])
         for path_variable in (
             "QWEN_BONSAI_OUTPUT_DIR",
