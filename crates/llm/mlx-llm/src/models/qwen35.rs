@@ -745,11 +745,30 @@ impl Qwen35Model {
         Ok((normalized, logits))
     }
 
+    /// MTP prompt prefill retains every normalized hidden row but projects only the last row.
+    pub(crate) fn prefill_hidden_and_last_logits(
+        &self,
+        input_ids: &Array,
+        cache: &mut Qwen35Cache,
+        offset: i32,
+    ) -> Result<(Array, Array)> {
+        let h = self.hidden(input_ids, cache, offset)?;
+        let normalized = rms_norm(&h, &self.norm, self.eps)?;
+        let s = normalized.shape()[1];
+        let last = normalized.take_axis(Array::from_slice(&[s - 1], &[1]), 1)?;
+        let logits = self.lm_head.forward(&last)?;
+        Ok((
+            normalized,
+            logits.reshape(&[logits.shape()[0], self.cfg.vocab_size])?,
+        ))
+    }
+
     /// Final-normalized target hidden states and logits for a fused multimodal prompt.
     ///
     /// The returned hidden rows are the authoritative target states used to seed Qwen3.8's MTP
     /// predictor. Keeping this beside the ordinary token-id path prevents visual placeholders from
     /// being re-embedded as token ids while building the predictor cache.
+    #[cfg(test)]
     pub(crate) fn hidden_and_logits_from_embeds_with_deepstack(
         &self,
         embeds: &Array,
@@ -776,6 +795,40 @@ impl Qwen35Model {
         let normalized = rms_norm(&h, &self.norm, self.eps)?;
         let logits = self.lm_head.forward(&normalized)?;
         Ok((normalized, logits))
+    }
+
+    /// Multimodal MTP prefill with DeepStack/M-RoPE and only the last target logit row.
+    pub(crate) fn prefill_hidden_and_last_logits_from_embeds_with_deepstack(
+        &self,
+        embeds: &Array,
+        positions: [&[i32]; 3],
+        cache: &mut Qwen35Cache,
+        visual_pos_mask: &[bool],
+        deepstack: &[Array],
+    ) -> Result<(Array, Array)> {
+        let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
+            positions,
+            self.cfg.mrope_section_resolved(),
+            COMPUTE_DTYPE,
+        )?;
+        let h0 = embeds.as_dtype(COMPUTE_DTYPE)?;
+        let layers = &self.layers;
+        let cache_layers = &mut cache.layers;
+        let h = deepstack_fused_decoder_layers(
+            &h0,
+            visual_pos_mask,
+            deepstack,
+            layers.len(),
+            |i, h| layers[i].forward(h, &cos, &sin, &mut cache_layers[i]),
+        )?;
+        let normalized = rms_norm(&h, &self.norm, self.eps)?;
+        let s = normalized.shape()[1];
+        let last = normalized.take_axis(Array::from_slice(&[s - 1], &[1]), 1)?;
+        let logits = self.lm_head.forward(&last)?;
+        Ok((
+            normalized,
+            logits.reshape(&[logits.shape()[0], self.cfg.vocab_size])?,
+        ))
     }
 
     /// Advance the in-checkpoint predictor from a token embedding plus its aligned target/previous
@@ -810,6 +863,33 @@ impl Qwen35Model {
         cache: &mut MtpCache,
         positions: [&[i32]; 3],
     ) -> Result<(Array, Array)> {
+        let normalized = self.mtp_hidden_from_embeds(embeds, hidden_states, cache, positions)?;
+        let logits = self.lm_head.forward(&normalized)?;
+        let last = logits.take_axis(Array::from_slice(&[normalized.shape()[1] - 1], &[1]), 1)?;
+        Ok((
+            normalized,
+            last.reshape(&[last.shape()[0], self.cfg.vocab_size])?,
+        ))
+    }
+
+    /// Warm the predictor cache with validated prompt pairs without computing unused logits.
+    pub(crate) fn mtp_warm_from_embeds(
+        &self,
+        embeds: &Array,
+        hidden_states: &Array,
+        cache: &mut MtpCache,
+        positions: [&[i32]; 3],
+    ) -> Result<Array> {
+        self.mtp_hidden_from_embeds(embeds, hidden_states, cache, positions)
+    }
+
+    fn mtp_hidden_from_embeds(
+        &self,
+        embeds: &Array,
+        hidden_states: &Array,
+        cache: &mut MtpCache,
+        positions: [&[i32]; 3],
+    ) -> Result<Array> {
         let mtp = self.mtp.as_ref().ok_or_else(|| {
             Error::Msg("qwen3_5 MTP requested but predictor is not loaded".into())
         })?;
@@ -852,12 +932,7 @@ impl Qwen35Model {
         };
         cache.steps += s as usize;
         let normalized = rms_norm(&out, &mtp.norm, self.eps)?;
-        let logits = self.lm_head.forward(&normalized)?;
-        let last = logits.take_axis(Array::from_slice(&[s - 1], &[1]), 1)?;
-        Ok((
-            normalized,
-            last.reshape(&[last.shape()[0], self.cfg.vocab_size])?,
-        ))
+        Ok(normalized)
     }
 
     /// Run the decoder stack over precomputed input `embeds` `[B, S, hidden]` with the given RoPE
@@ -1919,6 +1994,113 @@ mod tests {
         for x in logits.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>() {
             assert!(x.is_finite());
         }
+    }
+
+    #[test]
+    fn mtp_prefill_projects_only_last_row_and_warm_cache_matches_full() {
+        let cfg = Qwen35Config::from_json(&cfg_json_mtp()).unwrap();
+        let model = Qwen35Model::from_weights(
+            &synthetic_weights(&cfg),
+            "model.language_model",
+            cfg.clone(),
+        )
+        .unwrap();
+        let ids = Array::from_slice(&[1i32, 2, 3], &[1, 3]);
+        let as_f32 = |array: &Array| {
+            array
+                .as_dtype(Dtype::Float32)
+                .unwrap()
+                .as_slice::<f32>()
+                .to_vec()
+        };
+        let mut full_cache = model.new_cache();
+        let (full_hidden, full_logits) = model.hidden_and_logits(&ids, &mut full_cache, 0).unwrap();
+        let mut prefill_cache = model.new_cache();
+        let (hidden, last_logits) = model
+            .prefill_hidden_and_last_logits(&ids, &mut prefill_cache, 0)
+            .unwrap();
+        assert_eq!(last_logits.shape(), &[1, cfg.vocab_size]);
+        assert_eq!(as_f32(&hidden), as_f32(&full_hidden));
+        let expected_last = full_logits
+            .take_axis(Array::from_slice(&[2i32], &[1]), 1)
+            .unwrap();
+        assert_eq!(as_f32(&last_logits), as_f32(&expected_last));
+        assert_eq!(prefill_cache.offset(), full_cache.offset());
+
+        let embeds = model.embed_input_ids(&ids).unwrap();
+        let positions = [0, 1, 2];
+        let mut full_visual_cache = model.new_cache();
+        let (visual_hidden, visual_logits) = model
+            .hidden_and_logits_from_embeds_with_deepstack(
+                &embeds,
+                [&positions, &positions, &positions],
+                &mut full_visual_cache,
+                &[false; 3],
+                &[],
+            )
+            .unwrap();
+        let mut visual_cache = model.new_cache();
+        let (visual_prefill_hidden, visual_last) = model
+            .prefill_hidden_and_last_logits_from_embeds_with_deepstack(
+                &embeds,
+                [&positions, &positions, &positions],
+                &mut visual_cache,
+                &[false; 3],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(as_f32(&visual_prefill_hidden), as_f32(&visual_hidden));
+        let visual_expected = visual_logits
+            .take_axis(Array::from_slice(&[2i32], &[1]), 1)
+            .unwrap();
+        assert_eq!(as_f32(&visual_last), as_f32(&visual_expected));
+        assert_eq!(visual_cache.offset(), full_visual_cache.offset());
+
+        let shifted = embeds
+            .take_axis(Array::from_slice(&[1i32, 2], &[2]), 1)
+            .unwrap();
+        let aligned = hidden
+            .take_axis(Array::from_slice(&[0i32, 1], &[2]), 1)
+            .unwrap();
+        let seed_positions = [1, 2];
+        let mut full_mtp_cache = model.new_mtp_cache().unwrap();
+        let (full_mtp_hidden, last_mtp_logits) = model
+            .mtp_step_from_embeds(
+                &shifted,
+                &aligned,
+                &mut full_mtp_cache,
+                [&seed_positions, &seed_positions, &seed_positions],
+            )
+            .unwrap();
+        let all_mtp_logits = model.lm_head.forward(&full_mtp_hidden).unwrap();
+        let expected_mtp_last = all_mtp_logits
+            .take_axis(Array::from_slice(&[1i32], &[1]), 1)
+            .unwrap();
+        assert_eq!(last_mtp_logits.shape(), &[1, cfg.vocab_size]);
+        assert_eq!(as_f32(&last_mtp_logits), as_f32(&expected_mtp_last));
+        let mut warm_mtp_cache = model.new_mtp_cache().unwrap();
+        let warm_hidden = model
+            .mtp_warm_from_embeds(
+                &shifted,
+                &aligned,
+                &mut warm_mtp_cache,
+                [&seed_positions, &seed_positions, &seed_positions],
+            )
+            .unwrap();
+        assert_eq!(as_f32(&warm_hidden), as_f32(&full_mtp_hidden));
+        assert_eq!(warm_mtp_cache.layers[0].offset(), 2);
+        assert_eq!(full_mtp_cache.layers[0].offset(), 2);
+        let previous = hidden
+            .take_axis(Array::from_slice(&[2i32], &[1]), 1)
+            .unwrap();
+        let next = Array::from_slice(&[1i32], &[1, 1]);
+        let (_, full_next) = model
+            .mtp_step(&next, &previous, &mut full_mtp_cache, 3)
+            .unwrap();
+        let (_, warm_next) = model
+            .mtp_step(&next, &previous, &mut warm_mtp_cache, 3)
+            .unwrap();
+        assert_eq!(as_f32(&warm_next), as_f32(&full_next));
     }
 
     #[test]

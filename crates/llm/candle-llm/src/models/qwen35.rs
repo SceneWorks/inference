@@ -834,6 +834,27 @@ impl Qwen35Mtp {
         self.forward_sequence_from_embeddings(&embeddings, previous_hidden, 0, position, cache)
     }
 
+    /// Advance the predictor cache over validated prompt/replay pairs without projecting unused
+    /// all-position vocabulary logits.
+    pub fn warm_sequence(
+        &self,
+        input_ids: &[i32],
+        previous_hidden: &Tensor,
+        position: i32,
+        cache: &mut Qwen35MtpCache,
+    ) -> Result<()> {
+        if input_ids.is_empty() {
+            return Err(Error::Msg(
+                "qwen3_5 MTP sequence input must not be empty".into(),
+            ));
+        }
+        let ids: Vec<i64> = input_ids.iter().map(|&id| id as i64).collect();
+        let ids = Tensor::from_vec(ids, (1, input_ids.len()), &self.device)?;
+        let embeddings = self.embed_tokens.forward(&ids)?.to_dtype(self.dtype)?;
+        self.sequence_hidden_from_embeddings(&embeddings, previous_hidden, 0, position, cache)?;
+        Ok(())
+    }
+
     /// Process target-validated fused prompt embeddings with the prompt's explicit interleaved
     /// M-RoPE positions. Qwen3.8 is multimodal, so shifted vision rows must remain vision features
     /// rather than being re-embedded from their placeholder token ids.
@@ -853,6 +874,24 @@ impl Qwen35Mtp {
         self.forward_sequence_with_rope(embeddings, previous_hidden, 0, &cos, &sin, cache)
     }
 
+    /// Visual-prompt cache warmup with the same M-RoPE positions and fused embeddings.
+    pub fn warm_embeddings_mrope(
+        &self,
+        embeddings: &Tensor,
+        previous_hidden: &Tensor,
+        positions: [&[i32]; 3],
+        cache: &mut Qwen35MtpCache,
+    ) -> Result<()> {
+        let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
+            positions,
+            self.mrope_section,
+            self.dtype,
+            &self.device,
+        )?;
+        self.sequence_hidden_with_rope(embeddings, previous_hidden, 0, &cos, &sin, cache)?;
+        Ok(())
+    }
+
     fn forward_sequence_from_embeddings(
         &self,
         embeddings: &Tensor,
@@ -861,6 +900,24 @@ impl Qwen35Mtp {
         position: i32,
         cache: &mut Qwen35MtpCache,
     ) -> Result<(Tensor, Tensor)> {
+        let hidden = self.sequence_hidden_from_embeddings(
+            embeddings,
+            previous_hidden,
+            step_idx,
+            position,
+            cache,
+        )?;
+        Ok((self.lm_head.forward(&hidden)?, hidden))
+    }
+
+    fn sequence_hidden_from_embeddings(
+        &self,
+        embeddings: &Tensor,
+        previous_hidden: &Tensor,
+        step_idx: usize,
+        position: i32,
+        cache: &mut Qwen35MtpCache,
+    ) -> Result<Tensor> {
         let seq = embeddings.dim(1)?;
         if previous_hidden.dim(1)? != seq {
             return Err(Error::Msg(format!(
@@ -872,7 +929,7 @@ impl Qwen35Mtp {
         let (cos, sin) = self
             .rope
             .cos_sin(seq as i32, position, self.dtype, &self.device)?;
-        self.forward_sequence_with_rope(embeddings, previous_hidden, step_idx, &cos, &sin, cache)
+        self.sequence_hidden_with_rope(embeddings, previous_hidden, step_idx, &cos, &sin, cache)
     }
 
     fn forward_sequence_with_rope(
@@ -884,6 +941,20 @@ impl Qwen35Mtp {
         sin: &Tensor,
         cache: &mut Qwen35MtpCache,
     ) -> Result<(Tensor, Tensor)> {
+        let hidden =
+            self.sequence_hidden_with_rope(embeddings, previous_hidden, step_idx, cos, sin, cache)?;
+        Ok((self.lm_head.forward(&hidden)?, hidden))
+    }
+
+    fn sequence_hidden_with_rope(
+        &self,
+        embeddings: &Tensor,
+        previous_hidden: &Tensor,
+        step_idx: usize,
+        cos: &Tensor,
+        sin: &Tensor,
+        cache: &mut Qwen35MtpCache,
+    ) -> Result<Tensor> {
         let en = rms_norm(embeddings, &self.pre_fc_norm_embedding, self.eps)?;
         let hn = rms_norm(previous_hidden, &self.pre_fc_norm_hidden, self.eps)?;
         let fused = self.fc.forward(&Tensor::cat(&[&en, &hn], 2)?)?;
@@ -895,8 +966,7 @@ impl Qwen35Mtp {
         };
         cache.layers[layer_idx] = updated;
         let hidden = rms_norm(&hidden, &self.norm, self.eps)?;
-        let logits = self.lm_head.forward(&hidden)?;
-        Ok((logits, hidden))
+        Ok(hidden)
     }
 }
 
@@ -1002,6 +1072,23 @@ impl Qwen35Model {
     ) -> Result<(Tensor, Tensor)> {
         let hidden = self.normalize(&self.hidden(input_ids, cache, offset)?)?;
         let logits = self.project_normalized(&hidden)?;
+        Ok((logits, hidden))
+    }
+
+    /// MTP prompt prefill keeps every normalized hidden row for predictor alignment, while only
+    /// the final row needs target logits for the first sample.
+    pub fn prefill_with_hidden(
+        &self,
+        input_ids: &Tensor,
+        cache: &mut Qwen35Cache,
+        offset: i32,
+    ) -> Result<(Tensor, Tensor)> {
+        let hidden = self.normalize(&self.hidden(input_ids, cache, offset)?)?;
+        let (b, s, _) = hidden.dims3()?;
+        let last = hidden.narrow(1, s - 1, 1)?.contiguous()?;
+        let logits = self
+            .project_normalized(&last)?
+            .reshape((b, self.cfg.vocab_size as usize))?;
         Ok((logits, hidden))
     }
 
@@ -1214,6 +1301,38 @@ impl Qwen35Model {
         )?;
         let hidden = self.normalize(&hidden)?;
         let logits = self.project_normalized(&hidden)?;
+        Ok((logits, hidden))
+    }
+
+    /// Multimodal MTP prefill with DeepStack/M-RoPE and only the last target logit row.
+    pub fn prefill_from_embeds_deepstack_with_hidden(
+        &self,
+        embeds: &Tensor,
+        positions: [&[i32]; 3],
+        cache: &mut Qwen35Cache,
+        visual_pos_mask: &[bool],
+        deepstack: &[Tensor],
+    ) -> Result<(Tensor, Tensor)> {
+        let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
+            positions,
+            self.cfg.mrope_section_resolved(),
+            self.dtype,
+            &self.device,
+        )?;
+        let h0 = embeds.to_dtype(self.dtype)?;
+        let hidden = deepstack_fused_decoder_layers(
+            &h0,
+            visual_pos_mask,
+            deepstack,
+            self.layers.len(),
+            |i, h| self.layers[i].forward(h, &cos, &sin, &mut cache.layers[i]),
+        )?;
+        let hidden = self.normalize(&hidden)?;
+        let (b, s, _) = hidden.dims3()?;
+        let last = hidden.narrow(1, s - 1, 1)?.contiguous()?;
+        let logits = self
+            .project_normalized(&last)?
+            .reshape((b, self.cfg.vocab_size as usize))?;
         Ok((logits, hidden))
     }
 

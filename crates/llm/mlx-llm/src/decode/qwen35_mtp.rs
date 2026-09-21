@@ -212,14 +212,16 @@ fn generate_qwen35_mtp_inner(
     let mut timer = timed
         .then(|| prefill_started.map_or_else(GenerationTimer::start, GenerationTimer::start_at));
     let (prompt_hidden, prompt_logits) = match multimodal {
-        Some(prompt) => model.hidden_and_logits_from_embeds_with_deepstack(
+        Some(prompt) => model.prefill_hidden_and_last_logits_from_embeds_with_deepstack(
             prompt.embeddings,
             prompt.positions,
             &mut target_cache,
             prompt.visual_pos_mask,
             prompt.deepstack,
         )?,
-        None => model.hidden_and_logits(&input_ids(prompt_ids), &mut target_cache, 0)?,
+        None => {
+            model.prefill_hidden_and_last_logits(&input_ids(prompt_ids), &mut target_cache, 0)?
+        }
     };
     stats.forwards += 1;
 
@@ -251,19 +253,19 @@ fn generate_qwen35_mtp_inner(
                 ]
             }
         };
-        Some(model.mtp_step_from_embeds(&shifted, &aligned, &mut mtp_cache, positions)?)
+        Some(model.mtp_warm_from_embeds(&shifted, &aligned, &mut mtp_cache, positions)?)
     } else {
         None
     };
     if let Some(timer) = timer.as_mut() {
         let mut arrays = vec![&prompt_hidden, &prompt_logits];
-        if let Some((hidden, logits)) = mtp_seed.as_ref() {
-            arrays.extend([hidden, logits]);
+        if let Some(hidden) = mtp_seed.as_ref() {
+            arrays.push(hidden);
         }
         timer.finish_prefill(arrays)?;
     }
     let mut last_target_hidden = seq_rows(&prompt_hidden, prompt_len - 1, 1)?;
-    let first_logits = logits_row(&prompt_logits, prompt_len - 1)?;
+    let first_logits = prompt_logits;
     let mut history = prompt_ids.to_vec();
     let first = {
         let mask = constraint.as_mut().map(|c| c.allowed());
