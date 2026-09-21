@@ -199,14 +199,31 @@ fn delta_step(
     let decay = g.reshape((b, hv, 1, 1))?; // [B,Hv,1,1]
     let state = state.broadcast_mul(&decay)?; // S · g
     let k_r = k.reshape((b, hv, 1, dk))?; // [B,Hv,1,Dk]
-    let kv_mem = state.broadcast_mul(&k_r)?.sum(3)?; // (S·k).sum(Dk) → [B,Hv,Dv]
+    let kv_mem = state_read(&state, k, &k_r, b, hv, dk)?; // S·k → [B,Hv,Dv]
     let delta = v
         .broadcast_sub(&kv_mem)?
         .broadcast_mul(&beta.reshape((b, hv, 1))?)?; // (v−kv)·β → [B,Hv,Dv]
     let state = state.broadcast_add(&k_r.broadcast_mul(&delta.reshape((b, hv, dv, 1))?)?)?; // S + Δ⊗k
     let q_r = q.reshape((b, hv, 1, dk))?;
-    let y = state.broadcast_mul(&q_r)?.sum(3)?; // (S·q).sum(Dk) → [B,Hv,Dv]
+    let y = state_read(&state, q, &q_r, b, hv, dk)?; // S·q → [B,Hv,Dv]
     Ok((y, state))
+}
+
+/// Read the recurrent state with a head vector. CPU batched matvec avoids materializing a
+/// full-state elementwise product for each read; CUDA/Metal retain the validated ops path.
+fn state_read(
+    state: &Tensor,
+    vector: &Tensor,
+    vector_row: &Tensor,
+    b: usize,
+    hv: usize,
+    dk: usize,
+) -> Result<Tensor> {
+    if state.device().is_cpu() {
+        Ok(state.matmul(&vector.reshape((b, hv, dk, 1))?)?.squeeze(3)?)
+    } else {
+        Ok(state.broadcast_mul(vector_row)?.sum(3)?)
+    }
 }
 
 /// Repeat each head of `x` `[B,T,H,D]` `r` times along the head axis (contiguous), giving
@@ -366,6 +383,168 @@ mod tests {
             max_abs_diff(&host(&s_full), &host(&state.unwrap())) < 1e-5,
             "prefill vs step state"
         );
+        assert_eq!(s_full.dims(), &[1, 4, 2, 2]);
+        let mut cache = DeltaNetCache::new();
+        cache.update(
+            Tensor::zeros((1, 3, 4), DType::F32, &Device::Cpu).unwrap(),
+            s_full,
+            3,
+        );
+        assert_eq!(cache.offset(), 3);
+        assert_eq!(cache.ssm_state.as_ref().unwrap().dims(), &[1, 4, 2, 2]);
+    }
+
+    #[test]
+    fn cpu_state_read_matches_ops_at_qwen38_state_dims() {
+        // A full frozen Qwen3.8 recurrent state: B=1, Hv=48, Dk=Dv=128 (3 MiB F32).
+        let state = Tensor::from_vec(
+            (0..48 * 128 * 128)
+                .map(|i| ((i * 17 % 251) as f32 - 125.0) * 0.001)
+                .collect(),
+            (1, 48, 128, 128),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let vector = Tensor::from_vec(
+            (0..48 * 128)
+                .map(|i| ((i * 29 % 197) as f32 - 98.0) * 0.001)
+                .collect(),
+            (1, 48, 128),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let row = vector.reshape((1, 48, 1, 128)).unwrap();
+        let expected = state.broadcast_mul(&row).unwrap().sum(3).unwrap();
+        let got = state_read(&state, &vector, &row, 1, 48, 128).unwrap();
+        assert_eq!(got.dims(), &[1, 48, 128]);
+        let diff = max_abs_diff(&host(&expected), &host(&got));
+        assert!(diff < 1e-6, "CPU batched state read versus ops diff {diff}");
+    }
+
+    #[test]
+    fn cpu_batched_recurrence_matches_ops_and_chunks_with_two_batches() {
+        const B: usize = 2;
+        const T: usize = 5;
+        const HK: usize = 2;
+        const HV: usize = 4;
+        const DK: usize = 3;
+        const DV: usize = 5;
+        let sample = |len: usize, salt: usize, scale: f32| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i * 17 + salt) % 37) as f32 * scale - 18.0 * scale)
+                .collect()
+        };
+        let q = Tensor::from_vec(
+            sample(B * T * HK * DK, 1, 0.02),
+            (B, T, HK, DK),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let k = Tensor::from_vec(
+            sample(B * T * HK * DK, 2, 0.03),
+            (B, T, HK, DK),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let v = Tensor::from_vec(
+            sample(B * T * HV * DV, 3, 0.04),
+            (B, T, HV, DV),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let g = Tensor::from_vec(
+            sample(B * T * HV, 4, 0.001)
+                .into_iter()
+                .map(|x| 0.96 + x)
+                .collect(),
+            (B, T, HV),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let beta = Tensor::from_vec(
+            sample(B * T * HV, 5, 0.002)
+                .into_iter()
+                .map(|x| 0.4 + x)
+                .collect(),
+            (B, T, HV),
+            &Device::Cpu,
+        )
+        .unwrap();
+
+        let (actual_y, actual_state) = gated_delta_recurrence(&q, &k, &v, &g, &beta, None).unwrap();
+        assert_eq!(actual_y.dims(), &[B, T, HV, DV]);
+        assert_eq!(actual_state.dims(), &[B, HV, DV, DK]);
+
+        // The original broadcast-product/sum path is a separate multi-token numeric reference.
+        let q_full = repeat_heads(&q, HV / HK).unwrap();
+        let k_full = repeat_heads(&k, HV / HK).unwrap();
+        let mut reference_state = Tensor::zeros((B, HV, DV, DK), DType::F32, &Device::Cpu).unwrap();
+        let mut reference_ys = Vec::new();
+        for ti in 0..T {
+            let pick = |x: &Tensor| x.narrow(1, ti, 1).unwrap().squeeze(1).unwrap();
+            let (qt, kt, vt, gt, bt) = (
+                pick(&q_full),
+                pick(&k_full),
+                pick(&v),
+                pick(&g),
+                pick(&beta),
+            );
+            let decayed = reference_state
+                .broadcast_mul(&gt.reshape((B, HV, 1, 1)).unwrap())
+                .unwrap();
+            let k_row = kt.reshape((B, HV, 1, DK)).unwrap();
+            let remembered = decayed.broadcast_mul(&k_row).unwrap().sum(3).unwrap();
+            let delta = vt
+                .broadcast_sub(&remembered)
+                .unwrap()
+                .broadcast_mul(&bt.reshape((B, HV, 1)).unwrap())
+                .unwrap();
+            reference_state = decayed
+                .broadcast_add(
+                    &k_row
+                        .broadcast_mul(&delta.reshape((B, HV, DV, 1)).unwrap())
+                        .unwrap(),
+                )
+                .unwrap();
+            let y = reference_state
+                .broadcast_mul(&qt.reshape((B, HV, 1, DK)).unwrap())
+                .unwrap()
+                .sum(3)
+                .unwrap();
+            reference_ys.push(y.unsqueeze(1).unwrap());
+        }
+        let refs: Vec<_> = reference_ys.iter().collect();
+        let reference_y = Tensor::cat(&refs, 1).unwrap();
+        assert!(max_abs_diff(&host(&actual_y), &host(&reference_y)) < 1e-5);
+        assert!(max_abs_diff(&host(&actual_state), &host(&reference_state)) < 1e-5);
+
+        // The second batch makes a middle-sequence slice noncontiguous in its batch dimension.
+        let vector = q_full.narrow(1, 1, 1).unwrap().squeeze(1).unwrap();
+        assert!(!vector.is_contiguous());
+        let row = vector.reshape((B, HV, 1, DK)).unwrap();
+        let expected_read = actual_state.broadcast_mul(&row).unwrap().sum(3).unwrap();
+        let actual_read = state_read(&actual_state, &vector, &row, B, HV, DK).unwrap();
+        assert!(max_abs_diff(&host(&actual_read), &host(&expected_read)) < 1e-5);
+
+        let mut carried = None;
+        let mut chunks = Vec::new();
+        for (start, len) in [(0, 2), (2, 3)] {
+            let (y, state) = gated_delta_recurrence(
+                &q.narrow(1, start, len).unwrap(),
+                &k.narrow(1, start, len).unwrap(),
+                &v.narrow(1, start, len).unwrap(),
+                &g.narrow(1, start, len).unwrap(),
+                &beta.narrow(1, start, len).unwrap(),
+                carried.as_ref(),
+            )
+            .unwrap();
+            chunks.push(y);
+            carried = Some(state);
+        }
+        let refs: Vec<_> = chunks.iter().collect();
+        let chunked_y = Tensor::cat(&refs, 1).unwrap();
+        assert!(max_abs_diff(&host(&actual_y), &host(&chunked_y)) < 1e-5);
+        assert!(max_abs_diff(&host(&actual_state), &host(&carried.unwrap())) < 1e-5);
     }
 
     #[test]
@@ -428,5 +607,182 @@ mod tests {
         cache.reset();
         assert_eq!(cache.offset(), 0);
         assert!(cache.conv_state.is_none());
+    }
+
+    // Reproducible CPU operation comparison. This test is deliberately ignored because elapsed
+    // time is diagnostic evidence, not a CI gate; normal tests above pin the numeric contract.
+    #[test]
+    #[ignore]
+    fn qwen38_cpu_delta_matvec_experiment() {
+        use std::time::Instant;
+
+        // Frozen Qwen3.8 config: Hk=16, Hv=48, Dk=Dv=128. Values are seeded and kept bounded so
+        // both algorithms run the same stable recurrence without a real checkpoint or device.
+        const B: usize = 1;
+        const HK: usize = 16;
+        const HV: usize = 48;
+        const D: usize = 128;
+
+        fn seeded(len: usize, seed: u32, scale: f32) -> Vec<f32> {
+            let mut state = seed;
+            (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    ((state as f32 / u32::MAX as f32) * 2.0 - 1.0) * scale
+                })
+                .collect()
+        }
+
+        fn ops_step(
+            q: &Tensor,
+            k: &Tensor,
+            v: &Tensor,
+            g: &Tensor,
+            beta: &Tensor,
+            state: &Tensor,
+        ) -> Result<(Tensor, Tensor)> {
+            let (b, hv, dv, dk) = state.dims4()?;
+            let decay = g.reshape((b, hv, 1, 1))?;
+            let state = state.broadcast_mul(&decay)?;
+            let k_r = k.reshape((b, hv, 1, dk))?;
+            let kv_mem = state.broadcast_mul(&k_r)?.sum(3)?;
+            let delta = v
+                .broadcast_sub(&kv_mem)?
+                .broadcast_mul(&beta.reshape((b, hv, 1))?)?;
+            let state =
+                state.broadcast_add(&k_r.broadcast_mul(&delta.reshape((b, hv, dv, 1))?)?)?;
+            let y = state.broadcast_mul(&q.reshape((b, hv, 1, dk))?)?.sum(3)?;
+            Ok((y, state))
+        }
+
+        fn run_ops(
+            q: &Tensor,
+            k: &Tensor,
+            v: &Tensor,
+            g: &Tensor,
+            beta: &Tensor,
+        ) -> Result<(Tensor, Tensor)> {
+            let t = q.dim(1)?;
+            let q = repeat_heads(q, HV / HK)?;
+            let k = repeat_heads(k, HV / HK)?;
+            let mut state = Tensor::zeros((B, HV, D, D), DType::F32, &Device::Cpu)?;
+            let mut ys = Vec::with_capacity(t);
+            for ti in 0..t {
+                let qt = q.narrow(1, ti, 1)?.squeeze(1)?.contiguous()?;
+                let kt = k.narrow(1, ti, 1)?.squeeze(1)?.contiguous()?;
+                let vt = v.narrow(1, ti, 1)?.squeeze(1)?.contiguous()?;
+                let gt = g.narrow(1, ti, 1)?.squeeze(1)?.contiguous()?;
+                let bt = beta.narrow(1, ti, 1)?.squeeze(1)?.contiguous()?;
+                let (y, next) = ops_step(&qt, &kt, &vt, &gt, &bt, &state)?;
+                state = next;
+                ys.push(y.unsqueeze(1)?);
+            }
+            let refs: Vec<_> = ys.iter().collect();
+            Ok((Tensor::cat(&refs, 1)?, state))
+        }
+
+        fn run_chunked(
+            q: &Tensor,
+            k: &Tensor,
+            v: &Tensor,
+            g: &Tensor,
+            beta: &Tensor,
+        ) -> Result<(Tensor, Tensor)> {
+            let tokens = q.dim(1)?;
+            let mut state = None;
+            let mut outputs = Vec::new();
+            for start in (0..tokens).step_by(32) {
+                let len = 32.min(tokens - start);
+                let (y, next) = gated_delta_recurrence(
+                    &q.narrow(1, start, len)?,
+                    &k.narrow(1, start, len)?,
+                    &v.narrow(1, start, len)?,
+                    &g.narrow(1, start, len)?,
+                    &beta.narrow(1, start, len)?,
+                    state.as_ref(),
+                )?;
+                outputs.push(y);
+                state = Some(next);
+            }
+            let refs: Vec<_> = outputs.iter().collect();
+            Ok((Tensor::cat(&refs, 1)?, state.unwrap()))
+        }
+
+        for tokens in [64, 256] {
+            let q = Tensor::from_vec(
+                // Approximate Q component magnitude after L2 norm and 1/sqrt(D) scaling.
+                seeded(tokens * HK * D, 0x74ab_0191, 0.015),
+                (B, tokens, HK, D),
+                &Device::Cpu,
+            )
+            .unwrap();
+            let k = Tensor::from_vec(
+                seeded(tokens * HK * D, 0x1baf_72d5, 0.15),
+                (B, tokens, HK, D),
+                &Device::Cpu,
+            )
+            .unwrap();
+            let v = Tensor::from_vec(
+                seeded(tokens * HV * D, 0xf29a_1043, 0.5),
+                (B, tokens, HV, D),
+                &Device::Cpu,
+            )
+            .unwrap();
+            let g = Tensor::from_vec(
+                seeded(tokens * HV, 0x106b_87ca, 0.02)
+                    .into_iter()
+                    .map(|x| 0.97 + x)
+                    .collect(),
+                (B, tokens, HV),
+                &Device::Cpu,
+            )
+            .unwrap();
+            let beta = Tensor::from_vec(
+                seeded(tokens * HV, 0x7c29_13bd, 0.02)
+                    .into_iter()
+                    .map(|x| 0.5 + x)
+                    .collect(),
+                (B, tokens, HV),
+                &Device::Cpu,
+            )
+            .unwrap();
+
+            let start = Instant::now();
+            let (reference_y, reference_state) = run_ops(&q, &k, &v, &g, &beta).unwrap();
+            let reference_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let start = Instant::now();
+            let (candidate_y, candidate_state) =
+                gated_delta_recurrence(&q, &k, &v, &g, &beta, None).unwrap();
+            let candidate_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+            // Reverse execution order once to expose a simple warm-cache/order artifact.
+            let start = Instant::now();
+            let _candidate_again = gated_delta_recurrence(&q, &k, &v, &g, &beta, None).unwrap();
+            let candidate_reverse_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let start = Instant::now();
+            let _reference_again = run_ops(&q, &k, &v, &g, &beta).unwrap();
+            let reference_reverse_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+            let output_diff = max_abs_diff(&host(&reference_y), &host(&candidate_y));
+            let state_diff = max_abs_diff(&host(&reference_state), &host(&candidate_state));
+            let (chunked_y, chunked_state) = run_chunked(&q, &k, &v, &g, &beta).unwrap();
+            let chunked_output_diff = max_abs_diff(&host(&candidate_y), &host(&chunked_y));
+            let chunked_state_diff = max_abs_diff(&host(&candidate_state), &host(&chunked_state));
+            let output_max = host(&candidate_y)
+                .into_iter()
+                .map(f32::abs)
+                .fold(0.0, f32::max);
+            let state_max = host(&candidate_state)
+                .into_iter()
+                .map(f32::abs)
+                .fold(0.0, f32::max);
+            println!(
+                "qwen38_cpu_delta_matvec tokens={tokens} reference_ms={reference_ms:.3} candidate_ms={candidate_ms:.3} candidate_reverse_ms={candidate_reverse_ms:.3} reference_reverse_ms={reference_reverse_ms:.3} output_max={output_max:e} state_max={state_max:e} output_max_abs_diff={output_diff:e} state_max_abs_diff={state_diff:e} chunked_output_diff={chunked_output_diff:e} chunked_state_diff={chunked_state_diff:e}"
+            );
+            assert!(output_diff < 1e-4 && state_diff < 1e-4);
+            assert!(chunked_output_diff < 1e-5 && chunked_state_diff < 1e-5);
+        }
     }
 }

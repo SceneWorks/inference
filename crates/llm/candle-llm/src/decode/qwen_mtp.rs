@@ -221,7 +221,7 @@ fn generate_qwen35_mtp_inner(
     // Target prefill produces both the ordinary next-token logits and the final-normalized hidden
     // rows that train/infer the MTP pairing one position to the right.
     let (prompt_logits, prompt_hidden) = match multimodal.as_ref() {
-        Some(prompt) => target.forward_from_embeds_deepstack_with_hidden(
+        Some(prompt) => target.prefill_from_embeds_deepstack_with_hidden(
             prompt.embeddings,
             prompt.positions,
             &mut target_cache,
@@ -229,12 +229,12 @@ fn generate_qwen35_mtp_inner(
             prompt.deepstack,
         )?,
         None => {
-            target.forward_with_hidden(&input_ids(prompt_ids, device)?, &mut target_cache, 0)?
+            target.prefill_with_hidden(&input_ids(prompt_ids, device)?, &mut target_cache, 0)?
         }
     };
     stats.forwards += 1;
     let prompt_len = prompt_ids.len();
-    let logits_last = row3(&prompt_logits, prompt_len - 1)?;
+    let logits_last = prompt_logits;
     let mut previous_hidden = prompt_hidden.narrow(1, prompt_len - 1, 1)?;
 
     // Warm the MTP attention cache with the target-validated prompt pairs:
@@ -250,7 +250,7 @@ fn generate_qwen35_mtp_inner(
                     &prompt.positions[1][1..],
                     &prompt.positions[2][1..],
                 ];
-                let _ = mtp.forward_embeddings_mrope(
+                mtp.warm_embeddings_mrope(
                     &shifted_embeddings,
                     &previous,
                     shifted_positions,
@@ -258,7 +258,7 @@ fn generate_qwen35_mtp_inner(
                 )?;
             }
             None => {
-                let _ = mtp.forward_sequence(&prompt_ids[1..], &previous, 1, &mut mtp_cache)?;
+                mtp.warm_sequence(&prompt_ids[1..], &previous, 1, &mut mtp_cache)?;
             }
         }
     }
@@ -439,7 +439,7 @@ fn generate_qwen35_mtp_inner(
             let mut replay = Vec::with_capacity(keep_len);
             replay.push(cur);
             replay.extend_from_slice(&drafts[..accepted]);
-            let (_, hidden) = target.forward_with_hidden(
+            let (_, hidden) = target.prefill_with_hidden(
                 &input_ids(&replay, device)?,
                 &mut target_cache,
                 rope_position,
@@ -454,7 +454,7 @@ fn generate_qwen35_mtp_inner(
         mtp_cache = mtp_after_cur;
         if accepted > 0 {
             let preceding_hidden = kept_hidden.narrow(1, 0, accepted)?;
-            let _ = mtp.forward_sequence(
+            mtp.warm_sequence(
                 &drafts[..accepted],
                 &preceding_hidden,
                 rope_position + 1,
@@ -703,6 +703,81 @@ mod tests {
             seed: Some(7),
             stop_tokens: Vec::new(),
         }
+    }
+
+    #[test]
+    fn prompt_last_logits_and_predictor_warmup_match_full_projection() {
+        let (target, mtp) = fixture(true);
+        let prompt = [2, 3, 4];
+        let ids = input_ids(&prompt, target.device()).unwrap();
+        let mut full_cache = target.new_cache();
+        let (full_logits, full_hidden) = target
+            .forward_with_hidden(&ids, &mut full_cache, 0)
+            .unwrap();
+        let mut prefill_cache = target.new_cache();
+        let (last_logits, prefill_hidden) = target
+            .prefill_with_hidden(&ids, &mut prefill_cache, 0)
+            .unwrap();
+        assert_eq!(
+            last_logits.dims(),
+            &[1, target.config().vocab_size as usize]
+        );
+        assert_eq!(prefill_hidden.dims(), full_hidden.dims());
+        assert_eq!(
+            last_logits.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            row3(&full_logits, prompt.len() - 1)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        );
+        assert_eq!(
+            prefill_hidden
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            full_hidden.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+        let next = input_ids(&[1], target.device()).unwrap();
+        assert_eq!(
+            target
+                .decode_logits(&next, &mut full_cache, prompt.len() as i32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            target
+                .decode_logits(&next, &mut prefill_cache, prompt.len() as i32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        );
+
+        let previous = full_hidden.narrow(1, 0, prompt.len() - 1).unwrap();
+        let mut full_mtp_cache = mtp.new_cache();
+        let (full_mtp_logits, _) = mtp
+            .forward_sequence(&prompt[1..], &previous, 1, &mut full_mtp_cache)
+            .unwrap();
+        let mut warm_mtp_cache = mtp.new_cache();
+        mtp.warm_sequence(&prompt[1..], &previous, 1, &mut warm_mtp_cache)
+            .unwrap();
+        assert_eq!(full_mtp_logits.dims(), &[1, prompt.len() - 1, 6]);
+        let last_hidden = full_hidden.narrow(1, prompt.len() - 1, 1).unwrap();
+        let (full_next, _) = mtp
+            .step(1, &last_hidden, 0, prompt.len() as i32, &mut full_mtp_cache)
+            .unwrap();
+        let (warm_next, _) = mtp
+            .step(1, &last_hidden, 0, prompt.len() as i32, &mut warm_mtp_cache)
+            .unwrap();
+        assert_eq!(
+            full_next.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            warm_next.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
     }
 
     #[test]

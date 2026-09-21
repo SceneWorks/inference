@@ -485,8 +485,9 @@ def real_weight_windows_interpreter_errors(workflow: str) -> list[str]:
     ``windows_reviewed_interpreter_exemption_errors`` rather than skipped outright.
     """
     errors: list[str] = []
+    powershell_interpreter = r"$env:REVIEWED_PYTHON"
     interpreter = re.compile(
-        rf"({re.escape(WINDOWS_INTERPRETER)}|"
+        rf"({re.escape(WINDOWS_INTERPRETER)}|{re.escape(powershell_interpreter)}|"
         r"(?<![\w./$\"'-])py(?:\s+-\d+(?:\.\d+)?)?(?![\w-])|"
         r"(?<![\w./$\"'-])python[0-9.]*(?:\.exe)?(?![\w-]))",
         re.IGNORECASE,
@@ -576,14 +577,16 @@ def real_weight_windows_interpreter_errors(workflow: str) -> list[str]:
             looks_like_python_command = bool(
                 re.search(r"\s-m\s+pip\b|scripts[/\\][^\s]+\.py\b", command, re.IGNORECASE)
             )
-            if looks_like_python_command and WINDOWS_INTERPRETER not in command:
+            if looks_like_python_command and not any(
+                reviewed in command for reviewed in (WINDOWS_INTERPRETER, powershell_interpreter)
+            ):
                 errors.append(
                     f"{job}: Windows Python command must use {WINDOWS_INTERPRETER}: "
                     f"{command.strip()!r}"
                 )
             for found in found_interpreters:
                 name = found.group(1)
-                if name != WINDOWS_INTERPRETER:
+                if name not in (WINDOWS_INTERPRETER, powershell_interpreter):
                     errors.append(
                         f"{job}: Windows steps must name {WINDOWS_INTERPRETER}, found "
                         f"{name!r} in {command.strip()!r}"
@@ -1155,6 +1158,11 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             with self.subTest(replacement=replacement):
                 mutated = workflow.replace(WINDOWS_INTERPRETER, replacement, 1)
                 self.assertTrue(real_weight_windows_interpreter_errors(mutated))
+        ps_command = "& $env:REVIEWED_PYTHON scripts/release/qwen38_bonsai_terminal.py @arguments"
+        self.assertIn(ps_command, workflow)
+        for replacement in ("python", "py -3.14", "$env:OTHER_PYTHON"):
+            mutated = workflow.replace(ps_command, ps_command.replace("$env:REVIEWED_PYTHON", replacement), 1)
+            self.assertTrue(real_weight_windows_interpreter_errors(mutated))
         first_windows_install = pip_installs[0]
         no_fail_fast = workflow.replace(
             first_windows_install, first_windows_install.removesuffix(" || exit /b 1"), 1
@@ -3767,288 +3775,137 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("exit 1", step["run"])
         self.assertIn("join(needs.*.result", step["env"]["RESULTS"])
 
+    def assert_qwen38_candle_requires_successful_mlx(self, workflow: dict) -> None:
+        candle = workflow["jobs"]["qwen38-bonsai-candle"]
+        self.assertEqual(candle["needs"], "qwen38-bonsai-mlx")
+        self.assertEqual(
+            candle["if"],
+            "${{ !cancelled() && needs.qwen38-bonsai-mlx.result == 'success' && "
+            "github.event_name == 'workflow_dispatch' && "
+            "inputs.profile == 'qwen38-bonsai' }}",
+        )
+
+    def test_qwen38_candle_skips_after_failed_or_cancelled_mlx(self) -> None:
+        workflow = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
+        self.assert_qwen38_candle_requires_successful_mlx(workflow)
+        candle = workflow["jobs"]["qwen38-bonsai-candle"]
+        for unsafe_condition in (
+            candle["if"].replace("needs.qwen38-bonsai-mlx.result == 'success' && ", ""),
+            candle["if"].replace("== 'success'", "!= 'success'"),
+            candle["if"].replace("needs.qwen38-bonsai-mlx", "needs.qwen38-bonsai-candle"),
+        ):
+            with self.subTest(unsafe_condition=unsafe_condition):
+                mutated = copy.deepcopy(workflow)
+                mutated["jobs"]["qwen38-bonsai-candle"]["if"] = unsafe_condition
+                with self.assertRaises(AssertionError):
+                    self.assert_qwen38_candle_requires_successful_mlx(mutated)
+
     def test_qwen38_bonsai_terminal_profile_is_explicit_serial_and_sealed(self) -> None:
-        workflow_text = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
-        workflow = yaml.safe_load(workflow_text)
+        workflow = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
         options = workflow[True]["workflow_dispatch"]["inputs"]["profile"]["options"]
         self.assertIn("qwen38-bonsai", options)
-        preflight_input = workflow[True]["workflow_dispatch"]["inputs"][
-            "qwen38_bonsai_preflight_only"
-        ]
-        self.assertEqual(preflight_input["type"], "boolean")
-        self.assertFalse(preflight_input["default"])
-        provision_input = workflow[True]["workflow_dispatch"]["inputs"]["qwen38_bonsai_provision_only"]
-        self.assertEqual(provision_input["type"], "boolean")
-        self.assertFalse(provision_input["default"])
+        for name in ("qwen38_bonsai_preflight_only", "qwen38_bonsai_provision_only"):
+            setting = workflow[True]["workflow_dispatch"]["inputs"][name]
+            self.assertEqual(setting["type"], "boolean")
+            self.assertFalse(setting["default"])
         jobs = workflow["jobs"]
         mlx = jobs["qwen38-bonsai-mlx"]
-        candle = jobs["qwen38-bonsai-candle"]
-        self.assertEqual(
-            mlx["runs-on"], ["self-hosted", "macOS", "ARM64", "nax", "real-weights"]
-        )
-        self.assertEqual(
-            candle["runs-on"], ["self-hosted", "windows", "cuda", "real-weights"]
-        )
-        self.assertEqual(candle["needs"], "qwen38-bonsai-mlx")
-        self.assertIn("inputs.profile == 'qwen38-bonsai'", mlx["if"])
-        self.assertIn("inputs.profile == 'qwen38-bonsai'", candle["if"])
-        self.assertIn("!cancelled()", candle["if"])
-        self.assertNotIn("always()", candle["if"])
-
+        cuda = jobs["qwen38-bonsai-candle"]
+        cpu = jobs["qwen38-bonsai-candle-cpu"]
+        aggregate = jobs["qwen38-bonsai-aggregate"]
+        self.assertEqual(mlx["runs-on"], ["self-hosted", "macOS", "ARM64", "nax", "real-weights"])
+        self.assertEqual(cuda["runs-on"], cpu["runs-on"])
+        self.assertEqual(cuda["runs-on"], ["self-hosted", "windows", "cuda", "real-weights"])
+        self.assert_qwen38_candle_requires_successful_mlx(workflow)
+        self.assertEqual(cpu["needs"], "qwen38-bonsai-candle")
+        self.assertIn("needs.qwen38-bonsai-candle.result == 'success'", cpu["if"])
+        self.assertEqual(cpu["strategy"]["max-parallel"], 1)
+        self.assertFalse(cpu["strategy"]["fail-fast"])
+        self.assertEqual(cpu["timeout-minutes"], 360)
+        self.assertEqual(cuda["timeout-minutes"], 360)
+        self.assertEqual(mlx["timeout-minutes"], 360)
+        self.assertEqual(aggregate["needs"], ["qwen38-bonsai-mlx", "qwen38-bonsai-candle", "qwen38-bonsai-candle-cpu"])
+        self.assertEqual(cpu["permissions"]["actions"], "read")
+        self.assertEqual(aggregate["permissions"]["actions"], "read")
+        matrix = json.loads((WORKFLOW.parents[2] / "release" / "qwen38-bonsai-matrix.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(matrix["cells"]), 19)
+        expected_cpu = {cell["id"] for cell in matrix["cells"] if cell["device"] == "cpu" and cell["backend"] == "candle"}
+        actual_cpu = {item["cell"] for item in cpu["strategy"]["matrix"]["include"]}
+        self.assertEqual(actual_cpu, expected_cpu)
+        self.assertEqual(len(actual_cpu), 3)
+        self.assertEqual(mlx["env"]["QWEN_BONSAI_RUN_DIR"],
+                         "/Volumes/Models/Codex-builds/sc-23935/ci-${{ github.run_id }}-${{ github.run_attempt }}")
+        self.assertIn("scripts/release/resolve_snapshot_paths.py", "\n".join(step.get("run", "") for step in mlx["steps"]))
+        self.assertIn("runner.name == 'nax-macos'", "\n".join(step.get("if", "") for step in mlx["steps"]))
+        self.assertEqual(next(step for step in mlx["steps"] if step.get("name") == "Prepare external campaign storage")["timeout-minutes"], 2)
         mlx_commands = "\n".join(step.get("run", "") for step in mlx["steps"])
-        candle_commands = "\n".join(step.get("run", "") for step in candle["steps"])
-        external_root = (
-            "/Volumes/Models/Codex-builds/sc-23935/"
-            "ci-${{ github.run_id }}-${{ github.run_attempt }}"
-        )
-        self.assertEqual(mlx["env"]["QWEN_BONSAI_RUN_DIR"], external_root)
-        self.assertEqual(
-            mlx["env"]["QWEN_BONSAI_OUTPUT_DIR"], f"{external_root}/evidence"
-        )
-        self.assertEqual(
-            mlx["env"]["QWEN_BONSAI_TOOLS_DIR"], f"{external_root}/tools"
-        )
-        self.assertEqual(mlx["env"]["CARGO_TARGET_DIR"], f"{external_root}/cargo-target")
-        self.assertEqual(mlx["env"]["TMPDIR"], f"{external_root}/tmp")
-        storage = next(
-            step
-            for step in mlx["steps"]
-            if step.get("name") == "Prepare external campaign storage"
-        )
-        checkout = next(
-            step
-            for step in mlx["steps"]
-            if step.get("uses", "").startswith("actions/checkout@")
-        )
-        self.assertLess(mlx["steps"].index(storage), mlx["steps"].index(checkout))
-        self.assertIn('test ! -e "$QWEN_BONSAI_RUN_DIR"', storage["run"])
-        for path_variable in (
-            "QWEN_BONSAI_OUTPUT_DIR",
-            "QWEN_BONSAI_TOOLS_DIR",
-            "CARGO_TARGET_DIR",
-            "TMPDIR",
-        ):
-            self.assertIn(f'"${path_variable}"', storage["run"])
-        serialized_mlx = json.dumps(mlx)
-        self.assertNotIn("RUNNER_TEMP", serialized_mlx)
-        self.assertNotIn("${{ runner.temp }}", serialized_mlx)
-        snapshot_reference = re.compile(r"(?:\$|%)(BONSAI_[A-Z0-9_]+_SNAPSHOT)(?:\b|%)")
-
-        def missing_job_snapshot_env(job: dict) -> set[str]:
-            commands = "\n".join(step.get("run", "") for step in job["steps"])
-            referenced = set(snapshot_reference.findall(commands))
-            return referenced - set(job.get("env", {}))
-
-        self.assertEqual(missing_job_snapshot_env(mlx), set())
-        self.assertEqual(missing_job_snapshot_env(candle), set())
-        for name in (
-            "BONSAI_QWEN38_SNAPSHOT",
-            "BONSAI_MLX_SNAPSHOT",
-            "BONSAI_GGUF_SNAPSHOT",
-            "BONSAI_BASELINE_SNAPSHOT",
-        ):
-            self.assertEqual(mlx["env"][name], f"${{{{ vars.{name} }}}}")
-            self.assertEqual(candle["env"][name], f"${{{{ vars.CANDLE_{name} }}}}")
-        candle_without_mlx = copy.deepcopy(candle)
-        del candle_without_mlx["env"]["BONSAI_MLX_SNAPSHOT"]
-        self.assertEqual(
-            missing_job_snapshot_env(candle_without_mlx), {"BONSAI_MLX_SNAPSHOT"}
-        )
-        for job, commands in ((mlx, mlx_commands), (candle, candle_commands)):
-            self.assertIn("qwen38_bonsai_terminal.py hardware", commands)
-            self.assertIn("qwen38_bonsai_terminal.py qualify-snapshots", commands)
-            self.assertIn("qwen38_bonsai_terminal.py preflight", commands)
-            self.assertIn("qwen38_bonsai_terminal.py run ", commands)
-            self.assertIn("--binary", commands)
-            self.assertIn("--runtime-sha", commands)
-            self.assertNotIn("cargo test -- --ignored", commands)
-            self.assertEqual(
-                commands.count("scripts/ci/report_runner_disk_headroom.sh"),
-                1 if job is mlx else 0,
-            )
-            configured_cases = "\n".join(str(value) for value in job["env"].values())
-            for case_id in (
-                "reasoning_low",
-                "reasoning_medium",
-                "reasoning_xhigh",
-                "preserve_thinking",
-                "json_thinking",
-                "tool_roundtrip",
-                "video_forward",
-                "video_reverse",
-            ):
-                self.assertIn(case_id, configured_cases)
-        for case_id in ("mtp_greedy", "mtp_json", "mtp_image", "mtp_video"):
-            self.assertIn(case_id, mlx["env"]["QWEN38_ACCEPTANCE_CASES"])
-            self.assertIn(case_id, candle["env"]["QWEN38_ACCEPTANCE_CASES"])
-        self.assertLess(
-            mlx_commands.index("qwen38_bonsai_terminal.py preflight"),
-            mlx_commands.index("qwen38_bonsai_terminal.py provision-assets"),
-        )
-        self.assertLess(
-            candle_commands.index("qwen38_bonsai_terminal.py preflight"),
-            candle_commands.index("qwen38_bonsai_terminal.py provision-assets"),
-        )
-        cuda_oracle = next(
-            step
-            for step in candle["steps"]
-            if step.get("name")
-            == "Execute Candle packed CUDA operator oracles before provisioning"
-        )
-        cuda_oracle_command = (
-            "cargo test --locked -p candle-llm --features cuda --lib "
-            "primitives::prism::tests::cuda_packed_operator_oracles_compile_and_execute_nvrtc "
-            "-- --exact --nocapture"
-        )
-        self.assertIn('call "%VCVARS%" || exit /b 1', cuda_oracle["run"])
-        self.assertIn(cuda_oracle_command, cuda_oracle["run"])
-        self.assertIn('findstr /C:"test result: ok. 1 passed"', cuda_oracle["run"])
-        self.assertIn("check-gpu-reservation --gpu-index 0", cuda_oracle["run"])
-        self.assertNotIn("continue-on-error", cuda_oracle)
-        self.assertLess(
-            candle_commands.index(cuda_oracle_command),
-            candle_commands.index("qwen38_bonsai_terminal.py provision-assets"),
-        )
-        self.assertIn("--load-profile mlx-unified", mlx_commands)
-        self.assertIn("--load-profile candle-packed-cuda", candle_commands)
-        self.assertIn("qwen38_bonsai_terminal.py matrix-status", candle_commands)
-        self.assertIn("--candle-device auto", candle_commands)
-        self.assertIn("--candle-device cpu", candle_commands)
-        self.assertEqual((mlx_commands + candle_commands).count("--preflight "), 19)
-        self.assertEqual(candle_commands.count("--reservation-token"), 16)
-        self.assertIn("reserve-gpu --gpu-index 0", candle_commands)
-        self.assertIn("release-gpu --gpu-index 0", candle_commands)
-        self.assertIn('matrix-status --runtime-sha "%GITHUB_SHA%"', candle_commands)
-        self.assertIn('verify-matrix-seal --runtime-sha "%GITHUB_SHA%"', candle_commands)
-        release = next(
-            step
-            for step in candle["steps"]
-            if step.get("name") == "Release the Candle campaign CUDA reservation"
-        )
-        mlx_upload = next(
-            step
-            for step in mlx["steps"]
-            if step.get("name") == "Upload MLX qualification or sealed row evidence"
-        )
-        upload = next(
-            step
-            for step in candle["steps"]
-            if step.get("name") == "Upload Candle qualification or terminal evidence"
-        )
-        self.assertEqual(
-            mlx_upload["with"]["path"], "${{ env.QWEN_BONSAI_OUTPUT_DIR }}"
-        )
-        self.assertEqual(mlx_upload["if"], "always()")
-        self.assertEqual(release["if"], "always()")
-        self.assertEqual(upload["if"], "always()")
-
-        verifier = next(
-            step
-            for step in mlx["steps"]
-            if step.get("name") == "Install pinned snapshot verifier dependencies"
-        )
-        provision_mlx = next(
-            step
-            for step in mlx["steps"]
-            if step.get("name")
-            == "Provision admitted MLX assets and verify publisher identities"
-        )
-        self.assertIn('$QWEN_BONSAI_TOOLS_DIR/huggingface-hub', verifier["run"])
-        self.assertIn(
-            'PYTHONPATH="$QWEN_BONSAI_TOOLS_DIR/huggingface-hub"',
-            provision_mlx["run"],
-        )
-        self.assertIn('--evidence-root "$QWEN_BONSAI_OUTPUT_DIR"', provision_mlx["run"])
-
-        for job in (mlx, candle):
+        cuda_commands = "\n".join(step.get("run", "") for step in cuda["steps"])
+        cpu_commands = "\n".join(step.get("run", "") for step in cpu["steps"])
+        aggregate_commands = "\n".join(step.get("run", "") for step in aggregate["steps"])
+        for cell in matrix["cells"]:
+            if cell["backend"] == "mlx":
+                self.assertIn(cell["id"], mlx_commands)
+            elif cell["device"] == "cuda":
+                self.assertIn(cell["id"], cuda_commands)
+            else:
+                self.assertIn(cell["id"], actual_cpu)
+        self.assertEqual((mlx_commands + cuda_commands).count("--preflight "), 16)
+        self.assertIn("--load-profile candle-packed-cpu", cuda_commands)
+        self.assertIn("--candle-device auto", cuda_commands)
+        self.assertNotIn("--candle-device cpu", cuda_commands)
+        self.assertIn("--candle-device", cpu_commands)
+        self.assertIn("--cases', $cases", cpu_commands)
+        for name in ("BONSAI_CASES", "QWEN38_ACCEPTANCE_CASES", "BONSAI_ACCEPTANCE_CASES"):
+            self.assertIn(name, cpu["env"])
+        self.assertIn("context_2048", cpu["env"]["BONSAI_CASES"])
+        self.assertIn("mtp_video", cpu["env"]["QWEN38_ACCEPTANCE_CASES"])
+        for job in (mlx, cuda):
             steps = job["steps"]
             phase = next(step for step in steps if step.get("name") == "Validate exclusive qualification phase")
+            provision = next(step for step in steps if " provision-assets " in step.get("run", ""))
             self.assertIn("--preflight-only", phase["run"])
             self.assertIn("--provision-only", phase["run"])
-            provision = next(step for step in steps if " provision-assets " in step.get("run", ""))
             self.assertIn("inputs.qwen38_bonsai_preflight_only != true", provision["if"])
+            self.assertLess(steps.index(phase), steps.index(provision))
             self.assertNotIn("continue-on-error", provision)
-            for step in steps:
-                name = step.get("name", "")
-                if name.startswith(("Build one native", "Run MLX", "Run Candle")) or "matrix-status" in step.get("run", ""):
-                    self.assertIn("inputs.qwen38_bonsai_provision_only != true", step.get("if", ""), name)
-                    self.assertLess(steps.index(provision), steps.index(step), name)
-            metadata = next(step for step in steps if " qualify-snapshots " in step.get("run", ""))
-            self.assertIn("snapshot-metadata-before.json", metadata["run"])
-            self.assertLess(steps.index(phase), steps.index(metadata))
-        self.assertIn("inputs.qwen38_bonsai_provision_only != true", cuda_oracle["if"])
-
-        # Expanding a leading ~/ is metadata preparation, not model materialization. It must
-        # also precede qualification in preflight-only runs so the inspected path is real.
-        resolver = next(step for step in mlx["steps"] if step.get("name") == "Resolve runner-local snapshot paths")
-        local_snapshots = next(
-            step
-            for step in mlx["steps"]
-            if step.get("name") == "Select preserved local campaign snapshots"
-        )
-        qualification = next(step for step in mlx["steps"] if step.get("id") == "mlx_snapshot_metadata")
-        self.assertNotIn("if", resolver)
-        self.assertEqual(local_snapshots["if"], "runner.name == 'nax-macos'")
-        self.assertLess(mlx["steps"].index(resolver), mlx["steps"].index(local_snapshots))
-        self.assertLess(mlx["steps"].index(local_snapshots), mlx["steps"].index(qualification))
-        self.assertIn("scripts/release/resolve_snapshot_paths.py", resolver["run"])
-        self.assertIn("/Volumes/Models/Codex-models/sc-23935/hf/hub/", local_snapshots["run"])
-        self.assertIn("test -d \"$GGUF\"", local_snapshots["run"])
-        self.assertIn("test -d \"$BASELINE\"", local_snapshots["run"])
-        self.assertIn("BONSAI_GGUF_SNAPSHOT=%s", local_snapshots["run"])
-        self.assertIn("BONSAI_BASELINE_SNAPSHOT=%s", local_snapshots["run"])
-        self.assertIn(">> \"$GITHUB_ENV\"", local_snapshots["run"])
-        for job in (mlx, candle):
-            for step in job["steps"]:
-                name = step.get("name", "")
-                is_materialization = name.startswith(
-                    ("Install pinned snapshot", "Provision admitted", "Build one native", "Run MLX", "Run Candle")
-                ) or step.get("uses", "").startswith("actions/download-artifact")
-                if is_materialization:
-                    self.assertIn(
-                        "inputs.qwen38_bonsai_preflight_only != true",
-                        step.get("if", ""),
-                        name or step.get("uses"),
-                    )
-        self.assertNotIn(
-            "qwen38_bonsai_preflight_only",
-            cuda_oracle.get("if", ""),
-        )
-
-        matrix = json.loads(
-            (WORKFLOW.parents[2] / "release" / "qwen38-bonsai-matrix.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        cells = {cell["id"]: cell for cell in matrix["cells"]}
-        self.assertEqual(len(cells), 19)
-        combined_commands = mlx_commands + candle_commands
-        for cell_id in cells:
-            self.assertIn(cell_id, combined_commands)
-        for cell in (
-            "candle-cuda-qwen38-parent",
-            "candle-cuda-qwen3vl-baseline",
-            "candle-cpu-qwen38-parent",
-            "candle-cpu-bonsai-gguf",
-            "candle-cpu-qwen3vl-baseline",
-        ):
-            self.assertIn(cell, cells)
-        for backend in ("mlx", "candle"):
-            for language in ("pq2", "ptq1"):
-                for vision in ("bf16", "q8"):
-                    self.assertIn(f"functional-{backend}-{language}-{vision}", cells)
-        self.assertIn("functional-mlx-bonsai-mlx", cells)
-        self.assertIn("functional-candle-bonsai-mlx", cells)
-
-        manifest = tomllib.loads(MODEL_MANIFEST.read_text(encoding="utf-8"))
-        rows = {row["key"]: row for row in manifest["models"]}
-        for key in (
-            "bonsai-qwen38-parent",
-            "bonsai-mlx-2bit",
-            "bonsai-gguf",
-            "bonsai-qwen3vl-baseline",
-        ):
-            self.assertEqual(rows[key]["profiles"], ["qwen38-bonsai"])
+        cuda_steps = cuda["steps"]
+        oracle = next(step for step in cuda_steps if step.get("name") == "Execute Candle packed CUDA operator oracles before provisioning")
+        self.assertIn("cuda_packed_operator_oracles_compile_and_execute_nvrtc", oracle["run"])
+        self.assertNotIn("continue-on-error", oracle)
+        self.assertLess(cuda_steps.index(oracle), next(i for i, step in enumerate(cuda_steps) if " provision-assets " in step.get("run", "")))
+        self.assertEqual(next(step for step in cuda_steps if step.get("name") == "Release the Candle campaign CUDA reservation")["if"], "always()")
+        publisher = next(step for step in cuda_steps if step.get("name") == "Upload immutable Candle publisher qualification for CPU rows")
+        self.assertIn("snapshot-metadata.json", publisher["with"]["path"])
+        self.assertIn("provision-report.json", publisher["with"]["path"])
+        stage = next(step for step in cuda_steps if step.get("name") == "Stage the eight CUDA cells without duplicate CPU preflights")
+        self.assertIn("qwen38_bonsai_artifacts.py stage-cuda", stage["run"])
+        self.assertEqual(next(step for step in cuda_steps if step.get("name") == "Upload Candle preflight or provision qualification")["if"],
+                         "always() && (inputs.qwen38_bonsai_preflight_only == true || inputs.qwen38_bonsai_provision_only == true)")
+        row = next(step for step in cpu["steps"] if step.get("name") == "Run the complete frozen CPU row")
+        self.assertTrue(row["continue-on-error"])
+        self.assertIn("--model-id', $cell", row["run"])
+        self.assertIn("--runtime-sha', $env:GITHUB_SHA", row["run"])
+        self.assertIn("context_2048", cpu["env"]["BONSAI_CASES"])
+        self.assertIn("check-partition --role cpu", cpu_commands)
+        self.assertIn("check-partition --role mlx", mlx_commands)
+        self.assertIn("check-partition --role cuda", cuda_commands)
+        for job, role in ((mlx, "mlx"), (cuda, "cuda"), (cpu, "cpu")):
+            check = next(step for step in job["steps"] if f"check-partition --role {role}" in step.get("run", ""))
+            self.assertNotIn("continue-on-error", check)
+        self.assertEqual(next(step for step in mlx["steps"] if step.get("name") == "Upload MLX qualification or sealed row evidence")["if"], "always()")
+        self.assertEqual(next(step for step in cuda["steps"] if step.get("name") == "Upload immutable Candle CUDA row evidence")["if"],
+                         "always() && inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true")
+        self.assertEqual(next(step for step in cpu["steps"] if step.get("name") == "Upload immutable CPU row evidence")["if"], "always()")
+        self.assertEqual(next(step for step in aggregate["steps"] if step.get("name") == "Upload the selected roots and sealed terminal report")["if"], "always()")
+        self.assertIn("--role publisher", cpu_commands)
+        self.assertIn("artifact-ids", next(step for step in cpu["steps"] if step.get("name") == "Download the pinned publisher artifact")["with"])
+        self.assertIn("--role matrix", aggregate_commands)
+        self.assertIn("qwen38_bonsai_artifacts.py aggregate", aggregate_commands)
+        self.assertIn("artifact-ids", next(step for step in aggregate["steps"] if step.get("name") == "Download only the selected artifact IDs without merging roots")["with"])
+        self.assertFalse(next(step for step in aggregate["steps"] if step.get("name") == "Download only the selected artifact IDs without merging roots")["with"]["merge-multiple"])
+        for job in (cpu, aggregate):
+            self.assertIn("inputs.qwen38_bonsai_preflight_only != true", job["if"])
+            self.assertIn("inputs.qwen38_bonsai_provision_only != true", job["if"])
 
 
 if __name__ == "__main__":

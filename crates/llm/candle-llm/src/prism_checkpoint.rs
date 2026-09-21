@@ -522,8 +522,9 @@ fn gguf_tokenizer(raw: &RawGguf) -> Result<GgufTokenizer> {
     let mut added = Vec::new();
     for (id, token) in tokens.iter().enumerate() {
         vocab.insert(token.clone(), serde_json::json!(id));
-        if matches!(types.get(id).copied().unwrap_or(1), 3 | 4) {
-            added.push(serde_json::json!({"id":id,"content":token,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}));
+        let token_type = types.get(id).copied().unwrap_or(1);
+        if matches!(token_type, 3 | 4) {
+            added.push(crate::gguf::gguf_added_token(id, token, token_type));
         }
     }
     let doc = serde_json::json!({"version":"1.0","truncation":null,"padding":null,"added_tokens":added,
@@ -948,6 +949,67 @@ mod tests {
         assert_eq!(metadata.block_size, 1024);
         assert_eq!(metadata.forward_weight_names.len(), 401);
         assert_eq!(metadata.inverse_weight_names.len(), 1);
+    }
+
+    #[test]
+    #[ignore = "reads only frozen Bonsai GGUF metadata via BONSAI_GGUF"]
+    fn frozen_gguf_user_defined_markers_survive_skip_special_and_segment() {
+        use core_llm::{Channel, ThinkingSegmenter, Tokenizer, ToolCallSegmenter};
+
+        let path = std::env::var_os("BONSAI_GGUF")
+            .map(std::path::PathBuf::from)
+            .expect("BONSAI_GGUF must point to the frozen PQ2_0 or PTQ1_0 file");
+        let raw = RawGguf::open(&path).unwrap();
+        let types = raw.metadata["tokenizer.ggml.token_type"].array().unwrap();
+        for id in [248044, 248045, 248046] {
+            assert_eq!(types[id].u64(), Some(3), "CONTROL token {id}");
+        }
+        for id in [248058, 248059, 248066, 248067, 248068, 248069] {
+            assert_eq!(types[id].u64(), Some(4), "USER_DEFINED token {id}");
+        }
+
+        let gguf = gguf_tokenizer(&raw).unwrap();
+        let tokenizer = Tokenizer::from_json(&gguf.json).unwrap();
+        for (id, marker) in [
+            (248058, "<tool_call>"),
+            (248059, "</tool_call>"),
+            (248066, "<tool_response>"),
+            (248067, "</tool_response>"),
+            (248068, "<think>"),
+            (248069, "</think>"),
+        ] {
+            assert_eq!(tokenizer.encode(marker, false).unwrap(), [id]);
+            assert_eq!(tokenizer.decode(&[id], true).unwrap(), marker);
+        }
+        assert_eq!(tokenizer.decode(&[248045], true).unwrap(), "");
+        assert_eq!(tokenizer.decode(&[248045], false).unwrap(), "<|im_start|>");
+
+        let mut thinking = ThinkingSegmenter::default();
+        let mut spans = Vec::new();
+        for delta in [
+            tokenizer.decode(&[248068], true).unwrap(),
+            "391".to_owned(),
+            tokenizer.decode(&[248069], true).unwrap(),
+            "391".to_owned(),
+        ] {
+            spans.extend(thinking.push(&delta));
+        }
+        spans.extend(thinking.flush());
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].channel, Channel::Thinking);
+        assert_eq!(spans[0].text, "391");
+        assert_eq!(spans[1].channel, Channel::Content);
+        assert_eq!(spans[1].text, "391");
+
+        let mut tools = ToolCallSegmenter::new(&[]);
+        tools.push(&tokenizer.decode(&[248058], true).unwrap());
+        tools.push("<function=lookup_weather><parameter=city>Paris</parameter></function>");
+        tools.push(&tokenizer.decode(&[248059], true).unwrap());
+        tools.flush();
+        let calls = tools.take_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "lookup_weather");
+        assert_eq!(calls[0].arguments["city"], "Paris");
     }
 
     #[test]

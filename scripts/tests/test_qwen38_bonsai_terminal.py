@@ -6,9 +6,14 @@ import argparse
 import copy
 import importlib.util
 import json
+import os
 import struct
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
 
@@ -28,6 +33,101 @@ class TerminalEvidenceTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    @unittest.skipIf(os.name == "nt", "fixture executable uses a POSIX shebang")
+    def test_cpu_diagnostic_timeout_seals_partial_evidence_and_reaps_child_tree(self) -> None:
+        grandchild_pid_path = self.root / "grandchild.pid"
+        binary = self.root / "hanging-test"
+        binary.write_text(
+            f"#!{sys.executable}\n"
+            "import pathlib, subprocess, sys, time\n"
+            "child = subprocess.Popen([sys.executable, '-c', "
+            "'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'])\n"
+            f"pathlib.Path({str(grandchild_pid_path)!r}).write_text(str(child.pid))\n"
+            "time.sleep(60)\n",
+            encoding="utf-8",
+        )
+        binary.chmod(0o755)
+        preflight_path = self.root / "preflight.json"
+        preflight_path.write_text('{"load_profile":"candle-dense-cpu"}', encoding="utf-8")
+        output = self.root / "timeout-run"
+        args = terminal.parser().parse_args(
+            ["run", "--binary", str(binary), "--test-name", "ignored_test",
+             "--model-id", "parent", "--model-key", "parent", "--model-revision", "c" * 40,
+             "--snapshot", str(self.root), "--model-path", str(self.root / "weights.gguf"),
+             "--runtime-sha", self.runtime_sha, "--preflight", str(preflight_path),
+             "--cases", "arithmetic", "--output", str(output), "--candle-device", "cpu",
+             "--sample-interval", "0.05", "--diagnostic-timeout-seconds", "0.5"]
+        )
+        inventory = {"inventory_sha256": "e" * 64}
+        sizes = {"language_weight_bytes": 1, "vision_weight_bytes": 0, "projector_bytes": 0}
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(terminal, "source_identity", return_value={}))
+            stack.enter_context(mock.patch.object(terminal, "load_model", return_value={"revision": "c" * 40, "key": "parent"}))
+            stack.enter_context(mock.patch.object(terminal, "validate_variant_paths"))
+            stack.enter_context(mock.patch.object(terminal, "verify_snapshot"))
+            stack.enter_context(mock.patch.object(terminal, "snapshot_inventory", return_value=inventory))
+            stack.enter_context(mock.patch.object(terminal, "artifact_sizes", return_value=sizes))
+            stack.enter_context(mock.patch.object(terminal, "pinned_admission_sizes", return_value=sizes))
+            stack.enter_context(mock.patch.object(terminal, "validate_preflight_record"))
+            stack.enter_context(mock.patch.object(terminal, "selected_artifact", return_value={"path": "weights.gguf"}))
+            stack.enter_context(mock.patch.object(terminal, "nvidia_sample", return_value=(None, "not sampled")))
+            stack.enter_context(mock.patch.object(terminal, "physical_memory", return_value=(1, 1, None)))
+            self.assertEqual(terminal.run(args), 1)
+        receipt = json.loads((output / "receipt.json").read_text(encoding="utf-8"))
+        self.assertEqual(receipt["status"], "timed_out")
+        self.assertIsNone(receipt["model"]["inventory_after"]["inventory_sha256"])
+        self.assertIsNone(receipt["provider_evidence"])
+        self.assertEqual(receipt["process"]["diagnostic_timeout_seconds"], 0.5)
+        self.assertEqual(receipt["process"]["child_tree_cleanup"]["method"], "process_group")
+        self.assertTrue(receipt["process"]["child_tree_cleanup"]["tree_termination_requested"])
+        self.assertTrue(receipt["process"]["child_tree_cleanup"]["root_reaped"])
+        self.assertLess((output / "progress-rss.jsonl").stat().st_size, 2 * 1024 * 1024)
+        self.assertTrue((output / "progress-rss.jsonl").read_text(encoding="utf-8").strip())
+        manifest = json.loads((output / "artifact-manifest.json").read_text(encoding="utf-8"))
+        self.assertIn("progress-rss.jsonl", [item["path"] for item in manifest["files"]])
+        with self.assertRaisesRegex(ValueError, "did not complete successfully"):
+            terminal.validate_receipt(output)
+        self.assertTrue(grandchild_pid_path.is_file())
+        child_pid = int(grandchild_pid_path.read_text(encoding="utf-8"))
+        for _ in range(20):
+            state = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(child_pid)], capture_output=True, text=True,
+                encoding="utf-8",
+            ).stdout.strip()
+            if not state or state.startswith("Z"):
+                break
+            time.sleep(0.05)
+        else:
+            self.fail(f"owned grandchild {child_pid} survived timeout cleanup")
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group race regression")
+    def test_cleanup_still_kills_group_after_root_exits(self) -> None:
+        grandchild_pid_path = self.root / "orphan.pid"
+        script = (
+            "import pathlib,subprocess,sys; "
+            "child=subprocess.Popen([sys.executable,'-c',"
+            "'import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(60)']); "
+            f"pathlib.Path({str(grandchild_pid_path)!r}).write_text(str(child.pid))"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script], start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        proc.wait(timeout=5)
+        child_pid = int(grandchild_pid_path.read_text(encoding="utf-8"))
+        cleanup = terminal.terminate_owned_child(proc)
+        self.assertTrue(cleanup["tree_termination_requested"])
+        for _ in range(20):
+            state = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(child_pid)], capture_output=True, text=True,
+                encoding="utf-8",
+            ).stdout.strip()
+            if not state or state.startswith("Z"):
+                break
+            time.sleep(0.05)
+        else:
+            self.fail(f"owned grandchild {child_pid} survived post-exit cleanup")
 
     def make_run(
         self,
@@ -1155,6 +1255,21 @@ Pages purgeable:                             1000.
             seal=args.seal,
         )
         self.assertEqual(terminal.verify_matrix_seal(verify), 0)
+        selection = self.root / "selected-artifacts.json"
+        terminal.write_new(selection, {"runtime_sha": self.runtime_sha, "artifact_ids": [11, 12]})
+        selected_args = argparse.Namespace(
+            root=[self.root], matrix=matrix, manifest=manifest,
+            runtime_sha=self.runtime_sha,
+            output=self.root / "selected-matrix-report.json",
+            markdown=self.root / "selected-matrix-report.md",
+            seal=self.root / "selected-matrix-seal.json",
+            artifact_selection=selection,
+        )
+        self.assertEqual(terminal.matrix_status(selected_args), 0)
+        self.assertEqual(terminal.verify_matrix_seal(selected_args), 0)
+        selection.write_text('{"artifact_ids": [99]}\n', encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "matrix seal artifact mismatch"):
+            terminal.verify_matrix_seal(selected_args)
         sealed = json.loads(args.seal.read_text(encoding="utf-8"))
         omitted = sealed["files"].pop(0)
         args.seal.write_text(json.dumps(sealed), encoding="utf-8")
