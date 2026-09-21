@@ -92,7 +92,8 @@ class TerminalEvidenceTests(unittest.TestCase):
         child_pid = int(grandchild_pid_path.read_text(encoding="utf-8"))
         for _ in range(20):
             state = subprocess.run(
-                ["ps", "-o", "stat=", "-p", str(child_pid)], capture_output=True, text=True
+                ["ps", "-o", "stat=", "-p", str(child_pid)], capture_output=True, text=True,
+                encoding="utf-8",
             ).stdout.strip()
             if not state or state.startswith("Z"):
                 break
@@ -119,7 +120,8 @@ class TerminalEvidenceTests(unittest.TestCase):
         self.assertTrue(cleanup["tree_termination_requested"])
         for _ in range(20):
             state = subprocess.run(
-                ["ps", "-o", "stat=", "-p", str(child_pid)], capture_output=True, text=True
+                ["ps", "-o", "stat=", "-p", str(child_pid)], capture_output=True, text=True,
+                encoding="utf-8",
             ).stdout.strip()
             if not state or state.startswith("Z"):
                 break
