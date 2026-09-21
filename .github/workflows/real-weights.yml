@@ -1881,6 +1881,10 @@ jobs:
           path: ${{ env.QWEN_BONSAI_OUTPUT_DIR }}
           if-no-files-found: error
           retention-days: 30
+      - name: Require all eight sealed MLX rows
+        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true
+        run: |
+          python3.12 scripts/release/qwen38_bonsai_artifacts.py check-partition --role mlx --root "$QWEN_BONSAI_OUTPUT_DIR" --runtime-sha "$GITHUB_SHA"
 
   qwen38-bonsai-candle:
     name: Qwen3.8/Bonsai matched diagnostics (Candle/CUDA)
@@ -2006,6 +2010,17 @@ jobs:
         run: |
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
           "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py provision-assets --platform windows --runtime-sha "%GITHUB_SHA%" --evidence-root "%RUNNER_TEMP%\qwen38-bonsai-candle" || exit /b 1
+      - name: Upload immutable Candle publisher qualification for CPU rows
+        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qwen38-bonsai-publisher-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}\qwen38-bonsai-candle\snapshot-metadata.json
+            ${{ runner.temp }}\qwen38-bonsai-candle\provision-report.json
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Build one native Candle CUDA comparison executable
         if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true
         shell: cmd
@@ -2034,27 +2049,6 @@ jobs:
         run: |
           set /p BINARY=<"%RUNNER_TEMP%\qwen38-bonsai-candle\binary.txt"
           "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py run --candle-device auto --binary "%BINARY%" --test-name native_comparison --model-id candle-cuda-qwen3vl-baseline --model-key bonsai-qwen3vl-baseline --model-revision 0c351dd01ed87e9c1b53cbc748cba10e6187ff3b --snapshot "%BONSAI_BASELINE_SNAPSHOT%" --model-path "%BONSAI_BASELINE_SNAPSHOT%" --runtime-sha "%GITHUB_SHA%" --cases "%BONSAI_CASES%" --preflight "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cuda-qwen3vl-baseline-preflight.json" --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cuda-qwen3vl-baseline" || exit /b 1
-      - name: Run Candle CPU parent row
-        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true && (steps.candle_cpu_parent_preflight.outcome == 'success')
-        continue-on-error: true
-        shell: cmd
-        run: |
-          set /p BINARY=<"%RUNNER_TEMP%\qwen38-bonsai-candle\binary.txt"
-          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py run --candle-device cpu --binary "%BINARY%" --test-name native_comparison --model-id candle-cpu-qwen38-parent --model-key bonsai-qwen38-parent --model-revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 --snapshot "%BONSAI_QWEN38_SNAPSHOT%" --model-path "%BONSAI_QWEN38_SNAPSHOT%" --runtime-sha "%GITHUB_SHA%" --cases "%BONSAI_CASES%,%QWEN38_ACCEPTANCE_CASES%" --preflight "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cpu-qwen38-parent-preflight.json" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cpu-qwen38-parent" || exit /b 1
-      - name: Run Candle CPU Bonsai row
-        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true && (steps.candle_cpu_bonsai_preflight.outcome == 'success')
-        continue-on-error: true
-        shell: cmd
-        run: |
-          set /p BINARY=<"%RUNNER_TEMP%\qwen38-bonsai-candle\binary.txt"
-          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py run --candle-device cpu --binary "%BINARY%" --test-name native_comparison --model-id candle-cpu-bonsai-gguf --model-key bonsai-gguf --language-variant ptq1 --vision-variant q8 --model-revision 6ed5e12bf84b7a63069882c91dd9e9218647d17b --snapshot "%BONSAI_GGUF_SNAPSHOT%" --model-path "%BONSAI_GGUF_SNAPSHOT%\Ternary-Bonsai-2-27B-PTQ1_0.gguf" --projector-path "%BONSAI_GGUF_SNAPSHOT%\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf" --runtime-sha "%GITHUB_SHA%" --cases "%BONSAI_CASES%,%BONSAI_ACCEPTANCE_CASES%" --preflight "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cpu-bonsai-gguf-preflight.json" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cpu-bonsai-gguf" || exit /b 1
-      - name: Run Candle CPU baseline row
-        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true && (steps.candle_cpu_baseline_preflight.outcome == 'success')
-        continue-on-error: true
-        shell: cmd
-        run: |
-          set /p BINARY=<"%RUNNER_TEMP%\qwen38-bonsai-candle\binary.txt"
-          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py run --candle-device cpu --binary "%BINARY%" --test-name native_comparison --model-id candle-cpu-qwen3vl-baseline --model-key bonsai-qwen3vl-baseline --model-revision 0c351dd01ed87e9c1b53cbc748cba10e6187ff3b --snapshot "%BONSAI_BASELINE_SNAPSHOT%" --model-path "%BONSAI_BASELINE_SNAPSHOT%" --runtime-sha "%GITHUB_SHA%" --cases "%BONSAI_CASES%" --preflight "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cpu-qwen3vl-baseline-preflight.json" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cpu-qwen3vl-baseline" || exit /b 1
       - name: Run Candle Bonsai safetensors format route
         if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true && (steps.candle_format_preflight.outputs.bonsai == 'true')
         continue-on-error: true
@@ -2095,31 +2089,224 @@ jobs:
         shell: cmd
         run: |
           if exist "%BONSAI_GPU_RESERVATION%" "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py release-gpu --gpu-index 0 --reservation "%BONSAI_GPU_RESERVATION%" --token "%BONSAI_RESERVATION_TOKEN%" || exit /b 1
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        if: always() && inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true
-        with:
-          name: qwen38-bonsai-mlx-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}\qwen38-bonsai-mlx
-      - name: Validate the required backend/device matrix
+      - name: Stage the eight CUDA cells without duplicate CPU preflights
         if: always() && inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true
         shell: cmd
         run: |
-          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py matrix-status --runtime-sha "%GITHUB_SHA%" --root "%RUNNER_TEMP%\qwen38-bonsai-mlx" --root "%RUNNER_TEMP%\qwen38-bonsai-candle" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\matrix-report.json" --markdown "%RUNNER_TEMP%\qwen38-bonsai-candle\matrix-report.md" --seal "%RUNNER_TEMP%\qwen38-bonsai-candle\matrix-seal.json"
-          set "STATUS=%ERRORLEVEL%"
-          type "%RUNNER_TEMP%\qwen38-bonsai-candle\matrix-report.md"
-          if not "%STATUS%"=="0" exit /b %STATUS%
-          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py verify-matrix-seal --runtime-sha "%GITHUB_SHA%" --root "%RUNNER_TEMP%\qwen38-bonsai-mlx" --root "%RUNNER_TEMP%\qwen38-bonsai-candle" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\matrix-report.json" --markdown "%RUNNER_TEMP%\qwen38-bonsai-candle\matrix-report.md" --seal "%RUNNER_TEMP%\qwen38-bonsai-candle\matrix-seal.json" || exit /b 1
-          exit /b %STATUS%
-      - name: Upload Candle qualification or terminal evidence
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_artifacts.py stage-cuda --source "%RUNNER_TEMP%\qwen38-bonsai-candle" --output "%RUNNER_TEMP%\qwen38-bonsai-cuda-%GITHUB_RUN_ID%-%GITHUB_RUN_ATTEMPT%" --runtime-sha "%GITHUB_SHA%" || exit /b 1
+      - name: Upload immutable Candle CUDA row evidence
+        if: always() && inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qwen38-bonsai-cuda-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}\qwen38-bonsai-cuda-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 30
+      - name: Require all eight sealed Candle CUDA rows
+        if: inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true
+        shell: cmd
+        run: |
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_artifacts.py check-partition --role cuda --root "%RUNNER_TEMP%\qwen38-bonsai-cuda-%GITHUB_RUN_ID%-%GITHUB_RUN_ATTEMPT%" --runtime-sha "%GITHUB_SHA%" || exit /b 1
+      - name: Upload Candle preflight or provision qualification
+        if: always() && (inputs.qwen38_bonsai_preflight_only == true || inputs.qwen38_bonsai_provision_only == true)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qwen38-bonsai-candle-qualification-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}\qwen38-bonsai-candle
+          if-no-files-found: error
+          retention-days: 30
+
+  qwen38-bonsai-candle-cpu:
+    name: Qwen3.8/Bonsai Candle CPU row (${{ matrix.cell }})
+    if: ${{ !cancelled() && needs.qwen38-bonsai-candle.result == 'success' && github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen38-bonsai' && inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true }}
+    needs: qwen38-bonsai-candle
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - cell: candle-cpu-qwen38-parent
+            model_key: bonsai-qwen38-parent
+            revision: 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
+            load_profile: candle-dense-cpu
+          - cell: candle-cpu-bonsai-gguf
+            model_key: bonsai-gguf
+            revision: 6ed5e12bf84b7a63069882c91dd9e9218647d17b
+            load_profile: candle-packed-cpu
+          - cell: candle-cpu-qwen3vl-baseline
+            model_key: bonsai-qwen3vl-baseline
+            revision: 0c351dd01ed87e9c1b53cbc748cba10e6187ff3b
+            load_profile: candle-dense-cpu
+    env:
+      BONSAI_QWEN38_SNAPSHOT: ${{ vars.CANDLE_BONSAI_QWEN38_SNAPSHOT }}
+      BONSAI_GGUF_SNAPSHOT: ${{ vars.CANDLE_BONSAI_GGUF_SNAPSHOT }}
+      BONSAI_BASELINE_SNAPSHOT: ${{ vars.CANDLE_BONSAI_BASELINE_SNAPSHOT }}
+      BONSAI_CASES: arithmetic,logic,ordering,code,json,tool,multi_turn,image,multi_image,video_forward,video_reverse,context_64,context_512,context_2048
+      QWEN38_ACCEPTANCE_CASES: reasoning_low,reasoning_medium,reasoning_xhigh,preserve_thinking,tool_roundtrip,json_thinking,mtp_greedy,mtp_json,mtp_image,mtp_video
+      BONSAI_ACCEPTANCE_CASES: reasoning_low,reasoning_medium,reasoning_xhigh,preserve_thinking,tool_roundtrip,json_thinking
+      CARGO_BUILD_JOBS: "12"
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
+      - name: Initialize one fresh CPU evidence root and capture hardware
+        shell: cmd
+        run: |
+          set "CPU_ROOT=%RUNNER_TEMP%\qwen38-bonsai-${{ matrix.cell }}-%GITHUB_RUN_ID%-%GITHUB_RUN_ATTEMPT%"
+          if exist "%CPU_ROOT%" exit /b 1
+          mkdir "%CPU_ROOT%" || exit /b 1
+          echo CPU_ROOT=%CPU_ROOT%>>"%GITHUB_ENV%"
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py hardware --output "%CPU_ROOT%\hardware-before.json" || exit /b 1
+      - name: Select exact same-run publisher artifact ID
+        id: publisher
+        shell: cmd
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_artifacts.py select --role publisher --runtime-sha "%GITHUB_SHA%" --run-id "%GITHUB_RUN_ID%" --repository "%GITHUB_REPOSITORY%" --api-url "%GITHUB_API_URL%" --output "%CPU_ROOT%\publisher-selection.json" --github-output "%GITHUB_OUTPUT%" || exit /b 1
+      - name: Download the pinned publisher artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ steps.publisher.outputs.artifact_ids }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}\qwen38-bonsai-publisher-${{ matrix.cell }}-${{ github.run_id }}-${{ github.run_attempt }}
+          merge-multiple: true
+      - name: Bind publisher verification to this physical CPU host
+        shell: cmd
+        run: |
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_artifacts.py prepare-cpu --publisher "%RUNNER_TEMP%\qwen38-bonsai-publisher-${{ matrix.cell }}-%GITHUB_RUN_ID%-%GITHUB_RUN_ATTEMPT%" --output "%CPU_ROOT%" --runtime-sha "%GITHUB_SHA%" || exit /b 1
+      - name: Preflight exact CPU row before model load
+        shell: powershell
+        run: |
+          $root = $env:CPU_ROOT
+          $cell = '${{ matrix.cell }}'
+          $arguments = @('preflight', '--model-key', '${{ matrix.model_key }}', '--load-profile', '${{ matrix.load_profile }}', '--output', (Join-Path $root "$cell-preflight.json"))
+          if ($cell -eq 'candle-cpu-bonsai-gguf') { $arguments += @('--language-variant', 'ptq1', '--vision-variant', 'q8') }
+          & $env:REVIEWED_PYTHON scripts/release/qwen38_bonsai_terminal.py @arguments
+          if ($LASTEXITCODE -ne 0) { throw 'exact CPU row preflight was not admitted' }
+      - name: Build the exact-source Candle comparison executable
+        shell: cmd
+        run: |
+          call "%VCVARS%" || exit /b 1
+          cargo test --locked --release -p candle-llm --features cuda --test qwen38_bonsai --no-run --message-format=json > "%CPU_ROOT%\build.jsonl" 2> "%CPU_ROOT%\build.stderr" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py resolve-binary --target qwen38_bonsai < "%CPU_ROOT%\build.jsonl" > "%CPU_ROOT%\binary.txt" || exit /b 1
+      - name: Run the complete frozen CPU row
+        continue-on-error: true
+        shell: powershell
+        run: |
+          $cell = '${{ matrix.cell }}'
+          $root = $env:CPU_ROOT
+          $binary = (Get-Content -LiteralPath (Join-Path $root 'binary.txt') -Raw).Trim()
+          $cases = $env:BONSAI_CASES
+          $variants = @()
+          $projector = @()
+          switch ($cell) {
+            'candle-cpu-qwen38-parent' {
+              $snapshot = $env:BONSAI_QWEN38_SNAPSHOT
+              $model = $snapshot
+              $cases += ",$env:QWEN38_ACCEPTANCE_CASES"
+            }
+            'candle-cpu-bonsai-gguf' {
+              $snapshot = $env:BONSAI_GGUF_SNAPSHOT
+              $model = Join-Path $snapshot 'Ternary-Bonsai-2-27B-PTQ1_0.gguf'
+              $projector = @('--projector-path', (Join-Path $snapshot 'Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf'))
+              $variants = @('--language-variant', 'ptq1', '--vision-variant', 'q8')
+              $cases += ",$env:BONSAI_ACCEPTANCE_CASES"
+            }
+            'candle-cpu-qwen3vl-baseline' {
+              $snapshot = $env:BONSAI_BASELINE_SNAPSHOT
+              $model = $snapshot
+            }
+            default { throw 'unknown frozen CPU cell' }
+          }
+          $rowArguments = @('run', '--candle-device', 'cpu', '--binary', $binary, '--test-name', 'native_comparison', '--model-id', $cell, '--model-key', '${{ matrix.model_key }}', '--model-revision', '${{ matrix.revision }}', '--snapshot', $snapshot, '--model-path', $model, '--runtime-sha', $env:GITHUB_SHA, '--cases', $cases, '--preflight', (Join-Path $root "$cell-preflight.json"), '--output', (Join-Path $root $cell))
+          $rowArguments += $variants + $projector
+          & $env:REVIEWED_PYTHON scripts/release/qwen38_bonsai_terminal.py @rowArguments
+          if ($LASTEXITCODE -ne 0) { throw "CPU row $cell failed; sealed partial evidence will be uploaded" }
+      - name: Upload immutable CPU row evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qwen38-bonsai-${{ matrix.cell }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.CPU_ROOT }}
+          if-no-files-found: error
+          retention-days: 30
+      - name: Require the complete sealed CPU row
+        if: always()
+        shell: cmd
+        run: |
+          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_artifacts.py check-partition --role cpu --root "%CPU_ROOT%" --cell "${{ matrix.cell }}" --runtime-sha "%GITHUB_SHA%" || exit /b 1
+
+  qwen38-bonsai-aggregate:
+    name: Qwen3.8/Bonsai exact 19-cell artifact seal
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen38-bonsai' && inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true }}
+    needs: [qwen38-bonsai-mlx, qwen38-bonsai-candle, qwen38-bonsai-candle-cpu]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed Python 3.12
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config
+          PYTHON="$(uv python find 3.12.10 --managed-python --no-project --no-config)"
+          "$PYTHON" -c 'import sys; assert sys.version_info[:3] == (3, 12, 10)'
+          echo "REVIEWED_PYTHON=$PYTHON" >> "$GITHUB_ENV"
+      - name: Require all three execution partitions to succeed
+        run: |
+          test '${{ needs.qwen38-bonsai-mlx.result }}' = success
+          test '${{ needs.qwen38-bonsai-candle.result }}' = success
+          test '${{ needs.qwen38-bonsai-candle-cpu.result }}' = success
+      - name: Select exact immutable artifact IDs across run attempts
+        id: selected
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/qwen38-bonsai-aggregate"
+          "$REVIEWED_PYTHON" scripts/release/qwen38_bonsai_artifacts.py select --role matrix --runtime-sha "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" --repository "$GITHUB_REPOSITORY" --api-url "$GITHUB_API_URL" --output "$RUNNER_TEMP/qwen38-bonsai-aggregate/selected-artifacts.json" --github-output "$GITHUB_OUTPUT"
+      - name: Download only the selected artifact IDs without merging roots
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ steps.selected.outputs.artifact_ids }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/qwen38-bonsai-aggregate/downloads
+          merge-multiple: false
+      - name: Validate exact source, physical Windows host, all cases and aggregate seal
+        run: |
+          "$REVIEWED_PYTHON" scripts/release/qwen38_bonsai_artifacts.py aggregate --downloads "$RUNNER_TEMP/qwen38-bonsai-aggregate/downloads" --selection "$RUNNER_TEMP/qwen38-bonsai-aggregate/selected-artifacts.json" --output "$RUNNER_TEMP/qwen38-bonsai-aggregate/reports" --runtime-sha "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID"
+          cat "$RUNNER_TEMP/qwen38-bonsai-aggregate/reports/matrix-report.md"
+      - name: Upload the selected roots and sealed terminal report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: qwen38-bonsai-terminal-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/qwen38-bonsai-aggregate
           if-no-files-found: error
           retention-days: 30
-          path: |
-            ${{ runner.temp }}\qwen38-bonsai-mlx
-            ${{ runner.temp }}\qwen38-bonsai-candle
 
   mlx-llm:
     name: MLX LLM real weights

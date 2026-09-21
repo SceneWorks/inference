@@ -2090,8 +2090,7 @@ def matrix_status(args: argparse.Namespace) -> int:
     hardware_paths = [root / "hardware-before.json" for root in roots]
     if any(not path.is_file() for path in hardware_paths):
         raise ValueError("every evidence root requires hardware-before.json")
-    for path in hardware_paths:
-        validate_hardware_record(path)
+    hardware_records = [validate_hardware_record(path) for path in hardware_paths]
     rows = []
     complete_runs: dict[str, list[Path]] = {group: [] for group in groups}
     acceptance_rows: list[dict[str, Any]] = []
@@ -2112,6 +2111,8 @@ def matrix_status(args: argparse.Namespace) -> int:
                 or metadata.get("publisher_closure_sha256") != sha256(assets.DEFAULT_CLOSURE)
             ):
                 raise ValueError("platform snapshot metadata is incomplete or malformed")
+            if metadata.get("hostname") != hardware_records[index]["host"].get("hostname"):
+                raise ValueError("publisher verification and row hardware name different hosts")
             provision_path = root / "provision-report.json"
             provision = json.loads(provision_path.read_text(encoding="utf-8"))
             if (provision.get("complete") is not True or provision.get("runtime_sha") != expected_runtime_sha
@@ -2119,6 +2120,16 @@ def matrix_status(args: argparse.Namespace) -> int:
                 or provision.get("model_execution_performed") is not False):
                 raise ValueError("platform publisher verification is incomplete or unbound")
             sealed_files.extend(((index, metadata_path), (index, provision_path)))
+        candle_hosts = {
+            physical_windows_host_identity(hardware_records[index])
+            for index, root in enumerate(roots)
+            if any(
+                (root / f"{cell['id']}-preflight.json").is_file()
+                for cell in cells if cell["backend"] == "candle"
+            )
+        }
+        if len(candle_hosts) != 1:
+            raise ValueError("Candle evidence roots are not one physical Windows host")
     cuda_reservation_hashes: set[str] = set()
     for cell in cells:
         cell_id = cell["id"]
@@ -2369,7 +2380,10 @@ def matrix_status(args: argparse.Namespace) -> int:
                     "sha256": sha256(path),
                 }
             )
-        for role, path in (("matrix_report", args.output), ("matrix_markdown", args.markdown)):
+        aggregate_files = [("matrix_report", args.output), ("matrix_markdown", args.markdown)]
+        if getattr(args, "artifact_selection", None) is not None:
+            aggregate_files.append(("artifact_selection", args.artifact_selection))
+        for role, path in aggregate_files:
             entries.append(
                 {
                     "role": role,
@@ -2462,7 +2476,10 @@ def verify_matrix_seal(args: argparse.Namespace) -> int:
     ):
         raise ValueError("matrix seal does not cover the exact required evidence set")
     roles = [entry.get("role") for entry in entries if "root_index" not in entry]
-    if sorted(roles) != ["matrix_markdown", "matrix_report"]:
+    expected_roles = ["matrix_markdown", "matrix_report"]
+    if getattr(args, "artifact_selection", None) is not None:
+        expected_roles.append("artifact_selection")
+    if sorted(roles) != sorted(expected_roles):
         raise ValueError("matrix seal does not cover the exact aggregate reports")
     for entry in entries:
         if "root_index" in entry:
@@ -2474,6 +2491,7 @@ def verify_matrix_seal(args: argparse.Namespace) -> int:
             role_paths = {
                 "matrix_report": args.output,
                 "matrix_markdown": args.markdown,
+                "artifact_selection": getattr(args, "artifact_selection", None),
             }
             path = role_paths.get(entry.get("role"))
             if path is None or path.name != entry.get("path"):
@@ -2596,6 +2614,7 @@ def hardware(args: argparse.Namespace) -> int:
             "schema_version": 1,
             "captured_unix_seconds": time.time(),
             "host": {
+                "hostname": platform.node(),
                 "system": platform.system(),
                 "release": platform.release(),
                 "machine": platform.machine(),
@@ -2856,6 +2875,24 @@ def validate_hardware_record(path: Path) -> dict[str, Any]:
     return record
 
 
+def physical_windows_host_identity(record: dict[str, Any]) -> tuple[str, str, str, int, str]:
+    host = record.get("host", {})
+    gpus = record.get("gpus", [])
+    gpu0 = [gpu for gpu in gpus if gpu.get("index") == CUDA_DEVICE_INDEX]
+    identity = (
+        host.get("hostname"), host.get("system"), host.get("machine"),
+        host.get("physical_memory_bytes"), gpu0[0].get("uuid") if len(gpu0) == 1 else None,
+    )
+    if (
+        not all(isinstance(part, str) and part for part in identity[:3])
+        or identity[1] != "Windows"
+        or type(identity[3]) is not int or identity[3] <= 0
+        or not isinstance(identity[4], str) or not identity[4]
+    ):
+        raise ValueError("Candle root lacks exact physical Windows host identity")
+    return identity
+
+
 def parser() -> argparse.ArgumentParser:
     out = argparse.ArgumentParser()
     sub = out.add_subparsers(dest="command", required=True)
@@ -2891,6 +2928,7 @@ def parser() -> argparse.ArgumentParser:
     val.set_defaults(func=validate)
     matrix = sub.add_parser("matrix-status")
     matrix.add_argument("--root", type=Path, action="append", required=True)
+    matrix.add_argument("--artifact-selection", type=Path)
     matrix.add_argument(
         "--matrix", type=Path, default=Path("release/qwen38-bonsai-matrix.json")
     )
@@ -2902,6 +2940,7 @@ def parser() -> argparse.ArgumentParser:
     matrix.set_defaults(func=matrix_status)
     verify = sub.add_parser("verify-matrix-seal")
     verify.add_argument("--root", type=Path, action="append", required=True)
+    verify.add_argument("--artifact-selection", type=Path)
     verify.add_argument(
         "--matrix", type=Path, default=Path("release/qwen38-bonsai-matrix.json")
     )

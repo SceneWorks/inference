@@ -1255,6 +1255,21 @@ Pages purgeable:                             1000.
             seal=args.seal,
         )
         self.assertEqual(terminal.verify_matrix_seal(verify), 0)
+        selection = self.root / "selected-artifacts.json"
+        terminal.write_new(selection, {"runtime_sha": self.runtime_sha, "artifact_ids": [11, 12]})
+        selected_args = argparse.Namespace(
+            root=[self.root], matrix=matrix, manifest=manifest,
+            runtime_sha=self.runtime_sha,
+            output=self.root / "selected-matrix-report.json",
+            markdown=self.root / "selected-matrix-report.md",
+            seal=self.root / "selected-matrix-seal.json",
+            artifact_selection=selection,
+        )
+        self.assertEqual(terminal.matrix_status(selected_args), 0)
+        self.assertEqual(terminal.verify_matrix_seal(selected_args), 0)
+        selection.write_text('{"artifact_ids": [99]}\n', encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "matrix seal artifact mismatch"):
+            terminal.verify_matrix_seal(selected_args)
         sealed = json.loads(args.seal.read_text(encoding="utf-8"))
         omitted = sealed["files"].pop(0)
         args.seal.write_text(json.dumps(sealed), encoding="utf-8")
