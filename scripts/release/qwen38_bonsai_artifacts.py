@@ -213,9 +213,6 @@ def check_partition(args: argparse.Namespace) -> int:
             or receipt_model.get("id") != cell_id
             or receipt_model.get("manifest_key") != cell["model_key"]
             or receipt_model.get("revision") != model["revision"]
-            or receipt_model.get("artifact_sizes") != terminal.pinned_admission_sizes(
-                model, cell.get("language_variant"), cell.get("vision_variant")
-            )
             or receipt_model.get("language_variant") != cell.get("language_variant")
             or receipt_model.get("vision_variant") != cell.get("vision_variant")
             or receipt.get("command", {}).get("load_profile") != cell["load_profile"]
@@ -224,6 +221,11 @@ def check_partition(args: argparse.Namespace) -> int:
             or [row.get("case_id") for row in provider["cases"]] != expected_cases
         ):
             raise ValueError(f"{cell_id} source, model, preflight, or full case list differs from matrix")
+        terminal.validate_artifact_size_evidence(
+            receipt_model,
+            terminal.pinned_admission_sizes(
+                model, cell.get("language_variant"), cell.get("vision_variant")),
+        )
         if cell["device"] == "cuda":
             reservation = json.loads((args.root / "gpu-reservation.json").read_text(encoding="utf-8"))
             recheck = receipt.get("gpu", {}).get("admission_recheck") or {}

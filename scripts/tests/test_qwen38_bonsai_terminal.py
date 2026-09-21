@@ -317,7 +317,7 @@ class TerminalEvidenceTests(unittest.TestCase):
                 "revision": revision,
                 "language_variant": None,
                 "vision_variant": None,
-                "selected_model_artifact": {"sha256": "d" * 64},
+                "selected_model_artifact": {"kind": "file", "sha256": "d" * 64},
                 "selected_projector_artifact": {"sha256": "e" * 64},
                 "inventory_before": inventory,
                 "inventory_after": inventory,
@@ -908,9 +908,53 @@ class TerminalEvidenceTests(unittest.TestCase):
             handle.write(struct.pack("<Q", len(encoded)))
             handle.write(encoded)
             handle.write(bytes(20))
-        sizes = terminal.artifact_sizes(model, None)
+        (model / "tokenizer.json").write_bytes(b"tokens")
+        # Snapshot inventory excludes materialization/cache markers from evidence.
+        (model / ".cache").mkdir()
+        (model / ".cache" / "metadata.json").write_bytes(b"ignored")
+        sizes = terminal.artifact_sizes(model, None, {"files": [
+            {"path": "model.safetensors", "size": (model / "model.safetensors").stat().st_size},
+            {"path": "tokenizer.json", "size": 6},
+        ]})
         self.assertEqual(sizes["language_weight_bytes"], 8)
         self.assertEqual(sizes["vision_weight_bytes"], 12)
+        self.assertEqual(sizes["auxiliary_bytes"], 6)
+
+    def test_auxiliary_evidence_uses_snapshot_inventory_not_admission_zero(self) -> None:
+        files = [
+            {"path": "model.safetensors", "size": 128, "sha256": "a" * 64},
+            {"path": "tokenizer.json", "size": 17, "sha256": "b" * 64},
+            {"path": "nested/config.json", "size": 5, "sha256": "c" * 64},
+        ]
+        projection = [{key: item[key] for key in ("path", "size", "sha256")} for item in files]
+        digest = terminal.hashlib.sha256(
+            json.dumps(projection, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        model = {
+            "selected_model_artifact": {"kind": "snapshot", "sha256": digest},
+            "inventory_before": {"inventory_sha256": digest, "files": files},
+            "inventory_after": {"inventory_sha256": digest, "files": files},
+            "artifact_sizes": {
+                "language_weight_bytes": 100,
+                "vision_weight_bytes": 20,
+                "auxiliary_bytes": 22,
+            },
+        }
+        pinned = {"language_weight_bytes": 100, "vision_weight_bytes": 20, "auxiliary_bytes": 0}
+        terminal.validate_artifact_size_evidence(model, pinned)
+        for auxiliary in (0, 21, 23):
+            with self.subTest(auxiliary=auxiliary):
+                model["artifact_sizes"]["auxiliary_bytes"] = auxiliary
+                with self.assertRaisesRegex(ValueError, "auxiliary bytes"):
+                    terminal.validate_artifact_size_evidence(model, pinned)
+        model["artifact_sizes"]["auxiliary_bytes"] = 22
+        model["artifact_sizes"]["language_weight_bytes"] = 99
+        with self.assertRaisesRegex(ValueError, "weight bytes"):
+            terminal.validate_artifact_size_evidence(model, pinned)
+        model["artifact_sizes"]["language_weight_bytes"] = 100
+        model["inventory_before"]["files"][1]["size"] = 18
+        with self.assertRaisesRegex(ValueError, "inventory identity"):
+            terminal.validate_artifact_size_evidence(model, pinned)
 
     def test_selected_hf_symlink_keeps_snapshot_filename_and_inventory_identity(self) -> None:
         snapshot = self.root / "snapshot"
@@ -1541,6 +1585,32 @@ Pages purgeable:                             1000.
             seal=self.root / f"{label}-seal.json",
         )
         return args, preflight, run
+
+    def test_matrix_accepts_inventoried_auxiliary_and_rejects_undercount(self) -> None:
+        for label, measured, accepted in (("aux-exact", 22, True), ("aux-undercount", 0, False)):
+            with self.subTest(label=label):
+                args, _, run = self.make_single_matrix(label)
+                receipt_path = run / "receipt.json"
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                files = [
+                    {"path": "model.safetensors", "size": 128, "sha256": "a" * 64},
+                    {"path": "tokenizer.json", "size": 22, "sha256": "b" * 64},
+                ]
+                digest = terminal.hashlib.sha256(
+                    json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+                receipt["model"]["selected_model_artifact"] = {"kind": "snapshot", "sha256": digest}
+                inventory = {"inventory_sha256": digest, "files": files}
+                receipt["model"]["inventory_before"] = inventory
+                receipt["model"]["inventory_after"] = inventory
+                receipt["model"]["artifact_sizes"]["auxiliary_bytes"] = measured
+                receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+                self.reseal_run(run)
+                self.assertEqual(terminal.matrix_status(args), 0 if accepted else 1)
+                report = json.loads(args.output.read_text(encoding="utf-8"))
+                self.assertEqual(report["evidence_complete"], accepted)
+                if not accepted:
+                    self.assertIn("auxiliary bytes", report["required_cells"][0]["reason"])
 
     def test_matrix_rejects_stale_revision_wrong_device_backend_and_preflight(self) -> None:
         def mutate_backend(provider: dict) -> None:
