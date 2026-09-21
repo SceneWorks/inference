@@ -1,1151 +1,344 @@
-name: CI
+# NEVER MERGE: SC-23935 bounded Windows CPU parent and CUDA Bonsai diagnostic.
+# This temporarily replaces CI because GitHub cannot dispatch a newly added workflow from a
+# non-default branch. It has no automatic trigger and must be deleted with this branch.
+name: SC-23935 CPU parent and CUDA Bonsai probe (NEVER MERGE)
 
 on:
-  # `branches: [main]` is load-bearing. The merge queue was removed from ruleset 20481541 on
-  # 2026-08-11, so no event tests the commit that actually lands: a merge commit is a new SHA
-  # that no `pull_request` run ever saw. The ruleset still requires the `CI gate` context on
-  # main, which leaves this post-merge run as the only thing that can produce it — without it
-  # main carries zero check-runs and the required context is unproducible (sc-18825). This was
-  # dropped in e1032710 when the queue was introduced; the queue outlived it by six days. Tags
-  # keep their own trigger: release lanes are driven by `refs/tags/runtime-*`. The now-dead
-  # `merge_group:` trigger below is retained deliberately so re-enabling a queue stays a
-  # ruleset-only change.
-  push:
-    branches: [main]
-    tags: ["runtime-*"]
-  pull_request:
-  # A merge queue tests a speculative merge on a `gh-readonly-queue/main/**` ref. Without this
-  # trigger no run is ever created for that ref, the required checks stay pending, and every
-  # queued PR is evicted when `check_response_timeout_minutes` expires. Landing the trigger
-  # before any ruleset enables a queue keeps the checks reachable from the first enqueue
-  # (sc-17780; the sibling SceneWorks change is sc-17773).
-  merge_group:
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# Cancel superseded PR runs, but never cancel a queue entry or a release tag.
-#
-# The history this encodes predates the merge queue, when main carried its own push trigger:
-# github.ref was refs/heads/main for every merge, so a shared main group meant each merge
-# cancelled the previous merge's in-flight run — 24 of 60 main runs cancelled over the sampled
-# window, i.e. 40% of main commits carried no verdict at all (sc-12399, filed against the
-# sibling SceneWorks lane — same root cause here). That mattered most for windows-cuda-check
-# and the macOS lanes: platform targets are mutually exclusive, so each lane is the ONLY thing
-# compiling its cfg, and a killed run misattributes the break to the next commit and makes
-# bisect over main useless.
-#
-# Keying on github.sha rather than relying on cancel-in-progress alone is what fixed it, and it
-# is what makes the restored main trigger safe (sc-18825): GitHub allows at most ONE pending
-# run per concurrency group and evicts it when a newer run queues, so a shared group drops the
-# middle entry of a 3+ burst even with cancel-in-progress off. Per-SHA groups cannot evict
-# each other; runs serialize on the runner instead. Tag builds likewise never cancel (tags are
-# immutable — see CONTRIBUTING). Do NOT collapse this back to `group: ...${{ github.ref }}`.
-#
-# merge_group deliberately lands in the github.sha branch too. Each speculative merge is a
-# distinct commit, so per-SHA groups let concurrently-built queue entries run side by side
-# rather than evicting one another — grouping them by ref would serialize the queue down to
-# one entry and guarantee `check_response_timeout_minutes` evictions. GitHub cancels the run
-# itself when it dissolves a merge group, so nothing here needs to.
 concurrency:
-  group: inference-ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: sc23935-cpu-bonsai-probe
+  cancel-in-progress: false
 
 jobs:
-  changes:
-    name: select affected lanes
-    runs-on: ubuntu-latest
-    outputs:
-      workspace: ${{ steps.select.outputs.workspace }}
-      contracts: ${{ steps.select.outputs.contracts }}
-      candle_cpu: ${{ steps.select.outputs.candle_cpu }}
-      macos_metal: ${{ steps.select.outputs.macos_metal }}
-      windows_cuda: ${{ steps.select.outputs.windows_cuda }}
-      docs: ${{ steps.select.outputs.docs }}
-      release: ${{ steps.select.outputs.release }}
-      # Informational only: ordinary CI has no job that consumes this output because privileged
-      # real-weight runners remain dispatch/schedule-only in real-weights.yml.
-      real_weights: ${{ steps.select.outputs.real_weights }}
+  cpu-parent-and-cuda-bonsai:
+    name: Frozen CPU parent arithmetic and CUDA Bonsai eight-case probe
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 165
+    env:
+      BONSAI_QWEN38_SNAPSHOT: ${{ vars.CANDLE_BONSAI_QWEN38_SNAPSHOT }}
+      BONSAI_GGUF_SNAPSHOT: ${{ vars.CANDLE_BONSAI_GGUF_SNAPSHOT }}
+      CARGO_BUILD_JOBS: "12"
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+      CUDA_VISIBLE_DEVICES: "0"
+      EXPECTED_GPU_UUID: "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0"
+      RUST_BACKTRACE: "full"
+      RUST_TEST_THREADS: "1"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        timeout-minutes: 5
         with:
           fetch-depth: 0
-      # Feature-epic refs form a protected branch train. Keep this in `changes`, which is
-      # unconditional for every CI event and is itself required by the aggregate `CI gate`.
-      # A path-gated lane would let a docs-only topology violation merge without a verdict.
-      - name: Enforce feature-epic pull-request topology
-        run: python3 scripts/ci/feature_epic_policy.py
-      # Every BASE_SHA below must name `github.event.merge_group.base_sha`. A merge_group event
-      # carries NEITHER `pull_request.base.sha` NOR `before`, and the two consumers fail in
-      # opposite directions on an empty base: select_lanes.py hard-errors (visible), while
-      # check-review-findings.py degrades to `base_registry_text = None` and skips the
-      # append-only comparison while still reporting success (invisible). `github.sha` is
-      # already correct as HEAD for a merge group — it is the group's last commit — and
-      # base_sha is an ancestor of it, which the fetch-depth: 0 checkout above guarantees is
-      # present for the `git diff`.
-      - name: Validate append-only code-review finding allocations
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
-        run: python3 scripts/check-review-findings.py --base "$BASE_SHA"
-      - name: Expand changed paths through workspace dependencies
-        id: select
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          REF_TYPE: ${{ github.ref_type }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
-          HEAD_SHA: ${{ github.sha }}
-        run: |
-          if [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then
-            python3 scripts/ci/select_lanes.py --all --github-output "$GITHUB_OUTPUT"
-          else
-            python3 scripts/ci/select_lanes.py --base "$BASE_SHA" --head "$HEAD_SHA" --github-output "$GITHUB_OUTPUT"
-          fi
-      - name: Report privileged real-weight impact
-        run: |
-          {
-            echo "### Real-weight impact"
-            echo "- Selected by changed paths: \`${{ steps.select.outputs.real_weights }}\`"
-            echo "- Informational only: ordinary CI cannot launch privileged real-weight runners."
-            echo "- Use the scheduled or operator-dispatched \`real-weights.yml\` workflow for execution."
-          } >> "$GITHUB_STEP_SUMMARY"
 
-  # Whole-workspace manifest resolution. Deliberately NOT gated by `changes`: path-based
-  # lane selection never resolves the full member graph, so a manifest that any single lane
-  # would tolerate can still break `cargo metadata` for the workspace and reach main. A
-  # byte-identical duplicate `[dev-dependencies]` key in candle-gen-ideogram did exactly
-  # that — TOML forbids duplicate keys, so `cargo metadata`, `cargo tree`, and `cargo fmt
-  # --all` all failed hard on main until it was found by hand. `--no-deps` keeps this to a
-  # fast manifest parse (no dependency resolution, no compile).
-  resolve:
-    name: workspace manifest resolution
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Install pinned Rust toolchain
-        run: rustup show
-      - name: Resolve the full workspace manifest graph
-        run: cargo metadata --locked --no-deps --format-version 1 > /dev/null
+      - name: Initialize evidence and select Git Bash
+        timeout-minutes: 2
+        shell: powershell
+        run: |
+          $evidenceRoot = Join-Path $env:RUNNER_TEMP "sc23935-cpu-bonsai-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if (Test-Path -LiteralPath $evidenceRoot) { throw 'diagnostic evidence root already exists' }
+          New-Item -ItemType Directory -Path $evidenceRoot | Out-Null
+          [ordered]@{
+            schema_version = 1
+            github_sha = $env:GITHUB_SHA
+            run_id = $env:GITHUB_RUN_ID
+            run_attempt = $env:GITHUB_RUN_ATTEMPT
+            initialized_utc = [DateTime]::UtcNow.ToString('o')
+            scope = 'NEVER MERGE bounded diagnosis; full 19-cell campaign remains required'
+          } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $evidenceRoot 'initialization.json') -Encoding utf8
+          $reservation = Join-Path $env:LOCALAPPDATA 'SceneWorks\inference-reservations\cuda-device-0.json'
+          $token = "sc23935-cpu-bonsai-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          "SC23935_EVIDENCE_ROOT=$evidenceRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SC23935_GPU_RESERVATION=$reservation" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SC23935_RESERVATION_TOKEN=$token" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $gitBash = 'C:\Program Files\Git\bin\bash.exe'
+          if (-not (Test-Path -LiteralPath $gitBash -PathType Leaf)) {
+            throw "required Git Bash is missing: $gitBash"
+          }
+          'C:\Program Files\Git\bin' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-  # Whole-workspace formatting gate. Runs the pinned rustfmt across every member so drift
-  # cannot re-accumulate anywhere. This was scoped to gen-core only (in the `contracts` job)
-  # because the imported mlx-llm / candle-llm / mlx-gen / candle-gen trees had drifted from
-  # the pinned rustfmt; they were normalized in a dedicated format-only baseline commit
-  # (sc-13275), which is exactly the precondition the old `contracts` note called for. Data
-  # tables that are hand-formatted on purpose (e.g. the GGUF IQ grids) carry `#[rustfmt::skip]`
-  # so `--all` leaves them intact. Deliberately NOT gated by `changes` (like `resolve`):
-  # formatting can drift in any .rs file. `cargo fmt --all` also invokes `cargo metadata`, so
-  # this doubles as a second resolution tripwire — no compile, so it stays fast.
-  format:
-    name: workspace formatting
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Install pinned Rust toolchain
-        run: |
-          rustup show
-          rustup component add rustfmt
-      - name: Check whole-workspace formatting
-        run: cargo fmt --all --check
-
-  workspace:
-    name: workspace graph invariants
-    needs: changes
-    if: needs.changes.outputs.workspace == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Install pinned Rust toolchain
-        run: rustup show
-      # SAVE ONLY ON `main`. This is the canonical note; every other cache step in this file that
-      # runs on pull requests carries the same input and points here. The manual lanes deliberately
-      # do not — see `macos-nax` and `windows-cuda`.
-      #
-      # GitHub scopes an Actions cache to the ref that wrote it: a `refs/pull/N/merge` entry is
-      # readable only from inside PR N, while a `refs/heads/main` entry is readable from every
-      # branch and every PR. Left at the default (`save-if: true`) each PR job writes its own copy,
-      # so the repo accumulates one cache per lane per open PR and almost nothing another PR can
-      # use. Measured 2026-08-15, before this change: 12 of 13 caches were PR-scoped and exactly one
-      # sat on main (`macos-metal`), against a 16 GB ceiling the repo was filling to ~11 GB.
-      #
-      # The failure is a RATCHET, not a steady state. Eviction is LRU and fires on the PEAK, so a
-      # burst of concurrent PRs pushes the repo over the ceiling and drops the least-recently-read
-      # entries. A main baseline that PRs still read has its access time refreshed and survives —
-      # which is exactly why `macos-metal`'s survived and nothing else did. One that gets dropped
-      # can never come back, because refreshing it requires a read and the entry is gone; it stays
-      # dead until the next successful push to main, and those are days apart here. Main's
-      # `candle-cpu` baseline was full-matched at 2026-08-14T23:33 and gone by the next morning,
-      # after which every PR rebuilt the whole candle dependency graph inside its test step: the
-      # run at 2026-08-15T10:20 logged "No cache found", then spent ~18 of that step's 20 minutes
-      # compiling `candle-core` and its dependents.
-      #
-      # Restricting saves to main keeps exactly one baseline per lane, which is the only kind a PR
-      # can read anyway. A PR whose Cargo.lock differs from main's gets rust-cache's prefix restore
-      # instead of a full match: partial, and far better than cold.
-      - name: Cache Cargo graph
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Validate normalized workspace
-        run: ./scripts/check-workspace.py
-      # sc-19556. A RATCHET against scripts/clock_assertions_baseline.txt, not a zero-gate: the
-      # residual clock-bound assertions are real and tracked, and a gate demanding zero would be
-      # switched off within a week. This reds only when a file's count RISES or a newly flagged
-      # file appears — i.e. when a PR adds an assertion whose truth depends on how busy the runner
-      # was. `workspace` is the right lane because select_lanes.py never skips it, so the ratchet
-      # sees every PR regardless of which crates it touched.
-      - name: Ratchet wall-clock-dependent assertions
-        run: python3 scripts/check_clock_assertions.py --check-baseline .
-      # Installed BEFORE the tooling tests, not after: `test_mmaudio_reference.py` regenerates the
-      # MMAudio parity fixtures' deterministic inputs (a 28 MP synthetic clip) and compares digests,
-      # which needs numpy. Leaving this after the discover step would turn that gate into an import
-      # error rather than a check (sc-17285).
-      - name: Install pinned tooling test dependencies
-        run: python3 -m pip install --disable-pip-version-check numpy==2.4.3 safetensors==0.8.0
-      - name: Test repository tooling
-        run: python3 -m unittest discover -s scripts/tests -v
-      - name: Test Mage oracle provisioning failures
-        run: python3 scripts/release/provision_mage_oracles.py --self-test
-
-  contracts:
-    name: contracts + conformance testkits (Linux)
-    needs: changes
-    if: needs.changes.outputs.contracts == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Install pinned Rust toolchain
-        run: |
-          rustup show
-          rustup component add clippy
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          # Save only on `main` — see the note on the `workspace` job's cache step.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      # Formatting is enforced whole-workspace by the always-run `format` job
-      # (`cargo fmt --all --check`) now that the imported trees are normalized (sc-13275),
-      # so the former gen-core-only `cargo fmt --check` step here is redundant.
-      - name: Clippy contracts
-        run: >-
-          cargo clippy --locked
-          -p core-llm -p core-llm-testkit
-          -p sceneworks-gen-core -p sceneworks-gen-core-testkit
-          --all-targets -- -D warnings
-      - name: Test contracts
-        run: >-
-          cargo test --locked
-          -p core-llm -p core-llm-testkit
-          -p sceneworks-gen-core -p sceneworks-gen-core-testkit
-
-  # The NTFS half of the job above. The testkit's fixture writers size a fixture's tensor payload
-  # like the real checkpoint it stands in for and then leave it unwritten, which is free on APFS and
-  # ext4 but allocates every cluster on NTFS unless the file is flagged sparse first. The assertions
-  # that pin the flag are therefore `#[cfg(windows)]`, and before this lane NOTHING executed them:
-  # `contracts` runs on ubuntu-latest, where those blocks compile out, and `windows-cuda-check`
-  # builds its test binaries with `--no-run`. A regression that made every multi-GB fixture allocate
-  # its full length again -- the failure that filled the Windows CUDA box's system drive twice and
-  # ended a candle-worker run with StorageFull, os error 112 -- was green on every automatic lane.
-  #
-  # Deliberately HOSTED windows-latest, not the self-hosted `[windows, cuda]` pair. The testkit
-  # links no tensor library and no CUDA (see its Cargo.toml), so it builds cold in well under a
-  # minute of hosted time, and the four self-hosted runners stay free for work that needs a GPU box.
-  # Keep it that way: moving this to a self-hosted label would cost a whole lane on the scarcest
-  # resource in this repo to run a test that needs nothing but a filesystem.
-  contracts-windows:
-    name: contracts testkit (Windows)
-    needs: changes
-    if: needs.changes.outputs.contracts == 'true'
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Install pinned Rust toolchain
-        run: rustup show
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          # Save only on `main` -- see the note on the `workspace` job's cache step.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      # Just the testkit: the Linux `contracts` job above owns clippy and the whole contracts
-      # package set. This lane is here only for the assertions that need a real NTFS volume.
-      - name: Test contracts testkit on NTFS
-        run: cargo test --locked -p sceneworks-gen-core-testkit
-
-  # THE LINUX CPU LANE, SPLIT ACROSS FOUR RUNNERS. This was one `candle-cpu` job running every step
-  # in sequence at a ~40-minute median. Nothing was dropped: the four jobs below carry the same
-  # steps, with the same commands and the same step names, and all four are gated on the same
-  # `changes.outputs.candle_cpu` and listed in the `gate` job's `needs:`.
-  #
-  # (sc-19447 later split `candle-cpu-test`'s single invocation in two and gave the `candle-gen*`
-  # half `--tests`, so that job now carries two steps rather than one. Nothing was dropped there
-  # either; see the notes on those steps.)
-  #
-  # Why split rather than trim: the serial ordering was never a correctness requirement. Measured
-  # over nine successful PR runs on 2026-08-15, the steps were independent and the job was bounded
-  # by their SUM — clippy 2.5m, rustdoc 2.3m, package tests 18.4m, conformance 7.4m, SA3 1.2m,
-  # bundles 1.7m + 2.9m + 2.6m. Split, the lane is bounded by the longest single piece instead.
-  #
-  # Splitting also relieves the constraint that produced the `cargo clean` below: the all-target
-  # Clippy tree and the test tree no longer share a disk. The `-j 1` on the test invocations is
-  # RETAINED — that one bounds lld's link-time memory, which the original step observed "even after
-  # the Clippy target tree has been reclaimed", so it is independent of the split. Do not drop it
-  # without reproducing the SIGBUS.
-  #
-  # The SA3 weight-free step moved to `candle-cpu-conformance` unchanged. Its coverage guard,
-  # scripts/tests/test_sa3_ci_target_coverage.py, finds it by STEP NAME rather than by job, and a
-  # second policy test caps that step's comment block at four lines — so the note explaining the
-  # move lives here rather than on the step.
-  #
-  # Cache note: rust-cache derives its key from the job, so these four save four separate baselines
-  # instead of one. That is affordable only because `save-if` below restricts saving to `main` —
-  # without it, four jobs would write four PR-scoped caches per open PR. See the `save-if` note on
-  # the `workspace` job's cache step.
-
-  candle-cpu-lint:
-    name: Candle CPU lint + docs (Linux)
-    needs: changes
-    if: needs.changes.outputs.candle_cpu == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Install pinned Rust toolchain
-        run: |
-          rustup show
-          rustup component add clippy
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      # `candle-audio/testkit` is compiled here explicitly: until the first audio provider
-      # dev-depends on it (sc-12836), no target in the graph pulls the feature in, so without
-      # this flag the testkit module would be merged unguarded (the sc-11990 cfg-hole shape).
-      - name: Clippy Candle packages
-        run: >-
-          cargo clippy --locked
-          -p candle-llm -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu
-          --features candle-audio/testkit
-          --all-targets -- -D warnings
-      - name: Reclaim Clippy artifacts before linking tests
-        # RETAINED, and still between Clippy and rustdoc where it has always sat. The package tests
-        # that used to follow now run on their own runners, so this no longer protects them — but
-        # whether the all-target Clippy tree and the doc build fit together on one hosted runner has
-        # never been measured, and the ordering here is known-good. Dropping it is a separate
-        # change with its own evidence, not a freebie to take while splitting the lane.
-        run: cargo clean
-      - name: Rustdoc Linux CPU packages
-        # Public contracts and provider docs are link-heavy API surface. Keep their intra-doc graph
-        # valid on the complete CPU-buildable package set. This runner has no CUDA toolkit, so it
-        # cannot pass --features cuda and does not check `#[cfg(feature = "cuda")]` docs; the
-        # `windows-cuda-check` lane covers that feature configuration. Metal/MLX docs remain
-        # genuinely ungated: no lane documents them.
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-        run: >-
-          cargo doc --locked --no-deps
-          -p core-llm -p core-llm-testkit
-          -p sceneworks-gen-core -p sceneworks-gen-core-testkit
-          -p candle-llm -p 'candle-gen*' -p 'candle-audio*'
-          -p runtime-cpu -p runtime-catalog
-      # The three guards ride the lint job rather than a test job: `check-lock-poison.sh` shells out
-      # to no build tool at all and `check-gen-core-skew.sh` only runs `cargo tree`, so neither
-      # needs a compiled target dir and neither belongs on the critical path.
-      - name: Guard poison-tolerant shared locks
-        run: bash crates/media/candle-gen/scripts/check-lock-poison.sh
-      - name: Self-test the gen-core skew verdict
-        run: bash crates/media/candle-gen/scripts/check-gen-core-skew.sh --self-test
-      - name: Guard the real Candle gen-core graph
-        run: bash crates/media/candle-gen/scripts/check-gen-core-skew.sh candle-gen
-
-  candle-cpu-test:
-    name: Candle CPU package tests (Linux)
-    needs: changes
-    if: needs.changes.outputs.candle_cpu == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Install pinned Rust toolchain
-        run: rustup show
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Test Candle packages
-        # All-target Clippy in `candle-cpu-lint` checks every integration and real-weight target.
-        # Execute the package unit/catalog suites one linker at a time: concurrently linking several
-        # provider test binaries exceeds the hosted runner's memory-backed linker capacity and
-        # crashes lld with SIGBUS. That was observed even with the Clippy tree already reclaimed, so
-        # moving Clippy to its own runner does not lift it.
-        #
-        # `--lib` here is deliberate for these three groups and is NOT the sc-19447 defect:
-        #   * candle-llm's `conformance` target already executes in `candle-cpu-conformance`;
-        #   * `candle-audio*`'s integration targets are named one by one in that same job's SA3
-        #     step, a choice `scripts/tests/test_sa3_ci_target_coverage.py` polices — widening
-        #     them to `--tests` here would link SA3's real-weight-only binaries for zero cases and
-        #     silently make that guard redundant;
-        #   * runtime-cpu has no `tests/` directory at all.
-        # `candle-gen*` moved to its own invocation below because it was the group that had no
-        # `--tests` runner anywhere.
-        run: >-
-          cargo test --locked --lib -j 1
-          -p candle-llm -p 'candle-audio*' -p runtime-cpu
-      # sc-19447. Until this step existed, `candle-gen*`'s 176 integration targets executed in NO
-      # lane that runs automatically: this job was `--lib` only, `candle-cpu-lint` compiles them
-      # under all-target Clippy without running them, `windows-cuda-check` compiles them
-      # `--no-run`, `macos-metal` Clippies candle without testing it, and the only `--tests` runner
-      # for the family is the `workflow_dispatch`-only `windows-cuda` job. An entire epic's
-      # candle-side parity evidence therefore compiled green and was never evaluated.
-      #
-      # `--tests` over the whole `candle-gen*` glob rather than a curated `--test` list, which is
-      # the shape the sibling `macos-metal` job already uses for `mlx-gen*`. A curated list would
-      # need ~25 separate invocations and would rot the moment a target is added — the exact drift
-      # `test_sa3_ci_target_coverage.py` exists to catch on the audio side. The glob cannot drift,
-      # and `scripts/tests/test_candle_gen_ci_target_coverage.py` pins that it stays a glob that
-      # covers every crate carrying weight-free cases.
-      #
-      # Weight-bound cases stay out of this lane by ONE of two mechanisms, and only these two are
-      # trustworthy: `#[ignore]` (libtest reports `ignored`) or a file-level `#![cfg(feature =
-      # "cuda")]` (the target compiles to an empty binary). They stay reachable from the manual
-      # `windows-cuda` dispatch and from `real-weights.yml`, which is the deliberate split — see
-      # sc-19447 for the per-target classification and for the real-weight targets no lane names.
-      #
-      # A THIRD mechanism existed and was NOT trustworthy: 14 cases carried neither marker and
-      # instead printed `SKIP` and `return`ed when their guard was unsatisfied. libtest reports
-      # those as **passed**. Widening this step to `--tests` would therefore have converted "never
-      # evaluated" into "reported as evaluated" — the exact defect class sc-19447 exists to remove,
-      # laundered rather than fixed.
-      #
-      # THE 14 WERE NOT ONE KIND, and sc-19447 converted all of them to `#[ignore]` as though they
-      # were. THE REAL SPLIT IS 13 + 1:
-      #   * 13 are ENV-GATED and weight-bound — `candle-gen-flux2`'s `vae_encode_parity` and all
-      #     eleven `candle-gen-lens` `*_parity` targets (12 files; `encoder_quant_parity` carries
-      #     two such cases and factors its guard into a helper, so a body-only reading of the
-      #     sources undercounts). For these, `#[ignore]` is right: their weights are not on any
-      #     runner, so no lane should run them, and `real-weights.yml` opts in explicitly.
-      #   * 1 is DEVICE-GATED and weight-free, and it was LANE-REACHABLE: `candle-gen`'s
-      #     `cuda_quant_smoke::cuda_qmatmul_matches_cpu`, the sole canary for the sc-7544 silent-
-      #     zeros GGUF QMatMul regression. It gates on `default_device().is_cuda()`, not on an env
-      #     var, and the `windows-cuda` job below runs `--features cuda` with **no `-- --ignored`**
-      #     — so `#[ignore]` did not park it beside the weight-bound twelve, it SILENCED it on the
-      #     one lane that has ever executed it. It is `#![cfg(feature = "cuda")]` now: excluded
-      #     from this lane by the second trustworthy mechanism above (empty binary on
-      #     `ubuntu-latest`), and executed rather than `ignored` under `--features cuda`. Do not
-      #     re-`#[ignore]` it — see that file's module header.
-      #
-      # `scripts/tests/test_candle_gen_ci_target_coverage.py` refuses to count a self-skipping
-      # case as weight-free coverage and fails on any new one, so the class cannot re-enter
-      # silently. sd3's `reference_manifests_are_consistent_if_present` is deliberately NOT in that
-      # set: its references are committed to the repo, so it really does assert on every run.
-      #
-      # `-j 1` is carried over from the step above for the same lld/SIGBUS reason, and matters more
-      # here: this invocation links ~176 additional test binaries. `--lib` is redundant next to
-      # `--tests` (cargo's `--tests` already selects the lib's own test target — verified: both
-      # forms produce the same 210 binaries) and is kept only so this reads identically to the
-      # `macos-metal` invocation it is modelled on.
-      #
-      # MEASURED COST, so the widening is a deliberate choice rather than a silent one (sc-19447
-      # AC1). The number that governs is the HOSTED one; a local aarch64 figure understates it by
-      # roughly 5x and must not be quoted as the budget.
-      #
-      # HOSTED LINUX (ubuntu-latest, this job, wall-clock from the Actions API):
-      #   before  run 32328255786  main @f17c8254   job 528s   `Test Candle packages` 466s
-      #   after   run 32383334859  PR   @9ff4cecb3  job 1304s  `Test Candle packages` 261s
-      #                                                        + this step             999s
-      #   => +776s (+12m56s) on the job, a 2.47x increase. Run 32376222131 (@d308b185f) logged
-      #      1011s for this same step independently, so 999s is not a one-off.
-      #   Compare the JOB totals, not the steps: `Test Candle packages` also moved (466s -> 261s)
-      #   and no cause for that has been established — a main push saves the rust-cache while a PR
-      #   only restores it, so the two runs did not start from the same warmth. Attributing the
-      #   step-level delta to this change would be a guess; the job total is what was measured.
-      #
-      # LOCAL aarch64 (warm deps, only `candle-gen*` rebuilt, same `-j 1` / `RUST_TEST_THREADS=1`):
-      #   ~+2m43s. Recorded only to show the two do not agree — do NOT budget from it.
-      #
-      # WALL CLOCK vs RUNNER MINUTES — these are different costs and only one of them is free:
-      #   * Wall clock: unaffected. `macos-metal` (3391s in run 32383334859, with the `CI gate` job
-      #     starting 4s after it) is the binding constraint; this job now finishes ~40m before it.
-      #   * Runner minutes: ~13 additional minutes of hosted Linux on EVERY candle-touching PR.
-      #     That is the real price, it is paid per push, and it is the first thing to re-measure
-      #     (or to split across runners) if the candle lane's cost is ever questioned.
-      - name: Test Candle gen packages and integration targets
-        run: >-
-          cargo test --locked --lib --tests -j 1
-          -p 'candle-gen*'
-
-  candle-cpu-conformance:
-    name: Candle CPU conformance + SA3 gates (Linux)
-    needs: changes
-    if: needs.changes.outputs.candle_cpu == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Install pinned Rust toolchain
-        run: rustup show
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Test Candle LLM conformance
-        run: cargo test --locked -j 1 -p candle-llm --test conformance
-      - name: Test Stable Audio 3 weight-free quality gates
-        # Every integration target with a non-ignored case must be named in this command.
-        # scripts/tests/test_sa3_ci_target_coverage.py enforces that executable invariant.
-        # Rationale, real-weight exclusions, and historical mutation evidence live in the
-        # SC_14545 through SC_14550 migration records and SC_16605_REAL_WEIGHT_WORKFLOW_CLEANUP.md.
-        run: >-
-          cargo test --locked -j 1
-          -p candle-audio-stable-audio-3
-          --test provider --test dtype_policy --test variant_quality --test conformance
-          --test sampler_oracle --test same_oracle --test primitive_oracle
-          --test listening_stimuli --test reference_audio --test reference_window --test audio_edit
-          --test adapters
-          -- --nocapture
-
-  candle-cpu-bundles:
-    name: Candle CPU bundle profiles (Linux)
-    needs: changes
-    if: needs.changes.outputs.candle_cpu == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Install pinned Rust toolchain
-        run: rustup show
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      # These three resolve `runtime-cpu` under three different feature sets, so they share almost
-      # no artifacts with each other or with the default-feature build in `candle-cpu-test` — which
-      # is why they cost ~7m combined even when they ran straight after it. Grouping them keeps that
-      # feature thrash on one runner instead of spreading it.
-      - name: Test LLM-only CPU bundle
-        run: cargo test --locked --no-default-features --lib -p runtime-cpu
-      # The decided sc-12835 feature wiring: audio is its own additive bundle feature, so the
-      # LLM+audio composition (ChatWorks TTS without the media graph) is a supported profile.
-      - name: Test LLM+audio CPU bundle
-        run: cargo test --locked --no-default-features --features audio --lib -p runtime-cpu
-      # The fourth documented profile (audio-backend-strategy.md feature matrix): media without
-      # the audio lane must keep composing — one lane covers it, on the cheapest platform.
-      - name: Test media-only CPU bundle
-        run: cargo test --locked --no-default-features --features media --lib -p runtime-cpu
-
-  macos-metal:
-    name: MLX + Candle Metal packages (macOS)
-    needs: changes
-    if: needs.changes.outputs.macos_metal == 'true'
-    runs-on: macos-15
-    env:
-      # Hosted SDK 15 cannot compile the shipping macOS 26.2 NAX path. The root
-      # Cargo config is intentionally overridable so hosted CI exercises the
-      # correct non-NAX path; a 26.2+ self-hosted lane is still needed for NAX.
-      MACOSX_DEPLOYMENT_TARGET: "15.0"
-      # Line tables only, no full DWARF, for every profile this lane builds. Measured 2026-08-23
-      # (run 32630010202): with full debuginfo the broad `--lib --tests` graph alone grew `target/`
-      # to 35 GB, which is what forced the two mid-job `cargo clean`s — and each clean threw away
-      # the restored libmlx.a, so `pmetal-mlx-sys` (≈6 min of cmake on the 3-core hosted M1) was
-      # rebuilt FOUR times in one job, ~24 of its 61 minutes, against 6.7 minutes of actual test
-      # execution. Nothing in CI reads the DWARF; line tables keep panic backtraces addressable.
-      # `test` inherits `dev`, but it is set explicitly so a future `[profile.test]` block cannot
-      # silently re-inflate this lane. Do NOT reintroduce `cargo clean` between the cargo steps:
-      # the `Disk after ...` probes below are the evidence that it is no longer needed.
-      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
-      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
-      # Build-override debuginfo MUST match the profile debuginfo above, or this lane still
-      # builds libmlx three times per cold job. Measured locally 2026-08-23 (unit graphs +
-      # `-vv` OUT_DIR hashes): with the cargo default (build scripts/proc-macros at debug=0),
-      # `cargo build` lets bindgen's host-side `bitflags` share the target-side dev unit while
-      # `cargo check`/`clippy` and `cargo test` give it a separate build-override unit — so the
-      # bindgen → build-script → `pmetal-mlx-sys` metadata hash differs per command and each
-      # step gets its own OUT_DIR and its own ≈6 min cmake build of libmlx. With build-override
-      # aligned, Clippy, the `--lib --tests` run, and the LLM+audio bundle all resolve to ONE
-      # OUT_DIR (only the LLM-only bundle still differs, via `syn` feature unification).
-      CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: "line-tables-only"
-      CARGO_PROFILE_TEST_BUILD_OVERRIDE_DEBUG: "line-tables-only"
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Toolchain versions
-        run: |
-          sw_vers
-          xcodebuild -version
-          cmake --version
-      # sc-19556 CI-disk mitigation. On 2026-08-19 this lane hit the runner's disk wall three
-      # attempts running: attempt 1 died with `ar: libmlx.a: No space left on device` inside the
-      # MLX native build during "Test LLM+audio macOS bundle", and attempts 2-3 killed the runner
-      # outright (it could no longer write its own `_diag` log). Two things stack up:
-      #   * the hosted `macos-15-arm64` image ships NINE Xcode installs (16.0 through 26.3) plus the
-      #     Android SDK. This lane uses exactly one Xcode and no Android at all, so that payload is
-      #     pure dead weight sitting on the same volume as `target/`.
-      #   * this lane runs four cargo invocations with four different feature sets, and on any branch
-      #     whose manifest set differs from `main` the rust-cache restore is a prefix match
-      #     ("full match: false" — the failing run restored `...-c5bb8f3b` under key `...-e634915e`),
-      #     so the restored ~1.2 GB target/ is kept AND a second generation of artifacts is built on
-      #     top of it. Branches whose manifests match `main` get "full match: true" and never build
-      #     that second generation, which is why they passed the same day on the same image.
-      # The second generation has since been shrunk (line-tables-only debuginfo, see the job `env`),
-      # but the image payload is still dead weight, so it is still pruned — in the BACKGROUND.
-      # Measured at 3.6 min on the critical path when it ran inline; `sudo rm -rf` of eight Xcode
-      # bundles is pure I/O that overlaps fine with the cache restore and the first cargo build.
-      # Only non-active Xcodes and the Android SDK are removed, so nothing a later step selects
-      # can disappear under it. The log is printed by the final disk probe. This step is
-      # diagnostics + deletion only: it never fails the job.
-      - name: Reclaim runner disk (background)
-        run: |
-          set +e
-          echo "--- disk before reclaim ---"
-          df -h /
-          cat > "$RUNNER_TEMP/reclaim-runner-disk.sh" <<'EOS'
-          set +e
-          resolve() { ( cd "$1" >/dev/null 2>&1 && pwd -P ); }
-          keep="$(xcode-select -p 2>/dev/null | sed 's#/Contents/Developer.*##')"
-          case "$keep" in
-            /Applications/Xcode*.app)
-              keep_real="$(resolve "$keep")"
-              echo "active Xcode: $keep_real"
-              for app in /Applications/Xcode*.app; do
-                [ -e "$app" ] || continue
-                if [ "$(resolve "$app")" = "$keep_real" ]; then
-                  echo "keep  $app"
-                  continue
-                fi
-                echo "prune $app"
-                sudo rm -rf "$app"
-              done
-              ;;
-            *)
-              # DEVELOPER_DIR is CommandLineTools or unset — we cannot tell which Xcode the later
-              # steps will select, so prune nothing rather than guess.
-              echo "active developer dir is '${keep:-<none>}', not an Xcode bundle; skipping Xcode prune"
-              ;;
-          esac
-          sudo rm -rf "$HOME/Library/Android" "$HOME/.android"
-          echo "--- disk after reclaim ---"
-          df -h /
-          EOS
-          nohup bash "$RUNNER_TEMP/reclaim-runner-disk.sh" > "$RUNNER_TEMP/reclaim-runner-disk.log" 2>&1 &
-          echo "reclaim running in background (pid $!); log: $RUNNER_TEMP/reclaim-runner-disk.log"
-          exit 0
-      - name: Ensure Metal compiler
-        run: |
-          if ! xcrun --find metal >/dev/null 2>&1; then
-            sudo xcodebuild -downloadComponent MetalToolchain
-          fi
-          xcrun metal --version || true
-      - name: Install pinned Rust toolchain
-        run: |
-          rustup show
-          rustup component add clippy
-      - name: Fetch prebuilt MLX (sc-21382)
-        # pmetal-mlx-sys's cmake build of libmlx is ≈6 min on this runner on every cache miss
-        # (plus a network fetch of MLX). The SceneWorks/mlx-rs fork publishes that build per
-        # commit (`prebuilt-<sha12>` releases, cell = target × deployment target × Debug/Release);
-        # scripts/fetch-prebuilt-mlx.sh picks the asset for the rev pinned in Cargo.lock and this
-        # job's MACOSX_DEPLOYMENT_TARGET, exports PMETAL_MLX_PREBUILT_DIR and PMETAL_METALLIB_PATH
-        # (sc-20799 -- with a prebuilt or a warm cargo cache pmetal-mlx-sys's build.rs does not
-        # re-run, so nothing populates ~/.cache/pmetal/lib and the test binaries, which have no
-        # compiled-in metallib, cannot load one). build.rs links the archives only
-        # after checking the manifest against its own key -- a mismatch FAILS the build. The one
-        # failure tolerated here is "no prebuilt published for this rev yet" (exit 1), which is
-        # exactly the case where building from source is right; it is surfaced as a workflow
-        # annotation so a rev bump that forgot to publish is visible. Anything else is an error.
-        run: |
-          set +e
-          scripts/fetch-prebuilt-mlx.sh --github-env
-          rc=$?
-          set -e
-          if [ "$rc" = 1 ]; then
-            echo "::warning title=prebuilt MLX unavailable::no prebuilt for the pinned mlx-rs rev; building libmlx from source (see step log)"
-          elif [ "$rc" != 0 ]; then
-            exit "$rc"
-          fi
-      - name: Cache Cargo and MLX native build
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          # Save only on `main` — see the note on the `workspace` job's cache step. This lane's
-          # baseline is the 2 GB one that survived the 2026-08-15 eviction; the point of this input
-          # is that the others get to survive alongside it.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Clippy MLX packages
-        run: >-
-          cargo clippy --locked
-          -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos
-          --all-targets -- -D warnings
-      - name: Rustdoc macOS MLX packages
-        # This is the complete macOS/MLX package set the lane already builds. Keep its public
-        # intra-doc graph under the same warnings-as-errors policy as the Linux and CUDA package
-        # sets; NAX-specific docs remain on the separate macos-nax feature/platform lane.
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-        run: >-
-          cargo doc --locked --no-deps
-          -p mlx-llm -p mlx-llm-server
-          -p mlx-gen -p 'mlx-gen-*'
-          -p runtime-macos
-      # sc-19556 CI-disk mitigation. `target/doc` is written by the step above and read by nothing
-      # else in this job, so it is free to drop before the four cargo invocations start stacking
-      # feature-set generations into `target/debug`. The `df`/`du` lines are the permanent probes
-      # the 2026-08-19 disk failures had no data for. Diagnostics only; never fails the job.
-      - name: Disk after rustdoc
-        if: always()
-        run: |
-          set +e
-          rm -rf target/doc
-          df -h /
-          du -sh target 2>/dev/null
-          exit 0
-      # There is deliberately NO `cargo clean` here any more. Until 2026-08-23 one sat between
-      # rustdoc and the test build because the full-debuginfo test graph did not fit next to the
-      # Clippy graph; it also discarded the rust-cache-restored `pmetal-mlx-sys` output, so libmlx
-      # was rebuilt from cmake for the test step. With line-tables-only debuginfo (job `env`) both
-      # graphs fit and the native build is reused.
-      # Deliberately NOT given `-j 1` or `--test-threads` (sc-16049). Test concurrency is already
-      # pinned at 1: the root `.cargo/config.toml` force-sets `RUST_TEST_THREADS = 1` (MLX's shared
-      # Metal device is not thread-safe) and cargo runs test binaries one at a time, so exactly one
-      # test is live per invocation. Only build parallelism is uncapped, which is what we want.
-      # The flake that prompted the question was never seen on this lane — it was reproduced
-      # locally and is cross-PROCESS: two `cargo test` runs on one machine share a single
-      # `$TMPDIR`, and fixtures written to a hardcoded name there got truncated or removed under
-      # each other (`SafeTensors(NotFile)`, and torn reads as "Invalid json header length"). The
-      # fix was to key every temp fixture on `std::process::id()` (sc-16057). No in-run cap could
-      # have fixed that on any runner, and `-j 1` in particular bounds only BUILD jobs, so it
-      # neither caused nor cured it — it would just slow the lane down.
-      # NB the `macos-nax` lane below IS self-hosted, so it does share `$TMPDIR` between jobs; it
-      # is safe only because no hardcoded fixture path remains in the crates it runs (mlx-llm,
-      # runtime-macos). Keep it that way if that lane's package set ever grows.
-      - name: Test MLX packages
-        run: >-
-          cargo test --locked --lib --tests
-          -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos
-      # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
-      - name: Disk after MLX package tests
-        if: always()
-        run: |
-          set +e
-          df -h /
-          du -sh target 2>/dev/null
-          du -sh target/debug/build/pmetal-mlx-sys-*/out 2>/dev/null
-          exit 0
-      # Likewise no `cargo clean` before the bundle profiles (removed 2026-08-23): the bundle
-      # builds below reuse the dependency and `pmetal-mlx-sys` artifacts of the test step instead of
-      # rebuilding them from zero — that clean alone cost a third libmlx cmake build.
-      - name: Test LLM-only macOS bundle
-        run: cargo test --locked --no-default-features --lib -p runtime-macos
-      # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
-      - name: Disk after LLM-only bundle
-        if: always()
-        run: |
-          set +e
-          df -h /
-          du -sh target 2>/dev/null
-          du -sh target/debug/build/pmetal-mlx-sys-*/out 2>/dev/null
-          exit 0
-      # The decided sc-12835 feature wiring: audio is its own additive bundle feature, so the
-      # LLM+audio composition (mlx LLM + candle audio lane, no mlx media graph) is a supported
-      # profile — and this is the one platform where that combination is cross-backend.
-      - name: Test LLM+audio macOS bundle
-        run: cargo test --locked --no-default-features --features audio --lib -p runtime-macos
-      # sc-19556: this is the step that ran the runner out of disk on all three 2026-08-19 attempts,
-      # so the probe runs even when it fails — that is the reading we did not have. Diagnostics
-      # only; never fails the job.
-      - name: Disk after LLM+audio bundle
-        if: always()
-        run: |
-          set +e
-          echo "--- background reclaim log ---"
-          cat "$RUNNER_TEMP/reclaim-runner-disk.log" 2>/dev/null || echo "(no reclaim log)"
-          echo "--- disk ---"
-          df -h /
-          du -sh target 2>/dev/null
-          du -sh target/debug/build/pmetal-mlx-sys-*/out 2>/dev/null
-          exit 0
-      # The metal twin of the cuda gate on `windows-cuda-check`. This was a bare `cargo check` and so
-      # had two holes, both of the sc-11990 shape: it never linted `#[cfg(feature = "metal")]` code
-      # (no lane passes --features metal to Clippy), and without --all-targets it did not even
-      # *compile* metal-gated test targets — which is exactly where that story's break lived. The
-      # cuda twin found four such breaks the moment it was switched on (sc-12379), all in cfg-gated
-      # test targets no lane had ever compiled. Keep this package set aligned with the CPU and cuda
-      # Clippy lanes.
-      - name: Clippy Candle Metal packages
-        run: >-
-          cargo clippy --locked
-          -p candle-llm -p 'candle-gen*' -p 'candle-audio*'
-          --all-targets --features metal -- -D warnings
-
-  macos-nax:
-    name: runtime-macos NAX (macOS 26.2, manual)
-    needs: changes
-    if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.macos_metal == 'true'
-    runs-on: [self-hosted, macOS, ARM64, nax]
-    env:
-      MACOSX_DEPLOYMENT_TARGET: "26.2"
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Toolchain and platform versions
-        run: |
-          sw_vers
-          xcodebuild -version
-          xcrun metal --version
-          rustc --version
-          cargo --version
-      - name: Fetch prebuilt MLX (sc-21382)
-        # Same contract as the `macos-metal` step of this name; this lane's cell is 26.2/Debug and
-        # the self-hosted runner keeps the extracted tarball in ~/.cache/pmetal/prebuilt across
-        # runs, so after the first fetch this is a no-op.
-        run: |
-          set +e
-          scripts/fetch-prebuilt-mlx.sh --github-env
-          rc=$?
-          set -e
-          if [ "$rc" = 1 ]; then
-            echo "::warning title=prebuilt MLX unavailable::no prebuilt for the pinned mlx-rs rev; building libmlx from source (see step log)"
-          elif [ "$rc" != 0 ]; then
-            exit "$rc"
-          fi
-      # DELIBERATELY NO `save-if: main`, unlike the PR lanes (see the note on the `workspace` job's
-      # cache step). `macos-nax` is manual and never runs on `main`, so a main-only save would leave
-      # it nothing to restore; it also contributed no entry to the 2026-08-15 cache inventory. Do
-      # not re-symmetrise it with `macos-metal`.
-      - name: Cache Cargo and MLX native build
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          # This runner is a persistent Mac whose CARGO_HOME is the developer's real
-          # ~/.cargo. rust-cache's post step runs cleanBin(), which deletes every
-          # *regular file* in $CARGO_HOME/bin that cargo did not install (per
-          # .crates2.json) -- and `rustup` is the only regular file there. The 13
-          # rustup proxies (cargo, rustc, ...) are symlinks, so isFile() is false and
-          # they survive as dangling links, breaking every cargo/rustc call on the box
-          # until something reinstalls rustup. Harmless on ephemeral runners; not here.
-          cache-bin: "false"
-      - name: Exercise MLX engine and complete runtime catalog on NAX
-        run: cargo test --locked --lib -p mlx-llm -p runtime-macos
-      # SC-18318 acceptance is correctness-only: exercise the focused synthetic
-      # request-scoped exact-epilogue equality/receipt suite on a live Metal
-      # device. The p3_ filter is intentionally narrow and invokes no timing,
-      # memory, profiling, calibration, matrix, or real-weight path.
-      - name: Exercise exact P3 epilogues on NAX
-        env:
-          MLX_ENABLE_TF32: "1"
-          SCENEWORKS_REQUIRE_NAX: "1"
-        run: cargo test --locked --lib -p mlx-gen p3_ -- --test-threads=1
-      - name: Exercise LLM-only runtime catalog on NAX
-        run: cargo test --locked --no-default-features --lib -p runtime-macos
-
-  # Non-executing gate for the CUDA feature (compile, lint, docs) — runs on every PR/push that touches
-  # the lane.
-  #
-  # This exists because `--features cuda` code is invisible to every other lane: macOS cannot build it
-  # (no CUDA toolkit) and the CPU/Linux lanes do not enable the feature, so a `#[cfg(feature = "cuda")]`
-  # file can be merged in a state that does not compile, does not lint, or has broken docs, and nothing
-  # notices. That is not hypothetical —
-  # `candle-gen-mochi`'s `tier_parity.rs` shipped with three E0308s and was only caught by hand on the
-  # CUDA box (sc-11990). `--tests` is load-bearing here: the break was in a test target, so a bare
-  # `cargo build` would still have missed it.
-  #
-  # The broad package build remains deliberately `--no-run`: compiling needs nvcc + MSVC but never
-  # creates a CUDA context or allocates VRAM, so this is safe to run on every PR on the shared
-  # self-hosted rig without competing for the GPU. One weights-free catalog conformance test executes
-  # below because it needs the CUDA-gated registration graph but never touches a device; executing the
-  # rest of the CUDA tests stays in the manual `windows-cuda` lane.
-  windows-cuda-check:
-    name: Candle CUDA compile check (Windows)
-    needs: changes
-    # This persistent runner may execute repository build scripts, so a public-fork PR must never
-    # reach it. Pushes, manual dispatches, and PRs whose head belongs to this repository remain
-    # eligible; hosted jobs continue to validate fork PRs. merge_group is trusted for the same
-    # reason a push is: `gh-readonly-queue/main/**` is a ref in THIS repository, created by the
-    # queue from already-reviewed heads, so fork code cannot arrive by that path. Keep the guard
-    # keyed on `!= 'pull_request'` rather than an allowlist of trusted events, so a new trusted
-    # event does not silently lose CUDA coverage.
-    if: >-
-      needs.changes.outputs.windows_cuda == 'true' &&
-      (github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository)
-    runs-on: [self-hosted, windows, cuda]
-    env:
-      # Two listeners share this 48-thread host. Leaving Cargo at its per-process default lets
-      # overlapping CI runs launch roughly 96 compilers and trigger Windows DLL-init failures.
-      # Twelve jobs per listener leaves headroom for sccache, linkers, nvcc, and the runner itself.
-      CARGO_BUILD_JOBS: "12"
-      # 80 IS CORRECT ON A BLACKWELL BOX, AND RAISING IT TO 120 IS A REGRESSION (sc-19545).
-      #
-      # This pool is `MICHAEL-TRX50`: 2x RTX PRO 6000, 97887 MiB each, driver 596.36. "80 is
-      # Ampere, the box is Blackwell" therefore reads as an obvious bug, and is not one.
-      # `CUDA_COMPUTE_CAP` names the BOTTOM RUNG of an architecture ladder, never the hardware. It
-      # seeds one cudaforge `-gencode`; `vendor/candle-kernels/build.rs` appends sm_90, sm_120 and
-      # `compute_120` PTX on top (sc-7544), so the shipped `libmoe.a` is a fatbin that runs Ampere
-      # -> Ada -> Hopper -> Blackwell from one binary. Set this to 120 and the bottom rung
-      # disappears: quantized models stop working on every pre-Blackwell customer GPU, and the
-      # dense PTX floor rises to `compute_120` so even dense models stop loading there.
-      #
-      # The hazard the number LOOKS like -- quantized matmuls silently returning zeros -- is real,
-      # was sc-7544, and is fixed. What must actually hold is that the runner's arch is served by
-      # SOME rung, which is a different claim from "the cap matches the GPU". Concretely, the
-      # ladder is sm_80 (this value) + sm_90 + sm_120 SASS + `compute_120` PTX, so this pool's
-      # cards are covered natively.
-      #
-      # KNOWN GAP, recorded so it is not rediscovered: **datacenter Blackwell sm_100 (B100/B200) is
-      # NOT covered** on the quant path. Major 10 is served neither by the sm_9x/sm_12x cubins
-      # (SASS is compatible only upward WITHIN one major) nor by the `compute_120` PTX floor (120 >
-      # 100). build.rs states this is deliberate. If such a card ever joins this pool, quantized
-      # matmuls return zeros silently -- add `code=sm_100` to build.rs, do NOT touch this value.
-      #
-      # sm_120 for the current cards is a SPEC fact, not a CI measurement: no lane has ever queried
-      # `compute_cap`, and nothing in this repository does. `nvidia-smi` here reports only the
-      # truncated model name and memory.
-      #
-      # NOTHING ENFORCES ANY OF THIS. sc-19545 verified it by hand and wrote it down; a drift guard
-      # was explicitly scoped out. If someone edits this value, the first symptom is black
-      # renders on customer GPUs, not a red build.
-      CUDA_COMPUTE_CAP: "80"
-      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
-      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Select Git Bash
-        shell: cmd
-        run: |
-          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
-          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        timeout-minutes: 5
         with:
           toolchain: 1.96.0
-          components: clippy
+
       - name: Cache Cargo and CUDA objects
+        timeout-minutes: 5
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          # Persistent self-hosted box: rust-cache's post step deletes rustup.exe from
-          # %CARGO_HOME%\bin (see the macos-nax job for the full mechanism), leaving the
-          # proxies dangling. This is the real cause of the breakage that
-          # scripts/win/use-real-rust-toolchain.cmd works around in the app repo.
           cache-bin: "false"
-          # Save only on `main` — see the note on the `workspace` job's cache step. Unlike the
-          # `windows-cuda` lane below, this one runs on every PR that touches the CUDA paths, so it
-          # is one of the lanes that was writing a PR-scoped cache nothing else could read.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Compile Candle CUDA packages and test binaries (no GPU required)
-        shell: cmd
-        run: |
-          call "%VCVARS%"
-          cargo test --locked --lib --tests -p candle-llm -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-run
-      - name: Execute weights-free CUDA catalog conformance (no GPU required)
-        shell: cmd
-        run: |
-          call "%VCVARS%"
-          cargo test --locked -p candle-gen-catalog --features cuda tests::every_registered_memory_strategy_rejects_cross_route_decode_geometry -- --exact
-      # The lint twin of the compile check above. The `candle-cpu` lane already Clippies this same
-      # package set with --all-targets, but it has no CUDA toolkit and so cannot pass --features cuda:
-      # every `#[cfg(feature = "cuda")]` target is invisible to it and reaches main unlinted. That is
-      # not hypothetical either — a `print_literal` in candle-gen-krea's cuda-gated
-      # `nvfp4_krea_dit_gpu.rs` sat red on main until it was found by hand (sc-12379). Keep this Clippy
-      # package set aligned with the compile check above.
-      #
-      # No GPU required, same as the steps around it: Clippy type-checks the crate graph (hence vcvars
-      # + nvcc for the candle-kernels build script) but creates no CUDA context and allocates no VRAM.
-      - name: Clippy Candle CUDA packages (no GPU required)
-        shell: cmd
-        run: |
-          call "%VCVARS%"
-          cargo clippy --locked --all-targets -p candle-llm -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda -- -D warnings
-      # The doc twin of the compile check above. The hosted rustdoc gate cannot pass --features cuda
-      # (no CUDA toolkit), so `#[cfg(feature = "cuda")]` docs need this lane. Keep this doc package
-      # set aligned with the compile check above; together with the hosted gate, the CPU and CUDA
-      # doc graphs are each covered (sc-12275, sc-12284).
-      #
-      # No GPU required, same as the compile step: rustdoc builds the dep graph (hence vcvars + nvcc)
-      # but creates no CUDA context and allocates no VRAM, so it is safe on the shared self-hosted rig.
-      - name: Rustdoc Candle CUDA packages (no GPU required)
-        shell: cmd
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-        run: |
-          call "%VCVARS%"
-          cargo doc --locked --no-deps -p candle-llm -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda
 
-  windows-cuda:
-    name: Candle CUDA packages (Windows, manual)
-    needs: changes
-    if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.windows_cuda == 'true'
-    runs-on: [self-hosted, windows, cuda]
-    env:
-      # Keep manual runs inside the same per-listener budget as the automatic compile check.
-      CARGO_BUILD_JOBS: "12"
-      CUDA_COMPUTE_CAP: "80"
-      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
-      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Select Git Bash
-        shell: cmd
-        run: |
-          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
-          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        timeout-minutes: 5
         with:
-          toolchain: 1.96.0
-          components: rustfmt, clippy
-      # DELIBERATELY NO `save-if: main`, unlike the PR lanes (see the note on the `workspace` job's
-      # cache step). This lane is manual — `windows-cuda` runs only on `workflow_dispatch` — so its
-      # runs are operator iterations on whatever ref they dispatch, where a ref-scoped cache is the
-      # point. It never runs on `main`, so a main-only save would leave it nothing to restore and
-      # cold on every dispatch, and it contributed no entry to the 2026-08-15 cache inventory that
-      # was starving the PR lanes. Do not re-symmetrise it with `windows-cuda-check` above.
-      - name: Cache Cargo and CUDA objects
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          # Persistent self-hosted box: rust-cache's post step deletes rustup.exe from
-          # %CARGO_HOME%\bin (see the macos-nax job for the full mechanism), leaving the
-          # proxies dangling. This is the real cause of the breakage that
-          # scripts/win/use-real-rust-toolchain.cmd works around in the app repo.
-          cache-bin: "false"
-      - name: Build Candle CUDA packages
-        shell: cmd
-        run: |
-          call "%VCVARS%"
-          cargo build --locked -p candle-llm -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda
-      - name: Test Candle CUDA packages
-        shell: cmd
-        run: |
-          call "%VCVARS%"
-          cargo test --locked --lib --tests -p candle-llm -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-fail-fast
-      - name: Test LLM-only CUDA bundle
-        shell: cmd
-        run: |
-          call "%VCVARS%"
-          cargo test --locked --no-default-features --lib -p runtime-cuda
-      # The decided sc-12835 feature wiring: audio is its own additive bundle feature, so the
-      # LLM+audio composition (ChatWorks TTS without the media graph) is a supported profile.
-      - name: Test LLM+audio CUDA bundle
-        shell: cmd
-        run: |
-          call "%VCVARS%"
-          cargo test --locked --no-default-features --features audio --lib -p runtime-cuda
+          version: "0.12.3"
+          enable-cache: false
 
-  supply-chain:
-    name: dependency policy + advisories
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Cache cargo-deny 0.19.9
-        id: cargo-deny-cache
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: cargo-deny-0.19.9
-          add-rust-environment-hash-key: "false"
-          cache-targets: "false"
-          cache-bin: "true"
-          # Save only on `main` — see the note on the `workspace` job's cache step.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install cargo-deny
-        if: steps.cargo-deny-cache.outputs.cache-hit != 'true'
-        run: cargo install cargo-deny --locked --version 0.19.9
-      - name: Validate advisory-ignore governance
-        run: python3 scripts/ci/check_advisory_policy.py
-      - name: Check advisories, licenses, bans, and sources
-        run: cargo deny --locked check advisories bans licenses sources
+      - name: Install reviewed CPython and snapshot verifier dependencies
+        timeout-minutes: 8
+        shell: powershell
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config
+          if ($LASTEXITCODE -ne 0) { throw 'uv failed to install reviewed CPython' }
+          $reviewedPython = (& uv python find 3.12.10 --managed-python --no-project --no-config).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $reviewedPython -PathType Leaf)) {
+            throw 'reviewed CPython 3.12.10 is unavailable'
+          }
+          & $reviewedPython -c 'import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version'
+          if ($LASTEXITCODE -ne 0) { throw 'reviewed CPython version check failed' }
+          $pythonPath = Join-Path $env:RUNNER_TEMP 'sc23935-python'
+          & $reviewedPython -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes `
+            --target $pythonPath -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
+          if ($LASTEXITCODE -ne 0) { throw 'snapshot verifier dependency installation failed' }
+          "REVIEWED_PYTHON=$reviewedPython" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PYTHONPATH=$pythonPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-  docs:
-    name: repository documentation
-    needs: changes
-    if: needs.changes.outputs.docs == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Check local documentation links
-        run: python3 scripts/check_docs.py
+      # Parse every exact run block before the CUDA build or reservation. This catches Windows
+      # PowerShell 5 syntax errors that a Linux YAML check cannot see.
+      - name: Parse every embedded Windows PowerShell script
+        timeout-minutes: 3
+        shell: powershell
+        run: |
+          $extractor = Join-Path $env:RUNNER_TEMP 'sc23935-extract-powershell.py'
+          $scriptsJson = Join-Path $env:RUNNER_TEMP 'sc23935-powershell-scripts.json'
+          @'
+          import json
+          import pathlib
+          import sys
+          import yaml
 
-  release-metadata:
-    name: runtime manifest + SPDX SBOM
-    needs: changes
-    if: needs.changes.outputs.release == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Cache Cargo graph
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          # Save only on `main` — see the note on the `workspace` job's cache step.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Build dry-run release metadata
-        run: >-
-          python3 scripts/release/build_release.py
-          --tag runtime-2000.01.0-rc.0 --skip-archive
-      - name: Verify manifest, checksums, and SBOM graph
-        run: python3 scripts/release/verify_release.py dist/release --skip-smoke
+          workflow = yaml.safe_load(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          scripts = [
+              step["run"]
+              for job in workflow["jobs"].values()
+              for step in job.get("steps", [])
+              if step.get("shell") == "powershell"
+          ]
+          if not scripts or not all(isinstance(script, str) and script.strip() for script in scripts):
+              raise SystemExit("workflow has a missing or empty PowerShell run block")
+          pathlib.Path(sys.argv[2]).write_text(json.dumps(scripts), encoding="utf-8")
+          '@ | Set-Content -LiteralPath $extractor -Encoding utf8
+          uv run --no-project --no-config --python 3.12.10 --with pyyaml==6.0.3 `
+            python $extractor '.github/workflows/ci.yml' $scriptsJson
+          if ($LASTEXITCODE -ne 0) { throw 'failed to extract embedded PowerShell scripts' }
+          $scripts = @(Get-Content -LiteralPath $scriptsJson -Raw | ConvertFrom-Json)
+          for ($scriptIndex = 0; $scriptIndex -lt $scripts.Count; $scriptIndex++) {
+            $tokens = $null
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseInput(
+              $scripts[$scriptIndex], [ref]$tokens, [ref]$parseErrors
+            ) | Out-Null
+            if ($parseErrors.Count -ne 0) {
+              $parseErrors | ForEach-Object { Write-Error $_.Message }
+              throw "embedded PowerShell script $($scriptIndex + 1) has parser errors"
+            }
+          }
+          Write-Host "SC23935_POWERSHELL_PARSE scripts=$($scripts.Count) passed=true"
 
-  release-artifacts:
-    name: tagged source archive + external smoke
-    needs: [changes, release-metadata]
-    if: startsWith(github.ref, 'refs/tags/runtime-')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Cache Cargo graph
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          # Save only on `main` — see the note on the `workspace` job's cache step. This lane is
-          # tag-gated (`refs/tags/runtime-*`), and a tag-scoped cache is readable from no other ref
-          # at all, so saving here only ever consumed budget the PR lanes needed.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Build tagged source bundle
-        run: python3 scripts/release/build_release.py --tag "$GITHUB_REF_NAME"
-      - name: Verify and consume source bundle externally
-        run: python3 scripts/release/verify_release.py dist/release
-      - name: Upload immutable release inputs
+      - name: Record exact source, model, and hardware provenance
+        timeout-minutes: 7
+        shell: powershell
+        run: |
+          $status = @(git status --porcelain=v1)
+          $base = '7b7730a1a06a231ce337352dbc5b525eb3f8cc78'
+          git merge-base --is-ancestor $base HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'probe does not descend from exact RC4 source' }
+          if ($status.Count -ne 0) { throw 'diagnostic checkout is not clean' }
+          $candleRevision = '1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d'
+          if ((Get-Content -LiteralPath Cargo.toml -Raw) -notmatch [regex]::Escape($candleRevision)) {
+            throw 'Cargo.toml lost the expected pinned Candle revision'
+          }
+          [ordered]@{
+            schema_version = 1
+            github_sha = $env:GITHUB_SHA
+            checked_out_sha = (git rev-parse HEAD).Trim()
+            rc4_base_sha = $base
+            diagnostic_changed_paths = @(git diff --name-only "$base..HEAD")
+            clean_tree = $true
+            cargo_lock_sha256 = (Get-FileHash -Algorithm SHA256 Cargo.lock).Hash.ToLowerInvariant()
+            pinned_candle_revision = $candleRevision
+            expected_parent_revision = '1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0'
+            expected_bonsai_revision = '6ed5e12bf84b7a63069882c91dd9e9218647d17b'
+            parent_snapshot = $env:BONSAI_QWEN38_SNAPSHOT
+            bonsai_snapshot = $env:BONSAI_GGUF_SNAPSHOT
+            expected_gpu_index = 0
+            expected_gpu_uuid = $env:EXPECTED_GPU_UUID
+          } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $env:SC23935_EVIDENCE_ROOT 'provenance.json') -Encoding utf8
+          & $env:REVIEWED_PYTHON scripts/release/qwen38_bonsai_terminal.py hardware `
+            --output (Join-Path $env:SC23935_EVIDENCE_ROOT 'hardware-before.json')
+          if ($LASTEXITCODE -ne 0) { throw 'hardware inventory failed' }
+          & $env:REVIEWED_PYTHON scripts/release/qwen38_bonsai_terminal.py qualify-snapshots `
+            --platform windows `
+            --binding BONSAI_QWEN38_SNAPSHOT=bonsai-qwen38-parent --binding BONSAI_GGUF_SNAPSHOT=bonsai-gguf `
+            --output (Join-Path $env:SC23935_EVIDENCE_ROOT 'snapshot-metadata.json')
+          if ($LASTEXITCODE -ne 0) { throw 'frozen parent snapshot identity check failed' }
+
+      - name: Build the existing native Candle CUDA comparison executable
+        timeout-minutes: 45
+        shell: powershell
+        run: |
+          cmd /c "call `"$env:VCVARS`" && set" |
+            ForEach-Object {
+              if ($_ -match '^(.*?)=(.*)$') { Set-Item -Force "env:$($matches[1])" $matches[2] }
+            }
+          $env:PATH = "$(Join-Path $env:CUDA_PATH 'bin');$env:PATH"
+          @(
+            "rustc: $(rustc -Vv)",
+            "cargo: $(cargo -V)",
+            "nvcc: $(nvcc --version)"
+          ) | Set-Content -LiteralPath (Join-Path $env:SC23935_EVIDENCE_ROOT 'build-toolchain.txt') -Encoding utf8
+          $runner = Join-Path $env:RUNNER_TEMP 'sc23935-run-process.py'
+          @'
+          import json
+          import pathlib
+          import subprocess
+          import sys
+          import time
+
+          stdout_path, stderr_path, receipt_path, *command = sys.argv[1:]
+          started = time.time()
+          with open(stdout_path, "wb") as stdout, open(stderr_path, "wb") as stderr:
+              completed = subprocess.run(command, stdout=stdout, stderr=stderr, check=False)
+          pathlib.Path(receipt_path).write_text(json.dumps({
+              "command": command,
+              "returncode": completed.returncode,
+              "elapsed_seconds": time.time() - started,
+          }, indent=2), encoding="utf-8")
+          raise SystemExit(completed.returncode)
+          '@ | Set-Content -LiteralPath $runner -Encoding utf8
+          $buildJson = Join-Path $env:SC23935_EVIDENCE_ROOT 'build.jsonl'
+          $buildStderr = Join-Path $env:SC23935_EVIDENCE_ROOT 'build.stderr.log'
+          $buildReceipt = Join-Path $env:SC23935_EVIDENCE_ROOT 'build-process.json'
+          & $env:REVIEWED_PYTHON $runner $buildJson $buildStderr $buildReceipt cargo `
+            test --locked --release -p candle-llm --features cuda --test qwen38_bonsai --no-run --message-format=json
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content -LiteralPath $buildStderr
+            throw 'Candle CUDA comparison build failed'
+          }
+          $binaryPath = Join-Path $env:SC23935_EVIDENCE_ROOT 'binary.txt'
+          Get-Content -LiteralPath $buildJson | & $env:REVIEWED_PYTHON `
+            scripts/release/qwen38_bonsai_terminal.py resolve-binary --target qwen38_bonsai |
+            Set-Content -LiteralPath $binaryPath -Encoding ascii
+          if ($LASTEXITCODE -ne 0) { throw 'comparison binary resolution failed' }
+          $binary = (Get-Content -LiteralPath $binaryPath -Raw).Trim()
+          if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
+            throw "resolved comparison binary is missing: $binary"
+          }
+          [ordered]@{
+            path = $binary
+            size_bytes = (Get-Item -LiteralPath $binary).Length
+            sha256 = (Get-FileHash -Algorithm SHA256 $binary).Hash.ToLowerInvariant()
+          } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:SC23935_EVIDENCE_ROOT 'binary.json') -Encoding utf8
+          "SC23935_TEST_BINARY=$binary" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # One owned GPU0 token spans both phases on the same Windows host.
+      - name: Reserve GPU0 and preflight exact CPU and CUDA profiles
+        timeout-minutes: 5
+        shell: powershell
+        run: |
+          & $env:REVIEWED_PYTHON scripts/release/qwen38_bonsai_terminal.py reserve-gpu --gpu-index 0 --reservation $env:SC23935_GPU_RESERVATION --evidence (Join-Path $env:SC23935_EVIDENCE_ROOT 'gpu-reservation.json') --token $env:SC23935_RESERVATION_TOKEN
+          if ($LASTEXITCODE -ne 0) { throw 'GPU0 is unavailable, co-tenanted, or already reserved' }
+          'SC23935_RESERVATION_ACQUIRED=1' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $reservation = Get-Content -LiteralPath (Join-Path $env:SC23935_EVIDENCE_ROOT 'gpu-reservation.json') -Raw | ConvertFrom-Json
+          if ($reservation.gpu_index -ne 0 -or $reservation.gpu_uuid -ne $env:EXPECTED_GPU_UUID) { throw 'wrong physical GPU0 identity' }
+          & $env:REVIEWED_PYTHON scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-qwen38-parent --load-profile candle-dense-cpu --output (Join-Path $env:SC23935_EVIDENCE_ROOT 'cpu-preflight.json')
+          if ($LASTEXITCODE -ne 0) { throw 'dense CPU parent preflight failed' }
+          & $env:REVIEWED_PYTHON scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-gguf --language-variant ptq1 --vision-variant q8 --load-profile candle-packed-cuda --reservation $env:SC23935_GPU_RESERVATION --reservation-token $env:SC23935_RESERVATION_TOKEN --output (Join-Path $env:SC23935_EVIDENCE_ROOT 'cuda-preflight.json')
+          if ($LASTEXITCODE -ne 0) { throw 'packed CUDA Bonsai preflight failed' }
+          foreach ($name in @('cpu-preflight.json', 'cuda-preflight.json')) {
+            $preflight = Get-Content -LiteralPath (Join-Path $env:SC23935_EVIDENCE_ROOT $name) -Raw | ConvertFrom-Json
+            if ($preflight.admitted -ne $true) { throw "preflight did not admit $name" }
+          }
+
+      - name: Run CPU parent arithmetic with the 600-second native watchdog
+        id: cpu_probe
+        timeout-minutes: 20
+        continue-on-error: true
+        shell: powershell
+        run: |
+          $binary = (Get-Content -LiteralPath (Join-Path $env:SC23935_EVIDENCE_ROOT 'binary.txt') -Raw).Trim()
+          $root = $env:SC23935_EVIDENCE_ROOT
+          & $env:REVIEWED_PYTHON scripts/ci/sc23935_bounded_probe.py --row (Join-Path $root 'cpu-parent') --record (Join-Path $root 'cpu-launch.json') --timeout-seconds 900 -- $env:REVIEWED_PYTHON scripts/release/qwen38_bonsai_terminal.py run --diagnostic-timeout-seconds 600 --candle-device cpu --binary $binary --test-name native_comparison --model-id candle-cpu-qwen38-parent-stage-probe --model-key bonsai-qwen38-parent --model-revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 --snapshot $env:BONSAI_QWEN38_SNAPSHOT --model-path $env:BONSAI_QWEN38_SNAPSHOT --runtime-sha $env:GITHUB_SHA --cases arithmetic --preflight (Join-Path $root 'cpu-preflight.json') --output (Join-Path $root 'cpu-parent')
+          if ($LASTEXITCODE -ne 0) { throw "CPU probe status $LASTEXITCODE; inspect partial receipt and stages" }
+
+      - name: Prove the CPU child tree is absent
+        timeout-minutes: 2
+        id: cpu_cleanup
+        if: always() && env.SC23935_RESERVATION_ACQUIRED == '1'
+        shell: powershell
+        run: |
+          $path = Join-Path $env:SC23935_EVIDENCE_ROOT 'cpu-launch.json'
+          if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw 'missing CPU launch cleanup proof' }
+          $proof = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+          if ($proof.safe_to_continue -ne $true -or $proof.native_pids.Count -lt 1) { throw 'CPU child cleanup is unproven' }
+          foreach ($nativePid in $proof.native_pids) {
+            if (Get-CimInstance Win32_Process -Filter "ProcessId = $nativePid") { throw "CPU native PID $nativePid is alive" }
+          }
+          'safe=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Recheck GPU0 and run Bonsai CUDA acceptance plus tool/code diagnostics
+        id: cuda_probe
+        if: always() && steps.cpu_cleanup.outputs.safe == 'true'
+        timeout-minutes: 25
+        continue-on-error: true
+        shell: powershell
+        run: |
+          $root = $env:SC23935_EVIDENCE_ROOT
+          & $env:REVIEWED_PYTHON scripts/release/qwen38_bonsai_terminal.py check-gpu-reservation --gpu-index 0 --reservation $env:SC23935_GPU_RESERVATION --token $env:SC23935_RESERVATION_TOKEN --output (Join-Path $root 'gpu-recheck.json')
+          if ($LASTEXITCODE -ne 0) { throw 'GPU0 ownership, capacity, or no-co-tenant recheck failed' }
+          $binary = (Get-Content -LiteralPath (Join-Path $root 'binary.txt') -Raw).Trim()
+          $snapshot = $env:BONSAI_GGUF_SNAPSHOT
+          $model = Join-Path $snapshot 'Ternary-Bonsai-2-27B-PTQ1_0.gguf'
+          $projector = Join-Path $snapshot 'Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf'
+          & $env:REVIEWED_PYTHON scripts/ci/sc23935_bounded_probe.py --row (Join-Path $root 'cuda-bonsai') --record (Join-Path $root 'cuda-launch.json') --timeout-seconds 1200 -- $env:REVIEWED_PYTHON scripts/release/qwen38_bonsai_terminal.py run --candle-device auto --binary $binary --test-name native_comparison --model-id candle-cuda-bonsai-gguf-eight-case-probe --model-key bonsai-gguf --language-variant ptq1 --vision-variant q8 --model-revision 6ed5e12bf84b7a63069882c91dd9e9218647d17b --snapshot $snapshot --model-path $model --projector-path $projector --runtime-sha $env:GITHUB_SHA --cases reasoning_low,reasoning_medium,reasoning_xhigh,preserve_thinking,tool_roundtrip,json_thinking,tool,code --preflight (Join-Path $root 'cuda-preflight.json') --reservation $env:SC23935_GPU_RESERVATION --reservation-token $env:SC23935_RESERVATION_TOKEN --output (Join-Path $root 'cuda-bonsai')
+          if ($LASTEXITCODE -ne 0) { throw "CUDA Bonsai probe status $LASTEXITCODE; inspect exact cases" }
+
+      - name: Prove the CUDA child tree is absent
+        timeout-minutes: 2
+        id: cuda_cleanup
+        if: always() && steps.cpu_cleanup.outputs.safe == 'true'
+        shell: powershell
+        run: |
+          $path = Join-Path $env:SC23935_EVIDENCE_ROOT 'cuda-launch.json'
+          if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw 'missing CUDA launch cleanup proof' }
+          $proof = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+          if ($proof.safe_to_continue -ne $true -or $proof.native_pids.Count -lt 1) { throw 'CUDA child cleanup is unproven' }
+          foreach ($nativePid in $proof.native_pids) {
+            if (Get-CimInstance Win32_Process -Filter "ProcessId = $nativePid") { throw "CUDA native PID $nativePid is alive" }
+          }
+          'safe=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Release only a quiescent owned GPU0 reservation
+        timeout-minutes: 2
+        id: release
+        if: always() && env.SC23935_RESERVATION_ACQUIRED == '1'
+        shell: powershell
+        run: |
+          if ('${{ steps.cpu_cleanup.outputs.safe }}' -ne 'true' -or '${{ steps.cuda_cleanup.outputs.safe }}' -ne 'true') {
+            throw 'native cleanup unproven; retain owned reservation for coordinator cleanup'
+          }
+          & $env:REVIEWED_PYTHON scripts/release/qwen38_bonsai_terminal.py release-gpu --gpu-index 0 --reservation $env:SC23935_GPU_RESERVATION --token $env:SC23935_RESERVATION_TOKEN
+          if ($LASTEXITCODE -ne 0) { throw 'owned GPU0 reservation release failed' }
+          'released=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Validate and seal bounded diagnostic evidence
+        timeout-minutes: 5
+        if: always()
+        shell: powershell
+        run: |
+          & $env:REVIEWED_PYTHON scripts/ci/sc23935_bounded_probe.py validate --root $env:SC23935_EVIDENCE_ROOT --runtime-sha $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw 'diagnostic evidence failed validation; full campaign remains required' }
+
+      - name: Upload diagnostic evidence
+        timeout-minutes: 5
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ${{ github.ref_name }}-source
-          path: dist/release/
+          name: sc23935-cpu-bonsai-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}\sc23935-cpu-bonsai-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: error
-
-  # Single aggregated verdict for branch protection and the merge queue to require. Two reasons
-  # this exists rather than naming each lane in the ruleset:
-  #
-  # 1. A lane skipped by its `if:` reports SUCCESS to a required status check, and a lane skipped
-  #    because `needs: changes` FAILED reports the same way. Naming lanes individually therefore
-  #    lets a broken `changes` job read green across the whole board. Collapsing to `needs.*.result`
-  #    distinguishes them: a failed dependency leaves `failure` in the results, a genuine path-based
-  #    skip leaves `skipped`.
-  # 2. Required contexts are matched on job *display name*, so per-lane requirements silently stop
-  #    enforcing the moment a `name:` is reworded. One context that no one renames cannot rot that
-  #    way.
-  #
-  # `if: always()` is mandatory — the default `success()` would skip this job exactly when an
-  # upstream lane failed, which reports success and inverts the gate. Every non-gate job is listed;
-  # dispatch- and tag-only lanes are included deliberately, since `skipped` is tolerated and that
-  # keeps them covered on the events where they do run. Add new jobs here, or they go ungated.
-  gate:
-    name: CI gate
-    needs:
-      - changes
-      - resolve
-      - format
-      - workspace
-      - contracts
-      - contracts-windows
-      - candle-cpu-lint
-      - candle-cpu-test
-      - candle-cpu-conformance
-      - candle-cpu-bundles
-      - macos-metal
-      - macos-nax
-      - windows-cuda-check
-      - windows-cuda
-      - supply-chain
-      - docs
-      - release-metadata
-      - release-artifacts
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Require every lane to have succeeded or been skipped
-        env:
-          RESULTS: ${{ join(needs.*.result, ' ') }}
-        run: |
-          echo "lane results: $RESULTS"
-          for result in $RESULTS; do
-            case "$result" in
-              success|skipped) ;;
-              *)
-                echo "::error::a CI lane reported '$result'; see the failing job above"
-                exit 1
-                ;;
-            esac
-          done
+          retention-days: 14
