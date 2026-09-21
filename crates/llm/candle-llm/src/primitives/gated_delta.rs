@@ -422,6 +422,132 @@ mod tests {
     }
 
     #[test]
+    fn cpu_batched_recurrence_matches_ops_and_chunks_with_two_batches() {
+        const B: usize = 2;
+        const T: usize = 5;
+        const HK: usize = 2;
+        const HV: usize = 4;
+        const DK: usize = 3;
+        const DV: usize = 5;
+        let sample = |len: usize, salt: usize, scale: f32| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i * 17 + salt) % 37) as f32 * scale - 18.0 * scale)
+                .collect()
+        };
+        let q = Tensor::from_vec(
+            sample(B * T * HK * DK, 1, 0.02),
+            (B, T, HK, DK),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let k = Tensor::from_vec(
+            sample(B * T * HK * DK, 2, 0.03),
+            (B, T, HK, DK),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let v = Tensor::from_vec(
+            sample(B * T * HV * DV, 3, 0.04),
+            (B, T, HV, DV),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let g = Tensor::from_vec(
+            sample(B * T * HV, 4, 0.001)
+                .into_iter()
+                .map(|x| 0.96 + x)
+                .collect(),
+            (B, T, HV),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let beta = Tensor::from_vec(
+            sample(B * T * HV, 5, 0.002)
+                .into_iter()
+                .map(|x| 0.4 + x)
+                .collect(),
+            (B, T, HV),
+            &Device::Cpu,
+        )
+        .unwrap();
+
+        let (actual_y, actual_state) = gated_delta_recurrence(&q, &k, &v, &g, &beta, None).unwrap();
+        assert_eq!(actual_y.dims(), &[B, T, HV, DV]);
+        assert_eq!(actual_state.dims(), &[B, HV, DV, DK]);
+
+        // The original broadcast-product/sum path is a separate multi-token numeric reference.
+        let q_full = repeat_heads(&q, HV / HK).unwrap();
+        let k_full = repeat_heads(&k, HV / HK).unwrap();
+        let mut reference_state = Tensor::zeros((B, HV, DV, DK), DType::F32, &Device::Cpu).unwrap();
+        let mut reference_ys = Vec::new();
+        for ti in 0..T {
+            let pick = |x: &Tensor| x.narrow(1, ti, 1).unwrap().squeeze(1).unwrap();
+            let (qt, kt, vt, gt, bt) = (
+                pick(&q_full),
+                pick(&k_full),
+                pick(&v),
+                pick(&g),
+                pick(&beta),
+            );
+            let decayed = reference_state
+                .broadcast_mul(&gt.reshape((B, HV, 1, 1)).unwrap())
+                .unwrap();
+            let k_row = kt.reshape((B, HV, 1, DK)).unwrap();
+            let remembered = decayed.broadcast_mul(&k_row).unwrap().sum(3).unwrap();
+            let delta = vt
+                .broadcast_sub(&remembered)
+                .unwrap()
+                .broadcast_mul(&bt.reshape((B, HV, 1)).unwrap())
+                .unwrap();
+            reference_state = decayed
+                .broadcast_add(
+                    &k_row
+                        .broadcast_mul(&delta.reshape((B, HV, DV, 1)).unwrap())
+                        .unwrap(),
+                )
+                .unwrap();
+            let y = reference_state
+                .broadcast_mul(&qt.reshape((B, HV, 1, DK)).unwrap())
+                .unwrap()
+                .sum(3)
+                .unwrap();
+            reference_ys.push(y.unsqueeze(1).unwrap());
+        }
+        let refs: Vec<_> = reference_ys.iter().collect();
+        let reference_y = Tensor::cat(&refs, 1).unwrap();
+        assert!(max_abs_diff(&host(&actual_y), &host(&reference_y)) < 1e-5);
+        assert!(max_abs_diff(&host(&actual_state), &host(&reference_state)) < 1e-5);
+
+        // The second batch makes a middle-sequence slice noncontiguous in its batch dimension.
+        let vector = q_full.narrow(1, 1, 1).unwrap().squeeze(1).unwrap();
+        assert!(!vector.is_contiguous());
+        let row = vector.reshape((B, HV, 1, DK)).unwrap();
+        let expected_read = actual_state.broadcast_mul(&row).unwrap().sum(3).unwrap();
+        let actual_read = state_read(&actual_state, &vector, &row, B, HV, DK).unwrap();
+        assert!(max_abs_diff(&host(&actual_read), &host(&expected_read)) < 1e-5);
+
+        let mut carried = None;
+        let mut chunks = Vec::new();
+        for (start, len) in [(0, 2), (2, 3)] {
+            let (y, state) = gated_delta_recurrence(
+                &q.narrow(1, start, len).unwrap(),
+                &k.narrow(1, start, len).unwrap(),
+                &v.narrow(1, start, len).unwrap(),
+                &g.narrow(1, start, len).unwrap(),
+                &beta.narrow(1, start, len).unwrap(),
+                carried.as_ref(),
+            )
+            .unwrap();
+            chunks.push(y);
+            carried = Some(state);
+        }
+        let refs: Vec<_> = chunks.iter().collect();
+        let chunked_y = Tensor::cat(&refs, 1).unwrap();
+        assert!(max_abs_diff(&host(&actual_y), &host(&chunked_y)) < 1e-5);
+        assert!(max_abs_diff(&host(&actual_state), &host(&carried.unwrap())) < 1e-5);
+    }
+
+    #[test]
     fn compute_g_is_in_unit_interval_and_shaped() {
         // g = exp(−positive) ∈ (0, 1]: a per-head forget gate.
         let a = Tensor::from_slice(A, (1, 3, 4), &Device::Cpu).unwrap();
