@@ -603,7 +603,27 @@ def safetensor_sizes(path: Path) -> tuple[int, int]:
     return language, vision
 
 
-def artifact_sizes(model_path: Path, projector_path: Path | None) -> dict[str, int]:
+def inventoried_auxiliary_bytes(files: list[dict[str, Any]]) -> int:
+    if not files:
+        raise ValueError("snapshot inventory is missing file evidence")
+    auxiliary = 0
+    for item in files:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("path"), str)
+            or type(item.get("size")) is not int
+            or item["size"] < 0
+        ):
+            raise ValueError("snapshot inventory has invalid file sizes")
+        # Only top-level safetensors are selected as weights by artifact_sizes().
+        if "/" in item["path"] or not item["path"].endswith(".safetensors"):
+            auxiliary += item["size"]
+    return auxiliary
+
+
+def artifact_sizes(
+    model_path: Path, projector_path: Path | None, inventory: dict[str, Any]
+) -> dict[str, int]:
     language = vision = auxiliary = 0
     if model_path.is_file():
         language = model_path.stat().st_size
@@ -613,12 +633,7 @@ def artifact_sizes(model_path: Path, projector_path: Path | None) -> dict[str, i
             lang, vis = safetensor_sizes(path)
             language += lang
             vision += vis
-        weight_files = {path.resolve() for path in safetensors}
-        auxiliary = sum(
-            path.stat().st_size
-            for path in model_path.rglob("*")
-            if path.is_file() and path.resolve() not in weight_files
-        )
+        auxiliary = inventoried_auxiliary_bytes(inventory["files"])
     if projector_path is not None:
         vision += projector_path.stat().st_size
     return {
@@ -660,6 +675,50 @@ def pinned_admission_sizes(
         sizes[output] = value
     sizes["auxiliary_bytes"] = 0
     return sizes
+
+
+def validate_artifact_size_evidence(receipt_model: dict[str, Any], pinned: dict[str, int]) -> None:
+    """Check admitted weights and auxiliary bytes against the sealed snapshot inventory."""
+    measured = receipt_model.get("artifact_sizes")
+    weight_fields = ("language_weight_bytes", "vision_weight_bytes")
+    if (
+        not isinstance(measured, dict)
+        or set(measured) != {*weight_fields, "auxiliary_bytes"}
+        or any(type(value) is not int or value < 0 for value in measured.values())
+        or any(measured[key] != pinned[key] for key in weight_fields)
+    ):
+        raise ValueError("run weight bytes do not match pinned admission bytes")
+    selected = receipt_model.get("selected_model_artifact") or {}
+    if selected.get("kind") == "file":
+        expected_auxiliary = 0
+    elif selected.get("kind") == "snapshot":
+        inventory = receipt_model.get("inventory_before") or {}
+        files = inventory.get("files")
+        if not isinstance(files, list) or not files:
+            raise ValueError("run snapshot inventory is missing auxiliary file evidence")
+        projection = []
+        expected_auxiliary = inventoried_auxiliary_bytes(files)
+        for item in files:
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("path"), str)
+                or type(item.get("size")) is not int
+                or item["size"] < 0
+                or not isinstance(item.get("sha256"), str)
+            ):
+                raise ValueError("run snapshot inventory has invalid file evidence")
+            projection.append({key: item[key] for key in ("path", "size", "sha256")})
+        digest = hashlib.sha256(
+            json.dumps(projection, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        if selected.get("sha256") != digest or inventory.get("inventory_sha256") != digest:
+            raise ValueError("run snapshot inventory identity differs from selected artifact")
+        if (receipt_model.get("inventory_after") or {}).get("files") != files:
+            raise ValueError("run snapshot inventory files changed after execution")
+    else:
+        raise ValueError("run selected model artifact has an unknown kind")
+    if measured["auxiliary_bytes"] != expected_auxiliary:
+        raise ValueError("run auxiliary bytes do not match snapshot inventory")
 
 
 def host_load_bound(model: dict[str, Any], load_profile: str, sizes: dict[str, int],
@@ -831,7 +890,7 @@ def run(args: argparse.Namespace) -> int:
     before = snapshot_inventory(model, args.snapshot)
     if model["key"].startswith("bonsai-"):
         assets.verify_inventory(model, before)
-    measured_sizes = artifact_sizes(args.model_path, args.projector_path)
+    measured_sizes = artifact_sizes(args.model_path, args.projector_path, before)
     pinned_sizes = pinned_admission_sizes(model, args.language_variant, args.vision_variant)
     if any(measured_sizes[key] != pinned_sizes[key] for key in pinned_sizes if key != "auxiliary_bytes"):
         raise ValueError(
@@ -2201,12 +2260,14 @@ def matrix_status(args: argparse.Namespace) -> int:
                             raise ValueError("run model key does not match matrix cell")
                         if receipt_model.get("revision") != model["revision"]:
                             raise ValueError("run revision does not match pinned manifest")
-                        if receipt_model.get("artifact_sizes") != pinned_admission_sizes(
-                            model,
-                            cell.get("language_variant"),
-                            cell.get("vision_variant"),
-                        ):
-                            raise ValueError("run artifact sizes do not match pinned manifest")
+                        validate_artifact_size_evidence(
+                            receipt_model,
+                            pinned_admission_sizes(
+                                model,
+                                cell.get("language_variant"),
+                                cell.get("vision_variant"),
+                            ),
+                        )
                         if receipt_model.get("language_variant") != cell.get(
                             "language_variant"
                         ) or receipt_model.get("vision_variant") != cell.get("vision_variant"):
