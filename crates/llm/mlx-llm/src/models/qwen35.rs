@@ -1759,15 +1759,14 @@ mod tests {
         map.insert(key.to_string(), Array::from_slice(&data, shape));
     }
 
-    fn synthetic_weights(cfg: &Qwen35Config) -> Weights {
+    fn synthetic_weights_with_prefix(cfg: &Qwen35Config, pfx: &str) -> Weights {
         let h = cfg.hidden_size;
         let key_dim = cfg.linear_key_head_dim * cfg.linear_num_key_heads;
         let value_dim = cfg.linear_value_head_dim * cfg.linear_num_value_heads;
         let conv_dim = key_dim * 2 + value_dim;
         let mut m = HashMap::new();
-        // Mirror the real VLM-wrapped layout: the text decoder nests under `model.language_model`,
-        // with `lm_head.weight` at the checkpoint root.
-        let pfx = "model.language_model";
+        // The decoder can live under either VLM-wrapped or flat text-only roots; `lm_head` and
+        // `mtp.*` remain at the checkpoint root in both layouts.
         t(
             &mut m,
             &format!("{pfx}.embed_tokens.weight"),
@@ -1930,6 +1929,10 @@ mod tests {
         Weights::from_map(m)
     }
 
+    fn synthetic_weights(cfg: &Qwen35Config) -> Weights {
+        synthetic_weights_with_prefix(cfg, "model.language_model")
+    }
+
     fn cfg_json_mtp() -> serde_json::Value {
         let mut v = cfg_json();
         let tc = v["text_config"].as_object_mut().unwrap();
@@ -1964,6 +1967,56 @@ mod tests {
         }
         // The full-attention layer (layer 3) advanced the KV cache to 5 positions.
         assert_eq!(cache.offset(), 5);
+    }
+
+    #[test]
+    fn flat_text_and_wrapped_qwen35_match_target_and_mtp() {
+        let wrapped_json = cfg_json_mtp();
+        let flat_json = wrapped_json["text_config"].clone();
+        let wrapped_cfg = Qwen35Config::from_json(&wrapped_json).unwrap();
+        let flat_cfg = Qwen35Config::from_json(&flat_json).unwrap();
+        let wrapped = Qwen35Model::from_weights(
+            &synthetic_weights_with_prefix(&wrapped_cfg, "model.language_model"),
+            "model.language_model",
+            wrapped_cfg,
+        )
+        .unwrap();
+        let flat = Qwen35Model::from_weights(
+            &synthetic_weights_with_prefix(&flat_cfg, "model"),
+            "model",
+            flat_cfg,
+        )
+        .unwrap();
+        let ids = Array::from_slice(&[1i32, 7, 3], &[1, 3]);
+        let wrapped_logits = wrapped.forward(&ids, &mut wrapped.new_cache(), 0).unwrap();
+        let flat_logits = flat.forward(&ids, &mut flat.new_cache(), 0).unwrap();
+        let values = |a: &Array| {
+            a.as_dtype(Dtype::Float32)
+                .unwrap()
+                .as_slice::<f32>()
+                .to_vec()
+        };
+        assert_eq!(values(&wrapped_logits), values(&flat_logits));
+
+        let shifted_ids = Array::from_slice(&[2i32, 3], &[1, 2]);
+        let aligned_hidden = Array::from_slice(&vec![0f32; 2 * 32], &[1, 2, 32]);
+        let (_, wrapped_draft) = wrapped
+            .mtp_step(
+                &shifted_ids,
+                &aligned_hidden,
+                &mut wrapped.new_mtp_cache().unwrap(),
+                0,
+            )
+            .unwrap();
+        let (_, flat_draft) = flat
+            .mtp_step(
+                &shifted_ids,
+                &aligned_hidden,
+                &mut flat.new_mtp_cache().unwrap(),
+                0,
+            )
+            .unwrap();
+        assert_eq!(values(&wrapped_draft), values(&flat_draft));
     }
 
     #[test]

@@ -594,6 +594,24 @@ pub struct LlamaProvider {
     _prism_vision_weights: Option<Weights>,
 }
 
+/// The same Qwen3.5/3.8 decoder appears under `model.language_model` in VLM snapshots and
+/// directly under `model` in text-only finetunes. Reject ambiguous or incomplete layouts.
+fn qwen35_dense_prefix(has_key: impl Fn(&str) -> bool) -> CoreResult<&'static str> {
+    match (
+        has_key("model.language_model.embed_tokens.weight"),
+        has_key("model.embed_tokens.weight"),
+    ) {
+        (true, false) => Ok("model.language_model"),
+        (false, true) => Ok("model"),
+        (false, false) => Err(CoreError::Load(
+            "qwen3_5 checkpoint has no wrapped or flat decoder embeddings".into(),
+        )),
+        (true, true) => Err(CoreError::Load(
+            "qwen3_5 checkpoint has both wrapped and flat decoder embeddings".into(),
+        )),
+    }
+}
+
 impl LlamaProvider {
     /// Load a provider from a snapshot directory (config.json + tokenizer.json + shards). Dispatches
     /// the decoder architecture from `config.json` (Llama / Mistral / Qwen3) and optionally
@@ -660,8 +678,8 @@ impl LlamaProvider {
                 model
             } else {
                 // The text decoder nests under `model.language_model` in the VLM-wrapped checkpoint.
-                Qwen35Model::from_weights_with(&weights, "model.language_model", qcfg, quant)
-                    .map_err(to_core)?
+                let prefix = qwen35_dense_prefix(|key| weights.contains(key))?;
+                Qwen35Model::from_weights_with(&weights, prefix, qcfg, quant).map_err(to_core)?
             };
             (Decoder::Qwen35(m), descriptor)
         } else {
@@ -2502,6 +2520,25 @@ fn gemma4_multimodal(v: &serde_json::Value, block: &str, token_key: &str) -> boo
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn qwen35_dense_checkpoint_selects_one_decoder_root() {
+        let select = |keys: &[&str]| qwen35_dense_prefix(|key| keys.contains(&key));
+        assert_eq!(
+            select(&["model.language_model.embed_tokens.weight"]).unwrap(),
+            "model.language_model"
+        );
+        assert_eq!(
+            select(&["model.embed_tokens.weight", "mtp.fc.weight"]).unwrap(),
+            "model"
+        );
+        assert!(select(&[]).is_err());
+        assert!(select(&[
+            "model.language_model.embed_tokens.weight",
+            "model.embed_tokens.weight"
+        ])
+        .is_err());
+    }
 
     fn frozen_dense_qwen35_config() -> Qwen35Config {
         Qwen35Config::from_json(&json!({
