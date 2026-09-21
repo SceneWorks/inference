@@ -44,7 +44,9 @@ def process_exited(pid: int) -> bool:
     kernel.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
     kernel.WaitForSingleObject.restype = ctypes.c_uint32
     kernel.CloseHandle.argtypes = (ctypes.c_void_p,)
-    handle = kernel.OpenProcess(0x1000, 0, pid)
+    # WaitForSingleObject requires SYNCHRONIZE; PROCESS_QUERY_LIMITED_INFORMATION
+    # alone can open a live process but makes the wait fail with access denied.
+    handle = kernel.OpenProcess(0x00101000, 0, pid)
     if not handle:
         # Access denied is not evidence of process absence. Only the invalid-PID error is.
         return kernel.GetLastError() == 87
@@ -52,6 +54,26 @@ def process_exited(pid: int) -> bool:
         return kernel.WaitForSingleObject(handle, 0) == 0
     finally:
         kernel.CloseHandle(handle)
+
+
+def self_check_process_exit() -> int:
+    """Exercise Windows wait rights against a live then exited held child handle."""
+    if sys.platform != "win32":
+        raise RuntimeError("Windows process-exit check requires Windows")
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        if process_exited(child.pid):
+            raise RuntimeError("live diagnostic child incorrectly classified as exited")
+        child.terminate()
+        child.wait(timeout=10)
+        if not process_exited(child.pid):
+            raise RuntimeError("exited diagnostic child incorrectly classified as live")
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
+    print("Windows live/exited process-handle check passed", flush=True)
+    return 0
 
 
 def load_json(path: Path) -> dict:
@@ -326,7 +348,9 @@ def main() -> int:
                     pass
                 returncode = 124
     pids = sorted(native_pids(args.row))
-    wrapper_exited = wrapper.poll() is not None and process_exited(wrapper.pid)
+    # wait() observed the exact Popen handle. Reopening its numeric PID can
+    # inspect a reused process and is weaker than the held-handle result.
+    wrapper_exited = wrapper.poll() is not None
     native_exited = bool(pids) and all(process_exited(pid) for pid in pids)
     record = {
         "schema_version": 1,
@@ -351,4 +375,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(validate_main() if len(sys.argv) > 1 and sys.argv[1] == "validate" else main())
+    if len(sys.argv) > 1 and sys.argv[1] == "validate":
+        raise SystemExit(validate_main())
+    if len(sys.argv) > 1 and sys.argv[1] == "self-check-process-exit":
+        raise SystemExit(self_check_process_exit())
+    raise SystemExit(main())

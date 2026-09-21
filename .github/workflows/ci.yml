@@ -139,6 +139,94 @@ jobs:
           }
           Write-Host "SC23935_POWERSHELL_PARSE scripts=$($scripts.Count) passed=true"
 
+      - name: Prove Windows live and exited PID checks before model work
+        timeout-minutes: 1
+        shell: powershell
+        run: |
+          & $env:REVIEWED_PYTHON scripts/ci/sc23935_bounded_probe.py self-check-process-exit
+          if ($LASTEXITCODE -ne 0) { throw 'Windows process-exit proof failed' }
+
+      # One-time recovery for the exact failed diagnostic run. Its completed CPU
+      # receipt and launch record were inspected before this source change. Never
+      # remove another owner's reservation or kill a PID based on its number.
+      - name: Release only the quiescent reservation from run 35589659377
+        timeout-minutes: 2
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $oldToken = 'sc23935-cpu-bonsai-35589659377-1'
+          $oldTokenSha = 'b2d9e461330ba896465d97cf4924e7099b6630735f5ee7166ccac12a9c96485f'
+          $oldRunEnd = [DateTime]::Parse('2026-09-21T10:42:31Z', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+          $reservationPath = $env:SC23935_GPU_RESERVATION
+          $priorReservationPath = 'C:\Users\Michael\AppData\Local\SceneWorks\inference-reservations\cuda-device-0.json'
+          $recovery = [ordered]@{
+            schema_version = 1
+            prior_run_id = '35589659377'
+            prior_run_attempt = 1
+            prior_runtime_sha = 'aa2400b74cc6560ba7b3a6c61b0aa39f3802205b'
+            prior_token_sha256 = $oldTokenSha
+            expected_gpu_uuid = $env:EXPECTED_GPU_UUID
+            reservation_path = $reservationPath
+            pid_checks = @()
+            reservation_present = $false
+            gpu_recheck_passed = $false
+            release_attempted = $false
+            release_succeeded = $false
+            reservation_absent_after = $false
+          }
+          try {
+            if (-not [string]::Equals([IO.Path]::GetFullPath($reservationPath), [IO.Path]::GetFullPath($priorReservationPath), [StringComparison]::OrdinalIgnoreCase)) {
+              throw 'current runner reservation path differs from the exact prior Windows path'
+            }
+            foreach ($ownedPid in @(33712, 27036)) {
+              $process = Get-CimInstance Win32_Process -Filter "ProcessId = $ownedPid"
+              if ($null -ne $process) {
+                $createdUtc = ([DateTime]$process.CreationDate).ToUniversalTime()
+                $reused = $createdUtc -gt $oldRunEnd
+                $recovery.pid_checks += [ordered]@{ pid = $ownedPid; status = $(if ($reused) { 'reused_after_prior_run' } else { 'could_be_prior_run' }); creation_utc = $createdUtc.ToString('o') }
+                if (-not $reused) {
+                  throw "prior diagnostic PID $ownedPid may still be alive; retain reservation"
+                }
+                Write-Host "PID $ownedPid was reused after the prior diagnostic ended; no process was killed"
+              } else {
+                $recovery.pid_checks += [ordered]@{ pid = $ownedPid; status = 'absent'; creation_utc = $null }
+              }
+            }
+            $recovery.reservation_present = Test-Path -LiteralPath $reservationPath -PathType Leaf
+            if ($recovery.reservation_present) {
+              $record = Get-Content -LiteralPath $reservationPath -Raw | ConvertFrom-Json
+              if ($record.schema_version -ne 1 -or $record.gpu_index -ne 0 -or
+                  $record.gpu_uuid -ne $env:EXPECTED_GPU_UUID -or $record.token_sha256 -ne $oldTokenSha) {
+                throw 'GPU0 reservation differs from the exact prior diagnostic owner'
+              }
+              $recheckPath = Join-Path $env:SC23935_EVIDENCE_ROOT 'prior-reservation-recheck.json'
+              & $env:REVIEWED_PYTHON scripts/release/qwen38_bonsai_terminal.py check-gpu-reservation --gpu-index 0 --reservation $reservationPath --token $oldToken --output $recheckPath
+              if ($LASTEXITCODE -ne 0) { throw 'GPU0 identity or no-tenant recovery check failed' }
+              $recheck = Get-Content -LiteralPath $recheckPath -Raw | ConvertFrom-Json
+              if ($recheck.selected_gpu_uuid -ne $env:EXPECTED_GPU_UUID -or $recheck.selected_gpu_compute_processes.Count -ne 0) {
+                throw 'GPU0 recovery recheck does not prove the selected device is idle'
+              }
+              $recovery.gpu_recheck_passed = $true
+              $recovery.release_attempted = $true
+              & $env:REVIEWED_PYTHON scripts/release/qwen38_bonsai_terminal.py release-gpu --gpu-index 0 --reservation $reservationPath --token $oldToken
+              if ($LASTEXITCODE -ne 0) { throw 'exact prior diagnostic reservation release failed' }
+              $recovery.release_succeeded = $true
+              $recovery.reservation_absent_after = -not (Test-Path -LiteralPath $reservationPath)
+              if (-not $recovery.reservation_absent_after) { throw 'prior reservation still exists after owner-token release' }
+              Write-Host 'Released exact quiescent reservation from run 35589659377'
+            } else {
+              $recovery.reservation_absent_after = $true
+              Write-Host 'Exact prior reservation is already absent; no reservation was removed'
+            }
+          } catch {
+            $recovery['failure'] = $_.Exception.Message
+            throw
+          } finally {
+            $json = $recovery | ConvertTo-Json -Depth 5
+            [IO.File]::WriteAllText((Join-Path $env:SC23935_EVIDENCE_ROOT 'prior-reservation-recovery.json'), $json, [Text.UTF8Encoding]::new($false))
+          }
+
+
       - name: Record exact source, model, and hardware provenance
         timeout-minutes: 7
         shell: powershell
