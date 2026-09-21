@@ -9,6 +9,7 @@ use core_llm::{
     TextLlmRequest, ThinkingMode, VideoRef,
 };
 use serde_json::{json, Value};
+use std::io::Write;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Observable answer oracle, kept with the raw input so scoring can be independently repeated.
@@ -730,6 +731,25 @@ pub fn run_environment(
             .map_err(|error| format!("system clock precedes Unix epoch: {error}"))
     }
 
+    fn stage(
+        run_id: &str,
+        model_id: &str,
+        stage: &str,
+        event: &str,
+        run_started: Instant,
+    ) -> Result<(), String> {
+        let row = json!({"kind":"comparison_stage_v1","run_id":run_id,
+            "process_id":std::process::id(),"model_id":model_id,"stage":stage,
+            "event":event,"unix_seconds":unix_seconds()?,
+            "elapsed_seconds":run_started.elapsed().as_secs_f64()});
+        let stderr = std::io::stderr();
+        let mut stderr = stderr.lock();
+        writeln!(stderr, "{row}").map_err(|error| format!("write stage marker: {error}"))?;
+        stderr
+            .flush()
+            .map_err(|error| format!("flush stage marker: {error}"))
+    }
+
     fn scoped_memory(mut raw: Value, peak_scope: &str, peak_available: bool) -> Value {
         if let Some(object) = raw.as_object_mut() {
             object.insert(
@@ -781,8 +801,11 @@ pub fn run_environment(
             "vendor_quality_retention":false,
             "scope":"fixed native diagnostic cases only"},
         "native_memory_before_load":native_memory_before_load});
+    let run_started = Instant::now();
     let start = Instant::now();
+    stage(&run_id, &model_id, "load", "start", run_started)?;
     let loaded = load(&core_llm::LoadSpec::dense(&model_path));
+    stage(&run_id, &model_id, "load", "end", run_started)?;
     report["load_seconds"] = json!(start.elapsed().as_secs_f64());
     let result = match loaded {
         Err(error) => {
@@ -831,7 +854,21 @@ pub fn run_environment(
             }
             reset_interval()?;
             let resource_started = unix_seconds()?;
+            stage(
+                &run_id,
+                &model_id,
+                "forced_budget_probe",
+                "start",
+                run_started,
+            )?;
             let mut resource_record = measure_case(provider.as_ref(), resource_case);
+            stage(
+                &run_id,
+                &model_id,
+                "forced_budget_probe",
+                "end",
+                run_started,
+            )?;
             let resource_ended = unix_seconds()?;
             let resource_after = scoped_memory(
                 memory(),
@@ -886,6 +923,8 @@ pub fn run_environment(
                 }
                 reset_interval()?;
                 let case_started = unix_seconds()?;
+                let case_stage = format!("case:{}", case.id);
+                stage(&run_id, &model_id, &case_stage, "start", run_started)?;
                 let mut record = if case.id == "tool_roundtrip" {
                     measure_tool_roundtrip(provider.as_ref(), case)
                 } else if case.id == "preserve_thinking" {
@@ -895,6 +934,7 @@ pub fn run_environment(
                 } else {
                     measure_case(provider.as_ref(), case)
                 };
+                stage(&run_id, &model_id, &case_stage, "end", run_started)?;
                 let case_ended = unix_seconds()?;
                 let includes_recovery = record["status"] == "resource_declined";
                 let after_case = scoped_memory(
@@ -962,6 +1002,13 @@ pub fn run_environment(
             }
             reset_interval()?;
             let context_started = unix_seconds()?;
+            stage(
+                &run_id,
+                &model_id,
+                "context_admission_probe",
+                "start",
+                run_started,
+            )?;
             let mut context_admission = if caps.max_context_tokens == 0
                 || caps.max_context_tokens > u32::MAX as usize
             {
@@ -982,6 +1029,13 @@ pub fn run_environment(
                 json!({"evidence_complete":rejected,"declared_context_tokens":caps.max_context_tokens,
                     "requested_max_new_tokens":probe.request.max_new_tokens,"record":record})
             };
+            stage(
+                &run_id,
+                &model_id,
+                "context_admission_probe",
+                "end",
+                run_started,
+            )?;
             let context_ended = unix_seconds()?;
             let context_after = scoped_memory(
                 memory(),
@@ -1029,7 +1083,9 @@ pub fn run_environment(
             }
             report["native_memory_before_unload"] = before_unload;
             reset_interval()?;
+            stage(&run_id, &model_id, "unload", "start", run_started)?;
             drop(provider);
+            stage(&run_id, &model_id, "unload", "end", run_started)?;
             let after_unload = scoped_memory(
                 memory(),
                 "unload_interval_since_explicit_reset",
