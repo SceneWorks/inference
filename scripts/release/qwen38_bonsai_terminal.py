@@ -284,6 +284,54 @@ def nvidia_sample(pid: int) -> tuple[int | None, str | None]:
     return (total, None) if found else (None, "process not reported by nvidia-smi")
 
 
+def terminate_owned_child(proc: subprocess.Popen[bytes]) -> dict[str, Any]:
+    """Stop the owned process tree and record the kill request and root reaping."""
+    if os.name == "nt":
+        try:
+            result = subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+            tree_kill_requested = result.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            tree_kill_requested = False
+        if proc.poll() is None and not tree_kill_requested:
+            proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        return {
+            "method": "taskkill_tree",
+            "tree_termination_requested": tree_kill_requested,
+            "root_reaped": True,
+        }
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    # The root may exit on TERM while a descendant ignores it; the group still belongs
+    # to this new session, so always send KILL to any surviving group members.
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait(timeout=5)
+    return {
+        "method": "process_group",
+        "tree_termination_requested": True,
+        "root_reaped": True,
+    }
+
+
 def bounded_interval_samples(
     samples: list[dict[str, Any]],
     interval: dict[str, Any],
@@ -766,6 +814,13 @@ def validate_preflight_record(
 def run(args: argparse.Namespace) -> int:
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
+    diagnostic_timeout = getattr(args, "diagnostic_timeout_seconds", None)
+    if diagnostic_timeout is not None and (
+        args.candle_device != "cpu" or not 0 < diagnostic_timeout <= 3600
+    ):
+        raise ValueError(
+            "diagnostic timeout requires Candle CPU and a positive bound up to 3600 seconds"
+        )
     runtime_sha = checked_sha(args.runtime_sha, "runtime SHA")
     source = source_identity(runtime_sha, args.allow_dirty)
     model = load_model(args.manifest, args.model_key)
@@ -819,6 +874,7 @@ def run(args: argparse.Namespace) -> int:
     provider_path = output / "provider.json"
     stdout_path = output / "stdout.log"
     stderr_path = output / "stderr.log"
+    progress_rss_path = output / "progress-rss.jsonl"
     command = [str(binary), args.test_name, "--exact", "--ignored", "--nocapture", "--test-threads=1"]
     env = os.environ.copy()
     env.update(
@@ -850,26 +906,44 @@ def run(args: argparse.Namespace) -> int:
     interrupted: str | None = None
     previous_handlers: dict[int, Any] = {}
     proc: subprocess.Popen[bytes] | None = None
+    timed_out = False
+    progress_rss_truncated = False
+    child_tree_cleanup: dict[str, Any] | None = None
 
     def interrupt(signum: int, _frame: Any) -> None:
         nonlocal interrupted
         interrupted = signal.Signals(signum).name
-        if proc is not None and proc.poll() is None:
-            proc.terminate()
 
     for signum in (signal.SIGINT, signal.SIGTERM):
         previous_handlers[signum] = signal.signal(signum, interrupt)
     try:
-        with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
-            proc = subprocess.Popen(command, stdout=stdout, stderr=stderr, env=env)
-            while proc.poll() is None:
-                elapsed = time.monotonic() - started
-                rss_started = time.time()
-                rss = rss_bytes(proc.pid)
-                rss_ended = time.time()
-                if rss is not None:
-                    rss_samples.append(
-                        {
+        with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr, progress_rss_path.open(
+            "x", encoding="utf-8", newline="\n"
+        ) as progress_rss:
+            proc = subprocess.Popen(
+                command,
+                stdout=stdout,
+                stderr=stderr,
+                env=env,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+                start_new_session=os.name != "nt",
+            )
+            next_progress = 0.0
+            progress_bytes = 0
+            try:
+                while proc.poll() is None:
+                    elapsed = time.monotonic() - started
+                    if interrupted is not None or (
+                        diagnostic_timeout is not None and elapsed >= diagnostic_timeout
+                    ):
+                        timed_out = interrupted is None
+                        child_tree_cleanup = terminate_owned_child(proc)
+                        break
+                    rss_started = time.time()
+                    rss = rss_bytes(proc.pid)
+                    rss_ended = time.time()
+                    if rss is not None:
+                        sample = {
                             "seconds": elapsed,
                             "started_unix_seconds": rss_started,
                             "ended_unix_seconds": rss_ended,
@@ -877,30 +951,46 @@ def run(args: argparse.Namespace) -> int:
                             "process_id": proc.pid,
                             "bytes": rss,
                         }
-                    )
-                gpu_started = time.time()
-                gpu, reason = nvidia_sample(proc.pid)
-                gpu_ended = time.time()
-                if gpu is not None:
-                    gpu_samples.append(
-                        {
-                            "seconds": elapsed,
-                            "started_unix_seconds": gpu_started,
-                            "ended_unix_seconds": gpu_ended,
-                            "run_id": run_id,
-                            "process_id": proc.pid,
-                            "bytes": gpu,
-                        }
-                    )
-                elif reason:
-                    gpu_reasons.append(reason)
-                time.sleep(args.sample_interval)
+                        rss_samples.append(sample)
+                        if elapsed >= next_progress and not progress_rss_truncated:
+                            line = json.dumps(sample, sort_keys=True, separators=(",", ":")) + "\n"
+                            encoded = line.encode("utf-8")
+                            if progress_bytes + len(encoded) <= 2 * 1024 * 1024:
+                                progress_rss.write(line)
+                                progress_rss.flush()
+                                progress_bytes += len(encoded)
+                            else:
+                                progress_rss_truncated = True
+                            next_progress = elapsed + 5.0
+                    gpu_started = time.time()
+                    gpu, reason = nvidia_sample(proc.pid)
+                    gpu_ended = time.time()
+                    if gpu is not None:
+                        gpu_samples.append(
+                            {
+                                "seconds": elapsed,
+                                "started_unix_seconds": gpu_started,
+                                "ended_unix_seconds": gpu_ended,
+                                "run_id": run_id,
+                                "process_id": proc.pid,
+                                "bytes": gpu,
+                            }
+                        )
+                    elif reason:
+                        gpu_reasons.append(reason)
+                    time.sleep(args.sample_interval)
+            finally:
+                if proc.poll() is None:
+                    child_tree_cleanup = terminate_owned_child(proc)
             exit_code = proc.wait()
     finally:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
-    verify_snapshot(model, args.snapshot)
-    after = snapshot_inventory(model, args.snapshot)
+    if timed_out or interrupted is not None:
+        after = {"inventory_sha256": None, "unverified_reason": "child interrupted before post-run inventory"}
+    else:
+        verify_snapshot(model, args.snapshot)
+        after = snapshot_inventory(model, args.snapshot)
     provider = json.loads(provider_path.read_text(encoding="utf-8")) if provider_path.is_file() else None
     selected_process_id = proc.pid if proc is not None else None
     per_case_memory = (
@@ -916,6 +1006,7 @@ def run(args: argparse.Namespace) -> int:
     )
     completed = (
         interrupted is None
+        and not timed_out
         and exit_code == 0
         and provider is not None
         and provider.get("status") == "completed"
@@ -923,13 +1014,20 @@ def run(args: argparse.Namespace) -> int:
     )
     total_memory, available_memory, memory_reason = physical_memory()
     manifest = artifact_manifest(
-        output, [name for name in ("provider.json", "stdout.log", "stderr.log") if (output / name).is_file()]
+        output,
+        [
+            name
+            for name in ("provider.json", "stdout.log", "stderr.log", "progress-rss.jsonl")
+            if (output / name).is_file()
+        ],
     )
     write_new(output / "artifact-manifest.json", manifest)
     receipt = {
         "schema_version": SCHEMA_VERSION,
         "suite": SUITE,
-        "status": "completed" if completed else ("interrupted" if interrupted else "failed"),
+        "status": (
+            "completed" if completed else "timed_out" if timed_out else "interrupted" if interrupted else "failed"
+        ),
         "started_unix_seconds": started_wall,
         "elapsed_seconds": time.monotonic() - started,
         "command": {
@@ -976,6 +1074,10 @@ def run(args: argparse.Namespace) -> int:
             "process_id": selected_process_id,
             "rss_scope": "sampled_process_working_set_lower_bound",
             "sample_interval_seconds": args.sample_interval,
+            "progress_rss_path": "progress-rss.jsonl",
+            "progress_rss_truncated": progress_rss_truncated,
+            "diagnostic_timeout_seconds": diagnostic_timeout,
+            "child_tree_cleanup": child_tree_cleanup,
             "rss_samples": rss_samples,
             "peak_rss_bytes": max((sample["bytes"] for sample in rss_samples), default=None),
         },
@@ -2776,6 +2878,7 @@ def parser() -> argparse.ArgumentParser:
     run_p.add_argument("--output", type=Path, required=True)
     run_p.add_argument("--manifest", type=Path, default=Path("release/real-weight-models.toml"))
     run_p.add_argument("--sample-interval", type=float, default=0.1)
+    run_p.add_argument("--diagnostic-timeout-seconds", type=float)
     run_p.add_argument("--allow-dirty", action="store_true", help=argparse.SUPPRESS)
     run_p.add_argument("--candle-device", choices=("auto", "cpu"))
     run_p.set_defaults(func=run)
