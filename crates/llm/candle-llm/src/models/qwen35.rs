@@ -1831,7 +1831,7 @@ mod tests {
         );
     }
 
-    fn synthetic_weights(cfg: &Qwen35Config) -> Weights {
+    fn synthetic_weights_with_prefix(cfg: &Qwen35Config, pfx: &str) -> Weights {
         let h = cfg.hidden_size as usize;
         let key_dim = (cfg.linear_key_head_dim * cfg.linear_num_key_heads) as usize;
         let value_dim = (cfg.linear_value_head_dim * cfg.linear_num_value_heads) as usize;
@@ -1843,9 +1843,8 @@ mod tests {
         let hv = cfg.linear_num_value_heads as usize;
         let inter = cfg.intermediate_size as usize;
         let mut m = HashMap::new();
-        // Mirror the real VLM-wrapped layout: the text decoder nests under `model.language_model`,
-        // with `lm_head.weight` at the checkpoint root.
-        let pfx = "model.language_model";
+        // The decoder can live under either VLM-wrapped or flat text-only roots; `lm_head` stays
+        // at the checkpoint root in both layouts.
         t(
             &mut m,
             &format!("{pfx}.embed_tokens.weight"),
@@ -1903,7 +1902,29 @@ mod tests {
                 t(&mut m, &lp("self_attn.k_norm.weight"), &[hd]);
             }
         }
+        if cfg.mtp_num_hidden_layers == 1 {
+            t(&mut m, "mtp.fc.weight", &[h, 2 * h]);
+            t(&mut m, "mtp.pre_fc_norm_embedding.weight", &[h]);
+            t(&mut m, "mtp.pre_fc_norm_hidden.weight", &[h]);
+            t(&mut m, "mtp.norm.weight", &[h]);
+            let lp = |s: &str| format!("mtp.layers.0.{s}");
+            t(&mut m, &lp("input_layernorm.weight"), &[h]);
+            t(&mut m, &lp("post_attention_layernorm.weight"), &[h]);
+            t(&mut m, &lp("self_attn.q_proj.weight"), &[nh * hd * 2, h]);
+            t(&mut m, &lp("self_attn.k_proj.weight"), &[nkv * hd, h]);
+            t(&mut m, &lp("self_attn.v_proj.weight"), &[nkv * hd, h]);
+            t(&mut m, &lp("self_attn.o_proj.weight"), &[h, nh * hd]);
+            t(&mut m, &lp("self_attn.q_norm.weight"), &[hd]);
+            t(&mut m, &lp("self_attn.k_norm.weight"), &[hd]);
+            t(&mut m, &lp("mlp.gate_proj.weight"), &[inter, h]);
+            t(&mut m, &lp("mlp.up_proj.weight"), &[inter, h]);
+            t(&mut m, &lp("mlp.down_proj.weight"), &[h, inter]);
+        }
         Weights::from_map(m, Device::Cpu)
+    }
+
+    fn synthetic_weights(cfg: &Qwen35Config) -> Weights {
+        synthetic_weights_with_prefix(cfg, "model.language_model")
     }
 
     fn ids(toks: &[u32]) -> Tensor {
@@ -1946,6 +1967,40 @@ mod tests {
         }
         // The full-attention layer (layer 3) advanced the KV cache to 5 positions.
         assert_eq!(cache.offset(), 5);
+    }
+
+    #[test]
+    fn flat_text_and_wrapped_qwen35_match_target_and_mtp() {
+        let mut wrapped_json = cfg_json();
+        wrapped_json["text_config"]["mtp_num_hidden_layers"] = json!(1);
+        wrapped_json["text_config"]["mtp_use_dedicated_embeddings"] = json!(false);
+        let flat_json = wrapped_json["text_config"].clone();
+        let wrapped_cfg = Qwen35Config::from_json(&wrapped_json).unwrap();
+        let flat_cfg = Qwen35Config::from_json(&flat_json).unwrap();
+        let wrapped_weights = synthetic_weights_with_prefix(&wrapped_cfg, "model.language_model");
+        let flat_weights = synthetic_weights_with_prefix(&flat_cfg, "model");
+        let wrapped =
+            Qwen35Model::from_weights(&wrapped_weights, "model.language_model", wrapped_cfg)
+                .unwrap();
+        let flat = Qwen35Model::from_weights(&flat_weights, "model", flat_cfg).unwrap();
+
+        let tokens = ids(&[1, 7, 3]);
+        let wrapped_logits = wrapped
+            .forward(&tokens, &mut wrapped.new_cache(), 0)
+            .unwrap();
+        let flat_logits = flat.forward(&tokens, &mut flat.new_cache(), 0).unwrap();
+        assert_eq!(host(&wrapped_logits), host(&flat_logits));
+
+        let wrapped_mtp = Qwen35Mtp::from_weights_with(&wrapped_weights, &wrapped, None).unwrap();
+        let flat_mtp = Qwen35Mtp::from_weights_with(&flat_weights, &flat, None).unwrap();
+        let previous = Tensor::zeros((1, 1, 32), DType::F32, &Device::Cpu).unwrap();
+        let (wrapped_draft, _) = wrapped_mtp
+            .step(2, &previous, 0, 0, &mut wrapped_mtp.new_cache())
+            .unwrap();
+        let (flat_draft, _) = flat_mtp
+            .step(2, &previous, 0, 0, &mut flat_mtp.new_cache())
+            .unwrap();
+        assert_eq!(host(&wrapped_draft), host(&flat_draft));
     }
 
     #[test]

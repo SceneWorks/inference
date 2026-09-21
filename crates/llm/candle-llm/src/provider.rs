@@ -637,6 +637,25 @@ struct Gemma4Runtime {
     device: Device,
 }
 
+/// Qwen3.5/3.8 ships both VLM-wrapped and flat text-only checkpoints. The decoder math is the
+/// same; only the root of its HF tensor names differs. Reject mixed roots rather than silently
+/// choosing one set of weights from an ambiguous snapshot.
+fn qwen35_dense_prefix(has_key: impl Fn(&str) -> bool) -> CoreResult<&'static str> {
+    match (
+        has_key("model.language_model.embed_tokens.weight"),
+        has_key("model.embed_tokens.weight"),
+    ) {
+        (true, false) => Ok("model.language_model"),
+        (false, true) => Ok("model"),
+        (false, false) => Err(CoreError::Load(
+            "qwen3_5 checkpoint has no wrapped or flat decoder embeddings".into(),
+        )),
+        (true, true) => Err(CoreError::Load(
+            "qwen3_5 checkpoint has both wrapped and flat decoder embeddings".into(),
+        )),
+    }
+}
+
 impl LlamaProvider {
     /// Load a provider from `spec.source`: either a `*.gguf` file (loaded directly via Candle's
     /// native GGUF reader, story 7254) or an HF snapshot directory (config.json + tokenizer.json +
@@ -743,7 +762,8 @@ impl LlamaProvider {
                 )
                 .map_err(to_core)?
             } else {
-                Qwen35Model::from_weights_with(&weights, "model.language_model", qcfg, requested)
+                let prefix = qwen35_dense_prefix(|key| weights.contains(key))?;
+                Qwen35Model::from_weights_with(&weights, prefix, qcfg, requested)
                     .map_err(to_core)?
             };
             let configured_layers = m.config().mtp_num_hidden_layers;
@@ -2813,14 +2833,35 @@ mod tests {
         bonsai_sampling_defaults, can_load, can_load_vision, cuda_usable_memory_bytes,
         emit_content, eos_token_ids, expand_vision_placeholders, host_load_budget,
         load_memory_requirements, merged_frame_timestamps, prompt_opens_thinking,
-        substitute_vision_placeholders, validate_context_window, video_placeholder_text, JsonMask,
-        EAGER_ATTN_QUERY_CHUNK_SIZE,
+        qwen35_dense_prefix, substitute_vision_placeholders, validate_context_window,
+        video_placeholder_text, JsonMask, EAGER_ATTN_QUERY_CHUNK_SIZE,
     };
     use crate::decode::{ConstraintMask, RewindableConstraintMask};
     use core_llm::{
         ConstraintDecodeTable, Content, ImageRef, LlmMemoryGeometry, LoadSpec, Message, Role,
         VideoRef,
     };
+
+    #[test]
+    fn qwen35_dense_checkpoint_selects_one_decoder_root() {
+        let select = |keys: &[&str]| qwen35_dense_prefix(|key| keys.contains(&key));
+        assert_eq!(
+            select(&["model.language_model.embed_tokens.weight"]).unwrap(),
+            "model.language_model"
+        );
+        // The pinned Altworld/Hemmingway-1 index uses this flat text-only layout; MTP remains
+        // rooted at `mtp.*` and is loaded independently of the decoder prefix.
+        assert_eq!(
+            select(&["model.embed_tokens.weight", "mtp.fc.weight"]).unwrap(),
+            "model"
+        );
+        assert!(select(&[]).is_err());
+        assert!(select(&[
+            "model.language_model.embed_tokens.weight",
+            "model.embed_tokens.weight"
+        ])
+        .is_err());
+    }
 
     #[test]
     fn request_estimate_uses_the_eager_attention_runtime_tile() {

@@ -28,7 +28,7 @@ pub(crate) fn required_bytes(spec: &LoadSpec) -> Result<u64> {
     if spec.quantize.is_some()
         || !matches!(
             config["model_type"].as_str(),
-            Some("qwen3_5" | "qwen3_vl" | "prism_hadamard_qwen35")
+            Some("qwen3_5" | "qwen3_5_text" | "qwen3_vl" | "prism_hadamard_qwen35")
         )
     {
         // Other loaders and explicit quantization retain their conservative conversion bound.
@@ -162,22 +162,36 @@ mod tests {
     use super::*;
     use serde_json::json;
     #[test]
-    fn safetensors_file_is_priced_once_with_conversion_extras() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("config.json"),
-            r#"{"model_type":"qwen3_5"}"#,
-        )
-        .unwrap();
-        let header = serde_json::to_vec(&json!({"model.language_model.norm.weight":{
-            "dtype":"BF16","shape":[8],"data_offsets":[0,16]}}))
-        .unwrap();
-        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
-        bytes.extend(&header);
-        bytes.extend([0; 16]);
-        std::fs::write(dir.path().join("model.safetensors"), &bytes).unwrap();
-        let spec = LoadSpec::dense(dir.path().display().to_string());
-        assert_eq!(required_bytes(&spec).unwrap(), bytes.len() as u64 + 32);
+    fn qwen35_flat_and_wrapped_bf16_load_once_and_unknown_falls_back() {
+        for (model_type, prefix, shared_weight_path) in [
+            ("qwen3_5", "model.language_model", true),
+            ("qwen3_5_text", "model", true),
+            ("other", "model", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("config.json"),
+                json!({"model_type": model_type}).to_string(),
+            )
+            .unwrap();
+            let mut tensors = serde_json::Map::new();
+            tensors.insert(
+                format!("{prefix}.norm.weight"),
+                json!({"dtype":"BF16","shape":[8],"data_offsets":[0,16]}),
+            );
+            let header = serde_json::to_vec(&Value::Object(tensors)).unwrap();
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend(&header);
+            bytes.extend([0; 16]);
+            std::fs::write(dir.path().join("model.safetensors"), &bytes).unwrap();
+            let spec = LoadSpec::dense(dir.path().display().to_string());
+            let expected = if shared_weight_path {
+                bytes.len() as u64 + 32
+            } else {
+                (bytes.len() as u64) * 2
+            };
+            assert_eq!(required_bytes(&spec).unwrap(), expected, "{model_type}");
+        }
     }
 
     /// Header-only operational audit: never constructs a tensor or starts a model.
