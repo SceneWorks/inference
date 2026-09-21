@@ -1,4 +1,4 @@
-"""NEVER MERGE: bound one Windows native comparison and prove its process exited."""
+"""NEVER MERGE: bound one Windows CPU context probe and prove its process exited."""
 
 import argparse
 import ctypes
@@ -81,6 +81,15 @@ def load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
+def command_option(command: object, option: str) -> str | None:
+    if not isinstance(command, list):
+        return None
+    if command.count(option) != 1:
+        return None
+    index = command.index(option)
+    return command[index + 1] if index + 1 < len(command) else None
+
+
 def stage_markers(row: Path) -> list[dict]:
     result = []
     for line in (row / "stderr.log").read_text(encoding="utf-8", errors="replace").splitlines():
@@ -145,17 +154,10 @@ def validate_main() -> int:
     provenance = read("provenance.json")
     metadata = read("snapshot-metadata.json")
     reservation = read("gpu-reservation.json")
+    gpu_recheck = read("gpu-recheck.json")
     cpu_launch = read("cpu-launch.json")
-    cuda_launch = read("cuda-launch.json")
     cpu = read("cpu-parent/receipt.json")
-    cuda = read("cuda-bonsai/receipt.json")
     cpu_provider = read("cpu-parent/provider.json") if cpu.get("status") == "completed" else {}
-    cuda_provider = read("cuda-bonsai/provider.json")
-    expected_cases = [
-        "reasoning_low", "reasoning_medium", "reasoning_xhigh", "preserve_thinking",
-        "tool_roundtrip", "json_thinking", "tool", "code",
-    ]
-    required = expected_cases[:6]
 
     require(provenance.get("checked_out_sha") == args.runtime_sha, "source SHA mismatch")
     require(provenance.get("clean_tree") is True, "dirty diagnostic source")
@@ -169,34 +171,30 @@ def validate_main() -> int:
         reservation.get("gpu_uuid") == "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0",
         "wrong GPU UUID",
     )
-    for label, launch, receipt, revision, model_id in (
-        (
-            "CPU", cpu_launch, cpu, "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
-            "candle-cpu-qwen38-parent-stage-probe",
-        ),
-        (
-            "CUDA", cuda_launch, cuda, "6ed5e12bf84b7a63069882c91dd9e9218647d17b",
-            "candle-cuda-bonsai-gguf-eight-case-probe",
-        ),
-    ):
-        require(launch.get("safe_to_continue") is True, f"{label} process cleanup unproven")
-        require(bool(launch.get("native_pids")), f"{label} native PID missing")
-        require(receipt.get("runtime", {}).get("head_sha") == args.runtime_sha, f"{label} runtime SHA mismatch")
-        require(receipt.get("model", {}).get("revision") == revision, f"{label} model revision mismatch")
-        require(receipt.get("model", {}).get("id") == model_id, f"{label} model ID mismatch")
+    require(
+        gpu_recheck.get("selected_gpu_uuid") == "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0"
+        and gpu_recheck.get("selected_gpu_compute_processes") == [],
+        "GPU0 post-run recheck or no-co-tenant proof is missing",
+    )
+    require(cpu_launch.get("safe_to_continue") is True, "CPU process cleanup unproven")
+    require(bool(cpu_launch.get("native_pids")), "CPU native PID missing")
+    require(cpu_launch.get("timeout_seconds") == 1500, "CPU outer watchdog changed")
+    launch_command = cpu_launch.get("command")
+    require(command_option(launch_command, "--cases") == "context_64", "CPU launch case changed")
+    require(command_option(launch_command, "--diagnostic-timeout-seconds") == "1200", "CPU native watchdog changed")
+    require(cpu.get("runtime", {}).get("head_sha") == args.runtime_sha, "CPU runtime SHA mismatch")
+    model = cpu.get("model", {})
+    require(model.get("revision") == "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0", "CPU model revision mismatch")
+    require(model.get("id") == "candle-cpu-qwen38-parent-context64-probe", "CPU model ID mismatch")
+    require(bool(model.get("inventory_before", {}).get("files")), "CPU frozen inventory is absent")
+    require(cpu.get("process", {}).get("process_id") in (cpu_launch.get("native_pids") or []), "CPU native PID mismatch")
+    verify_row_seal("cpu-parent")
+    if cpu.get("status") == "completed":
         require(
-            bool(receipt.get("model", {}).get("inventory_before", {}).get("files")),
-            f"{label} frozen publisher-closure inventory is absent",
+            model.get("inventory_before", {}).get("inventory_sha256")
+            == model.get("inventory_after", {}).get("inventory_sha256"),
+            "CPU frozen snapshot changed",
         )
-        require(receipt.get("process", {}).get("process_id") in (launch.get("native_pids") or []), f"{label} native PID mismatch")
-        verify_row_seal("cpu-parent" if label == "CPU" else "cuda-bonsai")
-        if receipt.get("status") == "completed":
-            model = receipt.get("model", {})
-            require(
-                model.get("inventory_before", {}).get("inventory_sha256")
-                == model.get("inventory_after", {}).get("inventory_sha256"),
-                f"{label} frozen snapshot changed",
-            )
 
     cpu_status = cpu.get("status")
     require(cpu_status in ("completed", "timed_out"), "CPU neither completed nor bounded-timeout classified")
@@ -204,7 +202,7 @@ def validate_main() -> int:
     cpu_process = cpu.get("process", {})
     require(cpu.get("command", {}).get("candle_device") == "cpu", "CPU device selector mismatch")
     require(cpu.get("command", {}).get("load_profile") == "candle-dense-cpu", "CPU load profile mismatch")
-    require(cpu_process.get("diagnostic_timeout_seconds") == 600, "CPU 600-second watchdog absent")
+    require(cpu_process.get("diagnostic_timeout_seconds") == 1200, "CPU 1200-second watchdog absent")
     samples = root / "cpu-parent" / "progress-rss.jsonl"
     require(samples.is_file() and samples.stat().st_size > 0, "CPU progress RSS absent")
     markers = stage_markers(root / "cpu-parent") if (root / "cpu-parent/stderr.log").is_file() else []
@@ -236,33 +234,17 @@ def validate_main() -> int:
         require(cpu_process.get("exit_code") != 0, "timed-out CPU process misleadingly exited zero")
     else:
         require(cpu_provider.get("status") == "completed", "CPU provider did not complete")
-        require(cpu_provider.get("case_ids") == ["arithmetic"], "CPU ran more than arithmetic")
+        require(cpu_provider.get("case_ids") == ["context_64"], "CPU ran another case")
         cases = cpu_provider.get("cases", [])
         case = cases[0] if len(cases) == 1 else {}
-        require(case.get("status") == "completed", "CPU arithmetic not completed")
-        require(case.get("evidence_complete") is True, "CPU arithmetic evidence incomplete")
-        require(case.get("functional_acceptance_passed") is True, "CPU arithmetic oracle failed")
-        require(case.get("output", {}).get("text") == "391", "CPU arithmetic answer mismatch")
-
-    require(cuda_launch.get("returncode") == 0, "CUDA wrapper did not exit zero")
-    require(cuda.get("status") == "completed", "CUDA Bonsai wrapper did not complete")
-    require(cuda.get("command", {}).get("candle_device") == "auto", "CUDA selector mismatch")
-    require(cuda.get("command", {}).get("load_profile") == "candle-packed-cuda", "CUDA profile mismatch")
-    require(cuda.get("gpu", {}).get("admission_recheck", {}).get("admitted") is True, "CUDA reservation recheck absent")
-    require(cuda_provider.get("status") == "completed", "CUDA Bonsai provider did not complete")
-    require(cuda_provider.get("case_ids") == expected_cases, "CUDA Bonsai case list changed")
-    by_id = {case.get("case_id"): case for case in (cuda_provider.get("cases") or [])}
-    for case_id in required:
-        case = by_id.get(case_id, {})
-        require(case.get("status") == "completed", f"{case_id} did not complete")
-        require(case.get("evidence_complete") is True, f"{case_id} evidence incomplete")
-        require(case.get("functional_acceptance_passed") is True, f"{case_id} acceptance failed")
-        require(case.get("stream_contract_passed") is True, f"{case_id} stream contract failed")
-    for case_id in ("tool", "code"):
-        case = by_id.get(case_id, {})
-        require(case.get("status") == "completed", f"diagnostic {case_id} did not complete")
-        require(case.get("evidence_complete") is True, f"diagnostic {case_id} evidence incomplete")
-        require(isinstance(case.get("output", {}).get("tool_calls"), list), f"diagnostic {case_id} output is unparsed")
+        require(case.get("case_id") == "context_64", "CPU context case identity changed")
+        require(case.get("oracle") == {"kind": "exact", "value": "NEBULA-47"}, "CPU context oracle changed")
+        require(case.get("status") == "completed", "CPU context_64 not completed")
+        require(case.get("evidence_complete") is True, "CPU context_64 evidence incomplete")
+        require(case.get("stream_contract_passed") is True, "CPU context_64 stream failed")
+        require(case.get("quality_passed") is True, "CPU context_64 oracle failed")
+        answer = case.get("output", {}).get("text")
+        require(isinstance(answer, str) and answer.strip() == "NEBULA-47", "CPU context_64 answer mismatch")
     reservation_path = os.environ.get("SC23935_GPU_RESERVATION")
     require(bool(reservation_path), "owned reservation path is unknown")
     if reservation_path:
@@ -270,22 +252,15 @@ def validate_main() -> int:
 
     verification = {
         "schema_version": 1,
-        "passed": not errors,
+        "diagnostic_valid": not errors,
+        "context_case_passed": not errors and cpu_status == "completed",
         "runtime_sha": args.runtime_sha,
         "rc4_base_sha": provenance.get("rc4_base_sha"),
         "cpu_status": cpu_status,
         "cpu_last_stage": cpu_stage,
         "cpu_last_event": cpu_event,
-        "cuda_required_six": required,
-        "cuda_diagnostic_only": ["tool", "code"],
-        "cuda_diagnostic_results": {
-            case_id: {
-                "quality_passed": by_id.get(case_id, {}).get("quality_passed"),
-                "tool_calls": by_id.get(case_id, {}).get("output", {}).get("tool_calls"),
-                "text": by_id.get(case_id, {}).get("output", {}).get("text"),
-            }
-            for case_id in ("tool", "code")
-        },
+        "selected_case": "context_64",
+        "native_watchdog_seconds": 1200,
         "full_campaign_required": True,
         "full_campaign_accepted": False,
         "publisher_verification_scope": "wrapper inventory checked against pinned manifest; no provision-assets publisher-closure claim",
@@ -356,6 +331,7 @@ def main() -> int:
         "schema_version": 1,
         "scope": "SC-23935 bounded diagnostic; never full-matrix acceptance",
         "row": args.row.name,
+        "command": command,
         "wrapper_pid": wrapper.pid,
         "native_pids": pids,
         "timeout_seconds": args.timeout_seconds,

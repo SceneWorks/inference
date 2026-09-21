@@ -1,7 +1,7 @@
-# NEVER MERGE: SC-23935 bounded Windows CPU parent and CUDA Bonsai diagnostic.
+# NEVER MERGE: SC-23935 bounded Windows CPU parent context_64 diagnostic.
 # This temporarily replaces CI because GitHub cannot dispatch a newly added workflow from a
 # non-default branch. It has no automatic trigger and must be deleted with this branch.
-name: SC-23935 CPU parent and CUDA Bonsai probe (NEVER MERGE)
+name: SC-23935 CPU parent context_64 probe (NEVER MERGE)
 
 on:
   workflow_dispatch:
@@ -10,17 +10,16 @@ permissions:
   contents: read
 
 concurrency:
-  group: sc23935-cpu-bonsai-probe
+  group: sc23935-cpu-context64-probe
   cancel-in-progress: false
 
 jobs:
-  cpu-parent-and-cuda-bonsai:
-    name: Frozen CPU parent arithmetic and CUDA Bonsai eight-case probe
+  cpu-parent-context64:
+    name: Frozen CPU parent context_64 scale probe
     runs-on: [self-hosted, windows, cuda, real-weights]
     timeout-minutes: 165
     env:
       BONSAI_QWEN38_SNAPSHOT: ${{ vars.CANDLE_BONSAI_QWEN38_SNAPSHOT }}
-      BONSAI_GGUF_SNAPSHOT: ${{ vars.CANDLE_BONSAI_GGUF_SNAPSHOT }}
       CARGO_BUILD_JOBS: "12"
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
@@ -39,7 +38,7 @@ jobs:
         timeout-minutes: 2
         shell: powershell
         run: |
-          $evidenceRoot = Join-Path $env:RUNNER_TEMP "sc23935-cpu-bonsai-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $evidenceRoot = Join-Path $env:RUNNER_TEMP "sc23935-cpu-context64-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           if (Test-Path -LiteralPath $evidenceRoot) { throw 'diagnostic evidence root already exists' }
           New-Item -ItemType Directory -Path $evidenceRoot | Out-Null
           [ordered]@{
@@ -51,7 +50,7 @@ jobs:
             scope = 'NEVER MERGE bounded diagnosis; full 19-cell campaign remains required'
           } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $evidenceRoot 'initialization.json') -Encoding utf8
           $reservation = Join-Path $env:LOCALAPPDATA 'SceneWorks\inference-reservations\cuda-device-0.json'
-          $token = "sc23935-cpu-bonsai-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $token = "sc23935-cpu-context64-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           "SC23935_EVIDENCE_ROOT=$evidenceRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "SC23935_GPU_RESERVATION=$reservation" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "SC23935_RESERVATION_TOKEN=$token" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
@@ -97,7 +96,7 @@ jobs:
           "REVIEWED_PYTHON=$reviewedPython" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "PYTHONPATH=$pythonPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      # Parse every exact run block before the CUDA build or reservation. This catches Windows
+      # Parse every exact run block before the build or reservation. This catches Windows
       # PowerShell 5 syntax errors that a Linux YAML check cannot see.
       - name: Parse every embedded Windows PowerShell script
         timeout-minutes: 3
@@ -250,9 +249,7 @@ jobs:
             cargo_lock_sha256 = (Get-FileHash -Algorithm SHA256 Cargo.lock).Hash.ToLowerInvariant()
             pinned_candle_revision = $candleRevision
             expected_parent_revision = '1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0'
-            expected_bonsai_revision = '6ed5e12bf84b7a63069882c91dd9e9218647d17b'
             parent_snapshot = $env:BONSAI_QWEN38_SNAPSHOT
-            bonsai_snapshot = $env:BONSAI_GGUF_SNAPSHOT
             expected_gpu_index = 0
             expected_gpu_uuid = $env:EXPECTED_GPU_UUID
           } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $env:SC23935_EVIDENCE_ROOT 'provenance.json') -Encoding utf8
@@ -261,11 +258,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'hardware inventory failed' }
           & $env:REVIEWED_PYTHON scripts/release/qwen38_bonsai_terminal.py qualify-snapshots `
             --platform windows `
-            --binding BONSAI_QWEN38_SNAPSHOT=bonsai-qwen38-parent --binding BONSAI_GGUF_SNAPSHOT=bonsai-gguf `
+            --binding BONSAI_QWEN38_SNAPSHOT=bonsai-qwen38-parent `
             --output (Join-Path $env:SC23935_EVIDENCE_ROOT 'snapshot-metadata.json')
           if ($LASTEXITCODE -ne 0) { throw 'frozen parent snapshot identity check failed' }
 
-      - name: Build the existing native Candle CUDA comparison executable
+      - name: Build the existing native Candle comparison executable
         timeout-minutes: 45
         shell: powershell
         run: |
@@ -323,8 +320,8 @@ jobs:
           } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:SC23935_EVIDENCE_ROOT 'binary.json') -Encoding utf8
           "SC23935_TEST_BINARY=$binary" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      # One owned GPU0 token spans both phases on the same Windows host.
-      - name: Reserve GPU0 and preflight exact CPU and CUDA profiles
+      # Reserve GPU0 to keep this shared Windows host exclusive during the CPU probe.
+      - name: Reserve GPU0 and preflight the exact CPU profile
         timeout-minutes: 5
         shell: powershell
         run: |
@@ -335,22 +332,18 @@ jobs:
           if ($reservation.gpu_index -ne 0 -or $reservation.gpu_uuid -ne $env:EXPECTED_GPU_UUID) { throw 'wrong physical GPU0 identity' }
           & $env:REVIEWED_PYTHON scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-qwen38-parent --load-profile candle-dense-cpu --output (Join-Path $env:SC23935_EVIDENCE_ROOT 'cpu-preflight.json')
           if ($LASTEXITCODE -ne 0) { throw 'dense CPU parent preflight failed' }
-          & $env:REVIEWED_PYTHON scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-gguf --language-variant ptq1 --vision-variant q8 --load-profile candle-packed-cuda --reservation $env:SC23935_GPU_RESERVATION --reservation-token $env:SC23935_RESERVATION_TOKEN --output (Join-Path $env:SC23935_EVIDENCE_ROOT 'cuda-preflight.json')
-          if ($LASTEXITCODE -ne 0) { throw 'packed CUDA Bonsai preflight failed' }
-          foreach ($name in @('cpu-preflight.json', 'cuda-preflight.json')) {
-            $preflight = Get-Content -LiteralPath (Join-Path $env:SC23935_EVIDENCE_ROOT $name) -Raw | ConvertFrom-Json
-            if ($preflight.admitted -ne $true) { throw "preflight did not admit $name" }
-          }
+          $preflight = Get-Content -LiteralPath (Join-Path $env:SC23935_EVIDENCE_ROOT 'cpu-preflight.json') -Raw | ConvertFrom-Json
+          if ($preflight.admitted -ne $true) { throw 'CPU preflight did not admit the frozen parent' }
 
-      - name: Run CPU parent arithmetic with the 600-second native watchdog
+      - name: Run CPU parent context_64 with the 1200-second native watchdog
         id: cpu_probe
-        timeout-minutes: 20
+        timeout-minutes: 30
         continue-on-error: true
         shell: powershell
         run: |
           $binary = (Get-Content -LiteralPath (Join-Path $env:SC23935_EVIDENCE_ROOT 'binary.txt') -Raw).Trim()
           $root = $env:SC23935_EVIDENCE_ROOT
-          & $env:REVIEWED_PYTHON scripts/ci/sc23935_bounded_probe.py --row (Join-Path $root 'cpu-parent') --record (Join-Path $root 'cpu-launch.json') --timeout-seconds 900 -- $env:REVIEWED_PYTHON scripts/release/qwen38_bonsai_terminal.py run --diagnostic-timeout-seconds 600 --candle-device cpu --binary $binary --test-name native_comparison --model-id candle-cpu-qwen38-parent-stage-probe --model-key bonsai-qwen38-parent --model-revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 --snapshot $env:BONSAI_QWEN38_SNAPSHOT --model-path $env:BONSAI_QWEN38_SNAPSHOT --runtime-sha $env:GITHUB_SHA --cases arithmetic --preflight (Join-Path $root 'cpu-preflight.json') --output (Join-Path $root 'cpu-parent')
+          & $env:REVIEWED_PYTHON scripts/ci/sc23935_bounded_probe.py --row (Join-Path $root 'cpu-parent') --record (Join-Path $root 'cpu-launch.json') --timeout-seconds 1500 -- $env:REVIEWED_PYTHON scripts/release/qwen38_bonsai_terminal.py run --diagnostic-timeout-seconds 1200 --candle-device cpu --binary $binary --test-name native_comparison --model-id candle-cpu-qwen38-parent-context64-probe --model-key bonsai-qwen38-parent --model-revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 --snapshot $env:BONSAI_QWEN38_SNAPSHOT --model-path $env:BONSAI_QWEN38_SNAPSHOT --runtime-sha $env:GITHUB_SHA --cases context_64 --preflight (Join-Path $root 'cpu-preflight.json') --output (Join-Path $root 'cpu-parent')
           if ($LASTEXITCODE -ne 0) { throw "CPU probe status $LASTEXITCODE; inspect partial receipt and stages" }
 
       - name: Prove the CPU child tree is absent
@@ -368,47 +361,17 @@ jobs:
           }
           'safe=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-      - name: Recheck GPU0 and run Bonsai CUDA acceptance plus tool/code diagnostics
-        id: cuda_probe
-        if: always() && steps.cpu_cleanup.outputs.safe == 'true'
-        timeout-minutes: 25
-        continue-on-error: true
-        shell: powershell
-        run: |
-          $root = $env:SC23935_EVIDENCE_ROOT
-          & $env:REVIEWED_PYTHON scripts/release/qwen38_bonsai_terminal.py check-gpu-reservation --gpu-index 0 --reservation $env:SC23935_GPU_RESERVATION --token $env:SC23935_RESERVATION_TOKEN --output (Join-Path $root 'gpu-recheck.json')
-          if ($LASTEXITCODE -ne 0) { throw 'GPU0 ownership, capacity, or no-co-tenant recheck failed' }
-          $binary = (Get-Content -LiteralPath (Join-Path $root 'binary.txt') -Raw).Trim()
-          $snapshot = $env:BONSAI_GGUF_SNAPSHOT
-          $model = Join-Path $snapshot 'Ternary-Bonsai-2-27B-PTQ1_0.gguf'
-          $projector = Join-Path $snapshot 'Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf'
-          & $env:REVIEWED_PYTHON scripts/ci/sc23935_bounded_probe.py --row (Join-Path $root 'cuda-bonsai') --record (Join-Path $root 'cuda-launch.json') --timeout-seconds 1200 -- $env:REVIEWED_PYTHON scripts/release/qwen38_bonsai_terminal.py run --candle-device auto --binary $binary --test-name native_comparison --model-id candle-cuda-bonsai-gguf-eight-case-probe --model-key bonsai-gguf --language-variant ptq1 --vision-variant q8 --model-revision 6ed5e12bf84b7a63069882c91dd9e9218647d17b --snapshot $snapshot --model-path $model --projector-path $projector --runtime-sha $env:GITHUB_SHA --cases reasoning_low,reasoning_medium,reasoning_xhigh,preserve_thinking,tool_roundtrip,json_thinking,tool,code --preflight (Join-Path $root 'cuda-preflight.json') --reservation $env:SC23935_GPU_RESERVATION --reservation-token $env:SC23935_RESERVATION_TOKEN --output (Join-Path $root 'cuda-bonsai')
-          if ($LASTEXITCODE -ne 0) { throw "CUDA Bonsai probe status $LASTEXITCODE; inspect exact cases" }
-
-      - name: Prove the CUDA child tree is absent
-        timeout-minutes: 2
-        id: cuda_cleanup
-        if: always() && steps.cpu_cleanup.outputs.safe == 'true'
-        shell: powershell
-        run: |
-          $path = Join-Path $env:SC23935_EVIDENCE_ROOT 'cuda-launch.json'
-          if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw 'missing CUDA launch cleanup proof' }
-          $proof = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
-          if ($proof.safe_to_continue -ne $true -or $proof.native_pids.Count -lt 1) { throw 'CUDA child cleanup is unproven' }
-          foreach ($nativePid in $proof.native_pids) {
-            if (Get-CimInstance Win32_Process -Filter "ProcessId = $nativePid") { throw "CUDA native PID $nativePid is alive" }
-          }
-          'safe=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-
       - name: Release only a quiescent owned GPU0 reservation
         timeout-minutes: 2
         id: release
         if: always() && env.SC23935_RESERVATION_ACQUIRED == '1'
         shell: powershell
         run: |
-          if ('${{ steps.cpu_cleanup.outputs.safe }}' -ne 'true' -or '${{ steps.cuda_cleanup.outputs.safe }}' -ne 'true') {
+          if ('${{ steps.cpu_cleanup.outputs.safe }}' -ne 'true') {
             throw 'native cleanup unproven; retain owned reservation for coordinator cleanup'
           }
+          & $env:REVIEWED_PYTHON scripts/release/qwen38_bonsai_terminal.py check-gpu-reservation --gpu-index 0 --reservation $env:SC23935_GPU_RESERVATION --token $env:SC23935_RESERVATION_TOKEN --output (Join-Path $env:SC23935_EVIDENCE_ROOT 'gpu-recheck.json')
+          if ($LASTEXITCODE -ne 0) { throw 'GPU0 ownership or no-co-tenant release recheck failed' }
           & $env:REVIEWED_PYTHON scripts/release/qwen38_bonsai_terminal.py release-gpu --gpu-index 0 --reservation $env:SC23935_GPU_RESERVATION --token $env:SC23935_RESERVATION_TOKEN
           if ($LASTEXITCODE -ne 0) { throw 'owned GPU0 reservation release failed' }
           'released=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
@@ -426,7 +389,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: sc23935-cpu-bonsai-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}\sc23935-cpu-bonsai-${{ github.run_id }}-${{ github.run_attempt }}
+          name: sc23935-cpu-context64-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}\sc23935-cpu-context64-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: error
           retention-days: 14
