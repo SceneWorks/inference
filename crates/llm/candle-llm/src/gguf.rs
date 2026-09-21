@@ -56,6 +56,21 @@ pub struct GgufCheckpoint {
     tok_types: Vec<i32>,
 }
 
+/// GGML CONTROL (3) tokens are skippable; USER_DEFINED (4) tokens are literal markers.
+/// Both must remain added tokens so encoding matches their published ids atomically.
+pub(crate) fn gguf_added_token(id: usize, content: &str, token_type: i32) -> Json {
+    debug_assert!(matches!(token_type, 3 | 4));
+    json!({
+        "id": id,
+        "content": content,
+        "single_word": false,
+        "lstrip": false,
+        "rstrip": false,
+        "normalized": false,
+        "special": token_type == 3,
+    })
+}
+
 impl GgufCheckpoint {
     /// Open and load a `.gguf` file onto `device`: dequantize every tensor to dense, remap keys, and
     /// un-permute the Llama/Mistral q/k projections. Load-time re-quantization (`spec.quantize`) is
@@ -197,23 +212,15 @@ impl GgufCheckpoint {
     /// Build a HF `tokenizer.json` (byte-level BPE) string from the retained GGUF tokenizer metadata.
     fn build_bpe_tokenizer_json(&self) -> String {
         // GGML token-type tags: 1=NORMAL 2=UNKNOWN 3=CONTROL 4=USER_DEFINED 5=UNUSED 6=BYTE.
-        // CONTROL / USER_DEFINED ids are the special/added tokens (e.g. `<|im_start|>`), surfaced as
-        // `added_tokens` with `special:true` so encode maps them whole and decode can skip them.
+        // Both CONTROL and USER_DEFINED need atomic encoding, but only CONTROL is skipped when
+        // decoding with `skip_special_tokens`. USER_DEFINED includes tool and reasoning markers.
         let mut added = Vec::new();
         let mut vocab = Map::new();
         for (id, tok) in self.tok_tokens.iter().enumerate() {
             vocab.insert(tok.clone(), json!(id));
             let ty = self.tok_types.get(id).copied().unwrap_or(1);
             if ty == 3 || ty == 4 {
-                added.push(json!({
-                    "id": id,
-                    "content": tok,
-                    "single_word": false,
-                    "lstrip": false,
-                    "rstrip": false,
-                    "normalized": false,
-                    "special": true,
-                }));
+                added.push(gguf_added_token(id, tok, ty));
             }
         }
         let merges: Vec<Json> = self.tok_merges.iter().map(|m| json!(m)).collect();
@@ -550,6 +557,16 @@ fn meta_i32_array(meta: &HashMap<String, Value>, key: &str) -> Option<Vec<i32>> 
 mod tests {
     use super::*;
     use candle_core::Device;
+
+    #[test]
+    fn ggml_added_token_types_keep_control_and_user_defined_distinct() {
+        let control = gguf_added_token(2, "<|im_start|>", 3);
+        let user_defined = gguf_added_token(4, "<tool_call>", 4);
+        assert_eq!(control["special"], true);
+        assert_eq!(user_defined["special"], false);
+        assert_eq!(control["id"], 2);
+        assert_eq!(user_defined["id"], 4);
+    }
 
     /// `gguf_arch_to_hf` must NOT claim Gemma 4, so `can_load` declines a Gemma 4 GGUF up front and
     /// `load_for_model` reports a clean `Unsupported` rather than routing it into a mis-conversion.
