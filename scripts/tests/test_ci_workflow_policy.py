@@ -3767,6 +3767,31 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("exit 1", step["run"])
         self.assertIn("join(needs.*.result", step["env"]["RESULTS"])
 
+    def assert_qwen38_candle_requires_successful_mlx(self, workflow: dict) -> None:
+        candle = workflow["jobs"]["qwen38-bonsai-candle"]
+        self.assertEqual(candle["needs"], "qwen38-bonsai-mlx")
+        self.assertEqual(
+            candle["if"],
+            "${{ !cancelled() && needs.qwen38-bonsai-mlx.result == 'success' && "
+            "github.event_name == 'workflow_dispatch' && "
+            "inputs.profile == 'qwen38-bonsai' }}",
+        )
+
+    def test_qwen38_candle_skips_after_failed_or_cancelled_mlx(self) -> None:
+        workflow = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
+        self.assert_qwen38_candle_requires_successful_mlx(workflow)
+        candle = workflow["jobs"]["qwen38-bonsai-candle"]
+        for unsafe_condition in (
+            candle["if"].replace("needs.qwen38-bonsai-mlx.result == 'success' && ", ""),
+            candle["if"].replace("== 'success'", "!= 'success'"),
+            candle["if"].replace("needs.qwen38-bonsai-mlx", "needs.qwen38-bonsai-candle"),
+        ):
+            with self.subTest(unsafe_condition=unsafe_condition):
+                mutated = copy.deepcopy(workflow)
+                mutated["jobs"]["qwen38-bonsai-candle"]["if"] = unsafe_condition
+                with self.assertRaises(AssertionError):
+                    self.assert_qwen38_candle_requires_successful_mlx(mutated)
+
     def test_qwen38_bonsai_terminal_profile_is_explicit_serial_and_sealed(self) -> None:
         workflow_text = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         workflow = yaml.safe_load(workflow_text)
@@ -3789,11 +3814,9 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(
             candle["runs-on"], ["self-hosted", "windows", "cuda", "real-weights"]
         )
-        self.assertEqual(candle["needs"], "qwen38-bonsai-mlx")
+        self.assert_qwen38_candle_requires_successful_mlx(workflow)
         self.assertIn("inputs.profile == 'qwen38-bonsai'", mlx["if"])
         self.assertIn("inputs.profile == 'qwen38-bonsai'", candle["if"])
-        self.assertIn("!cancelled()", candle["if"])
-        self.assertNotIn("always()", candle["if"])
 
         mlx_commands = "\n".join(step.get("run", "") for step in mlx["steps"])
         candle_commands = "\n".join(step.get("run", "") for step in candle["steps"])
