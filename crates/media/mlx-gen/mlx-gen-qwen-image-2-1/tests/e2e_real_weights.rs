@@ -301,3 +301,222 @@ fn validation_render_reference_edit() {
     eprintln!("eleven references: {err}");
     assert!(err.contains("at most 10"), "{err}");
 }
+
+/// A **transparent** RGBA reference of `width`×`height`: the same deterministic picture
+/// [`synthetic_reference`] produces, matted onto a soft-edged disc so the alpha is a real ramp
+/// rather than a binary cut-out (a hard matte would survive any resampling order and so could not
+/// exercise the premultiplied resize).
+///
+/// Set `QWEN_IMAGE_2_1_RGBA_REF` to a PNG with an alpha channel to extract from a real image
+/// instead; reference images for a real evaluation are user-provided.
+fn transparent_reference(width: u32, height: u32) -> mlx_gen::RgbaImage {
+    if let Ok(path) = std::env::var("QWEN_IMAGE_2_1_RGBA_REF") {
+        let rgba = image::open(&path)
+            .unwrap_or_else(|e| panic!("QWEN_IMAGE_2_1_RGBA_REF={path}: {e}"))
+            .to_rgba8();
+        return mlx_gen::RgbaImage {
+            width: rgba.width(),
+            height: rgba.height(),
+            pixels: rgba.into_raw(),
+        };
+    }
+    let rgb = synthetic_reference(1, width, height);
+    let mut out = mlx_gen::RgbaImage::from_rgb(&rgb).unwrap();
+    let (cx, cy) = ((width - 1) as f32 / 2.0, (height - 1) as f32 / 2.0);
+    let radius = width.min(height) as f32 * 0.36;
+    for (i, px) in out.pixels.chunks_exact_mut(4).enumerate() {
+        let (x, y) = ((i as u32 % width) as f32, (i as u32 / width) as f32);
+        let dist = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
+        // A 3-px linear ramp at the disc boundary: opaque inside, transparent outside.
+        px[3] = (((radius + 1.5 - dist) / 3.0).clamp(0.0, 1.0) * 255.0).round() as u8;
+    }
+    out
+}
+
+/// The alpha histogram claim this smoke exists to make: the emitted alpha must be **non-trivial**.
+///
+/// "Four channels came back" is not evidence of transparency — a port that widened an RGB decode
+/// with a constant `A = 255` would satisfy it. So this asserts three things that a constant or
+/// near-constant plane cannot satisfy together, prints the full 16-bucket histogram, and writes it
+/// beside the PNG:
+///
+/// * the alpha is not constant;
+/// * a real share of the image is substantially transparent (`A < 128` on at least 2 % of pixels)
+///   **and** a real share is substantially opaque (`A > 200` on at least 2 %) — i.e. the matte
+///   separates figure from ground rather than dimming everything uniformly;
+/// * compositing over white actually changes the picture (the RGB a flattening consumer would see
+///   differs from the raw colour on at least 2 % of pixels), which is what makes the alpha
+///   load-bearing rather than decorative.
+fn assert_nontrivial_alpha(label: &str, image: &mlx_gen::RgbaImage, out_dir: &std::path::Path) {
+    let alpha: Vec<u8> = image.pixels.chunks_exact(4).map(|px| px[3]).collect();
+    let total = alpha.len();
+    assert!(total > 0, "{label}: empty image");
+
+    let mut histogram = [0usize; 16];
+    for &a in &alpha {
+        histogram[(a as usize) / 16] += 1;
+    }
+    let (min, max) = (*alpha.iter().min().unwrap(), *alpha.iter().max().unwrap());
+    let transparent = alpha.iter().filter(|&&a| a < 128).count();
+    let opaque = alpha.iter().filter(|&&a| a > 200).count();
+
+    // How much the white composite moves the colour.
+    let flattened = image.to_rgb_over_white().unwrap();
+    let raw: Vec<u8> = image
+        .pixels
+        .chunks_exact(4)
+        .flat_map(|px| px[..3].to_vec())
+        .collect();
+    let moved = flattened
+        .pixels
+        .chunks_exact(3)
+        .zip(raw.chunks_exact(3))
+        .filter(|(a, b)| a != b)
+        .count();
+
+    let report = format!(
+        "{label}: alpha min={min} max={max} \
+         transparent(<128)={transparent}/{total} ({:.1}%) \
+         opaque(>200)={opaque}/{total} ({:.1}%) \
+         composite-moved={moved}/{total} ({:.1}%)\nhistogram(16 buckets)={histogram:?}\n",
+        100.0 * transparent as f32 / total as f32,
+        100.0 * opaque as f32 / total as f32,
+        100.0 * moved as f32 / total as f32,
+    );
+    eprint!("{report}");
+    std::fs::write(out_dir.join(format!("{label}_alpha.txt")), &report).unwrap();
+
+    assert!(min != max, "{label}: the alpha channel is constant ({min})");
+    let floor = total / 50; // 2 %
+    assert!(
+        transparent >= floor,
+        "{label}: only {transparent}/{total} pixels are substantially transparent; the render \
+         carries no usable matte"
+    );
+    assert!(
+        opaque >= floor,
+        "{label}: only {opaque}/{total} pixels are substantially opaque; the render is a uniform \
+         wash rather than a subject on transparency"
+    );
+    assert!(
+        moved >= floor,
+        "{label}: compositing over white changed only {moved}/{total} pixels — the alpha is not \
+         load-bearing"
+    );
+}
+
+/// The bounded real-weight **transparency** smoke (sc-24111): one transparent text-to-image and
+/// one RGBA-reference extraction, both at 1024×1024 / 8 steps, each asserting a non-trivial alpha
+/// histogram on the emitted `RgbaImage`.
+///
+/// Transparency is requested by **prompt** (upstream ships no flag — see `UPSTREAM.md`);
+/// `output_channels: Rgba` only decides that the decoder's alpha reaches the caller instead of
+/// being composited over white. Both PNGs are written as RGBA8 so the alpha survives to disk.
+///
+/// Run detached under the RSS guard, exactly like the sibling smokes
+/// (`scratchpad/render_guard_rgba.sh`):
+///
+/// ```sh
+/// MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT=…/snapshots/790c9263… \
+/// QWEN_IMAGE_2_1_RENDER_OUT=~/SceneWorks/render-validation-sc-24111 \
+///   cargo test --locked --release -p mlx-gen-qwen-image-2-1 --test integration \
+///   e2e_real_weights::validation_render_transparency -- --ignored --nocapture --test-threads 1
+/// ```
+#[test]
+#[ignore]
+fn validation_render_transparency() {
+    use mlx_gen::gen_core::{Conditioning, OutputChannels};
+
+    let root = snapshot();
+    let out_dir = std::env::var("QWEN_IMAGE_2_1_RENDER_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let started = Instant::now();
+    let registry = mlx_gen_qwen_image_2_1::provider_registry().unwrap();
+    let generator = registry
+        .load("qwen_image_2_1", &LoadSpec::new(WeightsSource::Dir(root)))
+        .unwrap();
+    eprintln!("loaded in {:.1}s", started.elapsed().as_secs_f32());
+
+    // The model card's transparent-image prompt form, and an extraction prompt over a reference
+    // that already carries alpha (transparent-layer editing).
+    let cases: [(&str, String, Vec<Conditioning>); 2] = [
+        (
+            "t2i_transparent",
+            "This is an RGBA image with transparency. A cute cartoon fox sticker, bold clean \
+             outline. The image has an alpha channel and the background is transparent."
+                .to_owned(),
+            Vec::new(),
+        ),
+        (
+            "rgba_reference_extraction",
+            "Extract the subject onto a transparent background. This is an RGBA image with \
+             transparency; the background is fully transparent."
+                .to_owned(),
+            vec![Conditioning::ReferenceRgba {
+                image: transparent_reference(1024, 1024),
+                strength: None,
+            }],
+        ),
+    ];
+
+    for (label, prompt, conditioning) in cases {
+        let req = GenerationRequest {
+            prompt,
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            seed: Some(42),
+            conditioning,
+            output_channels: OutputChannels::Rgba,
+            ..Default::default()
+        };
+        generator
+            .validate(&req)
+            .unwrap_or_else(|e| panic!("{label}: the RGBA request was refused at validate: {e}"));
+
+        let render_started = Instant::now();
+        let out = generator
+            .generate(&req, &mut |p| {
+                if let Progress::Step { current, total } = p {
+                    eprintln!(
+                        "{label}: step {current}/{total} ({:.1}s)",
+                        render_started.elapsed().as_secs_f32()
+                    );
+                } else {
+                    eprintln!(
+                        "{label}: {p:?} ({:.1}s)",
+                        render_started.elapsed().as_secs_f32()
+                    );
+                }
+            })
+            .unwrap();
+        let GenerationOutput::ImagesRgba(images) = out else {
+            panic!("{label}: an `output_channels: Rgba` request must emit ImagesRgba");
+        };
+        let image = &images[0];
+        image.validate().unwrap();
+        assert_eq!((image.width, image.height), (1024, 1024));
+        assert_eq!(image.channels(), 4);
+
+        let path = out_dir.join(format!(
+            "qwen_image_2_1_{label}_1024x1024_8steps_seed42.png"
+        ));
+        image::save_buffer(
+            &path,
+            &image.pixels,
+            image.width,
+            image.height,
+            image::ColorType::Rgba8,
+        )
+        .unwrap();
+        assert_nontrivial_alpha(label, image, &out_dir);
+        eprintln!(
+            "wrote {} after {:.1}s render",
+            path.display(),
+            render_started.elapsed().as_secs_f32()
+        );
+    }
+}

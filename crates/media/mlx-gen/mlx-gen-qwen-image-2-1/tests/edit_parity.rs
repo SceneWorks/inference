@@ -100,6 +100,16 @@ fn sources(w: &Weights, case: &Case) -> Vec<Image> {
         .collect()
 }
 
+/// The same sources, widened the way `collect_references` widens an RGB
+/// `Conditioning::Reference` (upstream's `img.convert("RGBA")`, `A = 255`) — the form
+/// `prepare_references` consumes.
+fn opaque_sources(w: &Weights, case: &Case) -> Vec<mlx_gen::RgbaImage> {
+    sources(w, case)
+        .iter()
+        .map(|image| mlx_gen::RgbaImage::from_rgb(image).unwrap())
+        .collect()
+}
+
 struct Snapshot {
     tokenizer: mlx_gen::tokenizer::TextTokenizer,
     encoder: QwenImage21TextEncoder,
@@ -180,7 +190,7 @@ fn reference_preprocessing_matches_upstream() {
     let snap = snapshot();
     for name in ["ref1", "ref2", "annotated", "mask_ref", "aspect"] {
         let c = case(&w, name);
-        let prepared = prepare_references(&sources(&w, &c), &snap.vision).unwrap();
+        let prepared = prepare_references(&opaque_sources(&w, &c), &snap.vision).unwrap();
         assert_eq!(prepared.len(), c.references);
         for (i, reference) in prepared.iter().enumerate() {
             let grid = i32_host(w.require(&format!("{name}/grid_thw_{i}")).unwrap());
@@ -226,7 +236,7 @@ fn conditioning_matches_upstream_for_one_two_and_ten_references() {
     let snap = snapshot();
     for name in ["ref1", "ref2", "ref10", "annotated", "mask_ref", "aspect"] {
         let c = case(&w, name);
-        let prepared = prepare_references(&sources(&w, &c), &snap.vision).unwrap();
+        let prepared = prepare_references(&opaque_sources(&w, &c), &snap.vision).unwrap();
         let cond = conditioning(&snap, &c.prompt, &prepared);
         let want_mask = i32_host(w.require(&format!("{name}/image_pad_mask")).unwrap());
         assert_eq!(
@@ -252,7 +262,7 @@ fn reference_latents_match_upstream_in_order() {
     let snap = snapshot();
     for name in ["ref1", "ref2", "annotated", "mask_ref", "aspect"] {
         let c = case(&w, name);
-        let prepared = prepare_references(&sources(&w, &c), &snap.vision).unwrap();
+        let prepared = prepare_references(&opaque_sources(&w, &c), &snap.vision).unwrap();
         let latents = encode_references(&snap.vae, &prepared).unwrap();
         assert_eq!(latents.len(), c.references);
         for (i, got) in latents.iter().enumerate() {
@@ -282,7 +292,7 @@ enum ReferenceFeed {
 }
 
 fn run_case_feeding(snap: &Snapshot, w: &Weights, c: &Case, feed: ReferenceFeed) -> Array {
-    let prepared = prepare_references(&sources(w, c), &snap.vision).unwrap();
+    let prepared = prepare_references(&opaque_sources(w, c), &snap.vision).unwrap();
     let pos = conditioning(snap, &c.prompt, &prepared);
     let neg = c
         .negative
@@ -450,7 +460,7 @@ fn swapping_two_references_changes_the_output() {
         let c = case(&w, name);
         encode_references(
             &snap.vae,
-            &prepare_references(&sources(&w, &c), &snap.vision).unwrap(),
+            &prepare_references(&opaque_sources(&w, &c), &snap.vision).unwrap(),
         )
         .unwrap()
     };
@@ -468,7 +478,7 @@ fn the_boundary_holds_and_eleven_references_are_refused() {
         serde_json::from_str(w.metadata("_limits").expect("_limits metadata")).unwrap();
     assert_eq!(limits["max_reference_images"].as_u64(), Some(10));
 
-    let ten = sources(&w, &case(&w, "ref10"));
+    let ten = opaque_sources(&w, &case(&w, "ref10"));
     assert_eq!(ten.len(), 10);
     assert!(
         prepare_references(&ten, &snap.vision).is_ok(),
@@ -489,7 +499,14 @@ fn the_boundary_holds_and_eleven_references_are_refused() {
         height: 64,
         ..Default::default()
     };
-    req.conditioning = vec![Conditioning::MultiReference { images: eleven }];
+    // Back to RGB for the request seam: `MultiReference` carries RGB images, which
+    // `collect_references` widens itself.
+    req.conditioning = vec![Conditioning::MultiReference {
+        images: eleven
+            .iter()
+            .map(|r| r.to_rgb_over_white().unwrap())
+            .collect(),
+    }];
     let err = mlx_gen_qwen_image_2_1::collect_references(&req)
         .unwrap_err()
         .to_string();

@@ -1056,6 +1056,113 @@ mod tests {
         ));
     }
 
+    /// A **transparent** reference must survive the admission -> execution round trip and be
+    /// priced like an opaque one (sc-24111).
+    ///
+    /// Two halves, both load-bearing:
+    ///
+    /// * `geometry_from_request` (admission) and `memory_reference_count` (execution) must both
+    ///   score the request at ONE reference, so the scope's geometry gate lets it through. When
+    ///   `image_reference_count` scored `ReferenceRgba` at zero, admission at `reference_count: 1`
+    ///   was followed by a hard refusal here — "references=0 does not fit admitted ...
+    ///   references=1" — and an admission taken FROM the request priced the edit with zero
+    ///   reference tokens.
+    /// * the joint-token pricing must add exactly one `REFERENCE_FIT_TOKENS` block, the same block
+    ///   an RGB reference adds: a transparent reference is fitted to `OUTPUT_RESOLUTION` like any
+    ///   other.
+    ///
+    /// *Mutation that reds this:* drop `Conditioning::ReferenceRgba` from the `=> 1` arm of
+    /// `gen_core::GenerationRequest::image_reference_count` (i.e. restore the `_ => 0` wildcard).
+    #[test]
+    fn a_transparent_reference_passes_the_geometry_gate_and_is_priced_like_an_opaque_one() {
+        use gen_core::{Conditioning, GenerationRequest, Image, RgbaImage};
+
+        let rgb_reference = || Conditioning::Reference {
+            image: Image {
+                width: 64,
+                height: 64,
+                pixels: vec![0; 64 * 64 * 3],
+            },
+            strength: None,
+        };
+        let rgba_reference = || Conditioning::ReferenceRgba {
+            image: RgbaImage {
+                width: 64,
+                height: 64,
+                pixels: vec![0; 64 * 64 * 4],
+            },
+            strength: None,
+        };
+
+        let request_with = |conditioning: Vec<Conditioning>| GenerationRequest {
+            prompt: "a red fox".into(),
+            width: 2048,
+            height: 2048,
+            conditioning,
+            ..Default::default()
+        };
+
+        // 1. Admission and execution agree, and agree with the RGB carrier.
+        let transparent = request_with(vec![rgba_reference()]);
+        let opaque = request_with(vec![rgb_reference()]);
+        assert_eq!(
+            gen_core::wan_i2v_memory::geometry_from_request(&transparent).reference_count,
+            1,
+            "admission must see one reference"
+        );
+        assert_eq!(
+            transparent.memory_reference_count(),
+            1,
+            "execution must see the same one"
+        );
+        assert_eq!(
+            gen_core::wan_i2v_memory::geometry_from_request(&transparent),
+            gen_core::wan_i2v_memory::geometry_from_request(&opaque),
+            "a transparent reference admits identically to an opaque one"
+        );
+
+        // 2. The scope's geometry gate accepts it, admitted from the request itself.
+        let spec = LoadSpec::new(WeightsSource::Dir("/qwen-image-2-1".into()));
+        let contract = weights_free_memory_strategy_contract(MODEL_ID, &spec).unwrap();
+        let fixture = registered_valid_fixture(&spec, &contract, MemoryStrategy::StagedResidency)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut context = fixture.context.clone();
+        let admitted = gen_core::wan_i2v_memory::geometry_from_request(&transparent);
+        context.geometry.width = admitted.width;
+        context.geometry.height = admitted.height;
+        context.geometry.batch = admitted.batch;
+        // `geometry_from_request` reports `frames: 0` for a still-image request while the scope
+        // compares against its own `default_frames`; that axis is not what this test is about, so
+        // the fixture's value stands and the reference axis is the only one under test.
+        context.geometry.reference_count = admitted.reference_count;
+        context.has_reference = true;
+        assert_eq!(
+            safety_check(&spec, &contract, &context),
+            MemorySafetyDecision::Accept,
+            "a one-reference transparent edit must be admitted"
+        );
+
+        let mut scope = registered_begin_request(&spec, &contract, &context)
+            .unwrap()
+            .expect("this provider publishes a request scope");
+        let mut executing = transparent.clone();
+        scope.configure_request(&mut executing).expect(
+            "the admitted transparent-reference request must pass the scope's geometry gate",
+        );
+        scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
+
+        // 3. ...and it is priced with exactly one fitted reference block.
+        let bare = joint_tokens(2048, 2048, 0, 0);
+        let one = joint_tokens(2048, 2048, 0, transparent.memory_reference_count());
+        assert_eq!(
+            one - bare,
+            REFERENCE_FIT_TOKENS,
+            "a transparent reference costs one fitted block, like every other reference"
+        );
+    }
+
     #[test]
     fn bounded_decode_publishes_a_domain_and_refuses_everything_outside_it() {
         assert!(DECODE_TILE_EDGES.contains(&DECODE_TILE_EDGE));

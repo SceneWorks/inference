@@ -7,11 +7,11 @@
 //! Qwen-Image 2.1 latent layout (unpatched `[1, h·w, 64]`, `TimestepConvention::Sigma`).
 
 use mlx_gen::gen_core::sampling::TimestepConvention;
-use mlx_gen::image::decoded_to_image;
+use mlx_gen::image::{decoded_to_image, decoded_to_rgba_image};
 use mlx_gen::sampler::run_flow_sampler;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::tokenizer::TextTokenizer;
-use mlx_gen::{CancelFlag, Error, GenerationRequest, Image, Progress, Result};
+use mlx_gen::{CancelFlag, Error, GenerationRequest, Image, Progress, Result, RgbaImage};
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
@@ -319,8 +319,32 @@ pub fn decode_tiling(req: &GenerationRequest) -> Option<TilingConfig> {
         })
 }
 
-/// Final packed latents → RGB8 [`Image`]: unpack, denormalise (`z·std + mean`), decode RGBA
-/// (tiled when `tiling` is given), composite over white, quantise.
+/// Final packed latents → the VAE's four-channel decode, NCHW `[1, 4, H, W]` in `[-1, 1]`:
+/// unpack, denormalise (`z·std + mean`), decode RGBA (tiled when `tiling` is given).
+///
+/// The single decode both emissions are built from. There is only ever ONE denoise and ONE decode
+/// per image: upstream has no transparency flag and always decodes four channels (see
+/// `UPSTREAM.md`), so [`decode_rgb`] and [`decode_rgba`] differ **only** in what they do with the
+/// alpha the decoder already produced.
+fn decode_to_rgba_tensor(
+    vae: &QwenImage21Vae,
+    latents: &Array,
+    width: u32,
+    height: u32,
+    tiling: Option<&TilingConfig>,
+    cancel: Option<&CancelFlag>,
+) -> Result<Array> {
+    let unpacked = unpack_latents(latents, width, height)?;
+    let vae_space = vae.denormalize(&unpacked)?;
+    match tiling {
+        Some(cfg) => vae.decode_rgba_tiled(&vae_space, cfg, cancel),
+        None => vae.decode_rgba(&vae_space),
+    }
+}
+
+/// Final packed latents → RGB8 [`Image`]: `decode_to_rgba_tensor`, composite over white,
+/// quantise. The `OutputChannels::Rgb` emission (the default), byte-for-byte unchanged by
+/// sc-24111.
 pub fn decode_rgb(
     vae: &QwenImage21Vae,
     latents: &Array,
@@ -329,14 +353,28 @@ pub fn decode_rgb(
     tiling: Option<&TilingConfig>,
     cancel: Option<&CancelFlag>,
 ) -> Result<Image> {
-    let unpacked = unpack_latents(latents, width, height)?;
-    let vae_space = vae.denormalize(&unpacked)?;
-    let rgba = match tiling {
-        Some(cfg) => vae.decode_rgba_tiled(&vae_space, cfg, cancel)?,
-        None => vae.decode_rgba(&vae_space)?,
-    };
+    let rgba = decode_to_rgba_tensor(vae, latents, width, height, tiling, cancel)?;
     let rgb = rgba_to_rgb_over_white(&rgba)?;
     decoded_to_image(&rgb)
+}
+
+/// Final packed latents → RGBA8 [`RgbaImage`] with **straight (un-premultiplied)** alpha
+/// (sc-24111): `decode_to_rgba_tensor`, quantise. The `OutputChannels::Rgba` emission.
+///
+/// No compositing anywhere on this path — the alpha the VAE decoded reaches the caller, which is
+/// the whole point of the opt-in. Quantisation is upstream's
+/// `VaeImageProcessor.postprocess`: `clip(x·0.5 + 0.5, 0, 1)` per channel, `(v·255).round()`,
+/// `uint8`, interleaved RGBA (see [`mlx_gen::image::decoded_to_rgba_image`]).
+pub fn decode_rgba(
+    vae: &QwenImage21Vae,
+    latents: &Array,
+    width: u32,
+    height: u32,
+    tiling: Option<&TilingConfig>,
+    cancel: Option<&CancelFlag>,
+) -> Result<RgbaImage> {
+    let rgba = decode_to_rgba_tensor(vae, latents, width, height, tiling, cancel)?;
+    decoded_to_rgba_image(&rgba)
 }
 
 #[cfg(test)]

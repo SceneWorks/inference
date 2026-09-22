@@ -24,9 +24,13 @@
 //! Text-to-image at the seven upstream presets (any 32-px-multiple size in range), steps, seed,
 //! true-CFG guidance with a negative prompt, seeded determinism, progress + cancellation through
 //! the shared `run_flow_sampler` contract, Resident/Sequential residency, and load-time Q4/Q8 of
-//! the DiT. The VAE decodes RGBA ([`QwenImage21Vae::decode_rgba`]); the emitted [`Image`] is RGB
-//! **composited over white** ([`pipeline::rgba_to_rgb_over_white`]) until gen-core grows an RGBA
-//! output surface (sc-24111). The joint-sequence layout ([`transformer::JointLayout`]) already
+//! the DiT. The VAE decodes RGBA
+//! ([`QwenImage21Vae::decode_rgba`]), and the request's `output_channels` selects what
+//! reaches the caller: `Rgb` (the default) composites that decode over white
+//! ([`pipeline::rgba_to_rgb_over_white`]) and emits an `Image`, while `Rgba` emits the
+//! four-channel decode unflattened as an `RgbaImage` with straight alpha (sc-24111). There is
+//! ONE decode either way — upstream has no transparency flag, always decodes four channels,
+//! and leaves *whether* a render is transparent to the prompt; see `UPSTREAM.md`. The joint-sequence layout ([`transformer::JointLayout`]) already
 //! models condition-image blocks so the reference/edit path (a later story) appends segments
 //! rather than restructuring attention.
 //!
@@ -77,7 +81,7 @@ pub use loader::{
 };
 pub use model::{descriptor, load, QwenImage21, MODEL_ID};
 pub use pipeline::{
-    create_noise, decode_rgb, denoise, encode_prompt, encode_references, joint_layout,
+    create_noise, decode_rgb, decode_rgba, denoise, encode_prompt, encode_references, joint_layout,
     pack_latents, rgba_to_rgb_over_white, text_rows, unpack_latents, DenoiseInputs,
     ReferenceConditioning,
 };

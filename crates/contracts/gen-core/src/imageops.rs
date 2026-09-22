@@ -147,17 +147,28 @@ fn quantize_coeffs(coeffs: &[(usize, Vec<f64>)]) -> Vec<(usize, Vec<i64>)> {
 /// `ImagingResample` 8-bit path: float coefficients quantized to `PRECISION_BITS` fixed-point, an
 /// integer multiply-accumulate seeded with the rounding bias, then `clip8` (`>>PRECISION_BITS` +
 /// clamp) between/after passes. Returns f32 HWC with integer-valued samples in `[0, 255]`.
-/// Assumes 3 channels (RGB).
+///
+/// `c` is the interleaved channel count — 3 (RGB) for every caller that predates sc-24111, 4
+/// (RGBA) for [`resize_lanczos_rgba_u8`]. The two resampling passes accumulate **per channel and
+/// independently of the others**, so resizing a 4-channel buffer produces byte-identical R/G/B
+/// planes to resizing the same image's 3-channel buffer; widening is therefore free of any
+/// numerical consequence for the existing callers, and an all-255 alpha plane resamples to all-255
+/// (the quantized coefficients of each output sample sum to exactly one unit).
+// Eight parameters, one over the lint's threshold: `src`/`in_h`/`in_w`/`out_h`/`out_w` are the
+// image, `c` the channel count (sc-24111), and `support_radius`/`filter` the kernel. Bundling any
+// of them into a struct would be ceremony around a private, single-module helper with three
+// call sites, all of which spell the kernel pair as literals.
+#[allow(clippy::too_many_arguments)]
 fn resize_u8(
     src: &[u8],
     in_h: usize,
     in_w: usize,
     out_h: usize,
     out_w: usize,
+    c: usize,
     support_radius: f64,
     filter: &dyn Fn(f64) -> f64,
 ) -> crate::Result<Vec<f32>> {
-    let c = 3usize;
     // Reject zero/degenerate dims up front (F-008/L-E): a 0 source edge makes the buffer guard below
     // vacuous (`in_h*in_w*c == 0`) and yields a silent uniform-black output instead of a rejection,
     // and a 0 target edge later divides by zero in `precompute_coeffs`. The shipped envelope never
@@ -175,7 +186,8 @@ fn resize_u8(
     // entry points funnel through here, and this is a no-op for every well-formed image.
     if src.len() < in_h * in_w * c {
         return Err(Error::Msg(format!(
-            "resize_u8: pixel buffer too small — {} bytes for a {in_w}×{in_h} RGB image (need {})",
+            "resize_u8: pixel buffer too small — {} bytes for a {in_w}×{in_h} {c}-channel \
+             image (need {})",
             src.len(),
             in_h * in_w * c
         )));
@@ -223,7 +235,7 @@ pub fn resize_bicubic_u8(
     out_h: usize,
     out_w: usize,
 ) -> crate::Result<Vec<f32>> {
-    resize_u8(src, in_h, in_w, out_h, out_w, 2.0, &cubic)
+    resize_u8(src, in_h, in_w, out_h, out_w, 3, 2.0, &cubic)
 }
 
 /// PIL `Image.BILINEAR` resize of a uint8 RGB HWC image (SAM2's preprocessing filter). Returns
@@ -235,7 +247,7 @@ pub fn resize_bilinear_u8(
     out_h: usize,
     out_w: usize,
 ) -> crate::Result<Vec<f32>> {
-    resize_u8(src, in_h, in_w, out_h, out_w, 1.0, &triangle)
+    resize_u8(src, in_h, in_w, out_h, out_w, 3, 1.0, &triangle)
 }
 
 /// PIL `Image.LANCZOS` resize of a uint8 RGB HWC image (the fork's `scale_to_dimensions`). Returns
@@ -247,7 +259,103 @@ pub fn resize_lanczos_u8(
     out_h: usize,
     out_w: usize,
 ) -> crate::Result<Vec<f32>> {
-    resize_u8(src, in_h, in_w, out_h, out_w, 3.0, &lanczos3)
+    resize_u8(src, in_h, in_w, out_h, out_w, 3, 3.0, &lanczos3)
+}
+
+/// PIL `Image.LANCZOS` resize of a uint8 **RGBA** HWC image — the four-channel sibling of
+/// [`resize_lanczos_u8`] (sc-24111). Returns f32 HWC, integer-valued `[0,255]`, `out_h·out_w·4`,
+/// **straight (un-premultiplied)** alpha in and out.
+///
+/// This is upstream's own order of operations for a transparent condition image: diffusers
+/// converts to `RGBA` **first** and resizes all four channels together
+/// (`image_processor.resize(img, …)` on the RGBA PIL image), and only then flattens a copy over
+/// white for the vision tower.
+///
+/// ## The resample runs in PREMULTIPLIED space
+///
+/// `PIL.Image.resize` does not resample an `RGBA` image's four bands straight. It special-cases
+/// `LA`/`RGBA` for every filter but `NEAREST`:
+///
+/// ```text
+/// if self.mode in ["LA", "RGBA"] and resample != Resampling.NEAREST:
+///     im = self.convert({"LA": "La", "RGBA": "RGBa"}[self.mode])
+///     im = im.resize(size, resample, box)
+///     return im.convert(self.mode)
+/// ```
+///
+/// so the real pipeline is **premultiply → resample the four premultiplied bands (with `clip8`
+/// between passes, exactly as [`resize_lanczos_u8`] does) → un-premultiply**. That is not a
+/// rounding detail: on a soft matte edge, resampling straight colour lets the colour of
+/// nearly-transparent pixels bleed into visible ones at full weight, which is the classic dark
+/// (or, here, arbitrary) halo. Reproducing it is what makes a transparent reference's fitted
+/// pixels match upstream's rather than merely resemble them.
+///
+/// Both conversions use PIL's integer rules, verified exhaustively over all 256×256
+/// (channel, alpha) pairs against Pillow itself:
+///
+/// * premultiply `c' = (c·a + 127) / 255` (round-half-up — `floor(c·a/255)` is off by one);
+/// * un-premultiply `c = min(255, c'·255 / a)` for `a > 0`, and `c = c'` for `a = 0` (which only
+///   arises for a fully transparent pixel, where the stored colour is already `0` on legal input).
+///
+/// For a fully opaque image (`a = 255` everywhere) both conversions are the identity and the
+/// alpha band resamples to a constant 255, so this is **byte-identical** to widening an RGB image
+/// and calling [`resize_lanczos_u8`] on it — which is what keeps the ordinary RGB reference path
+/// unchanged.
+///
+/// `Err` (never a panic) on a zero dimension or a `src` buffer smaller than `in_h·in_w·4`.
+pub fn resize_lanczos_rgba_u8(
+    src: &[u8],
+    in_h: usize,
+    in_w: usize,
+    out_h: usize,
+    out_w: usize,
+) -> crate::Result<Vec<f32>> {
+    if src.len() < in_h * in_w * 4 {
+        return Err(Error::Msg(format!(
+            "resize_lanczos_rgba_u8: pixel buffer too small — {} bytes for a {in_w}×{in_h} RGBA \
+             image (need {})",
+            src.len(),
+            in_h * in_w * 4
+        )));
+    }
+    // RGBA -> RGBa.
+    let mut premultiplied = vec![0u8; in_h * in_w * 4];
+    for (dst, px) in premultiplied
+        .chunks_exact_mut(4)
+        .zip(src.chunks_exact(4).take(in_h * in_w))
+    {
+        let a = u32::from(px[3]);
+        for ch in 0..3 {
+            dst[ch] = ((u32::from(px[ch]) * a + 127) / 255) as u8;
+        }
+        dst[3] = px[3];
+    }
+
+    let resampled = resize_u8(&premultiplied, in_h, in_w, out_h, out_w, 4, 3.0, &lanczos3)?;
+
+    // RGBa -> RGBA.
+    let mut out = vec![0f32; out_h * out_w * 4];
+    for (dst, px) in out.chunks_exact_mut(4).zip(resampled.chunks_exact(4)) {
+        // `resize_u8` applies `clip8`, so every sample is already an integer in [0, 255].
+        let a = px[3] as u32;
+        for ch in 0..3 {
+            let c = px[ch] as u32;
+            // NOT a `checked_div`: the zero-alpha branch does not fall back to a neutral value,
+            // it passes the stored channel through UNCHANGED, which is what Pillow does (verified
+            // exhaustively over all 256x256 premultiplied pairs). `checked_div(...).unwrap_or(0)`
+            // would be a different, wrong rule.
+            #[allow(clippy::manual_checked_ops)]
+            {
+                dst[ch] = if a == 0 {
+                    c as f32
+                } else {
+                    (c * 255 / a).min(255) as f32
+                };
+            }
+        }
+        dst[3] = px[3];
+    }
+    Ok(out)
 }
 
 /// PIL `Image.LANCZOS` resize of an **unbounded f32** RGB HWC image — the HDR counterpart of

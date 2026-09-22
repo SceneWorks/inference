@@ -135,7 +135,7 @@ pub use generator::{
     AudioEditMode, AudioEditRef, AudioParams, Capabilities, ComponentPrecisionFloor, Conditioning,
     ConditioningKind, ControlClipRef, ControlKind, ConversationRole, ConversationSession,
     ConversationTurn, GenerationMemory, GenerationOutput, GenerationPhase, GenerationRequest,
-    Generator, HdrRequest, KeyframeRef, Modality, ModelDescriptor, PhaseAdapter,
+    Generator, HdrRequest, KeyframeRef, Modality, ModelDescriptor, OutputChannels, PhaseAdapter,
     PrecisionFloorComponent, ReplacementMode, SizeFloor, SpeechSegment,
     StagedResidencyAvailability, StepSupport, TimeRegion, VideoClipRef,
     REFERENCE_IMAGE_SHORT_EDGE_DEFAULT, REFERENCE_IMAGE_SHORT_EDGE_MAX,
@@ -168,7 +168,7 @@ pub use license::{
     license_table_conformance_errors, provider_terms, resolve_component, resolve_family,
     CeilingBoundary, ComponentLicense, LicenseFamily, LicenseTerm, ProviderComponents,
 };
-pub use media::{AudioChunk, AudioStem, AudioTrack, HdrFrame, Image};
+pub use media::{AudioChunk, AudioStem, AudioTrack, HdrFrame, Image, RgbaImage};
 pub use memory_phases::{
     DecoderTilingRealization, DecoderWorkspaceFacts, ImagePipelineArchitecture, MemoryPhaseFacts,
     StagedWeightSchedule, StreamedWeightFacts,

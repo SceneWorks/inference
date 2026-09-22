@@ -10,7 +10,7 @@ use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::tiling::TilingConfig;
 use candle_gen::gen_core::tokenizer::TextTokenizer;
-use candle_gen::gen_core::{CancelFlag, GenerationRequest, Image, Progress};
+use candle_gen::gen_core::{CancelFlag, GenerationRequest, Image, Progress, RgbaImage};
 use candle_gen::run_flow_sampler;
 use candle_gen::{CandleError as Error, Result};
 
@@ -329,8 +329,32 @@ pub fn decode_tiling(req: &GenerationRequest) -> Option<TilingConfig> {
         })
 }
 
-/// Final packed latents → RGB8 [`Image`]: unpack, denormalise (`z·std + mean`), decode RGBA
-/// (tiled when `tiling` is given), composite over white, quantise.
+/// Final packed latents → the VAE's four-channel decode, NCHW `[1, 4, H, W]` in `[-1, 1]`:
+/// unpack, denormalise (`z·std + mean`), decode RGBA (tiled when `tiling` is given).
+///
+/// The single decode both emissions are built from. There is only ever ONE denoise and ONE decode
+/// per image: upstream has no transparency flag and always decodes four channels (see
+/// `UPSTREAM.md`), so [`decode_rgb`] and [`decode_rgba`] differ **only** in what they do with the
+/// alpha the decoder already produced.
+fn decode_to_rgba_tensor(
+    vae: &QwenImage21Vae,
+    latents: &Tensor,
+    width: u32,
+    height: u32,
+    tiling: Option<&TilingConfig>,
+    cancel: Option<&CancelFlag>,
+) -> Result<Tensor> {
+    let unpacked = unpack_latents(latents, width, height)?;
+    let vae_space = vae.denormalize(&unpacked)?;
+    match tiling {
+        Some(cfg) => vae.decode_rgba_tiled(&vae_space, cfg, cancel),
+        None => vae.decode_rgba(&vae_space),
+    }
+}
+
+/// Final packed latents → RGB8 [`Image`]: `decode_to_rgba_tensor`, composite over white,
+/// quantise. The `OutputChannels::Rgb` emission (the default), byte-for-byte unchanged by
+/// sc-24111.
 pub fn decode_rgb(
     vae: &QwenImage21Vae,
     latents: &Tensor,
@@ -339,13 +363,27 @@ pub fn decode_rgb(
     tiling: Option<&TilingConfig>,
     cancel: Option<&CancelFlag>,
 ) -> Result<Image> {
-    let unpacked = unpack_latents(latents, width, height)?;
-    let vae_space = vae.denormalize(&unpacked)?;
-    let rgba = match tiling {
-        Some(cfg) => vae.decode_rgba_tiled(&vae_space, cfg, cancel)?,
-        None => vae.decode_rgba(&vae_space)?,
-    };
+    let rgba = decode_to_rgba_tensor(vae, latents, width, height, tiling, cancel)?;
     decoded_to_image(&rgba_to_rgb_over_white(&rgba)?)
+}
+
+/// Final packed latents → RGBA8 [`RgbaImage`] with **straight (un-premultiplied)** alpha
+/// (sc-24111): `decode_to_rgba_tensor`, quantise. The `OutputChannels::Rgba` emission.
+///
+/// No compositing anywhere on this path — the alpha the VAE decoded reaches the caller, which is
+/// the whole point of the opt-in. Quantisation is upstream's `VaeImageProcessor.postprocess`:
+/// `clip(x·0.5 + 0.5, 0, 1)` per channel, `(v·255).round()`, `uint8`, interleaved RGBA (see
+/// [`decoded_to_rgba_image`]).
+pub fn decode_rgba(
+    vae: &QwenImage21Vae,
+    latents: &Tensor,
+    width: u32,
+    height: u32,
+    tiling: Option<&TilingConfig>,
+    cancel: Option<&CancelFlag>,
+) -> Result<RgbaImage> {
+    let rgba = decode_to_rgba_tensor(vae, latents, width, height, tiling, cancel)?;
+    decoded_to_rgba_image(&rgba)
 }
 
 /// RGB NCHW in `[-1, 1]` → the gen-core RGB8 [`Image`], with diffusers-compatible
@@ -366,6 +404,37 @@ pub fn decoded_to_image(rgb: &Tensor) -> Result<Image> {
         .flatten_all()?
         .to_vec1::<u8>()?;
     Ok(Image {
+        width: width as u32,
+        height: height as u32,
+        pixels,
+    })
+}
+
+/// RGBA NCHW in `[-1, 1]` → the gen-core RGBA8 [`RgbaImage`] with **straight (un-premultiplied)**
+/// alpha (sc-24111) — the four-channel sibling of [`decoded_to_image`], sharing its exact
+/// quantisation chain ([`candle_gen::round_rgb8`]'s diffusers-compatible nearest-even rounding).
+///
+/// This is upstream's `VaeImageProcessor.postprocess` verbatim: `(x / 2 + 0.5).clamp(0, 1)` per
+/// channel **independently**, then `(v · 255).round().astype(uint8)` and
+/// `PIL.Image.fromarray(..., mode="RGBA")`. Nothing premultiplies, and the alpha is clamped by the
+/// same clamp as the colour — so the RGB and the RGBA emission of one decode differ only in
+/// whether the alpha is applied (over white) or carried.
+pub fn decoded_to_rgba_image(rgba: &Tensor) -> Result<RgbaImage> {
+    let dims = rgba.dims().to_vec();
+    if dims.len() != 4 || dims[1] != 4 {
+        return Err(Error::Msg(format!(
+            "qwen_image_2_1: decoded_to_rgba_image expects [1, 4, H, W], got {dims:?}"
+        )));
+    }
+    let (height, width) = (dims[2], dims[3]);
+    let scaled = ((rgba.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?;
+    let pixels = candle_gen::round_rgb8(&scaled)?
+        .i(0)?
+        .to_device(&Device::Cpu)?
+        .permute((1, 2, 0))?
+        .flatten_all()?
+        .to_vec1::<u8>()?;
+    Ok(RgbaImage {
         width: width as u32,
         height: height as u32,
         pixels,

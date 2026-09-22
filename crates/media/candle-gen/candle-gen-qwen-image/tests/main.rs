@@ -14,6 +14,9 @@
 #[path = "conformance.rs"]
 mod conformance;
 
+#[path = "descriptor_conformance.rs"]
+mod descriptor_conformance;
+
 #[path = "preview_real_weights.rs"]
 mod preview_real_weights;
 

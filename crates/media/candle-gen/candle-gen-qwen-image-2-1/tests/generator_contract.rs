@@ -220,3 +220,15 @@ fn load_time_quantization_is_refused_with_a_typed_error() {
     assert!(matches!(err, CoreError::Unsupported(_)), "{err:?}");
     assert!(err.to_string().contains("on-the-fly"), "{err}");
 }
+
+/// **Alpha-output honesty**, the shared gen-core conformance check (sc-24111): this provider
+/// advertises `supports_alpha_output`, so `validate()` must accept an `OutputChannels::Rgba`
+/// request, `generate()` must answer it with `GenerationOutput::ImagesRgba` carrying well-formed
+/// four-channel buffers, and the untouched RGB default must still yield
+/// `GenerationOutput::Images`. The candle twin of the MLX gate, so the capability is proven on
+/// both backends rather than assumed to transfer.
+#[test]
+fn alpha_output_honesty() {
+    let g = load(OffloadPolicy::Resident);
+    gen_core_testkit::check_alpha_output_honesty(g.as_ref(), &profile()).unwrap();
+}

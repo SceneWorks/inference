@@ -26,8 +26,12 @@
 //! Text-to-image at the seven upstream presets (any 32-px-multiple size in range), steps, seed,
 //! true-CFG guidance with a negative prompt, seeded determinism, progress + cancellation through
 //! the shared `run_flow_sampler` contract, and Resident/Sequential residency. The VAE decodes RGBA
-//! ([`QwenImage21Vae::decode_rgba`]); the emitted `Image` is RGB **composited over white**
-//! ([`pipeline::rgba_to_rgb_over_white`]) until gen-core grows an RGBA output surface (sc-24111).
+//! ([`QwenImage21Vae::decode_rgba`]), and the request's `output_channels` selects what
+//! reaches the caller: `Rgb` (the default) composites that decode over white
+//! ([`pipeline::rgba_to_rgb_over_white`]) and emits an `Image`, while `Rgba` emits the
+//! four-channel decode unflattened as an `RgbaImage` with straight alpha (sc-24111). There is
+//! ONE decode either way — upstream has no transparency flag, always decodes four channels,
+//! and leaves *whether* a render is transparent to the prompt; see `UPSTREAM.md`.
 //! A request asking for `GenerationMemory::tile_vae_decode` gets the **bounded** decode
 //! ([`QwenImage21Vae::decode_rgba_tiled`]): the decoder's global head runs once and only the
 //! up-sampling tail — where the 144-channel full-resolution spike lives — is tiled and
@@ -69,7 +73,7 @@ use candle_core::Device;
 use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Precision, Progress, Quant, SizeFloor,
+    ModelDescriptor, OutputChannels, Precision, Progress, Quant, SizeFloor,
 };
 use candle_gen::residency::Residency;
 use candle_gen::{CandleError as Error, Result};
@@ -116,9 +120,9 @@ pub use loader::{
 };
 pub use memory_strategy::{admission_geometry, AdmissionGeometry};
 pub use pipeline::{
-    create_noise, decode_rgb, decode_tiling, denoise, encode_prompt, encode_references,
-    joint_layout, pack_latents, rgba_to_rgb_over_white, text_rows, unpack_latents, DenoiseInputs,
-    ReferenceConditioning, DECODE_OVERLAP, DECODE_TILE_EDGE,
+    create_noise, decode_rgb, decode_rgba, decode_tiling, denoise, encode_prompt,
+    encode_references, joint_layout, pack_latents, rgba_to_rgb_over_white, text_rows,
+    unpack_latents, DenoiseInputs, ReferenceConditioning, DECODE_OVERLAP, DECODE_TILE_EDGE,
 };
 pub use quant::{Tier, GROUP_SIZE};
 pub use reference::{
@@ -169,10 +173,21 @@ pub fn descriptor() -> ModelDescriptor {
             // already exposes to SceneWorks routing. `Mask` is deliberately **not** advertised:
             // upstream has no mask input (see UPSTREAM.md), and a mask travels as an ordinary
             // extra reference the prompt names.
+            // `ReferenceRgba` (sc-24111) joins them: upstream converts every condition image
+            // to RGBA anyway, so a reference that already carries alpha is the general case and
+            // an RGB one the opaque special case. Advertising it is what lets a transparent layer
+            // be edited (its alpha reaches the VAE encode) instead of being flattened at the
+            // contract boundary.
             conditioning: vec![
                 gen_core::ConditioningKind::Reference,
+                gen_core::ConditioningKind::ReferenceRgba,
                 gen_core::ConditioningKind::MultiReference,
             ],
+            // Native transparency (sc-24111). The VAE is four-channel in and out on **every**
+            // route behind this descriptor — T2I and reference alike — so there is no sub-path
+            // that would have to fabricate an alpha to honour the flag. Whether a given render is
+            // actually transparent is decided by the prompt, not by this bit; see UPSTREAM.md.
+            supports_alpha_output: true,
             supports_lora: false,
             supports_lokr: false,
             samplers: candle_gen::curated_sampler_names(),
@@ -440,7 +455,14 @@ impl QwenImage21 {
                     .map(|neg| crate::pipeline::text_rows(&neg.hidden, &neg.image_pad_mask))
                     .transpose()?;
                 let conditioned = !references.is_empty();
-                let mut images = Vec::with_capacity(req.count as usize);
+                // ONE decode per image either way — upstream always decodes four channels and
+                // has no transparency flag — so this branch chooses only whether the alpha is
+                // carried (`Rgba`) or applied over white (`Rgb`, the default). The latents,
+                // the denoise and the VAE call are identical.
+                let rgba_out = req.output_channels == OutputChannels::Rgba;
+                let mut images = Vec::with_capacity(if rgba_out { 0 } else { req.count as usize });
+                let mut rgba_images =
+                    Vec::with_capacity(if rgba_out { req.count as usize } else { 0 });
                 for i in 0..req.count {
                     let seed = candle_gen::image_seed(params.base_seed, i);
                     let latents = create_noise(seed, req.width, req.height, channels, &device)?;
@@ -469,16 +491,31 @@ impl QwenImage21 {
                     if req.cancel.is_cancelled() {
                         return Err(Error::Canceled);
                     }
-                    images.push(decode_rgb(
-                        &heavy.vae,
-                        &latents,
-                        req.width,
-                        req.height,
-                        tiling.as_ref(),
-                        Some(&req.cancel),
-                    )?);
+                    if rgba_out {
+                        rgba_images.push(decode_rgba(
+                            &heavy.vae,
+                            &latents,
+                            req.width,
+                            req.height,
+                            tiling.as_ref(),
+                            Some(&req.cancel),
+                        )?);
+                    } else {
+                        images.push(decode_rgb(
+                            &heavy.vae,
+                            &latents,
+                            req.width,
+                            req.height,
+                            tiling.as_ref(),
+                            Some(&req.cancel),
+                        )?);
+                    }
                 }
-                Ok(GenerationOutput::Images(images))
+                if rgba_out {
+                    Ok(GenerationOutput::ImagesRgba(rgba_images))
+                } else {
+                    Ok(GenerationOutput::Images(images))
+                }
             },
         )
     }
@@ -600,9 +637,15 @@ mod tests {
             d.capabilities.conditioning,
             vec![
                 gen_core::ConditioningKind::Reference,
+                gen_core::ConditioningKind::ReferenceRgba,
                 gen_core::ConditioningKind::MultiReference,
             ],
-            "the reference/edit route is the same upstream call as text-to-image"
+            "the reference/edit route is the same upstream call as text-to-image, and a \
+             transparent reference is an ordinary reference that kept its alpha (sc-24111)"
+        );
+        assert!(
+            d.capabilities.supports_alpha_output,
+            "the VAE is four-channel on every route behind this descriptor (sc-24111)"
         );
         assert!(
             !d.capabilities.accepts(gen_core::ConditioningKind::Mask),

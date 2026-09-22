@@ -236,3 +236,14 @@ fn a_load_time_tier_the_tower_cannot_take_is_refused_by_name() {
     assert!(err.contains("would leave the tower dense"), "{err}");
     assert!(err.contains("group 64"), "{err}");
 }
+
+/// **Alpha-output honesty**, the shared gen-core conformance check (sc-24111): this provider
+/// advertises `supports_alpha_output`, so `validate()` must accept an `OutputChannels::Rgba`
+/// request, `generate()` must answer it with `GenerationOutput::ImagesRgba` carrying well-formed
+/// four-channel buffers, and the untouched RGB default must still yield
+/// `GenerationOutput::Images`.
+#[test]
+fn alpha_output_honesty() {
+    let g = load(OffloadPolicy::Resident);
+    gen_core_testkit::check_alpha_output_honesty(g.as_ref(), &profile()).unwrap();
+}

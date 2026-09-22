@@ -96,7 +96,8 @@ pub use voice_embedder::{
 
 use gen_core::{
     Capabilities, Conditioning, EncoderContract, Error, GenerationOutput, GenerationRequest,
-    Generator, Image, Modality, Progress, StepSupport, VisionEncoderContract,
+    Generator, Image, Modality, OutputChannels, Progress, RgbaImage, StepSupport,
+    VisionEncoderContract,
 };
 
 /// Mark `path` as an NTFS sparse file so a later `set_len` reserves no clusters for the hole.
@@ -826,6 +827,11 @@ pub(crate) fn output_bytes(out: &GenerationOutput) -> Vec<u8> {
         GenerationOutput::Images(imgs) => {
             imgs.iter().flat_map(|i| i.pixels.iter().copied()).collect()
         }
+        // RGBA (sc-24111): the same byte extraction — the interleaved buffer, alpha included, so
+        // a provider whose alpha channel is seed-dependent is caught by the determinism check too.
+        GenerationOutput::ImagesRgba(imgs) => {
+            imgs.iter().flat_map(|i| i.pixels.iter().copied()).collect()
+        }
         GenerationOutput::Video { frames, .. } => frames
             .iter()
             .flat_map(|f| f.pixels.iter().copied())
@@ -846,9 +852,25 @@ fn blank_image(profile: &Profile) -> Image {
     }
 }
 
-/// The first easily-constructed [`Conditioning`] whose kind the model does **not** advertise, or
-/// `None` if it accepts all of the candidates (then the negative-conditioning sub-check is skipped).
-fn undeclared_conditioning(caps: &Capabilities, profile: &Profile) -> Option<Conditioning> {
+/// A `width × height` all-transparent RGBA image, for building conditioning the model should
+/// reject. Fully transparent (`A = 0`) on purpose: a provider that flattens the fourth channel
+/// instead of refusing the kind produces a blank white plate rather than an obvious error.
+fn blank_rgba_image(profile: &Profile) -> RgbaImage {
+    RgbaImage {
+        width: profile.width,
+        height: profile.height,
+        pixels: vec![0u8; profile.width as usize * profile.height as usize * 4],
+    }
+}
+
+/// **Every** easily-constructed [`Conditioning`] whose kind the model does not advertise; empty if
+/// it accepts all of the candidates (then the negative-conditioning sub-check is skipped).
+///
+/// Returns the whole set, not the first match. It used to `find` the first, and that made every
+/// candidate after the first unreachable in practice: `Mask` leads the list and virtually no
+/// provider accepts it, so a provider could advertise nothing else and still only ever be probed
+/// for `Mask`. `ReferenceRgba` (sc-24111) was added to this list and was never once selected.
+fn undeclared_conditioning(caps: &Capabilities, profile: &Profile) -> Vec<Conditioning> {
     [
         Conditioning::Mask {
             image: blank_image(profile),
@@ -860,9 +882,17 @@ fn undeclared_conditioning(caps: &Capabilities, profile: &Profile) -> Option<Con
             image: blank_image(profile),
             strength: None,
         },
+        // sc-24111: default-deny on transparent references, so a family that grows an RGBA
+        // reference path without advertising the kind is caught here rather than by a
+        // preprocessor silently flattening the fourth channel.
+        Conditioning::ReferenceRgba {
+            image: blank_rgba_image(profile),
+            strength: None,
+        },
     ]
     .into_iter()
-    .find(|c| !caps.accepts(c.kind()))
+    .filter(|c| !caps.accepts(c.kind()))
+    .collect()
 }
 
 /// **Validate honesty.** Everything the descriptor advertises is accepted by `validate()`, and
@@ -976,8 +1006,9 @@ pub fn check_validate_honesty(g: &dyn Generator, profile: &Profile) -> Result<()
         }
     }
 
-    // Negative: an undeclared conditioning kind must be rejected.
-    if let Some(cond) = undeclared_conditioning(caps, profile) {
+    // Negative: EVERY undeclared conditioning kind must be rejected — not merely the first one
+    // that happens to lead the candidate list (sc-24111).
+    for cond in undeclared_conditioning(caps, profile) {
         let kind = cond.kind();
         let mut r = base_request(profile);
         r.conditioning = vec![cond];
@@ -991,6 +1022,119 @@ pub fn check_validate_honesty(g: &dyn Generator, profile: &Profile) -> Result<()
     }
 
     Ok(())
+}
+
+/// **Alpha-output honesty (sc-24111).** The two halves of
+/// [`Capabilities::supports_alpha_output`], each of which is trivially satisfiable alone:
+///
+/// * a provider that does **not** advertise it must *refuse* an [`OutputChannels::Rgba`] request
+///   at `validate()` — not accept it and return RGB, which is a silently wrong image (a subject
+///   the caller asked to have extracted onto transparency, handed back flattened, with no channel
+///   left to notice it with);
+/// * a provider that **does** advertise it must accept the request *and* answer it with
+///   [`GenerationOutput::ImagesRgba`] whose buffers are well-formed (`len == width · height · 4`)
+///   — never `GenerationOutput::Images`.
+///
+/// The RGB default is checked on both: `OutputChannels::Rgb` must still yield
+/// [`GenerationOutput::Images`], so advertising alpha cannot change what an untouched request
+/// receives.
+pub fn check_alpha_output_honesty(g: &dyn Generator, profile: &Profile) -> Result<(), String> {
+    let desc = g.descriptor();
+    let id = desc.id;
+    if desc.modality == Modality::Audio {
+        return Ok(());
+    }
+
+    // The RGB default is unaffected either way.
+    let mut rgb = base_request(profile);
+    rgb.output_channels = OutputChannels::Rgb;
+    g.validate(&rgb).map_err(|e| {
+        format!("alpha-output[{id}]: the default RGB request was rejected by validate(): {e}")
+    })?;
+
+    let mut rgba = base_request(profile);
+    rgba.output_channels = OutputChannels::Rgba;
+
+    if !desc.capabilities.supports_alpha_output {
+        return match g.validate(&rgba) {
+            Ok(()) => Err(format!(
+                "alpha-output[{id}]: `supports_alpha_output` is false, but an \
+                 `output_channels: Rgba` request was accepted by validate(). A provider that \
+                 cannot emit alpha must refuse the request — returning RGB instead hands the \
+                 caller a flattened image with nothing to say the alpha was dropped."
+            )),
+            Err(Error::Unsupported(_)) => Ok(()),
+            Err(other) => Err(format!(
+                "alpha-output[{id}]: an `output_channels: Rgba` request was refused, but as \
+                 {other:?} rather than Error::Unsupported — an unadvertised capability is an \
+                 Unsupported, which is what lets a consumer distinguish it from a bad request."
+            )),
+        };
+    }
+
+    // Advertised: validate must accept, and generate must answer in four channels.
+    g.validate(&rgba).map_err(|e| {
+        format!(
+            "alpha-output[{id}]: `supports_alpha_output` is advertised, but an \
+             `output_channels: Rgba` request was rejected by validate(): {e}"
+        )
+    })?;
+
+    let out = g
+        .generate(&rgba, &mut |_| {})
+        .map_err(|e| format!("alpha-output[{id}]: the RGBA request failed to generate: {e}"))?;
+    match out {
+        GenerationOutput::ImagesRgba(images) => {
+            if images.is_empty() {
+                return Err(format!(
+                    "alpha-output[{id}]: the RGBA request returned zero images"
+                ));
+            }
+            for (i, image) in images.iter().enumerate() {
+                image
+                    .validate()
+                    .map_err(|e| format!("alpha-output[{id}]: RGBA image {i} is malformed: {e}"))?;
+                if image.channels() != 4 {
+                    return Err(format!(
+                        "alpha-output[{id}]: RGBA image {i} reports {} channels, not 4",
+                        image.channels()
+                    ));
+                }
+            }
+        }
+        other => {
+            return Err(format!(
+                "alpha-output[{id}]: an `output_channels: Rgba` request returned {} instead of \
+                 GenerationOutput::ImagesRgba — an alpha-capable provider must answer in four \
+                 channels, not silently composite.",
+                output_variant_name(&other)
+            ));
+        }
+    }
+
+    // ...and the RGB default is still three channels on the very same provider.
+    match g.generate(&rgb, &mut |_| {}) {
+        Ok(GenerationOutput::Images(_)) => Ok(()),
+        Ok(other) => Err(format!(
+            "alpha-output[{id}]: the default `output_channels: Rgb` request returned {} instead \
+             of GenerationOutput::Images — advertising alpha must not change what an untouched \
+             request receives.",
+            output_variant_name(&other)
+        )),
+        Err(e) => Err(format!(
+            "alpha-output[{id}]: the default RGB request failed to generate: {e}"
+        )),
+    }
+}
+
+/// The variant name of a [`GenerationOutput`], for conformance failure messages.
+fn output_variant_name(out: &GenerationOutput) -> &'static str {
+    match out {
+        GenerationOutput::Images(_) => "GenerationOutput::Images",
+        GenerationOutput::ImagesRgba(_) => "GenerationOutput::ImagesRgba",
+        GenerationOutput::Video { .. } => "GenerationOutput::Video",
+        GenerationOutput::Audio(_) => "GenerationOutput::Audio",
+    }
 }
 
 /// **Progress.** `Progress::Step{current,total}` is monotone and complete: `current` runs exactly
@@ -1528,7 +1672,7 @@ pub fn conformance(make: impl Fn() -> Box<dyn Generator>, profile: &Profile) {
     let g: &dyn Generator = g.as_ref();
 
     type Check = fn(&dyn Generator, &Profile) -> Result<(), String>;
-    let checks: [Check; 7] = [
+    let checks: [Check; 8] = [
         check_validate_honesty,
         check_progress,
         check_progress_contract,
@@ -1536,6 +1680,13 @@ pub fn conformance(make: impl Fn() -> Box<dyn Generator>, profile: &Profile) {
         check_precancellation,
         check_seed_determinism,
         check_cfg_off_render,
+        // sc-24111. In the SHARED array, not hand-called by the two providers that advertise
+        // alpha: the half that matters most is the NEGATIVE one — every provider that does not
+        // advertise `supports_alpha_output` must refuse an `OutputChannels::Rgba` request rather
+        // than silently return RGB — and only a provider that never runs this check can regress
+        // it. It is inert for an audio-modality descriptor and costs a non-advertising provider
+        // one extra `validate()` call.
+        check_alpha_output_honesty,
     ];
 
     let failures: Vec<String> = checks
