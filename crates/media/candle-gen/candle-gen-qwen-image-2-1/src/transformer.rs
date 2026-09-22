@@ -307,6 +307,17 @@ fn gelu_tanh(x: &Tensor) -> Result<Tensor> {
 /// `[0, start + r]`), an image block is unmasked over the same keys — plus one unmasked call for
 /// the target rows `[prefix_len, S)` over every key. The per-segment outputs concatenate back into
 /// the full sequence.
+///
+/// Every call goes through [`candle_gen::ATTN_SCORES_BUDGET`], the F-003 i32-overflow guard, and
+/// **not** the un-chunked `usize::MAX` sentinel: this family's joint sequence is long enough for
+/// the guard to be load-bearing at the shipped sizes, not a formality. At the 1:1 2048² default the
+/// target block alone is `2·(2048/32) = 128` latent tokens per side → 16384 image tokens, so the
+/// unmasked target call's scores are `1 · 32 heads · 16384 · ~16.6k ≈ 8.7e9` elements — about 4×
+/// `i32::MAX`, which candle's CUDA kernels index with. Unguarded that silently corrupts the tail of
+/// the scores tensor: a green run, a wrong image. The guard chunks the query rows, which is
+/// mathematically equivalent (each row's softmax is independent) though not bitwise equal to a
+/// single pass; below the budget it returns the whole query axis, so the parity fixtures here —
+/// whose scores are a few hundred elements — take the identical single-pass path.
 fn block_causal_attention(
     q: &Tensor,
     k: &Tensor,
@@ -342,7 +353,7 @@ fn block_causal_attention(
             scale,
             mask.as_ref(),
             softmax_last_dim,
-            usize::MAX,
+            candle_gen::ATTN_SCORES_BUDGET,
         )?);
     }
     let qt = q.narrow(2, prefix_len, s - prefix_len)?.contiguous()?;
@@ -353,7 +364,7 @@ fn block_causal_attention(
         scale,
         None,
         softmax_last_dim,
-        usize::MAX,
+        candle_gen::ATTN_SCORES_BUDGET,
     )?);
     Ok(Tensor::cat(&outputs, 2)?)
 }
@@ -775,6 +786,57 @@ impl QwenImage21Transformer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The joint sequence is long enough at the SHIPPED sizes that the F-003 i32-overflow guard is
+    /// load-bearing, so every SDPA call here must carry the budget rather than the un-chunked
+    /// `usize::MAX` sentinel.
+    ///
+    /// Two halves, because either alone rots. The arithmetic half states *why* — at the 1:1 2048²
+    /// default the unmasked target call's scores exceed `i32::MAX`, which candle's CUDA kernels
+    /// index with, so an unguarded pass silently corrupts the tail and returns a wrong image behind
+    /// a green exit code. The source half is what actually catches a regression: no fixture in this
+    /// crate is within three orders of the budget, so a revert to `usize::MAX` would leave every
+    /// parity test green.
+    #[test]
+    fn the_joint_attention_is_budgeted_because_the_shipped_sizes_overflow_i32() {
+        // 1:1 2048²: 2·(2048/32) = 128 latent tokens per side.
+        let target_tokens = (2 * (2048 / 32)) * (2 * (2048 / 32));
+        assert_eq!(target_tokens, 16_384);
+        let cfg = TransformerConfig::production();
+        // The target call attends over the whole joint sequence; the prompt only lengthens it.
+        let scores = cfg.num_attention_heads * target_tokens * target_tokens;
+        assert!(
+            scores > i32::MAX as usize,
+            "{scores} scores elements must exceed i32::MAX ({}) for the guard to matter",
+            i32::MAX
+        );
+        assert!(
+            scores > candle_gen::ATTN_SCORES_BUDGET,
+            "{scores} must exceed the budget, so the planner really chunks at the default preset"
+        );
+
+        // Only the SHIPPED half of this file: the scan must not count its own assertions, and a
+        // `#[cfg(test)]` helper could not affect a render anyway.
+        let shipped = include_str!("transformer.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the file has a shipped half");
+        let calls = shipped.matches("sdpa_budgeted_bhsd(").count();
+        assert_eq!(calls, 2, "one prefix-segment call and one target call");
+        assert_eq!(
+            shipped.matches("candle_gen::ATTN_SCORES_BUDGET,").count(),
+            calls,
+            "every SDPA call must pass the budget"
+        );
+        // Code only — the prose above names the sentinel to explain why it is wrong.
+        assert!(
+            !shipped
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .any(|line| line.contains("usize::MAX")),
+            "no SDPA call may pass the un-chunked sentinel"
+        );
+    }
 
     #[test]
     fn t2i_layout_positions_follow_upstream_rope() {

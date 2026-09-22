@@ -185,6 +185,13 @@ impl Attention {
         let k = repeat_kv(k, self.kv_groups)?.contiguous()?;
         let v = repeat_kv(v, self.kv_groups)?.contiguous()?;
         let scale = 1.0 / (self.head_dim as f64).sqrt();
+        // Plain scores here, NOT the chunked `candle_gen::sdpa_budgeted_*`, and that is a bound
+        // rather than an oversight: the F-003 guard exists because candle's CUDA kernels index
+        // scores with i32, and this tower's sequence is capped by [`crate::loader::MAX_PROMPT_TOKENS`]
+        // (4096). Its widest scores tensor is therefore `32 heads · 4096 · 4096 ≈ 5.4e8` elements —
+        // a quarter of `i32::MAX`, and under `ATTN_SCORES_BUDGET`, so the planner would return the
+        // whole query axis and this exact single pass anyway. The DiT's joint sequence is the one
+        // that overflows; see `transformer::block_causal_attention`.
         let scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?.broadcast_add(mask)?;
         let ctx = softmax_last_dim(&scores)?.matmul(&v)?;
         let ctx = ctx

@@ -680,11 +680,10 @@ impl QwenImage21Vae {
         if cancel.is_some_and(CancelFlag::is_cancelled) {
             return Err(Error::Canceled);
         }
-        let (b, c, h, w) = latents.dims4()?;
+        let (_, _, h, w) = latents.dims4()?;
         if !cfg.needs_tiling(VaeTiling::QWEN_IMAGE_2_1, 1, h as i32, w as i32) {
             return self.decode_rgba(latents);
         }
-        let _ = (b, c);
         let head = self.decode_head(latents)?;
         // The shared tiler works on NCTHW with a singleton frame axis.
         let (hb, hc, hh, hw) = head.dims4()?;
