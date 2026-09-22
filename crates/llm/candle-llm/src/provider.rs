@@ -656,6 +656,49 @@ fn qwen35_dense_prefix(has_key: impl Fn(&str) -> bool) -> CoreResult<&'static st
     }
 }
 
+/// Whether a parsed config is the frozen Qwen3.8 parent served by this release. Keep this
+/// deliberately narrower than the generic Qwen3.5 decoder so flat text-only fine-tunes retain
+/// their existing CPU support.
+fn is_frozen_qwen38_config(config: &Value) -> bool {
+    let text = config.get("text_config").and_then(Value::as_object);
+    config.get("model_type").and_then(Value::as_str) == Some("qwen3_5")
+        && config
+            .get("architectures")
+            .and_then(Value::as_array)
+            .is_some_and(|architectures| {
+                architectures.iter().any(|architecture| {
+                    architecture.as_str() == Some("Qwen3_5ForConditionalGeneration")
+                })
+            })
+        && text.is_some_and(|text| {
+            text.get("model_type").and_then(Value::as_str) == Some("qwen3_5_text")
+                && text.get("hidden_size").and_then(Value::as_u64) == Some(5120)
+                && text.get("num_hidden_layers").and_then(Value::as_u64) == Some(64)
+                && text.get("vocab_size").and_then(Value::as_u64) == Some(248_320)
+                && text.get("mtp_num_hidden_layers").and_then(Value::as_u64) == Some(1)
+        })
+}
+
+fn requires_accelerator(source: &Path) -> CoreResult<bool> {
+    if crate::gguf::is_gguf_path(&source.to_string_lossy()) {
+        return crate::prism_checkpoint::PrismGgufCheckpoint::is_prism(source).map_err(to_core);
+    }
+    Ok(read_json(source, "config.json").is_some_and(|config| {
+        config.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35")
+            || is_frozen_qwen38_config(&config)
+    }))
+}
+
+fn ensure_supported_device(source: &Path, device: &Device) -> CoreResult<()> {
+    if device.is_cpu() && requires_accelerator(source)? {
+        return Err(CoreError::Load(
+            "Qwen3.8 and Prism/Bonsai require an accelerator; Candle CPU inference is unsupported"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 impl LlamaProvider {
     /// Load a provider from `spec.source`: either a `*.gguf` file (loaded directly via Candle's
     /// native GGUF reader, story 7254) or an HF snapshot directory (config.json + tokenizer.json +
@@ -666,6 +709,7 @@ impl LlamaProvider {
             return Err(CoreError::Load("an external projector is only valid with a GGUF language checkpoint; safetensors vision must be embedded".into()));
         }
         let device = select_device().map_err(to_core)?;
+        ensure_supported_device(Path::new(&spec.source), &device)?;
         let payload = core_llm::checkpoint_payload_bytes(Path::new(&spec.source))?;
         let staging = core_llm::checkpoint_staging_bytes(Path::new(&spec.source))?;
         let projector = spec
@@ -2831,11 +2875,64 @@ pub fn can_load(spec: &LoadSpec) -> bool {
 mod tests {
     use super::{
         bonsai_sampling_defaults, can_load, can_load_vision, cuda_usable_memory_bytes,
-        emit_content, eos_token_ids, expand_vision_placeholders, host_load_budget,
-        load_memory_requirements, merged_frame_timestamps, prompt_opens_thinking,
-        qwen35_dense_prefix, substitute_vision_placeholders, validate_context_window,
-        video_placeholder_text, JsonMask, EAGER_ATTN_QUERY_CHUNK_SIZE,
+        emit_content, ensure_supported_device, eos_token_ids, expand_vision_placeholders,
+        host_load_budget, is_frozen_qwen38_config, load_memory_requirements,
+        merged_frame_timestamps, prompt_opens_thinking, qwen35_dense_prefix,
+        substitute_vision_placeholders, validate_context_window, video_placeholder_text, JsonMask,
+        EAGER_ATTN_QUERY_CHUNK_SIZE,
     };
+
+    #[test]
+    fn accelerator_only_selector_is_exact_to_qwen38_and_bonsai() {
+        let frozen: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../docs/reference/qwen38/config.json"
+        )))
+        .unwrap();
+        assert!(is_frozen_qwen38_config(&frozen));
+
+        let mut flat = frozen.clone();
+        flat["model_type"] = serde_json::json!("qwen3_5_text");
+        flat.as_object_mut().unwrap().remove("text_config");
+        assert!(
+            !is_frozen_qwen38_config(&flat),
+            "generic flat qwen3_5_text checkpoints retain CPU support"
+        );
+
+        let mut other_geometry = frozen;
+        other_geometry["text_config"]["vocab_size"] = serde_json::json!(32_000);
+        assert!(!is_frozen_qwen38_config(&other_geometry));
+    }
+
+    #[test]
+    fn accelerator_only_snapshots_reject_cpu_before_weight_inventory() {
+        let qwen = tempfile::tempdir().unwrap();
+        std::fs::write(
+            qwen.path().join("config.json"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../docs/reference/qwen38/config.json"
+            )),
+        )
+        .unwrap();
+        let error = ensure_supported_device(qwen.path(), &candle_core::Device::Cpu)
+            .expect_err("Qwen3.8 CPU load must be rejected before missing weights are inspected");
+        assert!(error
+            .to_string()
+            .contains("Candle CPU inference is unsupported"));
+
+        let bonsai = tempfile::tempdir().unwrap();
+        std::fs::write(
+            bonsai.path().join("config.json"),
+            br#"{"model_type":"prism_hadamard_qwen35"}"#,
+        )
+        .unwrap();
+        let error = ensure_supported_device(bonsai.path(), &candle_core::Device::Cpu)
+            .expect_err("Bonsai CPU load must be rejected before missing weights are inspected");
+        assert!(error
+            .to_string()
+            .contains("Candle CPU inference is unsupported"));
+    }
     use crate::decode::{ConstraintMask, RewindableConstraintMask};
     use core_llm::{
         ConstraintDecodeTable, Content, ImageRef, LlmMemoryGeometry, LoadSpec, Message, Role,
