@@ -758,9 +758,7 @@ mod tests {
         scope.configure_request(&mut executing).expect(
             "the admitted transparent-reference request must pass the scope's geometry gate",
         );
-        scope
-            .finish(gen_core::MemoryRunOutcome::Complete)
-            .unwrap();
+        scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
 
         // 3. ...and it is priced with exactly one fitted reference block. This crate publishes the
         // per-reference cost on the admission geometry rather than through a `joint_tokens`

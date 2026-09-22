@@ -1151,9 +1151,7 @@ mod tests {
         scope.configure_request(&mut executing).expect(
             "the admitted transparent-reference request must pass the scope's geometry gate",
         );
-        scope
-            .finish(gen_core::MemoryRunOutcome::Complete)
-            .unwrap();
+        scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
 
         // 3. ...and it is priced with exactly one fitted reference block.
         let bare = joint_tokens(2048, 2048, 0, 0);
