@@ -67,6 +67,7 @@ fn denoise_trajectory_and_rgba_image_match_upstream() {
                 sampler: None,
                 seed: 0,
                 cancel: &cancel,
+                references: None,
             },
             &mut |p| {
                 if let Progress::Step { current, total } = p {
@@ -110,6 +111,7 @@ fn denoise_trajectory_and_rgba_image_match_upstream() {
                     sampler: None,
                     seed: 0,
                     cancel: &cancel,
+                    references: None,
                 },
                 &mut |_| {},
             )

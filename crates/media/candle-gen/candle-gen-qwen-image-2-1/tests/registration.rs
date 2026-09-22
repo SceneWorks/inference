@@ -35,8 +35,19 @@ fn advertised_surface_matches_the_story_contract() {
     assert!(caps.supports_sequential_offload);
     assert!(!caps.supports_lora && !caps.supports_lokr);
     assert_eq!(caps.max_count, 8);
-    assert!(caps.conditioning.is_empty(), "T2I only in this story");
-    assert!(!caps.accepts(ConditioningKind::Reference));
+    // Reference conditioning (sc-24110): one upstream call takes one ordered list of one to ten
+    // condition images, reached through either kind. No `Mask` — upstream has no mask input.
+    assert_eq!(
+        caps.conditioning,
+        vec![
+            ConditioningKind::Reference,
+            ConditioningKind::MultiReference
+        ]
+    );
+    assert!(caps.accepts(ConditioningKind::Reference));
+    assert!(caps.accepts(ConditioningKind::MultiReference));
+    assert!(!caps.accepts(ConditioningKind::Mask));
+    assert_eq!(candle_gen_qwen_image_2_1::MAX_REFERENCE_IMAGES, 10);
     assert!(
         !caps.supports_preview,
         "no fitted 64-channel preview projection yet"

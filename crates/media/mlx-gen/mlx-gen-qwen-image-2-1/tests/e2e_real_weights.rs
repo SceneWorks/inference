@@ -228,7 +228,13 @@ fn validation_render_reference_edit() {
     eprintln!("loaded in {:.1}s", started.elapsed().as_secs_f32());
 
     // (references, width, height, steps) — the caller-shaped case, then the boundary.
-    for (count, width, height, steps) in [(2usize, 1024u32, 1024u32, 8u32), (10, 512, 512, 4)] {
+    //
+    // Every reference is fitted to `output_resolution` (1024 px) whatever the target size, so ten
+    // references are ~41k prefix tokens on their own, and this port recomputes the whole
+    // block-causal prefix every step (no KV cache — see UPSTREAM.md). The boundary case therefore
+    // runs the fewest steps the sampler accepts rather than a smaller target: only the step count
+    // moves its cost.
+    for (count, width, height, steps) in [(2usize, 1024u32, 1024u32, 8u32), (10, 512, 512, 2)] {
         let refs = references(count, 768, 768);
         let req = GenerationRequest {
             prompt: "Combine the subjects of the reference images into one scene, evening light"

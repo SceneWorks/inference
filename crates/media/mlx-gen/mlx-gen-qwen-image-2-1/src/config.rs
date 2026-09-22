@@ -332,12 +332,20 @@ impl VisionConfig {
         // `processor/preprocessor_config.json`, or the `image_processor` block of
         // `processor/processor_config.json`. Absent, the released geometry stands.
         if let Some(block) = processor_config.and_then(|v| v.get("image_processor").or(Some(v))) {
-            if let Some(size) = block.get("size") {
-                if let Some(x) = size.get("shortest_edge").and_then(Value::as_u64) {
-                    processor.min_pixels = x as usize;
-                }
-                if let Some(x) = size.get("longest_edge").and_then(Value::as_u64) {
-                    processor.max_pixels = x as usize;
+            // `size.shortest_edge` / `size.longest_edge` is how both the released and the
+            // miniature processor serialise the budget; the bare `min_pixels` / `max_pixels`
+            // spelling is the older `Qwen2VLImageProcessor` form and wins when present.
+            let size = block.get("size");
+            for (bare, edge, out) in [
+                ("min_pixels", "shortest_edge", &mut processor.min_pixels),
+                ("max_pixels", "longest_edge", &mut processor.max_pixels),
+            ] {
+                if let Some(x) = block
+                    .get(bare)
+                    .and_then(Value::as_u64)
+                    .or_else(|| size.and_then(|s| s.get(edge)).and_then(Value::as_u64))
+                {
+                    *out = x as usize;
                 }
             }
             for (key, out) in [

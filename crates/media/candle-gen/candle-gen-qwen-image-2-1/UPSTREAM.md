@@ -239,7 +239,11 @@ Within the joint sequence:
 
 * No prefix KV cache: every step evaluates the full block-causal joint sequence (upstream's exact
   `QwenImage21AttnProcessor` prefill path). Upstream documents the cached and uncached paths as
-  equally valid but not bit-identical.
+  equally valid but not bit-identical. **On the reference route this is a real cost, not just a
+  numerical choice**: every condition image is fitted to `output_resolution` whatever the target
+  size, so ten references are ~41k prefix tokens that upstream encodes once and this port
+  re-encodes at every step. Reference-heavy requests scale with `steps × references` here where
+  upstream scales with `references + steps`.
 * Latents stay f32 between Euler steps (upstream rounds to bf16 each step).
 * The text tower runs f32 activations (upstream: bf16 end to end).
 * Noise is seeded from the shared launch-portable CPU `StdRng` (`candle_gen::seed`), not torch's
@@ -268,3 +272,28 @@ Within the joint sequence:
   engines.
 * Compute dtype is the backend's: f32 on CPU (the parity lane), bf16 on CUDA/Metal — where MLX
   always loads at the checkpoint's on-disk dtype.
+* **Reference route (sc-24110).** The semantics above are the frozen upstream ones and are held to
+  the *same* committed fixture (`qwen21_edit.safetensors`) as the MLX twin. The mechanical
+  divergences are:
+  * The Qwen3-VL vision tower is `candle_llm::models::Qwen35VisionModel` /
+    `Qwen35VisionConfig` — candle-llm carries Qwen3-VL and Qwen3.6 as **one** tower under the
+    `Qwen35…` spelling, where mlx-llm names it `Qwen3VLVision…`. Same architecture, same weights,
+    same `model.visual.*` prefix.
+  * `CandleError` has **no `Unsupported` variant** (unlike `mlx_gen::Error`), so the route's typed
+    refusals — a `Mask` conditioning, eleven references, a per-reference `strength`, a snapshot
+    with no tower, a `smart_resize` grid disagreement — all arrive as `CandleError::Msg` with the
+    **identical message text**. The capability floor still refuses an unadvertised
+    `ConditioningKind` as `gen_core::Error::Unsupported` before the route is reached.
+  * `prepare_reference` / `prepare_references` take an explicit `&Device`: candle tensors are
+    device-bound at construction, where mlx `Array`s are not.
+  * The ViT tower's weights are pulled out of the `text_encoder/` shards by an mmapped,
+    prefix-filtered read (`loader::load_vision_tower_weights`) rather than filtered out of an
+    already-resident `Weights` map as on the MLX side — candle's loader hands providers a
+    `VarBuilder`, which cannot be enumerated. Only `model.visual.*` is materialised, so attaching
+    the tower never stages a second copy of the language tower.
+  * The decoder block's rotary embedding grew an `Option<(&cos, &sin)>` parameter: `None` keeps
+    the precomputed 1-D table the text-to-image path has always used (that path stays
+    **bit-identical**, asserted by `edit_parity::the_text_to_image_path_is_unchanged_by_the_reference_route`),
+    and `Some` applies the interleaved M-RoPE tables from
+    `candle_llm::primitives::Rope::mrope_interleaved_cos_sin` through `candle_llm::primitives::apply_rope`.
+    Both are the same NeoX half-split convention.

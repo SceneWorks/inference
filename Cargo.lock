@@ -847,6 +847,7 @@ version = "0.0.0"
 dependencies = [
  "candle-core",
  "candle-gen",
+ "candle-llm",
  "candle-nn",
  "rand",
  "safetensors 0.7.0",

@@ -227,7 +227,11 @@ Within the joint sequence:
 
 * No prefix KV cache: every step evaluates the full block-causal joint sequence (upstream's exact
   `QwenImage21AttnProcessor` prefill path). Upstream documents the cached and uncached paths as
-  equally valid but not bit-identical.
+  equally valid but not bit-identical. **On the reference route this is a real cost, not just a
+  numerical choice**: every condition image is fitted to `output_resolution` whatever the target
+  size, so ten references are ~41k prefix tokens that upstream encodes once and this port
+  re-encodes at every step. Reference-heavy requests scale with `steps × references` here where
+  upstream scales with `references + steps`.
 * Latents stay f32 between Euler steps (upstream rounds to bf16 each step).
 * The text tower runs f32 activations over bf16 weights (upstream: bf16 end to end).
 * Noise is MLX-seeded (`mlx.random.normal` under `key(seed)`), not torch-seeded.
