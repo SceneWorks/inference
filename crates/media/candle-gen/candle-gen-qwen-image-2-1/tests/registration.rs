@@ -16,10 +16,15 @@ fn qwen_image_2_1_is_exported_by_provider_catalog_as_a_distinct_engine() {
     assert_eq!(d.backend, "candle");
 }
 
-/// The descriptor axes the two backends must agree on field-for-field. The two deliberate
-/// differences are `backend`/`mac_only` (this is the candle route) and `supported_quants`: MLX
-/// quantizes the DiT's Linears at load, candle has no affine-quantize-at-load path and instead
-/// loads an already-packed snapshot through its packed-detect Linears, so it advertises none.
+/// The descriptor axes the two backends must agree on field-for-field.
+///
+/// After sc-24112 there is exactly **one** deliberate difference left: `backend`/`mac_only`. The two
+/// backends now advertise the same `supported_quants` and the same `component_precision_floors`,
+/// because the Q4/Q8 tiers are *installable* on both — the tier artefacts are produced once by
+/// `mlx_gen_qwen_image_2_1::convert` and loaded by both backends' packed-detect projections. What
+/// still differs is how a tier is *reached*, which is a load-path property rather than a descriptor
+/// one: MLX can also quantize a dense snapshot at load, candle cannot and refuses that with a typed
+/// `Unsupported` (asserted in `tiers::the_descriptor_advertises_what_is_actually_installable`).
 #[test]
 fn advertised_surface_matches_the_story_contract() {
     let d = candle_gen_qwen_image_2_1::descriptor();
@@ -67,13 +72,17 @@ fn advertised_surface_matches_the_story_contract() {
     assert_eq!(candle_gen_qwen_image_2_1::DEFAULT_TRUE_CFG, 1.0);
     assert_eq!(candle_gen_qwen_image_2_1::PRESETS.len(), 7);
 
-    // The two deliberate differences, asserted rather than assumed.
+    // The one remaining deliberate difference, asserted rather than assumed.
     assert!(!caps.mac_only, "the candle route is not mac-only");
-    assert_eq!(
-        caps.supported_quants,
-        &[] as &[Quant],
-        "candle has no on-the-fly Q4/Q8 for this family"
-    );
+
+    // sc-24112: both affine tiers are installable on this backend, so the descriptor says so.
+    // Advertising them is what lets the worker's A-B tier toggle reach the candle route at all.
+    assert_eq!(caps.supported_quants, &[Quant::Q4, Quant::Q8]);
+    // ...and a tier is a WHOLE-PIPELINE contract: every packable component runs the width the
+    // caller selected, so there is no component precision floor to declare. Both backends agree.
+    //
+    // *Mutation that reds this:* reinstating the withdrawn Q4 -> Q8 text-encoder floor.
+    assert!(caps.component_precision_floors.is_empty());
 }
 
 /// The seven presets and the size grid are the SAME numbers the MLX crate's `config.rs` carries —

@@ -88,7 +88,11 @@ pub fn descriptor() -> ModelDescriptor {
             max_size,
             max_count: 8,
             mac_only: true,
+            // Both affine tiers are **installable** as pre-quantized snapshots ([`crate::convert`])
+            // and are also reachable by quantizing a dense snapshot at load.
             supported_quants: &[Quant::Q4, Quant::Q8],
+            // No `component_precision_floors`: a tier is a whole-pipeline contract, so every
+            // packable component runs the tier the caller selected (`crate::quant`).
             requires_sigma_shift: true,
             supports_sequential_offload: true,
             // Both sides must be multiples of 32 px (16× VAE × 2×2 vision slot).
@@ -117,10 +121,17 @@ pub(crate) struct Heavy {
 }
 
 /// Construct a [`QwenImage21`] from a [`LoadSpec`] whose `weights` is a `Qwen/Qwen-Image-2.1`
-/// snapshot directory. Weights load dense at their on-disk dtype; `spec.quantize` (Q4/Q8)
-/// quantizes the DiT's Linears at load. `Resident` (default) holds every component warm;
-/// `Sequential` loads the text encoder, encodes, drops it, then loads the DiT + VAE — bounding
-/// peak memory to `max(text encoder, DiT + VAE)`.
+/// snapshot directory — dense, or one of the pre-quantized tiers [`crate::convert`] produces.
+///
+/// `spec.quantize` (Q4/Q8) **selects a tier**. Against a pre-quantized snapshot it is a pure
+/// selector: every projection packed-detects off its `{base}.scales` sibling and no quantization
+/// pass runs, so a Q4 tier lands at ~4 bits/weight with no dense bf16 transient. Against a dense
+/// snapshot it still means "quantize the DiT at load", the historical behaviour. A request that
+/// disagrees with the tier on disk is a hard error rather than a silent mis-serve — see
+/// [`crate::quant::needs_load_time_quant`].
+///
+/// `Resident` (default) holds every component warm; `Sequential` loads the text encoder, encodes,
+/// drops it, then loads the DiT + VAE — bounding peak memory to `max(text encoder, DiT + VAE)`.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     gen_core::reject_unknown_components(spec, &[], MODEL_ID)?;
     if spec.precision != Precision::Bf16 {
@@ -149,6 +160,9 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         }
     }
     let root = loader::snapshot_root(&spec.weights)?;
+    // Resolve the request against the tier actually on disk before anything is read, so a
+    // mismatched pair fails with the actionable message rather than rendering the wrong tier.
+    crate::quant::needs_load_time_quant(root, spec.quantize)?;
     let tokenizer = loader::load_tokenizer(root)?;
     let drop_count = system_prompt_drop_count(&tokenizer)?;
     let scheduler = loader::load_scheduler_config(root)?;
@@ -167,16 +181,55 @@ fn build_residency(spec: &LoadSpec) -> Result<Residency<QwenImage21TextEncoder, 
     let heavy_spec = spec.clone();
     Residency::from_policy(
         spec.offload_policy,
-        move || loader::load_text_encoder(loader::snapshot_root(&text_spec.weights)?),
+        move || load_text_encoder(&text_spec),
         move |_use_pid| load_heavy(&heavy_spec),
     )
+}
+
+/// The Qwen3 language tower at the tier's declared text-encoder width.
+///
+/// A packed tier loads packed. A dense snapshot with a Q4/Q8 request is quantized here to
+/// [`crate::quant::Tier::text_encoder_bits`] — which is the selected tier, because a tier is a
+/// whole-pipeline contract — so a load-time tier and the installable tier of the same name hold the
+/// same resident layout rather than two different ones.
+///
+/// A geometry the single declared group size cannot cover is a **typed refusal**, not a silent
+/// dense tower: serving a "q4" load whose text encoder is secretly bf16 is the mixed-tier failure
+/// this route does not have.
+fn load_text_encoder(spec: &LoadSpec) -> Result<QwenImage21TextEncoder> {
+    let root = loader::snapshot_root(&spec.weights)?;
+    let mut encoder = loader::load_text_encoder(root)?;
+    if crate::quant::needs_load_time_quant(root, spec.quantize)? {
+        if let Some(bits) = crate::quant::Tier::from_selected(spec.quantize)
+            .and_then(crate::quant::Tier::text_encoder_bits)
+        {
+            if !encoder.quantize(bits)? {
+                return Err(Error::Msg(format!(
+                    "qwen_image_2_1: this snapshot's Qwen3 tower is {} wide with a {} SwiGLU \
+                     intermediate, and a tier is written at group {}; a load-time Q{bits} tier \
+                     would leave the tower dense, which is not the tier that was asked for. Point \
+                     at a pre-quantized snapshot, or drop the quantize request.",
+                    encoder.hidden_size(),
+                    encoder.intermediate_size(),
+                    crate::quant::GROUP_SIZE,
+                )));
+            }
+        }
+    }
+    Ok(encoder)
 }
 
 fn load_heavy(spec: &LoadSpec) -> Result<Heavy> {
     let root: &Path = loader::snapshot_root(&spec.weights)?;
     let mut transformer = loader::load_transformer(root)?;
-    if let Some(q) = spec.quantize {
-        transformer.quantize(q.bits())?;
+    // A pre-quantized tier is already packed — `quantize` would be a no-op over packed weights, so
+    // the guard decides rather than the call silently doing nothing.
+    if crate::quant::needs_load_time_quant(root, spec.quantize)? {
+        let bits = spec
+            .quantize
+            .expect("needs_load_time_quant is false without a requested tier")
+            .bits();
+        transformer.quantize(bits)?;
     }
     let vae = loader::load_vae(root)?;
     Ok(Heavy { transformer, vae })

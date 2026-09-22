@@ -38,9 +38,12 @@
 //! [`QwenImage21Vae::decode_rgba`]: crate::vae::QwenImage21Vae::decode_rgba
 
 pub mod config;
+pub mod convert;
 pub mod loader;
+pub mod memory_strategy;
 pub mod model;
 pub mod pipeline;
+pub mod quant;
 pub mod reference;
 pub mod scheduler;
 pub mod text_encoder;
@@ -93,11 +96,31 @@ pub use text_encoder::{
 pub use transformer::{JointLayout, QwenImage21Transformer, Segment};
 pub use vae::QwenImage21Vae;
 
+pub use convert::prequantize_turnkey;
+pub use memory_strategy::{admission_geometry, AdmissionGeometry};
+pub use quant::{Tier, GROUP_SIZE};
+
 /// Add the MLX Qwen-Image 2.1 generator to an explicit media registry builder.
+///
+/// Deliberately registers **no** [`ActivationMemoryRegistration`]: that carrier publishes only real
+/// on-device measurements, and this route's memory model is derived (see [`memory_strategy`]). The
+/// epic's terminal measurement story owns the anchor.
+///
+/// [`ActivationMemoryRegistration`]: mlx_gen::gen_core::ActivationMemoryRegistration
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(model::REGISTRATION)
+    registry
+        .register_generator(model::REGISTRATION)
+        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: model::MODEL_ID,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(model::MODEL_ID, spec)
+            },
+        })
+        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR_REGISTRATION)
 }
 
 /// Build the complete explicit MLX Qwen-Image 2.1 provider catalog.

@@ -3513,6 +3513,14 @@ mod preview_advertising {
             register_surfaces: Some(candle_gen_qwen_image::register_memory_contract_surfaces),
             resident_only_on_cpu: false,
         },
+        // sc-24112: the Qwen-Image 2.1 route publishes the shared ladder (staged residency +
+        // bounded decode implemented, the two bounded-DiT rungs classified).
+        MemoryRouteCrate {
+            dir: "candle-gen-qwen-image-2-1",
+            register_providers: candle_gen_qwen_image_2_1::register_providers,
+            register_surfaces: Some(candle_gen_qwen_image_2_1::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
         MemoryRouteCrate {
             dir: "candle-gen-sana",
             register_providers: candle_gen_sana::register_providers,

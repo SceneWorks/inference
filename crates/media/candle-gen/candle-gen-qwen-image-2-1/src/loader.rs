@@ -224,9 +224,17 @@ pub fn load_transformer(root: &Path, device: &Device) -> Result<QwenImage21Trans
 }
 
 /// The RGBA VAE from `<root>/vae/`.
+///
+/// The autoencoder is all-conv and stays **dense at every installable tier** (`crate::quant`), so
+/// its `VarBuilder` reads floats. [`crate::quant::guard_dense`] over the decode tail's outermost
+/// convolution turns a future tier that packed the VAE into a hard, named load error instead of a
+/// u32 code stream silently reinterpreted as bf16.
 pub fn load_vae(root: &Path, device: &Device) -> Result<QwenImage21Vae> {
     let cfg = VaeConfig::from_json_file(&root.join("vae").join("config.json"))?;
     let vb = candle_gen::loader::component_vb(root, "vae", compute_dtype(), device, LABEL)?;
+    for base in ["decoder.conv_in", "decoder.conv_out", "conv2"] {
+        crate::quant::guard_dense(&vb, base)?;
+    }
     QwenImage21Vae::new(&cfg, vb)
 }
 

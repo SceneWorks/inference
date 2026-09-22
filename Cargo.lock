@@ -853,6 +853,8 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2593,6 +2595,7 @@ dependencies = [
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 

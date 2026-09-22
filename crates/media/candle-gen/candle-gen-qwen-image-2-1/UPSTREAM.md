@@ -365,6 +365,54 @@ used.
 * It does not make transparency requestable as a mode. A caller asking for a transparent result
   writes a transparency prompt, exactly as upstream documents; `output_channels: Rgba` only
   decides whether the resulting alpha is delivered or composited away.
+## Installable tiers (sc-24112)
+
+Candle has **no affine-quantize-at-load path** for this family, and this story does not add one. What
+it adds is the other half: candle *installs* the pre-quantized tiers
+`mlx_gen_qwen_image_2_1::convert` produces, on exactly the artefacts MLX loads. Both packed
+components bind through `candle_gen::quant::AdaptLinear::linear_detect_gs`, which reads the packed
+triple straight into the quantized weight on the target device — no dense weight is ever
+materialized.
+
+**A tier is a whole-pipeline contract**: selecting q4 runs q4 through every packable component.
+
+| component | bf16 | q8 | q4 |
+|---|---|---|---|
+| `transformer/` | dense | packed Q8, group 64 | packed Q4, group 64 |
+| `text_encoder/` Qwen3 language tower | dense | packed Q8, group 64 | packed Q4, group 64 |
+| `text_encoder/` token embedding + norms | dense (`quant::guard_dense`) | dense | dense |
+| `vae/` | dense (`quant::guard_dense`) | dense | dense |
+
+`Capabilities::supported_quants` therefore reads `[Q4, Q8]` on this backend after this story, and
+`component_precision_floors` is **empty** — nothing is resident above the selected width.
+`LoadSpec::quantize` is a **tier selector** here: it is accepted only when the snapshot on disk
+already is that tier, a mismatch is refused with the snapshot to point at instead, and a Q4/Q8
+request against a **dense** snapshot is still the same typed `Unsupported` ("no on-the-fly
+quantization") it was before. A snapshot's tier is read from its packed code/scale shapes as well as
+its `config.json` marker, so a q4 label over q8 weights is a hard error rather than a q8 render under
+a q4 label.
+
+The production tiers are produced by the MLX converter and re-hosted at
+**`SceneWorks/qwen-image-2-1-mlx`** (`q8/`, `q4/` subdirectories, each with its `SHA256SUMS`); that is
+the repository the SceneWorks manifest half pins.
+
+The text encoder is packed here and dense in the 2512 `candle-gen-qwen-image` crate; the reasons are
+in `mlx-gen-qwen-image-2-1/UPSTREAM.md` and in `crate::quant`.
+
+## Memory (sc-24112)
+
+`memory_strategy` publishes the shared ladder — `Resident`, `StagedResidency` and `BoundedDecode`
+implemented, the two bounded-DiT rungs classified — and prices each component from the snapshot's own
+tensor headers at the width **its** loader materializes it at. The text encoder is priced over the
+loaded `model.language_model.*` prefix only: the checkpoint's `lm_head` and its whole `model.visual.*`
+tower are on disk but materialized by nothing on this route.
+
+The derived tier and activation tables are owned once, in `mlx_gen_qwen_image_2_1::memory_strategy`,
+and are not duplicated here — parameter counts and joint-token arithmetic are properties of the model,
+not of the backend. `memory_strategy::admission_geometry` reports the same consumer envelope as the
+MLX twin, including that each of up to 10 reference images adds `REFERENCE_FIT_TOKENS` (4 096) rather
+than the target's own token count: `reference::prepare` fits every condition image to
+`OUTPUT_RESOLUTION` (1024²) first. References are **priced**, not refused.
 
 ## Deliberate divergences
 
