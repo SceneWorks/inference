@@ -374,6 +374,160 @@ fn the_descriptor_advertises_what_is_actually_installable() {
     assert!(err.contains("on-the-fly"), "{err}");
 }
 
+/// **The packed loader reconstructs the dense weight**, on this backend's own seam.
+///
+/// `AdaptLinear::linear_detect_gs` is where a Candle packed tier becomes a usable projection, and
+/// a mix-up inside it (reading the scales as the biases, or vice versa) is invisible to a
+/// render-level parity bar: it perturbs pixels, and the q4 bars have to be loose enough for four
+/// bits. This drives the seam directly — packed projection vs dense projection on the same input —
+/// and bounds the difference by the quantization error the tier is allowed to have.
+///
+/// The bound is derived, not tuned: for `y = x·Wᵀ`, each output can be wrong by at most
+/// `Σ|xⱼ| · maxErr(W)`, and `maxErr(W)` is one group-64 level of that weight's own span. Cosine is
+/// asserted too, because a swap destroys direction long before it exhausts a magnitude budget.
+///
+/// CPU-only: no feature flags, no device.
+///
+/// *Mutation that reds this:* swapping the `scales` and `biases` reads inside
+/// `candle_gen::quant::lin_gs`.
+#[test]
+fn the_packed_loader_reconstructs_the_dense_projection() {
+    use candle_core::{DType, Device, Tensor};
+    use candle_gen::candle_core::safetensors::MmapedSafetensors;
+    use candle_gen::candle_nn::VarBuilder;
+    use candle_gen_qwen_image_2_1::quant::QLinear;
+
+    // The one DiT leaf the miniature geometry packs inside a transformer block.
+    const BASE: &str = "transformer_blocks.0.img_mlp.out";
+    let dev = Device::Cpu;
+
+    let dense_path = tiny_snapshot()
+        .join("transformer")
+        .join("diffusion_pytorch_model.safetensors");
+    let dense_bytes = std::fs::read(&dense_path).unwrap();
+    let dense_view = safetensors::SafeTensors::deserialize(&dense_bytes).unwrap();
+    let shape = dense_view
+        .tensor(&format!("{BASE}.weight"))
+        .unwrap()
+        .shape()
+        .to_vec();
+    let (out_dim, in_dim) = (shape[0], shape[1]);
+
+    // SAFETY: committed fixtures, read-only, nothing else touches them during the test.
+    let dense_vb = VarBuilder::from_backend(
+        Box::new(unsafe { MmapedSafetensors::new(&dense_path).unwrap() }),
+        DType::F32,
+        dev.clone(),
+    );
+    let dense = QLinear::linear_detect_gs(in_dim, out_dim, &dense_vb, BASE, false, GROUP_SIZE)
+        .expect("the dense weight loads");
+    assert!(!dense.is_packed(), "fixture sanity: the source is dense");
+    let dense_w: Vec<f32> = dense_view
+        .tensor(&format!("{BASE}.weight"))
+        .unwrap()
+        .data()
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+
+    let x = Tensor::from_vec(
+        (0..4 * in_dim)
+            .map(|i| (i as f32 * 0.37).sin())
+            .collect::<Vec<_>>(),
+        (4, in_dim),
+        &dev,
+    )
+    .unwrap();
+    let x_abs_sum: f32 = x
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap()
+        .chunks(in_dim)
+        .map(|row| row.iter().map(|v| v.abs()).sum::<f32>())
+        .fold(0f32, f32::max);
+    let want = dense
+        .forward(&x)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+
+    for tier in [Tier::Q8, Tier::Q4] {
+        let bits = tier.transformer_bits().unwrap() as u32;
+        let path = fixtures()
+            .join("tiers")
+            .join(tier.dir_name())
+            .join("transformer")
+            .join("model.safetensors");
+        // SAFETY: as above.
+        let vb = VarBuilder::from_backend(
+            Box::new(unsafe { MmapedSafetensors::new(&path).unwrap() }),
+            DType::F32,
+            dev.clone(),
+        );
+        let packed = QLinear::linear_detect_gs(in_dim, out_dim, &vb, BASE, false, GROUP_SIZE)
+            .expect("the packed weight loads");
+        assert!(
+            packed.is_packed(),
+            "{}: fixture sanity: {BASE} must be packed",
+            tier.dir_name()
+        );
+
+        // One group-64 level of the widest group's span — the most any element of W can be wrong by.
+        let levels = ((1_u32 << bits) - 1) as f32;
+        let mut widest_span = 0f32;
+        for row in 0..out_dim {
+            for chunk in 0..in_dim / GROUP_SIZE {
+                let lo = row * in_dim + chunk * GROUP_SIZE;
+                let slice = &dense_w[lo..lo + GROUP_SIZE];
+                let min = slice.iter().copied().fold(f32::INFINITY, f32::min);
+                let max = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                widest_span = widest_span.max(max - min);
+            }
+        }
+        let bound = x_abs_sum * widest_span / levels * 1.05 + 1e-5;
+
+        let got = packed
+            .forward(&x)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let mut worst = 0f32;
+        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+        for (a, b) in got.iter().zip(&want) {
+            worst = worst.max((a - b).abs());
+            dot += (*a as f64) * (*b as f64);
+            na += (*a as f64) * (*a as f64);
+            nb += (*b as f64) * (*b as f64);
+        }
+        let cosine = (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32;
+        eprintln!(
+            "{}: packed vs dense projection max|Δ|={worst:.4e} (bound {bound:.4e}) cosine={cosine:.6}",
+            tier.dir_name()
+        );
+        assert!(
+            worst <= bound,
+            "{}: the packed projection is {worst:.4e} from the dense one, beyond the \
+             one-level bound {bound:.4e} — the packed parts are not being read as scale/bias/code",
+            tier.dir_name()
+        );
+        // Per-tier floors: four bits genuinely move the projection on a 32-row tensor, so one
+        // floor for both would either be vacuous at q8 or wrong at q4. A swap of the packed parts
+        // does not land anywhere near either floor — it reconstructs a completely different matrix,
+        // so the cosine collapses toward zero rather than sitting at 0.99.
+        let floor = if bits == 8 { 0.9999 } else { 0.99 };
+        assert!(
+            cosine > floor,
+            "{}: packed vs dense cosine {cosine:.6} is below {floor}",
+            tier.dir_name()
+        );
+    }
+}
+
 /// **A mislabelled tier is caught by reading the weights, not the label.**
 ///
 /// Relabelling the q8 tier as q4 produces a snapshot that loads, renders, and passes a q4-vs-bf16
