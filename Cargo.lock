@@ -530,6 +530,7 @@ dependencies = [
  "candle-gen-pid",
  "candle-gen-pulid",
  "candle-gen-qwen-image",
+ "candle-gen-qwen-image-2-1",
  "candle-gen-sam3",
  "candle-gen-sana",
  "candle-gen-scail2",
