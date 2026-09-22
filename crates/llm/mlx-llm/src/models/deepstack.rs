@@ -33,7 +33,8 @@ pub(crate) fn splice_image_features(
 /// `<|image_pad|>` and/or video `<|video_pad|>`) with the next feature row, in sequence order. This is
 /// the multimodal splice for a mixed image+video prompt — the visual features (image features then
 /// the video's per-frame merged rows, concatenated in the same order the placeholders appear) line up
-/// one-to-one with the visual positions. Reduces to [`splice_image_features`] for a single token.
+/// one-to-one with the visual positions. Reduces to the crate-private `splice_image_features`
+/// for a single token.
 pub fn splice_vision_features(
     embeds: &Array,
     input_ids: &[i32],
