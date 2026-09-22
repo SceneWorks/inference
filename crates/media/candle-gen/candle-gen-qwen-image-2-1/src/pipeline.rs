@@ -8,8 +8,9 @@
 
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::gen_core::sampling::TimestepConvention;
+use candle_gen::gen_core::tiling::TilingConfig;
 use candle_gen::gen_core::tokenizer::TextTokenizer;
-use candle_gen::gen_core::{CancelFlag, Image, Progress};
+use candle_gen::gen_core::{CancelFlag, GenerationRequest, Image, Progress};
 use candle_gen::run_flow_sampler;
 use candle_gen::{CandleError as Error, Result};
 
@@ -160,16 +161,41 @@ pub fn rgba_to_rgb_over_white(rgba: &Tensor) -> Result<Tensor> {
     Ok(((out01 * 2.0)? - 1.0)?)
 }
 
-/// Final packed latents → RGB8 [`Image`]: unpack, denormalise (`z·std + mean`), decode RGBA,
-/// composite over white, quantise.
+/// Default bounded-decode tile geometry (output pixels) when a request asks for tiling without
+/// naming one — the sibling image VAEs' 512 px / 64 px.
+pub const DECODE_TILE_EDGE: u32 = 512;
+/// Default bounded-decode tile overlap (output pixels).
+pub const DECODE_OVERLAP: u32 = 64;
+
+/// The bounded-decode tiling a request selects: `GenerationMemory::tile_vae_decode` with its
+/// optional edge/overlap (output pixels), else `None` (single-pass decode).
+pub fn decode_tiling(req: &GenerationRequest) -> Option<TilingConfig> {
+    req.memory
+        .filter(|memory| memory.tile_vae_decode)
+        .map(|memory| {
+            TilingConfig::spatial_only(
+                memory.decode_tile_edge.unwrap_or(DECODE_TILE_EDGE) as i32,
+                memory.decode_overlap.unwrap_or(DECODE_OVERLAP) as i32,
+            )
+        })
+}
+
+/// Final packed latents → RGB8 [`Image`]: unpack, denormalise (`z·std + mean`), decode RGBA
+/// (tiled when `tiling` is given), composite over white, quantise.
 pub fn decode_rgb(
     vae: &QwenImage21Vae,
     latents: &Tensor,
     width: u32,
     height: u32,
+    tiling: Option<&TilingConfig>,
+    cancel: Option<&CancelFlag>,
 ) -> Result<Image> {
     let unpacked = unpack_latents(latents, width, height)?;
-    let rgba = vae.decode_rgba(&vae.denormalize(&unpacked)?)?;
+    let vae_space = vae.denormalize(&unpacked)?;
+    let rgba = match tiling {
+        Some(cfg) => vae.decode_rgba_tiled(&vae_space, cfg, cancel)?,
+        None => vae.decode_rgba(&vae_space)?,
+    };
     decoded_to_image(&rgba_to_rgb_over_white(&rgba)?)
 }
 

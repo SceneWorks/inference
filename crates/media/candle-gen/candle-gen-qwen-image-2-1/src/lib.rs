@@ -28,8 +28,13 @@
 //! the shared `run_flow_sampler` contract, and Resident/Sequential residency. The VAE decodes RGBA
 //! ([`QwenImage21Vae::decode_rgba`]); the emitted `Image` is RGB **composited over white**
 //! ([`pipeline::rgba_to_rgb_over_white`]) until gen-core grows an RGBA output surface (sc-24111).
-//! The joint-sequence layout ([`transformer::JointLayout`]) already models condition-image blocks so
-//! the reference/edit path (a later story) appends segments rather than restructuring attention.
+//! A request asking for `GenerationMemory::tile_vae_decode` gets the **bounded** decode
+//! ([`QwenImage21Vae::decode_rgba_tiled`]): the decoder's global head runs once and only the
+//! up-sampling tail — where the 144-channel full-resolution spike lives — is tiled and
+//! trapezoidally blended, over the one [`VaeTiling::QWEN_IMAGE_2_1`] geometry gen-core declares for
+//! both engines. The joint-sequence layout ([`transformer::JointLayout`]) already models
+//! condition-image blocks so the reference/edit path (a later story) appends segments rather than
+//! restructuring attention.
 //!
 //! ## Deliberate differences from the MLX twin
 //!
@@ -38,7 +43,7 @@
 //!   no affine-quantize-at-load path, so [`load`] refuses `LoadSpec::quantize` with a typed
 //!   `Unsupported` and the descriptor advertises no `supported_quants`. A snapshot that is
 //!   **already** an MLX-packed tier still loads: every DiT Linear goes through
-//!   `candle_gen::quant::AdaptLinear::linear_detect`, the same packed-detect seam
+//!   `candle_gen::quant::AdaptLinear::linear_detect_gs`, the same packed-detect seam
 //!   `candle-gen-qwen-image` uses.
 //! * Noise is drawn from the shared launch-portable CPU `StdRng` (`candle_gen::seed`), not MLX's
 //!   RNG, so a seed reproduces within a backend but not across the two.
@@ -48,6 +53,8 @@
 //!   convention-free.
 //!
 //! [`QwenImage21Vae::decode_rgba`]: crate::vae::QwenImage21Vae::decode_rgba
+//! [`QwenImage21Vae::decode_rgba_tiled`]: crate::vae::QwenImage21Vae::decode_rgba_tiled
+//! [`VaeTiling::QWEN_IMAGE_2_1`]: candle_gen::gen_core::tiling::VaeTiling::QWEN_IMAGE_2_1
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -97,8 +104,8 @@ pub use loader::{
     load_scheduler_config, load_text_encoder, load_tokenizer, load_transformer, load_vae,
 };
 pub use pipeline::{
-    create_noise, decode_rgb, denoise, encode_prompt, pack_latents, rgba_to_rgb_over_white,
-    unpack_latents, DenoiseInputs,
+    create_noise, decode_rgb, decode_tiling, denoise, encode_prompt, pack_latents,
+    rgba_to_rgb_over_white, unpack_latents, DenoiseInputs, DECODE_OVERLAP, DECODE_TILE_EDGE,
 };
 pub use text_encoder::{
     prompt_template, system_prefix, system_prompt_drop_count, QwenImage21TextEncoder,
@@ -325,6 +332,7 @@ impl QwenImage21 {
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
         let params = resolve_run_params(&self.scheduler, req)?;
+        let tiling = crate::pipeline::decode_tiling(req);
         let drop = self.drop_count;
         let device = self.device.clone();
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
@@ -372,7 +380,14 @@ impl QwenImage21 {
                     if req.cancel.is_cancelled() {
                         return Err(Error::Canceled);
                     }
-                    images.push(decode_rgb(&heavy.vae, &latents, req.width, req.height)?);
+                    images.push(decode_rgb(
+                        &heavy.vae,
+                        &latents,
+                        req.width,
+                        req.height,
+                        tiling.as_ref(),
+                        Some(&req.cancel),
+                    )?);
                 }
                 Ok(GenerationOutput::Images(images))
             },
