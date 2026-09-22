@@ -62,10 +62,10 @@ fn extend_use_only(
     k: &Array,
     v: &Array,
 ) -> Result<(Array, Array)> {
-    match cache.peek(layer) {
+    match cache.peek(layer).map_err(mll)? {
         Some((pk, pv)) => Ok((
-            concatenate_axis(&[pk, k], 2)?,
-            concatenate_axis(&[pv, v], 2)?,
+            concatenate_axis(&[&pk, k], 2)?,
+            concatenate_axis(&[&pv, v], 2)?,
         )),
         None => Ok((k.clone(), v.clone())),
     }

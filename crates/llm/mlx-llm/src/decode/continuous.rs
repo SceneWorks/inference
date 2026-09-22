@@ -38,7 +38,7 @@ use core_llm::FinishReason as CoreFinish;
 use crate::decode::batch::BatchRequest;
 use crate::decode::cancel::CancelFlag;
 use crate::decode::stream::{default_seed, FinishReason, GenerationOutput, StreamEvent};
-use crate::decode::{record_lane_token, LaneStep};
+use crate::decode::{record_lane_token, BufferRelease, LaneStep};
 use crate::error::{Error, Result};
 use crate::models::CausalLm;
 use crate::primitives::kv_cache::KvCache;
@@ -169,6 +169,12 @@ pub fn generate_continuous(
         }
         next_req += 1;
     }
+    // The initial lanes' prefills are done, evaluated (`admit_lane` samples each lane's first token
+    // from its prefill logits, which forces the graph), and *dropped* — each lane's logits are a
+    // local of `admit_lane` and die on return, so nothing prefill-sized outlives this point. The
+    // release is still taken on the loop's first `advance`, keeping one rule across every loop.
+    // Later admit-on-retire prefills are covered by the per-step release cadence.
+    let mut release = BufferRelease::new();
 
     // Decode loop: step every live lane, retire finished ones, refill freed slots from the queue.
     // Cancel is checked once at the top of each step (before another forward), so a mid-stream cancel
@@ -188,6 +194,8 @@ pub fn generate_continuous(
             }
         }
         lanes = survivors;
+        // After sampling: the step's graphs have been evaluated, so their transients are freeable.
+        release.advance(1);
 
         // Admit-on-retire: refill every freed slot from the waiting requests.
         while lanes.len() < config.max_batch && next_req < requests.len() {
