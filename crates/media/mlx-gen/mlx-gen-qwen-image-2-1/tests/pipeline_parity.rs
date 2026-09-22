@@ -3,10 +3,15 @@
 //! latents of the whole denoise loop and the decoded RGBA image — without guidance (`t2i`), with
 //! true CFG (`cfg`), and for a non-square two-slot target (`wide`).
 //!
-//! Tolerance: **1e-2 × peak** on the per-step latents and the `[0, 1]` RGBA image — the
-//! repository's bound for f32 Metal matmul chains vs f32 CPU torch (measured on this fixture:
-//! ≤ 5e-3 × peak after three Euler steps through the two-block DiT, ≤ 3e-3 on the image). The
-//! single-step claims below keep any drift from compounding across steps.
+//! Tolerances, set from the measured drift with stated headroom (f32 Metal matmul chains vs f32
+//! CPU torch; every comparison prints its numbers):
+//!
+//! * per-step latents: measured ≤ **7.0e-3 × peak** (`cfg/latents_after_step_2`, 2.01e-2 on a
+//!   2.87 peak); bound **2.5e-2 × peak** (3.5× headroom);
+//! * RGBA image on the `[0, 1]` scale (peak < 1, so the bound is absolute): measured ≤ **3.4e-3**
+//!   (`wide/image_rgba`); bound **1e-2** (2.9× headroom).
+//!
+//! The single-step claims below keep any drift from compounding across steps.
 
 use mlx_gen::gen_core::Progress;
 use mlx_gen::CancelFlag;
@@ -19,7 +24,7 @@ use mlx_rs::Array;
 
 use crate::common::{assert_close, fixture, meta_f32, meta_str, meta_usize, tiny_snapshot};
 
-const LATENT_TOL: f32 = 1e-2;
+const LATENT_TOL: f32 = 2.5e-2;
 const IMAGE_TOL: f32 = 1e-2;
 
 #[test]

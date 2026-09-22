@@ -21,7 +21,8 @@
 
 use mlx_gen::gen_core::LatentSpace;
 use mlx_gen::nn::{conv2d, silu, upsample_nearest};
-use mlx_gen::tiling::TilingConfig;
+use mlx_gen::tiling::{TilingConfig, VaeTiling};
+use mlx_gen::vae_tiling::tiled_decode;
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, LatentDecoder, Result};
 use mlx_rs::fast::scaled_dot_product_attention;
@@ -479,10 +480,24 @@ impl Decoder {
     }
 
     fn forward(&self, x: &Array, trace: &mut Trace<'_>) -> Result<Array> {
+        let head = self.forward_head(x, trace)?;
+        self.forward_tail(&head, trace)
+    }
+
+    /// The **global** head: `conv_in` → mid block (whose single-head attention spans the whole
+    /// latent). Runs once on the full latent; cheap at latent resolution.
+    fn forward_head(&self, x: &Array, trace: &mut Trace<'_>) -> Result<Array> {
         let x = self.conv_in.forward(x)?;
         trace.push("decoder/conv_in", &x)?;
-        let mut x = self.mid.forward(&x)?;
+        let x = self.mid.forward(&x)?;
         trace.push("decoder/mid_block", &x)?;
+        Ok(x)
+    }
+
+    /// The **spatially local** upsample tail: `up_blocks` → `norm_out` → SiLU → `conv_out`. Every
+    /// op is a per-pixel norm, a 3×3 conv, a nearest ×2 or a channel shuffle, so it tiles.
+    fn forward_tail(&self, head: &Array, trace: &mut Trace<'_>) -> Result<Array> {
+        let mut x = head.clone();
         for (i, block) in self.up_blocks.iter().enumerate() {
             x = block.forward(&x)?;
             trace.push(format!("decoder/up_block_{i}"), &x)?;
@@ -605,6 +620,68 @@ impl QwenImage21Vae {
         Self::to_nchw(&x)
     }
 
+    /// The decode **head** run once on the full latent: `post_quant_conv` → `conv_in` → the mid
+    /// block with its global attention. NCHW in (VAE-space latent), NCHW out at latent resolution.
+    pub fn decode_head(&self, latents: &Array) -> Result<Array> {
+        let z = Self::to_nhwc(latents, self.compute_dtype())?;
+        let z = self.post_quant_conv.forward(&z)?;
+        let head = self.decoder.forward_head(&z, &mut Trace(None))?;
+        Ok(head.transpose_axes(&[0, 3, 1, 2])?)
+    }
+
+    /// The decode **tail** for one (tile of the) head output: the spatially local up-blocks →
+    /// `norm_out` → SiLU → `conv_out` → clamp. NCHW in (head dtype) → RGBA NCHW `[B, 4, 16h, 16w]`
+    /// f32. `decode_rgba(z) == decode_tail(decode_head(z))` exactly.
+    pub fn decode_tail(&self, head: &Array) -> Result<Array> {
+        let x = head.transpose_axes(&[0, 2, 3, 1])?;
+        let x = self.decoder.forward_tail(&x, &mut Trace(None))?;
+        let x = clip(&x, (-1.0f32, 1.0f32))?;
+        Self::to_nchw(&x)
+    }
+
+    /// **Bounded** RGBA decode for large outputs (the 2752² presets): the global head runs once,
+    /// then the up-sampling tail — where the decode memory spike lives (144 channels at full
+    /// output resolution) — runs per overlapping spatial tile and the tiles are trapezoidally
+    /// blended by the shared [`mlx_gen::vae_tiling::tiled_decode`] machinery, with a cancel check
+    /// and a per-tile `eval` between tiles. Falls back to the single pass when `cfg` does not fire
+    /// for these dimensions. The only divergence from [`Self::decode_rgba`] is the conv-halo seam
+    /// term the overlap attenuates (see `tests/vae_parity.rs` for the measured bound); the head's
+    /// global attention is never tiled, so there is no per-tile normalisation/attention term.
+    pub fn decode_rgba_tiled(
+        &self,
+        latents: &Array,
+        cfg: &TilingConfig,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
+        let shape = latents.shape().to_vec();
+        if shape.len() != 4 {
+            return Err(Error::Msg(format!(
+                "qwen_image_2_1 vae: decode_rgba_tiled expects [B, C, h, w], got {shape:?}"
+            )));
+        }
+        let (h, w) = (shape[2], shape[3]);
+        if !cfg.needs_tiling(VaeTiling::QWEN_IMAGE_2_1, 1, h, w) {
+            return self.decode_rgba(latents);
+        }
+        let head = self.decode_head(latents)?;
+        // The tiler works on NCTHW with a singleton frame axis; tile axes are [T, H, W] = [2, 3, 4].
+        let hs = head.shape().to_vec();
+        let head5 = head.reshape(&[hs[0], hs[1], 1, hs[2], hs[3]])?;
+        let plan = cfg.plan(VaeTiling::QWEN_IMAGE_2_1, 1, h, w);
+        let out5 = tiled_decode(&head5, &plan, [2, 3, 4], cancel, |tile| {
+            let ts = tile.shape().to_vec();
+            let tile4 = tile.reshape(&[ts[0], ts[1], ts[3], ts[4]])?;
+            let dec = self.decode_tail(&tile4)?;
+            let ds = dec.shape().to_vec();
+            Ok(dec.reshape(&[ds[0], ds[1], 1, ds[2], ds[3]])?)
+        })?;
+        let os = out5.shape().to_vec();
+        Ok(out5.reshape(&[os[0], os[1], os[3], os[4]])?)
+    }
+
     /// The denoiser-space → VAE-space affine: `z · std + mean` (per channel, NCHW).
     pub fn denormalize(&self, latents: &Array) -> Result<Array> {
         let z = self.cfg.z_dim as i32;
@@ -643,15 +720,14 @@ impl LatentDecoder for QwenImage21Vae {
         crate::pipeline::rgba_to_rgb_over_white(&rgba)
     }
 
+    /// Bounded decode: [`Self::decode_rgba_tiled`] over the denormalised latent, composited to RGB.
     fn decode_tiled(
         &self,
         latents: &Array,
-        _tiling: &TilingConfig,
+        tiling: &TilingConfig,
         cancel: Option<&CancelFlag>,
     ) -> Result<Array> {
-        if cancel.is_some_and(CancelFlag::is_cancelled) {
-            return Err(Error::Canceled);
-        }
-        self.decode(latents)
+        let rgba = self.decode_rgba_tiled(&self.denormalize(latents)?, tiling, cancel)?;
+        crate::pipeline::rgba_to_rgb_over_white(&rgba)
     }
 }

@@ -34,11 +34,42 @@ fn snapshot() -> PathBuf {
     PathBuf::from(p)
 }
 
+/// Tokenizer only — no weights are opened. The released `processor/chat_template.jinja` renders a
+/// lone system message as exactly the literal prefix the port tokenizes, so the derived drop count
+/// is upstream's `_drop_idx` (14); `tools/_qwen21_common.py` re-proves the template/literal
+/// agreement token-for-token through `Qwen3VLProcessor.apply_chat_template` whenever the snapshot
+/// is present.
 #[test]
 #[ignore]
 fn released_tokenizer_drops_fourteen_system_tokens() {
     let tokenizer = load_tokenizer(&snapshot()).unwrap();
-    assert_eq!(system_prompt_drop_count(&tokenizer).unwrap(), 14);
+    let count = system_prompt_drop_count(&tokenizer).unwrap();
+    let ids = tokenizer
+        .encode_ids(&mlx_gen_qwen_image_2_1::system_prefix(), true)
+        .unwrap();
+    eprintln!("released tokenizer: system prefix = {count} tokens {ids:?}");
+    assert_eq!(count, 14);
+    assert_eq!(
+        ids,
+        [151644, 8948, 198, 1092, 30782, 408, 323, 23643, 279, 3897, 9934, 13, 151645, 198]
+    );
+}
+
+/// Config only — no weights are opened. The 128 transcribed `QWEN_IMAGE_2_1_Z64_MEAN` / `_STD`
+/// floats that identify the latent space must be the released `vae/config.json`'s
+/// `latents_mean` / `latents_std`, bit for bit after the f32 round both sides make.
+#[test]
+#[ignore]
+fn latent_space_statistics_match_the_released_vae_config() {
+    use mlx_gen::gen_core::{QWEN_IMAGE_2_1_Z64_MEAN, QWEN_IMAGE_2_1_Z64_STD};
+    let cfg =
+        mlx_gen_qwen_image_2_1::VaeConfig::from_json_file(&snapshot().join("vae/config.json"))
+            .unwrap();
+    assert_eq!(cfg.z_dim, 64);
+    assert_eq!(cfg.scale_factor_spatial, 16);
+    assert_eq!(cfg.latents_mean, QWEN_IMAGE_2_1_Z64_MEAN.to_vec());
+    assert_eq!(cfg.latents_std, QWEN_IMAGE_2_1_Z64_STD.to_vec());
+    eprintln!("released vae/config.json latents_mean/std == QWEN_IMAGE_2_1_Z64_MEAN/STD (64 + 64)");
 }
 
 #[test]

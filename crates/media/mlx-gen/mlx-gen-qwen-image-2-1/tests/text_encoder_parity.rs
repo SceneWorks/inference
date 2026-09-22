@@ -4,9 +4,10 @@
 //! state, and the final prompt embeddings — for a normal prompt, a negative prompt, the empty
 //! prompt and an RGBA-style prompt.
 //!
-//! Tolerance: **1e-2 × peak** on every layer and the embeddings (measured ≤ 2e-3: f32 CPU torch vs
-//! the reduced-precision f32 Metal matmul, two GQA layers deep); the embedding lookup itself is
-//! held to **1e-6** since it is a gather.
+//! Tolerance: **1e-2 × peak** on every layer and the embeddings — measured ≤ **1.8e-3 × peak**
+//! (`layer_1`, 1.44e-3 on a 0.84 peak: f32 CPU torch vs the reduced-precision f32 Metal matmul, two
+//! GQA layers deep), 5.5× headroom; the embedding lookup itself is held to **1e-6** since it is a
+//! gather (measured 0).
 
 use mlx_gen_qwen_image_2_1::{
     load_text_encoder, load_tokenizer, prompt_template, system_prompt_drop_count,
