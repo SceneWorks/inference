@@ -19,6 +19,14 @@ candle-gen = { path = "../candle-gen" }
 # so cargo unifies to one candle build (no skew).
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
+# sc-24110: the reference/edit route runs condition images through the Qwen3-VL VISION tower and
+# DeepStack, which the worker graph already carries — `models::Qwen35VisionModel` (the Qwen3-VL /
+# Qwen3.6 tower is one architecture in this crate), the shared `models::deepstack` splice/M-RoPE
+# helpers and `image::Qwen35ImageProcessor` (the same patch-16/merge-2 processor geometry
+# `Qwen/Qwen-Image-2.1`'s `processor/` declares). The `candle-gen-* -> candle-llm` direction is the
+# documented one (see `candle-gen-flux2`); the pin lives in the root workspace so cargo unifies ONE
+# candle-llm across the worker graph.
+candle-llm = { workspace = true }
 # `config.json` readers for the four snapshot components (transformer / text_encoder / vae /
 # scheduler): the loader is config-driven so the tiny parity snapshot and the production snapshot
 # go through one code path.
@@ -30,8 +38,8 @@ rand = { workspace = true }
 # Pass the backend selection through to the core crate so a downstream `--features metal`/`cuda` on
 # this provider crate selects the matching candle backend everywhere.
 default = []
-metal = ["candle-gen/metal"]
-cuda = ["candle-gen/cuda"]
+metal = ["candle-gen/metal", "candle-llm/metal"]
+cuda = ["candle-gen/cuda", "candle-llm/cuda"]
 
 [dev-dependencies]
 # gen-core conformance suite: drives this provider through the public Generator contract

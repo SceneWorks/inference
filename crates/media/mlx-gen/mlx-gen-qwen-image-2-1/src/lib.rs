@@ -37,6 +37,7 @@ pub mod config;
 pub mod loader;
 pub mod model;
 pub mod pipeline;
+pub mod reference;
 pub mod scheduler;
 pub mod text_encoder;
 pub mod transformer;
@@ -62,20 +63,28 @@ pub const UPSTREAM_LICENSE_NOTICE: &str = "Qwen is licensed under the Qwen RESEA
     Reserved.";
 
 pub use config::{
-    SchedulerConfig, SizePreset, TextEncoderConfig, TransformerConfig, VaeConfig, DEFAULT_STEPS,
-    DEFAULT_TRUE_CFG, MAX_REFERENCE_IMAGES, PRESETS, SIZE_MULTIPLE, SYSTEM_PROMPT,
-    VAE_SCALE_FACTOR,
+    SchedulerConfig, SizePreset, TextEncoderConfig, TransformerConfig, VaeConfig, VisionConfig,
+    DEFAULT_STEPS, DEFAULT_TRUE_CFG, IMAGE_TOKENS_PER_SLOT, MAX_REFERENCE_IMAGES,
+    OUTPUT_RESOLUTION, PRESETS, SIZE_MULTIPLE, SYSTEM_PROMPT, VAE_SCALE_FACTOR, VISION_MERGE_SIZE,
+    VISION_PATCH_SIZE,
 };
 pub use loader::{
     load_scheduler_config, load_text_encoder, load_tokenizer, load_transformer, load_vae,
+    load_vision_config,
 };
 pub use model::{descriptor, load, QwenImage21, MODEL_ID};
 pub use pipeline::{
-    create_noise, decode_rgb, denoise, encode_prompt, pack_latents, rgba_to_rgb_over_white,
-    unpack_latents, DenoiseInputs,
+    create_noise, decode_rgb, denoise, encode_prompt, encode_references, joint_layout,
+    pack_latents, rgba_to_rgb_over_white, text_rows, unpack_latents, DenoiseInputs,
+    ReferenceConditioning,
+};
+pub use reference::{
+    calculate_dimensions, collect_references, prepare_reference, prepare_references,
+    reference_derived_size, reference_target_size, validate_reference_count, PreparedReference,
 };
 pub use text_encoder::{
-    prompt_template, system_prefix, system_prompt_drop_count, QwenImage21TextEncoder,
+    image_pad_token_id, prompt_template, prompt_template_ti2i, system_prefix,
+    system_prompt_drop_count, QwenImage21TextEncoder, TextConditioning, IMAGE_PAD_TOKEN,
 };
 pub use transformer::{JointLayout, QwenImage21Transformer, Segment};
 pub use vae::QwenImage21Vae;

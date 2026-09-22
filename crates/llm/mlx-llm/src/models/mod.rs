@@ -5,7 +5,7 @@
 //! single loaded model can be shared and driven concurrently in the batch dimension later. The only
 //! mutable state in a forward pass is the KV cache, threaded in as `&mut dyn KvCache`.
 
-pub(crate) mod deepstack;
+pub mod deepstack;
 pub mod gemma4_mm;
 pub mod gpt_bigcode;
 pub mod llama;

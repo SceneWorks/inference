@@ -15,8 +15,9 @@ use candle_gen::run_flow_sampler;
 use candle_gen::{CandleError as Error, Result};
 
 use crate::config::VAE_SCALE_FACTOR;
+use crate::reference::PreparedReference;
 use crate::text_encoder::QwenImage21TextEncoder;
-use crate::transformer::QwenImage21Transformer;
+use crate::transformer::{JointLayout, QwenImage21Transformer, Segment};
 use crate::vae::QwenImage21Vae;
 
 /// `_pack_latents`: 2.1 consumes latents unpatched, so packing is a plain spatial flatten —
@@ -89,6 +90,136 @@ pub fn encode_prompt(
     text_encoder.encode_prompt(tokenizer, prompt, drop)
 }
 
+/// VAE-encode every prepared reference, in order, into the denoiser-space packed latents the
+/// joint sequence prepends to the noise — `prepare_latents`' `images is not None` branch:
+/// `_encode_vae_image` with `sample_mode="argmax"` (the posterior **mode**, not a sample), the
+/// same `(z − mean) / std` normalisation the target latents use, then the unpatched
+/// `[1, (h/16)·(w/16), 64]` flatten.
+pub fn encode_references(
+    vae: &QwenImage21Vae,
+    references: &[PreparedReference],
+) -> Result<Vec<Tensor>> {
+    references
+        .iter()
+        .map(|reference| {
+            let mode = vae.encode_mode(&reference.vae_input)?;
+            pack_latents(&vae.normalize(&mode)?)
+        })
+        .collect()
+}
+
+/// The joint text/image layout for a conditioned request — the Rust form of upstream's
+/// `image_pad_mask` expansion (`repeat_interleave(img_mask, where(img_mask, 4, 1))`) plus the
+/// appended target block.
+///
+/// `image_pad_mask` marks the vision slots in the **VLM** sequence; each slot stands for a 2×2
+/// group of latent tokens, so a run of `n` slots belonging to reference `k` becomes one
+/// [`Segment::Image`] of that reference's `(h/16, w/16)` grid. Block boundaries come from the
+/// per-reference slot counts, not from runs of `true`: two adjacent references with no text
+/// between them stay two blocks, exactly as `build_token_metadata` insists.
+pub fn joint_layout(
+    image_pad_mask: &[bool],
+    references: &[PreparedReference],
+    width: u32,
+    height: u32,
+) -> Result<JointLayout> {
+    let slots = image_pad_mask.iter().filter(|m| **m).count();
+    let expected: usize = references.iter().map(PreparedReference::vision_slots).sum();
+    if slots != expected {
+        return Err(Error::Msg(format!(
+            "qwen_image_2_1: the prompt reserved {slots} vision slots but the {} reference images \
+             need {expected}",
+            references.len()
+        )));
+    }
+    let mut segments: Vec<Segment> = Vec::with_capacity(2 * references.len() + 2);
+    let mut text_run = 0usize;
+    let mut cursor = 0usize;
+    let mut next_reference = 0usize;
+    while cursor < image_pad_mask.len() {
+        if !image_pad_mask[cursor] {
+            text_run += 1;
+            cursor += 1;
+            continue;
+        }
+        if text_run > 0 {
+            segments.push(Segment::Text { len: text_run });
+            text_run = 0;
+        }
+        let reference = references.get(next_reference).ok_or_else(|| {
+            Error::Msg(
+                "qwen_image_2_1: the prompt carries more vision-slot runs than reference images"
+                    .into(),
+            )
+        })?;
+        let take = reference.vision_slots();
+        for offset in 0..take {
+            if !image_pad_mask
+                .get(cursor + offset)
+                .copied()
+                .unwrap_or(false)
+            {
+                return Err(Error::Msg(format!(
+                    "qwen_image_2_1: reference image {next_reference} needs {take} contiguous \
+                     vision slots but the prompt breaks the run after {offset}"
+                )));
+            }
+        }
+        let (h, w) = reference.latent_grid();
+        segments.push(Segment::Image {
+            height: h,
+            width: w,
+        });
+        cursor += take;
+        next_reference += 1;
+    }
+    if next_reference != references.len() {
+        return Err(Error::Msg(format!(
+            "qwen_image_2_1: only {next_reference} of {} reference images found a vision-slot run \
+             in the prompt",
+            references.len()
+        )));
+    }
+    if text_run > 0 {
+        segments.push(Segment::Text { len: text_run });
+    }
+    let (h, w) = latent_grid(width, height);
+    segments.push(Segment::Image {
+        height: h,
+        width: w,
+    });
+    Ok(JointLayout { segments })
+}
+
+/// The text rows of a conditioning tensor — everything the DiT does **not** overwrite with a
+/// condition latent. `txt_in` is row-wise, so selecting the rows before the projection is exactly
+/// upstream's "project everything, then scatter the latents over the image rows".
+pub fn text_rows(hidden: &Tensor, image_pad_mask: &[bool]) -> Result<Tensor> {
+    if image_pad_mask.iter().all(|m| !*m) {
+        return Ok(hidden.clone());
+    }
+    let keep: Vec<u32> = image_pad_mask
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| !**m)
+        .map(|(i, _)| i as u32)
+        .collect();
+    let index = Tensor::from_vec(keep.clone(), keep.len(), hidden.device())?;
+    Ok(hidden.index_select(&index, 1)?.contiguous()?)
+}
+
+/// The reference conditioning one denoise run carries: the packed condition latents (in order)
+/// and the joint layout of each branch.
+pub struct ReferenceConditioning<'a> {
+    /// Packed `[1, tokens, 64]` latents, condition images first, in request order.
+    pub latents: &'a [Tensor],
+    /// Layout of the positive branch.
+    pub layout: &'a JointLayout,
+    /// Layout of the negative branch — a different prompt is a different text length, so true CFG
+    /// needs its own.
+    pub negative_layout: Option<&'a JointLayout>,
+}
+
 /// Everything one denoise run needs.
 pub struct DenoiseInputs<'a> {
     pub transformer: &'a QwenImage21Transformer,
@@ -106,21 +237,39 @@ pub struct DenoiseInputs<'a> {
     pub sampler: Option<&'a str>,
     pub seed: u64,
     pub cancel: &'a CancelFlag,
+    /// Ordered reference conditioning, or `None` for the text-to-image route.
+    pub references: Option<ReferenceConditioning<'a>>,
 }
 
 /// The denoise loop: every step runs the transformer over the full joint sequence and, with a
 /// negative branch, applies `neg + s·(pos − neg)`. Returns the final packed latents (f32).
+///
+/// With [`DenoiseInputs::references`] set, the condition latents are prepended to the target
+/// latents each step (`latent_model_input = cat([*reference_latents, latents], dim=1)`) and the
+/// transformer attends over the full interleaved layout; the velocity it returns is already
+/// sliced to the target block.
 pub fn denoise(inputs: DenoiseInputs<'_>, on_progress: &mut dyn FnMut(Progress)) -> Result<Tensor> {
     let (h, w) = latent_grid(inputs.width, inputs.height);
     let transformer = inputs.transformer;
     let pos = inputs.prompt_embeds;
     let neg = inputs.negative_embeds;
     let scale = inputs.true_cfg_scale as f64;
+    let references = inputs.references.as_ref();
     let predict = |latents: &Tensor, sigma: f32| -> Result<Tensor> {
-        let velocity = transformer.forward(latents, pos, sigma, h, w)?;
+        let branch = |text: &Tensor, layout: Option<&JointLayout>| -> Result<Tensor> {
+            match (references, layout) {
+                (Some(conditioning), Some(layout)) => {
+                    let mut images: Vec<&Tensor> = conditioning.latents.iter().collect();
+                    images.push(latents);
+                    transformer.forward_joint(text, &images, sigma, layout)
+                }
+                _ => transformer.forward(latents, text, sigma, h, w),
+            }
+        };
+        let velocity = branch(pos, references.map(|c| c.layout))?;
         match neg {
             Some(neg) => {
-                let uncond = transformer.forward(latents, neg, sigma, h, w)?;
+                let uncond = branch(neg, references.and_then(|c| c.negative_layout))?;
                 // `neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)`
                 let diff = ((&velocity - &uncond)? * scale)?;
                 Ok((&uncond + diff)?)
