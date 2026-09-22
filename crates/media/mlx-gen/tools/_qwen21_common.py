@@ -189,6 +189,24 @@ def real_chat_template() -> str:
     )
 
 
+def assert_released_template_matches_literal_prefix() -> None:
+    """The Rust port derives the system-prefix drop count by tokenizing the literal
+    `<|im_start|>system\n{SYS_PROMPT}<|im_end|>\n`; upstream derives it through
+    `processor.apply_chat_template([system message])`. Prove the two agree token-for-token on the
+    RELEASED tokenizer + chat template (and pin the count, 14) whenever the pinned snapshot is
+    present, so the literal can never drift from the template silently."""
+    from transformers import Qwen3VLProcessor
+
+    snap = Path(os.environ["MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT"])
+    proc = Qwen3VLProcessor.from_pretrained(str(snap / "processor"))
+    msg = [{"role": "system", "content": [{"type": "text", "text": SYS_PROMPT}]}]
+    via_template = proc.apply_chat_template(msg, tokenize=True, return_dict=False)[0]
+    via_literal = proc.tokenizer(f"<|im_start|>system\n{SYS_PROMPT}<|im_end|>\n").input_ids
+    assert via_template == via_literal, (via_template, via_literal)
+    assert len(via_literal) == 14, via_literal
+    print(f"released chat template == literal prefix: {len(via_literal)} tokens {via_literal}")
+
+
 def build_tiny_pipeline():
     """The tiny `QwenImage21Pipeline`: seeded components, real scheduler config, tiny tokenizer."""
     from diffusers import (
@@ -225,11 +243,17 @@ def build_tiny_pipeline():
 
     seed_all(1)
     # Five `dim_mult` stages -> four spatial downsamples -> the 16x compression the pipeline assumes.
+    # NON-UNIFORM widths on purpose (sc-24108 review): with a uniform `dim_mult` every stage has
+    # `in == out`, so `DupUp3D`'s channel-duplication index collapses to an identity gather and no
+    # `conv_shortcut` exists — the port's derivation would be untested. `[1, 1, 2, 4, 4]` with
+    # `decoder_base_dim != base_dim` gives the production shape: decoder up-stage 2 has
+    # `repeats = 4 < 8` (the `first_chunk` temporal slot matters) and up-stage 3 has `repeats = 2`
+    # (the row-offset matters), plus width-changing residual blocks in both encoder and decoder.
     vae = AutoencoderKLQwenImage21(
         base_dim=4,
-        decoder_base_dim=4,
+        decoder_base_dim=6,
         z_dim=Z_DIM,
-        dim_mult=[1, 1, 1, 1, 1],
+        dim_mult=[1, 1, 2, 4, 4],
         num_res_blocks=1,
         attn_scales=[],
         temperal_downsample=[False, True, True, True],
@@ -284,6 +308,8 @@ def build_tiny_pipeline():
         )
 
     tokenizer = build_tiny_tokenizer()
+    if os.environ.get("MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT"):
+        assert_released_template_matches_literal_prefix()
     processor = Qwen3VLProcessor(
         image_processor=Qwen2VLImageProcessor(
             patch_size=16, merge_size=2, temporal_patch_size=2, min_pixels=32 * 32, max_pixels=64 * 64

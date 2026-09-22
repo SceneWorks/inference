@@ -218,6 +218,7 @@ impl QwenImage21 {
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
         let params = resolve_run_params(&self.scheduler, req)?;
+        let tiling = crate::pipeline::decode_tiling(req);
         let drop = self.drop_count;
         self.residency.run(
             &req.cancel,
@@ -269,7 +270,14 @@ impl QwenImage21 {
                     if req.cancel.is_cancelled() {
                         return Err(Error::Canceled);
                     }
-                    images.push(decode_rgb(&heavy.vae, &latents, req.width, req.height)?);
+                    images.push(decode_rgb(
+                        &heavy.vae,
+                        &latents,
+                        req.width,
+                        req.height,
+                        tiling.as_ref(),
+                        Some(&req.cancel),
+                    )?);
                 }
                 Ok(GenerationOutput::Images(images))
             },
