@@ -204,11 +204,6 @@ impl Captioner for JoyCaption {
             ..Default::default()
         };
 
-        on_progress(Progress::Step {
-            current: 1,
-            total: 2,
-        });
-
         let gen_cancel = req.cancel.clone();
         let bridge_cancel = core_cancel;
         // Mirror once before the provider runs so a cancel requested between the entry check and here
@@ -216,22 +211,29 @@ impl Captioner for JoyCaption {
         if gen_cancel.is_cancelled() {
             bridge_cancel.cancel();
         }
-        let mut on_event = move |_ev: StreamEvent| {
+        // One progress step per generated token, `total` = the token budget (the same shape the
+        // candle captioner reports): downstream per-token hooks and UI progress see every token,
+        // not just a start/end pair.
+        let total = req.sampling.max_new_tokens;
+        let mut produced = 0u32;
+        let mut on_event = |ev: StreamEvent| {
             // Mirror on every event the provider emits (prefill/progress as well as tokens), so a
             // cancel during vision-encode/prefill trips the provider's flag before token 1.
             if gen_cancel.is_cancelled() {
                 bridge_cancel.cancel();
+            }
+            if let StreamEvent::Token { .. } = ev {
+                produced += 1;
+                on_progress(Progress::Step {
+                    current: produced,
+                    total,
+                });
             }
         };
         let out = self
             .provider
             .generate(&request, &mut on_event)
             .map_err(map_core_err)?;
-
-        on_progress(Progress::Step {
-            current: 2,
-            total: 2,
-        });
 
         Ok(CaptionOutput {
             text: out.text.trim().to_owned(),
