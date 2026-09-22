@@ -1,0 +1,170 @@
+{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {
+      "id": 0,
+      "content": "[UNK]",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 45,
+      "content": "<|endoftext|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 46,
+      "content": "<|im_start|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 47,
+      "content": "<|im_end|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 48,
+      "content": "<|vision_start|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 49,
+      "content": "<|vision_end|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 50,
+      "content": "<|vision_pad|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 51,
+      "content": "<|image_pad|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 52,
+      "content": "<|video_pad|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    }
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {
+    "type": "Whitespace"
+  },
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      }
+    ],
+    "pair": [
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "B",
+          "type_id": 1
+        }
+      }
+    ],
+    "special_tokens": {}
+  },
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "[UNK]": 0,
+      "system": 1,
+      "user": 2,
+      "assistant": 3,
+      "Comprehend": 4,
+      "and": 5,
+      "analyze": 6,
+      "the": 7,
+      "provided": 8,
+      "prompt": 9,
+      ".": 10,
+      ",": 11,
+      "a": 12,
+      "red": 13,
+      "fox": 14,
+      "in": 15,
+      "forest": 16,
+      "blurry": 17,
+      "low": 18,
+      "quality": 19,
+      "photo": 20,
+      "of": 21,
+      "cat": 22,
+      "on": 23,
+      "moon": 24,
+      "neon": 25,
+      "sign": 26,
+      "night": 27,
+      "city": 28,
+      "blue": 29,
+      "green": 30,
+      "sticker": 31,
+      "transparent": 32,
+      "background": 33,
+      "This": 34,
+      "is": 35,
+      "an": 36,
+      "RGBA": 37,
+      "image": 38,
+      "with": 39,
+      "transparency": 40,
+      "The": 41,
+      "has": 42,
+      "alpha": 43,
+      "channel": 44
+    },
+    "unk_token": "[UNK]"
+  }
+}

@@ -2287,6 +2287,7 @@ dependencies = [
  "mlx-gen-pid",
  "mlx-gen-pulid",
  "mlx-gen-qwen-image",
+ "mlx-gen-qwen-image-2-1",
  "mlx-gen-sam2",
  "mlx-gen-sam3",
  "mlx-gen-sana",
@@ -2560,6 +2561,19 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-pid",
  "mlx-gen-wan",
+ "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "mlx-gen-qwen-image-2-1"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "mlx-gen",
+ "mlx-gen-z-image",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",
