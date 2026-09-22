@@ -33,6 +33,7 @@ use crate::decode::cancel::CancelFlag;
 use crate::decode::stream::{
     default_seed, FinishReason, GenerationConfig, GenerationOutput, StreamEvent,
 };
+use crate::decode::BufferRelease;
 use crate::error::{Error, Result};
 use crate::models::CausalLm;
 use crate::primitives::input_ids;
@@ -117,6 +118,11 @@ pub fn generate_prompt_lookup(
     let mut history: Vec<i32> = prompt_ids.to_vec();
 
     let first = sample(&logits_last, &history, &config.sampling, &mut rng, None)?;
+    // That sample evaluated the (lazy) prefill graph. `logits_last` would otherwise live to the
+    // end of the function, so retire it explicitly; the release is taken on the loop's first
+    // `advance`, once step 0 has also retired its own transients.
+    drop(logits_last);
+    let mut release = BufferRelease::new();
     if config.stop_tokens.contains(&first) {
         finish = FinishReason::StopToken;
         on_event(StreamEvent::Done {
@@ -177,6 +183,7 @@ pub fn generate_prompt_lookup(
 
         // Roll the cache back to keep only `cur` + the accepted drafts; rejected-draft KV is dropped.
         cache.truncate(base_offset + 1 + accepted as i32)?;
+        release.advance(committed.len());
 
         // Commit, honoring stop tokens and the budget; `cur` advances to the last committed token.
         for &t in &committed {
@@ -271,11 +278,19 @@ pub fn generate_draft_speculative(
 
     // ---- Prefill both models; first token from the target's last-position logits. ----
     let logits_last = target.decode_logits(&input_ids(prompt_ids), &mut target_cache, 0)?;
-    draft.decode_logits(&input_ids(prompt_ids), &mut draft_cache, 0)?;
+    let draft_logits_last = draft.decode_logits(&input_ids(prompt_ids), &mut draft_cache, 0)?;
     stats.forwards += 1;
     let mut history: Vec<i32> = prompt_ids.to_vec();
 
     let first = sample(&logits_last, &history, &config.sampling, &mut rng, None)?;
+    // The sample evaluated the target's prefill graph; the draft's is only pulled by its first
+    // draft step, so force it here and retire both prefills' logits together — each would
+    // otherwise live to the end of the function. The release itself is taken on the loop's first
+    // `advance`, once step 0 has retired its own transients too.
+    mlx_rs::transforms::eval([&draft_logits_last])?;
+    drop(draft_logits_last);
+    drop(logits_last);
+    let mut release = BufferRelease::new();
     if config.stop_tokens.contains(&first) {
         finish = FinishReason::StopToken;
         on_event(StreamEvent::Done {
@@ -350,6 +365,7 @@ pub fn generate_draft_speculative(
         // Roll both caches back to keep `cur` + the accepted drafts.
         target_cache.truncate(base_target + 1 + accepted as i32)?;
         draft_cache.truncate(base_draft + 1 + accepted as i32)?;
+        release.advance(committed.len());
 
         for &t in &committed {
             if config.stop_tokens.contains(&t) {
