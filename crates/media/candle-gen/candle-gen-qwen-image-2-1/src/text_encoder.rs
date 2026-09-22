@@ -32,7 +32,9 @@
 use std::sync::Arc;
 
 use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
-use candle_gen::candle_nn::{rms_norm, rotary_emb, ops::softmax_last_dim, Embedding, Linear, RmsNorm, VarBuilder};
+use candle_gen::candle_nn::{
+    ops::softmax_last_dim, rms_norm, rotary_emb, Embedding, Linear, RmsNorm, VarBuilder,
+};
 use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::{CandleError as Error, Result};
 
@@ -169,14 +171,16 @@ impl Attention {
         let k = shape(self.k_proj.forward(x)?, self.kv_heads)?;
         let v = shape(self.v_proj.forward(x)?, self.kv_heads)?;
         // Per-head RMSNorm (Qwen3).
-        let q = self
-            .q_norm
-            .forward(&q.flatten(0, 2)?)?
-            .reshape((b, self.heads, len, self.head_dim))?;
-        let k = self
-            .k_norm
-            .forward(&k.flatten(0, 2)?)?
-            .reshape((b, self.kv_heads, len, self.head_dim))?;
+        let q =
+            self.q_norm
+                .forward(&q.flatten(0, 2)?)?
+                .reshape((b, self.heads, len, self.head_dim))?;
+        let k = self.k_norm.forward(&k.flatten(0, 2)?)?.reshape((
+            b,
+            self.kv_heads,
+            len,
+            self.head_dim,
+        ))?;
         let (q, k) = self.rotary.apply(&q, &k)?;
         let k = repeat_kv(k, self.kv_groups)?.contiguous()?;
         let v = repeat_kv(v, self.kv_groups)?.contiguous()?;
@@ -242,7 +246,9 @@ impl DecoderLayer {
     fn forward(&self, x: &Tensor, mask: &Tensor) -> Result<Tensor> {
         let h = self.attn.forward(&self.input_layernorm.forward(x)?, mask)?;
         let x = (x + h)?;
-        let h = self.mlp.forward(&self.post_attention_layernorm.forward(&x)?)?;
+        let h = self
+            .mlp
+            .forward(&self.post_attention_layernorm.forward(&x)?)?;
         Ok((&x + h)?)
     }
 }

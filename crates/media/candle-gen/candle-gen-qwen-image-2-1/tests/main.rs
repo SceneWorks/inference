@@ -36,3 +36,6 @@ mod text_encoder_parity;
 
 #[path = "transformer_parity.rs"]
 mod transformer_parity;
+
+#[path = "vae_parity.rs"]
+mod vae_parity;

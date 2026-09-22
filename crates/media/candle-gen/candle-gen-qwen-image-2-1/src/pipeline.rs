@@ -28,7 +28,10 @@ pub fn pack_latents(latents: &Tensor) -> Result<Tensor> {
         )));
     }
     let (b, c, h, w) = (dims[0], dims[1], dims[2], dims[3]);
-    Ok(latents.reshape((b, c, h * w))?.transpose(1, 2)?.contiguous()?)
+    Ok(latents
+        .reshape((b, c, h * w))?
+        .transpose(1, 2)?
+        .contiguous()?)
 }
 
 /// `_unpack_latents`: `[B, h·w, C]` → `[B, C, h, w]` for a `width × height` image.
@@ -42,7 +45,10 @@ pub fn unpack_latents(latents: &Tensor, width: u32, height: u32) -> Result<Tenso
         )));
     }
     let (b, c) = (dims[0], dims[2]);
-    Ok(latents.transpose(1, 2)?.reshape((b, c, h, w))?.contiguous()?)
+    Ok(latents
+        .transpose(1, 2)?
+        .reshape((b, c, h, w))?
+        .contiguous()?)
 }
 
 /// The latent grid `(h, w)` of a `width × height` request: `2 · (size // 32)` per side.
@@ -121,7 +127,7 @@ pub fn denoise(inputs: DenoiseInputs<'_>, on_progress: &mut dyn FnMut(Progress))
             None => Ok(velocity),
         }
     };
-    Ok(run_flow_sampler(
+    run_flow_sampler(
         inputs.sampler,
         TimestepConvention::Sigma,
         inputs.sigmas,
@@ -131,7 +137,7 @@ pub fn denoise(inputs: DenoiseInputs<'_>, on_progress: &mut dyn FnMut(Progress))
         on_progress,
         None,
         predict,
-    )?)
+    )
 }
 
 /// Alpha-composite an RGBA NCHW tensor in `[-1, 1]` over white → RGB NCHW in `[-1, 1]` (f32).
@@ -148,7 +154,9 @@ pub fn rgba_to_rgb_over_white(rgba: &Tensor) -> Result<Tensor> {
     let x = rgba.to_dtype(DType::F32)?;
     let rgb01 = ((x.i((.., 0..3, .., ..))? * 0.5)? + 0.5)?;
     let a01 = ((x.i((.., 3..4, .., ..))? * 0.5)? + 0.5)?;
-    let out01 = (rgb01.broadcast_mul(&a01)? + (1.0 - &a01)?)?;
+    // The `1 − α` term is `[B, 1, H, W]` against `[B, 3, H, W]`: it must BROADCAST over the three
+    // colour channels, exactly as the alpha multiply above does.
+    let out01 = rgb01.broadcast_mul(&a01)?.broadcast_add(&(1.0 - &a01)?)?;
     Ok(((out01 * 2.0)? - 1.0)?)
 }
 
