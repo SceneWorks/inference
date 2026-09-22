@@ -43,7 +43,9 @@ const TIMESTEP_DIM: usize = 256;
 /// `time_factor`: the transformer receives `sigma` and scales it by 1000 inside.
 const TIME_FACTOR: f32 = 1000.0;
 /// Group size for a pre-quantized (packed) DiT — the codebase-wide default (64).
-const GROUP_SIZE: i32 = 64;
+/// Single-sourced from [`crate::quant::GROUP_SIZE`]: the converter writes tiers at this group
+/// size and the packed-detect loaders must read them back at the same one.
+const GROUP_SIZE: i32 = crate::quant::GROUP_SIZE;
 
 /// One run of the joint sequence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

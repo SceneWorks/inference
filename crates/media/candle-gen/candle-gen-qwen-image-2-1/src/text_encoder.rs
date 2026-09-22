@@ -51,7 +51,7 @@ use std::sync::Arc;
 
 use candle_core::{DType, Device, IndexOp, Module, Tensor};
 use candle_gen::candle_nn::{
-    ops::softmax_last_dim, rms_norm, rotary_emb, Embedding, Linear, RmsNorm, VarBuilder,
+    ops::softmax_last_dim, rms_norm, rotary_emb, Embedding, RmsNorm, VarBuilder,
 };
 use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::{CandleError as Error, Result};
@@ -62,7 +62,18 @@ use candle_llm::models::Qwen35VisionModel;
 use candle_llm::primitives::{apply_rope, Rope};
 
 use crate::config::{TextEncoderConfig, VisionConfig, SYSTEM_PROMPT};
+use crate::quant::{guard_dense, QLinear, GROUP_SIZE};
 use crate::reference::PreparedReference;
+
+/// A bias-less, packed-detecting `[out, in]` projection — the seam that makes a pre-quantized
+/// Qwen-Image 2.1 tier installable on candle. Qwen3-VL text attention and its SwiGLU are bias-free
+/// (the config reader refuses `attention_bias: true`), and every decoder `Linear` in an installed
+/// tier is packed at [`GROUP_SIZE`], so this is the only width the detect loader ever needs.
+fn lin(in_dim: usize, out_dim: usize, vb: &VarBuilder, base: &str) -> Result<QLinear> {
+    Ok(QLinear::linear_detect_gs(
+        in_dim, out_dim, vb, base, false, GROUP_SIZE,
+    )?)
+}
 
 /// The system-role prefix of the T2I template — exactly what upstream tokenizes to derive
 /// `_drop_idx`.
@@ -179,10 +190,10 @@ fn repeat_kv(x: Tensor, n_rep: usize) -> candle_core::Result<Tensor> {
 }
 
 struct Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: QLinear,
+    k_proj: QLinear,
+    v_proj: QLinear,
+    o_proj: QLinear,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     heads: usize,
@@ -199,23 +210,18 @@ impl Attention {
             cfg.num_key_value_heads,
             cfg.head_dim,
         );
-        // Qwen3-VL text attention is bias-free (the config reader refuses `attention_bias: true`).
-        let lin = |out: usize, name: &str| -> Result<Linear> {
-            Ok(candle_gen::candle_nn::linear_no_bias(
-                cfg.hidden_size,
-                out,
-                vb.pp(name),
-            )?)
-        };
+        // Packed-detect: an installed q8/q4 tier binds the packed triple straight into the
+        // quantized weight; a dense snapshot takes the plain `candle_nn::Linear` path unchanged.
+        let qkv = |out: usize, name: &str| lin(cfg.hidden_size, out, &vb, name);
+        // The per-head RMSNorms are the leaves that stay dense in every tier.
+        for name in ["q_norm", "k_norm"] {
+            guard_dense(&vb, name)?;
+        }
         Ok(Self {
-            q_proj: lin(heads * head_dim, "q_proj")?,
-            k_proj: lin(kv_heads * head_dim, "k_proj")?,
-            v_proj: lin(kv_heads * head_dim, "v_proj")?,
-            o_proj: candle_gen::candle_nn::linear_no_bias(
-                heads * head_dim,
-                cfg.hidden_size,
-                vb.pp("o_proj"),
-            )?,
+            q_proj: qkv(heads * head_dim, "q_proj")?,
+            k_proj: qkv(kv_heads * head_dim, "k_proj")?,
+            v_proj: qkv(kv_heads * head_dim, "v_proj")?,
+            o_proj: lin(heads * head_dim, cfg.hidden_size, &vb, "o_proj")?,
             q_norm: rms_norm(head_dim, cfg.rms_norm_eps as f64, vb.pp("q_norm"))?,
             k_norm: rms_norm(head_dim, cfg.rms_norm_eps as f64, vb.pp("k_norm"))?,
             heads,
@@ -286,18 +292,18 @@ impl Attention {
 }
 
 struct Mlp {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    gate_proj: QLinear,
+    up_proj: QLinear,
+    down_proj: QLinear,
 }
 
 impl Mlp {
     fn new(cfg: &TextEncoderConfig, vb: VarBuilder) -> Result<Self> {
         let (h, i) = (cfg.hidden_size, cfg.intermediate_size);
         Ok(Self {
-            gate_proj: candle_gen::candle_nn::linear_no_bias(h, i, vb.pp("gate_proj"))?,
-            up_proj: candle_gen::candle_nn::linear_no_bias(h, i, vb.pp("up_proj"))?,
-            down_proj: candle_gen::candle_nn::linear_no_bias(i, h, vb.pp("down_proj"))?,
+            gate_proj: lin(h, i, &vb, "gate_proj")?,
+            up_proj: lin(h, i, &vb, "up_proj")?,
+            down_proj: lin(i, h, &vb, "down_proj")?,
         })
     }
 
@@ -392,6 +398,10 @@ impl QwenImage21TextEncoder {
             .split('.')
             .filter(|part| !part.is_empty())
             .fold(vb.clone(), |vb, part| vb.pp(part));
+        // The token embedding stays dense in every installable tier (`crate::quant`), so it is
+        // read as floats and guarded against a packed sibling rather than packed-detected.
+        guard_dense(&tower, "embed_tokens")?;
+        guard_dense(&tower, "norm")?;
         let embed_tokens = candle_gen::candle_nn::embedding(
             cfg.vocab_size,
             cfg.hidden_size,
