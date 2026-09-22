@@ -1354,6 +1354,15 @@ fn fingerprint_output(
         GenerationOutput::Audio(_) => {
             return Err("image/video P6 matrix unexpectedly produced audio-only output".to_owned());
         }
+        // Unreachable: no benchmark case sets `output_channels: Rgba` (sc-24111), so no provider
+        // here can answer in four channels. Named rather than wildcarded so a future output
+        // variant still breaks this match instead of silently fingerprinting nothing.
+        GenerationOutput::ImagesRgba(_) => {
+            return Err(
+                "image/video P6 matrix unexpectedly produced RGBA output; no case requests it"
+                    .to_owned(),
+            );
+        }
     };
     if payload_bytes == 0 || items == 0 {
         return Err("generation returned an empty output".to_owned());
