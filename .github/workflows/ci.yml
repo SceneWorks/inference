@@ -41,6 +41,11 @@ jobs:
             ('exit_code=' + $code) | Set-Content -Encoding ASCII (Join-Path $root ($label + '.exit.txt'))
             return [pscustomobject]@{ exit_code = $code; stdout = $stdout; stderr = $stderr }
           }
+          Get-CimInstance Win32_OperatingSystem | Select-Object LastBootUpTime,FreePhysicalMemory,TotalVisibleMemorySize | ConvertTo-Json | Set-Content -Encoding UTF8 (Join-Path $root 'boot-memory.json')
+          @(Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'candle|mlx|qwen|bonsai|llama|Runner.Worker|python' } | Select-Object Name,ProcessId,ParentProcessId,CreationDate,ExecutablePath) | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 (Join-Path $root 'native-processes.json')
+          try {
+            @(Get-WinEvent -FilterHashtable @{LogName='System'; Id=41,1074,6005,6006,6008; StartTime=(Get-Date).AddHours(-12)} -MaxEvents 20 -ErrorAction Stop | Select-Object TimeCreated,Id,ProviderName,Message) | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 (Join-Path $root 'restart-events.json')
+          } catch { $_.Exception.Message | Set-Content -Encoding UTF8 (Join-Path $root 'restart-events-error.txt') }
           $smi = Get-Command nvidia-smi -CommandType Application -ErrorAction SilentlyContinue
           if (-not $smi) { throw 'nvidia-smi is unavailable; identity.json remains for upload' }
           $gpu = Invoke-Capture 'gpu-csv' $smi.Source @('--query-gpu=index,name,uuid,memory.total,memory.free,memory.used,driver_version', '--format=csv,noheader,nounits')
