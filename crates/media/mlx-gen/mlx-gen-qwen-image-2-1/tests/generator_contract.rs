@@ -218,14 +218,21 @@ fn a_pre_tripped_cancel_is_typed_and_a_mid_run_cancel_stops_within_a_step() {
     );
 }
 
+/// A load-time tier is **whole-pipeline or nothing** (sc-24112).
+///
+/// This used to assert that `LoadSpec::quantize(Q8)` against the miniature snapshot quantized the
+/// DiT and rendered. It no longer can: a tier is written at group 64, the miniature Qwen3 tower is
+/// 32 wide with a 64-wide SwiGLU intermediate, so quantizing the DiT alone would produce a "q8"
+/// load whose text encoder is dense bf16 — a mixed tier under a single label. The load is refused
+/// with a message naming the geometry, and the packed q8/q4 TIERS (which do cover the whole
+/// pipeline) are exercised end to end in `tiers.rs`.
 #[test]
-fn load_time_q8_quantizes_the_dit_and_still_renders() {
+fn a_load_time_tier_the_tower_cannot_take_is_refused_by_name() {
     let registry = mlx_gen_qwen_image_2_1::provider_registry().unwrap();
-    let g = registry
-        .load(ID, &spec(OffloadPolicy::Resident).with_quant(Quant::Q8))
-        .expect("Q8 load-time quantization of the DiT");
-    let GenerationOutput::Images(images) = g.generate(&request(), &mut |_| {}).unwrap() else {
-        panic!("images expected");
+    let err = match registry.load(ID, &spec(OffloadPolicy::Resident).with_quant(Quant::Q8)) {
+        Ok(_) => panic!("a load-time tier that leaves the tower dense must be refused"),
+        Err(err) => err.to_string(),
     };
-    assert_eq!(images[0].pixels.len(), 32 * 32 * 3);
+    assert!(err.contains("would leave the tower dense"), "{err}");
+    assert!(err.contains("group 64"), "{err}");
 }

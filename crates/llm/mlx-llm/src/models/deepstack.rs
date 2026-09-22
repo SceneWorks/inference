@@ -11,7 +11,7 @@ pub type MropePositions = (Vec<i32>, Vec<i32>, Vec<i32>, i32);
 /// `[num_image_tokens, hidden]` (the vision encoder's merged patch rows), in sequence order — the
 /// shared VLM splice (no scatter; contiguous text/image spans concatenated). `hidden` is the decoder
 /// width. The number of image-token positions must equal the feature-row count.
-pub(crate) fn splice_image_features(
+pub fn splice_image_features(
     embeds: &Array,
     input_ids: &[i32],
     image_features: &Array,
@@ -34,7 +34,7 @@ pub(crate) fn splice_image_features(
 /// the multimodal splice for a mixed image+video prompt — the visual features (image features then
 /// the video's per-frame merged rows, concatenated in the same order the placeholders appear) line up
 /// one-to-one with the visual positions. Reduces to [`splice_image_features`] for a single token.
-pub(crate) fn splice_vision_features(
+pub fn splice_vision_features(
     embeds: &Array,
     input_ids: &[i32],
     vision_features: &Array,
@@ -88,7 +88,7 @@ pub(crate) fn splice_vision_features(
 /// the cursor by `max(grid_t, h/merge, w/merge)`. Qwen3-VL emits one video-token run **per frame**
 /// (timestamp-separated), so each `[t, h, w]` video grid expands to `t × [1, h, w]` per-frame blocks.
 /// Image grids are consumed one run per `image_grid_thw` entry (always `gt = 1`).
-pub(crate) fn mrope_positions_mm(
+pub fn mrope_positions_mm(
     input_ids: &[i32],
     image_grid_thw: &[[i32; 3]],
     image_token_id: i32,
@@ -171,7 +171,7 @@ pub(crate) fn mrope_positions_mm(
     Ok((t, h, w, delta))
 }
 
-pub(crate) fn deepstack_fused_decoder_layers<F>(
+pub fn deepstack_fused_decoder_layers<F>(
     h0: &Array,
     visual_pos_mask: &[bool],
     deepstack: &[Array],
@@ -191,11 +191,7 @@ where
     Ok(h)
 }
 
-pub(crate) fn add_visual_features(
-    h: &Array,
-    visual_pos_mask: &[bool],
-    visual: &Array,
-) -> Result<Array> {
+pub fn add_visual_features(h: &Array, visual_pos_mask: &[bool], visual: &Array) -> Result<Array> {
     let sh = h.shape();
     let (b, s, hidden) = (sh[0], sh[1], sh[2]);
     if b != 1 {

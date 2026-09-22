@@ -17,15 +17,15 @@
 //!     config.json               source config + {"quantization": {"bits", "group_size": 64}}
 //!     model.safetensors         packed: every Linear as {base}.weight|.scales|.biases
 //!   text_encoder/
-//!     config.json               source config + {"quantization": {"bits": 8, "group_size": 64}}
+//!     config.json               source config + {"quantization": {"bits", "group_size": 64}}
 //!     model.safetensors         packed language-tower decoder Linears; everything else verbatim
 //!   vae/ processor/ scheduler/  copied verbatim (dense)
 //! ```
 //!
-//! The `text_encoder/` marker always reads **8**, at both packed tiers — that is the declared
-//! [`crate::quant::TEXT_ENCODER_Q4_FLOOR`], and writing the selected tier there instead would
-//! mislabel the artefact for [`mlx_gen::quant::packed_quant_bits`] (and therefore for every fit
-//! estimate that reads it).
+//! Both packed components carry the **same** `bits`: a tier is a whole-pipeline contract, so
+//! `text_encoder/`'s marker is the tier the caller selected. Writing a different width in either
+//! marker would mislabel the artefact for [`mlx_gen::quant::packed_quant_bits`], and therefore for
+//! every fit estimate that reads it.
 //!
 //! # Reproducibility
 //!
@@ -124,9 +124,9 @@ pub fn quantize_transformer(src: &Path, dst: &Path, bits: i32) -> Result<()> {
 }
 
 /// Pre-quantize the `text_encoder/` dir into a packed `model.safetensors` + annotated
-/// `config.json` in `dst`. `bits` is always 8 for a shipped tier — the
-/// [`crate::quant::TEXT_ENCODER_Q4_FLOOR`] — but the parameter stays explicit so the converter has
-/// no hidden policy of its own.
+/// `config.json` in `dst`. `bits` is the tier's own width — a tier is a whole-pipeline contract, so
+/// this is always [`crate::quant::Tier::transformer_bits`] — and the parameter stays explicit so the
+/// converter has no hidden policy of its own.
 pub fn quantize_text_encoder(src: &Path, dst: &Path, bits: i32) -> Result<()> {
     pack_component(src, dst, bits, is_text_encoder_target)
 }

@@ -13,10 +13,14 @@
 //!
 //! # Per-component tiering — and why it is NOT the 2512 table
 //!
+//! **A tier is a whole-pipeline contract.** Selecting q4 runs q4 through every packable component;
+//! there is no per-component promotion, no `component_precision_floors` declaration, and no override
+//! to keep in sync. [`Tier::text_encoder_bits`] is literally [`Tier::transformer_bits`].
+//!
 //! | component | bf16 tier | q8 tier | q4 tier | why |
 //! |---|---|---|---|---|
 //! | `transformer/` (DiT, 7.12 B) | dense bf16 | **packed Q8** g64 | **packed Q4** g64 | every leaf is a `Linear`; all released input widths (64 / 256 / 4096 / 12288) are multiples of 64 |
-//! | `text_encoder/` Qwen3 language tower (7.57 B loaded) | dense bf16 | **packed Q8** g64 | **packed Q8** g64 ([`TEXT_ENCODER_Q4_FLOOR`]) | see below |
+//! | `text_encoder/` Qwen3 language tower (7.57 B loaded) | dense bf16 | **packed Q8** g64 | **packed Q4** g64 | same tier as the DiT — see below |
 //! | `text_encoder/` token embedding (622 M) | dense | dense | dense | [`crate::text_encoder`]'s `quantize` packs decoder layers only; keeping it dense preserves pre-quantize ≡ quantize-at-load |
 //! | `vae/` (338 M) | dense f32 | dense f32 | dense f32 | all-conv; zero group-quantizable 2-D leaves, and the released file ships f32 |
 //!
@@ -25,17 +29,17 @@
 //! tower is a minority of the footprint and upstream's `skip_quantization` note costs little. Qwen-
 //! Image 2.1 pairs a **7.12 B** DiT with a **7.57 B** Qwen3 tower: with a staged (`Sequential`) text
 //! encoder the resident floor is `max(text encoder, DiT + VAE)` (never the sum), so a dense tower
-//! would pin that floor at ~15.1 GB at *every* tier and a Q4 tier would buy essentially nothing.
+//! would pin that floor at ~14.1 GiB at *every* tier and a Q4 tier would buy essentially nothing.
 //! Reusing 2512's table here would have produced a tier that cannot do its job. Numbers:
 //! [`crate::memory_strategy`].
 //!
-//! [`TEXT_ENCODER_Q4_FLOOR`] keeps the tower at Q8 on the Q4 tier. That floor is a **prior**, not a
-//! measurement of this model: `mlx_gen_mage::quant`'s measured Qwen-LM-tower sweep found a Q4 SwiGLU
-//! MLP collapses generation quality while Q8 attention + MLP holds, and the Qwen3 tower here is the
-//! same block shape. It is declared through `Capabilities::component_precision_floors` so a caller's
-//! effective-tier label and memory evidence carry the substitution rather than having to rediscover
-//! it. Confirming or retiring it against real weights belongs to the epic's terminal measurement
-//! story; nothing here claims to have measured it.
+//! An earlier revision of this story held the tower at Q8 on the q4 tier, on the strength of
+//! `mlx_gen_mage::quant`'s measured Qwen-LM-tower sweep. That was **withdrawn**: it is a prior from
+//! a different model, it minted a "q4" tier that was not q4, and it had to be carried as a
+//! `component_precision_floors` declaration that every caller then has to reason about. A tier that
+//! needs a floor to be usable is a measurement result, not a default — and this route has no
+//! measurement. If a real sweep later shows the q4 tower is unusable, the honest outcome is a
+//! narrower `supported_quants`, not a q4 tier that quietly runs q8.
 //!
 //! # Group size 64, uniformly
 //!
@@ -53,7 +57,6 @@
 
 use std::path::Path;
 
-use mlx_gen::gen_core::{ComponentPrecisionFloor, PrecisionFloorComponent};
 use mlx_gen::{Error, Quant, Result};
 
 /// Group size every packed Qwen-Image 2.1 component is written and read at.
@@ -62,10 +65,6 @@ use mlx_gen::{Error, Quant, Result};
 /// parity gate can compare it against the Candle twin's own constant textually;
 /// `group_size_is_the_codebase_default` pins the two to the same number.
 pub const GROUP_SIZE: i32 = 64;
-
-/// The tier the Qwen3 language tower is resident at when **Q4** is selected. See the module docs:
-/// a prior carried from `mlx_gen_mage`'s measured Qwen-LM-tower sweep, declared rather than hidden.
-pub const TEXT_ENCODER_Q4_FLOOR: Quant = Quant::Q8;
 
 /// The snapshot subdirectories a tier owns, in conversion order.
 pub const PACKED_COMPONENTS: &[&str] = &["transformer", "text_encoder"];
@@ -79,9 +78,9 @@ pub const DENSE_COMPONENTS: &[&str] = &["vae", "processor", "tokenizer", "schedu
 pub enum Tier {
     /// The released dense snapshot itself — no conversion, just a mirror.
     Bf16,
-    /// Packed Q8 DiT + Q8 language tower.
+    /// Packed Q8 throughout.
     Q8,
-    /// Packed Q4 DiT + **Q8** language tower ([`TEXT_ENCODER_Q4_FLOOR`]).
+    /// Packed Q4 throughout.
     Q4,
 }
 
@@ -126,27 +125,44 @@ impl Tier {
         }
     }
 
-    /// Bits the `text_encoder/` decoder layers are packed at in this tier (`None` = dense). Q4
-    /// resolves to 8 — the declared [`TEXT_ENCODER_Q4_FLOOR`].
+    /// Bits the `text_encoder/` decoder layers are packed at in this tier (`None` = dense).
+    ///
+    /// **Structurally** [`Self::transformer_bits`]: a tier is a whole-pipeline contract, so this
+    /// cannot drift from the DiT's width without editing one expression that names the other.
     pub const fn text_encoder_bits(self) -> Option<i32> {
-        match self {
-            Self::Bf16 => None,
-            Self::Q8 | Self::Q4 => Some(8),
-        }
+        self.transformer_bits()
     }
 }
 
-/// The `component_precision_floors` this provider advertises — the single Q4 text-encoder floor.
-/// Published at every tier (the descriptor is tier-independent); it *applies* only at Q4, which
-/// [`mlx_gen::gen_core::ComponentPrecisionFloor::applies_to`] enforces.
-pub const COMPONENT_PRECISION_FLOORS: &[ComponentPrecisionFloor] = &[ComponentPrecisionFloor {
-    component: PrecisionFloorComponent::TextEncoder,
-    selected_tier: Quant::Q4,
-    resident_tier: TEXT_ENCODER_Q4_FLOOR,
-}];
+/// The bit-width a packed component's **weights actually are**, derived from one packed leaf's
+/// `{base}.weight` / `{base}.scales` shapes ([`mlx_gen::quant::packed_bits`]).
+///
+/// `None` when the component holds no packed leaf at all. This is the check that makes
+/// [`installed_tier`] a reading of the artefact rather than a reading of its label: a `config.json`
+/// is a text file anyone can edit, and a q4-labelled Q8 snapshot renders perfectly well at Q8 —
+/// so a parity bar comparing it against the real Q8 tier passes, and a monotonicity check comparing
+/// their sizes passes on equality. Nothing downstream can notice. This can.
+fn derived_component_bits(component_dir: &Path) -> Result<Option<i32>> {
+    let weights = match mlx_gen::weights::Weights::from_dir(component_dir) {
+        Ok(weights) => weights,
+        // A component with no readable safetensors is handled by the loaders, not here.
+        Err(_) => return Ok(None),
+    };
+    let Some(base) = weights
+        .keys()
+        .filter_map(|key| key.strip_suffix(".scales"))
+        .min()
+        .map(str::to_owned)
+    else {
+        return Ok(None);
+    };
+    let wq = weights.require(&format!("{base}.weight"))?;
+    let scales = weights.require(&format!("{base}.scales"))?;
+    Ok(Some(mlx_gen::quant::packed_bits(wq, scales, GROUP_SIZE)?))
+}
 
 /// The tier a snapshot on disk **is**, read from the `quantization` markers its packed components
-/// carry ([`mlx_gen::quant::packed_quant_bits_at`]).
+/// carry ([`mlx_gen::quant::packed_quant_bits_at`]) **and cross-checked against the packed shapes**.
 ///
 /// A snapshot whose `transformer/` and `text_encoder/` disagree in a way no tier produces is a hard
 /// error: silently picking one of them would serve a mislabelled tier, which is exactly the failure
@@ -159,13 +175,24 @@ pub fn installed_tier(root: &Path) -> Result<Tier> {
         ("text_encoder", "text_encoder"),
     ] {
         let component = root.join(dir);
-        if mlx_gen::quant::packed_quant_bits_at(&component)?.is_some() {
-            let group = mlx_gen::quant::packed_quant_group_size_at(&component)?;
-            if group != Some(GROUP_SIZE) {
+        let Some(declared) = mlx_gen::quant::packed_quant_bits_at(&component)? else {
+            continue;
+        };
+        let group = mlx_gen::quant::packed_quant_group_size_at(&component)?;
+        if group != Some(GROUP_SIZE) {
+            return Err(Error::Msg(format!(
+                "qwen_image_2_1: {label}/ declares quantization.group_size {group:?}, but every \
+                 packed tier of this model is written and read at group {GROUP_SIZE}; a \
+                 mismatched group size decodes the packed codes at the wrong bit-width"
+            )));
+        }
+        if let Some(derived) = derived_component_bits(&component)? {
+            if derived != declared {
                 return Err(Error::Msg(format!(
-                    "qwen_image_2_1: {label}/ declares quantization.group_size {group:?}, but every \
-                     packed tier of this model is written and read at group {GROUP_SIZE}; a \
-                     mismatched group size decodes the packed codes at the wrong bit-width"
+                    "qwen_image_2_1: {label}/config.json declares Q{declared} but its packed \
+                     weights are Q{derived} (derived from the code/scale shapes at group \
+                     {GROUP_SIZE}). The label is wrong, not the weights: a mislabelled tier renders \
+                     correctly at the width it really is, so nothing downstream would notice."
                 )));
             }
         }
@@ -230,18 +257,23 @@ pub fn needs_load_time_quant(root: &Path, requested: Option<Quant>) -> Result<bo
 mod tests {
     use super::*;
 
+    /// **A tier is a whole-pipeline contract**: every packable component runs at the selected
+    /// width, with no per-component promotion anywhere in the table.
+    ///
+    /// *Mutation that reds this:* `text_encoder_bits()` returning anything but
+    /// `transformer_bits()` — e.g. reinstating the withdrawn `Some(8)` arm for Q4.
     #[test]
-    fn tier_table_is_the_documented_per_component_assignment() {
+    fn a_tier_is_one_width_across_every_packable_component() {
         assert_eq!(Tier::Bf16.transformer_bits(), None);
-        assert_eq!(Tier::Bf16.text_encoder_bits(), None);
         assert_eq!(Tier::Q8.transformer_bits(), Some(8));
-        assert_eq!(Tier::Q8.text_encoder_bits(), Some(8));
         assert_eq!(Tier::Q4.transformer_bits(), Some(4));
-        assert_eq!(
-            Tier::Q4.text_encoder_bits(),
-            Some(8),
-            "the Q4 tier keeps the Qwen3 tower at the declared Q8 floor"
-        );
+        for tier in Tier::ALL {
+            assert_eq!(
+                tier.text_encoder_bits(),
+                tier.transformer_bits(),
+                "{tier:?}: the tower must run the tier the caller selected"
+            );
+        }
         // Round-trip through the caller-visible selector.
         for tier in Tier::ALL {
             assert_eq!(Tier::from_selected(tier.selected_quant()), Some(tier));
@@ -256,25 +288,19 @@ mod tests {
         assert_eq!(GROUP_SIZE, mlx_gen::quant::DEFAULT_GROUP_SIZE);
     }
 
+    /// The descriptor declares **no** component precision floor, because nothing in this route
+    /// promotes a component above the selected tier.
+    ///
+    /// *Mutation that reds this:* re-adding a `COMPONENT_PRECISION_FLOORS` table and wiring it into
+    /// the descriptor.
     #[test]
-    fn the_declared_floor_matches_the_tier_table() {
-        let floor = COMPONENT_PRECISION_FLOORS
-            .iter()
-            .find(|floor| floor.component == PrecisionFloorComponent::TextEncoder)
-            .expect("the text-encoder floor is declared");
-        assert_eq!(floor.selected_tier, Quant::Q4);
-        assert_eq!(floor.resident_tier, Quant::Q8);
-        assert!(floor.applies_to(Quant::Q4));
-        assert!(!floor.applies_to(Quant::Q8));
-        // The descriptor declaration and the converter's own table must not drift apart.
-        assert_eq!(
-            Tier::Q4.text_encoder_bits(),
-            Some(floor.resident_tier.bits())
-        );
-        assert_eq!(
-            Tier::Q8.text_encoder_bits(),
-            Some(Quant::Q8.bits()),
-            "Q8 applies no promotion"
+    fn the_descriptor_declares_no_precision_floor() {
+        assert!(
+            crate::descriptor()
+                .capabilities
+                .component_precision_floors
+                .is_empty(),
+            "a q4 tier that silently runs a q8 component is the thing this route does not do"
         );
     }
 
@@ -310,7 +336,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         write_marker(&root.join("transformer"), 4, GROUP_SIZE);
-        write_marker(&root.join("text_encoder"), 8, GROUP_SIZE);
+        write_marker(&root.join("text_encoder"), 4, GROUP_SIZE);
 
         assert_eq!(installed_tier(root).unwrap(), Tier::Q4);
         assert!(
@@ -329,9 +355,9 @@ mod tests {
     fn a_tier_no_converter_produces_and_a_foreign_group_size_are_hard_errors() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        // Q4 DiT with a Q4 tower: below the declared floor, so no installable tier names it.
+        // A mixed-width pair: no installable tier names it, because a tier is one width.
         write_marker(&root.join("transformer"), 4, GROUP_SIZE);
-        write_marker(&root.join("text_encoder"), 4, GROUP_SIZE);
+        write_marker(&root.join("text_encoder"), 8, GROUP_SIZE);
         let err = installed_tier(root).unwrap_err().to_string();
         assert!(err.contains("no installable tier"), "{err}");
 

@@ -19,11 +19,21 @@ pub const DEFAULT_STEPS: u32 = 40;
 /// Upstream default `true_cfg_scale`: 2.1 is meant to be sampled **without** guidance; a negative
 /// prompt plus a scale above 1 enables real classifier-free guidance (two forwards per step).
 pub const DEFAULT_TRUE_CFG: f32 = 1.0;
-/// Condition images the unified model accepts (README: "Support up to 10 reference images"). The
-/// joint-sequence layout is built for them; the edit route itself is a later story.
+/// Condition images the unified model accepts (README: "Support up to 10 reference images").
 pub const MAX_REFERENCE_IMAGES: usize = 10;
-/// The fixed system instruction of the T2I prompt template (`QwenImage21Pipeline.sys_prompt`).
+/// The fixed system instruction of the prompt templates (`QwenImage21Pipeline.sys_prompt`).
 pub const SYSTEM_PROMPT: &str = "Comprehend and analyze the provided prompt.";
+/// `QwenImage21Pipeline.__call__`'s `output_resolution` default — the side length every condition
+/// image is fitted to before it reaches the vision tower and the VAE.
+pub const OUTPUT_RESOLUTION: u32 = 1024;
+/// Qwen3-VL processor patch side (`processor/preprocessor_config.json` `patch_size`).
+pub const VISION_PATCH_SIZE: usize = 16;
+/// Qwen3-VL processor 2×2 patch merge (`merge_size`) — one `<|image_pad|>` slot per merged block,
+/// which the DiT expands into a 2×2 group of latent tokens.
+pub const VISION_MERGE_SIZE: usize = 2;
+/// Latent tokens one `<|image_pad|>` vision slot stands for
+/// (`transformer_qwenimage21._IMG_TOKENS_PER_SLOT`).
+pub const IMAGE_TOKENS_PER_SLOT: usize = VISION_MERGE_SIZE * VISION_MERGE_SIZE;
 
 /// One upstream aspect-ratio preset (README `aspect_ratios`, `(width, height)`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,6 +222,11 @@ pub struct TextEncoderConfig {
     pub intermediate_size: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
+    /// Interleaved M-RoPE section `[t, h, w]` (`rope_scaling.mrope_section`, sums to
+    /// `head_dim / 2`). With a text-only prompt all three position rows are the token index, so
+    /// the interleave collapses to plain 1-D RoPE — which is why the text-to-image path is
+    /// unchanged by the reference route (sc-24110).
+    pub mrope_section: [usize; 3],
 }
 
 impl TextEncoderConfig {
@@ -227,6 +242,7 @@ impl TextEncoderConfig {
             intermediate_size: 12_288,
             rms_norm_eps: 1e-6,
             rope_theta: 5_000_000.0,
+            mrope_section: [24, 20, 20],
         }
     }
 
@@ -254,17 +270,123 @@ impl TextEncoderConfig {
         }
         let hidden_size = u(text, "hidden_size", ctx)?;
         let num_attention_heads = u(text, "num_attention_heads", ctx)?;
+        let head_dim = u_or(text, "head_dim", hidden_size / num_attention_heads.max(1));
+        // `mrope_section` sums to `head_dim / 2`; a snapshot that omits it (or carries a section
+        // that does not sum) falls back to the even split the sibling Qwen3-VL ports use, which is
+        // also what a text-only prompt would collapse to anyway.
+        let half = head_dim / 2;
+        let even = [half - 2 * (half / 3), half / 3, half / 3];
+        let mrope_section = rope
+            .get("mrope_section")
+            .and_then(Value::as_array)
+            .filter(|s| s.len() == 3)
+            .and_then(|s| {
+                let parsed: Vec<usize> = s
+                    .iter()
+                    .filter_map(|v| v.as_u64().map(|x| x as usize))
+                    .collect();
+                (parsed.len() == 3 && parsed.iter().sum::<usize>() == half)
+                    .then(|| [parsed[0], parsed[1], parsed[2]])
+            })
+            .unwrap_or(even);
         Ok(Self {
             vocab_size: u(text, "vocab_size", ctx)?,
             hidden_size,
             num_hidden_layers: u(text, "num_hidden_layers", ctx)?,
             num_attention_heads,
             num_key_value_heads: u_or(text, "num_key_value_heads", num_attention_heads),
-            head_dim: u_or(text, "head_dim", hidden_size / num_attention_heads.max(1)),
+            head_dim,
             intermediate_size: u(text, "intermediate_size", ctx)?,
             rms_norm_eps: f_or(text, "rms_norm_eps", 1e-6),
             rope_theta: rope_theta as f32,
+            mrope_section,
         })
+    }
+}
+
+/// The Qwen3-VL **vision** tower geometry plus the host-side processor settings the reference
+/// route needs (`text_encoder/config.json` → `vision_config`, and `processor/`'s image-processor
+/// block). Parsed here so the tiny parity snapshot — which deliberately ships a miniature tower
+/// and a miniature pixel budget — drives exactly the production code path.
+#[derive(Clone, Debug)]
+pub struct VisionConfig {
+    /// The tower itself, in `mlx-llm`'s shared Qwen3-VL form.
+    pub tower: mlx_llm::models::Qwen3VLVisionConfig,
+    /// Host preprocessing (patch/merge/temporal geometry, pixel budget, mean/std).
+    pub processor: mlx_llm::image::Qwen35ImageProcessor,
+}
+
+impl VisionConfig {
+    pub fn from_value(
+        text_encoder_config: &Value,
+        processor_config: Option<&Value>,
+    ) -> Result<Self> {
+        let tower = mlx_llm::models::Qwen3VLVisionConfig::from_json(text_encoder_config)
+            .map_err(|e| Error::Msg(format!("qwen_image_2_1: text_encoder/config.json: {e}")))?;
+        let mut processor = mlx_llm::image::Qwen35ImageProcessor {
+            patch_size: tower.patch_size as usize,
+            temporal_patch_size: tower.temporal_patch_size as usize,
+            merge_size: tower.spatial_merge_size as usize,
+            ..Default::default()
+        };
+        // `processor/preprocessor_config.json`, or the `image_processor` block of
+        // `processor/processor_config.json`. Absent, the released geometry stands.
+        if let Some(block) = processor_config.and_then(|v| v.get("image_processor").or(Some(v))) {
+            // `size.shortest_edge` / `size.longest_edge` is how both the released and the
+            // miniature processor serialise the budget; the bare `min_pixels` / `max_pixels`
+            // spelling is the older `Qwen2VLImageProcessor` form and wins when present.
+            let size = block.get("size");
+            for (bare, edge, out) in [
+                ("min_pixels", "shortest_edge", &mut processor.min_pixels),
+                ("max_pixels", "longest_edge", &mut processor.max_pixels),
+            ] {
+                if let Some(x) = block
+                    .get(bare)
+                    .and_then(Value::as_u64)
+                    .or_else(|| size.and_then(|s| s.get(edge)).and_then(Value::as_u64))
+                {
+                    *out = x as usize;
+                }
+            }
+            for (key, out) in [
+                ("image_mean", &mut processor.mean),
+                ("image_std", &mut processor.std),
+            ] {
+                if let Some(values) = block.get(key).and_then(Value::as_array) {
+                    for (slot, value) in out.iter_mut().zip(values) {
+                        if let Some(x) = value.as_f64() {
+                            *slot = x as f32;
+                        }
+                    }
+                }
+            }
+        }
+        if processor.min_pixels == 0 || processor.max_pixels < processor.min_pixels {
+            return Err(Error::Msg(format!(
+                "qwen_image_2_1: the image processor's pixel budget is empty \
+                 ([{}, {}])",
+                processor.min_pixels, processor.max_pixels
+            )));
+        }
+        Ok(Self { tower, processor })
+    }
+
+    /// `output_resolution` for this snapshot: upstream's 1024-px default, clamped into the side
+    /// lengths the snapshot's own processor accepts without `smart_resize` rebinding the grid, and
+    /// snapped down onto the 32-px grid.
+    ///
+    /// Upstream takes `output_resolution` as a pipeline argument; gen-core's request carries no
+    /// field for it, so the default is derived rather than passed. On the released snapshot the
+    /// budget is `[256², 4096²]` and this is exactly 1024. The miniature parity snapshot's budget
+    /// is three orders of magnitude smaller, and deriving the value is what lets it exercise this
+    /// path at all.
+    pub fn output_resolution(&self) -> u32 {
+        let multiple = SIZE_MULTIPLE as f64;
+        let floor = (self.processor.min_pixels as f64).sqrt();
+        let ceiling = (self.processor.max_pixels as f64).sqrt();
+        let target = f64::from(OUTPUT_RESOLUTION).min(ceiling).max(floor);
+        let snapped = (target / multiple).floor() * multiple;
+        (snapped.max(multiple) as u32).max(SIZE_MULTIPLE)
     }
 }
 

@@ -37,12 +37,12 @@ use mlx_gen::gen_core::{
     MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
     MemoryStrategy, MemoryStrategySupport, ResidentRequestMemory, Result as CoreResult,
 };
-use mlx_gen::{LoadSpec, Quant, WeightsSource};
+use mlx_gen::{LoadSpec, WeightsSource};
 
 use crate::config::{MAX_REFERENCE_IMAGES, PRESETS};
 use crate::model::MODEL_ID;
 use crate::pipeline::{DECODE_OVERLAP, DECODE_TILE_EDGE};
-use crate::quant::{Tier, COMPONENT_PRECISION_FLOORS, GROUP_SIZE};
+use crate::quant::{Tier, GROUP_SIZE};
 
 /// Content fingerprint of this contract. Load shape is a separate typed axis on
 /// [`MemoryCalibrationIdentity`], so it is deliberately absent from the string.
@@ -195,29 +195,40 @@ pub mod derived {
     /// template. The request-time estimate takes the real count.
     pub const TABLE_CONDITIONING_TOKENS: u64 = 256;
 
+    /// Latent tokens **one reference image** contributes to the joint sequence.
+    ///
+    /// A reference is **not** admitted at the request's own geometry: `reference::prepare` fits
+    /// every condition image to [`crate::config::OUTPUT_RESOLUTION`] (upstream's
+    /// `output_resolution` default) before it reaches the vision tower and the VAE, so its latent
+    /// grid is `(1024/16)² = 4096` tokens whatever the target size. Pricing references at the
+    /// target's own token count — which an earlier revision of this module did — overstates the
+    /// worst-case joint sequence by more than 3x at the largest preset, which is a consumer
+    /// refusing requests that would in fact have fitted.
+    pub const REFERENCE_FIT_TOKENS: u64 = (crate::config::OUTPUT_RESOLUTION as u64
+        / PIXELS_PER_TOKEN)
+        * (crate::config::OUTPUT_RESOLUTION as u64 / PIXELS_PER_TOKEN);
+
     /// Latent tokens one image of `width × height` contributes to the joint sequence.
     pub const fn image_tokens(width: u32, height: u32) -> u64 {
         (width as u64 / PIXELS_PER_TOKEN) * (height as u64 / PIXELS_PER_TOKEN)
     }
 
     /// The joint sequence length the DiT attends over: the conditioning tokens, the target image,
-    /// and one block of image tokens per reference image.
+    /// and [`REFERENCE_FIT_TOKENS`] per reference image.
     ///
     /// **Reference images are extra image tokens, nothing else** — they enter as additional
-    /// `Segment::Image` blocks of the joint layout, at their own geometry. This is the quantity a
-    /// consumer must gate on: at the 2752×1536 preset cap with [`super::MAX_REFERENCE_IMAGES`]
-    /// references of the same size the joint sequence is eleven times one image's tokens.
+    /// `Segment::Image` blocks of the joint layout. They are priced at the **fitted** 1024² grid,
+    /// not at the target's geometry: see [`REFERENCE_FIT_TOKENS`]. This is the quantity a consumer
+    /// must gate on, and it grows with the reference count independently of the target size.
     pub const fn joint_tokens(
         width: u32,
         height: u32,
         conditioning_tokens: u64,
         reference_count: u32,
-        reference_width: u32,
-        reference_height: u32,
     ) -> u64 {
         conditioning_tokens
             + image_tokens(width, height)
-            + reference_count as u64 * image_tokens(reference_width, reference_height)
+            + reference_count as u64 * REFERENCE_FIT_TOKENS
     }
 
     /// Derived DiT activation transient for a joint sequence of `tokens`, at bf16.
@@ -267,14 +278,7 @@ pub mod derived {
         use_negative: bool,
         tile_edge: Option<u32>,
     ) -> u64 {
-        let tokens = joint_tokens(
-            width,
-            height,
-            conditioning_tokens,
-            reference_count,
-            width,
-            height,
-        );
+        let tokens = joint_tokens(width, height, conditioning_tokens, reference_count);
         let denoise = dit_activation_bytes(tokens);
         let decode = match tile_edge {
             Some(edge) => tiled_vae_decode_activation_bytes(width, height, edge, 64),
@@ -371,12 +375,13 @@ pub struct AdmissionGeometry {
     pub max_target_image_tokens: u64,
     /// Most reference images the joint layout accepts ([`MAX_REFERENCE_IMAGES`]).
     pub max_reference_images: u32,
-    /// Latent tokens **one** reference at the largest-area preset adds. References are extra image
-    /// token blocks; there is no separate reference budget.
+    /// Latent tokens **one** reference adds — [`derived::REFERENCE_FIT_TOKENS`], the fitted 1024²
+    /// grid every condition image is resized to, **not** the target's own token count. References
+    /// are extra image-token blocks; there is no separate reference budget.
     pub tokens_per_max_reference: u64,
     /// The worst-case joint sequence: the largest-area target plus
-    /// [`Self::max_reference_images`] references of the same size, plus the conditioning tokens the
-    /// published table assumes.
+    /// [`Self::max_reference_images`] fitted references, plus the conditioning tokens the published
+    /// table assumes.
     pub max_joint_tokens: u64,
     /// Pixels one latent token covers on each axis.
     pub pixels_per_token: u64,
@@ -403,14 +408,12 @@ pub fn admission_geometry() -> AdmissionGeometry {
         max_preset_area: widest.width as u64 * widest.height as u64,
         max_target_image_tokens: target_tokens,
         max_reference_images: MAX_REFERENCE_IMAGES as u32,
-        tokens_per_max_reference: target_tokens,
+        tokens_per_max_reference: derived::REFERENCE_FIT_TOKENS,
         max_joint_tokens: derived::joint_tokens(
             widest.width,
             widest.height,
             derived::TABLE_CONDITIONING_TOKENS,
             MAX_REFERENCE_IMAGES as u32,
-            widest.width,
-            widest.height,
         ),
         pixels_per_token: derived::PIXELS_PER_TOKEN,
         max_batch: crate::model::descriptor().capabilities.max_count,
@@ -442,6 +445,10 @@ fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
 /// Bytes the resolved tier's components occupy once loaded, read from the snapshot's own tensor
 /// headers.
 ///
+/// Public so the ignored real-weights test can hold [`derived::resident_weights`]'s hand-entered
+/// parameter counts to what the frozen snapshot actually contains — header reads only, no tensor
+/// data.
+///
 /// Each component is priced at what **its** loader materializes:
 ///
 /// * a **packed** tier is already in its resident form on disk, so it prices
@@ -453,7 +460,7 @@ fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
 ///   on this route, so they are [`ResidentProjection::Omit`] — charging them would bill ~2.4 GB of
 ///   weights no render touches;
 /// * the VAE prices `Stored`: it ships f32 and MLX loads at the on-disk dtype.
-fn asset_facts(spec: &LoadSpec, root: &Path) -> CoreResult<MemoryAssetFacts> {
+pub fn asset_facts(spec: &LoadSpec, root: &Path) -> CoreResult<MemoryAssetFacts> {
     let tier = resolved_tier(spec, root)?;
     let load_time_quant = crate::quant::installed_tier(root)? == Tier::Bf16;
     let projection = |bits: Option<i32>| -> ResidentProjection {
@@ -504,24 +511,15 @@ fn resolved_tier(spec: &LoadSpec, root: &Path) -> CoreResult<Tier> {
     }
 }
 
-/// The numeric tier this generator actually runs, carrying the declared text-encoder floor so a
-/// caller's effective-tier label and evidence identity record the substitution.
+/// The numeric tier this generator actually runs.
+///
+/// `component_precision_floors` is **empty and stays empty**: a tier is a whole-pipeline contract
+/// here, so there is no component resident above the selected width for a receipt to record.
 fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
     MemoryNumericTier {
         precision: spec.precision,
         quant: spec.quantize,
-        component_precision_floors: active_floors(spec.quantize),
-    }
-}
-
-/// The floors that actually apply to one selected tier. The descriptor publishes the whole table;
-/// a Q8 or dense load promotes nothing, so its receipt must be empty.
-pub(crate) fn active_floors(
-    selected: Option<Quant>,
-) -> &'static [mlx_gen::gen_core::ComponentPrecisionFloor] {
-    match selected {
-        Some(Quant::Q4) => COMPONENT_PRECISION_FLOORS,
-        _ => &[],
+        component_precision_floors: &[],
     }
 }
 
@@ -663,13 +661,16 @@ pub fn safety_check(
                 context.mode
             )));
         }
-        // Reference images are extra joint-sequence blocks the DiT already models, but this story's
-        // descriptor advertises no conditioning, so a reference-bearing request would be refused at
-        // `validate` anyway. Refuse it here rather than record evidence for a route that cannot run.
-        if context.geometry.reference_count != 0 || context.has_reference {
+        // References are PRICED, not refused: sc-24110 advertises Reference/MultiReference on this
+        // route, and each condition image is an extra joint-sequence block worth
+        // `derived::REFERENCE_FIT_TOKENS`. The only reference gate here is the count the joint
+        // layout can express; the per-image validation (geometry, grid agreement, the 1..=10 bound
+        // as a request error) is `crate::reference`'s, and it must stay there so a bad reference is
+        // a request refusal rather than a memory refusal.
+        if context.geometry.reference_count as usize > MAX_REFERENCE_IMAGES {
             return Err(CoreError::Unsupported(format!(
-                "{MODEL_ID}: reference conditioning is not advertised on this route yet; got {} \
-                 references (the joint layout models up to {MAX_REFERENCE_IMAGES})",
+                "{MODEL_ID}: {} reference images exceed the {MAX_REFERENCE_IMAGES} the joint layout \
+                 can express",
                 context.geometry.reference_count
             )));
         }
@@ -772,6 +773,7 @@ pub const MEMORY_BEHAVIOR_REGISTRATION: gen_core::MemoryBehaviorRegistration =
 mod tests {
     use super::derived::*;
     use super::*;
+    use mlx_gen::Quant;
 
     const GIB: f64 = (1_u64 << 30) as f64;
 
@@ -804,7 +806,7 @@ mod tests {
     /// The tier ladder is strictly monotone in every component that packs, the VAE never moves, and
     /// the Q4 tier's text encoder equals the Q8 tier's — the declared floor, visible in the numbers.
     #[test]
-    fn the_derived_tier_ladder_is_monotone_and_shows_the_text_encoder_floor() {
+    fn the_derived_tier_ladder_is_strictly_monotone_in_every_packable_component() {
         let bf16 = resident_weights(Tier::Bf16);
         let q8 = resident_weights(Tier::Q8);
         let q4 = resident_weights(Tier::Q4);
@@ -812,9 +814,11 @@ mod tests {
         assert!(q8.transformer < bf16.transformer);
         assert!(q4.transformer < q8.transformer);
         assert!(q8.conditioning < bf16.conditioning);
-        assert_eq!(
-            q4.conditioning, q8.conditioning,
-            "the Q4 tier holds the Qwen3 tower at the declared Q8 floor"
+        assert!(
+            q4.conditioning < q8.conditioning,
+            "a q4 tier runs a q4 tower: {} must be below {}",
+            q4.conditioning,
+            q8.conditioning
         );
         assert_eq!(bf16.decoder, q4.decoder, "the all-conv VAE never packs");
         assert!(q4.resident_total() < q8.resident_total());
@@ -825,7 +829,7 @@ mod tests {
         for (tier, resident, floor) in [
             (Tier::Bf16, 28.61, 14.51),
             (Tier::Q8, 16.33, 8.30),
-            (Tier::Q4, 13.02, 8.03),
+            (Tier::Q4, 9.78, 4.99),
         ] {
             let w = resident_weights(tier);
             assert!(
@@ -844,7 +848,7 @@ mod tests {
     /// Staging makes the floor `max`, never the sum — and at Q4 the *text encoder* is the binding
     /// term, which is the finding that justified packing the tower at all.
     #[test]
-    fn the_sequential_floor_is_a_max_and_the_tower_binds_at_q4() {
+    fn the_sequential_floor_is_a_max_and_the_heavy_pair_binds_at_every_tier() {
         for tier in Tier::ALL {
             let w = resident_weights(tier);
             assert!(w.sequential_floor() < w.resident_total());
@@ -853,11 +857,20 @@ mod tests {
                 w.conditioning.max(w.transformer + w.decoder)
             );
         }
-        let q4 = resident_weights(Tier::Q4);
-        assert!(
-            q4.conditioning > q4.transformer + q4.decoder,
-            "at Q4 the Qwen3 tower is the binding staged term"
-        );
+        // The DiT + VAE pair binds the staged floor at EVERY tier, because both sides of the max
+        // shrink together — which is the point of a whole-pipeline tier. (Under the withdrawn Q8
+        // text-encoder floor the tower stayed at 8.03 GiB and became the binding term at q4, so the
+        // q4 floor barely moved off q8's: 8.03 instead of 4.99. That is what the floor cost.)
+        for tier in Tier::ALL {
+            let w = resident_weights(tier);
+            assert!(
+                w.transformer + w.decoder > w.conditioning,
+                "{tier:?}: the heavy pair binds the staged floor ({} vs tower {})",
+                w.transformer + w.decoder,
+                w.conditioning
+            );
+            assert_eq!(w.sequential_floor(), w.transformer + w.decoder);
+        }
     }
 
     #[test]
@@ -906,19 +919,33 @@ mod tests {
         assert!(g.max_preset_area > 2048 * 2048);
         assert_eq!(g.max_target_image_tokens, 150 * 112);
         assert_eq!(g.max_reference_images, 10);
-        assert_eq!(g.tokens_per_max_reference, 150 * 112);
+        // `reference::prepare` FITS every condition image to `OUTPUT_RESOLUTION` (1024) before the
+        // vision tower and the VAE see it, so one reference is 64x64 latent tokens whatever the
+        // target size — NOT the target's 150x112.
+        //
+        // *Mutation that reds this:* `tokens_per_max_reference: target_tokens` (what this module
+        // published before the fix pass), which overstates the envelope by 3.4x.
+        assert_eq!(g.tokens_per_max_reference, REFERENCE_FIT_TOKENS);
+        assert_eq!(g.tokens_per_max_reference, 64 * 64);
         assert_eq!(g.pixels_per_token, 16);
         assert_eq!(g.max_batch, 8);
         assert_eq!(
             g.max_joint_tokens,
-            TABLE_CONDITIONING_TOKENS + 11 * 150 * 112,
-            "target + 10 references of the same size"
+            TABLE_CONDITIONING_TOKENS + 150 * 112 + 10 * 64 * 64,
+            "the largest-area target plus ten FITTED references"
         );
-        // The DiT transient at the envelope is 11x the reference-free one, minus the conditioning
-        // tokens' share — the quantity a consumer must gate on rather than rediscover.
-        let bare = dit_activation_bytes(joint_tokens(2048, 2048, 0, 0, 0, 0));
-        let full = dit_activation_bytes(joint_tokens(2048, 2048, 0, 10, 2048, 2048));
-        assert_eq!(full, 11 * bare);
+        assert_eq!(g.max_joint_tokens, 58_016, "256 + 16_800 + 10 x 4_096");
+        // A reference adds a fixed block, so the transient grows linearly in the count at a rate
+        // the target size does not change — the quantity a consumer must gate on.
+        let bare = dit_activation_bytes(joint_tokens(2048, 2048, 0, 0));
+        let one = dit_activation_bytes(joint_tokens(2048, 2048, 0, 1));
+        let ten = dit_activation_bytes(joint_tokens(2048, 2048, 0, 10));
+        assert_eq!(one - bare, dit_activation_bytes(REFERENCE_FIT_TOKENS));
+        assert_eq!(ten - bare, 10 * (one - bare));
+        assert!(
+            ten < 11 * bare,
+            "fitted references are cheaper than target-sized ones"
+        );
     }
 
     #[test]
@@ -957,27 +984,32 @@ mod tests {
         assert!(weights_free_memory_strategy_contract("qwen_image", &spec).is_err());
     }
 
+    /// No tier promotes any component, so no tier's receipt carries a floor.
+    ///
+    /// *Mutation that reds this:* returning a non-empty `component_precision_floors` from
+    /// `loaded_tier` for any selection.
     #[test]
-    fn the_q4_text_encoder_floor_reaches_the_numeric_tier_only_at_q4() {
+    fn no_tier_records_a_component_precision_floor() {
         let dir = WeightsSource::Dir("/qwen-image-2-1".into());
-        assert!(loaded_tier(&LoadSpec::new(dir.clone()))
-            .component_precision_floors
-            .is_empty());
-        assert!(
-            loaded_tier(&LoadSpec::new(dir.clone()).with_quant(Quant::Q8))
-                .component_precision_floors
-                .is_empty()
-        );
-        let q4 = loaded_tier(&LoadSpec::new(dir).with_quant(Quant::Q4));
-        assert_eq!(q4.component_precision_floors.len(), 1);
-        assert_eq!(
-            q4.component_precision_floors[0].resident_tier,
-            crate::quant::TEXT_ENCODER_Q4_FLOOR
-        );
+        for quant in [None, Some(Quant::Q8), Some(Quant::Q4)] {
+            let mut spec = LoadSpec::new(dir.clone());
+            if let Some(quant) = quant {
+                spec = spec.with_quant(quant);
+            }
+            assert!(
+                loaded_tier(&spec).component_precision_floors.is_empty(),
+                "{quant:?}: a whole-pipeline tier promotes nothing"
+            );
+        }
     }
 
+    /// References are **priced**, not refused: sc-24110 advertises them on this route, so a memory
+    /// refusal would make every reference render impossible. The count the joint layout cannot
+    /// express is still refused, and PiD and a crossed tier still are.
+    ///
+    /// *Mutation that reds this:* restoring the `reference_count != 0` refusal in `safety_check`.
     #[test]
-    fn a_reference_bearing_or_pid_route_is_refused_rather_than_recorded() {
+    fn references_are_priced_and_only_pid_tier_and_over_count_are_refused() {
         let spec = LoadSpec::new(WeightsSource::Dir("/qwen-image-2-1".into()));
         let contract = weights_free_memory_strategy_contract(MODEL_ID, &spec).unwrap();
         let fixture = registered_valid_fixture(&spec, &contract, MemoryStrategy::StagedResidency)
@@ -989,12 +1021,24 @@ mod tests {
             MemorySafetyDecision::Accept
         );
 
-        let mut referenced = fixture.context.clone();
-        referenced.geometry.reference_count = 1;
-        assert!(matches!(
-            safety_check(&spec, &contract, &referenced),
-            MemorySafetyDecision::Reject { .. }
-        ));
+        for count in [1_u32, MAX_REFERENCE_IMAGES as u32] {
+            let mut referenced = fixture.context.clone();
+            referenced.geometry.reference_count = count;
+            referenced.has_reference = true;
+            assert_eq!(
+                safety_check(&spec, &contract, &referenced),
+                MemorySafetyDecision::Accept,
+                "{count} references must be admitted at the derived peak, not refused"
+            );
+        }
+        let mut too_many = fixture.context.clone();
+        too_many.geometry.reference_count = MAX_REFERENCE_IMAGES as u32 + 1;
+        too_many.has_reference = true;
+        let over = safety_check(&spec, &contract, &too_many);
+        assert!(
+            matches!(over, MemorySafetyDecision::Reject { .. }),
+            "{over:?}"
+        );
 
         let mut pid = fixture.context.clone();
         pid.use_pid = true;

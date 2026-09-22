@@ -8,11 +8,15 @@
 //!
 //! # What is installable on this backend after this story
 //!
+//! **A tier is a whole-pipeline contract**: selecting q4 runs q4 through every packable component.
+//! There is no per-component promotion and no `component_precision_floors` declaration —
+//! [`Tier::text_encoder_bits`] is literally [`Tier::transformer_bits`].
+//!
 //! | tier | `transformer/` | `text_encoder/` language tower | `vae/` |
 //! |---|---|---|---|
 //! | bf16 | dense | dense | dense |
 //! | q8 | packed Q8 g64 | packed Q8 g64 | dense |
-//! | q4 | packed Q4 g64 | packed **Q8** g64 ([`TEXT_ENCODER_Q4_FLOOR`]) | dense |
+//! | q4 | packed Q4 g64 | packed Q4 g64 | dense |
 //!
 //! Both packed components bind through [`QLinear::linear_detect_gs`], which reads the packed
 //! triple `{base}.weight` (u32 codes) + `.scales` + `.biases` straight into the quantized weight on
@@ -37,26 +41,12 @@
 use std::path::Path;
 
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::{
-    ComponentPrecisionFloor, Error, PrecisionFloorComponent, Quant, Result,
-};
+use candle_gen::gen_core::{self, Error, Quant, Result};
 
 pub use candle_gen::quant::AdaptLinear as QLinear;
 
 /// Group size every packed Qwen-Image 2.1 component is written and read at.
 pub const GROUP_SIZE: usize = 64;
-
-/// The tier the Qwen3 language tower is resident at when **Q4** is selected — the same declared
-/// floor the MLX converter writes into the tier's `text_encoder/config.json`.
-pub const TEXT_ENCODER_Q4_FLOOR: Quant = Quant::Q8;
-
-/// The `component_precision_floors` this provider advertises. Published at every tier; it *applies*
-/// only at Q4, which `ComponentPrecisionFloor::applies_to` enforces.
-pub const COMPONENT_PRECISION_FLOORS: &[ComponentPrecisionFloor] = &[ComponentPrecisionFloor {
-    component: PrecisionFloorComponent::TextEncoder,
-    selected_tier: Quant::Q4,
-    resident_tier: TEXT_ENCODER_Q4_FLOOR,
-}];
 
 /// One installable numeric tier, mirroring `mlx_gen_qwen_image_2_1::quant::Tier`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -104,11 +94,11 @@ impl Tier {
     }
 
     /// Bits the `text_encoder/` decoder layers are packed at (`None` = dense).
+    ///
+    /// **Structurally** [`Self::transformer_bits`]: a tier is a whole-pipeline contract, so this
+    /// cannot drift from the DiT's width without editing one expression that names the other.
     pub const fn text_encoder_bits(self) -> Option<i64> {
-        match self {
-            Self::Bf16 => None,
-            Self::Q8 | Self::Q4 => Some(8),
-        }
+        self.transformer_bits()
     }
 }
 
@@ -147,10 +137,84 @@ pub fn packed_bits(component_dir: &Path) -> Result<Option<i64>> {
     }
 }
 
-/// The tier a snapshot on disk **is**, read from its components' `quantization` markers.
+/// The bit-width a packed component's **weights actually are**, derived from one packed leaf's
+/// `{base}.weight` (u32 codes, `[out, in·bits/32]`) and `{base}.scales` (`[out, in/group]`) shapes.
+///
+/// `None` when the component holds no packed leaf. This is what makes [`installed_tier`] a reading
+/// of the artefact rather than of its label: a `config.json` is a text file anyone can edit, and a
+/// q4-labelled Q8 snapshot renders perfectly well at Q8 — a parity bar against the real Q8 tier
+/// passes and a size-monotonicity check passes on equality, so nothing downstream notices.
+fn derived_component_bits(component_dir: &Path) -> Result<Option<i64>> {
+    // Header-only: `safetensors_path_tensor_headers` walks the component's shards and parses each
+    // file's JSON header without touching the data region.
+    let headers = match gen_core::weightsmeta::safetensors_path_tensor_headers(component_dir) {
+        Ok(headers) => headers,
+        // A component with no readable safetensors is the loaders' problem, not this check's.
+        Err(_) => return Ok(None),
+    };
+    let Some(base) = headers
+        .iter()
+        .filter_map(|header| header.name.strip_suffix(".scales"))
+        .min()
+        .map(str::to_owned)
+    else {
+        return Ok(None);
+    };
+    let shape = |suffix: &str| {
+        headers
+            .iter()
+            .find(|header| header.name == format!("{base}.{suffix}"))
+            .map(|header| header.shape.clone())
+    };
+    let (Some(wq), Some(scales)) = (shape("weight"), shape("scales")) else {
+        return Ok(None);
+    };
+    // `scales` is `[out, in/group]` ⇒ in = cols·group; the u32-packed `weight` is
+    // `[out, in·bits/32]` ⇒ bits = cols·32/in. Exact for any group-aligned Q4/Q8 pack.
+    let (&[wq_rows, wq_cols], &[sc_rows, sc_cols]) = (&wq[..], &scales[..]) else {
+        return Err(Error::Msg(format!(
+            "qwen_image_2_1: {} holds a packed leaf whose code/scale tensors are not rank-2 \
+             ({wq:?} / {scales:?})",
+            component_dir.display()
+        )));
+    };
+    if wq_rows != sc_rows || sc_cols == 0 {
+        return Err(Error::Msg(format!(
+            "qwen_image_2_1: {} holds a packed leaf whose codes {wq:?} and scales {scales:?} \
+             disagree on the output width",
+            component_dir.display()
+        )));
+    }
+    let in_features = sc_cols * GROUP_SIZE;
+    let bits = wq_cols * 32;
+    if in_features == 0 || bits % in_features != 0 {
+        return Err(Error::Msg(format!(
+            "qwen_image_2_1: {} holds a packed leaf whose codes {wq:?} do not divide exactly into \
+             {in_features} inputs at group {GROUP_SIZE}",
+            component_dir.display()
+        )));
+    }
+    Ok(Some((bits / in_features) as i64))
+}
+
+/// The tier a snapshot on disk **is**, read from its components' `quantization` markers **and
+/// cross-checked against the packed shapes**.
 pub fn installed_tier(root: &Path) -> Result<Tier> {
     let dit = packed_bits(&root.join("transformer"))?;
     let te = packed_bits(&root.join("text_encoder"))?;
+    for (label, declared) in [("transformer", dit), ("text_encoder", te)] {
+        let Some(declared) = declared else { continue };
+        if let Some(derived) = derived_component_bits(&root.join(label))? {
+            if derived != declared {
+                return Err(Error::Msg(format!(
+                    "qwen_image_2_1: {label}/config.json declares Q{declared} but its packed \
+                     weights are Q{derived} (derived from the code/scale shapes at group \
+                     {GROUP_SIZE}). The label is wrong, not the weights: a mislabelled tier renders \
+                     correctly at the width it really is, so nothing downstream would notice."
+                )));
+            }
+        }
+    }
     Tier::ALL
         .into_iter()
         .find(|tier| tier.transformer_bits() == dit && tier.text_encoder_bits() == te)
@@ -199,10 +263,11 @@ pub fn resolve_requested_tier(root: &Path, requested: Option<Quant>) -> Result<T
 
 /// Error loudly if `{base}.scales` exists under `vb` — a packed weight on a path that reads floats.
 ///
-/// Applied to the leaves that stay dense in **every** tier: the language tower's token embedding and
-/// its RMSNorm scales, and the whole all-conv VAE. Reading a u32 code stream as bf16 there would be
-/// silent garbage rather than a load failure, so this turns a future tier that packed them into a
-/// hard error naming the key.
+/// Applied to the leaves that stay dense in **every** tier: the language tower's token embedding,
+/// its final `norm` and the per-head q/k RMSNorms ([`crate::text_encoder`]), and the all-conv VAE's
+/// outermost convolutions ([`crate::loader::load_vae`]). Reading a u32 code stream as a float there
+/// would be silent garbage rather than a load failure, so this turns a future tier that packed one
+/// of them into a hard error naming the key.
 pub fn guard_dense(vb: &VarBuilder, base: &str) -> Result<()> {
     if vb.contains_tensor(&format!("{base}.scales")) {
         return Err(Error::Msg(format!(
@@ -239,23 +304,25 @@ mod tests {
         tmp
     }
 
+    /// **A tier is a whole-pipeline contract**, and this backend declares no precision floor.
+    ///
+    /// *Mutation that reds this:* `text_encoder_bits()` returning anything but
+    /// `transformer_bits()`, or re-adding a `component_precision_floors` declaration.
     #[test]
-    fn the_tier_table_mirrors_the_mlx_converter() {
+    fn a_tier_is_one_width_and_declares_no_precision_floor() {
         assert_eq!(Tier::Q8.transformer_bits(), Some(8));
         assert_eq!(Tier::Q4.transformer_bits(), Some(4));
-        assert_eq!(Tier::Q8.text_encoder_bits(), Some(8));
-        assert_eq!(
-            Tier::Q4.text_encoder_bits(),
-            Some(8),
-            "the Q4 tier holds the tower at the declared Q8 floor"
-        );
-        assert_eq!(COMPONENT_PRECISION_FLOORS.len(), 1);
-        assert_eq!(
-            COMPONENT_PRECISION_FLOORS[0].resident_tier,
-            TEXT_ENCODER_Q4_FLOOR
-        );
-        assert!(COMPONENT_PRECISION_FLOORS[0].applies_to(Quant::Q4));
-        assert!(!COMPONENT_PRECISION_FLOORS[0].applies_to(Quant::Q8));
+        for tier in Tier::ALL {
+            assert_eq!(
+                tier.text_encoder_bits(),
+                tier.transformer_bits(),
+                "{tier:?}: the tower must run the tier the caller selected"
+            );
+        }
+        assert!(crate::descriptor()
+            .capabilities
+            .component_precision_floors
+            .is_empty());
     }
 
     /// A dense snapshot keeps the historical contract exactly: dense loads, and a Q4/Q8 request is
@@ -278,7 +345,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         write_marker(&root.join("transformer"), 4, GROUP_SIZE as i64);
-        write_marker(&root.join("text_encoder"), 8, GROUP_SIZE as i64);
+        write_marker(&root.join("text_encoder"), 4, GROUP_SIZE as i64);
 
         assert_eq!(installed_tier(root).unwrap(), Tier::Q4);
         assert_eq!(
@@ -303,9 +370,9 @@ mod tests {
         assert!(err.contains("group 64"), "{err}");
 
         let tmp = tempfile::tempdir().unwrap();
-        // Q4 DiT with a Q4 tower is below the declared floor: no converter produces it.
+        // A mixed-width pair: no installable tier names it, because a tier is one width.
         write_marker(&tmp.path().join("transformer"), 4, GROUP_SIZE as i64);
-        write_marker(&tmp.path().join("text_encoder"), 4, GROUP_SIZE as i64);
+        write_marker(&tmp.path().join("text_encoder"), 8, GROUP_SIZE as i64);
         let err = installed_tier(tmp.path()).unwrap_err().to_string();
         assert!(err.contains("no installable tier"), "{err}");
     }

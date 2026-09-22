@@ -59,6 +59,170 @@ Config keys read: `transformer/config.json` (`in_channels`, `out_channels`, `num
 miniature seeded configs, with the tiny snapshot written by `save_pretrained` in the exact layout
 above. Each Rust parity test names the tolerance it holds the port to.
 
+## Reference conditioning and local editing (sc-24110)
+
+Everything below is read off the pinned `QwenImage21Pipeline.__call__` /
+`_get_qwen_prompt_embeds` / `prepare_latents` and
+`QwenImage21Transformer2DModel.forward` / `build_token_metadata` / `QwenImage21Rope.forward`,
+plus the pinned GitHub README. It is stated here because the shape of the feature is not
+obvious from the class names.
+
+### There is no edit pipeline, and no mask tensor
+
+Upstream ships **one** pipeline. `QwenImage21Pipeline.__call__` takes an optional
+`image: PipelineImageInput | None`; text-to-image is that argument being `None`. "Editing",
+"multi-reference composition" and "local editing" are all the same call with one or more
+condition images. There is no `QwenImage21EditPipeline`, no `strength`, no `mask_image`, no
+latent blending and **no inpaint**: nothing in the pipeline preserves source pixels outside a
+region, and the target latents are drawn from pure noise exactly as in text-to-image.
+
+The README's "specify local edits via circles, painted annotations, or separate masks" describes
+*what the checkpoint was trained to read inside its condition images*, not extra pipeline inputs.
+The pinned README and the pinned pipeline agree: the only image input is the ordered `image` list.
+Concretely:
+
+* **Annotated reference** — the caller draws the circle / paint stroke **into the reference image
+  itself** and describes the intent in the prompt ("remove the watch inside the red circle"). The
+  annotated image is an ordinary condition image; the marks reach the model both through the
+  Qwen3-VL vision tower and through the VAE latents.
+* **Separate mask** — the mask is an ordinary **additional condition image** in the same ordered
+  list, referred to by the prompt ("use the second image as the mask"). It is not a tensor with
+  its own argument, it is not composited, and the model is under no obligation to respect it
+  pixel-exactly.
+* **"Identity preservation"** upstream means the checkpoint's own training behaviour (portrait and
+  product fidelity across references). It is **not** a mechanism: there is no pinning, no
+  masking and no latent copy. Nothing in the code path guarantees any pixel of a reference
+  survives into the output.
+
+This port therefore implements exactly the ordered-reference contract and refuses
+`Conditioning::Mask` with a typed error that names the workaround, rather than inventing an
+inpaint semantic upstream does not have.
+
+### Up to ten references, and the order is meaningful
+
+The README caps composition at **10 reference images**. The pipeline itself does not enforce a cap;
+this port does (`MAX_REFERENCE_IMAGES = 10`), because past that the joint sequence is outside
+anything upstream documents or trained.
+
+Order is semantic, not incidental, in three separate ways:
+
+1. The prompt template numbers the images — `<image1>`, `<image2>`, … — so a prompt that says
+   "put the hat from image 3 on the person in image 1" is resolved by position.
+2. The target geometry, when the caller does not pin `width`/`height`, is derived from the
+   **last** image's aspect ratio (`image[-1].size`).
+3. Each reference occupies its own RoPE frame position in sequence order, and attention is
+   **block-causal**, so a reference can only be attended to by the text and references that follow
+   it. Swapping two references is a different request and produces a different image.
+
+### Preprocessing (one resize feeds both consumers)
+
+Per condition image, in list order:
+
+1. Converted to `RGBA` if it is not already (`img.convert("RGBA")`).
+2. `calculate_dimensions(output_resolution², w/h)` → `w' = round(sqrt(A·r)/32)·32`,
+   `h' = round((w'/r)/32)·32` with `output_resolution = 1024`. This is a *per-image* resize target
+   derived from that image's own aspect ratio, not from the output size.
+3. **One** resize to `(w', h')` feeds both consumers:
+   * `image_processor.resize(...)` → the PIL image handed to the **Qwen3-VL processor** (RGBA is
+     flattened over **white** for the vision tower only — `_get_qwen_prompt_embeds` composites an
+     RGBA condition onto a white background before the processor sees it);
+   * `image_processor.preprocess(...)` → the `[-1, 1]` NCHW tensor, `unsqueeze(2)` for the VAE's
+     temporal axis, handed to the **VAE** with all four channels.
+4. VAE encode uses `sample_mode="argmax"` — the posterior **mode**, not a sample — then the same
+   `(z − latents_mean) / latents_std` normalisation the target latents use.
+5. The encoded reference is packed unpatched (`[1, (h'/16)·(w'/16), 64]`) and the packed references
+   are concatenated **in list order** and prepended to the target noise:
+   `latent_model_input = cat([*reference_latents, latents], dim=1)`.
+
+The processor's own `smart_resize` runs on top of step 2 with `patch_size·merge_size = 32`, so for
+an image already sized to a multiple of 32 within the `[256², 4096²]` pixel budget it is a no-op —
+which is what makes the vision grid and the VAE grid line up (see below). A reference small enough
+to fall under `min_pixels` **is** enlarged by `smart_resize`, and the two grids then disagree; this
+port rejects that case with a typed error rather than silently mis-binding the blocks.
+
+### The text encoder reads the references (the Qwen3-VL vision tower is required)
+
+The condition images go through the **text encoder as well as** the VAE. `_get_qwen_prompt_embeds`
+builds the image-conditioned template
+
+```
+<|im_start|>system\n{SYSTEM}<|im_end|>\n
+<|im_start|>user\n<image1><|vision_start|><|image_pad|><|vision_end|>[ <imageN><|vision_start|><|image_pad|><|vision_end|>]*{prompt}<|im_end|>\n
+<|im_start|>assistant\n
+```
+
+(note the single leading space before `<image2>` onwards) and calls
+`processor(text=..., images=[...])`, so `pixel_values` and `image_grid_thw` reach
+`Qwen3VLForConditionalGeneration.forward`. That means the full VLM path runs:
+
+* `Qwen2VLImageProcessorFast` geometry — `patch_size 16`, `merge_size 2`, `temporal_patch_size 2`,
+  `mean = std = 0.5`, `min_pixels 65536`, `max_pixels 16777216`, bicubic;
+* the 27-layer Qwen3-VL ViT (`vision_config`: hidden 1152, 16 heads, MLP 4304,
+  `num_position_embeddings 2304` bilinearly resampled, 2-D rotary, 2×2 patch merger to
+  `out_hidden_size 4096`);
+* **DeepStack** — the ViT taps layers `[8, 16, 24]`, and those merged feature sets are added to the
+  visual-token rows after decoder layers 0, 1 and 2 of the language tower;
+* **interleaved M-RoPE** over the language tower (`mrope_section [24, 20, 20]`), which for a
+  text-only prompt collapses to the plain 1-D RoPE the text-to-image path already used — that
+  collapse is why the T2I path is bit-unchanged by this story.
+
+The hidden state taken is still the last decoder layer's output **before** the final RMSNorm, minus
+the system-prefix tokens.
+
+**What the vision tower does and does not reach.** The DiT overwrites every `<|image_pad|>` row of
+the joint sequence with the VAE latents (`joint_hidden_states[:, image_pad_mask] = hidden_states`),
+so the ViT features never reach the DiT directly. They reach it *indirectly and materially*: the
+language tower's attention lets every text token read the image rows, so the text conditioning the
+DiT does consume is a function of the reference pixels. Skipping the tower would therefore produce
+a structurally valid but wrongly-conditioned render, not a degraded one.
+
+### The joint sequence
+
+`img_mask` is the `<|image_pad|>` mask over the **VLM** sequence, with `target_tokens / 4` extra
+`True` slots appended for the target image. Each `True` slot stands for a **2×2 group of latent
+tokens**, so the DiT expands those positions four-fold
+(`repeat_interleave(img_mask, where(img_mask, 4, 1))`) and drops the packed latents into them. The
+resulting joint layout is
+
+```
+[text …] [ref 1 latents] [text …] [ref 2 latents] … [text …] [target latents]
+```
+
+i.e. each reference's latents sit **at the placeholder position the VLM reserved for it**, in the
+middle of the text, and the target's latents are appended last. `img_shapes` is
+`[(1, h'/16, w'/16) per reference in order, (1, H/16, W/16) for the target]`, and
+`build_token_metadata` checks that `sum(prod(shape))` equals the number of expanded image
+positions. This is the identity `(h'/32)·(w'/32) merged patches × 4 = (h'/16)·(w'/16)` latent
+tokens — the reason the two resizes have to agree.
+
+Block structure follows from `img_shapes`, **not** from runs of `True`: two adjacent references
+with no text between them stay two blocks, so they never attend to each other bidirectionally.
+Within the joint sequence:
+
+* attention is `(q_idx >= kv_idx) or same_image_block` — causal overall, bidirectional inside each
+  image block;
+* RoPE gives each image block a frame position frozen at the text cursor and a zero-centred
+  `(h, w)` grid, then advances the cursor by `max(h, w)`;
+* under `causal_condition`, text **and reference** tokens modulate from the extra `t = 0` row; only
+  the target tokens read the sampled timestep;
+* the velocity is sliced to the last `target_tokens` rows.
+
+`JointLayout` (`src/transformer.rs`) already models all of this; this story supplies the segments.
+
+### What this port does with all of that
+
+* `Conditioning::Reference { image, strength }` and `Conditioning::MultiReference { images }` are
+  both accepted and flattened, **in request order**, into one ordered reference list of 1–10
+  images. `strength` has no upstream meaning on this route and is refused unless it is `1.0`.
+* `Conditioning::Mask { image }` is refused (typed `Unsupported`) naming the upstream fact and the
+  workaround: pass the mask as an ordered reference and name it in the prompt.
+* With references present, `width`/`height` still come from the request (SceneWorks always sends
+  them); upstream's "derive from `image[-1]`" fallback is reproduced by
+  `reference_derived_size`, which callers may use to fill them.
+* Zero references on a request that carries a conditioning list, eleven or more references, an
+  empty or zero-dimension image, and a reference whose `smart_resize` grid disagrees with its VAE
+  grid are all typed, actionable refusals.
+
 ## Installable tiers (sc-24112)
 
 Qwen-Image 2.1 ships **pre-quantized**: a tier is a complete standalone snapshot in the layout above
@@ -66,10 +230,14 @@ whose weight-bearing components are already affine-quantized, produced offline b
 `convert::prequantize_turnkey` and loaded with no dense transient. `LoadSpec::quantize` selects a
 tier; it is a transform request only against a dense snapshot.
 
+**A tier is a whole-pipeline contract.** Selecting q4 runs q4 through every packable component.
+There is no per-component promotion, no `component_precision_floors` declaration and no override:
+`Tier::text_encoder_bits` is literally `Tier::transformer_bits`.
+
 | component | bf16 | q8 | q4 |
 |---|---|---|---|
 | `transformer/` (7.12 B params in 232 Linears) | dense bf16 | packed Q8, group 64 | packed Q4, group 64 |
-| `text_encoder/` Qwen3 language tower (6.95 B params in 252 decoder Linears) | dense bf16 | packed Q8, group 64 | **packed Q8**, group 64 |
+| `text_encoder/` Qwen3 language tower (6.95 B params in 252 decoder Linears) | dense bf16 | packed Q8, group 64 | packed Q4, group 64 |
 | `text_encoder/` token embedding (622 M) | dense | dense | dense |
 | `text_encoder/` `lm_head`, `model.visual.*` | dense, **not loaded** by this route | dense | dense |
 | `vae/` (338 M) | dense f32 | dense f32 | dense f32 |
@@ -81,11 +249,13 @@ Three decisions, each deliberate:
   a **7.57 B** tower: under `Sequential` the resident floor is `max(tower, DiT + VAE)`, so a dense
   tower would pin that floor at ~14.5 GiB at every tier and the Q4 tier would buy ~0.3 GiB over Q8.
   Reusing 2512's table here would have produced a tier that cannot do its job.
-* **The Q4 tier holds the tower at Q8** — declared through
-  `Capabilities::component_precision_floors`, never silent. That floor is a *prior* carried from
-  `mlx_gen_mage`'s measured Qwen-LM-tower sweep (a Q4 SwiGLU MLP collapses generation quality; Q8
-  attention + MLP holds), not a measurement of this model. Confirming or retiring it on real weights
-  belongs to the epic's terminal measurement story.
+* **No component precision floor.** An earlier revision held the tower at Q8 on the q4 tier, on
+  the strength of `mlx_gen_mage`'s measured Qwen-LM-tower sweep. That was **withdrawn**: it is a
+  prior from a different model, it minted a "q4" tier that was not q4, and it had to be carried as a
+  `component_precision_floors` declaration every caller then has to reason about. A tier that needs a
+  floor to be usable is a measurement result, not a default — and this route has no measurement. If
+  a real sweep later shows the q4 tower is unusable, the honest outcome is a narrower
+  `supported_quants`, not a q4 tier that quietly runs q8.
 * **Group size 64, uniformly.** A tier declares exactly one `quantization.group_size`, and the
   packed bit-width is derived from the packed shapes *at the group size the loader passes*, so a tier
   mixing group sizes would be decoded at the wrong width. A `Linear` narrower than 64 therefore stays
@@ -93,10 +263,19 @@ Three decisions, each deliberate:
   12288 and the tower's are 4096 / 12288), so in production the converter packs everything; only the
   miniature parity snapshot is partly dense.
 
+A **load-time** tier (a dense snapshot plus `LoadSpec::quantize`) is whole-pipeline or nothing: a
+geometry the single group size cannot cover is a typed refusal naming the widths, never a silently
+dense text encoder under a quantized label. The miniature parity snapshot is exactly such a geometry.
+
 The converted artefacts are **byte-reproducible** (keys are sorted before serialization and the
 config merge is deterministic) and each packed triple is **byte-identical to `mlx_rs::ops::quantize`**
-over the bf16 source — the same op the load-time quantizer runs. `tests/tiers.rs` pins both, and
-`tests/fixtures/tiers/` carries the committed miniature tiers the Candle backend reads.
+over the bf16 source — the same op the load-time quantizer runs. `tests/tiers.rs` pins both, plus a
+device-independent dequantization check against the dense weights, and `tests/fixtures/tiers/`
+carries the committed miniature tier weights the Candle backend reads.
+
+A snapshot's tier is read from its **packed code/scale shapes** as well as its `config.json` marker;
+a q4 label over q8 weights is a hard error, because such a snapshot renders perfectly well at q8 and
+nothing downstream would otherwise notice.
 
 ### Producing a tier
 
@@ -105,7 +284,10 @@ QWEN21_SRC=<dense snapshot> QWEN21_TIER=q4 QWEN21_DST=~/SceneWorks/qwen-image-2-
   cargo run --release --example qwen_image_2_1_prequant -p mlx-gen-qwen-image-2-1
 ```
 
-The example prints a SHA-256 manifest of everything it wrote.
+The example prints a SHA-256 manifest of everything it wrote **and writes it to
+`<tier>/SHA256SUMS`**. The production tiers are re-hosted at **`SceneWorks/qwen-image-2-1-mlx`**, one
+subdirectory per tier (`q8/`, `q4/`), each carrying that manifest — that is the repository the
+SceneWorks manifest half pins.
 
 ## Memory (sc-24112)
 
@@ -124,15 +306,23 @@ asset-facts + generic-headroom estimate path where the estimate safety margin ap
 copied from the 2512 route.
 
 `memory_strategy::admission_geometry` reports the envelope a consumer must gate on: the largest
-preset **area** (2400×1792, which is neither the widest preset nor the square default), the latent
-tokens it contributes, and the fact that each of up to 10 reference images adds a full block of image
-tokens to the joint sequence.
+preset **area** (2400×1792, which is neither the widest preset nor the square default), the 16 800
+latent tokens it contributes, and the fact that each of up to 10 reference images adds a further
+**4 096** tokens — `reference::prepare` fits every condition image to `OUTPUT_RESOLUTION` (1024²)
+before the vision tower and the VAE see it, so a reference costs the same whatever the target size.
+The worst-case joint sequence is therefore `256 + 16 800 + 10 × 4 096 = 58 016` tokens. References
+are **priced** by the memory contract, not refused; the 1..=10 bound and every per-image geometry
+check stay request-time refusals in `reference`.
 
 ## Deliberate divergences
 
 * No prefix KV cache: every step evaluates the full block-causal joint sequence (upstream's exact
   `QwenImage21AttnProcessor` prefill path). Upstream documents the cached and uncached paths as
-  equally valid but not bit-identical.
+  equally valid but not bit-identical. **On the reference route this is a real cost, not just a
+  numerical choice**: every condition image is fitted to `output_resolution` whatever the target
+  size, so ten references are ~41k prefix tokens that upstream encodes once and this port
+  re-encodes at every step. Reference-heavy requests scale with `steps × references` here where
+  upstream scales with `references + steps`.
 * Latents stay f32 between Euler steps (upstream rounds to bf16 each step).
 * The text tower runs f32 activations over bf16 weights (upstream: bf16 end to end).
 * Noise is MLX-seeded (`mlx.random.normal` under `key(seed)`), not torch-seeded.

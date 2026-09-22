@@ -18,7 +18,11 @@ use mlx_gen::{
 
 use crate::config::{SchedulerConfig, DEFAULT_STEPS, DEFAULT_TRUE_CFG, PRESETS, SIZE_MULTIPLE};
 use crate::loader;
-use crate::pipeline::{create_noise, decode_rgb, denoise, DenoiseInputs};
+use crate::pipeline::{
+    create_noise, decode_rgb, denoise, encode_references, joint_layout, text_rows, DenoiseInputs,
+    ReferenceConditioning,
+};
+use crate::reference::{collect_references, prepare_references};
 use crate::scheduler;
 use crate::text_encoder::{system_prompt_drop_count, QwenImage21TextEncoder};
 use crate::transformer::QwenImage21Transformer;
@@ -55,9 +59,16 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: true,
-            // Text-to-image only in this story; the joint layout already models condition images
-            // for the reference/edit route, which will advertise `MultiReference` when it lands.
-            conditioning: vec![],
+            // Reference conditioning (sc-24110). `Reference` and `MultiReference` reach the same
+            // upstream call — one ordered list of one to ten condition images — so both kinds are
+            // advertised and flattened in request order, matching the seam the 2512 edit provider
+            // already exposes to SceneWorks routing. `Mask` is deliberately **not** advertised:
+            // upstream has no mask input (see UPSTREAM.md), and a mask travels as an ordinary
+            // extra reference the prompt names.
+            conditioning: vec![
+                gen_core::ConditioningKind::Reference,
+                gen_core::ConditioningKind::MultiReference,
+            ],
             supports_lora: false,
             supports_lokr: false,
             samplers: curated_sampler_names(),
@@ -69,9 +80,8 @@ pub fn descriptor() -> ModelDescriptor {
             // Both affine tiers are **installable** as pre-quantized snapshots ([`crate::convert`])
             // and are also reachable by quantizing a dense snapshot at load.
             supported_quants: &[Quant::Q4, Quant::Q8],
-            // The Q4 tier holds the Qwen3 language tower at Q8 — declared, never silent, so a
-            // caller's effective-tier label and memory evidence carry the substitution.
-            component_precision_floors: crate::quant::COMPONENT_PRECISION_FLOORS,
+            // No `component_precision_floors`: a tier is a whole-pipeline contract, so every
+            // packable component runs the tier the caller selected (`crate::quant`).
             requires_sigma_shift: true,
             supports_sequential_offload: true,
             // Both sides must be multiples of 32 px (16× VAE × 2×2 vision slot).
@@ -168,9 +178,13 @@ fn build_residency(spec: &LoadSpec) -> Result<Residency<QwenImage21TextEncoder, 
 /// The Qwen3 language tower at the tier's declared text-encoder width.
 ///
 /// A packed tier loads packed. A dense snapshot with a Q4/Q8 request is quantized here to
-/// [`crate::quant::Tier::text_encoder_bits`] — which is **Q8 at both tiers**
-/// ([`crate::quant::TEXT_ENCODER_Q4_FLOOR`]) — so a load-time tier and the installable tier of the
-/// same name hold the same resident layout rather than two different ones.
+/// [`crate::quant::Tier::text_encoder_bits`] — which is the selected tier, because a tier is a
+/// whole-pipeline contract — so a load-time tier and the installable tier of the same name hold the
+/// same resident layout rather than two different ones.
+///
+/// A geometry the single declared group size cannot cover is a **typed refusal**, not a silent
+/// dense tower: serving a "q4" load whose text encoder is secretly bf16 is the mixed-tier failure
+/// this route does not have.
 fn load_text_encoder(spec: &LoadSpec) -> Result<QwenImage21TextEncoder> {
     let root = loader::snapshot_root(&spec.weights)?;
     let mut encoder = loader::load_text_encoder(root)?;
@@ -178,7 +192,17 @@ fn load_text_encoder(spec: &LoadSpec) -> Result<QwenImage21TextEncoder> {
         if let Some(bits) = crate::quant::Tier::from_selected(spec.quantize)
             .and_then(crate::quant::Tier::text_encoder_bits)
         {
-            encoder.quantize(bits)?;
+            if !encoder.quantize(bits)? {
+                return Err(Error::Msg(format!(
+                    "qwen_image_2_1: this snapshot's Qwen3 tower is {} wide with a {} SwiGLU \
+                     intermediate, and a tier is written at group {}; a load-time Q{bits} tier \
+                     would leave the tower dense, which is not the tier that was asked for. Point \
+                     at a pre-quantized snapshot, or drop the quantize request.",
+                    encoder.hidden_size(),
+                    encoder.intermediate_size(),
+                    crate::quant::GROUP_SIZE,
+                )));
+            }
         }
     }
     Ok(encoder)
@@ -265,12 +289,30 @@ impl QwenImage21 {
             false,
             on_progress,
             |te: &QwenImage21TextEncoder| {
-                let pos = te.encode_prompt(&self.tokenizer, &req.prompt, drop)?;
+                // The ordered reference list, host-preprocessed against the snapshot's own
+                // Qwen3-VL processor geometry. Empty ⇒ the text-to-image route, unchanged.
+                let images = collect_references(req)?;
+                let references = if images.is_empty() {
+                    Vec::new()
+                } else {
+                    let vision = te.vision_config().ok_or_else(|| {
+                        Error::Unsupported(
+                            "qwen_image_2_1: reference conditioning needs the snapshot's Qwen3-VL \
+                             vision tower (`text_encoder/config.json` `vision_config` + \
+                             `model.visual.*`), which this snapshot does not carry"
+                                .into(),
+                        )
+                    })?;
+                    prepare_references(&images, vision)?
+                };
+                let pos =
+                    te.encode_conditioning(&self.tokenizer, &req.prompt, drop, &references)?;
                 let neg = if params.use_negative {
-                    Some(te.encode_prompt(
+                    Some(te.encode_conditioning(
                         &self.tokenizer,
                         req.negative_prompt.as_deref().unwrap_or(""),
                         drop,
+                        &references,
                     )?)
                 } else {
                     None
@@ -278,14 +320,35 @@ impl QwenImage21 {
                 // MLX is lazy: force the conditioning while the encoder is alive, so a Sequential
                 // drop cannot leave an unevaluated graph pointing at freed weights.
                 match &neg {
-                    Some(neg) => mlx_rs::transforms::eval([&pos, neg])?,
-                    None => mlx_rs::transforms::eval([&pos])?,
+                    Some(neg) => mlx_rs::transforms::eval([&pos.hidden, &neg.hidden])?,
+                    None => mlx_rs::transforms::eval([&pos.hidden])?,
                 }
-                Ok((pos, neg))
+                Ok((pos, neg, references))
             },
             |_| Ok(()),
-            |heavy, (pos, neg), on_progress| {
+            |heavy, (pos, neg, references), on_progress| {
                 let channels = heavy.transformer.config().in_channels;
+                // The joint layout + the condition latents: both branches share one reference
+                // encode, but a different prompt is a different text length, hence two layouts.
+                let reference_latents = encode_references(&heavy.vae, &references)?;
+                let pos_layout =
+                    joint_layout(&pos.image_pad_mask, &references, req.width, req.height)?;
+                let neg_layout = neg
+                    .as_ref()
+                    .map(|neg| {
+                        joint_layout(&neg.image_pad_mask, &references, req.width, req.height)
+                    })
+                    .transpose()?;
+                let pos_text = text_rows(&pos.hidden, &pos.image_pad_mask)?;
+                let neg_text = neg
+                    .as_ref()
+                    .map(|neg| text_rows(&neg.hidden, &neg.image_pad_mask))
+                    .transpose()?;
+                let conditioning = (!references.is_empty()).then(|| ReferenceConditioning {
+                    latents: &reference_latents,
+                    layout: &pos_layout,
+                    negative_layout: neg_layout.as_ref(),
+                });
                 let mut images = Vec::with_capacity(req.count as usize);
                 for i in 0..req.count {
                     let seed = params.base_seed.wrapping_add(i as u64);
@@ -295,14 +358,19 @@ impl QwenImage21 {
                             transformer: &heavy.transformer,
                             sigmas: &params.sigmas,
                             latents,
-                            prompt_embeds: &pos,
-                            negative_embeds: neg.as_ref(),
+                            prompt_embeds: &pos_text,
+                            negative_embeds: neg_text.as_ref(),
                             true_cfg_scale: params.true_cfg,
                             width: req.width,
                             height: req.height,
                             sampler: req.sampler.as_deref(),
                             seed,
                             cancel: &req.cancel,
+                            references: conditioning.as_ref().map(|c| ReferenceConditioning {
+                                latents: c.latents,
+                                layout: c.layout,
+                                negative_layout: c.negative_layout,
+                            }),
                         },
                         on_progress,
                     )?;
@@ -329,6 +397,10 @@ impl QwenImage21 {
 /// negative/guidance support, sampler/scheduler membership, finiteness) plus the family's own
 /// `steps >= 2` (the terminal-sigma stretch is undefined at one step).
 pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<()> {
+    // The reference list first, so a caller sees the actionable message (the `Mask` workaround,
+    // the one-to-ten window) rather than the shared floor's generic "unsupported conditioning",
+    // and so a bad count is refused before any weight is touched.
+    collect_references(req)?;
     caps.validate_request(MODEL_ID, req)?;
     if req.prompt.trim().is_empty() && req.negative_prompt.is_none() {
         // Upstream renders an empty prompt as a single space; accept it, but a whitespace-only
@@ -389,7 +461,18 @@ mod tests {
             SizeFloor::RangeCheckedOnGrid { multiple: 32 }
         );
         assert!(d.capabilities.supports_true_cfg);
-        assert!(d.capabilities.conditioning.is_empty());
+        assert_eq!(
+            d.capabilities.conditioning,
+            vec![
+                gen_core::ConditioningKind::Reference,
+                gen_core::ConditioningKind::MultiReference,
+            ],
+            "the reference/edit route is the same upstream call as text-to-image"
+        );
+        assert!(
+            !d.capabilities.accepts(gen_core::ConditioningKind::Mask),
+            "upstream has no mask input; a mask travels as an ordinary extra reference"
+        );
         assert_eq!(d.denoiser_output_latent_space.map(|s| s.channels), Some(64));
         assert!(gen_core::registry::model_descriptor_errors(&d).is_empty());
     }
@@ -424,6 +507,44 @@ mod tests {
         r.prompt = "   ".into();
         let err = validate_request(&caps, &r).unwrap_err().to_string();
         assert!(err.contains("prompt is empty"), "{err}");
+    }
+
+    #[test]
+    fn reference_shapes_are_refused_at_validate_before_any_weight_loads() {
+        use mlx_gen::gen_core::{Conditioning, Image};
+
+        let caps = descriptor().capabilities;
+        let image = |n: u32| Image {
+            width: n,
+            height: n,
+            pixels: vec![0; (n * n * 3) as usize],
+        };
+        let mut r = req(2048, 2048);
+        assert!(
+            validate_request(&caps, &r).is_ok(),
+            "no conditioning is T2I"
+        );
+
+        r.conditioning = vec![Conditioning::MultiReference {
+            images: (0..11).map(|_| image(8)).collect(),
+        }];
+        let err = validate_request(&caps, &r).unwrap_err().to_string();
+        assert!(err.contains("at most 10"), "{err}");
+
+        // The `Mask` refusal must be this route's actionable message, not the shared floor's
+        // generic "unsupported conditioning" — which is why the reference check runs first.
+        r.conditioning = vec![Conditioning::Mask { image: image(8) }];
+        let err = validate_request(&caps, &r).unwrap_err().to_string();
+        assert!(err.contains("no mask input"), "{err}");
+        assert!(err.contains("extra reference"), "{err}");
+
+        r.conditioning = vec![Conditioning::MultiReference {
+            images: (0..10).map(|_| image(8)).collect(),
+        }];
+        assert!(
+            validate_request(&caps, &r).is_ok(),
+            "ten references is the documented boundary"
+        );
     }
 
     #[test]

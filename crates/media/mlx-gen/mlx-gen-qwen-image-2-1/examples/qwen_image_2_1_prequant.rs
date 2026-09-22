@@ -93,13 +93,21 @@ fn main() {
         started.elapsed().as_secs_f32()
     );
 
+    // The manifest is written BESIDE the tier as well as printed: it is what binds a published
+    // artefact to its bytes, and a digest that only ever existed in a log is not a binding.
+    // `SHA256SUMS` is excluded from its own listing (it does not exist yet when the tree is walked).
     let mut total = 0_u64;
+    let mut manifest = String::new();
     for (rel, digest) in digest_tree(&dst) {
         total += std::fs::metadata(dst.join(&rel))
             .map(|m| m.len())
             .unwrap_or(0);
         println!("{digest}  {rel}");
+        manifest.push_str(&format!("{digest}  {rel}\n"));
     }
+    let manifest_path = dst.join("SHA256SUMS");
+    std::fs::write(&manifest_path, manifest).expect("write SHA256SUMS beside the tier");
+    eprintln!("[prequant] manifest written to {}", manifest_path.display());
     eprintln!(
         "[prequant] {} tier total {:.2} GiB",
         tier.dir_name(),

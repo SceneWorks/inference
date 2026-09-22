@@ -20,6 +20,13 @@ mlx-rs = { workspace = true }
 # block is REUSED from Z-Image's parity-proven Qwen3 port (`text_encoder::EncoderLayer`) rather
 # than ported a third time. Same lane, dimension-parametric, packed-detect Q4/Q8 for free.
 mlx-gen-z-image = { path = "../mlx-gen-z-image" }
+# sc-24110: the reference/edit route runs condition images through the Qwen3-VL VISION tower and
+# DeepStack, which the worker graph already carries — `models::Qwen3VLVisionModel`, the shared
+# `models::deepstack` splice/M-RoPE helpers and `image::Qwen35ImageProcessor` (the same
+# patch-16/merge-2 processor geometry `Qwen/Qwen-Image-2.1`'s `processor/` declares). The
+# `mlx-gen-* -> mlx-llm` direction is the documented one (see `mlx-gen-ltx`); the pin lives in the
+# root workspace so cargo unifies ONE mlx-llm across the worker graph.
+mlx-llm = { workspace = true }
 # `config.json` readers for the four snapshot components (transformer / text_encoder / vae /
 # scheduler): the loader is config-driven so the tiny parity snapshot and the production snapshot
 # go through one code path.

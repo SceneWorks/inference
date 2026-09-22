@@ -23,13 +23,12 @@ use candle_gen::gen_core::{
     MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
     MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
     MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, MemoryStrategySupport, MemoryWindowMaterialization, Quant,
-    ResidentRequestMemory, WeightsSource,
+    MemoryStrategy, MemoryStrategySupport, MemoryWindowMaterialization, ResidentRequestMemory,
+    WeightsSource,
 };
 
 use crate::config::MAX_REFERENCE_IMAGES;
 use crate::pipeline::DECODE_OVERLAP;
-use crate::quant::COMPONENT_PRECISION_FLOORS;
 use crate::MODEL_ID;
 
 /// Content fingerprint of this contract. Distinct from the MLX twin's: the two backends never share
@@ -62,11 +61,12 @@ pub struct AdmissionGeometry {
     pub max_target_image_tokens: u64,
     /// Most reference images the joint layout accepts.
     pub max_reference_images: u32,
-    /// Latent tokens **one** reference at the largest-area preset adds — references are extra image
-    /// token blocks, so there is no separate reference budget.
+    /// Latent tokens **one** reference adds — [`REFERENCE_FIT_TOKENS`], the fitted 1024² grid every
+    /// condition image is resized to, **not** the target's own token count. References are extra
+    /// image-token blocks, so there is no separate reference budget.
     pub tokens_per_max_reference: u64,
     /// Worst-case joint sequence: the largest-area target plus [`Self::max_reference_images`]
-    /// references of the same size, plus the table's conditioning tokens.
+    /// fitted references, plus the table's conditioning tokens.
     pub max_joint_tokens: u64,
     /// Pixels one latent token covers on each axis.
     pub pixels_per_token: u64,
@@ -77,6 +77,17 @@ pub struct AdmissionGeometry {
 /// Conditioning tokens the published envelope assumes — a full 256-token prompt through the T2I
 /// template, matching the MLX twin's table.
 pub const TABLE_CONDITIONING_TOKENS: u64 = 256;
+
+/// Latent tokens **one reference image** contributes to the joint sequence.
+///
+/// A reference is **not** admitted at the request's own geometry: `reference::prepare` fits every
+/// condition image to [`crate::config::OUTPUT_RESOLUTION`] (upstream's `output_resolution` default)
+/// before it reaches the vision tower and the VAE, so its latent grid is `(1024/16)² = 4096` tokens
+/// whatever the target size. Pricing references at the target's own token count overstates the
+/// worst-case joint sequence by more than 3x at the largest preset — a consumer refusing requests
+/// that would in fact have fitted.
+pub const REFERENCE_FIT_TOKENS: u64 = (crate::config::OUTPUT_RESOLUTION as u64 / PIXELS_PER_TOKEN)
+    * (crate::config::OUTPUT_RESOLUTION as u64 / PIXELS_PER_TOKEN);
 
 /// Latent tokens one image of `width × height` contributes.
 pub const fn image_tokens(width: u32, height: u32) -> u64 {
@@ -102,10 +113,10 @@ pub fn admission_geometry() -> AdmissionGeometry {
         max_preset_area: widest.width as u64 * widest.height as u64,
         max_target_image_tokens: target_tokens,
         max_reference_images: MAX_REFERENCE_IMAGES as u32,
-        tokens_per_max_reference: target_tokens,
+        tokens_per_max_reference: REFERENCE_FIT_TOKENS,
         max_joint_tokens: TABLE_CONDITIONING_TOKENS
             + target_tokens
-            + MAX_REFERENCE_IMAGES as u64 * target_tokens,
+            + MAX_REFERENCE_IMAGES as u64 * REFERENCE_FIT_TOKENS,
         pixels_per_token: PIXELS_PER_TOKEN,
         max_batch: crate::descriptor().capabilities.max_count,
     }
@@ -215,23 +226,15 @@ fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
     }
 }
 
-/// The floors that actually apply to one selected tier. The descriptor publishes the whole table; a
-/// Q8 or dense load promotes nothing, so its receipt must be empty.
-pub(crate) fn active_floors(
-    selected: Option<Quant>,
-) -> &'static [gen_core::ComponentPrecisionFloor] {
-    match selected {
-        Some(Quant::Q4) => COMPONENT_PRECISION_FLOORS,
-        _ => &[],
-    }
-}
-
-/// The numeric tier this generator actually runs, carrying the declared text-encoder floor.
+/// The numeric tier this generator actually runs.
+///
+/// `component_precision_floors` is **empty and stays empty**: a tier is a whole-pipeline contract
+/// here, so no component is resident above the selected width.
 fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
     MemoryNumericTier {
         precision: spec.precision,
         quant: spec.quantize,
-        component_precision_floors: active_floors(spec.quantize),
+        component_precision_floors: &[],
     }
 }
 
@@ -366,10 +369,15 @@ pub fn safety_check(
                 context.mode
             )));
         }
-        if context.geometry.reference_count != 0 || context.has_reference {
+        // References are PRICED, not refused: sc-24110 advertises Reference/MultiReference on this
+        // route, and each condition image is an extra joint-sequence block worth
+        // [`REFERENCE_FIT_TOKENS`]. The only reference gate here is the count the joint layout can
+        // express; per-image validation belongs to `crate::reference`, so a bad reference stays a
+        // request refusal rather than becoming a memory refusal.
+        if context.geometry.reference_count as usize > MAX_REFERENCE_IMAGES {
             return Err(gen_core::Error::Unsupported(format!(
-                "{MODEL_ID}: reference conditioning is not advertised on this route yet; got {} \
-                 references (the joint layout models up to {MAX_REFERENCE_IMAGES})",
+                "{MODEL_ID}: {} reference images exceed the {MAX_REFERENCE_IMAGES} the joint layout \
+                 can express",
                 context.geometry.reference_count
             )));
         }
@@ -470,6 +478,7 @@ pub const MEMORY_BEHAVIOR_REGISTRATION: gen_core::MemoryBehaviorRegistration =
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::gen_core::Quant;
 
     fn spec() -> LoadSpec {
         LoadSpec::new(WeightsSource::Dir("/qwen-image-2-1".into()))
@@ -556,18 +565,22 @@ mod tests {
             .is_empty());
     }
 
+    /// No tier promotes any component, so no tier's receipt carries a floor.
+    ///
+    /// *Mutation that reds this:* returning a non-empty `component_precision_floors` from
+    /// `loaded_tier` for any selection.
     #[test]
-    fn the_q4_text_encoder_floor_reaches_the_numeric_tier_only_at_q4() {
-        assert!(loaded_tier(&spec()).component_precision_floors.is_empty());
-        assert!(loaded_tier(&spec().with_quant(Quant::Q8))
-            .component_precision_floors
-            .is_empty());
-        let q4 = loaded_tier(&spec().with_quant(Quant::Q4));
-        assert_eq!(q4.component_precision_floors.len(), 1);
-        assert_eq!(
-            q4.component_precision_floors[0].resident_tier,
-            crate::quant::TEXT_ENCODER_Q4_FLOOR
-        );
+    fn no_tier_records_a_component_precision_floor() {
+        for quant in [None, Some(Quant::Q8), Some(Quant::Q4)] {
+            let mut spec = spec();
+            if let Some(quant) = quant {
+                spec = spec.with_quant(quant);
+            }
+            assert!(
+                loaded_tier(&spec).component_precision_floors.is_empty(),
+                "{quant:?}: a whole-pipeline tier promotes nothing"
+            );
+        }
     }
 
     #[test]
@@ -580,13 +593,16 @@ mod tests {
         assert!(g.max_preset_area > 2048 * 2048);
         assert_eq!(g.max_target_image_tokens, 150 * 112);
         assert_eq!(g.max_reference_images, 10);
-        assert_eq!(g.tokens_per_max_reference, 150 * 112);
+        // A reference is FITTED to 1024² before it reaches the tower, so it is 64x64 tokens — NOT
+        // the target's 150x112. *Mutation that reds this:* `tokens_per_max_reference: target_tokens`.
+        assert_eq!(g.tokens_per_max_reference, 64 * 64);
         assert_eq!(g.pixels_per_token, 16);
         assert_eq!(g.max_batch, 8);
         assert_eq!(
             g.max_joint_tokens,
-            TABLE_CONDITIONING_TOKENS + 11 * 150 * 112
+            TABLE_CONDITIONING_TOKENS + 150 * 112 + 10 * 64 * 64
         );
+        assert_eq!(g.max_joint_tokens, 58_016, "256 + 16_800 + 10 x 4_096");
     }
 
     /// The Candle envelope must agree with the MLX twin's on every axis: the geometry a consumer
@@ -601,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reference_bearing_or_pid_route_is_refused_rather_than_recorded() {
+    fn references_are_priced_and_only_pid_tier_and_over_count_are_refused() {
         let spec = spec();
         let contract = weights_free_memory_strategy_contract(MODEL_ID, &spec).unwrap();
         let fixture = registered_valid_fixture(&spec, &contract, MemoryStrategy::StagedResidency)
@@ -613,10 +629,22 @@ mod tests {
             MemorySafetyDecision::Accept
         );
 
-        let mut referenced = fixture.context.clone();
-        referenced.geometry.reference_count = 1;
+        // References are priced, not refused — up to the count the joint layout can express.
+        for count in [1_u32, MAX_REFERENCE_IMAGES as u32] {
+            let mut referenced = fixture.context.clone();
+            referenced.geometry.reference_count = count;
+            referenced.has_reference = true;
+            assert_eq!(
+                safety_check(&spec, &contract, &referenced),
+                MemorySafetyDecision::Accept,
+                "{count} references must be admitted and priced"
+            );
+        }
+        let mut too_many = fixture.context.clone();
+        too_many.geometry.reference_count = MAX_REFERENCE_IMAGES as u32 + 1;
+        too_many.has_reference = true;
         assert!(matches!(
-            safety_check(&spec, &contract, &referenced),
+            safety_check(&spec, &contract, &too_many),
             MemorySafetyDecision::Reject { .. }
         ));
 
@@ -715,6 +743,11 @@ mod tests {
             8 * 8 * 4 + 8 * 4,
             "only the float scales follow the compute width"
         );
-        assert_eq!(crate::quant::Tier::Q4.text_encoder_bits(), Some(8));
+        // A tier is one width: the q4 tier's tower is q4, not a promoted q8.
+        assert_eq!(crate::quant::Tier::Q4.text_encoder_bits(), Some(4));
+        assert_eq!(
+            crate::quant::Tier::Q4.text_encoder_bits(),
+            crate::quant::Tier::Q4.transformer_bits()
+        );
     }
 }

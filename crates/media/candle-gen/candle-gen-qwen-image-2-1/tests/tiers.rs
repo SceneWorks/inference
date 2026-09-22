@@ -23,7 +23,7 @@ use candle_gen::gen_core::{
     GenerationMemory, GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy,
     OffloadPolicy as Policy, Quant, WeightsSource,
 };
-use candle_gen_qwen_image_2_1::quant::{installed_tier, resolve_requested_tier, Tier};
+use candle_gen_qwen_image_2_1::quant::{installed_tier, resolve_requested_tier, Tier, GROUP_SIZE};
 
 use crate::common::{fixtures, tiny_snapshot};
 
@@ -52,15 +52,44 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
-/// A complete `tier` snapshot under `dir`: the committed packed `transformer/` + `text_encoder/`,
-/// plus the dense `vae/`, `processor/`, `scheduler/` and `model_index.json` the converter copies
-/// through unchanged.
+/// `tiny-snapshot/<component>/config.json` + `{"quantization": {bits, group_size}}` — the same
+/// composition `mlx_gen::quant::write_quantized_config` performs.
+///
+/// The fixture deliberately ships **no** `config.json`: a packed component's config is the source
+/// config plus a marker, so committing it would couple these fixtures to every unrelated edit of
+/// `tiny-snapshot/*/config.json` (sc-24110 edits exactly that).
+fn composed_marker_config(component: &str, bits: i64) -> String {
+    let source = tiny_snapshot().join(component).join("config.json");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&source).expect("source config"))
+            .expect("valid json");
+    value["quantization"] = serde_json::json!({ "bits": bits, "group_size": GROUP_SIZE });
+    serde_json::to_string_pretty(&value).expect("serializable")
+}
+
+/// A complete `tier` snapshot under `dir`: the committed packed `model.safetensors` of
+/// `transformer/` + `text_encoder/` with a composed marker config, plus the dense `vae/`,
+/// `processor/`, `scheduler/` and `model_index.json` the converter copies through unchanged.
 fn compose_tier(dir: &Path, tier: Tier) -> PathBuf {
     let out = dir.join(tier.dir_name());
     std::fs::create_dir_all(&out).unwrap();
     let packed = fixtures().join("tiers").join(tier.dir_name());
-    for component in ["transformer", "text_encoder"] {
-        copy_dir(&packed.join(component), &out.join(component));
+    for (component, bits) in [
+        ("transformer", tier.transformer_bits().unwrap()),
+        ("text_encoder", tier.text_encoder_bits().unwrap()),
+    ] {
+        let dst = out.join(component);
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::copy(
+            packed.join(component).join("model.safetensors"),
+            dst.join("model.safetensors"),
+        )
+        .unwrap();
+        std::fs::write(
+            dst.join("config.json"),
+            composed_marker_config(component, bits),
+        )
+        .unwrap();
     }
     for component in ["vae", "processor", "scheduler"] {
         let src = tiny_snapshot().join(component);
@@ -172,6 +201,11 @@ fn the_fixture_tiers_pack_both_the_dit_and_the_tower() {
                 ],
             ),
         ] {
+            assert!(
+                !dir.join(component).join("config.json").exists(),
+                "{}/{component}/config.json must NOT be committed — it is composed at test time",
+                tier.dir_name()
+            );
             let bytes = std::fs::read(dir.join(component).join("model.safetensors")).unwrap();
             let parsed = safetensors::SafeTensors::deserialize(&bytes).unwrap();
             let mut packed: Vec<String> = parsed
@@ -198,6 +232,66 @@ fn the_fixture_tiers_pack_both_the_dit_and_the_tower() {
                 );
             }
         }
+    }
+}
+
+/// **The q4 tier's tower is a q4 artefact**, not a q8 one carried under a q4 label.
+///
+/// An earlier revision of this story held the tower at Q8 on the q4 tier and asserted the two
+/// artefacts were IDENTICAL. That is the inverse of the property that matters: a tier is a
+/// whole-pipeline contract.
+///
+/// *Mutation that reds this:* `Tier::text_encoder_bits` returning `Some(8)` for Q4.
+#[test]
+fn the_q4_tower_is_a_q4_artefact_not_the_q8_one() {
+    let q8 = fixtures().join("tiers/q8/text_encoder/model.safetensors");
+    let q4 = fixtures().join("tiers/q4/text_encoder/model.safetensors");
+    assert_ne!(
+        std::fs::read(&q8).unwrap(),
+        std::fs::read(&q4).unwrap(),
+        "an identical tower artefact would mean the q4 tier runs a q8 text encoder"
+    );
+    assert!(
+        std::fs::metadata(&q4).unwrap().len() < std::fs::metadata(&q8).unwrap().len(),
+        "the q4 tower must be the smaller artefact"
+    );
+    // And the codes really are half as wide: `[out, in·bits/32]`.
+    let base = "model.language_model.layers.0.mlp.down_proj.weight";
+    let width = |path: &Path| {
+        let bytes = std::fs::read(path).unwrap();
+        safetensors::SafeTensors::deserialize(&bytes)
+            .unwrap()
+            .tensor(base)
+            .unwrap()
+            .shape()[1]
+    };
+    assert_eq!(
+        width(&q4) * 2,
+        width(&q8),
+        "q4 codes are half the width of q8's"
+    );
+
+    // ...and the committed artefact matches what the TIER TABLE says its tower should be. Without
+    // this the test would pin the fixture without pinning the contract, and a code change that
+    // re-floored the tower would pass here until someone regenerated the fixture.
+    for (tier, path) in [(Tier::Q8, &q8), (Tier::Q4, &q4)] {
+        let bytes = std::fs::read(path).unwrap();
+        let parsed = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+        let wq = parsed.tensor(base).unwrap().shape().to_vec();
+        let scales = parsed
+            .tensor("model.language_model.layers.0.mlp.down_proj.scales")
+            .unwrap()
+            .shape()
+            .to_vec();
+        // `[out, in/group]` scales ⇒ in = cols·group; `[out, in·bits/32]` codes ⇒ bits = cols·32/in.
+        let derived = (wq[1] * 32 / (scales[1] * GROUP_SIZE)) as i64;
+        assert_eq!(
+            Some(derived),
+            tier.text_encoder_bits(),
+            "{}: the committed tower is Q{derived}, but the tier table says {:?}",
+            tier.dir_name(),
+            tier.text_encoder_bits()
+        );
     }
 }
 
@@ -237,16 +331,14 @@ fn a_composed_tier_self_reports_and_resolves_its_own_label() {
 fn the_descriptor_advertises_what_is_actually_installable() {
     let caps = candle_gen_qwen_image_2_1::descriptor().capabilities;
     assert_eq!(caps.supported_quants, &[Quant::Q4, Quant::Q8]);
-    assert_eq!(
-        caps.component_precision_floors,
-        candle_gen_qwen_image_2_1::COMPONENT_PRECISION_FLOORS
-    );
-    assert_eq!(caps.component_precision_floors.len(), 1);
-    assert_eq!(
-        caps.component_precision_floors[0].resident_tier,
-        Quant::Q8,
-        "the Q4 tier holds the Qwen3 tower at Q8"
-    );
+    // **A tier is a whole-pipeline contract**: nothing is resident above the selected width, so
+    // there is no floor to declare.
+    //
+    // *Mutation that reds this:* reinstating a `component_precision_floors` table on the descriptor.
+    assert!(caps.component_precision_floors.is_empty());
+    for tier in [Tier::Q8, Tier::Q4] {
+        assert_eq!(tier.text_encoder_bits(), tier.transformer_bits());
+    }
 
     // And the load path honours exactly that: each tier loads under its own label only.
     let tmp = tempfile::tempdir().unwrap();
@@ -282,6 +374,38 @@ fn the_descriptor_advertises_what_is_actually_installable() {
     assert!(err.contains("on-the-fly"), "{err}");
 }
 
+/// **A mislabelled tier is caught by reading the weights, not the label.**
+///
+/// Relabelling the q8 tier as q4 produces a snapshot that loads, renders, and passes a q4-vs-bf16
+/// parity bar (it renders exactly as well as q8 does) and a size-monotonicity check (it is the same
+/// size as q8). Nothing downstream notices — so the check has to be against the packed code/scale
+/// shapes.
+///
+/// *Mutation that reds this:* dropping the derived-vs-declared comparison from
+/// `quant::installed_tier`.
+#[test]
+fn a_mislabelled_tier_is_refused_by_reading_the_packed_shapes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = compose_tier(tmp.path(), Tier::Q8);
+    for component in ["transformer", "text_encoder"] {
+        std::fs::write(
+            root.join(component).join("config.json"),
+            composed_marker_config(component, 4),
+        )
+        .unwrap();
+    }
+    let err = installed_tier(&root)
+        .expect_err("a q4 label over q8 weights must be refused")
+        .to_string();
+    assert!(err.contains("declares Q4"), "{err}");
+    assert!(err.contains("packed weights are Q8"), "{err}");
+
+    assert!(candle_gen_qwen_image_2_1::provider_registry()
+        .unwrap()
+        .load(ID, &spec_for(&root, Some(Quant::Q4), Policy::Resident))
+        .is_err());
+}
+
 /// A packed tier loads through the production catalog path and renders. Both the DiT **and** the
 /// Qwen3 tower are packed in an installed tier, so this exercises the packed-detect seam on both.
 #[test]
@@ -294,12 +418,27 @@ fn packed_tiers_reload_and_render_within_the_declared_bars() {
     for (label, root, quant) in tier_cases(tmp.path()).into_iter().skip(1) {
         let packed = render(&spec_for(&root, quant, Policy::Resident), &req);
         assert_eq!((packed.width, packed.height), (EDGE, EDGE));
-        report(&format!("{label} vs bf16"), &packed, &dense, 64.0, 8.0);
+        // Q8's bars are tight enough that a scales/biases swap in the packed loader trips BOTH of
+        // them rather than only the max; Q4's are looser because four bits genuinely move pixels.
+        let (max_bound, mean_bound) = if label == "q8" {
+            (16.0, 1.0)
+        } else {
+            (64.0, 8.0)
+        };
+        report(
+            &format!("{label} vs bf16"),
+            &packed,
+            &dense,
+            max_bound,
+            mean_bound,
+        );
         mean_by_tier.push(pixel_errors(&packed, &dense).1);
     }
+    // STRICT: equality would mean the two tiers rendered identically, which is exactly what a
+    // mislabelled artefact (q4's config over q8's weights) looks like from here.
     assert!(
-        mean_by_tier[1] >= mean_by_tier[0],
-        "Q4 ({:.4}) must not be closer to bf16 than Q8 ({:.4})",
+        mean_by_tier[1] > mean_by_tier[0],
+        "Q4 ({:.4}) must be strictly further from bf16 than Q8 ({:.4})",
         mean_by_tier[1],
         mean_by_tier[0]
     );
@@ -390,9 +529,11 @@ fn the_contract_prices_each_installed_tier_from_its_own_inventory() {
         q4.transformer_bytes < q8.transformer_bytes,
         "the packed Q4 DiT must be cheaper than the Q8 one"
     );
-    assert_eq!(
-        q4.conditioning_bytes, q8.conditioning_bytes,
-        "both packed tiers hold the tower at the declared Q8 floor"
+    assert!(
+        q4.conditioning_bytes < q8.conditioning_bytes,
+        "a q4 tier prices a q4 tower ({} must be below {})",
+        q4.conditioning_bytes,
+        q8.conditioning_bytes
     );
     assert_eq!(
         q4.decoder_bytes, dense.decoder_bytes,
@@ -416,11 +557,23 @@ fn the_admission_envelope_is_reported_for_the_consumer_contract() {
         g.max_reference_images,
         candle_gen_qwen_image_2_1::MAX_REFERENCE_IMAGES as u32
     );
-    assert_eq!(g.tokens_per_max_reference, g.max_target_image_tokens);
+    // A reference is FITTED to `OUTPUT_RESOLUTION` (1024) before the vision tower and the VAE see
+    // it, so it is 64x64 latent tokens whatever the target size — NOT the target's 150x112.
+    //
+    // *Mutation that reds this:* `tokens_per_max_reference: target_tokens`, which overstates the
+    // worst-case joint sequence by 3.4x and would have a consumer refuse requests that do fit.
+    assert_eq!(
+        g.tokens_per_max_reference,
+        candle_gen_qwen_image_2_1::memory_strategy::REFERENCE_FIT_TOKENS
+    );
+    assert_eq!(g.tokens_per_max_reference, 64 * 64);
+    assert!(g.tokens_per_max_reference < g.max_target_image_tokens);
     assert_eq!(
         g.max_joint_tokens,
         candle_gen_qwen_image_2_1::memory_strategy::TABLE_CONDITIONING_TOKENS
-            + 11 * g.max_target_image_tokens,
-        "the target plus ten references of the same size"
+            + g.max_target_image_tokens
+            + 10 * g.tokens_per_max_reference,
+        "the largest-area target plus ten FITTED references"
     );
+    assert_eq!(g.max_joint_tokens, 58_016, "256 + 16_800 + 10 x 4_096");
 }

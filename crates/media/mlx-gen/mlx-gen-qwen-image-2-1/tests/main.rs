@@ -19,6 +19,9 @@ mod descriptor_conformance;
 #[path = "e2e_real_weights.rs"]
 mod e2e_real_weights;
 
+#[path = "edit_parity.rs"]
+mod edit_parity;
+
 #[path = "generator_contract.rs"]
 mod generator_contract;
 

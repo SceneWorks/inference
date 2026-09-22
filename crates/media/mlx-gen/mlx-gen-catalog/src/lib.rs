@@ -914,6 +914,10 @@ mod tests {
             );
         }
         for id in [
+            // sc-24112: Qwen-Image 2.1 publishes a DERIVED memory model and deliberately registers
+            // no activation anchor — the carrier is measurement-only by contract, so the consumer
+            // fallback is the honest answer until the terminal story measures one.
+            "qwen_image_2_1",
             "sana_1600m",
             "anima_turbo",
             "sensenova_u1_8b_fast",

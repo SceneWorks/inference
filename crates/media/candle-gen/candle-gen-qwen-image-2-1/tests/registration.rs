@@ -40,8 +40,19 @@ fn advertised_surface_matches_the_story_contract() {
     assert!(caps.supports_sequential_offload);
     assert!(!caps.supports_lora && !caps.supports_lokr);
     assert_eq!(caps.max_count, 8);
-    assert!(caps.conditioning.is_empty(), "T2I only in this story");
-    assert!(!caps.accepts(ConditioningKind::Reference));
+    // Reference conditioning (sc-24110): one upstream call takes one ordered list of one to ten
+    // condition images, reached through either kind. No `Mask` — upstream has no mask input.
+    assert_eq!(
+        caps.conditioning,
+        vec![
+            ConditioningKind::Reference,
+            ConditioningKind::MultiReference
+        ]
+    );
+    assert!(caps.accepts(ConditioningKind::Reference));
+    assert!(caps.accepts(ConditioningKind::MultiReference));
+    assert!(!caps.accepts(ConditioningKind::Mask));
+    assert_eq!(candle_gen_qwen_image_2_1::MAX_REFERENCE_IMAGES, 10);
     assert!(
         !caps.supports_preview,
         "no fitted 64-channel preview projection yet"
@@ -62,13 +73,11 @@ fn advertised_surface_matches_the_story_contract() {
     // sc-24112: both affine tiers are installable on this backend, so the descriptor says so.
     // Advertising them is what lets the worker's A-B tier toggle reach the candle route at all.
     assert_eq!(caps.supported_quants, &[Quant::Q4, Quant::Q8]);
-    // ...and the Q4 tier's text-encoder floor is descriptor-visible rather than a load-path secret.
-    assert_eq!(caps.component_precision_floors.len(), 1);
-    let floor = caps.component_precision_floors[0];
-    assert_eq!(floor.selected_tier, Quant::Q4);
-    assert_eq!(floor.resident_tier, Quant::Q8);
-    assert!(floor.applies_to(Quant::Q4));
-    assert!(!floor.applies_to(Quant::Q8), "Q8 promotes nothing");
+    // ...and a tier is a WHOLE-PIPELINE contract: every packable component runs the width the
+    // caller selected, so there is no component precision floor to declare. Both backends agree.
+    //
+    // *Mutation that reds this:* reinstating the withdrawn Q4 -> Q8 text-encoder floor.
+    assert!(caps.component_precision_floors.is_empty());
 }
 
 /// The seven presets and the size grid are the SAME numbers the MLX crate's `config.rs` carries —
