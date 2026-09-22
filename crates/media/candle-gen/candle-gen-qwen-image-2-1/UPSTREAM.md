@@ -290,7 +290,10 @@ Within the joint sequence:
     prefix-filtered read (`loader::load_vision_tower_weights`) rather than filtered out of an
     already-resident `Weights` map as on the MLX side — candle's loader hands providers a
     `VarBuilder`, which cannot be enumerated. Only `model.visual.*` is materialised, so attaching
-    the tower never stages a second copy of the language tower.
+    the tower never stages a second copy of the language tower. Each visual tensor is cast to
+    `DType::F32` on the way in, so both halves of the one encoder run in the same dtype: the
+    language tower comes off `VarBuilder` at `F32`, and leaving the ViT at its on-disk dtype would
+    have run a bf16 tower into f32 decoder layers on the released snapshot.
   * The decoder block's rotary embedding grew an `Option<(&cos, &sin)>` parameter: `None` keeps
     the precomputed 1-D table the text-to-image path has always used (that path stays
     **bit-identical**, asserted by `edit_parity::the_text_to_image_path_is_unchanged_by_the_reference_route`),

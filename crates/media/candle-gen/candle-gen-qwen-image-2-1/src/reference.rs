@@ -380,6 +380,22 @@ mod tests {
             calculate_dimensions(1024.0 * 1024.0, 9.0 / 16.0),
             (768, 1376)
         );
+        // Python's `round` is half-to-EVEN, and the fit lands on a 32-grid tie often enough that
+        // the difference is reachable, so pin two ratios whose width sits exactly on `.5`:
+        //   r = 1.031494140625 → w_raw = 1024·1.015625 = 1040, 1040/32 = 32.5 → ties-even 32
+        //     (1024 px); round-half-away would give 33 (1056 px).
+        //   r = 25/16 at the tiny fixture's 64-px fit → w_raw = 80, 80/32 = 2.5 → ties-even 2
+        //     (64 px); round-half-away would give 3 (96 px), which is also outside the tiny
+        //     processor's pixel budget — the `aspect` fixture case carries that one end to end.
+        assert_eq!(
+            calculate_dimensions(1024.0 * 1024.0, 1.031_494_140_625),
+            (1024, 1024)
+        );
+        assert_eq!(calculate_dimensions(64.0 * 64.0, 25.0 / 16.0), (64, 64));
+        // The `aspect` fixture's two non-square fits: they land exactly on the tiny processor's
+        // 4096-px ceiling and give heterogeneous, transposed latent blocks.
+        assert_eq!(calculate_dimensions(64.0 * 64.0, 4.0), (128, 32));
+        assert_eq!(calculate_dimensions(64.0 * 64.0, 0.25), (32, 128));
         // A degenerate ratio still lands on the grid rather than on zero.
         let (w, h) = calculate_dimensions(1024.0 * 1024.0, 1.0 / 400.0);
         assert_eq!(w % 32, 0);

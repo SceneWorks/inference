@@ -26,13 +26,18 @@
 //!   which is **one f32 ULP** at that magnitude. Bound **1e-6 x peak** (~4 ULP): this is host
 //!   `u8 -> f32` arithmetic and is held near exact.
 //! * **`prompt_embeds`** (ViT tower + DeepStack + interleaved M-RoPE + the decoder) — worst
-//!   `mask_ref/prompt_embeds`, `max|Δ| = 1.013e-6` at `peak = 2.043` → `5.0e-7 x peak`.
+//!   `ref10/prompt_embeds`, `max|Δ| = 1.132e-6` at `peak = 3.063` → `3.7e-7 x peak`.
 //!   Bound **2e-6 x peak**.
 //! * **reference latents** (VAE posterior mode, normalised, packed) — worst
-//!   `ref1/ref_latents_0`, `max|Δ| = 2.682e-7` against a bound floor of 1.0. Bound **1e-6**.
+//!   `aspect/ref_latents_0`, `max|Δ| = 2.682e-7` against a bound floor of 1.0. Bound **1e-6**.
 //! * **end-to-end latents** (the whole joint block-causal denoise) — worst
-//!   `ref10/latents_final`, `max|Δ| = 4.056e-5` at `peak = 5.003` → `8.1e-6 x peak`.
+//!   `ref10/latents_final`, `max|Δ| = 4.894e-5` at `peak = 5.007` → `9.8e-6 x peak`.
 //!   Bound **3e-5 x peak**.
+//!
+//! The reference-ORDER claim is deliberately **not** made against any of these: `LATENT_TOL x
+//! peak` is larger than upstream's own gap between the two orders, so an absolute bound there
+//! would accept a port that ignored ordering entirely. See
+//! [`swapping_two_references_changes_the_output`].
 //!
 //! For reference, the MLX twin measures 2.4e-7 / 4.9e-3 / 2.9e-4 / 2.1e-2 on Metal; the candle CPU
 //! lane is two to three orders of magnitude tighter on the three model gates, which is why the
@@ -53,6 +58,9 @@ const HOST_TOL: f32 = 1e-6;
 const TEXT_TOL: f32 = 2e-6;
 const REF_LATENT_TOL: f32 = 1e-6;
 const LATENT_TOL: f32 = 3e-5;
+/// The text-to-image conditioning against S1's frozen oracle gets its OWN bound, sized from its
+/// own evidence (measured 1.192e-7 at peak 0.841). ~8x headroom.
+const T2I_ORACLE_TOL: f32 = 1e-6;
 
 /// The per-case metadata `dump_qwen21_edit.py` writes as JSON.
 struct Case {
@@ -151,6 +159,23 @@ fn conditioning(
         .expect("image-conditioned encode")
 }
 
+/// The frozen `QwenImage21Pipeline.encode_prompt` text-to-image oracle S1 committed
+/// (`crates/media/mlx-gen/tools/dump_qwen21_text_encoder.py`): `(tensor key, its prompt)`.
+const FIXTURE_PROMPT_ORACLE: (&str, &str) = ("fox/prompt_embeds", "a red fox in the forest");
+
+fn fixture_text_encoder() -> Fixture {
+    Fixture::open("qwen21_text_encoder.safetensors")
+}
+
+fn te_tensor(w: &Fixture, key: &str) -> Tensor {
+    w.tensor(key)
+}
+
+/// `[1, L, hidden]` -> `[L, hidden]`, the shape the S1 oracle stores (`embeds[0]`).
+fn squeeze_batch(t: &Tensor) -> Tensor {
+    t.squeeze(0).expect("a single-sample conditioning")
+}
+
 #[test]
 fn the_tiny_snapshot_derives_upstreams_fit_from_its_own_pixel_budget() {
     let snap = snapshot();
@@ -164,7 +189,7 @@ fn the_tiny_snapshot_derives_upstreams_fit_from_its_own_pixel_budget() {
 fn reference_preprocessing_matches_upstream() {
     let w = Fixture::open("qwen21_edit.safetensors");
     let snap = snapshot();
-    for name in ["ref1", "ref2", "annotated", "mask_ref"] {
+    for name in ["ref1", "ref2", "annotated", "mask_ref", "aspect"] {
         let c = case(&w, name);
         let refs = prepared(&snap, &w, &c);
         assert_eq!(refs.len(), c.references);
@@ -179,6 +204,16 @@ fn reference_preprocessing_matches_upstream() {
                 reference.latent_tokens(),
                 reference.vision_slots() * 4,
                 "{name}: every vision slot stands for a 2x2 latent group"
+            );
+            // Exact, and the only transposition-sensitive claim available: the VAE compresses 16x
+            // and the processor's patch is 16 px, so the latent grid IS the vision grid, in the
+            // same orientation. A transposed grid keeps the token count (and so slips through
+            // every count check and, on the Metal lane, under the end-to-end bound) while binding
+            // each non-square block to the wrong RoPE geometry.
+            assert_eq!(
+                reference.latent_grid(),
+                (grid[1] as usize, grid[2] as usize),
+                "{name}/latent_grid_{i}: the latent grid must match the vision grid's orientation"
             );
             assert_close(
                 &format!("{name}/pixel_values_{i}"),
@@ -200,7 +235,7 @@ fn reference_preprocessing_matches_upstream() {
 fn conditioning_matches_upstream_for_one_two_and_ten_references() {
     let w = Fixture::open("qwen21_edit.safetensors");
     let snap = snapshot();
-    for name in ["ref1", "ref2", "ref10", "annotated", "mask_ref"] {
+    for name in ["ref1", "ref2", "ref10", "annotated", "mask_ref", "aspect"] {
         let c = case(&w, name);
         let refs = prepared(&snap, &w, &c);
         let cond = conditioning(&snap, &c.prompt, &refs);
@@ -226,7 +261,7 @@ fn conditioning_matches_upstream_for_one_two_and_ten_references() {
 fn reference_latents_match_upstream_in_order() {
     let w = Fixture::open("qwen21_edit.safetensors");
     let snap = snapshot();
-    for name in ["ref1", "ref2", "annotated", "mask_ref"] {
+    for name in ["ref1", "ref2", "annotated", "mask_ref", "aspect"] {
         let c = case(&w, name);
         let refs = prepared(&snap, &w, &c);
         let latents = encode_references(&snap.vae, &refs).unwrap();
@@ -244,6 +279,20 @@ fn reference_latents_match_upstream_in_order() {
 
 /// Run the whole conditioned denoise for one case from upstream's own initial noise.
 fn run_case(snap: &Snapshot, w: &Fixture, c: &Case) -> Tensor {
+    run_case_feeding(snap, w, c, ReferenceFeed::InOrder)
+}
+
+/// Which order the condition latents reach the denoiser in. `Reversed` is a deliberately
+/// wrong feed used by [`swapping_two_references_changes_the_output`]: the joint layout, the
+/// text conditioning and the per-reference RoPE blocks all stay put, only the latents change
+/// places, which is precisely the defect a magnitude-only ordering check cannot see.
+#[derive(Clone, Copy, PartialEq)]
+enum ReferenceFeed {
+    InOrder,
+    Reversed,
+}
+
+fn run_case_feeding(snap: &Snapshot, w: &Fixture, c: &Case, feed: ReferenceFeed) -> Tensor {
     let refs = prepared(snap, w, c);
     let pos = conditioning(snap, &c.prompt, &refs);
     let neg = c
@@ -260,7 +309,10 @@ fn run_case(snap: &Snapshot, w: &Fixture, c: &Case) -> Tensor {
     let neg_text = neg
         .as_ref()
         .map(|n| text_rows(&n.hidden, &n.image_pad_mask).unwrap());
-    let reference_latents = encode_references(&snap.vae, &refs).unwrap();
+    let mut reference_latents = encode_references(&snap.vae, &refs).unwrap();
+    if feed == ReferenceFeed::Reversed {
+        reference_latents.reverse();
+    }
 
     let sigmas = scheduler::sigmas_for_image(&snap.scheduler, c.steps, c.width, c.height).unwrap();
     let init = w.tensor(&format!("{}/latents_init", c.name));
@@ -307,7 +359,15 @@ fn run_case(snap: &Snapshot, w: &Fixture, c: &Case) -> Tensor {
 fn conditioned_denoise_matches_upstream_end_to_end() {
     let w = Fixture::open("qwen21_edit.safetensors");
     let snap = snapshot();
-    for name in ["ref1", "ref2", "ref10", "annotated", "mask_ref", "ref2_cfg"] {
+    for name in [
+        "ref1",
+        "ref2",
+        "ref10",
+        "annotated",
+        "mask_ref",
+        "ref2_cfg",
+        "aspect",
+    ] {
         let c = case(&w, name);
         let got = run_case(&snap, &w, &c);
         assert_close(
@@ -349,15 +409,45 @@ fn swapping_two_references_changes_the_output() {
         "reference order: got max|Δ|={got_gap:.3e} upstream max|Δ|={want_gap:.3e} \
          parity residual={parity:.3e} peak={peak:.3e}"
     );
-    // The ordering signal has to sit well clear of this port's own numerical floor, otherwise the
-    // comparison below would be measuring noise rather than the ordering.
+    // FIRST, the direction. A magnitude comparison alone is order-INSENSITIVE:
+    // Nor can a shape guard help — `calculate_dimensions` fits EVERY reference to the same target
+    // area, so all of them carry the same token count (the `aspect` case's (2x8), (8x2) and (4x4)
+    // blocks are all 16 tokens) and the joint layout's per-block counts still add up under any
+    // permutation. Only the rendered values separate the orders.
+    // A port that fed the condition latents to the denoiser in reverse would render `ref2` as
+    // `ref2_swap` and vice versa, so `got_gap` would be just as large — and the end-to-end parity
+    // bound is too loose to separate the two on its own. So pin the direction directly: feeding
+    // the SAME latents in reverse must land measurably further from upstream's `ref2` than the
+    // in-order feed does. Under a reversed port the two runs trade places and this inverts.
+    let reversed_feed = run_case_feeding(&snap, &w, &case(&w, "ref2"), ReferenceFeed::Reversed);
+    let in_order_err = gap(&got_a, &want_a);
+    let reversed_err = gap(&host_f32(&reversed_feed), &want_a);
+    eprintln!(
+        "reference feed: in-order max|Δ|={in_order_err:.3e} reversed max|Δ|={reversed_err:.3e} \
+         ratio={:.1}x",
+        reversed_err / in_order_err.max(f32::MIN_POSITIVE)
+    );
+    assert!(
+        reversed_err > 2.0 * in_order_err,
+        "feeding the condition latents in REVERSE lands {reversed_err:.3e} from upstream \
+         where the in-order feed lands {in_order_err:.3e}; the denoiser is not consuming the \
+         condition latents in request order (measured 2.6x on the Metal lane, where the \
+         numerical floor is what limits the separation, and ~1000x on the candle CPU lane)"
+    );
+
+    // THEN the magnitude, which catches the other failure: a port that dropped the ordering
+    // signal entirely would score `got_gap` ~ 0 against a large `want_gap`. The signal has to
+    // sit clear of this port's own numerical floor first, or the comparison measures noise.
     assert!(
         want_gap > 3.0 * parity,
         "upstream separates the two reference orders by only {want_gap:.3e}, within 3x this \
          port's parity residual {parity:.3e}; the ordering claim cannot be tested against it"
     );
+    // RELATIVE to upstream's own gap, never to the parity tolerance: `LATENT_TOL * peak` is
+    // larger than `want_gap` itself here, so an absolute bound would accept `got_gap = 0` — i.e.
+    // a port that dropped the ordering signal entirely.
     assert!(
-        (got_gap - want_gap).abs() <= LATENT_TOL * peak.max(1.0),
+        (got_gap - want_gap).abs() <= 0.25 * want_gap,
         "the port separates the two reference orders by {got_gap:.3e} where upstream separates \
          them by {want_gap:.3e}; reference order is not reaching the denoiser the same way"
     );
@@ -465,16 +555,33 @@ fn a_mask_conditioning_is_refused_with_the_upstream_workaround() {
 
 #[test]
 fn the_text_to_image_path_is_unchanged_by_the_reference_route() {
-    // With no references the conditioned entry point must be the plain 1-D-RoPE text path,
-    // bit-for-bit: the interleaved M-RoPE collapses when all three position rows are the token
-    // index, and nothing else engages.
+    // With no references the conditioned entry point must be the plain 1-D-RoPE text path: the
+    // interleaved M-RoPE collapses when all three position rows are the token index, and nothing
+    // else engages.
+    //
+    // The load-bearing claim is against the **committed upstream oracle**, not against this
+    // crate's own `encode_prompt` — comparing the two entry points to each other only proves they
+    // agree, and both share the early return, so a T2I regression introduced by this story would
+    // move both together and still pass. `qwen21_text_encoder.safetensors` is the frozen
+    // `QwenImage21Pipeline.encode_prompt` output for the same prompt, dumped before any of this.
     let snap = snapshot();
+    let oracle = FIXTURE_PROMPT_ORACLE;
+    let cond = conditioning(&snap, oracle.1, &[]);
+    assert!(cond.image_pad_mask.iter().all(|m| !*m));
+    let te = fixture_text_encoder();
+    assert_close(
+        "t2i/prompt_embeds (vs the frozen upstream oracle)",
+        &squeeze_batch(&cond.hidden),
+        &te_tensor(&te, oracle.0),
+        T2I_ORACLE_TOL,
+    );
+
+    // …and, as the cheaper half, the two entry points still agree bit-for-bit, so the reference
+    // route has not perturbed the text-to-image code path at all.
     let plain = snap
         .encoder
-        .encode_prompt(&snap.tokenizer, "a red fox in the forest", snap.drop)
+        .encode_prompt(&snap.tokenizer, oracle.1, snap.drop)
         .unwrap();
-    let cond = conditioning(&snap, "a red fox in the forest", &[]);
-    assert!(cond.image_pad_mask.iter().all(|m| !*m));
     let (a, b) = (host_f32(&plain), host_f32(&cond.hidden));
     assert_eq!(a.len(), b.len());
     assert!(
