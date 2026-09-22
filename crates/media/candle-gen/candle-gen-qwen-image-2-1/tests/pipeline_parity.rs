@@ -5,9 +5,12 @@
 //!
 //! Fixture and snapshot are the SAME ones the MLX twin reads.
 //!
-//! Tolerance: **1e-3 × peak** on the per-step latents and the `[0, 1]` RGBA image. The MLX twin
+//! Tolerance: **2e-4 × peak** on the per-step latents and the `[0, 1]` RGBA image. The MLX twin
 //! budgets 1e-2 for Metal's reduced-precision f32 matmul; candle CPU f32 against torch CPU f32 is
-//! the same arithmetic on the same hardware, so this lane holds a tighter bar. The single-step
+//! the same arithmetic on the same hardware, so the bar is set from this lane's own measurement.
+//! Measured on this fixture: worst latent `cfg/single_step_1`, `max|Δ| = 1.79e-4` at `peak = 2.92`
+//! → **6.1e-5 × peak**; worst image `cfg/image_rgba`, `max|Δ| = 2.2e-5` at `peak = 0.71`
+//! → **3.1e-5 × peak**. 2e-4 × peak carries ~3× headroom over the worst of those. The single-step
 //! claims below keep any drift from compounding across steps. Every claim prints its measured
 //! numbers.
 
@@ -19,8 +22,8 @@ use candle_gen_qwen_image_2_1::{
 
 use crate::common::{assert_close, device, tiny_snapshot, Fixture};
 
-const LATENT_TOL: f32 = 1e-3;
-const IMAGE_TOL: f32 = 1e-3;
+const LATENT_TOL: f32 = 2e-4;
+const IMAGE_TOL: f32 = 2e-4;
 
 #[test]
 fn denoise_trajectory_and_rgba_image_match_upstream() {

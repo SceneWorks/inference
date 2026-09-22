@@ -308,16 +308,22 @@ fn gelu_tanh(x: &Tensor) -> Result<Tensor> {
 /// the target rows `[prefix_len, S)` over every key. The per-segment outputs concatenate back into
 /// the full sequence.
 ///
-/// Every call goes through [`candle_gen::ATTN_SCORES_BUDGET`], the F-003 i32-overflow guard, and
-/// **not** the un-chunked `usize::MAX` sentinel: this family's joint sequence is long enough for
-/// the guard to be load-bearing at the shipped sizes, not a formality. At the 1:1 2048² default the
-/// target block alone is `2·(2048/32) = 128` latent tokens per side → 16384 image tokens, so the
-/// unmasked target call's scores are `1 · 32 heads · 16384 · ~16.6k ≈ 8.7e9` elements — about 4×
-/// `i32::MAX`, which candle's CUDA kernels index with. Unguarded that silently corrupts the tail of
-/// the scores tensor: a green run, a wrong image. The guard chunks the query rows, which is
-/// mathematically equivalent (each row's softmax is independent) though not bitwise equal to a
-/// single pass; below the budget it returns the whole query axis, so the parity fixtures here —
-/// whose scores are a few hundred elements — take the identical single-pass path.
+/// `budget` is the F-003 i32-overflow guard's score-element budget, forwarded to every SDPA call.
+/// Production passes [`candle_gen::ATTN_SCORES_BUDGET`] and **never** the un-chunked `usize::MAX`
+/// sentinel: this family's joint sequence is long enough for the guard to be load-bearing at the
+/// shipped sizes, not a formality. At the 1:1 2048² default the target block alone is
+/// `2·(2048/32) = 128` latent tokens per side → 16384 image tokens, so the unmasked target call's
+/// scores are `1 · 32 heads · 16384 · ~16.6k ≈ 8.7e9` elements — about 4× `i32::MAX`, which
+/// candle's CUDA kernels index with. Unguarded that silently corrupts the tail of the scores
+/// tensor: a green run, a wrong image.
+///
+/// The guard chunks the query rows, which is mathematically equivalent (each row's softmax is
+/// independent) though not bitwise equal to a single pass. **That equivalence is a property of the
+/// call shapes here, not a given** — a per-segment mask that does not narrow consistently along the
+/// query axis would silently diverge under chunking — so it is a parameter rather than a constant
+/// precisely so `chunked_and_unchunked_attention_agree_at_fixture_scale` can drive both branches on
+/// the real fixture geometry. On CUDA at every shipped preset the target call always chunks; on the
+/// fixtures it never would, which is why the test forces the budget instead of relying on size.
 fn block_causal_attention(
     q: &Tensor,
     k: &Tensor,
@@ -325,6 +331,7 @@ fn block_causal_attention(
     scale: f64,
     prefix_segments: &[(usize, usize, bool)],
     prefix_len: usize,
+    budget: usize,
 ) -> Result<Tensor> {
     let (_b, _h, s, _d) = q.dims4()?;
     let device = q.device();
@@ -353,7 +360,7 @@ fn block_causal_attention(
             scale,
             mask.as_ref(),
             softmax_last_dim,
-            candle_gen::ATTN_SCORES_BUDGET,
+            budget,
         )?);
     }
     let qt = q.narrow(2, prefix_len, s - prefix_len)?.contiguous()?;
@@ -364,7 +371,7 @@ fn block_causal_attention(
         scale,
         None,
         softmax_last_dim,
-        candle_gen::ATTN_SCORES_BUDGET,
+        budget,
     )?);
     Ok(Tensor::cat(&outputs, 2)?)
 }
@@ -423,7 +430,15 @@ impl Attention {
         let q = apply_rope(&norm(&q, &self.norm_q)?, cos, sin)?;
         let k = apply_rope(&norm(&k, &self.norm_k)?, cos, sin)?;
         let scale = (hd as f64).powf(-0.5);
-        let o = block_causal_attention(&q, &k, &v, scale, prefix_segments, prefix_len)?;
+        let o = block_causal_attention(
+            &q,
+            &k,
+            &v,
+            scale,
+            prefix_segments,
+            prefix_len,
+            candle_gen::ATTN_SCORES_BUDGET,
+        )?;
         let o = o.transpose(1, 2)?.reshape((b, s, h * hd))?;
         Ok(self.to_out.forward(&o)?)
     }
@@ -698,7 +713,11 @@ impl QwenImage21Transformer {
                         )));
                     }
                     let projected = self.img_in.forward(&img.to_dtype(dtype)?)?;
-                    trace.push("img_in", &projected)?;
+                    // Keyed by segment: a multi-image layout (the edit path) would otherwise emit
+                    // the SAME `img_in` key once per condition image, and every consumer that keys
+                    // a trace by name — including `transformer_parity.rs`'s stage-count assertion —
+                    // would silently stop holding instead of failing.
+                    trace.push(format!("img_in_{image_cursor}"), &projected)?;
                     pieces.push(projected);
                     image_cursor += 1;
                 }
@@ -823,10 +842,19 @@ mod tests {
             .expect("the file has a shipped half");
         let calls = shipped.matches("sdpa_budgeted_bhsd(").count();
         assert_eq!(calls, 2, "one prefix-segment call and one target call");
+        // Both SDPA calls forward the parameter, and exactly one production call site supplies the
+        // constant. This is what catches `block_causal_attention` hardcoding a budget of its own
+        // and ignoring its argument — a mutation the equivalence test below cannot see, because
+        // both of its branches would then take the same path and agree trivially.
         assert_eq!(
-            shipped.matches("candle_gen::ATTN_SCORES_BUDGET,").count(),
+            shipped.matches("        budget,\n").count(),
             calls,
-            "every SDPA call must pass the budget"
+            "every SDPA call must forward the `budget` parameter"
+        );
+        assert_eq!(
+            shipped.matches("candle_gen::ATTN_SCORES_BUDGET,\n").count(),
+            1,
+            "exactly one production call site supplies the budget constant"
         );
         // Code only — the prose above names the sentinel to explain why it is wrong.
         assert!(
@@ -835,6 +863,99 @@ mod tests {
                 .filter(|line| !line.trim_start().starts_with("//"))
                 .any(|line| line.contains("usize::MAX")),
             "no SDPA call may pass the un-chunked sentinel"
+        );
+    }
+
+    /// The chunked branch of the guard and the un-chunked one agree **on this crate's call
+    /// shapes**, at the real fixture geometry.
+    ///
+    /// This is the half the arithmetic above cannot assert. The guard splits the query axis and
+    /// narrows each per-segment mask with it; a mask that does not narrow consistently (a dropped
+    /// head axis, a `[1, 1, 1, Sk]` broadcast standing in for a per-row one) is *self*-consistent
+    /// in a single pass and silently wrong once chunked — and on CUDA the target call chunks at
+    /// every shipped preset while on the fixtures it never would. So the budget is forced small
+    /// here rather than waited for.
+    ///
+    /// Tolerance 1e-5, not equality: the driver's own docs say a different query-block `M` changes
+    /// the GEMM accumulation order, so the two agree to ~1 ULP rather than bitwise (SC-15943 is the
+    /// defect a sibling crate hit by asserting `== 0.0` on exactly this difference).
+    #[test]
+    fn chunked_and_unchunked_attention_agree_at_fixture_scale() {
+        use candle_gen::attention::attention_budget_from_usize;
+
+        // The `wide` fixture's geometry: 5 text tokens then a 2x4 target block.
+        let layout = JointLayout::text_to_image(5, 2, 4);
+        let (s, heads, head_dim) = (layout.total_len(), 4usize, 8usize);
+        let dev = Device::Cpu;
+        // Deterministic, non-degenerate q/k/v — a constant tensor would make every chunk boundary
+        // agree for the wrong reason.
+        let fill = |seed: usize| -> Tensor {
+            let n = heads * s * head_dim;
+            let v: Vec<f32> = (0..n)
+                .map(|i| (((i * 37 + seed * 11) % 97) as f32 / 97.0) - 0.5)
+                .collect();
+            Tensor::from_vec(v, (1, heads, s, head_dim), &dev).unwrap()
+        };
+        let (q, k, v) = (fill(0), fill(1), fill(2));
+        let scale = (head_dim as f64).powf(-0.5);
+        let segments = layout.prefix_segments();
+        let prefix = layout.prefix_len();
+
+        // A budget of one score element per query row forces the planner to chunk; assert that it
+        // really does, so the test cannot pass by never taking the branch it exists to exercise.
+        let rows_per_query = heads * s;
+        let forced = rows_per_query;
+        assert!(
+            (attention_budget_from_usize(forced).query_block_rows(rows_per_query as u64, s as u64)
+                as usize)
+                < s,
+            "the forced budget must actually chunk the query axis"
+        );
+        assert_eq!(
+            attention_budget_from_usize(usize::MAX)
+                .query_block_rows(rows_per_query as u64, s as u64) as usize,
+            s,
+            "the sentinel must leave the query axis whole"
+        );
+
+        let chunked = block_causal_attention(&q, &k, &v, scale, &segments, prefix, forced).unwrap();
+        let single =
+            block_causal_attention(&q, &k, &v, scale, &segments, prefix, usize::MAX).unwrap();
+        assert_eq!(chunked.dims(), single.dims());
+        let diff = (&chunked - &single)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        eprintln!("chunked_vs_unchunked: max|Δ|={diff:.3e} bound=1.000e-5");
+        assert!(
+            diff <= 1e-5,
+            "the chunked branch diverged from the single pass by {diff:.3e}"
+        );
+    }
+
+    /// A multi-image layout emits one DISTINCT trace key per image block.
+    ///
+    /// The edit path appends condition-image segments; keying them all `img_in` would give a
+    /// duplicate-keyed trace, and every consumer that counts or looks up stages by name — starting
+    /// with `transformer_parity.rs`'s stage-count assertion — would quietly stop meaning anything
+    /// rather than fail.
+    #[test]
+    fn every_image_segment_gets_its_own_trace_key() {
+        let shipped = include_str!("transformer.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the file has a shipped half");
+        assert!(
+            shipped.contains("trace.push(format!(\"img_in_{image_cursor}\"), &projected)?;"),
+            "the image projection must be traced under a per-segment key"
+        );
+        assert!(
+            !shipped.contains("trace.push(\"img_in\""),
+            "no image segment may push the un-indexed `img_in` key"
         );
     }
 

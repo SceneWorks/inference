@@ -7,15 +7,23 @@
 //!
 //! Runs on the plain CPU backend in f32, so it is **not** `#[ignore]`d — no GPU, no real weights.
 //!
-//! Tolerances: **1e-5 absolute** on the RoPE table (host trig on both sides); **1e-2 × peak** on
-//! every matmul-bearing stage and the velocity — the repository's stated bound for an f32 matmul
-//! chain against f32 CPU torch, kept identical to the MLX twin's so the two gates are comparable.
-//! candle CPU f32 vs torch CPU f32 is far tighter than that in practice: measured on this fixture,
-//! the RoPE table is **bit-identical** (`max|Δ| = 0`) and every matmul-bearing stage of every case
-//! lands at **≤ 1.5e-5 × peak** (worst: `square/block_1_mlp`, `max|Δ| = 7.0e-5` at `peak = 4.8`;
-//! the velocity worst case is `square`, `4.9e-5` at `peak = 3.3` → `1.5e-5 × peak`). `assert_close`
-//! prints the `max|Δ|` / `mean|Δ|` / `peak` of every stage — run with `--nocapture`. A stage past
-//! ~1e-4 × peak would be a porting bug, not tolerance, and the trace localises it.
+//! Tolerances: **1e-5 absolute** on the RoPE table (host trig on both sides) and **1e-4 × peak** on
+//! every matmul-bearing stage and the velocity.
+//!
+//! The bar is set from THIS lane's measurement, not inherited: the MLX twin needs 1e-2 because
+//! Metal runs f32 matmul in reduced precision, while candle CPU f32 is the same arithmetic torch
+//! ran, so importing 1e-2 here would be ~670× slack with no numerics behind it (the same reason
+//! `vae_parity` holds 1e-5). Measured on this fixture: the RoPE table is **bit-identical**
+//! (`max|Δ| = 0`) and every matmul-bearing stage of every case lands at **≤ 1.5e-5 × peak** —
+//! worst `square/block_1_mlp`, `max|Δ| = 7.0e-5` at `peak = 4.8`; worst velocity `square`,
+//! `4.9e-5` at `peak = 3.3`. 1e-4 × peak is that worst case with ~6× headroom, and it is the line
+//! the file already called a porting bug rather than tolerance.
+//!
+//! Mutation-checked, because a slack bar is indistinguishable from a passing one: swapping
+//! `apply_rope`'s interleaved `rope_i` for the half-split `rope` reds `square/block_0_attn` at
+//! 1e-4 (it stayed GREEN at 1e-2, where only `block_1_attn` failed — the first block's divergence
+//! was inside the old bar). `assert_close` prints the `max|Δ|` / `mean|Δ|` / `peak` of every stage;
+//! run with `--nocapture`.
 
 use candle_core::{Device, IndexOp};
 use candle_gen_qwen_image_2_1::loader::load_transformer;
@@ -23,7 +31,7 @@ use candle_gen_qwen_image_2_1::JointLayout;
 
 use crate::common::{assert_close, host_f32, tiny_snapshot, Fixture};
 
-const TOL: f32 = 1e-2;
+const TOL: f32 = 1e-4;
 
 #[test]
 fn rope_every_stage_and_velocity_match_upstream() {
@@ -62,12 +70,27 @@ fn rope_every_stage_and_velocity_match_upstream() {
         let (velocity, trace) = model
             .forward_joint_traced(&text, &[&hidden], timestep, &layout)
             .unwrap();
-        assert_eq!(trace.len(), 6 + 3 * model.config().num_layers);
+        // `5 + images + 3·layers`: txt_in, temb, modulation, norm_out, proj_out, one img_in per
+        // image segment, and three per block. Asserted against the layout rather than a bare
+        // constant so the count keeps meaning something when the edit path appends segments — and
+        // the key set is asserted DISTINCT, which is what a duplicate `img_in` would break.
+        let images = 1;
+        assert_eq!(trace.len(), 5 + images + 3 * model.config().num_layers);
+        let distinct: std::collections::BTreeSet<&str> =
+            trace.iter().map(|(stage, _)| stage.as_str()).collect();
+        assert_eq!(
+            distinct.len(),
+            trace.len(),
+            "{case}: every traced stage must have its own key"
+        );
         for (stage, got) in &trace {
             // Block outputs come from the block hook (`block_{i}_out`); every other stage from
-            // its module hook (`trace/<stage>`).
+            // its module hook (`trace/<stage>`). The image projection is keyed per segment
+            // (`img_in_{i}`) while the single-image fixture writes the bare `img_in`.
             let key = if stage.ends_with("_out") && stage.starts_with("block_") {
                 format!("{case}/{stage}")
+            } else if stage == "img_in_0" {
+                format!("{case}/trace/img_in")
             } else {
                 format!("{case}/trace/{stage}")
             };
