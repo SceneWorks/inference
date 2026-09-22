@@ -14,10 +14,20 @@ from scripts.release import qwen38_bonsai_rc7_bridge as bridge
 class Rc7BridgeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.old_matrix = json.loads(bridge.git_file(bridge.OBSERVED_SHA, "release/qwen38-bonsai-matrix.json"))
-        cls.new_matrix = json.loads((bridge.ROOT / "release/qwen38-bonsai-matrix.json").read_text())
-        cls.old_manifest = tomllib.loads(bridge.git_file(bridge.OBSERVED_SHA, "release/real-weight-models.toml").decode())
-        cls.new_manifest = tomllib.loads((bridge.ROOT / "release/real-weight-models.toml").read_text())
+        # Unit fixtures are intentionally synthetic: CI checks out only HEAD, so RC7 is
+        # unavailable there. The release verifier itself still requires the real RC7
+        # commit and compares it with the candidate when run for acceptance.
+        cls.new_matrix = json.loads(
+            (bridge.ROOT / "release/qwen38-bonsai-matrix.json").read_text(encoding="utf-8")
+        )
+        cls.old_matrix = copy.deepcopy(cls.new_matrix)
+        cls.old_matrix["cells"].extend({"id": cell} for cell in sorted(bridge.CPU_CELLS))
+        cls.new_manifest = tomllib.loads(
+            (bridge.ROOT / "release/real-weight-models.toml").read_text(encoding="utf-8")
+        )
+        cls.old_manifest = copy.deepcopy(cls.new_manifest)
+        for model in cls.old_manifest["models"]:
+            model.pop("supported_execution_profiles", None)
 
     def test_retained_accelerator_contract_and_pins_are_exact(self) -> None:
         bridge.validate_matrix(self.old_matrix, self.new_matrix)

@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -73,7 +72,7 @@ SUPPORTED_PROFILES = {
 
 
 def git(*args: str) -> str:
-    return subprocess.check_output(["git", *args], cwd=ROOT, text=True).strip()
+    return subprocess.check_output(["git", *args], cwd=ROOT, text=True, encoding="utf-8").strip()
 
 
 def git_file(revision: str, path: str) -> bytes:
@@ -129,10 +128,10 @@ def validate_manifest(old_models: dict, new_models: dict) -> None:
 
 def validate_retained_contract() -> None:
     old = json.loads(git_file(OBSERVED_SHA, "release/qwen38-bonsai-matrix.json"))
-    new = json.loads((ROOT / "release/qwen38-bonsai-matrix.json").read_text())
+    new = json.loads((ROOT / "release/qwen38-bonsai-matrix.json").read_text(encoding="utf-8"))
     validate_matrix(old, new)
-    old_models = tomllib.loads(git_file(OBSERVED_SHA, "release/real-weight-models.toml").decode())
-    new_models = tomllib.loads((ROOT / "release/real-weight-models.toml").read_text())
+    old_models = tomllib.loads(git_file(OBSERVED_SHA, "release/real-weight-models.toml").decode("utf-8"))
+    new_models = tomllib.loads((ROOT / "release/real-weight-models.toml").read_text(encoding="utf-8"))
     validate_manifest(old_models, new_models)
 
 
@@ -185,7 +184,7 @@ def verify(args: argparse.Namespace) -> int:
     validate_source_scope(
         head=head,
         clean=not bool(git("status", "--porcelain=v1", "--untracked-files=all")),
-        version=(ROOT / "release/VERSION").read_text(),
+        version=(ROOT / "release/VERSION").read_text(encoding="utf-8"),
     )
     validate_retained_contract()
     if args.output.exists():
@@ -228,7 +227,7 @@ def verify(args: argparse.Namespace) -> int:
         if terminal.matrix_status(argparse.Namespace(**common)) != 0:
             raise ValueError("16 accelerator cells did not pass scoped functional acceptance")
         terminal.verify_matrix_seal(argparse.Namespace(**common))
-    report = json.loads((args.output / "matrix-report.json").read_text())
+    report = json.loads((args.output / "matrix-report.json").read_text(encoding="utf-8"))
     terminal.write_new(args.output / "reuse-bridge.json", {
         "schema_version": 1,
         "observed_runtime_sha": OBSERVED_SHA,
