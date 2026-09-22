@@ -1161,22 +1161,45 @@ impl Scail2AnimationConditioningRef<'_> {
 
 impl GenerationRequest {
     /// Number of image-conditioning inputs represented by this request for memory-evidence
-    /// geometry. Multi-image carriers contribute their flattened image count; control/depth/mask
-    /// carriers each contribute one. A keyframe is a distinct image input even though its placement
-    /// is temporal; clips remain represented by the frame axis.
+    /// geometry. Multi-image carriers contribute their flattened image count; reference (opaque
+    /// **or** transparent), control/depth/mask carriers each contribute one. A keyframe is a
+    /// distinct image input even though its placement is temporal; clips remain represented by the
+    /// frame axis.
     pub fn image_reference_count(&self) -> u32 {
         self.conditioning.iter().fold(0_u32, |count, conditioning| {
+            // **This match is deliberately wildcard-free** (sc-24111), for the same reason
+            // `first_nonfinite_float` is: the `_ => 0` this replaces is exactly how
+            // `ReferenceRgba` came to be priced at zero. A carrier scored zero here is admitted at
+            // one `reference_count` and then refused at execution by both providers' request
+            // scopes — see `memory_reference_count` below, whose whole contract is that admission
+            // and execution agree carrier for carrier. A new variant now breaks the build here
+            // until someone classifies it.
             let increment = match conditioning {
+                // One image reference each. `ReferenceRgba` is an ordinary reference that kept its
+                // alpha, so it is priced identically to `Reference` — same fit, same token cost.
                 Conditioning::Reference { .. }
+                | Conditioning::ReferenceRgba { .. }
                 | Conditioning::Keyframe { .. }
                 | Conditioning::Control { .. }
                 | Conditioning::Depth { .. }
                 | Conditioning::Mask { .. } => 1,
+                // Multi-image carriers contribute their flattened image count.
                 Conditioning::MultiReference { images } => {
                     u32::try_from(images.len()).unwrap_or(u32::MAX)
                 }
                 Conditioning::ReduxRefs { refs } => u32::try_from(refs.len()).unwrap_or(u32::MAX),
-                _ => 0,
+                // Carriers that are **not** still-image references: audio and video payloads, the
+                // clip carriers (represented by the frame axis, not the image count), and the
+                // tensor-free conversation history. Named rather than wildcarded.
+                Conditioning::ReferenceAudio { .. }
+                | Conditioning::ReferenceVideo { .. }
+                | Conditioning::AudioEdit { .. }
+                | Conditioning::AudioEditRegions { .. }
+                | Conditioning::VoiceEmbedding { .. }
+                | Conditioning::VideoClip { .. }
+                | Conditioning::ControlClip { .. }
+                | Conditioning::VideoSync { .. }
+                | Conditioning::ConversationHistory { .. } => 0,
             };
             count.saturating_add(increment)
         })
@@ -3726,6 +3749,76 @@ impl Capabilities {
 
 #[cfg(test)]
 mod tests {
+
+    /// `image_reference_count()` must price a **transparent** reference exactly like an opaque one
+    /// (sc-24111).
+    ///
+    /// This is not cosmetic arithmetic. `memory_reference_count()` delegates here, and both
+    /// providers' request scopes refuse a request whose `memory_reference_count()` differs from
+    /// the admitted `MemoryGeometry::reference_count`. A `ReferenceRgba` scored as zero is
+    /// therefore admitted at `reference_count = 1` and then **refused at execution**
+    /// ("references=0 does not fit admitted … references=1"), or priced with zero reference
+    /// tokens — the exact admission/execution disagreement the doc comment on
+    /// `memory_reference_count` says must be impossible by construction.
+    #[test]
+    fn a_transparent_reference_is_priced_like_an_opaque_one() {
+        fn rgb() -> Image {
+            Image {
+                width: 8,
+                height: 8,
+                pixels: vec![0; 8 * 8 * 3],
+            }
+        }
+        fn rgba() -> RgbaImage {
+            RgbaImage {
+                width: 8,
+                height: 8,
+                pixels: vec![0; 8 * 8 * 4],
+            }
+        }
+
+        let lone = GenerationRequest {
+            conditioning: vec![Conditioning::ReferenceRgba {
+                image: rgba(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            lone.image_reference_count(),
+            1,
+            "a lone transparent reference is one image reference"
+        );
+        assert_eq!(
+            lone.memory_reference_count(),
+            1,
+            "the execution-side count must agree with admission"
+        );
+
+        let mixed = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: rgb(),
+                    strength: None,
+                },
+                Conditioning::ReferenceRgba {
+                    image: rgba(),
+                    strength: None,
+                },
+                Conditioning::MultiReference {
+                    images: vec![rgb()],
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            mixed.image_reference_count(),
+            3,
+            "RGB and RGBA references share one ordered list and are priced alike"
+        );
+        assert_eq!(mixed.memory_reference_count(), 3);
+    }
+
     use super::*;
     use crate::execution_domains::{CfgBatchingDomain, ExecutionValueDomain};
 

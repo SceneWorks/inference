@@ -127,16 +127,28 @@ fn validate_image(image: &RgbaImage, index: usize) -> Result<()> {
     Ok(())
 }
 
-/// The per-reference resize target upstream derives for `image` at `output_resolution`.
+/// The per-reference resize target upstream derives for a `(width, height)` at
+/// `output_resolution`.
 ///
-/// Geometry only — it reads `width`/`height`, so an RGB and an RGBA reference of the same size fit
-/// identically.
-pub fn reference_target_size(image: &RgbaImage, output_resolution: u32) -> Result<(u32, u32)> {
-    validate_image(image, 0)?;
+/// **Carrier-free on purpose**: this is pure geometry over the two numbers upstream's
+/// `calculate_dimensions` actually reads, so an RGB caller, an RGBA caller and a caller holding
+/// only a size all reach it without converting anything. Taking `&RgbaImage` here would have
+/// forced every RGB caller to widen a whole image — allocating `w·h·4` bytes — to ask a question
+/// about its aspect ratio.
+///
+/// Rejects a zero side (the ratio is undefined); the buffer/length check belongs to
+/// [`prepare_reference`], which is the entry point that actually reads pixels.
+pub fn reference_target_size(size: (u32, u32), output_resolution: u32) -> Result<(u32, u32)> {
+    let (width, height) = size;
+    if width == 0 || height == 0 {
+        return Err(Error::Msg(format!(
+            "qwen_image_2_1: a reference is {width}x{height}; both sides must be above zero"
+        )));
+    }
     let area = f64::from(output_resolution) * f64::from(output_resolution);
     Ok(calculate_dimensions(
         area,
-        f64::from(image.width) / f64::from(image.height),
+        f64::from(width) / f64::from(height),
     ))
 }
 
@@ -145,12 +157,13 @@ pub fn reference_target_size(image: &RgbaImage, output_resolution: u32) -> Resul
 ///
 /// SceneWorks always sends an explicit size, so this is not on the render path; it is the
 /// documented derivation a caller can use to fill the request, and the ordering tests assert that
-/// it reads the *last* reference rather than the first.
+/// it reads the *last* reference rather than the first. Takes sizes rather than images for the
+/// reason [`reference_target_size`] does.
 pub fn reference_derived_size(
-    references: &[RgbaImage],
+    reference_sizes: &[(u32, u32)],
     output_resolution: u32,
 ) -> Result<(u32, u32)> {
-    let last = references.last().ok_or_else(|| {
+    let last = reference_sizes.last().copied().ok_or_else(|| {
         Error::Msg("qwen_image_2_1: no reference images to derive the output size from".into())
     })?;
     reference_target_size(last, output_resolution)
@@ -165,7 +178,7 @@ pub fn prepare_reference(
 ) -> Result<PreparedReference> {
     validate_image(image, index)?;
     let output_resolution = vision.output_resolution();
-    let (rw, rh) = reference_target_size(image, output_resolution)?;
+    let (rw, rh) = reference_target_size((image.width, image.height), output_resolution)?;
     let (src_h, src_w) = (image.height as usize, image.width as usize);
     let (dst_h, dst_w) = (rh as usize, rw as usize);
 
@@ -519,7 +532,9 @@ mod tests {
 
     #[test]
     fn the_derived_size_reads_the_last_reference() {
-        let refs = vec![opaque(64, 128), opaque(128, 64)];
+        // Sizes, not images: the helper is carrier-free, so the claim (it reads the LAST entry)
+        // is stated without building pixel buffers at all.
+        let refs = [(64, 128), (128, 64)];
         let (w, h) = reference_derived_size(&refs, 1024).unwrap();
         assert!(w > h, "the last reference is landscape, got {w}x{h}");
         assert!(reference_derived_size(&[], 1024).is_err());

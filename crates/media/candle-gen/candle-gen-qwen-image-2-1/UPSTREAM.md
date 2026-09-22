@@ -278,7 +278,10 @@ images = (images * 255).round().astype("uint8")  # numpy_to_pil
 ```
 
 So the emitted alpha is **straight (un-premultiplied)**, clamped to `[0, 1]` by the same clamp as
-the colour, and rounded half-away-from-zero at 8 bits. Nothing premultiplies, and `A = 0` does
+the colour, and rounded **half-to-even** at 8 bits (numpy's `ndarray.round`, which is banker's
+rounding — `[0.5, 1.5, 2.5, 3.5] -> [0, 2, 2, 4]`). That is what `candle_gen::round_rgb8` and
+`mlx_rs::ops::round` implement; Rust's own `f32::round` is half-away-from-zero and would diverge
+at an exact `.5`, so neither emission path uses it. Nothing premultiplies, and `A = 0` does
 **not** imply `RGB = 0`: a fully transparent pixel still carries whatever colour the decoder
 painted there, which is why a consumer that flattens must composite rather than drop the fourth
 byte.
@@ -356,6 +359,16 @@ in `gen_core::imageops::resize_lanczos_rgba_u8`:
 For a fully opaque image both conversions are the identity and the alpha band resamples to a
 constant 255, so this is byte-identical to the three-channel resize the RGB reference route always
 used.
+
+### Capability discovery: the catalog does not publish the flag
+
+`runtime-catalog` does **not** emit `supports_alpha_output` in its provider rows — consistent with
+`supports_hdr`, which it also omits. The catalog publishes the conditioning kinds (so
+`referenceRgba` does appear there) but not the boolean output-surface flags. The SceneWorks half
+therefore infers availability from the manifest's own `supportsAlphaOutput` key rather than from
+the catalog dump; the engine-side flag remains the authority that the shared request floor
+enforces, so a manifest that disagrees with the descriptor gets a typed refusal at `validate`
+rather than a wrong render.
 
 ### What this port does NOT do
 

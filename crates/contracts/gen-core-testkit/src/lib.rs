@@ -863,9 +863,14 @@ fn blank_rgba_image(profile: &Profile) -> RgbaImage {
     }
 }
 
-/// The first easily-constructed [`Conditioning`] whose kind the model does **not** advertise, or
-/// `None` if it accepts all of the candidates (then the negative-conditioning sub-check is skipped).
-fn undeclared_conditioning(caps: &Capabilities, profile: &Profile) -> Option<Conditioning> {
+/// **Every** easily-constructed [`Conditioning`] whose kind the model does not advertise; empty if
+/// it accepts all of the candidates (then the negative-conditioning sub-check is skipped).
+///
+/// Returns the whole set, not the first match. It used to `find` the first, and that made every
+/// candidate after the first unreachable in practice: `Mask` leads the list and virtually no
+/// provider accepts it, so a provider could advertise nothing else and still only ever be probed
+/// for `Mask`. `ReferenceRgba` (sc-24111) was added to this list and was never once selected.
+fn undeclared_conditioning(caps: &Capabilities, profile: &Profile) -> Vec<Conditioning> {
     [
         Conditioning::Mask {
             image: blank_image(profile),
@@ -877,16 +882,17 @@ fn undeclared_conditioning(caps: &Capabilities, profile: &Profile) -> Option<Con
             image: blank_image(profile),
             strength: None,
         },
-        // sc-24111: default-deny on transparent references. Probed for every provider, so a
-        // family that grows an RGBA reference path without advertising the kind is caught here
-        // rather than by a preprocessor silently flattening the fourth channel.
+        // sc-24111: default-deny on transparent references, so a family that grows an RGBA
+        // reference path without advertising the kind is caught here rather than by a
+        // preprocessor silently flattening the fourth channel.
         Conditioning::ReferenceRgba {
             image: blank_rgba_image(profile),
             strength: None,
         },
     ]
     .into_iter()
-    .find(|c| !caps.accepts(c.kind()))
+    .filter(|c| !caps.accepts(c.kind()))
+    .collect()
 }
 
 /// **Validate honesty.** Everything the descriptor advertises is accepted by `validate()`, and
@@ -1000,8 +1006,9 @@ pub fn check_validate_honesty(g: &dyn Generator, profile: &Profile) -> Result<()
         }
     }
 
-    // Negative: an undeclared conditioning kind must be rejected.
-    if let Some(cond) = undeclared_conditioning(caps, profile) {
+    // Negative: EVERY undeclared conditioning kind must be rejected — not merely the first one
+    // that happens to lead the candidate list (sc-24111).
+    for cond in undeclared_conditioning(caps, profile) {
         let kind = cond.kind();
         let mut r = base_request(profile);
         r.conditioning = vec![cond];
@@ -1665,7 +1672,7 @@ pub fn conformance(make: impl Fn() -> Box<dyn Generator>, profile: &Profile) {
     let g: &dyn Generator = g.as_ref();
 
     type Check = fn(&dyn Generator, &Profile) -> Result<(), String>;
-    let checks: [Check; 7] = [
+    let checks: [Check; 8] = [
         check_validate_honesty,
         check_progress,
         check_progress_contract,
@@ -1673,6 +1680,13 @@ pub fn conformance(make: impl Fn() -> Box<dyn Generator>, profile: &Profile) {
         check_precancellation,
         check_seed_determinism,
         check_cfg_off_render,
+        // sc-24111. In the SHARED array, not hand-called by the two providers that advertise
+        // alpha: the half that matters most is the NEGATIVE one — every provider that does not
+        // advertise `supports_alpha_output` must refuse an `OutputChannels::Rgba` request rather
+        // than silently return RGB — and only a provider that never runs this check can regress
+        // it. It is inert for an audio-modality descriptor and costs a non-advertising provider
+        // one extra `validate()` call.
+        check_alpha_output_honesty,
     ];
 
     let failures: Vec<String> = checks
