@@ -297,6 +297,15 @@ def build_tiny_pipeline():
             "deepstack_visual_indexes": [0],
         },
     )
+    # The vision token ids must be the TINY tokenizer's, not `Qwen3VLConfig`'s released defaults
+    # (151652-151656): `Qwen3VLModel.forward` matches `config.image_token_id` against the tokenized
+    # ids to find the slots it splices vision features into, so a stale id makes every
+    # image-conditioned call fail with "tokens: 0, features: N" (sc-24110).
+    tokenizer_for_ids = build_tiny_tokenizer()
+    config.image_token_id = tokenizer_for_ids.convert_tokens_to_ids("<|image_pad|>")
+    config.video_token_id = tokenizer_for_ids.convert_tokens_to_ids("<|video_pad|>")
+    config.vision_start_token_id = tokenizer_for_ids.convert_tokens_to_ids("<|vision_start|>")
+    config.vision_end_token_id = tokenizer_for_ids.convert_tokens_to_ids("<|vision_end|>")
     text_encoder = Qwen3VLForConditionalGeneration(config).eval()
     with torch.no_grad():
         for p in text_encoder.parameters():
@@ -307,7 +316,7 @@ def build_tiny_pipeline():
             torch.linspace(0.5, 2.0, TEXT_HIDDEN)
         )
 
-    tokenizer = build_tiny_tokenizer()
+    tokenizer = tokenizer_for_ids
     if os.environ.get("MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT"):
         assert_released_template_matches_literal_prefix()
     processor = Qwen3VLProcessor(

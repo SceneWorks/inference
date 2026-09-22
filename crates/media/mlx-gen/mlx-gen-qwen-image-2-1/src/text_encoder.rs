@@ -20,22 +20,44 @@
 //! interleaved) are all the plain token index, so the rotary embedding is exactly 1-D RoPE at
 //! `rope_theta = 5e6` — which is why the decoder block is **reused** from Z-Image's Qwen3 port
 //! ([`mlx_gen_z_image::text_encoder::EncoderLayer`]: per-head `q_norm`/`k_norm`, bias-free GQA,
-//! HF half-split RoPE, SwiGLU) rather than ported a third time. The deepstack visual injection and
-//! the vision tower only engage with condition images (a later story); their weights
-//! (`model.visual.*`) are simply not loaded here.
+//! HF half-split RoPE, SwiGLU) rather than ported a third time. The DeepStack visual injection and
+//! the vision tower engage only with condition images — see *The image-conditioned path* below.
 //!
 //! Activations run f32 over the bf16 weight store (the sibling text encoders' policy); the DiT
 //! rounds the result to its own compute dtype at `txt_in`.
+//!
+//! # The image-conditioned path (sc-24110)
+//!
+//! With condition images the template becomes `prompt_template_ti2i` — one
+//! `<imageN><|vision_start|><|image_pad|><|vision_end|>` group per reference, in order, ahead of
+//! the prompt — and the full Qwen3-VL multimodal path engages:
+//!
+//! * each `<|image_pad|>` placeholder is **expanded** to one token per merged 2×2 vision patch,
+//!   exactly as `Qwen3VLProcessor` does when it sees `pixel_values`;
+//! * the ViT tower ([`mlx_llm::models::Qwen3VLVisionModel`]) encodes the references and its merged
+//!   rows are **spliced** into the image-token positions;
+//! * positions become **interleaved M-RoPE** (`mrope_section`) instead of plain 1-D RoPE — with a
+//!   text-only prompt all three rows are the token index, so the T2I path is bit-unchanged;
+//! * **DeepStack**: the tower's tapped features are added to the visual rows after each of the
+//!   first `deepstack_visual_indexes.len()` decoder layers.
+//!
+//! The returned [`TextConditioning`] carries the image-token mask alongside the hidden states —
+//! the DiT needs it to know which joint positions its condition latents occupy.
 
 use mlx_gen::nn::{build_mask, TextRope, TokenEmbedding};
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_gen_z_image::text_encoder::EncoderLayer;
+use mlx_llm::models::deepstack::{add_visual_features, mrope_positions_mm, splice_vision_features};
+use mlx_llm::models::Qwen3VLVisionModel;
+use mlx_llm::primitives::Rope;
+use mlx_rs::ops::concatenate_axis;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{Array, Dtype};
 
-use crate::config::{TextEncoderConfig, SYSTEM_PROMPT};
+use crate::config::{TextEncoderConfig, VisionConfig, SYSTEM_PROMPT};
+use crate::reference::PreparedReference;
 
 /// Group size for a pre-quantized (packed) Qwen3 tower — the codebase-wide default (64).
 const GROUP_SIZE: i32 = 64;
@@ -54,6 +76,46 @@ pub fn prompt_template(prompt: &str) -> String {
         "{}<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n",
         system_prefix()
     )
+}
+
+/// The literal `<|image_pad|>` placeholder — one per reference in the rendered template, which
+/// the processor then expands to one token per merged vision patch.
+pub const IMAGE_PAD_TOKEN: &str = "<|image_pad|>";
+
+/// The full raw **image-conditioned** template for `prompt` and `count` references
+/// (`QwenImage21Pipeline.prompt_template_ti2i` with `_get_qwen_prompt_embeds`' multi-image
+/// expansion). Note the single leading space before the second and later groups, which upstream's
+/// `replace += f" <image{i}>…"` introduces and which changes the tokenization.
+pub fn prompt_template_ti2i(prompt: &str, count: usize) -> String {
+    let prompt = if prompt.is_empty() { " " } else { prompt };
+    let mut groups = String::new();
+    for i in 1..=count {
+        if i > 1 {
+            groups.push(' ');
+        }
+        groups.push_str(&format!(
+            "<image{i}><|vision_start|>{IMAGE_PAD_TOKEN}<|vision_end|>"
+        ));
+    }
+    format!(
+        "{}<|im_start|>user\n{groups}{prompt}<|im_end|>\n<|im_start|>assistant\n",
+        system_prefix()
+    )
+}
+
+/// The `<|image_pad|>` id for the loaded tokenizer — upstream's
+/// `processor.tokenizer.encode("<|image_pad|>")[0]`, derived rather than read from
+/// `config.json`'s `image_token_id` (the miniature parity snapshot's tokenizer maps the same
+/// literal to a different id, and upstream trusts the tokenizer).
+pub fn image_pad_token_id(tokenizer: &TextTokenizer) -> Result<i32> {
+    let ids = tokenizer.encode_ids(IMAGE_PAD_TOKEN, false)?;
+    match ids.first() {
+        Some(&id) if ids.len() == 1 => Ok(id),
+        _ => Err(Error::Msg(format!(
+            "qwen_image_2_1: the tokenizer encodes `{IMAGE_PAD_TOKEN}` to {ids:?}, not a single \
+             id; condition images cannot be placed in the prompt"
+        ))),
+    }
 }
 
 /// How many leading template tokens to drop from the hidden states: the tokenized system-role
@@ -75,6 +137,31 @@ pub struct QwenImage21TextEncoder {
     layers: Vec<EncoderLayer>,
     rope: TextRope,
     hidden_size: usize,
+    /// Interleaved M-RoPE geometry for the image-conditioned path.
+    mrope: Rope,
+    mrope_section: [usize; 3],
+    /// The ViT tower + its host processor geometry. `None` on a snapshot that ships no
+    /// `vision_config` / `model.visual.*`, which makes the reference route a typed refusal
+    /// instead of a wrong render.
+    vision: Option<(Qwen3VLVisionModel, VisionConfig)>,
+}
+
+/// The conditioning one prompt produces: the hidden states the DiT's `txt_in` consumes, and —
+/// for the image-conditioned path — which of those positions are condition-image slots.
+pub struct TextConditioning {
+    /// `[1, L, hidden]`, f32, system prefix already dropped.
+    pub hidden: Array,
+    /// `L` flags, `true` at `<|image_pad|>` positions (all `false` for text-to-image). Each flag
+    /// stands for a 2×2 group of condition latents in the joint sequence.
+    pub image_pad_mask: Vec<bool>,
+}
+
+impl TextConditioning {
+    /// Vision slots per reference, in order — the run lengths of `image_pad_mask`, split by the
+    /// per-reference slot counts the caller supplies.
+    pub fn text_len(&self) -> usize {
+        self.image_pad_mask.iter().filter(|m| !**m).count()
+    }
 }
 
 impl QwenImage21TextEncoder {
@@ -105,7 +192,29 @@ impl QwenImage21TextEncoder {
             layers,
             rope: TextRope::new(cfg.head_dim as i32, cfg.rope_theta),
             hidden_size: cfg.hidden_size,
+            mrope: Rope::standard(cfg.head_dim as i32, cfg.rope_theta),
+            mrope_section: cfg.mrope_section,
+            vision: None,
         })
+    }
+
+    /// Attach the Qwen3-VL **vision** tower this snapshot ships (`model.visual.*`), which the
+    /// reference route needs. Without it [`Self::encode_conditioning`] refuses any request that
+    /// carries condition images.
+    pub fn with_vision(mut self, tower: Qwen3VLVisionModel, cfg: VisionConfig) -> Self {
+        self.vision = Some((tower, cfg));
+        self
+    }
+
+    /// `true` when the loaded snapshot carried a vision tower.
+    pub fn has_vision(&self) -> bool {
+        self.vision.is_some()
+    }
+
+    /// The vision geometry, for callers that need the snapshot's `output_resolution` / processor
+    /// before preparing references.
+    pub fn vision_config(&self) -> Option<&VisionConfig> {
+        self.vision.as_ref().map(|(_, cfg)| cfg)
     }
 
     pub fn hidden_size(&self) -> usize {
@@ -176,6 +285,161 @@ impl QwenImage21TextEncoder {
         let hidden = self.forward(&input_ids, &attention_mask)?;
         let total = hidden.shape()[1];
         Ok(hidden.index((.., drop as i32..total, ..)))
+    }
+
+    /// Prompt (+ ordered condition images) → [`TextConditioning`].
+    ///
+    /// With `references` empty this is [`Self::encode_prompt`] with an all-`false` mask — the
+    /// text-to-image path, unchanged. With references it renders
+    /// [`prompt_template_ti2i`], expands each `<|image_pad|>` placeholder to that reference's
+    /// merged-patch count, runs the ViT tower, splices its merged rows into the image positions,
+    /// switches the decoder onto interleaved M-RoPE and fuses the DeepStack taps — the port of
+    /// `_get_qwen_prompt_embeds`' `image is not None` branch.
+    pub fn encode_conditioning(
+        &self,
+        tokenizer: &TextTokenizer,
+        prompt: &str,
+        drop: usize,
+        references: &[PreparedReference],
+    ) -> Result<TextConditioning> {
+        if references.is_empty() {
+            let hidden = self.encode_prompt(tokenizer, prompt, drop)?;
+            let len = hidden.shape()[1] as usize;
+            return Ok(TextConditioning {
+                hidden,
+                image_pad_mask: vec![false; len],
+            });
+        }
+        let (tower, vision_cfg) = self.vision.as_ref().ok_or_else(|| {
+            Error::Unsupported(
+                "qwen_image_2_1: this snapshot ships no Qwen3-VL vision tower \
+                 (`text_encoder/config.json` has no `vision_config`, or `model.visual.*` is \
+                 missing), so reference images cannot be conditioned on. Reference conditioning \
+                 needs the tower: upstream encodes every condition image as vision context for the \
+                 text encoder as well as VAE latents for the DiT."
+                    .into(),
+            )
+        })?;
+        let merge = vision_cfg.processor.merge_size.max(1) as i32;
+        let image_token = image_pad_token_id(tokenizer)?;
+
+        // 1. Render + tokenize the image-conditioned template, then expand each single
+        //    `<|image_pad|>` placeholder into one token per merged vision patch — what
+        //    `Qwen3VLProcessor` does when it is handed `pixel_values`.
+        let text = prompt_template_ti2i(prompt, references.len());
+        let tokens = tokenizer.tokenize_preformatted(&text)?;
+        let placeholders = tokens.ids.iter().filter(|&&id| id == image_token).count();
+        if placeholders != references.len() {
+            return Err(Error::Msg(format!(
+                "qwen_image_2_1: the image-conditioned template tokenized to {placeholders} \
+                 `{IMAGE_PAD_TOKEN}` placeholders for {} reference images; the snapshot's \
+                 tokenizer does not render the upstream template",
+                references.len()
+            )));
+        }
+        let mut ids: Vec<i32> = Vec::with_capacity(tokens.ids.len());
+        let mut reference_cursor = 0usize;
+        for &id in &tokens.ids {
+            if id == image_token {
+                let slots = references[reference_cursor].vision_slots();
+                ids.extend(std::iter::repeat_n(id, slots));
+                reference_cursor += 1;
+            } else {
+                ids.push(id);
+            }
+        }
+        if ids.len() <= drop {
+            return Err(Error::Msg(format!(
+                "qwen_image_2_1: the image-conditioned prompt tokenized to {} tokens, not more \
+                 than the {drop} template tokens to drop",
+                ids.len()
+            )));
+        }
+
+        // 2. The ViT tower, per reference in order; merged rows and DeepStack taps concatenate in
+        //    the same order the placeholders appear.
+        let mut merged: Vec<Array> = Vec::with_capacity(references.len());
+        let mut taps: Vec<Vec<Array>> = Vec::new();
+        let mut grids: Vec<[i32; 3]> = Vec::with_capacity(references.len());
+        for reference in references {
+            let out = tower
+                .forward_with_deepstack(&reference.pixel_values, &[reference.grid_thw])
+                .map_err(from_llm)?;
+            if taps.is_empty() {
+                taps = vec![Vec::with_capacity(references.len()); out.deepstack_features.len()];
+            } else if taps.len() != out.deepstack_features.len() {
+                return Err(Error::Msg(
+                    "qwen_image_2_1: the vision tower returned a different number of DeepStack \
+                     taps for two references"
+                        .into(),
+                ));
+            }
+            for (slot, feature) in taps.iter_mut().zip(out.deepstack_features) {
+                slot.push(feature.as_dtype(Dtype::Float32)?);
+            }
+            merged.push(out.pooler_output.as_dtype(Dtype::Float32)?);
+            grids.push(reference.grid_thw);
+        }
+        let join = |parts: &[Array]| -> Result<Array> {
+            let refs: Vec<&Array> = parts.iter().collect();
+            Ok(concatenate_axis(&refs, 0)?)
+        };
+        let vision_features = join(&merged)?;
+        let deepstack: Vec<Array> = taps
+            .iter()
+            .map(|parts| join(parts))
+            .collect::<Result<Vec<_>>>()?;
+
+        // 3. Embed, splice the vision rows in, build interleaved M-RoPE positions.
+        let seq = ids.len() as i32;
+        let input_ids = Array::from_slice(&ids, &[1, seq]);
+        let embeds = self
+            .embed_tokens
+            .forward(&input_ids)?
+            .as_dtype(Dtype::Float32)?;
+        let hidden = self.hidden_size as i32;
+        let embeds = splice_vision_features(
+            &embeds,
+            &ids,
+            &vision_features,
+            &[image_token],
+            hidden,
+            Dtype::Float32,
+        )
+        .map_err(from_llm)?;
+        let (t_row, h_row, w_row, _) =
+            mrope_positions_mm(&ids, &grids, image_token, &[], i32::MIN, merge)
+                .map_err(from_llm)?;
+        let (cos, sin) = self
+            .mrope
+            .mrope_interleaved_cos_sin([&t_row, &h_row, &w_row], self.mrope_section, Dtype::Float32)
+            .map_err(from_llm)?;
+
+        // 4. Decoder layers with DeepStack fusion on the first `deepstack.len()` of them.
+        let visual_pos_mask: Vec<bool> = ids.iter().map(|&id| id == image_token).collect();
+        let attention_mask = Array::from_slice(&vec![1i32; ids.len()], &[1, seq]);
+        let mask = build_mask(&attention_mask, 1, seq)?;
+        let mut x = embeds;
+        for (i, layer) in self.layers.iter().enumerate() {
+            x = layer.forward(&x, &cos, &sin, &mask)?;
+            if let Some(feature) = deepstack.get(i) {
+                x = add_visual_features(&x, &visual_pos_mask, feature).map_err(from_llm)?;
+            }
+        }
+
+        let total = x.shape()[1];
+        Ok(TextConditioning {
+            hidden: x.index((.., drop as i32..total, ..)),
+            image_pad_mask: visual_pos_mask[drop..].to_vec(),
+        })
+    }
+}
+
+fn from_llm(e: mlx_llm::Error) -> Error {
+    match e {
+        mlx_llm::Error::Unsupported(m) => Error::Unsupported(m),
+        mlx_llm::Error::MissingTensor(k) => Error::MissingTensor(k),
+        other => Error::Msg(format!("qwen_image_2_1 vision: {other}")),
     }
 }
 

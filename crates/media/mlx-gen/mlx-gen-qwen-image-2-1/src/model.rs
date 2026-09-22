@@ -18,7 +18,11 @@ use mlx_gen::{
 
 use crate::config::{SchedulerConfig, DEFAULT_STEPS, DEFAULT_TRUE_CFG, PRESETS, SIZE_MULTIPLE};
 use crate::loader;
-use crate::pipeline::{create_noise, decode_rgb, denoise, DenoiseInputs};
+use crate::pipeline::{
+    create_noise, decode_rgb, denoise, encode_references, joint_layout, text_rows, DenoiseInputs,
+    ReferenceConditioning,
+};
+use crate::reference::{collect_references, prepare_references};
 use crate::scheduler;
 use crate::text_encoder::{system_prompt_drop_count, QwenImage21TextEncoder};
 use crate::transformer::QwenImage21Transformer;
@@ -55,9 +59,16 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: true,
-            // Text-to-image only in this story; the joint layout already models condition images
-            // for the reference/edit route, which will advertise `MultiReference` when it lands.
-            conditioning: vec![],
+            // Reference conditioning (sc-24110). `Reference` and `MultiReference` reach the same
+            // upstream call — one ordered list of one to ten condition images — so both kinds are
+            // advertised and flattened in request order, matching the seam the 2512 edit provider
+            // already exposes to SceneWorks routing. `Mask` is deliberately **not** advertised:
+            // upstream has no mask input (see UPSTREAM.md), and a mask travels as an ordinary
+            // extra reference the prompt names.
+            conditioning: vec![
+                gen_core::ConditioningKind::Reference,
+                gen_core::ConditioningKind::MultiReference,
+            ],
             supports_lora: false,
             supports_lokr: false,
             samplers: curated_sampler_names(),
@@ -225,12 +236,30 @@ impl QwenImage21 {
             false,
             on_progress,
             |te: &QwenImage21TextEncoder| {
-                let pos = te.encode_prompt(&self.tokenizer, &req.prompt, drop)?;
+                // The ordered reference list, host-preprocessed against the snapshot's own
+                // Qwen3-VL processor geometry. Empty ⇒ the text-to-image route, unchanged.
+                let images = collect_references(req)?;
+                let references = if images.is_empty() {
+                    Vec::new()
+                } else {
+                    let vision = te.vision_config().ok_or_else(|| {
+                        Error::Unsupported(
+                            "qwen_image_2_1: reference conditioning needs the snapshot's Qwen3-VL \
+                             vision tower (`text_encoder/config.json` `vision_config` + \
+                             `model.visual.*`), which this snapshot does not carry"
+                                .into(),
+                        )
+                    })?;
+                    prepare_references(&images, vision)?
+                };
+                let pos =
+                    te.encode_conditioning(&self.tokenizer, &req.prompt, drop, &references)?;
                 let neg = if params.use_negative {
-                    Some(te.encode_prompt(
+                    Some(te.encode_conditioning(
                         &self.tokenizer,
                         req.negative_prompt.as_deref().unwrap_or(""),
                         drop,
+                        &references,
                     )?)
                 } else {
                     None
@@ -238,14 +267,35 @@ impl QwenImage21 {
                 // MLX is lazy: force the conditioning while the encoder is alive, so a Sequential
                 // drop cannot leave an unevaluated graph pointing at freed weights.
                 match &neg {
-                    Some(neg) => mlx_rs::transforms::eval([&pos, neg])?,
-                    None => mlx_rs::transforms::eval([&pos])?,
+                    Some(neg) => mlx_rs::transforms::eval([&pos.hidden, &neg.hidden])?,
+                    None => mlx_rs::transforms::eval([&pos.hidden])?,
                 }
-                Ok((pos, neg))
+                Ok((pos, neg, references))
             },
             |_| Ok(()),
-            |heavy, (pos, neg), on_progress| {
+            |heavy, (pos, neg, references), on_progress| {
                 let channels = heavy.transformer.config().in_channels;
+                // The joint layout + the condition latents: both branches share one reference
+                // encode, but a different prompt is a different text length, hence two layouts.
+                let reference_latents = encode_references(&heavy.vae, &references)?;
+                let pos_layout =
+                    joint_layout(&pos.image_pad_mask, &references, req.width, req.height)?;
+                let neg_layout = neg
+                    .as_ref()
+                    .map(|neg| {
+                        joint_layout(&neg.image_pad_mask, &references, req.width, req.height)
+                    })
+                    .transpose()?;
+                let pos_text = text_rows(&pos.hidden, &pos.image_pad_mask)?;
+                let neg_text = neg
+                    .as_ref()
+                    .map(|neg| text_rows(&neg.hidden, &neg.image_pad_mask))
+                    .transpose()?;
+                let conditioning = (!references.is_empty()).then(|| ReferenceConditioning {
+                    latents: &reference_latents,
+                    layout: &pos_layout,
+                    negative_layout: neg_layout.as_ref(),
+                });
                 let mut images = Vec::with_capacity(req.count as usize);
                 for i in 0..req.count {
                     let seed = params.base_seed.wrapping_add(i as u64);
@@ -255,14 +305,19 @@ impl QwenImage21 {
                             transformer: &heavy.transformer,
                             sigmas: &params.sigmas,
                             latents,
-                            prompt_embeds: &pos,
-                            negative_embeds: neg.as_ref(),
+                            prompt_embeds: &pos_text,
+                            negative_embeds: neg_text.as_ref(),
                             true_cfg_scale: params.true_cfg,
                             width: req.width,
                             height: req.height,
                             sampler: req.sampler.as_deref(),
                             seed,
                             cancel: &req.cancel,
+                            references: conditioning.as_ref().map(|c| ReferenceConditioning {
+                                latents: c.latents,
+                                layout: c.layout,
+                                negative_layout: c.negative_layout,
+                            }),
                         },
                         on_progress,
                     )?;
@@ -349,7 +404,18 @@ mod tests {
             SizeFloor::RangeCheckedOnGrid { multiple: 32 }
         );
         assert!(d.capabilities.supports_true_cfg);
-        assert!(d.capabilities.conditioning.is_empty());
+        assert_eq!(
+            d.capabilities.conditioning,
+            vec![
+                gen_core::ConditioningKind::Reference,
+                gen_core::ConditioningKind::MultiReference,
+            ],
+            "the reference/edit route is the same upstream call as text-to-image"
+        );
+        assert!(
+            !d.capabilities.accepts(gen_core::ConditioningKind::Mask),
+            "upstream has no mask input; a mask travels as an ordinary extra reference"
+        );
         assert_eq!(d.denoiser_output_latent_space.map(|s| s.channels), Some(64));
         assert!(gen_core::registry::model_descriptor_errors(&d).is_empty());
     }

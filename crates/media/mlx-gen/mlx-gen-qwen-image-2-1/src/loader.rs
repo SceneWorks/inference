@@ -14,13 +14,16 @@
 //! Weights load dense at their on-disk dtype (bf16 released; f32 for the tiny parity snapshot) and
 //! every geometry comes from the component's own `config.json`, so one code path serves both.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result, WeightsSource};
 
-use crate::config::{SchedulerConfig, TextEncoderConfig, TransformerConfig, VaeConfig};
+use crate::config::{
+    SchedulerConfig, TextEncoderConfig, TransformerConfig, VaeConfig, VisionConfig,
+};
 use crate::text_encoder::QwenImage21TextEncoder;
 use crate::transformer::QwenImage21Transformer;
 use crate::vae::QwenImage21Vae;
@@ -73,16 +76,83 @@ pub fn load_tokenizer(root: &Path) -> Result<TextTokenizer> {
     )?)
 }
 
-/// The Qwen3-VL language tower from `<text_encoder>/` (config + shards).
-pub fn load_text_encoder_from(dir: &Path) -> Result<QwenImage21TextEncoder> {
-    let cfg = TextEncoderConfig::from_json_file(&dir.join("config.json"))?;
-    let w = Weights::from_dir(dir)?;
-    QwenImage21TextEncoder::from_weights(&w, TEXT_ENCODER_PREFIX, &cfg)
+/// Prefix of the ViT tower inside `Qwen3VLForConditionalGeneration` checkpoints.
+pub const VISION_TOWER_PREFIX: &str = "model.visual";
+
+/// The Qwen3-VL **vision** geometry for a snapshot: `text_encoder/config.json`'s `vision_config`
+/// plus the image-processor block of `processor/preprocessor_config.json` (falling back to
+/// `processor/processor_config.json`, which is what `save_pretrained` writes for a
+/// `Qwen3VLProcessor`).
+///
+/// `Ok(None)` when the snapshot declares no `vision_config` — the reference route then refuses
+/// with a typed error instead of rendering something wrongly conditioned.
+pub fn load_vision_config(root: &Path) -> Result<Option<VisionConfig>> {
+    let text_encoder = root.join("text_encoder").join("config.json");
+    if !text_encoder.is_file() {
+        return Ok(None);
+    }
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&text_encoder)?)
+        .map_err(|e| Error::Msg(format!("qwen_image_2_1: text_encoder/config.json: {e}")))?;
+    if value.get("vision_config").is_none() {
+        return Ok(None);
+    }
+    let mut processor = None;
+    for candidate in [
+        "processor/preprocessor_config.json",
+        "processor/processor_config.json",
+    ] {
+        let path = root.join(candidate);
+        if path.is_file() {
+            processor = Some(
+                serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path)?)
+                    .map_err(|e| Error::Msg(format!("qwen_image_2_1: {candidate}: {e}")))?,
+            );
+            break;
+        }
+    }
+    VisionConfig::from_value(&value, processor.as_ref()).map(Some)
 }
 
-/// The Qwen3-VL language tower from `<root>/text_encoder/`.
+/// The Qwen3-VL language tower from `<text_encoder>/` (config + shards), with the ViT tower
+/// attached when the snapshot ships one. `root` supplies the `processor/` geometry; pass `None`
+/// to load the language tower alone (the text-to-image path).
+pub fn load_text_encoder_from(
+    dir: &Path,
+    vision: Option<&VisionConfig>,
+) -> Result<QwenImage21TextEncoder> {
+    let cfg = TextEncoderConfig::from_json_file(&dir.join("config.json"))?;
+    let w = Weights::from_dir(dir)?;
+    let encoder = QwenImage21TextEncoder::from_weights(&w, TEXT_ENCODER_PREFIX, &cfg)?;
+    let Some(vision) = vision else {
+        return Ok(encoder);
+    };
+    // The ViT tower reads its own disjoint `model.visual.*` slice of the same shards. `mlx-llm`
+    // carries the shared Qwen3-VL tower, so the weights are handed across on its own `Weights`.
+    let visual: HashMap<String, mlx_rs::Array> = w
+        .keys()
+        .filter(|key| key.starts_with(VISION_TOWER_PREFIX))
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .filter_map(|key| w.get(&key).cloned().map(|array| (key, array)))
+        .collect();
+    if visual.is_empty() {
+        return Err(Error::MissingTensor(format!("{VISION_TOWER_PREFIX}.*")));
+    }
+    let tower = mlx_llm::models::Qwen3VLVisionModel::from_weights(
+        &mlx_llm::primitives::Weights::from_map(visual),
+        VISION_TOWER_PREFIX,
+        vision.tower.clone(),
+    )
+    .map_err(|e| Error::Msg(format!("qwen_image_2_1: Qwen3-VL vision tower: {e}")))?;
+    Ok(encoder.with_vision(tower, vision.clone()))
+}
+
+/// The Qwen3-VL language tower from `<root>/text_encoder/`, plus the ViT tower when the snapshot
+/// declares one.
 pub fn load_text_encoder(root: &Path) -> Result<QwenImage21TextEncoder> {
-    load_text_encoder_from(&root.join("text_encoder"))
+    let vision = load_vision_config(root)?;
+    load_text_encoder_from(&root.join("text_encoder"), vision.as_ref())
 }
 
 /// The DiT from `<root>/transformer/`.
