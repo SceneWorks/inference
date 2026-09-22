@@ -69,6 +69,44 @@ tiny snapshot written by `save_pretrained` in the exact layout above. One oracle
 the two backends cannot drift apart against two copies. Each Rust parity test names the tolerance it
 holds the port to and prints its measured error.
 
+## Installable tiers (sc-24112)
+
+Candle has **no affine-quantize-at-load path** for this family, and this story does not add one. What
+it adds is the other half: candle *installs* the pre-quantized tiers
+`mlx_gen_qwen_image_2_1::convert` produces, on exactly the artefacts MLX loads. Both packed
+components bind through `candle_gen::quant::AdaptLinear::linear_detect_gs`, which reads the packed
+triple straight into the quantized weight on the target device — no dense weight is ever
+materialized.
+
+| component | bf16 | q8 | q4 |
+|---|---|---|---|
+| `transformer/` | dense | packed Q8, group 64 | packed Q4, group 64 |
+| `text_encoder/` Qwen3 language tower | dense | packed Q8, group 64 | **packed Q8**, group 64 |
+| `text_encoder/` token embedding + norms | dense (`quant::guard_dense`) | dense | dense |
+| `vae/` | dense | dense | dense |
+
+`Capabilities::supported_quants` therefore reads `[Q4, Q8]` on this backend after this story, and
+`component_precision_floors` carries the Q4 → Q8 text-encoder floor. `LoadSpec::quantize` is a **tier
+selector** here: it is accepted only when the snapshot on disk already is that tier, a mismatch is
+refused with the snapshot to point at instead, and a Q4/Q8 request against a **dense** snapshot is
+still the same typed `Unsupported` ("no on-the-fly quantization") it was before.
+
+The text encoder is packed here and dense in the 2512 `candle-gen-qwen-image` crate; the reasons are
+in `mlx-gen-qwen-image-2-1/UPSTREAM.md` and in `crate::quant`.
+
+## Memory (sc-24112)
+
+`memory_strategy` publishes the shared ladder — `Resident`, `StagedResidency` and `BoundedDecode`
+implemented, the two bounded-DiT rungs classified — and prices each component from the snapshot's own
+tensor headers at the width **its** loader materializes it at. The text encoder is priced over the
+loaded `model.language_model.*` prefix only: the checkpoint's `lm_head` and its whole `model.visual.*`
+tower are on disk but materialized by nothing on this route.
+
+The derived tier and activation tables are owned once, in `mlx_gen_qwen_image_2_1::memory_strategy`,
+and are not duplicated here — parameter counts and joint-token arithmetic are properties of the model,
+not of the backend. `memory_strategy::admission_geometry` reports the same consumer envelope as the
+MLX twin.
+
 ## Deliberate divergences
 
 ### From upstream (shared with the MLX twin)

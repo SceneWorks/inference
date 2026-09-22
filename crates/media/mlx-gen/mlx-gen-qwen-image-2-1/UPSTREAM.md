@@ -59,6 +59,75 @@ Config keys read: `transformer/config.json` (`in_channels`, `out_channels`, `num
 miniature seeded configs, with the tiny snapshot written by `save_pretrained` in the exact layout
 above. Each Rust parity test names the tolerance it holds the port to.
 
+## Installable tiers (sc-24112)
+
+Qwen-Image 2.1 ships **pre-quantized**: a tier is a complete standalone snapshot in the layout above
+whose weight-bearing components are already affine-quantized, produced offline by
+`convert::prequantize_turnkey` and loaded with no dense transient. `LoadSpec::quantize` selects a
+tier; it is a transform request only against a dense snapshot.
+
+| component | bf16 | q8 | q4 |
+|---|---|---|---|
+| `transformer/` (7.12 B params in 232 Linears) | dense bf16 | packed Q8, group 64 | packed Q4, group 64 |
+| `text_encoder/` Qwen3 language tower (6.95 B params in 252 decoder Linears) | dense bf16 | packed Q8, group 64 | **packed Q8**, group 64 |
+| `text_encoder/` token embedding (622 M) | dense | dense | dense |
+| `text_encoder/` `lm_head`, `model.visual.*` | dense, **not loaded** by this route | dense | dense |
+| `vae/` (338 M) | dense f32 | dense f32 | dense f32 |
+
+Three decisions, each deliberate:
+
+* **The text encoder is packed**, unlike the 2512 `mlx-gen-qwen-image` crate. 2512 pairs a ~20 B DiT
+  with a ~7 B tower, so a dense tower is a minority of its footprint. 2.1 pairs a **7.12 B** DiT with
+  a **7.57 B** tower: under `Sequential` the resident floor is `max(tower, DiT + VAE)`, so a dense
+  tower would pin that floor at ~14.5 GiB at every tier and the Q4 tier would buy ~0.3 GiB over Q8.
+  Reusing 2512's table here would have produced a tier that cannot do its job.
+* **The Q4 tier holds the tower at Q8** — declared through
+  `Capabilities::component_precision_floors`, never silent. That floor is a *prior* carried from
+  `mlx_gen_mage`'s measured Qwen-LM-tower sweep (a Q4 SwiGLU MLP collapses generation quality; Q8
+  attention + MLP holds), not a measurement of this model. Confirming or retiring it on real weights
+  belongs to the epic's terminal measurement story.
+* **Group size 64, uniformly.** A tier declares exactly one `quantization.group_size`, and the
+  packed bit-width is derived from the packed shapes *at the group size the loader passes*, so a tier
+  mixing group sizes would be decoded at the wrong width. A `Linear` narrower than 64 therefore stays
+  dense. The released geometry has no such width (its four DiT input widths are 64 / 4096 / 4096 /
+  12288 and the tower's are 4096 / 12288), so in production the converter packs everything; only the
+  miniature parity snapshot is partly dense.
+
+The converted artefacts are **byte-reproducible** (keys are sorted before serialization and the
+config merge is deterministic) and each packed triple is **byte-identical to `mlx_rs::ops::quantize`**
+over the bf16 source — the same op the load-time quantizer runs. `tests/tiers.rs` pins both, and
+`tests/fixtures/tiers/` carries the committed miniature tiers the Candle backend reads.
+
+### Producing a tier
+
+```sh
+QWEN21_SRC=<dense snapshot> QWEN21_TIER=q4 QWEN21_DST=~/SceneWorks/qwen-image-2-1-tiers \
+  cargo run --release --example qwen_image_2_1_prequant -p mlx-gen-qwen-image-2-1
+```
+
+The example prints a SHA-256 manifest of everything it wrote.
+
+## Memory (sc-24112)
+
+`memory_strategy` publishes the shared ladder: `Resident`, `StagedResidency` and `BoundedDecode` are
+implemented; `BoundedAttention` and `BoundedTransformerResidency` are classified
+`StructurallyNotApplicable` (block-causal per-segment attention has no chunked variant here, and
+there is no block-streaming loader) rather than left to the ladder's cost order.
+
+`memory_strategy::derived` publishes a closed-form estimate of resident weights and of the warm
+activation transient for every tier at every preset. **Every number there is derived** — parameter
+counts × dtype width, plus a structural count of the live tensors in this crate's own forward — and
+this route therefore registers **no** `ActivationMemoryRegistration`: that carrier publishes only
+real on-device measurements, so filing a derivation there would launder an estimate into evidence.
+`activation_memory_bytes_1024("qwen_image_2_1")` answers `None`, and callers fall back to the
+asset-facts + generic-headroom estimate path where the estimate safety margin applies. None of it is
+copied from the 2512 route.
+
+`memory_strategy::admission_geometry` reports the envelope a consumer must gate on: the largest
+preset **area** (2400×1792, which is neither the widest preset nor the square default), the latent
+tokens it contributes, and the fact that each of up to 10 reference images adds a full block of image
+tokens to the joint sequence.
+
 ## Deliberate divergences
 
 * No prefix KV cache: every step evaluates the full block-causal joint sequence (upstream's exact

@@ -38,7 +38,9 @@ use mlx_rs::{Array, Dtype};
 use crate::config::{TextEncoderConfig, SYSTEM_PROMPT};
 
 /// Group size for a pre-quantized (packed) Qwen3 tower — the codebase-wide default (64).
-const GROUP_SIZE: i32 = 64;
+/// Single-sourced from [`crate::quant::GROUP_SIZE`]: the converter writes tiers at this group
+/// size and the packed-detect loaders must read them back at the same one.
+const GROUP_SIZE: i32 = crate::quant::GROUP_SIZE;
 
 /// The system-role prefix of the T2I template — exactly what upstream tokenizes to derive
 /// `_drop_idx`.
@@ -75,6 +77,9 @@ pub struct QwenImage21TextEncoder {
     layers: Vec<EncoderLayer>,
     rope: TextRope,
     hidden_size: usize,
+    /// The SwiGLU intermediate width — the second of the two `Linear` input widths
+    /// [`Self::quantize`] has to be able to cover at [`GROUP_SIZE`].
+    intermediate_size: usize,
 }
 
 impl QwenImage21TextEncoder {
@@ -105,6 +110,7 @@ impl QwenImage21TextEncoder {
             layers,
             rope: TextRope::new(cfg.head_dim as i32, cfg.rope_theta),
             hidden_size: cfg.hidden_size,
+            intermediate_size: cfg.intermediate_size,
         })
     }
 
@@ -112,12 +118,31 @@ impl QwenImage21TextEncoder {
         self.hidden_size
     }
 
-    /// Quantize every decoder Linear to Q4/Q8 (the embedding and norms stay dense).
-    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+    /// `true` iff both decoder `Linear` input widths are multiples of [`crate::quant::GROUP_SIZE`] — i.e. this
+    /// geometry can be affine-quantized at the one group size a Qwen-Image 2.1 tier may declare
+    /// ([`crate::quant`]). The released Qwen3 tower (4096 / 12288) can; the miniature parity
+    /// snapshot (32 / 64) cannot.
+    pub fn is_group_aligned(&self) -> bool {
+        self.hidden_size.is_multiple_of(GROUP_SIZE as usize)
+            && self.intermediate_size.is_multiple_of(GROUP_SIZE as usize)
+    }
+
+    /// Quantize every decoder `Linear` to Q4/Q8 at [`crate::quant::GROUP_SIZE`] (the embedding and the norms stay
+    /// dense — see [`crate::quant`]'s per-component table), returning whether anything was packed.
+    ///
+    /// A geometry [`Self::is_group_aligned`] rejects is left **dense** rather than packed at a
+    /// second group size: a tier declares exactly one `quantization.group_size`, and a component
+    /// packed at another would be decoded at the wrong bit-width on reload. This mirrors
+    /// [`crate::transformer::QwenImage21Transformer::quantize`]'s own width fallback, minus its
+    /// group-32 arm, which a shippable tier cannot use.
+    pub fn quantize(&mut self, bits: i32) -> Result<bool> {
+        if !self.is_group_aligned() {
+            return Ok(false);
+        }
         for layer in &mut self.layers {
             layer.quantize(bits)?;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// `input_ids` `[1, L]` (i32) + `attention_mask` `[1, L]` → the last decoder layer's hidden

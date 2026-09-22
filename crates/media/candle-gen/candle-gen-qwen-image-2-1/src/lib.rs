@@ -70,7 +70,9 @@ use candle_gen::{CandleError as Error, Result};
 
 pub mod config;
 pub mod loader;
+pub mod memory_strategy;
 pub mod pipeline;
+pub mod quant;
 pub mod scheduler;
 pub mod text_encoder;
 pub mod transformer;
@@ -103,10 +105,12 @@ pub use config::{
 pub use loader::{
     load_scheduler_config, load_text_encoder, load_tokenizer, load_transformer, load_vae,
 };
+pub use memory_strategy::{admission_geometry, AdmissionGeometry};
 pub use pipeline::{
     create_noise, decode_rgb, decode_tiling, denoise, encode_prompt, pack_latents,
     rgba_to_rgb_over_white, unpack_latents, DenoiseInputs, DECODE_OVERLAP, DECODE_TILE_EDGE,
 };
+pub use quant::{Tier, COMPONENT_PRECISION_FLOORS, GROUP_SIZE, TEXT_ENCODER_Q4_FLOOR};
 pub use text_encoder::{
     prompt_template, system_prefix, system_prompt_drop_count, QwenImage21TextEncoder,
 };
@@ -154,9 +158,15 @@ pub fn descriptor() -> ModelDescriptor {
             min_size: MIN_SIZE,
             max_size,
             max_count: 8,
-            // Candle has no affine-quantize-at-load path; a pre-packed snapshot still loads
-            // through the DiT's packed-detect Linears. See the crate docs.
-            supported_quants: &[] as &[Quant],
+            // **Installable** tiers, not on-the-fly ones (sc-24112). Candle still has no
+            // affine-quantize-at-load path — `validate_load_spec` refuses `quantize` against a
+            // dense snapshot with the same typed `Unsupported` as before — but the pre-quantized
+            // Q4/Q8 tiers `mlx_gen_qwen_image_2_1::convert` writes DO install here: the DiT and the
+            // Qwen3 tower both bind through `AdaptLinear::linear_detect_gs`. Advertising the tiers
+            // is what lets the worker's A-B tier toggle reach this backend; see `crate::quant`.
+            supported_quants: &[Quant::Q4, Quant::Q8],
+            // The Q4 tier holds the Qwen3 language tower at Q8 — declared, never silent.
+            component_precision_floors: crate::quant::COMPONENT_PRECISION_FLOORS,
             requires_sigma_shift: true,
             supports_sequential_offload: true,
             // Both sides must be multiples of 32 px (16× VAE × 2×2 vision slot).
@@ -208,7 +218,13 @@ pub(crate) fn validate_load_spec(spec: &LoadSpec) -> gen_core::Result<()> {
                 .into(),
         ));
     }
-    if spec.quantize.is_some() {
+    // `spec.quantize` is a TIER SELECTOR here, resolved against the snapshot on disk: it matches a
+    // pre-quantized tier (loaded packed, no quantization pass), or it is refused. A dense snapshot
+    // with a Q4/Q8 request is still the same typed `Unsupported` — candle cannot produce that tier
+    // itself. See `crate::quant::resolve_requested_tier`.
+    if let gen_core::WeightsSource::Dir(root) = &spec.weights {
+        crate::quant::resolve_requested_tier(root, spec.quantize)?;
+    } else if spec.quantize.is_some() {
         return Err(gen_core::Error::Unsupported(
             "qwen_image_2_1: candle has no on-the-fly Q4/Q8 quantization; provision an \
              already-packed snapshot instead"
@@ -426,7 +442,23 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(REGISTRATION)
+    register_memory_contract_surfaces(registry.register_generator(REGISTRATION))
+}
+
+/// The shared-ladder registrations (sc-24112). Split out the way the sibling Candle providers do so
+/// a CUDA-less catalog build can append the contract surface to a registry that already carries the
+/// generator, without registering it twice.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(candle_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: candle_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: MODEL_ID,
+            contract: |spec| memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec),
+        })
+        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR_REGISTRATION)
 }
 
 /// Build the complete explicit Candle Qwen-Image 2.1 provider catalog.

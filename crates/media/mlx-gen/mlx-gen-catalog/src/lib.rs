@@ -942,8 +942,11 @@ mod tests {
         // had no `MemoryProviderContract` at all before, so both ids were absent from every count
         // below — and sc-22736 added `wan2_2_t2v_14b` and `wan2_2_i2v_14b`, which now carry the
         // pre-load half of what their loaded generators already publish.
-        assert_eq!(registry.memory_strategy_registrations().len(), 58);
-        assert_eq!(registry.memory_contract_fixture_registrations().len(), 55);
+        // sc-24112 adds `qwen_image_2_1`: the MLX Qwen-Image 2.1 route now publishes the shared
+        // ladder (Resident / StagedResidency / BoundedDecode implemented, the two bounded-DiT rungs
+        // classified `StructurallyNotApplicable`), so it joins both registries — 58/55 -> 59/56.
+        assert_eq!(registry.memory_strategy_registrations().len(), 59);
+        assert_eq!(registry.memory_contract_fixture_registrations().len(), 56);
         let resident_only: Vec<_> = registry
             .resident_only_memory_contract_registrations()
             .map(|registration| registration.provider_id)
@@ -965,7 +968,12 @@ mod tests {
         // sc-22736 adds the two A14B routes as a THIRD narrowed shape: both ship all three tiers,
         // and the MLX worker loads every one of them Resident + eagerly materialized, so each
         // witnesses one selector per tier — 3 apiece, not 12.
-        assert_eq!(surfaces.len(), 51 * 12 + 6 + 3 + 2 * 3);
+        //
+        // sc-24112's `qwen_image_2_1` is a full-surface provider: it admits all three tiers under
+        // both offload policies and both materialization shapes (its contract classifies the
+        // bounded-DiT rungs rather than narrowing its selector universe), so it joins the 12-apiece
+        // group — 51 -> 52.
+        assert_eq!(surfaces.len(), 52 * 12 + 6 + 3 + 2 * 3);
         assert!(surfaces.iter().all(|surface| !surface.composed));
         let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);

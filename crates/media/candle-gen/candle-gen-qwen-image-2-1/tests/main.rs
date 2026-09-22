@@ -34,6 +34,9 @@ mod scheduler_parity;
 #[path = "text_encoder_parity.rs"]
 mod text_encoder_parity;
 
+#[path = "tiers.rs"]
+mod tiers;
+
 #[path = "transformer_parity.rs"]
 mod transformer_parity;
 
