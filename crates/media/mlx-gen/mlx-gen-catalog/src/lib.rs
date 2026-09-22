@@ -42,6 +42,7 @@ pub mod providers {
     pub use mlx_gen_pid as pid;
     pub use mlx_gen_pulid as pulid;
     pub use mlx_gen_qwen_image as qwen_image;
+    pub use mlx_gen_qwen_image_2_1 as qwen_image_2_1;
     pub use mlx_gen_sam2 as sam2;
     pub use mlx_gen_sam3 as sam3;
     pub use mlx_gen_sana as sana;
@@ -106,6 +107,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = mlx_gen_mochi::register_providers(registry);
     let registry = mlx_gen_pulid::register_providers(registry);
     let registry = mlx_gen_qwen_image::register_providers(registry);
+    let registry = mlx_gen_qwen_image_2_1::register_providers(registry);
     let registry = mlx_gen_sana::register_providers(registry);
     let registry = mlx_gen_scail2::register_providers(registry);
     let registry = mlx_gen_sd3::register_providers(registry);
@@ -759,9 +761,10 @@ mod tests {
     fn every_registered_generator_advertises_its_exact_latent_space() {
         use mlx_gen::gen_core::{
             LatentSpace, FLUX1_LATENT_SPACE, FLUX2_PACKED_LATENT_SPACE, LTX_VIDEO_LATENT_SPACE,
-            MAGE_LATENT_SPACE, MOCHI_VIDEO_LATENT_SPACE, QWEN_KREA_Z16_LATENT_SPACE,
-            SANA_LATENT_SPACE, SD3_LATENT_SPACE, SDXL_LATENT_SPACE, SEEDVR2_VIDEO_LATENT_SPACE,
-            SVD_LATENT_SPACE, WAN_Z16_VIDEO_LATENT_SPACE, WAN_Z48_LATENT_SPACE,
+            MAGE_LATENT_SPACE, MOCHI_VIDEO_LATENT_SPACE, QWEN_IMAGE_2_1_Z64_LATENT_SPACE,
+            QWEN_KREA_Z16_LATENT_SPACE, SANA_LATENT_SPACE, SD3_LATENT_SPACE, SDXL_LATENT_SPACE,
+            SEEDVR2_VIDEO_LATENT_SPACE, SVD_LATENT_SPACE, WAN_Z16_VIDEO_LATENT_SPACE,
+            WAN_Z48_LATENT_SPACE,
         };
 
         fn expected(
@@ -769,6 +772,8 @@ mod tests {
         ) -> Option<&'static LatentSpace> {
             match descriptor.family {
                 "anima" | "qwen-image" | "krea_2" => Some(&QWEN_KREA_Z16_LATENT_SPACE),
+                // Qwen-Image 2.1's 64-channel RGBA autoencoder is its own lineage (sc-24108).
+                "qwen-image-2-1" => Some(&QWEN_IMAGE_2_1_Z64_LATENT_SPACE),
                 "krea_realtime" => Some(&WAN_Z16_VIDEO_LATENT_SPACE),
                 "wan" if descriptor.id == "wan2_2_ti2v_5b" => Some(&WAN_Z48_LATENT_SPACE),
                 "bernini" | "scail2" | "wan" => Some(&WAN_Z16_VIDEO_LATENT_SPACE),
@@ -1773,6 +1778,7 @@ mod tests {
                 "qwen_image",
                 "qwen_image_control",
                 "qwen_image_edit",
+                "qwen_image_2_1",
                 "sana_1600m",
                 "sana_sprint_1600m",
                 "scail2_14b",
@@ -1840,8 +1846,9 @@ mod tests {
             .chain(&image_embedders)
             .chain(&text_embedders)
             .collect();
-        assert_eq!(distinct.len(), 70);
-        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 60);
+        // sc-24108 adds `qwen_image_2_1` (a generator with its own component row): 71 / 61.
+        assert_eq!(distinct.len(), 71);
+        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 61);
     }
 
     /// Mage-Flow's base, turbo, and RL variants are registered on the shipped MLX platform surface
