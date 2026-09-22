@@ -344,6 +344,10 @@ impl QwenImage21 {
 /// negative/guidance support, sampler/scheduler membership, finiteness) plus the family's own
 /// `steps >= 2` (the terminal-sigma stretch is undefined at one step).
 pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<()> {
+    // The reference list first, so a caller sees the actionable message (the `Mask` workaround,
+    // the one-to-ten window) rather than the shared floor's generic "unsupported conditioning",
+    // and so a bad count is refused before any weight is touched.
+    collect_references(req)?;
     caps.validate_request(MODEL_ID, req)?;
     if req.prompt.trim().is_empty() && req.negative_prompt.is_none() {
         // Upstream renders an empty prompt as a single space; accept it, but a whitespace-only
@@ -450,6 +454,44 @@ mod tests {
         r.prompt = "   ".into();
         let err = validate_request(&caps, &r).unwrap_err().to_string();
         assert!(err.contains("prompt is empty"), "{err}");
+    }
+
+    #[test]
+    fn reference_shapes_are_refused_at_validate_before_any_weight_loads() {
+        use mlx_gen::gen_core::{Conditioning, Image};
+
+        let caps = descriptor().capabilities;
+        let image = |n: u32| Image {
+            width: n,
+            height: n,
+            pixels: vec![0; (n * n * 3) as usize],
+        };
+        let mut r = req(2048, 2048);
+        assert!(
+            validate_request(&caps, &r).is_ok(),
+            "no conditioning is T2I"
+        );
+
+        r.conditioning = vec![Conditioning::MultiReference {
+            images: (0..11).map(|_| image(8)).collect(),
+        }];
+        let err = validate_request(&caps, &r).unwrap_err().to_string();
+        assert!(err.contains("at most 10"), "{err}");
+
+        // The `Mask` refusal must be this route's actionable message, not the shared floor's
+        // generic "unsupported conditioning" — which is why the reference check runs first.
+        r.conditioning = vec![Conditioning::Mask { image: image(8) }];
+        let err = validate_request(&caps, &r).unwrap_err().to_string();
+        assert!(err.contains("no mask input"), "{err}");
+        assert!(err.contains("extra reference"), "{err}");
+
+        r.conditioning = vec![Conditioning::MultiReference {
+            images: (0..10).map(|_| image(8)).collect(),
+        }];
+        assert!(
+            validate_request(&caps, &r).is_ok(),
+            "ten references is the documented boundary"
+        );
     }
 
     #[test]
