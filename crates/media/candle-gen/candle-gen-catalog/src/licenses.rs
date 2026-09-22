@@ -820,9 +820,6 @@ mod tests {
             "krea_realtime_video",
             "wan2_1_t2v_14b_diffusers",
             "wan2_1_vace_1_3b_diffusers",
-            // Qwen-Image 2.1 (sc-24108): the MLX provider landed first; the Candle provider lands
-            // in sc-24109, which removes this pin when it registers `qwen_image_2_1`.
-            "qwen_image_2_1",
             // The bespoke Candle PuLID path and the overlay crates (sc-16668), which register
             // no provider id on this backend. Candle has no `sam2` crate at all, so both SAM 2.1
             // rows are unreached here as well.
