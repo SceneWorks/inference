@@ -31,6 +31,9 @@ mod pipeline_parity;
 #[path = "registration.rs"]
 mod registration;
 
+#[path = "rgba_parity.rs"]
+mod rgba_parity;
+
 #[path = "scheduler_parity.rs"]
 mod scheduler_parity;
 

@@ -16,10 +16,21 @@
 //!    the vision tower and `.preprocess(...)` for the VAE on the same source at the same size).
 //! 3. The **vision** copy goes through the snapshot's Qwen3-VL processor geometry
 //!    ([`mlx_llm::image::Qwen35ImageProcessor`]) into `pixel_values` + `grid_thw`.
-//! 4. The **VAE** copy becomes RGBA NCHW in `[-1, 1]`. gen-core's [`Image`] is RGB8, so the alpha
-//!    upstream's `img.convert("RGBA")` synthesises for an opaque source is the constant `1.0`, and
-//!    upstream's "flatten RGBA over white for the vision tower" step is then the identity — which
-//!    is what lets one resized buffer serve both.
+//! 4. The **VAE** copy becomes RGBA NCHW in `[-1, 1]`, carrying **all four channels**.
+//!
+//! Upstream converts every condition image to `RGBA` up front (`img.convert("RGBA")`) and then
+//! splits the two consumers deliberately: `_get_qwen_prompt_embeds` composites the RGBA copy over
+//! **white** before the Qwen3-VL processor sees it ("the checkpoint was trained with the alpha
+//! composited over white for the vision encoder"), while `image_processor.preprocess` hands the
+//! VAE all four channels. Both of those are reproduced here literally (sc-24111): a
+//! [`Conditioning::ReferenceRgba`] reference's alpha reaches the VAE encode intact and is
+//! flattened over white for the vision tower only.
+//!
+//! An ordinary RGB [`Conditioning::Reference`] is the `A = 255` special case of exactly that
+//! path — the widening upstream's `convert("RGBA")` performs — so the white composite is the
+//! identity and the VAE alpha is the constant `+1.0`. The RGB reference route is therefore
+//! byte-for-byte what it was before transparent references existed, which `rgb_reference_is_the_
+//! opaque_rgba_case` asserts.
 //!
 //! The two grids have to agree: `(h'/32) · (w'/32)` merged vision patches × 4 latent tokens per
 //! slot must equal the `(h'/16) · (w'/16)` VAE tokens. They do whenever the processor's own
@@ -29,8 +40,8 @@
 //! the blocks.
 
 use mlx_gen::gen_core::imageops::checked_image_buffer_len;
-use mlx_gen::image::resize_lanczos_u8;
-use mlx_gen::{Conditioning, Error, GenerationRequest, Image, Result};
+use mlx_gen::image::resize_lanczos_rgba_u8;
+use mlx_gen::{Conditioning, Error, GenerationRequest, Image, Result, RgbaImage};
 use mlx_rs::Array;
 
 use crate::config::{
@@ -88,7 +99,7 @@ impl PreparedReference {
 
 /// Reject a reference whose buffer disagrees with its declared size, or whose size is zero.
 /// `index` only names the offender in the message.
-fn validate_image(image: &Image, index: usize) -> Result<()> {
+fn validate_image(image: &RgbaImage, index: usize) -> Result<()> {
     if image.width == 0 || image.height == 0 {
         return Err(Error::Msg(format!(
             "qwen_image_2_1: reference image {index} is {}x{}; a reference must have both sides \
@@ -96,17 +107,17 @@ fn validate_image(image: &Image, index: usize) -> Result<()> {
             image.width, image.height
         )));
     }
-    let expected = checked_image_buffer_len(image.width as usize, image.height as usize, 3)
+    let expected = checked_image_buffer_len(image.width as usize, image.height as usize, 4)
         .ok_or_else(|| {
             Error::Msg(format!(
-                "qwen_image_2_1: reference image {index} is {}x{}, which overflows an RGB \
+                "qwen_image_2_1: reference image {index} is {}x{}, which overflows an RGBA \
                      buffer length",
                 image.width, image.height
             ))
         })?;
     if image.pixels.len() != expected {
         return Err(Error::Msg(format!(
-            "qwen_image_2_1: reference image {index} carries {} bytes, not the {expected} an RGB8 \
+            "qwen_image_2_1: reference image {index} carries {} bytes, not the {expected} an RGBA8 \
              {}x{} image needs",
             image.pixels.len(),
             image.width,
@@ -117,7 +128,10 @@ fn validate_image(image: &Image, index: usize) -> Result<()> {
 }
 
 /// The per-reference resize target upstream derives for `image` at `output_resolution`.
-pub fn reference_target_size(image: &Image, output_resolution: u32) -> Result<(u32, u32)> {
+///
+/// Geometry only — it reads `width`/`height`, so an RGB and an RGBA reference of the same size fit
+/// identically.
+pub fn reference_target_size(image: &RgbaImage, output_resolution: u32) -> Result<(u32, u32)> {
     validate_image(image, 0)?;
     let area = f64::from(output_resolution) * f64::from(output_resolution);
     Ok(calculate_dimensions(
@@ -132,7 +146,10 @@ pub fn reference_target_size(image: &Image, output_resolution: u32) -> Result<(u
 /// SceneWorks always sends an explicit size, so this is not on the render path; it is the
 /// documented derivation a caller can use to fill the request, and the ordering tests assert that
 /// it reads the *last* reference rather than the first.
-pub fn reference_derived_size(references: &[Image], output_resolution: u32) -> Result<(u32, u32)> {
+pub fn reference_derived_size(
+    references: &[RgbaImage],
+    output_resolution: u32,
+) -> Result<(u32, u32)> {
     let last = references.last().ok_or_else(|| {
         Error::Msg("qwen_image_2_1: no reference images to derive the output size from".into())
     })?;
@@ -142,7 +159,7 @@ pub fn reference_derived_size(references: &[Image], output_resolution: u32) -> R
 /// Preprocess one reference: resize once (LANCZOS), then fan out to the vision processor and the
 /// VAE. `index` only names the offender in error messages.
 pub fn prepare_reference(
-    image: &Image,
+    image: &RgbaImage,
     index: usize,
     vision: &VisionConfig,
 ) -> Result<PreparedReference> {
@@ -152,20 +169,32 @@ pub fn prepare_reference(
     let (src_h, src_w) = (image.height as usize, image.width as usize);
     let (dst_h, dst_w) = (rh as usize, rw as usize);
 
-    // One resize on the u8 RGB source (PIL LANCZOS, `VaeImageProcessor`'s default resample). The
-    // resampler already clips to `[0, 255]` integers, so the cast is exact.
+    // One resize on the u8 **RGBA** source (PIL LANCZOS, `VaeImageProcessor`'s default resample),
+    // matching upstream's order: convert to RGBA first, resize all four channels together, split
+    // the consumers afterwards. The resampler already clips to `[0, 255]` integers, so the cast is
+    // exact.
     let resized: Vec<u8> = if (src_h, src_w) == (dst_h, dst_w) {
         image.pixels.clone()
     } else {
-        resize_lanczos_u8(&image.pixels, src_h, src_w, dst_h, dst_w)?
+        resize_lanczos_rgba_u8(&image.pixels, src_h, src_w, dst_h, dst_w)?
             .into_iter()
             .map(|v| v.clamp(0.0, 255.0) as u8)
             .collect()
     };
 
+    // The VISION copy is flattened over white — upstream's `white.paste(img, mask=A)` in
+    // `_get_qwen_prompt_embeds`, which the checkpoint was trained with. Only this copy; the VAE
+    // below still reads all four channels. For an opaque reference this is the identity.
+    let vision_rgb = RgbaImage {
+        width: rw,
+        height: rh,
+        pixels: resized.clone(),
+    }
+    .to_rgb_over_white()?;
+
     let (pixel_values, grids) = vision
         .processor
-        .preprocess(&resized, dst_w, dst_h)
+        .preprocess(&vision_rgb.pixels, dst_w, dst_h)
         .map_err(from_llm)?;
     let grid_thw = *grids.first().ok_or_else(|| {
         Error::Msg(format!(
@@ -195,14 +224,14 @@ pub fn prepare_reference(
     Ok(PreparedReference {
         pixel_values,
         grid_thw,
-        vae_input: rgb8_to_rgba_nchw(&resized, dst_w, dst_h),
+        vae_input: rgba8_to_nchw(&resized, dst_w, dst_h),
         size: (rw, rh),
     })
 }
 
 /// Preprocess every reference, in order.
 pub fn prepare_references(
-    images: &[Image],
+    images: &[RgbaImage],
     vision: &VisionConfig,
 ) -> Result<Vec<PreparedReference>> {
     validate_reference_count(images.len())?;
@@ -213,14 +242,18 @@ pub fn prepare_references(
         .collect()
 }
 
-/// RGB8 HWC → RGBA NCHW `[1, 4, h, w]` in `[-1, 1]`, alpha constant `1.0` (upstream's
-/// `img.convert("RGBA")` on an opaque source, then `VaeImageProcessor`'s `2x − 1`).
-fn rgb8_to_rgba_nchw(pixels: &[u8], width: usize, height: usize) -> Array {
+/// RGBA8 HWC → RGBA NCHW `[1, 4, h, w]` in `[-1, 1]` — `VaeImageProcessor.preprocess`'s
+/// `2x − 1`, applied to **all four channels** exactly as upstream hands them to the VAE.
+///
+/// The alpha is normalised by the same `2x − 1` as the colour (it is just a fourth plane to
+/// `preprocess`), which is what makes the decode side's `x·0.5 + 0.5` its exact inverse. An opaque
+/// reference (`A = 255`) yields the constant `+1.0` plane the RGB route always produced.
+fn rgba8_to_nchw(pixels: &[u8], width: usize, height: usize) -> Array {
     let plane = width * height;
-    let mut out = vec![1.0f32; 4 * plane];
-    for (c, chunk) in out.chunks_mut(plane).enumerate().take(3) {
+    let mut out = vec![0.0f32; 4 * plane];
+    for (c, chunk) in out.chunks_mut(plane).enumerate() {
         for (i, v) in chunk.iter_mut().enumerate() {
-            *v = f32::from(pixels[i * 3 + c]) / 255.0 * 2.0 - 1.0;
+            *v = f32::from(pixels[i * 4 + c]) / 255.0 * 2.0 - 1.0;
         }
     }
     Array::from_slice(&out, &[1, 4, height as i32, width as i32])
@@ -235,7 +268,13 @@ fn from_llm(e: mlx_llm::Error) -> Error {
 }
 
 /// The ordered reference list a request carries, flattened from every
-/// [`Conditioning::Reference`] / [`Conditioning::MultiReference`] **in request order**.
+/// [`Conditioning::Reference`] / [`Conditioning::ReferenceRgba`] / [`Conditioning::MultiReference`]
+/// **in request order**, every entry widened to RGBA.
+///
+/// RGB entries are widened with `A = 255` — upstream's `img.convert("RGBA")`, which it applies to
+/// every condition image whatever its mode — so the three carriers land in one ordered list and
+/// may be freely interleaved. An [`Conditioning::ReferenceRgba`] entry keeps the alpha it came
+/// with (sc-24111).
 ///
 /// Returns `Ok(vec![])` for a request with no conditioning at all — that is the text-to-image
 /// route, which stays exactly as it was. Every other shape is a typed refusal:
@@ -245,24 +284,22 @@ fn from_llm(e: mlx_llm::Error) -> Error {
 /// * an empty `MultiReference`, or a conditioning list that yields zero images.
 /// * more than [`MAX_REFERENCE_IMAGES`].
 /// * any other conditioning kind — [`Error::Unsupported`], as the capability floor would.
-pub fn collect_references(req: &GenerationRequest) -> Result<Vec<Image>> {
+pub fn collect_references(req: &GenerationRequest) -> Result<Vec<RgbaImage>> {
     if req.conditioning.is_empty() {
         return Ok(Vec::new());
     }
-    let mut images: Vec<Image> = Vec::new();
+    let mut images: Vec<RgbaImage> = Vec::new();
     for (slot, conditioning) in req.conditioning.iter().enumerate() {
         match conditioning {
             Conditioning::Reference { image, strength } => {
-                if let Some(strength) = strength {
-                    if (strength - 1.0).abs() > f32::EPSILON {
-                        return Err(Error::Unsupported(format!(
-                            "qwen_image_2_1: conditioning slot {slot} sets reference strength \
-                             {strength}, but Qwen-Image 2.1 conditions on a reference at full \
-                             weight — upstream's condition images have no strength. Drop the field \
-                             (or send 1.0)."
-                        )));
-                    }
-                }
+                reject_reference_strength(slot, *strength)?;
+                images.push(widen_rgb(image, slot)?);
+            }
+            // A reference that carries its own alpha (sc-24111) — a transparent layer being
+            // edited, or a previously extracted subject. Same ordering and strength rules as the
+            // RGB carrier; the alpha survives to the VAE encode (see `prepare_reference`).
+            Conditioning::ReferenceRgba { image, strength } => {
+                reject_reference_strength(slot, *strength)?;
                 images.push(image.clone());
             }
             Conditioning::MultiReference { images: refs } => {
@@ -273,7 +310,9 @@ pub fn collect_references(req: &GenerationRequest) -> Result<Vec<Image>> {
                          for text-to-image"
                     )));
                 }
-                images.extend(refs.iter().cloned());
+                for image in refs {
+                    images.push(widen_rgb(image, slot)?);
+                }
             }
             Conditioning::Mask { .. } => {
                 return Err(Error::Unsupported(format!(
@@ -288,7 +327,7 @@ pub fn collect_references(req: &GenerationRequest) -> Result<Vec<Image>> {
             other => {
                 return Err(Error::Unsupported(format!(
                     "qwen_image_2_1: conditioning slot {slot} is {:?}, which this route does not \
-                     accept; it takes Reference and MultiReference only",
+                     accept; it takes Reference, ReferenceRgba and MultiReference only",
                     other.kind()
                 )));
             }
@@ -296,6 +335,31 @@ pub fn collect_references(req: &GenerationRequest) -> Result<Vec<Image>> {
     }
     validate_reference_count(images.len())?;
     Ok(images)
+}
+
+/// Upstream's `img.convert("RGBA")`: widen an RGB reference to RGBA with a fully opaque alpha.
+/// `slot` names the offender when the caller's buffer disagrees with its declared size.
+fn widen_rgb(image: &Image, slot: usize) -> Result<RgbaImage> {
+    RgbaImage::from_rgb(image).map_err(|e| {
+        Error::Msg(format!(
+            "qwen_image_2_1: conditioning slot {slot} carries a malformed reference image: {e}"
+        ))
+    })
+}
+
+/// Condition images carry no strength upstream; accept only an unset or exactly-`1.0` value.
+/// Shared by the RGB and RGBA reference carriers so the two cannot drift.
+fn reject_reference_strength(slot: usize, strength: Option<f32>) -> Result<()> {
+    if let Some(strength) = strength {
+        if (strength - 1.0).abs() > f32::EPSILON {
+            return Err(Error::Unsupported(format!(
+                "qwen_image_2_1: conditioning slot {slot} sets reference strength {strength}, but \
+                 Qwen-Image 2.1 conditions on a reference at full weight — upstream's condition \
+                 images have no strength. Drop the field (or send 1.0)."
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The 1..=[`MAX_REFERENCE_IMAGES`] bound, as its own entry point so the boundary and the refusal
@@ -328,6 +392,22 @@ mod tests {
                 .map(|i| (i % 251) as u8)
                 .collect(),
         }
+    }
+
+    /// The same deterministic picture as [`image`], widened the way upstream's
+    /// `img.convert("RGBA")` widens an opaque source (`A = 255`).
+    fn opaque(width: u32, height: u32) -> RgbaImage {
+        RgbaImage::from_rgb(&image(width, height)).unwrap()
+    }
+
+    /// A genuinely transparent reference: the same colours, with a horizontal alpha ramp so the
+    /// alpha is neither constant nor separable from position.
+    fn transparent(width: u32, height: u32) -> RgbaImage {
+        let mut rgba = opaque(width, height);
+        for (i, px) in rgba.pixels.chunks_exact_mut(4).enumerate() {
+            px[3] = ((i % width as usize) * 255 / width.max(2) as usize) as u8;
+        }
+        rgba
     }
 
     fn production_vision() -> VisionConfig {
@@ -399,7 +479,7 @@ mod tests {
     #[test]
     fn a_reference_binds_four_latent_tokens_per_vision_slot() {
         let vision = production_vision();
-        let prepared = prepare_reference(&image(640, 480), 0, &vision).unwrap();
+        let prepared = prepare_reference(&opaque(640, 480), 0, &vision).unwrap();
         assert_eq!(prepared.latent_tokens(), prepared.vision_slots() * 4);
         assert_eq!(
             prepared.pixel_values.shape()[0] as usize,
@@ -418,11 +498,18 @@ mod tests {
     #[test]
     fn malformed_references_are_refused_before_any_tensor_work() {
         let vision = production_vision();
-        let err = prepare_reference(&image(0, 8), 3, &vision)
+        // Built directly: a zero side is exactly what `prepare_reference` must refuse, so it
+        // cannot come through the `opaque` helper (whose own widening rejects it first).
+        let zero = RgbaImage {
+            width: 0,
+            height: 8,
+            pixels: Vec::new(),
+        };
+        let err = prepare_reference(&zero, 3, &vision)
             .unwrap_err()
             .to_string();
         assert!(err.contains("reference image 3"), "{err}");
-        let mut short = image(8, 8);
+        let mut short = opaque(8, 8);
         short.pixels.truncate(3);
         let err = prepare_reference(&short, 1, &vision)
             .unwrap_err()
@@ -432,10 +519,179 @@ mod tests {
 
     #[test]
     fn the_derived_size_reads_the_last_reference() {
-        let refs = vec![image(64, 128), image(128, 64)];
+        let refs = vec![opaque(64, 128), opaque(128, 64)];
         let (w, h) = reference_derived_size(&refs, 1024).unwrap();
         assert!(w > h, "the last reference is landscape, got {w}x{h}");
         assert!(reference_derived_size(&[], 1024).is_err());
+    }
+
+    /// The RGB reference route is the **opaque special case** of the RGBA one (sc-24111).
+    ///
+    /// Two claims, both load-bearing for "sc-24111 changed nothing for an RGB reference":
+    ///
+    /// * the vision copy is byte-identical to the plain three-channel LANCZOS resize the crate
+    ///   performed before transparent references existed — i.e. widening to RGBA, resampling four
+    ///   channels and compositing over white round-trips exactly;
+    /// * the VAE input's alpha plane is the constant `+1.0` the old `rgb8_to_rgba_nchw` wrote.
+    #[test]
+    fn rgb_reference_is_the_opaque_rgba_case() {
+        let vision = production_vision();
+        let src = image(640, 480);
+        let prepared = prepare_reference(&opaque(640, 480), 0, &vision).unwrap();
+        let (rw, rh) = prepared.size;
+
+        // The pre-sc-24111 path: resize the three-channel buffer directly.
+        let want: Vec<u8> = mlx_gen::image::resize_lanczos_u8(
+            &src.pixels,
+            src.height as usize,
+            src.width as usize,
+            rh as usize,
+            rw as usize,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|v| v.clamp(0.0, 255.0) as u8)
+        .collect();
+        let (got, _) = vision
+            .processor
+            .preprocess(&want, rw as usize, rh as usize)
+            .unwrap();
+        assert!(
+            prepared
+                .pixel_values
+                .all_close(&got, Some(0.0), Some(0.0), None)
+                .unwrap()
+                .item::<bool>(),
+            "an opaque reference's vision copy must be byte-identical to the 3-channel resize"
+        );
+
+        // Alpha plane: `[1, 4, h, w]`, channel 3, every sample exactly +1.0.
+        let plane = mlx_rs::ops::indexing::IndexOp::index(&prepared.vae_input, (0, 3, .., ..));
+        let alpha: Vec<f32> = plane
+            .flatten(None, None)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        assert!(
+            alpha.iter().all(|&a| a == 1.0),
+            "an opaque reference's VAE alpha must be the constant +1.0"
+        );
+    }
+
+    /// A **transparent** reference is fed to the two consumers differently, exactly as upstream
+    /// feeds it (sc-24111): the VAE encode sees the real alpha, the Qwen3-VL vision tower sees the
+    /// reference composited over white.
+    #[test]
+    fn a_transparent_reference_reaches_the_vae_and_is_whitened_for_the_vision_tower() {
+        let vision = production_vision();
+        let prepared = prepare_reference(&transparent(640, 480), 0, &vision).unwrap();
+        let (rw, rh) = prepared.size;
+
+        // The VAE alpha is NOT flattened away — it is a real ramp in `[-1, 1]`.
+        let plane = mlx_rs::ops::indexing::IndexOp::index(&prepared.vae_input, (0, 3, .., ..));
+        let alpha: Vec<f32> = plane
+            .flatten(None, None)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        let min = alpha.iter().copied().fold(f32::INFINITY, f32::min);
+        let max = alpha.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            min < -0.5 && max > 0.5,
+            "the VAE must receive the reference's real alpha, got the range [{min}, {max}]"
+        );
+
+        // The vision copy is the white composite of the SAME resized RGBA — not a channel drop,
+        // and not the un-composited colour. Rebuild both and prove the processor got the former.
+        let resized: Vec<u8> = {
+            let src = transparent(640, 480);
+            mlx_gen::image::resize_lanczos_rgba_u8(
+                &src.pixels,
+                src.height as usize,
+                src.width as usize,
+                rh as usize,
+                rw as usize,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|v| v.clamp(0.0, 255.0) as u8)
+            .collect()
+        };
+        let whitened = RgbaImage {
+            width: rw,
+            height: rh,
+            pixels: resized.clone(),
+        }
+        .to_rgb_over_white()
+        .unwrap();
+        let dropped: Vec<u8> = resized
+            .chunks_exact(4)
+            .flat_map(|px| px[..3].to_vec())
+            .collect();
+        assert_ne!(
+            whitened.pixels, dropped,
+            "the fixture must actually exercise the composite (a ramp alpha changes the colour)"
+        );
+        let (want, _) = vision
+            .processor
+            .preprocess(&whitened.pixels, rw as usize, rh as usize)
+            .unwrap();
+        assert!(
+            prepared
+                .pixel_values
+                .all_close(&want, Some(0.0), Some(0.0), None)
+                .unwrap()
+                .item::<bool>(),
+            "the vision tower must read the reference composited over white"
+        );
+    }
+
+    /// RGB and RGBA references share ONE ordered list, in request order (sc-24111). Ordering is
+    /// semantic for this model, so an interleaved request must not be silently regrouped.
+    #[test]
+    fn rgb_and_rgba_references_interleave_in_request_order() {
+        let rgb = image(48, 48);
+        let rgba = transparent(64, 64);
+        let req = GenerationRequest {
+            prompt: "a red fox".into(),
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: rgb.clone(),
+                    strength: None,
+                },
+                Conditioning::ReferenceRgba {
+                    image: rgba.clone(),
+                    strength: Some(1.0),
+                },
+                Conditioning::MultiReference {
+                    images: vec![rgb.clone()],
+                },
+            ],
+            ..Default::default()
+        };
+        let refs = collect_references(&req).unwrap();
+        assert_eq!(refs.len(), 3);
+        assert_eq!(refs[0], RgbaImage::from_rgb(&rgb).unwrap());
+        assert_eq!(refs[1], rgba, "the RGBA reference keeps its own alpha");
+        assert_eq!(refs[2], RgbaImage::from_rgb(&rgb).unwrap());
+        assert!(refs[0].is_opaque() && refs[2].is_opaque());
+        assert!(!refs[1].is_opaque());
+    }
+
+    /// A transparent reference carries no strength either — the same refusal as the RGB carrier,
+    /// from the one shared check.
+    #[test]
+    fn a_transparent_reference_still_carries_no_strength() {
+        let req = GenerationRequest {
+            prompt: "a red fox".into(),
+            conditioning: vec![Conditioning::ReferenceRgba {
+                image: transparent(64, 64),
+                strength: Some(0.4),
+            }],
+            ..Default::default()
+        };
+        let err = collect_references(&req).unwrap_err().to_string();
+        assert!(err.contains("full weight"), "{err}");
     }
 
     #[test]

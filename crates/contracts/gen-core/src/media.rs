@@ -11,6 +11,152 @@ pub struct Image {
     pub pixels: Vec<u8>,
 }
 
+impl Image {
+    /// Interleaved 8-bit channels per pixel — always 3 (`[R, G, B]`).
+    ///
+    /// A constant, not a stored field: this type's invariant *is* three channels, and the
+    /// four-channel case lives in [`RgbaImage`] precisely so that no consumer has to ask at
+    /// runtime whether the buffer it is about to index by `3` really has three channels. It is
+    /// exposed so a channel-count-driven sink (e.g. an encoder that maps 3 → RGB8 and 4 → RGBA8)
+    /// can read the same accessor off either type instead of hardcoding the stride per variant.
+    pub const CHANNELS: usize = 3;
+
+    /// Interleaved channels per pixel — see [`Image::CHANNELS`].
+    pub fn channels(&self) -> usize {
+        Self::CHANNELS
+    }
+
+    /// Bytes per row: `width · CHANNELS`.
+    pub fn row_stride(&self) -> usize {
+        self.width as usize * Self::CHANNELS
+    }
+}
+
+/// An 8-bit **RGBA** image, row-major interleaved, with `pixels.len() == width * height * 4`
+/// (sc-24111) — the four-channel sibling of [`Image`].
+///
+/// ## Why a separate type rather than an `alpha` field on [`Image`]
+///
+/// [`Image`]'s whole contract is `width · height · 3`, and roughly a thousand construction sites
+/// and every consumer index against it. A nullable fourth plane bolted on would make "does this
+/// image have alpha?" a runtime question at every one of them, whose answer is `None` at all but
+/// two. A distinct type makes the four-channel case unrepresentable where it is not wanted and
+/// unmissable where it is: a consumer that only understands RGB cannot be handed one by accident,
+/// because it arrives on its own [`GenerationOutput`](crate::generator::GenerationOutput) variant
+/// and its own [`Conditioning`](crate::generator::Conditioning) variant.
+///
+/// ## Alpha convention — **straight (un-premultiplied)**, clamped
+///
+/// `pixels` are `[R, G, B, A]` per pixel with the colour channels **not** multiplied by alpha.
+/// This is exactly what diffusers' `VaeImageProcessor.postprocess` produces from a four-channel
+/// decode: `(x / 2 + 0.5).clamp(0, 1)` per channel *independently*, then `(v · 255).round()` to
+/// `uint8` and `PIL.Image.fromarray(..., mode="RGBA")`. Nothing premultiplies, and `A = 0` does
+/// **not** imply `R = G = B = 0` — a fully transparent pixel still carries whatever colour the
+/// decoder painted there. A consumer that flattens must therefore composite
+/// (`out = rgb·a + bg·(1 − a)`), which is what [`to_rgb_over_white`](Self::to_rgb_over_white)
+/// does; it must not simply drop the fourth byte.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RgbaImage {
+    pub width: u32,
+    pub height: u32,
+    /// Interleaved `[R, G, B, A]`, `width · height · 4` bytes, row-major, **straight** alpha.
+    pub pixels: Vec<u8>,
+}
+
+impl RgbaImage {
+    /// Interleaved 8-bit channels per pixel — always 4 (`[R, G, B, A]`, straight alpha).
+    ///
+    /// The counterpart of [`Image::CHANNELS`], so a channel-count-driven sink (an encoder mapping
+    /// 3 → RGB8 and 4 → RGBA8, for instance) reads one accessor off either type rather than
+    /// hardcoding a stride per output variant.
+    pub const CHANNELS: usize = 4;
+
+    /// Interleaved channels per pixel — see [`RgbaImage::CHANNELS`].
+    pub fn channels(&self) -> usize {
+        Self::CHANNELS
+    }
+
+    /// Bytes per row: `width · CHANNELS`.
+    pub fn row_stride(&self) -> usize {
+        self.width as usize * Self::CHANNELS
+    }
+
+    /// Reject an image whose buffer disagrees with its declared dimensions, or whose dimensions
+    /// are zero — the [`HdrFrame::validate`] contract, for the same reason: every consumer indexes
+    /// by `width`/`height` and would otherwise walk off the end of a short buffer.
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.width == 0 || self.height == 0 {
+            return Err(crate::Error::Msg(format!(
+                "RgbaImage: zero dimension — {}×{} (both edges must be > 0)",
+                self.width, self.height
+            )));
+        }
+        let want = self.width as usize * self.height as usize * 4;
+        if self.pixels.len() != want {
+            return Err(crate::Error::Msg(format!(
+                "RgbaImage: buffer length {} disagrees with {}×{} RGBA (need {want})",
+                self.pixels.len(),
+                self.width,
+                self.height
+            )));
+        }
+        Ok(())
+    }
+
+    /// Widen an opaque RGB [`Image`] to RGBA with `A = 255` everywhere — upstream's
+    /// `img.convert("RGBA")` on an opaque source.
+    pub fn from_rgb(image: &Image) -> crate::Result<Self> {
+        let want = image.width as usize * image.height as usize * 3;
+        if image.width == 0 || image.height == 0 || image.pixels.len() != want {
+            return Err(crate::Error::Msg(format!(
+                "RgbaImage::from_rgb: buffer length {} disagrees with {}×{} RGB (need {want})",
+                image.pixels.len(),
+                image.width,
+                image.height
+            )));
+        }
+        let mut pixels = Vec::with_capacity(want / 3 * 4);
+        for rgb in image.pixels.chunks_exact(3) {
+            pixels.extend_from_slice(rgb);
+            pixels.push(255);
+        }
+        Ok(Self {
+            width: image.width,
+            height: image.height,
+            pixels,
+        })
+    }
+
+    /// Composite this straight-alpha image over an opaque **white** background, yielding the RGB
+    /// [`Image`] an RGB-only consumer would show it as: `out = round(rgb·a + 255·(1 − a))` with
+    /// `a = A/255`.
+    ///
+    /// White, not black, because that is what a viewer showing a transparent PNG on a page shows,
+    /// and because the model's own reference path flattens RGBA over white before the vision tower
+    /// (see the provider crates' `UPSTREAM.md`). Exactly the identity when `A = 255` everywhere.
+    pub fn to_rgb_over_white(&self) -> crate::Result<Image> {
+        self.validate()?;
+        let mut pixels = Vec::with_capacity(self.pixels.len() / 4 * 3);
+        for px in self.pixels.chunks_exact(4) {
+            let a = f32::from(px[3]) / 255.0;
+            for &c in &px[..3] {
+                pixels.push((f32::from(c) * a + 255.0 * (1.0 - a)).round() as u8);
+            }
+        }
+        Ok(Image {
+            width: self.width,
+            height: self.height,
+            pixels,
+        })
+    }
+
+    /// Whether every pixel is fully opaque (`A == 255`) — i.e. this image carries no transparency
+    /// and [`to_rgb_over_white`](Self::to_rgb_over_white) is a lossless channel drop.
+    pub fn is_opaque(&self) -> bool {
+        self.pixels.chunks_exact(4).all(|px| px[3] == 255)
+    }
+}
+
 /// One high-dynamic-range frame: interleaved `f32` RGB, row-major, `rgb.len() == width · height · 3`.
 ///
 /// The HDR counterpart of [`Image`] (sc-18790). Deliberately **unbounded** — scene-linear light

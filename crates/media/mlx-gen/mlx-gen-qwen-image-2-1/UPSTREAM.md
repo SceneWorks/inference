@@ -223,6 +223,139 @@ Within the joint sequence:
   empty or zero-dimension image, and a reference whose `smart_resize` grid disagrees with its VAE
   grid are all typed, actionable refusals.
 
+## Native transparency: RGBA output, subject extraction, transparent-layer editing (sc-24111)
+
+### There is no transparency flag
+
+`QwenImage21Pipeline.__call__` takes **no** `rgba` / `transparent` / `mode` argument. The 2.1 VAE
+is four-channel in and out (`vae/config.json` `out_channels: 4`), so the pipeline *always* decodes
+four channels:
+
+```python
+image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]   # [B, 4, H, W]
+image = self.image_processor.postprocess(image, output_type=output_type)
+```
+
+and `postprocess(..., "pil")` therefore *always* returns a PIL image in mode `RGBA`
+(`numpy_to_pil` → `Image.fromarray` on a 4-channel array). Verified against the pinned revision on
+the committed tiny snapshot: every case in `tools/dump_qwen21_rgba.py` asserts `mode == "RGBA"`.
+
+**Whether a render is actually transparent is decided by the prompt.** The model card's
+"Transparent Image Generation (RGBA)" section is a *prompt recipe*, not a mode:
+
+> "This is an RGBA image with transparency. A cute cartoon dragon sticker. The image has alpha
+> channel and the background is transparent."
+
+There is **no separate matting model**, no alpha post-processor and no segmentation step anywhere
+in the pipeline. The alpha channel is whatever the VAE decoded — so there are **no guarantees
+about it beyond that**. An ordinary opaque prompt yields a near-opaque alpha, not an exactly-255
+one; a transparency prompt yields a soft matte the model chose. Nothing validates, thresholds or
+cleans it up, and a caller must not assume `A ∈ {0, 255}`.
+
+**Subject extraction** is likewise a prompt over the ordinary reference route ("extract the
+subject onto a transparent background" — this port's fixture uses the in-vocabulary
+"the red fox on a transparent background"), and **transparent-layer editing** is the ordinary
+reference route with a reference that happens to carry alpha. Neither is a distinct API, a
+distinct pipeline class or a distinct code path upstream.
+
+### The alpha convention: straight, per-channel clamp
+
+`VaeImageProcessor.postprocess` is, for every channel *independently*:
+
+```python
+image = (image * 0.5 + 0.5).clamp(0, 1)        # denormalize
+images = (images * 255).round().astype("uint8")  # numpy_to_pil
+```
+
+So the emitted alpha is **straight (un-premultiplied)**, clamped to `[0, 1]` by the same clamp as
+the colour, and rounded half-away-from-zero at 8 bits. Nothing premultiplies, and `A = 0` does
+**not** imply `RGB = 0`: a fully transparent pixel still carries whatever colour the decoder
+painted there, which is why a consumer that flattens must composite rather than drop the fourth
+byte.
+
+This port emits exactly that as `gen_core::RgbaImage` when the request sets
+`output_channels: OutputChannels::Rgba` (gated by `Capabilities::supports_alpha_output`, which
+this engine sets and every other provider leaves `false`). The default, `OutputChannels::Rgb`,
+composites the same decode over white and emits `Image` — byte-for-byte the pre-sc-24111
+behaviour. There is **one** decode either way; the request field selects only what happens to the
+alpha the decoder already produced.
+
+### RGBA reference inputs: the VAE sees the alpha, the vision tower sees it over white
+
+Upstream converts **every** condition image to RGBA up front and then feeds the two consumers
+*differently*:
+
+```python
+# __call__, step 1 — one resize, both consumers
+if hasattr(img, "mode") and img.mode != "RGBA":
+    img = img.convert("RGBA")
+input_images.append(self.image_processor.resize(img, width=iw, height=ih))          # vision
+vae_images.append(self.image_processor.preprocess(img, width=iw, height=ih).unsqueeze(2))  # VAE
+
+# _get_qwen_prompt_embeds — the vision copy only
+if img.mode == "RGBA":
+    # "The checkpoint was trained with the alpha composited over white for the vision encoder."
+    white = PILImage.new("RGB", img.size, (255, 255, 255))
+    white.paste(img, mask=img.getchannel("A"))
+    img = white
+```
+
+* the **VAE** encode receives all four channels, `2x − 1` normalised (`preprocess`), so a
+  transparent layer's alpha is real signal in the condition latents;
+* the **Qwen3-VL vision tower** receives the reference composited over **white**.
+
+PIL's `paste` with an `"L"` mask is exactly `round(rgb·a + 255·(1 − a))` with `a = A/255` —
+verified exhaustively over all 256×256 (colour, alpha) pairs against Pillow, and implemented as
+`gen_core::RgbaImage::to_rgb_over_white`.
+
+An ordinary RGB reference is the `A = 255` special case of this path (that is what
+`img.convert("RGBA")` produces), so the white composite is the identity and the VAE alpha plane is
+the constant `+1.0` — which is why the RGB reference route is unchanged by this story.
+
+**Sending a flattened RGB reference is a different request from sending the transparent layer.**
+The flattened copy hands the VAE white pixels where the layer is transparent; the transparent
+layer hands it the alpha. This port therefore carries the two on distinct conditioning variants
+(`Conditioning::Reference` and `Conditioning::ReferenceRgba`), both flattened into the one ordered
+reference list, freely interleavable, with the same 1..=10 bound and the same "no strength" rule.
+
+### The reference resize runs in PREMULTIPLIED space
+
+`PIL.Image.resize` does **not** resample an RGBA image's four bands straight. It special-cases
+`LA`/`RGBA` for every filter but `NEAREST`:
+
+```python
+if self.mode in ["LA", "RGBA"] and resample != Resampling.NEAREST:
+    im = self.convert({"LA": "La", "RGBA": "RGBa"}[self.mode])
+    im = im.resize(size, resample, box)
+    return im.convert(self.mode)
+```
+
+so upstream's condition-image fit is **premultiply → LANCZOS-resample the four premultiplied bands
+(with PIL's `clip8` between the horizontal and vertical passes) → un-premultiply**, not a
+straight four-band resample. On a soft matte edge the difference is large, not cosmetic: measured
+on this crate's `extract` fixture, resampling straight gives `pixel_values` `max|Δ| = 4.4e-1`
+against a `2.1e-5` bound and reference latents `max|Δ| = 1.7e-1` against `2.5e-2`; reproducing the
+premultiplied resample brings the latents to `2.9e-4`.
+
+PIL's integer rules, verified exhaustively over all 256×256 (channel, alpha) pairs and implemented
+in `gen_core::imageops::resize_lanczos_rgba_u8`:
+
+* premultiply `c' = (c·a + 127) / 255` (round-half-up; `floor(c·a/255)` is off by one);
+* un-premultiply `c = min(255, c'·255 / a)` for `a > 0`, and `c = c'` for `a = 0`.
+
+For a fully opaque image both conversions are the identity and the alpha band resamples to a
+constant 255, so this is byte-identical to the three-channel resize the RGB reference route always
+used.
+
+### What this port does NOT do
+
+* It does not synthesise alpha. `supports_alpha_output` means "the decoder is natively
+  four-channel", never "this provider can matte an opaque render".
+* It does not threshold, clean up, premultiply or otherwise post-process the decoded alpha.
+* It does not make transparency requestable as a mode. A caller asking for a transparent result
+  writes a transparency prompt, exactly as upstream documents; `output_channels: Rgba` only
+  decides whether the resulting alpha is delivered or composited away.
+
 ## Deliberate divergences
 
 * No prefix KV cache: every step evaluates the full block-causal joint sequence (upstream's exact
@@ -235,5 +368,6 @@ Within the joint sequence:
 * Latents stay f32 between Euler steps (upstream rounds to bf16 each step).
 * The text tower runs f32 activations over bf16 weights (upstream: bf16 end to end).
 * Noise is MLX-seeded (`mlx.random.normal` under `key(seed)`), not torch-seeded.
-* RGB emission composites the RGBA decode over white until gen-core carries an RGBA surface
-  (sc-24111); `QwenImage21Vae::decode_rgba` is the four-channel path.
+* RGB emission composites the RGBA decode over white — the `OutputChannels::Rgb` default.
+  `OutputChannels::Rgba` emits the four-channel decode unflattened as `RgbaImage`
+  (sc-24111); see *Native transparency* above.

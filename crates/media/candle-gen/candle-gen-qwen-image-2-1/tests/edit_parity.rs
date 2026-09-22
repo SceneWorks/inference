@@ -44,7 +44,7 @@
 //! bounds here are not copied across.
 
 use candle_core::{DType, Tensor};
-use candle_gen::gen_core::{CancelFlag, Conditioning, Image, Progress};
+use candle_gen::gen_core::{CancelFlag, Conditioning, Image, Progress, RgbaImage};
 use candle_gen_qwen_image_2_1::{
     denoise, encode_references, joint_layout, load_scheduler_config, load_text_encoder,
     load_tokenizer, load_transformer, load_vae, load_vision_config, prepare_references, scheduler,
@@ -104,6 +104,16 @@ fn sources(w: &Fixture, case: &Case) -> Vec<Image> {
         .collect()
 }
 
+/// The same sources, widened the way `collect_references` widens an RGB
+/// `Conditioning::Reference` (upstream's `img.convert("RGBA")`, `A = 255`) — the form
+/// `prepare_references` consumes.
+fn opaque_sources(w: &Fixture, case: &Case) -> Vec<RgbaImage> {
+    sources(w, case)
+        .iter()
+        .map(|image| RgbaImage::from_rgb(image).unwrap())
+        .collect()
+}
+
 struct Snapshot {
     tokenizer: candle_gen::gen_core::tokenizer::TextTokenizer,
     encoder: QwenImage21TextEncoder,
@@ -146,7 +156,7 @@ fn i32_host(t: &Tensor) -> Vec<i32> {
 }
 
 fn prepared(snap: &Snapshot, w: &Fixture, c: &Case) -> Vec<PreparedReference> {
-    prepare_references(&sources(w, c), &snap.vision, &device()).unwrap()
+    prepare_references(&opaque_sources(w, c), &snap.vision, &device()).unwrap()
 }
 
 fn conditioning(
@@ -472,7 +482,7 @@ fn the_boundary_holds_and_eleven_references_are_refused() {
     let limits: serde_json::Value = serde_json::from_str(w.meta("_limits")).unwrap();
     assert_eq!(limits["max_reference_images"].as_u64(), Some(10));
 
-    let ten = sources(&w, &case(&w, "ref10"));
+    let ten = opaque_sources(&w, &case(&w, "ref10"));
     assert_eq!(ten.len(), 10);
     assert!(
         prepare_references(&ten, &snap.vision, &dev).is_ok(),
@@ -493,7 +503,14 @@ fn the_boundary_holds_and_eleven_references_are_refused() {
         height: 64,
         ..Default::default()
     };
-    req.conditioning = vec![Conditioning::MultiReference { images: eleven }];
+    // Back to RGB for the request seam: `MultiReference` carries RGB images, which
+    // `collect_references` widens itself.
+    req.conditioning = vec![Conditioning::MultiReference {
+        images: eleven
+            .iter()
+            .map(|r| r.to_rgb_over_white().unwrap())
+            .collect(),
+    }];
     let err = candle_gen_qwen_image_2_1::collect_references(&req)
         .unwrap_err()
         .to_string();

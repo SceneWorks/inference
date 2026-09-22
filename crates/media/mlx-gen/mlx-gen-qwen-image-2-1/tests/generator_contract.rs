@@ -229,3 +229,14 @@ fn load_time_q8_quantizes_the_dit_and_still_renders() {
     };
     assert_eq!(images[0].pixels.len(), 32 * 32 * 3);
 }
+
+/// **Alpha-output honesty**, the shared gen-core conformance check (sc-24111): this provider
+/// advertises `supports_alpha_output`, so `validate()` must accept an `OutputChannels::Rgba`
+/// request, `generate()` must answer it with `GenerationOutput::ImagesRgba` carrying well-formed
+/// four-channel buffers, and the untouched RGB default must still yield
+/// `GenerationOutput::Images`.
+#[test]
+fn alpha_output_honesty() {
+    let g = load(OffloadPolicy::Resident);
+    gen_core_testkit::check_alpha_output_honesty(g.as_ref(), &profile()).unwrap();
+}

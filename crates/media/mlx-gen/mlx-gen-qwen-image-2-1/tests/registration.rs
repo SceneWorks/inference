@@ -42,12 +42,17 @@ fn advertised_surface_matches_the_story_contract() {
         caps.conditioning,
         vec![
             ConditioningKind::Reference,
+            ConditioningKind::ReferenceRgba,
             ConditioningKind::MultiReference
         ]
     );
     assert!(caps.accepts(ConditioningKind::Reference));
+    assert!(caps.accepts(ConditioningKind::ReferenceRgba));
     assert!(caps.accepts(ConditioningKind::MultiReference));
     assert!(!caps.accepts(ConditioningKind::Mask));
+    // Native transparency (sc-24111): the VAE is four-channel in and out on every route behind
+    // this descriptor, so the alpha output is advertised and an RGBA reference is accepted.
+    assert!(caps.supports_alpha_output);
     assert_eq!(mlx_gen_qwen_image_2_1::MAX_REFERENCE_IMAGES, 10);
     assert!(
         !caps.supports_preview,

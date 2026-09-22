@@ -9,7 +9,7 @@
 use crate::approximation::{ApproximationPlan, ApproximationRequest, ApproximationSurface};
 use crate::execution_domains::{CfgBatching, ExecutionSurface, FfnChunk, GraphEvalCadence};
 use crate::hdr::HdrColorSpace;
-use crate::media::{AudioChunk, AudioTrack, Image};
+use crate::media::{AudioChunk, AudioTrack, Image, RgbaImage};
 use crate::runtime::{
     CancelFlag, HdrFrameSink, PreviewSink, Progress, PromptEnhancementSink, Quant,
 };
@@ -288,12 +288,53 @@ pub trait ConversationSession {
 #[derive(Clone, Debug)]
 pub enum GenerationOutput {
     Images(Vec<Image>),
+    /// Four-channel images with a **straight (un-premultiplied) alpha** channel (sc-24111) — the
+    /// output of a request whose [`GenerationRequest::output_channels`] is
+    /// [`OutputChannels::Rgba`], on a provider whose
+    /// [`Capabilities::supports_alpha_output`] is `true`.
+    ///
+    /// A **separate variant**, not an `Option<Vec<u8>>` alpha plane on [`Images`](Self::Images),
+    /// for the reason [`RgbaImage`] is a separate type: an RGB-only consumer must not be able to
+    /// receive transparency by accident and silently drop it (a subject extracted onto a
+    /// transparent background, flattened to whatever the decoder painted behind the alpha, is a
+    /// wrong image the caller has no way to detect). Adding a variant makes every consumer's
+    /// `match` name the case explicitly, which is the point.
+    ///
+    /// **Never produced unless asked for.** `OutputChannels::Rgb` is the `Default`, and the shared
+    /// request floor refuses an RGBA request against a provider that does not advertise the
+    /// capability, so no existing consumer can be handed this variant by an existing request.
+    ImagesRgba(Vec<RgbaImage>),
     Video {
         frames: Vec<Image>,
         fps: u32,
         audio: Option<AudioTrack>,
     },
     Audio(AudioTrack),
+}
+
+/// How many channels an image generation emits ([`GenerationRequest::output_channels`],
+/// sc-24111).
+///
+/// [`Rgb`](Self::Rgb) is the `Default` and the historical behaviour, byte-for-byte: a provider
+/// whose decoder is natively four-channel (Qwen-Image 2.1) composites its alpha over white and
+/// emits [`GenerationOutput::Images`], exactly as it did before this field existed.
+///
+/// This is an **output-surface** selector, not a render mode. On Qwen-Image 2.1 — the only family
+/// that reads it today — it changes nothing about conditioning, denoise or decode: upstream has no
+/// transparency flag at all, always decodes four channels, and always returns a PIL `RGBA` image.
+/// *Whether* a render is actually transparent is decided by the **prompt** (see the provider
+/// crates' `UPSTREAM.md`). All this field decides is whether the caller receives the alpha the
+/// decoder produced or a white composite of it — which is why `Rgba` on an ordinary opaque prompt
+/// is legal and simply yields `A = 255` everywhere.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum OutputChannels {
+    /// 8-bit RGB ([`GenerationOutput::Images`]) — the default, and what every provider emitted
+    /// before sc-24111.
+    #[default]
+    Rgb,
+    /// 8-bit RGBA with straight alpha ([`GenerationOutput::ImagesRgba`]). Gated by
+    /// [`Capabilities::supports_alpha_output`].
+    Rgba,
 }
 
 /// The HDR opt-in block ([`GenerationRequest::hdr`], sc-18790).
@@ -625,6 +666,24 @@ pub struct GenerationRequest {
     /// `Some` here as [`Error::Unsupported`] at the contract boundary rather than silently
     /// rendering SDR and leaving the caller to discover it from the pixels.
     pub hdr: Option<HdrRequest>,
+
+    // --- Alpha / transparency (sc-24111; consumed by Qwen-Image 2.1 today) ---
+    /// Whether this generation's images come back as RGB or as RGBA with a straight alpha channel.
+    ///
+    /// **[`OutputChannels::Rgb`] is the `Default`** and is byte-for-byte the pre-sc-24111 render on
+    /// every provider, including the ones whose decoder is natively four-channel.
+    ///
+    /// Gated by [`Capabilities::supports_alpha_output`]: a provider that does not advertise an
+    /// alpha output refuses [`OutputChannels::Rgba`] here, on the shared floor, as
+    /// [`Error::Unsupported`] — it never silently returns RGB. The distinction matters because the
+    /// two are not interchangeable images: flattening a transparent subject over white is a
+    /// different picture from the one the caller asked for, and an RGB reply to an RGBA request
+    /// carries nothing that says so.
+    ///
+    /// Setting this to [`OutputChannels::Rgba`] does **not** make a render transparent. On
+    /// Qwen-Image 2.1 transparency is prompt-driven (upstream ships no flag); this field only
+    /// decides whether the decoder's alpha reaches the caller or is composited over white first.
+    pub output_channels: OutputChannels,
 }
 
 /// Quality-preserving execution levers for a single generation.
@@ -965,6 +1024,9 @@ impl Default for GenerationRequest {
             preview: PreviewSink::default(),
             // SDR. The one default that must never drift — see `GenerationRequest::hdr`.
             hdr: None,
+            // RGB. Like `hdr`, a default that must never drift: an unasked-for alpha channel
+            // reaching a consumer that indexes RGB triples is a corrupted image, not a bonus.
+            output_channels: OutputChannels::Rgb,
         }
     }
 }
@@ -1216,6 +1278,8 @@ impl GenerationRequest {
             // float-bearing HDR knob (a diffuse-white signal or roll-off rate on the request,
             // say) must join the floor, and this named-not-`..` binding forces that decision.
             hdr: _,
+            // An enum with two unit variants — no float to check (sc-24111).
+            output_channels: _,
             // The audio sub-block carries its own floats — destructured below the flat knobs.
             audio,
             // The multi-phase list carries per-phase floats (guidance + adapter weights), checked
@@ -1318,6 +1382,14 @@ impl GenerationRequest {
                     if let Some(s) = strength {
                         if !s.is_finite() {
                             return Some(("conditioning.reference.strength", *s));
+                        }
+                    }
+                }
+                // The RGBA sibling of `Reference` (sc-24111): same strength field, same math.
+                Conditioning::ReferenceRgba { strength, .. } => {
+                    if let Some(s) = strength {
+                        if !s.is_finite() {
+                            return Some(("conditioning.reference_rgba.strength", *s));
                         }
                     }
                 }
@@ -1743,6 +1815,30 @@ pub fn validate_reference_image_short_edge(id: &str, req: &GenerationRequest) ->
 pub enum Conditioning {
     /// img2img / IP-Adapter / identity reference.
     Reference { image: Image, strength: Option<f32> },
+    /// A reference image that **carries its own alpha channel** — a transparent layer being
+    /// edited, or a previously extracted subject being re-composed (sc-24111). The RGBA sibling of
+    /// [`Reference`](Self::Reference), with the same ordering semantics: it takes its place in the
+    /// request's ordered `conditioning` list and may be freely interleaved with RGB
+    /// [`Reference`](Self::Reference) / [`MultiReference`](Self::MultiReference) entries.
+    ///
+    /// A **distinct variant**, not an alpha field on `Reference`, for the reason
+    /// [`RgbaImage`] is a distinct type: a provider that has never thought about alpha cannot be
+    /// handed a transparent reference and quietly encode whatever colour sits behind `A = 0` as if
+    /// it were content. Default-deny on [`ConditioningKind::ReferenceRgba`] makes that free.
+    ///
+    /// **A transparent reference is not the same request as its flattened self.** The alpha is
+    /// consumed, not decoration: on Qwen-Image 2.1 the VAE encodes all four channels while the
+    /// vision tower reads the reference composited over white, which is exactly how upstream feeds
+    /// it (`img.convert("RGBA")`, `white.paste(img, mask=A)` for the processor copy,
+    /// `image_processor.preprocess(img)` for the VAE copy). Sending the flattened RGB instead
+    /// would hand the VAE white pixels where the layer is transparent.
+    ///
+    /// `strength` mirrors [`Reference`](Self::Reference)'s; a provider with no img2img strength
+    /// (Qwen-Image 2.1) requires it unset or exactly `1.0`.
+    ReferenceRgba {
+        image: RgbaImage,
+        strength: Option<f32>,
+    },
     /// A reference **audio** clip — voice cloning / style reference for audio models
     /// (sc-12834; the audio analogue of [`Conditioning::Reference`]). `strength` mirrors the
     /// per-reference img2img strength: `None` ⇒ the model default. Video→audio (Foley)
@@ -2004,6 +2100,7 @@ impl Conditioning {
     pub fn kind(&self) -> ConditioningKind {
         match self {
             Conditioning::Reference { .. } => ConditioningKind::Reference,
+            Conditioning::ReferenceRgba { .. } => ConditioningKind::ReferenceRgba,
             Conditioning::ReferenceAudio { .. } => ConditioningKind::ReferenceAudio,
             Conditioning::ReferenceVideo { .. } => ConditioningKind::ReferenceVideo,
             Conditioning::AudioEdit { .. } => ConditioningKind::AudioEdit,
@@ -2048,6 +2145,13 @@ pub enum ControlKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConditioningKind {
     Reference,
+    /// A reference image carrying its own alpha channel ([`Conditioning::ReferenceRgba`],
+    /// sc-24111). A **distinct** kind from [`Reference`](Self::Reference), deliberately: that is
+    /// what makes default-deny free. Every provider that predates transparent references keeps
+    /// advertising `Reference` alone, and [`Capabilities::accepts`] then refuses a transparent
+    /// reference as a typed [`Error::Unsupported`] with no flag and no provider code — rather than
+    /// letting it through to a preprocessor that would flatten or misread the fourth channel.
+    ReferenceRgba,
     /// Voice/style reference audio ([`Conditioning::ReferenceAudio`]).
     ReferenceAudio,
     /// Motion/camera reference video, optionally with its own soundtrack
@@ -2591,6 +2695,22 @@ pub struct Capabilities {
     /// would return SDR pixels tagged as an HDR render, which is precisely the washed-out-
     /// playback failure the opt-in exists to prevent.
     pub supports_hdr: bool,
+    /// Whether this model can emit **RGBA** images with a straight alpha channel through
+    /// [`GenerationRequest::output_channels`] = [`OutputChannels::Rgba`] (sc-24111).
+    ///
+    /// `Default` is `false`, so every existing provider is unsupported and the shared floor
+    /// rejects an RGBA request against it as [`Error::Unsupported`]. As with
+    /// [`supports_hdr`](Self::supports_hdr), the rejection is the point rather than a nuisance: a
+    /// model that quietly returned RGB would answer "extract this subject onto a transparent
+    /// background" with the subject flattened over whatever its decoder painted, and the caller
+    /// has no channel left to notice it with.
+    ///
+    /// A provider sets this only when **every** generation route behind the descriptor can emit
+    /// the four-channel image — i.e. its decoder is natively RGBA. It is not a request to
+    /// synthesise a matte: there is no separate matting model behind this flag, and a provider
+    /// must never fabricate an alpha channel (a constant `A = 255` widening of an RGB decode) to
+    /// advertise it.
+    pub supports_alpha_output: bool,
     /// Whether [`GenerationRequest::enhance_prompt`] changes the prompt consumed by this provider.
     ///
     /// This is weights-free discoverability for an optional semantic path, not a routing promise:
@@ -2983,6 +3103,18 @@ impl Capabilities {
         if req.hdr.is_some() && !self.supports_hdr {
             return Err(Error::Unsupported(format!(
                 "{id}: HDR output is not supported by this model"
+            )));
+        }
+        // RGBA opt-in (sc-24111). On the shared floor for the same reason HDR is: a per-provider
+        // check is a check a provider can forget, and a forgotten one returns an opaque RGB image
+        // to a caller who asked for transparency, with nothing in the reply to say the alpha was
+        // dropped. `Rgb` (the `Default`) validates vacuously, so this is inert for every request
+        // that has not opted in.
+        if req.output_channels == OutputChannels::Rgba && !self.supports_alpha_output {
+            return Err(Error::Unsupported(format!(
+                "{id}: RGBA (alpha-channel) output is not supported by this model; it emits RGB \
+                 only. Drop `output_channels: Rgba` from the request, or route to a provider whose \
+                 capabilities advertise `supports_alpha_output`."
             )));
         }
         if let Some(memory) = req.memory {
