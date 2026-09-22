@@ -273,12 +273,19 @@ fn generate_qwen35_mtp_inner(
         sample(&first_logits, &history, &config.sampling, &mut rng, mask)?
     };
     // The sample evaluated the target prefill; the predictor's warm-up graph is otherwise only
-    // pulled by the first draft step, so force it here and release both prefills' transients.
+    // pulled by the first draft step, so force it here and retire both prefills' transients.
     if let Some(hidden) = mtp_seed.as_ref() {
         eval([hidden])?;
     }
     drop(mtp_seed);
-    let mut release = BufferRelease::after_prefill();
+    // `prompt_hidden` is the full `[1, P, H]` prompt hidden states and would otherwise live to the
+    // end of the function. `last_target_hidden` is a `take_axis` gather of its final row, so it
+    // owns an independent buffer once evaluated — force that, then retire the prompt-length
+    // parent along with the prompt logits. The release is taken on the loop's first `advance`.
+    eval([&last_target_hidden])?;
+    drop(prompt_hidden);
+    drop(first_logits);
+    let mut release = BufferRelease::new();
     if config.stop_tokens.contains(&first) {
         finish = FinishReason::StopToken;
         on_event(StreamEvent::Done {

@@ -118,8 +118,11 @@ pub fn generate_prompt_lookup(
     let mut history: Vec<i32> = prompt_ids.to_vec();
 
     let first = sample(&logits_last, &history, &config.sampling, &mut rng, None)?;
-    // That sample evaluated the (lazy) prefill graph; release its transients now.
-    let mut release = BufferRelease::after_prefill();
+    // That sample evaluated the (lazy) prefill graph. `logits_last` would otherwise live to the
+    // end of the function, so retire it explicitly; the release is taken on the loop's first
+    // `advance`, once step 0 has also retired its own transients.
+    drop(logits_last);
+    let mut release = BufferRelease::new();
     if config.stop_tokens.contains(&first) {
         finish = FinishReason::StopToken;
         on_event(StreamEvent::Done {
@@ -281,10 +284,13 @@ pub fn generate_draft_speculative(
 
     let first = sample(&logits_last, &history, &config.sampling, &mut rng, None)?;
     // The sample evaluated the target's prefill graph; the draft's is only pulled by its first
-    // draft step, so force it here and release both prefills' transients together.
+    // draft step, so force it here and retire both prefills' logits together — each would
+    // otherwise live to the end of the function. The release itself is taken on the loop's first
+    // `advance`, once step 0 has retired its own transients too.
     mlx_rs::transforms::eval([&draft_logits_last])?;
     drop(draft_logits_last);
-    let mut release = BufferRelease::after_prefill();
+    drop(logits_last);
+    let mut release = BufferRelease::new();
     if config.stop_tokens.contains(&first) {
         finish = FinishReason::StopToken;
         on_event(StreamEvent::Done {

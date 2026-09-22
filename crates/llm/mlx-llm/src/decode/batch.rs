@@ -163,8 +163,12 @@ pub fn generate_batch(
             active.push(lane);
         }
     }
-    // The first-row sample above evaluated the (lazy) prefill graph; release its transients now.
-    let mut release = BufferRelease::after_prefill();
+    // The first-row samples above evaluated the (lazy) prefill graph, but this binding lives to
+    // the end of the function and the decode loop only *shadows* it, so without an explicit drop
+    // the prompt-length logits are held for the whole generation. Retire them here; the release
+    // itself is taken on the loop's first `advance`.
+    drop(logits);
+    let mut release = BufferRelease::new();
     // Compact away any sequence that finished during prefill before the first decode step.
     if !keep.is_empty() && keep.len() < n {
         cache.retain_sequences(&keep)?;

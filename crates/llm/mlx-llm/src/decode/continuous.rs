@@ -169,10 +169,12 @@ pub fn generate_continuous(
         }
         next_req += 1;
     }
-    // The initial lanes' prefills are done AND evaluated (`admit_lane` samples each lane's first
-    // token from its prefill logits, which forces the graph), so this release does see the prefill
-    // transients. Later admit-on-retire prefills are covered by the per-step release cadence.
-    let mut release = BufferRelease::after_prefill();
+    // The initial lanes' prefills are done, evaluated (`admit_lane` samples each lane's first token
+    // from its prefill logits, which forces the graph), and *dropped* — each lane's logits are a
+    // local of `admit_lane` and die on return, so nothing prefill-sized outlives this point. The
+    // release is still taken on the loop's first `advance`, keeping one rule across every loop.
+    // Later admit-on-retire prefills are covered by the per-step release cadence.
+    let mut release = BufferRelease::new();
 
     // Decode loop: step every live lane, retire finished ones, refill freed slots from the queue.
     // Cancel is checked once at the top of each step (before another forward), so a mid-stream cancel

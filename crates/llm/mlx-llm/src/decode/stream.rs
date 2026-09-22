@@ -421,9 +421,10 @@ pub(crate) fn decode_loop(
     let mut generated: Vec<i32> = Vec::new();
     let mut finish = FinishReason::MaxTokens;
     // Every caller hands us `logits` straight from its prefill — still lazy. The first `sample`
-    // below is what evaluates the prefill graph, so the post-prefill release is taken right after
-    // it (a release before that would find the prefill's transients not yet freed).
-    let mut release: Option<BufferRelease> = None;
+    // below evaluates that graph, but the prefill `logits` array itself stays live until step 0
+    // reassigns the binding at the bottom of this loop; the post-prefill release therefore rides
+    // the first `release.advance`, which sits just after that reassignment.
+    let mut release = BufferRelease::new();
 
     for step in 0..config.max_new_tokens {
         // Pulling logits to host for sampling forces a graph eval each step, so this check is
@@ -439,7 +440,6 @@ pub(crate) fn decode_loop(
             let mask = constraint.as_mut().map(|c| c.allowed());
             sample(&logits, &history, &config.sampling, &mut rng, mask)?
         };
-        let release = release.get_or_insert_with(BufferRelease::after_prefill);
 
         if config.stop_tokens.contains(&next) {
             finish = FinishReason::StopToken;
@@ -468,6 +468,8 @@ pub(crate) fn decode_loop(
         // Feed the new token back; its absolute position is the current cache length.
         let offset = cache.offset();
         let tok = input_ids(&[next]);
+        // This reassignment drops the previous `logits`; on step 0 that is the prefill's
+        // prompt-length logits, so the release below is the first moment they are freeable.
         logits = decoder.step(&tok, cache, offset)?;
         release.advance(1);
     }
