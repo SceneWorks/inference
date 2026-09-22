@@ -802,6 +802,11 @@ def validate_preflight_record(
     vision_variant: str | None,
 ) -> None:
     policy = LOAD_PROFILES[load_profile]
+    supported_profiles = model.get("supported_execution_profiles")
+    if supported_profiles is not None and load_profile not in supported_profiles:
+        raise ValueError(
+            f"{model['key']} does not support the {load_profile} execution profile"
+        )
     sizes = pinned_admission_sizes(model, language_variant, vision_variant)
     weight_bytes = sizes["language_weight_bytes"] + sizes["vision_weight_bytes"]
     reserve = preflight.get("reserve_bytes")
@@ -2091,12 +2096,13 @@ def validate_full_acceptance_contract(spec: dict[str, Any]) -> None:
         for backend, models in (
             ("mlx", ("qwen38-parent", "bonsai-mlx-2bit", "qwen3vl-baseline")),
             ("candle-cuda", ("qwen38-parent", "bonsai-gguf", "qwen3vl-baseline")),
-            ("candle-cpu", ("qwen38-parent", "bonsai-gguf", "qwen3vl-baseline")),
         )
         for model in models
     }
     if {cell.get("id") for cell in cells if cell.get("group") == "matched"} != expected_matched_ids:
         raise ValueError("full acceptance matched model/backend routes are incomplete")
+    if len(cells) != 16 or any(cell.get("device") == "cpu" for cell in cells):
+        raise ValueError("full acceptance requires exactly 16 accelerator cells")
     required_format_ids = {
         "functional-mlx-bonsai-mlx",
         "functional-candle-bonsai-mlx",
@@ -2592,6 +2598,11 @@ def preflight(args: argparse.Namespace) -> int:
     if args.reserve_bytes < 0:
         raise ValueError("admission reserve bytes must be nonnegative")
     model = load_model(args.manifest, args.model_key)
+    supported_profiles = model.get("supported_execution_profiles")
+    if supported_profiles is not None and args.load_profile not in supported_profiles:
+        raise ValueError(
+            f"{model['key']} does not support the {args.load_profile} execution profile"
+        )
     sizes = pinned_admission_sizes(model, args.language_variant, args.vision_variant)
     weight_bytes = sizes["language_weight_bytes"] + sizes["vision_weight_bytes"]
     policy = LOAD_PROFILES[args.load_profile]
