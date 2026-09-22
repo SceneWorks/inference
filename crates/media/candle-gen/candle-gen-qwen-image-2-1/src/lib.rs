@@ -69,7 +69,6 @@ pub mod text_encoder;
 pub mod transformer;
 pub mod vae;
 
-
 /// Hugging Face repository the production snapshot layout is frozen from.
 pub const UPSTREAM_HF_REPO: &str = "Qwen/Qwen-Image-2.1";
 /// Pinned `Qwen/Qwen-Image-2.1` revision (weights, configs, tokenizer, scheduler config).
@@ -261,9 +260,7 @@ fn build_residency(
     let heavy_device = device.clone();
     Residency::from_policy(
         spec.offload_policy,
-        move || {
-            loader::load_text_encoder(loader::snapshot_root(&text_spec.weights)?, &text_device)
-        },
+        move || loader::load_text_encoder(loader::snapshot_root(&text_spec.weights)?, &text_device),
         move |_use_pid| load_heavy(&heavy_spec, &heavy_device),
     )
 }
@@ -554,7 +551,10 @@ mod tests {
         assert!(err.contains("snapshot directory"), "{err}");
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
             .with_text_encoder(WeightsSource::Dir("/elsewhere".into()));
-        let err = load(&spec).err().expect("substitution is refused").to_string();
+        let err = load(&spec)
+            .err()
+            .expect("substitution is refused")
+            .to_string();
         assert!(err.contains("text_encoder"), "{err}");
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_quant(Quant::Q8);
         let err = load(&spec).err().expect("quantize is refused").to_string();
