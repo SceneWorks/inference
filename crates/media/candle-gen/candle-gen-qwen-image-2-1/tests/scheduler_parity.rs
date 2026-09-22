@@ -69,7 +69,10 @@ fn the_seven_presets_are_all_covered_by_the_table() {
     let w = Fixture::open("qwen21_scheduler.safetensors");
     for preset in candle_gen_qwen_image_2_1::PRESETS {
         let case = format!("preset_{}", preset.ratio.replace(':', "x"));
-        assert_eq!(w.meta_usize(&format!("{case}/width")), preset.width as usize);
+        assert_eq!(
+            w.meta_usize(&format!("{case}/width")),
+            preset.width as usize
+        );
         assert_eq!(
             w.meta_usize(&format!("{case}/height")),
             preset.height as usize

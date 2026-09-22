@@ -180,10 +180,10 @@ pub struct QwenImage21 {
 }
 
 /// Reject every overlay this route does not wire, with a typed, actionable error.
-pub(crate) fn validate_load_spec(spec: &LoadSpec) -> Result<()> {
+pub(crate) fn validate_load_spec(spec: &LoadSpec) -> gen_core::Result<()> {
     gen_core::reject_unknown_components(spec, &[], MODEL_ID)?;
     if spec.precision != Precision::Bf16 {
-        return Err(Error::Msg(
+        return Err(gen_core::Error::Msg(
             "qwen_image_2_1: components load at the backend's own compute dtype; drop the \
              precision override"
                 .into(),
@@ -192,37 +192,32 @@ pub(crate) fn validate_load_spec(spec: &LoadSpec) -> Result<()> {
     if !spec.adapters.is_empty() {
         return Err(gen_core::Error::Unsupported(
             "qwen_image_2_1: LoRA/LoKr adapters are not wired for Qwen-Image 2.1 yet".into(),
-        )
-        .into());
+        ));
     }
     if spec.text_encoder.is_some() {
         return Err(gen_core::Error::Unsupported(
             "qwen_image_2_1: the Qwen3-VL text encoder is loaded from the snapshot's own \
              text_encoder/; LoadSpec::text_encoder substitution is not advertised"
                 .into(),
-        )
-        .into());
+        ));
     }
     if spec.quantize.is_some() {
         return Err(gen_core::Error::Unsupported(
             "qwen_image_2_1: candle has no on-the-fly Q4/Q8 quantization; provision an \
              already-packed snapshot instead"
                 .into(),
-        )
-        .into());
+        ));
     }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(
             "qwen_image_2_1: control / IP-adapter overlays are not wired (text-to-image only)"
                 .into(),
-        )
-        .into());
+        ));
     }
     if spec.identity.is_some() {
         return Err(gen_core::Error::Unsupported(
             "qwen_image_2_1: identity weights are not wired".into(),
-        )
-        .into());
+        ));
     }
     Ok(())
 }

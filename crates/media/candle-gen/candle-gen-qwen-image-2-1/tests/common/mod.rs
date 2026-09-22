@@ -16,7 +16,8 @@ use candle_core::{DType, Device, Tensor};
 
 /// `tests/fixtures/` of the MLX twin — the single home of the Qwen-Image 2.1 parity fixtures.
 pub fn fixtures() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../mlx-gen/mlx-gen-qwen-image-2-1/tests/fixtures")
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../mlx-gen/mlx-gen-qwen-image-2-1/tests/fixtures")
 }
 
 /// The committed miniature snapshot in the exact `Qwen/Qwen-Image-2.1` layout.

@@ -41,8 +41,8 @@ fn rope_every_stage_and_velocity_match_upstream() {
 
         let (cos, sin) = model.rope(&layout).unwrap();
         let (got_cos, got_sin) = (host_f32(&cos), host_f32(&sin));
-        let want_cos = host_f32(w.tensor(&format!("{case}/rope_cos")));
-        let want_sin = host_f32(w.tensor(&format!("{case}/rope_sin")));
+        let want_cos = host_f32(&w.tensor(&format!("{case}/rope_cos")));
+        let want_sin = host_f32(&w.tensor(&format!("{case}/rope_sin")));
         assert_eq!(got_cos.len(), want_cos.len(), "{case}: rope width");
         let mut rope_max = 0f32;
         for (i, ((gc, wc), (gs, ws))) in got_cos
@@ -60,7 +60,7 @@ fn rope_every_stage_and_velocity_match_upstream() {
         eprintln!("{case}/rope: max|Δ|={rope_max:.3e} bound=1.000e-5");
 
         let (velocity, trace) = model
-            .forward_joint_traced(text, &[hidden], timestep, &layout)
+            .forward_joint_traced(&text, &[&hidden], timestep, &layout)
             .unwrap();
         assert_eq!(trace.len(), 6 + 3 * model.config().num_layers);
         for (stage, got) in &trace {
@@ -79,7 +79,7 @@ fn rope_every_stage_and_velocity_match_upstream() {
             } else {
                 got.clone()
             };
-            assert_close(&format!("{case}/{stage}"), &got, want, TOL);
+            assert_close(&format!("{case}/{stage}"), &got, &want, TOL);
         }
 
         // The model emits the whole joint sequence; the pipeline keeps the target's tail.

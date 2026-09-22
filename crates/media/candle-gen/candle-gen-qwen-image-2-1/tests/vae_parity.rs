@@ -11,7 +11,7 @@
 use candle_core::Device;
 use candle_gen_qwen_image_2_1::{load_vae, rgba_to_rgb_over_white};
 
-use crate::common::{assert_close, fixture, tiny_snapshot};
+use crate::common::{assert_close, tiny_snapshot, Fixture};
 
 /// Encoder bar. Measured worst `max|Δ| / max(1, peak)` = **3.6e-7** over both cases and every
 /// stage (largest absolute 3.8e-6, at `down_block_4`); the MLX twin budgets 1e-3 for Metal.
@@ -23,7 +23,7 @@ const DECODER_TOL: f32 = 1e-5;
 
 #[test]
 fn every_stage_of_encode_and_decode_matches_upstream() {
-    let w = fixture("qwen21_vae.safetensors");
+    let w = Fixture::open("qwen21_vae.safetensors");
     let vae = load_vae(&tiny_snapshot(), &Device::Cpu).unwrap();
     let want = |key: &str| {
         // Fixtures are 5-D `[B, C, T=1, H, W]`; the port is single-frame NCHW.

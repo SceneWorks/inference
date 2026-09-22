@@ -54,18 +54,53 @@ Config keys read: `transformer/config.json` (`in_channels`, `out_channels`, `num
 
 ## Fixtures
 
-`tests/fixtures/` is produced by `tools/dump_qwen21_*.py` (shared setup in
-`tools/_qwen21_common.py`) from the diffusers/transformers classes at the revisions above on
-miniature seeded configs, with the tiny snapshot written by `save_pretrained` in the exact layout
-above. Each Rust parity test names the tolerance it holds the port to.
+This crate commits **no fixtures of its own**. Its parity tests read the *same* committed
+`.safetensors` oracles and the same miniature snapshot the MLX twin reads, across the backend
+boundary by relative path:
+
+```
+crates/media/mlx-gen/mlx-gen-qwen-image-2-1/tests/fixtures/
+```
+
+(the idiom `candle-gen-ltx`, `candle-gen-mochi` and `candle-gen-krea` already use). They were
+produced by `crates/media/mlx-gen/tools/dump_qwen21_*.py` (shared setup in `_qwen21_common.py`) from
+the diffusers/transformers classes at the revisions above, on miniature seeded configs, with the
+tiny snapshot written by `save_pretrained` in the exact layout above. One oracle per component means
+the two backends cannot drift apart against two copies. Each Rust parity test names the tolerance it
+holds the port to and prints its measured error.
 
 ## Deliberate divergences
+
+### From upstream (shared with the MLX twin)
 
 * No prefix KV cache: every step evaluates the full block-causal joint sequence (upstream's exact
   `QwenImage21AttnProcessor` prefill path). Upstream documents the cached and uncached paths as
   equally valid but not bit-identical.
 * Latents stay f32 between Euler steps (upstream rounds to bf16 each step).
-* The text tower runs f32 activations over bf16 weights (upstream: bf16 end to end).
-* Noise is MLX-seeded (`mlx.random.normal` under `key(seed)`), not torch-seeded.
+* The text tower runs f32 activations (upstream: bf16 end to end).
+* Noise is seeded from the shared launch-portable CPU `StdRng` (`candle_gen::seed`), not torch's
+  generator; seed parity across frameworks is not a goal.
 * RGB emission composites the RGBA decode over white until gen-core carries an RGBA surface
   (sc-24111); `QwenImage21Vae::decode_rgba` is the four-channel path.
+
+### From the MLX twin (this crate is the candle sibling)
+
+* `backend = "candle"`, `mac_only = false`.
+* **No on-the-fly Q4/Q8.** MLX quantizes the DiT's Linears at load from `LoadSpec::quantize`;
+  candle has no affine-quantize-at-load path, so `load` refuses that spec with a typed
+  `Unsupported` and the descriptor advertises no `supported_quants`. An already-MLX-packed snapshot
+  still loads: every DiT Linear goes through `candle_gen::quant::AdaptLinear::linear_detect_gs`,
+  the packed-detect seam `candle-gen-qwen-image` uses, at the same group size the MLX `quantize`
+  would have written (64, or 32 for a narrower input width).
+* Tensors stay NCHW end to end. The MLX VAE works channels-last because mlx convolutions are NHWC;
+  candle is NCHW natively and the torch weights already ship `[out, in, kh, kw]`, so the layout
+  shuffles disappear and the two parameter-free VAE shortcuts (`AvgDown3D`, `DupUp3D`) are
+  re-derived on the channel axis rather than transcribed.
+* The Qwen3 decoder block is ported into `src/text_encoder.rs` rather than reused: the MLX twin
+  reaches `mlx_gen_z_image::text_encoder::EncoderLayer`, but candle's Z-Image Qwen3 decoder is a
+  private vendored module pinned to Z-Image's layer[-2] / `model.` prefix conventions.
+* Noise draw and per-image seed derivation come from `candle_gen::seed` (`image_seed`,
+  `seeded_normal_vec`), so a seed reproduces within the candle backend but not across the two
+  engines.
+* Compute dtype is the backend's: f32 on CPU (the parity lane), bf16 on CUDA/Metal — where MLX
+  always loads at the checkpoint's on-disk dtype.

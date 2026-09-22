@@ -1,8 +1,13 @@
-//! The bounded real-weight validation render (sc-24109) — `#[ignore]`d **and** `cuda`-gated: it
-//! needs the pinned `Qwen/Qwen-Image-2.1` snapshot at `CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT`
-//! (inference never self-fetches or derives a cache location, epic 13657) and a CUDA GPU — candle's
-//! plain CPU backend has no bf16 matmul, the same reason `candle-gen-ltx`'s conformance suite is
-//! CUDA-only.
+//! The bounded real-weight validation render (sc-24109) — `#[ignore]`d **and** gated to a GPU
+//! backend: it needs the pinned `Qwen/Qwen-Image-2.1` snapshot at
+//! `CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT` (inference never self-fetches or derives a cache location,
+//! epic 13657) and an accelerator, because the released weights are bf16 and candle's plain CPU
+//! backend has no bf16 matmul — the same reason `candle-gen-ltx`'s conformance suite is gated.
+//!
+//! The gate is `any(cuda, metal)` rather than `cuda` alone so the macOS candle lane type-checks
+//! this file too (`cargo check --features metal --all-targets`); CUDA is the lane the render is
+//! meant for, and neither is reachable in ordinary CI — no runner provisions the 32 GB snapshot
+//! (`release/real-weight-models.toml` records the key as deliberately unwired).
 //!
 //! Loads the released bf16 weights through the explicit catalog's production load path and renders
 //! one image at the upstream default preset (1:1 2048×2048, 40 steps, seed 42, no guidance),
@@ -20,7 +25,7 @@
 //! `QWEN_IMAGE_2_1_RENDER_SIZE=WxH` and `QWEN_IMAGE_2_1_RENDER_STEPS=N` override the preset for a
 //! quicker smoke.
 
-#![cfg(feature = "cuda")]
+#![cfg(any(feature = "cuda", feature = "metal"))]
 
 use std::path::PathBuf;
 use std::time::Instant;
