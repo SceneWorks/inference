@@ -141,6 +141,66 @@ fn spec_for(root: &Path, quant: Option<Quant>, policy: OffloadPolicy) -> LoadSpe
 
 // ── the tiers install ────────────────────────────────────────────────────────────────────────────
 
+/// **The fixture tiers genuinely pack BOTH components** — the guard against the rest of this file
+/// becoming vacuous.
+///
+/// Everything below renders through the packed-detect seam, but a snapshot with no packed tensor at
+/// all would render identically to the dense one and every parity bar would pass while proving
+/// nothing. The miniature geometry is mostly narrower than group 64, so only a few leaves are
+/// eligible; this pins that the eligible ones ARE packed, in the DiT **and** in the Qwen3 tower.
+#[test]
+fn the_fixture_tiers_pack_both_the_dit_and_the_tower() {
+    for tier in [Tier::Q8, Tier::Q4] {
+        let dir = fixtures().join("tiers").join(tier.dir_name());
+        for (component, expected) in [
+            (
+                "transformer",
+                vec![
+                    "time_text_embed.timestep_embedder.linear_1",
+                    "transformer_blocks.0.img_mlp.out",
+                    "transformer_blocks.1.img_mlp.out",
+                ],
+            ),
+            (
+                // The tower's only group-64-eligible width on this geometry is the SwiGLU
+                // `down_proj` (in = intermediate_size = 64). Two layers, so two packed triples —
+                // which is what makes the candle text-encoder packed path non-vacuous here.
+                "text_encoder",
+                vec![
+                    "model.language_model.layers.0.mlp.down_proj",
+                    "model.language_model.layers.1.mlp.down_proj",
+                ],
+            ),
+        ] {
+            let bytes = std::fs::read(dir.join(component).join("model.safetensors")).unwrap();
+            let parsed = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+            let mut packed: Vec<String> = parsed
+                .names()
+                .into_iter()
+                .filter_map(|name| name.strip_suffix(".scales").map(str::to_owned))
+                .collect();
+            packed.sort();
+            assert_eq!(
+                packed,
+                expected,
+                "{}/{component}: the committed tier must pack exactly the group-64-eligible leaves",
+                tier.dir_name()
+            );
+            for base in &packed {
+                assert!(
+                    parsed.tensor(&format!("{base}.biases")).is_ok(),
+                    "{base} is missing its packed bias table"
+                );
+                assert_eq!(
+                    parsed.tensor(&format!("{base}.weight")).unwrap().dtype(),
+                    safetensors::Dtype::U32,
+                    "{base} codes must be u32-packed"
+                );
+            }
+        }
+    }
+}
+
 /// The composed tier is what the converter says it is, and candle reads the marker the same way the
 /// MLX loader does.
 #[test]
