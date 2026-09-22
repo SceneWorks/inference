@@ -530,6 +530,7 @@ dependencies = [
  "candle-gen-pid",
  "candle-gen-pulid",
  "candle-gen-qwen-image",
+ "candle-gen-qwen-image-2-1",
  "candle-gen-sam3",
  "candle-gen-sana",
  "candle-gen-scail2",
@@ -838,6 +839,19 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+]
+
+[[package]]
+name = "candle-gen-qwen-image-2-1"
+version = "0.0.0"
+dependencies = [
+ "candle-core",
+ "candle-gen",
+ "candle-nn",
+ "rand",
+ "safetensors 0.7.0",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
 ]
 
 [[package]]
