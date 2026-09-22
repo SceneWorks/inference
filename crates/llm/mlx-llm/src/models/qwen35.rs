@@ -28,7 +28,7 @@ use crate::primitives::attention::{sdpa_capped, AttnMask};
 use crate::primitives::gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
 };
-use crate::primitives::kv_cache::KvCache;
+use crate::primitives::kv_cache::{ContiguousKvCache, KvCache};
 use crate::primitives::nn::{embed, linear, rms_norm, silu};
 use crate::primitives::prism::PrismEmbedding;
 use crate::primitives::projection::{Projection, QuantSpec};
@@ -564,27 +564,53 @@ impl DecoderLayer {
     }
 }
 
-/// A single full-attention layer's growing KV (the linear layers use [`DeltaNetCache`] instead).
-#[derive(Clone, Debug, Default)]
+/// A single full-attention layer's KV (the linear layers use [`DeltaNetCache`] instead): a
+/// one-layer block-allocated [`ContiguousKvCache`], written in place between block growths, so a
+/// long generation does not retire a strictly-larger buffer per token per layer (Qwen3.6-27B has
+/// 16 of these layers; the per-token concat cost ~370 MB of unreusable buffers per token at 5.6k
+/// context).
+///
+/// `Clone` is a buffer-sharing snapshot — the MTP loop's rollback (`target_cache.clone()` /
+/// `mtp_cache.clone()`) stays correct because the in-place write copies rather than donates while
+/// a snapshot holds the buffer.
+#[derive(Clone, Debug)]
 pub struct AttnKv {
-    kv: Option<(Array, Array)>,
+    kv: ContiguousKvCache,
+}
+
+impl Default for AttnKv {
+    fn default() -> Self {
+        Self {
+            kv: ContiguousKvCache::new(1),
+        }
+    }
 }
 
 impl AttnKv {
-    fn update(&mut self, k: &Array, v: &Array) -> Result<(Array, Array)> {
-        let merged = match self.kv.take() {
-            Some((pk, pv)) => (
-                concatenate_axis(&[&pk, k], 2)?,
-                concatenate_axis(&[&pv, v], 2)?,
-            ),
-            None => (k.clone(), v.clone()),
-        };
-        self.kv = Some((merged.0.clone(), merged.1.clone()));
-        Ok(merged)
+    /// A slot growing by `block` positions at a time; tests use a small block to cross growth
+    /// boundaries with tiny tensors.
+    #[cfg(test)]
+    fn with_block_tokens(block: i32) -> Self {
+        Self {
+            kv: ContiguousKvCache::with_block_tokens(1, block),
+        }
     }
 
+    fn update(&mut self, k: &Array, v: &Array) -> Result<(Array, Array)> {
+        self.kv.update(0, k, v)
+    }
+
+    /// Live positions — the slot's write offset, not the padded buffer length.
     fn offset(&self) -> i32 {
-        self.kv.as_ref().map(|(k, _)| k.shape()[2]).unwrap_or(0)
+        self.kv.offset()
+    }
+
+    fn batch_size(&self) -> i32 {
+        self.kv.batch_size()
+    }
+
+    fn reset(&mut self) {
+        self.kv.reset();
     }
 }
 
@@ -620,7 +646,7 @@ impl Qwen35Cache {
         for l in &mut self.layers {
             match l {
                 Qwen35LayerCache::Delta(c) => c.reset(),
-                Qwen35LayerCache::Attn(a) => a.kv = None,
+                Qwen35LayerCache::Attn(a) => a.reset(),
             }
         }
     }
@@ -1517,7 +1543,7 @@ impl KvCache for Qwen35Cache {
         self.layers
             .iter()
             .find_map(|l| match l {
-                Qwen35LayerCache::Attn(a) => a.kv.as_ref().map(|(k, _)| k.shape()[0]),
+                Qwen35LayerCache::Attn(a) => Some(a.batch_size()),
                 Qwen35LayerCache::Delta(_) => None,
             })
             .unwrap_or(0)
@@ -1684,8 +1710,96 @@ pub fn vision_merged_token_count(grid_thw: [i32; 3], spatial_merge_size: i32) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::primitives::kv_cache::testing::{host, tok, ConcatReference, CpuStream};
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn attn_kv_matches_concat_reference_across_a_block_boundary() {
+        let _cpu = CpuStream::enter();
+        // The full-attention slot is a one-layer block cache: 3-token prefill + enough single
+        // tokens to cross the block boundary twice, every returned K/V equal to a naive concat,
+        // and `offset` reporting live positions rather than the padded buffer length.
+        let block = 4;
+        let mut slot = AttnKv::with_block_tokens(block);
+        let mut reference = ConcatReference::new();
+        assert_eq!(slot.offset(), 0);
+        assert_eq!(slot.batch_size(), 0);
+
+        let prefill_k = Array::from_slice(&[0.0f32, 0.5, 1.0, 1.5, 2.0, 2.5], &[1, 1, 3, 2]);
+        let prefill_v = Array::from_slice(&[9.0f32, 9.5, 8.0, 8.5, 7.0, 7.5], &[1, 1, 3, 2]);
+        let (sk, sv) = slot.update(&prefill_k, &prefill_v).unwrap();
+        let (rk, rv) = reference.update(&prefill_k, &prefill_v);
+        assert_eq!(host(&sk), host(&rk));
+        assert_eq!(host(&sv), host(&rv));
+        assert_eq!(slot.offset(), 3);
+        assert_eq!(slot.batch_size(), 1);
+
+        for i in 0..7 {
+            let k = tok(10.0 + i as f32);
+            let v = tok(20.0 + i as f32);
+            let (sk, sv) = slot.update(&k, &v).unwrap();
+            let (rk, rv) = reference.update(&k, &v);
+            assert_eq!(sk.shape(), rk.shape(), "update {i}: shape");
+            assert_eq!(host(&sk), host(&rk), "update {i}: keys");
+            assert_eq!(host(&sv), host(&rv), "update {i}: values");
+            assert_eq!(slot.offset(), 4 + i, "update {i}: offset is live positions");
+        }
+        // 10 live positions in a 12-position buffer: offset must not read the padding.
+        assert_eq!(slot.offset(), 10);
+        assert_ne!(slot.offset(), 12);
+
+        slot.reset();
+        assert_eq!(slot.offset(), 0);
+        assert_eq!(slot.batch_size(), 0);
+    }
+
+    #[test]
+    fn attn_kv_clone_snapshot_survives_in_place_updates_and_rolls_back() {
+        let _cpu = CpuStream::enter();
+        // The MTP loop rolls back by restoring a `clone()` taken before the trial (there is no
+        // truncate on the hybrid cache). While the trial writes in place, the snapshot must stay
+        // exactly what it was, and continuing from it must match a reference that never saw the
+        // trial — across a block boundary, so the trial both overwrites padding and grows.
+        let block = 4;
+        let mut slot = AttnKv::with_block_tokens(block);
+        let mut reference = ConcatReference::new();
+        let prompt = Array::from_slice(&[0.0f32, 0.5, 1.0, 1.5, 2.0, 2.5], &[1, 1, 3, 2]);
+        slot.update(&prompt, &prompt).unwrap();
+        reference.update(&prompt, &prompt);
+
+        let snapshot = slot.clone();
+        let snapshot_k_before = host(reference.k.as_ref().unwrap());
+
+        // Trial: 3 draft tokens (positions 3..6) — fills the block and grows into a second one.
+        for i in 0..3 {
+            let d = tok(100.0 + i as f32);
+            slot.update(&d, &d).unwrap();
+        }
+        assert_eq!(slot.offset(), 6);
+        assert_eq!(
+            snapshot.offset(),
+            3,
+            "snapshot offset untouched by the trial"
+        );
+        let (snap_k, _) = snapshot.kv.peek(0).unwrap().unwrap();
+        assert_eq!(
+            host(&snap_k),
+            snapshot_k_before,
+            "snapshot contents untouched by the trial's in-place writes"
+        );
+
+        // Reject everything: restore the snapshot and replay the accepted path.
+        let mut slot = snapshot;
+        for i in 0..5 {
+            let t = tok(200.0 + i as f32);
+            let (sk, sv) = slot.update(&t, &t).unwrap();
+            let (rk, rv) = reference.update(&t, &t);
+            assert_eq!(host(&sk), host(&rk), "replay {i}: keys");
+            assert_eq!(host(&sv), host(&rv), "replay {i}: values");
+        }
+        assert_eq!(slot.offset(), 8);
+    }
 
     #[test]
     fn published_prism_norm_multiplier_matches_independent_rms_oracle() {

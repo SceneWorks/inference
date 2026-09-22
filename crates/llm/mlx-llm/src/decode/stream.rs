@@ -17,6 +17,7 @@ use core_llm::GenerationTimings;
 use mlx_rs::transforms::eval;
 use mlx_rs::Array;
 
+use super::BufferRelease;
 use crate::error::{Error, Result};
 use crate::primitives::input_ids;
 use crate::primitives::kv_cache::KvCache;
@@ -419,6 +420,11 @@ pub(crate) fn decode_loop(
 ) -> Result<GenerationOutput> {
     let mut generated: Vec<i32> = Vec::new();
     let mut finish = FinishReason::MaxTokens;
+    // Every caller hands us `logits` straight from its prefill — still lazy. The first `sample`
+    // below evaluates that graph, but the prefill `logits` array itself stays live until step 0
+    // reassigns the binding at the bottom of this loop; the post-prefill release therefore rides
+    // the first `release.advance`, which sits just after that reassignment.
+    let mut release = BufferRelease::new();
 
     for step in 0..config.max_new_tokens {
         // Pulling logits to host for sampling forces a graph eval each step, so this check is
@@ -462,7 +468,10 @@ pub(crate) fn decode_loop(
         // Feed the new token back; its absolute position is the current cache length.
         let offset = cache.offset();
         let tok = input_ids(&[next]);
+        // This reassignment drops the previous `logits`; on step 0 that is the prefill's
+        // prompt-length logits, so the release below is the first moment they are freeable.
         logits = decoder.step(&tok, cache, offset)?;
+        release.advance(1);
     }
 
     on_event(StreamEvent::Done {
