@@ -164,7 +164,11 @@ fn load_vision_tower_weights(
             .filter(|name| name.starts_with(VISION_TOWER_PREFIX))
             .collect();
         for name in names {
-            let tensor = st.load(&name, device)?;
+            // f32 to match the language tower, which `VarBuilder` loads at `DType::F32`. Without
+            // this the two halves of ONE encoder would run in different dtypes on the released
+            // bf16 snapshot — the ViT in bf16 feeding f32 decoder layers — which is neither
+            // upstream's behaviour (bf16 end to end) nor this port's (f32 activations).
+            let tensor = st.load(&name, device)?.to_dtype(DType::F32)?;
             tensors.insert(name, tensor);
         }
     }

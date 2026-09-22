@@ -294,7 +294,10 @@ def build_tiny_pipeline():
             "spatial_merge_size": 2,
             "temporal_patch_size": 2,
             "num_position_embeddings": 64,
-            "deepstack_visual_indexes": [0],
+            # TWO taps over the two vision layers (production taps three of its 27). One tap can
+            # only prove that a DeepStack feature is added *somewhere*; two pin the tap -> decoder
+            # layer ORDER, which is exactly what a swapped injection would break (sc-24110 review).
+            "deepstack_visual_indexes": [0, 1],
         },
     )
     # The vision token ids must be the TINY tokenizer's, not `Qwen3VLConfig`'s released defaults

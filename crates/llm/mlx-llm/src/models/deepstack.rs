@@ -11,7 +11,7 @@ pub type MropePositions = (Vec<i32>, Vec<i32>, Vec<i32>, i32);
 /// `[num_image_tokens, hidden]` (the vision encoder's merged patch rows), in sequence order — the
 /// shared VLM splice (no scatter; contiguous text/image spans concatenated). `hidden` is the decoder
 /// width. The number of image-token positions must equal the feature-row count.
-pub fn splice_image_features(
+pub(crate) fn splice_image_features(
     embeds: &Array,
     input_ids: &[i32],
     image_features: &Array,
@@ -33,7 +33,8 @@ pub fn splice_image_features(
 /// `<|image_pad|>` and/or video `<|video_pad|>`) with the next feature row, in sequence order. This is
 /// the multimodal splice for a mixed image+video prompt — the visual features (image features then
 /// the video's per-frame merged rows, concatenated in the same order the placeholders appear) line up
-/// one-to-one with the visual positions. Reduces to [`splice_image_features`] for a single token.
+/// one-to-one with the visual positions. Reduces to the crate-private `splice_image_features`
+/// for a single token.
 pub fn splice_vision_features(
     embeds: &Array,
     input_ids: &[i32],
@@ -171,7 +172,7 @@ pub fn mrope_positions_mm(
     Ok((t, h, w, delta))
 }
 
-pub fn deepstack_fused_decoder_layers<F>(
+pub(crate) fn deepstack_fused_decoder_layers<F>(
     h0: &Array,
     visual_pos_mask: &[bool],
     deepstack: &[Array],

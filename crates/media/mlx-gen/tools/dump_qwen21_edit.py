@@ -24,7 +24,16 @@ Cases (`output_resolution = 64`, the tiny processor's pixel budget; targets 64x6
                   README's circle / paint stroke), which upstream consumes as an ordinary
                   reference: no mask argument exists;
   * `mask_ref`  — a photo plus a **separate binary mask image** passed as a second ordinary
-                  reference, which is the only way upstream accepts one.
+                  reference, which is the only way upstream accepts one;
+  * `aspect`    — three references with DIFFERENT, NON-SQUARE aspect ratios, so the fit rule
+                  itself is under test rather than assumed. `4:1` fits to 128x32 and `1:4` to
+                  32x128 (both land exactly on the tiny processor's 4096-px ceiling), giving
+                  heterogeneous `img_shapes` of `(1, 2, 8)` and `(1, 8, 2)` against the square
+                  target's `(1, 4, 4)` — which is what exercises the RoPE cursor's
+                  `position += max(h, w)` and M-RoPE's `max(h/merge, w/merge)` advance for a
+                  non-square block. The third is a `25/16` ratio whose width lands on a 32-grid
+                  **tie** (80/32 = 2.5), so Python's half-to-EVEN `round` gives 64 where
+                  round-half-away would give 96.
 
 `use_kv_cache=False` on every run, as the other generators do.
 
@@ -184,6 +193,9 @@ def main() -> None:
 
     photo_a = synthetic(1, 48, 48)
     photo_b = synthetic(2, 80, 80)
+    # 96x24 is 4:1 and 24x96 is 1:4 (both fit to the 4096-px ceiling); 50x32 is 25/16, whose
+    # fitted width lands on a half-to-even tie. See the module docstring.
+    wide, tall, tie = synthetic(21, 96, 24), synthetic(22, 24, 96), synthetic(23, 50, 32)
 
     run_case(pipe, "ref1", [photo_a], out, meta)
     run_case(pipe, "ref2", [photo_a, photo_b], out, meta)
@@ -192,6 +204,7 @@ def main() -> None:
     run_case(pipe, "ref10", [synthetic(10 + i, 64, 64) for i in range(10)], out, meta, stages=False)
     run_case(pipe, "annotated", [annotated(3, 64, 64)], out, meta)
     run_case(pipe, "mask_ref", [photo_a, binary_mask(64, 64)], out, meta)
+    run_case(pipe, "aspect", [wide, tall, tie], out, meta)
 
     # The port's own bounds, recorded so the Rust refusal tests cite this file rather than a
     # constant typed twice. Upstream's pipeline does not enforce a cap; the README documents ten.

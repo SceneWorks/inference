@@ -90,3 +90,53 @@ fn frozen_upstream_revisions_are_recorded() {
         assert!(upstream.contains(sha), "UPSTREAM.md records {sha}");
     }
 }
+
+/// The released `processor/preprocessor_config.json` pixel budget, which
+/// [`VisionConfig::output_resolution`] derives upstream's 1024-px condition-image fit from.
+///
+/// It is pinned here rather than only inside a hand-written test JSON blob: the derivation is
+/// `min(1024, sqrt(max_pixels))` clamped up by `sqrt(min_pixels)`, so a snapshot bump that moved
+/// the budget would silently move every reference's fit — and with it the whole joint layout —
+/// while every parity fixture (dumped at the tiny snapshot's own budget) stayed green.
+#[test]
+fn the_released_processor_pixel_budget_pins_the_condition_image_fit() {
+    let vision = mlx_gen_qwen_image_2_1::VisionConfig::from_value(
+        &serde_json::json!({
+            "vision_config": {
+                "deepstack_visual_indexes": [8, 16, 24],
+                "depth": 27,
+                "hidden_size": 1152,
+                "in_channels": 3,
+                "intermediate_size": 4304,
+                "num_heads": 16,
+                "num_position_embeddings": 2304,
+                "out_hidden_size": 4096,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "temporal_patch_size": 2
+            }
+        }),
+        Some(&serde_json::json!({
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_std": [0.5, 0.5, 0.5],
+            // `Qwen/Qwen-Image-2.1` @ UPSTREAM_HF_REVISION, verbatim.
+            "size": { "shortest_edge": 65536, "longest_edge": 16777216 }
+        })),
+    )
+    .unwrap();
+    assert_eq!(vision.processor.min_pixels, 65_536, "256 x 256");
+    assert_eq!(vision.processor.max_pixels, 16_777_216, "4096 x 4096");
+    assert_eq!(vision.processor.patch_size, 16);
+    assert_eq!(vision.processor.merge_size, 2);
+    assert_eq!(vision.processor.temporal_patch_size, 2);
+    assert_eq!(vision.processor.mean, [0.5, 0.5, 0.5]);
+    assert_eq!(vision.processor.std, [0.5, 0.5, 0.5]);
+    assert_eq!(vision.tower.deepstack_visual_indexes, vec![8, 16, 24]);
+    // The whole point of the budget: it is what puts the fit on upstream's literal default.
+    assert_eq!(
+        vision.output_resolution(),
+        mlx_gen_qwen_image_2_1::OUTPUT_RESOLUTION,
+        "the released budget must derive upstream's own `output_resolution` default"
+    );
+    assert_eq!(mlx_gen_qwen_image_2_1::OUTPUT_RESOLUTION, 1024);
+}

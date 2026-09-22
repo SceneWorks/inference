@@ -38,7 +38,8 @@
   "video_token_id": 52,
   "vision_config": {
     "deepstack_visual_indexes": [
-      0
+      0,
+      1
     ],
     "depth": 2,
     "hidden_act": "gelu_pytorch_tanh",
