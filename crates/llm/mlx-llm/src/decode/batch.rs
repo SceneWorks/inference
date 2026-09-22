@@ -34,7 +34,7 @@ use core_llm::FinishReason as CoreFinish;
 
 use crate::decode::cancel::CancelFlag;
 use crate::decode::stream::{default_seed, Decode, FinishReason, GenerationOutput, StreamEvent};
-use crate::decode::{record_lane_token, LaneStep};
+use crate::decode::{record_lane_token, BufferRelease, LaneStep};
 use crate::error::{Error, Result};
 use crate::models::CausalLm;
 use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
@@ -163,6 +163,8 @@ pub fn generate_batch(
             active.push(lane);
         }
     }
+    // The first-row sample above evaluated the (lazy) prefill graph; release its transients now.
+    let mut release = BufferRelease::after_prefill();
     // Compact away any sequence that finished during prefill before the first decode step.
     if !keep.is_empty() && keep.len() < n {
         cache.retain_sequences(&keep)?;
@@ -208,6 +210,8 @@ pub fn generate_batch(
                 next_active.push(lane);
             }
         }
+        // After sampling: the step's graph has been evaluated, so its transients are freeable.
+        release.advance(1);
         if next_active.is_empty() {
             break;
         }
