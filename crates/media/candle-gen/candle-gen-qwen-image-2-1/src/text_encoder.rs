@@ -31,7 +31,7 @@
 
 use std::sync::Arc;
 
-use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
+use candle_core::{DType, Device, IndexOp, Module, Tensor};
 use candle_gen::candle_nn::{
     ops::softmax_last_dim, rms_norm, rotary_emb, Embedding, Linear, RmsNorm, VarBuilder,
 };
@@ -369,12 +369,6 @@ pub fn input_ids(ids: &[i32], device: &Device) -> Result<Tensor> {
     let host: Vec<u32> = ids.iter().map(|&id| id.max(0) as u32).collect();
     let len = host.len();
     Ok(Tensor::from_vec(host, (1, len), device)?)
-}
-
-/// `x.max(dim)`-free helper kept for symmetry with the MLX twin's trace plumbing.
-#[allow(dead_code)]
-fn last_dim(t: &Tensor) -> candle_core::Result<usize> {
-    t.dim(D::Minus1)
 }
 
 #[cfg(test)]

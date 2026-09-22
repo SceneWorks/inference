@@ -63,7 +63,7 @@ use candle_core::Device;
 use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Precision, Progress, Quant, SizeFloor, WeightsSource,
+    ModelDescriptor, Precision, Progress, Quant, SizeFloor,
 };
 use candle_gen::residency::Residency;
 use candle_gen::{CandleError as Error, Result};
@@ -434,15 +434,10 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
     register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
 }
 
-/// A single-file weights source is refused with an actionable message.
-pub fn requires_snapshot_directory(source: &WeightsSource) -> bool {
-    matches!(source, WeightsSource::Dir(_))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::OffloadPolicy;
+    use candle_gen::gen_core::{OffloadPolicy, WeightsSource};
 
     fn req(width: u32, height: u32) -> GenerationRequest {
         GenerationRequest {
