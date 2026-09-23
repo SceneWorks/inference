@@ -126,9 +126,10 @@ backend-neutral contracts  →  MLX/Candle engines  →  provider-family crates
   FP8 / INT8 cuBLASLt paths and codecs) used by both `candle-gen` and `candle-llm`, plus the fused
   decode primitives (`fused_decode`: RMSNorm(+residual), SwiGLU, QK-norm+RoPE, bit-identical to
   candle's op chains) and the fused NVFP4 decode GEMV (`nvfp4_gemv`: 1..=8 bf16 rows against a
-  resident NVFP4 weight, the decode-sized alternative to cuBLASLt W4A4). **Every runtime-compiled CUDA kernel goes through the nvrtc compile-once
-  seam** (`nvrtc::KernelSource::compiled`: per-device, per-source, failures cached) — never a
-  private `compile_ptx` + `load_module` (epic sc-24128 E3).
+  resident NVFP4 weight, the decode-sized alternative to cuBLASLt W4A4). **Every runtime-compiled
+  CUDA kernel goes through the nvrtc compile-once seam** (`nvrtc::KernelSource::compiled`:
+  per-device, per-source, failures cached) — never a private `compile_ptx` + `load_module` (epic
+  sc-24128 E3).
 - `crates/media/` — `mlx-gen` / `candle-gen` engines and provider families, plus the
   `mlx-gen-catalog` / `candle-gen-catalog` composition roots.
 - `crates/audio/` — the Candle-native audio family (`candle-audio` commons + the
