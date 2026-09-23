@@ -358,6 +358,12 @@ pub fn save_map(path: &Path, map: &HashMap<String, Array>) -> Result<()> {
 /// `nn.quantize(bf16)`). Every other tensor (norms, 1-D, non-divisible, non-target) passes through
 /// unchanged. `is_target` receives the **base** (the key minus its `.weight` suffix). The shape guard
 /// keeps an odd-shaped or 1-D target dense rather than crashing `quantize`.
+///
+/// Each packed target is **evaluated one tensor at a time** (source first, then the packed triple;
+/// sc-24114). Those evals are load-bearing, not redundant: MLX runs a safetensors `Load` on its
+/// CPU stream, and a GPU `quantize` over an unread `Load` makes the Metal command buffer wait on
+/// the disk read — deferred to one eval over the whole map, that trips the GPU watchdog
+/// (`kIOGPUCommandBufferCallbackErrorTimeout` → `SubmissionsIgnored`) on a slow volume.
 pub fn quantize_map(
     map: HashMap<String, Array>,
     bits: i32,
@@ -372,8 +378,21 @@ pub fn quantize_map(
             && v.shape()[1] % group_size == 0
             && v.shape()[1] >= group_size;
         if let (Some(base), true) = (base, packable) {
+            // sc-24114: consume the source bytes BEFORE the GPU quantize kernel is scheduled
+            // behind them. A safetensors `Load` runs on MLX's CPU stream; a GPU consumer of a
+            // not-yet-read `Load` makes `eval` encode a GPU-timeline wait on that read
+            // (`Event::wait(stream)` → `encodeWait`), so a graph of hundreds of lazy
+            // `Load → quantize` pairs turns into command buffers that sit on the Metal timeline
+            // waiting for gigabytes of `pread` from disk — and past the GPU watchdog that is
+            // `kIOGPUCommandBufferCallbackErrorTimeout`, after which every later submission of
+            // the process is `SubmissionsIgnored`. Reproduced at 90 production tensors from a
+            // ~300 MiB/s disk. Evaluating the source on its own stream first leaves the quantize
+            // with an already-resident input (no GPU wait at all), and evaluating the packed
+            // triple right away bounds the dense transient to one tensor.
+            v.eval()?;
             let wbf16 = v.as_dtype(Dtype::Bfloat16)?;
             let (wq, scales, biases) = quantize(&wbf16, group_size, bits)?;
+            eval([&wq, &scales, &biases])?;
             out.insert(format!("{base}.weight"), wq);
             out.insert(format!("{base}.scales"), scales);
             out.insert(format!("{base}.biases"), biases);
@@ -536,6 +555,69 @@ mod tests {
         assert!(error.contains("transformer"), "{error}");
         assert!(error.contains("Q8") && error.contains("Q4"), "{error}");
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// sc-24114: `quantize_map` consumes every packed target's source bytes before it returns —
+    /// the eval boundary that keeps a GPU quantize kernel from waiting on a disk read inside a
+    /// Metal command buffer (`kIOGPUCommandBufferCallbackErrorTimeout` on a slow volume).
+    ///
+    /// Mechanical pin: load a file lazily, run `quantize_map`, then **truncate the file to zero
+    /// bytes** before anything downstream evaluates. If the reads were still pending (the
+    /// pre-fix graph deferred them to `save_map`'s single eval), the later eval reads a
+    /// zero-length file and cannot reproduce the eager reference; if they were consumed inside
+    /// `quantize_map`, the packed triple is byte-identical to the reference.
+    ///
+    /// *Mutation that reds this:* removing the `v.eval()` / `eval([&wq, &scales, &biases])` pair
+    /// from `quantize_map`.
+    #[test]
+    fn quantize_map_consumes_its_source_bytes_before_returning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("model.safetensors");
+        let w = Array::from_slice(
+            &(0..256 * 128)
+                .map(|i| (i as f32 * 0.37).sin())
+                .collect::<Vec<_>>(),
+            &[256, 128],
+        );
+        let norm = Array::ones::<f32>(&[128]).unwrap();
+        Array::save_safetensors(
+            [
+                ("blocks.0.proj.weight", &w),
+                ("blocks.0.norm.weight", &norm),
+            ],
+            None::<&HashMap<String, String>>,
+            &path,
+        )
+        .unwrap();
+        // The eager reference, from bytes read while the file is intact.
+        let (ewq, esc, ebi) = quantize(w.as_dtype(Dtype::Bfloat16).unwrap(), 64, 8).unwrap();
+        eval([&ewq, &esc, &ebi]).unwrap();
+
+        let lazy = load_dir_map(tmp.path()).unwrap();
+        let out = quantize_map(lazy, 8, 64, |_| true).unwrap();
+        // Nothing has been evaluated by this test yet: pull the source out from under the map.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+
+        for (key, expected) in [
+            ("blocks.0.proj.weight", &ewq),
+            ("blocks.0.proj.scales", &esc),
+            ("blocks.0.proj.biases", &ebi),
+        ] {
+            let got = out.get(key).expect(key);
+            let same = mlx_rs::ops::eq(got, expected)
+                .and_then(|m| m.all(None))
+                .and_then(|a| a.try_item::<bool>());
+            assert!(
+                matches!(same, Ok(true)),
+                "{key}: packed output does not match the eager reference after the source was \
+                 truncated ({same:?}) — quantize_map deferred its reads"
+            );
+        }
     }
 
     #[test]

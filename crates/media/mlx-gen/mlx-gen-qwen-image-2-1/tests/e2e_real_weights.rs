@@ -34,6 +34,29 @@ fn snapshot() -> PathBuf {
     PathBuf::from(p)
 }
 
+/// A progress printer that reports the render clock **and** the interval since the previous
+/// event (`+Δs`). The shared sampler evaluates step `k−1`'s graph only after it has reported
+/// `Step { k }`, so the `+Δ` on the line *after* `step k` is the cost of step `k−1`'s forward,
+/// `step 1` and `step 2` always land together, and the bare clock reads like an accelerating
+/// per-step cost when it is a cumulative timestamp (that misread cost a GPU investigation on
+/// sc-24114). The `+Δ` column is the per-step figure to quote.
+fn progress_logger(label: String) -> impl FnMut(Progress) {
+    let render_started = Instant::now();
+    let mut previous = render_started;
+    move |p| {
+        let now = Instant::now();
+        let clock = now.duration_since(render_started).as_secs_f32();
+        let delta = now.duration_since(previous).as_secs_f32();
+        previous = now;
+        match p {
+            Progress::Step { current, total } => {
+                eprintln!("{label}step {current}/{total} ({clock:.1}s, +{delta:.1}s)")
+            }
+            other => eprintln!("{label}{other:?} ({clock:.1}s, +{delta:.1}s)"),
+        }
+    }
+}
+
 /// Tokenizer only — no weights are opened. The released `processor/chat_template.jinja` renders a
 /// lone system message as exactly the literal prefix the port tokenizes, so the derived drop count
 /// is upstream's `_drop_idx` (14); `tools/_qwen21_common.py` re-proves the template/literal
@@ -109,16 +132,7 @@ fn validation_render_default_preset() {
     };
     let render_started = Instant::now();
     let out = generator
-        .generate(&req, &mut |p| {
-            if let Progress::Step { current, total } = p {
-                eprintln!(
-                    "step {current}/{total} ({:.1}s)",
-                    render_started.elapsed().as_secs_f32()
-                );
-            } else {
-                eprintln!("{p:?} ({:.1}s)", render_started.elapsed().as_secs_f32());
-            }
-        })
+        .generate(&req, &mut progress_logger(String::new()))
         .unwrap();
     let GenerationOutput::Images(images) = out else {
         panic!("images expected");
@@ -163,6 +177,32 @@ fn synthetic_reference(seed: u32, width: u32, height: u32) -> mlx_gen::gen_core:
     }
 }
 
+/// A file name split into text and numeric runs (`ref10_x` → `["ref", 10, "_x"]`), so numbers
+/// compare by value.
+fn natural_key(name: &str) -> Vec<(String, u64)> {
+    let mut key = Vec::new();
+    let mut text = String::new();
+    let mut rest = name;
+    while !rest.is_empty() {
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        if digits > 0 {
+            key.push((
+                std::mem::take(&mut text),
+                rest[..digits].parse().unwrap_or(u64::MAX),
+            ));
+            rest = &rest[digits..];
+        } else {
+            let c = rest.chars().next().unwrap();
+            text.push(c);
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    if !text.is_empty() {
+        key.push((text, 0));
+    }
+    key
+}
+
 fn references(count: usize, width: u32, height: u32) -> Vec<mlx_gen::gen_core::Image> {
     let Ok(dir) = std::env::var("QWEN_IMAGE_2_1_EDIT_REFS") else {
         return (0..count)
@@ -174,7 +214,9 @@ fn references(count: usize, width: u32, height: u32) -> Vec<mlx_gen::gen_core::I
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| path.is_file())
         .collect();
-    paths.sort();
+    // Natural order, so `ref10_*` follows `ref9_*` rather than `ref1_*`: the two-reference case
+    // takes the first two files a caller laid out, not a lexical accident.
+    paths.sort_by_key(|path| natural_key(&path.file_name().unwrap_or_default().to_string_lossy()));
     assert!(
         paths.len() >= count,
         "QWEN_IMAGE_2_1_EDIT_REFS={dir} holds {} files, {count} needed",
@@ -248,19 +290,7 @@ fn validation_render_reference_edit() {
         };
         let render_started = Instant::now();
         let out = generator
-            .generate(&req, &mut |p| {
-                if let Progress::Step { current, total } = p {
-                    eprintln!(
-                        "{count} refs: step {current}/{total} ({:.1}s)",
-                        render_started.elapsed().as_secs_f32()
-                    );
-                } else {
-                    eprintln!(
-                        "{count} refs: {p:?} ({:.1}s)",
-                        render_started.elapsed().as_secs_f32()
-                    );
-                }
-            })
+            .generate(&req, &mut progress_logger(format!("{count} refs: ")))
             .unwrap();
         let GenerationOutput::Images(images) = out else {
             panic!("images expected");
@@ -290,8 +320,10 @@ fn validation_render_reference_edit() {
             prompt: "too many".to_owned(),
             width: 512,
             height: 512,
+            // Refused at `validate`, before any image is looked at, so the eleven are synthetic
+            // whatever `QWEN_IMAGE_2_1_EDIT_REFS` holds (a ten-file dir is the boundary itself).
             conditioning: vec![Conditioning::MultiReference {
-                images: references(11, 256, 256),
+                images: (1..=11).map(|i| synthetic_reference(i, 256, 256)).collect(),
             }],
             ..Default::default()
         })
@@ -479,19 +511,7 @@ fn validation_render_transparency() {
 
         let render_started = Instant::now();
         let out = generator
-            .generate(&req, &mut |p| {
-                if let Progress::Step { current, total } = p {
-                    eprintln!(
-                        "{label}: step {current}/{total} ({:.1}s)",
-                        render_started.elapsed().as_secs_f32()
-                    );
-                } else {
-                    eprintln!(
-                        "{label}: {p:?} ({:.1}s)",
-                        render_started.elapsed().as_secs_f32()
-                    );
-                }
-            })
+            .generate(&req, &mut progress_logger(format!("{label}: ")))
             .unwrap();
         let GenerationOutput::ImagesRgba(images) = out else {
             panic!("{label}: an `output_channels: Rgba` request must emit ImagesRgba");
