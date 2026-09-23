@@ -654,24 +654,36 @@ mod tests {
             .to_device(&Device::Cpu)
             .unwrap();
 
+        let flat_bf16 = |y: Tensor| {
+            y.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
         for m in [1usize, 5, 17, 130] {
             let x = ramp(m, k, 0xacdc + m as u64, &device)
                 .to_dtype(DType::BF16)
                 .unwrap();
-            let y = p
+            // The cuBLASLt W4A4 path at every M (the projection's dispatch sends M <= 8 to the
+            // fused GEMV, sc-24136; that path is checked below against its own reference).
+            let y = nv
                 .forward(&x.unsqueeze(0).unwrap())
                 .unwrap()
                 .squeeze(0)
                 .unwrap();
             assert_eq!(y.dims(), &[m, n]);
             assert_eq!(y.dtype(), DType::BF16);
-            let got = y
-                .to_dtype(DType::F32)
+            let got = flat_bf16(y);
+            // Through the projection: the GEMV for M <= 8 (activation NOT quantized, so its
+            // reference is the unquantized x against the same dequantized weight), cuBLASLt above.
+            let y_proj = p
+                .forward(&x.unsqueeze(0).unwrap())
                 .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1::<f32>()
+                .squeeze(0)
                 .unwrap();
+            assert_eq!(y_proj.dims(), &[m, n]);
 
             let x_host = x
                 .to_dtype(DType::F32)
@@ -692,12 +704,32 @@ mod tests {
                 .unwrap();
             let flat = |t: Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
             let vs_ref = rel_rms(&got, &flat(reference));
-            let vs_exact = rel_rms(&got, &flat(exact));
+            let vs_exact = rel_rms(&got, &flat(exact.clone()));
             assert!(
                 vs_ref <= 1e-2,
                 "M={m}: rel-RMS vs quantized reference {vs_ref}"
             );
             assert!(vs_exact <= 0.2, "M={m}: rel-RMS vs dense {vs_exact}");
+
+            let got_proj = flat_bf16(y_proj);
+            if m <= candle_quant_kernels::NVFP4_GEMV_MAX_ROWS
+                && crate::primitives::nvfp4_path::nvfp4_gemv_enabled()
+            {
+                let unquantized_ref = x_host
+                    .matmul(&w_deq.t().unwrap())
+                    .unwrap()
+                    .broadcast_add(&bias_f)
+                    .unwrap();
+                let vs_ref = rel_rms(&got_proj, &flat(unquantized_ref));
+                assert!(
+                    (vs_ref as f64) <= candle_quant_kernels::GEMV_REL_RMS_TOL,
+                    "M={m}: GEMV rel-RMS vs unquantized-activation reference {vs_ref}"
+                );
+                // More accurate than W4A4 against the dense product (no activation quantization).
+                assert!(rel_rms(&got_proj, &flat(exact)) < vs_exact, "M={m}");
+            } else {
+                assert_eq!(got_proj, got, "M={m}: the projection ran cuBLASLt");
+            }
         }
 
         // Residency: packed nibbles + padded UE4M3 scales + the bf16 bias, far below bf16.

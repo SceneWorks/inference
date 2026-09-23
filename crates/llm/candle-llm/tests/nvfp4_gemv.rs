@@ -224,7 +224,7 @@ fn gemv_matches_the_dequant_reference_on_every_qwen38_27b_projection_shape() {
         eprintln!("skipping: no sm_120 CUDA device");
         return;
     };
-    device.set_seed(0x5c24_136).unwrap();
+    device.set_seed(24_136).unwrap();
     let mut table = Vec::new();
     let shapes: Vec<_> = qwen38_27b_projection_shapes()
         .into_iter()
