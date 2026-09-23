@@ -2938,7 +2938,8 @@ pub(crate) mod tests {
             cosine > 0.9,
             "NVFP4 logits diverged from dense: cosine {cosine}"
         );
-        // Cosine is scale-invariant; the relative RMS error also pins the logits' magnitude.
+        // Cosine is scale-invariant; the relative RMS error also pins the logits' magnitude
+        // (measured 0.290 on sm_120, cosine 0.961; a head mis-scaled by 2 reads 0.83).
         let err: f64 = got
             .iter()
             .zip(&want)
