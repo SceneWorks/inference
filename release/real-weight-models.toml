@@ -463,20 +463,21 @@ expected_files = [
 
 [[models]]
 # sc-24108 / sc-24109 — Qwen-Image 2.1, the pinned snapshot the `*-qwen-image-2-1` crates freeze (see their
-# UPSTREAM.md). Public, unmirrored, ~32 GB bf16 (text_encoder 17.5 GB + transformer 14.2 GB +
-# vae 1.35 GB). The crate's real-weight gates (`tests/e2e_real_weights.rs`: the released
-# tokenizer's 14-token system prefix and the bounded default-preset validation render) are
-# operator-run on the dev Mac behind an external RSS guard; the candle twin's cuda-gated
-# `tests/e2e_real_weights.rs` (sc-24109) is the same pair on an operator CUDA host. No CI runner
-# provisions this snapshot, so the key is deliberately unwired.
+# UPSTREAM.md). Public, unmirrored, ~33 GB bf16 (text_encoder 17.5 GB + transformer 14.2 GB +
+# vae 1.35 GB). The MLX crate's real-weight gates (`tests/e2e_real_weights.rs`: the released
+# tokenizer's 14-token system prefix, the bounded validation renders) are operator-run on the dev
+# Mac behind an external RSS guard, so THIS row's MLX variable is deliberately unwired. The candle
+# twin reads the same bytes through `qwen-image-2-1-cuda` below, which the dispatch-only
+# `qwen-image-2-1` profile wires (sc-24114) — a separate key because wiring is per variable and
+# one row cannot be both wired and exempt.
 key = "qwen-image-2-1"
 repository = "Qwen/Qwen-Image-2.1"
 revision = "790c92633540aa0cb11d9abf19eb46d861714758"
 license = "Qwen Research License Agreement"
 size_class = "very-large"
 profiles = ["media-macos"]
-environment = ["MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT", "CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT"]
-unwired_reason = "operator-run validation renders behind an RSS guard (MLX, sc-24108) and on an operator CUDA host (candle, sc-24109); the 32 GB snapshot is provisioned on no CI runner"
+environment = ["MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT"]
+unwired_reason = "operator-run validation renders behind an external RSS guard on the dev Mac (MLX, sc-24108); no macOS runner provisions the 33 GB snapshot"
 expected_files = [
     "LICENSE",
     "model_index.json",
@@ -490,6 +491,72 @@ expected_files = [
     "transformer/diffusion_pytorch_model.safetensors.index.json",
     "vae/config.json",
     "vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# sc-24114 — the SAME pinned Qwen/Qwen-Image-2.1 bytes as `qwen-image-2-1` above, for the candle
+# real-weight lane: the dispatch-only `qwen-image-2-1` profile materializes it on the Windows CUDA
+# runner under `CANDLE_GEN_MODELS_ROOT` (the persistent hub cache, so the ~33 GB is fetched once)
+# and runs every test in `candle-gen-qwen-image-2-1/tests/e2e_real_weights.rs` that reads
+# `CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT` (tokenizer prefix, 2048² T2I, reference edit, transparency).
+key = "qwen-image-2-1-cuda"
+repository = "Qwen/Qwen-Image-2.1"
+revision = "790c92633540aa0cb11d9abf19eb46d861714758"
+license = "Qwen Research License Agreement"
+size_class = "very-large"
+profiles = ["qwen-image-2-1"]
+environment = ["CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT"]
+expected_files = [
+    "LICENSE",
+    "model_index.json",
+    "processor/tokenizer.json",
+    "processor/tokenizer_config.json",
+    "processor/chat_template.jinja",
+    "scheduler/scheduler_config.json",
+    "text_encoder/config.json",
+    "text_encoder/model.safetensors.index.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors.index.json",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# sc-24114 — the published Q8/Q4 tiers of Qwen-Image 2.1 (sc-24112's converter output), ~33 GB for
+# both. Each tier directory is a COMPLETE snapshot (packed `model.safetensors` for the DiT and the
+# Qwen3-VL tower, dense `vae/`, `processor/`, `scheduler/`), which the candle loader reads natively;
+# `validation_render_installed_tiers` points one level in (`/q8`, `/q4`). Materialized by the same
+# dispatch-only `qwen-image-2-1` profile, into the same persistent cache.
+key = "qwen-image-2-1-mlx"
+repository = "SceneWorks/qwen-image-2-1-mlx"
+revision = "1691de01c24a070131e0a28bf4c065fd027f4fe9"
+license = "Qwen Research License Agreement"
+size_class = "very-large"
+profiles = ["qwen-image-2-1"]
+environment = ["CANDLE_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT"]
+expected_files = [
+    "q8/model_index.json",
+    "q8/processor/tokenizer.json",
+    "q8/processor/tokenizer_config.json",
+    "q8/processor/chat_template.jinja",
+    "q8/scheduler/scheduler_config.json",
+    "q8/text_encoder/config.json",
+    "q8/text_encoder/model.safetensors",
+    "q8/transformer/config.json",
+    "q8/transformer/model.safetensors",
+    "q8/vae/config.json",
+    "q8/vae/diffusion_pytorch_model.safetensors",
+    "q4/model_index.json",
+    "q4/processor/tokenizer.json",
+    "q4/processor/tokenizer_config.json",
+    "q4/processor/chat_template.jinja",
+    "q4/scheduler/scheduler_config.json",
+    "q4/text_encoder/config.json",
+    "q4/text_encoder/model.safetensors",
+    "q4/transformer/config.json",
+    "q4/transformer/model.safetensors",
+    "q4/vae/config.json",
+    "q4/vae/diffusion_pytorch_model.safetensors",
 ]
 
 [[models]]

@@ -134,7 +134,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+        options: [all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1]
       qwen38_bonsai_preflight_only:
         description: Qualify Qwen/Bonsai host capacity and CUDA operators without provisioning or loading models
         type: boolean
@@ -7309,3 +7309,139 @@ jobs:
             ${{ runner.temp }}/minimax-h3-vram-bf16.log
             ${{ runner.temp }}/minimax-h3-vram-bf16.json
           if-no-files-found: error
+
+  # sc-24114 — Qwen-Image 2.1 real-weight evidence on candle/CUDA. DISPATCH-ONLY (`qwen-image-2-1`
+  # profile; never `all`, never the schedule): it renders at the upstream 2048² / 40-step default and
+  # loads ~33 GB five times, which has no business inside a weekly sweep.
+  #
+  # WHAT IT PROVISIONS. Two pinned snapshots, each through `ensure_model_snapshot.py`, INTO the
+  # runner's persistent hub cache (`vars.CANDLE_GEN_MODELS_ROOT`, the root `candle-media` already
+  # reads), so the ~66 GB is fetched once and every later dispatch only verifies it. Both paths are
+  # cache-shaped (`models--*/snapshots/<rev>`), so a miss is healed THROUGH the cache (`cache_dir`,
+  # no `local_dir`) and a mispointed root fails closed with a named error before a byte moves.
+  #   * `qwen-image-2-1-cuda`  Qwen/Qwen-Image-2.1 @ 790c9263…            bf16, ~33 GB
+  #   * `qwen-image-2-1-mlx`   SceneWorks/qwen-image-2-1-mlx @ 1691de01…  q8/ + q4/, ~33 GB
+  #
+  # WHAT IT RUNS. Every `#[ignore]`d test in `candle-gen-qwen-image-2-1/tests/e2e_real_weights.rs`,
+  # one `cargo test` per name with `--exact` AFTER the `--` and a run-count assertion (a rename is a
+  # red, not "0 passed; N filtered out" + exit 0). A failing test does not stop the rest: the lane
+  # collects all five verdicts and all their evidence, then reds at the end.
+  #
+  # WHY THE REFERENCE-EDIT TEST NEEDS NO `QWEN_IMAGE_2_1_EDIT_REFS`. Unset, the test synthesizes its
+  # deterministic references (2, 10, and the refused 11) itself; that variable exists for a
+  # user-provided evaluation set, which CI deliberately does not fabricate.
+  #
+  # THE BOX. `[self-hosted, windows, cuda, real-weights]` is ONE machine (`MICHAEL-TRX50`, 2x RTX PRO
+  # 6000 Blackwell @ 95.6 GiB) with two listeners, and `default_device()` hardcodes `cuda:0`. This
+  # workflow's `concurrency` group serializes it against every other real-weight job, but NOT against
+  # `ci.yml`'s CUDA compile check, so dispatch it when the box is otherwise idle. The resident set
+  # here is ~33 GB of 95.6, so a co-tenant costs time, not correctness — no VRAM number is asserted.
+  #
+  # `timeout-minutes: 240` is a runaway guard for a lane that has never executed, not a budget. A
+  # first dispatch pays a cold `--features cuda` release build (unmeasured for this crate; the
+  # closest observed CUDA real-weight job on this box is 52 min end to end) PLUS the one-time ~66 GB
+  # fetch; the renders themselves should be minutes each on this card (the 2048² T2I is ~16k image
+  # tokens x 40 steps; the ten-reference edit recomputes a ~41k-token prefix per step, which is why
+  # it runs two). Re-size it DOWN from the first run that completes.
+  candle-qwen-image-2-1:
+    name: Candle Qwen-Image 2.1 real weights (CUDA)
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 240
+    env:
+      # Runner-local hub-cache paths composed from the ONE repository variable the Windows candle
+      # lanes already share. The names on the LEFT are what the crate reads and what the manifest
+      # wiring gate counts.
+      CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
+      CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--Qwen--Qwen-Image-2.1\snapshots\790c92633540aa0cb11d9abf19eb46d861714758
+      CANDLE_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--SceneWorks--qwen-image-2-1-mlx\snapshots\1691de01c24a070131e0a28bf4c065fd027f4fe9
+      # The bottom rung of the arch ladder, not the hardware — see the note on `same-l-cuda`.
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - name: Require operator-provided models root and initialize evidence
+        shell: cmd
+        run: |
+          if "%CANDLE_GEN_MODELS_ROOT%"=="" (
+            echo Missing repository variable CANDLE_GEN_MODELS_ROOT for the Windows CUDA runner.
+            exit /b 1
+          )
+          if exist "%RUNNER_TEMP%\qwen-image-2-1-cuda-evidence" rmdir /s /q "%RUNNER_TEMP%\qwen-image-2-1-cuda-evidence"
+          mkdir "%RUNNER_TEMP%\qwen-image-2-1-cuda-evidence" || exit /b 1
+          echo QWEN_IMAGE_2_1_RENDER_OUT=%RUNNER_TEMP%\qwen-image-2-1-cuda-evidence>>"%GITHUB_ENV%"
+      # Report-only, like the same step on `candle-minimax-h3`: `continue-on-error` because a step
+      # that only produces a record must never red a lane, and `where` first because `nvidia-smi` is
+      # not on PATH on every CUDA host. The card state before the renders explains a slow or OOM run
+      # after the fact.
+      - name: Record the CUDA device inventory
+        continue-on-error: true
+        shell: cmd
+        run: |
+          where nvidia-smi >nul 2>&1 || (echo nvidia-smi not on PATH; exit /b 0)
+          nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free --format=csv > "%QWEN_IMAGE_2_1_RENDER_OUT%\cuda-device-inventory.csv"
+          type "%QWEN_IMAGE_2_1_RENDER_OUT%\cuda-device-inventory.csv"
+      - name: Materialize and verify immutable snapshots
+        shell: cmd
+        run: |
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
+          set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model qwen-image-2-1-cuda --snapshot "%CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model qwen-image-2-1-mlx --snapshot "%CANDLE_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT%" || exit /b 1
+      # Its own step so the cold nvcc/MSVC build reads as build time in the run's step timings,
+      # rather than being folded into the first render's.
+      - name: Build the Qwen-Image 2.1 CUDA test binary
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-gen-qwen-image-2-1 --features cuda --test integration --no-run || exit /b 1
+      - name: Run the Qwen-Image 2.1 real-weight renders
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          set "QWEN21_FAILED=0"
+          call :run_one released_tokenizer_drops_fourteen_system_tokens || set "QWEN21_FAILED=1"
+          call :run_one validation_render_default_preset || set "QWEN21_FAILED=1"
+          call :run_one validation_render_reference_edit || set "QWEN21_FAILED=1"
+          call :run_one validation_render_transparency || set "QWEN21_FAILED=1"
+          call :run_one validation_render_installed_tiers || set "QWEN21_FAILED=1"
+          if not "%QWEN21_FAILED%"=="0" exit /b 1
+          exit /b 0
+
+          :run_one
+          set "log=%QWEN_IMAGE_2_1_RENDER_OUT%\%~1.log"
+          cargo test --locked --release -p candle-gen-qwen-image-2-1 --features cuda --test integration e2e_real_weights::%~1 -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & echo ::error::%~1 failed & exit /b 1)
+          type "%log%"
+          findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~1 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
+          exit /b 0
+      - name: Keep the Qwen-Image 2.1 CUDA evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qwen-image-2-1-cuda-evidence
+          path: ${{ runner.temp }}/qwen-image-2-1-cuda-evidence
+          if-no-files-found: error
+          retention-days: 30
