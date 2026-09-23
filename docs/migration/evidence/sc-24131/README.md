@@ -80,17 +80,20 @@ there is the same-arithmetic exactness plus neighbour discrimination within the 
 
 ## AC2 — one target forward per verify step, zero replay forwards, K = 1..5
 
-`decode-bench/head-6937eff53/` (sealed; `comparison.md` against S2's sealed head `bd33b65a7`):
+`decode-bench/head-1d0f5cd9a/` (sealed at the PR's head, after S2's fix pass was merged;
+`comparison.md` sets it beside S2's sealed head `bd33b65a7` and the earlier sealed run of this
+story, `head-6937eff53`, taken before that merge — tokens, acceptance, `fwd/tok` and every
+recovery counter are identical between the two runs of this story):
 
 | row | tok/s | acceptance | fwd/tok | syncs/verify | **fwd/verify** | **replay forwards** | direct rollbacks / verify steps | first divergence |
 |---|---|---|---|---|---|---|---|---|
-| MTP off (reference, growing kv) | 15.66 | n/a | 1.000 | n/a | n/a | n/a | n/a | (ref) |
-| MTP off (StepModel, static kv) | 15.62 | n/a | 1.000 | n/a | n/a | n/a | n/a | yes (identical) |
-| MTP K=1 | 21.57 | 0.827 | 0.551 | 1.00 | **1.00** | **0** | 24 / 140 | 124 (exact bf16 tie) |
-| MTP K=2 | 21.54 | 0.757 | 0.402 | 1.00 | **1.00** | **0** | 32 / 102 | 124 (exact bf16 tie) |
-| MTP K=3 | 24.58 | 0.569 | 0.375 | 1.00 | **1.00** | **0** | 59 / 95 | 125 (knife-edge) |
-| MTP K=4 | 24.61 | 0.467 | 0.355 | 1.00 | **1.00** | **0** | 71 / 90 | 106 (exact bf16 tie) |
-| MTP K=5 | 24.53 | 0.465 | 0.305 | 1.00 | **1.00** | **0** | 65 / 77 | 124 (exact bf16 tie) |
+| MTP off (reference, growing kv) | 14.48 | n/a | 1.000 | n/a | n/a | n/a | n/a | (ref) |
+| MTP off (StepModel, static kv) | 14.61 | n/a | 1.000 | n/a | n/a | n/a | n/a | yes (identical) |
+| MTP K=1 | 18.86 | 0.827 | 0.551 | 1.00 | **1.00** | **0** | 24 / 140 | 124 (exact bf16 tie) |
+| MTP K=2 | 24.24 | 0.757 | 0.402 | 1.00 | **1.00** | **0** | 32 / 102 | 124 (exact bf16 tie) |
+| MTP K=3 | 23.16 | 0.569 | 0.375 | 1.00 | **1.00** | **0** | 59 / 95 | 125 (knife-edge) |
+| MTP K=4 | 22.80 | 0.467 | 0.355 | 1.00 | **1.00** | **0** | 71 / 90 | 106 (exact bf16 tie) |
+| MTP K=5 | 22.96 | 0.465 | 0.305 | 1.00 | **1.00** | **0** | 65 / 77 | 124 (exact bf16 tie) |
 
 * **`fwd/verify` is 1.00 and `replay forwards` is 0 on every row**, across the whole 256-token
   run at every K (S2's head paid 2 forwards on every partially rejected step: 24–71 of the
@@ -103,24 +106,28 @@ there is the same-arithmetic exactness plus neighbour discrimination within the 
   are not the same statistic as S2's rows (K=1 reproduces 0.827; K=2..5 part from the reference at
   or before S2's rows did and land at 0.757 / 0.569 / 0.467 / 0.465 vs 0.668 / 0.640 / 0.549 /
   0.480) — the like-for-like comparison is `fwd/tok`, which is what the removed replay changes.
-* **tok/s (honest reading)**: this run's reference is 15.66 tok/s against S2's 11.21 — the base
+* **tok/s (honest reading)**: this run's reference is 14.48 tok/s against S2's 11.21 — the base
   branch has since gained the fused primitives (S7) and the NVFP4/sampler work (S5/S8), and this
   is a different GPU on a different day, so cross-run absolute numbers are not the evidence;
   within-run ratios are. S2's MTP rows sat at **+27–31 %** over their reference (K=1..4;
-  +22 % at K=5); this run's sit at **+38 % (K=1, 2) and +57 % (K=3, 4, 5)** — the
+  +22 % at K=5); this run's sit at **+30 % (K=1) and +57–67 % (K=2..5)** — the
   partial-rejection-heavy rows gain the most, as expected from removing one target forward per
   rejected step: `fwd/tok` fell from 0.645 / 0.613 / 0.535 / 0.535 / 0.547 (S2) to
-  0.551 / 0.402 / 0.375 / 0.355 / 0.305 at K=1..5.
+  0.551 / 0.402 / 0.375 / 0.355 / 0.305 at K=1..5. The earlier run of this story
+  (`head-6937eff53`: reference 15.66, K=1..5 21.57 / 21.54 / 24.58 / 24.61 / 24.53) shows the
+  same counters and the same within-run gain band; the absolute spread between the two runs
+  (10–15 %) is this box's clock drift, as `sc-24132/README.md` documents.
 * **Memory**: the StepModel row's final cache reports 168.9 MiB live / 146.8 MiB checkpoints
   (one ring slot: `generate_step` asks for overshoot 0, depth 1) against S2's 168.9 / 293.6 (two
   start-of-step clones). An MTP request's ring is `K + 2` slots × 146.8 MiB (K=1: 440 MiB, K=5:
   1.03 GiB; the `[ac2]` lines show the exact per-K figures), priced as such at admission — more
   than S1's flat three-state bound from K=3 up, which is the honest cost of restoring any
   position of a K-draft verify without a replay.
-* **Co-tenancy**: GPU 1 is the shared lane. `run.json` records the co-tenants at start: another
-  story's CUDA test executable (`sc-24138-target-cuda\debug\deps\tools-*.exe`) plus the desktop
-  compositor processes; per-process memory is not exposed by the WDDM driver. GPU 1 held
-  < 1.4 GiB before every run here.
+* **Co-tenancy**: GPU 1 is the shared lane. `run.json` records the co-tenants at start — for
+  `head-6937eff53` another story's CUDA test executable
+  (`sc-24138-target-cuda\debug\deps\tools-*.exe`) plus the desktop compositor processes, for
+  `head-1d0f5cd9a` only the compositor processes; per-process memory is not exposed by the WDDM
+  driver. GPU 1 held < 1.4 GiB before every run here.
 
 ## Weights-free gates
 
@@ -138,8 +145,9 @@ there is the same-arithmetic exactness plus neighbour discrimination within the 
 
 * `deltanet-ring-real-weight.log` — `tests/deltanet_ring.rs` on the 27B, K = 1..5 (AC1 oracles
   per j, the ring-free envelope, the `[ac2]` engine counters and ring sizes).
-* `decode-bench/head-6937eff53/` — the sealed bench run (reference, StepModel, MTP K=1..5);
-  `decode-bench/comparison.md` — against S2's sealed head `bd33b65a7`.
+* `decode-bench/head-1d0f5cd9a/` — the sealed bench run at the PR's head (reference, StepModel,
+  MTP K=1..5); `decode-bench/head-6937eff53/` — the same suite before S2's fix pass was merged;
+  `decode-bench/comparison.md` — both beside S2's sealed head `bd33b65a7`.
 
 ## Reproduce
 
