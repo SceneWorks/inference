@@ -3,6 +3,11 @@
 //! [`generate`] is the model-agnostic decode loop; [`Decode`] is the seam any model implements to be
 //! driven by it. [`StreamEvent`]s are emitted per token through a callback. The Candle port of
 //! `mlx-llm`'s `decode` module.
+//!
+//! The Blackwell fast-decode epic (sc-24128) adds a second, narrower seam beside it:
+//! [`StepModel`] (one N-token step against a [`DecodeCache`](crate::primitives::DecodeCache)),
+//! driven by [`generate_step`], and the measured per-request [`DecodeRecord`] every path reports.
+//! The `Decode` loop stays as the parity oracle; the record's [`DecodePath`] says which one ran.
 
 use core_llm::schedule::{Scheduler, SeqId};
 use core_llm::FinishReason as CoreFinish;
@@ -14,7 +19,9 @@ pub mod cancel;
 pub mod continuous;
 pub mod prefix;
 pub mod qwen_mtp;
+pub mod record;
 pub mod speculative;
+pub mod step;
 pub mod stream;
 
 pub use batch::{generate_batch, BatchRequest};
@@ -26,8 +33,12 @@ pub use qwen_mtp::{
     generate_qwen35_mtp_timed, generate_qwen35_mtp_timed_with_stop, Qwen35MtpMultimodalPrompt,
     RewindableConstraintMask,
 };
+pub use record::{CountingDecode, DecodePath, DecodeRecord, RequestSpan};
 pub use speculative::{
     generate_draft_speculative, generate_prompt_lookup, SpeculativeConfig, SpeculativeStats,
+};
+pub use step::{
+    generate_step, generate_step_timed, LogitsScope, StepModel, StepOutput, StepRequest,
 };
 pub use stream::{
     generate, generate_from_prefill, generate_from_prefill_with_stop, generate_with,

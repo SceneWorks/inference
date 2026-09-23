@@ -121,6 +121,38 @@ fn thinking_provider_passes_core_llm_conformance() {
     );
 }
 
+/// The provider records which decode path ran and its measured counters (sc-24129): a plain
+/// text request runs the reference loop, one forward per emitted token including the prefill, and
+/// one device->host transfer per sampled token.
+#[test]
+fn provider_records_the_reference_decode_path() {
+    let guard = write_thinking_snapshot();
+    let spec = LoadSpec::dense(guard.path().to_str().unwrap().to_string());
+    let p = LlamaProvider::load(&spec).expect("load thinking provider");
+    assert!(p.last_decode_record().is_none(), "no request yet");
+
+    let mut req = TextLlmRequest::new(vec![Message::user("t1 t2 t3")], 6);
+    req.seed = Some(0);
+    let out = p.generate(&req, &mut |_| {}).expect("generate");
+    let record = p.last_decode_record().expect("record after generate");
+    assert_eq!(record.path, candle_llm::decode::DecodePath::Reference);
+    assert_eq!(
+        record.generated_tokens,
+        u64::from(out.usage.generated_tokens)
+    );
+    assert_eq!(
+        record.target_forwards, record.generated_tokens,
+        "prefill plus one forward per token after the first"
+    );
+    assert_eq!(record.host_syncs, record.generated_tokens);
+    assert_eq!(record.proposed_tokens, 0);
+    assert_eq!(record.acceptance_rate(), None);
+    assert!(
+        out.mtp.is_none(),
+        "MTP off leaves the contract's MTP stats absent"
+    );
+}
+
 /// A model that *actually reasons*: Qwen3's chat template gates `enable_thinking`, so an Enabled
 /// request produces `<think>…</think>` reasoning. Asserts the provider advertises thinking, the
 /// streamed channels reconstruct `out.text` / `out.thinking`, and reasoning is non-empty.

@@ -9,6 +9,7 @@
 
 use std::cell::OnceCell;
 use std::path::Path;
+use std::sync::Mutex;
 
 use candle_core::{DType, Device, Tensor};
 use core_llm::{
@@ -25,8 +26,9 @@ use serde_json::Value;
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
     generate_from_prefill_with_stop, generate_qwen35_mtp_multimodal_with_stop,
-    generate_qwen35_mtp_timed_with_stop, ConstraintMask, Decode, FinishReason, GenerationConfig,
-    Qwen35MtpMultimodalPrompt, RewindableConstraintMask, StreamEvent,
+    generate_qwen35_mtp_timed_with_stop, ConstraintMask, CountingDecode, Decode, DecodePath,
+    DecodeRecord, FinishReason, GenerationConfig, Qwen35MtpMultimodalPrompt, RequestSpan,
+    RewindableConstraintMask, StreamEvent,
 };
 use crate::device::select_device;
 use crate::gguf::GgufCheckpoint;
@@ -596,6 +598,11 @@ pub struct LlamaProvider {
     /// checkpoint that actually ships them (sc-18772). Independent of [`vision`](Self::vision):
     /// Gemma 4 does not use the Qwen-VL ViT/M-RoPE/DeepStack machinery at all.
     gemma4: Option<Gemma4Runtime>,
+    /// The measured [`DecodeRecord`] of the most recent [`TextLlm::generate`] call — which decode
+    /// path ran and its counters (sc-24129). The backend-neutral `TextLlmOutput` carries only the
+    /// MTP subset (`MtpStats`); the full record is read back through
+    /// [`LlamaProvider::last_decode_record`].
+    last_decode: Mutex<Option<DecodeRecord>>,
 }
 
 /// Whether Gemma 4's vision path has been validated end-to-end, and may therefore be advertised.
@@ -700,6 +707,16 @@ fn ensure_supported_device(source: &Path, device: &Device) -> CoreResult<()> {
 }
 
 impl LlamaProvider {
+    /// The measured decode record of the most recent `generate` call on this provider, or `None`
+    /// before the first. Says which path ran (`Reference`, `Mtp { drafts }`, …) and its counters;
+    /// the MTP subset also reaches callers as `TextLlmOutput::mtp`.
+    pub fn last_decode_record(&self) -> Option<DecodeRecord> {
+        *self
+            .last_decode
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Load a provider from `spec.source`: either a `*.gguf` file (loaded directly via Candle's
     /// native GGUF reader, story 7254) or an HF snapshot directory (config.json + tokenizer.json +
     /// shards). Either way the decoder architecture is dispatched (Llama / Mistral / Qwen3) and the
@@ -943,6 +960,7 @@ impl LlamaProvider {
             template,
             stop_tokens,
             constraint_table: OnceCell::new(),
+            last_decode: Mutex::new(None),
             vision,
             gemma4,
         })
@@ -1072,6 +1090,7 @@ impl LlamaProvider {
                 tokenizer,
                 template,
                 stop_tokens: ck.stop_tokens,
+                last_decode: Mutex::new(None),
                 constraint_table: OnceCell::new(),
                 vision,
                 gemma4: None,
@@ -1123,6 +1142,7 @@ impl LlamaProvider {
             tokenizer,
             template,
             stop_tokens,
+            last_decode: Mutex::new(None),
             constraint_table: OnceCell::new(),
             vision: None, // GGUF is the dense Llama-family path only — no Qwen3.6 VLM.
             // Likewise no Gemma 4 front-ends: the GGUF path reconstructs a dense text decoder,
@@ -1146,6 +1166,7 @@ impl LlamaProvider {
             tokenizer,
             template: Box::new(Llama3Template),
             stop_tokens,
+            last_decode: Mutex::new(None),
             constraint_table: OnceCell::new(),
             vision: None,
             gemma4: None,
@@ -1985,6 +2006,10 @@ impl TextLlm for LlamaProvider {
             .synchronize()
             .map_err(|e| to_core(e.into()))?;
         let generation_started = std::time::Instant::now();
+        let request_span = RequestSpan::begin();
+        // The reference loop's forwards are measured, not inferred (sc-24129).
+        let counted = CountingDecode::new(&self.model);
+        let mut extra_forwards = 0u64;
 
         // Encode + splice the visuals and compute M-RoPE positions (the placeholder-expanded prompt
         // becomes the effective sequence). `None` on the text-only path.
@@ -2291,6 +2316,8 @@ impl TextLlm for LlamaProvider {
                             model,
                             delta: *delta,
                         };
+                        let shifted = CountingDecode::new(&shifted);
+                        shifted.note_external_forward(); // the DeepStack prefill above
                         let result = generate_from_prefill_with_stop(
                             &shifted,
                             &mut *cache,
@@ -2303,6 +2330,7 @@ impl TextLlm for LlamaProvider {
                             should_stop_opt,
                         )
                         .map_err(to_core)?;
+                        extra_forwards = shifted.forwards();
                         model
                             .device()
                             .synchronize()
@@ -2329,6 +2357,7 @@ impl TextLlm for LlamaProvider {
                             let first = model
                                 .decode_logits_from_embeds(&m.embeds, &mut *cache, 0)
                                 .map_err(to_core)?;
+                            counted.note_external_forward();
                             self.model
                                 .device()
                                 .synchronize()
@@ -2336,7 +2365,7 @@ impl TextLlm for LlamaProvider {
                             let prefill = generation_started.elapsed();
                             let decode_started = std::time::Instant::now();
                             let result = generate_from_prefill_with_stop(
-                                &self.model,
+                                &counted,
                                 &mut *cache,
                                 first,
                                 m.expanded_ids.clone(),
@@ -2364,8 +2393,7 @@ impl TextLlm for LlamaProvider {
                                 let mut cache = self.model.make_cache();
                                 let ids =
                                     input_ids(&prompt_ids, self.model.device()).map_err(to_core)?;
-                                let first =
-                                    self.model.step(&ids, &mut *cache, 0).map_err(to_core)?;
+                                let first = counted.step(&ids, &mut *cache, 0).map_err(to_core)?;
                                 self.model
                                     .device()
                                     .synchronize()
@@ -2373,7 +2401,7 @@ impl TextLlm for LlamaProvider {
                                 let prefill = generation_started.elapsed();
                                 let decode_started = std::time::Instant::now();
                                 let result = generate_from_prefill_with_stop(
-                                    &self.model,
+                                    &counted,
                                     &mut *cache,
                                     first,
                                     prompt_ids.clone(),
@@ -2396,8 +2424,7 @@ impl TextLlm for LlamaProvider {
                                 let mut cache = self.model.make_cache();
                                 let ids =
                                     input_ids(&prompt_ids, self.model.device()).map_err(to_core)?;
-                                let first =
-                                    self.model.step(&ids, &mut *cache, 0).map_err(to_core)?;
+                                let first = counted.step(&ids, &mut *cache, 0).map_err(to_core)?;
                                 self.model
                                     .device()
                                     .synchronize()
@@ -2405,7 +2432,7 @@ impl TextLlm for LlamaProvider {
                                 let prefill = generation_started.elapsed();
                                 let decode_started = std::time::Instant::now();
                                 let result = generate_from_prefill_with_stop(
-                                    &self.model,
+                                    &counted,
                                     &mut *cache,
                                     first,
                                     prompt_ids.clone(),
@@ -2429,6 +2456,27 @@ impl TextLlm for LlamaProvider {
                 }
             }
         };
+
+        let decode_record = match (mtp_stats, mtp_drafts) {
+            (Some(stats), Some(drafts)) => DecodeRecord {
+                path: DecodePath::Mtp { drafts },
+                target_forwards: u64::from(stats.target_forwards),
+                proposed_tokens: u64::from(stats.proposed_tokens),
+                accepted_tokens: u64::from(stats.accepted_tokens),
+                generated_tokens: out.tokens.len() as u64,
+                host_syncs: request_span.host_syncs(),
+            },
+            _ => DecodeRecord::plain(
+                DecodePath::Reference,
+                counted.forwards() + extra_forwards,
+                out.tokens.len(),
+                request_span.host_syncs(),
+            ),
+        };
+        *self
+            .last_decode
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(decode_record);
 
         // End-of-generation tails, in pipeline order. First the reasoning segmenter's held-back
         // partial marker (it turned out not to begin a marker) as current-channel text — reasoning
