@@ -37,9 +37,8 @@ BF16 greedy, 256 new tokens per row.
   `CausalLm` prompt-lookup and draft-model loops are deleted; prompt lookup and draft-model
   speculation run through the engine's `NgramProposer` / `DraftModelProposer` (`decode/proposers.rs`),
   `tests/speculative.rs` ported onto them with its assertions unchanged. The retired draft loop's
-  vocab-mismatch refusal moved into the engine (`Proposer::vocab_size`), and the engine's bonus draw
-  is now the reference sampler bit for bit (`sample_host`: the same argmax fallback for a fully-masked
-  row, and no uniform consumed there) — so the engine with no proposer is exactly the reference loop.
+  vocab-mismatch refusal moved into the engine (`Proposer::vocab_size`), checked before any
+  inference.
 * **Admission (E6)** prices the widest layer: the causal family's geometry now carries the widest
   per-layer `(kv_heads, head_dim)` from `CausalLm::kv_layout`, which covers Gemma 4's full-attention
   layers and MLA's full-head keys (the scalar `head_dim` / `num_key_value_heads` it read before
