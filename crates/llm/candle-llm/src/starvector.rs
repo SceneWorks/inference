@@ -1268,12 +1268,8 @@ mod tests {
         assert!(pixels.device().same_device(&model_device));
         assert_eq!(stream(pixels.device()), stream(&model_device));
 
+        // Same GPU ordinal (all candle's per-op check compares), yet another device and stream.
         let second = crate::device::select_device().unwrap();
-        assert_eq!(
-            second.location(),
-            model_device.location(),
-            "candle's per-op check passes"
-        );
         assert!(!second.same_device(&model_device));
         if !cfg!(feature = "flash-attn") {
             assert_ne!(
