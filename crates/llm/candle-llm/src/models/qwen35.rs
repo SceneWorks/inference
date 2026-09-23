@@ -31,7 +31,7 @@ use crate::models::deepstack::{self, deepstack_fused_decoder_layers};
 use crate::primitives::attention::{repeat_kv, sdpa, sdpa_gqa_causal, AttnFormulation, AttnMask};
 use crate::primitives::decode_cache::{tensor_bytes, CacheMemory, DecodeCache};
 use crate::primitives::gated_delta::{
-    causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
+    causal_depthwise_conv_traced, compute_g, rms_norm_gated, DeltaNetCache, RingSpec,
 };
 use crate::primitives::kv_cache::{KvCacheKind, StaticKvCache};
 use crate::primitives::nn::{embed, rms_norm, rms_norm_residual, swiglu};
@@ -290,11 +290,12 @@ impl GatedDeltaNet {
 
         // Short conv over the q‖k‖v channels (only these are convolved), seeded by the cache tail,
         // then a *contiguous* split into q [key_dim] ‖ k [key_dim] ‖ v [value_dim] and reshape to heads.
-        let conv_state = match &cache.conv_state {
+        let conv_state = match cache.conv_state() {
             Some(cs) => cs.clone(),
             None => Tensor::zeros((b, self.conv_kernel - 1, self.conv_dim), dt, x.device())?,
         };
-        let (conv_out, new_conv) = causal_depthwise_conv(&mixed, &self.conv_weight, &conv_state)?;
+        let (conv_out, conv_trace) =
+            causal_depthwise_conv_traced(&mixed, &self.conv_weight, &conv_state)?;
         let qc = conv_out
             .narrow(2, 0, self.key_dim)?
             .contiguous()?
@@ -313,18 +314,20 @@ impl GatedDeltaNet {
         let qn = l2norm(&qc, 1e-6)?.affine(inv, 0.0)?;
         let kn = l2norm(&kc, 1e-6)?;
 
-        // The gated delta recurrence, accumulated in f32 (matching the reference kernel). GQA (q/k
-        // from Hk key heads → Hv value heads) is handled inside the recurrence primitive.
+        // The gated delta recurrence, accumulated in f32 (matching the reference kernel), run by
+        // the cache so every token's post-step state (conv tail + SSM state) lands in its
+        // checkpoint ring (sc-24131). GQA (q/k from Hk key heads → Hv value heads) is handled
+        // inside the recurrence primitive.
         let beta = sigmoid(&b_in)?;
         let g = compute_g(&a_in, &self.a_log, &self.dt_bias)?;
         let f = DType::F32;
-        let (y, new_ssm) = gated_delta_recurrence(
+        let y = cache.advance(
+            &conv_trace,
             &qn.to_dtype(f)?,
             &kn.to_dtype(f)?,
             &vc.to_dtype(f)?,
             &g.to_dtype(f)?,
             &beta.to_dtype(f)?,
-            cache.ssm_state.as_ref(),
         )?;
 
         // Gated RMS-norm with z (back in the layer dtype), then the output projection.
@@ -332,7 +335,6 @@ impl GatedDeltaNet {
         let result = self
             .out_proj
             .forward(&out.reshape((b, s, self.value_dim))?)?;
-        cache.update(new_conv, new_ssm, s as i32);
         Ok(result)
     }
 }
@@ -669,41 +671,44 @@ impl AttnKv {
     }
 }
 
-fn delta_bytes(c: &DeltaNetCache) -> usize {
-    c.conv_state
-        .as_ref()
-        .map(tensor_bytes)
-        .unwrap_or(0)
-        .saturating_add(c.ssm_state.as_ref().map(tensor_bytes).unwrap_or(0))
-}
-
-/// The recurrent (Gated DeltaNet) state of every linear layer at one sequence position — what a
-/// rollback restores, because the recurrence cannot be inverted. Only the linear layers are held
-/// (the full-attention KV rolls back by narrowing); the tensors are reference-counted clones, so a
-/// checkpoint costs no device memory until the live state moves on.
+/// The shape of one linear layer's recurrent state — what a [`RingSpec`] is built from
+/// (the batch is 1: the step seam and the provider decode one request per cache).
 #[derive(Clone, Debug)]
-struct DeltaCheckpoint {
-    offset: i32,
-    /// `(layer index, state)` for each linear layer, in layer order.
-    states: Vec<(usize, DeltaNetCache)>,
+struct RecurrentShape {
+    conv_dims: (usize, usize, usize),
+    conv_dtype: DType,
+    ssm_dims: (usize, usize, usize, usize),
+    device: Device,
 }
 
-/// Rollback checkpoints retained by a cache built through [`Qwen35Model::new_cache`] (and so
-/// `Decode::make_cache`) — the reference and MTP paths the provider runs. Neither calls
-/// [`Qwen35Cache::rollback_to`] (the MTP loop restores a clone), so they retain **none**: such a
-/// cache holds exactly one recurrent state, which is what request admission charges (E6). The
-/// provider's `memory_geometry` prices `1 + REFERENCE_MAX_CHECKPOINTS` recurrent states, so raising
-/// this constant raises admission with it.
+impl RecurrentShape {
+    fn ring_spec(&self, depth: usize) -> RingSpec {
+        RingSpec {
+            slots: depth + 1,
+            conv_dims: self.conv_dims,
+            conv_dtype: self.conv_dtype,
+            ssm_dims: self.ssm_dims,
+            ssm_dtype: DType::F32,
+            device: self.device.clone(),
+        }
+    }
+}
+
+/// Positions before the current one a cache built through [`Qwen35Model::new_cache`] (and so
+/// `Decode::make_cache`) can roll back to — the reference and MTP paths the provider runs. Neither
+/// calls [`Qwen35Cache::rollback_to`] (the MTP loop restores a clone), so they keep **no**
+/// checkpoint ring: such a cache holds exactly one recurrent state (the live one), which is what
+/// request admission charges (E6, [`Qwen35Model::recurrent_state_bytes`]`(1)`).
 pub const REFERENCE_MAX_CHECKPOINTS: usize = 0;
 
-/// Rollback checkpoints retained by a cache built through the [`StepModel`] seam
-/// ([`StepModel::new_cache`]) — the callers that roll back (the speculative verify of S2): the
-/// position the current step started from plus one earlier. Each checkpoint pins every linear
-/// layer's recurrent state — on Qwen3.8-27B ~151 MB of SSM state (48 linear layers × 48 value heads
-/// × 128 × 128 × 4 B) plus a ~6 MB conv tail — so at steady state a step cache holds three recurrent
-/// states (live + two checkpoints). A caller that admits step-seam requests must price
-/// `1 + STEP_MAX_CHECKPOINTS` states; deeper history is opt-in via
-/// [`Qwen35Cache::set_max_checkpoints`].
+/// Positions before the current one a cache built through the unbounded [`StepModel::new_cache`]
+/// can roll back to: its per-token checkpoint ring holds `1 + STEP_MAX_CHECKPOINTS` states (the
+/// live one plus this many earlier positions). The bounded [`StepModel::new_cache_for`] — what
+/// every request runs on — sizes the ring for the caller's overshoot instead (`K` drafts → a ring
+/// of `K + 2` positions: the step start plus the `K + 1` verify positions), and admission prices
+/// exactly that ([`Qwen35Model::recurrent_state_bytes`]). Each ring slot is one full recurrent
+/// state — on Qwen3.8-27B ~151 MB of SSM state (48 linear layers × 48 value heads × 128 × 128 × 4 B)
+/// plus a ~6 MB conv tail. Deeper history is opt-in via [`Qwen35Cache::set_max_checkpoints`].
 pub const STEP_MAX_CHECKPOINTS: usize = 2;
 
 /// The per-layer cache slot — a recurrent [`DeltaNetCache`] for linear layers, and for
@@ -725,27 +730,26 @@ impl Qwen35LayerCache {
     /// A deep copy of the slot (see [`StaticKvCache::try_clone`] for the static case).
     pub fn try_clone(&self) -> Result<Self> {
         Ok(match self {
-            Qwen35LayerCache::Delta(c) => Qwen35LayerCache::Delta(c.clone()),
+            Qwen35LayerCache::Delta(c) => Qwen35LayerCache::Delta(c.try_clone()?),
             Qwen35LayerCache::Attn(a) => Qwen35LayerCache::Attn(a.clone()),
             Qwen35LayerCache::StaticAttn(s) => Qwen35LayerCache::StaticAttn(s.try_clone()?),
         })
     }
 }
 
-/// The hybrid decoder's cache: one slot per decoder layer, plus the rollback checkpoints that make
-/// it a [`DecodeCache`].
+/// The hybrid decoder's cache: one slot per decoder layer, with the linear layers' per-token
+/// checkpoint rings that make it a [`DecodeCache`].
 ///
-/// The decoder records a [`checkpoint`](Self::checkpoint) of the linear layers' recurrent state at
-/// the start of every forward (i.e. at every position a step began from), keeping the newest
-/// [`max_checkpoints`](Self::set_max_checkpoints). [`rollback_to`](Self::rollback_to) can therefore
-/// return to any of those positions exactly — which covers what speculative decoding needs (roll
-/// back to the position the verify step started from) — and refuses positions it has no checkpoint
-/// for rather than approximating them. Per-position checkpoints inside a multi-token forward are the
-/// DeltaNet-checkpoint story (S3) and plug in behind the same method.
+/// Every linear layer's [`DeltaNetCache`] holds a preallocated ring of the recurrent state after
+/// each of the newest [`max_checkpoints`](Self::set_max_checkpoints)` + 1` positions (story
+/// sc-24131): a multi-token verify forward checkpoints every one of its positions, so
+/// [`rollback_to`](Self::rollback_to) can return to **any** position inside the last verify step
+/// exactly — no replay forward — and refuses positions older than the ring holds rather than
+/// approximating them. Rollback is a slot selection; the ring's buffers and addresses never move.
 ///
 /// Retention depends on who built the cache: [`Qwen35Model::new_cache`] (reference / MTP paths)
-/// keeps [`REFERENCE_MAX_CHECKPOINTS`] (none), [`StepModel::new_cache`] keeps
-/// [`STEP_MAX_CHECKPOINTS`].
+/// keeps [`REFERENCE_MAX_CHECKPOINTS`] (no ring), [`StepModel::new_cache`] keeps
+/// [`STEP_MAX_CHECKPOINTS`], [`StepModel::new_cache_for`] the caller's overshoot plus one.
 ///
 /// The full-attention slots are either the growing [`AttnKv`] (the reference path and the parity
 /// oracle) or, for a cache built by [`Qwen35Model::new_static_cache`] / [`StepModel::new_cache_for`],
@@ -756,18 +760,20 @@ impl Qwen35LayerCache {
 #[derive(Debug)]
 pub struct Qwen35Cache {
     layers: Vec<Qwen35LayerCache>,
-    checkpoints: Vec<DeltaCheckpoint>,
+    /// Positions before the current one the linear layers' rings can roll back to (`0`: no ring).
     max_checkpoints: usize,
+    /// One linear layer's state shape — what a ring of any depth is built from.
+    recurrent_shape: RecurrentShape,
     /// Added to the cache position to form the RoPE position of every token a
     /// [`StepModel::forward_step`] feeds (see [`set_rope_delta`](Self::set_rope_delta)).
     rope_delta: i32,
 }
 
 impl Qwen35Cache {
-    /// A deep copy of the whole cache (every layer slot and every checkpoint). The MTP loop's
-    /// "verify on a trial copy, restore the base on rejection" rollback is built on this. For a
-    /// static cache the copy is a full device copy of every attention buffer, and a failed copy is
-    /// returned as the device's error rather than panicking.
+    /// A deep copy of the whole cache (every layer slot, checkpoint rings included). The MTP
+    /// loop's "verify on a trial copy, restore the base on rejection" rollback is built on this.
+    /// For a static cache the copy is a full device copy of every attention buffer (and of every
+    /// ring), and a failed copy is returned as the device's error rather than panicking.
     pub fn try_clone(&self) -> Result<Self> {
         Ok(Self {
             layers: self
@@ -775,8 +781,8 @@ impl Qwen35Cache {
                 .iter()
                 .map(Qwen35LayerCache::try_clone)
                 .collect::<Result<Vec<_>>>()?,
-            checkpoints: self.checkpoints.clone(),
             max_checkpoints: self.max_checkpoints,
+            recurrent_shape: self.recurrent_shape.clone(),
             rope_delta: self.rope_delta,
         })
     }
@@ -815,8 +821,8 @@ impl Qwen35Cache {
             .unwrap_or(0)
     }
 
-    /// Drop all cached state and every checkpoint. A static cache keeps its buffers (offsets go
-    /// to zero; the bytes are overwritten by the next prefill).
+    /// Drop all cached state. A static cache keeps its buffers, and so does every checkpoint ring
+    /// (offsets go to zero; the bytes are overwritten by the next prefill).
     pub fn reset(&mut self) {
         for l in &mut self.layers {
             match l {
@@ -825,7 +831,6 @@ impl Qwen35Cache {
                 Qwen35LayerCache::StaticAttn(s) => s.reset(),
             }
         }
-        self.checkpoints.clear();
     }
 
     /// Which KV cache implementation the full-attention layers run on.
@@ -862,9 +867,36 @@ impl Qwen35Cache {
             .collect()
     }
 
+    /// The storage addresses of every linear layer's `(conv, ssm)` checkpoint ring, in layer
+    /// order (see [`storage_address`](crate::primitives::storage_address)) — empty for a cache
+    /// without rings or whose rings are not yet allocated. The pointer-stability gate reads these
+    /// across verify steps and rollbacks; the CUDA-graph runner (S6) captures them.
+    pub fn recurrent_ring_addresses(&self) -> Result<Vec<(usize, usize)>> {
+        let mut out = Vec::new();
+        for l in &self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                if let Some(addresses) = c.ring_addresses()? {
+                    out.push(addresses);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Allocate every linear layer's checkpoint ring now (a no-op without rings or once
+    /// allocated), so a request fails closed at admission rather than at its first forward.
+    pub fn preallocate_recurrent(&mut self) -> Result<()> {
+        for l in &mut self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                c.preallocate()?;
+            }
+        }
+        Ok(())
+    }
+
     /// Called at the start of every forward over `steps` new positions: refuses a step that would
     /// end past a static cache's capacity ([`Error::KvCapacityExceeded`], before any layer runs or
-    /// any state changes), then records the rollback checkpoint.
+    /// any state changes). The per-token checkpoints are written by the layers themselves.
     fn begin_forward(&mut self, steps: usize) -> Result<()> {
         if let Some(capacity) = self.kv_capacity() {
             let end = usize::try_from(self.offset())
@@ -877,79 +909,66 @@ impl Qwen35Cache {
                 });
             }
         }
-        self.checkpoint();
         Ok(())
     }
 
-    /// Change how many rollback checkpoints are retained (newest kept; `0` disables rollback to
-    /// anything but the current position and zero).
-    pub fn set_max_checkpoints(&mut self, max: usize) {
+    /// Change how many positions before the current one the cache can roll back to: every linear
+    /// layer's ring is reallocated for `max + 1` positions, carrying over the restorable positions
+    /// that still fit (`0` drops the rings: rollback to anything but the current position and
+    /// zero is refused). A failed allocation leaves the cache untouched (the rings are replaced
+    /// layer by layer, so a layer that failed keeps its old ring — the cache stays consistent
+    /// because every layer still holds the same positions). No-op when unchanged.
+    pub fn set_max_checkpoints(&mut self, max: usize) -> Result<()> {
+        if max == self.max_checkpoints {
+            return Ok(());
+        }
+        let spec = (max > 0).then(|| self.recurrent_shape.ring_spec(max));
+        for l in &mut self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                c.set_ring_spec(spec.clone())?;
+            }
+        }
         self.max_checkpoints = max;
-        self.prune_checkpoints();
+        Ok(())
     }
 
-    /// How many rollback checkpoints this cache retains.
+    /// How many positions before the current one this cache can roll back to at most.
     pub fn max_checkpoints(&self) -> usize {
         self.max_checkpoints
     }
 
-    /// Logical bytes of recurrent (Gated DeltaNet) state referenced by the cache: the live linear
-    /// layers' states plus every checkpoint's. The attention KV is excluded — this is the term
-    /// admission prices as `recurrent_bytes` (see `REFERENCE_MAX_CHECKPOINTS`).
+    /// Logical bytes of recurrent (Gated DeltaNet) state the cache holds: every linear layer's
+    /// ring (live slot plus checkpoint slots), or its live state for a ring-less cache. The
+    /// attention KV is excluded — this is the term admission prices as `recurrent_bytes`
+    /// ([`Qwen35Model::recurrent_state_bytes`]).
     pub fn recurrent_bytes(&self) -> usize {
-        let live = self.layers.iter().fold(0usize, |acc, l| match l {
-            Qwen35LayerCache::Delta(c) => acc.saturating_add(delta_bytes(c)),
+        self.layers.iter().fold(0usize, |acc, l| match l {
+            Qwen35LayerCache::Delta(c) => {
+                let (live, checkpoint) = c.memory_bytes();
+                acc.saturating_add(live).saturating_add(checkpoint)
+            }
             Qwen35LayerCache::Attn(_) | Qwen35LayerCache::StaticAttn(_) => acc,
-        });
-        live.saturating_add(self.memory().checkpoint_bytes)
+        })
     }
 
     /// The positions [`rollback_to`](Self::rollback_to) can currently return to, ascending
-    /// (`0` and the current position are always possible and not listed).
+    /// (`0` and the current position are always possible and not listed): the window the
+    /// linear layers' rings hold.
     pub fn checkpoint_offsets(&self) -> Vec<i32> {
-        self.checkpoints.iter().map(|c| c.offset).collect()
-    }
-
-    /// Record the linear layers' recurrent state at the current position. Idempotent for a
-    /// position already checkpointed as the newest entry. Called by the decoder at the start of
-    /// every forward.
-    pub fn checkpoint(&mut self) {
-        let offset = self.offset();
-        if self.max_checkpoints == 0 {
-            return;
-        }
-        if self.checkpoints.last().is_some_and(|c| c.offset == offset) {
-            return;
-        }
-        // A forward at an earlier position than a stored checkpoint means the cache was rolled back
-        // through a path other than `rollback_to` (a clone restored by the MTP loop); those later
-        // checkpoints describe positions that no longer exist.
-        self.checkpoints.retain(|c| c.offset < offset);
-        let states = self
-            .layers
+        self.layers
             .iter()
-            .enumerate()
-            .filter_map(|(i, l)| match l {
-                Qwen35LayerCache::Delta(c) => Some((i, c.clone())),
+            .find_map(|l| match l {
+                Qwen35LayerCache::Delta(c) => Some(c.restorable()),
                 Qwen35LayerCache::Attn(_) | Qwen35LayerCache::StaticAttn(_) => None,
             })
-            .collect();
-        self.checkpoints.push(DeltaCheckpoint { offset, states });
-        self.prune_checkpoints();
-    }
-
-    fn prune_checkpoints(&mut self) {
-        if self.checkpoints.len() > self.max_checkpoints {
-            let drop = self.checkpoints.len() - self.max_checkpoints;
-            self.checkpoints.drain(..drop);
-        }
+            .unwrap_or_default()
     }
 
     /// Roll the cache back so the next step continues from position `n` (see
     /// [`DecodeCache::rollback_to`]): the full-attention KV is narrowed to `n` (a static cache
-    /// just moves its offset — its buffers and their addresses are untouched) and the linear
-    /// layers' recurrent state is restored from the checkpoint taken at `n`. `n == offset()` is a
-    /// no-op and `n == 0` is a [`reset`](Self::reset); any other `n` without a checkpoint is
+    /// just moves its offset — its buffers and their addresses are untouched) and every linear
+    /// layer's ring selects its slot for `n` (no copy). `n == offset()` is a no-op and `n == 0` is
+    /// a [`reset`](Self::reset); any other `n` the rings no longer hold is
     /// [`Error::RollbackUnavailable`] (typed, so a speculative engine can fall back without matching
     /// message text) and leaves the cache untouched. `n` outside `0..=offset()` is [`Error::Msg`].
     pub fn rollback_to(&mut self, n: i32) -> Result<()> {
@@ -966,53 +985,44 @@ impl Qwen35Cache {
             self.reset();
             return Ok(());
         }
-        let idx = self
-            .checkpoints
-            .iter()
-            .rposition(|c| c.offset == n)
-            .ok_or_else(|| Error::RollbackUnavailable {
-                n,
-                have: self.checkpoint_offsets(),
-            })?;
-        let checkpoint = self.checkpoints[idx].clone();
-        for (i, state) in checkpoint.states {
-            match &mut self.layers[i] {
-                Qwen35LayerCache::Delta(c) => *c = state,
-                Qwen35LayerCache::Attn(_) | Qwen35LayerCache::StaticAttn(_) => {
-                    return Err(Error::Msg(
-                        "Qwen35Cache: checkpoint/layer type mismatch".into(),
-                    ))
+        // Every linear layer advances in lockstep, so one refusal means all refuse: check before
+        // touching anything.
+        for l in &self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                if !c.can_rollback_to(n) {
+                    return Err(Error::RollbackUnavailable {
+                        n,
+                        have: c.restorable(),
+                    });
                 }
             }
         }
         for l in &mut self.layers {
             match l {
+                Qwen35LayerCache::Delta(c) => c.rollback_to(n)?,
                 Qwen35LayerCache::Attn(a) => a.truncate(n)?,
                 Qwen35LayerCache::StaticAttn(s) => s.truncate(n)?,
-                Qwen35LayerCache::Delta(_) => {}
             }
         }
-        // The checkpoint at `n` still describes the (restored) state at `n`; later ones do not.
-        self.checkpoints.truncate(idx + 1);
         Ok(())
     }
 
-    /// Logical bytes referenced by the live state and by the checkpoints (see
+    /// Logical bytes referenced by the live state and by the checkpoint slots (see
     /// [`CacheMemory`] for what is and is not counted). A static cache's attention layers count
-    /// their **full preallocation** — that is what the request holds from its first step.
+    /// their **full preallocation**, and so does every checkpoint ring (one slot live, the rest
+    /// checkpoints) — that is what the request holds from its first step.
     pub fn memory(&self) -> CacheMemory {
-        let live_bytes = self.layers.iter().fold(0usize, |acc, l| {
-            acc.saturating_add(match l {
-                Qwen35LayerCache::Delta(c) => delta_bytes(c),
-                Qwen35LayerCache::Attn(a) => a.bytes(),
-                Qwen35LayerCache::StaticAttn(s) => s.bytes(),
-            })
-        });
-        let checkpoint_bytes = self
-            .checkpoints
-            .iter()
-            .flat_map(|c| c.states.iter())
-            .fold(0usize, |acc, (_, s)| acc.saturating_add(delta_bytes(s)));
+        let (live_bytes, checkpoint_bytes) =
+            self.layers
+                .iter()
+                .fold((0usize, 0usize), |(live, checkpoint), l| match l {
+                    Qwen35LayerCache::Delta(c) => {
+                        let (l, c) = c.memory_bytes();
+                        (live.saturating_add(l), checkpoint.saturating_add(c))
+                    }
+                    Qwen35LayerCache::Attn(a) => (live.saturating_add(a.bytes()), checkpoint),
+                    Qwen35LayerCache::StaticAttn(s) => (live.saturating_add(s.bytes()), checkpoint),
+                });
         CacheMemory {
             live_bytes,
             checkpoint_bytes,
@@ -1033,10 +1043,11 @@ impl DecodeCache for Qwen35Cache {
         Qwen35Cache::reset(self)
     }
 
-    fn retain_checkpoints(&mut self, n: usize) {
+    fn retain_checkpoints(&mut self, n: usize) -> Result<()> {
         if n > self.max_checkpoints {
-            self.set_max_checkpoints(n);
+            self.set_max_checkpoints(n)?;
         }
+        Ok(())
     }
 
     fn memory(&self) -> CacheMemory {
@@ -1546,18 +1557,55 @@ impl Qwen35Model {
     }
 
     /// A fresh per-layer cache (linear vs full-attn slot per the schedule) for the reference and MTP
-    /// paths: it retains [`REFERENCE_MAX_CHECKPOINTS`] (no) rollback checkpoints.
+    /// paths: it keeps [`REFERENCE_MAX_CHECKPOINTS`] (no) checkpoint ring.
     pub fn new_cache(&self) -> Qwen35Cache {
         self.new_cache_with_checkpoints(REFERENCE_MAX_CHECKPOINTS)
     }
 
-    /// A fresh cache that retains up to `max_checkpoints` rollback checkpoints (see
-    /// [`Qwen35Cache::rollback_to`]); each costs one recurrent state of device memory.
+    /// The shape of one linear layer's recurrent state (batch 1) in this model's compute dtype.
+    fn recurrent_shape(&self) -> RecurrentShape {
+        let c = &self.cfg;
+        let key_dim = (c.linear_key_head_dim * c.linear_num_key_heads).max(0) as usize;
+        let value_dim = (c.linear_value_head_dim * c.linear_num_value_heads).max(0) as usize;
+        let conv_dim = key_dim * 2 + value_dim;
+        RecurrentShape {
+            conv_dims: (1, c.linear_conv_kernel_dim.max(1) as usize - 1, conv_dim),
+            conv_dtype: self.dtype,
+            ssm_dims: (
+                1,
+                c.linear_num_value_heads.max(0) as usize,
+                c.linear_value_head_dim.max(0) as usize,
+                c.linear_key_head_dim.max(0) as usize,
+            ),
+            device: self.device.clone(),
+        }
+    }
+
+    /// Bytes of recurrent (Gated DeltaNet) state a cache holding `states` states per linear layer
+    /// occupies: the live state alone for a ring-less cache (`1`), a ring of `depth + 1` slots for
+    /// a cache that can roll back `depth` positions — exactly what
+    /// [`Qwen35Cache::recurrent_bytes`] reports for such a cache, and the term admission prices
+    /// (E6). Saturating.
+    pub fn recurrent_state_bytes(&self, states: usize) -> usize {
+        let linear_layers = (0..self.cfg.num_layers)
+            .filter(|&i| self.cfg.is_linear(i))
+            .count();
+        self.recurrent_shape()
+            .ring_spec(states.max(1) - 1)
+            .bytes()
+            .saturating_mul(linear_layers)
+    }
+
+    /// A fresh cache whose linear layers can roll back `max_checkpoints` positions (see
+    /// [`Qwen35Cache::rollback_to`]): each keeps a ring of `max_checkpoints + 1` recurrent states
+    /// (`0`: no ring). The rings are allocated by the first forward, or eagerly by
+    /// [`Qwen35Cache::preallocate_recurrent`] (which [`StepModel::new_cache_for`] calls).
     pub fn new_cache_with_checkpoints(&self, max_checkpoints: usize) -> Qwen35Cache {
+        let shape = self.recurrent_shape();
         let layers = (0..self.cfg.num_layers)
             .map(|i| {
                 if self.cfg.is_linear(i) {
-                    Qwen35LayerCache::Delta(DeltaNetCache::new())
+                    Qwen35LayerCache::Delta(Self::delta_slot(&shape, max_checkpoints))
                 } else {
                     Qwen35LayerCache::Attn(AttnKv::default())
                 }
@@ -1565,18 +1613,30 @@ impl Qwen35Model {
             .collect();
         Qwen35Cache {
             layers,
-            checkpoints: Vec::new(),
             max_checkpoints,
+            recurrent_shape: shape,
             rope_delta: 0,
         }
     }
 
+    fn delta_slot(shape: &RecurrentShape, max_checkpoints: usize) -> DeltaNetCache {
+        if max_checkpoints == 0 {
+            DeltaNetCache::new()
+        } else {
+            // `slots >= 2` always holds here, the only refusal `with_ring` has.
+            DeltaNetCache::with_ring(shape.ring_spec(max_checkpoints))
+                .expect("a ring of at least two slots")
+        }
+    }
+
     /// A fresh cache whose full-attention layers are **preallocated** [`StaticKvCache`]s holding
-    /// `capacity` positions (story sc-24132), retaining `max_checkpoints` rollback checkpoints.
-    /// The buffers — [`Qwen35Model::static_kv_bytes`] of device memory — are allocated here, once;
-    /// every step then writes in place. A `capacity` of zero is [`Error::Msg`] (nothing could ever
-    /// be written); one past the model's `max_position_embeddings` is
-    /// [`Error::KvCapacityExceeded`]. Both are refused before anything is allocated.
+    /// `capacity` positions (story sc-24132), whose linear layers can roll back `max_checkpoints`
+    /// positions (their rings are allocated by [`Qwen35Cache::preallocate_recurrent`] or the
+    /// first forward). The buffers — [`Qwen35Model::static_kv_bytes`] of device memory — are
+    /// allocated here, once; every step then writes in place. A `capacity` of zero is
+    /// [`Error::Msg`] (nothing could ever be written); one past the model's
+    /// `max_position_embeddings` is [`Error::KvCapacityExceeded`]. Both are refused before
+    /// anything is allocated.
     pub fn new_static_cache(&self, capacity: usize, max_checkpoints: usize) -> Result<Qwen35Cache> {
         if capacity == 0 {
             return Err(Error::Msg(
@@ -1594,10 +1654,11 @@ impl Qwen35Model {
             self.cfg.num_kv_heads.max(0) as usize,
             self.cfg.head_dim.max(0) as usize,
         );
+        let shape = self.recurrent_shape();
         let mut layers = Vec::with_capacity(self.cfg.num_layers);
         for i in 0..self.cfg.num_layers {
             layers.push(if self.cfg.is_linear(i) {
-                Qwen35LayerCache::Delta(DeltaNetCache::new())
+                Qwen35LayerCache::Delta(Self::delta_slot(&shape, max_checkpoints))
             } else {
                 Qwen35LayerCache::StaticAttn(StaticKvCache::new(
                     1,
@@ -1612,8 +1673,8 @@ impl Qwen35Model {
         }
         Ok(Qwen35Cache {
             layers,
-            checkpoints: Vec::new(),
             max_checkpoints,
+            recurrent_shape: shape,
             rope_delta: 0,
         })
     }
@@ -2311,22 +2372,26 @@ impl KvCache for Qwen35Cache {
 impl StepModel for Qwen35Model {
     type Cache = Qwen35Cache;
 
-    /// A cache that retains [`STEP_MAX_CHECKPOINTS`] rollback checkpoints — the step seam's callers
-    /// (the speculative verify) roll back through them.
+    /// A cache that can roll back [`STEP_MAX_CHECKPOINTS`] positions (its rings are allocated by
+    /// the first forward — this constructor cannot fail).
     fn new_cache(&self) -> Qwen35Cache {
         self.new_cache_with_checkpoints(STEP_MAX_CHECKPOINTS)
     }
 
     /// The static cache sized for `capacity + overshoot` positions (or the growing reference cache
-    /// when [`set_step_kv_cache`](Qwen35Model::set_step_kv_cache) selected it), retaining
-    /// [`STEP_MAX_CHECKPOINTS`].
+    /// when [`set_step_kv_cache`](Qwen35Model::set_step_kv_cache) selected it), whose linear
+    /// layers can roll back `overshoot + 1` positions: a verify step with `K = overshoot` drafts
+    /// writes `K + 1` positions and may roll back to any of them or to its start. Every ring is
+    /// allocated here, so the request fails closed with the device's error rather than at its
+    /// first forward.
     fn new_cache_for(&self, capacity: usize, overshoot: usize) -> Result<Qwen35Cache> {
-        match self.step_kv_cache {
-            KvCacheKind::Static => {
-                self.new_static_cache(capacity.saturating_add(overshoot), STEP_MAX_CHECKPOINTS)
-            }
-            KvCacheKind::Growing => Ok(self.new_cache_with_checkpoints(STEP_MAX_CHECKPOINTS)),
-        }
+        let depth = overshoot.saturating_add(1);
+        let mut cache = match self.step_kv_cache {
+            KvCacheKind::Static => self.new_static_cache(capacity.saturating_add(overshoot), depth)?,
+            KvCacheKind::Growing => self.new_cache_with_checkpoints(depth),
+        };
+        cache.preallocate_recurrent()?;
+        Ok(cache)
     }
 
     /// The static cache always attends un-expanded ([`AttnFormulation::Gqa`]); a growing cache
@@ -2897,7 +2962,7 @@ pub(crate) mod tests {
 
         // The cache advanced and holds both the recurrent and conv state for a follow-on decode step.
         assert_eq!(cache.offset(), s as i32);
-        assert!(cache.conv_state.is_some() && cache.ssm_state.is_some());
+        assert!(cache.conv_state().is_some() && cache.ssm_state().is_some());
     }
 
     /// A MoE config (`qwen3_5_moe`, the 35B-A3B shape scaled down): 6 experts, top-2, with a shared
@@ -3390,9 +3455,9 @@ pub(crate) mod tests {
             .unwrap();
 
         // Rolled back: prefill toks[..n], decode toks[n..m] one at a time (m > n), roll back to n.
-        // Retention is opt-in beyond the default two: keep every step start of this run.
+        // Retention is opt-in beyond the default two: keep every position of this run.
         let mut cache = model.new_cache();
-        cache.set_max_checkpoints(8);
+        cache.set_max_checkpoints(8).unwrap();
         model
             .decode_logits(&ids(&toks[..n]), &mut cache, 0)
             .unwrap();
@@ -3402,13 +3467,11 @@ pub(crate) mod tests {
                 .unwrap();
         }
         assert_eq!(cache.offset(), m as i32);
-        // Every step start is a checkpoint: the prefill at 0, then each single-token step.
-        let mut expected = vec![0i32];
-        expected.extend(n as i32..m as i32);
-        assert_eq!(cache.checkpoint_offsets(), expected);
+        // Every position is a checkpoint — the prefill's interior ones included (sc-24131).
+        assert_eq!(cache.checkpoint_offsets(), (1..m as i32).collect::<Vec<_>>());
         cache.rollback_to(n as i32).unwrap();
         assert_eq!(cache.offset(), n as i32);
-        assert_eq!(cache.checkpoint_offsets(), vec![0, n as i32]);
+        assert_eq!(cache.checkpoint_offsets(), (1..n as i32).collect::<Vec<_>>());
         let replayed = model
             .decode_logits(&ids(&[toks[n]]), &mut cache, n as i32)
             .unwrap();
@@ -3430,8 +3493,9 @@ pub(crate) mod tests {
         assert_eq!(max_abs_diff(&a, &b), 0.0);
     }
 
-    /// Rollback refuses positions it has no checkpoint for (inside a multi-token prefill, or pruned
-    /// away), and never approximates; `0` and the current position always work.
+    /// Rollback refuses positions the ring no longer holds (older than `max_checkpoints` behind
+    /// the current one), and never approximates; `0` and the current position always work, and
+    /// every position the ring holds — inside a multi-token prefill too — is exact.
     #[test]
     fn rollback_is_exact_or_refused() {
         let (_cfg, model) = text_model();
@@ -3442,10 +3506,14 @@ pub(crate) mod tests {
             .unwrap();
         assert!(cache.rollback_to(4).is_ok(), "current position is a no-op");
         assert_eq!(cache.offset(), 4);
-        // Refused with the typed variant (the S2 speculative engine matches on it, not on text).
-        match cache.rollback_to(2) {
-            Err(Error::RollbackUnavailable { n: 2, have }) => assert_eq!(have, vec![0]),
-            other => panic!("expected RollbackUnavailable {{ n: 2, have: [0] }}, got {other:?}"),
+        // The ring holds the newest STEP_MAX_CHECKPOINTS positions behind the current one, even
+        // inside one multi-token forward (sc-24131).
+        assert_eq!(cache.checkpoint_offsets(), vec![2, 3]);
+        // Older positions are refused with the typed variant (the S2 speculative engine matches
+        // on it, not on text).
+        match cache.rollback_to(1) {
+            Err(Error::RollbackUnavailable { n: 1, have }) => assert_eq!(have, vec![2, 3]),
+            other => panic!("expected RollbackUnavailable {{ n: 1, have: [2, 3] }}, got {other:?}"),
         }
         assert_eq!(
             cache.offset(),
@@ -3458,18 +3526,32 @@ pub(crate) mod tests {
             "past the end"
         );
         assert!(matches!(cache.rollback_to(-1), Err(Error::Msg(_))));
-        assert_eq!(
-            cache.checkpoint_offsets(),
-            vec![0],
-            "one forward so far: only its start is checkpointed"
-        );
+        // An interior position of the prefill is exact: re-decoding from it equals a fresh
+        // decode of that prefix.
+        cache.rollback_to(2).unwrap();
+        assert_eq!(cache.offset(), 2);
+        assert!(cache.checkpoint_offsets().is_empty());
+        let replayed = model.decode_logits(&ids(&[3]), &mut cache, 2).unwrap();
+        let mut fresh = model.new_cache();
+        model.decode_logits(&ids(&[1, 7]), &mut fresh, 0).unwrap();
+        let fresh_logits = model.decode_logits(&ids(&[3]), &mut fresh, 2).unwrap();
+        assert_eq!(max_abs_diff(&fresh_logits, &replayed), 0.0);
         cache.rollback_to(0).unwrap();
         assert_eq!(cache.offset(), 0);
         assert!(cache.checkpoint_offsets().is_empty());
-        assert_eq!(cache.memory(), CacheMemory::default());
+        // The rings stay allocated (they are priced from creation): one slot live, the rest
+        // checkpoints, no KV.
+        let one_state = model.recurrent_state_bytes(1);
+        assert_eq!(
+            cache.memory(),
+            CacheMemory {
+                live_bytes: one_state,
+                checkpoint_bytes: one_state * STEP_MAX_CHECKPOINTS,
+            }
+        );
 
-        // Retention: with room for one checkpoint only the newest step start survives.
-        cache.set_max_checkpoints(1);
+        // Retention: with room for one position only the newest one behind the current survives.
+        cache.set_max_checkpoints(1).unwrap();
         model.decode_logits(&ids(&[1, 7]), &mut cache, 0).unwrap();
         model.decode_logits(&ids(&[3]), &mut cache, 2).unwrap();
         model.decode_logits(&ids(&[42]), &mut cache, 3).unwrap();
@@ -3487,8 +3569,8 @@ pub(crate) mod tests {
         assert!(dyn_cache.truncate(3).is_ok());
         assert_eq!(dyn_cache.offset(), 3);
 
-        // The reference / MTP cache (`new_cache`, what `Decode::make_cache` boxes) retains no
-        // checkpoints, so it holds one recurrent state — and refuses any interior rollback.
+        // The reference / MTP cache (`new_cache`, what `Decode::make_cache` boxes) keeps no ring,
+        // so it holds one recurrent state — and refuses any interior rollback.
         let mut reference = model.new_cache();
         assert_eq!(reference.max_checkpoints(), REFERENCE_MAX_CHECKPOINTS);
         model
@@ -3498,33 +3580,157 @@ pub(crate) mod tests {
         model.decode_logits(&ids(&[9]), &mut reference, 4).unwrap();
         assert!(reference.checkpoint_offsets().is_empty());
         assert_eq!(reference.memory().checkpoint_bytes, 0);
+        assert!(reference.recurrent_ring_addresses().unwrap().is_empty());
         match reference.rollback_to(4) {
             Err(Error::RollbackUnavailable { n: 4, have }) => assert!(have.is_empty()),
             other => panic!("expected RollbackUnavailable {{ n: 4, have: [] }}, got {other:?}"),
         }
     }
 
-    /// The memory accounting follows the live tensors and the checkpoints, and a rollback drops
-    /// the rolled-back positions' KV bytes.
+    /// **AC1 (tiny config).** After one verify forward of `K + 1` tokens, rolling back to any
+    /// `j in 0..=K + 1` positions into it leaves every linear layer's conv and SSM state equal to
+    /// a fresh decode of that many tokens (max abs error `<= 1e-6`; exact on CPU), for every
+    /// `K in 1..=5` — and the rings' addresses never change across the verify step and the
+    /// rollbacks (the CUDA-graph identity).
+    #[test]
+    fn verify_step_rollback_to_every_position_matches_a_fresh_decode() {
+        let (_cfg, model) = text_model();
+        let prompt = [1u32, 7, 3, 42];
+        let toks = [9u32, 2, 11, 5, 8, 6, 4];
+        let p = prompt.len();
+        let states = |cache: &Qwen35Cache| -> Vec<(Vec<f32>, Vec<f32>)> {
+            cache
+                .layers
+                .iter()
+                .filter_map(|l| match l {
+                    Qwen35LayerCache::Delta(c) => Some((
+                        c.conv_state().map(host).unwrap_or_default(),
+                        c.ssm_state().map(host).unwrap_or_default(),
+                    )),
+                    _ => None,
+                })
+                .collect()
+        };
+        let max_err = |a: &[f32], b: &[f32]| -> f32 {
+            assert_eq!(a.len(), b.len());
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        };
+        for k in 1..=5usize {
+            // The engine's cache for `K` drafts (what `new_cache_for(_, K)` builds).
+            let mut cache = model.new_cache_for(32, k).unwrap();
+            assert_eq!(cache.max_checkpoints(), k + 1);
+            let addresses = cache.recurrent_ring_addresses().unwrap();
+            assert!(!addresses.is_empty());
+            model
+                .forward_step(&mut cache, StepRequest::last(&prompt.map(|t| t as i32)))
+                .unwrap();
+            let verify: Vec<i32> = toks[..k + 1].iter().map(|&t| t as i32).collect();
+            model
+                .forward_step(
+                    &mut cache,
+                    StepRequest {
+                        tokens: crate::decode::StepTokens::Host(&verify),
+                        scope: LogitsScope::All,
+                        want_hidden: false,
+                    },
+                )
+                .unwrap();
+            assert_eq!(cache.offset(), (p + k + 1) as i32);
+            assert_eq!(cache.recurrent_ring_addresses().unwrap(), addresses);
+            assert_eq!(
+                cache.checkpoint_offsets(),
+                (p as i32..(p + k + 1) as i32).collect::<Vec<_>>(),
+                "K={k}: the step start and every verify position are restorable"
+            );
+            for j in (0..=k + 1).rev() {
+                cache.rollback_to((p + j) as i32).unwrap();
+                assert_eq!(cache.recurrent_ring_addresses().unwrap(), addresses);
+                let mut fresh = model.new_cache();
+                model
+                    .decode_logits(&ids(&prompt), &mut fresh, 0)
+                    .unwrap();
+                for (i, &t) in toks[..j].iter().enumerate() {
+                    model
+                        .decode_logits(&ids(&[t]), &mut fresh, (p + i) as i32)
+                        .unwrap();
+                }
+                let (got, want) = (states(&cache), states(&fresh));
+                assert_eq!(got.len(), want.len());
+                for (layer, ((gc, gs), (wc, ws))) in got.iter().zip(&want).enumerate() {
+                    let (ce, se) = (max_err(gc, wc), max_err(gs, ws));
+                    assert!(
+                        ce <= 1e-6 && se <= 1e-6,
+                        "K={k} j={j} layer {layer}: conv {ce:e} ssm {se:e}"
+                    );
+                }
+                // And the next token decodes the same from a fresh step cache of the same kind
+                // (static KV) that never rolled back — on a deep copy, so the extra forward does
+                // not slide the ring's window past the step start.
+                let next = toks[j] as i32;
+                let mut trial = cache.try_clone().unwrap();
+                assert_ne!(trial.recurrent_ring_addresses().unwrap(), addresses);
+                let a = model
+                    .forward_step(&mut trial, StepRequest::last(&[next]))
+                    .unwrap()
+                    .logits;
+                let mut fresh_step = model.new_cache_for(32, 0).unwrap();
+                let mut fed: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+                fed.extend(toks[..j].iter().map(|&t| t as i32));
+                model
+                    .forward_step(&mut fresh_step, StepRequest::last(&fed))
+                    .unwrap();
+                let b = model
+                    .forward_step(&mut fresh_step, StepRequest::last(&[next]))
+                    .unwrap()
+                    .logits;
+                // Not bit-identical: the two caches reached position `p + j` through different
+                // row counts (a `K + 1`-row verify forward vs one `p + j`-row prefill), and a
+                // GEMM's reduction order follows its row count (the S2 finding) — last-bit
+                // differences in the projections, well inside 1e-5 on this fixture. The
+                // recurrent state itself, compared above, is what the rollback restores.
+                let logits_err = max_abs_diff(&a, &b);
+                assert!(logits_err <= 1e-5, "K={k} j={j}: logits {logits_err:e}");
+                assert_eq!(
+                    cache.offset(),
+                    (p + j) as i32,
+                    "the copy's forward left the cache alone"
+                );
+            }
+        }
+    }
+
+    /// The memory accounting: a step cache's rings are priced in full from creation (one slot
+    /// live, the rest checkpoints) and never grow; the KV follows the live positions and a
+    /// rollback drops the rolled-back positions' KV bytes.
     #[test]
     fn memory_accounting_tracks_live_state_and_checkpoints() {
         let (cfg, model) = text_model();
         let mut cache = StepModel::new_cache(&model);
-        assert_eq!(cache.memory(), CacheMemory::default());
+        let one_state = model.recurrent_state_bytes(1);
+        let ring = model.recurrent_state_bytes(1 + STEP_MAX_CHECKPOINTS);
+        assert_eq!(
+            cache.memory(),
+            CacheMemory {
+                live_bytes: one_state,
+                checkpoint_bytes: ring - one_state,
+            },
+            "the rings are priced from creation"
+        );
         model
             .decode_logits(&ids(&[1, 7, 3]), &mut cache, 0)
             .unwrap();
         let after_prefill = cache.memory();
         // One full-attention layer: K and V of [1, nkv, 3, hd] f32 each.
         let kv_bytes = 2 * (cfg.num_kv_heads as usize) * 3 * (cfg.head_dim as usize) * 4;
-        assert!(
-            after_prefill.live_bytes > kv_bytes,
-            "KV plus DeltaNet states"
-        );
         assert_eq!(
-            after_prefill.checkpoint_bytes, 0,
-            "the position-0 checkpoint holds empty (None) states"
+            after_prefill.live_bytes,
+            kv_bytes + one_state,
+            "KV plus the live DeltaNet slot"
         );
+        assert_eq!(after_prefill.checkpoint_bytes, ring - one_state);
         model.decode_logits(&ids(&[42]), &mut cache, 3).unwrap();
         let after_step = cache.memory();
         assert_eq!(
@@ -3532,20 +3738,11 @@ pub(crate) mod tests {
             kv_bytes / 3,
             "one more KV position; recurrent states are fixed-size"
         );
-        assert!(
-            after_step.checkpoint_bytes > 0,
-            "the position-3 checkpoint holds real states"
-        );
-        // The recurrent share: the live linear-layer states plus the one real checkpoint (the
-        // position-0 checkpoint is empty) — two states' worth.
+        assert_eq!(after_step.checkpoint_bytes, after_prefill.checkpoint_bytes);
+        assert_eq!(cache.recurrent_bytes(), ring);
         assert_eq!(
             cache.recurrent_bytes(),
-            after_step.live_bytes - kv_bytes * 4 / 3 + after_step.checkpoint_bytes
-        );
-        assert_eq!(
-            cache.recurrent_bytes(),
-            2 * after_step.checkpoint_bytes,
-            "live recurrent state + one checkpoint of the same size"
+            after_step.total_bytes() - kv_bytes * 4 / 3
         );
         cache.rollback_to(3).unwrap();
         assert_eq!(cache.memory().live_bytes, after_prefill.live_bytes);
@@ -3553,6 +3750,7 @@ pub(crate) mod tests {
             cache.memory().total_bytes(),
             after_step.total_bytes() - kv_bytes / 3
         );
+        assert_eq!(cache.recurrent_bytes(), ring, "a rollback frees nothing: slots are reused");
     }
 
     /// A schedule with no full-attention layer still reports its position (from the linear layers).

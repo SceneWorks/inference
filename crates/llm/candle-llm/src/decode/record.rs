@@ -91,6 +91,13 @@ pub struct DecodeRecord {
     pub proposer: ProposerKind,
     /// Verify steps the speculative engine took (0 on non-speculative paths).
     pub verify_steps: u64,
+    /// Verify steps whose partial acceptance was recovered by a direct cache rollback into the
+    /// verify step (sc-24131) — no extra target forward.
+    pub direct_rollbacks: u64,
+    /// Verify steps the cache could not roll back into, recovered by a rollback to the step start
+    /// plus a replay forward of the kept prefix — one extra target forward each. `0` on a cache
+    /// with per-token checkpoints (the `Qwen35Cache` since S3); the E2 "replay fallback" count.
+    pub replay_fallbacks: u64,
     /// Device->host transfers issued inside those verify steps (proposing, verifying, deciding and
     /// committing), so `verify_host_syncs / verify_steps` is the engine's per-step sync cost — the
     /// AC2 figure, exactly `1.0` for a greedy run with device-resident drafts.
@@ -120,6 +127,8 @@ impl DecodeRecord {
             attn_formulation: AttnFormulation::Gqa,
             proposer: ProposerKind::None,
             verify_steps: 0,
+            direct_rollbacks: 0,
+            replay_fallbacks: 0,
             verify_host_syncs: 0,
             fused_primitives: FusedTally::default(),
         }
@@ -177,6 +186,8 @@ impl DecodeRecord {
             attn_formulation: AttnFormulation::Gqa,
             proposer: ProposerKind::None,
             verify_steps: stats.verify_steps as u64,
+            direct_rollbacks: stats.direct_rollbacks as u64,
+            replay_fallbacks: stats.replay_fallbacks as u64,
             verify_host_syncs: 0,
             fused_primitives: FusedTally::default(),
         }
@@ -186,6 +197,14 @@ impl DecodeRecord {
     /// step ran.
     pub fn host_syncs_per_verify_step(&self) -> Option<f64> {
         (self.verify_steps > 0).then(|| self.verify_host_syncs as f64 / self.verify_steps as f64)
+    }
+
+    /// Target forwards per verify step — the verify forward plus any replay fallback:
+    /// `(verify_steps + replay_fallbacks) / verify_steps` — or `None` when no verify step ran.
+    /// Exactly `1.0` on a cache with per-token checkpoints (sc-24131 AC2).
+    pub fn target_forwards_per_verify_step(&self) -> Option<f64> {
+        (self.verify_steps > 0)
+            .then(|| (self.verify_steps + self.replay_fallbacks) as f64 / self.verify_steps as f64)
     }
 
     /// `accepted / proposed`, or `None` when nothing was proposed (non-speculative paths).
@@ -339,10 +358,12 @@ mod tests {
         let spec = DecodeRecord::speculative(
             DecodePath::Mtp { drafts: 3 },
             SpeculativeStats {
-                forwards: 5,
+                forwards: 6,
                 proposed: 12,
                 accepted: 6,
                 verify_steps: 4,
+                direct_rollbacks: 2,
+                replay_fallbacks: 1,
             },
             10,
             20,
@@ -350,9 +371,12 @@ mod tests {
         .with_proposer(ProposerKind::Mtp)
         .with_verify_syncs(4);
         assert_eq!(spec.acceptance_rate(), Some(0.5));
-        assert_eq!(spec.forwards_per_generated_token(), Some(0.5));
+        assert_eq!(spec.forwards_per_generated_token(), Some(0.6));
         assert_eq!(spec.host_syncs_per_token(), Some(2.0));
         assert_eq!(spec.host_syncs_per_verify_step(), Some(1.0));
+        assert_eq!((spec.direct_rollbacks, spec.replay_fallbacks), (2, 1));
+        assert_eq!(spec.target_forwards_per_verify_step(), Some(1.25));
+        assert_eq!(plain.target_forwards_per_verify_step(), None);
         assert_eq!(spec.path.label(), "mtp");
         assert_eq!(spec.proposer.label(), "mtp");
     }

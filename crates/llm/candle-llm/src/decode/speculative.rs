@@ -73,6 +73,15 @@ pub struct SpeculativeStats {
     /// Verify steps taken: target forwards over `[cur, drafts…]` whose outcome was decided
     /// (sc-24130). The denominator of "host syncs per verify step".
     pub verify_steps: usize,
+    /// Verify steps whose partial acceptance was recovered by a **direct** cache rollback to
+    /// `start + 1 + accepted` (sc-24131) — no extra target forward.
+    pub direct_rollbacks: usize,
+    /// Verify steps the cache could not roll back into ([`Error::RollbackUnavailable`]), recovered
+    /// by rolling back to the step start and **replaying** the kept prefix — one extra target
+    /// forward each. Zero on a cache with per-token checkpoints (the S3 `Qwen35Cache`).
+    ///
+    /// [`Error::RollbackUnavailable`]: crate::error::Error::RollbackUnavailable
+    pub replay_fallbacks: usize,
 }
 
 /// Generate from `prompt_ids` with prompt-lookup speculative decoding, returning the output and
