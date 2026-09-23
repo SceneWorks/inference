@@ -9,7 +9,7 @@
 //!   whole 256-token run and a rollback.
 //! * **Teacher-forced characterization** — both paths fed the reference's own 256 tokens; reports
 //!   per-position argmax agreement, the max |Δlogit| and the reference's top-2 logit gap wherever
-//!   the argmax differs (a bf16-ULP tie), and gates on the logit tolerance.
+//!   the argmax differs (a bf16-ULP tie), and gates on a 2-ULP logit tolerance.
 //!
 //! ```text
 //! BONSAI_QWEN38_SNAPSHOT=E:\...\snapshots\1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 \
@@ -194,7 +194,7 @@ fn ac3_static_kv_device_pointers_are_stable_across_the_fixture_and_a_rollback() 
 
 /// Both paths fed the reference's own greedy tokens, position by position: where do the argmaxes
 /// differ, by how much do the logits differ, and how close was the reference's top-2 gap there?
-/// Gates on the logit tolerance the flash-attn path already carries (3e-2 on bf16 logits); the
+/// Gates on the logits agreeing to within 2 bf16 ULPs (the reduction-order tolerance); the
 /// per-position report is the evidence for the AC1 decision when a knife-edge token flips.
 #[test]
 #[ignore = "needs the Qwen3.8-27B snapshot via BONSAI_QWEN38_SNAPSHOT and a GPU"]
@@ -247,16 +247,29 @@ fn teacher_forced_static_vs_attn_kv_logit_parity_report() {
         .forward_step(&mut growing, StepRequest::last(&prompt))
         .unwrap()
         .logits;
+    // bf16 ULP of a value: 8 significant bits, so 2^(exponent - 7).
+    let ulp = |x: f32| -> f32 {
+        let x = x.abs().max(f32::MIN_POSITIVE);
+        (2f32).powi(x.log2().floor() as i32 - 7)
+    };
     let mut max_delta = 0f32;
+    let mut max_delta_at = 0f32;
+    let mut max_ulps = 0f32;
     let mut disagreements = Vec::new();
     for (pos, &token) in reference.tokens.iter().enumerate() {
         let (ra, rb) = (host(&a), host(&b));
-        let delta = ra
-            .iter()
-            .zip(&rb)
-            .map(|(x, y)| (x - y).abs())
-            .fold(0f32, f32::max);
-        max_delta = max_delta.max(delta);
+        let mut delta = 0f32;
+        for (&x, &y) in ra.iter().zip(&rb) {
+            let d = (x - y).abs();
+            if d > delta {
+                delta = d;
+            }
+            if d > max_delta {
+                max_delta = d;
+                max_delta_at = y;
+            }
+            max_ulps = max_ulps.max(d / ulp(y));
+        }
         // The sampler's own greedy pick (device argmax) on each path; the host top-2 gap says how
         // close the runner-up was (a gap of 0 is an exact bf16 tie).
         let arg_a = argmax_device(&a).unwrap();
@@ -283,7 +296,7 @@ fn teacher_forced_static_vs_attn_kv_logit_parity_report() {
             .logits;
     }
     eprintln!(
-        "[teacher-forced] {} positions; argmax agrees at {}; max |delta logit| = {max_delta}",
+        "[teacher-forced] {} positions; argmax agrees at {}; max |delta logit| = {max_delta} (at a          reference logit of {max_delta_at}); max delta = {max_ulps} bf16 ULPs",
         reference.tokens.len(),
         reference.tokens.len() - disagreements.len()
     );
@@ -293,7 +306,7 @@ fn teacher_forced_static_vs_attn_kv_logit_parity_report() {
         );
     }
     assert!(
-        max_delta < 3e-2,
-        "static vs AttnKv logits differ by {max_delta}"
+        max_ulps <= 2.0,
+        "static vs AttnKv logits differ by {max_ulps} bf16 ULPs (max |delta| {max_delta})"
     );
 }
