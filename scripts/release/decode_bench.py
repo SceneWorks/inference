@@ -151,18 +151,31 @@ def baseline_bench_source(checkout: Path, identity: dict[str, Any], head_source:
     }
 
 
+def row_qualifiers(row: dict[str, Any]) -> list[str]:
+    """Which KV cache and which attention formulation produced the row (sc-24132), when the
+    binary reported them; a pre-epic baseline binary reports neither."""
+    qualifiers = []
+    if row.get("kv_cache"):
+        qualifiers.append(f"{row['kv_cache']} kv")
+    if row.get("attn_formulation"):
+        qualifiers.append(f"{row['attn_formulation']} attn")
+    return qualifiers
+
+
 def row_label(row: dict[str, Any]) -> str:
     path = row.get("path")
+    qualifiers = row_qualifiers(row)
     if path == "mtp":
-        return f"MTP K={row.get('mtp_drafts')}"
+        base = f"MTP K={row.get('mtp_drafts')}"
+        return f"{base} ({', '.join(qualifiers)})" if qualifiers else base
     if path == "reference":
-        return "MTP off (reference)"
+        return "MTP off (" + ", ".join(["reference", *qualifiers]) + ")"
     if path == "reference_unfused":
-        return "MTP off (reference, fused off)"
+        return "MTP off (" + ", ".join(["reference", "fused off", *qualifiers]) + ")"
     if path == "reference_cublaslt":
-        return "MTP off (reference, NVFP4 GEMV off)"
+        return "MTP off (" + ", ".join(["reference", "NVFP4 GEMV off", *qualifiers]) + ")"
     if path == "step_model":
-        return "MTP off (StepModel)"
+        return "MTP off (" + ", ".join(["StepModel", *qualifiers]) + ")"
     return str(path)
 
 
