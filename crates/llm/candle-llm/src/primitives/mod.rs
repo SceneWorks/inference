@@ -28,7 +28,10 @@ pub use decode_cache::{tensor_bytes, CacheMemory, DecodeCache};
 pub use gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
 };
-pub use host_sync::{host_sync_count, note_host_sync};
+pub use host_sync::{
+    host_sync_count, last_host_reason, note_host_sync, note_logits_to_host, note_sampler_path,
+    sampler_counters, SamplerCounters,
+};
 pub use kv_cache::{ContiguousKvCache, KvCache};
 pub use nn::{
     conv2d, embed, gelu, gelu_erf, input_ids, input_ids_batch, layer_norm, linear, rms_norm,
@@ -39,5 +42,9 @@ pub use prism::{GdnRowMap, PrismPackedWeight, PrismRegistry};
 pub use projection::{KvProjection, Projection, QuantSpec};
 pub use quant::QuantizedLinear;
 pub use rope::{apply_rope, Rope};
-pub use sampler::{sample, shaped_candidates, SamplingParams, SplitMix64, TokenRng};
+pub use sampler::{
+    device_sampler_available, sample, sample_device, sample_host, sampler_path, shaped_candidates,
+    uniform_device, with_reference_sampler, HostSampleReason, SamplerPath, SamplingParams,
+    SplitMix64, TokenRng,
+};
 pub use weights::Weights;

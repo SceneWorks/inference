@@ -203,7 +203,7 @@ pub fn generate_step_timed<M: StepModel>(
         DecodePath::StepModel,
         forwards,
         generated.len(),
-        span.host_syncs(),
+        span.counters(),
     );
     Ok((
         GenerationOutput {

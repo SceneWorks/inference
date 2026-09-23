@@ -10,6 +10,10 @@
 //! The counters are **measured**, not derived: forwards are counted by [`CountingDecode`] or by
 //! the loop that issued them, host syncs by the thread-local counter in
 //! [`primitives::host_sync`](crate::primitives::host_sync) bracketed around the request.
+//!
+//! Story sc-24133 adds the sampler's half ([`SamplerTelemetry`]): which sampler path served the
+//! request (`device`, or `host` with the reason), how many draws each path made, and how many whole
+//! logits rows were copied to the host.
 
 use std::cell::Cell;
 
@@ -18,8 +22,11 @@ use candle_core::{Device, Tensor};
 use crate::decode::speculative::SpeculativeStats;
 use crate::decode::stream::Decode;
 use crate::error::Result;
-use crate::primitives::host_sync::host_sync_count;
+use crate::primitives::host_sync::{
+    host_sync_count, last_host_reason, sampler_counters, SamplerCounters,
+};
 use crate::primitives::kv_cache::KvCache;
+use crate::primitives::sampler::SamplerPath;
 
 /// Which decode implementation produced a request's tokens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +59,39 @@ impl DecodePath {
     }
 }
 
+/// Which sampler served a request and what it cost (story sc-24133). Measured by the thread-local
+/// sampler counters bracketed around the request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SamplerTelemetry {
+    /// The request's sampler path: `Host(reason)` if any draw (or speculative distribution read)
+    /// ran on the host — with the most recent host reason — else `Device`; `None` if nothing was
+    /// sampled.
+    pub path: Option<SamplerPath>,
+    /// Tokens drawn on the device (greedy argmax or the device sampler).
+    pub device_draws: u64,
+    /// Host sampling decisions (host draws and speculative distribution reads).
+    pub host_draws: u64,
+    /// Whole logits rows copied to the host (a vocabulary-wide `to_vec1`).
+    pub logits_to_host: u64,
+}
+
+impl SamplerTelemetry {
+    /// `device`, `host:<reason>` (e.g. `host:penalty`), or `none` — the evidence-row label.
+    pub fn label(&self) -> String {
+        self.path
+            .map_or_else(|| "none".to_string(), |path| path.to_string())
+    }
+}
+
+/// A request's measured transfer counters: host syncs plus the sampler's telemetry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpanCounters {
+    /// Device→host transfers this crate issued.
+    pub host_syncs: u64,
+    /// The sampler's path and counters.
+    pub sampler: SamplerTelemetry,
+}
+
 /// Measured counters for one generation request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodeRecord {
@@ -67,6 +107,8 @@ pub struct DecodeRecord {
     pub generated_tokens: u64,
     /// Device→host transfers this crate issued while generating (see `primitives::host_sync`).
     pub host_syncs: u64,
+    /// Which sampler path served the request (`device` | `host` + reason) and its counters.
+    pub sampler: SamplerTelemetry,
 }
 
 impl DecodeRecord {
@@ -75,7 +117,7 @@ impl DecodeRecord {
         path: DecodePath,
         target_forwards: u64,
         generated: usize,
-        host_syncs: u64,
+        counters: SpanCounters,
     ) -> Self {
         Self {
             path,
@@ -83,7 +125,8 @@ impl DecodeRecord {
             proposed_tokens: 0,
             accepted_tokens: 0,
             generated_tokens: generated as u64,
-            host_syncs,
+            host_syncs: counters.host_syncs,
+            sampler: counters.sampler,
         }
     }
 
@@ -92,7 +135,7 @@ impl DecodeRecord {
         path: DecodePath,
         stats: SpeculativeStats,
         generated: usize,
-        host_syncs: u64,
+        counters: SpanCounters,
     ) -> Self {
         Self {
             path,
@@ -100,7 +143,8 @@ impl DecodeRecord {
             proposed_tokens: stats.proposed as u64,
             accepted_tokens: stats.accepted as u64,
             generated_tokens: generated as u64,
-            host_syncs,
+            host_syncs: counters.host_syncs,
+            sampler: counters.sampler,
         }
     }
 
@@ -121,6 +165,13 @@ impl DecodeRecord {
     pub fn host_syncs_per_token(&self) -> Option<f64> {
         (self.generated_tokens > 0).then(|| self.host_syncs as f64 / self.generated_tokens as f64)
     }
+
+    /// Whole logits rows copied to the host per emitted token, or `None` when nothing was
+    /// generated. `0.0` on the device sampler path.
+    pub fn logits_to_host_per_token(&self) -> Option<f64> {
+        (self.generated_tokens > 0)
+            .then(|| self.sampler.logits_to_host as f64 / self.generated_tokens as f64)
+    }
 }
 
 /// Brackets a request on the current thread: constructed before the first forward, `finish`ed after
@@ -128,6 +179,7 @@ impl DecodeRecord {
 #[derive(Debug)]
 pub struct RequestSpan {
     host_syncs_at_start: u64,
+    sampler_at_start: SamplerCounters,
 }
 
 impl Default for RequestSpan {
@@ -141,12 +193,42 @@ impl RequestSpan {
     pub fn begin() -> Self {
         Self {
             host_syncs_at_start: host_sync_count(),
+            sampler_at_start: sampler_counters(),
         }
     }
 
     /// Host syncs recorded on this thread since [`begin`](Self::begin).
     pub fn host_syncs(&self) -> u64 {
         host_sync_count().wrapping_sub(self.host_syncs_at_start)
+    }
+
+    /// The sampler's telemetry on this thread since [`begin`](Self::begin).
+    pub fn sampler(&self) -> SamplerTelemetry {
+        let now = sampler_counters();
+        let start = self.sampler_at_start;
+        let device_draws = now.device_draws.wrapping_sub(start.device_draws);
+        let host_draws = now.host_draws.wrapping_sub(start.host_draws);
+        let path = if host_draws > 0 {
+            last_host_reason().map(SamplerPath::Host)
+        } else if device_draws > 0 {
+            Some(SamplerPath::Device)
+        } else {
+            None
+        };
+        SamplerTelemetry {
+            path,
+            device_draws,
+            host_draws,
+            logits_to_host: now.logits_to_host.wrapping_sub(start.logits_to_host),
+        }
+    }
+
+    /// Everything measured on this thread since [`begin`](Self::begin).
+    pub fn counters(&self) -> SpanCounters {
+        SpanCounters {
+            host_syncs: self.host_syncs(),
+            sampler: self.sampler(),
+        }
     }
 }
 
@@ -225,10 +307,12 @@ mod tests {
 
     #[test]
     fn ratios_are_none_without_denominators_and_exact_otherwise() {
-        let plain = DecodeRecord::plain(DecodePath::Reference, 0, 0, 0);
+        let plain = DecodeRecord::plain(DecodePath::Reference, 0, 0, SpanCounters::default());
         assert_eq!(plain.acceptance_rate(), None);
         assert_eq!(plain.forwards_per_generated_token(), None);
         assert_eq!(plain.host_syncs_per_token(), None);
+        assert_eq!(plain.logits_to_host_per_token(), None);
+        assert_eq!(plain.sampler.label(), "none");
         assert_eq!(plain.path.label(), "reference");
 
         let spec = DecodeRecord::speculative(
@@ -239,12 +323,22 @@ mod tests {
                 accepted: 6,
             },
             10,
-            20,
+            SpanCounters {
+                host_syncs: 20,
+                sampler: SamplerTelemetry {
+                    path: Some(SamplerPath::Device),
+                    device_draws: 10,
+                    host_draws: 0,
+                    logits_to_host: 0,
+                },
+            },
         );
         assert_eq!(spec.acceptance_rate(), Some(0.5));
         assert_eq!(spec.forwards_per_generated_token(), Some(0.5));
         assert_eq!(spec.host_syncs_per_token(), Some(2.0));
         assert_eq!(spec.path.label(), "mtp");
+        assert_eq!(spec.logits_to_host_per_token(), Some(0.0));
+        assert_eq!(spec.sampler.label(), "device");
     }
 
     #[test]
@@ -252,5 +346,35 @@ mod tests {
         let span = RequestSpan::begin();
         crate::primitives::note_host_sync();
         assert_eq!(span.host_syncs(), 1);
+    }
+
+    #[test]
+    fn request_span_names_the_sampler_path_and_reason() {
+        use crate::primitives::{note_logits_to_host, note_sampler_path, HostSampleReason};
+        let span = RequestSpan::begin();
+        assert_eq!(span.sampler().path, None, "nothing sampled yet");
+        note_sampler_path(SamplerPath::Device);
+        assert_eq!(span.sampler().path, Some(SamplerPath::Device));
+        note_sampler_path(SamplerPath::Host(HostSampleReason::Constraint));
+        note_logits_to_host();
+        let telemetry = span.counters().sampler;
+        assert_eq!(
+            telemetry.path,
+            Some(SamplerPath::Host(HostSampleReason::Constraint)),
+            "any host draw makes the request a host request, with its reason"
+        );
+        assert_eq!(telemetry.label(), "host:constraint");
+        assert_eq!(
+            (
+                telemetry.device_draws,
+                telemetry.host_draws,
+                telemetry.logits_to_host
+            ),
+            (1, 1, 1)
+        );
+        // A later span on the same thread starts clean.
+        let next = RequestSpan::begin();
+        note_sampler_path(SamplerPath::Device);
+        assert_eq!(next.sampler().path, Some(SamplerPath::Device));
     }
 }

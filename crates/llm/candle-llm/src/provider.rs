@@ -2476,6 +2476,7 @@ impl TextLlm for LlamaProvider {
             }
         };
 
+        let span_counters = request_span.counters();
         let decode_record = match (mtp_stats, mtp_drafts) {
             (Some(stats), Some(drafts)) => DecodeRecord {
                 path: DecodePath::Mtp { drafts },
@@ -2483,13 +2484,14 @@ impl TextLlm for LlamaProvider {
                 proposed_tokens: u64::from(stats.proposed_tokens),
                 accepted_tokens: u64::from(stats.accepted_tokens),
                 generated_tokens: out.tokens.len() as u64,
-                host_syncs: request_span.host_syncs(),
+                host_syncs: span_counters.host_syncs,
+                sampler: span_counters.sampler,
             },
             _ => DecodeRecord::plain(
                 DecodePath::Reference,
                 counted.forwards() + extra_forwards,
                 out.tokens.len(),
-                request_span.host_syncs(),
+                span_counters,
             ),
         };
         *self
