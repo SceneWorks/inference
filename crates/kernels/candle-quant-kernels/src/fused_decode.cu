@@ -20,6 +20,14 @@
 // - bf16 SiLU replicates `usilu_bf16` (`x / (1 + hexp(-x))` in native bf16): `hexp` is
 //   `ex2.approx.f32(x * log2e)` rounded to bf16, and `__hdiv` is `div.approx.f32` on the widened
 //   operands with the 2^126 guard — the same PTX candle's kernel executes.
+//
+// TOOLKIT DEPENDENCY: that bf16 SiLU equivalence is against the `hexp` / `__hdiv` definitions in
+// CUDA 12.9's `cuda_bf16.hpp`, which candle's precompiled `usilu_bf16` is built with. A toolkit
+// whose `cuda_bf16.hpp` implements them differently (another exp approximation, an IEEE divide,
+// a different guard) breaks bit-identity for bf16 SwiGLU without any compile error. The guard is
+// the GPU parity test (`fused_decode::cuda_tests::swiglu_matches_reference_on_qwen35_and_edge_shapes`
+// and `candle-llm`'s `fused_primitives::cuda::fused_on_and_off_are_bit_identical_and_both_visible`):
+// re-run it on any CUDA toolkit bump.
 
 typedef unsigned short bf16_t;
 

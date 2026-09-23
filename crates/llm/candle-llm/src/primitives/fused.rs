@@ -20,7 +20,7 @@
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// Environment switch: `0` / `off` / `false` / `no` / `reference` disable the fused path.
 pub const FUSED_KERNELS_ENV: &str = "CANDLE_LLM_FUSED_KERNELS";
@@ -67,6 +67,43 @@ pub fn set_fused_kernels(enabled: Option<bool>) {
         None => POLICY_ENV,
     };
     POLICY.store(policy, Ordering::Relaxed);
+}
+
+/// Serialises everything that writes or depends on the process-global switch. Test harnesses run
+/// tests on parallel threads, so a test that flips the switch must hold this for as long as its
+/// assertions depend on the policy.
+static POLICY_LOCK: Mutex<()> = Mutex::new(());
+
+/// Holds the process-wide switch lock; restores the switch it found when dropped. Returned by
+/// [`fused_policy_guard`].
+#[doc(hidden)]
+#[must_use = "the policy is only held (and restored) while the guard is alive"]
+pub struct FusedPolicyGuard {
+    previous: u8,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl Drop for FusedPolicyGuard {
+    fn drop(&mut self) {
+        POLICY.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+/// Test seam: take the process-wide switch lock, apply `enabled` (as [`set_fused_kernels`]) and
+/// hand back a guard that restores the previous switch when dropped. Every test that flips the
+/// switch — or asserts a reason the switch could change — holds one, so parallel test threads
+/// cannot race on the global. [`set_fused_kernels`] may still be called while it is held.
+#[doc(hidden)]
+pub fn fused_policy_guard(enabled: Option<bool>) -> FusedPolicyGuard {
+    let lock = POLICY_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous = POLICY.load(Ordering::Relaxed);
+    set_fused_kernels(enabled);
+    FusedPolicyGuard {
+        previous,
+        _lock: lock,
+    }
 }
 
 /// Per-thread counts of fused-vs-reference leaf runs (monotone; take deltas with
@@ -230,6 +267,7 @@ mod tests {
 
     #[test]
     fn runtime_override_beats_the_environment_and_can_be_cleared() {
+        let _policy = fused_policy_guard(None);
         let from_env = fused_kernels_enabled();
         set_fused_kernels(Some(false));
         assert!(!fused_kernels_enabled());
@@ -240,8 +278,26 @@ mod tests {
     }
 
     #[test]
+    fn the_policy_guard_restores_the_switch_it_found() {
+        // Every other policy change in this binary happens under a guard that restores, so the
+        // value seen at each lock acquisition is the one the previous guard restored.
+        let before = fused_policy_guard(None).previous;
+        {
+            let _held = fused_policy_guard(Some(true));
+            assert!(fused_kernels_enabled());
+            set_fused_kernels(Some(false));
+            assert!(!fused_kernels_enabled());
+        }
+        let after = fused_policy_guard(None);
+        assert_eq!(
+            after.previous, before,
+            "dropping the guard restores the switch"
+        );
+    }
+
+    #[test]
     fn reference_reason_names_the_switch_or_the_build() {
-        set_fused_kernels(Some(false));
+        let _policy = fused_policy_guard(Some(false));
         let start = fused_tally();
         #[cfg(feature = "cuda")]
         {
@@ -257,6 +313,5 @@ mod tests {
             assert_eq!(d.reference, 1);
             assert_eq!(d.reference_reason, Some(REASON_CUDA_FEATURE_OFF));
         }
-        set_fused_kernels(None);
     }
 }
