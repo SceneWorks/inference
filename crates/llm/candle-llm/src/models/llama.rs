@@ -29,7 +29,6 @@
 //! projection output on every layer.
 
 use candle_core::{DType, Device, Tensor};
-use candle_nn::{Linear, Module};
 
 use crate::config::{Architecture, LayerAttentionType, ModelConfig};
 use crate::decode::step::{LogitsScope, StepModel, StepOutput, StepRequest};
@@ -42,7 +41,9 @@ use crate::primitives::kv_cache::{KvCache, KvCacheKind};
 use crate::primitives::nn::{
     embed, gelu, rms_norm, rms_norm_residual, rms_norm_unscaled, soft_cap, swiglu,
 };
-use crate::primitives::projection::{KvProjection, Projection, QuantSpec};
+use crate::primitives::projection::{
+    KvProjection, Projection, ProjectionFormat, QuantSpec, WeightCensus,
+};
 use crate::primitives::rope::{apply_rope, rms_norm_rope, Rope};
 use crate::primitives::step_kv_cache::{KvLayout, LayerKvShape, StepKvCache};
 use crate::primitives::{repeat_kv, ContiguousKvCache, PagedKvCache, Weights};
@@ -68,7 +69,7 @@ fn projection_from_weights(
     wkey: &str,
     with_bias: bool,
     dtype: DType,
-    quant: Option<QuantSpec>,
+    format: Option<&ProjectionFormat>,
     target_device: Option<&Device>,
 ) -> Result<Projection> {
     let stem = wkey.strip_suffix(".weight").unwrap_or(wkey);
@@ -85,11 +86,21 @@ fn projection_from_weights(
     };
 
     if w.contains(&scales_key) {
-        let quant = quant.ok_or_else(|| {
-            Error::Config(format!(
-                "packed projection `{stem}` has affine sidecars but the model config has no quantization block"
-            ))
-        })?;
+        let quant = match format {
+            Some(ProjectionFormat::Ggml(quant)) => *quant,
+            // An MLX affine triple is already quantized; NVFP4 quantizes from a dense weight, so
+            // re-packing it would mean dequantizing a lossy code into another lossy code.
+            Some(ProjectionFormat::Nvfp4(_)) => {
+                return Err(Error::Unsupported(format!(
+                    "nvfp4: packed projection `{stem}` is an MLX affine triple; NVFP4 projections                      are quantized from a dense snapshot"
+                )))
+            }
+            None => {
+                return Err(Error::Config(format!(
+                    "packed projection `{stem}` has affine sidecars but the model config has no quantization block"
+                )))
+            }
+        };
         let biases_key = format!("{stem}.biases");
         Projection::load_mlx_affine_q8(
             source,
@@ -100,7 +111,9 @@ fn projection_from_weights(
             target,
         )
     } else {
-        Projection::load_with_bias(dense_tensor(w, wkey, dtype, Some(target))?, bias, quant)
+        // Dense (none), GGML Q4/Q8, or NVFP4 — where a shape the FP4 GEMM cannot serve stays
+        // dense and is counted under `dense` by the load census (sc-24140).
+        Projection::load_eligible(dense_tensor(w, wkey, dtype, Some(target))?, bias, format)
     }
 }
 
@@ -109,7 +122,10 @@ pub struct CausalLm {
     embed_tokens: Tensor,
     layers: Vec<LlamaLayer>,
     norm: Tensor,
-    lm_head: Linear,
+    /// The LM head: dense, or NVFP4 under an NVFP4 load (sc-24140).
+    lm_head: Projection,
+    /// The device the head's weight lives on (the last shard's, or the embedding's when tied).
+    lm_head_device: Device,
     /// The RoPE every layer uses on a uniform model — and Gemma 4's `sliding_attention` schedule.
     rope: Rope,
     /// Gemma 4's `full_attention` RoPE (`proportional`, its own theta and head dim); `None` for
@@ -154,9 +170,10 @@ impl CausalLm {
         Self::from_weights_with(w, prefix, cfg, None)
     }
 
-    /// Build from a loaded checkpoint, optionally quantizing the attention/MLP projections on load.
-    /// Embeddings, the LM head, and norms always stay dense. The compute dtype is the device default
-    /// ([`compute_dtype`] — bf16 on GPU, f32 on CPU); use [`CausalLm::from_weights_dtype`] to pick it.
+    /// Build from a loaded checkpoint, optionally quantizing the attention/MLP projections on load
+    /// (GGML Q4/Q8). Embeddings, the LM head, and norms always stay dense. The compute dtype is the
+    /// device default ([`compute_dtype`] — bf16 on GPU, f32 on CPU); use
+    /// [`CausalLm::from_weights_dtype`] to pick it, [`CausalLm::from_weights_format`] for NVFP4.
     pub fn from_weights_with(
         w: &Weights,
         prefix: &str,
@@ -164,6 +181,26 @@ impl CausalLm {
         quant: Option<QuantSpec>,
     ) -> Result<Self> {
         Self::from_weights_dtype(w, prefix, cfg, quant, compute_dtype(w.device()))
+    }
+
+    /// Build from a loaded checkpoint with its projections stored in `format` (sc-24140) — the
+    /// one entry point for every [`ProjectionFormat`]: `None` keeps them dense, a GGML format
+    /// quantizes the attention/MLP projections exactly as [`CausalLm::from_weights_with`] does
+    /// (embeddings, head and norms dense), and **NVFP4** — whose format already proves the device
+    /// is sm_120 — quantizes every attention (q/k/v/o, MLA's low-rank projections), MLP and
+    /// MoE-expert projection **and the LM head** through [`Projection::load_eligible`], the shared
+    /// NVFP4 loader: a projection whose shape the FP4 GEMM cannot serve (`N % 16 != 0`) stays
+    /// dense and is reported under `dense` by [`CausalLm::weight_census`]. The decode GEMV
+    /// (sc-24136) serves the ≤ 8-row decode forwards automatically. Embeddings, norms and MoE
+    /// routers stay dense; a tied head is quantized from a copy of the embedding, which stays dense
+    /// for the lookup.
+    pub fn from_weights_format(
+        w: &Weights,
+        prefix: &str,
+        cfg: ModelConfig,
+        format: Option<&ProjectionFormat>,
+    ) -> Result<Self> {
+        Self::from_weights_dtype_impl(w, prefix, cfg, format, compute_dtype(w.device()), None)
     }
 
     /// Build from host-staged weights while materializing the resulting decoder on `device`.
@@ -179,7 +216,15 @@ impl CausalLm {
         quant: Option<QuantSpec>,
         device: &Device,
     ) -> Result<Self> {
-        Self::from_weights_dtype_impl(w, prefix, cfg, quant, compute_dtype(device), Some(device))
+        let format = quant.map(ProjectionFormat::from);
+        Self::from_weights_dtype_impl(
+            w,
+            prefix,
+            cfg,
+            format.as_ref(),
+            compute_dtype(device),
+            Some(device),
+        )
     }
 
     /// Like [`CausalLm::from_weights_with`] but with an explicit dense compute `dtype` — the
@@ -192,17 +237,20 @@ impl CausalLm {
         quant: Option<QuantSpec>,
         dtype: DType,
     ) -> Result<Self> {
-        Self::from_weights_dtype_impl(w, prefix, cfg, quant, dtype, None)
+        let format = quant.map(ProjectionFormat::from);
+        Self::from_weights_dtype_impl(w, prefix, cfg, format.as_ref(), dtype, None)
     }
 
     fn from_weights_dtype_impl(
         w: &Weights,
         prefix: &str,
         cfg: ModelConfig,
-        quant: Option<QuantSpec>,
+        format: Option<&ProjectionFormat>,
         dtype: DType,
         target_device: Option<&Device>,
     ) -> Result<Self> {
+        // NVFP4 also quantizes the LM head (sc-24140); a GGML format keeps it dense, as before.
+        let nvfp4 = format.filter(|f| f.is_nvfp4());
         let device = target_device.cloned().unwrap_or_else(|| w.device().clone());
         // The Qwen3-VL VLM wrapper nests the decoder under `model.language_model.*` (embeddings,
         // norm, `layers.{i}.*`) with the untied `lm_head.weight` at the checkpoint root; a plain
@@ -225,12 +273,12 @@ impl CausalLm {
         let p = |suffix: &str| join(&decoder_root, suffix);
         let req = |key: String| -> Result<Tensor> { dense_tensor(w, &key, dtype, target_device) };
         let proj = |key: String| -> Result<Projection> {
-            projection_from_weights(w, &key, false, dtype, quant, target_device)
+            projection_from_weights(w, &key, false, dtype, format, target_device)
         };
         // Like `proj`, but also loads a sibling `.bias` when present (Qwen2 attention carries q/k/v
         // bias; Llama / Qwen3 / Phi-3 do not).
         let proj_b = |key: String| -> Result<Projection> {
-            projection_from_weights(w, &key, true, dtype, quant, target_device)
+            projection_from_weights(w, &key, true, dtype, format, target_device)
         };
         // **Gemma-2's** norms are `(1 + weight)`; fold the +1 into the stored weight so the standard
         // `rms_norm` applies it. (Llama / Qwen3 norm weights are used verbatim — and so are
@@ -252,16 +300,18 @@ impl CausalLm {
 
         let embed_tokens = req(p("embed_tokens.weight"))?;
         let norm = norm_w(p("norm.weight"))?;
-        let lm_head = if cfg.tie_word_embeddings {
-            Linear::new(embed_tokens.clone(), None)
+        let head_weight = if cfg.tie_word_embeddings {
+            embed_tokens.clone()
         } else {
             let head_key = if vlm_nested {
                 "lm_head.weight".to_string()
             } else {
                 join(prefix, "lm_head.weight")
             };
-            Linear::new(req(head_key)?, None)
+            req(head_key)?
         };
+        let lm_head_device = head_weight.device().clone();
+        let lm_head = Projection::load_eligible(head_weight, None, nvfp4)?;
 
         let qk_norm = cfg.has_qk_norm();
         let num_heads = cfg.num_heads as usize;
@@ -307,7 +357,7 @@ impl CausalLm {
                     lp,
                     &cfg,
                     dtype,
-                    quant,
+                    format,
                     target_device,
                 )?)
             } else {
@@ -334,14 +384,18 @@ impl CausalLm {
                             )));
                         }
                         let qkv = req(packed)?; // [qd + 2*kvd, hidden]
+                        let split = |start: usize, len: usize| -> Result<Projection> {
+                            Projection::load_eligible(
+                                qkv.narrow(0, start, len)?.contiguous()?,
+                                None,
+                                format,
+                            )
+                        };
                         (
-                            Projection::load(qkv.narrow(0, 0, qd)?.contiguous()?, quant)?,
+                            split(0, qd)?,
                             Some(KvProjection::separate(
-                                Projection::load(qkv.narrow(0, qd, kvd)?.contiguous()?, quant)?,
-                                Projection::load(
-                                    qkv.narrow(0, qd + kvd, kvd)?.contiguous()?,
-                                    quant,
-                                )?,
+                                split(qd, kvd)?,
+                                split(qd + kvd, kvd)?,
                             )),
                         )
                     } else {
@@ -445,10 +499,14 @@ impl CausalLm {
                             )));
                         }
                         let gu = req(packed)?; // [2*inter, hidden]
-                        (
-                            Projection::load(gu.narrow(0, 0, inter)?.contiguous()?, quant)?,
-                            Projection::load(gu.narrow(0, inter, inter)?.contiguous()?, quant)?,
-                        )
+                        let split = |start: usize| -> Result<Projection> {
+                            Projection::load_eligible(
+                                gu.narrow(0, start, inter)?.contiguous()?,
+                                None,
+                                format,
+                            )
+                        };
+                        (split(0)?, split(inter)?)
                     } else {
                         (
                             proj(lp("mlp.gate_proj.weight"))?,
@@ -531,12 +589,13 @@ impl CausalLm {
             layers,
             norm,
             lm_head,
+            lm_head_device,
             rope,
             rope_full,
             dtype,
             device,
             layer_devices,
-            quantized: quant.is_some(),
+            quantized: format.is_some(),
             embed_scale: gemma.then(|| (cfg.hidden_size as f64).sqrt()),
             final_softcap: cfg.final_logit_softcap,
             kv_sharing: cfg
@@ -586,6 +645,26 @@ impl CausalLm {
     /// Whether the projections were quantized on load.
     pub fn is_quantized(&self) -> bool {
         self.quantized
+    }
+
+    /// The loaded model's resident weight set (sc-24140): every projection by the kind it actually
+    /// became — attention, MLP, MoE experts and the LM head — plus every other resident weight
+    /// tensor (embeddings, norms, routers, Gemma 4's layer scalars) under `other`. Under an NVFP4
+    /// load a projection whose shape the FP4 GEMM cannot serve is counted under `dense`, never
+    /// under `nvfp4`. A dense tied head *is* the embedding tensor, so its storage is counted once.
+    pub fn weight_census(&self) -> WeightCensus {
+        let mut census = WeightCensus::default();
+        let head_is_embedding =
+            self.cfg.tie_word_embeddings && matches!(self.lm_head, Projection::Dense(_));
+        if !head_is_embedding {
+            census.record_tensor(&self.embed_tokens);
+        }
+        census.projections.record(&self.lm_head);
+        census.record_tensor(&self.norm);
+        for layer in &self.layers {
+            layer.record(&mut census);
+        }
+        census
     }
 
     /// The device the model lives on.
@@ -1302,7 +1381,7 @@ impl CausalLm {
         let normed = rms_norm(h, &self.norm, self.cfg.rms_norm_eps as f64)?;
         // When sharded, the final norm sits on the last shard but the LM head may live elsewhere
         // (tied embeddings stay on the first shard); move the small hidden state to the head's device.
-        let normed = normed.to_device(self.lm_head.weight().device())?;
+        let normed = normed.to_device(&self.lm_head_device)?;
         let logits = self.lm_head.forward(&normed)?;
         // Gemma-2 soft-caps the final logits.
         match self.final_softcap {
@@ -1677,6 +1756,53 @@ struct LayerState<'a> {
 }
 
 impl LlamaLayer {
+    /// Add this layer's projections and weight tensors to a load census.
+    fn record(&self, census: &mut WeightCensus) {
+        for t in [&self.input_ln, &self.post_ln]
+            .into_iter()
+            .chain(self.pre_ff_ln.as_ref())
+            .chain(self.post_ff_ln.as_ref())
+            .chain(self.layer_scalar.as_ref())
+        {
+            census.record_tensor(t);
+        }
+        match &self.attn {
+            Attention::Gqa(a) => {
+                census.projections.record(&a.q);
+                if let Some(kv) = &a.kv {
+                    kv.record(&mut census.projections);
+                }
+                census.projections.record(&a.o);
+                for t in a.q_norm.iter().chain(a.k_norm.iter()) {
+                    census.record_tensor(t);
+                }
+            }
+            Attention::Mla(a) => {
+                for p in [&a.q_proj, &a.q_a_proj, &a.q_b_proj].into_iter().flatten() {
+                    census.projections.record(p);
+                }
+                for p in [&a.kv_a_proj, &a.kv_b_proj, &a.o_proj] {
+                    census.projections.record(p);
+                }
+                for t in a.q_a_layernorm.iter().chain([&a.kv_a_layernorm]) {
+                    census.record_tensor(t);
+                }
+            }
+        }
+        match &self.ffn {
+            Ffn::Dense(m) => m.record(census),
+            Ffn::Moe(m) => {
+                census.record_tensor(&m.router);
+                if let Some(gate) = &m.shared_gate {
+                    census.record_tensor(gate);
+                }
+                for expert in m.experts.iter().chain([&m.shared]) {
+                    expert.record(census);
+                }
+            }
+        }
+    }
+
     fn forward(
         &self,
         x: &Tensor,
@@ -2171,7 +2297,7 @@ impl MlaAttention {
         lp: impl Fn(&str) -> String,
         cfg: &ModelConfig,
         dtype: DType,
-        quant: Option<QuantSpec>,
+        format: Option<&ProjectionFormat>,
         target_device: Option<&Device>,
     ) -> Result<Self> {
         let mla = cfg.mla.ok_or_else(|| {
@@ -2179,7 +2305,7 @@ impl MlaAttention {
         })?;
         let req = |key: String| -> Result<Tensor> { dense_tensor(w, &key, dtype, target_device) };
         let proj = |key: String| -> Result<Projection> {
-            projection_from_weights(w, &key, false, dtype, quant, target_device)
+            projection_from_weights(w, &key, false, dtype, format, target_device)
         };
 
         // Query: a low-rank `q_a → norm → q_b` when the model has a query LoRA, else a full `q_proj`.
@@ -2295,6 +2421,12 @@ struct LlamaMlp {
 }
 
 impl LlamaMlp {
+    fn record(&self, census: &mut WeightCensus) {
+        for p in [&self.gate, &self.up, &self.down] {
+            census.projections.record(p);
+        }
+    }
+
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let g = self.gate.forward(x)?;
         let up = self.up.forward(x)?;
@@ -2417,6 +2549,223 @@ fn join(prefix: &str, suffix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tiny `Qwen3ForCausalLM` (the Qwen3-8B block shape: explicit head_dim, per-head q/k
+    /// RMSNorm, GQA) with `vocab` rows, deterministic weights on `device` (sc-24140).
+    fn tiny_qwen3(vocab: usize, tie: bool, device: &Device) -> (Weights, ModelConfig) {
+        const HIDDEN: usize = 64;
+        const INTER: usize = 96;
+        const HEADS: usize = 4;
+        const KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 16;
+        const LAYERS: usize = 2;
+        let cfg = serde_json::json!({
+            "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3",
+            "hidden_size": HIDDEN, "intermediate_size": INTER, "num_hidden_layers": LAYERS,
+            "num_attention_heads": HEADS, "num_key_value_heads": KV_HEADS, "head_dim": HEAD_DIM,
+            "vocab_size": vocab, "rms_norm_eps": 1e-6, "rope_theta": 1_000_000.0,
+            "max_position_embeddings": 128, "tie_word_embeddings": tie
+        });
+        let mut state = 0x5c24_1400u64 + vocab as u64;
+        let mut rand = |dims: &[usize], scale: f32| -> Tensor {
+            let n: usize = dims.iter().product();
+            let data: Vec<f32> = (0..n)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0) * scale
+                })
+                .collect();
+            Tensor::from_vec(data, dims, device).unwrap()
+        };
+        let mut w = std::collections::HashMap::new();
+        w.insert(
+            "model.embed_tokens.weight".to_string(),
+            rand(&[vocab, HIDDEN], 1.0),
+        );
+        w.insert(
+            "model.norm.weight".to_string(),
+            (rand(&[HIDDEN], 0.1) + 1.0).unwrap(),
+        );
+        if !tie {
+            w.insert("lm_head.weight".to_string(), rand(&[vocab, HIDDEN], 0.2));
+        }
+        let (qd, kvd) = (HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM);
+        for i in 0..LAYERS {
+            let p = |s: &str| format!("model.layers.{i}.{s}");
+            for key in ["input_layernorm.weight", "post_attention_layernorm.weight"] {
+                w.insert(p(key), (rand(&[HIDDEN], 0.1) + 1.0).unwrap());
+            }
+            for key in ["self_attn.q_norm.weight", "self_attn.k_norm.weight"] {
+                w.insert(p(key), (rand(&[HEAD_DIM], 0.1) + 1.0).unwrap());
+            }
+            w.insert(p("self_attn.q_proj.weight"), rand(&[qd, HIDDEN], 0.2));
+            w.insert(p("self_attn.k_proj.weight"), rand(&[kvd, HIDDEN], 0.2));
+            w.insert(p("self_attn.v_proj.weight"), rand(&[kvd, HIDDEN], 0.2));
+            w.insert(p("self_attn.o_proj.weight"), rand(&[HIDDEN, qd], 0.2));
+            w.insert(p("mlp.gate_proj.weight"), rand(&[INTER, HIDDEN], 0.2));
+            w.insert(p("mlp.up_proj.weight"), rand(&[INTER, HIDDEN], 0.2));
+            w.insert(p("mlp.down_proj.weight"), rand(&[HIDDEN, INTER], 0.2));
+        }
+        (
+            Weights::from_map(w, device.clone()),
+            ModelConfig::from_json(&cfg).unwrap(),
+        )
+    }
+
+    /// sc-24140: the llama-family load census names every projection's kind — the 7 attention/MLP
+    /// projections per layer plus the LM head — and every other resident tensor; a dense tied head
+    /// is the embedding and is counted once. GGML Q8 quantizes the layer projections and keeps the
+    /// head dense, exactly as `from_weights_with` always did.
+    #[test]
+    fn weight_census_counts_projections_by_kind_and_every_other_tensor() {
+        let (w, cfg) = tiny_qwen3(40, false, &Device::Cpu);
+        let layers = cfg.num_layers as u64;
+        let dense = CausalLm::from_weights_format(&w, "", cfg.clone(), None).unwrap();
+        let census = dense.weight_census();
+        let untied = census;
+        assert_eq!(census.projections.dense.count, 7 * layers + 1);
+        assert_eq!(census.projections.total().count, 7 * layers + 1);
+        // embed + final norm + (2 layer norms + q/k norm) per layer.
+        assert_eq!(census.other.count, 2 + 4 * layers);
+        let total = census.total();
+        assert_eq!(total.unmeasured, 0);
+        assert_eq!(total.resident_bytes, total.params * 4, "f32 on CPU");
+        let head_params = (cfg.vocab_size * cfg.hidden_size) as u64;
+        assert!(
+            census.other.params >= head_params,
+            "the embedding is resident"
+        );
+
+        let q8 = ProjectionFormat::from(QuantSpec::q8());
+        let quantized = CausalLm::from_weights_format(&w, "", cfg.clone(), Some(&q8)).unwrap();
+        assert!(quantized.is_quantized());
+        let census = quantized.weight_census();
+        assert_eq!(census.projections.ggml.count, 7 * layers);
+        assert_eq!(
+            census.projections.dense.count, 1,
+            "GGML keeps the head dense"
+        );
+        assert_eq!(census.projections.dense.params, head_params);
+        // `from_weights_with` is the same load.
+        let with = CausalLm::from_weights_with(&w, "", cfg, Some(QuantSpec::q8())).unwrap();
+        assert_eq!(with.weight_census(), census);
+
+        let (w, cfg) = tiny_qwen3(40, true, &Device::Cpu);
+        let tied = CausalLm::from_weights_format(&w, "", cfg.clone(), None)
+            .unwrap()
+            .weight_census();
+        assert_eq!(
+            tied.other.count,
+            1 + 4 * layers,
+            "a dense tied head is the embedding"
+        );
+        assert_eq!(tied.projections.dense.count, 7 * layers + 1);
+        assert_eq!(
+            tied.total().params + head_params,
+            untied.total().params,
+            "the tied head's storage is counted once"
+        );
+    }
+
+    /// sc-24140 (epic AT2 / E0): an NVFP4 load of the llama family stores every attention and MLP
+    /// projection **and the LM head** as NVFP4 through the shared loader, keeps a projection whose
+    /// shape the FP4 GEMM cannot serve (a 40-row head: `N % 16 != 0`) dense — visible under
+    /// `dense` in the census, never under `nvfp4` — refuses to repack an MLX affine triple, and
+    /// the decoder's logits track the dense model's.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn nvfp4_format_loads_every_eligible_projection_and_the_head_as_nvfp4() {
+        use crate::primitives::projection::ProjectionKind;
+        let Ok(device) = Device::new_cuda(0) else {
+            candle_quant_kernels::skip_without_sm120("no CUDA device");
+            return;
+        };
+        let Ok(format) = ProjectionFormat::nvfp4(&device) else {
+            candle_quant_kernels::skip_without_sm120("CUDA device below the NVFP4 floor");
+            return;
+        };
+        let (w, cfg) = tiny_qwen3(64, false, &device);
+        let layers = cfg.num_layers as u64;
+        let dense = CausalLm::from_weights_format(&w, "", cfg.clone(), None).unwrap();
+        let nvfp4 = CausalLm::from_weights_format(&w, "", cfg.clone(), Some(&format)).unwrap();
+        assert!(nvfp4.is_quantized());
+        assert_eq!(nvfp4.lm_head.kind(), ProjectionKind::Nvfp4);
+        let census = nvfp4.weight_census();
+        assert_eq!(census.projections.nvfp4.count, 7 * layers + 1);
+        assert_eq!(census.projections.dense.count, 0);
+        assert_eq!(census.projections.ggml.count, 0);
+        let bits = census.projections.nvfp4.bits_per_param().unwrap();
+        assert!(
+            bits < 8.0,
+            "NVFP4 projections are ~4.5 bits/param, got {bits}"
+        );
+
+        let prompt = [1i32, 5, 9, 2, 33, 17];
+        let ids = crate::primitives::input_ids(&prompt, &device).unwrap();
+        let row = |m: &CausalLm| -> Vec<f32> {
+            let mut cache = m.new_cache();
+            m.decode_logits(&ids, &mut cache, 0)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let (want, got) = (row(&dense), row(&nvfp4));
+        assert!(got.iter().all(|v| v.is_finite()));
+        let num: f32 = got.iter().zip(&want).map(|(g, w)| (g - w).powi(2)).sum();
+        let den: f32 = want.iter().map(|w| w.powi(2)).sum();
+        let rel = (num / den.max(1e-30)).sqrt();
+        assert!(rel < 0.35, "NVFP4 logits must track dense: rel-RMS {rel}");
+
+        // A 40-row head cannot be served by the FP4 GEMM: it stays dense and says so.
+        let (w, cfg) = tiny_qwen3(40, false, &device);
+        let odd = CausalLm::from_weights_format(&w, "", cfg.clone(), Some(&format)).unwrap();
+        assert_eq!(odd.lm_head.kind(), ProjectionKind::Dense);
+        let census = odd.weight_census();
+        assert_eq!(census.projections.nvfp4.count, 7 * layers);
+        assert_eq!(census.projections.dense.count, 1);
+        assert_eq!(
+            census.projections.dense.params,
+            (cfg.vocab_size * cfg.hidden_size) as u64
+        );
+
+        // An MLX affine triple is already quantized: NVFP4 refuses it by name.
+        let mut packed: std::collections::HashMap<String, Tensor> = w
+            .keys()
+            .map(|k| (k.to_string(), w.require(k).unwrap().clone()))
+            .collect();
+        let stem = "model.layers.0.mlp.up_proj";
+        packed.insert(
+            format!("{stem}.weight"),
+            Tensor::zeros((96, 16), DType::U32, &device).unwrap(),
+        );
+        packed.insert(
+            format!("{stem}.scales"),
+            Tensor::zeros((96, 1), DType::BF16, &device).unwrap(),
+        );
+        packed.insert(
+            format!("{stem}.biases"),
+            Tensor::zeros((96, 1), DType::BF16, &device).unwrap(),
+        );
+        match CausalLm::from_weights_format(
+            &Weights::from_map(packed, device.clone()),
+            "",
+            cfg,
+            Some(&format),
+        ) {
+            Err(Error::Unsupported(msg)) => {
+                assert!(msg.starts_with("nvfp4: "), "{msg}");
+                assert!(msg.contains(stem), "names the projection: {msg}");
+            }
+            Err(other) => panic!("expected the typed refusal, got {other}"),
+            Ok(_) => panic!("an MLX affine triple loaded under NVFP4"),
+        }
+    }
 
     #[test]
     fn join_handles_empty_prefix() {

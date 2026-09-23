@@ -361,6 +361,27 @@ impl Projection {
         }
     }
 
+    /// [`Self::load_as`] with the llama-family shape policy (sc-24140): under an NVFP4 `format`, a
+    /// weight whose shape the FP4 GEMM cannot serve ([`nvfp4_shape_refusal`] — `N % 16 != 0`, or
+    /// too large for the fused quantizer) stays **dense** instead of refusing the load, so a
+    /// checkpoint with one odd projection (a vocabulary that is not a multiple of 16, say) still
+    /// loads with every eligible projection NVFP4. The kept projection reports
+    /// [`ProjectionKind::Dense`], so the load census shows it under `dense` — never under an NVFP4
+    /// label. Every other format (and every eligible shape) behaves exactly as `load_as`.
+    pub fn load_eligible(
+        weight: Tensor,
+        bias: Option<Tensor>,
+        format: Option<&ProjectionFormat>,
+    ) -> Result<Self> {
+        if let Some(ProjectionFormat::Nvfp4(_)) = format {
+            let (rows, cols) = weight.dims2()?;
+            if nvfp4_shape_refusal(rows, cols).is_err() {
+                return Self::load_with_bias(weight, bias, None);
+            }
+        }
+        Self::load_as(weight, bias, format)
+    }
+
     /// Wrap a resident compact Prism weight. Prism projections do not carry an additive bias.
     pub fn load_prism(weight: std::sync::Arc<PrismPackedWeight>) -> Self {
         Self::Prism(weight)
@@ -617,7 +638,7 @@ mod tests {
     #[test]
     fn nvfp4_forward_matches_the_dequantize_then_matmul_reference() {
         let Some((device, format)) = nvfp4_format() else {
-            eprintln!("skipping: no sm_120 CUDA device");
+            candle_quant_kernels::skip_without_sm120("no sm_120 CUDA device");
             return;
         };
         let (n, k) = (96usize, 80usize); // K=80 pads to 96 at quantization
@@ -742,7 +763,7 @@ mod tests {
     #[test]
     fn an_ineligible_shape_is_refused_not_kept_dense() {
         let Some((device, format)) = nvfp4_format() else {
-            eprintln!("skipping: no sm_120 CUDA device");
+            candle_quant_kernels::skip_without_sm120("no sm_120 CUDA device");
             return;
         };
         let w = ramp(50, 32, 7, &device);

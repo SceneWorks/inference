@@ -3467,11 +3467,11 @@ pub(crate) mod tests {
     fn nvfp4_format_loads_the_large_projections_as_nvfp4() {
         use crate::primitives::projection::{ProjectionFormat, ProjectionKind};
         let Ok(device) = Device::new_cuda(0) else {
-            eprintln!("skipping: no CUDA device");
+            candle_quant_kernels::skip_without_sm120("no CUDA device");
             return;
         };
         let Ok(format) = ProjectionFormat::nvfp4(&device) else {
-            eprintln!("skipping: CUDA device below the NVFP4 floor");
+            candle_quant_kernels::skip_without_sm120("CUDA device below the NVFP4 floor");
             return;
         };
         // The fixture's vocabulary (50) is not a multiple of 16; NVFP4 needs N % 16 == 0.

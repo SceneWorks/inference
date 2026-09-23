@@ -31,6 +31,19 @@
 //!
 //! `BONSAI_QWEN38_SNAPSHOT` is the manifest's own environment name for this model
 //! (`release/real-weight-models.toml`); it is a passed-in path, never derived.
+//!
+//! **The llama family (sc-24140).** The knife-edge helpers are generic over [`StepModel`], and
+//! `llama_family_qwen3_8b_exact_rows_and_ngram_knife_edge_gate` holds Qwen3-8B (a `CausalLm`,
+//! `QWEN3_8B_SNAPSHOT`, ~16 GB bf16) to the same 256-token fixture: the static step seam, the
+//! fused-off loops and the CUDA-graph runner's fallback are **token-identical** to the reference
+//! loop, and every n-gram row's first divergence, if any, is one of the reference's enumerated
+//! knife-edge positions:
+//!
+//! ```text
+//! QWEN3_8B_SNAPSHOT=E:\...\models--Qwen--Qwen3-8B\snapshots\b968826d9c46dd6066d109eabc6255188de91218 \
+//!   cargo test --release --features cuda -p candle-llm --test speculative_engine_parity \
+//!   llama_family -- --ignored --nocapture
+//! ```
 
 mod common;
 
@@ -40,7 +53,7 @@ use candle_llm::decode::{
     MtpProposer, NgramProposer, Proposer, SpeculativePrompt, StepModel, StepRequest, StepTokens,
 };
 use candle_llm::device::select_device;
-use candle_llm::models::Qwen35Model;
+use candle_llm::models::{CausalLm, Qwen35Model};
 use candle_llm::primitives::sampler::{argmax_device, argmax_rows_device};
 use candle_llm::primitives::{
     causal_depthwise_conv, gated_delta_recurrence, input_ids, rms_norm, sdpa_gqa_causal,
@@ -49,6 +62,8 @@ use candle_llm::primitives::{
 use core_llm::ProposerKind;
 
 const SNAPSHOT_VAR: &str = "BONSAI_QWEN38_SNAPSHOT";
+/// The manifest's environment name for the llama-family real-weight model (sc-24138 / sc-24140).
+const QWEN3_8B_VAR: &str = "QWEN3_8B_SNAPSHOT";
 const FIXTURE_TOKENS: usize = 256;
 const PROMPT: &str = "Write a detailed, multi-paragraph explanation of how transformer language \
     models generate text. Cover tokenization, self-attention, the key/value cache, and greedy \
@@ -102,16 +117,18 @@ fn top2(row: &[f32]) -> (usize, f32) {
 }
 
 /// The single-token path's `(argmax, top-2 gap, bf16 ULP of the top logit)` at every position of
-/// the reference fixture, walked on a growing cache. A position whose gap is within one ULP is a
-/// **knife-edge**: a tie the last bit of a differently-rounded GEMM can flip. The device argmax
-/// (the sampler's own pick, which the fixture was produced with) is checked against the fixture;
-/// the host top-2 scan breaks exact ties by lowest index, which the device kernel need not.
-fn single_token_gaps(
-    model: &Qwen35Model,
+/// the reference fixture, walked on `cache` (fresh; the Qwen3.5 hybrid's growing cache, a
+/// `CausalLm`'s static step cache — any [`StepModel`], sc-24140). A position whose gap is within
+/// one ULP is a **knife-edge**: a tie the last bit of a differently-rounded GEMM can flip. The
+/// device argmax (the sampler's own pick, which the fixture was produced with) is checked against
+/// the fixture; the host top-2 scan breaks exact ties by lowest index, which the device kernel
+/// need not.
+fn single_token_gaps<M: StepModel>(
+    model: &M,
+    mut cache: M::Cache,
     prompt: &[i32],
     reference: &[i32],
 ) -> Vec<(i32, f32, f32)> {
-    let mut cache = model.new_cache_with_checkpoints(0);
     let mut logits = model
         .forward_step(&mut cache, StepRequest::last(prompt))
         .unwrap()
@@ -191,7 +208,12 @@ fn ac1_ac2_engine_greedy_fixture_rows_against_speculative_off() {
     let mtp = mtp.expect("the frozen Qwen3.8 snapshot carries a complete MTP head");
     let prompt = common::qwen35::render_chat_prompt(&snapshot, PROMPT);
     let reference = fixture_reference(&model, &prompt);
-    let gaps = single_token_gaps(&model, &prompt, &reference);
+    let gaps = single_token_gaps(
+        &model,
+        model.new_cache_with_checkpoints(0),
+        &prompt,
+        &reference,
+    );
     let edges = knife_edges(&gaps);
     eprintln!(
         "[ac1] reference knife-edge positions (top-2 gap <= 1 bf16 ULP of the top logit): {:?}",
@@ -264,10 +286,7 @@ fn ac1_ac2_engine_greedy_fixture_rows_against_speculative_off() {
             gap / ulp
         );
     }
-    let off_edge: Vec<&&(String, Option<usize>)> = diverged
-        .iter()
-        .filter(|(_, d)| !edges.iter().any(|(pos, _, _)| Some(*pos) == *d))
-        .collect();
+    let off_edge = off_edge_divergences(&rows, &edges);
     assert!(
         off_edge.is_empty(),
         "AC1 gate: rows diverged from speculative-off at a position that is not a reference \
@@ -292,7 +311,12 @@ fn teacher_forced_verify_shaped_forward_vs_single_token_knife_edge_gate() {
     let reference = fixture_reference(&model, &prompt);
     let mut sequence = prompt.clone();
     sequence.extend(&reference);
-    let gaps = single_token_gaps(&model, &prompt, &reference);
+    let gaps = single_token_gaps(
+        &model,
+        model.new_cache_with_checkpoints(0),
+        &prompt,
+        &reference,
+    );
     let edges = knife_edges(&gaps);
     eprintln!(
         "[teacher-forced] reference knife-edge positions (top-2 gap <= 1 bf16 ULP): {edges:?}"
@@ -374,6 +398,224 @@ fn teacher_forced_verify_shaped_forward_vs_single_token_knife_edge_gate() {
     assert_eq!(
         violations, 0,
         "a verify-shaped forward changed the argmax at a position that was not a bf16 knife-edge"
+    );
+}
+
+/// The positions of `rows` whose first divergence from the reference is **not** an enumerated
+/// knife-edge — the AC1 gate's violations (empty = the gate holds).
+fn off_edge_divergences<'a>(
+    rows: &'a [(String, Option<usize>)],
+    edges: &[(usize, f32, f32)],
+) -> Vec<&'a (String, Option<usize>)> {
+    rows.iter()
+        .filter(|(_, d)| d.is_some_and(|pos| !edges.iter().any(|(edge, _, _)| *edge == pos)))
+        .collect()
+}
+
+#[test]
+fn the_knife_edge_gate_excuses_only_enumerated_positions() {
+    // Gaps (argmax, gap, ulp): positions 1 and 3 are knife-edges (gap <= 1 ULP).
+    let gaps = [
+        (5, 0.5, 0.0625),
+        (6, 0.0625, 0.0625),
+        (7, 0.25, 0.0625),
+        (8, 0.0, 0.0625),
+    ];
+    let edges = knife_edges(&gaps);
+    assert_eq!(
+        edges.iter().map(|(p, _, _)| *p).collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+    let rows = vec![
+        ("identical".to_string(), None),
+        ("at an edge".to_string(), Some(3)),
+        ("off an edge".to_string(), Some(2)),
+    ];
+    let off = off_edge_divergences(&rows, &edges);
+    assert_eq!(off.len(), 1);
+    assert_eq!(off[0].0, "off an edge");
+    assert!(off_edge_divergences(&rows[..2], &edges).is_empty());
+}
+
+/// The Qwen3-8B `CausalLm` (bf16, the model default: `Gqa` reference arithmetic, static step
+/// cache).
+fn load_qwen3_8b(snapshot: &std::path::Path, device: &Device) -> CausalLm {
+    let cfg = candle_llm::config::ModelConfig::from_dir(snapshot).expect("config.json");
+    assert!(
+        !cfg.architecture.is_mla() && cfg.moe.is_none(),
+        "the llama-family gate runs a dense GQA decoder"
+    );
+    let weights = Weights::from_dir(snapshot, device).expect("load weights");
+    CausalLm::from_weights_format(&weights, "", cfg, None).expect("build model")
+}
+
+/// The `CausalLm` reference loop (E2): a `decode_logits` prefill on the model's own growing cache,
+/// then the shared token-at-a-time `Decode` loop.
+fn causal_reference_tokens(model: &CausalLm, prompt: &[i32], device: &Device) -> Vec<i32> {
+    let mut cache = model.new_cache();
+    let first = model
+        .decode_logits(&input_ids(prompt, device).unwrap(), &mut cache, 0)
+        .unwrap();
+    candle_llm::decode::generate_from_prefill(
+        model,
+        &mut cache,
+        first,
+        prompt.to_vec(),
+        &greedy(FIXTURE_TOKENS),
+        &CancelFlag::new(),
+        &mut |_| {},
+        None,
+    )
+    .unwrap()
+    .tokens
+}
+
+/// sc-24140 (epic AT3 / E1 on the llama family). Qwen3-8B, the 256-token greedy fixture:
+///
+/// * **exact** (token-identical to the reference loop): the static step seam; the reference loop
+///   and the static step seam with the fused primitives switched off; and the CUDA-graph runner
+///   with the switch on — which a `CausalLm` step refuses (`positions_host_scalar`), so every step
+///   runs eager through the runner's fallback, recorded with that reason;
+/// * **knife-edge gate**: the n-gram rows (K = 2, 3, 4 — the sc-24138 comparison rows that
+///   diverged at @65, @51, @132) diverge, if at all, only at an enumerated reference knife-edge
+///   (top-2 gap ≤ 1 bf16 ULP of the top logit on the single-token static path), with exactly one
+///   host sync per verify step.
+#[test]
+#[ignore = "needs the Qwen3-8B snapshot via QWEN3_8B_SNAPSHOT and a GPU (~16 GB)"]
+fn llama_family_qwen3_8b_exact_rows_and_ngram_knife_edge_gate() {
+    use candle_llm::decode::graph::{cuda_graphs_policy_guard, graph_tally, GraphRunner};
+    use candle_llm::primitives::fused_policy_guard;
+
+    let snapshot = common::qwen35::snapshot_from_env(QWEN3_8B_VAR)
+        .unwrap_or_else(|| panic!("set {QWEN3_8B_VAR}"));
+    let device = select_device().unwrap();
+    let model = load_qwen3_8b(&snapshot, &device);
+    let prompt = common::qwen35::render_chat_prompt(&snapshot, PROMPT);
+    let reference = causal_reference_tokens(&model, &prompt, &device);
+    assert_eq!(reference.len(), FIXTURE_TOKENS);
+    let static_cache = || {
+        model
+            .new_static_cache(prompt.len() + FIXTURE_TOKENS + 8)
+            .unwrap()
+    };
+    let gaps = single_token_gaps(&model, static_cache(), &prompt, &reference);
+    let edges = knife_edges(&gaps);
+    eprintln!(
+        "[llama] Qwen3-8B reference: {} prompt tokens, {FIXTURE_TOKENS} generated; knife-edge \
+         positions (top-2 gap <= 1 bf16 ULP of the top logit): {edges:?}",
+        prompt.len()
+    );
+
+    // The exact rows.
+    let step = |m: &dyn StepModel<Cache = candle_llm::primitives::StepKvCache>| {
+        generate_step(
+            m,
+            &prompt,
+            &greedy(FIXTURE_TOKENS),
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+        )
+        .unwrap()
+    };
+    let (static_out, static_record) = step(&model);
+    assert_eq!(static_record.kv_cache, KvCacheKind::Static);
+    let mut exact: Vec<(&str, Option<usize>)> = vec![(
+        "static step seam",
+        first_divergence(&reference, &static_out.tokens),
+    )];
+    {
+        let _off = fused_policy_guard(Some(false));
+        exact.push((
+            "reference loop, fused off",
+            first_divergence(
+                &reference,
+                &causal_reference_tokens(&model, &prompt, &device),
+            ),
+        ));
+        exact.push((
+            "static step seam, fused off",
+            first_divergence(&reference, &step(&model).0.tokens),
+        ));
+    }
+    let graphs = {
+        let _on = cuda_graphs_policy_guard(Some(true));
+        let runner = GraphRunner::new(&model);
+        let before = graph_tally();
+        let (out, _) = step(&runner);
+        exact.push((
+            "graph runner (switch on)",
+            first_divergence(&reference, &out.tokens),
+        ));
+        graph_tally().since(&before)
+    };
+    eprintln!(
+        "[llama] graph runner: {} replayed / {} eager, {} captured, fallback {:?}",
+        graphs.replayed, graphs.eager, graphs.captured, graphs.fallback_reason
+    );
+    for (row, d) in &exact {
+        eprintln!("[llama] exact row {row}: first divergence {d:?}");
+    }
+    assert!(
+        exact.iter().all(|(_, d)| d.is_none()),
+        "exact rows must be token-identical to the reference loop: {exact:?}"
+    );
+    assert_eq!(graphs.replayed, 0, "a CausalLm step is not replayable");
+    assert_eq!(graphs.fallback_reason, Some("positions_host_scalar"));
+
+    // The n-gram rows against the enumerated knife-edges.
+    let mut rows: Vec<(String, Option<usize>)> = Vec::new();
+    for k in [2usize, 3, 4] {
+        let mut proposer = NgramProposer { max_ngram: 3 };
+        let run = generate_speculative(
+            &model,
+            &mut proposer,
+            SpeculativePrompt::Tokens(&prompt),
+            &greedy(FIXTURE_TOKENS),
+            k,
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+        )
+        .unwrap();
+        let divergence = first_divergence(&reference, &run.output.tokens);
+        let record = run.record;
+        eprintln!(
+            "[llama] ngram K={k}: divergence {divergence:?} acceptance {:.3} proposed {} \
+             syncs/verify {:?} kv {} proposer {}",
+            record.acceptance_rate().unwrap_or(0.0),
+            record.proposed_tokens,
+            record.host_syncs_per_verify_step(),
+            record.kv_cache.label(),
+            record.proposer.label(),
+        );
+        assert_eq!(record.path, DecodePath::PromptLookup);
+        assert_eq!(record.proposer, ProposerKind::Ngram);
+        assert_eq!(run.output.tokens.len(), FIXTURE_TOKENS);
+        assert_eq!(
+            record.host_syncs_per_verify_step(),
+            Some(1.0),
+            "AC2 ngram K={k}"
+        );
+        if let Some(pos) = divergence {
+            let (_, gap, ulp) = gaps[pos];
+            eprintln!(
+                "[llama] ngram K={k}: first divergence at {pos}: reference top-2 gap {gap} = \
+                 {:.2} bf16 ULP of its top logit",
+                gap / ulp
+            );
+        }
+        rows.push((format!("ngram K={k}"), divergence));
+    }
+    let off_edge = off_edge_divergences(&rows, &edges);
+    assert!(
+        off_edge.is_empty(),
+        "knife-edge gate: n-gram rows diverged from the reference at a position that is not an \
+         enumerated knife-edge: {off_edge:?} (knife-edges {edges:?})"
+    );
+    eprintln!(
+        "[llama] gate holds: exact rows identical over {FIXTURE_TOKENS} tokens; n-gram divergences \
+         {rows:?} are all enumerated knife-edges"
     );
 }
 

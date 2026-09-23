@@ -508,7 +508,7 @@ mod cuda_tests {
     #[test]
     fn gemv_matches_the_dequant_reference_on_edge_shapes() {
         let Some((device, ctx)) = nvfp4_device() else {
-            eprintln!("skipping: no sm_120 CUDA device");
+            crate::skip_without_sm120("no sm_120 CUDA device");
             return;
         };
         for (n, k) in [(16, 17), (96, 80), (32, 1000), (48, 2049), (272, 512)] {
@@ -532,7 +532,7 @@ mod cuda_tests {
     #[test]
     fn gemv_serves_rank3_views_and_bias() {
         let Some((device, ctx)) = nvfp4_device() else {
-            eprintln!("skipping: no sm_120 CUDA device");
+            crate::skip_without_sm120("no sm_120 CUDA device");
             return;
         };
         let (n, k) = (64, 256);
@@ -574,7 +574,7 @@ mod cuda_tests {
     #[test]
     fn refusals_are_typed() {
         let Some((device, ctx)) = nvfp4_device() else {
-            eprintln!("skipping: no sm_120 CUDA device");
+            crate::skip_without_sm120("no sm_120 CUDA device");
             return;
         };
         let w = Nvfp4Weight::quantize(&bf16(&[32, 64], 5, 0.5, &device), None, &ctx).unwrap();
@@ -617,7 +617,7 @@ mod cuda_tests {
     #[test]
     fn gemv_compiles_once_through_the_seam() {
         let Some((device, ctx)) = nvfp4_device() else {
-            eprintln!("skipping: no sm_120 CUDA device");
+            crate::skip_without_sm120("no sm_120 CUDA device");
             return;
         };
         let Device::Cuda(dev) = &device else {
@@ -644,7 +644,7 @@ mod cuda_tests {
     #[test]
     fn gemv_is_closer_to_the_dense_product_than_w4a4() {
         let Some((device, ctx)) = nvfp4_device() else {
-            eprintln!("skipping: no sm_120 CUDA device");
+            crate::skip_without_sm120("no sm_120 CUDA device");
             return;
         };
         let (n, k) = (256, 1024);

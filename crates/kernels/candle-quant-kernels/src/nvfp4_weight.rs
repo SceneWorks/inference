@@ -511,7 +511,7 @@ mod tests {
     #[test]
     fn load_time_quantization_matches_the_cpu_packer_byte_for_byte() -> Result<()> {
         let Some((device, ctx)) = nvfp4_device() else {
-            eprintln!("skipping: no sm_120 CUDA device");
+            crate::skip_without_sm120("no sm_120 CUDA device");
             return Ok(());
         };
         let (rows, cols) = (256, 256);
@@ -534,7 +534,7 @@ mod tests {
     #[test]
     fn the_fused_quantizer_compiles_once_per_device_through_the_seam() {
         let Some((device, _ctx)) = nvfp4_device() else {
-            eprintln!("skipping: no sm_120 CUDA device");
+            crate::skip_without_sm120("no sm_120 CUDA device");
             return;
         };
         let Device::Cuda(cuda) = &device else {
@@ -557,7 +557,7 @@ mod tests {
     fn load_time_quantization_of_an_unaligned_k_matches_the_packer_on_the_padded_input(
     ) -> Result<()> {
         let Some((device, ctx)) = nvfp4_device() else {
-            eprintln!("skipping: no sm_120 CUDA device");
+            crate::skip_without_sm120("no sm_120 CUDA device");
             return Ok(());
         };
         let (rows, cols, cols_padded) = (96, 80, 96);
@@ -589,7 +589,7 @@ mod tests {
     #[test]
     fn a_row_narrowed_f32_view_quantizes_its_own_rows() -> Result<()> {
         let Some((device, ctx)) = nvfp4_device() else {
-            eprintln!("skipping: no sm_120 CUDA device");
+            crate::skip_without_sm120("no sm_120 CUDA device");
             return Ok(());
         };
         let full = Tensor::from_vec(ramp(64, 64, 0xA11C_E5EE_D000_0002), (64, 64), &device)?;

@@ -220,7 +220,7 @@ fn compare(
 fn gemv_matches_the_dequant_reference_on_every_qwen38_27b_projection_shape() {
     let _guard = lock();
     let Some((device, format)) = nvfp4() else {
-        eprintln!("skipping: no sm_120 CUDA device");
+        candle_quant_kernels::skip_without_sm120("no sm_120 CUDA device");
         return;
     };
     device.set_seed(24_136).unwrap();
@@ -349,7 +349,7 @@ fn gemv_matches_the_dequant_reference_on_every_qwen38_27b_projection_shape() {
 fn dispatch_takes_the_gemv_for_decode_rows_and_cublaslt_otherwise_visibly() {
     let _guard = lock();
     let Some((device, format)) = nvfp4() else {
-        eprintln!("skipping: no sm_120 CUDA device");
+        candle_quant_kernels::skip_without_sm120("no sm_120 CUDA device");
         return;
     };
     let (n, k) = (256, 512);
@@ -411,7 +411,7 @@ fn dispatch_takes_the_gemv_for_decode_rows_and_cublaslt_otherwise_visibly() {
 fn gemv_compiles_once_per_device_through_the_seam() {
     let _guard = lock();
     let Some((device, format)) = nvfp4() else {
-        eprintln!("skipping: no sm_120 CUDA device");
+        candle_quant_kernels::skip_without_sm120("no sm_120 CUDA device");
         return;
     };
     let Device::Cuda(dev) = &device else {

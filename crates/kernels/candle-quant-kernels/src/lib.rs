@@ -27,6 +27,9 @@
 //!   decode-sized alternative to the W4A4 cuBLASLt forward, with a typed refusal for everything
 //!   else so the caller falls back to cuBLASLt visibly.
 //!
+//! - [`sm120_gate`] — the sm_120 test gate (sc-24140): a GPU test's "no sm_120 device" skip, which
+//!   `REQUIRE_SM120=1` turns into a hard failure so an acceptance run proves the tests executed.
+//!
 //! Device code is behind `cfg(feature = "cuda")`; a CPU or Metal build compiles the codec, the
 //! capability floors, the kernel descriptors and the fused primitives' input checks only.
 
@@ -38,6 +41,7 @@ pub mod nvfp4_linear;
 pub mod nvfp4_outlier;
 pub mod nvfp4_weight;
 pub mod nvrtc;
+pub mod sm120_gate;
 
 pub use cublaslt::{
     compute_cap_meets_fp8_floor, compute_cap_meets_nvfp4_floor, quantize_activation_fp8,
@@ -72,6 +76,7 @@ pub use nvfp4_weight::{
 #[cfg(feature = "cuda")]
 pub use nvrtc::{device_compute_cap, CompiledKernel};
 pub use nvrtc::{nvrtc_arch_for, KernelCompileError, KernelSource};
+pub use sm120_gate::{skip_without_sm120, sm120_required, REQUIRE_SM120_ENV};
 
 /// Poison-tolerant `Mutex` lock for the handle's overwrite-on-miss caches — the same recovery
 /// `candle_gen::lock_recover` documents (sc-9015): every cache on [`cublaslt::CublasLt`] is a
