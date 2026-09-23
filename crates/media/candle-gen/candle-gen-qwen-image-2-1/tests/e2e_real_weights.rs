@@ -6,12 +6,15 @@
 //!
 //! The gate is `any(cuda, metal)` rather than `cuda` alone so the macOS candle lane type-checks
 //! this file too (`cargo check --features metal --all-targets`); CUDA is the lane the render is
-//! meant for, and neither is reachable in ordinary CI — no runner provisions the 32 GB snapshot
-//! (`release/real-weight-models.toml` records the key as deliberately unwired).
+//! meant for. Ordinary CI never reaches it: the dispatch-only `qwen-image-2-1` profile of
+//! `.github/workflows/real-weights.yml` (sc-24114) provisions both pinned snapshots on the Windows
+//! CUDA runner, runs every test in this file and uploads the PNGs, alpha reports and logs as the
+//! `qwen-image-2-1-cuda-evidence` artifact.
 //!
 //! Loads the released bf16 weights through the explicit catalog's production load path and renders
 //! one image at the upstream default preset (1:1 2048×2048, 40 steps, seed 42, no guidance),
-//! writing the raw RGB8 bytes to `QWEN_IMAGE_2_1_RENDER_OUT` (default: the current directory). It
+//! writing the raw RGB8 bytes and a PNG of them to `QWEN_IMAGE_2_1_RENDER_OUT` (default: the
+//! current directory). It
 //! also pins the released tokenizer's system-prefix drop count (14) — the one claim that needs only
 //! the snapshot's `processor/`, not the GPU.
 //!
@@ -34,6 +37,20 @@ use candle_gen::gen_core::{
     GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
 };
 use candle_gen_qwen_image_2_1::{load_tokenizer, system_prompt_drop_count, PRESETS};
+
+/// Write `pixels` (RGB8 or RGBA8, per `color`) as a PNG beside the raw bytes, so the evidence
+/// artifact carries something a reviewer can open without knowing the geometry (sc-24114).
+fn save_png(
+    path: &std::path::Path,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    color: image::ColorType,
+) {
+    image::save_buffer(path, pixels, width, height, color)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    eprintln!("wrote {}", path.display());
+}
 
 fn snapshot() -> PathBuf {
     let p = std::env::var("CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT").unwrap_or_else(|_| {
@@ -107,6 +124,13 @@ fn validation_render_default_preset() {
         "qwen_image_2_1_candle_{width}x{height}_{steps}steps_seed42.rgb"
     ));
     std::fs::write(&path, &image.pixels).unwrap();
+    save_png(
+        &path.with_extension("png"),
+        &image.pixels,
+        width,
+        height,
+        image::ColorType::Rgb8,
+    );
     eprintln!(
         "wrote {} ({width}x{height} RGB8) after {:.1}s total ({:.1}s render)",
         path.display(),
@@ -256,6 +280,13 @@ fn validation_render_reference_edit() {
             "qwen_image_2_1_candle_edit_{count}refs_{width}x{height}_{steps}steps_seed42.rgb"
         ));
         std::fs::write(&path, &image.pixels).unwrap();
+        save_png(
+            &path.with_extension("png"),
+            &image.pixels,
+            width,
+            height,
+            image::ColorType::Rgb8,
+        );
         eprintln!(
             "wrote {} ({width}x{height} RGB8) after {:.1}s render",
             path.display(),
@@ -278,4 +309,332 @@ fn validation_render_reference_edit() {
         .expect("eleven references must be refused");
     eprintln!("eleven references: {err}");
     assert!(err.contains("at most 10"), "{err}");
+}
+
+/// A **transparent** RGBA reference of `width`×`height`: the same deterministic picture
+/// [`synthetic_reference`] produces, matted onto a soft-edged disc so the alpha is a real ramp
+/// rather than a binary cut-out (a hard matte would survive any resampling order and so could not
+/// exercise the premultiplied resize). The candle twin of the MLX smoke's reference (sc-24111).
+///
+/// Set `QWEN_IMAGE_2_1_RGBA_REF` to a PNG with an alpha channel to extract from a real image
+/// instead; reference images for a real evaluation are user-provided.
+fn transparent_reference(width: u32, height: u32) -> candle_gen::gen_core::RgbaImage {
+    if let Ok(path) = std::env::var("QWEN_IMAGE_2_1_RGBA_REF") {
+        let rgba = image::open(&path)
+            .unwrap_or_else(|e| panic!("QWEN_IMAGE_2_1_RGBA_REF={path}: {e}"))
+            .to_rgba8();
+        return candle_gen::gen_core::RgbaImage {
+            width: rgba.width(),
+            height: rgba.height(),
+            pixels: rgba.into_raw(),
+        };
+    }
+    let rgb = synthetic_reference(1, width, height);
+    let mut out = candle_gen::gen_core::RgbaImage::from_rgb(&rgb).unwrap();
+    let (cx, cy) = ((width - 1) as f32 / 2.0, (height - 1) as f32 / 2.0);
+    let radius = width.min(height) as f32 * 0.36;
+    for (i, px) in out.pixels.chunks_exact_mut(4).enumerate() {
+        let (x, y) = ((i as u32 % width) as f32, (i as u32 / width) as f32);
+        let dist = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
+        // A 3-px linear ramp at the disc boundary: opaque inside, transparent outside.
+        px[3] = (((radius + 1.5 - dist) / 3.0).clamp(0.0, 1.0) * 255.0).round() as u8;
+    }
+    out
+}
+
+/// The alpha histogram claim the transparency smoke exists to make — the same three conditions as
+/// the MLX twin's: the alpha is not constant; at least 2 % of pixels are substantially transparent
+/// (`A < 128`) **and** at least 2 % substantially opaque (`A > 200`); and compositing over white
+/// moves at least 2 % of pixels. "Four channels came back" is not evidence of transparency — a
+/// port that widened an RGB decode with a constant `A = 255` would satisfy it. The full 16-bucket
+/// histogram is printed and written beside the PNG.
+fn assert_nontrivial_alpha(
+    label: &str,
+    image: &candle_gen::gen_core::RgbaImage,
+    out_dir: &std::path::Path,
+) {
+    let alpha: Vec<u8> = image.pixels.chunks_exact(4).map(|px| px[3]).collect();
+    let total = alpha.len();
+    assert!(total > 0, "{label}: empty image");
+
+    let mut histogram = [0usize; 16];
+    for &a in &alpha {
+        histogram[(a as usize) / 16] += 1;
+    }
+    let (min, max) = (*alpha.iter().min().unwrap(), *alpha.iter().max().unwrap());
+    let transparent = alpha.iter().filter(|&&a| a < 128).count();
+    let opaque = alpha.iter().filter(|&&a| a > 200).count();
+
+    let flattened = image.to_rgb_over_white().unwrap();
+    let raw: Vec<u8> = image
+        .pixels
+        .chunks_exact(4)
+        .flat_map(|px| px[..3].to_vec())
+        .collect();
+    let moved = flattened
+        .pixels
+        .chunks_exact(3)
+        .zip(raw.chunks_exact(3))
+        .filter(|(a, b)| a != b)
+        .count();
+
+    let report = format!(
+        "{label}: alpha min={min} max={max} \
+         transparent(<128)={transparent}/{total} ({:.1}%) \
+         opaque(>200)={opaque}/{total} ({:.1}%) \
+         composite-moved={moved}/{total} ({:.1}%)\nhistogram(16 buckets)={histogram:?}\n",
+        100.0 * transparent as f32 / total as f32,
+        100.0 * opaque as f32 / total as f32,
+        100.0 * moved as f32 / total as f32,
+    );
+    eprint!("{report}");
+    std::fs::write(out_dir.join(format!("{label}_alpha.txt")), &report).unwrap();
+
+    assert!(min != max, "{label}: the alpha channel is constant ({min})");
+    let floor = total / 50; // 2 %
+    assert!(
+        transparent >= floor,
+        "{label}: only {transparent}/{total} pixels are substantially transparent; the render \
+         carries no usable matte"
+    );
+    assert!(
+        opaque >= floor,
+        "{label}: only {opaque}/{total} pixels are substantially opaque; the render is a uniform \
+         wash rather than a subject on transparency"
+    );
+    assert!(
+        moved >= floor,
+        "{label}: compositing over white changed only {moved}/{total} pixels — the alpha is not \
+         load-bearing"
+    );
+}
+
+/// The bounded real-weight **transparency** smoke on candle (sc-24114, the twin of the MLX
+/// sc-24111 smoke): one transparent text-to-image and one RGBA-reference extraction, both at
+/// 1024×1024 / 8 steps, each asserting a non-trivial alpha histogram on the emitted `RgbaImage`.
+///
+/// Transparency is requested by **prompt** (upstream ships no flag — see `UPSTREAM.md`);
+/// `output_channels: Rgba` only decides that the decoder's alpha reaches the caller instead of
+/// being composited over white. Both PNGs are written as RGBA8 so the alpha survives to disk.
+///
+/// ```sh
+/// CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT=.../snapshots/790c9263... \
+/// QWEN_IMAGE_2_1_RENDER_OUT=.../render-validation-sc-24114 \
+///   cargo test --locked --release -p candle-gen-qwen-image-2-1 --features cuda \
+///   --test integration e2e_real_weights::validation_render_transparency \
+///   -- --ignored --exact --nocapture --test-threads 1
+/// ```
+#[test]
+#[ignore]
+fn validation_render_transparency() {
+    use candle_gen::gen_core::{Conditioning, OutputChannels};
+
+    let root = snapshot();
+    let out_dir = std::env::var("QWEN_IMAGE_2_1_RENDER_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let started = Instant::now();
+    let registry = candle_gen_qwen_image_2_1::provider_registry().unwrap();
+    let generator = registry
+        .load("qwen_image_2_1", &LoadSpec::new(WeightsSource::Dir(root)))
+        .unwrap();
+    eprintln!("loaded in {:.1}s", started.elapsed().as_secs_f32());
+
+    // The model card's transparent-image prompt form, and an extraction prompt over a reference
+    // that already carries alpha (transparent-layer editing).
+    let cases: [(&str, String, Vec<Conditioning>); 2] = [
+        (
+            "t2i_transparent",
+            "This is an RGBA image with transparency. A cute cartoon fox sticker, bold clean \
+             outline. The image has an alpha channel and the background is transparent."
+                .to_owned(),
+            Vec::new(),
+        ),
+        (
+            "rgba_reference_extraction",
+            "Extract the subject onto a transparent background. This is an RGBA image with \
+             transparency; the background is fully transparent."
+                .to_owned(),
+            vec![Conditioning::ReferenceRgba {
+                image: transparent_reference(1024, 1024),
+                strength: None,
+            }],
+        ),
+    ];
+
+    for (label, prompt, conditioning) in cases {
+        let req = GenerationRequest {
+            prompt,
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            seed: Some(42),
+            conditioning,
+            output_channels: OutputChannels::Rgba,
+            ..Default::default()
+        };
+        generator
+            .validate(&req)
+            .unwrap_or_else(|e| panic!("{label}: the RGBA request was refused at validate: {e}"));
+
+        let render_started = Instant::now();
+        let out = generator
+            .generate(&req, &mut |p| {
+                if let Progress::Step { current, total } = p {
+                    eprintln!(
+                        "{label}: step {current}/{total} ({:.1}s)",
+                        render_started.elapsed().as_secs_f32()
+                    );
+                } else {
+                    eprintln!(
+                        "{label}: {p:?} ({:.1}s)",
+                        render_started.elapsed().as_secs_f32()
+                    );
+                }
+            })
+            .unwrap();
+        let GenerationOutput::ImagesRgba(images) = out else {
+            panic!("{label}: an `output_channels: Rgba` request must emit ImagesRgba");
+        };
+        let image = &images[0];
+        image.validate().unwrap();
+        assert_eq!((image.width, image.height), (1024, 1024));
+        assert_eq!(image.channels(), 4);
+
+        save_png(
+            &out_dir.join(format!(
+                "qwen_image_2_1_candle_{label}_1024x1024_8steps_seed42.png"
+            )),
+            &image.pixels,
+            image.width,
+            image.height,
+            image::ColorType::Rgba8,
+        );
+        assert_nontrivial_alpha(label, image, &out_dir);
+        eprintln!(
+            "{label}: done after {:.1}s render",
+            render_started.elapsed().as_secs_f32()
+        );
+    }
+}
+
+/// The published Q8/Q4 tier snapshot (`SceneWorks/qwen-image-2-1-mlx`): one directory holding a
+/// complete `q8/` and `q4/` snapshot, each in the packed `model.safetensors` layout the candle
+/// loader reads natively (sc-24112).
+fn tier_snapshot() -> PathBuf {
+    let p = std::env::var("CANDLE_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT").unwrap_or_else(|_| {
+        panic!("set CANDLE_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT to the pinned SceneWorks/qwen-image-2-1-mlx snapshot dir (holding q8/ and q4/); inference never self-fetches (epic 13657)")
+    });
+    PathBuf::from(p)
+}
+
+/// The **published** tiers load and render on real weights (sc-24114). `tests/tiers.rs` proves the
+/// packed loader against the committed miniature fixture; this is the one test that opens the
+/// artefacts a user actually installs. Each tier must self-report as what its directory claims
+/// (read from the packed shapes, not the label), load packed through the production catalog path,
+/// and render a 1024×1024 / 8-step image that is not degenerate — a missed packed site reads codes
+/// as floats and collapses the image to a flat field, which the spread floor rejects.
+///
+/// ```sh
+/// CANDLE_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT=.../snapshots/1691de01... \
+/// QWEN_IMAGE_2_1_RENDER_OUT=.../render-validation-sc-24114 \
+///   cargo test --locked --release -p candle-gen-qwen-image-2-1 --features cuda \
+///   --test integration e2e_real_weights::validation_render_installed_tiers \
+///   -- --ignored --exact --nocapture --test-threads 1
+/// ```
+#[test]
+#[ignore]
+fn validation_render_installed_tiers() {
+    use candle_gen::gen_core::Quant;
+    use candle_gen_qwen_image_2_1::quant::{installed_tier, Tier};
+
+    let root = tier_snapshot();
+    let out_dir = std::env::var("QWEN_IMAGE_2_1_RENDER_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let (width, height, steps) = (1024u32, 1024u32, 8u32);
+
+    for (label, tier, quant) in [("q8", Tier::Q8, Quant::Q8), ("q4", Tier::Q4, Quant::Q4)] {
+        let dir = root.join(label);
+        assert_eq!(
+            installed_tier(&dir).unwrap(),
+            tier,
+            "{label}: {} does not hold the tier its name claims",
+            dir.display()
+        );
+
+        let started = Instant::now();
+        let registry = candle_gen_qwen_image_2_1::provider_registry().unwrap();
+        let generator = registry
+            .load(
+                "qwen_image_2_1",
+                &LoadSpec::new(WeightsSource::Dir(dir)).with_quant(quant),
+            )
+            .unwrap();
+        eprintln!("{label}: loaded in {:.1}s", started.elapsed().as_secs_f32());
+
+        let req = GenerationRequest {
+            prompt:
+                "A neon shop sign that reads \"QWEN IMAGE 2.1\", rainy night, reflections on wet pavement"
+                    .to_owned(),
+            width,
+            height,
+            steps: Some(steps),
+            seed: Some(42),
+            ..Default::default()
+        };
+        let render_started = Instant::now();
+        let out = generator
+            .generate(&req, &mut |p| {
+                if let Progress::Step { current, total } = p {
+                    eprintln!(
+                        "{label}: step {current}/{total} ({:.1}s)",
+                        render_started.elapsed().as_secs_f32()
+                    );
+                }
+            })
+            .unwrap();
+        let GenerationOutput::Images(images) = out else {
+            panic!("{label}: images expected");
+        };
+        let image = &images[0];
+        assert_eq!((image.width, image.height), (width, height));
+        assert_eq!(image.pixels.len(), (width as usize) * (height as usize) * 3);
+
+        let n = image.pixels.len() as f64;
+        let mean = image.pixels.iter().map(|&v| v as f64).sum::<f64>() / n;
+        let variance = image
+            .pixels
+            .iter()
+            .map(|&v| (v as f64 - mean).powi(2))
+            .sum::<f64>()
+            / n;
+        let std = variance.sqrt();
+        eprintln!("{label}: pixel mean={mean:.2} std={std:.2}");
+        assert!(
+            std > 8.0,
+            "{label}: the render is a near-flat field (std {std:.2}) — a packed site was read as \
+             dense"
+        );
+
+        let path = out_dir.join(format!(
+            "qwen_image_2_1_candle_{label}_{width}x{height}_{steps}steps_seed42.rgb"
+        ));
+        std::fs::write(&path, &image.pixels).unwrap();
+        save_png(
+            &path.with_extension("png"),
+            &image.pixels,
+            width,
+            height,
+            image::ColorType::Rgb8,
+        );
+        eprintln!(
+            "{label}: {:.1}s total ({:.1}s render)",
+            started.elapsed().as_secs_f32(),
+            render_started.elapsed().as_secs_f32()
+        );
+    }
 }
