@@ -12,6 +12,17 @@
 //! `CausalLm` reference loop, LLaVA's own caption loop, StarCoder2 through the shared reference
 //! loop and the StarVector-1B decoder with its layer-owned cache. Each golden holds the prompt, the
 //! greedy tokens, the logits every greedy token was chosen from, and a sampled run's tokens.
+//!
+//! After the migration every model is held to its golden on each path it now has:
+//!
+//! * the **reference** path (the `CausalLm` loop / the growing backing — the pre-migration
+//!   arithmetic, E2) reproduces the golden **bit for bit**, tokens and logits;
+//! * the **step seam on the static cache** (un-expanded GQA where a layer can express it) produces
+//!   the golden's greedy and sampled **tokens exactly**, and every logit row within
+//!   [`STATIC_LOGIT_TOL`] of the golden's (the un-expanded attention GEMMs round differently);
+//! * the **engine** (no proposer, n-gram, and a self-draft) produces the golden's greedy tokens;
+//! * the multimodal models (the Gemma 4 soft-token splice, LLaVA, StarCoder2 / StarVector with
+//!   their conditioning prefix) prefill through the seam's cache and decode through the engine.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -21,14 +32,19 @@ use serde_json::{json, Value};
 
 use candle_llm::config::ModelConfig;
 use candle_llm::decode::{
-    generate, generate_from_prefill_with_stop, CancelFlag, GenerationConfig, StreamEvent,
+    generate, generate_from_prefill_with_stop, generate_speculative, generate_step,
+    generate_step_from_prefill, CancelFlag, DecodePath, DraftModelProposer, GenerationConfig,
+    NgramProposer, NoProposer, SpeculativePrompt, StepModel, StepRequest, StreamEvent,
 };
 use candle_llm::llava::LlavaModel;
 use candle_llm::models::{
     CausalLm, StarCoder2, StarCoder2Config, StarVectorDecoder, StarVectorDecoderGeometry,
 };
 use candle_llm::primitives::sampler::{sample, SamplingParams};
-use candle_llm::primitives::{input_ids, KvCache, SplitMix64, TokenRng, Weights};
+use candle_llm::primitives::{
+    input_ids, AttnFormulation, DecodeCache, KvCache, KvCacheKind, SplitMix64, StepKvCache,
+    TokenRng, Weights,
+};
 
 // ---- goldens -----------------------------------------------------------------------------------
 
@@ -304,13 +320,13 @@ const LLAMA_PROMPT: [i32; 8] = [3, 17, 5, 29, 3, 17, 5, 11];
 
 #[test]
 fn llama_reference_matches_its_pre_migration_golden() {
-    let model = tiny_causal(false, 0x11A_4A);
+    let model = tiny_causal(false, 0x0001_1A4A);
     golden("llama", causal_before(&model, &LLAMA_PROMPT));
 }
 
 #[test]
 fn qwen3_dense_reference_matches_its_pre_migration_golden() {
-    let model = tiny_causal(true, 0x0_3E_3);
+    let model = tiny_causal(true, 0x03E3);
     golden("qwen3_dense", causal_before(&model, &LLAMA_PROMPT));
 }
 
@@ -373,7 +389,7 @@ fn gemma4_mm_embeds(model: &CausalLm, prompt: &[i32]) -> Tensor {
         .embed(&input_ids(prompt, &Device::Cpu).unwrap())
         .unwrap();
     let hidden = embeds.dim(2).unwrap();
-    let features = Draw::new(0x6E_33A).rand(&[1, 3, hidden]);
+    let features = Draw::new(0x0006_E33A).rand(&[1, 3, hidden]);
     let head = embeds.narrow(1, 0, 2).unwrap();
     let tail = embeds.narrow(1, 5, prompt.len() - 5).unwrap();
     Tensor::cat(&[&head, &features, &tail], 1).unwrap()
@@ -469,7 +485,7 @@ fn tiny_llava() -> LlavaModel {
         }
     });
     std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
-    let mut d = Draw::wide(0x11A_7A, SCALE_LLAVA);
+    let mut d = Draw::wide(0x0001_1A7A, SCALE_LLAVA);
     let mut w: HashMap<String, Tensor> = HashMap::new();
     let vp = |s: &str| format!("vision_tower.vision_model.{s}");
     let patches = (V_IMG / V_PATCH) * (V_IMG / V_PATCH);
@@ -637,7 +653,7 @@ const SC2: StarCoder2Config = StarCoder2Config {
 };
 
 fn tiny_starcoder2() -> StarCoder2 {
-    let mut d = Draw::wide(0x5C_2, SCALE_SC2);
+    let mut d = Draw::wide(0x05C2, SCALE_SC2);
     let mut w: HashMap<String, Tensor> = HashMap::new();
     let p = "model.svg_transformer.transformer";
     let k = |s: &str| format!("{p}.{s}");
@@ -681,7 +697,7 @@ const VISION_ROWS: usize = 5;
 
 /// The StarVector-8B prefill: projected "image" rows followed by the `<svg` prompt embeddings.
 fn starcoder2_embeds(model: &StarCoder2) -> Tensor {
-    let vision = Draw::new(0x5C_2_1).rand(&[1, VISION_ROWS, HIDDEN]);
+    let vision = Draw::new(0x5C21).rand(&[1, VISION_ROWS, HIDDEN]);
     let text = model
         .embed(&input_ids(&SVG_PROMPT, &Device::Cpu).unwrap())
         .unwrap();
@@ -751,7 +767,7 @@ const SV1_GEOMETRY: StarVectorDecoderGeometry = StarVectorDecoderGeometry {
 };
 
 fn tiny_starvector_1b_weights() -> Weights {
-    let mut d = Draw::new(0x5_1B);
+    let mut d = Draw::new(0x051B);
     let g = SV1_GEOMETRY;
     let mut w: HashMap<String, Tensor> = HashMap::new();
     let p = "model.svg_transformer.transformer.transformer";
@@ -780,7 +796,7 @@ fn tiny_starvector_1b_weights() -> Weights {
 }
 
 fn starvector_1b_embeds(decoder: &StarVectorDecoder) -> Tensor {
-    let vision = Draw::new(0x5_1B_1).rand(&[1, VISION_ROWS, HIDDEN]);
+    let vision = Draw::new(0x51B1).rand(&[1, VISION_ROWS, HIDDEN]);
     let text = decoder
         .embeddings(&input_ids(&SVG_PROMPT, &Device::Cpu).unwrap())
         .unwrap();
@@ -790,19 +806,22 @@ fn starvector_1b_embeds(decoder: &StarVectorDecoder) -> Tensor {
 /// The StarVector-1B provider's caption loop before the migration: prefill the joined embeddings,
 /// then sample / feed one token at a time through the decoder's layer-owned cache. Returns the
 /// tokens and the rows they were drawn from.
+///
+/// Since the migration the decoder is stateless and the K/V live in the caller's cache: the same
+/// loop over the step cache's growing backing (the reference concat) must still reproduce the
+/// golden bit for bit.
 fn starvector_1b_loop(
-    decoder: &mut StarVectorDecoder,
+    decoder: &StarVectorDecoder,
     params: &SamplingParams,
     seed: u64,
 ) -> (Vec<i32>, Vec<Vec<f32>>) {
-    decoder.reset();
-    let prefix = VISION_ROWS + SVG_PROMPT.len();
+    let mut cache = decoder.new_step_cache();
     let embeds = starvector_1b_embeds(decoder);
-    let mut logits = decoder.forward_embeds(&embeds, 0).unwrap();
+    let mut logits = decoder.forward_embeds(&embeds, &mut cache).unwrap();
     let mut history = SVG_PROMPT.to_vec();
     let mut rng = SplitMix64::new(seed);
     let (mut tokens, mut rows) = (Vec::new(), Vec::new());
-    for index in 0..NEW_TOKENS {
+    for _ in 0..NEW_TOKENS {
         rows.push(host(&logits));
         let id = sample(&logits, &history, params, &mut rng, None).unwrap();
         history.push(id);
@@ -810,19 +829,21 @@ fn starvector_1b_loop(
         let embed = decoder
             .embeddings(&input_ids(&[id], &Device::Cpu).unwrap())
             .unwrap();
-        logits = decoder.forward_embeds(&embed, prefix + index).unwrap();
+        logits = decoder.forward_embeds(&embed, &mut cache).unwrap();
     }
-    decoder.reset();
     (tokens, rows)
+}
+
+fn tiny_starvector_1b() -> StarVectorDecoder {
+    StarVectorDecoder::from_weights_with_geometry(&tiny_starvector_1b_weights(), SV1_GEOMETRY)
+        .unwrap()
 }
 
 #[test]
 fn starvector_1b_decoder_matches_its_pre_migration_golden() {
-    let mut decoder =
-        StarVectorDecoder::from_weights_with_geometry(&tiny_starvector_1b_weights(), SV1_GEOMETRY)
-            .unwrap();
-    let (greedy, rows) = starvector_1b_loop(&mut decoder, &SamplingParams::default(), 0);
-    let (sampled, _) = starvector_1b_loop(&mut decoder, &sampled_params(), SAMPLED_SEED);
+    let decoder = tiny_starvector_1b();
+    let (greedy, rows) = starvector_1b_loop(&decoder, &SamplingParams::default(), 0);
+    let (sampled, _) = starvector_1b_loop(&decoder, &sampled_params(), SAMPLED_SEED);
     golden(
         "starvector_1b",
         Golden {
@@ -832,4 +853,576 @@ fn starvector_1b_decoder_matches_its_pre_migration_golden() {
             sampled_tokens: sampled,
         },
     );
+}
+
+// =================================================================================================
+// After the migration: the step seam, the engine and the multimodal prefill paths vs the goldens
+// =================================================================================================
+
+/// Largest per-logit absolute difference allowed between the static cache's un-expanded attention
+/// and the golden's `repeat_kv`-expanded rows on CPU f32. The observed maximum is two orders of
+/// magnitude below this; a wrong cache (a stale or misplaced position) moves logits by O(0.1).
+const STATIC_LOGIT_TOL: f32 = 1e-4;
+
+/// One parity-table line on stderr (`--nocapture` shows it; the evidence table is built from it).
+fn report(model: &str, path: &str, diff: f32) {
+    eprintln!("[sc24138-parity] {model:<14} {path:<8} tokens=identical max|dlogit|={diff:.3e}");
+}
+
+fn max_abs_diff(a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
+    assert_eq!(a.len(), b.len(), "row count");
+    a.iter()
+        .zip(b)
+        .flat_map(|(x, y)| {
+            assert_eq!(x.len(), y.len(), "row width");
+            x.iter().zip(y).map(|(p, q)| (p - q).abs())
+        })
+        .fold(0.0f32, f32::max)
+}
+
+/// Walk `tokens` through the step seam from a prefilled `cache` whose prefill produced `first`,
+/// returning the row each token was chosen from (the prefill row first).
+fn step_walk<M: StepModel>(
+    model: &M,
+    cache: &mut M::Cache,
+    first: Tensor,
+    tokens: &[i32],
+) -> Vec<Vec<f32>> {
+    let mut rows = vec![host(&first)];
+    for &t in &tokens[..tokens.len() - 1] {
+        let out = model.forward_step(cache, StepRequest::last(&[t])).unwrap();
+        rows.push(host(&out.logits));
+    }
+    rows
+}
+
+/// A token prompt through the seam: prefill + walk.
+fn step_rows<M: StepModel>(model: &M, cache: &mut M::Cache, g: &Golden) -> Vec<Vec<f32>> {
+    let first = model
+        .forward_step(cache, StepRequest::last(&g.prompt))
+        .unwrap()
+        .logits;
+    step_walk(model, cache, first, &g.greedy_tokens)
+}
+
+fn greedy_step(model: &CausalLm, g: &Golden, config: &GenerationConfig) -> Vec<i32> {
+    generate_step(
+        model,
+        &g.prompt,
+        config,
+        &CancelFlag::new(),
+        &mut |_| {},
+        None,
+    )
+    .unwrap()
+    .0
+    .tokens
+}
+
+/// Every seam path of a `CausalLm` held to its golden. `gqa` says whether every layer can attend
+/// un-expanded (Gemma 4's sliding layers cannot).
+fn causal_after(name: &str, model: &mut CausalLm, g: &Golden, gqa: bool) {
+    // -- the static cache (the default step cache) --
+    assert_eq!(model.step_kv_cache(), KvCacheKind::Static);
+    let (out, record) = generate_step(
+        model,
+        &g.prompt,
+        &greedy_config(NEW_TOKENS),
+        &CancelFlag::new(),
+        &mut |_| {},
+        None,
+    )
+    .unwrap();
+    assert_eq!(out.tokens, g.greedy_tokens, "static step greedy tokens");
+    assert_eq!(record.path, DecodePath::StepModel);
+    assert_eq!(
+        record.kv_cache,
+        KvCacheKind::Static,
+        "telemetry names the cache"
+    );
+    let formulation = if gqa {
+        AttnFormulation::Gqa
+    } else {
+        AttnFormulation::Expanded
+    };
+    assert_eq!(
+        record.attn_formulation, formulation,
+        "telemetry names the arithmetic"
+    );
+    assert_eq!(
+        greedy_step(model, g, &sampled_config(NEW_TOKENS)),
+        g.sampled_tokens,
+        "static step sampled tokens"
+    );
+    let capacity = g.prompt.len() + NEW_TOKENS;
+    let mut fixed = model.new_cache_for(capacity, 0).unwrap();
+    assert_eq!(fixed.kv_capacity(), Some(capacity));
+    assert_eq!(
+        fixed.memory().live_bytes,
+        model.static_kv_bytes(capacity),
+        "the preallocation is exactly the priced bytes"
+    );
+    let rows = step_rows(model, &mut fixed, g);
+    let diff = max_abs_diff(&rows, &g.greedy_logits);
+    report(name, "static", diff);
+    assert!(diff <= STATIC_LOGIT_TOL, "static logits drift {diff}");
+
+    // -- the growing backing through the seam: the reference arithmetic, bit for bit --
+    model.set_step_kv_cache(KvCacheKind::Growing);
+    let (out, record) = generate_step(
+        model,
+        &g.prompt,
+        &greedy_config(NEW_TOKENS),
+        &CancelFlag::new(),
+        &mut |_| {},
+        None,
+    )
+    .unwrap();
+    assert_eq!(out.tokens, g.greedy_tokens, "growing step greedy tokens");
+    assert_eq!(record.kv_cache, KvCacheKind::Growing);
+    assert_eq!(record.attn_formulation, AttnFormulation::Expanded);
+    let mut growing = model.new_step_cache();
+    assert_eq!(step_rows(model, &mut growing, g), g.greedy_logits);
+    model.set_step_kv_cache(KvCacheKind::Static);
+
+    // -- the engine: no proposer, prompt lookup, and the model as its own draft --
+    let config = greedy_config(NEW_TOKENS);
+    let run = generate_speculative(
+        model,
+        &mut NoProposer,
+        SpeculativePrompt::Tokens(&g.prompt),
+        &config,
+        3,
+        &CancelFlag::new(),
+        &mut |_| {},
+        None,
+    )
+    .unwrap();
+    assert_eq!(run.output.tokens, g.greedy_tokens, "engine, no proposer");
+    let run = generate_speculative(
+        model,
+        &mut NgramProposer { max_ngram: 3 },
+        SpeculativePrompt::Tokens(&g.prompt),
+        &config,
+        3,
+        &CancelFlag::new(),
+        &mut |_| {},
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        run.output.tokens, g.greedy_tokens,
+        "engine, n-gram proposer"
+    );
+    assert_eq!(run.record.kv_cache, KvCacheKind::Static);
+    let mut draft = DraftModelProposer::new(&*model, capacity, 3);
+    let run = generate_speculative(
+        model,
+        &mut draft,
+        SpeculativePrompt::Tokens(&g.prompt),
+        &config,
+        3,
+        &CancelFlag::new(),
+        &mut |_| {},
+        None,
+    )
+    .unwrap();
+    assert_eq!(run.output.tokens, g.greedy_tokens, "engine, self-draft");
+    assert_eq!(
+        run.stats.accepted, run.stats.proposed,
+        "a draft identical to the target is always accepted"
+    );
+
+    // -- the reference loop with the un-expanded formulation selected --
+    if gqa {
+        model.set_attn_formulation(AttnFormulation::Gqa);
+        let out = generate(
+            model,
+            &g.prompt,
+            &greedy_config(NEW_TOKENS),
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(out.tokens, g.greedy_tokens, "reference loop, gqa selected");
+        // The selected reference and the static cache are the same arithmetic: bit-identical.
+        let mut fixed = model.new_cache_for(capacity, 0).unwrap();
+        let mut growing = model.new_step_cache();
+        assert_eq!(
+            step_rows(model, &mut fixed, g),
+            step_rows(model, &mut growing, g)
+        );
+        model.set_attn_formulation(AttnFormulation::Expanded);
+    }
+}
+
+#[test]
+fn llama_decodes_to_its_golden_on_every_seam_path() {
+    let mut model = tiny_causal(false, 0x0001_1A4A);
+    let g = golden("llama", causal_before(&model, &LLAMA_PROMPT));
+    causal_after("llama", &mut model, &g, true);
+    // The paged backing, kept behind the same seam: the reference arithmetic, bit for bit.
+    let mut paged = model.new_paged_step_cache(4);
+    assert_eq!(step_rows(&model, &mut paged, &g), g.greedy_logits);
+    assert!(paged.as_paged().is_some());
+}
+
+#[test]
+fn qwen3_dense_decodes_to_its_golden_on_every_seam_path() {
+    let mut model = tiny_causal(true, 0x03E3);
+    let g = golden("qwen3_dense", causal_before(&model, &LLAMA_PROMPT));
+    causal_after("qwen3_dense", &mut model, &g, true);
+}
+
+#[test]
+fn gemma4_decodes_to_its_golden_on_every_seam_path() {
+    let mut model = gemma4();
+    let g = golden("gemma4", causal_before(&model, &gemma4_prompt()));
+    causal_after("gemma4", &mut model, &g, false);
+}
+
+/// The Gemma 4 soft-token splice through the seam: the spliced embeddings prefill the step cache
+/// (static and growing), the continuation decodes through the engine.
+#[test]
+fn gemma4_mm_splice_decodes_to_its_golden_through_the_seam() {
+    let model = gemma4();
+    let prompt = gemma4_prompt();
+    let g = golden("gemma4_mm", gemma4_mm_before(&model, &prompt));
+    let embeds = gemma4_mm_embeds(&model, &prompt);
+    let capacity = prompt.len() + NEW_TOKENS;
+    for (backing, static_cache) in [("static", true), ("growing", false)] {
+        let fresh = || -> StepKvCache {
+            if static_cache {
+                model.new_static_cache(capacity).unwrap()
+            } else {
+                model.new_step_cache()
+            }
+        };
+        for (config, want) in [
+            (greedy_config(NEW_TOKENS), &g.greedy_tokens),
+            (sampled_config(NEW_TOKENS), &g.sampled_tokens),
+        ] {
+            let mut cache = fresh();
+            let first = model.step_prefill_from_embeds(&embeds, &mut cache).unwrap();
+            let (out, record) = generate_step_from_prefill(
+                &model,
+                &mut cache,
+                first,
+                &prompt,
+                &config,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+            )
+            .unwrap();
+            assert_eq!(&out.tokens, want, "{backing}: gemma4_mm tokens");
+            assert_eq!(record.path, DecodePath::StepModel);
+        }
+        let mut cache = fresh();
+        let first = model.step_prefill_from_embeds(&embeds, &mut cache).unwrap();
+        let rows = step_walk(&model, &mut cache, first, &g.greedy_tokens);
+        if static_cache {
+            let diff = max_abs_diff(&rows, &g.greedy_logits);
+            report("gemma4_mm", "static", diff);
+            assert!(diff <= STATIC_LOGIT_TOL, "gemma4_mm static drift {diff}");
+        } else {
+            assert_eq!(rows, g.greedy_logits, "gemma4_mm growing rows");
+        }
+    }
+}
+
+/// LLaVA's caption now decodes through the seam (its own loop is gone): the provider path on the
+/// growing backing is the golden bit for bit; the static backing gives the same tokens.
+#[test]
+fn llava_caption_decodes_to_its_golden_through_the_seam() {
+    let model = tiny_llava();
+    let g = golden("llava", llava_before(&model));
+    let features = model.image_features(&llava_image(), V_IMG, V_IMG).unwrap();
+    // `llava_before` ran `LlavaModel::generate` (now the seam) and held it to the golden already;
+    // here the same splice on the static backing.
+    let lang = model.language();
+    let expanded = candle_llm::llava::expand_image_tokens(
+        &LLAVA_PROMPT,
+        IMG_TOKEN,
+        model.config().image_seq_length,
+    );
+    let embeds = lang
+        .embed(&input_ids(&expanded, &Device::Cpu).unwrap())
+        .unwrap();
+    let spliced = candle_llm::llava::splice_image_features(
+        &embeds,
+        &expanded,
+        &features.to_dtype(lang.compute_dtype()).unwrap(),
+        IMG_TOKEN,
+    )
+    .unwrap();
+    for (config, want) in [
+        (greedy_config(NEW_TOKENS), &g.greedy_tokens),
+        (sampled_config(NEW_TOKENS), &g.sampled_tokens),
+    ] {
+        let mut cache = lang.new_static_cache(expanded.len() + NEW_TOKENS).unwrap();
+        let first = lang.step_prefill_from_embeds(&spliced, &mut cache).unwrap();
+        let (out, record) = generate_step_from_prefill(
+            lang,
+            &mut cache,
+            first,
+            &expanded,
+            &config,
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+        )
+        .unwrap();
+        assert_eq!(&out.tokens, want, "llava static tokens");
+        assert_eq!(record.kv_cache, KvCacheKind::Static);
+    }
+    // A cancel that lands after the prefill is the ordinary mid-stream cancellation, as before.
+    let cancel = CancelFlag::new();
+    let mut cache = lang.new_step_cache();
+    let first = lang.step_prefill_from_embeds(&spliced, &mut cache).unwrap();
+    cancel.cancel();
+    let (out, _) = generate_step_from_prefill(
+        lang,
+        &mut cache,
+        first,
+        &expanded,
+        &greedy_config(NEW_TOKENS),
+        &cancel,
+        &mut |_| {},
+        None,
+    )
+    .unwrap();
+    assert!(out.tokens.is_empty());
+    assert_eq!(
+        out.finish_reason,
+        candle_llm::decode::FinishReason::Cancelled
+    );
+}
+
+/// StarCoder2 (StarVector-8B's decoder) through the seam: the conditioning prefix prefills the
+/// step cache, the continuation decodes through the engine — the provider's path.
+#[test]
+fn starcoder2_decodes_to_its_golden_through_the_seam() {
+    let model = tiny_starcoder2();
+    let g = golden("starcoder2", starcoder2_before(&model));
+    let embeds = starcoder2_embeds(&model);
+    let capacity = VISION_ROWS + SVG_PROMPT.len() + NEW_TOKENS;
+    for static_cache in [true, false] {
+        let fresh = || {
+            if static_cache {
+                model.new_static_cache(capacity).unwrap()
+            } else {
+                model.new_step_cache()
+            }
+        };
+        for (config, want) in [
+            (greedy_config(NEW_TOKENS), &g.greedy_tokens),
+            (sampled_config(NEW_TOKENS), &g.sampled_tokens),
+        ] {
+            let mut cache = fresh();
+            let first = model.step_prefill_from_embeds(&embeds, &mut cache).unwrap();
+            let (out, _) = generate_step_from_prefill(
+                &model,
+                &mut cache,
+                first,
+                &SVG_PROMPT,
+                &config,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+            )
+            .unwrap();
+            assert_eq!(&out.tokens, want, "starcoder2 static={static_cache}");
+        }
+        let mut cache = fresh();
+        let first = model.step_prefill_from_embeds(&embeds, &mut cache).unwrap();
+        let rows = step_walk(&model, &mut cache, first, &g.greedy_tokens);
+        if static_cache {
+            let diff = max_abs_diff(&rows, &g.greedy_logits);
+            report("starcoder2", "static", diff);
+            assert!(diff <= STATIC_LOGIT_TOL, "starcoder2 static drift {diff}");
+            assert_eq!(model.attn_formulation(&cache), AttnFormulation::Gqa);
+        } else {
+            assert_eq!(rows, g.greedy_logits, "starcoder2 growing rows");
+        }
+    }
+    assert_eq!(
+        model
+            .new_static_cache(capacity)
+            .unwrap()
+            .memory()
+            .live_bytes,
+        model.static_kv_bytes(capacity)
+    );
+}
+
+/// The StarVector-1B decoder through the seam, on both backings: its multi-query fold attends the
+/// one shared K/V head un-expanded either way, so both are the golden bit for bit.
+#[test]
+fn starvector_1b_decodes_to_its_golden_through_the_seam() {
+    let decoder = tiny_starvector_1b();
+    let (greedy, rows) = starvector_1b_loop(&decoder, &SamplingParams::default(), 0);
+    let (sampled, _) = starvector_1b_loop(&decoder, &sampled_params(), SAMPLED_SEED);
+    let g = golden(
+        "starvector_1b",
+        Golden {
+            prompt: SVG_PROMPT.to_vec(),
+            greedy_tokens: greedy,
+            greedy_logits: rows,
+            sampled_tokens: sampled,
+        },
+    );
+    let embeds = starvector_1b_embeds(&decoder);
+    let capacity = VISION_ROWS + SVG_PROMPT.len() + NEW_TOKENS;
+    for static_cache in [true, false] {
+        let fresh = || {
+            if static_cache {
+                decoder.new_static_cache(capacity).unwrap()
+            } else {
+                decoder.new_step_cache()
+            }
+        };
+        for (config, want) in [
+            (greedy_config(NEW_TOKENS), &g.greedy_tokens),
+            (sampled_config(NEW_TOKENS), &g.sampled_tokens),
+        ] {
+            let mut cache = fresh();
+            let first = decoder.forward_embeds(&embeds, &mut cache).unwrap();
+            let (out, _) = generate_step_from_prefill(
+                &decoder,
+                &mut cache,
+                first,
+                &SVG_PROMPT,
+                &config,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+            )
+            .unwrap();
+            assert_eq!(&out.tokens, want, "starvector-1b static={static_cache}");
+        }
+        let mut cache = fresh();
+        let first = decoder.forward_embeds(&embeds, &mut cache).unwrap();
+        assert_eq!(
+            step_walk(&decoder, &mut cache, first, &g.greedy_tokens),
+            g.greedy_logits,
+            "starvector-1b static={static_cache} rows"
+        );
+    }
+    // Past the learned positions the static cache fails closed before allocating.
+    assert!(matches!(
+        decoder.new_static_cache(SV1_GEOMETRY.max_positions + 1),
+        Err(candle_llm::Error::KvCapacityExceeded { .. })
+    ));
+}
+
+/// A static request past `max_position_embeddings` is refused with the typed error before any
+/// allocation; a zero-capacity one is refused too.
+#[test]
+fn causal_static_cache_fails_closed_past_the_model_bound() {
+    let model = tiny_causal(false, 0x0001_1A4A);
+    assert!(matches!(
+        model.new_cache_for(120, 9),
+        Err(candle_llm::Error::KvCapacityExceeded {
+            requested: 129,
+            capacity: 128
+        })
+    ));
+    assert!(model.new_static_cache(0).is_err());
+    let cache = model.new_cache_for(120, 8).unwrap();
+    assert_eq!(cache.kv_capacity(), Some(128));
+}
+
+/// **AC3.** `decode/speculative.rs` holds no decode loop and nothing `CausalLm`-typed; the n-gram
+/// and draft-model proposers live in `decode/proposers.rs`.
+#[test]
+fn speculative_rs_holds_no_decode_loop() {
+    let source = include_str!("../src/decode/speculative.rs");
+    let code: String = source
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for forbidden in [
+        "fn generate",
+        "fn ",
+        "loop {",
+        "while ",
+        "for ",
+        "CausalLm",
+        "decode_logits",
+        "KvCache",
+    ] {
+        assert!(
+            !code.contains(forbidden),
+            "decode/speculative.rs code contains `{forbidden}`"
+        );
+    }
+    assert!(code.contains("pub struct SpeculativeStats"));
+    let proposers = include_str!("../src/decode/proposers.rs");
+    assert!(proposers.contains("pub struct NgramProposer"));
+    assert!(proposers.contains("pub struct DraftModelProposer"));
+}
+
+/// A draft whose vocabulary is not the target's is refused before any inference (the check the
+/// retired draft-model loop made, now the engine's).
+#[test]
+fn engine_refuses_a_draft_with_another_vocabulary() {
+    let target = tiny_causal(false, 0x0001_1A4A);
+    let draft = tiny_causal(true, 0x03E3);
+    assert_eq!(target.vocab_size(), draft.vocab_size());
+    // Same vocab: accepted. A proposer claiming another vocabulary: refused.
+    struct Wide<'a>(DraftModelProposer<'a, CausalLm>);
+    impl candle_llm::decode::Proposer for Wide<'_> {
+        fn kind(&self) -> core_llm::ProposerKind {
+            self.0.kind()
+        }
+        fn vocab_size(&self) -> Option<usize> {
+            Some(VOCAB + 1)
+        }
+        fn warm(&mut self, p: &[i32], h: Option<&Tensor>) -> candle_llm::Result<()> {
+            self.0.warm(p, h)
+        }
+        fn propose(
+            &mut self,
+            ctx: &candle_llm::decode::ProposeContext<'_>,
+            s: &mut candle_llm::decode::DraftSampler<'_, '_>,
+        ) -> candle_llm::Result<candle_llm::decode::Proposal> {
+            self.0.propose(ctx, s)
+        }
+        fn commit(
+            &mut self,
+            cur: i32,
+            accepted: &[i32],
+            h: Option<&Tensor>,
+            position: i32,
+        ) -> candle_llm::Result<()> {
+            self.0.commit(cur, accepted, h, position)
+        }
+    }
+    let mut ok = DraftModelProposer::new(&draft, 32, 2);
+    assert!(generate_speculative(
+        &target,
+        &mut ok,
+        SpeculativePrompt::Tokens(&LLAMA_PROMPT),
+        &greedy_config(4),
+        2,
+        &CancelFlag::new(),
+        &mut |_| {},
+        None,
+    )
+    .is_ok());
+    let mut wide = Wide(DraftModelProposer::new(&draft, 32, 2));
+    let err = generate_speculative(
+        &target,
+        &mut wide,
+        SpeculativePrompt::Tokens(&LLAMA_PROMPT),
+        &greedy_config(4),
+        2,
+        &CancelFlag::new(),
+        &mut |_| {},
+        None,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("vocab mismatch"), "{err}");
 }

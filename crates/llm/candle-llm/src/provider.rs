@@ -118,10 +118,16 @@ impl Decoder {
             match self {
                 Decoder::Causal(m) => {
                     let c = m.config();
+                    // The widest layer's KV geometry, so `layers × kv_heads × head_dim` covers every
+                    // layer's cache whatever its type: Gemma 4's full-attention layers are wider
+                    // than the scalar `head_dim` / `num_key_value_heads` (its sliding layers'), and
+                    // DeepSeek-V2's materialized MLA caches full-head `qk_nope + qk_rope` keys
+                    // (sc-24138, E6 — the step seam's static preallocation is this layout).
+                    let (kv_heads, head_dim) = m.kv_layout().widest_layer();
                     (
                         c.num_heads,
-                        c.num_kv_heads,
-                        c.head_dim,
+                        kv_heads as i32,
+                        head_dim as i32,
                         c.num_layers,
                         c.hidden_size,
                         c.intermediate_size,
@@ -163,12 +169,14 @@ impl Decoder {
         }
     }
 
-    /// How the decoder computes grouped-query attention (story sc-24132), for the decode record.
-    /// The generic causal family still runs `repeat_kv`-expanded attention over its growing cache
-    /// (its migration is S10), so it reports `Expanded`; the Qwen3.5 hybrid reports its selector.
+    /// How the decoder computes grouped-query attention (story sc-24132), for the decode record of
+    /// the provider's reference loop. The generic causal family reports what its selector really
+    /// ran over the growing cache (sc-24138: `Expanded` by default — the pre-migration arithmetic
+    /// — and `Gqa` only when selected and every layer can express it); the Qwen3.5 hybrid reports
+    /// its selector.
     fn attn_formulation(&self) -> crate::primitives::AttnFormulation {
         match self {
-            Decoder::Causal(_) => crate::primitives::AttnFormulation::Expanded,
+            Decoder::Causal(m) => m.effective_attn_formulation(m.attn_formulation()),
             Decoder::Qwen35(m) => m.attn_formulation(),
         }
     }
@@ -3117,6 +3125,9 @@ mod tests {
         EAGER_ATTN_QUERY_CHUNK_SIZE,
     };
     use super::{qwen35_recurrent_admission_bytes, Decode as _, Decoder};
+    use crate::models::CausalLm;
+    use candle_core::Tensor;
+    use std::collections::HashMap;
 
     #[test]
     fn accelerator_only_selector_is_exact_to_qwen38_and_bonsai() {
@@ -3768,6 +3779,160 @@ mod tests {
         assert_eq!(
             cache.memory().live_bytes as u64,
             model.static_kv_bytes(capacity + 3) as u64
+        );
+    }
+
+    /// A tiny dense causal decoder from a JSON config and seeded weights (llama or Gemma 4 keys).
+    fn tiny_causal_from(cfg: serde_json::Value, weights: HashMap<String, Tensor>) -> CausalLm {
+        let cfg = crate::config::ModelConfig::from_json(&cfg).unwrap();
+        CausalLm::from_weights(
+            &crate::primitives::Weights::from_map(weights, candle_core::Device::Cpu),
+            "",
+            cfg,
+        )
+        .unwrap()
+    }
+
+    fn tiny_llama_for_admission() -> CausalLm {
+        use crate::primitives::{SplitMix64, TokenRng};
+        let (vocab, hidden, inter, heads, kv_heads, layers) = (40usize, 32, 64, 4, 2, 3);
+        let head_dim = hidden / heads;
+        let mut rng = SplitMix64::new(0x000A_D417);
+        let mut rand = |dims: &[usize]| {
+            let n: usize = dims.iter().product();
+            let data: Vec<f32> = (0..n).map(|_| rng.next_f32() - 0.5).collect();
+            Tensor::from_vec(data, dims.to_vec(), &candle_core::Device::Cpu).unwrap()
+        };
+        let mut w = HashMap::new();
+        w.insert(
+            "model.embed_tokens.weight".to_string(),
+            rand(&[vocab, hidden]),
+        );
+        w.insert("model.norm.weight".to_string(), rand(&[hidden]));
+        w.insert("lm_head.weight".to_string(), rand(&[vocab, hidden]));
+        for i in 0..layers {
+            let p = |s: &str| format!("model.layers.{i}.{s}");
+            w.insert(p("input_layernorm.weight"), rand(&[hidden]));
+            w.insert(p("post_attention_layernorm.weight"), rand(&[hidden]));
+            w.insert(
+                p("self_attn.q_proj.weight"),
+                rand(&[heads * head_dim, hidden]),
+            );
+            w.insert(
+                p("self_attn.k_proj.weight"),
+                rand(&[kv_heads * head_dim, hidden]),
+            );
+            w.insert(
+                p("self_attn.v_proj.weight"),
+                rand(&[kv_heads * head_dim, hidden]),
+            );
+            w.insert(
+                p("self_attn.o_proj.weight"),
+                rand(&[hidden, heads * head_dim]),
+            );
+            w.insert(p("mlp.gate_proj.weight"), rand(&[inter, hidden]));
+            w.insert(p("mlp.up_proj.weight"), rand(&[inter, hidden]));
+            w.insert(p("mlp.down_proj.weight"), rand(&[hidden, inter]));
+        }
+        tiny_causal_from(
+            serde_json::json!({
+                "architectures": ["LlamaForCausalLM"], "model_type": "llama",
+                "hidden_size": hidden, "intermediate_size": inter, "num_hidden_layers": layers,
+                "num_attention_heads": heads, "num_key_value_heads": kv_heads,
+                "vocab_size": vocab, "rms_norm_eps": 1e-6, "rope_theta": 10000.0,
+                "max_position_embeddings": 256, "tie_word_embeddings": false
+            }),
+            w,
+        )
+    }
+
+    fn tiny_gemma4_for_admission() -> CausalLm {
+        let g: serde_json::Value = serde_json::from_str(include_str!(
+            "../../testdata/gemma4/gemma4_decoder_goldens.json"
+        ))
+        .unwrap();
+        let mut w = HashMap::new();
+        for (key, spec) in g["weights"].as_object().unwrap() {
+            let shape: Vec<usize> = spec["shape"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_u64().unwrap() as usize)
+                .collect();
+            let data: Vec<f32> = spec["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect();
+            w.insert(
+                key.clone(),
+                Tensor::from_vec(data, shape, &candle_core::Device::Cpu).unwrap(),
+            );
+        }
+        tiny_causal_from(g["config"].clone(), w)
+    }
+
+    /// E6 (sc-24138): the step seam's static KV cache preallocates every caching layer's K/V for
+    /// the request bound, and the causal family's admission geometry covers it — including Gemma
+    /// 4, whose full-attention layers are wider than the scalar `head_dim` / `num_key_value_heads`
+    /// the geometry used to read (the widest layer is priced now).
+    #[test]
+    fn causal_admission_covers_the_static_kv_preallocation() {
+        use crate::decode::StepModel;
+        use crate::primitives::DecodeCache;
+
+        for (label, model) in [
+            ("llama", tiny_llama_for_admission()),
+            ("gemma4", tiny_gemma4_for_admission()),
+        ] {
+            let (prompt_tokens, max_new_tokens) = (9usize, 17u32);
+            let capacity = prompt_tokens + max_new_tokens as usize;
+            let preallocation = model.static_kv_bytes(capacity) as u64;
+            assert!(preallocation > 0, "{label}");
+            let layout = model.kv_layout();
+            let decoder = Decoder::Causal(model);
+            let geometry = decoder.memory_geometry();
+            let (kv_heads, head_dim) = layout.widest_layer();
+            assert_eq!(
+                (geometry.kv_heads, geometry.head_dim),
+                (kv_heads as u64, head_dim as u64),
+                "{label}: the geometry is the widest layer's"
+            );
+            let kv_term = (capacity as u64)
+                * geometry.layers
+                * geometry.kv_heads
+                * geometry.head_dim
+                * geometry.element_bytes
+                * 2;
+            assert!(
+                preallocation <= kv_term,
+                "{label}: static preallocation {preallocation} exceeds the KV term {kv_term}"
+            );
+            let estimate =
+                core_llm::estimate_request_bytes(prompt_tokens, max_new_tokens, geometry, 0, 0)
+                    .unwrap();
+            assert!(estimate >= preallocation, "{label}");
+            let Decoder::Causal(model) = &decoder else {
+                unreachable!()
+            };
+            // What the step seam really allocates for that request is exactly the priced number,
+            // declared overshoot included.
+            let cache = model.new_cache_for(capacity, 3).unwrap();
+            assert_eq!(cache.kv_capacity(), Some(capacity + 3), "{label}");
+            assert_eq!(
+                cache.memory().live_bytes as u64,
+                model.static_kv_bytes(capacity + 3) as u64,
+                "{label}"
+            );
+        }
+        // Gemma 4's full layers are what the old scalar geometry under-priced.
+        let gemma4 = tiny_gemma4_for_admission();
+        let cfg = gemma4.config();
+        let (kv_heads, head_dim) = gemma4.kv_layout().widest_layer();
+        assert!(
+            kv_heads * head_dim > (cfg.num_kv_heads * cfg.head_dim) as usize,
+            "the fixture's widest layer is wider than the scalar geometry"
         );
     }
 

@@ -30,8 +30,9 @@ use core_llm::{
 };
 
 use crate::config::{Architecture, ModelConfig};
-use crate::decode::stream::default_seed;
-use crate::decode::{CancelFlag, FinishReason};
+use crate::decode::{
+    generate_step_from_prefill, CancelFlag, FinishReason, GenerationConfig, StreamEvent,
+};
 use crate::device::select_device;
 use crate::error::{Error, Result};
 use crate::image::SiglipImageProcessor;
@@ -39,7 +40,7 @@ use crate::models::siglip::{select_vision_feature, SiglipVisionConfig, SiglipVis
 use crate::models::CausalLm;
 use crate::primitives::nn::{gelu, gelu_erf, linear};
 use crate::primitives::projection::QuantSpec;
-use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
+use crate::primitives::sampler::SamplingParams;
 use crate::primitives::{input_ids, Weights};
 
 /// The registry id of the LLaVA provider.
@@ -333,6 +334,11 @@ impl LlavaModel {
 
     /// Generate a caption from a tokenized prompt (containing a single `image_token_id`) and the
     /// projected image features. Emits each token through `on_token(id, step)`.
+    ///
+    /// The spliced embeddings are prefilled into the decoder's shared step cache and the caption
+    /// decodes through the step seam — the engine's token-at-a-time loop (sc-24138) — on the
+    /// cache's growing backing: this provider has no admission surface to price a preallocation of
+    /// the whole (unbounded) caption budget. Same sampler, stop tokens and cancellation as before.
     #[allow(clippy::too_many_arguments)]
     pub fn generate(
         &self,
@@ -363,41 +369,33 @@ impl LlavaModel {
         let feat = image_features.to_dtype(self.language.compute_dtype())?;
         let spliced = splice_image_features(&embeds, &expanded, &feat, self.cfg.image_token_id)?;
 
-        let mut cache = self.language.new_cache();
-        let mut rng = SplitMix64::new(seed.unwrap_or_else(default_seed));
-        let mut history = expanded.clone();
-        let mut generated: Vec<i32> = Vec::new();
-        let prompt_len = expanded.len() as i32;
-        let mut logits = self
+        let mut cache = self.language.new_step_cache();
+        let logits = self
             .language
-            .decode_logits_from_embeds(&spliced, &mut cache, 0)?;
-        let mut finish = FinishReason::MaxTokens;
-
-        for step in 0..max_new_tokens {
-            if cancel.is_cancelled() {
-                finish = FinishReason::Cancelled;
-                break;
-            }
-            let next = sample(&logits, &history, params, &mut rng, None)?;
-            if stop_tokens.contains(&next) {
-                finish = FinishReason::StopToken;
-                break;
-            }
-            on_token(next, step);
-            generated.push(next);
-            history.push(next);
-            if step + 1 == max_new_tokens {
-                break;
-            }
-            let tok = input_ids(&[next], &self.device)?;
-            logits = self
-                .language
-                .decode_logits(&tok, &mut cache, prompt_len + step as i32)?;
-        }
-
+            .step_prefill_from_embeds(&spliced, &mut cache)?;
+        let config = GenerationConfig {
+            max_new_tokens,
+            sampling: *params,
+            seed,
+            stop_tokens: stop_tokens.to_vec(),
+        };
+        let (out, _record) = generate_step_from_prefill(
+            &self.language,
+            &mut cache,
+            logits,
+            &expanded,
+            &config,
+            cancel,
+            &mut |event| {
+                if let StreamEvent::Token { id, step } = event {
+                    on_token(id, step);
+                }
+            },
+            None,
+        )?;
         Ok(LlavaGeneration {
-            tokens: generated,
-            finish_reason: finish,
+            tokens: out.tokens,
+            finish_reason: out.finish_reason,
         })
     }
 }

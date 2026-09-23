@@ -53,6 +53,8 @@ DEFAULT_MODEL_KEY = "bonsai-qwen38-parent"
 # was calibrated against, so a re-uploaded config under the same revision name is refused too.
 PINNED_CONFIG_SHA256 = {
     "bonsai-qwen38-parent": "191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab",
+    # sc-24138: the llama-family row set (a `CausalLm` snapshot) runs on Qwen3-8B.
+    "qwen3-8b": "f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30",
 }
 BENCH_SOURCE_PATH = "crates/llm/candle-llm/tests/decode_bench.rs"
 HEAD_ONLY_BEGIN = "// >>> head-only\n"

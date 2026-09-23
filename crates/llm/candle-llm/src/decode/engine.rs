@@ -3,9 +3,9 @@
 //! **One** speculative loop over the [`StepModel`] / [`DecodeCache`] seams, with the proposal
 //! source behind the [`Proposer`] trait — the native MTP head, prompt lookup (n-gram) and a draft
 //! model ([`proposers`](super::proposers)). It replaces the Qwen-only `qwen_mtp` loop (whose
-//! verify / accept / rollback logic moved here) and is the only speculative path Qwen3.6/3.8 runs;
-//! the pre-epic `CausalLm` loops in [`speculative`](super::speculative) stay until the llama family
-//! is migrated onto the seams (S10).
+//! verify / accept / rollback logic moved here) and is the only speculative path: the pre-epic
+//! `CausalLm` prompt-lookup and draft-model loops were retired when the llama family moved onto
+//! the seams (S10, sc-24138), their proposers living in [`proposers`](super::proposers).
 //!
 //! ## One step
 //! 1. **Propose** `K` drafts after the current token `cur` (the last committed token, not yet in
@@ -37,7 +37,7 @@
 //! [`accept_token`]: core_llm::speculative::accept_token
 
 use candle_core::Tensor;
-use core_llm::speculative::{accept_token, greedy_commit, sample_weighted, Acceptance};
+use core_llm::speculative::{accept_token, greedy_commit, Acceptance};
 use core_llm::ProposerKind;
 
 use crate::decode::cancel::CancelFlag;
@@ -190,6 +190,15 @@ pub trait Proposer {
         false
     }
 
+    /// The vocabulary the proposer draws its drafts from, when it is a separate model — the
+    /// engine refuses a proposer whose vocabulary is not the target's before any inference
+    /// (a draft id past the target's vocabulary, or one naming a different token, would be
+    /// verified as garbage). `None` (the default) for a proposer that shares the target's
+    /// vocabulary by construction (MTP, n-gram).
+    fn vocab_size(&self) -> Option<usize> {
+        None
+    }
+
     /// Warm from the prefilled prompt: `prompt` is the effective prompt ids, `prompt_hidden` the
     /// target's hidden rows for every prompt position when [`wants_hidden`](Self::wants_hidden).
     fn warm(&mut self, prompt: &[i32], prompt_hidden: Option<&Tensor>) -> Result<()>;
@@ -326,6 +335,14 @@ pub fn generate_speculative_with<M: StepModel, P: Proposer>(
     let mut stats = SpeculativeStats::default();
     let mut verify_host_syncs = 0u64;
     let device = model.device();
+    if let Some(draft_vocab) = proposer.vocab_size() {
+        if draft_vocab != model.vocab_size() {
+            return Err(Error::Msg(format!(
+                "draft/target vocab mismatch: draft {draft_vocab} vs target {}",
+                model.vocab_size()
+            )));
+        }
+    }
     let wants_hidden = proposer.wants_hidden();
     let kind = proposer.kind();
 
@@ -759,16 +776,15 @@ fn decide(
             return Ok((draft_ids, committed, accepted));
         }
     }
-    // Every draft accepted: the bonus from the position past the last draft.
+    // Every draft accepted: the bonus from the position past the last draft, drawn exactly as the
+    // reference sampler draws an ordinary token — the same shaped distribution and the same single
+    // uniform, and the same argmax fallback for a fully-masked or non-finite row (a weighted draw
+    // with a `0` fallback would disagree there, and would consume a uniform the reference does
+    // not). With no drafts this is the token-at-a-time loop, so it must be the reference sampler
+    // bit for bit (sc-24138).
     let row = rows.next().expect("the bonus row");
     let mask = constraint.as_mut().map(|c| c.allowed());
-    let bonus = if greedy {
-        sample_host(row, &running, &config.sampling, rng, mask)
-    } else {
-        let target = shaped_candidates_host(row, &running, &config.sampling, mask);
-        sample_weighted(&target, rng.next_f32(), 0)
-    };
-    committed.push(bonus);
+    committed.push(sample_host(row, &running, &config.sampling, rng, mask));
     Ok((draft_ids, committed, accepted))
 }
 
@@ -778,6 +794,7 @@ mod tests {
     use std::collections::HashMap;
 
     use candle_core::{Device, Tensor};
+    use core_llm::speculative::sample_weighted;
     use serde_json::json;
 
     use super::*;

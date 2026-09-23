@@ -26,6 +26,7 @@ pub mod projection;
 pub mod quant;
 pub mod rope;
 pub mod sampler;
+pub mod step_kv_cache;
 pub mod weights;
 
 pub use attention::{
@@ -58,4 +59,5 @@ pub use projection::{
 pub use quant::QuantizedLinear;
 pub use rope::{apply_rope, rms_norm_rope, Rope};
 pub use sampler::{sample, shaped_candidates, SamplingParams, SplitMix64, TokenRng};
+pub use step_kv_cache::{KvLayout, LayerKvShape, StepKvCache};
 pub use weights::Weights;

@@ -370,6 +370,67 @@ pub fn generate_step_timed<M: StepModel>(
     ))
 }
 
+/// Decode the continuation of a **caller-prefilled** request through the step seam (sc-24138):
+/// the one speculative engine with no proposer — the token-at-a-time loop — over the request's own
+/// `cache`, positioned past the prompt by the caller's own prefill (a multimodal splice: LLaVA's
+/// image rows, the StarVector conditioning prefix). `logits` are the prefill's last-position row,
+/// `history` the effective prompt ids (the repetition-penalty window). Same sampler, stop, cancel
+/// and caller-stop contract as [`generate_speculative_with`](super::generate_speculative_with),
+/// whose record (`path = StepModel`, `proposer = none`) is returned beside the output.
+///
+/// A cancel that is already set when this is called — i.e. one that landed during the caller's
+/// prefill — is the ordinary mid-stream cancellation here (no tokens,
+/// [`FinishReason::Cancelled`]), not [`Error::Canceled`]: the caller has already run inference,
+/// and that is what the multimodal providers' own loops reported before they moved onto the seam.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_step_from_prefill<M: StepModel>(
+    model: &M,
+    cache: &mut M::Cache,
+    logits: Tensor,
+    history: &[i32],
+    config: &GenerationConfig,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    should_stop: Option<&dyn Fn() -> bool>,
+) -> Result<(GenerationOutput, DecodeRecord)> {
+    let run = super::engine::generate_speculative_with(
+        model,
+        &mut super::engine::NoProposer,
+        super::engine::SpeculativePrompt::Prefilled {
+            cache,
+            logits,
+            hidden: None,
+            history,
+            position_delta: 0,
+            warm_proposer: false,
+        },
+        config,
+        0,
+        cancel,
+        on_event,
+        None,
+        should_stop,
+        None,
+    );
+    match run {
+        Ok(run) => Ok((run.output, run.record)),
+        Err(Error::Canceled) => {
+            on_event(StreamEvent::Done {
+                reason: FinishReason::Cancelled,
+                generated: 0,
+            });
+            Ok((
+                GenerationOutput {
+                    tokens: Vec::new(),
+                    finish_reason: FinishReason::Cancelled,
+                },
+                DecodeRecord::plain(DecodePath::StepModel, 0, 0, 0),
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
