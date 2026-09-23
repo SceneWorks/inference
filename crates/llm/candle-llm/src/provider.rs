@@ -99,6 +99,32 @@ fn qwen35_recurrent_admission_bytes(c: &Qwen35Config, retained_checkpoints: usiz
     one_state.saturating_mul(1 + retained_checkpoints as u64)
 }
 
+/// The bytes admission prices for a request of `admitted_prompt` + `max_new_tokens` tokens: on
+/// the reference geometry with MTP off, and on the step seam's geometry when the engine will run
+/// — its cache retains [`STEP_MAX_CHECKPOINTS`](crate::models::qwen35::STEP_MAX_CHECKPOINTS)
+/// rollback checkpoints the reference cache does not, and its verify step overshoots the budget by
+/// `K` positions (E6, sc-24130).
+fn priced_request_bytes(
+    model: &Decoder,
+    mtp_plan: core_llm::MtpPlan,
+    admitted_prompt: usize,
+    max_new_tokens: u32,
+    vision_workspace: u64,
+) -> Option<u64> {
+    let geometry = match mtp_plan {
+        core_llm::MtpPlan::Mtp { .. } => model.step_memory_geometry(),
+        core_llm::MtpPlan::Off => model.memory_geometry(),
+    };
+    core_llm::estimate_chunked_request_bytes(
+        admitted_prompt,
+        max_new_tokens,
+        geometry,
+        vision_workspace,
+        mtp_plan.draft_tokens().unwrap_or(0),
+        EAGER_ATTN_QUERY_CHUNK_SIZE,
+    )
+}
+
 impl Decoder {
     /// The geometry admission prices for a request on the provider's own growing caches (the
     /// reference paths retain [`REFERENCE_MAX_CHECKPOINTS`](crate::models::qwen35::REFERENCE_MAX_CHECKPOINTS)).
@@ -2146,21 +2172,12 @@ impl TextLlm for LlamaProvider {
         // normally, and the record says `proposer=none` (E2, sc-24130).
         let mtp_plan = core_llm::resolve_mtp_plan(req.mtp, self.descriptor.capabilities.mtp);
         let mtp_drafts = mtp_plan.draft_tokens();
-        let required = core_llm::estimate_chunked_request_bytes(
+        let required = priced_request_bytes(
+            &self.model,
+            mtp_plan,
             admitted_prompt,
             req.max_new_tokens,
-            match mtp_plan {
-                // The engine's step cache retains rollback checkpoints the reference cache does
-                // not, and its verify step overshoots the budget by `K`.
-                core_llm::MtpPlan::Mtp { draft_tokens } => {
-                    let _ = draft_tokens;
-                    self.model.step_memory_geometry()
-                }
-                core_llm::MtpPlan::Off => self.model.memory_geometry(),
-            },
             vision_workspace,
-            mtp_drafts.unwrap_or(0),
-            EAGER_ATTN_QUERY_CHUNK_SIZE,
         )
         .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
         let available = request_available_memory(self.model.device())?;
@@ -2650,26 +2667,31 @@ impl TextLlm for LlamaProvider {
             }
         };
 
+        let span_counters = request_span.counters();
         // The engine's record is measured by the engine itself (the cache it ran on, the
-        // proposer, the per-verify-step syncs); the reference paths' record names `proposer=none`
-        // — including a request whose `MtpMode::Auto` resolved to no proposer (AC3, sc-24130).
+        // proposer, the per-verify-step syncs); the request span supplies the host-side
+        // counters. The reference paths' record names `proposer=none` — including a request
+        // whose `MtpMode::Auto` resolved to no proposer (AC3, sc-24130).
         let decode_record = match engine_record {
             Some(record) => DecodeRecord {
-                host_syncs: request_span.host_syncs(),
+                host_syncs: span_counters.host_syncs,
+                sampler: span_counters.sampler,
                 fused_primitives: request_span.fused_primitives(),
                 cuda_graphs: request_span.cuda_graphs(),
+                nvfp4_projections: request_span.nvfp4_projections(),
                 ..record
             },
             None => DecodeRecord::plain(
                 DecodePath::Reference,
                 counted.forwards() + extra_forwards,
                 out.tokens.len(),
-                request_span.host_syncs(),
+                span_counters,
             )
             .with_attn_formulation(self.model.attn_formulation())
             .with_proposer(mtp_plan.proposer())
             .with_fused_primitives(request_span.fused_primitives())
-            .with_cuda_graphs(request_span.cuda_graphs()),
+            .with_cuda_graphs(request_span.cuda_graphs())
+            .with_nvfp4_projections(request_span.nvfp4_projections()),
         };
         *self
             .last_decode
@@ -4032,5 +4054,149 @@ mod tests {
             step.recurrent_bytes(),
             qwen35_recurrent_admission_bytes(&cfg, STEP_MAX_CHECKPOINTS)
         );
+    }
+
+    #[test]
+    fn mtp_admission_prices_the_step_cache_checkpoints_and_the_verify_overshoot() {
+        use crate::models::qwen35::{REFERENCE_MAX_CHECKPOINTS, STEP_MAX_CHECKPOINTS};
+        use core_llm::{MtpCapabilities, MtpMode, MtpPlan};
+
+        let (cfg, model) = crate::models::qwen35::tests::text_model();
+        let one_state = qwen35_recurrent_admission_bytes(&cfg, 0);
+        let decoder = Decoder::Qwen35(model);
+        let advertised = Some(MtpCapabilities {
+            max_draft_tokens: 8,
+            recommended_draft_tokens: 3,
+        });
+        let (prompt, budget) = (11usize, 21u32);
+        let k = 3u32;
+        let off = core_llm::resolve_mtp_plan(MtpMode::Off, advertised);
+        let on = core_llm::resolve_mtp_plan(MtpMode::Enabled { draft_tokens: k }, advertised);
+        assert_eq!(off, MtpPlan::Off);
+        assert_eq!(on, MtpPlan::Mtp { draft_tokens: k });
+        let price = |plan| super::priced_request_bytes(&decoder, plan, prompt, budget, 0).unwrap();
+        let (off_bytes, on_bytes) = (price(off), price(on));
+
+        // The same request priced on the reference geometry with the width set: what admission
+        // would charge if it forgot the engine's cache. The step geometry's checkpoint term is
+        // the only difference, and the estimate carries the recurrent term three times with MTP.
+        let on_reference_geometry = core_llm::estimate_chunked_request_bytes(
+            prompt,
+            budget,
+            decoder.memory_geometry(),
+            0,
+            k,
+            EAGER_ATTN_QUERY_CHUNK_SIZE,
+        )
+        .unwrap();
+        let checkpoint_term = (STEP_MAX_CHECKPOINTS - REFERENCE_MAX_CHECKPOINTS) as u64 * one_state;
+        assert!(checkpoint_term > 0);
+        assert_eq!(
+            on_bytes - on_reference_geometry,
+            3 * checkpoint_term,
+            "an Enabled request is priced on the step cache's checkpoints"
+        );
+
+        // Against the Off request: the checkpoint term plus at least the K positions the verify
+        // step writes past the budget (each `layers * kv_heads * head_dim * 2 * element` bytes).
+        let geometry = decoder.step_memory_geometry();
+        let kv_per_position =
+            geometry.layers * geometry.kv_heads * geometry.head_dim * geometry.element_bytes * 2;
+        assert!(
+            on_bytes >= off_bytes + 3 * checkpoint_term + u64::from(k) * kv_per_position,
+            "Enabled {on_bytes} vs Off {off_bytes}: checkpoints {checkpoint_term} x 3, \
+             overshoot {k} x {kv_per_position}"
+        );
+        // And `Auto` without a head is priced exactly as `Off` (it runs the reference loop).
+        let auto_off = core_llm::resolve_mtp_plan(MtpMode::Auto, None);
+        assert_eq!(price(auto_off), off_bytes);
+    }
+
+    /// A tokenizer.json whose vocab is `t0..t{vocab-1}` (whitespace WordLevel), so every id of
+    /// the synthetic decoder decodes to a distinct piece.
+    fn synthetic_tokenizer_json(vocab: usize) -> String {
+        let entries: Vec<String> = (0..vocab).map(|i| format!("\"t{i}\": {i}")).collect();
+        format!(
+            r#"{{
+                "version": "1.0",
+                "added_tokens": [],
+                "normalizer": null,
+                "pre_tokenizer": {{ "type": "Whitespace" }},
+                "post_processor": null,
+                "decoder": null,
+                "model": {{ "type": "WordLevel", "vocab": {{ {} }}, "unk_token": "t0" }}
+            }}"#,
+            entries.join(", ")
+        )
+    }
+
+    #[test]
+    fn auto_mtp_on_a_qwen35_snapshot_without_a_head_decodes_normally_and_says_proposer_none() {
+        // AC3 (sc-24130), weights-free: the synthetic Qwen3.5 decoder written as a snapshot with
+        // no `mtp.*` tensors and `mtp_num_hidden_layers = 0`. The provider advertises no MTP,
+        // an `Auto` request decodes through the reference loop and the record names the proposer
+        // that ran — `none` — rather than silently downgrading; `Enabled` is refused.
+        use core_llm::{
+            LoadSpec, Message, MtpMode, ProposerKind, Sampling, TextLlm, TextLlmRequest,
+        };
+
+        let (cfg, weights, cfg_json) = crate::models::qwen35::tests::text_model_snapshot_parts();
+        let dir = tempfile::Builder::new()
+            .prefix("candle-qwen35-no-mtp-")
+            .tempdir()
+            .unwrap();
+        let mut config = serde_json::json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "model_type": "qwen3_5",
+        });
+        config["text_config"] = cfg_json["text_config"].clone();
+        assert_eq!(config["text_config"]["mtp_num_hidden_layers"], 0);
+        std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer.json"),
+            synthetic_tokenizer_json(cfg.vocab_size as usize),
+        )
+        .unwrap();
+        let tensors: std::collections::HashMap<String, candle_core::Tensor> = weights
+            .keys()
+            .map(|k| (k.to_string(), weights.get(k).unwrap().clone()))
+            .collect();
+        assert!(tensors.keys().all(|k| !k.starts_with("mtp.")));
+        candle_core::safetensors::save(&tensors, dir.path().join("model.safetensors")).unwrap();
+
+        let provider =
+            super::LlamaProvider::load(&LoadSpec::dense(dir.path().display().to_string()))
+                .expect("load the synthetic Qwen3.5 snapshot");
+        assert!(provider.descriptor().capabilities.mtp.is_none());
+
+        let request = |mtp| TextLlmRequest {
+            messages: vec![Message::user("t3 t7 t11 t2 t7 t11")],
+            sampling: Sampling::greedy(),
+            max_new_tokens: 6,
+            seed: Some(0),
+            mtp,
+            ..Default::default()
+        };
+        let out = provider
+            .generate(&request(MtpMode::Auto), &mut |_| {})
+            .expect("Auto decodes normally without a head");
+        assert_eq!(out.usage.generated_tokens, 6);
+        assert!(out.mtp.is_none());
+        let record = provider.last_decode_record().unwrap();
+        assert_eq!(record.proposer, ProposerKind::None);
+        assert_eq!(record.proposer.label(), "none");
+        assert_eq!(record.path, crate::decode::DecodePath::Reference);
+        assert_eq!(record.proposed_tokens, 0);
+        assert_eq!(record.verify_steps, 0);
+        assert_eq!(record.replay_forwards, 0);
+        // The same tokens as an explicit Off request: Auto is not a different decode.
+        let off = provider
+            .generate(&request(MtpMode::Off), &mut |_| {})
+            .unwrap();
+        assert_eq!(off.text, out.text);
+        assert!(matches!(
+            provider.generate(&request(MtpMode::Enabled { draft_tokens: 2 }), &mut |_| {}),
+            Err(core_llm::Error::Unsupported(_))
+        ));
     }
 }

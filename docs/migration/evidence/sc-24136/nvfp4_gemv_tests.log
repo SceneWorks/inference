@@ -1,0 +1,187 @@
+
+running 4 tests
+test dispatch_takes_the_gemv_for_decode_rows_and_cublaslt_otherwise_visibly ... ok
+test gemv_compiles_once_per_device_through_the_seam ... ok
+test gemv_matches_the_dequant_reference_on_every_qwen38_27b_projection_shape ... [nvfp4_gemv parity] self_attn.q_proj (+gate) [12288,5120] m=1    gemv rel-RMS 1.672e-3 (max |err| 1.550e-2, 0.296 of bound) | cuBLASLt W4A4 rel-RMS 9.400e-2 | gemv vs cuBLASLt 9.373e-2
+[nvfp4_gemv parity] self_attn.q_proj (+gate) [12288,5120] m=2    gemv rel-RMS 1.652e-3 (max |err| 1.555e-2, 0.295 of bound) | cuBLASLt W4A4 rel-RMS 9.688e-2 | gemv vs cuBLASLt 9.692e-2
+[nvfp4_gemv parity] self_attn.q_proj (+gate) [12288,5120] m=3    gemv rel-RMS 1.650e-3 (max |err| 1.554e-2, 0.298 of bound) | cuBLASLt W4A4 rel-RMS 9.593e-2 | gemv vs cuBLASLt 9.622e-2
+[nvfp4_gemv parity] self_attn.q_proj (+gate) [12288,5120] m=4    gemv rel-RMS 1.658e-3 (max |err| 1.562e-2, 0.304 of bound) | cuBLASLt W4A4 rel-RMS 9.546e-2 | gemv vs cuBLASLt 9.537e-2
+[nvfp4_gemv parity] self_attn.q_proj (+gate) [12288,5120] m=5    gemv rel-RMS 1.653e-3 (max |err| 1.562e-2, 0.298 of bound) | cuBLASLt W4A4 rel-RMS 9.496e-2 | gemv vs cuBLASLt 9.498e-2
+[nvfp4_gemv parity] self_attn.q_proj (+gate) [12288,5120] m=6    gemv rel-RMS 1.649e-3 (max |err| 1.559e-2, 0.305 of bound) | cuBLASLt W4A4 rel-RMS 9.444e-2 | gemv vs cuBLASLt 9.456e-2
+[nvfp4_gemv parity] self_attn.q_proj (+gate) [12288,5120] m=7    gemv rel-RMS 1.655e-3 (max |err| 1.562e-2, 0.307 of bound) | cuBLASLt W4A4 rel-RMS 9.482e-2 | gemv vs cuBLASLt 9.470e-2
+[nvfp4_gemv parity] self_attn.q_proj (+gate) [12288,5120] m=8    gemv rel-RMS 1.654e-3 (max |err| 1.560e-2, 0.300 of bound) | cuBLASLt W4A4 rel-RMS 9.619e-2 | gemv vs cuBLASLt 9.622e-2
+[nvfp4_gemv parity] self_attn.k_proj [1024,5120] m=1             gemv rel-RMS 1.713e-3 (max |err| 1.243e-2, 0.226 of bound) | cuBLASLt W4A4 rel-RMS 9.923e-2 | gemv vs cuBLASLt 9.886e-2
+[nvfp4_gemv parity] self_attn.k_proj [1024,5120] m=2             gemv rel-RMS 1.675e-3 (max |err| 1.496e-2, 0.284 of bound) | cuBLASLt W4A4 rel-RMS 9.595e-2 | gemv vs cuBLASLt 9.626e-2
+[nvfp4_gemv parity] self_attn.k_proj [1024,5120] m=3             gemv rel-RMS 1.658e-3 (max |err| 1.524e-2, 0.291 of bound) | cuBLASLt W4A4 rel-RMS 9.785e-2 | gemv vs cuBLASLt 9.774e-2
+[nvfp4_gemv parity] self_attn.k_proj [1024,5120] m=4             gemv rel-RMS 1.625e-3 (max |err| 1.532e-2, 0.284 of bound) | cuBLASLt W4A4 rel-RMS 9.351e-2 | gemv vs cuBLASLt 9.345e-2
+[nvfp4_gemv parity] self_attn.k_proj [1024,5120] m=5             gemv rel-RMS 1.687e-3 (max |err| 1.554e-2, 0.301 of bound) | cuBLASLt W4A4 rel-RMS 9.371e-2 | gemv vs cuBLASLt 9.380e-2
+[nvfp4_gemv parity] self_attn.k_proj [1024,5120] m=6             gemv rel-RMS 1.633e-3 (max |err| 1.536e-2, 0.291 of bound) | cuBLASLt W4A4 rel-RMS 9.252e-2 | gemv vs cuBLASLt 9.248e-2
+[nvfp4_gemv parity] self_attn.k_proj [1024,5120] m=7             gemv rel-RMS 1.664e-3 (max |err| 1.558e-2, 0.300 of bound) | cuBLASLt W4A4 rel-RMS 9.370e-2 | gemv vs cuBLASLt 9.362e-2
+[nvfp4_gemv parity] self_attn.k_proj [1024,5120] m=8             gemv rel-RMS 1.618e-3 (max |err| 1.389e-2, 0.269 of bound) | cuBLASLt W4A4 rel-RMS 9.707e-2 | gemv vs cuBLASLt 9.706e-2
+[nvfp4_gemv parity] self_attn.o_proj [5120,6144] m=1             gemv rel-RMS 1.664e-3 (max |err| 1.557e-2, 0.260 of bound) | cuBLASLt W4A4 rel-RMS 9.308e-2 | gemv vs cuBLASLt 9.335e-2
+[nvfp4_gemv parity] self_attn.o_proj [5120,6144] m=2             gemv rel-RMS 1.662e-3 (max |err| 1.553e-2, 0.254 of bound) | cuBLASLt W4A4 rel-RMS 9.731e-2 | gemv vs cuBLASLt 9.721e-2
+[nvfp4_gemv parity] self_attn.o_proj [5120,6144] m=3             gemv rel-RMS 1.639e-3 (max |err| 1.551e-2, 0.254 of bound) | cuBLASLt W4A4 rel-RMS 9.380e-2 | gemv vs cuBLASLt 9.375e-2
+[nvfp4_gemv parity] self_attn.o_proj [5120,6144] m=4             gemv rel-RMS 1.657e-3 (max |err| 1.562e-2, 0.257 of bound) | cuBLASLt W4A4 rel-RMS 9.430e-2 | gemv vs cuBLASLt 9.437e-2
+[nvfp4_gemv parity] self_attn.o_proj [5120,6144] m=5             gemv rel-RMS 1.659e-3 (max |err| 1.559e-2, 0.254 of bound) | cuBLASLt W4A4 rel-RMS 9.426e-2 | gemv vs cuBLASLt 9.430e-2
+[nvfp4_gemv parity] self_attn.o_proj [5120,6144] m=6             gemv rel-RMS 1.646e-3 (max |err| 1.561e-2, 0.259 of bound) | cuBLASLt W4A4 rel-RMS 9.608e-2 | gemv vs cuBLASLt 9.617e-2
+[nvfp4_gemv parity] self_attn.o_proj [5120,6144] m=7             gemv rel-RMS 1.658e-3 (max |err| 1.560e-2, 0.259 of bound) | cuBLASLt W4A4 rel-RMS 9.426e-2 | gemv vs cuBLASLt 9.442e-2
+[nvfp4_gemv parity] self_attn.o_proj [5120,6144] m=8             gemv rel-RMS 1.661e-3 (max |err| 1.558e-2, 0.255 of bound) | cuBLASLt W4A4 rel-RMS 9.581e-2 | gemv vs cuBLASLt 9.588e-2
+[nvfp4_gemv parity] linear_attn.in_proj_qkv [10240,5120] m=1     gemv rel-RMS 1.655e-3 (max |err| 1.500e-2, 0.286 of bound) | cuBLASLt W4A4 rel-RMS 9.520e-2 | gemv vs cuBLASLt 9.559e-2
+[nvfp4_gemv parity] linear_attn.in_proj_qkv [10240,5120] m=2     gemv rel-RMS 1.649e-3 (max |err| 1.525e-2, 0.290 of bound) | cuBLASLt W4A4 rel-RMS 9.491e-2 | gemv vs cuBLASLt 9.486e-2
+[nvfp4_gemv parity] linear_attn.in_proj_qkv [10240,5120] m=3     gemv rel-RMS 1.648e-3 (max |err| 1.545e-2, 0.299 of bound) | cuBLASLt W4A4 rel-RMS 9.528e-2 | gemv vs cuBLASLt 9.512e-2
+[nvfp4_gemv parity] linear_attn.in_proj_qkv [10240,5120] m=4     gemv rel-RMS 1.662e-3 (max |err| 1.553e-2, 0.287 of bound) | cuBLASLt W4A4 rel-RMS 9.607e-2 | gemv vs cuBLASLt 9.630e-2
+[nvfp4_gemv parity] linear_attn.in_proj_qkv [10240,5120] m=5     gemv rel-RMS 1.662e-3 (max |err| 1.559e-2, 0.304 of bound) | cuBLASLt W4A4 rel-RMS 9.445e-2 | gemv vs cuBLASLt 9.443e-2
+[nvfp4_gemv parity] linear_attn.in_proj_qkv [10240,5120] m=6     gemv rel-RMS 1.674e-3 (max |err| 1.562e-2, 0.297 of bound) | cuBLASLt W4A4 rel-RMS 9.535e-2 | gemv vs cuBLASLt 9.535e-2
+[nvfp4_gemv parity] linear_attn.in_proj_qkv [10240,5120] m=7     gemv rel-RMS 1.655e-3 (max |err| 1.561e-2, 0.298 of bound) | cuBLASLt W4A4 rel-RMS 9.442e-2 | gemv vs cuBLASLt 9.439e-2
+[nvfp4_gemv parity] linear_attn.in_proj_qkv [10240,5120] m=8     gemv rel-RMS 1.664e-3 (max |err| 1.562e-2, 0.307 of bound) | cuBLASLt W4A4 rel-RMS 9.560e-2 | gemv vs cuBLASLt 9.560e-2
+[nvfp4_gemv parity] linear_attn.in_proj_z [6144,5120] m=1        gemv rel-RMS 1.706e-3 (max |err| 1.562e-2, 0.303 of bound) | cuBLASLt W4A4 rel-RMS 9.385e-2 | gemv vs cuBLASLt 9.373e-2
+[nvfp4_gemv parity] linear_attn.in_proj_z [6144,5120] m=2        gemv rel-RMS 1.647e-3 (max |err| 1.541e-2, 0.288 of bound) | cuBLASLt W4A4 rel-RMS 9.471e-2 | gemv vs cuBLASLt 9.498e-2
+[nvfp4_gemv parity] linear_attn.in_proj_z [6144,5120] m=3        gemv rel-RMS 1.670e-3 (max |err| 1.528e-2, 0.291 of bound) | cuBLASLt W4A4 rel-RMS 9.494e-2 | gemv vs cuBLASLt 9.509e-2
+[nvfp4_gemv parity] linear_attn.in_proj_z [6144,5120] m=4        gemv rel-RMS 1.664e-3 (max |err| 1.562e-2, 0.292 of bound) | cuBLASLt W4A4 rel-RMS 9.616e-2 | gemv vs cuBLASLt 9.628e-2
+[nvfp4_gemv parity] linear_attn.in_proj_z [6144,5120] m=5        gemv rel-RMS 1.657e-3 (max |err| 1.562e-2, 0.300 of bound) | cuBLASLt W4A4 rel-RMS 9.485e-2 | gemv vs cuBLASLt 9.474e-2
+[nvfp4_gemv parity] linear_attn.in_proj_z [6144,5120] m=6        gemv rel-RMS 1.663e-3 (max |err| 1.561e-2, 0.300 of bound) | cuBLASLt W4A4 rel-RMS 9.507e-2 | gemv vs cuBLASLt 9.506e-2
+[nvfp4_gemv parity] linear_attn.in_proj_z [6144,5120] m=7        gemv rel-RMS 1.663e-3 (max |err| 1.551e-2, 0.301 of bound) | cuBLASLt W4A4 rel-RMS 9.574e-2 | gemv vs cuBLASLt 9.557e-2
+[nvfp4_gemv parity] linear_attn.in_proj_z [6144,5120] m=8        gemv rel-RMS 1.655e-3 (max |err| 1.557e-2, 0.301 of bound) | cuBLASLt W4A4 rel-RMS 9.495e-2 | gemv vs cuBLASLt 9.488e-2
+[nvfp4_gemv parity] mlp.gate_proj / up_proj [17408,5120] m=1     gemv rel-RMS 1.657e-3 (max |err| 1.539e-2, 0.302 of bound) | cuBLASLt W4A4 rel-RMS 9.650e-2 | gemv vs cuBLASLt 9.632e-2
+[nvfp4_gemv parity] mlp.gate_proj / up_proj [17408,5120] m=2     gemv rel-RMS 1.649e-3 (max |err| 1.552e-2, 0.301 of bound) | cuBLASLt W4A4 rel-RMS 9.527e-2 | gemv vs cuBLASLt 9.525e-2
+[nvfp4_gemv parity] mlp.gate_proj / up_proj [17408,5120] m=3     gemv rel-RMS 1.662e-3 (max |err| 1.559e-2, 0.299 of bound) | cuBLASLt W4A4 rel-RMS 9.516e-2 | gemv vs cuBLASLt 9.528e-2
+[nvfp4_gemv parity] mlp.gate_proj / up_proj [17408,5120] m=4     gemv rel-RMS 1.645e-3 (max |err| 1.561e-2, 0.295 of bound) | cuBLASLt W4A4 rel-RMS 9.458e-2 | gemv vs cuBLASLt 9.456e-2
+[nvfp4_gemv parity] mlp.gate_proj / up_proj [17408,5120] m=5     gemv rel-RMS 1.651e-3 (max |err| 1.554e-2, 0.306 of bound) | cuBLASLt W4A4 rel-RMS 9.566e-2 | gemv vs cuBLASLt 9.560e-2
+[nvfp4_gemv parity] mlp.gate_proj / up_proj [17408,5120] m=6     gemv rel-RMS 1.666e-3 (max |err| 1.558e-2, 0.298 of bound) | cuBLASLt W4A4 rel-RMS 9.545e-2 | gemv vs cuBLASLt 9.561e-2
+[nvfp4_gemv parity] mlp.gate_proj / up_proj [17408,5120] m=7     gemv rel-RMS 1.663e-3 (max |err| 1.562e-2, 0.306 of bound) | cuBLASLt W4A4 rel-RMS 9.508e-2 | gemv vs cuBLASLt 9.515e-2
+[nvfp4_gemv parity] mlp.gate_proj / up_proj [17408,5120] m=8     gemv rel-RMS 1.651e-3 (max |err| 1.556e-2, 0.297 of bound) | cuBLASLt W4A4 rel-RMS 9.474e-2 | gemv vs cuBLASLt 9.468e-2
+[nvfp4_gemv parity] mlp.down_proj [5120,17408] m=1               gemv rel-RMS 1.665e-3 (max |err| 2.666e-2, 0.091 of bound) | cuBLASLt W4A4 rel-RMS 9.551e-2 | gemv vs cuBLASLt 9.538e-2
+[nvfp4_gemv parity] mlp.down_proj [5120,17408] m=2               gemv rel-RMS 1.681e-3 (max |err| 2.989e-2, 0.104 of bound) | cuBLASLt W4A4 rel-RMS 9.783e-2 | gemv vs cuBLASLt 9.794e-2
+[nvfp4_gemv parity] mlp.down_proj [5120,17408] m=3               gemv rel-RMS 1.656e-3 (max |err| 3.110e-2, 0.107 of bound) | cuBLASLt W4A4 rel-RMS 9.568e-2 | gemv vs cuBLASLt 9.569e-2
+[nvfp4_gemv parity] mlp.down_proj [5120,17408] m=4               gemv rel-RMS 1.664e-3 (max |err| 2.940e-2, 0.100 of bound) | cuBLASLt W4A4 rel-RMS 9.505e-2 | gemv vs cuBLASLt 9.517e-2
+[nvfp4_gemv parity] mlp.down_proj [5120,17408] m=5               gemv rel-RMS 1.658e-3 (max |err| 3.114e-2, 0.106 of bound) | cuBLASLt W4A4 rel-RMS 9.409e-2 | gemv vs cuBLASLt 9.408e-2
+[nvfp4_gemv parity] mlp.down_proj [5120,17408] m=6               gemv rel-RMS 1.651e-3 (max |err| 3.114e-2, 0.106 of bound) | cuBLASLt W4A4 rel-RMS 9.570e-2 | gemv vs cuBLASLt 9.575e-2
+[nvfp4_gemv parity] mlp.down_proj [5120,17408] m=7               gemv rel-RMS 1.667e-3 (max |err| 3.099e-2, 0.105 of bound) | cuBLASLt W4A4 rel-RMS 9.518e-2 | gemv vs cuBLASLt 9.530e-2
+[nvfp4_gemv parity] mlp.down_proj [5120,17408] m=8               gemv rel-RMS 1.670e-3 (max |err| 3.093e-2, 0.106 of bound) | cuBLASLt W4A4 rel-RMS 9.471e-2 | gemv vs cuBLASLt 9.469e-2
+[nvfp4_gemv parity] mtp.fc [5120,10240] m=1                      gemv rel-RMS 1.651e-3 (max |err| 1.561e-2, 0.141 of bound) | cuBLASLt W4A4 rel-RMS 9.836e-2 | gemv vs cuBLASLt 9.853e-2
+[nvfp4_gemv parity] mtp.fc [5120,10240] m=2                      gemv rel-RMS 1.685e-3 (max |err| 2.095e-2, 0.143 of bound) | cuBLASLt W4A4 rel-RMS 9.398e-2 | gemv vs cuBLASLt 9.419e-2
+[nvfp4_gemv parity] mtp.fc [5120,10240] m=3                      gemv rel-RMS 1.659e-3 (max |err| 1.562e-2, 0.141 of bound) | cuBLASLt W4A4 rel-RMS 9.546e-2 | gemv vs cuBLASLt 9.548e-2
+[nvfp4_gemv parity] mtp.fc [5120,10240] m=4                      gemv rel-RMS 1.682e-3 (max |err| 2.141e-2, 0.145 of bound) | cuBLASLt W4A4 rel-RMS 9.385e-2 | gemv vs cuBLASLt 9.389e-2
+[nvfp4_gemv parity] mtp.fc [5120,10240] m=5                      gemv rel-RMS 1.658e-3 (max |err| 2.719e-2, 0.182 of bound) | cuBLASLt W4A4 rel-RMS 9.483e-2 | gemv vs cuBLASLt 9.462e-2
+[nvfp4_gemv parity] mtp.fc [5120,10240] m=6                      gemv rel-RMS 1.659e-3 (max |err| 1.562e-2, 0.142 of bound) | cuBLASLt W4A4 rel-RMS 9.527e-2 | gemv vs cuBLASLt 9.537e-2
+[nvfp4_gemv parity] mtp.fc [5120,10240] m=7                      gemv rel-RMS 1.662e-3 (max |err| 2.767e-2, 0.194 of bound) | cuBLASLt W4A4 rel-RMS 9.493e-2 | gemv vs cuBLASLt 9.488e-2
+[nvfp4_gemv parity] mtp.fc [5120,10240] m=8                      gemv rel-RMS 1.663e-3 (max |err| 2.940e-2, 0.206 of bound) | cuBLASLt W4A4 rel-RMS 9.443e-2 | gemv vs cuBLASLt 9.438e-2
+[nvfp4_gemv parity] lm_head [248320,5120] m=1                    gemv rel-RMS 1.649e-3 (max |err| 1.522e-2, 0.293 of bound) | cuBLASLt W4A4 rel-RMS 9.289e-2 | gemv vs cuBLASLt 9.389e-2
+[nvfp4_gemv parity] lm_head [248320,5120] m=2                    gemv rel-RMS 1.655e-3 (max |err| 1.528e-2, 0.289 of bound) | cuBLASLt W4A4 rel-RMS 9.609e-2 | gemv vs cuBLASLt 9.586e-2
+[nvfp4_gemv parity] lm_head [248320,5120] m=3                    gemv rel-RMS 1.649e-3 (max |err| 1.556e-2, 0.297 of bound) | cuBLASLt W4A4 rel-RMS 9.566e-2 | gemv vs cuBLASLt 9.569e-2
+[nvfp4_gemv parity] lm_head [248320,5120] m=4                    gemv rel-RMS 1.651e-3 (max |err| 1.560e-2, 0.304 of bound) | cuBLASLt W4A4 rel-RMS 9.615e-2 | gemv vs cuBLASLt 9.582e-2
+[nvfp4_gemv parity] lm_head [248320,5120] m=5                    gemv rel-RMS 1.655e-3 (max |err| 1.562e-2, 0.306 of bound) | cuBLASLt W4A4 rel-RMS 9.510e-2 | gemv vs cuBLASLt 9.561e-2
+[nvfp4_gemv parity] lm_head [248320,5120] m=6                    gemv rel-RMS 1.661e-3 (max |err| 1.561e-2, 0.305 of bound) | cuBLASLt W4A4 rel-RMS 9.445e-2 | gemv vs cuBLASLt 9.475e-2
+[nvfp4_gemv parity] lm_head [248320,5120] m=7                    gemv rel-RMS 1.659e-3 (max |err| 1.562e-2, 0.301 of bound) | cuBLASLt W4A4 rel-RMS 9.554e-2 | gemv vs cuBLASLt 9.554e-2
+[nvfp4_gemv parity] lm_head [248320,5120] m=8                    gemv rel-RMS 1.654e-3 (max |err| 1.558e-2, 0.302 of bound) | cuBLASLt W4A4 rel-RMS 9.537e-2 | gemv vs cuBLASLt 9.517e-2
+[nvfp4_gemv parity] edge K=17 [16,17] m=1                        gemv rel-RMS 9.923e-4 (max |err| 1.663e-4, 0.284 of bound) | cuBLASLt W4A4 rel-RMS 1.206e-1 | gemv vs cuBLASLt 1.175e-1
+[nvfp4_gemv parity] edge K=17 [16,17] m=2                        gemv rel-RMS 1.511e-3 (max |err| 2.584e-4, 0.451 of bound) | cuBLASLt W4A4 rel-RMS 9.411e-2 | gemv vs cuBLASLt 9.449e-2
+[nvfp4_gemv parity] edge K=17 [16,17] m=3                        gemv rel-RMS 1.912e-3 (max |err| 8.397e-4, 0.437 of bound) | cuBLASLt W4A4 rel-RMS 1.034e-1 | gemv vs cuBLASLt 1.009e-1
+[nvfp4_gemv parity] edge K=17 [16,17] m=4                        gemv rel-RMS 1.390e-3 (max |err| 4.614e-4, 0.442 of bound) | cuBLASLt W4A4 rel-RMS 9.618e-2 | gemv vs cuBLASLt 9.974e-2
+[nvfp4_gemv parity] edge K=17 [16,17] m=5                        gemv rel-RMS 1.733e-3 (max |err| 4.574e-4, 0.455 of bound) | cuBLASLt W4A4 rel-RMS 1.157e-1 | gemv vs cuBLASLt 1.149e-1
+[nvfp4_gemv parity] edge K=17 [16,17] m=6                        gemv rel-RMS 1.854e-3 (max |err| 4.882e-4, 0.452 of bound) | cuBLASLt W4A4 rel-RMS 9.470e-2 | gemv vs cuBLASLt 9.367e-2
+[nvfp4_gemv parity] edge K=17 [16,17] m=7                        gemv rel-RMS 1.734e-3 (max |err| 4.871e-4, 0.481 of bound) | cuBLASLt W4A4 rel-RMS 9.005e-2 | gemv vs cuBLASLt 8.966e-2
+[nvfp4_gemv parity] edge K=17 [16,17] m=8                        gemv rel-RMS 1.730e-3 (max |err| 4.558e-4, 0.449 of bound) | cuBLASLt W4A4 rel-RMS 8.030e-2 | gemv vs cuBLASLt 8.013e-2
+[nvfp4_gemv parity] edge K=80 (pads to 96) [96,80] m=1           gemv rel-RMS 1.875e-3 (max |err| 1.587e-3, 0.415 of bound) | cuBLASLt W4A4 rel-RMS 1.089e-1 | gemv vs cuBLASLt 1.123e-1
+[nvfp4_gemv parity] edge K=80 (pads to 96) [96,80] m=2           gemv rel-RMS 1.584e-3 (max |err| 1.467e-3, 0.471 of bound) | cuBLASLt W4A4 rel-RMS 1.041e-1 | gemv vs cuBLASLt 1.028e-1
+[nvfp4_gemv parity] edge K=80 (pads to 96) [96,80] m=3           gemv rel-RMS 1.621e-3 (max |err| 9.507e-4, 0.439 of bound) | cuBLASLt W4A4 rel-RMS 9.134e-2 | gemv vs cuBLASLt 9.212e-2
+[nvfp4_gemv parity] edge K=80 (pads to 96) [96,80] m=4           gemv rel-RMS 1.736e-3 (max |err| 9.652e-4, 0.470 of bound) | cuBLASLt W4A4 rel-RMS 1.009e-1 | gemv vs cuBLASLt 1.020e-1
+[nvfp4_gemv parity] edge K=80 (pads to 96) [96,80] m=5           gemv rel-RMS 1.658e-3 (max |err| 1.789e-3, 0.469 of bound) | cuBLASLt W4A4 rel-RMS 9.716e-2 | gemv vs cuBLASLt 9.900e-2
+[nvfp4_gemv parity] edge K=80 (pads to 96) [96,80] m=6           gemv rel-RMS 1.682e-3 (max |err| 1.150e-3, 0.450 of bound) | cuBLASLt W4A4 rel-RMS 9.541e-2 | gemv vs cuBLASLt 9.584e-2
+[nvfp4_gemv parity] edge K=80 (pads to 96) [96,80] m=7           gemv rel-RMS 1.710e-3 (max |err| 1.822e-3, 0.486 of bound) | cuBLASLt W4A4 rel-RMS 8.467e-2 | gemv vs cuBLASLt 8.463e-2
+[nvfp4_gemv parity] edge K=80 (pads to 96) [96,80] m=8           gemv rel-RMS 1.639e-3 (max |err| 1.914e-3, 0.461 of bound) | cuBLASLt W4A4 rel-RMS 9.407e-2 | gemv vs cuBLASLt 9.263e-2
+[nvfp4_gemv parity] edge K=1000 [32,1000] m=1                    gemv rel-RMS 1.625e-3 (max |err| 2.013e-3, 0.377 of bound) | cuBLASLt W4A4 rel-RMS 1.255e-1 | gemv vs cuBLASLt 1.250e-1
+[nvfp4_gemv parity] edge K=1000 [32,1000] m=2                    gemv rel-RMS 1.644e-3 (max |err| 3.550e-3, 0.366 of bound) | cuBLASLt W4A4 rel-RMS 8.793e-2 | gemv vs cuBLASLt 8.905e-2
+[nvfp4_gemv parity] edge K=1000 [32,1000] m=3                    gemv rel-RMS 1.630e-3 (max |err| 3.237e-3, 0.343 of bound) | cuBLASLt W4A4 rel-RMS 9.236e-2 | gemv vs cuBLASLt 9.052e-2
+[nvfp4_gemv parity] edge K=1000 [32,1000] m=4                    gemv rel-RMS 1.719e-3 (max |err| 3.799e-3, 0.342 of bound) | cuBLASLt W4A4 rel-RMS 9.050e-2 | gemv vs cuBLASLt 9.182e-2
+[nvfp4_gemv parity] edge K=1000 [32,1000] m=5                    gemv rel-RMS 1.678e-3 (max |err| 3.513e-3, 0.378 of bound) | cuBLASLt W4A4 rel-RMS 1.104e-1 | gemv vs cuBLASLt 1.103e-1
+[nvfp4_gemv parity] edge K=1000 [32,1000] m=6                    gemv rel-RMS 1.605e-3 (max |err| 3.711e-3, 0.426 of bound) | cuBLASLt W4A4 rel-RMS 9.809e-2 | gemv vs cuBLASLt 9.847e-2
+[nvfp4_gemv parity] edge K=1000 [32,1000] m=7                    gemv rel-RMS 1.787e-3 (max |err| 4.452e-3, 0.435 of bound) | cuBLASLt W4A4 rel-RMS 9.397e-2 | gemv vs cuBLASLt 9.526e-2
+[nvfp4_gemv parity] edge K=1000 [32,1000] m=8                    gemv rel-RMS 1.545e-3 (max |err| 3.069e-3, 0.380 of bound) | cuBLASLt W4A4 rel-RMS 9.929e-2 | gemv vs cuBLASLt 9.911e-2
+[nvfp4_gemv parity] edge K=5130 [128,5130] m=1                   gemv rel-RMS 1.642e-3 (max |err| 1.148e-2, 0.211 of bound) | cuBLASLt W4A4 rel-RMS 9.900e-2 | gemv vs cuBLASLt 9.959e-2
+[nvfp4_gemv parity] edge K=5130 [128,5130] m=2                   gemv rel-RMS 1.593e-3 (max |err| 7.654e-3, 0.212 of bound) | cuBLASLt W4A4 rel-RMS 9.090e-2 | gemv vs cuBLASLt 9.115e-2
+[nvfp4_gemv parity] edge K=5130 [128,5130] m=3                   gemv rel-RMS 1.757e-3 (max |err| 1.146e-2, 0.221 of bound) | cuBLASLt W4A4 rel-RMS 9.933e-2 | gemv vs cuBLASLt 9.907e-2
+[nvfp4_gemv parity] edge K=5130 [128,5130] m=4                   gemv rel-RMS 1.662e-3 (max |err| 7.628e-3, 0.203 of bound) | cuBLASLt W4A4 rel-RMS 9.106e-2 | gemv vs cuBLASLt 9.136e-2
+[nvfp4_gemv parity] edge K=5130 [128,5130] m=5                   gemv rel-RMS 1.620e-3 (max |err| 7.793e-3, 0.219 of bound) | cuBLASLt W4A4 rel-RMS 9.906e-2 | gemv vs cuBLASLt 9.894e-2
+[nvfp4_gemv parity] edge K=5130 [128,5130] m=6                   gemv rel-RMS 1.707e-3 (max |err| 1.473e-2, 0.241 of bound) | cuBLASLt W4A4 rel-RMS 9.380e-2 | gemv vs cuBLASLt 9.415e-2
+[nvfp4_gemv parity] edge K=5130 [128,5130] m=7                   gemv rel-RMS 1.693e-3 (max |err| 1.063e-2, 0.217 of bound) | cuBLASLt W4A4 rel-RMS 9.602e-2 | gemv vs cuBLASLt 9.585e-2
+[nvfp4_gemv parity] edge K=5130 [128,5130] m=8                   gemv rel-RMS 1.689e-3 (max |err| 1.264e-2, 0.230 of bound) | cuBLASLt W4A4 rel-RMS 9.631e-2 | gemv vs cuBLASLt 9.662e-2
+[nvfp4_gemv parity] wrote C:\Users\Michael\AppData\Local\Temp\claude\D--repos-ChatWorks--claude-worktrees-shortcut-epic-24128-4c11bb\e80b586c-dde2-4d4d-84b1-e3247a13f59c\scratchpad\ev\parity.json
+ok
+test nvfp4_gemv_microbench ... [nvfp4_gemv bench] self_attn.q_proj (+gate)     [ 12288, 5120] m=1  gemv     23.2 us (  1524 GB/s)  cuBLASLt    127.1 us  (5.47x)
+[nvfp4_gemv bench] self_attn.q_proj (+gate)     [ 12288, 5120] m=2  gemv     22.6 us (  1571 GB/s)  cuBLASLt    128.7 us  (5.70x)
+[nvfp4_gemv bench] self_attn.q_proj (+gate)     [ 12288, 5120] m=3  gemv     22.6 us (  1571 GB/s)  cuBLASLt    118.4 us  (5.24x)
+[nvfp4_gemv bench] self_attn.q_proj (+gate)     [ 12288, 5120] m=4  gemv     23.2 us (  1534 GB/s)  cuBLASLt    114.1 us  (4.93x)
+[nvfp4_gemv bench] self_attn.q_proj (+gate)     [ 12288, 5120] m=5  gemv     25.0 us (  1423 GB/s)  cuBLASLt    120.3 us  (4.81x)
+[nvfp4_gemv bench] self_attn.q_proj (+gate)     [ 12288, 5120] m=6  gemv     24.7 us (  1441 GB/s)  cuBLASLt    116.3 us  (4.71x)
+[nvfp4_gemv bench] self_attn.q_proj (+gate)     [ 12288, 5120] m=7  gemv     24.6 us (  1448 GB/s)  cuBLASLt    116.5 us  (4.74x)
+[nvfp4_gemv bench] self_attn.q_proj (+gate)     [ 12288, 5120] m=8  gemv     25.0 us (  1429 GB/s)  cuBLASLt    115.2 us  (4.61x)
+[nvfp4_gemv bench] self_attn.k_proj             [  1024, 5120] m=1  gemv     10.0 us (   298 GB/s)  cuBLASLt    131.6 us  (13.23x)
+[nvfp4_gemv bench] self_attn.k_proj             [  1024, 5120] m=2  gemv     12.3 us (   242 GB/s)  cuBLASLt    131.8 us  (10.73x)
+[nvfp4_gemv bench] self_attn.k_proj             [  1024, 5120] m=3  gemv     10.3 us (   290 GB/s)  cuBLASLt    135.8 us  (13.20x)
+[nvfp4_gemv bench] self_attn.k_proj             [  1024, 5120] m=4  gemv     10.4 us (   288 GB/s)  cuBLASLt    137.9 us  (13.26x)
+[nvfp4_gemv bench] self_attn.k_proj             [  1024, 5120] m=5  gemv     10.5 us (   288 GB/s)  cuBLASLt    142.2 us  (13.59x)
+[nvfp4_gemv bench] self_attn.k_proj             [  1024, 5120] m=6  gemv     10.3 us (   292 GB/s)  cuBLASLt    134.0 us  (12.95x)
+[nvfp4_gemv bench] self_attn.k_proj             [  1024, 5120] m=7  gemv      9.9 us (   305 GB/s)  cuBLASLt    135.9 us  (13.66x)
+[nvfp4_gemv bench] self_attn.k_proj             [  1024, 5120] m=8  gemv     11.2 us (   273 GB/s)  cuBLASLt    139.2 us  (12.46x)
+[nvfp4_gemv bench] self_attn.o_proj             [  5120, 6144] m=1  gemv     12.6 us (  1410 GB/s)  cuBLASLt    129.6 us  (10.32x)
+[nvfp4_gemv bench] self_attn.o_proj             [  5120, 6144] m=2  gemv     13.1 us (  1351 GB/s)  cuBLASLt    130.9 us  (9.97x)
+[nvfp4_gemv bench] self_attn.o_proj             [  5120, 6144] m=3  gemv     14.4 us (  1232 GB/s)  cuBLASLt    128.9 us  (8.94x)
+[nvfp4_gemv bench] self_attn.o_proj             [  5120, 6144] m=4  gemv     14.4 us (  1239 GB/s)  cuBLASLt    132.1 us  (9.20x)
+[nvfp4_gemv bench] self_attn.o_proj             [  5120, 6144] m=5  gemv     14.4 us (  1239 GB/s)  cuBLASLt    132.8 us  (9.24x)
+[nvfp4_gemv bench] self_attn.o_proj             [  5120, 6144] m=6  gemv     14.7 us (  1209 GB/s)  cuBLASLt    130.4 us  (8.84x)
+[nvfp4_gemv bench] self_attn.o_proj             [  5120, 6144] m=7  gemv     15.0 us (  1193 GB/s)  cuBLASLt    128.4 us  (8.58x)
+[nvfp4_gemv bench] self_attn.o_proj             [  5120, 6144] m=8  gemv     14.5 us (  1232 GB/s)  cuBLASLt    108.1 us  (7.45x)
+[nvfp4_gemv bench] linear_attn.in_proj_qkv      [ 10240, 5120] m=1  gemv     18.6 us (  1588 GB/s)  cuBLASLt    110.2 us  (5.93x)
+[nvfp4_gemv bench] linear_attn.in_proj_qkv      [ 10240, 5120] m=2  gemv     19.4 us (  1521 GB/s)  cuBLASLt    152.1 us  (7.83x)
+[nvfp4_gemv bench] linear_attn.in_proj_qkv      [ 10240, 5120] m=3  gemv     24.4 us (  1214 GB/s)  cuBLASLt    262.6 us  (10.78x)
+[nvfp4_gemv bench] linear_attn.in_proj_qkv      [ 10240, 5120] m=4  gemv     24.8 us (  1192 GB/s)  cuBLASLt    258.3 us  (10.40x)
+[nvfp4_gemv bench] linear_attn.in_proj_qkv      [ 10240, 5120] m=5  gemv     24.2 us (  1227 GB/s)  cuBLASLt    259.1 us  (10.73x)
+[nvfp4_gemv bench] linear_attn.in_proj_qkv      [ 10240, 5120] m=6  gemv     24.7 us (  1202 GB/s)  cuBLASLt    256.2 us  (10.38x)
+[nvfp4_gemv bench] linear_attn.in_proj_qkv      [ 10240, 5120] m=7  gemv     24.5 us (  1214 GB/s)  cuBLASLt    258.3 us  (10.55x)
+[nvfp4_gemv bench] linear_attn.in_proj_qkv      [ 10240, 5120] m=8  gemv     24.3 us (  1224 GB/s)  cuBLASLt    257.3 us  (10.59x)
+[nvfp4_gemv bench] linear_attn.in_proj_z        [  6144, 5120] m=1  gemv     17.3 us (  1025 GB/s)  cuBLASLt    115.3 us  (6.67x)
+[nvfp4_gemv bench] linear_attn.in_proj_z        [  6144, 5120] m=2  gemv     14.6 us (  1218 GB/s)  cuBLASLt    122.7 us  (8.43x)
+[nvfp4_gemv bench] linear_attn.in_proj_z        [  6144, 5120] m=3  gemv     14.9 us (  1191 GB/s)  cuBLASLt    115.2 us  (7.73x)
+[nvfp4_gemv bench] linear_attn.in_proj_z        [  6144, 5120] m=4  gemv     15.3 us (  1164 GB/s)  cuBLASLt    117.3 us  (7.67x)
+[nvfp4_gemv bench] linear_attn.in_proj_z        [  6144, 5120] m=5  gemv     16.5 us (  1081 GB/s)  cuBLASLt    115.5 us  (7.01x)
+[nvfp4_gemv bench] linear_attn.in_proj_z        [  6144, 5120] m=6  gemv     17.8 us (  1001 GB/s)  cuBLASLt    117.4 us  (6.59x)
+[nvfp4_gemv bench] linear_attn.in_proj_z        [  6144, 5120] m=7  gemv     18.0 us (   991 GB/s)  cuBLASLt    117.3 us  (6.51x)
+[nvfp4_gemv bench] linear_attn.in_proj_z        [  6144, 5120] m=8  gemv     14.4 us (  1238 GB/s)  cuBLASLt    142.7 us  (9.88x)
+[nvfp4_gemv bench] mlp.gate_proj / up_proj      [ 17408, 5120] m=1  gemv     30.2 us (  1663 GB/s)  cuBLASLt    130.5 us  (4.33x)
+[nvfp4_gemv bench] mlp.gate_proj / up_proj      [ 17408, 5120] m=2  gemv     27.8 us (  1805 GB/s)  cuBLASLt    124.8 us  (4.48x)
+[nvfp4_gemv bench] mlp.gate_proj / up_proj      [ 17408, 5120] m=3  gemv     28.7 us (  1751 GB/s)  cuBLASLt    125.7 us  (4.38x)
+[nvfp4_gemv bench] mlp.gate_proj / up_proj      [ 17408, 5120] m=4  gemv     28.7 us (  1753 GB/s)  cuBLASLt    125.6 us  (4.37x)
+[nvfp4_gemv bench] mlp.gate_proj / up_proj      [ 17408, 5120] m=5  gemv     32.7 us (  1540 GB/s)  cuBLASLt    125.1 us  (3.82x)
+[nvfp4_gemv bench] mlp.gate_proj / up_proj      [ 17408, 5120] m=6  gemv     31.9 us (  1579 GB/s)  cuBLASLt    124.6 us  (3.90x)
+[nvfp4_gemv bench] mlp.gate_proj / up_proj      [ 17408, 5120] m=7  gemv     30.7 us (  1643 GB/s)  cuBLASLt    127.5 us  (4.15x)
+[nvfp4_gemv bench] mlp.gate_proj / up_proj      [ 17408, 5120] m=8  gemv     30.8 us (  1642 GB/s)  cuBLASLt    126.3 us  (4.10x)
+[nvfp4_gemv bench] mlp.down_proj                [  5120,17408] m=1  gemv     29.8 us (  1682 GB/s)  cuBLASLt    140.8 us  (4.72x)
+[nvfp4_gemv bench] mlp.down_proj                [  5120,17408] m=2  gemv     30.7 us (  1634 GB/s)  cuBLASLt    142.5 us  (4.64x)
+[nvfp4_gemv bench] mlp.down_proj                [  5120,17408] m=3  gemv     30.8 us (  1634 GB/s)  cuBLASLt    138.2 us  (4.49x)
+[nvfp4_gemv bench] mlp.down_proj                [  5120,17408] m=4  gemv     31.2 us (  1612 GB/s)  cuBLASLt    143.1 us  (4.59x)
+[nvfp4_gemv bench] mlp.down_proj                [  5120,17408] m=5  gemv     32.8 us (  1537 GB/s)  cuBLASLt    140.7 us  (4.30x)
+[nvfp4_gemv bench] mlp.down_proj                [  5120,17408] m=6  gemv     32.8 us (  1537 GB/s)  cuBLASLt    142.4 us  (4.34x)
+[nvfp4_gemv bench] mlp.down_proj                [  5120,17408] m=7  gemv     33.5 us (  1505 GB/s)  cuBLASLt    151.6 us  (4.52x)
+[nvfp4_gemv bench] mlp.down_proj                [  5120,17408] m=8  gemv     31.0 us (  1631 GB/s)  cuBLASLt    142.9 us  (4.62x)
+[nvfp4_gemv bench] mtp.fc                       [  5120,10240] m=1  gemv     18.6 us (  1588 GB/s)  cuBLASLt    125.0 us  (6.73x)
+[nvfp4_gemv bench] mtp.fc                       [  5120,10240] m=2  gemv     19.1 us (  1546 GB/s)  cuBLASLt    122.4 us  (6.40x)
+[nvfp4_gemv bench] mtp.fc                       [  5120,10240] m=3  gemv     20.1 us (  1470 GB/s)  cuBLASLt    118.2 us  (5.87x)
+[nvfp4_gemv bench] mtp.fc                       [  5120,10240] m=4  gemv     20.5 us (  1444 GB/s)  cuBLASLt    119.3 us  (5.82x)
+[nvfp4_gemv bench] mtp.fc                       [  5120,10240] m=5  gemv     20.8 us (  1426 GB/s)  cuBLASLt    119.8 us  (5.76x)
+[nvfp4_gemv bench] mtp.fc                       [  5120,10240] m=6  gemv     22.1 us (  1342 GB/s)  cuBLASLt    118.7 us  (5.37x)
+[nvfp4_gemv bench] mtp.fc                       [  5120,10240] m=7  gemv     22.3 us (  1331 GB/s)  cuBLASLt    117.7 us  (5.27x)
+[nvfp4_gemv bench] mtp.fc                       [  5120,10240] m=8  gemv     20.6 us (  1443 GB/s)  cuBLASLt    122.6 us  (5.95x)
+[nvfp4_gemv bench] lm_head                      [248320, 5120] m=1  gemv    522.0 us (  1371 GB/s)  cuBLASLt    733.9 us  (1.41x)
+[nvfp4_gemv bench] lm_head                      [248320, 5120] m=2  gemv    532.6 us (  1345 GB/s)  cuBLASLt    687.2 us  (1.29x)
+[nvfp4_gemv bench] lm_head                      [248320, 5120] m=3  gemv    559.6 us (  1281 GB/s)  cuBLASLt    772.9 us  (1.38x)
+[nvfp4_gemv bench] lm_head                      [248320, 5120] m=4  gemv    586.2 us (  1224 GB/s)  cuBLASLt    684.2 us  (1.17x)
+[nvfp4_gemv bench] lm_head                      [248320, 5120] m=5  gemv    599.8 us (  1197 GB/s)  cuBLASLt    764.2 us  (1.27x)
+[nvfp4_gemv bench] lm_head                      [248320, 5120] m=6  gemv    617.1 us (  1164 GB/s)  cuBLASLt    689.7 us  (1.12x)
+[nvfp4_gemv bench] lm_head                      [248320, 5120] m=7  gemv    627.4 us (  1146 GB/s)  cuBLASLt    769.7 us  (1.23x)
+[nvfp4_gemv bench] lm_head                      [248320, 5120] m=8  gemv    606.2 us (  1186 GB/s)  cuBLASLt    774.0 us  (1.28x)
+[nvfp4_gemv bench] wrote C:\Users\Michael\AppData\Local\Temp\claude\D--repos-ChatWorks--claude-worktrees-shortcut-epic-24128-4c11bb\e80b586c-dde2-4d4d-84b1-e3247a13f59c\scratchpad\ev\kernel_microbench.json
+ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.37s
+

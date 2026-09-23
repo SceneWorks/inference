@@ -3128,6 +3128,18 @@ pub(crate) mod tests {
         (cfg, model)
     }
 
+    /// The parts a test needs to write the synthetic decoder as a snapshot directory: its config,
+    /// its weights (no `mtp.*` tensors) and the config JSON (`text_config` with
+    /// `mtp_num_hidden_layers = 0`) — the provider-level AC3 fixture (sc-24130).
+    pub(crate) fn text_model_snapshot_parts() -> (Qwen35Config, Weights, Value) {
+        let mut json = cfg_json();
+        json["text_config"]["mtp_num_hidden_layers"] = json!(0);
+        let cfg = Qwen35Config::from_json(&json).unwrap();
+        let weights = synthetic_weights(&cfg);
+        assert!(!Qwen35Mtp::complete_in(&weights, &cfg));
+        (cfg, weights, json)
+    }
+
     /// The synthetic decoder with `layers` decoder layers (the schedule keeps interval 4) — a
     /// *different* model of the same vocabulary, the draft model of the engine's tests.
     pub(crate) fn text_model_with_layers(layers: usize) -> (Qwen35Config, Qwen35Model) {

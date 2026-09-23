@@ -143,6 +143,101 @@ impl Sampling {
     pub fn is_greedy(&self) -> bool {
         self.temperature <= 0.0
     }
+
+    /// Whether a history-dependent logit penalty (repetition or presence) is requested. Penalties
+    /// read the token history, so a backend applies them on the host.
+    pub fn is_penalized(&self) -> bool {
+        self.repetition_penalty != 1.0 || self.presence_penalty != 0.0
+    }
+
+    /// The backend-neutral sampler routing policy (epic sc-24128, story sc-24133): which path a
+    /// backend should draw this request's tokens on, given whether a constraint (grammar / JSON
+    /// mask) is active. Temperature, top-k and top-p are expressible on the accelerator; a
+    /// constraint mask or a history penalty is not, so those requests take the host path with the
+    /// reason named. A backend may still route a [`SamplerPath::Device`] request to the host for a
+    /// backend reason ([`HostSampleReason::DeviceUnavailable`]) — never silently: the chosen path is
+    /// what it reports.
+    pub fn sampler_path(&self, constrained: bool) -> SamplerPath {
+        if constrained {
+            SamplerPath::Host(HostSampleReason::Constraint)
+        } else if self.is_penalized() {
+            SamplerPath::Host(HostSampleReason::Penalty)
+        } else {
+            SamplerPath::Device
+        }
+    }
+}
+
+/// Where a backend drew a token (epic sc-24128, story sc-24133). Telemetry, never a silent
+/// downgrade: a request that ran on the host says so and says why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SamplerPath {
+    /// Sampled on the accelerator; only the chosen token id crosses to the host.
+    Device,
+    /// The logits row was copied to the host and sampled there.
+    Host(HostSampleReason),
+}
+
+impl SamplerPath {
+    /// `"device"` or `"host"`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            SamplerPath::Device => "device",
+            SamplerPath::Host(_) => "host",
+        }
+    }
+
+    /// Why the host path ran, or `None` on the device path.
+    pub fn host_reason(&self) -> Option<HostSampleReason> {
+        match self {
+            SamplerPath::Device => None,
+            SamplerPath::Host(reason) => Some(*reason),
+        }
+    }
+}
+
+impl std::fmt::Display for SamplerPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SamplerPath::Device => f.write_str("device"),
+            SamplerPath::Host(reason) => write!(f, "host:{}", reason.label()),
+        }
+    }
+}
+
+/// Why a token was sampled on the host rather than on the accelerator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HostSampleReason {
+    /// A repetition or presence penalty reads the token history.
+    Penalty,
+    /// A grammar / JSON constraint mask is applied on the host.
+    Constraint,
+    /// The backend has no device sampler for this device (CPU, a build without the accelerator
+    /// feature, a shape the device kernel does not serve, or a sampler kernel that failed to
+    /// compile or load on this device).
+    DeviceUnavailable,
+    /// The temperature is positive but its reciprocal is not a usable finite scale (a subnormal
+    /// temperature, `+inf`, or NaN): the device kernel cannot shape weights from it, so the host
+    /// reference handles the request.
+    DegenerateTemperature,
+    /// Speculative acceptance needs the full shaped distribution on the host.
+    SpeculativeDistribution,
+    /// The caller forced the host reference sampler (parity checks and benchmarks).
+    Reference,
+}
+
+impl HostSampleReason {
+    /// Stable lower-case label for logs and evidence rows.
+    pub fn label(&self) -> &'static str {
+        match self {
+            HostSampleReason::Penalty => "penalty",
+            HostSampleReason::Constraint => "constraint",
+            HostSampleReason::DeviceUnavailable => "device_unavailable",
+            HostSampleReason::DegenerateTemperature => "degenerate_temperature",
+            HostSampleReason::SpeculativeDistribution => "speculative_distribution",
+            HostSampleReason::Reference => "reference",
+        }
+    }
 }
 
 /// A request to generate text.
@@ -225,6 +320,49 @@ impl TextLlmRequest {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sampler_path_policy_routes_penalties_and_constraints_to_host() {
+        let mut s = Sampling {
+            temperature: 0.8,
+            top_p: 0.9,
+            top_k: 40,
+            ..Sampling::default()
+        };
+        assert_eq!(s.sampler_path(false), SamplerPath::Device);
+        assert_eq!(
+            s.sampler_path(true),
+            SamplerPath::Host(HostSampleReason::Constraint)
+        );
+        assert_eq!(Sampling::greedy().sampler_path(false), SamplerPath::Device);
+        s.presence_penalty = 0.5;
+        assert_eq!(
+            s.sampler_path(false),
+            SamplerPath::Host(HostSampleReason::Penalty)
+        );
+        s.presence_penalty = 0.0;
+        s.repetition_penalty = 1.1;
+        assert_eq!(
+            s.sampler_path(false).to_string(),
+            "host:penalty",
+            "telemetry names the reason"
+        );
+        assert_eq!(
+            s.sampler_path(true),
+            SamplerPath::Host(HostSampleReason::Constraint),
+            "a constraint outranks a penalty"
+        );
+        assert_eq!(SamplerPath::Device.to_string(), "device");
+        assert_eq!(SamplerPath::Device.host_reason(), None);
+        assert_eq!(
+            SamplerPath::Host(HostSampleReason::DeviceUnavailable).label(),
+            "host"
+        );
+        assert_eq!(
+            SamplerPath::Host(HostSampleReason::DegenerateTemperature).to_string(),
+            "host:degenerate_temperature"
+        );
+    }
+
     use super::*;
 
     #[test]

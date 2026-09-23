@@ -364,12 +364,13 @@ pub fn generate_step_timed<M: StepModel + ?Sized>(
         DecodePath::StepModel,
         forwards,
         generated.len(),
-        span.host_syncs(),
+        span.counters(),
     )
     .with_kv_cache(cache.kv_kind())
     .with_attn_formulation(model.attn_formulation(&cache))
     .with_fused_primitives(span.fused_primitives())
-    .with_cuda_graphs(span.cuda_graphs());
+    .with_cuda_graphs(span.cuda_graphs())
+    .with_nvfp4_projections(span.nvfp4_projections());
     Ok((
         GenerationOutput {
             tokens: generated,

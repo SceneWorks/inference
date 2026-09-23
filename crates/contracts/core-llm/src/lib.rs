@@ -95,7 +95,8 @@ pub use registry::{
     ModelRequirements, TextLlmRegistration, TextLlmRegistry, TextLlmRegistryBuilder,
 };
 pub use request::{
-    LoadSpec, MtpMode, Quantize, ReasoningEffort, Sampling, TextLlmRequest, ThinkingMode,
+    HostSampleReason, LoadSpec, MtpMode, Quantize, ReasoningEffort, SamplerPath, Sampling,
+    TextLlmRequest, ThinkingMode,
 };
 pub use resource::{
     admit_request_memory, admit_request_memory_with_geometry, available_host_memory_bytes,
