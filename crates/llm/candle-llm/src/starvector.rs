@@ -4,17 +4,21 @@
 //! wrapper: this module accepts only the published 1B image-to-SVG shape and records the native
 //! preprocessing and weight-tree facts needed by the Candle model implementation.
 
+use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::sync::Mutex;
 
 use candle_core::{Device, Tensor};
 use serde_json::Value;
 
-use crate::decode::stream::default_seed;
+use crate::decode::{
+    generate_step_from_prefill, FinishReason as DecodeFinish, GenerationConfig,
+    StreamEvent as DecodeEvent,
+};
 use crate::error::{Error, Result};
 use crate::image::resize_bicubic_u8;
 use crate::models::StarVectorModel;
-use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
+use crate::primitives::sampler::SamplingParams;
 use crate::primitives::{input_ids, Weights};
 
 /// The only snapshot family this provider admits.
@@ -51,12 +55,26 @@ fn concatenate_conditioning_embeddings(vision: &Tensor, text: &Tensor) -> Result
     Ok(Tensor::cat(&[&vision, text], 1)?)
 }
 
-/// Sample one vocabulary row, preserving the provider's single-image shape contract.
+/// The contract's sampling knobs as the sampler's.
+fn sampling_params(sampling: &core_llm::Sampling) -> SamplingParams {
+    SamplingParams {
+        temperature: sampling.temperature,
+        top_p: sampling.top_p,
+        top_k: sampling.top_k,
+        presence_penalty: sampling.presence_penalty,
+        repetition_penalty: sampling.repetition_penalty,
+        repetition_context: sampling.repetition_context,
+    }
+}
+
+/// Sample one vocabulary row, preserving the provider's single-image shape contract — the
+/// selection rule the shared decode engine applies to every row it draws a token from.
+#[cfg(test)]
 fn next_token_id(
     logits: &Tensor,
     history: &[i32],
     sampling: &core_llm::Sampling,
-    rng: &mut SplitMix64,
+    rng: &mut crate::primitives::sampler::SplitMix64,
 ) -> Result<i32> {
     let dims = logits.dims();
     let vocabulary = dims.last().copied().unwrap_or(0);
@@ -70,20 +88,7 @@ fn next_token_id(
             "starvector token selection requires one nonempty vocabulary row; got {dims:?}"
         )));
     }
-    sample(
-        logits,
-        history,
-        &SamplingParams {
-            temperature: sampling.temperature,
-            top_p: sampling.top_p,
-            top_k: sampling.top_k,
-            presence_penalty: sampling.presence_penalty,
-            repetition_penalty: sampling.repetition_penalty,
-            repetition_context: sampling.repetition_context,
-        },
-        rng,
-        None,
-    )
+    crate::primitives::sampler::sample(logits, history, &sampling_params(sampling), rng, None)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -556,18 +561,26 @@ impl core_llm::StarVectorProvider for CandleStarVectorProvider {
                 &self.device,
             )
             .map_err(to_core)?;
-        let mut model = self
+        // The decoder is stateless (the request's K/V live in its own step cache); the lock only
+        // serializes generations, bounding the device memory the provider holds to one request.
+        let model = self
             .model
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        model.reset();
         let result = (|| {
             let vision = model.image_embeddings(&pixels).map_err(to_core)?;
             let ids = input_ids(&self.prompt, pixels.device())
                 .map_err(|e| core_llm::Error::Msg(e.to_string()))?;
-            let text = model.decoder.embeddings(&ids).map_err(to_core)?;
+            let decoder = &model.decoder;
+            let text = decoder.embeddings(&ids).map_err(to_core)?;
             let initial = concatenate_conditioning_embeddings(&vision, &text).map_err(to_core)?;
-            let mut logits = model.decoder.forward_embeds(&initial, 0).map_err(to_core)?;
+            // The conditioning prefill goes into the shared step cache (growing backing: the
+            // provider has no admission surface to price a whole-budget preallocation), then the
+            // continuation decodes through the step seam (sc-24138).
+            let mut cache = decoder.new_step_cache();
+            let logits = decoder
+                .forward_embeds(&initial, &mut cache)
+                .map_err(to_core)?;
             let mut stream = core_llm::StarVectorBoundedStream::new(req);
             match seed_svg_prompt(&mut stream, events)? {
                 core_llm::StarVectorStreamStatus::Continue => {}
@@ -575,54 +588,84 @@ impl core_llm::StarVectorProvider for CandleStarVectorProvider {
                     return Ok(emit_done(stream.output()?, events));
                 }
             }
-            let mut history = self.prompt.clone();
-            let mut rng = SplitMix64::new(req.text_request.seed.unwrap_or_else(default_seed));
+            let config = GenerationConfig {
+                max_new_tokens: req.text_request.max_new_tokens as usize,
+                sampling: sampling_params(&req.text_request.sampling),
+                seed: req.text_request.seed,
+                stop_tokens: vec![EOS_TOKEN_ID],
+            };
             let mut detok = self.tokenizer.decode_stream(true);
-            for index in 0..req.text_request.max_new_tokens {
-                if req.text_request.cancel.is_cancelled() {
-                    break;
-                }
-                let id = next_token_id(&logits, &history, &req.text_request.sampling, &mut rng)
-                    .map_err(to_core)?;
-                history.push(id);
-                if id == EOS_TOKEN_ID {
-                    if let Some(delta) = detok.finish()? {
-                        let status = stream.push_decoded_suffix(&delta, started.elapsed())?;
-                        if matches!(
-                            status,
-                            core_llm::StarVectorStreamStatus::Continue
-                                | core_llm::StarVectorStreamStatus::Stop(
-                                    core_llm::StarVectorFinishReason::CompleteRoot
-                                )
-                        ) {
-                            events(core_llm::StarVectorStreamEvent::Source { text: delta, index });
-                        }
-                        if matches!(status, core_llm::StarVectorStreamStatus::Stop(_)) {
-                            break;
+            let stopped = Cell::new(false);
+            let failure = RefCell::new(None);
+            let generated = {
+                let mut on_token = |event: DecodeEvent| {
+                    let DecodeEvent::Token { id, step } = event else {
+                        return;
+                    };
+                    if stopped.get() {
+                        return;
+                    }
+                    let pushed = decode_generated_svg_token(&mut detok, id).and_then(|decoded| {
+                        push_decoded_svg_token(
+                            &mut stream,
+                            decoded,
+                            started.elapsed(),
+                            step as u32 + 1,
+                            events,
+                        )
+                    });
+                    match pushed {
+                        Ok(core_llm::StarVectorStreamStatus::Continue) => {}
+                        Ok(core_llm::StarVectorStreamStatus::Stop(_)) => stopped.set(true),
+                        Err(error) => {
+                            *failure.borrow_mut() = Some(error);
+                            stopped.set(true);
                         }
                     }
+                };
+                generate_step_from_prefill(
+                    decoder,
+                    &mut cache,
+                    logits,
+                    &self.prompt,
+                    &config,
+                    &req.text_request.cancel,
+                    &mut on_token,
+                    Some(&|| stopped.get()),
+                )
+                .map_err(to_core)?
+                .0
+            };
+            if let Some(error) = failure.into_inner() {
+                return Err(error);
+            }
+            // The end-of-text token ends the stream the way the pre-seam loop did: flush the
+            // detokenizer's held bytes as source at the token's index, then mark the EOS.
+            if generated.finish_reason == DecodeFinish::StopToken && !stopped.get() {
+                let index = generated.tokens.len() as u32;
+                let mut ended = false;
+                if let Some(delta) = detok.finish()? {
+                    let status = stream.push_decoded_suffix(&delta, started.elapsed())?;
+                    if matches!(
+                        status,
+                        core_llm::StarVectorStreamStatus::Continue
+                            | core_llm::StarVectorStreamStatus::Stop(
+                                core_llm::StarVectorFinishReason::CompleteRoot
+                            )
+                    ) {
+                        events(core_llm::StarVectorStreamEvent::Source { text: delta, index });
+                    }
+                    ended = matches!(status, core_llm::StarVectorStreamStatus::Stop(_));
                 }
-                let decoded = decode_generated_svg_token(&mut detok, id)?;
-                let status = push_decoded_svg_token(
-                    &mut stream,
-                    decoded,
-                    started.elapsed(),
-                    index + 1,
-                    events,
-                )?;
-                if matches!(status, core_llm::StarVectorStreamStatus::Stop(_)) {
-                    break;
+                if !ended {
+                    push_decoded_svg_token(
+                        &mut stream,
+                        DecodedSvgToken::Eos,
+                        started.elapsed(),
+                        index + 1,
+                        events,
+                    )?;
                 }
-                let next = input_ids(&[id], pixels.device())
-                    .map_err(|e| core_llm::Error::Msg(e.to_string()))?;
-                let embed = model.decoder.embeddings(&next).map_err(to_core)?;
-                logits = model
-                    .decoder
-                    .forward_embeds(
-                        &embed,
-                        IMAGE_TOKEN_COUNT + self.prompt.len() + index as usize,
-                    )
-                    .map_err(to_core)?;
             }
             if stream.output().is_err() {
                 if let Some(delta) = detok.finish()? {
@@ -648,7 +691,6 @@ impl core_llm::StarVectorProvider for CandleStarVectorProvider {
             }
             Ok(emit_done(stream.output()?, events))
         })();
-        model.reset();
         result
     }
 }
@@ -672,6 +714,7 @@ fn to_core(error: Error) -> core_llm::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::primitives::SplitMix64;
     use candle_core::DType;
     use core_llm::{StarVectorBoundedStream, StarVectorProvider, StarVectorStreamEvent, TextLlm};
     use core_llm_testkit::{starvector_conformance, StarVectorProfile};

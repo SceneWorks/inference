@@ -285,6 +285,10 @@ impl<D: StepModel> Proposer for DraftModelProposer<'_, D> {
         ProposerKind::Draft
     }
 
+    fn vocab_size(&self) -> Option<usize> {
+        Some(self.draft.vocab_size())
+    }
+
     fn warm(&mut self, prompt: &[i32], _: Option<&Tensor>) -> Result<()> {
         let mut cache = self.draft.new_cache_for(self.budget, self.max_drafts + 1)?;
         // The K + 1 single-token draft steps each start a forward; the step start they must

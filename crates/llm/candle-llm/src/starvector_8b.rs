@@ -20,7 +20,7 @@ use core_llm::{
 };
 
 use crate::decode::{
-    generate_from_prefill_with_stop, FinishReason as DecodeFinish, GenerationConfig,
+    generate_step_from_prefill, FinishReason as DecodeFinish, GenerationConfig,
     StreamEvent as DecodeEvent,
 };
 use crate::error::{Error, Result};
@@ -28,7 +28,7 @@ use crate::image::SiglipImageProcessor;
 use crate::models::{SiglipVisionConfig, SiglipVisionTower, StarCoder2, StarCoder2Config};
 use crate::primitives::nn::{layer_norm, linear, silu};
 use crate::primitives::sampler::SamplingParams;
-use crate::primitives::{input_ids, KvCache, Weights};
+use crate::primitives::{input_ids, StepKvCache, Weights};
 
 pub const PROVIDER_ID: &str = "candle-starvector-8b";
 const SNAPSHOT_REPOSITORY: &str = "starvector/starvector-8b-im2svg";
@@ -74,11 +74,11 @@ impl StarVector8bModel {
         })
     }
 
-    fn prefill(
-        &self,
-        image: &core_llm::ImageRef,
-        prompt: &[i32],
-    ) -> Result<(Tensor, Box<dyn KvCache>)> {
+    /// Encode the image, join it to the `<svg` prompt embeddings and prefill them into a fresh
+    /// step-seam cache for the decoder (growing backing: the provider has no admission surface to
+    /// price a preallocation of the whole 16k-token SVG budget). The continuation then decodes
+    /// through the step seam (sc-24138).
+    fn prefill(&self, image: &core_llm::ImageRef, prompt: &[i32]) -> Result<(Tensor, StepKvCache)> {
         let pixels = preprocess_image(image, self.decoder.device())?;
         let vision = self.vision.forward(&pixels)?.last_hidden_state;
         let vision = self.adapter.forward(&vision, self.decoder.dtype())?;
@@ -86,10 +86,8 @@ impl StarVector8bModel {
             .decoder
             .embed(&input_ids(prompt, self.decoder.device())?)?;
         let embeds = Tensor::cat(&[&vision, &text], 1)?;
-        let mut cache: Box<dyn KvCache> = Box::new(self.decoder.cache());
-        let logits = self
-            .decoder
-            .logits_from_embeds(&embeds, cache.as_mut(), 0)?;
+        let mut cache = self.decoder.new_step_cache();
+        let logits = self.decoder.step_prefill_from_embeds(&embeds, &mut cache)?;
         Ok((logits, cache))
     }
 }
@@ -268,15 +266,18 @@ impl CandleStarVector8bProvider {
                 }
             }
         };
-        let generated = generate_from_prefill_with_stop(
+        // A cancel that landed during the prefill is still the typed pre-decode cancellation.
+        if request.text_request.cancel.is_cancelled() {
+            return Err(CoreError::Canceled);
+        }
+        let (generated, _record) = generate_step_from_prefill(
             &self.model.decoder,
-            cache.as_mut(),
+            &mut cache,
             first,
-            prompt,
+            &prompt,
             &config,
             &request.text_request.cancel,
             &mut decode,
-            None,
             Some(&|| stopped.get()),
         )
         .map_err(to_core)?;

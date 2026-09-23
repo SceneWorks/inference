@@ -27,7 +27,7 @@ use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
     cuda_graphs_enabled, generate_from_prefill_with_stop, generate_speculative_with,
     graph_workspace_admission_bytes, ConstraintMask, CountingDecode, Decode, DecodePath,
-    DecodeRecord, FinishReason, GenerationConfig, GraphRunner, GraphTally, MtpProposer,
+    DecodeRecord, FinishReason, GenerationConfig, GraphRunner, GraphTally, MtpProposer, NoProposer,
     RequestSpan, RewindableConstraintMask, SpeculativePrompt, StepModel, StreamEvent,
 };
 use crate::device::select_device;
@@ -42,7 +42,7 @@ use crate::primitives::attention::EAGER_ATTN_QUERY_CHUNK_SIZE;
 use crate::primitives::nn::input_ids;
 use crate::primitives::projection::{ProjectionFormat, QuantSpec, WeightCensus};
 use crate::primitives::sampler::SamplingParams;
-use crate::primitives::{KvCache, Weights};
+use crate::primitives::{KvCache, StepKvCache, Weights};
 
 /// The registry id of this provider.
 pub const PROVIDER_ID: &str = "candle-llama";
@@ -175,10 +175,19 @@ impl Decoder {
             match self {
                 Decoder::Causal(m) => {
                     let c = m.config();
+                    // The widest layer's KV geometry — the one layer with the largest
+                    // `kv_heads × head width` — so `layers × kv_heads × head_dim` covers every
+                    // layer's cache whatever its type, without crossing one layer type's head count
+                    // with another's width: Gemma 4's full-attention layers can be wider than the
+                    // scalar `head_dim` / `num_key_value_heads` (its sliding layers'), and
+                    // DeepSeek-V2's materialized MLA caches full-head `qk_nope + qk_rope` keys
+                    // (sc-24138, E6 — the step seam's static preallocation is this layout, and the
+                    // engine path the provider runs for this family allocates it).
+                    let (kv_heads, head_dim) = m.kv_layout().widest_layer();
                     (
                         c.num_heads,
-                        c.num_kv_heads,
-                        c.head_dim,
+                        kv_heads as i32,
+                        head_dim as i32,
                         c.num_layers,
                         c.hidden_size,
                         c.intermediate_size,
@@ -220,12 +229,16 @@ impl Decoder {
         }
     }
 
-    /// How the decoder computes grouped-query attention (story sc-24132), for the decode record.
-    /// The generic causal family still runs `repeat_kv`-expanded attention over its growing cache
-    /// (its migration is S10), so it reports `Expanded`; the Qwen3.5 hybrid reports its selector.
+    /// How the decoder computes grouped-query attention (story sc-24132), for the decode record of
+    /// the provider's reference loop (the engine stamps its own record from the cache it ran on).
+    /// The generic causal family reports what its selector really ran over the growing cache
+    /// (sc-24138: `Gqa` by default — the static cache's arithmetic — when every layer can express
+    /// it; `Expanded` when that pre-migration arithmetic is selected as a comparison, or when a
+    /// layer cannot attend un-expanded: a Gemma 2 soft-cap, a Gemma 4 sliding window, MLA); the
+    /// Qwen3.5 hybrid reports its selector.
     fn attn_formulation(&self) -> crate::primitives::AttnFormulation {
         match self {
-            Decoder::Causal(_) => crate::primitives::AttnFormulation::Expanded,
+            Decoder::Causal(m) => m.effective_attn_formulation(m.attn_formulation()),
             Decoder::Qwen35(m) => m.attn_formulation(),
         }
     }
@@ -696,6 +709,11 @@ pub struct LlamaProvider {
     /// What the load produced (sc-24135): the requested weight format and, for the qwen3_5 family,
     /// the resident weight census by projection kind. Read through [`LlamaProvider::load_record`].
     load_record: LoadRecord,
+    /// Which loop a llama-family ([`CausalLm`]) request decodes on (sc-24138):
+    /// [`DecodePath::StepModel`] — the unified engine over the step seam on the static KV cache,
+    /// the default — or [`DecodePath::Reference`], the `Decode` loop kept as the parity oracle.
+    /// Selected with [`LlamaProvider::set_causal_decode_path`].
+    causal_decode: DecodePath,
 }
 
 /// The load telemetry of a [`LlamaProvider`] (sc-24135, epic sc-24128 E2): which weight format was
@@ -871,6 +889,46 @@ impl LlamaProvider {
             .last_decode
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Select the loop a llama-family ([`CausalLm`]) request decodes on (sc-24138):
+    /// [`DecodePath::StepModel`] (the default) runs the unified engine over the step seam on the
+    /// static KV cache; [`DecodePath::Reference`] runs the `Decode` loop on the growing cache — the
+    /// parity oracle. Any other path is [`CoreError::InvalidRequest`]: speculation is chosen per
+    /// request (MTP), not here. The Qwen3.5-family hybrid and a Qwen-VL multimodal request are not
+    /// affected.
+    pub fn set_causal_decode_path(&mut self, path: DecodePath) -> CoreResult<()> {
+        match path {
+            DecodePath::StepModel | DecodePath::Reference => {
+                self.causal_decode = path;
+                Ok(())
+            }
+            other => Err(CoreError::InvalidRequest(format!(
+                "[candle-llama] the llama-family decode path is `step_model` or `reference`, not \
+                 `{}`",
+                other.label()
+            ))),
+        }
+    }
+
+    /// The loop a llama-family request decodes on (see
+    /// [`set_causal_decode_path`](Self::set_causal_decode_path)).
+    pub fn causal_decode_path(&self) -> DecodePath {
+        self.causal_decode
+    }
+
+    /// The llama-family decoder when this request decodes through the engine: a [`CausalLm`]
+    /// with the engine path selected and not a Qwen-VL multimodal request (whose DeepStack /
+    /// M-RoPE prefill shares the hybrid's [`VlmDecode`] reference loop).
+    fn causal_engine_model(&self, qwen_vl_multimodal: bool) -> Option<&CausalLm> {
+        match &self.model {
+            Decoder::Causal(model)
+                if self.causal_decode == DecodePath::StepModel && !qwen_vl_multimodal =>
+            {
+                Some(model)
+            }
+            _ => None,
+        }
     }
 
     /// Load a provider from `spec.source`: either a `*.gguf` file (loaded directly via Candle's
@@ -1153,6 +1211,7 @@ impl LlamaProvider {
             stop_tokens,
             constraint_table: OnceCell::new(),
             last_decode: Mutex::new(None),
+            causal_decode: DecodePath::StepModel,
             vision,
             gemma4,
             load_record: LoadRecord {
@@ -1287,6 +1346,7 @@ impl LlamaProvider {
                 template,
                 stop_tokens: ck.stop_tokens,
                 last_decode: Mutex::new(None),
+                causal_decode: DecodePath::StepModel,
                 constraint_table: OnceCell::new(),
                 vision,
                 gemma4: None,
@@ -1340,6 +1400,7 @@ impl LlamaProvider {
             template,
             stop_tokens,
             last_decode: Mutex::new(None),
+            causal_decode: DecodePath::StepModel,
             constraint_table: OnceCell::new(),
             vision: None, // GGUF is the dense Llama-family path only — no Qwen3.6 VLM.
             // Likewise no Gemma 4 front-ends: the GGUF path reconstructs a dense text decoder,
@@ -1371,6 +1432,7 @@ impl LlamaProvider {
             template: Box::new(Llama3Template),
             stop_tokens,
             last_decode: Mutex::new(None),
+            causal_decode: DecodePath::StepModel,
             constraint_table: OnceCell::new(),
             vision: None,
             gemma4: None,
@@ -2529,6 +2591,115 @@ impl TextLlm for LlamaProvider {
                 });
                 engine_record = Some(run.record);
                 run.output
+            } else if let Some(model) = self.causal_engine_model(mm.is_some()) {
+                // The llama family (text, and the Gemma 4 soft-token splice) through the unified
+                // engine over the step seam, on the static KV cache (sc-24138). The family has no
+                // MTP head, so the resolved plan is `Off` and the proposer is none; admission above
+                // priced the static preallocation (the widest layer's geometry, E6). The reference
+                // `Decode` loop below stays selectable (`set_causal_decode_path`) as the oracle.
+                let constraint = json_mask
+                    .as_mut()
+                    .map(|m| m as &mut dyn RewindableConstraintMask);
+                // The CUDA-graph runner (sc-24134) wraps the model when the switch is on, as on
+                // the MTP path: the family declares its steps uncapturable
+                // (`positions_host_scalar`), so every step runs eager and the record names why.
+                let graphs = GraphRunner::new(model);
+                let stepper: &dyn StepModel<Cache = StepKvCache> = if cuda_graphs_enabled() {
+                    &graphs
+                } else {
+                    model
+                };
+                let run = match &g4 {
+                    Some(m) => {
+                        // Gemma 4 multimodal: the spliced embeddings prefill the step cache on
+                        // ordinary causal 1-D positions (no M-RoPE, so no position shift), then the
+                        // continuation decodes through the engine. The expanded prompt (soft-token
+                        // spans included) is only known here, so its static preallocation is
+                        // admitted here, before anything is allocated.
+                        let capacity = m.expanded_ids.len().saturating_add(config.max_new_tokens);
+                        core_llm::admit_request_memory_with_geometry(
+                            m.expanded_ids.len(),
+                            req.max_new_tokens,
+                            self.descriptor.capabilities.max_context_tokens,
+                            model.static_kv_bytes(capacity) as u64,
+                            request_available_memory(model.device())?,
+                        )?;
+                        let mut cache = model.new_cache_for(capacity, 0).map_err(to_core)?;
+                        let logits = model
+                            .step_prefill_from_embeds(&m.embeds, &mut cache)
+                            .map_err(to_core)?;
+                        model
+                            .device()
+                            .synchronize()
+                            .map_err(|e| to_core(e.into()))?;
+                        let prefill = generation_started.elapsed();
+                        let decode_started = std::time::Instant::now();
+                        let run = generate_speculative_with(
+                            stepper,
+                            &mut NoProposer,
+                            SpeculativePrompt::Prefilled {
+                                cache: &mut cache,
+                                logits,
+                                hidden: None,
+                                history: &m.expanded_ids,
+                                position_delta: 0,
+                                warm_proposer: true,
+                            },
+                            &config,
+                            0,
+                            &req.cancel,
+                            &mut sink,
+                            constraint,
+                            should_stop_opt,
+                            None,
+                        )
+                        .map_err(to_core)?;
+                        model
+                            .device()
+                            .synchronize()
+                            .map_err(|e| to_core(e.into()))?;
+                        phase_prefill = prefill;
+                        phase_decode_started = decode_started;
+                        run
+                    }
+                    None => {
+                        model
+                            .device()
+                            .synchronize()
+                            .map_err(|e| to_core(e.into()))?;
+                        let mut prefill = None;
+                        let mut decode_started = None;
+                        let mut boundary = || -> crate::error::Result<()> {
+                            model.device().synchronize()?;
+                            prefill = Some(generation_started.elapsed());
+                            decode_started = Some(std::time::Instant::now());
+                            Ok(())
+                        };
+                        let run = generate_speculative_with(
+                            stepper,
+                            &mut NoProposer,
+                            SpeculativePrompt::Tokens(&prompt_ids),
+                            &config,
+                            0,
+                            &req.cancel,
+                            &mut sink,
+                            constraint,
+                            should_stop_opt,
+                            Some(&mut boundary),
+                        )
+                        .map_err(to_core)?;
+                        model
+                            .device()
+                            .synchronize()
+                            .map_err(|e| to_core(e.into()))?;
+                        phase_prefill = prefill.unwrap_or_else(|| generation_started.elapsed());
+                        phase_decode_started =
+                            decode_started.unwrap_or_else(std::time::Instant::now);
+                        run
+                    }
+                };
+                engine_record = Some(run.record);
+                run.output
             } else {
                 let constraint = json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask);
                 match &mm {
@@ -3187,6 +3358,9 @@ mod tests {
         EAGER_ATTN_QUERY_CHUNK_SIZE,
     };
     use super::{Decode as _, Decoder};
+    use crate::models::CausalLm;
+    use candle_core::Tensor;
+    use std::collections::HashMap;
 
     #[test]
     fn accelerator_only_selector_is_exact_to_qwen38_and_bonsai() {
@@ -3844,6 +4018,274 @@ mod tests {
         assert_eq!(
             cache.memory().live_bytes as u64,
             model.static_kv_bytes(capacity + 3) as u64 + live_recurrent
+        );
+    }
+
+    /// A tiny dense causal decoder from a JSON config and seeded weights (llama or Gemma 4 keys).
+    fn tiny_causal_from(cfg: serde_json::Value, weights: HashMap<String, Tensor>) -> CausalLm {
+        let cfg = crate::config::ModelConfig::from_json(&cfg).unwrap();
+        CausalLm::from_weights(
+            &crate::primitives::Weights::from_map(weights, candle_core::Device::Cpu),
+            "",
+            cfg,
+        )
+        .unwrap()
+    }
+
+    fn tiny_llama_for_admission() -> CausalLm {
+        use crate::primitives::{SplitMix64, TokenRng};
+        let (vocab, hidden, inter, heads, kv_heads, layers) = (40usize, 32, 64, 4, 2, 3);
+        let head_dim = hidden / heads;
+        let mut rng = SplitMix64::new(0x000A_D417);
+        let mut rand = |dims: &[usize]| {
+            let n: usize = dims.iter().product();
+            let data: Vec<f32> = (0..n).map(|_| rng.next_f32() - 0.5).collect();
+            Tensor::from_vec(data, dims.to_vec(), &candle_core::Device::Cpu).unwrap()
+        };
+        let mut w = HashMap::new();
+        w.insert(
+            "model.embed_tokens.weight".to_string(),
+            rand(&[vocab, hidden]),
+        );
+        w.insert("model.norm.weight".to_string(), rand(&[hidden]));
+        w.insert("lm_head.weight".to_string(), rand(&[vocab, hidden]));
+        for i in 0..layers {
+            let p = |s: &str| format!("model.layers.{i}.{s}");
+            w.insert(p("input_layernorm.weight"), rand(&[hidden]));
+            w.insert(p("post_attention_layernorm.weight"), rand(&[hidden]));
+            w.insert(
+                p("self_attn.q_proj.weight"),
+                rand(&[heads * head_dim, hidden]),
+            );
+            w.insert(
+                p("self_attn.k_proj.weight"),
+                rand(&[kv_heads * head_dim, hidden]),
+            );
+            w.insert(
+                p("self_attn.v_proj.weight"),
+                rand(&[kv_heads * head_dim, hidden]),
+            );
+            w.insert(
+                p("self_attn.o_proj.weight"),
+                rand(&[hidden, heads * head_dim]),
+            );
+            w.insert(p("mlp.gate_proj.weight"), rand(&[inter, hidden]));
+            w.insert(p("mlp.up_proj.weight"), rand(&[inter, hidden]));
+            w.insert(p("mlp.down_proj.weight"), rand(&[hidden, inter]));
+        }
+        tiny_causal_from(
+            serde_json::json!({
+                "architectures": ["LlamaForCausalLM"], "model_type": "llama",
+                "hidden_size": hidden, "intermediate_size": inter, "num_hidden_layers": layers,
+                "num_attention_heads": heads, "num_key_value_heads": kv_heads,
+                "vocab_size": vocab, "rms_norm_eps": 1e-6, "rope_theta": 10000.0,
+                "max_position_embeddings": 256, "tie_word_embeddings": false
+            }),
+            w,
+        )
+    }
+
+    /// The shared Gemma 4 decoder fixture: sliding layers 2 KV heads × 8, full layers
+    /// `attention_k_eq_v` with 1 global KV head × 16 — equal `kv_heads × head width` per layer.
+    ///
+    /// With `k_eq_v` off (`k_eq_v = false`) the full layers keep the ordinary two KV heads at the
+    /// global width 16 (upstream gates `num_global_key_value_heads` on the flag) and get their own
+    /// `v_proj`: 2 × 16 per full layer against the sliding layers' 2 × 8, so the full layers are
+    /// the widest and the scalar `num_key_value_heads × head_dim` (2 × 8) under-prices them.
+    fn tiny_gemma4_for_admission_with(k_eq_v: bool) -> CausalLm {
+        use crate::primitives::{SplitMix64, TokenRng};
+        let g: serde_json::Value = serde_json::from_str(include_str!(
+            "../../testdata/gemma4/gemma4_decoder_goldens.json"
+        ))
+        .unwrap();
+        let mut w = HashMap::new();
+        for (key, spec) in g["weights"].as_object().unwrap() {
+            let shape: Vec<usize> = spec["shape"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_u64().unwrap() as usize)
+                .collect();
+            let data: Vec<f32> = spec["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect();
+            w.insert(
+                key.clone(),
+                Tensor::from_vec(data, shape, &candle_core::Device::Cpu).unwrap(),
+            );
+        }
+        let mut cfg = g["config"].clone();
+        if !k_eq_v {
+            cfg["text_config"]["attention_k_eq_v"] = serde_json::json!(false);
+            let text = &cfg["text_config"];
+            let hidden = text["hidden_size"].as_u64().unwrap() as usize;
+            let kv_heads = text["num_key_value_heads"].as_u64().unwrap() as usize;
+            let global_head_dim = text["global_head_dim"].as_u64().unwrap() as usize;
+            let mut rng = SplitMix64::new(0x6E4F_A11D);
+            let mut rand = |dims: [usize; 2]| {
+                let data: Vec<f32> = (0..dims[0] * dims[1])
+                    .map(|_| (rng.next_f32() - 0.5) * 0.2)
+                    .collect();
+                Tensor::from_vec(data, dims.to_vec(), &candle_core::Device::Cpu).unwrap()
+            };
+            let layer_types = text["layer_types"].as_array().unwrap().clone();
+            for (i, kind) in layer_types.iter().enumerate() {
+                if kind.as_str() == Some("full_attention") {
+                    let rows = kv_heads * global_head_dim;
+                    w.insert(
+                        format!("model.layers.{i}.self_attn.k_proj.weight"),
+                        rand([rows, hidden]),
+                    );
+                    w.insert(
+                        format!("model.layers.{i}.self_attn.v_proj.weight"),
+                        rand([rows, hidden]),
+                    );
+                }
+            }
+        }
+        tiny_causal_from(cfg, w)
+    }
+
+    /// E6 (sc-24138): the provider decodes the llama family through the engine on the step seam's
+    /// static KV cache, which preallocates every caching layer's K/V for the request bound at
+    /// once, and admission prices it: the causal geometry carries the one widest layer's
+    /// `(kv_heads, head width)`, so `layers × kv_heads × head_dim × 2` covers every layer.
+    ///
+    /// * llama (uniform) and Gemma 4 with `k_eq_v` (sliding 2 × 8, full 1 × 16 — equal widths):
+    ///   the KV term is **exactly** the preallocation — no inflation (the old independent maxima,
+    ///   2 heads × 16, charged twice what any layer holds);
+    /// * Gemma 4 without `k_eq_v` (full 2 × 16 wider than sliding 2 × 8): the full layers set the
+    ///   geometry, and the scalar `num_key_value_heads × head_dim` would under-price the cache.
+    ///
+    /// The request is long enough (9 + 200 positions) that the KV term dominates the estimate, so
+    /// `priced >= preallocation` fails if the KV geometry is lost. The provider's causal engine
+    /// path runs no proposer, so it declares no verify overshoot and its request is priced on the
+    /// `Off` plan for exactly `prompt + max_new_tokens` positions; the seam's own overshoot
+    /// contract (`static_kv_bytes(capacity + overshoot)` exactly) is checked here too, but no
+    /// provider path prices one for this family.
+    #[test]
+    fn causal_admission_covers_the_static_kv_preallocation() {
+        use crate::decode::StepModel;
+        use crate::primitives::DecodeCache;
+
+        for (label, model, exact) in [
+            ("llama", tiny_llama_for_admission(), true),
+            ("gemma4 k_eq_v", tiny_gemma4_for_admission_with(true), true),
+            (
+                "gemma4 full wider",
+                tiny_gemma4_for_admission_with(false),
+                false,
+            ),
+        ] {
+            let (prompt_tokens, max_new_tokens) = (9usize, 200u32);
+            let capacity = prompt_tokens + max_new_tokens as usize;
+            let preallocation = model.static_kv_bytes(capacity) as u64;
+            assert!(preallocation > 0, "{label}");
+            let layout = model.kv_layout();
+            let widest = layout
+                .layers
+                .iter()
+                .flatten()
+                .map(|l| l.kv_heads * l.key_dim.max(l.value_dim))
+                .max()
+                .unwrap();
+            let decoder = Decoder::Causal(model);
+            let geometry = decoder.memory_geometry();
+            assert_eq!(
+                (geometry.kv_heads, geometry.head_dim),
+                {
+                    let (h, d) = layout.widest_layer();
+                    (h as u64, d as u64)
+                },
+                "{label}: the geometry is the widest layer's"
+            );
+            assert_eq!(
+                geometry.kv_heads * geometry.head_dim,
+                widest as u64,
+                "{label}: one layer's heads × width, never the maxima of two layer types"
+            );
+            let kv_term = (capacity as u64)
+                * geometry.layers
+                * geometry.kv_heads
+                * geometry.head_dim
+                * geometry.element_bytes
+                * 2;
+            if exact {
+                // CPU f32 cache elements are the geometry's 4 bytes: nothing is over-charged.
+                assert_eq!(
+                    kv_term, preallocation,
+                    "{label}: the KV term is exactly the preallocation (no inflation)"
+                );
+            } else {
+                assert!(
+                    preallocation <= kv_term,
+                    "{label}: static preallocation {preallocation} exceeds the KV term {kv_term}"
+                );
+            }
+            // What the provider charges this request (the causal engine path: plan `Off`).
+            let priced = super::priced_request_bytes(
+                &decoder,
+                core_llm::MtpPlan::Off,
+                prompt_tokens,
+                max_new_tokens,
+                0,
+                false,
+            )
+            .unwrap();
+            // The CUDA-graph workspace (sc-24134) is an MTP-plan term: the runner never captures
+            // a causal step (`positions_host_scalar`), so the switch does not change the price.
+            assert_eq!(
+                super::priced_request_bytes(
+                    &decoder,
+                    core_llm::MtpPlan::Off,
+                    prompt_tokens,
+                    max_new_tokens,
+                    0,
+                    true,
+                )
+                .unwrap(),
+                priced,
+                "{label}"
+            );
+            let Decoder::Causal(model) = &decoder else {
+                unreachable!()
+            };
+            // The cache the engine builds for that request (`new_cache_for(prompt + budget, 0)`)
+            // is exactly the priced preallocation, and the estimate covers it.
+            let cache = model.new_cache_for(capacity, 0).unwrap();
+            assert_eq!(cache.kv_kind(), crate::primitives::KvCacheKind::Static);
+            assert_eq!(cache.memory().live_bytes as u64, preallocation, "{label}");
+            assert!(
+                priced >= preallocation,
+                "{label}: priced {priced} < preallocation {preallocation}"
+            );
+            // The seam's overshoot contract: a declared overshoot is part of the bound, and the
+            // cache is exactly `static_kv_bytes(capacity + overshoot)` (the provider's causal path
+            // declares none — see above).
+            let cache = model.new_cache_for(capacity, 3).unwrap();
+            assert_eq!(cache.kv_capacity(), Some(capacity + 3), "{label}");
+            assert_eq!(
+                cache.memory().live_bytes as u64,
+                model.static_kv_bytes(capacity + 3) as u64,
+                "{label}"
+            );
+        }
+
+        // The non-`k_eq_v` fixture is where the full layers are widest: the scalar geometry the
+        // family read before sc-24138 would under-price the static cache.
+        let gemma4 = tiny_gemma4_for_admission_with(false);
+        let cfg = gemma4.config();
+        let scalar = (cfg.num_kv_heads * cfg.head_dim) as u64;
+        let (h, d) = gemma4.kv_layout().widest_layer();
+        assert_eq!((h, d), (2, 16), "the full layers (2 × 16) are the widest");
+        let capacity = 26u64;
+        let scalar_term = capacity * cfg.num_layers as u64 * scalar * 4 * 2;
+        assert!(
+            scalar_term < gemma4.static_kv_bytes(capacity as usize) as u64,
+            "the scalar geometry under-prices the full layers"
         );
     }
 
