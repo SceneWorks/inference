@@ -162,7 +162,7 @@ cause above).
 
 ## Weights-free gates
 
-* Git Bash: `cargo test --locked -p candle-llm --lib` — 299 passed (the engine's parity vs the
+* Git Bash: `cargo test --locked -p candle-llm --lib` — 313 passed after the merge of S5 + S8 (the engine's parity vs the
   step driver for MTP K=1..5 / n-gram / draft model / no proposer, one sync per verify step on the
   plain-greedy path and `K+1` on the penalized / constrained paths, direct-rollback vs replay
   forward counts with the replay counter pinned (0 / 8), chi-square of the stochastic decision over

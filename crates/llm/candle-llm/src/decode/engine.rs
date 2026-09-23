@@ -43,7 +43,7 @@
 
 use candle_core::Tensor;
 use core_llm::speculative::{accept_token, greedy_commit, sample_weighted, Acceptance};
-use core_llm::ProposerKind;
+use core_llm::{ProposerKind, SamplerPath};
 
 use crate::decode::cancel::CancelFlag;
 use crate::decode::record::{DecodePath, DecodeRecord, RequestSpan};
@@ -54,10 +54,10 @@ use crate::decode::stream::{
 };
 use crate::error::{Error, Result};
 use crate::primitives::decode_cache::{CacheMemory, DecodeCache};
-use crate::primitives::host_sync::host_sync_count;
+use crate::primitives::host_sync::{host_sync_count, note_sampler_path};
 use crate::primitives::input_ids;
 use crate::primitives::sampler::{
-    argmax_rows_tensor, logits_rows_host, sample, sample_host, shaped_candidates,
+    argmax_rows_tensor, logits_rows_host, sample, sample_row_host, shaped_candidates,
     shaped_candidates_host, SplitMix64, TokenRng,
 };
 
@@ -410,7 +410,7 @@ pub fn generate_speculative_with<M: StepModel, P: Proposer>(
             ProposerKind::Ngram => DecodePath::PromptLookup,
             ProposerKind::Draft => DecodePath::DraftModel,
         };
-        let record = DecodeRecord::speculative(path, stats, generated.len(), span.host_syncs())
+        let record = DecodeRecord::speculative(path, stats, generated.len(), span.counters())
             .with_kv_cache(cache.kv_kind())
             .with_attn_formulation(model.attn_formulation(cache))
             .with_proposer(kind)
@@ -730,6 +730,10 @@ fn decide(
             draft_ids.truncate(stop + 1);
         }
         let (committed, accepted) = greedy_commit(&target_argmax[..=draft_ids.len()], &draft_ids);
+        // Every committed token is a device argmax (the sampler telemetry's device path).
+        for _ in &committed {
+            note_sampler_path(SamplerPath::Device);
+        }
         return Ok((draft_ids, committed, accepted));
     }
 
@@ -761,7 +765,7 @@ fn decide(
         let row = rows.next().expect("one row per draft");
         let mask = constraint.as_mut().map(|c| c.allowed());
         let outcome = if greedy {
-            let target = sample_host(row, &running, &config.sampling, rng, mask);
+            let target = sample_row_host(row, &running, &config.sampling, rng, mask);
             if target == draft {
                 Acceptance::Accepted(draft)
             } else {
@@ -792,7 +796,7 @@ fn decide(
     let row = rows.next().expect("the bonus row");
     let mask = constraint.as_mut().map(|c| c.allowed());
     let bonus = if greedy {
-        sample_host(row, &running, &config.sampling, rng, mask)
+        sample_row_host(row, &running, &config.sampling, rng, mask)
     } else {
         let target = shaped_candidates_host(row, &running, &config.sampling, mask);
         sample_weighted(&target, rng.next_f32(), 0)

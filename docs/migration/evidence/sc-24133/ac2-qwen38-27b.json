@@ -1,0 +1,40 @@
+{
+  "story": "sc-24133",
+  "commit": "31fe9b074cdf8182e5dc3094cafa3df098589b4b",
+  "worktree_dirty": false,
+  "hardware": "RTX Pro 6000 / sm_120",
+  "model": "Qwen3.8-27B",
+  "snapshot": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "driver": "generate_step (StepModel)",
+  "prompt_tokens": 81,
+  "sampling": {
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 0,
+    "seed": 20240923
+  },
+  "device": {
+    "sampler_path": "device",
+    "generated_tokens": 128,
+    "host_syncs": 128,
+    "host_syncs_per_token": 1.0,
+    "logits_to_host": 0,
+    "logits_to_host_per_token": 0.0,
+    "device_draws": 128,
+    "host_draws": 0,
+    "decode_seconds": 11.2709488,
+    "decode_tokens_per_second": 11.356630419614719
+  },
+  "host_reference": {
+    "sampler_path": "host:reference",
+    "generated_tokens": 128,
+    "host_syncs": 128,
+    "host_syncs_per_token": 1.0,
+    "logits_to_host": 128,
+    "logits_to_host_per_token": 1.0,
+    "device_draws": 0,
+    "host_draws": 128,
+    "decode_seconds": 11.1665969,
+    "decode_tokens_per_second": 11.462758183739936
+  }
+}

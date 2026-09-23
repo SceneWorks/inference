@@ -1,0 +1,5 @@
+[decode_bench] reference          19.85 tok/s  prefill 0.714s  fused {"switch":"on","fused":69888,"reference":0,"reference_reason":null,"path":"fused"}  nvfp4 {"switch":"on","gemv":102256,"cublaslt":400,"cublaslt_reason":"rows","path":"mixed"}
+[decode_bench] reference_cublaslt  9.55 tok/s  prefill 0.689s  nvfp4 {"switch":"off","gemv":0,"cublaslt":102656,"cublaslt_reason":"disabled","path":"cublaslt"}
+[decode_bench] step_model         20.44 tok/s  prefill 0.737s
+[decode_bench] mtp K=2            20.88 tok/s  accept 0.550  fwd/tok 0.758
+[decode_bench] wrote C:\Users\Michael\AppData\Local\Temp\claude\D--repos-ChatWorks--claude-worktrees-shortcut-epic-24128-4c11bb\e80b586c-dde2-4d4d-84b1-e3247a13f59c\scratchpad\bench\head-43f5c6f18-nvfp4-gemv-on\decode_bench.json
