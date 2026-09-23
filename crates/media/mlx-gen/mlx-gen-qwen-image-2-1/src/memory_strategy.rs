@@ -58,8 +58,18 @@
 //!
 //! The 25-map and 6-matrix figures are the two derived numbers that have been held against an
 //! observation; that makes them checked derivations, not measurements, and neither is filed as
-//! evidence. Not modelled: the conditioning phase, whose transient (~1.7 GiB in the traced runs,
-//! whatever the target size) is below the decode's at every size from 1024² up.
+//! evidence. The reference route adds a third term: every condition image is VAE-**encoded** at
+//! the fitted 1024² grid inside the heavy phase, and the encoder's 96-channel full-resolution
+//! stage under the same 25-map pipeline ([`derived::vae_encode_activation_bytes`]) is 9.38 GiB —
+//! above the bounded decode's 6.06, so it is the request peak of a few-reference request at a
+//! preset (the ten-reference denoise, 10.58 GiB, overtakes it). Not modelled: the text-conditioning phase itself (~1.7 GiB in the traced T2I runs,
+//! whatever the target size), which is below the decode at every size from 1024² up.
+//!
+//! **The default-path peak is not monotonic in area.** At or below the 1024² threshold the decode
+//! is the untiled 25-map pass (14.06 GiB at 1024²), above it the bounded 6.06 GiB; a consumer
+//! floor built from the default preset alone under-predicts a 1024² request by ~8 GiB.
+//! [`derived::default_path_peak_max_bytes`] is the number a floor must be built from: the
+//! largest default-path peak over the whole admissible domain, which is the 1024² untiled one.
 
 use std::path::Path;
 
@@ -237,6 +247,10 @@ pub mod derived {
     pub const VAE_FULL_RES_CHANNELS: u64 = 144;
     /// Width of one decoder element (the released VAE ships and loads f32).
     pub const VAE_ELEMENT_WIDTH: u64 = 4;
+    /// Channels the **encoder**'s first stage runs at full input resolution (`base_dim` = 96 in
+    /// `vae/config.json`; the decoder's 144 is `decoder_base_dim`). The reference route encodes
+    /// every condition image here, at the fitted 1024² grid.
+    pub const VAE_ENCODE_FULL_RES_CHANNELS: u64 = 96;
 
     // ── MLX's pipelined evaluation (sc-24114) ───────────────────────────────────────────────────
     //
@@ -395,8 +409,32 @@ pub mod derived {
         ) + 4 * width as u64 * height as u64 * VAE_ELEMENT_WIDTH
     }
 
-    /// The warm activation high-water mark of one request: the larger of the denoise and decode
-    /// peaks, plus the conditioning that stays resident across both.
+    /// Derived VAE **encode** transient for one `width × height` condition image — the reference
+    /// route's `vae.encode_mode` in the heavy phase: [`VAE_PIPELINED_DECODE_MAPS`] maps of the
+    /// encoder's [`VAE_ENCODE_FULL_RES_CHANNELS`]-channel full-resolution stage, f32. The pipeline
+    /// depth, not the reference count, bounds the live set: every reference's encode is lazy and
+    /// materializes inside the first denoise step's eval, ten command buffers at a time whatever
+    /// the count. The encoder's mid-block attention runs at the 64² latent (6 × 4096² × 4 B =
+    /// 384 MiB) and never reaches this term.
+    ///
+    /// **Derived, err-high.** The one trace (2026-09-23, two 1024²-fitted references, 2048²
+    /// target, two steps, `QWEN_IMAGE_2_1_EDIT_CASES=2:2048x2048:2`) put the whole heavy-phase
+    /// transient — the lazy reference encodes materializing inside the denoise evals — at
+    /// 5.64 GiB (peak_active 35.41 over 29.77 GiB resident), against the 9.38 GiB this term
+    /// derives: the encoder's elementwise ops donate their input buffers where the decoder's
+    /// residual structure cannot, so fewer than 25 maps are ever allocated. The 25-map figure is
+    /// kept as the stated upper bound rather than fitted to one observation.
+    pub const fn vae_encode_activation_bytes(width: u32, height: u32) -> u64 {
+        VAE_PIPELINED_DECODE_MAPS
+            * VAE_ENCODE_FULL_RES_CHANNELS
+            * width as u64
+            * height as u64
+            * VAE_ELEMENT_WIDTH
+    }
+
+    /// The warm activation high-water mark of one request: the largest of the denoise, decode and
+    /// — with references — the fitted-1024² reference encode peaks, plus the conditioning that
+    /// stays resident across all of them.
     ///
     /// `use_negative` doubles the retained conditioning (the positive and negative embeddings are
     /// both alive for the whole denoise). `tile_edge` is the bounded-decode tile, `None` for the
@@ -416,9 +454,17 @@ pub mod derived {
             Some(edge) => tiled_vae_decode_activation_bytes(width, height, edge, 64),
             None => vae_decode_activation_bytes(width, height),
         };
+        let encode = if reference_count > 0 {
+            vae_encode_activation_bytes(
+                crate::config::OUTPUT_RESOLUTION,
+                crate::config::OUTPUT_RESOLUTION,
+            )
+        } else {
+            0
+        };
         let branches = if use_negative { 2 } else { 1 };
         let retained = branches * conditioning_tokens * DIT_INNER * BF16_WIDTH;
-        retained + if denoise > decode { denoise } else { decode }
+        retained + max(max(denoise, decode), encode)
     }
 
     /// The transient one request is **budgeted** at — [`activation_bytes`] for the decode the
@@ -494,6 +540,32 @@ pub mod derived {
         pub const fn default_peak_bytes(self) -> u64 {
             self.resident_weight_bytes + self.default_activation_bytes()
         }
+    }
+
+    /// The largest default-path request peak of `tier` over the **whole admissible domain** — the
+    /// number a consumer floor must be built from, because the default-path peak is not monotonic
+    /// in area: the largest preset's default peak is `resident + 6.06 GiB` (bounded decode), but a
+    /// request at or just below the untiled threshold decodes single-pass at
+    /// [`vae_decode_activation_bytes`] (14.06 GiB at 1024²). Priced at the table's assumptions
+    /// ([`TABLE_CONDITIONING_TOKENS`], no references, no negative branch): references only raise
+    /// the denoise and encode terms, and at 1024² the untiled decode still binds — the ten-fitted-
+    /// reference denoise is 8.32 GiB and the encode 9.38.
+    pub fn default_path_peak_max_bytes(tier: Tier) -> u64 {
+        let sub_threshold = activation_bytes(
+            crate::config::OUTPUT_RESOLUTION,
+            crate::config::OUTPUT_RESOLUTION,
+            TABLE_CONDITIONING_TOKENS,
+            0,
+            false,
+            None,
+        );
+        let presets = table()
+            .into_iter()
+            .filter(|row| row.tier == tier)
+            .map(|row| row.default_activation_bytes())
+            .max()
+            .unwrap_or(0);
+        resident_weights(tier).resident_total() + sub_threshold.max(presets)
     }
 
     /// The full derived table: every tier at every upstream preset, densest tier first.
@@ -596,14 +668,21 @@ impl AllocatorBounds {
     /// Bound the allocator for one request: memory limit `resident + transient_budget`, cache limit
     /// `transient_budget`. `resident_bytes` is the larger of what is active now (a warm resident
     /// pair) and the tier's derived resident set (a staged request enters with nothing loaded).
+    ///
+    /// Both limits are process-global, and a harness may already have lowered one — the memory
+    /// cap `mlx_gen::memory::apply_memory_cap_env` installs, a caller's own cache bound — so each
+    /// is installed as `min(previous, request)`: a request can only ever tighten what it found.
     pub fn enter(resident_bytes: u64, transient_budget_bytes: u64) -> Self {
         let resident = resident_bytes.max(mlx_rs::memory::get_active_memory() as u64);
         let memory_limit =
             usize::try_from(resident.saturating_add(transient_budget_bytes)).unwrap_or(usize::MAX);
         let cache_limit = usize::try_from(transient_budget_bytes).unwrap_or(usize::MAX);
+        let (previous_memory_limit, previous_cache_limit) = Self::current();
+        mlx_rs::memory::set_memory_limit(memory_limit.min(previous_memory_limit));
+        mlx_rs::memory::set_cache_limit(cache_limit.min(previous_cache_limit));
         Self {
-            previous_memory_limit: mlx_rs::memory::set_memory_limit(memory_limit),
-            previous_cache_limit: mlx_rs::memory::set_cache_limit(cache_limit),
+            previous_memory_limit,
+            previous_cache_limit,
         }
     }
 
@@ -1429,8 +1508,12 @@ mod tests {
         assert_eq!((spatial.tile_px, spatial.overlap_px), (256, 64));
     }
 
-    /// The allocator bounds install `resident + budget` / `budget` and restore the previous
-    /// limits on drop, so a request never leaks its bounds into the next one.
+    /// The allocator bounds install `resident + budget` / `budget`, never above a limit a harness
+    /// already lowered, and restore the previous limits on drop, so a request never leaks its
+    /// bounds into the next one.
+    ///
+    /// *Mutation that reds this:* installing the request's limits unconditionally (the first
+    /// revision), which raised a harness's `MLX_GEN_MEMORY_CAP_GIB` cap for the request.
     #[test]
     fn allocator_bounds_are_installed_for_the_request_and_restored_after_it() {
         let (memory_before, cache_before) = AllocatorBounds::current();
@@ -1443,6 +1526,88 @@ mod tests {
             assert!(memory <= (28 << 30) + (3 << 30) + mlx_rs::memory::get_active_memory());
         }
         assert_eq!(AllocatorBounds::current(), (memory_before, cache_before));
+
+        // A harness that lowered either limit keeps it: the request only ever tightens.
+        mlx_rs::memory::set_memory_limit(20 << 30);
+        mlx_rs::memory::set_cache_limit(1 << 30);
+        {
+            let _bounds = AllocatorBounds::enter(28 << 30, 3 << 30);
+            assert_eq!(AllocatorBounds::current(), (20 << 30, 1 << 30));
+        }
+        assert_eq!(AllocatorBounds::current(), (20 << 30, 1 << 30));
+        mlx_rs::memory::set_memory_limit(memory_before);
+        mlx_rs::memory::set_cache_limit(cache_before);
+        assert_eq!(AllocatorBounds::current(), (memory_before, cache_before));
+    }
+
+    /// The consumer-floor number: the default-path peak is not monotonic in area (the 1024²
+    /// untiled decode is 14.06 GiB, the presets' bounded decode 6.06), so the floor accessor must
+    /// be the sub-threshold untiled figure and at least every preset's default peak.
+    ///
+    /// *Mutation that reds this:* building the accessor from the presets alone.
+    #[test]
+    fn the_default_path_peak_maximum_is_the_sub_threshold_untiled_decode() {
+        for (tier, expected) in [(Tier::Bf16, 42.68), (Tier::Q8, 30.40), (Tier::Q4, 23.85)] {
+            let max = default_path_peak_max_bytes(tier);
+            let untiled_1024 = resident_weights(tier).resident_total()
+                + activation_bytes(1024, 1024, TABLE_CONDITIONING_TOKENS, 0, false, None);
+            assert_eq!(max, untiled_1024, "{tier:?}");
+            assert!(
+                (max as f64 / GIB - expected).abs() < 0.01,
+                "{tier:?}: {:.3} GiB != {expected}",
+                max as f64 / GIB
+            );
+            for row in table().into_iter().filter(|r| r.tier == tier) {
+                assert!(
+                    max >= row.default_peak_bytes(),
+                    "{tier:?} {}: floor source below a preset's default peak",
+                    row.preset.ratio
+                );
+            }
+        }
+        // The floors a consumer derives with its `ceil(peak GiB x 1.25)` rule.
+        let floors: Vec<u64> = [Tier::Bf16, Tier::Q8, Tier::Q4]
+            .into_iter()
+            .map(|tier| (default_path_peak_max_bytes(tier) as f64 / GIB * 1.25).ceil() as u64)
+            .collect();
+        assert_eq!(floors, [54, 38, 30]);
+    }
+
+    /// The reference route's encode term: 25 pipelined maps of the encoder's 96-channel
+    /// full-resolution stage at the fitted 1024² grid, 9.38 GiB — above the presets' bounded
+    /// decode, so it is the request peak of a few-reference request at a preset (the denoise
+    /// overtakes it near ten), and below the 1024² untiled decode, so it never moves the floor.
+    ///
+    /// *Mutation that reds this:* dropping the encode term from `activation_bytes`, or pricing it
+    /// at the decoder's 144 channels.
+    #[test]
+    fn a_reference_request_is_priced_at_the_pipelined_encode_of_the_fitted_grid() {
+        let encode = vae_encode_activation_bytes(1024, 1024) as f64 / GIB;
+        assert!((encode - 9.375).abs() < 0.001, "{encode}");
+        let plain = activation_bytes(2048, 2048, 256, 0, false, Some(DECODE_TILE_EDGE));
+        let one = activation_bytes(2048, 2048, 256, 1, false, Some(DECODE_TILE_EDGE));
+        let ten = activation_bytes(2048, 2048, 256, 10, false, Some(DECODE_TILE_EDGE));
+        assert!((plain as f64 / GIB - 6.06).abs() < 0.01);
+        assert_eq!(
+            one,
+            256 * DIT_INNER * BF16_WIDTH + vae_encode_activation_bytes(1024, 1024),
+            "one reference: the encode binds"
+        );
+        // The encode term itself does not grow with the count — the pipeline depth bounds it —
+        // but ten fitted references make the joint sequence 57.6k tokens, where the denoise
+        // (10.58 GiB) overtakes the encode.
+        assert_eq!(
+            ten,
+            256 * DIT_INNER * BF16_WIDTH + dit_activation_bytes(joint_tokens(2048, 2048, 256, 10)),
+            "ten references: the denoise binds"
+        );
+        assert!(ten > one);
+        assert!(
+            activation_bytes(1024, 1024, 256, 10, false, None)
+                == 256 * DIT_INNER * BF16_WIDTH + vae_decode_activation_bytes(1024, 1024),
+            "at 1024² the untiled decode still binds over ten references"
+        );
+        assert!(request_transient_budget_bytes(2048, 2048, 256, 1, false, None) > plain);
     }
 
     #[test]

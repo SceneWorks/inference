@@ -387,7 +387,28 @@ fn validation_render_reference_edit() {
     // block-causal prefix every step (no KV cache — see UPSTREAM.md). The boundary case therefore
     // runs the fewest steps the sampler accepts rather than a smaller target: only the step count
     // moves its cost.
-    for (count, width, height, steps) in [(2usize, 1024u32, 1024u32, 8u32), (10, 512, 512, 2)] {
+    //
+    // `QWEN_IMAGE_2_1_EDIT_CASES="refs:WxH:steps,…"` replaces the two cases (sc-24114's encode
+    // transient measurement: `2:2048x2048:2`); `QWEN_IMAGE_2_1_MEMORY_TRACE=1` prints the same
+    // `[mem]` phase lines as the T2I render. The reference encodes are lazy, so they materialize
+    // inside the first denoise step's eval: the phase that ends at `step 2 reported` is the one
+    // whose `peak_active` carries the encoder's transient.
+    let cases: Vec<(usize, u32, u32, u32)> = match std::env::var("QWEN_IMAGE_2_1_EDIT_CASES") {
+        Ok(spec) => spec
+            .split(',')
+            .map(|case| {
+                let mut parts = case.split(':');
+                let count = parts.next().unwrap().parse().unwrap();
+                let (w, h) = parts.next().unwrap().split_once('x').expect("WxH");
+                let steps = parts.next().unwrap().parse().unwrap();
+                (count, w.parse().unwrap(), h.parse().unwrap(), steps)
+            })
+            .collect(),
+        Err(_) => vec![(2, 1024, 1024, 8), (10, 512, 512, 2)],
+    };
+    let trace = std::env::var_os("QWEN_IMAGE_2_1_MEMORY_TRACE").is_some();
+    let footprint_max = footprint_sampler();
+    for (count, width, height, steps) in cases {
         let refs = references(count, 768, 768);
         let req = GenerationRequest {
             prompt: "Combine the subjects of the reference images into one scene, evening light"
@@ -399,10 +420,22 @@ fn validation_render_reference_edit() {
             conditioning: vec![Conditioning::MultiReference { images: refs }],
             ..Default::default()
         };
+        if trace {
+            memory_line("before generate", &footprint_max);
+        }
         let render_started = Instant::now();
+        let mut log = progress_logger(format!("{count} refs: "));
         let out = generator
-            .generate(&req, &mut progress_logger(format!("{count} refs: ")))
+            .generate(&req, &mut |p| {
+                log(p);
+                if trace {
+                    memory_line(&format!("{count} refs: {p:?}"), &footprint_max);
+                }
+            })
             .unwrap();
+        if trace {
+            memory_line("after decode (generate returned)", &footprint_max);
+        }
         let GenerationOutput::Images(images) = out else {
             panic!("images expected");
         };
