@@ -474,7 +474,8 @@ fn nvfp4_gemv_microbench() {
                 w.forward(&x).unwrap();
             });
             eprintln!(
-                "[nvfp4_gemv bench] {name:<28} [{n:>6},{k:>5}] m={m}  gemv {gemv:>8.1} us                  ({:>6.0} GB/s)  cuBLASLt {lt:>8.1} us  ({:.2}x)",
+                "[nvfp4_gemv bench] {name:<28} [{n:>6},{k:>5}] m={m}  gemv {gemv:>8.1} us \
+                 ({:>6.0} GB/s)  cuBLASLt {lt:>8.1} us  ({:.2}x)",
                 io_bytes / gemv / 1e3,
                 lt / gemv
             );
