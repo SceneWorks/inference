@@ -296,6 +296,7 @@ fn row_json(
         _ => Value::Null,
     };
     let diverged = reference.map(|r| divergence(r, &out.tokens));
+    let matches = diverged.map(|d| d.is_none());
     json!({
         "path": path,
         "mtp_drafts": drafts,
@@ -312,7 +313,7 @@ fn row_json(
         "host_syncs_per_token": ratio(host_syncs, generated),
         "device_used_bytes_after": device_used_after,
         "cache_logical_bytes": cache_logical_bytes,
-        "tokens_match_reference": reference.map(|_| diverged.is_none()),
+        "tokens_match_reference": matches,
         "first_divergence": diverged.flatten(),
         "tokens": out.tokens,
     })
