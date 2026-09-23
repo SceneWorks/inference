@@ -1031,10 +1031,12 @@ dependencies = [
  "candle-core",
  "candle-flash-attn",
  "candle-nn",
+ "candle-quant-kernels",
  "core-llm",
  "core-llm-testkit",
  "half",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
 ]

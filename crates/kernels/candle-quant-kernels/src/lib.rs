@@ -11,6 +11,8 @@
 //!   `cuda`-only; the small quant helpers and capability floors build everywhere.
 //! - [`nvfp4_linear`] — `Nvfp4Linear`, the media lane's FP4 linear layer with its W4A16 policy.
 //! - [`nvfp4_outlier`] — activation-outlier sparsity instrumentation (sc-11044).
+//! - [`nvfp4_weight`] — the LLM lane's load-time NVFP4 weight and its strict, typed capability
+//!   gate (sc-24135): quantized on-device at load, refused (never downgraded) where FP4 cannot run.
 //!
 //! Device code is behind `cfg(feature = "cuda")`; a CPU or Metal build compiles the codec and the
 //! capability floors only.
@@ -19,6 +21,7 @@ pub mod cublaslt;
 pub mod nvfp4;
 pub mod nvfp4_linear;
 pub mod nvfp4_outlier;
+pub mod nvfp4_weight;
 
 pub use cublaslt::{
     compute_cap_meets_fp8_floor, compute_cap_meets_nvfp4_floor, quantize_activation_fp8,
@@ -38,6 +41,9 @@ pub use nvfp4_linear::{
     NVFP4_M_ALIGN,
 };
 pub use nvfp4_outlier::{OutlierClass, OutlierSparsity};
+pub use nvfp4_weight::{
+    nvfp4_refusal_for_compute_cap, nvfp4_shape_refusal, Nvfp4Refusal, Nvfp4Weight, NVFP4_CAPABILITY,
+};
 
 /// Poison-tolerant `Mutex` lock for the handle's overwrite-on-miss caches — the same recovery
 /// `candle_gen::lock_recover` documents (sc-9015): every cache on [`cublaslt::CublasLt`] is a

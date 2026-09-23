@@ -112,6 +112,40 @@ impl QuantizedLinear {
         })
     }
 
+    /// Resident bytes of the weight as stored (the GGML block payload, or the dense tensor
+    /// `QMatMul` expanded a float-typed GGUF matrix into) plus the bias — the load telemetry's
+    /// per-projection footprint (sc-24135).
+    pub fn resident_bytes(&self) -> usize {
+        let dense = |t: &Tensor| t.elem_count() * t.dtype().size_in_bytes();
+        let weight = match &self.inner {
+            QuantizedWeight::Matmul(QMatMul::QTensor(q)) | QuantizedWeight::Dequant(q) => {
+                q.storage_size_in_bytes()
+            }
+            QuantizedWeight::Matmul(QMatMul::Tensor(t) | QMatMul::TensorF16(t)) => dense(t),
+        };
+        weight + self.bias.as_ref().map_or(0, dense)
+    }
+
+    /// Logical weight elements (`out · in`).
+    pub fn weight_elems(&self) -> usize {
+        match &self.inner {
+            QuantizedWeight::Matmul(QMatMul::QTensor(q)) | QuantizedWeight::Dequant(q) => {
+                q.shape().elem_count()
+            }
+            QuantizedWeight::Matmul(QMatMul::Tensor(t) | QMatMul::TensorF16(t)) => t.elem_count(),
+        }
+    }
+
+    /// The GGML block dtype the weight is stored in, when it is block-quantized.
+    pub fn ggml_dtype(&self) -> Option<GgmlDType> {
+        match &self.inner {
+            QuantizedWeight::Matmul(QMatMul::QTensor(q)) | QuantizedWeight::Dequant(q) => {
+                Some(q.dtype())
+            }
+            QuantizedWeight::Matmul(_) => None,
+        }
+    }
+
     /// Forward pass: `x @ dequant(weight)ᵀ (+ bias)`. The quantized matmul runs in f32; the result is
     /// cast back to `x`'s dtype so it composes with a bf16 decoder.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {

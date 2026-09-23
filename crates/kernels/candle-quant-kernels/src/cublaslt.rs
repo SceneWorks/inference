@@ -859,6 +859,14 @@ mod cuda_impl {
             // The activation as a contiguous f32 device slice — the kernels read it directly (K padding
             // is handled in-kernel by bounds-checking against the real K, so no `pad_with_zeros`).
             let xf = x.to_dtype(DType::F32)?.contiguous()?;
+            // The kernels index the storage from element 0, so a contiguous *view* with a start
+            // offset (an f32 row-narrow, which `to_dtype`/`contiguous` both pass through untouched)
+            // would be quantized from the wrong rows. Materialize it (sc-24135).
+            let xf = if xf.layout().start_offset() != 0 {
+                xf.copy()?
+            } else {
+                xf
+            };
             let (x_storage, _xl) = xf.storage_and_layout();
             let x_slice = match &*x_storage {
                 Storage::Cuda(cs) => match &cs.slice {

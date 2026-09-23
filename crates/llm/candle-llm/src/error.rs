@@ -31,6 +31,12 @@ pub enum Error {
     #[error("unsupported: {0}")]
     Unsupported(String),
 
+    /// A requested hardware capability is unavailable on the load device — kept typed so the
+    /// refusal carries *which* capability and why (sc-24135: NVFP4 below sm_120 or on CPU). Maps to
+    /// the contract's `Unsupported`, never to a silent fallback.
+    #[error("unsupported: {0}")]
+    Nvfp4Refused(#[from] candle_quant_kernels::Nvfp4Refusal),
+
     /// Generation was cancelled before it could run. Kept typed so the conformance suite and any
     /// consumer can tell cancellation apart from a real error.
     #[error("cancelled")]
