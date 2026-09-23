@@ -35,10 +35,11 @@ fixture and harness as `sc-24129/`, `sc-24132/` and `sc-24130/`.
   restorable; anything older is the typed `Error::RollbackUnavailable { n, have }` — the engine's
   fallback path is untouched, it just never fires on this cache. `retain_checkpoints` on the
   `DecodeCache` trait now returns `Result` (deepening a ring allocates).
-* **Telemetry (E2)**: `SpeculativeStats` / `DecodeRecord` carry `direct_rollbacks` and
-  `replay_fallbacks`, `DecodeRecord::target_forwards_per_verify_step()` is
-  `(verify_steps + replay_fallbacks) / verify_steps`, and the bench table gains `fwd/verify` and
-  `replay fallbacks` columns (JSON: `verify_steps`, `direct_rollbacks`, `replay_fallbacks`,
+* **Telemetry (E2)**: on top of S2's `replays` / `replay_forwards` (the `RollbackUnavailable`
+  → replay fallback count), `SpeculativeStats` / `DecodeRecord` carry `direct_rollbacks`,
+  `DecodeRecord::target_forwards_per_verify_step()` is
+  `(verify_steps + replay_forwards) / verify_steps`, and the bench table gains `fwd/verify` and
+  `replay forwards` columns (JSON: `verify_steps`, `direct_rollbacks`, `replay_forwards`,
   `target_forwards_per_verify_step`).
 
 ## AC1 — rollback to every position of a verify step restores the exact DeltaNet state
@@ -77,11 +78,11 @@ tiny config and under the same-arithmetic oracles on the 27B; on BF16 weights ag
 token-at-a-time oracle it cannot be met by any rollback mechanism, and the gate the test enforces
 there is the same-arithmetic exactness plus neighbour discrimination within the envelope.
 
-## AC2 — one target forward per verify step, zero replay fallbacks, K = 1..5
+## AC2 — one target forward per verify step, zero replay forwards, K = 1..5
 
 `decode-bench/head-6937eff53/` (sealed; `comparison.md` against S2's sealed head `bd33b65a7`):
 
-| row | tok/s | acceptance | fwd/tok | syncs/verify | **fwd/verify** | **replay fallbacks** | direct rollbacks / verify steps | first divergence |
+| row | tok/s | acceptance | fwd/tok | syncs/verify | **fwd/verify** | **replay forwards** | direct rollbacks / verify steps | first divergence |
 |---|---|---|---|---|---|---|---|---|
 | MTP off (reference, growing kv) | 15.66 | n/a | 1.000 | n/a | n/a | n/a | n/a | (ref) |
 | MTP off (StepModel, static kv) | 15.62 | n/a | 1.000 | n/a | n/a | n/a | n/a | yes (identical) |
@@ -91,7 +92,7 @@ there is the same-arithmetic exactness plus neighbour discrimination within the 
 | MTP K=4 | 24.61 | 0.467 | 0.355 | 1.00 | **1.00** | **0** | 71 / 90 | 106 (exact bf16 tie) |
 | MTP K=5 | 24.53 | 0.465 | 0.305 | 1.00 | **1.00** | **0** | 65 / 77 | 124 (exact bf16 tie) |
 
-* **`fwd/verify` is 1.00 and `replay fallbacks` is 0 on every row**, across the whole 256-token
+* **`fwd/verify` is 1.00 and `replay forwards` is 0 on every row**, across the whole 256-token
   run at every K (S2's head paid 2 forwards on every partially rejected step: 24–71 of the
   77–140 verify steps here were partial rejections, each now a direct rollback). The in-test
   gate (`[ac2]` in `deltanet-ring-real-weight.log`, 48 tokens) reports the same counters.
@@ -125,7 +126,7 @@ there is the same-arithmetic exactness plus neighbour discrimination within the 
 
 * Git Bash: `cargo test --locked -p candle-llm --lib` (311 passed, 9 ignored; new: the ring's
   primitive tests, the tiny-config AC1 sweep, the engine's `direct_rollbacks` /
-  `replay_fallbacks` counters with forced partial rejections at K=1..5 and a step-start-only mock
+  `replays` counters with forced partial rejections at K=1..5 and a step-start-only mock
   cache that still replays, admission pricing equal to the ring bytes for K=0..5), CPU clippy
   `-D warnings`, `cargo fmt --check`, CPU rustdoc `-D warnings`, `check-workspace.py`,
   `check_docs.py`, `pytest scripts/tests/test_decode_bench.py` (13 passed).
