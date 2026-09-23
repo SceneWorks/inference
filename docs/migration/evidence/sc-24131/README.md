@@ -148,12 +148,15 @@ recovery counter are identical between the two runs of this story):
 
 ## Weights-free gates
 
-* Git Bash: `cargo test --locked -p candle-llm --lib` (311 passed, 9 ignored; new: the ring's
-  primitive tests, the tiny-config AC1 sweep, the engine's `direct_rollbacks` /
-  `replays` counters with forced partial rejections at K=1..5 and a step-start-only mock
-  cache that still replays, admission pricing equal to the ring bytes for K=0..5), CPU clippy
-  `-D warnings`, `cargo fmt --check`, CPU rustdoc `-D warnings`, `check-workspace.py`,
-  `check_docs.py`, `pytest scripts/tests/test_decode_bench.py` (13 passed).
+* Git Bash: `cargo test --locked -p candle-llm --lib` (324 passed, 9 ignored; new: the ring's
+  primitive tests — including a forward that fails part-way, with `T < slots` and with
+  `T >= slots` — the tiny-config AC1 sweep, a ring replacement that fails part-way, the
+  engine's `direct_rollbacks` / `replays` counters with forced partial rejections at K=1..5 and
+  a step-start-only mock cache that still replays, fwd/verify on both prompt arms, admission
+  pricing equal to the ring bytes for K=0..5 and charging it once), `cargo test --locked -p
+  core-llm` (the `x1` / `x3` recurrent multiplier), CPU clippy `-D warnings`, `cargo fmt
+  --check`, CPU rustdoc `-D warnings`, `check-workspace.py`, `check_docs.py`,
+  `pytest scripts/tests/test_decode_bench.py` (13 passed).
 * PowerShell (MSVC 14.44 vcvars, `CUDA_COMPUTE_CAP=120`, `CUDA_VISIBLE_DEVICES=1`):
   `cargo test --locked --lib --tests -p candle-llm --features cuda`, CUDA clippy `-D warnings`,
   CUDA rustdoc `-D warnings` — see the PR for the run summary.
