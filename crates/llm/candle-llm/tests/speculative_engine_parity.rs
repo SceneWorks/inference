@@ -41,6 +41,7 @@ use candle_llm::decode::{
 };
 use candle_llm::device::select_device;
 use candle_llm::models::Qwen35Model;
+use candle_llm::primitives::sampler::{argmax_device, argmax_rows_device};
 use candle_llm::primitives::{
     causal_depthwise_conv, gated_delta_recurrence, input_ids, rms_norm, sdpa_gqa_causal,
     KvCacheKind, Projection, Weights,
@@ -100,27 +101,31 @@ fn top2(row: &[f32]) -> (usize, f32) {
     (best.0, best.1 - second)
 }
 
-/// The reference's knife-edge positions: where the single-token path's top-2 logit gap is within
-/// one bf16 ULP of its top logit — a tie the last bit of a differently-rounded GEMM can flip.
-/// Returns `(position, gap, ulp)`.
-fn knife_edges(model: &Qwen35Model, prompt: &[i32], reference: &[i32]) -> Vec<(usize, f32, f32)> {
+/// The single-token path's `(argmax, top-2 gap, bf16 ULP of the top logit)` at every position of
+/// the reference fixture, walked on a growing cache. A position whose gap is within one ULP is a
+/// **knife-edge**: a tie the last bit of a differently-rounded GEMM can flip. The device argmax
+/// (the sampler's own pick, which the fixture was produced with) is checked against the fixture;
+/// the host top-2 scan breaks exact ties by lowest index, which the device kernel need not.
+fn single_token_gaps(
+    model: &Qwen35Model,
+    prompt: &[i32],
+    reference: &[i32],
+) -> Vec<(i32, f32, f32)> {
     let mut cache = model.new_cache_with_checkpoints(0);
     let mut logits = model
         .forward_step(&mut cache, StepRequest::last(prompt))
         .unwrap()
         .logits;
-    let mut edges = Vec::new();
+    let mut gaps = Vec::with_capacity(reference.len());
     for (pos, &token) in reference.iter().enumerate() {
         let row = host(&logits);
         let (arg, gap) = top2(&row);
+        let device_arg = argmax_device(&logits).unwrap();
         assert_eq!(
-            arg as i32, token,
-            "single-token walk must reproduce the fixture"
+            device_arg, token,
+            "single-token walk must reproduce the fixture at {pos}"
         );
-        let ulp = bf16_ulp(row[arg]);
-        if gap <= ulp {
-            edges.push((pos, gap, ulp));
-        }
+        gaps.push((device_arg, gap, bf16_ulp(row[arg])));
         if pos + 1 == reference.len() {
             break;
         }
@@ -129,7 +134,16 @@ fn knife_edges(model: &Qwen35Model, prompt: &[i32], reference: &[i32]) -> Vec<(u
             .unwrap()
             .logits;
     }
-    edges
+    gaps
+}
+
+/// The knife-edge positions of [`single_token_gaps`]: `(position, gap, ulp)` with `gap <= ulp`.
+fn knife_edges(gaps: &[(i32, f32, f32)]) -> Vec<(usize, f32, f32)> {
+    gaps.iter()
+        .enumerate()
+        .filter(|(_, (_, gap, ulp))| gap <= ulp)
+        .map(|(pos, (_, gap, ulp))| (pos, *gap, *ulp))
+        .collect()
 }
 
 /// The speculative-off fixture through the step driver (the engine's own seam, static KV).
@@ -177,7 +191,8 @@ fn ac1_ac2_engine_greedy_fixture_rows_against_speculative_off() {
     let mtp = mtp.expect("the frozen Qwen3.8 snapshot carries a complete MTP head");
     let prompt = common::qwen35::render_chat_prompt(&snapshot, PROMPT);
     let reference = fixture_reference(&model, &prompt);
-    let edges = knife_edges(&model, &prompt, &reference);
+    let gaps = single_token_gaps(&model, &prompt, &reference);
+    let edges = knife_edges(&gaps);
     eprintln!(
         "[ac1] reference knife-edge positions (top-2 gap <= 1 bf16 ULP of the top logit): {:?}",
         edges
@@ -240,6 +255,15 @@ fn ac1_ac2_engine_greedy_fixture_rows_against_speculative_off() {
 
     let diverged: Vec<&(String, Option<usize>)> =
         rows.iter().filter(|(_, d)| d.is_some()).collect();
+    for (row, d) in &diverged {
+        let pos = d.unwrap();
+        let (_, gap, ulp) = gaps[pos];
+        eprintln!(
+            "[ac1] {row}: first divergence at {pos}: reference top-2 gap {gap} = {:.1} bf16 ULP \
+             of its top logit",
+            gap / ulp
+        );
+    }
     let off_edge: Vec<&&(String, Option<usize>)> = diverged
         .iter()
         .filter(|(_, d)| !edges.iter().any(|(pos, _, _)| Some(*pos) == *d))
@@ -268,28 +292,31 @@ fn teacher_forced_verify_shaped_forward_vs_single_token_knife_edge_gate() {
     let reference = fixture_reference(&model, &prompt);
     let mut sequence = prompt.clone();
     sequence.extend(&reference);
+    let gaps = single_token_gaps(&model, &prompt, &reference);
+    let edges = knife_edges(&gaps);
+    eprintln!(
+        "[teacher-forced] reference knife-edge positions (top-2 gap <= 1 bf16 ULP): {edges:?}"
+    );
 
     // Walk the reference one token at a time on a growing cache (cheap to clone), and at every
     // position run a verify-shaped forward over the next `K + 1` reference tokens from a clone:
-    // its row 0 is the same position computed with `M = K + 1`.
+    // row `i` of that forward is position `pos + i` computed with `M = K + 1` (every row, not
+    // just the first — the engine commits from all of them).
     let mut violations = 0usize;
+    let mut worst_flip_ulps = 0f32;
     for k in 1..=5usize {
         let mut single = model.new_cache_with_checkpoints(0);
         model
             .forward_step(&mut single, StepRequest::last(&prompt))
             .unwrap();
         let mut disagreements = Vec::new();
-        let mut knife_edges = Vec::new();
-        let mut max_delta = 0f32;
+        let mut positions_checked = 0usize;
         for pos in 0..FIXTURE_TOKENS {
             let cur = prompt.len() + pos;
             let end = (cur + k + 1).min(sequence.len());
             if end - cur < 2 {
                 break;
             }
-            // Row 0 of the verify-shaped forward over sequence[cur .. end] predicts the token
-            // after sequence[cur] — the same prediction the single-token path makes after feeding
-            // sequence[cur] alone, from the same state.
             let mut trial = single.try_clone().unwrap();
             let multi = model
                 .forward_step(
@@ -302,48 +329,48 @@ fn teacher_forced_verify_shaped_forward_vs_single_token_knife_edge_gate() {
                 )
                 .unwrap()
                 .logits;
-            let logits = model
-                .forward_step(&mut single, StepRequest::last(&[sequence[cur]]))
-                .unwrap()
-                .logits;
-            let m1 = host(&logits);
-            let mk = host(&multi.narrow(1, 0, 1).unwrap());
-            let (arg_1, gap_1) = top2(&m1);
-            let (arg_k, _) = top2(&mk);
-            let delta = m1
-                .iter()
-                .zip(&mk)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0f32, f32::max);
-            max_delta = max_delta.max(delta);
-            let top_ulp = bf16_ulp(m1[arg_1]);
-            if gap_1 <= top_ulp {
-                knife_edges.push((pos, gap_1, top_ulp));
-            }
-            if arg_1 != arg_k {
-                let excused = gap_1 <= top_ulp;
-                disagreements.push((pos, arg_1, arg_k, gap_1, top_ulp, delta, excused));
-                if !excused {
-                    violations += 1;
+            // Row i is the logits after feeding sequence[cur + i], which pick generated token
+            // pos + i + 1: compare with the single-token path's argmax and gap at that index.
+            let rows = end - cur;
+            let args = argmax_rows_device(&multi).unwrap();
+            for (i, &arg_k) in args.iter().enumerate().take(rows) {
+                let Some(&(arg_1, gap, ulp)) = gaps.get(pos + i + 1) else {
+                    break;
+                };
+                positions_checked += 1;
+                if arg_1 != arg_k {
+                    let excused = gap <= ulp;
+                    worst_flip_ulps = worst_flip_ulps.max(gap / ulp);
+                    disagreements.push((pos + i + 1, i, arg_1, arg_k, gap, ulp, excused));
+                    if !excused {
+                        violations += 1;
+                    }
                 }
             }
+            model
+                .forward_step(&mut single, StepRequest::last(&[sequence[cur]]))
+                .unwrap();
         }
         eprintln!(
-            "[teacher-forced] M={}: argmax disagreements {} of {FIXTURE_TOKENS}; reference \
-             knife-edge positions (top-2 gap <= 1 bf16 ULP) {:?}; max |delta logit| {max_delta}",
+            "[teacher-forced] M={}: argmax disagreements {} over {positions_checked} (position, \
+             row) pairs",
             k + 1,
             disagreements.len(),
-            knife_edges
         );
-        for (pos, a1, ak, gap, ulp, delta, excused) in &disagreements {
+        for (pos, row, a1, ak, gap, ulp, excused) in &disagreements {
             eprintln!(
-                "[teacher-forced] M={}: position {pos}: single-token argmax {a1}, verify-shaped \
-                 argmax {ak}, reference top-2 gap {gap} (1 ULP = {ulp}), max |delta| {delta}, \
+                "[teacher-forced] M={}: position {pos} (verify row {row}): single-token argmax \
+                 {a1}, verify-shaped argmax {ak}, reference top-2 gap {gap} = {:.1} bf16 ULP, \
                  knife-edge {excused}",
-                k + 1
+                k + 1,
+                gap / ulp
             );
         }
     }
+    eprintln!(
+        "[teacher-forced] largest reference top-2 gap at any flipped position: \
+         {worst_flip_ulps:.1} bf16 ULP"
+    );
     assert_eq!(
         violations, 0,
         "a verify-shaped forward changed the argmax at a position that was not a bf16 knife-edge"
