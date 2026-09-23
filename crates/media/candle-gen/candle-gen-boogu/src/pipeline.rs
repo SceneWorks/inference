@@ -112,6 +112,17 @@ pub(crate) const DEFAULT_IMG2IMG_STRENGTH: f32 = 0.5;
 const SPATIAL_SCALE: u32 = 8;
 pub(crate) const LATENT_CHANNELS: usize = 16;
 
+/// `VaeConfig::z_image().block_out_channels` — the decoder geometry [`VAE_DECODER`] bounds.
+const VAE_BLOCK_OUT_CHANNELS: [usize; 4] = [128, 256, 512, 512];
+
+/// The external z-image `AutoEncoderKL` decoder's shape for the sc-24114 launch-bound guard: past
+/// candle's 32-bit CUDA im2col/softmax indices (a 2048² decode) the native decode is tiled, since
+/// that decoder's convs cannot be chunked in-tree ([`candle_gen::bounded_kl_decode`]).
+const VAE_DECODER: candle_gen::KlDecoderShape<'static> = candle_gen::KlDecoderShape {
+    latent_channels: LATENT_CHANNELS,
+    block_out_channels: &VAE_BLOCK_OUT_CHANNELS,
+};
+
 /// Max prompt tokens the Qwen3-VL RoPE table is sized for (generous; Boogu prompts are short).
 /// Enforced up front by [`crate::tokenizer::BooguTokenizer`] so an over-length prompt returns a clear
 /// length error instead of an opaque tensor-shape error deep in the condition encoder (sc-9047).
@@ -1268,7 +1279,9 @@ fn decode(vae: &AutoEncoderKL, pid: Option<&PidDecoder>, lat: &Tensor) -> Result
             )?;
             pid.decode(lat)?
         }
-        None => vae.decode(lat)?.to_dtype(DType::F32)?, // [1, 3, H, W] in [-1, 1]
+        // [1, 3, H, W] in [-1, 1]
+        None => candle_gen::bounded_kl_decode(&VAE_DECODER, lat, |l| vae.decode(l))?
+            .to_dtype(DType::F32)?,
     };
     let img = postprocess_image(&decoded)?.i(0)?.to_device(&Device::Cpu)?;
     let (c, h, w) = img.dims3()?;
@@ -1382,6 +1395,21 @@ pub(crate) const TURBO_CURATED_DEFAULT_SAMPLER: &str = "lcm";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// sc-24114: the guard's decoder geometry is the loaded VAE's, and it tiles a 2048² decode
+    /// (past the CUDA im2col u32 bound) while 1024² stays the single pass.
+    #[test]
+    fn native_decode_is_bounded_at_2048_and_single_pass_at_1024() {
+        let cfg = VaeConfig::z_image();
+        assert_eq!(
+            VAE_DECODER.block_out_channels,
+            cfg.block_out_channels.as_slice()
+        );
+        assert_eq!(VAE_DECODER.latent_channels, cfg.latent_channels);
+        let latent = |px: usize| px / SPATIAL_SCALE as usize;
+        assert!(VAE_DECODER.exceeds_launch_bounds(latent(2048), latent(2048)));
+        assert!(!VAE_DECODER.exceeds_launch_bounds(latent(1024), latent(1024)));
+    }
 
     /// sc-12828: the t2i `load_components` stores the Qwen3-VL TE at **bf16**, not f32 — the deliberate,
     /// non-default choice the ~half-resident TE saving rides on (the encoder still computes f32 via
