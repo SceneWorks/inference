@@ -6,6 +6,10 @@
 //! a CUDA sm_120 device — is quantized to NVFP4 ([`Nvfp4Weight`], sc-24135) through the shared
 //! `candle-quant-kernels` codec and served by the cuBLASLt W4A4 FP4 GEMM.
 //!
+//! An NVFP4 projection's forward is one of two implementations over the same resident weight —
+//! the fused decode GEMV for ≤ 8 bf16 token rows, cuBLASLt W4A4 otherwise — chosen per call in
+//! [`nvfp4_path`](super::nvfp4_path) with the path recorded (sc-24136).
+//!
 //! [`ProjectionFormat`] is the load-time selector a loader threads to [`Projection::load_as`];
 //! [`ProjectionCensus`] is the load telemetry that says which kind each projection actually became.
 
@@ -399,12 +403,15 @@ impl Projection {
     }
 
     /// `x @ weightᵀ`.
+    ///
+    /// An NVFP4 projection dispatches between the fused decode GEMV (≤ 8 bf16 rows) and the
+    /// cuBLASLt W4A4 GEMM, recording which ran ([`nvfp4_path`](super::nvfp4_path), sc-24136).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Projection::Dense(l) => Ok(l.forward(x)?),
             Projection::Quantized(q) => q.forward(x),
             Projection::Prism(weight) => weight.forward(x),
-            Projection::Nvfp4(weight) => Ok(weight.forward(x)?),
+            Projection::Nvfp4(weight) => super::nvfp4_path::forward(weight, x),
         }
     }
 

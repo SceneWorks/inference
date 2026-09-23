@@ -24,6 +24,7 @@ use crate::error::Result;
 use crate::primitives::fused::{fused_tally, FusedTally};
 use crate::primitives::host_sync::host_sync_count;
 use crate::primitives::kv_cache::KvCache;
+use crate::primitives::nvfp4_path::{nvfp4_path_tally, Nvfp4PathTally};
 
 /// Which decode implementation produced a request's tokens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +76,11 @@ pub struct DecodeRecord {
     /// RMSNorm / SwiGLU / QK-norm+RoPE leaves ran the fused kernel, how many the op chain, and why
     /// the last op-chain run happened. `FusedTally::label` gives `fused` / `reference` / `mixed`.
     pub fused_primitives: FusedTally,
+    /// NVFP4 projection calls by path while generating (see `primitives::nvfp4_path`, sc-24136):
+    /// how many ran the fused decode GEMV, how many the cuBLASLt W4A4 GEMM, and why the last
+    /// cuBLASLt run happened (`rows` for a prefill, `disabled` with the switch off, …).
+    /// `Nvfp4PathTally::label` gives `gemv` / `cublaslt` / `mixed` / `none` (a non-NVFP4 model).
+    pub nvfp4_projections: Nvfp4PathTally,
 }
 
 impl DecodeRecord {
@@ -93,7 +99,15 @@ impl DecodeRecord {
             generated_tokens: generated as u64,
             host_syncs,
             fused_primitives: FusedTally::default(),
+            nvfp4_projections: Nvfp4PathTally::default(),
         }
+    }
+
+    /// The same record with its NVFP4 projection path tally filled in (from
+    /// [`RequestSpan::nvfp4_projections`]).
+    pub fn with_nvfp4_projections(mut self, tally: Nvfp4PathTally) -> Self {
+        self.nvfp4_projections = tally;
+        self
     }
 
     /// The same record with its fused-primitive tally filled in (from
@@ -118,6 +132,7 @@ impl DecodeRecord {
             generated_tokens: generated as u64,
             host_syncs,
             fused_primitives: FusedTally::default(),
+            nvfp4_projections: Nvfp4PathTally::default(),
         }
     }
 
@@ -146,6 +161,7 @@ impl DecodeRecord {
 pub struct RequestSpan {
     host_syncs_at_start: u64,
     fused_at_start: FusedTally,
+    nvfp4_at_start: Nvfp4PathTally,
 }
 
 impl Default for RequestSpan {
@@ -160,6 +176,7 @@ impl RequestSpan {
         Self {
             host_syncs_at_start: host_sync_count(),
             fused_at_start: fused_tally(),
+            nvfp4_at_start: nvfp4_path_tally(),
         }
     }
 
@@ -171,6 +188,11 @@ impl RequestSpan {
     /// Fused-vs-reference primitive runs on this thread since [`begin`](Self::begin).
     pub fn fused_primitives(&self) -> FusedTally {
         fused_tally().since(&self.fused_at_start)
+    }
+
+    /// NVFP4 projection calls by path on this thread since [`begin`](Self::begin).
+    pub fn nvfp4_projections(&self) -> Nvfp4PathTally {
+        nvfp4_path_tally().since(&self.nvfp4_at_start)
     }
 }
 
@@ -276,6 +298,27 @@ mod tests {
         let span = RequestSpan::begin();
         crate::primitives::note_host_sync();
         assert_eq!(span.host_syncs(), 1);
+    }
+
+    #[test]
+    fn request_span_brackets_this_threads_nvfp4_projection_paths() {
+        let span = RequestSpan::begin();
+        crate::primitives::nvfp4_path::note_cublaslt("rows");
+        crate::primitives::nvfp4_path::note_gemv();
+        crate::primitives::nvfp4_path::note_gemv();
+        let tally = span.nvfp4_projections();
+        assert_eq!((tally.gemv, tally.cublaslt), (2, 1));
+        assert_eq!(tally.cublaslt_reason, Some("rows"));
+        assert_eq!(tally.label(), "mixed");
+        let record =
+            DecodeRecord::plain(DecodePath::StepModel, 1, 1, 0).with_nvfp4_projections(tally);
+        assert_eq!(record.nvfp4_projections, tally);
+        assert_eq!(
+            DecodeRecord::plain(DecodePath::Reference, 1, 1, 0)
+                .nvfp4_projections
+                .label(),
+            "none"
+        );
     }
 
     #[test]

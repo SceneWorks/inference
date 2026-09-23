@@ -2612,6 +2612,7 @@ impl TextLlm for LlamaProvider {
                 generated_tokens: out.tokens.len() as u64,
                 host_syncs: request_span.host_syncs(),
                 fused_primitives: request_span.fused_primitives(),
+                nvfp4_projections: request_span.nvfp4_projections(),
             },
             _ => DecodeRecord::plain(
                 DecodePath::Reference,
@@ -2619,7 +2620,8 @@ impl TextLlm for LlamaProvider {
                 out.tokens.len(),
                 request_span.host_syncs(),
             )
-            .with_fused_primitives(request_span.fused_primitives()),
+            .with_fused_primitives(request_span.fused_primitives())
+            .with_nvfp4_projections(request_span.nvfp4_projections()),
         };
         *self
             .last_decode

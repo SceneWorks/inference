@@ -205,7 +205,8 @@ pub fn generate_step_timed<M: StepModel>(
         generated.len(),
         span.host_syncs(),
     )
-    .with_fused_primitives(span.fused_primitives());
+    .with_fused_primitives(span.fused_primitives())
+    .with_nvfp4_projections(span.nvfp4_projections());
     Ok((
         GenerationOutput {
             tokens: generated,
