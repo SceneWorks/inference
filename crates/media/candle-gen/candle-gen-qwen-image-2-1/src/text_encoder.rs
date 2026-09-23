@@ -286,20 +286,46 @@ impl Attention {
         let k = repeat_kv(k, self.kv_groups)?.contiguous()?;
         let v = repeat_kv(v, self.kv_groups)?.contiguous()?;
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        // Plain scores here, NOT the chunked `candle_gen::sdpa_budgeted_*`, and that is a bound
-        // rather than an oversight: the F-003 guard exists because candle's CUDA kernels index
-        // scores with i32, and this tower's sequence is capped by [`crate::loader::MAX_PROMPT_TOKENS`]
-        // (4096). Its widest scores tensor is therefore `32 heads · 4096 · 4096 ≈ 5.4e8` elements —
-        // a quarter of `i32::MAX`, and under `ATTN_SCORES_BUDGET`, so the planner would return the
-        // whole query axis and this exact single pass anyway. The DiT's joint sequence is the one
-        // that overflows; see `transformer::block_causal_attention`.
-        let scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?.broadcast_add(mask)?;
-        let ctx = softmax_last_dim(&scores)?.matmul(&v)?;
+        let ctx = attend(&q, &k, &v, mask, scale, candle_gen::ATTN_SCORES_BUDGET)?;
         let ctx = ctx
             .transpose(1, 2)?
             .reshape((b, len, self.heads * self.head_dim))?;
         Ok(self.o_proj.forward(&ctx)?)
     }
+}
+
+/// The scores → context step of [`Attention::forward`], through the F-003 i32-overflow guard
+/// ([`candle_gen::sdpa_budgeted_bhsd`]) with the additive `[1, 1, L, L]` causal `mask`.
+///
+/// This used to be a plain `matmul · scale + mask → softmax → matmul` on the argument that
+/// [`crate::loader::MAX_PROMPT_TOKENS`] (4096) bounds the sequence, so the widest scores tensor
+/// was `32 · 4096² ≈ 5.4e8` elements. That cap bounds only the **tokenizer**: the image-conditioned
+/// route ([`QwenImage21TextEncoder::encode_conditioning`]) expands each `<|image_pad|>` to one
+/// token per merged vision patch *after* tokenizing — 1,024 per reference fitted to 1024² — so the
+/// advertised ten-reference request runs this tower at ≈10.3k tokens and `32 · 10.3k² ≈ 3.4e9`
+/// score elements, past `i32::MAX`. candle's CUDA softmax kernel indexes `row · ncols + col` as an
+/// `int`, so that single pass wrapped negative and faulted (`CUDA_ERROR_ILLEGAL_ADDRESS`, the
+/// sc-24114 ten-reference evidence run). The guard chunks the query rows past the budget; below it
+/// — every text-to-image prompt, and up to six 1024²-fitted references — it is the same single
+/// pass as before (see `chunked_and_unchunked_text_attention_agree` and
+/// `ten_reference_conditioning_overflows_i32_and_chunks`).
+fn attend(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: &Tensor,
+    scale: f64,
+    budget: usize,
+) -> Result<Tensor> {
+    Ok(candle_gen::sdpa_budgeted_bhsd(
+        q,
+        k,
+        v,
+        scale,
+        Some(mask),
+        softmax_last_dim,
+        budget,
+    )?)
 }
 
 struct Mlp {
@@ -485,10 +511,7 @@ impl QwenImage21TextEncoder {
     /// The additive causal mask for a `len`-token prompt (prompts are never padded, so the
     /// attention mask is all-ones and the block is purely causal).
     fn causal_mask(&self, len: usize) -> Result<Tensor> {
-        let mask: Vec<f32> = (0..len)
-            .flat_map(|i| (0..len).map(move |j| if j <= i { 0.0 } else { f32::NEG_INFINITY }))
-            .collect();
-        Ok(Tensor::from_vec(mask, (1, 1, len, len), &self.device)?.to_dtype(self.dtype)?)
+        causal_mask(len, self.dtype, &self.device)
     }
 
     /// `input_ids` `[1, L]` (u32) → the last decoder layer's hidden states `[1, L, hidden]` at
@@ -686,6 +709,14 @@ impl QwenImage21TextEncoder {
     }
 }
 
+/// The additive `[1, 1, len, len]` causal mask: `0` at and below the diagonal, `-inf` above.
+fn causal_mask(len: usize, dtype: DType, device: &Device) -> Result<Tensor> {
+    let mask: Vec<f32> = (0..len)
+        .flat_map(|i| (0..len).map(move |j| if j <= i { 0.0 } else { f32::NEG_INFINITY }))
+        .collect();
+    Ok(Tensor::from_vec(mask, (1, 1, len, len), device)?.to_dtype(dtype)?)
+}
+
 /// `candle-llm`'s error into this crate's. `CandleError` has no `Unsupported` variant (unlike the
 /// MLX twin's), so every non-tensor failure keeps its message under `Msg`.
 fn from_llm(e: candle_llm::Error) -> Error {
@@ -715,5 +746,90 @@ mod tests {
         );
         assert!(prompt_template("").contains("user\n <|im_end|>"));
         assert!(t.starts_with(&system_prefix()));
+    }
+
+    /// The ten-reference contract at the production tower: the image-conditioned sequence is
+    /// past the tokenizer cap the old single pass relied on, its scores tensor is past
+    /// `i32::MAX`, and the shipped budget chunks it — while the capped text-to-image prompt stays
+    /// a single pass (`block == len`), byte-identical to before.
+    #[test]
+    fn ten_reference_conditioning_overflows_i32_and_chunks() {
+        use crate::config::{
+            TextEncoderConfig, IMAGE_TOKENS_PER_SLOT, MAX_REFERENCE_IMAGES, OUTPUT_RESOLUTION,
+            VAE_SCALE_FACTOR,
+        };
+        use candle_gen::attention::attention_budget_from_usize;
+
+        let heads = TextEncoderConfig::production().num_attention_heads;
+        let slots_per_reference =
+            ((OUTPUT_RESOLUTION / VAE_SCALE_FACTOR) as usize).pow(2) / IMAGE_TOKENS_PER_SLOT;
+        assert_eq!(slots_per_reference, 1024);
+        // Image slots alone — the template's own tokens only add to it.
+        let len = MAX_REFERENCE_IMAGES * slots_per_reference;
+        assert!(len > crate::loader::MAX_PROMPT_TOKENS);
+        let scores = (heads * len * len) as u64;
+        assert!(scores > i32::MAX as u64, "{scores}");
+
+        let plan = |len: usize| {
+            attention_budget_from_usize(candle_gen::ATTN_SCORES_BUDGET)
+                .query_block_rows((heads * len) as u64, len as u64) as usize
+        };
+        assert!(
+            plan(len) < len,
+            "ten references must chunk: block {}",
+            plan(len)
+        );
+        assert!((heads * plan(len) * len) as u64 <= i32::MAX as u64);
+        let capped = crate::loader::MAX_PROMPT_TOKENS;
+        assert_eq!(
+            plan(capped),
+            capped,
+            "the text-to-image cap stays a single pass"
+        );
+    }
+
+    /// The guarded path at a forced budget agrees with the un-chunked pass on random tensors
+    /// under the tower's own causal mask — the per-query `[1, 1, L, L]` mask must be narrowed
+    /// with its query chunk. Tolerance, not equality: a different GEMM `M` changes the
+    /// accumulation order.
+    #[test]
+    fn chunked_and_unchunked_text_attention_agree() {
+        use candle_gen::attention::attention_budget_from_usize;
+
+        let (heads, len, head_dim) = (4usize, 13usize, 8usize);
+        let dev = Device::Cpu;
+        let fill = |seed: usize| -> Tensor {
+            let n = heads * len * head_dim;
+            let v: Vec<f32> = (0..n)
+                .map(|i| (((i * 37 + seed * 11) % 97) as f32 / 97.0) - 0.5)
+                .collect();
+            Tensor::from_vec(v, (1, heads, len, head_dim), &dev).unwrap()
+        };
+        let (q, k, v) = (fill(0), fill(1), fill(2));
+        let mask = causal_mask(len, DType::F32, &dev).unwrap();
+        let scale = 1.0 / (head_dim as f64).sqrt();
+
+        let single = attend(&q, &k, &v, &mask, scale, usize::MAX).unwrap();
+        // Budgets forcing one-row chunks and ragged three-row chunks (13 = 3·4 + 1).
+        for rows in [1usize, 3] {
+            let budget = heads * len * rows;
+            assert_eq!(
+                attention_budget_from_usize(budget)
+                    .query_block_rows((heads * len) as u64, len as u64) as usize,
+                rows
+            );
+            let chunked = attend(&q, &k, &v, &mask, scale, budget).unwrap();
+            let diff = (&single - &chunked)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(diff <= 1e-5, "rows {rows}: max |Δ| = {diff}");
+        }
     }
 }

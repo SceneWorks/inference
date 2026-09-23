@@ -19,8 +19,9 @@
 
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::{
-    conv2d, group_norm, linear, Conv2d, Conv2dConfig, GroupNorm, Linear, Module, VarBuilder,
+    group_norm, linear, Conv2dConfig, GroupNorm, Linear, Module, VarBuilder,
 };
+use candle_gen::{budgeted_conv2d as conv2d, BudgetedConv2d as Conv2d};
 
 const GN_GROUPS: usize = 32;
 const GN_EPS: f64 = 1e-6;

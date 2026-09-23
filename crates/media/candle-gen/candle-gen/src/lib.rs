@@ -82,6 +82,14 @@ pub use attention::{
     ATTN_SCORES_BUDGET,
 };
 
+// Shared launch-bound-safe conv2d (sc-24114): candle's CUDA im2col launch truncates its element count
+// to u32, so a full-resolution VAE conv at 2048² silently fills only its first ~430 output rows. The
+// guard chunks over output rows past `CONV_IM2COL_BUDGET`; below it the call is the plain `Conv2d`.
+pub mod conv;
+pub use conv::{
+    budgeted_conv2d, conv2d_budgeted, conv2d_row_plan, BudgetedConv2d, CONV_IM2COL_BUDGET,
+};
+
 // Shared Qwen3-VL text-encoder grounding helpers (sc-11205 / F-118): the MRoPE / vision-splice
 // machinery (`Rotary` 1-D RoPE table, GQA `repeat_kv`, `<|image_pad|>` `image_blocks`, the vision-embed
 // `replace_seq`/`slice_seq`, the 3-D interleaved `mrope_positions` + `mrope_cos_sin`, and the additive
