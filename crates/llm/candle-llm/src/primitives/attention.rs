@@ -497,6 +497,97 @@ pub fn sdpa_gqa_causal(
     }
 }
 
+/// The additive length mask `[1, 1, q_len, capacity]` over a **preallocated** key buffer, built
+/// from device data only (story sc-24134): query row `i` may attend key `j` iff
+/// `j <= limits[i]`, where `limits` is `[q_len]` `u32` (the cache position of each query token,
+/// `pos + i`) and `arange` is the cache's constant `[capacity]` `u32` ramp `0, 1, …`. Allowed
+/// positions get exactly `0`, refused ones the same `MASK_NEG` the causal tiles use, so adding
+/// it leaves allowed scores bit-identical and drives refused ones to an exact zero weight.
+///
+/// Nothing here touches the host: the position is read from `limits` by the kernels, which is
+/// what lets a CUDA graph replay the same mask build at every position.
+pub fn capacity_mask(arange: &Tensor, limits: &Tensor, dtype: DType) -> Result<Tensor> {
+    let capacity = arange.dims1()?;
+    let q_len = limits.dims1()?;
+    let j = arange.unsqueeze(0)?.broadcast_as((q_len, capacity))?;
+    let limit = limits.unsqueeze(1)?.broadcast_as((q_len, capacity))?;
+    // `allowed` is exactly 0 or 1; `1·v − v = 0` and `0·v − v = −v` are exact in every dtype.
+    let neg = f64::from(MASK_NEG);
+    let mask = j.le(&limit)?.to_dtype(dtype)?.affine(-neg, neg)?;
+    Ok(mask.unsqueeze(0)?.unsqueeze(0)?)
+}
+
+/// [`sdpa_gqa_causal`] over a **full preallocated** K/V buffer `[b, hkv, capacity, d]` with an
+/// explicit additive mask `[1, 1, q_len, capacity]` (from [`capacity_mask`]) in place of the
+/// bounded `narrow` view plus the built-in causal tile (story sc-24134). Same folded
+/// grouped-query arithmetic, same chunking; the key extent is the buffer's capacity, a constant
+/// for the life of the cache, and the *length* is data (the mask), so the op sequence is
+/// identical at every position — the form a CUDA graph can capture once and replay. On the
+/// static-cache path this is the arithmetic both the eager step and the replayed graph run.
+pub fn sdpa_gqa_masked(
+    queries: &Tensor,
+    keys: &Tensor,
+    values: &Tensor,
+    scale: f32,
+    mask: &Tensor,
+) -> Result<Tensor> {
+    let (b, h, q_len, d) = queries.dims4()?;
+    let (bk, hkv, capacity, dk) = keys.dims4()?;
+    if bk != b || dk != d || values.dims() != keys.dims() || hkv == 0 || h % hkv != 0 {
+        return Err(Error::Msg(format!(
+            "sdpa_gqa_masked: queries {:?} do not group over keys {:?} / values {:?}",
+            queries.dims(),
+            keys.dims(),
+            values.dims()
+        )));
+    }
+    if mask.dims() != [1, 1, q_len, capacity] {
+        return Err(Error::Msg(format!(
+            "sdpa_gqa_masked: mask {:?} must be [1, 1, {q_len}, {capacity}]",
+            mask.dims()
+        )));
+    }
+    let groups = h / hkv;
+    let elements_per_query_row = b
+        .checked_mul(h)
+        .and_then(|e| e.checked_mul(capacity))
+        .ok_or_else(|| Error::Msg("eager attention tile size overflow".into()))?;
+    if elements_per_query_row == 0 {
+        return Err(Error::Msg(
+            "eager attention requires non-empty batch, heads, and keys".into(),
+        ));
+    }
+    let indexable_query_rows = (i32::MAX as usize) / elements_per_query_row;
+    if indexable_query_rows == 0 {
+        return Err(Error::Msg(format!(
+            "eager attention cannot index one query row with batch={b}, heads={h}, capacity={capacity}"
+        )));
+    }
+    let chunk = EAGER_ATTN_QUERY_CHUNK_SIZE.min(indexable_query_rows);
+    let keys_t = keys.transpose(2, 3)?;
+    let mut chunks = Vec::with_capacity(q_len.div_ceil(chunk));
+    for query_start in (0..q_len).step_by(chunk) {
+        let query_len = chunk.min(q_len - query_start);
+        let query = queries
+            .narrow(2, query_start, query_len)?
+            .contiguous()?
+            .reshape((b, hkv, groups * query_len, d))?;
+        let scores = (query.matmul(&keys_t)? * scale as f64)?; // [b, Hkv, groups * rows, cap]
+        let tile = mask.narrow(2, query_start, query_len)?; // [1, 1, rows, cap]
+        let scores = scores
+            .reshape((b, hkv, groups, query_len, capacity))?
+            .broadcast_add(&tile.unsqueeze(2)?)?
+            .reshape((b, hkv, groups * query_len, capacity))?;
+        let weights = softmax_last_dim(&scores)?;
+        chunks.push(weights.matmul(values)?.reshape((b, h, query_len, d))?);
+    }
+    if chunks.len() == 1 {
+        Ok(chunks.pop().expect("one gqa attention output chunk"))
+    } else {
+        Ok(Tensor::cat(&chunks.iter().collect::<Vec<_>>(), 2)?)
+    }
+}
+
 /// Try the fused FlashAttention-2 kernel; `Ok(None)` means "this case is not flash-eligible, use the
 /// eager path". Inputs are the same `[batch, heads, seq, head_dim]` tensors [`sdpa`] takes (K/V
 /// already GQA-expanded); the kernel wants `[batch, seq, heads, head_dim]`, so q/k/v are transposed

@@ -25,17 +25,18 @@ use serde_json::Value;
 
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
-    generate_from_prefill_with_stop, generate_speculative_with, ConstraintMask, CountingDecode,
-    Decode, DecodePath, DecodeRecord, FinishReason, GenerationConfig, MtpProposer, RequestSpan,
-    RewindableConstraintMask, SpeculativePrompt, StepModel, StreamEvent,
+    cuda_graphs_enabled, generate_from_prefill_with_stop, generate_speculative_with,
+    ConstraintMask, CountingDecode, Decode, DecodePath, DecodeRecord, FinishReason,
+    GenerationConfig, GraphRunner, MtpProposer, RequestSpan, RewindableConstraintMask,
+    SpeculativePrompt, StepModel, StreamEvent,
 };
 use crate::device::select_device;
 use crate::gguf::GgufCheckpoint;
 use crate::image::Qwen35ImageProcessor;
 use crate::models::gemma4_mm;
 use crate::models::{
-    CausalLm, Gemma4Layout, Gemma4Mm, Gemma4MmConfig, Qwen35Config, Qwen35Model, Qwen35Mtp,
-    Qwen35VisionConfig, Qwen35VisionModel, VlmDecode,
+    CausalLm, Gemma4Layout, Gemma4Mm, Gemma4MmConfig, Qwen35Cache, Qwen35Config, Qwen35Model,
+    Qwen35Mtp, Qwen35VisionConfig, Qwen35VisionModel, VlmDecode,
 };
 use crate::primitives::attention::EAGER_ATTN_QUERY_CHUNK_SIZE;
 use crate::primitives::nn::input_ids;
@@ -2368,6 +2369,16 @@ impl TextLlm for LlamaProvider {
                     .map(|m| m as &mut dyn RewindableConstraintMask);
                 let drafts = draft_tokens as usize;
                 let mut proposer = MtpProposer::new(mtp);
+                // The CUDA-graph runner (sc-24134) wraps the target when the switch is on: it
+                // replays captured decode / verify steps where it can and falls back eager with
+                // a named reason otherwise (`decode_record.cuda_graphs`); the engine is the
+                // same either way.
+                let graphs = GraphRunner::new(target);
+                let stepper: &dyn StepModel<Cache = Qwen35Cache> = if cuda_graphs_enabled() {
+                    &graphs
+                } else {
+                    target
+                };
                 // The unified engine over the step seam with the MTP proposer (sc-24130).
                 let run = match &mm {
                     Some(m) => {
@@ -2399,7 +2410,7 @@ impl TextLlm for LlamaProvider {
                         let prefill = generation_started.elapsed();
                         let decode_started = std::time::Instant::now();
                         let run = generate_speculative_with(
-                            target,
+                            stepper,
                             &mut proposer,
                             SpeculativePrompt::Prefilled {
                                 cache: &mut cache,
@@ -2441,7 +2452,7 @@ impl TextLlm for LlamaProvider {
                             Ok(())
                         };
                         let run = generate_speculative_with(
-                            target,
+                            stepper,
                             &mut proposer,
                             SpeculativePrompt::Tokens(&prompt_ids),
                             &config,
@@ -2646,6 +2657,7 @@ impl TextLlm for LlamaProvider {
             Some(record) => DecodeRecord {
                 host_syncs: request_span.host_syncs(),
                 fused_primitives: request_span.fused_primitives(),
+                cuda_graphs: request_span.cuda_graphs(),
                 ..record
             },
             None => DecodeRecord::plain(
@@ -2656,7 +2668,8 @@ impl TextLlm for LlamaProvider {
             )
             .with_attn_formulation(self.model.attn_formulation())
             .with_proposer(mtp_plan.proposer())
-            .with_fused_primitives(request_span.fused_primitives()),
+            .with_fused_primitives(request_span.fused_primitives())
+            .with_cuda_graphs(request_span.cuda_graphs()),
         };
         *self
             .last_decode

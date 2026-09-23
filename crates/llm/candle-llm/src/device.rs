@@ -22,8 +22,21 @@ pub fn select_device() -> Result<Device> {
             )));
         }
     }
+    // The model gets its **own** CUDA stream (story sc-24134): stream capture — what the
+    // CUDA-graph runner in `decode::graph` records a decode step with — is not supported on
+    // the legacy NULL stream `Device::new_cuda` uses. cudarc turns on per-slice event
+    // tracking as soon as a second stream exists; with every tensor of the process on this one
+    // stream there is nothing to order, and its waits on events recorded before a capture
+    // would invalidate the capture, so it is switched off (that is the documented use of the
+    // `unsafe`: the caller vouches for single-stream ordering).
     #[cfg(feature = "cuda")]
-    let dev = Device::new_cuda(0)?;
+    let dev = {
+        let dev = Device::new_cuda_with_stream(0)?;
+        if let Device::Cuda(cuda) = &dev {
+            unsafe { cuda.disable_event_tracking() };
+        }
+        dev
+    };
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     let dev = Device::new_metal(0)?;
     #[cfg(not(any(feature = "cuda", feature = "metal")))]

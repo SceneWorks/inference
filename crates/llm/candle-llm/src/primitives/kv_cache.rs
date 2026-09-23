@@ -365,6 +365,25 @@ impl StaticKvCache {
     pub fn layer_offset(&self, layer: usize) -> usize {
         self.len[layer]
     }
+
+    /// Advance every layer's offset by `n` positions **without writing** — the bookkeeping for
+    /// a step whose device writes a CUDA-graph replay produced (story sc-24134). Fails before
+    /// moving anything when the step would end past the capacity.
+    pub fn advance(&mut self, n: usize) -> Result<()> {
+        if let Some(&len) = self.len.iter().max() {
+            let end = len.saturating_add(n);
+            if end > self.capacity {
+                return Err(Error::KvCapacityExceeded {
+                    requested: end,
+                    capacity: self.capacity,
+                });
+            }
+        }
+        for l in &mut self.len {
+            *l += n;
+        }
+        Ok(())
+    }
 }
 
 impl StaticKvCache {

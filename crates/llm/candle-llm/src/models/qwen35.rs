@@ -1046,6 +1046,40 @@ impl DecodeCache for Qwen35Cache {
     fn kv_kind(&self) -> KvCacheKind {
         Qwen35Cache::kv_kind(self)
     }
+
+    /// A CUDA-graph replay (story sc-24134) needs every state tensor at a stable address: the
+    /// static KV buffers are; the S1 hybrid cache still *replaces* each linear layer's recurrent
+    /// state per step (`DeltaNetCache::update`), which the per-token DeltaNet checkpoint ring
+    /// (S3) turns into in-place writes — until then a hybrid cache says
+    /// `deltanet_state_unstable`, and a growing `AttnKv` cache `growing_kv`. Positions are
+    /// still Rust-side scalars on this path (`cos_sin`, `slice_set`, `narrow`), which the
+    /// runner's census and self-checks catch as `host_upload_in_capture`; see `decode::graph`.
+    fn graph_support(&self) -> std::result::Result<(), &'static str> {
+        for layer in &self.layers {
+            match layer {
+                Qwen35LayerCache::Delta(_) => return Err("deltanet_state_unstable"),
+                Qwen35LayerCache::Attn(_) => return Err("growing_kv"),
+                Qwen35LayerCache::StaticAttn(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// The bookkeeping of a `n`-token step whose device writes a graph replay produced: the
+    /// capacity check and the rollback checkpoint of `begin_forward`, then every static layer's
+    /// offset (a linear layer refuses — see [`graph_support`](Self::graph_support)).
+    fn replay_advance(&mut self, n: usize) -> Result<()> {
+        self.graph_support().map_err(|reason| {
+            Error::Unsupported(format!("Qwen35Cache::replay_advance: {reason}"))
+        })?;
+        self.begin_forward(n)?;
+        for layer in &mut self.layers {
+            if let Qwen35LayerCache::StaticAttn(s) = layer {
+                s.advance(n)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A loaded Qwen3.6 (`qwen3_5`) hybrid decoder.
@@ -2338,6 +2372,15 @@ impl StepModel for Qwen35Model {
         }
     }
 
+    /// The MoE block (35B-A3B) pulls its router probabilities to the host every step — a
+    /// device->host read no graph can replay (story sc-24134).
+    fn graph_support(&self) -> std::result::Result<(), &'static str> {
+        if self.cfg.moe.is_some() {
+            return Err("moe_router_host_read");
+        }
+        Ok(())
+    }
+
     fn device(&self) -> &Device {
         &self.device
     }
@@ -3030,6 +3073,54 @@ pub(crate) mod tests {
         let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
         let model = Qwen35Model::from_weights(
             &synthetic_weights(&cfg),
+            "model.language_model",
+            cfg.clone(),
+        )
+        .unwrap();
+        (cfg, model)
+    }
+
+    /// The synthetic decoder's weights moved to `device` (bf16 on a GPU, f32 on CPU: what the
+    /// loader would produce there).
+    #[cfg(feature = "cuda")]
+    fn synthetic_weights_on(cfg: &Qwen35Config, device: &Device) -> Weights {
+        let cpu = synthetic_weights(cfg);
+        Weights::from_map(
+            cpu.keys()
+                .map(|k| {
+                    (
+                        k.to_string(),
+                        cpu.require(k).unwrap().to_device(device).unwrap(),
+                    )
+                })
+                .collect(),
+            device.clone(),
+        )
+    }
+
+    /// [`text_model`] built on `device` (the CUDA-graph runner's tests).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn text_model_on(device: &Device) -> (Qwen35Config, Qwen35Model) {
+        let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
+        let model = Qwen35Model::from_weights(
+            &synthetic_weights_on(&cfg, device),
+            "model.language_model",
+            cfg.clone(),
+        )
+        .unwrap();
+        (cfg, model)
+    }
+
+    /// The synthetic decoder with **every** layer a full-attention layer (interval 1: no
+    /// Gated DeltaNet state), on `device` — the shape whose static cache holds nothing but
+    /// stable-address KV buffers (story sc-24134).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn text_model_attention_only_on(device: &Device) -> (Qwen35Config, Qwen35Model) {
+        let mut json = cfg_json();
+        json["text_config"]["full_attention_interval"] = json!(1);
+        let cfg = Qwen35Config::from_json(&json).unwrap();
+        let model = Qwen35Model::from_weights(
+            &synthetic_weights_on(&cfg, device),
             "model.language_model",
             cfg.clone(),
         )

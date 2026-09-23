@@ -28,7 +28,7 @@ use crate::primitives::decode_cache::{CacheMemory, DecodeCache};
 use crate::primitives::sampler::{sample, SplitMix64};
 
 /// Which positions' logits a step returns.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LogitsScope {
     /// Only the last input position: logits `[batch, vocab]`.
     Last,
@@ -230,6 +230,15 @@ pub trait StepModel {
         AttnFormulation::Gqa
     }
 
+    /// Whether this model's step can be captured as a CUDA graph at all (story sc-24134, E5):
+    /// `Err` names a known reason the step is not replayable — a device->host read inside the
+    /// step (a MoE router that pulls its probabilities to the host), positions or offsets that
+    /// only exist as Rust-side scalars. The runner checks this before any capture; the default
+    /// is `Ok` and the runner's census of the captured graph is the second gate.
+    fn graph_support(&self) -> std::result::Result<(), &'static str> {
+        Ok(())
+    }
+
     /// Where input-id tensors must live.
     fn device(&self) -> &Device;
 
@@ -251,7 +260,7 @@ pub trait StepModel {
 /// [`generate_with`](super::generate_with) for the same inputs.
 ///
 /// Returns [`Error::Canceled`] if `cancel` is already set before any inference.
-pub fn generate_step<M: StepModel>(
+pub fn generate_step<M: StepModel + ?Sized>(
     model: &M,
     prompt_ids: &[i32],
     config: &GenerationConfig,
@@ -270,7 +279,7 @@ pub fn generate_step<M: StepModel>(
 /// synchronize the device). Also returns the **final** cache's [`DecodeCache::memory`] — the state
 /// the request actually held at its last step, rollback checkpoints included — so a bench reports
 /// what a full-length request costs rather than a fresh cache's.
-pub fn generate_step_timed<M: StepModel>(
+pub fn generate_step_timed<M: StepModel + ?Sized>(
     model: &M,
     prompt_ids: &[i32],
     config: &GenerationConfig,
@@ -359,7 +368,8 @@ pub fn generate_step_timed<M: StepModel>(
     )
     .with_kv_cache(cache.kv_kind())
     .with_attn_formulation(model.attn_formulation(&cache))
-    .with_fused_primitives(span.fused_primitives());
+    .with_fused_primitives(span.fused_primitives())
+    .with_cuda_graphs(span.cuda_graphs());
     Ok((
         GenerationOutput {
             tokens: generated,
