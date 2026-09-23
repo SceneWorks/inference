@@ -27,8 +27,8 @@ use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
     cuda_graphs_enabled, generate_from_prefill_with_stop, generate_speculative_with,
     graph_workspace_admission_bytes, ConstraintMask, CountingDecode, Decode, DecodePath,
-    DecodeRecord, FinishReason, GenerationConfig, GraphRunner, MtpProposer, RequestSpan,
-    RewindableConstraintMask, SpeculativePrompt, StepModel, StreamEvent,
+    DecodeRecord, FinishReason, GenerationConfig, GraphRunner, GraphTally, MtpProposer,
+    RequestSpan, RewindableConstraintMask, SpeculativePrompt, StepModel, StreamEvent,
 };
 use crate::device::select_device;
 use crate::gguf::GgufCheckpoint;
@@ -97,6 +97,20 @@ fn qwen35_recurrent_admission_bytes(c: &Qwen35Config, retained_checkpoints: usiz
         .saturating_mul((c.linear_key_head_dim + c.linear_conv_kernel_dim) as u64)
         .saturating_mul(4);
     one_state.saturating_mul(1 + retained_checkpoints as u64)
+}
+
+/// The CUDA-graph tally of a request decoded on a reference path. The runner wraps the step-seam
+/// engine only (sc-24134), so with the switch on such a request's record names why no step went
+/// through it — `fallback=reference_path` — instead of a bare `graph: none`.
+fn reference_path_graphs(tally: GraphTally, switch_on: bool) -> GraphTally {
+    if switch_on && tally.label() == "none" {
+        GraphTally {
+            fallback_reason: Some(crate::decode::graph::REASON_REFERENCE_PATH),
+            ..tally
+        }
+    } else {
+        tally
+    }
 }
 
 /// The bytes admission prices for a request of `admitted_prompt` + `max_new_tokens` tokens: on
@@ -2705,7 +2719,10 @@ impl TextLlm for LlamaProvider {
             .with_attn_formulation(self.model.attn_formulation())
             .with_proposer(mtp_plan.proposer())
             .with_fused_primitives(request_span.fused_primitives())
-            .with_cuda_graphs(request_span.cuda_graphs())
+            .with_cuda_graphs(reference_path_graphs(
+                request_span.cuda_graphs(),
+                cuda_graphs_enabled(),
+            ))
             .with_nvfp4_projections(request_span.nvfp4_projections()),
         };
         *self
@@ -4177,15 +4194,10 @@ mod tests {
         )
     }
 
-    #[test]
-    fn auto_mtp_on_a_qwen35_snapshot_without_a_head_decodes_normally_and_says_proposer_none() {
-        // AC3 (sc-24130), weights-free: the synthetic Qwen3.5 decoder written as a snapshot with
-        // no `mtp.*` tensors and `mtp_num_hidden_layers = 0`. The provider advertises no MTP,
-        // an `Auto` request decodes through the reference loop and the record names the proposer
-        // that ran — `none` — rather than silently downgrading; `Enabled` is refused.
-        use core_llm::{
-            LoadSpec, Message, MtpMode, ProposerKind, Sampling, TextLlm, TextLlmRequest,
-        };
+    /// The synthetic Qwen3.5 decoder written as a snapshot with no `mtp.*` tensors and
+    /// `mtp_num_hidden_layers = 0`, loaded as a provider (keep the directory alive with it).
+    fn synthetic_qwen35_provider_without_mtp() -> (tempfile::TempDir, super::LlamaProvider) {
+        use core_llm::LoadSpec;
 
         let (cfg, weights, cfg_json) = crate::models::qwen35::tests::text_model_snapshot_parts();
         let dir = tempfile::Builder::new()
@@ -4214,6 +4226,18 @@ mod tests {
         let provider =
             super::LlamaProvider::load(&LoadSpec::dense(dir.path().display().to_string()))
                 .expect("load the synthetic Qwen3.5 snapshot");
+        (dir, provider)
+    }
+
+    #[test]
+    fn auto_mtp_on_a_qwen35_snapshot_without_a_head_decodes_normally_and_says_proposer_none() {
+        // AC3 (sc-24130), weights-free: the synthetic Qwen3.5 decoder written as a snapshot with
+        // no `mtp.*` tensors and `mtp_num_hidden_layers = 0`. The provider advertises no MTP,
+        // an `Auto` request decodes through the reference loop and the record names the proposer
+        // that ran — `none` — rather than silently downgrading; `Enabled` is refused.
+        use core_llm::{Message, MtpMode, ProposerKind, Sampling, TextLlm, TextLlmRequest};
+
+        let (_dir, provider) = synthetic_qwen35_provider_without_mtp();
         assert!(provider.descriptor().capabilities.mtp.is_none());
 
         let request = |mtp| TextLlmRequest {
@@ -4245,5 +4269,35 @@ mod tests {
             provider.generate(&request(MtpMode::Enabled { draft_tokens: 2 }), &mut |_| {}),
             Err(core_llm::Error::Unsupported(_))
         ));
+    }
+
+    /// sc-24134: with the CUDA-graph switch on, a request decoded on a reference path (MTP off)
+    /// never runs through the runner, and its record says why rather than a bare `graph: none`;
+    /// with the switch off the record is unchanged.
+    #[test]
+    fn a_reference_path_record_names_why_the_graph_runner_did_not_run() {
+        use core_llm::{Message, MtpMode, Sampling, TextLlm, TextLlmRequest};
+
+        let (_dir, provider) = synthetic_qwen35_provider_without_mtp();
+        let request = TextLlmRequest {
+            messages: vec![Message::user("t3 t7 t11 t2")],
+            sampling: Sampling::greedy(),
+            max_new_tokens: 3,
+            seed: Some(0),
+            mtp: MtpMode::Off,
+            ..Default::default()
+        };
+        let describe = |on: bool| {
+            let _guard = crate::decode::graph::cuda_graphs_policy_guard(Some(on));
+            provider.generate(&request, &mut |_| {}).unwrap();
+            let record = provider.last_decode_record().unwrap();
+            assert_eq!(record.path, crate::decode::DecodePath::Reference);
+            record.cuda_graphs.describe()
+        };
+        assert_eq!(
+            describe(true),
+            "graph: none replayed=0 eager=0 captured=0 fallback=reference_path"
+        );
+        assert_eq!(describe(false), "graph: none replayed=0 eager=0 captured=0");
     }
 }

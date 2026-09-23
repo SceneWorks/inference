@@ -21,7 +21,7 @@
 //! | `DECODE_BENCH_KV_CACHE`    | `static` (default) or `growing`: the `step_model` row's KV cache  |
 //! | `DECODE_BENCH_ATTN`        | `gqa` (default) or `expanded`: the growing slots' attention       |
 //! | `CANDLE_LLM_CUDA_GRAPHS`   | `1` runs the `step_model` / `mtp` / `ngram` rows through the CUDA-graph runner (sc-24134); every row records `cuda_graphs` |
-//! | `CANDLE_LLM_CUDA_STREAM`   | `own` (default) or `legacy`: the CUDA stream the model runs on (sc-24134), recorded as `cuda_stream` |
+//! | `CANDLE_LLM_CUDA_STREAM`   | `legacy` or `own`: the CUDA stream the model runs on (sc-24134; unset = `own` with `CANDLE_LLM_CUDA_GRAPHS` on, else `legacy`), recorded as `cuda_stream` |
 //!
 //! Rows are greedy (`temperature = 0`), no stop tokens, so every row emits exactly `NEW_TOKENS`
 //! and the token sequences are comparable: each row records whether it matched the reference row

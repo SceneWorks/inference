@@ -18,12 +18,13 @@ capturable ops it is token-identical to eager and **~28 % faster per step** in r
   as a memcpy that re-reads freed host memory at every replay.
 - **Replaced state.** A decode step leaves **96 allocations alive past the step**: the 48 linear layers' conv and
   SSM states, which the S1 hybrid cache replaces instead of writing in place.
-- **Scalar positions.** Positions are Rust-side scalars.
+- **Scalar positions.** Positions are Rust-side scalars. `Qwen35Model::graph_support` declares this
+  (`positions_host_scalar`), so no Qwen3.5/3.8 step is ever recorded by the runner.
 
 How the three acceptance criteria come out:
 
-- **AC1:** The 27B cache declares `deltanet_state_unstable` before any capture, so graphs-on is token-identical to
-  eager because it falls back to eager.
+- **AC1:** The 27B cache declares `deltanet_state_unstable` before any capture (the runner checks the cache's
+  declaration before the model's), so graphs-on is token-identical to eager because it falls back to eager.
 - **AC2:** decode_bench records graphs off vs on with that named reason. No win is measurable, so the default is
   off and `CANDLE_LLM_CUDA_GRAPHS=1` opts in.
 - **AC3:** Every refusal is a named fallback. None fails the request or changes the device.
@@ -34,16 +35,32 @@ How the three acceptance criteria come out:
    That call uses `cuMemAllocAsync` when the context reports memory-pool support (`has_async_alloc() == true` here).
    Inside a capture the temporaries become graph memory nodes, allocated and freed inside the graph. The step needs
    no pre-planned workspace. A contiguous POC step records `alloc=4 free=4`.
-2. **Stream — fixed in this story.**
+2. **Stream — the model's own stream only when graphs are on; the legacy stream stays the default.**
    - `Device::new_cuda` puts the model on the legacy NULL stream, which cannot be captured: `cuStreamBeginCapture`
      fails with `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`.
-   - `select_device` now uses `Device::new_cuda_with_stream` and turns off cudarc's per-slice event tracking. While
-     tracking is on, cudarc creates two CUDA events per allocation and waits on them across streams, and a wait on an
-     event recorded before a capture invalidates it.
-   - `CANDLE_LLM_CUDA_STREAM=legacy` restores the pre-story device. It serves as the comparison row and the rollback
-     lever; the runner refuses it as `legacy_stream`.
-   - **Measured:** every row is token-identical between the two streams, and the tok/s difference is inside the
-     run-to-run noise (AC2 table).
+   - `Device::new_cuda_with_stream` gives the model its own non-blocking stream; `select_device` then turns off
+     cudarc's per-slice event tracking. While tracking is on, cudarc creates two CUDA events per allocation and waits
+     on them across streams, and a wait on an event recorded before a capture invalidates it.
+   - Tracking off means nothing orders the model's stream against any other stream, so every tensor its kernels touch
+     must come from that one device. That is not safe as a process-wide default:
+     - StarVector-1B used to build a fresh device per request for its pixels — on the own stream a second stream, whose
+       conv and `cat` writes into memory allocated on the model's stream nothing orders (candle's per-op device check
+       compares the GPU ordinal only). It now keeps the load-time device.
+     - candle-flash-attn launches its kernels on stream 0, which does not synchronize with a non-blocking stream.
+   - So `select_device` keeps the **legacy stream by default** (`CudaStreamKind::resolve`). It builds the own stream
+     only when the CUDA-graph runner is switched on at that moment (`CANDLE_LLM_CUDA_GRAPHS=1` at load) or
+     `CANDLE_LLM_CUDA_STREAM=own` asks for it, and never in a `flash-attn` build (the runner refuses such a build as
+     `flash_attn_stream`). A model on the legacy stream is refused as `legacy_stream`.
+   - **Measured — no speed difference either way.** A 3× A/B of the two streams on this host (graphs off, 256 tokens,
+     every row token-identical):
+
+     | row | own stream tok/s | legacy stream tok/s |
+     |---|---|---|
+     | step_model | 14.91 / 14.68 / 15.10 | 14.72 / 14.14 / 14.73 |
+     | reference | 14.81 / 14.62 / 14.69 | 14.94 / 15.06 / 13.92 |
+
+     Run to run, one configuration spreads by about 4 % (up to 8 % with the 13.92 reference run), and the two streams
+     overlap. The stream is chosen for capture and safety, not for speed.
 3. **cuBLAS / cuBLASLt — works.**
    - GEMMs capture and replay bit-exactly on the handle candle created on the stream. No `cublasSetWorkspace` is
      needed with this toolkit, and the NVFP4 cuBLASLt path keeps its own persistent 32 MiB workspace.
@@ -59,14 +76,16 @@ How the three acceptance criteria come out:
      step; sampling runs on the logits it copies out.
 5. **Positions as data — not viable on this revision.** Inside a Qwen3.5/3.8 step the positions are Rust-side
    scalars: `cos_sin(offset)` builds RoPE tables on the host, `slice_set(offset)` writes the KV, and `narrow(len)`
-   bounds attention.
-   - The data-driven form is landed as primitives, **not** wired in: `capacity_mask` and `sdpa_gqa_masked` attend
-     over the full preallocated buffer with a device length mask.
-   - It isn't wired in because on this revision `index_select`, `scatter_set`, comparisons and broadcasts upload
+   bounds attention. `Qwen35Model::graph_support` declares it (`positions_host_scalar`).
+   - The POC measured the data-driven form — attention over the full preallocated buffer with a device length mask
+     (built with a comparison) — and did **not** keep it: the experiment's primitives are removed again, since
+     nothing could call them.
+   - It cannot be wired in on this revision because `index_select`, `scatter_set`, comparisons and broadcasts upload
      their own layouts.
-   - The masked full-capacity attention is also **not bit-identical** to the bounded `narrow` view. On the 27B shape,
-     40 of 384 decode lengths and 122 of 381 verify lengths differ by one bf16 ULP, because cuBLAS picks its kernel by
-     the key extent. Wiring it in would move the static path's bits and still not make the step replayable.
+   - The masked full-capacity attention is also **not bit-identical** to the bounded `narrow` view. On the 27B shape
+     (measured at `7699d507a`), 40 of 384 decode lengths and 122 of 381 verify lengths differ by one bf16 ULP, because
+     cuBLAS picks its kernel by the key extent. Wiring it in would move the static path's bits and still not make the
+     step replayable.
    - A data-driven length needs an attention kernel whose arithmetic does not depend on the extent (a seam kernel),
      not a mask over cuBLAS.
 6. **What breaks capture, precisely.** In `candle-core/src/cuda_backend/mod.rs`, these call
@@ -96,13 +115,16 @@ How the three acceptance criteria come out:
 
 ## What the runner does (E0, E2, E4, E5, E6)
 
-- **Structure.** There is one runner over any `StepModel` + `DecodeCache`, and model files carry no graph logic.
-  The seams are:
-  - `StepModel::graph_support` (the MoE router's host read → `moe_router_host_read`)
-  - `DecodeCache::{graph_support, stage_positions, replay_advance, graph_identity}`
-  - `StaticKvCache::advance`
+- **Structure.** There is one runner over any `StepModel` + `DecodeCache`, and model files carry no graph logic —
+  only declarations. The seams are:
+  - `StepModel::graph_support`: `Qwen35Model` declares `moe_router_host_read` (the MoE router's host read) and
+    otherwise `positions_host_scalar`.
+  - `DecodeCache::{graph_support, stage_positions, replay_advance, graph_identity}`. `Qwen35Cache` declares
+    `deltanet_state_unstable` / `growing_kv`; it has no replay bookkeeping (its model refuses first). Only the
+    synthetic test cache implements `replay_advance`.
 - **Capability checks before any capture (E5).** The runner checks, in order: switch, `cuda` feature, CUDA device,
-  capturable stream, stream-ordered allocator, event tracking off, and the model's and cache's declarations.
+  not a `flash-attn` build, capturable stream, stream-ordered allocator, event tracking off, the cache's declaration,
+  then the model's.
 - **Per step shape** (token count `M`, logits scope, hidden wanted):
   1. Eager warm-up, so kernels compile outside any capture.
   2. Capture.
@@ -112,17 +134,27 @@ How the three acceptance criteria come out:
   6. First replay at a *new* position, verified against eager. This catches a stale scalar or an unstable address.
   7. Replay.
 
-  Outputs are copied into preallocated staging tensors inside the capture and handed back as copies. The two
-  self-checks cost exactly one host sync each, once per shape.
+  Each self-check runs the eager step first, rolls back, runs the graph at the same position, compares, then rolls
+  back and re-runs eager, so the cache always holds the eager state. Outputs are copied into preallocated staging
+  tensors inside the capture and handed back as copies. The two self-checks cost exactly one host sync each, once per
+  shape. A capture ends even if the step panics (a drop guard ends it).
+- **Refusal and fallback (AC3).** A refusal drops **every** graph and staging tensor the runner holds. The failed
+  step rolls the cache back to its start and runs eager; this covers staging (`staging_failed`), the census,
+  instantiation, launches, and a self-check that cannot run (`self_check_failed`) or disagrees (`replay_mismatch`).
+  The one case that fails the step is a cache that cannot roll back to a position it restored or checkpointed earlier
+  in the same step (`rollback_unavailable`): then neither the graph's state nor the eager one can be trusted.
 - **Telemetry (E2).** Every step through the runner is counted with its reason on the per-thread `GraphTally`. It
   is reported as `DecodeRecord::cuda_graphs` (`graph: <label> replayed=<n> eager=<n> captured=<n>
   fallback=<reason>`), in the provider's record, and in decode_bench's `cuda graphs` column.
 - **Build variants (E4).** Without `cuda` the runner is a pass-through (`cuda_feature_off`).
 - **Memory (E6).**
-  - `GraphRunner::workspace()` reports the staging bytes and the driver's graph-memory reservation delta.
   - Admission prices `graph_workspace_admission_bytes`: staging plus one step's working set, for every shape the
     engine can present (`M = 1..=K+1`, two scopes). The provider adds this term when the runner is on and MTP runs.
-  - A failed staging allocation or instantiation is the named fallback `instantiate_failed`.
+  - `GraphRunner::workspace()` is telemetry: the staging bytes, and how much the device's graph-memory reservation
+    grew across the runner's captures. The pool is device-wide, so that number is approximate (it reads 0 when a live
+    graph's reservation already covers the step). A destroyed graph trims the pool (`cuDeviceGraphMemTrim`), so a
+    runner that drops its graphs gives the reservation back (32 MiB for the synthetic step).
+  - A failed staging allocation is the named fallback `staging_failed`; a failed instantiation `instantiate_failed`.
 
 ## AC1 — graphs on is token-identical to eager (real weights)
 
@@ -156,34 +188,53 @@ Three sealed runs of the same binary at `7699d507a`. None had a co-tenant on GPU
 | `head-7699d507a-graphs-off` | own | off | 13.41 | **13.30** | **18.85** | 1.00 / 0.35 | — |
 | `head-7699d507a-graphs-on` | own | **on** | 15.01 | **14.71** | **18.30** | 1.00 / 0.35 | `0 replayed / 256 eager (deltanet_state_unstable)` / `0 replayed / 137 eager (deltanet_state_unstable)` |
 
-- **The noise envelope.** The reference row never goes through the runner, and it ran the identical code at 13.41
-  and 15.01 tok/s in two back-to-back runs. Differences of ±10 % on this host are noise.
+(These runs predate the legacy-stream default: at `7699d507a` the own stream was the default, so the graphs-off run set
+`CANDLE_LLM_CUDA_STREAM=own` explicitly, which still selects it.)
+
+- **The noise envelope.** Run to run, one configuration of this code spreads by about 4 % on this host (the 3× stream
+  A/B in finding 2: 14.68–15.10 and 14.14–14.73 tok/s for step_model). The graphs-off run's **13.41 reference row is
+  an outlier**: the reference row never goes through the runner and ran 15.18 and 15.01 in the other two runs, and
+  13.92–15.06 in the A/B. Its 13.30 spec-off row sits with it, so that run was slow as a whole.
 - **What graphs-on actually ran.** Its spec-off and K = 3 rows ran the same eager steps as graphs-off (every step is
-  a named fallback). Their 14.71 vs 13.30 and 18.30 vs 18.85 are inside that envelope.
+  a named fallback). 14.71 vs 13.30 is that slow graphs-off run; 18.30 vs 18.85 (3 %) is inside the spread.
 - **Syncs.** Syncs per token are unchanged: no capture means no self-check sync.
 - **Decision (E8).** No win is measured, so the runner stays **opt-in, default off**.
-- **Stream.** The own-stream vs legacy-stream rows are also inside the envelope. The stream change is kept because
-  capture requires it, not for speed.
+- **Stream.** The own-stream vs legacy-stream rows show no speed difference (finding 2). The own stream is used only
+  when capture needs it.
 
 ## AC3 — fallback with a named reason, never a failure (samples)
 
-From `graph-unit-tests.log` (release, `7699d507a`) and the AC1 run:
+From `graph-unit-tests.log` (the CUDA unit tests) and the AC1 run (`dd91ecc9e`):
 
 ```text
 graph: eager replayed=0 eager=256 captured=0 fallback=deltanet_state_unstable      # 27B hybrid, spec off
-graph: eager replayed=0 eager=9 captured=0 fallback=host_upload_in_capture         # tiny Qwen3.5, attention-only static cache
+graph: eager replayed=0 eager=8 captured=0 fallback=positions_host_scalar          # tiny Qwen3.5, attention-only static cache
+graph: eager replayed=0 eager=8 captured=0 fallback=deltanet_state_unstable        # tiny Qwen3.5, hybrid static cache
 graph: eager replayed=0 eager=24 captured=0 fallback=mock_cache_declared_unstable  # cache declares itself unstable
 graph: eager replayed=0 eager=25 captured=0 fallback=sync_in_capture               # a noted device->host read during capture
 graph: eager replayed=0 eager=25 captured=0 fallback=allocation_escaped_capture    # census alloc=7 free=6 escaped=1
+graph: mixed replayed=1 eager=26 captured=0 fallback=replay_mismatch               # a Rust scalar baked into the capture
+graph: mixed replayed=4 eager=9 captured=1 fallback=launch_failed                  # a launch fails mid-request
 ```
 
-In each case the request finishes token-identical to the bare model, on the same device.
+In each case the request finishes token-identical to the bare model, on the same device, and the runner keeps no
+graph.
 
-These have CPU or CUDA unit tests:
+Which reasons have a test (CPU or CUDA unit tests unless noted):
 
-- the capability refusals: `disabled`, `not_cuda`, `cuda_feature_off`, `legacy_stream`
-- the shape guard: `shape` (prefills are never captured)
-- a failed launch: `launch_failed`, which rolls back and runs eager
+- the capability refusals `disabled`, `not_cuda`, `cuda_feature_off`, `legacy_stream`; `flash_attn_stream` only
+  compile-checked (`--features cuda,flash-attn`; its stream rule is unit-tested)
+- the declarations `mock_cache_declared_unstable`, `positions_host_scalar`, `deltanet_state_unstable`
+- the census `sync_in_capture`, `allocation_escaped_capture`; `host_upload_in_capture` and `host_read_in_capture` in
+  the POC tests and `census_step`
+- `replay_mismatch` (the synthetic `scalar` misbehaviour: the first replay at a new position disagrees)
+- `shape` (`oversized_steps_are_named_shape_fallbacks`: a 17-token step runs eager; decode steps still capture)
+- `launch_failed` (`a_failed_launch_rolls_back_and_falls_back_eager`, through a test-only launch-failure seam: the
+  replay's bookkeeping is rolled back and every step's logits and cache length match the bare model)
+- `reference_path` (provider: switch on, MTP off → `graph: none … fallback=reference_path`)
+- `capture_invalidated` (the legacy stream in the POC test)
+- no test: `staging_failed`, `self_check_failed`, `instantiate_failed`, `no_async_alloc`, `event_tracking`,
+  `step_failed_in_capture`, `rollback_unavailable`
 
 ## The census of a real 27B step (`qwen38_27b_step_census`)
 
@@ -208,10 +259,14 @@ and in-place `slice_set` — what candle can replay today:
 
 | test | result (release, `7699d507a`) |
 |---|---|
-| `synthetic_decode_through_the_runner_is_token_identical_and_replays` | 40 greedy tokens identical to eager. `graph: mixed replayed=37 eager=5 captured=1`. Census `nodes=20 kernels=8 htod=0 alloc=6 free=6 escaped=0`. Staging 100 B |
-| `synthetic_speculative_k3_through_the_runner_is_token_identical_and_replays` | K = 3 through the engine (4-token verify steps, rejections, rollbacks, replay forwards): 48 tokens identical, acceptance identical. `graph: mixed replayed=41 eager=11 captured=2`. Exactly one sync per verify step, plus two self-check syncs per captured shape |
-| `synthetic_misbehaviour_falls_back_with_a_named_reason` | Declared unstable / host read / escaping allocation → the three named reasons above. Tokens identical, nothing replayed, device unchanged |
-| `qwen35_static_step_is_refused_by_the_census_with_layout_uploads` | Tiny attention-only Qwen3.5 on the static cache: census `kernels=100 htod=10` → `host_upload_in_capture`. The hybrid config → `deltanet_state_unstable` |
+| `synthetic_decode_through_the_runner_is_token_identical_and_replays` | 40 greedy tokens identical to eager. `graph: mixed replayed=37 eager=6 captured=1`. Census `nodes=20 kernels=8 htod=0 alloc=6 free=6 escaped=0`. Staging 100 B |
+| `synthetic_speculative_k3_through_the_runner_is_token_identical_and_replays` | K = 3 through the engine (4-token verify steps, rejections, rollbacks, replay forwards): 48 tokens identical, acceptance identical. `graph: mixed replayed=41 eager=13 captured=2`. Exactly one sync per verify step, plus two self-check syncs per captured shape |
+| `synthetic_misbehaviour_falls_back_with_a_named_reason` | Declared unstable / host read / escaping allocation / baked-in scalar → the four named reasons above. Tokens identical to the same model run bare, no graph kept, device unchanged |
+| `oversized_steps_are_named_shape_fallbacks`, `a_failed_launch_rolls_back_and_falls_back_eager` | `shape` and `launch_failed`, as listed under AC3 |
+| `a_refusal_drops_every_captured_shape` | A verified 1-token graph is dropped, with its staging, when the 2-token shape is refused |
+| `a_panic_inside_the_capture_still_ends_it` | After a panic inside a capture the stream is out of capture mode and usable |
+| `graph_memory_is_reported_and_trimmed_when_the_graphs_go` | From a trimmed pool, one capture reports `graph_reserved_bytes = 33554432` (the device's whole reservation); `reset` trims it back to 0 |
+| `qwen35_steps_are_refused_by_declaration_and_the_census_finds_layout_uploads` | Tiny attention-only Qwen3.5 on the static cache → `positions_host_scalar`, no recording. `census_step` on a warmed 1-token step: `kernels=99 htod=11` → `host_upload_in_capture` (the runner's own recording at `7699d507a`, before the declaration existed, counted `kernels=100 htod=10`). The hybrid config → `deltanet_state_unstable` |
 | `poc_contiguous_ops_replay_bit_exact_and_index_select_is_refused` | matmul + softmax + affine + fused QK-norm/RoPE: 2 replays at new inputs, bit-exact. Adding one `index_select` → `htod=1` → refused |
 | `synthetic_replay_timing` | 2048 steps: **eager 125.5 µs/step, graphs 90.6 µs/step** (`replayed=2045`). An earlier release run at `6c07bcce3` measured 142.2 → 92.7 |
 
@@ -220,12 +275,14 @@ and in-place `slice_set` — what candle can replay today:
 These are ordered; each gate is visible as the runner's fallback reason:
 
 1. **S3's stable-address DeltaNet ring** lifts `deltanet_state_unstable` (and the `escaped=96`).
-2. **A candle revision that stops uploading layouts from host `Vec`s** lifts `host_upload_in_capture`. Positions then
-   need to be device data (RoPE tables gathered from a device position, KV written at a device offset, attention over
-   the capacity with a device length) through seam kernels whose arithmetic keeps the static path's bits.
+2. **Positions as device data** lift `positions_host_scalar`: RoPE tables gathered from a device position, KV written
+   at a device offset, attention over the capacity with a device length, through seam kernels whose arithmetic keeps
+   the static path's bits. The model then drops its declaration and implements the cache's `replay_advance`.
+3. **A candle revision that stops uploading layouts from host `Vec`s** lifts `host_upload_in_capture`, the census
+   gate that follows.
 
-The runner, the census, the self-checks, the telemetry and the admission term need no change for either. Each step
-only removes a named reason.
+The runner, the census, the self-checks, the telemetry and the admission term need no change for any of them. Each
+step only removes a named reason.
 
 ## Reproduce
 
@@ -243,5 +300,10 @@ for run in "legacy-stream-graphs-off CANDLE_LLM_CUDA_STREAM=legacy" "graphs-off 
 done
 python scripts/release/decode_bench.py table <the three dirs> --output comparison.md
 CUDA_VISIBLE_DEVICES=0 BONSAI_QWEN38_SNAPSHOT="$SNAP" <cuda_graphs exe> --ignored --nocapture --test-threads=1
-CUDA_VISIBLE_DEVICES=0 RUST_TEST_THREADS=1 <candle_llm lib exe> graph:: --nocapture --include-ignored
+CUDA_VISIBLE_DEVICES=0 RUST_TEST_THREADS=1 <candle_llm lib exe> graph:: device:: starvector:: --nocapture
 ```
+
+The sealed runs above were made at `7699d507a`, when the own stream was the default. At this revision the stream
+follows `CudaStreamKind::resolve`, and the three commands still select the same streams (`CANDLE_LLM_CUDA_STREAM` is
+explicit in each, and graphs-on also switches the runner on). The `cuda_graphs` tests select their device with the
+runner switched on, so both of their rows run on the own stream as before.

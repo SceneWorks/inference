@@ -4,10 +4,14 @@
 //! [`DecodeCache`]: [`GraphRunner`] wraps any step model, captures one CUDA graph per distinct
 //! step shape (the token count `M` — `1` for a decode step, `K + 1` for a speculative verify —
 //! plus the logits scope and whether hidden states are wanted) and replays it at every later
-//! step of that shape. Model files carry no graph logic; they only keep their per-step positions
-//! as **data** (a device tensor the kernels read, staged by [`DecodeCache::stage_positions`])
-//! and their state at **stable addresses** (the S4 static KV cache), which is what makes a
-//! captured step replayable at a new position.
+//! step of that shape. Model files carry no graph logic. A captured step is replayable at a new
+//! position only when every per-step position its kernels read is **device data** (staged by
+//! [`DecodeCache::stage_positions`]) and its state lives at **stable addresses** (a static KV
+//! cache). No Qwen3.5/3.8 step meets that on this revision — `Qwen35Model` keeps its positions as
+//! Rust-side scalars and declares so ([`StepModel::graph_support`] → `positions_host_scalar`), and
+//! the S1 hybrid cache still replaces its DeltaNet state per step (`deltanet_state_unstable`) — so
+//! the runner refuses those steps by name before any capture. The synthetic step model in the CUDA
+//! tests below meets it, and is what proves the runner end to end.
 //!
 //! ## What a captured step is
 //! Stream capture records every launch, memcpy and stream-ordered allocation the step issues
@@ -16,10 +20,11 @@
 //! `cuMemAllocAsync` on a device with memory-pool support (every Blackwell part), so the step's
 //! temporaries become graph memory nodes — allocated and freed inside the graph — and the
 //! runner needs no pre-planned workspace. The stream must be one candle created with
-//! `Device::new_cuda_with_stream` (the legacy NULL stream `Device::new_cuda` uses cannot be
-//! captured; [`select_device`](crate::device::select_device) does this), and the step's outputs
-//! are copied into preallocated staging tensors inside the capture so nothing the step allocated
-//! outlives it.
+//! `Device::new_cuda_with_stream`: the legacy NULL stream `Device::new_cuda` uses cannot be
+//! captured, and [`select_device`](crate::device::select_device) only builds the model's own
+//! stream when this runner is switched on at load time (or `CANDLE_LLM_CUDA_STREAM=own`). The
+//! step's outputs are copied into preallocated staging tensors inside the capture so nothing
+//! the step allocated outlives it.
 //!
 //! ## The POC finding: candle uploads layout metadata per op
 //! Every candle CUDA op whose kernel takes a layout — `index_select` (the embedding lookup),
@@ -32,36 +37,44 @@
 //! heap holds by then into the kernel's layout buffer (an illegal address, or silently wrong
 //! indexing). The runner therefore takes a **census** of every captured graph before it is
 //! instantiated ([`GraphCensus`]) and refuses one with a host-sourced memcpy node
-//! ([`REASON_HOST_UPLOAD_IN_CAPTURE`]) — the reason a Qwen3.5/3.8 step reports on this candle
-//! revision. What would fix it in candle: pass layouts by value as kernel parameters (or cache
-//! the `[dims, strides]` device buffers per layout) so no per-op host upload exists. Until then
-//! only a step built from contiguous-only ops, cuBLAS matmuls, `copy2d` (`slice_set`) and the
-//! nvrtc-seam kernels (scalar arguments) is replayable — the synthetic model in the CUDA tests
-//! below is such a step, and is what proves the runner end to end.
+//! ([`REASON_HOST_UPLOAD_IN_CAPTURE`]). A Qwen3.5/3.8 step recorded with the evidence-only
+//! `census_step` shows exactly that on this candle revision (the runner itself never records
+//! one: the declarations above refuse it first). What would fix it in candle: pass layouts by
+//! value as kernel parameters (or cache the `[dims, strides]` device buffers per layout) so no
+//! per-op host upload exists. Until then only a step built from contiguous-only ops, cuBLAS
+//! matmuls, `copy2d` (`slice_set`) and the nvrtc-seam kernels (scalar arguments) is replayable.
 //!
 //! ## Verification before trust
-//! A graph is only ever used after two bit-exact self-checks: the capture step and the first
-//! replay each launch the graph, roll the cache back, run the eager step, and compare every
-//! logit (and hidden) element on the device. Any difference — a stale scalar, a reallocated
-//! temporary, an unstable state address — throws the graph away, keeps the eager result and
-//! names the reason. The reference path is never changed by the runner (E2).
+//! A graph is only ever used after two bit-exact self-checks, at the capture step and at the
+//! first replay (a *new* position): each runs the eager step, rolls the cache back, launches
+//! the graph at the same position, compares every logit (and hidden) element on the device,
+//! then rolls back and re-runs the eager step so the cache holds the eager state. Any
+//! difference — a stale scalar, a reallocated temporary, an unstable state address — throws
+//! the graph away, keeps the eager result and names the reason. The reference path is never
+//! changed by the runner (E2).
 //!
 //! ## Fallback, never failure
 //! Every refusal is a **named** reason on the per-thread [`GraphTally`], reported per request
 //! through [`DecodeRecord::cuda_graphs`](crate::decode::DecodeRecord::cuda_graphs) as
-//! `graph: … fallback=<reason>`: the switch is off, the build has no `cuda` feature, the model
-//! is not on a CUDA device, the device has no stream-ordered allocator, the model or the cache
-//! declares itself uncapturable ([`StepModel::graph_support`], [`DecodeCache::graph_support`]),
-//! the census found a host upload / host read / an allocation that outlives the graph, the
-//! driver invalidated the capture, instantiation failed (memory), or a replay disagreed with
-//! eager. A fallback runs the eager step; the request continues on the same device.
+//! `graph: … fallback=<reason>`: the switch is off, the build has no `cuda` feature or uses
+//! `flash-attn`, the model is not on a CUDA device or is on the legacy stream, the device has
+//! no stream-ordered allocator, the cache or the model declares itself uncapturable
+//! ([`DecodeCache::graph_support`], then [`StepModel::graph_support`]), the step shape is not
+//! captured, the staging failed, the census found a host upload / host read / an allocation
+//! that outlives the graph, the driver invalidated the capture, instantiation or a launch
+//! failed, or a self-check could not run or disagreed with eager. A refusal drops every graph
+//! the runner holds; the step rolls the cache back and runs eager, and the request continues
+//! on the same device. The one case that fails the step is a cache that cannot roll back to a
+//! position it restored or checkpointed earlier in the same step (`rollback_unavailable`):
+//! then neither the graph's state nor the eager one can be trusted.
 //!
 //! ## Switch and accounting
 //! `CANDLE_LLM_CUDA_GRAPHS` (`1` / `on` / `true` / `yes` enable; the default is **off** —
 //! opt-in until a capturable step model exists and the decode bench shows a win, see the
-//! story's evidence) or [`set_cuda_graphs`] at runtime. Graph workspaces — the staging tensors
-//! and the graph's own reserved device memory — are reported by [`GraphRunner::workspace`] for
-//! admission (E6).
+//! story's evidence) or [`set_cuda_graphs`] at runtime. Admission prices graph memory up front
+//! with [`graph_workspace_admission_bytes`] (E6); [`GraphRunner::workspace`] reports what a
+//! runner holds (telemetry). A destroyed graph's memory is trimmed back from the device's graph
+//! pool.
 //!
 //! Without the `cuda` feature the runner is a transparent pass-through that reports
 //! [`REASON_CUDA_FEATURE_OFF`].
@@ -97,14 +110,28 @@ pub const REASON_NO_ASYNC_ALLOC: &str = "no_async_alloc";
 /// Fallback reason: cudarc's per-slice event tracking is on (a second stream exists on the
 /// context); its waits on events recorded before the capture would invalidate it.
 pub const REASON_EVENT_TRACKING: &str = "event_tracking";
-/// Fallback reason: the model runs on the legacy NULL stream (`Device::new_cuda`,
-/// `CANDLE_LLM_CUDA_STREAM=legacy`), which stream capture does not support.
+/// Fallback reason: the model runs on the legacy NULL stream (`Device::new_cuda`), which stream
+/// capture does not support — the device was selected while the switch was off, or with
+/// `CANDLE_LLM_CUDA_STREAM=legacy`.
 pub const REASON_LEGACY_STREAM: &str = "legacy_stream";
+/// Fallback reason: a `flash-attn` build. candle-flash-attn launches its kernels on stream 0,
+/// which cannot be captured and does not order against the model's own stream, so such a build
+/// keeps the legacy stream and never captures.
+pub const REASON_FLASH_ATTN_STREAM: &str = "flash_attn_stream";
 /// Fallback reason: the step shape is not capturable (empty, or more tokens than
 /// [`GraphRunner::MAX_CAPTURED_TOKENS`] — a prefill is never captured).
 pub const REASON_SHAPE: &str = "shape";
 /// Fallback reason: the cache cannot roll back to the step start, so the self-check cannot run.
 pub const REASON_ROLLBACK_UNAVAILABLE: &str = "rollback_unavailable";
+/// Fallback reason: the runner could not prepare or read back a graph step — allocating or
+/// filling the staging tensors (tokens, positions), the cache's replay bookkeeping, or copying
+/// the staged outputs out.
+pub const REASON_STAGING_FAILED: &str = "staging_failed";
+/// Fallback reason: a bit-exact self-check could not run (comparing the outputs failed).
+pub const REASON_SELF_CHECK_FAILED: &str = "self_check_failed";
+/// Why a request's record shows no runner step with the switch on: it decoded on a reference
+/// path the runner does not wrap (it serves the step-seam engine only).
+pub const REASON_REFERENCE_PATH: &str = "reference_path";
 /// Fallback reason: the step issued a device->host transfer this crate counts (`note_host_sync`)
 /// during capture — the data it read was never computed.
 pub const REASON_SYNC_IN_CAPTURE: &str = "sync_in_capture";
@@ -204,15 +231,16 @@ pub fn cuda_graphs_policy_guard(enabled: Option<bool>) -> CudaGraphsPolicyGuard 
     }
 }
 
-/// Per-thread counts of graph-replayed vs eager steps (monotone; take deltas with
+/// Per-thread counts of graph replays vs eager step executions (monotone; take deltas with
 /// [`GraphTally::since`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GraphTally {
-    /// Steps served by a graph replay.
+    /// Graph launches that ran a step: every replay, the first-replay self-check included.
     pub replayed: u64,
-    /// Steps served by the eager step (fallbacks, warm-ups, prefills, self-checks).
+    /// Eager executions of a step through the runner: fallbacks, warm-ups, prefills, and each
+    /// self-check's eager reference and eager re-run.
     pub eager: u64,
-    /// Graphs captured and verified (one per step shape).
+    /// Graphs that passed both self-checks (at most one per step shape).
     pub captured: u64,
     /// Why the most recent eager step happened when a graph was wanted (`None` if the runner
     /// was never asked, or every eager step was a warm-up / self-check).
@@ -334,15 +362,19 @@ impl Drop for CaptureFlag {
     }
 }
 
-/// The device memory a runner holds for its graphs (E6): the staging tensors it allocated and
-/// the graph memory the driver reserved for the captured temporaries.
+/// The device memory a runner holds for its graphs (telemetry; admission prices graph memory
+/// with [`graph_workspace_admission_bytes`], E6): the staging tensors it allocated and the growth
+/// of the device's graph-memory reservation across its captures.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GraphWorkspace {
     /// Bytes of the preallocated input / output staging tensors, every captured shape.
     pub staging_bytes: usize,
-    /// Bytes the driver reports reserved for graph memory nodes on the device after the runner's
-    /// captures (`CU_GRAPH_MEM_ATTR_RESERVED_MEM_CURRENT` delta; device-wide, so an
-    /// over-estimate when other graphs live on the device).
+    /// How much the device's graph-memory reservation (`CU_GRAPH_MEM_ATTR_RESERVED_MEM_CURRENT`)
+    /// grew across this runner's captures. The pool is device-wide and a graph reuses what is
+    /// already reserved, so this is an **approximation**: it under-reports (down to `0`) when
+    /// another live graph's reservation already covers the step, and it includes whatever
+    /// another thread reserved during the capture. Destroyed graphs are trimmed from the pool
+    /// (`cuDeviceGraphMemTrim`), so a runner that drops its graphs gives the reservation back.
     pub graph_reserved_bytes: usize,
 }
 
@@ -576,6 +608,9 @@ impl<'m, M: StepModel> GraphRunner<'m, M> {
             let Device::Cuda(dev) = self.model.device() else {
                 return Some(REASON_NOT_CUDA);
             };
+            if cfg!(feature = "flash-attn") {
+                return Some(REASON_FLASH_ATTN_STREAM);
+            }
             let stream = dev.cuda_stream();
             if stream.cu_stream().is_null() {
                 return Some(REASON_LEGACY_STREAM);
@@ -587,10 +622,12 @@ impl<'m, M: StepModel> GraphRunner<'m, M> {
             if ctx.is_managing_stream_synchronization() {
                 return Some(REASON_EVENT_TRACKING);
             }
-            if let Err(reason) = self.model.graph_support() {
+            // The cache's declaration first: it names the state a cache change lifts (S3's
+            // stable-address DeltaNet ring), the gate ahead of the model's own (positions).
+            if let Err(reason) = cache.graph_support() {
                 return Some(reason);
             }
-            if let Err(reason) = cache.graph_support() {
+            if let Err(reason) = self.model.graph_support() {
                 return Some(reason);
             }
             None
@@ -665,17 +702,21 @@ impl<M: StepModel> StepModel for GraphRunner<'_, M> {
     }
 }
 
-/// **Diagnostic** (evidence, sc-24134): record one step of `model` on `cache` as a CUDA graph,
-/// take its [`GraphCensus`], destroy the graph **without instantiating or launching it**, and
-/// roll the cache back to where it was. Nothing runs on the device, and the declared refusals
-/// ([`StepModel::graph_support`], [`DecodeCache::graph_support`]) are deliberately not consulted:
-/// this is how a real decoder step's launch count and host-upload count are measured. `None`
-/// when the recording itself failed (the reason is logged) — a step that frees a tensor it did
-/// not allocate inside the capture does that.
+/// **Evidence only** (sc-24134), not serving API: record one step of `model` on `cache` as a
+/// CUDA graph, take its [`GraphCensus`], destroy the graph **without instantiating or launching
+/// it**, and roll the cache back to where it was. Nothing runs on the device, and the declared
+/// refusals ([`StepModel::graph_support`], [`DecodeCache::graph_support`]) are deliberately not
+/// consulted: this is how a real decoder step's launch count and host-upload count are
+/// measured. `None` when the recording itself failed (the reason is logged) — a step that frees
+/// a tensor it did not allocate inside the capture does that.
 ///
-/// The recording replaces any state the step re-creates with graph-owned tensors that were never
-/// backed by memory; the rollback drops them, and the driver's complaints about freeing them are
-/// drained here. Use it on a model you are done with (the end of an evidence run), not mid-request.
+/// **Precondition: discard `cache` (and do not decode with `model` on it) after this call.** The
+/// recording replaces any state the step re-creates with graph-owned tensors that were never
+/// backed by memory; the rollback drops the ones it restores, but a cache that keeps any other
+/// such tensor holds an address nothing backs, and the driver errors from freeing them are only
+/// drained here. Call it at the end of an evidence run on a model and cache you are done with.
+/// The model's device must be on its own stream (the graph runner on at load time).
+#[doc(hidden)]
 #[cfg(feature = "cuda")]
 pub fn census_step<M: StepModel + ?Sized>(
     model: &M,
@@ -858,16 +899,28 @@ mod cuda {
 
     /// An instantiated CUDA graph on the device's stream. (cudarc's own `CudaGraph` instantiates
     /// through a flag enum with no zero value, so this wrapper drives the driver directly:
-    /// `cuGraphInstantiateWithFlags(0)`, explicit upload, executable destroyed before the graph.)
+    /// `cuGraphInstantiateWithFlags(0)`, explicit upload, executable destroyed before the graph,
+    /// and the device's graph-memory pool trimmed once both are gone.)
     pub(super) struct Graph {
         graph: sys::CUgraph,
         exec: sys::CUgraphExec,
         stream: Arc<CudaStream>,
     }
 
+    #[cfg(test)]
+    thread_local! {
+        /// Test seam: fail this thread's next graph launch (the `launch_failed` fallback test).
+        pub(super) static FAIL_NEXT_LAUNCH: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
     impl Graph {
         /// Replay the graph on its stream (asynchronous, stream-ordered like any launch).
         pub(super) fn launch(&self) -> std::result::Result<(), sys::CUresult> {
+            #[cfg(test)]
+            if FAIL_NEXT_LAUNCH.with(|f| f.replace(false)) {
+                return Err(sys::CUresult::CUDA_ERROR_LAUNCH_FAILED);
+            }
             self.stream.context().bind_to_thread().map_err(|e| e.0)?;
             ok(unsafe { sys::cuGraphLaunch(self.exec, self.stream.cu_stream()) })
         }
@@ -884,6 +937,9 @@ mod cuda {
             if !self.graph.is_null() {
                 unsafe { sys::cuGraphDestroy(self.graph) };
             }
+            // Graph memory stays reserved in the device-wide pool after its graph is gone until
+            // it is trimmed; give it back (only memory no live, scheduled graph uses is freed).
+            unsafe { sys::cuDeviceGraphMemTrim(self.stream.context().cu_device()) };
         }
     }
 
@@ -920,6 +976,7 @@ mod cuda {
     }
 
     impl State {
+        /// Drop every graph and staging tensor (each graph trims the pool as it goes).
         pub(super) fn clear(&mut self) {
             self.shapes.clear();
             self.graph_reserved_bytes = 0;
@@ -966,7 +1023,7 @@ mod cuda {
         (result == sys::CUresult::CUDA_SUCCESS).then_some(value)
     }
 
-    fn reserved_graph_mem(dev: &CudaDevice) -> Option<u64> {
+    pub(super) fn reserved_graph_mem(dev: &CudaDevice) -> Option<u64> {
         graph_mem_attribute(
             dev,
             sys::CUgraphMem_attribute::CU_GRAPH_MEM_ATTR_RESERVED_MEM_CURRENT,
@@ -986,33 +1043,76 @@ mod cuda {
     /// Why a capture attempt was abandoned.
     pub(super) struct Abandoned(pub(super) &'static str);
 
+    /// An open stream capture on this thread. [`end`](Self::end) ends it; dropping it without
+    /// that — the step panicked — ends it too and destroys whatever was recorded, so the stream
+    /// never stays in capture mode. The capture flag is cleared after the capture ends.
+    struct CaptureSession {
+        stream: Arc<CudaStream>,
+        open: bool,
+        _flag: CaptureFlag,
+    }
+
+    impl CaptureSession {
+        fn begin(stream: &Arc<CudaStream>) -> std::result::Result<Self, Abandoned> {
+            if let Err(e) =
+                stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            {
+                eprintln!("[cuda-graph] begin_capture failed: {e:?}");
+                return Err(Abandoned(REASON_CAPTURE_INVALIDATED));
+            }
+            Ok(Self {
+                stream: stream.clone(),
+                open: true,
+                _flag: CaptureFlag::set(),
+            })
+        }
+
+        /// `cuStreamEndCapture`: its result and the recorded graph (null when invalidated).
+        fn end(mut self) -> (sys::CUresult, sys::CUgraph) {
+            self.open = false;
+            let mut graph: sys::CUgraph = std::ptr::null_mut();
+            let ended = unsafe { sys::cuStreamEndCapture(self.stream.cu_stream(), &mut graph) };
+            (ended, graph)
+        }
+    }
+
+    impl Drop for CaptureSession {
+        fn drop(&mut self) {
+            if !self.open {
+                return;
+            }
+            let ctx = self.stream.context();
+            if ctx.bind_to_thread().is_err() {
+                return;
+            }
+            let mut graph: sys::CUgraph = std::ptr::null_mut();
+            unsafe { sys::cuStreamEndCapture(self.stream.cu_stream(), &mut graph) };
+            if !graph.is_null() {
+                unsafe { sys::cuGraphDestroy(graph) };
+            }
+            // Drain what the interrupted step left recorded on cudarc's context.
+            let _ = ctx.check_err();
+        }
+    }
+
     /// Capture `f` on the device's stream: begin capture, run the closure with the capture flag
     /// set, end capture. The closure's device work is **recorded, not run**. Returns the recorded
-    /// graph, or the reason capture was abandoned (the capture is always ended and cudarc's
-    /// recorded error state drained, so the stream is usable afterwards).
+    /// graph, or the reason capture was abandoned (the capture is always ended — also when `f`
+    /// panics — and cudarc's recorded error state drained, so the stream is usable afterwards).
     pub(super) fn capture<T>(
         dev: &CudaDevice,
         f: impl FnOnce() -> Result<T>,
     ) -> std::result::Result<(Recorded, T), Abandoned> {
         let stream = dev.cuda_stream();
         let ctx = stream.context();
-        if let Err(e) =
-            stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
-        {
-            eprintln!("[cuda-graph] begin_capture failed: {e:?}");
-            return Err(Abandoned(REASON_CAPTURE_INVALIDATED));
-        }
+        let session = CaptureSession::begin(&stream)?;
         let syncs_before = host_sync_count();
-        let outcome = {
-            let _flag = CaptureFlag::set();
-            f()
-        };
+        let outcome = f();
         // `cuStreamEndCapture` is called whatever happened: on a failed step it returns the
         // driver's invalidation error and leaves the stream in its normal state. A failing free
         // inside the capture is recorded on cudarc's context and would resurface on the next
         // call, so it is drained here.
-        let mut graph: sys::CUgraph = std::ptr::null_mut();
-        let ended = unsafe { sys::cuStreamEndCapture(stream.cu_stream(), &mut graph) };
+        let (ended, graph) = session.end();
         let recorded_err = ctx.check_err().err();
         let recorded = Recorded {
             graph,
@@ -1105,10 +1205,95 @@ mod cuda {
         Ok(())
     }
 
-    fn refuse<M: StepModel>(runner: &GraphRunner<'_, M>, key: ShapeKey, reason: &'static str) {
+    /// Runner-wide refusal: record the reason and drop **every** graph and staging tensor the
+    /// runner holds (a refused runner never replays again, so nothing it captured is kept).
+    fn refuse<M: StepModel>(runner: &GraphRunner<'_, M>, reason: &'static str) {
         let mut inner = runner.inner.borrow_mut();
-        inner.cuda.shapes.remove(&key);
+        inner.cuda.clear();
         inner.refused = Some(reason);
+    }
+
+    /// The end of every failed graph attempt: refuse with `reason`, take the cache back to `base`
+    /// (the attempt may have advanced it — a recording, a launch, the replay bookkeeping) and run
+    /// the eager step there. When the cache cannot return to `base` — a position it restored or
+    /// checkpointed earlier in this same step — neither the graph's state nor the eager one can
+    /// be trusted: the step fails with the cache's error (`rollback_unavailable`).
+    fn fall_back<M: StepModel>(
+        runner: &GraphRunner<'_, M>,
+        cache: &mut M::Cache,
+        request: StepRequest<'_>,
+        base: i32,
+        reason: &'static str,
+    ) -> Result<StepOutput> {
+        refuse(runner, reason);
+        restore(runner, cache, base, reason)?;
+        // A rollback after a recording drops the graph-owned tensors the step made, whose
+        // addresses nothing ever backed; cudarc records the failed frees on the context, where
+        // they would fail the eager step's first op. Drain them (as `census_step` does).
+        if let Device::Cuda(dev) = runner.model.device() {
+            if let Err(e) = dev.cuda_stream().context().check_err() {
+                eprintln!("[cuda-graph] drained a recorded driver error after `{reason}`: {e:?}");
+            }
+        }
+        let out = runner.model.forward_step(cache, request)?;
+        note_eager(Some(reason));
+        Ok(out)
+    }
+
+    /// Roll the cache back to `base` after the runner advanced it (see [`fall_back`]); `after`
+    /// names what happened, for the log.
+    fn restore<M: StepModel>(
+        runner: &GraphRunner<'_, M>,
+        cache: &mut M::Cache,
+        base: i32,
+        after: &str,
+    ) -> Result<()> {
+        cache.rollback_to(base).map_err(|e| {
+            eprintln!(
+                "[cuda-graph] cannot roll back to {base} after {after} ({REASON_ROLLBACK_UNAVAILABLE}): {e}"
+            );
+            refuse(runner, REASON_ROLLBACK_UNAVAILABLE);
+            e
+        })
+    }
+
+    /// The eager reference of a self-check: run the eager step at `base`, then roll the cache
+    /// back to `base` for the graph to run the same position. `Err(out)` when the cache cannot
+    /// roll back: the runner is refused and `out` — the eager step, which the cache holds — is
+    /// the step's answer.
+    fn eager_reference<M: StepModel>(
+        runner: &GraphRunner<'_, M>,
+        cache: &mut M::Cache,
+        request: StepRequest<'_>,
+        base: i32,
+    ) -> Result<std::result::Result<StepOutput, StepOutput>> {
+        let eager = runner.model.forward_step(cache, request)?;
+        if let Err(e) = cache.rollback_to(base) {
+            eprintln!("[cuda-graph] cannot roll back for the self-check: {e}");
+            refuse(runner, REASON_ROLLBACK_UNAVAILABLE);
+            note_eager(Some(REASON_ROLLBACK_UNAVAILABLE));
+            return Ok(Err(eager));
+        }
+        note_eager(None);
+        Ok(Ok(eager))
+    }
+
+    /// Compare the graph's outputs with the eager reference: `None` when bit-identical, the
+    /// fallback reason otherwise.
+    fn self_check(graph: &StepOutput, eager: &StepOutput, what: &str) -> Option<&'static str> {
+        match outputs_identical(graph, eager) {
+            Ok(true) => None,
+            Ok(false) => {
+                eprintln!("[cuda-graph] {what} disagreed with eager ({REASON_REPLAY_MISMATCH})");
+                Some(REASON_REPLAY_MISMATCH)
+            }
+            Err(e) => {
+                eprintln!(
+                    "[cuda-graph] {what}: the self-check failed ({REASON_SELF_CHECK_FAILED}): {e}"
+                );
+                Some(REASON_SELF_CHECK_FAILED)
+            }
+        }
     }
 
     /// The runner's CUDA step: warm-up, capture (with self-check), verified replay, replay.
@@ -1140,6 +1325,7 @@ mod cuda {
                 Some(Shape::Graph(_)) => Plan::Replay,
             }
         };
+        let base = cache.len();
         match plan {
             Plan::WarmUp => {
                 let out = model.forward_step(cache, request)?;
@@ -1153,39 +1339,32 @@ mod cuda {
                 Ok(out)
             }
             Plan::Capture => {
-                let base = cache.len();
-                // Staging tensors are allocated outside the capture; their shapes come from a
-                // dry run of the eager step's output shapes: the warm-up already proved the
-                // step runs, so this is one eager step whose result is the self-check reference.
-                let eager = model.forward_step(cache, request)?;
-                note_eager(None);
-                if let Err(e) = cache.rollback_to(base) {
-                    eprintln!("[cuda-graph] cannot roll back for the capture: {e}");
-                    refuse(runner, key, REASON_ROLLBACK_UNAVAILABLE);
-                    note_eager(Some(REASON_ROLLBACK_UNAVAILABLE));
-                    return Ok(eager);
-                }
-                let staging = (|| -> Result<(Tensor, Tensor, Option<Tensor>)> {
+                // The eager reference first: the warm-up proved the step runs, its outputs give
+                // the staging tensors their shapes, and it is what the caller gets either way.
+                let eager = match eager_reference(runner, cache, request, base)? {
+                    Ok(eager) => eager,
+                    Err(eager) => return Ok(eager),
+                };
+                // Staging, outside the capture: the id / output tensors the graph reads and
+                // writes, the step's tokens and positions. Nothing here advances the cache.
+                let staged = (|| -> Result<(Tensor, Tensor, Option<Tensor>)> {
                     let ids = Tensor::zeros((1, key.tokens), DType::U32, &device)?;
                     let logits = eager.logits.zeros_like()?;
                     let hidden = match &eager.hidden {
                         Some(h) => Some(h.zeros_like()?),
                         None => None,
                     };
+                    stage_tokens(&ids, &request.tokens, &device)?;
+                    cache.stage_positions()?;
                     Ok((ids, logits, hidden))
                 })();
-                let (ids, logits, hidden) = match staging {
+                let (ids, logits, hidden) = match staged {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("[cuda-graph] staging allocation failed: {e}");
-                        refuse(runner, key, REASON_INSTANTIATE_FAILED);
-                        let out = model.forward_step(cache, request)?;
-                        note_eager(Some(REASON_INSTANTIATE_FAILED));
-                        return Ok(out);
+                        eprintln!("[cuda-graph] staging the capture failed: {e}");
+                        return fall_back(runner, cache, request, base, REASON_STAGING_FAILED);
                     }
                 };
-                stage_tokens(&ids, &request.tokens, &device)?;
-                cache.stage_positions()?;
                 let reserved_before = reserved_graph_mem(&dev).unwrap_or(0);
                 let captured = capture(&dev, || {
                     let out = model.forward_step(
@@ -1198,16 +1377,13 @@ mod cuda {
                     )?;
                     stage_outputs(&logits, hidden.as_ref(), out)
                 });
-                // Whatever happens next, the Rust-side cache state advanced during the recording
-                // (or partially, on a failed step) and is taken back to the step start.
+                // From here every failure falls back through `fall_back`, which takes the cache
+                // back to the step start: the recording advanced its Rust-side state (or part of
+                // it, on a failed step), and a launch wrote its device state.
                 let recorded = match captured {
                     Ok((recorded, ())) => recorded,
                     Err(Abandoned(reason)) => {
-                        refuse(runner, key, reason);
-                        cache.rollback_to(base)?;
-                        let out = model.forward_step(cache, request)?;
-                        note_eager(Some(reason));
-                        return Ok(out);
+                        return fall_back(runner, cache, request, base, reason)
                     }
                 };
                 let census = recorded.census();
@@ -1219,55 +1395,33 @@ mod cuda {
                         census.describe()
                     );
                     drop(recorded);
-                    refuse(runner, key, reason);
-                    cache.rollback_to(base)?;
-                    let out = model.forward_step(cache, request)?;
-                    note_eager(Some(reason));
-                    return Ok(out);
+                    return fall_back(runner, cache, request, base, reason);
                 }
                 let graph = match recorded.instantiate() {
                     Ok(g) => g,
                     Err(Abandoned(reason)) => {
-                        refuse(runner, key, reason);
-                        cache.rollback_to(base)?;
-                        let out = model.forward_step(cache, request)?;
-                        note_eager(Some(reason));
-                        return Ok(out);
+                        return fall_back(runner, cache, request, base, reason)
                     }
                 };
-                // First launch, at `base`, then the bit-exact self-check against the eager step
-                // taken above (the cache was rolled back, so eager and graph wrote the same
-                // positions; the eager result is what the caller gets either way).
                 if let Err(e) = graph.launch() {
                     eprintln!("[cuda-graph] first launch failed: {e:?}");
                     drop(graph);
-                    refuse(runner, key, REASON_LAUNCH_FAILED);
-                    cache.rollback_to(base)?;
-                    let out = model.forward_step(cache, request)?;
-                    note_eager(Some(REASON_LAUNCH_FAILED));
-                    return Ok(out);
+                    return fall_back(runner, cache, request, base, REASON_LAUNCH_FAILED);
                 }
-                let replayed = StepOutput {
+                let launched = StepOutput {
                     logits: logits.clone(),
                     hidden: hidden.clone(),
                 };
-                let identical = outputs_identical(&replayed, &eager)?;
-                // The eager step is what the cache holds after this call: re-run it so the
-                // device state is the eager one (the launch wrote the same positions).
-                cache.rollback_to(base)?;
-                let eager = model.forward_step(cache, request)?;
-                if !identical {
-                    eprintln!(
-                        "[cuda-graph] capture self-check failed ({REASON_REPLAY_MISMATCH}) on the {}-token step",
-                        key.tokens
-                    );
+                let what = format!("the capture check of the {}-token step", key.tokens);
+                if let Some(reason) = self_check(&launched, &eager, &what) {
                     drop(graph);
-                    refuse(runner, key, REASON_REPLAY_MISMATCH);
-                    note_eager(Some(REASON_REPLAY_MISMATCH));
-                    return Ok(eager);
+                    return fall_back(runner, cache, request, base, reason);
                 }
+                // Verified: leave the eager step's state in the cache (the launch wrote the same
+                // positions) and keep the graph for its first replay.
+                restore(runner, cache, base, "the capture check")?;
+                let eager = model.forward_step(cache, request)?;
                 note_eager(None);
-                note_captured();
                 let reserved_after = reserved_graph_mem(&dev).unwrap_or(reserved_before);
                 let mut inner = runner.inner.borrow_mut();
                 inner.cuda.graph_reserved_bytes = inner
@@ -1289,95 +1443,83 @@ mod cuda {
             Plan::VerifyReplay => {
                 // The first replay at a *new* position is verified against eager — the check
                 // that catches a stale scalar or an unstable state address, which the capture
-                // step's own check (same inputs, same position) cannot.
-                let base = cache.len();
-                let replayed = replay(runner, cache, &request, key, base)?;
-                let Some(replayed) = replayed else {
-                    // The launch failed; `replay` already fell back.
-                    return runner.model.forward_step(cache, request).inspect(|_| {
-                        note_eager(Some(REASON_LAUNCH_FAILED));
-                    });
+                // step's own check (same inputs, same position) cannot. Eager first: until the
+                // replay runs, a cache that cannot roll back still holds the eager step.
+                let eager = match eager_reference(runner, cache, request, base)? {
+                    Ok(eager) => eager,
+                    Err(eager) => return Ok(eager),
                 };
-                if let Err(e) = cache.rollback_to(base) {
-                    eprintln!("[cuda-graph] cannot roll back for the replay check: {e}");
-                    refuse(runner, key, REASON_ROLLBACK_UNAVAILABLE);
-                    // The replay's device state is unverified: it cannot be kept.
-                    return Err(e);
+                let replayed = match replay(runner, cache, &request, key) {
+                    Ok(out) => out,
+                    Err(reason) => return fall_back(runner, cache, request, base, reason),
+                };
+                let what = format!("the first replay of the {}-token step", key.tokens);
+                if let Some(reason) = self_check(&replayed, &eager, &what) {
+                    return fall_back(runner, cache, request, base, reason);
                 }
+                // Verified: leave the eager step's state in the cache — a replay that wrote a
+                // stale position can still match eager's outputs this once.
+                restore(runner, cache, base, "the first-replay check")?;
                 let eager = model.forward_step(cache, request)?;
-                if !outputs_identical(&replayed, &eager)? {
-                    eprintln!(
-                        "[cuda-graph] first replay disagreed with eager ({REASON_REPLAY_MISMATCH}) on the {}-token step",
-                        key.tokens
-                    );
-                    refuse(runner, key, REASON_REPLAY_MISMATCH);
-                    note_eager(Some(REASON_REPLAY_MISMATCH));
-                    return Ok(eager);
-                }
                 note_eager(None);
+                note_captured();
                 if let Some(Shape::Graph(c)) = runner.inner.borrow_mut().cuda.shapes.get_mut(&key) {
                     c.replays = 1;
                 }
                 Ok(eager)
             }
-            Plan::Replay => {
-                let base = cache.len();
-                match replay(runner, cache, &request, key, base)? {
-                    Some(out) => {
-                        if let Some(Shape::Graph(c)) =
-                            runner.inner.borrow_mut().cuda.shapes.get_mut(&key)
-                        {
-                            c.replays = c.replays.wrapping_add(1);
-                        }
-                        Ok(out)
+            Plan::Replay => match replay(runner, cache, &request, key) {
+                Ok(out) => {
+                    if let Some(Shape::Graph(c)) =
+                        runner.inner.borrow_mut().cuda.shapes.get_mut(&key)
+                    {
+                        c.replays = c.replays.wrapping_add(1);
                     }
-                    None => {
-                        let out = runner.model.forward_step(cache, request)?;
-                        note_eager(Some(REASON_LAUNCH_FAILED));
-                        Ok(out)
-                    }
+                    Ok(out)
                 }
-            }
+                Err(reason) => fall_back(runner, cache, request, base, reason),
+            },
         }
     }
 
     /// One replay: stage the tokens and positions, do the cache's bookkeeping for the step,
-    /// launch, and return copies of the staged outputs. On a launch failure the bookkeeping is
-    /// undone, the graph dropped, and `None` returned so the caller runs eager.
+    /// launch, and return copies of the staged outputs. `Err` names why not; the cache may have
+    /// advanced (the caller falls back through [`fall_back`], which rolls it back).
     fn replay<M: StepModel>(
         runner: &GraphRunner<'_, M>,
         cache: &mut M::Cache,
         request: &StepRequest<'_>,
         key: ShapeKey,
-        base: i32,
-    ) -> Result<Option<StepOutput>> {
-        let device = runner.model.device();
-        let launched = {
-            let inner = runner.inner.borrow();
-            let Some(Shape::Graph(c)) = inner.cuda.shapes.get(&key) else {
-                return Err(Error::Msg(
-                    "cuda graph runner: no graph for the shape".into(),
-                ));
-            };
-            stage_tokens(&c.ids, &request.tokens, device)?;
-            cache.stage_positions()?;
-            cache.replay_advance(key.tokens)?;
-            match c.graph.launch() {
-                Ok(()) => {
-                    note_replayed();
-                    Some(copy_outputs(&c.logits, c.hidden.as_ref())?)
-                }
-                Err(e) => {
-                    eprintln!("[cuda-graph] launch failed: {e:?}");
-                    None
-                }
-            }
+    ) -> std::result::Result<StepOutput, &'static str> {
+        let inner = runner.inner.borrow();
+        let Some(Shape::Graph(c)) = inner.cuda.shapes.get(&key) else {
+            eprintln!(
+                "[cuda-graph] no graph to launch for the {}-token step",
+                key.tokens
+            );
+            return Err(REASON_LAUNCH_FAILED);
         };
-        if launched.is_none() {
-            refuse(runner, key, REASON_LAUNCH_FAILED);
-            cache.rollback_to(base)?;
+        let staged = stage_tokens(&c.ids, &request.tokens, runner.model.device())
+            .and_then(|()| cache.stage_positions())
+            .and_then(|()| cache.replay_advance(key.tokens));
+        if let Err(e) = staged {
+            eprintln!("[cuda-graph] staging the replay failed: {e}");
+            return Err(REASON_STAGING_FAILED);
         }
-        Ok(launched)
+        if let Err(e) = c.graph.launch() {
+            eprintln!("[cuda-graph] launch failed: {e:?}");
+            return Err(REASON_LAUNCH_FAILED);
+        }
+        match copy_outputs(&c.logits, c.hidden.as_ref()) {
+            Ok(out) => {
+                note_replayed();
+                Ok(out)
+            }
+            Err(e) => {
+                eprintln!("[cuda-graph] copying the replay's outputs failed: {e}");
+                Err(REASON_STAGING_FAILED)
+            }
+        }
     }
 }
 
@@ -1386,7 +1528,7 @@ mod tests {
     use super::*;
     use crate::decode::step::StepOutput;
     use crate::primitives::decode_cache::CacheMemory;
-    use candle_core::{DType, Tensor};
+    use candle_core::Tensor;
     use std::cell::Cell;
 
     /// A fixed-logits model whose cache is a bare counter (the step driver's own mock).
@@ -1678,19 +1820,6 @@ mod tests {
         assert_eq!(run.output.tokens, bare.tokens);
         assert_eq!(run.record.cuda_graphs.label(), "eager");
     }
-
-    #[test]
-    fn oversized_steps_are_named_shape_fallbacks_even_when_capturable() {
-        // The shape check runs after the capability checks; on a CPU model the capability
-        // refusal wins, so the shape reason is exercised through the tally directly.
-        let too_long = vec![1i32; GraphRunner::<Counter>::MAX_CAPTURED_TOKENS + 1];
-        let request = StepRequest::last(&too_long);
-        let key = ShapeKey::of(&request).unwrap();
-        assert!(key.tokens > GraphRunner::<Counter>::MAX_CAPTURED_TOKENS);
-        assert_eq!(key.scope, LogitsScope::Last);
-        assert!(!key.want_hidden);
-        let _ = DType::F32;
-    }
 }
 
 /// The story's POC experiments (sc-24134, step 0): what candle @ `1e6aa85e` on cudarc 0.19 can
@@ -1708,7 +1837,6 @@ mod cuda_tests {
     };
     use crate::decode::step::generate_step;
     use crate::decode::stream::GenerationConfig;
-    use crate::primitives::attention::{capacity_mask, sdpa_gqa_causal, sdpa_gqa_masked};
     use crate::primitives::decode_cache::CacheMemory;
     use crate::primitives::rope::rms_norm_rope;
     use candle_core::cuda_backend::cudarc::driver::sys;
@@ -1716,16 +1844,32 @@ mod cuda_tests {
     use core_llm::ProposerKind;
     use std::cell::Cell;
 
-    /// A capturable device: candle's own stream (the legacy NULL stream cannot be captured) with
-    /// cudarc's event tracking off — what `select_device` builds.
-    fn device() -> Option<(Device, candle_core::CudaDevice)> {
+    /// A capturable device the way a graphs-on deployment gets one: the switch on when
+    /// `select_device` runs, so the model gets its own stream with cudarc's event tracking off.
+    /// The returned guard keeps the switch on — and serializes the tests that capture — for
+    /// the whole test; bind it first so it is dropped last.
+    fn device() -> Option<(CudaGraphsPolicyGuard, Device, candle_core::CudaDevice)> {
+        let guard = cuda_graphs_policy_guard(Some(true));
         match crate::device::select_device() {
-            Ok(Device::Cuda(d)) => Some((Device::Cuda(d.clone()), d)),
+            Ok(Device::Cuda(d)) if !d.cuda_stream().cu_stream().is_null() => {
+                Some((guard, Device::Cuda(d.clone()), d))
+            }
+            Ok(Device::Cuda(_)) => {
+                eprintln!(
+                    "skipping: the legacy stream was selected (CANDLE_LLM_CUDA_STREAM, flash-attn)"
+                );
+                None
+            }
             _ => {
                 eprintln!("skipping: no CUDA device");
                 None
             }
         }
+    }
+
+    /// The device's graph-memory reservation now.
+    fn reserved(dev: &candle_core::CudaDevice) -> u64 {
+        super::cuda::reserved_graph_mem(dev).expect("the graph-memory attribute")
     }
 
     fn greedy(max_new_tokens: usize) -> GenerationConfig {
@@ -1739,11 +1883,50 @@ mod cuda_tests {
         config
     }
 
+    /// The device `select_device` builds with the switch on is refused by name when it cannot
+    /// be captured: in a `flash-attn` build (always the legacy stream) as `flash_attn_stream`,
+    /// otherwise not at all at the capability check (the own stream).
+    #[test]
+    fn a_flash_attn_build_is_refused_by_name() {
+        let _guard = cuda_graphs_policy_guard(Some(true));
+        let Ok(device @ Device::Cuda(_)) = crate::device::select_device() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let model = Synthetic::new(&device, None);
+        let runner = GraphRunner::new(&model);
+        let (_, record) = generate_step(
+            &runner,
+            &PROMPT,
+            &greedy(4),
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+        )
+        .unwrap();
+        eprintln!(
+            "[runner] select_device, switch on: {}",
+            record.cuda_graphs.describe()
+        );
+        if cfg!(feature = "flash-attn") {
+            assert_eq!(
+                record.cuda_graphs.fallback_reason,
+                Some(REASON_FLASH_ATTN_STREAM)
+            );
+            assert_eq!(runner.captured_graphs(), 0);
+        } else {
+            assert_eq!(record.cuda_graphs.fallback_reason, None);
+            assert_eq!(runner.captured_graphs(), 1);
+        }
+    }
+
     // ---- POC experiments ----
 
     #[test]
     fn poc_allocator_is_stream_ordered_and_the_stream_is_capturable() {
-        let Some((_, dev)) = device() else { return };
+        let Some((_guard, _, dev)) = device() else {
+            return;
+        };
         let stream = dev.cuda_stream();
         let ctx = stream.context();
         eprintln!(
@@ -1773,7 +1956,6 @@ mod cuda_tests {
             Ok(_) => panic!("the legacy stream must not be capturable"),
         }
         // The runner refuses it by name before any capture.
-        let _guard = cuda_graphs_policy_guard(Some(true));
         let model = Synthetic::new(&Device::Cuda(legacy), None);
         let runner = GraphRunner::new(&model);
         let (out, record) = generate_step(
@@ -1799,7 +1981,7 @@ mod cuda_tests {
     /// census refuses before anything is launched.
     #[test]
     fn poc_contiguous_ops_replay_bit_exact_and_index_select_is_refused() {
-        let Some((device, dev)) = device() else {
+        let Some((_guard, device, dev)) = device() else {
             return;
         };
         let (rows, n) = (4usize, 64usize);
@@ -1892,7 +2074,7 @@ mod cuda_tests {
     /// longer exists — the census names both before any launch.
     #[test]
     fn poc_host_traffic_inside_capture_is_named() {
-        let Some((device, dev)) = device() else {
+        let Some((_guard, device, dev)) = device() else {
             return;
         };
         let upload = capture(&dev, || {
@@ -1926,15 +2108,31 @@ mod cuda_tests {
         assert_eq!(ok, vec![3.0, 6.0, 9.0]);
     }
 
-    /// Op-by-op capture diagnostic (`POC_OP=matmul|softmax|index_select|rope|affine|slice_set|
-    /// transpose|broadcast_add|sum`): captures one candle op and reports its census.
+    /// Op-by-op capture diagnostic (evidence only): captures one candle op at a time — `POC_OP`
+    /// names one of `matmul|softmax|index_select|rope|affine|slice_set|transpose|broadcast_add|
+    /// sum`, unset runs them all — reports its census, and replays the ones the census accepts
+    /// (bit-exact against eager).
     #[test]
+    #[ignore = "evidence only: the per-op census behind the module docs (POC_OP selects one op)"]
     fn poc_single_op_census() {
-        let Ok(op) = std::env::var("POC_OP") else {
+        let Some((_guard, device, dev)) = device() else {
             return;
         };
-        let Some((device, dev)) = device() else {
-            return;
+        let ops: Vec<String> = match std::env::var("POC_OP") {
+            Ok(op) => vec![op],
+            Err(_) => [
+                "matmul",
+                "softmax",
+                "index_select",
+                "rope",
+                "affine",
+                "slice_set",
+                "transpose",
+                "broadcast_add",
+                "sum",
+            ]
+            .map(String::from)
+            .to_vec(),
         };
         let (rows, n) = (4usize, 64usize);
         let x = Tensor::arange(0f32, (rows * n) as f32, &device)
@@ -1962,114 +2160,49 @@ mod cuda_tests {
         let norm_w = Tensor::ones(n, DType::BF16, &device).unwrap();
         let cos = Tensor::ones((1, rows, n), DType::BF16, &device).unwrap();
         let sin = Tensor::zeros((1, rows, n), DType::BF16, &device).unwrap();
-        let step = |x: &Tensor| -> Result<Tensor> {
-            Ok(match op.as_str() {
-                "matmul" => x.matmul(&w)?,
-                "softmax" => candle_nn::ops::softmax_last_dim(x)?,
-                "index_select" => w.index_select(&idx, 0)?,
-                "rope" => rms_norm_rope(
-                    &x.reshape((1, rows, 1, n))?,
-                    &norm_w,
-                    1e-6,
-                    &cos,
-                    &sin,
-                    false,
-                )?
-                .reshape((rows, n))?,
-                "affine" => x.affine(2.0, 1.0)?,
-                "slice_set" => x.clone(),
-                "transpose" => x.t()?.contiguous()?.t()?.contiguous()?,
-                "broadcast_add" => x.broadcast_add(&row)?,
-                "sum" => x.sum_keepdim(1)?.broadcast_as((rows, n))?.contiguous()?,
-                other => panic!("unknown POC_OP {other}"),
+        for op in &ops {
+            let step = |x: &Tensor| -> Result<Tensor> {
+                Ok(match op.as_str() {
+                    "matmul" => x.matmul(&w)?,
+                    "softmax" => candle_nn::ops::softmax_last_dim(x)?,
+                    "index_select" => w.index_select(&idx, 0)?,
+                    "rope" => rms_norm_rope(
+                        &x.reshape((1, rows, 1, n))?,
+                        &norm_w,
+                        1e-6,
+                        &cos,
+                        &sin,
+                        false,
+                    )?
+                    .reshape((rows, n))?,
+                    "affine" => x.affine(2.0, 1.0)?,
+                    "slice_set" => x.clone(),
+                    "transpose" => x.t()?.contiguous()?.t()?.contiguous()?,
+                    "broadcast_add" => x.broadcast_add(&row)?,
+                    "sum" => x.sum_keepdim(1)?.broadcast_as((rows, n))?.contiguous()?,
+                    other => panic!("unknown POC_OP {other}"),
+                })
+            };
+            let out_stage = Tensor::zeros((rows, n), DType::BF16, &device).unwrap();
+            let eager = step(&x).unwrap();
+            let (recorded, ()) = capture(&dev, || {
+                let y = step(&x)?;
+                out_stage.slice_set(&y, 0, 0)?;
+                Ok(())
             })
-        };
-        let out_stage = Tensor::zeros((rows, n), DType::BF16, &device).unwrap();
-        let eager = step(&x).unwrap();
-        let (recorded, ()) = capture(&dev, || {
-            let y = step(&x)?;
-            out_stage.slice_set(&y, 0, 0)?;
-            Ok(())
-        })
-        .unwrap_or_else(|Abandoned(reason)| panic!("capture abandoned: {reason}"));
-        let census = recorded.census();
-        eprintln!("[poc] op {op}: census {}", census.describe());
-        if census.refusal().is_some() {
-            return;
-        }
-        let graph = recorded
-            .instantiate()
-            .unwrap_or_else(|Abandoned(reason)| panic!("instantiate: {reason}"));
-        graph.launch().unwrap();
-        let identical = bit_identical(&out_stage, &eager).unwrap();
-        eprintln!("[poc] op {op}: replayed, bit-identical = {identical}");
-        assert!(identical);
-    }
-
-    /// Position as data: the masked full-capacity attention against the bounded `narrow` view at
-    /// the Qwen3.8-27B decode and verify shapes, bf16, over every length up to the capacity.
-    /// Recorded finding (RTX Pro 6000 / sm_120): the two are **not** bit-identical — cuBLAS
-    /// selects its kernel (and so its reduction order) by the key extent, so a masked form
-    /// changes the static path's bits at a few dozen lengths by one bf16 ULP. That is why the
-    /// static path keeps `narrow` today: a data-driven length needs an attention kernel whose
-    /// arithmetic does not depend on the extent (a seam kernel), not a mask over cuBLAS.
-    #[test]
-    fn poc_masked_capacity_attention_vs_narrow_survey() {
-        let Some((device, _)) = device() else { return };
-        let (b, h, hkv, d, cap) = (1usize, 24usize, 4usize, 256usize, 384usize);
-        let mk = |heads, s, phase: f64| {
-            let n = (b * heads * s * d) as f32;
-            Tensor::arange(0f32, n, &device)
-                .unwrap()
-                .reshape((b, heads, s, d))
-                .unwrap()
-                .affine(0.0137, phase)
-                .unwrap()
-                .cos()
-                .unwrap()
-                .to_dtype(DType::BF16)
-                .unwrap()
-        };
-        let scale = (d as f32).powf(-0.5);
-        let k_buf = mk(hkv, cap, 1.7);
-        let v_buf = mk(hkv, cap, 3.1);
-        let arange = Tensor::arange(0u32, cap as u32, &device).unwrap();
-        for q_len in [1usize, 4] {
-            let q = mk(h, q_len, 0.4);
-            let mut mismatches = 0usize;
-            let mut worst = 0f32;
-            let mut first = None;
-            for len in q_len..=cap {
-                let pos = (len - q_len) as u32;
-                let narrow = sdpa_gqa_causal(
-                    &q,
-                    &k_buf.narrow(2, 0, len).unwrap(),
-                    &v_buf.narrow(2, 0, len).unwrap(),
-                    scale,
-                )
-                .unwrap();
-                let limits = Tensor::arange(pos, pos + q_len as u32, &device).unwrap();
-                let mask = capacity_mask(&arange, &limits, DType::BF16).unwrap();
-                let masked = sdpa_gqa_masked(&q, &k_buf, &v_buf, scale, &mask).unwrap();
-                if !bit_identical(&masked, &narrow).unwrap() {
-                    mismatches += 1;
-                    first.get_or_insert(len);
-                    let delta = (masked.to_dtype(DType::F32).unwrap()
-                        - narrow.to_dtype(DType::F32).unwrap())
-                    .unwrap()
-                    .abs()
-                    .unwrap()
-                    .max_all()
-                    .unwrap()
-                    .to_scalar::<f32>()
-                    .unwrap();
-                    worst = worst.max(delta);
-                }
+            .unwrap_or_else(|Abandoned(reason)| panic!("capture abandoned: {reason}"));
+            let census = recorded.census();
+            eprintln!("[poc] op {op}: census {}", census.describe());
+            if census.refusal().is_some() {
+                continue;
             }
-            eprintln!(
-                "[poc] masked(cap={cap}) vs narrow, q_len={q_len}: {mismatches} / {} lengths differ in bits (first {first:?}, max |delta| {worst})",
-                cap + 1 - q_len
-            );
+            let graph = recorded
+                .instantiate()
+                .unwrap_or_else(|Abandoned(reason)| panic!("instantiate: {reason}"));
+            graph.launch().unwrap();
+            let identical = bit_identical(&out_stage, &eager).unwrap();
+            eprintln!("[poc] op {op}: replayed, bit-identical = {identical}");
+            assert!(identical, "{op}");
         }
     }
 
@@ -2183,7 +2316,8 @@ mod cuda_tests {
     }
 
     impl Synthetic {
-        const MAX: usize = 16;
+        /// Longer than the runner captures, so the shape fallback is reachable.
+        const MAX: usize = 32;
 
         fn new(device: &Device, misbehave: Option<&'static str>) -> Self {
             let (n, vocab) = (32usize, 24usize);
@@ -2284,6 +2418,13 @@ mod cuda_tests {
                 }
                 _ => {}
             }
+            // A Rust-side scalar folded into a kernel argument (what a model with host-side
+            // positions does): the capture bakes in the position it was recorded at, so the
+            // first replay at a new position disagrees with eager.
+            let h = match self.misbehave.get() {
+                Some("scalar") => h.affine(1.0, f64::from(cache.len) * 1e-3)?,
+                _ => h,
+            };
             let last = h.narrow(0, m - 1, 1)?; // contiguous row
             cache.state.slice_set(&last, 0, 0)?;
             cache.len += m as i32;
@@ -2349,8 +2490,9 @@ mod cuda_tests {
     /// replays it for the rest of the request, token-identical to the bare model.
     #[test]
     fn synthetic_decode_through_the_runner_is_token_identical_and_replays() {
-        let Some((device, _)) = device() else { return };
-        let _guard = cuda_graphs_policy_guard(Some(true));
+        let Some((_guard, device, _)) = device() else {
+            return;
+        };
         let model = Synthetic::new(&device, None);
         let config = greedy(40);
         let (bare, _) = generate_step(
@@ -2381,11 +2523,10 @@ mod cuda_tests {
         let tally = record.cuda_graphs;
         eprintln!("[runner] synthetic decode: {}", tally.describe());
         assert_eq!(tally.captured, 1, "one graph for the 1-token shape");
-        // Prefill (5 tokens, eager) + warm-up + the capture step (the eager reference and the
-        // eager re-run that leaves the cache in the eager state: two eager executions) + the
-        // verified first replay (one eager reference): 5 eager steps; the verified replay and
-        // the other 36 decode steps replay.
-        assert_eq!(tally.eager, 5);
+        // Prefill (5 tokens, eager) + warm-up + the capture step and the verified first replay
+        // (each an eager reference and the eager re-run that leaves the cache in the eager
+        // state): 6 eager executions; the verified replay and the other 36 decode steps replay.
+        assert_eq!(tally.eager, 6);
         assert_eq!(tally.replayed, 37);
         assert_eq!(tally.fallback_reason, None);
         assert_eq!(tally.label(), "mixed");
@@ -2398,11 +2539,12 @@ mod cuda_tests {
         );
         assert_eq!(census.refusal(), None);
         // Model calls: prefill, warm-up, the capture step (eager reference, the recording, the
-        // eager re-run) and the verified replay's eager reference; replays never call the model.
+        // eager re-run) and the verified replay's eager reference and re-run; replays never call
+        // the model.
         let eager_calls = model.steps.get() - steps_before;
         assert_eq!(
             eager_calls,
-            1 + 1 + 3 + 1,
+            1 + 1 + 3 + 2,
             "eager model calls through the runner"
         );
         let workspace = runner.workspace();
@@ -2420,8 +2562,9 @@ mod cuda_tests {
     /// model through the same engine.
     #[test]
     fn synthetic_speculative_k3_through_the_runner_is_token_identical_and_replays() {
-        let Some((device, _)) = device() else { return };
-        let _guard = cuda_graphs_policy_guard(Some(true));
+        let Some((_guard, device, _)) = device() else {
+            return;
+        };
         let model = Synthetic::new(&device, None);
         let config = greedy(48);
         let (greedy_run, _) = generate_step(
@@ -2508,16 +2651,28 @@ mod cuda_tests {
 
     /// Every fallback is named and never fails the request: a cache that declares itself
     /// unstable, a step that reads the device during capture, a step whose allocation escapes
-    /// the graph. Each request finishes token-identical to the bare model, on the same device.
+    /// the graph, a step that bakes a Rust-side scalar into the capture (caught by the first
+    /// replay's self-check). Each request finishes token-identical to the same model run bare,
+    /// on the same device, with no graph kept.
     #[test]
     fn synthetic_misbehaviour_falls_back_with_a_named_reason() {
-        let Some((device, _)) = device() else { return };
-        let _guard = cuda_graphs_policy_guard(Some(true));
+        let Some((_guard, _, _)) = device() else {
+            return;
+        };
         let config = greedy(24);
-        let reference = {
-            let model = Synthetic::new(&device, None);
-            generate_step(
-                &model,
+        // (misbehaviour, reason, graph launches: the first-replay check's own replay)
+        for (misbehaviour, expected, launches) in [
+            ("declared", "mock_cache_declared_unstable", 0),
+            ("host_read", REASON_SYNC_IN_CAPTURE, 0),
+            ("escape", REASON_ALLOCATION_ESCAPED_CAPTURE, 0),
+            ("scalar", REASON_REPLAY_MISMATCH, 1),
+        ] {
+            // A device per case: the `escape` mock cache keeps the tensor its recording made
+            // outside any rollback, and freeing that never-backed address when the cache drops
+            // leaves an error on the device's context for its next op.
+            let device = crate::device::select_device().unwrap();
+            let bare = generate_step(
+                &Synthetic::new(&device, Some(misbehaviour)),
                 &PROMPT,
                 &config,
                 &CancelFlag::new(),
@@ -2526,13 +2681,7 @@ mod cuda_tests {
             )
             .unwrap()
             .0
-            .tokens
-        };
-        for (misbehaviour, expected) in [
-            ("declared", "mock_cache_declared_unstable"),
-            ("host_read", REASON_SYNC_IN_CAPTURE),
-            ("escape", REASON_ALLOCATION_ESCAPED_CAPTURE),
-        ] {
+            .tokens;
             let model = Synthetic::new(&device, Some(misbehaviour));
             let runner = GraphRunner::new(&model);
             let (out, record) = generate_step(
@@ -2548,10 +2697,14 @@ mod cuda_tests {
             if let Some(census) = runner.last_census() {
                 eprintln!("[runner] {misbehaviour} census: {}", census.describe());
             }
-            assert_eq!(out.tokens, reference, "{misbehaviour}: tokens changed");
+            assert_eq!(out.tokens, bare, "{misbehaviour}: tokens changed");
             assert_eq!(
-                record.cuda_graphs.replayed, 0,
-                "{misbehaviour}: nothing replayed"
+                record.cuda_graphs.replayed, launches,
+                "{misbehaviour}: graph launches"
+            );
+            assert_eq!(
+                record.cuda_graphs.captured, 0,
+                "{misbehaviour}: no graph passed both checks"
             );
             assert_eq!(
                 record.cuda_graphs.fallback_reason,
@@ -2567,20 +2720,198 @@ mod cuda_tests {
         }
     }
 
-    /// The Qwen3.5/3.8 decoder on a pure-attention tiny config with the static KV cache: the
-    /// runner captures the 1-token step, the census finds candle's per-op layout uploads
-    /// (host-sourced memcpy nodes), and the request falls back eager with that named reason —
-    /// the measured finding behind the module docs. The hybrid (DeltaNet) config is refused by
-    /// the cache's own declaration before any capture.
+    /// A step longer than the runner captures (a prefill) runs eager with the named reason
+    /// `shape`; it is a per-step fallback, not a refusal, so later decode steps still capture.
     #[test]
-    fn qwen35_static_step_is_refused_by_the_census_with_layout_uploads() {
+    fn oversized_steps_are_named_shape_fallbacks() {
+        let Some((_guard, device, _)) = device() else {
+            return;
+        };
+        let model = Synthetic::new(&device, None);
+        let runner = GraphRunner::new(&model);
+        let mut cache = runner.new_cache_for(64, 0).unwrap();
+        let long: Vec<i32> = (0..GraphRunner::<Synthetic>::MAX_CAPTURED_TOKENS as i32 + 1)
+            .map(|i| i % 20)
+            .collect();
+        let start = graph_tally();
+        let out = runner
+            .forward_step(&mut cache, StepRequest::last(&long))
+            .unwrap();
+        let tally = graph_tally().since(&start);
+        assert_eq!(out.logits.dims(), &[1, model.vocab]);
+        assert_eq!(cache.len(), long.len() as i32);
+        assert_eq!(tally.fallback_reason, Some(REASON_SHAPE));
+        assert_eq!((tally.eager, tally.replayed), (1, 0));
+        assert_eq!(
+            runner.refusal(),
+            None,
+            "a shape fallback does not refuse the runner"
+        );
+        for t in [1, 2, 3, 4] {
+            runner
+                .forward_step(&mut cache, StepRequest::last(&[t]))
+                .unwrap();
+        }
+        assert_eq!(runner.captured_graphs(), 1, "decode steps still capture");
+    }
+
+    /// A graph launch that fails mid-request: the replay's bookkeeping is rolled back, the step
+    /// runs eager with the named reason `launch_failed`, the runner drops its graph, and every
+    /// step's logits and the cache length stay identical to the bare model's.
+    #[test]
+    fn a_failed_launch_rolls_back_and_falls_back_eager() {
+        let Some((_guard, device, _)) = device() else {
+            return;
+        };
+        let model = Synthetic::new(&device, None);
+        let runner = GraphRunner::new(&model);
+        let mut cache = runner.new_cache_for(64, 0).unwrap();
+        let mut bare = model.new_cache();
+        let start = graph_tally();
+        for (i, t) in [3i32, 7, 11, 2, 7, 5, 9, 4, 8, 6].into_iter().enumerate() {
+            if i == 6 {
+                // Steps 0–1 warm up and capture, 2 is the verified replay, 3–5 replay.
+                assert_eq!(runner.captured_graphs(), 1);
+                super::cuda::FAIL_NEXT_LAUNCH.with(|f| f.set(true));
+            }
+            let graph = runner
+                .forward_step(&mut cache, StepRequest::last(&[t]))
+                .unwrap();
+            let eager = model
+                .forward_step(&mut bare, StepRequest::last(&[t]))
+                .unwrap();
+            assert!(
+                bit_identical(&graph.logits, &eager.logits).unwrap(),
+                "step {i}: logits"
+            );
+            assert_eq!(cache.len(), bare.len(), "step {i}: cache length");
+        }
+        let tally = graph_tally().since(&start);
+        eprintln!("[runner] failed launch: {}", tally.describe());
+        assert_eq!(tally.fallback_reason, Some(REASON_LAUNCH_FAILED));
+        assert_eq!(
+            tally.replayed, 4,
+            "the verified replay and three replays before the failure"
+        );
+        assert_eq!(runner.refusal(), Some(REASON_LAUNCH_FAILED));
+        assert_eq!(runner.captured_graphs(), 0);
+    }
+
+    /// A runner-wide refusal drops every graph the runner holds, not only the refused shape's:
+    /// a verified 1-token graph is released (with its staging) when the 2-token shape is refused.
+    #[test]
+    fn a_refusal_drops_every_captured_shape() {
+        let Some((_guard, device, _)) = device() else {
+            return;
+        };
+        let model = Synthetic::new(&device, None);
+        let runner = GraphRunner::new(&model);
+        let mut cache = runner.new_cache_for(64, 0).unwrap();
+        for t in [3, 7, 11, 2] {
+            runner
+                .forward_step(&mut cache, StepRequest::last(&[t]))
+                .unwrap();
+        }
+        assert_eq!(runner.captured_graphs(), 1);
+        assert!(runner.workspace().staging_bytes > 0);
+        // The 2-token shape keeps a fresh tensor from every step: its capture is refused.
+        model.misbehave.set(Some("escape"));
+        for pair in [[1, 2], [3, 4]] {
+            runner
+                .forward_step(&mut cache, StepRequest::last(&pair))
+                .unwrap();
+        }
+        assert_eq!(runner.refusal(), Some(REASON_ALLOCATION_ESCAPED_CAPTURE));
+        assert_eq!(
+            runner.captured_graphs(),
+            0,
+            "the 1-token graph is dropped too"
+        );
+        assert_eq!(runner.workspace(), GraphWorkspace::default());
+    }
+
+    /// A step that panics inside a capture still ends it: the stream leaves capture mode, the
+    /// capture flag is cleared, and the device keeps working.
+    #[test]
+    fn a_panic_inside_the_capture_still_ends_it() {
+        let Some((_guard, device, dev)) = device() else {
+            return;
+        };
+        let x = Tensor::new(&[1f32, 2.0, 3.0], &device).unwrap();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = capture(&dev, || -> Result<()> {
+                let _doubled = x.affine(2.0, 0.0)?;
+                panic!("a step panics inside the capture");
+            });
+        }));
+        assert!(panicked.is_err());
+        assert!(!capturing(), "the capture flag is cleared");
+        let mut status = sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE;
+        let queried =
+            unsafe { sys::cuStreamIsCapturing(dev.cuda_stream().cu_stream(), &mut status) };
+        assert_eq!(queried, sys::CUresult::CUDA_SUCCESS);
+        assert_eq!(
+            status,
+            sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE,
+            "the stream left capture mode"
+        );
+        let tripled = x.affine(3.0, 0.0).unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(tripled, vec![3.0, 6.0, 9.0]);
+    }
+
+    /// Graph memory (E6): the runner reports the reservation its capture added to a trimmed
+    /// pool, and gives it back — the pool is trimmed — when it drops its graphs.
+    #[test]
+    fn graph_memory_is_reported_and_trimmed_when_the_graphs_go() {
+        let Some((_guard, device, dev)) = device() else {
+            return;
+        };
+        // Earlier tests' graphs are gone (each trims as it goes); start from an empty pool.
+        unsafe { sys::cuDeviceGraphMemTrim(dev.cuda_stream().context().cu_device()) };
+        assert_eq!(reserved(&dev), 0, "no graph memory reserved at the start");
+        let model = Synthetic::new(&device, None);
+        let runner = GraphRunner::new(&model);
+        generate_step(
+            &runner,
+            &PROMPT,
+            &greedy(8),
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+        )
+        .unwrap();
+        assert_eq!(runner.captured_graphs(), 1);
+        let workspace = runner.workspace();
+        eprintln!(
+            "[runner] graph memory: {workspace:?}, device reserved {}",
+            reserved(&dev)
+        );
+        assert!(
+            workspace.graph_reserved_bytes > 0,
+            "the capture's reservation is reported"
+        );
+        assert_eq!(workspace.graph_reserved_bytes as u64, reserved(&dev));
+        runner.reset();
+        assert_eq!(runner.workspace(), GraphWorkspace::default());
+        assert_eq!(reserved(&dev), 0, "dropping the graphs trims the pool");
+    }
+
+    /// The Qwen3.5/3.8 decoder is refused by declaration before any capture: on a pure-attention
+    /// tiny config with the static KV cache the model's Rust-scalar positions
+    /// (`positions_host_scalar`), on the hybrid config the cache's replaced DeltaNet state
+    /// (`deltanet_state_unstable`, checked first). What a recording of its step would hold is
+    /// measured with `census_step`: candle's per-op layout uploads (host-sourced memcpy nodes).
+    #[test]
+    fn qwen35_steps_are_refused_by_declaration_and_the_census_finds_layout_uploads() {
         use crate::models::qwen35::tests::{text_model_attention_only_on, text_model_on};
-        let Some((device, _)) = device() else { return };
-        let _guard = cuda_graphs_policy_guard(Some(true));
+        let Some((_guard, device, _)) = device() else {
+            return;
+        };
         let config = greedy(8);
         let prompt = [1i32, 7, 3, 42, 9];
 
         let (_cfg, model) = text_model_attention_only_on(&device);
+        assert_eq!(model.graph_support(), Err("positions_host_scalar"));
         let (bare, _) = generate_step(
             &model,
             &prompt,
@@ -2607,17 +2938,33 @@ mod cuda_tests {
         );
         assert_eq!(
             record.cuda_graphs.fallback_reason,
-            Some(REASON_HOST_UPLOAD_IN_CAPTURE)
+            Some("positions_host_scalar")
         );
-        let census = runner.last_census().expect("a capture was attempted");
+        assert!(runner.last_census().is_none(), "refused before any capture");
+
+        // The measurement: record one warmed 1-token step (evidence only; the cache is
+        // discarded afterwards).
+        let mut cache = model.new_cache_for(prompt.len() + 8, 0).unwrap();
+        model
+            .forward_step(&mut cache, StepRequest::last(&prompt))
+            .unwrap();
+        model
+            .forward_step(&mut cache, StepRequest::last(&[3]))
+            .unwrap();
+        let census = census_step(&model, &mut cache, StepRequest::last(&[5]))
+            .unwrap()
+            .expect("the step records");
         eprintln!(
             "[runner] qwen35 1-token static step census: {}",
             census.describe()
         );
         assert!(census.memcpy_from_host > 0);
         assert!(census.kernels > 0);
+        assert_eq!(census.refusal(), Some(REASON_HOST_UPLOAD_IN_CAPTURE));
+        drop(cache);
 
         let (_cfg, hybrid) = text_model_on(&device);
+        assert_eq!(hybrid.graph_support(), Err("positions_host_scalar"));
         let runner = GraphRunner::new(&hybrid);
         let (_, record) = generate_step(
             &runner,
@@ -2644,8 +2991,9 @@ mod cuda_tests {
     #[test]
     #[ignore = "timing evidence; needs a quiet GPU"]
     fn synthetic_replay_timing() {
-        let Some((device, _)) = device() else { return };
-        let _guard = cuda_graphs_policy_guard(Some(true));
+        let Some((_guard, device, _)) = device() else {
+            return;
+        };
         let model = Synthetic::new(&device, None);
         let config = greedy(2048);
         fn time<M: StepModel>(
