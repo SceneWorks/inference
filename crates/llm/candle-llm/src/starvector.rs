@@ -367,6 +367,8 @@ pub struct CandleStarVectorProvider {
     descriptor: core_llm::TextLlmDescriptor,
     svg: core_llm::StarVectorDescriptor,
     processor: StarVectorImageProcessor,
+    /// The device the weights were loaded on; request pixels go here (sc-24134).
+    device: Device,
     tokenizer: core_llm::Tokenizer,
     prompt: Vec<i32>,
     model: Mutex<StarVectorModel>,
@@ -400,6 +402,7 @@ impl CandleStarVectorProvider {
             tokenizer,
             prompt,
             model: Mutex::new(StarVectorModel::from_weights(&weights).map_err(to_core)?),
+            device,
         })
     }
 }
@@ -555,7 +558,7 @@ impl core_llm::StarVectorProvider for CandleStarVectorProvider {
                 &image.pixels,
                 image.width as usize,
                 image.height as usize,
-                &crate::device::select_device().map_err(to_core)?,
+                &self.device,
             )
             .map_err(to_core)?;
         // The decoder is stateless (the request's K/V live in its own step cache); the lock only
@@ -1253,5 +1256,70 @@ mod tests {
         assert!(!result);
         assert!(!read_attempted.get(), "file payload must not be read");
         assert!(!can_load_path(file.path()));
+    }
+
+    /// sc-24134: the provider selects its device once, at load, and a request's pixels go to
+    /// that device. A `select_device()` per request would build a second device — on the own
+    /// stream a second CUDA stream (and cuBLAS / cuRAND handles) that candle's per-op check,
+    /// which compares the GPU ordinal only, cannot tell from the model's (see the CUDA test).
+    #[test]
+    fn the_provider_selects_its_device_once_at_load() {
+        let source = include_str!("starvector.rs");
+        let production = &source[..source.find("mod tests {").expect("the test module")];
+        // `CandleStarVectorProvider::load` is followed by the free `descriptor()` function.
+        let load = production
+            .find("pub fn load(")
+            .expect("the provider's load");
+        let load_end = production
+            .find("pub fn descriptor()")
+            .expect("descriptor()");
+        let calls: Vec<usize> = production
+            .match_indices("select_device(")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(calls.len(), 1, "one device selection: {calls:?}");
+        assert!(
+            (load..load_end).contains(&calls[0]),
+            "the device is selected in `load`, not per request"
+        );
+    }
+
+    /// The load-time device and a request's pixels are one device on one stream; a second
+    /// `select_device()` (what a per-request selection did) shares the GPU ordinal — so candle's
+    /// per-op check accepts mixing them — but is a different device, and on the own stream a
+    /// different CUDA stream.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn request_pixels_share_the_load_time_device_and_stream() {
+        use candle_core::Device;
+        // The graph runner on at load: the own stream, where a second device is a second stream.
+        let _guard = crate::decode::graph::cuda_graphs_policy_guard(Some(true));
+        let Ok(model_device @ Device::Cuda(_)) = crate::device::select_device() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let stream = |d: &Device| match d {
+            Device::Cuda(c) => (
+                c.cuda_stream().cu_stream() as usize,
+                c.cuda_stream().context().ordinal(),
+            ),
+            _ => unreachable!(),
+        };
+        let pixels = StarVectorImageProcessor::default()
+            .preprocess(&[10u8, 20, 30, 40, 50, 60], 2, 1, &model_device)
+            .unwrap();
+        assert!(pixels.device().same_device(&model_device));
+        assert_eq!(stream(pixels.device()), stream(&model_device));
+
+        // Same GPU ordinal (all candle's per-op check compares), yet another device and stream.
+        let second = crate::device::select_device().unwrap();
+        assert!(!second.same_device(&model_device));
+        if !cfg!(feature = "flash-attn") {
+            assert_ne!(
+                stream(&second).0,
+                stream(&model_device).0,
+                "a second own stream"
+            );
+        }
     }
 }

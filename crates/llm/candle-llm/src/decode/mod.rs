@@ -20,6 +20,7 @@ pub mod batch;
 pub mod cancel;
 pub mod continuous;
 pub mod engine;
+pub mod graph;
 pub mod prefix;
 pub mod proposers;
 pub mod record;
@@ -34,6 +35,10 @@ pub use engine::{
     generate_speculative, generate_speculative_with, DraftSample, DraftSampler, Drafts, NoProposer,
     Proposal, ProposeContext, Proposer, RewindableConstraintMask, SpeculativePrompt,
     SpeculativeRun,
+};
+pub use graph::{
+    cuda_graphs_enabled, graph_tally, graph_workspace_admission_bytes, set_cuda_graphs,
+    GraphRunner, GraphTally, GraphWorkspace, CUDA_GRAPHS_ENV,
 };
 pub use prefix::{generate_cached, PrefixCache, PrefixStats};
 pub use proposers::{DraftModelProposer, MtpProposer, NgramProposer};

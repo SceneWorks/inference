@@ -1429,6 +1429,19 @@ impl StepModel for CausalLm {
         self.effective_attn_formulation(self.cache_formulation(cache))
     }
 
+    /// Not replayable as a CUDA graph (story sc-24134), declared so the runner refuses before any
+    /// capture: a Mixture-of-Experts layer pulls its router probabilities to the host every step
+    /// for the top-k (`moe_router_host_read`), and every step's positions are Rust-side scalars —
+    /// the RoPE offset taken from the cache's length, the KV written at that offset, attention
+    /// bounded by the host-side length — which a graph would replay at the captured position
+    /// (`positions_host_scalar`).
+    fn graph_support(&self) -> std::result::Result<(), &'static str> {
+        if self.layers.iter().any(|l| matches!(l.ffn, Ffn::Moe(_))) {
+            return Err("moe_router_host_read");
+        }
+        Err("positions_host_scalar")
+    }
+
     fn device(&self) -> &Device {
         &self.device
     }

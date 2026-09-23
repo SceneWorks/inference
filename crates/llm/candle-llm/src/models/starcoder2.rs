@@ -252,6 +252,13 @@ impl StepModel for StarCoder2 {
         self.cache_formulation(cache)
     }
 
+    /// Not replayable as a CUDA graph (story sc-24134): the step's RoPE offset is the cache's
+    /// Rust-side length (plus its delta) and the KV lands at that host offset, so a graph would
+    /// replay at the captured position (`positions_host_scalar`).
+    fn graph_support(&self) -> std::result::Result<(), &'static str> {
+        Err("positions_host_scalar")
+    }
+
     fn device(&self) -> &Device {
         &self.device
     }

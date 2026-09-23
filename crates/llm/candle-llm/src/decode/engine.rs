@@ -304,7 +304,7 @@ pub struct SpeculativeRun {
 ///
 /// `drafts` is the proposal width `K`; `0` (or [`NoProposer`]) is the token-at-a-time loop.
 #[allow(clippy::too_many_arguments)]
-pub fn generate_speculative<M: StepModel, P: Proposer>(
+pub fn generate_speculative<M: StepModel + ?Sized, P: Proposer>(
     model: &M,
     proposer: &mut P,
     prompt: SpeculativePrompt<'_, M::Cache>,
@@ -324,7 +324,7 @@ pub fn generate_speculative<M: StepModel, P: Proposer>(
 /// is in the cache and the proposer is warmed, before the first token is sampled (it may
 /// synchronize the device).
 #[allow(clippy::too_many_arguments)]
-pub fn generate_speculative_with<M: StepModel, P: Proposer>(
+pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer>(
     model: &M,
     proposer: &mut P,
     prompt: SpeculativePrompt<'_, M::Cache>,
@@ -437,7 +437,9 @@ pub fn generate_speculative_with<M: StepModel, P: Proposer>(
             .with_kv_cache(cache.kv_kind())
             .with_attn_formulation(model.attn_formulation(cache))
             .with_proposer(kind)
-            .with_verify_syncs(verify_host_syncs);
+            .with_verify_syncs(verify_host_syncs)
+            .with_fused_primitives(span.fused_primitives())
+            .with_cuda_graphs(span.cuda_graphs());
         SpeculativeRun {
             output: GenerationOutput {
                 tokens: generated,

@@ -1674,3 +1674,41 @@ fn engine_refuses_a_draft_with_another_vocabulary() {
     .unwrap_err();
     assert!(err.to_string().contains("vocab mismatch"), "{err}");
 }
+
+/// sc-24134 × sc-24138: the families migrated onto the step seam declare that their steps cannot
+/// be replayed as CUDA graphs — every step's positions are Rust-side scalars (the RoPE offset or
+/// the learned-position rows taken at the cache's host-side length, the KV written there) — and
+/// the step cache names why it is not a graph backing on each backing, so the graph runner
+/// refuses by name before any capture instead of trusting the trait's permissive default.
+#[test]
+fn migrated_families_declare_their_steps_uncapturable() {
+    let causal = tiny_causal(false, 7);
+    assert_eq!(
+        StepModel::graph_support(&causal),
+        Err("positions_host_scalar")
+    );
+    assert_eq!(
+        StepModel::graph_support(&gemma4()),
+        Err("positions_host_scalar")
+    );
+    assert_eq!(
+        StepModel::graph_support(tiny_llava().language()),
+        Err("positions_host_scalar")
+    );
+    assert_eq!(
+        StepModel::graph_support(&tiny_starcoder2()),
+        Err("positions_host_scalar")
+    );
+    assert_eq!(
+        StepModel::graph_support(&tiny_starvector_1b()),
+        Err("positions_host_scalar")
+    );
+    assert_eq!(
+        DecodeCache::graph_support(&causal.new_step_cache()),
+        Err("growing_kv")
+    );
+    assert_eq!(
+        DecodeCache::graph_support(&causal.new_static_cache(8).unwrap()),
+        Err("positions_host_scalar")
+    );
+}

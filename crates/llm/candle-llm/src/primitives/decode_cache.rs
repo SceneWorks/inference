@@ -95,6 +95,46 @@ pub trait DecodeCache {
     fn kv_kind(&self) -> KvCacheKind {
         KvCacheKind::Growing
     }
+
+    /// Whether the cache can back a CUDA-graph replay (story sc-24134, E5): every tensor a step
+    /// reads or writes lives at an address that does not change across steps and rollbacks, and
+    /// every per-step position the kernels need is read from device data the cache stages
+    /// ([`stage_positions`](Self::stage_positions)). `Err` names why not — a stable lower-case
+    /// label the runner reports as the fallback reason (`cache_not_graph_capable` by default; a
+    /// hybrid cache whose recurrent state is still replaced per step says so). Checked before any
+    /// capture; a cache that answers `Ok` and is wrong is caught by the runner's bit-exact
+    /// self-checks, so this is a declaration, not the only gate.
+    fn graph_support(&self) -> std::result::Result<(), &'static str> {
+        Err("cache_not_graph_capable")
+    }
+
+    /// Write the cache's current position(s) into the device tensor(s) its model's kernels read
+    /// them from (a small host->device upload, issued **outside** any capture: the model calls
+    /// this at the start of an eager step, the graph runner before each replay). Must be a
+    /// no-op while [`graph::capturing`](crate::decode::graph::capturing) is set. The default
+    /// does nothing (a cache whose model takes positions from Rust-side scalars).
+    fn stage_positions(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// The bookkeeping a step of `n` tokens would do — the capacity check, the rollback
+    /// checkpoint, the per-layer offsets — when the device work for that step was produced by a
+    /// graph replay instead of the model's forward. Only called on a cache whose
+    /// [`graph_support`](Self::graph_support) is `Ok`; the default refuses.
+    fn replay_advance(&mut self, n: usize) -> Result<()> {
+        let _ = n;
+        Err(crate::error::Error::Unsupported(
+            "DecodeCache::replay_advance: this cache cannot back a graph replay".into(),
+        ))
+    }
+
+    /// An identity for the device buffers a graph would be captured against: two caches with
+    /// different identities never share graphs. The default is the cache's own address, which
+    /// holds while the cache is not moved between steps (it never is: the drivers borrow it for
+    /// the whole request); a cache with stable device buffers may answer with their address.
+    fn graph_identity(&self) -> usize {
+        self as *const Self as *const u8 as usize
+    }
 }
 
 #[cfg(test)]

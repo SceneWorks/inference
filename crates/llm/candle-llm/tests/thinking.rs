@@ -200,6 +200,55 @@ fn provider_records_the_decode_path_it_ran() {
     );
 }
 
+/// sc-24134 × sc-24138: with the CUDA-graph switch on, the llama family's engine path runs
+/// through the graph runner as the MTP path does — every step eager (the prefill included), and
+/// the record names why no graph ran (the build or device here; the family's own
+/// `positions_host_scalar` on a CUDA own-stream device) rather than a bare `graph: none`. With
+/// the switch off the model runs bare and the record is `graph: none`.
+#[test]
+fn causal_engine_requests_record_the_graph_runner() {
+    use candle_llm::decode::DecodePath;
+
+    let guard = write_thinking_snapshot();
+    let spec = LoadSpec::dense(guard.path().to_str().unwrap().to_string());
+    let p = LlamaProvider::load(&spec).expect("load thinking provider");
+    let mut req = TextLlmRequest::new(vec![Message::user("t1 t2 t3")], 6);
+    req.seed = Some(0);
+    let record = |on: bool| {
+        let _policy = candle_llm::decode::graph::cuda_graphs_policy_guard(Some(on));
+        p.generate(&req, &mut |_| {}).expect("generate");
+        p.last_decode_record().expect("record after generate")
+    };
+
+    let on = record(true);
+    assert_eq!(on.path, DecodePath::StepModel, "the engine ran");
+    assert_eq!(
+        on.cuda_graphs.label(),
+        "eager",
+        "{}",
+        on.cuda_graphs.describe()
+    );
+    assert_eq!(
+        on.cuda_graphs.eager, on.target_forwards,
+        "every target forward went through the runner, eager"
+    );
+    assert_eq!((on.cuda_graphs.replayed, on.cuda_graphs.captured), (0, 0));
+    assert!(
+        on.cuda_graphs.fallback_reason.is_some(),
+        "{}",
+        on.cuda_graphs.describe()
+    );
+
+    let off = record(false);
+    assert_eq!(off.path, DecodePath::StepModel);
+    assert_eq!(
+        off.cuda_graphs.label(),
+        "none",
+        "{}",
+        off.cuda_graphs.describe()
+    );
+}
+
 /// A model that *actually reasons*: Qwen3's chat template gates `enable_thinking`, so an Enabled
 /// request produces `<think>…</think>` reasoning. Asserts the provider advertises thinking, the
 /// streamed channels reconstruct `out.text` / `out.thinking`, and reasoning is non-empty.

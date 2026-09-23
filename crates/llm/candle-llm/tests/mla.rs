@@ -301,4 +301,14 @@ fn mla_decodes_through_the_static_step_cache() {
         model.static_kv_bytes(capacity),
         2 * capacity * NUM_HEADS * (QK_NOPE + QK_ROPE + V_HEAD) * 4
     );
+    // sc-24134: the CUDA-graph runner is refused by name before any capture — the MoE router
+    // reads its probabilities on the host, ahead of the family's host-scalar positions.
+    assert_eq!(
+        StepModel::graph_support(&model),
+        Err("moe_router_host_read")
+    );
+    assert_eq!(
+        DecodeCache::graph_support(&cache),
+        Err("positions_host_scalar")
+    );
 }

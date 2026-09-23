@@ -512,6 +512,13 @@ impl StepModel for StarVectorDecoder {
     // `attn_formulation` keeps the default `Gqa`: the multi-query fold above attends the one
     // shared K/V head un-expanded on every backing.
 
+    /// Not replayable as a CUDA graph (story sc-24134): the learned position rows are narrowed
+    /// out of `wpe` at the cache's Rust-side length and the KV lands at that host offset, so a
+    /// graph would replay at the captured position (`positions_host_scalar`).
+    fn graph_support(&self) -> std::result::Result<(), &'static str> {
+        Err("positions_host_scalar")
+    }
+
     fn device(&self) -> &Device {
         self.wte.device()
     }

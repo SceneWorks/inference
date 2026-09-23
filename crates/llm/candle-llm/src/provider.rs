@@ -25,8 +25,9 @@ use serde_json::Value;
 
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
-    generate_from_prefill_with_stop, generate_speculative_with, ConstraintMask, CountingDecode,
-    Decode, DecodePath, DecodeRecord, FinishReason, GenerationConfig, MtpProposer, NoProposer,
+    cuda_graphs_enabled, generate_from_prefill_with_stop, generate_speculative_with,
+    graph_workspace_admission_bytes, ConstraintMask, CountingDecode, Decode, DecodePath,
+    DecodeRecord, FinishReason, GenerationConfig, GraphRunner, GraphTally, MtpProposer, NoProposer,
     RequestSpan, RewindableConstraintMask, SpeculativePrompt, StepModel, StreamEvent,
 };
 use crate::device::select_device;
@@ -34,14 +35,14 @@ use crate::gguf::GgufCheckpoint;
 use crate::image::Qwen35ImageProcessor;
 use crate::models::gemma4_mm;
 use crate::models::{
-    CausalLm, Gemma4Layout, Gemma4Mm, Gemma4MmConfig, Qwen35Config, Qwen35Model, Qwen35Mtp,
-    Qwen35VisionConfig, Qwen35VisionModel, VlmDecode,
+    CausalLm, Gemma4Layout, Gemma4Mm, Gemma4MmConfig, Qwen35Cache, Qwen35Config, Qwen35Model,
+    Qwen35Mtp, Qwen35VisionConfig, Qwen35VisionModel, VlmDecode,
 };
 use crate::primitives::attention::EAGER_ATTN_QUERY_CHUNK_SIZE;
 use crate::primitives::nn::input_ids;
 use crate::primitives::projection::{ProjectionFormat, QuantSpec, WeightCensus};
 use crate::primitives::sampler::SamplingParams;
-use crate::primitives::{KvCache, Weights};
+use crate::primitives::{KvCache, StepKvCache, Weights};
 
 /// The registry id of this provider.
 pub const PROVIDER_ID: &str = "candle-llama";
@@ -82,6 +83,20 @@ impl Decode for Decoder {
     }
 }
 
+/// The CUDA-graph tally of a request decoded on a reference path. The runner wraps the step-seam
+/// engine only (sc-24134), so with the switch on such a request's record names why no step went
+/// through it — `fallback=reference_path` — instead of a bare `graph: none`.
+fn reference_path_graphs(tally: GraphTally, switch_on: bool) -> GraphTally {
+    if switch_on && tally.label() == "none" {
+        GraphTally {
+            fallback_reason: Some(crate::decode::graph::REASON_REFERENCE_PATH),
+            ..tally
+        }
+    } else {
+        tally
+    }
+}
+
 /// The bytes admission prices for a request of `admitted_prompt` + `max_new_tokens` tokens: on
 /// the reference geometry with MTP off, and on the step seam's geometry when the engine will run
 /// — its cache keeps a per-token checkpoint ring of `K + 2` recurrent states per linear layer
@@ -93,12 +108,17 @@ impl Decode for Decoder {
 /// by selecting a ring slot — it never clones the cache — so the `x3` clone/replay multiplier
 /// [`core_llm::estimate_chunked_request_bytes`] applies with MTP would charge `2 (K + 2)` states
 /// the request never holds.
+///
+/// When the engine will run through the CUDA-graph runner (`cuda_graphs`, sc-24134) the graphs it
+/// may capture are priced too ([`graph_workspace_admission_bytes`]), so a request that could not
+/// hold them fails closed at admission instead of at instantiation.
 fn priced_request_bytes(
     model: &Decoder,
     mtp_plan: core_llm::MtpPlan,
     admitted_prompt: usize,
     max_new_tokens: u32,
     vision_workspace: u64,
+    cuda_graphs: bool,
 ) -> Option<u64> {
     let geometry = match mtp_plan {
         core_llm::MtpPlan::Mtp { draft_tokens } => {
@@ -106,11 +126,21 @@ fn priced_request_bytes(
         }
         core_llm::MtpPlan::Off => model.memory_geometry(),
     };
+    let graph_workspace = match (cuda_graphs, mtp_plan.draft_tokens()) {
+        (true, Some(k)) => {
+            let total = u64::try_from(admitted_prompt)
+                .ok()?
+                .checked_add(u64::from(max_new_tokens))?
+                .checked_add(u64::from(k))?;
+            graph_workspace_admission_bytes(&geometry, total, k.checked_add(1)?)?
+        }
+        _ => 0,
+    };
     core_llm::estimate_chunked_request_bytes_with_recurrent_copies(
         admitted_prompt,
         max_new_tokens,
         geometry,
-        vision_workspace,
+        vision_workspace.checked_add(graph_workspace)?,
         mtp_plan.draft_tokens().unwrap_or(0),
         EAGER_ATTN_QUERY_CHUNK_SIZE,
         1,
@@ -2240,6 +2270,7 @@ impl TextLlm for LlamaProvider {
             admitted_prompt,
             req.max_new_tokens,
             vision_workspace,
+            cuda_graphs_enabled(),
         )
         .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
         let available = request_available_memory(self.model.device())?;
@@ -2448,6 +2479,16 @@ impl TextLlm for LlamaProvider {
                     .map(|m| m as &mut dyn RewindableConstraintMask);
                 let drafts = draft_tokens as usize;
                 let mut proposer = MtpProposer::new(mtp);
+                // The CUDA-graph runner (sc-24134) wraps the target when the switch is on: it
+                // replays captured decode / verify steps where it can and falls back eager with
+                // a named reason otherwise (`decode_record.cuda_graphs`); the engine is the
+                // same either way.
+                let graphs = GraphRunner::new(target);
+                let stepper: &dyn StepModel<Cache = Qwen35Cache> = if cuda_graphs_enabled() {
+                    &graphs
+                } else {
+                    target
+                };
                 // The unified engine over the step seam with the MTP proposer (sc-24130).
                 let run = match &mm {
                     Some(m) => {
@@ -2479,7 +2520,7 @@ impl TextLlm for LlamaProvider {
                         let prefill = generation_started.elapsed();
                         let decode_started = std::time::Instant::now();
                         let run = generate_speculative_with(
-                            target,
+                            stepper,
                             &mut proposer,
                             SpeculativePrompt::Prefilled {
                                 cache: &mut cache,
@@ -2521,7 +2562,7 @@ impl TextLlm for LlamaProvider {
                             Ok(())
                         };
                         let run = generate_speculative_with(
-                            target,
+                            stepper,
                             &mut proposer,
                             SpeculativePrompt::Tokens(&prompt_ids),
                             &config,
@@ -2559,6 +2600,15 @@ impl TextLlm for LlamaProvider {
                 let constraint = json_mask
                     .as_mut()
                     .map(|m| m as &mut dyn RewindableConstraintMask);
+                // The CUDA-graph runner (sc-24134) wraps the model when the switch is on, as on
+                // the MTP path: the family declares its steps uncapturable
+                // (`positions_host_scalar`), so every step runs eager and the record names why.
+                let graphs = GraphRunner::new(model);
+                let stepper: &dyn StepModel<Cache = StepKvCache> = if cuda_graphs_enabled() {
+                    &graphs
+                } else {
+                    model
+                };
                 let run = match &g4 {
                     Some(m) => {
                         // Gemma 4 multimodal: the spliced embeddings prefill the step cache on
@@ -2585,7 +2635,7 @@ impl TextLlm for LlamaProvider {
                         let prefill = generation_started.elapsed();
                         let decode_started = std::time::Instant::now();
                         let run = generate_speculative_with(
-                            model,
+                            stepper,
                             &mut NoProposer,
                             SpeculativePrompt::Prefilled {
                                 cache: &mut cache,
@@ -2626,7 +2676,7 @@ impl TextLlm for LlamaProvider {
                             Ok(())
                         };
                         let run = generate_speculative_with(
-                            model,
+                            stepper,
                             &mut NoProposer,
                             SpeculativePrompt::Tokens(&prompt_ids),
                             &config,
@@ -2830,6 +2880,7 @@ impl TextLlm for LlamaProvider {
                 host_syncs: span_counters.host_syncs,
                 sampler: span_counters.sampler,
                 fused_primitives: request_span.fused_primitives(),
+                cuda_graphs: request_span.cuda_graphs(),
                 nvfp4_projections: request_span.nvfp4_projections(),
                 ..record
             },
@@ -2842,6 +2893,10 @@ impl TextLlm for LlamaProvider {
             .with_attn_formulation(self.model.attn_formulation())
             .with_proposer(mtp_plan.proposer())
             .with_fused_primitives(request_span.fused_primitives())
+            .with_cuda_graphs(reference_path_graphs(
+                request_span.cuda_graphs(),
+                cuda_graphs_enabled(),
+            ))
             .with_nvfp4_projections(request_span.nvfp4_projections()),
         };
         *self
@@ -4177,8 +4232,24 @@ mod tests {
                 prompt_tokens,
                 max_new_tokens,
                 0,
+                false,
             )
             .unwrap();
+            // The CUDA-graph workspace (sc-24134) is an MTP-plan term: the runner never captures
+            // a causal step (`positions_host_scalar`), so the switch does not change the price.
+            assert_eq!(
+                super::priced_request_bytes(
+                    &decoder,
+                    core_llm::MtpPlan::Off,
+                    prompt_tokens,
+                    max_new_tokens,
+                    0,
+                    true,
+                )
+                .unwrap(),
+                priced,
+                "{label}"
+            );
             let Decoder::Causal(model) = &decoder else {
                 unreachable!()
             };
@@ -4504,6 +4575,37 @@ mod tests {
         );
     }
 
+    /// E6 (sc-24134): with the CUDA-graph runner switched on, an MTP request is priced for every
+    /// graph the runner may capture — exactly [`graph_workspace_admission_bytes`] over the step
+    /// geometry, the request's reach (`prompt + budget + K`) and the `K + 1` step token counts —
+    /// and a request that does not run the engine (MTP off) is priced as before.
+    #[test]
+    fn admission_includes_the_cuda_graph_workspace_when_the_runner_is_on() {
+        use core_llm::{MtpCapabilities, MtpMode};
+
+        let (_cfg, model) = crate::models::qwen35::tests::text_model();
+        let decoder = Decoder::Qwen35(model);
+        let advertised = Some(MtpCapabilities {
+            max_draft_tokens: 8,
+            recommended_draft_tokens: 3,
+        });
+        let (prompt, budget, k) = (11usize, 21u32, 3u32);
+        let off = core_llm::resolve_mtp_plan(MtpMode::Off, advertised);
+        let on = core_llm::resolve_mtp_plan(MtpMode::Enabled { draft_tokens: k }, advertised);
+        let price = |plan, graphs| {
+            super::priced_request_bytes(&decoder, plan, prompt, budget, 0, graphs).unwrap()
+        };
+        let graph_term = crate::decode::graph_workspace_admission_bytes(
+            &decoder.step_memory_geometry(k as usize),
+            (prompt as u64) + u64::from(budget) + u64::from(k),
+            k + 1,
+        )
+        .unwrap();
+        assert!(graph_term > 0);
+        assert_eq!(price(on, true) - price(on, false), graph_term);
+        assert_eq!(price(off, true), price(off, false));
+    }
+
     #[test]
     fn mtp_admission_prices_the_step_cache_checkpoints_and_the_verify_overshoot() {
         use core_llm::{MtpCapabilities, MtpMode, MtpPlan};
@@ -4521,7 +4623,8 @@ mod tests {
         let on = core_llm::resolve_mtp_plan(MtpMode::Enabled { draft_tokens: k }, advertised);
         assert_eq!(off, MtpPlan::Off);
         assert_eq!(on, MtpPlan::Mtp { draft_tokens: k });
-        let price = |plan| super::priced_request_bytes(&decoder, plan, prompt, budget, 0).unwrap();
+        let price =
+            |plan| super::priced_request_bytes(&decoder, plan, prompt, budget, 0, false).unwrap();
         let (off_bytes, on_bytes) = (price(off), price(on));
 
         // The same request priced on the reference geometry with the width set: what admission
@@ -4580,15 +4683,10 @@ mod tests {
         )
     }
 
-    #[test]
-    fn auto_mtp_on_a_qwen35_snapshot_without_a_head_decodes_normally_and_says_proposer_none() {
-        // AC3 (sc-24130), weights-free: the synthetic Qwen3.5 decoder written as a snapshot with
-        // no `mtp.*` tensors and `mtp_num_hidden_layers = 0`. The provider advertises no MTP,
-        // an `Auto` request decodes through the reference loop and the record names the proposer
-        // that ran — `none` — rather than silently downgrading; `Enabled` is refused.
-        use core_llm::{
-            LoadSpec, Message, MtpMode, ProposerKind, Sampling, TextLlm, TextLlmRequest,
-        };
+    /// The synthetic Qwen3.5 decoder written as a snapshot with no `mtp.*` tensors and
+    /// `mtp_num_hidden_layers = 0`, loaded as a provider (keep the directory alive with it).
+    fn synthetic_qwen35_provider_without_mtp() -> (tempfile::TempDir, super::LlamaProvider) {
+        use core_llm::LoadSpec;
 
         let (cfg, weights, cfg_json) = crate::models::qwen35::tests::text_model_snapshot_parts();
         let dir = tempfile::Builder::new()
@@ -4617,6 +4715,18 @@ mod tests {
         let provider =
             super::LlamaProvider::load(&LoadSpec::dense(dir.path().display().to_string()))
                 .expect("load the synthetic Qwen3.5 snapshot");
+        (dir, provider)
+    }
+
+    #[test]
+    fn auto_mtp_on_a_qwen35_snapshot_without_a_head_decodes_normally_and_says_proposer_none() {
+        // AC3 (sc-24130), weights-free: the synthetic Qwen3.5 decoder written as a snapshot with
+        // no `mtp.*` tensors and `mtp_num_hidden_layers = 0`. The provider advertises no MTP,
+        // an `Auto` request decodes through the reference loop and the record names the proposer
+        // that ran — `none` — rather than silently downgrading; `Enabled` is refused.
+        use core_llm::{Message, MtpMode, ProposerKind, Sampling, TextLlm, TextLlmRequest};
+
+        let (_dir, provider) = synthetic_qwen35_provider_without_mtp();
         assert!(provider.descriptor().capabilities.mtp.is_none());
 
         let request = |mtp| TextLlmRequest {
@@ -4648,5 +4758,35 @@ mod tests {
             provider.generate(&request(MtpMode::Enabled { draft_tokens: 2 }), &mut |_| {}),
             Err(core_llm::Error::Unsupported(_))
         ));
+    }
+
+    /// sc-24134: with the CUDA-graph switch on, a request decoded on a reference path (MTP off)
+    /// never runs through the runner, and its record says why rather than a bare `graph: none`;
+    /// with the switch off the record is unchanged.
+    #[test]
+    fn a_reference_path_record_names_why_the_graph_runner_did_not_run() {
+        use core_llm::{Message, MtpMode, Sampling, TextLlm, TextLlmRequest};
+
+        let (_dir, provider) = synthetic_qwen35_provider_without_mtp();
+        let request = TextLlmRequest {
+            messages: vec![Message::user("t3 t7 t11 t2")],
+            sampling: Sampling::greedy(),
+            max_new_tokens: 3,
+            seed: Some(0),
+            mtp: MtpMode::Off,
+            ..Default::default()
+        };
+        let describe = |on: bool| {
+            let _guard = crate::decode::graph::cuda_graphs_policy_guard(Some(on));
+            provider.generate(&request, &mut |_| {}).unwrap();
+            let record = provider.last_decode_record().unwrap();
+            assert_eq!(record.path, crate::decode::DecodePath::Reference);
+            record.cuda_graphs.describe()
+        };
+        assert_eq!(
+            describe(true),
+            "graph: none replayed=0 eager=0 captured=0 fallback=reference_path"
+        );
+        assert_eq!(describe(false), "graph: none replayed=0 eager=0 captured=0");
     }
 }

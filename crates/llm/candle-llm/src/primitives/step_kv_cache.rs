@@ -358,6 +358,20 @@ impl DecodeCache for StepKvCache {
             Backing::Growing(_) | Backing::Paged(_) => KvCacheKind::Growing,
         }
     }
+
+    /// Not a CUDA-graph backing (story sc-24134), declared so the runner refuses before any
+    /// capture: the growing backing reallocates its K/V as it grows (`growing_kv`), the paged
+    /// backing reserves blocks as it grows (`paged_kv`), and the static backing — stable buffers,
+    /// but written at its Rust-side offset and read up to its host-side length, with no
+    /// [`stage_positions`](DecodeCache::stage_positions) / [`replay_advance`](DecodeCache::replay_advance)
+    /// — says `positions_host_scalar`. No replay against this cache has been proven.
+    fn graph_support(&self) -> std::result::Result<(), &'static str> {
+        match self.backing {
+            Backing::Growing(_) => Err("growing_kv"),
+            Backing::Paged(_) => Err("paged_kv"),
+            Backing::Static(_) => Err("positions_host_scalar"),
+        }
+    }
 }
 
 #[cfg(test)]

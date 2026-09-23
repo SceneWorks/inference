@@ -20,6 +20,8 @@
 //! | `DECODE_BENCH_LABEL`       | hardware label recorded verbatim (default `RTX Pro 6000 / sm_120`) |
 //! | `DECODE_BENCH_KV_CACHE`    | `static` (default) or `growing`: the `step_model` row's KV cache  |
 //! | `DECODE_BENCH_ATTN`        | `gqa` (default) or `expanded`: the growing slots' attention       |
+//! | `CANDLE_LLM_CUDA_GRAPHS`   | `1` runs the `step_model` / `mtp` / `ngram` rows through the CUDA-graph runner (sc-24134); every row records `cuda_graphs` |
+//! | `CANDLE_LLM_CUDA_STREAM`   | `legacy` or `own`: the CUDA stream the model runs on (sc-24134; unset = `own` with `CANDLE_LLM_CUDA_GRAPHS` on, else `legacy`), recorded as `cuda_stream` |
 //!
 //! Rows are greedy (`temperature = 0`), no stop tokens, so every row emits exactly `NEW_TOKENS`
 //! and the token sequences are comparable: each row records whether it matched the reference row
@@ -96,12 +98,58 @@ use serde_json::{json, Value};
 use candle_llm::decode::generate_step_timed;
 use candle_llm::decode::CountingDecode;
 use candle_llm::decode::{
-    generate_speculative_with, MtpProposer, NgramProposer, Proposer, SpeculativePrompt,
+    cuda_graphs_enabled, generate_speculative_with, graph_tally, GraphRunner, GraphTally,
+    MtpProposer, NgramProposer, Proposer, SpeculativePrompt, StepModel,
 };
+use candle_llm::models::Qwen35Cache;
 use candle_llm::primitives::{
     fused_kernels_enabled, fused_tally, host_sync_count, nvfp4_gemv_enabled,
     nvfp4_gemv_policy_guard, nvfp4_path_tally, set_fused_kernels, ProjectionFormat,
 };
+
+/// The CUDA-graph switch state (`on` / `off`), or `None` on a binary without the runner.
+fn cuda_graphs_switch() -> Option<&'static str> {
+    Some(if cuda_graphs_enabled() { "on" } else { "off" })
+}
+
+/// The CUDA stream the model runs on (`own` / `legacy`, sc-24134), or `None` on a binary
+/// without the selector.
+fn cuda_stream_label() -> Option<&'static str> {
+    candle_llm::device::CudaStreamKind::from_env()
+        .ok()
+        .map(|k| k.label())
+}
+
+/// A snapshot of the thread's CUDA-graph tally (sc-24134); `cuda_graphs_delta` turns two
+/// snapshots into a row's JSON.
+fn cuda_graphs_now() -> Option<GraphTally> {
+    Some(graph_tally())
+}
+
+fn cuda_graphs_delta(before: Option<GraphTally>, switch: Option<&'static str>) -> Option<Value> {
+    let d = cuda_graphs_now()?.since(&before?);
+    Some(json!({
+        "switch": switch,
+        "replayed": d.replayed,
+        "eager": d.eager,
+        "captured": d.captured,
+        "fallback_reason": d.fallback_reason,
+        "path": d.label(),
+    }))
+}
+
+/// The step model a row drives: the graph runner over the target when the switch is on
+/// (sc-24134), the bare target otherwise.
+fn stepper<'a>(
+    model: &'a Qwen35Model,
+    runner: &'a GraphRunner<'a, Qwen35Model>,
+) -> &'a dyn StepModel<Cache = Qwen35Cache> {
+    if cuda_graphs_enabled() {
+        runner
+    } else {
+        model
+    }
+}
 
 /// A speculative row through the unified engine: the output, the raw counters, the prefill and
 /// decode seconds, the `(kv_cache, attn_formulation)` labels of the cache it ran on, the
@@ -137,8 +185,9 @@ fn engine_row<P: Proposer>(
         decode_started = Some(Instant::now());
         Ok(())
     };
+    let runner = GraphRunner::new(model);
     let run = generate_speculative_with(
-        model,
+        stepper(model, &runner),
         proposer,
         SpeculativePrompt::Tokens(prompt),
         config,
@@ -359,8 +408,9 @@ fn step_model_row(
         decode_started = Some(Instant::now());
         Ok(())
     };
+    let runner = GraphRunner::new(model);
     let (out, record, memory) = generate_step_timed(
-        model,
+        stepper(model, &runner),
         prompt,
         config,
         &CancelFlag::new(),
@@ -507,8 +557,16 @@ fn causal_engine_row<P: Proposer>(
         decode_started = Some(Instant::now());
         Ok(())
     };
+    // The graph runner over the model when the switch is on (sc-24134), as for the hybrid rows.
+    let runner = GraphRunner::new(model);
+    let stepper: &dyn StepModel<Cache = candle_llm::primitives::StepKvCache> =
+        if cuda_graphs_enabled() {
+            &runner
+        } else {
+            model
+        };
     let run = generate_speculative_with(
-        model,
+        stepper,
         proposer,
         SpeculativePrompt::Tokens(prompt),
         config,
@@ -600,6 +658,7 @@ fn causal_decode_bench(
         used
     };
     let switch = fused_switch();
+    let graphs_switch = cuda_graphs_switch();
     let mut rows_json = Vec::new();
     let mut reference_tokens: Option<Vec<i32>> = None;
 
@@ -617,6 +676,7 @@ fn causal_decode_bench(
         run(&warm, &mut |_| {});
         let syncs0 = host_syncs_now();
         let fused0 = fused_tally_now();
+        let graphs0 = cuda_graphs_now();
         let mut at_last = None;
         let (out, prefill, decode, forwards) = run(
             &config,
@@ -624,6 +684,7 @@ fn causal_decode_bench(
         );
         let syncs = host_syncs_now().zip(syncs0).map(|(a, b)| a - b);
         let fused = fused_delta(fused0, if fused_off { Some("off") } else { switch });
+        let graphs = cuda_graphs_delta(graphs0, graphs_switch);
         let used = note_peak(at_last);
         eprintln!(
             "[decode_bench] {row:<17} {:>7.2} tok/s  prefill {:.3}s",
@@ -647,6 +708,7 @@ fn causal_decode_bench(
             None,
             None,
             fused,
+            graphs,
             None,
             Some("none"),
             None,
@@ -677,6 +739,7 @@ fn causal_decode_bench(
         run(&warm, &mut |_| {});
         let syncs0 = host_syncs_now();
         let fused0 = fused_tally_now();
+        let graphs0 = cuda_graphs_now();
         let mut at_last = None;
         let (out, stats, prefill, decode, record, cache) = run(
             &config,
@@ -684,6 +747,7 @@ fn causal_decode_bench(
         );
         let syncs = host_syncs_now().zip(syncs0).map(|(a, b)| a - b);
         let fused = fused_delta(fused0, switch);
+        let graphs = cuda_graphs_delta(graphs0, graphs_switch);
         let used = note_peak(at_last);
         let per_verify = record.host_syncs_per_verify_step();
         let recovery = Some((
@@ -693,7 +757,7 @@ fn causal_decode_bench(
             record.prefill_forwards,
         ));
         eprintln!(
-            "[decode_bench] {row} K={k:<2}       {:>7.2} tok/s  accept {:.3}  fwd/tok {:.3}  syncs/verify {}  {}  kv {}  attn {}",
+            "[decode_bench] {row} K={k:<2}       {:>7.2} tok/s  accept {:.3}  fwd/tok {:.3}  syncs/verify {}  {}  kv {}  attn {}  graphs {}",
             out.tokens.len() as f64 / decode,
             if stats.proposed > 0 {
                 stats.accepted as f64 / stats.proposed as f64
@@ -705,6 +769,7 @@ fn causal_decode_bench(
             recovery_text(Some(stats.forwards as u64), recovery),
             record.kv_cache.label(),
             record.attn_formulation.label(),
+            graphs.as_ref().map_or("n/a".to_string(), |g| g.to_string()),
         );
         let speculative = row == "ngram";
         rows_json.push(row_json(
@@ -724,6 +789,7 @@ fn causal_decode_bench(
             per_verify,
             recovery,
             fused,
+            graphs,
             None,
             Some(record.proposer.label()),
             Some(stats.replays as u64),
@@ -751,6 +817,8 @@ fn causal_decode_bench(
     doc.insert("new_tokens", json!(new_tokens));
     doc.insert("warmup_tokens", json!(warmup_tokens));
     doc.insert("fused_kernels", json!(switch));
+    doc.insert("cuda_graphs", json!(graphs_switch));
+    doc.insert("cuda_stream", json!(cuda_stream_label()));
     doc.insert("device_used_bytes_after_load", json!(used_after_load));
     doc.insert("peak_device_used_bytes", json!(peak_used));
     doc.insert(
@@ -802,6 +870,22 @@ fn fused_delta(_before: Option<()>, _switch: Option<&'static str>) -> Option<Val
 
 fn with_fused_off<T>(f: impl FnOnce() -> T) -> T {
     f()
+}
+
+fn cuda_graphs_switch() -> Option<&'static str> {
+    None
+}
+
+fn cuda_stream_label() -> Option<&'static str> {
+    None
+}
+
+fn cuda_graphs_now() -> Option<()> {
+    None
+}
+
+fn cuda_graphs_delta(_before: Option<()>, _switch: Option<&'static str>) -> Option<Value> {
+    None
 }
 
 fn nvfp4_gemv_switch() -> Option<&'static str> {
@@ -1091,6 +1175,7 @@ fn row_json(
     syncs_per_verify_step: Option<f64>,
     recovery: Option<Recovery>,
     fused_primitives: Option<Value>,
+    cuda_graphs: Option<Value>,
     nvfp4_projections: Option<Value>,
     proposer: Option<&str>,
     replay_forwards: Option<u64>,
@@ -1135,6 +1220,7 @@ fn row_json(
         "kv_cache": kinds.map(|(kv_cache, _)| kv_cache),
         "attn_formulation": kinds.map(|(_, attn)| attn),
         "fused_primitives": fused_primitives,
+        "cuda_graphs": cuda_graphs,
         "nvfp4_projections": nvfp4_projections,
         "tokens_match_reference": matches,
         "first_divergence": diverged.flatten(),
@@ -1292,12 +1378,14 @@ fn decode_bench() {
     let mut rows_json = Vec::new();
     let mut reference_tokens: Option<Vec<i32>> = None;
     let switch = fused_switch();
+    let graphs_switch = cuda_graphs_switch();
     let nv_switch = nvfp4_gemv_switch();
 
     if rows.iter().any(|r| r == "reference") {
         reference_row(&model, &prompt, &warm, &device, &mut |_| {});
         let syncs0 = host_syncs_now();
         let fused0 = fused_tally_now();
+        let graphs0 = cuda_graphs_now();
         let nv0 = nvfp4_tally_now();
         let mut at_last = None;
         let (out, prefill, decode, forwards) = reference_row(
@@ -1309,6 +1397,7 @@ fn decode_bench() {
         );
         let syncs = host_syncs_now().zip(syncs0).map(|(a, b)| a - b);
         let fused = fused_delta(fused0, switch);
+        let graphs = cuda_graphs_delta(graphs0, graphs_switch);
         let nvfp4 = nvfp4_delta(nv0, nv_switch);
         let used = note_peak(at_last);
         eprintln!(
@@ -1335,6 +1424,7 @@ fn decode_bench() {
             None,
             None,
             fused,
+            graphs,
             nvfp4,
             Some("none"),
             None,
@@ -1346,6 +1436,7 @@ fn decode_bench() {
         with_fused_off(|| reference_row(&model, &prompt, &warm, &device, &mut |_| {}));
         let syncs0 = host_syncs_now();
         let fused0 = fused_tally_now();
+        let graphs0 = cuda_graphs_now();
         let nv0 = nvfp4_tally_now();
         let mut at_last = None;
         let (out, prefill, decode, forwards) = with_fused_off(|| {
@@ -1359,6 +1450,7 @@ fn decode_bench() {
         });
         let syncs = host_syncs_now().zip(syncs0).map(|(a, b)| a - b);
         let fused = fused_delta(fused0, Some("off"));
+        let graphs = cuda_graphs_delta(graphs0, graphs_switch);
         let nvfp4 = nvfp4_delta(nv0, nv_switch);
         let used = note_peak(at_last);
         eprintln!(
@@ -1384,6 +1476,7 @@ fn decode_bench() {
             None,
             None,
             fused,
+            graphs,
             nvfp4,
             Some("none"),
             None,
@@ -1398,6 +1491,7 @@ fn decode_bench() {
         let syncs0 = host_syncs_now();
         let fused0 = fused_tally_now();
         let nv0 = nvfp4_tally_now();
+        let graphs0 = cuda_graphs_now();
         let mut at_last = None;
         let (out, prefill, decode, forwards) = with_nvfp4_gemv_off(|| {
             reference_row(
@@ -1411,6 +1505,7 @@ fn decode_bench() {
         let syncs = host_syncs_now().zip(syncs0).map(|(a, b)| a - b);
         let fused = fused_delta(fused0, switch);
         let nvfp4 = nvfp4_delta(nv0, nv_switch.map(|_| "off"));
+        let graphs = cuda_graphs_delta(graphs0, graphs_switch);
         let used = note_peak(at_last);
         eprintln!(
             "[decode_bench] reference_cublaslt {:>5.2} tok/s  prefill {:.3}s  nvfp4 {}",
@@ -1435,6 +1530,7 @@ fn decode_bench() {
             None,
             None,
             fused,
+            graphs,
             nvfp4,
             Some("none"),
             None,
@@ -1447,6 +1543,7 @@ fn decode_bench() {
     if rows.iter().any(|r| r == "step_model") {
         step_model_row(&model, &prompt, &warm, &device, &mut |_| {});
         let fused0 = fused_tally_now();
+        let graphs0 = cuda_graphs_now();
         let nv0 = nvfp4_tally_now();
         let mut at_last = None;
         let (out, prefill, decode, record, cache, kinds, proposer) = step_model_row(
@@ -1458,12 +1555,14 @@ fn decode_bench() {
         );
         let cache = checked_step_cache(new_tokens, cache);
         let fused = fused_delta(fused0, switch);
+        let graphs = cuda_graphs_delta(graphs0, graphs_switch);
         let nvfp4 = nvfp4_delta(nv0, nv_switch);
         let used = note_peak(at_last);
         eprintln!(
-            "[decode_bench] step_model       {:>7.2} tok/s  prefill {:.3}s",
+            "[decode_bench] step_model       {:>7.2} tok/s  prefill {:.3}s  graphs {}",
             out.tokens.len() as f64 / decode,
-            prefill
+            prefill,
+            graphs.as_ref().map_or("n/a".to_string(), |g| g.to_string())
         );
         let (forwards, syncs) = match record {
             Some((forwards, syncs)) => (Some(forwards), Some(syncs)),
@@ -1486,6 +1585,7 @@ fn decode_bench() {
             None,
             None,
             fused,
+            graphs,
             nvfp4,
             Some(proposer),
             None,
@@ -1501,6 +1601,7 @@ fn decode_bench() {
             mtp_row(&model, mtp, &prompt, &warm, k, &device, &mut |_| {});
             let syncs0 = host_syncs_now();
             let fused0 = fused_tally_now();
+            let graphs0 = cuda_graphs_now();
             let nv0 = nvfp4_tally_now();
             let mut at_last = None;
             let (out, stats, prefill, decode, kinds, per_verify, proposer, recovery) = mtp_row(
@@ -1514,10 +1615,11 @@ fn decode_bench() {
             );
             let syncs = host_syncs_now().zip(syncs0).map(|(a, b)| a - b);
             let fused = fused_delta(fused0, switch);
+            let graphs = cuda_graphs_delta(graphs0, graphs_switch);
             let nvfp4 = nvfp4_delta(nv0, nv_switch);
             let used = note_peak(at_last);
             eprintln!(
-                "[decode_bench] mtp K={k}          {:>7.2} tok/s  accept {:.3}  fwd/tok {:.3}  syncs/verify {}  {}",
+                "[decode_bench] mtp K={k}          {:>7.2} tok/s  accept {:.3}  fwd/tok {:.3}  syncs/verify {}  {}  graphs {}",
                 out.tokens.len() as f64 / decode,
                 if stats.proposed > 0 {
                     stats.accepted as f64 / stats.proposed as f64
@@ -1526,7 +1628,8 @@ fn decode_bench() {
                 },
                 stats.forwards as f64 / out.tokens.len().max(1) as f64,
                 per_verify.map_or("n/a".to_string(), |s| format!("{s:.2}")),
-                recovery_text(Some(stats.forwards as u64), recovery)
+                recovery_text(Some(stats.forwards as u64), recovery),
+                graphs.as_ref().map_or("n/a".to_string(), |g| g.to_string())
             );
             rows_json.push(row_json(
                 "mtp",
@@ -1545,6 +1648,7 @@ fn decode_bench() {
                 per_verify,
                 recovery,
                 fused,
+                graphs,
                 nvfp4,
                 Some(proposer),
                 replay_forwards(&stats),
@@ -1561,6 +1665,7 @@ fn decode_bench() {
             ngram_row(&model, &prompt, &warm, k, &device, &mut |_| {});
             let syncs0 = host_syncs_now();
             let fused0 = fused_tally_now();
+            let graphs0 = cuda_graphs_now();
             let nv0 = nvfp4_tally_now();
             let mut at_last = None;
             let (out, stats, prefill, decode, kinds, per_verify, proposer, recovery) = ngram_row(
@@ -1573,6 +1678,7 @@ fn decode_bench() {
             );
             let syncs = host_syncs_now().zip(syncs0).map(|(a, b)| a - b);
             let fused = fused_delta(fused0, switch);
+            let graphs = cuda_graphs_delta(graphs0, graphs_switch);
             let nvfp4 = nvfp4_delta(nv0, nv_switch);
             let used = note_peak(at_last);
             eprintln!(
@@ -1604,6 +1710,7 @@ fn decode_bench() {
                 per_verify,
                 recovery,
                 fused,
+                graphs,
                 nvfp4,
                 Some(proposer),
                 replay_forwards(&stats),
@@ -1626,6 +1733,8 @@ fn decode_bench() {
     doc.insert("new_tokens", json!(new_tokens));
     doc.insert("warmup_tokens", json!(warmup_tokens));
     doc.insert("fused_kernels", json!(switch));
+    doc.insert("cuda_graphs", json!(graphs_switch));
+    doc.insert("cuda_stream", json!(cuda_stream_label()));
     doc.insert("weight_format", json!(format));
     doc.insert("nvfp4_gemv", json!(nv_switch));
     doc.insert("device_used_bytes_after_load", json!(used_after_load));
