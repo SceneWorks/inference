@@ -429,6 +429,12 @@ pub enum Quantize {
     Q4,
     /// 8-bit group-wise affine.
     Q8,
+    /// NVFP4 (sc-24135): E2M1 4-bit elements with one FP8-E4M3 scale per 16-element block and an
+    /// FP32 per-tensor scale (~4.5 bits/weight), quantized **at load** and served by a native FP4
+    /// GEMM. A hardware capability, not a storage format: a provider whose device cannot run it must
+    /// refuse the load with [`Error::Unsupported`](crate::Error::Unsupported) naming the capability
+    /// rather than fall back to another representation, and snapshot preparation never persists it.
+    Nvfp4,
 }
 
 impl LoadSpec {

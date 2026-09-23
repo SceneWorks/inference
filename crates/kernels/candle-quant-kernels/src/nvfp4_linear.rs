@@ -360,9 +360,9 @@ struct Fp4Resident {
 /// The shared handle + the device it is bound to (sc-12274). Cuda-only.
 #[cfg(feature = "cuda")]
 #[derive(Clone)]
-struct Fp4Ctx {
-    lt: std::sync::Arc<super::cublaslt::CublasLt>,
-    device: Device,
+pub(crate) struct Fp4Ctx {
+    pub(crate) lt: std::sync::Arc<super::cublaslt::CublasLt>,
+    pub(crate) device: Device,
 }
 
 /// A **shared, per-device cuBLASLt compute context** for [`Nvfp4Linear`] (sc-12274).
@@ -403,7 +403,7 @@ struct Fp4Ctx {
 #[derive(Clone, Default)]
 pub struct Nvfp4Context {
     #[cfg(feature = "cuda")]
-    inner: Option<Fp4Ctx>,
+    pub(crate) inner: Option<Fp4Ctx>,
 }
 
 impl Nvfp4Context {
@@ -489,7 +489,7 @@ impl Nvfp4Context {
     /// context built on `cuda:0` handed to a layer on `cuda:1` would stage the weight through the
     /// wrong device's stream. Mismatch is loud and falls back rather than corrupting the layer.
     #[cfg(feature = "cuda")]
-    fn handle_for(
+    pub(crate) fn handle_for(
         &self,
         device: &Device,
     ) -> std::result::Result<&std::sync::Arc<super::cublaslt::CublasLt>, Nvfp4Fallback> {
@@ -783,56 +783,15 @@ impl Nvfp4Linear {
         Linear::new(w, bias).forward(x)
     }
 
-    /// The W4A4 FP4 forward (cuda-only): flatten leading dims to `[M, K]`, pad M to [`NVFP4_M_ALIGN`],
-    /// pack the activation to NVFP4, run the resident-weight cuBLASLt FP4 GEMM, slice the padded rows
-    /// off, reshape back, add bias, cast to the input dtype. The weight never dequantizes — this is the
-    /// SC#6 packed-forward path.
+    /// The W4A4 FP4 forward (cuda-only) over this layer's resident weight — see [`w4a4_forward`],
+    /// the one W4A4 forward shared with the LLM lane's load-time weights (sc-24135).
     #[cfg(feature = "cuda")]
     fn forward_fp4(&self, x: &Tensor) -> Result<Tensor> {
         let fp4 = self
             .fp4
             .as_ref()
             .expect("Fp4W4A4 regime holds a staged weight");
-        let dims = x.dims().to_vec();
-        let k = *dims.last().expect("linear input has a last dim");
-        let m: usize = dims[..dims.len() - 1].iter().product();
-        let x2 = x.reshape((m, k))?;
-
-        // M-alignment (sc-11039 handoff): pad the token rows up to a multiple of NVFP4_M_ALIGN with
-        // zero rows (they add nothing to any real output) so cuBLASLt does not return NOT_SUPPORTED,
-        // then slice the padding back off the result.
-        let m_pad = round_up(m.max(1), NVFP4_M_ALIGN);
-        let x_pad = if m_pad != m {
-            x2.pad_with_zeros(0, 0, m_pad - m)?
-        } else {
-            x2
-        };
-
-        // W4A4 (sc-11044): quantize the activation to NVFP4 **on-device** — no CPU round-trip — and run
-        // the FP4 GEMM against the resident weight. `cols_padded` matches the resident weight so the two
-        // operands share the padded contraction width.
-        //
-        // The fused quantizer (sc-12078) is called UNCONDITIONALLY, and its errors propagate. This
-        // regime only exists because `try_build_fp4` already proved the kernel compiles on this handle,
-        // so there is no "nvrtc is missing" case left to catch here. What remains — a shape/storage
-        // mismatch, an OOM, a launch failure — is a real fault, and rerouting it to the unfused
-        // reference chain would answer a bug with a ~50×-slower projection while hiding the bug
-        // (the unfused path allocates too, so it would not survive an OOM either). Fail loud instead.
-        let cols_padded = fp4.w_staged.shape_padded().1;
-        let x_stg = fp4
-            .lt
-            .quantize_nvfp4_activation_fused(&x_pad, cols_padded)?;
-        let y = fp4.lt.matmul_nvfp4_staged(&fp4.w_staged, &x_stg)?; // [m_pad, N] bf16
-        let y = if m_pad != m { y.narrow(0, 0, m)? } else { y };
-
-        let n = y.dim(1)?;
-        let mut out_shape = dims[..dims.len() - 1].to_vec();
-        out_shape.push(n);
-        let mut y = y.reshape(out_shape)?;
-        if let Some(b) = &self.bias {
-            y = y.broadcast_add(&b.to_dtype(y.dtype())?)?;
-        }
-        y.to_dtype(x.dtype())
+        w4a4_forward(&fp4.lt, &fp4.w_staged, x, self.bias.as_ref())
     }
 
     /// [`Self::forward`] plus a **NaN/inf guard** (sc-11044 AC): asserts the output is finite and
@@ -986,6 +945,59 @@ impl Nvfp4Linear {
             }),
         }
     }
+}
+
+/// **The W4A4 FP4 forward** (cuda-only) — the one implementation every resident NVFP4 weight runs
+/// (the media lane's [`Nvfp4Linear`] and the LLM lane's load-time `Nvfp4Weight`, sc-24135):
+/// flatten leading dims to `[M, K]`, pad M to [`NVFP4_M_ALIGN`], quantize the activation to NVFP4
+/// on-device with the fused quantizer, run the resident-weight cuBLASLt FP4 GEMM, slice the padded
+/// rows off, reshape back, add bias, cast to the input dtype. The weight never dequantizes — this is
+/// the SC#6 packed-forward path.
+#[cfg(feature = "cuda")]
+pub(crate) fn w4a4_forward(
+    lt: &super::cublaslt::CublasLt,
+    w_staged: &super::cublaslt::DevNvfp4,
+    x: &Tensor,
+    bias: Option<&Tensor>,
+) -> Result<Tensor> {
+    let dims = x.dims().to_vec();
+    let k = *dims.last().expect("linear input has a last dim");
+    let m: usize = dims[..dims.len() - 1].iter().product();
+    let x2 = x.reshape((m, k))?;
+
+    // M-alignment (sc-11039 handoff): pad the token rows up to a multiple of NVFP4_M_ALIGN with
+    // zero rows (they add nothing to any real output) so cuBLASLt does not return NOT_SUPPORTED,
+    // then slice the padding back off the result.
+    let m_pad = round_up(m.max(1), NVFP4_M_ALIGN);
+    let x_pad = if m_pad != m {
+        x2.pad_with_zeros(0, 0, m_pad - m)?
+    } else {
+        x2
+    };
+
+    // W4A4 (sc-11044): quantize the activation to NVFP4 **on-device** — no CPU round-trip — and run
+    // the FP4 GEMM against the resident weight. `cols_padded` matches the resident weight so the two
+    // operands share the padded contraction width.
+    //
+    // The fused quantizer (sc-12078) is called UNCONDITIONALLY, and its errors propagate. This
+    // regime only exists because `try_build_fp4` already proved the kernel compiles on this handle,
+    // so there is no "nvrtc is missing" case left to catch here. What remains — a shape/storage
+    // mismatch, an OOM, a launch failure — is a real fault, and rerouting it to the unfused
+    // reference chain would answer a bug with a ~50×-slower projection while hiding the bug
+    // (the unfused path allocates too, so it would not survive an OOM either). Fail loud instead.
+    let cols_padded = w_staged.shape_padded().1;
+    let x_stg = lt.quantize_nvfp4_activation_fused(&x_pad, cols_padded)?;
+    let y = lt.matmul_nvfp4_staged(w_staged, &x_stg)?; // [m_pad, N] bf16
+    let y = if m_pad != m { y.narrow(0, 0, m)? } else { y };
+
+    let n = y.dim(1)?;
+    let mut out_shape = dims[..dims.len() - 1].to_vec();
+    out_shape.push(n);
+    let mut y = y.reshape(out_shape)?;
+    if let Some(b) = bias {
+        y = y.broadcast_add(&b.to_dtype(y.dtype())?)?;
+    }
+    y.to_dtype(x.dtype())
 }
 
 #[cfg(test)]

@@ -39,7 +39,10 @@ pub use nn::{
 };
 pub use paged_kv_cache::{BlockPool, PagedKvCache};
 pub use prism::{GdnRowMap, PrismPackedWeight, PrismRegistry};
-pub use projection::{KvProjection, Projection, QuantSpec};
+pub use projection::{
+    KvProjection, Projection, ProjectionCensus, ProjectionFormat, ProjectionKind, ProjectionTally,
+    QuantSpec, WeightCensus,
+};
 pub use quant::QuantizedLinear;
 pub use rope::{apply_rope, Rope};
 pub use sampler::{

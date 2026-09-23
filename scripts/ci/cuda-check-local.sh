@@ -107,7 +107,7 @@ target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
 rm -rf "$target_dir"/*/build/candle-kernels-* "$target_dir"/build/candle-kernels-* 2>/dev/null || true
 
 # Keep this package set aligned with the three steps in ci.yml's `windows-cuda-check` job.
-pkgs=(-p candle-llm -p "candle-gen*" -p "candle-audio*" -p runtime-cuda)
+pkgs=(-p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda)
 
 echo "==> clippy --features cuda (the lint twin of the Windows lane)"
 cargo clippy --locked --all-targets "${pkgs[@]}" --features cuda -- -D warnings

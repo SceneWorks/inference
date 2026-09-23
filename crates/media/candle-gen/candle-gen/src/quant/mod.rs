@@ -41,7 +41,14 @@ pub mod sidecar;
 // FP32 per-tensor scale (~4.5 effective bits/weight). Emits the canonical cuBLASLt-consumable byte /
 // 128×4-swizzled-scale layout the sc-11039 NVFP4 GEMM reads. Pure CPU numerics — builds everywhere
 // (no `cuda` feature), consumed on Blackwell sm_120 by the cuBLASLt path.
-pub mod nvfp4;
+//
+// sc-24135: this module, `cublaslt`, `nvfp4_linear` and `nvfp4_outlier` now live in the shared
+// `candle-quant-kernels` crate (so candle-llm serves the same NVFP4 implementation); they are
+// re-exported here at their original paths.
+pub use candle_quant_kernels::{cublaslt, nvfp4, nvfp4_linear, nvfp4_outlier};
+// ComfyUI Kitchen NVFP4 import (sc-20641): the one NVFP4 seam that reads gen-core's `to_blocked`
+// swizzle, kept beside the media checkpoint readers so the codec stays gen-core-free (sc-24135).
+pub mod nvfp4_kitchen;
 
 // The shared forward-time additive (unmerged) LoRA/LoKr seam (sc-11091, epic 10765): [`AdaptLinear`]
 // — a frozen dense/packed base plus stacked residuals `y = base(x) + Σ scale·((x·A)·B)`, memory-free
@@ -58,8 +65,8 @@ pub mod convrot;
 // The cuBLASLt 8-bit GEMM compute leg (sc-9299 spike, epic 9083's 8-bit pivot): fp8 E4M3 + int8
 // IGEMM matmul over cudarc's raw cublasLt sys bindings, plus the `Fp8Linear`/`Int8Linear` linear
 // layers with dynamic per-tensor activation quant. The `CublasLt` handle is cuda-only; the small
-// activation/weight quant helpers are pure candle ops and build everywhere.
-pub mod cublaslt;
+// activation/weight quant helpers are pure candle ops and build everywhere. (`cublaslt` is
+// re-exported from `candle-quant-kernels` above.)
 // The 8-bit linear layers own a `CublasLt` handle → cuda-only.
 #[cfg(feature = "cuda")]
 pub mod eight_bit_linear;
@@ -68,14 +75,12 @@ pub mod eight_bit_linear;
 // weight, forwarding through the sc-11039 cuBLASLt `matmul_nvfp4_staged` (W4A4) on Blackwell sm_120, with
 // a transparent dequant→bf16 fallback (W4A16 outlier override / <sm_120 / CPU / non-cuda). Unlike
 // `eight_bit_linear`, this module compiles WITHOUT the `cuda` feature (the fallback is pure candle ops);
-// the FP4 compute leg is cfg-gated internally.
-pub mod nvfp4_linear;
+// the FP4 compute leg is cfg-gated internally. (Re-exported from `candle-quant-kernels` above.)
 
 // Activation-outlier sparsity instrumentation (sc-11044): the spike sc-11038 "residual gate" metric —
 // per-layer, how many NVFP4 16-blocks carry a massive-activation outlier — used to confirm the
 // benign→W4A4 / outlier→W4A16 partition. Backend-neutral (pure host math over a materialized slice),
-// so it compiles and tests on the CPU lane.
-pub mod nvfp4_outlier;
+// so it compiles and tests on the CPU lane. (Re-exported from `candle-quant-kernels` above.)
 
 pub use adapt::{AdaptLinear, LokrFactors};
 pub use adapters::{install_dotted_adapters, AdditiveAdapterReport};
@@ -103,6 +108,7 @@ pub use cublaslt::{CublasLt, DevNvfp4};
 #[cfg(feature = "cuda")]
 pub use eight_bit_linear::{Fp8Linear, Int8Linear};
 
+pub use nvfp4_kitchen::Nvfp4KitchenExt;
 pub use nvfp4_linear::{
     ActPrecision, Nvfp4Context, Nvfp4Fallback, Nvfp4Linear, Nvfp4Partition, Nvfp4Regime,
     NVFP4_M_ALIGN,
