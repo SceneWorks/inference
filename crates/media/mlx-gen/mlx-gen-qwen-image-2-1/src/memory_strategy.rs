@@ -1573,14 +1573,22 @@ mod tests {
     /// revision), which raised a harness's `MLX_GEN_MEMORY_CAP_GIB` cap for the request.
     #[test]
     fn allocator_bounds_are_installed_for_the_request_and_restored_after_it() {
+        // Host-independent: the CI Mac's default limit (0.95 x memsize, ~7 GB on an 8 GB
+        // runner) is below the 31 GiB this request asks for, so everything is asserted against
+        // the limits read back before `enter`, never against an absolute number.
         let (memory_before, cache_before) = AllocatorBounds::current();
+        let active = mlx_rs::memory::get_active_memory();
         {
             let _bounds = AllocatorBounds::enter(28 << 30, 3 << 30);
             let (memory, cache) = AllocatorBounds::current();
-            assert_eq!(cache, 3 << 30);
-            // `resident` is the larger of the argument and what is active now.
-            assert!(memory >= (28 << 30) + (3 << 30), "{memory}");
-            assert!(memory <= (28 << 30) + (3 << 30) + mlx_rs::memory::get_active_memory());
+            assert_eq!(cache, cache_before.min(3 << 30));
+            // `resident` is the larger of the argument and what was active at entry.
+            let requested_min = (28 << 30) + (3 << 30);
+            let requested_max = requested_min + active;
+            assert!(
+                memory >= memory_before.min(requested_min) && memory <= memory_before.min(requested_max),
+                "installed {memory} outside min({memory_before}, {requested_min}..={requested_max})"
+            );
         }
         assert_eq!(AllocatorBounds::current(), (memory_before, cache_before));
 
