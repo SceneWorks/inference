@@ -151,6 +151,16 @@ fn provider_records_the_reference_decode_path() {
         out.mtp.is_none(),
         "MTP off leaves the contract's MTP stats absent"
     );
+
+    // A request that fails (here: cancelled before inference) clears the previous record rather
+    // than leaving it readable as if it described this request.
+    let cancelled = TextLlmRequest::new(vec![Message::user("t1 t2 t3")], 6);
+    cancelled.cancel.cancel();
+    assert!(p.generate(&cancelled, &mut |_| {}).is_err());
+    assert!(
+        p.last_decode_record().is_none(),
+        "a failed request must not expose the previous request's record"
+    );
 }
 
 /// A model that *actually reasons*: Qwen3's chat template gates `enable_thinking`, so an Enabled

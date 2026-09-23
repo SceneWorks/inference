@@ -83,6 +83,22 @@ impl Decode for Decoder {
     }
 }
 
+/// Upper bound on one Qwen3.5/3.6/3.8 recurrent (Gated DeltaNet) state — every linear layer's SSM
+/// state plus its conv tail, priced over all `num_layers` at f32 — times the states a request's
+/// cache holds at once: the live state plus `retained_checkpoints` rollback checkpoints (the
+/// decoder checkpoints at every forward, and each retained checkpoint pins a distinct state once
+/// the live state moves on). The provider's caches retain
+/// [`REFERENCE_MAX_CHECKPOINTS`](crate::models::qwen35::REFERENCE_MAX_CHECKPOINTS); a step-seam
+/// caller must price [`STEP_MAX_CHECKPOINTS`](crate::models::qwen35::STEP_MAX_CHECKPOINTS) (E6).
+fn qwen35_recurrent_admission_bytes(c: &Qwen35Config, retained_checkpoints: usize) -> u64 {
+    let one_state = (c.num_layers as u64)
+        .saturating_mul(c.linear_num_value_heads as u64)
+        .saturating_mul(c.linear_value_head_dim as u64)
+        .saturating_mul((c.linear_key_head_dim + c.linear_conv_kernel_dim) as u64)
+        .saturating_mul(4);
+    one_state.saturating_mul(1 + retained_checkpoints as u64)
+}
+
 impl Decoder {
     fn memory_geometry(&self) -> LlmMemoryGeometry {
         let (query_heads, kv_heads, head_dim, layers, hidden, intermediate, vocab, recurrent) =
@@ -110,13 +126,10 @@ impl Decoder {
                         c.hidden_size,
                         c.intermediate_size,
                         c.vocab_size,
-                        (c.num_layers as u64)
-                            .saturating_mul(c.linear_num_value_heads as u64)
-                            .saturating_mul(c.linear_value_head_dim as u64)
-                            .saturating_mul(
-                                (c.linear_key_head_dim + c.linear_conv_kernel_dim) as u64,
-                            )
-                            .saturating_mul(4),
+                        qwen35_recurrent_admission_bytes(
+                            c,
+                            crate::models::qwen35::REFERENCE_MAX_CHECKPOINTS,
+                        ),
                     )
                 }
             };
@@ -1883,6 +1896,12 @@ impl TextLlm for LlamaProvider {
         req: &TextLlmRequest,
         on_event: &mut dyn FnMut(CoreEvent),
     ) -> CoreResult<TextLlmOutput> {
+        // Request start: a request that fails or is cancelled (anywhere below, before the record
+        // is written on success) must not leave the previous request's record readable.
+        *self
+            .last_decode
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         self.validate(req)?;
         if req.cancel.is_cancelled() {
             return Err(CoreError::Canceled); // typed pre-inference cancel
@@ -2929,6 +2948,7 @@ mod tests {
         substitute_vision_placeholders, validate_context_window, video_placeholder_text, JsonMask,
         EAGER_ATTN_QUERY_CHUNK_SIZE,
     };
+    use super::{qwen35_recurrent_admission_bytes, Decode as _, Decoder};
 
     #[test]
     fn accelerator_only_selector_is_exact_to_qwen38_and_bonsai() {
@@ -3533,5 +3553,86 @@ mod tests {
             "w within per-frame grid"
         );
         let _ = h;
+    }
+    /// E6: admission prices every recurrent state a Qwen3.5-family request's cache holds. The
+    /// provider's cache (the reference/MTP `Decode::make_cache`) retains `REFERENCE_MAX_CHECKPOINTS`
+    /// rollback checkpoints, and the geometry charges `1 + REFERENCE_MAX_CHECKPOINTS` states; a
+    /// checkpointing step-seam cache holds more than one state and is covered only by the
+    /// checkpoint term.
+    #[test]
+    fn qwen35_admission_prices_every_recurrent_state_the_cache_holds() {
+        use crate::decode::{StepModel, StepRequest};
+        use crate::models::qwen35::{REFERENCE_MAX_CHECKPOINTS, STEP_MAX_CHECKPOINTS};
+        use crate::models::Qwen35Cache;
+        use crate::primitives::nn::input_ids;
+
+        let (cfg, model) = crate::models::qwen35::tests::text_model();
+        let one_state = qwen35_recurrent_admission_bytes(&cfg, 0);
+        assert!(one_state > 0);
+        let decoder = Decoder::Qwen35(model);
+        let geometry = decoder.memory_geometry();
+        assert_eq!(
+            geometry.recurrent_bytes,
+            one_state * (1 + REFERENCE_MAX_CHECKPOINTS as u64),
+            "the geometry charges the live state plus the provider cache's checkpoints"
+        );
+        // The admission estimate carries the whole recurrent term (charged once with MTP off).
+        let without = core_llm::LlmMemoryGeometry {
+            recurrent_bytes: 0,
+            ..geometry
+        };
+        let est = |g| core_llm::estimate_chunked_request_bytes(8, 4, g, 0, 0, 64).unwrap();
+        assert_eq!(est(geometry) - est(without), geometry.recurrent_bytes);
+
+        // What the provider's cache really holds at steady state (prefill + several steps).
+        let device = candle_core::Device::Cpu;
+        let mut cache = decoder.make_cache();
+        decoder
+            .step(&input_ids(&[1, 7, 3], &device).unwrap(), cache.as_mut(), 0)
+            .unwrap();
+        for (i, t) in [42, 9, 2, 11].into_iter().enumerate() {
+            decoder
+                .step(
+                    &input_ids(&[t], &device).unwrap(),
+                    cache.as_mut(),
+                    3 + i as i32,
+                )
+                .unwrap();
+        }
+        let held = cache.as_any_mut().downcast_mut::<Qwen35Cache>().unwrap();
+        assert_eq!(held.max_checkpoints(), REFERENCE_MAX_CHECKPOINTS);
+        assert!(
+            held.recurrent_bytes() as u64 <= geometry.recurrent_bytes,
+            "provider cache holds {} recurrent bytes, admission charges {}",
+            held.recurrent_bytes(),
+            geometry.recurrent_bytes
+        );
+
+        // A step-seam cache retains STEP_MAX_CHECKPOINTS states beyond the live one: one state of
+        // admission does not cover it; the checkpoint term does.
+        let Decoder::Qwen35(model) = &decoder else {
+            unreachable!()
+        };
+        let mut step = StepModel::new_cache(model);
+        model
+            .forward_step(&mut step, StepRequest::last(&[1, 7, 3]))
+            .unwrap();
+        for t in [42, 9, 2, 11] {
+            model
+                .forward_step(&mut step, StepRequest::last(&[t]))
+                .unwrap();
+        }
+        assert_eq!(step.checkpoint_offsets().len(), STEP_MAX_CHECKPOINTS);
+        assert!(
+            step.recurrent_bytes() as u64 > one_state,
+            "a checkpointing cache holds more than one recurrent state"
+        );
+        assert!(
+            step.recurrent_bytes() as u64
+                <= qwen35_recurrent_admission_bytes(&cfg, STEP_MAX_CHECKPOINTS),
+            "step cache holds {} recurrent bytes, its admission term is {}",
+            step.recurrent_bytes(),
+            qwen35_recurrent_admission_bytes(&cfg, STEP_MAX_CHECKPOINTS)
+        );
     }
 }

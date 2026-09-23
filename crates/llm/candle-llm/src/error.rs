@@ -36,6 +36,16 @@ pub enum Error {
     #[error("cancelled")]
     Canceled,
 
+    /// A cache was asked to roll back to position `n` but holds no checkpoint there (a recurrent
+    /// state cannot be inverted, so it refuses rather than approximate). `have` lists the positions
+    /// it could return to besides `0` and its current length. Typed so a speculative engine can
+    /// tell "no checkpoint" apart from a real failure and fall back (e.g. restore a clone).
+    #[error(
+        "no checkpoint at position {n} (have {have:?}); the recurrent state cannot be rolled back \
+         without one"
+    )]
+    RollbackUnavailable { n: i32, have: Vec<i32> },
+
     /// Anything else, with a human-readable message.
     #[error("{0}")]
     Msg(String),

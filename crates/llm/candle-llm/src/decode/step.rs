@@ -20,7 +20,7 @@ use crate::decode::stream::{
     default_seed, ConstraintMask, FinishReason, GenerationConfig, GenerationOutput, StreamEvent,
 };
 use crate::error::{Error, Result};
-use crate::primitives::decode_cache::DecodeCache;
+use crate::primitives::decode_cache::{CacheMemory, DecodeCache};
 use crate::primitives::sampler::{sample, SplitMix64};
 
 /// Which positions' logits a step returns.
@@ -89,7 +89,12 @@ pub trait StepModel {
 
     /// Run one step: feed `request.tokens` at positions `cache.len()..`, advance the cache by
     /// `tokens.len()`, and return the requested logits. An empty token slice is an error.
-    fn step(&self, cache: &mut Self::Cache, request: StepRequest<'_>) -> Result<StepOutput>;
+    ///
+    /// Named `forward_step` rather than `step` so a model that also implements the reference
+    /// [`Decode`](super::Decode) trait (whose method is `step`) has no ambiguous call site when both
+    /// traits are in scope.
+    fn forward_step(&self, cache: &mut Self::Cache, request: StepRequest<'_>)
+        -> Result<StepOutput>;
 }
 
 /// Generate from `prompt_ids` through the [`StepModel`] seam, returning the output and the
@@ -105,14 +110,17 @@ pub fn generate_step<M: StepModel>(
     on_event: &mut dyn FnMut(StreamEvent),
     constraint: Option<&mut dyn ConstraintMask>,
 ) -> Result<(GenerationOutput, DecodeRecord)> {
-    generate_step_timed(
+    let (output, record, _) = generate_step_timed(
         model, prompt_ids, config, cancel, on_event, constraint, None,
-    )
+    )?;
+    Ok((output, record))
 }
 
 /// [`generate_step`] with an optional prefill boundary callback, invoked once the prompt is in the
 /// cache and before the first token is sampled (the timed-provider / bench seam; the callback may
-/// synchronize the device).
+/// synchronize the device). Also returns the **final** cache's [`DecodeCache::memory`] — the state
+/// the request actually held at its last step, rollback checkpoints included — so a bench reports
+/// what a full-length request costs rather than a fresh cache's.
 pub fn generate_step_timed<M: StepModel>(
     model: &M,
     prompt_ids: &[i32],
@@ -121,7 +129,7 @@ pub fn generate_step_timed<M: StepModel>(
     on_event: &mut dyn FnMut(StreamEvent),
     mut constraint: Option<&mut dyn ConstraintMask>,
     mut on_prefill_complete: Option<&mut dyn FnMut() -> Result<()>>,
-) -> Result<(GenerationOutput, DecodeRecord)> {
+) -> Result<(GenerationOutput, DecodeRecord, CacheMemory)> {
     if cancel.is_cancelled() {
         return Err(Error::Canceled); // typed pre-inference cancel
     }
@@ -136,7 +144,7 @@ pub fn generate_step_timed<M: StepModel>(
 
     // Prefill the whole prompt at position 0; logits are for the last prompt position.
     let mut logits = model
-        .step(&mut cache, StepRequest::last(prompt_ids))?
+        .forward_step(&mut cache, StepRequest::last(prompt_ids))?
         .logits;
     forwards += 1;
     if let Some(boundary) = on_prefill_complete.as_mut() {
@@ -181,7 +189,9 @@ pub fn generate_step_timed<M: StepModel>(
         }
 
         // Feed the new token back at the cache's current length.
-        logits = model.step(&mut cache, StepRequest::last(&[next]))?.logits;
+        logits = model
+            .forward_step(&mut cache, StepRequest::last(&[next]))?
+            .logits;
         forwards += 1;
     }
 
@@ -201,13 +211,13 @@ pub fn generate_step_timed<M: StepModel>(
             finish_reason: finish,
         },
         record,
+        cache.memory(),
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::primitives::decode_cache::CacheMemory;
     use std::cell::Cell;
 
     /// A fixed-logits model whose cache is a bare counter, to exercise the driver's control flow.
@@ -234,7 +244,11 @@ mod tests {
             self.0 = 0;
         }
         fn memory(&self) -> CacheMemory {
-            CacheMemory::default()
+            // Grows with the cache, so a test can tell the final cache from a fresh one.
+            CacheMemory {
+                live_bytes: self.0 as usize * 4,
+                checkpoint_bytes: 1,
+            }
         }
     }
 
@@ -249,7 +263,11 @@ mod tests {
         fn vocab_size(&self) -> usize {
             self.vocab
         }
-        fn step(&self, cache: &mut CounterCache, request: StepRequest<'_>) -> Result<StepOutput> {
+        fn forward_step(
+            &self,
+            cache: &mut CounterCache,
+            request: StepRequest<'_>,
+        ) -> Result<StepOutput> {
             assert!(!request.tokens.is_empty());
             self.steps.set(self.steps.get() + 1);
             cache.0 += request.tokens.len() as i32;
@@ -377,7 +395,7 @@ mod tests {
             tokens_at_boundary.set(emitted.get());
             Ok(())
         };
-        generate_step_timed(
+        let (_, _, memory) = generate_step_timed(
             &model,
             &[1],
             &cfg,
@@ -394,5 +412,13 @@ mod tests {
         assert_eq!(boundary_hits.get(), 1);
         assert_eq!(tokens_at_boundary.get(), 0);
         assert_eq!(emitted.get(), 3);
+        // The memory is the final cache's: prompt (1) + two fed-back tokens = 3 positions.
+        assert_eq!(
+            memory,
+            CacheMemory {
+                live_bytes: 12,
+                checkpoint_bytes: 1
+            }
+        );
     }
 }

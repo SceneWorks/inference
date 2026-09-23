@@ -22,6 +22,13 @@
 //! token-for-token and, if not, the first divergence. Timing brackets the *decode* phase only
 //! (prefill is reported separately) with a device synchronize on both sides.
 //!
+//! Memory: `device_used_bytes_at_last_token` is `cuMemGetInfo` total-free sampled from the row's
+//! stream callback at its last generated token, while that row's cache is still alive (device-wide,
+//! so it includes the weights and any co-tenant); `peak_device_used_bytes` is the maximum over the
+//! rows and the post-load sample. The `step_model` row also reports its **final** cache's own
+//! accounting (`cache_live_bytes`, `cache_checkpoint_bytes`) - the rollback checkpoints included -
+//! returned by the step driver.
+//!
 //! The block between the `head-only` markers uses seams that do not exist on the pre-epic
 //! baseline (`StepModel`, host-sync accounting). `decode_bench.py baseline-source` rewrites this
 //! file into a copy that compiles against `d2b8cb335` by replacing that block with the stub in
@@ -33,8 +40,8 @@ use std::time::Instant;
 
 use candle_core::Device;
 use candle_llm::decode::{
-    generate_from_prefill, generate_qwen35_mtp_timed, CancelFlag, GenerationConfig,
-    GenerationOutput, SpeculativeStats,
+    generate_from_prefill, generate_qwen35_mtp_timed, CancelFlag, Decode, GenerationConfig,
+    GenerationOutput, SpeculativeStats, StreamEvent,
 };
 use candle_llm::device::select_device;
 use candle_llm::models::{Qwen35Config, Qwen35Model, Qwen35Mtp};
@@ -44,20 +51,45 @@ use serde_json::{json, Value};
 
 // >>> head-only
 use candle_llm::decode::generate_step_timed;
-use candle_llm::decode::StepModel;
+use candle_llm::decode::CountingDecode;
 use candle_llm::primitives::host_sync_count;
 
 fn host_syncs_now() -> Option<u64> {
     Some(host_sync_count())
 }
 
-/// The `StepModel` row: the same greedy loop as the reference, driven through the seam.
+/// The reference row with its target forwards **measured**: the loop runs through a
+/// `CountingDecode` and the direct `decode_logits` prefill is noted as one external forward.
+fn reference_row(
+    model: &Qwen35Model,
+    prompt: &[i32],
+    config: &GenerationConfig,
+    device: &Device,
+    on_event: &mut dyn FnMut(StreamEvent),
+) -> (GenerationOutput, f64, f64, Option<u64>) {
+    let counted = CountingDecode::new(model);
+    let (out, prefill, decode) = run_reference(model, &counted, prompt, config, device, on_event);
+    counted.note_external_forward(); // the `decode_logits` prefill `run_reference` issues directly
+    (out, prefill, decode, Some(counted.forwards()))
+}
+
+/// The `StepModel` row: the same greedy loop as the reference, driven through the seam. Returns
+/// the record's `(target_forwards, host_syncs)` and the **final** cache's `(live, checkpoint)`
+/// bytes - the state the timed request held at its last step.
+#[allow(clippy::type_complexity)]
 fn step_model_row(
     model: &Qwen35Model,
     prompt: &[i32],
     config: &GenerationConfig,
     device: &Device,
-) -> (GenerationOutput, f64, f64, Option<(u64, u64)>, Option<u64>) {
+    on_event: &mut dyn FnMut(StreamEvent),
+) -> (
+    GenerationOutput,
+    f64,
+    f64,
+    Option<(u64, u64)>,
+    Option<(u64, u64)>,
+) {
     let mut prefill_secs = 0.0;
     let started = Instant::now();
     let mut decode_started = None;
@@ -67,30 +99,24 @@ fn step_model_row(
         decode_started = Some(Instant::now());
         Ok(())
     };
-    let (out, record) = generate_step_timed(
+    let (out, record, memory) = generate_step_timed(
         model,
         prompt,
         config,
         &CancelFlag::new(),
-        &mut |_| {},
+        on_event,
         None,
         Some(&mut boundary),
     )
     .expect("step_model generation");
     device.synchronize().unwrap();
     let decode_secs = decode_started.unwrap().elapsed().as_secs_f64();
-    // The cache's own accounting for a full-length request, from a fresh replay of the prompt.
-    let mut cache = StepModel::new_cache(model);
-    model
-        .step(&mut cache, candle_llm::decode::StepRequest::last(prompt))
-        .unwrap();
-    let cache_bytes = cache.memory().total_bytes() as u64;
     (
         out,
         prefill_secs,
         decode_secs,
         Some((record.target_forwards, record.host_syncs)),
-        Some(cache_bytes),
+        Some((memory.live_bytes as u64, memory.checkpoint_bytes as u64)),
     )
 }
 // <<< head-only
@@ -103,12 +129,31 @@ fn host_syncs_now() -> Option<u64> {
     None
 }
 
+fn reference_row(
+    model: &Qwen35Model,
+    prompt: &[i32],
+    config: &GenerationConfig,
+    device: &Device,
+    on_event: &mut dyn FnMut(StreamEvent),
+) -> (GenerationOutput, f64, f64, Option<u64>) {
+    let (out, prefill, decode) = run_reference(model, model, prompt, config, device, on_event);
+    (out, prefill, decode, None)
+}
+
+#[allow(clippy::type_complexity)]
 fn step_model_row(
     _model: &Qwen35Model,
     _prompt: &[i32],
     _config: &GenerationConfig,
     _device: &Device,
-) -> (GenerationOutput, f64, f64, Option<(u64, u64)>, Option<u64>) {
+    _on_event: &mut dyn FnMut(StreamEvent),
+) -> (
+    GenerationOutput,
+    f64,
+    f64,
+    Option<(u64, u64)>,
+    Option<(u64, u64)>,
+) {
     unreachable!("the step_model row is not available on the pre-epic baseline")
 }
 "#;
@@ -195,12 +240,15 @@ fn load(snapshot: &Path, device: &Device) -> (Qwen35Model, Option<Qwen35Mtp>) {
     (model, mtp)
 }
 
-/// The pre-epic reference path: `decode_logits` prefill + the shared token-at-a-time loop.
-fn reference_row(
+/// The pre-epic reference path: `decode_logits` prefill + the shared token-at-a-time loop, driven
+/// through `decoder` (the model itself, or a counting wrapper around it on head).
+fn run_reference(
     model: &Qwen35Model,
+    decoder: &dyn Decode,
     prompt: &[i32],
     config: &GenerationConfig,
     device: &Device,
+    on_event: &mut dyn FnMut(StreamEvent),
 ) -> (GenerationOutput, f64, f64) {
     device.synchronize().unwrap();
     let started = Instant::now();
@@ -212,13 +260,13 @@ fn reference_row(
     let prefill_secs = started.elapsed().as_secs_f64();
     let decode_started = Instant::now();
     let out = generate_from_prefill(
-        model,
+        decoder,
         &mut cache,
         first,
         prompt.to_vec(),
         config,
         &CancelFlag::new(),
-        &mut |_| {},
+        on_event,
         None,
     )
     .expect("reference generation");
@@ -233,6 +281,7 @@ fn mtp_row(
     config: &GenerationConfig,
     drafts: u32,
     device: &Device,
+    on_event: &mut dyn FnMut(StreamEvent),
 ) -> (GenerationOutput, SpeculativeStats, f64, f64) {
     device.synchronize().unwrap();
     let started = Instant::now();
@@ -251,7 +300,7 @@ fn mtp_row(
         config,
         drafts,
         &CancelFlag::new(),
-        &mut |_| {},
+        on_event,
         None,
         &mut boundary,
     )
@@ -281,8 +330,8 @@ fn row_json(
     proposed: Option<u64>,
     accepted: Option<u64>,
     host_syncs: Option<u64>,
-    device_used_after: Option<u64>,
-    cache_logical_bytes: Option<u64>,
+    device_used_at_last_token: Option<u64>,
+    cache: Option<(u64, u64)>,
 ) -> Value {
     let generated = out.tokens.len() as u64;
     let ratio = |num: Option<u64>, den: u64| -> Value {
@@ -311,12 +360,59 @@ fn row_json(
         "target_forwards_per_generated_token": ratio(forwards, generated),
         "host_syncs": host_syncs,
         "host_syncs_per_token": ratio(host_syncs, generated),
-        "device_used_bytes_after": device_used_after,
-        "cache_logical_bytes": cache_logical_bytes,
+        "device_used_bytes_at_last_token": device_used_at_last_token,
+        "cache_live_bytes": cache.map(|(live, _)| live),
+        "cache_checkpoint_bytes": cache.map(|(_, checkpoint)| checkpoint),
         "tokens_match_reference": matches,
         "first_divergence": diverged.flatten(),
         "tokens": out.tokens,
     })
+}
+
+/// Checks the `step_model` row's final-cache accounting: once a request has taken a single-token
+/// step after the prefill (`new_tokens >= 2`), the step-seam cache holds a real rollback
+/// checkpoint, so `checkpoint_bytes == 0` would mean the bench is reading a cache that never
+/// decoded (the E6 bytes it exists to report would be missing).
+fn checked_step_cache(new_tokens: usize, cache: Option<(u64, u64)>) -> Option<(u64, u64)> {
+    if let Some((live, checkpoint)) = cache {
+        assert!(live > 0, "step_model cache reports no live bytes");
+        if new_tokens >= 2 {
+            assert!(
+                checkpoint > 0,
+                "step_model cache reports no checkpoint bytes after {new_tokens} tokens"
+            );
+        }
+    }
+    cache
+}
+
+/// A stream callback that samples device memory at the row's last generated token, while the row's
+/// cache is still alive (the device synchronize it implies lands at the end of the timed decode).
+fn last_token_sampler<'a>(
+    device: &'a Device,
+    new_tokens: usize,
+    slot: &'a mut Option<u64>,
+) -> impl FnMut(StreamEvent) + 'a {
+    move |event| {
+        if let StreamEvent::Token { step, .. } = event {
+            if step + 1 == new_tokens {
+                *slot = device_used_bytes(device);
+            }
+        }
+    }
+}
+
+#[test]
+fn step_cache_accepts_checkpoint_bytes_and_single_token_runs() {
+    assert_eq!(checked_step_cache(2, Some((10, 5))), Some((10, 5)));
+    assert_eq!(checked_step_cache(1, Some((10, 0))), Some((10, 0)));
+    assert_eq!(checked_step_cache(256, None), None);
+}
+
+#[test]
+#[should_panic(expected = "no checkpoint bytes after 2 tokens")]
+fn step_cache_without_checkpoint_bytes_after_two_tokens_is_refused() {
+    checked_step_cache(2, Some((10, 0)));
 }
 
 #[test]
@@ -362,11 +458,18 @@ fn decode_bench() {
     let mut reference_tokens: Option<Vec<i32>> = None;
 
     if rows.iter().any(|r| r == "reference") {
-        reference_row(&model, &prompt, &warm, &device);
+        reference_row(&model, &prompt, &warm, &device, &mut |_| {});
         let syncs0 = host_syncs_now();
-        let (out, prefill, decode) = reference_row(&model, &prompt, &config, &device);
+        let mut at_last = None;
+        let (out, prefill, decode, forwards) = reference_row(
+            &model,
+            &prompt,
+            &config,
+            &device,
+            &mut last_token_sampler(&device, new_tokens, &mut at_last),
+        );
         let syncs = host_syncs_now().zip(syncs0).map(|(a, b)| a - b);
-        let used = note_peak(device_used_bytes(&device));
+        let used = note_peak(at_last);
         eprintln!(
             "[decode_bench] reference        {:>7.2} tok/s  prefill {:.3}s",
             out.tokens.len() as f64 / decode,
@@ -379,7 +482,7 @@ fn decode_bench() {
             None,
             prefill,
             decode,
-            Some(out.tokens.len() as u64),
+            forwards,
             None,
             None,
             syncs,
@@ -390,10 +493,17 @@ fn decode_bench() {
     }
 
     if rows.iter().any(|r| r == "step_model") {
-        step_model_row(&model, &prompt, &warm, &device);
-        let (out, prefill, decode, record, cache_bytes) =
-            step_model_row(&model, &prompt, &config, &device);
-        let used = note_peak(device_used_bytes(&device));
+        step_model_row(&model, &prompt, &warm, &device, &mut |_| {});
+        let mut at_last = None;
+        let (out, prefill, decode, record, cache) = step_model_row(
+            &model,
+            &prompt,
+            &config,
+            &device,
+            &mut last_token_sampler(&device, new_tokens, &mut at_last),
+        );
+        let cache = checked_step_cache(new_tokens, cache);
+        let used = note_peak(at_last);
         eprintln!(
             "[decode_bench] step_model       {:>7.2} tok/s  prefill {:.3}s",
             out.tokens.len() as f64 / decode,
@@ -415,7 +525,7 @@ fn decode_bench() {
             None,
             syncs,
             used,
-            cache_bytes,
+            cache,
         ));
         if reference_tokens.is_none() {
             reference_tokens = Some(out.tokens);
@@ -425,11 +535,20 @@ fn decode_bench() {
     if rows.iter().any(|r| r == "mtp") {
         let mtp = mtp.as_ref().expect("snapshot carries a complete MTP head");
         for &k in &drafts {
-            mtp_row(&model, mtp, &prompt, &warm, k, &device);
+            mtp_row(&model, mtp, &prompt, &warm, k, &device, &mut |_| {});
             let syncs0 = host_syncs_now();
-            let (out, stats, prefill, decode) = mtp_row(&model, mtp, &prompt, &config, k, &device);
+            let mut at_last = None;
+            let (out, stats, prefill, decode) = mtp_row(
+                &model,
+                mtp,
+                &prompt,
+                &config,
+                k,
+                &device,
+                &mut last_token_sampler(&device, new_tokens, &mut at_last),
+            );
             let syncs = host_syncs_now().zip(syncs0).map(|(a, b)| a - b);
-            let used = note_peak(device_used_bytes(&device));
+            let used = note_peak(at_last);
             eprintln!(
                 "[decode_bench] mtp K={k}          {:>7.2} tok/s  accept {:.3}  fwd/tok {:.3}",
                 out.tokens.len() as f64 / decode,
@@ -458,7 +577,7 @@ fn decode_bench() {
     }
 
     let mut doc = BTreeMap::new();
-    doc.insert("schema_version", json!(1));
+    doc.insert("schema_version", json!(2));
     doc.insert("suite", json!("decode_bench"));
     doc.insert("label", json!(label));
     doc.insert("snapshot", json!(snapshot.display().to_string()));
@@ -475,7 +594,17 @@ fn decode_bench() {
     doc.insert("peak_device_used_bytes", json!(peak_used));
     doc.insert(
         "device_memory_scope",
-        json!("cuMemGetInfo total-free on the selected device: device-wide, includes co-tenants"),
+        json!(
+            "cuMemGetInfo total-free on the selected device, sampled at each row's last generated \
+             token while its cache is alive: device-wide, includes weights and co-tenants"
+        ),
+    );
+    doc.insert(
+        "cache_memory_scope",
+        json!(
+            "step_model row: the final cache's own logical accounting after the timed run \
+             (live state; rollback checkpoints counted separately)"
+        ),
     );
     doc.insert("rows", json!(rows_json));
     if let Some(parent) = output.parent() {

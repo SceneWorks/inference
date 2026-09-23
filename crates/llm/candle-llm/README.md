@@ -168,10 +168,14 @@ than bit-matches) non-speculative because the multi-token verify kernel rounds a
 differently from the single-token decode kernel.
 
 The `decode_step_parity` and `decode_bench` suites belong to the Blackwell fast-decode epic
-(sc-24128). Its two seams live in `decode::StepModel` (one N-token step returning last/all-position
-logits against a cache) and `primitives::DecodeCache` (length, `rollback_to(n)`, reset, memory
-accounting); `Qwen35Model` / `Qwen35Cache` implement both, the hybrid cache rolling back by narrowing
-the KV and restoring a checkpoint of the DeltaNet state taken at every step start. Every path ends in
+(sc-24128). Its two seams live in `decode::StepModel` (`forward_step`: one N-token step returning
+last/all-position logits against a cache) and `primitives::DecodeCache` (length, `rollback_to(n)`,
+reset, memory accounting); `Qwen35Model` / `Qwen35Cache` implement both, the hybrid cache rolling back
+by narrowing the KV and restoring a checkpoint of the DeltaNet state taken at every step start. Only
+step-seam caches retain checkpoints (`STEP_MAX_CHECKPOINTS` = 2, each a full recurrent state); the
+reference/MTP caches the provider builds retain none, and request admission prices
+`1 + REFERENCE_MAX_CHECKPOINTS` recurrent states. A refused rollback is the typed
+`Error::RollbackUnavailable`. Every path ends in
 a measured `decode::DecodeRecord` (path taken, target forwards, proposed/accepted tokens, host syncs);
 the provider exposes the last one through `LlamaProvider::last_decode_record`. The reference `Decode`
 loop is unchanged and stays the parity oracle.

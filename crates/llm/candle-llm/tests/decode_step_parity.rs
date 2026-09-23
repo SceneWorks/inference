@@ -135,12 +135,14 @@ fn ac2_rollback_then_redecode_matches_fresh_decode_on_real_weights() {
 
     // Rolled back: prefill tokens[..n], decode tokens[n..m] one at a time, roll back to n.
     let mut cache = StepModel::new_cache(&model);
-    cache.set_max_checkpoints(16); // keep every step start of this run (default is two)
+    cache.set_max_checkpoints(16); // keep every step start of this run (the step seam keeps two)
     model
-        .step(&mut cache, StepRequest::last(&tokens[..n]))
+        .forward_step(&mut cache, StepRequest::last(&tokens[..n]))
         .unwrap();
     for t in &tokens[n..m] {
-        model.step(&mut cache, StepRequest::last(&[*t])).unwrap();
+        model
+            .forward_step(&mut cache, StepRequest::last(&[*t]))
+            .unwrap();
     }
     assert_eq!(cache.len(), m as i32);
     let before = cache.memory();
@@ -149,7 +151,7 @@ fn ac2_rollback_then_redecode_matches_fresh_decode_on_real_weights() {
     let after = cache.memory();
     assert!(after.total_bytes() < before.total_bytes());
     let replayed = model
-        .step(&mut cache, StepRequest::last(&tokens[n..n + 1]))
+        .forward_step(&mut cache, StepRequest::last(&tokens[n..n + 1]))
         .unwrap()
         .logits;
     let (a, b) = (host(&fresh_logits), host(&replayed));

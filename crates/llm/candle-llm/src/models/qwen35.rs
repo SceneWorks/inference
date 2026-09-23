@@ -598,11 +598,23 @@ struct DeltaCheckpoint {
     states: Vec<(usize, DeltaNetCache)>,
 }
 
-/// How many rollback checkpoints a [`Qwen35Cache`] retains by default: the position the current
-/// step started from (what a speculative verify rolls back to) plus one earlier. Each checkpoint
-/// pins every linear layer's recurrent state — ~147 MB on Qwen3.8-27B (48 layers × 32×128×128 f32)
-/// — so deeper history is opt-in via [`Qwen35Cache::set_max_checkpoints`].
-pub const DEFAULT_MAX_CHECKPOINTS: usize = 2;
+/// Rollback checkpoints retained by a cache built through [`Qwen35Model::new_cache`] (and so
+/// `Decode::make_cache`) — the reference and MTP paths the provider runs. Neither calls
+/// [`Qwen35Cache::rollback_to`] (the MTP loop restores a clone), so they retain **none**: such a
+/// cache holds exactly one recurrent state, which is what request admission charges (E6). The
+/// provider's `memory_geometry` prices `1 + REFERENCE_MAX_CHECKPOINTS` recurrent states, so raising
+/// this constant raises admission with it.
+pub const REFERENCE_MAX_CHECKPOINTS: usize = 0;
+
+/// Rollback checkpoints retained by a cache built through the [`StepModel`] seam
+/// ([`StepModel::new_cache`]) — the callers that roll back (the speculative verify of S2): the
+/// position the current step started from plus one earlier. Each checkpoint pins every linear
+/// layer's recurrent state — on Qwen3.8-27B ~151 MB of SSM state (48 linear layers × 48 value heads
+/// × 128 × 128 × 4 B) plus a ~6 MB conv tail — so at steady state a step cache holds three recurrent
+/// states (live + two checkpoints). A caller that admits step-seam requests must price
+/// `1 + STEP_MAX_CHECKPOINTS` states; deeper history is opt-in via
+/// [`Qwen35Cache::set_max_checkpoints`].
+pub const STEP_MAX_CHECKPOINTS: usize = 2;
 
 /// The per-layer cache slot — a recurrent [`DeltaNetCache`] for linear layers, growing KV for
 /// full-attention layers.
@@ -622,6 +634,10 @@ pub enum Qwen35LayerCache {
 /// back to the position the verify step started from) — and refuses positions it has no checkpoint
 /// for rather than approximating them. Per-position checkpoints inside a multi-token forward are the
 /// DeltaNet-checkpoint story (S3) and plug in behind the same method.
+///
+/// Retention depends on who built the cache: [`Qwen35Model::new_cache`] (reference / MTP paths)
+/// keeps [`REFERENCE_MAX_CHECKPOINTS`] (none), [`StepModel::new_cache`] keeps
+/// [`STEP_MAX_CHECKPOINTS`].
 #[derive(Clone, Debug)]
 pub struct Qwen35Cache {
     layers: Vec<Qwen35LayerCache>,
@@ -665,6 +681,22 @@ impl Qwen35Cache {
     pub fn set_max_checkpoints(&mut self, max: usize) {
         self.max_checkpoints = max;
         self.prune_checkpoints();
+    }
+
+    /// How many rollback checkpoints this cache retains.
+    pub fn max_checkpoints(&self) -> usize {
+        self.max_checkpoints
+    }
+
+    /// Logical bytes of recurrent (Gated DeltaNet) state referenced by the cache: the live linear
+    /// layers' states plus every checkpoint's. The attention KV is excluded — this is the term
+    /// admission prices as `recurrent_bytes` (see `REFERENCE_MAX_CHECKPOINTS`).
+    pub fn recurrent_bytes(&self) -> usize {
+        let live = self.layers.iter().fold(0usize, |acc, l| match l {
+            Qwen35LayerCache::Delta(c) => acc.saturating_add(delta_bytes(c)),
+            Qwen35LayerCache::Attn(_) => acc,
+        });
+        live.saturating_add(self.memory().checkpoint_bytes)
     }
 
     /// The positions [`rollback_to`](Self::rollback_to) can currently return to, ascending
@@ -711,8 +743,9 @@ impl Qwen35Cache {
     /// Roll the cache back so the next step continues from position `n` (see
     /// [`DecodeCache::rollback_to`]): the full-attention KV is narrowed to `n` and the linear
     /// layers' recurrent state is restored from the checkpoint taken at `n`. `n == offset()` is a
-    /// no-op and `n == 0` is a [`reset`](Self::reset); any other `n` without a checkpoint is an
-    /// error and leaves the cache untouched.
+    /// no-op and `n == 0` is a [`reset`](Self::reset); any other `n` without a checkpoint is
+    /// [`Error::RollbackUnavailable`] (typed, so a speculative engine can fall back without matching
+    /// message text) and leaves the cache untouched. `n` outside `0..=offset()` is [`Error::Msg`].
     pub fn rollback_to(&mut self, n: i32) -> Result<()> {
         let cur = self.offset();
         if n < 0 || n > cur {
@@ -731,12 +764,9 @@ impl Qwen35Cache {
             .checkpoints
             .iter()
             .rposition(|c| c.offset == n)
-            .ok_or_else(|| {
-                Error::Msg(format!(
-                    "Qwen35Cache: no checkpoint at position {n} (have {:?}); the DeltaNet state \
-                     cannot be rolled back without one",
-                    self.checkpoint_offsets()
-                ))
+            .ok_or_else(|| Error::RollbackUnavailable {
+                n,
+                have: self.checkpoint_offsets(),
             })?;
         let checkpoint = self.checkpoints[idx].clone();
         for (i, state) in checkpoint.states {
@@ -1204,8 +1234,15 @@ impl Qwen35Model {
         self.dtype
     }
 
-    /// A fresh per-layer cache (linear vs full-attn slot per the schedule).
+    /// A fresh per-layer cache (linear vs full-attn slot per the schedule) for the reference and MTP
+    /// paths: it retains [`REFERENCE_MAX_CHECKPOINTS`] (no) rollback checkpoints.
     pub fn new_cache(&self) -> Qwen35Cache {
+        self.new_cache_with_checkpoints(REFERENCE_MAX_CHECKPOINTS)
+    }
+
+    /// A fresh cache that retains up to `max_checkpoints` rollback checkpoints (see
+    /// [`Qwen35Cache::rollback_to`]); each costs one recurrent state of device memory.
+    pub fn new_cache_with_checkpoints(&self, max_checkpoints: usize) -> Qwen35Cache {
         let layers = (0..self.cfg.num_layers)
             .map(|i| {
                 if self.cfg.is_linear(i) {
@@ -1218,7 +1255,7 @@ impl Qwen35Model {
         Qwen35Cache {
             layers,
             checkpoints: Vec::new(),
-            max_checkpoints: DEFAULT_MAX_CHECKPOINTS,
+            max_checkpoints,
         }
     }
 
@@ -1847,8 +1884,10 @@ impl KvCache for Qwen35Cache {
 impl StepModel for Qwen35Model {
     type Cache = Qwen35Cache;
 
+    /// A cache that retains [`STEP_MAX_CHECKPOINTS`] rollback checkpoints — the step seam's callers
+    /// (the speculative verify) roll back through them.
     fn new_cache(&self) -> Qwen35Cache {
-        Qwen35Model::new_cache(self)
+        self.new_cache_with_checkpoints(STEP_MAX_CHECKPOINTS)
     }
 
     fn device(&self) -> &Device {
@@ -1859,9 +1898,15 @@ impl StepModel for Qwen35Model {
         self.cfg.vocab_size as usize
     }
 
-    fn step(&self, cache: &mut Qwen35Cache, request: StepRequest<'_>) -> Result<StepOutput> {
+    fn forward_step(
+        &self,
+        cache: &mut Qwen35Cache,
+        request: StepRequest<'_>,
+    ) -> Result<StepOutput> {
         if request.tokens.is_empty() {
-            return Err(Error::Msg("Qwen35Model::step: empty token slice".into()));
+            return Err(Error::Msg(
+                "Qwen35Model::forward_step: empty token slice".into(),
+            ));
         }
         let offset = cache.offset();
         let ids = input_ids(request.tokens, &self.device)?;
@@ -1957,7 +2002,7 @@ impl crate::models::VlmDecode for Qwen35Model {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
@@ -2532,7 +2577,7 @@ mod tests {
         );
     }
 
-    fn text_model() -> (Qwen35Config, Qwen35Model) {
+    pub(crate) fn text_model() -> (Qwen35Config, Qwen35Model) {
         let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
         let model = Qwen35Model::from_weights(
             &synthetic_weights(&cfg),
@@ -2749,25 +2794,33 @@ mod tests {
     #[test]
     fn rollback_is_exact_or_refused() {
         let (_cfg, model) = text_model();
-        let mut cache = model.new_cache();
+        let mut cache = StepModel::new_cache(&model);
+        assert_eq!(cache.max_checkpoints(), STEP_MAX_CHECKPOINTS);
         model
             .decode_logits(&ids(&[1, 7, 3, 42]), &mut cache, 0)
             .unwrap();
         assert!(cache.rollback_to(4).is_ok(), "current position is a no-op");
         assert_eq!(cache.offset(), 4);
-        let err = cache.rollback_to(2).unwrap_err().to_string();
-        assert!(err.contains("no checkpoint at position 2"), "{err}");
+        // Refused with the typed variant (the S2 speculative engine matches on it, not on text).
+        match cache.rollback_to(2) {
+            Err(Error::RollbackUnavailable { n: 2, have }) => assert_eq!(have, vec![0]),
+            other => panic!("expected RollbackUnavailable {{ n: 2, have: [0] }}, got {other:?}"),
+        }
         assert_eq!(
             cache.offset(),
             4,
             "a refused rollback leaves the cache untouched"
         );
-        assert!(cache.rollback_to(5).is_err(), "past the end");
-        assert!(cache.rollback_to(-1).is_err());
+        // Out of range is a plain error, not "no checkpoint".
+        assert!(
+            matches!(cache.rollback_to(5), Err(Error::Msg(_))),
+            "past the end"
+        );
+        assert!(matches!(cache.rollback_to(-1), Err(Error::Msg(_))));
         assert_eq!(
             cache.checkpoint_offsets(),
             vec![0],
-            "default retention keeps the newest two"
+            "one forward so far: only its start is checkpointed"
         );
         cache.rollback_to(0).unwrap();
         assert_eq!(cache.offset(), 0);
@@ -2780,7 +2833,10 @@ mod tests {
         model.decode_logits(&ids(&[3]), &mut cache, 2).unwrap();
         model.decode_logits(&ids(&[42]), &mut cache, 3).unwrap();
         assert_eq!(cache.checkpoint_offsets(), vec![3]);
-        assert!(cache.rollback_to(2).is_err());
+        assert!(matches!(
+            cache.rollback_to(2),
+            Err(Error::RollbackUnavailable { n: 2, .. })
+        ));
         cache.rollback_to(3).unwrap();
         assert_eq!(cache.offset(), 3);
 
@@ -2789,6 +2845,22 @@ mod tests {
         crate::decode::Decode::step(&model, &ids(&[9]), dyn_cache, 3).unwrap();
         assert!(dyn_cache.truncate(3).is_ok());
         assert_eq!(dyn_cache.offset(), 3);
+
+        // The reference / MTP cache (`new_cache`, what `Decode::make_cache` boxes) retains no
+        // checkpoints, so it holds one recurrent state — and refuses any interior rollback.
+        let mut reference = model.new_cache();
+        assert_eq!(reference.max_checkpoints(), REFERENCE_MAX_CHECKPOINTS);
+        model
+            .decode_logits(&ids(&[1, 7, 3]), &mut reference, 0)
+            .unwrap();
+        model.decode_logits(&ids(&[42]), &mut reference, 3).unwrap();
+        model.decode_logits(&ids(&[9]), &mut reference, 4).unwrap();
+        assert!(reference.checkpoint_offsets().is_empty());
+        assert_eq!(reference.memory().checkpoint_bytes, 0);
+        match reference.rollback_to(4) {
+            Err(Error::RollbackUnavailable { n: 4, have }) => assert!(have.is_empty()),
+            other => panic!("expected RollbackUnavailable {{ n: 4, have: [] }}, got {other:?}"),
+        }
     }
 
     /// The memory accounting follows the live tensors and the checkpoints, and a rollback drops
@@ -2796,7 +2868,7 @@ mod tests {
     #[test]
     fn memory_accounting_tracks_live_state_and_checkpoints() {
         let (cfg, model) = text_model();
-        let mut cache = model.new_cache();
+        let mut cache = StepModel::new_cache(&model);
         assert_eq!(cache.memory(), CacheMemory::default());
         model
             .decode_logits(&ids(&[1, 7, 3]), &mut cache, 0)
@@ -2823,6 +2895,17 @@ mod tests {
             after_step.checkpoint_bytes > 0,
             "the position-3 checkpoint holds real states"
         );
+        // The recurrent share: the live linear-layer states plus the one real checkpoint (the
+        // position-0 checkpoint is empty) — two states' worth.
+        assert_eq!(
+            cache.recurrent_bytes(),
+            after_step.live_bytes - kv_bytes * 4 / 3 + after_step.checkpoint_bytes
+        );
+        assert_eq!(
+            cache.recurrent_bytes(),
+            2 * after_step.checkpoint_bytes,
+            "live recurrent state + one checkpoint of the same size"
+        );
         cache.rollback_to(3).unwrap();
         assert_eq!(cache.memory().live_bytes, after_prefill.live_bytes);
         assert_eq!(
@@ -2844,7 +2927,7 @@ mod tests {
             cfg.clone(),
         )
         .unwrap();
-        let mut cache = model.new_cache();
+        let mut cache = StepModel::new_cache(&model);
         model
             .decode_logits(&ids(&[1, 7, 3]), &mut cache, 0)
             .unwrap();
@@ -2929,13 +3012,13 @@ mod tests {
         let hidden = cfg.hidden_size as usize;
         let mut cache = StepModel::new_cache(&model);
         let out = model
-            .step(&mut cache, StepRequest::all(&[1, 7, 3]))
+            .forward_step(&mut cache, StepRequest::all(&[1, 7, 3]))
             .unwrap();
         assert_eq!(out.logits.dims(), &[1, 3, vocab]);
         assert!(out.hidden.is_none());
         assert_eq!(cache.len(), 3);
         let out = model
-            .step(
+            .forward_step(
                 &mut cache,
                 StepRequest {
                     tokens: &[42, 9],
@@ -2948,7 +3031,7 @@ mod tests {
         assert_eq!(out.hidden.unwrap().dims(), &[1, 2, hidden]);
         assert_eq!(cache.len(), 5);
         let out = model
-            .step(
+            .forward_step(
                 &mut cache,
                 StepRequest {
                     tokens: &[2],
@@ -2959,7 +3042,9 @@ mod tests {
             .unwrap();
         assert_eq!(out.logits.dims(), &[1, 1, vocab]);
         assert_eq!(out.hidden.unwrap().dims(), &[1, 1, hidden]);
-        assert!(model.step(&mut cache, StepRequest::last(&[])).is_err());
+        assert!(model
+            .forward_step(&mut cache, StepRequest::last(&[]))
+            .is_err());
         assert_eq!(StepModel::vocab_size(&model), vocab);
         // The last-logits step equals the reference `decode_logits` at the same position.
         let mut reference = model.new_cache();
@@ -2968,7 +3053,7 @@ mod tests {
             .unwrap();
         let a = model.decode_logits(&ids(&[11]), &mut reference, 6).unwrap();
         let b = model
-            .step(&mut cache, StepRequest::last(&[11]))
+            .forward_step(&mut cache, StepRequest::last(&[11]))
             .unwrap()
             .logits;
         assert!(max_abs_diff(&a, &b) < 1e-4);
