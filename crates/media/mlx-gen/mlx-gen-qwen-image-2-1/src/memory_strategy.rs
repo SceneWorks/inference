@@ -48,11 +48,13 @@ use crate::quant::{Tier, GROUP_SIZE};
 /// [`MemoryCalibrationIdentity`], so it is deliberately absent from the string.
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "qwen-image-2-1-mlx-derived-2026-09-22-v1";
 
-/// The decode tile edges this route publishes. **Derived, not a measured ladder**: 512 is the
-/// crate's shipped default ([`DECODE_TILE_EDGE`]) and the neighbours bracket it on the same 64-px
-/// overlap. A measured ladder (the 2512 route has one) is the terminal story's to establish; until
-/// then the published domain is deliberately narrow so a caller cannot select a geometry no one has
-/// ever exercised.
+/// The decode tile edges this route publishes — **derived defaults, pending the epic-end
+/// campaign**, not a measured ladder. 512 is the crate's shipped default ([`DECODE_TILE_EDGE`]) and
+/// the neighbours bracket it on the same 64-px overlap; 768 and 640 are published on the strength
+/// of the 2512 route's measured ladder (same 16x autoencoder family, same overlap), not on a run of
+/// this VAE. The terminal story's measurement campaign is what turns these into a measured ladder;
+/// until then the domain is deliberately narrow so a caller cannot select a geometry no sibling has
+/// ever exercised, and nothing here claims a measurement.
 pub const DECODE_TILE_EDGES: &[u32] = &[768, 640, 512, 384, 256];
 
 // ================================================================================================
@@ -76,6 +78,14 @@ pub mod derived {
                                   NOT measured on device";
 
     // ── Parameter counts, from the frozen snapshot's safetensors headers ────────────────────────
+    //
+    // Verified against the frozen snapshot's headers (`UPSTREAM_HF_REVISION`
+    // 790c92633540aa0cb11d9abf19eb46d861714758) on 2026-09-22 by
+    // `tiers::derived_parameter_counts_match_the_frozen_snapshot` (header reads only): the
+    // loaded `model.language_model.*` tower prices 15_136_811_008 B, `transformer/`
+    // 14_230_249_472 B and `vae/` 1_350_961_616 B at bf16/bf16/f32 — exactly what
+    // `resident_weights(Tier::Bf16)` derives from the four counts below. That test stays
+    // `#[ignore]`d only because it needs the 31 GB snapshot on disk; re-run it on any pin bump.
 
     /// Parameters in the DiT's 232 group-quantizable 2-D `Linear` weights.
     pub const DIT_LINEAR_PARAMS: u64 = 7_115_112_448;
@@ -453,8 +463,9 @@ fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
 ///
 /// * a **packed** tier is already in its resident form on disk, so it prices
 ///   [`ResidentProjection::Stored`]; a **dense** snapshot with a Q4/Q8 request is quantized at load,
-///   so it prices [`ResidentProjection::GroupQuantized`] at the tier's per-component bit-width
-///   (which is *not* uniform — the language tower has a declared Q4 floor);
+///   so it prices [`ResidentProjection::GroupQuantized`] at the tier's bit-width — one width for
+///   every packable component, because a tier is a whole-pipeline contract (the earlier Q8 tower
+///   floor on the q4 tier was withdrawn; `Tier::text_encoder_bits == Tier::transformer_bits`);
 /// * the language tower prices the loaded `model.language_model.*` prefix only. The checkpoint's
 ///   untied `lm_head` and the whole `model.visual.*` tower are on disk but materialized by nothing
 ///   on this route, so they are [`ResidentProjection::Omit`] — charging them would bill ~2.4 GB of
@@ -502,9 +513,11 @@ fn resolved_tier(spec: &LoadSpec, root: &Path) -> CoreResult<Tier> {
     crate::quant::needs_load_time_quant(root, spec.quantize)?;
     match crate::quant::installed_tier(root)? {
         Tier::Bf16 => Tier::from_selected(spec.quantize).ok_or_else(|| {
-            CoreError::Unsupported(format!(
-                "{MODEL_ID}: {:?} is not an MLX affine tier (Q4/Q8)",
-                spec.quantize
+            // Unreachable in practice — `needs_load_time_quant` refused a non-affine request one
+            // line up — but the refusal wording stays the shared one.
+            CoreError::Unsupported(spec.quantize.map_or_else(
+                || format!("{MODEL_ID}: a dense snapshot resolves to the bf16 tier"),
+                crate::quant::non_affine_quant_refusal,
             ))
         }),
         installed => Ok(installed),
@@ -803,8 +816,8 @@ mod tests {
         }
     }
 
-    /// The tier ladder is strictly monotone in every component that packs, the VAE never moves, and
-    /// the Q4 tier's text encoder equals the Q8 tier's — the declared floor, visible in the numbers.
+    /// The tier ladder is strictly monotone in every component that packs — the tower included,
+    /// since a q4 tier runs a q4 tower — and the VAE never moves.
     #[test]
     fn the_derived_tier_ladder_is_strictly_monotone_in_every_packable_component() {
         let bf16 = resident_weights(Tier::Bf16);

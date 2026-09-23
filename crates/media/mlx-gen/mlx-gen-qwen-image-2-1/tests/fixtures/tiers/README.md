@@ -66,6 +66,7 @@ a tier is a whole-pipeline contract, so selecting q4 runs q4 everywhere.
 
 The production tiers are produced by the same converter from the frozen
 `Qwen/Qwen-Image-2.1` snapshot and re-hosted at **`SceneWorks/qwen-image-2-1-mlx`**, one subdirectory
-per tier (`q8/`, `q4/`), each carrying the `SHA256SUMS` manifest the example writes beside it. That
+per tier (`q8/`, `q4/`), each carrying the `CHANGES.md` change record and the `SHA256SUMS` manifest
+the converter itself writes beside the weights (`convert::prequantize_turnkey`, sc-24114). That
 is the repository the SceneWorks manifest half pins. Until that upload happens the tiers are
 `supported_quants` a caller cannot yet download; the terminal story owns closing that gap.

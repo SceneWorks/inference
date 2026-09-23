@@ -439,7 +439,8 @@ than the target's own token count: `reference::prepare` fits every condition ima
   re-encodes at every step. Reference-heavy requests scale with `steps × references` here where
   upstream scales with `references + steps`.
 * Latents stay f32 between Euler steps (upstream rounds to bf16 each step).
-* The text tower runs f32 activations (upstream: bf16 end to end).
+* On the **CPU parity lane** the text tower runs f32 (upstream: bf16 end to end). On CUDA/Metal
+  it runs bf16 end to end **like upstream** — see *Compute dtype* below (sc-24114).
 * Noise is seeded from the shared launch-portable CPU `StdRng` (`candle_gen::seed`), not torch's
   generator; seed parity across frameworks is not a goal.
 * RGB emission composites the RGBA decode over white — the `OutputChannels::Rgb` default.
@@ -465,8 +466,15 @@ than the target's own token count: `reference::prepare` fits every condition ima
 * Noise draw and per-image seed derivation come from `candle_gen::seed` (`image_seed`,
   `seeded_normal_vec`), so a seed reproduces within the candle backend but not across the two
   engines.
-* Compute dtype is the backend's: f32 on CPU (the parity lane), bf16 on CUDA/Metal — where MLX
-  always loads at the checkpoint's on-disk dtype.
+* **Compute dtype** is the backend's, for *every* component: f32 on CPU (the parity lane), bf16 on
+  CUDA/Metal — where MLX always loads at the checkpoint's on-disk dtype. That includes the Qwen3-VL
+  text encoder (language tower and ViT): `loader::load_text_encoder_from` builds the tower's
+  `VarBuilder` at `compute_dtype()`, so a CUDA/Metal build runs the tower in bf16 exactly as
+  upstream's `QwenImage21Pipeline` runs `Qwen3VLForConditionalGeneration` (`torch_dtype=bfloat16`),
+  and the memory contract prices it at 2 B/param — the resident-bytes basis the SceneWorks floors
+  were derived at. Until sc-24114 the tower was read at f32 on every backend and priced at
+  4 B/param, which put the candle bf16 resident set at ~42.7 GiB against the 28.61 GiB the
+  derivation states. The S2/S3/S4 CPU parity lanes are unchanged: `compute_dtype()` is f32 there.
 * **Reference route (sc-24110).** The semantics above are the frozen upstream ones and are held to
   the *same* committed fixture (`qwen21_edit.safetensors`) as the MLX twin. The mechanical
   divergences are:
@@ -474,11 +482,13 @@ than the target's own token count: `reference::prepare` fits every condition ima
     `Qwen35VisionConfig` — candle-llm carries Qwen3-VL and Qwen3.6 as **one** tower under the
     `Qwen35…` spelling, where mlx-llm names it `Qwen3VLVision…`. Same architecture, same weights,
     same `model.visual.*` prefix.
-  * `CandleError` has **no `Unsupported` variant** (unlike `mlx_gen::Error`), so the route's typed
-    refusals — a `Mask` conditioning, eleven references, a per-reference `strength`, a snapshot
-    with no tower, a `smart_resize` grid disagreement — all arrive as `CandleError::Msg` with the
-    **identical message text**. The capability floor still refuses an unadvertised
-    `ConditioningKind` as `gen_core::Error::Unsupported` before the route is reached.
+  * The route's typed refusals — a `Mask` conditioning, an unadvertised conditioning kind, eleven
+    references, a per-reference `strength`, a snapshot with no tower, a `smart_resize` grid
+    disagreement — are `CandleError::Unsupported` with the **identical message text** the MLX twin
+    raises, and cross the `From<CandleError> for gen_core::Error` bridge as
+    `gen_core::Error::Unsupported` (sc-24114; `CandleError` gained the variant for exactly this,
+    where it used to arrive as `Msg`). The gen-core-testkit validate-honesty check requires the
+    typed variant for every undeclared conditioning kind.
   * `prepare_reference` / `prepare_references` take an explicit `&Device`: candle tensors are
     device-bound at construction, where mlx `Array`s are not.
   * The ViT tower's weights are pulled out of the `text_encoder/` shards by an mmapped,
@@ -486,9 +496,9 @@ than the target's own token count: `reference::prepare` fits every condition ima
     already-resident `Weights` map as on the MLX side — candle's loader hands providers a
     `VarBuilder`, which cannot be enumerated. Only `model.visual.*` is materialised, so attaching
     the tower never stages a second copy of the language tower. Each visual tensor is cast to
-    `DType::F32` on the way in, so both halves of the one encoder run in the same dtype: the
-    language tower comes off `VarBuilder` at `F32`, and leaving the ViT at its on-disk dtype would
-    have run a bf16 tower into f32 decoder layers on the released snapshot.
+    `compute_dtype()` on the way in, so both halves of the one encoder run in the same dtype as
+    the language tower's `VarBuilder`: bf16 end to end on CUDA/Metal (an `Arc`-clone no-op on the
+    released bf16 ViT), f32 end to end on the CPU parity lane.
   * The decoder block's rotary embedding grew an `Option<(&cos, &sin)>` parameter: `None` keeps
     the precomputed 1-D table the text-to-image path has always used (that path stays
     **bit-identical**, asserted by `edit_parity::the_text_to_image_path_is_unchanged_by_the_reference_route`),

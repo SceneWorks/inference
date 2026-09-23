@@ -26,8 +26,11 @@
 //! SwiGLU). The DeepStack visual injection and the vision tower engage only with condition images
 //! — see *The image-conditioned path* below.
 //!
-//! Activations run f32 (the sibling text encoders' policy); the DiT rounds the result to its own
-//! compute dtype at `txt_in`.
+//! Activations run at the dtype the tower's `VarBuilder` was built at — the backend's
+//! [`crate::loader::compute_dtype`]: the checkpoint's own bf16 on CUDA/Metal, exactly as upstream
+//! runs the encoder, and f32 on the CPU parity lane (sc-24114). Every table this module builds
+//! (rotary, causal mask, M-RoPE) is cast to that dtype; the DiT rounds the result to its own compute
+//! dtype at `txt_in` either way.
 //!
 //! # The image-conditioned path (sc-24110)
 //!
@@ -150,7 +153,15 @@ struct Rotary {
 }
 
 impl Rotary {
-    fn new(head_dim: usize, theta: f32, max_len: usize, device: &Device) -> Result<Self> {
+    /// The table is computed in f32 and cast to the tower's compute `dtype` once, so a bf16 tower
+    /// rotates bf16 queries with a bf16 table (candle's rope kernel wants one dtype throughout).
+    fn new(
+        head_dim: usize,
+        theta: f32,
+        max_len: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Self> {
         let inv: Vec<f32> = (0..head_dim)
             .step_by(2)
             .map(|i| 1f32 / theta.powf(i as f32 / head_dim as f32))
@@ -162,8 +173,8 @@ impl Rotary {
             .reshape((max_len, 1))?;
         let freqs = t.matmul(&inv)?;
         Ok(Self {
-            cos: freqs.cos()?,
-            sin: freqs.sin()?,
+            cos: freqs.cos()?.to_dtype(dtype)?,
+            sin: freqs.sin()?.to_dtype(dtype)?,
         })
     }
 
@@ -364,6 +375,9 @@ pub struct QwenImage21TextEncoder {
     layers: Vec<DecoderLayer>,
     hidden_size: usize,
     device: Device,
+    /// The dtype the weights were materialized at and the activations run at
+    /// ([`crate::loader::compute_dtype`] on the production path).
+    dtype: DType,
     /// Interleaved M-RoPE geometry for the image-conditioned path.
     mrope: Rope,
     mrope_section: [usize; 3],
@@ -376,7 +390,7 @@ pub struct QwenImage21TextEncoder {
 /// The conditioning one prompt produces: the hidden states the DiT's `txt_in` consumes, and —
 /// for the image-conditioned path — which of those positions are condition-image slots.
 pub struct TextConditioning {
-    /// `[1, L, hidden]`, f32, system prefix already dropped.
+    /// `[1, L, hidden]` at the tower's compute dtype, system prefix already dropped.
     pub hidden: Tensor,
     /// `L` flags, `true` at `<|image_pad|>` positions (all `false` for text-to-image). Each flag
     /// stands for a 2×2 group of condition latents in the joint sequence.
@@ -407,10 +421,14 @@ impl QwenImage21TextEncoder {
             cfg.hidden_size,
             tower.pp("embed_tokens"),
         )?;
+        // The compute dtype is the `VarBuilder`'s: whatever the loader materialized the weights at
+        // is what the activations run at (bf16 on CUDA/Metal like upstream, f32 on CPU).
+        let dtype = vb.dtype();
         let rotary = Arc::new(Rotary::new(
             cfg.head_dim,
             cfg.rope_theta,
             crate::loader::MAX_PROMPT_TOKENS,
+            dtype,
             vb.device(),
         )?);
         let vb_layers = tower.pp("layers");
@@ -425,10 +443,16 @@ impl QwenImage21TextEncoder {
             layers,
             hidden_size: cfg.hidden_size,
             device: vb.device().clone(),
+            dtype,
             mrope: Rope::standard(cfg.head_dim as i32, cfg.rope_theta),
             mrope_section: cfg.mrope_section,
             vision: None,
         })
+    }
+
+    /// The dtype the tower's weights were materialized at and its activations run at.
+    pub fn dtype(&self) -> DType {
+        self.dtype
     }
 
     /// Attach the Qwen3-VL **vision** tower this snapshot ships (`model.visual.*`), which the
@@ -464,11 +488,11 @@ impl QwenImage21TextEncoder {
         let mask: Vec<f32> = (0..len)
             .flat_map(|i| (0..len).map(move |j| if j <= i { 0.0 } else { f32::NEG_INFINITY }))
             .collect();
-        Ok(Tensor::from_vec(mask, (1, 1, len, len), &self.device)?)
+        Ok(Tensor::from_vec(mask, (1, 1, len, len), &self.device)?.to_dtype(self.dtype)?)
     }
 
-    /// `input_ids` `[1, L]` (u32) → the last decoder layer's hidden states `[1, L, hidden]`, f32,
-    /// **before** the final norm.
+    /// `input_ids` `[1, L]` (u32) → the last decoder layer's hidden states `[1, L, hidden]` at
+    /// [`Self::dtype`], **before** the final norm.
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
         self.forward_traced(input_ids, false).map(|(h, _)| h)
     }
@@ -482,7 +506,7 @@ impl QwenImage21TextEncoder {
     ) -> Result<(Tensor, Vec<(String, Tensor)>)> {
         let (_, len) = input_ids.dims2()?;
         let mut stages = Vec::new();
-        let mut x = self.embed_tokens.forward(input_ids)?.to_dtype(DType::F32)?;
+        let mut x = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
         if trace {
             stages.push(("embed".to_string(), x.clone()));
         }
@@ -496,8 +520,8 @@ impl QwenImage21TextEncoder {
         Ok((x, stages))
     }
 
-    /// Prompt → conditioning `[1, L − drop, hidden]` (f32): render the template, tokenize, run the
-    /// tower, drop the `drop` system-prefix tokens.
+    /// Prompt → conditioning `[1, L − drop, hidden]` at [`Self::dtype`]: render the template,
+    /// tokenize, run the tower, drop the `drop` system-prefix tokens.
     pub fn encode_prompt(
         &self,
         tokenizer: &TextTokenizer,
@@ -541,7 +565,7 @@ impl QwenImage21TextEncoder {
             });
         }
         let (tower, vision_cfg) = self.vision.as_ref().ok_or_else(|| {
-            Error::Msg(
+            Error::Unsupported(
                 "qwen_image_2_1: this snapshot ships no Qwen3-VL vision tower \
                  (`text_encoder/config.json` has no `vision_config`, or `model.visual.*` is \
                  missing), so reference images cannot be conditioned on. Reference conditioning \
@@ -604,10 +628,12 @@ impl QwenImage21TextEncoder {
                         .into(),
                 ));
             }
+            // The tower ran at its own (loader-cast) dtype; both halves of the one encoder
+            // run at the language tower's compute dtype from here on.
             for (slot, feature) in taps.iter_mut().zip(out.deepstack_features) {
-                slot.push(feature.to_dtype(DType::F32)?);
+                slot.push(feature.to_dtype(self.dtype)?);
             }
-            merged.push(out.pooler_output.to_dtype(DType::F32)?);
+            merged.push(out.pooler_output.to_dtype(self.dtype)?);
             grids.push(reference.grid_thw);
         }
         let join = |parts: &[Tensor]| -> Result<Tensor> {
@@ -625,7 +651,7 @@ impl QwenImage21TextEncoder {
         let embeds = self
             .embed_tokens
             .forward(&input_ids)?
-            .to_dtype(DType::F32)?;
+            .to_dtype(self.dtype)?;
         let embeds = splice_vision_features(&embeds, &ids, &vision_features, &[image_token])
             .map_err(from_llm)?;
         let (t_row, h_row, w_row, _) =
@@ -636,7 +662,7 @@ impl QwenImage21TextEncoder {
             .mrope_interleaved_cos_sin(
                 [&t_row, &h_row, &w_row],
                 self.mrope_section,
-                DType::F32,
+                self.dtype,
                 &self.device,
             )
             .map_err(from_llm)?;

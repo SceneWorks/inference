@@ -221,7 +221,8 @@ pub fn installed_tier(root: &Path) -> Result<Tier> {
         .ok_or_else(|| {
             Error::Msg(format!(
                 "qwen_image_2_1: no installable tier has transformer bits {dit:?} with text-encoder \
-                 bits {te:?}; the installable tiers are bf16 (dense/dense), q8 (8/8) and q4 (4/8)"
+                 bits {te:?}; a tier is one width, so the installable tiers are bf16 \
+                 (dense/dense), q8 (8/8) and q4 (4/4)"
             ))
         })
 }

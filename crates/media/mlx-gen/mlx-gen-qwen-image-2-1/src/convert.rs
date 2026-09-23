@@ -13,6 +13,9 @@
 //! <dst_root>/
 //!   model_index.json            copied
 //!   LICENSE / README.md         copied (Qwen Research License — F-045)
+//!   CHANGES.md                  the licence's §3(b) change record: what was re-packed, at what
+//!                               width, from which upstream revision, by which converter
+//!   SHA256SUMS                  `sha256sum` manifest over every other file (the binding digest)
 //!   transformer/
 //!     config.json               source config + {"quantization": {"bits", "group_size": 64}}
 //!     model.safetensors         packed: every Linear as {base}.weight|.scales|.biases
@@ -27,13 +30,19 @@
 //! marker would mislabel the artefact for [`mlx_gen::quant::packed_quant_bits`], and therefore for
 //! every fit estimate that reads it.
 //!
+//! `CHANGES.md` and `SHA256SUMS` are written by [`prequantize_turnkey`] **itself**
+//! ([`write_change_record`], [`write_sha256sums`]), not by the example driver around it, so no
+//! tier can be assembled without the change record the Qwen Research License requires of a
+//! modified redistribution or without the manifest a published artefact is bound to (sc-24114).
+//!
 //! # Reproducibility
 //!
-//! [`mlx_gen::quant::save_map`] sorts keys before serialization and
+//! [`mlx_gen::quant::save_map`] sorts keys before serialization,
 //! [`mlx_gen::quant::write_quantized_config`] writes `serde_json::to_string_pretty` of a
-//! deterministically-merged value, so converting the same source twice produces **byte-identical**
-//! files. `tests/tiers.rs` pins that by SHA-256 over the converted tiny snapshot, which is what lets
-//! a published tier be bound to a hash.
+//! deterministically-merged value, and the change record carries no timestamp or host name, so
+//! converting the same source twice produces **byte-identical** files — `SHA256SUMS` included.
+//! `tests/tiers.rs` pins that by SHA-256 over the converted tiny snapshot, which is what lets a
+//! published tier be bound to a hash.
 //!
 //! # Equivalence to load-time quantization
 //!
@@ -45,6 +54,7 @@
 //! converter deliberately leaves them dense rather than packing at a second group size the loader
 //! could not read back. See the [`crate::quant`] module docs.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use mlx_gen::quant::{
@@ -184,7 +194,141 @@ pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, tier: Tier) -> Resu
             copy_dir(&src, &dst_root.join(rel))?;
         }
     }
-    copy_turnkey_assets(src_root, dst_root)
+    copy_turnkey_assets(src_root, dst_root)?;
+    // The two files a *distributed* tier must carry beyond the weights (sc-24114): the licence's
+    // change record, and the manifest that binds the artefact to its bytes. Written by the
+    // converter itself — not by a driver around it — so no tier can leave here without them.
+    write_change_record(dst_root, tier)?;
+    write_sha256sums(dst_root)
+}
+
+// ============================================================================================
+// The distributed tier's change record and manifest.
+// ============================================================================================
+
+/// File name of the change record every converted tier carries.
+pub const CHANGES_FILE: &str = "CHANGES.md";
+/// File name of the SHA-256 manifest every converted tier carries.
+pub const SHA256SUMS_FILE: &str = "SHA256SUMS";
+
+/// The Qwen Research License §3(b) change record for one converted tier: which components were
+/// re-packed and at what width, which ride through verbatim, the upstream snapshot and revision
+/// the tier was derived from, and the converter that produced it.
+///
+/// Deterministic by construction — no timestamp, no host name — so the record is part of the
+/// byte-reproducible artefact rather than the one file that makes two conversions differ.
+pub fn change_record(tier: Tier) -> Result<String> {
+    let (Some(dit_bits), Some(te_bits)) = (tier.transformer_bits(), tier.text_encoder_bits())
+    else {
+        return Err(Error::Msg(format!(
+            "qwen_image_2_1 convert: the {} tier is the dense released snapshot itself and \
+             carries no change record",
+            tier.dir_name()
+        )));
+    };
+    let dense: Vec<String> = DENSE_COMPONENTS
+        .iter()
+        .map(|component| format!("`{component}/`"))
+        .collect();
+    Ok(format!(
+        "# Qwen-Image 2.1 — `{tier}` tier: change record\n\
+         \n\
+         This directory is a **modified copy** of the `{repo}` snapshot at revision\n\
+         `{revision}`, re-packed offline into the `{tier}` installable tier by\n\
+         `{converter}` {version} (`mlx_gen_qwen_image_2_1::convert::prequantize_turnkey`).\n\
+         This file is the notice of those changes the Qwen Research License Agreement §3(b)\n\
+         requires; the licence itself (`LICENSE`) and the upstream `README.md` are carried\n\
+         verbatim, and the §3(c) attribution is in `NOTICE` of the producing crate.\n\
+         \n\
+         ## Files that were changed\n\
+         \n\
+         | component | change |\n\
+         |---|---|\n\
+         | `transformer/model.safetensors` | every 2-D `Linear` weight affine-quantized to \
+         **Q{dit_bits}, group size {group}** (`weight` = packed u32 codes, plus `scales` and \
+         `biases` per group); RMSNorm scales dense |\n\
+         | `transformer/config.json` | upstream config plus `\"quantization\": {{\"bits\": \
+         {dit_bits}, \"group_size\": {group}}}` |\n\
+         | `text_encoder/model.safetensors` | the `model.language_model.layers.*` decoder \
+         projections (q/k/v/o, gate/up/down) affine-quantized to **Q{te_bits}, group size \
+         {group}**; token embedding, norms, `lm_head` and the whole `model.visual.*` vision tower \
+         dense and unchanged; the sharded upstream files are consolidated into one |\n\
+         | `text_encoder/config.json` | upstream config plus `\"quantization\": {{\"bits\": \
+         {te_bits}, \"group_size\": {group}}}` |\n\
+         \n\
+         A tier is a whole-pipeline contract: both packed components carry the same width.\n\
+         \n\
+         ## Files that were not changed\n\
+         \n\
+         {dense}, `model_index.json`, `LICENSE` and `README.md` are byte-for-byte copies of \
+         the upstream snapshot.\n\
+         \n\
+         ## Integrity\n\
+         \n\
+         `{sums}` beside this file lists the SHA-256 of every file in this directory. The \
+         conversion is byte-reproducible, so a re-run from the same upstream revision \
+         reproduces every digest.\n",
+        tier = tier.dir_name(),
+        repo = crate::UPSTREAM_HF_REPO,
+        revision = crate::UPSTREAM_HF_REVISION,
+        converter = env!("CARGO_PKG_NAME"),
+        version = env!("CARGO_PKG_VERSION"),
+        group = GROUP_SIZE,
+        dense = dense.join(", "),
+        sums = SHA256SUMS_FILE,
+    ))
+}
+
+/// Write [`change_record`] as `<dst_root>/CHANGES.md`.
+pub fn write_change_record(dst_root: &Path, tier: Tier) -> Result<()> {
+    std::fs::write(dst_root.join(CHANGES_FILE), change_record(tier)?)?;
+    Ok(())
+}
+
+/// Every regular file under `root` (hidden entries skipped, like the copy that produced them),
+/// keyed by its `/`-separated path relative to `root`, valued by its lowercase hex SHA-256 —
+/// sorted, so the manifest built from it is deterministic. [`SHA256SUMS_FILE`] itself is
+/// excluded, since it cannot list its own digest.
+pub fn digest_tree(root: &Path) -> Result<BTreeMap<String, String>> {
+    use sha2::{Digest, Sha256};
+    fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>) -> Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if mlx_gen::gen_core::weightsmeta::is_hidden_file(&path) {
+                continue;
+            }
+            if path.is_dir() {
+                walk(root, &path, out)?;
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|e| Error::Msg(format!("qwen_image_2_1 convert: {e}")))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel == SHA256SUMS_FILE {
+                continue;
+            }
+            let bytes = std::fs::read(&path)?;
+            out.insert(rel, format!("{:x}", Sha256::digest(&bytes)));
+        }
+        Ok(())
+    }
+    let mut out = BTreeMap::new();
+    walk(root, root, &mut out)?;
+    Ok(out)
+}
+
+/// Write `<dst_root>/SHA256SUMS` in `sha256sum` format (`<hex>  <relative path>`, one per line,
+/// sorted) over every other file in the tier — the manifest that binds a published artefact to
+/// its bytes. `sha256sum -c SHA256SUMS` from inside the tier verifies it.
+pub fn write_sha256sums(dst_root: &Path) -> Result<()> {
+    let mut manifest = String::new();
+    for (rel, digest) in digest_tree(dst_root)? {
+        manifest.push_str(&format!("{digest}  {rel}\n"));
+    }
+    std::fs::write(dst_root.join(SHA256SUMS_FILE), manifest)?;
+    Ok(())
 }
 
 // ============================================================================================
@@ -394,5 +538,96 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("mirror it"), "{err}");
+        assert!(change_record(Tier::Bf16).is_err());
+    }
+
+    fn tiny_snapshot() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-snapshot")
+    }
+
+    /// **The converter itself writes the change record and the manifest** (sc-24114): every
+    /// converted tier carries a `CHANGES.md` naming what was re-packed, at what width, from which
+    /// upstream revision and by which converter, and a `SHA256SUMS` whose digests match every
+    /// other file in the tier. Neither is the example driver's to add.
+    ///
+    /// *Mutation that reds this:* dropping the `write_change_record` / `write_sha256sums` calls
+    /// from the tail of `prequantize_turnkey` (the driver used to write `SHA256SUMS` on its own).
+    #[test]
+    fn a_converted_tier_carries_its_change_record_and_manifest() {
+        use sha2::{Digest, Sha256};
+
+        let tmp = tempfile::tempdir().unwrap();
+        for tier in [Tier::Q8, Tier::Q4] {
+            let out = tmp.path().join(tier.dir_name());
+            prequantize_turnkey(&tiny_snapshot(), &out, tier).unwrap();
+            let bits = tier.transformer_bits().unwrap();
+
+            // The change record: the licence's notice of what was changed, and nothing vague.
+            let changes = std::fs::read_to_string(out.join(CHANGES_FILE)).unwrap();
+            assert_eq!(changes, change_record(tier).unwrap());
+            for needle in [
+                &format!("`{}` tier", tier.dir_name()),
+                &format!("Q{bits}, group size {GROUP_SIZE}"),
+                "`transformer/model.safetensors`",
+                "`text_encoder/model.safetensors`",
+                "`transformer/config.json`",
+                "`text_encoder/config.json`",
+                "`vae/`",
+                crate::UPSTREAM_HF_REPO,
+                crate::UPSTREAM_HF_REVISION,
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+                "§3(b)",
+                SHA256SUMS_FILE,
+            ] {
+                assert!(
+                    changes.contains(needle),
+                    "{}: missing {needle:?}",
+                    tier.dir_name()
+                );
+            }
+            // Both packed components are named at the SAME width — a tier is one width.
+            assert!(
+                !changes.contains(&format!("Q{}", if bits == 4 { 8 } else { 4 })),
+                "{}: the record names a second width:\n{changes}",
+                tier.dir_name()
+            );
+
+            // The manifest: every other file, each digest right, itself excluded, sorted.
+            let manifest = std::fs::read_to_string(out.join(SHA256SUMS_FILE)).unwrap();
+            let mut listed = Vec::new();
+            for line in manifest.lines() {
+                let (digest, rel) = line
+                    .split_once("  ")
+                    .unwrap_or_else(|| panic!("malformed manifest line {line:?}"));
+                assert_ne!(rel, SHA256SUMS_FILE, "the manifest must not list itself");
+                let bytes = std::fs::read(out.join(rel)).unwrap();
+                assert_eq!(
+                    digest,
+                    format!("{:x}", Sha256::digest(&bytes)),
+                    "{}: {rel} digest",
+                    tier.dir_name()
+                );
+                listed.push(rel.to_owned());
+            }
+            let mut sorted = listed.clone();
+            sorted.sort();
+            assert_eq!(listed, sorted, "the manifest is sorted");
+            for rel in [
+                CHANGES_FILE,
+                "transformer/model.safetensors",
+                "transformer/config.json",
+                "text_encoder/model.safetensors",
+                "text_encoder/config.json",
+                "vae/config.json",
+            ] {
+                assert!(listed.iter().any(|l| l == rel), "{rel} must be listed");
+            }
+            assert_eq!(
+                listed.len(),
+                digest_tree(&out).unwrap().len(),
+                "every regular file but the manifest is listed"
+            );
+        }
     }
 }
