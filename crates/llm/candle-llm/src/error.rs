@@ -52,6 +52,17 @@ pub enum Error {
     )]
     RollbackUnavailable { n: i32, have: Vec<i32> },
 
+    /// A preallocated (static) KV cache was asked for more positions than it can hold — either at
+    /// construction (`requested` capacity past the model's `max_position_embeddings`, reported as
+    /// `capacity`) or at a step (`requested` = the position the step would end at, past the
+    /// buffer's `capacity`). Raised **before** any device write, so the cache is untouched and the
+    /// request fails closed instead of tripping an allocator OOM mid-decode (E6). Typed so admission
+    /// and the decode drivers can tell a capacity bound from a real failure.
+    #[error(
+        "static KV cache capacity exceeded: {requested} positions requested, capacity {capacity}"
+    )]
+    KvCapacityExceeded { requested: usize, capacity: usize },
+
     /// Anything else, with a human-readable message.
     #[error("{0}")]
     Msg(String),

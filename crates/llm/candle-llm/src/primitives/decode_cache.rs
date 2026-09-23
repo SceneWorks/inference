@@ -28,6 +28,7 @@
 use candle_core::Tensor;
 
 use crate::error::Result;
+use crate::primitives::kv_cache::KvCacheKind;
 
 /// The cache's own accounting of what it references, in bytes (see the module docs for what
 /// "logical" means).
@@ -72,6 +73,14 @@ pub trait DecodeCache {
 
     /// The cache's logical memory accounting.
     fn memory(&self) -> CacheMemory;
+
+    /// Which KV cache implementation backs the cache — reported per request as
+    /// [`DecodeRecord::kv_cache`](crate::decode::DecodeRecord::kv_cache). Defaults to
+    /// [`KvCacheKind::Growing`]; a cache built on [`StaticKvCache`](crate::primitives::StaticKvCache)
+    /// reports [`KvCacheKind::Static`].
+    fn kv_kind(&self) -> KvCacheKind {
+        KvCacheKind::Growing
+    }
 }
 
 #[cfg(test)]

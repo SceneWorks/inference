@@ -21,9 +21,10 @@ use candle_core::{Device, Tensor};
 use crate::decode::speculative::SpeculativeStats;
 use crate::decode::stream::Decode;
 use crate::error::Result;
+use crate::primitives::attention::AttnFormulation;
 use crate::primitives::fused::{fused_tally, FusedTally};
 use crate::primitives::host_sync::host_sync_count;
-use crate::primitives::kv_cache::KvCache;
+use crate::primitives::kv_cache::{KvCache, KvCacheKind};
 
 /// Which decode implementation produced a request's tokens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +72,15 @@ pub struct DecodeRecord {
     pub generated_tokens: u64,
     /// Device→host transfers this crate issued while generating (see `primitives::host_sync`).
     pub host_syncs: u64,
+    /// Which KV cache implementation the request ran on (story sc-24132): the growing reference
+    /// cache or the preallocated static one. Reported from the cache itself
+    /// ([`DecodeCache::kv_kind`](crate::primitives::DecodeCache::kv_kind)), so the row says what
+    /// actually ran, not what was configured.
+    pub kv_cache: KvCacheKind,
+    /// How grouped-query attention was computed (story sc-24132): the un-expanded `gqa`
+    /// formulation every path runs since S4, or the pre-S4 `expanded` (`repeat_kv`) arithmetic
+    /// selected for a comparison row. Reported from the model, which owns the selector.
+    pub attn_formulation: AttnFormulation,
     /// Fused-vs-reference primitive leaf runs while generating (see `primitives::fused`): how many
     /// RMSNorm / SwiGLU / QK-norm+RoPE leaves ran the fused kernel, how many the op chain, and why
     /// the last op-chain run happened. `FusedTally::label` gives `fused` / `reference` / `mixed`.
@@ -92,8 +102,24 @@ impl DecodeRecord {
             accepted_tokens: 0,
             generated_tokens: generated as u64,
             host_syncs,
+            kv_cache: KvCacheKind::Growing,
+            attn_formulation: AttnFormulation::Gqa,
             fused_primitives: FusedTally::default(),
         }
+    }
+
+    /// The same record with `kv_cache` set — the step driver stamps the cache's own
+    /// [`DecodeCache::kv_kind`](crate::primitives::DecodeCache::kv_kind) on it.
+    pub fn with_kv_cache(mut self, kv_cache: KvCacheKind) -> Self {
+        self.kv_cache = kv_cache;
+        self
+    }
+
+    /// The same record with `attn_formulation` set — stamped from the model's own selector
+    /// ([`StepModel::attn_formulation`](super::StepModel::attn_formulation)).
+    pub fn with_attn_formulation(mut self, attn_formulation: AttnFormulation) -> Self {
+        self.attn_formulation = attn_formulation;
+        self
     }
 
     /// The same record with its fused-primitive tally filled in (from
@@ -117,6 +143,8 @@ impl DecodeRecord {
             accepted_tokens: stats.accepted as u64,
             generated_tokens: generated as u64,
             host_syncs,
+            kv_cache: KvCacheKind::Growing,
+            attn_formulation: AttnFormulation::Gqa,
             fused_primitives: FusedTally::default(),
         }
     }
@@ -254,6 +282,15 @@ mod tests {
         assert_eq!(plain.forwards_per_generated_token(), None);
         assert_eq!(plain.host_syncs_per_token(), None);
         assert_eq!(plain.path.label(), "reference");
+        assert_eq!(plain.kv_cache, KvCacheKind::Growing);
+        assert_eq!(plain.attn_formulation, AttnFormulation::Gqa);
+        assert_eq!(plain.attn_formulation.label(), "gqa");
+        let stamped = plain
+            .with_kv_cache(KvCacheKind::Static)
+            .with_attn_formulation(AttnFormulation::Expanded);
+        assert_eq!(stamped.kv_cache, KvCacheKind::Static);
+        assert_eq!(stamped.attn_formulation, AttnFormulation::Expanded);
+        assert_eq!(stamped.attn_formulation.label(), "expanded");
 
         let spec = DecodeRecord::speculative(
             DecodePath::Mtp { drafts: 3 },
