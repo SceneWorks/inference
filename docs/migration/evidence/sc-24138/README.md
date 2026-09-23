@@ -74,9 +74,11 @@ below it (the un-expanded attention GEMMs round differently in the last bits).
 ## AC2 — Qwen3-8B through the shared engine (RTX Pro 6000 / sm_120)
 
 `decode-bench/` — sealed by `scripts/release/decode_bench.py run` (binary, source sha, model pin,
-hardware, co-tenants and memory samples in each `run.json`; `SEAL.json` hashes). All runs are
-`833e61542` (Rust sources identical to `110fcddf1`, where the binary was built; the one commit between
-is the harness's llama-family checkpoint rule). `comparison.md` merges the three same-prompt runs.
+hardware, co-tenants and memory samples in each `run.json`; `SEAL.json` hashes). The `833e61542` runs
+are the story's code before merging the S2 head (Rust sources identical to `110fcddf1`, where that
+binary was built; the one commit between is the harness's llama-family checkpoint rule); the
+`0e3d5a1d3` runs are the final code, after merging the S2 head `d45cfebb6` (S5 sampler telemetry, S8
+NVFP4 path). `comparison.md` merges the five same-prompt runs.
 
 | run | row | tok/s | acceptance | fwd/tok | syncs/tok | syncs/verify | tokens vs that run's reference |
 |---|---|---|---|---|---|---|---|
@@ -92,10 +94,27 @@ is the harness's llama-family checkpoint rule). `comparison.md` merges the three
 | gqa-ref-structured | StepModel (static kv, gqa) | 73.27 | — | 1.000 | 1.00 | 1.00 | identical |
 | gqa-ref-structured | n-gram K=2 / 3 / 4 / 6 | 79.51 / 81.00 / 78.55 / **88.14** | 0.232 / 0.164 / 0.128 / 0.137 | 0.770 / 0.762 / 0.770 / 0.695 | 0.77 / 0.76 / 0.77 / 0.70 | 1.00 | @58 / @58 / @58 / @55 |
 
+After the merge (`0e3d5a1d3`, GPU 1 idle at start), the same fixture, same binary flags:
+
+| run | row | tok/s | acceptance | syncs/verify | tokens vs that run's reference |
+|---|---|---|---|---|---|
+| expanded-ref | reference (pre-migration path) | 60.83 | — | — | (ref) |
+| expanded-ref | StepModel (static kv, gqa) | **74.42** | — | 1.00 | @65 |
+| expanded-ref | n-gram K=2 / 3 / 4 | 72.25 / 68.23 / 74.31 | 0.147 / 0.087 / 0.076 | 1.00 | @132 / @51 / @65 |
+| gqa-ref | reference (gqa selected) | 71.05 | — | — | (ref) |
+| gqa-ref | StepModel (static kv, gqa) | 70.61 | — | 1.00 | **identical (256/256)** |
+| gqa-ref | n-gram K=2 / 3 / 4 | 71.72 / 75.31 / 75.39 | 0.147 / 0.087 / 0.076 | 1.00 | @65 / @51 / @132 |
+
+Every row's tokens, divergence points, acceptance and forwards are **identical** before and after the
+merge; only wall-clock throughput moves, by the run-to-run noise of a shared lane.
+
 Reading it:
 
-* The step seam's static cache is **+16 %** over the pre-migration `CausalLm` reference on the prose
-  fixture (74.3 vs 64.1 tok/s): no per-step `cat` of the history and no `repeat_kv` expansion.
+* The step seam's static cache is **+16 % / +22 %** over the pre-migration `CausalLm` reference on
+  the prose fixture (74.3 vs 64.1, 74.4 vs 60.8 tok/s): no per-step `cat` of the history and no
+  `repeat_kv` expansion. Against a reference already on the un-expanded formulation the two are
+  within noise (70.9 vs 72.7, 71.1 vs 70.6): at 256 tokens on an 8B model the win is the attention
+  arithmetic, not the cache.
 * With the `Gqa` formulation selected on the reference loop, reference and static step path are
   **token-identical over all 256 tokens** — the same arithmetic on two caches. Against the expanded
   reference the static path diverges at token 65, the S4 knife-edge class (expanded vs un-expanded
@@ -129,6 +148,7 @@ or `KvCache`, and checks the n-gram / draft proposers are in `decode/proposers.r
   doc --no-deps -p candle-llm`, `python -m pytest scripts/tests/test_decode_bench.py`,
   `scripts/check-workspace.py`, `scripts/check_docs.py`.
 * CUDA (PowerShell, MSVC 14.44 vcvars, `CUDA_COMPUTE_CAP=120`, `CUDA_VISIBLE_DEVICES=1`):
-  `cargo test --locked --lib --tests -p candle-llm --features cuda` (37 binaries, all green, including
-  `architecture_forward` against the Windows+CUDA golden), `cargo clippy --locked -p candle-llm
-  --all-targets --features cuda -- -D warnings`.
+  `cargo test --locked --lib --tests -p candle-llm --features cuda` (all green before and after the
+  merge — 39 binaries after it — including `architecture_forward` against the Windows+CUDA golden),
+  `cargo clippy --locked -p candle-llm --all-targets --features cuda -- -D warnings`,
+  `RUSTDOCFLAGS=-D warnings cargo doc --no-deps -p candle-llm`.
