@@ -242,8 +242,10 @@ mod cuda_impl {
     use super::*;
     use candle_core::cuda_backend::cudarc;
     use candle_core::op::BackpropOp;
-    use candle_core::{CudaStorage, Device, Shape, Storage};
-    use cudarc::driver::{LaunchConfig, PushKernelArg};
+    use candle_core::{CudaDevice, CudaStorage, Device, Shape, Storage};
+    use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
+    use std::collections::HashMap;
+    use std::sync::{OnceLock, RwLock};
 
     use crate::nvfp4::{NVFP4_BLOCK, SF_ATOM_COLS};
 
@@ -251,6 +253,31 @@ mod cuda_impl {
         Nvfp4GemvError::Candle(candle_core::Error::Cuda(
             format!("nvfp4 GEMV kernel: {e:?}").into(),
         ))
+    }
+
+    /// The GEMV entry point for `dev`, resolved once per device ordinal: a launch does one map
+    /// lookup, no `cuModuleGetFunction`. Only successes are held here; a compile failure stays
+    /// cached in the nvrtc seam and is re-read from there.
+    fn function(dev: &CudaDevice) -> Result<CudaFunction, Nvfp4GemvError> {
+        static TABLE: OnceLock<RwLock<HashMap<usize, CudaFunction>>> = OnceLock::new();
+        let table = TABLE.get_or_init(Default::default);
+        let ordinal = dev.cuda_stream().context().ordinal();
+        if let Some(f) = table
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&ordinal)
+        {
+            return Ok(f.clone());
+        }
+        let f = NVFP4_GEMV_SRC
+            .compiled(dev)?
+            .function(NVFP4_GEMV_FUNCTION)?;
+        Ok(table
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(ordinal)
+            .or_insert(f)
+            .clone())
     }
 
     pub(super) fn launch(
@@ -261,9 +288,7 @@ mod cuda_impl {
         let Device::Cuda(dev) = weight.device() else {
             return Err(Nvfp4GemvRefusal::NotCuda.into());
         };
-        let func = NVFP4_GEMV_SRC
-            .compiled(dev)?
-            .function(NVFP4_GEMV_FUNCTION)?;
+        let func = function(dev)?;
 
         let staged = weight.staged();
         let (_, cols_padded) = staged.shape_padded();

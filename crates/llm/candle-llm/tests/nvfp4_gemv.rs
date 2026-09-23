@@ -16,16 +16,15 @@
 //!   GEMV vs cuBLASLt, per 27B shape and row count 1..=8.
 //!
 //! GPU tests skip (loudly) without an sm_120 CUDA device. They share the process-wide GEMV switch,
-//! so they serialize on one lock.
+//! so each holds `nvfp4_gemv_policy_guard` (which also restores the switch).
 
 #![cfg(feature = "cuda")]
-
-use std::sync::Mutex;
 
 use candle_core::{DType, Device, Tensor};
 use candle_llm::models::Qwen35Config;
 use candle_llm::primitives::{
-    nvfp4_path_tally, set_nvfp4_gemv, Projection, ProjectionFormat, ProjectionKind,
+    nvfp4_gemv_policy_guard, nvfp4_path_tally, set_nvfp4_gemv, Nvfp4GemvPolicyGuard, Projection,
+    ProjectionFormat, ProjectionKind,
 };
 use candle_quant_kernels::{
     e4m3_to_f32, gemv_abs_bound, Nvfp4Weight, E2M1_LUT, GEMV_REL_RMS_TOL, NVFP4_BLOCK,
@@ -33,10 +32,10 @@ use candle_quant_kernels::{
 };
 use serde_json::{json, Value};
 
-static SWITCH: Mutex<()> = Mutex::new(());
-
-fn lock() -> std::sync::MutexGuard<'static, ()> {
-    SWITCH.lock().unwrap_or_else(|p| p.into_inner())
+/// Every test here flips or depends on the process-wide GEMV switch: hold its lock (the guard
+/// restores the switch on drop).
+fn lock() -> Nvfp4GemvPolicyGuard {
+    nvfp4_gemv_policy_guard(None)
 }
 
 fn nvfp4() -> Option<(Device, ProjectionFormat)> {

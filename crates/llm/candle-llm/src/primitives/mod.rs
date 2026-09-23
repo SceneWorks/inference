@@ -52,6 +52,8 @@ pub use nn::{
 pub use nvfp4_path::{
     nvfp4_gemv_enabled, nvfp4_path_tally, set_nvfp4_gemv, Nvfp4PathTally, NVFP4_GEMV_ENV,
 };
+#[doc(hidden)]
+pub use nvfp4_path::{nvfp4_gemv_policy_guard, Nvfp4GemvPolicyGuard};
 pub use paged_kv_cache::{BlockPool, PagedKvCache};
 pub use prism::{GdnRowMap, PrismPackedWeight, PrismRegistry};
 pub use projection::{

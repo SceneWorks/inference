@@ -27,7 +27,7 @@
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use candle_core::Tensor;
 #[cfg(feature = "cuda")]
@@ -79,6 +79,42 @@ pub fn set_nvfp4_gemv(enabled: Option<bool>) {
         None => POLICY_ENV,
     };
     POLICY.store(policy, Ordering::Relaxed);
+}
+
+/// Serialises everything that writes or depends on the process-global switch (test threads run in
+/// parallel under a plain `cargo test`).
+static POLICY_LOCK: Mutex<()> = Mutex::new(());
+
+/// Holds the process-wide GEMV switch lock; restores the switch it found when dropped. Returned by
+/// [`nvfp4_gemv_policy_guard`].
+#[doc(hidden)]
+#[must_use = "the policy is only held (and restored) while the guard is alive"]
+pub struct Nvfp4GemvPolicyGuard {
+    previous: u8,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl Drop for Nvfp4GemvPolicyGuard {
+    fn drop(&mut self) {
+        POLICY.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+/// Test seam: take the process-wide GEMV switch lock, apply `enabled` (as [`set_nvfp4_gemv`]) and
+/// hand back a guard that restores the previous switch when dropped. Every test that flips the
+/// switch — or asserts which NVFP4 path ran — holds one, so parallel test threads cannot race on
+/// the global. [`set_nvfp4_gemv`] may still be called while it is held.
+#[doc(hidden)]
+pub fn nvfp4_gemv_policy_guard(enabled: Option<bool>) -> Nvfp4GemvPolicyGuard {
+    let lock = POLICY_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous = POLICY.load(Ordering::Relaxed);
+    set_nvfp4_gemv(enabled);
+    Nvfp4GemvPolicyGuard {
+        previous,
+        _lock: lock,
+    }
 }
 
 /// Per-thread counts of NVFP4 projection calls by path (monotone; take deltas with
@@ -230,6 +266,7 @@ mod tests {
 
     #[test]
     fn runtime_override_beats_the_environment_and_can_be_cleared() {
+        let _policy = nvfp4_gemv_policy_guard(None);
         let from_env = nvfp4_gemv_enabled();
         set_nvfp4_gemv(Some(false));
         assert!(!nvfp4_gemv_enabled());
@@ -237,5 +274,21 @@ mod tests {
         assert!(nvfp4_gemv_enabled());
         set_nvfp4_gemv(None);
         assert_eq!(nvfp4_gemv_enabled(), from_env);
+    }
+
+    #[test]
+    fn the_policy_guard_restores_the_switch_it_found() {
+        let before = nvfp4_gemv_policy_guard(None).previous;
+        {
+            let _held = nvfp4_gemv_policy_guard(Some(false));
+            assert!(!nvfp4_gemv_enabled());
+            set_nvfp4_gemv(Some(true));
+            assert!(nvfp4_gemv_enabled());
+        }
+        let after = nvfp4_gemv_policy_guard(None);
+        assert_eq!(
+            after.previous, before,
+            "dropping the guard restores the switch"
+        );
     }
 }

@@ -654,6 +654,7 @@ mod tests {
             .to_device(&Device::Cpu)
             .unwrap();
 
+        let _gemv_on = crate::primitives::nvfp4_path::nvfp4_gemv_policy_guard(Some(true));
         let flat_bf16 = |y: Tensor| {
             y.to_dtype(DType::F32)
                 .unwrap()
@@ -712,9 +713,7 @@ mod tests {
             assert!(vs_exact <= 0.2, "M={m}: rel-RMS vs dense {vs_exact}");
 
             let got_proj = flat_bf16(y_proj);
-            if m <= candle_quant_kernels::NVFP4_GEMV_MAX_ROWS
-                && crate::primitives::nvfp4_path::nvfp4_gemv_enabled()
-            {
+            if m <= candle_quant_kernels::NVFP4_GEMV_MAX_ROWS {
                 let unquantized_ref = x_host
                     .matmul(&w_deq.t().unwrap())
                     .unwrap()
