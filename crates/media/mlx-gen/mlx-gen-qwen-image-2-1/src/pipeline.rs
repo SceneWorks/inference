@@ -313,10 +313,11 @@ pub const DECODE_OVERLAP: u32 = 64;
 /// * otherwise the provider's **automatic threshold** applies — exactly what the shared field's
 ///   contract says (`tile_vae_decode` forces tiling "even below its automatic tiling threshold";
 ///   `false` and an absent block both mean "the provider decides"). The threshold is
-///   [`crate::memory_strategy::default_decode_is_bounded`]: above the fitted 1024² area the
-///   untiled decode's MLX transient would exceed the packed tiers' whole resident set, so every
-///   upstream preset decodes bounded at 512/64 by default (sc-24114). Below it the decode is the
-///   exact single pass.
+///   [`crate::memory_strategy::default_decode_is_bounded`]: wherever the untiled decode's MLX
+///   transient exceeds the bounded one that replaces it — every area above 512², so the fitted
+///   1024² grid and every upstream preset decode bounded at 512/64 by default (sc-24114; tiling
+///   is a preferred memory optimization, bitwise parity with candle is not required). At and
+///   below 512² the decode is the exact single pass.
 pub fn decode_tiling(req: &GenerationRequest) -> Option<TilingConfig> {
     match req.memory.filter(|memory| memory.tile_vae_decode) {
         Some(memory) => Some(TilingConfig::spatial_only(
@@ -447,9 +448,10 @@ mod tests {
                 preset.ratio
             );
         }
-        // At and below the fitted 1024² area the decode is the exact single pass, with or without
-        // an explicit (non-forcing) memory block — `tile_vae_decode: false` is "provider decides".
-        assert!(decode_tiling(&request(1024, 1024, None)).is_none());
+        // The fitted 1024² grid decodes bounded too (tiling saves memory there); at and below
+        // 512² the decode is the exact single pass, with or without an explicit (non-forcing)
+        // memory block — `tile_vae_decode: false` is "provider decides".
+        assert!(decode_tiling(&request(1024, 1024, None)).is_some());
         assert!(decode_tiling(&request(512, 512, None)).is_none());
         assert!(decode_tiling(&request(512, 512, Some(GenerationMemory::default()))).is_none());
         // ...and the same non-forcing block above the threshold still decodes bounded.

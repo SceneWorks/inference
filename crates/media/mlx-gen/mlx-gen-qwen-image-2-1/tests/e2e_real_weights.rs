@@ -174,7 +174,7 @@ fn validation_render_default_preset() {
 
     // `QWEN_IMAGE_2_1_MEMORY_TRACE=1` prints a `[mem]` line at every phase boundary (sc-24114's
     // footprint investigation); `QWEN_IMAGE_2_1_RENDER_TILED=1` asks for the bounded 512/64 decode
-    // explicitly (the default already bounds every preset, sc-24114), and
+    // explicitly (the default already bounds every area above 512², sc-24114), and
     // `QWEN_IMAGE_2_1_CLEAR_CACHE_BEFORE_DECODE=1` sheds MLX's buffer cache at the `Decoding` event.
     let trace = std::env::var_os("QWEN_IMAGE_2_1_MEMORY_TRACE").is_some();
     let footprint_max = footprint_sampler();
