@@ -452,8 +452,10 @@ fn frozen_qwen38_provider_executes_ar_mtp_tools_and_stops() {
     drop(stop_provider);
     drop(stop_snapshot);
     let plain_snapshot = write_snapshot_with(&tokenizer_path, false, false);
-    let plain_provider =
-        LlamaProvider::load(&LoadSpec::dense(plain_snapshot.path().display().to_string())).unwrap();
+    let plain_provider = LlamaProvider::load(&LoadSpec::dense(
+        plain_snapshot.path().display().to_string(),
+    ))
+    .unwrap();
     assert!(plain_provider.descriptor().capabilities.mtp.is_none());
     let mut auto_request = request("auto without a head", 3);
     auto_request.mtp = MtpMode::Auto;

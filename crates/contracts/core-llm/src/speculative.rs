@@ -93,7 +93,7 @@ impl MtpPlan {
 /// policy both engines apply: `Off` never speculates; `Auto` runs the advertised recommended
 /// width when the model has a head and decodes normally (`proposer=none`) when it does not;
 /// `Enabled` runs exactly the requested width (its admissibility is checked by
-/// [`TextLlmCapabilities::validate`](crate::TextLlmCapabilities::validate) before this point, so
+/// [`TextLlmCapabilities::validate_request`](crate::TextLlmCapabilities::validate_request) before this point, so
 /// an un-advertised `Enabled` here is the caller's contract violation and resolves to `Off`
 /// rather than inventing a width).
 pub fn resolve_mtp_plan(
