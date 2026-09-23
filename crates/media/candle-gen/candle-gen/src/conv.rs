@@ -24,7 +24,7 @@
 //! call is the plain `Conv2d::forward`, byte-identical to before the guard existed.
 
 use candle_core::{Result, Tensor};
-use candle_nn::{Conv2d, Module};
+use candle_nn::{Conv2d, Conv2dConfig, Module, VarBuilder};
 
 /// The im2col element budget one chunk may materialise — 2^30, a quarter of the u32 launch bound
 /// so the `as u32` truncation can never engage, and 4 GB f32 / 2 GB bf16 of transient per chunk.
@@ -101,11 +101,69 @@ fn out_len(input: usize, k: usize, padding: usize, stride: usize, dilation: usiz
     (input + 2 * padding - dilation * (k - 1) - 1) / stride + 1
 }
 
+/// A `candle_nn::Conv2d` behind the guard: the same constructor and accessors, and a
+/// [`Module::forward`] that is [`conv2d_budgeted`] at [`CONV_IM2COL_BUDGET`]. The drop-in a VAE
+/// crate imports `as Conv2d` (with [`budgeted_conv2d`] `as conv2d`) so every one of its
+/// convolutions is guarded without touching a call site.
+#[derive(Clone, Debug)]
+pub struct BudgetedConv2d {
+    inner: Conv2d,
+}
+
+impl BudgetedConv2d {
+    pub fn new(weight: Tensor, bias: Option<Tensor>, config: Conv2dConfig) -> Self {
+        Self::from_conv(Conv2d::new(weight, bias, config))
+    }
+
+    pub fn from_conv(inner: Conv2d) -> Self {
+        Self { inner }
+    }
+
+    /// The un-guarded convolution, for a caller that has already bounded its input.
+    pub fn inner(&self) -> &Conv2d {
+        &self.inner
+    }
+
+    pub fn weight(&self) -> &Tensor {
+        self.inner.weight()
+    }
+
+    pub fn bias(&self) -> Option<&Tensor> {
+        self.inner.bias()
+    }
+
+    pub fn config(&self) -> &Conv2dConfig {
+        self.inner.config()
+    }
+}
+
+impl Module for BudgetedConv2d {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        conv2d_budgeted(x, &self.inner, CONV_IM2COL_BUDGET)
+    }
+}
+
+/// `candle_nn::conv2d` (weight + bias from `vb`) into a [`BudgetedConv2d`].
+pub fn budgeted_conv2d(
+    in_channels: usize,
+    out_channels: usize,
+    kernel_size: usize,
+    cfg: Conv2dConfig,
+    vb: VarBuilder,
+) -> Result<BudgetedConv2d> {
+    Ok(BudgetedConv2d::from_conv(candle_nn::conv2d(
+        in_channels,
+        out_channels,
+        kernel_size,
+        cfg,
+        vb,
+    )?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use candle_core::Device;
-    use candle_nn::Conv2dConfig;
 
     fn fill(shape: (usize, usize, usize, usize), seed: usize) -> Tensor {
         let n = shape.0 * shape.1 * shape.2 * shape.3;
@@ -183,16 +241,16 @@ mod tests {
         }
     }
 
-    /// The production geometry the guard exists for: the Qwen-Image 2.1 decoder's full-resolution
-    /// stage (sc-24114 evidence render). At 2048² both its convs exceed the u32 launch bound
-    /// un-chunked — the upsampler's 288-in conv by 2.5×, the 144-in resnets by 1.27× — and chunk
-    /// under the shipped budget; at 1024² they are under the bound but still chunk (a 5.4 GB bf16
-    /// transient otherwise); the 512² stage is a single pass.
+    /// The full-resolution 3×3 conv of every candle image VAE at the 2048² render cap — the
+    /// widest `channels × 9` each decoder runs at output resolution. Every one of them exceeds
+    /// the shipped budget and chunks; the ≥128-channel ones (and Qwen-Image 2.1's 144/288)
+    /// are past the u32 launch bound outright, which is the sc-24114 corruption. The Qwen-Image
+    /// 2.1 upsampler is the widest of all. At 512² every one is a single pass.
     #[test]
-    fn the_qwen_image_2_1_full_resolution_stage_chunks_at_2048_and_1024_not_512() {
+    fn every_image_vae_full_resolution_conv_chunks_at_2048_and_not_at_512() {
         let conv = |c_in: usize| {
             Conv2d::new(
-                Tensor::zeros((144, c_in, 3, 3), candle_core::DType::F32, &Device::Cpu).unwrap(),
+                Tensor::zeros((4, c_in, 3, 3), candle_core::DType::F32, &Device::Cpu).unwrap(),
                 None,
                 Conv2dConfig {
                     padding: 1,
@@ -200,32 +258,39 @@ mod tests {
                 },
             )
         };
-        for (c_in, side, past_launch_bound, expect_chunked) in [
-            (288usize, 2048usize, true, true),
-            (144, 2048, true, true),
-            (288, 1024, false, true),
-            (144, 1024, false, true),
-            (288, 512, false, false),
-            (144, 512, false, false),
-        ] {
-            let im2col = (side * side * c_in * 9) as u64;
+        // (crate / VAE, full-resolution input channels of its widest 3×3 conv)
+        let vaes: [(&str, usize); 8] = [
+            ("sdxl AutoencoderKL (kolors/pulid/instantid)", 128),
+            ("flux AutoencoderKL (diffusers + native)", 128),
+            ("flux2 (lens, ideogram)", 128),
+            ("chroma", 128),
+            ("sana DC-AE", 128),
+            ("qwen-image Wan z16 (krea, anima)", 96),
+            ("qwen-image-2-1 resnets", 144),
+            ("qwen-image-2-1 upsampler", 288),
+        ];
+        let widest = vaes.iter().map(|(_, c)| *c).max().unwrap();
+        assert_eq!(
+            widest, 288,
+            "the shared budget test must track the widest VAE"
+        );
+        for (label, c_in) in vaes {
+            let im2col_2048 = (2048u64 * 2048) * c_in as u64 * 9;
             assert_eq!(
-                im2col > u64::from(u32::MAX),
-                past_launch_bound,
-                "{c_in}-in at {side}²: im2col {im2col} vs the u32 launch bound"
+                im2col_2048 > u64::from(u32::MAX),
+                c_in >= 120,
+                "{label}: {c_in} ch at 2048² is {im2col_2048} im2col elements"
             );
             let plan =
-                conv2d_row_plan([1, c_in, side, side], &conv(c_in), CONV_IM2COL_BUDGET).unwrap();
+                conv2d_row_plan([1, c_in, 2048, 2048], &conv(c_in), CONV_IM2COL_BUDGET).unwrap();
+            let rows = plan.unwrap_or_else(|| panic!("{label}: must chunk at 2048²"));
+            assert!((1..2048).contains(&rows), "{label}: {rows} rows");
+            assert!((rows * 2048 * c_in * 9) as u64 <= CONV_IM2COL_BUDGET as u64);
             assert_eq!(
-                plan.is_some(),
-                expect_chunked,
-                "{c_in}-in at {side}²: {plan:?}"
+                conv2d_row_plan([1, c_in, 512, 512], &conv(c_in), CONV_IM2COL_BUDGET).unwrap(),
+                None,
+                "{label}: 512² must stay a single pass"
             );
-            if let Some(rows) = plan {
-                // Every chunk stays under the budget and hence far under the launch bound.
-                assert!((rows * side * c_in * 9) as u64 <= CONV_IM2COL_BUDGET as u64);
-                assert!(rows >= 1 && rows < side);
-            }
         }
         // The truncated launch's arithmetic, pinned: 430 correct rows at 144 in — what the
         // evidence PNG shows.

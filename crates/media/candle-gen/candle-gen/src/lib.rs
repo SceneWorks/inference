@@ -86,7 +86,9 @@ pub use attention::{
 // to u32, so a full-resolution VAE conv at 2048² silently fills only its first ~430 output rows. The
 // guard chunks over output rows past `CONV_IM2COL_BUDGET`; below it the call is the plain `Conv2d`.
 pub mod conv;
-pub use conv::{conv2d_budgeted, conv2d_row_plan, CONV_IM2COL_BUDGET};
+pub use conv::{
+    budgeted_conv2d, conv2d_budgeted, conv2d_row_plan, BudgetedConv2d, CONV_IM2COL_BUDGET,
+};
 
 // Shared Qwen3-VL text-encoder grounding helpers (sc-11205 / F-118): the MRoPE / vision-splice
 // machinery (`Rotary` 1-D RoPE table, GQA `repeat_kv`, `<|image_pad|>` `image_blocks`, the vision-embed

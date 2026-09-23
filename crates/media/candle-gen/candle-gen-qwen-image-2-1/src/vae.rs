@@ -28,9 +28,10 @@
 
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::ops::softmax_last_dim;
-use candle_gen::candle_nn::{Conv2d, Conv2dConfig, VarBuilder};
+use candle_gen::candle_nn::{Conv2dConfig, Module, VarBuilder};
 use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
 use candle_gen::gen_core::{CancelFlag, LatentSpace};
+use candle_gen::BudgetedConv2d as Conv2d;
 use candle_gen::{CandleError as Error, LatentDecoder, Result};
 
 use crate::config::VaeConfig;
@@ -78,11 +79,7 @@ impl Conv {
     /// first 430 output rows. The ≤512² stages — and every parity fixture — stay the
     /// byte-identical single pass; the 1024² and 2048² full-resolution convs chunk.
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        Ok(candle_gen::conv2d_budgeted(
-            &x.contiguous()?,
-            &self.inner,
-            candle_gen::CONV_IM2COL_BUDGET,
-        )?)
+        Ok(self.inner.forward(&x.contiguous()?)?)
     }
 }
 
