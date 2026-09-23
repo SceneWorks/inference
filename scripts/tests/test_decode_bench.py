@@ -376,6 +376,11 @@ class DecodeBenchWrapperTests(unittest.TestCase):
         one_token = suite_document(new_tokens=1)
         one_token["rows"][1]["cache_checkpoint_bytes"] = 0
         bench.validate_suite_document(one_token)
+        # sc-24138: a llama-family document's step cache keeps no checkpoints by design.
+        llama = suite_document()
+        llama["model_family"] = "llama"
+        llama["rows"][1]["cache_checkpoint_bytes"] = 0
+        bench.validate_suite_document(llama)
 
     def test_table_refuses_runs_that_are_not_comparable(self) -> None:
         base = comparable_run("base")

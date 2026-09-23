@@ -155,11 +155,13 @@ tokens/s by occupancy. (The custom paged attention kernel that would batch the p
 loop — the next bottleneck as occupancy grows — is the deferred story 7258 / mlx sc-7325.)
 
 The `speculative` test covers **speculative decoding** — proposing several tokens per target forward
-and verifying them in one batched pass (`decode_logits_all`), accepting the longest agreeing prefix +
-a bonus and rolling back rejected drafts via the `KvCache::truncate` seam, in two flavors:
-**prompt-lookup** (`generate_prompt_lookup`, n-gram proposer, no draft model) and **draft-model**
-(`generate_draft_speculative`, a small/quantized model proposes, the big model verifies, accepted via
-the distribution-preserving acceptance sampler). With `num_draft = 0` the verify is a single-token
+and verifying them in one all-position step, accepting the longest agreeing prefix + a bonus and
+rolling back rejected drafts via `DecodeCache::rollback_to` — through the one unified engine
+(`generate_speculative`; the pre-epic `CausalLm` loops were retired in sc-24138) in two flavors:
+**prompt-lookup** (`NgramProposer`, no draft model) and **draft-model** (`DraftModelProposer`, a
+small/quantized model proposes, the big model verifies, accepted via the distribution-preserving
+acceptance sampler; a draft whose vocabulary is not the target's is refused before any inference).
+With `num_draft = 0` the verify is a single-token
 forward, so both are **bit-identical** to non-speculative `generate` — the exactness gate. A synthetic
 CPU model also shows draft acceptance (`forwards < tokens`) at identical greedy output (an identical
 draft accepts every token); the `#[ignore]`d real-weights variants confirm the speedup on a GPU
@@ -185,6 +187,27 @@ never clones the cache), one state with MTP off. A rollback past the ring is the
 a measured `decode::DecodeRecord` (path taken, target forwards, proposed/accepted tokens, host syncs);
 the provider exposes the last one through `LlamaProvider::last_decode_record`. The reference `Decode`
 loop is unchanged and stays the parity oracle.
+
+Every other decoder reaches the same machinery through the same two seams (sc-24138): `CausalLm`
+(the whole llama family — Llama, Qwen3 dense, Gemma 2/4, GLM-4, DeepSeek-V2 MLA, Qwen3-VL's
+decoder), `StarCoder2` (StarVector-8B) and the StarVector-1B GPTBigCode decoder implement
+`StepModel` over the one shared `primitives::StepKvCache` — static (per-layer preallocated
+`StaticKvCache`, the default), growing (the reference concat) or paged (kept behind the seam for
+continuous batching). No decoder keeps a private cache or decode loop: LLaVA and both StarVector
+providers prefill their conditioning into the step cache and decode through the engine
+(`decode::generate_step_from_prefill`). The provider decodes a llama-family request (text, and the
+Gemma 4 soft-token splice) through the unified engine on the static KV cache, priced in admission
+by the widest layer's KV geometry; `LlamaProvider::set_causal_decode_path(DecodePath::Reference)`
+keeps the `Decode` loop selectable as the oracle. `CausalLm` and `StarCoder2` attend
+un-expanded (`AttnFormulation::Gqa`, `sdpa_gqa_causal`) by default on every path, so the
+reference loop and the static cache are one arithmetic and token-identical by construction;
+`set_attn_formulation(AttnFormulation::Expanded)` selects the pre-migration `repeat_kv` arithmetic
+as a labelled comparison. As at S4 (sc-24132), the default reference's numerics moved from the
+expanded arithmetic's by at most one bf16 ULP at attention-GEMM knife-edges (on Qwen3-8B the two
+reference loops first differ at token index 65 of 256). `tests/step_seam_migration.rs` holds every
+decoder to goldens captured on the pre-migration tree (`tests/goldens/sc24138/`) with `Expanded`
+selected — logits bit for bit in the configuration they were measured on (Windows x86_64 MSVC),
+tokens exactly and logits within 1e-4 elsewhere.
 
 The `vlm` test covers the **vision-language path** (`LlavaModel` + `LlavaProvider`): a SigLIP vision
 tower ([`SiglipVisionTower`]) encodes the image, a two-layer GELU MLP projector lifts a chosen

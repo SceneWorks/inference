@@ -3,9 +3,9 @@
 //! **One** speculative loop over the [`StepModel`] / [`DecodeCache`] seams, with the proposal
 //! source behind the [`Proposer`] trait — the native MTP head, prompt lookup (n-gram) and a draft
 //! model ([`proposers`](super::proposers)). It replaces the Qwen-only `qwen_mtp` loop (whose
-//! verify / accept / rollback logic moved here) and is the only speculative path Qwen3.6/3.8 runs;
-//! the pre-epic `CausalLm` loops in [`speculative`](super::speculative) stay until the llama family
-//! is migrated onto the seams (S10).
+//! verify / accept / rollback logic moved here) and is the only speculative path: the pre-epic
+//! `CausalLm` prompt-lookup and draft-model loops were retired when the llama family moved onto
+//! the seams (S10, sc-24138), their proposers living in [`proposers`](super::proposers).
 //!
 //! ## One step
 //! 1. **Propose** `K` drafts after the current token `cur` (the last committed token, not yet in
@@ -198,6 +198,15 @@ pub trait Proposer {
         false
     }
 
+    /// The vocabulary the proposer draws its drafts from, when it is a separate model — the
+    /// engine refuses a proposer whose vocabulary is not the target's before any inference
+    /// (a draft id past the target's vocabulary, or one naming a different token, would be
+    /// verified as garbage). `None` (the default) for a proposer that shares the target's
+    /// vocabulary by construction (MTP, n-gram).
+    fn vocab_size(&self) -> Option<usize> {
+        None
+    }
+
     /// Warm from the prefilled prompt: `prompt` is the effective prompt ids, `prompt_hidden` the
     /// target's hidden rows for every prompt position when [`wants_hidden`](Self::wants_hidden).
     fn warm(&mut self, prompt: &[i32], prompt_hidden: Option<&Tensor>) -> Result<()>;
@@ -334,6 +343,14 @@ pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer>(
     let mut stats = SpeculativeStats::default();
     let mut verify_host_syncs = 0u64;
     let device = model.device();
+    if let Some(draft_vocab) = proposer.vocab_size() {
+        if draft_vocab != model.vocab_size() {
+            return Err(Error::Msg(format!(
+                "draft/target vocab mismatch: draft {draft_vocab} vs target {}",
+                model.vocab_size()
+            )));
+        }
+    }
     let wants_hidden = proposer.wants_hidden();
     let kind = proposer.kind();
 

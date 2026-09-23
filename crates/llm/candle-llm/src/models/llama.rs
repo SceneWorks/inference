@@ -32,14 +32,19 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module};
 
 use crate::config::{Architecture, LayerAttentionType, ModelConfig};
+use crate::decode::step::{LogitsScope, StepModel, StepOutput, StepRequest};
 use crate::device::compute_dtype;
 use crate::error::{Error, Result};
 use crate::models::deepstack::{self, deepstack_fused_decoder_layers, MropePositions};
-use crate::primitives::attention::{sdpa, AttnMask};
-use crate::primitives::kv_cache::KvCache;
-use crate::primitives::nn::{embed, gelu, rms_norm, rms_norm_unscaled, silu, soft_cap};
+use crate::primitives::attention::{sdpa, sdpa_gqa_causal, AttnFormulation, AttnMask};
+use crate::primitives::decode_cache::DecodeCache;
+use crate::primitives::kv_cache::{KvCache, KvCacheKind};
+use crate::primitives::nn::{
+    embed, gelu, rms_norm, rms_norm_residual, rms_norm_unscaled, soft_cap, swiglu,
+};
 use crate::primitives::projection::{KvProjection, Projection, QuantSpec};
-use crate::primitives::rope::{apply_rope, Rope};
+use crate::primitives::rope::{apply_rope, rms_norm_rope, Rope};
+use crate::primitives::step_kv_cache::{KvLayout, LayerKvShape, StepKvCache};
 use crate::primitives::{repeat_kv, ContiguousKvCache, PagedKvCache, Weights};
 
 fn dense_tensor(
@@ -126,6 +131,20 @@ pub struct CausalLm {
     /// Whether any layer reads its keys/values from an earlier one (Gemma 4 `num_kv_shared_layers`).
     /// Those are published per forward, so a continued (cached) generation is refused.
     kv_sharing: bool,
+    /// How grouped-query attention is computed on the reference paths and on a growing step cache
+    /// (story sc-24138): [`AttnFormulation::Gqa`] by default — the un-expanded `sdpa_gqa_causal`
+    /// the static cache runs, so the reference loop and the fast path are the same arithmetic and
+    /// token-identical by construction (as S4 made the Qwen3.5 hybrid's reference) — or
+    /// [`AttnFormulation::Expanded`], the pre-migration `repeat_kv` + `sdpa` arithmetic, selected
+    /// explicitly for a labelled comparison: it reproduces the pre-migration tree's numerics bit for
+    /// bit (the sc-24138 goldens). The two differ by at most one bf16 ULP at attention-GEMM
+    /// knife-edges (see sc-24132). A static step cache always attends un-expanded wherever the
+    /// layer can; a layer that cannot (soft-cap, sliding window, MLA) keeps the expanded
+    /// arithmetic whatever is selected.
+    attn_formulation: AttnFormulation,
+    /// Which KV cache [`StepModel::new_cache_for`] builds: [`KvCacheKind::Static`] (the default) or
+    /// [`KvCacheKind::Growing`] (the reference concat, through the same seam).
+    step_kv_cache: KvCacheKind,
 }
 
 impl CausalLm {
@@ -525,6 +544,8 @@ impl CausalLm {
                 .as_deref()
                 .is_some_and(|g| g.first_kv_shared_layer().is_some()),
             cfg,
+            attn_formulation: AttnFormulation::Gqa,
+            step_kv_cache: KvCacheKind::Static,
         })
     }
 
@@ -583,6 +604,157 @@ impl CausalLm {
     /// as separate caches over a shared [`BlockPool`](crate::primitives::BlockPool).
     pub fn new_paged_cache(&self, block_size: usize) -> PagedKvCache {
         PagedKvCache::new(self.cfg.num_layers, block_size)
+    }
+
+    /// The per-layer KV geometry the step seam allocates and admission prices (sc-24138): each
+    /// layer's own KV-head count and head widths (Gemma 4's layer types disagree on both;
+    /// DeepSeek-V2's materialized MLA caches full-head `qk_nope + qk_rope` keys beside
+    /// `v_head_dim` values), on the layer's own device; `None` for a Gemma 4 KV-shared tail layer,
+    /// which caches nothing.
+    pub fn kv_layout(&self) -> KvLayout {
+        let layers = (0..self.cfg.num_layers)
+            .map(|i| {
+                let device = self.layer_devices[i].clone();
+                if let Some(mla) = self.cfg.mla.filter(|_| self.cfg.is_mla()) {
+                    return Some(LayerKvShape {
+                        kv_heads: self.cfg.num_heads.max(0) as usize,
+                        key_dim: mla.q_head_dim().max(0) as usize,
+                        value_dim: mla.v_head_dim.max(0) as usize,
+                        device,
+                    });
+                }
+                if self
+                    .cfg
+                    .gemma4
+                    .as_deref()
+                    .is_some_and(|g| g.is_kv_shared(i))
+                {
+                    return None;
+                }
+                let la = self.cfg.layer_attention(i);
+                Some(LayerKvShape {
+                    kv_heads: la.num_kv_heads.max(0) as usize,
+                    key_dim: la.head_dim.max(0) as usize,
+                    value_dim: la.head_dim.max(0) as usize,
+                    device,
+                })
+            })
+            .collect();
+        KvLayout {
+            layers,
+            dtype: self.dtype,
+        }
+    }
+
+    /// Bytes [`new_static_cache`](Self::new_static_cache) preallocates for `capacity` positions —
+    /// the term admission charges for the static KV cache (E6). Saturating.
+    pub fn static_kv_bytes(&self, capacity: usize) -> usize {
+        self.kv_layout().static_bytes(capacity)
+    }
+
+    /// A step-seam cache whose caching layers are **preallocated** static KV buffers holding
+    /// `capacity` positions (story sc-24132's cache, per layer). A `capacity` of zero is
+    /// [`Error::Msg`]; one past `max_position_embeddings` is [`Error::KvCapacityExceeded`] — both
+    /// refused before anything is allocated.
+    pub fn new_static_cache(&self, capacity: usize) -> Result<StepKvCache> {
+        let max_positions = usize::try_from(self.cfg.max_position_embeddings).unwrap_or(0);
+        if max_positions > 0 && capacity > max_positions {
+            return Err(Error::KvCapacityExceeded {
+                requested: capacity,
+                capacity: max_positions,
+            });
+        }
+        StepKvCache::preallocated(&self.kv_layout(), capacity)
+    }
+
+    /// A step-seam cache on the growing backing — the reference concat, through the seam.
+    pub fn new_step_cache(&self) -> StepKvCache {
+        StepKvCache::growing(&self.kv_layout())
+    }
+
+    /// A step-seam cache on a fresh `block_size`-token paged backing (the continuous-batching /
+    /// prefix-sharing cache, kept behind the seam rather than replaced).
+    pub fn new_paged_step_cache(&self, block_size: usize) -> StepKvCache {
+        StepKvCache::paged(self.new_paged_cache(block_size), &self.kv_layout())
+    }
+
+    /// Select how the reference paths and a growing step cache attend (see the field docs):
+    /// [`AttnFormulation::Gqa`] is the default; [`AttnFormulation::Expanded`] reproduces the
+    /// pre-migration arithmetic for a labelled comparison. The static cache attends un-expanded
+    /// regardless.
+    pub fn set_attn_formulation(&mut self, formulation: AttnFormulation) {
+        self.attn_formulation = formulation;
+    }
+
+    /// The selected formulation (what the reference paths request).
+    pub fn attn_formulation(&self) -> AttnFormulation {
+        self.attn_formulation
+    }
+
+    /// Select which KV cache [`StepModel::new_cache_for`] builds.
+    pub fn set_step_kv_cache(&mut self, kind: KvCacheKind) {
+        self.step_kv_cache = kind;
+    }
+
+    /// Which KV cache [`StepModel::new_cache_for`] builds.
+    pub fn step_kv_cache(&self) -> KvCacheKind {
+        self.step_kv_cache
+    }
+
+    /// What actually ran when `requested` was asked for: [`AttnFormulation::Gqa`] only when every
+    /// attention layer can express it — grouped-query attention with no score soft-cap (Gemma 2),
+    /// no sliding window (Gemma 4) and not MLA; a layer that cannot keeps the `repeat_kv` + `sdpa`
+    /// arithmetic, and one such layer makes the request's label [`AttnFormulation::Expanded`].
+    pub fn effective_attn_formulation(&self, requested: AttnFormulation) -> AttnFormulation {
+        match requested {
+            AttnFormulation::Gqa if self.layers.iter().all(|l| l.attn.gqa_expressible()) => {
+                AttnFormulation::Gqa
+            }
+            _ => AttnFormulation::Expanded,
+        }
+    }
+
+    /// The formulation a request on `cache` asks for: un-expanded on a static cache, the model's
+    /// selector otherwise.
+    fn cache_formulation(&self, cache: &StepKvCache) -> AttnFormulation {
+        match cache.kv_kind() {
+            KvCacheKind::Static => AttnFormulation::Gqa,
+            KvCacheKind::Growing => self.attn_formulation,
+        }
+    }
+
+    /// Prefill precomputed `embeds` `[1, S, hidden]` into a step-seam cache at its current length
+    /// (plus its RoPE delta) and return the last-position logits `[1, vocab]` — the multimodal
+    /// splice point (LLaVA, the Gemma 4 soft tokens) for a request that then decodes through the
+    /// seam. Attends in the cache's formulation, exactly as [`StepModel::forward_step`] would.
+    pub fn step_prefill_from_embeds(
+        &self,
+        embeds: &Tensor,
+        cache: &mut StepKvCache,
+    ) -> Result<Tensor> {
+        let (b, s, _) = embeds.dims3()?;
+        let h = self.step_hidden(embeds, cache)?;
+        let last_h = h.narrow(1, s - 1, 1)?.contiguous()?;
+        Ok(self
+            .project_logits(&last_h)?
+            .reshape((b, self.cfg.vocab_size as usize))?)
+    }
+
+    /// The decoder stack over `embeds` at the cache's position (length + RoPE delta), in the
+    /// cache's formulation: final hidden states `[b, s, hidden]` (pre-norm).
+    fn step_hidden(&self, embeds: &Tensor, cache: &mut StepKvCache) -> Result<Tensor> {
+        let s = embeds.dim(1)?;
+        let offset = DecodeCache::len(cache) + cache.rope_delta();
+        let tables = self.rope_tables_seq(s as i32, offset)?;
+        let formulation = self.cache_formulation(cache);
+        self.run_decoder_stack_collecting(
+            embeds,
+            cache,
+            &tables,
+            AttnMask::Causal,
+            None,
+            formulation,
+        )
     }
 
     /// The engine's compute dtype for this model (bf16 on GPU, f32 on CPU) — the batched decode reads
@@ -740,7 +912,14 @@ impl CausalLm {
         let s = input_embeds.dim(1)? as i32;
         let tables = self.rope_tables_seq(s, offset)?;
         let mut out = Vec::with_capacity(self.layers.len() + 1);
-        self.run_decoder_stack_collecting(input_embeds, cache, &tables, mask, Some(&mut out))?;
+        self.run_decoder_stack_collecting(
+            input_embeds,
+            cache,
+            &tables,
+            mask,
+            Some(&mut out),
+            self.attn_formulation,
+        )?;
         if let Some(last) = out.last_mut() {
             *last = rms_norm(last, &self.norm, self.cfg.rms_norm_eps as f64)?;
         }
@@ -866,6 +1045,7 @@ impl CausalLm {
                     cache: &mut *cache,
                     layer_idx: i,
                     shared_kv: &mut shared_kv,
+                    formulation: self.attn_formulation,
                 };
                 self.layers[i].forward(&h, &cos_d, &sin_d, AttnMask::Causal, &mut state)
             },
@@ -1022,7 +1202,14 @@ impl CausalLm {
         tables: &RopeTables,
         mask: AttnMask<'_>,
     ) -> Result<Tensor> {
-        self.run_decoder_stack_collecting(input_embeds, cache, tables, mask, None)
+        self.run_decoder_stack_collecting(
+            input_embeds,
+            cache,
+            tables,
+            mask,
+            None,
+            self.attn_formulation,
+        )
     }
 
     /// [`CausalLm::run_decoder_stack`] with an optional sink for **every** layer's output — the one
@@ -1035,6 +1222,7 @@ impl CausalLm {
         tables: &RopeTables,
         mask: AttnMask<'_>,
         mut collect: Option<&mut Vec<Tensor>>,
+        formulation: AttnFormulation,
     ) -> Result<Tensor> {
         // Gemma 4's KV-sharing tail reads keys/values published **within one forward**. Upstream
         // keeps `shared_kv_states` alive across decode steps (they are the prefill's full-length
@@ -1097,6 +1285,7 @@ impl CausalLm {
                 cache: &mut *cache,
                 layer_idx: i,
                 shared_kv: &mut shared_kv,
+                formulation,
             };
             h = layer.forward(&h, cos_d, sin_d, layer_mask, &mut state)?;
             if let Some(sink) = collect.as_deref_mut() {
@@ -1214,6 +1403,81 @@ impl crate::decode::Decode for CausalLm {
 
     fn step(&self, input_ids: &Tensor, cache: &mut dyn KvCache, offset: i32) -> Result<Tensor> {
         self.decode_logits(input_ids, cache, offset)
+    }
+}
+
+impl StepModel for CausalLm {
+    type Cache = StepKvCache;
+
+    /// A step-seam cache on the growing backing.
+    fn new_cache(&self) -> StepKvCache {
+        self.new_step_cache()
+    }
+
+    /// The static cache sized for `capacity + overshoot` positions (or the growing backing when
+    /// [`set_step_kv_cache`](CausalLm::set_step_kv_cache) selected it).
+    fn new_cache_for(&self, capacity: usize, overshoot: usize) -> Result<StepKvCache> {
+        match self.step_kv_cache {
+            KvCacheKind::Static => self.new_static_cache(capacity.saturating_add(overshoot)),
+            KvCacheKind::Growing => Ok(self.new_step_cache()),
+        }
+    }
+
+    /// Un-expanded on a static cache where every layer can express it; otherwise the selector's
+    /// effective formulation (see [`CausalLm::effective_attn_formulation`]).
+    fn attn_formulation(&self, cache: &StepKvCache) -> AttnFormulation {
+        self.effective_attn_formulation(self.cache_formulation(cache))
+    }
+
+    /// Not replayable as a CUDA graph (story sc-24134), declared so the runner refuses before any
+    /// capture: a Mixture-of-Experts layer pulls its router probabilities to the host every step
+    /// for the top-k (`moe_router_host_read`), and every step's positions are Rust-side scalars —
+    /// the RoPE offset taken from the cache's length, the KV written at that offset, attention
+    /// bounded by the host-side length — which a graph would replay at the captured position
+    /// (`positions_host_scalar`).
+    fn graph_support(&self) -> std::result::Result<(), &'static str> {
+        if self.layers.iter().any(|l| matches!(l.ffn, Ffn::Moe(_))) {
+            return Err("moe_router_host_read");
+        }
+        Err("positions_host_scalar")
+    }
+
+    fn device(&self) -> &Device {
+        &self.device
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.cfg.vocab_size as usize
+    }
+
+    fn forward_step(
+        &self,
+        cache: &mut StepKvCache,
+        request: StepRequest<'_>,
+    ) -> Result<StepOutput> {
+        if request.is_empty()? {
+            return Err(Error::Msg(
+                "CausalLm::forward_step: empty token slice".into(),
+            ));
+        }
+        let ids = request.tokens.ids(&self.device)?;
+        let embeds = self.embed(&ids)?;
+        let (b, s, _) = embeds.dims3()?;
+        let h = self.step_hidden(&embeds, cache)?;
+        let logits = match request.scope {
+            LogitsScope::Last => {
+                let last_h = h.narrow(1, s - 1, 1)?.contiguous()?;
+                self.project_logits(&last_h)?
+                    .reshape((b, self.cfg.vocab_size as usize))?
+            }
+            LogitsScope::All => self.project_logits(&h)?,
+        };
+        let hidden = if request.want_hidden {
+            Some(rms_norm(&h, &self.norm, self.cfg.rms_norm_eps as f64)?)
+        } else {
+            None
+        };
+        Ok(StepOutput { logits, hidden })
     }
 }
 
@@ -1408,6 +1672,8 @@ struct LayerState<'a> {
     cache: &'a mut dyn KvCache,
     layer_idx: usize,
     shared_kv: &'a mut SharedKv,
+    /// How a grouped-query layer attends (see [`CausalLm::effective_attn_formulation`]).
+    formulation: AttnFormulation,
 }
 
 impl LlamaLayer {
@@ -1464,10 +1730,11 @@ impl LlamaLayer {
                 let ffn = rms_norm(&ffn, post_ff, self.eps)?;
                 h.broadcast_add(&ffn)?
             }
-            // Llama pre-norm: `post_ln` is the MLP pre-norm.
+            // Llama pre-norm: `post_ln` is the MLP pre-norm. The residual add and the norm are one
+            // fused launch on the fused path (sc-24137), bit-identical to the two ops.
             _ => {
-                let h = x.broadcast_add(attn)?;
-                let ffn = self.ffn.forward(&rms_norm(&h, &self.post_ln, self.eps)?)?;
+                let (h, normed) = rms_norm_residual(x, attn, &self.post_ln, self.eps)?;
+                let ffn = self.ffn.forward(&normed)?;
                 h.broadcast_add(&ffn)?
             }
         };
@@ -1504,6 +1771,15 @@ enum Attention {
 }
 
 impl Attention {
+    /// Whether this layer can attend through [`sdpa_gqa_causal`] (see
+    /// [`CausalLm::effective_attn_formulation`]).
+    fn gqa_expressible(&self) -> bool {
+        match self {
+            Attention::Gqa(a) => a.softcap.is_none() && a.sliding_window.is_none(),
+            Attention::Mla(_) => false,
+        }
+    }
+
     fn forward(
         &self,
         x: &Tensor,
@@ -1610,13 +1886,6 @@ impl LlamaAttention {
         let mut k = raw_k.reshape((b, s, nkv, hd))?;
         let v = raw_v.reshape((b, s, nkv, hd))?;
 
-        // Qwen3 / Gemma 4 per-head q/k RMSNorm over the head_dim axis, before RoPE.
-        if let Some(qn) = &self.q_norm {
-            q = rms_norm(&q, qn, self.eps)?;
-        }
-        if let Some(kn) = &self.k_norm {
-            k = rms_norm(&k, kn, self.eps)?;
-        }
         // Gemma 4's `v_norm`: parameterless, and on the **raw** projection output — never on the
         // k_norm'd or RoPE'd key, even when the projection is shared.
         let v = if self.v_norm {
@@ -1625,13 +1894,13 @@ impl LlamaAttention {
             v
         };
 
-        // RoPE on q,k (cos/sin broadcast over the head axis), then -> [b, heads, s, head_dim].
-        let q = apply_rope(&q, cos, sin, self.rope_interleaved)?
-            .transpose(1, 2)?
-            .contiguous()?;
-        let k = apply_rope(&k, cos, sin, self.rope_interleaved)?
-            .transpose(1, 2)?
-            .contiguous()?;
+        // Qwen3 / Gemma 4 per-head q/k RMSNorm over the head_dim axis, then RoPE on q,k (cos/sin
+        // broadcast over the head axis) — one fused launch per side on the fused path (sc-24137),
+        // bit-identical to the two ops — then -> [b, heads, s, head_dim].
+        q = self.norm_rope(&q, self.q_norm.as_ref(), cos, sin)?;
+        k = self.norm_rope(&k, self.k_norm.as_ref(), cos, sin)?;
+        let q = q.transpose(1, 2)?.contiguous()?;
+        let k = k.transpose(1, 2)?.contiguous()?;
         let v = v.transpose(1, 2)?.contiguous()?;
         Ok((q, k, v))
     }
@@ -1640,16 +1909,28 @@ impl LlamaAttention {
     /// itself. Returns `[b, heads, s, head_dim]`.
     fn project_queries(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
-        let mut q = self
+        let q = self
             .q
             .forward(x)?
             .reshape((b, s, self.num_heads, self.head_dim))?;
-        if let Some(qn) = &self.q_norm {
-            q = rms_norm(&q, qn, self.eps)?;
-        }
-        Ok(apply_rope(&q, cos, sin, self.rope_interleaved)?
+        Ok(self
+            .norm_rope(&q, self.q_norm.as_ref(), cos, sin)?
             .transpose(1, 2)?
             .contiguous()?)
+    }
+
+    /// The optional per-head RMSNorm (`norm`) followed by RoPE, over `[b, s, heads, head_dim]`.
+    fn norm_rope(
+        &self,
+        x: &Tensor,
+        norm: Option<&Tensor>,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<Tensor> {
+        match norm {
+            Some(w) => rms_norm_rope(x, w, self.eps, cos, sin, self.rope_interleaved),
+            None => apply_rope(x, cos, sin, self.rope_interleaved),
+        }
     }
 
     /// The mask this layer actually attends under: the forward's mask, narrowed by the layer's
@@ -1730,10 +2011,20 @@ impl LlamaAttention {
                 (q, k_all, v_all)
             }
         };
-        let k_all = repeat_kv(&k_all, self.groups)?;
-        let v_all = repeat_kv(&v_all, self.groups)?;
         let mask = self.layer_mask(mask);
-        let out = sdpa(&q, &k_all, &v_all, self.scale, self.softcap, mask)?; // [b, heads, s, head_dim]
+        // [b, heads, s, head_dim]. Un-expanded where the formulation asks for it and the layer can
+        // express it (plain causal, no soft-cap — a sliding layer's mask is `SlidingCausal` here);
+        // otherwise the `repeat_kv` expansion through `sdpa`, the pre-migration arithmetic.
+        let out = match (state.formulation, mask) {
+            (AttnFormulation::Gqa, AttnMask::Causal) if self.softcap.is_none() => {
+                sdpa_gqa_causal(&q, &k_all, &v_all, self.scale)?
+            }
+            _ => {
+                let k_all = repeat_kv(&k_all, self.groups)?;
+                let v_all = repeat_kv(&v_all, self.groups)?;
+                sdpa(&q, &k_all, &v_all, self.scale, self.softcap, mask)?
+            }
+        };
         self.output(&out)
     }
 
@@ -2006,9 +2297,15 @@ struct LlamaMlp {
 impl LlamaMlp {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let g = self.gate.forward(x)?;
-        let g = if self.gelu { gelu(&g)? } else { silu(&g)? };
         let up = self.up.forward(x)?;
-        self.down.forward(&(g * up)?)
+        // SwiGLU is one fused launch on the fused path (sc-24137), bit-identical to `silu · up`;
+        // the Gemma GeGLU keeps its op chain.
+        let gated = if self.gelu {
+            (gelu(&g)? * up)?
+        } else {
+            swiglu(&g, &up)?
+        };
+        self.down.forward(&gated)
     }
 }
 

@@ -7,11 +7,13 @@
 //! step of that shape. Model files carry no graph logic. A captured step is replayable at a new
 //! position only when every per-step position its kernels read is **device data** (staged by
 //! [`DecodeCache::stage_positions`]) and its state lives at **stable addresses** (a static KV
-//! cache). No Qwen3.5/3.8 step meets that on this revision — `Qwen35Model` keeps its positions as
-//! Rust-side scalars and declares so ([`StepModel::graph_support`] → `positions_host_scalar`), and
-//! the S1 hybrid cache still replaces its DeltaNet state per step (`deltanet_state_unstable`) — so
-//! the runner refuses those steps by name before any capture. The synthetic step model in the CUDA
-//! tests below meets it, and is what proves the runner end to end.
+//! cache, and — since sc-24131 — the per-token DeltaNet checkpoint ring, whose live state is a view
+//! of a preallocated slot written in place). No Qwen3.5/3.8 step meets that on this revision —
+//! `Qwen35Model` keeps its positions as Rust-side scalars and declares so
+//! ([`StepModel::graph_support`] → `positions_host_scalar`); a ring-less hybrid cache still
+//! replaces its DeltaNet state per step (`deltanet_state_unstable`) — so the runner refuses those
+//! steps by name before any capture. The synthetic step model in the CUDA tests below meets it,
+//! and is what proves the runner end to end.
 //!
 //! ## What a captured step is
 //! Stream capture records every launch, memcpy and stream-ordered allocation the step issues
@@ -661,8 +663,9 @@ impl<'m, M: StepModel> GraphRunner<'m, M> {
             if ctx.is_managing_stream_synchronization() {
                 return Some(REASON_EVENT_TRACKING);
             }
-            // The cache's declaration first: it names the state a cache change lifts (S3's
-            // stable-address DeltaNet ring), the gate ahead of the model's own (positions).
+            // The cache's declaration first: it names the state a cache change lifts (a
+            // ring-less DeltaNet cache's replaced state, a growing KV), the gate ahead of the
+            // model's own (positions).
             if let Err(reason) = cache.graph_support() {
                 return Some(reason);
             }
@@ -2971,11 +2974,13 @@ mod cuda_tests {
         assert_eq!(reserved(&dev), 0, "dropping the graphs trims the pool");
     }
 
-    /// The Qwen3.5/3.8 decoder is refused by declaration before any capture: on a pure-attention
-    /// tiny config with the static KV cache the model's Rust-scalar positions
-    /// (`positions_host_scalar`), on the hybrid config the cache's replaced DeltaNet state
-    /// (`deltanet_state_unstable`, checked first). What a recording of its step would hold is
-    /// measured with `census_step`: candle's per-op layout uploads (host-sourced memcpy nodes).
+    /// The Qwen3.5/3.8 decoder is refused by declaration before any capture: on the pure-attention
+    /// and the hybrid tiny configs alike, on the engine's cache (static KV, and on the hybrid the
+    /// per-token DeltaNet ring of sc-24131, whose state stays at stable addresses), by the model's
+    /// Rust-scalar positions (`positions_host_scalar`). What a recording of its step would hold is
+    /// measured with `census_step`: candle's per-op layout uploads (host-sourced memcpy nodes),
+    /// and — on the hybrid — no allocation outliving the step (`escaped=0`: the ring is written
+    /// in place, where the S1 cache replaced every linear layer's states).
     #[test]
     fn qwen35_steps_are_refused_by_declaration_and_the_census_finds_layout_uploads() {
         use crate::models::qwen35::tests::{text_model_attention_only_on, text_model_on};
@@ -3056,9 +3061,43 @@ mod cuda_tests {
         );
         assert_eq!(
             record.cuda_graphs.fallback_reason,
-            Some("deltanet_state_unstable")
+            Some("positions_host_scalar")
         );
         assert!(runner.last_census().is_none(), "refused before any capture");
+
+        // The hybrid step on the engine's cache (static KV + per-token DeltaNet ring), decode and
+        // a 4-token verify: the ring keeps the recurrent state in place, so nothing the step
+        // allocates outlives it; the layout uploads remain.
+        let mut cache = hybrid.new_cache_for(prompt.len() + 8, 3).unwrap();
+        assert_eq!(cache.graph_support(), Ok(()));
+        hybrid
+            .forward_step(&mut cache, StepRequest::last(&prompt))
+            .unwrap();
+        hybrid
+            .forward_step(&mut cache, StepRequest::last(&[3]))
+            .unwrap();
+        hybrid
+            .forward_step(&mut cache, StepRequest::all(&[4, 5, 6, 7]))
+            .unwrap();
+        let decode = census_step(&hybrid, &mut cache, StepRequest::last(&[5]))
+            .unwrap()
+            .expect("the decode step records");
+        let verify = census_step(&hybrid, &mut cache, StepRequest::all(&[4, 5, 6, 7]))
+            .unwrap()
+            .expect("the verify step records");
+        for (name, census) in [("1-token", decode), ("4-token", verify)] {
+            eprintln!(
+                "[runner] qwen35 hybrid {name} static step census: {}",
+                census.describe()
+            );
+            assert_eq!(
+                census.escaped_allocs, 0,
+                "{name}: the ring is written in place"
+            );
+            assert!(census.mem_allocs > 0 && census.kernels > 0);
+            assert!(census.memcpy_from_host > 0);
+            assert_eq!(census.refusal(), Some(REASON_HOST_UPLOAD_IN_CAPTURE));
+        }
     }
 
     /// What a graph replay saves per step on the synthetic model (the mechanism's win on a

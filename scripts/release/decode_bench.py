@@ -53,6 +53,8 @@ DEFAULT_MODEL_KEY = "bonsai-qwen38-parent"
 # was calibrated against, so a re-uploaded config under the same revision name is refused too.
 PINNED_CONFIG_SHA256 = {
     "bonsai-qwen38-parent": "191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab",
+    # sc-24138: the llama-family row set (a `CausalLm` snapshot) runs on Qwen3-8B.
+    "qwen3-8b": "f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30",
 }
 BENCH_SOURCE_PATH = "crates/llm/candle-llm/tests/decode_bench.rs"
 HEAD_ONLY_BEGIN = "// >>> head-only\n"
@@ -332,7 +334,11 @@ def validate_suite_document(doc: dict[str, Any]) -> None:
             )
         if not isinstance(row.get("decode_tokens_per_second"), (int, float)):
             raise ValueError(f"row {row_label(row)} has no decode throughput")
-        if row.get("path") == "step_model" and doc.get("new_tokens", 0) >= 2:
+        # The Qwen3.5/3.6/3.8 hybrid's step cache always holds a DeltaNet rollback checkpoint
+        # after a single-token step; a llama-family (`CausalLm`) cache rolls back by offset and
+        # keeps none (sc-24138), so only the hybrid's zero is a bench that read a fresh cache.
+        hybrid = doc.get("model_family", "qwen35") != "llama"
+        if hybrid and row.get("path") == "step_model" and doc.get("new_tokens", 0) >= 2:
             if not row.get("cache_checkpoint_bytes"):
                 raise ValueError(
                     "step_model row reports no rollback-checkpoint bytes for a multi-token run"

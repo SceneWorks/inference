@@ -7,8 +7,9 @@
 //!   the batch axis is real, not hardcoded to 1. The dynamic-batch scheduler (story 7255) retires
 //!   finished sequences through [`KvCache::retain_sequences`]; the prefix cache (story 7256) seeds a
 //!   fresh cache from a shared prefix's stored KV via [`ContiguousKvCache::seeded`] /
-//!   [`ContiguousKvCache::export`]. The llama family still runs on it (and on the paged cache);
-//!   migrating those users is S10 of epic sc-24128.
+//!   [`ContiguousKvCache::export`]. It is the reference paths' cache (the llama family's
+//!   `Decode` loop, the oracle), and the growing backing of the shared step-seam cache
+//!   ([`StepKvCache`](crate::primitives::StepKvCache), sc-24138).
 //! * [`StaticKvCache`] (epic sc-24128, story sc-24132) is the **preallocated** implementation the
 //!   fast-decode path runs on: per-layer K/V buffers allocated **once** for a request's capacity,
 //!   written **in place** at the current offset ([`Tensor::slice_set`], a bounded `copy2d`), and
@@ -288,18 +289,45 @@ impl StaticKvCache {
         dtype: DType,
         device: &Device,
     ) -> Result<Self> {
-        if capacity == 0 || batch == 0 || n_kv_heads == 0 || head_dim == 0 {
+        Self::with_value_dim(
+            num_layers, batch, n_kv_heads, head_dim, head_dim, capacity, dtype, device,
+        )
+    }
+
+    /// [`StaticKvCache::new`] with a value head width that differs from the key's — DeepSeek-V2's
+    /// materialized Multi-head Latent Attention caches `qk_nope + qk_rope`-wide keys beside
+    /// `v_head_dim`-wide values (sc-24138). Keys are `[batch, n_kv_heads, capacity, key_dim]`,
+    /// values `[batch, n_kv_heads, capacity, value_dim]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_value_dim(
+        num_layers: usize,
+        batch: usize,
+        n_kv_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        capacity: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Self> {
+        if capacity == 0 || batch == 0 || n_kv_heads == 0 || key_dim == 0 || value_dim == 0 {
             return Err(Error::Msg(format!(
                 "StaticKvCache: every dimension must be positive (batch {batch}, kv heads \
-                 {n_kv_heads}, head_dim {head_dim}, capacity {capacity})"
+                 {n_kv_heads}, key dim {key_dim}, value dim {value_dim}, capacity {capacity})"
             )));
         }
-        let shape = (batch, n_kv_heads, capacity, head_dim);
         let mut k = Vec::with_capacity(num_layers);
         let mut v = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
-            k.push(Tensor::zeros(shape, dtype, device)?);
-            v.push(Tensor::zeros(shape, dtype, device)?);
+            k.push(Tensor::zeros(
+                (batch, n_kv_heads, capacity, key_dim),
+                dtype,
+                device,
+            )?);
+            v.push(Tensor::zeros(
+                (batch, n_kv_heads, capacity, value_dim),
+                dtype,
+                device,
+            )?);
         }
         Ok(Self {
             k,
@@ -319,12 +347,26 @@ impl StaticKvCache {
         capacity: usize,
         dtype: DType,
     ) -> usize {
+        Self::buffer_bytes_with_value_dim(
+            num_layers, batch, n_kv_heads, head_dim, head_dim, capacity, dtype,
+        )
+    }
+
+    /// Bytes [`StaticKvCache::with_value_dim`] with these arguments allocates. Saturating.
+    pub fn buffer_bytes_with_value_dim(
+        num_layers: usize,
+        batch: usize,
+        n_kv_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        capacity: usize,
+        dtype: DType,
+    ) -> usize {
         batch
             .saturating_mul(n_kv_heads)
-            .saturating_mul(head_dim)
+            .saturating_mul(key_dim.saturating_add(value_dim))
             .saturating_mul(capacity)
             .saturating_mul(dtype.size_in_bytes())
-            .saturating_mul(2)
             .saturating_mul(num_layers)
     }
 
@@ -390,9 +432,11 @@ impl KvCache for StaticKvCache {
     fn update(&mut self, layer: usize, keys: &Tensor, values: &Tensor) -> Result<(Tensor, Tensor)> {
         let (b, h, s, d) = keys.dims4()?;
         let (bb, hb, cap, db) = self.k[layer].dims4()?;
-        if (b, h, d) != (bb, hb, db) || values.dims() != keys.dims() {
+        let vd = self.v[layer].dim(3)?;
+        if (b, h, d) != (bb, hb, db) || values.dims() != [b, h, s, vd] {
             return Err(Error::Msg(format!(
-                "StaticKvCache: step keys {:?} / values {:?} do not fit buffer [{bb}, {hb}, {cap}, {db}]",
+                "StaticKvCache: step keys {:?} / values {:?} do not fit buffers \
+                 [{bb}, {hb}, {cap}, {db}] / [{bb}, {hb}, {cap}, {vd}]",
                 keys.dims(),
                 values.dims()
             )));
@@ -884,6 +928,33 @@ mod static_tests {
             Err(Error::Unsupported(_))
         ));
         assert!(original.truncate(-1).is_err());
+    }
+
+    /// sc-24138: MLA caches keys and values of different widths; the static cache holds both, in
+    /// place, and still refuses a value that fits neither buffer.
+    #[test]
+    fn value_dim_may_differ_from_key_dim() {
+        let mut cache =
+            StaticKvCache::with_value_dim(1, 1, 2, 6, 4, 8, DType::F32, &Device::Cpu).unwrap();
+        assert_eq!(
+            cache.bytes(),
+            StaticKvCache::buffer_bytes_with_value_dim(1, 1, 2, 6, 4, 8, DType::F32)
+        );
+        assert_eq!(cache.bytes(), 2 * (6 + 4) * 8 * 4);
+        let (k, v) = cache
+            .update(0, &step(1, 2, 3, 6, 0.0), &step(1, 2, 3, 4, 1.0))
+            .unwrap();
+        assert_eq!(k.dims(), &[1, 2, 3, 6]);
+        assert_eq!(v.dims(), &[1, 2, 3, 4]);
+        assert_eq!(host(&v), host(&step(1, 2, 3, 4, 1.0)));
+        assert!(cache
+            .update(0, &step(1, 2, 1, 6, 0.0), &step(1, 2, 1, 6, 0.0))
+            .is_err());
+        assert_eq!(cache.offset(), 3);
+        assert_eq!(
+            StaticKvCache::buffer_bytes(2, 1, 2, 4, 8, DType::F32),
+            StaticKvCache::buffer_bytes_with_value_dim(2, 1, 2, 4, 4, 8, DType::F32)
+        );
     }
 
     #[test]

@@ -11,20 +11,24 @@ The runner lives in `crates/llm/candle-llm/src/decode/graph.rs` (`GraphRunner`).
 step model's decode steps (M = 1) and verify steps (M = K + 1) end to end. On a synthetic step model built from
 capturable ops it is token-identical to eager and **~28–30 % faster per step** in release.
 
-**No Qwen3.5/3.8 step can be replayed at candle `1e6aa85e`.** Three things block it:
+**No Qwen3.5/3.8 step can be replayed at candle `1e6aa85e`.** Three things blocked it when the story was measured;
+the merge of S3 (sc-24131) has since removed the second (see "After S3" below):
 
 - **Layout uploads.** A real 27B decode step records **3927 kernel launches and 851 host uploads**. Every candle
   CUDA op that takes a layout uploads its `[dims, strides]` from a temporary host `Vec`, and each upload is recorded
   as a memcpy that re-reads freed host memory at every replay.
-- **Replaced state.** A decode step leaves **96 allocations alive past the step**: the 48 linear layers' conv and
-  SSM states, which the S1 hybrid cache replaces instead of writing in place.
+- **Replaced state (lifted by S3).** A decode step left **96 allocations alive past the step**: the 48 linear
+  layers' conv and SSM states, which the S1 hybrid cache replaced instead of writing in place. S3's per-token DeltaNet
+  checkpoint ring keeps the live state as a view of a preallocated slot written in place; after the merge the same
+  census reads `escaped=0`.
 - **Scalar positions.** Positions are Rust-side scalars. `Qwen35Model::graph_support` declares this
   (`positions_host_scalar`), so no Qwen3.5/3.8 step is ever recorded by the runner.
 
 How the three acceptance criteria come out:
 
-- **AC1:** The 27B cache declares `deltanet_state_unstable` before any capture (the runner checks the cache's
-  declaration before the model's), so graphs-on is token-identical to eager because it falls back to eager.
+- **AC1:** The 27B step is refused by declaration before any capture, so graphs-on is token-identical to eager
+  because it falls back to eager. When measured, the cache's `deltanet_state_unstable` (checked before the model's)
+  was the named reason; after S3 the ring-backed cache passes and the model's `positions_host_scalar` is.
 - **AC2:** decode_bench records graphs off vs on with that named reason. No win is measurable, so the default is
   off and `CANDLE_LLM_CUDA_GRAPHS=1` opts in.
 - **AC3:** Every refusal is a named fallback. None fails the request or changes the device.
@@ -110,8 +114,9 @@ How the three acceptance criteria come out:
      returns `CUDA_ERROR_INVALID_VALUE`, named `step_failed_in_capture`. A rollback checkpoint pruned mid-step does
      this.
    - `Tensor::copy` inside a capture also returns `CUDA_ERROR_INVALID_VALUE`.
-   - The hybrid cache declares `deltanet_state_unstable` before any capture. S3's stable-address ring lifts that
-     declaration; after it, finding 6 is what remains.
+   - The S1 hybrid cache declared `deltanet_state_unstable` before any capture. S3's stable-address ring lifts that
+     declaration (a ring-less cache — the reference paths' — still makes it); after it, findings 5 and 6 are what
+     remain.
 
 ## What the runner does (E0, E2, E4, E5, E6)
 
@@ -120,8 +125,9 @@ How the three acceptance criteria come out:
   - `StepModel::graph_support`: `Qwen35Model` declares `moe_router_host_read` (the MoE router's host read) and
     otherwise `positions_host_scalar`.
   - `DecodeCache::{graph_support, stage_positions, replay_advance, graph_identity}`. `Qwen35Cache` declares
-    `deltanet_state_unstable` / `growing_kv`; it has no replay bookkeeping (its model refuses first). Only the
-    synthetic test cache implements `replay_advance`.
+    `deltanet_state_unstable` for a ring-less linear layer and `growing_kv` for a growing KV; the engine's cache
+    (static KV, per-token DeltaNet ring) passes since S3. It has no replay bookkeeping (its model refuses first).
+    Only the synthetic test cache implements `replay_advance`.
 - **Capability checks before any capture (E5).** The runner checks, in order: switch, `cuda` feature, CUDA device,
   not a `flash-attn` build, capturable stream, stream-ordered allocator, event tracking off, the cache's declaration,
   then the model's.
@@ -169,6 +175,12 @@ How the three acceptance criteria come out:
 Identity holds because the runner refuses the 27B hybrid by name before any capture. The replay path's own
 exactness (capture → replay bit-identical, decode and K = 3 verify) is proven on the synthetic step model below.
 
+**After S3 (merge of `8f72f3f7e`, `after-s3-merge.log`).** The same test passes with the named reason now
+`positions_host_scalar`: the ring-backed cache no longer declares itself unstable, and the model's positions refuse
+next. Spec off: 256 / 256 identical, `graph: eager replayed=0 eager=256 captured=0 fallback=positions_host_scalar`.
+MTP K = 3: 256 / 256 identical, acceptance identical (160 / 281 on S3's engine), `graph: eager replayed=0 eager=96
+captured=0 fallback=positions_host_scalar`.
+
 Regression checks:
 
 - `static_kv_parity::ac1_static_kv_greedy_fixture_is_token_identical_to_attn_kv` (S4's AC1) still passes on the
@@ -210,7 +222,7 @@ From `graph-unit-tests-review.log` (this revision's CUDA unit tests, release) an
 ```text
 graph: eager replayed=0 eager=256 captured=0 fallback=deltanet_state_unstable      # 27B hybrid, spec off
 graph: eager replayed=0 eager=8 captured=0 fallback=positions_host_scalar          # tiny Qwen3.5, attention-only static cache
-graph: eager replayed=0 eager=8 captured=0 fallback=deltanet_state_unstable        # tiny Qwen3.5, hybrid static cache
+graph: eager replayed=0 eager=8 captured=0 fallback=deltanet_state_unstable        # tiny Qwen3.5, hybrid static cache (before S3; positions_host_scalar after)
 graph: eager replayed=0 eager=24 captured=0 fallback=mock_cache_declared_unstable  # cache declares itself unstable
 graph: eager replayed=0 eager=25 captured=0 fallback=sync_in_capture               # a noted device->host read during capture
 graph: eager replayed=0 eager=25 captured=0 fallback=allocation_escaped_capture    # census alloc=7 free=6 escaped=1
@@ -226,7 +238,8 @@ Which reasons have a test (CPU or CUDA unit tests unless noted):
 - the capability refusals `disabled`, `not_cuda`, `cuda_feature_off`, `legacy_stream`, and `flash_attn_stream`
   (`a_flash_attn_build_is_refused_by_name` and the device tests, run in a `--features cuda,flash-attn` build too:
   there `select_device` stays on the legacy stream with the switch on, and the runner names the build)
-- the declarations `mock_cache_declared_unstable`, `positions_host_scalar`, `deltanet_state_unstable`
+- the declarations `mock_cache_declared_unstable`, `positions_host_scalar`, `deltanet_state_unstable` (after S3: a
+  ring-less cache, `graph_support_accepts_the_ringed_static_cache_and_names_the_rest`), `growing_kv`
 - the census `sync_in_capture`, `allocation_escaped_capture`; `host_upload_in_capture` and `host_read_in_capture` in
   the POC tests and `census_step`
 - `replay_mismatch` (the synthetic `scalar` misbehaviour: the first replay at a new position disagrees)
@@ -248,6 +261,14 @@ This records one step as a graph without launching anything:
 ```
 
 - `escaped=96` is the 48 linear layers × (conv state, SSM state) that the S1 cache replaces each step.
+- **After S3** (`after-s3-merge.log`), the same test on the ring-backed cache:
+
+  ```text
+  27B decode (1 token) step, 64 layers: nodes=14398 kernels=4023 memcpy(dtod=0, htod=851,  dtoh=0) alloc=4762 free=4762 escaped=0
+  27B verify (4 tokens) step, 64 layers: nodes=24475 kernels=6135 memcpy(dtod=0, htod=2386, dtoh=0) alloc=7977 free=7977 escaped=0
+  ```
+
+  Nothing outlives the step any more; the host uploads are unchanged (they are candle's, not the cache's).
 - `htod` is candle's per-op layout metadata plus the host-built RoPE tables.
 - A replay would remove the host-side issue cost of ~3.9 k launches (and ~4.8 k allocation calls) per decode step. On
   the synthetic model at `7699d507a`, graphs removed about 4.4 µs of host cost per captured kernel. At the same rate that would be
@@ -268,7 +289,7 @@ and in-place `slice_set` — what candle can replay today:
 | `a_refusal_drops_every_captured_shape` | A verified 1-token graph is dropped, with its staging, when the 2-token shape is refused |
 | `a_panic_inside_the_capture_still_ends_it` | After a panic inside a capture the stream is out of capture mode and usable |
 | `graph_memory_is_reported_and_trimmed_when_the_graphs_go` | From a trimmed pool, one capture reports `graph_reserved_bytes = 33554432` (the device's whole reservation); `reset` trims it back to 0 |
-| `qwen35_steps_are_refused_by_declaration_and_the_census_finds_layout_uploads` | Tiny attention-only Qwen3.5 on the static cache → `positions_host_scalar`, no recording. `census_step` on a warmed 1-token step: `kernels=99 htod=11` → `host_upload_in_capture` (the runner's own recording at `7699d507a`, before the declaration existed, counted `kernels=100 htod=10`). The hybrid config → `deltanet_state_unstable` |
+| `qwen35_steps_are_refused_by_declaration_and_the_census_finds_layout_uploads` | Tiny attention-only Qwen3.5 on the static cache → `positions_host_scalar`, no recording. `census_step` on a warmed 1-token step: `kernels=99 htod=11` → `host_upload_in_capture` (the runner's own recording at `7699d507a`, before the declaration existed, counted `kernels=100 htod=10`). The hybrid config → `deltanet_state_unstable` (after S3: `positions_host_scalar`; its census, decode and 4-token verify, reads `escaped=0`) |
 | `poc_contiguous_ops_replay_bit_exact_and_index_select_is_refused` | matmul + softmax + affine + fused QK-norm/RoPE: 2 replays at new inputs, bit-exact. Adding one `index_select` → `htod=1` → refused |
 | `synthetic_replay_timing` | 2048 steps: **eager 139.5 µs/step, graphs 97.6 µs/step** (`replayed=2045`, −30 %). Earlier release runs: 125.5 → 90.6 at `7699d507a`, 142.2 → 92.7 at `6c07bcce3` |
 
@@ -276,9 +297,11 @@ and in-place `slice_set` — what candle can replay today:
 
 These are ordered; each gate is visible as the runner's fallback reason:
 
-1. **S3's stable-address DeltaNet ring** lifts `deltanet_state_unstable` (and the `escaped=96`).
+1. **S3's stable-address DeltaNet ring** lifts `deltanet_state_unstable` (and the `escaped=96`). **Done** — merged
+   from `8f72f3f7e`; the census reads `escaped=0` and `positions_host_scalar` is now the first gate.
 2. **Positions as device data** lift `positions_host_scalar`: RoPE tables gathered from a device position, KV written
-   at a device offset, attention over the capacity with a device length, through seam kernels whose arithmetic keeps
+   at a device offset, the DeltaNet ring slot (`position % slots`) selected from device data, attention over the
+   capacity with a device length, through seam kernels whose arithmetic keeps
    the static path's bits. The model then drops its declaration and `Qwen35Cache` implements `replay_advance`.
 3. **A candle revision that stops uploading layouts from host `Vec`s** lifts `host_upload_in_capture`, the census
    gate that follows.

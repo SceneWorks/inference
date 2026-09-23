@@ -1086,19 +1086,26 @@ impl DecodeCache for Qwen35Cache {
         Qwen35Cache::kv_kind(self)
     }
 
-    /// A CUDA-graph replay (story sc-24134) needs every state tensor at a stable address: the
-    /// static KV buffers are; the S1 hybrid cache still *replaces* each linear layer's recurrent
-    /// state per step (`DeltaNetCache::update`), which the per-token DeltaNet checkpoint ring
-    /// (S3) turns into in-place writes — until then a hybrid cache says
-    /// `deltanet_state_unstable`, and a growing `AttnKv` cache `growing_kv`. A cache that
-    /// passes is still refused by its model: [`Qwen35Model`]'s positions are Rust-side scalars
-    /// (`positions_host_scalar`), so this cache keeps the trait's refusing `replay_advance`.
+    /// A CUDA-graph replay (story sc-24134) needs every state tensor at a stable address. The
+    /// static KV buffers are, and so is a linear layer's recurrent state once it keeps the
+    /// per-token checkpoint ring (sc-24131): the live state is a view of the newest preallocated
+    /// ring slot, written in place, so a recorded step leaves no allocation alive past it (the
+    /// census of a warmed hybrid step on the engine's cache reads `escaped=0`; the S1 cache,
+    /// which replaced both states of every linear layer per step, read `escaped=96` on the 27B).
+    /// A ring-less linear layer — the reference caches ([`REFERENCE_MAX_CHECKPOINTS`]) — still
+    /// replaces its state per step and says `deltanet_state_unstable`; a growing `AttnKv` cache
+    /// says `growing_kv`. A cache that passes is still refused by its model: [`Qwen35Model`]'s
+    /// positions are Rust-side scalars (`positions_host_scalar`) — the static KV write offset
+    /// and the ring slot a step writes alike — so this cache keeps the trait's refusing
+    /// `replay_advance`.
     fn graph_support(&self) -> std::result::Result<(), &'static str> {
         for layer in &self.layers {
             match layer {
-                Qwen35LayerCache::Delta(_) => return Err("deltanet_state_unstable"),
+                Qwen35LayerCache::Delta(c) if c.ring_spec().is_none() => {
+                    return Err("deltanet_state_unstable")
+                }
                 Qwen35LayerCache::Attn(_) => return Err("growing_kv"),
-                Qwen35LayerCache::StaticAttn(_) => {}
+                Qwen35LayerCache::Delta(_) | Qwen35LayerCache::StaticAttn(_) => {}
             }
         }
         Ok(())
@@ -4332,6 +4339,43 @@ pub(crate) mod tests {
         cache.reset();
         assert_eq!(cache.len(), 0);
         assert_eq!(cache.static_kv_addresses().unwrap(), addresses);
+    }
+
+    /// sc-24134 after sc-24131: the cache's CUDA-graph declaration. A linear layer that keeps the
+    /// per-token checkpoint ring holds its state at stable addresses, so the engine's static cache
+    /// passes — before and after a forward — and the model's own `positions_host_scalar` is what
+    /// refuses it; a ring-less linear layer still replaces its state per step
+    /// (`deltanet_state_unstable`, including once a ring is dropped), and a growing attention
+    /// cache is `growing_kv`.
+    #[test]
+    fn graph_support_accepts_the_ringed_static_cache_and_names_the_rest() {
+        let (_cfg, model) = text_model();
+        assert_eq!(model.graph_support(), Err("positions_host_scalar"));
+
+        let mut ringed = model.new_static_cache(16, STEP_MAX_CHECKPOINTS).unwrap();
+        assert_eq!(DecodeCache::graph_support(&ringed), Ok(()));
+        model
+            .forward_step(&mut ringed, StepRequest::last(&[1, 7, 3]))
+            .unwrap();
+        model
+            .forward_step(&mut ringed, StepRequest::last(&[5]))
+            .unwrap();
+        assert_eq!(DecodeCache::graph_support(&ringed), Ok(()));
+        ringed.set_max_checkpoints(0).unwrap();
+        assert_eq!(
+            DecodeCache::graph_support(&ringed),
+            Err("deltanet_state_unstable")
+        );
+
+        let ringless = model
+            .new_static_cache(16, REFERENCE_MAX_CHECKPOINTS)
+            .unwrap();
+        assert_eq!(
+            DecodeCache::graph_support(&ringless),
+            Err("deltanet_state_unstable")
+        );
+        let growing = model.new_cache_with_checkpoints(STEP_MAX_CHECKPOINTS);
+        assert_eq!(DecodeCache::graph_support(&growing), Err("growing_kv"));
     }
 
     /// **E6.** The static cache is bounded by the request and the model: a capacity of zero is a

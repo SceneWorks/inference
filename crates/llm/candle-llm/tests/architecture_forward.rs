@@ -31,7 +31,7 @@ use serde_json::{json, Map, Value};
 
 use candle_llm::config::ModelConfig;
 use candle_llm::models::CausalLm;
-use candle_llm::primitives::{input_ids, SplitMix64, TokenRng, Weights};
+use candle_llm::primitives::{input_ids, AttnFormulation, SplitMix64, TokenRng, Weights};
 
 const HIDDEN: usize = 32;
 const VOCAB: usize = 48;
@@ -573,8 +573,14 @@ fn run_forward(case: &Case) -> Vec<f32> {
         case.name
     );
     let weights = Weights::from_map(case.weights.clone(), Device::Cpu);
-    let model = CausalLm::from_weights(&weights, "", cfg)
+    let mut model = CausalLm::from_weights(&weights, "", cfg)
         .unwrap_or_else(|e| panic!("{}: model must build: {e}", case.name));
+    // The goldens are the `repeat_kv`-expanded attention arithmetic the decoder ran when they were
+    // captured. sc-24138 made the un-expanded `Gqa` formulation the default (the static cache's
+    // arithmetic, a last-bit change at attention-GEMM knife-edges), so this suite selects the
+    // arithmetic its goldens were measured with; everything else in the decoder loop is still held
+    // to them bit for bit.
+    model.set_attn_formulation(AttnFormulation::Expanded);
 
     let mut cache = model.new_cache();
     let mut out = Vec::new();
