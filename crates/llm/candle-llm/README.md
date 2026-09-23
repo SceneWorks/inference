@@ -198,7 +198,7 @@ reference loop and the static cache are one arithmetic and token-identical by co
 `set_attn_formulation(AttnFormulation::Expanded)` selects the pre-migration `repeat_kv` arithmetic
 as a labelled comparison. As at S4 (sc-24132), the default reference's numerics moved from the
 expanded arithmetic's by at most one bf16 ULP at attention-GEMM knife-edges (on Qwen3-8B the two
-reference loops first differ at token 65 of 256). `tests/step_seam_migration.rs` holds every
+reference loops first differ at token index 65 of 256). `tests/step_seam_migration.rs` holds every
 decoder to goldens captured on the pre-migration tree (`tests/goldens/sc24138/`) with `Expanded`
 selected — logits bit for bit in the configuration they were measured on (Windows x86_64 MSVC),
 tokens exactly and logits within 1e-4 elsewhere.

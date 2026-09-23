@@ -1,18 +1,24 @@
 test causal_static_cache_fails_closed_past_the_model_bound ... ok
 test engine_refuses_a_draft_with_another_vocabulary ... ok
 test gemma4_decodes_to_its_golden_on_every_seam_path ... [sc24138-parity] gemma4         static   tokens=identical max|dlogit|=6.676e-6
+ok
 test gemma4_mm_reference_matches_its_pre_migration_golden ... ok
 test gemma4_mm_splice_decodes_to_its_golden_through_the_seam ... [sc24138-parity] gemma4_mm      static   tokens=identical max|dlogit|=6.199e-6
+ok
 test gemma4_reference_matches_its_pre_migration_golden ... ok
+test golden_bit_exactness_is_limited_to_the_measured_configuration ... ok
 test llama_decodes_to_its_golden_on_every_seam_path ... [sc24138-parity] llama          static   tokens=identical max|dlogit|=1.013e-6
+ok
 test llama_reference_matches_its_pre_migration_golden ... ok
 test llava_caption_decodes_to_its_golden_through_the_seam ... ok
 test llava_caption_matches_its_pre_migration_golden ... ok
 test qwen3_dense_decodes_to_its_golden_on_every_seam_path ... [sc24138-parity] qwen3_dense    static   tokens=identical max|dlogit|=1.073e-6
+ok
 test qwen3_dense_reference_matches_its_pre_migration_golden ... ok
 test speculative_rs_holds_no_decode_loop ... ok
 test starcoder2_decodes_to_its_golden_through_the_seam ... [sc24138-parity] starcoder2     static   tokens=identical max|dlogit|=1.907e-6
+ok
 test starcoder2_reference_matches_its_pre_migration_golden ... ok
 test starvector_1b_decoder_matches_its_pre_migration_golden ... ok
 test starvector_1b_decodes_to_its_golden_through_the_seam ... ok
-test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
