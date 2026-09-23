@@ -30,8 +30,8 @@
 [ac1] K=5 j=1: rollback_to(98) vs second ring, same first 1 tokens + other suffix: conv max|err| 0e0 ssm max|err| 0e0; vs token-at-a-time decode: conv 3.75e-1 ssm 2.6131928e-2 (48 linear layers)
 [ac1] K=5 j=0: rollback_to(97) vs prompt-only state: conv max|err| 0e0 ssm max|err| 0e0; vs token-at-a-time decode: conv 0e0 ssm 0e0 (48 linear layers)
 [ac1] widths [1, 2, 3, 4, 5]: worst same-arithmetic max|err| 0e0 (gate 1e-6)
-[ac2] mtp K=1: verify_steps 24 direct_rollbacks 0 replay_fallbacks 0 fwd/verify Some(1.0) acceptance 1.000 cache live 155 MiB checkpoints 293 MiB
-[ac2] mtp K=2: verify_steps 16 direct_rollbacks 1 replay_fallbacks 0 fwd/verify Some(1.0) acceptance 0.969 cache live 156 MiB checkpoints 440 MiB
-[ac2] mtp K=3: verify_steps 13 direct_rollbacks 2 replay_fallbacks 0 fwd/verify Some(1.0) acceptance 0.895 cache live 156 MiB checkpoints 587 MiB
-[ac2] mtp K=4: verify_steps 12 direct_rollbacks 5 replay_fallbacks 0 fwd/verify Some(1.0) acceptance 0.795 cache live 156 MiB checkpoints 734 MiB
-[ac2] mtp K=5: verify_steps 10 direct_rollbacks 3 replay_fallbacks 0 fwd/verify Some(1.0) acceptance 0.787 cache live 156 MiB checkpoints 880 MiB
+[ac2] mtp K=1: verify_steps 24 direct_rollbacks 0 replay_forwards 0 fwd/verify Some(1.0) acceptance 1.000 cache live 155 MiB checkpoints 293 MiB
+[ac2] mtp K=2: verify_steps 16 direct_rollbacks 1 replay_forwards 0 fwd/verify Some(1.0) acceptance 0.969 cache live 156 MiB checkpoints 440 MiB
+[ac2] mtp K=3: verify_steps 13 direct_rollbacks 2 replay_forwards 0 fwd/verify Some(1.0) acceptance 0.895 cache live 156 MiB checkpoints 587 MiB
+[ac2] mtp K=4: verify_steps 12 direct_rollbacks 5 replay_forwards 0 fwd/verify Some(1.0) acceptance 0.795 cache live 156 MiB checkpoints 734 MiB
+[ac2] mtp K=5: verify_steps 10 direct_rollbacks 3 replay_forwards 0 fwd/verify Some(1.0) acceptance 0.787 cache live 156 MiB checkpoints 880 MiB
