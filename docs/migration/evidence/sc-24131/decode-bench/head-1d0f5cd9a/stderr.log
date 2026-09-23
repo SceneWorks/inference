@@ -1,0 +1,8 @@
+[decode_bench] reference          14.48 tok/s  prefill 0.744s  fused {"switch":"on","fused":69888,"reference":0,"reference_reason":null,"path":"fused"}  nvfp4 {"switch":"on","gemv":0,"cublaslt":0,"cublaslt_reason":null,"path":"none"}
+[decode_bench] step_model         14.61 tok/s  prefill 0.694s
+[decode_bench] mtp K=1            18.86 tok/s  accept 0.827  fwd/tok 0.551  syncs/verify 1.00  fwd/verify 1.00  rollbacks 24 direct / 0 replay
+[decode_bench] mtp K=2            24.24 tok/s  accept 0.757  fwd/tok 0.402  syncs/verify 1.00  fwd/verify 1.00  rollbacks 32 direct / 0 replay
+[decode_bench] mtp K=3            23.16 tok/s  accept 0.569  fwd/tok 0.375  syncs/verify 1.00  fwd/verify 1.00  rollbacks 59 direct / 0 replay
+[decode_bench] mtp K=4            22.80 tok/s  accept 0.467  fwd/tok 0.355  syncs/verify 1.00  fwd/verify 1.00  rollbacks 71 direct / 0 replay
+[decode_bench] mtp K=5            22.96 tok/s  accept 0.465  fwd/tok 0.305  syncs/verify 1.00  fwd/verify 1.00  rollbacks 65 direct / 0 replay
+[decode_bench] wrote D:\repos\inference\.claude\worktrees\sc-24131\docs\migration\evidence\sc-24131\decode-bench\head-1d0f5cd9a\decode_bench.json

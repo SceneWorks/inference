@@ -1,0 +1,18 @@
+# sc-24134 after merging S3 (sc-24131, 8f72f3f7e) into the story branch: GPU 0, RTX Pro 6000 / sm_120, CUDA_COMPUTE_CAP=120
+# tiny Qwen3.5 (debug): cargo test --locked -p candle-llm --features cuda --lib -- decode::graph::cuda_tests::qwen35_steps_are_refused --nocapture
+[runner] qwen35 attention-only static: graph: eager replayed=0 eager=8 captured=0 fallback=positions_host_scalar
+[runner] qwen35 1-token static step census: nodes=322 kernels=99 memcpy(dtod=0, htod=11, dtoh=0) memset=0 alloc=106 free=106 escaped=0 other=0
+[runner] qwen35 hybrid static: graph: eager replayed=0 eager=8 captured=0 fallback=positions_host_scalar
+[runner] qwen35 hybrid 1-token static step census: nodes=928 kernels=258 memcpy(dtod=0, htod=56, dtoh=0) memset=0 alloc=307 free=307 escaped=0 other=0
+[runner] qwen35 hybrid 4-token static step census: nodes=1540 kernels=384 memcpy(dtod=0, htod=152, dtoh=0) memset=0 alloc=502 free=502 escaped=0 other=0
+test decode::graph::cuda_tests::qwen35_steps_are_refused_by_declaration_and_the_census_finds_layout_uploads ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 372 filtered out; finished in 0.29s
+
+# Qwen3.8-27B @ 1d4bf0f2 (release): BONSAI_QWEN38_SNAPSHOT=<snapshot> cargo test --locked --release --features cuda -p candle-llm --test cuda_graphs -- --ignored --nocapture --test-threads=1
+[cuda_graphs] spec off, graphs on: graph: eager replayed=0 eager=256 captured=0 fallback=positions_host_scalar (256 tokens)
+[cuda_graphs] MTP K=3, graphs on: graph: eager replayed=0 eager=96 captured=0 fallback=positions_host_scalar (accepted 160 / proposed 281, verify steps 95)
+test ac1_graphs_on_is_token_identical_to_eager_for_spec_off_and_mtp_k3 ... ok
+[cuda_graphs] 27B decode (1 token) step, 64 layers: nodes=14398 kernels=4023 memcpy(dtod=0, htod=851, dtoh=0) memset=0 alloc=4762 free=4762 escaped=0 other=0 — per layer ~62.9 kernels, 13.3 host uploads
+[cuda_graphs] 27B verify (4 tokens) step, 64 layers: nodes=24475 kernels=6135 memcpy(dtod=0, htod=2386, dtoh=0) memset=0 alloc=7977 free=7977 escaped=0 other=0 — per layer ~95.9 kernels, 37.3 host uploads
+test qwen38_27b_step_census ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 104.51s

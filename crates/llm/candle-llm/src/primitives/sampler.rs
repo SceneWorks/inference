@@ -549,6 +549,7 @@ pub fn sample_row_host(
     let weights = nucleus_weights(&row, params);
     let total: f32 = weights.iter().map(|x| x.1).sum();
     if total <= 0.0 || !total.is_finite() {
+        let _ = rng.next_f32();
         return argmax_host(&row);
     }
     let mut target = rng.next_f32() * total;
@@ -658,7 +659,7 @@ pub fn argmax_device(logits: &Tensor) -> Result<i32> {
     Ok(read_token_id(&idx)? as i32)
 }
 
-// Every device->host read in this module goes through the two counted helpers below, so the
+// Every device->host read in this module goes through the three counted helpers below, so the
 // per-request counters (`host_syncs`, `logits_to_host`) cannot miss a transfer made here. The
 // `host_reads_go_through_the_counted_helpers` test scans this file and fails on a raw
 // `to_vec*` / `to_scalar` call anywhere else.
@@ -1086,11 +1087,21 @@ mod tests {
                 one_draw,
                 "sample_device drew once: {row:?}"
             );
+            // The speculative engine's host-row sampler takes the same argmax fallback and
+            // consumes the same one draw, so the host samplers stay draw-aligned.
+            let mut row_host = SplitMix64::new(21);
+            let c = sample_row_host(row.to_vec(), &[], &params, &mut row_host, None);
+            assert_eq!(c, argmax_host(row), "sample_row_host: {row:?}");
+            assert_eq!(
+                row_host.state(),
+                one_draw,
+                "sample_row_host drew once: {row:?}"
+            );
         }
     }
 
-    /// The AC2 counters only see transfers made through `read_token_id` / `read_logits_rows`, so
-    /// this module must not read a tensor to the host any other way.
+    /// The AC2 counters only see transfers made through `read_token_id` / `read_token_ids` /
+    /// `read_logits_rows`, so this module must not read a tensor to the host any other way.
     #[test]
     fn host_reads_go_through_the_counted_helpers() {
         const HELPERS: [&str; 3] = ["read_token_id", "read_token_ids", "read_logits_rows"];
@@ -1139,6 +1150,7 @@ mod tests {
             &rest[..end]
         };
         assert!(body("read_token_id").contains("note_host_sync();"));
+        assert!(body("read_token_ids").contains("note_host_sync();"));
         let rows = body("read_logits_rows");
         assert!(rows.contains("note_host_sync();"));
         assert!(rows.contains("note_logits_to_host();"));

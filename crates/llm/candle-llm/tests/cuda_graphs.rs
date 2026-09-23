@@ -3,9 +3,10 @@
 //!
 //! * **AC1** — a 256-token greedy decode with the graph runner **on** is token-identical to the
 //!   same request with it **off**, for speculation off (the step driver on the static KV cache)
-//!   and for MTP `K = 3` (the unified engine). On this candle revision the 27B hybrid falls
-//!   back eager with the named reason `deltanet_state_unstable` (the S1 cache replaces its
-//!   DeltaNet state per step), so identity holds by construction; the records say so.
+//!   and for MTP `K = 3` (the unified engine). On this revision the 27B hybrid falls back
+//!   eager with the named reason `positions_host_scalar` (the model's positions are Rust-side
+//!   scalars; its cache passes since the sc-24131 DeltaNet ring keeps the recurrent state at
+//!   stable addresses), so identity holds by construction; the records say so.
 //! * **Census** — what a real 27B decode step and a `K = 3` verify step are made of when
 //!   recorded as a graph: kernel launches, host uploads (candle's per-op layout metadata),
 //!   allocations. The number behind the story's finding and the upper bound of what a full
@@ -116,7 +117,7 @@ fn ac1_graphs_on_is_token_identical_to_eager_for_spec_off_and_mtp_k3() {
     );
     assert_eq!(
         graphs_record.cuda_graphs.fallback_reason,
-        Some("deltanet_state_unstable")
+        Some("positions_host_scalar")
     );
     assert_eq!(graphs_record.kv_cache, KvCacheKind::Static);
 
@@ -160,7 +161,7 @@ fn ac1_graphs_on_is_token_identical_to_eager_for_spec_off_and_mtp_k3() {
     assert_eq!(graphs_mtp.stats.accepted, eager_mtp.stats.accepted);
     assert_eq!(
         graphs_mtp.record.cuda_graphs.fallback_reason,
-        Some("deltanet_state_unstable")
+        Some("positions_host_scalar")
     );
     assert_eq!(graphs_mtp.record.host_syncs_per_verify_step(), Some(1.0));
 }
@@ -199,9 +200,10 @@ fn qwen38_27b_step_census() {
         .unwrap();
     device.synchronize().unwrap();
     let base = cache.len();
-    // Keep every checkpoint while recording: pruning one inside a capture frees a tensor
-    // allocated before it (`cuMemFreeAsync` → INVALID_VALUE), which abandons the recording.
-    cache.retain_checkpoints(64);
+    // A deep ring while recording. (The S1 cache pruned a checkpoint inside the capture without
+    // it — a free of a tensor allocated before it, `cuMemFreeAsync` → INVALID_VALUE, which
+    // abandons the recording; the sc-24131 ring writes its slots in place and prunes nothing.)
+    cache.retain_checkpoints(64).unwrap();
 
     let decode = census_step(&model, &mut cache, StepRequest::last(&[8])).unwrap();
     assert_eq!(cache.len(), base);

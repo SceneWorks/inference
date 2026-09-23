@@ -254,7 +254,7 @@ fn teacher_forced_static_vs_attn_kv_logit_parity_report() {
     let capacity = prompt.len() + FIXTURE_TOKENS;
     let mut fixed = model.new_static_cache(capacity, 0).unwrap();
     let mut growing = StepModel::new_cache(&model);
-    growing.set_max_checkpoints(0);
+    growing.set_max_checkpoints(0).unwrap();
     let mut a = model
         .forward_step(&mut fixed, StepRequest::last(&prompt))
         .unwrap()

@@ -135,7 +135,7 @@ fn ac2_rollback_then_redecode_matches_fresh_decode_on_real_weights() {
 
     // Rolled back: prefill tokens[..n], decode tokens[n..m] one at a time, roll back to n.
     let mut cache = StepModel::new_cache(&model);
-    cache.set_max_checkpoints(16); // keep every step start of this run (the step seam keeps two)
+    cache.set_max_checkpoints(16).unwrap(); // keep every position of this run (the step seam keeps two)
     model
         .forward_step(&mut cache, StepRequest::last(&tokens[..n]))
         .unwrap();
