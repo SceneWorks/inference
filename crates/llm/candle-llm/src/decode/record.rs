@@ -247,6 +247,23 @@ impl DecodeRecord {
         self
     }
 
+    /// The same record with the host-side counters and the fused / CUDA-graph / NVFP4 tallies of
+    /// the whole request measured by `span` (sc-24139) — for a caller that prefills before handing
+    /// the engine a [`Prefilled`](super::SpeculativePrompt::Prefilled) prompt, whose own span
+    /// starts after that prefill. The engine-measured fields (path, forwards, cache, proposer)
+    /// are kept.
+    pub fn with_request_span(self, span: &RequestSpan) -> Self {
+        let counters = span.counters();
+        Self {
+            host_syncs: counters.host_syncs,
+            sampler: counters.sampler,
+            fused_primitives: span.fused_primitives(),
+            cuda_graphs: span.cuda_graphs(),
+            nvfp4_projections: span.nvfp4_projections(),
+            ..self
+        }
+    }
+
     /// A record from a speculative run's [`SpeculativeStats`].
     pub fn speculative(
         path: DecodePath,
@@ -698,6 +715,43 @@ mod tests {
                 .cuda_graphs
                 .label(),
             "none"
+        );
+    }
+
+    /// sc-24139: a caller that prefills before the engine overlays its whole-request span on the
+    /// engine's record — the span's counters and tallies replace the engine's, and the
+    /// engine-measured fields stay.
+    #[test]
+    fn with_request_span_takes_the_whole_requests_counters() {
+        let span = RequestSpan::begin();
+        // Work before the engine's own span (the caller's prefill) ...
+        crate::primitives::note_host_sync();
+        crate::primitives::nvfp4_path::note_gemv();
+        // ... which the engine's record, measured after it, does not see.
+        let engine = DecodeRecord::plain(DecodePath::StepModel, 5, 4, SpanCounters::default())
+            .with_kv_cache(KvCacheKind::Static)
+            .with_proposer(ProposerKind::Ngram);
+        let record = engine.with_request_span(&span);
+        assert_eq!(record.host_syncs, 1);
+        assert_eq!(record.nvfp4_projections.gemv, 1);
+        assert_eq!(record.nvfp4_projections, span.nvfp4_projections());
+        assert_eq!(record.fused_primitives, span.fused_primitives());
+        assert_eq!(record.cuda_graphs, span.cuda_graphs());
+        assert_eq!(
+            (
+                record.path,
+                record.target_forwards,
+                record.generated_tokens,
+                record.kv_cache,
+                record.proposer
+            ),
+            (
+                DecodePath::StepModel,
+                5,
+                4,
+                KvCacheKind::Static,
+                ProposerKind::Ngram
+            )
         );
     }
 

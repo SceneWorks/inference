@@ -739,8 +739,9 @@ pub struct LoadRecord {
 }
 
 impl LoadRecord {
-    /// The backend-neutral report a product renders (sc-24139): the requested format and the
-    /// projection kinds actually resident, only the kinds present.
+    /// The backend-neutral report a product renders (sc-24139): the requested format, the
+    /// projection kinds actually resident (only the kinds present) and the CUDA-graph switch the
+    /// load settled ([`cuda_graphs`](Self::cuda_graphs)).
     pub fn report(&self) -> core_llm::LoadReport {
         let projections = self
             .census
@@ -767,6 +768,7 @@ impl LoadRecord {
         core_llm::LoadReport {
             requested: self.requested,
             projections,
+            cuda_graphs: self.cuda_graphs,
         }
     }
 }
@@ -884,6 +886,21 @@ fn nvfp4_format_with(
     if spec.quantize != Some(Quantize::Nvfp4) {
         return Ok(None);
     }
+    nvfp4_model_gate(spec)?;
+    gate(device).map(Some).map_err(to_core)
+}
+
+/// The model half of [`nvfp4_format`]: whether this provider serves NVFP4 for the checkpoint at
+/// `spec.source`, from `config.json` alone (never a weight shard). The load runs it before the
+/// device gate, and [`crate::backend::nvfp4_support`] answers a product's per-snapshot question
+/// with it (sc-24139), so the two can never disagree about which checkpoints NVFP4 serves.
+///
+/// A GGUF source is refused: it is already block-quantized, and NVFP4 quantizes from a dense
+/// snapshot. So is a Prism/Bonsai snapshot (already packed affine-2 — `load_dir` refuses any
+/// repacking) and an architecture outside the qwen3_5 family, NVFP4's first (and so far only)
+/// consumer (sc-24135), each by name. A missing or unreadable config is left to the loader's own
+/// error.
+pub(crate) fn nvfp4_model_gate(spec: &LoadSpec) -> CoreResult<()> {
     if crate::gguf::is_gguf_path(&spec.source) {
         return Err(CoreError::Unsupported(
             "nvfp4: NVFP4 projections are quantized from a dense safetensors snapshot; a GGUF \
@@ -891,13 +908,15 @@ fn nvfp4_format_with(
                 .into(),
         ));
     }
-    // NVFP4's first (and so far only) consumer is the qwen3_5 family (sc-24135); refuse the rest
-    // by name. A missing or unreadable config (or a Prism snapshot, which `load_dir` refuses for
-    // any repacking) is left to the loader's own error.
     if let Some(config) = read_json(Path::new(&spec.source), "config.json") {
-        let is_prism =
-            config.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35");
-        if let (false, Ok(arch)) = (is_prism, Architecture::from_config(&config)) {
+        if config.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35") {
+            return Err(CoreError::Unsupported(
+                "nvfp4: Prism/Bonsai is already packed affine-2; NVFP4 repacking would expand the \
+                 model"
+                    .into(),
+            ));
+        }
+        if let Ok(arch) = Architecture::from_config(&config) {
             if arch != Architecture::Qwen35 {
                 return Err(CoreError::Unsupported(format!(
                     "nvfp4: NVFP4 projections are served for the qwen3_5 family \
@@ -906,7 +925,7 @@ fn nvfp4_format_with(
             }
         }
     }
-    gate(device).map(Some).map_err(to_core)
+    Ok(())
 }
 
 fn ensure_supported_device(source: &Path, device: &Device) -> CoreResult<()> {
@@ -4808,6 +4827,8 @@ mod tests {
         })
         .expect("load with graphs requested");
         assert_eq!(on.load_record().cuda_graphs, Some(true));
+        // The load report carries the settled switch, not a guess from the request.
+        assert_eq!(on.load_report().unwrap().cuda_graphs, Some(true));
         // Flipping the process switch after the load does not change the loaded model's policy.
         crate::decode::set_cuda_graphs(Some(false));
         let out = on.generate(&request, &mut |_| {}).expect("generate");
@@ -4836,6 +4857,8 @@ mod tests {
             .load_report()
             .expect("the provider reports its load");
         assert_eq!(load.requested, None);
+        // `None` requested, the process switch (off) at load settled it: the report says `false`.
+        assert_eq!(load.cuda_graphs, Some(false));
         assert_eq!(load.projections.len(), 1, "{:?}", load.projections);
         assert_eq!(load.projections[0].kind, "dense");
         assert!(load.projections[0].count > 0 && load.projections[0].resident_bytes > 0);

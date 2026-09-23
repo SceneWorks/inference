@@ -20,8 +20,8 @@ use core_llm::{
 };
 
 use crate::decode::{
-    generate_step_from_prefill, FinishReason as DecodeFinish, GenerationConfig,
-    StreamEvent as DecodeEvent,
+    generate_step_from_prefill, DecodeRecord, FinishReason as DecodeFinish, GenerationConfig,
+    RequestSpan, StreamEvent as DecodeEvent,
 };
 use crate::error::{Error, Result};
 use crate::image::SiglipImageProcessor;
@@ -151,13 +151,27 @@ fn decode_generated_svg_token(
     detok.step(id as u32)
 }
 
+/// The load's quantization refusal: StarVector-8B loads its checkpoint's own encoding only. NVFP4 is
+/// refused by name — it is served for the qwen3_5 family only (sc-24135) — and
+/// [`crate::backend::nvfp4_support`] answers a product's per-snapshot NVFP4 question with this same
+/// gate (sc-24139).
+pub(crate) fn quantize_gate(spec: &LoadSpec) -> CoreResult<()> {
+    match spec.quantize {
+        None => Ok(()),
+        Some(core_llm::Quantize::Nvfp4) => Err(CoreError::Unsupported(
+            "nvfp4: NVFP4 projections are served for the qwen3_5 family only, not StarVector-8B \
+             (it does not support load-time quantization)"
+                .into(),
+        )),
+        Some(_) => Err(CoreError::Unsupported(
+            "StarVector-8B Candle does not support load-time quantization".into(),
+        )),
+    }
+}
+
 impl CandleStarVector8bProvider {
     pub fn load(spec: &LoadSpec) -> CoreResult<Self> {
-        if spec.quantize.is_some() {
-            return Err(CoreError::Unsupported(
-                "StarVector-8B Candle does not support load-time quantization".into(),
-            ));
-        }
+        quantize_gate(spec)?;
         let dir = Path::new(&spec.source);
         validate_snapshot(dir).map_err(to_core)?;
         let device = crate::device::select_device().map_err(to_core)?;
@@ -193,11 +207,13 @@ impl CandleStarVector8bProvider {
     /// Consume the loaded provider; tensor ownership is released without touching shared allocator policy.
     pub fn unload(self) {}
 
+    /// One SVG generation plus the measured decode record of its continuation (sc-24139) — `None`
+    /// when the bounded stream stopped on the static prefix, before any decode step.
     fn generate_svg_inner(
         &self,
         request: &StarVectorRequest,
         on_event: &mut dyn FnMut(StarVectorStreamEvent),
-    ) -> CoreResult<StarVectorOutput> {
+    ) -> CoreResult<(StarVectorOutput, Option<DecodeRecord>)> {
         self.validate_svg(request)?;
         if request.text_request.cancel.is_cancelled() {
             return Err(CoreError::Canceled);
@@ -215,9 +231,14 @@ impl CandleStarVector8bProvider {
                 text: SVG_PROMPT.into(),
                 index: 0,
             }),
-            StarVectorStreamStatus::Stop(_) => return emit_done(stream.output()?, on_event),
+            StarVectorStreamStatus::Stop(_) => {
+                return Ok((emit_done(stream.output()?, on_event)?, None))
+            }
         }
         let began = Instant::now();
+        // The whole request from the conditioning prefill on (the engine's own span starts after
+        // it).
+        let span = RequestSpan::begin();
         let (first, mut cache) = self.model.prefill(image, &prompt).map_err(to_core)?;
         let config = GenerationConfig {
             max_new_tokens: request.text_request.max_new_tokens as usize,
@@ -270,7 +291,7 @@ impl CandleStarVector8bProvider {
         if request.text_request.cancel.is_cancelled() {
             return Err(CoreError::Canceled);
         }
-        let (generated, _record) = generate_step_from_prefill(
+        let (generated, record) = generate_step_from_prefill(
             &self.model.decoder,
             &mut cache,
             first,
@@ -311,7 +332,10 @@ impl CandleStarVector8bProvider {
                 DecodeFinish::Stopped => {}
             }
         }
-        emit_done(stream.output()?, on_event)
+        Ok((
+            emit_done(stream.output()?, on_event)?,
+            Some(record.with_request_span(&span)),
+        ))
     }
 }
 
@@ -348,7 +372,7 @@ impl TextLlm for CandleStarVector8bProvider {
         let svg_request =
             StarVectorRequest::new(request.clone(), 2 * 1024 * 1024, Duration::from_secs(120));
         let prompt_tokens = self.tokenizer.encode(SVG_PROMPT, false)?.len() as u32;
-        let output = self.generate_svg_inner(&svg_request, &mut |event| match event {
+        let (output, record) = self.generate_svg_inner(&svg_request, &mut |event| match event {
             StarVectorStreamEvent::Source { text, index } => on_event(StreamEvent::Token {
                 id: index,
                 text,
@@ -378,7 +402,10 @@ impl TextLlm for CandleStarVector8bProvider {
                 generated_tokens: output.generated_tokens,
             },
             mtp: None,
-            decode: None,
+            // The continuation decodes through the shared engine (sc-24138), so it reports its
+            // path. No graph runner wraps this decoder, so the CUDA-graph switch was off here.
+            // `None` only when the bounded stream stopped on the static prefix, before a decode.
+            decode: record.map(|record| record.report(false)),
             finish_reason: Some(map_finish(output.finish_reason)),
         })
     }
@@ -394,6 +421,7 @@ impl StarVectorProvider for CandleStarVector8bProvider {
         on_event: &mut dyn FnMut(StarVectorStreamEvent),
     ) -> CoreResult<StarVectorOutput> {
         self.generate_svg_inner(request, on_event)
+            .map(|(output, _)| output)
     }
 }
 
@@ -610,6 +638,44 @@ mod tests {
     }"#;
     fn config() -> Value {
         json!({"model_type":"starvector","starcoder_model_name":"bigcode/starcoder2-7b","image_encoder_type":"siglip_384","adapter_norm":"layer_norm","image_size":384,"hidden_size":4608,"num_attention_heads":36,"num_hidden_layers":32,"num_kv_heads":4,"vocab_size":49152})
+    }
+    /// sc-24139: the continuation decodes through the shared engine, so the provider reports the
+    /// engine's record on `TextLlmOutput::decode` rather than `None`. (A real generation needs the
+    /// published 8B weights; this pins the wiring.)
+    #[test]
+    fn the_provider_reports_its_decode_record() {
+        let source = include_str!("starvector_8b.rs");
+        let production = &source[..source.find("mod tests {").expect("the test module")];
+        assert!(!production.contains("decode: None"));
+        assert!(production.contains("decode: record.map(|record| record.report(false))"));
+        assert!(production.contains("Some(record.with_request_span(&span))"));
+    }
+    /// sc-24139: NVFP4 is refused by name, any other load-time format with the existing refusal,
+    /// and the checkpoint's own encoding passes — the gate the per-snapshot probe asks.
+    #[test]
+    fn the_quantize_gate_refuses_nvfp4_by_name() {
+        let spec = |quantize| LoadSpec {
+            quantize,
+            ..LoadSpec::dense("/no/such/starvector-8b")
+        };
+        assert!(quantize_gate(&spec(None)).is_ok());
+        match quantize_gate(&spec(Some(core_llm::Quantize::Nvfp4))) {
+            Err(CoreError::Unsupported(message)) => {
+                assert!(message.starts_with("nvfp4: "), "{message}");
+                assert!(message.contains("StarVector-8B"), "{message}");
+            }
+            other => panic!("expected the NVFP4 refusal, got {other:?}"),
+        }
+        match quantize_gate(&spec(Some(core_llm::Quantize::Q4))) {
+            Err(CoreError::Unsupported(message)) => {
+                assert!(message.contains("load-time quantization"), "{message}")
+            }
+            other => panic!("expected the quantization refusal, got {other:?}"),
+        }
+        assert!(matches!(
+            CandleStarVector8bProvider::load(&spec(Some(core_llm::Quantize::Nvfp4))),
+            Err(CoreError::Unsupported(_))
+        ));
     }
     #[test]
     fn descriptor_matches_mlx_8b_contract() {

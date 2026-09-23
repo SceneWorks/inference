@@ -46,7 +46,7 @@ pub mod starvector_8b;
 // Re-export the contract crate so consumers can reach it as `candle_llm::core_llm::…`.
 pub use core_llm;
 
-pub use backend::backend_capabilities;
+pub use backend::{backend_capabilities, nvfp4_support};
 pub use config::{Architecture, ModelConfig, RopeScaling};
 pub use decode::{
     generate, generate_batch, generate_cached, generate_speculative, generate_with,

@@ -131,6 +131,12 @@ pub fn text_backend_capabilities() -> core_llm::BackendCapabilities {
     core_llm::BackendCapabilities::without_cuda("mlx", "metal")
 }
 
+/// Whether an NVFP4 load of the snapshot at `spec.source` can succeed (sc-24139): never on MLX —
+/// the same refusal, naming this backend, as [`text_backend_capabilities`] gives for the host.
+pub fn text_nvfp4_support(_spec: &core_llm::LoadSpec) -> core_llm::FeatureSupport {
+    text_backend_capabilities().nvfp4
+}
+
 /// Build the complete validated macOS runtime composition.
 pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
     #[cfg(feature = "audio")]

@@ -12,8 +12,8 @@ use candle_core::{Device, Tensor};
 use serde_json::Value;
 
 use crate::decode::{
-    generate_step_from_prefill, FinishReason as DecodeFinish, GenerationConfig,
-    StreamEvent as DecodeEvent,
+    generate_step_from_prefill, DecodeRecord, FinishReason as DecodeFinish, GenerationConfig,
+    RequestSpan, StreamEvent as DecodeEvent,
 };
 use crate::error::{Error, Result};
 use crate::image::resize_bicubic_u8;
@@ -373,8 +373,23 @@ pub struct CandleStarVectorProvider {
     prompt: Vec<i32>,
     model: Mutex<StarVectorModel>,
 }
+/// The load's NVFP4 refusal (sc-24139): NVFP4 is served for the qwen3_5 family only (sc-24135), and
+/// NVFP4 is a capability a provider must refuse rather than silently load another
+/// representation. [`crate::backend::nvfp4_support`] answers a product's per-snapshot question
+/// with the same gate.
+pub(crate) fn nvfp4_gate(spec: &core_llm::LoadSpec) -> core_llm::Result<()> {
+    if spec.quantize == Some(core_llm::Quantize::Nvfp4) {
+        return Err(core_llm::Error::Unsupported(
+            "nvfp4: NVFP4 projections are served for the qwen3_5 family only, not StarVector-1B"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 impl CandleStarVectorProvider {
     pub fn load(spec: &core_llm::LoadSpec) -> core_llm::Result<Self> {
+        nvfp4_gate(spec)?;
         read_config(&spec.source).map_err(to_core)?;
         let device = crate::device::select_device().map_err(to_core)?;
         let weights = Weights::from_dir(&spec.source, &device).map_err(to_core)?;
@@ -500,7 +515,7 @@ impl core_llm::TextLlm for CandleStarVectorProvider {
             1_000_000,
             std::time::Duration::from_secs(120),
         );
-        let out = core_llm::StarVectorProvider::generate_svg(self, &svg, &mut |_| {})?;
+        let (out, record) = self.generate_svg_recorded(&svg, &mut |_| {})?;
         let finish = match out.finish_reason {
             core_llm::StarVectorFinishReason::Cancelled => core_llm::FinishReason::Cancelled,
             core_llm::StarVectorFinishReason::TokenLimit => core_llm::FinishReason::Length,
@@ -521,7 +536,10 @@ impl core_llm::TextLlm for CandleStarVectorProvider {
             tool_calls: vec![],
             usage,
             mtp: None,
-            decode: None,
+            // The continuation decodes through the shared engine (sc-24138), so it reports its
+            // path. No graph runner wraps this decoder, so the CUDA-graph switch was off here.
+            // `None` only when the bounded stream stopped on the seeded prompt, before a decode.
+            decode: record.map(|record| record.report(false)),
             finish_reason: Some(finish),
         })
     }
@@ -535,7 +553,20 @@ impl core_llm::StarVectorProvider for CandleStarVectorProvider {
         req: &core_llm::StarVectorRequest,
         events: &mut dyn FnMut(core_llm::StarVectorStreamEvent),
     ) -> core_llm::Result<core_llm::StarVectorOutput> {
-        self.validate_svg(req)?;
+        self.generate_svg_recorded(req, events)
+            .map(|(output, _)| output)
+    }
+}
+impl CandleStarVectorProvider {
+    /// [`StarVectorProvider::generate_svg`](core_llm::StarVectorProvider::generate_svg) plus the
+    /// measured decode record of the continuation (sc-24139) — `None` when the bounded stream
+    /// stopped on the seeded prompt, before any decode step.
+    fn generate_svg_recorded(
+        &self,
+        req: &core_llm::StarVectorRequest,
+        events: &mut dyn FnMut(core_llm::StarVectorStreamEvent),
+    ) -> core_llm::Result<(core_llm::StarVectorOutput, Option<DecodeRecord>)> {
+        core_llm::StarVectorProvider::validate_svg(self, req)?;
         if req.text_request.cancel.is_cancelled() {
             return Err(core_llm::Error::Canceled);
         }
@@ -579,6 +610,9 @@ impl core_llm::StarVectorProvider for CandleStarVectorProvider {
             // provider has no admission surface to price a whole-budget preallocation), then the
             // continuation decodes through the step seam (sc-24138).
             let mut cache = decoder.new_step_cache();
+            // The whole request from the conditioning prefill on (the engine's own span starts
+            // after it).
+            let span = RequestSpan::begin();
             let logits = decoder
                 .forward_embeds(&initial, &mut cache)
                 .map_err(to_core)?;
@@ -586,7 +620,7 @@ impl core_llm::StarVectorProvider for CandleStarVectorProvider {
             match seed_svg_prompt(&mut stream, events)? {
                 core_llm::StarVectorStreamStatus::Continue => {}
                 core_llm::StarVectorStreamStatus::Stop(_) => {
-                    return Ok(emit_done(stream.output()?, events));
+                    return Ok((emit_done(stream.output()?, events), None));
                 }
             }
             let config = GenerationConfig {
@@ -598,7 +632,7 @@ impl core_llm::StarVectorProvider for CandleStarVectorProvider {
             let mut detok = self.tokenizer.decode_stream(true);
             let stopped = Cell::new(false);
             let failure = RefCell::new(None);
-            let generated = {
+            let (generated, record) = {
                 let mut on_token = |event: DecodeEvent| {
                     let DecodeEvent::Token { id, step } = event else {
                         return;
@@ -635,7 +669,6 @@ impl core_llm::StarVectorProvider for CandleStarVectorProvider {
                     Some(&|| stopped.get()),
                 )
                 .map_err(to_core)?
-                .0
             };
             if let Some(error) = failure.into_inner() {
                 return Err(error);
@@ -690,7 +723,10 @@ impl core_llm::StarVectorProvider for CandleStarVectorProvider {
                 // bounded stream's existing typed terminal reason without publishing partial SVG.
                 let _ = stream.push("", started.elapsed())?;
             }
-            Ok(emit_done(stream.output()?, events))
+            Ok((
+                emit_done(stream.output()?, events),
+                Some(record.with_request_span(&span)),
+            ))
         })();
         result
     }
@@ -1257,6 +1293,37 @@ mod tests {
         assert!(!result);
         assert!(!read_attempted.get(), "file payload must not be read");
         assert!(!can_load_path(file.path()));
+    }
+
+    /// sc-24139: the continuation decodes through the shared engine, so the provider reports the
+    /// engine's record on `TextLlmOutput::decode` rather than `None`. (A real generation needs
+    /// the exact published 1B geometry; this pins the wiring.)
+    #[test]
+    fn the_provider_reports_its_decode_record() {
+        let source = include_str!("starvector.rs");
+        let production = &source[..source.find("mod tests {").expect("the test module")];
+        assert!(!production.contains("decode: None"));
+        assert!(production.contains("decode: record.map(|record| record.report(false))"));
+        assert!(production.contains("Some(record.with_request_span(&span))"));
+    }
+
+    /// sc-24139: NVFP4 is refused at load by name (never a silent dense load), before the
+    /// snapshot is read, by the gate the per-snapshot probe asks.
+    #[test]
+    fn an_nvfp4_load_is_refused_by_name_before_reading_the_snapshot() {
+        let spec = core_llm::LoadSpec {
+            quantize: Some(core_llm::Quantize::Nvfp4),
+            ..core_llm::LoadSpec::dense("/no/such/starvector-1b")
+        };
+        match CandleStarVectorProvider::load(&spec) {
+            Err(core_llm::Error::Unsupported(message)) => {
+                assert!(message.starts_with("nvfp4: "), "{message}");
+                assert!(message.contains("StarVector-1B"), "{message}");
+            }
+            Err(other) => panic!("expected the NVFP4 refusal, got {other:?}"),
+            Ok(_) => panic!("an NVFP4 StarVector-1B load succeeded"),
+        }
+        assert!(nvfp4_gate(&core_llm::LoadSpec::dense("/no/such/starvector-1b")).is_ok());
     }
 
     /// sc-24134: the provider selects its device once, at load, and a request's pixels go to

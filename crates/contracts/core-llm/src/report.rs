@@ -170,6 +170,11 @@ pub struct LoadReport {
     /// Resident projections by kind, only the kinds present; empty when the backend does not
     /// census this architecture.
     pub projections: Vec<ProjectionReport>,
+    /// The CUDA-graph switch the loaded model's generations run under, as the load settled it:
+    /// [`LoadSpec::cuda_graphs`](crate::LoadSpec::cuda_graphs), else the backend's default at
+    /// load. `None` where the switch does not apply — a provider that never routes decode steps
+    /// through a CUDA-graph runner — so a product shows the settled value, not the request.
+    pub cuda_graphs: Option<bool>,
 }
 
 #[cfg(test)]
