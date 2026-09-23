@@ -388,8 +388,8 @@ fn generate_qwen35_mtp_inner(
         let mut verify = Vec::with_capacity(1 + drafts.len());
         verify.push(cur);
         verify.extend_from_slice(&drafts);
-        let target_base = target_cache.clone();
-        let mut trial_cache = target_base.clone();
+        let target_base = target_cache.try_clone()?;
+        let mut trial_cache = target_base.try_clone()?;
         let (verify_logits, trial_hidden) = target.forward_with_hidden(
             &input_ids(&verify, device)?,
             &mut trial_cache,
