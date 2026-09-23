@@ -16,8 +16,8 @@ use core_llm::{
     AudioRef, Channel, ChatTemplate, Constraint, ConstraintDecodeTable, ConstraintKind, Content,
     Error as CoreError, FinishReason as CoreFinish, GenerationTimings, ImageRef, IncrementalDetok,
     JinjaChatTemplate, JsonConstraint, Llama3Template, LlmMemoryGeometry, LoadSpec, Message,
-    ModelSamplingDefaults, MtpCapabilities, MtpMode, MtpStats, Quantize, ReasoningEffort,
-    RenderOptions, Result as CoreResult, Sampling, StopMatcher, StreamEvent as CoreEvent, TextLlm,
+    ModelSamplingDefaults, MtpCapabilities, MtpStats, Quantize, ReasoningEffort, RenderOptions,
+    Result as CoreResult, Sampling, StopMatcher, StreamEvent as CoreEvent, TextLlm,
     TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter,
     Tokenizer, ToolCallSegmenter, Usage, VideoRef,
 };
@@ -25,10 +25,9 @@ use serde_json::Value;
 
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
-    generate_from_prefill_with_stop, generate_qwen35_mtp_multimodal_with_stop,
-    generate_qwen35_mtp_timed_with_stop, ConstraintMask, CountingDecode, Decode, DecodePath,
-    DecodeRecord, FinishReason, GenerationConfig, Qwen35MtpMultimodalPrompt, RequestSpan,
-    RewindableConstraintMask, StreamEvent,
+    generate_from_prefill_with_stop, generate_speculative_with, ConstraintMask, CountingDecode,
+    Decode, DecodePath, DecodeRecord, FinishReason, GenerationConfig, MtpProposer, RequestSpan,
+    RewindableConstraintMask, SpeculativePrompt, StepModel, StreamEvent,
 };
 use crate::device::select_device;
 use crate::gguf::GgufCheckpoint;
@@ -100,7 +99,21 @@ fn qwen35_recurrent_admission_bytes(c: &Qwen35Config, retained_checkpoints: usiz
 }
 
 impl Decoder {
+    /// The geometry admission prices for a request on the provider's own growing caches (the
+    /// reference paths retain [`REFERENCE_MAX_CHECKPOINTS`](crate::models::qwen35::REFERENCE_MAX_CHECKPOINTS)).
     fn memory_geometry(&self) -> LlmMemoryGeometry {
+        self.memory_geometry_with_checkpoints(crate::models::qwen35::REFERENCE_MAX_CHECKPOINTS)
+    }
+
+    /// The geometry for a request that runs through the step seam — the speculative engine —
+    /// whose cache retains [`STEP_MAX_CHECKPOINTS`](crate::models::qwen35::STEP_MAX_CHECKPOINTS)
+    /// rollback checkpoints (each a distinct recurrent state once the live state moves on), and
+    /// whose verify step writes `K + 1` positions past the budget (E6).
+    fn step_memory_geometry(&self) -> LlmMemoryGeometry {
+        self.memory_geometry_with_checkpoints(crate::models::qwen35::STEP_MAX_CHECKPOINTS)
+    }
+
+    fn memory_geometry_with_checkpoints(&self, retained_checkpoints: usize) -> LlmMemoryGeometry {
         let (query_heads, kv_heads, head_dim, layers, hidden, intermediate, vocab, recurrent) =
             match self {
                 Decoder::Causal(m) => {
@@ -126,10 +139,7 @@ impl Decoder {
                         c.hidden_size,
                         c.intermediate_size,
                         c.vocab_size,
-                        qwen35_recurrent_admission_bytes(
-                            c,
-                            crate::models::qwen35::REFERENCE_MAX_CHECKPOINTS,
-                        ),
+                        qwen35_recurrent_admission_bytes(c, retained_checkpoints),
                     )
                 }
             };
@@ -2004,20 +2014,24 @@ impl TextLlm for LlamaProvider {
         // Every portable eager-attention mask variant is query-tiled; CUDA flash attention is
         // bounded more tightly. Use the runtime's exact maximum tile so admission prices the same
         // peak score/mask/weight lifetime the implementation enforces.
+        // The backend-neutral mode resolution (core-llm): Auto on a model without a head decodes
+        // normally, and the record says `proposer=none` (E2, sc-24130).
+        let mtp_plan = core_llm::resolve_mtp_plan(req.mtp, self.descriptor.capabilities.mtp);
+        let mtp_drafts = mtp_plan.draft_tokens();
         let required = core_llm::estimate_chunked_request_bytes(
             admitted_prompt,
             req.max_new_tokens,
-            self.model.memory_geometry(),
-            vision_workspace,
-            match req.mtp {
-                MtpMode::Off => 0,
-                MtpMode::Auto => self
-                    .descriptor
-                    .capabilities
-                    .mtp
-                    .map_or(0, |c| c.recommended_draft_tokens),
-                MtpMode::Enabled { draft_tokens } => draft_tokens,
+            match mtp_plan {
+                // The engine's step cache retains rollback checkpoints the reference cache does
+                // not, and its verify step overshoots the budget by `K`.
+                core_llm::MtpPlan::Mtp { draft_tokens } => {
+                    let _ = draft_tokens;
+                    self.model.step_memory_geometry()
+                }
+                core_llm::MtpPlan::Off => self.model.memory_geometry(),
             },
+            vision_workspace,
+            mtp_drafts.unwrap_or(0),
             EAGER_ATTN_QUERY_CHUNK_SIZE,
         )
         .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
@@ -2069,16 +2083,6 @@ impl TextLlm for LlamaProvider {
             seed: req.seed,
             stop_tokens: self.stop_tokens.clone(),
         };
-        let mtp_drafts = match req.mtp {
-            MtpMode::Off => None,
-            MtpMode::Auto => self
-                .descriptor
-                .capabilities
-                .mtp
-                .map(|cap| cap.recommended_draft_tokens),
-            MtpMode::Enabled { draft_tokens } => Some(draft_tokens),
-        };
-
         // Structured-output constraint: build a JSON mask over the cached decode table.
         let constraint_starts_in_reasoning =
             self.descriptor.capabilities.supports_thinking && prompt_opens_thinking(&prompt);
@@ -2139,6 +2143,7 @@ impl TextLlm for LlamaProvider {
         // The segmenter (when active) splits each delta into reasoning vs answer.
         let tokenizer = &self.tokenizer;
         let mut mtp_stats = None;
+        let mut engine_record: Option<DecodeRecord> = None;
         let phase_prefill;
         let phase_decode_started;
         let out = {
@@ -2234,45 +2239,65 @@ impl TextLlm for LlamaProvider {
                 let constraint = json_mask
                     .as_mut()
                     .map(|m| m as &mut dyn RewindableConstraintMask);
-                let (generated, stats) = match &mm {
+                let drafts = draft_tokens as usize;
+                let mut proposer = MtpProposer::new(mtp);
+                // The unified engine over the step seam with the MTP proposer (sc-24130).
+                let run = match &mm {
                     Some(m) => {
-                        let mut prefill = None;
-                        let mut decode_started = None;
-                        let mut boundary = || -> crate::error::Result<()> {
-                            target.device().synchronize()?;
-                            prefill = Some(generation_started.elapsed());
-                            decode_started = Some(std::time::Instant::now());
-                            Ok(())
-                        };
+                        // Multimodal: the fused-embedding / M-RoPE prefill is the caller's, into
+                        // the engine's own step cache; the predictor is warmed from the same
+                        // fused rows; the continuation positions are shifted by `mrope_delta`
+                        // inside the cache.
+                        let capacity = m.expanded_ids.len().saturating_add(config.max_new_tokens);
+                        let mut cache = target.new_cache_for(capacity, drafts).map_err(to_core)?;
                         let (t, h, w, delta) = &m.positions;
-                        let result = generate_qwen35_mtp_multimodal_with_stop(
+                        let positions = [t.as_slice(), h.as_slice(), w.as_slice()];
+                        let (logits, hidden) = target
+                            .prefill_from_embeds_deepstack_with_hidden(
+                                &m.embeds,
+                                positions,
+                                &mut cache,
+                                &m.visual_pos_mask,
+                                &m.deepstack,
+                            )
+                            .map_err(to_core)?;
+                        cache.set_rope_delta(*delta);
+                        proposer
+                            .warm_multimodal(&m.embeds, &hidden, positions)
+                            .map_err(to_core)?;
+                        target
+                            .device()
+                            .synchronize()
+                            .map_err(|e| to_core(e.into()))?;
+                        let prefill = generation_started.elapsed();
+                        let decode_started = std::time::Instant::now();
+                        let run = generate_speculative_with(
                             target,
-                            mtp,
-                            Qwen35MtpMultimodalPrompt {
-                                input_ids: &m.expanded_ids,
-                                embeddings: &m.embeds,
-                                positions: [t.as_slice(), h.as_slice(), w.as_slice()],
-                                visual_pos_mask: &m.visual_pos_mask,
-                                deepstack: &m.deepstack,
-                                continuation_delta: *delta,
+                            &mut proposer,
+                            SpeculativePrompt::Prefilled {
+                                cache: &mut cache,
+                                logits,
+                                hidden: Some(hidden),
+                                history: &m.expanded_ids,
+                                position_delta: *delta,
+                                warm_proposer: false,
                             },
                             &config,
-                            draft_tokens,
+                            drafts,
                             &req.cancel,
                             &mut sink,
                             constraint,
                             should_stop_opt,
-                            Some(&mut boundary),
+                            None,
                         )
                         .map_err(to_core)?;
                         target
                             .device()
                             .synchronize()
                             .map_err(|e| to_core(e.into()))?;
-                        phase_prefill = prefill.unwrap_or_else(|| generation_started.elapsed());
-                        phase_decode_started =
-                            decode_started.unwrap_or_else(std::time::Instant::now);
-                        result
+                        phase_prefill = prefill;
+                        phase_decode_started = decode_started;
+                        run
                     }
                     None => {
                         target
@@ -2288,17 +2313,17 @@ impl TextLlm for LlamaProvider {
                             decode_started = Some(std::time::Instant::now());
                             Ok(())
                         };
-                        let result = generate_qwen35_mtp_timed_with_stop(
+                        let run = generate_speculative_with(
                             target,
-                            mtp,
-                            &prompt_ids,
+                            &mut proposer,
+                            SpeculativePrompt::Tokens(&prompt_ids),
                             &config,
-                            draft_tokens,
+                            drafts,
                             &req.cancel,
                             &mut sink,
                             constraint,
                             should_stop_opt,
-                            &mut boundary,
+                            Some(&mut boundary),
                         )
                         .map_err(to_core)?;
                         target
@@ -2308,15 +2333,16 @@ impl TextLlm for LlamaProvider {
                         phase_prefill = prefill.unwrap_or_else(|| generation_started.elapsed());
                         phase_decode_started =
                             decode_started.unwrap_or_else(std::time::Instant::now);
-                        result
+                        run
                     }
                 };
                 mtp_stats = Some(MtpStats {
-                    proposed_tokens: u32::try_from(stats.proposed).unwrap_or(u32::MAX),
-                    accepted_tokens: u32::try_from(stats.accepted).unwrap_or(u32::MAX),
-                    target_forwards: u32::try_from(stats.forwards).unwrap_or(u32::MAX),
+                    proposed_tokens: u32::try_from(run.stats.proposed).unwrap_or(u32::MAX),
+                    accepted_tokens: u32::try_from(run.stats.accepted).unwrap_or(u32::MAX),
+                    target_forwards: u32::try_from(run.stats.forwards).unwrap_or(u32::MAX),
                 });
-                generated
+                engine_record = Some(run.record);
+                run.output
             } else {
                 let constraint = json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask);
                 match &mm {
@@ -2486,24 +2512,22 @@ impl TextLlm for LlamaProvider {
             }
         };
 
-        let decode_record = match (mtp_stats, mtp_drafts) {
-            (Some(stats), Some(drafts)) => DecodeRecord {
-                path: DecodePath::Mtp { drafts },
-                target_forwards: u64::from(stats.target_forwards),
-                proposed_tokens: u64::from(stats.proposed_tokens),
-                accepted_tokens: u64::from(stats.accepted_tokens),
-                generated_tokens: out.tokens.len() as u64,
+        // The engine's record is measured by the engine itself (the cache it ran on, the
+        // proposer, the per-verify-step syncs); the reference paths' record names `proposer=none`
+        // — including a request whose `MtpMode::Auto` resolved to no proposer (AC3, sc-24130).
+        let decode_record = match engine_record {
+            Some(record) => DecodeRecord {
                 host_syncs: request_span.host_syncs(),
-                kv_cache: crate::primitives::KvCacheKind::Growing,
-                attn_formulation: self.model.attn_formulation(),
+                ..record
             },
-            _ => DecodeRecord::plain(
+            None => DecodeRecord::plain(
                 DecodePath::Reference,
                 counted.forwards() + extra_forwards,
                 out.tokens.len(),
                 request_span.host_syncs(),
             )
-            .with_attn_formulation(self.model.attn_formulation()),
+            .with_attn_formulation(self.model.attn_formulation())
+            .with_proposer(mtp_plan.proposer()),
         };
         *self
             .last_decode

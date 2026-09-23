@@ -71,6 +71,16 @@ pub trait DecodeCache {
     /// Drop everything, returning to the freshly-constructed condition.
     fn reset(&mut self);
 
+    /// Ask the cache to retain at least `n` rollback checkpoints (the newest), so a caller that
+    /// takes `n` single-token steps past a position can still roll back to it — the draft-model
+    /// proposer's `K + 1` draft steps before the target verifies (sc-24130). A cache that can
+    /// roll back to any position without checkpoints ignores it (the default); a cache that
+    /// checkpoints step starts raises its retention, and whoever admits such a request prices
+    /// the extra states (E6). Never lowers an existing retention.
+    fn retain_checkpoints(&mut self, n: usize) {
+        let _ = n;
+    }
+
     /// The cache's logical memory accounting.
     fn memory(&self) -> CacheMemory;
 

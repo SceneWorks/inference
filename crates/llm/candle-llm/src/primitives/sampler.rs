@@ -83,8 +83,9 @@ impl Default for SamplingParams {
 
 impl SamplingParams {
     /// True when this configuration is pure greedy with no penalty and (caller-checked) no
-    /// constraint mask — eligible for the on-device argmax fast path.
-    fn is_plain_greedy(&self) -> bool {
+    /// constraint mask — eligible for the on-device argmax fast path (and, in the speculative
+    /// engine, for device-resident drafts).
+    pub fn is_plain_greedy(&self) -> bool {
         self.temperature <= 0.0 && self.repetition_penalty == 1.0 && self.presence_penalty == 0.0
     }
 }
@@ -162,7 +163,118 @@ fn penalized_logits(
         .flatten_all()?
         .to_dtype(DType::F32)?
         .to_vec1::<f32>()?;
+    penalize_host(&mut v, history, params, allowed);
+    Ok(v)
+}
 
+/// Pull every row of an all-positions logits tensor `[1, n, vocab]` (or `[n, vocab]`) to host f32
+/// in **one** device->host transfer — the speculative engine's verify decision (sc-24130): the
+/// `n = K + 1` rows come over together, then each row is shaped on host with
+/// [`sample_host`] / [`shaped_candidates_host`], so a verify step costs one sync however wide it
+/// is (the per-row [`sample`] would cost `K + 1`).
+pub fn logits_rows_host(logits: &Tensor) -> Result<Vec<Vec<f32>>> {
+    let (n, vocab) = match logits.dims() {
+        [1, n, vocab] | [n, vocab] => (*n, *vocab),
+        dims => {
+            return Err(crate::error::Error::Msg(format!(
+                "logits_rows_host: expected [1, n, vocab] or [n, vocab], got {dims:?}"
+            )))
+        }
+    };
+    super::host_sync::note_host_sync(); // one n x vocab transfer
+    let flat = logits
+        .flatten_all()?
+        .to_dtype(DType::F32)?
+        .to_vec1::<f32>()?;
+    Ok(flat
+        .chunks_exact(vocab)
+        .take(n)
+        .map(<[f32]>::to_vec)
+        .collect())
+}
+
+/// On-device argmax of every row of `[1, n, vocab]` (or `[n, vocab]`) logits, brought to host as
+/// **one** `n`-element transfer — the greedy verify decision's whole device->host traffic. Row `i`
+/// ties break to the lowest index like [`argmax_device`], so a row's result equals the
+/// single-row fast path's.
+pub fn argmax_rows_device(logits: &Tensor) -> Result<Vec<i32>> {
+    let rows = argmax_rows_tensor(logits)?;
+    super::host_sync::note_host_sync(); // one n-element transfer
+    Ok(rows
+        .to_vec1::<u32>()?
+        .into_iter()
+        .map(|t| t as i32)
+        .collect())
+}
+
+/// On-device argmax of every row of `[1, n, vocab]` (or `[n, vocab]`) logits as a `[n]` `u32`
+/// tensor that **stays on the device** — no host transfer. A greedy proposer keeps its draft
+/// tokens here and feeds them back as device ids, so drafting issues no sync; the tokens reach the
+/// host later inside the verify decision's single transfer.
+pub fn argmax_rows_tensor(logits: &Tensor) -> Result<Tensor> {
+    let (n, vocab) = match logits.dims() {
+        [1, n, vocab] | [n, vocab] => (*n, *vocab),
+        [vocab] => (1, *vocab),
+        dims => {
+            return Err(crate::error::Error::Msg(format!(
+                "argmax_rows_tensor: expected [1, n, vocab], [n, vocab] or [vocab], got {dims:?}"
+            )))
+        }
+    };
+    Ok(logits.reshape((n, vocab))?.argmax(1)?)
+}
+
+/// [`sample`] over a logits row already on the host (from [`logits_rows_host`]): identical
+/// shaping and draw, no device transfer. `row` is consumed (penalties are applied in place).
+pub fn sample_host(
+    mut row: Vec<f32>,
+    history: &[i32],
+    params: &SamplingParams,
+    rng: &mut impl TokenRng,
+    allowed: Option<&[bool]>,
+) -> i32 {
+    penalize_host(&mut row, history, params, allowed);
+    if params.temperature <= 0.0 {
+        return argmax_host(&row);
+    }
+    let weights = nucleus_weights(&row, params);
+    let total: f32 = weights.iter().map(|x| x.1).sum();
+    if total <= 0.0 || !total.is_finite() {
+        return argmax_host(&row);
+    }
+    let mut target = rng.next_f32() * total;
+    for (i, w) in &weights {
+        target -= *w;
+        if target <= 0.0 {
+            return *i as i32;
+        }
+    }
+    weights.last().map(|x| x.0).unwrap_or(0) as i32
+}
+
+/// [`shaped_candidates`] over a logits row already on the host (from [`logits_rows_host`]).
+pub fn shaped_candidates_host(
+    mut row: Vec<f32>,
+    history: &[i32],
+    params: &SamplingParams,
+    allowed: Option<&[bool]>,
+) -> Vec<(i32, f32)> {
+    penalize_host(&mut row, history, params, allowed);
+    nucleus_weights(&row, params)
+        .into_iter()
+        .map(|(i, w)| (i as i32, w))
+        .collect()
+}
+
+/// The constraint mask plus repetition and presence penalties over host logits, in place (the
+/// position-shaping shared by every sampling entry point). Repetition is applied first, then
+/// presence, matching the MLX backend's combined-penalty order.
+fn penalize_host(
+    v: &mut [f32],
+    history: &[i32],
+    params: &SamplingParams,
+    allowed: Option<&[bool]>,
+) {
     // Constraint mask: forbid disallowed ids.
     if let Some(mask) = allowed {
         for (i, val) in v.iter_mut().enumerate() {
@@ -199,7 +311,6 @@ fn penalized_logits(
             }
         }
     }
-    Ok(v)
 }
 
 /// Temperature + top-k + top-p shaping into `(index, unnormalised_weight)` candidates. Assumes
@@ -337,6 +448,76 @@ mod tests {
         let l = logits(&[0.1, 5.0, 0.2, 9.9, 3.0]);
         assert_eq!(argmax_device(&l).unwrap(), 3);
         assert_eq!(argmax_host(&[0.1, 5.0, 0.2, 9.9, 3.0]), 3);
+    }
+
+    #[test]
+    fn host_row_entry_points_match_the_tensor_ones_with_one_transfer() {
+        let rows = Tensor::from_vec(
+            vec![0.1f32, 5.0, 0.2, 9.9, 3.0, 2.0, 1.0, 4.0, 0.5, 4.0],
+            (1, 2, 5),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let before = crate::primitives::host_sync_count();
+        let host = logits_rows_host(&rows).unwrap();
+        assert_eq!(crate::primitives::host_sync_count() - before, 1);
+        assert_eq!(host.len(), 2);
+        assert_eq!(host[0], vec![0.1, 5.0, 0.2, 9.9, 3.0]);
+        let before = crate::primitives::host_sync_count();
+        assert_eq!(argmax_rows_device(&rows).unwrap(), vec![3, 2]); // ties -> lowest index
+        assert_eq!(crate::primitives::host_sync_count() - before, 1);
+        let before = crate::primitives::host_sync_count();
+        let kept = argmax_rows_tensor(&rows).unwrap();
+        assert_eq!(crate::primitives::host_sync_count() - before, 0);
+        assert_eq!(kept.to_vec1::<u32>().unwrap(), vec![3, 2]);
+
+        let params = SamplingParams {
+            temperature: 0.8,
+            top_p: 0.95,
+            top_k: 3,
+            repetition_penalty: 1.3,
+            repetition_context: 4,
+            presence_penalty: 0.2,
+        };
+        let row = logits(&[1.0, 2.0, 3.0, 0.5, -1.0, 4.0]);
+        let history = [1, 5, 5];
+        let mask = [true, true, true, true, false, true];
+        let mut a = SplitMix64::new(9);
+        let mut b = SplitMix64::new(9);
+        for _ in 0..16 {
+            let via_tensor = sample(&row, &history, &params, &mut a, Some(&mask)).unwrap();
+            let host_row = logits_rows_host(&row).unwrap().remove(0);
+            let via_host = sample_host(host_row, &history, &params, &mut b, Some(&mask));
+            assert_eq!(via_tensor, via_host);
+        }
+        assert_eq!(
+            shaped_candidates(&row, &history, &params, Some(&mask)).unwrap(),
+            shaped_candidates_host(
+                logits_rows_host(&row).unwrap().remove(0),
+                &history,
+                &params,
+                Some(&mask)
+            )
+        );
+        // Greedy on host with a penalty is the penalized argmax, like the tensor path.
+        let greedy = SamplingParams {
+            repetition_penalty: 5.0,
+            repetition_context: 8,
+            ..Default::default()
+        };
+        let l = logits(&[2.0, 1.5, 0.5]);
+        assert_eq!(
+            sample_host(
+                logits_rows_host(&l).unwrap().remove(0),
+                &[0, 0, 0],
+                &greedy,
+                &mut SplitMix64::new(0),
+                None
+            ),
+            1
+        );
+        let bad = Tensor::zeros((2, 2, 2), DType::F32, &Device::Cpu).unwrap();
+        assert!(logits_rows_host(&bad).is_err());
     }
 
     #[test]

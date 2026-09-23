@@ -20,7 +20,106 @@
 //! module stays tensor-free *and* RNG-free — deterministic and exhaustively unit-testable, with the
 //! backend feeding draws from its own seeded PRNG.
 //!
+//! ## The unified engine's policy (epic sc-24128, story sc-24130)
+//! The Candle engine runs **one** speculative loop over its step-model seam with pluggable
+//! proposers; the parts of that loop that are policy rather than tensor work live here so MLX can
+//! adopt them unchanged: which proposer a request resolves to ([`resolve_mtp_plan`],
+//! [`ProposerKind`]) and the verify decision ([`greedy_commit`] for greedy, [`accept_token`] for
+//! stochastic — the same acceptance rule as before, unchanged).
+//!
 //! [`mlx-llm`]: https://github.com/SceneWorks/mlx-llm
+
+/// Which proposal source a speculative run used (epic sc-24128, story sc-24130). Every decode
+/// record names one, so "which proposer ran" is visible per request and a request that resolved
+/// to no proposer says so (`none`) rather than silently downgrading.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProposerKind {
+    /// No proposer: the token-at-a-time path (also what [`MtpMode::Auto`](crate::MtpMode::Auto)
+    /// resolves to on a model without an MTP head).
+    #[default]
+    None,
+    /// The checkpoint-native multi-token-prediction head.
+    Mtp,
+    /// Prompt lookup: [`ngram_propose`] over the context.
+    Ngram,
+    /// A separate draft model.
+    Draft,
+}
+
+impl ProposerKind {
+    /// Stable lower-case label for logs and evidence rows (`none`, `mtp`, `ngram`, `draft`).
+    pub fn label(self) -> &'static str {
+        match self {
+            ProposerKind::None => "none",
+            ProposerKind::Mtp => "mtp",
+            ProposerKind::Ngram => "ngram",
+            ProposerKind::Draft => "draft",
+        }
+    }
+}
+
+/// What a request's [`MtpMode`](crate::MtpMode) resolves to against the loaded model
+/// ([`resolve_mtp_plan`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MtpPlan {
+    /// Decode token-at-a-time; the record names `proposer=none`.
+    Off,
+    /// Run the MTP proposer with `draft_tokens` drafts per verify step.
+    Mtp {
+        /// Drafts proposed per target verification pass.
+        draft_tokens: u32,
+    },
+}
+
+impl MtpPlan {
+    /// The proposer this plan runs.
+    pub fn proposer(self) -> ProposerKind {
+        match self {
+            MtpPlan::Off => ProposerKind::None,
+            MtpPlan::Mtp { .. } => ProposerKind::Mtp,
+        }
+    }
+
+    /// The draft width, or `None` when off.
+    pub fn draft_tokens(self) -> Option<u32> {
+        match self {
+            MtpPlan::Off => None,
+            MtpPlan::Mtp { draft_tokens } => Some(draft_tokens),
+        }
+    }
+}
+
+/// Resolve a request's MTP mode against what the model advertises — the backend-neutral mode
+/// policy both engines apply: `Off` never speculates; `Auto` runs the advertised recommended
+/// width when the model has a head and decodes normally (`proposer=none`) when it does not;
+/// `Enabled` runs exactly the requested width (its admissibility is checked by
+/// [`TextLlmCapabilities::validate`](crate::TextLlmCapabilities::validate) before this point, so
+/// an un-advertised `Enabled` here is the caller's contract violation and resolves to `Off`
+/// rather than inventing a width).
+pub fn resolve_mtp_plan(
+    mode: crate::MtpMode,
+    advertised: Option<crate::MtpCapabilities>,
+) -> MtpPlan {
+    match (mode, advertised) {
+        (crate::MtpMode::Off, _) | (_, None) => MtpPlan::Off,
+        (crate::MtpMode::Auto, Some(cap)) => MtpPlan::Mtp {
+            draft_tokens: cap.recommended_draft_tokens,
+        },
+        (crate::MtpMode::Enabled { draft_tokens }, Some(_)) => MtpPlan::Mtp { draft_tokens },
+    }
+}
+
+/// The greedy verify decision in one call: the committed run (accepted drafts + the bonus token)
+/// and how many drafts were accepted, from the target's per-position argmax
+/// (`target_argmax.len() == drafts.len() + 1`, see [`accept_greedy_run`]). Every committed token is
+/// the target's own greedy choice, so a greedy speculative run commits exactly what token-at-a-time
+/// greedy decoding would have chosen at each position.
+pub fn greedy_commit(target_argmax: &[i32], drafts: &[i32]) -> (Vec<i32>, usize) {
+    let accepted = accept_greedy_run(target_argmax, drafts);
+    let mut committed = drafts[..accepted].to_vec();
+    committed.push(target_argmax[accepted]);
+    (committed, accepted)
+}
 
 /// Propose a continuation by **prompt lookup**: find the most recent earlier occurrence of the
 /// sequence's trailing n-gram and return the tokens that followed it (story 7171).
@@ -192,6 +291,51 @@ mod tests {
         assert_eq!(ngram_propose(&[1, 2, 3, 4], 3, 4), Vec::<i32>::new());
         assert_eq!(ngram_propose(&[1], 3, 4), Vec::<i32>::new());
         assert_eq!(ngram_propose(&[], 3, 4), Vec::<i32>::new());
+    }
+
+    // --- mode resolution and the greedy commit (sc-24130) ---
+
+    #[test]
+    fn mtp_mode_resolves_against_the_advertised_head() {
+        use crate::{MtpCapabilities, MtpMode};
+        let cap = Some(MtpCapabilities {
+            max_draft_tokens: 5,
+            recommended_draft_tokens: 3,
+        });
+        assert_eq!(resolve_mtp_plan(MtpMode::Off, cap), MtpPlan::Off);
+        assert_eq!(resolve_mtp_plan(MtpMode::Off, None), MtpPlan::Off);
+        // Auto on a model without a head decodes normally and says so.
+        let none = resolve_mtp_plan(MtpMode::Auto, None);
+        assert_eq!(none, MtpPlan::Off);
+        assert_eq!(none.proposer(), ProposerKind::None);
+        assert_eq!(none.proposer().label(), "none");
+        assert_eq!(none.draft_tokens(), None);
+        let auto = resolve_mtp_plan(MtpMode::Auto, cap);
+        assert_eq!(auto, MtpPlan::Mtp { draft_tokens: 3 });
+        assert_eq!(auto.proposer(), ProposerKind::Mtp);
+        assert_eq!(auto.draft_tokens(), Some(3));
+        assert_eq!(
+            resolve_mtp_plan(MtpMode::Enabled { draft_tokens: 5 }, cap),
+            MtpPlan::Mtp { draft_tokens: 5 }
+        );
+        // An un-advertised Enabled is the caller's contract violation (validate rejects it
+        // first); the resolver never invents a width.
+        assert_eq!(
+            resolve_mtp_plan(MtpMode::Enabled { draft_tokens: 5 }, None),
+            MtpPlan::Off
+        );
+        assert_eq!(ProposerKind::default(), ProposerKind::None);
+        assert_eq!(ProposerKind::Ngram.label(), "ngram");
+        assert_eq!(ProposerKind::Draft.label(), "draft");
+        assert_eq!(ProposerKind::Mtp.label(), "mtp");
+    }
+
+    #[test]
+    fn greedy_commit_is_the_accepted_prefix_plus_the_bonus() {
+        assert_eq!(greedy_commit(&[1, 2, 9], &[1, 2]), (vec![1, 2, 9], 2));
+        assert_eq!(greedy_commit(&[1, 5, 9], &[1, 2]), (vec![1, 5], 1));
+        assert_eq!(greedy_commit(&[7, 5, 9], &[1, 2]), (vec![7], 0));
+        assert_eq!(greedy_commit(&[9], &[]), (vec![9], 0));
     }
 
     // --- greedy acceptance ---

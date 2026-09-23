@@ -36,11 +36,49 @@ pub enum LogitsScope {
     All,
 }
 
+/// The tokens one step feeds: host ids, or ids already on the model's device (story sc-24130).
+///
+/// A greedy proposer keeps its draft tokens on the device (the argmax tensor of each draft step)
+/// and hands the verify step `[cur, drafts…]` as a device tensor, so drafting and verifying issue
+/// no device->host transfer of their own; the drafts reach the host once, inside the verify
+/// decision's single transfer.
+#[derive(Clone, Copy, Debug)]
+pub enum StepTokens<'a> {
+    /// Token ids on the host.
+    Host(&'a [i32]),
+    /// A `[1, n]` `u32` id tensor on the model's device.
+    Device(&'a Tensor),
+}
+
+impl StepTokens<'_> {
+    /// How many tokens the step feeds.
+    pub fn len(&self) -> Result<usize> {
+        Ok(match self {
+            StepTokens::Host(tokens) => tokens.len(),
+            StepTokens::Device(ids) => ids.dims2()?.1,
+        })
+    }
+
+    /// `len() == 0`.
+    pub fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
+    }
+
+    /// The ids as a `[1, n]` `u32` tensor on `device` (built from host ids, or the device tensor
+    /// itself — no copy).
+    pub fn ids(&self, device: &Device) -> Result<Tensor> {
+        match self {
+            StepTokens::Host(tokens) => crate::primitives::input_ids(tokens, device),
+            StepTokens::Device(ids) => Ok((*ids).clone()),
+        }
+    }
+}
+
 /// One decode step's inputs.
 #[derive(Clone, Copy, Debug)]
 pub struct StepRequest<'a> {
     /// The tokens to feed, in order; they occupy positions `cache.len() .. cache.len() + n`.
-    pub tokens: &'a [i32],
+    pub tokens: StepTokens<'a>,
     /// Which logits to return.
     pub scope: LogitsScope,
     /// Also return the final-normalized hidden states `[batch, n, hidden]` (what a native MTP head
@@ -52,7 +90,7 @@ impl<'a> StepRequest<'a> {
     /// Last-position logits over `tokens`, no hidden states — the plain decode step.
     pub fn last(tokens: &'a [i32]) -> Self {
         Self {
-            tokens,
+            tokens: StepTokens::Host(tokens),
             scope: LogitsScope::Last,
             want_hidden: false,
         }
@@ -61,10 +99,45 @@ impl<'a> StepRequest<'a> {
     /// All-position logits over `tokens`, no hidden states — the verify step.
     pub fn all(tokens: &'a [i32]) -> Self {
         Self {
-            tokens,
+            tokens: StepTokens::Host(tokens),
             scope: LogitsScope::All,
             want_hidden: false,
         }
+    }
+
+    /// Last-position logits over device-resident ids `[1, n]`.
+    pub fn last_ids(ids: &'a Tensor) -> Self {
+        Self {
+            tokens: StepTokens::Device(ids),
+            scope: LogitsScope::Last,
+            want_hidden: false,
+        }
+    }
+
+    /// All-position logits over device-resident ids `[1, n]` — the verify step of a proposer
+    /// whose drafts live on the device.
+    pub fn all_ids(ids: &'a Tensor) -> Self {
+        Self {
+            tokens: StepTokens::Device(ids),
+            scope: LogitsScope::All,
+            want_hidden: false,
+        }
+    }
+
+    /// The same request, also returning the final-normalized hidden states.
+    pub fn with_hidden(mut self, want_hidden: bool) -> Self {
+        self.want_hidden = want_hidden;
+        self
+    }
+
+    /// How many tokens the step feeds.
+    pub fn len(&self) -> Result<usize> {
+        self.tokens.len()
+    }
+
+    /// `len() == 0`.
+    pub fn is_empty(&self) -> Result<bool> {
+        self.tokens.is_empty()
     }
 }
 
@@ -126,7 +199,7 @@ pub trait StepModel {
     ///     fn device(&self) -> &Device { &Device::Cpu }
     ///     fn vocab_size(&self) -> usize { 4 }
     ///     fn forward_step(&self, cache: &mut Bounded, request: StepRequest<'_>) -> Result<StepOutput> {
-    ///         cache.len += request.tokens.len() as i32;
+    ///         cache.len += request.len()? as i32;
     ///         Ok(StepOutput { logits: Tensor::zeros((1, 4), candle_core::DType::F32, &Device::Cpu)?, hidden: None })
     ///     }
     /// }
@@ -349,9 +422,9 @@ mod tests {
             cache: &mut CounterCache,
             request: StepRequest<'_>,
         ) -> Result<StepOutput> {
-            assert!(!request.tokens.is_empty());
+            assert!(!request.is_empty().unwrap());
             self.steps.set(self.steps.get() + 1);
-            cache.0 += request.tokens.len() as i32;
+            cache.0 += request.len()? as i32;
             // Token `(len) % vocab` is the argmax: the sequence is a predictable ramp.
             let mut row = vec![0f32; self.vocab];
             row[(cache.0 as usize) % self.vocab] = 10.0;

@@ -62,12 +62,17 @@ impl Default for SpeculativeConfig {
 /// Measured speculation efficiency for a run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SpeculativeStats {
-    /// Target forward passes (the prefill + one per verify step). Fewer than `generated` ⇒ speedup.
+    /// Target forward passes (the prefill + one per verify step, plus a replay forward per
+    /// rejected run on a cache that rolls back only to a step start). Fewer than `generated` ⇒
+    /// speedup.
     pub forwards: usize,
     /// Draft tokens proposed across all steps.
     pub proposed: usize,
     /// Draft tokens accepted across all steps.
     pub accepted: usize,
+    /// Verify steps taken: target forwards over `[cur, drafts…]` whose outcome was decided
+    /// (sc-24130). The denominator of "host syncs per verify step".
+    pub verify_steps: usize,
 }
 
 /// Generate from `prompt_ids` with prompt-lookup speculative decoding, returning the output and
@@ -164,6 +169,7 @@ pub fn generate_prompt_lookup(
         let logits_all =
             model.decode_logits_all(&input_ids(&verify, device)?, &mut cache, base_offset)?;
         stats.forwards += 1;
+        stats.verify_steps += 1;
 
         let (committed, accepted) = if greedy {
             decide_greedy(&logits_all, &drafts, &history, config, &mut rng)?
@@ -342,6 +348,7 @@ pub fn generate_draft_speculative(
             base_target,
         )?;
         stats.forwards += 1;
+        stats.verify_steps += 1;
 
         let (committed, accepted) = if greedy {
             decide_greedy(&logits_all, &drafts, &history, config, &mut rng)?
