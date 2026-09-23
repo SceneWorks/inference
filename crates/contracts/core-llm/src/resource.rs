@@ -82,6 +82,11 @@ pub fn estimate_request_bytes(
 /// attention runtime. KV, speculative rollback, media, decoder activation, and recurrent-state
 /// costs remain fully priced; only the two prompt-scaled tensors proven absent from that runtime
 /// path differ from [`estimate_request_bytes`].
+///
+/// With `mtp_width > 0` the recurrent-state term is charged three times — the live state plus the
+/// copies a clone/replay MTP loop holds while it verifies and restores. A backend whose
+/// `geometry.recurrent_bytes` already prices every rollback copy its cache holds uses
+/// [`estimate_chunked_request_bytes_with_recurrent_copies`] instead.
 pub fn estimate_chunked_request_bytes(
     prompt_tokens: usize,
     max_new_tokens: u32,
@@ -90,7 +95,36 @@ pub fn estimate_chunked_request_bytes(
     mtp_width: u32,
     max_attention_query_tokens: usize,
 ) -> Option<u64> {
-    if max_attention_query_tokens == 0 {
+    estimate_chunked_request_bytes_with_recurrent_copies(
+        prompt_tokens,
+        max_new_tokens,
+        geometry,
+        vision_workspace_bytes,
+        mtp_width,
+        max_attention_query_tokens,
+        if mtp_width > 0 { 3 } else { 1 },
+    )
+}
+
+/// [`estimate_chunked_request_bytes`] with the recurrent-state multiplier chosen by the caller:
+/// `geometry.recurrent_bytes` is charged exactly `recurrent_copies` times, whatever `mtp_width`
+/// is. Every other term is identical.
+///
+/// Pass `1` when `geometry.recurrent_bytes` is already the whole recurrent footprint of the
+/// request's cache — e.g. a cache that rolls back by selecting a slot of a preallocated
+/// per-token checkpoint ring priced into the geometry, and never clones. A clone/replay MTP loop
+/// keeps the `3` [`estimate_chunked_request_bytes`] applies. `recurrent_copies == 0` is refused
+/// (`None`): it would drop the recurrent state from admission altogether.
+pub fn estimate_chunked_request_bytes_with_recurrent_copies(
+    prompt_tokens: usize,
+    max_new_tokens: u32,
+    geometry: LlmMemoryGeometry,
+    vision_workspace_bytes: u64,
+    mtp_width: u32,
+    max_attention_query_tokens: usize,
+    recurrent_copies: u64,
+) -> Option<u64> {
+    if max_attention_query_tokens == 0 || recurrent_copies == 0 {
         return None;
     }
     let prompt = u64::try_from(prompt_tokens).ok()?;
@@ -132,11 +166,7 @@ pub fn estimate_chunked_request_bytes(
         .checked_add(mtp)?
         .checked_add(vision_workspace_bytes)?
         .checked_add(activations)?
-        .checked_add(
-            geometry
-                .recurrent_bytes
-                .checked_mul(if mtp_width > 0 { 3 } else { 1 })?,
-        )
+        .checked_add(geometry.recurrent_bytes.checked_mul(recurrent_copies)?)
 }
 
 /// Reject an estimated request before native tensor allocation.
@@ -350,6 +380,55 @@ mod tests {
         assert!(eager > 400_000_000_000);
         assert!(estimate_chunked_request_bytes(128, 16, geometry, 0, 0, 0).is_none());
         assert!(estimate_chunked_request_bytes(usize::MAX, u32::MAX, geometry, 0, 3, 8).is_none());
+    }
+
+    #[test]
+    fn recurrent_copies_scale_only_the_recurrent_term() {
+        let recurrent = 7_000_003u64;
+        let geometry = LlmMemoryGeometry {
+            query_heads: 24,
+            kv_heads: 4,
+            head_dim: 128,
+            layers: 64,
+            element_bytes: 4,
+            hidden_size: 5120,
+            intermediate_size: 17_408,
+            vocab_size: 248_320,
+            recurrent_bytes: recurrent,
+        };
+        let with = |mtp_width, copies| {
+            estimate_chunked_request_bytes_with_recurrent_copies(
+                1_000, 64, geometry, 0, mtp_width, 8, copies,
+            )
+        };
+        let once = with(5, 1).unwrap();
+        let thrice = with(5, 3).unwrap();
+        assert_eq!(
+            thrice - once,
+            2 * recurrent,
+            "only the recurrent term moves with the multiplier"
+        );
+        // The legacy entry point is the x3 clone/replay pricing with MTP and x1 without.
+        assert_eq!(
+            estimate_chunked_request_bytes(1_000, 64, geometry, 0, 5, 8),
+            Some(thrice)
+        );
+        assert_eq!(
+            estimate_chunked_request_bytes(1_000, 64, geometry, 0, 0, 8),
+            with(0, 1)
+        );
+        // With x1 the MTP request differs from the MTP-off one only by the non-recurrent MTP
+        // terms: the recurrent term is charged once either way.
+        let no_recurrent = LlmMemoryGeometry {
+            recurrent_bytes: 0,
+            ..geometry
+        };
+        let mtp_terms = estimate_chunked_request_bytes(1_000, 64, no_recurrent, 0, 5, 8).unwrap()
+            - estimate_chunked_request_bytes(1_000, 64, no_recurrent, 0, 0, 8).unwrap();
+        assert_eq!(once - with(0, 1).unwrap(), mtp_terms);
+        // Zero copies would drop the recurrent state from admission: refused.
+        assert_eq!(with(5, 0), None);
+        assert_eq!(with(5, u64::MAX / 2), None, "the multiplication is checked");
     }
 
     #[test]

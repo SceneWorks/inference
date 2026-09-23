@@ -170,11 +170,17 @@ differently from the single-token decode kernel.
 The `decode_step_parity` and `decode_bench` suites belong to the Blackwell fast-decode epic
 (sc-24128). Its two seams live in `decode::StepModel` (`forward_step`: one N-token step returning
 last/all-position logits against a cache) and `primitives::DecodeCache` (length, `rollback_to(n)`,
-reset, memory accounting); `Qwen35Model` / `Qwen35Cache` implement both, the hybrid cache rolling back
-by narrowing the KV and restoring a checkpoint of the DeltaNet state taken at every step start. Only
-step-seam caches retain checkpoints (`STEP_MAX_CHECKPOINTS` = 2, each a full recurrent state); the
-reference/MTP caches the provider builds retain none, and request admission prices
-`1 + REFERENCE_MAX_CHECKPOINTS` recurrent states. A refused rollback is the typed
+reset, memory accounting); `Qwen35Model` / `Qwen35Cache` implement both. A step-seam cache gives every
+linear layer's `DeltaNetCache` a preallocated per-token checkpoint ring (sc-24131): each forward writes the
+state after every one of its last `slots` tokens into slot `position % slots` in place, the live
+state is a view of the newest slot, and the hybrid cache rolls back by narrowing the KV and
+*selecting* the ring slot for the target position — no copy, no replay forward. A speculative request's
+cache comes from `StepModel::new_cache_for(capacity, K)`, whose ring holds `K + 2` positions (the step start
+plus the `K + 1` verify positions), so any position of the last verify step is restorable; the
+unbounded `StepModel::new_cache` keeps `STEP_MAX_CHECKPOINTS` = 2 positions behind the current one,
+and the reference caches the provider builds keep none (`REFERENCE_MAX_CHECKPOINTS` = 0). Admission
+prices the ring exactly — `K + 2` recurrent states for a `K`-draft request, charged once (the engine
+never clones the cache), one state with MTP off. A rollback past the ring is the typed
 `Error::RollbackUnavailable`. Every path ends in
 a measured `decode::DecodeRecord` (path taken, target forwards, proposed/accepted tokens, host syncs);
 the provider exposes the last one through `LlamaProvider::last_decode_record`. The reference `Decode`
