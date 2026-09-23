@@ -33,6 +33,8 @@ candle-quant-kernels = { workspace = true }
 thiserror = { workspace = true }
 # config.json parsing (HF model configs) — Value-based, no derive, matching the mlx-llm convention.
 serde_json = { workspace = true }
+# One-time warning when the CUDA device sampler kernel fails to compile/load (sc-24133).
+tracing = "0.1"
 
 [dev-dependencies]
 # Run the registered LlamaProvider through the backend-neutral contract checks.

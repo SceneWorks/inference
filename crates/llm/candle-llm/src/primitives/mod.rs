@@ -45,7 +45,10 @@ pub use fused::{fused_policy_guard, FusedPolicyGuard};
 pub use gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
 };
-pub use host_sync::{host_sync_count, note_host_sync};
+pub use host_sync::{
+    host_sync_count, last_host_reason, note_host_sync, note_logits_to_host, note_sampler_path,
+    sampler_counters, SamplerCounters,
+};
 pub use kv_cache::{
     kv_materialize_count, note_kv_materialize, storage_address, ContiguousKvCache, KvCache,
     KvCacheKind, StaticKvCache,
@@ -67,5 +70,9 @@ pub use projection::{
 };
 pub use quant::QuantizedLinear;
 pub use rope::{apply_rope, rms_norm_rope, Rope};
-pub use sampler::{sample, shaped_candidates, SamplingParams, SplitMix64, TokenRng};
+pub use sampler::{
+    device_sampler_available, sample, sample_device, sample_host, sampler_path, shaped_candidates,
+    uniform_device, with_reference_sampler, HostSampleReason, SamplerPath, SamplingParams,
+    SplitMix64, TokenRng,
+};
 pub use weights::Weights;
