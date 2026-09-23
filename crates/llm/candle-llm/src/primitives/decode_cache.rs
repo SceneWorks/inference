@@ -13,17 +13,19 @@
 //! positions `n..` had never been decoded**. A growing KV cache can satisfy any `n` by narrowing;
 //! a recurrent state cannot be inverted, so a hybrid cache may only roll back to positions it holds
 //! a **checkpoint** for and must return an error otherwise (never silently approximate). The
-//! contract is exact: after `rollback_to(n)` the logits for position `n` must equal a fresh decode
-//! to `n` (the `Qwen35Cache` rollback test is the gate).
+//! `Qwen35Cache` keeps a per-token checkpoint ring (sc-24131): every position of the last verify
+//! step is restorable, older ones are the typed refusal. The contract is exact: after
+//! `rollback_to(n)` the logits for position `n` must equal a fresh decode to `n` (the `Qwen35Cache`
+//! rollback test is the gate).
 //!
 //! ## Memory honesty
 //! [`DecodeCache::memory`] reports **logical** bytes — the byte size of every tensor the cache
-//! currently references, counting each reference once. Candle tensors are reference-counted, so a
-//! checkpoint that shares a buffer with the live state costs no extra device memory but *is* counted
-//! again under `checkpoint_bytes`; a narrowed view keeps its full backing buffer alive until the
-//! next append copies it. The number is therefore the cache's own accounting, not the allocator's,
-//! and is labelled as such — device-level peaks come from the allocator (`mem_get_info`) in the
-//! bench harness.
+//! currently references, counting each reference once. A preallocated buffer (a static KV cache,
+//! a checkpoint ring) counts in full from the moment it exists — it is what the request holds —
+//! with a ring's live slot under `live_bytes` and its other slots under `checkpoint_bytes`; a
+//! narrowed view keeps its full backing buffer alive until the next append copies it. The number
+//! is therefore the cache's own accounting, not the allocator's, and is labelled as such —
+//! device-level peaks come from the allocator (`mem_get_info`) in the bench harness.
 
 use candle_core::Tensor;
 
@@ -71,14 +73,16 @@ pub trait DecodeCache {
     /// Drop everything, returning to the freshly-constructed condition.
     fn reset(&mut self);
 
-    /// Ask the cache to retain at least `n` rollback checkpoints (the newest), so a caller that
-    /// takes `n` single-token steps past a position can still roll back to it — the draft-model
-    /// proposer's `K + 1` draft steps before the target verifies (sc-24130). A cache that can
-    /// roll back to any position without checkpoints ignores it (the default); a cache that
-    /// checkpoints step starts raises its retention, and whoever admits such a request prices
-    /// the extra states (E6). Never lowers an existing retention.
-    fn retain_checkpoints(&mut self, n: usize) {
+    /// Ask the cache to be able to roll back at least `n` positions from wherever it is, so a
+    /// caller that takes `n` single-token steps past a position can still roll back to it — the
+    /// draft-model proposer's `K + 1` draft steps before the target verifies (sc-24130). A cache
+    /// that can roll back to any position without checkpoints ignores it (the default); a cache
+    /// with a checkpoint ring deepens it (sc-24131), which allocates and so may fail — closed,
+    /// leaving the cache as it was — and whoever admits such a request prices the extra states
+    /// (E6). Never lowers an existing retention.
+    fn retain_checkpoints(&mut self, n: usize) -> Result<()> {
         let _ = n;
+        Ok(())
     }
 
     /// The cache's logical memory accounting.

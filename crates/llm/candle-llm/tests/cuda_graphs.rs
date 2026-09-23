@@ -201,7 +201,7 @@ fn qwen38_27b_step_census() {
     let base = cache.len();
     // Keep every checkpoint while recording: pruning one inside a capture frees a tensor
     // allocated before it (`cuMemFreeAsync` → INVALID_VALUE), which abandons the recording.
-    cache.retain_checkpoints(64);
+    cache.retain_checkpoints(64).unwrap();
 
     let decode = census_step(&model, &mut cache, StepRequest::last(&[8])).unwrap();
     assert_eq!(cache.len(), base);
