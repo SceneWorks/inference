@@ -241,11 +241,14 @@ mod tests {
         }
     }
 
-    /// The full-resolution 3×3 conv of every candle image VAE at the 2048² render cap — the
-    /// widest `channels × 9` each decoder runs at output resolution. Every one of them exceeds
-    /// the shipped budget and chunks; the ≥128-channel ones (and Qwen-Image 2.1's 144/288)
-    /// are past the u32 launch bound outright, which is the sc-24114 corruption. The Qwen-Image
-    /// 2.1 upsampler is the widest of all. At 512² every one is a single pass.
+    /// The widest full-resolution 3×3 conv of every candle image VAE at the 2048² render cap —
+    /// `channels × 9` of the conv with the most input channels that runs at output resolution.
+    /// In a diffusers `[128, 256, 512, 512]` KL decoder that is not the 128-channel last stage
+    /// but the up-block-2 **upsampler**, which convolves the nearest-×2 result at 256 in; in the
+    /// Wan z16 decoder it is the 192→96 upsampler; in Qwen-Image 2.1 the 288→144 one. Every
+    /// one exceeds the shipped budget and chunks, and every one is past the u32 launch bound
+    /// outright (the sc-24114 corruption; the 256-in KL upsampler crosses it from ≈1365²). At
+    /// 512² every one is a single pass.
     #[test]
     fn every_image_vae_full_resolution_conv_chunks_at_2048_and_not_at_512() {
         let conv = |c_in: usize| {
@@ -260,13 +263,19 @@ mod tests {
         };
         // (crate / VAE, full-resolution input channels of its widest 3×3 conv)
         let vaes: [(&str, usize); 8] = [
-            ("sdxl AutoencoderKL (kolors/pulid/instantid)", 128),
-            ("flux AutoencoderKL (diffusers + native)", 128),
-            ("flux2 (lens, ideogram)", 128),
-            ("chroma", 128),
-            ("sana DC-AE", 128),
-            ("qwen-image Wan z16 (krea, anima)", 96),
-            ("qwen-image-2-1 resnets", 144),
+            (
+                "sdxl AutoencoderKL up-block-2 upsampler (kolors/pulid/instantid)",
+                256,
+            ),
+            (
+                "flux AutoencoderKL up-block-2 upsampler (diffusers + native)",
+                256,
+            ),
+            ("flux2 up-block-2 upsampler (lens, ideogram)", 256),
+            ("chroma up-block-2 upsampler", 256),
+            ("sana DC-AE full-resolution stage", 128),
+            ("qwen-image Wan z16 up-block-2 upsampler (krea, anima)", 192),
+            ("qwen-image-2-1 full-resolution resnets", 144),
             ("qwen-image-2-1 upsampler", 288),
         ];
         let widest = vaes.iter().map(|(_, c)| *c).max().unwrap();
@@ -276,9 +285,8 @@ mod tests {
         );
         for (label, c_in) in vaes {
             let im2col_2048 = (2048u64 * 2048) * c_in as u64 * 9;
-            assert_eq!(
+            assert!(
                 im2col_2048 > u64::from(u32::MAX),
-                c_in >= 120,
                 "{label}: {c_in} ch at 2048² is {im2col_2048} im2col elements"
             );
             let plan =
