@@ -32,7 +32,10 @@ pub use siglip::{
     select_vision_feature, SiglipVisionConfig, SiglipVisionOutput, SiglipVisionTower,
 };
 pub use starcoder2::{StarCoder2, StarCoder2Config};
-pub use starvector::{StarVectorAdapter, StarVectorClip, StarVectorDecoder, StarVectorModel};
+pub use starvector::{
+    StarVectorAdapter, StarVectorClip, StarVectorDecoder, StarVectorDecoderGeometry,
+    StarVectorModel,
+};
 
 /// The backend-neutral multimodal seam over a loaded decoder. Both Qwen-VL backbones — the Qwen3.6
 /// hybrid linear/full-attention decoder ([`Qwen35Model`]) and the generic Qwen3-VL causal decoder

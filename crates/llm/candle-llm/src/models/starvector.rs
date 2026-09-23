@@ -212,6 +212,35 @@ pub struct StarVectorDecoder {
     lnw: Tensor,
     lnb: Tensor,
     head: Tensor,
+    geometry: StarVectorDecoderGeometry,
+}
+
+/// The GPTBigCode decoder's geometry. The shipped provider only ever loads
+/// [`StarVectorDecoderGeometry::STARVECTOR_1B`]; the knob exists so the tiny-config parity tests
+/// (sc-24138) can build the identical decoder at a CPU-sized width without a second code path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StarVectorDecoderGeometry {
+    /// Residual width (`n_embd`).
+    pub hidden: usize,
+    /// Query heads; the single shared (multi-query) K/V head has the same `head_dim`.
+    pub heads: usize,
+    /// Per-head width.
+    pub head_dim: usize,
+    /// Decoder blocks.
+    pub layers: usize,
+    /// Learned absolute positions (`n_positions`) — the context bound.
+    pub max_positions: usize,
+}
+
+impl StarVectorDecoderGeometry {
+    /// The published StarVector-1B (StarCoderBase-1B) decoder.
+    pub const STARVECTOR_1B: Self = Self {
+        hidden: STARVECTOR_HIDDEN,
+        heads: 16,
+        head_dim: 128,
+        layers: 24,
+        max_positions: 8192,
+    };
 }
 struct BigCodeBlock {
     ln1w: Tensor,
@@ -249,14 +278,22 @@ impl BigCodeBlock {
     fn reset(&mut self) {
         self.cache = None;
     }
-    fn forward(&mut self, input: &Tensor, past: usize) -> Result<Tensor> {
+    fn forward(
+        &mut self,
+        input: &Tensor,
+        past: usize,
+        geometry: StarVectorDecoderGeometry,
+    ) -> Result<Tensor> {
         let h = layer_norm(input, &self.ln1w, &self.ln1b, 1e-5)?;
         let qkv = linear(&h, &self.qkvw, Some(&self.qkvb))?;
         let (b, s, _) = qkv.dims3()?;
-        let q = qkv
-            .narrow(2, 0, STARVECTOR_HIDDEN)?
-            .reshape((b, s, 16, 128))?;
-        let mut kv = qkv.narrow(2, STARVECTOR_HIDDEN, 256)?;
+        let q = qkv.narrow(2, 0, geometry.hidden)?.reshape((
+            b,
+            s,
+            geometry.heads,
+            geometry.head_dim,
+        ))?;
+        let mut kv = qkv.narrow(2, geometry.hidden, 2 * geometry.head_dim)?;
         if let Some(old) = &self.cache {
             kv = Tensor::cat(&[old, &kv], 1)?;
         }
@@ -332,17 +369,27 @@ fn tied_token_embedding(w: &Weights, prefix: &str) -> Result<(Tensor, Tensor)> {
 
 impl StarVectorDecoder {
     pub fn from_weights(w: &Weights) -> Result<Self> {
+        Self::from_weights_with_geometry(w, StarVectorDecoderGeometry::STARVECTOR_1B)
+    }
+
+    /// [`from_weights`](Self::from_weights) at an explicit geometry (the tiny-config parity
+    /// fixtures; the provider always loads [`StarVectorDecoderGeometry::STARVECTOR_1B`]).
+    pub fn from_weights_with_geometry(
+        w: &Weights,
+        geometry: StarVectorDecoderGeometry,
+    ) -> Result<Self> {
         let p = "model.svg_transformer.transformer.transformer";
         let (wte, head) = tied_token_embedding(w, p)?;
         Ok(Self {
             wte,
             wpe: tensor(w, p, "wpe.weight")?,
-            layers: (0..24)
+            layers: (0..geometry.layers)
                 .map(|i| BigCodeBlock::load(w, &format!("{p}.h.{i}")))
                 .collect::<Result<Vec<_>>>()?,
             lnw: tensor(w, p, "ln_f.weight")?,
             lnb: tensor(w, p, "ln_f.bias")?,
             head,
+            geometry,
         })
     }
     pub fn reset(&mut self) {
@@ -355,7 +402,8 @@ impl StarVectorDecoder {
     }
     pub fn forward_embeds(&mut self, input: &Tensor, past: usize) -> Result<Tensor> {
         let (b, s, h) = input.dims3()?;
-        if h != STARVECTOR_HIDDEN || past + s > 8192 {
+        let geometry = self.geometry;
+        if h != geometry.hidden || past + s > geometry.max_positions {
             return Err(Error::Msg("starvector decoder context limit".into()));
         }
         let pos = self
@@ -365,7 +413,7 @@ impl StarVectorDecoder {
             .broadcast_as((b, s, h))?;
         let mut out = input.broadcast_add(&pos)?;
         for layer in &mut self.layers {
-            out = layer.forward(&out, past)?;
+            out = layer.forward(&out, past, geometry)?;
         }
         let out = layer_norm(&out, &self.lnw, &self.lnb, 1e-5)?;
         linear(&out.narrow(1, s - 1, 1)?.squeeze(1)?, &self.head, None)
