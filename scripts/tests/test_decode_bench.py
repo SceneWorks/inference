@@ -385,6 +385,18 @@ class DecodeBenchWrapperTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not match its seal"):
             bench.main(["table", str(output)])
 
+    def test_step_model_row_label_names_the_kv_cache_when_reported(self) -> None:
+        self.assertEqual(bench.row_label({"path": "step_model"}), "MTP off (StepModel)")
+        self.assertEqual(
+            bench.row_label({"path": "step_model", "kv_cache": "static"}),
+            "MTP off (StepModel, static kv)",
+        )
+        self.assertEqual(
+            bench.row_label({"path": "step_model", "kv_cache": "growing"}),
+            "MTP off (StepModel, growing kv)",
+        )
+        self.assertEqual(bench.row_label({"path": "reference", "kv_cache": "growing"}), "MTP off (reference)")
+
     def test_baseline_source_replaces_only_the_head_only_block(self) -> None:
         source = BENCH_SOURCE.read_text(encoding="utf-8")
         rewritten = bench.baseline_source_text(source)
@@ -396,6 +408,8 @@ class DecodeBenchWrapperTests(unittest.TestCase):
         self.assertIn("fn host_syncs_now() -> Option<u64> {\n    None\n}", rewritten)
         self.assertIn("(out, prefill, decode, None)", before_stub)
         self.assertIn('unreachable!("the step_model row is not available on the pre-epic baseline")', rewritten)
+        self.assertIn("fn select_step_kv_cache(_model: &mut Qwen35Model) {}", rewritten)
+        self.assertNotIn("set_step_kv_cache", before_stub)
         # Everything outside the block is untouched, so the two binaries measure the same rows.
         head_tail = source[source.index(bench.HEAD_ONLY_END) + len(bench.HEAD_ONLY_END):]
         self.assertTrue(rewritten.endswith(head_tail))

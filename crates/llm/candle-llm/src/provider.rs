@@ -2484,6 +2484,7 @@ impl TextLlm for LlamaProvider {
                 accepted_tokens: u64::from(stats.accepted_tokens),
                 generated_tokens: out.tokens.len() as u64,
                 host_syncs: request_span.host_syncs(),
+                kv_cache: crate::primitives::KvCacheKind::Growing,
             },
             _ => DecodeRecord::plain(
                 DecodePath::Reference,
@@ -3554,6 +3555,47 @@ mod tests {
         );
         let _ = h;
     }
+    /// E6 (sc-24132): the static KV cache preallocates K/V for the whole request bound at its
+    /// first step, and the geometry-based admission estimate already covers that preallocation —
+    /// `estimate_request_bytes` charges KV for `prompt + max_new_tokens` positions over every layer
+    /// at `element_bytes` (4), while the static cache holds only the full-attention layers in the
+    /// compute dtype — so a request admitted under the estimate cannot fail its preallocation
+    /// (and a request past the model bound fails closed with the typed error before allocating).
+    #[test]
+    fn qwen35_admission_covers_the_static_kv_preallocation() {
+        use crate::decode::StepModel;
+
+        let (_cfg, model) = crate::models::qwen35::tests::text_model();
+        let (prompt_tokens, max_new_tokens) = (11usize, 21u32);
+        let capacity = prompt_tokens + max_new_tokens as usize;
+        let preallocation = model.static_kv_bytes(capacity) as u64;
+        assert!(preallocation > 0);
+        let decoder = Decoder::Qwen35(model);
+        let geometry = decoder.memory_geometry();
+        let kv_term = (capacity as u64)
+            * geometry.layers
+            * geometry.kv_heads
+            * geometry.head_dim
+            * geometry.element_bytes
+            * 2;
+        assert!(
+            preallocation <= kv_term,
+            "static preallocation {preallocation} exceeds the KV term {kv_term} admission charges"
+        );
+        let estimate =
+            core_llm::estimate_request_bytes(prompt_tokens, max_new_tokens, geometry, 0, 0)
+                .unwrap();
+        assert!(estimate >= preallocation + geometry.recurrent_bytes);
+
+        // What the step seam really allocates for that request is exactly the priced number.
+        let Decoder::Qwen35(model) = &decoder else {
+            unreachable!()
+        };
+        let cache = model.new_cache_for(capacity).unwrap();
+        assert_eq!(cache.memory().live_bytes as u64, preallocation);
+        assert_eq!(cache.kv_kind(), crate::primitives::KvCacheKind::Static);
+    }
+
     /// E6: admission prices every recurrent state a Qwen3.5-family request's cache holds. The
     /// provider's cache (the reference/MTP `Decode::make_cache`) retains `REFERENCE_MAX_CHECKPOINTS`
     /// rollback checkpoints, and the geometry charges `1 + REFERENCE_MAX_CHECKPOINTS` states; a

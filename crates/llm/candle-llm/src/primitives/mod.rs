@@ -1,7 +1,7 @@
 //! Backend-owned tensor primitives (epic 7153).
 //!
 //! These are the decode leaves `candle-llm` owns — the Candle reimplementation of the `mlx-llm`
-//! foundation: a batch-capable KV cache, the sampler, the RoPE family, GQA attention helpers,
+//! foundation: the batch-capable KV caches (growing and preallocated), the sampler, the RoPE family, GQA attention helpers,
 //! group-wise quantization (Candle's `QTensor`/`QMatMul`), the `nn` leaves (linear / RMSNorm /
 //! activations / embedding), and a safetensors weights loader. They own Candle `Tensor`s directly.
 //!
@@ -23,13 +23,16 @@ pub mod rope;
 pub mod sampler;
 pub mod weights;
 
-pub use attention::{repeat_kv, sdpa, sdpa_causal, sliding_causal_mask, AttnMask};
+pub use attention::{repeat_kv, sdpa, sdpa_causal, sdpa_gqa_causal, sliding_causal_mask, AttnMask};
 pub use decode_cache::{tensor_bytes, CacheMemory, DecodeCache};
 pub use gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
 };
 pub use host_sync::{host_sync_count, note_host_sync};
-pub use kv_cache::{ContiguousKvCache, KvCache};
+pub use kv_cache::{
+    kv_materialize_count, note_kv_materialize, storage_address, ContiguousKvCache, KvCache,
+    KvCacheKind, StaticKvCache,
+};
 pub use nn::{
     conv2d, embed, gelu, gelu_erf, input_ids, input_ids_batch, layer_norm, linear, rms_norm,
     rms_norm_unscaled, silu, soft_cap,

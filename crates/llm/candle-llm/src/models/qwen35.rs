@@ -28,11 +28,12 @@ use crate::decode::step::{LogitsScope, StepModel, StepOutput, StepRequest};
 use crate::device::compute_dtype;
 use crate::error::{Error, Result};
 use crate::models::deepstack::{self, deepstack_fused_decoder_layers};
-use crate::primitives::attention::{repeat_kv, sdpa, AttnMask};
+use crate::primitives::attention::{repeat_kv, sdpa, sdpa_gqa_causal, AttnMask};
 use crate::primitives::decode_cache::{tensor_bytes, CacheMemory, DecodeCache};
 use crate::primitives::gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
 };
+use crate::primitives::kv_cache::{KvCacheKind, StaticKvCache};
 use crate::primitives::nn::{embed, input_ids, rms_norm, silu};
 use crate::primitives::projection::{Projection, QuantSpec};
 use crate::primitives::rope::{apply_rope, Rope};
@@ -332,14 +333,16 @@ struct Qwen35Attention {
     eps: f64,
 }
 
+/// The KV slot a full-attention layer writes this step into: the growing reference slot, or the
+/// preallocated static cache (story sc-24132). The two are kept as distinct code paths on purpose —
+/// the growing one is the parity oracle and runs exactly the pre-story arithmetic.
+enum KvSlot<'a> {
+    Growing(&'a mut AttnKv),
+    Static(&'a mut StaticKvCache),
+}
+
 impl Qwen35Attention {
-    fn forward(
-        &self,
-        x: &Tensor,
-        cos: &Tensor,
-        sin: &Tensor,
-        cache: &mut AttnKv,
-    ) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, cache: KvSlot<'_>) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
         let (nh, nkv, hd) = (self.num_heads, self.num_kv_heads, self.head_dim);
 
@@ -368,10 +371,21 @@ impl Qwen35Attention {
             .contiguous()?;
         let v = v.transpose(1, 2)?.contiguous()?;
 
-        let (k_all, v_all) = cache.update(&k, &v)?;
-        let k_all = repeat_kv(&k_all, self.groups)?;
-        let v_all = repeat_kv(&v_all, self.groups)?;
-        let out = sdpa(&q, &k_all, &v_all, self.scale, None, AttnMask::Causal)?; // [b,H,s,hd]
+        let out = match cache {
+            // Reference path: growing concat, GQA expanded, eager/fused SDPA.
+            KvSlot::Growing(growing) => {
+                let (k_all, v_all) = growing.update(&k, &v)?;
+                let k_all = repeat_kv(&k_all, self.groups)?;
+                let v_all = repeat_kv(&v_all, self.groups)?;
+                sdpa(&q, &k_all, &v_all, self.scale, None, AttnMask::Causal)? // [b,H,s,hd]
+            }
+            // Static path: in-place write, bounded views, grouped-query attention over them —
+            // no `cat`, no `repeat_kv`, no copy of the cached history.
+            KvSlot::Static(fixed) => {
+                let (k_all, v_all) = fixed.update(0, &k, &v)?;
+                sdpa_gqa_causal(&q, &k_all, &v_all, self.scale)? // [b,H,s,hd]
+            }
+        };
         let merged = out
             .transpose(1, 2)?
             .contiguous()?
@@ -512,7 +526,12 @@ impl DecoderLayer {
         let normed = rms_norm(x, &self.input_ln, self.eps)?;
         let r = match (&self.mixer, cache) {
             (Mixer::Delta(d), Qwen35LayerCache::Delta(c)) => d.forward(&normed, c)?,
-            (Mixer::Attn(a), Qwen35LayerCache::Attn(c)) => a.forward(&normed, cos, sin, c)?,
+            (Mixer::Attn(a), Qwen35LayerCache::Attn(c)) => {
+                a.forward(&normed, cos, sin, KvSlot::Growing(c))?
+            }
+            (Mixer::Attn(a), Qwen35LayerCache::StaticAttn(c)) => {
+                a.forward(&normed, cos, sin, KvSlot::Static(c))?
+            }
             _ => return Err(Error::Msg("qwen3_5: cache/mixer type mismatch".into())),
         };
         let h = x.broadcast_add(&r)?;
@@ -530,7 +549,10 @@ pub struct AttnKv {
 impl AttnKv {
     fn update(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
         let merged = match self.kv.take() {
-            Some((pk, pv)) => (Tensor::cat(&[&pk, k], 2)?, Tensor::cat(&[&pv, v], 2)?),
+            Some((pk, pv)) => {
+                crate::primitives::kv_cache::note_kv_materialize();
+                (Tensor::cat(&[&pk, k], 2)?, Tensor::cat(&[&pv, v], 2)?)
+            }
             None => (k.clone(), v.clone()),
         };
         self.kv = Some((merged.0.clone(), merged.1.clone()));
@@ -616,12 +638,15 @@ pub const REFERENCE_MAX_CHECKPOINTS: usize = 0;
 /// [`Qwen35Cache::set_max_checkpoints`].
 pub const STEP_MAX_CHECKPOINTS: usize = 2;
 
-/// The per-layer cache slot — a recurrent [`DeltaNetCache`] for linear layers, growing KV for
-/// full-attention layers.
+/// The per-layer cache slot — a recurrent [`DeltaNetCache`] for linear layers, and for
+/// full-attention layers either the growing reference KV ([`AttnKv`]) or a single-layer
+/// preallocated [`StaticKvCache`] (story sc-24132). A cache holds one kind of attention slot
+/// throughout; [`Qwen35Cache::kv_kind`] says which.
 #[derive(Clone, Debug)]
 pub enum Qwen35LayerCache {
     Delta(DeltaNetCache),
     Attn(AttnKv),
+    StaticAttn(StaticKvCache),
 }
 
 /// The hybrid decoder's cache: one slot per decoder layer, plus the rollback checkpoints that make
@@ -638,6 +663,11 @@ pub enum Qwen35LayerCache {
 /// Retention depends on who built the cache: [`Qwen35Model::new_cache`] (reference / MTP paths)
 /// keeps [`REFERENCE_MAX_CHECKPOINTS`] (none), [`StepModel::new_cache`] keeps
 /// [`STEP_MAX_CHECKPOINTS`].
+///
+/// The full-attention slots are either the growing [`AttnKv`] (the reference path and the parity
+/// oracle) or, for a cache built by [`Qwen35Model::new_static_cache`] / [`StepModel::new_cache_for`],
+/// one preallocated [`StaticKvCache`] per attention layer sized for the request's capacity: written
+/// in place, rolled back by moving the offset, buffers never reallocated (story sc-24132).
 #[derive(Clone, Debug)]
 pub struct Qwen35Cache {
     layers: Vec<Qwen35LayerCache>,
@@ -654,26 +684,82 @@ impl Qwen35Cache {
             .iter()
             .find_map(|l| match l {
                 Qwen35LayerCache::Attn(a) => Some(a.offset()),
+                Qwen35LayerCache::StaticAttn(s) => Some(s.offset()),
                 Qwen35LayerCache::Delta(_) => None,
             })
             .or_else(|| {
                 self.layers.iter().find_map(|l| match l {
                     Qwen35LayerCache::Delta(c) => Some(c.offset()),
-                    Qwen35LayerCache::Attn(_) => None,
+                    Qwen35LayerCache::Attn(_) | Qwen35LayerCache::StaticAttn(_) => None,
                 })
             })
             .unwrap_or(0)
     }
 
-    /// Drop all cached state and every checkpoint.
+    /// Drop all cached state and every checkpoint. A static cache keeps its buffers (offsets go
+    /// to zero; the bytes are overwritten by the next prefill).
     pub fn reset(&mut self) {
         for l in &mut self.layers {
             match l {
                 Qwen35LayerCache::Delta(c) => c.reset(),
                 Qwen35LayerCache::Attn(a) => a.kv = None,
+                Qwen35LayerCache::StaticAttn(s) => s.reset(),
             }
         }
         self.checkpoints.clear();
+    }
+
+    /// Which KV cache implementation the full-attention layers run on.
+    pub fn kv_kind(&self) -> KvCacheKind {
+        if self
+            .layers
+            .iter()
+            .any(|l| matches!(l, Qwen35LayerCache::StaticAttn(_)))
+        {
+            KvCacheKind::Static
+        } else {
+            KvCacheKind::Growing
+        }
+    }
+
+    /// Positions a static cache can hold, or `None` for a growing cache.
+    pub fn kv_capacity(&self) -> Option<usize> {
+        self.layers.iter().find_map(|l| match l {
+            Qwen35LayerCache::StaticAttn(s) => Some(s.capacity()),
+            _ => None,
+        })
+    }
+
+    /// The `(keys, values)` storage addresses of every static attention layer's buffers, in layer
+    /// order (see [`storage_address`](crate::primitives::storage_address)) — empty for a growing
+    /// cache. The pointer-stability gate (AC3) reads these across steps and rollbacks.
+    pub fn static_kv_addresses(&self) -> Result<Vec<(usize, usize)>> {
+        self.layers
+            .iter()
+            .filter_map(|l| match l {
+                Qwen35LayerCache::StaticAttn(s) => Some(s.storage_addresses(0)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Called at the start of every forward over `steps` new positions: refuses a step that would
+    /// end past a static cache's capacity ([`Error::KvCapacityExceeded`], before any layer runs or
+    /// any state changes), then records the rollback checkpoint.
+    fn begin_forward(&mut self, steps: usize) -> Result<()> {
+        if let Some(capacity) = self.kv_capacity() {
+            let end = usize::try_from(self.offset())
+                .unwrap_or(0)
+                .saturating_add(steps);
+            if end > capacity {
+                return Err(Error::KvCapacityExceeded {
+                    requested: end,
+                    capacity,
+                });
+            }
+        }
+        self.checkpoint();
+        Ok(())
     }
 
     /// Change how many rollback checkpoints are retained (newest kept; `0` disables rollback to
@@ -694,7 +780,7 @@ impl Qwen35Cache {
     pub fn recurrent_bytes(&self) -> usize {
         let live = self.layers.iter().fold(0usize, |acc, l| match l {
             Qwen35LayerCache::Delta(c) => acc.saturating_add(delta_bytes(c)),
-            Qwen35LayerCache::Attn(_) => acc,
+            Qwen35LayerCache::Attn(_) | Qwen35LayerCache::StaticAttn(_) => acc,
         });
         live.saturating_add(self.memory().checkpoint_bytes)
     }
@@ -726,7 +812,7 @@ impl Qwen35Cache {
             .enumerate()
             .filter_map(|(i, l)| match l {
                 Qwen35LayerCache::Delta(c) => Some((i, c.clone())),
-                Qwen35LayerCache::Attn(_) => None,
+                Qwen35LayerCache::Attn(_) | Qwen35LayerCache::StaticAttn(_) => None,
             })
             .collect();
         self.checkpoints.push(DeltaCheckpoint { offset, states });
@@ -741,7 +827,8 @@ impl Qwen35Cache {
     }
 
     /// Roll the cache back so the next step continues from position `n` (see
-    /// [`DecodeCache::rollback_to`]): the full-attention KV is narrowed to `n` and the linear
+    /// [`DecodeCache::rollback_to`]): the full-attention KV is narrowed to `n` (a static cache
+    /// just moves its offset — its buffers and their addresses are untouched) and the linear
     /// layers' recurrent state is restored from the checkpoint taken at `n`. `n == offset()` is a
     /// no-op and `n == 0` is a [`reset`](Self::reset); any other `n` without a checkpoint is
     /// [`Error::RollbackUnavailable`] (typed, so a speculative engine can fall back without matching
@@ -772,7 +859,7 @@ impl Qwen35Cache {
         for (i, state) in checkpoint.states {
             match &mut self.layers[i] {
                 Qwen35LayerCache::Delta(c) => *c = state,
-                Qwen35LayerCache::Attn(_) => {
+                Qwen35LayerCache::Attn(_) | Qwen35LayerCache::StaticAttn(_) => {
                     return Err(Error::Msg(
                         "Qwen35Cache: checkpoint/layer type mismatch".into(),
                     ))
@@ -780,8 +867,10 @@ impl Qwen35Cache {
             }
         }
         for l in &mut self.layers {
-            if let Qwen35LayerCache::Attn(a) = l {
-                a.truncate(n)?;
+            match l {
+                Qwen35LayerCache::Attn(a) => a.truncate(n)?,
+                Qwen35LayerCache::StaticAttn(s) => s.truncate(n)?,
+                Qwen35LayerCache::Delta(_) => {}
             }
         }
         // The checkpoint at `n` still describes the (restored) state at `n`; later ones do not.
@@ -790,12 +879,14 @@ impl Qwen35Cache {
     }
 
     /// Logical bytes referenced by the live state and by the checkpoints (see
-    /// [`CacheMemory`] for what is and is not counted).
+    /// [`CacheMemory`] for what is and is not counted). A static cache's attention layers count
+    /// their **full preallocation** — that is what the request holds from its first step.
     pub fn memory(&self) -> CacheMemory {
         let live_bytes = self.layers.iter().fold(0usize, |acc, l| {
             acc.saturating_add(match l {
                 Qwen35LayerCache::Delta(c) => delta_bytes(c),
                 Qwen35LayerCache::Attn(a) => a.bytes(),
+                Qwen35LayerCache::StaticAttn(s) => s.bytes(),
             })
         });
         let checkpoint_bytes = self
@@ -826,6 +917,10 @@ impl DecodeCache for Qwen35Cache {
     fn memory(&self) -> CacheMemory {
         Qwen35Cache::memory(self)
     }
+
+    fn kv_kind(&self) -> KvCacheKind {
+        Qwen35Cache::kv_kind(self)
+    }
 }
 
 /// A loaded Qwen3.6 (`qwen3_5`) hybrid decoder.
@@ -840,6 +935,9 @@ pub struct Qwen35Model {
     dtype: DType,
     device: Device,
     quantized: bool,
+    /// Which KV cache [`StepModel::new_cache_for`] builds (story sc-24132): the static cache by
+    /// default; [`KvCacheKind::Growing`] selects the reference `AttnKv` slots for parity runs.
+    step_kv_cache: KvCacheKind,
 }
 
 /// The checkpoint-native Qwen3.8 multi-token predictor.
@@ -1259,6 +1357,75 @@ impl Qwen35Model {
         }
     }
 
+    /// A fresh cache whose full-attention layers are **preallocated** [`StaticKvCache`]s holding
+    /// `capacity` positions (story sc-24132), retaining `max_checkpoints` rollback checkpoints.
+    /// The buffers — [`Qwen35Model::static_kv_bytes`] of device memory — are allocated here, once;
+    /// every step then writes in place. A `capacity` of zero or past the model's
+    /// `max_position_embeddings` is [`Error::KvCapacityExceeded`] before anything is allocated.
+    pub fn new_static_cache(&self, capacity: usize, max_checkpoints: usize) -> Result<Qwen35Cache> {
+        let max_positions = usize::try_from(self.cfg.max_position_embeddings).unwrap_or(0);
+        if capacity == 0 || (max_positions > 0 && capacity > max_positions) {
+            return Err(Error::KvCapacityExceeded {
+                requested: capacity,
+                capacity: max_positions,
+            });
+        }
+        let (kv_heads, head_dim) = (
+            self.cfg.num_kv_heads.max(0) as usize,
+            self.cfg.head_dim.max(0) as usize,
+        );
+        let mut layers = Vec::with_capacity(self.cfg.num_layers);
+        for i in 0..self.cfg.num_layers {
+            layers.push(if self.cfg.is_linear(i) {
+                Qwen35LayerCache::Delta(DeltaNetCache::new())
+            } else {
+                Qwen35LayerCache::StaticAttn(StaticKvCache::new(
+                    1,
+                    1,
+                    kv_heads,
+                    head_dim,
+                    capacity,
+                    self.dtype,
+                    &self.device,
+                )?)
+            });
+        }
+        Ok(Qwen35Cache {
+            layers,
+            checkpoints: Vec::new(),
+            max_checkpoints,
+        })
+    }
+
+    /// Bytes [`new_static_cache`](Self::new_static_cache) preallocates for `capacity` positions:
+    /// K and V for every full-attention layer in the compute dtype — the term admission charges
+    /// for the preallocation (E6). Saturating.
+    pub fn static_kv_bytes(&self, capacity: usize) -> usize {
+        let attention_layers = (0..self.cfg.num_layers)
+            .filter(|&i| !self.cfg.is_linear(i))
+            .count();
+        StaticKvCache::buffer_bytes(
+            attention_layers,
+            1,
+            self.cfg.num_kv_heads.max(0) as usize,
+            self.cfg.head_dim.max(0) as usize,
+            capacity,
+            self.dtype,
+        )
+    }
+
+    /// Select which KV cache [`StepModel::new_cache_for`] builds: [`KvCacheKind::Static`] (the
+    /// default) or [`KvCacheKind::Growing`] — the reference `AttnKv` path, kept selectable as the
+    /// parity oracle.
+    pub fn set_step_kv_cache(&mut self, kind: KvCacheKind) {
+        self.step_kv_cache = kind;
+    }
+
+    /// Which KV cache [`StepModel::new_cache_for`] builds.
+    pub fn step_kv_cache(&self) -> KvCacheKind {
+        self.step_kv_cache
+    }
+
     /// The device the model's tensors live on.
     pub fn device(&self) -> &Device {
         &self.device
@@ -1283,7 +1450,7 @@ impl Qwen35Model {
         sin: &Tensor,
         cache: &mut Qwen35Cache,
     ) -> Result<Tensor> {
-        cache.checkpoint();
+        cache.begin_forward(embeds.dim(1)?)?;
         let mut h = embeds.clone();
         for (layer, slot) in self.layers.iter().zip(cache.layers.iter_mut()) {
             h = layer.forward(&h, cos, sin, slot)?;
@@ -1529,7 +1696,7 @@ impl Qwen35Model {
             &self.device,
         )?;
         let h0 = embeds.to_dtype(self.dtype)?;
-        cache.checkpoint();
+        cache.begin_forward(h0.dim(1)?)?;
         let h = deepstack_fused_decoder_layers(
             &h0,
             visual_pos_mask,
@@ -1558,7 +1725,7 @@ impl Qwen35Model {
             &self.device,
         )?;
         let h0 = embeds.to_dtype(self.dtype)?;
-        cache.checkpoint();
+        cache.begin_forward(h0.dim(1)?)?;
         let hidden = deepstack_fused_decoder_layers(
             &h0,
             visual_pos_mask,
@@ -1587,7 +1754,7 @@ impl Qwen35Model {
             &self.device,
         )?;
         let h0 = embeds.to_dtype(self.dtype)?;
-        cache.checkpoint();
+        cache.begin_forward(h0.dim(1)?)?;
         let hidden = deepstack_fused_decoder_layers(
             &h0,
             visual_pos_mask,
@@ -1824,6 +1991,7 @@ impl Qwen35Model {
             dtype,
             device,
             quantized: quant.is_some() || prism.is_some(),
+            step_kv_cache: KvCacheKind::Static,
         })
     }
 }
@@ -1842,6 +2010,7 @@ impl KvCache for Qwen35Cache {
             .iter()
             .find_map(|l| match l {
                 Qwen35LayerCache::Attn(a) => a.kv.as_ref().map(|(k, _)| k.dims()[0] as i32),
+                Qwen35LayerCache::StaticAttn(s) => (s.offset() > 0).then(|| s.batch_size()),
                 Qwen35LayerCache::Delta(_) => None,
             })
             .unwrap_or(0)
@@ -1888,6 +2057,16 @@ impl StepModel for Qwen35Model {
     /// (the speculative verify) roll back through them.
     fn new_cache(&self) -> Qwen35Cache {
         self.new_cache_with_checkpoints(STEP_MAX_CHECKPOINTS)
+    }
+
+    /// The static cache sized for `capacity` (or the growing reference cache when
+    /// [`set_step_kv_cache`](Qwen35Model::set_step_kv_cache) selected it), retaining
+    /// [`STEP_MAX_CHECKPOINTS`].
+    fn new_cache_for(&self, capacity: usize) -> Result<Qwen35Cache> {
+        match self.step_kv_cache {
+            KvCacheKind::Static => self.new_static_cache(capacity, STEP_MAX_CHECKPOINTS),
+            KvCacheKind::Growing => Ok(self.new_cache_with_checkpoints(STEP_MAX_CHECKPOINTS)),
+        }
     }
 
     fn device(&self) -> &Device {
@@ -3057,5 +3236,309 @@ pub(crate) mod tests {
             .unwrap()
             .logits;
         assert!(max_abs_diff(&a, &b) < 1e-4);
+    }
+
+    // ---- Static KV cache (story sc-24132) ------------------------------------------------------
+
+    fn attention_layer_count(cfg: &Qwen35Config) -> usize {
+        (0..cfg.num_layers).filter(|&i| !cfg.is_linear(i)).count()
+    }
+
+    /// **AC1 (tiny config).** Greedy generation on the static KV cache is token-identical to the
+    /// `AttnKv` reference path — both through the reference `Decode` loop and through the same
+    /// `StepModel` driver with the growing cache selected — and the record names the cache that
+    /// ran. Step logits agree to f32 reduction order on every step.
+    #[test]
+    fn static_kv_greedy_matches_attn_kv_reference_path() {
+        use crate::decode::{generate_step, generate_with, CancelFlag, GenerationConfig};
+        let (_cfg, mut model) = text_model();
+        let prompt = [1i32, 7, 3, 42, 9];
+        let cfg = GenerationConfig {
+            max_new_tokens: 24,
+            seed: Some(3),
+            ..Default::default()
+        };
+        let reference =
+            generate_with(&model, &prompt, &cfg, &CancelFlag::new(), &mut |_| {}, None).unwrap();
+        assert_eq!(model.step_kv_cache(), KvCacheKind::Static);
+        let (fixed, record) =
+            generate_step(&model, &prompt, &cfg, &CancelFlag::new(), &mut |_| {}, None).unwrap();
+        assert_eq!(record.kv_cache, KvCacheKind::Static);
+        assert_eq!(record.path, crate::decode::DecodePath::StepModel);
+        assert_eq!(fixed.tokens.len(), 24);
+        assert_eq!(fixed.tokens, reference.tokens);
+
+        // The growing cache stays selectable through the same driver (the parity oracle).
+        model.set_step_kv_cache(KvCacheKind::Growing);
+        let (growing, record) =
+            generate_step(&model, &prompt, &cfg, &CancelFlag::new(), &mut |_| {}, None).unwrap();
+        assert_eq!(record.kv_cache, KvCacheKind::Growing);
+        assert_eq!(growing.tokens, reference.tokens);
+        model.set_step_kv_cache(KvCacheKind::Static);
+
+        // Logits parity per step: prefill (all positions) then single-token steps.
+        let mut fixed = model.new_static_cache(32, STEP_MAX_CHECKPOINTS).unwrap();
+        let mut growing = StepModel::new_cache(&model);
+        assert_eq!(fixed.kv_kind(), KvCacheKind::Static);
+        assert_eq!(growing.kv_kind(), KvCacheKind::Growing);
+        let a = model
+            .forward_step(&mut fixed, StepRequest::all(&prompt))
+            .unwrap()
+            .logits;
+        let b = model
+            .forward_step(&mut growing, StepRequest::all(&prompt))
+            .unwrap()
+            .logits;
+        assert_eq!(a.dims(), &[1, 5, 50]);
+        assert!(max_abs_diff(&a, &b) < 1e-5);
+        for t in [2i32, 11, 40, 5, 5, 17] {
+            let a = model
+                .forward_step(&mut fixed, StepRequest::last(&[t]))
+                .unwrap()
+                .logits;
+            let b = model
+                .forward_step(&mut growing, StepRequest::last(&[t]))
+                .unwrap()
+                .logits;
+            assert!(max_abs_diff(&a, &b) < 1e-5);
+        }
+        assert_eq!(fixed.len(), growing.len());
+        // A multi-token (verify-shaped) step after a prefix agrees too.
+        let a = model
+            .forward_step(&mut fixed, StepRequest::all(&[8, 9, 10]))
+            .unwrap()
+            .logits;
+        let b = model
+            .forward_step(&mut growing, StepRequest::all(&[8, 9, 10]))
+            .unwrap()
+            .logits;
+        assert!(max_abs_diff(&a, &b) < 1e-5);
+    }
+
+    /// **AC2 (op counter).** After warm-up, N single-token steps on the static cache record **zero**
+    /// KV materializations (no `cat`, no `repeat_kv`) and the cache's live bytes do not grow; the
+    /// growing cache under the same driver records three per attention layer per step (one `cat`
+    /// pair, two `repeat_kv`), which is what proves the counter counts.
+    #[test]
+    fn static_kv_decode_steps_materialize_nothing_and_hold_memory_flat() {
+        use crate::primitives::kv_cache::kv_materialize_count;
+        let (cfg, model) = text_model();
+        let attention_layers = attention_layer_count(&cfg);
+        assert_eq!(attention_layers, 1);
+        let steps = 16usize;
+
+        let mut fixed = model.new_static_cache(64, STEP_MAX_CHECKPOINTS).unwrap();
+        model
+            .forward_step(&mut fixed, StepRequest::last(&[1, 7, 3]))
+            .unwrap();
+        for t in [42i32, 9] {
+            model
+                .forward_step(&mut fixed, StepRequest::last(&[t]))
+                .unwrap(); // warm-up
+        }
+        let memory = fixed.memory();
+        let before = kv_materialize_count();
+        for i in 0..steps {
+            model
+                .forward_step(&mut fixed, StepRequest::last(&[(i % 50) as i32]))
+                .unwrap();
+        }
+        assert_eq!(
+            kv_materialize_count() - before,
+            0,
+            "static KV steps must issue no cat / repeat_kv copies"
+        );
+        assert_eq!(
+            fixed.memory().live_bytes,
+            memory.live_bytes,
+            "static KV live bytes are the preallocation and never grow"
+        );
+        assert_eq!(fixed.len(), 5 + steps as i32);
+
+        let mut growing = StepModel::new_cache(&model);
+        model
+            .forward_step(&mut growing, StepRequest::last(&[1, 7, 3]))
+            .unwrap();
+        for t in [42i32, 9] {
+            model
+                .forward_step(&mut growing, StepRequest::last(&[t]))
+                .unwrap();
+        }
+        let memory = growing.memory();
+        let before = kv_materialize_count();
+        for i in 0..steps {
+            model
+                .forward_step(&mut growing, StepRequest::last(&[(i % 50) as i32]))
+                .unwrap();
+        }
+        assert_eq!(
+            kv_materialize_count() - before,
+            (3 * attention_layers * steps) as u64,
+            "the growing path materializes cat + 2x repeat_kv per attention layer per step"
+        );
+        assert!(growing.memory().live_bytes > memory.live_bytes);
+    }
+
+    /// **AC3 (tiny config, storage identity).** Through 100 single-token steps and a rollback the
+    /// static attention buffers keep their storage addresses; the rollback then re-decodes exactly
+    /// (the rolled-back positions are overwritten in place).
+    #[test]
+    fn static_kv_buffers_keep_their_addresses_across_100_steps_and_rollback() {
+        let (_cfg, model) = text_model();
+        let mut cache = model.new_static_cache(128, 8).unwrap();
+        let addresses = cache.static_kv_addresses().unwrap();
+        assert_eq!(addresses.len(), 1);
+        assert_ne!(addresses[0].0, addresses[0].1);
+        model
+            .forward_step(&mut cache, StepRequest::last(&[1, 7, 3]))
+            .unwrap();
+        for i in 0..100 {
+            model
+                .forward_step(&mut cache, StepRequest::last(&[i * 7 % 50]))
+                .unwrap();
+            assert_eq!(cache.static_kv_addresses().unwrap(), addresses);
+        }
+        assert_eq!(cache.len(), 103);
+        let n = *cache.checkpoint_offsets().first().unwrap();
+        assert!(n > 3 && n < 103);
+        let fresh_logits = {
+            let mut fresh = model.new_static_cache(128, 0).unwrap();
+            let mut tokens = vec![1i32, 7, 3];
+            tokens.extend((0..(n - 3)).map(|i| i * 7 % 50));
+            model
+                .forward_step(&mut fresh, StepRequest::last(&tokens))
+                .unwrap();
+            model
+                .forward_step(&mut fresh, StepRequest::last(&[33]))
+                .unwrap()
+                .logits
+        };
+        cache.rollback_to(n).unwrap();
+        assert_eq!(cache.len(), n);
+        assert_eq!(cache.static_kv_addresses().unwrap(), addresses);
+        let replayed = model
+            .forward_step(&mut cache, StepRequest::last(&[33]))
+            .unwrap()
+            .logits;
+        assert_eq!(cache.static_kv_addresses().unwrap(), addresses);
+        assert!(max_abs_diff(&fresh_logits, &replayed) < 1e-5);
+        assert_eq!(cache.len(), n + 1);
+        cache.reset();
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.static_kv_addresses().unwrap(), addresses);
+    }
+
+    /// **E6.** The static cache is bounded by the request and the model: a capacity of zero or past
+    /// `max_position_embeddings` is refused before allocation; a step that would run past the
+    /// capacity is refused **before** any layer runs, leaving the cache (and its checkpoints)
+    /// exactly as they were; the step driver surfaces the same typed error for an over-budget
+    /// request.
+    #[test]
+    fn static_kv_capacity_is_bounded_and_fails_closed() {
+        use crate::decode::{generate_step, CancelFlag, GenerationConfig};
+        let (cfg, model) = text_model();
+        assert_eq!(cfg.max_position_embeddings, 128);
+        assert!(matches!(
+            model.new_static_cache(0, 0),
+            Err(Error::KvCapacityExceeded {
+                requested: 0,
+                capacity: 128
+            })
+        ));
+        assert!(matches!(
+            model.new_static_cache(129, 0),
+            Err(Error::KvCapacityExceeded {
+                requested: 129,
+                capacity: 128
+            })
+        ));
+        assert_eq!(
+            model.new_static_cache(128, 0).unwrap().kv_capacity(),
+            Some(128)
+        );
+
+        let mut cache = model.new_static_cache(6, STEP_MAX_CHECKPOINTS).unwrap();
+        model
+            .forward_step(&mut cache, StepRequest::last(&[1, 7, 3, 42]))
+            .unwrap();
+        let checkpoints = cache.checkpoint_offsets();
+        let memory = cache.memory();
+        let err = model
+            .forward_step(&mut cache, StepRequest::last(&[9, 2, 11]))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::KvCapacityExceeded {
+                    requested: 7,
+                    capacity: 6
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(cache.len(), 4, "a refused step does not advance");
+        assert_eq!(cache.checkpoint_offsets(), checkpoints);
+        assert_eq!(cache.memory(), memory);
+        model
+            .forward_step(&mut cache, StepRequest::last(&[9, 2]))
+            .unwrap();
+        assert_eq!(cache.len(), 6);
+
+        // Through the driver: prompt + budget past the model bound.
+        let over = GenerationConfig {
+            max_new_tokens: 200,
+            seed: Some(1),
+            ..Default::default()
+        };
+        let err = generate_step(
+            &model,
+            &[1, 7, 3],
+            &over,
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::KvCapacityExceeded {
+                    requested: 203,
+                    capacity: 128
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    /// **E6.** The preallocation is what the cache reports as live bytes from its first step, and
+    /// [`Qwen35Model::static_kv_bytes`] is that exact number (the term admission charges).
+    #[test]
+    fn static_kv_preallocation_is_priced_exactly() {
+        let (cfg, model) = text_model();
+        let capacity = 40usize;
+        let cache = model.new_static_cache(capacity, 0).unwrap();
+        let expected = attention_layer_count(&cfg)
+            * 2
+            * (cfg.num_kv_heads as usize)
+            * (cfg.head_dim as usize)
+            * capacity
+            * model.compute_dtype().size_in_bytes();
+        assert_eq!(model.static_kv_bytes(capacity), expected);
+        assert_eq!(
+            cache.memory().live_bytes,
+            expected,
+            "an empty static cache already holds its whole preallocation"
+        );
+        let mut cache = cache;
+        model
+            .forward_step(&mut cache, StepRequest::last(&[1, 7, 3]))
+            .unwrap();
+        assert!(cache.memory().live_bytes >= expected);
+        assert_eq!(
+            cache.memory().live_bytes - expected,
+            cache.recurrent_bytes(),
+            "past the preallocation only the recurrent state is live"
+        );
     }
 }

@@ -10,7 +10,10 @@
 //! deliberately the same algorithm as the reference loop in [`stream`](super::stream) (same prefill,
 //! same sampler, same stop / cancel / constraint order) so its output is token-identical to the
 //! reference path for the same prompt and config — the parity gate the tiny-config and real-weight
-//! tests hold. Unlike the reference loop it returns a [`DecodeRecord`] with measured counters.
+//! tests hold. Unlike the reference loop it returns a [`DecodeRecord`] with measured counters,
+//! including which KV cache the request ran on (`kv_cache`). The cache is built through
+//! [`StepModel::new_cache_for`] with the request's bound (prompt + budget), which is where a
+//! preallocated KV cache (story sc-24132) is sized and where an over-budget request fails closed.
 
 use candle_core::{Device, Tensor};
 
@@ -81,6 +84,16 @@ pub trait StepModel {
     /// A fresh, empty cache.
     fn new_cache(&self) -> Self::Cache;
 
+    /// A fresh, empty cache sized for a request that will hold at most `capacity` positions
+    /// (prompt + generation budget). A model with a preallocated KV cache (story sc-24132)
+    /// allocates it here, once, for exactly that bound, and fails closed with
+    /// [`Error::KvCapacityExceeded`] when the bound exceeds what it can serve; the default is the
+    /// unbounded [`new_cache`](Self::new_cache). [`generate_step`] builds its cache through this.
+    fn new_cache_for(&self, capacity: usize) -> Result<Self::Cache> {
+        let _ = capacity;
+        Ok(self.new_cache())
+    }
+
     /// Where input-id tensors must live.
     fn device(&self) -> &Device;
 
@@ -139,7 +152,10 @@ pub fn generate_step_timed<M: StepModel>(
 
     let span = RequestSpan::begin();
     let mut rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
-    let mut cache = model.new_cache();
+    // The request's bound: the prompt plus every token the loop may feed back. (The last budgeted
+    // token is sampled but never fed, so this is one position of slack.)
+    let capacity = prompt_ids.len().saturating_add(config.max_new_tokens);
+    let mut cache = model.new_cache_for(capacity)?;
     let mut forwards = 0u64;
 
     // Prefill the whole prompt at position 0; logits are for the last prompt position.
@@ -204,7 +220,8 @@ pub fn generate_step_timed<M: StepModel>(
         forwards,
         generated.len(),
         span.host_syncs(),
-    );
+    )
+    .with_kv_cache(cache.kv_kind());
     Ok((
         GenerationOutput {
             tokens: generated,

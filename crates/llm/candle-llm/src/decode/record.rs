@@ -19,7 +19,7 @@ use crate::decode::speculative::SpeculativeStats;
 use crate::decode::stream::Decode;
 use crate::error::Result;
 use crate::primitives::host_sync::host_sync_count;
-use crate::primitives::kv_cache::KvCache;
+use crate::primitives::kv_cache::{KvCache, KvCacheKind};
 
 /// Which decode implementation produced a request's tokens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +67,11 @@ pub struct DecodeRecord {
     pub generated_tokens: u64,
     /// Device→host transfers this crate issued while generating (see `primitives::host_sync`).
     pub host_syncs: u64,
+    /// Which KV cache implementation the request ran on (story sc-24132): the growing reference
+    /// cache or the preallocated static one. Reported from the cache itself
+    /// ([`DecodeCache::kv_kind`](crate::primitives::DecodeCache::kv_kind)), so the row says what
+    /// actually ran, not what was configured.
+    pub kv_cache: KvCacheKind,
 }
 
 impl DecodeRecord {
@@ -84,7 +89,15 @@ impl DecodeRecord {
             accepted_tokens: 0,
             generated_tokens: generated as u64,
             host_syncs,
+            kv_cache: KvCacheKind::Growing,
         }
+    }
+
+    /// The same record with `kv_cache` set — the step driver stamps the cache's own
+    /// [`DecodeCache::kv_kind`](crate::primitives::DecodeCache::kv_kind) on it.
+    pub fn with_kv_cache(mut self, kv_cache: KvCacheKind) -> Self {
+        self.kv_cache = kv_cache;
+        self
     }
 
     /// A record from a speculative run's [`SpeculativeStats`].
@@ -101,6 +114,7 @@ impl DecodeRecord {
             accepted_tokens: stats.accepted as u64,
             generated_tokens: generated as u64,
             host_syncs,
+            kv_cache: KvCacheKind::Growing,
         }
     }
 

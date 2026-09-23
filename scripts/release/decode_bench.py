@@ -151,6 +151,9 @@ def row_label(row: dict[str, Any]) -> str:
     if path == "reference":
         return "MTP off (reference)"
     if path == "step_model":
+        kv_cache = row.get("kv_cache")
+        if kv_cache:
+            return f"MTP off (StepModel, {kv_cache} kv)"
         return "MTP off (StepModel)"
     return str(path)
 
