@@ -68,6 +68,7 @@ METRIC_COLUMNS = (
     ("cache_live_bytes", "cache live", "mib"),
     ("cache_checkpoint_bytes", "cache checkpoints", "mib"),
     ("fused_primitives", "fused primitives", "fused"),
+    ("nvfp4_projections", "nvfp4 path", "nvfp4"),
 )
 # Fields every run merged into one table must share, or the rows are not comparable.
 COMPARABLE_FIELDS = (
@@ -153,6 +154,8 @@ def row_label(row: dict[str, Any]) -> str:
         return "MTP off (reference)"
     if path == "reference_unfused":
         return "MTP off (reference, fused off)"
+    if path == "reference_cublaslt":
+        return "MTP off (reference, NVFP4 GEMV off)"
     if path == "step_model":
         return "MTP off (StepModel)"
     return str(path)
@@ -169,6 +172,13 @@ def format_metric(value: Any, fmt: str) -> str:
         # sc-24137: the row's fused-vs-reference primitive tally and the switch it ran under.
         reason = f" ({value['reference_reason']})" if value.get("reference_reason") else ""
         return f"{value['switch']}: {value['fused']} fused / {value['reference']} ref{reason}"
+    if fmt == "nvfp4":
+        # sc-24136: NVFP4 projection calls by path (fused decode GEMV vs cuBLASLt W4A4) and the
+        # GEMV switch the row ran under; a bf16 run has no NVFP4 projections.
+        if not value.get("gemv") and not value.get("cublaslt"):
+            return "none"
+        reason = f" ({value['cublaslt_reason']})" if value.get("cublaslt_reason") else ""
+        return f"{value['switch']}: {value['gemv']} gemv / {value['cublaslt']} cuBLASLt{reason}"
     return fmt.format(value)
 
 
@@ -197,6 +207,12 @@ def check_comparable(runs: list[dict[str, Any]]) -> None:
             raise ValueError(f"runs differ in {section}.{field}: {sorted(values)}")
 
 
+def projection_format(suite: dict[str, Any]) -> str:
+    """` with NVFP4 projections` for a quantized run (sc-24136); empty for the dense default."""
+    fmt = suite.get("weight_format")
+    return f" with {fmt.upper()} projections" if fmt and fmt != "bf16" else ""
+
+
 def render_table(runs: list[dict[str, Any]]) -> str:
     """One Markdown table: a row per (run, decode row), the columns the story asks for.
 
@@ -221,7 +237,8 @@ def render_table(runs: list[dict[str, Any]]) -> str:
     lines = [
         f"**{label}** — {model['repository']} @ {model['revision'][:12]} "
         f"(`{model['key']}`, config sha256 {model['config_sha256'][:12]}), "
-        f"{suite.get('compute_dtype', 'unknown dtype')} greedy, {suite['prompt_tokens']} prompt "
+        f"{suite.get('compute_dtype', 'unknown dtype')}{projection_format(suite)} greedy, "
+        f"{suite['prompt_tokens']} prompt "
         f"tokens, {suite['new_tokens']} new tokens per row.",
         "",
         "| " + " | ".join(header) + " |",
@@ -249,7 +266,10 @@ def render_table(runs: list[dict[str, Any]]) -> str:
         "(n/a where the binary predates the counter); fused primitives = the switch the row ran "
         "under and how many RMSNorm / SwiGLU / QK-norm+RoPE leaves ran the fused kernel vs the "
         "op-chain reference, with the last reference reason (n/a where the binary predates the "
-        "fused primitives)."
+        "fused primitives); nvfp4 path = the NVFP4 decode-GEMV switch the row ran under and how many "
+        "NVFP4 projection calls ran the fused GEMV vs the cuBLASLt W4A4 GEMM, with the last "
+        "cuBLASLt reason (`rows` = a prefill; none = no NVFP4 projections; n/a where the binary "
+        "predates the GEMV)."
     )
     return "\n".join(lines) + "\n"
 
@@ -310,6 +330,7 @@ def run(args: argparse.Namespace) -> int:
             "DECODE_BENCH_DRAFTS": args.drafts,
             "DECODE_BENCH_NEW_TOKENS": str(args.new_tokens),
             "DECODE_BENCH_LABEL": args.label,
+            "DECODE_BENCH_FORMAT": args.format,
         }
     )
     if args.prompt:
@@ -468,6 +489,12 @@ def parser() -> argparse.ArgumentParser:
     run_p.add_argument("--new-tokens", type=int, default=256)
     run_p.add_argument("--prompt")
     run_p.add_argument("--label", default=DEFAULT_LABEL)
+    run_p.add_argument(
+        "--format",
+        default="bf16",
+        choices=("bf16", "nvfp4"),
+        help="projection weight format the binary loads (nvfp4 = quantized at load, sc-24135)",
+    )
     run_p.add_argument("--gpu-index", type=int, default=0)
     run_p.add_argument("--sample-interval", type=float, default=0.25)
     run_p.add_argument(
