@@ -31,6 +31,17 @@ pub const LATENT_CHANNELS: usize = 16;
 /// downsamplers).
 pub const SPATIAL_SCALE: u32 = 8;
 
+/// `sd3_vae_config().block_out_channels` — the decoder geometry [`VAE_DECODER`] bounds.
+const VAE_BLOCK_OUT_CHANNELS: [usize; 4] = [128, 256, 512, 512];
+
+/// The external `AutoEncoderKL` decoder's shape for the sc-24114 launch-bound guard: past candle's
+/// 32-bit CUDA im2col/softmax indices (a 2048² decode) the decode is tiled, since that decoder's
+/// convs cannot be chunked in-tree ([`candle_gen::bounded_kl_decode`]).
+pub const VAE_DECODER: candle_gen::KlDecoderShape<'static> = candle_gen::KlDecoderShape {
+    latent_channels: LATENT_CHANNELS,
+    block_out_channels: &VAE_BLOCK_OUT_CHANNELS,
+};
+
 /// The VAE **encoder**'s dtype for the img2img / `Reference` path (sc-11784): f32. Candle's
 /// `AutoEncoderKL::encode` samples the diagonal-gaussian via the *device* RNG (not launch-portable —
 /// breaks the sc-3673 deterministic-seed contract), so the img2img init runs the raw [`VaeEncoder`]
@@ -125,6 +136,21 @@ pub fn encode_mean(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// sc-24114: the guard's decoder geometry is the loaded VAE's, and it tiles a 2048² decode
+    /// (past the CUDA im2col u32 bound) while 1024² stays the single pass.
+    #[test]
+    fn native_decode_is_bounded_at_2048_and_single_pass_at_1024() {
+        let cfg = sd3_vae_config();
+        assert_eq!(
+            VAE_DECODER.block_out_channels,
+            cfg.block_out_channels.as_slice()
+        );
+        assert_eq!(VAE_DECODER.latent_channels, cfg.latent_channels);
+        let latent = |px: usize| px / SPATIAL_SCALE as usize;
+        assert!(VAE_DECODER.exceeds_launch_bounds(latent(2048), latent(2048)));
+        assert!(!VAE_DECODER.exceeds_launch_bounds(latent(1024), latent(1024)));
+    }
 
     #[test]
     fn sd3_vae_config_uses_sd35_constants() {

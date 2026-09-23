@@ -149,6 +149,11 @@ pub use seed::{
 // tile GEOMETRY stays in `gen_core::tiling`; this module owns the candle-side execution of a plan,
 // parameterized by each VAE's cost model + decode closure so the per-VAE numerics are unchanged.
 pub mod vae_tiling;
+
+// sc-24114: spatial bound for decodes through an EXTERNAL diffusers AutoencoderKL (z-image, boogu, sd3,
+// kolors) past candle's 32-bit CUDA im2col / softmax launch indices; in-tree VAEs chunk their convs.
+pub mod bounded_decode;
+pub use bounded_decode::{bounded_kl_decode, conv2d_im2col_elems, KlDecoderShape};
 pub use gen_core::tiling::VideoDecodeMemoryProfile;
 
 // Shared safetensors key→`Tensor` weight map (sc-9044 / F-060): the non-`VarBuilder` loader (float
