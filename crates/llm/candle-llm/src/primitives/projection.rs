@@ -142,8 +142,9 @@ pub enum Projection {
     Quantized(QuantizedLinear),
     /// A compact Prism/Bonsai affine-2 or native ternary weight.
     Prism(std::sync::Arc<PrismPackedWeight>),
-    /// An NVFP4 weight quantized at load (sc-24135), resident as packed E2M1 + UE4M3 scales.
-    Nvfp4(Nvfp4Weight),
+    /// An NVFP4 weight quantized at load (sc-24135), resident as packed E2M1 + UE4M3 scales. Boxed:
+    /// its device handles would otherwise grow every projection-holding enum in the decoders.
+    Nvfp4(Box<Nvfp4Weight>),
 }
 
 /// Which representation a loaded [`Projection`] actually holds — the load telemetry's kind.
@@ -339,7 +340,9 @@ impl Projection {
             Some(ProjectionFormat::Nvfp4(ctx)) => {
                 let (rows, cols) = weight.dims2()?;
                 nvfp4_shape_refusal(rows, cols)?;
-                Ok(Self::Nvfp4(Nvfp4Weight::quantize(&weight, bias, ctx)?))
+                Ok(Self::Nvfp4(Box::new(Nvfp4Weight::quantize(
+                    &weight, bias, ctx,
+                )?)))
             }
         }
     }
