@@ -76,12 +76,14 @@ pub struct SpeculativeStats {
     /// Verify steps whose partial acceptance was recovered by a **direct** cache rollback to
     /// `start + 1 + accepted` (sc-24131) — no extra target forward.
     pub direct_rollbacks: usize,
-    /// Verify steps the cache could not roll back into ([`Error::RollbackUnavailable`]), recovered
-    /// by rolling back to the step start and **replaying** the kept prefix — one extra target
-    /// forward each. Zero on a cache with per-token checkpoints (the S3 `Qwen35Cache`).
+    /// Replay forwards (sc-24130, E2): verify steps whose cache answered
+    /// [`Error::RollbackUnavailable`] for the direct rollback to `start + 1 + accepted`, so the
+    /// engine rolled back to the step start and replayed the kept prefix in one extra forward.
+    /// Counted inside `forwards`; `0` on a cache with per-position rollback — the `Qwen35Cache`
+    /// since its per-token checkpoint ring (sc-24131).
     ///
     /// [`Error::RollbackUnavailable`]: crate::error::Error::RollbackUnavailable
-    pub replay_fallbacks: usize,
+    pub replays: usize,
 }
 
 /// Generate from `prompt_ids` with prompt-lookup speculative decoding, returning the output and

@@ -479,7 +479,7 @@ fn penalized_logits(
 /// Pull every row of an all-positions logits tensor `[1, n, vocab]` (or `[n, vocab]`) to host f32
 /// in **one** device->host transfer — the speculative engine's verify decision (sc-24130): the
 /// `n = K + 1` rows come over together, then each row is shaped on host with
-/// [`sample_host`] / [`shaped_candidates_host`], so a verify step costs one sync however wide it
+/// [`sample_row_host`] / [`shaped_candidates_host`], so a verify step costs one sync however wide it
 /// is (the per-row [`sample`] would cost `K + 1`).
 pub fn logits_rows_host(logits: &Tensor) -> Result<Vec<Vec<f32>>> {
     let (n, vocab) = match logits.dims() {
@@ -490,7 +490,8 @@ pub fn logits_rows_host(logits: &Tensor) -> Result<Vec<Vec<f32>>> {
             )))
         }
     };
-    read_logits_rows(&logits.reshape((n, vocab))?) // one n x vocab transfer, n rows counted
+    // One n x vocab transfer (one counted sync), n counted logits-row copies.
+    read_logits_rows(&logits.reshape((n, vocab))?)
 }
 
 /// On-device argmax of every row of `[1, n, vocab]` (or `[n, vocab]`) logits, brought to host as
@@ -522,17 +523,25 @@ pub fn argmax_rows_tensor(logits: &Tensor) -> Result<Tensor> {
     Ok(logits.reshape((n, vocab))?.argmax(1)?)
 }
 
-/// [`sample_host`] over a logits row already on the host (from [`logits_rows_host`]): identical
-/// shaping and draw — the argmax fallback consumes the token's draw exactly as [`sample_host`]
-/// does, so a seeded stream stays aligned across the two — with no device transfer. `row` is
-/// consumed (penalties are applied in place).
-pub fn sample_host_row(
+/// [`sample`] over a logits row already on the host (from [`logits_rows_host`]): identical
+/// shaping and draw, no device transfer. `row` is consumed (penalties are applied in place).
+/// Counted as a host draw — the row came over for the speculative decision, or because a
+/// constraint or a penalty shapes it on the host.
+pub fn sample_row_host(
     mut row: Vec<f32>,
     history: &[i32],
     params: &SamplingParams,
     rng: &mut impl TokenRng,
     allowed: Option<&[bool]>,
 ) -> i32 {
+    let reason = if allowed.is_some() {
+        HostSampleReason::Constraint
+    } else if params.repetition_penalty != 1.0 || params.presence_penalty != 0.0 {
+        HostSampleReason::Penalty
+    } else {
+        HostSampleReason::SpeculativeDistribution
+    };
+    note_sampler_path(SamplerPath::Host(reason));
     penalize_host(&mut row, history, params, allowed);
     if params.temperature <= 0.0 {
         return argmax_host(&row);
@@ -661,7 +670,8 @@ fn read_token_id(id: &Tensor) -> Result<u32> {
     Ok(id.to_scalar::<u32>()?)
 }
 
-/// Read a `[n]` row of token ids to the host: one counted host sync (no logits row moves).
+/// Read a `[n]` tensor of token ids to the host: one counted host sync (an `n`-element copy,
+/// never the logits — no logits-row copy is counted).
 fn read_token_ids(ids: &Tensor) -> Result<Vec<u32>> {
     note_host_sync();
     Ok(ids.to_vec1::<u32>()?)
@@ -1249,7 +1259,7 @@ mod tests {
         for _ in 0..16 {
             let via_tensor = sample(&row, &history, &params, &mut a, Some(&mask)).unwrap();
             let host_row = logits_rows_host(&row).unwrap().remove(0);
-            let via_host = sample_host_row(host_row, &history, &params, &mut b, Some(&mask));
+            let via_host = sample_row_host(host_row, &history, &params, &mut b, Some(&mask));
             assert_eq!(via_tensor, via_host);
         }
         assert_eq!(
@@ -1269,7 +1279,7 @@ mod tests {
         };
         let l = logits(&[2.0, 1.5, 0.5]);
         assert_eq!(
-            sample_host_row(
+            sample_row_host(
                 logits_rows_host(&l).unwrap().remove(0),
                 &[0, 0, 0],
                 &greedy,

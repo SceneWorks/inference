@@ -59,7 +59,7 @@ def suite_document(new_tokens: int = 4, with_step: bool = True) -> dict:
             "host_syncs_per_verify_step": 1.0,
             "verify_steps": 3,
             "direct_rollbacks": 2,
-            "replay_fallbacks": 0,
+            "replay_forwards": 0,
             "target_forwards_per_verify_step": 1.0,
             "proposer": "mtp",
             "device_used_bytes_at_last_token": 3 * 2**29,
@@ -511,7 +511,9 @@ class DecodeBenchWrapperTests(unittest.TestCase):
         self.assertNotIn("generate_speculative_with", before_stub)
         self.assertNotIn("MtpProposer", before_stub)
         self.assertIn('unreachable!("the ngram row is not available on the pre-epic baseline")', rewritten)
-        self.assertIn("(out, stats, prefill_secs, decode_secs, None, None, None)", rewritten)
+        self.assertIn('(out, stats, prefill_secs, decode_secs, None, None, "mtp", None)', rewritten)
+        self.assertIn("fn replay_forwards(_stats: &SpeculativeStats) -> Option<u64> {", rewritten)
+        self.assertNotIn("Some(stats.replays as u64)", rewritten)
         self.assertNotIn("set_attn_formulation", before_stub)
         self.assertNotIn("attn_formulation()", before_stub)
         # Everything outside the block is untouched, so the two binaries measure the same rows.

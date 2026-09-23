@@ -25,7 +25,7 @@
 //!   same-arithmetic oracles above and on the f32 tiny config
 //!   (`models::qwen35::tests::verify_step_rollback_to_every_position_matches_a_fresh_decode`).
 //! * **AC2 (engine)** — a short greedy MTP run at every `K in 1..=5` recovers every partial
-//!   rejection with a direct rollback: `replay_fallbacks == 0`, exactly one target forward per
+//!   rejection with a direct rollback: `replay_forwards == 0`, exactly one target forward per
 //!   verify step. (The 256-token bench rows are the sealed AC2 evidence; this is the in-test
 //!   gate.)
 //!
@@ -294,16 +294,16 @@ fn ac1_verify_step_rollback_to_every_position_matches_a_fresh_decode() {
         .unwrap();
         let r = run.record;
         eprintln!(
-            "[ac2] mtp K={k}: verify_steps {} direct_rollbacks {} replay_fallbacks {} fwd/verify {:?} acceptance {:.3} cache live {} MiB checkpoints {} MiB",
+            "[ac2] mtp K={k}: verify_steps {} direct_rollbacks {} replay_forwards {} fwd/verify {:?} acceptance {:.3} cache live {} MiB checkpoints {} MiB",
             r.verify_steps,
             r.direct_rollbacks,
-            r.replay_fallbacks,
+            r.replay_forwards,
             r.target_forwards_per_verify_step(),
             r.acceptance_rate().unwrap_or(0.0),
             run.memory.live_bytes >> 20,
             run.memory.checkpoint_bytes >> 20,
         );
-        assert_eq!(r.replay_fallbacks, 0, "K={k}");
+        assert_eq!(r.replay_forwards, 0, "K={k}");
         assert_eq!(r.target_forwards_per_verify_step(), Some(1.0), "K={k}");
         assert_eq!(
             r.target_forwards,

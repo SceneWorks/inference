@@ -66,7 +66,7 @@ METRIC_COLUMNS = (
     ("host_syncs_per_token", "syncs/tok", "{:.2f}"),
     ("host_syncs_per_verify_step", "syncs/verify", "{:.2f}"),
     ("target_forwards_per_verify_step", "fwd/verify", "{:.2f}"),
-    ("replay_fallbacks", "replay fallbacks", "{}"),
+    ("replay_forwards", "replay forwards", "{}"),
     ("device_used_bytes_at_last_token", "device used @ last token", "gib"),
     ("cache_live_bytes", "cache live", "mib"),
     ("cache_checkpoint_bytes", "cache checkpoints", "mib"),
@@ -293,7 +293,7 @@ def render_table(runs: list[dict[str, Any]]) -> str:
         "fwd/tok = measured target forwards per generated token "
         "(n/a where the binary predates the counter); fwd/verify = target forwards per verify step "
         "(the verify forward plus any replay fallback; 1.00 on the per-token DeltaNet checkpoint "
-        "ring, sc-24131) and replay fallbacks = verify steps the engine recovered by rolling back "
+        "ring, sc-24131) and replay forwards = verify steps the engine recovered by rolling back "
         "to the step start and replaying the kept prefix (0 on the ring; n/a for non-speculative "
         "rows and where the binary predates the counters); fused primitives = the switch the row ran "
         "under and how many RMSNorm / SwiGLU / QK-norm+RoPE leaves ran the fused kernel vs the "

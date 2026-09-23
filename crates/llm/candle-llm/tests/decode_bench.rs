@@ -52,9 +52,13 @@
 //!
 //! The speculative rows (sc-24130) run the unified engine over the step seam — the `mtp` rows
 //! with the native MTP proposer, the `ngram` rows with prompt lookup — and report the proposer
-//! (`proposer`), the device->host syncs per verify step (`host_syncs_per_verify_step`, the AC2
-//! figure: exactly 1 on head, `K + 1` on the pre-epic loop, which the baseline binary reports as
-//! `null` because it predates the counter).
+//! the record says ran (`proposer`), the device->host syncs per verify step
+//! (`host_syncs_per_verify_step`, the AC2 figure: exactly 1 on head, `K + 1` on the pre-epic loop,
+//! which the baseline binary reports as `null` because it predates the counter), the replay
+//! forwards the engine spent on the `RollbackUnavailable` fallback (`replay_forwards`, E2) and the
+//! recovery split behind them (`verify_steps`, `direct_rollbacks`,
+//! `target_forwards_per_verify_step` — exactly 1.0 on the per-token DeltaNet checkpoint ring,
+//! sc-24131 AC2).
 //!
 //! The block between the `head-only` markers uses seams that do not exist on the pre-epic
 //! baseline (`StepModel`, host-sync accounting). `decode_bench.py baseline-source` rewrites this
@@ -89,8 +93,8 @@ use candle_llm::primitives::{
 
 /// A speculative row through the unified engine: the output, the raw counters, the prefill and
 /// decode seconds, the `(kv_cache, attn_formulation)` labels of the cache it ran on, the
-/// engine's host syncs per verify step, and its recovery counters `(verify_steps,
-/// direct_rollbacks, replay_fallbacks)` (sc-24131).
+/// engine's host syncs per verify step, the proposer the record says ran, and its recovery
+/// counters `(verify_steps, direct_rollbacks, replay_forwards)` (sc-24131).
 type SpeculativeRow = (
     GenerationOutput,
     SpeculativeStats,
@@ -98,6 +102,7 @@ type SpeculativeRow = (
     f64,
     Option<(&'static str, &'static str)>,
     Option<f64>,
+    &'static str,
     Option<(u64, u64, u64)>,
 );
 
@@ -145,10 +150,11 @@ fn engine_row<P: Proposer>(
             run.record.attn_formulation.label(),
         )),
         run.record.host_syncs_per_verify_step(),
+        run.record.proposer.label(),
         Some((
             run.record.verify_steps,
             run.record.direct_rollbacks,
-            run.record.replay_fallbacks,
+            run.record.replay_forwards,
         )),
     )
 }
@@ -198,6 +204,12 @@ fn ngram_row(
 
 fn host_syncs_now() -> Option<u64> {
     Some(host_sync_count())
+}
+
+/// The engine's replay forwards (the `RollbackUnavailable` -> replay fallback, E2), `None` on a
+/// binary whose stats predate the counter.
+fn replay_forwards(stats: &SpeculativeStats) -> Option<u64> {
+    Some(stats.replays as u64)
 }
 
 /// The fused-primitive switch state (`on` / `off`), or `None` on a binary without the switch.
@@ -323,6 +335,7 @@ fn step_model_row(
     Option<(u64, u64)>,
     Option<(u64, u64)>,
     Option<(&'static str, &'static str)>,
+    &'static str,
 ) {
     let mut prefill_secs = 0.0;
     let started = Instant::now();
@@ -352,6 +365,7 @@ fn step_model_row(
         Some((record.target_forwards, record.host_syncs)),
         Some((memory.live_bytes as u64, memory.checkpoint_bytes as u64)),
         Some((record.kv_cache.label(), record.attn_formulation.label())),
+        record.proposer.label(),
     )
 }
 
@@ -392,6 +406,10 @@ fn growing_row_kinds(model: &Qwen35Model) -> Option<(&'static str, &'static str)
 #[allow(dead_code)]
 const BASELINE_STUB: &str = r#"
 fn host_syncs_now() -> Option<u64> {
+    None
+}
+
+fn replay_forwards(_stats: &SpeculativeStats) -> Option<u64> {
     None
 }
 
@@ -466,6 +484,7 @@ fn step_model_row(
     Option<(u64, u64)>,
     Option<(u64, u64)>,
     Option<(&'static str, &'static str)>,
+    &'static str,
 ) {
     unreachable!("the step_model row is not available on the pre-epic baseline")
 }
@@ -485,6 +504,7 @@ type SpeculativeRow = (
     f64,
     Option<(&'static str, &'static str)>,
     Option<f64>,
+    &'static str,
     Option<(u64, u64, u64)>,
 );
 
@@ -522,7 +542,8 @@ fn mtp_row(
     .expect("mtp generation");
     device.synchronize().unwrap();
     let decode_secs = decode_started.unwrap().elapsed().as_secs_f64();
-    (out, stats, prefill_secs, decode_secs, None, None, None)
+    // No record on the baseline: the loop is the MTP loop by construction.
+    (out, stats, prefill_secs, decode_secs, None, None, "mtp", None)
 }
 
 fn ngram_row(
@@ -678,6 +699,8 @@ fn row_json(
     recovery: Option<(u64, u64, u64)>,
     fused_primitives: Option<Value>,
     nvfp4_projections: Option<Value>,
+    proposer: Option<&str>,
+    replay_forwards: Option<u64>,
 ) -> Value {
     let generated = out.tokens.len() as u64;
     let ratio = |num: Option<u64>, den: u64| -> Value {
@@ -700,12 +723,6 @@ fn row_json(
     };
     let diverged = reference.map(|r| divergence(r, &out.tokens));
     let matches = diverged.map(|d| d.is_none());
-    let proposer = match path {
-        "mtp" => Some("mtp"),
-        "ngram" => Some("ngram"),
-        "reference" | "step_model" => Some("none"),
-        _ => None,
-    };
     json!({
         "path": path,
         "mtp_drafts": if path == "mtp" { drafts } else { None },
@@ -714,7 +731,6 @@ fn row_json(
         "host_syncs_per_verify_step": syncs_per_verify_step,
         "verify_steps": recovery.map(|(v, _, _)| v),
         "direct_rollbacks": recovery.map(|(_, d, _)| d),
-        "replay_fallbacks": recovery.map(|(_, _, r)| r),
         "target_forwards_per_verify_step": forwards_per_verify,
         "generated_tokens": generated,
         "prefill_seconds": prefill_secs,
@@ -724,6 +740,7 @@ fn row_json(
         "proposed_tokens": proposed,
         "accepted_tokens": accepted,
         "acceptance_rate": acceptance,
+        "replay_forwards": replay_forwards,
         "target_forwards_per_generated_token": ratio(forwards, generated),
         "host_syncs": host_syncs,
         "host_syncs_per_token": ratio(host_syncs, generated),
@@ -890,6 +907,8 @@ fn decode_bench() {
             None,
             fused,
             nvfp4,
+            Some("none"),
+            None,
         ));
         reference_tokens = Some(out.tokens);
     }
@@ -937,6 +956,8 @@ fn decode_bench() {
             None,
             fused,
             nvfp4,
+            Some("none"),
+            None,
         ));
         if reference_tokens.is_none() {
             reference_tokens = Some(out.tokens);
@@ -986,6 +1007,8 @@ fn decode_bench() {
             None,
             fused,
             nvfp4,
+            Some("none"),
+            None,
         ));
         if reference_tokens.is_none() {
             reference_tokens = Some(out.tokens);
@@ -997,7 +1020,7 @@ fn decode_bench() {
         let fused0 = fused_tally_now();
         let nv0 = nvfp4_tally_now();
         let mut at_last = None;
-        let (out, prefill, decode, record, cache, kinds) = step_model_row(
+        let (out, prefill, decode, record, cache, kinds, proposer) = step_model_row(
             &model,
             &prompt,
             &config,
@@ -1035,6 +1058,8 @@ fn decode_bench() {
             None,
             fused,
             nvfp4,
+            Some(proposer),
+            None,
         ));
         if reference_tokens.is_none() {
             reference_tokens = Some(out.tokens);
@@ -1049,7 +1074,7 @@ fn decode_bench() {
             let fused0 = fused_tally_now();
             let nv0 = nvfp4_tally_now();
             let mut at_last = None;
-            let (out, stats, prefill, decode, kinds, per_verify, recovery) = mtp_row(
+            let (out, stats, prefill, decode, kinds, per_verify, proposer, recovery) = mtp_row(
                 &model,
                 mtp,
                 &prompt,
@@ -1092,6 +1117,8 @@ fn decode_bench() {
                 recovery,
                 fused,
                 nvfp4,
+                Some(proposer),
+                replay_forwards(&stats),
             ));
         }
     }
@@ -1107,7 +1134,7 @@ fn decode_bench() {
             let fused0 = fused_tally_now();
             let nv0 = nvfp4_tally_now();
             let mut at_last = None;
-            let (out, stats, prefill, decode, kinds, per_verify, recovery) = ngram_row(
+            let (out, stats, prefill, decode, kinds, per_verify, proposer, recovery) = ngram_row(
                 &model,
                 &prompt,
                 &config,
@@ -1149,6 +1176,8 @@ fn decode_bench() {
                 recovery,
                 fused,
                 nvfp4,
+                Some(proposer),
+                replay_forwards(&stats),
             ));
         }
     }
