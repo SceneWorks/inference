@@ -1,0 +1,68 @@
+{
+  "hardware": "RTX Pro 6000 / sm_120",
+  "vocab": 248320,
+  "logits_dtype": "bf16",
+  "note": "one full `sample` call per token, including the id sync",
+  "rows": [
+    {
+      "logits": "flat",
+      "sampling": "temperature",
+      "device_sampler_us_per_token": 320.94,
+      "host_reference_us_per_token": 1491.182
+    },
+    {
+      "logits": "flat",
+      "sampling": "temperature_top_p",
+      "device_sampler_us_per_token": 2501.275,
+      "host_reference_us_per_token": 15243.100333333332
+    },
+    {
+      "logits": "flat",
+      "sampling": "temperature_top_k",
+      "device_sampler_us_per_token": 929.4033333333333,
+      "host_reference_us_per_token": 2469.377
+    },
+    {
+      "logits": "flat",
+      "sampling": "temperature_top_k_top_p",
+      "device_sampler_us_per_token": 1971.4406666666664,
+      "host_reference_us_per_token": 2118.0319999999997
+    },
+    {
+      "logits": "flat",
+      "sampling": "greedy_argmax",
+      "device_sampler_us_per_token": 188.182
+    },
+    {
+      "logits": "peaked",
+      "sampling": "temperature",
+      "device_sampler_us_per_token": 347.9153333333333,
+      "host_reference_us_per_token": 1695.1156666666668
+    },
+    {
+      "logits": "peaked",
+      "sampling": "temperature_top_p",
+      "device_sampler_us_per_token": 853.4206666666666,
+      "host_reference_us_per_token": 2974.784666666667
+    },
+    {
+      "logits": "peaked",
+      "sampling": "temperature_top_k",
+      "device_sampler_us_per_token": 690.205,
+      "host_reference_us_per_token": 1355.288
+    },
+    {
+      "logits": "peaked",
+      "sampling": "temperature_top_k_top_p",
+      "device_sampler_us_per_token": 1202.17,
+      "host_reference_us_per_token": 2076.6123333333335
+    },
+    {
+      "logits": "peaked",
+      "sampling": "greedy_argmax",
+      "device_sampler_us_per_token": 200.71066666666667
+    }
+  ],
+  "story": "sc-24133",
+  "command": "cargo test --release --locked --features cuda -p candle-llm --test device_sampler -- --ignored --nocapture sampler_cost"
+}

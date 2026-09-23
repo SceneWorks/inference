@@ -33,7 +33,9 @@ pub use qwen_mtp::{
     generate_qwen35_mtp_timed, generate_qwen35_mtp_timed_with_stop, Qwen35MtpMultimodalPrompt,
     RewindableConstraintMask,
 };
-pub use record::{CountingDecode, DecodePath, DecodeRecord, RequestSpan};
+pub use record::{
+    CountingDecode, DecodePath, DecodeRecord, RequestSpan, SamplerTelemetry, SpanCounters,
+};
 pub use speculative::{
     generate_draft_speculative, generate_prompt_lookup, SpeculativeConfig, SpeculativeStats,
 };
