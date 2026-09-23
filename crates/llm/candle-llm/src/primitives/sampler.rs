@@ -3,6 +3,14 @@
 //! The Candle port of `mlx-llm`'s sampler (the union of the mlx-gen samplers): temperature + top-p +
 //! top-k + repetition/presence penalties, with greedy as the default.
 //!
+//! The host reference keeps `mlx-llm`'s math — the same weights, heap nucleus (mass accumulated in
+//! f64 on both backends since sc-24133) and inverse-CDF draw — with one deliberate difference: a
+//! degenerate stochastic row (a NaN logit, a `+inf` maximum, everything masked) still consumes one
+//! draw of the [`TokenRng`] before falling back to the argmax, so the host and device paths advance
+//! a seeded stream identically (`mlx-llm` returns the argmax without drawing). A temperature whose
+//! reciprocal is not a finite, non-zero scale (subnormal, `+inf`, NaN) never reaches the device
+//! kernel: it is routed to the host with [`HostSampleReason::DegenerateTemperature`].
+//!
 //! **Two implementations, one distribution** (epic sc-24128, story sc-24133):
 //!
 //! * the **host reference** ([`sample_host`]) — a stabilised, **unnormalised**
@@ -165,9 +173,35 @@ pub fn with_reference_sampler<T>(f: impl FnOnce() -> T) -> T {
 }
 
 /// Whether `device` has the device sampler for a `vocab`-wide row: a CUDA device in a
-/// `cuda`-feature build. CPU and Metal answer `false` and use the host reference.
+/// `cuda`-feature build whose sampler kernel compiled (NVRTC) and loaded. CPU and Metal answer
+/// `false` and use the host reference; so does a CUDA device whose kernel failed to compile or
+/// load — reported once with `tracing::warn!` and on every such draw as
+/// [`HostSampleReason::DeviceUnavailable`], never a hard error.
 pub fn device_sampler_available(device: &Device, vocab: usize) -> bool {
-    cfg!(feature = "cuda") && device.is_cuda() && (1..=DEVICE_SAMPLER_MAX_VOCAB).contains(&vocab)
+    device.is_cuda() && (1..=DEVICE_SAMPLER_MAX_VOCAB).contains(&vocab) && kernel_available(device)
+}
+
+#[cfg(feature = "cuda")]
+fn kernel_available(device: &Device) -> bool {
+    cuda::kernel_available(device)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn kernel_available(_: &Device) -> bool {
+    false
+}
+
+/// Whether a positive `temperature` has no usable finite, non-zero reciprocal: subnormal (`1/T`
+/// overflows to `+inf`), `+inf` (`1/T == 0`, and `(-inf) * 0` is NaN), or NaN. The device kernel
+/// cannot shape weights from such a scale (it does not handle NaN weights), so these requests take
+/// the host reference, which degenerates to the argmax (or, for `+inf`, the uniform draw over the
+/// finite logits) exactly as it always has.
+fn degenerate_temperature(temperature: f32) -> bool {
+    if temperature <= 0.0 {
+        return false; // greedy
+    }
+    let inv_t = 1.0 / temperature;
+    !inv_t.is_finite() || inv_t == 0.0
 }
 
 /// Where [`sample`] draws for `params` on `device` over a `vocab`-wide row, with or without a
@@ -185,6 +219,9 @@ pub fn sampler_path(
     }
     if params.temperature <= 0.0 {
         return SamplerPath::Device; // greedy: the on-device argmax, on every device
+    }
+    if degenerate_temperature(params.temperature) {
+        return SamplerPath::Host(HostSampleReason::DegenerateTemperature);
     }
     if REFERENCE_SAMPLER.with(Cell::get) {
         return SamplerPath::Host(HostSampleReason::Reference);
@@ -226,8 +263,7 @@ pub fn sample(
         SamplerPath::Device => {
             let row = logits.flatten_all()?.unsqueeze(0)?;
             let id = sample_device(&row, params, rng)?; // notes the device draw
-            note_host_sync(); // the chosen id: a 1-element device->host transfer
-            Ok(id.get(0)?.to_scalar::<u32>()? as i32)
+            Ok(read_token_id(&id.get(0)?)? as i32) // the chosen id: the one host sync
         }
         SamplerPath::Host(_) => {
             note_sampler_path(path);
@@ -248,7 +284,13 @@ pub fn sample(
 /// [`TokenRng::next_f32`], so a seed reproduces its draws.
 ///
 /// On a device without the kernel ([`device_sampler_available`] is `false`) the same selection
-/// rule runs on the host — the rows are copied, and the copy and the host path are counted.
+/// rule runs on the host — the rows are copied, and the copy and the host path are counted
+/// ([`HostSampleReason::DeviceUnavailable`]). A degenerate temperature (see [`sampler_path`]) takes
+/// that host rule on every device ([`HostSampleReason::DegenerateTemperature`]).
+///
+/// Every stochastic row consumes exactly one draw of `rng` on every path, including rows that
+/// degenerate to the argmax (a NaN logit, a `+inf` maximum, all `-inf`), so a seeded stream stays
+/// aligned whichever path each token took.
 pub fn sample_device(
     logits: &Tensor,
     params: &SamplingParams,
@@ -271,8 +313,13 @@ pub fn sample_device(
         }
         return Ok(rows.argmax(1)?);
     }
+    let reason = if degenerate_temperature(params.temperature) {
+        HostSampleReason::DegenerateTemperature
+    } else {
+        HostSampleReason::DeviceUnavailable
+    };
     #[cfg(feature = "cuda")]
-    if device_sampler_available(&device, vocab) {
+    if reason == HostSampleReason::DeviceUnavailable && device_sampler_available(&device, vocab) {
         let x = rows.to_dtype(DType::F32)?.contiguous()?;
         let ids = match rng.reserve_counter_draws(n_rows as u64) {
             Some(state) => cuda::sample_rows(&x, params, state, None)?,
@@ -296,14 +343,12 @@ pub fn sample_device(
         return Ok(ids);
     }
 
-    // No device kernel: the same index-order selection rule on the host.
+    // No device kernel (or a degenerate temperature): the same index-order rule on the host.
     let _ = vocab;
-    let host = rows.to_dtype(DType::F32)?.to_vec2::<f32>()?;
-    note_host_sync();
+    let host = read_logits_rows(&rows)?;
     let mut ids = Vec::with_capacity(n_rows);
     for row in &host {
-        note_logits_to_host();
-        note_sampler_path(SamplerPath::Host(HostSampleReason::DeviceUnavailable));
+        note_sampler_path(SamplerPath::Host(reason));
         ids.push(select_in_index_order(row, params, rng.next_f32()) as u32);
     }
     Ok(Tensor::from_vec(ids, n_rows, &device)?)
@@ -375,7 +420,11 @@ pub fn sample_host(
     let weights = nucleus_weights(&v, params);
     let total: f32 = weights.iter().map(|x| x.1).sum();
     if total <= 0.0 || !total.is_finite() {
-        return Ok(argmax_host(&v)); // everything masked / -inf; deterministic fallback
+        // Everything masked / -inf, a NaN, or a +inf maximum: the deterministic argmax fallback.
+        // It still consumes this token's draw, as the device sampler does (which reserves one
+        // draw per row before it sees the row), so a seeded stream stays aligned across paths.
+        let _ = rng.next_f32();
+        return Ok(argmax_host(&v));
     }
 
     // Categorical inverse-CDF draw over the (unnormalised) weights.
@@ -419,12 +468,9 @@ fn penalized_logits(
     params: &SamplingParams,
     allowed: Option<&[bool]>,
 ) -> Result<Vec<f32>> {
-    note_host_sync(); // whole-vocab device->host transfer
-    note_logits_to_host();
-    let mut v: Vec<f32> = logits
-        .flatten_all()?
-        .to_dtype(DType::F32)?
-        .to_vec1::<f32>()?;
+    let mut v: Vec<f32> = read_logits_rows(&logits.flatten_all()?.unsqueeze(0)?)?
+        .pop()
+        .unwrap_or_default();
 
     // Constraint mask: forbid disallowed ids.
     if let Some(mask) = allowed {
@@ -498,8 +544,29 @@ fn nucleus_weights(v: &[f32], params: &SamplingParams) -> Vec<(usize, f32)> {
 pub fn argmax_device(logits: &Tensor) -> Result<i32> {
     let flat = logits.flatten_all()?;
     let idx = flat.argmax(0)?;
-    note_host_sync(); // 1-element device->host transfer
-    Ok(idx.to_scalar::<u32>()? as i32)
+    Ok(read_token_id(&idx)? as i32)
+}
+
+// Every device->host read in this module goes through the two counted helpers below, so the
+// per-request counters (`host_syncs`, `logits_to_host`) cannot miss a transfer made here. The
+// `host_reads_go_through_the_counted_helpers` test scans this file and fails on a raw
+// `to_vec*` / `to_scalar` call anywhere else.
+
+/// Read one token id (a scalar `u32` tensor) to the host: one counted host sync.
+fn read_token_id(id: &Tensor) -> Result<u32> {
+    note_host_sync();
+    Ok(id.to_scalar::<u32>()?)
+}
+
+/// Read a `[rows, vocab]` logits tensor to host f32: one counted host sync, and one counted
+/// logits-row copy per row.
+fn read_logits_rows(rows: &Tensor) -> Result<Vec<Vec<f32>>> {
+    note_host_sync();
+    let host = rows.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+    for _ in &host {
+        note_logits_to_host();
+    }
+    Ok(host)
 }
 
 /// Host-side argmax over an f32 slice; first maximum wins (ties → lowest index).
@@ -524,8 +591,19 @@ fn weight_desc_index_asc(a: (usize, f32), b: (usize, f32)) -> Ordering {
 /// `top_p * total`, always keeping at least one. Ties break to lower index. The mass is accumulated
 /// in f64 (sc-24133): an f32 running sum over a wide vocabulary drifts by more than a tail token's
 /// weight, which moved the nucleus boundary by rounding alone (on a 5000-token row the f32 sum
-/// crossed the threshold one token early, 5e-6 of the mass before the exact crossing). The device
-/// sampler sums in exact fixed point.
+/// crossed the threshold one token early, 5e-6 of the mass before the exact crossing). `mlx-llm`'s
+/// `nucleus_select` accumulates in f64 the same way.
+///
+/// **Device divergence at the boundary (documented tolerance).** The device sampler finds the same
+/// threshold from its own `expf` weights truncated to fixed point (`floor(w * 2^40)`, so its mass
+/// is short by at most `vocab * 2^-40`) and a `ceil` over the tie run; this function sums the f32
+/// weights in f64. When the descending prefix mass lands within that rounding gap (plus an `expf`
+/// ulp per weight) of `top_p * total`, the two kept-sets can differ by the tokens inside the gap:
+/// one token whenever the boundary tokens weigh more than the gap (every realistic row, where the
+/// gap is ~1e-7 of the mass or less), and none when the boundary is exact in both arithmetics
+/// (e.g. equal weights of `1.0` with `top_p * count` an integer). The CUDA test
+/// `nucleus_boundary_divergence_is_at_most_one_token` pins exactly that: equal kept-set sizes on
+/// exact boundaries, `|device - host| <= 1` on boundaries placed at the rounding edge.
 fn nucleus_select(weights: &[(usize, f32)], top_p: f32) -> Vec<(usize, f32)> {
     let total: f64 = weights.iter().map(|x| f64::from(x.1)).sum();
     let threshold = f64::from(top_p.max(0.0)) * total;
@@ -598,6 +676,43 @@ mod cuda {
         }
     }
 
+    #[cfg(test)]
+    thread_local! {
+        /// Test hook: make this thread see the kernel as failed to compile/load.
+        pub(super) static FORCE_UNAVAILABLE: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// Whether the sampler kernel is compiled and loaded on `device`. The PTX compile is cached
+    /// process-wide and the module per device (Candle's custom-function cache), so after the first
+    /// call this is a cache lookup. A failure is logged once (`tracing::warn!`) and the caller routes
+    /// to the host with [`super::HostSampleReason::DeviceUnavailable`].
+    pub(super) fn kernel_available(device: &Device) -> bool {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let loaded = (|| -> candle_core::Result<()> {
+            #[cfg(test)]
+            if FORCE_UNAVAILABLE.with(std::cell::Cell::get) {
+                candle_core::bail!("sampler kernel forced unavailable (test hook)");
+            }
+            let dev = device.as_cuda_device()?;
+            dev.get_or_load_custom_func("candle_llm_sample_rows_f32", MODULE, ptx()?)?;
+            Ok(())
+        })();
+        match loaded {
+            Ok(()) => true,
+            Err(error) => {
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        %error,
+                        "candle-llm device sampler kernel unavailable; temperature/top-k/top-p \
+                         requests fall back to the host reference (host:device_unavailable)"
+                    );
+                }
+                false
+            }
+        }
+    }
+
     struct SampleRows {
         inv_t: f32,
         top_k: u32,
@@ -652,15 +767,18 @@ mod cuda {
         }
     }
 
-    /// Token ids `u32 [rows]` for contiguous f32 `x: [rows, vocab]` on a CUDA device.
+    /// Token ids `u32 [rows]` for contiguous f32 `x: [rows, vocab]` on a CUDA device. The caller
+    /// has routed degenerate temperatures (`1/T` not finite and non-zero) to the host.
     pub(super) fn sample_rows(
         x: &Tensor,
         params: &SamplingParams,
         state: u64,
         u_override: Option<f32>,
     ) -> Result<Tensor> {
+        let inv_t = 1.0 / params.temperature;
+        debug_assert!(inv_t.is_finite() && inv_t > 0.0, "degenerate temperature");
         let op = SampleRows {
-            inv_t: 1.0 / params.temperature,
+            inv_t,
             top_k: u32::try_from(params.top_k).unwrap_or(u32::MAX),
             top_p: params.top_p,
             state,
@@ -766,6 +884,171 @@ mod tests {
             sampler_path(&Device::Cpu, 8, &SamplingParams::default(), false)
         });
         assert_eq!(greedy, SamplerPath::Device, "greedy is unaffected");
+    }
+
+    #[test]
+    fn degenerate_temperatures_route_to_the_host_with_a_named_reason() {
+        let degenerate = [1e-39_f32, f32::INFINITY, f32::NAN];
+        for temperature in degenerate {
+            let params = SamplingParams {
+                temperature,
+                top_p: 0.9,
+                ..Default::default()
+            };
+            assert_eq!(
+                sampler_path(&Device::Cpu, 8, &params, false),
+                SamplerPath::Host(HostSampleReason::DegenerateTemperature),
+                "T = {temperature:e}"
+            );
+        }
+        for temperature in [0.7_f32, 1e-30, 1e30] {
+            assert!(!degenerate_temperature(temperature), "T = {temperature:e}");
+        }
+        // A subnormal temperature is the T -> 0 limit: the argmax, on both host entry points,
+        // reported as the degenerate-temperature host path, one draw consumed per token.
+        let tiny = SamplingParams {
+            temperature: 1e-39,
+            ..Default::default()
+        };
+        let l = logits(&[0.1, 5.0, 0.2, -1.0]);
+        let mut rng = SplitMix64::new(9);
+        assert_eq!(sample(&l, &[], &tiny, &mut rng, None).unwrap(), 1);
+        assert_eq!(
+            crate::primitives::last_host_reason(),
+            Some(HostSampleReason::DegenerateTemperature)
+        );
+        assert_eq!(rng.state(), 9u64.wrapping_add(SplitMix64::INCREMENT));
+        let ids = sample_device(&l, &tiny, &mut rng).unwrap();
+        assert_eq!(ids.to_vec1::<u32>().unwrap(), vec![1]);
+        assert_eq!(
+            crate::primitives::last_host_reason(),
+            Some(HostSampleReason::DegenerateTemperature)
+        );
+        // T = +inf: the uniform limit over the finite logits (never a NaN-driven pick).
+        let huge = SamplingParams {
+            temperature: f32::INFINITY,
+            ..Default::default()
+        };
+        for _ in 0..50 {
+            let id = sample(&l, &[], &huge, &mut rng, None).unwrap();
+            assert!((0..4).contains(&id), "{id}");
+        }
+    }
+
+    #[test]
+    fn degenerate_rows_consume_one_draw_on_every_host_path() {
+        let params = SamplingParams {
+            temperature: 0.9,
+            top_p: 0.9,
+            ..Default::default()
+        };
+        let rows: [&[f32]; 3] = [
+            &[0.0, 3.0, f32::NAN, 1.0],
+            &[0.0, f32::INFINITY, 1.0, 2.0],
+            &[f32::NEG_INFINITY; 4],
+        ];
+        for row in rows {
+            let l = logits(row);
+            let mut host = SplitMix64::new(21);
+            let mut portable = SplitMix64::new(21);
+            let a = sample_host(&l, &[], &params, &mut host, None).unwrap();
+            let b = sample_device(&l, &params, &mut portable).unwrap();
+            assert_eq!(a, argmax_host(row), "{row:?}");
+            assert_eq!(b.to_vec1::<u32>().unwrap(), vec![a as u32], "{row:?}");
+            let one_draw = 21u64.wrapping_add(SplitMix64::INCREMENT);
+            assert_eq!(host.state(), one_draw, "sample_host drew once: {row:?}");
+            assert_eq!(
+                portable.state(),
+                one_draw,
+                "sample_device drew once: {row:?}"
+            );
+        }
+    }
+
+    /// The AC2 counters only see transfers made through `read_token_id` / `read_logits_rows`, so
+    /// this module must not read a tensor to the host any other way.
+    #[test]
+    fn host_reads_go_through_the_counted_helpers() {
+        const HELPERS: [&str; 2] = ["read_token_id", "read_logits_rows"];
+        const RAW_READS: [&str; 5] = [".to_vec0", ".to_vec1", ".to_vec2", ".to_vec3", ".to_scalar"];
+        let source = include_str!("sampler.rs");
+        let tests_at = source
+            .find("#[cfg(test)]\nmod tests {")
+            .or_else(|| source.find("#[cfg(test)]\r\nmod tests {"))
+            .expect("the tests module marker");
+        let code = &source[..tests_at];
+        let mut current_fn = String::new();
+        let mut raw = Vec::new();
+        for (n, line) in code.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if let Some(at) = trimmed.find("fn ") {
+                let head = &trimmed[..at];
+                if head.is_empty() || head.ends_with("pub ") || head.ends_with(") ") {
+                    current_fn = trimmed[at + 3..]
+                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                }
+            }
+            if RAW_READS.iter().any(|r| line.contains(r)) && !HELPERS.contains(&current_fn.as_str())
+            {
+                raw.push(format!(
+                    "line {}: in fn {current_fn}: {}",
+                    n + 1,
+                    line.trim()
+                ));
+            }
+        }
+        assert!(
+            raw.is_empty(),
+            "raw host reads bypass the counters:\n{}",
+            raw.join("\n")
+        );
+        let body = |name: &str| {
+            let start = code.find(&format!("fn {name}(")).expect(name);
+            let rest = &code[start..];
+            let end = rest.find("\n}").expect("fn end");
+            &rest[..end]
+        };
+        assert!(body("read_token_id").contains("note_host_sync();"));
+        let rows = body("read_logits_rows");
+        assert!(rows.contains("note_host_sync();"));
+        assert!(rows.contains("note_logits_to_host();"));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_failed_kernel_routes_to_the_host_as_device_unavailable() {
+        let gpu = Device::new_cuda(0).expect("the cuda lane runs on a CUDA device");
+        let params = SamplingParams {
+            temperature: 0.8,
+            top_p: 0.9,
+            ..Default::default()
+        };
+        assert_eq!(sampler_path(&gpu, 64, &params, false), SamplerPath::Device);
+        cuda::FORCE_UNAVAILABLE.with(|c| c.set(true));
+        let path = sampler_path(&gpu, 64, &params, false);
+        let before = crate::primitives::sampler_counters();
+        let l = Tensor::from_vec(vec![0.5f32; 64], (1, 64), &gpu).unwrap();
+        let mut rng = SplitMix64::new(3);
+        let drawn = sample(&l, &[], &params, &mut rng, None);
+        let batched = sample_device(&l, &params, &mut rng);
+        cuda::FORCE_UNAVAILABLE.with(|c| c.set(false));
+        assert_eq!(path, SamplerPath::Host(HostSampleReason::DeviceUnavailable));
+        assert!((0..64).contains(&drawn.unwrap()), "the host path answered");
+        assert_eq!(batched.unwrap().dims(), &[1]);
+        let after = crate::primitives::sampler_counters();
+        assert_eq!(after.device_draws, before.device_draws);
+        assert_eq!(after.host_draws - before.host_draws, 2);
+        assert_eq!(after.logits_to_host - before.logits_to_host, 2);
+        assert_eq!(
+            crate::primitives::last_host_reason(),
+            Some(HostSampleReason::DeviceUnavailable)
+        );
     }
 
     #[test]

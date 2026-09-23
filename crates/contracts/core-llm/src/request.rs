@@ -213,8 +213,13 @@ pub enum HostSampleReason {
     /// A grammar / JSON constraint mask is applied on the host.
     Constraint,
     /// The backend has no device sampler for this device (CPU, a build without the accelerator
-    /// feature, or a shape the device kernel does not serve).
+    /// feature, a shape the device kernel does not serve, or a sampler kernel that failed to
+    /// compile or load on this device).
     DeviceUnavailable,
+    /// The temperature is positive but its reciprocal is not a usable finite scale (a subnormal
+    /// temperature, `+inf`, or NaN): the device kernel cannot shape weights from it, so the host
+    /// reference handles the request.
+    DegenerateTemperature,
     /// Speculative acceptance needs the full shaped distribution on the host.
     SpeculativeDistribution,
     /// The caller forced the host reference sampler (parity checks and benchmarks).
@@ -228,6 +233,7 @@ impl HostSampleReason {
             HostSampleReason::Penalty => "penalty",
             HostSampleReason::Constraint => "constraint",
             HostSampleReason::DeviceUnavailable => "device_unavailable",
+            HostSampleReason::DegenerateTemperature => "degenerate_temperature",
             HostSampleReason::SpeculativeDistribution => "speculative_distribution",
             HostSampleReason::Reference => "reference",
         }
@@ -350,6 +356,10 @@ mod tests {
         assert_eq!(
             SamplerPath::Host(HostSampleReason::DeviceUnavailable).label(),
             "host"
+        );
+        assert_eq!(
+            SamplerPath::Host(HostSampleReason::DegenerateTemperature).to_string(),
+            "host:degenerate_temperature"
         );
     }
 

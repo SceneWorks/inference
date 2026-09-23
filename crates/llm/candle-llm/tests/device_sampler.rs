@@ -235,16 +235,119 @@ fn configs() -> Vec<(&'static str, SamplingParams)> {
     ]
 }
 
+/// The `top_k` that cuts the exact tie of `fixed_logits` in half: index 3 is the k-th largest
+/// weight and index 11 (equal weight, higher index) the (k+1)-th, so the kernel's index cutoff
+/// among equal keys decides — a draw of token 11 fails the support check.
+fn tie_cut_k(vocab: usize) -> usize {
+    match vocab {
+        64 => 10,
+        5_000 => 16,
+        _ => panic!("no tie-cut k for vocab {vocab}"),
+    }
+}
+
+/// The eight indices of `tie_run_logits`' run of equal logits, spread over the row so different
+/// threads' index segments own them.
+fn tie_run_indices(vocab: usize) -> Vec<usize> {
+    (0..8).map(|j| 1 + j * (vocab - 2) / 8).collect()
+}
+
+/// One dominant token (the last index, weight 1), a run of eight exactly equal logits two below it
+/// (weight e^-2 each), and a tail ~12 below. Top-p 0.7 puts the nucleus threshold inside the run
+/// (the prefix needs 4 of the 8 ties, by index); top-k 5 likewise keeps 4 of them.
+fn tie_run_logits(vocab: usize) -> Vec<f32> {
+    let mut v: Vec<f32> = (0..vocab)
+        .map(|i| -8.0 - 0.5 * ((i as f32) * 0.37).sin())
+        .collect();
+    for i in tie_run_indices(vocab) {
+        v[i] = 2.0;
+    }
+    v[vocab - 1] = 4.0;
+    v
+}
+
+/// Every AC1 case at `vocab`: the shared configs on `fixed_logits`, the top-k tie cut, and the
+/// top-p / top-k thresholds landing inside a run of equal weights.
+fn cases(vocab: usize) -> Vec<(String, Vec<f32>, SamplingParams)> {
+    let logits = fixed_logits(vocab);
+    let mut out: Vec<(String, Vec<f32>, SamplingParams)> = configs()
+        .into_iter()
+        .map(|(name, params)| (name.to_string(), logits.clone(), params))
+        .collect();
+    let base = SamplingParams {
+        temperature: 1.0,
+        ..Default::default()
+    };
+    out.push((
+        "top_k_tie_cut".into(),
+        logits,
+        SamplingParams {
+            top_k: tie_cut_k(vocab),
+            ..base
+        },
+    ));
+    let run = tie_run_logits(vocab);
+    out.push((
+        "top_p_inside_tie_run".into(),
+        run.clone(),
+        SamplingParams { top_p: 0.7, ..base },
+    ));
+    out.push((
+        "top_k_inside_tie_run".into(),
+        run,
+        SamplingParams { top_k: 5, ..base },
+    ));
+    out
+}
+
 const DRAWS: u64 = 100_000;
 const P_FLOOR: f64 = 0.01;
+
+/// The tie cases test what they claim: the host reference keeps index 3 and drops index 11 at the
+/// tie-cut k, and keeps exactly the four lowest-index members of the tie run (plus the dominant
+/// token) under both the top-p and the top-k threshold.
+#[test]
+fn tie_cases_split_their_ties_in_the_reference() {
+    for vocab in [64usize, 5_000] {
+        let cut = SamplingParams {
+            temperature: 1.0,
+            top_k: tie_cut_k(vocab),
+            ..Default::default()
+        };
+        let probs = reference_probs(&fixed_logits(vocab), &cut);
+        assert!(probs.contains_key(&3), "V={vocab}: tie index 3 kept");
+        assert!(!probs.contains_key(&11), "V={vocab}: tie index 11 cut");
+
+        let run = tie_run_indices(vocab);
+        let mut want: Vec<i32> = run[..4].iter().map(|&i| i as i32).collect();
+        want.push(vocab as i32 - 1);
+        for params in [
+            SamplingParams {
+                temperature: 1.0,
+                top_p: 0.7,
+                ..Default::default()
+            },
+            SamplingParams {
+                temperature: 1.0,
+                top_k: 5,
+                ..Default::default()
+            },
+        ] {
+            let mut kept: Vec<i32> = reference_probs(&tie_run_logits(vocab), &params)
+                .into_keys()
+                .collect();
+            kept.sort_unstable();
+            assert_eq!(kept, want, "V={vocab} {params:?}");
+        }
+    }
+}
 
 /// The reference sampler through the same test: proves the statistic and the expected
 /// distribution are right, so a device pass means something.
 #[test]
 fn ac1_host_reference_passes_its_own_chi_square() {
-    let logits = fixed_logits(64);
-    let t = Tensor::from_vec(logits.clone(), (1, logits.len()), &Device::Cpu).unwrap();
-    for (name, params) in configs() {
+    for (name, logits, params) in cases(64) {
+        let t = Tensor::from_vec(logits.clone(), (1, logits.len()), &Device::Cpu).unwrap();
         let probs = reference_probs(&logits, &params);
         let mut rng = SplitMix64::new(0x5eed);
         let draws = (0..DRAWS).map(|_| sample_host(&t, &[], &params, &mut rng, None).unwrap());
@@ -257,9 +360,8 @@ fn ac1_host_reference_passes_its_own_chi_square() {
 /// The portable selection rule `sample_device` falls back to off-CUDA (index-order walk).
 #[test]
 fn ac1_portable_selection_rule_matches_the_host_distribution() {
-    let logits = fixed_logits(64);
-    let t = Tensor::from_vec(logits.clone(), (1, logits.len()), &Device::Cpu).unwrap();
-    for (name, params) in configs() {
+    for (name, logits, params) in cases(64) {
+        let t = Tensor::from_vec(logits.clone(), (1, logits.len()), &Device::Cpu).unwrap();
         let probs = reference_probs(&logits, &params);
         let mut rng = SplitMix64::new(0xc0ffee);
         let draws = (0..DRAWS).map(|_| {
@@ -535,8 +637,7 @@ mod cuda {
     #[test]
     fn ac1_device_sampler_matches_the_host_distribution() {
         for vocab in [64usize, 5_000] {
-            let logits = fixed_logits(vocab);
-            for (name, params) in configs() {
+            for (name, logits, params) in cases(vocab) {
                 let probs = reference_probs(&logits, &params);
                 let draws = device_draws_batched(&logits, &params, 0xace1);
                 let (p, bins) = chi_square_p(&tally(draws), &probs, DRAWS);
@@ -664,15 +765,30 @@ mod cuda {
                 7,
             ),
         ];
-        let mut rng = SplitMix64::new(3);
+        // Separate, identically seeded streams: every degenerate row consumes exactly one draw
+        // on the device path and on the host reference, so the streams stay in lockstep.
+        let mut dev_rng = SplitMix64::new(3);
+        let mut host_rng = SplitMix64::new(3);
         for (row, want) in cases {
             let t = Tensor::from_vec(row.clone(), (1, row.len()), &device).unwrap();
             let host = Tensor::from_vec(row.clone(), (1, row.len()), &Device::Cpu).unwrap();
-            let got = sample(&t, &[], &params, &mut rng, None).unwrap();
-            let reference = sample_host(&host, &[], &params, &mut rng, None).unwrap();
+            let before = dev_rng.state();
+            let got = sample(&t, &[], &params, &mut dev_rng, None).unwrap();
+            let reference = sample_host(&host, &[], &params, &mut host_rng, None).unwrap();
             assert_eq!(got, want);
             assert_eq!(reference, want, "host reference agrees");
+            assert_eq!(
+                dev_rng.state(),
+                before.wrapping_add(SplitMix64::INCREMENT),
+                "the device path consumed one draw"
+            );
+            assert_eq!(
+                host_rng.state(),
+                dev_rng.state(),
+                "the host reference consumed the same draw"
+            );
         }
+        let mut rng = dev_rng;
         // top_k = 1 and top_p = 0 are the argmax; ties go to the lower index.
         let mut row = fixed_logits(3_000);
         row[2_900] = 50.0;
@@ -694,6 +810,126 @@ mod cuda {
                 assert_eq!(sample(&t, &[], &params, &mut rng, None).unwrap(), 2_900);
             }
         }
+    }
+
+    /// A temperature with no finite, non-zero reciprocal never reaches the kernel (which cannot
+    /// shape NaN weights): it takes the host reference, labelled `host:degenerate_temperature`.
+    #[test]
+    fn degenerate_temperatures_take_the_host_reference_on_cuda() {
+        let device = gpu();
+        let mut row = vec![f32::NEG_INFINITY; 2_000];
+        for (i, x) in [(5usize, 1.0f32), (700, 3.0), (1_500, 2.0)] {
+            row[i] = x;
+        }
+        let t = Tensor::from_vec(row, (1, 2_000), &device).unwrap();
+        for temperature in [1e-39_f32, f32::INFINITY, f32::NAN] {
+            let params = SamplingParams {
+                temperature,
+                top_p: 0.9,
+                ..Default::default()
+            };
+            assert_eq!(
+                sampler_path(&device, 2_000, &params, false),
+                SamplerPath::Host(HostSampleReason::DegenerateTemperature),
+                "T = {temperature:e}"
+            );
+            let mut rng = SplitMix64::new(8);
+            let id = sample(&t, &[], &params, &mut rng, None).unwrap();
+            let batched = sample_device(&t, &params, &mut rng).unwrap();
+            let batched = batched.to_vec1::<u32>().unwrap()[0] as i32;
+            // 1e-39 is the T -> 0 limit; +inf and NaN weights meet a -inf logit (-inf * 0 is
+            // NaN), which the host reference resolves to the argmax as it always has.
+            assert_eq!(id, 700, "T = {temperature:e}");
+            assert_eq!(batched, 700, "T = {temperature:e}");
+            assert_eq!(
+                candle_llm::primitives::last_host_reason(),
+                Some(HostSampleReason::DegenerateTemperature)
+            );
+        }
+    }
+
+    /// Top-p boundaries placed exactly on, and at the rounding edge of, the nucleus threshold:
+    /// the device kept-set (every token a batch of seeded draws lands on) against the host
+    /// reference's (`shaped_candidates`). Exact boundaries must agree exactly; rounding-edge ones
+    /// may differ by the documented one token (`nucleus_select`, `sampler_cuda.cu` header).
+    #[test]
+    fn nucleus_boundary_divergence_is_at_most_one_token() {
+        const V: usize = 2_000;
+        const N: usize = 20_000;
+        let device = gpu();
+        let kept_on_device = |logits: &[f32], params: &SamplingParams| -> usize {
+            let row = Tensor::from_vec(logits.to_vec(), (1, V), &device).unwrap();
+            let rows = row.broadcast_as((N, V)).unwrap().contiguous().unwrap();
+            let mut ids = sample_device(&rows, params, &mut SplitMix64::new(0xb0))
+                .unwrap()
+                .to_vec1::<u32>()
+                .unwrap();
+            ids.sort_unstable();
+            ids.dedup();
+            ids.len()
+        };
+        let kept_on_host = |logits: &[f32], params: &SamplingParams| -> usize {
+            let t = Tensor::from_vec(logits.to_vec(), (1, V), &Device::Cpu).unwrap();
+            shaped_candidates(&t, &[], params, None).unwrap().len()
+        };
+        let spread = |count: usize| (0..count).map(move |j| 3 + j * (V - 7) / count);
+
+        // Exact in both arithmetics: `count` weights of exactly 1.0 (logit 0, the rest -inf) and
+        // top_p * count an integer, so both sides stop at exactly `j` tokens.
+        for count in [4usize, 8] {
+            let mut logits = vec![f32::NEG_INFINITY; V];
+            for i in spread(count) {
+                logits[i] = 0.0;
+            }
+            for j in 1..count {
+                let params = SamplingParams {
+                    temperature: 1.0,
+                    top_p: j as f32 / count as f32,
+                    ..Default::default()
+                };
+                let host = kept_on_host(&logits, &params);
+                let dev = kept_on_device(&logits, &params);
+                assert_eq!(host, j, "host, {j}/{count}");
+                assert_eq!(
+                    dev, host,
+                    "exact boundary {j}/{count}: device {dev}, host {host}"
+                );
+            }
+        }
+
+        // At the rounding edge: top_p set to each descending prefix's exact share of the host
+        // mass, and one f32 ulp either side of it.
+        let mut logits = vec![f32::NEG_INFINITY; V];
+        let values = [0.0f32, -0.3, -0.7, -1.1, -1.6, -2.2];
+        for (i, x) in spread(values.len()).zip(values) {
+            logits[i] = x;
+        }
+        let weights: Vec<f64> = values.iter().map(|&x| f64::from(x.exp())).collect();
+        let total: f64 = weights.iter().sum();
+        let (mut edges, mut equal) = (0usize, 0usize);
+        for j in 1..values.len() {
+            let share = (weights[..j].iter().sum::<f64>() / total) as f32;
+            for top_p in [
+                f32::from_bits(share.to_bits() - 1),
+                share,
+                f32::from_bits(share.to_bits() + 1),
+            ] {
+                let params = SamplingParams {
+                    temperature: 1.0,
+                    top_p,
+                    ..Default::default()
+                };
+                let host = kept_on_host(&logits, &params);
+                let dev = kept_on_device(&logits, &params);
+                assert!(
+                    host.abs_diff(dev) <= 1,
+                    "prefix {j}, top_p {top_p:e}: device kept {dev}, host kept {host}"
+                );
+                edges += 1;
+                equal += usize::from(host == dev);
+            }
+        }
+        eprintln!("[nucleus boundary] rounding-edge cases: {equal}/{edges} identical, rest +-1");
     }
 
     #[test]
@@ -962,8 +1198,23 @@ fn ac2_qwen38_temperature_top_p_decodes_without_logits_copies() {
             "decode_tokens_per_second": record.generated_tokens as f64 / secs,
         })
     };
+    // The code the row was measured at: HEAD, and whether tracked files had uncommitted changes.
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let commit = git(&["rev-parse", "HEAD"]).expect("git rev-parse HEAD");
+    let dirty = git(&["status", "--porcelain", "--untracked-files=no"])
+        .map(|s| !s.is_empty())
+        .unwrap_or(true);
     let evidence = json!({
         "story": "sc-24133",
+        "commit": commit,
+        "worktree_dirty": dirty,
         "hardware": "RTX Pro 6000 / sm_120",
         "model": "Qwen3.8-27B",
         "snapshot": snapshot.file_name().map(|s| s.to_string_lossy().into_owned()),

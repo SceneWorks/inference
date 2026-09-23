@@ -8,7 +8,20 @@
 // (`primitives::sampler::sample_host`): w_i = exp((x_i - max) / T); top-k keeps the k largest
 // weights, ties to the lower index; top-p keeps the shortest descending prefix whose mass reaches
 // top_p * total, ties to the lower index, at least one token; any NaN logit or a non-finite max
-// falls back to the argmax (first maximum), as the host does.
+// falls back to the argmax (first maximum), as the host does. Every row consumes exactly one draw
+// of the stream (row r uses draw r) whether or not it degenerates to the argmax; the host
+// reference consumes one draw on a degenerate row too, so seeded streams stay aligned.
+//
+// The caller guarantees 0 < inv_t < +inf (degenerate temperatures are routed to the host): a NaN
+// weight would rank above every real one in `key_of` and `fixed_of(NaN)` is undefined.
+//
+// Top-p boundary vs the host reference (documented tolerance, see `nucleus_select`): the nucleus
+// threshold here is `top_p * mass` over weights truncated to fixed point (`floor(w * 2^40)`, from
+// this device's `expf`), and the tie count is a double `ceil`; the host sums its f32 weights in
+// f64. When the descending prefix lands within that rounding gap (<= vocab * 2^-40 of mass plus an
+// expf ulp per weight) of the threshold, the kept sets can differ by the tokens inside the gap -
+// one token on any row whose boundary tokens outweigh the gap, none on boundaries that are exact in
+// both arithmetics. `tests/device_sampler.rs::nucleus_boundary_divergence_is_at_most_one_token`.
 //
 // NVRTC is invoked with no SDK include paths, so this source is self-contained.
 
