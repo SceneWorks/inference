@@ -7,6 +7,9 @@
 //!   names the cache that ran.
 //! * **AC3 (real weights)** — the static buffers' CUDA device pointers are unchanged across the
 //!   whole 256-token run and a rollback.
+//! * **Teacher-forced characterization** — both paths fed the reference's own 256 tokens; reports
+//!   per-position argmax agreement, the max |Δlogit| and the reference's top-2 logit gap wherever
+//!   the argmax differs (a bf16-ULP tie), and gates on the logit tolerance.
 //!
 //! ```text
 //! BONSAI_QWEN38_SNAPSHOT=E:\...\snapshots\1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 \
@@ -186,5 +189,106 @@ fn ac3_static_kv_device_pointers_are_stable_across_the_fixture_and_a_rollback() 
         "[ac3] {} attention buffers pinned across {FIXTURE_TOKENS} steps and a rollback to {n}; \
          preallocated {preallocated} bytes",
         addresses.len()
+    );
+}
+
+/// Both paths fed the reference's own greedy tokens, position by position: where do the argmaxes
+/// differ, by how much do the logits differ, and how close was the reference's top-2 gap there?
+/// Gates on the logit tolerance the flash-attn path already carries (3e-2 on bf16 logits); the
+/// per-position report is the evidence for the AC1 decision when a knife-edge token flips.
+#[test]
+#[ignore = "needs the Qwen3.8-27B snapshot via BONSAI_QWEN38_SNAPSHOT and a GPU"]
+fn teacher_forced_static_vs_attn_kv_logit_parity_report() {
+    use candle_core::DType;
+    let snapshot = common::qwen35::snapshot_from_env(SNAPSHOT_VAR)
+        .unwrap_or_else(|| panic!("set {SNAPSHOT_VAR}"));
+    let device = select_device().unwrap();
+    let (model, _mtp) = common::qwen35::load(&snapshot, &device);
+    let prompt = common::qwen35::render_chat_prompt(&snapshot, PROMPT);
+    let reference = generate_with(
+        &model,
+        &prompt,
+        &greedy(FIXTURE_TOKENS),
+        &CancelFlag::new(),
+        &mut |_| {},
+        None,
+    )
+    .unwrap();
+    let host = |t: &candle_core::Tensor| -> Vec<f32> {
+        t.flatten_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    };
+    let top2 = |row: &[f32]| -> (usize, f32) {
+        let (mut best, mut second) = ((0usize, f32::NEG_INFINITY), f32::NEG_INFINITY);
+        for (i, &v) in row.iter().enumerate() {
+            if v > best.1 {
+                second = best.1;
+                best = (i, v);
+            } else if v > second {
+                second = v;
+            }
+        }
+        (best.0, best.1 - second)
+    };
+    let capacity = prompt.len() + FIXTURE_TOKENS;
+    let mut fixed = model.new_static_cache(capacity, 0).unwrap();
+    let mut growing = StepModel::new_cache(&model);
+    growing.set_max_checkpoints(0);
+    let mut a = model
+        .forward_step(&mut fixed, StepRequest::last(&prompt))
+        .unwrap()
+        .logits;
+    let mut b = model
+        .forward_step(&mut growing, StepRequest::last(&prompt))
+        .unwrap()
+        .logits;
+    let mut max_delta = 0f32;
+    let mut disagreements = Vec::new();
+    for (pos, &token) in reference.tokens.iter().enumerate() {
+        let (ra, rb) = (host(&a), host(&b));
+        let delta = ra
+            .iter()
+            .zip(&rb)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        max_delta = max_delta.max(delta);
+        let (arg_a, gap_a) = top2(&ra);
+        let (arg_b, gap_b) = top2(&rb);
+        assert_eq!(
+            arg_b as i32, token,
+            "growing path must reproduce the reference token at {pos}"
+        );
+        if arg_a != arg_b {
+            disagreements.push((pos, arg_a, arg_b, gap_a, gap_b, delta));
+        }
+        if pos + 1 == reference.tokens.len() {
+            break;
+        }
+        a = model
+            .forward_step(&mut fixed, StepRequest::last(&[token]))
+            .unwrap()
+            .logits;
+        b = model
+            .forward_step(&mut growing, StepRequest::last(&[token]))
+            .unwrap()
+            .logits;
+    }
+    eprintln!(
+        "[teacher-forced] {} positions; argmax agrees at {}; max |delta logit| = {max_delta}",
+        reference.tokens.len(),
+        reference.tokens.len() - disagreements.len()
+    );
+    for (pos, arg_a, arg_b, gap_a, gap_b, delta) in &disagreements {
+        eprintln!(
+            "[teacher-forced] pos {pos}: static argmax {arg_a} (top-2 gap {gap_a}), reference argmax              {arg_b} (top-2 gap {gap_b}), max |delta logit| {delta}"
+        );
+    }
+    assert!(
+        max_delta < 3e-2,
+        "static vs AttnKv logits differ by {max_delta}"
     );
 }

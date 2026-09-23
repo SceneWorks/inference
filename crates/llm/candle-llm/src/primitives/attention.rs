@@ -949,6 +949,118 @@ mod tests {
         }
     }
 
+    /// **sc-24132 formulation survey (evidence, not a gate).** On CUDA bf16 at the Qwen3.8-27B
+    /// decode shape, how many of 131 key lengths (90..=1000 step 7) each un-expanded GQA
+    /// formulation is bit-identical to the reference `repeat_kv` + eager `sdpa` for. Recorded
+    /// result on RTX Pro 6000 / sm_120 (CUDA 12.9): V0 folded, strided K (the shipped path) 52
+    /// mismatching lengths; V1 folded + contiguous Kᵀ 52; V2 folded + contiguous Kᵀ and V 52; V3
+    /// per-KV-head stride-0 broadcast (M = 1, batch = groups) 32; V4 V3 + contiguous Kᵀ 28; V5 V4
+    /// + contiguous V 28. Every difference is a single bf16 ULP in a few elements: cuBLAS selects
+    /// its kernel (and so its reduction order) by `m`, batch count and strides, and only the
+    /// reference's own calls (batch = `b × H` over expanded heads, `m = 1`) reproduce the
+    /// reference's bits. Bit-exact parity with the expanded reference therefore requires the
+    /// expansion itself; see `docs/migration/evidence/sc-24132/README.md`.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "sc-24132 formulation survey; needs CUDA"]
+    fn gqa_variants_bit_match_survey() {
+        let device = Device::new_cuda(0).expect("cuda device");
+        let (b, h, hkv, d, cap) = (1usize, 24usize, 4usize, 256usize, 1024usize);
+        let groups = h / hkv;
+        let mk = |b, heads, s, d, phase: f64| {
+            let n = (b * heads * s * d) as f32;
+            Tensor::arange(0f32, n, &device)
+                .unwrap()
+                .reshape((b, heads, s, d))
+                .unwrap()
+                .affine(0.0137, phase)
+                .unwrap()
+                .cos()
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+        };
+        let scale = (d as f32).powf(-0.5);
+        let k_buf = mk(b, hkv, cap, d, 1.7);
+        let v_buf = mk(b, hkv, cap, d, 3.1);
+        let q = mk(b, h, 1, d, 0.4);
+        let to_bits = |t: &Tensor| -> Vec<u16> {
+            t.flatten_all()
+                .unwrap()
+                .to_vec1::<half::bf16>()
+                .unwrap()
+                .into_iter()
+                .map(half::bf16::to_bits)
+                .collect()
+        };
+        let mut mism = [0usize; 6];
+        let mut tested = 0usize;
+        for k_len in (90..=1000).step_by(7) {
+            tested += 1;
+            let k = k_buf.narrow(2, 0, k_len).unwrap();
+            let v = v_buf.narrow(2, 0, k_len).unwrap();
+            let want = to_bits(
+                &sdpa_eager(
+                    &q,
+                    &repeat_kv(&k, groups).unwrap(),
+                    &repeat_kv(&v, groups).unwrap(),
+                    scale,
+                    None,
+                    AttnMask::Causal,
+                )
+                .unwrap(),
+            );
+            // V0: current folded path (OP_T strided k, strided v).
+            let v0 = sdpa_gqa_causal(&q, &k, &v, scale).unwrap();
+            // V1: folded, kT contiguous copy (OP_N), v strided.
+            let qf = q.reshape((b, hkv, groups, d)).unwrap();
+            let kt = k.transpose(2, 3).unwrap().contiguous().unwrap();
+            let s1 = (qf.matmul(&kt).unwrap() * scale as f64).unwrap();
+            let w1 = softmax_last_dim(&s1).unwrap();
+            let v1 = w1.matmul(&v).unwrap().reshape((b, h, 1, d)).unwrap();
+            // V2: folded, kT contiguous and v contiguous.
+            let vc = v.contiguous().unwrap();
+            let v2 = w1.matmul(&vc).unwrap().reshape((b, h, 1, d)).unwrap();
+            // V3: per-kv-head, stride-0 broadcast (M=1, batch=groups), OP_T k.
+            let per_head = |kt_c: bool, v_c: bool| -> Tensor {
+                let mut outs = Vec::new();
+                for kv in 0..hkv {
+                    let qg = q
+                        .narrow(1, kv * groups, groups)
+                        .unwrap()
+                        .squeeze(0)
+                        .unwrap(); // [groups,1,d]
+                    let kg = k.narrow(1, kv, 1).unwrap().squeeze(0).unwrap(); // [1,L,d]
+                    let kgt = kg.transpose(1, 2).unwrap(); // [1,d,L]
+                    let kgt = if kt_c { kgt.contiguous().unwrap() } else { kgt };
+                    let kgt = kgt.broadcast_as((groups, d, k_len)).unwrap();
+                    let s = (qg.matmul(&kgt).unwrap() * scale as f64).unwrap(); // [groups,1,L]
+                    let w = softmax_last_dim(&s).unwrap();
+                    let vg = v.narrow(1, kv, 1).unwrap().squeeze(0).unwrap(); // [1,L,d]
+                    let vg = if v_c { vg.contiguous().unwrap() } else { vg };
+                    let vg = vg.broadcast_as((groups, k_len, d)).unwrap();
+                    outs.push(w.matmul(&vg).unwrap()); // [groups,1,d]
+                }
+                Tensor::cat(&outs.iter().collect::<Vec<_>>(), 0)
+                    .unwrap()
+                    .reshape((b, h, 1, d))
+                    .unwrap()
+            };
+            let v3 = per_head(false, false);
+            let v4 = per_head(true, false);
+            let v5 = per_head(true, true);
+            for (i, t) in [&v0, &v1, &v2, &v3, &v4, &v5].into_iter().enumerate() {
+                if to_bits(t) != want {
+                    mism[i] += 1;
+                }
+            }
+        }
+        eprintln!(
+            "[survey] {tested} key lengths; mismatches: V0 folded/OP_T {} | V1 folded/kT-copy {} | V2 folded/kT+v copy {} | V3 per-head bcast {} | V4 per-head kT-copy {} | V5 per-head kT+v copy {}",
+            mism[0], mism[1], mism[2], mism[3], mism[4], mism[5]
+        );
+    }
+
     /// Exact attention shape from the frozen Qwen3-VL campaign `context_512` request. RC2's
     /// unchunked `[1, 32, 9247, 9247]` softmax has 2,736,224,288 elements; Candle's CUDA kernel
     /// indexes it with signed `int`, so it crosses `INT_MAX` and faults. The production query tile
