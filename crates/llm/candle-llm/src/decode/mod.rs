@@ -37,7 +37,9 @@ pub use engine::{
 };
 pub use prefix::{generate_cached, PrefixCache, PrefixStats};
 pub use proposers::{DraftModelProposer, MtpProposer, NgramProposer};
-pub use record::{CountingDecode, DecodePath, DecodeRecord, RequestSpan};
+pub use record::{
+    CountingDecode, DecodePath, DecodeRecord, RequestSpan, SamplerTelemetry, SpanCounters,
+};
 pub use speculative::{
     generate_draft_speculative, generate_prompt_lookup, SpeculativeConfig, SpeculativeStats,
 };

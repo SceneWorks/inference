@@ -355,7 +355,7 @@ pub fn generate_step_timed<M: StepModel>(
         DecodePath::StepModel,
         forwards,
         generated.len(),
-        span.host_syncs(),
+        span.counters(),
     )
     .with_kv_cache(cache.kv_kind())
     .with_attn_formulation(model.attn_formulation(&cache))

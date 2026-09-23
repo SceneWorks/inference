@@ -2631,11 +2631,15 @@ impl TextLlm for LlamaProvider {
         };
 
         // The engine's record is measured by the engine itself (the cache it ran on, the
-        // proposer, the per-verify-step syncs); the reference paths' record names `proposer=none`
-        // — including a request whose `MtpMode::Auto` resolved to no proposer (AC3, sc-24130).
+        // proposer, the per-verify-step syncs); the request span's counters (host syncs, the
+        // sampler telemetry) and the fused tally are the provider's. The reference paths' record
+        // names `proposer=none` — including a request whose `MtpMode::Auto` resolved to no
+        // proposer (AC3, sc-24130).
+        let span_counters = request_span.counters();
         let decode_record = match engine_record {
             Some(record) => DecodeRecord {
-                host_syncs: request_span.host_syncs(),
+                host_syncs: span_counters.host_syncs,
+                sampler: span_counters.sampler,
                 fused_primitives: request_span.fused_primitives(),
                 ..record
             },
@@ -2643,7 +2647,7 @@ impl TextLlm for LlamaProvider {
                 DecodePath::Reference,
                 counted.forwards() + extra_forwards,
                 out.tokens.len(),
-                request_span.host_syncs(),
+                span_counters,
             )
             .with_attn_formulation(self.model.attn_formulation())
             .with_proposer(mtp_plan.proposer())
