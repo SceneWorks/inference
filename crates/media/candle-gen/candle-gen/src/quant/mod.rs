@@ -42,6 +42,9 @@ pub mod sidecar;
 // 128×4-swizzled-scale layout the sc-11039 NVFP4 GEMM reads. Pure CPU numerics — builds everywhere
 // (no `cuda` feature), consumed on Blackwell sm_120 by the cuBLASLt path.
 pub mod nvfp4;
+// ComfyUI Kitchen NVFP4 import (sc-20641): the one NVFP4 seam that reads gen-core's `to_blocked`
+// swizzle, kept beside the media checkpoint readers so the codec stays gen-core-free (sc-24135).
+pub mod nvfp4_kitchen;
 
 // The shared forward-time additive (unmerged) LoRA/LoKr seam (sc-11091, epic 10765): [`AdaptLinear`]
 // — a frozen dense/packed base plus stacked residuals `y = base(x) + Σ scale·((x·A)·B)`, memory-free
@@ -103,6 +106,7 @@ pub use cublaslt::{CublasLt, DevNvfp4};
 #[cfg(feature = "cuda")]
 pub use eight_bit_linear::{Fp8Linear, Int8Linear};
 
+pub use nvfp4_kitchen::Nvfp4KitchenExt;
 pub use nvfp4_linear::{
     ActPrecision, Nvfp4Context, Nvfp4Fallback, Nvfp4Linear, Nvfp4Partition, Nvfp4Regime,
     NVFP4_M_ALIGN,
