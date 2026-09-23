@@ -98,6 +98,14 @@ fn audio_lane() -> runtime_catalog::AudioLane {
     }
 }
 
+/// What this bundle's LLM backend can serve on this host before any model is loaded (sc-24139):
+/// the load device, its CUDA compute capability, and whether `Quantize::Nvfp4` and
+/// `LoadSpec::cuda_graphs` are available — each unavailable feature with the refusal a load would
+/// return. A product reads this to offer, or disable with the reason, those controls.
+pub fn text_backend_capabilities() -> core_llm::BackendCapabilities {
+    candle_llm::backend_capabilities()
+}
+
 /// Build the complete validated CUDA runtime composition.
 pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
     #[cfg(feature = "audio")]

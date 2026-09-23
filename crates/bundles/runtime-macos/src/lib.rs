@@ -124,6 +124,13 @@ fn audio_lane() -> runtime_catalog::AudioLane {
     }
 }
 
+/// What this bundle's LLM backend can serve on this host before any model is loaded (sc-24139).
+/// MLX has no CUDA device features: `Quantize::Nvfp4` and `LoadSpec::cuda_graphs` are unavailable,
+/// each with a reason naming this backend, so a product disables those controls with it.
+pub fn text_backend_capabilities() -> core_llm::BackendCapabilities {
+    core_llm::BackendCapabilities::without_cuda("mlx", "metal")
+}
+
 /// Build the complete validated macOS runtime composition.
 pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
     #[cfg(feature = "audio")]

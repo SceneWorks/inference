@@ -40,7 +40,7 @@ use crate::models::{
 };
 use crate::primitives::attention::EAGER_ATTN_QUERY_CHUNK_SIZE;
 use crate::primitives::nn::input_ids;
-use crate::primitives::projection::{ProjectionFormat, QuantSpec, WeightCensus};
+use crate::primitives::projection::{ProjectionFormat, ProjectionKind, QuantSpec, WeightCensus};
 use crate::primitives::sampler::SamplingParams;
 use crate::primitives::{KvCache, Weights};
 
@@ -696,6 +696,45 @@ pub struct LoadRecord {
     /// The decoder's resident weights by projection kind (target plus native MTP predictor), for
     /// the qwen3_5-family decoders; `None` for the other architectures, which do not report one.
     pub census: Option<WeightCensus>,
+    /// The CUDA-graph switch this provider was loaded under (sc-24139): `LoadSpec::cuda_graphs`,
+    /// else the process switch at load time. The CUDA stream is settled at load, so every
+    /// generation runs under this switch rather than whatever the process switch says later.
+    /// `None` for a provider assembled without a load ([`LlamaProvider::from_parts`]), which
+    /// follows the process switch.
+    pub cuda_graphs: Option<bool>,
+}
+
+impl LoadRecord {
+    /// The backend-neutral report a product renders (sc-24139): the requested format and the
+    /// projection kinds actually resident, only the kinds present.
+    pub fn report(&self) -> core_llm::LoadReport {
+        let projections = self
+            .census
+            .map(|census| {
+                [
+                    ProjectionKind::Dense,
+                    ProjectionKind::Ggml,
+                    ProjectionKind::Prism,
+                    ProjectionKind::Nvfp4,
+                ]
+                .into_iter()
+                .filter_map(|kind| {
+                    let tally = census.projections.tally(kind);
+                    (tally.count > 0).then(|| core_llm::ProjectionReport {
+                        kind: kind.label().to_string(),
+                        count: tally.count,
+                        params: tally.params,
+                        resident_bytes: tally.resident_bytes,
+                    })
+                })
+                .collect()
+            })
+            .unwrap_or_default();
+        core_llm::LoadReport {
+            requested: self.requested,
+            projections,
+        }
+    }
 }
 
 /// Whether Gemma 4's vision path has been validated end-to-end, and may therefore be advertised.
@@ -865,6 +904,12 @@ impl LlamaProvider {
         if spec.projector_source.is_some() && !crate::gguf::is_gguf_path(&spec.source) {
             return Err(CoreError::Load("an external projector is only valid with a GGUF language checkpoint; safetensors vision must be embedded".into()));
         }
+        // The load's CUDA-graph policy (sc-24139): settled before the device is opened — the
+        // graph runner needs the model on its own CUDA stream, which the device selection picks
+        // under this switch — and held for the whole load, then recorded so every generation on
+        // this provider runs under the same switch.
+        let cuda_graphs = spec.cuda_graphs.unwrap_or_else(cuda_graphs_enabled);
+        let _cuda_graphs_scope = crate::decode::cuda_graphs_scope(Some(cuda_graphs));
         let device = select_device().map_err(to_core)?;
         // NVFP4 (sc-24135): the capability floor is settled first — before the accelerator gate,
         // admission or any weight read — so a CPU or sub-sm_120 device answers an NVFP4 request with
@@ -926,6 +971,7 @@ impl LlamaProvider {
             Self::load_dir(Path::new(&spec.source), &device, requested.as_ref())?
         };
         provider.load_record.requested = spec.quantize;
+        provider.load_record.cuda_graphs = Some(cuda_graphs);
         Ok(provider)
     }
 
@@ -1142,6 +1188,7 @@ impl LlamaProvider {
             load_record: LoadRecord {
                 requested: None,
                 census,
+                cuda_graphs: None,
             },
         })
     }
@@ -2079,6 +2126,10 @@ impl TextLlm for LlamaProvider {
             .validate_request(&self.descriptor.id, req)
     }
 
+    fn load_report(&self) -> Option<core_llm::LoadReport> {
+        Some(self.load_record.report())
+    }
+
     fn generate(
         &self,
         req: &TextLlmRequest,
@@ -2094,6 +2145,11 @@ impl TextLlm for LlamaProvider {
         if req.cancel.is_cancelled() {
             return Err(CoreError::Canceled); // typed pre-inference cancel
         }
+        // The load's CUDA-graph policy (sc-24139) governs everything this request does on this
+        // thread — admission's workspace pricing, wrapping the step model, the runner's switch —
+        // and the report says which switch it ran under.
+        let _cuda_graphs_scope = crate::decode::cuda_graphs_scope(self.load_record.cuda_graphs);
+        let cuda_graphs_on = cuda_graphs_enabled();
 
         // Multimodal (Qwen-VL + image/video content): replace image/video blocks with the Qwen-VL
         // placeholder text so the (vision-free) chat template renders the vision framing
@@ -2812,6 +2868,7 @@ impl TextLlm for LlamaProvider {
             tool_calls,
             usage,
             mtp: mtp_stats,
+            decode: Some(decode_record.report(cuda_graphs_on)),
             finish_reason: Some(finish),
         })
     }
@@ -3826,6 +3883,7 @@ mod tests {
             source: source.into(),
             projector_source: None,
             quantize: Some(core_llm::Quantize::Nvfp4),
+            cuda_graphs: None,
         }
     }
 
@@ -4177,16 +4235,9 @@ mod tests {
         )
     }
 
-    #[test]
-    fn auto_mtp_on_a_qwen35_snapshot_without_a_head_decodes_normally_and_says_proposer_none() {
-        // AC3 (sc-24130), weights-free: the synthetic Qwen3.5 decoder written as a snapshot with
-        // no `mtp.*` tensors and `mtp_num_hidden_layers = 0`. The provider advertises no MTP,
-        // an `Auto` request decodes through the reference loop and the record names the proposer
-        // that ran — `none` — rather than silently downgrading; `Enabled` is refused.
-        use core_llm::{
-            LoadSpec, Message, MtpMode, ProposerKind, Sampling, TextLlm, TextLlmRequest,
-        };
-
+    /// The synthetic Qwen3.5 decoder written as a weights-free snapshot with no `mtp.*` tensors
+    /// and `mtp_num_hidden_layers = 0`.
+    fn synthetic_qwen35_snapshot_without_mtp() -> tempfile::TempDir {
         let (cfg, weights, cfg_json) = crate::models::qwen35::tests::text_model_snapshot_parts();
         let dir = tempfile::Builder::new()
             .prefix("candle-qwen35-no-mtp-")
@@ -4210,7 +4261,79 @@ mod tests {
             .collect();
         assert!(tensors.keys().all(|k| !k.starts_with("mtp.")));
         candle_core::safetensors::save(&tensors, dir.path().join("model.safetensors")).unwrap();
+        dir
+    }
 
+    /// sc-24139: the load's CUDA-graph policy is settled at load and recorded, every generation
+    /// runs under it (not under whatever the process switch says later), and the contract carries
+    /// the decode report and the load report a product renders — the same record the evidence
+    /// harness reads, never a guess.
+    #[test]
+    fn the_load_settles_the_graph_policy_and_the_contract_carries_the_reports() {
+        use core_llm::{LoadSpec, Message, ProposerKind, Sampling, TextLlm, TextLlmRequest};
+
+        let _process = crate::decode::graph::cuda_graphs_policy_guard(Some(false));
+        let dir = synthetic_qwen35_snapshot_without_mtp();
+        let source = dir.path().display().to_string();
+        let request = TextLlmRequest {
+            messages: vec![Message::user("t3 t7 t11 t2 t7 t11")],
+            sampling: Sampling::greedy(),
+            max_new_tokens: 4,
+            seed: Some(0),
+            ..Default::default()
+        };
+
+        // `Some(true)` wins over a process switch that is off, and the load records it.
+        let on = super::LlamaProvider::load(&LoadSpec {
+            cuda_graphs: Some(true),
+            ..LoadSpec::dense(source.clone())
+        })
+        .expect("load with graphs requested");
+        assert_eq!(on.load_record().cuda_graphs, Some(true));
+        // Flipping the process switch after the load does not change the loaded model's policy.
+        crate::decode::set_cuda_graphs(Some(false));
+        let out = on.generate(&request, &mut |_| {}).expect("generate");
+        let report = out
+            .decode
+            .clone()
+            .expect("the provider reports its decode path");
+        assert!(report.cuda_graphs.enabled, "the load's Some(true) governs");
+        assert_eq!(report, on.last_decode_record().unwrap().report(true));
+        assert_eq!(report.proposer, ProposerKind::None);
+        assert_eq!(report.path, "reference");
+        assert_eq!(
+            report.target_forwards,
+            u64::from(out.usage.generated_tokens)
+        );
+
+        // `None` keeps the process switch at load (off here); the report says so.
+        let default = super::LlamaProvider::load(&LoadSpec::dense(source)).expect("load");
+        assert_eq!(default.load_record().cuda_graphs, Some(false));
+        crate::decode::set_cuda_graphs(Some(true));
+        let out = default.generate(&request, &mut |_| {}).expect("generate");
+        assert!(!out.decode.expect("reported").cuda_graphs.enabled);
+
+        // The load report names the requested format and the resident projection kinds.
+        let load = default
+            .load_report()
+            .expect("the provider reports its load");
+        assert_eq!(load.requested, None);
+        assert_eq!(load.projections.len(), 1, "{:?}", load.projections);
+        assert_eq!(load.projections[0].kind, "dense");
+        assert!(load.projections[0].count > 0 && load.projections[0].resident_bytes > 0);
+    }
+
+    #[test]
+    fn auto_mtp_on_a_qwen35_snapshot_without_a_head_decodes_normally_and_says_proposer_none() {
+        // AC3 (sc-24130), weights-free: the synthetic Qwen3.5 decoder written as a snapshot with
+        // no `mtp.*` tensors and `mtp_num_hidden_layers = 0`. The provider advertises no MTP,
+        // an `Auto` request decodes through the reference loop and the record names the proposer
+        // that ran — `none` — rather than silently downgrading; `Enabled` is refused.
+        use core_llm::{
+            LoadSpec, Message, MtpMode, ProposerKind, Sampling, TextLlm, TextLlmRequest,
+        };
+
+        let dir = synthetic_qwen35_snapshot_without_mtp();
         let provider =
             super::LlamaProvider::load(&LoadSpec::dense(dir.path().display().to_string()))
                 .expect("load the synthetic Qwen3.5 snapshot");

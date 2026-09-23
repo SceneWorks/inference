@@ -18,10 +18,14 @@
 //!    de-provisionalizes the contract (story 7237).
 //! 5. [`prepare`] — exposes a [`core_llm::SnapshotPreparerRegistration`]: convert an HF snapshot
 //!    or a `*.gguf` into a persisted, loadable snapshot, optionally baking in Q4/Q8 (story 7662).
+//! 6. [`backend`] — what this build can serve on this host before any load
+//!    ([`backend_capabilities`]): the load device, its CUDA compute capability, and whether NVFP4
+//!    and CUDA graphs are available, with the load gate's reason when not (sc-24139).
 //!
 //! Compute runs in `bf16` on the GPU backends (CUDA / Metal) and `f32` on CPU. Candle `Tensor`s are
 //! `Send`/`Sync`, so a loaded model is freely shareable across threads.
 
+pub mod backend;
 pub mod config;
 pub mod decode;
 pub mod device;
@@ -42,6 +46,7 @@ pub mod starvector_8b;
 // Re-export the contract crate so consumers can reach it as `candle_llm::core_llm::…`.
 pub use core_llm;
 
+pub use backend::backend_capabilities;
 pub use config::{Architecture, ModelConfig, RopeScaling};
 pub use decode::{
     generate, generate_batch, generate_cached, generate_draft_speculative, generate_prompt_lookup,

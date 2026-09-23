@@ -513,6 +513,7 @@ impl TextLlm for JoyCaptionProvider {
             tool_calls: Vec::new(),
             usage,
             mtp: None,
+            decode: None,
             finish_reason: Some(finish),
         })
     }

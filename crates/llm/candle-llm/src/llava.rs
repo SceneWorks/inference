@@ -598,6 +598,7 @@ impl TextLlm for LlavaProvider {
             tool_calls: Vec::new(),
             usage,
             mtp: None,
+            decode: None,
             finish_reason: Some(finish),
         })
     }

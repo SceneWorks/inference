@@ -513,6 +513,7 @@ impl core_llm::TextLlm for CandleStarVectorProvider {
             tool_calls: vec![],
             usage,
             mtp: None,
+            decode: None,
             finish_reason: Some(finish),
         })
     }

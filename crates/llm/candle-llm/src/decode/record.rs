@@ -293,6 +293,45 @@ impl DecodeRecord {
         (self.generated_tokens > 0)
             .then(|| self.sampler.logits_to_host as f64 / self.generated_tokens as f64)
     }
+
+    /// The backend-neutral report a product renders (sc-24139): the same labels as the evidence
+    /// rows. `cuda_graphs_enabled` is the graph switch the request ran under (the loaded model's
+    /// `LoadSpec::cuda_graphs`, else the process switch at load), which the tally alone cannot
+    /// say: a request that never reached the runner reads `none` either way.
+    pub fn report(&self, cuda_graphs_enabled: bool) -> core_llm::DecodeReport {
+        let draft_tokens = match self.path {
+            DecodePath::Mtp { drafts } => Some(drafts),
+            _ => None,
+        };
+        core_llm::DecodeReport {
+            path: self.path.label().to_string(),
+            proposer: self.proposer,
+            draft_tokens,
+            sampler: self.sampler.label(),
+            kv_cache: self.kv_cache.label().to_string(),
+            attention: self.attn_formulation.label().to_string(),
+            cuda_graphs: core_llm::CudaGraphsReport {
+                enabled: cuda_graphs_enabled,
+                path: self.cuda_graphs.label().to_string(),
+                replayed: self.cuda_graphs.replayed,
+                eager: self.cuda_graphs.eager,
+                captured: self.cuda_graphs.captured,
+                fallback_reason: self.cuda_graphs.fallback_reason.map(str::to_string),
+            },
+            nvfp4_projections: core_llm::PathReport {
+                path: self.nvfp4_projections.label().to_string(),
+                reason: self.nvfp4_projections.cublaslt_reason.map(str::to_string),
+            },
+            fused_primitives: core_llm::PathReport {
+                path: self.fused_primitives.label().to_string(),
+                reason: self.fused_primitives.reference_reason.map(str::to_string),
+            },
+            target_forwards: self.target_forwards,
+            proposed_tokens: self.proposed_tokens,
+            accepted_tokens: self.accepted_tokens,
+            replay_forwards: self.replay_forwards,
+        }
+    }
 }
 
 /// Brackets a request on the current thread: constructed before the first forward, `finish`ed after
@@ -433,6 +472,87 @@ mod tests {
         fn step(&self, _: &Tensor, _: &mut dyn KvCache, _: i32) -> Result<Tensor> {
             Ok(Tensor::new(&[[0f32, 1.]], &self.0)?)
         }
+    }
+
+    #[test]
+    fn the_report_carries_every_path_label_and_names_the_fallbacks() {
+        let record = DecodeRecord::speculative(
+            DecodePath::Mtp { drafts: 3 },
+            SpeculativeStats {
+                forwards: 5,
+                proposed: 9,
+                accepted: 6,
+                verify_steps: 3,
+                replays: 1,
+            },
+            8,
+            SpanCounters {
+                host_syncs: 4,
+                sampler: SamplerTelemetry {
+                    path: Some(SamplerPath::Host(core_llm::HostSampleReason::Penalty)),
+                    device_draws: 0,
+                    host_draws: 8,
+                    logits_to_host: 8,
+                },
+            },
+        )
+        .with_proposer(ProposerKind::Mtp)
+        .with_kv_cache(KvCacheKind::Static)
+        .with_cuda_graphs(GraphTally {
+            replayed: 0,
+            eager: 7,
+            captured: 0,
+            fallback_reason: Some("deltanet_state_unstable"),
+        })
+        .with_nvfp4_projections(Nvfp4PathTally {
+            gemv: 40,
+            cublaslt: 2,
+            cublaslt_reason: Some("rows"),
+        })
+        .with_fused_primitives(FusedTally {
+            fused: 10,
+            reference: 0,
+            reference_reason: None,
+        });
+        let report = record.report(true);
+        assert_eq!(report.path, "mtp");
+        assert_eq!(report.proposer, ProposerKind::Mtp);
+        assert_eq!(report.draft_tokens, Some(3));
+        assert_eq!(report.sampler, "host:penalty");
+        assert_eq!(report.kv_cache, "static");
+        assert_eq!(report.attention, "gqa");
+        assert!(report.cuda_graphs.enabled);
+        assert_eq!(report.cuda_graphs.path, "eager");
+        assert_eq!(report.cuda_graphs.eager, 7);
+        assert_eq!(
+            report.cuda_graphs.fallback_reason.as_deref(),
+            Some("deltanet_state_unstable")
+        );
+        assert_eq!(report.nvfp4_projections.path, "mixed");
+        assert_eq!(report.nvfp4_projections.reason.as_deref(), Some("rows"));
+        assert_eq!(report.fused_primitives.path, "fused");
+        assert_eq!(report.fused_primitives.reason, None);
+        assert_eq!(
+            (
+                report.target_forwards,
+                report.proposed_tokens,
+                report.accepted_tokens
+            ),
+            (5, 9, 6)
+        );
+        assert_eq!(report.replay_forwards, 1);
+
+        // A reference run with the switch off: no proposer, no graph step, and the report says
+        // the switch was off rather than leaving `none` ambiguous.
+        let plain = DecodeRecord::plain(DecodePath::Reference, 3, 2, SpanCounters::default());
+        let report = plain.report(false);
+        assert_eq!(report.path, "reference");
+        assert_eq!(report.proposer, ProposerKind::None);
+        assert_eq!(report.draft_tokens, None);
+        assert_eq!(report.sampler, "none");
+        assert!(!report.cuda_graphs.enabled);
+        assert_eq!(report.cuda_graphs.path, "none");
+        assert_eq!(report.nvfp4_projections.path, "none");
     }
 
     #[test]
