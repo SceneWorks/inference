@@ -28,6 +28,15 @@ pub struct SpeculativeStats {
     /// rejected run on a cache that rolls back only to a step start). Fewer than `generated` ⇒
     /// speedup.
     pub forwards: usize,
+    /// The prefill forwards counted in `forwards`: one whenever the prompt was prefilled — by the
+    /// engine itself ([`SpeculativePrompt::Tokens`]) or by its caller
+    /// ([`SpeculativePrompt::Prefilled`], whose prefill the engine counts as one of the request's
+    /// target forwards all the same). `forwards - prefill_forwards` is what the verify steps and
+    /// any replays cost.
+    ///
+    /// [`SpeculativePrompt::Tokens`]: crate::decode::SpeculativePrompt::Tokens
+    /// [`SpeculativePrompt::Prefilled`]: crate::decode::SpeculativePrompt::Prefilled
+    pub prefill_forwards: usize,
     /// Draft tokens proposed across all steps.
     pub proposed: usize,
     /// Draft tokens accepted across all steps.
@@ -35,10 +44,14 @@ pub struct SpeculativeStats {
     /// Verify steps taken: target forwards over `[cur, drafts…]` whose outcome was decided
     /// (sc-24130). The denominator of "host syncs per verify step".
     pub verify_steps: usize,
+    /// Verify steps whose partial acceptance was recovered by a **direct** cache rollback to
+    /// `start + 1 + accepted` (sc-24131) — no extra target forward.
+    pub direct_rollbacks: usize,
     /// Replay forwards (sc-24130, E2): verify steps whose cache answered
     /// [`Error::RollbackUnavailable`] for the direct rollback to `start + 1 + accepted`, so the
     /// engine rolled back to the step start and replayed the kept prefix in one extra forward.
-    /// Counted inside `forwards`; `0` on a cache with per-position rollback.
+    /// Counted inside `forwards`; `0` on a cache with per-position rollback — the `Qwen35Cache`
+    /// since its per-token checkpoint ring (sc-24131).
     ///
     /// [`Error::RollbackUnavailable`]: crate::error::Error::RollbackUnavailable
     pub replays: usize,

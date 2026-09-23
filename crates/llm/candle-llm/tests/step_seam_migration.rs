@@ -1375,6 +1375,8 @@ fn llava_caption_decodes_to_its_golden_through_the_seam() {
         .unwrap();
         assert_eq!(&out.tokens, want, "llava static tokens");
         assert_eq!(record.kv_cache, KvCacheKind::Static);
+        // The caller's prefill counts as the engine's `Prefilled` path counts it (sc-24131).
+        assert_eq!(record.prefill_forwards, 1);
     }
     let mut cache = lang.new_static_cache(expanded.len() + NEW_TOKENS).unwrap();
     let first = lang.step_prefill_from_embeds(&spliced, &mut cache).unwrap();
@@ -1388,7 +1390,7 @@ fn llava_caption_decodes_to_its_golden_through_the_seam() {
     let mut cache = lang.new_step_cache();
     let first = lang.step_prefill_from_embeds(&spliced, &mut cache).unwrap();
     cancel.cancel();
-    let (out, _) = generate_step_from_prefill(
+    let (out, record) = generate_step_from_prefill(
         lang,
         &mut cache,
         first,
@@ -1400,6 +1402,11 @@ fn llava_caption_decodes_to_its_golden_through_the_seam() {
     )
     .unwrap();
     assert!(out.tokens.is_empty());
+    assert_eq!(
+        (record.target_forwards, record.prefill_forwards),
+        (1, 1),
+        "the caller's prefill is still one of the request's target forwards"
+    );
     assert_eq!(
         out.finish_reason,
         candle_llm::decode::FinishReason::Cancelled

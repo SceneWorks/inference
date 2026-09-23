@@ -19,6 +19,7 @@ use candle_core::{Device, Tensor};
 
 use crate::decode::cancel::CancelFlag;
 use crate::decode::record::{DecodePath, DecodeRecord, RequestSpan};
+use crate::decode::speculative::SpeculativeStats;
 use crate::decode::stream::{
     default_seed, ConstraintMask, FinishReason, GenerationConfig, GenerationOutput, StreamEvent,
 };
@@ -398,7 +399,7 @@ pub fn generate_step_from_prefill<M: StepModel>(
         model,
         &mut super::engine::NoProposer,
         super::engine::SpeculativePrompt::Prefilled {
-            cache,
+            cache: &mut *cache,
             logits,
             hidden: None,
             history,
@@ -420,12 +421,21 @@ pub fn generate_step_from_prefill<M: StepModel>(
                 reason: FinishReason::Cancelled,
                 generated: 0,
             });
+            // The caller's prefill is still one of the request's target forwards, counted as the
+            // engine counts it on the `Prefilled` path (`prefill_forwards`, sc-24131).
+            let prefill = SpeculativeStats {
+                forwards: 1,
+                prefill_forwards: 1,
+                ..SpeculativeStats::default()
+            };
             Ok((
                 GenerationOutput {
                     tokens: Vec::new(),
                     finish_reason: FinishReason::Cancelled,
                 },
-                DecodeRecord::plain(DecodePath::StepModel, 0, 0, Default::default()),
+                DecodeRecord::speculative(DecodePath::StepModel, prefill, 0, Default::default())
+                    .with_kv_cache(cache.kv_kind())
+                    .with_attn_formulation(model.attn_formulation(cache)),
             ))
         }
         Err(error) => Err(error),

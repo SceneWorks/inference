@@ -20,11 +20,14 @@
 //!    [`accept_token`] (the distribution-preserving `p/q` rule, unchanged) for stochastic. This is
 //!    the AC2 figure: exactly one host sync per verify step, where the old loop paid `K + 1`.
 //! 4. **Recover**: keep the accepted prefix. The engine first asks the cache to roll back to
-//!    `start + 1 + accepted`; a cache that only checkpoints step starts (the S1 `Qwen35Cache`)
-//!    answers [`Error::RollbackUnavailable`], and the engine then rolls back to the step start and
-//!    **replays** `[cur, accepted drafts…]` in one forward — exactly what the `qwen_mtp` loop did
-//!    with a cloned cache, so the acceptance statistics are unchanged. Per-token DeltaNet
-//!    checkpoints (S3) make the first call succeed and the replay disappear, with no change here.
+//!    `start + 1 + accepted` — a **direct rollback**, which every cache with per-token rollback
+//!    (a softmax-only cache, the `Qwen35Cache` with its per-token DeltaNet checkpoint ring since
+//!    S3, sc-24131) answers at no forward cost. A cache that cannot answers
+//!    [`Error::RollbackUnavailable`], and the engine then rolls back to the step start and
+//!    **replays** `[cur, accepted drafts…]` in one forward — the **replay fallback**, exactly
+//!    what the `qwen_mtp` loop did with a cloned cache, so the acceptance statistics are
+//!    unchanged. Both are counted ([`DecodeRecord::direct_rollbacks`] /
+//!    [`DecodeRecord::replay_forwards`]), so a run says which recovery it paid for.
 //! 5. **Commit** through the same event path as every other loop (`StreamEvent::Token`, stop
 //!    tokens, constraint advance, caller stop, cancellation, budget — E7). A cancel observed right
 //!    after the verify forward rolls the cache back to the step start and returns `Cancelled`
@@ -371,6 +374,7 @@ pub fn generate_speculative_with<M: StepModel, P: Proposer>(
                 StepRequest::last(prompt_ids).with_hidden(wants_hidden),
             )?;
             stats.forwards += 1;
+            stats.prefill_forwards += 1;
             let previous_hidden = last_row(out.hidden.as_ref())?;
             proposer.warm(prompt_ids, out.hidden.as_ref())?;
             (cache, out.logits, previous_hidden, prompt_ids.to_vec(), 0)
@@ -386,7 +390,9 @@ pub fn generate_speculative_with<M: StepModel, P: Proposer>(
             if prompt_ids.is_empty() {
                 return Err(Error::Msg("generate_speculative: empty prompt".into()));
             }
-            stats.forwards += 1; // the caller's prefill
+            // The caller's prefill: still one of the request's target forwards.
+            stats.forwards += 1;
+            stats.prefill_forwards += 1;
             let previous_hidden = last_row(hidden.as_ref())?;
             if warm_proposer {
                 proposer.warm(prompt_ids, hidden.as_ref())?;
@@ -581,17 +587,21 @@ pub fn generate_speculative_with<M: StepModel, P: Proposer>(
         stats.accepted += accepted;
 
         // 4. Recover the cache to `[cur, accepted…]`: a direct rollback when the cache can, else
-        //    back to the step start plus a replay of the kept prefix (the S1 hybrid cache).
+        //    back to the step start plus a replay of the kept prefix (a cache without per-token
+        //    checkpoints).
         let keep_len = 1 + accepted;
         let kept_hidden = if accepted == num_drafts {
             out.hidden
         } else {
             let target = base + keep_len as i32;
             match cache.rollback_to(target) {
-                Ok(()) => match out.hidden {
-                    Some(h) => Some(h.narrow(1, 0, keep_len)?),
-                    None => None,
-                },
+                Ok(()) => {
+                    stats.direct_rollbacks += 1;
+                    match out.hidden {
+                        Some(h) => Some(h.narrow(1, 0, keep_len)?),
+                        None => None,
+                    }
+                }
                 Err(Error::RollbackUnavailable { .. }) => {
                     cache.rollback_to(base)?;
                     let mut replay = Vec::with_capacity(keep_len);
@@ -916,10 +926,15 @@ mod tests {
             assert!(run.stats.verify_steps > 0);
             assert!(run.stats.proposed > 0);
             any_rejection |= run.stats.accepted < run.stats.proposed;
-            // Forwards: the prefill, one verify per step, and one replay per rejected run (the
-            // S1 cache checkpoints step starts only, so a rejection replays the kept prefix).
-            assert!(run.stats.forwards > run.stats.verify_steps);
-            assert!(run.stats.forwards <= 1 + 2 * run.stats.verify_steps);
+            // Forwards: the prefill plus exactly one verify per step — every partial rejection is
+            // a direct rollback into the per-token checkpoint ring (S3), never a replay.
+            assert_eq!(run.stats.forwards, 1 + run.stats.verify_steps, "K={k}");
+            assert_eq!(run.stats.replays, 0, "K={k}");
+            assert_eq!(
+                run.record.target_forwards_per_verify_step(),
+                Some(1.0),
+                "K={k}"
+            );
             // The greedy fast path: exactly one host sync per verify step (AC2), plus the one
             // first-token sample outside the steps.
             assert_eq!(run.record.host_syncs_per_verify_step(), Some(1.0), "K={k}");
@@ -1070,8 +1085,14 @@ mod tests {
         assert_eq!(rejected.stats.proposed, 12);
         assert_eq!(rejected.stats.accepted, 0);
         assert_eq!(
-            rejected.stats.forwards, 12,
-            "prefill + 6 verifies + 5 replays (the last step has no draft budget)"
+            rejected.stats.forwards, 7,
+            "prefill + 6 verifies, no replays: every rejection is a direct rollback"
+        );
+        assert_eq!(rejected.stats.verify_steps, 6);
+        assert_eq!(
+            (rejected.stats.direct_rollbacks, rejected.stats.replays),
+            (5, 0),
+            "5 rejected steps recovered directly (the last step has no draft budget)"
         );
         // Every draft accepted: proposed 4 / accepted 4 / forwards 3.
         let (target, mtp) = degenerate_fixture(true);
@@ -1210,6 +1231,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(multimodal.output.tokens, text.output.tokens);
+        // The caller's prefill is the run's prefill forward: fwd/verify is measured net of it on
+        // the Prefilled arm exactly as on the Tokens arm.
+        assert_eq!(
+            multimodal.record.target_forwards_per_verify_step(),
+            Some(1.0)
+        );
         assert_eq!(multimodal.stats, text.stats);
     }
 
@@ -1378,23 +1405,36 @@ mod tests {
 
     /// A decoder whose argmax at position `p` is `(p + 1) % vocab` (all positions), with a cache
     /// that can roll back to any position — the shape of a softmax-only decoder with per-token
-    /// rollback (or the S3 hybrid cache).
+    /// rollback (or the S3 hybrid cache). `step_start_only` makes it refuse interior positions
+    /// like the S1 hybrid cache did, to exercise the engine's replay fallback.
     struct Ramp {
         vocab: usize,
         forwards: Cell<u64>,
+        step_start_only: bool,
     }
-    struct RampCache(i32);
+    struct RampCache {
+        len: i32,
+        step_start: i32,
+        step_start_only: bool,
+    }
     impl DecodeCache for RampCache {
         fn len(&self) -> i32 {
-            self.0
+            self.len
         }
         fn rollback_to(&mut self, n: i32) -> Result<()> {
-            assert!(n >= 0 && n <= self.0);
-            self.0 = n;
+            assert!(n >= 0 && n <= self.len);
+            if self.step_start_only && n != self.step_start && n != self.len && n != 0 {
+                return Err(Error::RollbackUnavailable {
+                    n,
+                    have: vec![self.step_start],
+                });
+            }
+            self.len = n;
             Ok(())
         }
         fn reset(&mut self) {
-            self.0 = 0;
+            self.len = 0;
+            self.step_start = 0;
         }
         fn memory(&self) -> CacheMemory {
             CacheMemory::default()
@@ -1403,7 +1443,11 @@ mod tests {
     impl StepModel for Ramp {
         type Cache = RampCache;
         fn new_cache(&self) -> RampCache {
-            RampCache(0)
+            RampCache {
+                len: 0,
+                step_start: 0,
+                step_start_only: self.step_start_only,
+            }
         }
         fn device(&self) -> &Device {
             static CPU: Device = Device::Cpu;
@@ -1419,8 +1463,9 @@ mod tests {
         ) -> Result<StepOutput> {
             self.forwards.set(self.forwards.get() + 1);
             let n = request.len()?;
-            let start = cache.0 as usize;
-            cache.0 += n as i32;
+            let start = cache.len as usize;
+            cache.step_start = cache.len;
+            cache.len += n as i32;
             let mut rows = vec![0f32; n * self.vocab];
             for (i, row) in rows.chunks_exact_mut(self.vocab).enumerate() {
                 row[(start + i + 1) % self.vocab] = 10.0;
@@ -1468,6 +1513,7 @@ mod tests {
         let model = Ramp {
             vocab: 7,
             forwards: Cell::new(0),
+            step_start_only: false,
         };
         let config = greedy(10);
         // Prompt of 2 (positions 0, 1) -> the ramp continues 2, 3, 4, 5, 6, 0, 1, ...; the n-gram
@@ -1478,7 +1524,11 @@ mod tests {
         assert!(run_ngram.stats.accepted > 0);
         assert_eq!(run_ngram.stats.accepted, run_ngram.stats.proposed);
         assert_eq!(run_ngram.stats.forwards, 1 + run_ngram.stats.verify_steps);
-        assert_eq!(run_ngram.stats.replays, 0);
+        assert_eq!(
+            (run_ngram.stats.direct_rollbacks, run_ngram.stats.replays),
+            (0, 0),
+            "full acceptance needs no recovery at all"
+        );
         assert_eq!(run_ngram.record.replay_forwards, 0);
         // Every step rejects at the first draft: the direct rollback to `start + 1` succeeds, so
         // no replay forward is issued and the output is still the ramp.
@@ -1497,25 +1547,70 @@ mod tests {
             model.forwards.get() - before,
             run_wrong.stats.forwards as u64
         );
-
-        // The Qwen3.5 cache checkpoints step starts only: the same rejection costs one replay.
-        let (_cfg, qwen) = text_model();
-        let mut wrong = Wrong(vec![49, 49, 49]);
-        let expected = step_tokens(&qwen, &PROMPT, &config);
-        let run_qwen = run(&qwen, &mut wrong, &PROMPT, &config, 3);
-        assert_eq!(run_qwen.output.tokens, expected);
-        assert_eq!(run_qwen.stats.accepted, 0);
-        assert_eq!(run_qwen.stats.verify_steps, 9);
-        // The last step has no draft budget left (k = 0), so it cannot reject: 8 replays.
+        assert_eq!(run_wrong.stats.replays, 0);
         assert_eq!(
-            run_qwen.stats.forwards,
-            1 + 9 + 8,
-            "one replay per rejected verify"
+            run_wrong.stats.direct_rollbacks,
+            run_wrong.stats.verify_steps - 1,
+            "every rejected step (the last has no draft budget) was a direct rollback"
         );
-        // The fallback is visible in telemetry (E2): the stats and the record count each replay.
-        assert_eq!(run_qwen.stats.replays, 8);
-        assert_eq!(run_qwen.record.replay_forwards, 8);
-        assert_eq!(run_qwen.record.target_forwards, 1 + 9 + 8);
+        assert_eq!(
+            run_wrong.record.direct_rollbacks,
+            run_wrong.stats.direct_rollbacks as u64
+        );
+
+        // A cache that checkpoints step starts only (the S1 hybrid cache): the same rejection
+        // costs one replay forward, and the record says so.
+        let step_start = Ramp {
+            vocab: 7,
+            forwards: Cell::new(0),
+            step_start_only: true,
+        };
+        let mut wrong = Wrong(vec![99, 99, 99]);
+        let run_replay = run(&step_start, &mut wrong, &[0, 1], &config, 3);
+        assert_eq!(run_replay.output.tokens, vec![2, 3, 4, 5, 6, 0, 1, 2, 3, 4]);
+        assert_eq!(run_replay.stats.accepted, 0);
+        assert_eq!(
+            run_replay.stats.forwards,
+            1 + run_replay.stats.verify_steps + run_replay.stats.replays
+        );
+        assert_eq!(run_replay.stats.replays, run_replay.stats.verify_steps - 1);
+        assert_eq!(run_replay.stats.direct_rollbacks, 0);
+        assert_eq!(
+            run_replay.record.replay_forwards,
+            run_replay.stats.replays as u64
+        );
+        assert_eq!(
+            run_replay.record.target_forwards_per_verify_step(),
+            Some(
+                1.0 + (run_replay.stats.verify_steps - 1) as f64
+                    / run_replay.stats.verify_steps as f64
+            )
+        );
+
+        // The Qwen3.5 cache's per-token checkpoint ring (S3): the same forced rejections are all
+        // direct rollbacks — one target forward per verify step, zero replays — for every K.
+        let (_cfg, qwen) = text_model();
+        let expected = step_tokens(&qwen, &PROMPT, &config);
+        for k in 1..=5usize {
+            let mut wrong = Wrong(vec![49; k]);
+            let run_qwen = run(&qwen, &mut wrong, &PROMPT, &config, k);
+            assert_eq!(run_qwen.output.tokens, expected, "K={k}");
+            assert_eq!(run_qwen.stats.accepted, 0);
+            assert_eq!(run_qwen.stats.verify_steps, 9);
+            assert_eq!(
+                run_qwen.stats.forwards,
+                1 + 9,
+                "K={k}: the prefill plus one forward per verify step, no replays"
+            );
+            // The last step has no draft budget left (k = 0), so it cannot reject: 8 rollbacks.
+            assert_eq!(
+                (run_qwen.stats.direct_rollbacks, run_qwen.stats.replays),
+                (8, 0),
+                "K={k}"
+            );
+            assert_eq!(run_qwen.record.target_forwards_per_verify_step(), Some(1.0));
+            assert_eq!(run_qwen.record.replay_forwards, 0);
+        }
     }
 
     /// Proposes the ramp continuation after `cur`, `len` drafts wide **regardless of
@@ -1559,6 +1654,7 @@ mod tests {
         let model = Ramp {
             vocab: 7,
             forwards: Cell::new(0),
+            step_start_only: false,
         };
         let config = greedy(4);
         let prompt = [0, 1];
@@ -1608,6 +1704,7 @@ mod tests {
         let model = Ramp {
             vocab: 7,
             forwards: Cell::new(0),
+            step_start_only: false,
         };
         let mut config = greedy(10);
         config.stop_tokens = vec![4];

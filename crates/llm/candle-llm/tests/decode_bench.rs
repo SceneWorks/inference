@@ -54,8 +54,11 @@
 //! with the native MTP proposer, the `ngram` rows with prompt lookup — and report the proposer
 //! the record says ran (`proposer`), the device->host syncs per verify step
 //! (`host_syncs_per_verify_step`, the AC2 figure: exactly 1 on head, `K + 1` on the pre-epic loop,
-//! which the baseline binary reports as `null` because it predates the counter) and the replay
-//! forwards the engine spent on the `RollbackUnavailable` fallback (`replay_forwards`, E2).
+//! which the baseline binary reports as `null` because it predates the counter), the replay
+//! forwards the engine spent on the `RollbackUnavailable` fallback (`replay_forwards`, E2) and the
+//! recovery split behind them (`verify_steps`, `direct_rollbacks`,
+//! `target_forwards_per_verify_step` — the measured target forwards net of the prefill per verify
+//! step, exactly 1.0 on the per-token DeltaNet checkpoint ring, sc-24131 AC2).
 //!
 //! **Model selection (sc-24138).** The snapshot's `config.json` picks the family: a Qwen3.5 /
 //! 3.6 / 3.8 hybrid runs the rows above; a llama-family checkpoint (a `CausalLm` — Qwen3-8B, the
@@ -102,7 +105,8 @@ use candle_llm::primitives::{
 
 /// A speculative row through the unified engine: the output, the raw counters, the prefill and
 /// decode seconds, the `(kv_cache, attn_formulation)` labels of the cache it ran on, the
-/// engine's host syncs per verify step, and the proposer the record says ran.
+/// engine's host syncs per verify step, the proposer the record says ran, and its
+/// [`Recovery`] counters (sc-24131).
 type SpeculativeRow = (
     GenerationOutput,
     SpeculativeStats,
@@ -111,6 +115,7 @@ type SpeculativeRow = (
     Option<(&'static str, &'static str)>,
     Option<f64>,
     &'static str,
+    Option<Recovery>,
 );
 
 fn engine_row<P: Proposer>(
@@ -158,6 +163,12 @@ fn engine_row<P: Proposer>(
         )),
         run.record.host_syncs_per_verify_step(),
         run.record.proposer.label(),
+        Some((
+            run.record.verify_steps,
+            run.record.direct_rollbacks,
+            run.record.replay_forwards,
+            run.record.prefill_forwards,
+        )),
     )
 }
 
@@ -634,6 +645,7 @@ fn causal_decode_bench(
             None,
             Some(causal_reference_kinds(&model)),
             None,
+            None,
             fused,
             None,
             Some("none"),
@@ -674,8 +686,14 @@ fn causal_decode_bench(
         let fused = fused_delta(fused0, switch);
         let used = note_peak(at_last);
         let per_verify = record.host_syncs_per_verify_step();
+        let recovery = Some((
+            record.verify_steps,
+            record.direct_rollbacks,
+            record.replay_forwards,
+            record.prefill_forwards,
+        ));
         eprintln!(
-            "[decode_bench] {row} K={k:<2}       {:>7.2} tok/s  accept {:.3}  fwd/tok {:.3}  syncs/verify {}  kv {}  attn {}",
+            "[decode_bench] {row} K={k:<2}       {:>7.2} tok/s  accept {:.3}  fwd/tok {:.3}  syncs/verify {}  {}  kv {}  attn {}",
             out.tokens.len() as f64 / decode,
             if stats.proposed > 0 {
                 stats.accepted as f64 / stats.proposed as f64
@@ -684,6 +702,7 @@ fn causal_decode_bench(
             },
             stats.forwards as f64 / out.tokens.len().max(1) as f64,
             per_verify.map_or("n/a".to_string(), |s| format!("{s:.2}")),
+            recovery_text(Some(stats.forwards as u64), recovery),
             record.kv_cache.label(),
             record.attn_formulation.label(),
         );
@@ -703,6 +722,7 @@ fn causal_decode_bench(
             Some(cache),
             Some((record.kv_cache.label(), record.attn_formulation.label())),
             per_verify,
+            recovery,
             fused,
             None,
             Some(record.proposer.label()),
@@ -878,6 +898,7 @@ type SpeculativeRow = (
     Option<(&'static str, &'static str)>,
     Option<f64>,
     &'static str,
+    Option<Recovery>,
 );
 
 /// The pre-epic MTP loop (`generate_qwen35_mtp_timed`), which the baseline binary still carries.
@@ -915,7 +936,7 @@ fn mtp_row(
     device.synchronize().unwrap();
     let decode_secs = decode_started.unwrap().elapsed().as_secs_f64();
     // No record on the baseline: the loop is the MTP loop by construction.
-    (out, stats, prefill_secs, decode_secs, None, None, "mtp")
+    (out, stats, prefill_secs, decode_secs, None, None, "mtp", None)
 }
 
 fn ngram_row(
@@ -1068,6 +1089,7 @@ fn row_json(
     cache: Option<(u64, u64)>,
     kinds: Option<(&str, &str)>,
     syncs_per_verify_step: Option<f64>,
+    recovery: Option<Recovery>,
     fused_primitives: Option<Value>,
     nvfp4_projections: Option<Value>,
     proposer: Option<&str>,
@@ -1092,6 +1114,9 @@ fn row_json(
         "drafts": drafts,
         "proposer": proposer,
         "host_syncs_per_verify_step": syncs_per_verify_step,
+        "verify_steps": recovery.map(|(v, _, _, _)| v),
+        "direct_rollbacks": recovery.map(|(_, d, _, _)| d),
+        "target_forwards_per_verify_step": forwards_per_verify(forwards, recovery),
         "generated_tokens": generated,
         "prefill_seconds": prefill_secs,
         "decode_seconds": decode_secs,
@@ -1115,6 +1140,35 @@ fn row_json(
         "first_divergence": diverged.flatten(),
         "tokens": out.tokens,
     })
+}
+
+/// A speculative row's recovery counters, from the engine's record (sc-24131):
+/// `(verify_steps, direct_rollbacks, replay_forwards, prefill_forwards)`.
+type Recovery = (u64, u64, u64, u64);
+
+/// Target forwards per verify step from the row's **measured** target forwards:
+/// `(target_forwards - prefill_forwards) / verify_steps` — the formula of
+/// `DecodeRecord::target_forwards_per_verify_step`, so a forward that is neither a verify step nor
+/// a counted replay raises it (sc-24131 AC2: exactly 1.0 on the per-token checkpoint ring).
+/// `None` without a verify step or a forward count.
+fn forwards_per_verify(forwards: Option<u64>, recovery: Option<Recovery>) -> Option<f64> {
+    match (forwards, recovery) {
+        (Some(forwards), Some((verify_steps, _, _, prefill))) if verify_steps > 0 => {
+            Some(forwards.saturating_sub(prefill) as f64 / verify_steps as f64)
+        }
+        _ => None,
+    }
+}
+
+/// The recovery counters for the log line: `fwd/verify` (the AC2 figure of sc-24131) and how
+/// many verify steps were recovered by a direct rollback vs a replay fallback.
+fn recovery_text(forwards: Option<u64>, recovery: Option<Recovery>) -> String {
+    match (forwards_per_verify(forwards, recovery), recovery) {
+        (Some(per_verify), Some((_, direct, replays, _))) => {
+            format!("fwd/verify {per_verify:.2}  rollbacks {direct} direct / {replays} replay")
+        }
+        _ => "fwd/verify n/a".to_string(),
+    }
 }
 
 /// Checks the `step_model` row's final-cache accounting: once a request has taken a single-token
@@ -1148,6 +1202,20 @@ fn last_token_sampler<'a>(
             }
         }
     }
+}
+
+#[test]
+fn forwards_per_verify_is_measured_net_of_the_prefill() {
+    // 6 forwards = 1 prefill + 4 verify steps + 1 replay.
+    assert_eq!(forwards_per_verify(Some(6), Some((4, 3, 1, 1))), Some(1.25));
+    // Three forwards that are neither verify steps nor counted replays raise it; the counters
+    // alone (`(verify_steps + replays) / verify_steps`) would still say 1.25.
+    assert_eq!(forwards_per_verify(Some(9), Some((4, 3, 1, 1))), Some(2.0));
+    assert_eq!(forwards_per_verify(Some(9), Some((0, 0, 0, 1))), None);
+    assert_eq!(
+        recovery_text(Some(9), Some((4, 3, 1, 1))),
+        "fwd/verify 2.00  rollbacks 3 direct / 1 replay"
+    );
 }
 
 #[test]
@@ -1265,6 +1333,7 @@ fn decode_bench() {
             None,
             growing_row_kinds(&model),
             None,
+            None,
             fused,
             nvfp4,
             Some("none"),
@@ -1312,6 +1381,7 @@ fn decode_bench() {
             used,
             None,
             growing_row_kinds(&model),
+            None,
             None,
             fused,
             nvfp4,
@@ -1363,6 +1433,7 @@ fn decode_bench() {
             None,
             growing_row_kinds(&model),
             None,
+            None,
             fused,
             nvfp4,
             Some("none"),
@@ -1413,6 +1484,7 @@ fn decode_bench() {
             cache,
             kinds,
             None,
+            None,
             fused,
             nvfp4,
             Some(proposer),
@@ -1431,7 +1503,7 @@ fn decode_bench() {
             let fused0 = fused_tally_now();
             let nv0 = nvfp4_tally_now();
             let mut at_last = None;
-            let (out, stats, prefill, decode, kinds, per_verify, proposer) = mtp_row(
+            let (out, stats, prefill, decode, kinds, per_verify, proposer, recovery) = mtp_row(
                 &model,
                 mtp,
                 &prompt,
@@ -1445,7 +1517,7 @@ fn decode_bench() {
             let nvfp4 = nvfp4_delta(nv0, nv_switch);
             let used = note_peak(at_last);
             eprintln!(
-                "[decode_bench] mtp K={k}          {:>7.2} tok/s  accept {:.3}  fwd/tok {:.3}  syncs/verify {}",
+                "[decode_bench] mtp K={k}          {:>7.2} tok/s  accept {:.3}  fwd/tok {:.3}  syncs/verify {}  {}",
                 out.tokens.len() as f64 / decode,
                 if stats.proposed > 0 {
                     stats.accepted as f64 / stats.proposed as f64
@@ -1453,7 +1525,8 @@ fn decode_bench() {
                     0.0
                 },
                 stats.forwards as f64 / out.tokens.len().max(1) as f64,
-                per_verify.map_or("n/a".to_string(), |s| format!("{s:.2}"))
+                per_verify.map_or("n/a".to_string(), |s| format!("{s:.2}")),
+                recovery_text(Some(stats.forwards as u64), recovery)
             );
             rows_json.push(row_json(
                 "mtp",
@@ -1470,6 +1543,7 @@ fn decode_bench() {
                 None,
                 kinds.or_else(|| growing_row_kinds(&model)),
                 per_verify,
+                recovery,
                 fused,
                 nvfp4,
                 Some(proposer),
@@ -1489,7 +1563,7 @@ fn decode_bench() {
             let fused0 = fused_tally_now();
             let nv0 = nvfp4_tally_now();
             let mut at_last = None;
-            let (out, stats, prefill, decode, kinds, per_verify, proposer) = ngram_row(
+            let (out, stats, prefill, decode, kinds, per_verify, proposer, recovery) = ngram_row(
                 &model,
                 &prompt,
                 &config,
@@ -1502,7 +1576,7 @@ fn decode_bench() {
             let nvfp4 = nvfp4_delta(nv0, nv_switch);
             let used = note_peak(at_last);
             eprintln!(
-                "[decode_bench] ngram K={k}        {:>7.2} tok/s  accept {:.3}  fwd/tok {:.3}  syncs/verify {}",
+                "[decode_bench] ngram K={k}        {:>7.2} tok/s  accept {:.3}  fwd/tok {:.3}  syncs/verify {}  {}",
                 out.tokens.len() as f64 / decode,
                 if stats.proposed > 0 {
                     stats.accepted as f64 / stats.proposed as f64
@@ -1510,7 +1584,8 @@ fn decode_bench() {
                     0.0
                 },
                 stats.forwards as f64 / out.tokens.len().max(1) as f64,
-                per_verify.map_or("n/a".to_string(), |s| format!("{s:.2}"))
+                per_verify.map_or("n/a".to_string(), |s| format!("{s:.2}")),
+                recovery_text(Some(stats.forwards as u64), recovery)
             );
             rows_json.push(row_json(
                 "ngram",
@@ -1527,6 +1602,7 @@ fn decode_bench() {
                 None,
                 kinds,
                 per_verify,
+                recovery,
                 fused,
                 nvfp4,
                 Some(proposer),

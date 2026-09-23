@@ -293,7 +293,7 @@ impl<D: StepModel> Proposer for DraftModelProposer<'_, D> {
         let mut cache = self.draft.new_cache_for(self.budget, self.max_drafts + 1)?;
         // The K + 1 single-token draft steps each start a forward; the step start they must
         // roll back to has to survive them.
-        cache.retain_checkpoints(self.max_drafts + 2);
+        cache.retain_checkpoints(self.max_drafts + 2)?;
         self.draft
             .forward_step(&mut cache, StepRequest::last(prompt))?;
         self.draft_forwards += 1;

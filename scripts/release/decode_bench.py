@@ -67,6 +67,8 @@ METRIC_COLUMNS = (
     ("target_forwards_per_generated_token", "fwd/tok", "{:.3f}"),
     ("host_syncs_per_token", "syncs/tok", "{:.2f}"),
     ("host_syncs_per_verify_step", "syncs/verify", "{:.2f}"),
+    ("target_forwards_per_verify_step", "fwd/verify", "{:.2f}"),
+    ("replay_forwards", "replay forwards", "{}"),
     ("device_used_bytes_at_last_token", "device used @ last token", "gib"),
     ("cache_live_bytes", "cache live", "mib"),
     ("cache_checkpoint_bytes", "cache checkpoints", "mib"),
@@ -291,7 +293,12 @@ def render_table(runs: list[dict[str, Any]]) -> str:
         "the binary predates the counter); syncs/verify = the speculative engine's transfers per "
         "verify step (n/a for non-speculative rows and where the binary predates the engine); "
         "fwd/tok = measured target forwards per generated token "
-        "(n/a where the binary predates the counter); fused primitives = the switch the row ran "
+        "(n/a where the binary predates the counter); fwd/verify = measured target forwards net "
+        "of the prefill per verify step (the verify forward plus any replay fallback or other "
+        "extra forward; 1.00 on the per-token DeltaNet checkpoint "
+        "ring, sc-24131) and replay forwards = verify steps the engine recovered by rolling back "
+        "to the step start and replaying the kept prefix (0 on the ring; n/a for non-speculative "
+        "rows and where the binary predates the counters); fused primitives = the switch the row ran "
         "under and how many RMSNorm / SwiGLU / QK-norm+RoPE leaves ran the fused kernel vs the "
         "op-chain reference, with the last reference reason (n/a where the binary predates the "
         "fused primitives); nvfp4 path = the NVFP4 decode-GEMV switch the row ran under and how many "
