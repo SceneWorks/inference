@@ -653,49 +653,55 @@ mod cuda {
     use super::SamplingParams;
     use crate::error::Result;
     use candle_core::backend::BackendStorage;
+    use candle_core::cuda_backend::cudarc::driver::CudaFunction;
     use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
     use candle_core::cuda_backend::WrapErr;
     use candle_core::op::BackpropOp;
     use candle_core::{CpuStorage, CudaStorage, CustomOp1, Device, Layout, Shape, Storage, Tensor};
+    use candle_quant_kernels::KernelSource;
 
-    const SOURCE: &str = include_str!("sampler_cuda.cu");
-    const MODULE: &str = "candle_llm_sampler_v1";
+    /// The sampler kernels, compiled through the shared nvrtc compile-once seam (sc-24137 /
+    /// sc-23990): once per device, failure cached, no build.rs.
+    const SRC: KernelSource = KernelSource {
+        name: "candle_llm_sampler_v1",
+        src: include_str!("sampler_cuda.cu"),
+        cc_floor: (7, 0),
+    };
     /// Must equal `SAMPLER_THREADS` in the kernel source (block reductions assume 32 full warps).
     const THREADS: u32 = 1024;
-    static PTX: std::sync::OnceLock<std::result::Result<String, String>> =
-        std::sync::OnceLock::new();
-
-    fn ptx() -> candle_core::Result<&'static str> {
-        match PTX.get_or_init(|| {
-            candle_core::cuda_backend::cudarc::nvrtc::compile_ptx(SOURCE)
-                .map(|ptx| ptx.to_src())
-                .map_err(|e| format!("sampler CUDA nvrtc compile failed: {e}"))
-        }) {
-            Ok(ptx) => Ok(ptx),
-            Err(error) => candle_core::bail!("{error}"),
-        }
-    }
 
     #[cfg(test)]
     thread_local! {
-        /// Test hook: make this thread see the kernel as failed to compile/load.
-        pub(super) static FORCE_UNAVAILABLE: std::cell::Cell<bool> =
-            const { std::cell::Cell::new(false) };
+        /// Test hook: resolve this thread's sampler kernels from another [`KernelSource`] (a
+        /// deliberately broken one exercises the seam's cached-failure path).
+        pub(super) static SOURCE_OVERRIDE: std::cell::Cell<Option<KernelSource>> =
+            const { std::cell::Cell::new(None) };
     }
 
-    /// Whether the sampler kernel is compiled and loaded on `device`. The PTX compile is cached
-    /// process-wide and the module per device (Candle's custom-function cache), so after the first
-    /// call this is a cache lookup. A failure is logged once (`tracing::warn!`) and the caller routes
-    /// to the host with [`super::HostSampleReason::DeviceUnavailable`].
+    fn source() -> KernelSource {
+        #[cfg(test)]
+        if let Some(src) = SOURCE_OVERRIDE.with(std::cell::Cell::get) {
+            return src;
+        }
+        SRC
+    }
+
+    /// The sampler function `name` on `dev`, from the seam's per-device cache.
+    fn function(dev: &candle_core::CudaDevice, name: &str) -> candle_core::Result<CudaFunction> {
+        source()
+            .compiled(dev)
+            .and_then(|kernel| kernel.function(name))
+            .map_err(|e| candle_core::Error::Msg(format!("sampler CUDA kernel: {e}")))
+    }
+
+    /// Whether the sampler kernel is compiled and loaded on `device`. The seam caches the compile
+    /// outcome per device — success or failure — so after the first call this is a cache lookup.
+    /// A failure is logged once (`tracing::warn!`) and the caller routes to the host with
+    /// [`super::HostSampleReason::DeviceUnavailable`].
     pub(super) fn kernel_available(device: &Device) -> bool {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let loaded = (|| -> candle_core::Result<()> {
-            #[cfg(test)]
-            if FORCE_UNAVAILABLE.with(std::cell::Cell::get) {
-                candle_core::bail!("sampler kernel forced unavailable (test hook)");
-            }
-            let dev = device.as_cuda_device()?;
-            dev.get_or_load_custom_func("candle_llm_sample_rows_f32", MODULE, ptx()?)?;
+            function(device.as_cuda_device()?, "candle_llm_sample_rows_f32")?;
             Ok(())
         })();
         match loaded {
@@ -743,15 +749,15 @@ mod cuda {
             })?;
             let x = storage.as_cuda_slice::<f32>()?.slice(start..end);
             let mut out = unsafe { dev.alloc::<u32>(rows) }?;
-            let function =
-                dev.get_or_load_custom_func("candle_llm_sample_rows_f32", MODULE, ptx()?)?;
+            let function = function(&dev, "candle_llm_sample_rows_f32")?;
             let vocab = vocab as u32;
             let config = LaunchConfig {
                 grid_dim: (rows as u32, 1, 1),
                 block_dim: (THREADS, 1, 1),
                 shared_mem_bytes: 0,
             };
-            let mut builder = function.builder();
+            let stream = dev.cuda_stream();
+            let mut builder = stream.launch_builder(&function);
             builder
                 .arg(&x)
                 .arg(&vocab)
@@ -792,10 +798,10 @@ mod cuda {
         let dev = device.as_cuda_device()?.clone();
         let mut out = unsafe { dev.alloc::<f32>(n) }?;
         if n > 0 {
-            let function =
-                dev.get_or_load_custom_func("candle_llm_splitmix_uniform_f32", MODULE, ptx()?)?;
+            let function = function(&dev, "candle_llm_splitmix_uniform_f32")?;
             let count = n as u32;
-            let mut builder = function.builder();
+            let stream = dev.cuda_stream();
+            let mut builder = stream.launch_builder(&function);
             builder.arg(&state).arg(&count).arg(&mut out);
             unsafe { builder.launch(LaunchConfig::for_num_elems(count)) }.w()?;
         }
@@ -1030,14 +1036,28 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(sampler_path(&gpu, 64, &params, false), SamplerPath::Device);
-        cuda::FORCE_UNAVAILABLE.with(|c| c.set(true));
+        // A source nvrtc cannot compile: the seam caches the failure and serves it again.
+        const BROKEN: candle_quant_kernels::KernelSource = candle_quant_kernels::KernelSource {
+            name: "candle_llm_sampler_test_broken",
+            src: "this is not CUDA",
+            cc_floor: (7, 0),
+        };
+        let cuda_dev = gpu.as_cuda_device().unwrap();
+        let first = BROKEN.compiled(cuda_dev).unwrap_err();
+        assert_eq!(first.label(), "nvrtc");
+        assert_eq!(
+            BROKEN.compiled(cuda_dev).unwrap_err(),
+            first,
+            "failure is cached"
+        );
+        cuda::SOURCE_OVERRIDE.with(|c| c.set(Some(BROKEN)));
         let path = sampler_path(&gpu, 64, &params, false);
         let before = crate::primitives::sampler_counters();
         let l = Tensor::from_vec(vec![0.5f32; 64], (1, 64), &gpu).unwrap();
         let mut rng = SplitMix64::new(3);
         let drawn = sample(&l, &[], &params, &mut rng, None);
         let batched = sample_device(&l, &params, &mut rng);
-        cuda::FORCE_UNAVAILABLE.with(|c| c.set(false));
+        cuda::SOURCE_OVERRIDE.with(|c| c.set(None));
         assert_eq!(path, SamplerPath::Host(HostSampleReason::DeviceUnavailable));
         assert!((0..64).contains(&drawn.unwrap()), "the host path answered");
         assert_eq!(batched.unwrap().dims(), &[1]);
