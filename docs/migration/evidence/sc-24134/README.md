@@ -9,7 +9,7 @@ tokens per row. The fixture and harness are the same as `docs/migration/evidence
 
 The runner lives in `crates/llm/candle-llm/src/decode/graph.rs` (`GraphRunner`). It captures, checks and replays a
 step model's decode steps (M = 1) and verify steps (M = K + 1) end to end. On a synthetic step model built from
-capturable ops it is token-identical to eager and **~28 % faster per step** in release.
+capturable ops it is token-identical to eager and **~28–30 % faster per step** in release.
 
 **No Qwen3.5/3.8 step can be replayed at candle `1e6aa85e`.** Three things block it:
 
@@ -204,7 +204,8 @@ Three sealed runs of the same binary at `7699d507a`. None had a co-tenant on GPU
 
 ## AC3 — fallback with a named reason, never a failure (samples)
 
-From `graph-unit-tests.log` (the CUDA unit tests) and the AC1 run (`dd91ecc9e`):
+From `graph-unit-tests-review.log` (this revision's CUDA unit tests, release) and the AC1 run (`dd91ecc9e`).
+`graph-unit-tests.log` is the same suite at `7699d507a`, including the since-removed masked-attention survey:
 
 ```text
 graph: eager replayed=0 eager=256 captured=0 fallback=deltanet_state_unstable      # 27B hybrid, spec off
@@ -222,8 +223,9 @@ graph.
 
 Which reasons have a test (CPU or CUDA unit tests unless noted):
 
-- the capability refusals `disabled`, `not_cuda`, `cuda_feature_off`, `legacy_stream`; `flash_attn_stream` only
-  compile-checked (`--features cuda,flash-attn`; its stream rule is unit-tested)
+- the capability refusals `disabled`, `not_cuda`, `cuda_feature_off`, `legacy_stream`, and `flash_attn_stream`
+  (`a_flash_attn_build_is_refused_by_name` and the device tests, run in a `--features cuda,flash-attn` build too:
+  there `select_device` stays on the legacy stream with the switch on, and the runner names the build)
 - the declarations `mock_cache_declared_unstable`, `positions_host_scalar`, `deltanet_state_unstable`
 - the census `sync_in_capture`, `allocation_escaped_capture`; `host_upload_in_capture` and `host_read_in_capture` in
   the POC tests and `census_step`
@@ -248,7 +250,7 @@ This records one step as a graph without launching anything:
 - `escaped=96` is the 48 linear layers × (conv state, SSM state) that the S1 cache replaces each step.
 - `htod` is candle's per-op layout metadata plus the host-built RoPE tables.
 - A replay would remove the host-side issue cost of ~3.9 k launches (and ~4.8 k allocation calls) per decode step. On
-  the synthetic model, graphs removed about 4.4 µs of host cost per captured kernel. At the same rate that would be
+  the synthetic model at `7699d507a`, graphs removed about 4.4 µs of host cost per captured kernel. At the same rate that would be
   on the order of 17 ms of a ~65–75 ms 27B decode step. This is an **upper bound**, reachable only after the three
   blockers above are removed. It is not a measured win.
 
@@ -257,7 +259,7 @@ This records one step as a graph without launching anything:
 This is a synthetic recurrent step model built only from contiguous ops, cuBLAS matmuls, `tanh`, `cat` (`copy2d`)
 and in-place `slice_set` — what candle can replay today:
 
-| test | result (release, `7699d507a`) |
+| test | result (release, this revision: `graph-unit-tests-review.log`) |
 |---|---|
 | `synthetic_decode_through_the_runner_is_token_identical_and_replays` | 40 greedy tokens identical to eager. `graph: mixed replayed=37 eager=6 captured=1`. Census `nodes=20 kernels=8 htod=0 alloc=6 free=6 escaped=0`. Staging 100 B |
 | `synthetic_speculative_k3_through_the_runner_is_token_identical_and_replays` | K = 3 through the engine (4-token verify steps, rejections, rollbacks, replay forwards): 48 tokens identical, acceptance identical. `graph: mixed replayed=41 eager=13 captured=2`. Exactly one sync per verify step, plus two self-check syncs per captured shape |
@@ -268,7 +270,7 @@ and in-place `slice_set` — what candle can replay today:
 | `graph_memory_is_reported_and_trimmed_when_the_graphs_go` | From a trimmed pool, one capture reports `graph_reserved_bytes = 33554432` (the device's whole reservation); `reset` trims it back to 0 |
 | `qwen35_steps_are_refused_by_declaration_and_the_census_finds_layout_uploads` | Tiny attention-only Qwen3.5 on the static cache → `positions_host_scalar`, no recording. `census_step` on a warmed 1-token step: `kernels=99 htod=11` → `host_upload_in_capture` (the runner's own recording at `7699d507a`, before the declaration existed, counted `kernels=100 htod=10`). The hybrid config → `deltanet_state_unstable` |
 | `poc_contiguous_ops_replay_bit_exact_and_index_select_is_refused` | matmul + softmax + affine + fused QK-norm/RoPE: 2 replays at new inputs, bit-exact. Adding one `index_select` → `htod=1` → refused |
-| `synthetic_replay_timing` | 2048 steps: **eager 125.5 µs/step, graphs 90.6 µs/step** (`replayed=2045`). An earlier release run at `6c07bcce3` measured 142.2 → 92.7 |
+| `synthetic_replay_timing` | 2048 steps: **eager 139.5 µs/step, graphs 97.6 µs/step** (`replayed=2045`, −30 %). Earlier release runs: 125.5 → 90.6 at `7699d507a`, 142.2 → 92.7 at `6c07bcce3` |
 
 ## What it would take for graphs to pay on Qwen3.8
 
@@ -277,7 +279,7 @@ These are ordered; each gate is visible as the runner's fallback reason:
 1. **S3's stable-address DeltaNet ring** lifts `deltanet_state_unstable` (and the `escaped=96`).
 2. **Positions as device data** lift `positions_host_scalar`: RoPE tables gathered from a device position, KV written
    at a device offset, attention over the capacity with a device length, through seam kernels whose arithmetic keeps
-   the static path's bits. The model then drops its declaration and implements the cache's `replay_advance`.
+   the static path's bits. The model then drops its declaration and `Qwen35Cache` implements `replay_advance`.
 3. **A candle revision that stops uploading layouts from host `Vec`s** lifts `host_upload_in_capture`, the census
    gate that follows.
 

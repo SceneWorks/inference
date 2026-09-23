@@ -1,0 +1,78 @@
+
+running 25 tests
+test decode::graph::cuda_tests::a_failed_launch_rolls_back_and_falls_back_eager ... [cuda-graph] launch failed: CUDA_ERROR_LAUNCH_FAILED
+[runner] failed launch: graph: mixed replayed=4 eager=9 captured=1 fallback=launch_failed
+ok
+test decode::graph::cuda_tests::a_flash_attn_build_is_refused_by_name ... [runner] select_device, switch on: graph: mixed replayed=1 eager=6 captured=1
+ok
+test decode::graph::cuda_tests::a_panic_inside_the_capture_still_ends_it ... 
+thread 'decode::graph::cuda_tests::a_panic_inside_the_capture_still_ends_it' (28568) panicked at crates\llm\candle-llm\src\decode\graph.rs:2851:17:
+a step panics inside the capture
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+ok
+test decode::graph::cuda_tests::a_refusal_drops_every_captured_shape ... [cuda-graph] refusing the captured 2-token step (allocation_escaped_capture): nodes=38 kernels=15 memcpy(dtod=0, htod=0, dtoh=0) memset=0 alloc=12 free=11 escaped=1 other=0
+ok
+test decode::graph::cuda_tests::graph_memory_is_reported_and_trimmed_when_the_graphs_go ... [runner] graph memory: GraphWorkspace { staging_bytes: 100, graph_reserved_bytes: 33554432 }, device reserved 33554432
+ok
+test decode::graph::cuda_tests::oversized_steps_are_named_shape_fallbacks ... ok
+test decode::graph::cuda_tests::poc_allocator_is_stream_ordered_and_the_stream_is_capturable ... [poc] has_async_alloc = true (cudarc 0.19 CudaStream::alloc -> cuMemAllocAsync); event tracking = false
+[poc] graph reserved mem now = Some(0)
+[cuda-graph] begin_capture failed: DriverError(CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED, "operation not permitted when stream is capturing")
+[poc] capture on the legacy NULL stream -> capture_invalidated
+ok
+test decode::graph::cuda_tests::poc_contiguous_ops_replay_bit_exact_and_index_select_is_refused ... [poc] contiguous step census: nodes=13 kernels=5 memcpy(dtod=0, htod=0, dtoh=0) memset=0 alloc=4 free=4 escaped=0 other=0
+[poc] contiguous step: 2 replays bit-exact; graph used mem after = Some(33554432)
+[poc] + index_select census: nodes=22 kernels=7 memcpy(dtod=0, htod=1, dtoh=0) memset=0 alloc=7 free=7 escaped=0 other=0
+ok
+test decode::graph::cuda_tests::poc_host_traffic_inside_capture_is_named ... [poc] pageable host->device upload inside capture -> host_upload_in_capture
+[poc] device->host read inside capture -> host_read_in_capture
+ok
+test decode::graph::cuda_tests::poc_single_op_census ... [poc] op matmul: census nodes=4 kernels=2 memcpy(dtod=0, htod=0, dtoh=0) memset=0 alloc=1 free=1 escaped=0 other=0
+[poc] op matmul: replayed, bit-identical = true
+[poc] op softmax: census nodes=4 kernels=2 memcpy(dtod=0, htod=0, dtoh=0) memset=0 alloc=1 free=1 escaped=0 other=0
+[poc] op softmax: replayed, bit-identical = true
+[poc] op index_select: census nodes=7 kernels=2 memcpy(dtod=0, htod=1, dtoh=0) memset=0 alloc=2 free=2 escaped=0 other=0
+[poc] op rope: census nodes=4 kernels=2 memcpy(dtod=0, htod=0, dtoh=0) memset=0 alloc=1 free=1 escaped=0 other=0
+[poc] op rope: replayed, bit-identical = true
+[poc] op affine: census nodes=4 kernels=2 memcpy(dtod=0, htod=0, dtoh=0) memset=0 alloc=1 free=1 escaped=0 other=0
+[poc] op affine: replayed, bit-identical = true
+[poc] op slice_set: census nodes=1 kernels=1 memcpy(dtod=0, htod=0, dtoh=0) memset=0 alloc=0 free=0 escaped=0 other=0
+[poc] op slice_set: replayed, bit-identical = true
+[poc] op transpose: census nodes=13 kernels=3 memcpy(dtod=0, htod=2, dtoh=0) memset=0 alloc=4 free=4 escaped=0 other=0
+[poc] op broadcast_add: census nodes=7 kernels=2 memcpy(dtod=0, htod=1, dtoh=0) memset=0 alloc=2 free=2 escaped=0 other=0
+[poc] op sum: census nodes=13 kernels=3 memcpy(dtod=0, htod=2, dtoh=0) memset=0 alloc=4 free=4 escaped=0 other=0
+ok
+test decode::graph::cuda_tests::qwen35_steps_are_refused_by_declaration_and_the_census_finds_layout_uploads ... [runner] qwen35 attention-only static: graph: eager replayed=0 eager=8 captured=0 fallback=positions_host_scalar
+[runner] qwen35 1-token static step census: nodes=322 kernels=99 memcpy(dtod=0, htod=11, dtoh=0) memset=0 alloc=106 free=106 escaped=0 other=0
+[runner] qwen35 hybrid static: graph: eager replayed=0 eager=8 captured=0 fallback=deltanet_state_unstable
+ok
+test decode::graph::cuda_tests::synthetic_decode_through_the_runner_is_token_identical_and_replays ... [runner] synthetic decode: graph: mixed replayed=37 eager=6 captured=1
+[runner] synthetic 1-token step census: nodes=20 kernels=8 memcpy(dtod=0, htod=0, dtoh=0) memset=0 alloc=6 free=6 escaped=0 other=0
+[runner] workspace: GraphWorkspace { staging_bytes: 100, graph_reserved_bytes: 33554432 }
+ok
+test decode::graph::cuda_tests::synthetic_misbehaviour_falls_back_with_a_named_reason ... [runner] declared: graph: eager replayed=0 eager=24 captured=0 fallback=mock_cache_declared_unstable
+[runner] host_read: graph: eager replayed=0 eager=25 captured=0 fallback=sync_in_capture
+[cuda-graph] refusing the captured 1-token step (allocation_escaped_capture): nodes=22 kernels=9 memcpy(dtod=0, htod=0, dtoh=0) memset=0 alloc=7 free=6 escaped=1 other=0
+[runner] escape: graph: eager replayed=0 eager=25 captured=0 fallback=allocation_escaped_capture
+[runner] escape census: nodes=22 kernels=9 memcpy(dtod=0, htod=0, dtoh=0) memset=0 alloc=7 free=6 escaped=1 other=0
+[cuda-graph] the first replay of the 1-token step disagreed with eager (replay_mismatch)
+[runner] scalar: graph: mixed replayed=1 eager=26 captured=0 fallback=replay_mismatch
+[runner] scalar census: nodes=23 kernels=9 memcpy(dtod=0, htod=0, dtoh=0) memset=0 alloc=7 free=7 escaped=0 other=0
+ok
+test decode::graph::cuda_tests::synthetic_replay_timing ... [timing] synthetic 2048 steps: eager 139.5 us/step, graphs 97.6 us/step (graph: mixed replayed=2045 eager=6 captured=1)
+ok
+test decode::graph::cuda_tests::synthetic_speculative_k3_through_the_runner_is_token_identical_and_replays ... [runner] synthetic K=3: graph: mixed replayed=41 eager=13 captured=2 (verify steps 24, forwards 48)
+ok
+test decode::graph::tests::census_refusals_are_named_in_priority_order ... ok
+test decode::graph::tests::driver_and_engine_through_the_runner_match_the_bare_model ... ok
+test decode::graph::tests::graph_admission_prices_every_step_shape_of_a_request ... ok
+test decode::graph::tests::runner_is_a_named_pass_through_when_off_or_off_device ... ok
+test decode::graph::tests::switch_env_default_is_off_and_runtime_override_round_trips ... ok
+test decode::graph::tests::tally_deltas_labels_and_describe ... ok
+test decode::graph::tests::the_policy_guard_restores_the_switch_it_found ... ok
+test device::cuda_tests::select_device_is_legacy_by_default_and_own_when_the_graph_runner_is_on ... ok
+test device::tests::cuda_stream_switch_parses_own_legacy_and_refuses_the_rest ... ok
+test device::tests::stream_default_is_legacy_unless_graphs_are_on_or_own_is_asked_for ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 336 filtered out; finished in 1.22s
+
