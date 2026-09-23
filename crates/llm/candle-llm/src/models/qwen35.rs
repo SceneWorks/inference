@@ -33,9 +33,9 @@ use crate::primitives::decode_cache::{tensor_bytes, CacheMemory, DecodeCache};
 use crate::primitives::gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
 };
-use crate::primitives::nn::{embed, input_ids, rms_norm, silu};
+use crate::primitives::nn::{embed, input_ids, rms_norm, rms_norm_residual, swiglu};
 use crate::primitives::projection::{Projection, ProjectionFormat, QuantSpec, WeightCensus};
-use crate::primitives::rope::{apply_rope, Rope};
+use crate::primitives::rope::{rms_norm_rope, Rope};
 use crate::primitives::{KvCache, PrismRegistry, Weights};
 
 fn checkpoint_norm_weight(weight: Tensor, prism: bool) -> Result<Tensor> {
@@ -370,20 +370,15 @@ impl Qwen35Attention {
             .narrow(3, hd, hd)?
             .contiguous()?
             .reshape((b, s, nh * hd))?;
-        let q = rms_norm(&q, &self.q_norm, self.eps)?; // [b,s,H,hd]
-
-        let k = rms_norm(
-            &self.k_proj.forward(x)?.reshape((b, s, nkv, hd))?,
-            &self.k_norm,
-            self.eps,
-        )?;
+        let k = self.k_proj.forward(x)?.reshape((b, s, nkv, hd))?;
         let v = self.v_proj.forward(x)?.reshape((b, s, nkv, hd))?;
 
-        // Partial RoPE (NeoX), then transpose into head-major [b,H,s,hd].
-        let q = apply_rope(&q, cos, sin, false)?
+        // Per-head QK-norm then partial RoPE (NeoX) — one fused leaf each (sc-24137) — then
+        // transpose into head-major [b,H,s,hd].
+        let q = rms_norm_rope(&q, &self.q_norm, self.eps, cos, sin, false)? // [b,s,H,hd]
             .transpose(1, 2)?
             .contiguous()?;
-        let k = apply_rope(&k, cos, sin, false)?
+        let k = rms_norm_rope(&k, &self.k_norm, self.eps, cos, sin, false)?
             .transpose(1, 2)?
             .contiguous()?;
         let v = v.transpose(1, 2)?.contiguous()?;
@@ -417,9 +412,9 @@ impl Mlp {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = silu(&self.gate.forward(x)?)?;
+        let gate = self.gate.forward(x)?;
         let up = self.up.forward(x)?;
-        self.down.forward(&gate.broadcast_mul(&up)?)
+        self.down.forward(&swiglu(&gate, &up)?)
     }
 }
 
@@ -569,8 +564,9 @@ impl DecoderLayer {
             (Mixer::Attn(a), Qwen35LayerCache::Attn(c)) => a.forward(&normed, cos, sin, c)?,
             _ => return Err(Error::Msg("qwen3_5: cache/mixer type mismatch".into())),
         };
-        let h = x.broadcast_add(&r)?;
-        let m = self.ffn.forward(&rms_norm(&h, &self.post_ln, self.eps)?)?;
+        // Residual add + post-attention norm as one fused leaf (sc-24137); `h` carries forward.
+        let (h, normed) = rms_norm_residual(x, &r, &self.post_ln, self.eps)?;
+        let m = self.ffn.forward(&normed)?;
         Ok(h.broadcast_add(&m)?)
     }
 }

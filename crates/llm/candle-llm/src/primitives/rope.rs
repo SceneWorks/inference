@@ -11,6 +11,7 @@
 
 use candle_core::{DType, Device, Tensor};
 
+use super::nn::rms_norm_reference;
 use crate::error::{Error, Result};
 
 /// A rotary embedding: the host-side inverse-frequency table plus the dimension it rotates.
@@ -329,6 +330,36 @@ impl Rope {
     pub fn interleaved(&self) -> bool {
         self.interleaved
     }
+}
+
+/// Per-head RMSNorm (`weight: [head_dim]`) followed by [`apply_rope`] — the Qwen3 / Qwen3.5
+/// **QK-norm** pattern (`q_norm(q)` then rotary). One fused launch on the fused path (see
+/// [`fused`](super::fused)); otherwise [`rms_norm_reference`] then [`apply_rope`], with the reason
+/// recorded. Bit-identical either way.
+pub fn rms_norm_rope(
+    x: &Tensor,
+    weight: &Tensor,
+    eps: f64,
+    cos: &Tensor,
+    sin: &Tensor,
+    interleaved: bool,
+) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if super::fused::try_fused() {
+        if let Some(out) = super::fused::outcome(candle_quant_kernels::fused_decode::rms_norm_rope(
+            x,
+            weight,
+            eps,
+            cos,
+            sin,
+            interleaved,
+        )) {
+            return out;
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    super::fused::note_not_attempted();
+    apply_rope(&rms_norm_reference(x, weight, eps)?, cos, sin, interleaved)
 }
 
 /// Apply rotary embeddings to `x`.

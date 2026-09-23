@@ -9,6 +9,7 @@
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module};
 
+use super::fused;
 use crate::error::{Error, Result};
 
 /// `x @ weightᵀ (+ bias)`. `weight` is `[out, in]` (HF layout); `x` is `[..., in]`.
@@ -19,7 +20,66 @@ pub fn linear(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tens
 
 /// RMSNorm: `x / sqrt(mean(x²) + eps) * weight`, computed in f32 and cast back to `x`'s dtype.
 /// `weight` is `[d]` and broadcasts over the leading dims; the norm is over the last axis.
+///
+/// On a `cuda` build with the fused path enabled (see [`fused`](super::fused)) this is one
+/// nvrtc-compiled launch that is bit-identical to [`rms_norm_reference`]; otherwise, or when the
+/// kernel refuses the input (dtype, shape) or cannot be compiled on this device, the op chain
+/// runs and the reason is recorded in the thread's fused tally.
 pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if fused::try_fused() {
+        if let Some(out) =
+            fused::outcome(candle_quant_kernels::fused_decode::rms_norm(x, weight, eps))
+        {
+            return out;
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    fused::note_not_attempted();
+    rms_norm_reference(x, weight, eps)
+}
+
+/// `h = x + residual` followed by `rms_norm(h, weight, eps)`, returning `(h, normed)` — the
+/// decoder-layer pattern where `h` is the residual stream carried forward. One fused launch on the
+/// fused path; otherwise the two ops, exactly as a caller would write them.
+pub fn rms_norm_residual(
+    x: &Tensor,
+    residual: &Tensor,
+    weight: &Tensor,
+    eps: f64,
+) -> Result<(Tensor, Tensor)> {
+    #[cfg(feature = "cuda")]
+    if fused::try_fused() {
+        if let Some(out) = fused::outcome(candle_quant_kernels::fused_decode::rms_norm_residual(
+            x, residual, weight, eps,
+        )) {
+            return out;
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    fused::note_not_attempted();
+    let h = x.broadcast_add(residual)?;
+    let normed = rms_norm_reference(&h, weight, eps)?;
+    Ok((h, normed))
+}
+
+/// SwiGLU gate: `silu(gate) * up` (the Llama / Qwen MLP form, `down(silu(gate(x)) * up(x))`).
+/// One fused launch on the fused path; otherwise [`silu`] then the product.
+pub fn swiglu(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if fused::try_fused() {
+        if let Some(out) = fused::outcome(candle_quant_kernels::fused_decode::swiglu(gate, up)) {
+            return out;
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    fused::note_not_attempted();
+    Ok(silu(gate)?.broadcast_mul(up)?)
+}
+
+/// The RMSNorm op chain — the reference every fused variant is checked against and the path CPU
+/// takes: `x / sqrt(mean(x²) + eps) * weight` in f32, cast back to `x`'s dtype.
+pub fn rms_norm_reference(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
     let orig = x.dtype();
     let xf = x.to_dtype(DType::F32)?;
     let last = xf.rank() - 1;
