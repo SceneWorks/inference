@@ -1,0 +1,12 @@
+**RTX Pro 6000 / sm_120** — Qwen/Qwen3-8B @ b968826d9c46 (`qwen3-8b`, config sha256 f7c4eadfbbf5), BF16 greedy, 80 prompt tokens, 256 new tokens per row.
+
+| run | row | tokens | match ref | match baseline ref | tok/s | acceptance | fwd/tok | syncs/tok | syncs/verify | device used @ last token | cache live | cache checkpoints | fused primitives |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| head-833e61542-gqa-ref-structured | MTP off (reference, growing kv, gqa attn) | 256 | (ref) | yes | 70.77 | n/a | 1.000 | 1.00 | n/a | 17.13 GiB | n/a | n/a | on: 46336 fused / 0 ref |
+| head-833e61542-gqa-ref-structured | MTP off (StepModel, static kv, gqa attn) | 256 | yes | yes | 73.27 | n/a | 1.000 | 1.00 | 1.00 | 17.13 GiB | 47.2 MiB | 0.0 MiB | on: 46336 fused / 0 ref |
+| head-833e61542-gqa-ref-structured | n-gram K=2 (static kv, gqa attn) | 256 | no @58 | no @58 | 79.51 | 0.232 | 0.770 | 0.77 | 1.00 | 17.13 GiB | 47.5 MiB | 0.0 MiB | on: 35657 fused / 0 ref |
+| head-833e61542-gqa-ref-structured | n-gram K=3 (static kv, gqa attn) | 256 | no @58 | no @58 | 81.00 | 0.164 | 0.762 | 0.76 | 1.00 | 17.13 GiB | 47.7 MiB | 0.0 MiB | on: 35295 fused / 0 ref |
+| head-833e61542-gqa-ref-structured | n-gram K=4 (static kv, gqa attn) | 256 | no @58 | no @58 | 78.55 | 0.128 | 0.770 | 0.77 | 1.00 | 17.13 GiB | 47.8 MiB | 0.0 MiB | on: 35657 fused / 0 ref |
+| head-833e61542-gqa-ref-structured | n-gram K=6 (static kv, gqa attn) | 256 | no @55 | no @55 | 88.14 | 0.137 | 0.695 | 0.70 | 1.00 | 17.09 GiB | 48.1 MiB | 0.0 MiB | on: 32218 fused / 0 ref |
+
+match baseline ref = tokens identical to `head-833e61542-gqa-ref-structured`'s reference row; device used @ last token = cuMemGetInfo total-free sampled at the row's last generated token while its cache is alive (device-wide, weights included); cache live / checkpoints = the StepModel row's final cache's own accounting (rollback checkpoints separately); syncs/tok = device->host transfers issued by candle-llm per generated token (n/a where the binary predates the counter); syncs/verify = the speculative engine's transfers per verify step (n/a for non-speculative rows and where the binary predates the engine); fwd/tok = measured target forwards per generated token (n/a where the binary predates the counter); fused primitives = the switch the row ran under and how many RMSNorm / SwiGLU / QK-norm+RoPE leaves ran the fused kernel vs the op-chain reference, with the last reference reason (n/a where the binary predates the fused primitives).
