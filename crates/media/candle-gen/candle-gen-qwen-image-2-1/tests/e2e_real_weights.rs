@@ -52,6 +52,43 @@ fn save_png(
     eprintln!("wrote {}", path.display());
 }
 
+/// Reject a render whose rows are stale GPU memory rather than a picture (sc-24114): the 2048²
+/// evidence render passed every shape assertion with 430 correct rows above 1,600 rows of noise
+/// — candle's CUDA im2col launch had truncated the full-resolution conv's element count to u32.
+/// Per row, the mean absolute second difference of the luma along the columns is ~3 for a
+/// rendered scene (the evidence's intact strip peaks at 9.2, the sane 1024² renders at 5.8) and
+/// 20–35 for uninitialised memory; a row over 20 is static, and more than a quarter of them fails
+/// the render. The fraction is printed so a borderline pass is still readable in the log.
+fn assert_not_band_corrupted(label: &str, pixels: &[u8], width: u32, height: u32) {
+    let (w, h) = (width as usize, height as usize);
+    assert_eq!(pixels.len(), w * h * 3, "{label}: RGB8 geometry");
+    assert!(w >= 3, "{label}: width {w} is too narrow to measure");
+    let luma =
+        |px: &[u8]| 0.299 * f32::from(px[0]) + 0.587 * f32::from(px[1]) + 0.114 * f32::from(px[2]);
+    let static_rows = pixels
+        .chunks_exact(w * 3)
+        .filter(|row| {
+            let l: Vec<f32> = row.chunks_exact(3).map(luma).collect();
+            let hf = l
+                .windows(3)
+                .map(|t| (t[2] - 2.0 * t[1] + t[0]).abs())
+                .sum::<f32>()
+                / (w - 2) as f32;
+            hf > 20.0
+        })
+        .count();
+    let fraction = static_rows as f32 / h as f32;
+    eprintln!(
+        "{label}: static rows {static_rows}/{h} ({:.1}%)",
+        100.0 * fraction
+    );
+    assert!(
+        fraction <= 0.25,
+        "{label}: {static_rows} of {h} rows are noise — the render is band-corrupted (a stale \
+         or truncated device buffer reached the output)"
+    );
+}
+
 fn snapshot() -> PathBuf {
     let p = std::env::var("CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT").unwrap_or_else(|_| {
         panic!("set CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT to the pinned snapshot dir; inference never self-fetches (epic 13657)")
@@ -131,6 +168,7 @@ fn validation_render_default_preset() {
         height,
         image::ColorType::Rgb8,
     );
+    assert_not_band_corrupted("default_preset", &image.pixels, width, height);
     eprintln!(
         "wrote {} ({width}x{height} RGB8) after {:.1}s total ({:.1}s render)",
         path.display(),
@@ -287,6 +325,7 @@ fn validation_render_reference_edit() {
             height,
             image::ColorType::Rgb8,
         );
+        assert_not_band_corrupted(&format!("{count} refs"), &image.pixels, width, height);
         eprintln!(
             "wrote {} ({width}x{height} RGB8) after {:.1}s render",
             path.display(),
@@ -631,6 +670,7 @@ fn validation_render_installed_tiers() {
             height,
             image::ColorType::Rgb8,
         );
+        assert_not_band_corrupted(label, &image.pixels, width, height);
         eprintln!(
             "{label}: {:.1}s total ({:.1}s render)",
             started.elapsed().as_secs_f32(),

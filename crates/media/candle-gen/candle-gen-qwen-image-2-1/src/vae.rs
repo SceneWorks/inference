@@ -28,7 +28,7 @@
 
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::ops::softmax_last_dim;
-use candle_gen::candle_nn::{Conv2d, Conv2dConfig, Module, VarBuilder};
+use candle_gen::candle_nn::{Conv2d, Conv2dConfig, VarBuilder};
 use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
 use candle_gen::gen_core::{CancelFlag, LatentSpace};
 use candle_gen::{CandleError as Error, LatentDecoder, Result};
@@ -72,8 +72,17 @@ impl Conv {
         })
     }
 
+    /// `Conv2d::forward`, chunked over output rows past [`candle_gen::CONV_IM2COL_BUDGET`]
+    /// (sc-24114): at the 2048² preset the full-resolution stage's im2col buffer exceeds the u32
+    /// element count candle's CUDA launch truncates to, and the un-chunked op filled only its
+    /// first 430 output rows. The ≤512² stages — and every parity fixture — stay the
+    /// byte-identical single pass; the 1024² and 2048² full-resolution convs chunk.
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        Ok(self.inner.forward(&x.contiguous()?)?)
+        Ok(candle_gen::conv2d_budgeted(
+            &x.contiguous()?,
+            &self.inner,
+            candle_gen::CONV_IM2COL_BUDGET,
+        )?)
     }
 }
 
