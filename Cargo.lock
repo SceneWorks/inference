@@ -530,6 +530,7 @@ dependencies = [
  "candle-gen-pid",
  "candle-gen-pulid",
  "candle-gen-qwen-image",
+ "candle-gen-qwen-image-2-1",
  "candle-gen-sam3",
  "candle-gen-sana",
  "candle-gen-scail2",
@@ -833,6 +834,22 @@ dependencies = [
  "image",
  "rand",
  "rand_distr",
+ "safetensors 0.7.0",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "candle-gen-qwen-image-2-1"
+version = "0.0.0"
+dependencies = [
+ "candle-core",
+ "candle-gen",
+ "candle-llm",
+ "candle-nn",
+ "rand",
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
@@ -2287,6 +2304,7 @@ dependencies = [
  "mlx-gen-pid",
  "mlx-gen-pulid",
  "mlx-gen-qwen-image",
+ "mlx-gen-qwen-image-2-1",
  "mlx-gen-sam2",
  "mlx-gen-sam3",
  "mlx-gen-sana",
@@ -2563,6 +2581,21 @@ dependencies = [
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "mlx-gen-qwen-image-2-1"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "mlx-gen",
+ "mlx-gen-z-image",
+ "mlx-llm",
+ "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
  "tempfile",
 ]
 

@@ -462,6 +462,37 @@ expected_files = [
 ]
 
 [[models]]
+# sc-24108 / sc-24109 — Qwen-Image 2.1, the pinned snapshot the `*-qwen-image-2-1` crates freeze (see their
+# UPSTREAM.md). Public, unmirrored, ~32 GB bf16 (text_encoder 17.5 GB + transformer 14.2 GB +
+# vae 1.35 GB). The crate's real-weight gates (`tests/e2e_real_weights.rs`: the released
+# tokenizer's 14-token system prefix and the bounded default-preset validation render) are
+# operator-run on the dev Mac behind an external RSS guard; the candle twin's cuda-gated
+# `tests/e2e_real_weights.rs` (sc-24109) is the same pair on an operator CUDA host. No CI runner
+# provisions this snapshot, so the key is deliberately unwired.
+key = "qwen-image-2-1"
+repository = "Qwen/Qwen-Image-2.1"
+revision = "790c92633540aa0cb11d9abf19eb46d861714758"
+license = "Qwen Research License Agreement"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT", "CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT"]
+unwired_reason = "operator-run validation renders behind an RSS guard (MLX, sc-24108) and on an operator CUDA host (candle, sc-24109); the 32 GB snapshot is provisioned on no CI runner"
+expected_files = [
+    "LICENSE",
+    "model_index.json",
+    "processor/tokenizer.json",
+    "processor/tokenizer_config.json",
+    "processor/chat_template.jinja",
+    "scheduler/scheduler_config.json",
+    "text_encoder/config.json",
+    "text_encoder/model.safetensors.index.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors.index.json",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
 # SC-18309 N1 needs only the real SDXL VAE to prove that the shared native decode seam is byte-
 # exact to the former direct engine expression. Keep this as an exact two-file projection instead
 # of materializing the 13.5 GB full SDXL matrix on the rw-mage runner.

@@ -36,6 +36,7 @@ pub mod providers {
     pub use candle_gen_pid as pid;
     pub use candle_gen_pulid as pulid;
     pub use candle_gen_qwen_image as qwen_image;
+    pub use candle_gen_qwen_image_2_1 as qwen_image_2_1;
     pub use candle_gen_sam3 as sam3;
     pub use candle_gen_sana as sana;
     pub use candle_gen_scail2 as scail2;
@@ -112,6 +113,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = candle_gen_minimax_h3::register_providers(registry);
     let registry = candle_gen_mochi::register_providers(registry);
     let registry = candle_gen_qwen_image::register_providers(registry);
+    let registry = candle_gen_qwen_image_2_1::register_providers(registry);
     let registry = candle_gen_sana::register_providers(registry);
     let registry = candle_gen_scail2::register_providers(registry);
     let registry = candle_gen_sd3::register_providers(registry);
@@ -858,10 +860,18 @@ mod preview_advertising {
 
     /// The third class: registered routes that neither emit previews **nor** are no-gos.
     ///
-    /// The class is empty after sc-17218 wired Boogu, but keeping it explicit prevents a future
-    /// viable-but-unwired route from being silently absorbed into the no-go set. The total-partition
-    /// assertion below keeps all three classes honest as the registry grows.
-    const PREVIEW_DEFERRED_ROUTE_IDS: &[(&str, &str)] = &[];
+    /// The class was empty after sc-17218 wired Boogu; sc-24109 re-opened it with Qwen-Image 2.1.
+    /// Keeping it explicit prevents a viable-but-unwired route from being silently absorbed into
+    /// the no-go set. The total-partition assertion below keeps all three classes honest as the
+    /// registry grows.
+    ///
+    /// `qwen_image_2_1` is deferred, **not** a no-go: nothing about its 64-channel RGBA latent
+    /// space says a linear RGB fit cannot clear the epic-16624 bar — it is simply a space no fit
+    /// has been measured for, and it is the one candle latent space with a fourth (alpha) channel,
+    /// so the projection and the preview surface are the same question. sc-24111 is the story that
+    /// carries the RGBA output surface, and it is where the fit and the wiring belong together.
+    /// Its MLX twin (sc-24108) advertises `supports_preview: false` for the same reason.
+    const PREVIEW_DEFERRED_ROUTE_IDS: &[(&str, &str)] = &[("qwen_image_2_1", "sc-24111")];
 
     // ---- The derived half: what the provider sources actually do ---------------------------------
 
@@ -1232,6 +1242,17 @@ mod preview_advertising {
                     dark: &[],
                 },
             ],
+        },
+        ProviderCrate {
+            dir: "candle-gen-qwen-image-2-1",
+            register: candle_gen_qwen_image_2_1::register_providers,
+            denoise: Denoise::Shared,
+            // sc-24109: UNWIRED, hence the empty inventory. The crate's single
+            // `run_flow_sampler` site passes the literal `None` and it ships no `preview` module,
+            // so it emits nothing anywhere and is carried in DEFERRED_PREVIEW_ROUTE_IDS below
+            // rather than pinning a per-file inventory (an inventory only means something on a
+            // crate that emits).
+            routes: &[],
         },
         ProviderCrate {
             dir: "candle-gen-sana",
@@ -3492,6 +3513,14 @@ mod preview_advertising {
             register_surfaces: Some(candle_gen_qwen_image::register_memory_contract_surfaces),
             resident_only_on_cpu: false,
         },
+        // sc-24112: the Qwen-Image 2.1 route publishes the shared ladder (staged residency +
+        // bounded decode implemented, the two bounded-DiT rungs classified).
+        MemoryRouteCrate {
+            dir: "candle-gen-qwen-image-2-1",
+            register_providers: candle_gen_qwen_image_2_1::register_providers,
+            register_surfaces: Some(candle_gen_qwen_image_2_1::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
         MemoryRouteCrate {
             dir: "candle-gen-sana",
             register_providers: candle_gen_sana::register_providers,
@@ -5078,9 +5107,10 @@ mod tests {
     fn every_registered_generator_advertises_its_exact_latent_space() {
         use candle_gen::gen_core::{
             LatentSpace, FLUX1_LATENT_SPACE, FLUX2_PACKED_LATENT_SPACE, LTX_VIDEO_LATENT_SPACE,
-            MAGE_LATENT_SPACE, MOCHI_VIDEO_LATENT_SPACE, QWEN_KREA_Z16_LATENT_SPACE,
-            SANA_LATENT_SPACE, SD3_LATENT_SPACE, SDXL_LATENT_SPACE, SEEDVR2_VIDEO_LATENT_SPACE,
-            SVD_LATENT_SPACE, WAN_Z16_VIDEO_LATENT_SPACE, WAN_Z48_LATENT_SPACE,
+            MAGE_LATENT_SPACE, MOCHI_VIDEO_LATENT_SPACE, QWEN_IMAGE_2_1_Z64_LATENT_SPACE,
+            QWEN_KREA_Z16_LATENT_SPACE, SANA_LATENT_SPACE, SD3_LATENT_SPACE, SDXL_LATENT_SPACE,
+            SEEDVR2_VIDEO_LATENT_SPACE, SVD_LATENT_SPACE, WAN_Z16_VIDEO_LATENT_SPACE,
+            WAN_Z48_LATENT_SPACE,
         };
 
         fn expected(
@@ -5088,6 +5118,8 @@ mod tests {
         ) -> Option<&'static LatentSpace> {
             match descriptor.family {
                 "anima" | "qwen-image" | "krea_2" => Some(&QWEN_KREA_Z16_LATENT_SPACE),
+                // Qwen-Image 2.1's 64-channel RGBA autoencoder is its own lineage (sc-24109).
+                "qwen-image-2-1" => Some(&QWEN_IMAGE_2_1_Z64_LATENT_SPACE),
                 "wan" if descriptor.id == "wan2_2_ti2v_5b" => Some(&WAN_Z48_LATENT_SPACE),
                 "bernini" | "scail2" | "wan" => Some(&WAN_Z16_VIDEO_LATENT_SPACE),
                 "flux" | "boogu" | "chroma" | "z-image" => Some(&FLUX1_LATENT_SPACE),
@@ -5806,6 +5838,7 @@ mod tests {
                 "minimax_h3",
                 "mochi_1",
                 "qwen_image",
+                "qwen_image_2_1",
                 "sana_1600m",
                 "sana_sprint_1600m",
                 "scail2_14b",
@@ -5857,10 +5890,11 @@ mod tests {
 
         // sc-16667: the pinned surface and the model-weight licence mapping move together — this is
         // where a surface change and a mapping change meet. Five of the seven trainer ids are also
-        // generator ids, which is why 55 generators + 2 trainer-only ids + 1 captioner + 2
-        // embedders are 60 distinct ids.
+        // generator ids, which is why 56 generators + 2 trainer-only ids + 1 captioner + 2
+        // embedders are 61 distinct ids (sc-24109 adds `qwen_image_2_1`, a generator with its own
+        // component row).
         //
-        // Registration is never conditioned on the mapping: 50 < 60 because ten ids load nothing
+        // Registration is never conditioned on the mapping: 51 < 61 because ten ids load nothing
         // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in
         // our metadata for CI to report, and `licenses::tests` pins which ten and why — as
         // `#[cfg(test)]` data, so no gate can read it and suppress them.
@@ -5871,8 +5905,8 @@ mod tests {
             .chain(&image_embedders)
             .chain(&text_embedders)
             .collect();
-        assert_eq!(distinct.len(), 60);
-        assert_eq!(super::provider_components().len(), 50);
+        assert_eq!(distinct.len(), 61);
+        assert_eq!(super::provider_components().len(), 51);
     }
 
     /// The manifest emitter runs on **this** catalog's three slices, and its output is

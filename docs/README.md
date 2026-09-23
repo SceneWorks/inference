@@ -43,6 +43,9 @@ clause for every term assigned to a licence family.
   upstream checkpoints every registered media provider actually loads, read from the code. Records
   component identity only: it assigns no families and asserts no licences, and marks every component
   whose upstream the repository does not state as UNDETERMINED.
+- **[Qwen Research License evidence (sc-24108)](licensing/sc-24108-qwen-research-licence-evidence.md)** —
+  the primary-source read behind the `qwen-research` family and the `qwen_image_2_1` component row
+  (Qwen-Image 2.1). **Draft, unsigned.**
 - **[Checkpoint licence evidence (sc-16665)](licensing/sc-16665-checkpoint-licence-evidence.md)** —
   the primary-source licence read for each of those checkpoints, and the sign-off document behind
   `license::components`. **Draft, unsigned.** Its

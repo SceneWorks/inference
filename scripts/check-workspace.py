@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_MEMBER_COUNT = 95
+EXPECTED_MEMBER_COUNT = 97
 INTERNAL_PACKAGES = {
     "candle-audio",
     "candle-audio-catalog",
@@ -307,6 +307,14 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
         "backend asserts its own value is disjoint from that backend's own production identity set. "
         "Two backends sharing one would let a context assembled against the candle declaration "
         "satisfy the mlx handshake — the same reasoning as flux2's CALIBRATION_FINGERPRINT above."
+    ),
+    ("qwen-image-2-1", "MEMORY_CALIBRATION_FINGERPRINT"): (
+        "a calibration identity, per-backend by construction — the same reason as lens's entry "
+        "below. Neither value names a measured campaign yet: sc-24112 publishes a DERIVED memory "
+        "model on both backends, and the two derivations are genuinely different quantities (each "
+        "prices its components at the width ITS loader materializes them at). Letting the two "
+        "share one fingerprint would let a record built against one backend satisfy the other's "
+        "handshake, which is exactly what the identity exists to prevent."
     ),
     ("lens", "MEMORY_CALIBRATION_FINGERPRINT"): (
         "a calibration identity, per-backend by construction — the candle value names the CUDA "

@@ -119,10 +119,10 @@ pub use gen_core::weightsmeta::{safetensors_dir_bytes, safetensors_path_bytes};
 pub use generator::{
     default_seed, ActivationMemoryAnchor, Capabilities, Conditioning, ConditioningKind,
     ControlClipRef, ControlKind, GenerationOutput, GenerationPhase, GenerationRequest, Generator,
-    KeyframeRef, Modality, ModelDescriptor, PhaseAdapter, ReplacementMode, SizeFloor,
-    StagedResidencyAvailability, StepSupport, VideoClipRef,
+    KeyframeRef, Modality, ModelDescriptor, OutputChannels, PhaseAdapter, ReplacementMode,
+    SizeFloor, StagedResidencyAvailability, StepSupport, VideoClipRef,
 };
-pub use media::{AudioTrack, Image};
+pub use media::{AudioTrack, Image, RgbaImage};
 pub use registry::{
     CaptionerRegistration, ModelRegistration, PerComponentBytes, ProviderRegistry,
     ProviderRegistryBuilder, TrainerRegistration, TransformRegistration,

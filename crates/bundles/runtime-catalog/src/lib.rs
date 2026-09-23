@@ -647,6 +647,7 @@ fn modality_name(modality: Modality) -> &'static str {
 fn conditioning_name(conditioning: ConditioningKind) -> &'static str {
     match conditioning {
         ConditioningKind::Reference => "reference",
+        ConditioningKind::ReferenceRgba => "referenceRgba",
         ConditioningKind::ReferenceAudio => "referenceAudio",
         ConditioningKind::ReferenceVideo => "referenceVideo",
         ConditioningKind::AudioEdit => "audioEdit",

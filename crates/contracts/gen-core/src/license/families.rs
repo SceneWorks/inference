@@ -1,5 +1,5 @@
-//! The licence **family** table (sc-16662, extended by sc-16665) — nineteen upstream licence texts,
-//! transcribed.
+//! The licence **family** table (sc-16662, extended by sc-16665 and sc-24108) — twenty-one upstream
+//! licence texts, transcribed.
 //!
 //! # PROVISIONAL — gathered by an agent, not yet signed off by a human
 //!
@@ -711,6 +711,61 @@ pub const INSIGHTFACE_RESEARCH_ONLY: LicenseFamily = LicenseFamily {
     terms: &[LicenseTerm::NonCommercialWeights],
 };
 
+/// `Qwen/Qwen-Image-2.1` — the **Qwen RESEARCH LICENSE AGREEMENT**, release date September 20, 2026
+/// (sc-24108).
+///
+/// Text read at
+/// <https://huggingface.co/Qwen/Qwen-Image-2.1/raw/790c92633540aa0cb11d9abf19eb46d861714758/LICENSE>
+/// on 2026-09-22 (the `LICENSE` file shipped beside the pinned weights; the card declares
+/// `license_name: qwen-research`). A different text from the Apache-2.0 the earlier Qwen-Image
+/// checkpoints declare: §1(i) defines "Non-Commercial" as *"for research or evaluation purposes
+/// only"* and §2(a) grants the licence *"FOR NON-COMMERCIAL PURPOSES ONLY"*. The text restricts use
+/// of the **Materials** (weights, code, documentation) and says nothing about outputs, so no
+/// outputs term — see the module note on silence.
+pub const QWEN_RESEARCH: LicenseFamily = LicenseFamily {
+    id: "qwen-research",
+    spdx_id: "LicenseRef-Qwen-Research-License",
+    name: "Qwen Research License Agreement",
+    text_url: "https://huggingface.co/Qwen/Qwen-Image-2.1/raw/790c92633540aa0cb11d9abf19eb46d861714758/LICENSE",
+    terms: &[
+        // §2(a) "…to use, reproduce, distribute, copy, create derivative works of, and make
+        // modifications to the Materials FOR NON-COMMERCIAL PURPOSES ONLY."
+        LicenseTerm::NonCommercialWeights,
+        // §2(b) "You shall not use the Materials for any commercial purpose without obtaining a
+        // separate commercial license from us. If you wish to use the Materials commercially, you
+        // shall request a license from us at model-business@notice.qwencloud.com."
+        LicenseTerm::RegistrationRequired {
+            contact: Some("model-business@notice.qwencloud.com"),
+        },
+        // §3(a) "You shall give any other recipients of the Materials or derivative works a copy
+        // of this Agreement".
+        LicenseTerm::DownstreamLicenseCopy {
+            family: "qwen-research",
+        },
+        // §3(b) "You shall cause any modified files to carry prominent notices stating that you
+        // changed the files" and §3(c) "You shall retain in all copies of the Materials that you
+        // distribute the following attribution notices within a "Notice" text file".
+        LicenseTerm::NoticeFileRequired,
+        // §3(c), the notice itself: "Qwen is licensed under the Qwen RESEARCH LICENSE AGREEMENT,
+        // Copyright (c) 2026 Hangzhou Tongyi Laboratory Technology Co., Ltd. All Rights Reserved."
+        LicenseTerm::AttributionRequired,
+        // §4(b), verbatim — a duty on a product that trains or improves a model with the Materials
+        // or their outputs; no typed variant carries it.
+        LicenseTerm::DeployerObligation {
+            text: "If you use the Materials or any outputs or results therefrom to create, train, \
+                   fine-tune, or improve an AI model that is distributed or made available, you \
+                   shall prominently display \"Built with Qwen\" or \"Improved using Qwen\" in the \
+                   related product documentation.",
+        },
+        // §4(c), verbatim.
+        LicenseTerm::DeployerObligation {
+            text: "You shall not use \"Qwen\" as the primary name or identifier of any derivative \
+                   works or products; reasonable descriptive use (e.g., \"fine-tuned from Qwen \
+                   Image\") is permitted.",
+        },
+    ],
+};
+
 /// The ChatGLM3-6B License.
 ///
 /// Text read at <https://raw.githubusercontent.com/THUDM/ChatGLM3/main/MODEL_LICENSE> on
@@ -978,6 +1033,7 @@ pub const LICENSE_FAMILIES: &[LicenseFamily] = &[
     MIT,
     NVIDIA_NSCLV1,
     NVIDIA_OPEN_MODEL,
+    QWEN_RESEARCH,
     STABILITY_AI_COMMUNITY,
 ];
 
@@ -1013,9 +1069,10 @@ mod tests {
             MIT,
             NVIDIA_NSCLV1,
             NVIDIA_OPEN_MODEL,
+            QWEN_RESEARCH,
             STABILITY_AI_COMMUNITY,
         ];
-        assert_eq!(LICENSE_FAMILIES.len(), 20);
+        assert_eq!(LICENSE_FAMILIES.len(), 21);
         assert_eq!(LICENSE_FAMILIES, DECLARED);
 
         for family in LICENSE_FAMILIES {
@@ -1099,6 +1156,7 @@ mod tests {
                 "ideogram-4-non-commercial",
                 "insightface-research-only",
                 "nvidia-nsclv1",
+                "qwen-research",
             ]
         );
     }
@@ -1200,6 +1258,7 @@ mod tests {
                 "minimax-h3-community",
                 "nvidia-nsclv1",
                 "nvidia-open-model",
+                "qwen-research",
                 "stability-ai-community",
             ]
         );
@@ -1556,6 +1615,18 @@ mod tests {
                     "notice_file_required",
                     "attribution_required",
                     "acceptable_use_policy:https://www.nvidia.com/en-us/agreements/trustworthy-ai/terms/",
+                ],
+            ),
+            (
+                "qwen-research",
+                vec![
+                    "non_commercial_weights",
+                    "registration_required:model-business@notice.qwencloud.com",
+                    "downstream_license_copy:qwen-research",
+                    "notice_file_required",
+                    "attribution_required",
+                    "deployer_obligation:If you use the Materials or any outputs or resul",
+                    "deployer_obligation:You shall not use \"Qwen\" as the primary name or ",
                 ],
             ),
             (

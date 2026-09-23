@@ -5,7 +5,7 @@
 //! dimension later. The only mutable state in a forward pass is the KV cache, threaded in as
 //! `&mut dyn KvCache`.
 
-pub(crate) mod deepstack;
+pub mod deepstack;
 pub mod gemma4_mm;
 pub mod llama;
 pub mod qwen35;

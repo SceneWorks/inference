@@ -135,7 +135,7 @@ pub use generator::{
     AudioEditMode, AudioEditRef, AudioParams, Capabilities, ComponentPrecisionFloor, Conditioning,
     ConditioningKind, ControlClipRef, ControlKind, ConversationRole, ConversationSession,
     ConversationTurn, GenerationMemory, GenerationOutput, GenerationPhase, GenerationRequest,
-    Generator, HdrRequest, KeyframeRef, Modality, ModelDescriptor, PhaseAdapter,
+    Generator, HdrRequest, KeyframeRef, Modality, ModelDescriptor, OutputChannels, PhaseAdapter,
     PrecisionFloorComponent, ReplacementMode, SizeFloor, SpeechSegment,
     StagedResidencyAvailability, StepSupport, TimeRegion, VideoClipRef,
     REFERENCE_IMAGE_SHORT_EDGE_DEFAULT, REFERENCE_IMAGE_SHORT_EDGE_MAX,
@@ -154,10 +154,12 @@ pub use latent::{
     LatentNormalizationStats, LatentPatchLayout, LatentSpace, LatentTemporalLaw,
     SpatialCompression, DECODER_OPTIONS, FLUX1_LATENT_SPACE, FLUX2_PACKED_LATENT_SPACE,
     LTX_VIDEO_LATENT_SPACE, MAGE_LATENT_SPACE, MOCHI_VIDEO_LATENT_SPACE,
-    QWEN_KREA_Z16_LATENT_SPACE, QWEN_WAN_Z16_MEAN, QWEN_WAN_Z16_NORMALIZATION, QWEN_WAN_Z16_STD,
-    SANA_LATENT_SPACE, SD3_LATENT_SPACE, SDXL_LATENT_SPACE, SEEDVR2_VIDEO_LATENT_SPACE,
-    SVD_LATENT_SPACE, WAN_2_1_VAE_DECODER_ID, WAN_Z16_LATENT_SPACE, WAN_Z16_VIDEO_LATENT_SPACE,
-    WAN_Z48_LATENT_SPACE, WAN_Z48_MEAN, WAN_Z48_NORMALIZATION, WAN_Z48_STD,
+    QWEN_IMAGE_2_1_Z64_LATENT_SPACE, QWEN_IMAGE_2_1_Z64_MEAN, QWEN_IMAGE_2_1_Z64_NORMALIZATION,
+    QWEN_IMAGE_2_1_Z64_STD, QWEN_KREA_Z16_LATENT_SPACE, QWEN_WAN_Z16_MEAN,
+    QWEN_WAN_Z16_NORMALIZATION, QWEN_WAN_Z16_STD, SANA_LATENT_SPACE, SD3_LATENT_SPACE,
+    SDXL_LATENT_SPACE, SEEDVR2_VIDEO_LATENT_SPACE, SVD_LATENT_SPACE, WAN_2_1_VAE_DECODER_ID,
+    WAN_Z16_LATENT_SPACE, WAN_Z16_VIDEO_LATENT_SPACE, WAN_Z48_LATENT_SPACE, WAN_Z48_MEAN,
+    WAN_Z48_NORMALIZATION, WAN_Z48_STD,
 };
 pub use license::components::MEDIA_COMPONENT_LICENSES;
 pub use license::families::LICENSE_FAMILIES;
@@ -166,7 +168,7 @@ pub use license::{
     license_table_conformance_errors, provider_terms, resolve_component, resolve_family,
     CeilingBoundary, ComponentLicense, LicenseFamily, LicenseTerm, ProviderComponents,
 };
-pub use media::{AudioChunk, AudioStem, AudioTrack, HdrFrame, Image};
+pub use media::{AudioChunk, AudioStem, AudioTrack, HdrFrame, Image, RgbaImage};
 pub use memory_phases::{
     DecoderTilingRealization, DecoderWorkspaceFacts, ImagePipelineArchitecture, MemoryPhaseFacts,
     StagedWeightSchedule, StreamedWeightFacts,
