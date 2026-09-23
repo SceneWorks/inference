@@ -26,11 +26,7 @@ CUDA_CELLS = (
     "functional-candle-pq2-bf16", "functional-candle-pq2-q8",
     "functional-candle-ptq1-bf16", "functional-candle-ptq1-q8",
 )
-CPU_CELLS = (
-    "candle-cpu-qwen38-parent", "candle-cpu-bonsai-gguf",
-    "candle-cpu-qwen3vl-baseline",
-)
-ROLES = ("mlx", "cuda", *CPU_CELLS)
+ROLES = ("mlx", "cuda")
 
 
 def qualified_publisher(root: Path, runtime_sha: str) -> tuple[dict, dict]:
@@ -72,25 +68,6 @@ def stage_cuda(args: argparse.Namespace) -> int:
         if row.is_dir():
             shutil.copytree(row, output / cell)
     return 0
-
-
-def prepare_cpu(args: argparse.Namespace) -> int:
-    publisher, output = args.publisher.resolve(), args.output.resolve()
-    metadata, _ = qualified_publisher(publisher, args.runtime_sha)
-    hardware = terminal.validate_hardware_record(output / "hardware-before.json")
-    terminal.physical_windows_host_identity(hardware)
-    if metadata.get("hostname") != hardware["host"].get("hostname"):
-        raise ValueError("CPU row and publisher verification ran on different Windows hosts")
-    for name in ("snapshot-metadata.json", "provision-report.json"):
-        target = output / name
-        if target.exists():
-            raise ValueError(f"CPU publisher evidence already exists: {target}")
-        shutil.copy2(publisher / name, target)
-    return 0
-
-
-def artifact_roles(role: str) -> tuple[str, ...]:
-    return ("publisher",) if role == "publisher" else ROLES
 
 
 def list_run_artifacts(api_url: str, repository: str, run_id: str, token: str) -> list[dict]:
@@ -162,7 +139,7 @@ def select(args: argparse.Namespace) -> int:
     if not token:
         raise ValueError("GITHUB_TOKEN is required to select immutable artifact IDs")
     items = list_run_artifacts(args.api_url, args.repository, args.run_id, token)
-    chosen = choose_artifacts(items, roles=artifact_roles(args.role), runtime_sha=runtime_sha, run_id=args.run_id)
+    chosen = choose_artifacts(items, roles=ROLES, runtime_sha=runtime_sha, run_id=args.run_id)
     terminal.write_new(args.output, {
         "schema_version": 1, "runtime_sha": runtime_sha, "run_id": args.run_id,
         "selected": chosen,
@@ -186,9 +163,7 @@ def check_partition(args: argparse.Namespace) -> int:
     elif args.role == "cuda":
         ids = CUDA_CELLS
     else:
-        ids = (args.cell,)
-        if args.cell not in CPU_CELLS:
-            raise ValueError("unknown CPU campaign cell")
+        raise ValueError("unknown accelerator campaign partition")
     cells = {item["id"]: item for item in spec["cells"]}
     for cell_id in ids:
         cell = cells[cell_id]
@@ -276,7 +251,7 @@ def aggregate(args: argparse.Namespace) -> int:
                   artifact_selection=sealed_selection)
     status = terminal.matrix_status(argparse.Namespace(**common))
     if status != 0:
-        raise ValueError("full 19-cell matrix did not pass; inspect aggregate report")
+        raise ValueError("full 16-cell accelerator matrix did not pass; inspect aggregate report")
     terminal.verify_matrix_seal(argparse.Namespace(**common))
     return 0
 
@@ -289,13 +264,8 @@ def main() -> int:
     stage.add_argument("--output", type=Path, required=True)
     stage.add_argument("--runtime-sha", required=True)
     stage.set_defaults(func=stage_cuda)
-    prepare = sub.add_parser("prepare-cpu")
-    prepare.add_argument("--publisher", type=Path, required=True)
-    prepare.add_argument("--output", type=Path, required=True)
-    prepare.add_argument("--runtime-sha", required=True)
-    prepare.set_defaults(func=prepare_cpu)
     selector = sub.add_parser("select")
-    selector.add_argument("--role", choices=("publisher", "matrix"), required=True)
+    selector.add_argument("--role", choices=("matrix",), required=True)
     selector.add_argument("--runtime-sha", required=True)
     selector.add_argument("--run-id", required=True)
     selector.add_argument("--repository", required=True)
@@ -305,7 +275,7 @@ def main() -> int:
     selector.set_defaults(func=select)
     check = sub.add_parser("check-partition")
     check.add_argument("--root", type=Path, required=True)
-    check.add_argument("--role", choices=("mlx", "cuda", "cpu"), required=True)
+    check.add_argument("--role", choices=("mlx", "cuda"), required=True)
     check.add_argument("--cell")
     check.add_argument("--runtime-sha", required=True)
     check.add_argument("--matrix", type=Path, default=Path("release/qwen38-bonsai-matrix.json"))

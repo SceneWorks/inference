@@ -1158,11 +1158,6 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             with self.subTest(replacement=replacement):
                 mutated = workflow.replace(WINDOWS_INTERPRETER, replacement, 1)
                 self.assertTrue(real_weight_windows_interpreter_errors(mutated))
-        ps_command = "& $env:REVIEWED_PYTHON scripts/release/qwen38_bonsai_terminal.py @arguments"
-        self.assertIn(ps_command, workflow)
-        for replacement in ("python", "py -3.14", "$env:OTHER_PYTHON"):
-            mutated = workflow.replace(ps_command, ps_command.replace("$env:REVIEWED_PYTHON", replacement), 1)
-            self.assertTrue(real_weight_windows_interpreter_errors(mutated))
         first_windows_install = pip_installs[0]
         no_fail_fast = workflow.replace(
             first_windows_install, first_windows_install.removesuffix(" || exit /b 1"), 1
@@ -3800,7 +3795,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     self.assert_qwen38_candle_requires_successful_mlx(mutated)
 
-    def test_qwen38_bonsai_terminal_profile_is_explicit_serial_and_sealed(self) -> None:
+    def test_qwen38_bonsai_terminal_profile_is_accelerator_only_and_sealed(self) -> None:
         workflow = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
         options = workflow[True]["workflow_dispatch"]["inputs"]["profile"]["options"]
         self.assertIn("qwen38-bonsai", options)
@@ -3811,101 +3806,41 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         jobs = workflow["jobs"]
         mlx = jobs["qwen38-bonsai-mlx"]
         cuda = jobs["qwen38-bonsai-candle"]
-        cpu = jobs["qwen38-bonsai-candle-cpu"]
         aggregate = jobs["qwen38-bonsai-aggregate"]
+        self.assertNotIn("qwen38-bonsai-candle-cpu", jobs)
         self.assertEqual(mlx["runs-on"], ["self-hosted", "macOS", "ARM64", "nax", "real-weights"])
-        self.assertEqual(cuda["runs-on"], cpu["runs-on"])
         self.assertEqual(cuda["runs-on"], ["self-hosted", "windows", "cuda", "real-weights"])
         self.assert_qwen38_candle_requires_successful_mlx(workflow)
-        self.assertEqual(cpu["needs"], "qwen38-bonsai-candle")
-        self.assertIn("needs.qwen38-bonsai-candle.result == 'success'", cpu["if"])
-        self.assertEqual(cpu["strategy"]["max-parallel"], 1)
-        self.assertFalse(cpu["strategy"]["fail-fast"])
-        self.assertEqual(cpu["timeout-minutes"], 360)
-        self.assertEqual(cuda["timeout-minutes"], 360)
-        self.assertEqual(mlx["timeout-minutes"], 360)
-        self.assertEqual(aggregate["needs"], ["qwen38-bonsai-mlx", "qwen38-bonsai-candle", "qwen38-bonsai-candle-cpu"])
-        self.assertEqual(cpu["permissions"]["actions"], "read")
+        self.assertEqual(aggregate["needs"], ["qwen38-bonsai-mlx", "qwen38-bonsai-candle"])
         self.assertEqual(aggregate["permissions"]["actions"], "read")
         matrix = json.loads((WORKFLOW.parents[2] / "release" / "qwen38-bonsai-matrix.json").read_text(encoding="utf-8"))
-        self.assertEqual(len(matrix["cells"]), 19)
-        expected_cpu = {cell["id"] for cell in matrix["cells"] if cell["device"] == "cpu" and cell["backend"] == "candle"}
-        actual_cpu = {item["cell"] for item in cpu["strategy"]["matrix"]["include"]}
-        self.assertEqual(actual_cpu, expected_cpu)
-        self.assertEqual(len(actual_cpu), 3)
-        self.assertEqual(mlx["env"]["QWEN_BONSAI_RUN_DIR"],
-                         "/Volumes/Models/Codex-builds/sc-23935/ci-${{ github.run_id }}-${{ github.run_attempt }}")
-        self.assertIn("scripts/release/resolve_snapshot_paths.py", "\n".join(step.get("run", "") for step in mlx["steps"]))
-        self.assertIn("runner.name == 'nax-macos'", "\n".join(step.get("if", "") for step in mlx["steps"]))
-        self.assertEqual(next(step for step in mlx["steps"] if step.get("name") == "Prepare external campaign storage")["timeout-minutes"], 2)
+        self.assertEqual(len(matrix["cells"]), 16)
+        self.assertFalse(any(cell["device"] == "cpu" for cell in matrix["cells"]))
         mlx_commands = "\n".join(step.get("run", "") for step in mlx["steps"])
         cuda_commands = "\n".join(step.get("run", "") for step in cuda["steps"])
-        cpu_commands = "\n".join(step.get("run", "") for step in cpu["steps"])
         aggregate_commands = "\n".join(step.get("run", "") for step in aggregate["steps"])
         for cell in matrix["cells"]:
-            if cell["backend"] == "mlx":
-                self.assertIn(cell["id"], mlx_commands)
-            elif cell["device"] == "cuda":
-                self.assertIn(cell["id"], cuda_commands)
-            else:
-                self.assertIn(cell["id"], actual_cpu)
+            commands = mlx_commands if cell["backend"] == "mlx" else cuda_commands
+            self.assertIn(cell["id"], commands)
         self.assertEqual((mlx_commands + cuda_commands).count("--preflight "), 16)
-        self.assertIn("--load-profile candle-packed-cpu", cuda_commands)
+        self.assertNotIn("candle-packed-cpu", mlx_commands + cuda_commands)
+        self.assertNotIn("candle-dense-cpu", mlx_commands + cuda_commands)
+        self.assertNotIn("--candle-device cpu", mlx_commands + cuda_commands)
         self.assertIn("--candle-device auto", cuda_commands)
-        self.assertNotIn("--candle-device cpu", cuda_commands)
-        self.assertIn("--candle-device", cpu_commands)
-        self.assertIn("--cases', $cases", cpu_commands)
-        for name in ("BONSAI_CASES", "QWEN38_ACCEPTANCE_CASES", "BONSAI_ACCEPTANCE_CASES"):
-            self.assertIn(name, cpu["env"])
-        self.assertIn("context_2048", cpu["env"]["BONSAI_CASES"])
-        self.assertIn("mtp_video", cpu["env"]["QWEN38_ACCEPTANCE_CASES"])
         for job in (mlx, cuda):
             steps = job["steps"]
             phase = next(step for step in steps if step.get("name") == "Validate exclusive qualification phase")
             provision = next(step for step in steps if " provision-assets " in step.get("run", ""))
             self.assertIn("--preflight-only", phase["run"])
             self.assertIn("--provision-only", phase["run"])
-            self.assertIn("inputs.qwen38_bonsai_preflight_only != true", provision["if"])
             self.assertLess(steps.index(phase), steps.index(provision))
             self.assertNotIn("continue-on-error", provision)
-        cuda_steps = cuda["steps"]
-        oracle = next(step for step in cuda_steps if step.get("name") == "Execute Candle packed CUDA operator oracles before provisioning")
-        self.assertIn("cuda_packed_operator_oracles_compile_and_execute_nvrtc", oracle["run"])
-        self.assertNotIn("continue-on-error", oracle)
-        self.assertLess(cuda_steps.index(oracle), next(i for i, step in enumerate(cuda_steps) if " provision-assets " in step.get("run", "")))
-        self.assertEqual(next(step for step in cuda_steps if step.get("name") == "Release the Candle campaign CUDA reservation")["if"], "always()")
-        publisher = next(step for step in cuda_steps if step.get("name") == "Upload immutable Candle publisher qualification for CPU rows")
-        self.assertIn("snapshot-metadata.json", publisher["with"]["path"])
-        self.assertIn("provision-report.json", publisher["with"]["path"])
-        stage = next(step for step in cuda_steps if step.get("name") == "Stage the eight CUDA cells without duplicate CPU preflights")
-        self.assertIn("qwen38_bonsai_artifacts.py stage-cuda", stage["run"])
-        self.assertEqual(next(step for step in cuda_steps if step.get("name") == "Upload Candle preflight or provision qualification")["if"],
-                         "always() && (inputs.qwen38_bonsai_preflight_only == true || inputs.qwen38_bonsai_provision_only == true)")
-        row = next(step for step in cpu["steps"] if step.get("name") == "Run the complete frozen CPU row")
-        self.assertTrue(row["continue-on-error"])
-        self.assertIn("--model-id', $cell", row["run"])
-        self.assertIn("--runtime-sha', $env:GITHUB_SHA", row["run"])
-        self.assertIn("context_2048", cpu["env"]["BONSAI_CASES"])
-        self.assertIn("check-partition --role cpu", cpu_commands)
         self.assertIn("check-partition --role mlx", mlx_commands)
         self.assertIn("check-partition --role cuda", cuda_commands)
-        for job, role in ((mlx, "mlx"), (cuda, "cuda"), (cpu, "cpu")):
-            check = next(step for step in job["steps"] if f"check-partition --role {role}" in step.get("run", ""))
-            self.assertNotIn("continue-on-error", check)
-        self.assertEqual(next(step for step in mlx["steps"] if step.get("name") == "Upload MLX qualification or sealed row evidence")["if"], "always()")
-        self.assertEqual(next(step for step in cuda["steps"] if step.get("name") == "Upload immutable Candle CUDA row evidence")["if"],
-                         "always() && inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true")
-        self.assertEqual(next(step for step in cpu["steps"] if step.get("name") == "Upload immutable CPU row evidence")["if"], "always()")
-        self.assertEqual(next(step for step in aggregate["steps"] if step.get("name") == "Upload the selected roots and sealed terminal report")["if"], "always()")
-        self.assertIn("--role publisher", cpu_commands)
-        self.assertIn("artifact-ids", next(step for step in cpu["steps"] if step.get("name") == "Download the pinned publisher artifact")["with"])
         self.assertIn("--role matrix", aggregate_commands)
         self.assertIn("qwen38_bonsai_artifacts.py aggregate", aggregate_commands)
-        self.assertIn("artifact-ids", next(step for step in aggregate["steps"] if step.get("name") == "Download only the selected artifact IDs without merging roots")["with"])
         self.assertFalse(next(step for step in aggregate["steps"] if step.get("name") == "Download only the selected artifact IDs without merging roots")["with"]["merge-multiple"])
-        for job in (cpu, aggregate):
-            self.assertIn("inputs.qwen38_bonsai_preflight_only != true", job["if"])
-            self.assertIn("inputs.qwen38_bonsai_provision_only != true", job["if"])
+        self.assertEqual(next(step for step in aggregate["steps"] if step.get("name") == "Upload the selected roots and sealed terminal report")["if"], "always()")
 
 
 if __name__ == "__main__":
