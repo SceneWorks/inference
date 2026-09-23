@@ -97,6 +97,9 @@ pub const REASON_NO_ASYNC_ALLOC: &str = "no_async_alloc";
 /// Fallback reason: cudarc's per-slice event tracking is on (a second stream exists on the
 /// context); its waits on events recorded before the capture would invalidate it.
 pub const REASON_EVENT_TRACKING: &str = "event_tracking";
+/// Fallback reason: the model runs on the legacy NULL stream (`Device::new_cuda`,
+/// `CANDLE_LLM_CUDA_STREAM=legacy`), which stream capture does not support.
+pub const REASON_LEGACY_STREAM: &str = "legacy_stream";
 /// Fallback reason: the step shape is not capturable (empty, or more tokens than
 /// [`GraphRunner::MAX_CAPTURED_TOKENS`] — a prefill is never captured).
 pub const REASON_SHAPE: &str = "shape";
@@ -530,6 +533,9 @@ impl<'m, M: StepModel> GraphRunner<'m, M> {
                 return Some(REASON_NOT_CUDA);
             };
             let stream = dev.cuda_stream();
+            if stream.cu_stream().is_null() {
+                return Some(REASON_LEGACY_STREAM);
+            }
             let ctx = stream.context();
             if !ctx.has_async_alloc() {
                 return Some(REASON_NO_ASYNC_ALLOC);
@@ -1690,6 +1696,24 @@ mod cuda_tests {
             }
             Ok(_) => panic!("the legacy stream must not be capturable"),
         }
+        // The runner refuses it by name before any capture.
+        let _guard = cuda_graphs_policy_guard(Some(true));
+        let model = Synthetic::new(&Device::Cuda(legacy), None);
+        let runner = GraphRunner::new(&model);
+        let (out, record) = generate_step(
+            &runner,
+            &PROMPT,
+            &greedy(4),
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.tokens.len(), 4);
+        assert_eq!(
+            record.cuda_graphs.fallback_reason,
+            Some(REASON_LEGACY_STREAM)
+        );
     }
 
     /// The core experiment: contiguous candle ops (a cuBLAS matmul, a softmax, an affine, a

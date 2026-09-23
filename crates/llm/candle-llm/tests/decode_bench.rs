@@ -21,6 +21,7 @@
 //! | `DECODE_BENCH_KV_CACHE`    | `static` (default) or `growing`: the `step_model` row's KV cache  |
 //! | `DECODE_BENCH_ATTN`        | `gqa` (default) or `expanded`: the growing slots' attention       |
 //! | `CANDLE_LLM_CUDA_GRAPHS`   | `1` runs the `step_model` / `mtp` / `ngram` rows through the CUDA-graph runner (sc-24134); every row records `cuda_graphs` |
+//! | `CANDLE_LLM_CUDA_STREAM`   | `own` (default) or `legacy`: the CUDA stream the model runs on (sc-24134), recorded as `cuda_stream` |
 //!
 //! Rows are greedy (`temperature = 0`), no stop tokens, so every row emits exactly `NEW_TOKENS`
 //! and the token sequences are comparable: each row records whether it matched the reference row
@@ -94,6 +95,14 @@ use candle_llm::primitives::{
 /// The CUDA-graph switch state (`on` / `off`), or `None` on a binary without the runner.
 fn cuda_graphs_switch() -> Option<&'static str> {
     Some(if cuda_graphs_enabled() { "on" } else { "off" })
+}
+
+/// The CUDA stream the model runs on (`own` / `legacy`, sc-24134), or `None` on a binary
+/// without the selector.
+fn cuda_stream_label() -> Option<&'static str> {
+    candle_llm::device::CudaStreamKind::from_env()
+        .ok()
+        .map(|k| k.label())
 }
 
 /// A snapshot of the thread's CUDA-graph tally (sc-24134); `cuda_graphs_delta` turns two
@@ -461,6 +470,10 @@ fn with_fused_off<T>(f: impl FnOnce() -> T) -> T {
 }
 
 fn cuda_graphs_switch() -> Option<&'static str> {
+    None
+}
+
+fn cuda_stream_label() -> Option<&'static str> {
     None
 }
 
@@ -1231,6 +1244,7 @@ fn decode_bench() {
     doc.insert("warmup_tokens", json!(warmup_tokens));
     doc.insert("fused_kernels", json!(switch));
     doc.insert("cuda_graphs", json!(graphs_switch));
+    doc.insert("cuda_stream", json!(cuda_stream_label()));
     doc.insert("weight_format", json!(format));
     doc.insert("nvfp4_gemv", json!(nv_switch));
     doc.insert("device_used_bytes_after_load", json!(used_after_load));
