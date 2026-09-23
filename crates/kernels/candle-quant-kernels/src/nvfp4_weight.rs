@@ -432,7 +432,8 @@ mod tests {
         );
         // The largest padded grid that fits: 65536 × 32736 < 2^31.
         assert!(nvfp4_shape_refusal(65_536, 32_736).is_ok());
-        // usize overflow in the product is a refusal, not a wrap.
+        // usize overflow in the product is a refusal, not a wrap (2^40 · 2^40 wraps to 0).
+        assert!(nvfp4_shape_refusal(1 << 40, 1 << 40).is_err());
         assert!(nvfp4_shape_refusal(usize::MAX - 15, usize::MAX).is_err());
         let msg = Nvfp4Refusal::ShapeTooLarge {
             rows: 65_536,
