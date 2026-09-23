@@ -40,7 +40,7 @@ use crate::models::{
 };
 use crate::primitives::attention::EAGER_ATTN_QUERY_CHUNK_SIZE;
 use crate::primitives::nn::input_ids;
-use crate::primitives::projection::QuantSpec;
+use crate::primitives::projection::{ProjectionFormat, QuantSpec, WeightCensus};
 use crate::primitives::sampler::SamplingParams;
 use crate::primitives::{KvCache, Weights};
 
@@ -616,6 +616,25 @@ pub struct LlamaProvider {
     /// MTP subset (`MtpStats`); the full record is read back through
     /// [`LlamaProvider::last_decode_record`].
     last_decode: Mutex<Option<DecodeRecord>>,
+    /// What the load produced (sc-24135): the requested weight format and, for the qwen3_5 family,
+    /// the resident weight census by projection kind. Read through [`LlamaProvider::load_record`].
+    load_record: LoadRecord,
+}
+
+/// The load telemetry of a [`LlamaProvider`] (sc-24135, epic sc-24128 E2): which weight format was
+/// requested and which projection kinds the decoder actually holds, with their resident bytes.
+///
+/// An NVFP4 request either loads with every requested projection under
+/// `census.projections.nvfp4` or fails at load — this record is how a caller (and the evidence
+/// harness) sees that, and reads the resident bits/param.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoadRecord {
+    /// The load-time weight format the caller requested (`None` = the checkpoint's own dtype, or
+    /// its persisted `quantization` block).
+    pub requested: Option<Quantize>,
+    /// The decoder's resident weights by projection kind (target plus native MTP predictor), for
+    /// the qwen3_5-family decoders; `None` for the other architectures, which do not report one.
+    pub census: Option<WeightCensus>,
 }
 
 /// Whether Gemma 4's vision path has been validated end-to-end, and may therefore be advertised.
@@ -709,6 +728,53 @@ fn requires_accelerator(source: &Path) -> CoreResult<bool> {
     }))
 }
 
+/// The NVFP4 projection format for a load, or `None` when `spec` does not request NVFP4
+/// (sc-24135). The capability floor is settled here — before admission or any weight read — so a
+/// CPU or sub-sm_120 device is a typed refusal naming the capability (`CoreError::Unsupported`
+/// carrying "nvfp4"), never a fallback to another representation. A GGUF source is refused too:
+/// it is already block-quantized, and NVFP4 quantizes from a dense snapshot. So is a snapshot
+/// whose `config.json` names an architecture outside the qwen3_5 family — also before admission,
+/// so a memory refusal can never mask the capability refusal.
+fn nvfp4_format(spec: &LoadSpec, device: &Device) -> CoreResult<Option<ProjectionFormat>> {
+    nvfp4_format_with(spec, device, ProjectionFormat::nvfp4)
+}
+
+/// [`nvfp4_format`] with the device gate injected (`gate` is [`ProjectionFormat::nvfp4`] on the
+/// real path), so the gate's refusal can be driven through this helper with a mocked compute
+/// capability.
+fn nvfp4_format_with(
+    spec: &LoadSpec,
+    device: &Device,
+    gate: impl FnOnce(&Device) -> crate::Result<ProjectionFormat>,
+) -> CoreResult<Option<ProjectionFormat>> {
+    if spec.quantize != Some(Quantize::Nvfp4) {
+        return Ok(None);
+    }
+    if crate::gguf::is_gguf_path(&spec.source) {
+        return Err(CoreError::Unsupported(
+            "nvfp4: NVFP4 projections are quantized from a dense safetensors snapshot; a GGUF \
+             checkpoint is already block-quantized"
+                .into(),
+        ));
+    }
+    // NVFP4's first (and so far only) consumer is the qwen3_5 family (sc-24135); refuse the rest
+    // by name. A missing or unreadable config (or a Prism snapshot, which `load_dir` refuses for
+    // any repacking) is left to the loader's own error.
+    if let Some(config) = read_json(Path::new(&spec.source), "config.json") {
+        let is_prism =
+            config.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35");
+        if let (false, Ok(arch)) = (is_prism, Architecture::from_config(&config)) {
+            if arch != Architecture::Qwen35 {
+                return Err(CoreError::Unsupported(format!(
+                    "nvfp4: NVFP4 projections are served for the qwen3_5 family \
+                     (Qwen3.5/3.6/3.8) only; this checkpoint is {arch:?}"
+                )));
+            }
+        }
+    }
+    gate(device).map(Some).map_err(to_core)
+}
+
 fn ensure_supported_device(source: &Path, device: &Device) -> CoreResult<()> {
     if device.is_cpu() && requires_accelerator(source)? {
         return Err(CoreError::Load(
@@ -739,6 +805,10 @@ impl LlamaProvider {
             return Err(CoreError::Load("an external projector is only valid with a GGUF language checkpoint; safetensors vision must be embedded".into()));
         }
         let device = select_device().map_err(to_core)?;
+        // NVFP4 (sc-24135): the capability floor is settled first — before the accelerator gate,
+        // admission or any weight read — so a CPU or sub-sm_120 device answers an NVFP4 request with
+        // the typed refusal naming the capability, never a fallback to another representation.
+        let nvfp4 = nvfp4_format(spec, &device)?;
         ensure_supported_device(Path::new(&spec.source), &device)?;
         let payload = core_llm::checkpoint_payload_bytes(Path::new(&spec.source))?;
         let staging = core_llm::checkpoint_staging_bytes(Path::new(&spec.source))?;
@@ -752,9 +822,15 @@ impl LlamaProvider {
             || read_json(Path::new(&spec.source), "config.json").is_some_and(|c| {
                 c.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35")
             });
-        let (host_required, device_required) =
-            load_memory_requirements(payload, staging, projector, packed, device.is_cuda())
-                .ok_or_else(|| CoreError::Load("load memory estimate overflow".into()))?;
+        let (host_required, device_required) = load_memory_requirements(
+            payload,
+            staging,
+            projector,
+            packed,
+            device.is_cuda(),
+            nvfp4.is_some(),
+        )
+        .ok_or_else(|| CoreError::Load("load memory estimate overflow".into()))?;
         let budget = core_llm::operational_memory_override()?;
         // A discrete CUDA launcher's override describes device headroom. Host staging is a separate
         // allocation domain and must be checked against host capacity rather than GPU capacity.
@@ -767,25 +843,29 @@ impl LlamaProvider {
             core_llm::admit_request_memory(device_required, request_available_memory(&device)?)?;
         }
 
-        let requested = spec.quantize.map(|q| match q {
-            Quantize::Q4 => QuantSpec::q4(),
-            Quantize::Q8 => QuantSpec::q8(),
-        });
-        if crate::gguf::is_gguf_path(&spec.source) {
+        let requested = match spec.quantize {
+            None => None,
+            Some(Quantize::Q4) => Some(ProjectionFormat::from(QuantSpec::q4())),
+            Some(Quantize::Q8) => Some(ProjectionFormat::from(QuantSpec::q8())),
+            Some(Quantize::Nvfp4) => nvfp4,
+        };
+        let mut provider = if crate::gguf::is_gguf_path(&spec.source) {
             Self::load_gguf(
                 Path::new(&spec.source),
                 spec.projector_source.as_deref().map(Path::new),
                 &device,
-                requested,
-            )
+                requested.as_ref().and_then(ProjectionFormat::ggml),
+            )?
         } else {
             if spec.projector_source.is_some() {
                 return Err(CoreError::Load(
                     "an external projector is only valid with a GGUF language checkpoint; safetensors vision must be embedded".into(),
                 ));
             }
-            Self::load_dir(Path::new(&spec.source), &device, requested)
-        }
+            Self::load_dir(Path::new(&spec.source), &device, requested.as_ref())?
+        };
+        provider.load_record.requested = spec.quantize;
+        Ok(provider)
     }
 
     /// Load from an HF snapshot directory (config.json + tokenizer.json + safetensors shards).
@@ -793,14 +873,18 @@ impl LlamaProvider {
     /// `requested` is an explicit load-time quantization (`spec.quantize`); when it is `None` the
     /// snapshot's own persisted `quantization` block (written by the [`prepare`](crate::prepare)
     /// writer) is honored, so a `LoadSpec::dense` of a prepared Q4/Q8 snapshot loads quantized.
-    fn load_dir(dir: &Path, device: &Device, requested: Option<QuantSpec>) -> CoreResult<Self> {
+    fn load_dir(
+        dir: &Path,
+        device: &Device,
+        requested: Option<&ProjectionFormat>,
+    ) -> CoreResult<Self> {
         let cfg_value = read_json(dir, "config.json")
             .ok_or_else(|| CoreError::Load(format!("read config.json in {}", dir.display())))?;
         let is_prism =
             cfg_value.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35");
         if is_prism && requested.is_some() {
             return Err(CoreError::Load(
-                "Prism/Bonsai is already packed affine-2; Q4/Q8 repacking would expand the model"
+                "Prism/Bonsai is already packed affine-2; Q4/Q8/NVFP4 repacking would expand the model"
                     .into(),
             ));
         }
@@ -809,6 +893,12 @@ impl LlamaProvider {
         } else {
             Architecture::from_config(&cfg_value).map_err(to_core)?
         };
+        // A non-qwen3_5 NVFP4 request was already refused by name in `nvfp4_format`, before
+        // admission (sc-24135).
+        debug_assert!(
+            !(requested.is_some_and(ProjectionFormat::is_nvfp4) && arch != Architecture::Qwen35),
+            "nvfp4_format refuses non-qwen3_5 NVFP4 before load_dir"
+        );
         let (weights, prism) = if is_prism {
             let checkpoint =
                 crate::prism_checkpoint::PrismMlxCheckpoint::open(dir, device, &cfg_value)
@@ -837,13 +927,13 @@ impl LlamaProvider {
                 .map_err(to_core)?
             } else {
                 let prefix = qwen35_dense_prefix(|key| weights.contains(key))?;
-                Qwen35Model::from_weights_with(&weights, prefix, qcfg, requested)
+                Qwen35Model::from_weights_format(&weights, prefix, qcfg, requested)
                     .map_err(to_core)?
             };
             let configured_layers = m.config().mtp_num_hidden_layers;
             let has_mtp_tensors = weights.keys().any(|key| key.starts_with("mtp."));
             let mtp = if configured_layers > 0 {
-                Some(Qwen35Mtp::from_weights_with(&weights, &m, requested).map_err(to_core)?)
+                Some(Qwen35Mtp::from_weights_format(&weights, &m, requested).map_err(to_core)?)
             } else if has_mtp_tensors {
                 return Err(CoreError::Load(
                     "qwen3_5 checkpoint carries MTP tensors while config disables MTP".into(),
@@ -855,7 +945,9 @@ impl LlamaProvider {
         } else {
             let cfg = ModelConfig::from_dir(dir).map_err(to_core)?;
             let descriptor = descriptor_for(&cfg);
-            let quant = requested.or(cfg.quantization);
+            let quant = requested
+                .and_then(ProjectionFormat::ggml)
+                .or(cfg.quantization);
             let m = CausalLm::from_weights_with(&weights, "", cfg, quant).map_err(to_core)?;
             (Decoder::Causal(m), descriptor, None)
         };
@@ -965,6 +1057,16 @@ impl LlamaProvider {
         }
         descriptor.capabilities.supports_preserve_thinking = supports_preserve_thinking;
         descriptor.capabilities.supports_tools = supports_tools;
+        let census = match &model {
+            Decoder::Qwen35(m) => {
+                let mut census = m.weight_census();
+                if let Some(mtp) = &mtp {
+                    census.merge(&mtp.weight_census());
+                }
+                Some(census)
+            }
+            Decoder::Causal(_) => None,
+        };
         Ok(Self {
             descriptor,
             model,
@@ -976,6 +1078,10 @@ impl LlamaProvider {
             last_decode: Mutex::new(None),
             vision,
             gemma4,
+            load_record: LoadRecord {
+                requested: None,
+                census,
+            },
         })
     }
 
@@ -1107,6 +1213,7 @@ impl LlamaProvider {
                 constraint_table: OnceCell::new(),
                 vision,
                 gemma4: None,
+                load_record: LoadRecord::default(),
             });
         }
         if projector_path.is_some() {
@@ -1161,12 +1268,19 @@ impl LlamaProvider {
             // Likewise no Gemma 4 front-ends: the GGUF path reconstructs a dense text decoder,
             // and llama.cpp GGUFs carry no vision embedder / audio projector tensors.
             gemma4: None,
+            load_record: LoadRecord::default(),
         })
     }
 
     /// Whether the loaded model's projections are quantized.
     pub fn is_quantized(&self) -> bool {
         self.model.is_quantized()
+    }
+
+    /// The load telemetry: the requested weight format and the resident weight census by
+    /// projection kind (sc-24135).
+    pub fn load_record(&self) -> LoadRecord {
+        self.load_record
     }
 
     /// Assemble a provider from already-loaded parts with a default Llama-3 template (used by tests
@@ -1183,6 +1297,7 @@ impl LlamaProvider {
             constraint_table: OnceCell::new(),
             vision: None,
             gemma4: None,
+            load_record: LoadRecord::default(),
         }
     }
 
@@ -1479,12 +1594,18 @@ impl LlamaProvider {
 /// while source tensors are still alive. CPU dense conversion retains source tensors plus
 /// constructed F32 tensors. Packed CPU paths keep their existing two-copy upper bound, and external
 /// projectors retain the audited four-copy conversion allowance.
+///
+/// An NVFP4 load (sc-24135) quantizes on the device while the bf16 source tensors are still
+/// resident, so the device additionally holds the growing packed copy: 4.5 bits per 16-bit source
+/// element, i.e. `payload · 9/32`. The existing 25 percent headroom still covers the transient f32
+/// copy of the largest tensor the quantizer reads.
 fn load_memory_requirements(
     payload: u64,
     staging: u64,
     projector: u64,
     packed: bool,
     cuda: bool,
+    nvfp4: bool,
 ) -> Option<(u64, Option<u64>)> {
     let projector_bound = projector.checked_mul(4)?;
     let host = if cuda && !packed {
@@ -1495,9 +1616,15 @@ fn load_memory_requirements(
         payload.checked_mul(3)?.checked_add(projector_bound)?
     };
     let device = if cuda {
+        let nvfp4_packed = if nvfp4 {
+            payload.checked_mul(9)? / 32
+        } else {
+            0
+        };
         Some(
             payload
                 .checked_add(payload / 4)?
+                .checked_add(nvfp4_packed)?
                 .checked_add(projector_bound)?,
         )
     } else {
@@ -2766,6 +2893,8 @@ pub(crate) fn to_core(e: crate::Error) -> CoreError {
     match e {
         crate::Error::Canceled => CoreError::Canceled,
         crate::Error::Unsupported(m) => CoreError::Unsupported(m),
+        // The typed capability refusal (sc-24135) is the contract's `Unsupported`, verbatim.
+        crate::Error::Nvfp4Refused(r) => CoreError::Unsupported(r.to_string()),
         crate::Error::MissingTensor(m) => CoreError::Load(format!("missing tensor: {m}")),
         crate::Error::Config(m) => CoreError::Load(m),
         crate::Error::Io(e) => CoreError::Io(e),
@@ -3062,7 +3191,7 @@ mod tests {
         let payload = 55_563_006_776;
         let largest_shard = 3_988_973_152;
         let (host_required, device_required) =
-            load_memory_requirements(payload, largest_shard, 0, false, true).unwrap();
+            load_memory_requirements(payload, largest_shard, 0, false, true, false).unwrap();
 
         assert_eq!(host_required, largest_shard);
         assert_eq!(device_required, Some(69_453_758_470));
@@ -3116,8 +3245,9 @@ mod tests {
 
     #[test]
     fn load_memory_requirements_remain_checked() {
-        assert!(load_memory_requirements(u64::MAX, 1, 0, false, true).is_none());
-        assert!(load_memory_requirements(1, 1, u64::MAX, false, true).is_none());
+        assert!(load_memory_requirements(u64::MAX, 1, 0, false, true, false).is_none());
+        assert!(load_memory_requirements(1, 1, u64::MAX, false, true, false).is_none());
+        assert!(load_memory_requirements(u64::MAX / 4, 1, 0, false, true, true).is_none());
     }
 
     #[test]
@@ -3554,6 +3684,175 @@ mod tests {
         );
         let _ = h;
     }
+
+    fn nvfp4_spec(source: &str) -> core_llm::LoadSpec {
+        core_llm::LoadSpec {
+            source: source.into(),
+            projector_source: None,
+            quantize: Some(core_llm::Quantize::Nvfp4),
+        }
+    }
+
+    /// sc-24135 AC2: NVFP4 on a CPU device is a typed refusal naming the capability, settled by the
+    /// helper `LlamaProvider::load` calls before the accelerator gate, admission or any weight read.
+    #[test]
+    fn nvfp4_on_cpu_is_a_typed_refusal_naming_the_capability() {
+        let device = candle_core::Device::Cpu;
+        match super::nvfp4_format(&nvfp4_spec("snapshot-dir"), &device) {
+            Err(core_llm::Error::Unsupported(msg)) => {
+                assert!(msg.starts_with("nvfp4: "), "names the capability: {msg}");
+                assert!(msg.contains("sm_120"), "names the floor: {msg}");
+                assert!(msg.contains("Cpu"), "names the device: {msg}");
+            }
+            other => panic!("expected a typed Unsupported refusal, got {other:?}"),
+        }
+        // Non-NVFP4 requests never touch the gate.
+        for quantize in [
+            None,
+            Some(core_llm::Quantize::Q4),
+            Some(core_llm::Quantize::Q8),
+        ] {
+            let spec = core_llm::LoadSpec {
+                quantize,
+                ..nvfp4_spec("snapshot-dir")
+            };
+            assert!(super::nvfp4_format(&spec, &device).unwrap().is_none());
+        }
+        // A GGUF source is refused by name on any device (it is already block-quantized).
+        match super::nvfp4_format(&nvfp4_spec("model.gguf"), &device) {
+            Err(core_llm::Error::Unsupported(msg)) => assert!(msg.starts_with("nvfp4: "), "{msg}"),
+            other => panic!("expected a typed Unsupported refusal, got {other:?}"),
+        }
+    }
+
+    /// sc-24135 AC2 with a mocked sub-sm_120 capability: the device gate's refusal reaches the
+    /// backend-neutral contract as `Unsupported`, naming the capability, the floor and the device.
+    #[test]
+    fn a_sub_sm120_refusal_reaches_the_contract_as_unsupported() {
+        for cap in [(8, 9), (9, 0), (10, 0)] {
+            let refusal = candle_quant_kernels::nvfp4_refusal_for_compute_cap(cap).unwrap();
+            match super::to_core(crate::Error::Nvfp4Refused(refusal)) {
+                core_llm::Error::Unsupported(msg) => {
+                    assert!(msg.starts_with("nvfp4: "), "{msg}");
+                    assert!(msg.contains("sm_120"), "{msg}");
+                    assert!(msg.contains(&format!("sm_{}{}", cap.0, cap.1)), "{msg}");
+                }
+                other => panic!("expected Unsupported, got {other:?}"),
+            }
+        }
+    }
+
+    /// sc-24135 AC2 through the real gate: `nvfp4_format` → `Nvfp4Context::require_with` (a real
+    /// cuBLASLt handle, the capability probe mocked to a sub-sm_120 device) → the typed refusal →
+    /// the contract's `Unsupported`, naming the capability, the floor and the mocked device.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn nvfp4_format_refuses_a_mocked_sub_sm120_device_as_unsupported() {
+        let Ok(device) = candle_core::Device::new_cuda(0) else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        for cap in [(8, 9), (10, 0)] {
+            let gate = |d: &candle_core::Device| {
+                crate::primitives::projection::ProjectionFormat::nvfp4_with_cap_probe(d, |_| {
+                    Ok(cap)
+                })
+            };
+            match super::nvfp4_format_with(&nvfp4_spec("snapshot-dir"), &device, gate) {
+                Err(core_llm::Error::Unsupported(msg)) => {
+                    assert!(msg.starts_with("nvfp4: "), "{msg}");
+                    assert!(msg.contains("sm_120"), "names the floor: {msg}");
+                    assert!(
+                        msg.contains(&format!("sm_{}{}", cap.0, cap.1)),
+                        "names the device: {msg}"
+                    );
+                }
+                Err(other) => panic!("expected Unsupported for {cap:?}, got {other:?}"),
+                Ok(_) => panic!("a mocked sm_{}{} device served NVFP4", cap.0, cap.1),
+            }
+        }
+    }
+
+    /// sc-24135: an NVFP4 request for a snapshot outside the qwen3_5 family is refused by name in
+    /// `nvfp4_format` — before admission and the device gate — so no memory or device error can
+    /// mask it. The gate here would accept anything; it must not be reached.
+    #[test]
+    fn nvfp4_for_a_non_qwen35_snapshot_is_refused_before_the_device_gate() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("config.json"),
+            r#"{"architectures":["LlamaForCausalLM"],"model_type":"llama"}"#,
+        )
+        .unwrap();
+        let spec = nvfp4_spec(&root.path().to_string_lossy());
+        let gate = |_: &candle_core::Device| -> crate::Result<_> {
+            panic!("the device gate ran before the architecture refusal")
+        };
+        match super::nvfp4_format_with(&spec, &candle_core::Device::Cpu, gate) {
+            Err(core_llm::Error::Unsupported(msg)) => {
+                assert!(msg.starts_with("nvfp4: "), "{msg}");
+                assert!(msg.contains("qwen3_5 family"), "{msg}");
+                assert!(msg.contains("Llama"), "names the checkpoint: {msg}");
+            }
+            other => panic!("expected the architecture refusal, got {other:?}"),
+        }
+        // A qwen3_5 snapshot passes the architecture check and reaches the gate.
+        std::fs::write(
+            root.path().join("config.json"),
+            r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5"}"#,
+        )
+        .unwrap();
+        let reached = std::cell::Cell::new(false);
+        let gate = |_: &candle_core::Device| -> crate::Result<_> {
+            reached.set(true);
+            Err(crate::Error::Unsupported("nvfp4: gate reached".into()))
+        };
+        let _ = super::nvfp4_format_with(&spec, &candle_core::Device::Cpu, gate);
+        assert!(
+            reached.get(),
+            "a qwen3_5 snapshot must reach the device gate"
+        );
+    }
+
+    /// On a build with no CUDA backend the whole load refuses NVFP4 before reading a byte: the
+    /// source here does not exist, so any later step would have failed with a Load/IO error.
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn nvfp4_load_without_cuda_refuses_before_reading_the_snapshot() {
+        // A snapshot path that does not exist, inside a self-removing root.
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("no-snapshot-here");
+        match super::LlamaProvider::load(&nvfp4_spec(&missing.to_string_lossy())) {
+            Err(core_llm::Error::Unsupported(msg)) => assert!(msg.starts_with("nvfp4: "), "{msg}"),
+            Err(other) => panic!("expected the NVFP4 refusal first, got {other:?}"),
+            Ok(_) => panic!("NVFP4 cannot load without CUDA"),
+        }
+    }
+
+    /// E6: an NVFP4 load prices the packed copy (4.5 of every 16 source bits) on the device on top
+    /// of the resident bf16 source and the existing headroom; the host side is unchanged.
+    #[test]
+    fn nvfp4_admission_prices_the_packed_copy_beside_the_bf16_source() {
+        let payload = 55_000_000_000u64; // ~Qwen3.8-27B bf16
+        let (host_dense, dense) =
+            load_memory_requirements(payload, payload / 10, 0, false, true, false).unwrap();
+        let (host_nv, nv) =
+            load_memory_requirements(payload, payload / 10, 0, false, true, true).unwrap();
+        assert_eq!(
+            host_nv, host_dense,
+            "NVFP4 quantizes on the device, not the host"
+        );
+        assert_eq!(nv.unwrap() - dense.unwrap(), payload * 9 / 32);
+        assert_eq!(nv.unwrap(), payload + payload / 4 + payload * 9 / 32);
+        // No device domain on CPU (NVFP4 never gets this far there, but the pricing is total).
+        assert_eq!(
+            load_memory_requirements(payload, payload, 0, false, false, true)
+                .unwrap()
+                .1,
+            None
+        );
+    }
+
     /// E6: admission prices every recurrent state a Qwen3.5-family request's cache holds. The
     /// provider's cache (the reference/MTP `Decode::make_cache`) retains `REFERENCE_MAX_CHECKPOINTS`
     /// rollback checkpoints, and the geometry charges `1 + REFERENCE_MAX_CHECKPOINTS` states; a

@@ -416,10 +416,18 @@ impl LlavaProvider {
     /// `spec.quantize` (or the snapshot's persisted `quantization` block) quantizes the language
     /// decoder's projections; the vision tower and projector stay dense.
     pub fn load(spec: &LoadSpec) -> CoreResult<Self> {
-        let requested = spec.quantize.map(|q| match q {
-            Quantize::Q4 => QuantSpec::q4(),
-            Quantize::Q8 => QuantSpec::q8(),
-        });
+        let requested = spec
+            .quantize
+            .map(|q| match q {
+                Quantize::Q4 => Ok(QuantSpec::q4()),
+                Quantize::Q8 => Ok(QuantSpec::q8()),
+                // sc-24135: NVFP4 is served for the qwen3_5 family only; refuse by name.
+                Quantize::Nvfp4 => Err(CoreError::Unsupported(
+                    "nvfp4: NVFP4 projections are served for the qwen3_5 family only, not LLaVA"
+                        .into(),
+                )),
+            })
+            .transpose()?;
         let dir = Path::new(&spec.source);
         let device = select_device().map_err(to_core)?;
         let model = LlavaModel::from_dir_with(dir, &device, requested).map_err(to_core)?;
