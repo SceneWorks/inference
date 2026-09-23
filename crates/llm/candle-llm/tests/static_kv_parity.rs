@@ -222,6 +222,7 @@ fn teacher_forced_static_vs_attn_kv_logit_parity_report() {
             .to_vec1::<f32>()
             .unwrap()
     };
+    use candle_llm::primitives::sampler::argmax_device;
     let top2 = |row: &[f32]| -> (usize, f32) {
         let (mut best, mut second) = ((0usize, f32::NEG_INFINITY), f32::NEG_INFINITY);
         for (i, &v) in row.iter().enumerate() {
@@ -256,10 +257,14 @@ fn teacher_forced_static_vs_attn_kv_logit_parity_report() {
             .map(|(x, y)| (x - y).abs())
             .fold(0f32, f32::max);
         max_delta = max_delta.max(delta);
-        let (arg_a, gap_a) = top2(&ra);
-        let (arg_b, gap_b) = top2(&rb);
+        // The sampler's own greedy pick (device argmax) on each path; the host top-2 gap says how
+        // close the runner-up was (a gap of 0 is an exact bf16 tie).
+        let arg_a = argmax_device(&a).unwrap();
+        let arg_b = argmax_device(&b).unwrap();
+        let (_, gap_a) = top2(&ra);
+        let (_, gap_b) = top2(&rb);
         assert_eq!(
-            arg_b as i32, token,
+            arg_b, token,
             "growing path must reproduce the reference token at {pos}"
         );
         if arg_a != arg_b {
