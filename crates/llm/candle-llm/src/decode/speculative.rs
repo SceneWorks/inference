@@ -66,6 +66,15 @@ pub struct SpeculativeStats {
     /// rejected run on a cache that rolls back only to a step start). Fewer than `generated` ⇒
     /// speedup.
     pub forwards: usize,
+    /// The prefill forwards counted in `forwards`: one whenever the prompt was prefilled — by the
+    /// engine itself ([`SpeculativePrompt::Tokens`]) or by its caller
+    /// ([`SpeculativePrompt::Prefilled`], whose prefill the engine counts as one of the request's
+    /// target forwards all the same). `forwards - prefill_forwards` is what the verify steps and
+    /// any replays cost.
+    ///
+    /// [`SpeculativePrompt::Tokens`]: crate::decode::SpeculativePrompt::Tokens
+    /// [`SpeculativePrompt::Prefilled`]: crate::decode::SpeculativePrompt::Prefilled
+    pub prefill_forwards: usize,
     /// Draft tokens proposed across all steps.
     pub proposed: usize,
     /// Draft tokens accepted across all steps.
@@ -133,6 +142,7 @@ pub fn generate_prompt_lookup(
     // ---- Prefill: logits for the last prompt position; the first token is sampled as usual. ----
     let logits_last = model.decode_logits(&input_ids(prompt_ids, device)?, &mut cache, 0)?;
     stats.forwards += 1;
+    stats.prefill_forwards += 1;
     let mut history: Vec<i32> = prompt_ids.to_vec();
 
     let first = sample(&logits_last, &history, &config.sampling, &mut rng, None)?;
@@ -296,6 +306,7 @@ pub fn generate_draft_speculative(
         target.decode_logits(&input_ids(prompt_ids, device)?, &mut target_cache, 0)?;
     draft.decode_logits(&input_ids(prompt_ids, draft.device())?, &mut draft_cache, 0)?;
     stats.forwards += 1;
+    stats.prefill_forwards += 1;
     let mut history: Vec<i32> = prompt_ids.to_vec();
 
     let first = sample(&logits_last, &history, &config.sampling, &mut rng, None)?;

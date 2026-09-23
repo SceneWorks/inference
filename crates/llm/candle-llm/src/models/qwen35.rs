@@ -708,7 +708,8 @@ pub const REFERENCE_MAX_CHECKPOINTS: usize = 0;
 /// of `K + 2` positions: the step start plus the `K + 1` verify positions), and admission prices
 /// exactly that ([`Qwen35Model::recurrent_state_bytes`]). Each ring slot is one full recurrent
 /// state — on Qwen3.8-27B ~151 MB of SSM state (48 linear layers × 48 value heads × 128 × 128 × 4 B)
-/// plus a ~6 MB conv tail. Deeper history is opt-in via [`Qwen35Cache::set_max_checkpoints`].
+/// plus a ~2.9 MB bf16 conv tail (48 × 3 × 10240 × 2 B). Deeper history is opt-in via
+/// [`Qwen35Cache::set_max_checkpoints`].
 pub const STEP_MAX_CHECKPOINTS: usize = 2;
 
 /// The per-layer cache slot — a recurrent [`DeltaNetCache`] for linear layers, and for
@@ -927,18 +928,33 @@ impl Qwen35Cache {
     /// Change how many positions before the current one the cache can roll back to: every linear
     /// layer's ring is reallocated for `max + 1` positions, carrying over the restorable positions
     /// that still fit (`0` drops the rings: rollback to anything but the current position and
-    /// zero is refused). A failed allocation leaves the cache untouched (the rings are replaced
-    /// layer by layer, so a layer that failed keeps its old ring — the cache stays consistent
-    /// because every layer still holds the same positions). No-op when unchanged.
+    /// zero is refused). Every layer's replacement is built before any is swapped in, so a failed
+    /// allocation (or carry-over) leaves the cache untouched — every ring, its depth, the
+    /// recurrent bytes and `max_checkpoints` as they were; the price is that the old and new rings
+    /// coexist until the swap. No-op when unchanged.
     pub fn set_max_checkpoints(&mut self, max: usize) -> Result<()> {
         if max == self.max_checkpoints {
             return Ok(());
         }
         let spec = (max > 0).then(|| self.recurrent_shape.ring_spec(max));
-        for l in &mut self.layers {
+        self.replace_rings(max, &mut |_| spec.clone())
+    }
+
+    /// Rebuild every linear layer's ring with `spec_for(i)` (`i` counts the linear layers) and
+    /// swap them all in only once every one succeeded; the cache is untouched on error.
+    fn replace_rings(
+        &mut self,
+        max: usize,
+        spec_for: &mut dyn FnMut(usize) -> Option<RingSpec>,
+    ) -> Result<()> {
+        let mut replacements = Vec::new();
+        for (at, l) in self.layers.iter().enumerate() {
             if let Qwen35LayerCache::Delta(c) = l {
-                c.set_ring_spec(spec.clone())?;
+                replacements.push((at, c.resized(spec_for(replacements.len()))?));
             }
+        }
+        for (at, c) in replacements {
+            self.layers[at] = Qwen35LayerCache::Delta(c);
         }
         self.max_checkpoints = max;
         Ok(())
@@ -3735,6 +3751,61 @@ pub(crate) mod tests {
     /// The memory accounting: a step cache's rings are priced in full from creation (one slot
     /// live, the rest checkpoints) and never grow; the KV follows the live positions and a
     /// rollback drops the rolled-back positions' KV bytes.
+    /// `set_max_checkpoints` builds every linear layer's new ring before swapping any in: a
+    /// replacement that fails part-way — here the second linear layer's, whose slots cannot hold
+    /// the state it must carry over — leaves every ring (depth, buffers, restorable positions),
+    /// the recurrent bytes and `max_checkpoints` exactly as they were.
+    #[test]
+    fn a_ring_replacement_failing_part_way_leaves_the_cache_untouched() {
+        let (_cfg, model) = text_model();
+        let mut cache = StepModel::new_cache(&model);
+        model
+            .decode_logits(&ids(&[1, 7, 3, 42]), &mut cache, 0)
+            .unwrap();
+        let rings = |c: &Qwen35Cache| -> Vec<(usize, Option<(usize, usize)>)> {
+            c.layers
+                .iter()
+                .filter_map(|l| match l {
+                    Qwen35LayerCache::Delta(d) => Some((d.depth(), d.ring_addresses().unwrap())),
+                    Qwen35LayerCache::Attn(_) | Qwen35LayerCache::StaticAttn(_) => None,
+                })
+                .collect()
+        };
+        let snapshot = |c: &Qwen35Cache| {
+            (
+                rings(c),
+                c.recurrent_bytes(),
+                c.max_checkpoints(),
+                c.checkpoint_offsets(),
+            )
+        };
+        let before = snapshot(&cache);
+
+        let good = cache.recurrent_shape.ring_spec(6);
+        let mut bad = good.clone();
+        bad.ssm_dims.2 += 1;
+        let failed = cache.replace_rings(6, &mut |linear| {
+            Some(if linear == 1 {
+                bad.clone()
+            } else {
+                good.clone()
+            })
+        });
+        assert!(
+            failed.is_err(),
+            "the second linear layer's replacement fails"
+        );
+        assert_eq!(snapshot(&cache), before, "nothing was swapped in");
+
+        // The same deepening with every replacement valid goes through, for every layer.
+        cache.set_max_checkpoints(6).unwrap();
+        let depths: Vec<usize> = rings(&cache).iter().map(|&(depth, _)| depth).collect();
+        assert_eq!(
+            (depths, cache.max_checkpoints()),
+            (vec![6; before.0.len()], 6)
+        );
+    }
+
     #[test]
     fn memory_accounting_tracks_live_state_and_checkpoints() {
         let (cfg, model) = text_model();

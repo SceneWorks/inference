@@ -1087,6 +1087,16 @@ mod tests {
                 one_draw,
                 "sample_device drew once: {row:?}"
             );
+            // The speculative engine's host-row sampler takes the same argmax fallback and
+            // consumes the same one draw, so the host samplers stay draw-aligned.
+            let mut row_host = SplitMix64::new(21);
+            let c = sample_row_host(row.to_vec(), &[], &params, &mut row_host, None);
+            assert_eq!(c, argmax_host(row), "sample_row_host: {row:?}");
+            assert_eq!(
+                row_host.state(),
+                one_draw,
+                "sample_row_host drew once: {row:?}"
+            );
         }
     }
 

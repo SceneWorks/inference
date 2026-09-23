@@ -110,6 +110,11 @@ pub struct DecodeRecord {
     pub path: DecodePath,
     /// Target-model forward passes, including the prompt prefill.
     pub target_forwards: u64,
+    /// The prefill forwards among `target_forwards`, as the speculative engine counted them
+    /// ([`SpeculativeStats::prefill_forwards`]: one whenever the prompt was prefilled, by the
+    /// engine or by its caller). `0` on a non-speculative record, which keeps its prefill inside
+    /// `target_forwards` without splitting it out and has no verify step to divide by.
+    pub prefill_forwards: u64,
     /// Draft tokens proposed (0 on non-speculative paths).
     pub proposed_tokens: u64,
     /// Draft tokens accepted by target verification (0 on non-speculative paths).
@@ -170,6 +175,7 @@ impl DecodeRecord {
         Self {
             path,
             target_forwards,
+            prefill_forwards: 0,
             proposed_tokens: 0,
             accepted_tokens: 0,
             generated_tokens: generated as u64,
@@ -238,6 +244,7 @@ impl DecodeRecord {
         Self {
             path,
             target_forwards: stats.forwards as u64,
+            prefill_forwards: stats.prefill_forwards as u64,
             proposed_tokens: stats.proposed as u64,
             accepted_tokens: stats.accepted as u64,
             generated_tokens: generated as u64,
@@ -261,12 +268,16 @@ impl DecodeRecord {
         (self.verify_steps > 0).then(|| self.verify_host_syncs as f64 / self.verify_steps as f64)
     }
 
-    /// Target forwards per verify step — the verify forward plus any replay fallback:
-    /// `(verify_steps + replay_forwards) / verify_steps` — or `None` when no verify step ran.
-    /// Exactly `1.0` on a cache with per-token checkpoints (sc-24131 AC2).
+    /// Target forwards per verify step, from the **measured** forwards:
+    /// `(target_forwards - prefill_forwards) / verify_steps` — the verify forward, plus any replay
+    /// fallback, plus any other target forward the run spent — or `None` when no verify step ran.
+    /// Exactly `1.0` on a cache with per-token checkpoints (sc-24131 AC2); a forward that is
+    /// neither a verify step nor a counted replay shows up here rather than disappearing.
     pub fn target_forwards_per_verify_step(&self) -> Option<f64> {
-        (self.verify_steps > 0)
-            .then(|| (self.verify_steps + self.replay_forwards) as f64 / self.verify_steps as f64)
+        (self.verify_steps > 0).then(|| {
+            self.target_forwards.saturating_sub(self.prefill_forwards) as f64
+                / self.verify_steps as f64
+        })
     }
 
     /// `accepted / proposed`, or `None` when nothing was proposed (non-speculative paths).
@@ -468,6 +479,7 @@ mod tests {
             DecodePath::Mtp { drafts: 3 },
             SpeculativeStats {
                 forwards: 6,
+                prefill_forwards: 1,
                 proposed: 12,
                 accepted: 6,
                 verify_steps: 4,
@@ -496,8 +508,19 @@ mod tests {
             spec.replay_forwards, 1,
             "the replay fallback is on the record"
         );
+        // 6 forwards = 1 prefill + 4 verify steps + 1 replay.
+        assert_eq!(spec.prefill_forwards, 1);
         assert_eq!(spec.target_forwards_per_verify_step(), Some(1.25));
         assert_eq!(plain.target_forwards_per_verify_step(), None);
+        // The ratio is derived from the measured forwards: 9 target forwards against 4 verify
+        // steps + 1 replay + 1 prefill — three forwards that are neither a verify step nor a
+        // counted replay — raise it, where the counters alone
+        // (`(verify_steps + replay_forwards) / verify_steps`) would still say 1.25.
+        let uncounted = DecodeRecord {
+            target_forwards: 9,
+            ..spec
+        };
+        assert_eq!(uncounted.target_forwards_per_verify_step(), Some(2.0));
         assert_eq!(spec.path.label(), "mtp");
         assert_eq!(spec.proposer.label(), "mtp");
         assert_eq!(spec.logits_to_host_per_token(), Some(0.0));

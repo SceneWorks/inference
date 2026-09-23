@@ -28,19 +28,27 @@ fixture and harness as `sc-24129/`, `sc-24132/` and `sc-24130/`.
   slot is `48 × 128 × 128 × 4 B` of SSM state plus a `3 × 10240 × 2 B` bf16 conv tail — is what
   `Qwen35Cache::recurrent_bytes()` reports for that cache, and the provider's
   `step_memory_geometry(drafts)` charges `K + 2` slots for a `K`-draft request (the step start
-  plus the `K + 1` verify positions). The old term was an upper bound over all 64 layers with a
-  conv tail sized as `Hv × Dv × kernel`; the new one is the allocation. Allocation fails closed:
-  `StepModel::new_cache_for` preallocates every ring and returns the device's error.
+  plus the `K + 1` verify positions) — **once**: `priced_request_bytes` calls core-llm's additive
+  `estimate_chunked_request_bytes_with_recurrent_copies(…, 1)`, because the engine rolls back by
+  slot selection and never clones the cache, where `estimate_chunked_request_bytes` keeps its `x3`
+  clone/replay multiplier for mlx-llm's loop (unchanged). The old term was an upper bound over all
+  64 layers with a conv tail sized as `Hv × Dv × kernel`; the new one is the allocation.
+  Allocation fails closed: `StepModel::new_cache_for` preallocates every ring and returns the
+  device's error, and deepening a cache's rings (`Qwen35Cache::set_max_checkpoints`) builds every
+  layer's replacement before swapping any in.
 * **Rollback contract**: any position inside the last verify step (and the step start) is
   restorable; anything older is the typed `Error::RollbackUnavailable { n, have }` — the engine's
   fallback path is untouched, it just never fires on this cache. `retain_checkpoints` on the
   `DecodeCache` trait now returns `Result` (deepening a ring allocates).
 * **Telemetry (E2)**: on top of S2's `replays` / `replay_forwards` (the `RollbackUnavailable`
-  → replay fallback count), `SpeculativeStats` / `DecodeRecord` carry `direct_rollbacks`,
-  `DecodeRecord::target_forwards_per_verify_step()` is
-  `(verify_steps + replay_forwards) / verify_steps`, and the bench table gains `fwd/verify` and
-  `replay forwards` columns (JSON: `verify_steps`, `direct_rollbacks`, `replay_forwards`,
-  `target_forwards_per_verify_step`).
+  → replay fallback count), `SpeculativeStats` / `DecodeRecord` carry `direct_rollbacks` and
+  `prefill_forwards` (the prefill among the target forwards — the engine's own on
+  `SpeculativePrompt::Tokens`, the caller's on `Prefilled`, which the engine counts too),
+  `DecodeRecord::target_forwards_per_verify_step()` is derived from the **measured** forwards,
+  `(target_forwards - prefill_forwards) / verify_steps` (so a forward that is neither a verify
+  step nor a counted replay shows up in it), the bench computes its `fwd/verify` the same way, and
+  the bench table gains `fwd/verify` and `replay forwards` columns (JSON: `verify_steps`,
+  `direct_rollbacks`, `replay_forwards`, `target_forwards_per_verify_step`).
 
 ## AC1 — rollback to every position of a verify step restores the exact DeltaNet state
 
@@ -99,6 +107,12 @@ recovery counter are identical between the two runs of this story):
   run at every K (S2's head paid 2 forwards on every partially rejected step: 24–71 of the
   77–140 verify steps here were partial rejections, each now a direct rollback). The in-test
   gate (`[ac2]` in `deltanet-ring-real-weight.log`, 48 tokens) reports the same counters.
+* **Under the measured formula** (`(target_forwards - prefill_forwards) / verify_steps`, adopted
+  after these runs were sealed): recomputed from the committed `decode_bench.json` of both sealed
+  runs, every MTP row has `target_forwards == verify_steps + 1` (141 / 140, 103 / 102, 96 / 95,
+  91 / 90, 78 / 77 at K=1..5; the bench's rows run `SpeculativePrompt::Tokens`, one prefill), so
+  `fwd/verify` is exactly 1.00 under it too — the sealed column stands without a re-run. The
+  real-weight gate asserts the same identity (`target_forwards == 1 + verify_steps`) at every K.
 * **E1 parity**: the StepModel row is token-identical to the reference; every MTP row's first
   divergence (124, 124, 125, 106, 124) is one of S2's enumerated reference knife-edge positions
   (`51, 74, 99, 102, 103, 106, 107, 124, 125, 154, 161, 177, 186, 202, 243`); no new position.
@@ -120,9 +134,12 @@ recovery counter are identical between the two runs of this story):
 * **Memory**: the StepModel row's final cache reports 168.9 MiB live / 146.8 MiB checkpoints
   (one ring slot: `generate_step` asks for overshoot 0, depth 1) against S2's 168.9 / 293.6 (two
   start-of-step clones). An MTP request's ring is `K + 2` slots × 146.8 MiB (K=1: 440 MiB, K=5:
-  1.03 GiB; the `[ac2]` lines show the exact per-K figures), priced as such at admission — more
-  than S1's flat three-state bound from K=3 up, which is the honest cost of restoring any
-  position of a K-draft verify without a replay.
+  1.03 GiB; the `[ac2]` lines show the exact per-K figures) — more resident state than S1's
+  three from K=2 up, the honest cost of restoring any position of a K-draft verify without a
+  replay — and admission charges exactly that, once. (S2's pricing charged its three
+  upper-bound states `x3` with MTP, nine at every K; an earlier revision of this story charged the ring `x3`
+  too, `3 (K + 2)` states — ~2.0 GiB of phantom recurrent state at K=5 on the 27B — which the
+  `x1` pricing removes.)
 * **Co-tenancy**: GPU 1 is the shared lane. `run.json` records the co-tenants at start — for
   `head-6937eff53` another story's CUDA test executable
   (`sc-24138-target-cuda\debug\deps\tools-*.exe`) plus the desktop compositor processes, for

@@ -57,8 +57,8 @@
 //! which the baseline binary reports as `null` because it predates the counter), the replay
 //! forwards the engine spent on the `RollbackUnavailable` fallback (`replay_forwards`, E2) and the
 //! recovery split behind them (`verify_steps`, `direct_rollbacks`,
-//! `target_forwards_per_verify_step` — exactly 1.0 on the per-token DeltaNet checkpoint ring,
-//! sc-24131 AC2).
+//! `target_forwards_per_verify_step` — the measured target forwards net of the prefill per verify
+//! step, exactly 1.0 on the per-token DeltaNet checkpoint ring, sc-24131 AC2).
 //!
 //! The block between the `head-only` markers uses seams that do not exist on the pre-epic
 //! baseline (`StepModel`, host-sync accounting). `decode_bench.py baseline-source` rewrites this
@@ -93,8 +93,8 @@ use candle_llm::primitives::{
 
 /// A speculative row through the unified engine: the output, the raw counters, the prefill and
 /// decode seconds, the `(kv_cache, attn_formulation)` labels of the cache it ran on, the
-/// engine's host syncs per verify step, the proposer the record says ran, and its recovery
-/// counters `(verify_steps, direct_rollbacks, replay_forwards)` (sc-24131).
+/// engine's host syncs per verify step, the proposer the record says ran, and its
+/// [`Recovery`] counters (sc-24131).
 type SpeculativeRow = (
     GenerationOutput,
     SpeculativeStats,
@@ -103,7 +103,7 @@ type SpeculativeRow = (
     Option<(&'static str, &'static str)>,
     Option<f64>,
     &'static str,
-    Option<(u64, u64, u64)>,
+    Option<Recovery>,
 );
 
 fn engine_row<P: Proposer>(
@@ -155,6 +155,7 @@ fn engine_row<P: Proposer>(
             run.record.verify_steps,
             run.record.direct_rollbacks,
             run.record.replay_forwards,
+            run.record.prefill_forwards,
         )),
     )
 }
@@ -505,7 +506,7 @@ type SpeculativeRow = (
     Option<(&'static str, &'static str)>,
     Option<f64>,
     &'static str,
-    Option<(u64, u64, u64)>,
+    Option<Recovery>,
 );
 
 /// The pre-epic MTP loop (`generate_qwen35_mtp_timed`), which the baseline binary still carries.
@@ -696,7 +697,7 @@ fn row_json(
     cache: Option<(u64, u64)>,
     kinds: Option<(&str, &str)>,
     syncs_per_verify_step: Option<f64>,
-    recovery: Option<(u64, u64, u64)>,
+    recovery: Option<Recovery>,
     fused_primitives: Option<Value>,
     nvfp4_projections: Option<Value>,
     proposer: Option<&str>,
@@ -713,14 +714,6 @@ fn row_json(
         (Some(a), Some(p)) if p > 0 => json!(a as f64 / p as f64),
         _ => Value::Null,
     };
-    // Target forwards per verify step: the verify forward plus any replay fallback (sc-24131 AC2:
-    // exactly 1.0 on the per-token checkpoint ring).
-    let forwards_per_verify = match recovery {
-        Some((verify_steps, _, replays)) if verify_steps > 0 => {
-            json!((verify_steps + replays) as f64 / verify_steps as f64)
-        }
-        _ => Value::Null,
-    };
     let diverged = reference.map(|r| divergence(r, &out.tokens));
     let matches = diverged.map(|d| d.is_none());
     json!({
@@ -729,9 +722,9 @@ fn row_json(
         "drafts": drafts,
         "proposer": proposer,
         "host_syncs_per_verify_step": syncs_per_verify_step,
-        "verify_steps": recovery.map(|(v, _, _)| v),
-        "direct_rollbacks": recovery.map(|(_, d, _)| d),
-        "target_forwards_per_verify_step": forwards_per_verify,
+        "verify_steps": recovery.map(|(v, _, _, _)| v),
+        "direct_rollbacks": recovery.map(|(_, d, _, _)| d),
+        "target_forwards_per_verify_step": forwards_per_verify(forwards, recovery),
         "generated_tokens": generated,
         "prefill_seconds": prefill_secs,
         "decode_seconds": decode_secs,
@@ -757,14 +750,31 @@ fn row_json(
     })
 }
 
+/// A speculative row's recovery counters, from the engine's record (sc-24131):
+/// `(verify_steps, direct_rollbacks, replay_forwards, prefill_forwards)`.
+type Recovery = (u64, u64, u64, u64);
+
+/// Target forwards per verify step from the row's **measured** target forwards:
+/// `(target_forwards - prefill_forwards) / verify_steps` — the formula of
+/// `DecodeRecord::target_forwards_per_verify_step`, so a forward that is neither a verify step nor
+/// a counted replay raises it (sc-24131 AC2: exactly 1.0 on the per-token checkpoint ring).
+/// `None` without a verify step or a forward count.
+fn forwards_per_verify(forwards: Option<u64>, recovery: Option<Recovery>) -> Option<f64> {
+    match (forwards, recovery) {
+        (Some(forwards), Some((verify_steps, _, _, prefill))) if verify_steps > 0 => {
+            Some(forwards.saturating_sub(prefill) as f64 / verify_steps as f64)
+        }
+        _ => None,
+    }
+}
+
 /// The recovery counters for the log line: `fwd/verify` (the AC2 figure of sc-24131) and how
 /// many verify steps were recovered by a direct rollback vs a replay fallback.
-fn recovery_text(recovery: Option<(u64, u64, u64)>) -> String {
-    match recovery {
-        Some((verify_steps, direct, replays)) if verify_steps > 0 => format!(
-            "fwd/verify {:.2}  rollbacks {direct} direct / {replays} replay",
-            (verify_steps + replays) as f64 / verify_steps as f64
-        ),
+fn recovery_text(forwards: Option<u64>, recovery: Option<Recovery>) -> String {
+    match (forwards_per_verify(forwards, recovery), recovery) {
+        (Some(per_verify), Some((_, direct, replays, _))) => {
+            format!("fwd/verify {per_verify:.2}  rollbacks {direct} direct / {replays} replay")
+        }
         _ => "fwd/verify n/a".to_string(),
     }
 }
@@ -800,6 +810,20 @@ fn last_token_sampler<'a>(
             }
         }
     }
+}
+
+#[test]
+fn forwards_per_verify_is_measured_net_of_the_prefill() {
+    // 6 forwards = 1 prefill + 4 verify steps + 1 replay.
+    assert_eq!(forwards_per_verify(Some(6), Some((4, 3, 1, 1))), Some(1.25));
+    // Three forwards that are neither verify steps nor counted replays raise it; the counters
+    // alone (`(verify_steps + replays) / verify_steps`) would still say 1.25.
+    assert_eq!(forwards_per_verify(Some(9), Some((4, 3, 1, 1))), Some(2.0));
+    assert_eq!(forwards_per_verify(Some(9), Some((0, 0, 0, 1))), None);
+    assert_eq!(
+        recovery_text(Some(9), Some((4, 3, 1, 1))),
+        "fwd/verify 2.00  rollbacks 3 direct / 1 replay"
+    );
 }
 
 #[test]
@@ -1097,7 +1121,7 @@ fn decode_bench() {
                 },
                 stats.forwards as f64 / out.tokens.len().max(1) as f64,
                 per_verify.map_or("n/a".to_string(), |s| format!("{s:.2}")),
-                recovery_text(recovery)
+                recovery_text(Some(stats.forwards as u64), recovery)
             );
             rows_json.push(row_json(
                 "mtp",
@@ -1156,7 +1180,7 @@ fn decode_bench() {
                 },
                 stats.forwards as f64 / out.tokens.len().max(1) as f64,
                 per_verify.map_or("n/a".to_string(), |s| format!("{s:.2}")),
-                recovery_text(recovery)
+                recovery_text(Some(stats.forwards as u64), recovery)
             );
             rows_json.push(row_json(
                 "ngram",

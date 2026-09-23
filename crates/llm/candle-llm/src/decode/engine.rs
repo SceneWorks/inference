@@ -357,6 +357,7 @@ pub fn generate_speculative_with<M: StepModel, P: Proposer>(
                 StepRequest::last(prompt_ids).with_hidden(wants_hidden),
             )?;
             stats.forwards += 1;
+            stats.prefill_forwards += 1;
             let previous_hidden = last_row(out.hidden.as_ref())?;
             proposer.warm(prompt_ids, out.hidden.as_ref())?;
             (cache, out.logits, previous_hidden, prompt_ids.to_vec(), 0)
@@ -372,7 +373,9 @@ pub fn generate_speculative_with<M: StepModel, P: Proposer>(
             if prompt_ids.is_empty() {
                 return Err(Error::Msg("generate_speculative: empty prompt".into()));
             }
-            stats.forwards += 1; // the caller's prefill
+            // The caller's prefill: still one of the request's target forwards.
+            stats.forwards += 1;
+            stats.prefill_forwards += 1;
             let previous_hidden = last_row(hidden.as_ref())?;
             if warm_proposer {
                 proposer.warm(prompt_ids, hidden.as_ref())?;
@@ -1211,6 +1214,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(multimodal.output.tokens, text.output.tokens);
+        // The caller's prefill is the run's prefill forward: fwd/verify is measured net of it on
+        // the Prefilled arm exactly as on the Tokens arm.
+        assert_eq!(
+            multimodal.record.target_forwards_per_verify_step(),
+            Some(1.0)
+        );
         assert_eq!(multimodal.stats, text.stats);
     }
 

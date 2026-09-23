@@ -87,6 +87,12 @@ impl Decode for Decoder {
 /// — its cache keeps a per-token checkpoint ring of `K + 2` recurrent states per linear layer
 /// the reference cache does not (sc-24131), and its verify step overshoots the budget by `K`
 /// positions (E6, sc-24130).
+///
+/// The recurrent term is charged **once** on both paths: the geometry's `recurrent_bytes` is
+/// already the cache's whole recurrent footprint (the ring included), and the engine rolls back
+/// by selecting a ring slot — it never clones the cache — so the `x3` clone/replay multiplier
+/// [`core_llm::estimate_chunked_request_bytes`] applies with MTP would charge `2 (K + 2)` states
+/// the request never holds.
 fn priced_request_bytes(
     model: &Decoder,
     mtp_plan: core_llm::MtpPlan,
@@ -100,13 +106,14 @@ fn priced_request_bytes(
         }
         core_llm::MtpPlan::Off => model.memory_geometry(),
     };
-    core_llm::estimate_chunked_request_bytes(
+    core_llm::estimate_chunked_request_bytes_with_recurrent_copies(
         admitted_prompt,
         max_new_tokens,
         geometry,
         vision_workspace,
         mtp_plan.draft_tokens().unwrap_or(0),
         EAGER_ATTN_QUERY_CHUNK_SIZE,
+        1,
     )
 }
 
@@ -4103,22 +4110,23 @@ mod tests {
         // The same request priced on the reference geometry with the width set: what admission
         // would charge if it forgot the engine's cache. The step geometry's ring term — `K + 2`
         // states per linear layer against the reference cache's one (sc-24131) — is the only
-        // difference, and the estimate carries the recurrent term three times with MTP.
-        let on_reference_geometry = core_llm::estimate_chunked_request_bytes(
+        // difference, charged once: the engine rolls back by slot selection, never by a clone.
+        let on_reference_geometry = core_llm::estimate_chunked_request_bytes_with_recurrent_copies(
             prompt,
             budget,
             decoder.memory_geometry(),
             0,
             k,
             EAGER_ATTN_QUERY_CHUNK_SIZE,
+            1,
         )
         .unwrap();
         let ring_term = u64::from(k + 1) * one_state;
         assert!(ring_term > 0);
         assert_eq!(
             on_bytes - on_reference_geometry,
-            3 * ring_term,
-            "an Enabled request is priced on the step cache's per-token checkpoint ring"
+            ring_term,
+            "an Enabled request is priced on the step cache's per-token checkpoint ring, once"
         );
 
         // Against the Off request: the ring term plus at least the K positions the verify
@@ -4128,8 +4136,9 @@ mod tests {
         let kv_per_position =
             geometry.layers * geometry.kv_heads * geometry.head_dim * geometry.element_bytes * 2;
         assert!(
-            on_bytes >= off_bytes + 3 * ring_term + u64::from(k) * kv_per_position,
-            "Enabled {on_bytes} vs Off {off_bytes}: ring {ring_term} x 3,              overshoot {k} x {kv_per_position}"
+            on_bytes >= off_bytes + ring_term + u64::from(k) * kv_per_position,
+            "Enabled {on_bytes} vs Off {off_bytes}: ring {ring_term}, overshoot {k} x \
+             {kv_per_position}"
         );
         // And `Auto` without a head is priced exactly as `Off` (it runs the reference loop).
         let auto_off = core_llm::resolve_mtp_plan(MtpMode::Auto, None);

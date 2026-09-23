@@ -402,20 +402,35 @@ impl DeltaNetCache {
 
     /// Replace the ring geometry: `None` drops the ring (the cache keeps its live state as plain
     /// tensors), `Some` reallocates a ring of the new size and **carries over** every restorable
-    /// position that still fits (the newest `slots - 1` before the current one). Allocation
-    /// failures leave the cache untouched.
+    /// position that still fits (the newest `slots - 1` before the current one). Built through
+    /// [`resized`](Self::resized), so a failure (an invalid spec, the allocation, a carried state
+    /// that does not fit the new slots) leaves the cache untouched.
     pub fn set_ring_spec(&mut self, spec: Option<RingSpec>) -> Result<()> {
+        *self = self.resized(spec)?;
+        Ok(())
+    }
+
+    /// This cache under another ring geometry (see [`set_ring_spec`](Self::set_ring_spec)),
+    /// built without touching `self`: a caller replacing several layers' rings builds every
+    /// replacement first and swaps them in only once all succeeded. The replacement's ring is its
+    /// own allocation; a ring-less replacement holds a detached copy of the live state (the old
+    /// ring's buffer is written in place, so its views cannot be kept).
+    pub fn resized(&self, spec: Option<RingSpec>) -> Result<Self> {
         let Some(spec) = spec else {
-            if let Some(ring) = self.ring.take() {
-                if let (Some(conv), Some(ssm)) = (&self.conv_state, &self.ssm_state) {
-                    // Detach the live views from the buffer that is being dropped.
-                    self.conv_state = Some(conv.contiguous()?.copy()?);
-                    self.ssm_state = Some(ssm.contiguous()?.copy()?);
-                }
-                drop(ring);
-            }
-            self.spec = None;
-            return Ok(());
+            let (conv_state, ssm_state) = match (&self.ring, &self.conv_state, &self.ssm_state) {
+                (Some(_), Some(conv), Some(ssm)) => (
+                    Some(conv.contiguous()?.copy()?),
+                    Some(ssm.contiguous()?.copy()?),
+                ),
+                _ => (self.conv_state.clone(), self.ssm_state.clone()),
+            };
+            return Ok(DeltaNetCache {
+                conv_state,
+                ssm_state,
+                offset: self.offset,
+                spec: None,
+                ring: None,
+            });
         };
         spec.validate()?;
         let mut next = DeltaNetCache {
@@ -427,8 +442,7 @@ impl DeltaNetCache {
         };
         if self.ring.is_none() && self.conv_state.is_none() {
             // Nothing to carry: only the geometry changes (still lazily allocated).
-            self.spec = next.spec;
-            return Ok(());
+            return Ok(next);
         }
         next.preallocate()?;
         let ring = next.ring.as_mut().expect("just allocated");
@@ -446,8 +460,7 @@ impl DeltaNetCache {
             next.conv_state = Some(conv);
             next.ssm_state = Some(ssm);
         }
-        *self = next;
-        Ok(())
+        Ok(next)
     }
 
     /// The lowest position `rollback_to` can currently return to other than zero (`offset + 1`
@@ -508,9 +521,17 @@ impl DeltaNetCache {
     /// a view of the newest slot, and the position advances by `T`. Without a ring the final
     /// state is kept as plain tensors. Returns the recurrence output `y` `[B, T, Hv, Dv]`.
     ///
-    /// Shapes follow [`gated_delta_recurrence`]; with a ring, the produced states must match the
-    /// ring's slot shape (else the write is refused as a shape error and the cache is left
-    /// unadvanced — nothing is committed until the whole forward has run).
+    /// Shapes follow [`gated_delta_recurrence`]. The ring slots are written **during** the
+    /// recurrence, as each token's state is produced, so before the first write the restorable
+    /// window drops every position whose slot this forward reuses (those `slots` or more behind a
+    /// position it writes). A forward that fails part-way — a state of another shape than the
+    /// ring's slots, a device error — leaves the position unadvanced and
+    /// [`restorable`](Self::restorable) listing only slots that still hold their position's
+    /// state; with `T < slots` the live slot is never reused, so the cache keeps decoding from
+    /// where it was. A forward of `T >= slots` tokens rewrites every slot, the live one included:
+    /// its failure also drops the live state, and the cache refuses to advance again until it is
+    /// [`reset`](Self::reset) (or rolled back to zero) or handed a state through
+    /// [`update`](Self::update).
     pub fn advance(
         &mut self,
         conv: &ConvTrace,
@@ -528,10 +549,28 @@ impl DeltaNetCache {
                 conv.tokens()
             )));
         }
+        if self.offset > 0 && self.ssm_state.is_none() {
+            return Err(Error::Msg(format!(
+                "DeltaNetCache::advance: the live state at position {} was lost to a failed \
+                 forward; reset the cache first",
+                self.offset
+            )));
+        }
         let offset = self.offset;
-        let (y, final_state) = match &self.ring {
+        let next = offset + t as i32;
+        // Whether this forward's writes reach the live slot (every slot is rewritten once
+        // `T >= slots`), so that a failure part-way must drop the live state.
+        let mut clobbers_live = false;
+        let run = match self.ring.as_mut() {
             Some(ring) => {
-                let first_write = t.saturating_sub(ring.slots);
+                let slots = ring.slots;
+                clobbers_live = t >= slots;
+                // The writes land on positions `offset + T + 1 - min(T, slots) ..= offset + T`,
+                // whose slots held the positions `slots` behind them: stop listing those (and
+                // everything older) before the first write.
+                ring.lo = ring.lo.max(offset + t.min(slots) as i32 + 1 - slots as i32);
+                let ring = &*ring;
+                let first_write = t.saturating_sub(slots);
                 let mut sink = |ti: usize, state: &Tensor| -> Result<()> {
                     if ti < first_write {
                         return Ok(());
@@ -547,23 +586,29 @@ impl DeltaNetCache {
                     beta,
                     self.ssm_state.as_ref(),
                     &mut sink,
-                )?
+                )
+                .and_then(|(y, _)| Ok((y, ring.views(next)?)))
             }
-            None => gated_delta_recurrence(q, k, v, g, beta, self.ssm_state.as_ref())?,
+            None => gated_delta_recurrence(q, k, v, g, beta, self.ssm_state.as_ref()).and_then(
+                |(y, final_state)| Ok((y, (conv.tail_after(t - 1)?.contiguous()?, final_state))),
+            ),
         };
-        let next = offset + t as i32;
-        match self.ring.as_mut() {
-            Some(ring) => {
-                ring.lo = ring.lo.max(next + 1 - ring.slots as i32).max(1);
-                let (conv, ssm) = ring.views(next)?;
-                self.conv_state = Some(conv);
-                self.ssm_state = Some(ssm);
+        let (y, (conv_state, ssm_state)) = match run {
+            Ok(out) => out,
+            Err(e) => {
+                if clobbers_live {
+                    // Any slot — the live one included — may hold this forward's state now.
+                    self.conv_state = None;
+                    self.ssm_state = None;
+                }
+                return Err(e);
             }
-            None => {
-                self.conv_state = Some(conv.tail_after(t - 1)?.contiguous()?);
-                self.ssm_state = Some(final_state);
-            }
+        };
+        if let Some(ring) = self.ring.as_mut() {
+            ring.lo = ring.lo.max(next + 1 - ring.slots as i32).max(1);
         }
+        self.conv_state = Some(conv_state);
+        self.ssm_state = Some(ssm_state);
         self.offset = next;
         Ok(y)
     }
@@ -1671,5 +1716,106 @@ mod tests {
         let (_, trace) = causal_depthwise_conv_traced(x, &weight, &seed).unwrap();
         assert!(cache.advance(&trace, q, k, v, g, beta).is_err());
         assert_eq!(cache.offset(), 0, "a refused forward commits nothing");
+    }
+
+    /// `advance` over tokens `start..start + len` of the fixture whose conv trace is cut short so
+    /// that the tail after token `fail_at` is out of range: the recurrence fails on that token,
+    /// after the ring slots of the tokens before it were written.
+    fn advance_failing_at(
+        cache: &mut DeltaNetCache,
+        fixture: &Fixture,
+        start: usize,
+        len: usize,
+        fail_at: usize,
+    ) -> Result<Tensor> {
+        let (q, k, v, g, beta, x) = fixture;
+        let weight = Tensor::from_slice(CW, (RC, RK), &Device::Cpu).unwrap();
+        let conv_state = cache.conv_state().unwrap().clone();
+        let (_, trace) =
+            causal_depthwise_conv_traced(&narrow_t(x, start, len), &weight, &conv_state).unwrap();
+        let truncated = ConvTrace {
+            cat: trace.cat.narrow(1, 0, fail_at + trace.tail).unwrap(),
+            tokens: trace.tokens,
+            tail: trace.tail,
+        };
+        cache.advance(
+            &truncated,
+            &narrow_t(q, start, len),
+            &narrow_t(k, start, len),
+            &narrow_t(v, start, len),
+            &narrow_t(g, start, len),
+            &narrow_t(beta, start, len),
+        )
+    }
+
+    /// A forward that fails on its second token has already written its first token's state
+    /// into the ring: the slot that held position `offset + 1 - slots` now holds position
+    /// `offset + 1`. `restorable()` must not list any position whose slot the forward reuses, and
+    /// the live state (whose slot a `T < slots` forward never reuses) must survive.
+    #[test]
+    fn a_forward_failing_part_way_never_lists_an_overwritten_slot() {
+        let fixture = ring_inputs(8, 17);
+        let mut cache = DeltaNetCache::with_ring(ring_spec(4)).unwrap(); // depth 3
+        for i in 0..5 {
+            feed(&mut cache, &fixture, i, 1);
+        }
+        // The ring now holds positions 2, 3, 4 behind the live 5 (slots 2, 3, 0; live slot 1).
+        // Two tokens from offset 5: the first writes position 6 into position 2's slot, then the
+        // second fails (position 7 would have taken position 3's slot).
+        assert!(advance_failing_at(&mut cache, &fixture, 5, 2, 1).is_err());
+        assert_eq!(cache.offset(), 5, "a failed forward does not advance");
+        assert_eq!(
+            cache.restorable(),
+            vec![4],
+            "positions 2 (overwritten) and 3 (next in line) are no longer listed"
+        );
+        assert_eq!(
+            live(&cache),
+            fresh_state(&fixture, 5),
+            "the live state survived"
+        );
+    }
+
+    /// A forward of `T >= slots` tokens rewrites every slot, the live one included: when it fails
+    /// part-way the live state is gone, nothing is restorable, and the cache refuses to advance
+    /// (rather than silently decoding from a zero or a foreign state) until it is reset.
+    #[test]
+    fn a_failed_forward_that_reused_the_live_slot_drops_the_live_state() {
+        let fixture = ring_inputs(8, 19);
+        let mut cache = DeltaNetCache::with_ring(ring_spec(3)).unwrap(); // depth 2
+        for i in 0..4 {
+            feed(&mut cache, &fixture, i, 1);
+        }
+        // The ring now holds positions 2, 3 behind the live 4 (slots 2, 0; live slot 1).
+        // Four tokens from offset 4 on a 3-slot ring: the second and third write positions 6 and
+        // 7 (position 7 takes the live position 4's slot), then the fourth fails.
+        assert!(advance_failing_at(&mut cache, &fixture, 4, 4, 3).is_err());
+        assert_eq!(cache.offset(), 4, "a failed forward does not advance");
+        assert!(cache.restorable().is_empty());
+        assert!(
+            cache.conv_state().is_none() && cache.ssm_state().is_none(),
+            "the live slot now holds position 7's state"
+        );
+        let (q, k, v, g, beta, x) = &fixture;
+        let weight = Tensor::from_slice(CW, (RC, RK), &Device::Cpu).unwrap();
+        let zeros = Tensor::zeros((RB, RK - 1, RC), DType::F32, &Device::Cpu).unwrap();
+        let (_, trace) = causal_depthwise_conv_traced(&narrow_t(x, 4, 1), &weight, &zeros).unwrap();
+        let refused = cache.advance(
+            &trace,
+            &narrow_t(q, 4, 1),
+            &narrow_t(k, 4, 1),
+            &narrow_t(v, 4, 1),
+            &narrow_t(g, 4, 1),
+            &narrow_t(beta, 4, 1),
+        );
+        assert!(refused.is_err(), "no forward from a lost live state");
+        // A reset recovers the cache: it decodes again and its window refills.
+        cache.rollback_to(0).unwrap();
+        feed(&mut cache, &fixture, 0, 4);
+        assert_eq!(
+            cache.restorable(),
+            vec![2, 3],
+            "the window recovers after a reset"
+        );
     }
 }
