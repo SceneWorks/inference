@@ -44,6 +44,14 @@ fn greedy(max_new_tokens: usize) -> GenerationConfig {
     config
 }
 
+/// The device a graphs-on deployment gets: the switch on when `select_device` runs puts the
+/// model on its own stream (the legacy default cannot be captured). Both rows of each AC1
+/// comparison run on it, so graphs on vs off differ only in the runner.
+fn graphs_on_device() -> candle_core::Device {
+    let _guard = cuda_graphs_policy_guard(Some(true));
+    select_device().unwrap()
+}
+
 fn first_divergence(a: &[i32], b: &[i32]) -> Option<usize> {
     a.iter()
         .zip(b)
@@ -56,7 +64,7 @@ fn first_divergence(a: &[i32], b: &[i32]) -> Option<usize> {
 fn ac1_graphs_on_is_token_identical_to_eager_for_spec_off_and_mtp_k3() {
     let snapshot = common::qwen35::snapshot_from_env(SNAPSHOT_VAR)
         .unwrap_or_else(|| panic!("set {SNAPSHOT_VAR}"));
-    let device = select_device().unwrap();
+    let device = graphs_on_device();
     let (model, mtp) = common::qwen35::load(&snapshot, &device);
     let mtp = mtp.expect("the snapshot carries a complete MTP head");
     let prompt = common::qwen35::render_chat_prompt(&snapshot, PROMPT);
@@ -165,7 +173,7 @@ fn ac1_graphs_on_is_token_identical_to_eager_for_spec_off_and_mtp_k3() {
 fn qwen38_27b_step_census() {
     let snapshot = common::qwen35::snapshot_from_env(SNAPSHOT_VAR)
         .unwrap_or_else(|| panic!("set {SNAPSHOT_VAR}"));
-    let device = select_device().unwrap();
+    let device = graphs_on_device();
     let (model, _mtp) = common::qwen35::load(&snapshot, &device);
     let prompt = common::qwen35::render_chat_prompt(&snapshot, PROMPT);
     let mut cache = model.new_cache_for(prompt.len() + 64, 4).unwrap();

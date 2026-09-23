@@ -1051,31 +1051,15 @@ impl DecodeCache for Qwen35Cache {
     /// static KV buffers are; the S1 hybrid cache still *replaces* each linear layer's recurrent
     /// state per step (`DeltaNetCache::update`), which the per-token DeltaNet checkpoint ring
     /// (S3) turns into in-place writes — until then a hybrid cache says
-    /// `deltanet_state_unstable`, and a growing `AttnKv` cache `growing_kv`. Positions are
-    /// still Rust-side scalars on this path (`cos_sin`, `slice_set`, `narrow`), which the
-    /// runner's census and self-checks catch as `host_upload_in_capture`; see `decode::graph`.
+    /// `deltanet_state_unstable`, and a growing `AttnKv` cache `growing_kv`. A cache that
+    /// passes is still refused by its model: [`Qwen35Model`]'s positions are Rust-side scalars
+    /// (`positions_host_scalar`), so this cache keeps the trait's refusing `replay_advance`.
     fn graph_support(&self) -> std::result::Result<(), &'static str> {
         for layer in &self.layers {
             match layer {
                 Qwen35LayerCache::Delta(_) => return Err("deltanet_state_unstable"),
                 Qwen35LayerCache::Attn(_) => return Err("growing_kv"),
                 Qwen35LayerCache::StaticAttn(_) => {}
-            }
-        }
-        Ok(())
-    }
-
-    /// The bookkeeping of a `n`-token step whose device writes a graph replay produced: the
-    /// capacity check and the rollback checkpoint of `begin_forward`, then every static layer's
-    /// offset (a linear layer refuses — see [`graph_support`](Self::graph_support)).
-    fn replay_advance(&mut self, n: usize) -> Result<()> {
-        self.graph_support().map_err(|reason| {
-            Error::Unsupported(format!("Qwen35Cache::replay_advance: {reason}"))
-        })?;
-        self.begin_forward(n)?;
-        for layer in &mut self.layers {
-            if let Qwen35LayerCache::StaticAttn(s) = layer {
-                s.advance(n)?;
             }
         }
         Ok(())
@@ -2372,13 +2356,17 @@ impl StepModel for Qwen35Model {
         }
     }
 
-    /// The MoE block (35B-A3B) pulls its router probabilities to the host every step — a
-    /// device->host read no graph can replay (story sc-24134).
+    /// Not replayable as a CUDA graph on this revision (story sc-24134), declared so the runner
+    /// refuses before any capture: the MoE block (35B-A3B) pulls its router probabilities to
+    /// the host every step (`moe_router_host_read`), and every step's positions are Rust-side
+    /// scalars — the RoPE tables built on the host for `offset`, the KV written at
+    /// `slice_set(offset)`, attention bounded by `narrow(len)` — which a graph would replay at
+    /// the captured position (`positions_host_scalar`).
     fn graph_support(&self) -> std::result::Result<(), &'static str> {
         if self.cfg.moe.is_some() {
             return Err("moe_router_host_read");
         }
-        Ok(())
+        Err("positions_host_scalar")
     }
 
     fn device(&self) -> &Device {

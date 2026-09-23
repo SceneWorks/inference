@@ -12,8 +12,10 @@ use candle_core::{Device, DeviceLocation};
 use candle_quant_kernels::Nvfp4Context;
 use core_llm::{BackendCapabilities, FeatureSupport};
 
-use crate::decode::graph::{REASON_CUDA_FEATURE_OFF, REASON_NOT_CUDA};
-use crate::device::select_device;
+use crate::decode::graph::{
+    REASON_CUDA_FEATURE_OFF, REASON_FLASH_ATTN_STREAM, REASON_LEGACY_STREAM, REASON_NOT_CUDA,
+};
+use crate::device::{select_device, CudaStreamKind, CUDA_STREAM_ENV};
 
 /// This build's execution backend label (`candle-cuda`, `candle-metal`, `candle-cpu`).
 pub fn backend_label() -> &'static str {
@@ -28,7 +30,9 @@ pub fn backend_label() -> &'static str {
 
 /// What this build can serve on the device a load would use: the device, its CUDA compute
 /// capability, whether an NVFP4 load passes the device gate, and whether the CUDA-graph switch
-/// (`LoadSpec::cuda_graphs`) is honoured — each unavailable feature with its reason.
+/// (`LoadSpec::cuda_graphs`) can take effect — each unavailable feature with its reason. The
+/// switch cannot take effect where a load could never get the stream capture needs: a
+/// `flash-attn` build (always the legacy stream) or `CANDLE_LLM_CUDA_STREAM=legacy`.
 ///
 /// Probed once per process (the device a load selects does not change while it runs) and cached;
 /// the probe opens the load device the way a load does and, on CUDA, builds the NVFP4 context
@@ -57,7 +61,10 @@ pub fn capabilities_for_device(backend: &str, device: &Device) -> BackendCapabil
         DeviceLocation::Cuda { gpu_id } => (format!("cuda:{gpu_id}"), cuda_compute_cap(device)),
     };
     let cuda_graphs = if device.is_cuda() {
-        FeatureSupport::available()
+        cuda_graphs_on_cuda(
+            cfg!(feature = "flash-attn"),
+            std::env::var(CUDA_STREAM_ENV).ok().as_deref(),
+        )
     } else {
         // The same reasons the graph runner names when it refuses a step.
         let reason = if cfg!(feature = "cuda") {
@@ -77,6 +84,26 @@ pub fn capabilities_for_device(backend: &str, device: &Device) -> BackendCapabil
         nvfp4,
         cuda_graphs,
     }
+}
+
+/// The CUDA-graph switch on a CUDA device: available unless the build or the stream switch pins
+/// every load to the legacy stream (the runner's own reasons, `flash_attn_stream` /
+/// `legacy_stream`).
+fn cuda_graphs_on_cuda(flash_attn: bool, stream_env: Option<&str>) -> FeatureSupport {
+    if flash_attn {
+        return FeatureSupport::unavailable(format!(
+            "cuda_graphs: {REASON_FLASH_ATTN_STREAM}: this flash-attn build keeps every model on              the legacy CUDA stream, which stream capture cannot record"
+        ));
+    }
+    if matches!(
+        CudaStreamKind::parse(stream_env),
+        Ok(Some(CudaStreamKind::Legacy))
+    ) {
+        return FeatureSupport::unavailable(format!(
+            "cuda_graphs: {REASON_LEGACY_STREAM}: {CUDA_STREAM_ENV}=legacy pins every model to              the legacy CUDA stream, which stream capture cannot record"
+        ));
+    }
+    FeatureSupport::available()
 }
 
 /// The answer when no load device could be opened: every device feature is unavailable with the
@@ -132,6 +159,18 @@ mod tests {
     }
 
     #[test]
+    fn graphs_on_cuda_follow_the_stream_the_load_could_get() {
+        assert!(cuda_graphs_on_cuda(false, None).supported);
+        assert!(cuda_graphs_on_cuda(false, Some("own")).supported);
+        let legacy = cuda_graphs_on_cuda(false, Some(" LEGACY "));
+        assert!(!legacy.supported);
+        assert!(legacy.reason.unwrap().contains(REASON_LEGACY_STREAM));
+        let flash = cuda_graphs_on_cuda(true, None);
+        assert!(!flash.supported);
+        assert!(flash.reason.unwrap().contains(REASON_FLASH_ATTN_STREAM));
+    }
+
+    #[test]
     fn a_missing_device_names_the_error_in_every_refusal() {
         let caps = no_device("candle-cuda", "CUDA driver not found");
         assert!(caps.device.contains("CUDA driver not found"));
@@ -167,7 +206,14 @@ mod tests {
         };
         let caps = capabilities_for_device("candle-cuda", &device);
         assert_eq!(caps.device, "cuda:0");
-        assert!(caps.cuda_graphs.supported, "{:?}", caps.cuda_graphs);
+        assert_eq!(
+            caps.cuda_graphs.supported,
+            !cfg!(feature = "flash-attn")
+                && !std::env::var(CUDA_STREAM_ENV)
+                    .is_ok_and(|v| v.trim().eq_ignore_ascii_case("legacy")),
+            "{:?}",
+            caps.cuda_graphs
+        );
         let cap = caps
             .compute_capability
             .expect("a CUDA device reports its capability");
