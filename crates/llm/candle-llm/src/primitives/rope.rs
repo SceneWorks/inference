@@ -334,7 +334,7 @@ impl Rope {
 
 /// Per-head RMSNorm (`weight: [head_dim]`) followed by [`apply_rope`] — the Qwen3 / Qwen3.5
 /// **QK-norm** pattern (`q_norm(q)` then rotary). One fused launch on the fused path (see
-/// [`fused`](super::fused)); otherwise [`rms_norm_reference`] then [`apply_rope`], with the reason
+/// [`super::fused`]); otherwise [`rms_norm_reference`] then [`apply_rope`], with the reason
 /// recorded. Bit-identical either way.
 pub fn rms_norm_rope(
     x: &Tensor,

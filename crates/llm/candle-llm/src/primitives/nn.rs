@@ -21,7 +21,7 @@ pub fn linear(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tens
 /// RMSNorm: `x / sqrt(mean(x²) + eps) * weight`, computed in f32 and cast back to `x`'s dtype.
 /// `weight` is `[d]` and broadcasts over the leading dims; the norm is over the last axis.
 ///
-/// On a `cuda` build with the fused path enabled (see [`fused`](super::fused)) this is one
+/// On a `cuda` build with the fused path enabled (see [`super::fused`]) this is one
 /// nvrtc-compiled launch that is bit-identical to [`rms_norm_reference`]; otherwise, or when the
 /// kernel refuses the input (dtype, shape) or cannot be compiled on this device, the op chain
 /// runs and the reason is recorded in the thread's fused tally.

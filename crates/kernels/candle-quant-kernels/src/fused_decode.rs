@@ -810,6 +810,9 @@ mod cuda_tests {
 
     /// f32: max relative difference against `F32_MAX_REL`; bf16: max ulp distance against
     /// `BF16_MAX_ULP`. Both report how many elements differ at all.
+    // `BF16_MAX_ULP` is 0 (bit-identical), which makes `<=` look absurd to clippy; it stays a
+    // `<=` against the named tolerance so loosening the declaration is a one-line change.
+    #[allow(clippy::absurd_extreme_comparisons)]
     fn compare(what: &str, got: &Tensor, want: &Tensor) {
         assert_eq!(got.dims(), want.dims(), "{what}: shape");
         assert_eq!(got.dtype(), want.dtype(), "{what}: dtype");
