@@ -2938,6 +2938,18 @@ pub(crate) mod tests {
             cosine > 0.9,
             "NVFP4 logits diverged from dense: cosine {cosine}"
         );
+        // Cosine is scale-invariant; the relative RMS error also pins the logits' magnitude.
+        let err: f64 = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (*a as f64 - *b as f64).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let rel_rms = err / norm(&want).max(1e-30);
+        assert!(
+            rel_rms <= 0.3,
+            "NVFP4 logits diverged from dense: relative RMS {rel_rms}"
+        );
     }
 
     fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {

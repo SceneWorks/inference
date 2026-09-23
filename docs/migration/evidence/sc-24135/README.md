@@ -18,6 +18,11 @@ Files:
   `docs/architecture/inference-rearchitecture.md`, sha256
   `f238f90bf67cd78f023cf7a5430f161b2bea306e996201315f7af37b9f0629b1`).
 
+Both console logs begin with the stray line `operable program or batch file.`: the tail of a
+`cmd` "is not recognized as an internal or external command" error printed by the vcvars wrapper
+before cargo started. It is wrapper noise, not part of either run — every line after it is the
+unedited cargo/test output — and the logs are kept byte-for-byte as captured rather than edited.
+
 ## Results
 
 | | bf16 | NVFP4 |
@@ -60,7 +65,9 @@ accelerator gate, admission or any weight read, with
 (cuBLASLt block-scaled FP4 GEMM); the load device is Cpu")`. No sub-sm_120 GPU exists on this
 host; that refusal is covered by the mocked-capability unit tests
 (`nvfp4_weight::tests::sub_sm120_capabilities_are_refused_by_name`,
-`provider::tests::a_sub_sm120_refusal_reaches_the_contract_as_unsupported`).
+`provider::tests::a_sub_sm120_refusal_reaches_the_contract_as_unsupported`, and — through the real
+`nvfp4_format` → `Nvfp4Context::require_with` path with the capability probe mocked to sm_89 /
+sm_100 — `provider::tests::nvfp4_format_refuses_a_mocked_sub_sm120_device_as_unsupported`).
 
 ## Reproduce
 

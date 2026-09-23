@@ -8,10 +8,12 @@
 //!   packing them through the scalar CPU packer (and retaining the host container, as
 //!   `Nvfp4Linear` does) would cost minutes and ~15 GB of host RAM for nothing. [`Nvfp4Weight`]
 //!   instead runs the device-resident bf16 weight through the **same fused quantizer** the W4A4
-//!   forward uses for activations, whose output is byte-identical to
-//!   [`Nvfp4Tensor::pack`](crate::Nvfp4Tensor::pack) + staging (the sc-12078 parity contract: the
-//!   same per-tensor `amax / (6·448)` global scale, per-16-block UE4M3 scale and nearest-E2M1
-//!   codes, emitted in cuBLASLt's scale-factor layout). Only the packed bytes stay resident.
+//!   forward uses for activations. For `K` a multiple of [`NVFP4_K_ALIGN`] (32) its output is
+//!   byte-identical to [`Nvfp4Tensor::pack`](crate::Nvfp4Tensor::pack) + staging; otherwise it
+//!   equals the packer's output on the input zero-padded to the next multiple of 32 columns (the
+//!   packer itself pads `K` only to 16). Either way it is the sc-12078 parity contract: the same
+//!   per-tensor `amax / (6·448)` global scale, per-16-block UE4M3 scale and nearest-E2M1 codes,
+//!   emitted in cuBLASLt's scale-factor layout. Only the packed bytes stay resident.
 //! - **Refuse, never downgrade.** Requesting NVFP4 where the FP4 GEMM cannot run is a load error
 //!   carrying a typed [`Nvfp4Refusal`] that names the capability — not a silent dense fallback that
 //!   would serve a bf16 footprint under an NVFP4 label (epic E2 / E5).
@@ -22,7 +24,9 @@
 
 use candle_core::{Device, Result, Tensor};
 
-use crate::cublaslt::{compute_cap_meets_nvfp4_floor, NVFP4_COMPUTE_CAP_FLOOR, NVFP4_N_ALIGN};
+use crate::cublaslt::{
+    compute_cap_meets_nvfp4_floor, NVFP4_COMPUTE_CAP_FLOOR, NVFP4_K_ALIGN, NVFP4_N_ALIGN,
+};
 use crate::nvfp4_linear::Nvfp4Context;
 
 /// The capability name every [`Nvfp4Refusal`] carries.
@@ -56,6 +60,15 @@ pub enum Nvfp4Refusal {
     /// A projection's output dimension is not a multiple of [`NVFP4_N_ALIGN`] (16), which the
     /// cuBLASLt FP4 GEMM requires.
     ShapeIneligible {
+        /// Output features (`N`).
+        rows: usize,
+        /// Input features (`K`).
+        cols: usize,
+    },
+    /// A projection too large for the fused quantizer, which indexes the `K`-padded
+    /// `[rows, round_up(cols, 32)]` grid with 32-bit integers: more than `i32::MAX` elements would
+    /// silently overflow them.
+    ShapeTooLarge {
         /// Output features (`N`).
         rows: usize,
         /// Input features (`K`).
@@ -100,6 +113,13 @@ impl std::fmt::Display for Nvfp4Refusal {
                 "NVFP4 projection [{rows}, {cols}] is ineligible: the cuBLASLt FP4 GEMM needs the \
                  output dimension to be a multiple of {NVFP4_N_ALIGN}"
             ),
+            Self::ShapeTooLarge { rows, cols } => write!(
+                f,
+                "NVFP4 projection [{rows}, {cols}] is too large: the fused quantizer indexes the \
+                 K-padded weight with 32-bit integers, so rows x round_up(cols, {NVFP4_K_ALIGN}) \
+                 must not exceed {}",
+                i32::MAX
+            ),
         }
     }
 }
@@ -114,10 +134,20 @@ pub fn nvfp4_refusal_for_compute_cap(cap: (i32, i32)) -> Option<Nvfp4Refusal> {
 }
 
 /// The shape half of the gate: `Ok` iff a `[rows, cols]` weight can be served by the FP4 GEMM.
-/// `K` is padded to the GEMM's alignment at quantization time, so only `N` can disqualify.
+/// `K` is padded to the GEMM's alignment at quantization time, so its alignment never
+/// disqualifies; `N` must be a multiple of [`NVFP4_N_ALIGN`], and the `K`-padded element count
+/// must fit the fused quantizer's 32-bit indexing ([`Nvfp4Refusal::ShapeTooLarge`]). Pure
+/// arithmetic — no allocation — so a loader can settle it before reading the weight.
 pub fn nvfp4_shape_refusal(rows: usize, cols: usize) -> std::result::Result<(), Nvfp4Refusal> {
     if rows == 0 || cols == 0 || !rows.is_multiple_of(NVFP4_N_ALIGN) {
         return Err(Nvfp4Refusal::ShapeIneligible { rows, cols });
+    }
+    let fits_i32 = cols
+        .checked_next_multiple_of(NVFP4_K_ALIGN)
+        .and_then(|cols_padded| rows.checked_mul(cols_padded))
+        .is_some_and(|elems| elems <= i32::MAX as usize);
+    if !fits_i32 {
+        return Err(Nvfp4Refusal::ShapeTooLarge { rows, cols });
     }
     Ok(())
 }
@@ -130,39 +160,52 @@ impl Nvfp4Context {
     /// quantizer compiling. This is the whole capability floor, so a loader calls it **before**
     /// reading any weights (epic E5: declared and validated before launch).
     pub fn require(device: &Device) -> std::result::Result<Self, Nvfp4Refusal> {
+        #[cfg(feature = "cuda")]
+        {
+            Self::require_with(device, crate::cublaslt::CublasLt::compute_cap)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            Err(Nvfp4Refusal::NotCudaDevice {
+                device: format!("{:?}", device.location()),
+            })
+        }
+    }
+
+    /// [`Self::require`] with the compute-capability probe injected: `cap_probe` is asked for the
+    /// device's `(major, minor)` in place of the handle's real query, so the whole gate — handle,
+    /// capability refusal, quantizer — can be exercised with a mocked sub-sm_120 capability on an
+    /// sm_120 host. [`Self::require`] is exactly this with [`CublasLt::compute_cap`](crate::CublasLt::compute_cap).
+    #[cfg(feature = "cuda")]
+    pub fn require_with(
+        device: &Device,
+        cap_probe: impl FnOnce(&crate::cublaslt::CublasLt) -> Result<(i32, i32)>,
+    ) -> std::result::Result<Self, Nvfp4Refusal> {
         if !device.is_cuda() {
             return Err(Nvfp4Refusal::NotCudaDevice {
                 device: format!("{:?}", device.location()),
             });
         }
-        #[cfg(feature = "cuda")]
-        {
-            let lt = crate::cublaslt::CublasLt::new(device).map_err(|e| {
-                Nvfp4Refusal::HandleUnavailable {
-                    reason: e.to_string(),
-                }
-            })?;
-            let cap = lt
-                .compute_cap()
-                .map_err(|e| Nvfp4Refusal::HandleUnavailable {
-                    reason: e.to_string(),
-                })?;
-            if let Some(refusal) = nvfp4_refusal_for_compute_cap(cap) {
-                return Err(refusal);
+        let lt = crate::cublaslt::CublasLt::new(device).map_err(|e| {
+            Nvfp4Refusal::HandleUnavailable {
+                reason: e.to_string(),
             }
-            if !lt.nvfp4_fused_quantizer_available() {
-                return Err(Nvfp4Refusal::FusedQuantizerUnavailable);
-            }
-            Ok(Self {
-                inner: Some(crate::nvfp4_linear::Fp4Ctx {
-                    lt: std::sync::Arc::new(lt),
-                    device: device.clone(),
-                }),
-            })
+        })?;
+        let cap = cap_probe(&lt).map_err(|e| Nvfp4Refusal::HandleUnavailable {
+            reason: e.to_string(),
+        })?;
+        if let Some(refusal) = nvfp4_refusal_for_compute_cap(cap) {
+            return Err(refusal);
         }
-        // A non-cuda build cannot construct a CUDA device, so the check above already returned.
-        #[cfg(not(feature = "cuda"))]
-        unreachable!("a CUDA device exists only in a cuda build")
+        if !lt.nvfp4_fused_quantizer_available() {
+            return Err(Nvfp4Refusal::FusedQuantizerUnavailable);
+        }
+        Ok(Self {
+            inner: Some(crate::nvfp4_linear::Fp4Ctx {
+                lt: std::sync::Arc::new(lt),
+                device: device.clone(),
+            }),
+        })
     }
 }
 
@@ -188,8 +231,9 @@ impl Nvfp4Weight {
     /// Quantize a dense `[out, in]` weight (any float dtype, on `ctx`'s device) to a resident NVFP4
     /// weight. The dense tensor is not retained; drop it to release its memory.
     ///
-    /// Errors when the shape is ineligible ([`nvfp4_shape_refusal`] — call it first to get the typed
-    /// refusal), when `ctx` holds no handle for the weight's device, or on a device fault.
+    /// Errors when the shape is ineligible or too large for the quantizer's 32-bit indexing
+    /// ([`nvfp4_shape_refusal`] — call it first to get the typed refusal), when `ctx` holds no
+    /// handle for the weight's device, or on a device fault.
     pub fn quantize(weight: &Tensor, bias: Option<Tensor>, ctx: &Nvfp4Context) -> Result<Self> {
         let (rows, cols) = weight.dims2()?;
         if let Err(refusal) = nvfp4_shape_refusal(rows, cols) {
@@ -202,10 +246,13 @@ impl Nvfp4Weight {
                     "{NVFP4_CAPABILITY}: no NVFP4 handle for the weight's device ({why:?})"
                 ))
             })?;
-            let cols_padded = cols.div_ceil(crate::NVFP4_K_ALIGN) * crate::NVFP4_K_ALIGN;
+            // `nvfp4_shape_refusal` above bounds `rows * cols_padded` by `i32::MAX`.
+            let cols_padded = cols.div_ceil(NVFP4_K_ALIGN) * NVFP4_K_ALIGN;
             // The fused quantizer is layout-agnostic between operands: it emits the row-major
             // `[rows, cols_padded]` nibbles and cuBLASLt's row-major scale-factor-atom layout for
-            // whichever operand it is given, byte-identical to `Nvfp4Tensor::pack` + staging.
+            // whichever operand it is given. For `cols % 32 == 0` that is byte-identical to
+            // `Nvfp4Tensor::pack` + staging; otherwise it equals the packer's output on the input
+            // zero-padded to `cols_padded` columns (the packer pads `K` only to 16).
             let staged = lt.quantize_nvfp4_activation_fused(&weight.contiguous()?, cols_padded)?;
             Ok(Self {
                 rows,
@@ -362,6 +409,42 @@ mod tests {
         assert!(nvfp4_shape_refusal(0, 64).is_err());
     }
 
+    /// The fused quantizer indexes the K-padded grid with 32-bit integers (`long` is 32-bit on
+    /// MSVC), so a shape whose `rows × round_up(cols, 32)` exceeds `i32::MAX` is refused up front
+    /// — settled by arithmetic alone, nothing allocated.
+    #[test]
+    fn a_shape_past_the_quantizers_32_bit_indexing_is_refused() {
+        // 65536 × 32768 = 2^31 = i32::MAX + 1: one element too many.
+        assert_eq!(
+            nvfp4_shape_refusal(65_536, 32_768),
+            Err(Nvfp4Refusal::ShapeTooLarge {
+                rows: 65_536,
+                cols: 32_768
+            })
+        );
+        // K = 32_737 pads to 32_768, so the padded (not the logical) count is what overflows.
+        assert_eq!(
+            nvfp4_shape_refusal(65_536, 32_737),
+            Err(Nvfp4Refusal::ShapeTooLarge {
+                rows: 65_536,
+                cols: 32_737
+            })
+        );
+        // The largest padded grid that fits: 65536 × 32736 < 2^31.
+        assert!(nvfp4_shape_refusal(65_536, 32_736).is_ok());
+        // usize overflow in the product is a refusal, not a wrap.
+        assert!(nvfp4_shape_refusal(usize::MAX - 15, usize::MAX).is_err());
+        let msg = Nvfp4Refusal::ShapeTooLarge {
+            rows: 65_536,
+            cols: 32_768,
+        }
+        .to_string();
+        assert!(
+            msg.starts_with("nvfp4: ") && msg.contains("32-bit"),
+            "{msg}"
+        );
+    }
+
     #[test]
     fn quantize_on_cpu_is_an_error_not_a_dense_fallback() -> Result<()> {
         let w = Tensor::zeros((16, 32), candle_core::DType::F32, &Device::Cpu)?;
@@ -409,6 +492,40 @@ mod tests {
         let weight = Nvfp4Weight::quantize(&w, None, &ctx)?;
         let host = weight.to_host()?;
         let cpu = crate::Nvfp4Tensor::pack_from_slice(&data, rows, cols)?;
+        assert_eq!(host.global_scale, cpu.global_scale);
+        assert_eq!(host.packed, cpu.packed, "E2M1 nibbles");
+        assert_eq!(host.scales, cpu.scales, "UE4M3 block scales");
+        assert_eq!(weight.resident_bytes(), cpu.packed.len() + cpu.scales.len());
+        Ok(())
+    }
+
+    /// For `K` not a multiple of 32 the device pads `K` to 32 while the CPU packer pads only to 16,
+    /// so parity is against the packer run on the input zero-padded to 32 (here 80 → 96 columns;
+    /// 96 rows is below one 128-row scale atom).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn load_time_quantization_of_an_unaligned_k_matches_the_packer_on_the_padded_input(
+    ) -> Result<()> {
+        let Some((device, ctx)) = nvfp4_device() else {
+            eprintln!("skipping: no sm_120 CUDA device");
+            return Ok(());
+        };
+        let (rows, cols, cols_padded) = (96, 80, 96);
+        let data = ramp(rows, cols, 0x5EED_2413_5000_0003);
+        let w = Tensor::from_vec(data.clone(), (rows, cols), &device)?;
+        let weight = Nvfp4Weight::quantize(&w, None, &ctx)?;
+        assert_eq!(weight.shape(), (rows, cols));
+        let host = weight.to_host()?;
+        let padded: Vec<f32> = data
+            .chunks(cols)
+            .flat_map(|row| {
+                row.iter()
+                    .copied()
+                    .chain(std::iter::repeat_n(0.0, cols_padded - cols))
+            })
+            .collect();
+        let cpu = crate::Nvfp4Tensor::pack_from_slice(&padded, rows, cols_padded)?;
+        assert_eq!(host.cols_padded, cpu.cols_padded);
         assert_eq!(host.global_scale, cpu.global_scale);
         assert_eq!(host.packed, cpu.packed, "E2M1 nibbles");
         assert_eq!(host.scales, cpu.scales, "UE4M3 block scales");
