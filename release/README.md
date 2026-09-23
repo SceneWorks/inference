@@ -112,6 +112,30 @@ consumer smoke remains deliberately contract-only.
 
 ## Release gates
 
+### SC-23935 RC7 accelerator evidence reuse
+
+The approved Qwen3.8/Bonsai scope excludes Candle CPU inference. For the RC7-derived
+accelerator-only candidate only, the required real-weight profile may be satisfied by
+`scripts/release/qwen38_bonsai_rc7_bridge.py` over the two immutable RC7 MLX/CUDA
+artifacts. Run it on the clean, final candidate checkout with the exact downloaded
+artifact ZIPs; retain `reuse-bridge.json`, the 16-row matrix report and seal, and
+the selected artifact IDs/digests. The verifier checks the RC7 observation SHA,
+the reviewed CPU-only change, unchanged accelerator cells/cases/oracles/model pins,
+the live GitHub artifact identities, archive digests, and all original receipts.
+Its candidate SHA is read from the clean release-merge HEAD, so the RC8 version
+commit and release merge are bound without embedding a self-referential source
+SHA in the repository. The final tag must name that exact merge revision;
+merging it onward to `main` does not transfer these observations to a new tree.
+
+The historical RC7 19-cell workflow failed because its CPU Bonsai cell was
+missing. It remains failed. The bridge uses 16 original-source observations and
+does not claim model execution on the newer source. Raw quality misses (Bonsai
+`code` and baseline `ordering`) and the two pre-allocation MLX `context_2048`
+declines remain visible in the matrix report; no quality threshold is applied.
+Any change to supported accelerator runtime paths, case contract, or model pins
+invalidates this one-off route. All other candidate CI, bundle, hash, exact-tag,
+and consumer acceptance gates below remain required.
+
 Before a final tag is created:
 
 1. Workspace, contracts, affected backend/platform, documentation, and

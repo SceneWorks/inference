@@ -1145,6 +1145,8 @@ Pages purgeable:                             1000.
             )
         )
         terminal.validate_full_acceptance_contract(matrix)
+        self.assertEqual(len(matrix["cells"]), 16)
+        self.assertFalse(any(cell["device"] == "cpu" for cell in matrix["cells"]))
         mutants = []
         mutant = copy.deepcopy(matrix)
         del mutant["acceptance_contract"]
@@ -1176,10 +1178,27 @@ Pages purgeable:                             1000.
             cell for cell in mutant["cells"] if cell["id"] != "functional-candle-ptq1-q8"
         ]
         mutants.append(mutant)
+        mutant = copy.deepcopy(matrix)
+        cpu = copy.deepcopy(next(cell for cell in mutant["cells"] if cell["id"] == "candle-cuda-qwen38-parent"))
+        cpu.update(id="candle-cpu-qwen38-parent", device="cpu", load_profile="candle-dense-cpu")
+        mutant["cells"].append(cpu)
+        mutants.append(mutant)
         for mutant in mutants:
             with self.subTest(mutant=mutant):
                 with self.assertRaises(ValueError):
                     terminal.validate_full_acceptance_contract(mutant)
+
+    def test_accelerator_only_manifest_rejects_cpu_preflight_before_host_probe(self) -> None:
+        args = argparse.Namespace(
+            reserve_bytes=0,
+            manifest=SCRIPT.parents[2] / "release" / "real-weight-models.toml",
+            model_key="bonsai-qwen38-parent",
+            load_profile="candle-dense-cpu",
+        )
+        with mock.patch.object(
+            terminal, "physical_memory", side_effect=AssertionError("host probe must not run")
+        ), self.assertRaisesRegex(ValueError, "does not support the candle-dense-cpu"):
+            terminal.preflight(args)
 
     def test_matrix_status_lists_every_missing_or_unadmitted_cell(self) -> None:
         self.write_hardware()

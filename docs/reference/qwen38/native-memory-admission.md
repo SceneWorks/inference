@@ -9,6 +9,9 @@ remain unchanged.
 fresh available capacity; it cannot enlarge it. Invalid or non-Unicode values fail closed. Missing
 capacity also fails closed, even when a budget was supplied. CPU capacity comes from current host
 availability (Linux MemAvailable, macOS reclaimable/free vm_stat pages, Windows FreePhysicalMemory).
+Qwen3.8 and Prism/Bonsai are accelerator-only and Candle rejects those snapshots on CPU before
+checkpoint inventory or tensor allocation; this host-capacity behavior remains available to other
+model families.
 MLX uses that unified-memory capacity. Candle CUDA applies the operational cap to VRAM and reads
 current free memory from the loaded CUDA device's own context; host RAM is never substituted for
 VRAM, and a launch-time GPU snapshot never substitutes for current post-load free VRAM. CUDA load
@@ -16,9 +19,8 @@ admission checks host staging independently against current host capacity. Reque
 to *additional* request memory against current free capacity, so loaded weights are not charged
 twice.
 
-Load upper bounds use checkpoint files without evaluating tensor payloads. Dense Candle CPU
-reserves three times stored payload for source tensors plus conversion; packed Candle reserves two
-copies. Dense Candle CUDA's pinned loader reads one safetensors shard into a host buffer, copies its
+Load upper bounds use checkpoint files without evaluating tensor payloads. Dense Candle CUDA's
+pinned loader reads one safetensors shard into a host buffer, copies its
 tensors directly to CUDA at their stored dtype, then drops that buffer before reading the next
 shard. Its host bound is therefore the largest shard rather than two complete checkpoint copies.
 Qwen3.8 is BF16 and same-dtype model construction shares the loaded storage. CUDA device admission
