@@ -7383,6 +7383,16 @@ jobs:
         with:
           toolchain: 1.96.0
           components: rustfmt, clippy
+      # The runner service exports RUSTC_WRAPPER=sccache globally (it appears nowhere in this repo);
+      # its daemon resets mid-build on heavy Candle/CUDA graphs ("An existing connection was forcibly
+      # closed by the remote host (os error 10054)" with zero rustc diagnostics -- run 35898072912
+      # lost this lane to it 4 minutes in). Same step as SceneWorks' windows-candle.yml heavy lane:
+      # clear the wrapper for this job only; registry/git/target caches stay intact.
+      - name: Disable unstable sccache wrapper for the heavy Candle lane
+        shell: powershell
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='
+          Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
       - name: Require operator-provided models root and initialize evidence
         shell: cmd
         run: |
