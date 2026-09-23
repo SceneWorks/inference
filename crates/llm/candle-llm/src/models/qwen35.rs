@@ -34,9 +34,9 @@ use crate::primitives::gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
 };
 use crate::primitives::kv_cache::{KvCacheKind, StaticKvCache};
-use crate::primitives::nn::{embed, rms_norm, silu};
-use crate::primitives::projection::{Projection, QuantSpec};
-use crate::primitives::rope::{apply_rope, Rope};
+use crate::primitives::nn::{embed, rms_norm, rms_norm_residual, swiglu};
+use crate::primitives::projection::{Projection, ProjectionFormat, QuantSpec, WeightCensus};
+use crate::primitives::rope::{rms_norm_rope, Rope};
 use crate::primitives::{KvCache, PrismRegistry, Weights};
 
 fn checkpoint_norm_weight(weight: Tensor, prism: bool) -> Result<Tensor> {
@@ -255,6 +255,26 @@ struct GatedDeltaNet {
 }
 
 impl GatedDeltaNet {
+    fn record(&self, census: &mut WeightCensus) {
+        for p in [
+            &self.in_proj_qkv,
+            &self.in_proj_z,
+            &self.in_proj_a,
+            &self.in_proj_b,
+            &self.out_proj,
+        ] {
+            census.projections.record(p);
+        }
+        for t in [
+            &self.conv_weight,
+            &self.a_log,
+            &self.dt_bias,
+            &self.norm_weight,
+        ] {
+            census.record_tensor(t);
+        }
+    }
+
     fn forward(&self, x: &Tensor, cache: &mut DeltaNetCache) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
 
@@ -362,20 +382,15 @@ impl Qwen35Attention {
             .narrow(3, hd, hd)?
             .contiguous()?
             .reshape((b, s, nh * hd))?;
-        let q = rms_norm(&q, &self.q_norm, self.eps)?; // [b,s,H,hd]
-
-        let k = rms_norm(
-            &self.k_proj.forward(x)?.reshape((b, s, nkv, hd))?,
-            &self.k_norm,
-            self.eps,
-        )?;
+        let k = self.k_proj.forward(x)?.reshape((b, s, nkv, hd))?;
         let v = self.v_proj.forward(x)?.reshape((b, s, nkv, hd))?;
 
-        // Partial RoPE (NeoX), then transpose into head-major [b,H,s,hd].
-        let q = apply_rope(&q, cos, sin, false)?
+        // Per-head QK-norm then partial RoPE (NeoX) — one fused leaf each (sc-24137) — then
+        // transpose into head-major [b,H,s,hd].
+        let q = rms_norm_rope(&q, &self.q_norm, self.eps, cos, sin, false)? // [b,s,H,hd]
             .transpose(1, 2)?
             .contiguous()?;
-        let k = apply_rope(&k, cos, sin, false)?
+        let k = rms_norm_rope(&k, &self.k_norm, self.eps, cos, sin, false)?
             .transpose(1, 2)?
             .contiguous()?;
         let v = v.transpose(1, 2)?.contiguous()?;
@@ -421,10 +436,16 @@ struct Mlp {
 }
 
 impl Mlp {
+    fn record(&self, census: &mut WeightCensus) {
+        for p in [&self.gate, &self.up, &self.down] {
+            census.projections.record(p);
+        }
+    }
+
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = silu(&self.gate.forward(x)?)?;
+        let gate = self.gate.forward(x)?;
         let up = self.up.forward(x)?;
-        self.down.forward(&gate.broadcast_mul(&up)?)
+        self.down.forward(&swiglu(&gate, &up)?)
     }
 }
 
@@ -533,6 +554,34 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
+    fn record(&self, census: &mut WeightCensus) {
+        census.record_tensor(&self.input_ln);
+        census.record_tensor(&self.post_ln);
+        match &self.mixer {
+            Mixer::Delta(d) => d.record(census),
+            Mixer::Attn(a) => {
+                for p in [&a.q_proj, &a.k_proj, &a.v_proj, &a.o_proj] {
+                    census.projections.record(p);
+                }
+                census.record_tensor(&a.q_norm);
+                census.record_tensor(&a.k_norm);
+            }
+        }
+        match &self.ffn {
+            Ffn::Dense(m) => m.record(census),
+            Ffn::Moe(moe) => {
+                census.record_tensor(&moe.router);
+                census.record_tensor(&moe.shared_gate);
+                moe.shared.record(census);
+                for e in &moe.experts {
+                    e.record(census);
+                }
+            }
+        }
+    }
+}
+
+impl DecoderLayer {
     fn forward(
         &self,
         x: &Tensor,
@@ -552,8 +601,9 @@ impl DecoderLayer {
             }
             _ => return Err(Error::Msg("qwen3_5: cache/mixer type mismatch".into())),
         };
-        let h = x.broadcast_add(&r)?;
-        let m = self.ffn.forward(&rms_norm(&h, &self.post_ln, self.eps)?)?;
+        // Residual add + post-attention norm as one fused leaf (sc-24137); `h` carries forward.
+        let (h, normed) = rms_norm_residual(x, &r, &self.post_ln, self.eps)?;
+        let m = self.ffn.forward(&normed)?;
         Ok(h.broadcast_add(&m)?)
     }
 }
@@ -1105,6 +1155,36 @@ impl Qwen35Mtp {
         target: &Qwen35Model,
         quant: Option<QuantSpec>,
     ) -> Result<Self> {
+        let format = quant.map(ProjectionFormat::from);
+        Self::from_weights_format(w, target, format.as_ref())
+    }
+
+    /// The predictor's own resident weights (its `fc`, layers and norms). The token embedding and
+    /// LM head are the target's, shared by `Arc`, and are counted by
+    /// [`Qwen35Model::weight_census`] only.
+    pub fn weight_census(&self) -> WeightCensus {
+        let mut census = WeightCensus::default();
+        census.projections.record(&self.fc);
+        for t in [
+            &self.pre_fc_norm_embedding,
+            &self.pre_fc_norm_hidden,
+            &self.norm,
+        ] {
+            census.record_tensor(t);
+        }
+        for layer in &self.layers {
+            layer.record(&mut census);
+        }
+        census
+    }
+
+    /// [`Self::from_weights_with`] for any [`ProjectionFormat`] (NVFP4 included, sc-24135): the
+    /// predictor's projections are stored exactly like the target's.
+    pub fn from_weights_format(
+        w: &Weights,
+        target: &Qwen35Model,
+        format: Option<&ProjectionFormat>,
+    ) -> Result<Self> {
         let cfg = &target.cfg;
         if cfg.mtp_num_hidden_layers != 1 {
             return Err(Error::Config(
@@ -1138,7 +1218,8 @@ impl Qwen35Mtp {
         let req = |key: &str| -> Result<Tensor> { Ok(w.require(key)?.to_dtype(dtype)?) };
         // Qwen3.5/Qwen3.8 RMSNorm parameters are zero-centered (`1 + weight`).
         let norm_w = |key: &str| -> Result<Tensor> { Ok(req(key)?.affine(1.0, 1.0)?) };
-        let proj_q = |key: &str| -> Result<Projection> { Projection::load(req(key)?, quant) };
+        let proj_q =
+            |key: &str| -> Result<Projection> { Projection::load_as(req(key)?, None, format) };
         let groups = (cfg.num_heads / cfg.num_kv_heads) as usize;
         let mut layers = Vec::with_capacity(cfg.mtp_num_hidden_layers);
         for i in 0..cfg.mtp_num_hidden_layers {
@@ -1429,6 +1510,29 @@ impl Qwen35Model {
     /// The parsed config.
     pub fn config(&self) -> &Qwen35Config {
         &self.cfg
+    }
+
+    /// The resident weight set by projection kind (sc-24135 load telemetry): every projection the
+    /// decoder holds — including the ones a format leaves dense (`in_proj_a/b`, the MoE router is a
+    /// plain tensor) — plus embeddings, norms and recurrent parameters under `other`.
+    pub fn weight_census(&self) -> WeightCensus {
+        let mut census = WeightCensus::default();
+        // A dense tied head *is* the embedding tensor; count the storage once.
+        let head_is_embedding =
+            self.cfg.tie_word_embeddings && matches!(*self.lm_head, Projection::Dense(_));
+        match &self.embed_tokens {
+            QwenEmbedding::Dense(t) if !head_is_embedding => census.record_tensor(t),
+            QwenEmbedding::Dense(_) => {}
+            QwenEmbedding::Prism(p) => {
+                census.record_unmeasured((p.rows() * p.input_width()) as u64)
+            }
+        }
+        census.projections.record(&self.lm_head);
+        census.record_tensor(&self.norm);
+        for layer in &self.layers {
+            layer.record(&mut census);
+        }
+        census
     }
 
     /// Whether the large projections were quantized on load.
@@ -1928,6 +2032,17 @@ impl Qwen35Model {
         Self::from_weights_dtype(w, prefix, cfg, quant, compute_dtype(w.device()))
     }
 
+    /// Build from a loaded checkpoint storing the large projections in `format` (`None` = dense;
+    /// NVFP4 included, sc-24135) at the device's compute dtype.
+    pub fn from_weights_format(
+        w: &Weights,
+        prefix: &str,
+        cfg: Qwen35Config,
+        format: Option<&ProjectionFormat>,
+    ) -> Result<Self> {
+        Self::from_weights_dtype_impl(w, prefix, cfg, format, compute_dtype(w.device()), None)
+    }
+
     /// Build from a loaded checkpoint with an explicit compute `dtype`.
     ///
     /// `prefix` is the **decoder root** path: keys are read as `{prefix}.embed_tokens.weight`,
@@ -1943,7 +2058,8 @@ impl Qwen35Model {
         quant: Option<QuantSpec>,
         dtype: DType,
     ) -> Result<Self> {
-        Self::from_weights_dtype_impl(w, prefix, cfg, quant, dtype, None)
+        let format = quant.map(ProjectionFormat::from);
+        Self::from_weights_dtype_impl(w, prefix, cfg, format.as_ref(), dtype, None)
     }
 
     /// Build Qwen3.5/3.8 with compact Prism matrices while retaining ordinary tensors for norms,
@@ -1962,7 +2078,7 @@ impl Qwen35Model {
         w: &Weights,
         prefix: &str,
         cfg: Qwen35Config,
-        quant: Option<QuantSpec>,
+        format: Option<&ProjectionFormat>,
         dtype: DType,
         prism: Option<&PrismRegistry>,
     ) -> Result<Self> {
@@ -1985,7 +2101,7 @@ impl Qwen35Model {
         let proj_q = |key: String| -> Result<Projection> {
             match prism.and_then(|registry| registry.get(&key)) {
                 Some(weight) => Ok(Projection::load_prism(weight.clone())),
-                None => Projection::load(req(key)?, quant),
+                None => Projection::load_as(req(key)?, None, format),
             }
         };
         let proj_dense = |key: String| -> Result<Projection> {
@@ -2017,9 +2133,9 @@ impl Qwen35Model {
                     "Prism tied embeddings require an explicit lm_head packed tensor".into(),
                 ));
             };
-            Projection::load(weight.clone(), quant)?
+            Projection::load_as(weight.clone(), None, format)?
         } else {
-            Projection::load(req(head_key)?, quant)?
+            Projection::load_as(req(head_key)?, None, format)?
         };
         let lm_head = std::sync::Arc::new(lm_head);
 
@@ -2093,9 +2209,9 @@ impl Qwen35Model {
                         let up_w = gu.narrow(0, mi, mi)?.contiguous()?;
                         let dn = down.narrow(0, e, 1)?.squeeze(0)?.contiguous()?; // [hidden, mi]
                         experts.push(Mlp {
-                            gate: Projection::load(gate_w, quant)?,
-                            up: Projection::load(up_w, quant)?,
-                            down: Projection::load(dn, quant)?,
+                            gate: Projection::load_as(gate_w, None, format)?,
+                            up: Projection::load_as(up_w, None, format)?,
+                            down: Projection::load_as(dn, None, format)?,
                         });
                     }
                     Ffn::Moe(MoeFfn {
@@ -2131,7 +2247,7 @@ impl Qwen35Model {
             cfg,
             dtype,
             device,
-            quantized: quant.is_some() || prism.is_some(),
+            quantized: format.is_some() || prism.is_some(),
             step_kv_cache: KvCacheKind::Static,
             attn_formulation: AttnFormulation::Gqa,
         })
@@ -3130,6 +3246,119 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(logits.dims(), &[1, cfg.vocab_size as usize]);
         assert!(host(&logits).iter().all(|x| x.is_finite()));
+    }
+
+    /// The load census reports every projection the synthetic decoder holds, by kind, and every
+    /// other weight tensor, with f32 (CPU) resident bytes.
+    #[test]
+    fn dense_weight_census_covers_every_projection_and_tensor() {
+        let (cfg, model) = text_model();
+        let census = model.weight_census();
+        // 3 linear layers × (qkv, z, a, b, out) + 1 attention layer × (q, k, v, o)
+        // + 4 layers × (gate, up, down) + lm_head.
+        assert_eq!(census.projections.dense.count, 15 + 4 + 12 + 1);
+        assert_eq!(census.projections.total().count, 32);
+        let total = census.total();
+        assert_eq!(total.unmeasured, 0);
+        assert_eq!(total.resident_bytes, total.params * 4, "f32 on CPU");
+        // The embedding is resident beside the (untied) head.
+        assert!(!cfg.tie_word_embeddings);
+        assert!(census.other.params >= (cfg.vocab_size * cfg.hidden_size) as u64);
+    }
+
+    /// sc-24135: the loader selecting NVFP4 stores every large projection (and the head) as NVFP4,
+    /// keeps the per-head decay/delta projections dense exactly as Q4/Q8 do, and the decoder still
+    /// produces finite logits that track the dense model's.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn nvfp4_format_loads_the_large_projections_as_nvfp4() {
+        use crate::primitives::projection::{ProjectionFormat, ProjectionKind};
+        let Ok(device) = Device::new_cuda(0) else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let Ok(format) = ProjectionFormat::nvfp4(&device) else {
+            eprintln!("skipping: CUDA device below the NVFP4 floor");
+            return;
+        };
+        // The fixture's vocabulary (50) is not a multiple of 16; NVFP4 needs N % 16 == 0.
+        let mut v = cfg_json();
+        v["text_config"]["vocab_size"] = json!(64);
+        let cfg = Qwen35Config::from_json(&v).unwrap();
+        let cpu = synthetic_weights(&cfg);
+        let on_device = Weights::from_map(
+            cpu.keys()
+                .map(|k| {
+                    (
+                        k.to_string(),
+                        cpu.require(k).unwrap().to_device(&device).unwrap(),
+                    )
+                })
+                .collect(),
+            device.clone(),
+        );
+        let dense =
+            Qwen35Model::from_weights_format(&on_device, "model.language_model", cfg.clone(), None)
+                .unwrap();
+        let nvfp4 = Qwen35Model::from_weights_format(
+            &on_device,
+            "model.language_model",
+            cfg.clone(),
+            Some(&format),
+        )
+        .unwrap();
+        assert!(nvfp4.is_quantized());
+        assert_eq!(nvfp4.lm_head.kind(), ProjectionKind::Nvfp4);
+        let census = nvfp4.weight_census().projections;
+        assert_eq!(census.nvfp4.count, 32 - 6, "all but in_proj_a/b");
+        assert_eq!(
+            census.dense.count, 6,
+            "in_proj_a/b stay dense, as under Q4/Q8"
+        );
+        assert_eq!(census.ggml.count, 0);
+        assert!(
+            census.nvfp4.resident_bytes < census.nvfp4.params * 2,
+            "packed below bf16"
+        );
+
+        let prompt = Tensor::from_vec(vec![1u32, 7, 3, 42, 9], (1, 5), &device).unwrap();
+        let logits = |m: &Qwen35Model| {
+            let mut cache = m.new_cache();
+            m.forward(&prompt, &mut cache, 0)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let (want, got) = (logits(&dense), logits(&nvfp4));
+        assert!(got.iter().all(|x| x.is_finite()));
+        let dot: f64 = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (*a as f64) * (*b as f64))
+            .sum();
+        let norm = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+        let cosine = dot / (norm(&got) * norm(&want)).max(1e-30);
+        assert!(
+            cosine > 0.9,
+            "NVFP4 logits diverged from dense: cosine {cosine}"
+        );
+        // Cosine is scale-invariant; the relative RMS error also pins the logits' magnitude
+        // (measured 0.290 on sm_120, cosine 0.961; a head mis-scaled by 2 reads 0.83).
+        let err: f64 = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (*a as f64 - *b as f64).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let rel_rms = err / norm(&want).max(1e-30);
+        assert!(
+            rel_rms <= 0.3,
+            "NVFP4 logits diverged from dense: relative RMS {rel_rms}"
+        );
     }
 
     fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {

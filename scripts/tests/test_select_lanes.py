@@ -51,6 +51,16 @@ class SelectLanesTests(unittest.TestCase):
         self.assertTrue(lanes["windows_cuda"])
         self.assertFalse(lanes["contracts"])
 
+    def test_shared_quant_kernels_are_candle_classified(self) -> None:
+        # candle-quant-kernels (sc-24135) serves both candle-gen and candle-llm: every Candle lane,
+        # and never the fail-safe-to-all an unclassified top-level path would take.
+        lanes = select_lanes(["crates/kernels/candle-quant-kernels/src/nvfp4.rs"])
+        selected = {lane for lane, enabled in lanes.items() if enabled}
+        self.assertEqual(
+            selected,
+            {"workspace", "candle_cpu", "macos_metal", "windows_cuda", "real_weights"},
+        )
+
     def test_audio_family_is_candle_classified(self) -> None:
         # The Candle audio lane (sc-12835) runs on every platform: CPU/CUDA natively and macOS
         # through the mlx bundle's audio section — never fail-safe-to-all as an unknown path.

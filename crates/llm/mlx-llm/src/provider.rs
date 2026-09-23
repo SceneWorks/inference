@@ -626,6 +626,20 @@ impl LlamaProvider {
                     .into(),
             ));
         }
+        let quant = spec
+            .quantize
+            .map(|q| match q {
+                Quantize::Q4 => Ok(QuantSpec::q4()),
+                Quantize::Q8 => Ok(QuantSpec::q8()),
+                // sc-24135: NVFP4 is a CUDA sm_120 capability; refuse by name, never substitute —
+                // before admission, so a memory refusal cannot mask it.
+                Quantize::Nvfp4 => Err(CoreError::Unsupported(
+                    "nvfp4: NVFP4 projections need a CUDA device with compute capability >= \
+                     sm_120; the MLX backend has no NVFP4 GEMM"
+                        .into(),
+                )),
+            })
+            .transpose()?;
         let required = crate::load_memory::required_bytes(spec)?;
         let available = core_llm::effective_memory_budget(
             core_llm::available_host_memory_bytes(),
@@ -637,10 +651,6 @@ impl LlamaProvider {
         if dir.extension().and_then(|v| v.to_str()) == Some("gguf") {
             return Self::load_prism_gguf(spec, dir);
         }
-        let quant = spec.quantize.map(|q| match q {
-            Quantize::Q4 => QuantSpec::q4(),
-            Quantize::Q8 => QuantSpec::q8(),
-        });
         // Read config.json once to dispatch the architecture: the hybrid Qwen3.6 (`qwen3_5`) decoder
         // has its own config/weights path (and `ModelConfig` deliberately rejects it).
         let cfg_value = read_config_value(dir)?;

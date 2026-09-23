@@ -232,9 +232,16 @@ mod cuda_impl {
         nvfp4_quant_kernels: std::sync::Mutex<Option<Option<Arc<Nvfp4QuantKernels>>>>,
     }
 
-    /// The fused NVFP4 activation-quantize CUDA source (sc-12078), compiled once via nvrtc. Uses only
-    /// standard device intrinsics (no fp8/fp4 headers) so nvrtc needs no extra include path.
-    const NVFP4_QUANT_CU: &str = include_str!("nvfp4_quant.cu");
+    /// The fused NVFP4 activation-quantize CUDA source (sc-12078), compiled once per device through
+    /// the [`nvrtc`](crate::nvrtc) compile-once seam (sc-24137). Uses only standard device intrinsics
+    /// (no fp8/fp4 headers) so nvrtc needs no extra include path.
+    pub(crate) const NVFP4_QUANT_SRC: crate::nvrtc::KernelSource = crate::nvrtc::KernelSource {
+        name: "candle_quant_kernels_nvfp4_quant_v1",
+        src: include_str!("nvfp4_quant.cu"),
+        // Standard intrinsics only; sm_70 is the oldest this workspace targets (NVFP4 itself is
+        // gated to sm_100+/sm_120 by `meets_nvfp4_floor` before this is ever consulted).
+        cc_floor: (7, 0),
+    };
 
     /// The public, driver-reported configuration identity of the cuBLASLt algorithm selected for
     /// one NVFP4 GEMM shape. This deliberately copies documented scalar configuration attributes
@@ -774,7 +781,7 @@ mod cuda_impl {
         pub const NVFP4_FORCE_NO_FUSED_QUANT_ENV: &str = "SC12078_DISABLE_FUSED_QUANT";
 
         /// Compile (once) and fetch the fused NVFP4 activation-quantize kernels (sc-12078). nvrtc turns
-        /// [`NVFP4_QUANT_CU`] into a module JITed for the live device; the two functions are cached so
+        /// [`NVFP4_QUANT_SRC`] into a module JITed for the live device; the two functions are cached so
         /// the compile is paid once per handle, not per forward.
         fn nvfp4_quant_kernels(&self) -> Result<Arc<Nvfp4QuantKernels>> {
             let mut guard = crate::lock_recover(&self.nvfp4_quant_kernels);
@@ -794,17 +801,20 @@ mod cuda_impl {
                         Self::NVFP4_FORCE_NO_FUSED_QUANT_ENV
                     );
                 }
-                let ctx = self.stream.context();
-                let ptx = cudarc::nvrtc::compile_ptx(NVFP4_QUANT_CU).map_err(|e| {
+                // Compiled once per device for the process by the seam (a genuine nvrtc failure
+                // is cached there too); the handle only resolves the two functions.
+                let module = NVFP4_QUANT_SRC.compiled(&self.device).map_err(|e| {
                     candle_core::Error::Msg(format!(
                         "sc-12078 nvrtc compile of nvfp4_quant.cu failed: {e}"
                     ))
                 })?;
-                let module = ctx.load_module(ptx).map_err(drv_err)?;
-                let amax = module
-                    .load_function("nvfp4_block_amax_f32")
-                    .map_err(drv_err)?;
-                let pack = module.load_function("nvfp4_pack_f32").map_err(drv_err)?;
+                let fetch = |function: &str| {
+                    module
+                        .function(function)
+                        .map_err(|e| candle_core::Error::Msg(e.to_string()))
+                };
+                let amax = fetch("nvfp4_block_amax_f32")?;
+                let pack = fetch("nvfp4_pack_f32")?;
                 Ok(Arc::new(Nvfp4QuantKernels { amax, pack }))
             })();
             // Cache the outcome either way — a failed compile must not be retried per forward.
@@ -859,6 +869,14 @@ mod cuda_impl {
             // The activation as a contiguous f32 device slice — the kernels read it directly (K padding
             // is handled in-kernel by bounds-checking against the real K, so no `pad_with_zeros`).
             let xf = x.to_dtype(DType::F32)?.contiguous()?;
+            // The kernels index the storage from element 0, so a contiguous *view* with a start
+            // offset (an f32 row-narrow, which `to_dtype`/`contiguous` both pass through untouched)
+            // would be quantized from the wrong rows. Materialize it (sc-24135).
+            let xf = if xf.layout().start_offset() != 0 {
+                xf.copy()?
+            } else {
+                xf
+            };
             let (x_storage, _xl) = xf.storage_and_layout();
             let x_slice = match &*x_storage {
                 Storage::Cuda(cs) => match &cs.slice {
@@ -1153,7 +1171,7 @@ mod cuda_impl {
         ///
         /// This is the exact `X·Wᵀ` compute for a per-channel-quantized int8 weight. For a ConvRot
         /// checkpoint the stored `W_i8` is the *rotated* weight `W·R`, so the consume path applies the
-        /// matching online activation rotation `RHT(x)` ([`super::super::convrot`], sc-9601) before this call,
+        /// matching online activation rotation `RHT(x)` (candle-gen `quant::convrot`, sc-9601) before this call,
         /// making `RHT(x)·(W·R)ᵀ = x·Wᵀ`. The compute here is rotation-agnostic and correct either way.
         pub fn matmul_int8_per_channel(
             &self,
@@ -1712,7 +1730,7 @@ mod cuda_impl {
     /// tensor API has no RN-even round, so the tie is derived explicitly — `t.round()` away from a
     /// tie, and `floor(t) + (floor(t) mod 2)` on one (which is `floor(t)` when it is already even and
     /// `floor(t)+1`, also even, when it is odd). This is exactly the fused kernel's `__float2int_rn`
-    /// ([`NVFP4_QUANT_CU`], sc-12078) expressed in candle ops. Guarded by
+    /// ([`NVFP4_QUANT_SRC`], sc-12078) expressed in candle ops. Guarded by
     /// `nvfp4_unfused_e4m3_block_scale_bytes_match_cpu_at_exact_ties` — the GEMM rel-RMS gate cannot
     /// see this (exact midpoints are measure-zero under random activations, so it reads 0.000000
     /// throughout).
@@ -1766,7 +1784,7 @@ mod cuda_impl {
     /// midpoint to advance (`>`), while for an **odd** `i` the tie advances onto the even index `i+1`
     /// (`>=`). A uniform `>=` — as this used before — rounds every tie UP, which is wrong at 4 of the
     /// 7 midpoints (0.25, 1.25, 2.5, 5.0) and rescales the affected element. Same thresholds as the
-    /// fused kernel's `e2m1_code` ([`NVFP4_QUANT_CU`], sc-12078), which spells them as `<=`/`<`.
+    /// fused kernel's `e2m1_code` ([`NVFP4_QUANT_SRC`], sc-12078), which spells them as `<=`/`<`.
     /// Guarded by `nvfp4_e2m1_element_nibbles_match_cpu_at_exact_ties` (which runs both routes through
     /// one assertion); like the E4M3 tie defect this is invisible to a GEMM rel-RMS gate (exact
     /// midpoints are measure-zero).
@@ -1892,6 +1910,8 @@ mod cuda_impl {
 // `NVFP4_K_ALIGN` / `NVFP4_N_ALIGN` are NOT re-exported here: sc-20641 moved them to this module's
 // always-compiled half (the plan-time layout predicate needs them on every build), and `cuda_impl`
 // only borrows them back with its own `pub use`.
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) use cuda_impl::NVFP4_QUANT_SRC;
 #[cfg(feature = "cuda")]
 pub use cuda_impl::{CublasLt, DevFp8, DevInt8, DevNvfp4, Nvfp4AlgorithmIdentity};
 

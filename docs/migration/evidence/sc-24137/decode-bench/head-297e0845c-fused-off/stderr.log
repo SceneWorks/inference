@@ -1,0 +1,6 @@
+[decode_bench] reference          11.38 tok/s  prefill 0.867s  fused {"switch":"off","fused":0,"reference":69888,"reference_reason":"disabled","path":"reference"}
+[decode_bench] step_model         11.07 tok/s  prefill 0.758s
+[decode_bench] mtp K=1            12.15 tok/s  accept 0.827  fwd/tok 0.645
+[decode_bench] mtp K=2            14.00 tok/s  accept 0.779  fwd/tok 0.512
+[decode_bench] mtp K=3            12.84 tok/s  accept 0.607  fwd/tok 0.559
+[decode_bench] wrote C:\Users\Michael\AppData\Local\Temp\claude\D--repos-ChatWorks--claude-worktrees-shortcut-epic-24128-4c11bb\e80b586c-dde2-4d4d-84b1-e3247a13f59c\scratchpad\evidence-park\head-297e0845c-fused-off\decode_bench.json

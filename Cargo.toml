@@ -19,6 +19,7 @@ members = [
     "crates/contracts/core-llm/core-llm-testkit",
     "crates/contracts/gen-core",
     "crates/contracts/gen-core-testkit",
+    "crates/kernels/candle-quant-kernels",
     "crates/bundles/*",
     "crates/llm/candle-llm",
     "crates/llm/mlx-llm",
@@ -38,6 +39,9 @@ core-llm = { path = "crates/contracts/core-llm" }
 core-llm-testkit = { path = "crates/contracts/core-llm/core-llm-testkit" }
 mlx-llm = { path = "crates/llm/mlx-llm" }
 candle-llm = { path = "crates/llm/candle-llm" }
+# The shared low-precision kernels (NVFP4 codec + cuBLASLt wrapper) both Candle engines serve
+# from (sc-24135): one implementation, consumed by candle-gen (media) and candle-llm (LLM).
+candle-quant-kernels = { path = "crates/kernels/candle-quant-kernels" }
 sceneworks-gen-core = { path = "crates/contracts/gen-core" }
 sceneworks-gen-core-testkit = { path = "crates/contracts/gen-core-testkit" }
 runtime-catalog = { path = "crates/bundles/runtime-catalog" }

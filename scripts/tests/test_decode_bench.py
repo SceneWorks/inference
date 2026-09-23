@@ -80,6 +80,13 @@ def suite_document(new_tokens: int = 4, with_step: bool = True) -> dict:
                 "device_used_bytes_at_last_token": 2**30,
                 "cache_live_bytes": 3 * 2**20,
                 "cache_checkpoint_bytes": 2**21,
+                "fused_primitives": {
+                    "switch": "on",
+                    "fused": 12,
+                    "reference": 0,
+                    "reference_reason": None,
+                    "path": "fused",
+                },
                 "tokens_match_reference": True,
                 "first_divergence": None,
                 "tokens": list(range(new_tokens)),
@@ -225,15 +232,15 @@ class DecodeBenchWrapperTests(unittest.TestCase):
         self.assertEqual(seal["decode_bench.json"], record["suite_document_sha256"])
         table = (output / "decode_bench.md").read_text(encoding="utf-8")
         self.assertIn(
-            "| head-test | MTP off (reference) | 4 | (ref) | yes | 10.00 | n/a | 1.000 | n/a | n/a | 1.00 GiB | n/a | n/a |",
+            "| head-test | MTP off (reference) | 4 | (ref) | yes | 10.00 | n/a | 1.000 | n/a | n/a | 1.00 GiB | n/a | n/a | n/a |",
             table,
         )
         self.assertIn(
-            "| head-test | MTP off (StepModel) | 4 | yes | yes | 10.50 | n/a | 1.000 | 1.00 | n/a | 1.00 GiB | 3.0 MiB | 2.0 MiB |",
+            "| head-test | MTP off (StepModel) | 4 | yes | yes | 10.50 | n/a | 1.000 | 1.00 | n/a | 1.00 GiB | 3.0 MiB | 2.0 MiB | on: 12 fused / 0 ref |",
             table,
         )
         self.assertIn(
-            "| head-test | MTP K=3 | 4 | no @2 | no @2 | 15.50 | 0.500 | 0.750 | 4.00 | 1.00 | 1.50 GiB | n/a | n/a |",
+            "| head-test | MTP K=3 | 4 | no @2 | no @2 | 15.50 | 0.500 | 0.750 | 4.00 | 1.00 | 1.50 GiB | n/a | n/a | n/a |",
             table,
         )
         # The heading names the recorded model, not a literal.

@@ -9,7 +9,10 @@
 //!
 //! The counters are **measured**, not derived: forwards are counted by [`CountingDecode`] or by
 //! the loop that issued them, host syncs by the thread-local counter in
-//! [`primitives::host_sync`](crate::primitives::host_sync) bracketed around the request.
+//! [`primitives::host_sync`](crate::primitives::host_sync) bracketed around the request, and the
+//! fused-vs-reference primitive counts (sc-24137) by the thread-local tally in
+//! [`primitives::fused`](crate::primitives::fused) bracketed the same way — so a request that
+//! took the op-chain path for a leaf shows `reference` / `mixed` with the reason, never silently.
 
 use std::cell::Cell;
 
@@ -20,6 +23,7 @@ use crate::decode::speculative::SpeculativeStats;
 use crate::decode::stream::Decode;
 use crate::error::Result;
 use crate::primitives::attention::AttnFormulation;
+use crate::primitives::fused::{fused_tally, FusedTally};
 use crate::primitives::host_sync::host_sync_count;
 use crate::primitives::kv_cache::{KvCache, KvCacheKind};
 
@@ -91,6 +95,10 @@ pub struct DecodeRecord {
     /// committing), so `verify_host_syncs / verify_steps` is the engine's per-step sync cost — the
     /// AC2 figure, exactly `1.0` for a greedy run with device-resident drafts.
     pub verify_host_syncs: u64,
+    /// Fused-vs-reference primitive leaf runs while generating (see `primitives::fused`): how many
+    /// RMSNorm / SwiGLU / QK-norm+RoPE leaves ran the fused kernel, how many the op chain, and why
+    /// the last op-chain run happened. `FusedTally::label` gives `fused` / `reference` / `mixed`.
+    pub fused_primitives: FusedTally,
 }
 
 impl DecodeRecord {
@@ -113,6 +121,7 @@ impl DecodeRecord {
             proposer: ProposerKind::None,
             verify_steps: 0,
             verify_host_syncs: 0,
+            fused_primitives: FusedTally::default(),
         }
     }
 
@@ -143,6 +152,13 @@ impl DecodeRecord {
         self
     }
 
+    /// The same record with its fused-primitive tally filled in (from
+    /// [`RequestSpan::fused_primitives`]).
+    pub fn with_fused_primitives(mut self, tally: FusedTally) -> Self {
+        self.fused_primitives = tally;
+        self
+    }
+
     /// A record from a speculative run's [`SpeculativeStats`].
     pub fn speculative(
         path: DecodePath,
@@ -162,6 +178,7 @@ impl DecodeRecord {
             proposer: ProposerKind::None,
             verify_steps: stats.verify_steps as u64,
             verify_host_syncs: 0,
+            fused_primitives: FusedTally::default(),
         }
     }
 
@@ -195,6 +212,7 @@ impl DecodeRecord {
 #[derive(Debug)]
 pub struct RequestSpan {
     host_syncs_at_start: u64,
+    fused_at_start: FusedTally,
 }
 
 impl Default for RequestSpan {
@@ -208,12 +226,18 @@ impl RequestSpan {
     pub fn begin() -> Self {
         Self {
             host_syncs_at_start: host_sync_count(),
+            fused_at_start: fused_tally(),
         }
     }
 
     /// Host syncs recorded on this thread since [`begin`](Self::begin).
     pub fn host_syncs(&self) -> u64 {
         host_sync_count().wrapping_sub(self.host_syncs_at_start)
+    }
+
+    /// Fused-vs-reference primitive runs on this thread since [`begin`](Self::begin).
+    pub fn fused_primitives(&self) -> FusedTally {
+        fused_tally().since(&self.fused_at_start)
     }
 }
 
@@ -338,5 +362,26 @@ mod tests {
         let span = RequestSpan::begin();
         crate::primitives::note_host_sync();
         assert_eq!(span.host_syncs(), 1);
+    }
+
+    #[test]
+    fn request_span_brackets_this_threads_fused_primitive_runs() {
+        let span = RequestSpan::begin();
+        crate::primitives::fused::note_reference("shape");
+        crate::primitives::fused::note_fused();
+        let tally = span.fused_primitives();
+        assert_eq!(tally.fused, 1);
+        assert_eq!(tally.reference, 1);
+        assert_eq!(tally.reference_reason, Some("shape"));
+        assert_eq!(tally.label(), "mixed");
+        let record =
+            DecodeRecord::plain(DecodePath::Reference, 1, 1, 0).with_fused_primitives(tally);
+        assert_eq!(record.fused_primitives, tally);
+        assert_eq!(
+            DecodeRecord::plain(DecodePath::Reference, 1, 1, 0)
+                .fused_primitives
+                .label(),
+            "none"
+        );
     }
 }
