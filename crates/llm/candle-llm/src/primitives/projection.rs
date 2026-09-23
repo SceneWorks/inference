@@ -105,6 +105,16 @@ impl ProjectionFormat {
         Ok(Self::Nvfp4(Nvfp4Context::require(device)?))
     }
 
+    /// [`Self::nvfp4`] with the compute-capability probe injected
+    /// ([`Nvfp4Context::require_with`]), so the gate can be exercised with a mocked capability.
+    #[cfg(feature = "cuda")]
+    pub fn nvfp4_with_cap_probe(
+        device: &Device,
+        cap_probe: impl FnOnce(&candle_quant_kernels::CublasLt) -> candle_core::Result<(i32, i32)>,
+    ) -> Result<Self> {
+        Ok(Self::Nvfp4(Nvfp4Context::require_with(device, cap_probe)?))
+    }
+
     /// The GGML spec, when this is a GGML format.
     pub fn ggml(&self) -> Option<QuantSpec> {
         match self {

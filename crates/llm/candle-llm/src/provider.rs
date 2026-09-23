@@ -732,8 +732,21 @@ fn requires_accelerator(source: &Path) -> CoreResult<bool> {
 /// (sc-24135). The capability floor is settled here — before admission or any weight read — so a
 /// CPU or sub-sm_120 device is a typed refusal naming the capability (`CoreError::Unsupported`
 /// carrying "nvfp4"), never a fallback to another representation. A GGUF source is refused too:
-/// it is already block-quantized, and NVFP4 quantizes from a dense snapshot.
+/// it is already block-quantized, and NVFP4 quantizes from a dense snapshot. So is a snapshot
+/// whose `config.json` names an architecture outside the qwen3_5 family — also before admission,
+/// so a memory refusal can never mask the capability refusal.
 fn nvfp4_format(spec: &LoadSpec, device: &Device) -> CoreResult<Option<ProjectionFormat>> {
+    nvfp4_format_with(spec, device, ProjectionFormat::nvfp4)
+}
+
+/// [`nvfp4_format`] with the device gate injected (`gate` is [`ProjectionFormat::nvfp4`] on the
+/// real path), so the gate's refusal can be driven through this helper with a mocked compute
+/// capability.
+fn nvfp4_format_with(
+    spec: &LoadSpec,
+    device: &Device,
+    gate: impl FnOnce(&Device) -> crate::Result<ProjectionFormat>,
+) -> CoreResult<Option<ProjectionFormat>> {
     if spec.quantize != Some(Quantize::Nvfp4) {
         return Ok(None);
     }
@@ -744,7 +757,22 @@ fn nvfp4_format(spec: &LoadSpec, device: &Device) -> CoreResult<Option<Projectio
                 .into(),
         ));
     }
-    ProjectionFormat::nvfp4(device).map(Some).map_err(to_core)
+    // NVFP4's first (and so far only) consumer is the qwen3_5 family (sc-24135); refuse the rest
+    // by name. A missing or unreadable config (or a Prism snapshot, which `load_dir` refuses for
+    // any repacking) is left to the loader's own error.
+    if let Some(config) = read_json(Path::new(&spec.source), "config.json") {
+        let is_prism =
+            config.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35");
+        if let (false, Ok(arch)) = (is_prism, Architecture::from_config(&config)) {
+            if arch != Architecture::Qwen35 {
+                return Err(CoreError::Unsupported(format!(
+                    "nvfp4: NVFP4 projections are served for the qwen3_5 family \
+                     (Qwen3.5/3.6/3.8) only; this checkpoint is {arch:?}"
+                )));
+            }
+        }
+    }
+    gate(device).map(Some).map_err(to_core)
 }
 
 fn ensure_supported_device(source: &Path, device: &Device) -> CoreResult<()> {
@@ -865,14 +893,12 @@ impl LlamaProvider {
         } else {
             Architecture::from_config(&cfg_value).map_err(to_core)?
         };
-        // NVFP4's first (and so far only) consumer is the qwen3_5 family (sc-24135); refuse the
-        // rest by name before reading weights rather than serve them in another representation.
-        if requested.is_some_and(ProjectionFormat::is_nvfp4) && arch != Architecture::Qwen35 {
-            return Err(CoreError::Unsupported(format!(
-                "nvfp4: NVFP4 projections are served for the qwen3_5 family (Qwen3.5/3.6/3.8) only; \
-                 this checkpoint is {arch:?}"
-            )));
-        }
+        // A non-qwen3_5 NVFP4 request was already refused by name in `nvfp4_format`, before
+        // admission (sc-24135).
+        debug_assert!(
+            !(requested.is_some_and(ProjectionFormat::is_nvfp4) && arch != Architecture::Qwen35),
+            "nvfp4_format refuses non-qwen3_5 NVFP4 before load_dir"
+        );
         let (weights, prism) = if is_prism {
             let checkpoint =
                 crate::prism_checkpoint::PrismMlxCheckpoint::open(dir, device, &cfg_value)
@@ -3716,6 +3742,78 @@ mod tests {
                 other => panic!("expected Unsupported, got {other:?}"),
             }
         }
+    }
+
+    /// sc-24135 AC2 through the real gate: `nvfp4_format` → `Nvfp4Context::require_with` (a real
+    /// cuBLASLt handle, the capability probe mocked to a sub-sm_120 device) → the typed refusal →
+    /// the contract's `Unsupported`, naming the capability, the floor and the mocked device.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn nvfp4_format_refuses_a_mocked_sub_sm120_device_as_unsupported() {
+        let Ok(device) = candle_core::Device::new_cuda(0) else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        for cap in [(8, 9), (10, 0)] {
+            let gate = |d: &candle_core::Device| {
+                crate::primitives::projection::ProjectionFormat::nvfp4_with_cap_probe(d, |_| {
+                    Ok(cap)
+                })
+            };
+            match super::nvfp4_format_with(&nvfp4_spec("snapshot-dir"), &device, gate) {
+                Err(core_llm::Error::Unsupported(msg)) => {
+                    assert!(msg.starts_with("nvfp4: "), "{msg}");
+                    assert!(msg.contains("sm_120"), "names the floor: {msg}");
+                    assert!(
+                        msg.contains(&format!("sm_{}{}", cap.0, cap.1)),
+                        "names the device: {msg}"
+                    );
+                }
+                Err(other) => panic!("expected Unsupported for {cap:?}, got {other:?}"),
+                Ok(_) => panic!("a mocked sm_{}{} device served NVFP4", cap.0, cap.1),
+            }
+        }
+    }
+
+    /// sc-24135: an NVFP4 request for a snapshot outside the qwen3_5 family is refused by name in
+    /// `nvfp4_format` — before admission and the device gate — so no memory or device error can
+    /// mask it. The gate here would accept anything; it must not be reached.
+    #[test]
+    fn nvfp4_for_a_non_qwen35_snapshot_is_refused_before_the_device_gate() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("config.json"),
+            r#"{"architectures":["LlamaForCausalLM"],"model_type":"llama"}"#,
+        )
+        .unwrap();
+        let spec = nvfp4_spec(&root.path().to_string_lossy());
+        let gate = |_: &candle_core::Device| -> crate::Result<_> {
+            panic!("the device gate ran before the architecture refusal")
+        };
+        match super::nvfp4_format_with(&spec, &candle_core::Device::Cpu, gate) {
+            Err(core_llm::Error::Unsupported(msg)) => {
+                assert!(msg.starts_with("nvfp4: "), "{msg}");
+                assert!(msg.contains("qwen3_5 family"), "{msg}");
+                assert!(msg.contains("Llama"), "names the checkpoint: {msg}");
+            }
+            other => panic!("expected the architecture refusal, got {other:?}"),
+        }
+        // A qwen3_5 snapshot passes the architecture check and reaches the gate.
+        std::fs::write(
+            root.path().join("config.json"),
+            r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5"}"#,
+        )
+        .unwrap();
+        let reached = std::cell::Cell::new(false);
+        let gate = |_: &candle_core::Device| -> crate::Result<_> {
+            reached.set(true);
+            Err(crate::Error::Unsupported("nvfp4: gate reached".into()))
+        };
+        let _ = super::nvfp4_format_with(&spec, &candle_core::Device::Cpu, gate);
+        assert!(
+            reached.get(),
+            "a qwen3_5 snapshot must reach the device gate"
+        );
     }
 
     /// On a build with no CUDA backend the whole load refuses NVFP4 before reading a byte: the

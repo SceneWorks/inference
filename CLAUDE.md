@@ -122,6 +122,8 @@ backend-neutral contracts  →  MLX/Candle engines  →  provider-family crates
   plus their `*-testkit` conformance suites. **These stay tensor-neutral** — never depend on MLX or
   Candle tensor types here.
 - `crates/llm/` — `mlx-llm` (+ `server`) and `candle-llm` engines.
+- `crates/kernels/` — shared low-precision Candle kernels (`candle-quant-kernels`: the NVFP4 /
+  FP8 / INT8 cuBLASLt paths and codecs) used by both `candle-gen` and `candle-llm`.
 - `crates/media/` — `mlx-gen` / `candle-gen` engines and provider families, plus the
   `mlx-gen-catalog` / `candle-gen-catalog` composition roots.
 - `crates/audio/` — the Candle-native audio family (`candle-audio` commons + the
