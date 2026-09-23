@@ -52,7 +52,7 @@ pub use device::{compute_dtype, select_device};
 pub use error::{Error, Result};
 pub use llava::{LlavaConfig, LlavaModel, LlavaProvider};
 pub use models::CausalLm;
-pub use provider::LlamaProvider;
+pub use provider::{LlamaProvider, LoadRecord};
 
 /// Add only providers admitted to shipped Candle runtime catalogs.
 pub fn register_text_providers(

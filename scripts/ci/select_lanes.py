@@ -150,8 +150,12 @@ def select_lanes(paths: Iterable[str], force_all: bool = False) -> dict[str, boo
             lanes.update(windows_cuda=True, real_weights=True, release=True)
             continue
 
-        if _under(path, "crates/llm/candle-llm") or _under(
-            path, "crates/media/candle-gen"
+        # The shared low-precision kernels (sc-24135) are consumed by both Candle engines, so a
+        # change there exercises every lane either engine builds on.
+        if (
+            _under(path, "crates/llm/candle-llm")
+            or _under(path, "crates/media/candle-gen")
+            or _under(path, "crates/kernels")
         ):
             lanes.update(
                 candle_cpu=True,

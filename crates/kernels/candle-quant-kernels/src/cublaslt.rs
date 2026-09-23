@@ -859,6 +859,14 @@ mod cuda_impl {
             // The activation as a contiguous f32 device slice — the kernels read it directly (K padding
             // is handled in-kernel by bounds-checking against the real K, so no `pad_with_zeros`).
             let xf = x.to_dtype(DType::F32)?.contiguous()?;
+            // The kernels index the storage from element 0, so a contiguous *view* with a start
+            // offset (an f32 row-narrow, which `to_dtype`/`contiguous` both pass through untouched)
+            // would be quantized from the wrong rows. Materialize it (sc-24135).
+            let xf = if xf.layout().start_offset() != 0 {
+                xf.copy()?
+            } else {
+                xf
+            };
             let (x_storage, _xl) = xf.storage_and_layout();
             let x_slice = match &*x_storage {
                 Storage::Cuda(cs) => match &cs.slice {
@@ -1153,7 +1161,7 @@ mod cuda_impl {
         ///
         /// This is the exact `X·Wᵀ` compute for a per-channel-quantized int8 weight. For a ConvRot
         /// checkpoint the stored `W_i8` is the *rotated* weight `W·R`, so the consume path applies the
-        /// matching online activation rotation `RHT(x)` ([`super::super::convrot`], sc-9601) before this call,
+        /// matching online activation rotation `RHT(x)` (candle-gen `quant::convrot`, sc-9601) before this call,
         /// making `RHT(x)·(W·R)ᵀ = x·Wᵀ`. The compute here is rotation-agnostic and correct either way.
         pub fn matmul_int8_per_channel(
             &self,

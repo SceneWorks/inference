@@ -102,7 +102,7 @@ fn prepare_hf(spec: &PrepareSpec) -> Result<PrepareReport> {
         )));
     }
 
-    let Some(q) = spec.quantize.map(quant_spec) else {
+    let Some(q) = spec.quantize.map(quant_spec).transpose()? else {
         // Dense: the source is already a loadable snapshot, so return it untouched (write nothing).
         let num_tensors = count_safetensors_tensors(src)?;
         if num_tensors == 0 {
@@ -165,7 +165,7 @@ fn prepare_gguf(spec: &PrepareSpec) -> Result<PrepareReport> {
     for t in tensors.values_mut() {
         *t = t.to_dtype(DType::F16)?;
     }
-    let quant = spec.quantize.map(quant_spec);
+    let quant = spec.quantize.map(quant_spec).transpose()?;
     if let Some(q) = quant {
         requant_projections(&mut tensors, q)?;
         stamp_quantization(&mut config, q);
@@ -209,10 +209,17 @@ fn prepare_gguf(spec: &PrepareSpec) -> Result<PrepareReport> {
 }
 
 /// Map the contract's [`Quantize`] knob to the engine's [`QuantSpec`].
-fn quant_spec(q: Quantize) -> QuantSpec {
+fn quant_spec(q: Quantize) -> Result<QuantSpec> {
     match q {
-        Quantize::Q4 => QuantSpec::q4(),
-        Quantize::Q8 => QuantSpec::q8(),
+        Quantize::Q4 => Ok(QuantSpec::q4()),
+        Quantize::Q8 => Ok(QuantSpec::q8()),
+        // NVFP4 is a load-time CUDA capability (sc-24135): quantized on the device at load, never
+        // persisted into a prepared snapshot.
+        Quantize::Nvfp4 => Err(Error::Unsupported(
+            "nvfp4: NVFP4 is quantized at load on a CUDA sm_120 device and is never persisted by \
+             snapshot preparation; prepare a dense snapshot and load it with Quantize::Nvfp4"
+                .into(),
+        )),
     }
 }
 
