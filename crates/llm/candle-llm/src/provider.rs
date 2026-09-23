@@ -2641,6 +2641,7 @@ impl TextLlm for LlamaProvider {
                 host_syncs: span_counters.host_syncs,
                 sampler: span_counters.sampler,
                 fused_primitives: request_span.fused_primitives(),
+                nvfp4_projections: request_span.nvfp4_projections(),
                 ..record
             },
             None => DecodeRecord::plain(
@@ -2651,7 +2652,8 @@ impl TextLlm for LlamaProvider {
             )
             .with_attn_formulation(self.model.attn_formulation())
             .with_proposer(mtp_plan.proposer())
-            .with_fused_primitives(request_span.fused_primitives()),
+            .with_fused_primitives(request_span.fused_primitives())
+            .with_nvfp4_projections(request_span.nvfp4_projections()),
         };
         *self
             .last_decode

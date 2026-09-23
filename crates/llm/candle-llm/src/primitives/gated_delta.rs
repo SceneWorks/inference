@@ -309,7 +309,8 @@ impl StateRing {
         let slot = self.slot(position);
         self.conv
             .slice_set(&conv.contiguous()?.unsqueeze(0)?, 0, slot)?;
-        self.ssm.slice_set(&ssm.contiguous()?.unsqueeze(0)?, 0, slot)?;
+        self.ssm
+            .slice_set(&ssm.contiguous()?.unsqueeze(0)?, 0, slot)?;
         Ok(())
     }
 
@@ -1469,8 +1470,7 @@ mod tests {
         assert_eq!((trace.tokens(), trace.tail_len()), (5, RK - 1));
         let mut state = seed;
         for ti in 0..5 {
-            let (out, next) =
-                causal_depthwise_conv(&narrow_t(&x, ti, 1), &weight, &state).unwrap();
+            let (out, next) = causal_depthwise_conv(&narrow_t(&x, ti, 1), &weight, &state).unwrap();
             assert_eq!(host(&out), host(&out_all.narrow(1, ti, 1).unwrap()));
             assert_eq!(host(&trace.tail_after(ti).unwrap()), host(&next));
             state = next;
@@ -1551,7 +1551,11 @@ mod tests {
         ));
         cache.rollback_to(4).unwrap();
         assert_eq!(live(&cache), fresh_state(&fixture, 4));
-        assert_eq!(cache.restorable(), Vec::<i32>::new(), "nothing below 4 is held");
+        assert_eq!(
+            cache.restorable(),
+            Vec::<i32>::new(),
+            "nothing below 4 is held"
+        );
         // Zero is always reachable; the ring keeps its buffers.
         let addresses = cache.ring_addresses().unwrap().unwrap();
         cache.rollback_to(0).unwrap();
@@ -1635,7 +1639,11 @@ mod tests {
         assert_eq!(spec.slot_bytes(), slot);
         assert_eq!(spec.bytes(), 4 * slot);
         let mut cache = DeltaNetCache::with_ring(spec).unwrap();
-        assert_eq!(cache.memory_bytes(), (slot, 3 * slot), "priced from the spec");
+        assert_eq!(
+            cache.memory_bytes(),
+            (slot, 3 * slot),
+            "priced from the spec"
+        );
         cache.preallocate().unwrap();
         assert_eq!(cache.memory_bytes(), (slot, 3 * slot));
         let fixture = ring_inputs(3, 9);

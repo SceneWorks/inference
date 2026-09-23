@@ -883,6 +883,18 @@ impl Qwen35Cache {
         Ok(out)
     }
 
+    /// Every linear layer's live recurrent state `(conv tail, SSM state)`, in layer order —
+    /// `None` before the first forward. What the rollback gate compares against a fresh decode.
+    pub fn recurrent_states(&self) -> Vec<(Option<&Tensor>, Option<&Tensor>)> {
+        self.layers
+            .iter()
+            .filter_map(|l| match l {
+                Qwen35LayerCache::Delta(c) => Some((c.conv_state(), c.ssm_state())),
+                Qwen35LayerCache::Attn(_) | Qwen35LayerCache::StaticAttn(_) => None,
+            })
+            .collect()
+    }
+
     /// Allocate every linear layer's checkpoint ring now (a no-op without rings or once
     /// allocated), so a request fails closed at admission rather than at its first forward.
     pub fn preallocate_recurrent(&mut self) -> Result<()> {
@@ -2387,7 +2399,9 @@ impl StepModel for Qwen35Model {
     fn new_cache_for(&self, capacity: usize, overshoot: usize) -> Result<Qwen35Cache> {
         let depth = overshoot.saturating_add(1);
         let mut cache = match self.step_kv_cache {
-            KvCacheKind::Static => self.new_static_cache(capacity.saturating_add(overshoot), depth)?,
+            KvCacheKind::Static => {
+                self.new_static_cache(capacity.saturating_add(overshoot), depth)?
+            }
             KvCacheKind::Growing => self.new_cache_with_checkpoints(depth),
         };
         cache.preallocate_recurrent()?;
@@ -3468,10 +3482,16 @@ pub(crate) mod tests {
         }
         assert_eq!(cache.offset(), m as i32);
         // Every position is a checkpoint — the prefill's interior ones included (sc-24131).
-        assert_eq!(cache.checkpoint_offsets(), (1..m as i32).collect::<Vec<_>>());
+        assert_eq!(
+            cache.checkpoint_offsets(),
+            (1..m as i32).collect::<Vec<_>>()
+        );
         cache.rollback_to(n as i32).unwrap();
         assert_eq!(cache.offset(), n as i32);
-        assert_eq!(cache.checkpoint_offsets(), (1..n as i32).collect::<Vec<_>>());
+        assert_eq!(
+            cache.checkpoint_offsets(),
+            (1..n as i32).collect::<Vec<_>>()
+        );
         let replayed = model
             .decode_logits(&ids(&[toks[n]]), &mut cache, n as i32)
             .unwrap();
@@ -3649,9 +3669,7 @@ pub(crate) mod tests {
                 cache.rollback_to((p + j) as i32).unwrap();
                 assert_eq!(cache.recurrent_ring_addresses().unwrap(), addresses);
                 let mut fresh = model.new_cache();
-                model
-                    .decode_logits(&ids(&prompt), &mut fresh, 0)
-                    .unwrap();
+                model.decode_logits(&ids(&prompt), &mut fresh, 0).unwrap();
                 for (i, &t) in toks[..j].iter().enumerate() {
                     model
                         .decode_logits(&ids(&[t]), &mut fresh, (p + i) as i32)
@@ -3750,7 +3768,11 @@ pub(crate) mod tests {
             cache.memory().total_bytes(),
             after_step.total_bytes() - kv_bytes / 3
         );
-        assert_eq!(cache.recurrent_bytes(), ring, "a rollback frees nothing: slots are reused");
+        assert_eq!(
+            cache.recurrent_bytes(),
+            ring,
+            "a rollback frees nothing: slots are reused"
+        );
     }
 
     /// A schedule with no full-attention layer still reports its position (from the linear layers).

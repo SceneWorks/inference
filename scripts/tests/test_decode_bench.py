@@ -57,10 +57,21 @@ def suite_document(new_tokens: int = 4, with_step: bool = True) -> dict:
             "target_forwards_per_generated_token": 0.75,
             "host_syncs_per_token": 4.0,
             "host_syncs_per_verify_step": 1.0,
+            "verify_steps": 3,
+            "direct_rollbacks": 2,
+            "replay_fallbacks": 0,
+            "target_forwards_per_verify_step": 1.0,
             "proposer": "mtp",
             "device_used_bytes_at_last_token": 3 * 2**29,
             "cache_live_bytes": None,
             "cache_checkpoint_bytes": None,
+            "nvfp4_projections": {
+                "switch": "on",
+                "gemv": 30,
+                "cublaslt": 2,
+                "cublaslt_reason": "rows",
+                "path": "mixed",
+            },
             "tokens_match_reference": False,
             "first_divergence": 2,
             "tokens": [0, 1, 9, 3][:new_tokens],
@@ -86,6 +97,13 @@ def suite_document(new_tokens: int = 4, with_step: bool = True) -> dict:
                     "reference": 0,
                     "reference_reason": None,
                     "path": "fused",
+                },
+                "nvfp4_projections": {
+                    "switch": "on",
+                    "gemv": 0,
+                    "cublaslt": 0,
+                    "cublaslt_reason": None,
+                    "path": "none",
                 },
                 "tokens_match_reference": True,
                 "first_divergence": None,
@@ -115,7 +133,7 @@ def fake_binary(directory: Path, document: dict | None, exit_code: int = 0) -> P
         f"payload = pathlib.Path({str(payload)!r})\n"
         "if payload.exists():\n"
         "    pathlib.Path(os.environ['DECODE_BENCH_OUTPUT']).write_text(payload.read_text())\n"
-        "print('rows', os.environ['DECODE_BENCH_ROWS'], 'drafts', os.environ['DECODE_BENCH_DRAFTS'])\n"
+        "print('rows', os.environ['DECODE_BENCH_ROWS'], 'drafts', os.environ['DECODE_BENCH_DRAFTS'], 'format', os.environ['DECODE_BENCH_FORMAT'])\n"
         f"sys.exit({exit_code})\n",
         encoding="utf-8",
     )
@@ -232,15 +250,15 @@ class DecodeBenchWrapperTests(unittest.TestCase):
         self.assertEqual(seal["decode_bench.json"], record["suite_document_sha256"])
         table = (output / "decode_bench.md").read_text(encoding="utf-8")
         self.assertIn(
-            "| head-test | MTP off (reference) | 4 | (ref) | yes | 10.00 | n/a | 1.000 | n/a | n/a | 1.00 GiB | n/a | n/a | n/a |",
+            "| head-test | MTP off (reference) | 4 | (ref) | yes | 10.00 | n/a | 1.000 | n/a | n/a | n/a | n/a | 1.00 GiB | n/a | n/a | n/a | n/a |",
             table,
         )
         self.assertIn(
-            "| head-test | MTP off (StepModel) | 4 | yes | yes | 10.50 | n/a | 1.000 | 1.00 | n/a | 1.00 GiB | 3.0 MiB | 2.0 MiB | on: 12 fused / 0 ref |",
+            "| head-test | MTP off (StepModel) | 4 | yes | yes | 10.50 | n/a | 1.000 | 1.00 | n/a | n/a | n/a | 1.00 GiB | 3.0 MiB | 2.0 MiB | on: 12 fused / 0 ref | none |",
             table,
         )
         self.assertIn(
-            "| head-test | MTP K=3 | 4 | no @2 | no @2 | 15.50 | 0.500 | 0.750 | 4.00 | 1.00 | 1.50 GiB | n/a | n/a | n/a |",
+            "| head-test | MTP K=3 | 4 | no @2 | no @2 | 15.50 | 0.500 | 0.750 | 4.00 | 1.00 | 1.00 | 0 | 1.50 GiB | n/a | n/a | n/a | on: 30 gemv / 2 cuBLASLt (rows) |",
             table,
         )
         # The heading names the recorded model, not a literal.
@@ -249,7 +267,7 @@ class DecodeBenchWrapperTests(unittest.TestCase):
         self.assertIn("BF16 greedy, 40 prompt tokens, 4 new tokens per row", table)
         self.assertNotIn("Qwen3.8-27B", table)
         stdout = (output / "stdout.log").read_text(encoding="utf-8")
-        self.assertIn("rows reference,step_model,mtp drafts 1,2,3,4,5", stdout)
+        self.assertIn("rows reference,step_model,mtp drafts 1,2,3,4,5 format bf16", stdout)
         # `table` re-verifies the seal and combines runs.
         combined = self.root / "combined.md"
         self.assertEqual(bench.main(["table", str(output), str(output), "--output", str(combined)]), 0)
@@ -369,6 +387,16 @@ class DecodeBenchWrapperTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no reference row"):
             bench.render_table([no_reference, base])
 
+    def test_table_refuses_merging_a_bf16_run_with_an_nvfp4_run(self) -> None:
+        # `base` has no `weight_format` key at all (a pre-sc-24136 document, implicitly bf16).
+        base = comparable_run("base")
+        nvfp4 = comparable_run("nvfp4-run", weight_format="nvfp4")
+        with self.assertRaisesRegex(ValueError, "suite.weight_format"):
+            bench.render_table([base, nvfp4])
+        # An explicit "bf16" document still merges with an older, key-less bf16 document.
+        explicit_bf16 = comparable_run("explicit-bf16", weight_format="bf16")
+        bench.render_table([base, explicit_bf16])
+
     def test_table_compares_every_row_with_the_first_runs_reference(self) -> None:
         base = comparable_run("baseline")
         head = copy.deepcopy(base)
@@ -382,6 +410,32 @@ class DecodeBenchWrapperTests(unittest.TestCase):
         self.assertIn("| head | MTP off (reference) | 4 | (ref) | no @3 |", text)
         self.assertIn("| head | MTP off (StepModel) | 4 | yes | no @3 |", text)
         self.assertIn("| head | MTP K=3 | 4 | no @2 | no @2 |", text)
+
+    def test_nvfp4_rows_are_labelled_and_the_heading_names_the_format(self) -> None:
+        doc = suite_document()
+        doc["weight_format"] = "nvfp4"
+        doc["rows"].append(
+            {
+                **doc["rows"][0],
+                "path": "reference_cublaslt",
+                "tokens_match_reference": False,
+                "first_divergence": 1,
+                "nvfp4_projections": {
+                    "switch": "off",
+                    "gemv": 0,
+                    "cublaslt": 64,
+                    "cublaslt_reason": "disabled",
+                    "path": "cublaslt",
+                },
+            }
+        )
+        run = {"run_name": "nv", "label": bench.DEFAULT_LABEL, "model": {
+            "repository": "Test/Decode-Model", "revision": REVISION, "key": MODEL_KEY,
+            "config_sha256": "0" * 64}, "suite": doc}
+        table = bench.render_table([run])
+        self.assertIn("BF16 with NVFP4 projections greedy", table)
+        self.assertIn("| nv | MTP off (reference, NVFP4 GEMV off) |", table)
+        self.assertIn("| off: 0 gemv / 64 cuBLASLt (disabled) |", table)
 
     def test_table_rejects_a_tampered_run(self) -> None:
         binary = fake_binary(self.root / "bin", suite_document())
@@ -457,7 +511,7 @@ class DecodeBenchWrapperTests(unittest.TestCase):
         self.assertNotIn("generate_speculative_with", before_stub)
         self.assertNotIn("MtpProposer", before_stub)
         self.assertIn('unreachable!("the ngram row is not available on the pre-epic baseline")', rewritten)
-        self.assertIn("(out, stats, prefill_secs, decode_secs, None, None)", rewritten)
+        self.assertIn("(out, stats, prefill_secs, decode_secs, None, None, None)", rewritten)
         self.assertNotIn("set_attn_formulation", before_stub)
         self.assertNotIn("attn_formulation()", before_stub)
         # Everything outside the block is untouched, so the two binaries measure the same rows.

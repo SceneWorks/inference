@@ -1038,7 +1038,10 @@ mod tests {
         );
         assert_eq!(rejected.stats.verify_steps, 6);
         assert_eq!(
-            (rejected.stats.direct_rollbacks, rejected.stats.replay_fallbacks),
+            (
+                rejected.stats.direct_rollbacks,
+                rejected.stats.replay_fallbacks
+            ),
             (5, 0),
             "5 rejected steps recovered directly (the last step has no draft budget)"
         );
@@ -1458,7 +1461,10 @@ mod tests {
         assert_eq!(run_ngram.stats.accepted, run_ngram.stats.proposed);
         assert_eq!(run_ngram.stats.forwards, 1 + run_ngram.stats.verify_steps);
         assert_eq!(
-            (run_ngram.stats.direct_rollbacks, run_ngram.stats.replay_fallbacks),
+            (
+                run_ngram.stats.direct_rollbacks,
+                run_ngram.stats.replay_fallbacks
+            ),
             (0, 0),
             "full acceptance needs no recovery at all"
         );
@@ -1480,7 +1486,10 @@ mod tests {
             run_wrong.stats.verify_steps - 1,
             "every rejected step (the last has no draft budget) was a direct rollback"
         );
-        assert_eq!(run_wrong.record.direct_rollbacks, run_wrong.stats.direct_rollbacks as u64);
+        assert_eq!(
+            run_wrong.record.direct_rollbacks,
+            run_wrong.stats.direct_rollbacks as u64
+        );
 
         // A cache that checkpoints step starts only (the S1 hybrid cache): the same rejection
         // costs one replay forward, and the record says so.
@@ -1497,12 +1506,21 @@ mod tests {
             run_replay.stats.forwards,
             1 + run_replay.stats.verify_steps + run_replay.stats.replay_fallbacks
         );
-        assert_eq!(run_replay.stats.replay_fallbacks, run_replay.stats.verify_steps - 1);
+        assert_eq!(
+            run_replay.stats.replay_fallbacks,
+            run_replay.stats.verify_steps - 1
+        );
         assert_eq!(run_replay.stats.direct_rollbacks, 0);
-        assert_eq!(run_replay.record.replay_fallbacks, run_replay.stats.replay_fallbacks as u64);
+        assert_eq!(
+            run_replay.record.replay_fallbacks,
+            run_replay.stats.replay_fallbacks as u64
+        );
         assert_eq!(
             run_replay.record.target_forwards_per_verify_step(),
-            Some(1.0 + (run_replay.stats.verify_steps - 1) as f64 / run_replay.stats.verify_steps as f64)
+            Some(
+                1.0 + (run_replay.stats.verify_steps - 1) as f64
+                    / run_replay.stats.verify_steps as f64
+            )
         );
 
         // The Qwen3.5 cache's per-token checkpoint ring (S3): the same forced rejections are all
@@ -1522,7 +1540,10 @@ mod tests {
             );
             // The last step has no draft budget left (k = 0), so it cannot reject: 8 rollbacks.
             assert_eq!(
-                (run_qwen.stats.direct_rollbacks, run_qwen.stats.replay_fallbacks),
+                (
+                    run_qwen.stats.direct_rollbacks,
+                    run_qwen.stats.replay_fallbacks
+                ),
                 (8, 0),
                 "K={k}"
             );
