@@ -1754,17 +1754,42 @@ impl GenerationRequest {
     }
 }
 
+/// The last value [`default_seed`] handed out in this process — the seam that makes two
+/// back-to-back calls distinct even when they share a clock tick (sc-24114).
+static LAST_DEFAULT_SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Seed when a [`GenerationRequest`] omits one: nanos since the epoch (any nonzero value works —
 /// this only sets which sample is drawn; a caller wanting reproducibility passes `req.seed`).
 /// Shared by every generator (F-006).
+///
+/// **Never returns the same value twice in one process.** The clock alone does not guarantee
+/// that: `SystemTime::now()` is coarser than a nanosecond on every platform this runs on, so two
+/// unseeded requests resolved back to back could draw the identical seed and render the identical
+/// sample. Each call therefore returns `max(now, last + 1)` through a compare-and-swap, which is
+/// strictly increasing across calls and threads and lands back on the clock as soon as it moves
+/// past the last value handed out.
 pub fn default_seed() -> u64 {
+    use std::sync::atomic::Ordering;
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         // Fall back to a nonzero value: 0 is the "no seed" sentinel a caller would pass to mean
         // "pick one", so the default must never itself be 0 (F-089).
-        .unwrap_or(1)
+        .unwrap_or(1);
+    let mut last = LAST_DEFAULT_SEED.load(Ordering::Relaxed);
+    loop {
+        let candidate = now.max(last.wrapping_add(1)).max(1);
+        match LAST_DEFAULT_SEED.compare_exchange_weak(
+            last,
+            candidate,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return candidate,
+            Err(observed) => last = observed,
+        }
+    }
 }
 
 /// Smallest admitted [`GenerationRequest::reference_image_short_edge`] (sc-23402).
@@ -3749,6 +3774,46 @@ impl Capabilities {
 
 #[cfg(test)]
 mod tests {
+
+    /// `default_seed()` never hands out the same value twice in one process, even when calls land
+    /// in one clock tick, and never hands out the zero sentinel (sc-24114). Back to back the values
+    /// are strictly increasing; across threads they are pairwise distinct.
+    ///
+    /// *Mutation that reds this:* returning the bare clock reading (the pre-sc-24114 body): the
+    /// tight loop below draws duplicates on any platform whose clock is coarser than the loop.
+    #[test]
+    fn default_seed_is_nonzero_and_never_repeats_in_process() {
+        use std::collections::HashSet;
+
+        let burst: Vec<u64> = (0..10_000).map(|_| super::default_seed()).collect();
+        assert!(burst.iter().all(|seed| *seed != 0));
+        assert!(
+            burst.windows(2).all(|pair| pair[1] > pair[0]),
+            "consecutive default seeds must be strictly increasing"
+        );
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    (0..2_000)
+                        .map(|_| super::default_seed())
+                        .collect::<Vec<u64>>()
+                })
+            })
+            .collect();
+        let mut all: Vec<u64> = burst;
+        for handle in handles {
+            all.extend(handle.join().unwrap());
+        }
+        let distinct: HashSet<u64> = all.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            all.len(),
+            "a default seed was handed out twice"
+        );
+        // Deliberately no wall-clock assertion here (the clock ratchet): that the value lands
+        // back on the clock once it moves past the last seed follows from `max(now, last + 1)`.
+    }
 
     /// `image_reference_count()` must price a **transparent** reference exactly like an opaque one
     /// (sc-24111).
