@@ -289,7 +289,11 @@ def validate_suite_document(doc: dict[str, Any]) -> None:
             )
         if not isinstance(row.get("decode_tokens_per_second"), (int, float)):
             raise ValueError(f"row {row_label(row)} has no decode throughput")
-        if row.get("path") == "step_model" and doc.get("new_tokens", 0) >= 2:
+        # The Qwen3.5/3.6/3.8 hybrid's step cache always holds a DeltaNet rollback checkpoint
+        # after a single-token step; a llama-family (`CausalLm`) cache rolls back by offset and
+        # keeps none (sc-24138), so only the hybrid's zero is a bench that read a fresh cache.
+        hybrid = doc.get("model_family", "qwen35") != "llama"
+        if hybrid and row.get("path") == "step_model" and doc.get("new_tokens", 0) >= 2:
             if not row.get("cache_checkpoint_bytes"):
                 raise ValueError(
                     "step_model row reports no rollback-checkpoint bytes for a multi-token run"
