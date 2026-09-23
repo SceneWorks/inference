@@ -45,8 +45,9 @@ pub use core_llm;
 pub use config::{Architecture, ModelConfig, RopeScaling};
 pub use decode::{
     generate, generate_batch, generate_cached, generate_draft_speculative, generate_prompt_lookup,
-    generate_with, generate_with_cache, BatchRequest, CancelFlag, FinishReason, GenerationConfig,
-    GenerationOutput, PrefixCache, PrefixStats, SpeculativeConfig, SpeculativeStats, StreamEvent,
+    generate_speculative, generate_with, generate_with_cache, BatchRequest, CancelFlag,
+    FinishReason, GenerationConfig, GenerationOutput, PrefixCache, PrefixStats, Proposer,
+    SpeculativeConfig, SpeculativePrompt, SpeculativeRun, SpeculativeStats, StreamEvent,
 };
 pub use device::{compute_dtype, select_device};
 pub use error::{Error, Result};

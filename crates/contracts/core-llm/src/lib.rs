@@ -105,7 +105,10 @@ pub use resource::{
     LlmMemoryGeometry, AVAILABLE_MEMORY_OVERRIDE,
 };
 pub use schedule::{Scheduler, SeqId, SeqSpec};
-pub use speculative::{accept_greedy_run, accept_token, ngram_propose, Acceptance};
+pub use speculative::{
+    accept_greedy_run, accept_token, greedy_commit, ngram_propose, resolve_mtp_plan, Acceptance,
+    MtpPlan, ProposerKind,
+};
 pub use starvector::{
     generated_token_budget, validate_advertised_generated_token_cap,
     validate_generated_token_budget, DecoderArchitecture, ImagePreprocessing, ProjectionMetadata,

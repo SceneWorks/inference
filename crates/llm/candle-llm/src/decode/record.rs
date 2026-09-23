@@ -22,6 +22,7 @@
 use std::cell::Cell;
 
 use candle_core::{Device, Tensor};
+use core_llm::ProposerKind;
 
 use crate::decode::speculative::SpeculativeStats;
 use crate::decode::stream::Decode;
@@ -42,14 +43,17 @@ pub enum DecodePath {
     Reference,
     /// The token-at-a-time loop over the [`StepModel`](super::StepModel) seam.
     StepModel,
-    /// Native Qwen3.8 multi-token prediction with `drafts` proposals per verify forward.
+    /// Native Qwen3.8 multi-token prediction with `drafts` proposals per verify forward (the
+    /// unified engine over [`StepModel`](super::StepModel) with the MTP proposer, sc-24130).
     Mtp {
         /// Draft tokens requested per target verification pass.
         drafts: u32,
     },
-    /// Prompt-lookup (n-gram) speculation over a `CausalLm`.
+    /// Prompt-lookup (n-gram) speculation: the unified engine with the n-gram proposer, or the
+    /// pre-epic loop over a `CausalLm`.
     PromptLookup,
-    /// Draft-model speculation over a `CausalLm` pair.
+    /// Draft-model speculation: the unified engine with the draft-model proposer, or the pre-epic
+    /// loop over a `CausalLm` pair.
     DraftModel,
 }
 
@@ -125,6 +129,21 @@ pub struct DecodeRecord {
     /// formulation every path runs since S4, or the pre-S4 `expanded` (`repeat_kv`) arithmetic
     /// selected for a comparison row. Reported from the model, which owns the selector.
     pub attn_formulation: AttnFormulation,
+    /// Which proposer ran (sc-24130): `none` on the token-at-a-time paths — including a request
+    /// whose [`MtpMode::Auto`](core_llm::MtpMode::Auto) resolved to no proposer, which is thereby
+    /// visible rather than a silent downgrade — else `mtp` / `ngram` / `draft`.
+    pub proposer: ProposerKind,
+    /// Verify steps the speculative engine took (0 on non-speculative paths).
+    pub verify_steps: u64,
+    /// Verify steps that fell back from a direct rollback to a step-start rollback plus a replay
+    /// forward (sc-24130, E2): the engine's `RollbackUnavailable` → replay recovery made visible.
+    /// `0` on non-speculative paths and on a cache with per-position rollback; on the S1 hybrid
+    /// cache one per rejected verify step. Each is one of `target_forwards`.
+    pub replay_forwards: u64,
+    /// Device->host transfers issued inside those verify steps (proposing, verifying, deciding and
+    /// committing), so `verify_host_syncs / verify_steps` is the engine's per-step sync cost — the
+    /// AC2 figure, exactly `1.0` for a greedy run with device-resident drafts.
+    pub verify_host_syncs: u64,
     /// Fused-vs-reference primitive leaf runs while generating (see `primitives::fused`): how many
     /// RMSNorm / SwiGLU / QK-norm+RoPE leaves ran the fused kernel, how many the op chain, and why
     /// the last op-chain run happened. `FusedTally::label` gives `fused` / `reference` / `mixed`.
@@ -154,9 +173,26 @@ impl DecodeRecord {
             sampler: counters.sampler,
             kv_cache: KvCacheKind::Growing,
             attn_formulation: AttnFormulation::Gqa,
+            proposer: ProposerKind::None,
+            verify_steps: 0,
+            replay_forwards: 0,
+            verify_host_syncs: 0,
             fused_primitives: FusedTally::default(),
             nvfp4_projections: Nvfp4PathTally::default(),
         }
+    }
+
+    /// The same record with `proposer` set — the engine stamps the proposer it ran.
+    pub fn with_proposer(mut self, proposer: ProposerKind) -> Self {
+        self.proposer = proposer;
+        self
+    }
+
+    /// The same record with the verify-step counters set (see
+    /// [`host_syncs_per_verify_step`](Self::host_syncs_per_verify_step)).
+    pub fn with_verify_syncs(mut self, verify_host_syncs: u64) -> Self {
+        self.verify_host_syncs = verify_host_syncs;
+        self
     }
 
     /// The same record with its NVFP4 projection path tally filled in (from
@@ -204,9 +240,19 @@ impl DecodeRecord {
             sampler: counters.sampler,
             kv_cache: KvCacheKind::Growing,
             attn_formulation: AttnFormulation::Gqa,
+            proposer: ProposerKind::None,
+            verify_steps: stats.verify_steps as u64,
+            replay_forwards: stats.replays as u64,
+            verify_host_syncs: 0,
             fused_primitives: FusedTally::default(),
             nvfp4_projections: Nvfp4PathTally::default(),
         }
+    }
+
+    /// Host syncs per verify step (`verify_host_syncs / verify_steps`), or `None` when no verify
+    /// step ran.
+    pub fn host_syncs_per_verify_step(&self) -> Option<f64> {
+        (self.verify_steps > 0).then(|| self.verify_host_syncs as f64 / self.verify_steps as f64)
     }
 
     /// `accepted / proposed`, or `None` when nothing was proposed (non-speculative paths).
@@ -392,12 +438,17 @@ mod tests {
         assert_eq!(plain.kv_cache, KvCacheKind::Growing);
         assert_eq!(plain.attn_formulation, AttnFormulation::Gqa);
         assert_eq!(plain.attn_formulation.label(), "gqa");
+        assert_eq!(plain.proposer, ProposerKind::None);
+        assert_eq!(plain.proposer.label(), "none");
+        assert_eq!(plain.host_syncs_per_verify_step(), None);
         let stamped = plain
             .with_kv_cache(KvCacheKind::Static)
-            .with_attn_formulation(AttnFormulation::Expanded);
+            .with_attn_formulation(AttnFormulation::Expanded)
+            .with_proposer(ProposerKind::Ngram);
         assert_eq!(stamped.kv_cache, KvCacheKind::Static);
         assert_eq!(stamped.attn_formulation, AttnFormulation::Expanded);
         assert_eq!(stamped.attn_formulation.label(), "expanded");
+        assert_eq!(stamped.proposer, ProposerKind::Ngram);
 
         let spec = DecodeRecord::speculative(
             DecodePath::Mtp { drafts: 3 },
@@ -405,6 +456,8 @@ mod tests {
                 forwards: 5,
                 proposed: 12,
                 accepted: 6,
+                verify_steps: 4,
+                replays: 2,
             },
             10,
             SpanCounters {
@@ -416,11 +469,19 @@ mod tests {
                     logits_to_host: 0,
                 },
             },
-        );
+        )
+        .with_proposer(ProposerKind::Mtp)
+        .with_verify_syncs(4);
         assert_eq!(spec.acceptance_rate(), Some(0.5));
         assert_eq!(spec.forwards_per_generated_token(), Some(0.5));
         assert_eq!(spec.host_syncs_per_token(), Some(2.0));
+        assert_eq!(spec.host_syncs_per_verify_step(), Some(1.0));
+        assert_eq!(
+            spec.replay_forwards, 2,
+            "the replay fallback is on the record"
+        );
         assert_eq!(spec.path.label(), "mtp");
+        assert_eq!(spec.proposer.label(), "mtp");
         assert_eq!(spec.logits_to_host_per_token(), Some(0.0));
         assert_eq!(spec.sampler.label(), "device");
     }

@@ -56,6 +56,8 @@ def suite_document(new_tokens: int = 4, with_step: bool = True) -> dict:
             "acceptance_rate": 0.5,
             "target_forwards_per_generated_token": 0.75,
             "host_syncs_per_token": 4.0,
+            "host_syncs_per_verify_step": 1.0,
+            "proposer": "mtp",
             "device_used_bytes_at_last_token": 3 * 2**29,
             "cache_live_bytes": None,
             "cache_checkpoint_bytes": None,
@@ -244,15 +246,15 @@ class DecodeBenchWrapperTests(unittest.TestCase):
         self.assertEqual(seal["decode_bench.json"], record["suite_document_sha256"])
         table = (output / "decode_bench.md").read_text(encoding="utf-8")
         self.assertIn(
-            "| head-test | MTP off (reference) | 4 | (ref) | yes | 10.00 | n/a | 1.000 | n/a | 1.00 GiB | n/a | n/a | n/a | n/a |",
+            "| head-test | MTP off (reference) | 4 | (ref) | yes | 10.00 | n/a | 1.000 | n/a | n/a | 1.00 GiB | n/a | n/a | n/a | n/a |",
             table,
         )
         self.assertIn(
-            "| head-test | MTP off (StepModel) | 4 | yes | yes | 10.50 | n/a | 1.000 | 1.00 | 1.00 GiB | 3.0 MiB | 2.0 MiB | on: 12 fused / 0 ref | none |",
+            "| head-test | MTP off (StepModel) | 4 | yes | yes | 10.50 | n/a | 1.000 | 1.00 | n/a | 1.00 GiB | 3.0 MiB | 2.0 MiB | on: 12 fused / 0 ref | none |",
             table,
         )
         self.assertIn(
-            "| head-test | MTP K=3 | 4 | no @2 | no @2 | 15.50 | 0.500 | 0.750 | 4.00 | 1.50 GiB | n/a | n/a | n/a | on: 30 gemv / 2 cuBLASLt (rows) |",
+            "| head-test | MTP K=3 | 4 | no @2 | no @2 | 15.50 | 0.500 | 0.750 | 4.00 | 1.00 | 1.50 GiB | n/a | n/a | n/a | on: 30 gemv / 2 cuBLASLt (rows) |",
             table,
         )
         # The heading names the recorded model, not a literal.
@@ -472,6 +474,11 @@ class DecodeBenchWrapperTests(unittest.TestCase):
             "MTP off (reference, gqa attn)",
         )
         self.assertEqual(
+            bench.row_label({"path": "ngram", "drafts": 3, "kv_cache": "static", "attn_formulation": "gqa"}),
+            "n-gram K=3 (static kv, gqa attn)",
+        )
+        self.assertEqual(bench.row_label({"path": "ngram", "drafts": 2}), "n-gram K=2")
+        self.assertEqual(
             bench.row_label({"path": "mtp", "mtp_drafts": 3, "kv_cache": "growing", "attn_formulation": "gqa"}),
             "MTP K=3 (growing kv, gqa attn)",
         )
@@ -494,6 +501,15 @@ class DecodeBenchWrapperTests(unittest.TestCase):
             "fn growing_row_kinds(_model: &Qwen35Model) -> Option<(&'static str, &'static str)> {\n    None\n}",
             rewritten,
         )
+        # The speculative rows: the baseline keeps the pre-epic MTP loop, has no n-gram row and
+        # reports no per-verify-step syncs; the engine never appears before the stub.
+        self.assertIn("generate_qwen35_mtp_timed", rewritten)
+        self.assertNotIn("generate_speculative_with", before_stub)
+        self.assertNotIn("MtpProposer", before_stub)
+        self.assertIn('unreachable!("the ngram row is not available on the pre-epic baseline")', rewritten)
+        self.assertIn('(out, stats, prefill_secs, decode_secs, None, None, "mtp")', rewritten)
+        self.assertIn("fn replay_forwards(_stats: &SpeculativeStats) -> Option<u64> {", rewritten)
+        self.assertNotIn("Some(stats.replays as u64)", rewritten)
         self.assertNotIn("set_attn_formulation", before_stub)
         self.assertNotIn("attn_formulation()", before_stub)
         # Everything outside the block is untouched, so the two binaries measure the same rows.

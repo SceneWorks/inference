@@ -64,6 +64,7 @@ METRIC_COLUMNS = (
     ("acceptance_rate", "acceptance", "{:.3f}"),
     ("target_forwards_per_generated_token", "fwd/tok", "{:.3f}"),
     ("host_syncs_per_token", "syncs/tok", "{:.2f}"),
+    ("host_syncs_per_verify_step", "syncs/verify", "{:.2f}"),
     ("device_used_bytes_at_last_token", "device used @ last token", "gib"),
     ("cache_live_bytes", "cache live", "mib"),
     ("cache_checkpoint_bytes", "cache checkpoints", "mib"),
@@ -167,6 +168,9 @@ def row_label(row: dict[str, Any]) -> str:
     qualifiers = row_qualifiers(row)
     if path == "mtp":
         base = f"MTP K={row.get('mtp_drafts')}"
+        return f"{base} ({', '.join(qualifiers)})" if qualifiers else base
+    if path == "ngram":
+        base = f"n-gram K={row.get('drafts')}"
         return f"{base} ({', '.join(qualifiers)})" if qualifiers else base
     if path == "reference":
         return "MTP off (" + ", ".join(["reference", *qualifiers]) + ")"
@@ -282,7 +286,9 @@ def render_table(runs: list[dict[str, Any]]) -> str:
         "token while its cache is alive (device-wide, weights included); cache live / checkpoints "
         "= the StepModel row's final cache's own accounting (rollback checkpoints separately); "
         "syncs/tok = device->host transfers issued by candle-llm per generated token (n/a where "
-        "the binary predates the counter); fwd/tok = measured target forwards per generated token "
+        "the binary predates the counter); syncs/verify = the speculative engine's transfers per "
+        "verify step (n/a for non-speculative rows and where the binary predates the engine); "
+        "fwd/tok = measured target forwards per generated token "
         "(n/a where the binary predates the counter); fused primitives = the switch the row ran "
         "under and how many RMSNorm / SwiGLU / QK-norm+RoPE leaves ran the fused kernel vs the "
         "op-chain reference, with the last reference reason (n/a where the binary predates the "

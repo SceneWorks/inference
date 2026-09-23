@@ -62,12 +62,24 @@ impl Default for SpeculativeConfig {
 /// Measured speculation efficiency for a run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SpeculativeStats {
-    /// Target forward passes (the prefill + one per verify step). Fewer than `generated` ⇒ speedup.
+    /// Target forward passes (the prefill + one per verify step, plus a replay forward per
+    /// rejected run on a cache that rolls back only to a step start). Fewer than `generated` ⇒
+    /// speedup.
     pub forwards: usize,
     /// Draft tokens proposed across all steps.
     pub proposed: usize,
     /// Draft tokens accepted across all steps.
     pub accepted: usize,
+    /// Verify steps taken: target forwards over `[cur, drafts…]` whose outcome was decided
+    /// (sc-24130). The denominator of "host syncs per verify step".
+    pub verify_steps: usize,
+    /// Replay forwards (sc-24130, E2): verify steps whose cache answered
+    /// [`Error::RollbackUnavailable`] for the direct rollback to `start + 1 + accepted`, so the
+    /// engine rolled back to the step start and replayed the kept prefix in one extra forward.
+    /// Counted inside `forwards`; `0` on a cache with per-position rollback.
+    ///
+    /// [`Error::RollbackUnavailable`]: crate::error::Error::RollbackUnavailable
+    pub replays: usize,
 }
 
 /// Generate from `prompt_ids` with prompt-lookup speculative decoding, returning the output and
@@ -164,6 +176,7 @@ pub fn generate_prompt_lookup(
         let logits_all =
             model.decode_logits_all(&input_ids(&verify, device)?, &mut cache, base_offset)?;
         stats.forwards += 1;
+        stats.verify_steps += 1;
 
         let (committed, accepted) = if greedy {
             decide_greedy(&logits_all, &drafts, &history, config, &mut rng)?
@@ -342,6 +355,7 @@ pub fn generate_draft_speculative(
             base_target,
         )?;
         stats.forwards += 1;
+        stats.verify_steps += 1;
 
         let (committed, accepted) = if greedy {
             decide_greedy(&logits_all, &drafts, &history, config, &mut rng)?

@@ -34,7 +34,7 @@ use crate::primitives::gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
 };
 use crate::primitives::kv_cache::{KvCacheKind, StaticKvCache};
-use crate::primitives::nn::{embed, input_ids, rms_norm, rms_norm_residual, swiglu};
+use crate::primitives::nn::{embed, rms_norm, rms_norm_residual, swiglu};
 use crate::primitives::projection::{Projection, ProjectionFormat, QuantSpec, WeightCensus};
 use crate::primitives::rope::{rms_norm_rope, Rope};
 use crate::primitives::{KvCache, PrismRegistry, Weights};
@@ -758,6 +758,9 @@ pub struct Qwen35Cache {
     layers: Vec<Qwen35LayerCache>,
     checkpoints: Vec<DeltaCheckpoint>,
     max_checkpoints: usize,
+    /// Added to the cache position to form the RoPE position of every token a
+    /// [`StepModel::forward_step`] feeds (see [`set_rope_delta`](Self::set_rope_delta)).
+    rope_delta: i32,
 }
 
 impl Qwen35Cache {
@@ -774,7 +777,22 @@ impl Qwen35Cache {
                 .collect::<Result<Vec<_>>>()?,
             checkpoints: self.checkpoints.clone(),
             max_checkpoints: self.max_checkpoints,
+            rope_delta: self.rope_delta,
         })
+    }
+
+    /// The shift between cache positions and RoPE positions for tokens fed through the step seam
+    /// ([`StepModel::forward_step`] uses `offset() + rope_delta()`): zero for a text prompt, the
+    /// interleaved M-RoPE `mrope_delta` after a multimodal prefill, whose 3-D positions end past
+    /// the sequence length. Set by the caller that prefilled the cache; a configuration, not a
+    /// state — `reset` and `rollback_to` leave it alone.
+    pub fn set_rope_delta(&mut self, delta: i32) {
+        self.rope_delta = delta;
+    }
+
+    /// The step seam's RoPE shift (see [`set_rope_delta`](Self::set_rope_delta)).
+    pub fn rope_delta(&self) -> i32 {
+        self.rope_delta
     }
 
     /// Positions already cached — the RoPE offset for the next step (read from the first full-attn
@@ -1013,6 +1031,12 @@ impl DecodeCache for Qwen35Cache {
 
     fn reset(&mut self) {
         Qwen35Cache::reset(self)
+    }
+
+    fn retain_checkpoints(&mut self, n: usize) {
+        if n > self.max_checkpoints {
+            self.set_max_checkpoints(n);
+        }
     }
 
     fn memory(&self) -> CacheMemory {
@@ -1276,11 +1300,25 @@ impl Qwen35Mtp {
         position: i32,
         cache: &mut Qwen35MtpCache,
     ) -> Result<(Tensor, Tensor)> {
+        let ids = Tensor::from_vec(vec![input_id as i64], (1, 1), &self.device)?;
+        self.step_ids(&ids, previous_hidden, step_idx, position, cache)
+    }
+
+    /// [`step`](Self::step) over a `[1, 1]` id tensor already on the device — how the greedy
+    /// proposer feeds each draft's device argmax straight into the next draft step without a host
+    /// transfer (sc-24130).
+    pub fn step_ids(
+        &self,
+        ids: &Tensor,
+        previous_hidden: &Tensor,
+        step_idx: usize,
+        position: i32,
+        cache: &mut Qwen35MtpCache,
+    ) -> Result<(Tensor, Tensor)> {
         if self.layers.is_empty() {
             return Err(Error::Msg("qwen3_5 MTP has no predictor layers".into()));
         }
-        let ids = Tensor::from_vec(vec![input_id as i64], (1, 1), &self.device)?;
-        let embeddings = self.embed_tokens.forward(&ids)?.to_dtype(self.dtype)?;
+        let embeddings = self.embed_tokens.forward(ids)?.to_dtype(self.dtype)?;
         self.step_from_embeddings(&embeddings, previous_hidden, step_idx, position, cache)
     }
 
@@ -1529,6 +1567,7 @@ impl Qwen35Model {
             layers,
             checkpoints: Vec::new(),
             max_checkpoints,
+            rope_delta: 0,
         }
     }
 
@@ -1575,6 +1614,7 @@ impl Qwen35Model {
             layers,
             checkpoints: Vec::new(),
             max_checkpoints,
+            rope_delta: 0,
         })
     }
 
@@ -2311,13 +2351,14 @@ impl StepModel for Qwen35Model {
         cache: &mut Qwen35Cache,
         request: StepRequest<'_>,
     ) -> Result<StepOutput> {
-        if request.tokens.is_empty() {
+        if request.is_empty()? {
             return Err(Error::Msg(
                 "Qwen35Model::forward_step: empty token slice".into(),
             ));
         }
-        let offset = cache.offset();
-        let ids = input_ids(request.tokens, &self.device)?;
+        // RoPE positions continue from the cache, shifted by the caller's delta (M-RoPE prompts).
+        let offset = cache.offset() + cache.rope_delta();
+        let ids = request.tokens.ids(&self.device)?;
         let (logits, hidden) = match (request.scope, request.want_hidden) {
             (LogitsScope::Last, false) => (self.decode_logits(&ids, cache, offset)?, None),
             (LogitsScope::Last, true) => {
@@ -2996,6 +3037,97 @@ pub(crate) mod tests {
         (cfg, model)
     }
 
+    /// The parts a test needs to write the synthetic decoder as a snapshot directory: its config,
+    /// its weights (no `mtp.*` tensors) and the config JSON (`text_config` with
+    /// `mtp_num_hidden_layers = 0`) — the provider-level AC3 fixture (sc-24130).
+    pub(crate) fn text_model_snapshot_parts() -> (Qwen35Config, Weights, Value) {
+        let mut json = cfg_json();
+        json["text_config"]["mtp_num_hidden_layers"] = json!(0);
+        let cfg = Qwen35Config::from_json(&json).unwrap();
+        let weights = synthetic_weights(&cfg);
+        assert!(!Qwen35Mtp::complete_in(&weights, &cfg));
+        (cfg, weights, json)
+    }
+
+    /// The synthetic decoder with `layers` decoder layers (the schedule keeps interval 4) — a
+    /// *different* model of the same vocabulary, the draft model of the engine's tests.
+    pub(crate) fn text_model_with_layers(layers: usize) -> (Qwen35Config, Qwen35Model) {
+        let mut json = cfg_json();
+        json["text_config"]["num_hidden_layers"] = json!(layers);
+        let cfg = Qwen35Config::from_json(&json).unwrap();
+        let model = Qwen35Model::from_weights(
+            &synthetic_weights(&cfg),
+            "model.language_model",
+            cfg.clone(),
+        )
+        .unwrap();
+        (cfg, model)
+    }
+
+    /// The same synthetic decoder with a complete one-layer MTP head (the speculative engine's
+    /// tiny-config fixture, sc-24130).
+    pub(crate) fn text_model_with_mtp() -> (Qwen35Config, Qwen35Model, Qwen35Mtp) {
+        let mut json = cfg_json();
+        json["text_config"]["mtp_num_hidden_layers"] = json!(1);
+        let cfg = Qwen35Config::from_json(&json).unwrap();
+        let weights = synthetic_weights(&cfg);
+        assert!(Qwen35Mtp::complete_in(&weights, &cfg));
+        let model =
+            Qwen35Model::from_weights(&weights, "model.language_model", cfg.clone()).unwrap();
+        let mtp = Qwen35Mtp::from_weights_with(&weights, &model, None).unwrap();
+        (cfg, model, mtp)
+    }
+
+    #[test]
+    fn step_seam_rope_delta_shifts_the_continuation_positions() {
+        // A cache prefilled at positions 0..3 whose continuation must run at 3 + delta (the
+        // M-RoPE `mrope_delta` after a multimodal prompt): the step seam's logits equal a direct
+        // `decode_logits` at that shifted offset, and differ from the unshifted ones.
+        let (_cfg, model) = text_model();
+        let prompt = [3, 1, 4];
+        let mut direct = model.new_cache();
+        model
+            .decode_logits(&ids(&[3, 1, 4]), &mut direct, 0)
+            .unwrap();
+        let shifted = model.decode_logits(&ids(&[9]), &mut direct, 3 + 5).unwrap();
+        let mut plain = model.new_cache();
+        model
+            .decode_logits(&ids(&[3, 1, 4]), &mut plain, 0)
+            .unwrap();
+        let unshifted = model.decode_logits(&ids(&[9]), &mut plain, 3).unwrap();
+
+        let mut cache = StepModel::new_cache(&model);
+        model
+            .forward_step(&mut cache, StepRequest::last(&prompt))
+            .unwrap();
+        cache.set_rope_delta(5);
+        assert_eq!(cache.rope_delta(), 5);
+        let via_step = model
+            .forward_step(&mut cache, StepRequest::last(&[9]))
+            .unwrap()
+            .logits;
+        assert_eq!(host(&via_step), host(&shifted));
+        assert_ne!(host(&via_step), host(&unshifted));
+        // The delta is configuration: a rollback keeps it, and a clone carries it.
+        cache.rollback_to(3).unwrap();
+        assert_eq!(cache.rope_delta(), 5);
+        assert_eq!(cache.try_clone().unwrap().rope_delta(), 5);
+        // Device-resident ids feed the same step as host ids.
+        let mut a = StepModel::new_cache(&model);
+        let mut b = StepModel::new_cache(&model);
+        let via_host = model
+            .forward_step(&mut a, StepRequest::all(&[3, 1, 4]))
+            .unwrap()
+            .logits;
+        let device_ids = ids(&[3, 1, 4]);
+        let via_device = model
+            .forward_step(&mut b, StepRequest::all_ids(&device_ids))
+            .unwrap()
+            .logits;
+        assert_eq!(host(&via_host), host(&via_device));
+        assert_eq!(via_host.dims(), &[1, 3, 50]);
+    }
+
     /// `mrope_positions` (the `get_rope_index` port) must reproduce the reference 3-D position rows +
     /// `mrope_delta` for an image+text sequence — exact integer index math (oracle gen_mrope.py).
     #[test]
@@ -3539,27 +3671,13 @@ pub(crate) mod tests {
         assert!(out.hidden.is_none());
         assert_eq!(cache.len(), 3);
         let out = model
-            .forward_step(
-                &mut cache,
-                StepRequest {
-                    tokens: &[42, 9],
-                    scope: LogitsScope::Last,
-                    want_hidden: true,
-                },
-            )
+            .forward_step(&mut cache, StepRequest::last(&[42, 9]).with_hidden(true))
             .unwrap();
         assert_eq!(out.logits.dims(), &[1, vocab]);
         assert_eq!(out.hidden.unwrap().dims(), &[1, 2, hidden]);
         assert_eq!(cache.len(), 5);
         let out = model
-            .forward_step(
-                &mut cache,
-                StepRequest {
-                    tokens: &[2],
-                    scope: LogitsScope::All,
-                    want_hidden: true,
-                },
-            )
+            .forward_step(&mut cache, StepRequest::all(&[2]).with_hidden(true))
             .unwrap();
         assert_eq!(out.logits.dims(), &[1, 1, vocab]);
         assert_eq!(out.hidden.unwrap().dims(), &[1, 1, hidden]);

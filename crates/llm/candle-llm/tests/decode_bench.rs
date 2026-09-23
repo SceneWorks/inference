@@ -10,9 +10,10 @@
 //! |----------------------------|--------------------------------------------------------------|
 //! | `DECODE_BENCH_SNAPSHOT`    | snapshot directory (config.json, tokenizer*.json, shards)    |
 //! | `DECODE_BENCH_OUTPUT`      | JSON path to write (must not exist)                          |
-//! | `DECODE_BENCH_ROWS`        | comma list of `reference`, `reference_unfused`, `reference_cublaslt`, `step_model`, `mtp` (default `reference,step_model,mtp`) |
+//! | `DECODE_BENCH_ROWS`        | comma list of `reference`, `reference_unfused`, `reference_cublaslt`, `step_model`, `mtp`, `ngram` (default `reference,step_model,mtp`) |
 //! | `DECODE_BENCH_FORMAT`      | projection weight format: `bf16` (default) or `nvfp4` (quantized at load, sc-24135) |
 //! | `DECODE_BENCH_DRAFTS`      | MTP draft widths, comma list (default `1,2,3,4,5`)           |
+//! | `DECODE_BENCH_NGRAM_DRAFTS` | n-gram draft widths, comma list (default `3`)               |
 //! | `DECODE_BENCH_NEW_TOKENS`  | tokens generated per row (default 256)                       |
 //! | `DECODE_BENCH_WARMUP_TOKENS` | tokens of the untimed warm-up run (default 16)             |
 //! | `DECODE_BENCH_PROMPT`      | user message (default: a long-answer explanation request)    |
@@ -41,12 +42,20 @@
 //! returned by the step driver.
 //!
 //! Every row on head says which KV cache and which attention formulation produced it
-//! (sc-24132): `kv_cache` is `static` for the preallocated cache (the `step_model` row's default;
-//! `DECODE_BENCH_KV_CACHE=growing` selects the `AttnKv` reference slots through the same driver)
-//! or `growing` (the reference and MTP rows always); `attn_formulation` is `gqa` (the un-expanded
-//! `sdpa_gqa_causal` every path runs since S4) or `expanded` (`DECODE_BENCH_ATTN=expanded`: the
-//! pre-S4 `repeat_kv` arithmetic on the growing slots, the labelled comparison row that reproduces
-//! the sealed pre-epic baseline's bits). The pre-epic baseline binary reports neither (`null`).
+//! (sc-24132): `kv_cache` is `static` for the preallocated cache (the `step_model`, `mtp` and
+//! `ngram` rows' default; `DECODE_BENCH_KV_CACHE=growing` selects the `AttnKv` reference slots
+//! through the same seam) or `growing` (the reference row always); `attn_formulation` is `gqa`
+//! (the un-expanded `sdpa_gqa_causal` every path runs since S4) or `expanded`
+//! (`DECODE_BENCH_ATTN=expanded`: the pre-S4 `repeat_kv` arithmetic on the growing slots, the
+//! labelled comparison row that reproduces the sealed pre-epic baseline's bits). The pre-epic
+//! baseline binary reports neither (`null`).
+//!
+//! The speculative rows (sc-24130) run the unified engine over the step seam — the `mtp` rows
+//! with the native MTP proposer, the `ngram` rows with prompt lookup — and report the proposer
+//! the record says ran (`proposer`), the device->host syncs per verify step
+//! (`host_syncs_per_verify_step`, the AC2 figure: exactly 1 on head, `K + 1` on the pre-epic loop,
+//! which the baseline binary reports as `null` because it predates the counter) and the replay
+//! forwards the engine spent on the `RollbackUnavailable` fallback (`replay_forwards`, E2).
 //!
 //! The block between the `head-only` markers uses seams that do not exist on the pre-epic
 //! baseline (`StepModel`, host-sync accounting). `decode_bench.py baseline-source` rewrites this
@@ -59,8 +68,8 @@ use std::time::Instant;
 
 use candle_core::Device;
 use candle_llm::decode::{
-    generate_from_prefill, generate_qwen35_mtp_timed, CancelFlag, Decode, GenerationConfig,
-    GenerationOutput, SpeculativeStats, StreamEvent,
+    generate_from_prefill, CancelFlag, Decode, GenerationConfig, GenerationOutput,
+    SpeculativeStats, StreamEvent,
 };
 use candle_llm::device::select_device;
 use candle_llm::models::{Qwen35Config, Qwen35Model, Qwen35Mtp};
@@ -71,13 +80,126 @@ use serde_json::{json, Value};
 // >>> head-only
 use candle_llm::decode::generate_step_timed;
 use candle_llm::decode::CountingDecode;
+use candle_llm::decode::{
+    generate_speculative_with, MtpProposer, NgramProposer, Proposer, SpeculativePrompt,
+};
 use candle_llm::primitives::{
     fused_kernels_enabled, fused_tally, host_sync_count, nvfp4_gemv_enabled,
     nvfp4_gemv_policy_guard, nvfp4_path_tally, set_fused_kernels, ProjectionFormat,
 };
 
+/// A speculative row through the unified engine: the output, the raw counters, the prefill and
+/// decode seconds, the `(kv_cache, attn_formulation)` labels of the cache it ran on, the
+/// engine's host syncs per verify step, and the proposer the record says ran.
+type SpeculativeRow = (
+    GenerationOutput,
+    SpeculativeStats,
+    f64,
+    f64,
+    Option<(&'static str, &'static str)>,
+    Option<f64>,
+    &'static str,
+);
+
+fn engine_row<P: Proposer>(
+    model: &Qwen35Model,
+    proposer: &mut P,
+    prompt: &[i32],
+    config: &GenerationConfig,
+    drafts: usize,
+    device: &Device,
+    on_event: &mut dyn FnMut(StreamEvent),
+) -> SpeculativeRow {
+    device.synchronize().unwrap();
+    let started = Instant::now();
+    let mut prefill_secs = 0.0;
+    let mut decode_started = None;
+    let mut boundary = || {
+        device.synchronize()?;
+        prefill_secs = started.elapsed().as_secs_f64();
+        decode_started = Some(Instant::now());
+        Ok(())
+    };
+    let run = generate_speculative_with(
+        model,
+        proposer,
+        SpeculativePrompt::Tokens(prompt),
+        config,
+        drafts,
+        &CancelFlag::new(),
+        on_event,
+        None,
+        None,
+        Some(&mut boundary),
+    )
+    .expect("speculative generation");
+    device.synchronize().unwrap();
+    let decode_secs = decode_started.unwrap().elapsed().as_secs_f64();
+    (
+        run.output,
+        run.stats,
+        prefill_secs,
+        decode_secs,
+        Some((
+            run.record.kv_cache.label(),
+            run.record.attn_formulation.label(),
+        )),
+        run.record.host_syncs_per_verify_step(),
+        run.record.proposer.label(),
+    )
+}
+
+/// The `mtp` row: the engine with the native MTP proposer, `drafts` per verify step.
+fn mtp_row(
+    model: &Qwen35Model,
+    mtp: &Qwen35Mtp,
+    prompt: &[i32],
+    config: &GenerationConfig,
+    drafts: u32,
+    device: &Device,
+    on_event: &mut dyn FnMut(StreamEvent),
+) -> SpeculativeRow {
+    let mut proposer = MtpProposer::new(mtp);
+    engine_row(
+        model,
+        &mut proposer,
+        prompt,
+        config,
+        drafts as usize,
+        device,
+        on_event,
+    )
+}
+
+/// The `ngram` row: the engine with prompt lookup (trailing n-grams up to 3), `drafts` per step.
+fn ngram_row(
+    model: &Qwen35Model,
+    prompt: &[i32],
+    config: &GenerationConfig,
+    drafts: u32,
+    device: &Device,
+    on_event: &mut dyn FnMut(StreamEvent),
+) -> SpeculativeRow {
+    let mut proposer = NgramProposer { max_ngram: 3 };
+    engine_row(
+        model,
+        &mut proposer,
+        prompt,
+        config,
+        drafts as usize,
+        device,
+        on_event,
+    )
+}
+
 fn host_syncs_now() -> Option<u64> {
     Some(host_sync_count())
+}
+
+/// The engine's replay forwards (the `RollbackUnavailable` -> replay fallback, E2), `None` on a
+/// binary whose stats predate the counter.
+fn replay_forwards(stats: &SpeculativeStats) -> Option<u64> {
+    Some(stats.replays as u64)
 }
 
 /// The fused-primitive switch state (`on` / `off`), or `None` on a binary without the switch.
@@ -203,6 +325,7 @@ fn step_model_row(
     Option<(u64, u64)>,
     Option<(u64, u64)>,
     Option<(&'static str, &'static str)>,
+    &'static str,
 ) {
     let mut prefill_secs = 0.0;
     let started = Instant::now();
@@ -232,6 +355,7 @@ fn step_model_row(
         Some((record.target_forwards, record.host_syncs)),
         Some((memory.live_bytes as u64, memory.checkpoint_bytes as u64)),
         Some((record.kv_cache.label(), record.attn_formulation.label())),
+        record.proposer.label(),
     )
 }
 
@@ -272,6 +396,10 @@ fn growing_row_kinds(model: &Qwen35Model) -> Option<(&'static str, &'static str)
 #[allow(dead_code)]
 const BASELINE_STUB: &str = r#"
 fn host_syncs_now() -> Option<u64> {
+    None
+}
+
+fn replay_forwards(_stats: &SpeculativeStats) -> Option<u64> {
     None
 }
 
@@ -346,6 +474,7 @@ fn step_model_row(
     Option<(u64, u64)>,
     Option<(u64, u64)>,
     Option<(&'static str, &'static str)>,
+    &'static str,
 ) {
     unreachable!("the step_model row is not available on the pre-epic baseline")
 }
@@ -356,6 +485,65 @@ fn select_attn_formulation(_model: &mut Qwen35Model) {}
 
 fn growing_row_kinds(_model: &Qwen35Model) -> Option<(&'static str, &'static str)> {
     None
+}
+
+type SpeculativeRow = (
+    GenerationOutput,
+    SpeculativeStats,
+    f64,
+    f64,
+    Option<(&'static str, &'static str)>,
+    Option<f64>,
+    &'static str,
+);
+
+/// The pre-epic MTP loop (`generate_qwen35_mtp_timed`), which the baseline binary still carries.
+fn mtp_row(
+    model: &Qwen35Model,
+    mtp: &Qwen35Mtp,
+    prompt: &[i32],
+    config: &GenerationConfig,
+    drafts: u32,
+    device: &Device,
+    on_event: &mut dyn FnMut(StreamEvent),
+) -> SpeculativeRow {
+    device.synchronize().unwrap();
+    let started = Instant::now();
+    let mut prefill_secs = 0.0;
+    let mut decode_started = None;
+    let mut boundary = || {
+        device.synchronize()?;
+        prefill_secs = started.elapsed().as_secs_f64();
+        decode_started = Some(Instant::now());
+        Ok(())
+    };
+    let (out, stats) = candle_llm::decode::generate_qwen35_mtp_timed(
+        model,
+        mtp,
+        prompt,
+        config,
+        drafts,
+        &CancelFlag::new(),
+        on_event,
+        None,
+        &mut boundary,
+    )
+    .expect("mtp generation");
+    device.synchronize().unwrap();
+    let decode_secs = decode_started.unwrap().elapsed().as_secs_f64();
+    // No record on the baseline: the loop is the MTP loop by construction.
+    (out, stats, prefill_secs, decode_secs, None, None, "mtp")
+}
+
+fn ngram_row(
+    _model: &Qwen35Model,
+    _prompt: &[i32],
+    _config: &GenerationConfig,
+    _drafts: u32,
+    _device: &Device,
+    _on_event: &mut dyn FnMut(StreamEvent),
+) -> SpeculativeRow {
+    unreachable!("the ngram row is not available on the pre-epic baseline")
 }
 "#;
 
@@ -473,42 +661,6 @@ fn run_reference(
     (out, prefill_secs, decode_started.elapsed().as_secs_f64())
 }
 
-fn mtp_row(
-    model: &Qwen35Model,
-    mtp: &Qwen35Mtp,
-    prompt: &[i32],
-    config: &GenerationConfig,
-    drafts: u32,
-    device: &Device,
-    on_event: &mut dyn FnMut(StreamEvent),
-) -> (GenerationOutput, SpeculativeStats, f64, f64) {
-    device.synchronize().unwrap();
-    let started = Instant::now();
-    let mut prefill_secs = 0.0;
-    let mut decode_started = None;
-    let mut boundary = || {
-        device.synchronize()?;
-        prefill_secs = started.elapsed().as_secs_f64();
-        decode_started = Some(Instant::now());
-        Ok(())
-    };
-    let (out, stats) = generate_qwen35_mtp_timed(
-        model,
-        mtp,
-        prompt,
-        config,
-        drafts,
-        &CancelFlag::new(),
-        on_event,
-        None,
-        &mut boundary,
-    )
-    .expect("mtp generation");
-    device.synchronize().unwrap();
-    let decode_secs = decode_started.unwrap().elapsed().as_secs_f64();
-    (out, stats, prefill_secs, decode_secs)
-}
-
 fn divergence(reference: &[i32], other: &[i32]) -> Option<usize> {
     reference
         .iter()
@@ -532,8 +684,11 @@ fn row_json(
     device_used_at_last_token: Option<u64>,
     cache: Option<(u64, u64)>,
     kinds: Option<(&str, &str)>,
+    syncs_per_verify_step: Option<f64>,
     fused_primitives: Option<Value>,
     nvfp4_projections: Option<Value>,
+    proposer: Option<&str>,
+    replay_forwards: Option<u64>,
 ) -> Value {
     let generated = out.tokens.len() as u64;
     let ratio = |num: Option<u64>, den: u64| -> Value {
@@ -550,7 +705,10 @@ fn row_json(
     let matches = diverged.map(|d| d.is_none());
     json!({
         "path": path,
-        "mtp_drafts": drafts,
+        "mtp_drafts": if path == "mtp" { drafts } else { None },
+        "drafts": drafts,
+        "proposer": proposer,
+        "host_syncs_per_verify_step": syncs_per_verify_step,
         "generated_tokens": generated,
         "prefill_seconds": prefill_secs,
         "decode_seconds": decode_secs,
@@ -559,6 +717,7 @@ fn row_json(
         "proposed_tokens": proposed,
         "accepted_tokens": accepted,
         "acceptance_rate": acceptance,
+        "replay_forwards": replay_forwards,
         "target_forwards_per_generated_token": ratio(forwards, generated),
         "host_syncs": host_syncs,
         "host_syncs_per_token": ratio(host_syncs, generated),
@@ -709,8 +868,11 @@ fn decode_bench() {
             used,
             None,
             growing_row_kinds(&model),
+            None,
             fused,
             nvfp4,
+            Some("none"),
+            None,
         ));
         reference_tokens = Some(out.tokens);
     }
@@ -754,8 +916,11 @@ fn decode_bench() {
             used,
             None,
             growing_row_kinds(&model),
+            None,
             fused,
             nvfp4,
+            Some("none"),
+            None,
         ));
         if reference_tokens.is_none() {
             reference_tokens = Some(out.tokens);
@@ -801,8 +966,11 @@ fn decode_bench() {
             used,
             None,
             growing_row_kinds(&model),
+            None,
             fused,
             nvfp4,
+            Some("none"),
+            None,
         ));
         if reference_tokens.is_none() {
             reference_tokens = Some(out.tokens);
@@ -814,7 +982,7 @@ fn decode_bench() {
         let fused0 = fused_tally_now();
         let nv0 = nvfp4_tally_now();
         let mut at_last = None;
-        let (out, prefill, decode, record, cache, kinds) = step_model_row(
+        let (out, prefill, decode, record, cache, kinds, proposer) = step_model_row(
             &model,
             &prompt,
             &config,
@@ -848,8 +1016,11 @@ fn decode_bench() {
             used,
             cache,
             kinds,
+            None,
             fused,
             nvfp4,
+            Some(proposer),
+            None,
         ));
         if reference_tokens.is_none() {
             reference_tokens = Some(out.tokens);
@@ -864,7 +1035,7 @@ fn decode_bench() {
             let fused0 = fused_tally_now();
             let nv0 = nvfp4_tally_now();
             let mut at_last = None;
-            let (out, stats, prefill, decode) = mtp_row(
+            let (out, stats, prefill, decode, kinds, per_verify, proposer) = mtp_row(
                 &model,
                 mtp,
                 &prompt,
@@ -878,14 +1049,15 @@ fn decode_bench() {
             let nvfp4 = nvfp4_delta(nv0, nv_switch);
             let used = note_peak(at_last);
             eprintln!(
-                "[decode_bench] mtp K={k}          {:>7.2} tok/s  accept {:.3}  fwd/tok {:.3}",
+                "[decode_bench] mtp K={k}          {:>7.2} tok/s  accept {:.3}  fwd/tok {:.3}  syncs/verify {}",
                 out.tokens.len() as f64 / decode,
                 if stats.proposed > 0 {
                     stats.accepted as f64 / stats.proposed as f64
                 } else {
                     0.0
                 },
-                stats.forwards as f64 / out.tokens.len().max(1) as f64
+                stats.forwards as f64 / out.tokens.len().max(1) as f64,
+                per_verify.map_or("n/a".to_string(), |s| format!("{s:.2}"))
             );
             rows_json.push(row_json(
                 "mtp",
@@ -900,9 +1072,69 @@ fn decode_bench() {
                 syncs,
                 used,
                 None,
-                growing_row_kinds(&model),
+                kinds.or_else(|| growing_row_kinds(&model)),
+                per_verify,
                 fused,
                 nvfp4,
+                Some(proposer),
+                replay_forwards(&stats),
+            ));
+        }
+    }
+
+    if rows.iter().any(|r| r == "ngram") {
+        let ngram_drafts: Vec<u32> = env_or("DECODE_BENCH_NGRAM_DRAFTS", "3")
+            .split(',')
+            .map(|s| s.trim().parse().expect("n-gram draft width"))
+            .collect();
+        for &k in &ngram_drafts {
+            ngram_row(&model, &prompt, &warm, k, &device, &mut |_| {});
+            let syncs0 = host_syncs_now();
+            let fused0 = fused_tally_now();
+            let nv0 = nvfp4_tally_now();
+            let mut at_last = None;
+            let (out, stats, prefill, decode, kinds, per_verify, proposer) = ngram_row(
+                &model,
+                &prompt,
+                &config,
+                k,
+                &device,
+                &mut last_token_sampler(&device, new_tokens, &mut at_last),
+            );
+            let syncs = host_syncs_now().zip(syncs0).map(|(a, b)| a - b);
+            let fused = fused_delta(fused0, switch);
+            let nvfp4 = nvfp4_delta(nv0, nv_switch);
+            let used = note_peak(at_last);
+            eprintln!(
+                "[decode_bench] ngram K={k}        {:>7.2} tok/s  accept {:.3}  fwd/tok {:.3}  syncs/verify {}",
+                out.tokens.len() as f64 / decode,
+                if stats.proposed > 0 {
+                    stats.accepted as f64 / stats.proposed as f64
+                } else {
+                    0.0
+                },
+                stats.forwards as f64 / out.tokens.len().max(1) as f64,
+                per_verify.map_or("n/a".to_string(), |s| format!("{s:.2}"))
+            );
+            rows_json.push(row_json(
+                "ngram",
+                Some(k),
+                &out,
+                reference_tokens.as_deref(),
+                prefill,
+                decode,
+                Some(stats.forwards as u64),
+                Some(stats.proposed as u64),
+                Some(stats.accepted as u64),
+                syncs,
+                used,
+                None,
+                kinds,
+                per_verify,
+                fused,
+                nvfp4,
+                Some(proposer),
+                replay_forwards(&stats),
             ));
         }
     }
