@@ -2623,6 +2623,7 @@ impl TextLlm for LlamaProvider {
                 host_syncs: request_span.host_syncs(),
                 kv_cache: crate::primitives::KvCacheKind::Growing,
                 attn_formulation: self.model.attn_formulation(),
+                fused_primitives: request_span.fused_primitives(),
             },
             _ => DecodeRecord::plain(
                 DecodePath::Reference,
@@ -2630,7 +2631,8 @@ impl TextLlm for LlamaProvider {
                 out.tokens.len(),
                 request_span.host_syncs(),
             )
-            .with_attn_formulation(self.model.attn_formulation()),
+            .with_attn_formulation(self.model.attn_formulation())
+            .with_fused_primitives(request_span.fused_primitives()),
         };
         *self
             .last_decode

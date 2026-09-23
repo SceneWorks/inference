@@ -285,7 +285,8 @@ pub fn generate_step_timed<M: StepModel>(
         span.host_syncs(),
     )
     .with_kv_cache(cache.kv_kind())
-    .with_attn_formulation(model.attn_formulation(&cache));
+    .with_attn_formulation(model.attn_formulation(&cache))
+    .with_fused_primitives(span.fused_primitives());
     Ok((
         GenerationOutput {
             tokens: generated,

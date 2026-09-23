@@ -67,6 +67,7 @@ METRIC_COLUMNS = (
     ("device_used_bytes_at_last_token", "device used @ last token", "gib"),
     ("cache_live_bytes", "cache live", "mib"),
     ("cache_checkpoint_bytes", "cache checkpoints", "mib"),
+    ("fused_primitives", "fused primitives", "fused"),
 )
 # Fields every run merged into one table must share, or the rows are not comparable.
 COMPARABLE_FIELDS = (
@@ -163,6 +164,8 @@ def row_label(row: dict[str, Any]) -> str:
         return f"{base} ({', '.join(qualifiers)})" if qualifiers else base
     if path == "reference":
         return "MTP off (" + ", ".join(["reference", *qualifiers]) + ")"
+    if path == "reference_unfused":
+        return "MTP off (" + ", ".join(["reference", "fused off", *qualifiers]) + ")"
     if path == "step_model":
         return "MTP off (" + ", ".join(["StepModel", *qualifiers]) + ")"
     return str(path)
@@ -175,6 +178,10 @@ def format_metric(value: Any, fmt: str) -> str:
         return f"{value / 2**30:.2f} GiB"
     if fmt == "mib":
         return f"{value / 2**20:.1f} MiB"
+    if fmt == "fused":
+        # sc-24137: the row's fused-vs-reference primitive tally and the switch it ran under.
+        reason = f" ({value['reference_reason']})" if value.get("reference_reason") else ""
+        return f"{value['switch']}: {value['fused']} fused / {value['reference']} ref{reason}"
     return fmt.format(value)
 
 
@@ -252,7 +259,10 @@ def render_table(runs: list[dict[str, Any]]) -> str:
         "= the StepModel row's final cache's own accounting (rollback checkpoints separately); "
         "syncs/tok = device->host transfers issued by candle-llm per generated token (n/a where "
         "the binary predates the counter); fwd/tok = measured target forwards per generated token "
-        "(n/a where the binary predates the counter)."
+        "(n/a where the binary predates the counter); fused primitives = the switch the row ran "
+        "under and how many RMSNorm / SwiGLU / QK-norm+RoPE leaves ran the fused kernel vs the "
+        "op-chain reference, with the last reference reason (n/a where the binary predates the "
+        "fused primitives)."
     )
     return "\n".join(lines) + "\n"
 
