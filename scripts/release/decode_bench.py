@@ -72,6 +72,7 @@ METRIC_COLUMNS = (
     ("cache_checkpoint_bytes", "cache checkpoints", "mib"),
     ("fused_primitives", "fused primitives", "fused"),
     ("nvfp4_projections", "nvfp4 path", "nvfp4"),
+    ("cuda_graphs", "cuda graphs", "graphs"),
 )
 # Fields every run merged into one table must share, or the rows are not comparable. A field may
 # carry an optional default (used with `.get` when an older document lacks the key) so a
@@ -203,6 +204,13 @@ def format_metric(value: Any, fmt: str) -> str:
             return "none"
         reason = f" ({value['cublaslt_reason']})" if value.get("cublaslt_reason") else ""
         return f"{value['switch']}: {value['gemv']} gemv / {value['cublaslt']} cuBLASLt{reason}"
+    if fmt == "graphs":
+        # sc-24134: the row's CUDA-graph tally, the switch it ran under and the fallback reason.
+        reason = f" ({value['fallback_reason']})" if value.get("fallback_reason") else ""
+        return (
+            f"{value['switch']}: {value['replayed']} replayed / {value['eager']} eager, "
+            f"{value['captured']} captured{reason}"
+        )
     return fmt.format(value)
 
 
@@ -302,7 +310,10 @@ def render_table(runs: list[dict[str, Any]]) -> str:
         "fused primitives); nvfp4 path = the NVFP4 decode-GEMV switch the row ran under and how many "
         "NVFP4 projection calls ran the fused GEMV vs the cuBLASLt W4A4 GEMM, with the last "
         "cuBLASLt reason (`rows` = a prefill; none = no NVFP4 projections; n/a where the binary "
-        "predates the GEMV)."
+        "predates the GEMV); "
+        "cuda graphs = the CUDA-graph runner switch the row ran under, how "
+        "many steps replayed a captured graph vs ran eager, how many graphs were captured, and "
+        "the last fallback reason (n/a where the binary predates the runner)."
     )
     return "\n".join(lines) + "\n"
 

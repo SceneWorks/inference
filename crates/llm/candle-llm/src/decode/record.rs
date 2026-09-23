@@ -24,6 +24,7 @@ use std::cell::Cell;
 use candle_core::{Device, Tensor};
 use core_llm::ProposerKind;
 
+use crate::decode::graph::{graph_tally, GraphTally};
 use crate::decode::speculative::SpeculativeStats;
 use crate::decode::stream::Decode;
 use crate::error::Result;
@@ -157,6 +158,11 @@ pub struct DecodeRecord {
     /// RMSNorm / SwiGLU / QK-norm+RoPE leaves ran the fused kernel, how many the op chain, and why
     /// the last op-chain run happened. `FusedTally::label` gives `fused` / `reference` / `mixed`.
     pub fused_primitives: FusedTally,
+    /// CUDA-graph runner steps while generating (story sc-24134, see `decode::graph`): how many
+    /// steps replayed a captured graph, how many ran eager, how many graphs were captured, and —
+    /// when an eager step was a fallback — the named reason (`graph: … fallback=<reason>` in
+    /// [`GraphTally::describe`]). `none` when no runner was involved (the reference paths).
+    pub cuda_graphs: GraphTally,
     /// NVFP4 projection calls by path while generating (see `primitives::nvfp4_path`, sc-24136):
     /// how many ran the fused decode GEMV, how many the cuBLASLt W4A4 GEMM, and why the last
     /// cuBLASLt run happened (`rows` for a prefill, `disabled` with the switch off, …).
@@ -189,8 +195,15 @@ impl DecodeRecord {
             replay_forwards: 0,
             verify_host_syncs: 0,
             fused_primitives: FusedTally::default(),
+            cuda_graphs: GraphTally::default(),
             nvfp4_projections: Nvfp4PathTally::default(),
         }
+    }
+
+    /// The same record with its CUDA-graph tally filled in (from [`RequestSpan::cuda_graphs`]).
+    pub fn with_cuda_graphs(mut self, tally: GraphTally) -> Self {
+        self.cuda_graphs = tally;
+        self
     }
 
     /// The same record with `proposer` set — the engine stamps the proposer it ran.
@@ -258,6 +271,7 @@ impl DecodeRecord {
             replay_forwards: stats.replays as u64,
             verify_host_syncs: 0,
             fused_primitives: FusedTally::default(),
+            cuda_graphs: GraphTally::default(),
             nvfp4_projections: Nvfp4PathTally::default(),
         }
     }
@@ -313,6 +327,7 @@ pub struct RequestSpan {
     host_syncs_at_start: u64,
     sampler_at_start: SamplerCounters,
     fused_at_start: FusedTally,
+    graphs_at_start: GraphTally,
     nvfp4_at_start: Nvfp4PathTally,
 }
 
@@ -329,6 +344,7 @@ impl RequestSpan {
             host_syncs_at_start: host_sync_count(),
             sampler_at_start: sampler_counters(),
             fused_at_start: fused_tally(),
+            graphs_at_start: graph_tally(),
             nvfp4_at_start: nvfp4_path_tally(),
         }
     }
@@ -370,6 +386,11 @@ impl RequestSpan {
     /// Fused-vs-reference primitive runs on this thread since [`begin`](Self::begin).
     pub fn fused_primitives(&self) -> FusedTally {
         fused_tally().since(&self.fused_at_start)
+    }
+
+    /// CUDA-graph runner steps on this thread since [`begin`](Self::begin).
+    pub fn cuda_graphs(&self) -> GraphTally {
+        graph_tally().since(&self.graphs_at_start)
     }
 
     /// NVFP4 projection calls by path on this thread since [`begin`](Self::begin).
@@ -532,6 +553,31 @@ mod tests {
         let span = RequestSpan::begin();
         crate::primitives::note_host_sync();
         assert_eq!(span.host_syncs(), 1);
+    }
+
+    #[test]
+    fn request_span_brackets_this_threads_cuda_graph_steps() {
+        let span = RequestSpan::begin();
+        assert_eq!(span.cuda_graphs(), GraphTally::default());
+        assert_eq!(span.cuda_graphs().label(), "none");
+        let record = DecodeRecord::plain(DecodePath::Reference, 1, 1, SpanCounters::default())
+            .with_cuda_graphs(GraphTally {
+                replayed: 3,
+                eager: 1,
+                captured: 1,
+                fallback_reason: None,
+            });
+        assert_eq!(record.cuda_graphs.label(), "mixed");
+        assert_eq!(
+            record.cuda_graphs.describe(),
+            "graph: mixed replayed=3 eager=1 captured=1"
+        );
+        assert_eq!(
+            DecodeRecord::plain(DecodePath::Reference, 1, 1, SpanCounters::default())
+                .cuda_graphs
+                .label(),
+            "none"
+        );
     }
 
     #[test]

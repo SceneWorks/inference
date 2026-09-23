@@ -105,6 +105,14 @@ def suite_document(new_tokens: int = 4, with_step: bool = True) -> dict:
                     "cublaslt_reason": None,
                     "path": "none",
                 },
+                "cuda_graphs": {
+                    "switch": "on",
+                    "replayed": 0,
+                    "eager": 4,
+                    "captured": 0,
+                    "fallback_reason": "deltanet_state_unstable",
+                    "path": "eager",
+                },
                 "tokens_match_reference": True,
                 "first_divergence": None,
                 "tokens": list(range(new_tokens)),
@@ -254,11 +262,11 @@ class DecodeBenchWrapperTests(unittest.TestCase):
             table,
         )
         self.assertIn(
-            "| head-test | MTP off (StepModel) | 4 | yes | yes | 10.50 | n/a | 1.000 | 1.00 | n/a | n/a | n/a | 1.00 GiB | 3.0 MiB | 2.0 MiB | on: 12 fused / 0 ref | none |",
+            "| head-test | MTP off (StepModel) | 4 | yes | yes | 10.50 | n/a | 1.000 | 1.00 | n/a | n/a | n/a | 1.00 GiB | 3.0 MiB | 2.0 MiB | on: 12 fused / 0 ref | none | on: 0 replayed / 4 eager, 0 captured (deltanet_state_unstable) |",
             table,
         )
         self.assertIn(
-            "| head-test | MTP K=3 | 4 | no @2 | no @2 | 15.50 | 0.500 | 0.750 | 4.00 | 1.00 | 1.00 | 0 | 1.50 GiB | n/a | n/a | n/a | on: 30 gemv / 2 cuBLASLt (rows) |",
+            "| head-test | MTP K=3 | 4 | no @2 | no @2 | 15.50 | 0.500 | 0.750 | 4.00 | 1.00 | 1.00 | 0 | 1.50 GiB | n/a | n/a | n/a | on: 30 gemv / 2 cuBLASLt (rows) | n/a |",
             table,
         )
         # The heading names the recorded model, not a literal.
