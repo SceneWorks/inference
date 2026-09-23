@@ -147,10 +147,8 @@ fn ac1_graphs_on_is_token_identical_to_eager_for_spec_off_and_mtp_k3() {
         "MTP K=3 with graphs on diverged at {:?}",
         first_divergence(&eager_mtp.output.tokens, &graphs_mtp.output.tokens)
     );
-    assert_eq!(
-        graphs_mtp.output.tokens, eager.tokens,
-        "MTP K=3 vs the step driver"
-    );
+    // (MTP vs the token-at-a-time driver is S2's gate, with its enumerated bf16 knife-edge
+    // exceptions; this story's claim is graphs on vs off on the same path, asserted above.)
     assert_eq!(graphs_mtp.stats.accepted, eager_mtp.stats.accepted);
     assert_eq!(
         graphs_mtp.record.cuda_graphs.fallback_reason,
@@ -193,6 +191,9 @@ fn qwen38_27b_step_census() {
         .unwrap();
     device.synchronize().unwrap();
     let base = cache.len();
+    // Keep every checkpoint while recording: pruning one inside a capture frees a tensor
+    // allocated before it (`cuMemFreeAsync` → INVALID_VALUE), which abandons the recording.
+    cache.retain_checkpoints(64);
 
     let decode = census_step(&model, &mut cache, StepRequest::last(&[8])).unwrap();
     assert_eq!(cache.len(), base);

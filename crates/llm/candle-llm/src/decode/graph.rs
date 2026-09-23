@@ -353,6 +353,50 @@ impl GraphWorkspace {
     }
 }
 
+/// Bytes admission charges for the CUDA graphs one request may hold (E6, story sc-24134), on the
+/// same basis the request estimator prices a step (`core_llm::estimate_chunked_request_bytes`).
+///
+/// A graph's memory nodes are served from a device-wide graph pool the driver keeps reserved while
+/// the graph lives, *beside* the stream-ordered pool the eager step uses, so each captured shape
+/// costs its own copy of one step's working set: the projections, MLP intermediates and residuals
+/// (`M · (3·intermediate + 8·hidden + vocab)`), the attention scores / weights over every position
+/// the request can reach (`3 · M · query_heads · total_positions`), plus the runner's staging
+/// tensors (ids, all-position logits, hidden rows). The speculative engine can present
+/// `max_step_tokens` token counts (`1 ..= K + 1`: the verify and every replay length) in two logits
+/// scopes each, so every one is priced. `None` on overflow (the caller fails closed).
+pub fn graph_workspace_admission_bytes(
+    geometry: &core_llm::LlmMemoryGeometry,
+    total_positions: u64,
+    max_step_tokens: u32,
+) -> Option<u64> {
+    let e = geometry.element_bytes;
+    let per_token = geometry
+        .intermediate_size
+        .checked_mul(3)?
+        .checked_add(geometry.hidden_size.checked_mul(8)?)?
+        .checked_add(geometry.vocab_size)?
+        .checked_mul(e)?
+        .checked_add(
+            geometry
+                .query_heads
+                .checked_mul(total_positions)?
+                .checked_mul(e)?
+                .checked_mul(3)?,
+        )?
+        // Staging: the id, a logits row and a hidden row per token.
+        .checked_add(4)?
+        .checked_add(
+            geometry
+                .vocab_size
+                .checked_add(geometry.hidden_size)?
+                .checked_mul(e)?,
+        )?;
+    // Σ_{M=1}^{N} M = N (N + 1) / 2 token-rows, in two scopes.
+    let n = u64::from(max_step_tokens);
+    let rows = n.checked_mul(n.checked_add(1)?)? / 2;
+    per_token.checked_mul(rows)?.checked_mul(2)
+}
+
 /// What a captured graph is made of — the node census the runner takes before instantiating it,
 /// and the record behind the POC findings (a real decoder step's census is in the evidence).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1472,6 +1516,38 @@ mod tests {
             GraphTally::default().describe(),
             "graph: none replayed=0 eager=0 captured=0"
         );
+    }
+
+    #[test]
+    fn graph_admission_prices_every_step_shape_of_a_request() {
+        let geometry = core_llm::LlmMemoryGeometry {
+            query_heads: 4,
+            kv_heads: 2,
+            head_dim: 8,
+            layers: 4,
+            element_bytes: 4,
+            hidden_size: 32,
+            intermediate_size: 64,
+            vocab_size: 50,
+            recurrent_bytes: 0,
+        };
+        let per_token = (3 * 64 + 8 * 32 + 50) * 4 + 4 * 100 * 4 * 3 + 4 + (50 + 32) * 4;
+        // A decode-only request (one 1-token shape, two scopes).
+        assert_eq!(
+            graph_workspace_admission_bytes(&geometry, 100, 1),
+            Some(2 * per_token)
+        );
+        // K = 3: token counts 1..=4 → 10 token-rows per scope.
+        assert_eq!(
+            graph_workspace_admission_bytes(&geometry, 100, 4),
+            Some(2 * 10 * per_token)
+        );
+        assert_eq!(graph_workspace_admission_bytes(&geometry, 100, 0), Some(0));
+        let huge = core_llm::LlmMemoryGeometry {
+            vocab_size: u64::MAX,
+            ..geometry
+        };
+        assert_eq!(graph_workspace_admission_bytes(&huge, 100, 4), None);
     }
 
     #[test]

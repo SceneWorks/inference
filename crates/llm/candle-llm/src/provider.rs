@@ -26,9 +26,9 @@ use serde_json::Value;
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
     cuda_graphs_enabled, generate_from_prefill_with_stop, generate_speculative_with,
-    ConstraintMask, CountingDecode, Decode, DecodePath, DecodeRecord, FinishReason,
-    GenerationConfig, GraphRunner, MtpProposer, RequestSpan, RewindableConstraintMask,
-    SpeculativePrompt, StepModel, StreamEvent,
+    graph_workspace_admission_bytes, ConstraintMask, CountingDecode, Decode, DecodePath,
+    DecodeRecord, FinishReason, GenerationConfig, GraphRunner, MtpProposer, RequestSpan,
+    RewindableConstraintMask, SpeculativePrompt, StepModel, StreamEvent,
 };
 use crate::device::select_device;
 use crate::gguf::GgufCheckpoint;
@@ -103,23 +103,37 @@ fn qwen35_recurrent_admission_bytes(c: &Qwen35Config, retained_checkpoints: usiz
 /// the reference geometry with MTP off, and on the step seam's geometry when the engine will run
 /// — its cache retains [`STEP_MAX_CHECKPOINTS`](crate::models::qwen35::STEP_MAX_CHECKPOINTS)
 /// rollback checkpoints the reference cache does not, and its verify step overshoots the budget by
-/// `K` positions (E6, sc-24130).
+/// `K` positions (E6, sc-24130). When the engine will run through the CUDA-graph runner
+/// (`cuda_graphs`, sc-24134) the graphs it may capture are priced too
+/// ([`graph_workspace_admission_bytes`]), so a request that could not hold them fails closed at
+/// admission instead of at instantiation.
 fn priced_request_bytes(
     model: &Decoder,
     mtp_plan: core_llm::MtpPlan,
     admitted_prompt: usize,
     max_new_tokens: u32,
     vision_workspace: u64,
+    cuda_graphs: bool,
 ) -> Option<u64> {
     let geometry = match mtp_plan {
         core_llm::MtpPlan::Mtp { .. } => model.step_memory_geometry(),
         core_llm::MtpPlan::Off => model.memory_geometry(),
     };
+    let graph_workspace = match (cuda_graphs, mtp_plan.draft_tokens()) {
+        (true, Some(k)) => {
+            let total = u64::try_from(admitted_prompt)
+                .ok()?
+                .checked_add(u64::from(max_new_tokens))?
+                .checked_add(u64::from(k))?;
+            graph_workspace_admission_bytes(&geometry, total, k.checked_add(1)?)?
+        }
+        _ => 0,
+    };
     core_llm::estimate_chunked_request_bytes(
         admitted_prompt,
         max_new_tokens,
         geometry,
-        vision_workspace,
+        vision_workspace.checked_add(graph_workspace)?,
         mtp_plan.draft_tokens().unwrap_or(0),
         EAGER_ATTN_QUERY_CHUNK_SIZE,
     )
@@ -2178,6 +2192,7 @@ impl TextLlm for LlamaProvider {
             admitted_prompt,
             req.max_new_tokens,
             vision_workspace,
+            cuda_graphs_enabled(),
         )
         .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
         let available = request_available_memory(self.model.device())?;
@@ -4056,6 +4071,37 @@ mod tests {
         );
     }
 
+    /// E6 (sc-24134): with the CUDA-graph runner switched on, an MTP request is priced for every
+    /// graph the runner may capture — exactly [`graph_workspace_admission_bytes`] over the step
+    /// geometry, the request's reach (`prompt + budget + K`) and the `K + 1` step token counts —
+    /// and a request that does not run the engine (MTP off) is priced as before.
+    #[test]
+    fn admission_includes_the_cuda_graph_workspace_when_the_runner_is_on() {
+        use core_llm::{MtpCapabilities, MtpMode};
+
+        let (_cfg, model) = crate::models::qwen35::tests::text_model();
+        let decoder = Decoder::Qwen35(model);
+        let advertised = Some(MtpCapabilities {
+            max_draft_tokens: 8,
+            recommended_draft_tokens: 3,
+        });
+        let (prompt, budget, k) = (11usize, 21u32, 3u32);
+        let off = core_llm::resolve_mtp_plan(MtpMode::Off, advertised);
+        let on = core_llm::resolve_mtp_plan(MtpMode::Enabled { draft_tokens: k }, advertised);
+        let price = |plan, graphs| {
+            super::priced_request_bytes(&decoder, plan, prompt, budget, 0, graphs).unwrap()
+        };
+        let graph_term = crate::decode::graph_workspace_admission_bytes(
+            &decoder.step_memory_geometry(),
+            (prompt as u64) + u64::from(budget) + u64::from(k),
+            k + 1,
+        )
+        .unwrap();
+        assert!(graph_term > 0);
+        assert_eq!(price(on, true) - price(on, false), graph_term);
+        assert_eq!(price(off, true), price(off, false));
+    }
+
     #[test]
     fn mtp_admission_prices_the_step_cache_checkpoints_and_the_verify_overshoot() {
         use crate::models::qwen35::{REFERENCE_MAX_CHECKPOINTS, STEP_MAX_CHECKPOINTS};
@@ -4074,7 +4120,8 @@ mod tests {
         let on = core_llm::resolve_mtp_plan(MtpMode::Enabled { draft_tokens: k }, advertised);
         assert_eq!(off, MtpPlan::Off);
         assert_eq!(on, MtpPlan::Mtp { draft_tokens: k });
-        let price = |plan| super::priced_request_bytes(&decoder, plan, prompt, budget, 0).unwrap();
+        let price =
+            |plan| super::priced_request_bytes(&decoder, plan, prompt, budget, 0, false).unwrap();
         let (off_bytes, on_bytes) = (price(off), price(on));
 
         // The same request priced on the reference geometry with the width set: what admission
