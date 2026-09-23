@@ -38,6 +38,8 @@ pub use decode_cache::{tensor_bytes, CacheMemory, DecodeCache};
 pub use fused::{
     fused_kernels_enabled, fused_tally, set_fused_kernels, FusedTally, FUSED_KERNELS_ENV,
 };
+#[doc(hidden)]
+pub use fused::{fused_policy_guard, FusedPolicyGuard};
 pub use gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
 };

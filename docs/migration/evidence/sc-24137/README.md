@@ -7,6 +7,18 @@ Write-once evidence for story sc-24137 (epic sc-24128, S9). Hardware: **RTX Pro 
 `--release --features cuda`, `CUDA_COMPUTE_CAP=120`, MSVC 14.44, source `297e0845c` (clean tree,
 verified by the harness).
 
+**Later changes, not in the sealed runs.** The Prism packed-operator refactor onto the nvrtc seam
+(`aec2d2264`) landed after these runs and is covered by
+`cuda_packed_operator_oracles_compile_and_execute_nvrtc`. The review fix pass after it (per-device
+resolved function table for the fused kernels, per-key `OnceLock` slots and name-to-source binding
+in the seam, the NVFP4 quantizer moved onto the seam, the fused-policy test lock) is covered by the
+in-process parity tests rather than a new sealed run:
+`fused_primitives::cuda::fused_on_and_off_are_bit_identical_and_both_visible` and the
+`fused_decode::cuda_tests` reference parity tests, all green in
+`cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels --features cuda` on GPU 1
+(RTX PRO 6000 / sm_120, CUDA 12.9), with the `fused_primitives` binary looped 200× and
+`primitives::fused::` 1000× at the default thread count, 0 failures.
+
 Files:
 
 - [`decode-bench/comparison.md`](decode-bench/comparison.md) — the decode bench (sc-24129 harness,

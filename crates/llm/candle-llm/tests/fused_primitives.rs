@@ -16,8 +16,8 @@
 
 use candle_core::{DType, Device, Tensor};
 use candle_llm::primitives::{
-    apply_rope, fused_kernels_enabled, fused_tally, rms_norm, rms_norm_reference,
-    rms_norm_residual, rms_norm_rope, set_fused_kernels, silu, swiglu, FusedTally,
+    apply_rope, fused_kernels_enabled, fused_policy_guard, fused_tally, rms_norm,
+    rms_norm_reference, rms_norm_residual, rms_norm_rope, silu, swiglu, FusedTally,
 };
 
 fn ramp(n: usize, seed: u64, scale: f32) -> Vec<f32> {
@@ -165,7 +165,9 @@ const LEAVES: u64 = 6;
 #[test]
 fn a_cpu_tensor_takes_the_reference_path_and_says_why() {
     let dev = Device::Cpu;
-    set_fused_kernels(None);
+    // Holds the process-wide switch lock: a parallel test flipping it off would turn the expected
+    // `not_cuda` into `disabled`.
+    let _policy = fused_policy_guard(None);
     let start = fused_tally();
     let got = run_all(&dev, DType::F32, EPS);
     let tally = tally_since(&start);
@@ -185,7 +187,7 @@ fn a_cpu_tensor_takes_the_reference_path_and_says_why() {
 
 #[test]
 fn switching_the_fused_path_off_is_recorded_as_disabled() {
-    set_fused_kernels(Some(false));
+    let _policy = fused_policy_guard(Some(false));
     assert!(!fused_kernels_enabled());
     let start = fused_tally();
     let _ = rms_norm(
@@ -195,7 +197,6 @@ fn switching_the_fused_path_off_is_recorded_as_disabled() {
     )
     .unwrap();
     let tally = tally_since(&start);
-    set_fused_kernels(None);
     assert_eq!(tally.reference, 1);
     // Off beats "not cuda": the switch is checked first, so the reason names the switch on a CUDA
     // build and the build on a CPU one.
@@ -210,6 +211,7 @@ fn switching_the_fused_path_off_is_recorded_as_disabled() {
 #[cfg(feature = "cuda")]
 mod cuda {
     use super::*;
+    use candle_llm::primitives::set_fused_kernels;
 
     fn device() -> Option<Device> {
         Device::new_cuda(0).ok()
@@ -218,6 +220,7 @@ mod cuda {
     #[test]
     fn fused_on_and_off_are_bit_identical_and_both_visible() {
         let Some(dev) = device() else { return };
+        let _policy = fused_policy_guard(None);
         for dtype in [DType::F32, DType::BF16] {
             set_fused_kernels(Some(true));
             let start = fused_tally();
@@ -231,7 +234,6 @@ mod cuda {
             let start = fused_tally();
             let off = run_all(&dev, dtype, EPS);
             let t_off = tally_since(&start);
-            set_fused_kernels(None);
             assert_eq!(t_off.fused, 0, "{dtype:?}: {t_off:?}");
             assert_eq!(t_off.reference, LEAVES, "{dtype:?}: {t_off:?}");
             assert_eq!(t_off.reference_reason, Some("disabled"));
@@ -248,13 +250,12 @@ mod cuda {
     #[test]
     fn an_unserved_dtype_runs_the_reference_visibly() {
         let Some(dev) = device() else { return };
-        set_fused_kernels(Some(true));
+        let _policy = fused_policy_guard(Some(true));
         let x = tensor(&[1, 3, 512], 1, 3.0, DType::F16, &dev);
         let w = tensor(&[512], 2, 1.5, DType::F16, &dev);
         let start = fused_tally();
         let got = rms_norm(&x, &w, EPS).unwrap();
         let tally = tally_since(&start);
-        set_fused_kernels(None);
         assert_eq!(tally.fused, 0);
         assert_eq!(tally.reference, 1);
         assert_eq!(tally.reference_reason, Some("dtype"));
@@ -268,7 +269,7 @@ mod cuda {
     #[test]
     fn a_shape_the_kernel_refuses_runs_the_reference_visibly() {
         let Some(dev) = device() else { return };
-        set_fused_kernels(Some(true));
+        let _policy = fused_policy_guard(Some(true));
         // A head wider than the fused RoPE kernel's staging buffer.
         let q = tensor(&[1, 2, 1, 2048], 1, 3.0, DType::BF16, &dev);
         let w = tensor(&[2048], 2, 1.5, DType::BF16, &dev);
@@ -278,7 +279,6 @@ mod cuda {
         let start = fused_tally();
         let got = rms_norm_rope(&q, &w, EPS, &cos, &sin, false).unwrap();
         let tally = tally_since(&start);
-        set_fused_kernels(None);
         assert_eq!(tally.fused, 0);
         assert_eq!(tally.reference, 1);
         assert_eq!(tally.reference_reason, Some("head_dim_too_large"));
@@ -353,6 +353,7 @@ mod cuda {
         };
         config.sampling.temperature = 0.0;
 
+        let _policy = fused_policy_guard(None);
         let decode = |enabled: bool| -> (Vec<i32>, FusedTally) {
             set_fused_kernels(Some(enabled));
             let start = fused_tally();
@@ -374,7 +375,6 @@ mod cuda {
             .expect("generate");
             dev.synchronize().unwrap();
             let tally = fused_tally().since(&start);
-            set_fused_kernels(None);
             (out.tokens, tally)
         };
 

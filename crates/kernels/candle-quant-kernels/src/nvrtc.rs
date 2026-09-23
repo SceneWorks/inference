@@ -2,8 +2,9 @@
 //!
 //! Every runtime-compiled CUDA kernel in the workspace goes through one mechanism: a
 //! [`KernelSource`] names an `include_str!`'d `.cu` source and the compute-capability floor it
-//! needs, and [`KernelSource::compiled`] turns it into a loaded module for one device. There is no
-//! `build.rs` and no `nvcc` step — nvrtc JITs the source for the live device at first use.
+//! needs, and `KernelSource::compiled` (cuda builds) turns it into a loaded module for one
+//! device. There is no `build.rs` and no `nvcc` step — nvrtc JITs the source for the live device
+//! at first use.
 //!
 //! The cache is **per device, per kernel** (keyed by the CUDA device ordinal and the kernel name)
 //! and it stores the *outcome*: a successful compile is held for the life of the process, and a
@@ -11,6 +12,17 @@
 //! typed [`KernelCompileError`] on every later call without recompiling (epic E3). The fused
 //! decode primitives fall back to their op-chain reference on that error, and the error is what
 //! their telemetry reports as the reason.
+//!
+//! The process-wide map lock only guards slot lookup: each key owns a `OnceLock` slot, so nvrtc
+//! and the module load run outside the map lock (other kernels and other devices are never held
+//! up by a compile), while callers racing on the *same* key still block on its slot and nvrtc
+//! runs once.
+//!
+//! A name is bound to its source text on first use: a second, *different* source reusing a name
+//! is a programming error and panics on use (naming both), rather than silently being served the
+//! first source's module. (Text, not address: a `const` descriptor's `&'static str` is not
+//! guaranteed one address across codegen units, so the check compares contents when the
+//! addresses differ.)
 //!
 //! Compilation targets the device's own architecture (`--gpu-architecture=compute_XY`, the
 //! highest known virtual architecture at or below the device's capability), so PTX instructions
@@ -26,7 +38,8 @@ use std::fmt;
 /// cache key, unique per source) and the compute-capability floor the code needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KernelSource {
-    /// Cache key and diagnostic name; unique per distinct source in the process.
+    /// Cache key and diagnostic name; must be unique per distinct source in the process (a reuse
+    /// with different text panics on use).
     pub name: &'static str,
     /// The CUDA C++ source, compiled as-is (no include paths: sources use only builtins).
     pub src: &'static str,
@@ -214,10 +227,13 @@ mod cuda_impl {
 
     type Key = (usize, &'static str);
     type Outcome = Result<Arc<CompiledKernel>, KernelCompileError>;
+    /// One key's outcome, initialised (compiled) outside the map lock.
+    type Slot = Arc<OnceLock<Outcome>>;
 
     #[derive(Default)]
     struct Cache {
-        outcomes: HashMap<Key, Outcome>,
+        /// Each key's slot and the source text it was first requested with.
+        slots: HashMap<Key, (&'static str, Slot)>,
         attempts: HashMap<Key, u64>,
     }
 
@@ -254,16 +270,36 @@ mod cuda_impl {
         /// The compiled module for `dev`: compiled and loaded on the first call per device,
         /// served from the cache after that — **including a failure**, which is returned as the
         /// same [`KernelCompileError`] without touching nvrtc again.
+        ///
+        /// Only the slot lookup holds the process-wide lock; the compile itself runs under this
+        /// key's own `OnceLock`, so concurrent callers of the same key wait for the one compile and
+        /// everything else proceeds.
         pub fn compiled(&self, dev: &CudaDevice) -> Outcome {
             let key = self.key(dev);
-            let mut guard = lock();
-            if let Some(outcome) = guard.outcomes.get(&key) {
-                return outcome.clone();
-            }
-            *guard.attempts.entry(key).or_insert(0) += 1;
-            let outcome = self.compile_uncached(dev, key.0);
-            guard.outcomes.insert(key, outcome.clone());
-            outcome
+            let (bound, slot) = {
+                let mut guard = lock();
+                let (bound, slot) = guard
+                    .slots
+                    .entry(key)
+                    .or_insert_with(|| (self.src, Slot::default()));
+                (*bound, slot.clone())
+            };
+            self.assert_same_source(bound);
+            slot.get_or_init(|| {
+                *lock().attempts.entry(key).or_insert(0) += 1;
+                self.compile_uncached(dev, key.0)
+            })
+            .clone()
+        }
+
+        /// Panics if `bound` (the text this name was first compiled from) is a different source.
+        fn assert_same_source(&self, bound: &'static str) {
+            assert!(
+                std::ptr::eq(bound, self.src) || bound == self.src,
+                "nvrtc seam: kernel name `{name}` is already bound to a different source; \
+                 every KernelSource needs a unique name",
+                name = self.name
+            );
         }
 
         fn compile_uncached(&self, dev: &CudaDevice, ordinal: usize) -> Outcome {
@@ -310,7 +346,9 @@ mod cuda_impl {
 
         /// The cached outcome for `dev` if there is one, without compiling.
         pub fn cached(&self, dev: &CudaDevice) -> Option<Outcome> {
-            lock().outcomes.get(&self.key(dev)).cloned()
+            let (bound, slot) = lock().slots.get(&self.key(dev)).cloned()?;
+            self.assert_same_source(bound);
+            slot.get().cloned()
         }
     }
 }
@@ -431,6 +469,88 @@ mod cuda_tests {
             BROKEN.cached(&dev).and_then(|outcome| outcome.err()),
             Some(first)
         );
+    }
+
+    const NAMESAKE_A: KernelSource = KernelSource {
+        name: "sc24137_seam_test_namesake",
+        src: "extern \"C\" __global__ void a(float* out) { out[0] = 1.0f; }",
+        cc_floor: (7, 0),
+    };
+
+    /// Same name as [`NAMESAKE_A`], different text and a different symbol.
+    const NAMESAKE_B: KernelSource = KernelSource {
+        name: "sc24137_seam_test_namesake",
+        src: "extern \"C\" __global__ void b(float* out) { out[0] = 2.0f; }",
+        cc_floor: (7, 0),
+    };
+
+    #[test]
+    fn a_second_source_reusing_a_name_is_refused_not_served_the_first_module() {
+        let Some(dev) = device() else { return };
+        let a = NAMESAKE_A.compiled(&dev).expect("A compiles");
+        a.function("a").expect("A's own symbol");
+        // Without the check this hands back A's module (which has no symbol `b`).
+        let refused =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| NAMESAKE_B.compiled(&dev)))
+                .expect_err("a different source under a bound name must not be served");
+        let message = refused
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            message.contains("sc24137_seam_test_namesake")
+                && message.contains("already bound to a different source"),
+            "{message}"
+        );
+        // The first source is unaffected.
+        assert!(Arc::ptr_eq(&a, &NAMESAKE_A.compiled(&dev).unwrap()));
+        assert_eq!(NAMESAKE_A.compile_attempts(&dev), 1);
+    }
+
+    const PER_DEVICE: KernelSource = KernelSource {
+        name: "sc24137_seam_test_per_device",
+        src: "extern \"C\" __global__ void one(float* out) { out[0] = 1.0f; }",
+        cc_floor: (7, 0),
+    };
+
+    /// Two real ordinals get two modules, each compiled once. Skips unless a second device is
+    /// visible (`CUDA_VISIBLE_DEVICES` restricted to one GPU hides ordinal 1).
+    #[test]
+    fn each_ordinal_gets_its_own_module_compiled_once() {
+        let (Some(dev0), Ok(Device::Cuda(dev1))) = (device(), Device::new_cuda(1)) else {
+            eprintln!("skipping: no second CUDA device");
+            return;
+        };
+        let m0 = PER_DEVICE.compiled(&dev0).expect("ordinal 0");
+        let m1 = PER_DEVICE.compiled(&dev1).expect("ordinal 1");
+        assert!(!Arc::ptr_eq(&m0, &m1), "one module per ordinal");
+        assert_eq!(m0.ordinal(), 0);
+        assert_eq!(m1.ordinal(), 1);
+        assert!(Arc::ptr_eq(&m0, &PER_DEVICE.compiled(&dev0).unwrap()));
+        assert!(Arc::ptr_eq(&m1, &PER_DEVICE.compiled(&dev1).unwrap()));
+        assert_eq!(PER_DEVICE.compile_attempts(&dev0), 1);
+        assert_eq!(PER_DEVICE.compile_attempts(&dev1), 1);
+    }
+
+    const RACED: KernelSource = KernelSource {
+        name: "sc24137_seam_test_raced",
+        src: "extern \"C\" __global__ void raced(float* out) { out[0] = 2.0f; }",
+        cc_floor: (7, 0),
+    };
+
+    /// Callers racing on one key share one compile (the per-key slot, not the map lock, is what
+    /// serialises them).
+    #[test]
+    fn racing_callers_share_one_compile() {
+        let Some(dev) = device() else { return };
+        let modules: Vec<_> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| s.spawn(|| RACED.compiled(&dev).expect("compiles")))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(modules.iter().all(|m| Arc::ptr_eq(m, &modules[0])));
+        assert_eq!(RACED.compile_attempts(&dev), 1);
     }
 
     #[test]

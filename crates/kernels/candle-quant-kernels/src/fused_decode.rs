@@ -12,6 +12,17 @@
 //! test asserts is exactly what the GPU refuses. Unsupported input is never coerced: the caller
 //! routes it to the reference chain and reports the refusal.
 //!
+//! **Toolkit dependency.** bf16 SwiGLU is bit-identical to candle's `usilu_bf16` because the kernel
+//! replicates CUDA 12.9's `cuda_bf16.hpp` `hexp` / `__hdiv` (`ex2.approx` and `div.approx` with the
+//! 2^126 guard). A toolkit that changes those definitions changes candle's reference, not this
+//! kernel, and nothing fails to compile — the GPU parity tests
+//! (`cuda_tests::swiglu_matches_reference_on_qwen35_and_edge_shapes` here and `candle-llm`'s
+//! `fused_primitives::cuda::fused_on_and_off_are_bit_identical_and_both_visible`) are the guard;
+//! re-run them on any CUDA toolkit bump.
+//!
+//! The six entry points (three kernels × f32/bf16) are resolved once per device into a table, so a
+//! leaf launch does one map lookup — no symbol formatting and no `cuModuleGetFunction`.
+//!
 //! Only the launch functions (`rms_norm`, `rms_norm_residual`, `swiglu`, `rms_norm_rope`) are
 //! `cuda`-only.
 
@@ -298,6 +309,8 @@ mod cuda_impl {
     use candle_core::op::BackpropOp;
     use candle_core::{CudaDevice, CudaStorage, Device, Shape, Storage};
     use cudarc::driver::{CudaFunction, CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg};
+    use std::collections::HashMap;
+    use std::sync::{OnceLock, RwLock};
 
     fn drv(e: cudarc::driver::DriverError) -> FusedError {
         FusedError::Candle(candle_core::Error::Cuda(
@@ -312,15 +325,95 @@ mod cuda_impl {
         }
     }
 
-    fn function(dev: &CudaDevice, base: &str, dtype: DType) -> Result<CudaFunction, FusedError> {
-        let suffix = match dtype {
-            DType::F32 => "f32",
-            DType::BF16 => "bf16",
+    /// The three fused entry points; indexes [`FusedFunctions`].
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Kernel {
+        RmsNormResidual = 0,
+        Swiglu = 1,
+        RmsNormRope = 2,
+    }
+
+    impl Kernel {
+        const ALL: [Kernel; 3] = [Kernel::RmsNormResidual, Kernel::Swiglu, Kernel::RmsNormRope];
+
+        pub(super) fn symbol(self, dtype: DType) -> &'static str {
+            match (self, dtype) {
+                (Kernel::RmsNormResidual, DType::F32) => "rms_norm_residual_f32",
+                (Kernel::RmsNormResidual, _) => "rms_norm_residual_bf16",
+                (Kernel::Swiglu, DType::F32) => "swiglu_f32",
+                (Kernel::Swiglu, _) => "swiglu_bf16",
+                (Kernel::RmsNormRope, DType::F32) => "rms_norm_rope_f32",
+                (Kernel::RmsNormRope, _) => "rms_norm_rope_bf16",
+            }
+        }
+    }
+
+    /// Every fused entry point of one device's module, resolved once (`cuModuleGetFunction` and
+    /// the symbol names stay off the per-leaf launch path).
+    pub(super) struct FusedFunctions {
+        f32: [CudaFunction; 3],
+        bf16: [CudaFunction; 3],
+    }
+
+    impl FusedFunctions {
+        fn resolve(dev: &CudaDevice) -> Result<Self, KernelCompileError> {
+            let module = FUSED_DECODE_SRC.compiled(dev)?;
+            let load = |dtype: DType| -> Result<[CudaFunction; 3], KernelCompileError> {
+                let [a, b, c] = Kernel::ALL;
+                Ok([
+                    module.function(a.symbol(dtype))?,
+                    module.function(b.symbol(dtype))?,
+                    module.function(c.symbol(dtype))?,
+                ])
+            };
+            Ok(Self {
+                f32: load(DType::F32)?,
+                bf16: load(DType::BF16)?,
+            })
+        }
+    }
+
+    /// Per-ordinal resolved function tables. Only successes are held here (leaked once per device
+    /// for the life of the process); a compile failure stays cached in the nvrtc seam and is
+    /// re-read from there.
+    fn tables() -> &'static RwLock<HashMap<usize, &'static FusedFunctions>> {
+        static TABLES: OnceLock<RwLock<HashMap<usize, &'static FusedFunctions>>> = OnceLock::new();
+        TABLES.get_or_init(Default::default)
+    }
+
+    pub(super) fn functions(dev: &CudaDevice) -> Result<&'static FusedFunctions, FusedError> {
+        let ordinal = dev.cuda_stream().context().ordinal();
+        if let Some(table) = tables()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&ordinal)
+        {
+            return Ok(table);
+        }
+        let resolved = FusedFunctions::resolve(dev)?;
+        let mut tables = tables()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(*tables
+            .entry(ordinal)
+            .or_insert_with(|| Box::leak(Box::new(resolved))))
+    }
+
+    fn function(
+        dev: &CudaDevice,
+        kernel: Kernel,
+        dtype: DType,
+    ) -> Result<&'static CudaFunction, FusedError> {
+        let table = match dtype {
+            DType::F32 | DType::BF16 => functions(dev)?,
             other => return Err(FusedRefusal::Dtype(other).into()),
         };
-        Ok(FUSED_DECODE_SRC
-            .compiled(dev)?
-            .function(&format!("{base}_{suffix}"))?)
+        let row = if dtype == DType::F32 {
+            &table.f32
+        } else {
+            &table.bf16
+        };
+        Ok(&row[kernel as usize])
     }
 
     fn wrap<T: CudaDType>(slice: CudaSlice<T>, dev: &CudaDevice, shape: Shape) -> Tensor {
@@ -410,12 +503,12 @@ mod cuda_impl {
     pub fn rms_norm(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor, FusedError> {
         let plan = check_rms_norm(x, None, w)?;
         let dev = cuda_device(x)?;
-        let func = function(dev, "rms_norm_residual", plan.dtype)?;
+        let func = function(dev, Kernel::RmsNormResidual, plan.dtype)?;
         let x = x.contiguous()?;
         let w = w.contiguous()?;
         let (_, y) = match plan.dtype {
-            DType::F32 => rms_norm_launch::<f32>(dev, &func, &x, None, &w, plan, eps)?,
-            _ => rms_norm_launch::<half::bf16>(dev, &func, &x, None, &w, plan, eps)?,
+            DType::F32 => rms_norm_launch::<f32>(dev, func, &x, None, &w, plan, eps)?,
+            _ => rms_norm_launch::<half::bf16>(dev, func, &x, None, &w, plan, eps)?,
         };
         Ok(y)
     }
@@ -430,13 +523,13 @@ mod cuda_impl {
     ) -> Result<(Tensor, Tensor), FusedError> {
         let plan = check_rms_norm(x, Some(residual), w)?;
         let dev = cuda_device(x)?;
-        let func = function(dev, "rms_norm_residual", plan.dtype)?;
+        let func = function(dev, Kernel::RmsNormResidual, plan.dtype)?;
         let x = x.contiguous()?;
         let r = residual.contiguous()?;
         let w = w.contiguous()?;
         let (h, y) = match plan.dtype {
-            DType::F32 => rms_norm_launch::<f32>(dev, &func, &x, Some(&r), &w, plan, eps)?,
-            _ => rms_norm_launch::<half::bf16>(dev, &func, &x, Some(&r), &w, plan, eps)?,
+            DType::F32 => rms_norm_launch::<f32>(dev, func, &x, Some(&r), &w, plan, eps)?,
+            _ => rms_norm_launch::<half::bf16>(dev, func, &x, Some(&r), &w, plan, eps)?,
         };
         Ok((h.expect("residual launch returns h"), y))
     }
@@ -469,12 +562,12 @@ mod cuda_impl {
     pub fn swiglu(gate: &Tensor, up: &Tensor) -> Result<Tensor, FusedError> {
         let n = check_swiglu(gate, up)?;
         let dev = cuda_device(gate)?;
-        let func = function(dev, "swiglu", gate.dtype())?;
+        let func = function(dev, Kernel::Swiglu, gate.dtype())?;
         let gate = gate.contiguous()?;
         let up = up.contiguous()?;
         match gate.dtype() {
-            DType::F32 => swiglu_launch::<f32>(dev, &func, &gate, &up, n),
-            _ => swiglu_launch::<half::bf16>(dev, &func, &gate, &up, n),
+            DType::F32 => swiglu_launch::<f32>(dev, func, &gate, &up, n),
+            _ => swiglu_launch::<half::bf16>(dev, func, &gate, &up, n),
         }
     }
 
@@ -539,16 +632,14 @@ mod cuda_impl {
     ) -> Result<Tensor, FusedError> {
         let plan = check_rms_norm_rope(x, w, cos, sin)?;
         let dev = cuda_device(x)?;
-        let func = function(dev, "rms_norm_rope", plan.dtype)?;
+        let func = function(dev, Kernel::RmsNormRope, plan.dtype)?;
         let x = x.contiguous()?;
         let w = w.contiguous()?;
         let cos = cos.contiguous()?;
         let sin = sin.contiguous()?;
         match plan.dtype {
-            DType::F32 => {
-                rope_launch::<f32>(dev, &func, &x, &w, &cos, &sin, plan, interleaved, eps)
-            }
-            _ => rope_launch::<half::bf16>(dev, &func, &x, &w, &cos, &sin, plan, interleaved, eps),
+            DType::F32 => rope_launch::<f32>(dev, func, &x, &w, &cos, &sin, plan, interleaved, eps),
+            _ => rope_launch::<half::bf16>(dev, func, &x, &w, &cos, &sin, plan, interleaved, eps),
         }
     }
 }
@@ -729,6 +820,29 @@ mod cuda_tests {
 
     fn device() -> Option<Device> {
         Device::new_cuda(0).ok()
+    }
+
+    /// The entry points are resolved once per device: a second lookup (and a second `CudaDevice`
+    /// handle for the same ordinal) returns the same table, and each slot is the symbol it names.
+    #[test]
+    fn entry_points_are_resolved_once_per_device() {
+        use super::cuda_impl::{functions, Kernel};
+        let (Some(Device::Cuda(dev)), Some(Device::Cuda(again))) = (device(), device()) else {
+            return;
+        };
+        let first = functions(&dev).expect("resolves");
+        assert!(std::ptr::eq(first, functions(&dev).unwrap()));
+        assert!(std::ptr::eq(first, functions(&again).unwrap()));
+        assert_eq!(FUSED_DECODE_SRC.compile_attempts(&dev), 1);
+        assert_eq!(
+            Kernel::RmsNormResidual.symbol(DType::F32),
+            "rms_norm_residual_f32"
+        );
+        assert_eq!(Kernel::Swiglu.symbol(DType::BF16), "swiglu_bf16");
+        assert_eq!(
+            Kernel::RmsNormRope.symbol(DType::BF16),
+            "rms_norm_rope_bf16"
+        );
     }
 
     fn ramp(n: usize, seed: u64, scale: f32) -> Vec<f32> {

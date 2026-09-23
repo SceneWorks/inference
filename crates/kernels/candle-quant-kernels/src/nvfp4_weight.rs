@@ -526,6 +526,28 @@ mod tests {
         Ok(())
     }
 
+    /// The fused NVFP4 quantizer compiles through the shared nvrtc seam (sc-24137): a fresh
+    /// `CublasLt` handle resolves its functions from the process-wide module, so nvrtc runs once
+    /// per device however many handles probe it.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_fused_quantizer_compiles_once_per_device_through_the_seam() {
+        let Some((device, _ctx)) = nvfp4_device() else {
+            eprintln!("skipping: no sm_120 CUDA device");
+            return;
+        };
+        let Device::Cuda(cuda) = &device else {
+            unreachable!()
+        };
+        let src = crate::cublaslt::NVFP4_QUANT_SRC;
+        for _ in 0..3 {
+            let lt = crate::CublasLt::new(&device).expect("handle");
+            assert!(lt.nvfp4_fused_quantizer_available());
+        }
+        assert!(matches!(src.cached(cuda), Some(Ok(_))), "the seam holds it");
+        assert_eq!(src.compile_attempts(cuda), 1, "nvrtc ran once");
+    }
+
     /// For `K` not a multiple of 32 the device pads `K` to 32 while the CPU packer pads only to 16,
     /// so parity is against the packer run on the input zero-padded to 32 (here 80 → 96 columns;
     /// 96 rows is below one 128-row scale atom).
