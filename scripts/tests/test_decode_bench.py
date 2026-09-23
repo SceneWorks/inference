@@ -457,7 +457,9 @@ class DecodeBenchWrapperTests(unittest.TestCase):
         self.assertNotIn("generate_speculative_with", before_stub)
         self.assertNotIn("MtpProposer", before_stub)
         self.assertIn('unreachable!("the ngram row is not available on the pre-epic baseline")', rewritten)
-        self.assertIn("(out, stats, prefill_secs, decode_secs, None, None)", rewritten)
+        self.assertIn('(out, stats, prefill_secs, decode_secs, None, None, "mtp")', rewritten)
+        self.assertIn("fn replay_forwards(_stats: &SpeculativeStats) -> Option<u64> {", rewritten)
+        self.assertNotIn("Some(stats.replays as u64)", rewritten)
         self.assertNotIn("set_attn_formulation", before_stub)
         self.assertNotIn("attn_formulation()", before_stub)
         # Everything outside the block is untouched, so the two binaries measure the same rows.

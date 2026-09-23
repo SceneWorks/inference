@@ -29,11 +29,21 @@ Story S2 of epic sc-24128. Host: Windows 11, **RTX Pro 6000 / sm_120** (GPU 0), 
   answers the typed `RollbackUnavailable`, so it rolls back to the step start and replays the kept
   prefix — the same forwards as the old clone-restore loop, so the acceptance statistics are
   unchanged (the tiny-config test ran both loops side by side before the old one was deleted:
-  tokens / proposed / accepted / forwards identical for K = 1..5, greedy and stochastic). S3's
-  per-token checkpoints will make the first call succeed with no change here.
+  tokens / proposed / accepted / forwards identical for K = 1..5, greedy and stochastic; the
+  real-weight identical-prefix comparison is below). S3's per-token checkpoints will make the
+  first call succeed with no change here.
 * **Telemetry (E2)**: `DecodeRecord.proposer` (`none` / `mtp` / `ngram` / `draft`),
-  `verify_steps`, `verify_host_syncs`, `host_syncs_per_verify_step()`; the bench reports
-  `proposer` and `syncs/verify` per row.
+  `verify_steps`, `verify_host_syncs`, `host_syncs_per_verify_step()`, and
+  `replay_forwards` (`SpeculativeStats.replays`: the `RollbackUnavailable` → replay fallbacks,
+  one per rejected verify step on the S1 cache, `0` on a cache with per-position rollback — the
+  engine test pins both); the bench reports `proposer` (from the record, not the row name),
+  `syncs/verify` and `replay_forwards` per row.
+* **The stream contract (E7)**: the engine checks the cancel flag right after the verify forward,
+  as the old loop did, and rolls the cache back to the step start before returning `Cancelled`;
+  every early exit of the commit loop (stop token, caller stop, cancel, budget) settles the cache
+  so it never holds a position the committed history does not. Device-resident greedy drafts
+  cannot stop at a stop token while drafting, so the verify decision truncates them at the first
+  stop token: nothing past an accepted stop token is counted as proposed or accepted.
 
 ## The token-107 knife-edge: root cause
 
@@ -111,7 +121,14 @@ cause above).
   `< 1` as before.
 * **AC2**: every engine row reports exactly **1.00** host syncs per verify step (the old loop: 1.64
   → 3.21 syncs per generated token at K=1..5 on S1's head, i.e. `K+1` per verify step). Per token the
-  engine issues 0.55 → 0.30 syncs at K=1..5.
+  engine issues 0.55 → 0.30 syncs at K=1..5. The 1.00 is the **plain-greedy** figure (the bench
+  rows and every provider request without penalties, a constraint or sampling): with a repetition
+  penalty or a constraint the drafts are sampled on the host, one whole-vocab transfer each, and
+  the verify decision pulls the `K+1` rows in one copy — `K+1` syncs per verify step, the old
+  loop's figure on every path; a stochastic run adds a shaped-distribution copy per draft,
+  `2K+1`. Both are pinned by the tiny-config tests
+  (`penalized_and_constrained_verify_steps_cost_one_sync_per_draft_plus_one`,
+  `stochastic_runs_are_seed_deterministic_and_bounded`).
 * **AC3**: `tests/qwen38_mtp.rs::frozen_qwen38_provider_executes_ar_mtp_tools_and_stops` (frozen
   tokenizer, CPU) — the same checkpoint without an MTP head advertises no MTP; `MtpMode::Auto`
   decodes normally with `proposer=none` (`DecodePath::Reference`), `Enabled` is refused

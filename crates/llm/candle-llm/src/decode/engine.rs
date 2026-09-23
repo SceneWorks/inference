@@ -26,7 +26,12 @@
 //!    with a cloned cache, so the acceptance statistics are unchanged. Per-token DeltaNet
 //!    checkpoints (S3) make the first call succeed and the replay disappear, with no change here.
 //! 5. **Commit** through the same event path as every other loop (`StreamEvent::Token`, stop
-//!    tokens, constraint advance, caller stop, cancellation, budget — E7).
+//!    tokens, constraint advance, caller stop, cancellation, budget — E7). A cancel observed right
+//!    after the verify forward rolls the cache back to the step start and returns `Cancelled`
+//!    before any token of that step is committed, as the old loop did. Device-resident drafts
+//!    cannot stop at a stop token while drafting, so the decision truncates them at the first stop
+//!    token (the host-sampled proposers stop there themselves): nothing past an accepted stop
+//!    token is counted as proposed or accepted.
 //!
 //! The record names the proposer that ran ([`DecodeRecord::proposer`]) and counts verify steps
 //! and the host syncs spent inside them ([`DecodeRecord::host_syncs_per_verify_step`]); a run with
@@ -529,6 +534,13 @@ pub fn generate_speculative_with<M: StepModel, P: Proposer>(
         )?;
         stats.forwards += 1;
         stats.verify_steps += 1;
+        if cancel.is_cancelled() {
+            // The old loop checked right after the verify forward too (E7): nothing of this step
+            // is committed; the cache goes back to the step start.
+            cache.rollback_to(base)?;
+            finish = FinishReason::Cancelled;
+            break;
+        }
 
         // 3. Decide, on host, from one transfer.
         let (draft_ids, committed, accepted) = decide(
@@ -545,6 +557,10 @@ pub fn generate_speculative_with<M: StepModel, P: Proposer>(
         if let (Some(c), Some(checkpoint)) = (constraint.as_mut(), constraint_checkpoint) {
             c.rewind(checkpoint);
         }
+        // Drafts past a stop token were never a proposal (the decision dropped them); the cache
+        // still holds all `num_drafts + 1` verify positions, so `accepted < num_drafts` below
+        // rolls it back to the kept prefix.
+        stats.proposed -= num_drafts - draft_ids.len();
         stats.accepted += accepted;
 
         // 4. Recover the cache to `[cur, accepted…]`: a direct rollback when the cache can, else
@@ -569,6 +585,7 @@ pub fn generate_speculative_with<M: StepModel, P: Proposer>(
                         StepRequest::last(&replay).with_hidden(wants_hidden),
                     )?;
                     stats.forwards += 1;
+                    stats.replays += 1;
                     replayed.hidden
                 }
                 Err(e) => return Err(e),
@@ -614,6 +631,9 @@ pub fn generate_speculative_with<M: StepModel, P: Proposer>(
             }
             if generated.len() >= config.max_new_tokens {
                 finish = FinishReason::MaxTokens;
+                // A proposer that honours `max_drafts` cannot leave accepted positions unemitted
+                // here (the width is clamped to the budget); one that over-proposes can.
+                settle(cache, base, emitted, accepted)?;
                 break 'outer;
             }
         }
@@ -653,8 +673,9 @@ fn last_row(hidden: Option<&Tensor>) -> Result<Option<Tensor>> {
     }
 }
 
-/// The verify decision from one device->host transfer. Returns the drafts as host ids, the
-/// committed run (accepted drafts + the bonus / correction token) and the accepted count.
+/// The verify decision from one device->host transfer. Returns the drafts as host ids (truncated
+/// after the first stop token among them), the committed run (accepted drafts + the bonus /
+/// correction token) and the accepted count.
 #[allow(clippy::too_many_arguments)]
 fn decide(
     logits: &Tensor,
@@ -700,7 +721,15 @@ fn decide(
                 draft_ids.len()
             )));
         }
-        let (committed, accepted) = greedy_commit(&target_argmax, &draft_ids);
+        // Device drafting cannot see a stop token; nothing past the first one is a proposal.
+        let mut draft_ids = draft_ids;
+        if let Some(stop) = draft_ids
+            .iter()
+            .position(|t| config.stop_tokens.contains(t))
+        {
+            draft_ids.truncate(stop + 1);
+        }
+        let (committed, accepted) = greedy_commit(&target_argmax[..=draft_ids.len()], &draft_ids);
         return Ok((draft_ids, committed, accepted));
     }
 
@@ -1259,8 +1288,13 @@ mod tests {
         }
     }
 
+    // AC2's `1.00` is the plain-greedy figure. With penalties or a constraint the drafts are
+    // sampled on the host — one whole-vocab transfer per draft — and the verify decision pulls
+    // the K + 1 rows in one copy: `K + 1` syncs per verify step (the old loop's figure on every
+    // path); stochastic runs add a shaped-distribution copy per draft (`2K + 1`, pinned in
+    // `stochastic_runs_are_seed_deterministic_and_bounded`).
     #[test]
-    fn penalized_and_constrained_verify_steps_still_cost_one_host_sync() {
+    fn penalized_and_constrained_verify_steps_cost_one_sync_per_draft_plus_one() {
         let (_cfg, model, mtp) = text_model_with_mtp();
         let mut config = greedy(16);
         config.sampling.repetition_penalty = 1.3;
@@ -1275,6 +1309,10 @@ mod tests {
         assert_eq!(
             run.record.verify_host_syncs,
             run.stats.verify_steps as u64 + draft_syncs
+        );
+        assert!(
+            run.record.host_syncs_per_verify_step().unwrap() > 1.0,
+            "the host-shaped path is not the 1.00 figure"
         );
 
         // A constraint: the mask is applied on host rows, still one transfer per verify.
@@ -1419,6 +1457,8 @@ mod tests {
         assert!(run_ngram.stats.accepted > 0);
         assert_eq!(run_ngram.stats.accepted, run_ngram.stats.proposed);
         assert_eq!(run_ngram.stats.forwards, 1 + run_ngram.stats.verify_steps);
+        assert_eq!(run_ngram.stats.replays, 0);
+        assert_eq!(run_ngram.record.replay_forwards, 0);
         // Every step rejects at the first draft: the direct rollback to `start + 1` succeeds, so
         // no replay forward is issued and the output is still the ramp.
         let before = model.forwards.get();
@@ -1427,6 +1467,11 @@ mod tests {
         assert_eq!(run_wrong.output.tokens, vec![2, 3, 4, 5, 6, 0, 1, 2, 3, 4]);
         assert_eq!(run_wrong.stats.accepted, 0);
         assert_eq!(run_wrong.stats.forwards, 1 + run_wrong.stats.verify_steps);
+        assert_eq!(
+            run_wrong.stats.replays, 0,
+            "a direct rollback never replays"
+        );
+        assert_eq!(run_wrong.record.replay_forwards, 0);
         assert_eq!(
             model.forwards.get() - before,
             run_wrong.stats.forwards as u64
@@ -1446,6 +1491,121 @@ mod tests {
             1 + 9 + 8,
             "one replay per rejected verify"
         );
+        // The fallback is visible in telemetry (E2): the stats and the record count each replay.
+        assert_eq!(run_qwen.stats.replays, 8);
+        assert_eq!(run_qwen.record.replay_forwards, 8);
+        assert_eq!(run_qwen.record.target_forwards, 1 + 9 + 8);
+    }
+
+    /// Proposes the ramp continuation after `cur`, `len` drafts wide **regardless of
+    /// `max_drafts`** — a misbehaving proposer whose accepted run can outlive the budget.
+    struct Over {
+        vocab: i32,
+        len: usize,
+    }
+    impl Proposer for Over {
+        fn kind(&self) -> ProposerKind {
+            ProposerKind::Draft
+        }
+        fn warm(&mut self, _: &[i32], _: Option<&Tensor>) -> Result<()> {
+            Ok(())
+        }
+        fn propose(
+            &mut self,
+            ctx: &ProposeContext<'_>,
+            _: &mut DraftSampler<'_, '_>,
+        ) -> Result<Proposal> {
+            Ok(Proposal {
+                drafts: Some(Drafts::Host(
+                    (1..=self.len as i32)
+                        .map(|i| (ctx.cur + i) % self.vocab)
+                        .collect(),
+                )),
+                dists: Vec::new(),
+            })
+        }
+        fn commit(&mut self, _: i32, _: &[i32], _: Option<&Tensor>, _: i32) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn max_tokens_exit_settles_the_cache_when_an_accepted_run_outlives_the_budget() {
+        // Budget 4, width 3: the first token leaves 3, so the step's width is clamped to 2 — but
+        // the proposer answers with 5 drafts, all accepted (6 positions written). The budget is
+        // reached after 3 of them: the exit must roll the cache back so it holds no position the
+        // committed history does not (the same contract as the stop / cancel exits).
+        let model = Ramp {
+            vocab: 7,
+            forwards: Cell::new(0),
+        };
+        let config = greedy(4);
+        let prompt = [0, 1];
+        let mut cache = model
+            .new_cache_for(prompt.len() + config.max_new_tokens, 3)
+            .unwrap();
+        let out = model
+            .forward_step(&mut cache, StepRequest::last(&prompt))
+            .unwrap();
+        let mut over = Over { vocab: 7, len: 5 };
+        let run = generate_speculative(
+            &model,
+            &mut over,
+            SpeculativePrompt::Prefilled {
+                cache: &mut cache,
+                logits: out.logits,
+                hidden: None,
+                history: &prompt,
+                position_delta: 0,
+                warm_proposer: false,
+            },
+            &config,
+            3,
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+        )
+        .unwrap();
+        assert_eq!(run.output.tokens, vec![2, 3, 4, 5]);
+        assert_eq!(run.output.finish_reason, FinishReason::MaxTokens);
+        assert_eq!(run.stats.proposed, 5);
+        assert_eq!(run.stats.accepted, 5);
+        assert!(
+            cache.len() as usize <= prompt.len() + run.output.tokens.len(),
+            "cache {} holds positions past the {} committed",
+            cache.len(),
+            prompt.len() + run.output.tokens.len()
+        );
+    }
+
+    #[test]
+    fn device_greedy_drafts_stop_counting_at_an_accepted_stop_token() {
+        // A draft model on the plain-greedy path drafts on the device and cannot see a stop
+        // token: it proposes [3, 4, 5] after 2 with 4 the stop token. The decision must truncate
+        // the run at the stop token — 5 is neither proposed nor accepted, although the target
+        // would have accepted it — and the run ends at the stop with the drafts before it.
+        let model = Ramp {
+            vocab: 7,
+            forwards: Cell::new(0),
+        };
+        let mut config = greedy(10);
+        config.stop_tokens = vec![4];
+        let prompt = [0, 1];
+        let mut proposer = DraftModelProposer::new(&model, prompt.len() + config.max_new_tokens, 3);
+        let run = run(&model, &mut proposer, &prompt, &config, 3);
+        assert_eq!(run.output.tokens, vec![2, 3]);
+        assert_eq!(run.output.finish_reason, FinishReason::StopToken);
+        assert_eq!(run.record.proposer, ProposerKind::Draft);
+        // Drafts up to and including the stop token: 3 and 4.
+        assert_eq!(
+            run.stats.proposed, 2,
+            "the draft past the stop token is not a proposal"
+        );
+        assert_eq!(
+            run.stats.accepted, 2,
+            "accepted must not exceed the drafts up to the stop token"
+        );
+        assert_eq!(run.stats.verify_steps, 1);
     }
 
     // ---- Stochastic: seed-deterministic, and the decision preserves the target distribution ----
@@ -1497,35 +1657,47 @@ mod tests {
         rows.extend(vec![0.0f32; vocab]);
         let logits = Tensor::from_vec(rows, (1, 2, vocab), &Device::Cpu).unwrap();
         let q: Vec<(i32, f32)> = vec![(0, 0.4), (1, 0.1), (2, 0.2), (3, 0.1), (4, 0.2)];
-        let mut rng = SplitMix64::new(0x5eed);
-        let n = 60_000usize;
-        let mut counts = vec![0u64; vocab];
-        for _ in 0..n {
-            let proposed = sample_weighted(&q, rng.next_f32(), 0);
-            let (_, committed, _) = decide(
-                &logits,
-                &Drafts::Host(vec![proposed]),
-                &[vec![(proposed, 1.0)]],
-                &[],
-                &config,
-                &mut rng,
-                false,
-                false,
-                None,
-            )
-            .unwrap();
-            counts[committed[0] as usize] += 1;
-        }
         let max = p_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let weights: Vec<f64> = p_logits.iter().map(|&x| ((x - max) as f64).exp()).collect();
         let total: f64 = weights.iter().sum();
-        let mut chi2 = 0.0f64;
-        for (t, &c) in counts.iter().enumerate() {
-            let expected = n as f64 * weights[t] / total;
-            chi2 += (c as f64 - expected).powi(2) / expected;
+        let n = 60_000usize;
+        // The draft distribution handed to the decision: the point mass an n-gram proposer
+        // reports, and the actual `q` a draft model reports (the `p / q` ratio then decides,
+        // not a plain `p` comparison).
+        let point_mass = |t: i32| vec![(t, 1.0f32)];
+        let draft_q = |_: i32| q.clone();
+        type DistOf<'a> = &'a dyn Fn(i32) -> Vec<(i32, f32)>;
+        let cases: [(&str, DistOf<'_>); 2] = [("point mass", &point_mass), ("draft q", &draft_q)];
+        for (name, dist_of) in cases {
+            let mut rng = SplitMix64::new(0x5eed);
+            let mut counts = vec![0u64; vocab];
+            for _ in 0..n {
+                let proposed = sample_weighted(&q, rng.next_f32(), 0);
+                let (_, committed, _) = decide(
+                    &logits,
+                    &Drafts::Host(vec![proposed]),
+                    &[dist_of(proposed)],
+                    &[],
+                    &config,
+                    &mut rng,
+                    false,
+                    false,
+                    None,
+                )
+                .unwrap();
+                counts[committed[0] as usize] += 1;
+            }
+            let mut chi2 = 0.0f64;
+            for (t, &c) in counts.iter().enumerate() {
+                let expected = n as f64 * weights[t] / total;
+                chi2 += (c as f64 - expected).powi(2) / expected;
+            }
+            // 4 degrees of freedom: chi-square 99.9 % critical value 18.47.
+            assert!(
+                chi2 < 18.47,
+                "{name}: chi-square {chi2:.2} over counts {counts:?}"
+            );
         }
-        // 4 degrees of freedom: chi-square 99.9 % critical value 18.47.
-        assert!(chi2 < 18.47, "chi-square {chi2:.2} over counts {counts:?}");
     }
 
     // ---- The stream contract: stop tokens, caller stop, cancellation, cache consistency ----
@@ -1691,6 +1863,110 @@ mod tests {
                 let next = crate::primitives::sampler::argmax_device(&next).unwrap();
                 assert_eq!(next, full[cancel_at]);
             }
+        }
+    }
+
+    /// A target whose `forward_step` fires a cancel as its `at`-th forward returns — a cancel
+    /// that lands while a step's forward is in flight.
+    struct CancelInForward<'a> {
+        inner: &'a Qwen35Model,
+        flag: CancelFlag,
+        at: u64,
+        forwards: Cell<u64>,
+    }
+    impl StepModel for CancelInForward<'_> {
+        type Cache = <Qwen35Model as StepModel>::Cache;
+        fn new_cache(&self) -> Self::Cache {
+            StepModel::new_cache(self.inner)
+        }
+        fn new_cache_for(&self, capacity: usize, overshoot: usize) -> Result<Self::Cache> {
+            self.inner.new_cache_for(capacity, overshoot)
+        }
+        fn device(&self) -> &Device {
+            StepModel::device(self.inner)
+        }
+        fn vocab_size(&self) -> usize {
+            StepModel::vocab_size(self.inner)
+        }
+        fn forward_step(
+            &self,
+            cache: &mut Self::Cache,
+            request: StepRequest<'_>,
+        ) -> Result<StepOutput> {
+            let out = self.inner.forward_step(cache, request)?;
+            self.forwards.set(self.forwards.get() + 1);
+            if self.forwards.get() == self.at {
+                self.flag.cancel();
+            }
+            Ok(out)
+        }
+    }
+
+    #[test]
+    fn cancellation_inside_the_verify_forward_commits_nothing_of_that_step() {
+        // The old loop checked the flag right after the verify forward; the engine must too: a
+        // cancel that lands during a step's verify forward returns Cancelled with only the tokens
+        // committed before that step, and the caller's cache is back at the step start.
+        let (_cfg, model, mtp) = text_model_with_mtp();
+        let config = greedy(24);
+        let full = step_tokens(&model, &PROMPT, &config);
+        // `at = 1`: the first forward through the wrapper is the first step's verify. `at = 3`:
+        // a forward inside a later step (a verify, or the replay of a rejected one).
+        for at in [1u64, 3] {
+            let mut cache = model
+                .new_cache_for(PROMPT.len() + config.max_new_tokens, 3)
+                .unwrap();
+            let out = model
+                .forward_step(&mut cache, StepRequest::last(&PROMPT).with_hidden(true))
+                .unwrap();
+            let flag = CancelFlag::new();
+            let wrapped = CancelInForward {
+                inner: &model,
+                flag: flag.clone(),
+                at,
+                forwards: Cell::new(0),
+            };
+            let mut proposer = MtpProposer::new(&mtp);
+            let run = generate_speculative(
+                &wrapped,
+                &mut proposer,
+                SpeculativePrompt::Prefilled {
+                    cache: &mut cache,
+                    logits: out.logits,
+                    hidden: out.hidden,
+                    history: &PROMPT,
+                    position_delta: 0,
+                    warm_proposer: true,
+                },
+                &config,
+                3,
+                &flag,
+                &mut |_| {},
+                None,
+            )
+            .unwrap();
+            assert_eq!(run.output.finish_reason, FinishReason::Cancelled, "at={at}");
+            let n = run.output.tokens.len();
+            assert!(n >= 1, "at={at}: the first token precedes every step");
+            assert_eq!(run.output.tokens, full[..n], "at={at}");
+            if at == 1 {
+                assert_eq!(n, 1, "the verify of the first step commits nothing");
+                assert_eq!(run.stats.verify_steps, 1);
+                assert_eq!(run.stats.accepted, 0);
+                assert_eq!(cache.len() as usize, PROMPT.len(), "back at the step start");
+            }
+            let committed = PROMPT.len() + n;
+            assert!(cache.len() as usize <= committed, "at={at}");
+            // Re-decoding from the settled cache continues the same greedy sequence.
+            let mut history = PROMPT.to_vec();
+            history.extend(&run.output.tokens);
+            let fed = &history[cache.len() as usize..committed];
+            let next = model
+                .forward_step(&mut cache, StepRequest::last(fed))
+                .unwrap()
+                .logits;
+            let next = crate::primitives::sampler::argmax_device(&next).unwrap();
+            assert_eq!(next, full[n], "at={at}");
         }
     }
 

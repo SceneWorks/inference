@@ -91,6 +91,11 @@ pub struct DecodeRecord {
     pub proposer: ProposerKind,
     /// Verify steps the speculative engine took (0 on non-speculative paths).
     pub verify_steps: u64,
+    /// Verify steps that fell back from a direct rollback to a step-start rollback plus a replay
+    /// forward (sc-24130, E2): the engine's `RollbackUnavailable` → replay recovery made visible.
+    /// `0` on non-speculative paths and on a cache with per-position rollback; on the S1 hybrid
+    /// cache one per rejected verify step. Each is one of `target_forwards`.
+    pub replay_forwards: u64,
     /// Device->host transfers issued inside those verify steps (proposing, verifying, deciding and
     /// committing), so `verify_host_syncs / verify_steps` is the engine's per-step sync cost — the
     /// AC2 figure, exactly `1.0` for a greedy run with device-resident drafts.
@@ -120,6 +125,7 @@ impl DecodeRecord {
             attn_formulation: AttnFormulation::Gqa,
             proposer: ProposerKind::None,
             verify_steps: 0,
+            replay_forwards: 0,
             verify_host_syncs: 0,
             fused_primitives: FusedTally::default(),
         }
@@ -177,6 +183,7 @@ impl DecodeRecord {
             attn_formulation: AttnFormulation::Gqa,
             proposer: ProposerKind::None,
             verify_steps: stats.verify_steps as u64,
+            replay_forwards: stats.replays as u64,
             verify_host_syncs: 0,
             fused_primitives: FusedTally::default(),
         }
@@ -343,6 +350,7 @@ mod tests {
                 proposed: 12,
                 accepted: 6,
                 verify_steps: 4,
+                replays: 2,
             },
             10,
             20,
@@ -353,6 +361,10 @@ mod tests {
         assert_eq!(spec.forwards_per_generated_token(), Some(0.5));
         assert_eq!(spec.host_syncs_per_token(), Some(2.0));
         assert_eq!(spec.host_syncs_per_verify_step(), Some(1.0));
+        assert_eq!(
+            spec.replay_forwards, 2,
+            "the replay fallback is on the record"
+        );
         assert_eq!(spec.path.label(), "mtp");
         assert_eq!(spec.proposer.label(), "mtp");
     }
