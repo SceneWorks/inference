@@ -35,8 +35,12 @@ use crate::MODEL_ID;
 /// calibration evidence, and the candle route materializes its components at different widths.
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "qwen-image-2-1-candle-derived-2026-09-22-v1";
 
-/// The published decode-tile domain. Derived, not a measured ladder — the crate's shipped default
-/// bracketed by its neighbours at the same 64-px overlap. A measured ladder is the terminal story's.
+/// The published decode-tile domain — **derived defaults, pending the epic-end campaign**, not a
+/// measured ladder. The crate's shipped default (512) is bracketed by its neighbours at the same
+/// 64-px overlap; 768 and 640 are published on the strength of the 2512 route's measured ladder
+/// (same 16x autoencoder family, same overlap), not on a run of this VAE. The terminal story's
+/// measurement campaign is what turns these into a measured ladder, and nothing here claims
+/// otherwise.
 pub const DECODE_TILE_EDGES: &[u32] = &[768, 640, 512, 384, 256];
 
 /// Pixels one latent token covers on each axis (the VAE's 16× spatial scale; `patch_size == 1`).
@@ -152,29 +156,41 @@ fn component_bytes(
         })
 }
 
-/// Width `loader::compute_dtype` materializes the DiT and the VAE at on this build.
-fn compute_width() -> u64 {
+/// Width `loader::compute_dtype` materializes every float component at on this build — the DiT,
+/// the VAE and the text encoder alike (sc-24114). Public so a test can hold the priced width to the
+/// loaded tower's dtype.
+pub fn compute_width() -> u64 {
     crate::loader::compute_dtype().size_in_bytes() as u64
 }
 
 /// The load-exact component inventory.
 ///
 /// * `transformer/` at [`compute_width`] — bf16 on a GPU build, f32 on the CPU parity lane;
-/// * `text_encoder/` over the **loaded** `model.language_model.*` prefix only, at f32: the tower
-///   runs f32 activations over its weights exactly as the MLX twin does
-///   (`loader::load_text_encoder_from` builds its `VarBuilder` at `DType::F32`). The checkpoint's
-///   untied `lm_head` and its whole `model.visual.*` tower are on disk but materialized by nothing
-///   on this route, so they contribute zero rather than ~2.4 GB of weights no render touches;
+/// * `text_encoder/` over the **loaded** `model.language_model.*` prefix only, at
+///   [`compute_width`] too: `loader::load_text_encoder_from` builds the tower's `VarBuilder` at
+///   `compute_dtype()`, so a CUDA/Metal build holds the tower at bf16 exactly as upstream does and
+///   as the SceneWorks floors were derived (before sc-24114 it was read at f32 on every backend and
+///   priced at 4 B/param — a ~14 GiB overstatement of the resident bf16 footprint). The
+///   checkpoint's untied `lm_head` and its whole `model.visual.*` tower are on disk but
+///   materialized by nothing on this route, so they contribute zero rather than ~2.4 GB of weights
+///   no render touches;
 /// * `vae/` at [`compute_width`].
 ///
 /// A packed tier's u32 code tensors are integers and therefore price at their stored width through
 /// [`component_bytes`], independent of the float width — which is what makes one function correct
 /// for all three tiers.
 fn asset_facts(root: &Path) -> gen_core::Result<MemoryAssetFacts> {
-    let width = compute_width();
+    asset_facts_at(root, compute_width())
+}
+
+/// `asset_facts` at an explicit float `width` (bytes per element). The production inventory is
+/// `asset_facts` at [`compute_width`]; this seam exists so the pricing rule — **every** float
+/// component at ONE width, the tower included — can be held on the CPU lane, where the compute
+/// width happens to equal the 4 B/param the tower used to be mispriced at.
+pub fn asset_facts_at(root: &Path, width: u64) -> gen_core::Result<MemoryAssetFacts> {
     let all = |_: &str| true;
     let transformer = component_bytes(&root.join("transformer"), width, &all)?;
-    let conditioning = component_bytes(&root.join("text_encoder"), 4, &|name: &str| {
+    let conditioning = component_bytes(&root.join("text_encoder"), width, &|name: &str| {
         name.starts_with(crate::loader::TEXT_ENCODER_PREFIX)
     })?;
     let decoder = component_bytes(&root.join("vae"), width, &all)?;
@@ -863,6 +879,53 @@ mod tests {
         assert_eq!(
             crate::quant::Tier::Q4.text_encoder_bits(),
             crate::quant::Tier::Q4.transformer_bits()
+        );
+    }
+
+    /// **Every float component is priced at ONE width — the tower included** (sc-24114). Before
+    /// this the tower was read and priced at f32 on every backend, which put the candle bf16
+    /// resident set ~14 GiB above the derivation the SceneWorks floors were taken from.
+    ///
+    /// Stated at an explicit width on the all-float dense tiny snapshot, where halving the width
+    /// must exactly halve every component — the CPU lane's own compute width is 4, which is the
+    /// very number the tower used to be hard-wired to, so `asset_facts()` alone could not tell the
+    /// two apart there. The production inventory is then held to the compute width.
+    ///
+    /// *Mutation that reds this:* pricing `text_encoder/` at a literal `4` again inside
+    /// `asset_facts_at` (the tower's bf16 bytes stop being half its f32 bytes).
+    #[test]
+    fn the_tower_is_priced_at_the_compute_width_like_every_other_component() {
+        let tiny = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../mlx-gen/mlx-gen-qwen-image-2-1/tests/fixtures/tiny-snapshot");
+        let at_bf16 = asset_facts_at(&tiny, 2).unwrap();
+        let at_f32 = asset_facts_at(&tiny, 4).unwrap();
+        assert!(at_bf16.conditioning_bytes > 0);
+        assert_eq!(
+            at_bf16.conditioning_bytes * 2,
+            at_f32.conditioning_bytes,
+            "the tower follows the float width like the DiT and the VAE"
+        );
+        assert_eq!(at_bf16.transformer_bytes * 2, at_f32.transformer_bytes);
+        assert_eq!(at_bf16.decoder_bytes * 2, at_f32.decoder_bytes);
+        assert_eq!(at_bf16.base_bytes * 2, at_f32.base_bytes);
+
+        // The production inventory is the compute-width one, and the compute width is the
+        // loaded tower's dtype.
+        let spec = LoadSpec::new(WeightsSource::Dir(tiny.clone()));
+        let contract = memory_strategy_contract(MODEL_ID, &spec).unwrap();
+        assert_eq!(
+            contract.asset_facts,
+            asset_facts_at(&tiny, compute_width()).unwrap()
+        );
+        assert_eq!(
+            compute_width(),
+            crate::loader::compute_dtype().size_in_bytes() as u64
+        );
+        let tower = crate::loader::load_text_encoder(&tiny, &candle_core::Device::Cpu).unwrap();
+        assert_eq!(
+            tower.dtype().size_in_bytes() as u64,
+            compute_width(),
+            "the priced width is the width the tower is actually materialized at"
         );
     }
 }

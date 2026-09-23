@@ -231,17 +231,44 @@ pub struct QwenImage21 {
     device: Device,
     residency: Residency<QwenImage21TextEncoder, Heavy>,
     lifecycle: Mutex<()>,
+    /// The spec this generator was loaded from — the tier and residency policy the shared
+    /// memory-strategy seam checks a request selection against (sc-24114).
+    spec: LoadSpec,
+    /// The loaded memory contract ([`memory_strategy::memory_strategy_contract`] over the snapshot
+    /// on disk), published through [`Generator::memory_strategy_contract`] so the SceneWorks
+    /// worker's optimized selections reach this generator instead of the trait's
+    /// "has not adopted the shared memory-strategy contract" default.
+    memory_strategy: gen_core::MemoryProviderContract,
+}
+
+/// The one refusal both Qwen-Image 2.1 backends raise for a `LoadSpec::precision` override. The
+/// wording is shared with `mlx_gen_qwen_image_2_1::model::PRECISION_OVERRIDE_REFUSAL` by literal
+/// (the two provider crates cannot share a symbol without routing it through gen-core); the tests
+/// on both sides pin this exact text so the two cannot drift.
+pub const PRECISION_OVERRIDE_REFUSAL: &str = "qwen_image_2_1: components load at the backend's \
+    own compute dtype (the checkpoint's bf16 on MLX, CUDA and Metal; f32 on the candle CPU lane); \
+    drop the precision override";
+
+/// The one refusal both backends raise for a `LoadSpec::quantize` that is not an affine tier —
+/// shared wording, see [`PRECISION_OVERRIDE_REFUSAL`].
+pub fn non_affine_quant_refusal(quant: Quant) -> String {
+    format!("qwen_image_2_1: {quant:?} is not a Qwen-Image 2.1 affine tier (Q4/Q8)")
 }
 
 /// Reject every overlay this route does not wire, with a typed, actionable error.
 pub(crate) fn validate_load_spec(spec: &LoadSpec) -> gen_core::Result<()> {
     gen_core::reject_unknown_components(spec, &[], MODEL_ID)?;
     if spec.precision != Precision::Bf16 {
-        return Err(gen_core::Error::Msg(
-            "qwen_image_2_1: components load at the backend's own compute dtype; drop the \
-             precision override"
-                .into(),
+        return Err(gen_core::Error::Unsupported(
+            PRECISION_OVERRIDE_REFUSAL.into(),
         ));
+    }
+    if let Some(quant) = spec.quantize {
+        if !matches!(quant, Quant::Q4 | Quant::Q8) {
+            return Err(gen_core::Error::Unsupported(non_affine_quant_refusal(
+                quant,
+            )));
+        }
     }
     if !spec.adapters.is_empty() {
         return Err(gen_core::Error::Unsupported(
@@ -294,6 +321,10 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let tokenizer = loader::load_tokenizer(root)?;
     let drop_count = system_prompt_drop_count(&tokenizer)?;
     let scheduler = loader::load_scheduler_config(root)?;
+    // The loaded contract is priced from the snapshot on disk BEFORE any weight is read, so a
+    // tier/request disagreement is the same refusal whether it is asked for through `load` or
+    // through the memory registration.
+    let memory_strategy = memory_strategy::memory_strategy_contract(MODEL_ID, spec)?;
     let residency = build_residency(spec, &device)?;
     Ok(Box::new(QwenImage21 {
         descriptor: descriptor(),
@@ -303,6 +334,8 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         device,
         residency,
         lifecycle: Mutex::new(()),
+        spec: spec.clone(),
+        memory_strategy,
     }))
 }
 
@@ -331,6 +364,31 @@ fn load_heavy(spec: &LoadSpec, device: &Device) -> Result<Heavy> {
 impl Generator for QwenImage21 {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    /// The registered contract, priced from the loaded snapshot — the same one
+    /// [`memory_strategy::MEMORY_REGISTRATION`] builds for this spec.
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        memory_strategy::safety_check(&self.spec, &self.memory_strategy, context)
+    }
+
+    /// The registered executable seam (`memory_strategy::registered_begin_request`) on the
+    /// loaded generator: the scope's `configure_request` writes the admitted
+    /// `GenerationMemory` onto the request, which [`Self::generate`] then honours — staged
+    /// residency through `Residency::run_request_scoped`, bounded decode through
+    /// [`pipeline::decode_tiling`].
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        memory_strategy::registered_begin_request(&self.spec, &self.memory_strategy, context)
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -378,6 +436,13 @@ pub(crate) fn resolve_run_params(
     })
 }
 
+/// Whether one request runs staged: the request's admitted `GenerationMemory::stage_residency`
+/// (written by the memory-strategy scope) OR a `Sequential` load policy. Mirrors the MLX twin.
+pub(crate) fn stage_residency_for(spec: &LoadSpec, req: &GenerationRequest) -> bool {
+    req.memory.is_some_and(|memory| memory.stage_residency)
+        || spec.offload_policy == gen_core::OffloadPolicy::Sequential
+}
+
 impl QwenImage21 {
     fn generate_impl(
         &self,
@@ -390,7 +455,15 @@ impl QwenImage21 {
         let drop = self.drop_count;
         let device = self.device.clone();
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
-        self.residency.run(
+        // Staged residency is a per-request execution decision (sc-24114): the shared worker
+        // selects it through the memory-strategy scope, which writes `GenerationMemory` onto the
+        // request. A `Sequential` load policy stages every request whatever the request says, so
+        // the two are OR'd — a request can stage a warm-loaded generator, never un-stage a
+        // sequential one.
+        let stage_residency = stage_residency_for(&self.spec, req);
+        self.residency.run_request_scoped(
+            stage_residency,
+            false,
             &req.cancel,
             false,
             on_progress,
@@ -402,7 +475,7 @@ impl QwenImage21 {
                     Vec::new()
                 } else {
                     let vision = te.vision_config().ok_or_else(|| {
-                        Error::Msg(
+                        Error::Unsupported(
                             "qwen_image_2_1: reference conditioning needs the snapshot's Qwen3-VL \
                              vision tower (`text_encoder/config.json` `vision_config` + \
                              `model.visual.*`), which this snapshot does not carry"
@@ -605,6 +678,67 @@ mod tests {
             assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
         }
         assert!(UPSTREAM_LICENSE_NOTICE.contains("Qwen RESEARCH LICENSE AGREEMENT"));
+    }
+
+    /// The two load-spec refusals both backends share **by literal** (sc-24114): the exact text
+    /// is pinned here and, character for character, in `mlx_gen_qwen_image_2_1::model`'s tests,
+    /// so the wording cannot drift on either side without one of the two pins going red. Both are
+    /// the typed `Unsupported`, not `Msg`.
+    #[test]
+    fn precision_and_non_affine_quant_refusals_share_the_mlx_wording() {
+        assert_eq!(
+            PRECISION_OVERRIDE_REFUSAL,
+            "qwen_image_2_1: components load at the backend's own compute dtype (the checkpoint's \
+             bf16 on MLX, CUDA and Metal; f32 on the candle CPU lane); drop the precision override"
+        );
+        assert_eq!(
+            non_affine_quant_refusal(Quant::Nvfp4),
+            "qwen_image_2_1: Nvfp4 is not a Qwen-Image 2.1 affine tier (Q4/Q8)"
+        );
+
+        let spec = LoadSpec::new(WeightsSource::Dir("/qwen-image-2-1".into()));
+        let mut fp32 = spec.clone();
+        fp32.precision = Precision::Fp32;
+        match validate_load_spec(&fp32) {
+            Err(gen_core::Error::Unsupported(message)) => {
+                assert_eq!(message, PRECISION_OVERRIDE_REFUSAL);
+            }
+            other => panic!("a precision override must be a typed Unsupported, got {other:?}"),
+        }
+        match validate_load_spec(&spec.with_quant(Quant::Nvfp4)) {
+            Err(gen_core::Error::Unsupported(message)) => {
+                assert_eq!(message, non_affine_quant_refusal(Quant::Nvfp4));
+            }
+            other => panic!("a non-affine tier must be a typed Unsupported, got {other:?}"),
+        }
+    }
+
+    /// A request stages when the memory-strategy scope said so OR the load policy is
+    /// `Sequential`; a plain request on a `Resident` load does not.
+    ///
+    /// *Mutation that reds this:* dropping either arm of the `||` in `stage_residency_for`.
+    #[test]
+    fn stage_residency_is_the_request_selection_or_the_sequential_policy() {
+        use candle_gen::gen_core::GenerationMemory;
+
+        let resident = LoadSpec::new(WeightsSource::Dir("/qwen-image-2-1".into()));
+        let sequential = resident
+            .clone()
+            .with_offload_policy(OffloadPolicy::Sequential);
+        let plain = req(64, 64);
+        let mut staged = req(64, 64);
+        staged.memory = Some(GenerationMemory {
+            stage_residency: true,
+            ..Default::default()
+        });
+        let mut unstaged = req(64, 64);
+        unstaged.memory = Some(GenerationMemory::default());
+
+        assert!(!stage_residency_for(&resident, &plain));
+        assert!(!stage_residency_for(&resident, &unstaged));
+        assert!(stage_residency_for(&resident, &staged));
+        assert!(stage_residency_for(&sequential, &plain));
+        assert!(stage_residency_for(&sequential, &staged));
     }
 
     #[test]

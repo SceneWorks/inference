@@ -223,7 +223,7 @@ pub fn prepare_reference(
     let patch = vision.processor.patch_size as i32;
     let (want_h, want_w) = ((rh as i32) / patch, (rw as i32) / patch);
     if grid_thw != [1, want_h, want_w] {
-        return Err(Error::Msg(format!(
+        return Err(Error::Unsupported(format!(
             "qwen_image_2_1: reference image {index} ({}x{}) fits to {rw}x{rh}, but the Qwen3-VL \
              processor's smart_resize rebinds it to a {}x{} patch grid instead of {want_w}x{want_h}, \
              so its vision slots would no longer cover its VAE latents 4:1. Supply a reference whose \
@@ -299,7 +299,11 @@ fn from_llm(e: candle_llm::Error) -> Error {
 /// * a per-reference `strength` other than `1.0` — condition images carry no strength upstream.
 /// * an empty `MultiReference`, or a conditioning list that yields zero images.
 /// * more than [`MAX_REFERENCE_IMAGES`].
-/// * any other conditioning kind, as the capability floor would.
+/// * any other conditioning kind — [`Error::Unsupported`], as the capability floor would.
+///
+/// Every one of these is the typed [`Error::Unsupported`] the MLX twin raises, with the identical
+/// message text: the worker and the gen-core-testkit validate-honesty check key off the variant
+/// to tell "refused by design" from "broke" (sc-24114).
 pub fn collect_references(req: &GenerationRequest) -> Result<Vec<RgbaImage>> {
     if req.conditioning.is_empty() {
         return Ok(Vec::new());
@@ -331,7 +335,7 @@ pub fn collect_references(req: &GenerationRequest) -> Result<Vec<RgbaImage>> {
                 }
             }
             Conditioning::Mask { .. } => {
-                return Err(Error::Msg(format!(
+                return Err(Error::Unsupported(format!(
                     "qwen_image_2_1: conditioning slot {slot} is a Mask, and Qwen-Image 2.1 has no \
                      mask input — upstream's pipeline takes only an ordered list of condition \
                      images and performs no inpainting. For a local edit, either draw the \
@@ -341,7 +345,7 @@ pub fn collect_references(req: &GenerationRequest) -> Result<Vec<RgbaImage>> {
                 )));
             }
             other => {
-                return Err(Error::Msg(format!(
+                return Err(Error::Unsupported(format!(
                     "qwen_image_2_1: conditioning slot {slot} is {:?}, which this route does not \
                      accept; it takes Reference, ReferenceRgba and MultiReference only",
                     other.kind()
@@ -368,7 +372,7 @@ fn widen_rgb(image: &Image, slot: usize) -> Result<RgbaImage> {
 fn reject_reference_strength(slot: usize, strength: Option<f32>) -> Result<()> {
     if let Some(strength) = strength {
         if (strength - 1.0).abs() > f32::EPSILON {
-            return Err(Error::Msg(format!(
+            return Err(Error::Unsupported(format!(
                 "qwen_image_2_1: conditioning slot {slot} sets reference strength {strength}, but \
                  Qwen-Image 2.1 conditions on a reference at full weight — upstream's condition \
                  images have no strength. Drop the field (or send 1.0)."
@@ -388,7 +392,7 @@ pub fn validate_reference_count(count: usize) -> Result<()> {
         )));
     }
     if count > MAX_REFERENCE_IMAGES {
-        return Err(Error::Msg(format!(
+        return Err(Error::Unsupported(format!(
             "qwen_image_2_1: {count} reference images were supplied; upstream composes at most \
              {MAX_REFERENCE_IMAGES}"
         )));

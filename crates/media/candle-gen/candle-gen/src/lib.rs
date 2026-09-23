@@ -238,6 +238,16 @@ pub enum CandleError {
     #[error("{0}")]
     Msg(String),
 
+    /// A typed **capability refusal**: the request asks for something this route deliberately does
+    /// not do (an unadvertised conditioning kind, a strength on a condition image, more references
+    /// than a joint layout can express, a quant tier the backend cannot produce). Kept a typed
+    /// variant — NOT a `Msg` — so the [`From`] bridge lifts it to the contract-load-bearing
+    /// [`gen_core::Error::Unsupported`]: the worker and the gen-core-testkit validate-honesty check
+    /// key off that variant to tell "refused by design" from "broke" (sc-24114). Mirrors mlx-gen's
+    /// `Error::Unsupported`.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
+
     /// Cooperative cancellation tripped mid-generation (the request's `CancelFlag`). Kept a typed
     /// variant — NOT a `Msg` — so a provider's rich-`Result` body can `return Err(CandleError::Canceled)`
     /// between denoise steps and the [`From`] bridge lifts it to the contract-load-bearing
@@ -265,6 +275,8 @@ impl From<CandleError> for gen_core::Error {
             // candle's Error is `Send + Sync + 'static`, so it boxes straight into Backend.
             CandleError::Candle(c) => gen_core::Error::backend(c),
             CandleError::Msg(s) => gen_core::Error::Msg(s),
+            // Preserve the typed refusal across the bridge (do NOT stringify to Msg).
+            CandleError::Unsupported(s) => gen_core::Error::Unsupported(s),
             // Preserve the typed cancellation signal across the bridge (do NOT stringify to Msg).
             CandleError::Canceled => gen_core::Error::Canceled,
             CandleError::GeometryRefused {
@@ -294,7 +306,7 @@ impl From<gen_core::Error> for CandleError {
         match e {
             gen_core::Error::Canceled => CandleError::Canceled,
             gen_core::Error::MissingTensor(s) => CandleError::Msg(format!("missing tensor: {s}")),
-            gen_core::Error::Unsupported(s) => CandleError::Msg(format!("unsupported: {s}")),
+            gen_core::Error::Unsupported(s) => CandleError::Unsupported(s),
             gen_core::Error::GeometryRefused {
                 reason,
                 requested_width,

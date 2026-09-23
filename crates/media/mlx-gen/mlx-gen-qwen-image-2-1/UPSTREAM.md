@@ -429,9 +429,13 @@ QWEN21_SRC=<dense snapshot> QWEN21_TIER=q4 QWEN21_DST=~/SceneWorks/qwen-image-2-
   cargo run --release --example qwen_image_2_1_prequant -p mlx-gen-qwen-image-2-1
 ```
 
-The example prints a SHA-256 manifest of everything it wrote **and writes it to
-`<tier>/SHA256SUMS`**. The production tiers are re-hosted at **`SceneWorks/qwen-image-2-1-mlx`**, one
-subdirectory per tier (`q8/`, `q4/`), each carrying that manifest — that is the repository the
+The **converter itself** (`convert::prequantize_turnkey`, sc-24114) writes two files beside the
+weights of every tier it assembles: `<tier>/CHANGES.md`, the change record the Qwen Research
+License §3(b) requires of a modified redistribution (which components were re-packed, at what
+bits/group, from which upstream revision, by which converter version), and `<tier>/SHA256SUMS`, the
+`sha256sum`-format manifest over every other file. The example only selects the tier and echoes
+the manifest. The production tiers are re-hosted at **`SceneWorks/qwen-image-2-1-mlx`**, one
+subdirectory per tier (`q8/`, `q4/`), each carrying both files — that is the repository the
 SceneWorks manifest half pins.
 
 ## Memory (sc-24112)

@@ -2062,8 +2062,10 @@ mod tests {
         assert!(
             matches!(
                 error,
-                CandleError::Msg(ref reason)
-                    if reason.starts_with("unsupported: artifact seal mismatch after load: ")
+                // The seal mismatch is a typed `gen_core::Error::Unsupported`; the bridge keeps
+                // the class (sc-24114) instead of stringifying it into a `Msg`.
+                CandleError::Unsupported(ref reason)
+                    if reason.starts_with("artifact seal mismatch after load: ")
             ),
             "unexpected: {error:?}"
         );

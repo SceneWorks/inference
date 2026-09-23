@@ -1,5 +1,5 @@
-//! Offline pre-quantization of a `Qwen/Qwen-Image-2.1` snapshot into one installable tier, plus the
-//! SHA-256 manifest that binds the result (sc-24112).
+//! Offline pre-quantization of a `Qwen/Qwen-Image-2.1` snapshot into one installable tier
+//! (sc-24112).
 //!
 //! ```text
 //! QWEN21_SRC=<dense snapshot> QWEN21_TIER=q4 QWEN21_DST=<out root> \
@@ -10,17 +10,18 @@
 //! standalone snapshot (see `mlx_gen_qwen_image_2_1::convert`). `QWEN21_TIER` is `q8` or `q4`; the
 //! `bf16` tier is the dense source itself and is refused rather than copied.
 //!
-//! Every file's SHA-256 is printed on completion. The conversion is byte-reproducible, so those
-//! digests are the manifest a published tier is bound to.
+//! The converter itself writes the tier's `CHANGES.md` (the Qwen Research License change record)
+//! and `SHA256SUMS` (the manifest a published tier is bound to) — this driver only selects the
+//! tier and echoes the manifest it wrote (sc-24114). The conversion is byte-reproducible, so those
+//! digests are stable across runs.
 //!
 //! **Resource note.** The released snapshot is ~31 GB and the converter holds one component's tensor
 //! map at a time; run it under an external RSS guard with a stated cap rather than unattended.
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
-use mlx_gen_qwen_image_2_1::convert::prequantize_turnkey;
+use mlx_gen_qwen_image_2_1::convert::{prequantize_turnkey, CHANGES_FILE, SHA256SUMS_FILE};
 use mlx_gen_qwen_image_2_1::quant::Tier;
 
 fn env_or(key: &str, default: &str) -> String {
@@ -38,32 +39,6 @@ fn tier_from_env() -> Tier {
                 Tier::ALL.map(Tier::dir_name)
             )
         })
-}
-
-/// Every regular file under `root`, relative path → SHA-256, sorted.
-fn digest_tree(root: &Path) -> BTreeMap<String, String> {
-    use sha2::{Digest, Sha256};
-    fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(root, &path, out);
-            } else if let Ok(bytes) = std::fs::read(&path) {
-                let rel = path
-                    .strip_prefix(root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                out.insert(rel, format!("{:x}", Sha256::digest(&bytes)));
-            }
-        }
-    }
-    let mut out = BTreeMap::new();
-    walk(root, root, &mut out);
-    out
 }
 
 fn main() {
@@ -93,21 +68,23 @@ fn main() {
         started.elapsed().as_secs_f32()
     );
 
-    // The manifest is written BESIDE the tier as well as printed: it is what binds a published
-    // artefact to its bytes, and a digest that only ever existed in a log is not a binding.
-    // `SHA256SUMS` is excluded from its own listing (it does not exist yet when the tree is walked).
+    // Echo the manifest the converter wrote beside the tier, and the tier's size.
+    let manifest_path = dst.join(SHA256SUMS_FILE);
+    let manifest = std::fs::read_to_string(&manifest_path).expect("the converter wrote SHA256SUMS");
     let mut total = 0_u64;
-    let mut manifest = String::new();
-    for (rel, digest) in digest_tree(&dst) {
-        total += std::fs::metadata(dst.join(&rel))
-            .map(|m| m.len())
-            .unwrap_or(0);
-        println!("{digest}  {rel}");
-        manifest.push_str(&format!("{digest}  {rel}\n"));
+    for line in manifest.lines() {
+        println!("{line}");
+        if let Some((_, rel)) = line.split_once("  ") {
+            total += std::fs::metadata(dst.join(rel))
+                .map(|m| m.len())
+                .unwrap_or(0);
+        }
     }
-    let manifest_path = dst.join("SHA256SUMS");
-    std::fs::write(&manifest_path, manifest).expect("write SHA256SUMS beside the tier");
-    eprintln!("[prequant] manifest written to {}", manifest_path.display());
+    eprintln!(
+        "[prequant] change record at {}, manifest at {}",
+        dst.join(CHANGES_FILE).display(),
+        manifest_path.display()
+    );
     eprintln!(
         "[prequant] {} tier total {:.2} GiB",
         tier.dir_name(),

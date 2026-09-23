@@ -203,9 +203,18 @@ pub fn installed_tier(root: &Path) -> Result<Tier> {
         .ok_or_else(|| {
             Error::Msg(format!(
                 "qwen_image_2_1: no installable tier has transformer bits {dit:?} with text-encoder \
-                 bits {te:?}; the installable tiers are bf16 (dense/dense), q8 (8/8) and q4 (4/8)"
+                 bits {te:?}; a tier is one width, so the installable tiers are bf16 \
+                 (dense/dense), q8 (8/8) and q4 (4/4)"
             ))
         })
+}
+
+/// The one refusal both Qwen-Image 2.1 backends raise for a `LoadSpec::quantize` that is not an
+/// affine tier. The wording is shared with `candle_gen_qwen_image_2_1::non_affine_quant_refusal`
+/// by literal (the two provider crates cannot share a symbol without routing it through gen-core);
+/// the tests on both sides pin this exact text so the two cannot drift.
+pub fn non_affine_quant_refusal(quant: Quant) -> String {
+    format!("qwen_image_2_1: {quant:?} is not a Qwen-Image 2.1 affine tier (Q4/Q8)")
 }
 
 /// Validate a caller's `LoadSpec::quantize` against the tier actually on disk.
@@ -233,9 +242,7 @@ pub fn needs_load_time_quant(root: &Path, requested: Option<Quant>) -> Result<bo
         return Ok(false);
     };
     let Some(wanted) = Tier::from_selected(Some(requested)) else {
-        return Err(Error::Unsupported(format!(
-            "qwen_image_2_1: {requested:?} is not an MLX affine tier (Q4/Q8)"
-        )));
+        return Err(Error::Unsupported(non_affine_quant_refusal(requested)));
     };
     match installed {
         Tier::Bf16 => Ok(true),

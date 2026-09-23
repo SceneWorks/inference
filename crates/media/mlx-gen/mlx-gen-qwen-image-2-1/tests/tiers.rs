@@ -830,6 +830,268 @@ fn staged_residency_preserves_the_resident_output_at_every_tier() {
     }
 }
 
+// ── the shared seam on the LOADED generator ─────────────────────────────────────────────────────
+
+/// The worker's admitted context for `strategy` on a loaded `spec`, at the tiny render geometry —
+/// what `sceneworks-worker::memory_strategy::generate_with_scope` hands the generator.
+fn admitted_context(
+    contract: &mlx_gen::gen_core::MemoryProviderContract,
+    spec: &LoadSpec,
+    strategy: mlx_gen::gen_core::MemoryStrategy,
+    edge: u32,
+) -> mlx_gen::gen_core::MemoryRunContext {
+    use mlx_gen::gen_core::{MemoryBehaviorRoute, MemoryMode, MemoryNumericTier};
+    let mut context = mlx_gen::gen_core::standard_memory_behavior_context(
+        contract,
+        strategy,
+        MemoryNumericTier {
+            precision: spec.precision,
+            quant: spec.quantize,
+            component_precision_floors: &[],
+        },
+        MemoryBehaviorRoute {
+            mode: MemoryMode::TextToImage,
+            reference_count: 0,
+            use_pid: false,
+            has_phases: true,
+            overlay: None,
+        },
+    )
+    .expect("a valid behaviour context");
+    context.geometry.width = edge;
+    context.geometry.height = edge;
+    context.geometry.batch = 1;
+    context
+}
+
+/// `generate` through the public trait, collecting the progress stream.
+fn generate_traced(
+    generator: &dyn mlx_gen::Generator,
+    req: &GenerationRequest,
+) -> (Image, Vec<mlx_gen::gen_core::Progress>) {
+    let mut events = Vec::new();
+    let image = match generator
+        .generate(req, &mut |p| events.push(p))
+        .expect("render")
+    {
+        GenerationOutput::Images(mut images) => images.remove(0),
+        other => panic!("images expected, got {other:?}"),
+    };
+    (image, events)
+}
+
+fn loads_renderer(events: &[mlx_gen::gen_core::Progress]) -> bool {
+    use mlx_gen::gen_core::{LoadPhase, Progress};
+    events
+        .iter()
+        .any(|p| matches!(p, Progress::Loading(LoadPhase::Renderer)))
+}
+
+/// **The shared memory-strategy seam reaches the loaded generator** (sc-24114). The SceneWorks
+/// worker never calls the crate's `registered_*` functions; it calls the `Generator` trait —
+/// `memory_strategy_contract`, `memory_strategy_safety_check`, `begin_memory_strategy_request` —
+/// and before this the 2.1 generators inherited the trait defaults, which publish no contract and
+/// reject every optimized selection ("has not adopted the shared memory-strategy contract"), so a
+/// card admitted only through the staged rung rendered straight into a typed failure.
+///
+/// Through the trait, at every tier: the published contract IS the registered one; a staged
+/// selection is accepted, opens a scope, and the scope-configured request renders **byte-identical
+/// to the resident render** — while actually staging: the warm pair is evicted and reloaded
+/// (`Loading(TextEncoder)` / `Loading(Renderer)` on the progress stream), which a plain request on
+/// the same warm generator never does.
+///
+/// *Mutations that red this:* removing the `memory_strategy_contract` override (`None != Some`);
+/// removing the `begin_memory_strategy_request` override (the default refuses to open a scope for
+/// an implemented optimized rung); reverting `generate_impl` from `run_request_scoped(stage, …)`
+/// to `run(…)` (the staged request then renders warm and emits no `Loading` event).
+#[test]
+fn a_staged_selection_through_the_generator_trait_stages_and_preserves_the_resident_output() {
+    use mlx_gen::gen_core::{
+        LoadPhase, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy, Progress,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    for (label, root, quant) in [
+        ("bf16", tiny_snapshot(), None),
+        ("q8", convert_into(tmp.path(), Tier::Q8), Some(Quant::Q8)),
+        ("q4", convert_into(tmp.path(), Tier::Q4), Some(Quant::Q4)),
+    ] {
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_offload_policy(OffloadPolicy::Resident);
+        if let Some(quant) = quant {
+            spec = spec.with_quant(quant);
+        }
+        let generator = mlx_gen_qwen_image_2_1::provider_registry()
+            .unwrap()
+            .load(ID, &spec)
+            .expect("the tier loads through the catalog path");
+
+        // 1. The trait publishes the REGISTERED contract, priced from this very snapshot.
+        let registered =
+            mlx_gen_qwen_image_2_1::memory_strategy::memory_strategy_contract(ID, &spec)
+                .expect("the registered contract");
+        assert_eq!(
+            generator.memory_strategy_contract(),
+            Some(&registered),
+            "{label}: the loaded generator must publish the registered contract"
+        );
+        assert!(
+            registered.asset_facts.base_bytes > 0,
+            "{label}: the published contract is priced, not the weights-free surface"
+        );
+
+        // 2. Warm the resident pair, then take the resident reference render: no load event.
+        let plain = request(EDGE, EDGE);
+        let _ = generate_traced(&*generator, &plain);
+        let (resident, resident_events) = generate_traced(&*generator, &plain);
+        assert!(
+            !loads_renderer(&resident_events),
+            "{label}: a plain request on a warm generator must not reload: {resident_events:?}"
+        );
+
+        // 3. A staged selection through the trait: admitted, scoped, configured onto the request.
+        let context = admitted_context(&registered, &spec, MemoryStrategy::StagedResidency, EDGE);
+        assert_eq!(
+            generator.memory_strategy_safety_check(&context),
+            MemorySafetyDecision::Accept,
+            "{label}"
+        );
+        let mut scope = generator
+            .begin_memory_strategy_request(&context)
+            .expect("the staged selection is admitted")
+            .expect("an implemented optimized rung opens a request scope");
+        let mut staged_req = request(EDGE, EDGE);
+        scope
+            .configure_request(&mut staged_req)
+            .expect("the tiny request fits the admitted geometry");
+        assert!(
+            staged_req.memory.is_some_and(|m| m.stage_residency),
+            "{label}: the scope must write the staged selection onto the request"
+        );
+
+        // 4. …which renders byte-identically, and genuinely staged.
+        let (staged, staged_events) = generate_traced(&*generator, &staged_req);
+        scope.finish(MemoryRunOutcome::Complete).unwrap();
+        assert_eq!(
+            staged.pixels, resident.pixels,
+            "{label}: the staged render must be byte-identical to the resident one"
+        );
+        assert!(
+            loads_renderer(&staged_events),
+            "{label}: the staged request must evict and reload the heavy pair (no \
+             Loading(Renderer) in {staged_events:?}) — it rendered warm instead"
+        );
+        assert!(
+            staged_events
+                .iter()
+                .any(|p| matches!(p, Progress::Loading(LoadPhase::TextEncoder))),
+            "{label}: a staged request loads the tower first: {staged_events:?}"
+        );
+
+        // 5. And the warm pair is rebuilt for the next plain request, which again loads nothing
+        //    after its own rebuild.
+        let _ = generate_traced(&*generator, &plain);
+        let (again, again_events) = generate_traced(&*generator, &plain);
+        assert_eq!(again.pixels, resident.pixels, "{label}");
+        assert!(!loads_renderer(&again_events), "{label}: {again_events:?}");
+    }
+}
+
+/// **Bounded decode through the trait** (sc-24114): a `BoundedDecode` selection inside the
+/// published domain is admitted, its scope writes the tile geometry onto the request, and the
+/// render reproduces the untiled one within the seam-blend bars the crate already holds itself to.
+///
+/// The smallest published edge is 256, so the render is 512 px (a genuine 2x2 tiling) on the
+/// dense tier only — the packed tiers' bounded decode is covered by
+/// `bounded_decode_preserves_the_untiled_output_at_every_tier` through the same request field.
+///
+/// *Mutation that reds this:* removing the `begin_memory_strategy_request` override, or the
+/// scope no longer writing `GenerationMemory::tile_vae_decode` (the tiling assertions fail).
+#[test]
+fn a_bounded_decode_selection_through_the_generator_trait_tiles_the_decode() {
+    use mlx_gen::gen_core::{MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy};
+
+    const TRAIT_EDGE: u32 = 512;
+    const TRAIT_TILE: u32 = 256;
+    let spec = LoadSpec::new(WeightsSource::Dir(tiny_snapshot()));
+    let generator = mlx_gen_qwen_image_2_1::provider_registry()
+        .unwrap()
+        .load(ID, &spec)
+        .unwrap();
+    let registered =
+        mlx_gen_qwen_image_2_1::memory_strategy::memory_strategy_contract(ID, &spec).unwrap();
+    assert!(mlx_gen_qwen_image_2_1::memory_strategy::DECODE_TILE_EDGES.contains(&TRAIT_TILE));
+
+    let mut context = admitted_context(
+        &registered,
+        &spec,
+        MemoryStrategy::BoundedDecode,
+        TRAIT_EDGE,
+    );
+    context.selection.parameters.decode_tile_edge = Some(TRAIT_TILE);
+    context.selection.parameters.decode_overlap = Some(DECODE_TILE_OVERLAP);
+    assert_eq!(
+        generator.memory_strategy_safety_check(&context),
+        MemorySafetyDecision::Accept
+    );
+    let mut scope = generator
+        .begin_memory_strategy_request(&context)
+        .unwrap()
+        .expect("bounded decode opens a request scope");
+    let mut tiled_req = request(TRAIT_EDGE, TRAIT_EDGE);
+    scope.configure_request(&mut tiled_req).unwrap();
+    let memory = tiled_req.memory.expect("the scope writes the selection");
+    assert!(
+        memory.tile_vae_decode,
+        "bounded decode must tile the VAE decode"
+    );
+    assert_eq!(memory.decode_tile_edge, Some(TRAIT_TILE));
+    assert_eq!(memory.decode_overlap, Some(DECODE_TILE_OVERLAP));
+    assert!(
+        mlx_gen_qwen_image_2_1::pipeline::decode_tiling(&tiled_req).is_some(),
+        "the pipeline must see the tiling the scope configured"
+    );
+
+    let (tiled, _) = generate_traced(&*generator, &tiled_req);
+    scope.finish(MemoryRunOutcome::Complete).unwrap();
+    let (untiled, _) = generate_traced(&*generator, &request(TRAIT_EDGE, TRAIT_EDGE));
+    assert_eq!((tiled.width, tiled.height), (TRAIT_EDGE, TRAIT_EDGE));
+    report(
+        "trait bounded decode vs untiled",
+        &tiled,
+        &untiled,
+        24.0,
+        2.0,
+    );
+}
+
+/// A selection **outside** the published decode domain is refused at the trait's safety check —
+/// the same typed refusal the registered seam raises — rather than rendering at a geometry no one
+/// published.
+#[test]
+fn an_unpublished_decode_geometry_is_refused_through_the_generator_trait() {
+    use mlx_gen::gen_core::{MemorySafetyDecision, MemoryStrategy};
+
+    let spec = LoadSpec::new(WeightsSource::Dir(tiny_snapshot()));
+    let generator = mlx_gen_qwen_image_2_1::provider_registry()
+        .unwrap()
+        .load(ID, &spec)
+        .unwrap();
+    let registered =
+        mlx_gen_qwen_image_2_1::memory_strategy::memory_strategy_contract(ID, &spec).unwrap();
+    let mut context = admitted_context(&registered, &spec, MemoryStrategy::BoundedDecode, 512);
+    context.selection.parameters.decode_tile_edge = Some(1024);
+    context.selection.parameters.decode_overlap = Some(DECODE_TILE_OVERLAP);
+    assert!(matches!(
+        generator.memory_strategy_safety_check(&context),
+        MemorySafetyDecision::Reject { .. }
+    ));
+    assert!(matches!(
+        generator.begin_memory_strategy_request(&context),
+        Err(mlx_gen::gen_core::Error::Unsupported(_))
+    ));
+}
+
 /// Bounded (tiled) decode is a memory lever, not a quality one: the head-once/tail-tiled decode
 /// must reproduce the untiled decode to within seam-blend noise, at every tier.
 #[test]

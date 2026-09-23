@@ -117,6 +117,41 @@ fn b_or(v: &Value, key: &str, default: bool) -> bool {
     v.get(key).and_then(Value::as_bool).unwrap_or(default)
 }
 
+/// The even `[t, h, w]` split of `half = head_dim / 2` the sibling Qwen3-VL ports use when a
+/// snapshot declares no `mrope_section` — `t` takes the remainder so the three always sum to `half`.
+pub(crate) fn even_mrope_section(half: usize) -> [usize; 3] {
+    [half - 2 * (half / 3), half / 3, half / 3]
+}
+
+/// A **present** `rope_scaling.mrope_section`, validated: exactly three non-negative integers that
+/// sum to `half`. Anything else is a typed refusal, never a silent fallback to
+/// [`even_mrope_section`] — a wrong section rotates every condition token with the wrong geometry
+/// and no later check would notice (sc-24114).
+pub(crate) fn parse_mrope_section(section: &Value, half: usize, ctx: &str) -> Result<[usize; 3]> {
+    let refuse = |why: &str| {
+        Error::Msg(format!(
+            "qwen_image_2_1: {ctx}: `mrope_section` {section} is invalid ({why}); it must be three \
+             non-negative integers summing to head_dim / 2 = {half}. Fix the snapshot's \
+             text_encoder/config.json, or omit the field for the even split."
+        ))
+    };
+    let items = section.as_array().ok_or_else(|| refuse("not an array"))?;
+    if items.len() != 3 {
+        return Err(refuse("wrong arity"));
+    }
+    let mut parsed = [0usize; 3];
+    for (slot, item) in parsed.iter_mut().zip(items) {
+        *slot = item
+            .as_u64()
+            .and_then(|x| usize::try_from(x).ok())
+            .ok_or_else(|| refuse("a non-integer entry"))?;
+    }
+    if parsed.iter().sum::<usize>() != half {
+        return Err(refuse("wrong sum"));
+    }
+    Ok(parsed)
+}
+
 fn f32_list(v: &Value, key: &str, ctx: &str) -> Result<Vec<f32>> {
     field(v, key, ctx)?
         .as_array()
@@ -271,24 +306,17 @@ impl TextEncoderConfig {
         let hidden_size = u(text, "hidden_size", ctx)?;
         let num_attention_heads = u(text, "num_attention_heads", ctx)?;
         let head_dim = u_or(text, "head_dim", hidden_size / num_attention_heads.max(1));
-        // `mrope_section` sums to `head_dim / 2`; a snapshot that omits it (or carries a section
-        // that does not sum) falls back to the even split the sibling Qwen3-VL ports use, which is
-        // also what a text-only prompt would collapse to anyway.
+        // `mrope_section` is `[t, h, w]` and sums to `head_dim / 2`. A snapshot that OMITS it
+        // falls back to the even split the sibling Qwen3-VL ports use (which is also what a
+        // text-only prompt collapses to); a snapshot that CARRIES one that is malformed — wrong
+        // arity, a non-integer entry, or a sum that is not `head_dim / 2` — is refused rather than
+        // silently re-split: the image-conditioned path would otherwise rotate every condition
+        // token with the wrong geometry and nothing downstream would notice (sc-24114).
         let half = head_dim / 2;
-        let even = [half - 2 * (half / 3), half / 3, half / 3];
-        let mrope_section = rope
-            .get("mrope_section")
-            .and_then(Value::as_array)
-            .filter(|s| s.len() == 3)
-            .and_then(|s| {
-                let parsed: Vec<usize> = s
-                    .iter()
-                    .filter_map(|v| v.as_u64().map(|x| x as usize))
-                    .collect();
-                (parsed.len() == 3 && parsed.iter().sum::<usize>() == half)
-                    .then(|| [parsed[0], parsed[1], parsed[2]])
-            })
-            .unwrap_or(even);
+        let mrope_section = match rope.get("mrope_section") {
+            None | Some(Value::Null) => even_mrope_section(half),
+            Some(section) => parse_mrope_section(section, half, ctx)?,
+        };
         Ok(Self {
             vocab_size: u(text, "vocab_size", ctx)?,
             hidden_size,
@@ -629,5 +657,68 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("spatial compression"), "{err}");
+    }
+
+    /// One `text_config` with `rope_scaling` replaced by `rope`.
+    fn text_encoder_with_rope(rope: serde_json::Value) -> Result<TextEncoderConfig> {
+        TextEncoderConfig::from_value(&serde_json::json!({
+            "model_type": "qwen3_vl",
+            "text_config": {
+                "attention_bias": false, "head_dim": 128, "hidden_size": 4096,
+                "intermediate_size": 12288, "num_attention_heads": 32, "num_hidden_layers": 36,
+                "num_key_value_heads": 8, "rms_norm_eps": 1e-06,
+                "rope_scaling": rope,
+                "rope_theta": 5000000, "vocab_size": 151936
+            }
+        }))
+    }
+
+    /// An **absent** `mrope_section` falls back to the even split; a **present** one is taken as
+    /// written when valid and is a typed refusal — never a silent even split — when it is not.
+    ///
+    /// *Mutation that reds this:* restoring the `.unwrap_or(even)` fallback for a present-but-
+    /// invalid section (any of the four malformed cases below would then load as `[44, 42, 42]`).
+    #[test]
+    fn mrope_section_falls_back_only_when_absent_and_refuses_when_present_and_invalid() {
+        // Absent (no `rope_scaling` block at all, a block without the key, or an explicit null):
+        // the even split of head_dim / 2 = 64 -> [22, 21, 21].
+        for rope in [
+            serde_json::Value::Null,
+            serde_json::json!({"rope_type": "default"}),
+            serde_json::json!({"rope_type": "default", "mrope_section": null}),
+        ] {
+            let te = text_encoder_with_rope(rope.clone()).unwrap();
+            assert_eq!(
+                te.mrope_section,
+                [22, 21, 21],
+                "absent section under {rope}"
+            );
+            assert_eq!(te.mrope_section, even_mrope_section(64));
+        }
+
+        // Present and valid: taken as written, even when it is not the even split.
+        let te =
+            text_encoder_with_rope(serde_json::json!({"mrope_section": [24, 20, 20]})).unwrap();
+        assert_eq!(te.mrope_section, [24, 20, 20]);
+        let te =
+            text_encoder_with_rope(serde_json::json!({"mrope_section": [32, 16, 16]})).unwrap();
+        assert_eq!(te.mrope_section, [32, 16, 16]);
+
+        // Present and invalid: refused, naming the field and the constraint.
+        for (section, why) in [
+            (serde_json::json!([24, 20]), "wrong arity"),
+            (serde_json::json!([24, 20, 20, 0]), "wrong arity"),
+            (serde_json::json!([24, 20, 21]), "wrong sum"),
+            (serde_json::json!([24, "20", 20]), "a non-integer entry"),
+            (serde_json::json!([24, -20, 60]), "a non-integer entry"),
+            (serde_json::json!(64), "not an array"),
+        ] {
+            let err = text_encoder_with_rope(serde_json::json!({"mrope_section": section}))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("`mrope_section`"), "{section}: {err}");
+            assert!(err.contains(why), "{section}: expected `{why}` in {err}");
+            assert!(err.contains("= 64"), "{section}: {err}");
+        }
     }
 }

@@ -13,9 +13,12 @@
 //!
 //! Every geometry comes from the component's own `config.json`, so the miniature parity snapshot
 //! and the production snapshot go through one code path. Unlike the MLX twin — which loads dense at
-//! the on-disk dtype — candle's `VarBuilder` casts on read, so each component names the dtype it
-//! computes in ([`compute_dtype`]): f32 on CPU (the parity lane) and bf16 on CUDA for the DiT and
-//! the VAE, matching the released checkpoint's own dtype.
+//! the on-disk dtype — candle's `VarBuilder` casts on read, so every component is materialized at
+//! ONE dtype, [`compute_dtype`]: f32 on CPU (the parity lane) and bf16 on CUDA/Metal for the DiT,
+//! the VAE **and the Qwen3-VL text encoder** (language tower + ViT), matching the released
+//! checkpoint's own dtype and how upstream runs it. Before sc-24114 the text encoder was read at
+//! f32 on every backend, which made the tower's resident footprint 4 B/param on CUDA — ~28 GiB
+//! for a component upstream holds at ~14 GiB.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -44,9 +47,10 @@ const PAD_TOKEN_ID: i32 = 151_643;
 /// Error label every loader message carries.
 pub(crate) const LABEL: &str = "qwen_image_2_1";
 
-/// The dtype this backend computes the weight-heavy components in: the checkpoint's own bf16 on a
-/// GPU backend, f32 on CPU (candle's CPU half-precision kernels are slow, and the parity lane wants
-/// f32 anyway). The text tower always runs f32 activations, matching the MLX twin.
+/// The dtype this backend materializes and computes **every** component in: the checkpoint's own
+/// bf16 on a GPU backend (CUDA/Metal) — the text encoder included, exactly as upstream's
+/// `QwenImage21Pipeline` runs `Qwen3VLForConditionalGeneration` in `torch_dtype=bfloat16` — and f32
+/// on CPU (candle's CPU half-precision kernels are slow, and the parity lane wants f32 anyway).
 pub fn compute_dtype() -> DType {
     #[cfg(any(feature = "cuda", feature = "metal"))]
     {
@@ -150,6 +154,7 @@ pub fn load_vision_config(root: &Path) -> Result<Option<VisionConfig>> {
 fn load_vision_tower_weights(
     dir: &Path,
     device: &Device,
+    dtype: DType,
 ) -> Result<candle_llm::primitives::Weights> {
     let files = candle_gen::loader::sorted_safetensors(dir, LABEL)?;
     let mut tensors: HashMap<String, candle_core::Tensor> = HashMap::new();
@@ -164,11 +169,11 @@ fn load_vision_tower_weights(
             .filter(|name| name.starts_with(VISION_TOWER_PREFIX))
             .collect();
         for name in names {
-            // f32 to match the language tower, which `VarBuilder` loads at `DType::F32`. Without
-            // this the two halves of ONE encoder would run in different dtypes on the released
-            // bf16 snapshot — the ViT in bf16 feeding f32 decoder layers — which is neither
-            // upstream's behaviour (bf16 end to end) nor this port's (f32 activations).
-            let tensor = st.load(&name, device)?.to_dtype(DType::F32)?;
+            // Cast to the language tower's `dtype` (`compute_dtype` on the production path), so
+            // the two halves of ONE encoder run at one dtype: bf16 end to end on CUDA/Metal, as
+            // upstream; f32 end to end on the CPU parity lane. (The released ViT ships bf16, so
+            // on a GPU build this is the `Arc`-clone no-op cast.)
+            let tensor = st.load(&name, device)?.to_dtype(dtype)?;
             tensors.insert(name, tensor);
         }
     }
@@ -192,14 +197,29 @@ pub fn load_text_encoder_from(
     device: &Device,
     vision: Option<&VisionConfig>,
 ) -> Result<QwenImage21TextEncoder> {
+    // The tower is materialized at the backend's compute dtype like every other component:
+    // bf16 on CUDA/Metal (upstream runs the encoder in bf16, and a bf16-resident tower is what
+    // the SceneWorks memory floors were derived at), f32 on the CPU parity lane (sc-24114).
+    load_text_encoder_from_at(dir, device, vision, compute_dtype())
+}
+
+/// [`load_text_encoder_from`] at an explicit `dtype` — the seam the tests use to hold the tower
+/// (language + ViT) to ONE materialization dtype on the CPU lane, where [`compute_dtype`] happens
+/// to be the f32 the tower used to be hard-wired to. Production goes through
+/// [`load_text_encoder_from`] and never names a dtype.
+pub fn load_text_encoder_from_at(
+    dir: &Path,
+    device: &Device,
+    vision: Option<&VisionConfig>,
+    dtype: DType,
+) -> Result<QwenImage21TextEncoder> {
     let cfg = TextEncoderConfig::from_json_file(&dir.join("config.json"))?;
-    // f32 activations over the checkpoint's weights, exactly as the MLX twin does.
-    let vb = candle_gen::loader::load_sorted_mmap(dir, DType::F32, device, LABEL)?;
+    let vb = candle_gen::loader::load_sorted_mmap(dir, dtype, device, LABEL)?;
     let encoder = QwenImage21TextEncoder::new(&cfg, vb, TEXT_ENCODER_PREFIX)?;
     let Some(vision) = vision else {
         return Ok(encoder);
     };
-    let weights = load_vision_tower_weights(dir, device)?;
+    let weights = load_vision_tower_weights(dir, device, dtype)?;
     let tower = candle_llm::models::Qwen35VisionModel::from_weights(
         &weights,
         VISION_TOWER_PREFIX,

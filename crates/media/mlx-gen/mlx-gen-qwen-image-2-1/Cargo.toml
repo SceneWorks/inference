@@ -31,13 +31,13 @@ mlx-llm = { workspace = true }
 # scheduler): the loader is config-driven so the tiny parity snapshot and the production snapshot
 # go through one code path.
 serde_json = { workspace = true }
+# sc-24114: the converter itself writes each tier's `SHA256SUMS` manifest (`convert::write_sha256sums`),
+# so the digest is a production dependency, not only the tests' hash pin over a converted tier.
+sha2 = { workspace = true }
 
 [dev-dependencies]
 sceneworks-gen-core-testkit = { workspace = true }
 tempfile = { workspace = true }
-# sc-24112: SHA-256 hash pins over the converted tier, proving the offline pre-quantization is
-# byte-reproducible and can therefore be bound to a published artefact.
-sha2 = { workspace = true }
 # PNG output for the ignored real-weight validation render.
 image = { workspace = true }
 

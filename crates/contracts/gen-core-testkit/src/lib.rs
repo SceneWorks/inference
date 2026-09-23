@@ -1007,17 +1007,30 @@ pub fn check_validate_honesty(g: &dyn Generator, profile: &Profile) -> Result<()
     }
 
     // Negative: EVERY undeclared conditioning kind must be rejected — not merely the first one
-    // that happens to lead the candidate list (sc-24111).
+    // that happens to lead the candidate list (sc-24111) — and rejected as the typed
+    // `Error::Unsupported`, the variant the worker keys off to tell "refused by design" from
+    // "broke" (sc-24114). A provider whose own pre-floor validation refuses a kind as `Msg`
+    // reports a capability refusal as a failure.
     for cond in undeclared_conditioning(caps, profile) {
         let kind = cond.kind();
         let mut r = base_request(profile);
         r.conditioning = vec![cond];
-        if g.validate(&r).is_ok() {
-            return Err(format!(
-                "validate-honesty[{id}]: undeclared {kind:?} conditioning was accepted by validate() \
-                 (descriptor advertises {:?})",
-                caps.conditioning
-            ));
+        match g.validate(&r) {
+            Ok(()) => {
+                return Err(format!(
+                    "validate-honesty[{id}]: undeclared {kind:?} conditioning was accepted by \
+                     validate() (descriptor advertises {:?})",
+                    caps.conditioning
+                ));
+            }
+            Err(Error::Unsupported(_)) => {}
+            Err(other) => {
+                return Err(format!(
+                    "validate-honesty[{id}]: undeclared {kind:?} conditioning was refused as \
+                     {other:?} rather than Error::Unsupported — an unadvertised conditioning kind \
+                     is a capability refusal, not a failure"
+                ));
+            }
         }
     }
 
