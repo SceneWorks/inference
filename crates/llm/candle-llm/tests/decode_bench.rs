@@ -10,7 +10,7 @@
 //! |----------------------------|--------------------------------------------------------------|
 //! | `DECODE_BENCH_SNAPSHOT`    | snapshot directory (config.json, tokenizer*.json, shards)    |
 //! | `DECODE_BENCH_OUTPUT`      | JSON path to write (must not exist)                          |
-//! | `DECODE_BENCH_ROWS`        | comma list of `reference`, `step_model`, `mtp` (default all) |
+//! | `DECODE_BENCH_ROWS`        | comma list of `reference`, `reference_unfused`, `step_model`, `mtp` (default `reference,step_model,mtp`) |
 //! | `DECODE_BENCH_DRAFTS`      | MTP draft widths, comma list (default `1,2,3,4,5`)           |
 //! | `DECODE_BENCH_NEW_TOKENS`  | tokens generated per row (default 256)                       |
 //! | `DECODE_BENCH_WARMUP_TOKENS` | tokens of the untimed warm-up run (default 16)             |
@@ -19,7 +19,10 @@
 //!
 //! Rows are greedy (`temperature = 0`), no stop tokens, so every row emits exactly `NEW_TOKENS`
 //! and the token sequences are comparable: each row records whether it matched the reference row
-//! token-for-token and, if not, the first divergence. Timing brackets the *decode* phase only
+//! token-for-token and, if not, the first divergence. The `reference_unfused` row (sc-24137) is
+//! the reference loop with the fused decode primitives switched **off** for that row only, so one
+//! document holds the fused-on vs fused-off token identity and tok/s; every row also records its
+//! fused-vs-reference primitive tally (`fused_primitives`) and the document records the switch. Timing brackets the *decode* phase only
 //! (prefill is reported separately) with a device synchronize on both sides.
 //!
 //! Memory: `device_used_bytes_at_last_token` is `cuMemGetInfo` total-free sampled from the row's
@@ -52,10 +55,46 @@ use serde_json::{json, Value};
 // >>> head-only
 use candle_llm::decode::generate_step_timed;
 use candle_llm::decode::CountingDecode;
-use candle_llm::primitives::host_sync_count;
+use candle_llm::primitives::{
+    fused_kernels_enabled, fused_tally, host_sync_count, set_fused_kernels,
+};
 
 fn host_syncs_now() -> Option<u64> {
     Some(host_sync_count())
+}
+
+/// The fused-primitive switch state (`on` / `off`), or `None` on a binary without the switch.
+fn fused_switch() -> Option<&'static str> {
+    Some(if fused_kernels_enabled() { "on" } else { "off" })
+}
+
+/// A snapshot of the thread's fused-vs-reference primitive tally (sc-24137), or `None` on a
+/// binary without the fused primitives; `fused_delta` turns two snapshots into a row's JSON.
+fn fused_tally_now() -> Option<candle_llm::primitives::FusedTally> {
+    Some(fused_tally())
+}
+
+fn fused_delta(
+    before: Option<candle_llm::primitives::FusedTally>,
+    switch: Option<&'static str>,
+) -> Option<Value> {
+    let d = fused_tally_now()?.since(&before?);
+    Some(json!({
+        "switch": switch,
+        "fused": d.fused,
+        "reference": d.reference,
+        "reference_reason": d.reference_reason,
+        "path": d.label(),
+    }))
+}
+
+/// Run `f` with the fused primitives switched off, restoring the previous policy afterwards.
+fn with_fused_off<T>(f: impl FnOnce() -> T) -> T {
+    let was = fused_kernels_enabled();
+    set_fused_kernels(Some(false));
+    let out = f();
+    set_fused_kernels(Some(was));
+    out
 }
 
 /// The reference row with its target forwards **measured**: the loop runs through a
@@ -127,6 +166,22 @@ fn step_model_row(
 const BASELINE_STUB: &str = r#"
 fn host_syncs_now() -> Option<u64> {
     None
+}
+
+fn fused_switch() -> Option<&'static str> {
+    None
+}
+
+fn fused_tally_now() -> Option<()> {
+    None
+}
+
+fn fused_delta(_before: Option<()>, _switch: Option<&'static str>) -> Option<Value> {
+    None
+}
+
+fn with_fused_off<T>(f: impl FnOnce() -> T) -> T {
+    f()
 }
 
 fn reference_row(
@@ -332,6 +387,7 @@ fn row_json(
     host_syncs: Option<u64>,
     device_used_at_last_token: Option<u64>,
     cache: Option<(u64, u64)>,
+    fused_primitives: Option<Value>,
 ) -> Value {
     let generated = out.tokens.len() as u64;
     let ratio = |num: Option<u64>, den: u64| -> Value {
@@ -363,6 +419,7 @@ fn row_json(
         "device_used_bytes_at_last_token": device_used_at_last_token,
         "cache_live_bytes": cache.map(|(live, _)| live),
         "cache_checkpoint_bytes": cache.map(|(_, checkpoint)| checkpoint),
+        "fused_primitives": fused_primitives,
         "tokens_match_reference": matches,
         "first_divergence": diverged.flatten(),
         "tokens": out.tokens,
@@ -456,10 +513,12 @@ fn decode_bench() {
 
     let mut rows_json = Vec::new();
     let mut reference_tokens: Option<Vec<i32>> = None;
+    let switch = fused_switch();
 
     if rows.iter().any(|r| r == "reference") {
         reference_row(&model, &prompt, &warm, &device, &mut |_| {});
         let syncs0 = host_syncs_now();
+        let fused0 = fused_tally_now();
         let mut at_last = None;
         let (out, prefill, decode, forwards) = reference_row(
             &model,
@@ -469,11 +528,13 @@ fn decode_bench() {
             &mut last_token_sampler(&device, new_tokens, &mut at_last),
         );
         let syncs = host_syncs_now().zip(syncs0).map(|(a, b)| a - b);
+        let fused = fused_delta(fused0, switch);
         let used = note_peak(at_last);
         eprintln!(
-            "[decode_bench] reference        {:>7.2} tok/s  prefill {:.3}s",
+            "[decode_bench] reference        {:>7.2} tok/s  prefill {:.3}s  fused {}",
             out.tokens.len() as f64 / decode,
-            prefill
+            prefill,
+            fused.as_ref().map_or("n/a".to_string(), |f| f.to_string())
         );
         rows_json.push(row_json(
             "reference",
@@ -488,12 +549,57 @@ fn decode_bench() {
             syncs,
             used,
             None,
+            fused,
         ));
         reference_tokens = Some(out.tokens);
     }
 
+    if rows.iter().any(|r| r == "reference_unfused") {
+        with_fused_off(|| reference_row(&model, &prompt, &warm, &device, &mut |_| {}));
+        let syncs0 = host_syncs_now();
+        let fused0 = fused_tally_now();
+        let mut at_last = None;
+        let (out, prefill, decode, forwards) = with_fused_off(|| {
+            reference_row(
+                &model,
+                &prompt,
+                &config,
+                &device,
+                &mut last_token_sampler(&device, new_tokens, &mut at_last),
+            )
+        });
+        let syncs = host_syncs_now().zip(syncs0).map(|(a, b)| a - b);
+        let fused = fused_delta(fused0, Some("off"));
+        let used = note_peak(at_last);
+        eprintln!(
+            "[decode_bench] reference_unfused {:>6.2} tok/s  prefill {:.3}s  fused {}",
+            out.tokens.len() as f64 / decode,
+            prefill,
+            fused.as_ref().map_or("n/a".to_string(), |f| f.to_string())
+        );
+        rows_json.push(row_json(
+            "reference_unfused",
+            None,
+            &out,
+            reference_tokens.as_deref(),
+            prefill,
+            decode,
+            forwards,
+            None,
+            None,
+            syncs,
+            used,
+            None,
+            fused,
+        ));
+        if reference_tokens.is_none() {
+            reference_tokens = Some(out.tokens);
+        }
+    }
+
     if rows.iter().any(|r| r == "step_model") {
         step_model_row(&model, &prompt, &warm, &device, &mut |_| {});
+        let fused0 = fused_tally_now();
         let mut at_last = None;
         let (out, prefill, decode, record, cache) = step_model_row(
             &model,
@@ -503,6 +609,7 @@ fn decode_bench() {
             &mut last_token_sampler(&device, new_tokens, &mut at_last),
         );
         let cache = checked_step_cache(new_tokens, cache);
+        let fused = fused_delta(fused0, switch);
         let used = note_peak(at_last);
         eprintln!(
             "[decode_bench] step_model       {:>7.2} tok/s  prefill {:.3}s",
@@ -526,6 +633,7 @@ fn decode_bench() {
             syncs,
             used,
             cache,
+            fused,
         ));
         if reference_tokens.is_none() {
             reference_tokens = Some(out.tokens);
@@ -537,6 +645,7 @@ fn decode_bench() {
         for &k in &drafts {
             mtp_row(&model, mtp, &prompt, &warm, k, &device, &mut |_| {});
             let syncs0 = host_syncs_now();
+            let fused0 = fused_tally_now();
             let mut at_last = None;
             let (out, stats, prefill, decode) = mtp_row(
                 &model,
@@ -548,6 +657,7 @@ fn decode_bench() {
                 &mut last_token_sampler(&device, new_tokens, &mut at_last),
             );
             let syncs = host_syncs_now().zip(syncs0).map(|(a, b)| a - b);
+            let fused = fused_delta(fused0, switch);
             let used = note_peak(at_last);
             eprintln!(
                 "[decode_bench] mtp K={k}          {:>7.2} tok/s  accept {:.3}  fwd/tok {:.3}",
@@ -572,6 +682,7 @@ fn decode_bench() {
                 syncs,
                 used,
                 None,
+                fused,
             ));
         }
     }
@@ -590,6 +701,7 @@ fn decode_bench() {
     doc.insert("prompt_tokens", json!(prompt.len()));
     doc.insert("new_tokens", json!(new_tokens));
     doc.insert("warmup_tokens", json!(warmup_tokens));
+    doc.insert("fused_kernels", json!(switch));
     doc.insert("device_used_bytes_after_load", json!(used_after_load));
     doc.insert("peak_device_used_bytes", json!(peak_used));
     doc.insert(

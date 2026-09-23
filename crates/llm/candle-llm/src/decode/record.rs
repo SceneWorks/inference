@@ -14,6 +14,10 @@
 //! Story sc-24133 adds the sampler's half ([`SamplerTelemetry`]): which sampler path served the
 //! request (`device`, or `host` with the reason), how many draws each path made, and how many whole
 //! logits rows were copied to the host.
+//!
+//! Story sc-24137 adds the fused-vs-reference primitive counts, by the thread-local tally in
+//! [`primitives::fused`](crate::primitives::fused) bracketed the same way — so a request that
+//! took the op-chain path for a leaf shows `reference` / `mixed` with the reason, never silently.
 
 use std::cell::Cell;
 
@@ -22,6 +26,7 @@ use candle_core::{Device, Tensor};
 use crate::decode::speculative::SpeculativeStats;
 use crate::decode::stream::Decode;
 use crate::error::Result;
+use crate::primitives::fused::{fused_tally, FusedTally};
 use crate::primitives::host_sync::{
     host_sync_count, last_host_reason, sampler_counters, SamplerCounters,
 };
@@ -109,6 +114,10 @@ pub struct DecodeRecord {
     pub host_syncs: u64,
     /// Which sampler path served the request (`device` | `host` + reason) and its counters.
     pub sampler: SamplerTelemetry,
+    /// Fused-vs-reference primitive leaf runs while generating (see `primitives::fused`): how many
+    /// RMSNorm / SwiGLU / QK-norm+RoPE leaves ran the fused kernel, how many the op chain, and why
+    /// the last op-chain run happened. `FusedTally::label` gives `fused` / `reference` / `mixed`.
+    pub fused_primitives: FusedTally,
 }
 
 impl DecodeRecord {
@@ -127,7 +136,15 @@ impl DecodeRecord {
             generated_tokens: generated as u64,
             host_syncs: counters.host_syncs,
             sampler: counters.sampler,
+            fused_primitives: FusedTally::default(),
         }
+    }
+
+    /// The same record with its fused-primitive tally filled in (from
+    /// [`RequestSpan::fused_primitives`]).
+    pub fn with_fused_primitives(mut self, tally: FusedTally) -> Self {
+        self.fused_primitives = tally;
+        self
     }
 
     /// A record from a speculative run's [`SpeculativeStats`].
@@ -145,6 +162,7 @@ impl DecodeRecord {
             generated_tokens: generated as u64,
             host_syncs: counters.host_syncs,
             sampler: counters.sampler,
+            fused_primitives: FusedTally::default(),
         }
     }
 
@@ -180,6 +198,7 @@ impl DecodeRecord {
 pub struct RequestSpan {
     host_syncs_at_start: u64,
     sampler_at_start: SamplerCounters,
+    fused_at_start: FusedTally,
 }
 
 impl Default for RequestSpan {
@@ -194,6 +213,7 @@ impl RequestSpan {
         Self {
             host_syncs_at_start: host_sync_count(),
             sampler_at_start: sampler_counters(),
+            fused_at_start: fused_tally(),
         }
     }
 
@@ -229,6 +249,11 @@ impl RequestSpan {
             host_syncs: self.host_syncs(),
             sampler: self.sampler(),
         }
+    }
+
+    /// Fused-vs-reference primitive runs on this thread since [`begin`](Self::begin).
+    pub fn fused_primitives(&self) -> FusedTally {
+        fused_tally().since(&self.fused_at_start)
     }
 }
 
@@ -376,5 +401,26 @@ mod tests {
         let next = RequestSpan::begin();
         note_sampler_path(SamplerPath::Device);
         assert_eq!(next.sampler().path, Some(SamplerPath::Device));
+    }
+
+    #[test]
+    fn request_span_brackets_this_threads_fused_primitive_runs() {
+        let span = RequestSpan::begin();
+        crate::primitives::fused::note_reference("shape");
+        crate::primitives::fused::note_fused();
+        let tally = span.fused_primitives();
+        assert_eq!(tally.fused, 1);
+        assert_eq!(tally.reference, 1);
+        assert_eq!(tally.reference_reason, Some("shape"));
+        assert_eq!(tally.label(), "mixed");
+        let record = DecodeRecord::plain(DecodePath::Reference, 1, 1, SpanCounters::default())
+            .with_fused_primitives(tally);
+        assert_eq!(record.fused_primitives, tally);
+        assert_eq!(
+            DecodeRecord::plain(DecodePath::Reference, 1, 1, SpanCounters::default())
+                .fused_primitives
+                .label(),
+            "none"
+        );
     }
 }
