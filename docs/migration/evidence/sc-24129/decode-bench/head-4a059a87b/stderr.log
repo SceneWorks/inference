@@ -1,0 +1,8 @@
+[decode_bench] reference          12.17 tok/s  prefill 0.687s
+[decode_bench] step_model         11.85 tok/s  prefill 0.749s
+[decode_bench] mtp K=1            14.99 tok/s  accept 0.827  fwd/tok 0.645
+[decode_bench] mtp K=2            16.67 tok/s  accept 0.779  fwd/tok 0.512
+[decode_bench] mtp K=3            14.85 tok/s  accept 0.607  fwd/tok 0.559
+[decode_bench] mtp K=4            13.29 tok/s  accept 0.493  fwd/tok 0.609
+[decode_bench] mtp K=5            13.39 tok/s  accept 0.480  fwd/tok 0.547
+[decode_bench] wrote C:\Users\Michael\AppData\Local\Temp\claude\decode-bench\sc-24129-r2\head-4a059a87b\decode_bench.json

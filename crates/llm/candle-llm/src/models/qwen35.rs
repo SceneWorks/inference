@@ -24,14 +24,16 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::ops::sigmoid;
 use serde_json::Value;
 
+use crate::decode::step::{LogitsScope, StepModel, StepOutput, StepRequest};
 use crate::device::compute_dtype;
 use crate::error::{Error, Result};
 use crate::models::deepstack::{self, deepstack_fused_decoder_layers};
 use crate::primitives::attention::{repeat_kv, sdpa, AttnMask};
+use crate::primitives::decode_cache::{tensor_bytes, CacheMemory, DecodeCache};
 use crate::primitives::gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
 };
-use crate::primitives::nn::{embed, rms_norm, silu};
+use crate::primitives::nn::{embed, input_ids, rms_norm, silu};
 use crate::primitives::projection::{Projection, QuantSpec};
 use crate::primitives::rope::{apply_rope, Rope};
 use crate::primitives::{KvCache, PrismRegistry, Weights};
@@ -421,6 +423,7 @@ impl MoeFfn {
 
         // Router probabilities (f32 softmax for a stable top-k), pulled to host.
         let logits = xf.matmul(&self.router.t()?)?; // [t, E]
+        crate::primitives::host_sync::note_host_sync();
         let probs =
             candle_nn::ops::softmax_last_dim(&logits.to_dtype(DType::F32)?)?.to_vec2::<f32>()?;
 
@@ -540,7 +543,78 @@ impl AttnKv {
             .map(|(k, _)| k.dims()[2] as i32)
             .unwrap_or(0)
     }
+
+    /// Keep positions `0..len` along the sequence axis (the growing-KV half of a rollback). The
+    /// narrowed views are made contiguous so the next append copies only what is kept.
+    fn truncate(&mut self, len: i32) -> Result<()> {
+        let Some((k, v)) = self.kv.take() else {
+            return Ok(());
+        };
+        let cur = k.dims()[2];
+        let len = usize::try_from(len).map_err(|_| Error::Msg("AttnKv: negative length".into()))?;
+        if len > cur {
+            return Err(Error::Msg(format!(
+                "AttnKv: cannot truncate to {len} past {cur} cached positions"
+            )));
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        if len == cur {
+            self.kv = Some((k, v));
+            return Ok(());
+        }
+        self.kv = Some((
+            k.narrow(2, 0, len)?.contiguous()?,
+            v.narrow(2, 0, len)?.contiguous()?,
+        ));
+        Ok(())
+    }
+
+    fn bytes(&self) -> usize {
+        self.kv
+            .as_ref()
+            .map(|(k, v)| tensor_bytes(k).saturating_add(tensor_bytes(v)))
+            .unwrap_or(0)
+    }
 }
+
+fn delta_bytes(c: &DeltaNetCache) -> usize {
+    c.conv_state
+        .as_ref()
+        .map(tensor_bytes)
+        .unwrap_or(0)
+        .saturating_add(c.ssm_state.as_ref().map(tensor_bytes).unwrap_or(0))
+}
+
+/// The recurrent (Gated DeltaNet) state of every linear layer at one sequence position — what a
+/// rollback restores, because the recurrence cannot be inverted. Only the linear layers are held
+/// (the full-attention KV rolls back by narrowing); the tensors are reference-counted clones, so a
+/// checkpoint costs no device memory until the live state moves on.
+#[derive(Clone, Debug)]
+struct DeltaCheckpoint {
+    offset: i32,
+    /// `(layer index, state)` for each linear layer, in layer order.
+    states: Vec<(usize, DeltaNetCache)>,
+}
+
+/// Rollback checkpoints retained by a cache built through [`Qwen35Model::new_cache`] (and so
+/// `Decode::make_cache`) — the reference and MTP paths the provider runs. Neither calls
+/// [`Qwen35Cache::rollback_to`] (the MTP loop restores a clone), so they retain **none**: such a
+/// cache holds exactly one recurrent state, which is what request admission charges (E6). The
+/// provider's `memory_geometry` prices `1 + REFERENCE_MAX_CHECKPOINTS` recurrent states, so raising
+/// this constant raises admission with it.
+pub const REFERENCE_MAX_CHECKPOINTS: usize = 0;
+
+/// Rollback checkpoints retained by a cache built through the [`StepModel`] seam
+/// ([`StepModel::new_cache`]) — the callers that roll back (the speculative verify of S2): the
+/// position the current step started from plus one earlier. Each checkpoint pins every linear
+/// layer's recurrent state — on Qwen3.8-27B ~151 MB of SSM state (48 linear layers × 48 value heads
+/// × 128 × 128 × 4 B) plus a ~6 MB conv tail — so at steady state a step cache holds three recurrent
+/// states (live + two checkpoints). A caller that admits step-seam requests must price
+/// `1 + STEP_MAX_CHECKPOINTS` states; deeper history is opt-in via
+/// [`Qwen35Cache::set_max_checkpoints`].
+pub const STEP_MAX_CHECKPOINTS: usize = 2;
 
 /// The per-layer cache slot — a recurrent [`DeltaNetCache`] for linear layers, growing KV for
 /// full-attention layers.
@@ -550,15 +624,31 @@ pub enum Qwen35LayerCache {
     Attn(AttnKv),
 }
 
-/// The hybrid decoder's cache: one slot per decoder layer.
+/// The hybrid decoder's cache: one slot per decoder layer, plus the rollback checkpoints that make
+/// it a [`DecodeCache`].
+///
+/// The decoder records a [`checkpoint`](Self::checkpoint) of the linear layers' recurrent state at
+/// the start of every forward (i.e. at every position a step began from), keeping the newest
+/// [`max_checkpoints`](Self::set_max_checkpoints). [`rollback_to`](Self::rollback_to) can therefore
+/// return to any of those positions exactly — which covers what speculative decoding needs (roll
+/// back to the position the verify step started from) — and refuses positions it has no checkpoint
+/// for rather than approximating them. Per-position checkpoints inside a multi-token forward are the
+/// DeltaNet-checkpoint story (S3) and plug in behind the same method.
+///
+/// Retention depends on who built the cache: [`Qwen35Model::new_cache`] (reference / MTP paths)
+/// keeps [`REFERENCE_MAX_CHECKPOINTS`] (none), [`StepModel::new_cache`] keeps
+/// [`STEP_MAX_CHECKPOINTS`].
 #[derive(Clone, Debug)]
 pub struct Qwen35Cache {
     layers: Vec<Qwen35LayerCache>,
+    checkpoints: Vec<DeltaCheckpoint>,
+    max_checkpoints: usize,
 }
 
 impl Qwen35Cache {
     /// Positions already cached — the RoPE offset for the next step (read from the first full-attn
-    /// layer; all layers advance in lockstep).
+    /// layer, or the first linear layer when the schedule has no full-attention layer; all layers
+    /// advance in lockstep).
     pub fn offset(&self) -> i32 {
         self.layers
             .iter()
@@ -566,10 +656,16 @@ impl Qwen35Cache {
                 Qwen35LayerCache::Attn(a) => Some(a.offset()),
                 Qwen35LayerCache::Delta(_) => None,
             })
+            .or_else(|| {
+                self.layers.iter().find_map(|l| match l {
+                    Qwen35LayerCache::Delta(c) => Some(c.offset()),
+                    Qwen35LayerCache::Attn(_) => None,
+                })
+            })
             .unwrap_or(0)
     }
 
-    /// Drop all cached state.
+    /// Drop all cached state and every checkpoint.
     pub fn reset(&mut self) {
         for l in &mut self.layers {
             match l {
@@ -577,6 +673,158 @@ impl Qwen35Cache {
                 Qwen35LayerCache::Attn(a) => a.kv = None,
             }
         }
+        self.checkpoints.clear();
+    }
+
+    /// Change how many rollback checkpoints are retained (newest kept; `0` disables rollback to
+    /// anything but the current position and zero).
+    pub fn set_max_checkpoints(&mut self, max: usize) {
+        self.max_checkpoints = max;
+        self.prune_checkpoints();
+    }
+
+    /// How many rollback checkpoints this cache retains.
+    pub fn max_checkpoints(&self) -> usize {
+        self.max_checkpoints
+    }
+
+    /// Logical bytes of recurrent (Gated DeltaNet) state referenced by the cache: the live linear
+    /// layers' states plus every checkpoint's. The attention KV is excluded — this is the term
+    /// admission prices as `recurrent_bytes` (see `REFERENCE_MAX_CHECKPOINTS`).
+    pub fn recurrent_bytes(&self) -> usize {
+        let live = self.layers.iter().fold(0usize, |acc, l| match l {
+            Qwen35LayerCache::Delta(c) => acc.saturating_add(delta_bytes(c)),
+            Qwen35LayerCache::Attn(_) => acc,
+        });
+        live.saturating_add(self.memory().checkpoint_bytes)
+    }
+
+    /// The positions [`rollback_to`](Self::rollback_to) can currently return to, ascending
+    /// (`0` and the current position are always possible and not listed).
+    pub fn checkpoint_offsets(&self) -> Vec<i32> {
+        self.checkpoints.iter().map(|c| c.offset).collect()
+    }
+
+    /// Record the linear layers' recurrent state at the current position. Idempotent for a
+    /// position already checkpointed as the newest entry. Called by the decoder at the start of
+    /// every forward.
+    pub fn checkpoint(&mut self) {
+        let offset = self.offset();
+        if self.max_checkpoints == 0 {
+            return;
+        }
+        if self.checkpoints.last().is_some_and(|c| c.offset == offset) {
+            return;
+        }
+        // A forward at an earlier position than a stored checkpoint means the cache was rolled back
+        // through a path other than `rollback_to` (a clone restored by the MTP loop); those later
+        // checkpoints describe positions that no longer exist.
+        self.checkpoints.retain(|c| c.offset < offset);
+        let states = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| match l {
+                Qwen35LayerCache::Delta(c) => Some((i, c.clone())),
+                Qwen35LayerCache::Attn(_) => None,
+            })
+            .collect();
+        self.checkpoints.push(DeltaCheckpoint { offset, states });
+        self.prune_checkpoints();
+    }
+
+    fn prune_checkpoints(&mut self) {
+        if self.checkpoints.len() > self.max_checkpoints {
+            let drop = self.checkpoints.len() - self.max_checkpoints;
+            self.checkpoints.drain(..drop);
+        }
+    }
+
+    /// Roll the cache back so the next step continues from position `n` (see
+    /// [`DecodeCache::rollback_to`]): the full-attention KV is narrowed to `n` and the linear
+    /// layers' recurrent state is restored from the checkpoint taken at `n`. `n == offset()` is a
+    /// no-op and `n == 0` is a [`reset`](Self::reset); any other `n` without a checkpoint is
+    /// [`Error::RollbackUnavailable`] (typed, so a speculative engine can fall back without matching
+    /// message text) and leaves the cache untouched. `n` outside `0..=offset()` is [`Error::Msg`].
+    pub fn rollback_to(&mut self, n: i32) -> Result<()> {
+        let cur = self.offset();
+        if n < 0 || n > cur {
+            return Err(Error::Msg(format!(
+                "Qwen35Cache: cannot roll back to {n} with {cur} positions cached"
+            )));
+        }
+        if n == cur {
+            return Ok(());
+        }
+        if n == 0 {
+            self.reset();
+            return Ok(());
+        }
+        let idx = self
+            .checkpoints
+            .iter()
+            .rposition(|c| c.offset == n)
+            .ok_or_else(|| Error::RollbackUnavailable {
+                n,
+                have: self.checkpoint_offsets(),
+            })?;
+        let checkpoint = self.checkpoints[idx].clone();
+        for (i, state) in checkpoint.states {
+            match &mut self.layers[i] {
+                Qwen35LayerCache::Delta(c) => *c = state,
+                Qwen35LayerCache::Attn(_) => {
+                    return Err(Error::Msg(
+                        "Qwen35Cache: checkpoint/layer type mismatch".into(),
+                    ))
+                }
+            }
+        }
+        for l in &mut self.layers {
+            if let Qwen35LayerCache::Attn(a) = l {
+                a.truncate(n)?;
+            }
+        }
+        // The checkpoint at `n` still describes the (restored) state at `n`; later ones do not.
+        self.checkpoints.truncate(idx + 1);
+        Ok(())
+    }
+
+    /// Logical bytes referenced by the live state and by the checkpoints (see
+    /// [`CacheMemory`] for what is and is not counted).
+    pub fn memory(&self) -> CacheMemory {
+        let live_bytes = self.layers.iter().fold(0usize, |acc, l| {
+            acc.saturating_add(match l {
+                Qwen35LayerCache::Delta(c) => delta_bytes(c),
+                Qwen35LayerCache::Attn(a) => a.bytes(),
+            })
+        });
+        let checkpoint_bytes = self
+            .checkpoints
+            .iter()
+            .flat_map(|c| c.states.iter())
+            .fold(0usize, |acc, (_, s)| acc.saturating_add(delta_bytes(s)));
+        CacheMemory {
+            live_bytes,
+            checkpoint_bytes,
+        }
+    }
+}
+
+impl DecodeCache for Qwen35Cache {
+    fn len(&self) -> i32 {
+        self.offset()
+    }
+
+    fn rollback_to(&mut self, n: i32) -> Result<()> {
+        Qwen35Cache::rollback_to(self, n)
+    }
+
+    fn reset(&mut self) {
+        Qwen35Cache::reset(self)
+    }
+
+    fn memory(&self) -> CacheMemory {
+        Qwen35Cache::memory(self)
     }
 }
 
@@ -986,8 +1234,15 @@ impl Qwen35Model {
         self.dtype
     }
 
-    /// A fresh per-layer cache (linear vs full-attn slot per the schedule).
+    /// A fresh per-layer cache (linear vs full-attn slot per the schedule) for the reference and MTP
+    /// paths: it retains [`REFERENCE_MAX_CHECKPOINTS`] (no) rollback checkpoints.
     pub fn new_cache(&self) -> Qwen35Cache {
+        self.new_cache_with_checkpoints(REFERENCE_MAX_CHECKPOINTS)
+    }
+
+    /// A fresh cache that retains up to `max_checkpoints` rollback checkpoints (see
+    /// [`Qwen35Cache::rollback_to`]); each costs one recurrent state of device memory.
+    pub fn new_cache_with_checkpoints(&self, max_checkpoints: usize) -> Qwen35Cache {
         let layers = (0..self.cfg.num_layers)
             .map(|i| {
                 if self.cfg.is_linear(i) {
@@ -997,7 +1252,16 @@ impl Qwen35Model {
                 }
             })
             .collect();
-        Qwen35Cache { layers }
+        Qwen35Cache {
+            layers,
+            checkpoints: Vec::new(),
+            max_checkpoints,
+        }
+    }
+
+    /// The device the model's tensors live on.
+    pub fn device(&self) -> &Device {
+        &self.device
     }
 
     /// Run the decoder stack over `input_ids` `[B, S]` at sequence `offset`, returning the final
@@ -1019,6 +1283,7 @@ impl Qwen35Model {
         sin: &Tensor,
         cache: &mut Qwen35Cache,
     ) -> Result<Tensor> {
+        cache.checkpoint();
         let mut h = embeds.clone();
         for (layer, slot) in self.layers.iter().zip(cache.layers.iter_mut()) {
             h = layer.forward(&h, cos, sin, slot)?;
@@ -1264,6 +1529,7 @@ impl Qwen35Model {
             &self.device,
         )?;
         let h0 = embeds.to_dtype(self.dtype)?;
+        cache.checkpoint();
         let h = deepstack_fused_decoder_layers(
             &h0,
             visual_pos_mask,
@@ -1292,6 +1558,7 @@ impl Qwen35Model {
             &self.device,
         )?;
         let h0 = embeds.to_dtype(self.dtype)?;
+        cache.checkpoint();
         let hidden = deepstack_fused_decoder_layers(
             &h0,
             visual_pos_mask,
@@ -1320,6 +1587,7 @@ impl Qwen35Model {
             &self.device,
         )?;
         let h0 = embeds.to_dtype(self.dtype)?;
+        cache.checkpoint();
         let hidden = deepstack_fused_decoder_layers(
             &h0,
             visual_pos_mask,
@@ -1607,8 +1875,54 @@ impl KvCache for Qwen35Cache {
         ))
     }
 
-    fn truncate(&mut self, _len: i32) -> Result<()> {
-        Err(Error::Msg("Qwen35Cache: truncate not supported".into()))
+    // Rollback through the trait object: exact where a checkpoint exists (see `rollback_to`).
+    fn truncate(&mut self, len: i32) -> Result<()> {
+        Qwen35Cache::rollback_to(self, len)
+    }
+}
+
+impl StepModel for Qwen35Model {
+    type Cache = Qwen35Cache;
+
+    /// A cache that retains [`STEP_MAX_CHECKPOINTS`] rollback checkpoints — the step seam's callers
+    /// (the speculative verify) roll back through them.
+    fn new_cache(&self) -> Qwen35Cache {
+        self.new_cache_with_checkpoints(STEP_MAX_CHECKPOINTS)
+    }
+
+    fn device(&self) -> &Device {
+        &self.device
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.cfg.vocab_size as usize
+    }
+
+    fn forward_step(
+        &self,
+        cache: &mut Qwen35Cache,
+        request: StepRequest<'_>,
+    ) -> Result<StepOutput> {
+        if request.tokens.is_empty() {
+            return Err(Error::Msg(
+                "Qwen35Model::forward_step: empty token slice".into(),
+            ));
+        }
+        let offset = cache.offset();
+        let ids = input_ids(request.tokens, &self.device)?;
+        let (logits, hidden) = match (request.scope, request.want_hidden) {
+            (LogitsScope::Last, false) => (self.decode_logits(&ids, cache, offset)?, None),
+            (LogitsScope::Last, true) => {
+                let (logits, hidden) = self.prefill_with_hidden(&ids, cache, offset)?;
+                (logits, Some(hidden))
+            }
+            (LogitsScope::All, false) => (self.forward(&ids, cache, offset)?, None),
+            (LogitsScope::All, true) => {
+                let (logits, hidden) = self.forward_with_hidden(&ids, cache, offset)?;
+                (logits, Some(hidden))
+            }
+        };
+        Ok(StepOutput { logits, hidden })
     }
 }
 
@@ -1688,7 +2002,7 @@ impl crate::models::VlmDecode for Qwen35Model {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
@@ -2263,7 +2577,7 @@ mod tests {
         );
     }
 
-    fn text_model() -> (Qwen35Config, Qwen35Model) {
+    pub(crate) fn text_model() -> (Qwen35Config, Qwen35Model) {
         let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
         let model = Qwen35Model::from_weights(
             &synthetic_weights(&cfg),
@@ -2404,5 +2718,344 @@ mod tests {
             .unwrap();
         assert_eq!(logits.dims(), &[1, cfg.vocab_size as usize]);
         assert!(host(&logits).iter().all(|x| x.is_finite()));
+    }
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        assert_eq!(a.dims(), b.dims());
+        host(a)
+            .iter()
+            .zip(&host(b))
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// **AC2 (tiny config).** Decode `m > n` tokens, roll back to `n`, re-decode token `n`: the
+    /// logits must equal a fresh decode to `n + 1` — exactly, since the restored recurrent state is
+    /// the same tensor and the narrowed KV holds the same values.
+    #[test]
+    fn rollback_to_then_redecode_matches_fresh_decode() {
+        let (_cfg, model) = text_model();
+        let toks = [1u32, 7, 3, 42, 9, 2, 11, 5];
+        let n = 3usize;
+        let m = toks.len();
+
+        // Fresh: prefill toks[..n], then decode toks[n] -> logits for position n.
+        let mut fresh = model.new_cache();
+        model
+            .decode_logits(&ids(&toks[..n]), &mut fresh, 0)
+            .unwrap();
+        let fresh_logits = model
+            .decode_logits(&ids(&[toks[n]]), &mut fresh, n as i32)
+            .unwrap();
+
+        // Rolled back: prefill toks[..n], decode toks[n..m] one at a time (m > n), roll back to n.
+        // Retention is opt-in beyond the default two: keep every step start of this run.
+        let mut cache = model.new_cache();
+        cache.set_max_checkpoints(8);
+        model
+            .decode_logits(&ids(&toks[..n]), &mut cache, 0)
+            .unwrap();
+        for (i, &t) in toks[n..m].iter().enumerate() {
+            model
+                .decode_logits(&ids(&[t]), &mut cache, (n + i) as i32)
+                .unwrap();
+        }
+        assert_eq!(cache.offset(), m as i32);
+        // Every step start is a checkpoint: the prefill at 0, then each single-token step.
+        let mut expected = vec![0i32];
+        expected.extend(n as i32..m as i32);
+        assert_eq!(cache.checkpoint_offsets(), expected);
+        cache.rollback_to(n as i32).unwrap();
+        assert_eq!(cache.offset(), n as i32);
+        assert_eq!(cache.checkpoint_offsets(), vec![0, n as i32]);
+        let replayed = model
+            .decode_logits(&ids(&[toks[n]]), &mut cache, n as i32)
+            .unwrap();
+        assert_eq!(
+            max_abs_diff(&fresh_logits, &replayed),
+            0.0,
+            "rollback_to({n}) then re-decode must equal a fresh decode"
+        );
+        assert_eq!(cache.offset(), n as i32 + 1);
+
+        // Continuing past the rollback point stays exact too (the conv tail was restored as well).
+        let mut fresh2 = fresh;
+        let a = model
+            .decode_logits(&ids(&[toks[n + 1]]), &mut fresh2, n as i32 + 1)
+            .unwrap();
+        let b = model
+            .decode_logits(&ids(&[toks[n + 1]]), &mut cache, n as i32 + 1)
+            .unwrap();
+        assert_eq!(max_abs_diff(&a, &b), 0.0);
+    }
+
+    /// Rollback refuses positions it has no checkpoint for (inside a multi-token prefill, or pruned
+    /// away), and never approximates; `0` and the current position always work.
+    #[test]
+    fn rollback_is_exact_or_refused() {
+        let (_cfg, model) = text_model();
+        let mut cache = StepModel::new_cache(&model);
+        assert_eq!(cache.max_checkpoints(), STEP_MAX_CHECKPOINTS);
+        model
+            .decode_logits(&ids(&[1, 7, 3, 42]), &mut cache, 0)
+            .unwrap();
+        assert!(cache.rollback_to(4).is_ok(), "current position is a no-op");
+        assert_eq!(cache.offset(), 4);
+        // Refused with the typed variant (the S2 speculative engine matches on it, not on text).
+        match cache.rollback_to(2) {
+            Err(Error::RollbackUnavailable { n: 2, have }) => assert_eq!(have, vec![0]),
+            other => panic!("expected RollbackUnavailable {{ n: 2, have: [0] }}, got {other:?}"),
+        }
+        assert_eq!(
+            cache.offset(),
+            4,
+            "a refused rollback leaves the cache untouched"
+        );
+        // Out of range is a plain error, not "no checkpoint".
+        assert!(
+            matches!(cache.rollback_to(5), Err(Error::Msg(_))),
+            "past the end"
+        );
+        assert!(matches!(cache.rollback_to(-1), Err(Error::Msg(_))));
+        assert_eq!(
+            cache.checkpoint_offsets(),
+            vec![0],
+            "one forward so far: only its start is checkpointed"
+        );
+        cache.rollback_to(0).unwrap();
+        assert_eq!(cache.offset(), 0);
+        assert!(cache.checkpoint_offsets().is_empty());
+        assert_eq!(cache.memory(), CacheMemory::default());
+
+        // Retention: with room for one checkpoint only the newest step start survives.
+        cache.set_max_checkpoints(1);
+        model.decode_logits(&ids(&[1, 7]), &mut cache, 0).unwrap();
+        model.decode_logits(&ids(&[3]), &mut cache, 2).unwrap();
+        model.decode_logits(&ids(&[42]), &mut cache, 3).unwrap();
+        assert_eq!(cache.checkpoint_offsets(), vec![3]);
+        assert!(matches!(
+            cache.rollback_to(2),
+            Err(Error::RollbackUnavailable { n: 2, .. })
+        ));
+        cache.rollback_to(3).unwrap();
+        assert_eq!(cache.offset(), 3);
+
+        // Through the `KvCache` trait object the same rollback is reachable as `truncate`.
+        let dyn_cache: &mut dyn KvCache = &mut cache;
+        crate::decode::Decode::step(&model, &ids(&[9]), dyn_cache, 3).unwrap();
+        assert!(dyn_cache.truncate(3).is_ok());
+        assert_eq!(dyn_cache.offset(), 3);
+
+        // The reference / MTP cache (`new_cache`, what `Decode::make_cache` boxes) retains no
+        // checkpoints, so it holds one recurrent state — and refuses any interior rollback.
+        let mut reference = model.new_cache();
+        assert_eq!(reference.max_checkpoints(), REFERENCE_MAX_CHECKPOINTS);
+        model
+            .decode_logits(&ids(&[1, 7, 3]), &mut reference, 0)
+            .unwrap();
+        model.decode_logits(&ids(&[42]), &mut reference, 3).unwrap();
+        model.decode_logits(&ids(&[9]), &mut reference, 4).unwrap();
+        assert!(reference.checkpoint_offsets().is_empty());
+        assert_eq!(reference.memory().checkpoint_bytes, 0);
+        match reference.rollback_to(4) {
+            Err(Error::RollbackUnavailable { n: 4, have }) => assert!(have.is_empty()),
+            other => panic!("expected RollbackUnavailable {{ n: 4, have: [] }}, got {other:?}"),
+        }
+    }
+
+    /// The memory accounting follows the live tensors and the checkpoints, and a rollback drops
+    /// the rolled-back positions' KV bytes.
+    #[test]
+    fn memory_accounting_tracks_live_state_and_checkpoints() {
+        let (cfg, model) = text_model();
+        let mut cache = StepModel::new_cache(&model);
+        assert_eq!(cache.memory(), CacheMemory::default());
+        model
+            .decode_logits(&ids(&[1, 7, 3]), &mut cache, 0)
+            .unwrap();
+        let after_prefill = cache.memory();
+        // One full-attention layer: K and V of [1, nkv, 3, hd] f32 each.
+        let kv_bytes = 2 * (cfg.num_kv_heads as usize) * 3 * (cfg.head_dim as usize) * 4;
+        assert!(
+            after_prefill.live_bytes > kv_bytes,
+            "KV plus DeltaNet states"
+        );
+        assert_eq!(
+            after_prefill.checkpoint_bytes, 0,
+            "the position-0 checkpoint holds empty (None) states"
+        );
+        model.decode_logits(&ids(&[42]), &mut cache, 3).unwrap();
+        let after_step = cache.memory();
+        assert_eq!(
+            after_step.live_bytes - after_prefill.live_bytes,
+            kv_bytes / 3,
+            "one more KV position; recurrent states are fixed-size"
+        );
+        assert!(
+            after_step.checkpoint_bytes > 0,
+            "the position-3 checkpoint holds real states"
+        );
+        // The recurrent share: the live linear-layer states plus the one real checkpoint (the
+        // position-0 checkpoint is empty) — two states' worth.
+        assert_eq!(
+            cache.recurrent_bytes(),
+            after_step.live_bytes - kv_bytes * 4 / 3 + after_step.checkpoint_bytes
+        );
+        assert_eq!(
+            cache.recurrent_bytes(),
+            2 * after_step.checkpoint_bytes,
+            "live recurrent state + one checkpoint of the same size"
+        );
+        cache.rollback_to(3).unwrap();
+        assert_eq!(cache.memory().live_bytes, after_prefill.live_bytes);
+        assert_eq!(
+            cache.memory().total_bytes(),
+            after_step.total_bytes() - kv_bytes / 3
+        );
+    }
+
+    /// A schedule with no full-attention layer still reports its position (from the linear layers).
+    #[test]
+    fn offset_falls_back_to_linear_layers() {
+        let mut v = cfg_json();
+        v["text_config"]["full_attention_interval"] = json!(100);
+        let cfg = Qwen35Config::from_json(&v).unwrap();
+        assert!((0..cfg.num_layers).all(|i| cfg.is_linear(i)));
+        let model = Qwen35Model::from_weights(
+            &synthetic_weights(&cfg),
+            "model.language_model",
+            cfg.clone(),
+        )
+        .unwrap();
+        let mut cache = StepModel::new_cache(&model);
+        model
+            .decode_logits(&ids(&[1, 7, 3]), &mut cache, 0)
+            .unwrap();
+        assert_eq!(cache.offset(), 3);
+        model.decode_logits(&ids(&[9]), &mut cache, 3).unwrap();
+        assert_eq!(cache.offset(), 4);
+        cache.rollback_to(3).unwrap();
+        assert_eq!(cache.offset(), 3);
+    }
+
+    /// **AC1 (tiny config).** Greedy generation through the `StepModel` seam is token-identical to
+    /// the reference `Decode` loop, and the record says which path ran.
+    #[test]
+    fn step_model_greedy_matches_reference_decode_loop() {
+        use crate::decode::{generate_step, generate_with, CancelFlag, GenerationConfig};
+        let (_cfg, model) = text_model();
+        let prompt = [1i32, 7, 3, 42, 9];
+        let cfg = GenerationConfig {
+            max_new_tokens: 24,
+            seed: Some(3),
+            ..Default::default()
+        };
+        let reference =
+            generate_with(&model, &prompt, &cfg, &CancelFlag::new(), &mut |_| {}, None).unwrap();
+        let mut events = 0usize;
+        let (step, record) = generate_step(
+            &model,
+            &prompt,
+            &cfg,
+            &CancelFlag::new(),
+            &mut |e| {
+                if matches!(e, crate::decode::StreamEvent::Token { .. }) {
+                    events += 1;
+                }
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(step.tokens.len(), 24);
+        assert_eq!(step.tokens, reference.tokens);
+        assert_eq!(step.finish_reason, reference.finish_reason);
+        assert_eq!(events, 24);
+        assert_eq!(record.path, crate::decode::DecodePath::StepModel);
+        assert_eq!(record.target_forwards, 24, "prefill + 23 steps");
+        assert_eq!(record.generated_tokens, 24);
+        assert_eq!(
+            record.host_syncs, 24,
+            "one device argmax per token on the plain-greedy path"
+        );
+
+        // Sampling (positive temperature) is seed-deterministic and identical across the seams too.
+        let mut sampled = cfg.clone();
+        sampled.sampling.temperature = 0.9;
+        sampled.sampling.top_k = 5;
+        let reference = generate_with(
+            &model,
+            &prompt,
+            &sampled,
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+        )
+        .unwrap();
+        let (step, _) = generate_step(
+            &model,
+            &prompt,
+            &sampled,
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+        )
+        .unwrap();
+        assert_eq!(step.tokens, reference.tokens);
+    }
+
+    /// The `StepModel` step shapes: last vs all logits, optional hidden states, and the cache
+    /// advancing by the token count.
+    #[test]
+    fn step_model_shapes_and_cache_advance() {
+        let (cfg, model) = text_model();
+        let vocab = cfg.vocab_size as usize;
+        let hidden = cfg.hidden_size as usize;
+        let mut cache = StepModel::new_cache(&model);
+        let out = model
+            .forward_step(&mut cache, StepRequest::all(&[1, 7, 3]))
+            .unwrap();
+        assert_eq!(out.logits.dims(), &[1, 3, vocab]);
+        assert!(out.hidden.is_none());
+        assert_eq!(cache.len(), 3);
+        let out = model
+            .forward_step(
+                &mut cache,
+                StepRequest {
+                    tokens: &[42, 9],
+                    scope: LogitsScope::Last,
+                    want_hidden: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(out.logits.dims(), &[1, vocab]);
+        assert_eq!(out.hidden.unwrap().dims(), &[1, 2, hidden]);
+        assert_eq!(cache.len(), 5);
+        let out = model
+            .forward_step(
+                &mut cache,
+                StepRequest {
+                    tokens: &[2],
+                    scope: LogitsScope::All,
+                    want_hidden: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(out.logits.dims(), &[1, 1, vocab]);
+        assert_eq!(out.hidden.unwrap().dims(), &[1, 1, hidden]);
+        assert!(model
+            .forward_step(&mut cache, StepRequest::last(&[]))
+            .is_err());
+        assert_eq!(StepModel::vocab_size(&model), vocab);
+        // The last-logits step equals the reference `decode_logits` at the same position.
+        let mut reference = model.new_cache();
+        model
+            .decode_logits(&ids(&[1, 7, 3, 42, 9, 2]), &mut reference, 0)
+            .unwrap();
+        let a = model.decode_logits(&ids(&[11]), &mut reference, 6).unwrap();
+        let b = model
+            .forward_step(&mut cache, StepRequest::last(&[11]))
+            .unwrap()
+            .logits;
+        assert!(max_abs_diff(&a, &b) < 1e-4);
     }
 }

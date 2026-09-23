@@ -1,0 +1,7 @@
+[decode_bench] reference          11.57 tok/s  prefill 0.686s
+[decode_bench] mtp K=1            14.22 tok/s  accept 0.827  fwd/tok 0.645
+[decode_bench] mtp K=2            17.11 tok/s  accept 0.779  fwd/tok 0.512
+[decode_bench] mtp K=3            14.37 tok/s  accept 0.607  fwd/tok 0.559
+[decode_bench] mtp K=4            13.67 tok/s  accept 0.493  fwd/tok 0.609
+[decode_bench] mtp K=5            14.17 tok/s  accept 0.480  fwd/tok 0.547
+[decode_bench] wrote C:\Users\Michael\AppData\Local\Temp\claude\decode-bench\sc-24129-r2\baseline-d2b8cb335\decode_bench.json

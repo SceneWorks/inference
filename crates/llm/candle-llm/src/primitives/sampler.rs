@@ -157,6 +157,7 @@ fn penalized_logits(
     params: &SamplingParams,
     allowed: Option<&[bool]>,
 ) -> Result<Vec<f32>> {
+    super::host_sync::note_host_sync(); // whole-vocab device->host transfer
     let mut v: Vec<f32> = logits
         .flatten_all()?
         .to_dtype(DType::F32)?
@@ -234,6 +235,7 @@ fn nucleus_weights(v: &[f32], params: &SamplingParams) -> Vec<(usize, f32)> {
 pub fn argmax_device(logits: &Tensor) -> Result<i32> {
     let flat = logits.flatten_all()?;
     let idx = flat.argmax(0)?;
+    super::host_sync::note_host_sync(); // 1-element device->host transfer
     Ok(idx.to_scalar::<u32>()? as i32)
 }
 

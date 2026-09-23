@@ -85,6 +85,8 @@ parity tests:
 | `CANDLE_LLM_{PHI3,QWEN2MOE,GEMMA2,GLM4,DEEPSEEK}_MODEL` | a snapshot for that architecture family | `breadth` — coherent-text streaming per family |
 | `CANDLE_LLM_GEMMA4_MODEL` | a Gemma 4 unified snapshot dir (e.g. `google/gemma-4-12B-it`) | `breadth` — coherent-text streaming; `gemma4_decoder` — the real-weight per-layer-type forward (hidden-state stack + soft-capped logits) |
 | `CANDLE_LLM_VLM_MODEL` | a SigLIP-based `LlavaForConditionalGeneration` snapshot dir (small: `llava-hf/llava-interleave-qwen-0.5b-hf`; faithful: JoyCaption) | `vlm` — image captioning + the multimodal conformance check |
+| `BONSAI_QWEN38_SNAPSHOT` | the frozen Qwen3.8-27B snapshot dir (the manifest's own name for it) | `decode_step_parity` — the sc-24129 seam gates on real weights: a 256-token greedy decode through `StepModel` is token-identical to the `Decode` loop, and `Qwen35Cache::rollback_to` re-decodes to the same logits as a fresh decode |
+| `DECODE_BENCH_SNAPSHOT` + `DECODE_BENCH_OUTPUT` | the same snapshot, plus a JSON path to write | `decode_bench` — the decode-perf suite (tok/s, acceptance, forwards and host syncs per token, device memory) for reference / `StepModel` / native MTP `K=1..5`; run and sealed by `scripts/release/decode_bench.py` |
 
 The `breadth` test streams a prompt through each non-Llama architecture: **Phi-3** (packed qkv/gate_up),
 **Qwen2-MoE** (router + experts + shared, q/k/v bias), **Gemma-2** (sandwich norms + soft-caps + GeGLU),
@@ -164,6 +166,19 @@ draft accepts every token); the `#[ignore]`d real-weights variants confirm the s
 snapshot (a dense target + **Q4** draft from the same weights), where the greedy run *tracks* (rather
 than bit-matches) non-speculative because the multi-token verify kernel rounds a few bf16 ULP
 differently from the single-token decode kernel.
+
+The `decode_step_parity` and `decode_bench` suites belong to the Blackwell fast-decode epic
+(sc-24128). Its two seams live in `decode::StepModel` (`forward_step`: one N-token step returning
+last/all-position logits against a cache) and `primitives::DecodeCache` (length, `rollback_to(n)`,
+reset, memory accounting); `Qwen35Model` / `Qwen35Cache` implement both, the hybrid cache rolling back
+by narrowing the KV and restoring a checkpoint of the DeltaNet state taken at every step start. Only
+step-seam caches retain checkpoints (`STEP_MAX_CHECKPOINTS` = 2, each a full recurrent state); the
+reference/MTP caches the provider builds retain none, and request admission prices
+`1 + REFERENCE_MAX_CHECKPOINTS` recurrent states. A refused rollback is the typed
+`Error::RollbackUnavailable`. Every path ends in
+a measured `decode::DecodeRecord` (path taken, target forwards, proposed/accepted tokens, host syncs);
+the provider exposes the last one through `LlamaProvider::last_decode_record`. The reference `Decode`
+loop is unchanged and stays the parity oracle.
 
 The `vlm` test covers the **vision-language path** (`LlavaModel` + `LlavaProvider`): a SigLIP vision
 tower ([`SiglipVisionTower`]) encodes the image, a two-layer GELU MLP projector lifts a chosen

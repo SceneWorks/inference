@@ -12,8 +12,7 @@ use core_llm::speculative::{accept_token, sample_weighted, Acceptance};
 use crate::decode::cancel::CancelFlag;
 use crate::decode::speculative::{decide_greedy, decide_stochastic, SpeculativeStats};
 use crate::decode::stream::{
-    default_seed, ConstraintMask, Decode, FinishReason, GenerationConfig, GenerationOutput,
-    StreamEvent,
+    default_seed, ConstraintMask, FinishReason, GenerationConfig, GenerationOutput, StreamEvent,
 };
 use crate::error::{Error, Result};
 use crate::models::{Qwen35Model, Qwen35Mtp};

@@ -9,6 +9,7 @@
 
 use std::cell::OnceCell;
 use std::path::Path;
+use std::sync::Mutex;
 
 use candle_core::{DType, Device, Tensor};
 use core_llm::{
@@ -25,8 +26,9 @@ use serde_json::Value;
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
     generate_from_prefill_with_stop, generate_qwen35_mtp_multimodal_with_stop,
-    generate_qwen35_mtp_timed_with_stop, ConstraintMask, Decode, FinishReason, GenerationConfig,
-    Qwen35MtpMultimodalPrompt, RewindableConstraintMask, StreamEvent,
+    generate_qwen35_mtp_timed_with_stop, ConstraintMask, CountingDecode, Decode, DecodePath,
+    DecodeRecord, FinishReason, GenerationConfig, Qwen35MtpMultimodalPrompt, RequestSpan,
+    RewindableConstraintMask, StreamEvent,
 };
 use crate::device::select_device;
 use crate::gguf::GgufCheckpoint;
@@ -81,6 +83,22 @@ impl Decode for Decoder {
     }
 }
 
+/// Upper bound on one Qwen3.5/3.6/3.8 recurrent (Gated DeltaNet) state — every linear layer's SSM
+/// state plus its conv tail, priced over all `num_layers` at f32 — times the states a request's
+/// cache holds at once: the live state plus `retained_checkpoints` rollback checkpoints (the
+/// decoder checkpoints at every forward, and each retained checkpoint pins a distinct state once
+/// the live state moves on). The provider's caches retain
+/// [`REFERENCE_MAX_CHECKPOINTS`](crate::models::qwen35::REFERENCE_MAX_CHECKPOINTS); a step-seam
+/// caller must price [`STEP_MAX_CHECKPOINTS`](crate::models::qwen35::STEP_MAX_CHECKPOINTS) (E6).
+fn qwen35_recurrent_admission_bytes(c: &Qwen35Config, retained_checkpoints: usize) -> u64 {
+    let one_state = (c.num_layers as u64)
+        .saturating_mul(c.linear_num_value_heads as u64)
+        .saturating_mul(c.linear_value_head_dim as u64)
+        .saturating_mul((c.linear_key_head_dim + c.linear_conv_kernel_dim) as u64)
+        .saturating_mul(4);
+    one_state.saturating_mul(1 + retained_checkpoints as u64)
+}
+
 impl Decoder {
     fn memory_geometry(&self) -> LlmMemoryGeometry {
         let (query_heads, kv_heads, head_dim, layers, hidden, intermediate, vocab, recurrent) =
@@ -108,13 +126,10 @@ impl Decoder {
                         c.hidden_size,
                         c.intermediate_size,
                         c.vocab_size,
-                        (c.num_layers as u64)
-                            .saturating_mul(c.linear_num_value_heads as u64)
-                            .saturating_mul(c.linear_value_head_dim as u64)
-                            .saturating_mul(
-                                (c.linear_key_head_dim + c.linear_conv_kernel_dim) as u64,
-                            )
-                            .saturating_mul(4),
+                        qwen35_recurrent_admission_bytes(
+                            c,
+                            crate::models::qwen35::REFERENCE_MAX_CHECKPOINTS,
+                        ),
                     )
                 }
             };
@@ -596,6 +611,11 @@ pub struct LlamaProvider {
     /// checkpoint that actually ships them (sc-18772). Independent of [`vision`](Self::vision):
     /// Gemma 4 does not use the Qwen-VL ViT/M-RoPE/DeepStack machinery at all.
     gemma4: Option<Gemma4Runtime>,
+    /// The measured [`DecodeRecord`] of the most recent [`TextLlm::generate`] call — which decode
+    /// path ran and its counters (sc-24129). The backend-neutral `TextLlmOutput` carries only the
+    /// MTP subset (`MtpStats`); the full record is read back through
+    /// [`LlamaProvider::last_decode_record`].
+    last_decode: Mutex<Option<DecodeRecord>>,
 }
 
 /// Whether Gemma 4's vision path has been validated end-to-end, and may therefore be advertised.
@@ -700,6 +720,16 @@ fn ensure_supported_device(source: &Path, device: &Device) -> CoreResult<()> {
 }
 
 impl LlamaProvider {
+    /// The measured decode record of the most recent `generate` call on this provider, or `None`
+    /// before the first. Says which path ran (`Reference`, `Mtp { drafts }`, …) and its counters;
+    /// the MTP subset also reaches callers as `TextLlmOutput::mtp`.
+    pub fn last_decode_record(&self) -> Option<DecodeRecord> {
+        *self
+            .last_decode
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Load a provider from `spec.source`: either a `*.gguf` file (loaded directly via Candle's
     /// native GGUF reader, story 7254) or an HF snapshot directory (config.json + tokenizer.json +
     /// shards). Either way the decoder architecture is dispatched (Llama / Mistral / Qwen3) and the
@@ -943,6 +973,7 @@ impl LlamaProvider {
             template,
             stop_tokens,
             constraint_table: OnceCell::new(),
+            last_decode: Mutex::new(None),
             vision,
             gemma4,
         })
@@ -1072,6 +1103,7 @@ impl LlamaProvider {
                 tokenizer,
                 template,
                 stop_tokens: ck.stop_tokens,
+                last_decode: Mutex::new(None),
                 constraint_table: OnceCell::new(),
                 vision,
                 gemma4: None,
@@ -1123,6 +1155,7 @@ impl LlamaProvider {
             tokenizer,
             template,
             stop_tokens,
+            last_decode: Mutex::new(None),
             constraint_table: OnceCell::new(),
             vision: None, // GGUF is the dense Llama-family path only — no Qwen3.6 VLM.
             // Likewise no Gemma 4 front-ends: the GGUF path reconstructs a dense text decoder,
@@ -1146,6 +1179,7 @@ impl LlamaProvider {
             tokenizer,
             template: Box::new(Llama3Template),
             stop_tokens,
+            last_decode: Mutex::new(None),
             constraint_table: OnceCell::new(),
             vision: None,
             gemma4: None,
@@ -1862,6 +1896,12 @@ impl TextLlm for LlamaProvider {
         req: &TextLlmRequest,
         on_event: &mut dyn FnMut(CoreEvent),
     ) -> CoreResult<TextLlmOutput> {
+        // Request start: a request that fails or is cancelled (anywhere below, before the record
+        // is written on success) must not leave the previous request's record readable.
+        *self
+            .last_decode
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         self.validate(req)?;
         if req.cancel.is_cancelled() {
             return Err(CoreError::Canceled); // typed pre-inference cancel
@@ -1985,6 +2025,10 @@ impl TextLlm for LlamaProvider {
             .synchronize()
             .map_err(|e| to_core(e.into()))?;
         let generation_started = std::time::Instant::now();
+        let request_span = RequestSpan::begin();
+        // The reference loop's forwards are measured, not inferred (sc-24129).
+        let counted = CountingDecode::new(&self.model);
+        let mut extra_forwards = 0u64;
 
         // Encode + splice the visuals and compute M-RoPE positions (the placeholder-expanded prompt
         // becomes the effective sequence). `None` on the text-only path.
@@ -2291,6 +2335,8 @@ impl TextLlm for LlamaProvider {
                             model,
                             delta: *delta,
                         };
+                        let shifted = CountingDecode::new(&shifted);
+                        shifted.note_external_forward(); // the DeepStack prefill above
                         let result = generate_from_prefill_with_stop(
                             &shifted,
                             &mut *cache,
@@ -2303,6 +2349,7 @@ impl TextLlm for LlamaProvider {
                             should_stop_opt,
                         )
                         .map_err(to_core)?;
+                        extra_forwards = shifted.forwards();
                         model
                             .device()
                             .synchronize()
@@ -2329,6 +2376,7 @@ impl TextLlm for LlamaProvider {
                             let first = model
                                 .decode_logits_from_embeds(&m.embeds, &mut *cache, 0)
                                 .map_err(to_core)?;
+                            counted.note_external_forward();
                             self.model
                                 .device()
                                 .synchronize()
@@ -2336,7 +2384,7 @@ impl TextLlm for LlamaProvider {
                             let prefill = generation_started.elapsed();
                             let decode_started = std::time::Instant::now();
                             let result = generate_from_prefill_with_stop(
-                                &self.model,
+                                &counted,
                                 &mut *cache,
                                 first,
                                 m.expanded_ids.clone(),
@@ -2364,8 +2412,7 @@ impl TextLlm for LlamaProvider {
                                 let mut cache = self.model.make_cache();
                                 let ids =
                                     input_ids(&prompt_ids, self.model.device()).map_err(to_core)?;
-                                let first =
-                                    self.model.step(&ids, &mut *cache, 0).map_err(to_core)?;
+                                let first = counted.step(&ids, &mut *cache, 0).map_err(to_core)?;
                                 self.model
                                     .device()
                                     .synchronize()
@@ -2373,7 +2420,7 @@ impl TextLlm for LlamaProvider {
                                 let prefill = generation_started.elapsed();
                                 let decode_started = std::time::Instant::now();
                                 let result = generate_from_prefill_with_stop(
-                                    &self.model,
+                                    &counted,
                                     &mut *cache,
                                     first,
                                     prompt_ids.clone(),
@@ -2396,8 +2443,7 @@ impl TextLlm for LlamaProvider {
                                 let mut cache = self.model.make_cache();
                                 let ids =
                                     input_ids(&prompt_ids, self.model.device()).map_err(to_core)?;
-                                let first =
-                                    self.model.step(&ids, &mut *cache, 0).map_err(to_core)?;
+                                let first = counted.step(&ids, &mut *cache, 0).map_err(to_core)?;
                                 self.model
                                     .device()
                                     .synchronize()
@@ -2405,7 +2451,7 @@ impl TextLlm for LlamaProvider {
                                 let prefill = generation_started.elapsed();
                                 let decode_started = std::time::Instant::now();
                                 let result = generate_from_prefill_with_stop(
-                                    &self.model,
+                                    &counted,
                                     &mut *cache,
                                     first,
                                     prompt_ids.clone(),
@@ -2429,6 +2475,27 @@ impl TextLlm for LlamaProvider {
                 }
             }
         };
+
+        let decode_record = match (mtp_stats, mtp_drafts) {
+            (Some(stats), Some(drafts)) => DecodeRecord {
+                path: DecodePath::Mtp { drafts },
+                target_forwards: u64::from(stats.target_forwards),
+                proposed_tokens: u64::from(stats.proposed_tokens),
+                accepted_tokens: u64::from(stats.accepted_tokens),
+                generated_tokens: out.tokens.len() as u64,
+                host_syncs: request_span.host_syncs(),
+            },
+            _ => DecodeRecord::plain(
+                DecodePath::Reference,
+                counted.forwards() + extra_forwards,
+                out.tokens.len(),
+                request_span.host_syncs(),
+            ),
+        };
+        *self
+            .last_decode
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(decode_record);
 
         // End-of-generation tails, in pipeline order. First the reasoning segmenter's held-back
         // partial marker (it turned out not to begin a marker) as current-channel text — reasoning
@@ -2881,6 +2948,7 @@ mod tests {
         substitute_vision_placeholders, validate_context_window, video_placeholder_text, JsonMask,
         EAGER_ATTN_QUERY_CHUNK_SIZE,
     };
+    use super::{qwen35_recurrent_admission_bytes, Decode as _, Decoder};
 
     #[test]
     fn accelerator_only_selector_is_exact_to_qwen38_and_bonsai() {
@@ -3485,5 +3553,86 @@ mod tests {
             "w within per-frame grid"
         );
         let _ = h;
+    }
+    /// E6: admission prices every recurrent state a Qwen3.5-family request's cache holds. The
+    /// provider's cache (the reference/MTP `Decode::make_cache`) retains `REFERENCE_MAX_CHECKPOINTS`
+    /// rollback checkpoints, and the geometry charges `1 + REFERENCE_MAX_CHECKPOINTS` states; a
+    /// checkpointing step-seam cache holds more than one state and is covered only by the
+    /// checkpoint term.
+    #[test]
+    fn qwen35_admission_prices_every_recurrent_state_the_cache_holds() {
+        use crate::decode::{StepModel, StepRequest};
+        use crate::models::qwen35::{REFERENCE_MAX_CHECKPOINTS, STEP_MAX_CHECKPOINTS};
+        use crate::models::Qwen35Cache;
+        use crate::primitives::nn::input_ids;
+
+        let (cfg, model) = crate::models::qwen35::tests::text_model();
+        let one_state = qwen35_recurrent_admission_bytes(&cfg, 0);
+        assert!(one_state > 0);
+        let decoder = Decoder::Qwen35(model);
+        let geometry = decoder.memory_geometry();
+        assert_eq!(
+            geometry.recurrent_bytes,
+            one_state * (1 + REFERENCE_MAX_CHECKPOINTS as u64),
+            "the geometry charges the live state plus the provider cache's checkpoints"
+        );
+        // The admission estimate carries the whole recurrent term (charged once with MTP off).
+        let without = core_llm::LlmMemoryGeometry {
+            recurrent_bytes: 0,
+            ..geometry
+        };
+        let est = |g| core_llm::estimate_chunked_request_bytes(8, 4, g, 0, 0, 64).unwrap();
+        assert_eq!(est(geometry) - est(without), geometry.recurrent_bytes);
+
+        // What the provider's cache really holds at steady state (prefill + several steps).
+        let device = candle_core::Device::Cpu;
+        let mut cache = decoder.make_cache();
+        decoder
+            .step(&input_ids(&[1, 7, 3], &device).unwrap(), cache.as_mut(), 0)
+            .unwrap();
+        for (i, t) in [42, 9, 2, 11].into_iter().enumerate() {
+            decoder
+                .step(
+                    &input_ids(&[t], &device).unwrap(),
+                    cache.as_mut(),
+                    3 + i as i32,
+                )
+                .unwrap();
+        }
+        let held = cache.as_any_mut().downcast_mut::<Qwen35Cache>().unwrap();
+        assert_eq!(held.max_checkpoints(), REFERENCE_MAX_CHECKPOINTS);
+        assert!(
+            held.recurrent_bytes() as u64 <= geometry.recurrent_bytes,
+            "provider cache holds {} recurrent bytes, admission charges {}",
+            held.recurrent_bytes(),
+            geometry.recurrent_bytes
+        );
+
+        // A step-seam cache retains STEP_MAX_CHECKPOINTS states beyond the live one: one state of
+        // admission does not cover it; the checkpoint term does.
+        let Decoder::Qwen35(model) = &decoder else {
+            unreachable!()
+        };
+        let mut step = StepModel::new_cache(model);
+        model
+            .forward_step(&mut step, StepRequest::last(&[1, 7, 3]))
+            .unwrap();
+        for t in [42, 9, 2, 11] {
+            model
+                .forward_step(&mut step, StepRequest::last(&[t]))
+                .unwrap();
+        }
+        assert_eq!(step.checkpoint_offsets().len(), STEP_MAX_CHECKPOINTS);
+        assert!(
+            step.recurrent_bytes() as u64 > one_state,
+            "a checkpointing cache holds more than one recurrent state"
+        );
+        assert!(
+            step.recurrent_bytes() as u64
+                <= qwen35_recurrent_admission_bytes(&cfg, STEP_MAX_CHECKPOINTS),
+            "step cache holds {} recurrent bytes, its admission term is {}",
+            step.recurrent_bytes(),
+            qwen35_recurrent_admission_bytes(&cfg, STEP_MAX_CHECKPOINTS)
+        );
     }
 }
