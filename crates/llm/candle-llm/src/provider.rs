@@ -2611,13 +2611,15 @@ impl TextLlm for LlamaProvider {
                 accepted_tokens: u64::from(stats.accepted_tokens),
                 generated_tokens: out.tokens.len() as u64,
                 host_syncs: request_span.host_syncs(),
+                fused_primitives: request_span.fused_primitives(),
             },
             _ => DecodeRecord::plain(
                 DecodePath::Reference,
                 counted.forwards() + extra_forwards,
                 out.tokens.len(),
                 request_span.host_syncs(),
-            ),
+            )
+            .with_fused_primitives(request_span.fused_primitives()),
         };
         *self
             .last_decode
