@@ -306,17 +306,26 @@ pub fn rgba_to_rgb_over_white(rgba: &Array) -> Result<Array> {
 pub const DECODE_TILE_EDGE: u32 = 512;
 pub const DECODE_OVERLAP: u32 = 64;
 
-/// The bounded-decode tiling a request selects: `GenerationMemory::tile_vae_decode` with its
-/// optional edge/overlap (output pixels), else `None` (single-pass decode).
+/// The bounded-decode tiling a request runs.
+///
+/// * `GenerationMemory::tile_vae_decode` **forces** the bounded decode at the request's own
+///   edge/overlap (output pixels), defaulting to [`DECODE_TILE_EDGE`]/[`DECODE_OVERLAP`];
+/// * otherwise the provider's **automatic threshold** applies — exactly what the shared field's
+///   contract says (`tile_vae_decode` forces tiling "even below its automatic tiling threshold";
+///   `false` and an absent block both mean "the provider decides"). The threshold is
+///   [`crate::memory_strategy::default_decode_is_bounded`]: above the fitted 1024² area the
+///   untiled decode's MLX transient would exceed the packed tiers' whole resident set, so every
+///   upstream preset decodes bounded at 512/64 by default (sc-24114). Below it the decode is the
+///   exact single pass.
 pub fn decode_tiling(req: &GenerationRequest) -> Option<TilingConfig> {
-    req.memory
-        .filter(|memory| memory.tile_vae_decode)
-        .map(|memory| {
-            TilingConfig::spatial_only(
-                memory.decode_tile_edge.unwrap_or(DECODE_TILE_EDGE) as i32,
-                memory.decode_overlap.unwrap_or(DECODE_OVERLAP) as i32,
-            )
-        })
+    match req.memory.filter(|memory| memory.tile_vae_decode) {
+        Some(memory) => Some(TilingConfig::spatial_only(
+            memory.decode_tile_edge.unwrap_or(DECODE_TILE_EDGE) as i32,
+            memory.decode_overlap.unwrap_or(DECODE_OVERLAP) as i32,
+        )),
+        None => crate::memory_strategy::default_decode_is_bounded(req.width, req.height)
+            .then(|| TilingConfig::spatial_only(DECODE_TILE_EDGE as i32, DECODE_OVERLAP as i32)),
+    }
 }
 
 /// Final packed latents → the VAE's four-channel decode, NCHW `[1, 4, H, W]` in `[-1, 1]`:
@@ -409,6 +418,56 @@ mod tests {
         assert_eq!(a.shape(), &[1, 8, 8]);
         assert!(a.all_close(&b, None, None, None).unwrap().item::<bool>());
         assert!(!a.all_close(&c, None, None, None).unwrap().item::<bool>());
+    }
+
+    /// The decode policy the pipeline runs (sc-24114): the provider's own area threshold applies
+    /// whenever nothing forces tiling, and `tile_vae_decode` forces it at any size.
+    ///
+    /// *Mutation that reds this:* restoring the `req.memory.filter(..).map(..)` body, which
+    /// decoded every preset untiled unless a memory block forced tiling.
+    #[test]
+    fn decode_tiling_applies_the_area_threshold_unless_tiling_is_forced() {
+        use mlx_gen::gen_core::GenerationMemory;
+        let request = |width, height, memory| GenerationRequest {
+            prompt: "x".into(),
+            width,
+            height,
+            memory,
+            ..Default::default()
+        };
+        // Every upstream preset is above the threshold: bounded at the shipped 512/64.
+        for preset in crate::config::PRESETS {
+            let cfg = decode_tiling(&request(preset.width, preset.height, None))
+                .unwrap_or_else(|| panic!("{} must decode bounded by default", preset.ratio));
+            let spatial = cfg.spatial.expect("spatial tiling");
+            assert_eq!(spatial.tile_px, DECODE_TILE_EDGE as i32, "{}", preset.ratio);
+            assert_eq!(
+                spatial.overlap_px, DECODE_OVERLAP as i32,
+                "{}",
+                preset.ratio
+            );
+        }
+        // At and below the fitted 1024² area the decode is the exact single pass, with or without
+        // an explicit (non-forcing) memory block — `tile_vae_decode: false` is "provider decides".
+        assert!(decode_tiling(&request(1024, 1024, None)).is_none());
+        assert!(decode_tiling(&request(512, 512, None)).is_none());
+        assert!(decode_tiling(&request(512, 512, Some(GenerationMemory::default()))).is_none());
+        // ...and the same non-forcing block above the threshold still decodes bounded.
+        assert!(decode_tiling(&request(2048, 2048, Some(GenerationMemory::default()))).is_some());
+        // Forcing tiles at any size, at the request's own geometry.
+        let forced = decode_tiling(&request(
+            512,
+            512,
+            Some(GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: Some(256),
+                decode_overlap: Some(64),
+                ..Default::default()
+            }),
+        ))
+        .unwrap();
+        let forced = forced.spatial.expect("spatial tiling");
+        assert_eq!((forced.tile_px, forced.overlap_px), (256, 64));
     }
 
     #[test]

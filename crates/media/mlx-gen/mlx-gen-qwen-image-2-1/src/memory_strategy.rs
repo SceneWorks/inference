@@ -26,6 +26,40 @@
 //!
 //! None of these numbers are copied from the 2512 `qwen_image` route. That route's DiT is ~3× this
 //! one and its text tower is a different architecture; its measured anchor is not evidence here.
+//!
+//! # The decode transient is priced for MLX's *pipelined* evaluation (sc-24114)
+//!
+//! The first revision of this model counted the decoder's structurally live full-resolution maps
+//! (three) and priced the untiled 2048² decode at 6.75 GiB. The memory campaign then hard-stopped
+//! every 2048² cell above 100 GB, and one traced run showed why: MLX commits every full-res decoder
+//! op as its own Metal command buffer and keeps ten in flight ahead of the GPU, each pinning its
+//! input and output map, so the free-running untiled decode holds **25** maps — 56.6 GiB measured
+//! against 56.25 derived ([`derived::VAE_PIPELINED_DECODE_MAPS`]) — and the allocator then pools
+//! every freed map up to the device's working-set line (64.7 GiB cached, 109.9 GB footprint).
+//! The DiT step carries the same in-flight term on top of its structural count
+//! ([`derived::DIT_LIVE_HIDDEN_TENSORS`] + [`derived::MLX_MAX_ACTIVE_TASKS`]). Three things
+//! changed, and every published number follows from them:
+//!
+//! * the **default decode is bounded** (512/64) wherever the untiled decode's pipelined transient
+//!   would exceed half the bf16 resident set — above the fitted 1024² area, so at every upstream
+//!   preset — through [`default_decode_is_bounded`], which [`crate::pipeline::decode_tiling`]
+//!   applies whenever nothing forces tiling. The bounded decode's own peak is the head's global
+//!   attention ([`derived::VAE_HEAD_ATTENTION_MATRICES`]), which no tiling touches;
+//! * every request installs [`AllocatorBounds`]: a **cache limit** of the request's transient
+//!   budget, so freed buffers above it return to the OS and the process footprint tracks active
+//!   memory, and an MLX **memory limit** of resident + budget as *uncredited* defence in depth —
+//!   it makes the eval loop drain in-flight work when active memory passes the budget, but a
+//!   retired command buffer's arrays are released one autorelease-pool drain later, so it only
+//!   trims the pipelined set (17 maps measured at 1024² against 25 free-running), and the table
+//!   does not count on it;
+//! * the table's `activation_bytes` is the free-running untiled transient, `tiled_activation_bytes`
+//!   the bounded one, and `default_activation_bytes` the one the default path runs — the number a
+//!   consumer's floor must be built from.
+//!
+//! The 25-map and 6-matrix figures are the two derived numbers that have been held against an
+//! observation; that makes them checked derivations, not measurements, and neither is filed as
+//! evidence. Not modelled: the conditioning phase, whose transient (~1.7 GiB in the traced runs,
+//! whatever the target size) is below the decode's at every size from 1024² up.
 
 use std::path::Path;
 
@@ -182,24 +216,66 @@ pub mod derived {
     ///   whole block → 4
     ///
     /// (The attention peak — `x`, `h`, q/k/v, the two RoPE half-planes and the SDPA output — counts
-    /// 8, so the FFN's 13 dominates.) **A structural count, not a measurement**: it ignores
-    /// allocator slack, the MLX graph's transient retention and any kernel workspace, all of which a
-    /// real sweep would fold in.
+    /// 8, so the FFN's 13 dominates.) **A structural count, not a measurement**, and only the
+    /// synchronous floor: [`dit_activation_bytes`] adds one `[S, inner]` output per in-flight
+    /// command buffer ([`MLX_MAX_ACTIVE_TASKS`] plus the one being scheduled) for MLX's pipelined
+    /// evaluation — 24 tensors in all, 3.05 GiB at 2048² against the 2.77–3.02 GiB three traced
+    /// runs measured for the denoise.
     pub const DIT_LIVE_HIDDEN_TENSORS: u64 = 13;
 
     /// Bytes per RoPE table entry pair (`cos` + `sin`, both f32, `head_dim / 2` wide):
     /// `2 · 64 · 4`.
     pub const DIT_ROPE_BYTES_PER_TOKEN: u64 = 512;
 
-    /// Live full-resolution feature maps at the VAE decoder's tail, each
+    /// **Structurally** live full-resolution feature maps at the VAE decoder's tail, each
     /// `full_res_channels · H · W` f32: the residual input, the residual branch's output, and the
-    /// `norm_out`/`conv_out` input. The decoder is f32 throughout.
+    /// `norm_out`/`conv_out` input. The decoder is f32 throughout. This is what a *synchronous*
+    /// executor holds; on MLX it is only the floor of [`VAE_PIPELINED_DECODE_MAPS`] — see there.
     pub const VAE_LIVE_FULL_RES_MAPS: u64 = 3;
     /// Channels the decoder's last stage runs at full output resolution — the same
     /// `full_res_channels` `gen_core::tiling::VaeTiling::QWEN_IMAGE_2_1` declares.
     pub const VAE_FULL_RES_CHANNELS: u64 = 144;
     /// Width of one decoder element (the released VAE ships and loads f32).
     pub const VAE_ELEMENT_WIDTH: u64 = 4;
+
+    // ── MLX's pipelined evaluation (sc-24114) ───────────────────────────────────────────────────
+    //
+    // MLX does not execute a graph synchronously. `eval` walks the tape and commits one Metal
+    // command buffer per op whose outputs exceed `max_mb_per_buffer` (40–50 MB) — every full-res
+    // decoder op at any shipped preset — and keeps committing ahead of the GPU until
+    // `MAX_ACTIVE_TASKS` (10, `mlx/transforms.cpp`) command buffers are in flight OR active memory
+    // exceeds the allocator's *memory limit*. An in-flight op pins its input and its output until
+    // its command buffer retires, so the decode's live set is NOT the structural 3 maps: it is the
+    // structural set plus two maps for each of the ten in-flight ops and the one being scheduled.
+    //
+    // Measured on 2026-09-23 (2048², bf16, one untiled decode, `MLX_MAX_OPS_PER_BUFFER` unset):
+    // active memory rose from 29.66 GiB to a 86.29 GiB peak — a 56.63 GiB transient against the
+    // 56.25 GiB `VAE_PIPELINED_DECODE_MAPS` derives (0.7% apart) — while the "3 live maps" model
+    // said 6.75 GiB. The allocator then kept 64.68 GiB of that in its cache (nothing bounded it
+    // below the ~0.95 × recommendedMaxWorkingSetSize gc line), for a 109.85 GB process footprint.
+    //
+    // The memory limit is NOT credited against this. `mlx/transforms.cpp` waits only while command
+    // buffers are in flight, and a retired buffer's arrays are released when its completion
+    // closure is destroyed — one autorelease-pool drain later — so once the structural set plus
+    // the lagging releases sit above the limit the loop proceeds one op at a time without ever
+    // getting back under it. Measured the same day at 1024² untiled with the limit at resident
+    // + 4.9 GiB: a 9.67 GiB transient (17 maps) against 14.06 GiB (25 maps) free-running.
+
+    /// Command buffers MLX keeps in flight before its eval loop waits for the GPU
+    /// (`MAX_ACTIVE_TASKS` in `mlx/transforms.cpp`; there is no runtime knob).
+    pub const MLX_MAX_ACTIVE_TASKS: u64 = 10;
+    /// Full-resolution maps one in-flight decoder op pins: its input and its output.
+    pub const MLX_MAPS_PER_INFLIGHT_OP: u64 = 2;
+    /// Full-res maps the untiled decode allocates under MLX's pipelined evaluation: the structural
+    /// set plus an input/output pair for the ten in-flight ops and the one being scheduled,
+    /// `3 + 2 · (10 + 1)` = 25. This is the number the table prices the untiled decode at and the
+    /// one the campaign observed.
+    pub const VAE_PIPELINED_DECODE_MAPS: u64 =
+        VAE_LIVE_FULL_RES_MAPS + MLX_MAPS_PER_INFLIGHT_OP * (MLX_MAX_ACTIVE_TASKS + 1);
+    /// Slack above the derived transient in the request-scoped allocator bounds: kernel workspace
+    /// (Winograd transforms at the 288-channel half-resolution stage, SDPA scratch) that no map
+    /// count carries. 1 GiB.
+    pub const MLX_EVAL_SLACK_BYTES: u64 = 1 << 30;
 
     /// Conditioning tokens the published table assumes — a full 256-token prompt through the T2I
     /// template. The request-time estimate takes the real count.
@@ -244,42 +320,88 @@ pub mod derived {
     /// Derived DiT activation transient for a joint sequence of `tokens`, at bf16.
     ///
     /// Linear in `tokens`, hence linear in image **area** — which is the shape the MLX image lane
-    /// has consistently shown above 1024². The `true_cfg` negative branch runs sequentially over
-    /// the same buffers, so it does not double this; it doubles only the resident conditioning,
-    /// which [`activation_bytes`] accounts for separately.
+    /// has consistently shown above 1024². The structural [`DIT_LIVE_HIDDEN_TENSORS`] plus one
+    /// `[S, inner]` output per in-flight command buffer ([`MLX_MAX_ACTIVE_TASKS`]): every
+    /// per-block op at a preset writes more than `max_mb_per_buffer`, so each is its own command
+    /// buffer and the pipeline keeps ten outputs allocated ahead of the GPU, plus the one it is
+    /// scheduling. The `true_cfg`
+    /// negative branch runs sequentially over the same buffers, so it does not double this; it
+    /// doubles only the resident conditioning, which [`activation_bytes`] accounts for separately.
     pub const fn dit_activation_bytes(tokens: u64) -> u64 {
-        tokens * DIT_INNER * DIT_LIVE_HIDDEN_TENSORS * BF16_WIDTH
+        tokens * DIT_INNER * (DIT_LIVE_HIDDEN_TENSORS + MLX_MAX_ACTIVE_TASKS + 1) * BF16_WIDTH
             + tokens * DIT_ROPE_BYTES_PER_TOKEN
     }
 
-    /// Derived VAE decode transient for one untiled `width × height` decode.
-    pub const fn vae_decode_activation_bytes(width: u32, height: u32) -> u64 {
-        VAE_LIVE_FULL_RES_MAPS
-            * VAE_FULL_RES_CHANNELS
-            * width as u64
-            * height as u64
-            * VAE_ELEMENT_WIDTH
+    /// Bytes of one full-resolution decoder map at `width × height`.
+    pub const fn full_res_map_bytes(width: u32, height: u32) -> u64 {
+        VAE_FULL_RES_CHANNELS * width as u64 * height as u64 * VAE_ELEMENT_WIDTH
     }
 
-    /// Derived VAE decode transient when [`super::MemoryStrategy::BoundedDecode`] is engaged: the
-    /// full-resolution tail runs one `tile_edge²` tile at a time, plus the blended output canvas
-    /// (RGBA f32 at full resolution) the tiles are written into.
+    /// `[h·w, h·w]` f32 matrices live in the decode **head**'s global attention: the mid-block's
+    /// single-head self-attention spans every latent position with `head_dim` = 1152, far past
+    /// the fused SDPA kernel's head width, so MLX materialises the score matrix — `q·kᵀ`, its
+    /// scaling and the softmax output — and, because every one of them is its own command buffer
+    /// whose arrays are released only when its completion closure is destroyed at the next pool
+    /// drain, the same three again. Six matrices of `image_tokens²` elements; at 2048² each is
+    /// 1 GiB. The head runs once, untiled, **before**
+    /// the tail, so it competes with the tail for the decode peak rather than adding to it.
+    ///
+    /// Measured 2026-09-23 on the bounded 2048² path: a 5.55 GiB decode transient against the
+    /// 6.06 GiB this term derives (the tile maps are 0.15 GiB each and cannot reach it); an
+    /// earlier run with a 1.4 GiB tighter memory limit showed 3.96 GiB, the limit engaged.
+    pub const VAE_HEAD_ATTENTION_MATRICES: u64 = 6;
+
+    /// The decode head's attention transient at `width × height`:
+    /// [`VAE_HEAD_ATTENTION_MATRICES`] `[tokens, tokens]` f32 matrices.
+    pub const fn vae_head_attention_bytes(width: u32, height: u32) -> u64 {
+        let tokens = image_tokens(width, height);
+        VAE_HEAD_ATTENTION_MATRICES * tokens * tokens * VAE_ELEMENT_WIDTH
+    }
+
+    const fn max(a: u64, b: u64) -> u64 {
+        if a > b {
+            a
+        } else {
+            b
+        }
+    }
+
+    /// Derived VAE decode transient for one untiled `width × height` decode: the larger of the
+    /// head's attention matrices and the tail's [`VAE_PIPELINED_DECODE_MAPS`] full-res maps (the
+    /// tail, at every size from 512² up).
+    pub const fn vae_decode_activation_bytes(width: u32, height: u32) -> u64 {
+        max(
+            vae_head_attention_bytes(width, height),
+            VAE_PIPELINED_DECODE_MAPS * full_res_map_bytes(width, height),
+        )
+    }
+
+    /// Derived VAE decode transient when the decode is bounded: the head runs once at full latent
+    /// extent (its attention matrices are the peak at every preset), then the full-resolution tail
+    /// runs one `tile_edge²` tile at a time behind a per-tile `eval` (so the pipelined set is a
+    /// tile's, [`VAE_PIPELINED_DECODE_MAPS`] maps of `tile_edge²`); plus the blended RGBA f32
+    /// output canvas the tiles are folded into, which is live through both. `overlap` shapes the
+    /// tile grid, not the tile the tail decodes — `gen_core::tiling::split_spatial` cuts
+    /// `tile_edge`-wide tiles at a `tile_edge − overlap` stride — so it does not enter the bytes.
     pub const fn tiled_vae_decode_activation_bytes(
         width: u32,
         height: u32,
         tile_edge: u32,
-        overlap: u32,
+        _overlap: u32,
     ) -> u64 {
-        let edge = tile_edge as u64 + overlap as u64;
-        VAE_LIVE_FULL_RES_MAPS * VAE_FULL_RES_CHANNELS * edge * edge * VAE_ELEMENT_WIDTH
-            + 4 * width as u64 * height as u64 * VAE_ELEMENT_WIDTH
+        max(
+            vae_head_attention_bytes(width, height),
+            VAE_PIPELINED_DECODE_MAPS * full_res_map_bytes(tile_edge, tile_edge),
+        ) + 4 * width as u64 * height as u64 * VAE_ELEMENT_WIDTH
     }
 
     /// The warm activation high-water mark of one request: the larger of the denoise and decode
     /// peaks, plus the conditioning that stays resident across both.
     ///
     /// `use_negative` doubles the retained conditioning (the positive and negative embeddings are
-    /// both alive for the whole denoise).
+    /// both alive for the whole denoise). `tile_edge` is the bounded-decode tile, `None` for the
+    /// untiled decode; [`super::default_decode_is_bounded`] is the policy that picks between them
+    /// when a request does not force tiling.
     pub const fn activation_bytes(
         width: u32,
         height: u32,
@@ -299,6 +421,32 @@ pub mod derived {
         retained + if denoise > decode { denoise } else { decode }
     }
 
+    /// The transient one request is **budgeted** at — [`activation_bytes`] for the decode the
+    /// request will actually run (forced tile, else the default policy) plus
+    /// [`MLX_EVAL_SLACK_BYTES`]. This is the number [`super::AllocatorBounds`] hands MLX as the
+    /// request's cache limit and, on top of the resident set, as its memory limit; the
+    /// runtime is held to it rather than merely estimated by it.
+    pub fn request_transient_budget_bytes(
+        width: u32,
+        height: u32,
+        conditioning_tokens: u64,
+        reference_count: u32,
+        use_negative: bool,
+        forced_tile_edge: Option<u32>,
+    ) -> u64 {
+        let tile_edge = forced_tile_edge.or_else(|| {
+            super::default_decode_is_bounded(width, height).then_some(super::DECODE_TILE_EDGE)
+        });
+        activation_bytes(
+            width,
+            height,
+            conditioning_tokens,
+            reference_count,
+            use_negative,
+            tile_edge,
+        ) + MLX_EVAL_SLACK_BYTES
+    }
+
     /// One published row of the derived table: a tier at a preset.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct TableRow {
@@ -309,22 +457,42 @@ pub mod derived {
         /// `max(tower, DiT + VAE)` under the `Sequential` policy.
         pub sequential_weight_floor_bytes: u64,
         /// Warm transient at [`TABLE_CONDITIONING_TOKENS`], no references, no negative branch,
-        /// untiled decode.
+        /// untiled decode ([`VAE_PIPELINED_DECODE_MAPS`] maps).
         pub activation_bytes: u64,
         /// The same with bounded decode engaged at the shipped 512/64 geometry.
         pub tiled_activation_bytes: u64,
+        /// Whether the **default** decode at this preset is the bounded one
+        /// ([`super::default_decode_is_bounded`]).
+        pub default_decode_bounded: bool,
     }
 
     impl TableRow {
+        /// The transient the default path runs at this preset: `tiled_activation_bytes` where the
+        /// default decode is bounded, else `activation_bytes`.
+        pub const fn default_activation_bytes(self) -> u64 {
+            if self.default_decode_bounded {
+                self.tiled_activation_bytes
+            } else {
+                self.activation_bytes
+            }
+        }
+
         /// Derived request peak under `Sequential` + bounded decode — the configuration a memory-
         /// constrained host runs.
         pub const fn bounded_peak_bytes(self) -> u64 {
             self.sequential_weight_floor_bytes + self.tiled_activation_bytes
         }
 
-        /// Derived request peak under `Resident` + untiled decode.
+        /// Derived request peak under `Resident` + **untiled** decode — what a caller that forces
+        /// the single pass above the threshold pays. Not the default path at any preset.
         pub const fn resident_peak_bytes(self) -> u64 {
             self.resident_weight_bytes + self.activation_bytes
+        }
+
+        /// Derived request peak under `Resident` on the **default** path — the number a
+        /// consumer's floor should be built from.
+        pub const fn default_peak_bytes(self) -> u64 {
+            self.resident_weight_bytes + self.default_activation_bytes()
         }
     }
 
@@ -355,10 +523,102 @@ pub mod derived {
                         false,
                         Some(super::DECODE_TILE_EDGE),
                     ),
+                    default_decode_bounded: super::default_decode_is_bounded(
+                        preset.width,
+                        preset.height,
+                    ),
                 });
             }
         }
         rows
+    }
+}
+
+// ================================================================================================
+// Default decode policy and the request-scoped allocator bounds (sc-24114).
+// ================================================================================================
+
+/// The untiled decode's transient may take at most this fraction of the **bf16 resident set**
+/// (denominator [`DEFAULT_UNTILED_DECODE_FRACTION_OF_RESIDENT`]) before the default decode is
+/// bounded: one half. At 1024² — the fitted grid every reference image is resized to — the
+/// pipelined untiled transient is 25 × 0.5625 GiB = 14.06 GiB, just under half of 28.61 GiB, so
+/// the fitted area is the largest that decodes untiled by default; 1056×1024 (14.50 GiB) is
+/// already over. Every upstream preset is ≥ 4.19 Mpx, where the untiled decode would cost
+/// 56.25 GiB or more — twice the bf16 resident set, six times q4's — against the 6.06 GiB the
+/// bounded 512/64 decode of the same preset needs (the head's attention matrices, which no tiling
+/// touches, plus the RGBA canvas). The measured 1024² untiled transient was 9.67 GiB (17 maps,
+/// the memory limit engaged); the policy is stated against the derived 25-map number.
+pub const DEFAULT_UNTILED_DECODE_FRACTION_OF_RESIDENT: u64 = 2;
+
+/// The provider's automatic decode policy: whether a `width × height` request that does not force
+/// tiling (`GenerationMemory::tile_vae_decode`) decodes bounded at the shipped 512/64 geometry.
+///
+/// `true` wherever [`derived::vae_decode_activation_bytes`] exceeds the bf16 resident set divided
+/// by [`DEFAULT_UNTILED_DECODE_FRACTION_OF_RESIDENT`] — above the fitted 1024² area, so at every
+/// upstream preset — and `false` at or below it, where the decode is the exact single pass. The
+/// same tier-independent line applies at every tier: the seam the parity tests bound is a
+/// property of the geometry, and a q4 render must not diverge from a bf16 one at the same size.
+/// The shared `GenerationMemory` field only *forces* tiling; `false` (and an absent block) means
+/// "the provider's own threshold applies", so there is no request-level way to ask for an untiled
+/// decode above the threshold. That is deliberate: the untiled transient at a preset is a
+/// multiple of every tier's resident set, and the ≤ 2/255 mean seam divergence the parity tests
+/// bound is the whole price of bounding it.
+pub const fn default_decode_is_bounded(width: u32, height: u32) -> bool {
+    derived::vae_decode_activation_bytes(width, height)
+        > derived::resident_weights(Tier::Bf16).resident_total()
+            / DEFAULT_UNTILED_DECODE_FRACTION_OF_RESIDENT
+}
+
+/// Request-scoped MLX allocator bounds (sc-24114). Two knobs, both restored on drop:
+///
+/// * **cache limit** (`mlx_rs::memory::set_cache_limit`): the allocator returns freed buffers
+///   above it to the OS immediately instead of pooling them up to ~0.95 × the device's
+///   recommended working set. Set to the request's transient budget, the process footprint the OS
+///   (and the campaign's ceiling) sees tracks `active + budget` instead of growing to the pool
+///   line — the untiled 2048² decode left 64.68 GiB pooled with the limit unset. This is the knob
+///   the footprint numbers rest on.
+/// * **memory limit** (`mlx_rs::memory::set_memory_limit`): MLX's eval loop drains in-flight
+///   command buffers while active memory is above it. Set to the resident set plus the budget it
+///   is **defence in depth that the derived table does not credit**: a retired command buffer's
+///   arrays are released one autorelease-pool drain after it completes, so the loop cannot get
+///   back under the limit once the lagging releases exceed the budget, and it then proceeds one op
+///   at a time (17 maps measured at 1024² untiled against 25 free-running). It cannot fail a
+///   request: with nothing in flight it never waits.
+///
+/// Neither changes a single computed value: the memory limit only reorders when work is committed
+/// and the cache limit only decides where a dead buffer goes.
+pub struct AllocatorBounds {
+    previous_memory_limit: usize,
+    previous_cache_limit: usize,
+}
+
+impl AllocatorBounds {
+    /// Bound the allocator for one request: memory limit `resident + transient_budget`, cache limit
+    /// `transient_budget`. `resident_bytes` is the larger of what is active now (a warm resident
+    /// pair) and the tier's derived resident set (a staged request enters with nothing loaded).
+    pub fn enter(resident_bytes: u64, transient_budget_bytes: u64) -> Self {
+        let resident = resident_bytes.max(mlx_rs::memory::get_active_memory() as u64);
+        let memory_limit =
+            usize::try_from(resident.saturating_add(transient_budget_bytes)).unwrap_or(usize::MAX);
+        let cache_limit = usize::try_from(transient_budget_bytes).unwrap_or(usize::MAX);
+        Self {
+            previous_memory_limit: mlx_rs::memory::set_memory_limit(memory_limit),
+            previous_cache_limit: mlx_rs::memory::set_cache_limit(cache_limit),
+        }
+    }
+
+    /// The limits currently installed, `(memory, cache)`, for tests and traces.
+    pub fn current() -> (usize, usize) {
+        let cache = mlx_rs::memory::set_cache_limit(0);
+        mlx_rs::memory::set_cache_limit(cache);
+        (mlx_rs::memory::get_memory_limit(), cache)
+    }
+}
+
+impl Drop for AllocatorBounds {
+    fn drop(&mut self) {
+        mlx_rs::memory::set_memory_limit(self.previous_memory_limit);
+        mlx_rs::memory::set_cache_limit(self.previous_cache_limit);
     }
 }
 
@@ -607,8 +867,10 @@ pub fn weights_free_memory_strategy_contract(
             MemoryFormulaVariable::DecodeTileArea,
         ],
     };
-    // The load-time default tiles nothing, so an explicit `Resident` selection has no default to
-    // override.
+    // The load-time default is the provider's own decode threshold (`default_decode_is_bounded`:
+    // bounded 512/64 above the fitted 1024² area, the exact single pass at or below it) plus the
+    // request-scoped allocator bounds; a `Resident` selection keeps exactly that, so there is no
+    // load-time staging or windowing for an explicit selection to override.
     contract.resident_request_memory = ResidentRequestMemory::PreserveLoadDefaults;
     for capability in &mut contract.strategies {
         capability.support = match capability.strategy {
@@ -959,6 +1221,228 @@ mod tests {
             ten < 11 * bare,
             "fitted references are cheaper than target-sized ones"
         );
+    }
+
+    /// The decode and denoise models against the on-device observations this module was corrected
+    /// from (sc-24114, bf16, 2026-09-23): a free-running untiled 2048² decode took active memory
+    /// from 29.66 GiB to 86.29 GiB — a 56.63 GiB transient — the bounded 2048² decode 5.55 GiB,
+    /// and the two-step 2048² denoise 2.77–3.02 GiB. The earlier "3 live maps" model priced the
+    /// untiled decode at 6.75 GiB; the pipelined model prices it within 1% of the observation,
+    /// the bounded default at its head's 6 GiB of attention matrices, and the denoise at 3.05 GiB.
+    ///
+    /// *Mutation that reds this:* `VAE_PIPELINED_DECODE_MAPS = VAE_LIVE_FULL_RES_MAPS` (the old
+    /// synchronous model), dropping `MLX_MAX_ACTIVE_TASKS` from `dit_activation_bytes`, or pricing
+    /// the tile at `(edge + overlap)²`.
+    #[test]
+    fn the_decode_and_denoise_models_reproduce_the_measured_transients() {
+        const MEASURED_UNTILED_2048_GIB: f64 = 56.63;
+        const MEASURED_BOUNDED_2048_GIB: f64 = 5.55;
+        const MEASURED_DENOISE_2048_GIB: [f64; 2] = [2.77, 3.02];
+        let map = full_res_map_bytes(2048, 2048) as f64 / GIB;
+        assert!(
+            (map - 2.25).abs() < 0.001,
+            "one 2048² map is 2.25 GiB, got {map}"
+        );
+        assert_eq!(VAE_PIPELINED_DECODE_MAPS, 25);
+
+        let untiled = vae_decode_activation_bytes(2048, 2048) as f64 / GIB;
+        assert!((untiled - 56.25).abs() < 0.01, "{untiled}");
+        assert!(
+            (untiled - MEASURED_UNTILED_2048_GIB).abs() / MEASURED_UNTILED_2048_GIB < 0.02,
+            "free-running untiled decode: derived {untiled:.2} GiB vs measured \
+             {MEASURED_UNTILED_2048_GIB} GiB"
+        );
+        let bounded =
+            tiled_vae_decode_activation_bytes(2048, 2048, super::DECODE_TILE_EDGE, 64) as f64 / GIB;
+        assert!((bounded - 6.06).abs() < 0.01, "{bounded}");
+        let head = vae_head_attention_bytes(2048, 2048) as f64 / GIB;
+        assert!((head - 6.0).abs() < 0.001, "{head}");
+        assert!(
+            bounded >= MEASURED_BOUNDED_2048_GIB
+                && (bounded - MEASURED_BOUNDED_2048_GIB) / MEASURED_BOUNDED_2048_GIB < 0.10,
+            "bounded decode: derived {bounded:.2} GiB vs measured {MEASURED_BOUNDED_2048_GIB} GiB"
+        );
+
+        let denoise = dit_activation_bytes(joint_tokens(2048, 2048, TABLE_CONDITIONING_TOKENS, 0))
+            as f64
+            / GIB;
+        assert!((denoise - 3.05).abs() < 0.01, "{denoise}");
+        assert!(
+            denoise > MEASURED_DENOISE_2048_GIB[0] * 0.95
+                && denoise < MEASURED_DENOISE_2048_GIB[1] * 1.05,
+            "DiT step: derived {denoise:.2} GiB vs measured {MEASURED_DENOISE_2048_GIB:?}"
+        );
+        // At the presets the bounded decode (its head) is above the DiT step, so the default
+        // transient IS the bounded decode plus the retained conditioning.
+        let row = table()
+            .into_iter()
+            .find(|r| r.tier == Tier::Bf16 && r.preset.width == 2048 && r.preset.height == 2048)
+            .unwrap();
+        assert!(row.default_decode_bounded);
+        assert!((row.tiled_activation_bytes as f64 / GIB - 6.06).abs() < 0.01);
+        assert!((row.activation_bytes as f64 / GIB - 56.25).abs() < 0.01);
+        assert!(
+            (row.default_peak_bytes() as f64 / GIB - 34.67).abs() < 0.01,
+            "bf16 default peak at 2048²: {:.3} GiB",
+            row.default_peak_bytes() as f64 / GIB
+        );
+        assert!((row.resident_peak_bytes() as f64 / GIB - 84.86).abs() < 0.01);
+        // The rule the consumer floors are built from: the default-path peak per tier at the
+        // default preset, to 0.01 GiB.
+        for (tier, peak) in [(Tier::Bf16, 34.67), (Tier::Q8, 22.40), (Tier::Q4, 15.85)] {
+            let row = table()
+                .into_iter()
+                .find(|r| r.tier == tier && r.preset.width == 2048 && r.preset.height == 2048)
+                .unwrap();
+            assert!(
+                (row.default_peak_bytes() as f64 / GIB - peak).abs() < 0.01,
+                "{tier:?} default peak {:.3} GiB != {peak}",
+                row.default_peak_bytes() as f64 / GIB
+            );
+        }
+    }
+
+    /// The default decode policy: bounded wherever the untiled transient would exceed half the
+    /// bf16 resident set — above the fitted 1024² area, so at every upstream preset — and the
+    /// exact single pass at or below it; the budget the allocator bounds are set from follows the
+    /// same choice.
+    ///
+    /// *Mutation that reds this:* `>=` in `default_decode_is_bounded`, a fraction of 1 (which
+    /// would leave 1056×1024 untiled) or 4 (which would tile 1024²), or a threshold at the default
+    /// preset's own area.
+    #[test]
+    fn the_default_decode_is_bounded_above_the_fitted_area_and_untiled_at_it() {
+        assert_eq!(DEFAULT_UNTILED_DECODE_FRACTION_OF_RESIDENT, 2);
+        let line = resident_weights(Tier::Bf16).resident_total() / 2;
+        assert!((line as f64 / GIB - 14.30).abs() < 0.01);
+        assert!((vae_decode_activation_bytes(1024, 1024) as f64 / GIB - 14.06).abs() < 0.01);
+        assert!((vae_decode_activation_bytes(1056, 1024) as f64 / GIB - 14.50).abs() < 0.01);
+        assert!(!default_decode_is_bounded(1024, 1024));
+        assert!(!default_decode_is_bounded(512, 2048));
+        assert!(!default_decode_is_bounded(512, 512));
+        assert!(default_decode_is_bounded(1056, 1024));
+        for preset in PRESETS {
+            assert!(
+                default_decode_is_bounded(preset.width, preset.height),
+                "{} decodes bounded by default",
+                preset.ratio
+            );
+        }
+        assert!(table().iter().all(|row| row.default_decode_bounded));
+
+        // The budget is the default path's transient plus the slack; a forced tile overrides it.
+        let bounded = request_transient_budget_bytes(2048, 2048, 256, 0, false, None);
+        assert_eq!(
+            bounded,
+            activation_bytes(2048, 2048, 256, 0, false, Some(super::DECODE_TILE_EDGE))
+                + MLX_EVAL_SLACK_BYTES
+        );
+        let untiled = request_transient_budget_bytes(1024, 1024, 256, 0, false, None);
+        assert_eq!(
+            untiled,
+            activation_bytes(1024, 1024, 256, 0, false, None) + MLX_EVAL_SLACK_BYTES
+        );
+        let forced = request_transient_budget_bytes(1024, 1024, 256, 0, false, Some(256));
+        assert_eq!(
+            forced,
+            activation_bytes(1024, 1024, 256, 0, false, Some(256)) + MLX_EVAL_SLACK_BYTES
+        );
+        assert!(forced < untiled);
+        // Ten fitted references raise the denoise term, never the decode term.
+        assert!(
+            request_transient_budget_bytes(2048, 2048, 256, 10, false, None) > bounded,
+            "references are joint tokens and price into the budget"
+        );
+    }
+
+    /// A `Resident` selection through the registered scope leaves the request with no memory
+    /// block, so the provider's own threshold decides: bounded at the default preset, untiled at
+    /// a small size. A `BoundedDecode` selection forces the tile it admitted at any size.
+    ///
+    /// *Mutation that reds this:* `ResidentRequestMemory::ExplicitResident` together with a
+    /// `decode_tiling` that treats `tile_vae_decode: false` as "untiled".
+    #[test]
+    fn a_resident_selection_defers_to_the_default_decode_policy() {
+        use gen_core::{GenerationRequest, MemoryRunOutcome};
+
+        let spec = LoadSpec::new(WeightsSource::Dir("/qwen-image-2-1".into()));
+        let contract = weights_free_memory_strategy_contract(MODEL_ID, &spec).unwrap();
+        let scoped = |strategy: MemoryStrategy, edge: u32, tile: Option<u32>| {
+            let mut context = mlx_gen::gen_core::standard_memory_behavior_context(
+                &contract,
+                strategy,
+                loaded_tier(&spec),
+                MemoryBehaviorRoute {
+                    mode: MemoryMode::TextToImage,
+                    reference_count: 0,
+                    use_pid: false,
+                    has_phases: true,
+                    overlay: None,
+                },
+            )
+            .unwrap();
+            context.geometry.width = edge;
+            context.geometry.height = edge;
+            context.geometry.batch = 1;
+            context.selection.parameters.decode_tile_edge = tile;
+            context.selection.parameters.decode_overlap = tile.map(|_| DECODE_OVERLAP);
+            let mut request = GenerationRequest {
+                prompt: "a red fox".into(),
+                width: edge,
+                height: edge,
+                ..Default::default()
+            };
+            match registered_begin_request(&spec, &contract, &context).unwrap() {
+                Some(mut scope) => {
+                    scope.configure_request(&mut request).unwrap();
+                    scope.finish(MemoryRunOutcome::Complete).unwrap();
+                }
+                None => assert_eq!(strategy, MemoryStrategy::Resident),
+            }
+            (request.memory, crate::pipeline::decode_tiling(&request))
+        };
+
+        let (memory, tiling) = scoped(MemoryStrategy::Resident, 2048, None);
+        assert_eq!(
+            memory, None,
+            "a resident selection preserves the load defaults"
+        );
+        let spatial = tiling
+            .expect("the default preset decodes bounded")
+            .spatial
+            .unwrap();
+        assert_eq!((spatial.tile_px, spatial.overlap_px), (512, 64));
+
+        let (memory, tiling) = scoped(MemoryStrategy::Resident, 512, None);
+        assert_eq!(memory, None);
+        assert!(
+            tiling.is_none(),
+            "below the threshold the decode is untiled"
+        );
+
+        let (memory, tiling) = scoped(MemoryStrategy::BoundedDecode, 512, Some(256));
+        assert!(memory.unwrap().tile_vae_decode);
+        let spatial = tiling
+            .expect("a bounded selection forces tiling")
+            .spatial
+            .unwrap();
+        assert_eq!((spatial.tile_px, spatial.overlap_px), (256, 64));
+    }
+
+    /// The allocator bounds install `resident + budget` / `budget` and restore the previous
+    /// limits on drop, so a request never leaks its bounds into the next one.
+    #[test]
+    fn allocator_bounds_are_installed_for_the_request_and_restored_after_it() {
+        let (memory_before, cache_before) = AllocatorBounds::current();
+        {
+            let _bounds = AllocatorBounds::enter(28 << 30, 3 << 30);
+            let (memory, cache) = AllocatorBounds::current();
+            assert_eq!(cache, 3 << 30);
+            // `resident` is the larger of the argument and what is active now.
+            assert!(memory >= (28 << 30) + (3 << 30), "{memory}");
+            assert!(memory <= (28 << 30) + (3 << 30) + mlx_rs::memory::get_active_memory());
+        }
+        assert_eq!(AllocatorBounds::current(), (memory_before, cache_before));
     }
 
     #[test]

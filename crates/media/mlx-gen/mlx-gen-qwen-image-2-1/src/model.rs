@@ -349,6 +349,28 @@ impl QwenImage21 {
         self.validate(req)?;
         let params = resolve_run_params(&self.scheduler, req)?;
         let tiling = crate::pipeline::decode_tiling(req);
+        // sc-24114: request-scoped allocator bounds — cache limit = the derived transient budget
+        // (freed buffers above it go back to the OS instead of pooling to the device's working-set
+        // line, which is what let the footprint reach 110 GB), memory limit = resident + budget
+        // (uncredited defence in depth against the eval pipeline's run-ahead). Restored on drop.
+        let _bounds = crate::memory_strategy::AllocatorBounds::enter(
+            crate::memory_strategy::derived::resident_weights(
+                crate::quant::Tier::from_selected(self.spec.quantize)
+                    .unwrap_or(crate::quant::Tier::Bf16),
+            )
+            .resident_total(),
+            crate::memory_strategy::derived::request_transient_budget_bytes(
+                req.width,
+                req.height,
+                crate::memory_strategy::derived::TABLE_CONDITIONING_TOKENS,
+                req.memory_reference_count(),
+                params.use_negative,
+                tiling
+                    .as_ref()
+                    .and_then(|t| t.spatial)
+                    .map(|s| s.tile_px as u32),
+            ),
+        );
         let drop = self.drop_count;
         // Staged residency is a per-request execution decision (sc-24114): the shared worker
         // selects it through the memory-strategy scope, which writes `GenerationMemory` onto the
@@ -459,6 +481,10 @@ impl QwenImage21 {
                     if req.cancel.is_cancelled() {
                         return Err(Error::Canceled);
                     }
+                    // The denoise's pooled buffers are the wrong sizes for the decoder; shed them
+                    // so the decode starts from `active` rather than `active + pool` (a pure
+                    // memory hint — the latents are materialized by the sampler's final eval).
+                    mlx_rs::memory::clear_cache();
                     if rgba_out {
                         rgba_images.push(decode_rgba(
                             &heavy.vae,
@@ -478,6 +504,9 @@ impl QwenImage21 {
                             Some(&req.cancel),
                         )?);
                     }
+                    // The decoded image is host bytes now; nothing the decoder pooled is reused by
+                    // the next image's denoise, so return it before the next step or the caller.
+                    mlx_rs::memory::clear_cache();
                 }
                 if rgba_out {
                     Ok(GenerationOutput::ImagesRgba(rgba_images))
