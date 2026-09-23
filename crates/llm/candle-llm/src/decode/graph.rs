@@ -70,7 +70,9 @@ use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use candle_core::{Device, Tensor};
+use candle_core::Device;
+#[cfg(feature = "cuda")]
+use candle_core::Tensor;
 
 #[cfg(feature = "cuda")]
 use crate::decode::step::StepTokens;
@@ -275,6 +277,7 @@ pub fn graph_tally() -> GraphTally {
     TALLY.with(Cell::get)
 }
 
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn note_replayed() {
     TALLY.with(|t| {
         let mut v = t.get();
@@ -1333,7 +1336,7 @@ mod tests {
     use super::*;
     use crate::decode::step::StepOutput;
     use crate::primitives::decode_cache::CacheMemory;
-    use candle_core::DType;
+    use candle_core::{DType, Tensor};
     use std::cell::Cell;
 
     /// A fixed-logits model whose cache is a bare counter (the step driver's own mock).
