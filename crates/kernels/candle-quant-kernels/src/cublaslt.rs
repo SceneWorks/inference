@@ -1606,6 +1606,18 @@ mod cuda_impl {
             self.global_scale
         }
 
+        /// The device E2M1 nibble buffer (row-major `[rows, cols_padded / 2]`), for kernels in this
+        /// crate that read the resident weight directly (the fused decode GEMV, sc-24136).
+        pub(crate) fn packed_slice(&self) -> &cudarc::driver::CudaSlice<u8> {
+            &self.packed
+        }
+
+        /// The device UE4M3 block-scale buffer, in cuBLASLt's row-major scale-factor-atom layout
+        /// (see `cublaslt_scale_layout`), for kernels in this crate (sc-24136).
+        pub(crate) fn scales_slice(&self) -> &cudarc::driver::CudaSlice<u8> {
+            &self.scales
+        }
+
         /// Copy the staged **UE4M3 block-scale bytes** back to the host — the swizzled buffer exactly as
         /// cuBLASLt reads it (see `cublaslt_scale_layout`, private to this module, for the offset of a
         /// logical `(row, block)`).

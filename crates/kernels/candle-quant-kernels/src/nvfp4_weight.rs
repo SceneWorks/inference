@@ -223,6 +223,10 @@ pub struct Nvfp4Weight {
     lt: std::sync::Arc<crate::cublaslt::CublasLt>,
     #[cfg(feature = "cuda")]
     staged: crate::cublaslt::DevNvfp4,
+    /// The CUDA device the packed weight lives on (the decode GEMV refuses an activation on
+    /// another device rather than reading across contexts).
+    #[cfg(feature = "cuda")]
+    device: Device,
     #[cfg(not(feature = "cuda"))]
     _uninhabited: std::convert::Infallible,
 }
@@ -260,6 +264,7 @@ impl Nvfp4Weight {
                 bias,
                 lt: std::sync::Arc::clone(lt),
                 staged,
+                device: weight.device().clone(),
             })
         }
         #[cfg(not(feature = "cuda"))]
@@ -276,6 +281,11 @@ impl Nvfp4Weight {
 
     /// `y = x·Wᵀ (+ b)` through the W4A4 FP4 GEMM. Accepts a rank-≥1 activation `[..., in]` and
     /// returns `[..., out]` in the activation's dtype.
+    ///
+    /// This is the cuBLASLt path at every row count. For decode-sized inputs (≤
+    /// [`NVFP4_GEMV_MAX_ROWS`](crate::NVFP4_GEMV_MAX_ROWS) rows) the fused W4A16 GEMV,
+    /// `forward_gemv` (only compiled with the `cuda` feature), is the other implementation; the
+    /// caller picks (sc-24136).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
         {
@@ -291,6 +301,23 @@ impl Nvfp4Weight {
     /// The logical `[out, in]` weight shape.
     pub fn shape(&self) -> (usize, usize) {
         (self.rows, self.cols)
+    }
+
+    /// The optional `[out]` bias.
+    pub fn bias(&self) -> Option<&Tensor> {
+        self.bias.as_ref()
+    }
+
+    /// The staged packed operand (nibbles + swizzled block scales + global scale).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn staged(&self) -> &crate::cublaslt::DevNvfp4 {
+        &self.staged
+    }
+
+    /// The device the packed weight lives on.
+    #[cfg(feature = "cuda")]
+    pub fn device(&self) -> &Device {
+        &self.device
     }
 
     /// Resident device bytes of the packed weight (E2M1 nibbles + UE4M3 block scales) plus the

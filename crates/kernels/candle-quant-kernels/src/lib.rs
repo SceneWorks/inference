@@ -21,12 +21,19 @@
 //!   QK-norm+RoPE as single launches that are bit-identical to candle's op chain, each with a typed
 //!   shape/dtype refusal so the caller can fall back to the reference visibly.
 //!
+//! - [`nvfp4_gemv`] — the fused NVFP4 decode GEMV (sc-24136): a resident [`Nvfp4Weight`] times an
+//!   unquantized bf16 activation of 1..=8 rows in one tensor-core launch (exact bf16 dequant,
+//!   f32 accumulate), the
+//!   decode-sized alternative to the W4A4 cuBLASLt forward, with a typed refusal for everything
+//!   else so the caller falls back to cuBLASLt visibly.
+//!
 //! Device code is behind `cfg(feature = "cuda")`; a CPU or Metal build compiles the codec, the
 //! capability floors, the kernel descriptors and the fused primitives' input checks only.
 
 pub mod cublaslt;
 pub mod fused_decode;
 pub mod nvfp4;
+pub mod nvfp4_gemv;
 pub mod nvfp4_linear;
 pub mod nvfp4_outlier;
 pub mod nvfp4_weight;
@@ -48,6 +55,11 @@ pub use fused_decode::{
 pub use nvfp4::{
     e2m1_from_f32, e4m3_from_f32, e4m3_to_f32, Nvfp4Tensor, E2M1_LUT, E2M1_MAX, E4M3_MAX,
     NVFP4_BLOCK,
+};
+pub use nvfp4_gemv::{
+    check_nvfp4_gemv, gemv_abs_bound, Nvfp4GemvError, Nvfp4GemvPlan, Nvfp4GemvRefusal,
+    GEMV_REL_RMS_TOL, NVFP4_GEMV_FUNCTION, NVFP4_GEMV_MAX_ROWS, NVFP4_GEMV_ROWS_PER_BLOCK,
+    NVFP4_GEMV_SRC, NVFP4_GEMV_THREADS,
 };
 pub use nvfp4_linear::{
     ActPrecision, Nvfp4Context, Nvfp4Fallback, Nvfp4Linear, Nvfp4Partition, Nvfp4Regime,

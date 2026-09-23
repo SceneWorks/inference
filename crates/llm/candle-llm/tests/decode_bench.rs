@@ -10,7 +10,8 @@
 //! |----------------------------|--------------------------------------------------------------|
 //! | `DECODE_BENCH_SNAPSHOT`    | snapshot directory (config.json, tokenizer*.json, shards)    |
 //! | `DECODE_BENCH_OUTPUT`      | JSON path to write (must not exist)                          |
-//! | `DECODE_BENCH_ROWS`        | comma list of `reference`, `reference_unfused`, `step_model`, `mtp` (default `reference,step_model,mtp`) |
+//! | `DECODE_BENCH_ROWS`        | comma list of `reference`, `reference_unfused`, `reference_cublaslt`, `step_model`, `mtp` (default `reference,step_model,mtp`) |
+//! | `DECODE_BENCH_FORMAT`      | projection weight format: `bf16` (default) or `nvfp4` (quantized at load, sc-24135) |
 //! | `DECODE_BENCH_DRAFTS`      | MTP draft widths, comma list (default `1,2,3,4,5`)           |
 //! | `DECODE_BENCH_NEW_TOKENS`  | tokens generated per row (default 256)                       |
 //! | `DECODE_BENCH_WARMUP_TOKENS` | tokens of the untimed warm-up run (default 16)             |
@@ -24,7 +25,12 @@
 //! token-for-token and, if not, the first divergence. The `reference_unfused` row (sc-24137) is
 //! the reference loop with the fused decode primitives switched **off** for that row only, so one
 //! document holds the fused-on vs fused-off token identity and tok/s; every row also records its
-//! fused-vs-reference primitive tally (`fused_primitives`) and the document records the switch. Timing brackets the *decode* phase only
+//! fused-vs-reference primitive tally (`fused_primitives`) and the document records the switch.
+//! With `DECODE_BENCH_FORMAT=nvfp4` every row also records which NVFP4 projection path ran
+//! (`nvfp4_projections`: fused decode GEMV vs cuBLASLt W4A4 calls and the last cuBLASLt reason,
+//! sc-24136) and the document records the GEMV switch (`nvfp4_gemv`); the `reference_cublaslt`
+//! row is the reference loop with the GEMV switched **off** for that row only, so one document
+//! holds the GEMV-on vs cuBLASLt tok/s. Timing brackets the *decode* phase only
 //! (prefill is reported separately) with a device synchronize on both sides.
 //!
 //! Memory: `device_used_bytes_at_last_token` is `cuMemGetInfo` total-free sampled from the row's
@@ -66,7 +72,8 @@ use serde_json::{json, Value};
 use candle_llm::decode::generate_step_timed;
 use candle_llm::decode::CountingDecode;
 use candle_llm::primitives::{
-    fused_kernels_enabled, fused_tally, host_sync_count, set_fused_kernels,
+    fused_kernels_enabled, fused_tally, host_sync_count, nvfp4_gemv_enabled,
+    nvfp4_gemv_policy_guard, nvfp4_path_tally, set_fused_kernels, ProjectionFormat,
 };
 
 fn host_syncs_now() -> Option<u64> {
@@ -105,6 +112,63 @@ fn with_fused_off<T>(f: impl FnOnce() -> T) -> T {
     let out = f();
     set_fused_kernels(Some(was));
     out
+}
+
+/// The NVFP4 decode-GEMV switch state (`on` / `off`), or `None` on a binary without it.
+fn nvfp4_gemv_switch() -> Option<&'static str> {
+    Some(if nvfp4_gemv_enabled() { "on" } else { "off" })
+}
+
+/// A snapshot of the thread's NVFP4 projection path tally (sc-24136), or `None` on a binary
+/// without it; `nvfp4_delta` turns two snapshots into a row's JSON.
+fn nvfp4_tally_now() -> Option<candle_llm::primitives::Nvfp4PathTally> {
+    Some(nvfp4_path_tally())
+}
+
+fn nvfp4_delta(
+    before: Option<candle_llm::primitives::Nvfp4PathTally>,
+    switch: Option<&'static str>,
+) -> Option<Value> {
+    let d = nvfp4_tally_now()?.since(&before?);
+    Some(json!({
+        "switch": switch,
+        "gemv": d.gemv,
+        "cublaslt": d.cublaslt,
+        "cublaslt_reason": d.cublaslt_reason,
+        "path": d.label(),
+    }))
+}
+
+/// Run `f` with the NVFP4 decode GEMV switched off (every NVFP4 projection on cuBLASLt),
+/// restoring the previous policy afterwards. Uses the process-wide policy guard so a prior
+/// env-derived (`None`) policy comes back as `None`, not pinned to whatever `Some(bool)` state
+/// this call happened to observe.
+fn with_nvfp4_gemv_off<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = nvfp4_gemv_policy_guard(Some(false));
+    f()
+}
+
+/// Build the target (and the MTP head, when the snapshot carries one) in the requested
+/// projection format: `bf16` keeps the checkpoint's dense projections, `nvfp4` quantizes them at
+/// load (sc-24135).
+fn build_model(
+    weights: &Weights,
+    prefix: &str,
+    cfg: Qwen35Config,
+    format: &str,
+    device: &Device,
+) -> (Qwen35Model, Option<Qwen35Mtp>) {
+    let format = match format {
+        "bf16" => None,
+        "nvfp4" => Some(ProjectionFormat::nvfp4(device).expect("NVFP4 capability")),
+        other => panic!("DECODE_BENCH_FORMAT must be bf16 or nvfp4, got {other}"),
+    };
+    let model = Qwen35Model::from_weights_format(weights, prefix, cfg.clone(), format.as_ref())
+        .expect("build model");
+    let mtp = (cfg.mtp_num_hidden_layers > 0 && Qwen35Mtp::complete_in(weights, &cfg)).then(|| {
+        Qwen35Mtp::from_weights_format(weights, &model, format.as_ref()).expect("build mtp")
+    });
+    (model, mtp)
 }
 
 /// The reference row with its target forwards **measured**: the loop runs through a
@@ -227,6 +291,36 @@ fn with_fused_off<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
+fn nvfp4_gemv_switch() -> Option<&'static str> {
+    None
+}
+
+fn nvfp4_tally_now() -> Option<()> {
+    None
+}
+
+fn nvfp4_delta(_before: Option<()>, _switch: Option<&'static str>) -> Option<Value> {
+    None
+}
+
+fn with_nvfp4_gemv_off<T>(f: impl FnOnce() -> T) -> T {
+    f()
+}
+
+fn build_model(
+    weights: &Weights,
+    prefix: &str,
+    cfg: Qwen35Config,
+    format: &str,
+    _device: &Device,
+) -> (Qwen35Model, Option<Qwen35Mtp>) {
+    assert_eq!(format, "bf16", "the pre-epic baseline has no NVFP4 projections");
+    let model = Qwen35Model::from_weights(weights, prefix, cfg.clone()).expect("build model");
+    let mtp = (cfg.mtp_num_hidden_layers > 0 && Qwen35Mtp::complete_in(weights, &cfg))
+        .then(|| Qwen35Mtp::from_weights_with(weights, &model, None).expect("build mtp"));
+    (model, mtp)
+}
+
 fn reference_row(
     model: &Qwen35Model,
     prompt: &[i32],
@@ -330,7 +424,7 @@ fn render_prompt(snapshot: &Path, user: &str) -> Vec<i32> {
         .collect()
 }
 
-fn load(snapshot: &Path, device: &Device) -> (Qwen35Model, Option<Qwen35Mtp>) {
+fn load(snapshot: &Path, device: &Device, format: &str) -> (Qwen35Model, Option<Qwen35Mtp>) {
     let config: Value =
         serde_json::from_str(&std::fs::read_to_string(snapshot.join("config.json")).unwrap())
             .unwrap();
@@ -341,10 +435,8 @@ fn load(snapshot: &Path, device: &Device) -> (Qwen35Model, Option<Qwen35Mtp>) {
     } else {
         "model"
     };
-    let model = Qwen35Model::from_weights(&weights, prefix, cfg.clone()).expect("build model");
-    let mtp = (cfg.mtp_num_hidden_layers > 0 && Qwen35Mtp::complete_in(&weights, &cfg))
-        .then(|| Qwen35Mtp::from_weights_with(&weights, &model, None).expect("build mtp"));
-    (model, mtp)
+    build_model(&weights, prefix, cfg, format, device)
+    // `weights` drops here: tensors the model did not keep (the bf16 NVFP4 sources) are freed.
 }
 
 /// The pre-epic reference path: `decode_logits` prefill + the shared token-at-a-time loop, driven
@@ -441,6 +533,7 @@ fn row_json(
     cache: Option<(u64, u64)>,
     kinds: Option<(&str, &str)>,
     fused_primitives: Option<Value>,
+    nvfp4_projections: Option<Value>,
 ) -> Value {
     let generated = out.tokens.len() as u64;
     let ratio = |num: Option<u64>, den: u64| -> Value {
@@ -475,6 +568,7 @@ fn row_json(
         "kv_cache": kinds.map(|(kv_cache, _)| kv_cache),
         "attn_formulation": kinds.map(|(_, attn)| attn),
         "fused_primitives": fused_primitives,
+        "nvfp4_projections": nvfp4_projections,
         "tokens_match_reference": matches,
         "first_divergence": diverged.flatten(),
         "tokens": out.tokens,
@@ -546,11 +640,12 @@ fn decode_bench() {
     let warmup_tokens: usize = env_or("DECODE_BENCH_WARMUP_TOKENS", "16").parse().unwrap();
     let label = env_or("DECODE_BENCH_LABEL", DEFAULT_LABEL);
     let prompt_text = env_or("DECODE_BENCH_PROMPT", DEFAULT_PROMPT);
+    let format = env_or("DECODE_BENCH_FORMAT", "bf16");
 
     let device = select_device().expect("device");
     let device_name = if device.is_cuda() { "cuda" } else { "cpu" };
     let load_started = Instant::now();
-    let (mut model, mut mtp) = load(&snapshot, &device);
+    let (mut model, mut mtp) = load(&snapshot, &device, &format);
     select_step_kv_cache(&mut model);
     select_attn_formulation(&mut model);
     if let Some(mtp) = mtp.as_mut() {
@@ -574,11 +669,13 @@ fn decode_bench() {
     let mut rows_json = Vec::new();
     let mut reference_tokens: Option<Vec<i32>> = None;
     let switch = fused_switch();
+    let nv_switch = nvfp4_gemv_switch();
 
     if rows.iter().any(|r| r == "reference") {
         reference_row(&model, &prompt, &warm, &device, &mut |_| {});
         let syncs0 = host_syncs_now();
         let fused0 = fused_tally_now();
+        let nv0 = nvfp4_tally_now();
         let mut at_last = None;
         let (out, prefill, decode, forwards) = reference_row(
             &model,
@@ -589,12 +686,14 @@ fn decode_bench() {
         );
         let syncs = host_syncs_now().zip(syncs0).map(|(a, b)| a - b);
         let fused = fused_delta(fused0, switch);
+        let nvfp4 = nvfp4_delta(nv0, nv_switch);
         let used = note_peak(at_last);
         eprintln!(
-            "[decode_bench] reference        {:>7.2} tok/s  prefill {:.3}s  fused {}",
+            "[decode_bench] reference        {:>7.2} tok/s  prefill {:.3}s  fused {}  nvfp4 {}",
             out.tokens.len() as f64 / decode,
             prefill,
-            fused.as_ref().map_or("n/a".to_string(), |f| f.to_string())
+            fused.as_ref().map_or("n/a".to_string(), |f| f.to_string()),
+            nvfp4.as_ref().map_or("n/a".to_string(), |f| f.to_string())
         );
         rows_json.push(row_json(
             "reference",
@@ -611,6 +710,7 @@ fn decode_bench() {
             None,
             growing_row_kinds(&model),
             fused,
+            nvfp4,
         ));
         reference_tokens = Some(out.tokens);
     }
@@ -619,6 +719,7 @@ fn decode_bench() {
         with_fused_off(|| reference_row(&model, &prompt, &warm, &device, &mut |_| {}));
         let syncs0 = host_syncs_now();
         let fused0 = fused_tally_now();
+        let nv0 = nvfp4_tally_now();
         let mut at_last = None;
         let (out, prefill, decode, forwards) = with_fused_off(|| {
             reference_row(
@@ -631,6 +732,7 @@ fn decode_bench() {
         });
         let syncs = host_syncs_now().zip(syncs0).map(|(a, b)| a - b);
         let fused = fused_delta(fused0, Some("off"));
+        let nvfp4 = nvfp4_delta(nv0, nv_switch);
         let used = note_peak(at_last);
         eprintln!(
             "[decode_bench] reference_unfused {:>6.2} tok/s  prefill {:.3}s  fused {}",
@@ -653,6 +755,54 @@ fn decode_bench() {
             None,
             growing_row_kinds(&model),
             fused,
+            nvfp4,
+        ));
+        if reference_tokens.is_none() {
+            reference_tokens = Some(out.tokens);
+        }
+    }
+
+    if rows.iter().any(|r| r == "reference_cublaslt") {
+        with_nvfp4_gemv_off(|| reference_row(&model, &prompt, &warm, &device, &mut |_| {}));
+        let syncs0 = host_syncs_now();
+        let fused0 = fused_tally_now();
+        let nv0 = nvfp4_tally_now();
+        let mut at_last = None;
+        let (out, prefill, decode, forwards) = with_nvfp4_gemv_off(|| {
+            reference_row(
+                &model,
+                &prompt,
+                &config,
+                &device,
+                &mut last_token_sampler(&device, new_tokens, &mut at_last),
+            )
+        });
+        let syncs = host_syncs_now().zip(syncs0).map(|(a, b)| a - b);
+        let fused = fused_delta(fused0, switch);
+        let nvfp4 = nvfp4_delta(nv0, nv_switch.map(|_| "off"));
+        let used = note_peak(at_last);
+        eprintln!(
+            "[decode_bench] reference_cublaslt {:>5.2} tok/s  prefill {:.3}s  nvfp4 {}",
+            out.tokens.len() as f64 / decode,
+            prefill,
+            nvfp4.as_ref().map_or("n/a".to_string(), |f| f.to_string())
+        );
+        rows_json.push(row_json(
+            "reference_cublaslt",
+            None,
+            &out,
+            reference_tokens.as_deref(),
+            prefill,
+            decode,
+            forwards,
+            None,
+            None,
+            syncs,
+            used,
+            None,
+            growing_row_kinds(&model),
+            fused,
+            nvfp4,
         ));
         if reference_tokens.is_none() {
             reference_tokens = Some(out.tokens);
@@ -662,6 +812,7 @@ fn decode_bench() {
     if rows.iter().any(|r| r == "step_model") {
         step_model_row(&model, &prompt, &warm, &device, &mut |_| {});
         let fused0 = fused_tally_now();
+        let nv0 = nvfp4_tally_now();
         let mut at_last = None;
         let (out, prefill, decode, record, cache, kinds) = step_model_row(
             &model,
@@ -672,6 +823,7 @@ fn decode_bench() {
         );
         let cache = checked_step_cache(new_tokens, cache);
         let fused = fused_delta(fused0, switch);
+        let nvfp4 = nvfp4_delta(nv0, nv_switch);
         let used = note_peak(at_last);
         eprintln!(
             "[decode_bench] step_model       {:>7.2} tok/s  prefill {:.3}s",
@@ -697,6 +849,7 @@ fn decode_bench() {
             cache,
             kinds,
             fused,
+            nvfp4,
         ));
         if reference_tokens.is_none() {
             reference_tokens = Some(out.tokens);
@@ -709,6 +862,7 @@ fn decode_bench() {
             mtp_row(&model, mtp, &prompt, &warm, k, &device, &mut |_| {});
             let syncs0 = host_syncs_now();
             let fused0 = fused_tally_now();
+            let nv0 = nvfp4_tally_now();
             let mut at_last = None;
             let (out, stats, prefill, decode) = mtp_row(
                 &model,
@@ -721,6 +875,7 @@ fn decode_bench() {
             );
             let syncs = host_syncs_now().zip(syncs0).map(|(a, b)| a - b);
             let fused = fused_delta(fused0, switch);
+            let nvfp4 = nvfp4_delta(nv0, nv_switch);
             let used = note_peak(at_last);
             eprintln!(
                 "[decode_bench] mtp K={k}          {:>7.2} tok/s  accept {:.3}  fwd/tok {:.3}",
@@ -747,6 +902,7 @@ fn decode_bench() {
                 None,
                 growing_row_kinds(&model),
                 fused,
+                nvfp4,
             ));
         }
     }
@@ -766,6 +922,8 @@ fn decode_bench() {
     doc.insert("new_tokens", json!(new_tokens));
     doc.insert("warmup_tokens", json!(warmup_tokens));
     doc.insert("fused_kernels", json!(switch));
+    doc.insert("weight_format", json!(format));
+    doc.insert("nvfp4_gemv", json!(nv_switch));
     doc.insert("device_used_bytes_after_load", json!(used_after_load));
     doc.insert("peak_device_used_bytes", json!(peak_used));
     doc.insert(

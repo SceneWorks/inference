@@ -2626,6 +2626,7 @@ impl TextLlm for LlamaProvider {
                 kv_cache: crate::primitives::KvCacheKind::Growing,
                 attn_formulation: self.model.attn_formulation(),
                 fused_primitives: request_span.fused_primitives(),
+                nvfp4_projections: request_span.nvfp4_projections(),
             },
             _ => DecodeRecord::plain(
                 DecodePath::Reference,
@@ -2634,7 +2635,8 @@ impl TextLlm for LlamaProvider {
                 span_counters,
             )
             .with_attn_formulation(self.model.attn_formulation())
-            .with_fused_primitives(request_span.fused_primitives()),
+            .with_fused_primitives(request_span.fused_primitives())
+            .with_nvfp4_projections(request_span.nvfp4_projections()),
         };
         *self
             .last_decode
