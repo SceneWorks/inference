@@ -284,7 +284,8 @@ impl Nvfp4Weight {
     ///
     /// This is the cuBLASLt path at every row count. For decode-sized inputs (≤
     /// [`NVFP4_GEMV_MAX_ROWS`](crate::NVFP4_GEMV_MAX_ROWS) rows) the fused W4A16 GEMV,
-    /// [`Self::forward_gemv`], is the other implementation; the caller picks (sc-24136).
+    /// `forward_gemv` (only compiled with the `cuda` feature), is the other implementation; the
+    /// caller picks (sc-24136).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
         {

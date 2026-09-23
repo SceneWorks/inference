@@ -70,13 +70,18 @@ METRIC_COLUMNS = (
     ("fused_primitives", "fused primitives", "fused"),
     ("nvfp4_projections", "nvfp4 path", "nvfp4"),
 )
-# Fields every run merged into one table must share, or the rows are not comparable.
+# Fields every run merged into one table must share, or the rows are not comparable. A field may
+# carry an optional default (used with `.get` when an older document lacks the key) so a
+# pre-sc-24136 document — implicitly bf16, before `weight_format` existed — still compares equal
+# to an explicit `weight_format: "bf16"` run instead of silently merging a bf16 run with an nvfp4
+# one.
 COMPARABLE_FIELDS = (
     ("model", "key"),
     ("model", "revision"),
     ("model", "config_sha256"),
     ("suite", "prompt_tokens"),
     ("suite", "new_tokens"),
+    ("suite", "weight_format", "bf16"),
 )
 
 
@@ -201,8 +206,10 @@ def check_comparable(runs: list[dict[str, Any]]) -> None:
     labels = {run["label"] for run in runs}
     if len(labels) != 1:
         raise ValueError(f"runs carry different hardware labels: {sorted(labels)}")
-    for section, field in COMPARABLE_FIELDS:
-        values = {json.dumps(run.get(section, {}).get(field)) for run in runs}
+    for entry in COMPARABLE_FIELDS:
+        section, field = entry[0], entry[1]
+        default = entry[2] if len(entry) > 2 else None
+        values = {json.dumps(run.get(section, {}).get(field, default)) for run in runs}
         if len(values) != 1:
             raise ValueError(f"runs differ in {section}.{field}: {sorted(values)}")
 

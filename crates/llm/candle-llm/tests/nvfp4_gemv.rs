@@ -445,6 +445,15 @@ fn time_us(device: &Device, iters: usize, mut f: impl FnMut()) -> f64 {
 /// Per-shape kernel microbench: µs per call and effective GB/s (packed weight + scales + bf16
 /// activation in + bf16 output out, per call) for the GEMV and for the cuBLASLt W4A4 forward, on
 /// every 27B projection shape at rows 1..=8.
+///
+/// **L2 caveat.** `time_us` times `iters` back-to-back calls against the *same* resident weight
+/// between two device synchronizes (5 untimed warm-up calls first). For a projection whose packed
+/// weight + scales fit in the GPU's L2 (roughly ≤ 50 MB on this hardware), the warm-up call leaves
+/// it L2-resident for every timed call after it, so the reported GB/s for those shapes reflects L2
+/// bandwidth, not HBM bandwidth — decode in the real model reads whichever projection the token
+/// stream last touched, which is not reliably L2-resident. Treat the GB/s column as an
+/// upper-bound / cache-hit figure for small projections, not a guarantee of that throughput
+/// against cold HBM.
 #[test]
 #[ignore = "microbench: run in release on an idle sm_120 GPU (NVFP4_GEMV_BENCH_OUTPUT=<json>)"]
 fn nvfp4_gemv_microbench() {

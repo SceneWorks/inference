@@ -62,8 +62,8 @@ use serde_json::{json, Value};
 use candle_llm::decode::generate_step_timed;
 use candle_llm::decode::CountingDecode;
 use candle_llm::primitives::{
-    fused_kernels_enabled, fused_tally, host_sync_count, nvfp4_gemv_enabled, nvfp4_path_tally,
-    set_fused_kernels, set_nvfp4_gemv, ProjectionFormat,
+    fused_kernels_enabled, fused_tally, host_sync_count, nvfp4_gemv_enabled,
+    nvfp4_gemv_policy_guard, nvfp4_path_tally, set_fused_kernels, ProjectionFormat,
 };
 
 fn host_syncs_now() -> Option<u64> {
@@ -130,13 +130,12 @@ fn nvfp4_delta(
 }
 
 /// Run `f` with the NVFP4 decode GEMV switched off (every NVFP4 projection on cuBLASLt),
-/// restoring the previous policy afterwards.
+/// restoring the previous policy afterwards. Uses the process-wide policy guard so a prior
+/// env-derived (`None`) policy comes back as `None`, not pinned to whatever `Some(bool)` state
+/// this call happened to observe.
 fn with_nvfp4_gemv_off<T>(f: impl FnOnce() -> T) -> T {
-    let was = nvfp4_gemv_enabled();
-    set_nvfp4_gemv(Some(false));
-    let out = f();
-    set_nvfp4_gemv(Some(was));
-    out
+    let _guard = nvfp4_gemv_policy_guard(Some(false));
+    f()
 }
 
 /// Build the target (and the MTP head, when the snapshot carries one) in the requested

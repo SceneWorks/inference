@@ -381,6 +381,16 @@ class DecodeBenchWrapperTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no reference row"):
             bench.render_table([no_reference, base])
 
+    def test_table_refuses_merging_a_bf16_run_with_an_nvfp4_run(self) -> None:
+        # `base` has no `weight_format` key at all (a pre-sc-24136 document, implicitly bf16).
+        base = comparable_run("base")
+        nvfp4 = comparable_run("nvfp4-run", weight_format="nvfp4")
+        with self.assertRaisesRegex(ValueError, "suite.weight_format"):
+            bench.render_table([base, nvfp4])
+        # An explicit "bf16" document still merges with an older, key-less bf16 document.
+        explicit_bf16 = comparable_run("explicit-bf16", weight_format="bf16")
+        bench.render_table([base, explicit_bf16])
+
     def test_table_compares_every_row_with_the_first_runs_reference(self) -> None:
         base = comparable_run("baseline")
         head = copy.deepcopy(base)

@@ -3,8 +3,9 @@
 //! A [`Projection::Nvfp4`](super::projection::Projection::Nvfp4) weight has two forward
 //! implementations in `candle-quant-kernels`, both over the same resident packed weight:
 //!
-//! - the **fused decode GEMV** ([`Nvfp4Weight::forward_gemv`]): one launch, bf16 activation of
-//!   1..=[`NVFP4_GEMV_MAX_ROWS`] rows **not quantized**, f32 accumulate (W4A16 math);
+//! - the **fused decode GEMV** (`Nvfp4Weight::forward_gemv`, only compiled with the `cuda`
+//!   feature): one launch, bf16 activation of 1..=[`NVFP4_GEMV_MAX_ROWS`] rows **not quantized**,
+//!   f32 accumulate (W4A16 math);
 //! - the **cuBLASLt W4A4 GEMM** ([`Nvfp4Weight::forward`]): activation quantized on-device to
 //!   NVFP4 (one host sync for its per-tensor scale), block-scaled FP4 tensor-core GEMM.
 //!

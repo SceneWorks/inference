@@ -115,6 +115,16 @@ Wall clock over back-to-back calls between two device synchronizes (200 calls; 5
 after 5 warm-ups. Effective GB/s = (packed weight + scales + bf16 activation + bf16 output) / time.
 All 8 row counts are in `kernel_microbench.json`.
 
+**Methodology / L2 caveat.** Every timed call in this microbench reruns against the *same*
+resident weight (the 5 untimed warm-up calls leave it cache-resident before timing starts). For a
+projection whose packed NVFP4 weight + scales fit in the GPU's L2 (roughly ≤ 50 MB on this
+hardware — every row here except `lm_head`, whose [248320, 5120] weight is far larger), the timed
+calls are largely hitting L2, so the reported GB/s is an L2-bandwidth figure, not an HBM-bandwidth
+one. Decode in the real model reads whichever projection the token stream last touched, which is
+not reliably L2-resident, so treat the GB/s column (and the derived TB/s figures quoted elsewhere
+in this document) as an upper bound for the smaller projections rather than a promise of that
+throughput against cold HBM. `lm_head`'s numbers are the ones least affected by this caveat.
+
 | projection | [N, K] | 1 row | GB/s @1 | 3 rows | 8 rows | GB/s @8 | GEMV speedup, rows 1..=8 |
 |---|---|---:|---:|---:|---:|---:|---:|
 | self_attn.q_proj (+gate) | [12288, 5120] | 23.2 / 127.1 | 1524 | 22.6 / 118.4 | 25.0 / 115.2 | 1429 | 4.61×–5.70× |
