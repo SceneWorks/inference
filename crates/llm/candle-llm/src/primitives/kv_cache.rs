@@ -7,8 +7,9 @@
 //!   the batch axis is real, not hardcoded to 1. The dynamic-batch scheduler (story 7255) retires
 //!   finished sequences through [`KvCache::retain_sequences`]; the prefix cache (story 7256) seeds a
 //!   fresh cache from a shared prefix's stored KV via [`ContiguousKvCache::seeded`] /
-//!   [`ContiguousKvCache::export`]. The llama family still runs on it (and on the paged cache);
-//!   migrating those users is S10 of epic sc-24128.
+//!   [`ContiguousKvCache::export`]. It is the reference paths' cache (the llama family's
+//!   `Decode` loop, the oracle), and the growing backing of the shared step-seam cache
+//!   ([`StepKvCache`](crate::primitives::StepKvCache), sc-24138).
 //! * [`StaticKvCache`] (epic sc-24128, story sc-24132) is the **preallocated** implementation the
 //!   fast-decode path runs on: per-layer K/V buffers allocated **once** for a request's capacity,
 //!   written **in place** at the current offset ([`Tensor::slice_set`], a bounded `copy2d`), and
