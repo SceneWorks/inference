@@ -18,6 +18,7 @@ use candle_core::{Device, Tensor};
 use crate::decode::speculative::SpeculativeStats;
 use crate::decode::stream::Decode;
 use crate::error::Result;
+use crate::primitives::attention::AttnFormulation;
 use crate::primitives::host_sync::host_sync_count;
 use crate::primitives::kv_cache::{KvCache, KvCacheKind};
 
@@ -72,6 +73,10 @@ pub struct DecodeRecord {
     /// ([`DecodeCache::kv_kind`](crate::primitives::DecodeCache::kv_kind)), so the row says what
     /// actually ran, not what was configured.
     pub kv_cache: KvCacheKind,
+    /// How grouped-query attention was computed (story sc-24132): the un-expanded `gqa`
+    /// formulation every path runs since S4, or the pre-S4 `expanded` (`repeat_kv`) arithmetic
+    /// selected for a comparison row. Reported from the model, which owns the selector.
+    pub attn_formulation: AttnFormulation,
 }
 
 impl DecodeRecord {
@@ -90,6 +95,7 @@ impl DecodeRecord {
             generated_tokens: generated as u64,
             host_syncs,
             kv_cache: KvCacheKind::Growing,
+            attn_formulation: AttnFormulation::Gqa,
         }
     }
 
@@ -97,6 +103,13 @@ impl DecodeRecord {
     /// [`DecodeCache::kv_kind`](crate::primitives::DecodeCache::kv_kind) on it.
     pub fn with_kv_cache(mut self, kv_cache: KvCacheKind) -> Self {
         self.kv_cache = kv_cache;
+        self
+    }
+
+    /// The same record with `attn_formulation` set — stamped from the model's own selector
+    /// ([`StepModel::attn_formulation`](super::StepModel::attn_formulation)).
+    pub fn with_attn_formulation(mut self, attn_formulation: AttnFormulation) -> Self {
+        self.attn_formulation = attn_formulation;
         self
     }
 
@@ -115,6 +128,7 @@ impl DecodeRecord {
             generated_tokens: generated as u64,
             host_syncs,
             kv_cache: KvCacheKind::Growing,
+            attn_formulation: AttnFormulation::Gqa,
         }
     }
 
@@ -244,6 +258,15 @@ mod tests {
         assert_eq!(plain.forwards_per_generated_token(), None);
         assert_eq!(plain.host_syncs_per_token(), None);
         assert_eq!(plain.path.label(), "reference");
+        assert_eq!(plain.kv_cache, KvCacheKind::Growing);
+        assert_eq!(plain.attn_formulation, AttnFormulation::Gqa);
+        assert_eq!(plain.attn_formulation.label(), "gqa");
+        let stamped = plain
+            .with_kv_cache(KvCacheKind::Static)
+            .with_attn_formulation(AttnFormulation::Expanded);
+        assert_eq!(stamped.kv_cache, KvCacheKind::Static);
+        assert_eq!(stamped.attn_formulation, AttnFormulation::Expanded);
+        assert_eq!(stamped.attn_formulation.label(), "expanded");
 
         let spec = DecodeRecord::speculative(
             DecodePath::Mtp { drafts: 3 },

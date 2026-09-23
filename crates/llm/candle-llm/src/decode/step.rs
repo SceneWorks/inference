@@ -23,6 +23,7 @@ use crate::decode::stream::{
     default_seed, ConstraintMask, FinishReason, GenerationConfig, GenerationOutput, StreamEvent,
 };
 use crate::error::{Error, Result};
+use crate::primitives::attention::AttnFormulation;
 use crate::primitives::decode_cache::{CacheMemory, DecodeCache};
 use crate::primitives::sampler::{sample, SplitMix64};
 
@@ -84,14 +85,76 @@ pub trait StepModel {
     /// A fresh, empty cache.
     fn new_cache(&self) -> Self::Cache;
 
-    /// A fresh, empty cache sized for a request that will hold at most `capacity` positions
-    /// (prompt + generation budget). A model with a preallocated KV cache (story sc-24132)
-    /// allocates it here, once, for exactly that bound, and fails closed with
-    /// [`Error::KvCapacityExceeded`] when the bound exceeds what it can serve; the default is the
-    /// unbounded [`new_cache`](Self::new_cache). [`generate_step`] builds its cache through this.
-    fn new_cache_for(&self, capacity: usize) -> Result<Self::Cache> {
-        let _ = capacity;
+    /// A fresh, empty cache sized for a request that will hold at most `capacity + overshoot`
+    /// positions: `capacity` is the prompt plus the generation budget, `overshoot` the positions a
+    /// caller may write **past** that budget before it decides what to keep — a speculative verify
+    /// step writes `K + 1` positions at once (the current token plus `K` drafts), so it can run
+    /// past the budget by up to `K` positions before rolling back, and must ask for them here
+    /// (the S2 draft-model story). The token-at-a-time [`generate_step`] passes `0`.
+    ///
+    /// A model with a preallocated KV cache (story sc-24132) allocates it here, once, for exactly
+    /// that bound, and fails closed with [`Error::KvCapacityExceeded`] when the bound exceeds
+    /// what it can serve; the default is the unbounded [`new_cache`](Self::new_cache).
+    ///
+    /// ```
+    /// use candle_core::{Device, Tensor};
+    /// use candle_llm::decode::{StepModel, StepOutput, StepRequest};
+    /// use candle_llm::error::{Error, Result};
+    /// use candle_llm::primitives::{CacheMemory, DecodeCache};
+    ///
+    /// /// A cache that remembers the bound it was built for.
+    /// struct Bounded { len: i32, capacity: usize }
+    /// impl DecodeCache for Bounded {
+    ///     fn len(&self) -> i32 { self.len }
+    ///     fn rollback_to(&mut self, n: i32) -> Result<()> { self.len = n; Ok(()) }
+    ///     fn reset(&mut self) { self.len = 0; }
+    ///     fn memory(&self) -> CacheMemory { CacheMemory { live_bytes: 0, checkpoint_bytes: 0 } }
+    /// }
+    ///
+    /// struct Model;
+    /// impl StepModel for Model {
+    ///     type Cache = Bounded;
+    ///     fn new_cache(&self) -> Bounded { Bounded { len: 0, capacity: usize::MAX } }
+    ///     /// The bound is the budget *plus* the overshoot the caller declared.
+    ///     fn new_cache_for(&self, capacity: usize, overshoot: usize) -> Result<Bounded> {
+    ///         let capacity = capacity.saturating_add(overshoot);
+    ///         if capacity > 1024 {
+    ///             return Err(Error::KvCapacityExceeded { requested: capacity, capacity: 1024 });
+    ///         }
+    ///         Ok(Bounded { len: 0, capacity })
+    ///     }
+    ///     fn device(&self) -> &Device { &Device::Cpu }
+    ///     fn vocab_size(&self) -> usize { 4 }
+    ///     fn forward_step(&self, cache: &mut Bounded, request: StepRequest<'_>) -> Result<StepOutput> {
+    ///         cache.len += request.tokens.len() as i32;
+    ///         Ok(StepOutput { logits: Tensor::zeros((1, 4), candle_core::DType::F32, &Device::Cpu)?, hidden: None })
+    ///     }
+    /// }
+    ///
+    /// // A verify step with K = 3 drafts writes 4 positions at once: the request needs 3 positions
+    /// // past `prompt + max_new_tokens`, and asks for them as the overshoot.
+    /// let (prompt, max_new_tokens, drafts) = (97usize, 256usize, 3usize);
+    /// let cache = Model.new_cache_for(prompt + max_new_tokens, drafts).unwrap();
+    /// assert_eq!(cache.capacity, 356);
+    /// // Past the model's bound the request fails closed before anything is allocated.
+    /// assert!(matches!(
+    ///     Model.new_cache_for(1000, 25),
+    ///     Err(Error::KvCapacityExceeded { requested: 1025, capacity: 1024 })
+    /// ));
+    /// ```
+    fn new_cache_for(&self, capacity: usize, overshoot: usize) -> Result<Self::Cache> {
+        let _ = (capacity, overshoot);
         Ok(self.new_cache())
+    }
+
+    /// How grouped-query attention was computed for a request running on `cache` (story sc-24132),
+    /// stamped on the [`DecodeRecord`] so an evidence row says which arithmetic produced its
+    /// tokens — what actually ran on that cache, not merely what was configured (a preallocated
+    /// static cache always attends un-expanded, whatever the model's selector says). The default
+    /// is [`AttnFormulation::Gqa`] — the un-expanded formulation every path runs since S4.
+    fn attn_formulation(&self, cache: &Self::Cache) -> AttnFormulation {
+        let _ = cache;
+        AttnFormulation::Gqa
     }
 
     /// Where input-id tensors must live.
@@ -155,7 +218,7 @@ pub fn generate_step_timed<M: StepModel>(
     // The request's bound: the prompt plus every token the loop may feed back. (The last budgeted
     // token is sampled but never fed, so this is one position of slack.)
     let capacity = prompt_ids.len().saturating_add(config.max_new_tokens);
-    let mut cache = model.new_cache_for(capacity)?;
+    let mut cache = model.new_cache_for(capacity, 0)?;
     let mut forwards = 0u64;
 
     // Prefill the whole prompt at position 0; logits are for the last prompt position.
@@ -221,7 +284,8 @@ pub fn generate_step_timed<M: StepModel>(
         generated.len(),
         span.host_syncs(),
     )
-    .with_kv_cache(cache.kv_kind());
+    .with_kv_cache(cache.kv_kind())
+    .with_attn_formulation(model.attn_formulation(&cache));
     Ok((
         GenerationOutput {
             tokens: generated,

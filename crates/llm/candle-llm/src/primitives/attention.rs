@@ -89,6 +89,38 @@ pub enum AttnMask<'a> {
     },
 }
 
+/// How grouped-query attention is computed over the cached K/V (story sc-24132) — surfaced per
+/// request through [`DecodeRecord::attn_formulation`](crate::decode::DecodeRecord::attn_formulation)
+/// so an evidence row says which arithmetic produced its tokens.
+///
+/// The two are **not** bit-identical on CUDA: cuBLAS picks its kernel (and with it the fp32
+/// reduction order that decides the last bf16 bit) by the GEMM's `m`, batch count and strides,
+/// and the un-expanded formulation issues different GEMMs (`m = groups`, `batch = b·kv_heads`)
+/// than the expanded one (`m = 1`, `batch = b·heads`). They differ by at most one bf16 ULP at
+/// attention-GEMM knife-edges; see `docs/migration/evidence/sc-24132/README.md`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AttnFormulation {
+    /// [`sdpa_gqa_causal`]: the query groups folded onto the sequence axis, attending the
+    /// un-expanded K/V views directly — the default for every path since S4 (the reference oracle
+    /// included, so static-vs-reference parity holds by construction).
+    #[default]
+    Gqa,
+    /// The pre-S4 arithmetic: [`repeat_kv`]-expanded K/V through [`sdpa`]. Kept selectable only as
+    /// a labelled comparison row against the sealed pre-epic baseline (it reproduces that
+    /// baseline's bits); it materializes the expansion every step, so it is never the fast path.
+    Expanded,
+}
+
+impl AttnFormulation {
+    /// Stable lower-case label for logs and evidence rows.
+    pub fn label(&self) -> &'static str {
+        match self {
+            AttnFormulation::Gqa => "gqa",
+            AttnFormulation::Expanded => "expanded",
+        }
+    }
+}
+
 /// Expand grouped-query KV heads to the full query head count.
 ///
 /// `x` is `[batch, n_kv_heads, seq, head_dim]`; the result is `[batch, n_kv_heads * groups, seq,
@@ -379,9 +411,12 @@ pub fn sdpa_causal(queries: &Tensor, keys: &Tensor, values: &Tensor, scale: f32)
 /// of the output attends KV head `h / groups`, the [`repeat_kv`] convention. Returns
 /// `[batch, heads, q_len, head_dim]`, contiguous.
 ///
-/// With the `flash-attn` feature the fused kernel (grouped-query native) is tried first under the
-/// same eligibility as [`sdpa`]; otherwise, and on CPU, the folded eager path runs. Query rows are
-/// tiled like [`sdpa`] so every score tile stays within signed 32-bit element indexing.
+/// Always the folded eager path, on every device. The fused `flash-attn` kernel is deliberately
+/// **not** tried here (unlike [`sdpa`]): it would receive un-expanded, narrowed K/V — a GQA + stride
+/// combination no test covers on this repository's CUDA lane (the feature is not part of it), so
+/// until a flash-vs-eager parity test exists for those views the fused kernel stays out of this
+/// path. Query rows are tiled like [`sdpa`] so every score tile stays within signed 32-bit
+/// element indexing.
 pub fn sdpa_gqa_causal(
     queries: &Tensor,
     keys: &Tensor,
@@ -402,10 +437,6 @@ pub fn sdpa_gqa_causal(
         return Err(Error::Msg(format!(
             "causal attention needs k_len >= q_len, got {k_len} keys and {q_len} queries"
         )));
-    }
-    #[cfg(feature = "flash-attn")]
-    if let Some(out) = try_flash_attn(queries, keys, values, scale, None, AttnMask::Causal)? {
-        return Ok(out);
     }
     let groups = h / hkv;
     // Same tile bound as the eager path: the folded tile has `hkv * groups * rows == h * rows`
@@ -954,12 +985,13 @@ mod tests {
     /// formulation is bit-identical to the reference `repeat_kv` + eager `sdpa` for. Recorded
     /// result on RTX Pro 6000 / sm_120 (CUDA 12.9): V0 folded, strided K (the shipped path) 52
     /// mismatching lengths; V1 folded + contiguous Kᵀ 52; V2 folded + contiguous Kᵀ and V 52; V3
-    /// per-KV-head stride-0 broadcast (M = 1, batch = groups) 32; V4 V3 + contiguous Kᵀ 28; V5 V4
-    /// + contiguous V 28. Every difference is a single bf16 ULP in a few elements: cuBLAS selects
-    /// its kernel (and so its reduction order) by `m`, batch count and strides, and only the
-    /// reference's own calls (batch = `b × H` over expanded heads, `m = 1`) reproduce the
+    /// per-KV-head stride-0 broadcast (M = 1, batch = groups) 32; V4 V3 with contiguous Kᵀ 28;
+    /// V5 V4 with contiguous V 28. Every difference is a single bf16 ULP in a few elements: cuBLAS
+    /// selects its kernel (and so its reduction order) by `m`, batch count and strides, and only
+    /// the reference's own calls (batch = `b × H` over expanded heads, `m = 1`) reproduce the
     /// reference's bits. Bit-exact parity with the expanded reference therefore requires the
-    /// expansion itself; see `docs/migration/evidence/sc-24132/README.md`.
+    /// expansion itself — which is why S4 moved the reference onto the un-expanded formulation
+    /// instead (`AttnFormulation`); see `docs/migration/evidence/sc-24132/README.md`.
     #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "sc-24132 formulation survey; needs CUDA"]

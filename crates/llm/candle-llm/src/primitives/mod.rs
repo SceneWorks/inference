@@ -23,7 +23,9 @@ pub mod rope;
 pub mod sampler;
 pub mod weights;
 
-pub use attention::{repeat_kv, sdpa, sdpa_causal, sdpa_gqa_causal, sliding_causal_mask, AttnMask};
+pub use attention::{
+    repeat_kv, sdpa, sdpa_causal, sdpa_gqa_causal, sliding_causal_mask, AttnFormulation, AttnMask,
+};
 pub use decode_cache::{tensor_bytes, CacheMemory, DecodeCache};
 pub use gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,

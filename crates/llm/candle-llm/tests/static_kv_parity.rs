@@ -3,13 +3,19 @@
 //!
 //! * **AC1** — a 256-token greedy decode on the preallocated [`StaticKvCache`] (the `StepModel`
 //!   driver's default cache) is token-identical to the `AttnKv` reference path — both the
-//!   pre-epic `Decode` loop and the same driver with the growing cache selected — and the record
-//!   names the cache that ran.
+//!   reference `Decode` loop and the same driver with the growing cache selected — and the record
+//!   names the cache and the attention formulation that ran. Since S4 the reference path attends
+//!   through the same `sdpa_gqa_causal` as the static cache (the coordinator's decision: bit
+//!   identity between the un-expanded GQA matmul and the pre-S4 `repeat_kv`-expanded GEMM is a
+//!   cuBLAS kernel-selection property and not attainable), so this parity holds by construction;
+//!   the pre-S4 `expanded` arithmetic stays selectable only as a labelled bench comparison row.
 //! * **AC3 (real weights)** — the static buffers' CUDA device pointers are unchanged across the
 //!   whole 256-token run and a rollback.
-//! * **Teacher-forced characterization** — both paths fed the reference's own 256 tokens; reports
-//!   per-position argmax agreement, the max |Δlogit| and the reference's top-2 logit gap wherever
-//!   the argmax differs (a bf16-ULP tie), and gates on every disagreement being such a tie.
+//! * **Teacher-forced diagnostic** (not an acceptance gate) — the static path against the pre-S4
+//!   `expanded` reference arithmetic, both fed the reference's own 256 tokens; reports per-position
+//!   argmax agreement, the max |Δlogit| and the reference's top-2 logit gap wherever the argmax
+//!   differs (a bf16-ULP tie). It documents the ≤ 1 bf16 ULP knife-edge behaviour the decision
+//!   accepted; it is not cited as AC1.
 //!
 //! ```text
 //! BONSAI_QWEN38_SNAPSHOT=E:\...\snapshots\1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 \
@@ -27,7 +33,7 @@ use candle_llm::decode::{
     generate_step, generate_with, CancelFlag, DecodePath, GenerationConfig, StepModel, StepRequest,
 };
 use candle_llm::device::select_device;
-use candle_llm::primitives::{kv_materialize_count, DecodeCache, KvCacheKind};
+use candle_llm::primitives::{kv_materialize_count, AttnFormulation, DecodeCache, KvCacheKind};
 
 const SNAPSHOT_VAR: &str = "BONSAI_QWEN38_SNAPSHOT";
 const FIXTURE_TOKENS: usize = 256;
@@ -63,7 +69,8 @@ fn ac1_static_kv_greedy_fixture_is_token_identical_to_attn_kv() {
     let prompt = common::qwen35::render_chat_prompt(&snapshot, PROMPT);
     let config = greedy(FIXTURE_TOKENS);
 
-    // The pre-epic reference loop: AttnKv slots, repeat_kv + sdpa.
+    // The reference loop: AttnKv slots, attending through `sdpa_gqa_causal` (the S4 reference).
+    assert_eq!(model.attn_formulation(), AttnFormulation::Gqa);
     let reference = generate_with(
         &model,
         &prompt,
@@ -94,6 +101,7 @@ fn ac1_static_kv_greedy_fixture_is_token_identical_to_attn_kv() {
     );
     assert_eq!(record.path, DecodePath::StepModel);
     assert_eq!(record.kv_cache, KvCacheKind::Static);
+    assert_eq!(record.attn_formulation, AttnFormulation::Gqa);
     assert_eq!(record.generated_tokens, FIXTURE_TOKENS as u64);
     assert_eq!(record.target_forwards, FIXTURE_TOKENS as u64);
     assert_eq!(
@@ -115,6 +123,7 @@ fn ac1_static_kv_greedy_fixture_is_token_identical_to_attn_kv() {
     )
     .unwrap();
     assert_eq!(record.kv_cache, KvCacheKind::Growing);
+    assert_eq!(record.attn_formulation, AttnFormulation::Gqa);
     assert_eq!(
         growing.tokens,
         reference.tokens,
@@ -122,7 +131,8 @@ fn ac1_static_kv_greedy_fixture_is_token_identical_to_attn_kv() {
         first_divergence(&reference.tokens, &growing.tokens)
     );
     eprintln!(
-        "[ac1] {} tokens identical across reference / static / growing; static record {record:?}",
+        "[ac1] {} tokens identical across reference / static / growing (gqa); growing record \
+         {record:?}",
         reference.tokens.len()
     );
 }
@@ -192,10 +202,14 @@ fn ac3_static_kv_device_pointers_are_stable_across_the_fixture_and_a_rollback() 
     );
 }
 
-/// Both paths fed the reference's own greedy tokens, position by position: where do the argmaxes
-/// differ, by how much do the logits differ, and how close was the reference's top-2 gap there?
-/// Gates on every argmax disagreement being a bf16 knife-edge in the reference itself (top-2 gap
-/// within 4 ULPs of the top logit); the per-position report is the evidence for the AC1 decision.
+/// **Diagnostic only — not the AC1 gate.** The static path against the pre-S4 `expanded`
+/// reference arithmetic (`repeat_kv` + `sdpa`, selected explicitly here), both fed that reference's
+/// own greedy tokens position by position: where do the argmaxes differ, by how much do the logits
+/// differ, and how close was the reference's top-2 gap there? It characterizes the ≤ 1 bf16 ULP
+/// knife-edge difference between the two formulations that the S4 decision accepted (the
+/// `attention::tests::gqa_variants_bit_match_survey` companion) and checks every argmax
+/// disagreement is a bf16 knife-edge in the expanded reference itself (top-2 gap within 4 ULPs of
+/// the top logit). AC1 is `ac1_static_kv_greedy_fixture_is_token_identical_to_attn_kv`.
 #[test]
 #[ignore = "needs the Qwen3.8-27B snapshot via BONSAI_QWEN38_SNAPSHOT and a GPU"]
 fn teacher_forced_static_vs_attn_kv_logit_parity_report() {
@@ -203,7 +217,9 @@ fn teacher_forced_static_vs_attn_kv_logit_parity_report() {
     let snapshot = common::qwen35::snapshot_from_env(SNAPSHOT_VAR)
         .unwrap_or_else(|| panic!("set {SNAPSHOT_VAR}"));
     let device = select_device().unwrap();
-    let (model, _mtp) = common::qwen35::load(&snapshot, &device);
+    let (mut model, _mtp) = common::qwen35::load(&snapshot, &device);
+    // The pre-S4 arithmetic on the growing slots; the static cache always attends un-expanded.
+    model.set_attn_formulation(AttnFormulation::Expanded);
     let prompt = common::qwen35::render_chat_prompt(&snapshot, PROMPT);
     let reference = generate_with(
         &model,

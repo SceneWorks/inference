@@ -367,22 +367,20 @@ impl StaticKvCache {
     }
 }
 
-impl Clone for StaticKvCache {
-    /// A **deep** copy: the clone gets its own buffers. Sharing them would let one cache's in-place
-    /// writes silently corrupt the other. Cloning a static cache is therefore a full device copy —
-    /// the MTP loop's "restore a clone" rollback runs on the growing cache for that reason.
-    fn clone(&self) -> Self {
-        let copy = |ts: &[Tensor]| -> Vec<Tensor> {
-            ts.iter()
-                .map(|t| t.copy().expect("StaticKvCache clone: device copy"))
-                .collect()
-        };
-        Self {
-            k: copy(&self.k),
-            v: copy(&self.v),
+impl StaticKvCache {
+    /// A **deep** copy: the clone gets its own buffers (a full device copy). Sharing them would let
+    /// one cache's in-place writes silently corrupt the other. Deliberately not `Clone`: the copy
+    /// can fail (device memory) and must surface that as an error, not a panic — the MTP loop's
+    /// "restore a clone" rollback goes through this and propagates the failure.
+    pub fn try_clone(&self) -> Result<Self> {
+        let copy =
+            |ts: &[Tensor]| -> Result<Vec<Tensor>> { ts.iter().map(|t| Ok(t.copy()?)).collect() };
+        Ok(Self {
+            k: copy(&self.k)?,
+            v: copy(&self.v)?,
             len: self.len.clone(),
             capacity: self.capacity,
-        }
+        })
     }
 }
 
@@ -853,8 +851,10 @@ mod static_tests {
         assert_eq!(cache.storage_addresses(0).unwrap(), addresses[0]);
     }
 
+    /// `try_clone` is a deep copy: the clone owns its buffers, and writing into it leaves the
+    /// original's offset and bytes alone.
     #[test]
-    fn bytes_are_the_full_preallocation_and_clone_is_deep() {
+    fn bytes_are_the_full_preallocation_and_try_clone_is_deep() {
         let cache = StaticKvCache::new(3, 2, 4, 8, 16, DType::F32, &Device::Cpu).unwrap();
         let expected = StaticKvCache::buffer_bytes(3, 2, 4, 8, 16, DType::F32);
         assert_eq!(expected, 3 * 2 * 2 * 4 * 8 * 16 * 4);
@@ -863,7 +863,7 @@ mod static_tests {
         original
             .update(0, &step(2, 4, 1, 8, 1.0), &step(2, 4, 1, 8, 1.0))
             .unwrap();
-        let mut copy = original.clone();
+        let mut copy = original.try_clone().unwrap();
         assert_eq!(copy.offset(), 1);
         assert_ne!(
             copy.storage_addresses(0).unwrap(),
@@ -874,6 +874,11 @@ mod static_tests {
             .unwrap();
         assert_eq!(original.offset(), 1);
         assert_eq!(host(&original.views(0).unwrap().0).len(), 2 * 4 * 8);
+        assert_eq!(
+            host(&original.views(0).unwrap().0),
+            host(&step(2, 4, 1, 8, 1.0)),
+            "the clone's write must not reach the original's buffer"
+        );
         assert!(matches!(
             original.retain_sequences(&[0]),
             Err(Error::Unsupported(_))

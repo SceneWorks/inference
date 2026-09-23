@@ -16,6 +16,8 @@
 //! | `DECODE_BENCH_WARMUP_TOKENS` | tokens of the untimed warm-up run (default 16)             |
 //! | `DECODE_BENCH_PROMPT`      | user message (default: a long-answer explanation request)    |
 //! | `DECODE_BENCH_LABEL`       | hardware label recorded verbatim (default `RTX Pro 6000 / sm_120`) |
+//! | `DECODE_BENCH_KV_CACHE`    | `static` (default) or `growing`: the `step_model` row's KV cache  |
+//! | `DECODE_BENCH_ATTN`        | `gqa` (default) or `expanded`: the growing slots' attention       |
 //!
 //! Rows are greedy (`temperature = 0`), no stop tokens, so every row emits exactly `NEW_TOKENS`
 //! and the token sequences are comparable: each row records whether it matched the reference row
@@ -27,9 +29,15 @@
 //! so it includes the weights and any co-tenant); `peak_device_used_bytes` is the maximum over the
 //! rows and the post-load sample. The `step_model` row also reports its **final** cache's own
 //! accounting (`cache_live_bytes`, `cache_checkpoint_bytes`) - the rollback checkpoints included -
-//! and which KV cache it ran on (`kv_cache`: `static` for the preallocated cache of sc-24132,
-//! `growing` for the `AttnKv` reference slots; `DECODE_BENCH_KV_CACHE=growing` selects the latter) -
 //! returned by the step driver.
+//!
+//! Every row on head says which KV cache and which attention formulation produced it
+//! (sc-24132): `kv_cache` is `static` for the preallocated cache (the `step_model` row's default;
+//! `DECODE_BENCH_KV_CACHE=growing` selects the `AttnKv` reference slots through the same driver)
+//! or `growing` (the reference and MTP rows always); `attn_formulation` is `gqa` (the un-expanded
+//! `sdpa_gqa_causal` every path runs since S4) or `expanded` (`DECODE_BENCH_ATTN=expanded`: the
+//! pre-S4 `repeat_kv` arithmetic on the growing slots, the labelled comparison row that reproduces
+//! the sealed pre-epic baseline's bits). The pre-epic baseline binary reports neither (`null`).
 //!
 //! The block between the `head-only` markers uses seams that do not exist on the pre-epic
 //! baseline (`StepModel`, host-sync accounting). `decode_bench.py baseline-source` rewrites this
@@ -91,7 +99,7 @@ fn step_model_row(
     f64,
     Option<(u64, u64)>,
     Option<(u64, u64)>,
-    Option<&'static str>,
+    Option<(&'static str, &'static str)>,
 ) {
     let mut prefill_secs = 0.0;
     let started = Instant::now();
@@ -120,7 +128,7 @@ fn step_model_row(
         decode_secs,
         Some((record.target_forwards, record.host_syncs)),
         Some((memory.live_bytes as u64, memory.checkpoint_bytes as u64)),
-        Some(record.kv_cache.label()),
+        Some((record.kv_cache.label(), record.attn_formulation.label())),
     )
 }
 
@@ -134,6 +142,25 @@ fn select_step_kv_cache(model: &mut Qwen35Model) {
         other => panic!("DECODE_BENCH_KV_CACHE must be `static` or `growing`, got {other:?}"),
     };
     model.set_step_kv_cache(kind);
+}
+
+/// `DECODE_BENCH_ATTN` (`gqa` by default; `expanded` selects the pre-S4 `repeat_kv` + `sdpa`
+/// arithmetic on the growing `AttnKv` slots) selects how the reference / growing paths attend
+/// (sc-24132). The static cache always attends un-expanded.
+fn select_attn_formulation(model: &mut Qwen35Model) {
+    use candle_llm::primitives::AttnFormulation;
+    let formulation = match env_or("DECODE_BENCH_ATTN", "gqa").as_str() {
+        "gqa" => AttnFormulation::Gqa,
+        "expanded" => AttnFormulation::Expanded,
+        other => panic!("DECODE_BENCH_ATTN must be `gqa` or `expanded`, got {other:?}"),
+    };
+    model.set_attn_formulation(formulation);
+}
+
+/// The `(kv_cache, attn_formulation)` labels of a row decoded on the model's own growing cache —
+/// the reference loop and the MTP loop (`new_cache` / `make_cache`, always the `AttnKv` slots).
+fn growing_row_kinds(model: &Qwen35Model) -> Option<(&'static str, &'static str)> {
+    Some(("growing", model.attn_formulation().label()))
 }
 // <<< head-only
 
@@ -169,12 +196,18 @@ fn step_model_row(
     f64,
     Option<(u64, u64)>,
     Option<(u64, u64)>,
-    Option<&'static str>,
+    Option<(&'static str, &'static str)>,
 ) {
     unreachable!("the step_model row is not available on the pre-epic baseline")
 }
 
 fn select_step_kv_cache(_model: &mut Qwen35Model) {}
+
+fn select_attn_formulation(_model: &mut Qwen35Model) {}
+
+fn growing_row_kinds(_model: &Qwen35Model) -> Option<(&'static str, &'static str)> {
+    None
+}
 "#;
 
 const DEFAULT_LABEL: &str = "RTX Pro 6000 / sm_120";
@@ -351,7 +384,7 @@ fn row_json(
     host_syncs: Option<u64>,
     device_used_at_last_token: Option<u64>,
     cache: Option<(u64, u64)>,
-    kv_cache: Option<&str>,
+    kinds: Option<(&str, &str)>,
 ) -> Value {
     let generated = out.tokens.len() as u64;
     let ratio = |num: Option<u64>, den: u64| -> Value {
@@ -383,7 +416,8 @@ fn row_json(
         "device_used_bytes_at_last_token": device_used_at_last_token,
         "cache_live_bytes": cache.map(|(live, _)| live),
         "cache_checkpoint_bytes": cache.map(|(_, checkpoint)| checkpoint),
-        "kv_cache": kv_cache,
+        "kv_cache": kinds.map(|(kv_cache, _)| kv_cache),
+        "attn_formulation": kinds.map(|(_, attn)| attn),
         "tokens_match_reference": matches,
         "first_divergence": diverged.flatten(),
         "tokens": out.tokens,
@@ -459,8 +493,12 @@ fn decode_bench() {
     let device = select_device().expect("device");
     let device_name = if device.is_cuda() { "cuda" } else { "cpu" };
     let load_started = Instant::now();
-    let (mut model, mtp) = load(&snapshot, &device);
+    let (mut model, mut mtp) = load(&snapshot, &device);
     select_step_kv_cache(&mut model);
+    select_attn_formulation(&mut model);
+    if let Some(mtp) = mtp.as_mut() {
+        mtp.set_attn_formulation(model.attn_formulation());
+    }
     let load_secs = load_started.elapsed().as_secs_f64();
     let used_after_load = device_used_bytes(&device);
     let prompt = render_prompt(&snapshot, &prompt_text);
@@ -510,7 +548,7 @@ fn decode_bench() {
             syncs,
             used,
             None,
-            None,
+            growing_row_kinds(&model),
         ));
         reference_tokens = Some(out.tokens);
     }
@@ -518,7 +556,7 @@ fn decode_bench() {
     if rows.iter().any(|r| r == "step_model") {
         step_model_row(&model, &prompt, &warm, &device, &mut |_| {});
         let mut at_last = None;
-        let (out, prefill, decode, record, cache, kv_cache) = step_model_row(
+        let (out, prefill, decode, record, cache, kinds) = step_model_row(
             &model,
             &prompt,
             &config,
@@ -549,7 +587,7 @@ fn decode_bench() {
             syncs,
             used,
             cache,
-            kv_cache,
+            kinds,
         ));
         if reference_tokens.is_none() {
             reference_tokens = Some(out.tokens);
@@ -596,7 +634,7 @@ fn decode_bench() {
                 syncs,
                 used,
                 None,
-                None,
+                growing_row_kinds(&model),
             ));
         }
     }

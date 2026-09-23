@@ -153,6 +153,16 @@ impl Decoder {
         }
     }
 
+    /// How the decoder computes grouped-query attention (story sc-24132), for the decode record.
+    /// The generic causal family still runs `repeat_kv`-expanded attention over its growing cache
+    /// (its migration is S10), so it reports `Expanded`; the Qwen3.5 hybrid reports its selector.
+    fn attn_formulation(&self) -> crate::primitives::AttnFormulation {
+        match self {
+            Decoder::Causal(_) => crate::primitives::AttnFormulation::Expanded,
+            Decoder::Qwen35(m) => m.attn_formulation(),
+        }
+    }
+
     /// The decoder as the backend-neutral multimodal seam. Both backbones implement [`VlmDecode`]
     /// (the Qwen3.6 hybrid and the generic Qwen3-VL causal decoder), so the provider drives the
     /// image prefill + decode through one trait object rather than forking on the concrete type.
@@ -2485,13 +2495,15 @@ impl TextLlm for LlamaProvider {
                 generated_tokens: out.tokens.len() as u64,
                 host_syncs: request_span.host_syncs(),
                 kv_cache: crate::primitives::KvCacheKind::Growing,
+                attn_formulation: self.model.attn_formulation(),
             },
             _ => DecodeRecord::plain(
                 DecodePath::Reference,
                 counted.forwards() + extra_forwards,
                 out.tokens.len(),
                 request_span.host_syncs(),
-            ),
+            )
+            .with_attn_formulation(self.model.attn_formulation()),
         };
         *self
             .last_decode
@@ -3591,9 +3603,16 @@ mod tests {
         let Decoder::Qwen35(model) = &decoder else {
             unreachable!()
         };
-        let cache = model.new_cache_for(capacity).unwrap();
+        let cache = model.new_cache_for(capacity, 0).unwrap();
         assert_eq!(cache.memory().live_bytes as u64, preallocation);
         assert_eq!(cache.kv_kind(), crate::primitives::KvCacheKind::Static);
+        // A declared overshoot is part of the bound (and of the priced preallocation).
+        let cache = model.new_cache_for(capacity, 3).unwrap();
+        assert_eq!(cache.kv_capacity(), Some(capacity + 3));
+        assert_eq!(
+            cache.memory().live_bytes as u64,
+            model.static_kv_bytes(capacity + 3) as u64
+        );
     }
 
     /// E6: admission prices every recurrent state a Qwen3.5-family request's cache holds. The
