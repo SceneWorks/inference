@@ -29,11 +29,21 @@ Story S2 of epic sc-24128. Host: Windows 11, **RTX Pro 6000 / sm_120** (GPU 0), 
   answers the typed `RollbackUnavailable`, so it rolls back to the step start and replays the kept
   prefix — the same forwards as the old clone-restore loop, so the acceptance statistics are
   unchanged (the tiny-config test ran both loops side by side before the old one was deleted:
-  tokens / proposed / accepted / forwards identical for K = 1..5, greedy and stochastic). S3's
-  per-token checkpoints will make the first call succeed with no change here.
+  tokens / proposed / accepted / forwards identical for K = 1..5, greedy and stochastic; the
+  real-weight identical-prefix comparison is below). S3's per-token checkpoints will make the
+  first call succeed with no change here.
 * **Telemetry (E2)**: `DecodeRecord.proposer` (`none` / `mtp` / `ngram` / `draft`),
-  `verify_steps`, `verify_host_syncs`, `host_syncs_per_verify_step()`; the bench reports
-  `proposer` and `syncs/verify` per row.
+  `verify_steps`, `verify_host_syncs`, `host_syncs_per_verify_step()`, and
+  `replay_forwards` (`SpeculativeStats.replays`: the `RollbackUnavailable` → replay fallbacks,
+  one per rejected verify step on the S1 cache, `0` on a cache with per-position rollback — the
+  engine test pins both); the bench reports `proposer` (from the record, not the row name),
+  `syncs/verify` and `replay_forwards` per row.
+* **The stream contract (E7)**: the engine checks the cancel flag right after the verify forward,
+  as the old loop did, and rolls the cache back to the step start before returning `Cancelled`;
+  every early exit of the commit loop (stop token, caller stop, cancel, budget) settles the cache
+  so it never holds a position the committed history does not. Device-resident greedy drafts
+  cannot stop at a stop token while drafting, so the verify decision truncates them at the first
+  stop token: nothing past an accepted stop token is counted as proposed or accepted.
 
 ## The token-107 knife-edge: root cause
 
@@ -101,17 +111,42 @@ token-identical over 256 tokens, and every first divergence is an enumerated kni
 ties and two 1-ULP gaps). The literal AC1 wording is not met and cannot be on this hardware (root
 cause above).
 
-* **Acceptance vs the pre-engine loop.** K=1 and K=5 reproduce S1's sealed acceptance to three
-  decimals (0.827, 0.480) with the same forwards per token (0.645, 0.547); the old loop's rows all
-  parted from their reference at the 107 tie, the engine's at the 124 tie — both are exact bf16 ties
-  in the enumerated set, and which side a tie falls on is the last bit of a GEMM. K=2..4 diverge from the reference earlier or later than the old
-  loop did, and an acceptance rate is a property of the sequence actually decoded, so once the
-  sequences part the rates are not the same statistic: the like-for-like comparison is the
-  tiny-config side-by-side (identical) and K=1 / K=5 above. Every MTP row's forwards per token is
-  `< 1` as before.
+* **Acceptance vs the pre-engine loop, on the identical prefix** (`decode-bench/acceptance-prefix/`).
+  Over 256 tokens the 256-token rows above and the old loop's sealed rows decode *different*
+  sequences past their first tie (the old loop's rows parted from their reference at the 107 tie,
+  the engine's at 124 / 125 / 186), and an acceptance rate is a property of the sequence actually
+  decoded — so the 256-token rates (K=2: 0.779 old vs 0.668 engine; K=4: 0.493 vs 0.549) are not
+  the same statistic. The like-for-like comparison is the two loops on the prefix they share: the
+  old `qwen_mtp` loop (built from `87478b336`, the commit before the engine landed, run through
+  its own `decode_bench`) and the engine at this PR's code sha (`51621c288`), the same fixture,
+  **124 new tokens** (the first old-vs-new divergence, the 124 tie), K=1..5, GPU 0 with no
+  co-tenant. Every row of both runs is token-identical to the reference over the 124 tokens, and
+  **proposed / accepted / target forwards match exactly for every K**
+  (`acceptance-prefix/comparison.md`, the two sealed runs beside it):
+
+  | K | proposed old / new | accepted old / new | target forwards old / new | acceptance | replay forwards (engine) |
+  |---|---|---|---|---|---|
+  | 1 | 65 / 65 | 57 / 57 | 75 / 75 | 0.877 | 8 |
+  | 2 | 91 / 91 | 77 / 77 | 57 / 57 | 0.846 | 10 |
+  | 3 | 117 / 117 | 83 / 83 | 58 / 58 | 0.709 | 17 |
+  | 4 | 132 / 132 | 90 / 90 | 53 / 53 | 0.682 | 19 |
+  | 5 | 154 / 154 | 92 / 92 | 54 / 54 | 0.597 | 22 |
+
+  No draft-side knife-edge had to be invoked: the MTP head proposed the same drafts and the target
+  accepted the same runs on the growing (old) and static (engine) caches, and the engine's replay
+  forwards are exactly the old loop's clone-restore replays (`target_forwards` equal). The
+  256-token rates differ only because the sequences differ after the tie. Every MTP row's forwards
+  per token is `< 1` as before.
 * **AC2**: every engine row reports exactly **1.00** host syncs per verify step (the old loop: 1.64
   → 3.21 syncs per generated token at K=1..5 on S1's head, i.e. `K+1` per verify step). Per token the
-  engine issues 0.55 → 0.30 syncs at K=1..5.
+  engine issues 0.55 → 0.30 syncs at K=1..5. The 1.00 is the **plain-greedy** figure (the bench
+  rows and every provider request without penalties, a constraint or sampling): with a repetition
+  penalty or a constraint the drafts are sampled on the host, one whole-vocab transfer each, and
+  the verify decision pulls the `K+1` rows in one copy — `K+1` syncs per verify step, the old
+  loop's figure on every path; a stochastic run adds a shaped-distribution copy per draft,
+  `2K+1`. Both are pinned by the tiny-config tests
+  (`penalized_and_constrained_verify_steps_cost_one_sync_per_draft_plus_one`,
+  `stochastic_runs_are_seed_deterministic_and_bounded`).
 * **AC3**: `tests/qwen38_mtp.rs::frozen_qwen38_provider_executes_ar_mtp_tools_and_stops` (frozen
   tokenizer, CPU) — the same checkpoint without an MTP head advertises no MTP; `MtpMode::Auto`
   decodes normally with `proposer=none` (`DecodePath::Reference`), `Enabled` is refused
@@ -127,15 +162,19 @@ cause above).
 
 ## Weights-free gates
 
-* Git Bash: `cargo test --locked -p candle-llm --lib` — 288 passed (16 new: the engine's parity vs
-  the step driver for MTP K=1..5 / n-gram / draft model / no proposer, one-sync-per-verify accounting
-  on the greedy, penalized and constrained paths, direct-rollback vs replay forward counts, chi-square
-  of the stochastic decision, stop / caller-stop / cancel contracts, cache consistency after a
-  mid-verify cancel, the prefilled and multimodal prompt paths, the rope-delta seam), `cargo test -p
-  core-llm` (199 + 4), `cargo test -p candle-llm --test qwen38_mtp -- --ignored` (frozen tokenizer,
-  3 passed), CPU clippy `-D warnings`, `cargo fmt --check`, `check-workspace.py`, `check_docs.py`,
-  `check_clock_assertions.py --check-baseline`, `pytest scripts/tests/test_decode_bench.py`
-  (11 passed).
+* Git Bash: `cargo test --locked -p candle-llm --lib` — 313 passed after the merge of S5 + S8 (the engine's parity vs the
+  step driver for MTP K=1..5 / n-gram / draft model / no proposer, one sync per verify step on the
+  plain-greedy path and `K+1` on the penalized / constrained paths, direct-rollback vs replay
+  forward counts with the replay counter pinned (0 / 8), chi-square of the stochastic decision over
+  a point-mass and the real draft `q`, stop / caller-stop / cancel contracts, cache consistency
+  after a mid-verify cancel and after a cancel fired inside the verify forward, the budget exit
+  settling an over-proposed run, device-greedy drafts truncated at a stop token, the prefilled and
+  multimodal prompt paths, the rope-delta seam; in `provider.rs`: an `Enabled{3}` request priced on
+  the step geometry — checkpoints plus the K-position overshoot — and AC3 on a synthetic Qwen3.5
+  snapshot without an MTP head: `Auto` decodes normally with `proposer=none`, `Enabled` is
+  refused), `cargo test -p core-llm` (199 + 4), `cargo test -p candle-llm --test qwen38_mtp --
+  --ignored` (frozen tokenizer, 3 passed), CPU clippy `-D warnings`, `cargo fmt --check`,
+  `check-workspace.py`, `check_docs.py`, `pytest scripts/tests/test_decode_bench.py` (11 passed).
 * PowerShell (MSVC 14.44 vcvars, `CUDA_COMPUTE_CAP=120`): CUDA clippy `-D warnings`, rustdoc
   `-D warnings`, `cargo test --locked --lib --tests -p candle-llm --features cuda`.
 
@@ -143,7 +182,17 @@ cause above).
 
 * `decode-bench/head-bd33b65a7/` — the sealed bench run (reference, StepModel, MTP K=1..5, n-gram
   K=3); `decode-bench/comparison.md` — against the pre-epic baseline, S1's and S4's sealed heads.
+* `decode-bench/acceptance-prefix/` — the identical-prefix comparison: `old-loop-87478b336/` (the
+  pre-engine loop's own bench, 124 tokens, K=1..5), `head-51621c288/` (the engine at this PR's
+  code sha, same run), `comparison.md` (the table above, generated from the two sealed JSONs).
 * `parity-survey.log` — the op-isolation survey and the first (row-0) AC1 pass.
 * `parity-teacher-forced-row0.log` — the row-0 teacher-forced gate.
 * `parity-final.log` — the AC1 rows with each divergence's reference gap and the all-rows
-  teacher-forced gate, at the PR's code sha.
+  teacher-forced gate: both non-survey parity tests in **one** invocation at the PR's code sha
+  (`51621c288`, release, `--features cuda`), unfiltered `test … ok` / `test result` lines
+  included; the log's paths are relative. (The earlier version of this file was grep-filtered from
+  two separate invocations and embedded absolute scratchpad paths; the first invocation's
+  `1 passed; 1 failed` line named neither the failing test nor its assertion, because the filter
+  dropped them. This re-run — both tests, one invocation, at the code sha — replaces it: `2 passed;
+  0 failed`, the 3 filtered out being the survey and the two `common::fixture_*` tests the
+  binary also carries.)

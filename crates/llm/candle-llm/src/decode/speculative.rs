@@ -35,4 +35,11 @@ pub struct SpeculativeStats {
     /// Verify steps taken: target forwards over `[cur, drafts…]` whose outcome was decided
     /// (sc-24130). The denominator of "host syncs per verify step".
     pub verify_steps: usize,
+    /// Replay forwards (sc-24130, E2): verify steps whose cache answered
+    /// [`Error::RollbackUnavailable`] for the direct rollback to `start + 1 + accepted`, so the
+    /// engine rolled back to the step start and replayed the kept prefix in one extra forward.
+    /// Counted inside `forwards`; `0` on a cache with per-position rollback.
+    ///
+    /// [`Error::RollbackUnavailable`]: crate::error::Error::RollbackUnavailable
+    pub replays: usize,
 }

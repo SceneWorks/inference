@@ -9,8 +9,13 @@
 //!
 //! The counters are **measured**, not derived: forwards are counted by [`CountingDecode`] or by
 //! the loop that issued them, host syncs by the thread-local counter in
-//! [`primitives::host_sync`](crate::primitives::host_sync) bracketed around the request, and the
-//! fused-vs-reference primitive counts (sc-24137) by the thread-local tally in
+//! [`primitives::host_sync`](crate::primitives::host_sync) bracketed around the request.
+//!
+//! Story sc-24133 adds the sampler's half ([`SamplerTelemetry`]): which sampler path served the
+//! request (`device`, or `host` with the reason), how many draws each path made, and how many whole
+//! logits rows were copied to the host.
+//!
+//! Story sc-24137 adds the fused-vs-reference primitive counts, by the thread-local tally in
 //! [`primitives::fused`](crate::primitives::fused) bracketed the same way — so a request that
 //! took the op-chain path for a leaf shows `reference` / `mixed` with the reason, never silently.
 
@@ -24,8 +29,12 @@ use crate::decode::stream::Decode;
 use crate::error::Result;
 use crate::primitives::attention::AttnFormulation;
 use crate::primitives::fused::{fused_tally, FusedTally};
-use crate::primitives::host_sync::host_sync_count;
+use crate::primitives::host_sync::{
+    host_sync_count, last_host_reason, sampler_counters, SamplerCounters,
+};
 use crate::primitives::kv_cache::{KvCache, KvCacheKind};
+use crate::primitives::nvfp4_path::{nvfp4_path_tally, Nvfp4PathTally};
+use crate::primitives::sampler::SamplerPath;
 
 /// Which decode implementation produced a request's tokens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +70,39 @@ impl DecodePath {
     }
 }
 
+/// Which sampler served a request and what it cost (story sc-24133). Measured by the thread-local
+/// sampler counters bracketed around the request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SamplerTelemetry {
+    /// The request's sampler path: `Host(reason)` if any draw (or speculative distribution read)
+    /// ran on the host — with the most recent host reason — else `Device`; `None` if nothing was
+    /// sampled.
+    pub path: Option<SamplerPath>,
+    /// Tokens drawn on the device (greedy argmax or the device sampler).
+    pub device_draws: u64,
+    /// Host sampling decisions (host draws and speculative distribution reads).
+    pub host_draws: u64,
+    /// Whole logits rows copied to the host (a vocabulary-wide `to_vec1`).
+    pub logits_to_host: u64,
+}
+
+impl SamplerTelemetry {
+    /// `device`, `host:<reason>` (e.g. `host:penalty`), or `none` — the evidence-row label.
+    pub fn label(&self) -> String {
+        self.path
+            .map_or_else(|| "none".to_string(), |path| path.to_string())
+    }
+}
+
+/// A request's measured transfer counters: host syncs plus the sampler's telemetry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpanCounters {
+    /// Device→host transfers this crate issued.
+    pub host_syncs: u64,
+    /// The sampler's path and counters.
+    pub sampler: SamplerTelemetry,
+}
+
 /// Measured counters for one generation request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodeRecord {
@@ -76,6 +118,8 @@ pub struct DecodeRecord {
     pub generated_tokens: u64,
     /// Device→host transfers this crate issued while generating (see `primitives::host_sync`).
     pub host_syncs: u64,
+    /// Which sampler path served the request (`device` | `host` + reason) and its counters.
+    pub sampler: SamplerTelemetry,
     /// Which KV cache implementation the request ran on (story sc-24132): the growing reference
     /// cache or the preallocated static one. Reported from the cache itself
     /// ([`DecodeCache::kv_kind`](crate::primitives::DecodeCache::kv_kind)), so the row says what
@@ -91,6 +135,11 @@ pub struct DecodeRecord {
     pub proposer: ProposerKind,
     /// Verify steps the speculative engine took (0 on non-speculative paths).
     pub verify_steps: u64,
+    /// Verify steps that fell back from a direct rollback to a step-start rollback plus a replay
+    /// forward (sc-24130, E2): the engine's `RollbackUnavailable` → replay recovery made visible.
+    /// `0` on non-speculative paths and on a cache with per-position rollback; on the S1 hybrid
+    /// cache one per rejected verify step. Each is one of `target_forwards`.
+    pub replay_forwards: u64,
     /// Device->host transfers issued inside those verify steps (proposing, verifying, deciding and
     /// committing), so `verify_host_syncs / verify_steps` is the engine's per-step sync cost — the
     /// AC2 figure, exactly `1.0` for a greedy run with device-resident drafts.
@@ -99,6 +148,11 @@ pub struct DecodeRecord {
     /// RMSNorm / SwiGLU / QK-norm+RoPE leaves ran the fused kernel, how many the op chain, and why
     /// the last op-chain run happened. `FusedTally::label` gives `fused` / `reference` / `mixed`.
     pub fused_primitives: FusedTally,
+    /// NVFP4 projection calls by path while generating (see `primitives::nvfp4_path`, sc-24136):
+    /// how many ran the fused decode GEMV, how many the cuBLASLt W4A4 GEMM, and why the last
+    /// cuBLASLt run happened (`rows` for a prefill, `disabled` with the switch off, …).
+    /// `Nvfp4PathTally::label` gives `gemv` / `cublaslt` / `mixed` / `none` (a non-NVFP4 model).
+    pub nvfp4_projections: Nvfp4PathTally,
 }
 
 impl DecodeRecord {
@@ -107,7 +161,7 @@ impl DecodeRecord {
         path: DecodePath,
         target_forwards: u64,
         generated: usize,
-        host_syncs: u64,
+        counters: SpanCounters,
     ) -> Self {
         Self {
             path,
@@ -115,13 +169,16 @@ impl DecodeRecord {
             proposed_tokens: 0,
             accepted_tokens: 0,
             generated_tokens: generated as u64,
-            host_syncs,
+            host_syncs: counters.host_syncs,
+            sampler: counters.sampler,
             kv_cache: KvCacheKind::Growing,
             attn_formulation: AttnFormulation::Gqa,
             proposer: ProposerKind::None,
             verify_steps: 0,
+            replay_forwards: 0,
             verify_host_syncs: 0,
             fused_primitives: FusedTally::default(),
+            nvfp4_projections: Nvfp4PathTally::default(),
         }
     }
 
@@ -135,6 +192,13 @@ impl DecodeRecord {
     /// [`host_syncs_per_verify_step`](Self::host_syncs_per_verify_step)).
     pub fn with_verify_syncs(mut self, verify_host_syncs: u64) -> Self {
         self.verify_host_syncs = verify_host_syncs;
+        self
+    }
+
+    /// The same record with its NVFP4 projection path tally filled in (from
+    /// [`RequestSpan::nvfp4_projections`]).
+    pub fn with_nvfp4_projections(mut self, tally: Nvfp4PathTally) -> Self {
+        self.nvfp4_projections = tally;
         self
     }
 
@@ -164,7 +228,7 @@ impl DecodeRecord {
         path: DecodePath,
         stats: SpeculativeStats,
         generated: usize,
-        host_syncs: u64,
+        counters: SpanCounters,
     ) -> Self {
         Self {
             path,
@@ -172,13 +236,16 @@ impl DecodeRecord {
             proposed_tokens: stats.proposed as u64,
             accepted_tokens: stats.accepted as u64,
             generated_tokens: generated as u64,
-            host_syncs,
+            host_syncs: counters.host_syncs,
+            sampler: counters.sampler,
             kv_cache: KvCacheKind::Growing,
             attn_formulation: AttnFormulation::Gqa,
             proposer: ProposerKind::None,
             verify_steps: stats.verify_steps as u64,
+            replay_forwards: stats.replays as u64,
             verify_host_syncs: 0,
             fused_primitives: FusedTally::default(),
+            nvfp4_projections: Nvfp4PathTally::default(),
         }
     }
 
@@ -205,6 +272,13 @@ impl DecodeRecord {
     pub fn host_syncs_per_token(&self) -> Option<f64> {
         (self.generated_tokens > 0).then(|| self.host_syncs as f64 / self.generated_tokens as f64)
     }
+
+    /// Whole logits rows copied to the host per emitted token, or `None` when nothing was
+    /// generated. `0.0` on the device sampler path.
+    pub fn logits_to_host_per_token(&self) -> Option<f64> {
+        (self.generated_tokens > 0)
+            .then(|| self.sampler.logits_to_host as f64 / self.generated_tokens as f64)
+    }
 }
 
 /// Brackets a request on the current thread: constructed before the first forward, `finish`ed after
@@ -212,7 +286,9 @@ impl DecodeRecord {
 #[derive(Debug)]
 pub struct RequestSpan {
     host_syncs_at_start: u64,
+    sampler_at_start: SamplerCounters,
     fused_at_start: FusedTally,
+    nvfp4_at_start: Nvfp4PathTally,
 }
 
 impl Default for RequestSpan {
@@ -226,7 +302,9 @@ impl RequestSpan {
     pub fn begin() -> Self {
         Self {
             host_syncs_at_start: host_sync_count(),
+            sampler_at_start: sampler_counters(),
             fused_at_start: fused_tally(),
+            nvfp4_at_start: nvfp4_path_tally(),
         }
     }
 
@@ -235,9 +313,43 @@ impl RequestSpan {
         host_sync_count().wrapping_sub(self.host_syncs_at_start)
     }
 
+    /// The sampler's telemetry on this thread since [`begin`](Self::begin).
+    pub fn sampler(&self) -> SamplerTelemetry {
+        let now = sampler_counters();
+        let start = self.sampler_at_start;
+        let device_draws = now.device_draws.wrapping_sub(start.device_draws);
+        let host_draws = now.host_draws.wrapping_sub(start.host_draws);
+        let path = if host_draws > 0 {
+            last_host_reason().map(SamplerPath::Host)
+        } else if device_draws > 0 {
+            Some(SamplerPath::Device)
+        } else {
+            None
+        };
+        SamplerTelemetry {
+            path,
+            device_draws,
+            host_draws,
+            logits_to_host: now.logits_to_host.wrapping_sub(start.logits_to_host),
+        }
+    }
+
+    /// Everything measured on this thread since [`begin`](Self::begin).
+    pub fn counters(&self) -> SpanCounters {
+        SpanCounters {
+            host_syncs: self.host_syncs(),
+            sampler: self.sampler(),
+        }
+    }
+
     /// Fused-vs-reference primitive runs on this thread since [`begin`](Self::begin).
     pub fn fused_primitives(&self) -> FusedTally {
         fused_tally().since(&self.fused_at_start)
+    }
+
+    /// NVFP4 projection calls by path on this thread since [`begin`](Self::begin).
+    pub fn nvfp4_projections(&self) -> Nvfp4PathTally {
+        nvfp4_path_tally().since(&self.nvfp4_at_start)
     }
 }
 
@@ -316,10 +428,12 @@ mod tests {
 
     #[test]
     fn ratios_are_none_without_denominators_and_exact_otherwise() {
-        let plain = DecodeRecord::plain(DecodePath::Reference, 0, 0, 0);
+        let plain = DecodeRecord::plain(DecodePath::Reference, 0, 0, SpanCounters::default());
         assert_eq!(plain.acceptance_rate(), None);
         assert_eq!(plain.forwards_per_generated_token(), None);
         assert_eq!(plain.host_syncs_per_token(), None);
+        assert_eq!(plain.logits_to_host_per_token(), None);
+        assert_eq!(plain.sampler.label(), "none");
         assert_eq!(plain.path.label(), "reference");
         assert_eq!(plain.kv_cache, KvCacheKind::Growing);
         assert_eq!(plain.attn_formulation, AttnFormulation::Gqa);
@@ -343,9 +457,18 @@ mod tests {
                 proposed: 12,
                 accepted: 6,
                 verify_steps: 4,
+                replays: 2,
             },
             10,
-            20,
+            SpanCounters {
+                host_syncs: 20,
+                sampler: SamplerTelemetry {
+                    path: Some(SamplerPath::Device),
+                    device_draws: 10,
+                    host_draws: 0,
+                    logits_to_host: 0,
+                },
+            },
         )
         .with_proposer(ProposerKind::Mtp)
         .with_verify_syncs(4);
@@ -353,8 +476,14 @@ mod tests {
         assert_eq!(spec.forwards_per_generated_token(), Some(0.5));
         assert_eq!(spec.host_syncs_per_token(), Some(2.0));
         assert_eq!(spec.host_syncs_per_verify_step(), Some(1.0));
+        assert_eq!(
+            spec.replay_forwards, 2,
+            "the replay fallback is on the record"
+        );
         assert_eq!(spec.path.label(), "mtp");
         assert_eq!(spec.proposer.label(), "mtp");
+        assert_eq!(spec.logits_to_host_per_token(), Some(0.0));
+        assert_eq!(spec.sampler.label(), "device");
     }
 
     #[test]
@@ -362,6 +491,57 @@ mod tests {
         let span = RequestSpan::begin();
         crate::primitives::note_host_sync();
         assert_eq!(span.host_syncs(), 1);
+    }
+
+    #[test]
+    fn request_span_brackets_this_threads_nvfp4_projection_paths() {
+        let span = RequestSpan::begin();
+        crate::primitives::nvfp4_path::note_cublaslt("rows");
+        crate::primitives::nvfp4_path::note_gemv();
+        crate::primitives::nvfp4_path::note_gemv();
+        let tally = span.nvfp4_projections();
+        assert_eq!((tally.gemv, tally.cublaslt), (2, 1));
+        assert_eq!(tally.cublaslt_reason, Some("rows"));
+        assert_eq!(tally.label(), "mixed");
+        let record = DecodeRecord::plain(DecodePath::StepModel, 1, 1, SpanCounters::default())
+            .with_nvfp4_projections(tally);
+        assert_eq!(record.nvfp4_projections, tally);
+        assert_eq!(
+            DecodeRecord::plain(DecodePath::Reference, 1, 1, SpanCounters::default())
+                .nvfp4_projections
+                .label(),
+            "none"
+        );
+    }
+
+    #[test]
+    fn request_span_names_the_sampler_path_and_reason() {
+        use crate::primitives::{note_logits_to_host, note_sampler_path, HostSampleReason};
+        let span = RequestSpan::begin();
+        assert_eq!(span.sampler().path, None, "nothing sampled yet");
+        note_sampler_path(SamplerPath::Device);
+        assert_eq!(span.sampler().path, Some(SamplerPath::Device));
+        note_sampler_path(SamplerPath::Host(HostSampleReason::Constraint));
+        note_logits_to_host();
+        let telemetry = span.counters().sampler;
+        assert_eq!(
+            telemetry.path,
+            Some(SamplerPath::Host(HostSampleReason::Constraint)),
+            "any host draw makes the request a host request, with its reason"
+        );
+        assert_eq!(telemetry.label(), "host:constraint");
+        assert_eq!(
+            (
+                telemetry.device_draws,
+                telemetry.host_draws,
+                telemetry.logits_to_host
+            ),
+            (1, 1, 1)
+        );
+        // A later span on the same thread starts clean.
+        let next = RequestSpan::begin();
+        note_sampler_path(SamplerPath::Device);
+        assert_eq!(next.sampler().path, Some(SamplerPath::Device));
     }
 
     #[test]
@@ -374,11 +554,11 @@ mod tests {
         assert_eq!(tally.reference, 1);
         assert_eq!(tally.reference_reason, Some("shape"));
         assert_eq!(tally.label(), "mixed");
-        let record =
-            DecodeRecord::plain(DecodePath::Reference, 1, 1, 0).with_fused_primitives(tally);
+        let record = DecodeRecord::plain(DecodePath::Reference, 1, 1, SpanCounters::default())
+            .with_fused_primitives(tally);
         assert_eq!(record.fused_primitives, tally);
         assert_eq!(
-            DecodeRecord::plain(DecodePath::Reference, 1, 1, 0)
+            DecodeRecord::plain(DecodePath::Reference, 1, 1, SpanCounters::default())
                 .fused_primitives
                 .label(),
             "none"

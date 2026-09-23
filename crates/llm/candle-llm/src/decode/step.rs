@@ -355,11 +355,12 @@ pub fn generate_step_timed<M: StepModel>(
         DecodePath::StepModel,
         forwards,
         generated.len(),
-        span.host_syncs(),
+        span.counters(),
     )
     .with_kv_cache(cache.kv_kind())
     .with_attn_formulation(model.attn_formulation(&cache))
-    .with_fused_primitives(span.fused_primitives());
+    .with_fused_primitives(span.fused_primitives())
+    .with_nvfp4_projections(span.nvfp4_projections());
     Ok((
         GenerationOutput {
             tokens: generated,
@@ -424,7 +425,7 @@ pub fn generate_step_from_prefill<M: StepModel>(
                     tokens: Vec::new(),
                     finish_reason: FinishReason::Cancelled,
                 },
-                DecodeRecord::plain(DecodePath::StepModel, 0, 0, 0),
+                DecodeRecord::plain(DecodePath::StepModel, 0, 0, Default::default()),
             ))
         }
         Err(error) => Err(error),

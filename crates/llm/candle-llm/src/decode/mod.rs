@@ -37,7 +37,9 @@ pub use engine::{
 };
 pub use prefix::{generate_cached, PrefixCache, PrefixStats};
 pub use proposers::{DraftModelProposer, MtpProposer, NgramProposer};
-pub use record::{CountingDecode, DecodePath, DecodeRecord, RequestSpan};
+pub use record::{
+    CountingDecode, DecodePath, DecodeRecord, RequestSpan, SamplerTelemetry, SpanCounters,
+};
 pub use speculative::SpeculativeStats;
 pub use step::{
     generate_step, generate_step_from_prefill, generate_step_timed, LogitsScope, StepModel,
