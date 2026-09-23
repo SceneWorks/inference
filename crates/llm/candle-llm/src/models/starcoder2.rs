@@ -4,9 +4,12 @@
 //! uses GQA, RoPE, biasful LayerNorm, and a biasful GELU MLP.
 //!
 //! It implements both decode seams (story sc-24138): the reference [`Decode`] over a
-//! [`ContiguousKvCache`] (the pre-migration arithmetic, kept as the parity oracle) and
-//! [`StepModel`] over the shared [`StepKvCache`] — preallocated by default, where it attends the
-//! un-expanded K/V through [`sdpa_gqa_causal`].
+//! [`ContiguousKvCache`] (kept as the parity oracle) and [`StepModel`] over the shared
+//! [`StepKvCache`] — preallocated by default. Every path attends the un-expanded K/V through
+//! [`sdpa_gqa_causal`] by default, so the reference loop, the growing backing and the static cache
+//! are the same arithmetic; [`StarCoder2::set_attn_formulation`] selects the pre-migration
+//! `repeat_kv`-expanded arithmetic ([`AttnFormulation::Expanded`]) on the reference paths and the
+//! growing backing, as a labelled comparison.
 
 use candle_core::{DType, Device, Tensor};
 
@@ -62,6 +65,11 @@ pub struct StarCoder2 {
     device: Device,
     /// Which KV cache [`StepModel::new_cache_for`] builds (static by default).
     step_kv_cache: KvCacheKind,
+    /// How the reference paths and a growing step cache attend: [`AttnFormulation::Gqa`] (the
+    /// default — the static cache's arithmetic) or [`AttnFormulation::Expanded`] (the
+    /// pre-migration `repeat_kv` + `sdpa`, selected for a comparison). The static cache attends
+    /// un-expanded regardless.
+    attn_formulation: AttnFormulation,
 }
 
 impl StarCoder2 {
@@ -91,6 +99,7 @@ impl StarCoder2 {
             dtype,
             device: w.device().clone(),
             step_kv_cache: KvCacheKind::Static,
+            attn_formulation: AttnFormulation::Gqa,
         })
     }
 
@@ -106,15 +115,16 @@ impl StarCoder2 {
         &self.device
     }
 
-    /// Last-position logits `[batch, vocab]` over `embeds` at `offset` — the reference forward
-    /// (`repeat_kv`-expanded attention), unchanged by the step-seam migration.
+    /// Last-position logits `[batch, vocab]` over `embeds` at `offset` — the reference forward,
+    /// in the selected formulation ([`AttnFormulation::Gqa`] by default; see
+    /// [`set_attn_formulation`](Self::set_attn_formulation)).
     pub fn logits_from_embeds(
         &self,
         embeds: &Tensor,
         cache: &mut dyn KvCache,
         offset: i32,
     ) -> Result<Tensor> {
-        let state = self.normed_states(embeds, cache, offset, AttnFormulation::Expanded)?;
+        let state = self.normed_states(embeds, cache, offset, self.attn_formulation)?;
         let sequence = state.dim(1)?;
         let last = state.narrow(1, sequence - 1, 1)?.squeeze(1)?;
         linear(&last, &self.embed_tokens, None)
@@ -187,6 +197,18 @@ impl StarCoder2 {
         self.step_kv_cache = kind;
     }
 
+    /// Select how the reference paths and a growing step cache attend:
+    /// [`AttnFormulation::Gqa`] (the default) or [`AttnFormulation::Expanded`] (the pre-migration
+    /// arithmetic, for a labelled comparison). The static cache attends un-expanded regardless.
+    pub fn set_attn_formulation(&mut self, formulation: AttnFormulation) {
+        self.attn_formulation = formulation;
+    }
+
+    /// The selected formulation (what the reference paths and a growing cache run).
+    pub fn attn_formulation(&self) -> AttnFormulation {
+        self.attn_formulation
+    }
+
     /// Prefill `embeds` (the StarVector-8B image rows + `<svg` prompt) into a step-seam cache at
     /// its current length, in the cache's formulation; last-position logits `[batch, vocab]`.
     pub fn step_prefill_from_embeds(
@@ -195,18 +217,18 @@ impl StarCoder2 {
         cache: &mut StepKvCache,
     ) -> Result<Tensor> {
         let offset = DecodeCache::len(cache) + cache.rope_delta();
-        let formulation = Self::cache_formulation(cache);
+        let formulation = self.cache_formulation(cache);
         let state = self.normed_states(embeds, cache, offset, formulation)?;
         let sequence = state.dim(1)?;
         let last = state.narrow(1, sequence - 1, 1)?.squeeze(1)?;
         linear(&last, &self.embed_tokens, None)
     }
 
-    /// Un-expanded attention on a static cache; the reference arithmetic on a growing one.
-    fn cache_formulation(cache: &StepKvCache) -> AttnFormulation {
+    /// Un-expanded attention on a static cache; the selected formulation on a growing one.
+    fn cache_formulation(&self, cache: &StepKvCache) -> AttnFormulation {
         match cache.kv_kind() {
             KvCacheKind::Static => AttnFormulation::Gqa,
-            KvCacheKind::Growing => AttnFormulation::Expanded,
+            KvCacheKind::Growing => self.attn_formulation,
         }
     }
 }
@@ -227,7 +249,7 @@ impl StepModel for StarCoder2 {
     }
 
     fn attn_formulation(&self, cache: &StepKvCache) -> AttnFormulation {
-        Self::cache_formulation(cache)
+        self.cache_formulation(cache)
     }
 
     fn device(&self) -> &Device {
@@ -250,7 +272,7 @@ impl StepModel for StarCoder2 {
         }
         let embeds = self.embed(&request.tokens.ids(&self.device)?)?;
         let offset = DecodeCache::len(cache) + cache.rope_delta();
-        let formulation = Self::cache_formulation(cache);
+        let formulation = self.cache_formulation(cache);
         let state = self.normed_states(&embeds, cache, offset, formulation)?;
         let logits = match request.scope {
             LogitsScope::Last => {

@@ -61,9 +61,13 @@
 //! 3.6 / 3.8 hybrid runs the rows above; a llama-family checkpoint (a `CausalLm` — Qwen3-8B, the
 //! epic's second real-weight model) runs `reference` / `reference_unfused` (the `CausalLm`
 //! reference loop, E2), `step_model` (the step seam, static KV by default) and `ngram` (prompt
-//! lookup through the unified engine). For it `DECODE_BENCH_ATTN` unset keeps the model default —
-//! `expanded`, the pre-migration arithmetic — on the reference rows; the static cache attends
-//! un-expanded (`gqa`). The document then carries `model_family: "llama"` and its `architecture`.
+//! lookup through the unified engine). For it `DECODE_BENCH_ATTN` defaults to `gqa` as for the
+//! hybrid — the model default since sc-24138, the static cache's arithmetic, so the reference rows
+//! and the `step_model` row are token-identical by construction; `DECODE_BENCH_ATTN=expanded`
+//! selects the pre-migration `repeat_kv` arithmetic on the reference rows (and a growing
+//! `step_model` cache), the labelled "expanded attn" comparison row. The static cache attends
+//! un-expanded (`gqa`) either way. The document then carries `model_family: "llama"` and its
+//! `architecture`.
 //!
 //! The block between the `head-only` markers uses seams that do not exist on the pre-epic
 //! baseline (`StepModel`, host-sync accounting). `decode_bench.py baseline-source` rewrites this
@@ -522,7 +526,8 @@ fn causal_engine_row<P: Proposer>(
 
 /// The decode bench over a llama-family snapshot (sc-24138 AC2). Rows: `reference` (the
 /// `CausalLm` reference loop, growing cache, `DECODE_BENCH_ATTN` selecting its formulation —
-/// unset keeps the model default, `expanded`, the pre-migration arithmetic), `reference_unfused`,
+/// `gqa` by default, the model default; `expanded` is the labelled pre-migration comparison),
+/// `reference_unfused`,
 /// `step_model` (the step seam, token at a time, on `DECODE_BENCH_KV_CACHE` — static by default)
 /// and `ngram` (prompt lookup through the unified engine, one row per `DECODE_BENCH_NGRAM_DRAFTS`
 /// width). `mtp` is refused: the llama family has no MTP head.
@@ -562,11 +567,12 @@ fn causal_decode_bench(
         "growing" => model.set_step_kv_cache(KvCacheKind::Growing),
         other => panic!("DECODE_BENCH_KV_CACHE must be `static` or `growing`, got {other:?}"),
     }
-    match std::env::var("DECODE_BENCH_ATTN").ok().as_deref() {
-        None | Some("") => {}
-        Some("gqa") => model.set_attn_formulation(AttnFormulation::Gqa),
-        Some("expanded") => model.set_attn_formulation(AttnFormulation::Expanded),
-        Some(other) => panic!("DECODE_BENCH_ATTN must be `gqa` or `expanded`, got {other:?}"),
+    // `gqa` unless the labelled comparison is asked for, exactly as `select_attn_formulation`
+    // does for the hybrid.
+    match env_or("DECODE_BENCH_ATTN", "gqa").as_str() {
+        "gqa" => model.set_attn_formulation(AttnFormulation::Gqa),
+        "expanded" => model.set_attn_formulation(AttnFormulation::Expanded),
+        other => panic!("DECODE_BENCH_ATTN must be `gqa` or `expanded`, got {other:?}"),
     }
     let load_secs = load_started.elapsed().as_secs_f64();
     let used_after_load = device_used_bytes(&device);

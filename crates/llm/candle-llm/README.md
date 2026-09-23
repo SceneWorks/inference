@@ -189,8 +189,19 @@ decoder), `StarCoder2` (StarVector-8B) and the StarVector-1B GPTBigCode decoder 
 `StaticKvCache`, the default), growing (the reference concat) or paged (kept behind the seam for
 continuous batching). No decoder keeps a private cache or decode loop: LLaVA and both StarVector
 providers prefill their conditioning into the step cache and decode through the engine
-(`decode::generate_step_from_prefill`). `tests/step_seam_migration.rs` holds every one of them to
-goldens captured on the pre-migration tree (`tests/goldens/sc24138/`).
+(`decode::generate_step_from_prefill`). The provider decodes a llama-family request (text, and the
+Gemma 4 soft-token splice) through the unified engine on the static KV cache, priced in admission
+by the widest layer's KV geometry; `LlamaProvider::set_causal_decode_path(DecodePath::Reference)`
+keeps the `Decode` loop selectable as the oracle. `CausalLm` and `StarCoder2` attend
+un-expanded (`AttnFormulation::Gqa`, `sdpa_gqa_causal`) by default on every path, so the
+reference loop and the static cache are one arithmetic and token-identical by construction;
+`set_attn_formulation(AttnFormulation::Expanded)` selects the pre-migration `repeat_kv` arithmetic
+as a labelled comparison. As at S4 (sc-24132), the default reference's numerics moved from the
+expanded arithmetic's by at most one bf16 ULP at attention-GEMM knife-edges (on Qwen3-8B the two
+reference loops first differ at token 65 of 256). `tests/step_seam_migration.rs` holds every
+decoder to goldens captured on the pre-migration tree (`tests/goldens/sc24138/`) with `Expanded`
+selected — logits bit for bit in the configuration they were measured on (Windows x86_64 MSVC),
+tokens exactly and logits within 1e-4 elsewhere.
 
 The `vlm` test covers the **vision-language path** (`LlavaModel` + `LlavaProvider`): a SigLIP vision
 tower ([`SiglipVisionTower`]) encodes the image, a two-layer GELU MLP projector lifts a chosen

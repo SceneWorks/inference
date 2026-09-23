@@ -41,7 +41,7 @@ use crate::models::CausalLm;
 use crate::primitives::nn::{gelu, gelu_erf, linear};
 use crate::primitives::projection::QuantSpec;
 use crate::primitives::sampler::SamplingParams;
-use crate::primitives::{input_ids, Weights};
+use crate::primitives::{input_ids, AttnFormulation, Weights};
 
 /// The registry id of the LLaVA provider.
 pub const PROVIDER_ID: &str = "candle-llava";
@@ -306,6 +306,14 @@ impl LlavaModel {
     /// embed/splice/decode loop.
     pub fn language(&self) -> &CausalLm {
         &self.language
+    }
+
+    /// Select how the language decoder attends on its reference paths and growing step cache —
+    /// the caption loop's backing ([`CausalLm::set_attn_formulation`]): [`AttnFormulation::Gqa`]
+    /// by default, [`AttnFormulation::Expanded`] for the pre-migration arithmetic (a labelled
+    /// comparison, e.g. against goldens captured before sc-24138).
+    pub fn set_attn_formulation(&mut self, formulation: AttnFormulation) {
+        self.language.set_attn_formulation(formulation);
     }
 
     /// The device the model is loaded on.

@@ -132,11 +132,15 @@ pub struct CausalLm {
     /// Those are published per forward, so a continued (cached) generation is refused.
     kv_sharing: bool,
     /// How grouped-query attention is computed on the reference paths and on a growing step cache
-    /// (story sc-24138): [`AttnFormulation::Expanded`] by default — the pre-migration `repeat_kv` +
-    /// `sdpa` arithmetic, so the `CausalLm` reference loop stays bit-identical to the tree before
-    /// the migration (E2) — or [`AttnFormulation::Gqa`], the static cache's arithmetic, which makes
-    /// the reference and the fast path token-identical by construction. A static step cache always
-    /// attends un-expanded wherever the layer can.
+    /// (story sc-24138): [`AttnFormulation::Gqa`] by default — the un-expanded `sdpa_gqa_causal`
+    /// the static cache runs, so the reference loop and the fast path are the same arithmetic and
+    /// token-identical by construction (as S4 made the Qwen3.5 hybrid's reference) — or
+    /// [`AttnFormulation::Expanded`], the pre-migration `repeat_kv` + `sdpa` arithmetic, selected
+    /// explicitly for a labelled comparison: it reproduces the pre-migration tree's numerics bit for
+    /// bit (the sc-24138 goldens). The two differ by at most one bf16 ULP at attention-GEMM
+    /// knife-edges (see sc-24132). A static step cache always attends un-expanded wherever the
+    /// layer can; a layer that cannot (soft-cap, sliding window, MLA) keeps the expanded
+    /// arithmetic whatever is selected.
     attn_formulation: AttnFormulation,
     /// Which KV cache [`StepModel::new_cache_for`] builds: [`KvCacheKind::Static`] (the default) or
     /// [`KvCacheKind::Growing`] (the reference concat, through the same seam).
@@ -540,7 +544,7 @@ impl CausalLm {
                 .as_deref()
                 .is_some_and(|g| g.first_kv_shared_layer().is_some()),
             cfg,
-            attn_formulation: AttnFormulation::Expanded,
+            attn_formulation: AttnFormulation::Gqa,
             step_kv_cache: KvCacheKind::Static,
         })
     }
@@ -674,8 +678,10 @@ impl CausalLm {
         StepKvCache::paged(self.new_paged_cache(block_size), &self.kv_layout())
     }
 
-    /// Select how the reference paths and a growing step cache attend (see the field docs). The
-    /// static cache attends un-expanded regardless.
+    /// Select how the reference paths and a growing step cache attend (see the field docs):
+    /// [`AttnFormulation::Gqa`] is the default; [`AttnFormulation::Expanded`] reproduces the
+    /// pre-migration arithmetic for a labelled comparison. The static cache attends un-expanded
+    /// regardless.
     pub fn set_attn_formulation(&mut self, formulation: AttnFormulation) {
         self.attn_formulation = formulation;
     }

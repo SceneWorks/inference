@@ -79,13 +79,26 @@ impl KvLayout {
         })
     }
 
-    /// The largest per-layer `(kv_heads, max(key_dim, value_dim))` — the scalar pair an admission
-    /// geometry must carry so `layers × kv_heads × head_dim × 2` covers every layer, whatever its
-    /// type.
+    /// The `(kv_heads, max(key_dim, value_dim))` of the layer whose K/V are widest per position —
+    /// the largest `kv_heads × max(key_dim, value_dim)` — the scalar pair an admission geometry
+    /// carries so `layers × kv_heads × head_dim × 2` covers every layer, whatever its type.
+    ///
+    /// The pair is taken from **one** layer rather than maxing the head count and the head width
+    /// independently: Gemma 4's sliding layers are many narrow heads and its full layers few wide
+    /// ones (e.g. 8×256 vs `k_eq_v` 1×512), and the independent maxima (8×512) would price twice
+    /// what any layer holds. `(0, 0)` when no layer caches anything.
     pub fn widest_layer(&self) -> (usize, usize) {
-        self.layers.iter().flatten().fold((0, 0), |(h, d), l| {
-            (h.max(l.kv_heads), d.max(l.key_dim.max(l.value_dim)))
-        })
+        self.layers
+            .iter()
+            .flatten()
+            .map(|l| (l.kv_heads, l.key_dim.max(l.value_dim)))
+            .fold((0, 0), |widest, layer| {
+                if layer.0.saturating_mul(layer.1) > widest.0.saturating_mul(widest.1) {
+                    layer
+                } else {
+                    widest
+                }
+            })
     }
 }
 
@@ -397,7 +410,8 @@ mod tests {
         let l = layout();
         assert_eq!(l.bytes_per_position(), (2 * 8 + 16 + 3 * 10) * 4);
         assert_eq!(l.static_bytes(5), 5 * l.bytes_per_position());
-        assert_eq!(l.widest_layer(), (3, 8));
+        // The widest single layer: the MLA-like 3 × max(6, 4) = 18 beats 2 × 4 and 1 × 8.
+        assert_eq!(l.widest_layer(), (3, 6));
         let cache = StepKvCache::preallocated(&l, 5).unwrap();
         assert_eq!(cache.memory().live_bytes, l.static_bytes(5));
         assert_eq!(cache.kv_capacity(), Some(5));
@@ -407,6 +421,42 @@ mod tests {
             "the tail caches nothing"
         );
         assert!(StepKvCache::preallocated(&l, 0).is_err());
+    }
+
+    /// The admission pair is one layer's `(kv_heads, head width)`, never the head count of one
+    /// layer type crossed with the width of another: on a Gemma 4 12B-style stack (sliding 8×256,
+    /// full `k_eq_v` 1×512) the independent maxima (8×512) would price twice what any layer holds.
+    #[test]
+    fn widest_layer_is_one_layers_geometry() {
+        let shape = |kv_heads, dim| {
+            Some(LayerKvShape {
+                kv_heads,
+                key_dim: dim,
+                value_dim: dim,
+                device: Device::Cpu,
+            })
+        };
+        let layout = |layers| KvLayout {
+            layers,
+            dtype: DType::BF16,
+        };
+        // Sliding layers win: 8 × 256 = 2048 against the full layers' 1 × 512.
+        let gemma4_12b = layout(vec![shape(8, 256), shape(8, 256), shape(1, 512), None]);
+        let (h, d) = gemma4_12b.widest_layer();
+        assert_eq!((h, d), (8, 256));
+        // The scalar geometry prices every caching layer at the widest one — no more.
+        let caching = gemma4_12b.layers.iter().flatten().count();
+        assert_eq!(
+            caching * h * d * 2 * 2,
+            3 * 2048 * 2 * 2,
+            "no inflation past the widest layer"
+        );
+        assert!(caching * h * d * 2 * 2 >= gemma4_12b.bytes_per_position());
+        // Full layers win when their product is larger: 4 × 512 = 2048 > 8 × 128 = 1024.
+        let full_wider = layout(vec![shape(8, 128), shape(4, 512), shape(8, 128)]);
+        assert_eq!(full_wider.widest_layer(), (4, 512));
+        assert!(3 * 4 * 512 * 2 * 2 >= full_wider.bytes_per_position());
+        assert_eq!(layout(vec![None, None]).widest_layer(), (0, 0));
     }
 
     /// The three backings hold the same K/V through writes and rollbacks; the static one never

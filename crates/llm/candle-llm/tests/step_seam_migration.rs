@@ -13,16 +13,30 @@
 //! loop and the StarVector-1B decoder with its layer-owned cache. Each golden holds the prompt, the
 //! greedy tokens, the logits every greedy token was chosen from, and a sampled run's tokens.
 //!
-//! After the migration every model is held to its golden on each path it now has:
+//! After the migration the decoders attend un-expanded (`AttnFormulation::Gqa`) by default on
+//! every path — the reference loop, the growing and paged backings and the static cache are one
+//! arithmetic — and the pre-migration `repeat_kv` expansion (`AttnFormulation::Expanded`) is the
+//! explicitly selected comparison. Every model is held to its golden on each path it now has:
 //!
-//! * the **reference** path (the `CausalLm` loop / the growing backing — the pre-migration
-//!   arithmetic, E2) reproduces the golden **bit for bit**, tokens and logits;
-//! * the **step seam on the static cache** (un-expanded GQA where a layer can express it) produces
-//!   the golden's greedy and sampled **tokens exactly**, and every logit row within
-//!   [`STATIC_LOGIT_TOL`] of the golden's (the un-expanded attention GEMMs round differently);
+//! * the golden producers select **`Expanded`**, the pre-migration arithmetic: the reference path
+//!   with it reproduces the golden **bit for bit**, tokens and logits (E2);
+//! * the **default** reference loop and growing backing are the static cache's arithmetic: their
+//!   logit rows equal the static cache's **bit for bit**, and their tokens are the golden's;
+//! * the **step seam on the static cache** produces the golden's greedy and sampled **tokens
+//!   exactly**, and every logit row within [`STATIC_LOGIT_TOL`] of the golden's (the un-expanded
+//!   attention GEMMs round differently in the last bits);
 //! * the **engine** (no proposer, n-gram, and a self-draft) produces the golden's greedy tokens;
 //! * the multimodal models (the Gemma 4 soft-token splice, LLaVA, StarCoder2 / StarVector with
 //!   their conditioning prefix) prefill through the seam's cache and decode through the engine.
+//!
+//! **Where "bit for bit" against a golden holds.** The goldens were measured on Windows x86_64
+//! MSVC (CPU f32; the Windows CPU and `--features cuda` lanes both reproduce them). Another
+//! platform's libm / GEMM kernels round the same graph differently in the last bits — on Linux
+//! (WSL Ubuntu, glibc) every golden token is reproduced while logits move by a few ULP — so,
+//! as `architecture_forward.rs` scopes its goldens, a golden's logits are compared bit for bit
+//! only in the measured configuration ([`goldens_bit_exact`]) and within [`STATIC_LOGIT_TOL`]
+//! elsewhere; its tokens are compared exactly everywhere. Comparisons between two paths of this
+//! tree (default growing vs static, and so on) are bit for bit on every platform.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -107,9 +121,71 @@ fn golden_path(name: &str) -> PathBuf {
         .join(format!("{name}.json"))
 }
 
-/// The committed golden for `name`, after checking that `before` (this tree's pre-migration path)
-/// still reproduces it bit-for-bit. With `SC24138_WRITE_GOLDENS=1` the golden is (re)written from
-/// `before` instead — done once, at the commit that introduced this file.
+/// Whether a golden's logits are compared bit for bit in this build: only in the configuration
+/// the goldens were measured on, Windows x86_64 MSVC (see the module docs). Elsewhere tokens stay
+/// exact and logits are held within [`STATIC_LOGIT_TOL`].
+fn goldens_bit_exact(os: &str, arch: &str, target_env: &str) -> bool {
+    matches!((os, arch, target_env), ("windows", "x86_64", "msvc"))
+}
+
+fn goldens_bit_exact_here() -> bool {
+    goldens_bit_exact(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        if cfg!(target_env = "msvc") {
+            "msvc"
+        } else {
+            "other"
+        },
+    )
+}
+
+#[test]
+fn golden_bit_exactness_is_limited_to_the_measured_configuration() {
+    assert!(goldens_bit_exact("windows", "x86_64", "msvc"));
+    for (os, arch, env) in [
+        ("windows", "x86_64", "gnu"),
+        ("windows", "aarch64", "msvc"),
+        ("linux", "x86_64", "other"),
+        ("linux", "aarch64", "other"),
+        ("macos", "aarch64", "other"),
+    ] {
+        assert!(!goldens_bit_exact(os, arch, env), "{os}/{arch}/{env}");
+    }
+}
+
+/// Logit rows against a golden's: bit for bit in the measured configuration, within
+/// [`STATIC_LOGIT_TOL`] elsewhere (see the module docs).
+fn assert_golden_rows(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
+    if goldens_bit_exact_here() {
+        assert_eq!(got, want, "{what}: the golden's logits, bit for bit");
+    } else {
+        let diff = max_abs_diff(got, want);
+        assert!(
+            diff <= STATIC_LOGIT_TOL,
+            "{what}: logits drift {diff} from the golden (off the measured configuration)"
+        );
+    }
+}
+
+/// A decode against a golden: prompt and tokens exactly, logits per [`assert_golden_rows`].
+fn assert_golden(what: &str, got: &Golden, want: &Golden) {
+    assert_eq!(got.prompt, want.prompt, "{what}: prompt");
+    assert_eq!(
+        got.greedy_tokens, want.greedy_tokens,
+        "{what}: greedy tokens"
+    );
+    assert_eq!(
+        got.sampled_tokens, want.sampled_tokens,
+        "{what}: sampled tokens"
+    );
+    assert_golden_rows(what, &got.greedy_logits, &want.greedy_logits);
+}
+
+/// The committed golden for `name`, after checking that `before` (this tree's pre-migration path,
+/// the `Expanded` arithmetic) still reproduces it — bit for bit in the measured configuration
+/// ([`assert_golden`]). With `SC24138_WRITE_GOLDENS=1` the golden is (re)written from `before`
+/// instead — done once, at the commit that introduced this file.
 fn golden(name: &str, before: Golden) -> Golden {
     let path = golden_path(name);
     if std::env::var("SC24138_WRITE_GOLDENS").is_ok_and(|v| v == "1") {
@@ -121,9 +197,10 @@ fn golden(name: &str, before: Golden) -> Golden {
     }
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let want = Golden::from_json(&serde_json::from_str(&text).unwrap());
-    assert_eq!(
-        before, want,
-        "{name}: the pre-migration path drifted from its golden"
+    assert_golden(
+        &format!("{name}: the pre-migration (expanded) path"),
+        &before,
+        &want,
     );
     want
 }
@@ -268,8 +345,19 @@ fn tiny_causal(qwen3: bool, seed: u64) -> CausalLm {
 }
 
 /// The reference (pre-migration) decode of a `CausalLm`: `generate` for the tokens, and the same
-/// greedy walk through `decode_logits` for the rows each token came from.
-fn causal_before(model: &CausalLm, prompt: &[i32]) -> Golden {
+/// greedy walk through `decode_logits` for the rows each token came from — with the pre-migration
+/// `Expanded` arithmetic selected explicitly (the default is `Gqa`), restored afterwards.
+fn causal_before(model: &mut CausalLm, prompt: &[i32]) -> Golden {
+    let selected = model.attn_formulation();
+    model.set_attn_formulation(AttnFormulation::Expanded);
+    let golden = causal_reference(model, prompt);
+    model.set_attn_formulation(selected);
+    golden
+}
+
+/// The `CausalLm` reference loop's decode in the model's selected formulation: `generate` for the
+/// tokens (greedy and sampled), the same greedy walk through `decode_logits` for the rows.
+fn causal_reference(model: &CausalLm, prompt: &[i32]) -> Golden {
     let greedy = generate(
         model,
         prompt,
@@ -320,14 +408,14 @@ const LLAMA_PROMPT: [i32; 8] = [3, 17, 5, 29, 3, 17, 5, 11];
 
 #[test]
 fn llama_reference_matches_its_pre_migration_golden() {
-    let model = tiny_causal(false, 0x0001_1A4A);
-    golden("llama", causal_before(&model, &LLAMA_PROMPT));
+    let mut model = tiny_causal(false, 0x0001_1A4A);
+    golden("llama", causal_before(&mut model, &LLAMA_PROMPT));
 }
 
 #[test]
 fn qwen3_dense_reference_matches_its_pre_migration_golden() {
-    let model = tiny_causal(true, 0x03E3);
-    golden("qwen3_dense", causal_before(&model, &LLAMA_PROMPT));
+    let mut model = tiny_causal(true, 0x03E3);
+    golden("qwen3_dense", causal_before(&mut model, &LLAMA_PROMPT));
 }
 
 // ---- Gemma 4 (the shared decoder fixture) -------------------------------------------------------
@@ -377,8 +465,8 @@ fn gemma4_prompt() -> Vec<i32> {
 
 #[test]
 fn gemma4_reference_matches_its_pre_migration_golden() {
-    let model = gemma4();
-    golden("gemma4", causal_before(&model, &gemma4_prompt()));
+    let mut model = gemma4();
+    golden("gemma4", causal_before(&mut model, &gemma4_prompt()));
 }
 
 /// The `gemma4_mm` splice, standing in for the vision/audio embedders: the prompt's embeddings
@@ -423,7 +511,17 @@ fn embeds_reference(
     tokens_of(&events)
 }
 
-fn gemma4_mm_before(model: &CausalLm, prompt: &[i32]) -> Golden {
+/// The Gemma 4 splice's pre-migration decode, with the `Expanded` arithmetic selected explicitly
+/// (restored afterwards).
+fn gemma4_mm_before(model: &mut CausalLm, prompt: &[i32]) -> Golden {
+    let selected = model.attn_formulation();
+    model.set_attn_formulation(AttnFormulation::Expanded);
+    let golden = gemma4_mm_reference(model, prompt);
+    model.set_attn_formulation(selected);
+    golden
+}
+
+fn gemma4_mm_reference(model: &CausalLm, prompt: &[i32]) -> Golden {
     let embeds = gemma4_mm_embeds(model, prompt);
     let greedy = embeds_reference(model, &embeds, prompt, &greedy_config(NEW_TOKENS));
     let mut cache = model.new_cache();
@@ -449,8 +547,8 @@ fn gemma4_mm_before(model: &CausalLm, prompt: &[i32]) -> Golden {
 
 #[test]
 fn gemma4_mm_reference_matches_its_pre_migration_golden() {
-    let model = gemma4();
-    golden("gemma4_mm", gemma4_mm_before(&model, &gemma4_prompt()));
+    let mut model = gemma4();
+    golden("gemma4_mm", gemma4_mm_before(&mut model, &gemma4_prompt()));
 }
 
 // ---- LLaVA -------------------------------------------------------------------------------------
@@ -592,7 +690,19 @@ fn llava_caption(
     out.tokens
 }
 
-fn llava_before(model: &LlavaModel) -> Golden {
+/// LLaVA's caption before the migration, with the language decoder's `Expanded` arithmetic
+/// selected explicitly through [`LlavaModel::set_attn_formulation`] (restored afterwards).
+fn llava_before(model: &mut LlavaModel) -> Golden {
+    let selected = model.language().attn_formulation();
+    model.set_attn_formulation(AttnFormulation::Expanded);
+    let golden = llava_reference(model);
+    model.set_attn_formulation(selected);
+    golden
+}
+
+/// LLaVA's caption (`LlavaModel::generate`, now through the seam on the growing backing) and the
+/// rows its greedy tokens came from, in the language decoder's selected formulation.
+fn llava_reference(model: &LlavaModel) -> Golden {
     let features = model.image_features(&llava_image(), V_IMG, V_IMG).unwrap();
     let greedy = llava_caption(model, &features, &SamplingParams::default(), 0);
     // The rows the caption loop chose from: the spliced prefill, then single-token steps.
@@ -635,8 +745,8 @@ fn llava_before(model: &LlavaModel) -> Golden {
 
 #[test]
 fn llava_caption_matches_its_pre_migration_golden() {
-    let model = tiny_llava();
-    golden("llava", llava_before(&model));
+    let mut model = tiny_llava();
+    golden("llava", llava_before(&mut model));
 }
 
 // ---- StarCoder2 (the StarVector-8B decoder) -------------------------------------------------------
@@ -725,7 +835,19 @@ fn starcoder2_reference(model: &StarCoder2, config: &GenerationConfig) -> Vec<i3
     tokens_of(&events)
 }
 
-fn starcoder2_before(model: &StarCoder2) -> Golden {
+/// StarCoder2's decode before the migration, with the `Expanded` arithmetic selected explicitly
+/// (restored afterwards).
+fn starcoder2_before(model: &mut StarCoder2) -> Golden {
+    let selected = model.attn_formulation();
+    model.set_attn_formulation(AttnFormulation::Expanded);
+    let golden = starcoder2_golden_walk(model);
+    model.set_attn_formulation(selected);
+    golden
+}
+
+/// The reference loop's greedy and sampled decode plus the greedy rows, in the model's selected
+/// formulation.
+fn starcoder2_golden_walk(model: &StarCoder2) -> Golden {
     let greedy = starcoder2_reference(model, &greedy_config(NEW_TOKENS));
     let mut cache = model.cache();
     let mut logits = model
@@ -752,8 +874,8 @@ fn starcoder2_before(model: &StarCoder2) -> Golden {
 
 #[test]
 fn starcoder2_reference_matches_its_pre_migration_golden() {
-    let model = tiny_starcoder2();
-    golden("starcoder2", starcoder2_before(&model));
+    let mut model = tiny_starcoder2();
+    golden("starcoder2", starcoder2_before(&mut model));
 }
 
 // ---- StarVector-1B (GPTBigCode, multi-query) ------------------------------------------------------
@@ -967,7 +1089,13 @@ fn causal_after(name: &str, model: &mut CausalLm, g: &Golden, gqa: bool) {
     report(name, "static", diff);
     assert!(diff <= STATIC_LOGIT_TOL, "static logits drift {diff}");
 
-    // -- the growing backing through the seam: the reference arithmetic, bit for bit --
+    // -- the growing backing through the seam, default formulation: the static cache's
+    //    arithmetic, bit for bit, and the same label --
+    assert_eq!(
+        model.attn_formulation(),
+        AttnFormulation::Gqa,
+        "un-expanded is the default"
+    );
     model.set_step_kv_cache(KvCacheKind::Growing);
     let (out, record) = generate_step(
         model,
@@ -980,9 +1108,44 @@ fn causal_after(name: &str, model: &mut CausalLm, g: &Golden, gqa: bool) {
     .unwrap();
     assert_eq!(out.tokens, g.greedy_tokens, "growing step greedy tokens");
     assert_eq!(record.kv_cache, KvCacheKind::Growing);
+    assert_eq!(
+        record.attn_formulation, formulation,
+        "the default growing cache attends like the static one"
+    );
+    let mut growing = model.new_step_cache();
+    // Built explicitly: `new_cache_for` follows the growing selection made above.
+    let mut fixed = model.new_static_cache(capacity).unwrap();
+    assert_eq!(fixed.kv_kind(), KvCacheKind::Static);
+    assert_eq!(
+        step_rows(model, &mut growing, g),
+        step_rows(model, &mut fixed, g),
+        "{name}: the default growing backing is the static cache's arithmetic, bit for bit"
+    );
+
+    // -- the growing backing with `Expanded` selected: the pre-migration arithmetic, the golden
+    //    (bit for bit in the measured configuration) --
+    model.set_attn_formulation(AttnFormulation::Expanded);
+    let (out, record) = generate_step(
+        model,
+        &g.prompt,
+        &greedy_config(NEW_TOKENS),
+        &CancelFlag::new(),
+        &mut |_| {},
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        out.tokens, g.greedy_tokens,
+        "growing expanded greedy tokens"
+    );
     assert_eq!(record.attn_formulation, AttnFormulation::Expanded);
     let mut growing = model.new_step_cache();
-    assert_eq!(step_rows(model, &mut growing, g), g.greedy_logits);
+    assert_golden_rows(
+        &format!("{name}: growing, expanded"),
+        &step_rows(model, &mut growing, g),
+        &g.greedy_logits,
+    );
+    model.set_attn_formulation(AttnFormulation::Gqa);
     model.set_step_kv_cache(KvCacheKind::Static);
 
     // -- the engine: no proposer, prompt lookup, and the model as its own draft --
@@ -1033,63 +1196,76 @@ fn causal_after(name: &str, model: &mut CausalLm, g: &Golden, gqa: bool) {
         "a draft identical to the target is always accepted"
     );
 
-    // -- the reference loop with the un-expanded formulation selected --
-    if gqa {
-        model.set_attn_formulation(AttnFormulation::Gqa);
-        let out = generate(
-            model,
-            &g.prompt,
-            &greedy_config(NEW_TOKENS),
-            &CancelFlag::new(),
-            &mut |_| {},
-        )
-        .unwrap();
-        assert_eq!(out.tokens, g.greedy_tokens, "reference loop, gqa selected");
-        // The selected reference and the static cache are the same arithmetic: bit-identical.
-        let mut fixed = model.new_cache_for(capacity, 0).unwrap();
-        let mut growing = model.new_step_cache();
-        assert_eq!(
-            step_rows(model, &mut fixed, g),
-            step_rows(model, &mut growing, g)
-        );
-        model.set_attn_formulation(AttnFormulation::Expanded);
-    }
+    // -- the default reference loop: the static cache's arithmetic --
+    // The `CausalLm` reference loop in its default formulation produces the golden's greedy and
+    // sampled tokens, and the rows it chose them from are the static cache's, bit for bit — the
+    // reference and the fast path are one arithmetic on two caches.
+    let reference = causal_reference(model, &g.prompt);
+    assert_eq!(
+        reference.greedy_tokens, g.greedy_tokens,
+        "{name}: default reference loop, greedy"
+    );
+    assert_eq!(
+        reference.sampled_tokens, g.sampled_tokens,
+        "{name}: default reference loop, sampled"
+    );
+    let mut fixed = model.new_static_cache(capacity).unwrap();
+    assert_eq!(
+        reference.greedy_logits,
+        step_rows(model, &mut fixed, g),
+        "{name}: the default reference loop is the static cache's arithmetic, bit for bit"
+    );
 }
 
 #[test]
 fn llama_decodes_to_its_golden_on_every_seam_path() {
     let mut model = tiny_causal(false, 0x0001_1A4A);
-    let g = golden("llama", causal_before(&model, &LLAMA_PROMPT));
+    let g = golden("llama", causal_before(&mut model, &LLAMA_PROMPT));
     causal_after("llama", &mut model, &g, true);
-    // The paged backing, kept behind the same seam: the reference arithmetic, bit for bit.
+    // The paged backing, kept behind the same seam: the static cache's arithmetic by default, the
+    // golden with `Expanded` selected.
     let mut paged = model.new_paged_step_cache(4);
-    assert_eq!(step_rows(&model, &mut paged, &g), g.greedy_logits);
+    let mut fixed = model.new_static_cache(g.prompt.len() + NEW_TOKENS).unwrap();
+    assert_eq!(
+        step_rows(&model, &mut paged, &g),
+        step_rows(&model, &mut fixed, &g),
+        "paged (default) = static, bit for bit"
+    );
     assert!(paged.as_paged().is_some());
+    model.set_attn_formulation(AttnFormulation::Expanded);
+    let mut paged = model.new_paged_step_cache(4);
+    assert_golden_rows(
+        "llama: paged, expanded",
+        &step_rows(&model, &mut paged, &g),
+        &g.greedy_logits,
+    );
 }
 
 #[test]
 fn qwen3_dense_decodes_to_its_golden_on_every_seam_path() {
     let mut model = tiny_causal(true, 0x03E3);
-    let g = golden("qwen3_dense", causal_before(&model, &LLAMA_PROMPT));
+    let g = golden("qwen3_dense", causal_before(&mut model, &LLAMA_PROMPT));
     causal_after("qwen3_dense", &mut model, &g, true);
 }
 
 #[test]
 fn gemma4_decodes_to_its_golden_on_every_seam_path() {
     let mut model = gemma4();
-    let g = golden("gemma4", causal_before(&model, &gemma4_prompt()));
+    let g = golden("gemma4", causal_before(&mut model, &gemma4_prompt()));
     causal_after("gemma4", &mut model, &g, false);
 }
 
 /// The Gemma 4 soft-token splice through the seam: the spliced embeddings prefill the step cache
-/// (static and growing), the continuation decodes through the engine.
+/// (static and growing), the continuation decodes through the engine. The default growing
+/// backing is the static cache's arithmetic bit for bit; with `Expanded` selected it is the golden.
 #[test]
 fn gemma4_mm_splice_decodes_to_its_golden_through_the_seam() {
-    let model = gemma4();
+    let mut model = gemma4();
     let prompt = gemma4_prompt();
-    let g = golden("gemma4_mm", gemma4_mm_before(&model, &prompt));
+    let g = golden("gemma4_mm", gemma4_mm_before(&mut model, &prompt));
     let embeds = gemma4_mm_embeds(&model, &prompt);
     let capacity = prompt.len() + NEW_TOKENS;
+    let mut static_rows = Vec::new();
     for (backing, static_cache) in [("static", true), ("growing", false)] {
         let fresh = || -> StepKvCache {
             if static_cache {
@@ -1125,18 +1301,42 @@ fn gemma4_mm_splice_decodes_to_its_golden_through_the_seam() {
             let diff = max_abs_diff(&rows, &g.greedy_logits);
             report("gemma4_mm", "static", diff);
             assert!(diff <= STATIC_LOGIT_TOL, "gemma4_mm static drift {diff}");
+            static_rows = rows;
         } else {
-            assert_eq!(rows, g.greedy_logits, "gemma4_mm growing rows");
+            assert_eq!(
+                rows, static_rows,
+                "gemma4_mm: the default growing backing is the static cache's arithmetic"
+            );
         }
     }
+    model.set_attn_formulation(AttnFormulation::Expanded);
+    let mut cache = model.new_step_cache();
+    let first = model.step_prefill_from_embeds(&embeds, &mut cache).unwrap();
+    assert_golden_rows(
+        "gemma4_mm: growing, expanded",
+        &step_walk(&model, &mut cache, first, &g.greedy_tokens),
+        &g.greedy_logits,
+    );
 }
 
 /// LLaVA's caption now decodes through the seam (its own loop is gone): the provider path on the
-/// growing backing is the golden bit for bit; the static backing gives the same tokens.
+/// growing backing with `Expanded` selected is the golden (`llava_before`); in the default
+/// formulation it gives the golden's tokens, and the static backing gives the same tokens with
+/// the default rows bit for bit.
 #[test]
 fn llava_caption_decodes_to_its_golden_through_the_seam() {
-    let model = tiny_llava();
-    let g = golden("llava", llava_before(&model));
+    let mut model = tiny_llava();
+    let g = golden("llava", llava_before(&mut model));
+    assert_eq!(model.language().attn_formulation(), AttnFormulation::Gqa);
+    let default = llava_reference(&model);
+    assert_eq!(
+        default.greedy_tokens, g.greedy_tokens,
+        "llava default greedy"
+    );
+    assert_eq!(
+        default.sampled_tokens, g.sampled_tokens,
+        "llava default sampled"
+    );
     let features = model.image_features(&llava_image(), V_IMG, V_IMG).unwrap();
     // `llava_before` ran `LlavaModel::generate` (now the seam) and held it to the golden already;
     // here the same splice on the static backing.
@@ -1176,6 +1376,13 @@ fn llava_caption_decodes_to_its_golden_through_the_seam() {
         assert_eq!(&out.tokens, want, "llava static tokens");
         assert_eq!(record.kv_cache, KvCacheKind::Static);
     }
+    let mut cache = lang.new_static_cache(expanded.len() + NEW_TOKENS).unwrap();
+    let first = lang.step_prefill_from_embeds(&spliced, &mut cache).unwrap();
+    assert_eq!(
+        step_walk(lang, &mut cache, first, &g.greedy_tokens),
+        default.greedy_logits,
+        "llava: the default caption rows are the static cache's, bit for bit"
+    );
     // A cancel that lands after the prefill is the ordinary mid-stream cancellation, as before.
     let cancel = CancelFlag::new();
     let mut cache = lang.new_step_cache();
@@ -1200,13 +1407,17 @@ fn llava_caption_decodes_to_its_golden_through_the_seam() {
 }
 
 /// StarCoder2 (StarVector-8B's decoder) through the seam: the conditioning prefix prefills the
-/// step cache, the continuation decodes through the engine — the provider's path.
+/// step cache, the continuation decodes through the engine — the provider's path. The default
+/// reference loop and growing backing are the static cache's arithmetic bit for bit; with
+/// `Expanded` selected the growing backing is the golden.
 #[test]
 fn starcoder2_decodes_to_its_golden_through_the_seam() {
-    let model = tiny_starcoder2();
-    let g = golden("starcoder2", starcoder2_before(&model));
+    let mut model = tiny_starcoder2();
+    let g = golden("starcoder2", starcoder2_before(&mut model));
+    assert_eq!(model.attn_formulation(), AttnFormulation::Gqa);
     let embeds = starcoder2_embeds(&model);
     let capacity = VISION_ROWS + SVG_PROMPT.len() + NEW_TOKENS;
+    let mut static_rows = Vec::new();
     for static_cache in [true, false] {
         let fresh = || {
             if static_cache {
@@ -1237,15 +1448,45 @@ fn starcoder2_decodes_to_its_golden_through_the_seam() {
         let mut cache = fresh();
         let first = model.step_prefill_from_embeds(&embeds, &mut cache).unwrap();
         let rows = step_walk(&model, &mut cache, first, &g.greedy_tokens);
+        assert_eq!(
+            StepModel::attn_formulation(&model, &cache),
+            AttnFormulation::Gqa,
+            "starcoder2 static={static_cache}: un-expanded by default on either backing"
+        );
         if static_cache {
             let diff = max_abs_diff(&rows, &g.greedy_logits);
             report("starcoder2", "static", diff);
             assert!(diff <= STATIC_LOGIT_TOL, "starcoder2 static drift {diff}");
-            assert_eq!(model.attn_formulation(&cache), AttnFormulation::Gqa);
+            static_rows = rows;
         } else {
-            assert_eq!(rows, g.greedy_logits, "starcoder2 growing rows");
+            assert_eq!(
+                rows, static_rows,
+                "starcoder2: the default growing backing is the static cache's arithmetic"
+            );
         }
     }
+    // The default reference loop (the `Decode` trait) is the same arithmetic.
+    let reference = starcoder2_golden_walk(&model);
+    assert_eq!(reference.greedy_tokens, g.greedy_tokens);
+    assert_eq!(reference.sampled_tokens, g.sampled_tokens);
+    assert_eq!(
+        reference.greedy_logits, static_rows,
+        "starcoder2: the default reference loop is the static cache's arithmetic, bit for bit"
+    );
+    // `Expanded` selected: the growing backing is the pre-migration arithmetic — the golden.
+    model.set_attn_formulation(AttnFormulation::Expanded);
+    let mut cache = model.new_step_cache();
+    assert_eq!(
+        StepModel::attn_formulation(&model, &cache),
+        AttnFormulation::Expanded
+    );
+    let first = model.step_prefill_from_embeds(&embeds, &mut cache).unwrap();
+    assert_golden_rows(
+        "starcoder2: growing, expanded",
+        &step_walk(&model, &mut cache, first, &g.greedy_tokens),
+        &g.greedy_logits,
+    );
+    model.set_attn_formulation(AttnFormulation::Gqa);
     assert_eq!(
         model
             .new_static_cache(capacity)
@@ -1303,10 +1544,10 @@ fn starvector_1b_decodes_to_its_golden_through_the_seam() {
         }
         let mut cache = fresh();
         let first = decoder.forward_embeds(&embeds, &mut cache).unwrap();
-        assert_eq!(
-            step_walk(&decoder, &mut cache, first, &g.greedy_tokens),
-            g.greedy_logits,
-            "starvector-1b static={static_cache} rows"
+        assert_golden_rows(
+            &format!("starvector-1b static={static_cache} rows"),
+            &step_walk(&decoder, &mut cache, first, &g.greedy_tokens),
+            &g.greedy_logits,
         );
     }
     // Past the learned positions the static cache fails closed before allocating.
