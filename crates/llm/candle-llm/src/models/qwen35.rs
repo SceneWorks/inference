@@ -4490,4 +4490,56 @@ pub(crate) mod tests {
             "past the preallocation only the recurrent state is live"
         );
     }
+
+    /// **E6, a static cache with a checkpoint ring** — the CPU twin of the real-weight AC3 memory
+    /// assertion (`tests/static_kv_parity.rs`, corrected in sc-24140's terminal run): from its
+    /// creation to its last step the cache holds exactly the KV preallocation
+    /// ([`Qwen35Model::static_kv_bytes`]) plus the per-token checkpoint ring (sc-24131) admission
+    /// prices for it ([`Qwen35Model::recurrent_state_bytes`]`(1 + max_checkpoints)`) — one ring
+    /// slot counted live, the rest as checkpoints — and neither decoding nor a rollback grows it or
+    /// moves the KV buffers.
+    #[test]
+    fn ringed_static_cache_holds_exactly_what_admission_prices() {
+        let (_cfg, model) = text_model();
+        let (capacity, max_checkpoints) = (40usize, 4usize);
+        let mut cache = model.new_static_cache(capacity, max_checkpoints).unwrap();
+        let kv_bytes = model.static_kv_bytes(capacity);
+        let one_state = model.recurrent_state_bytes(1);
+        let ring_bytes = model.recurrent_state_bytes(1 + max_checkpoints);
+        assert!(one_state > 0 && ring_bytes == 5 * one_state);
+        let preallocated = cache.memory();
+        assert_eq!(
+            cache.recurrent_bytes(),
+            ring_bytes,
+            "the rings, from creation"
+        );
+        assert_eq!(
+            preallocated.total_bytes() - cache.recurrent_bytes(),
+            kv_bytes,
+            "the KV component is exactly the static preallocation"
+        );
+        assert_eq!(preallocated.total_bytes(), kv_bytes + ring_bytes);
+        assert_eq!(
+            preallocated,
+            CacheMemory {
+                live_bytes: kv_bytes + one_state,
+                checkpoint_bytes: ring_bytes - one_state,
+            }
+        );
+        let addresses = cache.static_kv_addresses().unwrap();
+        model
+            .forward_step(&mut cache, StepRequest::last(&[1, 7, 3]))
+            .unwrap();
+        for token in [42, 5, 9, 11, 2] {
+            model
+                .forward_step(&mut cache, StepRequest::last(&[token]))
+                .unwrap();
+        }
+        assert_eq!(cache.memory(), preallocated, "nothing grew while decoding");
+        let n = *cache.checkpoint_offsets().first().unwrap();
+        cache.rollback_to(n).unwrap();
+        assert_eq!(cache.len(), n);
+        assert_eq!(cache.memory(), preallocated, "nor on a rollback");
+        assert_eq!(cache.static_kv_addresses().unwrap(), addresses);
+    }
 }

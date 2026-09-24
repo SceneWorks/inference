@@ -10,7 +10,10 @@
 //!   cuBLAS kernel-selection property and not attainable), so this parity holds by construction;
 //!   the pre-S4 `expanded` arithmetic stays selectable only as a labelled bench comparison row.
 //! * **AC3 (real weights)** — the static buffers' CUDA device pointers are unchanged across the
-//!   whole 256-token run and a rollback.
+//!   whole 256-token run and a rollback, and the cache holds exactly what admission prices from
+//!   its creation to its last step: `static_kv_bytes(capacity)` of KV plus the per-token
+//!   checkpoint ring (`recurrent_state_bytes(1 + max_checkpoints)`, sc-24131) — the ring was
+//!   missing from this assertion until sc-24140's terminal run caught it.
 //! * **sc-24140 (provider)** — the provider's default path for a request whose speculation is off
 //!   (the engine with no proposer, on the static cache) is token-identical to the reference loop
 //!   selected on the same provider, event for event over the 256-token fixture
@@ -38,7 +41,9 @@ use candle_llm::decode::{
     generate_step, generate_with, CancelFlag, DecodePath, GenerationConfig, StepModel, StepRequest,
 };
 use candle_llm::device::select_device;
-use candle_llm::primitives::{kv_materialize_count, AttnFormulation, DecodeCache, KvCacheKind};
+use candle_llm::primitives::{
+    kv_materialize_count, AttnFormulation, CacheMemory, DecodeCache, KvCacheKind,
+};
 
 const SNAPSHOT_VAR: &str = "BONSAI_QWEN38_SNAPSHOT";
 const FIXTURE_TOKENS: usize = 256;
@@ -152,15 +157,42 @@ fn ac3_static_kv_device_pointers_are_stable_across_the_fixture_and_a_rollback() 
     let prompt = common::qwen35::render_chat_prompt(&snapshot, PROMPT);
 
     let capacity = prompt.len() + FIXTURE_TOKENS;
-    let mut cache = model.new_static_cache(capacity, 4).unwrap();
+    let max_checkpoints = 4;
+    let mut cache = model.new_static_cache(capacity, max_checkpoints).unwrap();
     let addresses = cache.static_kv_addresses().unwrap();
     assert_eq!(
         addresses.len(),
         16,
         "Qwen3.8-27B has 16 full-attention layers"
     );
-    let preallocated = cache.memory().live_bytes;
-    assert_eq!(preallocated, model.static_kv_bytes(capacity));
+    // What the cache holds from its creation (E6): the static KV preallocation (sc-24132) plus
+    // every linear layer's per-token checkpoint ring (sc-24131) of `max_checkpoints + 1` recurrent
+    // states — one slot counted live, the rest as checkpoints — each priced by the function
+    // admission charges for it (`static_kv_bytes`; `recurrent_state_bytes(1 + retained)`, the
+    // provider's `memory_geometry_with_checkpoints`).
+    let kv_bytes = model.static_kv_bytes(capacity);
+    let one_state = model.recurrent_state_bytes(1);
+    let ring_bytes = model.recurrent_state_bytes(1 + max_checkpoints);
+    let preallocated = cache.memory();
+    assert_eq!(
+        cache.recurrent_bytes(),
+        ring_bytes,
+        "the rings are held from creation, at the bytes admission prices"
+    );
+    assert_eq!(
+        preallocated.total_bytes() - cache.recurrent_bytes(),
+        kv_bytes,
+        "the KV component is exactly the static preallocation"
+    );
+    assert_eq!(preallocated.total_bytes(), kv_bytes + ring_bytes);
+    assert_eq!(
+        preallocated,
+        CacheMemory {
+            live_bytes: kv_bytes + one_state,
+            checkpoint_bytes: ring_bytes - one_state,
+        },
+        "live: the KV buffers and one ring slot per linear layer; checkpoints: the other slots"
+    );
 
     let mut logits = model
         .forward_step(&mut cache, StepRequest::last(&prompt))
@@ -186,11 +218,10 @@ fn ac3_static_kv_device_pointers_are_stable_across_the_fixture_and_a_rollback() 
     }
     device.synchronize().unwrap();
     assert_eq!(cache.static_kv_addresses().unwrap(), addresses);
-    let memory = cache.memory();
     assert_eq!(
-        memory.live_bytes - preallocated,
-        cache.recurrent_bytes() - memory.checkpoint_bytes,
-        "the attention buffers never grew: past the preallocation only the live recurrent state"
+        cache.memory(),
+        preallocated,
+        "nothing grew: the KV buffers and the checkpoint rings were all held from creation"
     );
     let n = *cache.checkpoint_offsets().first().unwrap();
     cache.rollback_to(n).unwrap();
@@ -202,8 +233,9 @@ fn ac3_static_kv_device_pointers_are_stable_across_the_fixture_and_a_rollback() 
     assert_eq!(cache.static_kv_addresses().unwrap(), addresses);
     eprintln!(
         "[ac3] {} attention buffers pinned across {FIXTURE_TOKENS} steps and a rollback to {n}; \
-         preallocated {preallocated} bytes",
-        addresses.len()
+         preallocated {} bytes ({kv_bytes} KV + {ring_bytes} checkpoint ring)",
+        addresses.len(),
+        preallocated.total_bytes()
     );
 }
 

@@ -1255,27 +1255,11 @@ impl LlamaProvider {
         // the typed refusal naming the capability, never a fallback to another representation.
         let nvfp4 = nvfp4_format(spec, &device)?;
         ensure_supported_device(Path::new(&spec.source), &device)?;
-        let payload = core_llm::checkpoint_payload_bytes(Path::new(&spec.source))?;
-        let staging = core_llm::checkpoint_staging_bytes(Path::new(&spec.source))?;
-        let projector = spec
-            .projector_source
-            .as_ref()
-            .map(|p| core_llm::checkpoint_payload_bytes(Path::new(p)))
-            .transpose()?
-            .unwrap_or(0);
-        let packed = crate::gguf::is_gguf_path(&spec.source)
-            || read_json(Path::new(&spec.source), "config.json").is_some_and(|c| {
-                c.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35")
-            });
-        let (host_required, device_required) = load_memory_requirements(
-            payload,
-            staging,
-            projector,
-            packed,
-            device.is_cuda(),
-            nvfp4.is_some(),
-        )
-        .ok_or_else(|| CoreError::Load("load memory estimate overflow".into()))?;
+        let LoadMemoryEstimate {
+            host_required_bytes: host_required,
+            device_required_bytes: device_required,
+            ..
+        } = Self::load_memory_estimate(spec, device.is_cuda())?;
         let budget = core_llm::operational_memory_override()?;
         // A discrete CUDA launcher's override describes device headroom. Host staging is a separate
         // allocation domain and must be checked against host capacity rather than GPU capacity.
@@ -1312,6 +1296,47 @@ impl LlamaProvider {
         provider.load_record.requested = spec.quantize;
         provider.load_record.cuda_graphs = Some(cuda_graphs);
         Ok(provider)
+    }
+
+    /// The memory a [`load`](Self::load) of `spec` admits against before it reads a single
+    /// weight (E6): the host staging bound and, on CUDA (`cuda`), the device bound — including
+    /// the quantized projection copy a Q4 / Q8 / NVFP4 load builds on the device while the
+    /// checkpoint's source tensors are still resident
+    /// ([`LoadMemoryEstimate::quantized_copy_bytes`], sc-24140). `load` admits with exactly this
+    /// function, so a caller (or the residency evidence) reads the figure the load was admitted
+    /// against. Reads only file sizes, `config.json` and tensor names — never tensor data; an
+    /// unreadable source is [`CoreError::Load`].
+    pub fn load_memory_estimate(spec: &LoadSpec, cuda: bool) -> CoreResult<LoadMemoryEstimate> {
+        let source = Path::new(&spec.source);
+        let payload = core_llm::checkpoint_payload_bytes(source)?;
+        let staging = core_llm::checkpoint_staging_bytes(source)?;
+        let projector = spec
+            .projector_source
+            .as_ref()
+            .map(|p| core_llm::checkpoint_payload_bytes(Path::new(p)))
+            .transpose()?
+            .unwrap_or(0);
+        let config = read_json(source, "config.json");
+        let packed = crate::gguf::is_gguf_path(&spec.source)
+            || config.as_ref().is_some_and(|c| {
+                c.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35")
+            });
+        let copy = load_quantized_copy(spec, config.as_ref(), packed);
+        let overflow = || CoreError::Load("load memory estimate overflow".into());
+        let (host_required, device_required) =
+            load_memory_requirements(payload, staging, projector, packed, cuda, copy)
+                .ok_or_else(overflow)?;
+        let quantized_copy_bytes = if cuda {
+            copy.device_bytes(payload).ok_or_else(overflow)?
+        } else {
+            0
+        };
+        Ok(LoadMemoryEstimate {
+            payload_bytes: payload,
+            host_required_bytes: host_required,
+            device_required_bytes: device_required,
+            quantized_copy_bytes,
+        })
     }
 
     /// Load from an HF snapshot directory (config.json + tokenizer.json + safetensors shards).
@@ -2049,17 +2074,22 @@ impl LlamaProvider {
 /// constructed F32 tensors. Packed CPU paths keep their existing two-copy upper bound, and external
 /// projectors retain the audited four-copy conversion allowance.
 ///
-/// An NVFP4 load (sc-24135) quantizes on the device while the bf16 source tensors are still
-/// resident, so the device additionally holds the growing packed copy: 4.5 bits per 16-bit source
-/// element, i.e. `payload · 9/32`. The existing 25 percent headroom still covers the transient f32
-/// copy of the largest tensor the quantizer reads.
+/// A quantizing load quantizes on the device while the source tensors are still resident
+/// (`Weights::from_dir` holds every source tensor until the decoder is built), so the device
+/// additionally holds the growing quantized copy ([`QuantizedCopy::device_bytes`]): NVFP4
+/// (sc-24135) and GGML Q4_K at 4.5 bits per 16-bit source element (`payload · 9/32`), GGML Q8_0
+/// at 8.5 bits (`payload · 17/32`), and a Q8_0 repack of an already-packed MLX-affine 8-bit source
+/// at up to 8.5 bits per 8 source bits (`payload · 17/16`). The GGML copies were unpriced until
+/// sc-24140's terminal measurement showed a Qwen3-8B Q8 load peaking above the dense bound. The
+/// existing 25 percent headroom still covers the transient f32 copy of the largest tensor the
+/// quantizer reads.
 fn load_memory_requirements(
     payload: u64,
     staging: u64,
     projector: u64,
     packed: bool,
     cuda: bool,
-    nvfp4: bool,
+    copy: QuantizedCopy,
 ) -> Option<(u64, Option<u64>)> {
     let projector_bound = projector.checked_mul(4)?;
     let host = if cuda && !packed {
@@ -2070,21 +2100,106 @@ fn load_memory_requirements(
         payload.checked_mul(3)?.checked_add(projector_bound)?
     };
     let device = if cuda {
-        let nvfp4_packed = if nvfp4 {
-            payload.checked_mul(9)? / 32
-        } else {
-            0
-        };
         Some(
             payload
                 .checked_add(payload / 4)?
-                .checked_add(nvfp4_packed)?
+                .checked_add(copy.device_bytes(payload)?)?
                 .checked_add(projector_bound)?,
         )
     } else {
         None
     };
     Some((host, device))
+}
+
+/// What [`LlamaProvider::load`] must find free before it reads a weight (E6), per allocation
+/// domain — the figure the load admits against ([`LlamaProvider::load_memory_estimate`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoadMemoryEstimate {
+    /// The checkpoint payload: every `*.safetensors` shard of the snapshot (or the single file).
+    pub payload_bytes: u64,
+    /// Host staging the load needs (one shard on a CUDA load of a dense snapshot).
+    pub host_required_bytes: u64,
+    /// Device bytes a CUDA load needs (`None` on a host device): the resident source payload, the
+    /// 25 percent constructor headroom, the quantized copy and any external projector bound.
+    pub device_required_bytes: Option<u64>,
+    /// The part of `device_required_bytes` that is the quantized projection copy built beside the
+    /// resident source tensors (`0` for a dense or packed-GGUF load, and off CUDA).
+    pub quantized_copy_bytes: u64,
+}
+
+/// The quantized projection copy a load builds on the device while the checkpoint's source
+/// tensors are still resident — what admission adds to the payload for it (E6, sc-24140).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuantizedCopy {
+    /// No load-time quantization: the source tensors are the resident weights (a dense load, or a
+    /// GGUF / Prism checkpoint whose stored blocks the loader wraps without a second copy).
+    None,
+    /// NVFP4 from a dense source: 4.5 bits per 16-bit source element.
+    Nvfp4,
+    /// GGML Q4_K from a dense source: 4.5 bits (144 bytes per 256 elements) per 16-bit element.
+    Q4K,
+    /// GGML Q8_0 from a dense source: 8.5 bits (34 bytes per 32 elements) per 16-bit element.
+    Q8_0,
+    /// GGML Q8_0 repacked from an MLX-affine 8-bit source (`U32`-packed codes plus per-group
+    /// scale / bias sidecars, at least 8 bits per element): up to 8.5 bits per 8 source bits.
+    Q8_0FromPackedAffine,
+}
+
+impl QuantizedCopy {
+    /// Device bytes of the copy for a `payload`-byte checkpoint (`None` on overflow). Priced over
+    /// the whole payload — embeddings, norms and a dense head included — so it bounds the copy of
+    /// the projections alone.
+    fn device_bytes(self, payload: u64) -> Option<u64> {
+        let (numerator, denominator) = match self {
+            QuantizedCopy::None => return Some(0),
+            QuantizedCopy::Nvfp4 | QuantizedCopy::Q4K => (9, 32),
+            QuantizedCopy::Q8_0 => (17, 32),
+            QuantizedCopy::Q8_0FromPackedAffine => (17, 16),
+        };
+        Some(payload.checked_mul(numerator)? / denominator)
+    }
+}
+
+/// Which quantized copy a load of `spec` builds beside its source tensors: the explicit
+/// `spec.quantize`, else the snapshot's persisted `quantization` block read from `config` (top
+/// level or `text_config`, bits 4 or 8 — a prepared snapshot carries it over dense weights and
+/// the loader re-quantizes them). A `packed` GGUF / Prism checkpoint builds none. A GGML format
+/// over packed MLX-affine projections ([`packed_affine_refusal`]'s test: the block over
+/// `.scales` sidecars) is a Q8_0 repack of an ~8-bit source rather than of a 16-bit one.
+fn load_quantized_copy(spec: &LoadSpec, config: Option<&Value>, packed: bool) -> QuantizedCopy {
+    if packed {
+        return QuantizedCopy::None;
+    }
+    let bits = match spec.quantize {
+        Some(Quantize::Nvfp4) => return QuantizedCopy::Nvfp4,
+        Some(Quantize::Q8) => 8,
+        Some(Quantize::Q4) => 4,
+        None => match config.and_then(persisted_quantization_bits) {
+            Some(bits) => bits,
+            None => return QuantizedCopy::None,
+        },
+    };
+    let packed_affine =
+        config.is_some_and(|c| packed_affine_refusal(Path::new(&spec.source), c).is_some());
+    match (packed_affine, bits) {
+        (true, _) => QuantizedCopy::Q8_0FromPackedAffine,
+        (false, 8) => QuantizedCopy::Q8_0,
+        (false, _) => QuantizedCopy::Q4K,
+    }
+}
+
+/// The `bits` of a snapshot's persisted `quantization` block (top level, else `text_config`) when
+/// the loader quantizes to it (4 → Q4_K, 8 → Q8_0); any other width loads dense.
+fn persisted_quantization_bits(config: &Value) -> Option<u32> {
+    let block = config
+        .get("quantization")
+        .or_else(|| config.get("text_config")?.get("quantization"))?;
+    match block.get("bits")?.as_u64()? {
+        4 => Some(4),
+        8 => Some(8),
+        _ => None,
+    }
 }
 
 /// The process-wide override caps the execution-memory domain. On a discrete CUDA device, host
@@ -3708,10 +3823,10 @@ mod tests {
     use super::{
         bonsai_sampling_defaults, can_load, can_load_vision, cuda_usable_memory_bytes,
         emit_content, ensure_supported_device, eos_token_ids, expand_vision_placeholders,
-        host_load_budget, is_frozen_qwen38_config, load_memory_requirements,
+        host_load_budget, is_frozen_qwen38_config, load_memory_requirements, load_quantized_copy,
         merged_frame_timestamps, prompt_opens_thinking, qwen35_dense_prefix,
         substitute_vision_placeholders, validate_context_window, video_placeholder_text, JsonMask,
-        EAGER_ATTN_QUERY_CHUNK_SIZE,
+        QuantizedCopy, EAGER_ATTN_QUERY_CHUNK_SIZE,
     };
     use super::{Decode as _, Decoder};
     use crate::decode::DecodePath;
@@ -3831,7 +3946,8 @@ mod tests {
         let payload = 55_563_006_776;
         let largest_shard = 3_988_973_152;
         let (host_required, device_required) =
-            load_memory_requirements(payload, largest_shard, 0, false, true, false).unwrap();
+            load_memory_requirements(payload, largest_shard, 0, false, true, QuantizedCopy::None)
+                .unwrap();
 
         assert_eq!(host_required, largest_shard);
         assert_eq!(device_required, Some(69_453_758_470));
@@ -3885,9 +4001,23 @@ mod tests {
 
     #[test]
     fn load_memory_requirements_remain_checked() {
-        assert!(load_memory_requirements(u64::MAX, 1, 0, false, true, false).is_none());
-        assert!(load_memory_requirements(1, 1, u64::MAX, false, true, false).is_none());
-        assert!(load_memory_requirements(u64::MAX / 4, 1, 0, false, true, true).is_none());
+        assert!(
+            load_memory_requirements(u64::MAX, 1, 0, false, true, QuantizedCopy::None).is_none()
+        );
+        assert!(
+            load_memory_requirements(1, 1, u64::MAX, false, true, QuantizedCopy::None).is_none()
+        );
+        for copy in [
+            QuantizedCopy::Nvfp4,
+            QuantizedCopy::Q4K,
+            QuantizedCopy::Q8_0,
+            QuantizedCopy::Q8_0FromPackedAffine,
+        ] {
+            assert!(
+                load_memory_requirements(u64::MAX / 4, 1, 0, false, true, copy).is_none(),
+                "{copy:?}"
+            );
+        }
     }
 
     #[test]
@@ -4968,15 +5098,205 @@ mod tests {
         }
     }
 
+    /// E6 (sc-24140 terminal): a GGML load quantizes on the device while every bf16 source tensor
+    /// is still resident, exactly like NVFP4 — so the device bound carries the growing copy on top
+    /// of the payload and the headroom: Q8_0 at 8.5 of every 16 source bits, Q4_K at 4.5, and a
+    /// Q8_0 repack of an ~8-bit MLX-affine source at up to 8.5 of every 8. At R the GGML copy was
+    /// unpriced and a Qwen3-8B Q8 load peaked above its admission. The host side is unchanged.
+    #[test]
+    fn ggml_admission_prices_the_quantized_copy_beside_the_source() {
+        let payload = 16_400_000_000u64; // ~Qwen3-8B bf16
+        let bound = |copy| load_memory_requirements(payload, payload / 10, 0, false, true, copy);
+        let (host_dense, dense) = bound(QuantizedCopy::None).unwrap();
+        let dense = dense.unwrap();
+        assert_eq!(dense, payload + payload / 4);
+        for (copy, extra) in [
+            (QuantizedCopy::Q8_0, payload * 17 / 32),
+            (QuantizedCopy::Q4K, payload * 9 / 32),
+            (QuantizedCopy::Nvfp4, payload * 9 / 32),
+            (QuantizedCopy::Q8_0FromPackedAffine, payload * 17 / 16),
+        ] {
+            let (host, device) = bound(copy).unwrap();
+            assert_eq!(
+                host, host_dense,
+                "{copy:?} quantizes on the device, not the host"
+            );
+            assert_eq!(device.unwrap() - dense, extra, "{copy:?}");
+            assert_eq!(copy.device_bytes(payload), Some(extra), "{copy:?}");
+        }
+        // The packed GGUF / Prism branch builds no second copy.
+        assert_eq!(QuantizedCopy::None.device_bytes(payload), Some(0));
+    }
+
+    /// Which copy a load builds: the explicit request first, else the snapshot's persisted
+    /// `quantization` block (top level or `text_config`, bits 4 / 8 only) over dense weights, a
+    /// Q8_0 repack when the block sits over MLX-affine `.scales` sidecars, and none for a packed
+    /// GGUF / Prism checkpoint.
+    #[test]
+    fn load_quantized_copy_follows_the_request_then_the_persisted_block() {
+        use core_llm::{LoadSpec, Quantize};
+        let dir = tempfile::Builder::new()
+            .prefix("candle-quantized-copy-")
+            .tempdir()
+            .unwrap();
+        let spec = |quantize| LoadSpec {
+            quantize,
+            ..LoadSpec::dense(dir.path().display().to_string())
+        };
+        let dense = serde_json::json!({ "model_type": "llama" });
+        let copy = |quantize, config: &serde_json::Value| {
+            load_quantized_copy(&spec(quantize), Some(config), false)
+        };
+        assert_eq!(copy(None, &dense), QuantizedCopy::None);
+        assert_eq!(copy(Some(Quantize::Q8), &dense), QuantizedCopy::Q8_0);
+        assert_eq!(copy(Some(Quantize::Q4), &dense), QuantizedCopy::Q4K);
+        assert_eq!(copy(Some(Quantize::Nvfp4), &dense), QuantizedCopy::Nvfp4);
+        assert_eq!(
+            load_quantized_copy(&spec(Some(Quantize::Q8)), None, false),
+            QuantizedCopy::Q8_0,
+            "no readable config: the request alone"
+        );
+        assert_eq!(
+            load_quantized_copy(&spec(Some(Quantize::Q8)), Some(&dense), true),
+            QuantizedCopy::None,
+            "a packed GGUF / Prism checkpoint wraps its stored blocks"
+        );
+
+        // A prepared snapshot: the persisted block over dense weights (no sidecars on disk).
+        let q8 = serde_json::json!({ "model_type": "llama", "quantization": { "bits": 8 } });
+        let q4 = serde_json::json!({ "model_type": "llama", "quantization": { "bits": 4 } });
+        let nested = serde_json::json!({ "text_config": { "quantization": { "bits": 8 } } });
+        let odd = serde_json::json!({ "quantization": { "bits": 5 } });
+        assert_eq!(copy(None, &q8), QuantizedCopy::Q8_0);
+        assert_eq!(copy(None, &q4), QuantizedCopy::Q4K);
+        assert_eq!(copy(None, &nested), QuantizedCopy::Q8_0);
+        assert_eq!(copy(None, &odd), QuantizedCopy::None, "bits 5 loads dense");
+        assert_eq!(
+            copy(Some(Quantize::Q4), &q8),
+            QuantizedCopy::Q4K,
+            "the request wins"
+        );
+
+        // The block over MLX-affine sidecars: the projections are already ~8-bit packed.
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            serde_json::json!({ "weight_map": {
+                "model.layers.0.mlp.up_proj.weight": "model.safetensors",
+                "model.layers.0.mlp.up_proj.scales": "model.safetensors",
+                "model.layers.0.mlp.up_proj.biases": "model.safetensors",
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(copy(None, &q8), QuantizedCopy::Q8_0FromPackedAffine);
+        assert_eq!(
+            copy(Some(Quantize::Q8), &q8),
+            QuantizedCopy::Q8_0FromPackedAffine
+        );
+        assert_eq!(
+            copy(Some(Quantize::Q8), &dense),
+            QuantizedCopy::Q8_0,
+            "sidecar names without a block are not a packed snapshot"
+        );
+    }
+
+    /// E6 on a synthetic geometry: a bf16 llama snapshot loaded `Quantize::Q8` holds its whole
+    /// payload plus the Q8_0 copy of its projections at the load's peak, and the copy
+    /// `LlamaProvider::load_memory_estimate` — the function `load` admits with — prices bounds the
+    /// copy the loader really builds (the census's GGML bytes). Dense and NVFP4 are unchanged.
+    #[test]
+    fn q8_load_estimate_prices_the_copy_the_loader_builds() {
+        use core_llm::{LoadSpec, Quantize};
+        let (cfg, weights) = tiny_llama_parts();
+        let weights: HashMap<String, Tensor> = weights
+            .into_iter()
+            .map(|(k, t)| (k, t.to_dtype(candle_core::DType::BF16).unwrap()))
+            .collect();
+        let dir = tempfile::Builder::new()
+            .prefix("candle-q8-admission-")
+            .tempdir()
+            .unwrap();
+        std::fs::write(dir.path().join("config.json"), cfg.to_string()).unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer.json"),
+            synthetic_tokenizer_json(40),
+        )
+        .unwrap();
+        candle_core::safetensors::save(&weights, dir.path().join("model.safetensors")).unwrap();
+        let spec = |quantize| LoadSpec {
+            quantize,
+            ..LoadSpec::dense(dir.path().display().to_string())
+        };
+        let estimate =
+            |quantize| super::LlamaProvider::load_memory_estimate(&spec(quantize), true).unwrap();
+
+        let dense = estimate(None);
+        let payload = dense.payload_bytes;
+        let source_bytes: u64 = weights.values().map(|t| (t.elem_count() * 2) as u64).sum();
+        assert!(payload >= source_bytes, "the file holds every bf16 source");
+        assert_eq!(dense.device_required_bytes, Some(payload + payload / 4));
+        assert_eq!(dense.quantized_copy_bytes, 0);
+        let q8 = estimate(Some(Quantize::Q8));
+        assert_eq!(q8.payload_bytes, payload);
+        assert_eq!(q8.host_required_bytes, dense.host_required_bytes);
+        assert_eq!(q8.quantized_copy_bytes, payload * 17 / 32);
+        assert_eq!(
+            q8.device_required_bytes,
+            Some(payload + payload / 4 + payload * 17 / 32)
+        );
+        assert_eq!(
+            estimate(Some(Quantize::Nvfp4)).device_required_bytes,
+            Some(payload + payload / 4 + payload * 9 / 32),
+            "NVFP4's pricing is unchanged"
+        );
+        let off_cuda =
+            super::LlamaProvider::load_memory_estimate(&spec(Some(Quantize::Q8)), false).unwrap();
+        assert_eq!(
+            (
+                off_cuda.device_required_bytes,
+                off_cuda.quantized_copy_bytes
+            ),
+            (None, 0)
+        );
+
+        // What the loader really builds beside the resident sources.
+        let census = super::LlamaProvider::load(&spec(Some(Quantize::Q8)))
+            .expect("load the synthetic llama snapshot Q8")
+            .load_record()
+            .census
+            .expect("census");
+        let copy = census.projections.ggml.resident_bytes;
+        assert_eq!(
+            copy,
+            census.projections.ggml.params * 34 / 32,
+            "Q8_0: 8.5 bits"
+        );
+        assert!(
+            copy <= q8.quantized_copy_bytes,
+            "the priced copy {} bounds the built copy {copy}",
+            q8.quantized_copy_bytes
+        );
+        assert!(
+            source_bytes + copy <= q8.device_required_bytes.unwrap(),
+            "sources plus copy (the load's peak) fit the admitted bound"
+        );
+        assert!(
+            source_bytes + copy > dense.device_required_bytes.unwrap(),
+            "the dense-only bound — the pricing at R — does not"
+        );
+    }
+
     /// E6: an NVFP4 load prices the packed copy (4.5 of every 16 source bits) on the device on top
     /// of the resident bf16 source and the existing headroom; the host side is unchanged.
     #[test]
     fn nvfp4_admission_prices_the_packed_copy_beside_the_bf16_source() {
         let payload = 55_000_000_000u64; // ~Qwen3.8-27B bf16
         let (host_dense, dense) =
-            load_memory_requirements(payload, payload / 10, 0, false, true, false).unwrap();
+            load_memory_requirements(payload, payload / 10, 0, false, true, QuantizedCopy::None)
+                .unwrap();
         let (host_nv, nv) =
-            load_memory_requirements(payload, payload / 10, 0, false, true, true).unwrap();
+            load_memory_requirements(payload, payload / 10, 0, false, true, QuantizedCopy::Nvfp4)
+                .unwrap();
         assert_eq!(
             host_nv, host_dense,
             "NVFP4 quantizes on the device, not the host"
@@ -4985,7 +5305,7 @@ mod tests {
         assert_eq!(nv.unwrap(), payload + payload / 4 + payload * 9 / 32);
         // No device domain on CPU (NVFP4 never gets this far there, but the pricing is total).
         assert_eq!(
-            load_memory_requirements(payload, payload, 0, false, false, true)
+            load_memory_requirements(payload, payload, 0, false, false, QuantizedCopy::Nvfp4)
                 .unwrap()
                 .1,
             None
