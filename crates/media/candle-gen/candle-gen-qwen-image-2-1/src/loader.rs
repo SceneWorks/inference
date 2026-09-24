@@ -14,9 +14,9 @@
 //! Every geometry comes from the component's own `config.json`, so the miniature parity snapshot
 //! and the production snapshot go through one code path. Unlike the MLX twin — which loads dense at
 //! the on-disk dtype — candle's `VarBuilder` casts on read, so every component is materialized at
-//! ONE dtype, [`compute_dtype`]: f32 on CPU (the parity lane) and bf16 on CUDA/Metal for the DiT,
-//! the VAE **and the Qwen3-VL text encoder** (language tower + ViT), matching the released
-//! checkpoint's own dtype and how upstream runs it. Before sc-24114 the text encoder was read at
+//! ONE dtype, [`compute_dtype_on`]: f32 on a CPU device (the parity lane, on every build) and bf16
+//! on a CUDA/Metal device for the DiT, the VAE **and the Qwen3-VL text encoder** (language tower +
+//! ViT), matching the released checkpoint's own dtype and how upstream runs it. Before sc-24114 the text encoder was read at
 //! f32 on every backend, which made the tower's resident footprint 4 B/param on CUDA — ~28 GiB
 //! for a component upstream holds at ~14 GiB.
 
@@ -51,6 +51,10 @@ pub(crate) const LABEL: &str = "qwen_image_2_1";
 /// bf16 on a GPU backend (CUDA/Metal) — the text encoder included, exactly as upstream's
 /// `QwenImage21Pipeline` runs `Qwen3VLForConditionalGeneration` in `torch_dtype=bfloat16` — and f32
 /// on CPU (candle's CPU half-precision kernels are slow, and the parity lane wants f32 anyway).
+///
+/// This is the build's answer for its production device (`candle_gen::default_device`, the GPU on
+/// a GPU build) and is what the memory contract prices at. The loaders materialize at
+/// [`compute_dtype_on`], which also accounts for the device actually passed in.
 pub fn compute_dtype() -> DType {
     #[cfg(any(feature = "cuda", feature = "metal"))]
     {
@@ -59,6 +63,22 @@ pub fn compute_dtype() -> DType {
     #[cfg(not(any(feature = "cuda", feature = "metal")))]
     {
         DType::F32
+    }
+}
+
+/// The dtype every loader materializes a component at on `device`: [`compute_dtype`] on a GPU
+/// device, and f32 on a CPU device **on every build**.
+///
+/// candle's CPU backend has no bf16 matmul (`unsupported dtype BF16 for op matmul`), so a
+/// CUDA/Metal build that loads onto `Device::Cpu` must not inherit the GPU's bf16. That is exactly
+/// what the committed-snapshot parity tests do when the Windows CUDA packages lane runs them under
+/// `--features cuda`. Production always loads onto `candle_gen::default_device()`, which is the GPU
+/// on a GPU build, so it still runs at bf16.
+pub fn compute_dtype_on(device: &Device) -> DType {
+    if device.is_cpu() {
+        DType::F32
+    } else {
+        compute_dtype()
     }
 }
 
@@ -197,15 +217,15 @@ pub fn load_text_encoder_from(
     device: &Device,
     vision: Option<&VisionConfig>,
 ) -> Result<QwenImage21TextEncoder> {
-    // The tower is materialized at the backend's compute dtype like every other component:
+    // The tower is materialized at the device's compute dtype like every other component:
     // bf16 on CUDA/Metal (upstream runs the encoder in bf16, and a bf16-resident tower is what
     // the SceneWorks memory floors were derived at), f32 on the CPU parity lane (sc-24114).
-    load_text_encoder_from_at(dir, device, vision, compute_dtype())
+    load_text_encoder_from_at(dir, device, vision, compute_dtype_on(device))
 }
 
 /// [`load_text_encoder_from`] at an explicit `dtype` — the seam the tests use to hold the tower
-/// (language + ViT) to ONE materialization dtype on the CPU lane, where [`compute_dtype`] happens
-/// to be the f32 the tower used to be hard-wired to. Production goes through
+/// (language + ViT) to ONE materialization dtype on the CPU lane, where [`compute_dtype_on`] is
+/// the f32 the tower used to be hard-wired to. Production goes through
 /// [`load_text_encoder_from`] and never names a dtype.
 pub fn load_text_encoder_from_at(
     dir: &Path,
@@ -239,7 +259,13 @@ pub fn load_text_encoder(root: &Path, device: &Device) -> Result<QwenImage21Text
 /// The DiT from `<root>/transformer/`.
 pub fn load_transformer(root: &Path, device: &Device) -> Result<QwenImage21Transformer> {
     let cfg = TransformerConfig::from_json_file(&root.join("transformer").join("config.json"))?;
-    let vb = candle_gen::loader::component_vb(root, "transformer", compute_dtype(), device, LABEL)?;
+    let vb = candle_gen::loader::component_vb(
+        root,
+        "transformer",
+        compute_dtype_on(device),
+        device,
+        LABEL,
+    )?;
     QwenImage21Transformer::new(&cfg, vb)
 }
 
@@ -251,7 +277,8 @@ pub fn load_transformer(root: &Path, device: &Device) -> Result<QwenImage21Trans
 /// u32 code stream silently reinterpreted as bf16.
 pub fn load_vae(root: &Path, device: &Device) -> Result<QwenImage21Vae> {
     let cfg = VaeConfig::from_json_file(&root.join("vae").join("config.json"))?;
-    let vb = candle_gen::loader::component_vb(root, "vae", compute_dtype(), device, LABEL)?;
+    let vb =
+        candle_gen::loader::component_vb(root, "vae", compute_dtype_on(device), device, LABEL)?;
     for base in ["decoder.conv_in", "decoder.conv_out", "conv2"] {
         crate::quant::guard_dense(&vb, base)?;
     }

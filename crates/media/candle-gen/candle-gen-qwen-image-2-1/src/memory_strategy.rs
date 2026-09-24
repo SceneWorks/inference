@@ -156,9 +156,9 @@ fn component_bytes(
         })
 }
 
-/// Width `loader::compute_dtype` materializes every float component at on this build — the DiT,
-/// the VAE and the text encoder alike (sc-24114). Public so a test can hold the priced width to the
-/// loaded tower's dtype.
+/// Width `loader::compute_dtype` materializes every float component at on this build's production
+/// device (`candle_gen::default_device`) — the DiT, the VAE and the text encoder alike (sc-24114).
+/// Public so a test can hold the priced width to the loaded tower's dtype.
 pub fn compute_width() -> u64 {
     crate::loader::compute_dtype().size_in_bytes() as u64
 }
@@ -168,8 +168,9 @@ pub fn compute_width() -> u64 {
 /// * `transformer/` at [`compute_width`] — bf16 on a GPU build, f32 on the CPU parity lane;
 /// * `text_encoder/` over the **loaded** `model.language_model.*` prefix only, at
 ///   [`compute_width`] too: `loader::load_text_encoder_from` builds the tower's `VarBuilder` at
-///   `compute_dtype()`, so a CUDA/Metal build holds the tower at bf16 exactly as upstream does and
-///   as the SceneWorks floors were derived (before sc-24114 it was read at f32 on every backend and
+///   `compute_dtype_on(device)`, which is `compute_dtype()` on the production (GPU) device, so a
+///   CUDA/Metal build holds the tower at bf16 exactly as upstream does and as the SceneWorks
+///   floors were derived (before sc-24114 it was read at f32 on every backend and
 ///   priced at 4 B/param — a ~14 GiB overstatement of the resident bf16 footprint). The
 ///   checkpoint's untied `lm_head` and its whole `model.visual.*` tower are on disk but
 ///   materialized by nothing on this route, so they contribute zero rather than ~2.4 GB of weights
@@ -921,7 +922,11 @@ mod tests {
             compute_width(),
             crate::loader::compute_dtype().size_in_bytes() as u64
         );
-        let tower = crate::loader::load_text_encoder(&tiny, &candle_core::Device::Cpu).unwrap();
+        // On the production device: a GPU build prices its GPU's bf16, while a CPU device is held
+        // at f32 on every build (`loader::compute_dtype_on`; candle's CPU backend has no bf16
+        // matmul), so loading onto `Device::Cpu` here would compare the wrong pair on CUDA/Metal.
+        let device = candle_gen::default_device().unwrap();
+        let tower = crate::loader::load_text_encoder(&tiny, &device).unwrap();
         assert_eq!(
             tower.dtype().size_in_bytes() as u64,
             compute_width(),

@@ -883,7 +883,7 @@ fn an_unpublished_decode_geometry_is_refused_through_the_generator_trait() {
 /// matmul, so the bf16 kernels themselves are exercised only on a CUDA/Metal build): the tower
 /// loaded at f16 IS f16 end to end (the `VarBuilder`, every table, every traced stage, the
 /// conditioning it emits), attaches its ViT, and agrees with the f32 tower to half precision —
-/// and the production entry point resolves to `compute_dtype()`.
+/// and the production entry point resolves to `compute_dtype_on(device)`.
 ///
 /// *Mutation that reds this:* `load_text_encoder_from_at` building its `VarBuilder` at a literal
 /// `DType::F32` again (the f16 tower's dtype and conditioning come back f32).
@@ -891,7 +891,7 @@ fn an_unpublished_decode_geometry_is_refused_through_the_generator_trait() {
 fn the_text_encoder_is_materialized_at_the_compute_dtype() {
     use candle_core::IndexOp;
     use candle_core::{DType, Device};
-    use candle_gen_qwen_image_2_1::loader::{compute_dtype, load_text_encoder_from_at};
+    use candle_gen_qwen_image_2_1::loader::{compute_dtype_on, load_text_encoder_from_at};
     use candle_gen_qwen_image_2_1::{
         load_text_encoder, load_tokenizer, load_vision_config, system_prompt_drop_count,
     };
@@ -899,7 +899,7 @@ fn the_text_encoder_is_materialized_at_the_compute_dtype() {
     let root = tiny_snapshot();
     let device = Device::Cpu;
     let production = load_text_encoder(&root, &device).unwrap();
-    assert_eq!(production.dtype(), compute_dtype());
+    assert_eq!(production.dtype(), compute_dtype_on(&device));
 
     let vision = load_vision_config(&root).unwrap();
     assert!(vision.is_some(), "the tiny snapshot ships a vision tower");
@@ -957,6 +957,42 @@ fn the_text_encoder_is_materialized_at_the_compute_dtype() {
         &half_embeds.i(0).unwrap().to_dtype(DType::F32).unwrap(),
         &f32_embeds.i(0).unwrap(),
         3e-2,
+    );
+}
+
+/// **A CPU device materializes every component at f32 on every build**, a CUDA/Metal one
+/// included. candle's CPU backend has no bf16 matmul, so before this a `--features cuda` build
+/// loaded the committed-snapshot parity lane (`Device::Cpu`) at the GPU's bf16. Every parity test
+/// then failed on its first projection with `unsupported dtype BF16 for op matmul`, on the Windows
+/// CUDA packages lane only, because it is the one lane that runs these tests under `--features cuda`.
+///
+/// This holds all three loaders to the rule directly, so a regression names itself here instead of
+/// surfacing as eleven parity failures. On a CPU build the rule is also the build default, so this
+/// reds only under `--features cuda`/`metal`, which is the lane the regression lives on.
+///
+/// *Mutation that reds this (GPU build):* any of `load_text_encoder_from`, `load_transformer` or
+/// `load_vae` materializing at the build-wide `compute_dtype()` instead of
+/// `compute_dtype_on(device)`.
+#[test]
+fn a_cpu_device_materializes_every_component_at_f32_on_every_build() {
+    use candle_core::{DType, Device};
+    use candle_gen_qwen_image_2_1::loader::compute_dtype_on;
+    use candle_gen_qwen_image_2_1::{load_text_encoder, load_transformer, load_vae};
+
+    let root = tiny_snapshot();
+    let device = Device::Cpu;
+    assert_eq!(compute_dtype_on(&device), DType::F32);
+    assert_eq!(
+        load_text_encoder(&root, &device).unwrap().dtype(),
+        DType::F32
+    );
+    assert_eq!(
+        load_transformer(&root, &device).unwrap().compute_dtype(),
+        DType::F32
+    );
+    assert_eq!(
+        load_vae(&root, &device).unwrap().compute_dtype(),
+        DType::F32
     );
 }
 

@@ -474,7 +474,10 @@ than the target's own token count: `reference::prepare` fits every condition ima
   and the memory contract prices it at 2 B/param — the resident-bytes basis the SceneWorks floors
   were derived at. Until sc-24114 the tower was read at f32 on every backend and priced at
   4 B/param, which put the candle bf16 resident set at ~42.7 GiB against the 28.61 GiB the
-  derivation states. The S2/S3/S4 CPU parity lanes are unchanged: `compute_dtype()` is f32 there.
+  derivation states. The S2/S3/S4 CPU parity lanes are unchanged: the loaders materialize at
+  `loader::compute_dtype_on(device)`, which is f32 for a CPU device on every build, a CUDA/Metal
+  build included (candle's CPU backend has no bf16 matmul). Production loads onto
+  `candle_gen::default_device()`, so a GPU build still runs every component at bf16.
 * **Reference route (sc-24110).** The semantics above are the frozen upstream ones and are held to
   the *same* committed fixture (`qwen21_edit.safetensors`) as the MLX twin. The mechanical
   divergences are:
