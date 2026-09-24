@@ -1,0 +1,99 @@
+{
+  "label": "RTX Pro 6000 / sm_120",
+  "snapshot": "E:\\huggingface\\hub\\models--Qwen--Qwen3-8B\\snapshots\\b968826d9c46dd6066d109eabc6255188de91218",
+  "format": "nvfp4",
+  "new_tokens": 256,
+  "generated_tokens": 256,
+  "token_events": 255,
+  "finish": "Some(Length)",
+  "decode_record": "Some(DecodeRecord { path: StepModel, target_forwards: 256, prefill_forwards: 1, proposed_tokens: 0, accepted_tokens: 0, generated_tokens: 256, host_syncs: 256, sampler: SamplerTelemetry { path: Some(Device), device_draws: 256, host_draws: 0, logits_to_host: 0 }, kv_cache: Static, attn_formulation: Gqa, proposer: None, verify_steps: 255, direct_rollbacks: 0, replay_forwards: 0, verify_host_syncs: 255, fused_primitives: FusedTally { fused: 46336, reference: 0, reference_reason: None }, cuda_graphs: GraphTally { replayed: 0, eager: 0, captured: 0, fallback_reason: None }, nvfp4_projections: Nvfp4PathTally { gemv: 64516, cublaslt: 252, cublaslt_reason: Some(\"rows\") } })",
+  "load_secs": 6.5369322,
+  "admission": {
+    "payload_bytes": 16381516776,
+    "host_required_bytes": 3996250744,
+    "device_required_bytes": 24733950690,
+    "source_bytes": 16381516776,
+    "cast_copy_bytes": 0,
+    "quantized_copy_bytes": 4257054720,
+    "device_required_bytes_at_r": 25084197563,
+    "device_required_bytes_before_review": 25084197563
+  },
+  "census": {
+    "total_resident_bytes": 5502330880,
+    "dense": {
+      "count": 0,
+      "params": 0,
+      "resident_bytes": 0
+    },
+    "ggml": {
+      "count": 0,
+      "params": 0,
+      "resident_bytes": 0
+    },
+    "nvfp4": {
+      "count": 253,
+      "params": 7568097280,
+      "resident_bytes": 4257054720
+    },
+    "other": {
+      "count": 146,
+      "params": 622638080,
+      "resident_bytes": 1245276160
+    }
+  },
+  "samples": {
+    "before_load": {
+      "device_used_bytes": 1785266176,
+      "pool_reserved_bytes": 0,
+      "pool_used_bytes": 0,
+      "pool_reserved_peak_bytes": 0,
+      "pool_used_peak_bytes": 0
+    },
+    "after_load": {
+      "device_used_bytes": 10484252672,
+      "pool_reserved_bytes": 8690597888,
+      "pool_used_bytes": 5535885312,
+      "pool_reserved_peak_bytes": 21172846592,
+      "pool_used_peak_bytes": 20885989380
+    },
+    "load_device_peak_polled_bytes": 22966501376,
+    "after_first_decode_step": {
+      "device_used_bytes": 10614276096,
+      "pool_reserved_bytes": 8690597888,
+      "pool_used_bytes": 5582056968,
+      "pool_reserved_peak_bytes": 8690597888,
+      "pool_used_peak_bytes": 5593592536
+    },
+    "at_last_token": {
+      "index": 254,
+      "sample": {
+        "device_used_bytes": 10614276096,
+        "pool_reserved_bytes": 8690597888,
+        "pool_used_bytes": 5582056968,
+        "pool_reserved_peak_bytes": 8690597888,
+        "pool_used_peak_bytes": 5593592536
+      }
+    },
+    "after_generate": {
+      "device_used_bytes": 10614276096,
+      "pool_reserved_bytes": 8690597888,
+      "pool_used_bytes": 5535885312,
+      "pool_reserved_peak_bytes": 8690597888,
+      "pool_used_peak_bytes": 5593592536
+    },
+    "after_provider_drop": {
+      "device_used_bytes": 1915289600,
+      "pool_reserved_bytes": 0,
+      "pool_used_bytes": 0,
+      "pool_reserved_peak_bytes": 8690597888,
+      "pool_used_peak_bytes": 5593592536
+    },
+    "after_provider_drop_trimmed": {
+      "device_used_bytes": 1915289600,
+      "pool_reserved_bytes": 0,
+      "pool_used_bytes": 0,
+      "pool_reserved_peak_bytes": 8690597888,
+      "pool_used_peak_bytes": 5593592536
+    }
+  }
+}

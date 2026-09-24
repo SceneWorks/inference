@@ -64,6 +64,87 @@ fn dense_tensor(
     Ok(source.to_device(target)?.to_dtype(dtype)?)
 }
 
+/// Whether a [`CausalLm`] load stores the decoder-layer tensor `suffix` (its key after
+/// `{decoder_root}.layers.{i}.`, see [`split_layer_key`](super::split_layer_key)) in a requested
+/// projection format rather than dense: the attention projections (q/k/v/o, Phi-3's fused
+/// `qkv_proj`, MLA's low-rank q/kv), the MLP projections (and Phi-3's fused `gate_up_proj`) and
+/// every MoE expert / shared-expert projection. Norms, MoE routers and the shared-expert gate stay
+/// dense; the LM head is a projection only under NVFP4 (see `from_weights_format`).
+///
+/// This is the rule load admission prices the quantized copy by (sc-24140). Every loader site
+/// that quantizes a layer tensor debug-asserts it, so the pricing and the loader cannot drift
+/// apart unnoticed.
+pub(crate) fn quantizes_layer_tensor(suffix: &str) -> bool {
+    const PROJECTIONS: [&str; 19] = [
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "self_attn.o_proj.weight",
+        "self_attn.qkv_proj.weight",
+        "self_attn.q_a_proj.weight",
+        "self_attn.q_b_proj.weight",
+        "self_attn.kv_a_proj_with_mqa.weight",
+        "self_attn.kv_b_proj.weight",
+        "mlp.gate_proj.weight",
+        "mlp.up_proj.weight",
+        "mlp.down_proj.weight",
+        "mlp.gate_up_proj.weight",
+        "mlp.shared_expert.gate_proj.weight",
+        "mlp.shared_expert.up_proj.weight",
+        "mlp.shared_expert.down_proj.weight",
+        "mlp.shared_experts.gate_proj.weight",
+        "mlp.shared_experts.up_proj.weight",
+        "mlp.shared_experts.down_proj.weight",
+    ];
+    if PROJECTIONS.contains(&suffix) {
+        return true;
+    }
+    // `mlp.experts.{e}.{gate,up,down}_proj.weight`
+    suffix
+        .strip_prefix("mlp.experts.")
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(expert, projection)| {
+            expert.parse::<usize>().is_ok()
+                && matches!(
+                    projection,
+                    "gate_proj.weight" | "up_proj.weight" | "down_proj.weight"
+                )
+        })
+}
+
+/// The debug half of [`quantizes_layer_tensor`]'s contract: a layer tensor the loader stores in a
+/// requested `format` must be one admission priced.
+fn debug_assert_priced(key: &str, format: Option<&ProjectionFormat>) {
+    debug_assert!(
+        format.is_none()
+            || super::split_layer_key(key)
+                .is_some_and(|(_, _, suffix)| quantizes_layer_tensor(suffix)),
+        "`{key}` is quantized on load but `quantizes_layer_tensor` does not price it"
+    );
+}
+
+/// Whether the checkpoint nests the decoder under `model.language_model` (the Qwen3-VL wrapper,
+/// and a wrapped Gemma 4, probed by `has_key`) rather than `[{prefix}.]model`.
+fn vlm_nested(cfg: &ModelConfig, has_key: impl Fn(&str) -> bool) -> bool {
+    cfg.architecture.is_qwen3_vl()
+        || (cfg.architecture.is_gemma4() && has_key("model.language_model.embed_tokens.weight"))
+}
+
+/// The root the decoder's keys hang off (`{root}.embed_tokens.weight`, `{root}.layers.{i}.…`) —
+/// `model.language_model` for a wrapped VLM, `[{prefix}.]model` otherwise. Shared by the loader
+/// and load admission (sc-24140).
+pub(crate) fn decoder_root(
+    cfg: &ModelConfig,
+    prefix: &str,
+    has_key: impl Fn(&str) -> bool,
+) -> String {
+    if vlm_nested(cfg, has_key) {
+        "model.language_model".to_string()
+    } else {
+        join(prefix, "model")
+    }
+}
+
 fn projection_from_weights(
     w: &Weights,
     wkey: &str,
@@ -72,6 +153,7 @@ fn projection_from_weights(
     format: Option<&ProjectionFormat>,
     target_device: Option<&Device>,
 ) -> Result<Projection> {
+    debug_assert_priced(wkey, format);
     let stem = wkey.strip_suffix(".weight").unwrap_or(wkey);
     let scales_key = format!("{stem}.scales");
     let source = w.require(wkey)?;
@@ -270,14 +352,8 @@ impl CausalLm {
         // packed encoder, whose weights are re-rooted on unpack) keeps the plain `model.*` layout.
         // Probe rather than guess: the nesting is a checkpoint fact, not a config one, and picking
         // the wrong stem fails on the very first weight lookup with a key the caller never wrote.
-        let vlm_nested = cfg.architecture.is_qwen3_vl()
-            || (cfg.architecture.is_gemma4()
-                && w.contains("model.language_model.embed_tokens.weight"));
-        let decoder_root = if vlm_nested {
-            "model.language_model".to_string()
-        } else {
-            join(prefix, "model")
-        };
+        let vlm_nested = vlm_nested(&cfg, |key| w.contains(key));
+        let decoder_root = decoder_root(&cfg, prefix, |key| w.contains(key));
         let p = |suffix: &str| join(&decoder_root, suffix);
         let req = |key: String| -> Result<Tensor> { dense_tensor(w, &key, dtype, target_device) };
         let proj = |key: String| -> Result<Projection> {
@@ -387,6 +463,7 @@ impl CausalLm {
                 let (q, kv) = {
                     let packed = lp("self_attn.qkv_proj.weight");
                     if w.contains(&packed) {
+                        debug_assert_priced(&packed, format);
                         let stem = packed.strip_suffix(".weight").unwrap_or(&packed);
                         if w.contains(&format!("{stem}.scales")) {
                             return Err(Error::Config(format!(
@@ -502,6 +579,7 @@ impl CausalLm {
                 let (gate, up) = {
                     let packed = lp("mlp.gate_up_proj.weight");
                     if w.contains(&packed) {
+                        debug_assert_priced(&packed, format);
                         let stem = packed.strip_suffix(".weight").unwrap_or(&packed);
                         if w.contains(&format!("{stem}.scales")) {
                             return Err(Error::Config(format!(
@@ -2795,6 +2873,125 @@ mod tests {
             }
             Err(other) => panic!("expected the typed refusal, got {other}"),
             Ok(_) => panic!("an MLX affine triple loaded under NVFP4"),
+        }
+    }
+
+    /// A tiny `Phi3ForCausalLM` (fused `qkv_proj` / `gate_up_proj`) 256 wide, so Q4_K can quantize
+    /// every projection, with f32 weights on the host.
+    fn tiny_phi3() -> (Weights, ModelConfig) {
+        const HIDDEN: usize = 256;
+        const INTER: usize = 256;
+        const HEADS: usize = 4;
+        const KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 64;
+        const VOCAB: usize = 48;
+        let cfg = serde_json::json!({
+            "architectures": ["Phi3ForCausalLM"], "model_type": "phi3",
+            "hidden_size": HIDDEN, "intermediate_size": INTER, "num_hidden_layers": 2,
+            "num_attention_heads": HEADS, "num_key_value_heads": KV_HEADS, "vocab_size": VOCAB,
+            "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "max_position_embeddings": 128,
+            "tie_word_embeddings": false
+        });
+        let mut rng = crate::primitives::SplitMix64::new(0x9_4133);
+        let mut rand = |dims: &[usize]| -> Tensor {
+            use crate::primitives::TokenRng;
+            let n: usize = dims.iter().product();
+            let data: Vec<f32> = (0..n).map(|_| rng.next_f32() - 0.5).collect();
+            Tensor::from_vec(data, dims, &Device::Cpu).unwrap()
+        };
+        let (qd, kvd) = (HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM);
+        let mut w = std::collections::HashMap::new();
+        w.insert("model.embed_tokens.weight".into(), rand(&[VOCAB, HIDDEN]));
+        w.insert(
+            "model.norm.weight".into(),
+            Tensor::ones(HIDDEN, DType::F32, &Device::Cpu).unwrap(),
+        );
+        w.insert("lm_head.weight".into(), rand(&[VOCAB, HIDDEN]));
+        for i in 0..2 {
+            let p = |s: &str| format!("model.layers.{i}.{s}");
+            for key in ["input_layernorm.weight", "post_attention_layernorm.weight"] {
+                w.insert(
+                    p(key),
+                    Tensor::ones(HIDDEN, DType::F32, &Device::Cpu).unwrap(),
+                );
+            }
+            w.insert(
+                p("self_attn.qkv_proj.weight"),
+                rand(&[qd + 2 * kvd, HIDDEN]),
+            );
+            w.insert(p("self_attn.o_proj.weight"), rand(&[HIDDEN, qd]));
+            w.insert(p("mlp.gate_up_proj.weight"), rand(&[2 * INTER, HIDDEN]));
+            w.insert(p("mlp.down_proj.weight"), rand(&[HIDDEN, INTER]));
+        }
+        (
+            Weights::from_map(w, Device::Cpu),
+            ModelConfig::from_json(&cfg).unwrap(),
+        )
+    }
+
+    /// sc-24140 review: Phi-3's fused `qkv_proj` / `gate_up_proj` are split into narrowed views
+    /// before they are quantized, and on a host device (f32 compute) those views reach the GGML
+    /// quantizer as they are. Candle's quantizer reads a source's storage from its start, so each
+    /// part must be compacted first or k / v / up would be quantized from q's / gate's rows (a
+    /// size-check panic in a debug build, silently wrong weights in a release one). Every part's
+    /// Q8_0 and Q4_K projection tracks its dense twin on the same input.
+    #[test]
+    fn ggml_quantizes_each_fused_part_from_its_own_rows() {
+        let (w, cfg) = tiny_phi3();
+        let dense = CausalLm::from_weights_format(&w, "", cfg.clone(), None).unwrap();
+        let x = {
+            let data: Vec<f32> = (0..3 * 256)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0)
+                .collect();
+            Tensor::from_vec(data, (3, 256), &Device::Cpu).unwrap()
+        };
+        let parts = |m: &CausalLm| -> Vec<Tensor> {
+            let mut out = Vec::new();
+            for layer in &m.layers {
+                let Attention::Gqa(a) = &layer.attn else {
+                    panic!("GQA")
+                };
+                let kv = a.kv.as_ref().unwrap();
+                let Ffn::Dense(mlp) = &layer.ffn else {
+                    panic!("dense MLP")
+                };
+                for p in [&a.q, kv.key(), kv.value().unwrap(), &mlp.gate, &mlp.up] {
+                    out.push(p.forward(&x).unwrap());
+                }
+            }
+            out
+        };
+        let want = parts(&dense);
+        for (quant, tolerance) in [(QuantSpec::q8(), 0.02f32), (QuantSpec::q4(), 0.1)] {
+            let format = ProjectionFormat::from(quant);
+            let model = CausalLm::from_weights_format(&w, "", cfg.clone(), Some(&format)).unwrap();
+            assert_eq!(model.weight_census().projections.ggml.count, 2 * 7);
+            for (i, (got, want)) in parts(&model).iter().zip(&want).enumerate() {
+                let err = (got - want)
+                    .unwrap()
+                    .sqr()
+                    .unwrap()
+                    .sum_all()
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap()
+                    .sqrt();
+                let norm = want
+                    .sqr()
+                    .unwrap()
+                    .sum_all()
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap()
+                    .sqrt();
+                assert!(
+                    err / norm < tolerance,
+                    "{quant:?} part {i} (layer {}, {}): relative error {}",
+                    i / 5,
+                    ["q", "k", "v", "gate", "up"][i % 5],
+                    err / norm
+                );
+            }
         }
     }
 

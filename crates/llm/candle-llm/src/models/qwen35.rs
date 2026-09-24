@@ -39,6 +39,48 @@ use crate::primitives::projection::{Projection, ProjectionFormat, QuantSpec, Wei
 use crate::primitives::rope::{rms_norm_rope, Rope};
 use crate::primitives::{KvCache, PrismRegistry, Weights};
 
+/// Whether a dense [`Qwen35Model`] / [`Qwen35Mtp`] load stores the checkpoint tensor `key` in a
+/// requested projection format rather than dense: in every decoder (and MTP) layer the Gated
+/// DeltaNet in/out projections (`in_proj_qkv`, `in_proj_z`, `out_proj`), the attention q/k/v/o,
+/// the dense MLP, the stacked MoE experts and the shared expert; and the MTP `fc`. The per-head
+/// `in_proj_a` / `in_proj_b`, the conv, `A_log` / `dt_bias`, the norms, the MoE router and
+/// shared-expert gate, and the embeddings stay dense. The LM head is quantized under every
+/// format — a tied head from a copy of the embedding — and is not a keyed rule here.
+///
+/// The rule load admission prices the quantized copy by (sc-24140); every loader site that
+/// quantizes a keyed tensor debug-asserts it.
+pub(crate) fn quantizes_tensor(key: &str) -> bool {
+    const LAYER_PROJECTIONS: [&str; 15] = [
+        "linear_attn.in_proj_qkv.weight",
+        "linear_attn.in_proj_z.weight",
+        "linear_attn.out_proj.weight",
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "self_attn.o_proj.weight",
+        "mlp.gate_proj.weight",
+        "mlp.up_proj.weight",
+        "mlp.down_proj.weight",
+        "mlp.experts.gate_up_proj",
+        "mlp.experts.down_proj",
+        "mlp.shared_expert.gate_proj.weight",
+        "mlp.shared_expert.up_proj.weight",
+        "mlp.shared_expert.down_proj.weight",
+    ];
+    key == "mtp.fc.weight"
+        || super::split_layer_key(key)
+            .is_some_and(|(_, _, suffix)| LAYER_PROJECTIONS.contains(&suffix))
+}
+
+/// The debug half of [`quantizes_tensor`]'s contract: a keyed tensor the loader stores in a
+/// requested `format` must be one admission priced.
+fn debug_assert_priced(key: &str, format: Option<&ProjectionFormat>) {
+    debug_assert!(
+        format.is_none() || quantizes_tensor(key),
+        "`{key}` is quantized on load but `quantizes_tensor` does not price it"
+    );
+}
+
 fn checkpoint_norm_weight(weight: Tensor, prism: bool) -> Result<Tensor> {
     if prism {
         Ok(weight)
@@ -1282,8 +1324,10 @@ impl Qwen35Mtp {
         let req = |key: &str| -> Result<Tensor> { Ok(w.require(key)?.to_dtype(dtype)?) };
         // Qwen3.5/Qwen3.8 RMSNorm parameters are zero-centered (`1 + weight`).
         let norm_w = |key: &str| -> Result<Tensor> { Ok(req(key)?.affine(1.0, 1.0)?) };
-        let proj_q =
-            |key: &str| -> Result<Projection> { Projection::load_as(req(key)?, None, format) };
+        let proj_q = |key: &str| -> Result<Projection> {
+            debug_assert_priced(key, format);
+            Projection::load_as(req(key)?, None, format)
+        };
         let groups = (cfg.num_heads / cfg.num_kv_heads) as usize;
         let mut layers = Vec::with_capacity(cfg.mtp_num_hidden_layers);
         for i in 0..cfg.mtp_num_hidden_layers {
@@ -2215,7 +2259,10 @@ impl Qwen35Model {
         let proj_q = |key: String| -> Result<Projection> {
             match prism.and_then(|registry| registry.get(&key)) {
                 Some(weight) => Ok(Projection::load_prism(weight.clone())),
-                None => Projection::load_as(req(key)?, None, format),
+                None => {
+                    debug_assert_priced(&key, format);
+                    Projection::load_as(req(key)?, None, format)
+                }
             }
         };
         let proj_dense = |key: String| -> Result<Projection> {
@@ -2314,6 +2361,8 @@ impl Qwen35Model {
                 // [E, hidden, moe_inter].
                 Some(moe) => {
                     let mi = moe.moe_intermediate_size as usize;
+                    debug_assert_priced(&lp("mlp.experts.gate_up_proj"), format);
+                    debug_assert_priced(&lp("mlp.experts.down_proj"), format);
                     let gate_up = req(lp("mlp.experts.gate_up_proj"))?;
                     let down = req(lp("mlp.experts.down_proj"))?;
                     let mut experts = Vec::with_capacity(moe.num_experts as usize);
@@ -3116,6 +3165,78 @@ pub(crate) mod tests {
         );
     }
 
+    /// sc-24140 review: the qwen3_5 loader quantizes every MoE expert from a view narrowed out of
+    /// the stacked `gate_up_proj` / `down_proj`, and on a host device (f32 compute) those views
+    /// reach the GGML quantizer as they are. Candle's quantizer reads a source's storage from its
+    /// start, so each slice must be compacted first — else every expert would be quantized from
+    /// the first expert's rows (a size-check panic in a debug build, silently wrong experts in a
+    /// release one). Each expert's Q8_0 gate / up / down tracks its dense twin, and so do the
+    /// model's logits.
+    #[test]
+    fn q8_moe_experts_quantize_from_their_own_slices() {
+        let mut json = cfg_json_moe();
+        let text = json["text_config"].as_object_mut().unwrap();
+        // Every projection 32 or 64 wide, so Q8_0 (32-element blocks) quantizes all of them.
+        text.insert("moe_intermediate_size".into(), json!(32));
+        text.insert("shared_expert_intermediate_size".into(), json!(32));
+        text.insert("linear_value_head_dim".into(), json!(8));
+        let cfg = Qwen35Config::from_json(&json).unwrap();
+        let weights = synthetic_weights(&cfg);
+        let prefix = "model.language_model";
+        let dense = Qwen35Model::from_weights_format(&weights, prefix, cfg.clone(), None).unwrap();
+        let q8 = ProjectionFormat::from(QuantSpec::q8());
+        let quant = Qwen35Model::from_weights_format(&weights, prefix, cfg, Some(&q8)).unwrap();
+
+        let x = Tensor::from_vec(
+            (0..2 * 32)
+                .map(|i| ((i * 29 % 67) as f32 - 33.0) / 33.0)
+                .collect::<Vec<f32>>(),
+            (2, 32),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let rel = |got: &Tensor, want: &Tensor| -> f32 {
+            let norm = |t: &Tensor| {
+                t.sqr()
+                    .unwrap()
+                    .sum_all()
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap()
+            };
+            (norm(&(got - want).unwrap()) / norm(want)).sqrt()
+        };
+        let mut experts = 0;
+        for (d, q) in dense.layers.iter().zip(&quant.layers) {
+            let (Ffn::Moe(d), Ffn::Moe(q)) = (&d.ffn, &q.ffn) else {
+                panic!("an MoE layer")
+            };
+            for (e, (de, qe)) in d.experts.iter().zip(&q.experts).enumerate() {
+                assert_eq!(qe.gate.kind(), crate::primitives::ProjectionKind::Ggml);
+                let hidden = de.gate.forward(&x).unwrap();
+                for (name, dp, qp, input) in [
+                    ("gate", &de.gate, &qe.gate, &x),
+                    ("up", &de.up, &qe.up, &x),
+                    ("down", &de.down, &qe.down, &hidden),
+                ] {
+                    let err = rel(&qp.forward(input).unwrap(), &dp.forward(input).unwrap());
+                    assert!(err < 0.02, "expert {e} {name}: relative error {err}");
+                }
+                experts += 1;
+            }
+        }
+        assert_eq!(experts, 4 * 6);
+
+        let prompt = ids(&[1, 7, 3, 42, 9]);
+        let logits =
+            |m: &Qwen35Model| host(&m.decode_logits(&prompt, &mut m.new_cache(), 0).unwrap());
+        let (want, got) = (logits(&dense), logits(&quant));
+        let dot: f32 = want.iter().zip(&got).map(|(a, b)| a * b).sum();
+        let norm = |v: &[f32]| v.iter().map(|a| a * a).sum::<f32>().sqrt();
+        let cosine = dot / (norm(&want) * norm(&got));
+        assert!(cosine > 0.999, "Q8 logits vs dense: cosine {cosine}");
+    }
+
     #[test]
     fn moe_model_forward_and_prefill_equals_stepwise() {
         let cfg = Qwen35Config::from_json(&cfg_json_moe()).unwrap();
@@ -3216,6 +3337,17 @@ pub(crate) mod tests {
         )
         .unwrap();
         (cfg, model)
+    }
+
+    /// The synthetic decoder's config JSON (4 layers: 3 linear, 1 full attention).
+    pub(crate) fn synthetic_cfg_json() -> Value {
+        cfg_json()
+    }
+
+    /// Seeded weights for any synthetic `cfg` (decoder under `model.language_model`, plus the MTP
+    /// head when `cfg.mtp_num_hidden_layers == 1`, the MoE bank when `cfg.moe` is set).
+    pub(crate) fn synthetic_snapshot_weights(cfg: &Qwen35Config) -> Weights {
+        synthetic_weights(cfg)
     }
 
     /// The parts a test needs to write the synthetic decoder as a snapshot directory: its config,
@@ -4489,5 +4621,57 @@ pub(crate) mod tests {
             cache.recurrent_bytes(),
             "past the preallocation only the recurrent state is live"
         );
+    }
+
+    /// **E6, a static cache with a checkpoint ring** — the CPU twin of the real-weight AC3 memory
+    /// assertion (`tests/static_kv_parity.rs`, corrected in sc-24140's terminal run): from its
+    /// creation to its last step the cache holds exactly the KV preallocation
+    /// ([`Qwen35Model::static_kv_bytes`]) plus the per-token checkpoint ring (sc-24131) admission
+    /// prices for it ([`Qwen35Model::recurrent_state_bytes`]`(1 + max_checkpoints)`) — one ring
+    /// slot counted live, the rest as checkpoints — and neither decoding nor a rollback grows it or
+    /// moves the KV buffers.
+    #[test]
+    fn ringed_static_cache_holds_exactly_what_admission_prices() {
+        let (_cfg, model) = text_model();
+        let (capacity, max_checkpoints) = (40usize, 4usize);
+        let mut cache = model.new_static_cache(capacity, max_checkpoints).unwrap();
+        let kv_bytes = model.static_kv_bytes(capacity);
+        let one_state = model.recurrent_state_bytes(1);
+        let ring_bytes = model.recurrent_state_bytes(1 + max_checkpoints);
+        assert!(one_state > 0 && ring_bytes == 5 * one_state);
+        let preallocated = cache.memory();
+        assert_eq!(
+            cache.recurrent_bytes(),
+            ring_bytes,
+            "the rings, from creation"
+        );
+        assert_eq!(
+            preallocated.total_bytes() - cache.recurrent_bytes(),
+            kv_bytes,
+            "the KV component is exactly the static preallocation"
+        );
+        assert_eq!(preallocated.total_bytes(), kv_bytes + ring_bytes);
+        assert_eq!(
+            preallocated,
+            CacheMemory {
+                live_bytes: kv_bytes + one_state,
+                checkpoint_bytes: ring_bytes - one_state,
+            }
+        );
+        let addresses = cache.static_kv_addresses().unwrap();
+        model
+            .forward_step(&mut cache, StepRequest::last(&[1, 7, 3]))
+            .unwrap();
+        for token in [42, 5, 9, 11, 2] {
+            model
+                .forward_step(&mut cache, StepRequest::last(&[token]))
+                .unwrap();
+        }
+        assert_eq!(cache.memory(), preallocated, "nothing grew while decoding");
+        let n = *cache.checkpoint_offsets().first().unwrap();
+        cache.rollback_to(n).unwrap();
+        assert_eq!(cache.len(), n);
+        assert_eq!(cache.memory(), preallocated, "nor on a rollback");
+        assert_eq!(cache.static_kv_addresses().unwrap(), addresses);
     }
 }

@@ -596,7 +596,10 @@ mod tests {
         let view = full.narrow(0, 32, 32)?;
         assert!(view.is_contiguous() && view.layout().start_offset() != 0);
         let from_view = Nvfp4Weight::quantize(&view, None, &ctx)?.to_host()?;
-        let from_copy = Nvfp4Weight::quantize(&view.copy()?, None, &ctx)?.to_host()?;
+        // A compact tensor of the view's own rows (`copy` keeps the view's storage and offset).
+        let compact = view.force_contiguous()?;
+        assert_eq!(compact.layout().start_offset(), 0);
+        let from_copy = Nvfp4Weight::quantize(&compact, None, &ctx)?.to_host()?;
         assert_eq!(from_view.packed, from_copy.packed);
         assert_eq!(from_view.scales, from_copy.scales);
         Ok(())
