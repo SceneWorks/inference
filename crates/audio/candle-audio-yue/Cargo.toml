@@ -20,8 +20,15 @@ candle-audio = { path = "../candle-audio" }
 candle-llm = { workspace = true }
 # candle-nn at the workspace's pinned candle revision (the xcodec / Vocos convnets).
 candle-nn = { workspace = true }
+# The mm tokenizer (sc-19376): `tokenizer.json` in every stage-1 tier dir is the byte-fallback BPE
+# derived from the upstream SentencePiece `tokenizer.model`, with the mm special tokens at their ids.
+tokenizers = { workspace = true }
+# The lyric section split: Python's `\w` is the Unicode `[\p{L}\p{N}_]` class.
+regex = { workspace = true }
 
 [dev-dependencies]
+# Reads the committed prompt-builder golden (tests/fixtures/yue_prompt_reference.json).
+serde_json = { workspace = true }
 # The backend-neutral generator conformance suite (progress contract, typed cancellation, seed
 # determinism, component load gate) the end-to-end seam test runs against the engine.
 sceneworks-gen-core-testkit = { workspace = true }
