@@ -36,6 +36,85 @@ pub(crate) fn mlx_affine_q8_in_dim(
     .then_some(in_dim)
 }
 
+/// The GGML block types a prepared snapshot persists (sc-19375). Their block byte sizes are
+/// pairwise distinct — Q4_0 18 B / 32 weights, Q8_0 34 B / 32, Q4_K 144 B / 256 — which is what
+/// makes a stored block tensor self-describing.
+const STORED_GGML: [GgmlDType; 3] = [GgmlDType::Q4_0, GgmlDType::Q8_0, GgmlDType::Q4K];
+
+/// The GGML block type and logical `(rows, cols)` of a **stored GGML block tensor** — a prepared
+/// Q4 / Q8 snapshot's on-disk projection form (sc-19375): a `U8` tensor `[rows, blocks_per_row,
+/// block_bytes]` holding the raw GGML blocks of a `[rows, cols]` weight, row-major (GGML blocks run
+/// along the input dimension, so each row is `blocks_per_row` whole blocks). The block type is the
+/// one of [`STORED_GGML`] whose block size is `block_bytes`. `None` for any other tensor. The
+/// loader, load admission and the NVFP4 gate classify a tensor by this one rule, from its dtype
+/// and shape alone.
+pub(crate) fn ggml_block_storage(
+    is_u8: bool,
+    shape: &[usize],
+) -> Option<(GgmlDType, usize, usize)> {
+    let &[rows, blocks, block_bytes] = shape else {
+        return None;
+    };
+    if !is_u8 {
+        return None;
+    }
+    let dtype = STORED_GGML
+        .into_iter()
+        .find(|d| d.type_size() == block_bytes)?;
+    Some((dtype, rows, blocks.checked_mul(dtype.block_size())?))
+}
+
+/// Serialize a 2-D [`QTensor`] of a persisted block type (Q4_0 / Q8_0 / Q4_K) into its stored
+/// GGML block tensor on the CPU: a `U8` `[rows, blocks_per_row, block_bytes]` tensor of the raw
+/// GGML blocks, row-major, which [`from_ggml_block_tensor`] reads back.
+pub fn to_ggml_block_tensor(qt: &QTensor) -> Result<Tensor> {
+    let dtype = qt.dtype();
+    let (rows, cols) = qt.shape().dims2()?;
+    if !STORED_GGML.contains(&dtype) || !cols.is_multiple_of(dtype.block_size()) {
+        return Err(crate::error::Error::Unsupported(format!(
+            "ggml block storage: cannot persist a {dtype:?} [{rows}, {cols}] tensor"
+        )));
+    }
+    let bytes = qt.data()?.into_owned();
+    let blocks = cols / dtype.block_size();
+    Ok(Tensor::from_vec(
+        bytes,
+        (rows, blocks, dtype.type_size()),
+        &Device::Cpu,
+    )?)
+}
+
+/// Rebuild the [`QTensor`] a stored GGML block tensor holds, directly on `device`: the blocks are
+/// used exactly as stored — never dequantized and re-quantized.
+pub fn from_ggml_block_tensor(stored: &Tensor, device: &Device) -> Result<QTensor> {
+    let Some((dtype, rows, cols)) = ggml_block_storage(stored.dtype() == DType::U8, stored.dims())
+    else {
+        return Err(crate::error::Error::Config(format!(
+            "ggml block storage: {:?} {:?} is not a stored GGML block tensor",
+            stored.dtype(),
+            stored.shape()
+        )));
+    };
+    let bytes = stored
+        .to_device(&Device::Cpu)?
+        .flatten_all()?
+        .to_vec1::<u8>()?;
+    // candle reinterprets the byte slice as a block slice (2-byte aligned `f16` fields), so hand
+    // it u64-backed storage rather than rely on the byte vector's allocation alignment.
+    let mut words = vec![0u64; bytes.len().div_ceil(8)];
+    // SAFETY: `words` owns `words.len() * 8 >= bytes.len()` initialized bytes, and u8 has no
+    // alignment requirement; the byte view does not outlive `words`.
+    let aligned =
+        unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), bytes.len()) };
+    aligned.copy_from_slice(&bytes);
+    Ok(candle_core::quantized::ggml_file::qtensor_from_ggml(
+        dtype,
+        aligned,
+        vec![rows, cols],
+        device,
+    )?)
+}
+
 /// A linear projection whose weight is stored GGML block-quantized.
 pub struct QuantizedLinear {
     inner: QuantizedWeight,

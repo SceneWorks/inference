@@ -1008,17 +1008,25 @@ pub(crate) fn nvfp4_model_gate(spec: &LoadSpec) -> CoreResult<()> {
 /// [`nvfp4_model_gate`], sc-24140 feature-end review). Packed means both: a `quantization` block
 /// in `config.json` (top level or `text_config`, where [`ModelConfig`] reads it) **and** a
 /// `<stem>.weight` whose `<stem>.scales` sidecar the snapshot names. A prepared Q4/Q8 snapshot
-/// ([`crate::prepare`]) carries the block over *dense* weights, so it is not packed: NVFP4
-/// quantizes its projections like any dense snapshot's. The tensor names come from
-/// `model.safetensors.index.json` when it exists, else from each shard's header — never from
-/// tensor data. An unreadable index or header is left to the loader's own error.
+/// ([`crate::prepare`]) whose block says `storage: "ggml"` stores its projections as GGML blocks
+/// (sc-19375) and is packed too; an older prepared snapshot carries the block over *dense*
+/// weights, so it is not packed: NVFP4 quantizes its projections like any dense snapshot's. The
+/// tensor names come from `model.safetensors.index.json` when it exists, else from each shard's
+/// header — never from tensor data. An unreadable index or header is left to the loader's own
+/// error.
 fn packed_affine_refusal(dir: &Path, config: &Value) -> Option<String> {
-    let has_block = config.get("quantization").is_some()
-        || config
+    let block = config.get("quantization").or_else(|| {
+        config
             .get("text_config")
-            .is_some_and(|text| text.get("quantization").is_some());
-    if !has_block {
-        return None;
+            .and_then(|text| text.get("quantization"))
+    });
+    let block = block?;
+    if block.get("storage").and_then(Value::as_str) == Some(crate::prepare::GGML_STORAGE) {
+        return Some(
+            "this snapshot's projections are stored as GGML blocks (a prepared Q4 / Q8 tier); \
+             NVFP4 projections are quantized from a dense snapshot"
+                .into(),
+        );
     }
     let names = snapshot_tensor_names(dir)?;
     let mut stems: Vec<&str> = names
@@ -2438,6 +2446,18 @@ fn snapshot_quantized_copy_bytes<'a>(
                     suffix,
                     "self_attn.qkv_proj.weight" | "mlp.gate_up_proj.weight"
                 );
+                // A stored GGML block tensor (a prepared Q4 / Q8 snapshot, sc-19375) is rebuilt
+                // as a `QTensor` beside its source bytes: priced at the blocks the device holds.
+                if let Some((stored, rows, cols)) = crate::primitives::quant::ggml_block_storage(
+                    tensor.dtype == "U8",
+                    &tensor.shape,
+                ) {
+                    add(ggml_device_bytes(
+                        (rows as u64).checked_mul(cols as u64)?,
+                        stored,
+                    )?)?;
+                    continue;
+                }
                 let stem = key.strip_suffix(".weight").unwrap_or(key);
                 if let Some(scales) = tensors.get(&format!("{stem}.scales")) {
                     // A fused triple is refused by the loader; an unfused one is repacked.

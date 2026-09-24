@@ -17,19 +17,30 @@
 //! across both inputs.
 //!
 //! # How quantization is persisted
-//! mlx-llm stores genuinely quantized tensors (packed `weight`/`scales`/`biases`). Candle's quantized
-//! tensor (`QTensor`, GGML blocks) has **no safetensors representation**, so candle persists a Q4/Q8
-//! snapshot as **dense weights carrying the quantization rounding** plus a `quantization` block in
-//! `config.json`. The writer runs each attention/MLP **projection** through Candle's quantizer
-//! ([`primitives::quant`](crate::primitives::quant)) and stores the dequantized (rounded) result;
-//! embeddings, the LM head, and norms stay dense (the contract's tensor-level invariant). On load the
-//! provider honors the `quantization` block and re-quantizes the projections via `QTensor`, so a
-//! `LoadSpec::dense` of a prepared Q4/Q8 snapshot yields a genuinely quantized model — the same
-//! observable result as mlx-llm, in candle's storage shape.
+//! A Q4 / Q8 snapshot stores its layer projections **already quantized** (sc-19375), so a tier
+//! directory holds only the bytes of the tier a user picked — never a dense bundle re-quantized at
+//! load. Each separate attention / MLP / MoE-expert projection of a llama-family [`CausalLm`](crate::CausalLm)
+//! (every layer tensor `quantizes_layer_tensor`
+//! names, except the fused Phi-3 `qkv_proj` / `gate_up_proj` the loader splits before quantizing)
+//! is quantized once by Candle's quantizer and written as a **stored GGML block tensor**: a `U8`
+//! `[rows, blocks_per_row, block_bytes]` tensor holding the raw GGML blocks
+//! ([`to_ggml_block_tensor`](crate::primitives::quant::to_ggml_block_tensor); the block type is
+//! recovered from `block_bytes`, see `ggml_block_storage`). The loader rebuilds each `QTensor`
+//! straight from those bytes onto the target device — no dequantize → re-quantize — so a prepared
+//! snapshot loads to exactly the model a dense load quantized at load time would build.
+//! `config.json` carries `quantization: { bits, storage: "ggml" }`.
 //!
-//! Q4_K's block size is 256 and Q8_0's is 32, so a projection's input dimension must be a multiple of
-//! that to quantize (Qwen3's 1024 is 256-aligned; SmolLM2's 576 is not — use Q8 there). A misaligned
-//! projection is a clear error, not a silent dense fallback, matching quantize-on-load.
+//! Embeddings, the LM head and norms stay dense (the contract's tensor-level invariant). A
+//! projection the loader does not read through its projection path (the fused Phi-3 tensors, and
+//! every projection of the qwen3_5 hybrid, whose loader reads only an explicit request) keeps the
+//! earlier storage — dense weights carrying the quantization rounding, which a load re-quantizes
+//! from the `quantization` block — and that snapshot has no `storage` key. Snapshots prepared
+//! before sc-19375 are all of that dense-rounded form and load exactly as before.
+//!
+//! Q4 is Q4_K (256-weight blocks), falling back to Q4_0 (32-weight blocks, the same 4.5
+//! bits/weight) for a projection whose input dimension is 32- but not 256-aligned; Q8 is Q8_0
+//! (32-weight blocks). A projection aligned to neither is a clear error, not a silent dense
+//! fallback, matching quantize-on-load.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -43,8 +54,10 @@ use core_llm::{
     SnapshotPreparerRegistration,
 };
 
+use crate::config::Architecture;
 use crate::error::{Error, Result};
 use crate::gguf::GgufCheckpoint;
+use crate::models::{llama, split_layer_key};
 use crate::primitives::projection::QuantSpec;
 use crate::primitives::Weights;
 use crate::provider::to_core;
@@ -122,12 +135,12 @@ fn prepare_hf(spec: &PrepareSpec) -> Result<PrepareReport> {
 
     // Quantized: load dense weights, round the projections to the requested scheme, write the
     // snapshot. The source dtype is preserved (the loader casts to its compute dtype anyway).
+    let mut config = read_json(&config_path)?;
     let mut tensors = Weights::from_dir(src, &Device::Cpu)?.into_map();
-    requant_projections(&mut tensors, q)?;
+    let stored = quantize_projections(&mut tensors, q, stores_blocks(&config))?;
 
     std::fs::create_dir_all(&spec.out_dir)?;
-    let mut config = read_json(&config_path)?;
-    stamp_quantization(&mut config, q);
+    stamp_quantization(&mut config, q, stored);
     write_json(&spec.out_dir.join("config.json"), &config)?;
     save_safetensors(&tensors, &spec.out_dir.join("model.safetensors"))?;
     std::fs::copy(&tokenizer_path, spec.out_dir.join("tokenizer.json"))?;
@@ -167,8 +180,8 @@ fn prepare_gguf(spec: &PrepareSpec) -> Result<PrepareReport> {
     }
     let quant = spec.quantize.map(quant_spec).transpose()?;
     if let Some(q) = quant {
-        requant_projections(&mut tensors, q)?;
-        stamp_quantization(&mut config, q);
+        let stored = quantize_projections(&mut tensors, q, stores_blocks(&config))?;
+        stamp_quantization(&mut config, q, stored);
     }
 
     // The GGUF reconstructed config carries no stop-token ids; stamp them from the GGUF metadata so
@@ -223,17 +236,44 @@ fn quant_spec(q: Quantize) -> Result<QuantSpec> {
     }
 }
 
-/// Round each attention/MLP **projection** weight in place to `q`, by quantizing then dequantizing
-/// via Candle's `QTensor` — the persisted weights then carry the quantization error, and the loader
-/// re-quantizes them losslessly via the `quantization` config block. Embeddings, the LM head, and
-/// norms (anything not ending `_proj.weight`) stay dense, per the contract's quant invariant.
-fn requant_projections(tensors: &mut HashMap<String, Tensor>, q: QuantSpec) -> Result<()> {
+/// Whether a snapshot with this `config.json` is loaded by the llama-family [`CausalLm`](crate::CausalLm) — the
+/// loader that reads stored GGML block tensors. The qwen3_5 hybrid and Prism/Bonsai are not.
+fn stores_blocks(config: &Json) -> bool {
+    config.get("model_type").and_then(Json::as_str) != Some("prism_hadamard_qwen35")
+        && Architecture::from_config(config).is_ok_and(|arch| arch != Architecture::Qwen35)
+}
+
+/// Whether the `CausalLm` loader reads `key` through its projection path, and so accepts it as a
+/// stored GGML block tensor: a layer projection it quantizes, other than the fused Phi-3 tensors it
+/// splits into parts first.
+fn stored_as_blocks(key: &str) -> bool {
+    split_layer_key(key).is_some_and(|(_, _, suffix)| {
+        llama::quantizes_layer_tensor(suffix)
+            && !matches!(
+                suffix,
+                "self_attn.qkv_proj.weight" | "mlp.gate_up_proj.weight"
+            )
+    })
+}
+
+/// Quantize each attention/MLP **projection** weight to `q` in place. When `blocks` (a
+/// [`CausalLm`](crate::CausalLm) snapshot) a projection its loader reads through the projection path is replaced by
+/// its stored GGML block tensor; any other projection is rounded — quantized then dequantized back
+/// to its dtype, which the loader re-quantizes from the `quantization` block. Embeddings, the LM
+/// head, and norms (anything not ending `_proj.weight`) stay dense, per the contract's quant
+/// invariant. Returns how many projections were stored as blocks.
+fn quantize_projections(
+    tensors: &mut HashMap<String, Tensor>,
+    q: QuantSpec,
+    blocks: bool,
+) -> Result<usize> {
     let mut keys: Vec<String> = tensors
         .keys()
         .filter(|k| is_quantizable_projection(k))
         .cloned()
         .collect();
     keys.sort(); // deterministic order so an error names the first offender stably
+    let mut stored = 0;
     for key in keys {
         let w = &tensors[&key];
         if w.rank() != 2 {
@@ -249,10 +289,15 @@ fn requant_projections(tensors: &mut HashMap<String, Tensor>, q: QuantSpec) -> R
                 ggml
             ))
         })?;
-        let rounded = qt.dequantize(&Device::Cpu)?.to_dtype(dtype)?;
-        tensors.insert(key, rounded);
+        let persisted = if blocks && stored_as_blocks(&key) {
+            stored += 1;
+            crate::primitives::quant::to_ggml_block_tensor(&qt)?
+        } else {
+            qt.dequantize(&Device::Cpu)?.to_dtype(dtype)?
+        };
+        tensors.insert(key, persisted);
     }
-    Ok(())
+    Ok(stored)
 }
 
 /// Whether a weight key is a quantizable projection: the attention/MLP projection matrices
@@ -265,14 +310,21 @@ fn is_quantizable_projection(key: &str) -> bool {
 }
 
 /// Stamp a `quantization` block (`{ "bits": 4 | 8 }`) into a `config.json` value so the loader
-/// re-quantizes the projections on load.
-fn stamp_quantization(config: &mut Json, q: QuantSpec) {
+/// builds quantized projections; `"storage": "ggml"` is added when `stored` projections were
+/// persisted as GGML block tensors (a snapshot that needs a block-aware loader).
+fn stamp_quantization(config: &mut Json, q: QuantSpec, stored: usize) {
     if let Some(obj) = config.as_object_mut() {
         let mut block = Map::new();
         block.insert("bits".into(), Json::from(q.bits()));
+        if stored > 0 {
+            block.insert("storage".into(), Json::from(GGML_STORAGE));
+        }
         obj.insert("quantization".into(), Json::Object(block));
     }
 }
+
+/// The `quantization.storage` tag of a snapshot whose projections are stored GGML blocks.
+pub const GGML_STORAGE: &str = "ggml";
 
 /// Resolve a GGUF source to the `*.gguf` file: a file path is used directly; a directory is searched
 /// for the first `*.gguf`.
@@ -398,9 +450,12 @@ mod tests {
     #[test]
     fn stamps_quantization_block() {
         let mut cfg = serde_json::json!({ "hidden_size": 8 });
-        stamp_quantization(&mut cfg, QuantSpec::q4());
-        assert_eq!(cfg["quantization"]["bits"], serde_json::json!(4));
-        stamp_quantization(&mut cfg, QuantSpec::q8());
-        assert_eq!(cfg["quantization"]["bits"], serde_json::json!(8));
+        stamp_quantization(&mut cfg, QuantSpec::q4(), 0);
+        assert_eq!(cfg["quantization"], serde_json::json!({ "bits": 4 }));
+        stamp_quantization(&mut cfg, QuantSpec::q8(), 3);
+        assert_eq!(
+            cfg["quantization"],
+            serde_json::json!({ "bits": 8, "storage": "ggml" })
+        );
     }
 }

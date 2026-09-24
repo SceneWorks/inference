@@ -27,9 +27,13 @@ and byte-compared so the recorded sha256 is reproducible (``save_file`` header o
 * ``bf16/`` — the upstream safetensors snapshot, verified safetensors-only (no pickle, no
   AppleDouble ``._*`` sidecars), plus a derived ``tokenizer.json``.
 * ``q8/`` and ``q4/`` — candle-llm ``prepare_snapshot`` output (the ``prepare_snapshot`` example in
-  ``crates/llm/candle-llm``): dense weights carrying the Q8_0 / Q4_K rounding + a ``quantization``
-  block in ``config.json`` (candle's prepared-snapshot shape), plus ``tokenizer.model`` and
-  ``generation_config.json`` copied from bf16.
+  ``crates/llm/candle-llm``), **pre-quantized**: every layer projection is stored as a GGML block
+  tensor (``U8`` ``[rows, blocks_per_row, block_bytes]`` — Q8_0 in q8; Q4_K in q4, Q4_0 where the
+  input dim is not 256-aligned) that the candle loader rebuilds directly, never re-quantizing;
+  embeddings, LM head and norms stay bf16. ``config.json`` carries
+  ``quantization: {bits, storage: "ggml"}``; ``tokenizer.model`` and ``generation_config.json``
+  are copied from bf16. Each tier directory is self-contained, so a user downloads only the tier
+  they pick.
 
 The derived ``tokenizer.json`` (candle-llm's loader and preparer require one) is built from the
 mm SentencePiece ``tokenizer.model`` as a byte-fallback BPE with the mm tokenizer's special tokens
@@ -53,6 +57,9 @@ Run with the YuE reference venv (torch, safetensors, sentencepiece, tokenizers, 
     $PY scripts/audio/prepare_yue_assets.py lm --dest <assets>/yue-s2-1b-general-candle \\
         --yue <YuE clone> --source-repo m-a-p/YuE-s2-1B-general --revision <hf sha> \\
         --preparer target/release/examples/prepare_snapshot
+
+``lm --retier`` regenerates q8/q4 (and the metadata) for a repo already staged at the same
+upstream revision, without a fresh download.
 """
 
 from __future__ import annotations
@@ -107,12 +114,12 @@ def sha256(path: Path) -> str:
 
 
 def write_json(path: Path, value) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def tree_rss_kb(root_pid: int) -> int:
     """Summed RSS (KiB) of ``root_pid`` and all its descendants, via ``ps``."""
-    out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,rss="], capture_output=True, text=True).stdout
+    out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,rss="], capture_output=True, text=True, encoding="utf-8").stdout
     children: dict[int, list[int]] = {}
     rss: dict[int, int] = {}
     for line in out.splitlines():
@@ -132,7 +139,7 @@ def tree_rss_kb(root_pid: int) -> int:
 
 def run_guarded(cmd: list[str], limit_gb: float, env: dict | None = None) -> tuple[str, float]:
     """Run ``cmd`` and kill it if its process-tree RSS exceeds ``limit_gb``. Returns (stdout, peak GB)."""
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, env=env, start_new_session=True)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, encoding="utf-8", env=env, start_new_session=True)
     peak = 0.0
     limit_kb = int(limit_gb * 1024 * 1024)
     while proc.poll() is None:
@@ -222,7 +229,7 @@ def build_tokenizer_json(model_file: Path, yue: Path, out: Path) -> dict:
         "",
     ]
     for p in sorted((yue / "prompt_egs").glob("*.txt")):
-        corpus.append(p.read_text())
+        corpus.append(p.read_text(encoding="utf-8"))
     lyrics = "".join(corpus)
     rng = random.Random(19374)
     specials_text = [t for t, _ in specials]
@@ -333,7 +340,11 @@ def cmd_lm(a: argparse.Namespace) -> None:
     dest, yue = Path(a.dest), Path(a.yue)
     bf16 = dest / "bf16"
     marker = bf16 / ".download-complete"
-    if not marker.is_file() or marker.read_text().strip() != f"{a.source_repo}@{a.revision}":
+    if a.retier:
+        staged = json.loads((dest / "SOURCE_REVISION.json").read_text(encoding="utf-8"))
+        if (staged["upstream_repo"], staged["upstream_revision"]) != (a.source_repo, a.revision):
+            raise SystemExit(f"{dest} is staged from a different upstream revision")
+    elif not marker.is_file() or marker.read_text(encoding="utf-8").strip() != f"{a.source_repo}@{a.revision}":
         raise SystemExit(f"{bf16} is not a completed download of {a.source_repo}@{a.revision}")
     shutil.rmtree(bf16 / ".cache", ignore_errors=True)
     for p in bf16.rglob("*"):
@@ -341,7 +352,7 @@ def cmd_lm(a: argparse.Namespace) -> None:
             continue
         if p.name.startswith("._") or p.suffix in (".bin", ".pth", ".pt", ".ckpt", ".pkl"):
             raise SystemExit(f"{p}: not a safetensors-only snapshot")
-    cfg = json.loads((bf16 / "config.json").read_text())
+    cfg = json.loads((bf16 / "config.json").read_text(encoding="utf-8"))
     if cfg.get("architectures") != ["LlamaForCausalLM"]:
         raise SystemExit(f"{bf16}: unexpected architectures {cfg.get('architectures')}")
     vocab = cfg["vocab_size"]
@@ -364,25 +375,26 @@ def cmd_lm(a: argparse.Namespace) -> None:
         prepared = json.loads(stdout.strip().splitlines()[-1])
         for name in ("tokenizer.model", "generation_config.json"):
             shutil.copy2(bf16 / name, out / name)
-        qcfg = json.loads((out / "config.json").read_text())
+        qcfg = json.loads((out / "config.json").read_text(encoding="utf-8"))
         bits = {"q8": 8, "q4": 4}[tier]
-        if qcfg.get("quantization") != {"bits": bits}:
-            raise SystemExit(f"{out}: quantization block {qcfg.get('quantization')} != bits {bits}")
-        qh = dir_headers(out)
-        if set(qh) != set(headers):
-            raise SystemExit(f"{out}: tensor names differ from bf16")
-        for k, h in headers.items():
-            if qh[k]["shape"] != h["shape"] or qh[k]["dtype"] != h["dtype"]:
-                raise SystemExit(f"{out}: {k} shape/dtype differs from bf16")
+        if qcfg.get("quantization") != {"bits": bits, "storage": "ggml"}:
+            raise SystemExit(f"{out}: quantization block {qcfg.get('quantization')} != bits {bits} ggml")
+        ggml_types = verify_tier(out, headers, tier)
+        tier_bytes = sum(p.stat().st_size for p in out.glob("*.safetensors"))
         report[tier] = {
             "tensors": prepared["num_tensors"],
             "quantization": qcfg["quantization"],
-            "ggml": "Q8_0" if tier == "q8" else ggml_q4_summary(cfg),
+            "ggml": ggml_types,
+            "safetensors_bytes": tier_bytes,
             "preparer_peak_rss_gb": round(peak, 1),
         }
-        print(f"{dest.name}/{tier}: prepared ({prepared['num_tensors']} tensors, peak RSS {peak:.1f} GB)")
+        print(
+            f"{dest.name}/{tier}: prepared ({prepared['num_tensors']} tensors, "
+            f"{tier_bytes / 1e9:.2f} GB, {ggml_types}, peak RSS {peak:.1f} GB)"
+        )
 
-    marker.unlink()
+    if marker.is_file():
+        marker.unlink()
     write_json(
         dest / "sceneworks-tiers.json",
         {
@@ -390,17 +402,17 @@ def cmd_lm(a: argparse.Namespace) -> None:
             "tiered": True,
             "tiers": {
                 "bf16": {"dir": "bf16", "format": "hf-safetensors", "storage_dtype": "bfloat16"},
-                "q8": {
-                    "dir": "q8",
-                    "format": "candle-llm-prepared",
-                    "quantization": {"bits": 8},
-                    "ggml": report["q8"]["ggml"],
-                },
-                "q4": {
-                    "dir": "q4",
-                    "format": "candle-llm-prepared",
-                    "quantization": {"bits": 4},
-                    "ggml": report["q4"]["ggml"],
+                **{
+                    tier: {
+                        "dir": tier,
+                        "format": "candle-llm-prepared",
+                        "prequantized": True,
+                        "quantization": report[tier]["quantization"],
+                        "projection_storage": "ggml-blocks (U8 [rows, blocks_per_row, block_bytes])",
+                        "ggml": report[tier]["ggml"],
+                        "dense_tensors_dtype": "bfloat16 (embeddings, lm_head, norms)",
+                    }
+                    for tier in ("q8", "q4")
                 },
             },
             "companion_unquantized": {
@@ -415,11 +427,40 @@ def cmd_lm(a: argparse.Namespace) -> None:
     finish_repo(dest, yue, a.source_repo, a.revision, report, lm_readme(a.source_repo, a.revision, report, cfg))
 
 
-def ggml_q4_summary(cfg: dict) -> str:
-    dims = {cfg["hidden_size"], cfg["intermediate_size"]}
-    if all(d % 256 == 0 for d in dims):
-        return "Q4_K"
-    return "Q4_K (Q4_0 for projections whose input dim is not 256-aligned)"
+# GGML block byte size -> (type, weights per block), the candle-llm stored-block convention.
+GGML_BLOCKS = {18: ("Q4_0", 32), 34: ("Q8_0", 32), 144: ("Q4_K", 256)}
+
+
+def expected_ggml(tier: str, cols: int) -> str:
+    if tier == "q8":
+        return "Q8_0"
+    return "Q4_K" if cols % 256 == 0 else "Q4_0"
+
+
+def verify_tier(out: Path, bf16_headers: dict, tier: str) -> dict:
+    """Check a prepared tier holds pre-quantized projections and dense everything else.
+
+    Every ``*_proj.weight`` must be a ``U8`` GGML block tensor of the expected type whose logical
+    shape is the bf16 weight's; every other tensor must match bf16 exactly (dtype + shape).
+    Returns ``{ggml type: projection count}``.
+    """
+    qh = dir_headers(out)
+    if set(qh) != set(bf16_headers):
+        raise SystemExit(f"{out}: tensor names differ from bf16")
+    counts: dict[str, int] = {}
+    for k, h in bf16_headers.items():
+        q = qh[k]
+        if k.endswith("_proj.weight"):
+            rows, cols = h["shape"]
+            if q["dtype"] != "U8" or len(q["shape"]) != 3:
+                raise SystemExit(f"{out}: {k} is not stored quantized ({q['dtype']} {q['shape']})")
+            name, block = GGML_BLOCKS.get(q["shape"][2], (None, 0))
+            if name != expected_ggml(tier, cols) or q["shape"][:2] != [rows, cols // block]:
+                raise SystemExit(f"{out}: {k} stored as {q['shape']}, expected {expected_ggml(tier, cols)} of [{rows}, {cols}]")
+            counts[name] = counts.get(name, 0) + 1
+        elif q["shape"] != h["shape"] or q["dtype"] != h["dtype"]:
+            raise SystemExit(f"{out}: {k} shape/dtype differs from bf16")
+    return dict(sorted(counts.items()))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -429,9 +470,9 @@ def ggml_q4_summary(cfg: dict) -> str:
 def finish_repo(dest: Path, yue: Path, source_repo: str, revision: str, report: dict, readme: str) -> None:
     shutil.copy2(yue / "LICENSE", dest / "LICENSE")
     shutil.copy2(yue / "NOTICE", dest / "NOTICE")
-    (dest / "README.md").write_text(readme)
+    (dest / "README.md").write_text(readme, encoding="utf-8")
     yue_commit = subprocess.run(
-        ["git", "-C", str(yue), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+        ["git", "-C", str(yue), "rev-parse", "HEAD"], capture_output=True, text=True, encoding="utf-8", check=True
     ).stdout.strip()
     files = {}
     for p in sorted(dest.rglob("*")):
@@ -464,6 +505,14 @@ tags:
 """
 
 
+def gb(n: int) -> str:
+    return f"{n / 1e9:.2f} GB"
+
+
+def fmt_types(types: dict) -> str:
+    return " + ".join(f"{k} ×{v}" for k, v in types.items())
+
+
 def lm_readme(repo: str, rev: str, report: dict, cfg: dict) -> str:
     stage = "stage-1 (7B lyrics → codebook-0 LM)" if report["vocab_size"] == STAGE1_VOCAB else "stage-2 (1B codebook upsampler)"
     return FRONT_MATTER + f"""
@@ -479,12 +528,16 @@ distribution.
 | Dir | Contents |
 |---|---|
 | `bf16/` | the upstream safetensors snapshot, unmodified, plus a derived `tokenizer.json` |
-| `q8/` | candle-llm `prepare_snapshot` Q8 tier: dense weights carrying the Q8_0 rounding + `quantization: {{bits: 8}}` in `config.json` |
-| `q4/` | candle-llm `prepare_snapshot` Q4 tier: dense weights carrying the {report['q4']['ggml']} rounding + `quantization: {{bits: 4}}` |
+| `q8/` | pre-quantized Q8 tier ({gb(report['q8']['safetensors_bytes'])}): projections stored as GGML {fmt_types(report['q8']['ggml'])} blocks |
+| `q4/` | pre-quantized Q4 tier ({gb(report['q4']['safetensors_bytes'])}): projections stored as GGML {fmt_types(report['q4']['ggml'])} blocks |
 
-The q8/q4 tiers are produced from `bf16/` by candle-llm's snapshot preparer; the candle loader
-re-quantizes the projections on load from the persisted `quantization` block. Embeddings, the LM
-head and norms stay dense in every tier. The xcodec codec + Vocos decoders are **not** tiered
+Each tier directory is self-contained (config, tokenizer, weights) — download only the tier you
+use. The q8/q4 tiers are produced from `bf16/` by candle-llm's snapshot preparer
+(`prepare_snapshot`): every attention/MLP projection is quantized once and stored as its raw GGML
+blocks — a `U8` tensor `[rows, blocks_per_row, block_bytes]`, the block type given by
+`block_bytes` (18 = Q4_0, 34 = Q8_0, 144 = Q4_K) — which the candle loader rebuilds directly
+(no dequantize/re-quantize). `config.json` carries `quantization: {{bits, storage: "ggml"}}`.
+Embeddings, the LM head and norms stay bf16 in every tier. The xcodec codec + Vocos decoders are **not** tiered
 (approved carve-out); every tier pairs with
 [`SceneWorks/xcodec-mini-infer`](https://huggingface.co/SceneWorks/xcodec-mini-infer).
 
@@ -565,6 +618,7 @@ def main() -> None:
     m.add_argument("--revision", required=True)
     m.add_argument("--preparer", required=True, help="built candle-llm `prepare_snapshot` example binary")
     m.add_argument("--rss-limit-gb", type=float, default=RSS_LIMIT_GB_DEFAULT)
+    m.add_argument("--retier", action="store_true", help="regenerate q8/q4 of an already staged repo")
     m.set_defaults(func=cmd_lm)
     a = p.parse_args()
     a.func(a)
