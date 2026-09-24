@@ -768,6 +768,15 @@ jobs:
           cargo clippy --locked
           -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*'
           --all-targets --features metal -- -D warnings
+      # sc-19381 (epic sc-19373): YuE stage 2 decodes in bf16 on Metal, so its greedy residual
+      # picks can flip at argmax near-ties that the CPU's f32 path (the exact-parity lane) does
+      # not have. This characterises that divergence on a real Metal device — flips counted, logit
+      # noise bounded — instead of assuming Metal equals the CPU golden. Synthetic weights, one
+      # test binary; it fails, never skips, if the device is missing.
+      - name: Test YuE stage-2 Metal divergence characterisation
+        run: >-
+          cargo test --locked -p candle-audio-yue --features metal --lib
+          stage2::tests::metal -- --nocapture
 
   macos-nax:
     name: runtime-macos NAX (macOS 26.2, manual)

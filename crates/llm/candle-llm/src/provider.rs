@@ -1812,6 +1812,16 @@ impl LlamaProvider {
         }
     }
 
+    /// Consume the provider and keep only its Llama-family decoder (`None` for the Qwen3.6
+    /// hybrid) — [`LlamaProvider::causal_lm`] for an engine that owns the decoder: the provider's
+    /// chat template is not `Send`, and such an engine needs none of the chat/tokenizer state.
+    pub fn into_causal_lm(self) -> Option<CausalLm> {
+        match self.model {
+            Decoder::Causal(m) => Some(m),
+            Decoder::Qwen35(_) => None,
+        }
+    }
+
     /// The load telemetry: the requested weight format and the resident weight census by
     /// projection kind (sc-24135).
     pub fn load_record(&self) -> LoadRecord {

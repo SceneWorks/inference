@@ -447,7 +447,8 @@ fn production_wiring_refuses_instead_of_rendering_placeholder_audio() {
     assert!(refused((s.tokenizer)(&assets)), "tokenizer");
     assert!(refused((s.icl_encoder)(&assets)), "icl encoder");
     assert!(refused((s.stage1)(&assets, None)), "stage 1");
-    assert!(refused((s.stage2)(&assets, None)), "stage 2");
+    // Stage 2 is implemented (sc-19381): with nothing staged it fails to load, never a stub.
+    assert!((s.stage2)(&assets, None).is_err(), "stage 2");
     assert!(refused((s.codec)(&assets)), "codec");
     assert!(refused((s.vocoder)(&assets)), "vocoder");
     assert!(refused((s.splice)(&[0.0], &[0.0])), "splice");
