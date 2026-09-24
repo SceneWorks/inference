@@ -32,7 +32,7 @@ The 256 tokens produce 255 events because the `<think>` marker token is stripped
 reasoning segmenter on both paths.
 
 Measured at commit `4180cec58a8222ec581f572f8742e1f86ee44c9d` on a clean tracked tree (the JSON
-records `commit` and `worktree_dirty`). Load took 60 s. Each 256-token decode took about 19–20 s
+records `commit` and `worktree_dirty`). Load took 28 s. Each 256-token decode took about 19–20 s
 on both paths:
 
 ```text
