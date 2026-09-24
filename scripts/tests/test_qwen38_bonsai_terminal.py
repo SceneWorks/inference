@@ -15,6 +15,7 @@ import time
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
+from typing import Any, Callable
 from unittest import mock
 
 
@@ -1767,28 +1768,36 @@ Pages purgeable:                             1000.
             )
         self.assertFalse(state["admitted"])
 
-    def run_short_case_campaign(self, name: str) -> dict:
-        """Run the wrapper over a stand-in child whose one E7 case lasts 120 ms, while every
-        nvidia-smi query takes 1.2 s (a WDDM host), and return the sealed receipt."""
+    SHORT_CASE_CHILD = (
+        "import json, os, time\n"
+        "time.sleep(0.4)\n"
+        "started = time.time()\n"
+        "time.sleep(0.12)\n"
+        "ended = time.time()\n"
+        "time.sleep(1.0)\n"
+        "provider = {'status': 'completed', 'model_id': os.environ['BONSAI_COMPARISON_MODEL_ID'],\n"
+        "    'cases': [{'case_id': 'image', 'status': 'completed',\n"
+        "               'request_peak_claim_eligible': True,\n"
+        "               'measurement_interval': {\n"
+        "                   'run_id': os.environ['BONSAI_COMPARISON_RUN_ID'],\n"
+        "                   'process_id': os.getpid(), 'kind': 'selected_case',\n"
+        "                   'started_unix_seconds': started, 'ended_unix_seconds': ended}}]}\n"
+        "with open(os.environ['BONSAI_COMPARISON_OUTPUT'], 'x', encoding='utf-8') as out:\n"
+        "    json.dump(provider, out)\n"
+    )
+
+    def run_stand_in_campaign(
+        self,
+        name: str,
+        child_source: str,
+        *,
+        nvidia_smi: Callable[[int], tuple[int | None, str | None]],
+        patches: dict[str, Any] | None = None,
+    ) -> Path:
+        """Run the wrapper over a stand-in child (the interpreter runs ``child_source``) with a
+        stand-in ``nvidia-smi``, and return the evidence directory."""
         child = self.root / f"{name}-child.py"
-        child.write_text(
-            "import json, os, time\n"
-            "time.sleep(0.4)\n"
-            "started = time.time()\n"
-            "time.sleep(0.12)\n"
-            "ended = time.time()\n"
-            "time.sleep(1.0)\n"
-            "provider = {'status': 'completed', 'model_id': os.environ['BONSAI_COMPARISON_MODEL_ID'],\n"
-            "    'cases': [{'case_id': 'image', 'status': 'completed',\n"
-            "               'request_peak_claim_eligible': True,\n"
-            "               'measurement_interval': {\n"
-            "                   'run_id': os.environ['BONSAI_COMPARISON_RUN_ID'],\n"
-            "                   'process_id': os.getpid(), 'kind': 'selected_case',\n"
-            "                   'started_unix_seconds': started, 'ended_unix_seconds': ended}}]}\n"
-            "with open(os.environ['BONSAI_COMPARISON_OUTPUT'], 'x', encoding='utf-8') as out:\n"
-            "    json.dump(provider, out)\n",
-            encoding="utf-8",
-        )
+        child.write_text(child_source, encoding="utf-8")
         preflight_path = self.root / f"{name}-preflight.json"
         preflight_path.write_text('{"load_profile":"candle-dense-cpu"}', encoding="utf-8")
         output = self.root / name
@@ -1800,13 +1809,6 @@ Pages purgeable:                             1000.
              "--runtime-sha", self.runtime_sha, "--preflight", str(preflight_path),
              "--cases", "image", "--output", str(output), "--candle-device", "cpu"]
         )
-        gpu_queries: list[float] = []
-
-        def slow_nvidia_smi(_pid: int) -> tuple[None, str]:
-            gpu_queries.append(time.monotonic())
-            time.sleep(1.2)
-            return None, "per-process GPU memory unavailable (WDDM or unsupported driver)"
-
         inventory = {"inventory_sha256": "e" * 64}
         sizes = {"language_weight_bytes": 1, "vision_weight_bytes": 0, "projector_bytes": 0}
         with ExitStack() as stack:
@@ -1819,9 +1821,26 @@ Pages purgeable:                             1000.
             stack.enter_context(mock.patch.object(terminal, "pinned_admission_sizes", return_value=sizes))
             stack.enter_context(mock.patch.object(terminal, "validate_preflight_record"))
             stack.enter_context(mock.patch.object(terminal, "selected_artifact", return_value={"path": "weights.gguf"}))
-            stack.enter_context(mock.patch.object(terminal, "nvidia_sample", side_effect=slow_nvidia_smi))
+            stack.enter_context(mock.patch.object(terminal, "nvidia_sample", side_effect=nvidia_smi))
             stack.enter_context(mock.patch.object(terminal, "physical_memory", return_value=(1, 1, None)))
+            for attribute, value in (patches or {}).items():
+                stack.enter_context(mock.patch.object(terminal, attribute, value))
             terminal.run(args)
+        return output
+
+    def run_short_case_campaign(self, name: str, *, patches: dict[str, Any] | None = None) -> dict:
+        """Run the wrapper over a stand-in child whose one E7 case lasts 120 ms, while every
+        nvidia-smi query takes 1.2 s (a WDDM host), and return the sealed receipt."""
+        gpu_queries: list[float] = []
+
+        def slow_nvidia_smi(_pid: int) -> tuple[None, str]:
+            gpu_queries.append(time.monotonic())
+            time.sleep(1.2)
+            return None, "per-process GPU memory unavailable (WDDM or unsupported driver)"
+
+        output = self.run_stand_in_campaign(
+            name, self.SHORT_CASE_CHILD, nvidia_smi=slow_nvidia_smi, patches=patches
+        )
         self.assertTrue(gpu_queries, "the stand-in nvidia-smi was never queried")
         return json.loads((output / "receipt.json").read_text(encoding="utf-8"))
 
@@ -1833,8 +1852,14 @@ Pages purgeable:                             1000.
         receipt = self.run_short_case_campaign("short-case")
         process = receipt["process"]
         self.assertEqual(process["exit_code"], 0)
+        self.assertEqual(process["rss_source"], terminal.rss_source())
         self.assertEqual(
-            process["rss_sample_interval_seconds"], terminal.RSS_SAMPLE_INTERVAL_SECONDS
+            process["rss_sample_interval_seconds"],
+            terminal.rss_cadence(
+                process["rss_source"],
+                rss_interval=terminal.RSS_SAMPLE_INTERVAL_SECONDS,
+                sample_interval=process["sample_interval_seconds"],
+            ),
         )
         (image,) = receipt["case_memory"]
         self.assertEqual(image["case_id"], "image")
@@ -1868,6 +1893,288 @@ Pages purgeable:                             1000.
         for value in ("0", "-0.01", "0.06", "1", "nan", "inf"):
             with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
                 terminal.rss_sample_interval(value)
+
+    def test_rss_cadence_follows_the_cost_of_one_rss_read(self) -> None:
+        """Review of sc-24164: only an in-process RSS read runs on the fast loop. The ps fallback
+        (macOS) spawns a process per read, so it keeps the --sample-interval cadence."""
+        for os_name, platform_name, source in (
+            ("nt", "win32", terminal.RSS_SOURCE_WORKING_SET),
+            ("posix", "linux", terminal.RSS_SOURCE_PROC_STATUS),
+            ("posix", "darwin", terminal.RSS_SOURCE_PS),
+            ("posix", "freebsd14", terminal.RSS_SOURCE_PS),
+        ):
+            with self.subTest(platform=platform_name):
+                with mock.patch.object(terminal.os, "name", os_name), mock.patch.object(
+                    terminal.sys, "platform", platform_name
+                ):
+                    self.assertEqual(terminal.rss_source(), source)
+        for source in (terminal.RSS_SOURCE_WORKING_SET, terminal.RSS_SOURCE_PROC_STATUS):
+            with self.subTest(source=source):
+                self.assertEqual(
+                    terminal.rss_cadence(source, rss_interval=0.02, sample_interval=0.1), 0.02
+                )
+        for sample_interval in (0.1, 0.5, 0.01):
+            with self.subTest(source=terminal.RSS_SOURCE_PS, sample_interval=sample_interval):
+                self.assertEqual(
+                    terminal.rss_cadence(
+                        terminal.RSS_SOURCE_PS, rss_interval=0.02, sample_interval=sample_interval
+                    ),
+                    sample_interval,
+                )
+
+    def test_ps_rss_fallback_is_read_once_per_sample_interval(self) -> None:
+        reads: list[float] = []
+
+        def counting_ps(_pid: int) -> int:
+            reads.append(time.monotonic())
+            return 64 << 20
+
+        receipt = self.run_short_case_campaign(
+            "ps-cadence",
+            patches={
+                "rss_source": lambda: terminal.RSS_SOURCE_PS,
+                "rss_bytes": counting_ps,
+            },
+        )
+        process = receipt["process"]
+        self.assertEqual(process["rss_source"], terminal.RSS_SOURCE_PS)
+        self.assertEqual(process["rss_sample_interval_seconds"], process["sample_interval_seconds"])
+        self.assertEqual(process["rss_samples_collected"], len(reads))
+        # About one spawn per --sample-interval (0.1 s), not the fast loop's 30-50 a second.
+        self.assertGreater(len(reads), 5)
+        self.assertLessEqual(
+            len(reads), (reads[-1] - reads[0]) / process["sample_interval_seconds"] + 2
+        )
+
+    def test_gpu_sampler_failure_stops_the_child_early_and_fails(self) -> None:
+        """Review of sc-24164: an exception on the nvidia-smi thread used to surface only once the
+        child exited on its own. The sampling loop now stops the child as soon as it sees one and
+        the run fails with it, without writing a receipt."""
+        queries: list[float] = []
+
+        def failing_nvidia_smi(_pid: int) -> tuple[int | None, str | None]:
+            queries.append(time.monotonic())
+            raise RuntimeError("stand-in nvidia-smi crashed")
+
+        real_terminate = terminal.terminate_owned_child
+        stopped: list[subprocess.Popen[bytes]] = []
+
+        def recording_terminate(proc: subprocess.Popen[bytes]) -> dict[str, Any]:
+            stopped.append(proc)
+            return real_terminate(proc)
+
+        began = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, "stand-in nvidia-smi crashed"):
+            self.run_stand_in_campaign(
+                "gpu-failure",
+                "import time\ntime.sleep(30)\n",
+                nvidia_smi=failing_nvidia_smi,
+                patches={"terminate_owned_child": recording_terminate},
+            )
+        self.assertLess(time.monotonic() - began, 15, "the run waited for the child to exit")
+        self.assertEqual(len(queries), 1)
+        self.assertTrue(stopped, "the sampling loop did not stop the child")
+        self.assertIsNotNone(stopped[0].poll(), "the child outlived the failed run")
+        self.assertFalse((self.root / "gpu-failure" / "receipt.json").exists())
+
+    @staticmethod
+    def thin_whole_stream_at_end(
+        samples: list[dict], intervals: list[dict], *, spacing: float
+    ) -> list[dict]:
+        """The reference: the pre-spool thinning, over the whole stream held in memory."""
+        if not samples:
+            return []
+        keep: set[int] = set()
+        last_kept = -float("inf")
+        for index, sample in enumerate(samples):
+            if sample["started_unix_seconds"] - last_kept >= spacing:
+                keep.add(index)
+                last_kept = sample["started_unix_seconds"]
+        keep.add(max(range(len(samples)), key=lambda index: samples[index]["bytes"]))
+        for interval in intervals:
+            started = interval.get("started_unix_seconds")
+            ended = interval.get("ended_unix_seconds")
+            if not isinstance(started, (int, float)) or not isinstance(ended, (int, float)):
+                continue
+            inside: list[int] = []
+            before: int | None = None
+            after: int | None = None
+            for index, sample in enumerate(samples):
+                if sample["started_unix_seconds"] >= started and sample["ended_unix_seconds"] <= ended:
+                    inside.append(index)
+                elif sample["ended_unix_seconds"] <= started:
+                    before = index
+                elif after is None and sample["started_unix_seconds"] >= ended:
+                    after = index
+            if inside:
+                peak = max(inside, key=lambda index: samples[index]["bytes"])
+                keep.update((inside[0], inside[-1], peak))
+            keep.update(index for index in (before, after) if index is not None)
+        return [samples[index] for index in sorted(keep)]
+
+    def test_spooled_thinning_keeps_the_gate_evidence_of_thinning_at_the_end(self) -> None:
+        """Review of sc-24164: the fast RSS stream is spooled to disk as it arrives and thinned in
+        one replay, instead of being held in memory until the run ends. On a synthetic 50 Hz stream
+        the receipt, every case's gate evidence and the run peak are exactly those of thinning the
+        whole in-memory stream at the end."""
+        import random
+
+        rng = random.Random(24164)
+        run_id, process_id = "a" * 64, 4242
+        stream: list[dict] = []
+        clock, value = 1_000.0, 900 << 20
+        for index in range(30_000):  # ten minutes at 50 Hz
+            clock += 0.02 + rng.uniform(-0.004, 0.004)
+            value = max(1, value + rng.randint(-(1 << 20), 1 << 20))
+            if index % 997 == 0:
+                value += 64 << 20
+            stream.append(
+                {
+                    "seconds": clock - 1_000.0,
+                    "started_unix_seconds": clock,
+                    "ended_unix_seconds": clock + rng.uniform(0.0002, 0.004),
+                    "run_id": run_id,
+                    "process_id": process_id,
+                    "bytes": value,
+                }
+            )
+        # A tie for the run peak and for one case's peak, so first-of-equals is checked too.
+        run_peak = max(sample["bytes"] for sample in stream) + 1
+        stream[4_321]["bytes"] = stream[17_654]["bytes"] = run_peak
+        stream[20_100]["bytes"] = stream[20_140]["bytes"] = run_peak - 1
+
+        def between(first: int, last: int) -> dict:
+            return {
+                "started_unix_seconds": stream[first]["started_unix_seconds"],
+                "ended_unix_seconds": stream[last]["ended_unix_seconds"],
+            }
+
+        gap = {  # inside the gap between two samples: no sample fits
+            "started_unix_seconds": stream[9_000]["ended_unix_seconds"] + 1e-6,
+            "ended_unix_seconds": stream[9_001]["started_unix_seconds"] - 1e-6,
+        }
+        instant = {  # zero length, at a sample's start
+            "started_unix_seconds": stream[12_000]["started_unix_seconds"],
+            "ended_unix_seconds": stream[12_000]["started_unix_seconds"],
+        }
+        cases = {
+            "short": between(1_001, 1_004),
+            "long": between(3_000, 18_000),
+            "overlapping": between(17_000, 21_000),
+            "tied_peak": between(20_050, 20_200),
+            "single": between(25_000, 25_000),
+            "gap": gap,
+            "instant": instant,
+            "before_stream": {"started_unix_seconds": 10.0, "ended_unix_seconds": 20.0},
+            "after_stream": {"started_unix_seconds": 1e7, "ended_unix_seconds": 1e7 + 1},
+        }
+        intervals = [*cases.values(), {}]  # a case without a measured interval is skipped
+
+        with terminal.RssSampleSpool() as spool:
+            for sample in stream:
+                spool.append(sample)
+            self.assertEqual(spool.count, len(stream))
+            retained = terminal.retained_rss_samples(
+                spool.samples(run_id=run_id, process_id=process_id), intervals, spacing=0.1
+            )
+        reference = self.thin_whole_stream_at_end(stream, intervals, spacing=0.1)
+        self.assertEqual(retained, reference)
+        self.assertLess(len(retained), len(stream) // 4)
+        self.assertEqual(max(sample["bytes"] for sample in retained), run_peak)
+
+        provider = {
+            "model_id": "parent",
+            "cases": [
+                {
+                    "case_id": case_id,
+                    "request_peak_claim_eligible": True,
+                    "measurement_interval": {
+                        **interval,
+                        "run_id": run_id,
+                        "process_id": process_id,
+                        "model_id": "parent",
+                    },
+                }
+                for case_id, interval in cases.items()
+            ],
+        }
+
+        def evidence(samples: list[dict]) -> list[dict]:
+            return terminal.case_memory_evidence(
+                provider, samples, [], run_id=run_id, process_id=process_id
+            )
+
+        self.assertEqual(evidence(retained), evidence(reference))
+        gate_fields = (
+            "available",
+            "first_sample_bytes",
+            "peak_bytes",
+            "observed_growth_from_first_sample_bytes",
+            "unavailable_reason",
+            "bracketing_samples",
+        )
+        for kept, full in zip(evidence(retained), evidence(stream)):
+            with self.subTest(case=kept["case_id"]):
+                for field in gate_fields:
+                    self.assertEqual(kept["rss"].get(field), full["rss"].get(field), field)
+                terminal.validate_sample_set(
+                    kept["rss"],
+                    kept["measurement_interval"],
+                    run_id=run_id,
+                    process_id=process_id,
+                    allowed_scopes={
+                        "sampled_process_working_set_within_selected_request_lower_bound"
+                    },
+                    root=self.root,
+                )
+        by_case = {row["case_id"]: row["rss"] for row in evidence(retained)}
+        for case_id in ("short", "long", "overlapping", "tied_peak", "single"):
+            self.assertTrue(by_case[case_id]["available"], case_id)
+        for case_id in ("gap", "instant", "before_stream", "after_stream"):
+            self.assertFalse(by_case[case_id]["available"], case_id)
+
+    def test_rss_spool_holds_the_stream_on_disk_and_fails_closed(self) -> None:
+        import tracemalloc
+
+        def sample(index: int) -> dict:
+            return {
+                "seconds": index * 0.02,
+                "started_unix_seconds": 1_000.0 + index * 0.02,
+                "ended_unix_seconds": 1_000.001 + index * 0.02,
+                "run_id": "r",
+                "process_id": 7,
+                "bytes": (512 << 20) + index,
+            }
+
+        count = 100_000  # over half an hour at 50 Hz
+        tracemalloc.start()
+        try:
+            with terminal.RssSampleSpool() as spool:
+                baseline = tracemalloc.get_traced_memory()[0]
+                for index in range(count):
+                    spool.append(sample(index))
+                grown = tracemalloc.get_traced_memory()[0] - baseline
+        finally:
+            tracemalloc.stop()
+        # The same samples held as dicts take tens of MB; the spool holds a write buffer.
+        self.assertLess(grown, 256 * 1024, f"spooling {count} samples grew memory by {grown} B")
+
+        with terminal.RssSampleSpool() as spool:
+            for index in range(3):
+                spool.append(sample(index))
+            self.assertEqual(
+                list(spool.samples(run_id="r", process_id=7)), [sample(i) for i in range(3)]
+            )
+            spool.append(sample(3))  # appending after a replay continues the stream
+            self.assertEqual(len(list(spool.samples(run_id="r", process_id=7))), 4)
+            spool._file.write(b"\x00" * 5)  # a torn record
+            with self.assertRaisesRegex(ValueError, "partial record"):
+                list(spool.samples(run_id="r", process_id=7))
+        with terminal.RssSampleSpool() as spool:
+            spool.append(sample(0))
+            spool.count += 1  # a sample the spool never received
+            with self.assertRaisesRegex(ValueError, "replayed 1 of 2"):
+                list(spool.samples(run_id="r", process_id=7))
 
     def test_retained_rss_keeps_every_sample_the_evidence_depends_on(self) -> None:
         def sample(index: int) -> dict:
