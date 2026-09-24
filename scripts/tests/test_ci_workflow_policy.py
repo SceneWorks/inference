@@ -3740,6 +3740,19 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             workflow["jobs"]["gate"]["needs"],
             "CI gate must fail when the topology policy in changes fails",
         )
+        checkouts = [
+            step
+            for step in changes["steps"]
+            if str(step.get("uses", "")).startswith("actions/checkout@")
+        ]
+        self.assertEqual(
+            [(step.get("with") or {}).get("fetch-depth") for step in checkouts],
+            [0],
+            "an annotated tag push names the tag object in `after`; a fetch-depth: 0 checkout "
+            "fetches refs/tags/* so the policy can peel that object to GITHUB_SHA, while a "
+            "shallow tag checkout fetches only the peeled commit and fails every annotated "
+            "runtime-* tag closed",
+        )
 
         triggers = workflow[True]
         self.assertIn("pull_request", triggers)

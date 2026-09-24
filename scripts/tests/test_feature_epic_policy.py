@@ -1,4 +1,6 @@
+import functools
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -9,6 +11,7 @@ from types import SimpleNamespace
 
 from scripts.ci.feature_epic_policy import (
     PolicyError,
+    resolve_local_commit,
     resolve_local_merge_parents,
     resolve_remote_feature_branch,
     validate_event,
@@ -25,6 +28,19 @@ PR_MERGE_SHA = "3" * 40
 MERGE_GROUP_HEAD_SHA = "4" * 40
 MERGE_GROUP_BASE_SHA = "5" * 40
 QUEUE_SUFFIX_SHA = "6" * 40
+# An annotated tag push names the tag OBJECT in `after`; GITHUB_SHA is the commit it peels to.
+TAG_OBJECT_SHA = "a" * 40
+TAGGED_COMMIT_SHA = "b" * 40
+OTHER_COMMIT_SHA = "c" * 40
+RELEASE_TAG = "runtime-2026.09.1-rc.0"
+HERMETIC_GIT_ENV = {
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_AUTHOR_NAME": "feature-epic-policy-test",
+    "GIT_AUTHOR_EMAIL": "feature-epic-policy-test@example.invalid",
+    "GIT_COMMITTER_NAME": "feature-epic-policy-test",
+    "GIT_COMMITTER_EMAIL": "feature-epic-policy-test@example.invalid",
+}
 
 
 def canonical_feature(epic: int) -> str:
@@ -75,6 +91,71 @@ def merge_group_event(base: str) -> dict:
     }
 
 
+def tag_push_event(after: str, tag: str = RELEASE_TAG) -> dict:
+    return {
+        "repository": {"full_name": REPOSITORY},
+        "ref": f"refs/tags/{tag}",
+        "after": after,
+    }
+
+
+def peel_fixture(obj: str) -> str:
+    """Model `git rev-parse <obj>^{commit}` over a store holding one annotated tag object."""
+    return {TAG_OBJECT_SHA: TAGGED_COMMIT_SHA}.get(obj, obj)
+
+
+def absent_tag_object(obj: str) -> str:
+    raise PolicyError(f"could not peel {obj} to a commit in the checkout")
+
+
+def hermetic_git_env() -> dict[str, str]:
+    return {**os.environ, **HERMETIC_GIT_ENV}
+
+
+def git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=hermetic_git_env(),
+    ).stdout.strip()
+
+
+def annotated_tag_checkout(root: Path, tag: str) -> tuple[Path, str, str]:
+    """Reproduce what actions/checkout (fetch-depth: 0) leaves behind on an annotated-tag push.
+
+    It first fetches every tag, so the pushed tag object lands in the object store; then, because
+    the local tag resolves to the tag object rather than GITHUB_SHA, it force-refetches the peeled
+    commit onto the same ref. The ref now names the commit, but the tag object is still present.
+    """
+    origin = root / "origin"
+    origin.mkdir()
+    git(origin, "init", "-q")
+    git(origin, "commit", "-q", "--allow-empty", "--no-verify", "-m", "release")
+    git(origin, "tag", "-a", "-m", "release", tag)
+    tag_object = git(origin, "rev-parse", f"refs/tags/{tag}")
+    commit = git(origin, "rev-parse", f"refs/tags/{tag}^{{commit}}")
+
+    checkout = root / "checkout"
+    checkout.mkdir()
+    git(checkout, "init", "-q")
+    git(checkout, "remote", "add", "origin", str(origin))
+    git(
+        checkout,
+        "fetch",
+        "-q",
+        "--prune",
+        "origin",
+        "+refs/heads/*:refs/remotes/origin/*",
+        "+refs/tags/*:refs/tags/*",
+    )
+    git(checkout, "fetch", "-q", "--no-tags", "--prune", "origin", f"+{commit}:refs/tags/{tag}")
+    git(checkout, "checkout", "-q", "--force", f"refs/tags/{tag}")
+    return checkout, tag_object, commit
+
+
 def active_sha_for(event_name: str, payload: dict) -> str | None:
     if event_name == "pull_request":
         return payload["pull_request"]["merge_commit_sha"]
@@ -94,6 +175,7 @@ def validate(
     use_event_sha: bool = True,
     feature_resolver=canonical_feature,
     commit_parent_resolver=lambda _commit: (PR_BASE_SHA, PR_HEAD_SHA),
+    commit_peeler=None,
 ) -> str:
     if use_event_sha:
         active_sha = active_sha_for(event_name, payload)
@@ -104,6 +186,7 @@ def validate(
         active_sha=active_sha,
         feature_resolver=feature_resolver,
         commit_parent_resolver=commit_parent_resolver,
+        commit_peeler=commit_peeler,
     )
 
 
@@ -475,33 +558,159 @@ class FeatureEpicPolicyTests(unittest.TestCase):
         )
 
     def test_push_binds_after_to_active_sha(self) -> None:
-        event = {
-            "repository": {"full_name": REPOSITORY},
-            "ref": "refs/tags/runtime-0.9.0",
-            "after": PR_MERGE_SHA,
-        }
+        for ref in ("refs/heads/main", "refs/tags/runtime-0.9.0"):
+            with self.subTest(ref=ref):
+                event = {
+                    "repository": {"full_name": REPOSITORY},
+                    "ref": ref,
+                    "after": PR_MERGE_SHA,
+                }
+                self.assert_rejected(
+                    "push",
+                    event,
+                    "GITHUB_SHA is required",
+                    use_event_sha=False,
+                    active_sha=None,
+                    commit_peeler=peel_fixture,
+                )
+                del event["after"]
+                self.assert_rejected(
+                    "push",
+                    event,
+                    "after is missing",
+                    use_event_sha=False,
+                    active_sha=PR_MERGE_SHA,
+                    commit_peeler=peel_fixture,
+                )
+
         self.assert_rejected(
             "push",
-            event,
-            "GITHUB_SHA is required",
-            use_event_sha=False,
-            active_sha=None,
-        )
-        self.assert_rejected(
-            "push",
-            event,
+            {
+                "repository": {"full_name": REPOSITORY},
+                "ref": "refs/heads/main",
+                "after": PR_MERGE_SHA,
+            },
             "GITHUB_SHA must equal after",
             use_event_sha=False,
             active_sha="7" * 40,
         )
-        del event["after"]
+        # A branch push names a commit in `after`, so nothing is peeled: a tag object that
+        # happens to peel to GITHUB_SHA must not satisfy a main push.
         self.assert_rejected(
             "push",
-            event,
-            "after is missing",
+            {
+                "repository": {"full_name": REPOSITORY},
+                "ref": "refs/heads/main",
+                "after": TAG_OBJECT_SHA,
+            },
+            "GITHUB_SHA must equal after",
             use_event_sha=False,
-            active_sha=PR_MERGE_SHA,
+            active_sha=TAGGED_COMMIT_SHA,
+            commit_peeler=peel_fixture,
         )
+
+    def test_annotated_tag_push_binds_the_peeled_commit_to_active_sha(self) -> None:
+        # Runs 35812806857 (runtime-2026.09.0) and 35796817963 (runtime-2026.09.0-rc.8) refused
+        # exactly this shape: `after` is the tag object, GITHUB_SHA the commit it peels to.
+        reason = validate(
+            "push",
+            tag_push_event(TAG_OBJECT_SHA),
+            use_event_sha=False,
+            active_sha=TAGGED_COMMIT_SHA,
+            commit_peeler=peel_fixture,
+        )
+        self.assertIn("tag push", reason)
+
+    def test_lightweight_tag_push_binds_after_directly_without_a_local_peel(self) -> None:
+        for peeler in (None, peel_fixture):
+            with self.subTest(peeler=getattr(peeler, "__name__", None)):
+                reason = validate(
+                    "push",
+                    tag_push_event(TAGGED_COMMIT_SHA),
+                    use_event_sha=False,
+                    active_sha=TAGGED_COMMIT_SHA,
+                    commit_peeler=peeler,
+                )
+                self.assertIn("tag push", reason)
+
+    def test_tag_push_refuses_a_revision_the_pushed_tag_does_not_name(self) -> None:
+        names_other = "GITHUB_SHA must equal the commit that tag push after names"
+        cases = (
+            ("annotated tag peels to another commit", TAG_OBJECT_SHA, OTHER_COMMIT_SHA,
+             peel_fixture, names_other),
+            ("lightweight tag names another commit", TAGGED_COMMIT_SHA, OTHER_COMMIT_SHA,
+             peel_fixture, names_other),
+            ("no peeler to prove what a tag object names", TAG_OBJECT_SHA, TAGGED_COMMIT_SHA,
+             None, "no local commit peeler"),
+            ("tag object absent from the checkout", TAG_OBJECT_SHA, TAGGED_COMMIT_SHA,
+             absent_tag_object, "could not peel"),
+        )
+        for label, after, active_sha, peeler, pattern in cases:
+            with self.subTest(label):
+                self.assert_rejected(
+                    "push",
+                    tag_push_event(after),
+                    pattern,
+                    use_event_sha=False,
+                    active_sha=active_sha,
+                    commit_peeler=peeler,
+                )
+
+    def test_local_commit_peeler_peels_tag_objects_and_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkout, tag_object, commit = annotated_tag_checkout(Path(temp_dir), RELEASE_TAG)
+            runner = functools.partial(subprocess.run, cwd=checkout, env=hermetic_git_env())
+            self.assertNotEqual(tag_object, commit)
+            self.assertEqual(resolve_local_commit(tag_object, runner=runner), commit)
+            self.assertEqual(resolve_local_commit(commit, runner=runner), commit)
+
+            tree = git(checkout, "rev-parse", f"{commit}^{{tree}}")
+            for label, obj in (("absent object", OTHER_COMMIT_SHA), ("tree", tree)):
+                with self.subTest(label):
+                    with self.assertRaisesRegex(PolicyError, "could not peel"):
+                        resolve_local_commit(obj, runner=runner)
+
+    def test_cli_binds_an_annotated_release_tag_push_through_the_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            checkout, tag_object, commit = annotated_tag_checkout(root, RELEASE_TAG)
+            # actions/checkout has repointed the local ref at the commit; only the object store
+            # still carries the tag object that `after` names.
+            self.assertEqual(git(checkout, "cat-file", "-t", f"refs/tags/{RELEASE_TAG}"), "commit")
+            self.assertEqual(git(checkout, "cat-file", "-t", tag_object), "tag")
+            other = git(checkout, "commit-tree", "-m", "other", f"{commit}^{{tree}}")
+            event_path = root / "event.json"
+            event_path.write_text(json.dumps(tag_push_event(tag_object)), encoding="utf-8")
+
+            for active_sha, expected_code, expected_text in (
+                (commit, 0, "feature epic branch policy: tag push"),
+                (other, 1, "::error title=Feature epic branch policy::"),
+            ):
+                with self.subTest(expected_code=expected_code):
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(SCRIPT),
+                            "--event-name",
+                            "push",
+                            "--event-path",
+                            str(event_path),
+                            "--repository",
+                            REPOSITORY,
+                            "--active-sha",
+                            active_sha,
+                        ],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        cwd=checkout,
+                        env=hermetic_git_env(),
+                    )
+                    self.assertEqual(
+                        result.returncode, expected_code, result.stdout + result.stderr
+                    )
+                    self.assertIn(expected_text, result.stdout)
 
     def test_dispatch_is_allowed_but_unknown_events_fail_closed(self) -> None:
         payload = {"repository": {"full_name": REPOSITORY}}
