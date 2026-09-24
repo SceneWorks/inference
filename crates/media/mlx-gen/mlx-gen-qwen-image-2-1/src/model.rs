@@ -88,8 +88,12 @@ pub fn descriptor() -> ModelDescriptor {
             max_size,
             max_count: 8,
             mac_only: true,
-            // Both affine tiers are **installable** as pre-quantized snapshots ([`crate::convert`])
-            // and are also reachable by quantizing a dense snapshot at load.
+            // Both affine tiers ship as **pre-quantized** snapshots ([`crate::convert`]); against
+            // one, `spec.quantize` only selects the tier on disk. Against a dense snapshot a Q4/Q8
+            // request still quantizes the DiT and the Qwen3 tower at load (the tower's is a typed
+            // refusal for a geometry the group size cannot cover). A non-affine request, a request
+            // that disagrees with a packed tier, or no request against one is a typed refusal
+            // ([`crate::quant::needs_load_time_quant`]), never a silent mis-serve.
             supported_quants: &[Quant::Q4, Quant::Q8],
             // No `component_precision_floors`: a tier is a whole-pipeline contract, so every
             // packable component runs the tier the caller selected (`crate::quant`).

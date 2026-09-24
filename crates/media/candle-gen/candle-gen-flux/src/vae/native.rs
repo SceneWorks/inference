@@ -3,7 +3,8 @@
 // faithful upstream copy warning-clean under the workspace `-D warnings` gate.
 #![allow(dead_code)]
 use candle_gen::candle_core::{Result, Tensor, D};
-use candle_gen::candle_nn::{conv2d, group_norm, Conv2d, GroupNorm, VarBuilder};
+use candle_gen::candle_nn::{group_norm, GroupNorm, VarBuilder};
+use candle_gen::{budgeted_conv2d as conv2d, BudgetedConv2d as Conv2d};
 
 // https://github.com/black-forest-labs/flux/blob/727e3a71faf37390f318cf9434f0939653302b60/src/flux/modules/autoencoder.py#L9
 #[derive(Debug, Clone)]
