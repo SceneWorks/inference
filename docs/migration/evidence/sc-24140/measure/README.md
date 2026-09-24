@@ -4,8 +4,10 @@ Epic sc-24128, feature-end fix story, findings A–E. Host: Windows 11, **RTX Pr
 (GPU 1, `CUDA_VISIBLE_DEVICES=1`), CUDA 12.9, MSVC 14.44, `CUDA_COMPUTE_CAP=120`, release builds
 with `--features cuda`. Real-weight model: `Qwen/Qwen3-8B` @ `b968826d9c46`
 (`qwen3-8b`, pinned in `release/real-weight-models.toml`, config sha256 `f7c4eadf…` pinned in
-`scripts/release/decode_bench.py`). Final measured code: `6867f52d9` (this branch merged with the
-feature head carrying S11 #1035 and the round-1 decode fixes #1036), clean tree.
+`scripts/release/decode_bench.py`). Measured code: `6867f52d9` (this branch merged with the
+feature head carrying S11 #1035 and the round-1 decode fixes #1036), clean tree. The code after it
+adds only the per-thread mask accounting in tests (`attention.rs`) and boxes the `CausalLm` LM
+head with its device (CUDA clippy `large_enum_variant`) — no arithmetic change.
 
 ## A — NVFP4 reaches the llama family (`CausalLm`)
 
@@ -147,9 +149,10 @@ they fail (3 of 3 and 9 of 9) naming the reason; on GPU 1 with `REQUIRE_SM120=1`
 
 ## Mutations
 
-`mutations.log` — 47 mutations, one per added or changed assertion, each applied alone to a
-touched source, the named gate run, and the source restored: **47 RED** (P19 reds through the
+`mutations.log` — 51 mutations, one per added or changed assertion, each applied alone to a
+touched source, the named gate run, and the source restored: **51 RED** (P19 reds through the
 campaign's own coverage refusal, a `ValueError`, rather than the test's assertion). Python
 harness (P1–P21), Rust CPU (R1–R16, S1–S2 — the S11 probe after the merge —, T1), Rust CUDA on
 GPU 1 (C1–C5), real weights on GPU 1 (G1: the reference loop computing `Expanded` fails the exact
-rows at 65; G2: counting every disagreement fails the teacher-forced gate).
+rows at 65; G2: counting every disagreement fails the teacher-forced gate). R1b / R2b / C1b / C2b
+re-run the head mutations on the final (boxed-head) code.

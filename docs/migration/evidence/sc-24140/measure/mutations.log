@@ -518,3 +518,52 @@
     FAILED
     test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7 filtered out; finished in 52.59s
 
+[R1b] RED (exit 101, 5s)
+  assertion: the llama census counts the LM head as a projection (final code)
+  mutation:  weight_census skips the head
+  file:      crates\llm\candle-llm\src\models\llama.rs
+  gate:      cargo test --locked -p candle-llm --lib -- weight_census_counts_projections
+  failure:
+    test models::llama::tests::weight_census_counts_projections_by_kind_and_every_other_tensor ... FAILED
+    thread 'models::llama::tests::weight_census_counts_projections_by_kind_and_every_other_tensor' (32000) panicked at crates\llm\candle-llm\src\models\llama.rs:2635:9:
+    assertion `left == right` failed
+    left: 14
+    right: 15
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 380 filtered out; finished in 0.00s
+
+[R2b] RED (exit 101, 3s)
+  assertion: a dense tied head's storage is counted once (final code)
+  mutation:  head_is_embedding always false
+  file:      crates\llm\candle-llm\src\models\llama.rs
+  gate:      cargo test --locked -p candle-llm --lib -- weight_census_counts_projections
+  failure:
+    test models::llama::tests::weight_census_counts_projections_by_kind_and_every_other_tensor ... FAILED
+    thread 'models::llama::tests::weight_census_counts_projections_by_kind_and_every_other_tensor' (26792) panicked at crates\llm\candle-llm\src\models\llama.rs:2667:9:
+    assertion `left == right` failed: a dense tied head is the embedding
+    left: 10
+    right: 9
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 380 filtered out; finished in 0.00s
+
+[C1b] RED (exit 101, 7s)
+  assertion: an NVFP4 llama load stores the LM head as NVFP4 (final code)
+  mutation:  the head is loaded dense under NVFP4
+  file:      crates\llm\candle-llm\src\models\llama.rs
+  gate:      cargo test --locked --features cuda -p candle-llm --lib -- nvfp4_format_loads_every --test-threads=1
+  failure:
+    test models::llama::tests::nvfp4_format_loads_every_eligible_projection_and_the_head_as_nvfp4 ... FAILED
+    thread 'models::llama::tests::nvfp4_format_loads_every_eligible_projection_and_the_head_as_nvfp4' (26492) panicked at crates\llm\candle-llm\src\models\llama.rs:2702:9:
+    assertion `left == right` failed
+    left: Dense
+    right: Nvfp4
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 410 filtered out; finished in 0.15s
+
+[C2b] RED (exit 101, 6s)
+  assertion: an FP4-ineligible head (40 rows) stays dense instead of refusing the load (final code)
+  mutation:  the head goes through the strict load_as
+  file:      crates\llm\candle-llm\src\models\llama.rs
+  gate:      cargo test --locked --features cuda -p candle-llm --lib -- nvfp4_format_loads_every --test-threads=1
+  failure:
+    test models::llama::tests::nvfp4_format_loads_every_eligible_projection_and_the_head_as_nvfp4 ... FAILED
+    thread 'models::llama::tests::nvfp4_format_loads_every_eligible_projection_and_the_head_as_nvfp4' (35228) panicked at crates\llm\candle-llm\src\models\llama.rs:2755:85:
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 410 filtered out; finished in 0.26s
+
