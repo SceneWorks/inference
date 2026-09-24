@@ -1,0 +1,13 @@
+warning: candle-kernels@0.10.2: Compiling 11 of 11 PTX kernels
+warning: candle-kernels@0.10.2: Using 24 threads for compilation
+warning: candle-kernels@0.10.2: Compiling 15 of 15 kernels
+    Finished `release` profile [optimized] target(s) in 0.26s
+     Running tests\cuda_graphs.rs (C:\cargo-targets\at-head-rc1\release\deps\cuda_graphs-27c63b839f4d805e.exe)
+
+running 1 test
+test ac1_graphs_on_is_token_identical_to_eager_for_spec_off_and_mtp_k3 ... [cuda_graphs] spec off, graphs on: graph: eager replayed=0 eager=256 captured=0 fallback=positions_host_scalar (256 tokens)
+[cuda_graphs] MTP K=3, graphs on: graph: eager replayed=0 eager=96 captured=0 fallback=positions_host_scalar (accepted 160 / proposed 281, verify steps 95)
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 81.39s
+

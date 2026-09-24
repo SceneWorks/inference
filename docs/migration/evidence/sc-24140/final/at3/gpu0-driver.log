@@ -1,0 +1,15 @@
+=== AT3 parity 27B start Thu 09/24/2026 10:37:58.04
+PARITY27_EXIT=0
+=== AT3 cuda_graphs ac1 start Thu 09/24/2026 10:50:51.02
+CUDAGRAPHS_EXIT=0
+=== AT3 qwen35_vision start Thu 09/24/2026 10:52:12.95
+VISION_EXIT=0
+=== AT4 27B start Thu 09/24/2026 10:52:39.20
+AT4_27B_EXIT=0
+=== load_residency 27B bf16 start Thu 09/24/2026 10:54:54.67
+LR27_BF16_EXIT=0
+=== load_residency 27B q8 start Thu 09/24/2026 10:55:35.13
+LR27_Q8_EXIT=0
+=== load_residency 27B nvfp4 start Thu 09/24/2026 10:58:18.80
+LR27_NVFP4_EXIT=0
+=== GPU0 done Thu 09/24/2026 10:58:58.15
