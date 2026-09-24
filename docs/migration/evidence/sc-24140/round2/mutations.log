@@ -1,0 +1,80 @@
+# sc-24140 feature-end review, round 2: one mutation per added or changed assertion.
+# Each mutation applied alone to the named source, the named test run, the source restored and
+# touched. Python: scripts/release/decode_bench.py mutated, scripts/tests/test_decode_bench.py run.
+# Rust CPU: CARGO_TARGET_DIR=C:/cargo-targets/fe-r2-cpu. Rust CUDA: --features cuda,
+# CUDA_VISIBLE_DEVICES=1 (RTX PRO 6000 Blackwell Max-Q, sm_120), MSVC 14.44, CUDA_COMPUTE_CAP=120.
+
+# 59 mutations, 59 RED.
+## Python (P1-P34): <id> <assertion> -> <result> (pytest summary)
+P1 prompt hash joins the comparison key -> RED (1 failed, 26 deselected in 0.24s)
+P2 sampling seed joins the comparison key -> RED (1 failed, 26 deselected in 0.22s)
+P3 document device must be cuda/cpu -> RED (1 failed, 26 deselected in 1.57s)
+P4 prompt_token_ids required -> RED (1 failed, 26 deselected in 1.54s)
+P5 prompt_token_ids length == prompt_tokens -> RED (1 failed, 26 deselected in 1.55s)
+P6 label needs a CUDA device -> RED (1 failed, 26 deselected in 0.56s)
+P7 label's compute capability must match -> RED (1 failed, 26 deselected in 1.00s)
+P8 label's GPU name must match -> RED (1 failed, 26 deselected in 1.31s)
+P9 label must be <GPU> / sm_<NN> -> RED (1 failed, 26 deselected in 1.61s)
+P10 head binary must embed provenance -> RED (1 failed, 26 deselected in 0.48s)
+P11 embedded SHA must be the runtime SHA -> RED (1 failed, 26 deselected in 0.80s)
+P12 head binary must be built clean -> RED (1 failed, 26 deselected in 1.03s)
+P13 baseline binary naming another commit refused -> RED (1 failed, 26 deselected in 0.99s)
+P14 run checks the probed hardware -> RED (1 failed, 26 deselected in 0.61s)
+P15 run checks the build provenance -> RED (1 failed, 26 deselected in 0.53s)
+P16a campaign re-checks collected head runs -> RED (1 failed, 26 deselected in 0.69s)
+P16b campaign re-checks baselines' device -> RED (1 failed, 26 deselected in 0.72s)
+P17 a non-baseline first run is labelled 'no S1 baseline' -> RED (1 failed, 25 deselected in 0.25s)
+P18 bf16 without a basis reads 'n/a (no S1 baseline)' -> RED (1 failed, 26 deselected in 0.24s)
+P19 run-mode campaign refuses a model without S1 baseline before running -> RED (1 failed, 26 deselected in 4.26s)
+P20 a missing S1 baseline joins the missing list -> RED (1 failed, 26 deselected in 1.05s)
+P21 the S1 baseline must be bf16 -> RED (1 failed, 26 deselected in 0.71s)
+P22 the S1 baseline must be the model's own -> RED (1 failed, 26 deselected in 4.62s)
+P23 the index records allow_partial -> RED (1 failed, 26 deselected in 1.03s)
+P24 campaign-verify fails missing cells unless allowed -> RED (1 failed, 26 deselected in 1.04s)
+P25 campaign-verify reports each missing cell -> RED (1 failed, 26 deselected in 1.02s)
+P26 verify recomputes the missing list -> RED (1 failed, 26 deselected in 1.06s)
+P27 INDEX.md names a partial campaign -> RED (1 failed, 26 deselected in 1.04s)
+P28 INDEX.md lists each model's S1 baseline -> RED (1 failed, 25 deselected in 1.03s)
+P29 campaign-verify says a complete campaign is complete -> RED (1 failed, 26 deselected in 3.70s)
+P30 run.json carries the binary's build provenance -> RED (1 failed, 26 deselected in 0.64s)
+P31 run.json carries the probed device -> RED (1 failed, 26 deselected in 0.63s)
+P32 run.json carries the prompt hash -> RED (1 failed, 26 deselected in 0.61s)
+P33 the S1 baseline is in each model's table (unlabelled basis) -> RED (1 failed, 26 deselected in 3.71s)
+P34 a collected campaign copies its baselines in -> RED (1 failed, 26 deselected in 1.01s)
+
+## Rust, CPU (R1-R12): <id> <assertion> -> <result> [test; where it failed]
+R1a LLaVA refusal says 'not served for LLaVA' -> RED [backend::tests::nvfp4_support_follows_the_selected_providers_own_gates; panicked at crates\llm\candle-llm\src\backend.rs:397:13]
+R1b StarVector-1B refusal says 'not served for StarVector-1B' -> RED [backend::tests::nvfp4_support_follows_the_selected_providers_own_gates; panicked at crates\llm\candle-llm\src\backend.rs:397:13]
+R1c StarVector-8B refusal says 'not served for StarVector-8B' -> RED [backend::tests::nvfp4_support_follows_the_selected_providers_own_gates; panicked at crates\llm\candle-llm\src\backend.rs:397:13]
+R2 no refusal claims 'qwen3_5 family only' -> RED [backend::tests::nvfp4_support_follows_the_selected_providers_own_gates; panicked at crates\llm\candle-llm\src\backend.rs:401:13]
+R3 probe refuses a packed MLX-affine snapshot -> RED [backend::tests::nvfp4_support_follows_the_selected_providers_own_gates; panicked at crates\llm\candle-llm\src\backend.rs:415:9]
+R4 probe offers a prepared Q4 snapshot (block over dense weights) -> RED [backend::tests::nvfp4_support_follows_the_selected_providers_own_gates; panicked at crates\llm\candle-llm\src\backend.rs:418:9]
+R5 the load refuses a packed snapshot at the gate, as the probe does -> RED [backend::tests::nvfp4_support_answers_what_the_load_does; panicked at crates\llm\candle-llm\src\backend.rs:479:17]
+R6a gate reads shard headers when there is no index -> RED [provider::tests::nvfp4_gate_refuses_a_packed_mlx_affine_snapshot_before_the_device_gate; panicked at crates\llm\candle-llm\src\provider.rs:4925:13]
+R6b gate reads a text_config quantization block -> RED [provider::tests::nvfp4_gate_refuses_a_packed_mlx_affine_snapshot_before_the_device_gate; panicked at crates\llm\candle-llm\src\provider.rs:4922:13]
+R6c an orphan .scales is not a packed triple -> RED [provider::tests::nvfp4_gate_refuses_a_packed_mlx_affine_snapshot_before_the_device_gate; panicked at crates\llm\candle-llm\src\provider.rs:4947:17]
+R6d a triple without a quantization block is not refused by the gate -> RED [provider::tests::nvfp4_gate_refuses_a_packed_mlx_affine_snapshot_before_the_device_gate; panicked at crates\llm\candle-llm\src\provider.rs:4947:17]
+R6e the packed refusal is one sentence (no run of spaces) -> RED [provider::tests::nvfp4_gate_refuses_a_packed_mlx_affine_snapshot_before_the_device_gate; panicked at crates\llm\candle-llm\src\provider.rs:4928:13]
+R8a the switch lock is re-entrant on its thread -> RED [primitives::switch::tests::the_lock_is_reentrant_on_its_thread_and_excludes_every_other_thread; panicked at crates\llm\candle-llm\src\primitives\switch.rs:312:14]
+R8b the switch lock excludes other threads -> RED [primitives::switch::tests::the_lock_is_reentrant_on_its_thread_and_excludes_every_other_thread; panicked at crates\llm\candle-llm\src\primitives\switch.rs:323:9]
+R8c the last release wakes a waiting thread -> RED [primitives::switch::tests::the_lock_is_reentrant_on_its_thread_and_excludes_every_other_thread; panicked at crates\llm\candle-llm\src\primitives\switch.rs:329:14]
+R8d a guard still restores its policy (a hold restores none) -> RED [primitives::switch::tests::the_lock_is_reentrant_on_its_thread_and_excludes_every_other_thread; panicked at crates\llm\candle-llm\src\primitives\switch.rs:313:9]
+R9 no unit test opens a CUDA device outside the locked helpers -> RED [device::tests::cuda_devices_are_opened_only_behind_the_cuda_test_lock; panicked at crates\llm\candle-llm\src\device.rs:270:9]
+R12a an empty embedded provenance reads as null -> RED [build_provenance_is_absent_or_names_the_checkout_head; panicked at crates\llm\candle-llm\tests\decode_bench.rs:1806:5]
+R12b embedded provenance names the checkout HEAD (built with CANDLE_LLM_BUILD_PROVENANCE=1) -> RED [build_provenance_is_absent_or_names_the_checkout_head; panicked at crates\llm\candle-llm\tests\decode_bench.rs:1806:5]
+#   R12b ran on a build with CANDLE_LLM_BUILD_PROVENANCE=1 (build.rs mutated to embed HEAD~1);
+#   unmutated, the same build embeds HEAD and the test is GREEN (2 passed).
+
+## Rust, CUDA on GPU 1 (R7, R10, R11): <id> <assertion> -> <result> [test; where it failed]
+R7 the llama MLX-affine NVFP4 refusal is one sentence -> RED [models::llama::tests::nvfp4_format_loads_every_eligible_projection_and_the_head_as_nvfp4; panicked at crates\llm\candle-llm\src\models\llama.rs:2794:17]
+R10a select_device takes the CUDA test lock -> RED [device::cuda_tests::opening_a_cuda_device_holds_the_cuda_test_lock_until_the_thread_ends; panicked at crates\llm\candle-llm\src\device.rs:351:13]
+R10b new_cuda_for_test takes the CUDA test lock -> RED [device::cuda_tests::opening_a_cuda_device_holds_the_cuda_test_lock_until_the_thread_ends; panicked at crates\llm\candle-llm\src\device.rs:352:13]
+R11a the probe reports major.minor -> RED [device_probe_reads_the_cuda_device_and_nothing_on_cpu; panicked at crates\llm\candle-llm\tests\decode_bench.rs:1780:53]
+R11b the probe reads 12.0 on the sm_120 lane (REQUIRE_SM120=1) -> RED [device_probe_reads_the_cuda_device_and_nothing_on_cpu; panicked at crates\llm\candle-llm\tests\decode_bench.rs:1787:9]
+#   R11b ran with REQUIRE_SM120=1; unmutated, the probe test is GREEN on GPU 1 with REQUIRE_SM120=1.
+
+## Finding 5: the 20x CUDA lib loop (--test-threads=8, GPU 1)
+fixed (this branch): 20 runs, 0 failures (cuda-lib-loop-fixed.txt)
+control (feature head 022246245, no CUDA test lock): 20 runs, 9 failures, every one
+  poc_contiguous_ops_replay_bit_exact_and_index_select_is_refused: capture abandoned: capture_invalidated
+  (cuda-lib-loop-control.txt)

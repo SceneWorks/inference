@@ -1,0 +1,22 @@
+# candle-llm CUDA lib tests, fixed binary (this branch), 20 runs: <exe> --test-threads=8, CUDA_VISIBLE_DEVICES=1 (RTX PRO 6000 Blackwell Max-Q, sm_120)
+run 1 exit=0 test result: ok. 402 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 6.84s
+run 2 exit=0 test result: ok. 402 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 6.90s
+run 3 exit=0 test result: ok. 402 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 6.88s
+run 4 exit=0 test result: ok. 402 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 7.41s
+run 5 exit=0 test result: ok. 402 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 7.66s
+run 6 exit=0 test result: ok. 402 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 7.81s
+run 7 exit=0 test result: ok. 402 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 7.18s
+run 8 exit=0 test result: ok. 402 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 6.61s
+run 9 exit=0 test result: ok. 402 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 6.68s
+run 10 exit=0 test result: ok. 402 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 6.57s
+run 11 exit=0 test result: ok. 402 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 6.06s
+run 12 exit=0 test result: ok. 402 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 5.94s
+run 13 exit=0 test result: ok. 402 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 6.28s
+run 14 exit=0 test result: ok. 402 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 5.96s
+run 15 exit=0 test result: ok. 402 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 6.55s
+run 16 exit=0 test result: ok. 402 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 6.16s
+run 17 exit=0 test result: ok. 402 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 6.08s
+run 18 exit=0 test result: ok. 402 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 6.16s
+run 19 exit=0 test result: ok. 402 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 6.05s
+run 20 exit=0 test result: ok. 402 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 6.07s
+TOTAL runs=20 failures=0 CUDA_VISIBLE_DEVICES=1
