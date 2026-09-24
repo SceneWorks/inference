@@ -54,13 +54,15 @@ pub mod providers {
     pub use candle_audio_openvoice;
     pub use candle_audio_stable_audio_3;
     pub use candle_audio_whisper;
+    pub use candle_audio_yue;
 }
 
 /// Add every provider shipped by the Candle audio lane to an explicit registry builder, in
 /// stable catalog order: the generators first (Kokoro TTS, MOSS SFX, ACE-Step music, Stable Audio 3
 /// small-music — sc-14543 and small-sfx — sc-14544, MOSS-TTS-Realtime
 /// streaming TTS — sc-13392, Chatterbox clone-TTS — sc-13239, MMAudio video→audio Foley 16k — sc-12843
-/// and 44.1 kHz — sc-13441), then the voice-cloning identity embedder (Chatterbox `ve`, sc-12844),
+/// and 44.1 kHz — sc-13441, MOSS-TTSD dialogue — sc-13518, the six YuE lyrics2song variants —
+/// sc-19382), then the voice-cloning identity embedder (Chatterbox `ve`, sc-12844),
 /// then the audio transforms
 /// (OpenVoice V2 voice conversion, sc-13223 — the first real `AudioTransform`), then the
 /// transcribers (Whisper ASR, sc-12850 — the first real `Transcriber`, the audio Captioner-analog),
@@ -75,6 +77,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = candle_audio_chatterbox::register_providers(registry);
     let registry = candle_audio_mmaudio::register_providers(registry);
     let registry = candle_audio_moss_tts::register_providers(registry);
+    let registry = candle_audio_yue::register_providers(registry);
     let registry = candle_audio_chatterbox_ve::register_providers(registry);
     let registry = candle_audio_openvoice::register_providers(registry);
     let registry = candle_audio_whisper::register_providers(registry);
@@ -137,6 +140,7 @@ pub fn component_licenses() -> Vec<gen_core::ComponentLicense> {
     rows.extend_from_slice(candle_audio_chatterbox::COMPONENT_LICENSES);
     rows.extend_from_slice(candle_audio_mmaudio::COMPONENT_LICENSES);
     rows.extend_from_slice(candle_audio_moss_tts::COMPONENT_LICENSES);
+    rows.extend_from_slice(candle_audio_yue::COMPONENT_LICENSES);
     // Deliberately empty: `chatterbox_ve` loads the row `candle-audio-chatterbox` already owns.
     rows.extend_from_slice(candle_audio_chatterbox_ve::COMPONENT_LICENSES);
     rows.extend_from_slice(candle_audio_openvoice::COMPONENT_LICENSES);
@@ -157,6 +161,7 @@ pub fn provider_components() -> Vec<gen_core::ProviderComponents> {
     providers.extend_from_slice(candle_audio_chatterbox::PROVIDER_COMPONENTS);
     providers.extend_from_slice(candle_audio_mmaudio::PROVIDER_COMPONENTS);
     providers.extend_from_slice(candle_audio_moss_tts::PROVIDER_COMPONENTS);
+    providers.extend_from_slice(candle_audio_yue::PROVIDER_COMPONENTS);
     providers.extend_from_slice(candle_audio_chatterbox_ve::PROVIDER_COMPONENTS);
     providers.extend_from_slice(candle_audio_openvoice::PROVIDER_COMPONENTS);
     providers.extend_from_slice(candle_audio_whisper::PROVIDER_COMPONENTS);
@@ -332,7 +337,13 @@ mod tests {
                 "chatterbox_tts",
                 "mmaudio_small_16k",
                 "mmaudio_large_44k",
-                "moss_ttsd_v05"
+                "moss_ttsd_v05",
+                "yue_en_cot",
+                "yue_en_icl",
+                "yue_zh_cot",
+                "yue_zh_icl",
+                "yue_jp_kr_cot",
+                "yue_jp_kr_icl"
             ]
         );
         // The voice-cloning identity embedder surfaces as its own kind (sc-12844), in catalog order.
@@ -631,6 +642,62 @@ mod tests {
                 MMAUDIO.to_vec(),
             ),
             ("moss_ttsd_v05", vec!["moss_ttsd_v05"], APACHE.to_vec()),
+            // YuE (sc-19382): each variant loads its own stage-1 checkpoint plus the shared stage-2
+            // and xcodec snapshots — one row per artifact, all Apache-2.0.
+            (
+                "yue_en_cot",
+                vec![
+                    "yue_s1_7b_anneal_en_cot",
+                    "yue_s2_1b_general",
+                    "xcodec_mini_infer",
+                ],
+                APACHE.to_vec(),
+            ),
+            (
+                "yue_en_icl",
+                vec![
+                    "yue_s1_7b_anneal_en_icl",
+                    "yue_s2_1b_general",
+                    "xcodec_mini_infer",
+                ],
+                APACHE.to_vec(),
+            ),
+            (
+                "yue_zh_cot",
+                vec![
+                    "yue_s1_7b_anneal_zh_cot",
+                    "yue_s2_1b_general",
+                    "xcodec_mini_infer",
+                ],
+                APACHE.to_vec(),
+            ),
+            (
+                "yue_zh_icl",
+                vec![
+                    "yue_s1_7b_anneal_zh_icl",
+                    "yue_s2_1b_general",
+                    "xcodec_mini_infer",
+                ],
+                APACHE.to_vec(),
+            ),
+            (
+                "yue_jp_kr_cot",
+                vec![
+                    "yue_s1_7b_anneal_jp_kr_cot",
+                    "yue_s2_1b_general",
+                    "xcodec_mini_infer",
+                ],
+                APACHE.to_vec(),
+            ),
+            (
+                "yue_jp_kr_icl",
+                vec![
+                    "yue_s1_7b_anneal_jp_kr_icl",
+                    "yue_s2_1b_general",
+                    "xcodec_mini_infer",
+                ],
+                APACHE.to_vec(),
+            ),
             // The same artifact row the generator points at — one checkpoint, one row, two
             // providers.
             ("chatterbox_ve", vec!["chatterbox"], MIT_ONLY.to_vec()),
@@ -653,8 +720,8 @@ mod tests {
             })
             .collect();
         assert_eq!(ordered, expected);
-        assert_eq!(providers.len(), 18);
-        assert_eq!(components.len(), 33);
+        assert_eq!(providers.len(), 24);
+        assert_eq!(components.len(), 41);
     }
 
     /// **The migration proof: no provider lost a term it previously carried (sc-16663).**

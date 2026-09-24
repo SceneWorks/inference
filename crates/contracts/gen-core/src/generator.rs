@@ -846,6 +846,19 @@ pub struct AudioParams {
     /// [`AudioParams`]. `prompt` still carries any single-voice / global text; a model that reads the
     /// script renders it in preference to `prompt`.
     pub script: Option<Vec<SpeechSegment>>,
+    /// How many **lyric segments** to render (segment-by-segment autoregressive song models, e.g.
+    /// YuE — sc-19382). `None` ⇒ the model default. A model that renders the whole text in one pass
+    /// ignores it; one that reads it documents how it resolves a count larger than the lyrics hold.
+    pub segments: Option<u32>,
+    /// Per-segment autoregressive **token budget** (segment-by-segment song models, sc-19382).
+    /// `None` ⇒ the model default. Must be `>= 1` where read.
+    pub max_new_tokens_per_segment: Option<u32>,
+    /// Autoregressive **repetition penalty** (token-sampled audio models, sc-19382). `None` ⇒ the
+    /// model default. Must be finite and `> 0` where read.
+    pub repetition_penalty: Option<f32>,
+    /// The span of the [`Conditioning::ReferenceAudio`] clip a model conditions on (in-context
+    /// audio prompting, e.g. YuE ICL — sc-19382), in seconds. `None` ⇒ the model default window.
+    pub reference_region: Option<TimeRegion>,
 }
 
 /// One segment of a multi-speaker dialogue [`script`](AudioParams::script) (sc-12848) — the text a
@@ -1364,13 +1377,27 @@ impl GenerationRequest {
             // The script carries no floats (text + opaque labels); named (no `..`) so a future
             // float-bearing per-segment control fails to compile here until it is classified.
             script: _,
+            // Integer counts (sc-19382): no floats to classify.
+            segments: _,
+            max_new_tokens_per_segment: _,
             target_duration,
             bpm,
+            repetition_penalty,
+            reference_region,
         }) = audio
         {
-            let audio_floats: [(&'static str, Option<f32>); 2] = [
+            let audio_floats: [(&'static str, Option<f32>); 5] = [
                 ("audio.target_duration", *target_duration),
                 ("audio.bpm", *bpm),
+                ("audio.repetition_penalty", *repetition_penalty),
+                (
+                    "audio.reference_region.start_secs",
+                    reference_region.map(|r| r.start_secs),
+                ),
+                (
+                    "audio.reference_region.end_secs",
+                    reference_region.and_then(|r| r.end_secs),
+                ),
             ];
             for (name, v) in audio_floats {
                 if let Some(x) = v {
