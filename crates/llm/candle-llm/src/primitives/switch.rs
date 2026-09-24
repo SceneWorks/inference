@@ -16,9 +16,16 @@
 //! cannot race on the global, and the policy it found, restored on drop — including a policy that
 //! was deferring to the environment (`None`), which a hand-rolled "read then set `Some(was)`"
 //! restore would pin instead.
+//!
+//! The lock is **re-entrant on one thread** (sc-24140 feature-end review): the CUDA-graph
+//! switch's lock is also the CUDA unit tests' serialization lock, which a test thread takes when
+//! it opens a CUDA device ([`ProcessSwitch::hold`]) and keeps until it exits, so the same thread
+//! must still be able to take a [`SwitchGuard`] afterwards. Another thread still waits.
 
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
+use std::thread::ThreadId;
 
 const POLICY_ENV: u8 = 0;
 const POLICY_ON: u8 = 1;
@@ -32,7 +39,7 @@ pub struct ProcessSwitch {
     parse: fn(&str) -> bool,
     policy: AtomicU8,
     from_env: OnceLock<bool>,
-    lock: Mutex<()>,
+    lock: ThreadLock,
 }
 
 impl ProcessSwitch {
@@ -45,7 +52,7 @@ impl ProcessSwitch {
             parse,
             policy: AtomicU8::new(POLICY_ENV),
             from_env: OnceLock::new(),
-            lock: Mutex::new(()),
+            lock: ThreadLock::new(),
         }
     }
 
@@ -81,10 +88,7 @@ impl ProcessSwitch {
     /// restores the policy it found — override or deferral — when dropped. [`set`](Self::set)
     /// may still be called while it is held.
     pub fn guard(&'static self, enabled: Option<bool>) -> SwitchGuard {
-        let lock = self
-            .lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let lock = self.hold();
         let previous = self.policy.load(Ordering::Relaxed);
         self.set(enabled);
         SwitchGuard {
@@ -92,6 +96,121 @@ impl ProcessSwitch {
             previous,
             _lock: lock,
         }
+    }
+
+    /// Take the switch's lock without touching its policy: the lock is released when the
+    /// returned [`SwitchLock`] drops, and nothing is restored. Re-entrant on the holding thread.
+    pub fn hold(&'static self) -> SwitchLock {
+        self.lock.acquire();
+        SwitchLock {
+            lock: &self.lock,
+            _thread_bound: PhantomData,
+        }
+    }
+
+    /// [`hold`](Self::hold) without waiting: `None` while another thread holds the lock — the
+    /// clock-free way for a test to observe that the lock is held elsewhere.
+    #[cfg(test)]
+    pub(crate) fn try_hold(&'static self) -> Option<SwitchLock> {
+        // Lazily: a `SwitchLock` built for a failed attempt would release someone else's hold
+        // when dropped.
+        self.lock.try_acquire().then(|| SwitchLock {
+            lock: &self.lock,
+            _thread_bound: PhantomData,
+        })
+    }
+}
+
+/// A lock that one thread may take any number of times (each [`SwitchLock`] releases one) while
+/// every other thread waits for the last release.
+struct ThreadLock {
+    state: Mutex<LockState>,
+    released: Condvar,
+}
+
+struct LockState {
+    owner: Option<ThreadId>,
+    depth: usize,
+    /// Threads blocked in [`ThreadLock::acquire`] (tests read it to know a waiter is parked).
+    waiting: usize,
+}
+
+impl LockState {
+    /// Take one hold for `me` unless another thread owns the lock.
+    fn take(&mut self, me: ThreadId) -> bool {
+        if self.owner.is_some_and(|owner| owner != me) {
+            return false;
+        }
+        self.owner = Some(me);
+        self.depth += 1;
+        true
+    }
+}
+
+impl ThreadLock {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new(LockState {
+                owner: None,
+                depth: 0,
+                waiting: 0,
+            }),
+            released: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) {
+        let me = std::thread::current().id();
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        while !state.take(me) {
+            state.waiting += 1;
+            state = self
+                .released
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+            state.waiting -= 1;
+        }
+    }
+
+    #[cfg(test)]
+    fn try_acquire(&self) -> bool {
+        let me = std::thread::current().id();
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.take(me)
+    }
+
+    /// How many threads are parked waiting for the lock.
+    #[cfg(test)]
+    fn waiting(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .waiting
+    }
+
+    /// Release one hold. Never asks for the current thread, so it also runs from a thread-local
+    /// destructor at thread exit.
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.depth = state.depth.saturating_sub(1);
+        if state.depth == 0 {
+            state.owner = None;
+            self.released.notify_all();
+        }
+    }
+}
+
+/// One hold of a [`ProcessSwitch`]'s lock ([`ProcessSwitch::hold`]); releases it when dropped.
+/// Bound to the thread that took it.
+#[must_use = "the lock is only held while the value is alive"]
+pub struct SwitchLock {
+    lock: &'static ThreadLock,
+    _thread_bound: PhantomData<*const ()>,
+}
+
+impl Drop for SwitchLock {
+    fn drop(&mut self) {
+        self.lock.release();
     }
 }
 
@@ -109,7 +228,8 @@ fn encode(enabled: Option<bool>) -> u8 {
 pub struct SwitchGuard {
     switch: &'static ProcessSwitch,
     previous: u8,
-    _lock: MutexGuard<'static, ()>,
+    // Declared last: dropped after `Drop::drop` has restored the policy.
+    _lock: SwitchLock,
 }
 
 impl SwitchGuard {
@@ -196,5 +316,68 @@ mod tests {
         );
         std::env::remove_var(READ_ONCE.env());
         assert!(READ_ONCE.enabled());
+    }
+
+    /// sc-24140 feature-end review: the lock is re-entrant on the thread that holds it — a
+    /// thread-lifetime [`ProcessSwitch::hold`] followed by a [`SwitchGuard`] and another hold does
+    /// not deadlock, and the hold restores no policy — while no other thread can take it, and a
+    /// thread parked waiting for it gets it at the last release. Nothing is read through a clock:
+    /// exclusion is a non-waiting `try_hold`, the waiter is known parked by the lock's own count;
+    /// the only timeouts bound a regression's hang.
+    #[test]
+    fn the_lock_is_reentrant_on_its_thread_and_excludes_every_other_thread() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        static SHARED: ProcessSwitch =
+            ProcessSwitch::new("CANDLE_LLM_TEST_SWITCH_UNSET_C", false, on_words);
+
+        let (holding, held) = channel();
+        let (release, released) = channel::<()>();
+        let owner = std::thread::spawn(move || {
+            let outer = SHARED.hold();
+            {
+                let _guard = SHARED.guard(Some(true));
+                let _again = SHARED.hold();
+                assert!(SHARED.enabled());
+            }
+            let restored = SHARED.enabled();
+            holding.send(restored).unwrap();
+            released.recv().unwrap();
+            drop(outer);
+        });
+        let restored = held
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the holding thread re-entered its own lock");
+        assert!(
+            !restored,
+            "the guard restores its policy; the outer hold restores nothing"
+        );
+
+        let taken_elsewhere = std::thread::spawn(|| SHARED.try_hold().is_some())
+            .join()
+            .unwrap();
+        assert!(
+            !taken_elsewhere,
+            "no other thread can take the lock while it is held"
+        );
+
+        let (acquired_tx, acquired) = channel();
+        let waiter = std::thread::spawn(move || {
+            let _held = SHARED.hold();
+            acquired_tx.send(()).unwrap();
+        });
+        // Release only once the waiter is parked on the lock, so the hand-off is what wakes it.
+        while SHARED.lock.waiting() == 0 {
+            if acquired.try_recv().is_ok() {
+                panic!("the waiter took a lock another thread holds");
+            }
+            std::thread::yield_now();
+        }
+        release.send(()).unwrap();
+        acquired
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the last release hands the lock to the waiting thread");
+        owner.join().unwrap();
+        waiter.join().unwrap();
     }
 }

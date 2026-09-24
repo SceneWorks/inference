@@ -3466,7 +3466,7 @@ pub(crate) mod tests {
     #[test]
     fn nvfp4_format_loads_the_large_projections_as_nvfp4() {
         use crate::primitives::projection::{ProjectionFormat, ProjectionKind};
-        let Ok(device) = Device::new_cuda(0) else {
+        let Ok(device) = crate::device::new_cuda_for_test() else {
             candle_quant_kernels::skip_without_sm120("no CUDA device");
             return;
         };

@@ -373,15 +373,15 @@ pub struct CandleStarVectorProvider {
     prompt: Vec<i32>,
     model: Mutex<StarVectorModel>,
 }
-/// The load's NVFP4 refusal (sc-24139): NVFP4 is served for the qwen3_5 family only (sc-24135), and
+/// The load's NVFP4 refusal (sc-24139): NVFP4 is not served for StarVector-1B (the Llama
+/// provider serves it for the qwen3_5 hybrid and the llama family, sc-24135 / sc-24140), and
 /// NVFP4 is a capability a provider must refuse rather than silently load another
 /// representation. [`crate::backend::nvfp4_support`] answers a product's per-snapshot question
 /// with the same gate.
 pub(crate) fn nvfp4_gate(spec: &core_llm::LoadSpec) -> core_llm::Result<()> {
     if spec.quantize == Some(core_llm::Quantize::Nvfp4) {
         return Err(core_llm::Error::Unsupported(
-            "nvfp4: NVFP4 projections are served for the qwen3_5 family only, not StarVector-1B"
-                .into(),
+            "nvfp4: NVFP4 projections are not served for StarVector-1B".into(),
         ));
     }
     Ok(())

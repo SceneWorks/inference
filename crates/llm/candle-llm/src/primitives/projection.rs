@@ -636,7 +636,7 @@ mod tests {
     /// A CUDA device that meets the NVFP4 floor, or `None` (the GPU tests then skip loudly).
     #[cfg(feature = "cuda")]
     fn nvfp4_format() -> Option<(Device, ProjectionFormat)> {
-        let device = Device::new_cuda(0).ok()?;
+        let device = crate::device::new_cuda_for_test().ok()?;
         let format = ProjectionFormat::nvfp4(&device).ok()?;
         Some((device, format))
     }

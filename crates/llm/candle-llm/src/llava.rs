@@ -418,15 +418,16 @@ impl LlavaModel {
 
 /// The weight format a LLaVA load quantizes its language decoder to, or the typed refusal. The
 /// load runs it first, and [`crate::backend::nvfp4_support`] answers a product's per-snapshot
-/// NVFP4 question with it (sc-24139): NVFP4 is served for the qwen3_5 family only (sc-24135), so
-/// it is refused here by name.
+/// NVFP4 question with it (sc-24139): the Llama provider serves NVFP4 (the qwen3_5 hybrid,
+/// sc-24135, and the llama family, sc-24140), but LLaVA — whose provider owns the vision-tower
+/// load — does not, so it is refused here by name.
 pub(crate) fn requested_quantization(spec: &LoadSpec) -> CoreResult<Option<QuantSpec>> {
     spec.quantize
         .map(|q| match q {
             Quantize::Q4 => Ok(QuantSpec::q4()),
             Quantize::Q8 => Ok(QuantSpec::q8()),
             Quantize::Nvfp4 => Err(CoreError::Unsupported(
-                "nvfp4: NVFP4 projections are served for the qwen3_5 family only, not LLaVA".into(),
+                "nvfp4: NVFP4 projections are not served for LLaVA".into(),
             )),
         })
         .transpose()

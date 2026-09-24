@@ -96,6 +96,11 @@ fixtures are in the JSON.
   `--allow-partial`), records MTP on the llama family as `n/a (no MTP head)`, copies every run and
   baseline into the campaign directory, and seals `INDEX.md` + `index.json` (one table per model,
   baselines first). `campaign-verify` re-checks the campaign seal and every run's seal.
+  Since round 2 of the feature-end review ([`../round2/README.md`](../round2/README.md)), every
+  model also needs a bf16 S1 baseline, or the campaign lists it as missing. `campaign-verify` fails
+  a campaign that has missing cells unless it was sealed with `--allow-partial`. A head run's binary
+  must be built with `CANDLE_LLM_BUILD_PROVENANCE=1`, so that it embeds the runtime SHA and a clean
+  tree. The label must match the probed device.
 
 **Smoke** (not the campaign): `decode-bench/campaign-smoke/` — Qwen3-8B × {bf16, q8, nvfp4} ×
 {graphs off, on} × {off, MTP (n/a), n-gram K=3} + sampled rows, 16 tokens, with the 16-token

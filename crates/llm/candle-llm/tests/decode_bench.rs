@@ -18,7 +18,7 @@
 //! | `DECODE_BENCH_NEW_TOKENS`  | tokens generated per row (default 256)                       |
 //! | `DECODE_BENCH_WARMUP_TOKENS` | tokens of the untimed warm-up run (default 16)             |
 //! | `DECODE_BENCH_PROMPT`      | user message (default: a long-answer explanation request)    |
-//! | `DECODE_BENCH_LABEL`       | hardware label recorded verbatim (default `RTX Pro 6000 / sm_120`) |
+//! | `DECODE_BENCH_LABEL`       | hardware label recorded verbatim (default `RTX Pro 6000 / sm_120`); the harness checks it against the probed device |
 //! | `DECODE_BENCH_KV_CACHE`    | `static` (default) or `growing`: the `step_model` row's KV cache  |
 //! | `DECODE_BENCH_ATTN`        | `gqa` (default) or `expanded`: the growing slots' attention       |
 //! | `CANDLE_LLM_CUDA_GRAPHS`   | `1` runs the `step_model` / `mtp` / `ngram` rows through the CUDA-graph runner (sc-24134); every row records `cuda_graphs` |
@@ -68,6 +68,16 @@
 //! recovery split behind them (`verify_steps`, `direct_rollbacks`,
 //! `target_forwards_per_verify_step` — the measured target forwards net of the prefill per verify
 //! step, exactly 1.0 on the per-token DeltaNet checkpoint ring, sc-24131 AC2).
+//!
+//! **Run identity (sc-24140 feature-end review).** Both families record the device the rows ran
+//! on as probed from the driver (`device`, `device_name`, `compute_capability` — `12.0` on
+//! sm_120), the exact prompt token ids (`prompt_token_ids`) and the build's provenance
+//! (`build.git_sha` / `build.git_dirty`, embedded when the binary was built with
+//! `CANDLE_LLM_BUILD_PROVENANCE=1`; `null` otherwise). `decode_bench.py` refuses a document whose
+//! probed device does not match the hardware label, and a head run whose binary does not name
+//! the runtime SHA and a clean tree; the prompt hash and the sampling seed join the table's
+//! comparison key. These helpers sit outside the head-only block, so a baseline binary records
+//! them too (its build provenance is `null`: its commit predates the build script).
 //!
 //! **Model selection (sc-24138).** The snapshot's `config.json` picks the family: a Qwen3.5 /
 //! 3.6 / 3.8 hybrid runs the rows above; a llama-family checkpoint (a `CausalLm` — Qwen3-8B, the
@@ -1124,6 +1134,55 @@ fn device_used_bytes(device: &Device) -> Option<u64> {
     }
 }
 
+/// The device the rows ran on, probed from the driver (sc-24140 feature-end review): the CUDA
+/// device's name and compute capability (`major.minor`), so the harness checks the operator's
+/// hardware label against the hardware; `(None, None)` on a CPU device. Outside the head-only
+/// block — it uses only what the pre-epic baseline already links — so both binaries record it.
+fn device_probe(device: &Device) -> (Option<String>, Option<String>) {
+    #[cfg(feature = "cuda")]
+    if let Ok(cuda) = device.as_cuda_device() {
+        use candle_core::cuda_backend::cudarc::driver::sys::CUdevice_attribute as Attribute;
+        let stream = cuda.cuda_stream();
+        let context = stream.context();
+        let major = context.attribute(Attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR);
+        let minor = context.attribute(Attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR);
+        let capability = major
+            .ok()
+            .zip(minor.ok())
+            .map(|(major, minor)| format!("{major}.{minor}"));
+        return (context.name().ok(), capability);
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = device;
+        (None, None)
+    }
+}
+
+/// The source state this binary was built from (sc-24140 feature-end review): the checkout's
+/// `HEAD` and whether its tree was dirty, embedded by `candle-llm`'s build script when the build
+/// ran with `CANDLE_LLM_BUILD_PROVENANCE=1`; `null` without it (and on the pre-epic baseline,
+/// whose commit has no build script). The harness requires a head run's to name the runtime SHA
+/// and a clean tree.
+fn build_provenance() -> Value {
+    let non_empty = |value: Option<&'static str>| value.filter(|v| !v.is_empty());
+    json!({
+        "git_sha": non_empty(option_env!("CANDLE_LLM_BUILD_GIT_SHA")),
+        "git_dirty": non_empty(option_env!("CANDLE_LLM_BUILD_GIT_DIRTY")).map(|v| v == "1"),
+    })
+}
+
+/// The document fields both families record about where and from what the rows ran (sc-24140
+/// feature-end review): the probed device, the build provenance and the exact prompt token ids —
+/// which the harness hashes into the table's comparison key beside the sampling seed.
+fn insert_run_identity(doc: &mut BTreeMap<&'static str, Value>, device: &Device, prompt: &[i32]) {
+    let (device_name, compute_capability) = device_probe(device);
+    doc.insert("device_name", json!(device_name));
+    doc.insert("compute_capability", json!(compute_capability));
+    doc.insert("build", build_provenance());
+    doc.insert("prompt_token_ids", json!(prompt));
+}
+
 fn greedy_config(new_tokens: usize) -> GenerationConfig {
     let mut config = GenerationConfig {
         max_new_tokens: new_tokens,
@@ -1466,6 +1525,7 @@ fn causal_decode_bench(
     doc.insert("label", json!(label));
     doc.insert("snapshot", json!(snapshot.display().to_string()));
     doc.insert("device", json!(device_name));
+    insert_run_identity(&mut doc, &device, &prompt);
     doc.insert(
         "compute_dtype",
         json!(format!("{:?}", model.compute_dtype())),
@@ -1698,6 +1758,53 @@ fn step_cache_accepts_checkpoint_bytes_and_single_token_runs() {
 #[should_panic(expected = "no checkpoint bytes after 2 tokens")]
 fn step_cache_without_checkpoint_bytes_after_two_tokens_is_refused() {
     checked_step_cache(2, Some((10, 0)));
+}
+
+/// sc-24140 feature-end review: the probe reads the device the rows run on — nothing on a CPU
+/// device; a CUDA device's driver name and `major.minor` compute capability, `12.0` on the sm_120
+/// lane (which `REQUIRE_SM120=1` demands).
+#[test]
+fn device_probe_reads_the_cuda_device_and_nothing_on_cpu() {
+    assert_eq!(device_probe(&Device::Cpu), (None, None));
+    let Ok(device) = select_device() else {
+        return;
+    };
+    let (name, capability) = device_probe(&device);
+    if !device.is_cuda() {
+        assert_eq!((name, capability), (None, None));
+        return;
+    }
+    let name = name.expect("a CUDA device has a name");
+    assert!(!name.trim().is_empty());
+    let capability = capability.expect("a CUDA device has a compute capability");
+    let (major, minor) = capability.split_once('.').expect("major.minor");
+    assert!(
+        major.parse::<u32>().is_ok() && minor.parse::<u32>().is_ok(),
+        "{capability}"
+    );
+    let require_sm120 = std::env::var("REQUIRE_SM120").unwrap_or_default();
+    if !matches!(require_sm120.trim(), "" | "0") {
+        assert_eq!(capability, "12.0", "{name}");
+    }
+}
+
+/// sc-24140 feature-end review: the embedded build provenance is absent (a build without
+/// `CANDLE_LLM_BUILD_PROVENANCE=1`: both fields `null`) or names this checkout's `HEAD` and
+/// whether the tree was dirty.
+#[test]
+fn build_provenance_is_absent_or_names_the_checkout_head() {
+    let build = build_provenance();
+    let Some(sha) = build["git_sha"].as_str() else {
+        assert_eq!(build, json!({"git_sha": null, "git_dirty": null}));
+        return;
+    };
+    let head = std::process::Command::new("git")
+        .args(["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"])
+        .output()
+        .expect("git");
+    assert!(head.status.success());
+    assert_eq!(sha, String::from_utf8_lossy(&head.stdout).trim());
+    assert!(build["git_dirty"].is_boolean(), "{build}");
 }
 
 #[test]
@@ -2264,6 +2371,7 @@ fn decode_bench() {
     doc.insert("label", json!(label));
     doc.insert("snapshot", json!(snapshot.display().to_string()));
     doc.insert("device", json!(device_name));
+    insert_run_identity(&mut doc, &device, &prompt);
     doc.insert(
         "compute_dtype",
         json!(format!("{:?}", model.compute_dtype())),

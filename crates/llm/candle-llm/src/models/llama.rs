@@ -92,7 +92,8 @@ fn projection_from_weights(
             // re-packing it would mean dequantizing a lossy code into another lossy code.
             Some(ProjectionFormat::Nvfp4(_)) => {
                 return Err(Error::Unsupported(format!(
-                    "nvfp4: packed projection `{stem}` is an MLX affine triple; NVFP4 projections                      are quantized from a dense snapshot"
+                    "nvfp4: packed projection `{stem}` is an MLX affine triple; NVFP4 projections \
+                     are quantized from a dense snapshot"
                 )))
             }
             None => {
@@ -2686,7 +2687,7 @@ mod tests {
     #[test]
     fn nvfp4_format_loads_every_eligible_projection_and_the_head_as_nvfp4() {
         use crate::primitives::projection::ProjectionKind;
-        let Ok(device) = Device::new_cuda(0) else {
+        let Ok(device) = crate::device::new_cuda_for_test() else {
             candle_quant_kernels::skip_without_sm120("no CUDA device");
             return;
         };
@@ -2789,6 +2790,8 @@ mod tests {
             Err(Error::Unsupported(msg)) => {
                 assert!(msg.starts_with("nvfp4: "), "{msg}");
                 assert!(msg.contains(stem), "names the projection: {msg}");
+                // One sentence: a line continuation that lost its `\` leaves a run of spaces.
+                assert!(!msg.contains("  "), "{msg:?}");
             }
             Err(other) => panic!("expected the typed refusal, got {other}"),
             Ok(_) => panic!("an MLX affine triple loaded under NVFP4"),
@@ -2867,7 +2870,7 @@ mod tests {
         use crate::primitives::{BlockPool, PagedKvCache, Weights};
         use std::time::Instant;
 
-        let device = match Device::new_cuda(0) {
+        let device = match crate::device::new_cuda_for_test() {
             Ok(d) => d,
             Err(_) => {
                 eprintln!("skip: no CUDA device");

@@ -228,6 +228,33 @@ pub fn cuda_graphs_policy_guard(enabled: Option<bool>) -> CudaGraphsPolicyGuard 
     SWITCH.guard(enabled)
 }
 
+/// Unit-test seam (sc-24140 feature-end review): hold the lock [`cuda_graphs_policy_guard`]
+/// takes — the one CUDA test lock — from now until the calling test thread exits, without
+/// touching the switch. A stream capture is invalidated by concurrent legacy-stream work in the
+/// same process, so every unit test that opens a CUDA device — through
+/// [`select_device`](crate::device::select_device) or `crate::device::new_cuda_for_test`, which
+/// both call this — is serialized with every test that captures (those hold the guard). The lock
+/// is re-entrant on its thread, so a guard taken before or after still works; a test must not
+/// open a CUDA device from a thread it spawns while it holds the lock. Idempotent per thread.
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) fn hold_cuda_test_lock() {
+    use crate::primitives::switch::SwitchLock;
+    use std::cell::RefCell;
+    thread_local! {
+        static HELD: RefCell<Option<SwitchLock>> = const { RefCell::new(None) };
+    }
+    HELD.with(|held| {
+        held.borrow_mut().get_or_insert_with(|| SWITCH.hold());
+    });
+}
+
+/// Unit-test probe: the CUDA test lock ([`hold_cuda_test_lock`]) if no other thread holds it,
+/// without waiting.
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) fn try_cuda_test_lock() -> Option<crate::primitives::switch::SwitchLock> {
+    SWITCH.try_hold()
+}
+
 /// Per-thread counts of graph replays vs eager step executions (monotone; take deltas with
 /// [`GraphTally::since`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1974,7 +2001,7 @@ mod cuda_tests {
         assert_eq!(recorded.census().nodes, 0);
         // The legacy NULL stream (`Device::new_cuda`) refuses capture: the reason the device
         // selector builds the model on its own stream.
-        let Ok(Device::Cuda(legacy)) = Device::new_cuda(0) else {
+        let Ok(Device::Cuda(legacy)) = crate::device::new_cuda_for_test() else {
             return;
         };
         match capture(&legacy, || Ok(())) {

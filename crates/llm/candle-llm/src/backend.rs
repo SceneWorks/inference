@@ -42,6 +42,10 @@ pub fn backend_label() -> &'static str {
 /// reuses). It never reads weights.
 pub fn backend_capabilities() -> BackendCapabilities {
     static CAPABILITIES: OnceLock<BackendCapabilities> = OnceLock::new();
+    // Take the CUDA test lock *before* the one-time probe (which opens a device behind it), so a
+    // test holding the lock never waits on a probe that waits on the lock.
+    #[cfg(all(test, feature = "cuda"))]
+    crate::decode::graph::hold_cuda_test_lock();
     CAPABILITIES
         .get_or_init(|| match select_device() {
             Ok(device) => capabilities_for_device(backend_label(), &device),
@@ -95,12 +99,13 @@ pub fn capabilities_for_device(backend: &str, device: &Device) -> BackendCapabil
 /// The provider is the one `registry` would load `spec` with
 /// ([`TextLlmRegistry::select_for_model`] — the runtime bundle's own composition), and the answer
 /// comes from that provider's own load gates, never a copy of them: the llama family's
-/// [`nvfp4_model_gate`](crate::provider) (GGUF and Prism refusals; the qwen3_5 hybrid and the
-/// llama-family `CausalLm` architectures served, sc-24140) followed by the
+/// [`nvfp4_model_gate`](crate::provider) (GGUF, Prism and packed MLX-affine refusals; the qwen3_5
+/// hybrid and the llama-family `CausalLm` architectures served, sc-24140) followed by the
 /// device gate ([`Nvfp4Context::require`], cached in [`backend_capabilities`]); LLaVA's and both
 /// StarVector providers' quantization gates, which refuse NVFP4 by name. So when a provider starts
-/// serving NVFP4 for more checkpoints, this answer follows. Reads only `config.json` (and a GGUF
-/// header); `spec.quantize` is ignored — the question is always NVFP4.
+/// serving NVFP4 for more checkpoints, this answer follows. Reads only `config.json`, the
+/// snapshot's tensor names (its safetensors index or shard headers, never tensor data) and a GGUF
+/// header; `spec.quantize` is ignored — the question is always NVFP4.
 pub fn nvfp4_support(registry: &TextLlmRegistry, spec: &LoadSpec) -> FeatureSupport {
     nvfp4_support_with(registry, spec, backend_capabilities().nvfp4)
 }
@@ -264,6 +269,26 @@ mod tests {
         dir.path().to_string_lossy().into_owned()
     }
 
+    /// A llama snapshot with an MLX-style `quantization` block and one shard: `packed` names an
+    /// MLX-affine triple (`.weight` + `.scales` + `.biases`), otherwise dense weights only — a
+    /// prepared Q4 snapshot ([`crate::prepare`]).
+    fn affine_snapshot(packed: bool) -> tempfile::TempDir {
+        let mut config = llama();
+        config["quantization"] = serde_json::json!({"group_size": 64, "bits": 4});
+        let dir = snapshot(config);
+        let names: &[&str] = if packed {
+            &[
+                "model.layers.0.mlp.up_proj.weight",
+                "model.layers.0.mlp.up_proj.scales",
+                "model.layers.0.mlp.up_proj.biases",
+            ]
+        } else {
+            &["model.layers.0.mlp.up_proj.weight"]
+        };
+        crate::provider::write_test_snapshot_tensors(dir.path(), names, false);
+        dir
+    }
+
     fn llama() -> serde_json::Value {
         serde_json::json!({"architectures": ["LlamaForCausalLM"], "model_type": "llama"})
     }
@@ -367,13 +392,39 @@ mod tests {
             assert!(!answer.supported, "{names}: {answer:?}");
             let reason = answer.reason.unwrap();
             assert!(reason.starts_with("nvfp4: "), "{reason}");
-            assert!(reason.contains(names), "{names}: {reason}");
+            // The provider's own refusal (ChatWorks shows it verbatim): accurate since sc-24140,
+            // when the llama family joined the qwen3_5 hybrid in serving NVFP4.
+            assert!(
+                reason.contains(&format!("not served for {names}")),
+                "{names}: {reason}"
+            );
+            assert!(!reason.contains("qwen3_5 family only"), "{reason}");
         }
 
         let prism = snapshot(serde_json::json!({"model_type": "prism_hadamard_qwen35"}));
         let answer = nvfp4_support_with(&registry, &LoadSpec::dense(source(&prism)), sm120.clone());
         assert!(!answer.supported);
         assert!(answer.reason.unwrap().contains("Prism"));
+
+        // sc-24140 feature-end review: a packed MLX-affine llama-family snapshot is refused by the
+        // model gate — even where the device gate passes — and a prepared Q4 snapshot (the
+        // `quantization` block over dense weights) is offered.
+        let packed = affine_snapshot(true);
+        let answer =
+            nvfp4_support_with(&registry, &LoadSpec::dense(source(&packed)), sm120.clone());
+        assert!(!answer.supported, "{answer:?}");
+        let reason = answer.reason.unwrap();
+        assert!(reason.starts_with("nvfp4: "), "{reason}");
+        assert!(reason.contains("packed MLX-affine"), "{reason}");
+        let prepared = affine_snapshot(false);
+        assert_eq!(
+            nvfp4_support_with(
+                &registry,
+                &LoadSpec::dense(source(&prepared)),
+                sm120.clone()
+            ),
+            sm120
+        );
 
         // No linked provider serves the snapshot: refused, naming why.
         let unknown = snapshot(serde_json::json!({"model_type": "not_a_model"}));
@@ -396,18 +447,26 @@ mod tests {
     #[test]
     fn nvfp4_support_answers_what_the_load_does() {
         let registry = crate::cuda_text_registry().unwrap();
-        for config in [
+        let mut dirs: Vec<_> = [
             llama(),
             qwen3(),
             qwen35(),
             llava(),
             starvector_1b(),
             starvector_8b(),
-        ] {
-            let dir = snapshot(config);
+        ]
+        .into_iter()
+        .map(snapshot)
+        .collect();
+        // sc-24140 feature-end review: the packed MLX-affine snapshot (refused by the model gate,
+        // before the load reads a weight) and the prepared Q4 one (the gate passes).
+        let packed = dirs.len();
+        dirs.push(affine_snapshot(true));
+        dirs.push(affine_snapshot(false));
+        for (i, dir) in dirs.iter().enumerate() {
             let spec = LoadSpec {
                 quantize: Some(Quantize::Nvfp4),
-                ..LoadSpec::dense(source(&dir))
+                ..LoadSpec::dense(source(dir))
             };
             let probe = nvfp4_support(&registry, &spec);
             let load = match registry.load_for_model(&spec) {
@@ -418,6 +477,10 @@ mod tests {
                 assert!(!load.starts_with("nvfp4: "), "{load}");
             } else {
                 assert_eq!(probe.reason.as_deref(), Some(load.as_str()));
+            }
+            if i == packed {
+                assert!(!probe.supported, "{probe:?}");
+                assert!(load.contains("packed MLX-affine"), "{load}");
             }
         }
     }
@@ -466,7 +529,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn a_cuda_device_reports_its_compute_capability_and_the_nvfp4_gate() {
-        let device = match Device::new_cuda(0) {
+        let device = match crate::device::new_cuda_for_test() {
             Ok(device) => device,
             Err(error) => {
                 assert!(
