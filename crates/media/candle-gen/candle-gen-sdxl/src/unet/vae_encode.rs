@@ -14,6 +14,7 @@
 //! budget. Loaded f32 for a clean latent mean; the latents are cached once then frozen.
 
 use candle_core::{Result, Tensor};
+use candle_gen::{budgeted_conv2d, BudgetedConv2d};
 use candle_nn::{self as nn, Module};
 
 use super::unet_2d_blocks::{
@@ -34,12 +35,12 @@ const IN_CHANNELS: usize = 3;
 /// (`encoder.*` / `quant_conv.*` keys) unchanged.
 #[derive(Debug)]
 pub struct VaeMomentsEncoder {
-    conv_in: nn::Conv2d,
+    conv_in: BudgetedConv2d,
     down_blocks: Vec<DownEncoderBlock2D>,
     mid_block: UNetMidBlock2D,
     conv_norm_out: nn::GroupNorm,
-    conv_out: nn::Conv2d,
-    quant_conv: Option<nn::Conv2d>,
+    conv_out: BudgetedConv2d,
+    quant_conv: Option<BudgetedConv2d>,
     scale: f64,
 }
 
@@ -53,7 +54,7 @@ impl VaeMomentsEncoder {
             ..Default::default()
         };
         let vs_enc = vs.pp("encoder");
-        let conv_in = nn::conv2d(
+        let conv_in = budgeted_conv2d(
             IN_CHANNELS,
             BLOCK_OUT_CHANNELS[0],
             3,
@@ -99,14 +100,14 @@ impl VaeMomentsEncoder {
         let conv_norm_out =
             nn::group_norm(NORM_NUM_GROUPS, last, 1e-6, vs_enc.pp("conv_norm_out"))?;
         // `double_z`: the encoder emits 2·latent channels (mean ‖ logvar).
-        let conv_out = nn::conv2d(
+        let conv_out = budgeted_conv2d(
             last,
             2 * LATENT_CHANNELS,
             3,
             conv_cfg,
             vs_enc.pp("conv_out"),
         )?;
-        let quant_conv = Some(nn::conv2d(
+        let quant_conv = Some(budgeted_conv2d(
             2 * LATENT_CHANNELS,
             2 * LATENT_CHANNELS,
             1,

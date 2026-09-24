@@ -551,16 +551,25 @@ impl Drop for AttentionMemoryGuard {
     }
 }
 
+/// The effective score-element budget a request's `attention_chunk_size` selects: the knob
+/// verbatim when it is at or under [`candle_gen::ATTN_SCORES_BUDGET`], else that bound
+/// (sc-24114). The knob is a `u32` and was applied unclamped, so a value above `i32::MAX`
+/// would have re-enabled the CUDA softmax `int`-index overflow the budget exists to prevent
+/// — a request can ask for smaller attention chunks, never for larger-than-safe ones.
+pub(crate) fn effective_attention_budget(memory: Option<gen_core::GenerationMemory>) -> usize {
+    memory
+        .filter(|memory| memory.chunk_attention)
+        .and_then(|memory| memory.attention_chunk_size)
+        .map_or(candle_gen::ATTN_SCORES_BUDGET, |budget| {
+            (budget as usize).min(candle_gen::ATTN_SCORES_BUDGET)
+        })
+}
+
 pub(crate) fn enter_attention_memory(
     memory: Option<gen_core::GenerationMemory>,
 ) -> AttentionMemoryGuard {
     let previous = REQUEST_ATTENTION_BUDGET.get();
-    let selected = memory
-        .filter(|memory| memory.chunk_attention)
-        .and_then(|memory| memory.attention_chunk_size)
-        .map(|budget| budget as usize)
-        .unwrap_or(candle_gen::ATTN_SCORES_BUDGET);
-    REQUEST_ATTENTION_BUDGET.set(selected);
+    REQUEST_ATTENTION_BUDGET.set(effective_attention_budget(memory));
     AttentionMemoryGuard(previous)
 }
 
@@ -950,6 +959,46 @@ mod explicit_registry_tests {
 
 #[cfg(test)]
 mod tests {
+    /// An in-bound `attention_chunk_size` is honored verbatim; one above the kernel-safe bound
+    /// is clamped to [`candle_gen::ATTN_SCORES_BUDGET`] (sc-24114); an unset or disabled knob is
+    /// the default. The request-scoped guard sees the same value and restores on drop.
+    #[test]
+    fn attention_chunk_size_is_clamped_to_the_softmax_index_bound() {
+        use candle_gen::ATTN_SCORES_BUDGET;
+        let memory = |chunk: bool, size: Option<u32>| {
+            Some(gen_core::GenerationMemory {
+                chunk_attention: chunk,
+                attention_chunk_size: size,
+                ..Default::default()
+            })
+        };
+        assert_eq!(super::effective_attention_budget(None), ATTN_SCORES_BUDGET);
+        assert_eq!(
+            super::effective_attention_budget(memory(false, Some(1 << 20))),
+            ATTN_SCORES_BUDGET
+        );
+        assert_eq!(
+            super::effective_attention_budget(memory(true, Some(1 << 20))),
+            1 << 20
+        );
+        assert_eq!(
+            super::effective_attention_budget(memory(true, Some(ATTN_SCORES_BUDGET as u32))),
+            ATTN_SCORES_BUDGET
+        );
+        for over in [ATTN_SCORES_BUDGET as u32 + 1, i32::MAX as u32 + 1, u32::MAX] {
+            assert_eq!(
+                super::effective_attention_budget(memory(true, Some(over))),
+                ATTN_SCORES_BUDGET,
+                "{over} must clamp"
+            );
+        }
+        assert!(ATTN_SCORES_BUDGET < i32::MAX as usize);
+        super::with_attention_memory(memory(true, Some(u32::MAX)), || {
+            assert_eq!(super::request_attention_budget(), ATTN_SCORES_BUDGET);
+        });
+        assert_eq!(super::request_attention_budget(), ATTN_SCORES_BUDGET);
+    }
+
     use super::*;
     use candle_gen::gen_core::{Conditioning, ConditioningKind, Image, LoadSpec, WeightsSource};
 

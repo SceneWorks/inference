@@ -711,9 +711,10 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # `mlx-qwen-image-producers` jobs; 24 since sc-17250 added the JoyCaption and
         # MOSS-TTS-Realtime jobs; 22 before).
         MACOS_HUB_LOCK: 35,
+        # 13 since sc-24114 added the `candle-qwen-image-2-1` job;
         # 12 since SC-23942 added the Qwen/Bonsai Candle materialization lane;
         # 11 since sc-18932 added the `candle-minimax-h3` job.
-        WINDOWS_HUB_LOCK: 12,
+        WINDOWS_HUB_LOCK: 13,
         # `candle-scail2-shared` is the only lane on the py314 Windows lock.
         WINDOWS_SCAIL_HUB_LOCK: 1,
         WINDOWS_MAGE_LOCK: 1,
@@ -997,13 +998,14 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def test_real_weight_python_installs_are_binary_hash_locked(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
-        # 35 / 12 after SC-23942 added one pinned materialization lane per native backend.
+        # 35 / 12 after SC-23942 added one pinned materialization lane per native backend; 13 Windows
+        # after sc-24114 added `candle-qwen-image-2-1`.
         # The remaining jobs retain their materialization lanes. These counts
         # are the anti-drift half of the policy above: the shape checks pass on a job that installs
         # nothing, so only a count notices a lane that quietly stopped materializing its snapshot.
         # Bump them when you add or remove a lane.
         self.assertEqual(workflow.count(MACOS_HUB_LOCK), 35)
-        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 12)
+        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 13)
         self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(
@@ -3841,6 +3843,107 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("qwen38_bonsai_artifacts.py aggregate", aggregate_commands)
         self.assertFalse(next(step for step in aggregate["steps"] if step.get("name") == "Download only the selected artifact IDs without merging roots")["with"]["merge-multiple"])
         self.assertEqual(next(step for step in aggregate["steps"] if step.get("name") == "Upload the selected roots and sealed terminal report")["if"], "always()")
+
+
+    def qwen_image_2_1_lane_errors(self, workflow: dict, source: str) -> list[str]:
+        """Everything `test_qwen_image_2_1_cuda_lane_…` below binds, as a list of findings."""
+        errors: list[str] = []
+        options = workflow[True]["workflow_dispatch"]["inputs"]["profile"]["options"]
+        if "qwen-image-2-1" not in options:
+            errors.append("`qwen-image-2-1` is not a dispatchable profile")
+        job = workflow["jobs"].get("candle-qwen-image-2-1")
+        if job is None:
+            return errors + ["no `candle-qwen-image-2-1` job"]
+        if job["if"] != "github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1'":
+            errors.append(f"not dispatch-only on its own profile: {job['if']!r}")
+        if job["runs-on"] != ["self-hosted", "windows", "cuda", "real-weights"]:
+            errors.append(f"wrong runner: {job['runs-on']!r}")
+
+        models = {
+            model["key"]: model
+            for model in tomllib.loads(MODEL_MANIFEST.read_text(encoding="utf-8"))["models"]
+        }
+        for key, variable in (
+            ("qwen-image-2-1-cuda", "CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT"),
+            ("qwen-image-2-1-mlx", "CANDLE_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT"),
+        ):
+            model = models[key]
+            expected = (
+                "${{ vars.CANDLE_GEN_MODELS_ROOT }}\\models--"
+                + model["repository"].replace("/", "--")
+                + "\\snapshots\\"
+                + model["revision"]
+            )
+            if job["env"].get(variable) != expected:
+                errors.append(f"{variable} is not the pinned cache path {expected!r}")
+            if model["environment"] != [variable]:
+                errors.append(f"{key} does not declare exactly {variable}")
+            materialize = (
+                f'scripts/release/ensure_model_snapshot.py --model {key} --snapshot "%{variable}%"'
+            )
+            if not any(materialize in step.get("run", "") for step in job["steps"]):
+                errors.append(f"{key} is never materialized")
+
+        steps = {step.get("name"): step for step in job["steps"]}
+        run = steps.get("Run the Qwen-Image 2.1 real-weight renders", {}).get("run", "")
+        selected = re.findall(r"call :run_one (\w+) \|\| set \"QWEN21_FAILED=1\"", run)
+        ignored = re.findall(r"#\[test\]\s*#\[ignore\]\s*fn (\w+)\(", source)
+        if sorted(selected) != sorted(ignored) or len(selected) != len(set(selected)):
+            errors.append(
+                f"the lane selects {sorted(selected)} but the file's ignored tests are {sorted(ignored)}"
+            )
+        for fragment in (
+            "cargo test --locked --release -p candle-gen-qwen-image-2-1 --features cuda "
+            "--test integration e2e_real_weights::%~1 -- --ignored --exact --nocapture",
+            'findstr /C:"test result: ok. 1 passed" "%log%"',
+            'if not "%QWEN21_FAILED%"=="0" exit /b 1',
+        ):
+            if run.count(fragment) != 1:
+                errors.append(f"the render step must carry exactly one {fragment!r}")
+
+        upload = steps.get("Keep the Qwen-Image 2.1 CUDA evidence", {})
+        if upload.get("with", {}).get("name") != "qwen-image-2-1-cuda-evidence":
+            errors.append("the evidence artifact is not `qwen-image-2-1-cuda-evidence`")
+        if upload.get("if") != "${{ !cancelled() }}":
+            errors.append("the evidence upload must survive a failed render")
+        if upload.get("with", {}).get("if-no-files-found") != "error":
+            errors.append("an empty evidence upload must red")
+        return errors
+
+    def test_qwen_image_2_1_cuda_lane_runs_every_real_weight_test_on_pinned_snapshots(self) -> None:
+        """sc-24114: the dispatch-only Qwen-Image 2.1 CUDA lane runs EVERY `#[ignore]`d test in
+        `candle-gen-qwen-image-2-1/tests/e2e_real_weights.rs` -- no more, no fewer -- against the two
+        pinned cache paths it materializes, and keeps its evidence even when a render reds.
+
+        Binding the selection to the file's own `#[ignore]` set is what stops a test added there
+        from silently running nowhere, and a rename from turning into "0 passed" + exit 0.
+        """
+        workflow_text = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = yaml.safe_load(workflow_text)
+        source = (
+            REAL_WEIGHTS_WORKFLOW.parents[2]
+            / "crates/media/candle-gen/candle-gen-qwen-image-2-1/tests/e2e_real_weights.rs"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(self.qwen_image_2_1_lane_errors(workflow, source), [])
+
+        # The detector has to detect.
+        renamed = source.replace(
+            "fn validation_render_transparency(", "fn validation_render_rgba("
+        )
+        self.assertTrue(self.qwen_image_2_1_lane_errors(workflow, renamed))
+        added = source + "\n#[test]\n#[ignore]\nfn an_unwired_render() {}\n"
+        self.assertTrue(self.qwen_image_2_1_lane_errors(workflow, added))
+        for mutate in (
+            lambda job: job.update({"if": "inputs.profile == 'all' || inputs.profile == 'qwen-image-2-1'"}),
+            lambda job: job["env"].update(
+                {"CANDLE_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT": "E:\\somewhere\\else"}
+            ),
+            lambda job: job["steps"][-1].pop("if"),
+        ):
+            mutated = copy.deepcopy(workflow)
+            mutate(mutated["jobs"]["candle-qwen-image-2-1"])
+            with self.subTest(mutation=mutate):
+                self.assertTrue(self.qwen_image_2_1_lane_errors(mutated, source))
 
 
 if __name__ == "__main__":

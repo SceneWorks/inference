@@ -252,6 +252,28 @@ fn a_converted_tier_is_a_complete_standalone_snapshot() {
             );
         }
 
+        // The licence rides along (sc-24114): `copy_turnkey_assets` is best-effort per file, so
+        // without this pin a converter that stopped copying `LICENSE` would still produce a tier
+        // that loads — and ships the Qwen Research License's weights without its text. It must be
+        // byte-identical to the source's and bound by the tier's manifest.
+        assert_eq!(
+            std::fs::read(out.join("LICENSE")).unwrap(),
+            std::fs::read(tiny_snapshot().join("LICENSE")).unwrap(),
+            "{}: LICENSE must be copied unchanged",
+            tier.dir_name()
+        );
+        let sums = std::fs::read_to_string(out.join("SHA256SUMS")).unwrap();
+        let license_digest = format!(
+            "{:x}",
+            Sha256::digest(std::fs::read(out.join("LICENSE")).unwrap())
+        );
+        assert!(
+            sums.lines()
+                .any(|line| line == format!("{license_digest}  LICENSE")),
+            "{}: SHA256SUMS does not bind LICENSE:\n{sums}",
+            tier.dir_name()
+        );
+
         // And the snapshot self-reports the tier it is.
         assert_eq!(installed_tier(&out).unwrap(), tier);
     }

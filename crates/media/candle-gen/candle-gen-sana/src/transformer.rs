@@ -45,8 +45,9 @@ use std::path::PathBuf;
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 use candle_gen::candle_nn::ops::{silu, softmax_last_dim};
-use candle_gen::candle_nn::{Conv2d, Module};
+use candle_gen::candle_nn::Module;
 use candle_gen::quant::{linear_from_weights, ActPrecision, Nvfp4Context, Nvfp4Linear, QLinear};
+use candle_gen::BudgetedConv2d as Conv2d;
 use candle_gen::Weights;
 
 use crate::config::SanaTransformerConfig;
