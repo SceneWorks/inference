@@ -505,14 +505,6 @@ fn llama_family_qwen3_8b_exact_rows_and_ngram_knife_edge_gate() {
             .new_static_cache(prompt.len() + FIXTURE_TOKENS + 8)
             .unwrap()
     };
-    let gaps = single_token_gaps(&model, static_cache(), &prompt, &reference);
-    let edges = knife_edges(&gaps);
-    eprintln!(
-        "[llama] Qwen3-8B reference: {} prompt tokens, {FIXTURE_TOKENS} generated; knife-edge \
-         positions (top-2 gap <= 1 bf16 ULP of the top logit): {edges:?}",
-        prompt.len()
-    );
-
     // The exact rows.
     let step = |m: &dyn StepModel<Cache = candle_llm::primitives::StepKvCache>| {
         generate_step(
@@ -569,6 +561,16 @@ fn llama_family_qwen3_8b_exact_rows_and_ngram_knife_edge_gate() {
     );
     assert_eq!(graphs.replayed, 0, "a CausalLm step is not replayable");
     assert_eq!(graphs.fallback_reason, Some("positions_host_scalar"));
+
+    // The knife-edges: the reference positions whose top-2 gap is within one bf16 ULP on the
+    // single-token static path (enumerated after the exact rows, which need none).
+    let gaps = single_token_gaps(&model, static_cache(), &prompt, &reference);
+    let edges = knife_edges(&gaps);
+    eprintln!(
+        "[llama] Qwen3-8B reference: {} prompt tokens, {FIXTURE_TOKENS} generated; knife-edge \
+         positions (top-2 gap <= 1 bf16 ULP of the top logit): {edges:?}",
+        prompt.len()
+    );
 
     // The n-gram rows against the enumerated knife-edges.
     let mut rows: Vec<(String, Option<usize>)> = Vec::new();
