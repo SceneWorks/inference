@@ -247,6 +247,16 @@ impl DecodeRecord {
         self
     }
 
+    /// The same record with every per-thread tally `span` measured filled in — the fused
+    /// primitives, the CUDA-graph runner's steps and the NVFP4 projection paths. The one place a
+    /// record takes its span's tallies (sc-24140), so no record producer stamps some and forgets
+    /// another.
+    pub fn with_span_tallies(self, span: &RequestSpan) -> Self {
+        self.with_fused_primitives(span.fused_primitives())
+            .with_cuda_graphs(span.cuda_graphs())
+            .with_nvfp4_projections(span.nvfp4_projections())
+    }
+
     /// A record from a speculative run's [`SpeculativeStats`].
     pub fn speculative(
         path: DecodePath,

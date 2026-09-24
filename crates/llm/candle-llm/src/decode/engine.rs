@@ -45,7 +45,7 @@
 //! [`accept_token`]: core_llm::speculative::accept_token
 
 use candle_core::Tensor;
-use core_llm::speculative::{accept_token, greedy_commit, sample_weighted, Acceptance};
+use core_llm::speculative::{accept_token, greedy_commit, Acceptance};
 use core_llm::{ProposerKind, SamplerPath};
 
 use crate::decode::cancel::CancelFlag;
@@ -60,8 +60,8 @@ use crate::primitives::decode_cache::{CacheMemory, DecodeCache};
 use crate::primitives::host_sync::{host_sync_count, note_sampler_path};
 use crate::primitives::input_ids;
 use crate::primitives::sampler::{
-    argmax_rows_tensor, logits_rows_host, sample, sample_row_host, shaped_candidates,
-    shaped_candidates_host, SplitMix64, TokenRng,
+    acceptance_target_host, argmax_rows_tensor, host_row_reason, logits_rows_host, sample,
+    sample_row_host, shaped_candidates, SplitMix64, TokenRng,
 };
 
 /// Constraint state that can be rewound after speculative exploration. The committed state is
@@ -304,7 +304,7 @@ pub struct SpeculativeRun {
 ///
 /// `drafts` is the proposal width `K`; `0` (or [`NoProposer`]) is the token-at-a-time loop.
 #[allow(clippy::too_many_arguments)]
-pub fn generate_speculative<M: StepModel + ?Sized, P: Proposer>(
+pub fn generate_speculative<M: StepModel + ?Sized, P: Proposer + ?Sized>(
     model: &M,
     proposer: &mut P,
     prompt: SpeculativePrompt<'_, M::Cache>,
@@ -324,7 +324,7 @@ pub fn generate_speculative<M: StepModel + ?Sized, P: Proposer>(
 /// is in the cache and the proposer is warmed, before the first token is sampled (it may
 /// synchronize the device).
 #[allow(clippy::too_many_arguments)]
-pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer>(
+pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer + ?Sized>(
     model: &M,
     proposer: &mut P,
     prompt: SpeculativePrompt<'_, M::Cache>,
@@ -438,8 +438,7 @@ pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer>(
             .with_attn_formulation(model.attn_formulation(cache))
             .with_proposer(kind)
             .with_verify_syncs(verify_host_syncs)
-            .with_fused_primitives(span.fused_primitives())
-            .with_cuda_graphs(span.cuda_graphs());
+            .with_span_tallies(&span);
         SpeculativeRun {
             output: GenerationOutput {
                 tokens: generated,
@@ -705,6 +704,13 @@ fn last_row(hidden: Option<&Tensor>) -> Result<Option<Tensor>> {
 /// The verify decision from one device->host transfer. Returns the drafts as host ids (truncated
 /// after the first stop token among them), the committed run (accepted drafts + the bonus /
 /// correction token) and the accepted count.
+///
+/// A step with **no drafts** (the [`NoProposer`] run, or a step whose width the budget clamped to
+/// zero) has no decision to make: its one verify row is an ordinary draw through [`sample`] — the
+/// device argmax or the device sampler where the request allows it, the host reference where a
+/// penalty or a constraint needs the row — exactly the token-at-a-time loop's draw, with the
+/// same seeded stream, and recorded by the sampler. With drafts, every host draw is recorded too:
+/// each acceptance test and the bonus (sc-24140).
 #[allow(clippy::too_many_arguments)]
 fn decide(
     logits: &Tensor,
@@ -718,6 +724,16 @@ fn decide(
     mut constraint: Option<&mut (dyn RewindableConstraintMask + '_)>,
 ) -> Result<(Vec<i32>, Vec<i32>, usize)> {
     let n = logits.dim(1)?; // 1 + K verify positions
+    if drafts.is_empty()? {
+        if n != 1 {
+            return Err(Error::Msg(format!(
+                "verify returned {n} positions for 0 drafts"
+            )));
+        }
+        let mask = constraint.as_mut().map(|c| c.allowed());
+        let token = sample(logits, history, &config.sampling, rng, mask)?;
+        return Ok((Vec::new(), vec![token], 0));
+    }
     if plain_greedy && constraint.is_none() {
         // The greedy fast path: argmax on device, one transfer of `[argmax (K+1) ‖ drafts (K)]`.
         let argmax = argmax_rows_tensor(logits)?; // [K + 1] u32
@@ -801,7 +817,12 @@ fn decide(
                 Acceptance::Rejected(target)
             }
         } else {
-            let target = shaped_candidates_host(row, &running, &config.sampling, mask);
+            // The acceptance test is a host draw over the host row: recorded as one.
+            note_sampler_path(SamplerPath::Host(host_row_reason(
+                &config.sampling,
+                mask.is_some(),
+            )));
+            let target = acceptance_target_host(row, &running, &config.sampling, mask);
             let q = dists.get(i).cloned().unwrap_or_else(|| vec![(draft, 1.0)]);
             accept_token(&target, &q, draft, rng.next_f32(), rng.next_f32())
         };
@@ -821,15 +842,11 @@ fn decide(
             return Ok((draft_ids, committed, accepted));
         }
     }
-    // Every draft accepted: the bonus from the position past the last draft.
+    // Every draft accepted: the bonus from the position past the last draft — the host reference
+    // draw over the host row (recorded; a row nothing survives the shaping of commits its argmax).
     let row = rows.next().expect("the bonus row");
     let mask = constraint.as_mut().map(|c| c.allowed());
-    let bonus = if greedy {
-        sample_row_host(row, &running, &config.sampling, rng, mask)
-    } else {
-        let target = shaped_candidates_host(row, &running, &config.sampling, mask);
-        sample_weighted(&target, rng.next_f32(), 0)
-    };
+    let bonus = sample_row_host(row, &running, &config.sampling, rng, mask);
     committed.push(bonus);
     Ok((draft_ids, committed, accepted))
 }
@@ -840,6 +857,7 @@ mod tests {
     use std::collections::HashMap;
 
     use candle_core::{Device, Tensor};
+    use core_llm::speculative::sample_weighted;
     use serde_json::json;
 
     use super::*;
@@ -1296,6 +1314,8 @@ mod tests {
 
     #[test]
     fn no_proposer_is_the_step_driver_and_reports_proposer_none() {
+        // `generate_step` is this engine with no proposer (sc-24140): one loop, one record
+        // convention — the prefill in `prefill_forwards`, every later forward a verify step.
         let (_cfg, model) = text_model();
         let config = greedy(12);
         let (expected, record) = generate_step(
@@ -1307,15 +1327,105 @@ mod tests {
             None,
         )
         .unwrap();
+        let reference = generate_with(
+            &model,
+            &PROMPT,
+            &config,
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+        )
+        .unwrap();
+        assert_eq!(expected.tokens, reference.tokens);
         let run = run(&model, &mut NoProposer, &PROMPT, &config, 3);
         assert_eq!(run.output.tokens, expected.tokens);
         assert_eq!(run.record.proposer, ProposerKind::None);
         assert_eq!(run.record.proposer.label(), "none");
         assert_eq!(run.record.path, DecodePath::StepModel);
         assert_eq!(run.record.proposed_tokens, 0);
-        assert_eq!(run.record.target_forwards, record.target_forwards);
-        assert_eq!(run.record.host_syncs, record.host_syncs);
+        assert_eq!(
+            run.record, record,
+            "generate_step's record is the engine's, field for field"
+        );
+        assert_eq!(
+            (
+                record.target_forwards,
+                record.prefill_forwards,
+                record.verify_steps
+            ),
+            (12, 1, 11)
+        );
+        assert_eq!(record.host_syncs, 12, "one sync per token");
         assert_eq!(run.record.host_syncs_per_verify_step(), Some(1.0));
+    }
+
+    // ---- Every host decision is recorded; a degenerate row commits its argmax (sc-24140) ----
+
+    #[test]
+    fn stochastic_host_decisions_are_recorded_and_a_degenerate_row_commits_its_argmax() {
+        use crate::primitives::host_sync::sampler_counters;
+
+        let vocab = 6usize;
+        let config = GenerationConfig {
+            max_new_tokens: 4,
+            sampling: SamplingParams {
+                temperature: 1.0,
+                top_p: 1.0,
+                top_k: 0,
+                ..Default::default()
+            },
+            seed: Some(0),
+            stop_tokens: Vec::new(),
+        };
+        // One point-mass draft `2`, verified over `rows` (the draft's row, then the bonus row).
+        let decide_rows = |rows: Vec<Vec<f32>>| {
+            let n = rows.len();
+            let logits = Tensor::from_vec(rows.concat(), (1, n, vocab), &Device::Cpu).unwrap();
+            let before = sampler_counters();
+            let (_, committed, accepted) = decide(
+                &logits,
+                &Drafts::Host(vec![2]),
+                &[vec![(2, 1.0)]],
+                &[],
+                &config,
+                &mut SplitMix64::new(3),
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+            let after = sampler_counters();
+            (
+                committed,
+                accepted,
+                after.host_draws - before.host_draws,
+                after.device_draws - before.device_draws,
+            )
+        };
+        let certain = |t: usize| {
+            let mut row = vec![f32::NEG_INFINITY; vocab];
+            row[t] = 0.0;
+            row
+        };
+        let inf_at = |t: usize| {
+            let mut row = vec![0.0f32; vocab];
+            row[t] = f32::INFINITY;
+            row
+        };
+        // The draft accepted, an ordinary bonus row: two host decisions (the acceptance test and
+        // the bonus draw), both recorded.
+        assert_eq!(
+            decide_rows(vec![certain(2), certain(4)]),
+            (vec![2, 4], 1, 2, 0)
+        );
+        // A bonus row nothing survives the shaping of (a `+inf` at id 3): its argmax, not id 0.
+        assert_eq!(
+            decide_rows(vec![certain(2), inf_at(3)]),
+            (vec![2, 3], 1, 2, 0)
+        );
+        // A degenerate acceptance row: the target is the point mass on its argmax, so the draft is
+        // rejected for id 3 — never committed as a fallback the row did not choose.
+        assert_eq!(decide_rows(vec![inf_at(3), certain(4)]), (vec![3], 0, 1, 0));
     }
 
     // ---- One host sync per verify step on the host-shaped paths too ----
@@ -1482,6 +1592,56 @@ mod tests {
                 hidden: None,
             })
         }
+    }
+
+    /// A [`Ramp`] whose every forward records one fused primitive leaf and one NVFP4 decode-GEMV
+    /// call, as a real decoder's forward records its primitives.
+    struct Tallied(Ramp);
+    impl StepModel for Tallied {
+        type Cache = RampCache;
+        fn new_cache(&self) -> RampCache {
+            self.0.new_cache()
+        }
+        fn device(&self) -> &Device {
+            StepModel::device(&self.0)
+        }
+        fn vocab_size(&self) -> usize {
+            self.0.vocab
+        }
+        fn forward_step(
+            &self,
+            cache: &mut RampCache,
+            request: StepRequest<'_>,
+        ) -> Result<StepOutput> {
+            crate::primitives::fused::note_fused();
+            crate::primitives::nvfp4_path::note_gemv();
+            self.0.forward_step(cache, request)
+        }
+    }
+
+    #[test]
+    fn the_engine_record_carries_every_span_tally() {
+        // sc-24140: the engine's record carries every per-thread tally its span measured — the
+        // fused primitives, the CUDA-graph runner's steps and the NVFP4 projection paths — so a
+        // consumer of `run.record` (the bench, LLaVA, StarVector) sees what ran without patching.
+        let _graphs = crate::decode::graph::cuda_graphs_policy_guard(Some(true));
+        let model = Tallied(Ramp {
+            vocab: 7,
+            forwards: Cell::new(0),
+            step_start_only: false,
+        });
+        let runner = crate::decode::GraphRunner::new(&model);
+        let run = run(&runner, &mut NoProposer, &[0, 1], &greedy(5), 0);
+        let forwards = run.record.target_forwards;
+        assert_eq!(forwards, 5);
+        assert_eq!(run.record.fused_primitives.fused, forwards);
+        assert_eq!(run.record.nvfp4_projections.gemv, forwards);
+        assert_eq!(
+            run.record.cuda_graphs.eager,
+            forwards,
+            "every step went through the runner, eager here: {}",
+            run.record.cuda_graphs.describe()
+        );
     }
 
     /// Proposes fixed wrong drafts every step so every verify rejects at the first draft.

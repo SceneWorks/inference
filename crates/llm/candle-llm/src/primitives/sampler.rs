@@ -479,7 +479,7 @@ fn penalized_logits(
 /// Pull every row of an all-positions logits tensor `[1, n, vocab]` (or `[n, vocab]`) to host f32
 /// in **one** device->host transfer — the speculative engine's verify decision (sc-24130): the
 /// `n = K + 1` rows come over together, then each row is shaped on host with
-/// [`sample_row_host`] / [`shaped_candidates_host`], so a verify step costs one sync however wide it
+/// [`sample_row_host`] / [`acceptance_target_host`], so a verify step costs one sync however wide it
 /// is (the per-row [`sample`] would cost `K + 1`).
 pub fn logits_rows_host(logits: &Tensor) -> Result<Vec<Vec<f32>>> {
     let (n, vocab) = match logits.dims() {
@@ -534,14 +534,10 @@ pub fn sample_row_host(
     rng: &mut impl TokenRng,
     allowed: Option<&[bool]>,
 ) -> i32 {
-    let reason = if allowed.is_some() {
-        HostSampleReason::Constraint
-    } else if params.repetition_penalty != 1.0 || params.presence_penalty != 0.0 {
-        HostSampleReason::Penalty
-    } else {
-        HostSampleReason::SpeculativeDistribution
-    };
-    note_sampler_path(SamplerPath::Host(reason));
+    note_sampler_path(SamplerPath::Host(host_row_reason(
+        params,
+        allowed.is_some(),
+    )));
     penalize_host(&mut row, history, params, allowed);
     if params.temperature <= 0.0 {
         return argmax_host(&row);
@@ -562,18 +558,41 @@ pub fn sample_row_host(
     weights.last().map(|x| x.0).unwrap_or(0) as i32
 }
 
-/// [`shaped_candidates`] over a logits row already on the host (from [`logits_rows_host`]).
-pub fn shaped_candidates_host(
+/// Why a decision over a logits row already on the host (from [`logits_rows_host`]) was made on
+/// the host: the constraint mask or the penalty that shapes it there, else the speculative
+/// decision the row came over for. The reason [`sample_row_host`] records, and the one a caller
+/// records for a host acceptance draw ([`acceptance_target_host`]).
+pub fn host_row_reason(params: &SamplingParams, constrained: bool) -> HostSampleReason {
+    if constrained {
+        HostSampleReason::Constraint
+    } else if params.repetition_penalty != 1.0 || params.presence_penalty != 0.0 {
+        HostSampleReason::Penalty
+    } else {
+        HostSampleReason::SpeculativeDistribution
+    }
+}
+
+/// The target distribution a speculative acceptance draw
+/// ([`core_llm::speculative::accept_token`]) tests a draft against, over a logits row already on
+/// the host (from [`logits_rows_host`]): the shaped candidates ([`shaped_candidates`] over the
+/// host row) or —
+/// when nothing survives the shaping (every logit masked, a NaN, a `+inf` maximum) — the point
+/// mass on the row's argmax, the token every sampling path ([`sample_host`], [`sample_device`],
+/// [`sample_row_host`]) commits for such a row. Never empty, so a degenerate row can never commit
+/// a fallback id the row itself did not choose.
+pub fn acceptance_target_host(
     mut row: Vec<f32>,
     history: &[i32],
     params: &SamplingParams,
     allowed: Option<&[bool]>,
 ) -> Vec<(i32, f32)> {
     penalize_host(&mut row, history, params, allowed);
-    nucleus_weights(&row, params)
-        .into_iter()
-        .map(|(i, w)| (i as i32, w))
-        .collect()
+    let weights = nucleus_weights(&row, params);
+    let total: f32 = weights.iter().map(|x| x.1).sum();
+    if total <= 0.0 || !total.is_finite() {
+        return vec![(argmax_host(&row), 1.0)];
+    }
+    weights.into_iter().map(|(i, w)| (i as i32, w)).collect()
 }
 
 /// The constraint mask plus repetition and presence penalties over host logits, in place (the
@@ -1274,12 +1293,43 @@ mod tests {
         }
         assert_eq!(
             shaped_candidates(&row, &history, &params, Some(&mask)).unwrap(),
-            shaped_candidates_host(
+            acceptance_target_host(
                 logits_rows_host(&row).unwrap().remove(0),
                 &history,
                 &params,
                 Some(&mask)
             )
+        );
+        // A row nothing survives the shaping of (a `+inf` maximum at id 3): every path commits the
+        // row's argmax, and the acceptance target is the point mass on it — never id 0, and never
+        // an empty set a caller must invent a token for (sc-24140).
+        let degenerate = logits(&[1.0, 2.0, 0.5, f32::INFINITY, -1.0, 0.0]);
+        let target = acceptance_target_host(
+            logits_rows_host(&degenerate).unwrap().remove(0),
+            &[],
+            &params,
+            None,
+        );
+        assert_eq!(target, vec![(3, 1.0)]);
+        let mut rng = SplitMix64::new(4);
+        assert_eq!(
+            sample(&degenerate, &[], &params, &mut rng, None).unwrap(),
+            3
+        );
+        let host_row = logits_rows_host(&degenerate).unwrap().remove(0);
+        assert_eq!(
+            sample_row_host(host_row, &[], &params, &mut SplitMix64::new(4), None),
+            3
+        );
+        assert_eq!(
+            host_row_reason(&params, false),
+            HostSampleReason::Penalty,
+            "a penalized row is shaped on the host for its penalty"
+        );
+        assert_eq!(host_row_reason(&params, true), HostSampleReason::Constraint);
+        assert_eq!(
+            host_row_reason(&SamplingParams::default(), false),
+            HostSampleReason::SpeculativeDistribution
         );
         // Greedy on host with a penalty is the penalized argmax, like the tensor path.
         let greedy = SamplingParams {

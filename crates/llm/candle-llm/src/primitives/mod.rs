@@ -32,6 +32,7 @@ pub mod quant;
 pub mod rope;
 pub mod sampler;
 pub mod step_kv_cache;
+pub mod switch;
 pub mod weights;
 
 pub use attention::{
@@ -77,4 +78,5 @@ pub use sampler::{
     SplitMix64, TokenRng,
 };
 pub use step_kv_cache::{KvLayout, LayerKvShape, StepKvCache};
+pub use switch::{ProcessSwitch, SwitchGuard};
 pub use weights::Weights;
