@@ -42,6 +42,19 @@ def _all(lanes: dict[str, bool]) -> None:
         lanes[lane] = True
 
 
+def only_lanes(names: Iterable[str]) -> dict[str, bool]:
+    """Exactly the named lanes: an operator's manual dispatch scoped to them.
+
+    Unlike path selection this does not add ``workspace`` unless it is named, so a dispatch runs
+    what was asked for and nothing else (in particular, no macOS lane unless one is named).
+    """
+    selected = set(names)
+    unknown = selected - set(LANES)
+    if not selected or unknown:
+        raise ValueError(f"unknown or empty lane selection: {sorted(unknown)}")
+    return {lane: lane in selected for lane in LANES}
+
+
 def select_lanes(paths: Iterable[str], force_all: bool = False) -> dict[str, bool]:
     """Return the minimal safe lane set for the supplied repository paths."""
     lanes = {lane: False for lane in LANES}
@@ -210,18 +223,25 @@ def main() -> int:
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--paths", nargs="*", help="changed paths supplied directly")
     source.add_argument("--all", action="store_true", help="select every lane")
+    source.add_argument(
+        "--only",
+        nargs="+",
+        choices=LANES,
+        metavar="LANE",
+        help="select exactly these lanes (a manual dispatch scoped to them)",
+    )
     parser.add_argument("--base", help="base Git revision")
     parser.add_argument("--head", default="HEAD", help="head Git revision")
     parser.add_argument("--github-output", help="append key=value outputs to this file")
     args = parser.parse_args()
 
     paths = args.paths
-    if paths is None and not args.all:
+    if paths is None and not args.all and not args.only:
         if not args.base:
-            parser.error("provide --paths, --base, or --all")
+            parser.error("provide --paths, --base, --all or --only")
         paths = changed_paths(args.base, args.head)
 
-    lanes = select_lanes(paths or [], force_all=args.all)
+    lanes = only_lanes(args.only) if args.only else select_lanes(paths or [], force_all=args.all)
     print(json.dumps(lanes, sort_keys=True))
     if args.github_output:
         with open(args.github_output, "a", encoding="utf-8") as output:

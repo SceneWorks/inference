@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import tomllib
 import unittest
@@ -3652,6 +3653,51 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                         head_repository=head_repository,
                     ),
                     expected,
+                )
+
+    def test_windows_cuda_dispatch_schedules_no_macos_lane(self) -> None:
+        """sc-24164: `lanes: windows-cuda` selects only the Windows CUDA lane set, and every macOS
+        job (including self-hosted `macos-nax`) is gated on the macOS lane it leaves unselected."""
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        parsed = yaml.safe_load(workflow)
+        lanes_input = parsed[True]["workflow_dispatch"]["inputs"]["lanes"]
+        self.assertEqual(lanes_input["default"], "all", "a bare dispatch must keep running every lane")
+        self.assertEqual(lanes_input["options"], ["all", "windows-cuda"])
+        select = next(
+            step for step in parsed["jobs"]["changes"]["steps"] if step.get("id") == "select"
+        )
+        self.assertEqual(select["env"]["DISPATCH_LANES"], "${{ inputs.lanes }}")
+        run = select["run"]
+        scoped = (
+            'if [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "windows-cuda" ]]; then\n'
+            '  python3 scripts/ci/select_lanes.py --only windows_cuda --github-output "$GITHUB_OUTPUT"\n'
+            'elif [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then'
+        )
+        self.assertTrue(run.startswith(scoped), run)
+
+        output = Path(self.enterContext(tempfile.TemporaryDirectory())) / "github-output"
+        subprocess.run(
+            [sys.executable, "scripts/ci/select_lanes.py", "--only", "windows_cuda",
+             "--github-output", str(output)],
+            cwd=WORKFLOW.parents[2],
+            check=True,
+            capture_output=True,
+        )
+        selected = dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").split())
+        self.assertEqual({lane for lane, value in selected.items() if value == "true"}, {"windows_cuda"})
+
+        macos_jobs = {
+            name
+            for name, job in parsed["jobs"].items()
+            if "macos" in json.dumps(job.get("runs-on", "")).lower()
+        }
+        self.assertIn("macos-nax", macos_jobs)
+        for name in macos_jobs:
+            with self.subTest(job=name):
+                self.assertIn(
+                    "needs.changes.outputs.macos_metal == 'true'",
+                    parsed["jobs"][name].get("if", ""),
+                    f"{name} could be scheduled by a dispatch that did not select the macOS lane",
                 )
 
     def test_manual_cuda_package_tests_collect_all_failures_without_masking_exit(self) -> None:
