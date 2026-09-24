@@ -1,0 +1,110 @@
+warning: candle-kernels@0.10.2: Compiling 11 of 11 PTX kernels
+warning: candle-kernels@0.10.2: Using 24 threads for compilation
+warning: candle-kernels@0.10.2: Compiling 15 of 15 kernels
+    Finished `release` profile [optimized] target(s) in 0.29s
+     Running tests\decode_step_parity.rs (C:\cargo-targets\at-head-rc1\release\deps\decode_step_parity-44bf57165f2d4d6e.exe)
+
+running 2 tests
+test ac1_step_model_greedy_fixture_is_token_identical_to_reference ... [ac1] 256 tokens identical; record DecodeRecord { path: StepModel, target_forwards: 256, prefill_forwards: 1, proposed_tokens: 0, accepted_tokens: 0, generated_tokens: 256, host_syncs: 256, sampler: SamplerTelemetry { path: Some(Device), device_draws: 256, host_draws: 0, logits_to_host: 0 }, kv_cache: Static, attn_formulation: Gqa, proposer: None, verify_steps: 255, direct_rollbacks: 0, replay_forwards: 0, verify_host_syncs: 255, fused_primitives: FusedTally { fused: 69888, reference: 0, reference_reason: None }, cuda_graphs: GraphTally { replayed: 0, eager: 0, captured: 0, fallback_reason: None }, nvfp4_projections: Nvfp4PathTally { gemv: 0, cublaslt: 0, cublaslt_reason: None } }
+ok
+test ac2_rollback_then_redecode_matches_fresh_decode_on_real_weights ... [ac2] rollback from 109 to 101: logits identical (max diff 0); cache CacheMemory { live_bytes: 161087488, checkpoint_bytes: 2463105024 } -> CacheMemory { live_bytes: 160563200, checkpoint_bytes: 2463105024 }
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 86.00s
+
+     Running tests\speculative_engine_parity.rs (C:\cargo-targets\at-head-rc1\release\deps\speculative_engine_parity-13410f90fbaa9392.exe)
+
+running 3 tests
+test ac1_ac2_engine_greedy_fixture_rows_against_speculative_off ... [ac1] reference knife-edge positions (top-2 gap <= 1 bf16 ULP of the top logit): [(51, 0.125, 0.125), (74, 0.125, 0.125), (99, 0.125, 0.125), (102, 0.125, 0.125), (103, 0.125, 0.125), (106, 0.0, 0.125), (107, 0.0, 0.125), (124, 0.0, 0.125), (125, 0.125, 0.125), (154, 0.125, 0.125), (161, 0.125, 0.125), (177, 0.125, 0.125), (186, 0.125, 0.125), (202, 0.125, 0.125), (243, 0.0, 0.125)]
+[ac1] mtp K=1: tokens 256 divergence Some(124) acceptance 0.827 fwd/tok 0.551 syncs/verify Some(1.0) syncs/tok 0.55 kv static attn gqa proposer mtp verify_steps 140
+[ac1] mtp K=2: tokens 256 divergence Some(124) acceptance 0.757 fwd/tok 0.402 syncs/verify Some(1.0) syncs/tok 0.40 kv static attn gqa proposer mtp verify_steps 102
+[ac1] mtp K=3: tokens 256 divergence Some(125) acceptance 0.569 fwd/tok 0.375 syncs/verify Some(1.0) syncs/tok 0.38 kv static attn gqa proposer mtp verify_steps 95
+[ac1] mtp K=4: tokens 256 divergence Some(106) acceptance 0.467 fwd/tok 0.355 syncs/verify Some(1.0) syncs/tok 0.36 kv static attn gqa proposer mtp verify_steps 90
+[ac1] mtp K=5: tokens 256 divergence Some(124) acceptance 0.465 fwd/tok 0.305 syncs/verify Some(1.0) syncs/tok 0.30 kv static attn gqa proposer mtp verify_steps 77
+[ac1] ngram K=3: tokens 256 divergence Some(102) acceptance 0.189 proposed 281 fwd/tok 0.793 syncs/verify Some(1.0) kv static proposer ngram
+[ac1] free-running mtp K=1: first divergence at 124, reference top-2 gap 0.00 bf16 ULP (a knife-edge; recorded, not gated)
+[ac1] free-running mtp K=2: first divergence at 124, reference top-2 gap 0.00 bf16 ULP (a knife-edge; recorded, not gated)
+[ac1] free-running mtp K=3: first divergence at 125, reference top-2 gap 1.00 bf16 ULP (a knife-edge; recorded, not gated)
+[ac1] free-running mtp K=4: first divergence at 106, reference top-2 gap 0.00 bf16 ULP (a knife-edge; recorded, not gated)
+[ac1] free-running mtp K=5: first divergence at 124, reference top-2 gap 0.00 bf16 ULP (a knife-edge; recorded, not gated)
+[ac1] free-running ngram K=3: first divergence at 102, reference top-2 gap 1.00 bf16 ULP (a knife-edge; recorded, not gated)
+[ac1] 0 of 6 rows token-identical over 256 tokens
+ok
+test op_isolation_survey_which_primitive_depends_on_the_row_count ... [op-survey] projection layers.3.self_attn.q_proj.weight [5120 -> ...]: M=2: differs (max 520.0 bf16 ULP); M=3: differs (max 520.0 bf16 ULP); M=4: differs (max 520.0 bf16 ULP); M=5: differs (max 520.0 bf16 ULP); M=6: differs (max 520.0 bf16 ULP)
+[op-survey] projection layers.3.self_attn.k_proj.weight [5120 -> ...]: M=2: differs (max 174.0 bf16 ULP); M=3: differs (max 174.0 bf16 ULP); M=4: differs (max 174.0 bf16 ULP); M=5: differs (max 174.0 bf16 ULP); M=6: differs (max 174.0 bf16 ULP)
+[op-survey] projection layers.3.self_attn.v_proj.weight [5120 -> ...]: M=2: differs (max 166.0 bf16 ULP); M=3: differs (max 166.0 bf16 ULP); M=4: differs (max 166.0 bf16 ULP); M=5: differs (max 166.0 bf16 ULP); M=6: differs (max 166.0 bf16 ULP)
+[op-survey] projection layers.3.self_attn.o_proj.weight [6144 -> ...]: M=2: differs (max 41.0 bf16 ULP); M=3: differs (max 41.0 bf16 ULP); M=4: differs (max 41.0 bf16 ULP); M=5: differs (max 41.0 bf16 ULP); M=6: differs (max 41.0 bf16 ULP)
+[op-survey] projection layers.0.linear_attn.in_proj_qkv.weight [5120 -> ...]: M=2: differs (max 1.0 bf16 ULP); M=3: differs (max 1.0 bf16 ULP); M=4: differs (max 1.0 bf16 ULP); M=5: differs (max 1.0 bf16 ULP); M=6: differs (max 1.0 bf16 ULP)
+[op-survey] projection layers.0.linear_attn.out_proj.weight [6144 -> ...]: M=2: differs (max 2.0 bf16 ULP); M=3: differs (max 2.0 bf16 ULP); M=4: differs (max 2.0 bf16 ULP); M=5: differs (max 2.0 bf16 ULP); M=6: differs (max 2.0 bf16 ULP)
+[op-survey] projection layers.0.mlp.gate_proj.weight [5120 -> ...]: M=2: differs (max 2340.0 bf16 ULP); M=3: differs (max 2340.0 bf16 ULP); M=4: differs (max 4.0 bf16 ULP); M=5: differs (max 4.0 bf16 ULP); M=6: differs (max 4.0 bf16 ULP)
+[op-survey] projection layers.0.mlp.down_proj.weight [17408 -> ...]: M=2: differs (max 1609.0 bf16 ULP); M=3: differs (max 1609.0 bf16 ULP); M=4: differs (max 1609.0 bf16 ULP); M=5: differs (max 1609.0 bf16 ULP); M=6: differs (max 1609.0 bf16 ULP)
+[op-survey] projection lm_head.weight [5120 -> ...]: M=2: differs (max 520.0 bf16 ULP); M=3: differs (max 520.0 bf16 ULP); M=4: differs (max 520.0 bf16 ULP); M=5: differs (max 520.0 bf16 ULP); M=6: differs (max 520.0 bf16 ULP)
+[op-survey] sdpa_gqa_causal row 0 over 205 keys (q_len = M): M=2: bit-identical; M=3: bit-identical; M=4: bit-identical; M=5: bit-identical; M=6: bit-identical
+[op-survey] sdpa_gqa_causal row 0 over 128 keys (q_len = M): M=2: bit-identical; M=3: bit-identical; M=4: bit-identical; M=5: bit-identical; M=6: bit-identical
+[op-survey] sdpa_gqa_causal row 0 over 353 keys (q_len = M): M=2: bit-identical; M=3: differs (max 1.0 bf16 ULP); M=4: bit-identical; M=5: bit-identical; M=6: bit-identical
+[op-survey] gated_delta_recurrence step 0 (T = M): M=2: bit-identical; M=3: bit-identical; M=4: bit-identical; M=5: bit-identical; M=6: bit-identical
+[op-survey] causal_depthwise_conv row 0 (S = M): M=2: bit-identical; M=3: bit-identical; M=4: bit-identical; M=5: bit-identical; M=6: bit-identical
+[op-survey] rms_norm row 0: M=2: bit-identical; M=3: bit-identical; M=4: bit-identical; M=5: bit-identical; M=6: bit-identical
+[op-survey] projection GEMMs whose row 0 depends on the row count: ["layers.3.self_attn.q_proj.weight", "layers.3.self_attn.k_proj.weight", "layers.3.self_attn.v_proj.weight", "layers.3.self_attn.o_proj.weight", "layers.0.linear_attn.in_proj_qkv.weight", "layers.0.linear_attn.out_proj.weight", "layers.0.mlp.gate_proj.weight", "layers.0.mlp.down_proj.weight", "lm_head.weight"]
+ok
+test teacher_forced_verify_shaped_forward_vs_single_token_knife_edge_gate ... [teacher-forced] reference knife-edge positions (top-2 gap <= 1 bf16 ULP): [(51, 0.125, 0.125), (74, 0.125, 0.125), (99, 0.125, 0.125), (102, 0.125, 0.125), (103, 0.125, 0.125), (106, 0.0, 0.125), (107, 0.0, 0.125), (124, 0.0, 0.125), (125, 0.125, 0.125), (154, 0.125, 0.125), (161, 0.125, 0.125), (177, 0.125, 0.125), (186, 0.125, 0.125), (202, 0.125, 0.125), (243, 0.0, 0.125)]
+[teacher-forced] M=2: argmax disagreements 4 over 509 (position, row) pairs
+[teacher-forced] M=2: position 74 (verify row 1): single-token argmax 17120, verify-shaped argmax 41163, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=2: position 74 (verify row 0): single-token argmax 17120, verify-shaped argmax 41163, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=2: position 106 (verify row 1): single-token argmax 369, verify-shaped argmax 883, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=2: position 154 (verify row 0): single-token argmax 303, verify-shaped argmax 264, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=3: argmax disagreements 9 over 762 (position, row) pairs
+[teacher-forced] M=3: position 106 (verify row 1): single-token argmax 369, verify-shaped argmax 883, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=3: position 106 (verify row 0): single-token argmax 369, verify-shaped argmax 883, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=3: position 107 (verify row 1): single-token argmax 6355, verify-shaped argmax 883, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=3: position 125 (verify row 1): single-token argmax 61446, verify-shaped argmax 15156, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=3: position 154 (verify row 2): single-token argmax 303, verify-shaped argmax 264, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=3: position 154 (verify row 0): single-token argmax 303, verify-shaped argmax 264, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=3: position 177 (verify row 1): single-token argmax 18082, verify-shaped argmax 15796, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=3: position 186 (verify row 2): single-token argmax 357, verify-shaped argmax 1049, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=3: position 186 (verify row 1): single-token argmax 357, verify-shaped argmax 1049, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=4: argmax disagreements 4 over 1014 (position, row) pairs
+[teacher-forced] M=4: position 106 (verify row 2): single-token argmax 369, verify-shaped argmax 883, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=4: position 106 (verify row 0): single-token argmax 369, verify-shaped argmax 883, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=4: position 154 (verify row 1): single-token argmax 303, verify-shaped argmax 264, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=4: position 186 (verify row 2): single-token argmax 357, verify-shaped argmax 1049, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=5: argmax disagreements 10 over 1265 (position, row) pairs
+[teacher-forced] M=5: position 74 (verify row 3): single-token argmax 17120, verify-shaped argmax 41163, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=5: position 106 (verify row 3): single-token argmax 369, verify-shaped argmax 883, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=5: position 106 (verify row 0): single-token argmax 369, verify-shaped argmax 883, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=5: position 124 (verify row 4): single-token argmax 694, verify-shaped argmax 13, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=5: position 125 (verify row 4): single-token argmax 61446, verify-shaped argmax 15156, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=5: position 124 (verify row 1): single-token argmax 694, verify-shaped argmax 13, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=5: position 125 (verify row 0): single-token argmax 61446, verify-shaped argmax 15156, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=5: position 161 (verify row 3): single-token argmax 33625, verify-shaped argmax 264, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=5: position 177 (verify row 2): single-token argmax 18082, verify-shaped argmax 15796, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=5: position 186 (verify row 3): single-token argmax 357, verify-shaped argmax 1049, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=6: argmax disagreements 7 over 1515 (position, row) pairs
+[teacher-forced] M=6: position 106 (verify row 3): single-token argmax 369, verify-shaped argmax 883, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=6: position 106 (verify row 1): single-token argmax 369, verify-shaped argmax 883, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=6: position 124 (verify row 4): single-token argmax 694, verify-shaped argmax 13, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=6: position 125 (verify row 3): single-token argmax 61446, verify-shaped argmax 15156, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=6: position 124 (verify row 1): single-token argmax 694, verify-shaped argmax 13, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=6: position 154 (verify row 5): single-token argmax 303, verify-shaped argmax 264, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=6: position 186 (verify row 2): single-token argmax 357, verify-shaped argmax 1049, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] largest reference top-2 gap at any flipped position: 1.0 bf16 ULP
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 436.91s
+
+     Running tests\static_kv_parity.rs (C:\cargo-targets\at-head-rc1\release\deps\static_kv_parity-a21a794db8ff3e56.exe)
+
+running 4 tests
+test ac1_static_kv_greedy_fixture_is_token_identical_to_attn_kv ... [ac1] 256 tokens identical across reference / static / growing (gqa); growing record DecodeRecord { path: StepModel, target_forwards: 256, prefill_forwards: 1, proposed_tokens: 0, accepted_tokens: 0, generated_tokens: 256, host_syncs: 256, sampler: SamplerTelemetry { path: Some(Device), device_draws: 256, host_draws: 0, logits_to_host: 0 }, kv_cache: Growing, attn_formulation: Gqa, proposer: None, verify_steps: 255, direct_rollbacks: 0, replay_forwards: 0, verify_host_syncs: 255, fused_primitives: FusedTally { fused: 69888, reference: 0, reference_reason: None }, cuda_graphs: GraphTally { replayed: 0, eager: 0, captured: 0, fallback_reason: None }, nvfp4_projections: Nvfp4PathTally { gemv: 0, cublaslt: 0, cublaslt_reason: None } }
+ok
+test ac3_static_kv_device_pointers_are_stable_across_the_fixture_and_a_rollback ... [ac3] 16 attention buffers pinned across 256 steps and a rollback to 349; preallocated 792854528 bytes (23134208 KV + 769720320 checkpoint ring)
+ok
+test provider_off_path_is_token_identical_to_the_reference_loop ... [sc-24140] wrote C:\evidence\sc-24128\rc1\at3\provider-off-qwen38-27b.json
+[sc-24140] engine 256 tokens / 255 events, reference 256 tokens / 255 events, identical=true
+ok
+test teacher_forced_static_vs_attn_kv_logit_parity_report ... [teacher-forced] 256 positions; argmax agrees at 255; max |delta logit| =          2.703125 at position 56 (reference logit 5.28125, row range 41.125); mean per-position max          |delta| = 0.25434303
+[teacher-forced] pos 107: static argmax 6355 (top-2 gap 0), reference argmax              883 (top-2 gap 0.125 = 1 bf16 ULPs of the top logit), max |delta logit| 0.125
+ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 249.21s
+

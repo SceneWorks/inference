@@ -1,0 +1,19 @@
+warning: candle-kernels@0.10.2: Compiling 11 of 11 PTX kernels
+warning: candle-kernels@0.10.2: Using 24 threads for compilation
+warning: candle-kernels@0.10.2: Compiling 15 of 15 kernels
+    Finished `release` profile [optimized] target(s) in 0.25s
+     Running tests\qwen35_vision.rs (C:\cargo-targets\at-head-rc1\release\deps\qwen35_vision-300960e9d411dd08.exe)
+
+running 1 test
+test qwen35_vision_grounds_on_image ... 
+=== qwen3.6 VISION (red) ===
+[answer] "Red"
+
+
+=== qwen3.6 VISION (blue) ===
+[answer] "Blue"
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 25.73s
+

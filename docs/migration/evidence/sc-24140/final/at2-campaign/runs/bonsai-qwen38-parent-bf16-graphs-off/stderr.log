@@ -1,0 +1,11 @@
+[decode_bench] reference          15.74 tok/s  prefill 1.300s  fused {"switch":"on","fused":69888,"reference":0,"reference_reason":null,"path":"fused"}  nvfp4 {"switch":"on","gemv":0,"cublaslt":0,"cublaslt_reason":null,"path":"none"}
+[decode_bench] step_model         15.63 tok/s  prefill 1.288s  graphs {"switch":"off","replayed":0,"eager":0,"captured":0,"fallback_reason":null,"path":"none"}
+[decode_bench] mtp K=1            21.15 tok/s  accept 0.827  fwd/tok 0.551  syncs/verify 1.00  fwd/verify 1.00  rollbacks 24 direct / 0 replay  graphs {"switch":"off","replayed":0,"eager":0,"captured":0,"fallback_reason":null,"path":"none"}
+[decode_bench] mtp K=2            25.04 tok/s  accept 0.757  fwd/tok 0.402  syncs/verify 1.00  fwd/verify 1.00  rollbacks 32 direct / 0 replay  graphs {"switch":"off","replayed":0,"eager":0,"captured":0,"fallback_reason":null,"path":"none"}
+[decode_bench] mtp K=3            23.94 tok/s  accept 0.569  fwd/tok 0.375  syncs/verify 1.00  fwd/verify 1.00  rollbacks 59 direct / 0 replay  graphs {"switch":"off","replayed":0,"eager":0,"captured":0,"fallback_reason":null,"path":"none"}
+[decode_bench] mtp K=4            24.29 tok/s  accept 0.467  fwd/tok 0.355  syncs/verify 1.00  fwd/verify 1.00  rollbacks 71 direct / 0 replay  graphs {"switch":"off","replayed":0,"eager":0,"captured":0,"fallback_reason":null,"path":"none"}
+[decode_bench] mtp K=5            23.77 tok/s  accept 0.465  fwd/tok 0.305  syncs/verify 1.00  fwd/verify 1.00  rollbacks 65 direct / 0 replay  graphs {"switch":"off","replayed":0,"eager":0,"captured":0,"fallback_reason":null,"path":"none"}
+[decode_bench] ngram K=3          15.04 tok/s  accept 0.189  fwd/tok 0.793  syncs/verify 1.00  fwd/verify 1.00  rollbacks 84 direct / 0 replay
+[decode_bench] sampled            15.67 tok/s  prefill 0.665s  sampler {"path":"device","device_draws":256,"host_draws":0,"logits_to_host":0,"logits_to_host_per_token":0.0,"host_draws_per_token":0.0}
+[decode_bench] sampled_step_model 15.42 tok/s  prefill 1.294s  sampler {"path":"device","device_draws":256,"host_draws":0,"logits_to_host":0,"logits_to_host_per_token":0.0,"host_draws_per_token":0.0}
+[decode_bench] wrote C:\evidence\sc-24128\rc1\at2-campaign\runs\bonsai-qwen38-parent-bf16-graphs-off\decode_bench.json
