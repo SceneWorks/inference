@@ -347,7 +347,7 @@ impl RewindableConstraintMask for CommitOnly<'_, '_> {
     fn rewind(&mut self, checkpoint: usize) {
         assert_eq!(
             checkpoint, self.accepted,
-            "a token-at-a-time run advanced its constraint speculatively; a plain ConstraintMask              cannot rewind"
+            "a plain ConstraintMask cannot rewind: the token-at-a-time run advanced it speculatively"
         );
     }
 }
@@ -588,6 +588,35 @@ mod tests {
             generate_step(&model, &[], &cfg, &CancelFlag::new(), &mut |_| {}, None),
             Err(Error::Msg(_))
         ));
+    }
+
+    /// The adapter `generate_step` hands the engine: a plain constraint advanced only by emitted
+    /// tokens, so a rewind to the latest checkpoint is a no-op — and a rewind that would have to
+    /// undo an advance fails loudly instead of leaving the constraint ahead of the history.
+    #[test]
+    fn a_commit_only_constraint_refuses_to_rewind_an_advance() {
+        struct Log(Vec<i32>);
+        impl ConstraintMask for Log {
+            fn allowed(&mut self) -> &[bool] {
+                &[]
+            }
+            fn accept(&mut self, token: i32) {
+                self.0.push(token);
+            }
+        }
+        let mut log = Log(Vec::new());
+        let mut adapter = CommitOnly {
+            inner: &mut log,
+            accepted: 0,
+        };
+        adapter.accept(3);
+        let checkpoint = adapter.checkpoint();
+        adapter.rewind(checkpoint);
+        adapter.accept(4);
+        let advanced =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| adapter.rewind(checkpoint)));
+        assert!(advanced.is_err(), "rewinding past an advance must fail");
+        assert_eq!(log.0, vec![3, 4], "every accept reaches the constraint");
     }
 
     #[test]

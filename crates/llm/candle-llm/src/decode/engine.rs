@@ -19,6 +19,9 @@
 //!    them ([`logits_rows_host`]). The policy is `core_llm`'s: [`greedy_commit`] for greedy,
 //!    [`accept_token`] (the distribution-preserving `p/q` rule, unchanged) for stochastic. This is
 //!    the AC2 figure: exactly one host sync per verify step, where the old loop paid `K + 1`.
+//!    A step with **no** drafts (the [`NoProposer`] run, or a step the budget clamped to `K = 0`)
+//!    has no decision to make: its one row is an ordinary [`sample`] draw — the device sampler
+//!    for a temperature / top-p request — exactly the token-at-a-time loop's (sc-24140).
 //! 4. **Recover**: keep the accepted prefix. The engine first asks the cache to roll back to
 //!    `start + 1 + accepted` — a **direct rollback**, which every cache with per-token rollback
 //!    (a softmax-only cache, the `Qwen35Cache` with its per-token DeltaNet checkpoint ring since
