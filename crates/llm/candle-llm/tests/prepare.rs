@@ -196,6 +196,172 @@ fn quant_round_trip(tag: &str, hidden: usize, inter: usize, quant: Quantize) {
     .unwrap();
 }
 
+/// The safetensors header of one file: `name -> (dtype, shape)`.
+fn header(path: &std::path::Path) -> HashMap<String, (String, Vec<usize>)> {
+    let bytes = std::fs::read(path).unwrap();
+    let n = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+    let v: serde_json::Value = serde_json::from_slice(&bytes[8..8 + n]).unwrap();
+    v.as_object()
+        .unwrap()
+        .iter()
+        .filter(|(k, _)| k.as_str() != "__metadata__")
+        .map(|(k, t)| {
+            let shape = t["shape"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d.as_u64().unwrap() as usize)
+                .collect();
+            (k.clone(), (t["dtype"].as_str().unwrap().to_string(), shape))
+        })
+        .collect()
+}
+
+/// Last-position logits of a loaded llama-family provider over a fixed prompt, on the host.
+fn logits(provider: &LlamaProvider) -> Vec<f32> {
+    let model = provider.causal_lm().expect("a llama-family decoder");
+    let ids = Tensor::from_vec(vec![1u32, 5, 9, 2, 7], (1, 5), model.device()).unwrap();
+    let mut cache = model.new_cache();
+    model
+        .decode_logits(&ids, &mut cache, 0)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap()
+}
+
+/// sc-19375: a Q4 / Q8 tier stores its layer projections **already quantized** — each a `U8`
+/// GGML block tensor `[rows, blocks, block_bytes]` of the tier's block type — so the tier is a
+/// fraction of the dense source, and loading it (no load-time request: the persisted block drives
+/// it) builds exactly the model a load-time quantization of the dense source builds: identical
+/// logits. The Q4 case uses a 288-wide MLP, so `down_proj` exercises the Q4_0 fallback.
+#[test]
+fn prepared_tiers_store_ggml_blocks_and_load_identically() {
+    for (tag, hidden, inter, quant, blocks) in [
+        (
+            "blocks-q4",
+            256usize,
+            288usize,
+            Quantize::Q4,
+            [144usize, 18],
+        ),
+        ("blocks-q8", 64, 96, Quantize::Q8, [34, 34]),
+    ] {
+        let src = write_synthetic(tag, hidden, inter);
+        let out = unique_dir(&format!("{tag}-out"));
+        prepare_snapshot(&PrepareSpec::quantized(
+            src.to_path_buf(),
+            out.to_path_buf(),
+            quant,
+        ))
+        .unwrap();
+
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(cfg["quantization"]["storage"], serde_json::json!("ggml"));
+
+        // Every layer projection is stored as GGML blocks of the tier's type; the rest stay dense.
+        let tensors = header(&out.join("model.safetensors"));
+        let source = header(&src.join("model.safetensors"));
+        let mut projections = 0;
+        for (name, (dtype, shape)) in &tensors {
+            if name.ends_with("_proj.weight") {
+                projections += 1;
+                let (_, src_shape) = &source[name];
+                let (rows, cols) = (src_shape[0], src_shape[1]);
+                let block_bytes = if name.ends_with("down_proj.weight") {
+                    blocks[1]
+                } else {
+                    blocks[0]
+                };
+                let block_len = if block_bytes == 144 { 256 } else { 32 };
+                assert_eq!(dtype, "U8", "{tag}: {name} must be stored quantized");
+                assert_eq!(
+                    shape,
+                    &vec![rows, cols / block_len, block_bytes],
+                    "{tag}: {name} block layout"
+                );
+            } else {
+                assert_eq!(dtype, &source[name].0, "{tag}: {name} stays dense");
+            }
+        }
+        assert_eq!(projections, 14, "{tag}: 2 layers x 7 projections");
+
+        // The tier holds only its own bytes: well under the dense f32 source.
+        let tier = std::fs::metadata(out.join("model.safetensors"))
+            .unwrap()
+            .len();
+        let dense = std::fs::metadata(src.join("model.safetensors"))
+            .unwrap()
+            .len();
+        let bound = if matches!(quant, Quantize::Q4) {
+            0.2
+        } else {
+            0.35
+        };
+        assert!(
+            (tier as f64) < bound * dense as f64,
+            "{tag}: tier {tier} B is not quantized storage (dense source {dense} B)"
+        );
+
+        let prepared =
+            LlamaProvider::load(&LoadSpec::dense(out.to_str().unwrap().to_string())).unwrap();
+        assert!(prepared.is_quantized(), "{tag}: loads quantized");
+        let mut at_load = LoadSpec::dense(src.to_str().unwrap().to_string());
+        at_load.quantize = Some(quant);
+        let at_load = LlamaProvider::load(&at_load).unwrap();
+        assert_eq!(
+            logits(&prepared),
+            logits(&at_load),
+            "{tag}: stored blocks must load to the load-time-quantized model exactly"
+        );
+
+        // Stored blocks are never re-quantized to another tier.
+        let mut other = LoadSpec::dense(out.to_str().unwrap().to_string());
+        other.quantize = Some(if matches!(quant, Quantize::Q4) {
+            Quantize::Q8
+        } else {
+            Quantize::Q4
+        });
+        assert!(
+            LlamaProvider::load(&other).is_err(),
+            "{tag}: re-quantizing stored blocks must be refused"
+        );
+    }
+}
+
+/// Backward compatibility: a snapshot prepared before sc-19375 — dense weights carrying the
+/// rounding plus a bare `quantization` block — still loads quantized, to the same logits as a
+/// load-time quantization of those weights.
+#[test]
+fn dense_rounded_prepared_snapshot_still_loads_quantized() {
+    let src = write_synthetic("legacy", 64, 96);
+    let cfg_path = src.join("config.json");
+    let mut cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+    cfg["quantization"] = serde_json::json!({ "bits": 8 });
+    let legacy = unique_dir("legacy-snap");
+    std::fs::write(legacy.join("config.json"), cfg.to_string()).unwrap();
+    std::fs::copy(src.join("tokenizer.json"), legacy.join("tokenizer.json")).unwrap();
+    std::fs::copy(
+        src.join("model.safetensors"),
+        legacy.join("model.safetensors"),
+    )
+    .unwrap();
+
+    let loaded =
+        LlamaProvider::load(&LoadSpec::dense(legacy.to_str().unwrap().to_string())).unwrap();
+    assert!(loaded.is_quantized());
+    let mut at_load = LoadSpec::dense(src.to_str().unwrap().to_string());
+    at_load.quantize = Some(Quantize::Q8);
+    let at_load = LlamaProvider::load(&at_load).unwrap();
+    assert_eq!(logits(&loaded), logits(&at_load));
+}
+
 /// A multimodal snapshot (a `vision_config` block) is declined by the text preparer, so
 /// `prepare_snapshot` reports no backend (Unsupported) rather than mis-preparing it.
 #[test]

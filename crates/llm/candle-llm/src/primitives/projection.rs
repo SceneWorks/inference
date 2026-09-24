@@ -85,6 +85,28 @@ impl QuantSpec {
     pub fn group_size(&self) -> usize {
         self.group_size
     }
+
+    /// The GGML dtype a projection with input dimension `in_dim` is quantized to under this spec.
+    ///
+    /// Q4_K's 256-element super-block does not divide every model's MLP width (YuE stage-2's
+    /// `intermediate_size` 5504 = 21.5 × 256, so its `down_proj` has a 5504-wide input). A 4-bit
+    /// spec therefore falls back to Q4_0 — 32-element blocks, the same 4.5 bits/weight — for an
+    /// `in_dim` that is 32- but not 256-aligned; every other case keeps the spec's own dtype (a
+    /// dimension aligned to neither still fails loudly in the quantizer). The snapshot preparer and
+    /// quantize-on-load both resolve through here, so a prepared Q4 snapshot re-quantizes on load
+    /// to exactly the representation its persisted rounding came from.
+    pub fn dtype_for_in_dim(&self, in_dim: usize) -> GgmlDType {
+        let q4k_block = GgmlDType::Q4K.block_size();
+        let q4_0_block = GgmlDType::Q4_0.block_size();
+        if self.dtype == GgmlDType::Q4K
+            && !in_dim.is_multiple_of(q4k_block)
+            && in_dim.is_multiple_of(q4_0_block)
+        {
+            GgmlDType::Q4_0
+        } else {
+            self.dtype
+        }
+    }
 }
 
 /// The load-time storage format for a decoder's large projections — the weight-format selector
@@ -364,9 +386,14 @@ impl Projection {
     ) -> Result<Self> {
         match quant {
             None => Ok(Projection::Dense(Linear::new(weight, bias))),
-            Some(q) => Ok(Projection::Quantized(QuantizedLinear::quantize(
-                &weight, q.dtype, bias,
-            )?)),
+            Some(q) => {
+                let in_dim = weight.dims().last().copied().unwrap_or(0);
+                Ok(Projection::Quantized(QuantizedLinear::quantize(
+                    &weight,
+                    q.dtype_for_in_dim(in_dim),
+                    bias,
+                )?))
+            }
         }
     }
 
@@ -611,6 +638,25 @@ mod tests {
             .sum();
         let den: f64 = want.iter().map(|w| (*w as f64).powi(2)).sum();
         (num / den.max(1e-30)).sqrt() as f32
+    }
+
+    /// sc-19375: a 4-bit spec serves a 32- but not 256-aligned input dimension (YuE stage-2's
+    /// 5504-wide `down_proj`) as Q4_0 instead of refusing the load; aligned dims and Q8 are unchanged.
+    #[test]
+    fn q4_falls_back_to_q4_0_for_non_256_aligned_inputs() {
+        let q4 = QuantSpec::q4();
+        assert_eq!(q4.dtype_for_in_dim(4096), GgmlDType::Q4K);
+        assert_eq!(q4.dtype_for_in_dim(5504), GgmlDType::Q4_0);
+        assert_eq!(q4.dtype_for_in_dim(100), GgmlDType::Q4K); // aligned to neither: quantizer refuses
+        assert_eq!(QuantSpec::q8().dtype_for_in_dim(5504), GgmlDType::Q8_0);
+
+        let p = Projection::load(ramp(8, 5504, 7, &Device::Cpu), Some(q4)).unwrap();
+        assert_eq!(p.kind(), ProjectionKind::Ggml);
+        let Projection::Quantized(q) = &p else {
+            panic!("expected a quantized projection")
+        };
+        assert_eq!(q.ggml_dtype(), Some(GgmlDType::Q4_0));
+        assert!(Projection::load(ramp(8, 100, 7, &Device::Cpu), Some(q4)).is_err());
     }
 
     /// sc-24135 AC2 at the primitive: an NVFP4 format for a CPU device is the typed refusal.
