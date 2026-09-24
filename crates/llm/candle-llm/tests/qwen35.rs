@@ -171,6 +171,7 @@ fn qwen35_quantize_on_load_q8() {
         source: model_dir(),
         projector_source: None,
         quantize: Some(Quantize::Q8),
+        cuda_graphs: None,
     })
     .expect("load q8");
     assert!(q8.is_quantized(), "Q8 load must report quantized");

@@ -129,6 +129,7 @@ impl TextLlm for StubTextLlm {
                     usage,
                     mtp: None,
                     timings: None,
+                    decode: None,
                     finish_reason: Some(FinishReason::Cancelled),
                 });
             }
@@ -169,6 +170,7 @@ impl TextLlm for StubTextLlm {
             usage,
             mtp: None,
             timings: None,
+            decode: None,
             finish_reason: Some(FinishReason::Length),
         })
     }

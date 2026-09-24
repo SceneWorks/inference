@@ -205,17 +205,24 @@ fn provider_records_the_decode_path_it_ran() {
 /// the record names why no graph ran (the build or device here; the family's own
 /// `positions_host_scalar` on a CUDA own-stream device) rather than a bare `graph: none`. With
 /// the switch off the model runs bare and the record is `graph: none`.
+///
+/// The switch is a load option (sc-24139): each case loads the provider under it
+/// (`LoadSpec::cuda_graphs`), since a CUDA load settles the model's stream then and every
+/// generation runs under the switch the load recorded, not the process switch of the moment.
 #[test]
 fn causal_engine_requests_record_the_graph_runner() {
     use candle_llm::decode::DecodePath;
 
     let guard = write_thinking_snapshot();
-    let spec = LoadSpec::dense(guard.path().to_str().unwrap().to_string());
-    let p = LlamaProvider::load(&spec).expect("load thinking provider");
     let mut req = TextLlmRequest::new(vec![Message::user("t1 t2 t3")], 6);
     req.seed = Some(0);
     let record = |on: bool| {
-        let _policy = candle_llm::decode::graph::cuda_graphs_policy_guard(Some(on));
+        let spec = LoadSpec {
+            cuda_graphs: Some(on),
+            ..LoadSpec::dense(guard.path().to_str().unwrap().to_string())
+        };
+        let p = LlamaProvider::load(&spec).expect("load thinking provider");
+        assert_eq!(p.load_record().cuda_graphs, Some(on));
         p.generate(&req, &mut |_| {}).expect("generate");
         p.last_decode_record().expect("record after generate")
     };

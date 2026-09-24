@@ -73,10 +73,11 @@
 //! ## Switch and accounting
 //! `CANDLE_LLM_CUDA_GRAPHS` (`1` / `on` / `true` / `yes` enable; the default is **off** —
 //! opt-in until a capturable step model exists and the decode bench shows a win, see the
-//! story's evidence) or [`set_cuda_graphs`] at runtime. Admission prices graph memory up front
-//! with [`graph_workspace_admission_bytes`] (E6); [`GraphRunner::workspace`] reports what a
-//! runner holds (telemetry). A destroyed graph's memory is trimmed back from the device's graph
-//! pool.
+//! story's evidence) or [`set_cuda_graphs`] at runtime; a load's own `LoadSpec::cuda_graphs`
+//! overrides both for that model — its load (the stream it lands on) and every generation on it
+//! ([`cuda_graphs_scope`], sc-24139). Admission prices graph memory up front with
+//! [`graph_workspace_admission_bytes`] (E6); [`GraphRunner::workspace`] reports what a runner
+//! holds (telemetry). A destroyed graph's memory is trimmed back from the device's graph pool.
 //!
 //! Without the `cuda` feature the runner is a transparent pass-through that reports
 //! [`REASON_CUDA_FEATURE_OFF`].
@@ -179,9 +180,23 @@ fn env_says_enabled() -> bool {
     })
 }
 
+thread_local! {
+    /// The thread-scoped switch ([`cuda_graphs_scope`]); `None` defers to the process switch.
+    static REQUEST_POLICY: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
 /// Whether the graph runner may capture at all (the switch; a `cuda` build on a CUDA device is
-/// still required for a graph to exist).
+/// still required for a graph to exist). A loaded model's own policy — `LoadSpec::cuda_graphs`,
+/// scoped over its load and each of its generations by [`cuda_graphs_scope`] — wins over the
+/// process switch ([`set_cuda_graphs`] / [`CUDA_GRAPHS_ENV`]).
 pub fn cuda_graphs_enabled() -> bool {
+    if let Some(enabled) = REQUEST_POLICY.with(Cell::get) {
+        return enabled;
+    }
+    process_cuda_graphs_enabled()
+}
+
+fn process_cuda_graphs_enabled() -> bool {
     match POLICY.load(Ordering::Relaxed) {
         POLICY_ON => true,
         POLICY_OFF => false,
@@ -198,6 +213,30 @@ pub fn set_cuda_graphs(enabled: Option<bool>) {
         None => POLICY_ENV,
     };
     POLICY.store(policy, Ordering::Relaxed);
+}
+
+/// Restores the calling thread's previous scoped switch when dropped. Returned by
+/// [`cuda_graphs_scope`].
+#[must_use = "the graph policy only applies while the scope is alive"]
+pub struct CudaGraphsScope {
+    previous: Option<bool>,
+}
+
+impl Drop for CudaGraphsScope {
+    fn drop(&mut self) {
+        REQUEST_POLICY.with(|p| p.set(self.previous));
+    }
+}
+
+/// Apply a loaded model's graph policy (`LoadSpec::cuda_graphs`, sc-24139) on the current
+/// thread until the returned scope drops: `Some(true)` / `Some(false)` force the switch on / off
+/// for everything done on this thread meanwhile — the device selection at load, and per request
+/// admission's workspace pricing, the choice to wrap the step model and the runner's own switch
+/// check — and `None` keeps the process switch. A load and its decodes run on the calling thread
+/// (the tallies are thread-local for the same reason), so work on another thread is unaffected.
+pub fn cuda_graphs_scope(enabled: Option<bool>) -> CudaGraphsScope {
+    let previous = REQUEST_POLICY.with(|p| p.replace(enabled));
+    CudaGraphsScope { previous }
 }
 
 static POLICY_LOCK: Mutex<()> = Mutex::new(());
@@ -1613,6 +1652,36 @@ mod tests {
         if std::env::var_os(CUDA_GRAPHS_ENV).is_none() {
             assert!(!cuda_graphs_enabled());
         }
+    }
+
+    #[test]
+    fn a_scope_overrides_the_process_switch_on_its_thread_only() {
+        let _guard = cuda_graphs_policy_guard(Some(false));
+        {
+            let _on = cuda_graphs_scope(Some(true));
+            assert!(cuda_graphs_enabled(), "the scope's Some(true) wins");
+            // Another thread sees the process switch, not this scope's policy.
+            let elsewhere = std::thread::spawn(cuda_graphs_enabled).join().unwrap();
+            assert!(!elsewhere);
+            {
+                let _inner = cuda_graphs_scope(Some(false));
+                assert!(!cuda_graphs_enabled());
+            }
+            assert!(
+                cuda_graphs_enabled(),
+                "a nested scope restores the outer one"
+            );
+            // `None` defers to the process switch.
+            let _defer = cuda_graphs_scope(None);
+            assert!(!cuda_graphs_enabled());
+        }
+        assert!(!cuda_graphs_enabled(), "the scope is gone once dropped");
+        set_cuda_graphs(Some(true));
+        let _off = cuda_graphs_scope(Some(false));
+        assert!(
+            !cuda_graphs_enabled(),
+            "Some(false) wins over a process switch that is on"
+        );
     }
 
     #[test]

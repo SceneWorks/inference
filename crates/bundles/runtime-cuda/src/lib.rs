@@ -98,6 +98,27 @@ fn audio_lane() -> runtime_catalog::AudioLane {
     }
 }
 
+/// What this bundle's LLM backend can serve on this host before any model is loaded (sc-24139):
+/// the load device, its CUDA compute capability, and whether `Quantize::Nvfp4` and
+/// `LoadSpec::cuda_graphs` are available — each unavailable feature with the refusal a load would
+/// return. A product reads this to offer, or disable with the reason, those controls.
+pub fn text_backend_capabilities() -> core_llm::BackendCapabilities {
+    candle_llm::backend_capabilities()
+}
+
+/// Whether an NVFP4 load of the snapshot at `spec.source` can pass every gate this bundle's load
+/// runs before reading a weight (sc-24139): the provider this bundle's text registry would load it
+/// with, that provider's own NVFP4 gate, then the device gate. A product asks before it downloads
+/// weight shards or registers a snapshot as NVFP4. Reads only `config.json` (or a GGUF header).
+pub fn text_nvfp4_support(spec: &core_llm::LoadSpec) -> core_llm::FeatureSupport {
+    match candle_llm::cuda_text_registry() {
+        Ok(registry) => candle_llm::nvfp4_support(&registry, spec),
+        Err(error) => core_llm::FeatureSupport::unavailable(format!(
+            "nvfp4: the CUDA text registry did not compose: {error}"
+        )),
+    }
+}
+
 /// Build the complete validated CUDA runtime composition.
 pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
     #[cfg(feature = "audio")]

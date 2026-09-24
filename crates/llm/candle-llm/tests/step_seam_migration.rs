@@ -560,6 +560,12 @@ const V_HIDDEN: usize = 16;
 
 /// A tiny `LlavaForConditionalGeneration` (SigLIP 8×8 / 4×4 patches, 2-layer Llama decoder).
 fn tiny_llava() -> LlavaModel {
+    let guard = tiny_llava_snapshot();
+    LlavaModel::from_dir(guard.path(), &Device::Cpu).unwrap()
+}
+
+/// [`tiny_llava`]'s snapshot directory (config + weights, no tokenizer).
+fn tiny_llava_snapshot() -> tempfile::TempDir {
     let guard = tempfile::Builder::new()
         .prefix("candle-llm-sc24138-llava-")
         .tempdir()
@@ -649,7 +655,7 @@ fn tiny_llava() -> LlavaModel {
         w.insert(p("mlp.down_proj.weight"), d.rand(&[HIDDEN, INTER]));
     }
     candle_core::safetensors::save(&w, dir.join("model.safetensors")).unwrap();
-    LlavaModel::from_dir(dir, &Device::Cpu).unwrap()
+    guard
 }
 
 /// A deterministic two-colour 8×8 RGB image.
@@ -747,6 +753,78 @@ fn llava_reference(model: &LlavaModel) -> Golden {
 fn llava_caption_matches_its_pre_migration_golden() {
     let mut model = tiny_llava();
     golden("llava", llava_before(&mut model));
+}
+
+/// sc-24139: the caption decodes through the engine, and the generation carries the engine's
+/// measured record — the step seam, one prefill forward, every emitted token counted.
+#[test]
+fn llava_caption_carries_the_engines_decode_record() {
+    let model = tiny_llava();
+    let features = model.image_features(&llava_image(), V_IMG, V_IMG).unwrap();
+    let out = model
+        .generate(
+            &LLAVA_PROMPT,
+            &features,
+            &SamplingParams::default(),
+            NEW_TOKENS,
+            Some(0),
+            &[],
+            &CancelFlag::new(),
+            &mut |_, _| {},
+        )
+        .unwrap();
+    assert_eq!(out.record.path, DecodePath::StepModel);
+    assert_eq!(out.record.prefill_forwards, 1);
+    assert_eq!(out.record.generated_tokens, out.tokens.len() as u64);
+    assert_eq!(out.record.report(false).path, "step_model");
+}
+
+/// sc-24139: the LLaVA provider reports that record on `TextLlmOutput::decode` — the path a
+/// product shows for this generation — instead of `None`. It is not wired to the CUDA-graph
+/// runner, so the report says the switch was off.
+#[test]
+fn llava_provider_reports_its_decode_path() {
+    use candle_llm::core_llm::{
+        Content, ImageRef, LoadSpec, Message, Role, TextLlm, TextLlmRequest,
+    };
+
+    let dir = tiny_llava_snapshot();
+    let vocab: Vec<String> = (0..VOCAB).map(|i| format!("\"t{i}\": {i}")).collect();
+    std::fs::write(
+        dir.path().join("tokenizer.json"),
+        format!(
+            r#"{{"version": "1.0", "added_tokens": [], "normalizer": null,
+                "pre_tokenizer": {{"type": "Whitespace"}}, "post_processor": null,
+                "decoder": null,
+                "model": {{"type": "WordLevel", "vocab": {{ {} }}, "unk_token": "t0"}}}}"#,
+            vocab.join(", ")
+        ),
+    )
+    .unwrap();
+    let provider = candle_llm::LlavaProvider::load(&LoadSpec::dense(
+        dir.path().to_string_lossy().into_owned(),
+    ))
+    .unwrap();
+    let image = ImageRef::new(V_IMG as u32, V_IMG as u32, llava_image()).unwrap();
+    let request = TextLlmRequest {
+        messages: vec![Message {
+            role: Role::User,
+            content: vec![Content::Image(image), Content::text("t12 t19".to_owned())],
+            thinking: None,
+            tool_calls: Vec::new(),
+        }],
+        max_new_tokens: 4,
+        seed: Some(0),
+        ..Default::default()
+    };
+    let out = provider.generate(&request, &mut |_| {}).unwrap();
+    let decode = out
+        .decode
+        .expect("the LLaVA provider reports its decode path");
+    assert_eq!(decode.path, "step_model");
+    assert!(!decode.cuda_graphs.enabled);
+    assert_eq!(decode.cuda_graphs.path, "none");
+    assert!(decode.target_forwards >= 1);
 }
 
 // ---- StarCoder2 (the StarVector-8B decoder) -------------------------------------------------------

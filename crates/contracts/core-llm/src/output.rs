@@ -124,6 +124,10 @@ pub struct TextLlmOutput {
     /// Synchronized backend phase measurements, when implemented by this provider.
     /// `None` is unavailable evidence, never zero latency.
     pub timings: Option<GenerationTimings>,
+    /// Which decode path served this generation — proposer, sampler, CUDA graphs, NVFP4 projection
+    /// path — as the backend measured it (sc-24139). `None` when the provider does not report one;
+    /// never a guess.
+    pub decode: Option<crate::report::DecodeReport>,
     /// Why generation stopped (`None` only on a default-constructed value).
     pub finish_reason: Option<FinishReason>,
 }
