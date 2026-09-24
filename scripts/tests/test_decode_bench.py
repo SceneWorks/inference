@@ -6,6 +6,7 @@ import copy
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -142,6 +143,7 @@ def fake_binary(directory: Path, document: dict | None, exit_code: int = 0) -> P
         "if payload.exists():\n"
         "    pathlib.Path(os.environ['DECODE_BENCH_OUTPUT']).write_text(payload.read_text())\n"
         "print('rows', os.environ['DECODE_BENCH_ROWS'], 'drafts', os.environ['DECODE_BENCH_DRAFTS'], 'format', os.environ['DECODE_BENCH_FORMAT'])\n"
+        "print('graphs', os.environ.get('CANDLE_LLM_CUDA_GRAPHS'), 'ngram', os.environ['DECODE_BENCH_NGRAM_DRAFTS'], 'sampling', os.environ['DECODE_BENCH_SAMPLING'])\n"
         f"sys.exit({exit_code})\n",
         encoding="utf-8",
     )
@@ -150,6 +152,65 @@ def fake_binary(directory: Path, document: dict | None, exit_code: int = 0) -> P
         binary.write_text(f'@"{sys.executable}" "{script}" %*\n', encoding="utf-8")
     else:
         binary = directory / "fake_bench"
+        binary.write_text(f"#!/bin/sh\nexec '{sys.executable}' '{script}' \"$@\"\n", encoding="utf-8")
+        binary.chmod(0o755)
+    return binary
+
+
+MATRIX_BENCH = r"""
+import json, os, pathlib, sys
+snapshot = pathlib.Path(os.environ['DECODE_BENCH_SNAPSHOT'])
+config = json.loads((snapshot / 'config.json').read_text())
+llama = 'qwen3_5' not in config.get('model_type', '')
+rows = [r for r in os.environ['DECODE_BENCH_ROWS'].split(',') if r]
+new_tokens = int(os.environ['DECODE_BENCH_NEW_TOKENS'])
+graphs = 'on' if os.environ.get('CANDLE_LLM_CUDA_GRAPHS') == '1' else 'off'
+temperature, top_p, seed = os.environ['DECODE_BENCH_SAMPLING'].split(',')
+def row(path, **extra):
+    base = {
+        'path': path, 'generated_tokens': new_tokens, 'decode_tokens_per_second': 10.0,
+        'tokens': list(range(new_tokens)), 'tokens_match_reference': None if path in ('reference', 'sampled') else True,
+        'first_divergence': None, 'cache_checkpoint_bytes': 0 if llama else 1024,
+        'sampler': {'path': 'device', 'device_draws': new_tokens, 'host_draws': 0,
+                    'logits_to_host': 0, 'logits_to_host_per_token': 0.0},
+    }
+    if path.startswith('sampled'):
+        base['sampling'] = {'temperature': float(temperature), 'top_p': float(top_p), 'seed': int(seed)}
+    base.update(extra)
+    return base
+out = []
+for r in rows:
+    if r == 'mtp':
+        if llama:
+            sys.exit('the llama family has no MTP head')
+        out += [row('mtp', mtp_drafts=int(k), drafts=int(k)) for k in os.environ['DECODE_BENCH_DRAFTS'].split(',')]
+    elif r == 'ngram':
+        out += [row('ngram', drafts=int(k)) for k in os.environ['DECODE_BENCH_NGRAM_DRAFTS'].split(',')]
+    else:
+        out.append(row(r))
+doc = {
+    'schema_version': 2, 'suite': 'decode_bench', 'label': os.environ['DECODE_BENCH_LABEL'],
+    'compute_dtype': 'BF16', 'prompt_tokens': 40, 'new_tokens': new_tokens, 'rows': out,
+    'weight_format': os.environ['DECODE_BENCH_FORMAT'], 'cuda_graphs': graphs,
+}
+if llama:
+    doc['model_family'] = 'llama'
+pathlib.Path(os.environ['DECODE_BENCH_OUTPUT']).write_text(json.dumps(doc))
+print('rows', os.environ['DECODE_BENCH_ROWS'], 'format', os.environ['DECODE_BENCH_FORMAT'], 'graphs', graphs)
+"""
+
+
+def matrix_binary(directory: Path) -> Path:
+    """A fake bench that emits the rows it is asked for, in the format and graph switch it runs
+    under, and refuses `mtp` on a llama-family snapshot as the real one does."""
+    directory.mkdir(parents=True, exist_ok=True)
+    script = directory / "matrix_bench.py"
+    script.write_text(MATRIX_BENCH, encoding="utf-8")
+    if os.name == "nt":
+        binary = directory / "matrix_bench.cmd"
+        binary.write_text(f'@"{sys.executable}" "{script}" %*\n', encoding="utf-8")
+    else:
+        binary = directory / "matrix_bench"
         binary.write_text(f"#!/bin/sh\nexec '{sys.executable}' '{script}' \"$@\"\n", encoding="utf-8")
         binary.chmod(0o755)
     return binary
@@ -258,15 +319,15 @@ class DecodeBenchWrapperTests(unittest.TestCase):
         self.assertEqual(seal["decode_bench.json"], record["suite_document_sha256"])
         table = (output / "decode_bench.md").read_text(encoding="utf-8")
         self.assertIn(
-            "| head-test | MTP off (reference) | 4 | (ref) | yes | 10.00 | n/a | 1.000 | n/a | n/a | n/a | n/a | 1.00 GiB | n/a | n/a | n/a | n/a |",
+            "| head-test | bf16 | n/a | MTP off (reference) | 4 | (ref) | yes | 10.00 | n/a | 1.000 | n/a | n/a | n/a | n/a | 1.00 GiB | n/a | n/a | n/a | n/a | n/a | n/a |",
             table,
         )
         self.assertIn(
-            "| head-test | MTP off (StepModel) | 4 | yes | yes | 10.50 | n/a | 1.000 | 1.00 | n/a | n/a | n/a | 1.00 GiB | 3.0 MiB | 2.0 MiB | on: 12 fused / 0 ref | none | on: 0 replayed / 4 eager, 0 captured (deltanet_state_unstable) |",
+            "| head-test | bf16 | n/a | MTP off (StepModel) | 4 | yes | yes | 10.50 | n/a | 1.000 | 1.00 | n/a | n/a | n/a | 1.00 GiB | 3.0 MiB | 2.0 MiB | on: 12 fused / 0 ref | none | on: 0 replayed / 4 eager, 0 captured (deltanet_state_unstable) | n/a |",
             table,
         )
         self.assertIn(
-            "| head-test | MTP K=3 | 4 | no @2 | no @2 | 15.50 | 0.500 | 0.750 | 4.00 | 1.00 | 1.00 | 0 | 1.50 GiB | n/a | n/a | n/a | on: 30 gemv / 2 cuBLASLt (rows) | n/a |",
+            "| head-test | bf16 | n/a | MTP K=3 | 4 | no @2 | no @2 | 15.50 | 0.500 | 0.750 | 4.00 | 1.00 | 1.00 | 0 | 1.50 GiB | n/a | n/a | n/a | on: 30 gemv / 2 cuBLASLt (rows) | n/a | n/a |",
             table,
         )
         # The heading names the recorded model, not a literal.
@@ -276,6 +337,10 @@ class DecodeBenchWrapperTests(unittest.TestCase):
         self.assertNotIn("Qwen3.8-27B", table)
         stdout = (output / "stdout.log").read_text(encoding="utf-8")
         self.assertIn("rows reference,step_model,mtp drafts 1,2,3,4,5 format bf16", stdout)
+        # No `--cuda-graphs`: the switch is inherited, not forced; the default knobs reach the binary.
+        self.assertIn("ngram 3 sampling 0.7,0.9,0", stdout)
+        self.assertEqual(record["requested"]["weight_format"], "bf16")
+        self.assertIsNone(record["requested"]["cuda_graphs"])
         # `table` re-verifies the seal and combines runs.
         combined = self.root / "combined.md"
         self.assertEqual(bench.main(["table", str(output), str(output), "--output", str(combined)]), 0)
@@ -381,6 +446,12 @@ class DecodeBenchWrapperTests(unittest.TestCase):
         llama["model_family"] = "llama"
         llama["rows"][1]["cache_checkpoint_bytes"] = 0
         bench.validate_suite_document(llama)
+        # sc-24140: the hybrid's sampled step-seam row holds a checkpoint too.
+        sampled_step = suite_document()
+        sampled_step["rows"][1]["path"] = "sampled_step_model"
+        sampled_step["rows"][1]["cache_checkpoint_bytes"] = 0
+        with self.assertRaisesRegex(ValueError, "sampled_step_model row reports no rollback-checkpoint"):
+            bench.validate_suite_document(sampled_step)
 
     def test_table_refuses_runs_that_are_not_comparable(self) -> None:
         base = comparable_run("base")
@@ -400,15 +471,148 @@ class DecodeBenchWrapperTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no reference row"):
             bench.render_table([no_reference, base])
 
-    def test_table_refuses_merging_a_bf16_run_with_an_nvfp4_run(self) -> None:
-        # `base` has no `weight_format` key at all (a pre-sc-24136 document, implicitly bf16).
-        base = comparable_run("base")
-        nvfp4 = comparable_run("nvfp4-run", weight_format="nvfp4")
-        with self.assertRaisesRegex(ValueError, "suite.weight_format"):
-            bench.render_table([base, nvfp4])
-        # An explicit "bf16" document still merges with an older, key-less bf16 document.
-        explicit_bf16 = comparable_run("explicit-bf16", weight_format="bf16")
-        bench.render_table([base, explicit_bf16])
+    def test_weight_format_is_a_row_dimension_compared_per_format(self) -> None:
+        # sc-24140: runs of different formats merge; each row compares with its own format's
+        # baseline, and a non-bf16 row without one compares with its head's bf16 reference row.
+        baseline = comparable_run("baseline")  # no `weight_format`: a pre-sc-24136 bf16 document
+        baseline["run_kind"] = "baseline"
+        baseline["source"] = {"head_sha": "b" * 40}
+        head_bf16 = comparable_run("head-bf16", weight_format="bf16", cuda_graphs="off")
+        head_bf16["source"] = {"head_sha": "a" * 40}
+        for row in head_bf16["suite"]["rows"]:
+            row["tokens"] = [0, 1, 2, 7] if row["path"] != "mtp" else row["tokens"]
+        head_q8 = comparable_run("head-q8", weight_format="q8", cuda_graphs="on")
+        head_q8["source"] = {"head_sha": "a" * 40}
+        for row in head_q8["suite"]["rows"]:
+            row["tokens"] = [0, 1, 5, 7] if row["path"] != "mtp" else row["tokens"]
+        # An nvfp4 run from another commit has no bf16 reference of its own in the table.
+        other_nvfp4 = comparable_run("other-nvfp4", weight_format="nvfp4")
+        other_nvfp4["source"] = {"head_sha": "c" * 40}
+        text = bench.render_table([baseline, head_bf16, head_q8, other_nvfp4])
+        self.assertIn("with BF16 / Q8 / NVFP4 projections (the format column)", text)
+        # bf16 rows: against the bf16 baseline, unlabelled.
+        self.assertIn("| head-bf16 | bf16 | off | MTP off (reference) | 4 | (ref) | no @3 |", text)
+        # q8 rows: no q8 baseline, so the head's own bf16 reference row, labelled.
+        self.assertIn(
+            "| head-q8 | q8 | on | MTP off (reference) | 4 | (ref) | no @2 (vs head-bf16 bf16 ref) |",
+            text,
+        )
+        self.assertIn(
+            "| head-q8 | q8 | on | MTP off (StepModel) | 4 | yes | no @2 (vs head-bf16 bf16 ref) |",
+            text,
+        )
+        self.assertIn(
+            "| other-nvfp4 | nvfp4 | n/a | MTP off (reference) | 4 | (ref) | n/a (no bf16 ref) |",
+            text,
+        )
+        # A q8 baseline, when present, is the q8 rows' basis instead.
+        q8_baseline = comparable_run("q8-baseline", weight_format="q8")
+        q8_baseline["run_kind"] = "baseline"
+        text = bench.render_table([baseline, q8_baseline, head_bf16, head_q8])
+        self.assertIn("| head-q8 | q8 | on | MTP off (reference) | 4 | (ref) | no @2 |", text)
+        self.assertNotIn("(vs head-bf16 bf16 ref)", text)
+        # The basis selection itself.
+        self.assertEqual(bench.comparison_basis([baseline, head_q8], head_q8, "greedy"), None)
+        label, tokens = bench.comparison_basis([baseline, head_bf16, head_q8], head_q8, "greedy")
+        self.assertEqual((label, tokens), ("vs head-bf16 bf16 ref", [0, 1, 2, 7]))
+        # Differing formats no longer refuse, but everything else still does.
+        other_model = comparable_run("other", weight_format="q8")
+        other_model["model"] = {**other_model["model"], "revision": OTHER_REVISION}
+        with self.assertRaisesRegex(ValueError, "model.revision"):
+            bench.render_table([baseline, other_model])
+
+    def test_sampled_rows_compare_with_the_sampled_reference_and_show_the_sampler(self) -> None:
+        sampling = {"temperature": 0.7, "top_p": 0.9, "top_k": 0, "seed": 0}
+        sampler = {
+            "path": "device",
+            "device_draws": 4,
+            "host_draws": 0,
+            "logits_to_host": 0,
+            "logits_to_host_per_token": 0.0,
+        }
+        base = comparable_run("baseline")
+        base["suite"]["rows"].append(
+            {**base["suite"]["rows"][0], "path": "sampled", "tokens": [4, 4, 4, 4], "sampling": sampling}
+        )
+        head = comparable_run("head")
+        head["suite"]["rows"] += [
+            {
+                **head["suite"]["rows"][0],
+                "path": "sampled",
+                "tokens": [4, 4, 9, 4],
+                "sampling": sampling,
+                "sampler": {**sampler, "path": "host:penalty", "device_draws": 0, "host_draws": 4,
+                            "logits_to_host": 4, "logits_to_host_per_token": 1.0},
+                "kv_cache": "growing",
+            },
+            {
+                **head["suite"]["rows"][1],
+                "path": "sampled_step_model",
+                "tokens": [4, 4, 9, 4],
+                "tokens_match_reference": True,
+                "sampling": sampling,
+                "sampler": sampler,
+                "kv_cache": "static",
+            },
+        ]
+        text = bench.render_table([base, head])
+        self.assertIn("Sampled rows: temperature 0.7, top-p 0.9, seed 0", text)
+        # The sampled rows compare with the baseline's *sampled* row, not its greedy reference.
+        self.assertIn(
+            "| head | bf16 | n/a | sampled (reference, growing kv) | 4 | (ref) | no @2 |", text
+        )
+        self.assertIn(
+            "| head | bf16 | n/a | sampled (StepModel, static kv) | 4 | yes | no @2 |", text
+        )
+        self.assertIn("| host:penalty: 0 device / 4 host, 1.00 logits rows->host/tok |", text)
+        self.assertIn("| device: 4 device / 0 host, 0.00 logits rows->host/tok |", text)
+        self.assertEqual(bench.row_kind({"path": "sampled_step_model"}), "sampled")
+        self.assertEqual(bench.row_kind({"path": "step_model"}), "greedy")
+        self.assertEqual(bench.row_label({"path": "sampled"}), "sampled (reference)")
+
+    def test_run_accepts_every_weight_format_and_refuses_a_mismatch(self) -> None:
+        for fmt in ("q8", "q4", "nvfp4"):
+            doc = suite_document()
+            doc["weight_format"] = fmt
+            output = self.root / f"out-{fmt}"
+            binary = fake_binary(self.root / f"bin-{fmt}", doc)
+            self.assertEqual(bench.main(self.run_args(binary, output, format=fmt)), 0)
+            self.assertIn(f"format {fmt}", (output / "stdout.log").read_text(encoding="utf-8"))
+            record = json.loads((output / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["requested"]["weight_format"], fmt)
+        with self.assertRaises(SystemExit):
+            bench.parser().parse_args(self.run_args(self.root / "x", self.root / "y", format="fp8"))
+        # The binary must record the format it was asked for.
+        doc = suite_document()
+        doc["weight_format"] = "bf16"
+        with self.assertRaisesRegex(ValueError, "weight_format 'bf16', requested 'q8'"):
+            bench.main(self.run_args(fake_binary(self.root / "wrong", doc), self.root / "wrong-out", format="q8"))
+        # A document without the key is bf16: fine for bf16, refused for q8.
+        bench.check_requested_dimensions({}, "bf16", None)
+        with self.assertRaisesRegex(ValueError, "requested 'q8'"):
+            bench.check_requested_dimensions({}, "q8", None)
+
+    def test_run_forces_the_cuda_graph_switch_and_requires_it_recorded(self) -> None:
+        doc = suite_document()
+        doc["cuda_graphs"] = "on"
+        output = self.root / "graphs-on"
+        self.assertEqual(
+            bench.main(self.run_args(fake_binary(self.root / "g-on", doc), output, cuda_graphs="on")), 0
+        )
+        self.assertIn("graphs 1 ", (output / "stdout.log").read_text(encoding="utf-8"))
+        doc["cuda_graphs"] = "off"
+        output = self.root / "graphs-off"
+        self.assertEqual(
+            bench.main(self.run_args(fake_binary(self.root / "g-off", doc), output, cuda_graphs="off")), 0
+        )
+        self.assertIn("graphs 0 ", (output / "stdout.log").read_text(encoding="utf-8"))
+        # Asked for on, ran off: refused.
+        with self.assertRaisesRegex(ValueError, "cuda_graphs 'off', requested 'on'"):
+            bench.main(self.run_args(fake_binary(self.root / "g-bad", doc), self.root / "g-bad-out", cuda_graphs="on"))
+        # A pre-epic binary records no switch: a forced switch is refused rather than assumed.
+        doc.pop("cuda_graphs")
+        with self.assertRaisesRegex(ValueError, "cuda_graphs None"):
+            bench.main(self.run_args(fake_binary(self.root / "g-none", doc), self.root / "g-none-out", cuda_graphs="off"))
 
     def test_table_compares_every_row_with_the_first_runs_reference(self) -> None:
         base = comparable_run("baseline")
@@ -419,10 +623,10 @@ class DecodeBenchWrapperTests(unittest.TestCase):
             if row["path"] != "mtp":
                 row["tokens"] = [0, 1, 2, 7]
         text = bench.render_table([base, head])
-        self.assertIn("| baseline | MTP off (reference) | 4 | (ref) | yes |", text)
-        self.assertIn("| head | MTP off (reference) | 4 | (ref) | no @3 |", text)
-        self.assertIn("| head | MTP off (StepModel) | 4 | yes | no @3 |", text)
-        self.assertIn("| head | MTP K=3 | 4 | no @2 | no @2 |", text)
+        self.assertIn("| baseline | bf16 | n/a | MTP off (reference) | 4 | (ref) | yes |", text)
+        self.assertIn("| head | bf16 | n/a | MTP off (reference) | 4 | (ref) | no @3 |", text)
+        self.assertIn("| head | bf16 | n/a | MTP off (StepModel) | 4 | yes | no @3 |", text)
+        self.assertIn("| head | bf16 | n/a | MTP K=3 | 4 | no @2 | no @2 |", text)
 
     def test_nvfp4_rows_are_labelled_and_the_heading_names_the_format(self) -> None:
         doc = suite_document()
@@ -447,7 +651,7 @@ class DecodeBenchWrapperTests(unittest.TestCase):
             "config_sha256": "0" * 64}, "suite": doc}
         table = bench.render_table([run])
         self.assertIn("BF16 with NVFP4 projections greedy", table)
-        self.assertIn("| nv | MTP off (reference, NVFP4 GEMV off) |", table)
+        self.assertIn("| nv | nvfp4 | n/a | MTP off (reference, NVFP4 GEMV off) |", table)
         self.assertIn("| off: 0 gemv / 64 cuBLASLt (disabled) |", table)
 
     def test_table_rejects_a_tampered_run(self) -> None:
@@ -500,6 +704,259 @@ class DecodeBenchWrapperTests(unittest.TestCase):
             "MTP K=3 (growing kv, gqa attn)",
         )
 
+    # ---- campaign (sc-24140) --------------------------------------------------------------
+
+    def campaign_manifest(self) -> tuple[Path, Path, Path]:
+        """A manifest with a llama-family and a hybrid model, both snapshots pinned."""
+        manifest = self.root / "campaign-models.toml"
+        manifest.write_text(
+            "[[models]]\n"
+            'key = "llama-test"\n'
+            'repository = "Test/Llama"\n'
+            f'revision = "{REVISION}"\n'
+            'expected_files = ["config.json"]\n'
+            "\n[[models]]\n"
+            'key = "hybrid-test"\n'
+            'repository = "Test/Hybrid"\n'
+            f'revision = "{OTHER_REVISION}"\n'
+            'expected_files = ["config.json"]\n',
+            encoding="utf-8",
+        )
+        llama = self.root / "hub" / "models--Test--Llama" / "snapshots" / REVISION
+        llama.mkdir(parents=True)
+        (llama / "config.json").write_text('{"model_type": "qwen3"}', encoding="utf-8")
+        hybrid = self.root / "hub" / "models--Test--Hybrid" / "snapshots" / OTHER_REVISION
+        hybrid.mkdir(parents=True)
+        (hybrid / "config.json").write_text('{"model_type": "qwen3_5"}', encoding="utf-8")
+        bench.PINNED_CONFIG_SHA256["llama-test"] = bench.sha256_file(llama / "config.json")
+        bench.PINNED_CONFIG_SHA256["hybrid-test"] = bench.sha256_file(hybrid / "config.json")
+        return manifest, llama, hybrid
+
+    def campaign_args(self, output: Path, manifest: Path, *extra: str) -> list[str]:
+        return [
+            "campaign",
+            "--output", str(output),
+            "--binary", str(matrix_binary(self.root / "matrix")),
+            "--runtime-sha", self.sha,
+            "--checkout", str(self.checkout),
+            "--manifest", str(manifest),
+            "--new-tokens", "4",
+            "--sample-interval", "0.01",
+            *extra,
+        ]
+
+    def test_campaign_runs_the_matrix_and_seals_an_index(self) -> None:
+        manifest, llama, hybrid = self.campaign_manifest()
+        output = self.root / "campaign"
+        self.assertEqual(
+            bench.main(
+                self.campaign_args(
+                    output, manifest,
+                    "--model", f"llama-test={llama}",
+                    "--model", f"hybrid-test={hybrid}",
+                    "--formats", "bf16,q8",
+                    "--drafts", "1,2",
+                )
+            ),
+            0,
+        )
+        runs = sorted(p.name for p in (output / "runs").iterdir())
+        self.assertEqual(
+            runs,
+            sorted(
+                f"{m}-{f}-graphs-{g}"
+                for m in ("llama-test", "hybrid-test")
+                for f in ("bf16", "q8")
+                for g in ("off", "on")
+            ),
+        )
+        # Each run was asked for its cell's format, graph switch and family rows.
+        record = json.loads((output / "runs" / "llama-test-q8-graphs-on" / "run.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["requested"]["weight_format"], "q8")
+        self.assertEqual(record["requested"]["cuda_graphs"], "on")
+        self.assertEqual(record["requested"]["rows"], "reference,step_model,ngram,sampled,sampled_step_model")
+        record = json.loads((output / "runs" / "hybrid-test-bf16-graphs-off" / "run.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["requested"]["rows"], "reference,step_model,mtp,ngram,sampled,sampled_step_model")
+        index = (output / "INDEX.md").read_text(encoding="utf-8")
+        self.assertIn(
+            "| llama-test | q8 | on | ok | n/a (no MTP head) | ok (K=3) | ok | head-llama-test-q8-graphs-on |",
+            index,
+        )
+        self.assertIn(
+            "| hybrid-test | bf16 | off | ok | ok (K=1,2) | ok (K=3) | ok | head-hybrid-test-bf16-graphs-off |",
+            index,
+        )
+        # One table per model, each holding that model's runs.
+        self.assertIn("## llama-test", index)
+        self.assertIn("## hybrid-test", index)
+        self.assertIn("| head-llama-test-q8-graphs-on | q8 | on | MTP off (reference) |", index)
+        self.assertIn("(vs head-llama-test-bf16-graphs-off bf16 ref)", index)
+        meta = json.loads((output / "index.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["runtime_sha"], self.sha)
+        self.assertEqual(meta["missing"], [])
+        self.assertEqual(len(meta["cells"]), 8)
+        self.assertEqual(bench.main(["campaign-verify", str(output)]), 0)
+        # Self-contained: runs are named relative to the campaign, which verifies after a move.
+        self.assertEqual(
+            {c["run_directory"] for c in meta["cells"]},
+            {f"runs/{name}" for name in runs},
+        )
+        moved = self.root / "moved-campaign"
+        shutil.move(str(output), str(moved))
+        bench.verify_campaign(moved)
+        output = moved
+        # An index naming a run outside the campaign is refused, even when re-sealed.
+        tampered = self.root / "tampered-campaign"
+        shutil.copytree(moved, tampered)
+        index = json.loads((tampered / "index.json").read_text(encoding="utf-8"))
+        index["cells"][0]["run_directory"] = str(moved / index["cells"][0]["run_directory"])
+        (tampered / "index.json").write_text(json.dumps(index), encoding="utf-8")
+        (tampered / "SEAL.json").write_text(
+            json.dumps({n: bench.sha256_file(tampered / n) for n in ("INDEX.md", "index.json")}),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "outside the campaign directory"):
+            bench.verify_campaign(tampered)
+        # Tampering with the index or any sealed run is caught.
+        with (output / "INDEX.md").open("a", encoding="utf-8") as handle:
+            handle.write("edited\n")
+        with self.assertRaisesRegex(ValueError, "does not match the campaign seal"):
+            bench.verify_campaign(output)
+
+    def test_campaign_verify_catches_a_tampered_run(self) -> None:
+        manifest, llama, _ = self.campaign_manifest()
+        output = self.root / "campaign"
+        bench.main(
+            self.campaign_args(
+                output, manifest, "--model", f"llama-test={llama}", "--formats", "bf16",
+                "--graphs", "off", "--speculative", "off", "--no-sampled",
+            )
+        )
+        self.assertIn("| llama-test | bf16 | off | ok | head-llama-test-bf16-graphs-off |",
+                      (output / "INDEX.md").read_text(encoding="utf-8"))
+        doc = output / "runs" / "llama-test-bf16-graphs-off" / "decode_bench.json"
+        doc.write_text(doc.read_text(encoding="utf-8").replace("10.0", "99.0"), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "does not match its seal"):
+            bench.verify_campaign(output)
+
+    def test_campaign_refuses_a_dirty_tree_and_leaves_nothing(self) -> None:
+        manifest, llama, _ = self.campaign_manifest()
+        (self.checkout / "untracked.rs").write_text("x", encoding="utf-8")
+        output = self.root / "dirty-campaign"
+        with self.assertRaisesRegex(ValueError, "dirty"):
+            bench.main(self.campaign_args(output, manifest, "--model", f"llama-test={llama}"))
+        self.assertFalse(output.exists(), "a refused campaign must not leave a directory")
+        (self.checkout / "untracked.rs").unlink()
+        # Output inside the measured checkout would dirty it for the next run: refused up front.
+        inside = self.checkout / "evidence" / "campaign"
+        with self.assertRaisesRegex(ValueError, "inside the measured checkout"):
+            bench.main(self.campaign_args(inside, manifest, "--model", f"llama-test={llama}"))
+        self.assertFalse(inside.exists())
+        # An unpinned snapshot is refused before anything runs.
+        bench.PINNED_CONFIG_SHA256.pop("llama-test")
+        with self.assertRaisesRegex(ValueError, "no pinned config sha256"):
+            bench.main(self.campaign_args(output, manifest, "--model", f"llama-test={llama}"))
+        self.assertFalse(output.exists())
+        with self.assertRaisesRegex(ValueError, "unknown values"):
+            bench.main(self.campaign_args(output, manifest, "--model", f"x={llama}", "--formats", "bf16,fp8"))
+        with self.assertRaisesRegex(ValueError, "KEY=SNAPSHOT"):
+            bench.main(self.campaign_args(output, manifest, "--model", str(llama)))
+
+    def test_campaign_collects_sealed_runs_and_refuses_dirty_or_foreign_runs(self) -> None:
+        manifest, llama, hybrid = self.campaign_manifest()
+        runs = self.root / "sealed"
+        binary = matrix_binary(self.root / "matrix")
+        for fmt in ("bf16", "nvfp4"):
+            args = self.run_args(binary, runs / f"llama-{fmt}", run_name=f"head-llama-{fmt}",
+                                 format=fmt, cuda_graphs="off",
+                                 rows="reference,step_model,ngram")
+            args[args.index("--snapshot") + 1] = str(llama)
+            args[args.index("--manifest") + 1] = str(manifest)
+            args[args.index("--model-key") + 1] = "llama-test"
+            self.assertEqual(bench.main(args), 0)
+        collect = ["--collect", str(runs / "llama-bf16"), "--collect", str(runs / "llama-nvfp4")]
+        common = ["campaign", "--formats", "bf16,nvfp4", "--graphs", "off", "--no-sampled"]
+        output = self.root / "collected"
+        self.assertEqual(bench.main([*common, "--output", str(output), *collect]), 0)
+        index = (output / "INDEX.md").read_text(encoding="utf-8")
+        self.assertIn("| llama-test | nvfp4 | off | ok | n/a (no MTP head) | ok (K=3) | head-llama-nvfp4 |", index)
+        meta = json.loads((output / "index.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["mode"], "collect")
+        # The collected runs were copied in: the campaign verifies without its sources.
+        self.assertEqual(
+            sorted(c["run_directory"] for c in meta["cells"]), ["runs/llama-bf16", "runs/llama-nvfp4"]
+        )
+        self.assertTrue((output / "runs" / "llama-bf16" / "SEAL.json").is_file())
+        bench.verify_campaign(output)
+        # A requested cell with no run is refused unless the index is explicitly partial.
+        partial = self.root / "partial"
+        with self.assertRaisesRegex(ValueError, "missing: llama-test / q8 / graphs off / off"):
+            bench.main(["campaign", "--formats", "bf16,q8", "--graphs", "off", "--no-sampled",
+                        "--output", str(partial), "--collect", str(runs / "llama-bf16")])
+        self.assertFalse(partial.exists())
+        self.assertEqual(
+            bench.main(["campaign", "--formats", "bf16,q8", "--graphs", "off", "--no-sampled",
+                        "--allow-partial", "--output", str(partial), "--collect", str(runs / "llama-bf16")]),
+            0,
+        )
+        self.assertIn("| llama-test | q8 | off | missing | n/a (no MTP head) | missing | missing |",
+                      (partial / "INDEX.md").read_text(encoding="utf-8"))
+        # A run outside the requested matrix is refused.
+        with self.assertRaisesRegex(ValueError, "outside the requested matrix"):
+            bench.main([*common[:1], "--formats", "bf16", "--graphs", "off", "--no-sampled",
+                        "--output", str(self.root / "stray"), *collect])
+        # A sealed run built from a dirty tree is refused.
+        dirty = runs / "llama-dirty"
+        dirty.mkdir()
+        record = json.loads((runs / "llama-bf16" / "run.json").read_text(encoding="utf-8"))
+        record["source"] = {**record["source"], "clean_tree": False, "dirty_paths": ["?? scratch.rs"]}
+        record["run_name"] = "head-llama-dirty"
+        (dirty / "run.json").write_text(json.dumps(record), encoding="utf-8")
+        for name in ("decode_bench.json", "decode_bench.md", "stdout.log", "stderr.log"):
+            (dirty / name).write_bytes((runs / "llama-bf16" / name).read_bytes())
+        (dirty / "SEAL.json").write_text(
+            json.dumps({n: bench.sha256_file(dirty / n) for n in ("decode_bench.json", "run.json", "decode_bench.md", "stdout.log", "stderr.log")}),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "built from a dirty tree"):
+            bench.main([*common, "--output", str(self.root / "dirty-out"), "--collect", str(dirty)])
+        self.assertFalse((self.root / "dirty-out").exists())
+        # Head runs from two commits do not make one campaign.
+        other = runs / "llama-other"
+        other.mkdir()
+        record = json.loads((runs / "llama-nvfp4" / "run.json").read_text(encoding="utf-8"))
+        record["source"] = {**record["source"], "head_sha": "e" * 40}
+        (other / "run.json").write_text(json.dumps(record), encoding="utf-8")
+        for name in ("decode_bench.json", "decode_bench.md", "stdout.log", "stderr.log"):
+            (other / name).write_bytes((runs / "llama-nvfp4" / name).read_bytes())
+        (other / "SEAL.json").write_text(
+            json.dumps({n: bench.sha256_file(other / n) for n in ("decode_bench.json", "run.json", "decode_bench.md", "stdout.log", "stderr.log")}),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "different commits"):
+            bench.main([*common, "--output", str(self.root / "mixed"),
+                        "--collect", str(runs / "llama-bf16"), "--collect", str(other)])
+        # A baseline is not a head run, and a head run is not a baseline.
+        with self.assertRaisesRegex(ValueError, "is not a baseline run"):
+            bench.main([*common, "--output", str(self.root / "b"), *collect, "--baseline", str(runs / "llama-bf16")])
+
+    def test_campaign_rows_and_cell_status_per_family(self) -> None:
+        self.assertEqual(bench.campaign_rows("llama", ["off", "mtp", "ngram"], False), ["reference", "step_model", "ngram"])
+        self.assertEqual(
+            bench.campaign_rows("qwen35", ["off", "mtp", "ngram"], True),
+            ["reference", "step_model", "mtp", "ngram", "sampled", "sampled_step_model"],
+        )
+        self.assertEqual(bench.cell_status(None, "llama", "mtp", [1]), "n/a (no MTP head)")
+        self.assertEqual(bench.cell_status(None, "qwen35", "mtp", [1]), "missing")
+        run = {"suite": {"rows": [{"path": "mtp", "mtp_drafts": 1}]}}
+        self.assertEqual(bench.cell_status(run, "qwen35", "mtp", [1]), "ok (K=1)")
+        self.assertEqual(bench.cell_status(run, "qwen35", "mtp", [1, 2]), "missing")
+        self.assertEqual(bench.snapshot_family(self.snapshot), "qwen35")
+        cfg = self.root / "vl"
+        cfg.mkdir()
+        (cfg / "config.json").write_text('{"model_type": "qwen3_vl"}', encoding="utf-8")
+        self.assertEqual(bench.snapshot_family(cfg), "llama")
+
     def test_baseline_source_replaces_only_the_head_only_block(self) -> None:
         source = BENCH_SOURCE.read_text(encoding="utf-8")
         rewritten = bench.baseline_source_text(source)
@@ -529,6 +986,32 @@ class DecodeBenchWrapperTests(unittest.TestCase):
         self.assertNotIn("Some(stats.replays as u64)", rewritten)
         self.assertNotIn("set_attn_formulation", before_stub)
         self.assertNotIn("attn_formulation()", before_stub)
+        # sc-24140: nothing the baseline compiles — the whole file outside the `BASELINE_STUB`
+        # literal — may call a head-only seam (the shared body once did: `mtp.set_attn_formulation`).
+        literal_start = rewritten.index(bench.STUB_BEGIN)
+        literal_end = rewritten.index(bench.STUB_END, literal_start) + len(bench.STUB_END)
+        compiled = rewritten[:literal_start] + rewritten[literal_end:]
+        code = "\n".join(
+            line for line in compiled.splitlines() if not line.lstrip().startswith("//")
+        )
+        for head_only in (
+            ".set_attn_formulation(",
+            ".attn_formulation()",
+            ".set_step_kv_cache(",
+            "from_weights_format(",
+            ".weight_census()",
+            "RequestSpan::",
+            "generate_speculative_with(",
+            "generate_step_timed(",
+            "CountingDecode::",
+            "ProjectionFormat::",
+        ):
+            self.assertNotIn(head_only, code, head_only)
+        # The llama family's pre-epic reference: the stub loads `CausalLm` with the pre-epic
+        # loader and runs the shared `decode_logits` + `generate_from_prefill` reference.
+        self.assertIn("CausalLm::from_weights_with(&weights, \"\", cfg, baseline_quant(format))", compiled)
+        self.assertIn("run_causal_reference(model, model, prompt, config, device, on_event)", compiled)
+        self.assertNotIn("fn is_causal_snapshot(_snapshot: &Path) -> bool {\n    false", compiled)
         # Everything outside the block is untouched, so the two binaries measure the same rows.
         head_tail = source[source.index(bench.HEAD_ONLY_END) + len(bench.HEAD_ONLY_END):]
         self.assertTrue(rewritten.endswith(head_tail))

@@ -171,6 +171,10 @@ Reading it:
   StepModel row on the static cache emit the same **256 / 256** tokens; the n-gram rows diverge at
   knife-edges (the S2 finding: a multi-row verify forward's projection GEMMs pick a different cuBLAS
   kernel than the M = 1 decode), with exactly **one** device→host transfer per verify step.
+  *Correction (sc-24140, `docs/migration/evidence/sc-24140/measure/`): enumerated, @65 (0 ULP) and
+  @132 (0.5 ULP) are ≤ 1 bf16 ULP knife-edges, but @51 (n-gram K=3) is a **2.0 ULP** reference gap
+  — not a knife-edge under the decided rule; a single verify-shaped forward never flips it, the
+  free-running row reaches it through K/V earlier verify forwards wrote.*
 * **The old expanded reference is the labelled comparison.** It agrees with the default reference on
   the first 65 tokens and diverges at index 65 — the ≤ 1 bf16 ULP formulation knife-edge above;
   its StepModel row is token-identical to the default reference.

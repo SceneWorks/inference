@@ -10,8 +10,9 @@
 //! |----------------------------|--------------------------------------------------------------|
 //! | `DECODE_BENCH_SNAPSHOT`    | snapshot directory (config.json, tokenizer*.json, shards)    |
 //! | `DECODE_BENCH_OUTPUT`      | JSON path to write (must not exist)                          |
-//! | `DECODE_BENCH_ROWS`        | comma list of `reference`, `reference_unfused`, `reference_cublaslt`, `step_model`, `mtp`, `ngram` (default `reference,step_model,mtp`) |
-//! | `DECODE_BENCH_FORMAT`      | projection weight format: `bf16` (default) or `nvfp4` (quantized at load, sc-24135) |
+//! | `DECODE_BENCH_ROWS`        | comma list of `reference`, `reference_unfused`, `reference_cublaslt`, `step_model`, `mtp`, `ngram`, `sampled`, `sampled_step_model` (default `reference,step_model,mtp`) |
+//! | `DECODE_BENCH_FORMAT`      | projection weight format, quantized at load for both families: `bf16` (default, dense), `q8` / `q4` (GGML Q8_0 / Q4_K, the `Quantize::Q8` / `Q4` load path), `nvfp4` (sc-24135; the llama family since sc-24140) |
+//! | `DECODE_BENCH_SAMPLING`    | the stochastic rows' `temperature,top_p,seed` (default `0.7,0.9,0`)  |
 //! | `DECODE_BENCH_DRAFTS`      | MTP draft widths, comma list (default `1,2,3,4,5`)           |
 //! | `DECODE_BENCH_NGRAM_DRAFTS` | n-gram draft widths, comma list (default `3`)               |
 //! | `DECODE_BENCH_NEW_TOKENS`  | tokens generated per row (default 256)                       |
@@ -25,7 +26,13 @@
 //!
 //! Rows are greedy (`temperature = 0`), no stop tokens, so every row emits exactly `NEW_TOKENS`
 //! and the token sequences are comparable: each row records whether it matched the reference row
-//! token-for-token and, if not, the first divergence. The `reference_unfused` row (sc-24137) is
+//! token-for-token and, if not, the first divergence. The **stochastic** rows (sc-24140) are the
+//! same loops under a seeded temperature + top-p sampler (`DECODE_BENCH_SAMPLING`, recorded as the
+//! row's `sampling`): `sampled` is the reference loop, `sampled_step_model` the step seam, and a
+//! `sampled_step_model` row compares against the run's `sampled` row (the same seed, so the same
+//! draws wherever the logits agree). Every row records its sampler telemetry (`sampler`: the path
+//! — `device`, `host:<reason>` or `none` —, device / host draws and whole logits rows copied to
+//! the host, per token too), the S5 measurement inside the one decode-perf home. The `reference_unfused` row (sc-24137) is
 //! the reference loop with the fused decode primitives switched **off** for that row only, so one
 //! document holds the fused-on vs fused-off token identity and tok/s; every row also records its
 //! fused-vs-reference primitive tally (`fused_primitives`) and the document records the switch.
@@ -64,9 +71,11 @@
 //!
 //! **Model selection (sc-24138).** The snapshot's `config.json` picks the family: a Qwen3.5 /
 //! 3.6 / 3.8 hybrid runs the rows above; a llama-family checkpoint (a `CausalLm` — Qwen3-8B, the
-//! epic's second real-weight model) runs `reference` / `reference_unfused` (the `CausalLm`
-//! reference loop, E2), `step_model` (the step seam, static KV by default) and `ngram` (prompt
-//! lookup through the unified engine). For it `DECODE_BENCH_ATTN` defaults to `gqa` as for the
+//! epic's second real-weight model) runs `reference` / `reference_unfused` / `reference_cublaslt`
+//! / `sampled` (the `CausalLm` reference loop, E2), `step_model` / `sampled_step_model` (the step
+//! seam, static KV by default) and `ngram` (prompt lookup through the unified engine), in any
+//! `DECODE_BENCH_FORMAT` (sc-24140: NVFP4 included — the decode GEMV serves its ≤ 8-row
+//! forwards, as for the hybrid). `mtp` is refused: the family has no MTP head. For it `DECODE_BENCH_ATTN` defaults to `gqa` as for the
 //! hybrid — the model default since sc-24138, the static cache's arithmetic, so the reference rows
 //! and the `step_model` row are token-identical by construction; `DECODE_BENCH_ATTN=expanded`
 //! selects the pre-migration `repeat_kv` arithmetic on the reference rows (and a growing
@@ -77,7 +86,10 @@
 //! The block between the `head-only` markers uses seams that do not exist on the pre-epic
 //! baseline (`StepModel`, host-sync accounting). `decode_bench.py baseline-source` rewrites this
 //! file into a copy that compiles against `d2b8cb335` by replacing that block with the stub in
-//! `BASELINE_STUB`; the harness is what keeps the two in step.
+//! `BASELINE_STUB`; the harness is what keeps the two in step. The stub carries the pre-epic
+//! reference loops of **both** families (sc-24140: the `CausalLm` `decode_logits` +
+//! `generate_from_prefill` reference too, so a Qwen3-8B baseline exists) in `bf16`, `q8` and `q4`
+//! — the formats the pre-epic loaders already had; NVFP4 postdates it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -99,7 +111,7 @@ use candle_llm::decode::generate_step_timed;
 use candle_llm::decode::CountingDecode;
 use candle_llm::decode::{
     cuda_graphs_enabled, generate_speculative_with, graph_tally, GraphRunner, GraphTally,
-    MtpProposer, NgramProposer, Proposer, SpeculativePrompt, StepModel,
+    MtpProposer, NgramProposer, Proposer, RequestSpan, SpeculativePrompt, StepModel,
 };
 use candle_llm::models::Qwen35Cache;
 use candle_llm::primitives::{
@@ -341,9 +353,75 @@ fn with_nvfp4_gemv_off<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// A snapshot of this thread's sampler counters (sc-24133), or `None` on a binary without them;
+/// `sampler_delta` turns it into a row's `sampler` JSON.
+fn sampler_now() -> Option<RequestSpan> {
+    Some(RequestSpan::begin())
+}
+
+/// The row's sampler telemetry since `before`: the path (`device`, `host:<reason>`, `none`), the
+/// device and host draws, and the whole logits rows copied to the host — also per generated token.
+fn sampler_delta(before: Option<RequestSpan>, generated: usize) -> Option<Value> {
+    let t = before?.sampler();
+    let per_token = |n: u64| (generated > 0).then(|| n as f64 / generated as f64);
+    Some(json!({
+        "path": t.label(),
+        "device_draws": t.device_draws,
+        "host_draws": t.host_draws,
+        "logits_to_host": t.logits_to_host,
+        "logits_to_host_per_token": per_token(t.logits_to_host),
+        "host_draws_per_token": per_token(t.host_draws),
+    }))
+}
+
+/// `DECODE_BENCH_FORMAT` as the load-time projection format both families' loaders take:
+/// `bf16` keeps the checkpoint's dense projections; `q8` / `q4` are GGML Q8_0 / Q4_K (the
+/// `Quantize::Q8` / `Q4` load path); `nvfp4` quantizes on-device at load (sc-24135 / sc-24140).
+fn projection_format(format: &str, device: &Device) -> Option<ProjectionFormat> {
+    use candle_llm::primitives::QuantSpec;
+    match format {
+        "bf16" => None,
+        "q8" => Some(ProjectionFormat::from(QuantSpec::q8())),
+        "q4" => Some(ProjectionFormat::from(QuantSpec::q4())),
+        "nvfp4" => Some(ProjectionFormat::nvfp4(device).expect("NVFP4 capability")),
+        other => panic!("DECODE_BENCH_FORMAT must be bf16, q8, q4 or nvfp4, got {other}"),
+    }
+}
+
+/// The loaded model's weight census (bits/param by projection kind), `None` on a binary without it.
+fn census_json(census: candle_llm::primitives::WeightCensus) -> Option<Value> {
+    let tally = |t: &candle_llm::primitives::ProjectionTally| {
+        json!({
+            "count": t.count,
+            "params": t.params,
+            "resident_bytes": t.resident_bytes,
+            "bits_per_param": t.bits_per_param(),
+        })
+    };
+    let p = &census.projections;
+    Some(json!({
+        "projections": {
+            "dense": tally(&p.dense),
+            "ggml": tally(&p.ggml),
+            "nvfp4": tally(&p.nvfp4),
+            "total": tally(&p.total()),
+        },
+        "other_tensors": tally(&census.other),
+        "total": tally(&census.total()),
+    }))
+}
+
+/// The hybrid's census for the document (target + MTP head).
+fn hybrid_census(model: &Qwen35Model, mtp: Option<&Qwen35Mtp>) -> Option<Value> {
+    let mut census = model.weight_census();
+    if let Some(mtp) = mtp {
+        census.merge(&mtp.weight_census());
+    }
+    census_json(census)
+}
+
 /// Build the target (and the MTP head, when the snapshot carries one) in the requested
-/// projection format: `bf16` keeps the checkpoint's dense projections, `nvfp4` quantizes them at
-/// load (sc-24135).
+/// projection format ([`projection_format`]).
 fn build_model(
     weights: &Weights,
     prefix: &str,
@@ -351,11 +429,7 @@ fn build_model(
     format: &str,
     device: &Device,
 ) -> (Qwen35Model, Option<Qwen35Mtp>) {
-    let format = match format {
-        "bf16" => None,
-        "nvfp4" => Some(ProjectionFormat::nvfp4(device).expect("NVFP4 capability")),
-        other => panic!("DECODE_BENCH_FORMAT must be bf16 or nvfp4, got {other}"),
-    };
+    let format = projection_format(format, device);
     let model = Qwen35Model::from_weights_format(weights, prefix, cfg.clone(), format.as_ref())
         .expect("build model");
     let mtp = (cfg.mtp_num_hidden_layers > 0 && Qwen35Mtp::complete_in(weights, &cfg)).then(|| {
@@ -461,69 +535,102 @@ fn select_attn_formulation(model: &mut Qwen35Model) {
 fn growing_row_kinds(model: &Qwen35Model) -> Option<(&'static str, &'static str)> {
     Some(("growing", model.attn_formulation().label()))
 }
+
+/// The MTP head attends in the target's selected formulation (sc-24132). Head-only: the pre-epic
+/// baseline has neither selector (sc-24140 moved this out of the shared body, which the baseline
+/// rewrite could not compile).
+fn select_mtp_attn_formulation(model: &Qwen35Model, mtp: Option<&mut Qwen35Mtp>) {
+    if let Some(mtp) = mtp {
+        mtp.set_attn_formulation(model.attn_formulation());
+    }
+}
+/// sc-24140: `DECODE_BENCH_FORMAT` names the four load-time formats both families take.
+#[test]
+fn projection_format_names_bf16_q8_q4_and_nvfp4() {
+    use candle_llm::primitives::QuantSpec;
+    let cpu = Device::Cpu;
+    assert!(projection_format("bf16", &cpu).is_none());
+    assert_eq!(
+        projection_format("q8", &cpu).and_then(|f| f.ggml()),
+        Some(QuantSpec::q8())
+    );
+    assert_eq!(
+        projection_format("q4", &cpu).and_then(|f| f.ggml()),
+        Some(QuantSpec::q4())
+    );
+    // NVFP4 is a capability: on the CPU it is the typed refusal, never a silent downgrade.
+    let nvfp4 = std::panic::catch_unwind(|| projection_format("nvfp4", &Device::Cpu));
+    assert!(nvfp4.is_err(), "NVFP4 on the CPU must refuse");
+    let other = std::panic::catch_unwind(|| projection_format("fp8", &Device::Cpu));
+    assert!(other.is_err(), "an unknown format must refuse");
+}
+
 // ---- The llama family (sc-24138): a `CausalLm` snapshot, e.g. Qwen3-8B ----------------------
 
-/// Whether the snapshot is a llama-family (`CausalLm`) checkpoint rather than a Qwen3.5/3.6/3.8
-/// hybrid — decided from `config.json` by the same dispatch the provider uses.
-fn is_causal_snapshot(snapshot: &Path) -> bool {
-    let config: Value =
-        serde_json::from_str(&std::fs::read_to_string(snapshot.join("config.json")).unwrap())
-            .unwrap();
-    !matches!(
-        candle_llm::config::Architecture::from_config(&config),
-        Ok(candle_llm::config::Architecture::Qwen35)
-    )
+/// Load a llama-family snapshot in `DECODE_BENCH_FORMAT` (every [`projection_format`], NVFP4
+/// included since sc-24140 — the shared loader, `CausalLm::from_weights_format`) and apply the
+/// selectors: `DECODE_BENCH_KV_CACHE` picks the step seam's cache (static by default) and
+/// `DECODE_BENCH_ATTN` the reference loop's formulation — `gqa` unless the labelled pre-migration
+/// comparison (`expanded`) is asked for, exactly as `select_attn_formulation` does for the hybrid.
+fn causal_load(
+    snapshot: &Path,
+    cfg: candle_llm::config::ModelConfig,
+    device: &Device,
+    format: &str,
+) -> candle_llm::models::CausalLm {
+    use candle_llm::primitives::{AttnFormulation, KvCacheKind};
+    let format = projection_format(format, device);
+    let weights = Weights::from_dir(snapshot, device).expect("load weights");
+    let mut model =
+        candle_llm::models::CausalLm::from_weights_format(&weights, "", cfg, format.as_ref())
+            .expect("build model");
+    // `weights` drops here: the tensors the model did not keep (the NVFP4 sources) are freed.
+    drop(weights);
+    match env_or("DECODE_BENCH_KV_CACHE", "static").as_str() {
+        "static" => model.set_step_kv_cache(KvCacheKind::Static),
+        "growing" => model.set_step_kv_cache(KvCacheKind::Growing),
+        other => panic!("DECODE_BENCH_KV_CACHE must be `static` or `growing`, got {other:?}"),
+    }
+    match env_or("DECODE_BENCH_ATTN", "gqa").as_str() {
+        "gqa" => model.set_attn_formulation(AttnFormulation::Gqa),
+        "expanded" => model.set_attn_formulation(AttnFormulation::Expanded),
+        other => panic!("DECODE_BENCH_ATTN must be `gqa` or `expanded`, got {other:?}"),
+    }
+    model
+}
+
+/// The llama-family model's weight census for the document.
+fn causal_census(model: &candle_llm::models::CausalLm) -> Option<Value> {
+    census_json(model.weight_census())
 }
 
 /// The `(kv_cache, attn_formulation)` labels of a `CausalLm` reference row (its own growing
 /// cache, in the selector's effective formulation).
-fn causal_reference_kinds(model: &candle_llm::models::CausalLm) -> (&'static str, &'static str) {
-    (
+fn causal_reference_kinds(
+    model: &candle_llm::models::CausalLm,
+) -> Option<(&'static str, &'static str)> {
+    Some((
         "growing",
         model
             .effective_attn_formulation(model.attn_formulation())
             .label(),
-    )
+    ))
 }
 
-/// The `CausalLm` reference loop — the pre-migration path (E2): a `decode_logits` prefill on the
-/// model's own growing cache, then the shared token-at-a-time loop through a `CountingDecode`.
+/// The `CausalLm` reference row with its target forwards **measured**: the shared reference loop
+/// through a `CountingDecode`, the direct `decode_logits` prefill noted as one external forward.
 fn causal_reference_row(
     model: &candle_llm::models::CausalLm,
     prompt: &[i32],
     config: &GenerationConfig,
     device: &Device,
     on_event: &mut dyn FnMut(StreamEvent),
-) -> (GenerationOutput, f64, f64, u64) {
+) -> (GenerationOutput, f64, f64, Option<u64>) {
     let counted = CountingDecode::new(model);
-    device.synchronize().unwrap();
-    let started = Instant::now();
-    let mut cache = model.new_cache();
-    let first = model
-        .decode_logits(&input_ids(prompt, device).unwrap(), &mut cache, 0)
-        .expect("prefill");
+    let (out, prefill, decode) =
+        run_causal_reference(model, &counted, prompt, config, device, on_event);
     counted.note_external_forward();
-    device.synchronize().unwrap();
-    let prefill_secs = started.elapsed().as_secs_f64();
-    let decode_started = Instant::now();
-    let out = generate_from_prefill(
-        &counted,
-        &mut cache,
-        first,
-        prompt.to_vec(),
-        config,
-        &CancelFlag::new(),
-        on_event,
-        None,
-    )
-    .expect("reference generation");
-    device.synchronize().unwrap();
-    (
-        out,
-        prefill_secs,
-        decode_started.elapsed().as_secs_f64(),
-        counted.forwards(),
-    )
+    (out, prefill, decode, Some(counted.forwards()))
 }
 
 /// One row through the step seam: the engine with `proposer` (`NoProposer` is the token-at-a-time
@@ -592,162 +699,71 @@ fn causal_engine_row<P: Proposer>(
     )
 }
 
-/// The decode bench over a llama-family snapshot (sc-24138 AC2). Rows: `reference` (the
-/// `CausalLm` reference loop, growing cache, `DECODE_BENCH_ATTN` selecting its formulation —
-/// `gqa` by default, the model default; `expanded` is the labelled pre-migration comparison),
-/// `reference_unfused`,
-/// `step_model` (the step seam, token at a time, on `DECODE_BENCH_KV_CACHE` — static by default)
-/// and `ngram` (prompt lookup through the unified engine, one row per `DECODE_BENCH_NGRAM_DRAFTS`
-/// width). `mtp` is refused: the llama family has no MTP head.
+/// The llama family's step-seam rows (sc-24138): `step_model` (the step seam, token at a time,
+/// on `DECODE_BENCH_KV_CACHE`), `ngram` (prompt lookup through the unified engine, one row per
+/// `DECODE_BENCH_NGRAM_DRAFTS` width) and `sampled_step_model` (the step seam under the seeded
+/// sampler, sc-24140), each with the row's device-memory sample at its last token. A greedy row
+/// compares against `reference_tokens`, a sampled one against `sampled_reference`; the first row
+/// of a kind becomes that kind's reference when the reference loop was not requested.
 #[allow(clippy::too_many_arguments)]
-fn causal_decode_bench(
-    snapshot: &Path,
-    output: &Path,
+fn causal_engine_rows(
+    model: &candle_llm::models::CausalLm,
     rows: &[String],
+    prompt: &[i32],
+    greedy: (&GenerationConfig, &GenerationConfig),
+    sampled: (&GenerationConfig, &GenerationConfig),
+    device: &Device,
     new_tokens: usize,
-    warmup_tokens: usize,
-    label: &str,
-    prompt_text: &str,
-    format: &str,
-) {
+    reference_tokens: &mut Option<Vec<i32>>,
+    sampled_reference: &mut Option<Vec<i32>>,
+) -> Vec<(Value, Option<u64>)> {
     use candle_llm::decode::NoProposer;
-    use candle_llm::models::CausalLm;
-    use candle_llm::primitives::{AttnFormulation, KvCacheKind};
-
-    assert!(
-        !rows.iter().any(|r| r == "mtp"),
-        "the llama family has no MTP head; use reference / reference_unfused / step_model / ngram"
-    );
-    assert_eq!(
-        format, "bf16",
-        "NVFP4 projections are served for the qwen3_5 family only; the llama family benches bf16"
-    );
-    let device = select_device().expect("device");
-    let device_name = if device.is_cuda() { "cuda" } else { "cpu" };
-    let load_started = Instant::now();
-    let cfg = candle_llm::config::ModelConfig::from_dir(snapshot).expect("config.json");
-    let architecture = format!("{:?}", cfg.architecture);
-    let weights = Weights::from_dir(snapshot, &device).expect("load weights");
-    let mut model = CausalLm::from_weights(&weights, "", cfg).expect("build model");
-    drop(weights);
-    match env_or("DECODE_BENCH_KV_CACHE", "static").as_str() {
-        "static" => model.set_step_kv_cache(KvCacheKind::Static),
-        "growing" => model.set_step_kv_cache(KvCacheKind::Growing),
-        other => panic!("DECODE_BENCH_KV_CACHE must be `static` or `growing`, got {other:?}"),
-    }
-    // `gqa` unless the labelled comparison is asked for, exactly as `select_attn_formulation`
-    // does for the hybrid.
-    match env_or("DECODE_BENCH_ATTN", "gqa").as_str() {
-        "gqa" => model.set_attn_formulation(AttnFormulation::Gqa),
-        "expanded" => model.set_attn_formulation(AttnFormulation::Expanded),
-        other => panic!("DECODE_BENCH_ATTN must be `gqa` or `expanded`, got {other:?}"),
-    }
-    let load_secs = load_started.elapsed().as_secs_f64();
-    let used_after_load = device_used_bytes(&device);
-    let prompt = render_prompt(snapshot, prompt_text);
-    let config = greedy_config(new_tokens);
-    let warm = greedy_config(warmup_tokens);
-    let mut peak_used = used_after_load;
-    let mut note_peak = |used: Option<u64>| {
-        if let (Some(p), Some(u)) = (peak_used, used) {
-            peak_used = Some(p.max(u));
-        } else if peak_used.is_none() {
-            peak_used = used;
-        }
-        used
-    };
     let switch = fused_switch();
     let graphs_switch = cuda_graphs_switch();
-    let mut rows_json = Vec::new();
-    let mut reference_tokens: Option<Vec<i32>> = None;
-
-    for (row, fused_off) in [("reference", false), ("reference_unfused", true)] {
-        if !rows.iter().any(|r| r == row) {
-            continue;
-        }
-        let run = |cfg: &GenerationConfig, sink: &mut dyn FnMut(StreamEvent)| {
-            if fused_off {
-                with_fused_off(|| causal_reference_row(&model, &prompt, cfg, &device, sink))
-            } else {
-                causal_reference_row(&model, &prompt, cfg, &device, sink)
-            }
-        };
-        run(&warm, &mut |_| {});
-        let syncs0 = host_syncs_now();
-        let fused0 = fused_tally_now();
-        let graphs0 = cuda_graphs_now();
-        let mut at_last = None;
-        let (out, prefill, decode, forwards) = run(
-            &config,
-            &mut last_token_sampler(&device, new_tokens, &mut at_last),
-        );
-        let syncs = host_syncs_now().zip(syncs0).map(|(a, b)| a - b);
-        let fused = fused_delta(fused0, if fused_off { Some("off") } else { switch });
-        let graphs = cuda_graphs_delta(graphs0, graphs_switch);
-        let used = note_peak(at_last);
-        eprintln!(
-            "[decode_bench] {row:<17} {:>7.2} tok/s  prefill {:.3}s",
-            out.tokens.len() as f64 / decode,
-            prefill
-        );
-        rows_json.push(row_json(
-            row,
-            None,
-            &out,
-            reference_tokens.as_deref(),
-            prefill,
-            decode,
-            Some(forwards),
-            None,
-            None,
-            syncs,
-            used,
-            None,
-            Some(causal_reference_kinds(&model)),
-            None,
-            None,
-            fused,
-            graphs,
-            None,
-            Some("none"),
-            None,
-        ));
-        if reference_tokens.is_none() {
-            reference_tokens = Some(out.tokens);
-        }
-    }
-
-    let mut engine_rows: Vec<(&str, usize)> = Vec::new();
+    let nv_switch = nvfp4_gemv_switch();
+    let mut engine_rows: Vec<(&str, usize, bool)> = Vec::new();
     if rows.iter().any(|r| r == "step_model") {
-        engine_rows.push(("step_model", 0));
+        engine_rows.push(("step_model", 0, false));
     }
     if rows.iter().any(|r| r == "ngram") {
         for k in env_or("DECODE_BENCH_NGRAM_DRAFTS", "3").split(',') {
-            engine_rows.push(("ngram", k.trim().parse().expect("n-gram draft width")));
+            engine_rows.push((
+                "ngram",
+                k.trim().parse().expect("n-gram draft width"),
+                false,
+            ));
         }
     }
-    for (row, k) in engine_rows {
+    if rows.iter().any(|r| r == "sampled_step_model") {
+        engine_rows.push(("sampled_step_model", 0, true));
+    }
+    let mut out_rows = Vec::new();
+    for (row, k, sampling) in engine_rows {
+        let (config, warm) = if sampling { sampled } else { greedy };
         let run = |cfg: &GenerationConfig, sink: &mut dyn FnMut(StreamEvent)| {
             if row == "ngram" {
                 let mut proposer = NgramProposer { max_ngram: 3 };
-                causal_engine_row(&model, &mut proposer, &prompt, cfg, k, &device, sink)
+                causal_engine_row(model, &mut proposer, prompt, cfg, k, device, sink)
             } else {
-                causal_engine_row(&model, &mut NoProposer, &prompt, cfg, 0, &device, sink)
+                causal_engine_row(model, &mut NoProposer, prompt, cfg, 0, device, sink)
             }
         };
-        run(&warm, &mut |_| {});
+        run(warm, &mut |_| {});
         let syncs0 = host_syncs_now();
         let fused0 = fused_tally_now();
         let graphs0 = cuda_graphs_now();
+        let nv0 = nvfp4_tally_now();
+        let sampler0 = sampler_now();
         let mut at_last = None;
         let (out, stats, prefill, decode, record, cache) = run(
-            &config,
-            &mut last_token_sampler(&device, new_tokens, &mut at_last),
+            config,
+            &mut last_token_sampler(device, new_tokens, &mut at_last),
         );
+        let sampler = sampler_delta(sampler0, out.tokens.len());
         let syncs = host_syncs_now().zip(syncs0).map(|(a, b)| a - b);
         let fused = fused_delta(fused0, switch);
         let graphs = cuda_graphs_delta(graphs0, graphs_switch);
-        let used = note_peak(at_last);
+        let nvfp4 = nvfp4_delta(nv0, nv_switch);
         let per_verify = record.host_syncs_per_verify_step();
         let recovery = Some((
             record.verify_steps,
@@ -756,7 +772,7 @@ fn causal_decode_bench(
             record.prefill_forwards,
         ));
         eprintln!(
-            "[decode_bench] {row} K={k:<2}       {:>7.2} tok/s  accept {:.3}  fwd/tok {:.3}  syncs/verify {}  {}  kv {}  attn {}  graphs {}",
+            "[decode_bench] {row} K={k:<2}       {:>7.2} tok/s  accept {:.3}  fwd/tok {:.3}  syncs/verify {}  {}  kv {}  attn {}  graphs {}  sampler {}",
             out.tokens.len() as f64 / decode,
             if stats.proposed > 0 {
                 stats.accepted as f64 / stats.proposed as f64
@@ -769,77 +785,51 @@ fn causal_decode_bench(
             record.kv_cache.label(),
             record.attn_formulation.label(),
             graphs.as_ref().map_or("n/a".to_string(), |g| g.to_string()),
+            sampler.as_ref().map_or("n/a".to_string(), |s| s.to_string()),
         );
         let speculative = row == "ngram";
-        rows_json.push(row_json(
-            row,
-            speculative.then_some(k as u32),
-            &out,
-            reference_tokens.as_deref(),
-            prefill,
-            decode,
-            Some(stats.forwards as u64),
-            speculative.then_some(stats.proposed as u64),
-            speculative.then_some(stats.accepted as u64),
-            syncs,
-            used,
-            Some(cache),
-            Some((record.kv_cache.label(), record.attn_formulation.label())),
-            per_verify,
-            recovery,
-            fused,
-            graphs,
-            None,
-            Some(record.proposer.label()),
-            Some(stats.replays as u64),
-        ));
-        if reference_tokens.is_none() {
-            reference_tokens = Some(out.tokens);
+        let basis = if sampling {
+            sampled_reference.as_deref()
+        } else {
+            reference_tokens.as_deref()
+        };
+        let value = annotate_row(
+            row_json(
+                row,
+                speculative.then_some(k as u32),
+                &out,
+                basis,
+                prefill,
+                decode,
+                Some(stats.forwards as u64),
+                speculative.then_some(stats.proposed as u64),
+                speculative.then_some(stats.accepted as u64),
+                syncs,
+                at_last,
+                Some(cache),
+                Some((record.kv_cache.label(), record.attn_formulation.label())),
+                per_verify,
+                recovery,
+                fused,
+                graphs,
+                nvfp4,
+                Some(record.proposer.label()),
+                Some(stats.replays as u64),
+            ),
+            sampling.then_some(config),
+            sampler,
+        );
+        out_rows.push((value, at_last));
+        let slot = if sampling {
+            &mut *sampled_reference
+        } else {
+            &mut *reference_tokens
+        };
+        if slot.is_none() {
+            *slot = Some(out.tokens);
         }
     }
-
-    let mut doc = BTreeMap::new();
-    doc.insert("schema_version", json!(2));
-    doc.insert("suite", json!("decode_bench"));
-    doc.insert("model_family", json!("llama"));
-    doc.insert("weight_format", json!(format));
-    doc.insert("architecture", json!(architecture));
-    doc.insert("label", json!(label));
-    doc.insert("snapshot", json!(snapshot.display().to_string()));
-    doc.insert("device", json!(device_name));
-    doc.insert(
-        "compute_dtype",
-        json!(format!("{:?}", model.compute_dtype())),
-    );
-    doc.insert("load_seconds", json!(load_secs));
-    doc.insert("prompt_tokens", json!(prompt.len()));
-    doc.insert("new_tokens", json!(new_tokens));
-    doc.insert("warmup_tokens", json!(warmup_tokens));
-    doc.insert("fused_kernels", json!(switch));
-    doc.insert("cuda_graphs", json!(graphs_switch));
-    doc.insert("cuda_stream", json!(cuda_stream_label()));
-    doc.insert("device_used_bytes_after_load", json!(used_after_load));
-    doc.insert("peak_device_used_bytes", json!(peak_used));
-    doc.insert(
-        "device_memory_scope",
-        json!(
-            "cuMemGetInfo total-free on the selected device, sampled at each row's last generated \
-             token while its cache is alive: device-wide, includes weights and co-tenants"
-        ),
-    );
-    doc.insert(
-        "cache_memory_scope",
-        json!(
-            "step-seam rows: the final cache's own logical accounting after the timed run (a \
-             static cache is its whole preallocation; the llama family keeps no checkpoints)"
-        ),
-    );
-    doc.insert("rows", json!(rows_json));
-    if let Some(parent) = output.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    std::fs::write(output, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
-    eprintln!("[decode_bench] wrote {}", output.display());
+    out_rows
 }
 // <<< head-only
 
@@ -903,6 +893,30 @@ fn with_nvfp4_gemv_off<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
+fn sampler_now() -> Option<()> {
+    None
+}
+
+fn sampler_delta(_before: Option<()>, _generated: usize) -> Option<Value> {
+    None
+}
+
+/// The pre-epic loaders' formats: dense or GGML Q8_0 / Q4_K quantized at load. NVFP4 postdates
+/// the baseline.
+fn baseline_quant(format: &str) -> Option<candle_llm::primitives::QuantSpec> {
+    use candle_llm::primitives::QuantSpec;
+    match format {
+        "bf16" => None,
+        "q8" => Some(QuantSpec::q8()),
+        "q4" => Some(QuantSpec::q4()),
+        other => panic!("the pre-epic baseline loads bf16, q8 or q4, not {other}"),
+    }
+}
+
+fn hybrid_census(_model: &Qwen35Model, _mtp: Option<&Qwen35Mtp>) -> Option<Value> {
+    None
+}
+
 fn build_model(
     weights: &Weights,
     prefix: &str,
@@ -910,10 +924,11 @@ fn build_model(
     format: &str,
     _device: &Device,
 ) -> (Qwen35Model, Option<Qwen35Mtp>) {
-    assert_eq!(format, "bf16", "the pre-epic baseline has no NVFP4 projections");
-    let model = Qwen35Model::from_weights(weights, prefix, cfg.clone()).expect("build model");
+    let quant = baseline_quant(format);
+    let model = Qwen35Model::from_weights_with(weights, prefix, cfg.clone(), quant)
+        .expect("build model");
     let mtp = (cfg.mtp_num_hidden_layers > 0 && Qwen35Mtp::complete_in(weights, &cfg))
-        .then(|| Qwen35Mtp::from_weights_with(weights, &model, None).expect("build mtp"));
+        .then(|| Qwen35Mtp::from_weights_with(weights, &model, quant).expect("build mtp"));
     (model, mtp)
 }
 
@@ -955,22 +970,63 @@ fn growing_row_kinds(_model: &Qwen35Model) -> Option<(&'static str, &'static str
     None
 }
 
-fn is_causal_snapshot(_snapshot: &Path) -> bool {
-    false
+fn select_mtp_attn_formulation(_model: &Qwen35Model, _mtp: Option<&mut Qwen35Mtp>) {}
+
+/// The pre-epic `CausalLm` load: `from_weights_with` in bf16 / q8 / q4, the model's own
+/// (pre-migration) attention arithmetic, no step seam.
+fn causal_load(
+    snapshot: &Path,
+    cfg: candle_llm::config::ModelConfig,
+    device: &Device,
+    format: &str,
+) -> candle_llm::models::CausalLm {
+    let weights = Weights::from_dir(snapshot, device).expect("load weights");
+    candle_llm::models::CausalLm::from_weights_with(&weights, "", cfg, baseline_quant(format))
+        .expect("build model")
+}
+
+fn causal_census(_model: &candle_llm::models::CausalLm) -> Option<Value> {
+    None
+}
+
+fn causal_reference_kinds(
+    _model: &candle_llm::models::CausalLm,
+) -> Option<(&'static str, &'static str)> {
+    None
+}
+
+/// The pre-epic `CausalLm` reference: `decode_logits` + `generate_from_prefill`, uncounted.
+fn causal_reference_row(
+    model: &candle_llm::models::CausalLm,
+    prompt: &[i32],
+    config: &GenerationConfig,
+    device: &Device,
+    on_event: &mut dyn FnMut(StreamEvent),
+) -> (GenerationOutput, f64, f64, Option<u64>) {
+    let (out, prefill, decode) =
+        run_causal_reference(model, model, prompt, config, device, on_event);
+    (out, prefill, decode, None)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn causal_decode_bench(
-    _snapshot: &Path,
-    _output: &Path,
-    _rows: &[String],
+fn causal_engine_rows(
+    _model: &candle_llm::models::CausalLm,
+    rows: &[String],
+    _prompt: &[i32],
+    _greedy: (&GenerationConfig, &GenerationConfig),
+    _sampled: (&GenerationConfig, &GenerationConfig),
+    _device: &Device,
     _new_tokens: usize,
-    _warmup_tokens: usize,
-    _label: &str,
-    _prompt_text: &str,
-    _format: &str,
-) {
-    unreachable!("the llama-family rows are not available on the pre-epic baseline")
+    _reference_tokens: &mut Option<Vec<i32>>,
+    _sampled_reference: &mut Option<Vec<i32>>,
+) -> Vec<(Value, Option<u64>)> {
+    assert!(
+        !rows
+            .iter()
+            .any(|r| matches!(r.as_str(), "step_model" | "ngram" | "sampled_step_model")),
+        "the step-seam rows are not available on the pre-epic baseline"
+    );
+    Vec::new()
 }
 
 type SpeculativeRow = (
@@ -1148,6 +1204,305 @@ fn run_reference(
     (out, prefill_secs, decode_started.elapsed().as_secs_f64())
 }
 
+/// The pre-epic `CausalLm` reference path (E2): a `decode_logits` prefill on the model's own
+/// growing cache, then the shared token-at-a-time loop driven through `decoder` (the model itself,
+/// or a counting wrapper around it on head) — the same arithmetic on both binaries.
+fn run_causal_reference(
+    model: &candle_llm::models::CausalLm,
+    decoder: &dyn Decode,
+    prompt: &[i32],
+    config: &GenerationConfig,
+    device: &Device,
+    on_event: &mut dyn FnMut(StreamEvent),
+) -> (GenerationOutput, f64, f64) {
+    device.synchronize().unwrap();
+    let started = Instant::now();
+    let mut cache = model.new_cache();
+    let first = model
+        .decode_logits(&input_ids(prompt, device).unwrap(), &mut cache, 0)
+        .expect("prefill");
+    device.synchronize().unwrap();
+    let prefill_secs = started.elapsed().as_secs_f64();
+    let decode_started = Instant::now();
+    let out = generate_from_prefill(
+        decoder,
+        &mut cache,
+        first,
+        prompt.to_vec(),
+        config,
+        &CancelFlag::new(),
+        on_event,
+        None,
+    )
+    .expect("reference generation");
+    device.synchronize().unwrap();
+    (out, prefill_secs, decode_started.elapsed().as_secs_f64())
+}
+
+/// Whether the snapshot is a llama-family (`CausalLm`) checkpoint rather than a Qwen3.5/3.6/3.8
+/// hybrid — decided from `config.json` by the same dispatch the provider uses.
+fn is_causal_snapshot(snapshot: &Path) -> bool {
+    let config: Value =
+        serde_json::from_str(&std::fs::read_to_string(snapshot.join("config.json")).unwrap())
+            .unwrap();
+    !matches!(
+        candle_llm::config::Architecture::from_config(&config),
+        Ok(candle_llm::config::Architecture::Qwen35)
+    )
+}
+
+/// The stochastic rows' sampler (sc-24140): `DECODE_BENCH_SAMPLING` = `temperature,top_p,seed`
+/// (default `0.7,0.9,0`), no stop tokens, so every row still emits exactly `new_tokens`.
+fn sampled_config(new_tokens: usize) -> GenerationConfig {
+    let spec = env_or("DECODE_BENCH_SAMPLING", "0.7,0.9,0");
+    let parts: Vec<&str> = spec.split(',').map(str::trim).collect();
+    let [temperature, top_p, seed] = parts.as_slice() else {
+        panic!("DECODE_BENCH_SAMPLING must be `temperature,top_p,seed`, got {spec:?}");
+    };
+    let mut config = greedy_config(new_tokens);
+    config.sampling.temperature = temperature.parse().expect("sampling temperature");
+    config.sampling.top_p = top_p.parse().expect("sampling top_p");
+    config.seed = Some(seed.parse().expect("sampling seed"));
+    assert!(
+        config.sampling.temperature > 0.0,
+        "a stochastic row needs a positive temperature"
+    );
+    config
+}
+
+/// A row's `sampling` knobs (`null` for a greedy row).
+fn sampling_json(config: &GenerationConfig) -> Value {
+    json!({
+        "temperature": config.sampling.temperature,
+        "top_p": config.sampling.top_p,
+        "top_k": config.sampling.top_k,
+        "seed": config.seed,
+    })
+}
+
+/// Add the sc-24140 row dimensions to a row: its `sampling` (`null` = greedy) and its
+/// `sampler` telemetry (`null` on a binary without the counters).
+fn annotate_row(
+    mut row: Value,
+    sampling: Option<&GenerationConfig>,
+    sampler: Option<Value>,
+) -> Value {
+    row["sampling"] = sampling.map_or(Value::Null, sampling_json);
+    row["sampler"] = sampler.unwrap_or(Value::Null);
+    row
+}
+
+/// The decode bench over a llama-family snapshot (sc-24138 AC2; formats, stochastic rows and the
+/// pre-epic baseline since sc-24140). Rows: `reference` (the `CausalLm` reference loop, growing
+/// cache, `DECODE_BENCH_ATTN` selecting its formulation on head), `reference_unfused` (fused
+/// primitives off for the row), `reference_cublaslt` (NVFP4 decode GEMV off for the row),
+/// `sampled` (the reference loop under the seeded sampler), and the step-seam rows of
+/// `causal_engine_rows`. `mtp` is refused: the llama family has no MTP head.
+#[allow(clippy::too_many_arguments)]
+fn causal_decode_bench(
+    snapshot: &Path,
+    output: &Path,
+    rows: &[String],
+    new_tokens: usize,
+    warmup_tokens: usize,
+    label: &str,
+    prompt_text: &str,
+    format: &str,
+) {
+    assert!(
+        !rows.iter().any(|r| r == "mtp"),
+        "the llama family has no MTP head; use reference / reference_unfused / \
+         reference_cublaslt / sampled / step_model / sampled_step_model / ngram"
+    );
+    let device = select_device().expect("device");
+    let device_name = if device.is_cuda() { "cuda" } else { "cpu" };
+    let load_started = Instant::now();
+    let cfg = candle_llm::config::ModelConfig::from_dir(snapshot).expect("config.json");
+    let architecture = format!("{:?}", cfg.architecture);
+    let model = causal_load(snapshot, cfg, &device, format);
+    let load_secs = load_started.elapsed().as_secs_f64();
+    let used_after_load = device_used_bytes(&device);
+    let prompt = render_prompt(snapshot, prompt_text);
+    let config = greedy_config(new_tokens);
+    let warm = greedy_config(warmup_tokens);
+    let sampled = sampled_config(new_tokens);
+    let sampled_warm = sampled_config(warmup_tokens);
+    let mut peak_used = used_after_load;
+    let mut note_peak = |used: Option<u64>| {
+        if let (Some(p), Some(u)) = (peak_used, used) {
+            peak_used = Some(p.max(u));
+        } else if peak_used.is_none() {
+            peak_used = used;
+        }
+        used
+    };
+    let switch = fused_switch();
+    let graphs_switch = cuda_graphs_switch();
+    let nv_switch = nvfp4_gemv_switch();
+    let mut rows_json = Vec::new();
+    let mut reference_tokens: Option<Vec<i32>> = None;
+    let mut sampled_reference: Option<Vec<i32>> = None;
+
+    // (row, fused off, NVFP4 GEMV off, sampled)
+    for (row, fused_off, gemv_off, sampling) in [
+        ("reference", false, false, false),
+        ("reference_unfused", true, false, false),
+        ("reference_cublaslt", false, true, false),
+        ("sampled", false, false, true),
+    ] {
+        if !rows.iter().any(|r| r == row) {
+            continue;
+        }
+        let (row_config, row_warm) = if sampling {
+            (&sampled, &sampled_warm)
+        } else {
+            (&config, &warm)
+        };
+        let run = |cfg: &GenerationConfig, sink: &mut dyn FnMut(StreamEvent)| {
+            if fused_off {
+                with_fused_off(|| causal_reference_row(&model, &prompt, cfg, &device, sink))
+            } else if gemv_off {
+                with_nvfp4_gemv_off(|| causal_reference_row(&model, &prompt, cfg, &device, sink))
+            } else {
+                causal_reference_row(&model, &prompt, cfg, &device, sink)
+            }
+        };
+        run(row_warm, &mut |_| {});
+        let syncs0 = host_syncs_now();
+        let fused0 = fused_tally_now();
+        let graphs0 = cuda_graphs_now();
+        let nv0 = nvfp4_tally_now();
+        let sampler0 = sampler_now();
+        let mut at_last = None;
+        let (out, prefill, decode, forwards) = run(
+            row_config,
+            &mut last_token_sampler(&device, new_tokens, &mut at_last),
+        );
+        let sampler = sampler_delta(sampler0, out.tokens.len());
+        let syncs = host_syncs_now().zip(syncs0).map(|(a, b)| a - b);
+        let fused = fused_delta(fused0, if fused_off { Some("off") } else { switch });
+        let graphs = cuda_graphs_delta(graphs0, graphs_switch);
+        let nvfp4 = nvfp4_delta(
+            nv0,
+            if gemv_off {
+                nv_switch.map(|_| "off")
+            } else {
+                nv_switch
+            },
+        );
+        let used = note_peak(at_last);
+        eprintln!(
+            "[decode_bench] {row:<18} {:>7.2} tok/s  prefill {:.3}s  nvfp4 {}  sampler {}",
+            out.tokens.len() as f64 / decode,
+            prefill,
+            nvfp4.as_ref().map_or("n/a".to_string(), |f| f.to_string()),
+            sampler
+                .as_ref()
+                .map_or("n/a".to_string(), |s| s.to_string()),
+        );
+        let basis = if sampling {
+            sampled_reference.as_deref()
+        } else {
+            reference_tokens.as_deref()
+        };
+        rows_json.push(annotate_row(
+            row_json(
+                row,
+                None,
+                &out,
+                basis,
+                prefill,
+                decode,
+                forwards,
+                None,
+                None,
+                syncs,
+                used,
+                None,
+                causal_reference_kinds(&model),
+                None,
+                None,
+                fused,
+                graphs,
+                nvfp4,
+                Some("none"),
+                None,
+            ),
+            sampling.then_some(row_config),
+            sampler,
+        ));
+        let slot = if sampling {
+            &mut sampled_reference
+        } else {
+            &mut reference_tokens
+        };
+        if slot.is_none() {
+            *slot = Some(out.tokens);
+        }
+    }
+
+    for (value, used) in causal_engine_rows(
+        &model,
+        rows,
+        &prompt,
+        (&config, &warm),
+        (&sampled, &sampled_warm),
+        &device,
+        new_tokens,
+        &mut reference_tokens,
+        &mut sampled_reference,
+    ) {
+        note_peak(used);
+        rows_json.push(value);
+    }
+
+    let mut doc = BTreeMap::new();
+    doc.insert("schema_version", json!(2));
+    doc.insert("suite", json!("decode_bench"));
+    doc.insert("model_family", json!("llama"));
+    doc.insert("weight_format", json!(format));
+    doc.insert("weight_census", json!(causal_census(&model)));
+    doc.insert("architecture", json!(architecture));
+    doc.insert("label", json!(label));
+    doc.insert("snapshot", json!(snapshot.display().to_string()));
+    doc.insert("device", json!(device_name));
+    doc.insert(
+        "compute_dtype",
+        json!(format!("{:?}", model.compute_dtype())),
+    );
+    doc.insert("load_seconds", json!(load_secs));
+    doc.insert("prompt_tokens", json!(prompt.len()));
+    doc.insert("new_tokens", json!(new_tokens));
+    doc.insert("warmup_tokens", json!(warmup_tokens));
+    doc.insert("sampling", sampling_json(&sampled));
+    doc.insert("fused_kernels", json!(switch));
+    doc.insert("cuda_graphs", json!(graphs_switch));
+    doc.insert("cuda_stream", json!(cuda_stream_label()));
+    doc.insert("nvfp4_gemv", json!(nv_switch));
+    doc.insert("device_used_bytes_after_load", json!(used_after_load));
+    doc.insert("peak_device_used_bytes", json!(peak_used));
+    doc.insert(
+        "device_memory_scope",
+        json!(
+            "cuMemGetInfo total-free on the selected device, sampled at each row's last generated \
+             token while its cache is alive: device-wide, includes weights and co-tenants"
+        ),
+    );
+    doc.insert(
+        "cache_memory_scope",
+        json!(
+            "step-seam rows: the final cache's own logical accounting after the timed run (a \
+             static cache is its whole preallocation; the llama family keeps no checkpoints)"
+        ),
+    );
+    doc.insert("rows", json!(rows_json));
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(output, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+    eprintln!("[decode_bench] wrote {}", output.display());
+}
+
 fn divergence(reference: &[i32], other: &[i32]) -> Option<usize> {
     reference
         .iter()
@@ -1304,6 +1659,35 @@ fn forwards_per_verify_is_measured_net_of_the_prefill() {
 }
 
 #[test]
+fn sampled_config_is_the_seeded_temperature_top_p_triple() {
+    let config = sampled_config(8);
+    assert_eq!(config.max_new_tokens, 8);
+    assert!(
+        config.stop_tokens.is_empty(),
+        "every row emits exactly new_tokens"
+    );
+    // The default `0.7,0.9,0` unless the environment overrides it.
+    if std::env::var("DECODE_BENCH_SAMPLING").is_err() {
+        assert_eq!(config.sampling.temperature, 0.7);
+        assert_eq!(config.sampling.top_p, 0.9);
+        assert_eq!(config.seed, Some(0));
+    }
+    let row = annotate_row(
+        json!({"path": "sampled"}),
+        Some(&config),
+        Some(json!({"path": "device"})),
+    );
+    assert_eq!(
+        row["sampling"]["temperature"],
+        json!(config.sampling.temperature)
+    );
+    assert_eq!(row["sampling"]["seed"], json!(config.seed));
+    assert_eq!(row["sampler"]["path"], "device");
+    let greedy = annotate_row(json!({"path": "reference"}), None, None);
+    assert!(greedy["sampling"].is_null() && greedy["sampler"].is_null());
+}
+
+#[test]
 fn step_cache_accepts_checkpoint_bytes_and_single_token_runs() {
     assert_eq!(checked_step_cache(2, Some((10, 5))), Some((10, 5)));
     assert_eq!(checked_step_cache(1, Some((10, 0))), Some((10, 0)));
@@ -1356,9 +1740,7 @@ fn decode_bench() {
     let (mut model, mut mtp) = load(&snapshot, &device, &format);
     select_step_kv_cache(&mut model);
     select_attn_formulation(&mut model);
-    if let Some(mtp) = mtp.as_mut() {
-        mtp.set_attn_formulation(model.attn_formulation());
-    }
+    select_mtp_attn_formulation(&model, mtp.as_mut());
     let load_secs = load_started.elapsed().as_secs_f64();
     let used_after_load = device_used_bytes(&device);
     let prompt = render_prompt(&snapshot, &prompt_text);
@@ -1386,6 +1768,7 @@ fn decode_bench() {
         let fused0 = fused_tally_now();
         let graphs0 = cuda_graphs_now();
         let nv0 = nvfp4_tally_now();
+        let sampler0 = sampler_now();
         let mut at_last = None;
         let (out, prefill, decode, forwards) = reference_row(
             &model,
@@ -1399,6 +1782,7 @@ fn decode_bench() {
         let graphs = cuda_graphs_delta(graphs0, graphs_switch);
         let nvfp4 = nvfp4_delta(nv0, nv_switch);
         let used = note_peak(at_last);
+        let sampler = sampler_delta(sampler0, out.tokens.len());
         eprintln!(
             "[decode_bench] reference        {:>7.2} tok/s  prefill {:.3}s  fused {}  nvfp4 {}",
             out.tokens.len() as f64 / decode,
@@ -1406,27 +1790,31 @@ fn decode_bench() {
             fused.as_ref().map_or("n/a".to_string(), |f| f.to_string()),
             nvfp4.as_ref().map_or("n/a".to_string(), |f| f.to_string())
         );
-        rows_json.push(row_json(
-            "reference",
+        rows_json.push(annotate_row(
+            row_json(
+                "reference",
+                None,
+                &out,
+                None,
+                prefill,
+                decode,
+                forwards,
+                None,
+                None,
+                syncs,
+                used,
+                None,
+                growing_row_kinds(&model),
+                None,
+                None,
+                fused,
+                graphs,
+                nvfp4,
+                Some("none"),
+                None,
+            ),
             None,
-            &out,
-            None,
-            prefill,
-            decode,
-            forwards,
-            None,
-            None,
-            syncs,
-            used,
-            None,
-            growing_row_kinds(&model),
-            None,
-            None,
-            fused,
-            graphs,
-            nvfp4,
-            Some("none"),
-            None,
+            sampler,
         ));
         reference_tokens = Some(out.tokens);
     }
@@ -1437,6 +1825,7 @@ fn decode_bench() {
         let fused0 = fused_tally_now();
         let graphs0 = cuda_graphs_now();
         let nv0 = nvfp4_tally_now();
+        let sampler0 = sampler_now();
         let mut at_last = None;
         let (out, prefill, decode, forwards) = with_fused_off(|| {
             reference_row(
@@ -1452,33 +1841,38 @@ fn decode_bench() {
         let graphs = cuda_graphs_delta(graphs0, graphs_switch);
         let nvfp4 = nvfp4_delta(nv0, nv_switch);
         let used = note_peak(at_last);
+        let sampler = sampler_delta(sampler0, out.tokens.len());
         eprintln!(
             "[decode_bench] reference_unfused {:>6.2} tok/s  prefill {:.3}s  fused {}",
             out.tokens.len() as f64 / decode,
             prefill,
             fused.as_ref().map_or("n/a".to_string(), |f| f.to_string())
         );
-        rows_json.push(row_json(
-            "reference_unfused",
+        rows_json.push(annotate_row(
+            row_json(
+                "reference_unfused",
+                None,
+                &out,
+                reference_tokens.as_deref(),
+                prefill,
+                decode,
+                forwards,
+                None,
+                None,
+                syncs,
+                used,
+                None,
+                growing_row_kinds(&model),
+                None,
+                None,
+                fused,
+                graphs,
+                nvfp4,
+                Some("none"),
+                None,
+            ),
             None,
-            &out,
-            reference_tokens.as_deref(),
-            prefill,
-            decode,
-            forwards,
-            None,
-            None,
-            syncs,
-            used,
-            None,
-            growing_row_kinds(&model),
-            None,
-            None,
-            fused,
-            graphs,
-            nvfp4,
-            Some("none"),
-            None,
+            sampler,
         ));
         if reference_tokens.is_none() {
             reference_tokens = Some(out.tokens);
@@ -1491,6 +1885,7 @@ fn decode_bench() {
         let fused0 = fused_tally_now();
         let nv0 = nvfp4_tally_now();
         let graphs0 = cuda_graphs_now();
+        let sampler0 = sampler_now();
         let mut at_last = None;
         let (out, prefill, decode, forwards) = with_nvfp4_gemv_off(|| {
             reference_row(
@@ -1506,33 +1901,38 @@ fn decode_bench() {
         let nvfp4 = nvfp4_delta(nv0, nv_switch.map(|_| "off"));
         let graphs = cuda_graphs_delta(graphs0, graphs_switch);
         let used = note_peak(at_last);
+        let sampler = sampler_delta(sampler0, out.tokens.len());
         eprintln!(
             "[decode_bench] reference_cublaslt {:>5.2} tok/s  prefill {:.3}s  nvfp4 {}",
             out.tokens.len() as f64 / decode,
             prefill,
             nvfp4.as_ref().map_or("n/a".to_string(), |f| f.to_string())
         );
-        rows_json.push(row_json(
-            "reference_cublaslt",
+        rows_json.push(annotate_row(
+            row_json(
+                "reference_cublaslt",
+                None,
+                &out,
+                reference_tokens.as_deref(),
+                prefill,
+                decode,
+                forwards,
+                None,
+                None,
+                syncs,
+                used,
+                None,
+                growing_row_kinds(&model),
+                None,
+                None,
+                fused,
+                graphs,
+                nvfp4,
+                Some("none"),
+                None,
+            ),
             None,
-            &out,
-            reference_tokens.as_deref(),
-            prefill,
-            decode,
-            forwards,
-            None,
-            None,
-            syncs,
-            used,
-            None,
-            growing_row_kinds(&model),
-            None,
-            None,
-            fused,
-            graphs,
-            nvfp4,
-            Some("none"),
-            None,
+            sampler,
         ));
         if reference_tokens.is_none() {
             reference_tokens = Some(out.tokens);
@@ -1544,6 +1944,7 @@ fn decode_bench() {
         let fused0 = fused_tally_now();
         let graphs0 = cuda_graphs_now();
         let nv0 = nvfp4_tally_now();
+        let sampler0 = sampler_now();
         let mut at_last = None;
         let (out, prefill, decode, record, cache, kinds, proposer) = step_model_row(
             &model,
@@ -1557,6 +1958,7 @@ fn decode_bench() {
         let graphs = cuda_graphs_delta(graphs0, graphs_switch);
         let nvfp4 = nvfp4_delta(nv0, nv_switch);
         let used = note_peak(at_last);
+        let sampler = sampler_delta(sampler0, out.tokens.len());
         eprintln!(
             "[decode_bench] step_model       {:>7.2} tok/s  prefill {:.3}s  graphs {}",
             out.tokens.len() as f64 / decode,
@@ -1567,27 +1969,31 @@ fn decode_bench() {
             Some((forwards, syncs)) => (Some(forwards), Some(syncs)),
             None => (None, None),
         };
-        rows_json.push(row_json(
-            "step_model",
+        rows_json.push(annotate_row(
+            row_json(
+                "step_model",
+                None,
+                &out,
+                reference_tokens.as_deref(),
+                prefill,
+                decode,
+                forwards,
+                None,
+                None,
+                syncs,
+                used,
+                cache,
+                kinds,
+                None,
+                None,
+                fused,
+                graphs,
+                nvfp4,
+                Some(proposer),
+                None,
+            ),
             None,
-            &out,
-            reference_tokens.as_deref(),
-            prefill,
-            decode,
-            forwards,
-            None,
-            None,
-            syncs,
-            used,
-            cache,
-            kinds,
-            None,
-            None,
-            fused,
-            graphs,
-            nvfp4,
-            Some(proposer),
-            None,
+            sampler,
         ));
         if reference_tokens.is_none() {
             reference_tokens = Some(out.tokens);
@@ -1602,6 +2008,7 @@ fn decode_bench() {
             let fused0 = fused_tally_now();
             let graphs0 = cuda_graphs_now();
             let nv0 = nvfp4_tally_now();
+            let sampler0 = sampler_now();
             let mut at_last = None;
             let (out, stats, prefill, decode, kinds, per_verify, proposer, recovery) = mtp_row(
                 &model,
@@ -1617,6 +2024,7 @@ fn decode_bench() {
             let graphs = cuda_graphs_delta(graphs0, graphs_switch);
             let nvfp4 = nvfp4_delta(nv0, nv_switch);
             let used = note_peak(at_last);
+            let sampler = sampler_delta(sampler0, out.tokens.len());
             eprintln!(
                 "[decode_bench] mtp K={k}          {:>7.2} tok/s  accept {:.3}  fwd/tok {:.3}  syncs/verify {}  {}  graphs {}",
                 out.tokens.len() as f64 / decode,
@@ -1630,27 +2038,31 @@ fn decode_bench() {
                 recovery_text(Some(stats.forwards as u64), recovery),
                 graphs.as_ref().map_or("n/a".to_string(), |g| g.to_string())
             );
-            rows_json.push(row_json(
-                "mtp",
-                Some(k),
-                &out,
-                reference_tokens.as_deref(),
-                prefill,
-                decode,
-                Some(stats.forwards as u64),
-                Some(stats.proposed as u64),
-                Some(stats.accepted as u64),
-                syncs,
-                used,
+            rows_json.push(annotate_row(
+                row_json(
+                    "mtp",
+                    Some(k),
+                    &out,
+                    reference_tokens.as_deref(),
+                    prefill,
+                    decode,
+                    Some(stats.forwards as u64),
+                    Some(stats.proposed as u64),
+                    Some(stats.accepted as u64),
+                    syncs,
+                    used,
+                    None,
+                    kinds.or_else(|| growing_row_kinds(&model)),
+                    per_verify,
+                    recovery,
+                    fused,
+                    graphs,
+                    nvfp4,
+                    Some(proposer),
+                    replay_forwards(&stats),
+                ),
                 None,
-                kinds.or_else(|| growing_row_kinds(&model)),
-                per_verify,
-                recovery,
-                fused,
-                graphs,
-                nvfp4,
-                Some(proposer),
-                replay_forwards(&stats),
+                sampler,
             ));
         }
     }
@@ -1666,6 +2078,7 @@ fn decode_bench() {
             let fused0 = fused_tally_now();
             let graphs0 = cuda_graphs_now();
             let nv0 = nvfp4_tally_now();
+            let sampler0 = sampler_now();
             let mut at_last = None;
             let (out, stats, prefill, decode, kinds, per_verify, proposer, recovery) = ngram_row(
                 &model,
@@ -1680,6 +2093,7 @@ fn decode_bench() {
             let graphs = cuda_graphs_delta(graphs0, graphs_switch);
             let nvfp4 = nvfp4_delta(nv0, nv_switch);
             let used = note_peak(at_last);
+            let sampler = sampler_delta(sampler0, out.tokens.len());
             eprintln!(
                 "[decode_bench] ngram K={k}        {:>7.2} tok/s  accept {:.3}  fwd/tok {:.3}  syncs/verify {}  {}",
                 out.tokens.len() as f64 / decode,
@@ -1692,29 +2106,156 @@ fn decode_bench() {
                 per_verify.map_or("n/a".to_string(), |s| format!("{s:.2}")),
                 recovery_text(Some(stats.forwards as u64), recovery)
             );
-            rows_json.push(row_json(
-                "ngram",
-                Some(k),
+            rows_json.push(annotate_row(
+                row_json(
+                    "ngram",
+                    Some(k),
+                    &out,
+                    reference_tokens.as_deref(),
+                    prefill,
+                    decode,
+                    Some(stats.forwards as u64),
+                    Some(stats.proposed as u64),
+                    Some(stats.accepted as u64),
+                    syncs,
+                    used,
+                    None,
+                    kinds,
+                    per_verify,
+                    recovery,
+                    fused,
+                    graphs,
+                    nvfp4,
+                    Some(proposer),
+                    replay_forwards(&stats),
+                ),
+                None,
+                sampler,
+            ));
+        }
+    }
+
+    // The stochastic rows (sc-24140): the reference loop and the step seam under the seeded
+    // sampler; `sampled_step_model` compares against `sampled`.
+    let sampled = sampled_config(new_tokens);
+    let sampled_warm = sampled_config(warmup_tokens);
+    let mut sampled_reference: Option<Vec<i32>> = None;
+    if rows.iter().any(|r| r == "sampled") {
+        reference_row(&model, &prompt, &sampled_warm, &device, &mut |_| {});
+        let syncs0 = host_syncs_now();
+        let fused0 = fused_tally_now();
+        let graphs0 = cuda_graphs_now();
+        let nv0 = nvfp4_tally_now();
+        let sampler0 = sampler_now();
+        let mut at_last = None;
+        let (out, prefill, decode, forwards) = reference_row(
+            &model,
+            &prompt,
+            &sampled,
+            &device,
+            &mut last_token_sampler(&device, new_tokens, &mut at_last),
+        );
+        let sampler = sampler_delta(sampler0, out.tokens.len());
+        let syncs = host_syncs_now().zip(syncs0).map(|(a, b)| a - b);
+        let fused = fused_delta(fused0, switch);
+        let graphs = cuda_graphs_delta(graphs0, graphs_switch);
+        let nvfp4 = nvfp4_delta(nv0, nv_switch);
+        let used = note_peak(at_last);
+        eprintln!(
+            "[decode_bench] sampled          {:>7.2} tok/s  prefill {:.3}s  sampler {}",
+            out.tokens.len() as f64 / decode,
+            prefill,
+            sampler
+                .as_ref()
+                .map_or("n/a".to_string(), |s| s.to_string())
+        );
+        rows_json.push(annotate_row(
+            row_json(
+                "sampled",
+                None,
                 &out,
-                reference_tokens.as_deref(),
+                None,
                 prefill,
                 decode,
-                Some(stats.forwards as u64),
-                Some(stats.proposed as u64),
-                Some(stats.accepted as u64),
+                forwards,
+                None,
+                None,
                 syncs,
                 used,
                 None,
+                growing_row_kinds(&model),
+                None,
+                None,
+                fused,
+                graphs,
+                nvfp4,
+                Some("none"),
+                None,
+            ),
+            Some(&sampled),
+            sampler,
+        ));
+        sampled_reference = Some(out.tokens);
+    }
+
+    if rows.iter().any(|r| r == "sampled_step_model") {
+        step_model_row(&model, &prompt, &sampled_warm, &device, &mut |_| {});
+        let fused0 = fused_tally_now();
+        let graphs0 = cuda_graphs_now();
+        let nv0 = nvfp4_tally_now();
+        let sampler0 = sampler_now();
+        let mut at_last = None;
+        let (out, prefill, decode, record, cache, kinds, proposer) = step_model_row(
+            &model,
+            &prompt,
+            &sampled,
+            &device,
+            &mut last_token_sampler(&device, new_tokens, &mut at_last),
+        );
+        let sampler = sampler_delta(sampler0, out.tokens.len());
+        let cache = checked_step_cache(new_tokens, cache);
+        let fused = fused_delta(fused0, switch);
+        let graphs = cuda_graphs_delta(graphs0, graphs_switch);
+        let nvfp4 = nvfp4_delta(nv0, nv_switch);
+        let used = note_peak(at_last);
+        eprintln!(
+            "[decode_bench] sampled_step_model {:>5.2} tok/s  prefill {:.3}s  sampler {}",
+            out.tokens.len() as f64 / decode,
+            prefill,
+            sampler
+                .as_ref()
+                .map_or("n/a".to_string(), |s| s.to_string())
+        );
+        let (forwards, syncs) = match record {
+            Some((forwards, syncs)) => (Some(forwards), Some(syncs)),
+            None => (None, None),
+        };
+        rows_json.push(annotate_row(
+            row_json(
+                "sampled_step_model",
+                None,
+                &out,
+                sampled_reference.as_deref(),
+                prefill,
+                decode,
+                forwards,
+                None,
+                None,
+                syncs,
+                used,
+                cache,
                 kinds,
-                per_verify,
-                recovery,
+                None,
+                None,
                 fused,
                 graphs,
                 nvfp4,
                 Some(proposer),
-                replay_forwards(&stats),
-            ));
-        }
+                None,
+            ),
+            Some(&sampled),
+            sampler,
+        ));
     }
 
     let mut doc = BTreeMap::new();
@@ -1735,6 +2276,8 @@ fn decode_bench() {
     doc.insert("cuda_graphs", json!(graphs_switch));
     doc.insert("cuda_stream", json!(cuda_stream_label()));
     doc.insert("weight_format", json!(format));
+    doc.insert("weight_census", json!(hybrid_census(&model, mtp.as_ref())));
+    doc.insert("sampling", sampling_json(&sampled));
     doc.insert("nvfp4_gemv", json!(nv_switch));
     doc.insert("device_used_bytes_after_load", json!(used_after_load));
     doc.insert("peak_device_used_bytes", json!(peak_used));

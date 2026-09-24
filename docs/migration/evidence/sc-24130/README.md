@@ -72,7 +72,10 @@ parity oracle to one draft width and make each K its own reference. Neither is o
 finding is inherent to cuBLAS kernel selection, so this story takes **option (b)**: the parity gate is
 "token-identical except at reference knife-edge positions where the reference's top-2 logit gap is
 within one bf16 ULP of its top logit", with the positions enumerated (below), and AC1's literal
-wording is recorded as not met (see BLOCKED in the PR).
+wording is recorded as not met (see BLOCKED in the PR). *Refined at the sc-24140 feature-end
+review: the gate is the **teacher-forced** verify-shaped forward, and free-running speculative
+divergences are recorded, not gated — see
+[`sc-24140/measure/README.md`](../sc-24140/measure/README.md#the-e1-rule-for-speculative-rows).*
 
 ### The knife-edge positions on the fixture
 

@@ -149,8 +149,8 @@ fn causal_mask_chunk(
 ) -> Result<Tensor> {
     #[cfg(test)]
     {
-        CAUSAL_MASK_BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        MAX_CAUSAL_MASK_ROWS.fetch_max(query_len, std::sync::atomic::Ordering::SeqCst);
+        CAUSAL_MASK_BUILDS.with(|c| c.set(c.get() + 1));
+        MAX_CAUSAL_MASK_ROWS.with(|c| c.set(c.get().max(query_len)));
     }
     let offset = k_len.checked_sub(total_query_len).ok_or_else(|| {
         Error::Msg(format!(
@@ -226,13 +226,15 @@ fn sliding_causal_mask_chunk(
     Ok(Tensor::from_vec(data, (1, 1, query_len, k_len), device)?.to_dtype(dtype)?)
 }
 
-/// Number of host-side causal-mask tiles built, used to pin the decode fast path and tile bound.
+// Host-side causal-mask tiles built (and the widest), used to pin the decode fast path and tile
+// bound. Per thread (sc-24140): a test builds its masks on its own thread, and a process-wide
+// counter also counted every mask a concurrently running test built, so the tests that read it
+// flaked under the parallel test runner.
 #[cfg(test)]
-static CAUSAL_MASK_BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(test)]
-static MAX_CAUSAL_MASK_ROWS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static CAUSAL_MASK_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MAX_CAUSAL_MASK_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Eager scaled-dot-product attention over `[batch, heads, seq, head_dim]` tensors.
 ///
@@ -725,12 +727,12 @@ mod tests {
     /// Reset mask accounting so a test observes only its own builds. Tests run single-threaded here
     /// (`RUST_TEST_THREADS=1` is forced), so this is race-free.
     fn reset_mask_accounting() {
-        CAUSAL_MASK_BUILDS.store(0, std::sync::atomic::Ordering::SeqCst);
-        MAX_CAUSAL_MASK_ROWS.store(0, std::sync::atomic::Ordering::SeqCst);
+        CAUSAL_MASK_BUILDS.with(|c| c.set(0));
+        MAX_CAUSAL_MASK_ROWS.with(|c| c.set(0));
     }
 
     fn mask_builds() -> usize {
-        CAUSAL_MASK_BUILDS.load(std::sync::atomic::Ordering::SeqCst)
+        CAUSAL_MASK_BUILDS.with(std::cell::Cell::get)
     }
 
     /// Bounded, varied f32 CPU tensor (cos keeps values in [-1, 1] so the softmax is well-behaved).
@@ -814,7 +816,7 @@ mod tests {
         assert_eq!(out.dims(), &[1, 1, q_len, 2]);
         assert_eq!(mask_builds(), 2);
         assert_eq!(
-            MAX_CAUSAL_MASK_ROWS.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_CAUSAL_MASK_ROWS.with(std::cell::Cell::get),
             EAGER_ATTN_QUERY_CHUNK_SIZE
         );
     }

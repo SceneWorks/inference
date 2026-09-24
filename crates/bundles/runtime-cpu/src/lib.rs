@@ -160,8 +160,9 @@ mod tests {
 
     /// sc-24139: the bundle answers the per-snapshot NVFP4 question from the gates of the
     /// provider its registry would load: a StarVector-1B snapshot is refused by that provider's
-    /// own NVFP4 gate (which runs before any device gate), a qwen3_5 snapshot passes the model
-    /// gate and gets the device's refusal — on CPU, the host capability's own reason.
+    /// own NVFP4 gate (which runs before any device gate), a qwen3_5 snapshot — and, since
+    /// sc-24140, a llama-family one (Qwen3-8B's `qwen3`) — passes the model gate and gets the
+    /// device's refusal — on CPU, the host capability's own reason.
     #[test]
     fn text_nvfp4_support_answers_per_snapshot() {
         let root = tempfile::tempdir().unwrap();
@@ -182,9 +183,14 @@ mod tests {
             "qwen35",
             r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5"}"#,
         );
+        let qwen3 = snapshot(
+            "qwen3",
+            r#"{"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3"}"#,
+        );
         let refused = super::text_nvfp4_support(&starvector);
         let host = super::text_backend_capabilities().nvfp4;
         let device = super::text_nvfp4_support(&qwen);
+        let llama_family = super::text_nvfp4_support(&qwen3);
 
         assert!(!refused.supported);
         let reason = refused.reason.unwrap();
@@ -194,6 +200,10 @@ mod tests {
         );
         assert!(!host.supported);
         assert_eq!(device, host);
+        assert_eq!(
+            llama_family, host,
+            "the llama family reaches the device gate"
+        );
     }
 
     /// sc-24139: the CPU bundle answers the host-capability query without a model, and every CUDA

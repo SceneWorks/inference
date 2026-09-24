@@ -95,7 +95,8 @@ pub fn capabilities_for_device(backend: &str, device: &Device) -> BackendCapabil
 /// The provider is the one `registry` would load `spec` with
 /// ([`TextLlmRegistry::select_for_model`] — the runtime bundle's own composition), and the answer
 /// comes from that provider's own load gates, never a copy of them: the llama family's
-/// [`nvfp4_model_gate`](crate::provider) (GGUF, Prism and architecture refusals) followed by the
+/// [`nvfp4_model_gate`](crate::provider) (GGUF and Prism refusals; the qwen3_5 hybrid and the
+/// llama-family `CausalLm` architectures served, sc-24140) followed by the
 /// device gate ([`Nvfp4Context::require`], cached in [`backend_capabilities`]); LLaVA's and both
 /// StarVector providers' quantization gates, which refuse NVFP4 by name. So when a provider starts
 /// serving NVFP4 for more checkpoints, this answer follows. Reads only `config.json` (and a GGUF
@@ -267,6 +268,11 @@ mod tests {
         serde_json::json!({"architectures": ["LlamaForCausalLM"], "model_type": "llama"})
     }
 
+    /// Qwen3-8B's family: the llama-family `CausalLm` (sc-24140).
+    fn qwen3() -> serde_json::Value {
+        serde_json::json!({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"})
+    }
+
     fn qwen35() -> serde_json::Value {
         serde_json::json!({
             "architectures": ["Qwen3_5ForConditionalGeneration"],
@@ -314,8 +320,9 @@ mod tests {
     }
 
     /// sc-24139: the per-snapshot NVFP4 answer comes from the gates of the provider a load would
-    /// reach. With the device gate passing (an sm_120 host), only a qwen3_5 snapshot is offered;
-    /// every other family is refused by name, and the request's own format is irrelevant.
+    /// reach. With the device gate passing (an sm_120 host), the qwen3_5 hybrid and — since
+    /// sc-24140 — the llama family (Llama, Qwen3-8B's `qwen3`) are offered; LLaVA, both
+    /// StarVectors and Prism are refused by name, and the request's own format is irrelevant.
     #[test]
     fn nvfp4_support_follows_the_selected_providers_own_gates() {
         let registry = crate::cuda_text_registry().unwrap();
@@ -327,6 +334,21 @@ mod tests {
         // The model gate passes, so the device gate answers — whichever way it answers.
         assert_eq!(nvfp4_support_with(&registry, &spec, sm120.clone()), sm120);
         assert_eq!(nvfp4_support_with(&registry, &spec, sm89.clone()), sm89);
+        // sc-24140: the llama family passes the same model gate the load runs.
+        for config in [llama(), qwen3()] {
+            let dir = snapshot(config.clone());
+            let spec = LoadSpec::dense(source(&dir));
+            assert_eq!(
+                nvfp4_support_with(&registry, &spec, sm120.clone()),
+                sm120,
+                "{config}"
+            );
+            assert_eq!(
+                nvfp4_support_with(&registry, &spec, sm89.clone()),
+                sm89,
+                "{config}"
+            );
+        }
         // The question is always NVFP4, whatever format the caller's spec carries.
         let q4 = LoadSpec {
             quantize: Some(Quantize::Q4),
@@ -335,7 +357,6 @@ mod tests {
         assert_eq!(nvfp4_support_with(&registry, &q4, sm89.clone()), sm89);
 
         for (config, names) in [
-            (llama(), "Llama"),
             (llava(), "LLaVA"),
             (starvector_1b(), "StarVector-1B"),
             (starvector_8b(), "StarVector-8B"),
@@ -375,7 +396,14 @@ mod tests {
     #[test]
     fn nvfp4_support_answers_what_the_load_does() {
         let registry = crate::cuda_text_registry().unwrap();
-        for config in [llama(), qwen35(), llava(), starvector_1b(), starvector_8b()] {
+        for config in [
+            llama(),
+            qwen3(),
+            qwen35(),
+            llava(),
+            starvector_1b(),
+            starvector_8b(),
+        ] {
             let dir = snapshot(config);
             let spec = LoadSpec {
                 quantize: Some(Quantize::Nvfp4),

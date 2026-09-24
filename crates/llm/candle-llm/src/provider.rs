@@ -775,8 +775,9 @@ pub struct LlamaProvider {
     /// MTP subset (`MtpStats`); the full record is read back through
     /// [`LlamaProvider::last_decode_record`].
     last_decode: Mutex<Option<DecodeRecord>>,
-    /// What the load produced (sc-24135): the requested weight format and, for the qwen3_5 family,
-    /// the resident weight census by projection kind. Read through [`LlamaProvider::load_record`].
+    /// What the load produced (sc-24135): the requested weight format and the resident weight
+    /// census by projection kind (the qwen3_5 and — sc-24140 — llama families). Read through
+    /// [`LlamaProvider::load_record`].
     load_record: LoadRecord,
     /// Which loop a request whose speculation is off decodes on, for both families (sc-24138,
     /// sc-24140): [`DecodePath::StepModel`] — the unified engine over the step seam on the static
@@ -788,16 +789,19 @@ pub struct LlamaProvider {
 /// The load telemetry of a [`LlamaProvider`] (sc-24135, epic sc-24128 E2): which weight format was
 /// requested and which projection kinds the decoder actually holds, with their resident bytes.
 ///
-/// An NVFP4 request either loads with every requested projection under
-/// `census.projections.nvfp4` or fails at load — this record is how a caller (and the evidence
-/// harness) sees that, and reads the resident bits/param.
+/// An NVFP4 request never reports a dense projection under an NVFP4 label: the qwen3_5 family
+/// loads every requested projection under `census.projections.nvfp4` or fails at load, and the
+/// llama family (sc-24140) keeps a projection whose shape the FP4 GEMM cannot serve dense, counted
+/// under `census.projections.dense` — this record is how a caller (and the evidence harness)
+/// sees which, and reads the resident bits/param.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LoadRecord {
     /// The load-time weight format the caller requested (`None` = the checkpoint's own dtype, or
     /// its persisted `quantization` block).
     pub requested: Option<Quantize>,
-    /// The decoder's resident weights by projection kind (target plus native MTP predictor), for
-    /// the qwen3_5-family decoders; `None` for the other architectures, which do not report one.
+    /// The decoder's resident weights by projection kind (target plus native MTP predictor): the
+    /// qwen3_5-family decoders and, since sc-24140, the llama family (`CausalLm`, safetensors or
+    /// GGUF); `None` for the Prism/Bonsai GGUF hybrid and a provider assembled from parts.
     pub census: Option<WeightCensus>,
     /// The CUDA-graph switch this provider was loaded under (sc-24139): `LoadSpec::cuda_graphs`,
     /// else the process switch at load time. The CUDA stream is settled at load, so every
@@ -936,10 +940,14 @@ fn requires_accelerator(source: &Path) -> CoreResult<bool> {
 /// The NVFP4 projection format for a load, or `None` when `spec` does not request NVFP4
 /// (sc-24135). The capability floor is settled here — before admission or any weight read — so a
 /// CPU or sub-sm_120 device is a typed refusal naming the capability (`CoreError::Unsupported`
-/// carrying "nvfp4"), never a fallback to another representation. A GGUF source is refused too:
-/// it is already block-quantized, and NVFP4 quantizes from a dense snapshot. So is a snapshot
-/// whose `config.json` names an architecture outside the qwen3_5 family — also before admission,
-/// so a memory refusal can never mask the capability refusal.
+/// carrying "nvfp4"), never a fallback to another representation. A source whose family cannot
+/// hold NVFP4 projections is refused by name too, also before admission, so a memory refusal can
+/// never mask the capability refusal: a GGUF file or a Prism/Bonsai snapshot (both already
+/// packed; NVFP4 quantizes from a dense snapshot). The qwen3_5 hybrid (sc-24135) and every
+/// llama-family `CausalLm` decoder (sc-24140 — Llama/Mistral, Qwen3 dense, Phi-3, Qwen2-MoE,
+/// Gemma 2/4, GLM-4, DeepSeek-V2, the Qwen3-VL decoder) are served; a multimodal tower beside the
+/// decoder stays dense, as on the qwen3_5 family, and LLaVA — whose provider owns the tower
+/// load — refuses NVFP4 itself.
 fn nvfp4_format(spec: &LoadSpec, device: &Device) -> CoreResult<Option<ProjectionFormat>> {
     nvfp4_format_with(spec, device, ProjectionFormat::nvfp4)
 }
@@ -966,9 +974,9 @@ fn nvfp4_format_with(
 ///
 /// A GGUF source is refused: it is already block-quantized, and NVFP4 quantizes from a dense
 /// snapshot. So is a Prism/Bonsai snapshot (already packed affine-2 — `load_dir` refuses any
-/// repacking) and an architecture outside the qwen3_5 family, NVFP4's first (and so far only)
-/// consumer (sc-24135), each by name. A missing or unreadable config is left to the loader's own
-/// error.
+/// repacking), by name ([`nvfp4_family_refusal`]). The qwen3_5 hybrid (sc-24135) and every
+/// llama-family `CausalLm` architecture (sc-24140) are served. A missing or unreadable config is
+/// left to the loader's own error.
 pub(crate) fn nvfp4_model_gate(spec: &LoadSpec) -> CoreResult<()> {
     if crate::gguf::is_gguf_path(&spec.source) {
         return Err(CoreError::Unsupported(
@@ -977,24 +985,48 @@ pub(crate) fn nvfp4_model_gate(spec: &LoadSpec) -> CoreResult<()> {
                 .into(),
         ));
     }
+    // The family rule (sc-24140): the one place it lives, so every caller — the load path and the
+    // capability probe alike — answers the same. A missing or unreadable config, or an
+    // architecture the dispatch does not recognize, is left to the loader's own error.
     if let Some(config) = read_json(Path::new(&spec.source), "config.json") {
-        if config.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35") {
-            return Err(CoreError::Unsupported(
-                "nvfp4: Prism/Bonsai is already packed affine-2; NVFP4 repacking would expand the \
-                 model"
-                    .into(),
-            ));
-        }
-        if let Ok(arch) = Architecture::from_config(&config) {
-            if arch != Architecture::Qwen35 {
-                return Err(CoreError::Unsupported(format!(
-                    "nvfp4: NVFP4 projections are served for the qwen3_5 family \
-                     (Qwen3.5/3.6/3.8) only; this checkpoint is {arch:?}"
-                )));
-            }
+        if let Some(reason) = nvfp4_family_refusal(&config) {
+            return Err(CoreError::Unsupported(format!("nvfp4: {reason}")));
         }
     }
     Ok(())
+}
+
+/// Why a snapshot's family cannot hold NVFP4 projections, or `None` when it can (the family half of
+/// [`nvfp4_format_with`]). Prism/Bonsai snapshots are already packed affine-2; the qwen3_5 hybrid
+/// and every llama-family (`CausalLm`) architecture quantize their dense projections through the
+/// shared loader ([`Projection::load_as`](crate::primitives::Projection::load_as) /
+/// [`load_eligible`](crate::primitives::Projection::load_eligible)).
+fn nvfp4_family_refusal(config: &Value) -> Option<String> {
+    if config.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35") {
+        return Some(
+            "a Prism/Bonsai snapshot is already packed affine-2; NVFP4 projections are quantized \
+             from a dense snapshot"
+                .into(),
+        );
+    }
+    match Architecture::from_config(config) {
+        // Every architecture the provider dispatches decodes through `Qwen35Model` or `CausalLm`,
+        // and both load NVFP4 projections.
+        Ok(
+            Architecture::Qwen35
+            | Architecture::Llama
+            | Architecture::Qwen3
+            | Architecture::Phi3
+            | Architecture::Qwen2Moe
+            | Architecture::Gemma2
+            | Architecture::Glm4
+            | Architecture::DeepseekV2
+            | Architecture::Qwen3Vl
+            | Architecture::Gemma4Unified
+            | Architecture::Gemma4,
+        )
+        | Err(_) => None,
+    }
 }
 
 fn ensure_supported_device(source: &Path, device: &Device) -> CoreResult<()> {
@@ -1193,12 +1225,6 @@ impl LlamaProvider {
         } else {
             Architecture::from_config(&cfg_value).map_err(to_core)?
         };
-        // A non-qwen3_5 NVFP4 request was already refused by name in `nvfp4_format`, before
-        // admission (sc-24135).
-        debug_assert!(
-            !(requested.is_some_and(ProjectionFormat::is_nvfp4) && arch != Architecture::Qwen35),
-            "nvfp4_format refuses non-qwen3_5 NVFP4 before load_dir"
-        );
         let (weights, prism) = if is_prism {
             let checkpoint =
                 crate::prism_checkpoint::PrismMlxCheckpoint::open(dir, device, &cfg_value)
@@ -1245,10 +1271,13 @@ impl LlamaProvider {
         } else {
             let cfg = ModelConfig::from_dir(dir).map_err(to_core)?;
             let descriptor = descriptor_for(&cfg);
-            let quant = requested
-                .and_then(ProjectionFormat::ggml)
-                .or(cfg.quantization);
-            let m = CausalLm::from_weights_with(&weights, "", cfg, quant).map_err(to_core)?;
+            // An explicit request (Q4 / Q8 / NVFP4, sc-24140) wins; otherwise the snapshot's own
+            // persisted `quantization` block, as before.
+            let format = requested
+                .cloned()
+                .or_else(|| cfg.quantization.map(ProjectionFormat::from));
+            let m = CausalLm::from_weights_format(&weights, "", cfg, format.as_ref())
+                .map_err(to_core)?;
             (Decoder::Causal(m), descriptor, None)
         };
         if mtp.is_some() {
@@ -1365,7 +1394,8 @@ impl LlamaProvider {
                 }
                 Some(census)
             }
-            Decoder::Causal(_) => None,
+            // sc-24140: the llama family reports its census too (bits/param by projection kind).
+            Decoder::Causal(m) => Some(m.weight_census()),
         };
         Ok(Self {
             descriptor,
@@ -1528,10 +1558,11 @@ impl LlamaProvider {
         let mut descriptor = descriptor_for(&ck.config);
         let quant = requested.or(ck.config.quantization);
         // GGUF is the dense Llama-family path only (no hybrid Qwen3.6 GGUF remap).
-        let model = Decoder::Causal(
-            CausalLm::from_weights_with(&ck.weights, "", ck.config.clone(), quant)
-                .map_err(to_core)?,
-        );
+        let causal = CausalLm::from_weights_with(&ck.weights, "", ck.config.clone(), quant)
+            .map_err(to_core)?;
+        // sc-24140: the llama family reports its census on every load path.
+        let census = Some(causal.weight_census());
+        let model = Decoder::Causal(causal);
 
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
         let sibling_tokenizer = dir.join("tokenizer.json");
@@ -1572,7 +1603,11 @@ impl LlamaProvider {
             // Likewise no Gemma 4 front-ends: the GGUF path reconstructs a dense text decoder,
             // and llama.cpp GGUFs carry no vision embedder / audio projector tensors.
             gemma4: None,
-            load_record: LoadRecord::default(),
+            load_record: LoadRecord {
+                requested: None,
+                census,
+                cuda_graphs: None,
+            },
         })
     }
 
@@ -4241,6 +4276,12 @@ mod tests {
     }
 
     fn tiny_llama_for_admission() -> CausalLm {
+        let (cfg, w) = tiny_llama_parts();
+        tiny_causal_from(cfg, w)
+    }
+
+    /// The tiny llama decoder's config and seeded weights (3 layers, vocab 40).
+    fn tiny_llama_parts() -> (serde_json::Value, HashMap<String, Tensor>) {
         use crate::primitives::{SplitMix64, TokenRng};
         let (vocab, hidden, inter, heads, kv_heads, layers) = (40usize, 32, 64, 4, 2, 3);
         let head_dim = hidden / heads;
@@ -4281,7 +4322,7 @@ mod tests {
             w.insert(p("mlp.up_proj.weight"), rand(&[inter, hidden]));
             w.insert(p("mlp.down_proj.weight"), rand(&[hidden, inter]));
         }
-        tiny_causal_from(
+        (
             serde_json::json!({
                 "architectures": ["LlamaForCausalLM"], "model_type": "llama",
                 "hidden_size": hidden, "intermediate_size": inter, "num_hidden_layers": layers,
@@ -4291,6 +4332,54 @@ mod tests {
             }),
             w,
         )
+    }
+
+    /// sc-24140: a llama-family load reports its weight census (the `LoadRecord` said `None` for
+    /// every non-qwen3_5 architecture), and the requested format reaches `CausalLm`: dense keeps
+    /// all 3 × 7 projections and the head dense; `Quantize::Q8` makes the layer projections GGML
+    /// and keeps the head dense.
+    #[test]
+    fn a_llama_family_load_reports_its_census_for_the_requested_format() {
+        use core_llm::{LoadSpec, Quantize};
+        let (cfg, weights) = tiny_llama_parts();
+        let dir = tempfile::Builder::new()
+            .prefix("candle-llama-census-")
+            .tempdir()
+            .unwrap();
+        std::fs::write(dir.path().join("config.json"), cfg.to_string()).unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer.json"),
+            synthetic_tokenizer_json(40),
+        )
+        .unwrap();
+        candle_core::safetensors::save(&weights, dir.path().join("model.safetensors")).unwrap();
+        let load = |quantize| {
+            super::LlamaProvider::load(&LoadSpec {
+                quantize,
+                ..LoadSpec::dense(dir.path().display().to_string())
+            })
+            .expect("load the synthetic llama snapshot")
+            .load_record()
+        };
+        let dense = load(None);
+        let census = dense
+            .census
+            .expect("a llama-family load reports its census");
+        assert_eq!(census.projections.dense.count, 3 * 7 + 1);
+        assert_eq!(census.projections.ggml.count, 0);
+        let q8 = load(Some(Quantize::Q8));
+        assert_eq!(q8.requested, Some(Quantize::Q8));
+        let census = q8.census.expect("census");
+        assert_eq!(
+            census.projections.ggml.count,
+            3 * 7,
+            "every layer projection is Q8"
+        );
+        assert_eq!(
+            census.projections.dense.count, 1,
+            "the head stays dense under GGML"
+        );
+        assert_eq!(census.projections.dense.params, 40 * 32);
     }
 
     /// The shared Gemma 4 decoder fixture: sliding layers 2 KV heads × 8, full layers
@@ -4622,45 +4711,53 @@ mod tests {
         }
     }
 
-    /// sc-24135: an NVFP4 request for a snapshot outside the qwen3_5 family is refused by name in
-    /// `nvfp4_format` — before admission and the device gate — so no memory or device error can
-    /// mask it. The gate here would accept anything; it must not be reached.
+    /// sc-24140: the family rule `nvfp4_format` applies before admission and the device gate. The
+    /// qwen3_5 hybrid **and** the llama family (a `CausalLm` — Qwen3-8B's `qwen3`, Llama/Mistral,
+    /// Gemma, …) reach the gate; a Prism/Bonsai snapshot (already packed affine-2) is refused by
+    /// name before it, so no memory or device error can mask the refusal. The refusing gate below
+    /// panics if reached.
     #[test]
-    fn nvfp4_for_a_non_qwen35_snapshot_is_refused_before_the_device_gate() {
+    fn nvfp4_family_rule_serves_qwen35_and_the_llama_family_and_refuses_prism() {
         let root = tempfile::tempdir().unwrap();
+        let spec = nvfp4_spec(&root.path().to_string_lossy());
+        for config in [
+            r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5"}"#,
+            r#"{"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3"}"#,
+            r#"{"architectures":["LlamaForCausalLM"],"model_type":"llama"}"#,
+            r#"{"architectures":["MistralForCausalLM"],"model_type":"mistral"}"#,
+            r#"{"architectures":["Gemma2ForCausalLM"],"model_type":"gemma2"}"#,
+            r#"{"architectures":["DeepseekV2ForCausalLM"],"model_type":"deepseek_v2"}"#,
+            r#"{"architectures":["Qwen3VLForConditionalGeneration"],"model_type":"qwen3_vl"}"#,
+        ] {
+            std::fs::write(root.path().join("config.json"), config).unwrap();
+            let reached = std::cell::Cell::new(false);
+            let gate = |_: &candle_core::Device| -> crate::Result<_> {
+                reached.set(true);
+                Err(crate::Error::Unsupported("nvfp4: gate reached".into()))
+            };
+            match super::nvfp4_format_with(&spec, &candle_core::Device::Cpu, gate) {
+                Err(core_llm::Error::Unsupported(msg)) => assert_eq!(msg, "nvfp4: gate reached"),
+                other => panic!("{config}: expected the gate's refusal, got {other:?}"),
+            }
+            assert!(reached.get(), "{config} must reach the device gate");
+        }
+
         std::fs::write(
             root.path().join("config.json"),
-            r#"{"architectures":["LlamaForCausalLM"],"model_type":"llama"}"#,
+            r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"prism_hadamard_qwen35"}"#,
         )
         .unwrap();
-        let spec = nvfp4_spec(&root.path().to_string_lossy());
         let gate = |_: &candle_core::Device| -> crate::Result<_> {
-            panic!("the device gate ran before the architecture refusal")
+            panic!("the device gate ran before the family refusal")
         };
         match super::nvfp4_format_with(&spec, &candle_core::Device::Cpu, gate) {
             Err(core_llm::Error::Unsupported(msg)) => {
                 assert!(msg.starts_with("nvfp4: "), "{msg}");
-                assert!(msg.contains("qwen3_5 family"), "{msg}");
-                assert!(msg.contains("Llama"), "names the checkpoint: {msg}");
+                assert!(msg.contains("Prism/Bonsai"), "names the family: {msg}");
+                assert!(msg.contains("dense snapshot"), "names the reason: {msg}");
             }
-            other => panic!("expected the architecture refusal, got {other:?}"),
+            other => panic!("expected the family refusal, got {other:?}"),
         }
-        // A qwen3_5 snapshot passes the architecture check and reaches the gate.
-        std::fs::write(
-            root.path().join("config.json"),
-            r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5"}"#,
-        )
-        .unwrap();
-        let reached = std::cell::Cell::new(false);
-        let gate = |_: &candle_core::Device| -> crate::Result<_> {
-            reached.set(true);
-            Err(crate::Error::Unsupported("nvfp4: gate reached".into()))
-        };
-        let _ = super::nvfp4_format_with(&spec, &candle_core::Device::Cpu, gate);
-        assert!(
-            reached.get(),
-            "a qwen3_5 snapshot must reach the device gate"
-        );
     }
 
     /// On a build with no CUDA backend the whole load refuses NVFP4 before reading a byte: the

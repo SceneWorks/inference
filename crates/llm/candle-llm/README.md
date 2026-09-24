@@ -50,6 +50,14 @@ aligned, matching the eager convention, so cached decode stays correct; the two 
 few half-precision ULPs (proven by a gated parity test). `candle-flash-attn` ships sm80 kernels that
 **do compile and run on sm_120** (Blackwell) under the project's `CUDA_COMPUTE_CAP=120` build.
 
+NVFP4 projections (`ProjectionFormat::Nvfp4`, sm_120 and up — a typed refusal below) load for the
+Qwen3.5/3.8 hybrid and, since sc-24140, the whole llama family: `CausalLm::from_weights_format`
+quantizes every attention / MLP / MoE-expert projection and the LM head through the shared
+`Projection::load_eligible`, keeping a shape the FP4 GEMM cannot serve (`N % 16 != 0`) dense and
+visible under `dense` in `CausalLm::weight_census`. The CUDA tests that need an sm_120 device skip
+(loudly) without one; `REQUIRE_SM120=1` turns every such skip into a failure, so an acceptance run on
+the authoritative box proves they ran.
+
 ### Multi-GPU (pipeline sharding)
 
 `CausalLm::from_dir_sharded(dir, cfg, dtype, &[dev0, dev1, …])` splits a decoder's layers into
@@ -86,7 +94,9 @@ parity tests:
 | `CANDLE_LLM_GEMMA4_MODEL` | a Gemma 4 unified snapshot dir (e.g. `google/gemma-4-12B-it`) | `breadth` — coherent-text streaming; `gemma4_decoder` — the real-weight per-layer-type forward (hidden-state stack + soft-capped logits) |
 | `CANDLE_LLM_VLM_MODEL` | a SigLIP-based `LlavaForConditionalGeneration` snapshot dir (small: `llava-hf/llava-interleave-qwen-0.5b-hf`; faithful: JoyCaption) | `vlm` — image captioning + the multimodal conformance check |
 | `BONSAI_QWEN38_SNAPSHOT` | the frozen Qwen3.8-27B snapshot dir (the manifest's own name for it) | `decode_step_parity` — the sc-24129 seam gates on real weights: a 256-token greedy decode through `StepModel` is token-identical to the `Decode` loop, and `Qwen35Cache::rollback_to` re-decodes to the same logits as a fresh decode |
-| `DECODE_BENCH_SNAPSHOT` + `DECODE_BENCH_OUTPUT` | the same snapshot, plus a JSON path to write | `decode_bench` — the decode-perf suite (tok/s, acceptance, forwards and host syncs per token, device memory) for reference / `StepModel` / native MTP `K=1..5`; run and sealed by `scripts/release/decode_bench.py` |
+| `DECODE_BENCH_SNAPSHOT` + `DECODE_BENCH_OUTPUT` | the same snapshot (or Qwen3-8B for the llama family), plus a JSON path to write | `decode_bench` — the one decode-perf home (tok/s, acceptance, forwards and host syncs per token, sampler path and logits rows to host, device memory) for reference / `StepModel` / native MTP `K=1..5` / n-gram and the seeded temperature + top-p rows, in any `DECODE_BENCH_FORMAT` (`bf16`, `q8`, `q4`, `nvfp4` — both families); run and sealed by `scripts/release/decode_bench.py`, whose `campaign` subcommand runs (or collects) the whole matrix — models x formats x speculative modes x CUDA graphs — and seals one index over it |
+| `QWEN3_8B_SNAPSHOT` | the pinned `Qwen/Qwen3-8B` snapshot dir (the manifest's name for it) | `speculative_engine_parity::llama_family_qwen3_8b_exact_rows_and_teacher_forced_knife_edge_gate` — the llama family's 256-token gate (sc-24140): static seam, fused-off loops and the CUDA-graph fallback token-identical to the reference loop; teacher-forced verify-shaped forwards flip only at ≤ 1 bf16 ULP knife-edges (the E1 gate); free-running n-gram divergences recorded with their gaps |
+| `NVFP4_EVIDENCE_SNAPSHOT` (+ `_OUTPUT`, `_PPL_TEXT`) | a Qwen3.5/3.8 or llama-family snapshot | `nvfp4_evidence` — bf16 vs NVFP4: weight census (bits/param by projection kind), the 256-token fixture's first divergence, perplexity over a fixed slice, and the provider's `Quantize::Nvfp4` load record |
 
 The `breadth` test streams a prompt through each non-Llama architecture: **Phi-3** (packed qkv/gate_up),
 **Qwen2-MoE** (router + experts + shared, q/k/v bias), **Gemma-2** (sandwich norms + soft-caps + GeGLU),

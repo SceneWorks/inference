@@ -1,0 +1,3 @@
+[decode_bench] reference            24.62 tok/s  prefill 0.047s  nvfp4 n/a  sampler n/a
+[decode_bench] sampled              22.58 tok/s  prefill 0.051s  nvfp4 n/a  sampler n/a
+[decode_bench] wrote D:\fe-r1-evidence\baseline-d2b8cb335-qwen3-8b\decode_bench.json

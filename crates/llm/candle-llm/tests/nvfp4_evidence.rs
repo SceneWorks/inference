@@ -1,6 +1,6 @@
 //! `nvfp4_evidence` — the real-weight evidence run for NVFP4 projections (sc-24135, epic sc-24128).
 //!
-//! One `#[ignore]`d test that loads a Qwen3.5/3.6/3.8 snapshot twice — bf16, then NVFP4 — and writes
+//! One `#[ignore]`d test that loads a snapshot twice — bf16, then NVFP4 — and writes
 //! one JSON document with, per row: the resident weight census (bytes and bits/param by projection
 //! kind), device memory in use after load, the greedy 256-token fixture (tokens + decoded text), and
 //! perplexity over a fixed token slice of a committed text file. The NVFP4 row also records the
@@ -8,6 +8,11 @@
 //! divergence is expected, its position is the evidence). A third, provider-level row loads the
 //! same snapshot through `LlamaProvider::load` with `Quantize::Nvfp4` and records the provider's
 //! `LoadRecord`, proving the selector reaches the loader end to end.
+//!
+//! The snapshot's `config.json` picks the family, as the provider does: a Qwen3.5/3.6/3.8 hybrid
+//! (`Qwen35Model`, sc-24135) or a llama-family `CausalLm` — Qwen3-8B, whose NVFP4 load arrived in
+//! sc-24140 (every attention/MLP projection and the LM head through the shared loader). Both run
+//! the same fixture and the same perplexity slice, so the documents compare across families.
 //!
 //! Every input is passed in; nothing is derived from a cache:
 //!
@@ -33,7 +38,7 @@ use std::time::Instant;
 use candle_core::{DType, Device, Tensor, D};
 use candle_llm::decode::{generate_from_prefill, CancelFlag, GenerationConfig};
 use candle_llm::device::select_device;
-use candle_llm::models::{Qwen35Config, Qwen35Model};
+use candle_llm::models::{CausalLm, Qwen35Config, Qwen35Model};
 use candle_llm::primitives::{input_ids, ProjectionFormat, ProjectionTally, WeightCensus, Weights};
 use core_llm::{ChatTemplate, JinjaChatTemplate, LoadSpec, Message, RenderOptions, Tokenizer};
 use serde_json::{json, Value};
@@ -119,59 +124,136 @@ fn census_json(c: &WeightCensus) -> Value {
     })
 }
 
-fn load(snapshot: &Path, device: &Device, format: Option<&ProjectionFormat>) -> Qwen35Model {
+/// The decoder under evidence: the qwen3_5 hybrid or a llama-family `CausalLm` (sc-24140).
+enum Model {
+    Hybrid(Qwen35Model),
+    Causal(CausalLm),
+}
+
+/// Whether `config.json` names the qwen3_5 hybrid (else the llama family), by the provider's
+/// own dispatch.
+fn is_hybrid(config: &Value) -> bool {
+    matches!(
+        candle_llm::config::Architecture::from_config(config),
+        Ok(candle_llm::config::Architecture::Qwen35)
+    )
+}
+
+fn load(snapshot: &Path, device: &Device, format: Option<&ProjectionFormat>) -> Model {
     let config: Value =
         serde_json::from_str(&std::fs::read_to_string(snapshot.join("config.json")).unwrap())
             .unwrap();
-    let cfg = Qwen35Config::from_json(&config).expect("qwen3_5 config");
     let weights = Weights::from_dir(snapshot, device).expect("load weights");
+    if !is_hybrid(&config) {
+        let cfg = candle_llm::config::ModelConfig::from_json(&config).expect("llama-family config");
+        return Model::Causal(
+            CausalLm::from_weights_format(&weights, "", cfg, format).expect("build model"),
+        );
+    }
+    let cfg = Qwen35Config::from_json(&config).expect("qwen3_5 config");
     let prefix = if weights.contains("model.language_model.embed_tokens.weight") {
         "model.language_model"
     } else {
         "model"
     };
-    Qwen35Model::from_weights_format(&weights, prefix, cfg, format).expect("build model")
+    Model::Hybrid(
+        Qwen35Model::from_weights_format(&weights, prefix, cfg, format).expect("build model"),
+    )
     // `weights` drops here: every tensor the model did not keep (the bf16 NVFP4 sources) is freed.
 }
 
-fn greedy(model: &Qwen35Model, prompt: &[i32], new_tokens: usize, device: &Device) -> Vec<i32> {
-    let mut config = GenerationConfig {
-        max_new_tokens: new_tokens,
-        seed: Some(0),
-        stop_tokens: Vec::new(),
-        ..Default::default()
-    };
-    config.sampling.temperature = 0.0;
-    let mut cache = model.new_cache();
-    let first = model
-        .decode_logits(&input_ids(prompt, device).unwrap(), &mut cache, 0)
-        .expect("prefill");
-    generate_from_prefill(
-        model,
-        &mut cache,
-        first,
-        prompt.to_vec(),
-        &config,
-        &CancelFlag::new(),
-        &mut |_| {},
-        None,
-    )
-    .expect("greedy generation")
-    .tokens
+impl Model {
+    fn family(&self) -> &'static str {
+        match self {
+            Model::Hybrid(_) => "qwen35",
+            Model::Causal(_) => "llama",
+        }
+    }
+
+    fn weight_census(&self) -> WeightCensus {
+        match self {
+            Model::Hybrid(m) => m.weight_census(),
+            Model::Causal(m) => m.weight_census(),
+        }
+    }
+
+    /// The greedy fixture on the reference loop: a `decode_logits` prefill on the model's own
+    /// growing cache, then the shared token-at-a-time loop.
+    fn greedy(&self, prompt: &[i32], new_tokens: usize, device: &Device) -> Vec<i32> {
+        let mut config = GenerationConfig {
+            max_new_tokens: new_tokens,
+            seed: Some(0),
+            stop_tokens: Vec::new(),
+            ..Default::default()
+        };
+        config.sampling.temperature = 0.0;
+        let ids = input_ids(prompt, device).unwrap();
+        let run = |decoder: &dyn candle_llm::decode::Decode,
+                   cache: &mut dyn candle_llm::primitives::KvCache,
+                   first: Tensor| {
+            generate_from_prefill(
+                decoder,
+                cache,
+                first,
+                prompt.to_vec(),
+                &config,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+            )
+            .expect("greedy generation")
+            .tokens
+        };
+        match self {
+            Model::Hybrid(m) => {
+                let mut cache = m.new_cache();
+                let first = m.decode_logits(&ids, &mut cache, 0).expect("prefill");
+                run(m, &mut cache, first)
+            }
+            Model::Causal(m) => {
+                let mut cache = m.new_cache();
+                let first = m.decode_logits(&ids, &mut cache, 0).expect("prefill");
+                run(m, &mut cache, first)
+            }
+        }
+    }
+
+    /// `(mean NLL, perplexity)` of `ids[1..]` given their prefixes.
+    fn perplexity(&self, ids: &[i32], device: &Device) -> (f64, f64) {
+        match self {
+            Model::Hybrid(m) => {
+                let mut cache = m.new_cache();
+                perplexity_with(ids, device, |chunk, start| {
+                    m.forward(chunk, &mut cache, start)
+                        .expect("teacher-forced forward")
+                })
+            }
+            Model::Causal(m) => {
+                let mut cache = m.new_cache();
+                perplexity_with(ids, device, |chunk, start| {
+                    m.decode_logits_all(chunk, &mut cache, start)
+                        .expect("teacher-forced forward")
+                })
+            }
+        }
+    }
 }
 
-/// `(mean NLL, perplexity)` of `ids[1..]` given their prefixes.
-fn perplexity(model: &Qwen35Model, ids: &[i32], device: &Device) -> (f64, f64) {
-    let mut cache = model.new_cache();
+/// `(mean NLL, perplexity)` of `ids[1..]` given their prefixes, teacher-forced through `forward`
+/// (`[1, len, vocab]` logits for a chunk at a start position, on one cache) in `PPL_CHUNK`-token
+/// chunks.
+fn perplexity_with(
+    ids: &[i32],
+    device: &Device,
+    mut forward: impl FnMut(&Tensor, i32) -> Tensor,
+) -> (f64, f64) {
     let mut nll_sum = 0f64;
     let mut scored = 0usize;
     let mut start = 0usize;
     while start < ids.len() {
         let end = (start + PPL_CHUNK).min(ids.len());
         let chunk = &ids[start..end];
-        let logits = model
-            .forward(&input_ids(chunk, device).unwrap(), &mut cache, start as i32)
-            .expect("teacher-forced forward")
+        let logits = forward(&input_ids(chunk, device).unwrap(), start as i32)
             .squeeze(0)
             .unwrap();
         // `logits` is [len, vocab]. Position i predicts ids[start + i + 1]; the last chunk's last
@@ -267,31 +349,33 @@ fn nvfp4_real_weight_evidence() {
     );
 
     let baseline_used = device_used_bytes(&device);
+    let mut family = "";
     let mut rows = Vec::new();
     let mut bf16_tokens: Option<Vec<i32>> = None;
     for (name, nvfp4) in [("bf16", false), ("nvfp4", true)] {
         let format = nvfp4.then(|| ProjectionFormat::nvfp4(&device).expect("NVFP4 capability"));
         let started = Instant::now();
         let model = load(&snapshot, &device, format.as_ref());
+        family = model.family();
         let load_secs = started.elapsed().as_secs_f64();
         let used_after_load = device_used_bytes(&device);
         let census = model.weight_census();
 
         let started = Instant::now();
-        let tokens = greedy(&model, &prompt, new_tokens, &device);
+        let tokens = model.greedy(&prompt, new_tokens, &device);
         let greedy_secs = started.elapsed().as_secs_f64();
         let text_out = tok
             .decode(&tokens.iter().map(|&t| t as u32).collect::<Vec<_>>(), true)
             .unwrap_or_default();
 
         let started = Instant::now();
-        let (mean_nll, ppl) = perplexity(&model, slice, &device);
+        let (mean_nll, ppl) = model.perplexity(slice, &device);
         let ppl_secs = started.elapsed().as_secs_f64();
         let divergence = bf16_tokens
             .as_ref()
             .map(|reference| first_divergence(reference, &tokens));
         eprintln!(
-            "[sc-24135] {name}: load {load_secs:.1}s, resident weights {} B ({:?} bits/param; \
+            "[nvfp4-evidence] {family} {name}: load {load_secs:.1}s, resident weights {} B ({:?} bits/param; \
              projections {:?}), ppl {ppl:.4} over {ppl_tokens} tokens, first divergence vs bf16 \
              {divergence:?}",
             census.total().resident_bytes,
@@ -340,12 +424,14 @@ fn nvfp4_real_weight_evidence() {
         "load_seconds": provider_load_secs,
         "device_used_bytes_after_load": device_used_bytes(&device),
         "requested": format!("{:?}", record.requested),
+        // The hybrid's census includes its MTP head; the llama family has none (sc-24140).
         "weight_census_incl_mtp": record.census.as_ref().map(census_json),
     });
     drop(provider);
 
     let doc = json!({
-        "story": "sc-24135",
+        "story": if family == "llama" { "sc-24140" } else { "sc-24135" },
+        "model_family": family,
         "hardware_label": label,
         "snapshot": snapshot.to_string_lossy(),
         "device_used_bytes_before_load": baseline_used,
