@@ -181,6 +181,18 @@ pub const NVFP4_K_ALIGN: usize = 32;
 /// `check_nvfp4_alignment` and by the plan-time predicate.
 pub const NVFP4_N_ALIGN: usize = 16;
 
+/// The fused NVFP4 activation-quantize CUDA source (sc-12078), compiled once per device through
+/// the [`nvrtc`](crate::nvrtc) compile-once seam (sc-24137). Uses only standard device intrinsics
+/// (no fp8/fp4 headers) so nvrtc needs no extra include path. Outside `cuda_impl`, like every seam
+/// descriptor, so [`NVRTC_SOURCES`](crate::NVRTC_SOURCES) names it on every build.
+pub(crate) const NVFP4_QUANT_SRC: crate::nvrtc::KernelSource = crate::nvrtc::KernelSource {
+    name: "candle_quant_kernels_nvfp4_quant_v1",
+    src: include_str!("nvfp4_quant.cu"),
+    // Standard intrinsics only; sm_70 is the oldest this workspace targets (NVFP4 itself is
+    // gated to sm_100+/sm_120 by `meets_nvfp4_floor` before this is ever consulted).
+    cc_floor: (7, 0),
+};
+
 #[cfg(feature = "cuda")]
 mod cuda_impl {
     use super::super::nvfp4::{Nvfp4Tensor, SF_ATOM_COLS, SF_ATOM_ROWS};
@@ -231,17 +243,6 @@ mod cuda_impl {
         /// re-attempt (and re-fail) nvrtc on every projection of every denoise step.
         nvfp4_quant_kernels: std::sync::Mutex<Option<Option<Arc<Nvfp4QuantKernels>>>>,
     }
-
-    /// The fused NVFP4 activation-quantize CUDA source (sc-12078), compiled once per device through
-    /// the [`nvrtc`](crate::nvrtc) compile-once seam (sc-24137). Uses only standard device intrinsics
-    /// (no fp8/fp4 headers) so nvrtc needs no extra include path.
-    pub(crate) const NVFP4_QUANT_SRC: crate::nvrtc::KernelSource = crate::nvrtc::KernelSource {
-        name: "candle_quant_kernels_nvfp4_quant_v1",
-        src: include_str!("nvfp4_quant.cu"),
-        // Standard intrinsics only; sm_70 is the oldest this workspace targets (NVFP4 itself is
-        // gated to sm_100+/sm_120 by `meets_nvfp4_floor` before this is ever consulted).
-        cc_floor: (7, 0),
-    };
 
     /// The public, driver-reported configuration identity of the cuBLASLt algorithm selected for
     /// one NVFP4 GEMM shape. This deliberately copies documented scalar configuration attributes
@@ -1923,8 +1924,6 @@ mod cuda_impl {
 // `NVFP4_K_ALIGN` / `NVFP4_N_ALIGN` are NOT re-exported here: sc-20641 moved them to this module's
 // always-compiled half (the plan-time layout predicate needs them on every build), and `cuda_impl`
 // only borrows them back with its own `pub use`.
-#[cfg(all(test, feature = "cuda"))]
-pub(crate) use cuda_impl::NVFP4_QUANT_SRC;
 #[cfg(feature = "cuda")]
 pub use cuda_impl::{CublasLt, DevFp8, DevInt8, DevNvfp4, Nvfp4AlgorithmIdentity};
 

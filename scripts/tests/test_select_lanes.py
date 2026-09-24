@@ -1,6 +1,6 @@
 import unittest
 
-from scripts.ci.select_lanes import LANES, select_lanes
+from scripts.ci.select_lanes import LANES, only_lanes, select_lanes
 
 
 class SelectLanesTests(unittest.TestCase):
@@ -201,6 +201,15 @@ class SelectLanesTests(unittest.TestCase):
     def test_empty_or_forced_input_selects_everything(self) -> None:
         self.assertTrue(all(select_lanes([]).values()))
         self.assertTrue(all(select_lanes(["README.md"], force_all=True).values()))
+
+    def test_only_selects_exactly_the_named_lanes(self) -> None:
+        lanes = only_lanes(["windows_cuda"])
+        self.assertEqual({lane for lane, enabled in lanes.items() if enabled}, {"windows_cuda"})
+        self.assertFalse(lanes["macos_metal"])
+        self.assertEqual(set(lanes), set(LANES))
+        for bad in ([], ["windows-cuda"], ["windows_cuda", "nope"]):
+            with self.subTest(selection=bad), self.assertRaises(ValueError):
+                only_lanes(bad)
 
 
 if __name__ == "__main__":
