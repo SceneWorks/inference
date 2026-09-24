@@ -22,9 +22,10 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TextIO
 
 try:
     from scripts.release.verify_model_snapshot import load_model, snapshot_inventory, verify_snapshot
@@ -332,6 +333,179 @@ def terminate_owned_child(proc: subprocess.Popen[bytes]) -> dict[str, Any]:
     }
 
 
+RSS_SAMPLE_INTERVAL_SECONDS = 0.02
+MAX_RSS_SAMPLE_INTERVAL_SECONDS = 0.05
+
+
+def rss_sample_interval(value: str) -> float:
+    """Parse ``--rss-sample-interval``: positive and at most 50 ms, so no cadence setting can
+    reopen the short-case race the dedicated RSS loop closes (sc-24164)."""
+    interval = float(value)
+    if not (math.isfinite(interval) and 0 < interval <= MAX_RSS_SAMPLE_INTERVAL_SECONDS):
+        raise argparse.ArgumentTypeError(
+            "RSS sample interval must be positive and at most "
+            f"{MAX_RSS_SAMPLE_INTERVAL_SECONDS} seconds"
+        )
+    return interval
+
+
+def sample_owned_child(
+    proc: subprocess.Popen[bytes],
+    *,
+    run_id: str,
+    started: float,
+    rss_interval: float,
+    gpu_interval: float,
+    progress_rss: TextIO,
+    diagnostic_timeout: float | None,
+    interrupted: Callable[[], str | None],
+) -> dict[str, Any]:
+    """Sample the owned child until it exits or is stopped, on two independent cadences.
+
+    Host RSS is read every ``rss_interval`` seconds on this thread; per-process GPU memory comes
+    from ``nvidia-smi`` on a thread of its own every ``gpu_interval`` seconds. The two used to share
+    one loop, so each RSS sample waited behind an ``nvidia-smi`` query that can take most of a
+    second on Windows, and a short selected case (the E7 ``image`` case once the sc-24128 decode
+    made it fast) could start and finish between two RSS samples, leaving the gate no complete
+    in-window sample (sc-24164). Reading the working set is cheap (a syscall on Windows and Linux,
+    one short ``ps`` on macOS), so the RSS cadence no longer depends on the GPU query at all.
+
+    A diagnostic timeout or interrupt stops the child from this loop, as before. An exception on
+    the GPU thread is re-raised here once the thread has stopped.
+    """
+    read_rss = rss_bytes
+    read_gpu = nvidia_sample
+    rss_samples: list[dict[str, Any]] = []
+    gpu_samples: list[dict[str, Any]] = []
+    gpu_reasons: list[str] = []
+    gpu_errors: list[BaseException] = []
+    stop = threading.Event()
+
+    def sample_gpu() -> None:
+        try:
+            while not stop.is_set() and proc.poll() is None:
+                elapsed = time.monotonic() - started
+                gpu_started = time.time()
+                gpu, reason = read_gpu(proc.pid)
+                gpu_ended = time.time()
+                if gpu is not None:
+                    gpu_samples.append(
+                        {
+                            "seconds": elapsed,
+                            "started_unix_seconds": gpu_started,
+                            "ended_unix_seconds": gpu_ended,
+                            "run_id": run_id,
+                            "process_id": proc.pid,
+                            "bytes": gpu,
+                        }
+                    )
+                elif reason:
+                    gpu_reasons.append(reason)
+                stop.wait(gpu_interval)
+        except BaseException as error:  # surfaced on the sampling thread after join
+            gpu_errors.append(error)
+
+    gpu_thread = threading.Thread(target=sample_gpu, name="nvidia-smi-sampler", daemon=True)
+    timed_out = False
+    child_tree_cleanup: dict[str, Any] | None = None
+    progress_rss_truncated = False
+    next_progress = 0.0
+    progress_bytes = 0
+    gpu_thread.start()
+    try:
+        while proc.poll() is None:
+            elapsed = time.monotonic() - started
+            stopped_by = interrupted()
+            if stopped_by is not None or (
+                diagnostic_timeout is not None and elapsed >= diagnostic_timeout
+            ):
+                timed_out = stopped_by is None
+                child_tree_cleanup = terminate_owned_child(proc)
+                break
+            rss_started = time.time()
+            rss = read_rss(proc.pid)
+            rss_ended = time.time()
+            if rss is not None:
+                sample = {
+                    "seconds": elapsed,
+                    "started_unix_seconds": rss_started,
+                    "ended_unix_seconds": rss_ended,
+                    "run_id": run_id,
+                    "process_id": proc.pid,
+                    "bytes": rss,
+                }
+                rss_samples.append(sample)
+                if elapsed >= next_progress and not progress_rss_truncated:
+                    line = json.dumps(sample, sort_keys=True, separators=(",", ":")) + "\n"
+                    encoded = line.encode("utf-8")
+                    if progress_bytes + len(encoded) <= 2 * 1024 * 1024:
+                        progress_rss.write(line)
+                        progress_rss.flush()
+                        progress_bytes += len(encoded)
+                    else:
+                        progress_rss_truncated = True
+                    next_progress = elapsed + 5.0
+            time.sleep(rss_interval)
+    finally:
+        stop.set()
+        gpu_thread.join()
+    if gpu_errors:
+        raise gpu_errors[0]
+    return {
+        "rss_samples": rss_samples,
+        "gpu_samples": gpu_samples,
+        "gpu_reasons": gpu_reasons,
+        "timed_out": timed_out,
+        "child_tree_cleanup": child_tree_cleanup,
+        "progress_rss_truncated": progress_rss_truncated,
+    }
+
+
+def retained_rss_samples(
+    samples: list[dict[str, Any]],
+    intervals: list[dict[str, Any]],
+    *,
+    spacing: float,
+) -> list[dict[str, Any]]:
+    """The RSS samples a receipt keeps from the fast sampling stream (sc-24164).
+
+    The fast loop exists so every selected case contains complete samples, not to multiply the
+    receipt by the sampling rate. The stream is thinned to one sample per ``spacing`` seconds,
+    and every sample the evidence depends on is kept regardless: the run's peak, each case
+    interval's first, last and peak contained samples, and the nearest sample on either side of
+    it. So a case's first sample, peak and growth, and the run's peak, are those of the full stream.
+    """
+    if not samples:
+        return []
+    keep: set[int] = set()
+    last_kept = -math.inf
+    for index, sample in enumerate(samples):
+        if sample["started_unix_seconds"] - last_kept >= spacing:
+            keep.add(index)
+            last_kept = sample["started_unix_seconds"]
+    keep.add(max(range(len(samples)), key=lambda index: samples[index]["bytes"]))
+    for interval in intervals:
+        started = interval.get("started_unix_seconds")
+        ended = interval.get("ended_unix_seconds")
+        if not isinstance(started, (int, float)) or not isinstance(ended, (int, float)):
+            continue
+        inside: list[int] = []
+        before: int | None = None
+        after: int | None = None
+        for index, sample in enumerate(samples):
+            if sample["started_unix_seconds"] >= started and sample["ended_unix_seconds"] <= ended:
+                inside.append(index)
+            elif sample["ended_unix_seconds"] <= started:
+                before = index
+            elif after is None and sample["started_unix_seconds"] >= ended:
+                after = index
+        if inside:
+            peak = max(inside, key=lambda index: samples[index]["bytes"])
+            keep.update((inside[0], inside[-1], peak))
+        keep.update(index for index in (before, after) if index is not None)
+    return [samples[index] for index in sorted(keep)]
+
+
 def bounded_interval_samples(
     samples: list[dict[str, Any]],
     interval: dict[str, Any],
@@ -341,18 +515,37 @@ def bounded_interval_samples(
     scope: str,
     unavailable_reason: str,
 ) -> dict[str, Any]:
-    """Retain only complete same-process samples captured inside one selected-case interval."""
+    """Retain only complete same-process samples captured inside one selected-case interval.
+
+    With none inside, the evidence stays unavailable (the E7 gate fails closed on it) but records
+    the nearest complete same-process sample on each side of the interval, so a case the sampler
+    could not bracket still shows how its memory was bounded from outside (sc-24164). Those
+    samples are diagnostics, never the in-window evidence the gate counts.
+    """
     started = interval["started_unix_seconds"]
     ended = interval["ended_unix_seconds"]
-    contained = [
+    same_process = [
         sample
         for sample in samples
-        if sample.get("run_id") == run_id
-        and sample.get("process_id") == process_id
-        and sample.get("started_unix_seconds", math.inf) >= started
+        if sample.get("run_id") == run_id and sample.get("process_id") == process_id
+    ]
+    contained = [
+        sample
+        for sample in same_process
+        if sample.get("started_unix_seconds", math.inf) >= started
         and sample.get("ended_unix_seconds", -math.inf) <= ended
     ]
     if not contained:
+        before = [
+            sample
+            for sample in same_process
+            if sample.get("ended_unix_seconds", math.inf) <= started
+        ]
+        after = [
+            sample
+            for sample in same_process
+            if sample.get("started_unix_seconds", -math.inf) >= ended
+        ]
         return {
             "available": False,
             "scope": scope,
@@ -361,6 +554,14 @@ def bounded_interval_samples(
             "first_sample_bytes": None,
             "observed_growth_from_first_sample_bytes": None,
             "unavailable_reason": unavailable_reason,
+            "bracketing_samples": {
+                "before": max(before, key=lambda sample: sample["ended_unix_seconds"])
+                if before
+                else None,
+                "after": min(after, key=lambda sample: sample["started_unix_seconds"])
+                if after
+                else None,
+            },
         }
     values = [sample["bytes"] for sample in contained]
     peak = max(values)
@@ -964,7 +1165,8 @@ def run(args: argparse.Namespace) -> int:
     started = time.monotonic()
     run_id = hashlib.sha256(os.urandom(32)).hexdigest()
     env["BONSAI_COMPARISON_RUN_ID"] = run_id
-    rss_samples: list[dict[str, Any]] = []
+    rss_interval = getattr(args, "rss_sample_interval", RSS_SAMPLE_INTERVAL_SECONDS)
+    collected_rss: list[dict[str, Any]] = []
     gpu_samples: list[dict[str, Any]] = []
     gpu_reasons: list[str] = []
     interrupted: str | None = None
@@ -992,57 +1194,23 @@ def run(args: argparse.Namespace) -> int:
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
                 start_new_session=os.name != "nt",
             )
-            next_progress = 0.0
-            progress_bytes = 0
             try:
-                while proc.poll() is None:
-                    elapsed = time.monotonic() - started
-                    if interrupted is not None or (
-                        diagnostic_timeout is not None and elapsed >= diagnostic_timeout
-                    ):
-                        timed_out = interrupted is None
-                        child_tree_cleanup = terminate_owned_child(proc)
-                        break
-                    rss_started = time.time()
-                    rss = rss_bytes(proc.pid)
-                    rss_ended = time.time()
-                    if rss is not None:
-                        sample = {
-                            "seconds": elapsed,
-                            "started_unix_seconds": rss_started,
-                            "ended_unix_seconds": rss_ended,
-                            "run_id": run_id,
-                            "process_id": proc.pid,
-                            "bytes": rss,
-                        }
-                        rss_samples.append(sample)
-                        if elapsed >= next_progress and not progress_rss_truncated:
-                            line = json.dumps(sample, sort_keys=True, separators=(",", ":")) + "\n"
-                            encoded = line.encode("utf-8")
-                            if progress_bytes + len(encoded) <= 2 * 1024 * 1024:
-                                progress_rss.write(line)
-                                progress_rss.flush()
-                                progress_bytes += len(encoded)
-                            else:
-                                progress_rss_truncated = True
-                            next_progress = elapsed + 5.0
-                    gpu_started = time.time()
-                    gpu, reason = nvidia_sample(proc.pid)
-                    gpu_ended = time.time()
-                    if gpu is not None:
-                        gpu_samples.append(
-                            {
-                                "seconds": elapsed,
-                                "started_unix_seconds": gpu_started,
-                                "ended_unix_seconds": gpu_ended,
-                                "run_id": run_id,
-                                "process_id": proc.pid,
-                                "bytes": gpu,
-                            }
-                        )
-                    elif reason:
-                        gpu_reasons.append(reason)
-                    time.sleep(args.sample_interval)
+                sampled = sample_owned_child(
+                    proc,
+                    run_id=run_id,
+                    started=started,
+                    rss_interval=rss_interval,
+                    gpu_interval=args.sample_interval,
+                    progress_rss=progress_rss,
+                    diagnostic_timeout=diagnostic_timeout,
+                    interrupted=lambda: interrupted,
+                )
+                collected_rss = sampled["rss_samples"]
+                gpu_samples = sampled["gpu_samples"]
+                gpu_reasons = sampled["gpu_reasons"]
+                timed_out = sampled["timed_out"]
+                child_tree_cleanup = sampled["child_tree_cleanup"]
+                progress_rss_truncated = sampled["progress_rss_truncated"]
             finally:
                 if proc.poll() is None:
                     child_tree_cleanup = terminate_owned_child(proc)
@@ -1056,6 +1224,12 @@ def run(args: argparse.Namespace) -> int:
         verify_snapshot(model, args.snapshot)
         after = snapshot_inventory(model, args.snapshot)
     provider = json.loads(provider_path.read_text(encoding="utf-8")) if provider_path.is_file() else None
+    # Every sample the per-case evidence and the run peak depend on, at the receipt's cadence.
+    rss_samples = retained_rss_samples(
+        collected_rss,
+        [case.get("measurement_interval", {}) for case in (provider or {}).get("cases", [])],
+        spacing=args.sample_interval,
+    )
     selected_process_id = proc.pid if proc is not None else None
     per_case_memory = (
         case_memory_evidence(
@@ -1138,6 +1312,8 @@ def run(args: argparse.Namespace) -> int:
             "process_id": selected_process_id,
             "rss_scope": "sampled_process_working_set_lower_bound",
             "sample_interval_seconds": args.sample_interval,
+            "rss_sample_interval_seconds": rss_interval,
+            "rss_samples_collected": len(collected_rss),
             "progress_rss_path": "progress-rss.jsonl",
             "progress_rss_truncated": progress_rss_truncated,
             "diagnostic_timeout_seconds": diagnostic_timeout,
@@ -2986,7 +3162,18 @@ def parser() -> argparse.ArgumentParser:
     run_p.add_argument("--cases", required=True)
     run_p.add_argument("--output", type=Path, required=True)
     run_p.add_argument("--manifest", type=Path, default=Path("release/real-weight-models.toml"))
-    run_p.add_argument("--sample-interval", type=float, default=0.1)
+    run_p.add_argument(
+        "--sample-interval",
+        type=float,
+        default=0.1,
+        help="nvidia-smi cadence and the spacing of the RSS samples a receipt retains",
+    )
+    run_p.add_argument(
+        "--rss-sample-interval",
+        type=rss_sample_interval,
+        default=RSS_SAMPLE_INTERVAL_SECONDS,
+        help="host RSS cadence (at most 0.05 s), independent of nvidia-smi",
+    )
     run_p.add_argument("--diagnostic-timeout-seconds", type=float)
     run_p.add_argument("--allow-dirty", action="store_true", help=argparse.SUPPRESS)
     run_p.add_argument("--candle-device", choices=("auto", "cpu"))

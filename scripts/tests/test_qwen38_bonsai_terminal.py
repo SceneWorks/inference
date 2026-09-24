@@ -1767,6 +1767,195 @@ Pages purgeable:                             1000.
             )
         self.assertFalse(state["admitted"])
 
+    def run_short_case_campaign(self, name: str) -> dict:
+        """Run the wrapper over a stand-in child whose one E7 case lasts 120 ms, while every
+        nvidia-smi query takes 1.2 s (a WDDM host), and return the sealed receipt."""
+        child = self.root / f"{name}-child.py"
+        child.write_text(
+            "import json, os, time\n"
+            "time.sleep(0.4)\n"
+            "started = time.time()\n"
+            "time.sleep(0.12)\n"
+            "ended = time.time()\n"
+            "time.sleep(1.0)\n"
+            "provider = {'status': 'completed', 'model_id': os.environ['BONSAI_COMPARISON_MODEL_ID'],\n"
+            "    'cases': [{'case_id': 'image', 'status': 'completed',\n"
+            "               'request_peak_claim_eligible': True,\n"
+            "               'measurement_interval': {\n"
+            "                   'run_id': os.environ['BONSAI_COMPARISON_RUN_ID'],\n"
+            "                   'process_id': os.getpid(), 'kind': 'selected_case',\n"
+            "                   'started_unix_seconds': started, 'ended_unix_seconds': ended}}]}\n"
+            "with open(os.environ['BONSAI_COMPARISON_OUTPUT'], 'x', encoding='utf-8') as out:\n"
+            "    json.dump(provider, out)\n",
+            encoding="utf-8",
+        )
+        preflight_path = self.root / f"{name}-preflight.json"
+        preflight_path.write_text('{"load_profile":"candle-dense-cpu"}', encoding="utf-8")
+        output = self.root / name
+        # The wrapper runs `<binary> <test-name> --exact ...`: the interpreter runs the stand-in.
+        args = terminal.parser().parse_args(
+            ["run", "--binary", sys.executable, "--test-name", str(child),
+             "--model-id", "parent", "--model-key", "parent", "--model-revision", "c" * 40,
+             "--snapshot", str(self.root), "--model-path", str(self.root / "weights.gguf"),
+             "--runtime-sha", self.runtime_sha, "--preflight", str(preflight_path),
+             "--cases", "image", "--output", str(output), "--candle-device", "cpu"]
+        )
+        gpu_queries: list[float] = []
+
+        def slow_nvidia_smi(_pid: int) -> tuple[None, str]:
+            gpu_queries.append(time.monotonic())
+            time.sleep(1.2)
+            return None, "per-process GPU memory unavailable (WDDM or unsupported driver)"
+
+        inventory = {"inventory_sha256": "e" * 64}
+        sizes = {"language_weight_bytes": 1, "vision_weight_bytes": 0, "projector_bytes": 0}
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(terminal, "source_identity", return_value={}))
+            stack.enter_context(mock.patch.object(terminal, "load_model", return_value={"revision": "c" * 40, "key": "parent"}))
+            stack.enter_context(mock.patch.object(terminal, "validate_variant_paths"))
+            stack.enter_context(mock.patch.object(terminal, "verify_snapshot"))
+            stack.enter_context(mock.patch.object(terminal, "snapshot_inventory", return_value=inventory))
+            stack.enter_context(mock.patch.object(terminal, "artifact_sizes", return_value=sizes))
+            stack.enter_context(mock.patch.object(terminal, "pinned_admission_sizes", return_value=sizes))
+            stack.enter_context(mock.patch.object(terminal, "validate_preflight_record"))
+            stack.enter_context(mock.patch.object(terminal, "selected_artifact", return_value={"path": "weights.gguf"}))
+            stack.enter_context(mock.patch.object(terminal, "nvidia_sample", side_effect=slow_nvidia_smi))
+            stack.enter_context(mock.patch.object(terminal, "physical_memory", return_value=(1, 1, None)))
+            terminal.run(args)
+        self.assertTrue(gpu_queries, "the stand-in nvidia-smi was never queried")
+        return json.loads((output / "receipt.json").read_text(encoding="utf-8"))
+
+    def test_short_case_gets_in_window_rss_despite_a_slow_nvidia_smi(self) -> None:
+        """sc-24164: release gate 2 failed "required E7 case image lacks bounded memory evidence"
+        because RSS and nvidia-smi shared one loop, so on Windows RSS was sampled well under 1 Hz and
+        the E7 image case (fast since sc-24128) finished between two samples. RSS now has its own
+        fast loop; however slow nvidia-smi is, a 120 ms case holds complete in-window samples."""
+        receipt = self.run_short_case_campaign("short-case")
+        process = receipt["process"]
+        self.assertEqual(process["exit_code"], 0)
+        self.assertEqual(
+            process["rss_sample_interval_seconds"], terminal.RSS_SAMPLE_INTERVAL_SECONDS
+        )
+        (image,) = receipt["case_memory"]
+        self.assertEqual(image["case_id"], "image")
+        rss = image["rss"]
+        self.assertTrue(
+            rss["available"], f"no complete RSS sample inside the 120 ms case: {rss}"
+        )
+        self.assertGreaterEqual(len(rss["samples"]), 1)
+        terminal.validate_sample_set(
+            rss,
+            image["measurement_interval"],
+            run_id=process["run_id"],
+            process_id=process["process_id"],
+            allowed_scopes={
+                "sampled_process_working_set_within_selected_request_lower_bound"
+            },
+            root=self.root,
+        )
+        # The slow query ran beside the RSS loop: it produced no GPU sample, only its reason.
+        self.assertFalse(receipt["gpu"]["available"])
+        self.assertIn("WDDM", receipt["gpu"]["unavailable_reason"])
+        # The fast stream is thinned for the receipt without dropping the evidence.
+        self.assertLessEqual(len(process["rss_samples"]), process["rss_samples_collected"])
+        self.assertEqual(
+            process["peak_rss_bytes"], max(sample["bytes"] for sample in process["rss_samples"])
+        )
+
+    def test_rss_sample_interval_is_bounded_to_the_fast_loop(self) -> None:
+        self.assertEqual(terminal.rss_sample_interval("0.02"), 0.02)
+        self.assertEqual(terminal.rss_sample_interval("0.05"), 0.05)
+        for value in ("0", "-0.01", "0.06", "1", "nan", "inf"):
+            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
+                terminal.rss_sample_interval(value)
+
+    def test_retained_rss_keeps_every_sample_the_evidence_depends_on(self) -> None:
+        def sample(index: int) -> dict:
+            started = 100.0 + index * 0.02
+            return {
+                "seconds": index * 0.02,
+                "started_unix_seconds": started,
+                "ended_unix_seconds": started + 0.001,
+                "run_id": "r",
+                "process_id": 7,
+                "bytes": 1_000 + (index * 7919) % 97,
+            }
+
+        samples = [sample(index) for index in range(5_000)]  # 100 s at 50 Hz
+        samples[1_234]["bytes"] = 10**9  # the run's peak
+        samples[2_001]["bytes"] = 10**6  # a peak inside the long case, off the thinning grid
+        short = {"started_unix_seconds": 150.0005, "ended_unix_seconds": 150.045}
+        long = {"started_unix_seconds": 130.0, "ended_unix_seconds": 145.0}
+        between = {"started_unix_seconds": 160.0015, "ended_unix_seconds": 160.019}
+        retained = terminal.retained_rss_samples(
+            samples, [short, long, between], spacing=0.1
+        )
+        self.assertLess(len(retained), len(samples) // 4)
+        self.assertEqual(
+            [s["started_unix_seconds"] for s in retained],
+            sorted(s["started_unix_seconds"] for s in retained),
+        )
+        self.assertEqual(max(s["bytes"] for s in retained), 10**9)
+
+        def evidence(stream: list, interval: dict) -> dict:
+            return terminal.bounded_interval_samples(
+                stream, interval, run_id="r", process_id=7, scope="s", unavailable_reason="none"
+            )
+
+        for interval in (short, long):
+            full, kept = evidence(samples, interval), evidence(retained, interval)
+            self.assertTrue(kept["available"])
+            for field in ("first_sample_bytes", "peak_bytes", "observed_growth_from_first_sample_bytes"):
+                self.assertEqual(kept[field], full[field], field)
+        self.assertEqual(evidence(retained, long)["peak_bytes"], 10**6)
+        # A window no sample fits in stays unavailable, with its bracketing samples kept.
+        full, kept = evidence(samples, between), evidence(retained, between)
+        self.assertFalse(kept["available"])
+        self.assertEqual(kept["bracketing_samples"], full["bracketing_samples"])
+        self.assertIsNotNone(kept["bracketing_samples"]["before"])
+        self.assertIsNotNone(kept["bracketing_samples"]["after"])
+
+    def test_unbracketed_e7_case_records_its_neighbours_and_still_fails_closed(self) -> None:
+        run = self.make_run("bracketed-e7-sample")
+        self.add_context_decline(run)
+        receipt_path = run / "receipt.json"
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        context = next(
+            row for row in receipt["case_memory"] if row["case_id"] == "context_64"
+        )
+        interval = context["measurement_interval"]
+        identity = {
+            "run_id": receipt["process"]["run_id"],
+            "process_id": receipt["process"]["process_id"],
+        }
+        before = {
+            **identity,
+            "started_unix_seconds": interval["started_unix_seconds"] - 0.5,
+            "ended_unix_seconds": interval["started_unix_seconds"] - 0.4,
+            "bytes": 11,
+        }
+        after = {
+            **identity,
+            "started_unix_seconds": interval["ended_unix_seconds"] + 0.4,
+            "ended_unix_seconds": interval["ended_unix_seconds"] + 0.5,
+            "bytes": 13,
+        }
+        context["rss"] = terminal.bounded_interval_samples(
+            [before, after],
+            interval,
+            scope="sampled_process_working_set_within_selected_request_lower_bound",
+            unavailable_reason="no complete RSS sample fell within the selected case interval",
+            **identity,
+        )
+        self.assertFalse(context["rss"]["available"])
+        self.assertEqual(context["rss"]["samples"], [])
+        self.assertEqual(context["rss"]["bracketing_samples"], {"before": before, "after": after})
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        self.reseal_run(run)
+        # Neighbouring samples are diagnostics, never in-window evidence: the gate fails closed.
+        with self.assertRaisesRegex(ValueError, "required E7 case"):
+            terminal.validate_receipt(run)
+
 
 if __name__ == "__main__":
     unittest.main()
