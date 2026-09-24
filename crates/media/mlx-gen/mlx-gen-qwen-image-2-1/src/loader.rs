@@ -13,6 +13,22 @@
 //!
 //! Weights load dense at their on-disk dtype (bf16 released; f32 for the tiny parity snapshot) and
 //! every geometry comes from the component's own `config.json`, so one code path serves both.
+//!
+//! # Every loader materializes at load (sc-24114) — do not remove as "unnecessary"
+//!
+//! Each loader calls `Weights::materialize_accessed` before returning. MLX runs a safetensors
+//! `Load` on its **CPU stream**; when a GPU kernel consumes a not-yet-read `Load`, `eval` encodes a
+//! GPU-timeline wait on that `pread` inside the Metal command buffer (`Event::wait(stream)` →
+//! `encodeWait`). Left lazy, the first forward *was* the load: a 14 GB DiT streamed from a slow
+//! (~300 MiB/s) volume held command buffers on the Metal timeline past the **GPU watchdog** —
+//! `kIOGPUCommandBufferCallbackErrorTimeout`, then `SubmissionsIgnored` for the rest of the process
+//! (the sc-24110/24111 real-weight smokes). Materializing here reads on the CPU stream with no GPU
+//! consumer waiting, and is also the sc-22414 GPU-view coherence seam every other provider's loader
+//! sits behind. It does not defeat staged residency: `Residency` calls these loaders at the start
+//! of the phase that needs the component (tower for the encode, DiT + VAE after the tower is
+//! dropped), so the staged peak stays `max(tower, DiT + VAE)`. `materialize_accessed` (not
+//! `materialize`) so the untied `lm_head` and, on the text-only route, `model.visual.*` are never
+//! read.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -124,6 +140,7 @@ pub fn load_text_encoder_from(
     let w = Weights::from_dir(dir)?;
     let encoder = QwenImage21TextEncoder::from_weights(&w, TEXT_ENCODER_PREFIX, &cfg)?;
     let Some(vision) = vision else {
+        w.materialize_accessed()?;
         return Ok(encoder);
     };
     // The ViT tower reads its own disjoint `model.visual.*` slice of the same shards. `mlx-llm`
@@ -145,6 +162,8 @@ pub fn load_text_encoder_from(
         vision.tower.clone(),
     )
     .map_err(|e| Error::Msg(format!("qwen_image_2_1: Qwen3-VL vision tower: {e}")))?;
+    // The `visual` slice was read through `get`, so it is in the accessed set too.
+    w.materialize_accessed()?;
     Ok(encoder.with_vision(tower, vision.clone()))
 }
 
@@ -160,7 +179,9 @@ pub fn load_transformer(root: &Path) -> Result<QwenImage21Transformer> {
     let dir = root.join("transformer");
     let cfg = TransformerConfig::from_json_file(&dir.join("config.json"))?;
     let w = Weights::from_dir(&dir)?;
-    QwenImage21Transformer::from_weights(&w, &cfg)
+    let transformer = QwenImage21Transformer::from_weights(&w, &cfg)?;
+    w.materialize_accessed()?;
+    Ok(transformer)
 }
 
 /// The RGBA VAE from `<root>/vae/`.
@@ -168,7 +189,9 @@ pub fn load_vae(root: &Path) -> Result<QwenImage21Vae> {
     let dir = root.join("vae");
     let cfg = VaeConfig::from_json_file(&dir.join("config.json"))?;
     let w = Weights::from_dir(&dir)?;
-    QwenImage21Vae::from_weights(&w, &cfg)
+    let vae = QwenImage21Vae::from_weights(&w, &cfg)?;
+    w.materialize_accessed()?;
+    Ok(vae)
 }
 
 /// `<root>/scheduler/scheduler_config.json`, or the frozen production values when the snapshot
@@ -179,5 +202,124 @@ pub fn load_scheduler_config(root: &Path) -> Result<SchedulerConfig> {
         SchedulerConfig::from_json_file(&path)
     } else {
         Ok(SchedulerConfig::production())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_rs::Array;
+
+    fn tiny_snapshot() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-snapshot")
+    }
+
+    fn truncate(path: &Path) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+            .set_len(0)
+            .unwrap();
+    }
+
+    fn byte_equal(a: &Array, b: &Array) -> bool {
+        a.shape() == b.shape()
+            && mlx_rs::ops::eq(a, b)
+                .and_then(|m| m.all(None))
+                .and_then(|m| m.try_item::<bool>())
+                .unwrap_or(false)
+    }
+
+    /// sc-24114: every loader consumes its snapshot bytes **at load**, not inside the first
+    /// forward. The pre-fix loaders handed out lazy `Load`s, so step 1 of a render was the read —
+    /// and each GPU kernel consuming an unread weight put a GPU-timeline wait on a `pread` inside
+    /// a Metal command buffer (`kIOGPUCommandBufferCallbackErrorTimeout` from a slow volume).
+    ///
+    /// Mechanical pin: load all three components from a private copy of the tiny snapshot, then
+    /// **truncate every shard to zero bytes**, then run a forward through each and compare it with
+    /// the same forward from an untouched load. If the reads were deferred, the forward reads an
+    /// empty file (an error, or different bytes); if they were consumed at load, the outputs are
+    /// identical.
+    ///
+    /// *Mutation that reds this:* dropping any of the three `w.materialize_accessed()` calls.
+    #[test]
+    fn loaders_consume_their_snapshot_bytes_at_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("snapshot");
+        mlx_gen::quant::copy_dir(&tiny_snapshot(), &root).unwrap();
+
+        let reference_root = tiny_snapshot();
+        let (ref_te, ref_dit, ref_vae) = (
+            load_text_encoder(&reference_root).unwrap(),
+            load_transformer(&reference_root).unwrap(),
+            load_vae(&reference_root).unwrap(),
+        );
+        let (te, dit, vae) = (
+            load_text_encoder(&root).unwrap(),
+            load_transformer(&root).unwrap(),
+            load_vae(&root).unwrap(),
+        );
+        for shard in [
+            "text_encoder/model.safetensors",
+            "transformer/diffusion_pytorch_model.safetensors",
+            "vae/diffusion_pytorch_model.safetensors",
+        ] {
+            truncate(&root.join(shard));
+        }
+
+        // Text encoder: four tokens through the tower.
+        let ids = Array::from_slice(&[5i32, 17, 29, 41], &[1, 4]);
+        let mask = Array::ones::<i32>(&[1, 4]).unwrap();
+        let want = ref_te.forward(&ids, &mask).unwrap();
+        let got = te
+            .forward(&ids, &mask)
+            .expect("text encoder forward after truncation");
+        mlx_rs::transforms::eval([&want, &got]).unwrap();
+        assert!(
+            byte_equal(&want, &got),
+            "text encoder output differs after truncation"
+        );
+
+        // DiT: a 2x2 latent grid conditioned on four text rows, at the fixture's geometry.
+        let cfg = dit.config();
+        let (h, w) = (2usize, 2usize);
+        let latents = Array::from_slice(
+            &(0..(h * w * cfg.in_channels))
+                .map(|i| (i as f32 * 0.11).sin())
+                .collect::<Vec<_>>(),
+            &[1, (h * w) as i32, cfg.in_channels as i32],
+        );
+        let text = Array::from_slice(
+            &(0..4 * cfg.context_in_dim)
+                .map(|i| (i as f32 * 0.07).cos())
+                .collect::<Vec<_>>(),
+            &[1, 4, cfg.context_in_dim as i32],
+        );
+        let want = ref_dit.forward(&latents, &text, 0.5, h, w).unwrap();
+        let got = dit
+            .forward(&latents, &text, 0.5, h, w)
+            .expect("transformer forward after truncation");
+        mlx_rs::transforms::eval([&want, &got]).unwrap();
+        assert!(
+            byte_equal(&want, &got),
+            "transformer output differs after truncation"
+        );
+
+        // VAE: decode one latent frame.
+        let z_dim = vae.config().z_dim as i32;
+        let z = Array::from_slice(
+            &(0..(z_dim * 4))
+                .map(|i| (i as f32 * 0.19).sin())
+                .collect::<Vec<_>>(),
+            &[1, z_dim, 2, 2],
+        );
+        let want = ref_vae.decode_rgba(&z).unwrap();
+        let got = vae.decode_rgba(&z).expect("vae decode after truncation");
+        mlx_rs::transforms::eval([&want, &got]).unwrap();
+        assert!(
+            byte_equal(&want, &got),
+            "vae output differs after truncation"
+        );
     }
 }

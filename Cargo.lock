@@ -850,6 +850,7 @@ dependencies = [
  "candle-gen",
  "candle-llm",
  "candle-nn",
+ "image",
  "rand",
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",

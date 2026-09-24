@@ -12,9 +12,10 @@
 //! de-normalized as `z·std + mean` with per-channel constants before `post_quant_conv`.
 
 use candle_gen::candle_core::{DType, Error as CandleError, IndexOp, Result, Tensor};
-use candle_gen::candle_nn::{Conv2d, Conv2dConfig, Module, VarBuilder};
+use candle_gen::candle_nn::{Conv2dConfig, Module, VarBuilder};
 use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
 use candle_gen::gen_core::{QWEN_WAN_Z16_MEAN as LATENTS_MEAN, QWEN_WAN_Z16_STD as LATENTS_STD};
+use candle_gen::BudgetedConv2d as Conv2d;
 use candle_gen::LatentDecoder;
 
 const NORM_EPS: f64 = 1e-12;
