@@ -51,8 +51,42 @@ pub fn dequantize_mxfp4(blocks: &Array, scales: &Array, dtype: Dtype) -> Result<
     }
 
     let dense = Array::from_slice(&out, &[e as i32, r as i32, in_c as i32]);
-    dense
-        .transpose_axes(&[0, 2, 1])?
-        .as_dtype(dtype)
-        .map_err(Error::from)
+    drop(out);
+    let result = dense.transpose_axes(&[0, 2, 1])?.as_dtype(dtype)?;
+    // Materialize this projection before the caller loads the next one. Otherwise the lazy
+    // bf16 cast retains its full f32 source across all 24 encoder layers (~71 GiB of staging
+    // for the production configuration), even after the source weight map is drained.
+    drop(dense);
+    result.eval()?;
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dequantized_bf16_does_not_retain_full_f32_staging_buffer() {
+        // A small stand-in for the 48 expert projections loaded by the dense encoder.
+        let blocks = Array::from_slice(&vec![0x22u8; 8 * 256 * 8 * 16], &[8, 256, 8, 16]);
+        let scales = Array::from_slice(&vec![127u8; 8 * 256 * 8], &[8, 256, 8]);
+        blocks.eval().unwrap();
+        scales.eval().unwrap();
+        let before = mlx_rs::memory::get_active_memory();
+        let outputs: Vec<_> = (0..8)
+            .map(|_| dequantize_mxfp4(&blocks, &scales, Dtype::Bfloat16).unwrap())
+            .collect();
+        let output = &outputs[0];
+        let retained = mlx_rs::memory::get_active_memory().saturating_sub(before);
+        let output_bytes: usize = outputs.iter().map(Array::nbytes).sum();
+        // A completed Metal submission can retain its last input until the command buffer is
+        // retired. Permit one f32 projection, but never one per resident bf16 projection.
+        assert!(
+            retained <= output_bytes + 2 * output.nbytes() + 64 * 1024,
+            "dequantization retained {retained} bytes for {output_bytes} bytes of bf16 outputs; f32 staging must not accumulate across projections"
+        );
+        let values = output.as_dtype(Dtype::Float32).unwrap();
+        assert_eq!(values.shape(), &[8, 256, 256]);
+        assert!(values.as_slice::<f32>().iter().all(|&v| v == 1.0));
+    }
 }
