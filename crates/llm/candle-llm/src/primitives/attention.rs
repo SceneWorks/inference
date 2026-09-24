@@ -405,13 +405,66 @@ pub fn sdpa_causal(queries: &Tensor, keys: &Tensor, values: &Tensor, scale: f32)
     sdpa(queries, keys, values, scale, None, AttnMask::Causal)
 }
 
+/// Whether `t` (`[.., rows, cols]`) can be read **in place** as the right-hand operand of a batched
+/// matmul on every backend this crate runs (sc-24164).
+///
+/// This is the intersection of Candle's CUDA (`gemm_config`) and Metal (`call_mlx_gemm`)
+/// operand rules, which the CPU `gemm` path also accepts: the matrix must be dense in one of the two
+/// BLAS orders — row-major (`OP_N`: unit column stride, row stride equal to `cols`) or column-major
+/// (`OP_T`: unit row stride, column stride equal to `rows`), a size-1 axis's stride being
+/// irrelevant — and at most two batch axes that collapse to one uniform batch stride. A static
+/// cache's narrowed K/V views (and their `Kᵀ`) pass; a `[b, s, h, d] -> [b, h, s, d]` transpose of
+/// a multi-token, multi-head projection does not (its row stride is `h · d`, not `d`), and the
+/// CUDA matmul rejects it with "matmul is only supported for contiguous tensors".
+fn gemm_rhs_readable(t: &Tensor) -> bool {
+    let (dims, stride) = (t.dims(), t.stride());
+    let rank = dims.len();
+    if rank < 2 {
+        return false;
+    }
+    let (rows, cols) = (dims[rank - 2], dims[rank - 1]);
+    let (row_stride, col_stride) = (stride[rank - 2], stride[rank - 1]);
+    let row_major = (col_stride == 1 || cols == 1) && (row_stride == cols || rows == 1);
+    let col_major = (row_stride == 1 || rows == 1) && (col_stride == rows || cols == 1);
+    let batch_collapses = match (&dims[..rank - 2], &stride[..rank - 2]) {
+        ([], []) | ([_], [_]) => true,
+        ([d0, d1], [s0, s1]) => *s0 == s1 * d1 || *d0 == 1 || *d1 == 1,
+        _ => false,
+    };
+    (row_major || col_major) && batch_collapses
+}
+
+/// `t` itself when the matmul can read it in place as a right-hand operand — `transposed`: its
+/// last-two-axes transpose, the score matmul's `Kᵀ` — otherwise one contiguous copy of `t`
+/// (sc-24164). Copying `t` rather than the transposed view keeps a copied `Kᵀ` in the layout a
+/// static cache's views hand the matmul (the same `OP_T` GEMM), so the copy changes no arithmetic.
+/// A copy is a KV materialization and is counted as one
+/// ([`note_kv_materialize`](crate::primitives::kv_cache::note_kv_materialize)).
+fn gemm_rhs_or_contiguous(t: &Tensor, transposed: bool) -> Result<Tensor> {
+    let readable = if transposed {
+        gemm_rhs_readable(&t.transpose(2, 3)?)
+    } else {
+        gemm_rhs_readable(t)
+    };
+    if readable {
+        return Ok(t.clone());
+    }
+    crate::primitives::kv_cache::note_kv_materialize();
+    Ok(t.contiguous()?)
+}
+
 /// Zero-copy grouped-query causal attention (see the module docs).
 ///
 /// `queries` is `[batch, heads, q_len, head_dim]`; `keys`/`values` are the **un-expanded**
-/// `[batch, kv_heads, k_len, head_dim]` (any strides the matmul can read — a static cache's
-/// narrowed views included), with `heads` a multiple of `kv_heads` and `k_len >= q_len`. Head `h`
-/// of the output attends KV head `h / groups`, the [`repeat_kv`] convention. Returns
-/// `[batch, heads, q_len, head_dim]`, contiguous.
+/// `[batch, kv_heads, k_len, head_dim]`, with `heads` a multiple of `kv_heads` and
+/// `k_len >= q_len`. Head `h` of the output attends KV head `h / groups`, the [`repeat_kv`]
+/// convention. Returns `[batch, heads, q_len, head_dim]`, contiguous.
+///
+/// Any strides are accepted (sc-24164). K/V the matmul can read in place — contiguous tensors and a
+/// static cache's narrowed views — are attended with no copy; anything else (for instance a
+/// head-transposed projection handed straight through a growing cache's first append) is copied
+/// contiguous once per call rather than failing the CUDA matmul. Each query tile is made
+/// contiguous before it is folded, so the query's layout never reaches the matmul either.
 ///
 /// Always the folded eager path, on every device. The fused `flash-attn` kernel is deliberately
 /// **not** tried here (unlike [`sdpa`]): it would receive un-expanded, narrowed K/V — a GQA + stride
@@ -459,8 +512,10 @@ pub fn sdpa_gqa_causal(
         )));
     }
     let chunk = EAGER_ATTN_QUERY_CHUNK_SIZE.min(indexable_query_rows);
-    // Keys transposed for the score matmul — a strided view, never materialized.
-    let keys_t = keys.transpose(2, 3)?;
+    // Keys transposed for the score matmul — a strided view, materialized only when the matmul
+    // cannot read it in place (never for a static cache's views or a contiguous tensor).
+    let keys_t = gemm_rhs_or_contiguous(keys, true)?.transpose(2, 3)?;
+    let values = gemm_rhs_or_contiguous(values, false)?;
     let mut chunks = Vec::with_capacity(q_len.div_ceil(chunk));
     for query_start in (0..q_len).step_by(chunk) {
         let query_len = chunk.min(q_len - query_start);
@@ -490,7 +545,7 @@ pub fn sdpa_gqa_causal(
         };
         let weights = softmax_last_dim(&scores)?;
         // [b, Hkv, groups * rows, d] -> [b, H, rows, d] (head h = kv * groups + g).
-        chunks.push(weights.matmul(values)?.reshape((b, h, query_len, d))?);
+        chunks.push(weights.matmul(&values)?.reshape((b, h, query_len, d))?);
     }
     if chunks.len() == 1 {
         Ok(chunks.pop().expect("one gqa attention output chunk"))
@@ -715,6 +770,64 @@ mod tests {
         // Mis-grouped heads and k_len < q_len are rejected.
         assert!(sdpa_gqa_causal(&varied4(1, 3, 1, 4, 0.0), &k, &k, 0.5).is_err());
         assert!(sdpa_gqa_causal(&varied4(1, 2, 8, 4, 0.0), &k, &k, 0.5).is_err());
+    }
+
+    /// sc-24164: K/V handed over as a bare `[b, s, hkv, d] -> [b, hkv, s, d]` transpose of a
+    /// multi-token, multi-KV-head projection (StarCoder2's pre-fix prefill through the growing
+    /// cache) are a layout the CUDA/Metal matmul cannot read, so the GQA path copies each once and
+    /// attends exactly the values the contiguous tensors give. Layouts the matmul can read — a
+    /// contiguous tensor, a static cache's narrowed views, a single-token decode step's transpose —
+    /// are still attended with no copy. (The CPU `gemm` reads any strides, so here the gate is the
+    /// layout classification and the copy count; the CUDA test proves the matmul itself.)
+    #[test]
+    fn gqa_causal_copies_only_kv_layouts_the_matmul_cannot_read() {
+        use crate::primitives::kv_cache::kv_materialize_count;
+        let (b, hkv, groups, d, s) = (1usize, 2usize, 3usize, 4usize, 6usize);
+        let h = hkv * groups;
+        let head_major = |t: Tensor| t.transpose(1, 2).unwrap();
+        let k = head_major(varied4(b, s, hkv, d, 1.7));
+        let v = head_major(varied4(b, s, hkv, d, 3.1));
+        assert!(!gemm_rhs_readable(&k.transpose(2, 3).unwrap()));
+        assert!(!gemm_rhs_readable(&v));
+        let q = head_major(varied4(b, s, h, d, 0.4));
+
+        let before = kv_materialize_count();
+        let got = sdpa_gqa_causal(&q, &k, &v, 0.5).unwrap();
+        assert_eq!(
+            kv_materialize_count() - before,
+            2,
+            "one contiguous copy each of K and V"
+        );
+        let dense = |t: &Tensor| t.contiguous().unwrap();
+        let want = sdpa_gqa_causal(&dense(&q), &dense(&k), &dense(&v), 0.5).unwrap();
+        assert_eq!(bits(&got), bits(&want));
+        let reference = sdpa_eager(
+            &q,
+            &repeat_kv(&k, groups).unwrap(),
+            &repeat_kv(&v, groups).unwrap(),
+            0.5,
+            None,
+            AttnMask::Causal,
+        )
+        .unwrap();
+        assert!(max_abs_diff(&got, &reference) <= 1e-6);
+
+        // Readable in place: contiguous K/V, a static cache's narrowed views of a larger buffer,
+        // and the one-token decode step's transpose (its sequence axis has size 1).
+        let buffer = varied4(b, hkv, 16, d, 1.7);
+        let one_token = head_major(varied4(b, 1, hkv, d, 1.7));
+        for kv in [buffer.clone(), buffer.narrow(2, 0, 9).unwrap(), one_token] {
+            assert!(gemm_rhs_readable(&kv.transpose(2, 3).unwrap()));
+            assert!(gemm_rhs_readable(&kv));
+            let before = kv_materialize_count();
+            let q = varied4(b, h, 1, d, 0.4);
+            sdpa_gqa_causal(&q, &kv, &kv, 0.5).unwrap();
+            assert_eq!(
+                kv_materialize_count(),
+                before,
+                "a readable layout is never copied"
+            );
+        }
     }
 
     #[test]
@@ -980,6 +1093,78 @@ mod tests {
                 "q={q_len} k={k_len}: gqa vs repeat_kv max|delta| = {diff}"
             );
         }
+    }
+
+    /// sc-24164 regression at the exact StarVector-8B prefill that failed on CUDA (release gate 2,
+    /// `runtime-2026.09.1-rc.1`): 36 query heads over 4 KV heads, head dim 128, a 578-token prefill
+    /// (576 image rows + the `<svg` prompt), with Q/K/V handed over as bare head transposes of their
+    /// `[b, s, heads, d]` projections — StarCoder2's pre-fix layout, which the growing cache passed
+    /// straight through on its first append. `Kᵀ` is then `[1, 4, 128, 578]` with strides
+    /// `[295936, 128, 1, 512]`, the layout the CUDA matmul rejected ("matmul is only supported for
+    /// contiguous tensors"). The GQA path must attend it — bit-identical to the same values made
+    /// contiguous, and within the half-precision tolerance of `repeat_kv` + eager `sdpa`.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gqa_causal_attends_head_transposed_kv_on_cuda() {
+        let device = crate::device::new_cuda_for_test().expect("cuda device");
+        let (b, h, hkv, d, s) = (1usize, 36usize, 4usize, 128usize, 578usize);
+        // A contiguous `[b, s, heads, d]` projection, transposed head-major without a copy.
+        let projected = |heads: usize, phase: f64| {
+            let n = (b * s * heads * d) as f32;
+            Tensor::arange(0f32, n, &device)
+                .unwrap()
+                .reshape((b, s, heads, d))
+                .unwrap()
+                .affine(0.0137, phase)
+                .unwrap()
+                .cos()
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+                .transpose(1, 2)
+                .unwrap()
+        };
+        let (q, k, v) = (projected(h, 0.4), projected(hkv, 1.7), projected(hkv, 3.1));
+        assert_eq!(k.transpose(2, 3).unwrap().stride(), &[295_936, 128, 1, 512]);
+        assert!(!gemm_rhs_readable(&k.transpose(2, 3).unwrap()) && !gemm_rhs_readable(&v));
+        let scale = (d as f32).powf(-0.5);
+        let got = sdpa_gqa_causal(&q, &k, &v, scale)
+            .expect("head-transposed K/V must attend on CUDA, not fail the matmul");
+        assert_eq!(got.dims(), &[b, h, s, d]);
+        let dense = |t: &Tensor| t.contiguous().unwrap();
+        let want = sdpa_gqa_causal(&dense(&q), &dense(&k), &dense(&v), scale).unwrap();
+        let to_bits = |t: &Tensor| -> Vec<u16> {
+            t.flatten_all()
+                .unwrap()
+                .to_vec1::<half::bf16>()
+                .unwrap()
+                .into_iter()
+                .map(half::bf16::to_bits)
+                .collect()
+        };
+        assert!(
+            to_bits(&got) == to_bits(&want),
+            "the copy must not change the arithmetic"
+        );
+        let groups = h / hkv;
+        let reference = sdpa_eager(
+            &q,
+            &repeat_kv(&k, groups).unwrap(),
+            &repeat_kv(&v, groups).unwrap(),
+            scale,
+            None,
+            AttnMask::Causal,
+        )
+        .unwrap();
+        let diff = (got.to_dtype(DType::F32).unwrap() - reference.to_dtype(DType::F32).unwrap())
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(diff < 3e-2, "gqa vs repeat_kv max|delta| = {diff}");
     }
 
     /// **sc-24132 formulation survey (evidence, not a gate).** On CUDA bf16 at the Qwen3.8-27B
