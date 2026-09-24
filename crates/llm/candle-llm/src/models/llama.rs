@@ -122,10 +122,10 @@ pub struct CausalLm {
     embed_tokens: Tensor,
     layers: Vec<LlamaLayer>,
     norm: Tensor,
-    /// The LM head: dense, or NVFP4 under an NVFP4 load (sc-24140).
-    lm_head: Projection,
-    /// The device the head's weight lives on (the last shard's, or the embedding's when tied).
-    lm_head_device: Device,
+    /// The LM head (dense, or NVFP4 under an NVFP4 load — sc-24140) and the device its weight
+    /// lives on. Boxed: a projection plus a CUDA device handle would otherwise grow the provider's
+    /// decoder enum past its other variant.
+    lm_head: Box<LmHead>,
     /// The RoPE every layer uses on a uniform model — and Gemma 4's `sliding_attention` schedule.
     rope: Rope,
     /// Gemma 4's `full_attention` RoPE (`proportional`, its own theta and head dim); `None` for
@@ -161,6 +161,13 @@ pub struct CausalLm {
     /// Which KV cache [`StepModel::new_cache_for`] builds: [`KvCacheKind::Static`] (the default) or
     /// [`KvCacheKind::Growing`] (the reference concat, through the same seam).
     step_kv_cache: KvCacheKind,
+}
+
+/// The LM head and the device its weight lives on (the last shard's, or the embedding's when
+/// tied).
+struct LmHead {
+    projection: Projection,
+    device: Device,
 }
 
 impl CausalLm {
@@ -310,8 +317,10 @@ impl CausalLm {
             };
             req(head_key)?
         };
-        let lm_head_device = head_weight.device().clone();
-        let lm_head = Projection::load_eligible(head_weight, None, nvfp4)?;
+        let lm_head = Box::new(LmHead {
+            device: head_weight.device().clone(),
+            projection: Projection::load_eligible(head_weight, None, nvfp4)?,
+        });
 
         let qk_norm = cfg.has_qk_norm();
         let num_heads = cfg.num_heads as usize;
@@ -589,7 +598,6 @@ impl CausalLm {
             layers,
             norm,
             lm_head,
-            lm_head_device,
             rope,
             rope_full,
             dtype,
@@ -655,11 +663,11 @@ impl CausalLm {
     pub fn weight_census(&self) -> WeightCensus {
         let mut census = WeightCensus::default();
         let head_is_embedding =
-            self.cfg.tie_word_embeddings && matches!(self.lm_head, Projection::Dense(_));
+            self.cfg.tie_word_embeddings && matches!(self.lm_head.projection, Projection::Dense(_));
         if !head_is_embedding {
             census.record_tensor(&self.embed_tokens);
         }
-        census.projections.record(&self.lm_head);
+        census.projections.record(&self.lm_head.projection);
         census.record_tensor(&self.norm);
         for layer in &self.layers {
             layer.record(&mut census);
@@ -1381,8 +1389,8 @@ impl CausalLm {
         let normed = rms_norm(h, &self.norm, self.cfg.rms_norm_eps as f64)?;
         // When sharded, the final norm sits on the last shard but the LM head may live elsewhere
         // (tied embeddings stay on the first shard); move the small hidden state to the head's device.
-        let normed = normed.to_device(&self.lm_head_device)?;
-        let logits = self.lm_head.forward(&normed)?;
+        let normed = normed.to_device(&self.lm_head.device)?;
+        let logits = self.lm_head.projection.forward(&normed)?;
         // Gemma-2 soft-caps the final logits.
         match self.final_softcap {
             Some(c) => Ok(soft_cap(&logits, c)?),
@@ -2691,7 +2699,7 @@ mod tests {
         let dense = CausalLm::from_weights_format(&w, "", cfg.clone(), None).unwrap();
         let nvfp4 = CausalLm::from_weights_format(&w, "", cfg.clone(), Some(&format)).unwrap();
         assert!(nvfp4.is_quantized());
-        assert_eq!(nvfp4.lm_head.kind(), ProjectionKind::Nvfp4);
+        assert_eq!(nvfp4.lm_head.projection.kind(), ProjectionKind::Nvfp4);
         let census = nvfp4.weight_census();
         assert_eq!(census.projections.nvfp4.count, 7 * layers + 1);
         assert_eq!(census.projections.dense.count, 0);
@@ -2745,7 +2753,7 @@ mod tests {
         // A 40-row head cannot be served by the FP4 GEMM: it stays dense and says so.
         let (w, cfg) = tiny_qwen3(40, false, &device);
         let odd = CausalLm::from_weights_format(&w, "", cfg.clone(), Some(&format)).unwrap();
-        assert_eq!(odd.lm_head.kind(), ProjectionKind::Dense);
+        assert_eq!(odd.lm_head.projection.kind(), ProjectionKind::Dense);
         let census = odd.weight_census();
         assert_eq!(census.projections.nvfp4.count, 7 * layers);
         assert_eq!(census.projections.dense.count, 1);
