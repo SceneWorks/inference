@@ -864,7 +864,7 @@ mod static_tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn cuda_device_pointers_are_stable_across_100_steps_and_rollback() {
-        let device = Device::new_cuda(0).expect("cuda device");
+        let device = crate::device::new_cuda_for_test().expect("cuda device");
         let mk = |phase: f32| step(1, 2, 1, 8, phase).to_device(&device).unwrap();
         let mut cache = StaticKvCache::new(2, 1, 2, 8, 128, DType::F32, &device).unwrap();
         let addresses: Vec<(usize, usize)> = (0..2)

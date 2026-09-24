@@ -112,6 +112,10 @@ pub fn select_device() -> Result<Device> {
     // The stream (story sc-24134): the legacy NULL stream unless the CUDA-graph runner — which
     // records a decode step with stream capture, unsupported on the legacy stream — is on at
     // this point, or `CANDLE_LLM_CUDA_STREAM=own` asks for it (`CudaStreamKind::resolve`).
+    // A unit test that opens a CUDA device runs behind the CUDA test lock until it ends
+    // (sc-24140 feature-end review; `crate::decode::graph::hold_cuda_test_lock`).
+    #[cfg(all(test, feature = "cuda"))]
+    crate::decode::graph::hold_cuda_test_lock();
     #[cfg(feature = "cuda")]
     let dev = cuda_device(CudaStreamKind::from_env()?)?;
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
@@ -145,6 +149,17 @@ fn cuda_device(kind: CudaStreamKind) -> Result<Device> {
         }
         CudaStreamKind::Legacy => Device::new_cuda(0)?,
     })
+}
+
+/// Unit-test seam (sc-24140 feature-end review): `Device::new_cuda(0)` — a device on the legacy
+/// NULL stream — taken behind the CUDA test lock
+/// ([`hold_cuda_test_lock`](crate::decode::graph::hold_cuda_test_lock)) for the rest of the
+/// calling test, so its launches never overlap another test's stream capture. Every unit test
+/// opens a CUDA device through this or [`select_device`], never `Device::new_cuda` directly.
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) fn new_cuda_for_test() -> Result<Device> {
+    crate::decode::graph::hold_cuda_test_lock();
+    Ok(Device::new_cuda(0)?)
 }
 
 /// The dense compute dtype for a device: `bf16` on the GPU backends (CUDA / Metal — matching the
@@ -211,6 +226,53 @@ mod tests {
         }
         assert_eq!(second, first, "the cached value, not a re-read");
     }
+
+    /// sc-24140 feature-end review: a unit test opens a CUDA device only through `select_device`
+    /// or `new_cuda_for_test`, both behind the CUDA test lock. A direct `Device::new_cuda` (or
+    /// `new_cuda_with_stream`) anywhere else in `src/` could launch on the legacy stream while
+    /// another test captures a graph — the `capture_invalidated` flake. The only direct calls are
+    /// `cuda_device`'s two and the test helper's one.
+    #[test]
+    fn cuda_devices_are_opened_only_behind_the_cuda_test_lock() {
+        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&src, &mut files);
+        // Split so this test's own source is not a match.
+        let needles = [
+            ["Device::new_", "cuda("].concat(),
+            ["new_cuda_", "with_stream("].concat(),
+        ];
+        let mut direct = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let name = file
+                .strip_prefix(&src)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            for (number, line) in text.lines().enumerate() {
+                let code = line.trim_start();
+                if !code.starts_with("//") && needles.iter().any(|n| code.contains(n.as_str())) {
+                    direct.push(format!("{name}:{}", number + 1));
+                }
+            }
+        }
+        assert_eq!(direct.len(), 3, "{direct:?}");
+        assert!(
+            direct.iter().all(|site| site.starts_with("device.rs:")),
+            "open CUDA devices in tests through `new_cuda_for_test` or `select_device`: {direct:?}"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "cuda"))]
@@ -256,5 +318,48 @@ mod cuda_tests {
             Some(expected_on),
             "graphs on: the own stream, tracking off"
         );
+    }
+
+    /// sc-24140 feature-end review: a test thread that opens a CUDA device — through
+    /// `select_device` or `new_cuda_for_test` — holds the CUDA test lock (the graph guard's) until
+    /// it exits, so no other test's capture can overlap its legacy-stream launches; the lock is
+    /// released when the thread ends. Every wait is bounded.
+    #[test]
+    fn opening_a_cuda_device_holds_the_cuda_test_lock_until_the_thread_ends() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let openers: [(&str, fn() -> Result<Device>); 2] = [
+            ("select_device", select_device),
+            ("new_cuda_for_test", new_cuda_for_test),
+        ];
+        for (name, open) in openers {
+            let (opened_tx, opened) = channel();
+            let (finish_tx, finish) = channel::<()>();
+            let holder = std::thread::spawn(move || {
+                opened_tx.send(open().is_ok_and(|d| d.is_cuda())).unwrap();
+                finish.recv().unwrap();
+            });
+            if !opened.recv_timeout(Duration::from_secs(600)).unwrap() {
+                eprintln!("skipping: no CUDA device");
+                finish_tx.send(()).unwrap();
+                holder.join().unwrap();
+                return;
+            }
+            let (guarded_tx, guarded) = channel();
+            let waiter = std::thread::spawn(move || {
+                let _guard = cuda_graphs_policy_guard(None);
+                guarded_tx.send(()).unwrap();
+            });
+            assert!(
+                guarded.recv_timeout(Duration::from_millis(500)).is_err(),
+                "{name}: a capture guard must wait while a test thread holds a CUDA device"
+            );
+            finish_tx.send(()).unwrap();
+            holder.join().unwrap();
+            guarded
+                .recv_timeout(Duration::from_secs(600))
+                .unwrap_or_else(|_| panic!("{name}: the lock is released when the thread ends"));
+            waiter.join().unwrap();
+        }
     }
 }

@@ -1434,7 +1434,8 @@ mod tests {
             }
         }
 
-        let device = Device::new_cuda(0).expect("CUDA is required for the Prism NVRTC fixture");
+        let device = crate::device::new_cuda_for_test()
+            .expect("CUDA is required for the Prism NVRTC fixture");
         let rows = 4usize;
         let width = 128usize;
         let signs = (0..width)

@@ -152,15 +152,16 @@ fn decode_generated_svg_token(
 }
 
 /// The load's quantization refusal: StarVector-8B loads its checkpoint's own encoding only. NVFP4 is
-/// refused by name — it is served for the qwen3_5 family only (sc-24135) — and
+/// refused by name — it is not served for StarVector-8B (the Llama provider serves it for the
+/// qwen3_5 hybrid and the llama family, sc-24135 / sc-24140) — and
 /// [`crate::backend::nvfp4_support`] answers a product's per-snapshot NVFP4 question with this same
 /// gate (sc-24139).
 pub(crate) fn quantize_gate(spec: &LoadSpec) -> CoreResult<()> {
     match spec.quantize {
         None => Ok(()),
         Some(core_llm::Quantize::Nvfp4) => Err(CoreError::Unsupported(
-            "nvfp4: NVFP4 projections are served for the qwen3_5 family only, not StarVector-8B \
-             (it does not support load-time quantization)"
+            "nvfp4: NVFP4 projections are not served for StarVector-8B (it does not support \
+             load-time quantization)"
                 .into(),
         )),
         Some(_) => Err(CoreError::Unsupported(

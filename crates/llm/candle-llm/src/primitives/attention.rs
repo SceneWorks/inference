@@ -921,7 +921,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn gqa_causal_matches_repeat_kv_sdpa_on_cuda_bf16_27b_shape() {
-        let device = Device::new_cuda(0).expect("cuda device");
+        let device = crate::device::new_cuda_for_test().expect("cuda device");
         let (b, h, hkv, d, cap) = (1usize, 24usize, 4usize, 256usize, 400usize);
         let groups = h / hkv;
         let mk = |b, heads, s, d, phase: f64| {
@@ -998,7 +998,7 @@ mod tests {
     #[test]
     #[ignore = "sc-24132 formulation survey; needs CUDA"]
     fn gqa_variants_bit_match_survey() {
-        let device = Device::new_cuda(0).expect("cuda device");
+        let device = crate::device::new_cuda_for_test().expect("cuda device");
         let (b, h, hkv, d, cap) = (1usize, 24usize, 4usize, 256usize, 1024usize);
         let groups = h / hkv;
         let mk = |b, heads, s, d, phase: f64| {
@@ -1105,7 +1105,7 @@ mod tests {
     #[ignore = "requires CUDA; exact Qwen3-VL context_512 attention-shape regression"]
     fn cuda_qwen3vl_context_512_shape_uses_bounded_eager_attention() {
         eprintln!("stage=device");
-        let device = Device::new_cuda(0).expect("cuda device");
+        let device = crate::device::new_cuda_for_test().expect("cuda device");
         let (b, h, s, d) = (1usize, 32usize, 9_247usize, 128usize);
         assert!(b * h * s * s > i32::MAX as usize);
         assert!(b * h * EAGER_ATTN_QUERY_CHUNK_SIZE * s < i32::MAX as usize);
@@ -1132,7 +1132,7 @@ mod tests {
     #[cfg(feature = "flash-attn")]
     #[test]
     fn flash_attn_matches_eager_on_cuda() {
-        let device = Device::new_cuda(0).expect("cuda device");
+        let device = crate::device::new_cuda_for_test().expect("cuda device");
         // Bounded, varied bf16 q/k/v (cos keeps values in [-1, 1] so the softmax doesn't saturate).
         let mk = |b, h, s, d, phase: f64| {
             let n = (b * h * s * d) as f32;
@@ -1196,7 +1196,7 @@ mod tests {
     #[cfg(feature = "flash-attn")]
     #[test]
     fn flash_attn_varlen_matches_eager_per_seq_on_cuda() {
-        let device = Device::new_cuda(0).expect("cuda device");
+        let device = crate::device::new_cuda_for_test().expect("cuda device");
         let (h, kvh, d) = (4usize, 2usize, 64usize); // GQA: groups = 2
         let groups = h / kvh;
         let scale = (d as f32).powf(-0.5);
@@ -1311,7 +1311,7 @@ mod tests {
         use crate::primitives::{BlockPool, PagedKvCache};
         use std::time::Instant;
 
-        let device = Device::new_cuda(0).expect("cuda device");
+        let device = crate::device::new_cuda_for_test().expect("cuda device");
         let block_size = 16usize;
         let iters = 30usize;
         let warmup = 8usize;

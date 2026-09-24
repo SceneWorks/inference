@@ -16,27 +16,38 @@ Subcommands:
   campaign         run (or collect already-sealed runs of) the AT2 matrix — models x weight
                    formats x speculative modes x CUDA graphs — and seal an index with one table
                    per model plus the baseline rows (sc-24140)
-  campaign-verify  re-check a sealed campaign index against its seal and every run's seal
+  campaign-verify  re-check a sealed campaign index against its seal and every run's seal, report
+                   its missing cells, and fail on any unless the index was sealed `--allow-partial`
   baseline-source  rewrite `decode_bench.rs` so it compiles against the pre-epic baseline
 
-A **head** run requires a clean checkout at `--runtime-sha`. A **baseline** run
-(`--baseline-of <head decode_bench.rs>`) requires the checkout's only change to be the untracked
-`crates/llm/candle-llm/tests/decode_bench.rs`, byte-for-byte the `baseline-source` rewrite of the
-named head file; both files' sha256 are recorded in `run.json`.
+A **head** run requires a clean checkout at `--runtime-sha` **and** a binary built from it: built
+with `CANDLE_LLM_BUILD_PROVENANCE=1`, the binary embeds the commit and whether the tree was dirty,
+and the run is refused unless that is `--runtime-sha` on a clean tree (sc-24140 feature-end
+review). A **baseline** run (`--baseline-of <head decode_bench.rs>`) requires the checkout's only
+change to be the untracked `crates/llm/candle-llm/tests/decode_bench.rs`, byte-for-byte the
+`baseline-source` rewrite of the named head file; both files' sha256 are recorded in `run.json`.
+Its binary embeds no provenance (the pre-epic commit has no build script). Every run's document
+records the device the binary probed, and `--label` (`<GPU> / sm_<NN>`) is a claim that device
+must meet: CUDA, the named GPU, that compute capability.
 
 **Weight format is a row dimension** (sc-24140): a table may merge runs of different formats
 (`bf16`, `q8`, `q4`, `nvfp4`). Every row is compared with the *baseline of its own format* — the
-first `baseline` run of that format, or the table's first run when it has that format — and a
-non-bf16 row with no same-format baseline (the pre-epic S1 baseline is bf16 only) is compared with
-the **head's own bf16 reference row** (a bf16 run of the same source commit), labelled as such.
+first `baseline` run of that format; without one, the table's first run when it has that format,
+labelled `vs <run> ref, no S1 baseline` — and a non-bf16 row with no same-format baseline (the
+pre-epic S1 baseline is bf16 only) is compared with the **head's own bf16 reference row** (a bf16
+run of the same source commit), labelled as such. Runs merge only when they share the model, the
+prompt (its token ids' sha256) and the sampling seed. A campaign needs a bf16 S1 baseline per
+model, or lists it as missing.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -116,6 +127,9 @@ COMPARABLE_FIELDS = (
     ("suite", "prompt_tokens"),
     ("suite", "new_tokens"),
 )
+# The label's claim the probed device must meet (sc-24140 feature-end review): `<GPU> / sm_<NN>`.
+LABEL_PATTERN = re.compile(r"^(?P<gpu>\S.*?) / sm_(?P<sm>\d{2,3})$")
+PROVENANCE_SWITCH = "CANDLE_LLM_BUILD_PROVENANCE"
 
 
 def sha256_file(path: Path) -> str:
@@ -271,6 +285,28 @@ def divergence(reference: list[int], other: list[int]) -> int | None:
     return None
 
 
+def prompt_sha256(suite: dict[str, Any]) -> str | None:
+    """The sha256 of the exact prompt token ids the binary decoded from (sc-24140 feature-end
+    review), `None` for a document that predates `prompt_token_ids`."""
+    ids = suite.get("prompt_token_ids")
+    if ids is None:
+        return None
+    return hashlib.sha256(json.dumps(ids, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def sampling_seed(suite: dict[str, Any]) -> Any:
+    """The stochastic rows' seed the run was configured with (`None` before sc-24140)."""
+    return (suite.get("sampling") or {}).get("seed")
+
+
+# Derived comparison keys (sc-24140 feature-end review): two runs over different prompts of the
+# same length, or sampled under different seeds, are not the same measurement.
+DERIVED_COMPARABLE = (
+    ("suite.prompt_sha256", lambda run: prompt_sha256(run.get("suite", {}))),
+    ("suite.sampling.seed", lambda run: sampling_seed(run.get("suite", {}))),
+)
+
+
 def check_comparable(runs: list[dict[str, Any]]) -> None:
     labels = {run["label"] for run in runs}
     if len(labels) != 1:
@@ -279,6 +315,10 @@ def check_comparable(runs: list[dict[str, Any]]) -> None:
         values = {json.dumps(run.get(section, {}).get(field)) for run in runs}
         if len(values) != 1:
             raise ValueError(f"runs differ in {section}.{field}: {sorted(values)}")
+    for name, key in DERIVED_COMPARABLE:
+        values = {json.dumps(key(run)) for run in runs}
+        if len(values) != 1:
+            raise ValueError(f"runs differ in {name}: {sorted(values)}")
 
 
 def run_format(run: dict[str, Any]) -> str:
@@ -316,18 +356,21 @@ def comparison_basis(
     runs: list[dict[str, Any]], run: dict[str, Any], kind: str
 ) -> tuple[str, list[int]] | None:
     """What a row of `run` is compared with in `match baseline ref` (sc-24140): `(label, tokens)`
-    — an empty label for the baseline of the row's own format (the first `baseline` run of that
-    format, else the table's first run when it has that format), else, for a non-bf16 row, the
-    head's own bf16 reference row (a bf16 run built from the same source commit), labelled.
-    `None` when neither exists."""
+    — an empty label only for a **baseline** run of the row's own format (the first `baseline`
+    run of that format); else the table's first run when it has that format, labelled
+    `vs <run> ref, no S1 baseline` (sc-24140 feature-end review: a head compared with a head is
+    not the S1 comparison); else, for a non-bf16 row, the head's own bf16 reference row (a bf16
+    run built from the same source commit), labelled. `None` when none exists."""
     fmt = run_format(run)
     candidates = [r for r in runs if r.get("run_kind") == "baseline" and run_format(r) == fmt]
-    if run_format(runs[0]) == fmt:
+    if run_format(runs[0]) == fmt and runs[0] not in candidates:
         candidates.append(runs[0])
     for candidate in candidates:
         tokens = basis_tokens(candidate, kind)
         if tokens is not None:
-            return "", tokens
+            if candidate.get("run_kind") == "baseline":
+                return "", tokens
+            return f"vs {candidate['run_name']} ref, no S1 baseline", tokens
     if fmt != "bf16":
         for candidate in runs:
             if run_format(candidate) == "bf16" and same_source(candidate, run):
@@ -340,7 +383,7 @@ def comparison_basis(
 def baseline_match_text(runs: list[dict[str, Any]], run: dict[str, Any], row: dict[str, Any]) -> str:
     basis = comparison_basis(runs, run, row_kind(row))
     if basis is None:
-        return "n/a (no bf16 ref)" if run_format(run) != "bf16" else "n/a"
+        return "n/a (no bf16 ref)" if run_format(run) != "bf16" else "n/a (no S1 baseline)"
     label, tokens = basis
     cross = divergence(tokens, row.get("tokens", []))
     text = "yes" if cross is None else f"no @{cross}"
@@ -425,10 +468,11 @@ def render_table(runs: list[dict[str, Any]]) -> str:
     lines.append(
         f"format = the run's projection weight format; graphs = the CUDA-graph switch the binary "
         f"ran under (n/a where it predates the runner); match baseline ref = tokens identical to "
-        f"the baseline reference row of the row's own format (`{runs[0]['run_name']}`'s when it "
-        "has that format; a sampled row against the baseline's `sampled` row) — a non-bf16 row "
-        "with no same-format baseline is compared with its head's own bf16 reference row, labelled "
-        "`vs <run> bf16 ref`; "
+        "the reference row of a `baseline` run of the row's own format (a sampled row against the "
+        "baseline's `sampled` row); with no such baseline the row is compared with the table's "
+        f"first run (`{runs[0]['run_name']}`) when it has that format, labelled `vs <run> ref, no "
+        "S1 baseline`, and a non-bf16 row otherwise with its head's own bf16 reference row, "
+        "labelled `vs <run> bf16 ref`; "
         "device used @ last token = cuMemGetInfo total-free sampled at the row's last generated "
         "token while its cache is alive (device-wide, weights included); cache live / checkpoints "
         "= the StepModel row's final cache's own accounting (rollback checkpoints separately); "
@@ -464,6 +508,15 @@ def validate_suite_document(doc: dict[str, Any]) -> None:
     rows = doc.get("rows")
     if not isinstance(rows, list) or not rows:
         raise ValueError("decode_bench document holds no rows")
+    if doc.get("device") not in ("cuda", "cpu"):
+        raise ValueError(f"binary recorded device {doc.get('device')!r}, expected `cuda` or `cpu`")
+    ids = doc.get("prompt_token_ids")
+    if not isinstance(ids, list) or not all(isinstance(i, int) for i in ids):
+        raise ValueError("binary recorded no prompt_token_ids")
+    if len(ids) != doc.get("prompt_tokens"):
+        raise ValueError(
+            f"binary recorded {len(ids)} prompt_token_ids for {doc.get('prompt_tokens')} prompt tokens"
+        )
     for row in rows:
         if row.get("generated_tokens") != doc.get("new_tokens"):
             raise ValueError(
@@ -483,6 +536,56 @@ def validate_suite_document(doc: dict[str, Any]) -> None:
                     f"{row.get('path')} row reports no rollback-checkpoint bytes for a "
                     "multi-token run"
                 )
+
+
+def check_probed_hardware(doc: dict[str, Any], label: str) -> None:
+    """The hardware label is a claim the probed device must meet (sc-24140 feature-end review):
+    it has the form `<GPU> / sm_<NN>`, and the binary ran on a CUDA device whose driver name
+    contains `<GPU>` (case-insensitively) and whose compute capability is `N.N` — `RTX Pro 6000 /
+    sm_120` needs an RTX PRO 6000 at 12.0."""
+    match = LABEL_PATTERN.match(label)
+    if match is None:
+        raise ValueError(
+            f"hardware label {label!r} is not `<GPU> / sm_<NN>`, so it cannot be checked against "
+            "the probed device"
+        )
+    if doc.get("device") != "cuda":
+        raise ValueError(f"label {label!r} claims a CUDA device; the binary ran on {doc.get('device')!r}")
+    sm = match["sm"]
+    capability = f"{sm[:-1]}.{sm[-1]}"
+    if doc.get("compute_capability") != capability:
+        raise ValueError(
+            f"label {label!r} claims compute capability {capability}; the probed device has "
+            f"{doc.get('compute_capability')!r}"
+        )
+    name = doc.get("device_name") or ""
+    if match["gpu"].strip().lower() not in name.lower():
+        raise ValueError(f"label {label!r} names {match['gpu']!r}; the probed device is {name!r}")
+
+
+def check_build_provenance(doc: dict[str, Any], runtime_sha: str, run_kind: str) -> None:
+    """Tie the binary to the source it was measured as (sc-24140 feature-end review): a head run's
+    binary must embed the runtime SHA and a clean tree (built with `CANDLE_LLM_BUILD_PROVENANCE=1`).
+    A baseline binary embeds nothing — its pre-epic commit has no build script — but one that does
+    must name the runtime SHA too."""
+    build = doc.get("build") or {}
+    sha = build.get("git_sha")
+    if run_kind == "baseline":
+        if sha is not None and sha != runtime_sha:
+            raise ValueError(f"baseline binary was built from {sha}, not the runtime SHA {runtime_sha}")
+        return
+    if sha is None:
+        raise ValueError(
+            f"the binary embeds no build provenance; build it with {PROVENANCE_SWITCH}=1 so it names "
+            "the commit it was built from"
+        )
+    if sha != runtime_sha:
+        raise ValueError(f"the binary was built from {sha}, not the runtime SHA {runtime_sha}")
+    if build.get("git_dirty") is not False:
+        raise ValueError(
+            f"the binary was built from a dirty tree (git_dirty={build.get('git_dirty')!r}); a head "
+            "run measures a clean build"
+        )
 
 
 def check_requested_dimensions(doc: dict[str, Any], weight_format: str, cuda_graphs: str | None) -> None:
@@ -574,6 +677,8 @@ def run(args: argparse.Namespace) -> int:
     check_requested_dimensions(doc, args.format, cuda_graphs)
     if doc.get("label") != args.label:
         raise ValueError("binary recorded a different hardware label than requested")
+    check_probed_hardware(doc, args.label)
+    check_build_provenance(doc, runtime_sha, "baseline" if baseline else "head")
 
     def peak(samples: list[dict[str, Any]]) -> dict[str, Any]:
         if not samples:
@@ -602,7 +707,13 @@ def run(args: argparse.Namespace) -> int:
             "cuda_graphs": cuda_graphs,
             "sampling": args.sampling,
         },
-        "binary": {"path": str(binary), "sha256": sha256_file(binary)},
+        "binary": {"path": str(binary), "sha256": sha256_file(binary), "build": doc.get("build")},
+        "probed_device": {
+            "device": doc.get("device"),
+            "name": doc.get("device_name"),
+            "compute_capability": doc.get("compute_capability"),
+        },
+        "prompt": {"tokens": doc.get("prompt_tokens"), "token_ids_sha256": prompt_sha256(doc)},
         "source": identity,
         "baseline_bench_source": bench_source,
         "model": model,
@@ -737,12 +848,28 @@ def sampled_status(run: dict[str, Any] | None) -> str:
     return "ok" if all(path in paths for path in SAMPLED_ROWS) else "not run"
 
 
+def baseline_missing(models: list[dict[str, Any]], baselines: list[dict[str, Any]]) -> list[str]:
+    """The AT2 campaign's S1 comparison row (sc-24140 feature-end review): every model needs a
+    bf16 `baseline` run of its own. One entry per model without one, in the `missing` list's form."""
+    return [
+        f"{model['key']} / S1 baseline (bf16)"
+        for model in models
+        if not any(
+            b["model"]["key"] == model["key"] and run_format(b) == "bf16" for b in baselines
+        )
+    ]
+
+
 def check_campaign_runs(heads: list[dict[str, Any]], baselines: list[dict[str, Any]]) -> str | None:
-    """Every head run in a campaign is clean and from one commit; every baseline is a baseline;
-    one hardware label throughout. Returns the head runs' runtime SHA (`None` without heads)."""
+    """Every head run in a campaign is clean and from one commit, built from it (its binary's
+    embedded provenance), on the device its label claims; every baseline is a baseline on that
+    device; one hardware label throughout. Returns the head runs' runtime SHA (`None` without
+    heads)."""
     for run in baselines:
         if run.get("run_kind") != "baseline":
             raise ValueError(f"{run['run_name']} is not a baseline run")
+        check_probed_hardware(run["suite"], run["label"])
+        check_build_provenance(run["suite"], run.get("source", {}).get("head_sha"), "baseline")
     shas = set()
     for run in heads:
         if run.get("run_kind") != "head":
@@ -753,6 +880,8 @@ def check_campaign_runs(heads: list[dict[str, Any]], baselines: list[dict[str, A
                 f"{run['run_name']} was built from a dirty tree ({source.get('dirty_paths')}); "
                 "a campaign seals clean head runs only"
             )
+        check_probed_hardware(run["suite"], run["label"])
+        check_build_provenance(run["suite"], source.get("head_sha"), "head")
         shas.add(source.get("head_sha"))
     if len(shas) > 1:
         raise ValueError(f"campaign head runs come from different commits: {sorted(map(str, shas))}")
@@ -822,6 +951,10 @@ def campaign(args: argparse.Namespace) -> int:
                     f"baseline {baseline['run_name']} carries label {baseline['label']!r}, the "
                     f"campaign runs under {args.label!r}"
                 )
+        # A model without its S1 baseline is refused before anything runs (unless partial).
+        absent = baseline_missing(models, baselines)
+        if absent and not args.allow_partial:
+            raise ValueError("campaign matrix cells are missing: " + "; ".join(absent))
         output.mkdir(parents=True)
         heads = []
         for model in models:
@@ -900,6 +1033,7 @@ def campaign(args: argparse.Namespace) -> int:
     stray = [h["run_name"] for h in heads if not any(c["run"] == h["run_name"] for c in cells)]
     if stray:
         raise ValueError(f"runs outside the requested matrix: {stray}")
+    missing += baseline_missing(models, baselines)
     if missing and not args.allow_partial:
         raise ValueError("campaign matrix cells are missing: " + "; ".join(missing))
 
@@ -940,6 +1074,15 @@ def campaign(args: argparse.Namespace) -> int:
         + (" + the stochastic rows" if args.sampled else "")
         + ". `n/a` = a cell the family cannot run (the llama family has no MTP head).",
         "",
+    ]
+    if missing:
+        lines += [
+            f"**Partial campaign** (sealed with `--allow-partial`): {len(missing)} missing — "
+            + "; ".join(missing)
+            + ".",
+            "",
+        ]
+    lines += [
         "## Coverage",
         "",
         "| model | format | graphs | " + " | ".join(mode_names[m] for m in modes) + " | run |",
@@ -951,6 +1094,14 @@ def campaign(args: argparse.Namespace) -> int:
             + " | ".join(cell["speculative"][m] for m in modes)
             + f" | {cell['run'] or 'missing'} |"
         )
+    lines += ["", "| model | S1 baseline (bf16) |", "|---|---|"]
+    for model in models:
+        names = [
+            b["run_name"]
+            for b in baselines
+            if b["model"]["key"] == model["key"] and run_format(b) == "bf16"
+        ]
+        lines.append(f"| {model['key']} | {', '.join(names) or 'missing'} |")
     tables = {}
     for model in models:
         model_runs = [r for r in baselines if r["model"]["key"] == model["key"]] + [
@@ -979,6 +1130,9 @@ def campaign(args: argparse.Namespace) -> int:
         },
         "cells": cells,
         "missing": missing,
+        # Whether missing cells were explicitly allowed (`--allow-partial`); `campaign-verify`
+        # fails a campaign with missing cells unless this is true.
+        "allow_partial": bool(args.allow_partial),
         "baselines": [
             {
                 "run": r["run_name"],
@@ -1011,21 +1165,58 @@ def verify_campaign(directory: Path) -> dict[str, Any]:
     if index.get("suite") != CAMPAIGN_SUITE:
         raise ValueError(f"{directory} is not a decode_bench campaign")
     entries = [c for c in index["cells"] if c.get("run_directory")] + index["baselines"]
+    loaded = {}
     for entry in entries:
         relative = Path(entry["run_directory"])
         if relative.is_absolute() or ".." in relative.parts:
             raise ValueError(f"{directory}: {relative} is outside the campaign directory")
         run_dir = directory / relative
-        load_run(run_dir)
+        loaded[entry["run_directory"]] = load_run(run_dir)
         if sha256_file(run_dir / "SEAL.json") != entry["run_seal_sha256"]:
             raise ValueError(f"{run_dir} was re-sealed after the campaign index was written")
+    # The index's `missing` list must be exactly what its cells and baselines say is missing
+    # (sc-24140 feature-end review), so an index cannot hide a gap behind an empty list.
+    missing = index.get("missing")
+    if not isinstance(missing, list):
+        raise ValueError(f"{directory}: the campaign index has no `missing` list")
+    expected = [
+        f"{cell['model']} / {cell['weight_format']} / graphs {cell['cuda_graphs']} / {mode}"
+        for cell in index["cells"]
+        for mode, text in cell["speculative"].items()
+        if text in ("missing", "not run")
+    ]
+    baselines = [loaded[b["run_directory"]] for b in index["baselines"]]
+    expected += baseline_missing([{"key": key} for key in index["matrix"]["models"]], baselines)
+    if sorted(expected) != sorted(missing):
+        raise ValueError(
+            f"{directory}: the index's missing list {missing} disagrees with its cells and "
+            f"baselines {expected}"
+        )
     return index
 
 
 def campaign_verify(args: argparse.Namespace) -> int:
+    """Re-check a sealed campaign and report its gaps: exit 0 for a complete campaign, or for a
+    partial one sealed with `--allow-partial` (recorded in the index); non-zero otherwise."""
     index = verify_campaign(Path(args.directory))
-    print(f"campaign {args.directory}: {len(index['cells'])} cells, seals verified")
-    return 0
+    missing = index["missing"]
+    if not missing:
+        print(f"campaign {args.directory}: {len(index['cells'])} cells, seals verified, complete")
+        return 0
+    print(
+        f"campaign {args.directory}: {len(index['cells'])} cells, seals verified, "
+        f"{len(missing)} missing:"
+    )
+    for entry in missing:
+        print(f"  missing: {entry}")
+    if index.get("allow_partial") is True:
+        print("partial campaign, explicitly allowed (sealed with --allow-partial)")
+        return 0
+    print(
+        "FAIL: the campaign has missing cells and was not sealed as partial (--allow-partial)",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def baseline_source_text(source: str) -> str:

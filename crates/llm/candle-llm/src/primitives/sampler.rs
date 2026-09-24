@@ -1178,7 +1178,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn a_failed_kernel_routes_to_the_host_as_device_unavailable() {
-        let gpu = Device::new_cuda(0).expect("the cuda lane runs on a CUDA device");
+        let gpu = crate::device::new_cuda_for_test().expect("the cuda lane runs on a CUDA device");
         let params = SamplingParams {
             temperature: 0.8,
             top_p: 0.9,

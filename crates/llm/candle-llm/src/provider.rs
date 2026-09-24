@@ -968,15 +968,17 @@ fn nvfp4_format_with(
 }
 
 /// The model half of [`nvfp4_format`]: whether this provider serves NVFP4 for the checkpoint at
-/// `spec.source`, from `config.json` alone (never a weight shard). The load runs it before the
-/// device gate, and [`crate::backend::nvfp4_support`] answers a product's per-snapshot question
-/// with it (sc-24139), so the two can never disagree about which checkpoints NVFP4 serves.
+/// `spec.source`, from `config.json` and the snapshot's tensor names (never tensor data). The load
+/// runs it before the device gate, and [`crate::backend::nvfp4_support`] answers a product's
+/// per-snapshot question with it (sc-24139), so the two can never disagree about which
+/// checkpoints NVFP4 serves.
 ///
 /// A GGUF source is refused: it is already block-quantized, and NVFP4 quantizes from a dense
 /// snapshot. So is a Prism/Bonsai snapshot (already packed affine-2 — `load_dir` refuses any
-/// repacking), by name ([`nvfp4_family_refusal`]). The qwen3_5 hybrid (sc-24135) and every
-/// llama-family `CausalLm` architecture (sc-24140) are served. A missing or unreadable config is
-/// left to the loader's own error.
+/// repacking), by name ([`nvfp4_family_refusal`]), and a packed MLX-affine snapshot of any family
+/// ([`packed_affine_refusal`] — the loader refuses its triples too, but only after reading the
+/// weights). The qwen3_5 hybrid (sc-24135) and every llama-family `CausalLm` architecture
+/// (sc-24140) are served. A missing or unreadable config is left to the loader's own error.
 pub(crate) fn nvfp4_model_gate(spec: &LoadSpec) -> CoreResult<()> {
     if crate::gguf::is_gguf_path(&spec.source) {
         return Err(CoreError::Unsupported(
@@ -988,12 +990,124 @@ pub(crate) fn nvfp4_model_gate(spec: &LoadSpec) -> CoreResult<()> {
     // The family rule (sc-24140): the one place it lives, so every caller — the load path and the
     // capability probe alike — answers the same. A missing or unreadable config, or an
     // architecture the dispatch does not recognize, is left to the loader's own error.
-    if let Some(config) = read_json(Path::new(&spec.source), "config.json") {
-        if let Some(reason) = nvfp4_family_refusal(&config) {
+    let dir = Path::new(&spec.source);
+    if let Some(config) = read_json(dir, "config.json") {
+        if let Some(reason) =
+            nvfp4_family_refusal(&config).or_else(|| packed_affine_refusal(dir, &config))
+        {
             return Err(CoreError::Unsupported(format!("nvfp4: {reason}")));
         }
     }
     Ok(())
+}
+
+/// Why a snapshot's projections are already packed MLX-affine, or `None` (the packed half of
+/// [`nvfp4_model_gate`], sc-24140 feature-end review). Packed means both: a `quantization` block
+/// in `config.json` (top level or `text_config`, where [`ModelConfig`] reads it) **and** a
+/// `<stem>.weight` whose `<stem>.scales` sidecar the snapshot names. A prepared Q4/Q8 snapshot
+/// ([`crate::prepare`]) carries the block over *dense* weights, so it is not packed: NVFP4
+/// quantizes its projections like any dense snapshot's. The tensor names come from
+/// `model.safetensors.index.json` when it exists, else from each shard's header — never from
+/// tensor data. An unreadable index or header is left to the loader's own error.
+fn packed_affine_refusal(dir: &Path, config: &Value) -> Option<String> {
+    let has_block = config.get("quantization").is_some()
+        || config
+            .get("text_config")
+            .is_some_and(|text| text.get("quantization").is_some());
+    if !has_block {
+        return None;
+    }
+    let names = snapshot_tensor_names(dir)?;
+    let mut stems: Vec<&str> = names
+        .iter()
+        .filter_map(|name| {
+            let stem = name.strip_suffix(".scales")?;
+            names.contains(&format!("{stem}.weight")).then_some(stem)
+        })
+        .collect();
+    // The first packed projection by name, so the refusal reads the same on every run.
+    stems.sort_unstable();
+    let stem = stems.first()?;
+    Some(format!(
+        "this snapshot's projections are packed MLX-affine (a `quantization` block over affine \
+         sidecars such as `{stem}.scales`); NVFP4 projections are quantized from a dense snapshot"
+    ))
+}
+
+/// The tensor names a safetensors snapshot holds: the index's `weight_map` keys, else every
+/// `*.safetensors` shard's header keys (the 8-byte length prefix and the JSON header only).
+/// `None` when neither can be read.
+fn snapshot_tensor_names(dir: &Path) -> Option<std::collections::HashSet<String>> {
+    if let Some(index) = read_json(dir, "model.safetensors.index.json") {
+        let map = index.get("weight_map")?.as_object()?;
+        return Some(map.keys().cloned().collect());
+    }
+    let mut names = std::collections::HashSet::new();
+    for entry in std::fs::read_dir(dir).ok()? {
+        let path = entry.ok()?.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("safetensors") {
+            names.extend(safetensors_header_names(&path)?);
+        }
+    }
+    Some(names)
+}
+
+/// The tensor names in one safetensors file's header, without reading its data.
+fn safetensors_header_names(path: &Path) -> Option<Vec<String>> {
+    use std::io::Read;
+    // A real header is kilobytes to a few megabytes; never allocate for a corrupt length.
+    const MAX_HEADER_BYTES: u64 = 256 << 20;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut len = [0u8; 8];
+    file.read_exact(&mut len).ok()?;
+    let len = u64::from_le_bytes(len);
+    if len > MAX_HEADER_BYTES {
+        return None;
+    }
+    let mut header = vec![0u8; len as usize];
+    file.read_exact(&mut header).ok()?;
+    let header: Value = serde_json::from_slice(&header).ok()?;
+    Some(
+        header
+            .as_object()?
+            .keys()
+            .filter(|key| key.as_str() != "__metadata__")
+            .cloned()
+            .collect(),
+    )
+}
+
+/// Test seam for [`packed_affine_refusal`]: write tiny tensors named `names` into `dir` — as a
+/// `model.safetensors` shard, or (`index`) only a `model.safetensors.index.json` naming them.
+#[cfg(test)]
+pub(crate) fn write_test_snapshot_tensors(dir: &Path, names: &[&str], index: bool) {
+    if index {
+        let map: serde_json::Map<String, Value> = names
+            .iter()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    Value::from("model-00001-of-00001.safetensors"),
+                )
+            })
+            .collect();
+        let index = serde_json::json!({"metadata": {}, "weight_map": map});
+        std::fs::write(dir.join("model.safetensors.index.json"), index.to_string()).unwrap();
+        return;
+    }
+    let tensors: std::collections::HashMap<String, Tensor> = names
+        .iter()
+        .map(|name| {
+            let dtype = if name.ends_with(".weight") {
+                DType::U32
+            } else {
+                DType::BF16
+            };
+            let tensor = Tensor::zeros((2, 2), dtype, &Device::Cpu).unwrap();
+            (name.to_string(), tensor)
+        })
+        .collect();
+    candle_core::safetensors::save(&tensors, dir.join("model.safetensors")).unwrap();
 }
 
 /// Why a snapshot's family cannot hold NVFP4 projections, or `None` when it can (the family half of
@@ -4686,7 +4800,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn nvfp4_format_refuses_a_mocked_sub_sm120_device_as_unsupported() {
-        let Ok(device) = candle_core::Device::new_cuda(0) else {
+        let Ok(device) = crate::device::new_cuda_for_test() else {
             eprintln!("skipping: no CUDA device");
             return;
         };
@@ -4757,6 +4871,85 @@ mod tests {
                 assert!(msg.contains("dense snapshot"), "names the reason: {msg}");
             }
             other => panic!("expected the family refusal, got {other:?}"),
+        }
+    }
+
+    /// sc-24140 feature-end review: a packed MLX-affine snapshot — a `quantization` block over
+    /// `<stem>.weight` + `<stem>.scales` — is refused by the model gate, from the index's
+    /// `weight_map` or the shard headers (never tensor data), on the llama family and the hybrid
+    /// alike; the loader would otherwise refuse its triples only after reading every weight. A
+    /// prepared Q4/Q8 snapshot (the block over dense weights), a triple without the block and an
+    /// orphan `.scales` are not packed. The device gate below panics if the refusal misses it.
+    #[test]
+    fn nvfp4_gate_refuses_a_packed_mlx_affine_snapshot_before_the_device_gate() {
+        let llama =
+            serde_json::json!({"architectures": ["LlamaForCausalLM"], "model_type": "llama"});
+        let block = serde_json::json!({"group_size": 64, "bits": 4});
+        let with_block = |mut config: serde_json::Value| {
+            config["quantization"] = block.clone();
+            config
+        };
+        let triple = [
+            "model.layers.0.mlp.up_proj.weight",
+            "model.layers.0.mlp.up_proj.scales",
+            "model.layers.0.mlp.up_proj.biases",
+        ];
+        let refusal = |config: &serde_json::Value, names: &[&str], index: bool| {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("config.json"), config.to_string()).unwrap();
+            super::write_test_snapshot_tensors(root.path(), names, index);
+            let gate = |_: &candle_core::Device| -> crate::Result<_> {
+                Err(crate::Error::Unsupported("nvfp4: gate reached".into()))
+            };
+            let spec = nvfp4_spec(&root.path().to_string_lossy());
+            match super::nvfp4_format_with(&spec, &candle_core::Device::Cpu, gate) {
+                Err(core_llm::Error::Unsupported(msg)) => msg,
+                other => panic!("{config}: expected an Unsupported refusal, got {other:?}"),
+            }
+        };
+        let hybrid = serde_json::json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "model_type": "qwen3_5",
+            "text_config": {"quantization": block.clone()}
+        });
+        for (config, index) in [
+            (with_block(llama.clone()), true),
+            (with_block(llama.clone()), false),
+            (hybrid, false),
+        ] {
+            let msg = refusal(&config, &triple, index);
+            assert!(msg.starts_with("nvfp4: "), "{msg}");
+            assert!(
+                msg.contains("packed MLX-affine"),
+                "{config} (index {index}): {msg}"
+            );
+            assert!(msg.contains("model.layers.0.mlp.up_proj.scales"), "{msg}");
+            assert!(msg.contains("dense snapshot"), "{msg}");
+            assert!(!msg.contains("  "), "{msg:?}");
+        }
+        // Not packed: each reaches the device gate.
+        let dense = [
+            "model.layers.0.mlp.up_proj.weight",
+            "model.layers.0.mlp.down_proj.weight",
+        ];
+        for (config, names) in [
+            (with_block(llama.clone()), &dense[..]),
+            (llama.clone(), &triple[..]),
+            (
+                with_block(llama.clone()),
+                &[
+                    "model.layers.0.mlp.up_proj.scales",
+                    "model.layers.0.mlp.down_proj.weight",
+                ][..],
+            ),
+        ] {
+            for index in [true, false] {
+                assert_eq!(
+                    refusal(&config, names, index),
+                    "nvfp4: gate reached",
+                    "{config} {names:?} (index {index})"
+                );
+            }
         }
     }
 
