@@ -405,6 +405,10 @@ mod tests {
         assert_eq!(spec.source, "model.gguf");
         assert_eq!(spec.projector_source.as_deref(), Some("projector.gguf"));
         assert!(spec.quantize.is_none());
+        assert!(
+            spec.cuda_graphs.is_none(),
+            "a dense load keeps the backend's graph default"
+        );
     }
 }
 
@@ -420,6 +424,17 @@ pub struct LoadSpec {
     pub projector_source: Option<String>,
     /// Optional load-time **weight** quantization (the model projection weights).
     pub quantize: Option<Quantize>,
+    /// Load-time CUDA-graph decode policy (sc-24139): `Some(true)` / `Some(false)` turn the
+    /// backend's CUDA-graph runner on / off for every generation on this loaded model; `None`
+    /// keeps the backend's default (candle-llm: `CANDLE_LLM_CUDA_GRAPHS`, off unless set). It is a
+    /// **load** option because a CUDA backend settles the model's stream at load — graph capture
+    /// needs a dedicated stream, which the eager path does not use — so changing it means
+    /// reloading. A hint, never a requirement: a backend that cannot capture graphs loads and
+    /// decodes eagerly and names why — before the load in
+    /// [`BackendCapabilities::cuda_graphs`](crate::BackendCapabilities::cuda_graphs), and per
+    /// generation in [`DecodeReport::cuda_graphs`](crate::DecodeReport::cuda_graphs) where the
+    /// backend reports one. Backends without CUDA ignore it.
+    pub cuda_graphs: Option<bool>,
 }
 
 /// Load-time quantization request.
@@ -444,6 +459,7 @@ impl LoadSpec {
             source: source.into(),
             projector_source: None,
             quantize: None,
+            cuda_graphs: None,
         }
     }
 

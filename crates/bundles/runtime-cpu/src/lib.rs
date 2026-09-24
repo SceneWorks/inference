@@ -81,6 +81,27 @@ fn audio_lane() -> runtime_catalog::AudioLane {
     }
 }
 
+/// What this bundle's LLM backend can serve on this host before any model is loaded (sc-24139):
+/// the load device, its CUDA compute capability, and whether `Quantize::Nvfp4` and
+/// `LoadSpec::cuda_graphs` are available — each unavailable feature with the refusal a load would
+/// return. A product reads this to offer, or disable with the reason, those controls.
+pub fn text_backend_capabilities() -> core_llm::BackendCapabilities {
+    candle_llm::backend_capabilities()
+}
+
+/// Whether an NVFP4 load of the snapshot at `spec.source` can pass every gate this bundle's load
+/// runs before reading a weight (sc-24139): the provider this bundle's text registry would load it
+/// with, that provider's own NVFP4 gate, then the device gate (a refusal on every CPU host). Reads
+/// only `config.json` (or a GGUF header).
+pub fn text_nvfp4_support(spec: &core_llm::LoadSpec) -> core_llm::FeatureSupport {
+    match candle_llm::text_registry() {
+        Ok(registry) => candle_llm::nvfp4_support(&registry, spec),
+        Err(error) => core_llm::FeatureSupport::unavailable(format!(
+            "nvfp4: the CPU text registry did not compose: {error}"
+        )),
+    }
+}
+
 /// Build the complete validated CPU runtime composition.
 pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
     #[cfg(feature = "audio")]
@@ -135,6 +156,74 @@ mod tests {
             None,
             "the exact tiling geometry must not imply a budget-independent SVD peak profile"
         );
+    }
+
+    /// sc-24139: the bundle answers the per-snapshot NVFP4 question from the gates of the
+    /// provider its registry would load: a StarVector-1B snapshot is refused by that provider's
+    /// own NVFP4 gate (which runs before any device gate), a qwen3_5 snapshot — and, since
+    /// sc-24140, a llama-family one (Qwen3-8B's `qwen3`) — passes the model gate and gets the
+    /// device's refusal — on CPU, the host capability's own reason.
+    #[test]
+    fn text_nvfp4_support_answers_per_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let snapshot = |name: &str, config: &str| {
+            let dir = root.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("config.json"), config).unwrap();
+            super::core_llm::LoadSpec::dense(dir.to_string_lossy())
+        };
+        let starvector = snapshot(
+            "starvector-1b",
+            r#"{"model_type":"starvector","starcoder_model_name":"bigcode/starcoderbase-1b",
+                "image_encoder_type":"clip","image_size":224,"hidden_size":2048,
+                "vocab_size":49156,"max_position_embeddings":8192,"num_hidden_layers":24,
+                "num_attention_heads":16,"multi_query":true}"#,
+        );
+        let qwen = snapshot(
+            "qwen35",
+            r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5"}"#,
+        );
+        let qwen3 = snapshot(
+            "qwen3",
+            r#"{"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3"}"#,
+        );
+        let refused = super::text_nvfp4_support(&starvector);
+        let host = super::text_backend_capabilities().nvfp4;
+        let device = super::text_nvfp4_support(&qwen);
+        let llama_family = super::text_nvfp4_support(&qwen3);
+
+        assert!(!refused.supported);
+        let reason = refused.reason.unwrap();
+        assert!(
+            reason.starts_with("nvfp4: ") && reason.contains("StarVector-1B"),
+            "{reason}"
+        );
+        assert!(!host.supported);
+        assert_eq!(device, host);
+        assert_eq!(
+            llama_family, host,
+            "the llama family reaches the device gate"
+        );
+    }
+
+    /// sc-24139: the CPU bundle answers the host-capability query without a model, and every CUDA
+    /// device feature is unavailable with the load gate's reason — the source a product disables
+    /// its NVFP4 and CUDA-graph controls with.
+    #[test]
+    fn text_backend_capabilities_refuse_cuda_features_with_reasons() {
+        let caps = super::text_backend_capabilities();
+        assert_eq!(caps.backend, "candle-cpu");
+        assert_eq!(caps.device, "cpu");
+        assert_eq!(caps.compute_capability, None);
+        assert!(!caps.nvfp4.supported);
+        assert!(caps.nvfp4.reason.as_deref().unwrap().starts_with("nvfp4: "));
+        assert!(!caps.cuda_graphs.supported);
+        assert!(caps
+            .cuda_graphs
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with("cuda_graphs: "));
     }
 
     #[test]

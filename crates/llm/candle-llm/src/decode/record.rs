@@ -247,6 +247,23 @@ impl DecodeRecord {
         self
     }
 
+    /// The same record with the host-side counters and the fused / CUDA-graph / NVFP4 tallies of
+    /// the whole request measured by `span` (sc-24139) — for a caller that prefills before handing
+    /// the engine a [`Prefilled`](super::SpeculativePrompt::Prefilled) prompt, whose own span
+    /// starts after that prefill. The engine-measured fields (path, forwards, cache, proposer)
+    /// are kept.
+    pub fn with_request_span(self, span: &RequestSpan) -> Self {
+        let counters = span.counters();
+        Self {
+            host_syncs: counters.host_syncs,
+            sampler: counters.sampler,
+            fused_primitives: span.fused_primitives(),
+            cuda_graphs: span.cuda_graphs(),
+            nvfp4_projections: span.nvfp4_projections(),
+            ..self
+        }
+    }
+
     /// A record from a speculative run's [`SpeculativeStats`].
     pub fn speculative(
         path: DecodePath,
@@ -317,6 +334,45 @@ impl DecodeRecord {
     pub fn logits_to_host_per_token(&self) -> Option<f64> {
         (self.generated_tokens > 0)
             .then(|| self.sampler.logits_to_host as f64 / self.generated_tokens as f64)
+    }
+
+    /// The backend-neutral report a product renders (sc-24139): the same labels as the evidence
+    /// rows. `cuda_graphs_enabled` is the graph switch the request ran under (the loaded model's
+    /// `LoadSpec::cuda_graphs`, else the process switch at load), which the tally alone cannot
+    /// say: a request that never reached the runner reads `none` either way.
+    pub fn report(&self, cuda_graphs_enabled: bool) -> core_llm::DecodeReport {
+        let draft_tokens = match self.path {
+            DecodePath::Mtp { drafts } => Some(drafts),
+            _ => None,
+        };
+        core_llm::DecodeReport {
+            path: self.path.label().to_string(),
+            proposer: self.proposer,
+            draft_tokens,
+            sampler: self.sampler.label(),
+            kv_cache: self.kv_cache.label().to_string(),
+            attention: self.attn_formulation.label().to_string(),
+            cuda_graphs: core_llm::CudaGraphsReport {
+                enabled: cuda_graphs_enabled,
+                path: self.cuda_graphs.label().to_string(),
+                replayed: self.cuda_graphs.replayed,
+                eager: self.cuda_graphs.eager,
+                captured: self.cuda_graphs.captured,
+                fallback_reason: self.cuda_graphs.fallback_reason.map(str::to_string),
+            },
+            nvfp4_projections: core_llm::PathReport {
+                path: self.nvfp4_projections.label().to_string(),
+                reason: self.nvfp4_projections.cublaslt_reason.map(str::to_string),
+            },
+            fused_primitives: core_llm::PathReport {
+                path: self.fused_primitives.label().to_string(),
+                reason: self.fused_primitives.reference_reason.map(str::to_string),
+            },
+            target_forwards: self.target_forwards,
+            proposed_tokens: self.proposed_tokens,
+            accepted_tokens: self.accepted_tokens,
+            replay_forwards: self.replay_forwards,
+        }
     }
 }
 
@@ -461,6 +517,88 @@ mod tests {
     }
 
     #[test]
+    fn the_report_carries_every_path_label_and_names_the_fallbacks() {
+        let record = DecodeRecord::speculative(
+            DecodePath::Mtp { drafts: 3 },
+            SpeculativeStats {
+                forwards: 5,
+                proposed: 9,
+                accepted: 6,
+                verify_steps: 3,
+                replays: 1,
+                ..SpeculativeStats::default()
+            },
+            8,
+            SpanCounters {
+                host_syncs: 4,
+                sampler: SamplerTelemetry {
+                    path: Some(SamplerPath::Host(core_llm::HostSampleReason::Penalty)),
+                    device_draws: 0,
+                    host_draws: 8,
+                    logits_to_host: 8,
+                },
+            },
+        )
+        .with_proposer(ProposerKind::Mtp)
+        .with_kv_cache(KvCacheKind::Static)
+        .with_cuda_graphs(GraphTally {
+            replayed: 0,
+            eager: 7,
+            captured: 0,
+            fallback_reason: Some("deltanet_state_unstable"),
+        })
+        .with_nvfp4_projections(Nvfp4PathTally {
+            gemv: 40,
+            cublaslt: 2,
+            cublaslt_reason: Some("rows"),
+        })
+        .with_fused_primitives(FusedTally {
+            fused: 10,
+            reference: 0,
+            reference_reason: None,
+        });
+        let report = record.report(true);
+        assert_eq!(report.path, "mtp");
+        assert_eq!(report.proposer, ProposerKind::Mtp);
+        assert_eq!(report.draft_tokens, Some(3));
+        assert_eq!(report.sampler, "host:penalty");
+        assert_eq!(report.kv_cache, "static");
+        assert_eq!(report.attention, "gqa");
+        assert!(report.cuda_graphs.enabled);
+        assert_eq!(report.cuda_graphs.path, "eager");
+        assert_eq!(report.cuda_graphs.eager, 7);
+        assert_eq!(
+            report.cuda_graphs.fallback_reason.as_deref(),
+            Some("deltanet_state_unstable")
+        );
+        assert_eq!(report.nvfp4_projections.path, "mixed");
+        assert_eq!(report.nvfp4_projections.reason.as_deref(), Some("rows"));
+        assert_eq!(report.fused_primitives.path, "fused");
+        assert_eq!(report.fused_primitives.reason, None);
+        assert_eq!(
+            (
+                report.target_forwards,
+                report.proposed_tokens,
+                report.accepted_tokens
+            ),
+            (5, 9, 6)
+        );
+        assert_eq!(report.replay_forwards, 1);
+
+        // A reference run with the switch off: no proposer, no graph step, and the report says
+        // the switch was off rather than leaving `none` ambiguous.
+        let plain = DecodeRecord::plain(DecodePath::Reference, 3, 2, SpanCounters::default());
+        let report = plain.report(false);
+        assert_eq!(report.path, "reference");
+        assert_eq!(report.proposer, ProposerKind::None);
+        assert_eq!(report.draft_tokens, None);
+        assert_eq!(report.sampler, "none");
+        assert!(!report.cuda_graphs.enabled);
+        assert_eq!(report.cuda_graphs.path, "none");
+        assert_eq!(report.nvfp4_projections.path, "none");
+    }
+
+    #[test]
     fn counting_decode_measures_forwards() {
         let stub = Stub(Device::Cpu);
         let counted = CountingDecode::new(&stub);
@@ -577,6 +715,43 @@ mod tests {
                 .cuda_graphs
                 .label(),
             "none"
+        );
+    }
+
+    /// sc-24139: a caller that prefills before the engine overlays its whole-request span on the
+    /// engine's record — the span's counters and tallies replace the engine's, and the
+    /// engine-measured fields stay.
+    #[test]
+    fn with_request_span_takes_the_whole_requests_counters() {
+        let span = RequestSpan::begin();
+        // Work before the engine's own span (the caller's prefill) ...
+        crate::primitives::note_host_sync();
+        crate::primitives::nvfp4_path::note_gemv();
+        // ... which the engine's record, measured after it, does not see.
+        let engine = DecodeRecord::plain(DecodePath::StepModel, 5, 4, SpanCounters::default())
+            .with_kv_cache(KvCacheKind::Static)
+            .with_proposer(ProposerKind::Ngram);
+        let record = engine.with_request_span(&span);
+        assert_eq!(record.host_syncs, 1);
+        assert_eq!(record.nvfp4_projections.gemv, 1);
+        assert_eq!(record.nvfp4_projections, span.nvfp4_projections());
+        assert_eq!(record.fused_primitives, span.fused_primitives());
+        assert_eq!(record.cuda_graphs, span.cuda_graphs());
+        assert_eq!(
+            (
+                record.path,
+                record.target_forwards,
+                record.generated_tokens,
+                record.kv_cache,
+                record.proposer
+            ),
+            (
+                DecodePath::StepModel,
+                5,
+                4,
+                KvCacheKind::Static,
+                ProposerKind::Ngram
+            )
         );
     }
 

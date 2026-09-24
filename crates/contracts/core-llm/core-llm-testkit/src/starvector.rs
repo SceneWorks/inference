@@ -383,6 +383,7 @@ mod tests {
                 usage,
                 mtp: None,
                 timings: None,
+                decode: None,
                 finish_reason: Some(core_llm::FinishReason::Stop),
             })
         }

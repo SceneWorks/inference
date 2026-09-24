@@ -1960,6 +1960,7 @@ impl TextLlm for LlamaProvider {
                 accepted_tokens: u32::try_from(stats.accepted).unwrap_or(u32::MAX),
                 target_forwards: u32::try_from(stats.forwards).unwrap_or(u32::MAX),
             }),
+            decode: None,
             finish_reason: Some(finish),
         })
     }

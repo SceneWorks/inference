@@ -76,6 +76,7 @@ fn llama_quantize_on_load_q8() {
         source: dir.clone(),
         projector_source: None,
         quantize: Some(Quantize::Q8),
+        cuda_graphs: None,
     })
     .unwrap();
     assert!(q8.is_quantized());
@@ -93,6 +94,7 @@ fn llama_quantize_on_load_q4() {
         source: dir,
         projector_source: None,
         quantize: Some(Quantize::Q4),
+        cuda_graphs: None,
     })
     .unwrap();
     assert!(q4.is_quantized());

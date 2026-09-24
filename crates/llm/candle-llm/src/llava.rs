@@ -31,7 +31,8 @@ use core_llm::{
 
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
-    generate_step_from_prefill, CancelFlag, FinishReason, GenerationConfig, StreamEvent,
+    generate_step_from_prefill, CancelFlag, DecodeRecord, FinishReason, GenerationConfig,
+    RequestSpan, StreamEvent,
 };
 use crate::device::select_device;
 use crate::error::{Error, Result};
@@ -241,6 +242,10 @@ pub struct LlavaGeneration {
     pub tokens: Vec<i32>,
     /// Why generation stopped.
     pub finish_reason: FinishReason,
+    /// The measured decode record (sc-24139): the engine's record of the caption decode, with the
+    /// host-side counters and the fused / CUDA-graph / NVFP4 tallies of the whole request from
+    /// the spliced prefill on — what [`LlavaProvider`] reports on `TextLlmOutput::decode`.
+    pub record: DecodeRecord,
 }
 
 /// A loaded LLaVA VLM: vision tower, projector, language decoder, and image preprocessor.
@@ -366,6 +371,8 @@ impl LlavaModel {
             return Err(Error::Canceled);
         }
 
+        // The whole request from the spliced prefill on: the engine measures only its own loop.
+        let span = RequestSpan::begin();
         // Splice the image rows (in the decoder's dtype) into the token embeddings, then decode.
         let expanded = expand_image_tokens(
             prompt_ids,
@@ -387,7 +394,7 @@ impl LlavaModel {
             seed,
             stop_tokens: stop_tokens.to_vec(),
         };
-        let (out, _record) = generate_step_from_prefill(
+        let (out, record) = generate_step_from_prefill(
             &self.language,
             &mut cache,
             logits,
@@ -404,8 +411,25 @@ impl LlavaModel {
         Ok(LlavaGeneration {
             tokens: out.tokens,
             finish_reason: out.finish_reason,
+            record: record.with_request_span(&span),
         })
     }
+}
+
+/// The weight format a LLaVA load quantizes its language decoder to, or the typed refusal. The
+/// load runs it first, and [`crate::backend::nvfp4_support`] answers a product's per-snapshot
+/// NVFP4 question with it (sc-24139): NVFP4 is served for the qwen3_5 family only (sc-24135), so
+/// it is refused here by name.
+pub(crate) fn requested_quantization(spec: &LoadSpec) -> CoreResult<Option<QuantSpec>> {
+    spec.quantize
+        .map(|q| match q {
+            Quantize::Q4 => Ok(QuantSpec::q4()),
+            Quantize::Q8 => Ok(QuantSpec::q8()),
+            Quantize::Nvfp4 => Err(CoreError::Unsupported(
+                "nvfp4: NVFP4 projections are served for the qwen3_5 family only, not LLaVA".into(),
+            )),
+        })
+        .transpose()
 }
 
 /// LLaVA served as a multimodal [`core_llm::TextLlm`] provider.
@@ -422,18 +446,7 @@ impl LlavaProvider {
     /// `spec.quantize` (or the snapshot's persisted `quantization` block) quantizes the language
     /// decoder's projections; the vision tower and projector stay dense.
     pub fn load(spec: &LoadSpec) -> CoreResult<Self> {
-        let requested = spec
-            .quantize
-            .map(|q| match q {
-                Quantize::Q4 => Ok(QuantSpec::q4()),
-                Quantize::Q8 => Ok(QuantSpec::q8()),
-                // sc-24135: NVFP4 is served for the qwen3_5 family only; refuse by name.
-                Quantize::Nvfp4 => Err(CoreError::Unsupported(
-                    "nvfp4: NVFP4 projections are served for the qwen3_5 family only, not LLaVA"
-                        .into(),
-                )),
-            })
-            .transpose()?;
+        let requested = requested_quantization(spec)?;
         let dir = Path::new(&spec.source);
         let device = select_device().map_err(to_core)?;
         let model = LlavaModel::from_dir_with(dir, &device, requested).map_err(to_core)?;
@@ -604,6 +617,10 @@ impl TextLlm for LlavaProvider {
             tool_calls: Vec::new(),
             usage,
             mtp: None,
+            // The caption decodes through the shared engine (sc-24138), so it reports its path
+            // like every engine request. The CUDA-graph switch is not wired into this provider
+            // (no graph runner wraps its decoder), so the report says the switch was off here.
+            decode: Some(gen.record.report(false)),
             finish_reason: Some(finish),
         })
     }
