@@ -626,6 +626,87 @@ fn llama_family_qwen3_8b_exact_rows_and_ngram_knife_edge_gate() {
     );
 }
 
+/// sc-24140 (E1 as worded — *verify-shaped forwards*): the Qwen3-8B reference fixture, every
+/// position re-decoded through a verify-shaped forward (`M = K + 1` reference tokens, every row)
+/// from a cache the **single-token** path wrote, against the single-token argmax: a disagreement
+/// is excused only at a position whose reference top-2 gap is within one bf16 ULP. This isolates
+/// one verify forward's arithmetic from the free-running rows, whose later positions attend K/V
+/// that earlier verify forwards wrote (and so can drift further). The static cache rolls back by
+/// offset, so each trial forward is undone exactly before the single-token step advances.
+#[test]
+#[ignore = "needs the Qwen3-8B snapshot via QWEN3_8B_SNAPSHOT and a GPU (~16 GB)"]
+fn llama_family_qwen3_8b_teacher_forced_verify_shaped_knife_edge_gate() {
+    use candle_llm::primitives::DecodeCache;
+
+    let snapshot = common::qwen35::snapshot_from_env(QWEN3_8B_VAR)
+        .unwrap_or_else(|| panic!("set {QWEN3_8B_VAR}"));
+    let device = select_device().unwrap();
+    let model = load_qwen3_8b(&snapshot, &device);
+    let prompt = common::qwen35::render_chat_prompt(&snapshot, PROMPT);
+    let reference = causal_reference_tokens(&model, &prompt, &device);
+    let mut sequence = prompt.clone();
+    sequence.extend(&reference);
+    let capacity = prompt.len() + FIXTURE_TOKENS + 8;
+    let gaps = single_token_gaps(
+        &model,
+        model.new_static_cache(capacity).unwrap(),
+        &prompt,
+        &reference,
+    );
+    let edges = knife_edges(&gaps);
+    eprintln!("[llama teacher-forced] reference knife-edge positions: {edges:?}");
+
+    let mut violations = Vec::new();
+    for k in 1..=5usize {
+        let mut cache = model.new_static_cache(capacity).unwrap();
+        model
+            .forward_step(&mut cache, StepRequest::last(&prompt))
+            .unwrap();
+        let mut disagreements = Vec::new();
+        for pos in 0..FIXTURE_TOKENS {
+            let cur = prompt.len() + pos;
+            let end = (cur + k + 1).min(sequence.len());
+            if end - cur < 2 {
+                break;
+            }
+            let multi = model
+                .forward_step(
+                    &mut cache,
+                    StepRequest {
+                        tokens: StepTokens::Host(&sequence[cur..end]),
+                        scope: LogitsScope::All,
+                        want_hidden: false,
+                    },
+                )
+                .unwrap()
+                .logits;
+            cache.rollback_to(cur as i32).unwrap();
+            for (i, &arg_k) in argmax_rows_device(&multi).unwrap().iter().enumerate() {
+                let Some(&(arg_1, gap, ulp)) = gaps.get(pos + i + 1) else {
+                    break;
+                };
+                if arg_1 != arg_k {
+                    disagreements.push((pos + i + 1, i, gap / ulp));
+                    if gap > ulp {
+                        violations.push((k + 1, pos + i + 1, i, gap / ulp));
+                    }
+                }
+            }
+            model
+                .forward_step(&mut cache, StepRequest::last(&[sequence[cur]]))
+                .unwrap();
+        }
+        eprintln!(
+            "[llama teacher-forced] M={}: argmax disagreements (position, verify row, reference              gap in bf16 ULP): {disagreements:?}",
+            k + 1
+        );
+    }
+    assert!(
+        violations.is_empty(),
+        "a verify-shaped forward changed the argmax at a position that is not a bf16 knife-edge          (M, position, verify row, gap ULP): {violations:?}"
+    );
+}
+
 /// Compare row 0 of `f` over an `M`-row input with `f` over that row alone.
 fn row0_survey(name: &str, f: &dyn Fn(usize) -> Tensor, ms: &[usize]) -> Vec<(usize, bool, f32)> {
     let alone = host(&f(1));
