@@ -328,7 +328,8 @@ mod cuda_tests {
     fn opening_a_cuda_device_holds_the_cuda_test_lock_until_the_thread_ends() {
         use std::sync::mpsc::channel;
         use std::time::Duration;
-        let openers: [(&str, fn() -> Result<Device>); 2] = [
+        type Open = fn() -> Result<Device>;
+        let openers: [(&str, Open); 2] = [
             ("select_device", select_device),
             ("new_cuda_for_test", new_cuda_for_test),
         ];
