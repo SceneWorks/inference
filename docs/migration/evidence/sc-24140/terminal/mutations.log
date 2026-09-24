@@ -1,0 +1,23 @@
+# sc-24140 terminal (epic sc-24128): one mutation per added or corrected assertion.
+# Each mutation applied alone to the committed source, the named CPU lib test(s) run
+# (cargo test --locked -p candle-llm --lib <test> -- --exact, CARGO_TARGET_DIR=C:/cargo-targets/fix-terminal),
+# the source restored. RED = the test fails under the mutation.
+# 7 mutations, 7 RED.
+
+M1a item 1: recurrent_state_bytes prices one ring slot too many -> RED
+    models::qwen35::tests::ringed_static_cache_holds_exactly_what_admission_prices: RED (test result: FAILED. 0 passed; 1 failed)
+M1b item 1: static_kv_bytes prices one position fewer than new_static_cache allocates -> RED
+    models::qwen35::tests::ringed_static_cache_holds_exactly_what_admission_prices: RED (test result: FAILED. 0 passed; 1 failed)
+M1c item 1: the ring is counted only once allocated (the pre-sc-24131 accounting the stale assertion encoded) -> RED
+    models::qwen35::tests::ringed_static_cache_holds_exactly_what_admission_prices: RED (test result: FAILED. 0 passed; 1 failed)
+M2a item 2: the GGML Q8 copy unpriced again (the pricing at R) -> RED
+    provider::tests::q8_load_estimate_prices_the_copy_the_loader_builds: RED (test result: FAILED. 0 passed; 1 failed)
+    provider::tests::load_quantized_copy_follows_the_request_then_the_persisted_block: RED (test result: FAILED. 0 passed; 1 failed)
+M2b item 2: Q8_0 priced at 8 bits per 16 instead of 8.5 -> RED
+    provider::tests::ggml_admission_prices_the_quantized_copy_beside_the_source: RED (test result: FAILED. 0 passed; 1 failed)
+    provider::tests::q8_load_estimate_prices_the_copy_the_loader_builds: RED (test result: FAILED. 0 passed; 1 failed)
+M2c item 2: the persisted quantization block ignored (a prepared Q8 snapshot unpriced) -> RED
+    provider::tests::load_quantized_copy_follows_the_request_then_the_persisted_block: RED (test result: FAILED. 0 passed; 1 failed)
+M2d item 2: load_memory_estimate drops the copy from the device bound -> RED
+    provider::tests::ggml_admission_prices_the_quantized_copy_beside_the_source: RED (test result: FAILED. 0 passed; 1 failed)
+    provider::tests::q8_load_estimate_prices_the_copy_the_loader_builds: RED (test result: FAILED. 0 passed; 1 failed)
