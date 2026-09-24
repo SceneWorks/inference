@@ -148,6 +148,39 @@ impl std::fmt::Debug for ProjectionFormat {
     }
 }
 
+/// Candle's CUDA `MATRIX_ROW_PADDING` (elements): every GGML tensor candle quantizes onto a CUDA
+/// device is allocated this many elements' worth of blocks past its payload.
+const GGML_CUDA_ROW_PADDING: u64 = 512;
+
+/// Device bytes of an `elems`-element weight quantized to `dtype` by
+/// [`QuantizedLinear::quantize`]: the GGML blocks (what the load census counts) plus the CUDA row
+/// padding candle allocates past them. `None` on overflow. Load admission prices a GGML copy
+/// with it (sc-24140).
+pub(crate) fn ggml_device_bytes(elems: u64, dtype: GgmlDType) -> Option<u64> {
+    let (block, size) = (dtype.block_size() as u64, dtype.type_size() as u64);
+    elems
+        .div_ceil(block)
+        .checked_mul(size)?
+        .checked_add(GGML_CUDA_ROW_PADDING * size / block)
+}
+
+/// Device bytes of a `[rows, cols]` weight quantized to NVFP4 by [`Nvfp4Weight::quantize`] — the
+/// E2M1 nibbles over the `K`-padded columns plus the UE4M3 block scales laid out in cuBLASLt's
+/// 128 × 4 scale-factor atoms — or `None` when the FP4 GEMM cannot serve the shape
+/// ([`nvfp4_shape_refusal`], the test [`Projection::load_eligible`] keeps such a weight dense by)
+/// or on overflow. Load admission prices an NVFP4 copy with it (sc-24140).
+pub(crate) fn nvfp4_device_bytes(rows: usize, cols: usize) -> Option<u64> {
+    use candle_quant_kernels::nvfp4::{SF_ATOM_COLS, SF_ATOM_ROWS};
+    use candle_quant_kernels::{NVFP4_BLOCK, NVFP4_K_ALIGN};
+    nvfp4_shape_refusal(rows, cols).ok()?;
+    let cols_padded = cols.checked_next_multiple_of(NVFP4_K_ALIGN)?;
+    let nibbles = rows.checked_mul(cols_padded / 2)?;
+    let scales = rows
+        .checked_next_multiple_of(SF_ATOM_ROWS)?
+        .checked_mul((cols_padded / NVFP4_BLOCK).checked_next_multiple_of(SF_ATOM_COLS)?)?;
+    Some(nibbles.checked_add(scales)? as u64)
+}
+
 /// A linear projection weight, dense or quantized.
 pub enum Projection {
     /// A dense `[out, in]` weight wrapped in a Candle linear.

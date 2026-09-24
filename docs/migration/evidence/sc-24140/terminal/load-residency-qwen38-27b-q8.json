@@ -7,13 +7,16 @@
   "token_events": 256,
   "finish": "Some(Length)",
   "decode_record": "Some(DecodeRecord { path: StepModel, target_forwards: 256, prefill_forwards: 1, proposed_tokens: 0, accepted_tokens: 0, generated_tokens: 256, host_syncs: 256, sampler: SamplerTelemetry { path: Some(Device), device_draws: 256, host_draws: 0, logits_to_host: 0 }, kv_cache: Static, attn_formulation: Gqa, proposer: None, verify_steps: 255, direct_rollbacks: 0, replay_forwards: 0, verify_host_syncs: 255, fused_primitives: FusedTally { fused: 69888, reference: 0, reference_reason: None }, cuda_graphs: GraphTally { replayed: 0, eager: 0, captured: 0, fallback_reason: None }, nvfp4_projections: Nvfp4PathTally { gemv: 0, cublaslt: 0, cublaslt_reason: None } })",
-  "load_secs": 136.6927363,
+  "load_secs": 136.4398103,
   "admission": {
     "payload_bytes": 55563006776,
     "host_required_bytes": 3988973152,
-    "device_required_bytes": 98971605819,
-    "quantized_copy_bytes": 29517847349,
-    "device_required_bytes_at_r": 69453758470
+    "device_required_bytes": 97103455526,
+    "source_bytes": 55563006776,
+    "cast_copy_bytes": 0,
+    "quantized_copy_bytes": 27649697056,
+    "device_required_bytes_at_r": 69453758470,
+    "device_required_bytes_before_review": 98971605819
   },
   "census": {
     "total_resident_bytes": 30244800512,
@@ -47,49 +50,49 @@
       "pool_used_peak_bytes": 0
     },
     "after_load": {
-      "device_used_bytes": 43636031488,
-      "pool_reserved_bytes": 41842376704,
+      "device_used_bytes": 43870912512,
+      "pool_reserved_bytes": 42077257728,
       "pool_used_bytes": 32087943392,
       "pool_reserved_peak_bytes": 89053462528,
       "pool_used_peak_bytes": 85056862912
     },
-    "load_device_peak_polled_bytes": 91095519232,
+    "load_device_peak_polled_bytes": 91056984064,
     "after_first_decode_step": {
-      "device_used_bytes": 43763957760,
-      "pool_reserved_bytes": 41842376704,
+      "device_used_bytes": 43998838784,
+      "pool_reserved_bytes": 42077257728,
       "pool_used_bytes": 32438673896,
-      "pool_reserved_peak_bytes": 41842376704,
+      "pool_reserved_peak_bytes": 42077257728,
       "pool_used_peak_bytes": 32474553124
     },
     "at_last_token": {
       "index": 255,
       "sample": {
-        "device_used_bytes": 43763957760,
-        "pool_reserved_bytes": 41842376704,
+        "device_used_bytes": 43998838784,
+        "pool_reserved_bytes": 42077257728,
         "pool_used_bytes": 32438673896,
-        "pool_reserved_peak_bytes": 41842376704,
+        "pool_reserved_peak_bytes": 42077257728,
         "pool_used_peak_bytes": 32474553124
       }
     },
     "after_generate": {
-      "device_used_bytes": 43763957760,
-      "pool_reserved_bytes": 41842376704,
+      "device_used_bytes": 43998838784,
+      "pool_reserved_bytes": 42077257728,
       "pool_used_bytes": 32106658272,
-      "pool_reserved_peak_bytes": 41842376704,
+      "pool_reserved_peak_bytes": 42077257728,
       "pool_used_peak_bytes": 32474553124
     },
     "after_provider_drop": {
-      "device_used_bytes": 2047410176,
-      "pool_reserved_bytes": 134217728,
+      "device_used_bytes": 2013855744,
+      "pool_reserved_bytes": 100663296,
       "pool_used_bytes": 18714880,
-      "pool_reserved_peak_bytes": 41842376704,
+      "pool_reserved_peak_bytes": 42077257728,
       "pool_used_peak_bytes": 32474553124
     },
     "after_provider_drop_trimmed": {
-      "device_used_bytes": 2047410176,
-      "pool_reserved_bytes": 134217728,
+      "device_used_bytes": 2013855744,
+      "pool_reserved_bytes": 100663296,
       "pool_used_bytes": 18714880,
-      "pool_reserved_peak_bytes": 41842376704,
+      "pool_reserved_peak_bytes": 42077257728,
       "pool_used_peak_bytes": 32474553124
     }
   }

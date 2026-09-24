@@ -39,6 +39,48 @@ use crate::primitives::projection::{Projection, ProjectionFormat, QuantSpec, Wei
 use crate::primitives::rope::{rms_norm_rope, Rope};
 use crate::primitives::{KvCache, PrismRegistry, Weights};
 
+/// Whether a dense [`Qwen35Model`] / [`Qwen35Mtp`] load stores the checkpoint tensor `key` in a
+/// requested projection format rather than dense: in every decoder (and MTP) layer the Gated
+/// DeltaNet in/out projections (`in_proj_qkv`, `in_proj_z`, `out_proj`), the attention q/k/v/o,
+/// the dense MLP, the stacked MoE experts and the shared expert; and the MTP `fc`. The per-head
+/// `in_proj_a` / `in_proj_b`, the conv, `A_log` / `dt_bias`, the norms, the MoE router and
+/// shared-expert gate, and the embeddings stay dense. The LM head is quantized under every
+/// format — a tied head from a copy of the embedding — and is not a keyed rule here.
+///
+/// The rule load admission prices the quantized copy by (sc-24140); every loader site that
+/// quantizes a keyed tensor debug-asserts it.
+pub(crate) fn quantizes_tensor(key: &str) -> bool {
+    const LAYER_PROJECTIONS: [&str; 15] = [
+        "linear_attn.in_proj_qkv.weight",
+        "linear_attn.in_proj_z.weight",
+        "linear_attn.out_proj.weight",
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "self_attn.o_proj.weight",
+        "mlp.gate_proj.weight",
+        "mlp.up_proj.weight",
+        "mlp.down_proj.weight",
+        "mlp.experts.gate_up_proj",
+        "mlp.experts.down_proj",
+        "mlp.shared_expert.gate_proj.weight",
+        "mlp.shared_expert.up_proj.weight",
+        "mlp.shared_expert.down_proj.weight",
+    ];
+    key == "mtp.fc.weight"
+        || super::split_layer_key(key)
+            .is_some_and(|(_, _, suffix)| LAYER_PROJECTIONS.contains(&suffix))
+}
+
+/// The debug half of [`quantizes_tensor`]'s contract: a keyed tensor the loader stores in a
+/// requested `format` must be one admission priced.
+fn debug_assert_priced(key: &str, format: Option<&ProjectionFormat>) {
+    debug_assert!(
+        format.is_none() || quantizes_tensor(key),
+        "`{key}` is quantized on load but `quantizes_tensor` does not price it"
+    );
+}
+
 fn checkpoint_norm_weight(weight: Tensor, prism: bool) -> Result<Tensor> {
     if prism {
         Ok(weight)
@@ -1282,8 +1324,10 @@ impl Qwen35Mtp {
         let req = |key: &str| -> Result<Tensor> { Ok(w.require(key)?.to_dtype(dtype)?) };
         // Qwen3.5/Qwen3.8 RMSNorm parameters are zero-centered (`1 + weight`).
         let norm_w = |key: &str| -> Result<Tensor> { Ok(req(key)?.affine(1.0, 1.0)?) };
-        let proj_q =
-            |key: &str| -> Result<Projection> { Projection::load_as(req(key)?, None, format) };
+        let proj_q = |key: &str| -> Result<Projection> {
+            debug_assert_priced(key, format);
+            Projection::load_as(req(key)?, None, format)
+        };
         let groups = (cfg.num_heads / cfg.num_kv_heads) as usize;
         let mut layers = Vec::with_capacity(cfg.mtp_num_hidden_layers);
         for i in 0..cfg.mtp_num_hidden_layers {
@@ -2215,7 +2259,10 @@ impl Qwen35Model {
         let proj_q = |key: String| -> Result<Projection> {
             match prism.and_then(|registry| registry.get(&key)) {
                 Some(weight) => Ok(Projection::load_prism(weight.clone())),
-                None => Projection::load_as(req(key)?, None, format),
+                None => {
+                    debug_assert_priced(&key, format);
+                    Projection::load_as(req(key)?, None, format)
+                }
             }
         };
         let proj_dense = |key: String| -> Result<Projection> {
@@ -2314,6 +2361,8 @@ impl Qwen35Model {
                 // [E, hidden, moe_inter].
                 Some(moe) => {
                     let mi = moe.moe_intermediate_size as usize;
+                    debug_assert_priced(&lp("mlp.experts.gate_up_proj"), format);
+                    debug_assert_priced(&lp("mlp.experts.down_proj"), format);
                     let gate_up = req(lp("mlp.experts.gate_up_proj"))?;
                     let down = req(lp("mlp.experts.down_proj"))?;
                     let mut experts = Vec::with_capacity(moe.num_experts as usize);
@@ -3216,6 +3265,17 @@ pub(crate) mod tests {
         )
         .unwrap();
         (cfg, model)
+    }
+
+    /// The synthetic decoder's config JSON (4 layers: 3 linear, 1 full attention).
+    pub(crate) fn synthetic_cfg_json() -> Value {
+        cfg_json()
+    }
+
+    /// Seeded weights for any synthetic `cfg` (decoder under `model.language_model`, plus the MTP
+    /// head when `cfg.mtp_num_hidden_layers == 1`, the MoE bank when `cfg.moe` is set).
+    pub(crate) fn synthetic_snapshot_weights(cfg: &Qwen35Config) -> Weights {
+        synthetic_weights(cfg)
     }
 
     /// The parts a test needs to write the synthetic decoder as a snapshot directory: its config,

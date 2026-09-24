@@ -1,20 +1,25 @@
-# sc-24140 terminal: real-weight static_kv_parity on Qwen3.8-27B, source tree at e9e959a39f4c6b7b862f91466da1aef65bdf6360 (the code commit; this log is added after it).
-# RTX Pro 6000 / sm_120, GPU 1 (CUDA_VISIBLE_DEVICES=1, REQUIRE_SM120=1), GPU 1 at 889 MiB before the run.
+# sc-24140 terminal (review fixes): real-weight static_kv_parity on Qwen3.8-27B, source tree at the review-fix commit (this log is committed with it; base bd66280edc88c982d75afad80ccb71db556e5c8f).
+# RTX Pro 6000 / sm_120, GPU 1 (CUDA_VISIBLE_DEVICES=1, REQUIRE_SM120=1), GPU 1 at 879 MiB before the run.
 # cargo test --release --locked -p candle-llm --features cuda --test static_kv_parity -- --ignored --nocapture --test-threads=1
 
-GPU1 used: 889 MiB
-    Finished `release` profile [optimized] target(s) in 10.09s
+warning: candle-kernels@0.10.2: Compiling 11 of 11 PTX kernels
+warning: candle-kernels@0.10.2: Using 24 threads for compilation
+warning: candle-kernels@0.10.2: Compiling 15 of 15 kernels
+   Compiling candle-llm v0.0.0 (D:\repos\inference\.claude\worktrees\fix-terminal\crates\llm\candle-llm)
+    Finished `release` profile [optimized] target(s) in 9.72s
      Running tests\static_kv_parity.rs (C:\cargo-targets\fix-terminal\release\deps\static_kv_parity-a21a794db8ff3e56.exe)
+
 running 4 tests
-[ac1] 256 tokens identical across reference / static / growing (gqa); growing record DecodeRecord { path: StepModel, target_forwards: 256, prefill_forwards: 1, proposed_tokens: 0, accepted_tokens: 0, generated_tokens: 256, host_syncs: 256, sampler: SamplerTelemetry { path: Some(Device), device_draws: 256, host_draws: 0, logits_to_host: 0 }, kv_cache: Growing, attn_formulation: Gqa, proposer: None, verify_steps: 255, direct_rollbacks: 0, replay_forwards: 0, verify_host_syncs: 255, fused_primitives: FusedTally { fused: 69888, reference: 0, reference_reason: None }, cuda_graphs: GraphTally { replayed: 0, eager: 0, captured: 0, fallback_reason: None }, nvfp4_projections: Nvfp4PathTally { gemv: 0, cublaslt: 0, cublaslt_reason: None } }
-test ac1_static_kv_greedy_fixture_is_token_identical_to_attn_kv ... ok
-[ac3] 16 attention buffers pinned across 256 steps and a rollback to 349; preallocated 792854528 bytes (23134208 KV + 769720320 checkpoint ring)
-test ac3_static_kv_device_pointers_are_stable_across_the_fixture_and_a_rollback ... ok
-[sc-24140] engine 256 tokens / 255 events, reference 256 tokens / 255 events, identical=true
-test provider_off_path_is_token_identical_to_the_reference_loop ... ok
-[teacher-forced] 256 positions; argmax agrees at 255; max |delta logit| =          2.703125 at position 56 (reference logit 5.28125, row range 41.125); mean per-position max          |delta| = 0.25434303
+test ac1_static_kv_greedy_fixture_is_token_identical_to_attn_kv ... [ac1] 256 tokens identical across reference / static / growing (gqa); growing record DecodeRecord { path: StepModel, target_forwards: 256, prefill_forwards: 1, proposed_tokens: 0, accepted_tokens: 0, generated_tokens: 256, host_syncs: 256, sampler: SamplerTelemetry { path: Some(Device), device_draws: 256, host_draws: 0, logits_to_host: 0 }, kv_cache: Growing, attn_formulation: Gqa, proposer: None, verify_steps: 255, direct_rollbacks: 0, replay_forwards: 0, verify_host_syncs: 255, fused_primitives: FusedTally { fused: 69888, reference: 0, reference_reason: None }, cuda_graphs: GraphTally { replayed: 0, eager: 0, captured: 0, fallback_reason: None }, nvfp4_projections: Nvfp4PathTally { gemv: 0, cublaslt: 0, cublaslt_reason: None } }
+ok
+test ac3_static_kv_device_pointers_are_stable_across_the_fixture_and_a_rollback ... [ac3] 16 attention buffers pinned across 256 steps and a rollback to 349; preallocated 792854528 bytes (23134208 KV + 769720320 checkpoint ring)
+ok
+test provider_off_path_is_token_identical_to_the_reference_loop ... [sc-24140] engine 256 tokens / 255 events, reference 256 tokens / 255 events, identical=true
+ok
+test teacher_forced_static_vs_attn_kv_logit_parity_report ... [teacher-forced] 256 positions; argmax agrees at 255; max |delta logit| =          2.703125 at position 56 (reference logit 5.28125, row range 41.125); mean per-position max          |delta| = 0.25434303
 [teacher-forced] pos 107: static argmax 6355 (top-2 gap 0), reference argmax              883 (top-2 gap 0.125 = 1 bf16 ULPs of the top logit), max |delta logit| 0.125
-test teacher_forced_static_vs_attn_kv_logit_parity_report ... ok
-test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 244.24s
+ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 239.23s
+
 EXIT=0
-[exited with code 0]

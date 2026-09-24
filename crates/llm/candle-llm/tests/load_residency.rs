@@ -1,10 +1,12 @@
 //! `load_residency` — where a provider load's device memory goes, format by format (sc-24140
 //! terminal measurement, E6).
 //!
-//! One `#[ignore]`d test that loads a snapshot through [`LlamaProvider::load`] in one weight
-//! format, generates a greedy fixture, and records the device memory at each stage next to the
-//! figure admission priced the load at ([`LlamaProvider::load_memory_estimate`], the function the
-//! load itself admits with) and the loaded weight census. Every sample is taken after a
+//! One `#[ignore]`d test that loads a snapshot (or a single `*.gguf` file) through
+//! [`LlamaProvider::load`] in one weight format, generates a greedy fixture, and records the
+//! device memory at each stage next to the figure admission priced the load at
+//! ([`LlamaProvider::load_memory_estimate`], the function the load itself admits with) and the
+//! loaded weight census. It fails when the load's polled device peak (over the pre-load
+//! baseline) exceeds that admitted device bound, so a pricing regression fails the measurement. Every sample is taken after a
 //! device-wide synchronize and reads both the driver (`cuMemGetInfo` total - free: device-wide,
 //! so the CUDA context, loaded kernels and any co-tenant are included) and the device's current
 //! CUDA memory pool — the stream-ordered allocator cudarc serves every candle allocation from:
@@ -15,7 +17,7 @@
 //!
 //! | variable                    | meaning                                                      |
 //! |-----------------------------|--------------------------------------------------------------|
-//! | `LOAD_RESIDENCY_SNAPSHOT`   | snapshot directory (config.json, tokenizer*.json, shards)    |
+//! | `LOAD_RESIDENCY_SNAPSHOT`   | snapshot directory (config.json, tokenizer*.json, shards), or a `*.gguf` file |
 //! | `LOAD_RESIDENCY_FORMAT`     | `bf16` (default, dense), `q8`, `q4` or `nvfp4` — `LoadSpec::quantize` |
 //! | `LOAD_RESIDENCY_NEW_TOKENS` | greedy tokens generated (default 256)                        |
 //! | `LOAD_RESIDENCY_OUTPUT`     | JSON path to write (optional; the document is always printed) |
@@ -141,9 +143,12 @@ fn load_residency_by_format() {
         .context()
         .clone();
     let estimate = LlamaProvider::load_memory_estimate(&spec, true).unwrap();
+    let device_required = estimate
+        .device_required_bytes
+        .expect("a CUDA load has a device bound");
     let payload = estimate.payload_bytes;
     // The device bound at R (e9faeabdb) for comparison: payload + 25 % headroom, plus the packed
-    // copy for NVFP4 only — the GGML copy was unpriced there.
+    // copy for NVFP4 only — the GGML copy was unpriced there, and a GGUF was priced as its file.
     let admission_at_r = payload
         + payload / 4
         + if quantize == Some(Quantize::Nvfp4) {
@@ -151,8 +156,20 @@ fn load_residency_by_format() {
         } else {
             0
         };
+    // The bound before the sc-24140 review (bd66280ed): the copy priced over the whole payload
+    // (Q8_0 at 17/32, Q4_K and NVFP4 at 9/32) — still the file plus 25 % for a GGUF.
+    let gguf = snapshot.ends_with(".gguf");
+    let admission_before_review = payload
+        + payload / 4
+        + match quantize {
+            _ if gguf => 0,
+            Some(Quantize::Q8) => payload * 17 / 32,
+            Some(Quantize::Q4 | Quantize::Nvfp4) => payload * 9 / 32,
+            None => 0,
+        };
 
     let before_load = sample(&ctx);
+    let baseline = before_load["device_used_bytes"].as_u64().unwrap();
     reset_pool_peaks(&ctx);
     let stop = Arc::new(AtomicBool::new(false));
     let polled_peak = Arc::new(AtomicU64::new(0));
@@ -218,8 +235,11 @@ fn load_residency_by_format() {
             "payload_bytes": payload,
             "host_required_bytes": estimate.host_required_bytes,
             "device_required_bytes": estimate.device_required_bytes,
+            "source_bytes": estimate.source_bytes,
+            "cast_copy_bytes": estimate.cast_copy_bytes,
             "quantized_copy_bytes": estimate.quantized_copy_bytes,
             "device_required_bytes_at_r": admission_at_r,
+            "device_required_bytes_before_review": admission_before_review,
         },
         "census": {
             "total_resident_bytes": total.resident_bytes,
@@ -244,6 +264,14 @@ fn load_residency_by_format() {
     if let Ok(path) = std::env::var("LOAD_RESIDENCY_OUTPUT") {
         std::fs::write(&path, &text).unwrap();
     }
+    // E6: the load never peaks above the device bound it was admitted against (device-wide
+    // polled peak over the pre-load baseline, so a co-tenant's steady use cancels out).
+    let load_peak = load_device_peak.saturating_sub(baseline);
+    assert!(
+        load_peak <= device_required,
+        "the load peaked at {load_peak} B over its baseline, above the {device_required} B it \
+         was admitted against"
+    );
     assert_eq!(
         out.usage.generated_tokens, new_tokens,
         "the fixture ran to length"

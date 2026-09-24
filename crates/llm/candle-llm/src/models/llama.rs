@@ -64,6 +64,87 @@ fn dense_tensor(
     Ok(source.to_device(target)?.to_dtype(dtype)?)
 }
 
+/// Whether a [`CausalLm`] load stores the decoder-layer tensor `suffix` (its key after
+/// `{decoder_root}.layers.{i}.`, see [`split_layer_key`](super::split_layer_key)) in a requested
+/// projection format rather than dense: the attention projections (q/k/v/o, Phi-3's fused
+/// `qkv_proj`, MLA's low-rank q/kv), the MLP projections (and Phi-3's fused `gate_up_proj`) and
+/// every MoE expert / shared-expert projection. Norms, MoE routers and the shared-expert gate stay
+/// dense; the LM head is a projection only under NVFP4 (see `from_weights_format`).
+///
+/// This is the rule load admission prices the quantized copy by (sc-24140). Every loader site
+/// that quantizes a layer tensor debug-asserts it, so the pricing and the loader cannot drift
+/// apart unnoticed.
+pub(crate) fn quantizes_layer_tensor(suffix: &str) -> bool {
+    const PROJECTIONS: [&str; 19] = [
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "self_attn.o_proj.weight",
+        "self_attn.qkv_proj.weight",
+        "self_attn.q_a_proj.weight",
+        "self_attn.q_b_proj.weight",
+        "self_attn.kv_a_proj_with_mqa.weight",
+        "self_attn.kv_b_proj.weight",
+        "mlp.gate_proj.weight",
+        "mlp.up_proj.weight",
+        "mlp.down_proj.weight",
+        "mlp.gate_up_proj.weight",
+        "mlp.shared_expert.gate_proj.weight",
+        "mlp.shared_expert.up_proj.weight",
+        "mlp.shared_expert.down_proj.weight",
+        "mlp.shared_experts.gate_proj.weight",
+        "mlp.shared_experts.up_proj.weight",
+        "mlp.shared_experts.down_proj.weight",
+    ];
+    if PROJECTIONS.contains(&suffix) {
+        return true;
+    }
+    // `mlp.experts.{e}.{gate,up,down}_proj.weight`
+    suffix
+        .strip_prefix("mlp.experts.")
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(expert, projection)| {
+            expert.parse::<usize>().is_ok()
+                && matches!(
+                    projection,
+                    "gate_proj.weight" | "up_proj.weight" | "down_proj.weight"
+                )
+        })
+}
+
+/// The debug half of [`quantizes_layer_tensor`]'s contract: a layer tensor the loader stores in a
+/// requested `format` must be one admission priced.
+fn debug_assert_priced(key: &str, format: Option<&ProjectionFormat>) {
+    debug_assert!(
+        format.is_none()
+            || super::split_layer_key(key)
+                .is_some_and(|(_, _, suffix)| quantizes_layer_tensor(suffix)),
+        "`{key}` is quantized on load but `quantizes_layer_tensor` does not price it"
+    );
+}
+
+/// Whether the checkpoint nests the decoder under `model.language_model` (the Qwen3-VL wrapper,
+/// and a wrapped Gemma 4, probed by `has_key`) rather than `[{prefix}.]model`.
+fn vlm_nested(cfg: &ModelConfig, has_key: impl Fn(&str) -> bool) -> bool {
+    cfg.architecture.is_qwen3_vl()
+        || (cfg.architecture.is_gemma4() && has_key("model.language_model.embed_tokens.weight"))
+}
+
+/// The root the decoder's keys hang off (`{root}.embed_tokens.weight`, `{root}.layers.{i}.…`) —
+/// `model.language_model` for a wrapped VLM, `[{prefix}.]model` otherwise. Shared by the loader
+/// and load admission (sc-24140).
+pub(crate) fn decoder_root(
+    cfg: &ModelConfig,
+    prefix: &str,
+    has_key: impl Fn(&str) -> bool,
+) -> String {
+    if vlm_nested(cfg, has_key) {
+        "model.language_model".to_string()
+    } else {
+        join(prefix, "model")
+    }
+}
+
 fn projection_from_weights(
     w: &Weights,
     wkey: &str,
@@ -72,6 +153,7 @@ fn projection_from_weights(
     format: Option<&ProjectionFormat>,
     target_device: Option<&Device>,
 ) -> Result<Projection> {
+    debug_assert_priced(wkey, format);
     let stem = wkey.strip_suffix(".weight").unwrap_or(wkey);
     let scales_key = format!("{stem}.scales");
     let source = w.require(wkey)?;
@@ -270,14 +352,8 @@ impl CausalLm {
         // packed encoder, whose weights are re-rooted on unpack) keeps the plain `model.*` layout.
         // Probe rather than guess: the nesting is a checkpoint fact, not a config one, and picking
         // the wrong stem fails on the very first weight lookup with a key the caller never wrote.
-        let vlm_nested = cfg.architecture.is_qwen3_vl()
-            || (cfg.architecture.is_gemma4()
-                && w.contains("model.language_model.embed_tokens.weight"));
-        let decoder_root = if vlm_nested {
-            "model.language_model".to_string()
-        } else {
-            join(prefix, "model")
-        };
+        let vlm_nested = vlm_nested(&cfg, |key| w.contains(key));
+        let decoder_root = decoder_root(&cfg, prefix, |key| w.contains(key));
         let p = |suffix: &str| join(&decoder_root, suffix);
         let req = |key: String| -> Result<Tensor> { dense_tensor(w, &key, dtype, target_device) };
         let proj = |key: String| -> Result<Projection> {
@@ -387,6 +463,7 @@ impl CausalLm {
                 let (q, kv) = {
                     let packed = lp("self_attn.qkv_proj.weight");
                     if w.contains(&packed) {
+                        debug_assert_priced(&packed, format);
                         let stem = packed.strip_suffix(".weight").unwrap_or(&packed);
                         if w.contains(&format!("{stem}.scales")) {
                             return Err(Error::Config(format!(
@@ -502,6 +579,7 @@ impl CausalLm {
                 let (gate, up) = {
                     let packed = lp("mlp.gate_up_proj.weight");
                     if w.contains(&packed) {
+                        debug_assert_priced(&packed, format);
                         let stem = packed.strip_suffix(".weight").unwrap_or(&packed);
                         if w.contains(&format!("{stem}.scales")) {
                             return Err(Error::Config(format!(

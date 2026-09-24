@@ -13,6 +13,29 @@ use candle_nn::{Linear, Module};
 
 use crate::error::Result;
 
+/// The input width `in` of an MLX affine **8-bit** triple in the layout
+/// [`QuantizedLinear::from_mlx_affine_q8`] accepts — a `U32` code matrix `[out, in / 4]` (four
+/// 8-bit codes per word) beside `[out, in / group_size]` scales and biases — or `None` for any
+/// other layout, which it refuses (a 4-bit pack, eight codes per word, among them). Load admission
+/// prices the Q8_0 repack by this same test (sc-24140), so it prices no copy for a triple the
+/// loader refuses.
+pub(crate) fn mlx_affine_q8_in_dim(
+    weight_is_u32: bool,
+    weight: (usize, usize),
+    scales: (usize, usize),
+    biases: (usize, usize),
+    group_size: usize,
+) -> Option<usize> {
+    let (out_dim, packed_cols) = weight;
+    let in_dim = scales.1.checked_mul(group_size)?;
+    (weight_is_u32
+        && group_size != 0
+        && scales.0 == out_dim
+        && biases == scales
+        && packed_cols.checked_mul(4) == Some(in_dim))
+    .then_some(in_dim)
+}
+
 /// A linear projection whose weight is stored GGML block-quantized.
 pub struct QuantizedLinear {
     inner: QuantizedWeight,
@@ -61,16 +84,14 @@ impl QuantizedLinear {
         device: &Device,
     ) -> Result<Self> {
         let (out_dim, packed_cols) = weight.dims2()?;
-        let (scale_rows, scale_cols) = scales.dims2()?;
-        let in_dim = scale_cols.checked_mul(group_size).ok_or_else(|| {
-            crate::error::Error::Config("MLX affine Q8 input width overflow".into())
-        })?;
-        if weight.dtype() != DType::U32
-            || group_size == 0
-            || scale_rows != out_dim
-            || biases.dims2()? != (scale_rows, scale_cols)
-            || packed_cols.checked_mul(4) != Some(in_dim)
-        {
+        let (_, scale_cols) = scales.dims2()?;
+        let Some(in_dim) = mlx_affine_q8_in_dim(
+            weight.dtype() == DType::U32,
+            (out_dim, packed_cols),
+            scales.dims2()?,
+            biases.dims2()?,
+            group_size,
+        ) else {
             return Err(crate::error::Error::Config(format!(
                 "invalid MLX affine Q8 triple: weight {:?} {:?}, scales {:?}, biases {:?}, group {group_size}",
                 weight.dtype(),
@@ -78,7 +99,7 @@ impl QuantizedLinear {
                 scales.shape(),
                 biases.shape()
             )));
-        }
+        };
 
         let cpu = Device::Cpu;
         let words = weight.to_device(&cpu)?.flatten_all()?.to_vec1::<u32>()?;

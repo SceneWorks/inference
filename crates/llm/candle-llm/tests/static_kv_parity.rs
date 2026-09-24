@@ -227,6 +227,11 @@ fn ac3_static_kv_device_pointers_are_stable_across_the_fixture_and_a_rollback() 
     cache.rollback_to(n).unwrap();
     assert_eq!(cache.len(), n);
     assert_eq!(cache.static_kv_addresses().unwrap(), addresses);
+    assert_eq!(
+        cache.memory(),
+        preallocated,
+        "a rollback keeps every buffer and ring slot it was priced for"
+    );
     model
         .forward_step(&mut cache, StepRequest::last(&[1]))
         .unwrap();
