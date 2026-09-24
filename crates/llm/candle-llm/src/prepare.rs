@@ -240,12 +240,13 @@ fn requant_projections(tensors: &mut HashMap<String, Tensor>, q: QuantSpec) -> R
             continue;
         }
         let dtype = w.dtype();
-        let qt = QTensor::quantize(&w.to_dtype(DType::F32)?, q.dtype).map_err(|e| {
+        let ggml = q.dtype_for_in_dim(w.dims()[1]);
+        let qt = QTensor::quantize(&w.to_dtype(DType::F32)?, ggml).map_err(|e| {
             Error::Unsupported(format!(
                 "prepare: cannot quantize `{key}` {:?} to {:?}: {e} — the input dimension must be a \
-                 multiple of the block size (Q4_K=256, Q8_0=32); use Q8 for non-256-aligned models",
+                 multiple of the block size (Q4_K=256, falling back to Q4_0=32; Q8_0=32)",
                 w.dims(),
-                q.dtype
+                ggml
             ))
         })?;
         let rounded = qt.dequantize(&Device::Cpu)?.to_dtype(dtype)?;

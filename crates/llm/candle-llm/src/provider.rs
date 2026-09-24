@@ -1793,6 +1793,17 @@ impl LlamaProvider {
         self.model.is_quantized()
     }
 
+    /// The loaded Llama-family decoder, or `None` for the Qwen3.6 hybrid. An engine that runs its
+    /// own decode loop over raw logits (YuE's CFG / allow-range / teacher-forced loops, epic
+    /// sc-19373) loads through [`LlamaProvider::load`] — the same `LoadSpec`, admission and
+    /// persisted-`quantization` handling as every other caller — and drives this directly.
+    pub fn causal_lm(&self) -> Option<&CausalLm> {
+        match &self.model {
+            Decoder::Causal(m) => Some(m),
+            Decoder::Qwen35(_) => None,
+        }
+    }
+
     /// The load telemetry: the requested weight format and the resident weight census by
     /// projection kind (sc-24135).
     pub fn load_record(&self) -> LoadRecord {
