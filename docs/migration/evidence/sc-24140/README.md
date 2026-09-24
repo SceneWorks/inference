@@ -31,13 +31,19 @@ equality.
 The 256 tokens produce 255 events because the `<think>` marker token is stripped by the
 reasoning segmenter on both paths.
 
-Measured at the commit recorded in the JSON (`commit`, `worktree_dirty`):
+Measured at commit `4180cec58a8222ec581f572f8742e1f86ee44c9d` on a clean tracked tree (the JSON
+records `commit` and `worktree_dirty`). Load took 60 s. Each 256-token decode took about 19–20 s
+on both paths:
 
 ```text
 BONSAI_QWEN38_SNAPSHOT=E:\huggingface\hub\models--Qwen--Qwen3.8-27B\snapshots\1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
 SC24140_EVIDENCE_OUTPUT=<worktree>\docs\migration\evidence\sc-24140\provider-off-path-parity-qwen38-27b.json
 cargo test --release --locked -p candle-llm --features cuda --test static_kv_parity -- --ignored --nocapture --exact provider_off_path_is_token_identical_to_the_reference_loop
 ```
+
+The sc-24132 AC1 test was re-run over the new `generate_step`, which is now the engine with no
+proposer. Its tokens are identical across reference / static / growing (`gqa`), with the engine's
+record convention (`ac1-generate-step-engine-qwen38-27b.log`).
 
 ## Mutations
 
