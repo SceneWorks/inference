@@ -567,3 +567,49 @@
     thread 'models::llama::tests::nvfp4_format_loads_every_eligible_projection_and_the_head_as_nvfp4' (35228) panicked at crates\llm\candle-llm\src\models\llama.rs:2755:85:
     test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 410 filtered out; finished in 0.26s
 
+[G3] RED (exit 101, 84s)
+  assertion: E1 gate (Qwen3-8B, combined test): a teacher-forced verify-shaped forward flips the argmax only at a <= 1 bf16 ULP knife-edge
+  mutation:  every teacher-forced disagreement counted as a violation
+  file:      crates\llm\candle-llm\tests\speculative_engine_parity.rs
+  gate:      cargo test --locked --release --features cuda -p candle-llm --test speculative_engine_parity -- llama_family_qwen3_8b_exact_rows_and_teacher_forced_knife_edge_gate --ignored --nocapture --test-threads=1
+  failure:
+    thread 'llama_family_qwen3_8b_exact_rows_and_teacher_forced_knife_edge_gate' (38672) panicked at crates\llm\candle-llm\tests\speculative_engine_parity.rs:705:5:
+    FAILED
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 78.05s
+
+[G4] RED (exit 101, 41s)
+  assertion: exact rows (Qwen3-8B, combined test) are token-identical to the reference loop
+  mutation:  the reference loop computes the pre-migration Expanded attention
+  file:      crates\llm\candle-llm\tests\speculative_engine_parity.rs
+  gate:      cargo test --locked --release --features cuda -p candle-llm --test speculative_engine_parity -- llama_family_qwen3_8b_exact_rows_and_teacher_forced_knife_edge_gate --ignored --nocapture --test-threads=1
+  failure:
+    thread 'llama_family_qwen3_8b_exact_rows_and_teacher_forced_knife_edge_gate' (39928) panicked at crates\llm\candle-llm\tests\speculative_engine_parity.rs:677:5:
+    FAILED
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 35.23s
+
+[R17] RED (exit 101, 2s)
+  assertion: the free-running record names each divergence, its gap in ULP and whether it is a knife-edge
+  mutation:  the record reports the raw gap instead of gap / ULP
+  file:      crates\llm\candle-llm\tests\speculative_engine_parity.rs
+  gate:      cargo test --locked -p candle-llm --test speculative_engine_parity -- the_free_running_record
+  failure:
+    test the_free_running_record_names_each_divergence_its_gap_and_whether_it_is_a_knife_edge ... FAILED
+    thread 'the_free_running_record_names_each_divergence_its_gap_and_whether_it_is_a_knife_edge' (36896) panicked at crates\llm\candle-llm\tests\speculative_engine_parity.rs:469:5:
+    assertion `left == right` failed
+    left: [FreeRunning { row: "identical", divergence: None }, FreeRunning { row: "at an edge", divergence: Some((3, 0.0, true)) }, FreeRunning { row: "off an edge", divergence: Some((2, 0.25, false)) }]
+    right: [FreeRunning { row: "identical", divergence: None }, FreeRunning { row: "at an edge", divergence: Some((3, 0.0, true)) }, FreeRunning { row: "off an edge", divergence: Some((2, 4.0, false)) }]
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+[R18] RED (exit 101, 2s)
+  assertion: the free-running record marks an off-edge divergence as not a knife-edge
+  mutation:  every divergence marked a knife-edge
+  file:      crates\llm\candle-llm\tests\speculative_engine_parity.rs
+  gate:      cargo test --locked -p candle-llm --test speculative_engine_parity -- the_free_running_record
+  failure:
+    test the_free_running_record_names_each_divergence_its_gap_and_whether_it_is_a_knife_edge ... FAILED
+    thread 'the_free_running_record_names_each_divergence_its_gap_and_whether_it_is_a_knife_edge' (37560) panicked at crates\llm\candle-llm\tests\speculative_engine_parity.rs:469:5:
+    assertion `left == right` failed
+    left: [FreeRunning { row: "identical", divergence: None }, FreeRunning { row: "at an edge", divergence: Some((3, 0.0, true)) }, FreeRunning { row: "off an edge", divergence: Some((2, 4.0, true)) }]
+    right: [FreeRunning { row: "identical", divergence: None }, FreeRunning { row: "at an edge", divergence: Some((3, 0.0, true)) }, FreeRunning { row: "off an edge", divergence: Some((2, 4.0, false)) }]
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+

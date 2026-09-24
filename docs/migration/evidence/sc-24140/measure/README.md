@@ -9,6 +9,28 @@ feature head carrying S11 #1035 and the round-1 decode fixes #1036), clean tree.
 adds only the per-thread mask accounting in tests (`attention.rs`) and boxes the `CausalLm` LM
 head with its device (CUDA clippy `large_enum_variant`) — no arithmetic change.
 
+## The E1 rule for speculative rows
+
+Decided at this feature-end review (finding D); stated once here, applied on both families in
+`crates/llm/candle-llm/tests/speculative_engine_parity.rs`:
+
+* **Exact rows are gated token-identical**: every path with no verify forward — the reference
+  loop, the static step seam, the fused-off loops and the CUDA-graph fallback.
+* **The E1 gate for speculative rows is the teacher-forced verify-shaped forward**: every row of
+  an `M = 2..6` verify forward over the reference fixture, from a cache the single-token path wrote,
+  may disagree with the single-token argmax only at a reference position whose top-2 logit gap is
+  `<= 1` bf16 ULP of its top logit (the S2 mechanism: cuBLAS rounds an `M`-row GEMM differently
+  from `M = 1`).
+* **Free-running speculative rows are recorded, not gated**: first divergence and the reference's
+  top-2 gap in ULP. A free-running row compounds the same rounding — its later positions attend
+  K/V that earlier verify forwards wrote — so any fixed ULP bound on it would be arbitrary.
+
+The case that decided it: Qwen3-8B, n-gram K=3, free-running, first diverges at **@51 with a
+2.00-ULP** reference gap, while the teacher-forced gate **passes** (no single verify forward flips
+@51; every teacher-forced flip is at ≤ 1 ULP). Qwen3.8-27B keeps its gate in
+`teacher_forced_verify_shaped_forward_vs_single_token_knife_edge_gate`; its AC1 free-running rows
+are now recorded the same way.
+
 ## A — NVFP4 reaches the llama family (`CausalLm`)
 
 `CausalLm::from_weights_format(w, prefix, cfg, Option<&ProjectionFormat>)` is the one loader for
@@ -110,10 +132,10 @@ the smoke above (both sampled rows on every cell).
 
 ## D — the llama-family knife-edge gate (Qwen3-8B, 256 tokens)
 
-`single_token_gaps` / `knife_edges` are generic over `StepModel`. Log: `knife-edge-qwen3-8b.log`
-(merged head, GPU 1).
-
-`llama_family_qwen3_8b_exact_rows_and_ngram_knife_edge_gate`:
+`single_token_gaps` / `knife_edges` are generic over `StepModel`; the free-running record is
+`free_running_record`. One test, `llama_family_qwen3_8b_exact_rows_and_teacher_forced_knife_edge_gate`,
+applies the E1 rule above. Log: `knife-edge-qwen3-8b.log` (commit `8ea9d21e0`, clean tree, GPU 1):
+**passes**.
 
 | row | vs the reference loop (growing, `gqa`) |
 |---|---|
@@ -121,22 +143,18 @@ the smoke above (both sampled rows on every cell).
 | reference loop, fused primitives off | **identical** |
 | static step seam, fused off | **identical** |
 | CUDA-graph runner, switch on (own stream) | **identical**; 0 replayed / 256 eager, fallback `positions_host_scalar` |
-| n-gram K=2 | first divergence @65 — top-2 gap **0.00** bf16 ULP (knife-edge) |
-| n-gram K=4 | @132 — **0.50** ULP (knife-edge) |
-| n-gram K=3 | @51 — **2.00** ULP: **not** a knife-edge → the gate **fails** |
+| teacher-forced verify-shaped forwards, M = 2..6, every row (**the E1 gate**) | **holds**: 30 disagreements, every one at 65 (0 ULP), 90 / 134 / 141 (1.0 ULP) or 132 (0.5 ULP) |
+| free-running n-gram K=2 (recorded) | first divergence @65 — top-2 gap **0.00** bf16 ULP (a knife-edge) |
+| free-running n-gram K=4 (recorded) | @132 — **0.50** ULP (a knife-edge) |
+| free-running n-gram K=3 (recorded) | @51 — **2.00** ULP (not a knife-edge) |
 
 Reference knife-edges (gap ≤ 1 ULP): 17, 65, 90, 132, 134, 141, 148, 193, 228. The S10 README's
 statement that @51 is a knife-edge is **not true** under the decided rule (it was never
 enumerated).
 
-`llama_family_qwen3_8b_teacher_forced_verify_shaped_knife_edge_gate` (E1 as worded — one
-verify-shaped forward, M = 2..6, every row, from a cache the single-token path wrote, undone by
-offset rollback): **passes**. Every argmax disagreement is at 65 (0 ULP), 90 / 134 / 141 (1.0 ULP)
-or 132 (0.5 ULP). Position 51 never flips in a single verify forward: the free-running K=3 row
-reaches a 2-ULP flip through **compounding** — its later positions attend K/V that earlier verify
-forwards (M = 4 GEMMs) wrote. Whether the free-running exception should cover that drift (e.g. a
-2-ULP bound for free-running rows, or the teacher-forced gate as the E1 check) is a product
-decision; the free-running gate is left asserting the decided ≤ 1 ULP rule, so it records RED.
+Position 51 never flips in a single verify forward: the free-running K=3 row reaches a 2-ULP
+flip through compounding — its later positions attend K/V that earlier verify forwards (M = 4
+GEMMs) wrote. Under the E1 rule that row is recorded, not gated.
 
 ## E — `REQUIRE_SM120=1`
 
@@ -149,10 +167,16 @@ they fail (3 of 3 and 9 of 9) naming the reason; on GPU 1 with `REQUIRE_SM120=1`
 
 ## Mutations
 
-`mutations.log` — 51 mutations, one per added or changed assertion, each applied alone to a
-touched source, the named gate run, and the source restored: **51 RED** (P19 reds through the
+`mutations.log` — 55 mutations, one per added or changed assertion, each applied alone to a
+touched source, the named gate run, and the source restored: **55 RED** (P19 reds through the
 campaign's own coverage refusal, a `ValueError`, rather than the test's assertion). Python
 harness (P1–P21), Rust CPU (R1–R16, S1–S2 — the S11 probe after the merge —, T1), Rust CUDA on
 GPU 1 (C1–C5), real weights on GPU 1 (G1: the reference loop computing `Expanded` fails the exact
 rows at 65; G2: counting every disagreement fails the teacher-forced gate). R1b / R2b / C1b / C2b
-re-run the head mutations on the final (boxed-head) code.
+re-run the head mutations on the final (boxed-head) code. After the E1 decision (G3, G4, R17,
+R18 on the combined Qwen3-8B test and the free-running record): counting every teacher-forced
+disagreement fails the E1 gate (G3, GPU 1); the reference computing `Expanded` fails the exact
+rows (G4, GPU 1); the record reporting the raw gap (R17) or marking every divergence a knife-edge
+(R18) fails its unit test. G1, G2 and R11 were run against the pre-decision tests
+(`…_exact_rows_and_ngram_knife_edge_gate`, `…_teacher_forced_verify_shaped_knife_edge_gate`,
+`off_edge_divergences`), which the combined test and `free_running_record` replace.
