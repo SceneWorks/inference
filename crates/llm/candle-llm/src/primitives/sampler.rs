@@ -786,6 +786,16 @@ impl Ord for ByWeight {
 /// Why a kernel: at the pinned Candle rev, `arg_sort_last_dim` sorts a row inside one block's
 /// shared memory (a 248k vocabulary does not fit) and `cumsum` is a triangular matmul
 /// (quadratic in the vocabulary), so top-k / top-p cannot be expressed with Candle ops.
+/// The device sampler's kernels, compiled through the shared nvrtc compile-once seam (sc-24137 /
+/// sc-23990): once per device, failure cached, no build.rs. Listed in
+/// [`NVRTC_SOURCES`](super::NVRTC_SOURCES).
+pub(crate) const SAMPLER_SRC: candle_quant_kernels::KernelSource =
+    candle_quant_kernels::KernelSource {
+        name: "candle_llm_sampler_v1",
+        src: include_str!("sampler_cuda.cu"),
+        cc_floor: (7, 0),
+    };
+
 #[cfg(feature = "cuda")]
 mod cuda {
     use super::SamplingParams;
@@ -798,13 +808,6 @@ mod cuda {
     use candle_core::{CpuStorage, CudaStorage, CustomOp1, Device, Layout, Shape, Storage, Tensor};
     use candle_quant_kernels::KernelSource;
 
-    /// The sampler kernels, compiled through the shared nvrtc compile-once seam (sc-24137 /
-    /// sc-23990): once per device, failure cached, no build.rs.
-    const SRC: KernelSource = KernelSource {
-        name: "candle_llm_sampler_v1",
-        src: include_str!("sampler_cuda.cu"),
-        cc_floor: (7, 0),
-    };
     /// Must equal `SAMPLER_THREADS` in the kernel source (block reductions assume 32 full warps).
     const THREADS: u32 = 1024;
 
@@ -821,7 +824,7 @@ mod cuda {
         if let Some(src) = SOURCE_OVERRIDE.with(std::cell::Cell::get) {
             return src;
         }
-        SRC
+        super::SAMPLER_SRC
     }
 
     /// The sampler function `name` on `dev`, from the seam's per-device cache.

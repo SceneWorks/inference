@@ -650,6 +650,16 @@ fn gdn_reorder_tensor(x: &Tensor, layout: GdnLayout) -> Result<Tensor> {
     Ok(x.index_select(&gather, x.rank() - 1)?)
 }
 
+/// The Prism packed-operator kernels, compiled through the shared nvrtc compile-once seam
+/// (sc-24137 / sc-23990): once per device, failure cached, no build.rs. Listed in
+/// [`NVRTC_SOURCES`](super::NVRTC_SOURCES).
+pub(crate) const PRISM_SRC: candle_quant_kernels::KernelSource =
+    candle_quant_kernels::KernelSource {
+        name: "candle_llm_prism_packed_v1",
+        src: include_str!("prism_cuda.cu"),
+        cc_floor: (7, 0),
+    };
+
 #[cfg(feature = "cuda")]
 mod cuda {
     use super::*;
@@ -658,15 +668,7 @@ mod cuda {
     use candle_core::cuda_backend::WrapErr;
     use candle_core::{CpuStorage, CudaStorage, CustomOp2, CustomOp3, Layout, Shape};
 
-    /// The Prism packed-operator kernels, compiled through the shared nvrtc compile-once seam
-    /// (sc-24137 / sc-23990): once per device, failure cached, no build.rs.
-    const PRISM_SRC: candle_quant_kernels::KernelSource = candle_quant_kernels::KernelSource {
-        name: "candle_llm_prism_packed_v1",
-        src: include_str!("prism_cuda.cu"),
-        cc_floor: (7, 0),
-    };
-
-    pub(super) fn function(
+    fn function(
         dev: &candle_core::CudaDevice,
         name: &str,
     ) -> candle_core::Result<candle_core::cuda_backend::cudarc::driver::CudaFunction> {
@@ -1570,41 +1572,6 @@ mod tests {
                 rotate(dense[0].clone(), &signs, true),
             ];
             assert_close(&actual, &expected);
-        }
-    }
-
-    /// Every Prism packed-operator kernel in `prism_cuda.cu`.
-    #[cfg(feature = "cuda")]
-    const PRISM_KERNELS: [&str; 6] = [
-        "prism_mlx_affine2_matmul_f32",
-        "prism_pq2_matmul_f32",
-        "prism_ptq_matmul_f32",
-        "prism_mlx_affine2_embedding_f32",
-        "prism_pq2_embedding_f32",
-        "prism_ptq_embedding_f32",
-    ];
-
-    /// sc-24164: since sc-24137 the Prism kernels compile through the nvrtc seam for the device's
-    /// own architecture (`compute_120` on Blackwell), where the PTQ decode's indexed `pow3[5]`
-    /// table spilled to 24 B of per-thread local memory. That made `prism_ptq_matmul_f32` 3.2x
-    /// slower and Bonsai GGUF prefill 2.5x slower. No Prism kernel may use local memory, as the
-    /// seam compiles it for the live device.
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn cuda_prism_kernels_use_no_local_memory() {
-        let device = crate::device::new_cuda_for_test().expect("cuda device");
-        let dev = device.as_cuda_device().unwrap();
-        for kernel in PRISM_KERNELS {
-            let function = cuda::function(dev, kernel).unwrap();
-            let local = function.local_size_bytes().unwrap();
-            eprintln!(
-                "[prism-nvrtc] {kernel}: {local} B local, {} registers",
-                function.num_regs().unwrap()
-            );
-            assert_eq!(
-                local, 0,
-                "{kernel} spills {local} B/thread to local memory under the seam's architecture"
-            );
         }
     }
 
