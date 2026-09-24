@@ -184,6 +184,7 @@ name = "candle-audio"
 version = "0.0.0"
 dependencies = [
  "candle-core",
+ "candle-nn",
  "libc",
  "sceneworks-gen-core",
  "sha2",
