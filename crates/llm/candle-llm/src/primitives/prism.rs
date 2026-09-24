@@ -666,7 +666,7 @@ mod cuda {
         cc_floor: (7, 0),
     };
 
-    fn function(
+    pub(super) fn function(
         dev: &candle_core::CudaDevice,
         name: &str,
     ) -> candle_core::Result<candle_core::cuda_backend::cudarc::driver::CudaFunction> {
@@ -1571,5 +1571,174 @@ mod tests {
             ];
             assert_close(&actual, &expected);
         }
+    }
+
+    /// Every Prism packed-operator kernel in `prism_cuda.cu`.
+    #[cfg(feature = "cuda")]
+    const PRISM_KERNELS: [&str; 6] = [
+        "prism_mlx_affine2_matmul_f32",
+        "prism_pq2_matmul_f32",
+        "prism_ptq_matmul_f32",
+        "prism_mlx_affine2_embedding_f32",
+        "prism_pq2_embedding_f32",
+        "prism_ptq_embedding_f32",
+    ];
+
+    /// sc-24164: since sc-24137 the Prism kernels compile through the nvrtc seam for the device's
+    /// own architecture (`compute_120` on Blackwell), where the PTQ decode's indexed `pow3[5]`
+    /// table spilled to 24 B of per-thread local memory. That made `prism_ptq_matmul_f32` 3.2x
+    /// slower and Bonsai GGUF prefill 2.5x slower. No Prism kernel may use local memory, as the
+    /// seam compiles it for the live device.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_prism_kernels_use_no_local_memory() {
+        let device = crate::device::new_cuda_for_test().expect("cuda device");
+        let dev = device.as_cuda_device().unwrap();
+        for kernel in PRISM_KERNELS {
+            let function = cuda::function(dev, kernel).unwrap();
+            let local = function.local_size_bytes().unwrap();
+            eprintln!(
+                "[prism-nvrtc] {kernel}: {local} B local, {} registers",
+                function.num_regs().unwrap()
+            );
+            assert_eq!(
+                local, 0,
+                "{kernel} spills {local} B/thread to local memory under the seam's architecture"
+            );
+        }
+    }
+
+    /// sc-24164 parity: the PTQ select chain that replaced the `pow3` table decodes exactly the
+    /// values the table did, bit for bit, as does PQ2. Checked through the embedding kernels,
+    /// which run the same per-value decode (`prism_ptq_value` / `prism_pq2_value`) the matmul
+    /// kernels reduce over, for every byte value at every packed position and every lane. The
+    /// scales are both positive and negative, so the sign of a decoded zero is checked too. The
+    /// reference is the kernel's own formula evaluated on the host.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_gguf_decode_is_bit_exact_for_every_packed_byte() {
+        const POW3: [u32; 5] = [1, 3, 9, 27, 81];
+        let device = crate::device::new_cuda_for_test().expect("cuda device");
+        let (width, rows) = (128usize, 256usize);
+        for kind in [PrismPackedKind::Pq2_0, PrismPackedKind::Ptq1_0] {
+            let block_bytes = kind.block_bytes();
+            let (data, scale_at) = match kind {
+                PrismPackedKind::Pq2_0 => (2..block_bytes, 0),
+                PrismPackedKind::Ptq1_0 => (0..26, 26),
+            };
+            let mut bytes = vec![0u8; rows * block_bytes];
+            let mut expected = Vec::with_capacity(rows * width);
+            for row in 0..rows {
+                let block = &mut bytes[row * block_bytes..(row + 1) * block_bytes];
+                // Across the 256 rows, every data position takes every byte value.
+                for (position, byte) in block[data.clone()].iter_mut().enumerate() {
+                    *byte = (row + 37 * position) as u8;
+                }
+                let magnitude = 0.0625 * (1 + row % 7) as f32;
+                let scale = half::f16::from_f32(if row % 2 == 0 { magnitude } else { -magnitude });
+                block[scale_at..scale_at + 2].copy_from_slice(&scale.to_bits().to_le_bytes());
+                let scale = scale.to_f32();
+                for lane in 0..width {
+                    let code = match kind {
+                        PrismPackedKind::Pq2_0 => {
+                            u32::from((block[2 + lane / 4] >> (2 * (lane % 4))) & 3)
+                        }
+                        PrismPackedKind::Ptq1_0 => {
+                            let (byte_at, trit) = match lane {
+                                0..80 => (lane % 16, lane / 16),
+                                80..120 => (16 + (lane - 80) % 8, (lane - 80) / 8),
+                                _ => (24 + (lane - 120) % 2, (lane - 120) / 2),
+                            };
+                            (((u32::from(block[byte_at]) * POW3[trit]) & 255) * 3) >> 8
+                        }
+                    };
+                    expected.push(((code as f32 - 1.0) * scale).to_bits());
+                }
+            }
+            let name = format!("cuda.{kind:?}.decode.weight");
+            let weight = PrismPackedWeight::from_gguf(
+                &name,
+                kind,
+                &[width, rows],
+                bytes,
+                &metadata(&name, PrismTransformRole::Inverse, vec![1; width]),
+                None,
+                None,
+                &device,
+            )
+            .unwrap();
+            let ids = Tensor::arange(0u32, rows as u32, &device).unwrap();
+            // The raw kernel decode, before the embedding's inverse transform.
+            let decoded = cuda::embedding(&weight, &ids)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>();
+            assert_eq!(decoded.len(), expected.len());
+            let mismatches = decoded
+                .iter()
+                .zip(&expected)
+                .enumerate()
+                .filter(|(_, (got, want))| got != want)
+                .map(|(at, (got, want))| (at / width, at % width, *got, *want))
+                .take(8)
+                .collect::<Vec<_>>();
+            assert!(
+                mismatches.is_empty(),
+                "{kind:?} decode differs (row, lane, got bits, want bits): {mismatches:?}"
+            );
+        }
+    }
+
+    /// sc-24164 timing evidence (a bench, not a gate): `prism_ptq_matmul_f32` milliseconds per
+    /// token on a Bonsai-sized 17408x5120 PTQ matrix over a 64-token prefill.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "sc-24164 PTQ matmul timing; needs CUDA"]
+    fn cuda_ptq_matmul_timing() {
+        let device = crate::device::new_cuda_for_test().expect("cuda device");
+        let (rows, width, tokens) = (17_408usize, 5_120usize, 64usize);
+        let kind = PrismPackedKind::Ptq1_0;
+        let mut bytes = vec![0u8; rows * width / 128 * kind.block_bytes()];
+        for (block, chunk) in bytes.chunks_exact_mut(kind.block_bytes()).enumerate() {
+            for (position, byte) in chunk[..26].iter_mut().enumerate() {
+                *byte = (block * 7 + position * 37) as u8;
+            }
+            chunk[26..].copy_from_slice(&half::f16::from_f32(0.01).to_bits().to_le_bytes());
+        }
+        let name = "cuda.timing.weight";
+        let weight = PrismPackedWeight::from_gguf(
+            name,
+            kind,
+            &[width, rows],
+            bytes,
+            &metadata(name, PrismTransformRole::None, vec![1; width]),
+            None,
+            None,
+            &device,
+        )
+        .unwrap();
+        let x = Tensor::arange(0f32, (tokens * width) as f32, &device)
+            .unwrap()
+            .affine(1e-4, -0.5)
+            .unwrap()
+            .reshape((tokens, width))
+            .unwrap();
+        let run = || {
+            cuda::matmul(&weight, &x).unwrap();
+            device.synchronize().unwrap();
+        };
+        run();
+        let iterations = 10;
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            run();
+        }
+        let per_token_ms = started.elapsed().as_secs_f64() * 1e3 / (iterations * tokens) as f64;
+        eprintln!("[prism-ptq-timing] {rows}x{width}, {tokens} tokens: {per_token_ms:.3} ms/token");
     }
 }

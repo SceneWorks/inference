@@ -56,9 +56,18 @@ __device__ __forceinline__ float prism_pq2_value(
     return ((float)code - 1.0f) * scale;
 }
 
+// 3^trit for trit in 0..=4, as a select chain. Do not turn this back into an indexed local array:
+// `trit` is data-dependent, so nvrtc places such an array in per-thread local memory. Since
+// sc-24137 the kernels compile for the device's own architecture (`compute_120` on Blackwell), and
+// there the array spilled 24 B of local memory into every PTQ dot product. That made
+// `prism_ptq_matmul_f32` 3.2x slower and Bonsai GGUF prefill 2.5x slower (sc-24164). The integer
+// result, and so every decoded value, is unchanged.
+__device__ __forceinline__ uint32_t prism_pow3(uint32_t trit) {
+    return trit == 0u ? 1u : trit == 1u ? 3u : trit == 2u ? 9u : trit == 3u ? 27u : 81u;
+}
+
 __device__ __forceinline__ float prism_ptq_value(
     const uint8_t* packed, uint32_t row, uint32_t width, uint32_t col) {
-    const uint32_t pow3[5] = {1u, 3u, 9u, 27u, 81u};
     uint32_t blocks = width / 128;
     uint32_t lane = col & 127u;
     const uint8_t* block = packed + (row * blocks + col / 128) * 28;
@@ -76,7 +85,7 @@ __device__ __forceinline__ float prism_ptq_value(
         byte_at = 24 + lane % 2;
         trit = lane / 2;
     }
-    uint32_t code = ((((uint32_t)block[byte_at] * pow3[trit]) & 255u) * 3u) >> 8;
+    uint32_t code = ((((uint32_t)block[byte_at] * prism_pow3(trit)) & 255u) * 3u) >> 8;
     return ((float)code - 1.0f) * scale;
 }
 
