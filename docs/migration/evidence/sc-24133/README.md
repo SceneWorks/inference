@@ -68,3 +68,25 @@ Top-p boundary tolerance (`nucleus_boundary_divergence_is_at_most_one_token`): o
 (equal weights of 1.0 with an integer `top_p * count`), the device and host kept sets are the same
 size, with no divergence. With top-p placed at each prefix's exact share of the mass and one f32 ulp
 either side, the kept sets matched in 15 of 15 cases. The documented tolerance is ±1 token.
+
+## MLX nucleus mass in f64 — macOS-lane CI evidence (CI-only)
+
+The same review commit (`31fe9b074`) moved `mlx-llm`'s `nucleus_select` from an f32 to an f64
+running sum, matching `candle-llm`. That changes MLX top-p sampling only where an f32 sum's
+rounding had moved the nucleus boundary: a knife-edge boundary may keep one token more or fewer
+than the f32 mlx-gen references. MLX cannot be built or run on the Windows dev box, so the only
+evidence for the change is the hosted macOS lane of CI. It is **CI-only evidence**. No local MLX
+run and no real-weight MLX sampling comparison backs it (feature-end review, sc-24140 item 8).
+
+| where | head | job | `mlx_llm` unit tests |
+|---|---|---|---|
+| PR #1023 (S5, sc-24133, the change itself) | `4c227be36` (contains `31fe9b074`) | [MLX + Candle Metal packages (macOS)](https://github.com/SceneWorks/inference/actions/runs/35897208137/job/107304179290): success | 291 passed, 0 failed, 7 ignored |
+| PR #1031 (S10; its merge `e3248a3a8` is the feature head this round started from; the MLX sampler is unchanged since `31fe9b074`) | `49dece6bb` | [MLX + Candle Metal packages (macOS)](https://github.com/SceneWorks/inference/actions/runs/35926318443/job/107402310102): success | 291 passed, 0 failed, 7 ignored |
+
+Both jobs ran `cargo test --locked --lib --tests -p mlx-llm -p mlx-llm-server -p mlx-gen -p
+'mlx-gen-*' -p runtime-macos` on the hosted macOS runner (Metal 320, not the NAX lane). The sampler
+tests that exercise the nucleus pass there, including
+`primitives::sampler::tests::nucleus_matches_full_sort_for_distinct_weights` and
+`primitives::sampler::tests::top_p_restricts_to_nucleus`. These tests check the heap nucleus
+against a full sort and check nucleus membership. None of them pins a knife-edge boundary against the f32
+references, so the one-token boundary difference itself is documented, not measured.

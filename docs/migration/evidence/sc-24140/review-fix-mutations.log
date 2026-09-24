@@ -1,0 +1,78 @@
+sc-24140 — feature-end review round 1 (decode routing): mutation runs
+======================================================================
+
+Each mutation was applied alone to the committed fix, the named tests were run, and the file was
+restored (and touched) before the next. CPU rows: `cargo test --locked --no-fail-fast -p
+candle-llm` in Git Bash (CPU target). CUDA row: the same with `--features cuda` under MSVC 14.44
+vcvars, `CUDA_COMPUTE_CAP=120`, GPU 0 (RTX Pro 6000 / sm_120). All rows were RED under the
+mutation and GREEN on the restored tree.
+
+item 1 — the K = 0 decision draws through `sample` (engine.rs `decide`)
+  k0_host_path            `if false && drafts.is_empty()?` — K = 0 falls back to the host-shaped path
+    CPU  RED  provider::tests::a_stochastic_off_request_draws_through_the_device_sampler_where_there_is_one
+              (label "host:speculative_distribution", not "host:device_unavailable")
+    CPU  RED  device_sampler::cpu_engine_without_drafts_draws_through_sample_on_both_families
+              (path Some(Host(SpeculativeDistribution)))
+    CPU  RED  thinking::a_stochastic_request_draws_through_the_device_sampler_where_there_is_one
+    CUDA RED  device_sampler::cuda::cuda_engine_without_drafts_draws_through_sample_on_both_families
+              ("the seeded stream of the token-at-a-time seam loop": tokens diverge)
+    CUDA RED  device_sampler::cuda::ac2_tiny_config_temperature_top_p_has_zero_logits_copies_and_one_sync_per_token
+    CUDA RED  provider::tests::a_stochastic_off_request_… and thinking::a_stochastic_request_…
+              (label "host:speculative_distribution", not "device")
+
+item 1 — every host decision is recorded; a degenerate row commits its argmax
+  acceptance_unrecorded   the acceptance draw's `note_sampler_path` removed
+    CPU  RED  engine::tests::stochastic_host_decisions_are_recorded_and_a_degenerate_row_commits_its_argmax
+              (host draws 1, expected 2)
+  bonus_unrecorded        the stochastic bonus drawn with an unrecorded `sample_weighted`
+    CPU  RED  engine::tests::stochastic_host_decisions_… (host draws 1, expected 2)
+  bonus_degenerate_zero   `sample_row_host`'s degenerate fallback returns id 0, not the argmax
+    CPU  RED  engine::tests::stochastic_host_decisions_… (committed [2, 0], expected [2, 3])
+    CPU  RED  sampler::tests::host_row_entry_points_match_the_tensor_ones_with_one_transfer
+    CPU  RED  sampler::tests::degenerate_rows_consume_one_draw_on_every_host_path
+  degenerate_target_empty `acceptance_target_host` returns an empty target for a degenerate row
+    CPU  RED  engine::tests::stochastic_host_decisions_… (committed [2] — the draft — expected [3])
+    CPU  RED  sampler::tests::host_row_entry_points_match_the_tensor_ones_with_one_transfer (target [])
+
+item 2 — Qwen3.5 Off on the engine; one selector
+  qwen_off_reference      `decode_route` sends a Qwen3.5 Off request to the reference loop
+    CPU  RED  provider::tests::a_request_decodes_on_the_engine_unless_the_reference_loop_is_selected
+    CPU  RED  provider::tests::auto_mtp_on_a_qwen35_snapshot_without_a_head_decodes_normally_and_says_proposer_none
+    CPU  RED  provider::tests::the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run
+    CPU  RED  provider::tests::a_stochastic_off_request_draws_through_the_device_sampler_where_there_is_one
+  selector_does_not_store `set_decode_path` returns Ok without storing
+    CPU  RED  provider::tests::a_request_decodes_on_the_engine_unless_…, auto_mtp_on_a_qwen35_…,
+              the_runner_wraps_the_off_path_…
+    CPU  RED  thinking::provider_records_the_decode_path_it_ran
+    CPU  RED  gemma4_multimodal::gemma4_decodes_through_the_engine_and_the_reference_stays_selectable
+
+item 3 — `generate_step` is the engine (one loop, one record convention)
+  generate_step_own_loop  `generate_step_timed` restored to its pre-fix token loop + `DecodeRecord::plain`
+    CPU  RED  engine::tests::no_proposer_is_the_step_driver_and_reports_proposer_none
+              ("generate_step's record is the engine's, field for field")
+  commit_only_silent      `CommitOnly::rewind`'s invariant check compiled out
+    CPU  RED  step::tests::a_commit_only_constraint_refuses_to_rewind_an_advance
+
+item 4 — the graph workspace is priced whenever the runner wraps the engine
+  graphs_only_with_drafts `engine_graph_workspace` returns 0 when drafts == 0 (the pre-fix rule)
+    CPU  RED  provider::tests::admission_includes_the_cuda_graph_workspace_when_the_runner_is_on
+    CPU  RED  provider::tests::causal_admission_covers_the_static_kv_preallocation
+    CPU  RED  provider::tests::the_spliced_prompt_readmission_prices_the_graph_workspace_when_the_runner_is_on
+
+item 5 — the record carries every span tally
+  nvfp4_unstamped         `with_span_tallies` drops the NVFP4 projection tally
+    CPU  RED  engine::tests::the_engine_record_carries_every_span_tally (nvfp4 gemv 0, expected 5)
+
+item 6 — one switch implementation; cached env reads
+  switch_rereads_env      `ProcessSwitch::env_enabled` re-reads the variable on every call
+    CPU  RED  switch::tests::the_environment_is_read_once_and_parsed_after_trimming_and_lower_casing
+  guard_pins_observed     the guard records `Some(enabled())` instead of the policy it found
+    CPU  RED  switch::tests::the_guard_restores_a_deferral_not_the_state_it_observed (found Some(true))
+  stream_rereads_env      `stream_env_value` re-reads CANDLE_LLM_CUDA_STREAM on every call
+    CPU  RED  device::tests::the_stream_switch_is_read_once_per_process
+
+item 7 — KvCapacityExceeded is a typed resource exhaustion
+  kv_capacity_generic     `request_error`'s capacity arm disabled (falls through to `to_core`)
+    CPU  RED  provider::tests::a_kv_capacity_refusal_is_a_typed_resource_exhaustion
+  to_core_backend         `to_core`'s capacity arm removed (opaque `CoreError::Backend`)
+    CPU  RED  provider::tests::a_kv_capacity_refusal_is_a_typed_resource_exhaustion
