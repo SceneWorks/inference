@@ -377,8 +377,10 @@ fn frozen_qwen38_provider_executes_ar_mtp_tools_and_stops() {
         "native Qwen AR reports synchronized phase timings"
     );
     assert_eq!(ar.usage.generated_tokens, 2);
+    // Speculation off decodes on the engine with no proposer, on the static cache (sc-24140).
     let ar_record = provider.last_decode_record().unwrap();
-    assert_eq!(ar_record.path, DecodePath::Reference);
+    assert_eq!(ar_record.path, DecodePath::StepModel);
+    assert_eq!(ar_record.kv_cache, KvCacheKind::Static);
     assert_eq!(ar_record.proposer, ProposerKind::None);
 
     let mut mtp_request = request("What is 2+2?", 4);
@@ -448,7 +450,8 @@ fn frozen_qwen38_provider_executes_ar_mtp_tools_and_stops() {
     assert_eq!(stop_stats.proposed_tokens, 0);
 
     // AC3 (sc-24130): the same checkpoint without an MTP head advertises no MTP; `Auto` decodes
-    // normally and the record says `proposer=none`; `Enabled` is refused rather than downgraded.
+    // normally — the engine with no proposer (sc-24140) — and the record says `proposer=none`;
+    // `Enabled` is refused rather than downgraded.
     drop(stop_provider);
     drop(stop_snapshot);
     let plain_snapshot = write_snapshot_with(&tokenizer_path, false, false);
@@ -463,7 +466,8 @@ fn frozen_qwen38_provider_executes_ar_mtp_tools_and_stops() {
     assert!(auto_output.mtp.is_none());
     assert_eq!(auto_output.usage.generated_tokens, 3);
     let auto_record = plain_provider.last_decode_record().unwrap();
-    assert_eq!(auto_record.path, DecodePath::Reference);
+    assert_eq!(auto_record.path, DecodePath::StepModel);
+    assert_eq!(auto_record.kv_cache, KvCacheKind::Static);
     assert_eq!(auto_record.proposer, ProposerKind::None);
     assert_eq!(auto_record.proposer.label(), "none");
     assert_eq!(auto_record.proposed_tokens, 0);

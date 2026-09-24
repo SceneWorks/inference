@@ -19,8 +19,8 @@
 //! compile error's label (`nvrtc`, `compute_floor`, …).
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+
+use super::switch::{ProcessSwitch, SwitchGuard};
 
 /// Environment switch: `0` / `off` / `false` / `no` / `reference` disable the fused path.
 pub const FUSED_KERNELS_ENV: &str = "CANDLE_LLM_FUSED_KERNELS";
@@ -30,64 +30,30 @@ pub const REASON_DISABLED: &str = "disabled";
 /// Reference-run reason: this build has no `cuda` feature, so no fused path exists.
 pub const REASON_CUDA_FEATURE_OFF: &str = "cuda_feature_off";
 
-const POLICY_ENV: u8 = 0;
-const POLICY_ON: u8 = 1;
-const POLICY_OFF: u8 = 2;
-
-static POLICY: AtomicU8 = AtomicU8::new(POLICY_ENV);
-
-fn env_says_enabled() -> bool {
-    static FROM_ENV: OnceLock<bool> = OnceLock::new();
-    *FROM_ENV.get_or_init(|| {
-        std::env::var(FUSED_KERNELS_ENV)
-            .map(|v| {
-                let v = v.trim().to_ascii_lowercase();
-                !matches!(v.as_str(), "0" | "off" | "false" | "no" | "reference")
-            })
-            .unwrap_or(true)
-    })
+fn env_value_enables(v: &str) -> bool {
+    !matches!(v, "0" | "off" | "false" | "no" | "reference")
 }
+
+/// The fused-primitive switch (on unless the environment turns it off), on the crate's one
+/// switch implementation, [`ProcessSwitch`].
+static SWITCH: ProcessSwitch = ProcessSwitch::new(FUSED_KERNELS_ENV, true, env_value_enables);
 
 /// Whether the fused path may be tried at all (the switch; a `cuda` build is still required for
 /// it to exist).
 pub fn fused_kernels_enabled() -> bool {
-    match POLICY.load(Ordering::Relaxed) {
-        POLICY_ON => true,
-        POLICY_OFF => false,
-        _ => env_says_enabled(),
-    }
+    SWITCH.enabled()
 }
 
 /// Override the switch for the process: `Some(true)` / `Some(false)` force it, `None` returns to
 /// the environment's setting.
 pub fn set_fused_kernels(enabled: Option<bool>) {
-    let policy = match enabled {
-        Some(true) => POLICY_ON,
-        Some(false) => POLICY_OFF,
-        None => POLICY_ENV,
-    };
-    POLICY.store(policy, Ordering::Relaxed);
+    SWITCH.set(enabled);
 }
-
-/// Serialises everything that writes or depends on the process-global switch. Test harnesses run
-/// tests on parallel threads, so a test that flips the switch must hold this for as long as its
-/// assertions depend on the policy.
-static POLICY_LOCK: Mutex<()> = Mutex::new(());
 
 /// Holds the process-wide switch lock; restores the switch it found when dropped. Returned by
 /// [`fused_policy_guard`].
 #[doc(hidden)]
-#[must_use = "the policy is only held (and restored) while the guard is alive"]
-pub struct FusedPolicyGuard {
-    previous: u8,
-    _lock: MutexGuard<'static, ()>,
-}
-
-impl Drop for FusedPolicyGuard {
-    fn drop(&mut self) {
-        POLICY.store(self.previous, Ordering::Relaxed);
-    }
-}
+pub type FusedPolicyGuard = SwitchGuard;
 
 /// Test seam: take the process-wide switch lock, apply `enabled` (as [`set_fused_kernels`]) and
 /// hand back a guard that restores the previous switch when dropped. Every test that flips the
@@ -95,15 +61,7 @@ impl Drop for FusedPolicyGuard {
 /// cannot race on the global. [`set_fused_kernels`] may still be called while it is held.
 #[doc(hidden)]
 pub fn fused_policy_guard(enabled: Option<bool>) -> FusedPolicyGuard {
-    let lock = POLICY_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let previous = POLICY.load(Ordering::Relaxed);
-    set_fused_kernels(enabled);
-    FusedPolicyGuard {
-        previous,
-        _lock: lock,
-    }
+    SWITCH.guard(enabled)
 }
 
 /// Per-thread counts of fused-vs-reference leaf runs (monotone; take deltas with
@@ -281,7 +239,7 @@ mod tests {
     fn the_policy_guard_restores_the_switch_it_found() {
         // Every other policy change in this binary happens under a guard that restores, so the
         // value seen at each lock acquisition is the one the previous guard restored.
-        let before = fused_policy_guard(None).previous;
+        let before = fused_policy_guard(None).found();
         {
             let _held = fused_policy_guard(Some(true));
             assert!(fused_kernels_enabled());
@@ -290,7 +248,8 @@ mod tests {
         }
         let after = fused_policy_guard(None);
         assert_eq!(
-            after.previous, before,
+            after.found(),
+            before,
             "dropping the guard restores the switch"
         );
     }

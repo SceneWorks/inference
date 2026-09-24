@@ -115,8 +115,8 @@ use candle_llm::decode::{
 };
 use candle_llm::models::Qwen35Cache;
 use candle_llm::primitives::{
-    fused_kernels_enabled, fused_tally, host_sync_count, nvfp4_gemv_enabled,
-    nvfp4_gemv_policy_guard, nvfp4_path_tally, set_fused_kernels, ProjectionFormat,
+    fused_kernels_enabled, fused_policy_guard, fused_tally, host_sync_count, nvfp4_gemv_enabled,
+    nvfp4_gemv_policy_guard, nvfp4_path_tally, ProjectionFormat,
 };
 
 /// The CUDA-graph switch state (`on` / `off`), or `None` on a binary without the runner.
@@ -312,12 +312,11 @@ fn fused_delta(
 }
 
 /// Run `f` with the fused primitives switched off, restoring the previous policy afterwards.
+/// Uses the process-wide policy guard so a prior env-derived (`None`) policy comes back as
+/// `None`, not pinned to whatever `Some(bool)` state this call happened to observe.
 fn with_fused_off<T>(f: impl FnOnce() -> T) -> T {
-    let was = fused_kernels_enabled();
-    set_fused_kernels(Some(false));
-    let out = f();
-    set_fused_kernels(Some(was));
-    out
+    let _guard = fused_policy_guard(Some(false));
+    f()
 }
 
 /// The NVFP4 decode-GEMV switch state (`on` / `off`), or `None` on a binary without it.

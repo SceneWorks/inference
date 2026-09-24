@@ -192,11 +192,17 @@ plus the `K + 1` verify positions), so any position of the last verify step is r
 unbounded `StepModel::new_cache` keeps `STEP_MAX_CHECKPOINTS` = 2 positions behind the current one,
 and the reference caches the provider builds keep none (`REFERENCE_MAX_CHECKPOINTS` = 0). Admission
 prices the ring exactly — `K + 2` recurrent states for a `K`-draft request, charged once (the engine
-never clones the cache), one state with MTP off. A rollback past the ring is the typed
+never clones the cache), two with speculation off (the no-proposer engine's `K = 0` ring), one on
+the reference loop. A rollback past the ring is the typed
 `Error::RollbackUnavailable`. Every path ends in
 a measured `decode::DecodeRecord` (path taken, target forwards, proposed/accepted tokens, host syncs);
-the provider exposes the last one through `LlamaProvider::last_decode_record`. The reference `Decode`
-loop is unchanged and stays the parity oracle.
+the provider exposes the last one through `LlamaProvider::last_decode_record`. A Qwen3.5-family
+request with speculation off (`Off`, or `Auto` on a checkpoint without an MTP head) decodes through
+the same engine with no proposer — `decode::generate_step` is that engine with `K = 0`, the seam's
+one token-at-a-time loop — on the static KV cache, the checkpoint ring and the CUDA-graph runner
+(sc-24140); with no drafts the engine draws each token through `sample`, so a temperature / top-p
+request stays on the device sampler. The reference `Decode` loop is unchanged and stays the parity
+oracle, selectable with `LlamaProvider::set_decode_path(DecodePath::Reference)`.
 
 Every other decoder reaches the same machinery through the same two seams (sc-24138): `CausalLm`
 (the whole llama family — Llama, Qwen3 dense, Gemma 2/4, GLM-4, DeepSeek-V2 MLA, Qwen3-VL's
@@ -207,8 +213,9 @@ continuous batching). No decoder keeps a private cache or decode loop: LLaVA and
 providers prefill their conditioning into the step cache and decode through the engine
 (`decode::generate_step_from_prefill`). The provider decodes a llama-family request (text, and the
 Gemma 4 soft-token splice) through the unified engine on the static KV cache, priced in admission
-by the widest layer's KV geometry; `LlamaProvider::set_causal_decode_path(DecodePath::Reference)`
-keeps the `Decode` loop selectable as the oracle. `CausalLm` and `StarCoder2` attend
+by the widest layer's KV geometry (plus, with the CUDA-graph runner on, its graph workspace);
+`LlamaProvider::set_decode_path(DecodePath::Reference)` — one selector for both families — keeps
+the `Decode` loop selectable as the oracle. `CausalLm` and `StarCoder2` attend
 un-expanded (`AttnFormulation::Gqa`, `sdpa_gqa_causal`) by default on every path, so the
 reference loop and the static cache are one arithmetic and token-identical by construction;
 `set_attn_formulation(AttnFormulation::Expanded)` selects the pre-migration `repeat_kv` arithmetic

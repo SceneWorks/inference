@@ -6,27 +6,29 @@
 //! one N-token step, rejected suffixes dropped with [`DecodeCache::rollback_to`]), static KV, the
 //! CUDA-graph runner — is written once against this trait; model files only implement it.
 //!
-//! [`generate_step`] is the walking-skeleton driver: the token-at-a-time loop over the seam. It is
-//! deliberately the same algorithm as the reference loop in [`stream`](super::stream) (same prefill,
-//! same sampler, same stop / cancel / constraint order) so its output is token-identical to the
-//! reference path for the same prompt and config — the parity gate the tiny-config and real-weight
-//! tests hold. Unlike the reference loop it returns a [`DecodeRecord`] with measured counters,
-//! including which KV cache the request ran on (`kv_cache`). The cache is built through
-//! [`StepModel::new_cache_for`] with the request's bound (prompt + budget), which is where a
-//! preallocated KV cache (story sc-24132) is sized and where an over-budget request fails closed.
+//! [`generate_step`] is the token-at-a-time driver over the seam — since sc-24140 a thin wrapper
+//! over the one [`engine`](super::engine) loop with no proposer, so the seam has exactly one loop.
+//! It keeps the reference loop's algorithm (see [`stream`](super::stream): same prefill, same
+//! sampler routing and seeded stream, same stop / cancel / constraint order) so its output is
+//! token-identical to the reference path for the same prompt and config — the parity gate the
+//! tiny-config and real-weight tests hold. Unlike the reference loop it returns a
+//! [`DecodeRecord`] with measured counters, including which KV cache the request ran on
+//! (`kv_cache`). The cache is built through [`StepModel::new_cache_for`] with the request's bound
+//! (prompt + budget), which is where a preallocated KV cache (story sc-24132) is sized and where
+//! an over-budget request fails closed.
 
 use candle_core::{Device, Tensor};
 
 use crate::decode::cancel::CancelFlag;
+use crate::decode::engine::RewindableConstraintMask;
 use crate::decode::record::{DecodePath, DecodeRecord, RequestSpan};
 use crate::decode::speculative::SpeculativeStats;
 use crate::decode::stream::{
-    default_seed, ConstraintMask, FinishReason, GenerationConfig, GenerationOutput, StreamEvent,
+    ConstraintMask, FinishReason, GenerationConfig, GenerationOutput, StreamEvent,
 };
 use crate::error::{Error, Result};
 use crate::primitives::attention::AttnFormulation;
 use crate::primitives::decode_cache::{CacheMemory, DecodeCache};
-use crate::primitives::sampler::{sample, SplitMix64};
 
 /// Which positions' logits a step returns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -257,10 +259,19 @@ pub trait StepModel {
 }
 
 /// Generate from `prompt_ids` through the [`StepModel`] seam, returning the output and the
-/// measured [`DecodeRecord`] (`path == StepModel`). Token-identical to
+/// measured [`DecodeRecord`] (`path == StepModel`, `proposer == none`). Token-identical to
 /// [`generate_with`](super::generate_with) for the same inputs.
 ///
+/// A thin wrapper (sc-24140): the token-at-a-time loop over the seam **is** the one speculative
+/// engine with no proposer ([`generate_speculative_with`] with [`NoProposer`] and `K = 0`), so the
+/// seam has one loop, one sampler routing and one record convention — the engine's (the prefill
+/// counted in `prefill_forwards`, every later forward a verify step with its host syncs in
+/// `verify_host_syncs`).
+///
 /// Returns [`Error::Canceled`] if `cancel` is already set before any inference.
+///
+/// [`generate_speculative_with`]: super::generate_speculative_with
+/// [`NoProposer`]: super::NoProposer
 pub fn generate_step<M: StepModel + ?Sized>(
     model: &M,
     prompt_ids: &[i32],
@@ -279,107 +290,66 @@ pub fn generate_step<M: StepModel + ?Sized>(
 /// cache and before the first token is sampled (the timed-provider / bench seam; the callback may
 /// synchronize the device). Also returns the **final** cache's [`DecodeCache::memory`] — the state
 /// the request actually held at its last step, rollback checkpoints included — so a bench reports
-/// what a full-length request costs rather than a fresh cache's.
+/// what a full-length request costs rather than a fresh cache's. The cache is built through
+/// [`StepModel::new_cache_for`] with the request's bound (prompt + budget, no overshoot).
 pub fn generate_step_timed<M: StepModel + ?Sized>(
     model: &M,
     prompt_ids: &[i32],
     config: &GenerationConfig,
     cancel: &CancelFlag,
     on_event: &mut dyn FnMut(StreamEvent),
-    mut constraint: Option<&mut dyn ConstraintMask>,
-    mut on_prefill_complete: Option<&mut dyn FnMut() -> Result<()>>,
+    constraint: Option<&mut dyn ConstraintMask>,
+    on_prefill_complete: Option<&mut dyn FnMut() -> Result<()>>,
 ) -> Result<(GenerationOutput, DecodeRecord, CacheMemory)> {
-    if cancel.is_cancelled() {
-        return Err(Error::Canceled); // typed pre-inference cancel
-    }
-    if prompt_ids.is_empty() {
-        return Err(Error::Msg("generate_step: empty prompt".into()));
-    }
+    let mut commit_only = constraint.map(|inner| CommitOnly { inner, accepted: 0 });
+    let run = super::engine::generate_speculative_with(
+        model,
+        &mut super::engine::NoProposer,
+        super::engine::SpeculativePrompt::Tokens(prompt_ids),
+        config,
+        0,
+        cancel,
+        on_event,
+        commit_only
+            .as_mut()
+            .map(|c| c as &mut dyn RewindableConstraintMask),
+        None,
+        on_prefill_complete,
+    )?;
+    Ok((run.output, run.record, run.memory))
+}
 
-    let span = RequestSpan::begin();
-    let mut rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
-    // The request's bound: the prompt plus every token the loop may feed back. (The last budgeted
-    // token is sampled but never fed, so this is one position of slack.)
-    let capacity = prompt_ids.len().saturating_add(config.max_new_tokens);
-    let mut cache = model.new_cache_for(capacity, 0)?;
-    let mut forwards = 0u64;
+/// A plain [`ConstraintMask`] as the engine's [`RewindableConstraintMask`], for a run with **no
+/// drafts**: with `K = 0` the engine advances the constraint only by tokens it emits, so there is
+/// never a speculative advance to undo. The adapter checks that rather than trusting it — a rewind
+/// that would have to undo an advance panics instead of silently leaving the constraint ahead.
+struct CommitOnly<'a, 'c> {
+    inner: &'a mut (dyn ConstraintMask + 'c),
+    accepted: usize,
+}
 
-    // Prefill the whole prompt at position 0; logits are for the last prompt position.
-    let mut logits = model
-        .forward_step(&mut cache, StepRequest::last(prompt_ids))?
-        .logits;
-    forwards += 1;
-    if let Some(boundary) = on_prefill_complete.as_mut() {
-        boundary()?;
-    }
-
-    let mut history: Vec<i32> = prompt_ids.to_vec();
-    let mut generated: Vec<i32> = Vec::new();
-    let mut finish = FinishReason::MaxTokens;
-
-    for step in 0..config.max_new_tokens {
-        if cancel.is_cancelled() {
-            finish = FinishReason::Cancelled;
-            break;
-        }
-
-        let next = {
-            let mask = constraint.as_mut().map(|c| c.allowed());
-            sample(&logits, &history, &config.sampling, &mut rng, mask)?
-        };
-
-        if config.stop_tokens.contains(&next) {
-            finish = FinishReason::StopToken;
-            break;
-        }
-
-        if let Some(c) = &mut constraint {
-            c.accept(next);
-        }
-
-        on_event(StreamEvent::Token { id: next, step });
-        generated.push(next);
-        history.push(next);
-
-        if cancel.is_cancelled() {
-            finish = FinishReason::Cancelled;
-            break;
-        }
-
-        if step + 1 == config.max_new_tokens {
-            break; // budget reached; finish stays MaxTokens
-        }
-
-        // Feed the new token back at the cache's current length.
-        logits = model
-            .forward_step(&mut cache, StepRequest::last(&[next]))?
-            .logits;
-        forwards += 1;
+impl ConstraintMask for CommitOnly<'_, '_> {
+    fn allowed(&mut self) -> &[bool] {
+        self.inner.allowed()
     }
 
-    on_event(StreamEvent::Done {
-        reason: finish,
-        generated: generated.len(),
-    });
-    let record = DecodeRecord::plain(
-        DecodePath::StepModel,
-        forwards,
-        generated.len(),
-        span.counters(),
-    )
-    .with_kv_cache(cache.kv_kind())
-    .with_attn_formulation(model.attn_formulation(&cache))
-    .with_fused_primitives(span.fused_primitives())
-    .with_cuda_graphs(span.cuda_graphs())
-    .with_nvfp4_projections(span.nvfp4_projections());
-    Ok((
-        GenerationOutput {
-            tokens: generated,
-            finish_reason: finish,
-        },
-        record,
-        cache.memory(),
-    ))
+    fn accept(&mut self, token: i32) {
+        self.accepted += 1;
+        self.inner.accept(token);
+    }
+}
+
+impl RewindableConstraintMask for CommitOnly<'_, '_> {
+    fn checkpoint(&self) -> usize {
+        self.accepted
+    }
+
+    fn rewind(&mut self, checkpoint: usize) {
+        assert_eq!(
+            checkpoint, self.accepted,
+            "a plain ConstraintMask cannot rewind: the token-at-a-time run advanced it speculatively"
+        );
+    }
 }
 
 /// Decode the continuation of a **caller-prefilled** request through the step seam (sc-24138):
@@ -405,6 +375,9 @@ pub fn generate_step_from_prefill<M: StepModel + ?Sized>(
     on_event: &mut dyn FnMut(StreamEvent),
     should_stop: Option<&dyn Fn() -> bool>,
 ) -> Result<(GenerationOutput, DecodeRecord)> {
+    // Brackets the call so a cancel that lands before the engine's own span still reports the
+    // request's measured counters and tallies (the same record convention as a run).
+    let span = RequestSpan::begin();
     let run = super::engine::generate_speculative_with(
         model,
         &mut super::engine::NoProposer,
@@ -443,9 +416,10 @@ pub fn generate_step_from_prefill<M: StepModel + ?Sized>(
                     tokens: Vec::new(),
                     finish_reason: FinishReason::Cancelled,
                 },
-                DecodeRecord::speculative(DecodePath::StepModel, prefill, 0, Default::default())
+                DecodeRecord::speculative(DecodePath::StepModel, prefill, 0, span.counters())
                     .with_kv_cache(cache.kv_kind())
-                    .with_attn_formulation(model.attn_formulation(cache)),
+                    .with_attn_formulation(model.attn_formulation(cache))
+                    .with_span_tallies(&span),
             ))
         }
         Err(error) => Err(error),
@@ -614,6 +588,35 @@ mod tests {
             generate_step(&model, &[], &cfg, &CancelFlag::new(), &mut |_| {}, None),
             Err(Error::Msg(_))
         ));
+    }
+
+    /// The adapter `generate_step` hands the engine: a plain constraint advanced only by emitted
+    /// tokens, so a rewind to the latest checkpoint is a no-op — and a rewind that would have to
+    /// undo an advance fails loudly instead of leaving the constraint ahead of the history.
+    #[test]
+    fn a_commit_only_constraint_refuses_to_rewind_an_advance() {
+        struct Log(Vec<i32>);
+        impl ConstraintMask for Log {
+            fn allowed(&mut self) -> &[bool] {
+                &[]
+            }
+            fn accept(&mut self, token: i32) {
+                self.0.push(token);
+            }
+        }
+        let mut log = Log(Vec::new());
+        let mut adapter = CommitOnly {
+            inner: &mut log,
+            accepted: 0,
+        };
+        adapter.accept(3);
+        let checkpoint = adapter.checkpoint();
+        adapter.rewind(checkpoint);
+        adapter.accept(4);
+        let advanced =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| adapter.rewind(checkpoint)));
+        assert!(advanced.is_err(), "rewinding past an advance must fail");
+        assert_eq!(log.0, vec![3, 4], "every accept reaches the constraint");
     }
 
     #[test]

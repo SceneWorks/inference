@@ -247,21 +247,29 @@ impl DecodeRecord {
         self
     }
 
+    /// The same record with every per-thread tally `span` measured filled in — the fused
+    /// primitives, the CUDA-graph runner's steps and the NVFP4 projection paths. The one place a
+    /// record takes its span's tallies (sc-24140), so no record producer stamps some and forgets
+    /// another.
+    pub fn with_span_tallies(self, span: &RequestSpan) -> Self {
+        self.with_fused_primitives(span.fused_primitives())
+            .with_cuda_graphs(span.cuda_graphs())
+            .with_nvfp4_projections(span.nvfp4_projections())
+    }
+
     /// The same record with the host-side counters and the fused / CUDA-graph / NVFP4 tallies of
     /// the whole request measured by `span` (sc-24139) — for a caller that prefills before handing
     /// the engine a [`Prefilled`](super::SpeculativePrompt::Prefilled) prompt, whose own span
     /// starts after that prefill. The engine-measured fields (path, forwards, cache, proposer)
-    /// are kept.
+    /// are kept; the tallies go through [`with_span_tallies`](Self::with_span_tallies).
     pub fn with_request_span(self, span: &RequestSpan) -> Self {
         let counters = span.counters();
         Self {
             host_syncs: counters.host_syncs,
             sampler: counters.sampler,
-            fused_primitives: span.fused_primitives(),
-            cuda_graphs: span.cuda_graphs(),
-            nvfp4_projections: span.nvfp4_projections(),
             ..self
         }
+        .with_span_tallies(span)
     }
 
     /// A record from a speculative run's [`SpeculativeStats`].

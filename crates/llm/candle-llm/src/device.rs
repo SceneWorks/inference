@@ -4,6 +4,8 @@
 //! (CUDA → Metal → CPU). The compute dtype is `bf16` on the GPU backends (matching the `mlx-llm`
 //! reference) and `f32` on CPU, where half-precision kernels are slow or unsupported.
 
+use std::sync::OnceLock;
+
 use candle_core::{DType, Device};
 
 use crate::error::{Error, Result};
@@ -13,6 +15,14 @@ use crate::error::{Error, Result};
 /// [`select_device`] time and `legacy` otherwise; a `flash-attn` build is always `legacy`. See
 /// [`CudaStreamKind::resolve`].
 pub const CUDA_STREAM_ENV: &str = "CANDLE_LLM_CUDA_STREAM";
+
+/// [`CUDA_STREAM_ENV`]'s value, read once per process and cached.
+fn stream_env_value() -> Option<&'static str> {
+    static VALUE: OnceLock<Option<String>> = OnceLock::new();
+    VALUE
+        .get_or_init(|| std::env::var(CUDA_STREAM_ENV).ok())
+        .as_deref()
+}
 
 /// Which CUDA stream [`select_device`] puts the model on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,10 +74,10 @@ impl CudaStreamKind {
 
     /// The stream [`select_device`] would pick now: the environment switch resolved against the
     /// CUDA-graph runner's switch ([`cuda_graphs_enabled`](crate::decode::cuda_graphs_enabled)).
+    /// The variable is read once per process, like every other switch (sc-24140).
     pub fn from_env() -> Result<Self> {
-        let value = std::env::var(CUDA_STREAM_ENV).ok();
         Ok(Self::resolve(
-            Self::parse(value.as_deref())?,
+            Self::parse(stream_env_value())?,
             crate::decode::cuda_graphs_enabled(),
         ))
     }
@@ -185,6 +195,21 @@ mod tests {
         assert_eq!(CudaStreamKind::resolve(None, true), own_unless_flash);
         assert_eq!(CudaStreamKind::resolve(Some(Own), false), own_unless_flash);
         assert_eq!(CudaStreamKind::resolve(Some(Legacy), true), Legacy);
+    }
+
+    /// The stream switch is read once per process like every other switch (sc-24140): a later
+    /// change of the variable is not seen.
+    #[test]
+    fn the_stream_switch_is_read_once_per_process() {
+        let first = stream_env_value().map(str::to_owned);
+        let was = std::env::var_os(CUDA_STREAM_ENV);
+        std::env::set_var(CUDA_STREAM_ENV, "not-a-stream-kind");
+        let second = stream_env_value().map(str::to_owned);
+        match was {
+            Some(value) => std::env::set_var(CUDA_STREAM_ENV, value),
+            None => std::env::remove_var(CUDA_STREAM_ENV),
+        }
+        assert_eq!(second, first, "the cached value, not a re-read");
     }
 }
 
