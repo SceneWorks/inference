@@ -420,6 +420,7 @@ impl TextLlm for StarVector8bProvider {
                 generated_tokens: output.generated_tokens,
             },
             mtp: None,
+            decode: None,
             finish_reason: Some(map_finish(output.finish_reason)),
         })
     }

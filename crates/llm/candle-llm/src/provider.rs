@@ -40,7 +40,7 @@ use crate::models::{
 };
 use crate::primitives::attention::EAGER_ATTN_QUERY_CHUNK_SIZE;
 use crate::primitives::nn::input_ids;
-use crate::primitives::projection::{ProjectionFormat, QuantSpec, WeightCensus};
+use crate::primitives::projection::{ProjectionFormat, ProjectionKind, QuantSpec, WeightCensus};
 use crate::primitives::sampler::SamplingParams;
 use crate::primitives::{KvCache, StepKvCache, Weights};
 
@@ -799,6 +799,47 @@ pub struct LoadRecord {
     /// The decoder's resident weights by projection kind (target plus native MTP predictor), for
     /// the qwen3_5-family decoders; `None` for the other architectures, which do not report one.
     pub census: Option<WeightCensus>,
+    /// The CUDA-graph switch this provider was loaded under (sc-24139): `LoadSpec::cuda_graphs`,
+    /// else the process switch at load time. The CUDA stream is settled at load, so every
+    /// generation runs under this switch rather than whatever the process switch says later.
+    /// `None` for a provider assembled without a load ([`LlamaProvider::from_parts`]), which
+    /// follows the process switch.
+    pub cuda_graphs: Option<bool>,
+}
+
+impl LoadRecord {
+    /// The backend-neutral report a product renders (sc-24139): the requested format, the
+    /// projection kinds actually resident (only the kinds present) and the CUDA-graph switch the
+    /// load settled ([`cuda_graphs`](Self::cuda_graphs)).
+    pub fn report(&self) -> core_llm::LoadReport {
+        let projections = self
+            .census
+            .map(|census| {
+                [
+                    ProjectionKind::Dense,
+                    ProjectionKind::Ggml,
+                    ProjectionKind::Prism,
+                    ProjectionKind::Nvfp4,
+                ]
+                .into_iter()
+                .filter_map(|kind| {
+                    let tally = census.projections.tally(kind);
+                    (tally.count > 0).then(|| core_llm::ProjectionReport {
+                        kind: kind.label().to_string(),
+                        count: tally.count,
+                        params: tally.params,
+                        resident_bytes: tally.resident_bytes,
+                    })
+                })
+                .collect()
+            })
+            .unwrap_or_default();
+        core_llm::LoadReport {
+            requested: self.requested,
+            projections,
+            cuda_graphs: self.cuda_graphs,
+        }
+    }
 }
 
 /// Whether Gemma 4's vision path has been validated end-to-end, and may therefore be advertised.
@@ -914,6 +955,21 @@ fn nvfp4_format_with(
     if spec.quantize != Some(Quantize::Nvfp4) {
         return Ok(None);
     }
+    nvfp4_model_gate(spec)?;
+    gate(device).map(Some).map_err(to_core)
+}
+
+/// The model half of [`nvfp4_format`]: whether this provider serves NVFP4 for the checkpoint at
+/// `spec.source`, from `config.json` alone (never a weight shard). The load runs it before the
+/// device gate, and [`crate::backend::nvfp4_support`] answers a product's per-snapshot question
+/// with it (sc-24139), so the two can never disagree about which checkpoints NVFP4 serves.
+///
+/// A GGUF source is refused: it is already block-quantized, and NVFP4 quantizes from a dense
+/// snapshot. So is a Prism/Bonsai snapshot (already packed affine-2 — `load_dir` refuses any
+/// repacking) and an architecture outside the qwen3_5 family, NVFP4's first (and so far only)
+/// consumer (sc-24135), each by name. A missing or unreadable config is left to the loader's own
+/// error.
+pub(crate) fn nvfp4_model_gate(spec: &LoadSpec) -> CoreResult<()> {
     if crate::gguf::is_gguf_path(&spec.source) {
         return Err(CoreError::Unsupported(
             "nvfp4: NVFP4 projections are quantized from a dense safetensors snapshot; a GGUF \
@@ -921,13 +977,15 @@ fn nvfp4_format_with(
                 .into(),
         ));
     }
-    // NVFP4's first (and so far only) consumer is the qwen3_5 family (sc-24135); refuse the rest
-    // by name. A missing or unreadable config (or a Prism snapshot, which `load_dir` refuses for
-    // any repacking) is left to the loader's own error.
     if let Some(config) = read_json(Path::new(&spec.source), "config.json") {
-        let is_prism =
-            config.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35");
-        if let (false, Ok(arch)) = (is_prism, Architecture::from_config(&config)) {
+        if config.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35") {
+            return Err(CoreError::Unsupported(
+                "nvfp4: Prism/Bonsai is already packed affine-2; NVFP4 repacking would expand the \
+                 model"
+                    .into(),
+            ));
+        }
+        if let Ok(arch) = Architecture::from_config(&config) {
             if arch != Architecture::Qwen35 {
                 return Err(CoreError::Unsupported(format!(
                     "nvfp4: NVFP4 projections are served for the qwen3_5 family \
@@ -936,7 +994,7 @@ fn nvfp4_format_with(
             }
         }
     }
-    gate(device).map(Some).map_err(to_core)
+    Ok(())
 }
 
 fn ensure_supported_device(source: &Path, device: &Device) -> CoreResult<()> {
@@ -1039,6 +1097,12 @@ impl LlamaProvider {
         if spec.projector_source.is_some() && !crate::gguf::is_gguf_path(&spec.source) {
             return Err(CoreError::Load("an external projector is only valid with a GGUF language checkpoint; safetensors vision must be embedded".into()));
         }
+        // The load's CUDA-graph policy (sc-24139): settled before the device is opened — the
+        // graph runner needs the model on its own CUDA stream, which the device selection picks
+        // under this switch — and held for the whole load, then recorded so every generation on
+        // this provider runs under the same switch.
+        let cuda_graphs = spec.cuda_graphs.unwrap_or_else(cuda_graphs_enabled);
+        let _cuda_graphs_scope = crate::decode::cuda_graphs_scope(Some(cuda_graphs));
         let device = select_device().map_err(to_core)?;
         // NVFP4 (sc-24135): the capability floor is settled first — before the accelerator gate,
         // admission or any weight read — so a CPU or sub-sm_120 device answers an NVFP4 request with
@@ -1100,6 +1164,7 @@ impl LlamaProvider {
             Self::load_dir(Path::new(&spec.source), &device, requested.as_ref())?
         };
         provider.load_record.requested = spec.quantize;
+        provider.load_record.cuda_graphs = Some(cuda_graphs);
         Ok(provider)
     }
 
@@ -1317,6 +1382,7 @@ impl LlamaProvider {
             load_record: LoadRecord {
                 requested: None,
                 census,
+                cuda_graphs: None,
             },
         })
     }
@@ -2257,6 +2323,10 @@ impl TextLlm for LlamaProvider {
             .validate_request(&self.descriptor.id, req)
     }
 
+    fn load_report(&self) -> Option<core_llm::LoadReport> {
+        Some(self.load_record.report())
+    }
+
     fn generate(
         &self,
         req: &TextLlmRequest,
@@ -2272,6 +2342,11 @@ impl TextLlm for LlamaProvider {
         if req.cancel.is_cancelled() {
             return Err(CoreError::Canceled); // typed pre-inference cancel
         }
+        // The load's CUDA-graph policy (sc-24139) governs everything this request does on this
+        // thread — admission's workspace pricing, wrapping the step model, the runner's switch —
+        // and the report says which switch it ran under.
+        let _cuda_graphs_scope = crate::decode::cuda_graphs_scope(self.load_record.cuda_graphs);
+        let cuda_graphs_on = cuda_graphs_enabled();
 
         // Multimodal (Qwen-VL + image/video content): replace image/video blocks with the Qwen-VL
         // placeholder text so the (vision-free) chat template renders the vision framing
@@ -3010,12 +3085,7 @@ impl TextLlm for LlamaProvider {
         // proposer that ran: `none` for a request whose speculation is off, including one whose
         // `MtpMode::Auto` resolved to no proposer (AC3, sc-24130).
         let decode_record = match engine_record {
-            Some(record) => DecodeRecord {
-                host_syncs: span_counters.host_syncs,
-                sampler: span_counters.sampler,
-                ..record
-            }
-            .with_span_tallies(&request_span),
+            Some(record) => record.with_request_span(&request_span),
             None => DecodeRecord::plain(
                 DecodePath::Reference,
                 counted.forwards() + extra_forwards,
@@ -3134,6 +3204,7 @@ impl TextLlm for LlamaProvider {
             tool_calls,
             usage,
             mtp: mtp_stats,
+            decode: Some(decode_record.report(cuda_graphs_on)),
             finish_reason: Some(finish),
         })
     }
@@ -4467,6 +4538,7 @@ mod tests {
             source: source.into(),
             projector_source: None,
             quantize: Some(core_llm::Quantize::Nvfp4),
+            cuda_graphs: None,
         }
     }
 
@@ -4898,11 +4970,9 @@ mod tests {
         )
     }
 
-    /// The synthetic Qwen3.5 decoder written as a snapshot with no `mtp.*` tensors and
-    /// `mtp_num_hidden_layers = 0`, loaded as a provider (keep the directory alive with it).
-    fn synthetic_qwen35_provider_without_mtp() -> (tempfile::TempDir, super::LlamaProvider) {
-        use core_llm::LoadSpec;
-
+    /// The synthetic Qwen3.5 decoder written as a weights-free snapshot with no `mtp.*` tensors
+    /// and `mtp_num_hidden_layers = 0`.
+    fn synthetic_qwen35_snapshot_without_mtp() -> tempfile::TempDir {
         let (cfg, weights, cfg_json) = crate::models::qwen35::tests::text_model_snapshot_parts();
         let dir = tempfile::Builder::new()
             .prefix("candle-qwen35-no-mtp-")
@@ -4926,11 +4996,83 @@ mod tests {
             .collect();
         assert!(tensors.keys().all(|k| !k.starts_with("mtp.")));
         candle_core::safetensors::save(&tensors, dir.path().join("model.safetensors")).unwrap();
+        dir
+    }
 
+    /// [`synthetic_qwen35_snapshot_without_mtp`] loaded as a provider with the backend's default
+    /// graph switch (keep the directory alive with it).
+    fn synthetic_qwen35_provider_without_mtp() -> (tempfile::TempDir, super::LlamaProvider) {
+        use core_llm::LoadSpec;
+
+        let dir = synthetic_qwen35_snapshot_without_mtp();
         let provider =
             super::LlamaProvider::load(&LoadSpec::dense(dir.path().display().to_string()))
                 .expect("load the synthetic Qwen3.5 snapshot");
         (dir, provider)
+    }
+
+    /// sc-24139: the load's CUDA-graph policy is settled at load and recorded, every generation
+    /// runs under it (not under whatever the process switch says later), and the contract carries
+    /// the decode report and the load report a product renders — the same record the evidence
+    /// harness reads, never a guess.
+    #[test]
+    fn the_load_settles_the_graph_policy_and_the_contract_carries_the_reports() {
+        use core_llm::{LoadSpec, Message, ProposerKind, Sampling, TextLlm, TextLlmRequest};
+
+        let _process = crate::decode::graph::cuda_graphs_policy_guard(Some(false));
+        let dir = synthetic_qwen35_snapshot_without_mtp();
+        let source = dir.path().display().to_string();
+        let request = TextLlmRequest {
+            messages: vec![Message::user("t3 t7 t11 t2 t7 t11")],
+            sampling: Sampling::greedy(),
+            max_new_tokens: 4,
+            seed: Some(0),
+            ..Default::default()
+        };
+
+        // `Some(true)` wins over a process switch that is off, and the load records it.
+        let on = super::LlamaProvider::load(&LoadSpec {
+            cuda_graphs: Some(true),
+            ..LoadSpec::dense(source.clone())
+        })
+        .expect("load with graphs requested");
+        assert_eq!(on.load_record().cuda_graphs, Some(true));
+        // The load report carries the settled switch, not a guess from the request.
+        assert_eq!(on.load_report().unwrap().cuda_graphs, Some(true));
+        // Flipping the process switch after the load does not change the loaded model's policy.
+        crate::decode::set_cuda_graphs(Some(false));
+        let out = on.generate(&request, &mut |_| {}).expect("generate");
+        let report = out
+            .decode
+            .clone()
+            .expect("the provider reports its decode path");
+        assert!(report.cuda_graphs.enabled, "the load's Some(true) governs");
+        assert_eq!(report, on.last_decode_record().unwrap().report(true));
+        assert_eq!(report.proposer, ProposerKind::None);
+        // `Auto` on a snapshot without a head: the engine with no proposer, since sc-24140.
+        assert_eq!(report.path, "step_model");
+        assert_eq!(
+            report.target_forwards,
+            u64::from(out.usage.generated_tokens)
+        );
+
+        // `None` keeps the process switch at load (off here); the report says so.
+        let default = super::LlamaProvider::load(&LoadSpec::dense(source)).expect("load");
+        assert_eq!(default.load_record().cuda_graphs, Some(false));
+        crate::decode::set_cuda_graphs(Some(true));
+        let out = default.generate(&request, &mut |_| {}).expect("generate");
+        assert!(!out.decode.expect("reported").cuda_graphs.enabled);
+
+        // The load report names the requested format and the resident projection kinds.
+        let load = default
+            .load_report()
+            .expect("the provider reports its load");
+        assert_eq!(load.requested, None);
+        // `None` requested, the process switch (off) at load settled it: the report says `false`.
+        assert_eq!(load.cuda_graphs, Some(false));
+        assert_eq!(load.projections.len(), 1, "{:?}", load.projections);
+        assert_eq!(load.projections[0].kind, "dense");
+        assert!(load.projections[0].count > 0 && load.projections[0].resident_bytes > 0);
     }
 
     #[test]
@@ -5006,16 +5148,17 @@ mod tests {
         }
     }
 
-    /// sc-24134, sc-24140: with the CUDA-graph switch on, a request whose speculation is off runs
-    /// through the runner (the engine with no proposer) and its record says what the runner did
-    /// with each step; a request decoded on the reference loop never runs through the runner, and
-    /// its record says why rather than a bare `graph: none`. With the switch off neither record
-    /// shows the runner.
+    /// sc-24134, sc-24139, sc-24140: with the CUDA-graph switch on — the one the provider was
+    /// loaded under (`LoadSpec::cuda_graphs`; the stream is settled at load) — a request whose
+    /// speculation is off runs through the runner (the engine with no proposer) and its record
+    /// says what the runner did with each step; a request decoded on the reference loop never runs
+    /// through the runner, and its record says why rather than a bare `graph: none`. With the
+    /// switch off neither record shows the runner.
     #[test]
     fn the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run() {
-        use core_llm::{Message, MtpMode, Sampling, TextLlm, TextLlmRequest};
+        use core_llm::{LoadSpec, Message, MtpMode, Sampling, TextLlm, TextLlmRequest};
 
-        let (_dir, mut provider) = synthetic_qwen35_provider_without_mtp();
+        let dir = synthetic_qwen35_snapshot_without_mtp();
         let request = TextLlmRequest {
             messages: vec![Message::user("t3 t7 t11 t2")],
             sampling: Sampling::greedy(),
@@ -5024,13 +5167,20 @@ mod tests {
             mtp: MtpMode::Off,
             ..Default::default()
         };
-        let run = |provider: &super::LlamaProvider, on: bool| {
-            let _guard = crate::decode::graph::cuda_graphs_policy_guard(Some(on));
+        let load = |on: bool| {
+            super::LlamaProvider::load(&LoadSpec {
+                cuda_graphs: Some(on),
+                ..LoadSpec::dense(dir.path().display().to_string())
+            })
+            .expect("load the synthetic Qwen3.5 snapshot")
+        };
+        let run = |provider: &super::LlamaProvider| {
             provider.generate(&request, &mut |_| {}).unwrap();
             provider.last_decode_record().unwrap()
         };
 
-        let engine = run(&provider, true);
+        let (mut on, mut off) = (load(true), load(false));
+        let engine = run(&on);
         assert_eq!(engine.path, DecodePath::StepModel);
         assert_eq!(
             engine.cuda_graphs.eager + engine.cuda_graphs.replayed,
@@ -5043,19 +5193,22 @@ mod tests {
             .fallback_reason
             .expect("an eager step names why");
         assert_ne!(reason, crate::decode::graph::REASON_REFERENCE_PATH);
-        assert_eq!(run(&provider, false).cuda_graphs.label(), "none");
+        assert_eq!(run(&off).cuda_graphs.label(), "none");
 
-        provider.set_decode_path(DecodePath::Reference).unwrap();
-        let describe = |on: bool| {
-            let record = run(&provider, on);
+        let describe = |provider: &mut super::LlamaProvider| {
+            provider.set_decode_path(DecodePath::Reference).unwrap();
+            let record = run(provider);
             assert_eq!(record.path, DecodePath::Reference);
             record.cuda_graphs.describe()
         };
         assert_eq!(
-            describe(true),
+            describe(&mut on),
             "graph: none replayed=0 eager=0 captured=0 fallback=reference_path"
         );
-        assert_eq!(describe(false), "graph: none replayed=0 eager=0 captured=0");
+        assert_eq!(
+            describe(&mut off),
+            "graph: none replayed=0 eager=0 captured=0"
+        );
     }
 
     /// sc-24140 (E7): a static KV cache's capacity refusal reaches the contract as the typed

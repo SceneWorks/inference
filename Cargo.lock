@@ -3369,6 +3369,7 @@ dependencies = [
  "candle-gen-catalog",
  "candle-llm",
  "runtime-catalog",
+ "tempfile",
 ]
 
 [[package]]

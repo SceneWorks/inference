@@ -40,6 +40,14 @@ item 2 — Qwen3.5 Off on the engine; one selector
     CPU  RED  provider::tests::auto_mtp_on_a_qwen35_snapshot_without_a_head_decodes_normally_and_says_proposer_none
     CPU  RED  provider::tests::the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run
     CPU  RED  provider::tests::a_stochastic_off_request_draws_through_the_device_sampler_where_there_is_one
+    after merging S11 (#1035, a400b2e83), on the merged tree:
+    CPU  RED  provider::tests::the_load_settles_the_graph_policy_and_the_contract_carries_the_reports
+              (S11's assertion updated to `report.path == "step_model"`; got "reference")
+    CPU  RED  provider::tests::the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run
+              (reworked to load under `LoadSpec::cuda_graphs`)
+    CPU  RED  qwen38_mtp::frozen_qwen38_provider_executes_ar_mtp_tools_and_stops (ignored; run with
+              QWEN38_TOKENIZER_JSON = the frozen 27B tokenizer — its AR and Auto-without-head rows now
+              assert `step_model` / `static`)
   selector_does_not_store `set_decode_path` returns Ok without storing
     CPU  RED  provider::tests::a_request_decodes_on_the_engine_unless_…, auto_mtp_on_a_qwen35_…,
               the_runner_wraps_the_off_path_…

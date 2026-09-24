@@ -12,6 +12,9 @@ candle-gen-catalog = { workspace = true, optional = true }
 candle-audio-catalog = { workspace = true, optional = true }
 candle-llm = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [features]
 default = ["media", "audio"]
 # SceneWorks consumes the complete bundle. LLM-only products can disable default features without

@@ -33,6 +33,10 @@
 //! - [`BlockAllocator`] — backend-neutral paged-KV block allocation policy (refcounts + free list).
 //! - [`speculative`] — backend-neutral speculative-decoding policy (n-gram proposer + distribution-
 //!   preserving acceptance sampler).
+//! - [`report`] — backend-neutral evidence a product renders: [`DecodeReport`] (which decode path
+//!   served a generation, on [`TextLlmOutput::decode`]), [`LoadReport`] (what a load produced, via
+//!   [`TextLlm::load_report`]) and [`BackendCapabilities`] (what the host can serve — NVFP4, CUDA
+//!   graphs — with the refusal reason when it cannot).
 //! - [`registry`] — explicit provider composition, id-based routing, and **model-first** resolution
 //!   ([`TextLlmRegistry::load_for_model`] / [`ModelRequirements`] over a weightless `can_load`
 //!   probe).
@@ -52,6 +56,7 @@ pub mod prefix;
 pub mod prepare;
 pub mod prism;
 pub mod registry;
+pub mod report;
 pub mod request;
 pub mod resource;
 pub mod schedule;
@@ -93,6 +98,10 @@ pub use prism::{
 };
 pub use registry::{
     ModelRequirements, TextLlmRegistration, TextLlmRegistry, TextLlmRegistryBuilder,
+};
+pub use report::{
+    BackendCapabilities, CudaGraphsReport, DecodeReport, FeatureSupport, LoadReport, PathReport,
+    ProjectionReport,
 };
 pub use request::{
     HostSampleReason, LoadSpec, MtpMode, Quantize, ReasoningEffort, SamplerPath, Sampling,
