@@ -4,14 +4,18 @@
 //! backend.
 //!
 //! The synthetic tests need no model weights (they run in CI): a tiny snapshot is prepared dense
-//! (passthrough) and re-quantized (Q8 with 32-aligned dims, Q4 with 256-aligned dims), and each
-//! prepared snapshot is loaded back through `load_for_model` / `LlamaProvider` to prove it is a
-//! genuinely quantized, loadable model. Gated tests run the same `check_snapshot_preparer` against
-//! real HF snapshots and a GGUF.
+//! (passthrough) and re-quantized (Q8 and Q4 — Q4_K on 256-aligned input dims, Q4_0 on 32- but not
+//! 256-aligned ones), and each prepared snapshot is loaded back through `load_for_model` /
+//! `LlamaProvider` to prove it is a genuinely quantized, loadable model. Gated tests run the same
+//! `check_snapshot_preparer` against real HF snapshots and a GGUF.
+//!
+//! The stored-block tests load through `LlamaProvider::load`, which opens the selected device:
+//! built with `--features metal` or `--features cuda` they rebuild the stored blocks on that
+//! accelerator (their fixtures are bf16, so a load-time quantization there sees the same weights).
 //!
 //! ```text
 //! CANDLE_LLM_TEST_MODEL=/path/SmolLM2     # HF dense + Q8
-//! CANDLE_LLM_QWEN3_MODEL=/path/Qwen3-0.6B # HF Q4 (256-aligned)
+//! CANDLE_LLM_QWEN3_MODEL=/path/Qwen3-0.6B # HF Q4 (Q4_K throughout: 256-aligned)
 //! CANDLE_LLM_GGUF=/path/Model.gguf        # GGUF dense + Q8
 //!   cargo test --features cuda --test prepare -- --ignored --nocapture
 //! ```
@@ -64,9 +68,15 @@ fn tokenizer_json() -> String {
     )
 }
 
-/// Write a tiny synthetic HF snapshot whose projection in-dims all equal `hidden` (and `inter`), so a
-/// `hidden`/`inter` that is block-aligned (32 for Q8, 256 for Q4) can be re-quantized.
+/// Write a tiny synthetic f32 HF snapshot whose projection in-dims all equal `hidden` (and
+/// `inter`), so a `hidden`/`inter` that is 32-aligned can be re-quantized (Q8_0; Q4_K where it is
+/// also 256-aligned, else Q4_0).
 fn write_synthetic(tag: &str, hidden: usize, inter: usize) -> Fixture {
+    write_synthetic_as(tag, hidden, inter, DType::F32)
+}
+
+/// [`write_synthetic`] with every tensor stored in `dtype`.
+fn write_synthetic_as(tag: &str, hidden: usize, inter: usize, dtype: DType) -> Fixture {
     let dir = unique_dir(tag);
     let config = format!(
         r#"{{ "hidden_size": {hidden}, "intermediate_size": {inter}, "num_hidden_layers": 2,
@@ -98,6 +108,9 @@ fn write_synthetic(tag: &str, hidden: usize, inter: usize) -> Fixture {
         arrays.insert(p("mlp.gate_proj.weight"), randn((inter, hidden), &mut rng));
         arrays.insert(p("mlp.up_proj.weight"), randn((inter, hidden), &mut rng));
         arrays.insert(p("mlp.down_proj.weight"), randn((hidden, inter), &mut rng));
+    }
+    for t in arrays.values_mut() {
+        *t = t.to_dtype(dtype).unwrap();
     }
     candle_core::safetensors::save(&arrays, dir.join("model.safetensors")).unwrap();
     dir
@@ -143,7 +156,8 @@ fn synthetic_q8_writes_quantized_snapshot() {
     quant_round_trip("q8", 32, 32, Quantize::Q8);
 }
 
-/// Q4_K (block size 256) needs 256-aligned projection in-dims.
+/// Q4 on 256-aligned projection in-dims: Q4_K (block size 256) throughout. A 32- but not
+/// 256-aligned in-dim falls back to Q4_0 (see `prepared_tiers_store_ggml_blocks_and_load_identically`).
 #[test]
 fn synthetic_q4_writes_quantized_snapshot() {
     quant_round_trip("q4", 256, 256, Quantize::Q4);
@@ -238,6 +252,10 @@ fn logits(provider: &LlamaProvider) -> Vec<f32> {
 /// fraction of the dense source, and loading it (no load-time request: the persisted block drives
 /// it) builds exactly the model a load-time quantization of the dense source builds: identical
 /// logits. The Q4 case uses a 288-wide MLP, so `down_proj` exercises the Q4_0 fallback.
+///
+/// The loads run on the selected device, so a `--features metal` / `--features cuda` build
+/// rebuilds the stored blocks on that accelerator; the bf16 fixture keeps a load-time quantization
+/// there (bf16 compute) quantizing exactly the weights the preparer did.
 #[test]
 fn prepared_tiers_store_ggml_blocks_and_load_identically() {
     for (tag, hidden, inter, quant, blocks) in [
@@ -250,7 +268,7 @@ fn prepared_tiers_store_ggml_blocks_and_load_identically() {
         ),
         ("blocks-q8", 64, 96, Quantize::Q8, [34, 34]),
     ] {
-        let src = write_synthetic(tag, hidden, inter);
+        let src = write_synthetic_as(tag, hidden, inter, DType::BF16);
         let out = unique_dir(&format!("{tag}-out"));
         prepare_snapshot(&PrepareSpec::quantized(
             src.to_path_buf(),
@@ -291,7 +309,8 @@ fn prepared_tiers_store_ggml_blocks_and_load_identically() {
         }
         assert_eq!(projections, 14, "{tag}: 2 layers x 7 projections");
 
-        // The tier holds only its own bytes: well under the dense f32 source.
+        // The tier holds only its own bytes: well under the dense bf16 source (Q4 is 0.28 of a
+        // bf16 projection, Q8 0.53; the dense embeddings and head add a little).
         let tier = std::fs::metadata(out.join("model.safetensors"))
             .unwrap()
             .len();
@@ -299,9 +318,9 @@ fn prepared_tiers_store_ggml_blocks_and_load_identically() {
             .unwrap()
             .len();
         let bound = if matches!(quant, Quantize::Q4) {
-            0.2
-        } else {
             0.35
+        } else {
+            0.6
         };
         assert!(
             (tier as f64) < bound * dense as f64,
@@ -319,6 +338,20 @@ fn prepared_tiers_store_ggml_blocks_and_load_identically() {
             logits(&at_load),
             "{tag}: stored blocks must load to the load-time-quantized model exactly"
         );
+        // The weight reader keeps the stored blocks on the host (their `QTensor`s are built on
+        // the device from there) and puts every dense tensor on the loading device.
+        let device = candle_llm::device::select_device().unwrap();
+        let weights = candle_llm::primitives::Weights::from_dir(&*out, &device).unwrap();
+        for (name, (dtype, _)) in &tensors {
+            let t = weights.get(name).unwrap();
+            match dtype.as_str() {
+                "U8" => assert!(t.device().is_cpu(), "{tag}: {name} read onto the host"),
+                _ => assert!(
+                    t.device().same_device(&device),
+                    "{tag}: {name} on the device"
+                ),
+            }
+        }
 
         // Stored blocks are never re-quantized to another tier.
         let mut other = LoadSpec::dense(out.to_str().unwrap().to_string());
@@ -331,6 +364,64 @@ fn prepared_tiers_store_ggml_blocks_and_load_identically() {
             LlamaProvider::load(&other).is_err(),
             "{tag}: re-quantizing stored blocks must be refused"
         );
+        // Nor re-quantized to NVFP4: the model gate names the stored blocks before any device
+        // or weight is touched.
+        let mut nvfp4 = LoadSpec::dense(out.to_str().unwrap().to_string());
+        nvfp4.quantize = Some(Quantize::Nvfp4);
+        match LlamaProvider::load(&nvfp4) {
+            Err(e) => assert!(
+                e.to_string().contains("stored as GGML blocks"),
+                "{tag}: {e}"
+            ),
+            Ok(_) => panic!("{tag}: NVFP4 over stored blocks must be refused"),
+        }
+
+        // Admission prices the stored blocks' device copy exactly as a load-time quantization of
+        // the dense source (Q4_0 and Q4_K cost the same per weight, padding included) — and holds
+        // the stored source bytes on the host, never the device.
+        let estimate = |dir: &std::path::Path, quantize| {
+            let mut spec = LoadSpec::dense(dir.to_str().unwrap().to_string());
+            spec.quantize = quantize;
+            LlamaProvider::load_memory_estimate(&spec, true).unwrap()
+        };
+        let stored = estimate(&out, None);
+        assert_eq!(
+            stored.quantized_copy_bytes,
+            estimate(&src, Some(quant)).quantized_copy_bytes,
+            "{tag}: stored blocks priced as the load-time copy"
+        );
+        let block_bytes: u64 = tensors
+            .values()
+            .filter(|(dtype, _)| dtype == "U8")
+            .map(|(_, shape)| shape.iter().product::<usize>() as u64)
+            .sum();
+        assert_eq!(
+            stored.source_bytes,
+            stored.payload_bytes - block_bytes,
+            "{tag}: the stored blocks are read onto the host, not the device"
+        );
+        assert_eq!(
+            stored.host_required_bytes,
+            core_llm::checkpoint_staging_bytes(&out).unwrap() + block_bytes,
+            "{tag}: the host holds the stored blocks beside one shard of staging"
+        );
+
+        // A stored-block tier whose config lost its `quantization` block is refused, never
+        // read as dense weights.
+        let stripped = unique_dir(&format!("{tag}-stripped"));
+        let mut bare = cfg.clone();
+        bare.as_object_mut().unwrap().remove("quantization");
+        std::fs::write(stripped.join("config.json"), bare.to_string()).unwrap();
+        for file in ["tokenizer.json", "model.safetensors"] {
+            std::fs::copy(out.join(file), stripped.join(file)).unwrap();
+        }
+        match LlamaProvider::load(&LoadSpec::dense(stripped.to_str().unwrap().to_string())) {
+            Err(e) => assert!(
+                e.to_string().contains("no quantization block"),
+                "{tag}: {e}"
+            ),
+            Ok(_) => panic!("{tag}: stored blocks without a quantization block must be refused"),
+        }
     }
 }
 
@@ -453,9 +544,11 @@ fn real_hf_q8() {
     );
 }
 
-/// Q4_K (block size 256) needs 256-aligned dims — Qwen3 (hidden 1024) qualifies, SmolLM2 does not.
+/// Q4 on a real snapshot. Any 32-aligned model prepares Q4 (Q4_K where an input dim is 256-aligned,
+/// Q4_0 where it is only 32-aligned — SmolLM2's hidden 576 included); Qwen3 (hidden 1024) keeps
+/// this case on Q4_K throughout.
 #[test]
-#[ignore = "needs a Qwen3 snapshot via CANDLE_LLM_QWEN3_MODEL (Q4; dims must be 256-aligned)"]
+#[ignore = "needs a real HF snapshot via CANDLE_LLM_QWEN3_MODEL (Q4)"]
 fn real_hf_q4_qwen3() {
     real_check(
         std::env::var("CANDLE_LLM_QWEN3_MODEL")
