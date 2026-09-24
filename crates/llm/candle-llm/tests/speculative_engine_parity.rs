@@ -1,23 +1,31 @@
 //! Real-weight acceptance and root-cause diagnostics for the unified speculative engine
 //! (sc-24130) on Qwen3.8-27B (`#[ignore]`d — needs the frozen snapshot and a GPU with ~54 GB free):
 //!
-//! * **AC1 (free-running, knife-edge gate)** — the 256-token greedy fixture through the engine
-//!   with the MTP proposer at K = 1..5 and with the n-gram proposer, each compared token-for-token
-//!   with the speculative-off `StepModel` driver (itself token-identical to the reference loop,
-//!   sc-24129 / sc-24132). The literal wording ("token-identical") cannot hold on this hardware:
-//!   the op-isolation survey below shows every cuBLAS projection GEMM rounds row 0 differently
-//!   for `M >= 2` rows than for the row alone, so a verify forward (`M = K + 1`) lands on the
-//!   other side of a bf16 tie wherever the reference's own top-2 logit gap is within one bf16 ULP
-//!   of its top logit. The gate therefore is: a row's first divergence, if any, is one of the
-//!   reference's **enumerated knife-edge positions** (top-2 gap `<= 1` bf16 ULP), and the
-//!   positions are listed in the evidence. The acceptance rate of every MTP row is printed for
-//!   comparison with the pre-engine loop's sealed rows.
+//! **The E1 rule for speculative rows (decided at the sc-24140 feature-end review).** A verify
+//! forward runs `M = K + 1` rows, and the op-isolation survey below shows every cuBLAS projection
+//! GEMM rounds row 0 differently for `M >= 2` rows than for the row alone, so a verify-shaped
+//! forward can land on the other side of a bf16 tie wherever the reference's own top-2 logit gap
+//! is within one bf16 ULP of its top logit. The **gate** is therefore the *teacher-forced*
+//! verify-shaped forward: every row of an `M = 2..6` forward over the reference fixture may
+//! disagree with the single-token argmax only at a reference position whose top-2 gap is
+//! `<= 1` bf16 ULP. A *free-running* speculative row compounds that rounding — its later
+//! positions attend K/V that earlier verify forwards wrote — so no fixed ULP bound on its first
+//! divergence is principled (Qwen3-8B n-gram K=3 first diverges at @51, a 2.0-ULP gap, while the
+//! teacher-forced gate passes there): free-running first divergences are **recorded** (index and
+//! the reference's top-2 gap in ULP, [`free_running_record`]), not gated. Rows with no verify
+//! forward (reference, static, fused off, the CUDA-graph fallback) stay gated token-identical.
+//!
+//! * **AC1 (free-running, recorded)** — the 256-token greedy fixture through the engine with the
+//!   MTP proposer at K = 1..5 and with the n-gram proposer, each compared token-for-token with the
+//!   speculative-off `StepModel` driver (itself token-identical to the reference loop, sc-24129 /
+//!   sc-24132); each first divergence is printed with the reference's gap. The acceptance rate of
+//!   every MTP row is printed for comparison with the pre-engine loop's sealed rows.
 //! * **AC2** — every engine row's record reports exactly one host sync per verify step.
-//! * **Teacher-forced knife-edge gate** — every position of the reference fixture re-decoded
-//!   through a *verify-shaped* forward (`M = K + 1` tokens, row 0) against the single-token
-//!   forward: positions where the argmax differs are enumerated with the reference's top-2 logit
-//!   gap in bf16 ULPs. The gate: argmax-identical at every position whose reference top-2 gap
-//!   exceeds one bf16 ULP of its top logit.
+//! * **Teacher-forced knife-edge gate (the E1 gate)** — every position of the reference fixture
+//!   re-decoded through a *verify-shaped* forward (`M = K + 1` tokens, every row) against the
+//!   single-token forward: positions where the argmax differs are enumerated with the reference's
+//!   top-2 logit gap in bf16 ULPs. The gate: argmax-identical at every position whose reference
+//!   top-2 gap exceeds one bf16 ULP of its top logit.
 //! * **Op isolation survey** — which primitive, at the 27B decode shapes, gives a different
 //!   last bit for row 0 of an `M`-row input than for the same row alone: the projection GEMMs
 //!   (attention q/k/v/o, DeltaNet in-projections, the MLP, the LM head), grouped-query attention
@@ -33,11 +41,11 @@
 //! (`release/real-weight-models.toml`); it is a passed-in path, never derived.
 //!
 //! **The llama family (sc-24140).** The knife-edge helpers are generic over [`StepModel`], and
-//! `llama_family_qwen3_8b_exact_rows_and_ngram_knife_edge_gate` holds Qwen3-8B (a `CausalLm`,
-//! `QWEN3_8B_SNAPSHOT`, ~16 GB bf16) to the same 256-token fixture: the static step seam, the
-//! fused-off loops and the CUDA-graph runner's fallback are **token-identical** to the reference
-//! loop, and every n-gram row's first divergence, if any, is one of the reference's enumerated
-//! knife-edge positions:
+//! `llama_family_qwen3_8b_exact_rows_and_teacher_forced_knife_edge_gate` holds Qwen3-8B (a
+//! `CausalLm`, `QWEN3_8B_SNAPSHOT`, ~16 GB bf16) to the same rule on the same 256-token fixture:
+//! the static step seam, the fused-off loops and the CUDA-graph runner's fallback are
+//! **token-identical** to the reference loop, the teacher-forced verify-shaped gate holds, and the
+//! free-running n-gram rows' first divergences are recorded with their gaps:
 //!
 //! ```text
 //! QWEN3_8B_SNAPSHOT=E:\...\models--Qwen--Qwen3-8B\snapshots\b968826d9c46dd6066d109eabc6255188de91218 \
@@ -275,28 +283,14 @@ fn ac1_ac2_engine_greedy_fixture_rows_against_speculative_off() {
     );
     rows.push(("ngram K=3".to_string(), divergence));
 
-    let diverged: Vec<&(String, Option<usize>)> =
-        rows.iter().filter(|(_, d)| d.is_some()).collect();
-    for (row, d) in &diverged {
-        let pos = d.unwrap();
-        let (_, gap, ulp) = gaps[pos];
-        eprintln!(
-            "[ac1] {row}: first divergence at {pos}: reference top-2 gap {gap} = {:.1} bf16 ULP \
-             of its top logit",
-            gap / ulp
-        );
-    }
-    let off_edge = off_edge_divergences(&rows, &edges);
-    assert!(
-        off_edge.is_empty(),
-        "AC1 gate: rows diverged from speculative-off at a position that is not a reference \
-         knife-edge: {off_edge:?} (knife-edges {edges:?})"
-    );
+    // Free-running rows are recorded, not gated (the E1 rule, module docs): the E1 gate is the
+    // teacher-forced test below.
+    let record = free_running_record(&rows, &gaps, &edges);
+    print_free_running("ac1", &record);
     eprintln!(
-        "[ac1] {} of {} rows token-identical over {FIXTURE_TOKENS} tokens; every divergence is a \
-         reference knife-edge position: {diverged:?}",
-        rows.len() - diverged.len(),
-        rows.len()
+        "[ac1] {} of {} rows token-identical over {FIXTURE_TOKENS} tokens",
+        record.iter().filter(|r| r.divergence.is_none()).count(),
+        record.len()
     );
 }
 
@@ -401,19 +395,59 @@ fn teacher_forced_verify_shaped_forward_vs_single_token_knife_edge_gate() {
     );
 }
 
-/// The positions of `rows` whose first divergence from the reference is **not** an enumerated
-/// knife-edge — the AC1 gate's violations (empty = the gate holds).
-fn off_edge_divergences<'a>(
-    rows: &'a [(String, Option<usize>)],
+/// One free-running speculative row's record (sc-24140): its first divergence from the reference,
+/// if any, as `(position, reference top-2 gap in bf16 ULP of the top logit, whether that position
+/// is an enumerated knife-edge)`. Recorded, never gated: a free-running row compounds the
+/// verify-shape rounding through the K/V earlier verify forwards wrote (see the module docs).
+#[derive(Debug, PartialEq)]
+struct FreeRunning {
+    row: String,
+    divergence: Option<(usize, f32, bool)>,
+}
+
+/// [`FreeRunning`] records for `rows` (`(label, first divergence)`), reading the gap of each
+/// divergence from the reference's single-token `gaps`.
+fn free_running_record(
+    rows: &[(String, Option<usize>)],
+    gaps: &[(i32, f32, f32)],
     edges: &[(usize, f32, f32)],
-) -> Vec<&'a (String, Option<usize>)> {
+) -> Vec<FreeRunning> {
     rows.iter()
-        .filter(|(_, d)| d.is_some_and(|pos| !edges.iter().any(|(edge, _, _)| *edge == pos)))
+        .map(|(row, d)| FreeRunning {
+            row: row.clone(),
+            divergence: d.map(|pos| {
+                let (_, gap, ulp) = gaps[pos];
+                (
+                    pos,
+                    gap / ulp,
+                    edges.iter().any(|(edge, _, _)| *edge == pos),
+                )
+            }),
+        })
         .collect()
 }
 
+/// Print the free-running record (the evidence line for each row).
+fn print_free_running(tag: &str, record: &[FreeRunning]) {
+    for entry in record {
+        match entry.divergence {
+            None => eprintln!("[{tag}] free-running {}: token-identical", entry.row),
+            Some((pos, ulps, edge)) => eprintln!(
+                "[{tag}] free-running {}: first divergence at {pos}, reference top-2 gap \
+                 {ulps:.2} bf16 ULP ({}; recorded, not gated)",
+                entry.row,
+                if edge {
+                    "a knife-edge"
+                } else {
+                    "not a knife-edge"
+                }
+            ),
+        }
+    }
+}
+
 #[test]
-fn the_knife_edge_gate_excuses_only_enumerated_positions() {
+fn the_free_running_record_names_each_divergence_its_gap_and_whether_it_is_a_knife_edge() {
     // Gaps (argmax, gap, ulp): positions 1 and 3 are knife-edges (gap <= 1 ULP).
     let gaps = [
         (5, 0.5, 0.0625),
@@ -431,10 +465,24 @@ fn the_knife_edge_gate_excuses_only_enumerated_positions() {
         ("at an edge".to_string(), Some(3)),
         ("off an edge".to_string(), Some(2)),
     ];
-    let off = off_edge_divergences(&rows, &edges);
-    assert_eq!(off.len(), 1);
-    assert_eq!(off[0].0, "off an edge");
-    assert!(off_edge_divergences(&rows[..2], &edges).is_empty());
+    let record = free_running_record(&rows, &gaps, &edges);
+    assert_eq!(
+        record,
+        vec![
+            FreeRunning {
+                row: "identical".into(),
+                divergence: None
+            },
+            FreeRunning {
+                row: "at an edge".into(),
+                divergence: Some((3, 0.0, true))
+            },
+            FreeRunning {
+                row: "off an edge".into(),
+                divergence: Some((2, 4.0, false))
+            },
+        ]
+    );
 }
 
 /// The Qwen3-8B `CausalLm` (bf16, the model default: `Gqa` reference arithmetic, static step
@@ -470,19 +518,88 @@ fn causal_reference_tokens(model: &CausalLm, prompt: &[i32], device: &Device) ->
     .tokens
 }
 
-/// sc-24140 (epic AT3 / E1 on the llama family). Qwen3-8B, the 256-token greedy fixture:
+/// The teacher-forced verify-shaped gate on a `CausalLm` (sc-24140 — the E1 gate): the reference
+/// fixture, every position re-decoded through a verify-shaped forward (`M = K + 1` reference
+/// tokens, `K = 1..=5`, every row) from a static cache the **single-token** path wrote, against
+/// the single-token argmax. Returns every `(M, position, verify row, reference gap in ULP)`
+/// disagreement and the subset that is **not** excused (gap above one bf16 ULP). The static
+/// cache rolls back by offset, so each trial forward is undone exactly before the single-token
+/// step advances.
+#[allow(clippy::type_complexity)]
+fn llama_teacher_forced(
+    model: &CausalLm,
+    prompt: &[i32],
+    reference: &[i32],
+    gaps: &[(i32, f32, f32)],
+) -> (
+    Vec<(usize, usize, usize, f32)>,
+    Vec<(usize, usize, usize, f32)>,
+) {
+    use candle_llm::primitives::DecodeCache;
+
+    let mut sequence = prompt.to_vec();
+    sequence.extend(reference);
+    let capacity = prompt.len() + reference.len() + 8;
+    let mut disagreements = Vec::new();
+    let mut violations = Vec::new();
+    for k in 1..=5usize {
+        let mut cache = model.new_static_cache(capacity).unwrap();
+        model
+            .forward_step(&mut cache, StepRequest::last(prompt))
+            .unwrap();
+        for pos in 0..reference.len() {
+            let cur = prompt.len() + pos;
+            let end = (cur + k + 1).min(sequence.len());
+            if end - cur < 2 {
+                break;
+            }
+            let multi = model
+                .forward_step(
+                    &mut cache,
+                    StepRequest {
+                        tokens: StepTokens::Host(&sequence[cur..end]),
+                        scope: LogitsScope::All,
+                        want_hidden: false,
+                    },
+                )
+                .unwrap()
+                .logits;
+            cache.rollback_to(cur as i32).unwrap();
+            for (i, &arg_k) in argmax_rows_device(&multi).unwrap().iter().enumerate() {
+                let Some(&(arg_1, gap, ulp)) = gaps.get(pos + i + 1) else {
+                    break;
+                };
+                if arg_1 != arg_k {
+                    let entry = (k + 1, pos + i + 1, i, gap / ulp);
+                    disagreements.push(entry);
+                    if gap > ulp {
+                        violations.push(entry);
+                    }
+                }
+            }
+            model
+                .forward_step(&mut cache, StepRequest::last(&[sequence[cur]]))
+                .unwrap();
+        }
+    }
+    (disagreements, violations)
+}
+
+/// sc-24140 (epic AT3 / E1 on the llama family). Qwen3-8B, the 256-token greedy fixture, under the
+/// E1 rule (module docs):
 ///
-/// * **exact** (token-identical to the reference loop): the static step seam; the reference loop
-///   and the static step seam with the fused primitives switched off; and the CUDA-graph runner
-///   with the switch on — which a `CausalLm` step refuses (`positions_host_scalar`), so every step
-///   runs eager through the runner's fallback, recorded with that reason;
-/// * **knife-edge gate**: the n-gram rows (K = 2, 3, 4 — the sc-24138 comparison rows that
-///   diverged at @65, @51, @132) diverge, if at all, only at an enumerated reference knife-edge
-///   (top-2 gap ≤ 1 bf16 ULP of the top logit on the single-token static path), with exactly one
-///   host sync per verify step.
+/// * **exact** (gated, token-identical to the reference loop): the static step seam; the
+///   reference loop and the static step seam with the fused primitives switched off; and the
+///   CUDA-graph runner with the switch on — which a `CausalLm` step refuses
+///   (`positions_host_scalar`), so every step runs eager through the runner's fallback;
+/// * **teacher-forced verify-shaped gate** (gated): every row of an `M = 2..6` verify forward
+///   flips the argmax only at a reference position whose top-2 gap is `<= 1` bf16 ULP;
+/// * **free-running n-gram rows** (K = 2, 3, 4 — the sc-24138 comparison rows): recorded — first
+///   divergence and the reference's gap in ULP — not gated; each keeps one host sync per verify
+///   step (AC2, gated).
 #[test]
 #[ignore = "needs the Qwen3-8B snapshot via QWEN3_8B_SNAPSHOT and a GPU (~16 GB)"]
-fn llama_family_qwen3_8b_exact_rows_and_ngram_knife_edge_gate() {
+fn llama_family_qwen3_8b_exact_rows_and_teacher_forced_knife_edge_gate() {
     use candle_llm::decode::graph::{cuda_graphs_policy_guard, graph_tally, GraphRunner};
     use candle_llm::primitives::fused_policy_guard;
 
@@ -563,7 +680,7 @@ fn llama_family_qwen3_8b_exact_rows_and_ngram_knife_edge_gate() {
     assert_eq!(graphs.fallback_reason, Some("positions_host_scalar"));
 
     // The knife-edges: the reference positions whose top-2 gap is within one bf16 ULP on the
-    // single-token static path (enumerated after the exact rows, which need none).
+    // single-token static path.
     let gaps = single_token_gaps(&model, static_cache(), &prompt, &reference);
     let edges = knife_edges(&gaps);
     eprintln!(
@@ -572,7 +689,26 @@ fn llama_family_qwen3_8b_exact_rows_and_ngram_knife_edge_gate() {
         prompt.len()
     );
 
-    // The n-gram rows against the enumerated knife-edges.
+    // The E1 gate: teacher-forced verify-shaped forwards.
+    let (disagreements, violations) = llama_teacher_forced(&model, &prompt, &reference, &gaps);
+    for m in 2..=6usize {
+        let at_m: Vec<_> = disagreements
+            .iter()
+            .filter(|(mm, ..)| *mm == m)
+            .map(|(_, pos, row, ulps)| (*pos, *row, *ulps))
+            .collect();
+        eprintln!(
+            "[llama teacher-forced] M={m}: argmax disagreements (position, verify row, reference \
+             gap in bf16 ULP): {at_m:?}"
+        );
+    }
+    assert!(
+        violations.is_empty(),
+        "E1 gate: a verify-shaped forward changed the argmax at a position that is not a bf16 \
+         knife-edge (M, position, verify row, gap ULP): {violations:?}"
+    );
+
+    // The free-running n-gram rows: recorded, not gated.
     let mut rows: Vec<(String, Option<usize>)> = Vec::new();
     for k in [2usize, 3, 4] {
         let mut proposer = NgramProposer { max_ngram: 3 };
@@ -606,106 +742,13 @@ fn llama_family_qwen3_8b_exact_rows_and_ngram_knife_edge_gate() {
             Some(1.0),
             "AC2 ngram K={k}"
         );
-        if let Some(pos) = divergence {
-            let (_, gap, ulp) = gaps[pos];
-            eprintln!(
-                "[llama] ngram K={k}: first divergence at {pos}: reference top-2 gap {gap} = \
-                 {:.2} bf16 ULP of its top logit",
-                gap / ulp
-            );
-        }
         rows.push((format!("ngram K={k}"), divergence));
     }
-    let off_edge = off_edge_divergences(&rows, &edges);
-    assert!(
-        off_edge.is_empty(),
-        "knife-edge gate: n-gram rows diverged from the reference at a position that is not an \
-         enumerated knife-edge: {off_edge:?} (knife-edges {edges:?})"
-    );
+    print_free_running("llama", &free_running_record(&rows, &gaps, &edges));
     eprintln!(
-        "[llama] gate holds: exact rows identical over {FIXTURE_TOKENS} tokens; n-gram divergences \
-         {rows:?} are all enumerated knife-edges"
-    );
-}
-
-/// sc-24140 (E1 as worded — *verify-shaped forwards*): the Qwen3-8B reference fixture, every
-/// position re-decoded through a verify-shaped forward (`M = K + 1` reference tokens, every row)
-/// from a cache the **single-token** path wrote, against the single-token argmax: a disagreement
-/// is excused only at a position whose reference top-2 gap is within one bf16 ULP. This isolates
-/// one verify forward's arithmetic from the free-running rows, whose later positions attend K/V
-/// that earlier verify forwards wrote (and so can drift further). The static cache rolls back by
-/// offset, so each trial forward is undone exactly before the single-token step advances.
-#[test]
-#[ignore = "needs the Qwen3-8B snapshot via QWEN3_8B_SNAPSHOT and a GPU (~16 GB)"]
-fn llama_family_qwen3_8b_teacher_forced_verify_shaped_knife_edge_gate() {
-    use candle_llm::primitives::DecodeCache;
-
-    let snapshot = common::qwen35::snapshot_from_env(QWEN3_8B_VAR)
-        .unwrap_or_else(|| panic!("set {QWEN3_8B_VAR}"));
-    let device = select_device().unwrap();
-    let model = load_qwen3_8b(&snapshot, &device);
-    let prompt = common::qwen35::render_chat_prompt(&snapshot, PROMPT);
-    let reference = causal_reference_tokens(&model, &prompt, &device);
-    let mut sequence = prompt.clone();
-    sequence.extend(&reference);
-    let capacity = prompt.len() + FIXTURE_TOKENS + 8;
-    let gaps = single_token_gaps(
-        &model,
-        model.new_static_cache(capacity).unwrap(),
-        &prompt,
-        &reference,
-    );
-    let edges = knife_edges(&gaps);
-    eprintln!("[llama teacher-forced] reference knife-edge positions: {edges:?}");
-
-    let mut violations = Vec::new();
-    for k in 1..=5usize {
-        let mut cache = model.new_static_cache(capacity).unwrap();
-        model
-            .forward_step(&mut cache, StepRequest::last(&prompt))
-            .unwrap();
-        let mut disagreements = Vec::new();
-        for pos in 0..FIXTURE_TOKENS {
-            let cur = prompt.len() + pos;
-            let end = (cur + k + 1).min(sequence.len());
-            if end - cur < 2 {
-                break;
-            }
-            let multi = model
-                .forward_step(
-                    &mut cache,
-                    StepRequest {
-                        tokens: StepTokens::Host(&sequence[cur..end]),
-                        scope: LogitsScope::All,
-                        want_hidden: false,
-                    },
-                )
-                .unwrap()
-                .logits;
-            cache.rollback_to(cur as i32).unwrap();
-            for (i, &arg_k) in argmax_rows_device(&multi).unwrap().iter().enumerate() {
-                let Some(&(arg_1, gap, ulp)) = gaps.get(pos + i + 1) else {
-                    break;
-                };
-                if arg_1 != arg_k {
-                    disagreements.push((pos + i + 1, i, gap / ulp));
-                    if gap > ulp {
-                        violations.push((k + 1, pos + i + 1, i, gap / ulp));
-                    }
-                }
-            }
-            model
-                .forward_step(&mut cache, StepRequest::last(&[sequence[cur]]))
-                .unwrap();
-        }
-        eprintln!(
-            "[llama teacher-forced] M={}: argmax disagreements (position, verify row, reference              gap in bf16 ULP): {disagreements:?}",
-            k + 1
-        );
-    }
-    assert!(
-        violations.is_empty(),
-        "a verify-shaped forward changed the argmax at a position that is not a bf16 knife-edge          (M, position, verify row, gap ULP): {violations:?}"
+        "[llama] gate holds: exact rows identical over {FIXTURE_TOKENS} tokens; {} teacher-forced \
+         disagreements, all at <= 1 bf16 ULP knife-edges",
+        disagreements.len()
     );
 }
 
