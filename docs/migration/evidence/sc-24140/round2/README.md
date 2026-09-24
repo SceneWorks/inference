@@ -52,6 +52,10 @@ Epic sc-24128, feature-end fix story, round 2. Host: Windows 11, CUDA lane on **
    * Every test that captures already holds the lock through its graph guard.
    * A source-scan test fails if a direct CUDA device constructor appears anywhere in `src/`
      outside `device.rs`.
+   * The lock tests use no clock (the `check_clock_assertions.py` ratchet holds). Exclusion is
+     checked with a non-waiting `try_hold` from another thread. The lock counts its parked
+     waiters, so the hand-off test releases only once a waiter is parked. The only timeouts
+     are there to stop a regression from hanging.
 
 ## The 20× CUDA lib loop (finding 5)
 
@@ -59,12 +63,12 @@ Epic sc-24128, feature-end fix story, round 2. Host: Windows 11, CUDA lane on **
 
 | binary | runs | failures |
 |---|---|---|
-| this branch ([`cuda-lib-loop-fixed.txt`](cuda-lib-loop-fixed.txt)) | 20 | **0** (402 passed each) |
+| this branch, merged with feature head `b912ace5f` ([`cuda-lib-loop-fixed.txt`](cuda-lib-loop-fixed.txt)) | 20 | **0** (402 passed each) |
 | control: feature head `022246245`, no lock ([`cuda-lib-loop-control.txt`](cuda-lib-loop-control.txt)) | 20 | **9** |
 
 Every control failure is `poc_contiguous_ops_replay_bit_exact_and_index_select_is_refused`, which
 panicked with `capture abandoned: capture_invalidated` at `graph.rs:2093`. Serializing the CUDA
-tests raises the suite's time from about 1.9 s to about 6.5 s.
+tests raises the suite's time from about 1.9 s to about 4.5–5 s.
 
 ## Mutations
 
@@ -72,9 +76,9 @@ tests raises the suite's time from about 1.9 s to about 6.5 s.
 mutation was applied alone, the named test was run, and the source was restored and touched.
 
 * Python: P1–P34.
-* Rust on the CPU: R1–R12.
-* Rust on CUDA, GPU 1: R7, R10, R11.
+* Rust on the CPU: R1–R12. R8a–R8e were re-run on the final, clock-free lock test.
+* Rust on CUDA, GPU 1: R7, R10, R11. R10a–R10b were re-run on the final test.
 
-All 59 mutations turned their tests **RED**. The provenance test was also run **GREEN** on a build with
+All 60 mutations turned their tests **RED**. The provenance test was also run **GREEN** on a build with
 `CANDLE_LLM_BUILD_PROVENANCE=1`, which embedded this checkout's `HEAD`, before R12b was run
 against it.

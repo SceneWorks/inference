@@ -4,7 +4,7 @@
 # Rust CPU: CARGO_TARGET_DIR=C:/cargo-targets/fe-r2-cpu. Rust CUDA: --features cuda,
 # CUDA_VISIBLE_DEVICES=1 (RTX PRO 6000 Blackwell Max-Q, sm_120), MSVC 14.44, CUDA_COMPUTE_CAP=120.
 
-# 59 mutations, 59 RED.
+# 60 mutations, 60 RED.
 ## Python (P1-P34): <id> <assertion> -> <result> (pytest summary)
 P1 prompt hash joins the comparison key -> RED (1 failed, 26 deselected in 0.24s)
 P2 sampling seed joins the comparison key -> RED (1 failed, 26 deselected in 0.22s)
@@ -55,10 +55,11 @@ R6b gate reads a text_config quantization block -> RED [provider::tests::nvfp4_g
 R6c an orphan .scales is not a packed triple -> RED [provider::tests::nvfp4_gate_refuses_a_packed_mlx_affine_snapshot_before_the_device_gate; panicked at crates\llm\candle-llm\src\provider.rs:4947:17]
 R6d a triple without a quantization block is not refused by the gate -> RED [provider::tests::nvfp4_gate_refuses_a_packed_mlx_affine_snapshot_before_the_device_gate; panicked at crates\llm\candle-llm\src\provider.rs:4947:17]
 R6e the packed refusal is one sentence (no run of spaces) -> RED [provider::tests::nvfp4_gate_refuses_a_packed_mlx_affine_snapshot_before_the_device_gate; panicked at crates\llm\candle-llm\src\provider.rs:4928:13]
-R8a the switch lock is re-entrant on its thread -> RED [primitives::switch::tests::the_lock_is_reentrant_on_its_thread_and_excludes_every_other_thread; panicked at crates\llm\candle-llm\src\primitives\switch.rs:312:14]
-R8b the switch lock excludes other threads -> RED [primitives::switch::tests::the_lock_is_reentrant_on_its_thread_and_excludes_every_other_thread; panicked at crates\llm\candle-llm\src\primitives\switch.rs:323:9]
-R8c the last release wakes a waiting thread -> RED [primitives::switch::tests::the_lock_is_reentrant_on_its_thread_and_excludes_every_other_thread; panicked at crates\llm\candle-llm\src\primitives\switch.rs:329:14]
-R8d a guard still restores its policy (a hold restores none) -> RED [primitives::switch::tests::the_lock_is_reentrant_on_its_thread_and_excludes_every_other_thread; panicked at crates\llm\candle-llm\src\primitives\switch.rs:313:9]
+R8a the switch lock is re-entrant on its thread -> RED [primitives::switch::tests::the_lock_is_reentrant_on_its_thread_and_excludes_every_other_thread; panicked at crates\llm\candle-llm\src\primitives\switch.rs:350:14]
+R8b the switch lock excludes other threads -> RED [primitives::switch::tests::the_lock_is_reentrant_on_its_thread_and_excludes_every_other_thread; panicked at crates\llm\candle-llm\src\primitives\switch.rs:359:9]
+R8c the last release wakes a waiting thread -> RED [primitives::switch::tests::the_lock_is_reentrant_on_its_thread_and_excludes_every_other_thread; panicked at crates\llm\candle-llm\src\primitives\switch.rs:378:14]
+R8d a guard still restores its policy (a hold restores none) -> RED [primitives::switch::tests::the_lock_is_reentrant_on_its_thread_and_excludes_every_other_thread; panicked at crates\llm\candle-llm\src\primitives\switch.rs:351:9]
+R8e a failed try_hold releases nothing (lazy SwitchLock) -> RED [primitives::switch::tests::the_lock_is_reentrant_on_its_thread_and_excludes_every_other_thread; panicked at crates\llm\candle-llm\src\primitives\switch.rs:372:17]
 R9 no unit test opens a CUDA device outside the locked helpers -> RED [device::tests::cuda_devices_are_opened_only_behind_the_cuda_test_lock; panicked at crates\llm\candle-llm\src\device.rs:270:9]
 R12a an empty embedded provenance reads as null -> RED [build_provenance_is_absent_or_names_the_checkout_head; panicked at crates\llm\candle-llm\tests\decode_bench.rs:1806:5]
 R12b embedded provenance names the checkout HEAD (built with CANDLE_LLM_BUILD_PROVENANCE=1) -> RED [build_provenance_is_absent_or_names_the_checkout_head; panicked at crates\llm\candle-llm\tests\decode_bench.rs:1806:5]

@@ -248,6 +248,13 @@ pub(crate) fn hold_cuda_test_lock() {
     });
 }
 
+/// Unit-test probe: the CUDA test lock ([`hold_cuda_test_lock`]) if no other thread holds it,
+/// without waiting.
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) fn try_cuda_test_lock() -> Option<crate::primitives::switch::SwitchLock> {
+    SWITCH.try_hold()
+}
+
 /// Per-thread counts of graph replays vs eager step executions (monotone; take deltas with
 /// [`GraphTally::since`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

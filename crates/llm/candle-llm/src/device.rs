@@ -346,15 +346,20 @@ mod cuda_tests {
                 holder.join().unwrap();
                 return;
             }
+            let taken_elsewhere =
+                std::thread::spawn(|| crate::decode::graph::try_cuda_test_lock().is_some())
+                    .join()
+                    .unwrap();
+            assert!(
+                !taken_elsewhere,
+                "{name}: no other thread can take the CUDA test lock while a test thread holds a \
+                 CUDA device"
+            );
             let (guarded_tx, guarded) = channel();
             let waiter = std::thread::spawn(move || {
                 let _guard = cuda_graphs_policy_guard(None);
                 guarded_tx.send(()).unwrap();
             });
-            assert!(
-                guarded.recv_timeout(Duration::from_millis(500)).is_err(),
-                "{name}: a capture guard must wait while a test thread holds a CUDA device"
-            );
             finish_tx.send(()).unwrap();
             holder.join().unwrap();
             guarded
