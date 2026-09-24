@@ -57,6 +57,64 @@ fn progress_logger(label: String) -> impl FnMut(Progress) {
     }
 }
 
+/// `phys_footprint` of this process — the counter the SceneWorks memory campaign's ceiling reads
+/// (`physical_footprint_at_or_above_…`) — and its lifetime maximum, in bytes, via
+/// `proc_pid_rusage(RUSAGE_INFO_V4)`. RSS is meaningless for Metal buffers; this is not.
+fn phys_footprint() -> (u64, u64) {
+    extern "C" {
+        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u8) -> i32;
+    }
+    // `rusage_info_v4` is 296 bytes: `ri_phys_footprint` at byte 72 and
+    // `ri_lifetime_max_phys_footprint` at byte 240 (see `<sys/resource.h>`).
+    let mut buffer = [0u8; 512];
+    // SAFETY: the buffer is larger than `rusage_info_v4` and the pid is our own.
+    let rc = unsafe { proc_pid_rusage(std::process::id() as i32, 4, buffer.as_mut_ptr()) };
+    assert_eq!(rc, 0, "proc_pid_rusage failed");
+    let read = |offset: usize| u64::from_ne_bytes(buffer[offset..offset + 8].try_into().unwrap());
+    (read(72), read(240))
+}
+
+/// One `[mem]` line per phase boundary: MLX's active / cache / peak-active counters, the process
+/// footprint, and the footprint high-water mark the sampler thread saw since the previous line.
+/// Resets MLX's peak counter so the next line's `peak_active` is that phase's own high-water mark.
+fn memory_line(label: &str, footprint_max: &std::sync::atomic::AtomicU64) {
+    const GIB: f64 = (1u64 << 30) as f64;
+    let (fp, fp_lifetime) = phys_footprint();
+    let fp_phase = footprint_max.swap(0, std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "[mem] {label}: active={:.2} GiB cache={:.2} GiB peak_active={:.2} GiB footprint={:.2} GB \
+         footprint_phase_max={:.2} GB footprint_lifetime_max={:.2} GB mlx_memory_limit={:.2} GB \
+         mlx_cache_limit={:.2} GB",
+        mlx_rs::memory::get_active_memory() as f64 / GIB,
+        mlx_rs::memory::get_cache_memory() as f64 / GIB,
+        mlx_rs::memory::get_peak_memory() as f64 / GIB,
+        fp as f64 / 1e9,
+        fp_phase.max(fp) as f64 / 1e9,
+        fp_lifetime as f64 / 1e9,
+        mlx_rs::memory::get_memory_limit() as f64 / 1e9,
+        {
+            // `get_cache_limit` is not bound; read it by setting and restoring.
+            let current = mlx_rs::memory::set_cache_limit(0);
+            mlx_rs::memory::set_cache_limit(current);
+            current as f64 / 1e9
+        },
+    );
+    mlx_rs::memory::reset_peak_memory();
+}
+
+/// A 50 ms footprint sampler so the per-phase footprint peak is observed, not just its value at
+/// the boundary. Returns the shared high-water cell; the thread runs until the process exits.
+fn footprint_sampler() -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+    let cell = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let shared = cell.clone();
+    std::thread::spawn(move || loop {
+        let (fp, _) = phys_footprint();
+        shared.fetch_max(fp, std::sync::atomic::Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    });
+    cell
+}
+
 /// Tokenizer only — no weights are opened. The released `processor/chat_template.jinja` renders a
 /// lone system message as exactly the literal prefix the port tokenizes, so the derived drop count
 /// is upstream's `_drop_idx` (14); `tools/_qwen21_common.py` re-proves the template/literal
@@ -114,13 +172,36 @@ fn validation_render_default_preset() {
         .unwrap_or_else(|_| PathBuf::from("."));
     std::fs::create_dir_all(&out_dir).unwrap();
 
+    // `QWEN_IMAGE_2_1_MEMORY_TRACE=1` prints a `[mem]` line at every phase boundary (sc-24114's
+    // footprint investigation); `QWEN_IMAGE_2_1_RENDER_TILED=1` asks for the bounded 512/64 decode
+    // explicitly (the default already bounds every area above 512², sc-24114), and
+    // `QWEN_IMAGE_2_1_CLEAR_CACHE_BEFORE_DECODE=1` sheds MLX's buffer cache at the `Decoding` event.
+    let trace = std::env::var_os("QWEN_IMAGE_2_1_MEMORY_TRACE").is_some();
+    let footprint_max = footprint_sampler();
+    if trace {
+        memory_line("before load", &footprint_max);
+    }
+
     let started = Instant::now();
     let registry = mlx_gen_qwen_image_2_1::provider_registry().unwrap();
     let generator = registry
         .load("qwen_image_2_1", &LoadSpec::new(WeightsSource::Dir(root)))
         .unwrap();
     eprintln!("loaded in {:.1}s", started.elapsed().as_secs_f32());
+    if trace {
+        memory_line("after load (lazy)", &footprint_max);
+    }
 
+    let memory = if std::env::var_os("QWEN_IMAGE_2_1_RENDER_TILED").is_some() {
+        Some(mlx_gen::gen_core::GenerationMemory {
+            tile_vae_decode: true,
+            decode_tile_edge: Some(mlx_gen_qwen_image_2_1::pipeline::DECODE_TILE_EDGE),
+            decode_overlap: Some(mlx_gen_qwen_image_2_1::pipeline::DECODE_OVERLAP),
+            ..Default::default()
+        })
+    } else {
+        None
+    };
     let req = GenerationRequest {
         prompt: "A neon shop sign that reads \"QWEN IMAGE 2.1\", rainy night, reflections on wet pavement"
             .to_owned(),
@@ -128,12 +209,42 @@ fn validation_render_default_preset() {
         height,
         steps: Some(steps),
         seed: Some(42),
+        memory,
         ..Default::default()
     };
+    eprintln!(
+        "decode tiling: {:?}",
+        mlx_gen_qwen_image_2_1::pipeline::decode_tiling(&req)
+    );
+    let clear_before_decode =
+        std::env::var_os("QWEN_IMAGE_2_1_CLEAR_CACHE_BEFORE_DECODE").is_some();
     let render_started = Instant::now();
+    let mut log = progress_logger(String::new());
+    let footprint_for_progress = footprint_max.clone();
     let out = generator
-        .generate(&req, &mut progress_logger(String::new()))
+        .generate(&req, &mut |p| {
+            log(p);
+            if trace {
+                let label = match &p {
+                    Progress::Loading(phase) => format!("loading {phase:?}"),
+                    Progress::Step { current, .. } => format!("step {current} reported"),
+                    Progress::Decoding => "before decode".to_owned(),
+                };
+                memory_line(&label, &footprint_for_progress);
+            }
+            if clear_before_decode && matches!(p, Progress::Decoding) {
+                mlx_rs::memory::clear_cache();
+                if trace {
+                    memory_line("before decode, after clear_cache", &footprint_for_progress);
+                }
+            }
+        })
         .unwrap();
+    if trace {
+        memory_line("after decode (generate returned)", &footprint_max);
+        mlx_rs::memory::clear_cache();
+        memory_line("after clear_cache", &footprint_max);
+    }
     let GenerationOutput::Images(images) = out else {
         panic!("images expected");
     };
@@ -276,7 +387,28 @@ fn validation_render_reference_edit() {
     // block-causal prefix every step (no KV cache — see UPSTREAM.md). The boundary case therefore
     // runs the fewest steps the sampler accepts rather than a smaller target: only the step count
     // moves its cost.
-    for (count, width, height, steps) in [(2usize, 1024u32, 1024u32, 8u32), (10, 512, 512, 2)] {
+    //
+    // `QWEN_IMAGE_2_1_EDIT_CASES="refs:WxH:steps,…"` replaces the two cases (sc-24114's encode
+    // transient measurement: `2:2048x2048:2`); `QWEN_IMAGE_2_1_MEMORY_TRACE=1` prints the same
+    // `[mem]` phase lines as the T2I render. The reference encodes are lazy, so they materialize
+    // inside the first denoise step's eval: the phase that ends at `step 2 reported` is the one
+    // whose `peak_active` carries the encoder's transient.
+    let cases: Vec<(usize, u32, u32, u32)> = match std::env::var("QWEN_IMAGE_2_1_EDIT_CASES") {
+        Ok(spec) => spec
+            .split(',')
+            .map(|case| {
+                let mut parts = case.split(':');
+                let count = parts.next().unwrap().parse().unwrap();
+                let (w, h) = parts.next().unwrap().split_once('x').expect("WxH");
+                let steps = parts.next().unwrap().parse().unwrap();
+                (count, w.parse().unwrap(), h.parse().unwrap(), steps)
+            })
+            .collect(),
+        Err(_) => vec![(2, 1024, 1024, 8), (10, 512, 512, 2)],
+    };
+    let trace = std::env::var_os("QWEN_IMAGE_2_1_MEMORY_TRACE").is_some();
+    let footprint_max = footprint_sampler();
+    for (count, width, height, steps) in cases {
         let refs = references(count, 768, 768);
         let req = GenerationRequest {
             prompt: "Combine the subjects of the reference images into one scene, evening light"
@@ -288,10 +420,22 @@ fn validation_render_reference_edit() {
             conditioning: vec![Conditioning::MultiReference { images: refs }],
             ..Default::default()
         };
+        if trace {
+            memory_line("before generate", &footprint_max);
+        }
         let render_started = Instant::now();
+        let mut log = progress_logger(format!("{count} refs: "));
         let out = generator
-            .generate(&req, &mut progress_logger(format!("{count} refs: ")))
+            .generate(&req, &mut |p| {
+                log(p);
+                if trace {
+                    memory_line(&format!("{count} refs: {p:?}"), &footprint_max);
+                }
+            })
             .unwrap();
+        if trace {
+            memory_line("after decode (generate returned)", &footprint_max);
+        }
         let GenerationOutput::Images(images) = out else {
             panic!("images expected");
         };
