@@ -6,6 +6,7 @@ import copy
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -795,6 +796,27 @@ class DecodeBenchWrapperTests(unittest.TestCase):
         self.assertEqual(meta["missing"], [])
         self.assertEqual(len(meta["cells"]), 8)
         self.assertEqual(bench.main(["campaign-verify", str(output)]), 0)
+        # Self-contained: runs are named relative to the campaign, which verifies after a move.
+        self.assertEqual(
+            {c["run_directory"] for c in meta["cells"]},
+            {f"runs/{name}" for name in runs},
+        )
+        moved = self.root / "moved-campaign"
+        shutil.move(str(output), str(moved))
+        bench.verify_campaign(moved)
+        output = moved
+        # An index naming a run outside the campaign is refused, even when re-sealed.
+        tampered = self.root / "tampered-campaign"
+        shutil.copytree(moved, tampered)
+        index = json.loads((tampered / "index.json").read_text(encoding="utf-8"))
+        index["cells"][0]["run_directory"] = str(moved / index["cells"][0]["run_directory"])
+        (tampered / "index.json").write_text(json.dumps(index), encoding="utf-8")
+        (tampered / "SEAL.json").write_text(
+            json.dumps({n: bench.sha256_file(tampered / n) for n in ("INDEX.md", "index.json")}),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "outside the campaign directory"):
+            bench.verify_campaign(tampered)
         # Tampering with the index or any sealed run is caught.
         with (output / "INDEX.md").open("a", encoding="utf-8") as handle:
             handle.write("edited\n")
@@ -858,7 +880,13 @@ class DecodeBenchWrapperTests(unittest.TestCase):
         self.assertEqual(bench.main([*common, "--output", str(output), *collect]), 0)
         index = (output / "INDEX.md").read_text(encoding="utf-8")
         self.assertIn("| llama-test | nvfp4 | off | ok | n/a (no MTP head) | ok (K=3) | head-llama-nvfp4 |", index)
-        self.assertEqual(json.loads((output / "index.json").read_text(encoding="utf-8"))["mode"], "collect")
+        meta = json.loads((output / "index.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["mode"], "collect")
+        # The collected runs were copied in: the campaign verifies without its sources.
+        self.assertEqual(
+            sorted(c["run_directory"] for c in meta["cells"]), ["runs/llama-bf16", "runs/llama-nvfp4"]
+        )
+        self.assertTrue((output / "runs" / "llama-bf16" / "SEAL.json").is_file())
         bench.verify_campaign(output)
         # A requested cell with no run is refused unless the index is explicitly partial.
         partial = self.root / "partial"

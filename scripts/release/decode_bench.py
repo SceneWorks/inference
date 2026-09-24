@@ -37,6 +37,7 @@ import argparse
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import time
@@ -891,10 +892,8 @@ def campaign(args: argparse.Namespace) -> int:
                         "weight_format": fmt,
                         "cuda_graphs": switch,
                         "run": cell_run["run_name"] if cell_run else None,
-                        "run_directory": cell_run["directory"] if cell_run else None,
-                        "run_seal_sha256": (
-                            sha256_file(Path(cell_run["directory"]) / "SEAL.json") if cell_run else None
-                        ),
+                        "run_directory": None,  # filled once the run sits in the campaign
+                        "run_seal_sha256": None,
                         "speculative": status,
                     }
                 )
@@ -903,6 +902,31 @@ def campaign(args: argparse.Namespace) -> int:
         raise ValueError(f"runs outside the requested matrix: {stray}")
     if missing and not args.allow_partial:
         raise ValueError("campaign matrix cells are missing: " + "; ".join(missing))
+
+    # The campaign is self-contained: every baseline (and, collecting, every head run) is copied
+    # in beside the runs it ran, re-verified from the copy, and the index names it relative to
+    # the campaign directory — so the sealed directory can be moved (into the repository's
+    # evidence tree) and still verify.
+    output.mkdir(parents=True, exist_ok=True)
+    copies = [("baselines", run) for run in baselines]
+    if args.collect:
+        copies += [("runs", run) for run in heads]
+    for kind, entry in copies:
+        source = Path(entry["directory"])
+        destination = output / kind / source.name
+        if destination.exists():
+            raise ValueError(f"two sealed runs share the directory name {source.name!r}")
+        shutil.copytree(source, destination)
+        copied = load_run(destination)
+        if copied["suite_document_sha256"] != entry["suite_document_sha256"]:
+            raise ValueError(f"{destination} is not a faithful copy of {source}")
+        entry["directory"] = str(destination)
+    by_name = {run["run_name"]: run for run in heads}
+    for cell in cells:
+        if cell["run"]:
+            directory = Path(by_name[cell["run"]]["directory"])
+            cell["run_directory"] = directory.relative_to(output).as_posix()
+            cell["run_seal_sha256"] = sha256_file(directory / "SEAL.json")
 
     # The index: the coverage table, then one comparison table per model (baselines first).
     label = (heads or baselines)[0]["label"] if (heads or baselines) else args.label
@@ -937,7 +961,6 @@ def campaign(args: argparse.Namespace) -> int:
         text = render_table(model_runs)
         tables[model["key"]] = [r["run_name"] for r in model_runs]
         lines += ["", f"## {model['key']}", "", text.rstrip("\n")]
-    output.mkdir(parents=True, exist_ok=True)
     index_md = output / "INDEX.md"
     index_md.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
     index = {
@@ -959,7 +982,7 @@ def campaign(args: argparse.Namespace) -> int:
         "baselines": [
             {
                 "run": r["run_name"],
-                "run_directory": r["directory"],
+                "run_directory": Path(r["directory"]).relative_to(output).as_posix(),
                 "run_seal_sha256": sha256_file(Path(r["directory"]) / "SEAL.json"),
             }
             for r in baselines
@@ -989,7 +1012,10 @@ def verify_campaign(directory: Path) -> dict[str, Any]:
         raise ValueError(f"{directory} is not a decode_bench campaign")
     entries = [c for c in index["cells"] if c.get("run_directory")] + index["baselines"]
     for entry in entries:
-        run_dir = Path(entry["run_directory"])
+        relative = Path(entry["run_directory"])
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"{directory}: {relative} is outside the campaign directory")
+        run_dir = directory / relative
         load_run(run_dir)
         if sha256_file(run_dir / "SEAL.json") != entry["run_seal_sha256"]:
             raise ValueError(f"{run_dir} was re-sealed after the campaign index was written")
