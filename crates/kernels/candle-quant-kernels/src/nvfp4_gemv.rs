@@ -296,10 +296,11 @@ mod cuda_impl {
         let num_k_atoms = n_blocks.div_ceil(SF_ATOM_COLS);
 
         // The kernel reads x as a dense [rows, k] bf16 matrix; 16-byte vector loads need K % 8 == 0
-        // and a start offset on a 16-byte boundary (a narrowed view may not be).
+        // and a start offset on a 16-byte boundary (a narrowed view may not be). Realign such a
+        // view into a fresh tensor: `Tensor::copy` keeps the view's storage and offset.
         let x2 = x.reshape((plan.rows, plan.k))?.contiguous()?;
         let x2 = if x2.layout().start_offset() % 8 != 0 {
-            x2.copy()?
+            x2.force_contiguous()?
         } else {
             x2
         };
@@ -568,6 +569,27 @@ mod cuda_tests {
             &x.contiguous().unwrap(),
             &direct,
         );
+    }
+
+    /// A contiguous activation view whose start is off the 16-byte boundary the vector loads need
+    /// (a row narrow at an odd element offset) is realigned before the launch, and reads its own
+    /// rows (sc-24140 review: `Tensor::copy` keeps a view's storage and offset, so it cannot
+    /// realign one).
+    #[test]
+    fn gemv_realigns_a_contiguous_view_off_the_vector_boundary() {
+        let Some((device, ctx)) = nvfp4_device() else {
+            crate::skip_without_sm120("no sm_120 CUDA device");
+            return;
+        };
+        let (n, k) = (64, 256);
+        let w = Nvfp4Weight::quantize(&bf16(&[n, k], 3, 0.5, &device), None, &ctx).unwrap();
+        let flat = bf16(&[1 + 3 * k], 13, 1.0, &device);
+        let x = flat.narrow(0, 1, 3 * k).unwrap().reshape((3, k)).unwrap();
+        assert!(x.is_contiguous() && !x.layout().start_offset().is_multiple_of(8));
+        let y = w.forward_gemv(&x).unwrap();
+        let compact = x.force_contiguous().unwrap();
+        assert_eq!(compact.layout().start_offset(), 0);
+        assert_matches_dequant_reference("offset view", &w, &compact, &y);
     }
 
     /// Unsupported inputs are refused, typed, before any launch; the cuBLASLt path serves them.

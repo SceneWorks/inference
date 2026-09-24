@@ -1334,22 +1334,33 @@ impl LlamaProvider {
         let working = if crate::gguf::is_gguf_path(&spec.source) {
             if crate::prism_checkpoint::PrismGgufCheckpoint::is_prism(source).map_err(to_core)? {
                 // Prism GGUF: packed blocks the loader wraps, never re-quantized.
-                LoadWorkingSet::resident_payload(payload, 0, true)
+                LoadWorkingSet::resident_payload(payload, 0, 0, true)
             } else {
                 gguf_working_set(source, requested, cuda)?
             }
         } else {
             let config = read_json(source, "config.json");
             let decoder = PricedDecoder::from_config(config.as_ref());
-            let copy = match decoder.format(requested) {
-                Some(format) => {
-                    let tensors = snapshot_tensor_headers(source)?;
-                    snapshot_quantized_copy_bytes(&decoder, format, &tensors)
-                        .ok_or_else(overflow)?
-                }
-                None => 0,
+            let format = decoder.format(requested);
+            let builds = matches!(decoder, PricedDecoder::Causal(_) | PricedDecoder::Qwen35(_));
+            let (cast, copy) = if builds && (cuda || format.is_some()) {
+                let tensors = snapshot_tensor_headers(source)?;
+                let (copy, consumed) = match format {
+                    Some(format) => snapshot_quantized_copy_bytes(&decoder, format, &tensors)
+                        .ok_or_else(overflow)?,
+                    None => (0, Default::default()),
+                };
+                // Off CUDA the compute dtype is f32 and the host rule's three payloads cover it.
+                let cast = if cuda {
+                    snapshot_cast_copy_bytes(&tensors, &consumed).ok_or_else(overflow)?
+                } else {
+                    0
+                };
+                (cast, copy)
+            } else {
+                (0, 0)
             };
-            LoadWorkingSet::resident_payload(payload, copy, decoder.is_packed())
+            LoadWorkingSet::resident_payload(payload, cast, copy, decoder.is_packed())
         };
         let (host_required, device_required) =
             load_memory_requirements(payload, staging, projector, cuda, working)
@@ -2162,8 +2173,9 @@ pub struct LoadMemoryEstimate {
     /// dequantized into (`0` off CUDA).
     pub source_bytes: u64,
     /// The compute-dtype (bf16) casts the load builds beside that source for the tensors it
-    /// keeps dense: a llama-family GGUF's, cast from its f32 map (`0` for a safetensors or Prism
-    /// checkpoint, and off CUDA).
+    /// keeps dense: a llama-family GGUF's, cast from its f32 map, and a safetensors snapshot's
+    /// tensors stored in a float dtype other than bf16 (f16, f32) (`0` for a bf16 snapshot, a
+    /// Prism checkpoint, and off CUDA).
     pub cast_copy_bytes: u64,
     /// The quantized projection copy the load builds beside the source: exactly the projections
     /// the loader stores in the requested (or a snapshot's persisted) format, at the bytes the
@@ -2198,12 +2210,13 @@ struct LoadWorkingSet {
 }
 
 impl LoadWorkingSet {
-    /// A safetensors or Prism load: the payload itself is the resident source (bf16 tensors are
-    /// their own compute-dtype weights), plus the quantized `copy`.
-    fn resident_payload(payload: u64, copy: u64, packed: bool) -> Self {
+    /// A safetensors or Prism load: the payload itself is the resident source, plus the bf16
+    /// `cast` of every tensor stored in another float dtype ([`snapshot_cast_copy_bytes`]) and
+    /// the quantized `copy`.
+    fn resident_payload(payload: u64, cast: u64, copy: u64, packed: bool) -> Self {
         Self {
             source: payload,
-            cast: 0,
+            cast,
             copy,
             host: if packed {
                 HostRule::Packed
@@ -2231,6 +2244,12 @@ impl CopyFormat {
             Quantize::Q8 => Self::Ggml(QuantSpec::q8()),
             Quantize::Nvfp4 => Self::Nvfp4,
         })
+    }
+
+    /// Whether the loader keeps a `[rows, cols]` projection dense under this format: an NVFP4
+    /// shape the FP4 GEMM cannot serve (the test `load_eligible` applies).
+    fn keeps_dense(self, rows: usize, cols: usize) -> bool {
+        self == Self::Nvfp4 && nvfp4_device_bytes(rows, cols).is_none()
     }
 
     /// Device bytes of a dense `[rows, cols]` projection stored in this format: its GGML blocks,
@@ -2376,14 +2395,17 @@ fn snapshot_tensor_headers(dir: &Path) -> CoreResult<SnapshotTensors> {
 /// head and any vision tower are never priced: the loader never copies them.
 ///
 /// A GGML format over an MLX-affine triple (a `.scales` sidecar) is a Q8_0 repack, priced only
-/// where the loader performs one ([`affine_q8_repack_bytes`]). `None` on overflow.
-fn snapshot_quantized_copy_bytes(
+/// where the loader performs one ([`affine_q8_repack_bytes`]). Returns the copy's bytes and the
+/// float tensors the loader consumes into it whole — never kept dense, so never cast beside
+/// their source ([`snapshot_cast_copy_bytes`]). `None` on overflow.
+fn snapshot_quantized_copy_bytes<'a>(
     decoder: &PricedDecoder,
     format: CopyFormat,
-    tensors: &SnapshotTensors,
-) -> Option<u64> {
+    tensors: &'a SnapshotTensors,
+) -> Option<(u64, std::collections::HashSet<&'a str>)> {
     use crate::models::{llama, qwen35, split_layer_key};
     let mut total = 0u64;
+    let mut consumed = std::collections::HashSet::new();
     let mut add = |bytes: u64| -> Option<()> {
         total = total.checked_add(bytes)?;
         Some(())
@@ -2435,6 +2457,10 @@ fn snapshot_quantized_copy_bytes(
                     }
                     _ => vec![rows],
                 };
+                // An NVFP4 part the FP4 GEMM cannot serve stays dense (as its source's cast).
+                if !parts.iter().any(|&part| format.keeps_dense(part, cols)) {
+                    consumed.insert(key.as_str());
+                }
                 for part in parts {
                     add(format.projection_bytes(part, cols)?)?;
                 }
@@ -2447,13 +2473,17 @@ fn snapshot_quantized_copy_bytes(
                     "lm_head.weight".to_string()
                 };
                 if let Some((rows, cols)) = tensors.get(&head).and_then(TensorHeader::dims2) {
+                    // A tied head is a copy; the embedding itself stays dense.
+                    if !cfg.tie_word_embeddings && !format.keeps_dense(rows, cols) {
+                        consumed.insert("lm_head.weight");
+                    }
                     add(format.projection_bytes(rows, cols)?)?;
                 }
             }
         }
         PricedDecoder::Qwen35(cfg) => {
             let Ok(prefix) = qwen35_dense_prefix(|key| tensors.contains_key(key)) else {
-                return Some(0);
+                return Some((0, consumed));
             };
             let mtp_layers = cfg.mtp_num_hidden_layers;
             for (key, tensor) in tensors {
@@ -2467,6 +2497,7 @@ fn snapshot_quantized_copy_bytes(
                 if !loaded || !qwen35::quantizes_tensor(key) {
                     continue;
                 }
+                consumed.insert(key.as_str());
                 // The stacked MoE experts are quantized one expert slice at a time: a
                 // `[mi, hidden]` gate and up from `gate_up_proj`, a `[hidden, mi]` down.
                 let stacked = key.rsplit_once(".mlp.experts.").map(|(_, name)| name);
@@ -2499,10 +2530,49 @@ fn snapshot_quantized_copy_bytes(
                 "lm_head.weight".to_string()
             };
             if let Some((rows, cols)) = tensors.get(&head).and_then(TensorHeader::dims2) {
+                if !cfg.tie_word_embeddings {
+                    consumed.insert("lm_head.weight");
+                }
                 add(format.projection_bytes(rows, cols)?)?;
             }
         }
         PricedDecoder::Prism | PricedDecoder::Refused => {}
+    }
+    Some((total, consumed))
+}
+
+/// The compute-dtype casts a CUDA load of a safetensors snapshot builds beside its resident
+/// source (E6, sc-24140 review). The decoder takes every tensor it keeps dense through
+/// `to_dtype(bf16)`, which shares a bf16 tensor's storage but copies any other float: an f16 or
+/// f32 snapshot holds a second, 2-byte copy of each such tensor beside its source until the
+/// decoder is built. So every float tensor not stored in bf16 is charged 2 bytes per element,
+/// except those the loader consumes whole into its quantized copy (`consumed` — cast only
+/// transiently, one projection at a time, inside the headroom) and an MLX-affine triple's
+/// `.scales` / `.biases`, which the loader converts on the host. A tensor a multimodal tower casts
+/// to f32 instead is charged its bf16 size; the rest of that cast stays in the headroom, as it
+/// does for a bf16 snapshot. `None` on overflow.
+fn snapshot_cast_copy_bytes(
+    tensors: &SnapshotTensors,
+    consumed: &std::collections::HashSet<&str>,
+) -> Option<u64> {
+    let mut total = 0u64;
+    for (key, tensor) in tensors {
+        // `F16`, `F32`, `F64`, `F8_*`: every safetensors float tag but `BF16`.
+        if !tensor.dtype.starts_with('F') || consumed.contains(key.as_str()) {
+            continue;
+        }
+        let sidecar = [".scales", ".biases"].iter().any(|sidecar| {
+            key.strip_suffix(sidecar)
+                .is_some_and(|stem| tensors.contains_key(&format!("{stem}.weight")))
+        });
+        if sidecar {
+            continue;
+        }
+        let elems = tensor
+            .shape
+            .iter()
+            .try_fold(1u64, |n, &d| n.checked_mul(d as u64))?;
+        total = total.checked_add(elems.checked_mul(2)?)?;
     }
     Some(total)
 }
@@ -4350,7 +4420,7 @@ mod tests {
         // the 18 shards serially; this is the total payload and the largest individual shard.
         let payload = 55_563_006_776;
         let largest_shard = 3_988_973_152;
-        let dense = LoadWorkingSet::resident_payload(payload, 0, false);
+        let dense = LoadWorkingSet::resident_payload(payload, 0, 0, false);
         let (host_required, device_required) =
             load_memory_requirements(payload, largest_shard, 0, true, dense).unwrap();
 
@@ -4406,7 +4476,7 @@ mod tests {
 
     #[test]
     fn load_memory_requirements_remain_checked() {
-        let dense = |payload, copy| LoadWorkingSet::resident_payload(payload, copy, false);
+        let dense = |payload, copy| LoadWorkingSet::resident_payload(payload, 0, copy, false);
         assert!(load_memory_requirements(u64::MAX, 1, 0, true, dense(u64::MAX, 0)).is_none());
         assert!(load_memory_requirements(1, 1, u64::MAX, true, dense(1, 0)).is_none());
         assert!(
@@ -5523,6 +5593,16 @@ mod tests {
         weights: &HashMap<String, Tensor>,
         vocab: usize,
     ) -> tempfile::TempDir {
+        write_snapshot_as(config, weights, vocab, |_| candle_core::DType::BF16)
+    }
+
+    /// [`write_snapshot`] with each float tensor stored in `dtype(key)`.
+    fn write_snapshot_as(
+        config: &serde_json::Value,
+        weights: &HashMap<String, Tensor>,
+        vocab: usize,
+        dtype: impl Fn(&str) -> candle_core::DType,
+    ) -> tempfile::TempDir {
         use candle_core::DType;
         let dir = tempfile::Builder::new()
             .prefix("candle-admission-")
@@ -5539,7 +5619,7 @@ mod tests {
             .map(|(key, t)| {
                 let t = match t.dtype() {
                     DType::U32 => t.clone(),
-                    _ => t.to_dtype(DType::BF16).unwrap(),
+                    _ => t.to_dtype(dtype(key)).unwrap(),
                 };
                 (key.clone(), t)
             })
@@ -5586,8 +5666,8 @@ mod tests {
         let bound =
             |cuda, working| load_memory_requirements(payload, staging, 0, cuda, working).unwrap();
         let copy = 7_400_000_000;
-        let dense = LoadWorkingSet::resident_payload(payload, 0, false);
-        let quantized = LoadWorkingSet::resident_payload(payload, copy, false);
+        let dense = LoadWorkingSet::resident_payload(payload, 0, 0, false);
+        let quantized = LoadWorkingSet::resident_payload(payload, 0, copy, false);
         assert_eq!(bound(true, dense), (staging, Some(payload + payload / 4)));
         assert_eq!(
             bound(true, quantized),
@@ -5595,11 +5675,19 @@ mod tests {
             "the copy is built on the device beside the source, not on the host"
         );
         assert_eq!(bound(false, quantized), (3 * payload, None));
-        let prism = LoadWorkingSet::resident_payload(payload, 0, true);
+        let prism = LoadWorkingSet::resident_payload(payload, 0, 0, true);
         assert_eq!(
             bound(true, prism),
             (2 * payload, Some(payload + payload / 4))
         );
+        // An f16 snapshot: the bf16 casts sit beside the source, on the device only.
+        let cast = payload;
+        let f16 = LoadWorkingSet::resident_payload(payload, cast, copy, false);
+        assert_eq!(
+            bound(true, f16),
+            (staging, Some(payload + payload / 4 + cast + copy))
+        );
+        assert_eq!(bound(false, f16), (3 * payload, None));
 
         // A llama-family GGUF: its f32 map is the source, its bf16 casts and copy sit beside it.
         let (map, cast) = (32_800_000_000u64, 2_500_000_000u64);
@@ -5714,6 +5802,93 @@ mod tests {
         assert_eq!(
             q4.quantized_copy_bytes,
             ggml_copy_built(&census, GgmlDType::Q4K)
+        );
+    }
+
+    /// sc-24140 review: the decoder casts every tensor it keeps dense to bf16 (`to_dtype`, which
+    /// shares a bf16 tensor's storage but copies any other float), so a CUDA load of an f16 or
+    /// f32 snapshot holds a 2-byte cast of each such tensor beside its source. Admission charges
+    /// it explicitly — not out of the 25 percent headroom — for every tensor the loader keeps
+    /// dense, and not for a projection it consumes whole into its quantized copy (or an NVFP4
+    /// shape it keeps dense, which it charges). A bf16 snapshot is charged none.
+    #[test]
+    fn a_non_bf16_snapshot_is_charged_the_bf16_cast_beside_its_source() {
+        use crate::primitives::projection::nvfp4_device_bytes;
+        use candle_core::quantized::GgmlDType;
+        use candle_core::DType;
+        use core_llm::Quantize;
+        let (cfg, weights) = tiny_llama_parts();
+        let elems = |keep: &dyn Fn(&str) -> bool| -> u64 {
+            weights
+                .iter()
+                .filter(|(key, _)| keep(key))
+                .map(|(_, t)| t.elem_count() as u64)
+                .sum()
+        };
+        let all = elems(&|_| true);
+        let projections = elems(&|key| key.contains("_proj."));
+        let estimate = |dir: &tempfile::TempDir, quantize, cuda| {
+            super::LlamaProvider::load_memory_estimate(&spec_at(dir.path(), quantize), cuda)
+                .unwrap()
+        };
+
+        let bf16 = write_snapshot(&cfg, &weights, 40);
+        assert_eq!(estimate(&bf16, None, true).cast_copy_bytes, 0);
+        for dtype in [DType::F16, DType::F32] {
+            let dir = write_snapshot_as(&cfg, &weights, 40, |_| dtype);
+            let dense = estimate(&dir, None, true);
+            let payload = dense.payload_bytes;
+            assert_eq!(
+                dense.cast_copy_bytes,
+                2 * all,
+                "{dtype:?}: every tensor, cast to bf16"
+            );
+            assert_eq!(
+                dense.device_required_bytes,
+                Some(payload + payload / 4 + 2 * all),
+                "{dtype:?}"
+            );
+            let q8 = estimate(&dir, Some(Quantize::Q8), true);
+            assert_eq!(
+                q8.cast_copy_bytes,
+                2 * (all - projections),
+                "{dtype:?}: the quantized projections are consumed, not cast"
+            );
+            assert_eq!(
+                q8.quantized_copy_bytes,
+                estimate(&bf16, Some(Quantize::Q8), true).quantized_copy_bytes
+            );
+            // NVFP4 also consumes the layer projections; the 40-row head stays dense, cast.
+            assert_eq!(nvfp4_device_bytes(40, 32), None);
+            assert_eq!(
+                estimate(&dir, Some(Quantize::Nvfp4), true).cast_copy_bytes,
+                2 * (all - projections)
+            );
+            let host = estimate(&dir, None, false);
+            assert_eq!(
+                (host.cast_copy_bytes, host.host_required_bytes),
+                (0, 3 * payload),
+                "{dtype:?}: off CUDA the host rule covers the f32 conversion"
+            );
+            // The loader really keeps its projections quantized from this source.
+            let census = loaded_census(&spec_at(dir.path(), Some(Quantize::Q8)));
+            assert_eq!(
+                q8.quantized_copy_bytes,
+                ggml_copy_built(&census, GgmlDType::Q8_0)
+            );
+        }
+
+        // A bf16 snapshot with f32 norms (a common export): only the norms are cast.
+        let mixed = write_snapshot_as(&cfg, &weights, 40, |key| {
+            if key.contains("norm") {
+                DType::F32
+            } else {
+                DType::BF16
+            }
+        });
+        assert_eq!(
+            estimate(&mixed, None, true).cast_copy_bytes,
+            2 * elems(&|key| key.contains("norm"))
         );
     }
 
@@ -5900,13 +6075,32 @@ mod tests {
             estimate(&moe),
             3 * linear + attention + 4 * ffn + q8(50, 32)
         );
-        // The census half needs the CUDA build: on a host device candle's quantizer reads a
-        // narrowed expert slice from the start of its storage (the f32 compute dtype shares it).
-        if cfg!(feature = "cuda") {
-            let census = loaded_census(&spec_at(moe.path(), Some(Quantize::Q8)));
-            assert_eq!(census.projections.ggml.count, 62);
-            assert_eq!(estimate(&moe), ggml_copy_built(&census, GgmlDType::Q8_0));
-        }
+        let census = loaded_census(&spec_at(moe.path(), Some(Quantize::Q8)));
+        assert_eq!(census.projections.ggml.count, 62);
+        assert_eq!(estimate(&moe), ggml_copy_built(&census, GgmlDType::Q8_0));
+    }
+
+    /// sc-24140 review: a qwen3_5 MoE snapshot loads under `Quantize::Q8` on every device and
+    /// decodes. On a host device the loader hands the GGML quantizer each expert as a view
+    /// narrowed out of the stacked tensors, which candle's quantizer read from the storage's
+    /// start — a size-check panic at load (debug) or every expert quantized from the first
+    /// expert's rows (release) — until `QuantizedLinear::quantize` compacted its source.
+    #[test]
+    fn a_qwen35_moe_snapshot_loads_q8_and_decodes() {
+        use core_llm::{Message, Quantize, Sampling, TextLlm, TextLlmRequest};
+        let dir = q8_capable_qwen35_snapshot(true);
+        let provider = super::LlamaProvider::load(&spec_at(dir.path(), Some(Quantize::Q8)))
+            .expect("load the MoE snapshot Q8");
+        assert!(provider.is_quantized());
+        let request = TextLlmRequest {
+            messages: vec![Message::user("t3 t7 t11 t2")],
+            sampling: Sampling::greedy(),
+            max_new_tokens: 4,
+            seed: Some(0),
+            ..Default::default()
+        };
+        let out = provider.generate(&request, &mut |_| {}).expect("decode");
+        assert_eq!(out.usage.generated_tokens, 4);
     }
 
     /// A tiny `qwen3` GGUF (2 layers, hidden 32, vocab 40): Q8_0 matrices, f32 norms, and a

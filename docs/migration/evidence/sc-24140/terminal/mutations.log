@@ -23,54 +23,76 @@ M2d item 2: load_memory_estimate drops the copy from the device bound -> RED
     provider::tests::ggml_admission_prices_the_quantized_copy_beside_the_source: RED (test result: FAILED. 0 passed; 1 failed)
     provider::tests::q8_load_estimate_prices_the_copy_the_loader_builds: RED (test result: FAILED. 0 passed; 1 failed)
 
-# sc-24140 review fixes: one mutation per added or changed assertion. Each applied alone to the
-# review-fix source, the named test(s) run, the source restored. RED = the test fails under it.
-# R1-R5, R0: CPU lib tests (cargo test --locked -p candle-llm --lib <test> -- --exact,
-# CARGO_TARGET_DIR=C:/cargo-targets/fix-terminal), Git Bash.
+# sc-24140 review fixes (and the coordinator's follow-ups a / b): one mutation per added or changed
+# assertion. Each applied alone to the final source, the named test(s) run, the source restored.
+# RED = the test fails under it. Everything below was re-run against the final code.
+# R8, R7, R1-R5, R0: CPU lib tests (cargo test --locked -p candle-llm --lib <test> -- --exact,
+# CARGO_TARGET_DIR=C:/cargo-targets/fix-terminal), Git Bash, debug build.
+R8a item a: a non-bf16 snapshot's bf16 casts left to the headroom (the rule before the fix) -> RED
+    provider::tests::a_non_bf16_snapshot_is_charged_the_bf16_cast_beside_its_source: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.02s; panicked at crates\llm\candle-llm\src\provider.rs:5841:13: assertion `left == right` failed: F16: every tensor, cast to bf16)
+R8b item a: the projections the loader consumes into its quantized copy charged a cast too -> RED
+    provider::tests::a_non_bf16_snapshot_is_charged_the_bf16_cast_beside_its_source: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.01s; panicked at crates\llm\candle-llm\src\provider.rs:5852:13: assertion `left == right` failed: F16: the quantized projections are consumed, not cast)
+R8c item a: an NVFP4 shape the loader keeps dense treated as consumed (its cast unpriced) -> RED
+    provider::tests::a_non_bf16_snapshot_is_charged_the_bf16_cast_beside_its_source: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.02s; panicked at crates\llm\candle-llm\src\provider.rs:5863:13: assertion `left == right` failed)
+R7 item b: QuantizedLinear::quantize hands candle's quantizer the f32 view as it is (the code before the fix) -> RED
+    models::llama::tests::ggml_quantizes_each_fused_part_from_its_own_rows: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.01s; panicked at candle-core/src/quantized/k_quants.rs:625:9: assertion `left == right` failed: size mismatch 131072 2048 32)
+    models::qwen35::tests::q8_moe_experts_quantize_from_their_own_slices: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.00s; panicked at candle-core/src/quantized/k_quants.rs:625:9: assertion `left == right` failed: size mismatch 12288 32 32)
+    provider::tests::a_qwen35_moe_snapshot_loads_q8_and_decodes: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.26s; panicked at candle-core/src/quantized/k_quants.rs:625:9: assertion `left == right` failed: size mismatch 6144 32 32)
+    provider::tests::qwen35_q8_estimate_prices_exactly_the_copy_the_loader_builds: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.46s; panicked at candle-core/src/quantized/k_quants.rs:625:9: assertion `left == right` failed: size mismatch 6144 32 32)
 R1a item 1: a GGUF's dequantized f32 map priced at 2 bytes per element -> RED
-    provider::tests::gguf_admission_prices_the_dequantized_map_and_the_copies_beside_it: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 389 filtered out; finished in 0.01s)
+    provider::tests::gguf_admission_prices_the_dequantized_map_and_the_copies_beside_it: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.01s; panicked at crates\llm\candle-llm\src\provider.rs:6201:9: assertion `left == right` failed: every tensor dequantized to f32)
 R1b item 1: a GGUF's bf16 casts of its dense-kept tensors unpriced -> RED
-    provider::tests::gguf_admission_prices_the_dequantized_map_and_the_copies_beside_it: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 389 filtered out; finished in 0.01s)
+    provider::tests::gguf_admission_prices_the_dequantized_map_and_the_copies_beside_it: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.01s; panicked at crates\llm\candle-llm\src\provider.rs:6206:9: assertion `left == right` failed: every tensor cast to bf16 beside it)
 R1c item 1: a llama-family GGUF priced as its file plus 25 percent (the rule before the review) -> RED
-    provider::tests::gguf_admission_prices_the_dequantized_map_and_the_copies_beside_it: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 389 filtered out; finished in 0.01s)
+    provider::tests::gguf_admission_prices_the_dequantized_map_and_the_copies_beside_it: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.01s; panicked at crates\llm\candle-llm\src\provider.rs:6201:9: assertion `left == right` failed: every tensor dequantized to f32)
 R1d item 1: a GGUF on a host device priced at two payloads (the packed host rule) -> RED
-    provider::tests::gguf_admission_prices_the_dequantized_map_and_the_copies_beside_it: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 389 filtered out; finished in 0.01s)
-    provider::tests::admission_prices_the_working_set_beside_the_resident_source: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 389 filtered out; finished in 0.00s)
+    provider::tests::gguf_admission_prices_the_dequantized_map_and_the_copies_beside_it: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.02s; panicked at crates\llm\candle-llm\src\provider.rs:6233:9: assertion `left == right` failed: on a host device the f32 map and the copy are host memory)
+    provider::tests::admission_prices_the_working_set_beside_the_resident_source: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.00s; panicked at crates\llm\candle-llm\src\provider.rs:5702:9: assertion `left == right` failed)
 R2 item 2: the persisted quantization block priced for every architecture, qwen3_5 included (the rule before the review) -> RED
-    provider::tests::a_persisted_block_is_priced_only_where_the_loader_honours_it: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 389 filtered out; finished in 0.28s)
+    provider::tests::a_persisted_block_is_priced_only_where_the_loader_honours_it: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.25s; panicked at crates\llm\candle-llm\src\provider.rs:5930:9: assertion `left == right` failed: qwen3_5 ignores the persisted block)
 R3 item 3: any MLX-affine triple priced as a Q8_0 repack of its codes, 4-bit ones included (the rule before the review) -> RED
-    provider::tests::an_affine_triple_is_priced_only_where_the_loader_repacks_it: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 389 filtered out; finished in 0.25s)
+    provider::tests::an_affine_triple_is_priced_only_where_the_loader_repacks_it: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.24s; panicked at crates\llm\candle-llm\src\provider.rs:5999:13: assertion `left == right` failed: None: the 4-bit triple is not priced)
 R5a item 5: the copy priced over the whole payload (the rule before the review) -> RED
-    provider::tests::quantized_load_estimates_price_exactly_the_copy_the_loader_builds: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 389 filtered out; finished in 0.25s)
-    provider::tests::a_persisted_block_is_priced_only_where_the_loader_honours_it: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 389 filtered out; finished in 0.23s)
-    provider::tests::qwen35_q8_estimate_prices_exactly_the_copy_the_loader_builds: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 389 filtered out; finished in 0.26s)
+    provider::tests::quantized_load_estimates_price_exactly_the_copy_the_loader_builds: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.24s; panicked at crates\llm\candle-llm\src\provider.rs:5740:9: assertion `left == right` failed: exactly the Q8_0 copy the loader built)
+    provider::tests::a_persisted_block_is_priced_only_where_the_loader_honours_it: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.24s; panicked at crates\llm\candle-llm\src\provider.rs:5912:9: assertion `left == right` failed)
+    provider::tests::qwen35_q8_estimate_prices_exactly_the_copy_the_loader_builds: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.24s; panicked at crates\llm\candle-llm\src\provider.rs:6065:9: assertion `left == right` failed)
 R5b item 5: the llama projection rule misses mlp.down_proj -> RED
-    provider::tests::quantized_load_estimates_price_exactly_the_copy_the_loader_builds: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 389 filtered out; finished in 0.24s)
+    provider::tests::quantized_load_estimates_price_exactly_the_copy_the_loader_builds: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.24s; panicked at crates\llm\candle-llm\src\models\llama.rs:118:5: `model.layers.0.mlp.down_proj.weight` is quantized on load but `quantizes_layer_tensor` does not price it)
 R5c item 5: the llama head priced under GGML (it stays dense there) -> RED
-    provider::tests::quantized_load_estimates_price_exactly_the_copy_the_loader_builds: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 389 filtered out; finished in 0.25s)
+    provider::tests::quantized_load_estimates_price_exactly_the_copy_the_loader_builds: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.24s; panicked at crates\llm\candle-llm\src\provider.rs:5740:9: assertion `left == right` failed: exactly the Q8_0 copy the loader built)
 R5d item 5: the qwen3_5 head unpriced (it is quantized under every format) -> RED
-    provider::tests::qwen35_q8_estimate_prices_exactly_the_copy_the_loader_builds: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 389 filtered out; finished in 0.24s)
+    provider::tests::qwen35_q8_estimate_prices_exactly_the_copy_the_loader_builds: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.24s; panicked at crates\llm\candle-llm\src\provider.rs:6065:9: assertion `left == right` failed)
 R5e item 5: the qwen3_5 projection rule misses linear_attn.out_proj -> RED
-    provider::tests::qwen35_q8_estimate_prices_exactly_the_copy_the_loader_builds: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 389 filtered out; finished in 0.24s)
+    provider::tests::qwen35_q8_estimate_prices_exactly_the_copy_the_loader_builds: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.24s; panicked at crates\llm\candle-llm\src\models\qwen35.rs:78:5: `model.language_model.layers.0.linear_attn.out_proj.weight` is quantized on load but `quantizes_tensor` does not price it)
 R5f item 5: candle's CUDA row padding past each GGML tensor unpriced -> RED
-    provider::tests::quantized_load_estimates_price_exactly_the_copy_the_loader_builds: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 389 filtered out; finished in 0.24s)
-    provider::tests::gguf_admission_prices_the_dequantized_map_and_the_copies_beside_it: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 389 filtered out; finished in 0.01s)
-    provider::tests::qwen35_q8_estimate_prices_exactly_the_copy_the_loader_builds: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 389 filtered out; finished in 0.24s)
+    provider::tests::quantized_load_estimates_price_exactly_the_copy_the_loader_builds: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.24s; panicked at crates\llm\candle-llm\src\provider.rs:5740:9: assertion `left == right` failed: exactly the Q8_0 copy the loader built)
+    provider::tests::gguf_admission_prices_the_dequantized_map_and_the_copies_beside_it: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.01s; panicked at crates\llm\candle-llm\src\provider.rs:6226:9: assertion `left == right` failed)
+    provider::tests::qwen35_q8_estimate_prices_exactly_the_copy_the_loader_builds: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.24s; panicked at crates\llm\candle-llm\src\provider.rs:6065:9: assertion `left == right` failed)
 R5g item 5: a stacked MoE gate_up priced as one slice per expert (it is a gate and an up) -> RED
-    provider::tests::qwen35_q8_estimate_prices_exactly_the_copy_the_loader_builds: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 389 filtered out; finished in 0.25s)
+    provider::tests::qwen35_q8_estimate_prices_exactly_the_copy_the_loader_builds: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.25s; panicked at crates\llm\candle-llm\src\provider.rs:6074:9: assertion `left == right` failed)
 R0a restructured bound: the headroom over the source at a fifth instead of a quarter -> RED
-    provider::tests::dense_cuda_load_admission_separates_host_staging_from_current_vram: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 389 filtered out; finished in 0.00s)
-    provider::tests::admission_prices_the_working_set_beside_the_resident_source: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 389 filtered out; finished in 0.00s)
+    provider::tests::dense_cuda_load_admission_separates_host_staging_from_current_vram: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.00s; panicked at crates\llm\candle-llm\src\provider.rs:4428:9: assertion `left == right` failed)
+    provider::tests::admission_prices_the_working_set_beside_the_resident_source: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.00s; panicked at crates\llm\candle-llm\src\provider.rs:5671:9: assertion `left == right` failed)
 R0b restructured bound: the cast added unchecked -> RED
-    provider::tests::load_memory_requirements_remain_checked: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 389 filtered out; finished in 0.00s)
-# R5h: CUDA lib test (PowerShell, MSVC 14.44 vcvars64, CUDA_COMPUTE_CAP=120, CUDA_VISIBLE_DEVICES=1,
-# cargo test --locked --lib -p candle-llm --features cuda -- --exact <test>).
+    provider::tests::load_memory_requirements_remain_checked: RED (test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 393 filtered out; finished in 0.00s; panicked at crates\llm\candle-llm\src\provider.rs:4493:13: true)
+# R7 again, release build (cargo test --release --locked -p candle-llm --lib -- --exact ...): candle's
+# size check is a debug_assert, so a release build quantizes the wrong rows silently. The model tests'
+# numeric assertions catch it.
+R7-release item b: the quantizer fix reverted, release build -> RED
+    models::llama::tests::ggml_quantizes_each_fused_part_from_its_own_rows: RED (Q8_0 part 1 (layer 0, k): relative error 1.4159466)
+    models::qwen35::tests::q8_moe_experts_quantize_from_their_own_slices: RED (expert 0 up: relative error 1.9094934)
+    (provider::tests::a_qwen35_moe_snapshot_loads_q8_and_decodes loads and decodes the corrupt model: it is not a numeric check)
+# R5h, R9: CUDA lib tests (PowerShell, MSVC 14.44 vcvars64, CUDA_COMPUTE_CAP=120, CUDA_VISIBLE_DEVICES=1).
 R5h item 5: nvfp4_device_bytes without cuBLASLt's 128 x 4 scale-atom padding -> RED
     provider::tests::nvfp4_load_estimate_prices_exactly_the_copy_the_loader_builds: RED (test result: FAILED. 1 passed; 1 failed; left 15552, right 24576)
+R9a item b: the fused NVFP4 quantizer "materializes" an offset view with Tensor::copy (the code before the fix) -> RED
+    candle-quant-kernels nvfp4_weight::tests::a_row_narrowed_f32_view_quantizes_its_own_rows (now against force_contiguous): RED (the E2M1 nibbles differ)
+R9b item b: the NVFP4 GEMV realigns an activation view with Tensor::copy (the code before the fix) -> RED
+    candle-quant-kernels nvfp4_gemv::cuda_tests::gemv_realigns_a_contiguous_view_off_the_vector_boundary: RED (DriverError(CUDA_ERROR_MISALIGNED_ADDRESS, "misaligned address"))
 # R6a / R6b: real weights on GPU 1, --release --features cuda.
 R6a item 6: DeltaNetCache::rollback_to releases the ring's accounting (clears the ring spec) -> RED
     static_kv_parity ac3_static_kv_device_pointers_are_stable_across_the_fixture_and_a_rollback (Qwen3.8-27B): RED at the post-rollback assertion (left: CacheMemory { live_bytes: 177078272, checkpoint_bytes: 0 }, right: CacheMemory { live_bytes: 177078272, checkpoint_bytes: 615776256 })
     models::qwen35::tests::ringed_static_cache_holds_exactly_what_admission_prices (CPU twin): RED (test result: FAILED. 0 passed; 1 failed)
 R6b item 6: load_memory_requirements drops the quantized copy from the device bound -> RED
     load_residency load_residency_by_format (Qwen3-8B, q8): RED (the load peaked at 26818379776 B over its baseline, above the 20476895970 B it was admitted against)
-# 18 review mutations, 18 RED.
+# 25 review mutations, 25 RED.

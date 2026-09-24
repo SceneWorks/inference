@@ -2876,6 +2876,125 @@ mod tests {
         }
     }
 
+    /// A tiny `Phi3ForCausalLM` (fused `qkv_proj` / `gate_up_proj`) 256 wide, so Q4_K can quantize
+    /// every projection, with f32 weights on the host.
+    fn tiny_phi3() -> (Weights, ModelConfig) {
+        const HIDDEN: usize = 256;
+        const INTER: usize = 256;
+        const HEADS: usize = 4;
+        const KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 64;
+        const VOCAB: usize = 48;
+        let cfg = serde_json::json!({
+            "architectures": ["Phi3ForCausalLM"], "model_type": "phi3",
+            "hidden_size": HIDDEN, "intermediate_size": INTER, "num_hidden_layers": 2,
+            "num_attention_heads": HEADS, "num_key_value_heads": KV_HEADS, "vocab_size": VOCAB,
+            "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "max_position_embeddings": 128,
+            "tie_word_embeddings": false
+        });
+        let mut rng = crate::primitives::SplitMix64::new(0x9_4133);
+        let mut rand = |dims: &[usize]| -> Tensor {
+            use crate::primitives::TokenRng;
+            let n: usize = dims.iter().product();
+            let data: Vec<f32> = (0..n).map(|_| rng.next_f32() - 0.5).collect();
+            Tensor::from_vec(data, dims, &Device::Cpu).unwrap()
+        };
+        let (qd, kvd) = (HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM);
+        let mut w = std::collections::HashMap::new();
+        w.insert("model.embed_tokens.weight".into(), rand(&[VOCAB, HIDDEN]));
+        w.insert(
+            "model.norm.weight".into(),
+            Tensor::ones(HIDDEN, DType::F32, &Device::Cpu).unwrap(),
+        );
+        w.insert("lm_head.weight".into(), rand(&[VOCAB, HIDDEN]));
+        for i in 0..2 {
+            let p = |s: &str| format!("model.layers.{i}.{s}");
+            for key in ["input_layernorm.weight", "post_attention_layernorm.weight"] {
+                w.insert(
+                    p(key),
+                    Tensor::ones(HIDDEN, DType::F32, &Device::Cpu).unwrap(),
+                );
+            }
+            w.insert(
+                p("self_attn.qkv_proj.weight"),
+                rand(&[qd + 2 * kvd, HIDDEN]),
+            );
+            w.insert(p("self_attn.o_proj.weight"), rand(&[HIDDEN, qd]));
+            w.insert(p("mlp.gate_up_proj.weight"), rand(&[2 * INTER, HIDDEN]));
+            w.insert(p("mlp.down_proj.weight"), rand(&[HIDDEN, INTER]));
+        }
+        (
+            Weights::from_map(w, Device::Cpu),
+            ModelConfig::from_json(&cfg).unwrap(),
+        )
+    }
+
+    /// sc-24140 review: Phi-3's fused `qkv_proj` / `gate_up_proj` are split into narrowed views
+    /// before they are quantized, and on a host device (f32 compute) those views reach the GGML
+    /// quantizer as they are. Candle's quantizer reads a source's storage from its start, so each
+    /// part must be compacted first or k / v / up would be quantized from q's / gate's rows (a
+    /// size-check panic in a debug build, silently wrong weights in a release one). Every part's
+    /// Q8_0 and Q4_K projection tracks its dense twin on the same input.
+    #[test]
+    fn ggml_quantizes_each_fused_part_from_its_own_rows() {
+        let (w, cfg) = tiny_phi3();
+        let dense = CausalLm::from_weights_format(&w, "", cfg.clone(), None).unwrap();
+        let x = {
+            let data: Vec<f32> = (0..3 * 256)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0)
+                .collect();
+            Tensor::from_vec(data, (3, 256), &Device::Cpu).unwrap()
+        };
+        let parts = |m: &CausalLm| -> Vec<Tensor> {
+            let mut out = Vec::new();
+            for layer in &m.layers {
+                let Attention::Gqa(a) = &layer.attn else {
+                    panic!("GQA")
+                };
+                let kv = a.kv.as_ref().unwrap();
+                let Ffn::Dense(mlp) = &layer.ffn else {
+                    panic!("dense MLP")
+                };
+                for p in [&a.q, kv.key(), kv.value().unwrap(), &mlp.gate, &mlp.up] {
+                    out.push(p.forward(&x).unwrap());
+                }
+            }
+            out
+        };
+        let want = parts(&dense);
+        for (quant, tolerance) in [(QuantSpec::q8(), 0.02f32), (QuantSpec::q4(), 0.1)] {
+            let format = ProjectionFormat::from(quant);
+            let model = CausalLm::from_weights_format(&w, "", cfg.clone(), Some(&format)).unwrap();
+            assert_eq!(model.weight_census().projections.ggml.count, 2 * 7);
+            for (i, (got, want)) in parts(&model).iter().zip(&want).enumerate() {
+                let err = (got - want)
+                    .unwrap()
+                    .sqr()
+                    .unwrap()
+                    .sum_all()
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap()
+                    .sqrt();
+                let norm = want
+                    .sqr()
+                    .unwrap()
+                    .sum_all()
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap()
+                    .sqrt();
+                assert!(
+                    err / norm < tolerance,
+                    "{quant:?} part {i} (layer {}, {}): relative error {}",
+                    i / 5,
+                    ["q", "k", "v", "gate", "up"][i % 5],
+                    err / norm
+                );
+            }
+        }
+    }
+
     #[test]
     fn join_handles_empty_prefix() {
         assert_eq!(join("", "model.norm.weight"), "model.norm.weight");

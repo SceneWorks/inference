@@ -871,9 +871,10 @@ mod cuda_impl {
             let xf = x.to_dtype(DType::F32)?.contiguous()?;
             // The kernels index the storage from element 0, so a contiguous *view* with a start
             // offset (an f32 row-narrow, which `to_dtype`/`contiguous` both pass through untouched)
-            // would be quantized from the wrong rows. Materialize it (sc-24135).
+            // would be quantized from the wrong rows. Materialize it into a fresh tensor (sc-24135;
+            // sc-24140 review: `Tensor::copy` keeps the view's storage and offset, so it did not).
             let xf = if xf.layout().start_offset() != 0 {
-                xf.copy()?
+                xf.force_contiguous()?
             } else {
                 xf
             };

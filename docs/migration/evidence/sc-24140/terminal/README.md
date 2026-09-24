@@ -226,6 +226,17 @@ beside the source. `LlamaProvider::load_memory_estimate` returns it with its par
   from the GGUF header with candle's own reader. On a host device the f32 map is host memory, so a
   host-device GGUF load prices its host domain by the same working set. A Prism GGUF (packed
   blocks the loader wraps) keeps its pricing.
+* **A snapshot not stored in bf16 is charged the bf16 cast beside its source** (coordinator
+  follow-up). The decoder takes every tensor it keeps dense through `to_dtype(bf16)`, which
+  shares a bf16 tensor's storage but copies any other float. So a CUDA load of an f16 or f32
+  snapshot holds a second, 2-byte copy of each such tensor beside its source until the decoder is
+  built. Before, only the 25 % headroom covered it: a Llama-2-7B-shaped f16 snapshot (13.5 GB)
+  peaks near 27 GB against a 16.9 GB bound. `snapshot_cast_copy_bytes` now charges 2 B per element
+  for every float tensor not stored in bf16, reported as `cast_copy_bytes`. It skips the projections the loader
+  consumes whole into its quantized copy (they are cast one at a time, inside the headroom), and an
+  MLX-affine triple's sidecars, which the loader converts on the host. An NVFP4 shape the loader
+  keeps dense is charged. Every measured snapshot is all-bf16, so no measured load's pricing
+  changed.
 
 The 25 % headroom is needed on the GGUF path too. The GGUF → Q8 load's pool live peak was 42.99 GB,
 but the pool reserved 48.25 GB: 5.26 GB of fragmentation around the per-projection bf16 → f32 →
@@ -239,6 +250,40 @@ so a co-tenant between about 4.7 and 12.5 GB is still refused up front although 
 That band is the 25 % headroom (13.9 GB on the 27B), which this PR leaves as it was: the 8B Q8 load
 consumed 3.06 GB of its 4.10 GB headroom, and the GGUF → Q8 load 5.63 GB of 8.19 GB. At R, a
 co-tenant between about 12.5 and 32.3 GB was admitted into a failure.
+
+### Quantizing a view: candle's quantizer reads from the storage's start (coordinator follow-up)
+
+Candle's GGML `QTensor::quantize` hands its source's **whole storage** to the block quantizer. It
+ignores the view's offset and extent. Two loaders quantize views:
+
+* the qwen3_5 MoE loader: every expert is narrowed out of the stacked `experts.gate_up_proj` /
+  `experts.down_proj`;
+* the llama loader: Phi-3's fused `qkv_proj` / `gate_up_proj` are narrowed into q / k / v and
+  gate / up.
+
+On CUDA the bf16 → f32 cast before the quantizer builds a fresh tensor, so the defect is masked.
+On a host device the compute dtype is already f32. There the cast is a no-op and the view itself
+reaches candle. In a debug build that trips candle's size check. In a release build it silently
+quantizes every expert from the first expert's rows, and k / v / up from q's / gate's rows.
+
+The fix is at the one GGML call site in candle-llm: `QuantizedLinear::quantize` compacts an f32
+source with `force_contiguous` before quantizing it. Candle itself is not patched. The only other
+`QTensor::quantize` call site in candle-llm, the `prepare` writer, is handed whole tensors read
+from safetensors.
+
+The same idiom was broken in two NVFP4 sites (`candle-quant-kernels`), which I fixed the same way:
+
+* **The fused NVFP4 quantizer** (`quantize_nvfp4_activation_fused`) meant to materialize an
+  offset view with `Tensor::copy`. `copy` keeps the view's storage and offset, so the materialization did nothing. Its test,
+  `a_row_narrowed_f32_view_quantizes_its_own_rows`, compared the view against `view.copy()` and so
+  passed either way. The test now compares against a `force_contiguous` tensor. It failed against
+  the old code (different nibbles) and passes with `force_contiguous`.
+* **The NVFP4 decode GEMV** realigned an activation view off the 16-byte boundary with `copy` too.
+  A new test, `gemv_realigns_a_contiguous_view_off_the_vector_boundary`, hit
+  `CUDA_ERROR_MISALIGNED_ADDRESS` before the fix and passes with `force_contiguous`.
+
+The shipped paths hand both NVFP4 sites a fresh bf16 → f32 cast or an aligned activation, so neither
+was reached in practice.
 
 A follow-up could shrink both the quantizing load peak and the idle reservation. The loader would
 quantize shard by shard and drop each source as it is consumed, instead of holding the whole map.
@@ -262,12 +307,31 @@ That is a loader change and is not made here.
   loader's census, the file-plus-25 % rule is several times below.
 * `nvfp4_load_estimate_prices_exactly_the_copy_the_loader_builds` (CUDA) — the NVFP4 copy equals
   the census.
+* `a_non_bf16_snapshot_is_charged_the_bf16_cast_beside_its_source` — f16 and f32 snapshots of the
+  tiny llama: every tensor's bf16 cast dense, all but the consumed projections under Q8 and
+  NVFP4 (the ineligible 40-row NVFP4 head charged), none off CUDA, only the norms of a bf16
+  snapshot with f32 norms, none for a bf16 snapshot.
+* `models::qwen35::tests::q8_moe_experts_quantize_from_their_own_slices` — every Q8_0 expert
+  gate / up / down of a tiny qwen3_5 MoE (f32, host) tracks its dense twin (relative error
+  < 2 %), and the logits track the dense model's (cosine > 0.999).
+* `a_qwen35_moe_snapshot_loads_q8_and_decodes` — the MoE snapshot loads `Quantize::Q8` through the
+  provider on the host and decodes 4 tokens; `qwen35_q8_estimate_prices_exactly_the_copy_the_loader_builds`
+  now checks the MoE copy against the census on the host too.
+* `models::llama::tests::ggml_quantizes_each_fused_part_from_its_own_rows` — Phi-3's fused q / k /
+  v / gate / up, each Q8_0 and Q4_K part against its dense twin.
 
-**Mutations** (`mutations.log`, the review block): R1a–R1d (the GGUF working set), R2 (the
-persisted block), R3 (the affine triple), R5a–R5h (the per-projection copy), R0a–R0b (the
-restructured bound) — all RED on the named unit tests — and R6b, the device bound without the
-quantized copy, RED on the **real-weight** Qwen3-8B Q8 `load_residency` run (`the load peaked at
-26818379776 B over its baseline, above the 20476895970 B it was admitted against`).
+**Mutations** (`mutations.log`, the review block). Each was re-run against the final code:
+
+* R1a–R1d (the GGUF working set), R2 (the persisted block), R3 (the affine triple), R5a–R5h (the
+  per-projection copy), R0a–R0b (the restructured bound), R8a–R8c (the bf16 cast) — all RED on the
+  named unit tests.
+* R6b, the device bound without the quantized copy — RED on the **real-weight** Qwen3-8B Q8
+  `load_residency` run (`the load peaked at 26818379776 B over its baseline, above the
+  20476895970 B it was admitted against`).
+* R7, the quantizer fix reverted:
+  * **debug:** the four view tests RED, each on candle's size check (`size mismatch 6144 32 32`).
+  * **release:** the two model tests RED on their numeric assertions — the silent-corruption case.
+* R9a / R9b, the NVFP4 `copy` idiom restored — RED on GPU 1.
 
 ### The GGUF measurement
 
@@ -302,6 +366,13 @@ User-visible effect:
 * A prepared **qwen3_5** snapshot's persisted `quantization` block is no longer charged (its loader
   ignores the block and loads dense), and a **4-bit MLX-affine** snapshot gets the loader's typed
   refusal instead of a memory refusal.
+* An **f16 or f32 safetensors** snapshot is charged the bf16 copy the loader builds beside it
+  (2 bytes per dense-kept element), so its loads no longer run out of device memory part-way
+  through. bf16 snapshots are unaffected.
+* **Fixed:** a qwen3_5 MoE snapshot, or a Phi-3 one, loaded with Q4 / Q8 on a CPU device quantized
+  the wrong rows. MoE experts were built from the first expert's weights, and Phi-3's k / v / up
+  from q's / gate's. Debug builds hit an assertion instead. It now quantizes each expert and each
+  fused part from its own rows. CUDA loads were not affected.
 
 ## Commands
 
@@ -319,11 +390,11 @@ CUDA_VISIBLE_DEVICES=1 LOAD_RESIDENCY_SNAPSHOT=E:\huggingface\hub\models--Qwen--
 
 | shell | gate | result |
 |---|---|---|
-| Git Bash | `cargo fmt -p candle-llm -p core-llm -- --check` | ok |
-| Git Bash | `cargo test --locked -p candle-llm -p core-llm --lib` | ok: 381 + 204 passed, 0 failed |
-| Git Bash | `cargo clippy --locked -p candle-llm -p core-llm --all-targets -- -D warnings` | ok |
-| Git Bash | `RUSTDOCFLAGS="-D warnings" cargo doc --locked -p candle-llm -p core-llm --no-deps` | ok |
+| Git Bash | `cargo fmt -p candle-llm -p core-llm -p candle-quant-kernels -- --check` | ok |
+| Git Bash | `cargo test --locked -p candle-llm -p core-llm -p candle-quant-kernels --lib` | ok: 385 + 204 + 40 passed, 0 failed |
+| Git Bash | `cargo clippy --locked -p candle-llm -p core-llm -p candle-quant-kernels --all-targets -- -D warnings` | ok |
+| Git Bash | `RUSTDOCFLAGS="-D warnings" cargo doc --locked -p candle-llm -p core-llm -p candle-quant-kernels --no-deps` | ok |
 | Git Bash | `python scripts/check-workspace.py`; `python scripts/check_docs.py` | ok |
-| PowerShell, MSVC 14.44 vcvars64, `CUDA_COMPUTE_CAP=120`, `CUDA_VISIBLE_DEVICES=1` | `cargo clippy --locked -p candle-llm --all-targets --features cuda -- -D warnings` | ok |
-| same | `cargo test --locked --lib --tests -p candle-llm --features cuda` | ok: lib 409 passed / 13 ignored; all 41 test binaries green (581 passed, 0 failed) |
+| PowerShell, MSVC 14.44 vcvars64, `CUDA_COMPUTE_CAP=120`, `CUDA_VISIBLE_DEVICES=1` | `cargo clippy --locked -p candle-llm -p candle-quant-kernels --all-targets --features cuda -- -D warnings` | ok |
+| same | `cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels --features cuda` | ok: candle-llm lib 413 passed / 13 ignored, candle-quant-kernels lib 63 passed; all 42 test binaries green (648 passed, 0 failed) |
 | same, `--release`, real weights | `static_kv_parity` (4 ignored tests) and `load_residency` (8B bf16 / Q8 / NVFP4, 8B Q4_K GGUF dense / Q8, 27B Q8 / NVFP4) | ok |

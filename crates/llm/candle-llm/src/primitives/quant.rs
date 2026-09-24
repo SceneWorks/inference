@@ -64,8 +64,19 @@ impl QuantizedLinear {
 
     /// Quantize a dense `[out, in]` weight (the input dim must be a multiple of `dtype`'s block
     /// size). `bias`, if present, is added after the matmul.
+    ///
+    /// `weight` may be a view — an expert sliced out of a stacked qwen3_5 MoE tensor, or one part
+    /// of a fused Phi-3 `qkv_proj` / `gate_up_proj`. Candle's quantizer reads its source's storage
+    /// from the start, ignoring the view's offset and extent, so the f32 source it is handed is
+    /// always compacted first: a cast to f32 builds a fresh tensor, but an f32 weight (every
+    /// weight on a host device, whose compute dtype is f32) would otherwise be passed through as
+    /// the view itself and quantize the wrong rows — or trip candle's size check (sc-24140).
     pub fn quantize(weight: &Tensor, dtype: GgmlDType, bias: Option<Tensor>) -> Result<Self> {
-        let qt = QTensor::quantize(&weight.to_dtype(DType::F32)?, dtype)?;
+        let source = match weight.dtype() {
+            DType::F32 => weight.force_contiguous()?,
+            _ => weight.to_dtype(DType::F32)?,
+        };
+        let qt = QTensor::quantize(&source, dtype)?;
         Ok(Self {
             inner: QuantizedWeight::Matmul(QMatMul::from_qtensor(qt)?),
             bias,

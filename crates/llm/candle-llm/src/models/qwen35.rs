@@ -3165,6 +3165,78 @@ pub(crate) mod tests {
         );
     }
 
+    /// sc-24140 review: the qwen3_5 loader quantizes every MoE expert from a view narrowed out of
+    /// the stacked `gate_up_proj` / `down_proj`, and on a host device (f32 compute) those views
+    /// reach the GGML quantizer as they are. Candle's quantizer reads a source's storage from its
+    /// start, so each slice must be compacted first — else every expert would be quantized from
+    /// the first expert's rows (a size-check panic in a debug build, silently wrong experts in a
+    /// release one). Each expert's Q8_0 gate / up / down tracks its dense twin, and so do the
+    /// model's logits.
+    #[test]
+    fn q8_moe_experts_quantize_from_their_own_slices() {
+        let mut json = cfg_json_moe();
+        let text = json["text_config"].as_object_mut().unwrap();
+        // Every projection 32 or 64 wide, so Q8_0 (32-element blocks) quantizes all of them.
+        text.insert("moe_intermediate_size".into(), json!(32));
+        text.insert("shared_expert_intermediate_size".into(), json!(32));
+        text.insert("linear_value_head_dim".into(), json!(8));
+        let cfg = Qwen35Config::from_json(&json).unwrap();
+        let weights = synthetic_weights(&cfg);
+        let prefix = "model.language_model";
+        let dense = Qwen35Model::from_weights_format(&weights, prefix, cfg.clone(), None).unwrap();
+        let q8 = ProjectionFormat::from(QuantSpec::q8());
+        let quant = Qwen35Model::from_weights_format(&weights, prefix, cfg, Some(&q8)).unwrap();
+
+        let x = Tensor::from_vec(
+            (0..2 * 32)
+                .map(|i| ((i * 29 % 67) as f32 - 33.0) / 33.0)
+                .collect::<Vec<f32>>(),
+            (2, 32),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let rel = |got: &Tensor, want: &Tensor| -> f32 {
+            let norm = |t: &Tensor| {
+                t.sqr()
+                    .unwrap()
+                    .sum_all()
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap()
+            };
+            (norm(&(got - want).unwrap()) / norm(want)).sqrt()
+        };
+        let mut experts = 0;
+        for (d, q) in dense.layers.iter().zip(&quant.layers) {
+            let (Ffn::Moe(d), Ffn::Moe(q)) = (&d.ffn, &q.ffn) else {
+                panic!("an MoE layer")
+            };
+            for (e, (de, qe)) in d.experts.iter().zip(&q.experts).enumerate() {
+                assert_eq!(qe.gate.kind(), crate::primitives::ProjectionKind::Ggml);
+                let hidden = de.gate.forward(&x).unwrap();
+                for (name, dp, qp, input) in [
+                    ("gate", &de.gate, &qe.gate, &x),
+                    ("up", &de.up, &qe.up, &x),
+                    ("down", &de.down, &qe.down, &hidden),
+                ] {
+                    let err = rel(&qp.forward(input).unwrap(), &dp.forward(input).unwrap());
+                    assert!(err < 0.02, "expert {e} {name}: relative error {err}");
+                }
+                experts += 1;
+            }
+        }
+        assert_eq!(experts, 4 * 6);
+
+        let prompt = ids(&[1, 7, 3, 42, 9]);
+        let logits =
+            |m: &Qwen35Model| host(&m.decode_logits(&prompt, &mut m.new_cache(), 0).unwrap());
+        let (want, got) = (logits(&dense), logits(&quant));
+        let dot: f32 = want.iter().zip(&got).map(|(a, b)| a * b).sum();
+        let norm = |v: &[f32]| v.iter().map(|a| a * a).sum::<f32>().sqrt();
+        let cosine = dot / (norm(&want) * norm(&got));
+        assert!(cosine > 0.999, "Q8 logits vs dense: cosine {cosine}");
+    }
+
     #[test]
     fn moe_model_forward_and_prefill_equals_stepwise() {
         let cfg = Qwen35Config::from_json(&cfg_json_moe()).unwrap();
