@@ -659,7 +659,7 @@ fn gemma4_decodes_through_the_engine_and_the_reference_stays_selectable() {
 
     let fx = write_snapshot(true, true);
     let mut p = LlamaProvider::load(&spec_of(&fx)).expect("load");
-    assert_eq!(p.causal_decode_path(), DecodePath::StepModel, "the default");
+    assert_eq!(p.decode_path(), DecodePath::StepModel, "the default");
     let rising: Vec<f32> = (0..8).map(|i| i as f32 / 8.0).collect();
     let requests = [
         request(vec![
@@ -684,7 +684,7 @@ fn gemma4_decodes_through_the_engine_and_the_reference_stays_selectable() {
         );
         assert_eq!(record.proposer, core_llm::ProposerKind::None, "request {i}");
     }
-    p.set_causal_decode_path(DecodePath::Reference)
+    p.set_decode_path(DecodePath::Reference)
         .expect("the reference loop is selectable");
     let cpu = !candle_llm::device::select_device().unwrap().is_cuda();
     for (i, (req, want)) in requests.iter().zip(&engine).enumerate() {

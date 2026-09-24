@@ -24,12 +24,14 @@ mod common;
 use std::collections::HashMap;
 
 use candle_core::{Device, Tensor};
+use candle_llm::config::ModelConfig;
 use candle_llm::decode::{
-    generate_step, CancelFlag, ConstraintMask, DecodeRecord, GenerationConfig,
+    generate_step, CancelFlag, ConstraintMask, DecodeRecord, GenerationConfig, StepModel,
+    StepRequest,
 };
-use candle_llm::models::{Qwen35Config, Qwen35Model};
+use candle_llm::models::{CausalLm, Qwen35Config, Qwen35Model};
 use candle_llm::primitives::{
-    sample_device, sample_host, sampler_path, shaped_candidates, with_reference_sampler,
+    sample, sample_device, sample_host, sampler_path, shaped_candidates, with_reference_sampler,
     HostSampleReason, SamplerPath, SamplingParams, SplitMix64, Weights,
 };
 use serde_json::json;
@@ -606,6 +608,132 @@ fn routing_policy_is_the_core_llm_policy_plus_device_availability() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// sc-24140: the engine with no proposer draws through `sample` — the token-at-a-time loop's
+// sampler — on both families.
+// ---------------------------------------------------------------------------------------------
+
+/// A tiny llama-family decoder (GQA, 2 layers) over the same `TINY_VOCAB` as [`tiny_qwen35`].
+fn tiny_llama(device: &Device) -> CausalLm {
+    let cfg = ModelConfig::from_json(&json!({
+        "architectures": ["LlamaForCausalLM"], "model_type": "llama",
+        "hidden_size": 32, "intermediate_size": 64, "num_hidden_layers": 2,
+        "num_attention_heads": 4, "num_key_value_heads": 2, "vocab_size": TINY_VOCAB,
+        "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "tie_word_embeddings": false,
+        "max_position_embeddings": 256
+    }))
+    .unwrap();
+    let (h, inter, qd, kvd, v) = (32usize, 64usize, 32usize, 16usize, TINY_VOCAB);
+    let mut m = HashMap::new();
+    let mut seed = 0usize;
+    let mut t = |key: String, dims: &[usize]| {
+        let n: usize = dims.iter().product();
+        seed += 1;
+        let data: Vec<f32> = (0..n)
+            .map(|i| (((i * 7 + seed * 13) % 29) as f32 - 14.0) * 0.03)
+            .collect();
+        m.insert(key, Tensor::from_vec(data, dims.to_vec(), device).unwrap());
+    };
+    t("model.embed_tokens.weight".into(), &[v, h]);
+    t("model.norm.weight".into(), &[h]);
+    t("lm_head.weight".into(), &[v, h]);
+    for i in 0..2 {
+        let p = |s: &str| format!("model.layers.{i}.{s}");
+        t(p("input_layernorm.weight"), &[h]);
+        t(p("post_attention_layernorm.weight"), &[h]);
+        t(p("self_attn.q_proj.weight"), &[qd, h]);
+        t(p("self_attn.k_proj.weight"), &[kvd, h]);
+        t(p("self_attn.v_proj.weight"), &[kvd, h]);
+        t(p("self_attn.o_proj.weight"), &[h, qd]);
+        t(p("mlp.gate_proj.weight"), &[inter, h]);
+        t(p("mlp.up_proj.weight"), &[inter, h]);
+        t(p("mlp.down_proj.weight"), &[h, inter]);
+    }
+    CausalLm::from_weights(&Weights::from_map(m, device.clone()), "", cfg).unwrap()
+}
+
+/// The token-at-a-time loop the step seam ran before sc-24140 made `generate_step` a wrapper over
+/// the engine: a last-position `forward_step` over the same cache the engine builds, then
+/// [`sample`] per token. The engine with no proposer must reproduce its seeded stream exactly.
+fn seam_oracle<M: StepModel>(model: &M, prompt: &[i32], config: &GenerationConfig) -> Vec<i32> {
+    let mut cache = model
+        .new_cache_for(prompt.len() + config.max_new_tokens, 0)
+        .unwrap();
+    let mut logits = model
+        .forward_step(&mut cache, StepRequest::last(prompt))
+        .unwrap()
+        .logits;
+    let mut rng = SplitMix64::new(config.seed.unwrap());
+    let mut history = prompt.to_vec();
+    let mut tokens = Vec::new();
+    for step in 0..config.max_new_tokens {
+        let next = sample(&logits, &history, &config.sampling, &mut rng, None).unwrap();
+        tokens.push(next);
+        history.push(next);
+        if step + 1 == config.max_new_tokens {
+            break;
+        }
+        logits = model
+            .forward_step(&mut cache, StepRequest::last(&[next]))
+            .unwrap()
+            .logits;
+    }
+    tokens
+}
+
+/// E0 / E1 / E2 (sc-24140): a temperature + top-p request through the engine with no proposer —
+/// what `generate_step`, the provider's Off path, LLaVA and StarVector run — draws every token
+/// through [`sample`]: the same seeded stream as the pre-wrapper seam loop, every draw recorded,
+/// and on CUDA the device sampler (no logits row copied to the host); on CPU the host reference,
+/// and the record says why.
+fn assert_the_engine_draws_through_sample<M: StepModel>(model: &M) {
+    let config = stochastic(TOKENS);
+    let (out, record) = generate_step(
+        model,
+        &PROMPT,
+        &config,
+        &CancelFlag::new(),
+        &mut |_| {},
+        None,
+    )
+    .unwrap();
+    assert_eq!(out.tokens.len(), TOKENS);
+    assert_eq!(
+        out.tokens,
+        seam_oracle(model, &PROMPT, &config),
+        "the seeded stream of the token-at-a-time seam loop"
+    );
+    assert_eq!(
+        record.sampler.device_draws + record.sampler.host_draws,
+        TOKENS as u64,
+        "every draw is recorded: {:?}",
+        record.sampler
+    );
+    if model.device().is_cuda() {
+        assert_eq!(record.sampler.path, Some(SamplerPath::Device));
+        assert_eq!(record.sampler.label(), "device");
+        assert_eq!(record.sampler.device_draws, TOKENS as u64);
+        assert_eq!(
+            record.sampler.logits_to_host, 0,
+            "no logits row reached the host"
+        );
+        assert_eq!(record.host_syncs, TOKENS as u64, "one sync per token");
+    } else {
+        assert_eq!(
+            record.sampler.path,
+            Some(SamplerPath::Host(HostSampleReason::DeviceUnavailable))
+        );
+        assert_eq!(record.sampler.host_draws, TOKENS as u64);
+        assert_eq!(record.sampler.logits_to_host, TOKENS as u64);
+    }
+}
+
+#[test]
+fn cpu_engine_without_drafts_draws_through_sample_on_both_families() {
+    assert_the_engine_draws_through_sample(&tiny_qwen35(&Device::Cpu));
+    assert_the_engine_draws_through_sample(&tiny_llama(&Device::Cpu));
+}
+
+// ---------------------------------------------------------------------------------------------
 // CUDA: the kernel itself.
 // ---------------------------------------------------------------------------------------------
 
@@ -991,6 +1119,15 @@ mod cuda {
         let (_, reference) = with_reference_sampler(|| run_step(&model, &stochastic(TOKENS)));
         assert_eq!(reference.sampler.label(), "host:reference");
         assert_eq!(reference.sampler.logits_to_host, TOKENS as u64);
+    }
+
+    /// sc-24140: on CUDA the engine with no proposer — `generate_step`, the provider's Off path,
+    /// LLaVA, StarVector — keeps a temperature + top-p request on the device sampler for both
+    /// families: zero logits rows to the host, one sync per token, the seam loop's seeded stream.
+    #[test]
+    fn cuda_engine_without_drafts_draws_through_sample_on_both_families() {
+        assert_the_engine_draws_through_sample(&tiny_qwen35(&gpu()));
+        assert_the_engine_draws_through_sample(&tiny_llama(&gpu()));
     }
 
     #[test]

@@ -83,8 +83,6 @@
 //! [`REASON_CUDA_FEATURE_OFF`].
 
 use std::cell::{Cell, RefCell};
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use candle_core::Device;
 #[cfg(feature = "cuda")]
@@ -96,6 +94,7 @@ use crate::decode::step::{LogitsScope, StepModel, StepOutput, StepRequest};
 use crate::error::Result;
 use crate::primitives::attention::AttnFormulation;
 use crate::primitives::decode_cache::DecodeCache;
+use crate::primitives::switch::{ProcessSwitch, SwitchGuard};
 
 /// Environment switch: `1` / `on` / `true` / `yes` enable the graph runner; anything else (and
 /// unset) leaves it off.
@@ -162,23 +161,13 @@ pub const REASON_REPLAY_MISMATCH: &str = "replay_mismatch";
 /// Fallback reason: the step's outputs are not a shape the staging tensors can hold.
 pub const REASON_OUTPUT_SHAPE: &str = "output_shape";
 
-const POLICY_ENV: u8 = 0;
-const POLICY_ON: u8 = 1;
-const POLICY_OFF: u8 = 2;
-
-static POLICY: AtomicU8 = AtomicU8::new(POLICY_ENV);
-
-fn env_says_enabled() -> bool {
-    static FROM_ENV: OnceLock<bool> = OnceLock::new();
-    *FROM_ENV.get_or_init(|| {
-        std::env::var(CUDA_GRAPHS_ENV)
-            .map(|v| {
-                let v = v.trim().to_ascii_lowercase();
-                matches!(v.as_str(), "1" | "on" | "true" | "yes")
-            })
-            .unwrap_or(false)
-    })
+fn env_value_enables(v: &str) -> bool {
+    matches!(v, "1" | "on" | "true" | "yes")
 }
+
+/// The process CUDA-graph switch (off unless the environment turns it on), on the crate's one
+/// switch implementation, [`ProcessSwitch`].
+static SWITCH: ProcessSwitch = ProcessSwitch::new(CUDA_GRAPHS_ENV, false, env_value_enables);
 
 thread_local! {
     /// The thread-scoped switch ([`cuda_graphs_scope`]); `None` defers to the process switch.
@@ -193,26 +182,13 @@ pub fn cuda_graphs_enabled() -> bool {
     if let Some(enabled) = REQUEST_POLICY.with(Cell::get) {
         return enabled;
     }
-    process_cuda_graphs_enabled()
-}
-
-fn process_cuda_graphs_enabled() -> bool {
-    match POLICY.load(Ordering::Relaxed) {
-        POLICY_ON => true,
-        POLICY_OFF => false,
-        _ => env_says_enabled(),
-    }
+    SWITCH.enabled()
 }
 
 /// Override the switch for the process: `Some(true)` / `Some(false)` force it, `None` returns to
 /// the environment's setting.
 pub fn set_cuda_graphs(enabled: Option<bool>) {
-    let policy = match enabled {
-        Some(true) => POLICY_ON,
-        Some(false) => POLICY_OFF,
-        None => POLICY_ENV,
-    };
-    POLICY.store(policy, Ordering::Relaxed);
+    SWITCH.set(enabled);
 }
 
 /// Restores the calling thread's previous scoped switch when dropped. Returned by
@@ -239,37 +215,17 @@ pub fn cuda_graphs_scope(enabled: Option<bool>) -> CudaGraphsScope {
     CudaGraphsScope { previous }
 }
 
-static POLICY_LOCK: Mutex<()> = Mutex::new(());
-
 /// Holds the process-wide switch lock; restores the switch it found when dropped. Returned by
 /// [`cuda_graphs_policy_guard`].
 #[doc(hidden)]
-#[must_use = "the policy is only held (and restored) while the guard is alive"]
-pub struct CudaGraphsPolicyGuard {
-    previous: u8,
-    _lock: MutexGuard<'static, ()>,
-}
-
-impl Drop for CudaGraphsPolicyGuard {
-    fn drop(&mut self) {
-        POLICY.store(self.previous, Ordering::Relaxed);
-    }
-}
+pub type CudaGraphsPolicyGuard = SwitchGuard;
 
 /// Test seam: take the process-wide switch lock, apply `enabled` (as [`set_cuda_graphs`]) and
 /// hand back a guard that restores the previous switch when dropped. Every test that flips the
 /// switch — or asserts a reason the switch could change — holds one.
 #[doc(hidden)]
 pub fn cuda_graphs_policy_guard(enabled: Option<bool>) -> CudaGraphsPolicyGuard {
-    let lock = POLICY_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let previous = POLICY.load(Ordering::Relaxed);
-    set_cuda_graphs(enabled);
-    CudaGraphsPolicyGuard {
-        previous,
-        _lock: lock,
-    }
+    SWITCH.guard(enabled)
 }
 
 /// Per-thread counts of graph replays vs eager step executions (monotone; take deltas with

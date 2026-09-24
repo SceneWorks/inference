@@ -11,6 +11,11 @@
 //!   the pre-S4 `expanded` arithmetic stays selectable only as a labelled bench comparison row.
 //! * **AC3 (real weights)** — the static buffers' CUDA device pointers are unchanged across the
 //!   whole 256-token run and a rollback.
+//! * **sc-24140 (provider)** — the provider's default path for a request whose speculation is off
+//!   (the engine with no proposer, on the static cache) is token-identical to the reference loop
+//!   selected on the same provider, event for event over the 256-token fixture
+//!   (`provider_off_path_is_token_identical_to_the_reference_loop`; evidence row with
+//!   `SC24140_EVIDENCE_OUTPUT`).
 //! * **Teacher-forced diagnostic** (not an acceptance gate) — the static path against the pre-S4
 //!   `expanded` reference arithmetic, both fed the reference's own 256 tokens; reports per-position
 //!   argmax agreement, the max |Δlogit| and the reference's top-2 logit gap wherever the argmax
@@ -342,4 +347,157 @@ fn teacher_forced_static_vs_attn_kv_logit_parity_report() {
             gap_b / top_ulp
         );
     }
+}
+
+/// sc-24140 (item 2 of the feature-end review): a Qwen3.8-27B request whose speculation is off
+/// — the provider's default path since sc-24140, the engine with no proposer on the static KV
+/// cache — is token-identical to the reference `Decode` loop selected on the same provider,
+/// greedy, over the 256-token fixture. Both attend through un-expanded GQA and both are M = 1
+/// steps, so the parity is exact (no knife-edge exception applies). Every streamed event (token
+/// id, index, channel, text) and the final output are compared. `SC24140_EVIDENCE_OUTPUT` names
+/// a JSON file to write the evidence row to.
+#[test]
+#[ignore = "needs the Qwen3.8-27B snapshot via BONSAI_QWEN38_SNAPSHOT and a GPU"]
+fn provider_off_path_is_token_identical_to_the_reference_loop() {
+    use candle_llm::LlamaProvider;
+    use core_llm::{LoadSpec, Message, MtpMode, Sampling, StreamEvent, TextLlm, TextLlmRequest};
+
+    let snapshot = common::qwen35::snapshot_from_env(SNAPSHOT_VAR)
+        .unwrap_or_else(|| panic!("set {SNAPSHOT_VAR}"));
+    let started = std::time::Instant::now();
+    let mut provider = LlamaProvider::load(&LoadSpec::dense(snapshot.display().to_string()))
+        .expect("load the Qwen3.8-27B provider");
+    let load_secs = started.elapsed().as_secs_f64();
+    assert_eq!(provider.decode_path(), DecodePath::StepModel, "the default");
+    let request = TextLlmRequest {
+        messages: vec![Message::user(PROMPT)],
+        sampling: Sampling::greedy(),
+        max_new_tokens: FIXTURE_TOKENS as u32,
+        seed: Some(0),
+        mtp: MtpMode::Off,
+        ..Default::default()
+    };
+    type Event = (u32, usize, String, String);
+    let run = |provider: &LlamaProvider| {
+        let mut events: Vec<Event> = Vec::new();
+        let started = std::time::Instant::now();
+        let out = provider
+            .generate(&request, &mut |event| {
+                if let StreamEvent::Token {
+                    id,
+                    index,
+                    channel,
+                    text,
+                } = event
+                {
+                    events.push((id, index, format!("{channel:?}"), text));
+                }
+            })
+            .expect("generate");
+        let secs = started.elapsed().as_secs_f64();
+        let record = provider.last_decode_record().expect("record");
+        (out, events, record, secs)
+    };
+
+    let (engine, engine_events, engine_record, engine_secs) = run(&provider);
+    assert_eq!(engine_record.path, DecodePath::StepModel, "the engine ran");
+    assert_eq!(engine_record.kv_cache, KvCacheKind::Static);
+    assert_eq!(engine_record.attn_formulation, AttnFormulation::Gqa);
+    assert_eq!(engine_record.proposer, core_llm::ProposerKind::None);
+
+    provider
+        .set_decode_path(DecodePath::Reference)
+        .expect("the reference loop is selectable");
+    let (reference, reference_events, reference_record, reference_secs) = run(&provider);
+    assert_eq!(reference_record.path, DecodePath::Reference);
+    assert_eq!(reference_record.kv_cache, KvCacheKind::Growing);
+    assert_eq!(reference_record.attn_formulation, AttnFormulation::Gqa);
+
+    let ids = |events: &[Event]| events.iter().map(|e| e.0 as i32).collect::<Vec<i32>>();
+    let divergence = first_divergence(&ids(&reference_events), &ids(&engine_events));
+    let identical = engine_events == reference_events
+        && engine.text == reference.text
+        && engine.thinking == reference.thinking
+        && engine.usage == reference.usage
+        && engine.finish_reason == reference.finish_reason;
+    // The code the row was measured at: HEAD, and whether tracked files had uncommitted changes.
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let commit = git(&["rev-parse", "HEAD"]).expect("git rev-parse HEAD");
+    let dirty = git(&["status", "--porcelain", "--untracked-files=no"])
+        .map(|s| !s.is_empty())
+        .unwrap_or(true);
+    let evidence = serde_json::json!({
+        "story": "sc-24140",
+        "commit": commit,
+        "worktree_dirty": dirty,
+        "check": "feature-end review item 2: Qwen3.8-27B provider default path (MtpMode::Off) vs the reference Decode loop, greedy",
+        "snapshot": snapshot.display().to_string(),
+        "device": format!("{:?}", candle_llm::device::select_device().unwrap().location()),
+        "prompt": PROMPT,
+        "max_new_tokens": FIXTURE_TOKENS,
+        "load_secs": load_secs,
+        "identical": identical,
+        "first_event_divergence": divergence,
+        "engine": {
+            "path": engine_record.path.label(),
+            "kv_cache": engine_record.kv_cache.label(),
+            "attn_formulation": engine_record.attn_formulation.label(),
+            "proposer": engine_record.proposer.label(),
+            "generated_tokens": engine.usage.generated_tokens,
+            "events": engine_events.len(),
+            "target_forwards": engine_record.target_forwards,
+            "prefill_forwards": engine_record.prefill_forwards,
+            "verify_steps": engine_record.verify_steps,
+            "host_syncs": engine_record.host_syncs,
+            "sampler": engine_record.sampler.label(),
+            "logits_to_host": engine_record.sampler.logits_to_host,
+            "cuda_graphs": engine_record.cuda_graphs.describe(),
+            "fused_primitives": engine_record.fused_primitives.label(),
+            "finish_reason": format!("{:?}", engine.finish_reason),
+            "wall_secs": engine_secs,
+        },
+        "reference": {
+            "path": reference_record.path.label(),
+            "kv_cache": reference_record.kv_cache.label(),
+            "attn_formulation": reference_record.attn_formulation.label(),
+            "proposer": reference_record.proposer.label(),
+            "generated_tokens": reference.usage.generated_tokens,
+            "events": reference_events.len(),
+            "target_forwards": reference_record.target_forwards,
+            "host_syncs": reference_record.host_syncs,
+            "sampler": reference_record.sampler.label(),
+            "finish_reason": format!("{:?}", reference.finish_reason),
+            "wall_secs": reference_secs,
+        },
+        "event_token_ids": ids(&engine_events),
+    });
+    if let Ok(path) = std::env::var("SC24140_EVIDENCE_OUTPUT") {
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(&evidence).unwrap()).unwrap();
+        eprintln!("[sc-24140] wrote {path}");
+    }
+    eprintln!(
+        "[sc-24140] engine {} tokens / {} events, reference {} tokens / {} events, identical={identical}",
+        engine.usage.generated_tokens,
+        engine_events.len(),
+        reference.usage.generated_tokens,
+        reference_events.len()
+    );
+    assert_eq!(
+        engine_events, reference_events,
+        "the Off path's stream diverged from the reference loop at event {divergence:?}"
+    );
+    assert_eq!(engine.text, reference.text);
+    assert_eq!(engine.thinking, reference.thinking);
+    assert_eq!(engine.usage, reference.usage);
+    assert_eq!(engine.finish_reason, reference.finish_reason);
 }

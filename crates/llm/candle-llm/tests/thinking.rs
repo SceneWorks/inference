@@ -125,7 +125,7 @@ fn thinking_provider_passes_core_llm_conformance() {
 /// llama-family text request decodes through the unified engine over the step seam on the static
 /// KV cache (sc-24138): the record says `step_model` / `static` / `gqa` / no proposer, one
 /// forward per emitted token including the prefill, and one device->host transfer per sampled
-/// token. The reference loop stays selectable (`set_causal_decode_path`); attending in the same
+/// token. The reference loop stays selectable (`set_decode_path`); attending in the same
 /// (default, un-expanded) formulation, it produces the same text on CPU f32, where the two loops
 /// are bit-identical. (On a CUDA device the bf16 attention GEMMs over the static cache's strided
 /// views and the growing cache's contiguous ones may round differently in the last bit, which a
@@ -140,7 +140,7 @@ fn provider_records_the_decode_path_it_ran() {
     let spec = LoadSpec::dense(guard.path().to_str().unwrap().to_string());
     let mut p = LlamaProvider::load(&spec).expect("load thinking provider");
     assert!(p.last_decode_record().is_none(), "no request yet");
-    assert_eq!(p.causal_decode_path(), DecodePath::StepModel);
+    assert_eq!(p.decode_path(), DecodePath::StepModel);
 
     let mut req = TextLlmRequest::new(vec![Message::user("t1 t2 t3")], 6);
     req.seed = Some(0);
@@ -171,7 +171,7 @@ fn provider_records_the_decode_path_it_ran() {
     );
 
     // The reference loop, selected: the oracle's record, the same text.
-    p.set_causal_decode_path(DecodePath::Reference)
+    p.set_decode_path(DecodePath::Reference)
         .expect("the reference loop is selectable");
     let reference = p.generate(&req, &mut |_| {}).expect("generate (reference)");
     let record = p.last_decode_record().expect("record after generate");
@@ -185,9 +185,9 @@ fn provider_records_the_decode_path_it_ran() {
         assert_eq!(reference.usage, out.usage);
     }
     // Speculation is chosen per request, not here.
-    assert!(p.set_causal_decode_path(DecodePath::PromptLookup).is_err());
-    assert_eq!(p.causal_decode_path(), DecodePath::Reference);
-    p.set_causal_decode_path(DecodePath::StepModel).unwrap();
+    assert!(p.set_decode_path(DecodePath::PromptLookup).is_err());
+    assert_eq!(p.decode_path(), DecodePath::Reference);
+    p.set_decode_path(DecodePath::StepModel).unwrap();
 
     // A request that fails (here: cancelled before inference) clears the previous record rather
     // than leaving it readable as if it described this request.
@@ -254,6 +254,50 @@ fn causal_engine_requests_record_the_graph_runner() {
         "{}",
         off.cuda_graphs.describe()
     );
+}
+
+/// sc-24140 (E0 / E2): a llama-family temperature + top-p request — ChatWorks' default — decodes
+/// on the engine with no proposer and draws every token through `sample`: on CUDA the device
+/// sampler (zero logits rows copied to the host), on CPU the host reference and the record says
+/// why; every draw is recorded either way.
+#[test]
+fn a_stochastic_request_draws_through_the_device_sampler_where_there_is_one() {
+    use candle_llm::decode::DecodePath;
+
+    let guard = write_thinking_snapshot();
+    let spec = LoadSpec::dense(guard.path().to_str().unwrap().to_string());
+    let p = LlamaProvider::load(&spec).expect("load thinking provider");
+    let mut req = TextLlmRequest::new(vec![Message::user("t1 t2 t3")], 8);
+    req.sampling = core_llm::Sampling {
+        temperature: 0.8,
+        top_p: 0.9,
+        ..core_llm::Sampling::greedy()
+    };
+    req.seed = Some(5);
+    let out = p.generate(&req, &mut |_| {}).expect("generate");
+    let record = p.last_decode_record().expect("record after generate");
+    assert_eq!(record.path, DecodePath::StepModel, "the engine ran");
+    // A stop token is drawn but not emitted.
+    let stopped = out.finish_reason == Some(core_llm::FinishReason::Stop);
+    let draws = u64::from(out.usage.generated_tokens) + u64::from(stopped);
+    assert!(draws > 0);
+    assert_eq!(
+        record.sampler.device_draws + record.sampler.host_draws,
+        draws,
+        "every draw is recorded: {:?}",
+        record.sampler
+    );
+    if candle_llm::device::select_device().unwrap().is_cuda() {
+        assert_eq!(record.sampler.label(), "device");
+        assert_eq!(record.sampler.device_draws, draws);
+        assert_eq!(
+            record.sampler.logits_to_host, 0,
+            "no logits row reached the host"
+        );
+    } else {
+        assert_eq!(record.sampler.label(), "host:device_unavailable");
+        assert_eq!(record.sampler.host_draws, draws);
+    }
 }
 
 /// A model that *actually reasons*: Qwen3's chat template gates `enable_thinking`, so an Enabled
