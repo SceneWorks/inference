@@ -1,13 +1,13 @@
 {
   "story": "sc-24140",
-  "commit": "4180cec58a8222ec581f572f8742e1f86ee44c9d",
+  "commit": "007c3a8181b2e704e04c50d4ad0e527ebe8bdd6e",
   "worktree_dirty": false,
   "check": "feature-end review item 2: Qwen3.8-27B provider default path (MtpMode::Off) vs the reference Decode loop, greedy",
   "snapshot": "E:\\huggingface\\hub\\models--Qwen--Qwen3.8-27B\\snapshots\\1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
   "device": "Cuda { gpu_id: 0 }",
   "prompt": "Write a detailed, multi-paragraph explanation of how transformer language models generate text. Cover tokenization, self-attention, the key/value cache, and greedy versus sampled decoding, and finish with the trade-offs of speculative decoding.",
   "max_new_tokens": 256,
-  "load_secs": 28.1806192,
+  "load_secs": 21.6525342,
   "identical": true,
   "first_event_divergence": null,
   "engine": {
@@ -26,7 +26,7 @@
     "cuda_graphs": "graph: none replayed=0 eager=0 captured=0",
     "fused_primitives": "fused",
     "finish_reason": "Some(Length)",
-    "wall_secs": 20.0170864
+    "wall_secs": 17.8735452
   },
   "reference": {
     "path": "reference",
@@ -39,7 +39,7 @@
     "host_syncs": 256,
     "sampler": "device",
     "finish_reason": "Some(Length)",
-    "wall_secs": 19.0966584
+    "wall_secs": 17.281763
   },
   "event_token_ids": [
     1596,

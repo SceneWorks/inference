@@ -31,9 +31,10 @@ equality.
 The 256 tokens produce 255 events because the `<think>` marker token is stripped by the
 reasoning segmenter on both paths.
 
-Measured at commit `4180cec58a8222ec581f572f8742e1f86ee44c9d` on a clean tracked tree (the JSON
-records `commit` and `worktree_dirty`). Load took 28 s. Each 256-token decode took about 19–20 s
-on both paths:
+Measured at commit `007c3a8181b2e704e04c50d4ad0e527ebe8bdd6e` on a clean tracked tree. That
+commit is this branch merged with the feature head that carries S11 (#1035). The JSON records
+`commit` and `worktree_dirty`. Load took 22 s, and each 256-token decode took 17–18 s on both
+paths. An earlier run at the pre-merge commit `4180cec58` was identical as well. The command:
 
 ```text
 BONSAI_QWEN38_SNAPSHOT=E:\huggingface\hub\models--Qwen--Qwen3.8-27B\snapshots\1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
