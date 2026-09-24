@@ -1,5 +1,9 @@
 # sc-24140 — feature-end review, round 1 (decode routing): evidence
 
+The round's measurement and llama-family findings (A: llama-family NVFP4, B: the decode-perf
+matrix and campaign, C: stochastic rows, D: the llama knife-edge gate, E: `REQUIRE_SM120`) have
+their own evidence in [`measure/README.md`](measure/README.md).
+
 Epic sc-24128, feature-end fix story. Host: Windows 11, **RTX Pro 6000 / sm_120** (GPU 0,
 `CUDA_VISIBLE_DEVICES=0`), CUDA 12.9, MSVC 14.44, `CUDA_COMPUTE_CAP=120`.
 
