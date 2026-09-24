@@ -618,6 +618,21 @@ mod tests {
         assert_eq!(census.total().count, 2);
     }
 
+    /// sc-24140: outside NVFP4, `load_eligible` is exactly `load_as` — whatever the shape.
+    #[test]
+    fn load_eligible_is_load_as_for_dense_and_ggml() {
+        let dev = Device::Cpu;
+        let q8 = ProjectionFormat::from(QuantSpec::q8());
+        for (rows, cols) in [(64usize, 64usize), (50, 64)] {
+            for format in [None, Some(&q8)] {
+                let a = Projection::load_eligible(ramp(rows, cols, 3, &dev), None, format).unwrap();
+                let b = Projection::load_as(ramp(rows, cols, 3, &dev), None, format).unwrap();
+                assert_eq!(a.kind(), b.kind(), "{rows}x{cols} {format:?}");
+                assert_eq!(a.resident_bytes(), b.resident_bytes());
+            }
+        }
+    }
+
     /// A CUDA device that meets the NVFP4 floor, or `None` (the GPU tests then skip loudly).
     #[cfg(feature = "cuda")]
     fn nvfp4_format() -> Option<(Device, ProjectionFormat)> {
@@ -756,6 +771,35 @@ mod tests {
         let bytes = p.resident_bytes().unwrap();
         assert_eq!(bytes, (wq.packed.len() + wq.scales.len() + n * 2) as u64);
         assert!(bytes < (n * k * 2) as u64);
+    }
+
+    /// sc-24140: the llama-family loader's shape policy — under NVFP4, an eligible shape becomes
+    /// NVFP4 and one the FP4 GEMM cannot serve (`N % 16 != 0`) stays dense, reported as `Dense`
+    /// (so the census counts it under `dense`), bias included.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn load_eligible_keeps_an_ineligible_nvfp4_shape_dense_and_visible() {
+        let Some((device, format)) = nvfp4_format() else {
+            candle_quant_kernels::skip_without_sm120("no sm_120 CUDA device");
+            return;
+        };
+        let eligible = Projection::load_eligible(
+            ramp(64, 32, 7, &device).to_dtype(DType::BF16).unwrap(),
+            None,
+            Some(&format),
+        )
+        .unwrap();
+        assert_eq!(eligible.kind(), ProjectionKind::Nvfp4);
+        let bias = ramp(1, 50, 9, &device).reshape(50).unwrap();
+        let odd =
+            Projection::load_eligible(ramp(50, 32, 7, &device), Some(bias), Some(&format)).unwrap();
+        assert_eq!(odd.kind(), ProjectionKind::Dense);
+        assert_eq!(odd.resident_bytes(), Some((50 * 32 + 50) * 4));
+        let mut census = ProjectionCensus::default();
+        census.record(&eligible);
+        census.record(&odd);
+        assert_eq!((census.nvfp4.count, census.dense.count), (1, 1));
+        assert_eq!(census.dense.params, 50 * 32);
     }
 
     /// An NVFP4 request never keeps an ineligible projection dense: it is a typed refusal.

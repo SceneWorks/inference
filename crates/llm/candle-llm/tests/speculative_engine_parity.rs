@@ -488,7 +488,14 @@ fn llama_family_qwen3_8b_exact_rows_and_ngram_knife_edge_gate() {
 
     let snapshot = common::qwen35::snapshot_from_env(QWEN3_8B_VAR)
         .unwrap_or_else(|| panic!("set {QWEN3_8B_VAR}"));
-    let device = select_device().unwrap();
+    // The device as a graphs-on load gets it: `select_device` resolves the stream from the switch,
+    // so with it on the model runs on its own stream (every row below — the stream changes no
+    // arithmetic) and the graph-runner row exercises the `CausalLm` step's own refusal, not the
+    // legacy stream's.
+    let device = {
+        let _graphs = cuda_graphs_policy_guard(Some(true));
+        select_device().unwrap()
+    };
     let model = load_qwen3_8b(&snapshot, &device);
     let prompt = common::qwen35::render_chat_prompt(&snapshot, PROMPT);
     let reference = causal_reference_tokens(&model, &prompt, &device);

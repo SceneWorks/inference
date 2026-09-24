@@ -15,8 +15,10 @@
 //! - **Microbench** (`#[ignore]`, `NVFP4_GEMV_BENCH_OUTPUT=<json>`): µs per call and effective GB/s,
 //!   GEMV vs cuBLASLt, per 27B shape and row count 1..=8.
 //!
-//! GPU tests skip (loudly) without an sm_120 CUDA device. They share the process-wide GEMV switch,
-//! so each holds `nvfp4_gemv_policy_guard` (which also restores the switch).
+//! GPU tests skip (loudly) without an sm_120 CUDA device — and fail instead under
+//! `REQUIRE_SM120=1` (`candle_quant_kernels::skip_without_sm120`, sc-24140), so an acceptance run
+//! proves they ran. They share the process-wide GEMV switch, so each holds
+//! `nvfp4_gemv_policy_guard` (which also restores the switch).
 
 #![cfg(feature = "cuda")]
 

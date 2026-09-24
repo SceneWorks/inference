@@ -536,6 +536,36 @@ fn select_attn_formulation(model: &mut Qwen35Model) {
 fn growing_row_kinds(model: &Qwen35Model) -> Option<(&'static str, &'static str)> {
     Some(("growing", model.attn_formulation().label()))
 }
+
+/// The MTP head attends in the target's selected formulation (sc-24132). Head-only: the pre-epic
+/// baseline has neither selector (sc-24140 moved this out of the shared body, which the baseline
+/// rewrite could not compile).
+fn select_mtp_attn_formulation(model: &Qwen35Model, mtp: Option<&mut Qwen35Mtp>) {
+    if let Some(mtp) = mtp {
+        mtp.set_attn_formulation(model.attn_formulation());
+    }
+}
+/// sc-24140: `DECODE_BENCH_FORMAT` names the four load-time formats both families take.
+#[test]
+fn projection_format_names_bf16_q8_q4_and_nvfp4() {
+    use candle_llm::primitives::QuantSpec;
+    let cpu = Device::Cpu;
+    assert!(projection_format("bf16", &cpu).is_none());
+    assert_eq!(
+        projection_format("q8", &cpu).and_then(|f| f.ggml()),
+        Some(QuantSpec::q8())
+    );
+    assert_eq!(
+        projection_format("q4", &cpu).and_then(|f| f.ggml()),
+        Some(QuantSpec::q4())
+    );
+    // NVFP4 is a capability: on the CPU it is the typed refusal, never a silent downgrade.
+    let nvfp4 = std::panic::catch_unwind(|| projection_format("nvfp4", &Device::Cpu));
+    assert!(nvfp4.is_err(), "NVFP4 on the CPU must refuse");
+    let other = std::panic::catch_unwind(|| projection_format("fp8", &Device::Cpu));
+    assert!(other.is_err(), "an unknown format must refuse");
+}
+
 // ---- The llama family (sc-24138): a `CausalLm` snapshot, e.g. Qwen3-8B ----------------------
 
 /// Load a llama-family snapshot in `DECODE_BENCH_FORMAT` (every [`projection_format`], NVFP4
@@ -940,6 +970,8 @@ fn select_attn_formulation(_model: &mut Qwen35Model) {}
 fn growing_row_kinds(_model: &Qwen35Model) -> Option<(&'static str, &'static str)> {
     None
 }
+
+fn select_mtp_attn_formulation(_model: &Qwen35Model, _mtp: Option<&mut Qwen35Mtp>) {}
 
 /// The pre-epic `CausalLm` load: `from_weights_with` in bf16 / q8 / q4, the model's own
 /// (pre-migration) attention arithmetic, no step seam.
@@ -1628,6 +1660,35 @@ fn forwards_per_verify_is_measured_net_of_the_prefill() {
 }
 
 #[test]
+fn sampled_config_is_the_seeded_temperature_top_p_triple() {
+    let config = sampled_config(8);
+    assert_eq!(config.max_new_tokens, 8);
+    assert!(
+        config.stop_tokens.is_empty(),
+        "every row emits exactly new_tokens"
+    );
+    // The default `0.7,0.9,0` unless the environment overrides it.
+    if std::env::var("DECODE_BENCH_SAMPLING").is_err() {
+        assert_eq!(config.sampling.temperature, 0.7);
+        assert_eq!(config.sampling.top_p, 0.9);
+        assert_eq!(config.seed, Some(0));
+    }
+    let row = annotate_row(
+        json!({"path": "sampled"}),
+        Some(&config),
+        Some(json!({"path": "device"})),
+    );
+    assert_eq!(
+        row["sampling"]["temperature"],
+        json!(config.sampling.temperature)
+    );
+    assert_eq!(row["sampling"]["seed"], json!(config.seed));
+    assert_eq!(row["sampler"]["path"], "device");
+    let greedy = annotate_row(json!({"path": "reference"}), None, None);
+    assert!(greedy["sampling"].is_null() && greedy["sampler"].is_null());
+}
+
+#[test]
 fn step_cache_accepts_checkpoint_bytes_and_single_token_runs() {
     assert_eq!(checked_step_cache(2, Some((10, 5))), Some((10, 5)));
     assert_eq!(checked_step_cache(1, Some((10, 0))), Some((10, 0)));
@@ -1680,9 +1741,7 @@ fn decode_bench() {
     let (mut model, mut mtp) = load(&snapshot, &device, &format);
     select_step_kv_cache(&mut model);
     select_attn_formulation(&mut model);
-    if let Some(mtp) = mtp.as_mut() {
-        mtp.set_attn_formulation(model.attn_formulation());
-    }
+    select_mtp_attn_formulation(&model, mtp.as_mut());
     let load_secs = load_started.elapsed().as_secs_f64();
     let used_after_load = device_used_bytes(&device);
     let prompt = render_prompt(&snapshot, &prompt_text);

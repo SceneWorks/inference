@@ -706,8 +706,9 @@ pub struct LlamaProvider {
     /// MTP subset (`MtpStats`); the full record is read back through
     /// [`LlamaProvider::last_decode_record`].
     last_decode: Mutex<Option<DecodeRecord>>,
-    /// What the load produced (sc-24135): the requested weight format and, for the qwen3_5 family,
-    /// the resident weight census by projection kind. Read through [`LlamaProvider::load_record`].
+    /// What the load produced (sc-24135): the requested weight format and the resident weight
+    /// census by projection kind (the qwen3_5 and — sc-24140 — llama families). Read through
+    /// [`LlamaProvider::load_record`].
     load_record: LoadRecord,
     /// Which loop a llama-family ([`CausalLm`]) request decodes on (sc-24138):
     /// [`DecodePath::StepModel`] — the unified engine over the step seam on the static KV cache,
@@ -719,16 +720,19 @@ pub struct LlamaProvider {
 /// The load telemetry of a [`LlamaProvider`] (sc-24135, epic sc-24128 E2): which weight format was
 /// requested and which projection kinds the decoder actually holds, with their resident bytes.
 ///
-/// An NVFP4 request either loads with every requested projection under
-/// `census.projections.nvfp4` or fails at load — this record is how a caller (and the evidence
-/// harness) sees that, and reads the resident bits/param.
+/// An NVFP4 request never reports a dense projection under an NVFP4 label: the qwen3_5 family
+/// loads every requested projection under `census.projections.nvfp4` or fails at load, and the
+/// llama family (sc-24140) keeps a projection whose shape the FP4 GEMM cannot serve dense, counted
+/// under `census.projections.dense` — this record is how a caller (and the evidence harness)
+/// sees which, and reads the resident bits/param.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LoadRecord {
     /// The load-time weight format the caller requested (`None` = the checkpoint's own dtype, or
     /// its persisted `quantization` block).
     pub requested: Option<Quantize>,
-    /// The decoder's resident weights by projection kind (target plus native MTP predictor), for
-    /// the qwen3_5-family decoders; `None` for the other architectures, which do not report one.
+    /// The decoder's resident weights by projection kind (target plus native MTP predictor): the
+    /// qwen3_5-family decoders and, since sc-24140, the llama family (`CausalLm`, safetensors or
+    /// GGUF); `None` for the Prism/Bonsai GGUF hybrid and a provider assembled from parts.
     pub census: Option<WeightCensus>,
 }
 
@@ -1390,10 +1394,11 @@ impl LlamaProvider {
         let mut descriptor = descriptor_for(&ck.config);
         let quant = requested.or(ck.config.quantization);
         // GGUF is the dense Llama-family path only (no hybrid Qwen3.6 GGUF remap).
-        let model = Decoder::Causal(
-            CausalLm::from_weights_with(&ck.weights, "", ck.config.clone(), quant)
-                .map_err(to_core)?,
-        );
+        let causal = CausalLm::from_weights_with(&ck.weights, "", ck.config.clone(), quant)
+            .map_err(to_core)?;
+        // sc-24140: the llama family reports its census on every load path.
+        let census = Some(causal.weight_census());
+        let model = Decoder::Causal(causal);
 
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
         let sibling_tokenizer = dir.join("tokenizer.json");
@@ -1434,7 +1439,10 @@ impl LlamaProvider {
             // Likewise no Gemma 4 front-ends: the GGUF path reconstructs a dense text decoder,
             // and llama.cpp GGUFs carry no vision embedder / audio projector tensors.
             gemma4: None,
-            load_record: LoadRecord::default(),
+            load_record: LoadRecord {
+                requested: None,
+                census,
+            },
         })
     }
 
@@ -4061,6 +4069,12 @@ mod tests {
     }
 
     fn tiny_llama_for_admission() -> CausalLm {
+        let (cfg, w) = tiny_llama_parts();
+        tiny_causal_from(cfg, w)
+    }
+
+    /// The tiny llama decoder's config and seeded weights (3 layers, vocab 40).
+    fn tiny_llama_parts() -> (serde_json::Value, HashMap<String, Tensor>) {
         use crate::primitives::{SplitMix64, TokenRng};
         let (vocab, hidden, inter, heads, kv_heads, layers) = (40usize, 32, 64, 4, 2, 3);
         let head_dim = hidden / heads;
@@ -4101,7 +4115,7 @@ mod tests {
             w.insert(p("mlp.up_proj.weight"), rand(&[inter, hidden]));
             w.insert(p("mlp.down_proj.weight"), rand(&[hidden, inter]));
         }
-        tiny_causal_from(
+        (
             serde_json::json!({
                 "architectures": ["LlamaForCausalLM"], "model_type": "llama",
                 "hidden_size": hidden, "intermediate_size": inter, "num_hidden_layers": layers,
@@ -4111,6 +4125,54 @@ mod tests {
             }),
             w,
         )
+    }
+
+    /// sc-24140: a llama-family load reports its weight census (the `LoadRecord` said `None` for
+    /// every non-qwen3_5 architecture), and the requested format reaches `CausalLm`: dense keeps
+    /// all 3 × 7 projections and the head dense; `Quantize::Q8` makes the layer projections GGML
+    /// and keeps the head dense.
+    #[test]
+    fn a_llama_family_load_reports_its_census_for_the_requested_format() {
+        use core_llm::{LoadSpec, Quantize};
+        let (cfg, weights) = tiny_llama_parts();
+        let dir = tempfile::Builder::new()
+            .prefix("candle-llama-census-")
+            .tempdir()
+            .unwrap();
+        std::fs::write(dir.path().join("config.json"), cfg.to_string()).unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer.json"),
+            synthetic_tokenizer_json(40),
+        )
+        .unwrap();
+        candle_core::safetensors::save(&weights, dir.path().join("model.safetensors")).unwrap();
+        let load = |quantize| {
+            super::LlamaProvider::load(&LoadSpec {
+                quantize,
+                ..LoadSpec::dense(dir.path().display().to_string())
+            })
+            .expect("load the synthetic llama snapshot")
+            .load_record()
+        };
+        let dense = load(None);
+        let census = dense
+            .census
+            .expect("a llama-family load reports its census");
+        assert_eq!(census.projections.dense.count, 3 * 7 + 1);
+        assert_eq!(census.projections.ggml.count, 0);
+        let q8 = load(Some(Quantize::Q8));
+        assert_eq!(q8.requested, Some(Quantize::Q8));
+        let census = q8.census.expect("census");
+        assert_eq!(
+            census.projections.ggml.count,
+            3 * 7,
+            "every layer projection is Q8"
+        );
+        assert_eq!(
+            census.projections.dense.count, 1,
+            "the head stays dense under GGML"
+        );
+        assert_eq!(census.projections.dense.params, 40 * 32);
     }
 
     /// The shared Gemma 4 decoder fixture: sliding layers 2 KV heads × 8, full layers

@@ -958,6 +958,32 @@ class DecodeBenchWrapperTests(unittest.TestCase):
         self.assertNotIn("Some(stats.replays as u64)", rewritten)
         self.assertNotIn("set_attn_formulation", before_stub)
         self.assertNotIn("attn_formulation()", before_stub)
+        # sc-24140: nothing the baseline compiles — the whole file outside the `BASELINE_STUB`
+        # literal — may call a head-only seam (the shared body once did: `mtp.set_attn_formulation`).
+        literal_start = rewritten.index(bench.STUB_BEGIN)
+        literal_end = rewritten.index(bench.STUB_END, literal_start) + len(bench.STUB_END)
+        compiled = rewritten[:literal_start] + rewritten[literal_end:]
+        code = "\n".join(
+            line for line in compiled.splitlines() if not line.lstrip().startswith("//")
+        )
+        for head_only in (
+            ".set_attn_formulation(",
+            ".attn_formulation()",
+            ".set_step_kv_cache(",
+            "from_weights_format(",
+            ".weight_census()",
+            "RequestSpan::",
+            "generate_speculative_with(",
+            "generate_step_timed(",
+            "CountingDecode::",
+            "ProjectionFormat::",
+        ):
+            self.assertNotIn(head_only, code, head_only)
+        # The llama family's pre-epic reference: the stub loads `CausalLm` with the pre-epic
+        # loader and runs the shared `decode_logits` + `generate_from_prefill` reference.
+        self.assertIn("CausalLm::from_weights_with(&weights, \"\", cfg, baseline_quant(format))", compiled)
+        self.assertIn("run_causal_reference(model, model, prompt, config, device, on_event)", compiled)
+        self.assertNotIn("fn is_causal_snapshot(_snapshot: &Path) -> bool {\n    false", compiled)
         # Everything outside the block is untouched, so the two binaries measure the same rows.
         head_tail = source[source.index(bench.HEAD_ONLY_END) + len(bench.HEAD_ONLY_END):]
         self.assertTrue(rewritten.endswith(head_tail))
