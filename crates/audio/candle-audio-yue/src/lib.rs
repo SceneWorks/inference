@@ -19,9 +19,10 @@
 //! | Vocos upsampler | [`vocoder`] | [`vocoder::Vocoder::decode`] | sc-19378 |
 //! | low-band splice | [`splice`] | [`splice::SpliceFn`] | sc-19378 |
 //!
-//! **Walking skeleton (sc-19382).** Every production loader currently returns its module's
-//! deterministic, weights-free stub; the story named in the table replaces that module's `load`
-//! (the stub stays as the end-to-end seam test's double). The engine itself — staged residency
+//! **Walking skeleton (sc-19382).** Every production loader currently refuses with
+//! `Unsupported`, so a registered provider fails closed instead of rendering placeholder audio;
+//! the story named in the table replaces that module's `load`. Each module's deterministic,
+//! weights-free `load_stub` is the end-to-end seam test's double. The engine itself — staged residency
 //! (each stage released before the next loads), the stage-1 decode loop with a cancel check before
 //! every step, segment-level progress, codebook-0 de-interleave, stem assembly — is final.
 //!

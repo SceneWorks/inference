@@ -8,7 +8,8 @@
 //! top-p, repetition penalty, the minimum-new-tokens floor, and the "smart context" that drops the
 //! oldest segment block when the sequence outgrows the cache — lives behind `step`.
 //!
-//! The production loader is currently the weights-free [`StubStage1`]; **sc-19380** replaces
+//! The production loader refuses (`Unsupported`) until its story lands;
+//! [`StubStage1`] is the test double; **sc-19380** replaces
 //! [`load`] with the candle-llm `CausalLm` (Llama, GQA, KV cache, bf16/q8/q4) driven decode. The
 //! stub stays as the end-to-end seam test's weights-free double.
 
@@ -51,10 +52,11 @@ pub trait Stage1Model: Send {
     fn end_segment(&mut self) -> gen_core::Result<()>;
 }
 
-/// Production loader. **Stub until sc-19380** (returns [`StubStage1`]). `tier` is `None` when the
-/// caller asserted no tier (detect it from the staged snapshot).
-pub fn load(assets: &Assets, tier: Option<Tier>) -> gen_core::Result<Box<dyn Stage1Model>> {
-    load_stub(assets, tier)
+/// Production loader. **Refuses until sc-19380** lands the real stage-1 LM ([`load_stub`] is the
+/// test double only). `tier` is `None` when the caller asserted no tier (detect it from the staged
+/// snapshot).
+pub fn load(_assets: &Assets, _tier: Option<Tier>) -> gen_core::Result<Box<dyn Stage1Model>> {
+    Err(crate::stages::not_yet_implemented("stage-1 LM", "sc-19380"))
 }
 
 /// The weights-free stub loader (the seam test's double).

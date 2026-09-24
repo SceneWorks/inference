@@ -426,3 +426,29 @@ fn the_generator_meets_the_shared_progress_cancel_and_seed_contracts() {
     let c = audio(g.generate(&other, &mut |_| {}).unwrap());
     assert_ne!(a.samples, c.samples, "the seed reaches stage 1");
 }
+
+fn refused<T>(r: crate::gen_core::Result<T>) -> bool {
+    matches!(r, Err(Error::Unsupported(_)))
+}
+
+#[test]
+fn production_wiring_refuses_instead_of_rendering_placeholder_audio() {
+    // The registered entry point loads lazily, then the render refuses at its first stage.
+    let g = crate::model::load_en_cot(&spec()).unwrap();
+    assert!(refused(g.generate(&song(None), &mut |_| {})));
+
+    // Every production stage refuses on its own, so no later stage can fall back to its stub.
+    let s = StageSet::production();
+    let assets = Assets {
+        stage1: "/staged/yue-s1".into(),
+        stage2: "/staged/yue-s2".into(),
+        xcodec: "/staged/xcodec".into(),
+    };
+    assert!(refused((s.tokenizer)(&assets)), "tokenizer");
+    assert!(refused((s.icl_encoder)(&assets)), "icl encoder");
+    assert!(refused((s.stage1)(&assets, None)), "stage 1");
+    assert!(refused((s.stage2)(&assets, None)), "stage 2");
+    assert!(refused((s.codec)(&assets)), "codec");
+    assert!(refused((s.vocoder)(&assets)), "vocoder");
+    assert!(refused((s.splice)(&[0.0], &[0.0])), "splice");
+}

@@ -1,8 +1,8 @@
 //! **Seam: xcodec decode** — one track's 8-codebook grid → its 16 kHz waveform plus the quantized
 //! codec embedding the Vocos upsampler consumes.
 //!
-//! fp16 at every tier (the approved epic-R2 carve-out). The production loader is currently the
-//! weights-free [`StubCodec`]; **sc-19377** replaces [`load`] with the xcodec (SoundStream/SEANet +
+//! fp16 at every tier (the approved epic-R2 carve-out). The production loader refuses (`Unsupported`) until its story lands;
+//! [`StubCodec`] is the test double; **sc-19377** replaces [`load`] with the xcodec (SoundStream/SEANet +
 //! RVQ) decoder from the `xcodec_mini_infer` snapshot. The stub stays as the end-to-end seam test's
 //! weights-free double.
 
@@ -32,9 +32,13 @@ pub trait CodecDecoder: Send {
     fn decode(&self, frames: &CodecFrames, cancel: &CancelFlag) -> gen_core::Result<DecodedTrack>;
 }
 
-/// Production loader. **Stub until sc-19377** (returns [`StubCodec`]).
-pub fn load(assets: &Assets) -> gen_core::Result<Box<dyn CodecDecoder>> {
-    load_stub(assets)
+/// Production loader. **Refuses until sc-19377** lands the real xcodec decoder ([`load_stub`] is
+/// the test double only).
+pub fn load(_assets: &Assets) -> gen_core::Result<Box<dyn CodecDecoder>> {
+    Err(crate::stages::not_yet_implemented(
+        "codec decoder",
+        "sc-19377",
+    ))
 }
 
 /// The weights-free stub loader (the seam test's double).

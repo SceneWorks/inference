@@ -2,8 +2,8 @@
 //! track's own decoder checkpoint (separate vocal and instrumental decoders in
 //! `xcodec_mini_infer/decoders/`).
 //!
-//! fp16 at every tier (the approved epic-R2 carve-out). The production loader is currently the
-//! weights-free [`StubVocoder`]; **sc-19378** replaces [`load`] with the two Vocos decoders. The
+//! fp16 at every tier (the approved epic-R2 carve-out). The production loader refuses (`Unsupported`) until its story lands;
+//! [`StubVocoder`] is the test double; **sc-19378** replaces [`load`] with the two Vocos decoders. The
 //! stub stays as the end-to-end seam test's weights-free double.
 
 use candle_audio::candle_core::Tensor;
@@ -48,9 +48,10 @@ pub trait Vocoder: Send {
     ) -> gen_core::Result<Vec<f32>>;
 }
 
-/// Production loader. **Stub until sc-19378** (returns [`StubVocoder`]).
-pub fn load(assets: &Assets) -> gen_core::Result<Box<dyn Vocoder>> {
-    load_stub(assets)
+/// Production loader. **Refuses until sc-19378** lands the real Vocos upsamplers ([`load_stub`] is
+/// the test double only).
+pub fn load(_assets: &Assets) -> gen_core::Result<Box<dyn Vocoder>> {
+    Err(crate::stages::not_yet_implemented("vocoder", "sc-19378"))
 }
 
 /// The weights-free stub loader (the seam test's double).

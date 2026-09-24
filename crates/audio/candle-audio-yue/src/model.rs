@@ -57,6 +57,9 @@ pub fn stage1_hub_revision(variant: Variant) -> &'static str {
 ///
 /// - **Mode**: ICL variants advertise [`ConditioningKind::ReferenceAudio`] (the reference clip);
 ///   CoT variants advertise no conditioning, so the shared floor refuses a reference sent to them.
+///   Only ICL advertises `supports_reference_region` (the reference window).
+/// - **Song controls**: `supports_segmented_lyrics` (segment count + per-segment token budget) and
+///   `supports_repetition_penalty` on every variant.
 /// - **Tier**: `supported_quants` = q4 + q8 (bf16 is the unquantized load) for both LMs.
 /// - **Guidance**: `supports_guidance` — CFG on/off (and its scale) is a request knob.
 pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
@@ -79,6 +82,9 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8],
             audio_sample_rates: vec![SAMPLE_RATE],
             audio_languages: variant.language.codes().to_vec(),
+            supports_segmented_lyrics: true,
+            supports_repetition_penalty: true,
+            supports_reference_region: variant.mode == Mode::Icl,
             ..Default::default()
         },
     }
@@ -99,7 +105,7 @@ fn refuse(id: &str, field: &str, why: &str) -> gen_core::Error {
 /// | `audio.max_new_tokens_per_segment` | stage-1 token budget per segment (default 3000) |
 /// | `audio.repetition_penalty` | stage-1 repetition penalty (default 1.1) |
 /// | `seed` | sampler seed (default 42) |
-/// | `guidance` | `None` ⇒ the 1.5 / 1.2 schedule; `≤ 1` ⇒ guidance off; `> 1` ⇒ that scale for every segment |
+/// | `guidance` | `None` ⇒ the 1.5 / 1.2 schedule; `0 ..= 1` ⇒ explicitly off; `> 1` ⇒ that scale for every segment; negative / non-finite ⇒ refused |
 /// | `ReferenceAudio` conditioning | ICL reference — dual-track when the clip carries `vocals` + `instrumental` stems |
 /// | `audio.reference_region` | ICL window (default 0–30 s; open end ⇒ clip end) |
 pub fn map_request(variant: Variant, req: &GenerationRequest) -> gen_core::Result<YueRequest> {
@@ -148,9 +154,9 @@ pub fn map_request(variant: Variant, req: &GenerationRequest) -> gen_core::Resul
         out.seed = seed;
     }
     if let Some(g) = req.guidance {
-        if !g.is_finite() {
+        if !g.is_finite() || g < 0.0 {
             return Err(gen_core::Error::Msg(format!(
-                "{id}: guidance must be finite, got {g}"
+                "{id}: guidance must be a finite, non-negative scale (0..=1 turns CFG off), got {g}"
             )));
         }
         out.decode.guidance = if g <= 1.0 {
@@ -608,6 +614,16 @@ mod tests {
         assert_eq!(r.decode.repetition_penalty, 1.3);
         assert_eq!(r.seed, 7);
         assert_eq!(r.decode.guidance, Guidance::Off);
+        req.guidance = Some(1.0);
+        let r = map_request(cot(), &req).unwrap();
+        assert_eq!(r.decode.guidance, Guidance::Off, "1.0 is the off boundary");
+        for bad in [-0.5, f32::NAN, f32::INFINITY] {
+            req.guidance = Some(bad);
+            assert!(
+                matches!(map_request(cot(), &req), Err(gen_core::Error::Msg(_))),
+                "guidance {bad} must be refused"
+            );
+        }
         req.guidance = Some(2.0);
         let r = map_request(cot(), &req).unwrap();
         assert_eq!(

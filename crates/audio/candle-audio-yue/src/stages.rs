@@ -1,5 +1,5 @@
 //! The engine's stage wiring: one loader per seam. [`StageSet::production`] is what the registered
-//! providers load through; [`StageSet::stubs`] is the weights-free set the end-to-end seam test
+//! providers load through (each stage refuses with `Unsupported` until its story lands); [`StageSet::stubs`] is the weights-free set the end-to-end seam test
 //! drives. Each field is independently replaceable, so a test can wrap one stage (to observe its
 //! load/drop order or trip a cancel mid-decode) and keep the rest.
 
@@ -81,6 +81,14 @@ impl StageSet {
             splice: crate::splice::splice_stub,
         }
     }
+}
+
+/// The refusal every production stage returns until its story lands the real implementation, so a
+/// registered YuE provider fails closed instead of rendering the stubs' placeholder tones.
+pub(crate) fn not_yet_implemented(stage: &str, story: &str) -> gen_core::Error {
+    gen_core::Error::Unsupported(format!(
+        "candle-audio-yue: YuE {stage} not yet implemented ({story})"
+    ))
 }
 
 impl std::fmt::Debug for StageSet {

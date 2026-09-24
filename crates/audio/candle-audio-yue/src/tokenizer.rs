@@ -1,7 +1,8 @@
 //! **Seam: tokenizer / prompt builder.** Genre tags + structured lyrics (+ the ICL reference block)
 //! → the per-segment stage-1 prompt token blocks.
 //!
-//! The production loader is currently the weights-free [`StubTokenizer`]; **sc-19376** replaces
+//! The production loader refuses (`Unsupported`) until its story lands;
+//! [`StubTokenizer`] is the test double; **sc-19376** replaces
 //! [`load`] with the mm sentencepiece tokenizer (`tokenizer.model` in the stage-1 snapshot) and the
 //! reference prompt layout. The stub stays as the end-to-end seam test's weights-free double.
 
@@ -45,9 +46,10 @@ pub trait PromptTokenizer: Send {
     fn build(&self, input: &PromptInput<'_>) -> gen_core::Result<Stage1Prompt>;
 }
 
-/// Production loader. **Stub until sc-19376** (returns [`StubTokenizer`]).
-pub fn load(assets: &Assets) -> gen_core::Result<Box<dyn PromptTokenizer>> {
-    load_stub(assets)
+/// Production loader. **Refuses until sc-19376** lands the real prompt builder ([`load_stub`] is
+/// the test double only).
+pub fn load(_assets: &Assets) -> gen_core::Result<Box<dyn PromptTokenizer>> {
+    Err(crate::stages::not_yet_implemented("tokenizer", "sc-19376"))
 }
 
 /// The weights-free stub loader (the seam test's double).

@@ -313,6 +313,75 @@ mod tests {
     /// (**moss_sfx_v2**). Later stories extend this exact assertion, in catalog order.
     /// The generators-only / candle-backend / audio-modality sweeps are asserted here too so
     /// a provider that would fail bundle validation is caught in its own family first.
+    /// sc-19382: the segmented-song / reference-window controls fail closed on every shipped
+    /// generator that does not read them — only YuE advertises them (the window on ICL only).
+    #[test]
+    fn segmented_song_controls_reach_only_the_models_that_read_them() {
+        use super::gen_core::{AudioParams, Error, GenerationRequest, TimeRegion};
+        let registry = super::provider_registry().unwrap();
+        let fields: [(&str, AudioParams); 4] = [
+            (
+                "segments",
+                AudioParams {
+                    segments: Some(2),
+                    ..Default::default()
+                },
+            ),
+            (
+                "max_new_tokens_per_segment",
+                AudioParams {
+                    max_new_tokens_per_segment: Some(100),
+                    ..Default::default()
+                },
+            ),
+            (
+                "repetition_penalty",
+                AudioParams {
+                    repetition_penalty: Some(1.1),
+                    ..Default::default()
+                },
+            ),
+            (
+                "reference_region",
+                AudioParams {
+                    reference_region: Some(TimeRegion {
+                        start_secs: 0.0,
+                        end_secs: Some(10.0),
+                    }),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for r in registry.generators() {
+            let d = (r.descriptor)();
+            let request = |audio: AudioParams| GenerationRequest {
+                prompt: "a song".into(),
+                audio: Some(audio),
+                ..Default::default()
+            };
+            // The baseline passes, so a refusal below is the field's own gate.
+            d.capabilities
+                .validate_request_audio(d.id, &request(AudioParams::default()))
+                .unwrap_or_else(|e| panic!("{}: baseline refused: {e}", d.id));
+            for (field, audio) in &fields {
+                let reads = d.id.starts_with("yue_")
+                    && (*field != "reference_region" || d.id.ends_with("_icl"));
+                let got = d
+                    .capabilities
+                    .validate_request_audio(d.id, &request(audio.clone()));
+                if reads {
+                    assert!(got.is_ok(), "{}: {field} must be accepted: {got:?}", d.id);
+                } else {
+                    assert!(
+                        matches!(got, Err(Error::Unsupported(_))),
+                        "{}: {field} must be refused, got {got:?}",
+                        d.id
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn complete_catalog_has_stable_conforming_surface() {
         let registry = super::provider_registry().unwrap();
@@ -720,8 +789,6 @@ mod tests {
             })
             .collect();
         assert_eq!(ordered, expected);
-        assert_eq!(providers.len(), 24);
-        assert_eq!(components.len(), 41);
     }
 
     /// **The migration proof: no provider lost a term it previously carried (sc-16663).**

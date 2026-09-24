@@ -3,7 +3,8 @@
 //! fed the codebook-0 token and greedily decodes the seven residuals with logits sliced to
 //! `[STAGE2_SLICE_MIN, STAGE2_SLICE_MAX]`, in 6 s (300-frame) chunks.
 //!
-//! The production loader is currently the weights-free [`StubStage2`]; **sc-19381** replaces
+//! The production loader refuses (`Unsupported`) until its story lands;
+//! [`StubStage2`] is the test double; **sc-19381** replaces
 //! [`load`] with the candle-llm `CausalLm` driven teacher-forced decode (bf16/q8/q4). The stub stays
 //! as the end-to-end seam test's weights-free double.
 
@@ -19,9 +20,10 @@ pub trait Stage2Model: Send {
     fn upsample(&mut self, cb0: &[u32], cancel: &CancelFlag) -> gen_core::Result<CodecFrames>;
 }
 
-/// Production loader. **Stub until sc-19381** (returns [`StubStage2`]).
-pub fn load(assets: &Assets, tier: Option<Tier>) -> gen_core::Result<Box<dyn Stage2Model>> {
-    load_stub(assets, tier)
+/// Production loader. **Refuses until sc-19381** lands the real stage-2 LM ([`load_stub`] is the
+/// test double only).
+pub fn load(_assets: &Assets, _tier: Option<Tier>) -> gen_core::Result<Box<dyn Stage2Model>> {
+    Err(crate::stages::not_yet_implemented("stage-2 LM", "sc-19381"))
 }
 
 /// The weights-free stub loader (the seam test's double).

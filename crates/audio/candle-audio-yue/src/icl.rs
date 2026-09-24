@@ -1,8 +1,8 @@
 //! **Seam: ICL reference encoder.** A reference clip window (single-track mix, or dual-track vocal
 //! + instrumental) → the mm-vocabulary codec token block the ICL prompt embeds.
 //!
-//! Loaded only for ICL renders and released before stage 1 loads. The production loader is
-//! currently the weights-free [`StubIclEncoder`]; **sc-19379** replaces [`load`] with the xcodec
+//! Loaded only for ICL renders and released before stage 1 loads. The production loader refuses (`Unsupported`) until its story lands;
+//! [`StubIclEncoder`] is the test double; **sc-19379** replaces [`load`] with the xcodec
 //! encoder (SEANet + RVQ + HuBERT semantic branch from the `xcodec_mini_infer` snapshot). The stub
 //! stays as the end-to-end seam test's weights-free double.
 
@@ -30,9 +30,13 @@ pub trait IclEncoder: Send {
     ) -> gen_core::Result<IclPromptCodes>;
 }
 
-/// Production loader. **Stub until sc-19379** (returns [`StubIclEncoder`]).
-pub fn load(assets: &Assets) -> gen_core::Result<Box<dyn IclEncoder>> {
-    load_stub(assets)
+/// Production loader. **Refuses until sc-19379** lands the real ICL encoder ([`load_stub`] is the
+/// test double only).
+pub fn load(_assets: &Assets) -> gen_core::Result<Box<dyn IclEncoder>> {
+    Err(crate::stages::not_yet_implemented(
+        "ICL encoder",
+        "sc-19379",
+    ))
 }
 
 /// The weights-free stub loader (the seam test's double).
