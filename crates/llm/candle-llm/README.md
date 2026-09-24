@@ -50,6 +50,14 @@ aligned, matching the eager convention, so cached decode stays correct; the two 
 few half-precision ULPs (proven by a gated parity test). `candle-flash-attn` ships sm80 kernels that
 **do compile and run on sm_120** (Blackwell) under the project's `CUDA_COMPUTE_CAP=120` build.
 
+NVFP4 projections (`ProjectionFormat::Nvfp4`, sm_120 and up — a typed refusal below) load for the
+Qwen3.5/3.8 hybrid and, since sc-24140, the whole llama family: `CausalLm::from_weights_format`
+quantizes every attention / MLP / MoE-expert projection and the LM head through the shared
+`Projection::load_eligible`, keeping a shape the FP4 GEMM cannot serve (`N % 16 != 0`) dense and
+visible under `dense` in `CausalLm::weight_census`. The CUDA tests that need an sm_120 device skip
+(loudly) without one; `REQUIRE_SM120=1` turns every such skip into a failure, so an acceptance run on
+the authoritative box proves they ran.
+
 ### Multi-GPU (pipeline sharding)
 
 `CausalLm::from_dir_sharded(dir, cfg, dtype, &[dev0, dev1, …])` splits a decoder's layers into
@@ -85,6 +93,10 @@ parity tests:
 | `CANDLE_LLM_{PHI3,QWEN2MOE,GEMMA2,GLM4,DEEPSEEK}_MODEL` | a snapshot for that architecture family | `breadth` — coherent-text streaming per family |
 | `CANDLE_LLM_GEMMA4_MODEL` | a Gemma 4 unified snapshot dir (e.g. `google/gemma-4-12B-it`) | `breadth` — coherent-text streaming; `gemma4_decoder` — the real-weight per-layer-type forward (hidden-state stack + soft-capped logits) |
 | `CANDLE_LLM_VLM_MODEL` | a SigLIP-based `LlavaForConditionalGeneration` snapshot dir (small: `llava-hf/llava-interleave-qwen-0.5b-hf`; faithful: JoyCaption) | `vlm` — image captioning + the multimodal conformance check |
+| `BONSAI_QWEN38_SNAPSHOT` | the frozen Qwen3.8-27B snapshot dir (the manifest's own name for it) | `decode_step_parity` — the sc-24129 seam gates on real weights: a 256-token greedy decode through `StepModel` is token-identical to the `Decode` loop, and `Qwen35Cache::rollback_to` re-decodes to the same logits as a fresh decode |
+| `DECODE_BENCH_SNAPSHOT` + `DECODE_BENCH_OUTPUT` | the same snapshot (or Qwen3-8B for the llama family), plus a JSON path to write | `decode_bench` — the one decode-perf home (tok/s, acceptance, forwards and host syncs per token, sampler path and logits rows to host, device memory) for reference / `StepModel` / native MTP `K=1..5` / n-gram and the seeded temperature + top-p rows, in any `DECODE_BENCH_FORMAT` (`bf16`, `q8`, `q4`, `nvfp4` — both families); run and sealed by `scripts/release/decode_bench.py`, whose `campaign` subcommand runs (or collects) the whole matrix — models x formats x speculative modes x CUDA graphs — and seals one index over it |
+| `QWEN3_8B_SNAPSHOT` | the pinned `Qwen/Qwen3-8B` snapshot dir (the manifest's name for it) | `speculative_engine_parity::llama_family_qwen3_8b_exact_rows_and_teacher_forced_knife_edge_gate` — the llama family's 256-token gate (sc-24140): static seam, fused-off loops and the CUDA-graph fallback token-identical to the reference loop; teacher-forced verify-shaped forwards flip only at ≤ 1 bf16 ULP knife-edges (the E1 gate); free-running n-gram divergences recorded with their gaps |
+| `NVFP4_EVIDENCE_SNAPSHOT` (+ `_OUTPUT`, `_PPL_TEXT`) | a Qwen3.5/3.8 or llama-family snapshot | `nvfp4_evidence` — bf16 vs NVFP4: weight census (bits/param by projection kind), the 256-token fixture's first divergence, perplexity over a fixed slice, and the provider's `Quantize::Nvfp4` load record |
 
 The `breadth` test streams a prompt through each non-Llama architecture: **Phi-3** (packed qkv/gate_up),
 **Qwen2-MoE** (router + experts + shared, q/k/v bias), **Gemma-2** (sandwich norms + soft-caps + GeGLU),
@@ -153,17 +165,66 @@ tokens/s by occupancy. (The custom paged attention kernel that would batch the p
 loop — the next bottleneck as occupancy grows — is the deferred story 7258 / mlx sc-7325.)
 
 The `speculative` test covers **speculative decoding** — proposing several tokens per target forward
-and verifying them in one batched pass (`decode_logits_all`), accepting the longest agreeing prefix +
-a bonus and rolling back rejected drafts via the `KvCache::truncate` seam, in two flavors:
-**prompt-lookup** (`generate_prompt_lookup`, n-gram proposer, no draft model) and **draft-model**
-(`generate_draft_speculative`, a small/quantized model proposes, the big model verifies, accepted via
-the distribution-preserving acceptance sampler). With `num_draft = 0` the verify is a single-token
+and verifying them in one all-position step, accepting the longest agreeing prefix + a bonus and
+rolling back rejected drafts via `DecodeCache::rollback_to` — through the one unified engine
+(`generate_speculative`; the pre-epic `CausalLm` loops were retired in sc-24138) in two flavors:
+**prompt-lookup** (`NgramProposer`, no draft model) and **draft-model** (`DraftModelProposer`, a
+small/quantized model proposes, the big model verifies, accepted via the distribution-preserving
+acceptance sampler; a draft whose vocabulary is not the target's is refused before any inference).
+With `num_draft = 0` the verify is a single-token
 forward, so both are **bit-identical** to non-speculative `generate` — the exactness gate. A synthetic
 CPU model also shows draft acceptance (`forwards < tokens`) at identical greedy output (an identical
 draft accepts every token); the `#[ignore]`d real-weights variants confirm the speedup on a GPU
 snapshot (a dense target + **Q4** draft from the same weights), where the greedy run *tracks* (rather
 than bit-matches) non-speculative because the multi-token verify kernel rounds a few bf16 ULP
 differently from the single-token decode kernel.
+
+The `decode_step_parity` and `decode_bench` suites belong to the Blackwell fast-decode epic
+(sc-24128). Its two seams live in `decode::StepModel` (`forward_step`: one N-token step returning
+last/all-position logits against a cache) and `primitives::DecodeCache` (length, `rollback_to(n)`,
+reset, memory accounting); `Qwen35Model` / `Qwen35Cache` implement both. A step-seam cache gives every
+linear layer's `DeltaNetCache` a preallocated per-token checkpoint ring (sc-24131): each forward writes the
+state after every one of its last `slots` tokens into slot `position % slots` in place, the live
+state is a view of the newest slot, and the hybrid cache rolls back by narrowing the KV and
+*selecting* the ring slot for the target position — no copy, no replay forward. A speculative request's
+cache comes from `StepModel::new_cache_for(capacity, K)`, whose ring holds `K + 2` positions (the step start
+plus the `K + 1` verify positions), so any position of the last verify step is restorable; the
+unbounded `StepModel::new_cache` keeps `STEP_MAX_CHECKPOINTS` = 2 positions behind the current one,
+and the reference caches the provider builds keep none (`REFERENCE_MAX_CHECKPOINTS` = 0). Admission
+prices the ring exactly — `K + 2` recurrent states for a `K`-draft request, charged once (the engine
+never clones the cache), two with speculation off (the no-proposer engine's `K = 0` ring), one on
+the reference loop. A rollback past the ring is the typed
+`Error::RollbackUnavailable`. Every path ends in
+a measured `decode::DecodeRecord` (path taken, target forwards, proposed/accepted tokens, host syncs);
+the provider exposes the last one through `LlamaProvider::last_decode_record`. A Qwen3.5-family
+request with speculation off (`Off`, or `Auto` on a checkpoint without an MTP head) decodes through
+the same engine with no proposer — `decode::generate_step` is that engine with `K = 0`, the seam's
+one token-at-a-time loop — on the static KV cache, the checkpoint ring and the CUDA-graph runner
+(sc-24140); with no drafts the engine draws each token through `sample`, so a temperature / top-p
+request stays on the device sampler. The reference `Decode` loop is unchanged and stays the parity
+oracle, selectable with `LlamaProvider::set_decode_path(DecodePath::Reference)`.
+
+Every other decoder reaches the same machinery through the same two seams (sc-24138): `CausalLm`
+(the whole llama family — Llama, Qwen3 dense, Gemma 2/4, GLM-4, DeepSeek-V2 MLA, Qwen3-VL's
+decoder), `StarCoder2` (StarVector-8B) and the StarVector-1B GPTBigCode decoder implement
+`StepModel` over the one shared `primitives::StepKvCache` — static (per-layer preallocated
+`StaticKvCache`, the default), growing (the reference concat) or paged (kept behind the seam for
+continuous batching). No decoder keeps a private cache or decode loop: LLaVA and both StarVector
+providers prefill their conditioning into the step cache and decode through the engine
+(`decode::generate_step_from_prefill`). The provider decodes a llama-family request (text, and the
+Gemma 4 soft-token splice) through the unified engine on the static KV cache, priced in admission
+by the widest layer's KV geometry (plus, with the CUDA-graph runner on, its graph workspace);
+`LlamaProvider::set_decode_path(DecodePath::Reference)` — one selector for both families — keeps
+the `Decode` loop selectable as the oracle. `CausalLm` and `StarCoder2` attend
+un-expanded (`AttnFormulation::Gqa`, `sdpa_gqa_causal`) by default on every path, so the
+reference loop and the static cache are one arithmetic and token-identical by construction;
+`set_attn_formulation(AttnFormulation::Expanded)` selects the pre-migration `repeat_kv` arithmetic
+as a labelled comparison. As at S4 (sc-24132), the default reference's numerics moved from the
+expanded arithmetic's by at most one bf16 ULP at attention-GEMM knife-edges (on Qwen3-8B the two
+reference loops first differ at token index 65 of 256). `tests/step_seam_migration.rs` holds every
+decoder to goldens captured on the pre-migration tree (`tests/goldens/sc24138/`) with `Expanded`
+selected — logits bit for bit in the configuration they were measured on (Windows x86_64 MSVC),
+tokens exactly and logits within 1e-4 elsewhere.
 
 The `vlm` test covers the **vision-language path** (`LlavaModel` + `LlavaProvider`): a SigLIP vision
 tower ([`SiglipVisionTower`]) encodes the image, a two-layer GELU MLP projector lifts a chosen

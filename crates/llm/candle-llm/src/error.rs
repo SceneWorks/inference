@@ -31,10 +31,37 @@ pub enum Error {
     #[error("unsupported: {0}")]
     Unsupported(String),
 
+    /// A requested hardware capability is unavailable on the load device — kept typed so the
+    /// refusal carries *which* capability and why (sc-24135: NVFP4 below sm_120 or on CPU). Maps to
+    /// the contract's `Unsupported`, never to a silent fallback.
+    #[error("unsupported: {0}")]
+    Nvfp4Refused(#[from] candle_quant_kernels::Nvfp4Refusal),
+
     /// Generation was cancelled before it could run. Kept typed so the conformance suite and any
     /// consumer can tell cancellation apart from a real error.
     #[error("cancelled")]
     Canceled,
+
+    /// A cache was asked to roll back to position `n` but holds no checkpoint there (a recurrent
+    /// state cannot be inverted, so it refuses rather than approximate). `have` lists the positions
+    /// it could return to besides `0` and its current length. Typed so a speculative engine can
+    /// tell "no checkpoint" apart from a real failure and fall back (e.g. restore a clone).
+    #[error(
+        "no checkpoint at position {n} (have {have:?}); the recurrent state cannot be rolled back \
+         without one"
+    )]
+    RollbackUnavailable { n: i32, have: Vec<i32> },
+
+    /// A preallocated (static) KV cache was asked for more positions than it can hold — either at
+    /// construction (`requested` capacity past the model's `max_position_embeddings`, reported as
+    /// `capacity`) or at a step (`requested` = the position the step would end at, past the
+    /// buffer's `capacity`). Raised **before** any device write, so the cache is untouched and the
+    /// request fails closed instead of tripping an allocator OOM mid-decode (E6). Typed so admission
+    /// and the decode drivers can tell a capacity bound from a real failure.
+    #[error(
+        "static KV cache capacity exceeded: {requested} positions requested, capacity {capacity}"
+    )]
+    KvCapacityExceeded { requested: usize, capacity: usize },
 
     /// Anything else, with a human-readable message.
     #[error("{0}")]

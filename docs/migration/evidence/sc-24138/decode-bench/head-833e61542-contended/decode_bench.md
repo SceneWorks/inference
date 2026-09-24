@@ -1,0 +1,11 @@
+**RTX Pro 6000 / sm_120** — Qwen/Qwen3-8B @ b968826d9c46 (`qwen3-8b`, config sha256 f7c4eadfbbf5), BF16 greedy, 53 prompt tokens, 256 new tokens per row.
+
+| run | row | tokens | match ref | match baseline ref | tok/s | acceptance | fwd/tok | syncs/tok | syncs/verify | device used @ last token | cache live | cache checkpoints | fused primitives |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| head-833e61542 | MTP off (reference, growing kv, expanded attn) | 256 | (ref) | yes | 17.94 | n/a | 1.000 | 1.00 | n/a | 17.13 GiB | n/a | n/a | on: 46336 fused / 0 ref |
+| head-833e61542 | MTP off (StepModel, static kv, gqa attn) | 256 | no @65 | no @65 | 38.98 | n/a | 1.000 | 1.00 | 1.00 | 17.09 GiB | 43.5 MiB | 0.0 MiB | on: 46336 fused / 0 ref |
+| head-833e61542 | n-gram K=2 (static kv, gqa attn) | 256 | no @132 | no @132 | 20.26 | 0.147 | 0.875 | 0.88 | 1.00 | 17.09 GiB | 43.7 MiB | 0.0 MiB | on: 40544 fused / 0 ref |
+| head-833e61542 | n-gram K=3 (static kv, gqa attn) | 256 | no @51 | no @51 | 20.16 | 0.087 | 0.887 | 0.89 | 1.00 | 17.09 GiB | 43.9 MiB | 0.0 MiB | on: 41087 fused / 0 ref |
+| head-833e61542 | n-gram K=4 (static kv, gqa attn) | 256 | no @65 | no @65 | 22.13 | 0.076 | 0.875 | 0.88 | 1.00 | 17.09 GiB | 44.0 MiB | 0.0 MiB | on: 40544 fused / 0 ref |
+
+match baseline ref = tokens identical to `head-833e61542`'s reference row; device used @ last token = cuMemGetInfo total-free sampled at the row's last generated token while its cache is alive (device-wide, weights included); cache live / checkpoints = the StepModel row's final cache's own accounting (rollback checkpoints separately); syncs/tok = device->host transfers issued by candle-llm per generated token (n/a where the binary predates the counter); syncs/verify = the speculative engine's transfers per verify step (n/a for non-speculative rows and where the binary predates the engine); fwd/tok = measured target forwards per generated token (n/a where the binary predates the counter); fused primitives = the switch the row ran under and how many RMSNorm / SwiGLU / QK-norm+RoPE leaves ran the fused kernel vs the op-chain reference, with the last reference reason (n/a where the binary predates the fused primitives).

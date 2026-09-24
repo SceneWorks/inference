@@ -3,6 +3,13 @@
 //! [`generate`] is the model-agnostic decode loop; [`Decode`] is the seam any model implements to be
 //! driven by it. [`StreamEvent`]s are emitted per token through a callback. The Candle port of
 //! `mlx-llm`'s `decode` module.
+//!
+//! The Blackwell fast-decode epic (sc-24128) adds a second, narrower seam beside it:
+//! [`StepModel`] (one N-token step against a [`DecodeCache`](crate::primitives::DecodeCache)),
+//! driven by [`generate_step`], and the measured per-request [`DecodeRecord`] every path reports.
+//! The `Decode` loop stays as the parity oracle; the record's [`DecodePath`] says which one ran.
+//! Speculation over that seam is the one [`engine`] loop ([`generate_speculative`]) with a
+//! [`Proposer`] — MTP, n-gram or a draft model ([`proposers`]) — behind it (story sc-24130).
 
 use core_llm::schedule::{Scheduler, SeqId};
 use core_llm::FinishReason as CoreFinish;
@@ -12,22 +19,36 @@ use self::stream::{FinishReason as StreamFinishReason, StreamEvent as DecodeEven
 pub mod batch;
 pub mod cancel;
 pub mod continuous;
+pub mod engine;
+pub mod graph;
 pub mod prefix;
-pub mod qwen_mtp;
+pub mod proposers;
+pub mod record;
 pub mod speculative;
+pub mod step;
 pub mod stream;
 
 pub use batch::{generate_batch, BatchRequest};
 pub use cancel::CancelFlag;
 pub use continuous::{generate_continuous, BatchExactness, ContinuousConfig};
-pub use prefix::{generate_cached, PrefixCache, PrefixStats};
-pub use qwen_mtp::{
-    generate_qwen35_mtp, generate_qwen35_mtp_multimodal, generate_qwen35_mtp_multimodal_with_stop,
-    generate_qwen35_mtp_timed, generate_qwen35_mtp_timed_with_stop, Qwen35MtpMultimodalPrompt,
-    RewindableConstraintMask,
+pub use engine::{
+    generate_speculative, generate_speculative_with, DraftSample, DraftSampler, Drafts, NoProposer,
+    Proposal, ProposeContext, Proposer, RewindableConstraintMask, SpeculativePrompt,
+    SpeculativeRun,
 };
-pub use speculative::{
-    generate_draft_speculative, generate_prompt_lookup, SpeculativeConfig, SpeculativeStats,
+pub use graph::{
+    cuda_graphs_enabled, cuda_graphs_scope, graph_tally, graph_workspace_admission_bytes,
+    set_cuda_graphs, CudaGraphsScope, GraphRunner, GraphTally, GraphWorkspace, CUDA_GRAPHS_ENV,
+};
+pub use prefix::{generate_cached, PrefixCache, PrefixStats};
+pub use proposers::{DraftModelProposer, MtpProposer, NgramProposer};
+pub use record::{
+    CountingDecode, DecodePath, DecodeRecord, RequestSpan, SamplerTelemetry, SpanCounters,
+};
+pub use speculative::SpeculativeStats;
+pub use step::{
+    generate_step, generate_step_from_prefill, generate_step_timed, LogitsScope, StepModel,
+    StepOutput, StepRequest, StepTokens,
 };
 pub use stream::{
     generate, generate_from_prefill, generate_from_prefill_with_stop, generate_with,

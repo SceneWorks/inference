@@ -658,20 +658,22 @@ mod cuda {
     use candle_core::cuda_backend::WrapErr;
     use candle_core::{CpuStorage, CudaStorage, CustomOp2, CustomOp3, Layout, Shape};
 
-    const SOURCE: &str = include_str!("prism_cuda.cu");
-    const MODULE: &str = "candle_llm_prism_packed_v1";
-    static PTX: std::sync::OnceLock<std::result::Result<String, String>> =
-        std::sync::OnceLock::new();
+    /// The Prism packed-operator kernels, compiled through the shared nvrtc compile-once seam
+    /// (sc-24137 / sc-23990): once per device, failure cached, no build.rs.
+    const PRISM_SRC: candle_quant_kernels::KernelSource = candle_quant_kernels::KernelSource {
+        name: "candle_llm_prism_packed_v1",
+        src: include_str!("prism_cuda.cu"),
+        cc_floor: (7, 0),
+    };
 
-    fn ptx() -> candle_core::Result<&'static str> {
-        match PTX.get_or_init(|| {
-            candle_core::cuda_backend::cudarc::nvrtc::compile_ptx(SOURCE)
-                .map(|ptx| ptx.to_src())
-                .map_err(|e| format!("Prism CUDA nvrtc compile failed: {e}"))
-        }) {
-            Ok(ptx) => Ok(ptx),
-            Err(error) => candle_core::bail!("{error}"),
-        }
+    fn function(
+        dev: &candle_core::CudaDevice,
+        name: &str,
+    ) -> candle_core::Result<candle_core::cuda_backend::cudarc::driver::CudaFunction> {
+        PRISM_SRC
+            .compiled(dev)
+            .and_then(|kernel| kernel.function(name))
+            .map_err(|e| candle_core::Error::Msg(format!("Prism CUDA kernel: {e}")))
     }
 
     fn map_args(map: Option<GdnRowMap>) -> (u32, u32, u32, u32) {
@@ -724,8 +726,7 @@ mod cuda {
             let words = contiguous_cuda::<u32>(sw, lw)?;
             let scales = contiguous_cuda::<f32>(ss, ls)?;
             let mut output = unsafe { dev.alloc::<f32>(self.tokens * self.rows) }?;
-            let function =
-                dev.get_or_load_custom_func("prism_mlx_affine2_matmul_f32", MODULE, ptx()?)?;
+            let function = function(&dev, "prism_mlx_affine2_matmul_f32")?;
             let (prefix, groups, repetitions, unit) = map_args(self.map);
             let (tokens, rows, width) = (self.tokens as u32, self.rows as u32, self.width as u32);
             let config = LaunchConfig {
@@ -733,7 +734,8 @@ mod cuda {
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
             };
-            let mut builder = function.builder();
+            let stream = dev.cuda_stream();
+            let mut builder = stream.launch_builder(&function);
             builder.arg(&x).arg(&words).arg(&scales).arg(&mut output);
             builder
                 .arg(&tokens)
@@ -789,7 +791,7 @@ mod cuda {
                 PrismPackedKind::Pq2_0 => "prism_pq2_matmul_f32",
                 PrismPackedKind::Ptq1_0 => "prism_ptq_matmul_f32",
             };
-            let function = dev.get_or_load_custom_func(kernel, MODULE, ptx()?)?;
+            let function = function(&dev, kernel)?;
             let (prefix, groups, repetitions, unit) = map_args(self.map);
             let (tokens, rows, width) = (self.tokens as u32, self.rows as u32, self.width as u32);
             let config = LaunchConfig {
@@ -797,7 +799,8 @@ mod cuda {
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
             };
-            let mut builder = function.builder();
+            let stream = dev.cuda_stream();
+            let mut builder = stream.launch_builder(&function);
             builder.arg(&x).arg(&packed).arg(&mut output);
             builder
                 .arg(&tokens)
@@ -945,10 +948,11 @@ mod cuda {
         width: usize,
     ) -> candle_core::Result<(CudaStorage, Shape)> {
         let mut output = unsafe { dev.alloc::<f32>(count * width) }?;
-        let function = dev.get_or_load_custom_func(kernel, MODULE, ptx()?)?;
+        let function = function(dev, kernel)?;
         let (count_u, rows_u, width_u) = (count as u32, rows as u32, width as u32);
         let config = LaunchConfig::for_num_elems((count * width) as u32);
-        let mut builder = function.builder();
+        let stream = dev.cuda_stream();
+        let mut builder = stream.launch_builder(&function);
         builder.arg(ids);
         match packed {
             EmbeddingPacked::Mlx(words, scales) => {
@@ -1430,7 +1434,8 @@ mod tests {
             }
         }
 
-        let device = Device::new_cuda(0).expect("CUDA is required for the Prism NVRTC fixture");
+        let device = crate::device::new_cuda_for_test()
+            .expect("CUDA is required for the Prism NVRTC fixture");
         let rows = 4usize;
         let width = 128usize;
         let signs = (0..width)

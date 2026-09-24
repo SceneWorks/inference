@@ -33,6 +33,21 @@ profiles = ["llm-macos", "llm-cuda"]
 environment = ["MLX_LLM_QWEN3_MODEL", "CANDLE_LLM_QWEN3_MODEL"]
 expected_files = ["config.json", "tokenizer.json", "model.safetensors"]
 
+# Epic sc-24128 (story sc-24138): the llama-family decode_bench model — the Qwen3 dense
+# architecture the step-seam migration moved onto the shared fast-decode path. Operator-run on the
+# authoritative RTX Pro 6000 host through scripts/release/decode_bench.py, which also pins its
+# config.json sha256; no CI lane dispatches it.
+[[models]]
+key = "qwen3-8b"
+repository = "Qwen/Qwen3-8B"
+revision = "b968826d9c46dd6066d109eabc6255188de91218"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["decode-bench"]
+environment = ["QWEN3_8B_SNAPSHOT"]
+unwired_reason = "operator-run decode_bench (scripts/release/decode_bench.py) for epic sc-24128 on the authoritative RTX Pro 6000 host; deliberately outside CI (sc-24138)"
+expected_files = ["config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json", "model.safetensors.index.json", "model-00001-of-00005.safetensors", "model-00002-of-00005.safetensors", "model-00003-of-00005.safetensors", "model-00004-of-00005.safetensors", "model-00005-of-00005.safetensors"]
+
 # SC-22261 terminal-only native StarVector campaign. These rows intentionally do not ride the
 # scheduled/all LLM sweep: the single campaign must serialize its MLX and authoritative CUDA
 # measurements and bind both implementations to the same immutable SVG-Bench receipt.

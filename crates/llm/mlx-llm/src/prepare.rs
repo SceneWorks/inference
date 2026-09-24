@@ -14,10 +14,16 @@ fn backend() -> &'static str {
     "mlx"
 }
 
-fn to_quant_spec(q: Quantize) -> QuantSpec {
+fn to_quant_spec(q: Quantize) -> CoreResult<QuantSpec> {
     match q {
-        Quantize::Q4 => QuantSpec::q4(),
-        Quantize::Q8 => QuantSpec::q8(),
+        Quantize::Q4 => Ok(QuantSpec::q4()),
+        Quantize::Q8 => Ok(QuantSpec::q8()),
+        // NVFP4 is a load-time CUDA capability (sc-24135), never a persisted snapshot format.
+        Quantize::Nvfp4 => Err(CoreError::Unsupported(
+            "nvfp4: NVFP4 is a load-time format for CUDA sm_120 and is never persisted by \
+             snapshot preparation; the MLX backend has no NVFP4 GEMM"
+                .into(),
+        )),
     }
 }
 
@@ -41,7 +47,7 @@ pub fn can_prepare(spec: &PrepareSpec) -> bool {
 
 pub fn prepare(spec: &PrepareSpec) -> CoreResult<PrepareReport> {
     let format = detect_format(&spec.source)?;
-    let quant = spec.quantize.map(to_quant_spec);
+    let quant = spec.quantize.map(to_quant_spec).transpose()?;
 
     match format {
         ModelFormat::Gguf => {

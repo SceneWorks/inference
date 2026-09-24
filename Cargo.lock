@@ -441,6 +441,7 @@ version = "0.0.0"
 dependencies = [
  "candle-core",
  "candle-nn",
+ "candle-quant-kernels",
  "float8",
  "fs2",
  "half",
@@ -1031,12 +1032,15 @@ dependencies = [
  "candle-core",
  "candle-flash-attn",
  "candle-nn",
+ "candle-quant-kernels",
  "core-llm",
  "core-llm-testkit",
  "half",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -1068,6 +1072,16 @@ dependencies = [
  "safetensors 0.7.0",
  "serde",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "candle-quant-kernels"
+version = "0.0.0"
+dependencies = [
+ "candle-core",
+ "candle-nn",
+ "float8",
+ "half",
 ]
 
 [[package]]
@@ -3356,6 +3370,7 @@ dependencies = [
  "candle-gen-catalog",
  "candle-llm",
  "runtime-catalog",
+ "tempfile",
 ]
 
 [[package]]

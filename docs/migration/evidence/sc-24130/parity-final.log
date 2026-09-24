@@ -1,0 +1,66 @@
+# speculative_engine_parity at the PR's code sha 51621c288 (release, --features cuda, CUDA_COMPUTE_CAP=120), GPU 0, RTX Pro 6000 / sm_120, no co-tenant
+# one invocation: speculative_engine_parity --ignored --skip op_isolation_survey --nocapture --test-threads=1
+# (the 3 filtered out: op_isolation_survey_which_primitive_depends_on_the_row_count and the two common::fixture_* tests)
+
+running 2 tests
+test ac1_ac2_engine_greedy_fixture_rows_against_speculative_off ... [ac1] reference knife-edge positions (top-2 gap <= 1 bf16 ULP of the top logit): [(51, 0.125, 0.125), (74, 0.125, 0.125), (99, 0.125, 0.125), (102, 0.125, 0.125), (103, 0.125, 0.125), (106, 0.0, 0.125), (107, 0.0, 0.125), (124, 0.0, 0.125), (125, 0.125, 0.125), (154, 0.125, 0.125), (161, 0.125, 0.125), (177, 0.125, 0.125), (186, 0.125, 0.125), (202, 0.125, 0.125), (243, 0.0, 0.125)]
+[ac1] mtp K=1: tokens 256 divergence Some(124) acceptance 0.827 fwd/tok 0.645 syncs/verify Some(1.0) syncs/tok 0.55 kv static attn gqa proposer mtp verify_steps 140
+[ac1] mtp K=2: tokens 256 divergence Some(125) acceptance 0.668 fwd/tok 0.613 syncs/verify Some(1.0) syncs/tok 0.43 kv static attn gqa proposer mtp verify_steps 110
+[ac1] mtp K=3: tokens 256 divergence Some(186) acceptance 0.640 fwd/tok 0.535 syncs/verify Some(1.0) syncs/tok 0.35 kv static attn gqa proposer mtp verify_steps 88
+[ac1] mtp K=4: tokens 256 divergence Some(124) acceptance 0.549 fwd/tok 0.535 syncs/verify Some(1.0) syncs/tok 0.32 kv static attn gqa proposer mtp verify_steps 81
+[ac1] mtp K=5: tokens 256 divergence Some(124) acceptance 0.480 fwd/tok 0.547 syncs/verify Some(1.0) syncs/tok 0.30 kv static attn gqa proposer mtp verify_steps 76
+[ac1] ngram K=3: tokens 256 divergence Some(186) acceptance 0.167 proposed 288 fwd/tok 1.145 syncs/verify Some(1.0) kv static proposer ngram
+[ac1] mtp K=1: first divergence at 124: reference top-2 gap 0 = 0.0 bf16 ULP of its top logit
+[ac1] mtp K=2: first divergence at 125: reference top-2 gap 0.125 = 1.0 bf16 ULP of its top logit
+[ac1] mtp K=3: first divergence at 186: reference top-2 gap 0.125 = 1.0 bf16 ULP of its top logit
+[ac1] mtp K=4: first divergence at 124: reference top-2 gap 0 = 0.0 bf16 ULP of its top logit
+[ac1] mtp K=5: first divergence at 124: reference top-2 gap 0 = 0.0 bf16 ULP of its top logit
+[ac1] ngram K=3: first divergence at 186: reference top-2 gap 0.125 = 1.0 bf16 ULP of its top logit
+[ac1] 0 of 6 rows token-identical over 256 tokens; every divergence is a reference knife-edge position: [("mtp K=1", Some(124)), ("mtp K=2", Some(125)), ("mtp K=3", Some(186)), ("mtp K=4", Some(124)), ("mtp K=5", Some(124)), ("ngram K=3", Some(186))]
+ok
+test teacher_forced_verify_shaped_forward_vs_single_token_knife_edge_gate ... [teacher-forced] reference knife-edge positions (top-2 gap <= 1 bf16 ULP): [(51, 0.125, 0.125), (74, 0.125, 0.125), (99, 0.125, 0.125), (102, 0.125, 0.125), (103, 0.125, 0.125), (106, 0.0, 0.125), (107, 0.0, 0.125), (124, 0.0, 0.125), (125, 0.125, 0.125), (154, 0.125, 0.125), (161, 0.125, 0.125), (177, 0.125, 0.125), (186, 0.125, 0.125), (202, 0.125, 0.125), (243, 0.0, 0.125)]
+[teacher-forced] M=2: argmax disagreements 4 over 509 (position, row) pairs
+[teacher-forced] M=2: position 74 (verify row 1): single-token argmax 17120, verify-shaped argmax 41163, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=2: position 74 (verify row 0): single-token argmax 17120, verify-shaped argmax 41163, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=2: position 106 (verify row 1): single-token argmax 369, verify-shaped argmax 883, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=2: position 154 (verify row 0): single-token argmax 303, verify-shaped argmax 264, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=3: argmax disagreements 9 over 762 (position, row) pairs
+[teacher-forced] M=3: position 106 (verify row 1): single-token argmax 369, verify-shaped argmax 883, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=3: position 106 (verify row 0): single-token argmax 369, verify-shaped argmax 883, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=3: position 107 (verify row 1): single-token argmax 6355, verify-shaped argmax 883, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=3: position 125 (verify row 1): single-token argmax 61446, verify-shaped argmax 15156, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=3: position 154 (verify row 2): single-token argmax 303, verify-shaped argmax 264, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=3: position 154 (verify row 0): single-token argmax 303, verify-shaped argmax 264, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=3: position 177 (verify row 1): single-token argmax 18082, verify-shaped argmax 15796, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=3: position 186 (verify row 2): single-token argmax 357, verify-shaped argmax 1049, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=3: position 186 (verify row 1): single-token argmax 357, verify-shaped argmax 1049, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=4: argmax disagreements 4 over 1014 (position, row) pairs
+[teacher-forced] M=4: position 106 (verify row 2): single-token argmax 369, verify-shaped argmax 883, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=4: position 106 (verify row 0): single-token argmax 369, verify-shaped argmax 883, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=4: position 154 (verify row 1): single-token argmax 303, verify-shaped argmax 264, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=4: position 186 (verify row 2): single-token argmax 357, verify-shaped argmax 1049, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=5: argmax disagreements 10 over 1265 (position, row) pairs
+[teacher-forced] M=5: position 74 (verify row 3): single-token argmax 17120, verify-shaped argmax 41163, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=5: position 106 (verify row 3): single-token argmax 369, verify-shaped argmax 883, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=5: position 106 (verify row 0): single-token argmax 369, verify-shaped argmax 883, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=5: position 124 (verify row 4): single-token argmax 694, verify-shaped argmax 13, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=5: position 125 (verify row 4): single-token argmax 61446, verify-shaped argmax 15156, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=5: position 124 (verify row 1): single-token argmax 694, verify-shaped argmax 13, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=5: position 125 (verify row 0): single-token argmax 61446, verify-shaped argmax 15156, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=5: position 161 (verify row 3): single-token argmax 33625, verify-shaped argmax 264, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=5: position 177 (verify row 2): single-token argmax 18082, verify-shaped argmax 15796, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=5: position 186 (verify row 3): single-token argmax 357, verify-shaped argmax 1049, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=6: argmax disagreements 7 over 1515 (position, row) pairs
+[teacher-forced] M=6: position 106 (verify row 3): single-token argmax 369, verify-shaped argmax 883, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=6: position 106 (verify row 1): single-token argmax 369, verify-shaped argmax 883, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=6: position 124 (verify row 4): single-token argmax 694, verify-shaped argmax 13, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=6: position 125 (verify row 3): single-token argmax 61446, verify-shaped argmax 15156, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=6: position 124 (verify row 1): single-token argmax 694, verify-shaped argmax 13, reference top-2 gap 0 = 0.0 bf16 ULP, knife-edge true
+[teacher-forced] M=6: position 154 (verify row 5): single-token argmax 303, verify-shaped argmax 264, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] M=6: position 186 (verify row 2): single-token argmax 357, verify-shaped argmax 1049, reference top-2 gap 0.125 = 1.0 bf16 ULP, knife-edge true
+[teacher-forced] largest reference top-2 gap at any flipped position: 1.0 bf16 ULP
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 440.21s
+
+# exit code 0

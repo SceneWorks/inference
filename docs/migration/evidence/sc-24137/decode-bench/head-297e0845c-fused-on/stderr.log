@@ -1,0 +1,7 @@
+[decode_bench] reference          14.17 tok/s  prefill 0.792s  fused {"switch":"on","fused":69888,"reference":0,"reference_reason":null,"path":"fused"}
+[decode_bench] reference_unfused  10.79 tok/s  prefill 0.877s  fused {"switch":"off","fused":0,"reference":69888,"reference_reason":"disabled","path":"reference"}
+[decode_bench] step_model         13.76 tok/s  prefill 0.845s
+[decode_bench] mtp K=1            15.89 tok/s  accept 0.827  fwd/tok 0.645
+[decode_bench] mtp K=2            18.95 tok/s  accept 0.779  fwd/tok 0.512
+[decode_bench] mtp K=3            16.86 tok/s  accept 0.607  fwd/tok 0.559
+[decode_bench] wrote D:\repos\inference\.claude\worktrees\sc-24137\docs\migration\evidence\sc-24137\decode-bench\head-297e0845c-fused-on\decode_bench.json

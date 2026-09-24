@@ -1,10 +1,17 @@
 //! Native StarVector-1B tensor modules.
+//!
+//! The GPTBigCode decoder implements the step seam (story sc-24138): its multi-query K/V live in
+//! the shared [`StepKvCache`] (one K/V head per layer) rather than inside the decoder, so the
+//! forward is `&self` and a request's cache is the request's own.
 
-use candle_core::{DType, Tensor};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::ops::softmax_last_dim;
 
+use crate::decode::step::{LogitsScope, StepModel, StepOutput, StepRequest};
 use crate::error::{Error, Result};
+use crate::primitives::kv_cache::{KvCache, KvCacheKind};
 use crate::primitives::nn::{conv2d, gelu, layer_norm, linear};
+use crate::primitives::step_kv_cache::{KvLayout, LayerKvShape, StepKvCache};
 use crate::primitives::Weights;
 
 const CLIP_WIDTH: usize = 1024;
@@ -203,8 +210,8 @@ impl StarVectorAdapter {
 
 /// GPTBigCode decoder for the checkpoint's `inputs_embeds` StarVector prefill.
 ///
-/// It intentionally owns a per-layer MQA cache, so a provider serializes one generation at a time
-/// behind a mutex and can reset it on cancellation/unload.
+/// Stateless: the per-layer multi-query K/V are the caller's [`KvCache`] — a [`StepKvCache`]
+/// through the step seam ([`StepModel`]) — so concurrent requests never share decoder state.
 pub struct StarVectorDecoder {
     wte: Tensor,
     wpe: Tensor,
@@ -212,6 +219,37 @@ pub struct StarVectorDecoder {
     lnw: Tensor,
     lnb: Tensor,
     head: Tensor,
+    geometry: StarVectorDecoderGeometry,
+    /// Which KV cache [`StepModel::new_cache_for`] builds (static by default).
+    step_kv_cache: KvCacheKind,
+}
+
+/// The GPTBigCode decoder's geometry. The shipped provider only ever loads
+/// [`StarVectorDecoderGeometry::STARVECTOR_1B`]; the knob exists so the tiny-config parity tests
+/// (sc-24138) can build the identical decoder at a CPU-sized width without a second code path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StarVectorDecoderGeometry {
+    /// Residual width (`n_embd`).
+    pub hidden: usize,
+    /// Query heads; the single shared (multi-query) K/V head has the same `head_dim`.
+    pub heads: usize,
+    /// Per-head width.
+    pub head_dim: usize,
+    /// Decoder blocks.
+    pub layers: usize,
+    /// Learned absolute positions (`n_positions`) — the context bound.
+    pub max_positions: usize,
+}
+
+impl StarVectorDecoderGeometry {
+    /// The published StarVector-1B (StarCoderBase-1B) decoder.
+    pub const STARVECTOR_1B: Self = Self {
+        hidden: STARVECTOR_HIDDEN,
+        heads: 16,
+        head_dim: 128,
+        layers: 24,
+        max_positions: 8192,
+    };
 }
 struct BigCodeBlock {
     ln1w: Tensor,
@@ -226,7 +264,6 @@ struct BigCodeBlock {
     fcb: Tensor,
     projw: Tensor,
     projb: Tensor,
-    cache: Option<Tensor>,
 }
 impl BigCodeBlock {
     fn load(w: &Weights, p: &str) -> Result<Self> {
@@ -243,25 +280,32 @@ impl BigCodeBlock {
             fcb: tensor(w, p, "mlp.c_fc.bias")?,
             projw: decoder_projection(w, p, "mlp.c_proj.weight")?,
             projb: tensor(w, p, "mlp.c_proj.bias")?,
-            cache: None,
         })
     }
-    fn reset(&mut self) {
-        self.cache = None;
-    }
-    fn forward(&mut self, input: &Tensor, past: usize) -> Result<Tensor> {
+    /// One block over `input` `[b, s, hidden]` at position `past`, appending this step's shared
+    /// K/V (`[b, 1, s, head_dim]` each) to `cache` layer `layer`.
+    fn forward(
+        &self,
+        input: &Tensor,
+        past: usize,
+        geometry: StarVectorDecoderGeometry,
+        cache: &mut dyn KvCache,
+        layer: usize,
+    ) -> Result<Tensor> {
         let h = layer_norm(input, &self.ln1w, &self.ln1b, 1e-5)?;
         let qkv = linear(&h, &self.qkvw, Some(&self.qkvb))?;
         let (b, s, _) = qkv.dims3()?;
-        let q = qkv
-            .narrow(2, 0, STARVECTOR_HIDDEN)?
-            .reshape((b, s, 16, 128))?;
-        let mut kv = qkv.narrow(2, STARVECTOR_HIDDEN, 256)?;
-        if let Some(old) = &self.cache {
-            kv = Tensor::cat(&[old, &kv], 1)?;
-        }
-        self.cache = Some(kv.clone());
-        let attn = multi_query_attention(&q, &kv, past)?;
+        let q = qkv.narrow(2, 0, geometry.hidden)?.reshape((
+            b,
+            s,
+            geometry.heads,
+            geometry.head_dim,
+        ))?;
+        let head = geometry.head_dim;
+        let k = qkv.narrow(2, geometry.hidden, head)?.contiguous()?;
+        let v = qkv.narrow(2, geometry.hidden + head, head)?.contiguous()?;
+        let (keys, values) = cache.update(layer, &k.unsqueeze(1)?, &v.unsqueeze(1)?)?;
+        let attn = multi_query_attention_split(&q, &keys.squeeze(1)?, &values.squeeze(1)?, past)?;
         let residual = (input + linear(&attn, &self.outw, Some(&self.outb))?)?;
         let mlp = gelu(&linear(
             &layer_norm(&residual, &self.ln2w, &self.ln2b, 1e-5)?,
@@ -272,14 +316,38 @@ impl BigCodeBlock {
     }
 }
 
+/// The pre-migration packed-cache form (`kv` `[b, total, 2·head]`, K then V), kept for the
+/// shape-contract tests: split and attend.
+#[cfg(test)]
 fn multi_query_attention(q: &Tensor, kv: &Tensor, past: usize) -> Result<Tensor> {
-    let (b, s, heads, head) = q.dims4()?;
+    let (b, s, _heads, head) = q.dims4()?;
     let (kv_batch, total, kv_width) = kv.dims3()?;
     if kv_batch != b || total != past + s || kv_width != head * 2 {
         return Err(Error::Msg(format!(
             "starvector MQA shape mismatch: query={:?}, kv={:?}, past={past}",
             q.dims(),
             kv.dims()
+        )));
+    }
+    multi_query_attention_split(q, &kv.narrow(2, 0, head)?, &kv.narrow(2, head, head)?, past)
+}
+
+/// GPTBigCode multi-query attention of `q` `[b, s, heads, head]` over the shared `keys` / `values`
+/// `[b, total, head]` (`total = past + s`), bottom-right causal.
+fn multi_query_attention_split(
+    q: &Tensor,
+    keys: &Tensor,
+    values: &Tensor,
+    past: usize,
+) -> Result<Tensor> {
+    let (b, s, heads, head) = q.dims4()?;
+    let (kv_batch, total, kv_width) = keys.dims3()?;
+    if kv_batch != b || total != past + s || kv_width != head || values.dims() != keys.dims() {
+        return Err(Error::Msg(format!(
+            "starvector MQA shape mismatch: query={:?}, keys={:?}, values={:?}, past={past}",
+            q.dims(),
+            keys.dims(),
+            values.dims()
         )));
     }
 
@@ -291,10 +359,10 @@ fn multi_query_attention(q: &Tensor, kv: &Tensor, past: usize) -> Result<Tensor>
         .transpose(1, 2)?
         .contiguous()?
         .reshape((b, heads * s, head))?;
-    let keys = kv.narrow(2, 0, head)?.transpose(1, 2)?;
-    // The V half has a `2 * head` row stride after `narrow`; CUDA GEMM only accepts a dense
-    // minor matrix, so materialize this view just as we do for the transposed K half.
-    let values = kv.narrow(2, head, head)?.contiguous()?;
+    let keys = keys.transpose(1, 2)?;
+    // A cache view may be strided (a static buffer's bounded view); CUDA GEMM only accepts a
+    // dense minor matrix, so materialize it just as we do for the transposed keys.
+    let values = values.contiguous()?;
     let scores = (query.matmul(&keys.contiguous()?)? * (head as f64).powf(-0.5))?
         .reshape((b, heads, s, total))?;
     let mut allow = vec![0u8; s * total];
@@ -332,30 +400,50 @@ fn tied_token_embedding(w: &Weights, prefix: &str) -> Result<(Tensor, Tensor)> {
 
 impl StarVectorDecoder {
     pub fn from_weights(w: &Weights) -> Result<Self> {
+        Self::from_weights_with_geometry(w, StarVectorDecoderGeometry::STARVECTOR_1B)
+    }
+
+    /// [`from_weights`](Self::from_weights) at an explicit geometry (the tiny-config parity
+    /// fixtures; the provider always loads [`StarVectorDecoderGeometry::STARVECTOR_1B`]).
+    pub fn from_weights_with_geometry(
+        w: &Weights,
+        geometry: StarVectorDecoderGeometry,
+    ) -> Result<Self> {
         let p = "model.svg_transformer.transformer.transformer";
         let (wte, head) = tied_token_embedding(w, p)?;
         Ok(Self {
             wte,
             wpe: tensor(w, p, "wpe.weight")?,
-            layers: (0..24)
+            layers: (0..geometry.layers)
                 .map(|i| BigCodeBlock::load(w, &format!("{p}.h.{i}")))
                 .collect::<Result<Vec<_>>>()?,
             lnw: tensor(w, p, "ln_f.weight")?,
             lnb: tensor(w, p, "ln_f.bias")?,
             head,
+            geometry,
+            step_kv_cache: KvCacheKind::Static,
         })
-    }
-    pub fn reset(&mut self) {
-        for layer in &mut self.layers {
-            layer.reset();
-        }
     }
     pub fn embeddings(&self, ids: &Tensor) -> Result<Tensor> {
         crate::primitives::nn::embed(&self.wte, ids)
     }
-    pub fn forward_embeds(&mut self, input: &Tensor, past: usize) -> Result<Tensor> {
+    /// The decoder's geometry.
+    pub fn geometry(&self) -> StarVectorDecoderGeometry {
+        self.geometry
+    }
+    /// Last-position logits `[b, vocab]` over `input` `[b, s, hidden]`, appended to `cache` at its
+    /// current length.
+    pub fn forward_embeds(&self, input: &Tensor, cache: &mut dyn KvCache) -> Result<Tensor> {
+        let out = self.normed_states(input, cache)?;
+        let s = out.dim(1)?;
+        linear(&out.narrow(1, s - 1, 1)?.squeeze(1)?, &self.head, None)
+    }
+    /// The block stack over `input` at `cache`'s length, final-LayerNormed: `[b, s, hidden]`.
+    fn normed_states(&self, input: &Tensor, cache: &mut dyn KvCache) -> Result<Tensor> {
         let (b, s, h) = input.dims3()?;
-        if h != STARVECTOR_HIDDEN || past + s > 8192 {
+        let past = usize::try_from(cache.offset()).unwrap_or(0);
+        let geometry = self.geometry;
+        if h != geometry.hidden || past + s > geometry.max_positions {
             return Err(Error::Msg("starvector decoder context limit".into()));
         }
         let pos = self
@@ -364,16 +452,121 @@ impl StarVectorDecoder {
             .reshape((1, s, h))?
             .broadcast_as((b, s, h))?;
         let mut out = input.broadcast_add(&pos)?;
-        for layer in &mut self.layers {
-            out = layer.forward(&out, past)?;
+        for (index, layer) in self.layers.iter().enumerate() {
+            out = layer.forward(&out, past, geometry, cache, index)?;
         }
-        let out = layer_norm(&out, &self.lnw, &self.lnb, 1e-5)?;
-        linear(&out.narrow(1, s - 1, 1)?.squeeze(1)?, &self.head, None)
+        layer_norm(&out, &self.lnw, &self.lnb, 1e-5)
+    }
+    /// One shared K/V head per layer at `head_dim`, in the stored weights' dtype, on their device.
+    pub fn kv_layout(&self) -> KvLayout {
+        let shape = LayerKvShape {
+            kv_heads: 1,
+            key_dim: self.geometry.head_dim,
+            value_dim: self.geometry.head_dim,
+            device: self.device().clone(),
+        };
+        KvLayout {
+            layers: vec![Some(shape); self.layers.len()],
+            dtype: self.wte.dtype(),
+        }
+    }
+    /// Bytes [`new_static_cache`](Self::new_static_cache) preallocates for `capacity` positions.
+    pub fn static_kv_bytes(&self, capacity: usize) -> usize {
+        self.kv_layout().static_bytes(capacity)
+    }
+    /// A step-seam cache preallocated for `capacity` positions; past the learned positions
+    /// (`max_positions`) is [`Error::KvCapacityExceeded`], before anything is allocated.
+    pub fn new_static_cache(&self, capacity: usize) -> Result<StepKvCache> {
+        if capacity > self.geometry.max_positions {
+            return Err(Error::KvCapacityExceeded {
+                requested: capacity,
+                capacity: self.geometry.max_positions,
+            });
+        }
+        StepKvCache::preallocated(&self.kv_layout(), capacity)
+    }
+    /// A step-seam cache on the growing backing.
+    pub fn new_step_cache(&self) -> StepKvCache {
+        StepKvCache::growing(&self.kv_layout())
+    }
+    /// Select which KV cache [`StepModel::new_cache_for`] builds.
+    pub fn set_step_kv_cache(&mut self, kind: KvCacheKind) {
+        self.step_kv_cache = kind;
     }
 }
 
-/// Loaded native tensor stack.  The provider owns this behind a mutex because decoder KV state is
-/// request-local; [`reset`](Self::reset) is called on every terminal path.
+impl StepModel for StarVectorDecoder {
+    type Cache = StepKvCache;
+
+    fn new_cache(&self) -> StepKvCache {
+        self.new_step_cache()
+    }
+
+    fn new_cache_for(&self, capacity: usize, overshoot: usize) -> Result<StepKvCache> {
+        match self.step_kv_cache {
+            KvCacheKind::Static => self.new_static_cache(capacity.saturating_add(overshoot)),
+            KvCacheKind::Growing => Ok(self.new_step_cache()),
+        }
+    }
+
+    // `attn_formulation` keeps the default `Gqa`: the multi-query fold above attends the one
+    // shared K/V head un-expanded on every backing.
+
+    /// Not replayable as a CUDA graph (story sc-24134): the learned position rows are narrowed
+    /// out of `wpe` at the cache's Rust-side length and the KV lands at that host offset, so a
+    /// graph would replay at the captured position (`positions_host_scalar`).
+    fn graph_support(&self) -> std::result::Result<(), &'static str> {
+        Err("positions_host_scalar")
+    }
+
+    fn device(&self) -> &Device {
+        self.wte.device()
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.wte.dim(0).unwrap_or(0)
+    }
+
+    fn forward_step(
+        &self,
+        cache: &mut StepKvCache,
+        request: StepRequest<'_>,
+    ) -> Result<StepOutput> {
+        if request.is_empty()? {
+            return Err(Error::Msg(
+                "StarVectorDecoder::forward_step: empty token slice".into(),
+            ));
+        }
+        let embeds = self.embeddings(&request.tokens.ids(self.wte.device())?)?;
+        debug_assert_eq!(
+            cache.rope_delta(),
+            0,
+            "learned positions carry no RoPE delta"
+        );
+        let out = self.normed_states(&embeds, cache)?;
+        let logits = match request.scope {
+            LogitsScope::Last => {
+                let s = out.dim(1)?;
+                linear(&out.narrow(1, s - 1, 1)?.squeeze(1)?, &self.head, None)?
+            }
+            // Row-wise through the same 2-D product the last-position path runs, so a one-token
+            // verify step is bit-identical to a plain decode step.
+            LogitsScope::All => {
+                let (b, s, h) = out.dims3()?;
+                let vocab = self.head.dim(0)?;
+                linear(&out.reshape((b * s, h))?, &self.head, None)?.reshape((b, s, vocab))?
+            }
+        };
+        Ok(StepOutput {
+            logits,
+            hidden: request.want_hidden.then_some(out),
+        })
+    }
+}
+
+/// Loaded native tensor stack. The decoder is stateless (each request's K/V live in its own
+/// [`StepKvCache`]); the provider still serializes generations behind a mutex, which bounds the
+/// device memory it holds to one request's activations and cache.
 pub struct StarVectorModel {
     pub vision: StarVectorClip,
     pub adapter: StarVectorAdapter,
@@ -389,9 +582,6 @@ impl StarVectorModel {
     }
     pub fn image_embeddings(&self, pixels: &Tensor) -> Result<Tensor> {
         self.adapter.forward(&self.vision.forward(pixels)?)
-    }
-    pub fn reset(&mut self) {
-        self.decoder.reset();
     }
 }
 

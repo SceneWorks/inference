@@ -258,3 +258,57 @@ fn mla_query_lora_prefills_and_decodes() {
     let model = load_tiny_deepseek("qlora", Some(20));
     run_decode(&model);
 }
+
+/// sc-24138: DeepSeek-V2's materialized MLA caches `qk_nope + qk_rope`-wide keys beside
+/// `v_head_dim`-wide values; the step seam's static cache holds both widths, its preallocation is
+/// exactly the priced bytes, and the static decode is the reference decode token for token.
+#[test]
+fn mla_decodes_through_the_static_step_cache() {
+    use candle_llm::decode::{generate, generate_step, CancelFlag, GenerationConfig, StepModel};
+    use candle_llm::primitives::{DecodeCache, KvCacheKind};
+
+    let model = load_tiny_deepseek("s10", None);
+    let layout = model.kv_layout();
+    let shape = layout.layers[0].as_ref().unwrap();
+    assert_eq!(
+        (shape.kv_heads, shape.key_dim, shape.value_dim),
+        (NUM_HEADS, QK_NOPE + QK_ROPE, V_HEAD)
+    );
+    let prompt = [3, 1, 4, 1, 5, 9];
+    let config = GenerationConfig {
+        max_new_tokens: 10,
+        seed: Some(0),
+        ..Default::default()
+    };
+    let reference = generate(&model, &prompt, &config, &CancelFlag::new(), &mut |_| {})
+        .unwrap()
+        .tokens;
+    let (out, record) = generate_step(
+        &model,
+        &prompt,
+        &config,
+        &CancelFlag::new(),
+        &mut |_| {},
+        None,
+    )
+    .unwrap();
+    assert_eq!(out.tokens, reference);
+    assert_eq!(record.kv_cache, KvCacheKind::Static);
+    let capacity = prompt.len() + 10;
+    let cache = model.new_cache_for(capacity, 0).unwrap();
+    assert_eq!(cache.memory().live_bytes, model.static_kv_bytes(capacity));
+    assert_eq!(
+        model.static_kv_bytes(capacity),
+        2 * capacity * NUM_HEADS * (QK_NOPE + QK_ROPE + V_HEAD) * 4
+    );
+    // sc-24134: the CUDA-graph runner is refused by name before any capture — the MoE router
+    // reads its probabilities on the host, ahead of the family's host-scalar positions.
+    assert_eq!(
+        StepModel::graph_support(&model),
+        Err("moe_router_host_read")
+    );
+    assert_eq!(
+        DecodeCache::graph_support(&cache),
+        Err("positions_host_scalar")
+    );
+}

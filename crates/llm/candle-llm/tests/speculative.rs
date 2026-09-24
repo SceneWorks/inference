@@ -1,4 +1,8 @@
-//! Prompt-lookup speculative-decoding tests (story 7259).
+//! Prompt-lookup and draft-model speculative-decoding tests (stories 7259 / 7260), run through the
+//! **unified engine** over the step seam since the llama family migrated onto it (sc-24138): the
+//! n-gram and draft-model proposers ([`NgramProposer`] / [`DraftModelProposer`]) behind
+//! `generate_speculative`, the target a `CausalLm` on its (static) step cache. The pre-epic
+//! `CausalLm` loops these tests were written against are retired; the assertions are unchanged.
 //!
 //! ## What these prove
 //! - **Exactness gate (`num_draft = 0`)**: with no drafts the verify is a single-token forward, so
@@ -20,8 +24,8 @@ use core_llm::Tokenizer;
 
 use candle_llm::config::ModelConfig;
 use candle_llm::decode::{
-    generate, generate_draft_speculative, generate_prompt_lookup, CancelFlag, GenerationConfig,
-    SpeculativeConfig,
+    generate, generate_speculative, CancelFlag, DraftModelProposer, GenerationConfig,
+    GenerationOutput, NgramProposer, SpeculativePrompt, SpeculativeStats, StreamEvent,
 };
 use candle_llm::device::select_device;
 use candle_llm::models::CausalLm;
@@ -50,6 +54,74 @@ fn base_greedy(model: &CausalLm, prompt: &[i32], max_new: usize) -> Vec<i32> {
     )
     .unwrap()
     .tokens
+}
+
+/// Proposal knobs: the longest trailing n-gram to match and the drafts per verify step.
+#[derive(Clone, Copy)]
+struct Spec {
+    max_ngram: usize,
+    num_draft: usize,
+}
+
+impl Default for Spec {
+    fn default() -> Self {
+        Self {
+            max_ngram: 3,
+            num_draft: 4,
+        }
+    }
+}
+
+type Run = candle_llm::Result<(GenerationOutput, SpeculativeStats)>;
+
+/// Prompt lookup through the engine: the n-gram proposer, `num_draft` drafts per verify step.
+fn ngram_engine(
+    model: &CausalLm,
+    prompt: &[i32],
+    config: &GenerationConfig,
+    spec: &Spec,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+) -> Run {
+    let mut proposer = NgramProposer {
+        max_ngram: spec.max_ngram,
+    };
+    generate_speculative(
+        model,
+        &mut proposer,
+        SpeculativePrompt::Tokens(prompt),
+        config,
+        spec.num_draft,
+        cancel,
+        on_event,
+        None,
+    )
+    .map(|run| (run.output, run.stats))
+}
+
+/// Draft-model speculation through the engine: `draft` proposes, `target` verifies.
+fn draft_engine(
+    target: &CausalLm,
+    draft: &CausalLm,
+    prompt: &[i32],
+    config: &GenerationConfig,
+    spec: &Spec,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+) -> Run {
+    let mut proposer =
+        DraftModelProposer::new(draft, prompt.len() + config.max_new_tokens, spec.num_draft);
+    generate_speculative(
+        target,
+        &mut proposer,
+        SpeculativePrompt::Tokens(prompt),
+        config,
+        spec.num_draft,
+        cancel,
+        on_event,
+        None,
+    )
+    .map(|run| (run.output, run.stats))
 }
 
 fn common_prefix(a: &[i32], b: &[i32]) -> usize {
@@ -145,7 +217,7 @@ fn build_tiny(vocab: usize, tag: &str) -> CausalLm {
 #[test]
 fn num_draft_zero_is_bit_identical_to_nonspec_cpu() {
     let model = build_tiny_llama();
-    let no_draft = SpeculativeConfig {
+    let no_draft = Spec {
         max_ngram: 3,
         num_draft: 0,
     };
@@ -155,7 +227,7 @@ fn num_draft_zero_is_bit_identical_to_nonspec_cpu() {
         vec![3, 1, 4, 1, 5, 9, 2, 6],
     ] {
         let base = base_greedy(&model, &prompt, 24);
-        let (out, stats) = generate_prompt_lookup(
+        let (out, stats) = ngram_engine(
             &model,
             &prompt,
             &greedy_config(24),
@@ -179,13 +251,13 @@ fn num_draft_zero_is_bit_identical_to_nonspec_cpu() {
 #[test]
 fn drafts_track_and_accept_on_cpu() {
     let model = build_tiny_llama();
-    let spec = SpeculativeConfig::default();
+    let spec = Spec::default();
     // A long greedy run; a tiny deterministic model settles into a repeating cycle, so the n-gram
     // proposer hits and drafts are accepted.
     let prompt = vec![1, 2, 3, 4, 5, 6, 7, 8];
     let max_new = 64;
     let base = base_greedy(&model, &prompt, max_new);
-    let (out, stats) = generate_prompt_lookup(
+    let (out, stats) = ngram_engine(
         &model,
         &prompt,
         &greedy_config(max_new),
@@ -215,7 +287,7 @@ fn drafts_track_and_accept_on_cpu() {
 #[test]
 fn stochastic_is_deterministic_for_fixed_seed_cpu() {
     let model = build_tiny_llama();
-    let spec = SpeculativeConfig::default();
+    let spec = Spec::default();
     let cfg = GenerationConfig {
         max_new_tokens: 24,
         sampling: SamplingParams {
@@ -227,7 +299,7 @@ fn stochastic_is_deterministic_for_fixed_seed_cpu() {
         stop_tokens: Vec::new(),
     };
     let prompt = vec![2, 4, 6, 8, 10];
-    let a = generate_prompt_lookup(
+    let a = ngram_engine(
         &model,
         &prompt,
         &cfg,
@@ -237,7 +309,7 @@ fn stochastic_is_deterministic_for_fixed_seed_cpu() {
     )
     .unwrap()
     .0;
-    let b = generate_prompt_lookup(
+    let b = ngram_engine(
         &model,
         &prompt,
         &cfg,
@@ -259,14 +331,14 @@ fn stochastic_is_deterministic_for_fixed_seed_cpu() {
 #[test]
 fn draft_num_draft_zero_identical_to_target_cpu() {
     let model = build_tiny_llama();
-    let no_draft = SpeculativeConfig {
+    let no_draft = Spec {
         max_ngram: 3,
         num_draft: 0,
     };
     let prompt = vec![1, 2, 3, 4, 5];
     let base = base_greedy(&model, &prompt, 24);
     // The draft is irrelevant when num_draft = 0 (the model itself stands in as a draft).
-    let (out, stats) = generate_draft_speculative(
+    let (out, stats) = draft_engine(
         &model,
         &model,
         &prompt,
@@ -290,11 +362,11 @@ fn draft_equals_target_accepts_everything_cpu() {
     // Using the target as its own draft: every proposed token is the target's argmax, so on CPU
     // (deterministic, order-stable) every draft is accepted — the maximal speedup, identical output.
     let model = build_tiny_llama();
-    let spec = SpeculativeConfig::default();
+    let spec = Spec::default();
     let prompt = vec![1, 2, 3, 4, 5, 6, 7, 8];
     let max_new = 48;
     let base = base_greedy(&model, &prompt, max_new);
-    let (out, stats) = generate_draft_speculative(
+    let (out, stats) = draft_engine(
         &model,
         &model,
         &prompt,
@@ -326,12 +398,12 @@ fn draft_spec_rejects_vocab_mismatch_cpu() {
     let target = build_tiny(VOCAB, "voca"); // vocab 48
     let draft = build_tiny(64, "vocb"); // vocab 64
     assert_ne!(target.config().vocab_size, draft.config().vocab_size);
-    let err = generate_draft_speculative(
+    let err = draft_engine(
         &target,
         &draft,
         &[1, 2, 3],
         &greedy_config(8),
-        &SpeculativeConfig::default(),
+        &Spec::default(),
         &CancelFlag::new(),
         &mut |_| {},
     );
@@ -341,7 +413,7 @@ fn draft_spec_rejects_vocab_mismatch_cpu() {
 #[test]
 fn draft_spec_stochastic_deterministic_cpu() {
     let model = build_tiny_llama();
-    let spec = SpeculativeConfig::default();
+    let spec = Spec::default();
     let cfg = GenerationConfig {
         max_new_tokens: 24,
         sampling: SamplingParams {
@@ -353,7 +425,7 @@ fn draft_spec_stochastic_deterministic_cpu() {
         stop_tokens: Vec::new(),
     };
     let prompt = vec![3, 6, 9, 12];
-    let a = generate_draft_speculative(
+    let a = draft_engine(
         &model,
         &model,
         &prompt,
@@ -364,7 +436,7 @@ fn draft_spec_stochastic_deterministic_cpu() {
     )
     .unwrap()
     .0;
-    let b = generate_draft_speculative(
+    let b = draft_engine(
         &model,
         &model,
         &prompt,
@@ -409,14 +481,14 @@ fn encode(tok: &Tokenizer, text: &str) -> Vec<i32> {
 
 fn run_suite(fx: Fixture) {
     // ---- Exactness gate: num_draft = 0 ⇒ single-token verify ⇒ identical to non-speculative. ----
-    let no_draft = SpeculativeConfig {
+    let no_draft = Spec {
         max_ngram: 3,
         num_draft: 0,
     };
     for text in ["The capital of France is", "Q: What is 2+2? A:"] {
         let p = encode(&fx.tok, text);
         let base = base_greedy(&fx.model, &p, 32);
-        let (out, stats) = generate_prompt_lookup(
+        let (out, stats) = ngram_engine(
             &fx.model,
             &p,
             &greedy_config(32),
@@ -434,13 +506,13 @@ fn run_suite(fx: Fixture) {
     }
 
     // ---- Multi-draft: tracks non-speculative + measured speedup on a context-repetitive prompt. ----
-    let spec = SpeculativeConfig::default();
+    let spec = Spec::default();
     let rep = encode(
         &fx.tok,
         "List: alpha beta gamma alpha beta gamma alpha beta gamma alpha beta gamma alpha beta gamma",
     );
     let base = base_greedy(&fx.model, &rep, 48);
-    let (out, stats) = generate_prompt_lookup(
+    let (out, stats) = ngram_engine(
         &fx.model,
         &rep,
         &greedy_config(48),
@@ -485,10 +557,10 @@ fn run_suite(fx: Fixture) {
         stop_tokens: Vec::new(),
     };
     let p = encode(&fx.tok, "Write a short sentence about the sea:");
-    let a = generate_prompt_lookup(&fx.model, &p, &scfg, &spec, &CancelFlag::new(), &mut |_| {})
+    let a = ngram_engine(&fx.model, &p, &scfg, &spec, &CancelFlag::new(), &mut |_| {})
         .unwrap()
         .0;
-    let b = generate_prompt_lookup(&fx.model, &p, &scfg, &spec, &CancelFlag::new(), &mut |_| {})
+    let b = ngram_engine(&fx.model, &p, &scfg, &spec, &CancelFlag::new(), &mut |_| {})
         .unwrap()
         .0;
     assert_eq!(
@@ -551,14 +623,14 @@ fn load_draft_target(env: &str) -> Option<(CausalLm, CausalLm, Tokenizer)> {
 
 fn run_draft_suite(target: CausalLm, draft: CausalLm, tok: Tokenizer) {
     // ---- Exactness gate: num_draft = 0 ⇒ identical to non-speculative target decoding. ----
-    let no_draft = SpeculativeConfig {
+    let no_draft = Spec {
         max_ngram: 3,
         num_draft: 0,
     };
     for text in ["The capital of France is", "Q: What is 2+2? A:"] {
         let p = encode(&tok, text);
         let base = base_greedy(&target, &p, 28);
-        let (out, stats) = generate_draft_speculative(
+        let (out, stats) = draft_engine(
             &target,
             &draft,
             &p,
@@ -576,13 +648,13 @@ fn run_draft_suite(target: CausalLm, draft: CausalLm, tok: Tokenizer) {
     }
 
     // ---- Draft-model greedy: tracks non-spec + measured win from accepted drafts. ----
-    let spec = SpeculativeConfig::default();
+    let spec = Spec::default();
     let p = encode(
         &tok,
         "Once upon a time in a small village there lived a curious",
     );
     let base = base_greedy(&target, &p, 48);
-    let (out, stats) = generate_draft_speculative(
+    let (out, stats) = draft_engine(
         &target,
         &draft,
         &p,
@@ -627,7 +699,7 @@ fn run_draft_suite(target: CausalLm, draft: CausalLm, tok: Tokenizer) {
         stop_tokens: Vec::new(),
     };
     let p = encode(&tok, "Describe the morning sky:");
-    let a = generate_draft_speculative(
+    let a = draft_engine(
         &target,
         &draft,
         &p,
@@ -638,7 +710,7 @@ fn run_draft_suite(target: CausalLm, draft: CausalLm, tok: Tokenizer) {
     )
     .unwrap()
     .0;
-    let b = generate_draft_speculative(
+    let b = draft_engine(
         &target,
         &draft,
         &p,
@@ -689,12 +761,12 @@ fn draft_speculative_rejects_vocab_mismatch() {
     };
     assert_ne!(a.model.config().vocab_size, b.model.config().vocab_size);
     let p = encode(&a.tok, "Hello");
-    let err = generate_draft_speculative(
+    let err = draft_engine(
         &a.model,
         &b.model,
         &p,
         &greedy_config(8),
-        &SpeculativeConfig::default(),
+        &Spec::default(),
         &CancelFlag::new(),
         &mut |_| {},
     );

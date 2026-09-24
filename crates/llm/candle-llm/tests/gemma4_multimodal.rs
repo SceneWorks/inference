@@ -563,6 +563,7 @@ fn gemma4_generates_dense_and_at_each_quantized_tier() {
             source: src.clone(),
             projector_source: None,
             quantize,
+            cuda_graphs: None,
         };
         let p = LlamaProvider::load(&spec)
             .unwrap_or_else(|e| panic!("load gemma4 (quantize={quantize:?}): {e}"));
@@ -643,6 +644,62 @@ fn audio_conditioning_changes_the_provider_output() {
         clip(rising),
         "generation is deterministic"
     );
+}
+
+/// sc-24138: a Gemma 4 request — the soft-token splice and plain text alike — decodes through
+/// the unified engine over the step seam on the **static** KV cache by default, and the record
+/// says so (`step_model`, `static`, no proposer). The reference `Decode` loop stays selectable as
+/// the oracle and, attending in the same formulation, produces the same tokens on CPU f32 (where
+/// the two loops are bit-identical; a CUDA device's bf16 GEMMs over the two caches' layouts may
+/// round differently in the last bit, so there only the paths are compared).
+#[test]
+fn gemma4_decodes_through_the_engine_and_the_reference_stays_selectable() {
+    use candle_llm::decode::DecodePath;
+    use candle_llm::primitives::KvCacheKind;
+
+    let fx = write_snapshot(true, true);
+    let mut p = LlamaProvider::load(&spec_of(&fx)).expect("load");
+    assert_eq!(p.decode_path(), DecodePath::StepModel, "the default");
+    let rising: Vec<f32> = (0..8).map(|i| i as f32 / 8.0).collect();
+    let requests = [
+        request(vec![
+            Content::Audio(AudioRef::new(AUDIO_RATE, rising).unwrap()),
+            Content::text("t1"),
+        ]),
+        request(vec![Content::text("t1 t2")]),
+    ];
+    let mut engine = Vec::new();
+    for (i, req) in requests.iter().enumerate() {
+        engine.push(generate(&p, req));
+        let record = p.last_decode_record().expect("record");
+        assert_eq!(
+            record.path,
+            DecodePath::StepModel,
+            "request {i}: the engine ran"
+        );
+        assert_eq!(
+            record.kv_cache,
+            KvCacheKind::Static,
+            "request {i}: on the static cache"
+        );
+        assert_eq!(record.proposer, core_llm::ProposerKind::None, "request {i}");
+    }
+    p.set_decode_path(DecodePath::Reference)
+        .expect("the reference loop is selectable");
+    let cpu = !candle_llm::device::select_device().unwrap().is_cuda();
+    for (i, (req, want)) in requests.iter().zip(&engine).enumerate() {
+        let got = generate(&p, req);
+        if cpu {
+            assert_eq!(&got, want, "request {i}: the same tokens");
+        }
+        let record = p.last_decode_record().expect("record");
+        assert_eq!(
+            record.path,
+            DecodePath::Reference,
+            "request {i}: the oracle ran"
+        );
+        assert_eq!(record.kv_cache, KvCacheKind::Growing, "request {i}");
+    }
 }
 
 /// A clip at the wrong sample rate is refused rather than silently reinterpreted.

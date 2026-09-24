@@ -20,6 +20,17 @@
 //! so cached decode stays correct. Numerics differ by a few half-precision ULPs from the eager path
 //! (different reduction order), the same tolerance the batched / prefix-reuse GPU paths carry.
 //!
+//! [`sdpa_gqa_causal`] (epic sc-24128, story sc-24132) is the **zero-copy grouped-query** causal
+//! attention the static-KV decode path runs: queries `[b, H, s, d]` against un-expanded keys/values
+//! `[b, Hkv, L, d]`, with the `H / Hkv` query groups folded into the query-sequence axis so one
+//! batched matmul per side serves every group — no [`repeat_kv`] expansion, and no `contiguous`
+//! copy of the cache's narrowed K/V views (the matmul reads their strides directly). The causal
+//! mask broadcasts over the groups from a 5-D view of the scores; a single-query decode step builds
+//! none. Numerically it is the eager path's arithmetic in a different batching (`groups` query rows
+//! per matmul instead of one), so it agrees with `repeat_kv` + [`sdpa`] to the backend's
+//! reduction order — a few ULPs, the same tolerance the flash path carries; the real-weight
+//! greedy fixture (`tests/static_kv_parity.rs`) is the token-level gate.
+//!
 //! The continuous-batching `Throughput` path (story 7347) decodes many sequences at once over
 //! per-sequence paged caches; its attention used to be an N-call per-sequence SDPA loop, which
 //! flatlined throughput at occupancy (the cost is N kernel launches + N gathers, not per-kernel
@@ -78,6 +89,38 @@ pub enum AttnMask<'a> {
     },
 }
 
+/// How grouped-query attention is computed over the cached K/V (story sc-24132) — surfaced per
+/// request through [`DecodeRecord::attn_formulation`](crate::decode::DecodeRecord::attn_formulation)
+/// so an evidence row says which arithmetic produced its tokens.
+///
+/// The two are **not** bit-identical on CUDA: cuBLAS picks its kernel (and with it the fp32
+/// reduction order that decides the last bf16 bit) by the GEMM's `m`, batch count and strides,
+/// and the un-expanded formulation issues different GEMMs (`m = groups`, `batch = b·kv_heads`)
+/// than the expanded one (`m = 1`, `batch = b·heads`). They differ by at most one bf16 ULP at
+/// attention-GEMM knife-edges; see `docs/migration/evidence/sc-24132/README.md`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AttnFormulation {
+    /// [`sdpa_gqa_causal`]: the query groups folded onto the sequence axis, attending the
+    /// un-expanded K/V views directly — the default for every path since S4 (the reference oracle
+    /// included, so static-vs-reference parity holds by construction).
+    #[default]
+    Gqa,
+    /// The pre-S4 arithmetic: [`repeat_kv`]-expanded K/V through [`sdpa`]. Kept selectable only as
+    /// a labelled comparison row against the sealed pre-epic baseline (it reproduces that
+    /// baseline's bits); it materializes the expansion every step, so it is never the fast path.
+    Expanded,
+}
+
+impl AttnFormulation {
+    /// Stable lower-case label for logs and evidence rows.
+    pub fn label(&self) -> &'static str {
+        match self {
+            AttnFormulation::Gqa => "gqa",
+            AttnFormulation::Expanded => "expanded",
+        }
+    }
+}
+
 /// Expand grouped-query KV heads to the full query head count.
 ///
 /// `x` is `[batch, n_kv_heads, seq, head_dim]`; the result is `[batch, n_kv_heads * groups, seq,
@@ -86,6 +129,7 @@ pub fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
     if groups == 1 {
         return Ok(x.clone());
     }
+    crate::primitives::kv_cache::note_kv_materialize();
     let (b, hkv, s, d) = x.dims4()?;
     Ok(x.unsqueeze(2)?
         .broadcast_as((b, hkv, groups, s, d))?
@@ -105,8 +149,8 @@ fn causal_mask_chunk(
 ) -> Result<Tensor> {
     #[cfg(test)]
     {
-        CAUSAL_MASK_BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        MAX_CAUSAL_MASK_ROWS.fetch_max(query_len, std::sync::atomic::Ordering::SeqCst);
+        CAUSAL_MASK_BUILDS.with(|c| c.set(c.get() + 1));
+        MAX_CAUSAL_MASK_ROWS.with(|c| c.set(c.get().max(query_len)));
     }
     let offset = k_len.checked_sub(total_query_len).ok_or_else(|| {
         Error::Msg(format!(
@@ -182,13 +226,15 @@ fn sliding_causal_mask_chunk(
     Ok(Tensor::from_vec(data, (1, 1, query_len, k_len), device)?.to_dtype(dtype)?)
 }
 
-/// Number of host-side causal-mask tiles built, used to pin the decode fast path and tile bound.
+// Host-side causal-mask tiles built (and the widest), used to pin the decode fast path and tile
+// bound. Per thread (sc-24140): a test builds its masks on its own thread, and a process-wide
+// counter also counted every mask a concurrently running test built, so the tests that read it
+// flaked under the parallel test runner.
 #[cfg(test)]
-static CAUSAL_MASK_BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(test)]
-static MAX_CAUSAL_MASK_ROWS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static CAUSAL_MASK_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MAX_CAUSAL_MASK_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Eager scaled-dot-product attention over `[batch, heads, seq, head_dim]` tensors.
 ///
@@ -359,6 +405,100 @@ pub fn sdpa_causal(queries: &Tensor, keys: &Tensor, values: &Tensor, scale: f32)
     sdpa(queries, keys, values, scale, None, AttnMask::Causal)
 }
 
+/// Zero-copy grouped-query causal attention (see the module docs).
+///
+/// `queries` is `[batch, heads, q_len, head_dim]`; `keys`/`values` are the **un-expanded**
+/// `[batch, kv_heads, k_len, head_dim]` (any strides the matmul can read — a static cache's
+/// narrowed views included), with `heads` a multiple of `kv_heads` and `k_len >= q_len`. Head `h`
+/// of the output attends KV head `h / groups`, the [`repeat_kv`] convention. Returns
+/// `[batch, heads, q_len, head_dim]`, contiguous.
+///
+/// Always the folded eager path, on every device. The fused `flash-attn` kernel is deliberately
+/// **not** tried here (unlike [`sdpa`]): it would receive un-expanded, narrowed K/V — a GQA + stride
+/// combination no test covers on this repository's CUDA lane (the feature is not part of it), so
+/// until a flash-vs-eager parity test exists for those views the fused kernel stays out of this
+/// path. Query rows are tiled like [`sdpa`] so every score tile stays within signed 32-bit
+/// element indexing.
+pub fn sdpa_gqa_causal(
+    queries: &Tensor,
+    keys: &Tensor,
+    values: &Tensor,
+    scale: f32,
+) -> Result<Tensor> {
+    let (b, h, q_len, d) = queries.dims4()?;
+    let (bk, hkv, k_len, dk) = keys.dims4()?;
+    if bk != b || dk != d || values.dims() != keys.dims() || hkv == 0 || h % hkv != 0 {
+        return Err(Error::Msg(format!(
+            "sdpa_gqa_causal: queries {:?} do not group over keys {:?} / values {:?}",
+            queries.dims(),
+            keys.dims(),
+            values.dims()
+        )));
+    }
+    if k_len < q_len {
+        return Err(Error::Msg(format!(
+            "causal attention needs k_len >= q_len, got {k_len} keys and {q_len} queries"
+        )));
+    }
+    let groups = h / hkv;
+    // Same tile bound as the eager path: the folded tile has `hkv * groups * rows == h * rows`
+    // score elements per batch row, so the arithmetic is unchanged.
+    let elements_per_query_row = b
+        .checked_mul(h)
+        .and_then(|e| e.checked_mul(k_len))
+        .ok_or_else(|| Error::Msg("eager attention tile size overflow".into()))?;
+    if elements_per_query_row == 0 {
+        return Err(Error::Msg(
+            "eager attention requires non-empty batch, heads, and keys".into(),
+        ));
+    }
+    let indexable_query_rows = (i32::MAX as usize) / elements_per_query_row;
+    if indexable_query_rows == 0 {
+        return Err(Error::Msg(format!(
+            "eager attention cannot index one query row with batch={b}, heads={h}, k_len={k_len}"
+        )));
+    }
+    let chunk = EAGER_ATTN_QUERY_CHUNK_SIZE.min(indexable_query_rows);
+    // Keys transposed for the score matmul — a strided view, never materialized.
+    let keys_t = keys.transpose(2, 3)?;
+    let mut chunks = Vec::with_capacity(q_len.div_ceil(chunk));
+    for query_start in (0..q_len).step_by(chunk) {
+        let query_len = chunk.min(q_len - query_start);
+        // [b, H, rows, d] -> [b, Hkv, groups * rows, d]: a free reshape of the contiguous query
+        // (a whole-range `narrow` is the tensor itself, so the decode step copies nothing).
+        let query = queries
+            .narrow(2, query_start, query_len)?
+            .contiguous()?
+            .reshape((b, hkv, groups * query_len, d))?;
+        let scores = (query.matmul(&keys_t)? * scale as f64)?; // [b, Hkv, groups * rows, L]
+                                                               // A single-query bottom-right causal mask is all zeros: skip it (the decode step).
+        let scores = if q_len == 1 {
+            scores
+        } else {
+            let tile = causal_mask_chunk(
+                query_start,
+                query_len,
+                q_len,
+                k_len,
+                scores.dtype(),
+                scores.device(),
+            )?; // [1, 1, rows, L]
+            scores
+                .reshape((b, hkv, groups, query_len, k_len))?
+                .broadcast_add(&tile.unsqueeze(2)?)?
+                .reshape((b, hkv, groups * query_len, k_len))?
+        };
+        let weights = softmax_last_dim(&scores)?;
+        // [b, Hkv, groups * rows, d] -> [b, H, rows, d] (head h = kv * groups + g).
+        chunks.push(weights.matmul(values)?.reshape((b, h, query_len, d))?);
+    }
+    if chunks.len() == 1 {
+        Ok(chunks.pop().expect("one gqa attention output chunk"))
+    } else {
+        Ok(Tensor::cat(&chunks.iter().collect::<Vec<_>>(), 2)?)
+    }
+}
+
 /// Try the fused FlashAttention-2 kernel; `Ok(None)` means "this case is not flash-eligible, use the
 /// eager path". Inputs are the same `[batch, heads, seq, head_dim]` tensors [`sdpa`] takes (K/V
 /// already GQA-expanded); the kernel wants `[batch, seq, heads, head_dim]`, so q/k/v are transposed
@@ -509,6 +649,74 @@ mod tests {
         assert_eq!(h, vec![0.0, 1.0, 0.0, 1.0, 2.0, 3.0, 2.0, 3.0]);
     }
 
+    /// sc-24132: the folded grouped-query path agrees with `repeat_kv` + eager `sdpa` — bit-identical
+    /// on the decode shape (one query, no mask), and within reduction-order tolerance on a chunked
+    /// prefill / multi-token verify shape — while never materializing the expanded heads, over
+    /// strided (narrowed, transposed) K/V views like the static cache hands over.
+    #[test]
+    fn gqa_causal_matches_repeat_kv_sdpa_without_materializing() {
+        let (b, hkv, groups, d) = (2usize, 2usize, 3usize, 4usize);
+        let h = hkv * groups;
+        let cap = 16usize;
+        // A "static buffer" [b, hkv, cap, d] whose written prefix is a narrowed view.
+        let k_buf = varied4(b, hkv, cap, d, 1.7);
+        let v_buf = varied4(b, hkv, cap, d, 3.1);
+        for (q_len, k_len) in [(1usize, 9usize), (1, 16), (5, 9), (7, 7), (3, 16)] {
+            let k = k_buf.narrow(2, 0, k_len).unwrap();
+            let v = v_buf.narrow(2, 0, k_len).unwrap();
+            assert!(k_len == cap || !k.is_contiguous());
+            let q = varied4(b, h, q_len, d, 0.4);
+
+            let before = crate::primitives::kv_cache::kv_materialize_count();
+            let got = sdpa_gqa_causal(&q, &k, &v, 0.5).unwrap();
+            assert_eq!(
+                crate::primitives::kv_cache::kv_materialize_count(),
+                before,
+                "gqa path must not expand K/V"
+            );
+            assert_eq!(got.dims(), &[b, h, q_len, d]);
+            assert!(got.is_contiguous());
+
+            let want = sdpa_eager(
+                &q,
+                &repeat_kv(&k, groups).unwrap(),
+                &repeat_kv(&v, groups).unwrap(),
+                0.5,
+                None,
+                AttnMask::Causal,
+            )
+            .unwrap();
+            let diff = max_abs_diff(&got, &want);
+            assert!(diff <= 1e-6, "q={q_len} k={k_len}: max|delta| = {diff}");
+        }
+        // Chunked prefill keeps the global bottom-right alignment across tiles.
+        let q_len = EAGER_ATTN_QUERY_CHUNK_SIZE + 3;
+        let k_len = q_len + 2;
+        let q = varied4(1, 2, q_len, 2, 0.1);
+        let k = varied4(1, 1, k_len, 2, 0.2);
+        let v = varied4(1, 1, k_len, 2, 0.3);
+        let got = sdpa_gqa_causal(&q, &k, &v, 0.5).unwrap();
+        let want = sdpa_eager(
+            &q,
+            &repeat_kv(&k, 2).unwrap(),
+            &repeat_kv(&v, 2).unwrap(),
+            0.5,
+            None,
+            AttnMask::Causal,
+        )
+        .unwrap();
+        assert!(max_abs_diff(&got, &want) <= 1e-6);
+        // Groups == 1 (MHA) is the plain causal path.
+        let q = varied4(1, 2, 3, 4, 0.9);
+        let k = varied4(1, 2, 6, 4, 0.8);
+        let got = sdpa_gqa_causal(&q, &k, &k, 0.5).unwrap();
+        let want = sdpa_eager(&q, &k, &k, 0.5, None, AttnMask::Causal).unwrap();
+        assert!(max_abs_diff(&got, &want) <= 1e-6);
+        // Mis-grouped heads and k_len < q_len are rejected.
+        assert!(sdpa_gqa_causal(&varied4(1, 3, 1, 4, 0.0), &k, &k, 0.5).is_err());
+        assert!(sdpa_gqa_causal(&varied4(1, 2, 8, 4, 0.0), &k, &k, 0.5).is_err());
+    }
+
     #[test]
     fn sdpa_causal_runs_and_shapes() {
         let q = arange4(1, 1, 2, 4);
@@ -519,12 +727,12 @@ mod tests {
     /// Reset mask accounting so a test observes only its own builds. Tests run single-threaded here
     /// (`RUST_TEST_THREADS=1` is forced), so this is race-free.
     fn reset_mask_accounting() {
-        CAUSAL_MASK_BUILDS.store(0, std::sync::atomic::Ordering::SeqCst);
-        MAX_CAUSAL_MASK_ROWS.store(0, std::sync::atomic::Ordering::SeqCst);
+        CAUSAL_MASK_BUILDS.with(|c| c.set(0));
+        MAX_CAUSAL_MASK_ROWS.with(|c| c.set(0));
     }
 
     fn mask_builds() -> usize {
-        CAUSAL_MASK_BUILDS.load(std::sync::atomic::Ordering::SeqCst)
+        CAUSAL_MASK_BUILDS.with(std::cell::Cell::get)
     }
 
     /// Bounded, varied f32 CPU tensor (cos keeps values in [-1, 1] so the softmax is well-behaved).
@@ -608,7 +816,7 @@ mod tests {
         assert_eq!(out.dims(), &[1, 1, q_len, 2]);
         assert_eq!(mask_builds(), 2);
         assert_eq!(
-            MAX_CAUSAL_MASK_ROWS.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_CAUSAL_MASK_ROWS.with(std::cell::Cell::get),
             EAGER_ATTN_QUERY_CHUNK_SIZE
         );
     }
@@ -704,6 +912,189 @@ mod tests {
         assert_eq!(last[0][259], 0.0);
     }
 
+    /// On CUDA in bf16 at the Qwen3.8-27B attention shape (24 query heads over 4 KV heads, head
+    /// dim 256), the folded grouped-query path must agree with `repeat_kv` + eager `sdpa` — the
+    /// static-KV decode step against the reference path — on the decode shape and a short verify
+    /// shape, reading the K/V through narrowed views of a larger buffer as the static cache does.
+    /// Prints the max |delta| and whether the bits are identical (informational; the gate is the
+    /// half-precision tolerance).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gqa_causal_matches_repeat_kv_sdpa_on_cuda_bf16_27b_shape() {
+        let device = crate::device::new_cuda_for_test().expect("cuda device");
+        let (b, h, hkv, d, cap) = (1usize, 24usize, 4usize, 256usize, 400usize);
+        let groups = h / hkv;
+        let mk = |b, heads, s, d, phase: f64| {
+            let n = (b * heads * s * d) as f32;
+            Tensor::arange(0f32, n, &device)
+                .unwrap()
+                .reshape((b, heads, s, d))
+                .unwrap()
+                .affine(0.0137, phase)
+                .unwrap()
+                .cos()
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+        };
+        let scale = (d as f32).powf(-0.5);
+        let k_buf = mk(b, hkv, cap, d, 1.7);
+        let v_buf = mk(b, hkv, cap, d, 3.1);
+        let to_bits = |t: &Tensor| -> Vec<u16> {
+            t.flatten_all()
+                .unwrap()
+                .to_vec1::<half::bf16>()
+                .unwrap()
+                .into_iter()
+                .map(half::bf16::to_bits)
+                .collect()
+        };
+        for (q_len, k_len) in [(1usize, 97usize), (1, 353), (4, 101), (97, 97)] {
+            let k = k_buf.narrow(2, 0, k_len).unwrap();
+            let v = v_buf.narrow(2, 0, k_len).unwrap();
+            let q = mk(b, h, q_len, d, 0.4);
+            let got = sdpa_gqa_causal(&q, &k, &v, scale).unwrap();
+            let want = sdpa_eager(
+                &q,
+                &repeat_kv(&k, groups).unwrap(),
+                &repeat_kv(&v, groups).unwrap(),
+                scale,
+                None,
+                AttnMask::Causal,
+            )
+            .unwrap();
+            let diff = (got.to_dtype(DType::F32).unwrap() - want.to_dtype(DType::F32).unwrap())
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            let identical = to_bits(&got) == to_bits(&want);
+            eprintln!(
+                "[gqa-cuda] q={q_len} k={k_len}: max|delta| = {diff}, bit-identical = {identical}"
+            );
+            assert!(
+                diff < 3e-2,
+                "q={q_len} k={k_len}: gqa vs repeat_kv max|delta| = {diff}"
+            );
+        }
+    }
+
+    /// **sc-24132 formulation survey (evidence, not a gate).** On CUDA bf16 at the Qwen3.8-27B
+    /// decode shape, how many of 131 key lengths (90..=1000 step 7) each un-expanded GQA
+    /// formulation is bit-identical to the reference `repeat_kv` + eager `sdpa` for. Recorded
+    /// result on RTX Pro 6000 / sm_120 (CUDA 12.9): V0 folded, strided K (the shipped path) 52
+    /// mismatching lengths; V1 folded + contiguous Kᵀ 52; V2 folded + contiguous Kᵀ and V 52; V3
+    /// per-KV-head stride-0 broadcast (M = 1, batch = groups) 32; V4 V3 with contiguous Kᵀ 28;
+    /// V5 V4 with contiguous V 28. Every difference is a single bf16 ULP in a few elements: cuBLAS
+    /// selects its kernel (and so its reduction order) by `m`, batch count and strides, and only
+    /// the reference's own calls (batch = `b × H` over expanded heads, `m = 1`) reproduce the
+    /// reference's bits. Bit-exact parity with the expanded reference therefore requires the
+    /// expansion itself — which is why S4 moved the reference onto the un-expanded formulation
+    /// instead (`AttnFormulation`); see `docs/migration/evidence/sc-24132/README.md`.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "sc-24132 formulation survey; needs CUDA"]
+    fn gqa_variants_bit_match_survey() {
+        let device = crate::device::new_cuda_for_test().expect("cuda device");
+        let (b, h, hkv, d, cap) = (1usize, 24usize, 4usize, 256usize, 1024usize);
+        let groups = h / hkv;
+        let mk = |b, heads, s, d, phase: f64| {
+            let n = (b * heads * s * d) as f32;
+            Tensor::arange(0f32, n, &device)
+                .unwrap()
+                .reshape((b, heads, s, d))
+                .unwrap()
+                .affine(0.0137, phase)
+                .unwrap()
+                .cos()
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+        };
+        let scale = (d as f32).powf(-0.5);
+        let k_buf = mk(b, hkv, cap, d, 1.7);
+        let v_buf = mk(b, hkv, cap, d, 3.1);
+        let q = mk(b, h, 1, d, 0.4);
+        let to_bits = |t: &Tensor| -> Vec<u16> {
+            t.flatten_all()
+                .unwrap()
+                .to_vec1::<half::bf16>()
+                .unwrap()
+                .into_iter()
+                .map(half::bf16::to_bits)
+                .collect()
+        };
+        let mut mism = [0usize; 6];
+        let mut tested = 0usize;
+        for k_len in (90..=1000).step_by(7) {
+            tested += 1;
+            let k = k_buf.narrow(2, 0, k_len).unwrap();
+            let v = v_buf.narrow(2, 0, k_len).unwrap();
+            let want = to_bits(
+                &sdpa_eager(
+                    &q,
+                    &repeat_kv(&k, groups).unwrap(),
+                    &repeat_kv(&v, groups).unwrap(),
+                    scale,
+                    None,
+                    AttnMask::Causal,
+                )
+                .unwrap(),
+            );
+            // V0: current folded path (OP_T strided k, strided v).
+            let v0 = sdpa_gqa_causal(&q, &k, &v, scale).unwrap();
+            // V1: folded, kT contiguous copy (OP_N), v strided.
+            let qf = q.reshape((b, hkv, groups, d)).unwrap();
+            let kt = k.transpose(2, 3).unwrap().contiguous().unwrap();
+            let s1 = (qf.matmul(&kt).unwrap() * scale as f64).unwrap();
+            let w1 = softmax_last_dim(&s1).unwrap();
+            let v1 = w1.matmul(&v).unwrap().reshape((b, h, 1, d)).unwrap();
+            // V2: folded, kT contiguous and v contiguous.
+            let vc = v.contiguous().unwrap();
+            let v2 = w1.matmul(&vc).unwrap().reshape((b, h, 1, d)).unwrap();
+            // V3: per-kv-head, stride-0 broadcast (M=1, batch=groups), OP_T k.
+            let per_head = |kt_c: bool, v_c: bool| -> Tensor {
+                let mut outs = Vec::new();
+                for kv in 0..hkv {
+                    let qg = q
+                        .narrow(1, kv * groups, groups)
+                        .unwrap()
+                        .squeeze(0)
+                        .unwrap(); // [groups,1,d]
+                    let kg = k.narrow(1, kv, 1).unwrap().squeeze(0).unwrap(); // [1,L,d]
+                    let kgt = kg.transpose(1, 2).unwrap(); // [1,d,L]
+                    let kgt = if kt_c { kgt.contiguous().unwrap() } else { kgt };
+                    let kgt = kgt.broadcast_as((groups, d, k_len)).unwrap();
+                    let s = (qg.matmul(&kgt).unwrap() * scale as f64).unwrap(); // [groups,1,L]
+                    let w = softmax_last_dim(&s).unwrap();
+                    let vg = v.narrow(1, kv, 1).unwrap().squeeze(0).unwrap(); // [1,L,d]
+                    let vg = if v_c { vg.contiguous().unwrap() } else { vg };
+                    let vg = vg.broadcast_as((groups, k_len, d)).unwrap();
+                    outs.push(w.matmul(&vg).unwrap()); // [groups,1,d]
+                }
+                Tensor::cat(&outs.iter().collect::<Vec<_>>(), 0)
+                    .unwrap()
+                    .reshape((b, h, 1, d))
+                    .unwrap()
+            };
+            let v3 = per_head(false, false);
+            let v4 = per_head(true, false);
+            let v5 = per_head(true, true);
+            for (i, t) in [&v0, &v1, &v2, &v3, &v4, &v5].into_iter().enumerate() {
+                if to_bits(t) != want {
+                    mism[i] += 1;
+                }
+            }
+        }
+        eprintln!(
+            "[survey] {tested} key lengths; mismatches: V0 folded/OP_T {} | V1 folded/kT-copy {} | V2 folded/kT+v copy {} | V3 per-head bcast {} | V4 per-head kT-copy {} | V5 per-head kT+v copy {}",
+            mism[0], mism[1], mism[2], mism[3], mism[4], mism[5]
+        );
+    }
+
     /// Exact attention shape from the frozen Qwen3-VL campaign `context_512` request. RC2's
     /// unchunked `[1, 32, 9247, 9247]` softmax has 2,736,224,288 elements; Candle's CUDA kernel
     /// indexes it with signed `int`, so it crosses `INT_MAX` and faults. The production query tile
@@ -714,7 +1105,7 @@ mod tests {
     #[ignore = "requires CUDA; exact Qwen3-VL context_512 attention-shape regression"]
     fn cuda_qwen3vl_context_512_shape_uses_bounded_eager_attention() {
         eprintln!("stage=device");
-        let device = Device::new_cuda(0).expect("cuda device");
+        let device = crate::device::new_cuda_for_test().expect("cuda device");
         let (b, h, s, d) = (1usize, 32usize, 9_247usize, 128usize);
         assert!(b * h * s * s > i32::MAX as usize);
         assert!(b * h * EAGER_ATTN_QUERY_CHUNK_SIZE * s < i32::MAX as usize);
@@ -741,7 +1132,7 @@ mod tests {
     #[cfg(feature = "flash-attn")]
     #[test]
     fn flash_attn_matches_eager_on_cuda() {
-        let device = Device::new_cuda(0).expect("cuda device");
+        let device = crate::device::new_cuda_for_test().expect("cuda device");
         // Bounded, varied bf16 q/k/v (cos keeps values in [-1, 1] so the softmax doesn't saturate).
         let mk = |b, h, s, d, phase: f64| {
             let n = (b * h * s * d) as f32;
@@ -805,7 +1196,7 @@ mod tests {
     #[cfg(feature = "flash-attn")]
     #[test]
     fn flash_attn_varlen_matches_eager_per_seq_on_cuda() {
-        let device = Device::new_cuda(0).expect("cuda device");
+        let device = crate::device::new_cuda_for_test().expect("cuda device");
         let (h, kvh, d) = (4usize, 2usize, 64usize); // GQA: groups = 2
         let groups = h / kvh;
         let scale = (d as f32).powf(-0.5);
@@ -920,7 +1311,7 @@ mod tests {
         use crate::primitives::{BlockPool, PagedKvCache};
         use std::time::Instant;
 
-        let device = Device::new_cuda(0).expect("cuda device");
+        let device = crate::device::new_cuda_for_test().expect("cuda device");
         let block_size = 16usize;
         let iters = 30usize;
         let warmup = 8usize;

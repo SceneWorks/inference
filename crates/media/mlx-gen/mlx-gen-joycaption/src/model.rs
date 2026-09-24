@@ -58,6 +58,7 @@ pub fn load_joycaption(spec: &LoadSpec) -> Result<JoyCaption> {
                 source: root.to_string_lossy().into_owned(),
                 projector_source: None,
                 quantize: None,
+                cuda_graphs: None,
             },
             &ModelRequirements::default().with_vision(),
         )

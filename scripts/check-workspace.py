@@ -14,13 +14,14 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_MEMBER_COUNT = 97
+EXPECTED_MEMBER_COUNT = 98
 INTERNAL_PACKAGES = {
     "candle-audio",
     "candle-audio-catalog",
     "candle-audio-kokoro",
     "candle-audio-moss-sfx",
     "candle-gen-catalog",
+    "candle-quant-kernels",
     "core-llm",
     "core-llm-testkit",
     "mlx-gen-catalog",

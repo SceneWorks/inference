@@ -4,17 +4,21 @@
 //! wrapper: this module accepts only the published 1B image-to-SVG shape and records the native
 //! preprocessing and weight-tree facts needed by the Candle model implementation.
 
+use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::sync::Mutex;
 
 use candle_core::{Device, Tensor};
 use serde_json::Value;
 
-use crate::decode::stream::default_seed;
+use crate::decode::{
+    generate_step_from_prefill, DecodeRecord, FinishReason as DecodeFinish, GenerationConfig,
+    RequestSpan, StreamEvent as DecodeEvent,
+};
 use crate::error::{Error, Result};
 use crate::image::resize_bicubic_u8;
 use crate::models::StarVectorModel;
-use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
+use crate::primitives::sampler::SamplingParams;
 use crate::primitives::{input_ids, Weights};
 
 /// The only snapshot family this provider admits.
@@ -51,12 +55,26 @@ fn concatenate_conditioning_embeddings(vision: &Tensor, text: &Tensor) -> Result
     Ok(Tensor::cat(&[&vision, text], 1)?)
 }
 
-/// Sample one vocabulary row, preserving the provider's single-image shape contract.
+/// The contract's sampling knobs as the sampler's.
+fn sampling_params(sampling: &core_llm::Sampling) -> SamplingParams {
+    SamplingParams {
+        temperature: sampling.temperature,
+        top_p: sampling.top_p,
+        top_k: sampling.top_k,
+        presence_penalty: sampling.presence_penalty,
+        repetition_penalty: sampling.repetition_penalty,
+        repetition_context: sampling.repetition_context,
+    }
+}
+
+/// Sample one vocabulary row, preserving the provider's single-image shape contract — the
+/// selection rule the shared decode engine applies to every row it draws a token from.
+#[cfg(test)]
 fn next_token_id(
     logits: &Tensor,
     history: &[i32],
     sampling: &core_llm::Sampling,
-    rng: &mut SplitMix64,
+    rng: &mut crate::primitives::sampler::SplitMix64,
 ) -> Result<i32> {
     let dims = logits.dims();
     let vocabulary = dims.last().copied().unwrap_or(0);
@@ -70,20 +88,7 @@ fn next_token_id(
             "starvector token selection requires one nonempty vocabulary row; got {dims:?}"
         )));
     }
-    sample(
-        logits,
-        history,
-        &SamplingParams {
-            temperature: sampling.temperature,
-            top_p: sampling.top_p,
-            top_k: sampling.top_k,
-            presence_penalty: sampling.presence_penalty,
-            repetition_penalty: sampling.repetition_penalty,
-            repetition_context: sampling.repetition_context,
-        },
-        rng,
-        None,
-    )
+    crate::primitives::sampler::sample(logits, history, &sampling_params(sampling), rng, None)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -362,12 +367,29 @@ pub struct CandleStarVectorProvider {
     descriptor: core_llm::TextLlmDescriptor,
     svg: core_llm::StarVectorDescriptor,
     processor: StarVectorImageProcessor,
+    /// The device the weights were loaded on; request pixels go here (sc-24134).
+    device: Device,
     tokenizer: core_llm::Tokenizer,
     prompt: Vec<i32>,
     model: Mutex<StarVectorModel>,
 }
+/// The load's NVFP4 refusal (sc-24139): NVFP4 is not served for StarVector-1B (the Llama
+/// provider serves it for the qwen3_5 hybrid and the llama family, sc-24135 / sc-24140), and
+/// NVFP4 is a capability a provider must refuse rather than silently load another
+/// representation. [`crate::backend::nvfp4_support`] answers a product's per-snapshot question
+/// with the same gate.
+pub(crate) fn nvfp4_gate(spec: &core_llm::LoadSpec) -> core_llm::Result<()> {
+    if spec.quantize == Some(core_llm::Quantize::Nvfp4) {
+        return Err(core_llm::Error::Unsupported(
+            "nvfp4: NVFP4 projections are not served for StarVector-1B".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl CandleStarVectorProvider {
     pub fn load(spec: &core_llm::LoadSpec) -> core_llm::Result<Self> {
+        nvfp4_gate(spec)?;
         read_config(&spec.source).map_err(to_core)?;
         let device = crate::device::select_device().map_err(to_core)?;
         let weights = Weights::from_dir(&spec.source, &device).map_err(to_core)?;
@@ -395,6 +417,7 @@ impl CandleStarVectorProvider {
             tokenizer,
             prompt,
             model: Mutex::new(StarVectorModel::from_weights(&weights).map_err(to_core)?),
+            device,
         })
     }
 }
@@ -492,7 +515,7 @@ impl core_llm::TextLlm for CandleStarVectorProvider {
             1_000_000,
             std::time::Duration::from_secs(120),
         );
-        let out = core_llm::StarVectorProvider::generate_svg(self, &svg, &mut |_| {})?;
+        let (out, record) = self.generate_svg_recorded(&svg, &mut |_| {})?;
         let finish = match out.finish_reason {
             core_llm::StarVectorFinishReason::Cancelled => core_llm::FinishReason::Cancelled,
             core_llm::StarVectorFinishReason::TokenLimit => core_llm::FinishReason::Length,
@@ -513,6 +536,10 @@ impl core_llm::TextLlm for CandleStarVectorProvider {
             tool_calls: vec![],
             usage,
             mtp: None,
+            // The continuation decodes through the shared engine (sc-24138), so it reports its
+            // path. No graph runner wraps this decoder, so the CUDA-graph switch was off here.
+            // `None` only when the bounded stream stopped on the seeded prompt, before a decode.
+            decode: record.map(|record| record.report(false)),
             finish_reason: Some(finish),
         })
     }
@@ -526,7 +553,20 @@ impl core_llm::StarVectorProvider for CandleStarVectorProvider {
         req: &core_llm::StarVectorRequest,
         events: &mut dyn FnMut(core_llm::StarVectorStreamEvent),
     ) -> core_llm::Result<core_llm::StarVectorOutput> {
-        self.validate_svg(req)?;
+        self.generate_svg_recorded(req, events)
+            .map(|(output, _)| output)
+    }
+}
+impl CandleStarVectorProvider {
+    /// [`StarVectorProvider::generate_svg`](core_llm::StarVectorProvider::generate_svg) plus the
+    /// measured decode record of the continuation (sc-24139) — `None` when the bounded stream
+    /// stopped on the seeded prompt, before any decode step.
+    fn generate_svg_recorded(
+        &self,
+        req: &core_llm::StarVectorRequest,
+        events: &mut dyn FnMut(core_llm::StarVectorStreamEvent),
+    ) -> core_llm::Result<(core_llm::StarVectorOutput, Option<DecodeRecord>)> {
+        core_llm::StarVectorProvider::validate_svg(self, req)?;
         if req.text_request.cancel.is_cancelled() {
             return Err(core_llm::Error::Canceled);
         }
@@ -550,76 +590,116 @@ impl core_llm::StarVectorProvider for CandleStarVectorProvider {
                 &image.pixels,
                 image.width as usize,
                 image.height as usize,
-                &crate::device::select_device().map_err(to_core)?,
+                &self.device,
             )
             .map_err(to_core)?;
-        let mut model = self
+        // The decoder is stateless (the request's K/V live in its own step cache); the lock only
+        // serializes generations, bounding the device memory the provider holds to one request.
+        let model = self
             .model
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        model.reset();
         let result = (|| {
             let vision = model.image_embeddings(&pixels).map_err(to_core)?;
             let ids = input_ids(&self.prompt, pixels.device())
                 .map_err(|e| core_llm::Error::Msg(e.to_string()))?;
-            let text = model.decoder.embeddings(&ids).map_err(to_core)?;
+            let decoder = &model.decoder;
+            let text = decoder.embeddings(&ids).map_err(to_core)?;
             let initial = concatenate_conditioning_embeddings(&vision, &text).map_err(to_core)?;
-            let mut logits = model.decoder.forward_embeds(&initial, 0).map_err(to_core)?;
+            // The conditioning prefill goes into the shared step cache (growing backing: the
+            // provider has no admission surface to price a whole-budget preallocation), then the
+            // continuation decodes through the step seam (sc-24138).
+            let mut cache = decoder.new_step_cache();
+            // The whole request from the conditioning prefill on (the engine's own span starts
+            // after it).
+            let span = RequestSpan::begin();
+            let logits = decoder
+                .forward_embeds(&initial, &mut cache)
+                .map_err(to_core)?;
             let mut stream = core_llm::StarVectorBoundedStream::new(req);
             match seed_svg_prompt(&mut stream, events)? {
                 core_llm::StarVectorStreamStatus::Continue => {}
                 core_llm::StarVectorStreamStatus::Stop(_) => {
-                    return Ok(emit_done(stream.output()?, events));
+                    return Ok((emit_done(stream.output()?, events), None));
                 }
             }
-            let mut history = self.prompt.clone();
-            let mut rng = SplitMix64::new(req.text_request.seed.unwrap_or_else(default_seed));
+            let config = GenerationConfig {
+                max_new_tokens: req.text_request.max_new_tokens as usize,
+                sampling: sampling_params(&req.text_request.sampling),
+                seed: req.text_request.seed,
+                stop_tokens: vec![EOS_TOKEN_ID],
+            };
             let mut detok = self.tokenizer.decode_stream(true);
-            for index in 0..req.text_request.max_new_tokens {
-                if req.text_request.cancel.is_cancelled() {
-                    break;
-                }
-                let id = next_token_id(&logits, &history, &req.text_request.sampling, &mut rng)
-                    .map_err(to_core)?;
-                history.push(id);
-                if id == EOS_TOKEN_ID {
-                    if let Some(delta) = detok.finish()? {
-                        let status = stream.push_decoded_suffix(&delta, started.elapsed())?;
-                        if matches!(
-                            status,
-                            core_llm::StarVectorStreamStatus::Continue
-                                | core_llm::StarVectorStreamStatus::Stop(
-                                    core_llm::StarVectorFinishReason::CompleteRoot
-                                )
-                        ) {
-                            events(core_llm::StarVectorStreamEvent::Source { text: delta, index });
-                        }
-                        if matches!(status, core_llm::StarVectorStreamStatus::Stop(_)) {
-                            break;
+            let stopped = Cell::new(false);
+            let failure = RefCell::new(None);
+            let (generated, record) = {
+                let mut on_token = |event: DecodeEvent| {
+                    let DecodeEvent::Token { id, step } = event else {
+                        return;
+                    };
+                    if stopped.get() {
+                        return;
+                    }
+                    let pushed = decode_generated_svg_token(&mut detok, id).and_then(|decoded| {
+                        push_decoded_svg_token(
+                            &mut stream,
+                            decoded,
+                            started.elapsed(),
+                            step as u32 + 1,
+                            events,
+                        )
+                    });
+                    match pushed {
+                        Ok(core_llm::StarVectorStreamStatus::Continue) => {}
+                        Ok(core_llm::StarVectorStreamStatus::Stop(_)) => stopped.set(true),
+                        Err(error) => {
+                            *failure.borrow_mut() = Some(error);
+                            stopped.set(true);
                         }
                     }
+                };
+                generate_step_from_prefill(
+                    decoder,
+                    &mut cache,
+                    logits,
+                    &self.prompt,
+                    &config,
+                    &req.text_request.cancel,
+                    &mut on_token,
+                    Some(&|| stopped.get()),
+                )
+                .map_err(to_core)?
+            };
+            if let Some(error) = failure.into_inner() {
+                return Err(error);
+            }
+            // The end-of-text token ends the stream the way the pre-seam loop did: flush the
+            // detokenizer's held bytes as source at the token's index, then mark the EOS.
+            if generated.finish_reason == DecodeFinish::StopToken && !stopped.get() {
+                let index = generated.tokens.len() as u32;
+                let mut ended = false;
+                if let Some(delta) = detok.finish()? {
+                    let status = stream.push_decoded_suffix(&delta, started.elapsed())?;
+                    if matches!(
+                        status,
+                        core_llm::StarVectorStreamStatus::Continue
+                            | core_llm::StarVectorStreamStatus::Stop(
+                                core_llm::StarVectorFinishReason::CompleteRoot
+                            )
+                    ) {
+                        events(core_llm::StarVectorStreamEvent::Source { text: delta, index });
+                    }
+                    ended = matches!(status, core_llm::StarVectorStreamStatus::Stop(_));
                 }
-                let decoded = decode_generated_svg_token(&mut detok, id)?;
-                let status = push_decoded_svg_token(
-                    &mut stream,
-                    decoded,
-                    started.elapsed(),
-                    index + 1,
-                    events,
-                )?;
-                if matches!(status, core_llm::StarVectorStreamStatus::Stop(_)) {
-                    break;
+                if !ended {
+                    push_decoded_svg_token(
+                        &mut stream,
+                        DecodedSvgToken::Eos,
+                        started.elapsed(),
+                        index + 1,
+                        events,
+                    )?;
                 }
-                let next = input_ids(&[id], pixels.device())
-                    .map_err(|e| core_llm::Error::Msg(e.to_string()))?;
-                let embed = model.decoder.embeddings(&next).map_err(to_core)?;
-                logits = model
-                    .decoder
-                    .forward_embeds(
-                        &embed,
-                        IMAGE_TOKEN_COUNT + self.prompt.len() + index as usize,
-                    )
-                    .map_err(to_core)?;
             }
             if stream.output().is_err() {
                 if let Some(delta) = detok.finish()? {
@@ -643,9 +723,11 @@ impl core_llm::StarVectorProvider for CandleStarVectorProvider {
                 // bounded stream's existing typed terminal reason without publishing partial SVG.
                 let _ = stream.push("", started.elapsed())?;
             }
-            Ok(emit_done(stream.output()?, events))
+            Ok((
+                emit_done(stream.output()?, events),
+                Some(record.with_request_span(&span)),
+            ))
         })();
-        model.reset();
         result
     }
 }
@@ -669,6 +751,7 @@ fn to_core(error: Error) -> core_llm::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::primitives::SplitMix64;
     use candle_core::DType;
     use core_llm::{StarVectorBoundedStream, StarVectorProvider, StarVectorStreamEvent, TextLlm};
     use core_llm_testkit::{starvector_conformance, StarVectorProfile};
@@ -1210,5 +1293,101 @@ mod tests {
         assert!(!result);
         assert!(!read_attempted.get(), "file payload must not be read");
         assert!(!can_load_path(file.path()));
+    }
+
+    /// sc-24139: the continuation decodes through the shared engine, so the provider reports the
+    /// engine's record on `TextLlmOutput::decode` rather than `None`. (A real generation needs
+    /// the exact published 1B geometry; this pins the wiring.)
+    #[test]
+    fn the_provider_reports_its_decode_record() {
+        let source = include_str!("starvector.rs");
+        let production = &source[..source.find("mod tests {").expect("the test module")];
+        assert!(!production.contains("decode: None"));
+        assert!(production.contains("decode: record.map(|record| record.report(false))"));
+        assert!(production.contains("Some(record.with_request_span(&span))"));
+    }
+
+    /// sc-24139: NVFP4 is refused at load by name (never a silent dense load), before the
+    /// snapshot is read, by the gate the per-snapshot probe asks.
+    #[test]
+    fn an_nvfp4_load_is_refused_by_name_before_reading_the_snapshot() {
+        let spec = core_llm::LoadSpec {
+            quantize: Some(core_llm::Quantize::Nvfp4),
+            ..core_llm::LoadSpec::dense("/no/such/starvector-1b")
+        };
+        match CandleStarVectorProvider::load(&spec) {
+            Err(core_llm::Error::Unsupported(message)) => {
+                assert!(message.starts_with("nvfp4: "), "{message}");
+                assert!(message.contains("StarVector-1B"), "{message}");
+            }
+            Err(other) => panic!("expected the NVFP4 refusal, got {other:?}"),
+            Ok(_) => panic!("an NVFP4 StarVector-1B load succeeded"),
+        }
+        assert!(nvfp4_gate(&core_llm::LoadSpec::dense("/no/such/starvector-1b")).is_ok());
+    }
+
+    /// sc-24134: the provider selects its device once, at load, and a request's pixels go to
+    /// that device. A `select_device()` per request would build a second device — on the own
+    /// stream a second CUDA stream (and cuBLAS / cuRAND handles) that candle's per-op check,
+    /// which compares the GPU ordinal only, cannot tell from the model's (see the CUDA test).
+    #[test]
+    fn the_provider_selects_its_device_once_at_load() {
+        let source = include_str!("starvector.rs");
+        let production = &source[..source.find("mod tests {").expect("the test module")];
+        // `CandleStarVectorProvider::load` is followed by the free `descriptor()` function.
+        let load = production
+            .find("pub fn load(")
+            .expect("the provider's load");
+        let load_end = production
+            .find("pub fn descriptor()")
+            .expect("descriptor()");
+        let calls: Vec<usize> = production
+            .match_indices("select_device(")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(calls.len(), 1, "one device selection: {calls:?}");
+        assert!(
+            (load..load_end).contains(&calls[0]),
+            "the device is selected in `load`, not per request"
+        );
+    }
+
+    /// The load-time device and a request's pixels are one device on one stream; a second
+    /// `select_device()` (what a per-request selection did) shares the GPU ordinal — so candle's
+    /// per-op check accepts mixing them — but is a different device, and on the own stream a
+    /// different CUDA stream.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn request_pixels_share_the_load_time_device_and_stream() {
+        use candle_core::Device;
+        // The graph runner on at load: the own stream, where a second device is a second stream.
+        let _guard = crate::decode::graph::cuda_graphs_policy_guard(Some(true));
+        let Ok(model_device @ Device::Cuda(_)) = crate::device::select_device() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let stream = |d: &Device| match d {
+            Device::Cuda(c) => (
+                c.cuda_stream().cu_stream() as usize,
+                c.cuda_stream().context().ordinal(),
+            ),
+            _ => unreachable!(),
+        };
+        let pixels = StarVectorImageProcessor::default()
+            .preprocess(&[10u8, 20, 30, 40, 50, 60], 2, 1, &model_device)
+            .unwrap();
+        assert!(pixels.device().same_device(&model_device));
+        assert_eq!(stream(pixels.device()), stream(&model_device));
+
+        // Same GPU ordinal (all candle's per-op check compares), yet another device and stream.
+        let second = crate::device::select_device().unwrap();
+        assert!(!second.same_device(&model_device));
+        if !cfg!(feature = "flash-attn") {
+            assert_ne!(
+                stream(&second).0,
+                stream(&model_device).0,
+                "a second own stream"
+            );
+        }
     }
 }

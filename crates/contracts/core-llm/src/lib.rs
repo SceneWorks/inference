@@ -33,6 +33,10 @@
 //! - [`BlockAllocator`] — backend-neutral paged-KV block allocation policy (refcounts + free list).
 //! - [`speculative`] — backend-neutral speculative-decoding policy (n-gram proposer + distribution-
 //!   preserving acceptance sampler).
+//! - [`report`] — backend-neutral evidence a product renders: [`DecodeReport`] (which decode path
+//!   served a generation, on [`TextLlmOutput::decode`]), [`LoadReport`] (what a load produced, via
+//!   [`TextLlm::load_report`]) and [`BackendCapabilities`] (what the host can serve — NVFP4, CUDA
+//!   graphs — with the refusal reason when it cannot).
 //! - [`registry`] — explicit provider composition, id-based routing, and **model-first** resolution
 //!   ([`TextLlmRegistry::load_for_model`] / [`ModelRequirements`] over a weightless `can_load`
 //!   probe).
@@ -52,6 +56,7 @@ pub mod prefix;
 pub mod prepare;
 pub mod prism;
 pub mod registry;
+pub mod report;
 pub mod request;
 pub mod resource;
 pub mod schedule;
@@ -94,17 +99,26 @@ pub use prism::{
 pub use registry::{
     ModelRequirements, TextLlmRegistration, TextLlmRegistry, TextLlmRegistryBuilder,
 };
+pub use report::{
+    BackendCapabilities, CudaGraphsReport, DecodeReport, FeatureSupport, LoadReport, PathReport,
+    ProjectionReport,
+};
 pub use request::{
-    LoadSpec, MtpMode, Quantize, ReasoningEffort, Sampling, TextLlmRequest, ThinkingMode,
+    HostSampleReason, LoadSpec, MtpMode, Quantize, ReasoningEffort, SamplerPath, Sampling,
+    TextLlmRequest, ThinkingMode,
 };
 pub use resource::{
     admit_request_memory, admit_request_memory_with_geometry, available_host_memory_bytes,
     checkpoint_payload_bytes, checkpoint_staging_bytes, effective_memory_budget,
-    estimate_chunked_request_bytes, estimate_request_bytes, operational_memory_override,
-    LlmMemoryGeometry, AVAILABLE_MEMORY_OVERRIDE,
+    estimate_chunked_request_bytes, estimate_chunked_request_bytes_with_recurrent_copies,
+    estimate_request_bytes, operational_memory_override, LlmMemoryGeometry,
+    AVAILABLE_MEMORY_OVERRIDE,
 };
 pub use schedule::{Scheduler, SeqId, SeqSpec};
-pub use speculative::{accept_greedy_run, accept_token, ngram_propose, Acceptance};
+pub use speculative::{
+    accept_greedy_run, accept_token, greedy_commit, ngram_propose, resolve_mtp_plan, Acceptance,
+    MtpPlan, ProposerKind,
+};
 pub use starvector::{
     generated_token_budget, validate_advertised_generated_token_cap,
     validate_generated_token_budget, DecoderArchitecture, ImagePreprocessing, ProjectionMetadata,

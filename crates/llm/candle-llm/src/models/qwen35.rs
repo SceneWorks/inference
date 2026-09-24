@@ -24,16 +24,19 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::ops::sigmoid;
 use serde_json::Value;
 
+use crate::decode::step::{LogitsScope, StepModel, StepOutput, StepRequest};
 use crate::device::compute_dtype;
 use crate::error::{Error, Result};
 use crate::models::deepstack::{self, deepstack_fused_decoder_layers};
-use crate::primitives::attention::{repeat_kv, sdpa, AttnMask};
+use crate::primitives::attention::{repeat_kv, sdpa, sdpa_gqa_causal, AttnFormulation, AttnMask};
+use crate::primitives::decode_cache::{tensor_bytes, CacheMemory, DecodeCache};
 use crate::primitives::gated_delta::{
-    causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
+    causal_depthwise_conv_traced, compute_g, rms_norm_gated, DeltaNetCache, RingSpec,
 };
-use crate::primitives::nn::{embed, rms_norm, silu};
-use crate::primitives::projection::{Projection, QuantSpec};
-use crate::primitives::rope::{apply_rope, Rope};
+use crate::primitives::kv_cache::{KvCacheKind, StaticKvCache};
+use crate::primitives::nn::{embed, rms_norm, rms_norm_residual, swiglu};
+use crate::primitives::projection::{Projection, ProjectionFormat, QuantSpec, WeightCensus};
+use crate::primitives::rope::{rms_norm_rope, Rope};
 use crate::primitives::{KvCache, PrismRegistry, Weights};
 
 fn checkpoint_norm_weight(weight: Tensor, prism: bool) -> Result<Tensor> {
@@ -252,6 +255,26 @@ struct GatedDeltaNet {
 }
 
 impl GatedDeltaNet {
+    fn record(&self, census: &mut WeightCensus) {
+        for p in [
+            &self.in_proj_qkv,
+            &self.in_proj_z,
+            &self.in_proj_a,
+            &self.in_proj_b,
+            &self.out_proj,
+        ] {
+            census.projections.record(p);
+        }
+        for t in [
+            &self.conv_weight,
+            &self.a_log,
+            &self.dt_bias,
+            &self.norm_weight,
+        ] {
+            census.record_tensor(t);
+        }
+    }
+
     fn forward(&self, x: &Tensor, cache: &mut DeltaNetCache) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
 
@@ -267,11 +290,12 @@ impl GatedDeltaNet {
 
         // Short conv over the q‖k‖v channels (only these are convolved), seeded by the cache tail,
         // then a *contiguous* split into q [key_dim] ‖ k [key_dim] ‖ v [value_dim] and reshape to heads.
-        let conv_state = match &cache.conv_state {
+        let conv_state = match cache.conv_state() {
             Some(cs) => cs.clone(),
             None => Tensor::zeros((b, self.conv_kernel - 1, self.conv_dim), dt, x.device())?,
         };
-        let (conv_out, new_conv) = causal_depthwise_conv(&mixed, &self.conv_weight, &conv_state)?;
+        let (conv_out, conv_trace) =
+            causal_depthwise_conv_traced(&mixed, &self.conv_weight, &conv_state)?;
         let qc = conv_out
             .narrow(2, 0, self.key_dim)?
             .contiguous()?
@@ -290,18 +314,20 @@ impl GatedDeltaNet {
         let qn = l2norm(&qc, 1e-6)?.affine(inv, 0.0)?;
         let kn = l2norm(&kc, 1e-6)?;
 
-        // The gated delta recurrence, accumulated in f32 (matching the reference kernel). GQA (q/k
-        // from Hk key heads → Hv value heads) is handled inside the recurrence primitive.
+        // The gated delta recurrence, accumulated in f32 (matching the reference kernel), run by
+        // the cache so every token's post-step state (conv tail + SSM state) lands in its
+        // checkpoint ring (sc-24131). GQA (q/k from Hk key heads → Hv value heads) is handled
+        // inside the recurrence primitive.
         let beta = sigmoid(&b_in)?;
         let g = compute_g(&a_in, &self.a_log, &self.dt_bias)?;
         let f = DType::F32;
-        let (y, new_ssm) = gated_delta_recurrence(
+        let y = cache.advance(
+            &conv_trace,
             &qn.to_dtype(f)?,
             &kn.to_dtype(f)?,
             &vc.to_dtype(f)?,
             &g.to_dtype(f)?,
             &beta.to_dtype(f)?,
-            cache.ssm_state.as_ref(),
         )?;
 
         // Gated RMS-norm with z (back in the layer dtype), then the output projection.
@@ -309,7 +335,6 @@ impl GatedDeltaNet {
         let result = self
             .out_proj
             .forward(&out.reshape((b, s, self.value_dim))?)?;
-        cache.update(new_conv, new_ssm, s as i32);
         Ok(result)
     }
 }
@@ -330,13 +355,24 @@ struct Qwen35Attention {
     eps: f64,
 }
 
+/// The KV slot a full-attention layer writes this step into: the growing reference slot, or the
+/// preallocated static cache (story sc-24132). Both attend through [`sdpa_gqa_causal`] by default,
+/// so the growing slot — the parity oracle — and the static one share one attention arithmetic and
+/// are token-identical by construction; [`AttnFormulation::Expanded`] keeps the pre-S4
+/// `repeat_kv` + [`sdpa`] arithmetic selectable on the growing slot as a labelled comparison row.
+enum KvSlot<'a> {
+    Growing(&'a mut AttnKv),
+    Static(&'a mut StaticKvCache),
+}
+
 impl Qwen35Attention {
     fn forward(
         &self,
         x: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        cache: &mut AttnKv,
+        cache: KvSlot<'_>,
+        formulation: AttnFormulation,
     ) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
         let (nh, nkv, hd) = (self.num_heads, self.num_kv_heads, self.head_dim);
@@ -348,28 +384,42 @@ impl Qwen35Attention {
             .narrow(3, hd, hd)?
             .contiguous()?
             .reshape((b, s, nh * hd))?;
-        let q = rms_norm(&q, &self.q_norm, self.eps)?; // [b,s,H,hd]
-
-        let k = rms_norm(
-            &self.k_proj.forward(x)?.reshape((b, s, nkv, hd))?,
-            &self.k_norm,
-            self.eps,
-        )?;
+        let k = self.k_proj.forward(x)?.reshape((b, s, nkv, hd))?;
         let v = self.v_proj.forward(x)?.reshape((b, s, nkv, hd))?;
 
-        // Partial RoPE (NeoX), then transpose into head-major [b,H,s,hd].
-        let q = apply_rope(&q, cos, sin, false)?
+        // Per-head QK-norm then partial RoPE (NeoX) — one fused leaf each (sc-24137) — then
+        // transpose into head-major [b,H,s,hd].
+        let q = rms_norm_rope(&q, &self.q_norm, self.eps, cos, sin, false)? // [b,s,H,hd]
             .transpose(1, 2)?
             .contiguous()?;
-        let k = apply_rope(&k, cos, sin, false)?
+        let k = rms_norm_rope(&k, &self.k_norm, self.eps, cos, sin, false)?
             .transpose(1, 2)?
             .contiguous()?;
         let v = v.transpose(1, 2)?.contiguous()?;
 
-        let (k_all, v_all) = cache.update(&k, &v)?;
-        let k_all = repeat_kv(&k_all, self.groups)?;
-        let v_all = repeat_kv(&v_all, self.groups)?;
-        let out = sdpa(&q, &k_all, &v_all, self.scale, None, AttnMask::Causal)?; // [b,H,s,hd]
+        let out = match (cache, formulation) {
+            // Reference path: growing concat, then the same grouped-query attention the static
+            // path runs (the S4 decision: one attention arithmetic for both slots).
+            (KvSlot::Growing(growing), AttnFormulation::Gqa) => {
+                let (k_all, v_all) = growing.update(&k, &v)?;
+                sdpa_gqa_causal(&q, &k_all, &v_all, self.scale)? // [b,H,s,hd]
+            }
+            // The pre-S4 reference arithmetic, selectable only for comparison rows: growing
+            // concat, GQA expanded per step, eager/fused SDPA.
+            (KvSlot::Growing(growing), AttnFormulation::Expanded) => {
+                let (k_all, v_all) = growing.update(&k, &v)?;
+                let k_all = repeat_kv(&k_all, self.groups)?;
+                let v_all = repeat_kv(&v_all, self.groups)?;
+                sdpa(&q, &k_all, &v_all, self.scale, None, AttnMask::Causal)? // [b,H,s,hd]
+            }
+            // Static path: in-place write, bounded views, grouped-query attention over them —
+            // no `cat`, no `repeat_kv`, no copy of the cached history. The formulation selector
+            // does not apply: expanding would be exactly the copy this cache exists to remove.
+            (KvSlot::Static(fixed), _) => {
+                let (k_all, v_all) = fixed.update(0, &k, &v)?;
+                sdpa_gqa_causal(&q, &k_all, &v_all, self.scale)? // [b,H,s,hd]
+            }
+        };
         let merged = out
             .transpose(1, 2)?
             .contiguous()?
@@ -388,10 +438,16 @@ struct Mlp {
 }
 
 impl Mlp {
+    fn record(&self, census: &mut WeightCensus) {
+        for p in [&self.gate, &self.up, &self.down] {
+            census.projections.record(p);
+        }
+    }
+
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = silu(&self.gate.forward(x)?)?;
+        let gate = self.gate.forward(x)?;
         let up = self.up.forward(x)?;
-        self.down.forward(&gate.broadcast_mul(&up)?)
+        self.down.forward(&swiglu(&gate, &up)?)
     }
 }
 
@@ -421,6 +477,7 @@ impl MoeFfn {
 
         // Router probabilities (f32 softmax for a stable top-k), pulled to host.
         let logits = xf.matmul(&self.router.t()?)?; // [t, E]
+        crate::primitives::host_sync::note_host_sync();
         let probs =
             candle_nn::ops::softmax_last_dim(&logits.to_dtype(DType::F32)?)?.to_vec2::<f32>()?;
 
@@ -499,21 +556,56 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
+    fn record(&self, census: &mut WeightCensus) {
+        census.record_tensor(&self.input_ln);
+        census.record_tensor(&self.post_ln);
+        match &self.mixer {
+            Mixer::Delta(d) => d.record(census),
+            Mixer::Attn(a) => {
+                for p in [&a.q_proj, &a.k_proj, &a.v_proj, &a.o_proj] {
+                    census.projections.record(p);
+                }
+                census.record_tensor(&a.q_norm);
+                census.record_tensor(&a.k_norm);
+            }
+        }
+        match &self.ffn {
+            Ffn::Dense(m) => m.record(census),
+            Ffn::Moe(moe) => {
+                census.record_tensor(&moe.router);
+                census.record_tensor(&moe.shared_gate);
+                moe.shared.record(census);
+                for e in &moe.experts {
+                    e.record(census);
+                }
+            }
+        }
+    }
+}
+
+impl DecoderLayer {
     fn forward(
         &self,
         x: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
         cache: &mut Qwen35LayerCache,
+        formulation: AttnFormulation,
     ) -> Result<Tensor> {
         let normed = rms_norm(x, &self.input_ln, self.eps)?;
         let r = match (&self.mixer, cache) {
             (Mixer::Delta(d), Qwen35LayerCache::Delta(c)) => d.forward(&normed, c)?,
-            (Mixer::Attn(a), Qwen35LayerCache::Attn(c)) => a.forward(&normed, cos, sin, c)?,
+            (Mixer::Attn(a), Qwen35LayerCache::Attn(c)) => {
+                a.forward(&normed, cos, sin, KvSlot::Growing(c), formulation)?
+            }
+            (Mixer::Attn(a), Qwen35LayerCache::StaticAttn(c)) => {
+                a.forward(&normed, cos, sin, KvSlot::Static(c), formulation)?
+            }
             _ => return Err(Error::Msg("qwen3_5: cache/mixer type mismatch".into())),
         };
-        let h = x.broadcast_add(&r)?;
-        let m = self.ffn.forward(&rms_norm(&h, &self.post_ln, self.eps)?)?;
+        // Residual add + post-attention norm as one fused leaf (sc-24137); `h` carries forward.
+        let (h, normed) = rms_norm_residual(x, &r, &self.post_ln, self.eps)?;
+        let m = self.ffn.forward(&normed)?;
         Ok(h.broadcast_add(&m)?)
     }
 }
@@ -527,7 +619,10 @@ pub struct AttnKv {
 impl AttnKv {
     fn update(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
         let merged = match self.kv.take() {
-            Some((pk, pv)) => (Tensor::cat(&[&pk, k], 2)?, Tensor::cat(&[&pv, v], 2)?),
+            Some((pk, pv)) => {
+                crate::primitives::kv_cache::note_kv_materialize();
+                (Tensor::cat(&[&pk, k], 2)?, Tensor::cat(&[&pv, v], 2)?)
+            }
             None => (k.clone(), v.clone()),
         };
         self.kv = Some((merged.0.clone(), merged.1.clone()));
@@ -540,43 +635,480 @@ impl AttnKv {
             .map(|(k, _)| k.dims()[2] as i32)
             .unwrap_or(0)
     }
+
+    /// Keep positions `0..len` along the sequence axis (the growing-KV half of a rollback). The
+    /// narrowed views are made contiguous so the next append copies only what is kept.
+    fn truncate(&mut self, len: i32) -> Result<()> {
+        let Some((k, v)) = self.kv.take() else {
+            return Ok(());
+        };
+        let cur = k.dims()[2];
+        let len = usize::try_from(len).map_err(|_| Error::Msg("AttnKv: negative length".into()))?;
+        if len > cur {
+            return Err(Error::Msg(format!(
+                "AttnKv: cannot truncate to {len} past {cur} cached positions"
+            )));
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        if len == cur {
+            self.kv = Some((k, v));
+            return Ok(());
+        }
+        self.kv = Some((
+            k.narrow(2, 0, len)?.contiguous()?,
+            v.narrow(2, 0, len)?.contiguous()?,
+        ));
+        Ok(())
+    }
+
+    fn bytes(&self) -> usize {
+        self.kv
+            .as_ref()
+            .map(|(k, v)| tensor_bytes(k).saturating_add(tensor_bytes(v)))
+            .unwrap_or(0)
+    }
 }
 
-/// The per-layer cache slot — a recurrent [`DeltaNetCache`] for linear layers, growing KV for
-/// full-attention layers.
+/// The shape of one linear layer's recurrent state — what a [`RingSpec`] is built from
+/// (the batch is 1: the step seam and the provider decode one request per cache).
 #[derive(Clone, Debug)]
+struct RecurrentShape {
+    conv_dims: (usize, usize, usize),
+    conv_dtype: DType,
+    ssm_dims: (usize, usize, usize, usize),
+    device: Device,
+}
+
+impl RecurrentShape {
+    fn ring_spec(&self, depth: usize) -> RingSpec {
+        RingSpec {
+            slots: depth + 1,
+            conv_dims: self.conv_dims,
+            conv_dtype: self.conv_dtype,
+            ssm_dims: self.ssm_dims,
+            ssm_dtype: DType::F32,
+            device: self.device.clone(),
+        }
+    }
+}
+
+/// Positions before the current one a cache built through [`Qwen35Model::new_cache`] (and so
+/// `Decode::make_cache`) can roll back to — the reference and MTP paths the provider runs. Neither
+/// calls [`Qwen35Cache::rollback_to`] (the MTP loop restores a clone), so they keep **no**
+/// checkpoint ring: such a cache holds exactly one recurrent state (the live one), which is what
+/// request admission charges (E6, [`Qwen35Model::recurrent_state_bytes`]`(1)`).
+pub const REFERENCE_MAX_CHECKPOINTS: usize = 0;
+
+/// Positions before the current one a cache built through the unbounded [`StepModel::new_cache`]
+/// can roll back to: its per-token checkpoint ring holds `1 + STEP_MAX_CHECKPOINTS` states (the
+/// live one plus this many earlier positions). The bounded [`StepModel::new_cache_for`] — what
+/// every request runs on — sizes the ring for the caller's overshoot instead (`K` drafts → a ring
+/// of `K + 2` positions: the step start plus the `K + 1` verify positions), and admission prices
+/// exactly that ([`Qwen35Model::recurrent_state_bytes`]). Each ring slot is one full recurrent
+/// state — on Qwen3.8-27B ~151 MB of SSM state (48 linear layers × 48 value heads × 128 × 128 × 4 B)
+/// plus a ~2.9 MB bf16 conv tail (48 × 3 × 10240 × 2 B). Deeper history is opt-in via
+/// [`Qwen35Cache::set_max_checkpoints`].
+pub const STEP_MAX_CHECKPOINTS: usize = 2;
+
+/// The per-layer cache slot — a recurrent [`DeltaNetCache`] for linear layers, and for
+/// full-attention layers either the growing reference KV ([`AttnKv`]) or a single-layer
+/// preallocated [`StaticKvCache`] (story sc-24132). A cache holds one kind of attention slot
+/// throughout; [`Qwen35Cache::kv_kind`] says which.
+///
+/// Not `Clone`: a static slot's copy is a full device copy that can fail, so copying goes through
+/// the fallible [`try_clone`](Self::try_clone) (and [`Qwen35Cache::try_clone`]) instead of a
+/// `Clone` that would have to panic.
+#[derive(Debug)]
 pub enum Qwen35LayerCache {
     Delta(DeltaNetCache),
     Attn(AttnKv),
+    StaticAttn(StaticKvCache),
 }
 
-/// The hybrid decoder's cache: one slot per decoder layer.
-#[derive(Clone, Debug)]
+impl Qwen35LayerCache {
+    /// A deep copy of the slot (see [`StaticKvCache::try_clone`] for the static case).
+    pub fn try_clone(&self) -> Result<Self> {
+        Ok(match self {
+            Qwen35LayerCache::Delta(c) => Qwen35LayerCache::Delta(c.try_clone()?),
+            Qwen35LayerCache::Attn(a) => Qwen35LayerCache::Attn(a.clone()),
+            Qwen35LayerCache::StaticAttn(s) => Qwen35LayerCache::StaticAttn(s.try_clone()?),
+        })
+    }
+}
+
+/// The hybrid decoder's cache: one slot per decoder layer, with the linear layers' per-token
+/// checkpoint rings that make it a [`DecodeCache`].
+///
+/// Every linear layer's [`DeltaNetCache`] holds a preallocated ring of the recurrent state after
+/// each of the newest [`max_checkpoints`](Self::set_max_checkpoints)` + 1` positions (story
+/// sc-24131): a multi-token verify forward checkpoints every one of its positions, so
+/// [`rollback_to`](Self::rollback_to) can return to **any** position inside the last verify step
+/// exactly — no replay forward — and refuses positions older than the ring holds rather than
+/// approximating them. Rollback is a slot selection; the ring's buffers and addresses never move.
+///
+/// Retention depends on who built the cache: [`Qwen35Model::new_cache`] (reference / MTP paths)
+/// keeps [`REFERENCE_MAX_CHECKPOINTS`] (no ring), [`StepModel::new_cache`] keeps
+/// [`STEP_MAX_CHECKPOINTS`], [`StepModel::new_cache_for`] the caller's overshoot plus one.
+///
+/// The full-attention slots are either the growing [`AttnKv`] (the reference path and the parity
+/// oracle) or, for a cache built by [`Qwen35Model::new_static_cache`] / [`StepModel::new_cache_for`],
+/// one preallocated [`StaticKvCache`] per attention layer sized for the request's capacity: written
+/// in place, rolled back by moving the offset, buffers never reallocated (story sc-24132).
+///
+/// Not `Clone` — see [`try_clone`](Self::try_clone).
+#[derive(Debug)]
 pub struct Qwen35Cache {
     layers: Vec<Qwen35LayerCache>,
+    /// Positions before the current one the linear layers' rings can roll back to (`0`: no ring).
+    max_checkpoints: usize,
+    /// One linear layer's state shape — what a ring of any depth is built from.
+    recurrent_shape: RecurrentShape,
+    /// Added to the cache position to form the RoPE position of every token a
+    /// [`StepModel::forward_step`] feeds (see [`set_rope_delta`](Self::set_rope_delta)).
+    rope_delta: i32,
 }
 
 impl Qwen35Cache {
+    /// A deep copy of the whole cache (every layer slot, checkpoint rings included). The MTP
+    /// loop's "verify on a trial copy, restore the base on rejection" rollback is built on this.
+    /// For a static cache the copy is a full device copy of every attention buffer (and of every
+    /// ring), and a failed copy is returned as the device's error rather than panicking.
+    pub fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            layers: self
+                .layers
+                .iter()
+                .map(Qwen35LayerCache::try_clone)
+                .collect::<Result<Vec<_>>>()?,
+            max_checkpoints: self.max_checkpoints,
+            recurrent_shape: self.recurrent_shape.clone(),
+            rope_delta: self.rope_delta,
+        })
+    }
+
+    /// The shift between cache positions and RoPE positions for tokens fed through the step seam
+    /// ([`StepModel::forward_step`] uses `offset() + rope_delta()`): zero for a text prompt, the
+    /// interleaved M-RoPE `mrope_delta` after a multimodal prefill, whose 3-D positions end past
+    /// the sequence length. Set by the caller that prefilled the cache; a configuration, not a
+    /// state — `reset` and `rollback_to` leave it alone.
+    pub fn set_rope_delta(&mut self, delta: i32) {
+        self.rope_delta = delta;
+    }
+
+    /// The step seam's RoPE shift (see [`set_rope_delta`](Self::set_rope_delta)).
+    pub fn rope_delta(&self) -> i32 {
+        self.rope_delta
+    }
+
     /// Positions already cached — the RoPE offset for the next step (read from the first full-attn
-    /// layer; all layers advance in lockstep).
+    /// layer, or the first linear layer when the schedule has no full-attention layer; all layers
+    /// advance in lockstep).
     pub fn offset(&self) -> i32 {
         self.layers
             .iter()
             .find_map(|l| match l {
                 Qwen35LayerCache::Attn(a) => Some(a.offset()),
+                Qwen35LayerCache::StaticAttn(s) => Some(s.offset()),
                 Qwen35LayerCache::Delta(_) => None,
+            })
+            .or_else(|| {
+                self.layers.iter().find_map(|l| match l {
+                    Qwen35LayerCache::Delta(c) => Some(c.offset()),
+                    Qwen35LayerCache::Attn(_) | Qwen35LayerCache::StaticAttn(_) => None,
+                })
             })
             .unwrap_or(0)
     }
 
-    /// Drop all cached state.
+    /// Drop all cached state. A static cache keeps its buffers, and so does every checkpoint ring
+    /// (offsets go to zero; the bytes are overwritten by the next prefill).
     pub fn reset(&mut self) {
         for l in &mut self.layers {
             match l {
                 Qwen35LayerCache::Delta(c) => c.reset(),
                 Qwen35LayerCache::Attn(a) => a.kv = None,
+                Qwen35LayerCache::StaticAttn(s) => s.reset(),
             }
         }
+    }
+
+    /// Which KV cache implementation the full-attention layers run on.
+    pub fn kv_kind(&self) -> KvCacheKind {
+        if self
+            .layers
+            .iter()
+            .any(|l| matches!(l, Qwen35LayerCache::StaticAttn(_)))
+        {
+            KvCacheKind::Static
+        } else {
+            KvCacheKind::Growing
+        }
+    }
+
+    /// Positions a static cache can hold, or `None` for a growing cache.
+    pub fn kv_capacity(&self) -> Option<usize> {
+        self.layers.iter().find_map(|l| match l {
+            Qwen35LayerCache::StaticAttn(s) => Some(s.capacity()),
+            _ => None,
+        })
+    }
+
+    /// The `(keys, values)` storage addresses of every static attention layer's buffers, in layer
+    /// order (see [`storage_address`](crate::primitives::storage_address)) — empty for a growing
+    /// cache. The pointer-stability gate (AC3) reads these across steps and rollbacks.
+    pub fn static_kv_addresses(&self) -> Result<Vec<(usize, usize)>> {
+        self.layers
+            .iter()
+            .filter_map(|l| match l {
+                Qwen35LayerCache::StaticAttn(s) => Some(s.storage_addresses(0)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The storage addresses of every linear layer's `(conv, ssm)` checkpoint ring, in layer
+    /// order (see [`storage_address`](crate::primitives::storage_address)) — empty for a cache
+    /// without rings or whose rings are not yet allocated. The pointer-stability gate reads these
+    /// across verify steps and rollbacks; the CUDA-graph runner (S6) captures them.
+    pub fn recurrent_ring_addresses(&self) -> Result<Vec<(usize, usize)>> {
+        let mut out = Vec::new();
+        for l in &self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                if let Some(addresses) = c.ring_addresses()? {
+                    out.push(addresses);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every linear layer's live recurrent state `(conv tail, SSM state)`, in layer order —
+    /// `None` before the first forward. What the rollback gate compares against a fresh decode.
+    pub fn recurrent_states(&self) -> Vec<(Option<&Tensor>, Option<&Tensor>)> {
+        self.layers
+            .iter()
+            .filter_map(|l| match l {
+                Qwen35LayerCache::Delta(c) => Some((c.conv_state(), c.ssm_state())),
+                Qwen35LayerCache::Attn(_) | Qwen35LayerCache::StaticAttn(_) => None,
+            })
+            .collect()
+    }
+
+    /// Allocate every linear layer's checkpoint ring now (a no-op without rings or once
+    /// allocated), so a request fails closed at admission rather than at its first forward.
+    pub fn preallocate_recurrent(&mut self) -> Result<()> {
+        for l in &mut self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                c.preallocate()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Called at the start of every forward over `steps` new positions: refuses a step that would
+    /// end past a static cache's capacity ([`Error::KvCapacityExceeded`], before any layer runs or
+    /// any state changes). The per-token checkpoints are written by the layers themselves.
+    fn begin_forward(&mut self, steps: usize) -> Result<()> {
+        if let Some(capacity) = self.kv_capacity() {
+            let end = usize::try_from(self.offset())
+                .unwrap_or(0)
+                .saturating_add(steps);
+            if end > capacity {
+                return Err(Error::KvCapacityExceeded {
+                    requested: end,
+                    capacity,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Change how many positions before the current one the cache can roll back to: every linear
+    /// layer's ring is reallocated for `max + 1` positions, carrying over the restorable positions
+    /// that still fit (`0` drops the rings: rollback to anything but the current position and
+    /// zero is refused). Every layer's replacement is built before any is swapped in, so a failed
+    /// allocation (or carry-over) leaves the cache untouched — every ring, its depth, the
+    /// recurrent bytes and `max_checkpoints` as they were; the price is that the old and new rings
+    /// coexist until the swap. No-op when unchanged.
+    pub fn set_max_checkpoints(&mut self, max: usize) -> Result<()> {
+        if max == self.max_checkpoints {
+            return Ok(());
+        }
+        let spec = (max > 0).then(|| self.recurrent_shape.ring_spec(max));
+        self.replace_rings(max, &mut |_| spec.clone())
+    }
+
+    /// Rebuild every linear layer's ring with `spec_for(i)` (`i` counts the linear layers) and
+    /// swap them all in only once every one succeeded; the cache is untouched on error.
+    fn replace_rings(
+        &mut self,
+        max: usize,
+        spec_for: &mut dyn FnMut(usize) -> Option<RingSpec>,
+    ) -> Result<()> {
+        let mut replacements = Vec::new();
+        for (at, l) in self.layers.iter().enumerate() {
+            if let Qwen35LayerCache::Delta(c) = l {
+                replacements.push((at, c.resized(spec_for(replacements.len()))?));
+            }
+        }
+        for (at, c) in replacements {
+            self.layers[at] = Qwen35LayerCache::Delta(c);
+        }
+        self.max_checkpoints = max;
+        Ok(())
+    }
+
+    /// How many positions before the current one this cache can roll back to at most.
+    pub fn max_checkpoints(&self) -> usize {
+        self.max_checkpoints
+    }
+
+    /// Logical bytes of recurrent (Gated DeltaNet) state the cache holds: every linear layer's
+    /// ring (live slot plus checkpoint slots), or its live state for a ring-less cache. The
+    /// attention KV is excluded — this is the term admission prices as `recurrent_bytes`
+    /// ([`Qwen35Model::recurrent_state_bytes`]).
+    pub fn recurrent_bytes(&self) -> usize {
+        self.layers.iter().fold(0usize, |acc, l| match l {
+            Qwen35LayerCache::Delta(c) => {
+                let (live, checkpoint) = c.memory_bytes();
+                acc.saturating_add(live).saturating_add(checkpoint)
+            }
+            Qwen35LayerCache::Attn(_) | Qwen35LayerCache::StaticAttn(_) => acc,
+        })
+    }
+
+    /// The positions [`rollback_to`](Self::rollback_to) can currently return to, ascending
+    /// (`0` and the current position are always possible and not listed): the window the
+    /// linear layers' rings hold.
+    pub fn checkpoint_offsets(&self) -> Vec<i32> {
+        self.layers
+            .iter()
+            .find_map(|l| match l {
+                Qwen35LayerCache::Delta(c) => Some(c.restorable()),
+                Qwen35LayerCache::Attn(_) | Qwen35LayerCache::StaticAttn(_) => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// Roll the cache back so the next step continues from position `n` (see
+    /// [`DecodeCache::rollback_to`]): the full-attention KV is narrowed to `n` (a static cache
+    /// just moves its offset — its buffers and their addresses are untouched) and every linear
+    /// layer's ring selects its slot for `n` (no copy). `n == offset()` is a no-op and `n == 0` is
+    /// a [`reset`](Self::reset); any other `n` the rings no longer hold is
+    /// [`Error::RollbackUnavailable`] (typed, so a speculative engine can fall back without matching
+    /// message text) and leaves the cache untouched. `n` outside `0..=offset()` is [`Error::Msg`].
+    pub fn rollback_to(&mut self, n: i32) -> Result<()> {
+        let cur = self.offset();
+        if n < 0 || n > cur {
+            return Err(Error::Msg(format!(
+                "Qwen35Cache: cannot roll back to {n} with {cur} positions cached"
+            )));
+        }
+        if n == cur {
+            return Ok(());
+        }
+        if n == 0 {
+            self.reset();
+            return Ok(());
+        }
+        // Every linear layer advances in lockstep, so one refusal means all refuse: check before
+        // touching anything.
+        for l in &self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                if !c.can_rollback_to(n) {
+                    return Err(Error::RollbackUnavailable {
+                        n,
+                        have: c.restorable(),
+                    });
+                }
+            }
+        }
+        for l in &mut self.layers {
+            match l {
+                Qwen35LayerCache::Delta(c) => c.rollback_to(n)?,
+                Qwen35LayerCache::Attn(a) => a.truncate(n)?,
+                Qwen35LayerCache::StaticAttn(s) => s.truncate(n)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Logical bytes referenced by the live state and by the checkpoint slots (see
+    /// [`CacheMemory`] for what is and is not counted). A static cache's attention layers count
+    /// their **full preallocation**, and so does every checkpoint ring (one slot live, the rest
+    /// checkpoints) — that is what the request holds from its first step.
+    pub fn memory(&self) -> CacheMemory {
+        let (live_bytes, checkpoint_bytes) =
+            self.layers
+                .iter()
+                .fold((0usize, 0usize), |(live, checkpoint), l| match l {
+                    Qwen35LayerCache::Delta(c) => {
+                        let (l, c) = c.memory_bytes();
+                        (live.saturating_add(l), checkpoint.saturating_add(c))
+                    }
+                    Qwen35LayerCache::Attn(a) => (live.saturating_add(a.bytes()), checkpoint),
+                    Qwen35LayerCache::StaticAttn(s) => (live.saturating_add(s.bytes()), checkpoint),
+                });
+        CacheMemory {
+            live_bytes,
+            checkpoint_bytes,
+        }
+    }
+}
+
+impl DecodeCache for Qwen35Cache {
+    fn len(&self) -> i32 {
+        self.offset()
+    }
+
+    fn rollback_to(&mut self, n: i32) -> Result<()> {
+        Qwen35Cache::rollback_to(self, n)
+    }
+
+    fn reset(&mut self) {
+        Qwen35Cache::reset(self)
+    }
+
+    fn retain_checkpoints(&mut self, n: usize) -> Result<()> {
+        if n > self.max_checkpoints {
+            self.set_max_checkpoints(n)?;
+        }
+        Ok(())
+    }
+
+    fn memory(&self) -> CacheMemory {
+        Qwen35Cache::memory(self)
+    }
+
+    fn kv_kind(&self) -> KvCacheKind {
+        Qwen35Cache::kv_kind(self)
+    }
+
+    /// A CUDA-graph replay (story sc-24134) needs every state tensor at a stable address. The
+    /// static KV buffers are, and so is a linear layer's recurrent state once it keeps the
+    /// per-token checkpoint ring (sc-24131): the live state is a view of the newest preallocated
+    /// ring slot, written in place, so a recorded step leaves no allocation alive past it (the
+    /// census of a warmed hybrid step on the engine's cache reads `escaped=0`; the S1 cache,
+    /// which replaced both states of every linear layer per step, read `escaped=96` on the 27B).
+    /// A ring-less linear layer — the reference caches ([`REFERENCE_MAX_CHECKPOINTS`]) — still
+    /// replaces its state per step and says `deltanet_state_unstable`; a growing `AttnKv` cache
+    /// says `growing_kv`. A cache that passes is still refused by its model: [`Qwen35Model`]'s
+    /// positions are Rust-side scalars (`positions_host_scalar`) — the static KV write offset
+    /// and the ring slot a step writes alike — so this cache keeps the trait's refusing
+    /// `replay_advance`.
+    fn graph_support(&self) -> std::result::Result<(), &'static str> {
+        for layer in &self.layers {
+            match layer {
+                Qwen35LayerCache::Delta(c) if c.ring_spec().is_none() => {
+                    return Err("deltanet_state_unstable")
+                }
+                Qwen35LayerCache::Attn(_) => return Err("growing_kv"),
+                Qwen35LayerCache::Delta(_) | Qwen35LayerCache::StaticAttn(_) => {}
+            }
+        }
+        Ok(())
     }
 }
 
@@ -592,6 +1124,13 @@ pub struct Qwen35Model {
     dtype: DType,
     device: Device,
     quantized: bool,
+    /// Which KV cache [`StepModel::new_cache_for`] builds (story sc-24132): the static cache by
+    /// default; [`KvCacheKind::Growing`] selects the reference `AttnKv` slots for parity runs.
+    step_kv_cache: KvCacheKind,
+    /// How the growing `AttnKv` slots attend (story sc-24132): [`AttnFormulation::Gqa`] by default
+    /// (the same arithmetic as the static cache); [`AttnFormulation::Expanded`] is the pre-S4
+    /// `repeat_kv` + `sdpa` arithmetic, selectable for comparison rows only.
+    attn_formulation: AttnFormulation,
 }
 
 /// The checkpoint-native Qwen3.8 multi-token predictor.
@@ -615,6 +1154,9 @@ pub struct Qwen35Mtp {
     dtype: DType,
     device: Device,
     vocab_size: usize,
+    /// The predictor layers' attention formulation (copied from the target at construction; see
+    /// [`Qwen35Model::set_attn_formulation`]).
+    attn_formulation: AttnFormulation,
 }
 
 /// Persistent full-attention state for each published MTP layer.
@@ -677,6 +1219,36 @@ impl Qwen35Mtp {
         target: &Qwen35Model,
         quant: Option<QuantSpec>,
     ) -> Result<Self> {
+        let format = quant.map(ProjectionFormat::from);
+        Self::from_weights_format(w, target, format.as_ref())
+    }
+
+    /// The predictor's own resident weights (its `fc`, layers and norms). The token embedding and
+    /// LM head are the target's, shared by `Arc`, and are counted by
+    /// [`Qwen35Model::weight_census`] only.
+    pub fn weight_census(&self) -> WeightCensus {
+        let mut census = WeightCensus::default();
+        census.projections.record(&self.fc);
+        for t in [
+            &self.pre_fc_norm_embedding,
+            &self.pre_fc_norm_hidden,
+            &self.norm,
+        ] {
+            census.record_tensor(t);
+        }
+        for layer in &self.layers {
+            layer.record(&mut census);
+        }
+        census
+    }
+
+    /// [`Self::from_weights_with`] for any [`ProjectionFormat`] (NVFP4 included, sc-24135): the
+    /// predictor's projections are stored exactly like the target's.
+    pub fn from_weights_format(
+        w: &Weights,
+        target: &Qwen35Model,
+        format: Option<&ProjectionFormat>,
+    ) -> Result<Self> {
         let cfg = &target.cfg;
         if cfg.mtp_num_hidden_layers != 1 {
             return Err(Error::Config(
@@ -710,7 +1282,8 @@ impl Qwen35Mtp {
         let req = |key: &str| -> Result<Tensor> { Ok(w.require(key)?.to_dtype(dtype)?) };
         // Qwen3.5/Qwen3.8 RMSNorm parameters are zero-centered (`1 + weight`).
         let norm_w = |key: &str| -> Result<Tensor> { Ok(req(key)?.affine(1.0, 1.0)?) };
-        let proj_q = |key: &str| -> Result<Projection> { Projection::load(req(key)?, quant) };
+        let proj_q =
+            |key: &str| -> Result<Projection> { Projection::load_as(req(key)?, None, format) };
         let groups = (cfg.num_heads / cfg.num_kv_heads) as usize;
         let mut layers = Vec::with_capacity(cfg.mtp_num_hidden_layers);
         for i in 0..cfg.mtp_num_hidden_layers {
@@ -751,11 +1324,23 @@ impl Qwen35Mtp {
             norm: norm_w("mtp.norm.weight")?,
             rope: Rope::partial(cfg.rotary_dim(), cfg.rope_theta, false),
             mrope_section: cfg.mrope_section_resolved(),
+            attn_formulation: target.attn_formulation,
             eps,
             dtype,
             device: target.device.clone(),
             vocab_size: cfg.vocab_size as usize,
         })
+    }
+
+    /// Select how the predictor layers attend (see [`Qwen35Model::set_attn_formulation`]); the
+    /// head copies the target's selection when it is built.
+    pub fn set_attn_formulation(&mut self, formulation: AttnFormulation) {
+        self.attn_formulation = formulation;
+    }
+
+    /// How the predictor layers attend.
+    pub fn attn_formulation(&self) -> AttnFormulation {
+        self.attn_formulation
     }
 
     /// A fresh cache for the auxiliary full-attention layers.
@@ -779,11 +1364,25 @@ impl Qwen35Mtp {
         position: i32,
         cache: &mut Qwen35MtpCache,
     ) -> Result<(Tensor, Tensor)> {
+        let ids = Tensor::from_vec(vec![input_id as i64], (1, 1), &self.device)?;
+        self.step_ids(&ids, previous_hidden, step_idx, position, cache)
+    }
+
+    /// [`step`](Self::step) over a `[1, 1]` id tensor already on the device — how the greedy
+    /// proposer feeds each draft's device argmax straight into the next draft step without a host
+    /// transfer (sc-24130).
+    pub fn step_ids(
+        &self,
+        ids: &Tensor,
+        previous_hidden: &Tensor,
+        step_idx: usize,
+        position: i32,
+        cache: &mut Qwen35MtpCache,
+    ) -> Result<(Tensor, Tensor)> {
         if self.layers.is_empty() {
             return Err(Error::Msg("qwen3_5 MTP has no predictor layers".into()));
         }
-        let ids = Tensor::from_vec(vec![input_id as i64], (1, 1), &self.device)?;
-        let embeddings = self.embed_tokens.forward(&ids)?.to_dtype(self.dtype)?;
+        let embeddings = self.embed_tokens.forward(ids)?.to_dtype(self.dtype)?;
         self.step_from_embeddings(&embeddings, previous_hidden, step_idx, position, cache)
     }
 
@@ -960,7 +1559,8 @@ impl Qwen35Mtp {
         let fused = self.fc.forward(&Tensor::cat(&[&en, &hn], 2)?)?;
         let layer_idx = step_idx % self.layers.len();
         let mut slot = Qwen35LayerCache::Attn(cache.layers[layer_idx].clone());
-        let hidden = self.layers[layer_idx].forward(&fused, cos, sin, &mut slot)?;
+        let hidden =
+            self.layers[layer_idx].forward(&fused, cos, sin, &mut slot, self.attn_formulation)?;
         let Qwen35LayerCache::Attn(updated) = slot else {
             unreachable!("MTP layers are always full attention")
         };
@@ -976,6 +1576,29 @@ impl Qwen35Model {
         &self.cfg
     }
 
+    /// The resident weight set by projection kind (sc-24135 load telemetry): every projection the
+    /// decoder holds — including the ones a format leaves dense (`in_proj_a/b`, the MoE router is a
+    /// plain tensor) — plus embeddings, norms and recurrent parameters under `other`.
+    pub fn weight_census(&self) -> WeightCensus {
+        let mut census = WeightCensus::default();
+        // A dense tied head *is* the embedding tensor; count the storage once.
+        let head_is_embedding =
+            self.cfg.tie_word_embeddings && matches!(*self.lm_head, Projection::Dense(_));
+        match &self.embed_tokens {
+            QwenEmbedding::Dense(t) if !head_is_embedding => census.record_tensor(t),
+            QwenEmbedding::Dense(_) => {}
+            QwenEmbedding::Prism(p) => {
+                census.record_unmeasured((p.rows() * p.input_width()) as u64)
+            }
+        }
+        census.projections.record(&self.lm_head);
+        census.record_tensor(&self.norm);
+        for layer in &self.layers {
+            layer.record(&mut census);
+        }
+        census
+    }
+
     /// Whether the large projections were quantized on load.
     pub fn is_quantized(&self) -> bool {
         self.quantized
@@ -986,18 +1609,179 @@ impl Qwen35Model {
         self.dtype
     }
 
-    /// A fresh per-layer cache (linear vs full-attn slot per the schedule).
+    /// A fresh per-layer cache (linear vs full-attn slot per the schedule) for the reference and MTP
+    /// paths: it keeps [`REFERENCE_MAX_CHECKPOINTS`] (no) checkpoint ring.
     pub fn new_cache(&self) -> Qwen35Cache {
+        self.new_cache_with_checkpoints(REFERENCE_MAX_CHECKPOINTS)
+    }
+
+    /// The shape of one linear layer's recurrent state (batch 1) in this model's compute dtype.
+    fn recurrent_shape(&self) -> RecurrentShape {
+        let c = &self.cfg;
+        let key_dim = (c.linear_key_head_dim * c.linear_num_key_heads).max(0) as usize;
+        let value_dim = (c.linear_value_head_dim * c.linear_num_value_heads).max(0) as usize;
+        let conv_dim = key_dim * 2 + value_dim;
+        RecurrentShape {
+            conv_dims: (1, c.linear_conv_kernel_dim.max(1) as usize - 1, conv_dim),
+            conv_dtype: self.dtype,
+            ssm_dims: (
+                1,
+                c.linear_num_value_heads.max(0) as usize,
+                c.linear_value_head_dim.max(0) as usize,
+                c.linear_key_head_dim.max(0) as usize,
+            ),
+            device: self.device.clone(),
+        }
+    }
+
+    /// Bytes of recurrent (Gated DeltaNet) state a cache holding `states` states per linear layer
+    /// occupies: the live state alone for a ring-less cache (`1`), a ring of `depth + 1` slots for
+    /// a cache that can roll back `depth` positions — exactly what
+    /// [`Qwen35Cache::recurrent_bytes`] reports for such a cache, and the term admission prices
+    /// (E6). Saturating.
+    pub fn recurrent_state_bytes(&self, states: usize) -> usize {
+        let linear_layers = (0..self.cfg.num_layers)
+            .filter(|&i| self.cfg.is_linear(i))
+            .count();
+        self.recurrent_shape()
+            .ring_spec(states.max(1) - 1)
+            .bytes()
+            .saturating_mul(linear_layers)
+    }
+
+    /// A fresh cache whose linear layers can roll back `max_checkpoints` positions (see
+    /// [`Qwen35Cache::rollback_to`]): each keeps a ring of `max_checkpoints + 1` recurrent states
+    /// (`0`: no ring). The rings are allocated by the first forward, or eagerly by
+    /// [`Qwen35Cache::preallocate_recurrent`] (which [`StepModel::new_cache_for`] calls).
+    pub fn new_cache_with_checkpoints(&self, max_checkpoints: usize) -> Qwen35Cache {
+        let shape = self.recurrent_shape();
         let layers = (0..self.cfg.num_layers)
             .map(|i| {
                 if self.cfg.is_linear(i) {
-                    Qwen35LayerCache::Delta(DeltaNetCache::new())
+                    Qwen35LayerCache::Delta(Self::delta_slot(&shape, max_checkpoints))
                 } else {
                     Qwen35LayerCache::Attn(AttnKv::default())
                 }
             })
             .collect();
-        Qwen35Cache { layers }
+        Qwen35Cache {
+            layers,
+            max_checkpoints,
+            recurrent_shape: shape,
+            rope_delta: 0,
+        }
+    }
+
+    fn delta_slot(shape: &RecurrentShape, max_checkpoints: usize) -> DeltaNetCache {
+        if max_checkpoints == 0 {
+            DeltaNetCache::new()
+        } else {
+            // `slots >= 2` always holds here, the only refusal `with_ring` has.
+            DeltaNetCache::with_ring(shape.ring_spec(max_checkpoints))
+                .expect("a ring of at least two slots")
+        }
+    }
+
+    /// A fresh cache whose full-attention layers are **preallocated** [`StaticKvCache`]s holding
+    /// `capacity` positions (story sc-24132), whose linear layers can roll back `max_checkpoints`
+    /// positions (their rings are allocated by [`Qwen35Cache::preallocate_recurrent`] or the
+    /// first forward). The buffers — [`Qwen35Model::static_kv_bytes`] of device memory — are
+    /// allocated here, once; every step then writes in place. A `capacity` of zero is
+    /// [`Error::Msg`] (nothing could ever be written); one past the model's
+    /// `max_position_embeddings` is [`Error::KvCapacityExceeded`]. Both are refused before
+    /// anything is allocated.
+    pub fn new_static_cache(&self, capacity: usize, max_checkpoints: usize) -> Result<Qwen35Cache> {
+        if capacity == 0 {
+            return Err(Error::Msg(
+                "qwen3_5: a static KV cache needs a capacity of at least one position".into(),
+            ));
+        }
+        let max_positions = usize::try_from(self.cfg.max_position_embeddings).unwrap_or(0);
+        if max_positions > 0 && capacity > max_positions {
+            return Err(Error::KvCapacityExceeded {
+                requested: capacity,
+                capacity: max_positions,
+            });
+        }
+        let (kv_heads, head_dim) = (
+            self.cfg.num_kv_heads.max(0) as usize,
+            self.cfg.head_dim.max(0) as usize,
+        );
+        let shape = self.recurrent_shape();
+        let mut layers = Vec::with_capacity(self.cfg.num_layers);
+        for i in 0..self.cfg.num_layers {
+            layers.push(if self.cfg.is_linear(i) {
+                Qwen35LayerCache::Delta(Self::delta_slot(&shape, max_checkpoints))
+            } else {
+                Qwen35LayerCache::StaticAttn(StaticKvCache::new(
+                    1,
+                    1,
+                    kv_heads,
+                    head_dim,
+                    capacity,
+                    self.dtype,
+                    &self.device,
+                )?)
+            });
+        }
+        Ok(Qwen35Cache {
+            layers,
+            max_checkpoints,
+            recurrent_shape: shape,
+            rope_delta: 0,
+        })
+    }
+
+    /// Bytes [`new_static_cache`](Self::new_static_cache) preallocates for `capacity` positions:
+    /// K and V for every full-attention layer in the compute dtype — the term admission charges
+    /// for the preallocation (E6). Saturating.
+    pub fn static_kv_bytes(&self, capacity: usize) -> usize {
+        let attention_layers = (0..self.cfg.num_layers)
+            .filter(|&i| !self.cfg.is_linear(i))
+            .count();
+        StaticKvCache::buffer_bytes(
+            attention_layers,
+            1,
+            self.cfg.num_kv_heads.max(0) as usize,
+            self.cfg.head_dim.max(0) as usize,
+            capacity,
+            self.dtype,
+        )
+    }
+
+    /// Select which KV cache [`StepModel::new_cache_for`] builds: [`KvCacheKind::Static`] (the
+    /// default) or [`KvCacheKind::Growing`] — the reference `AttnKv` path, kept selectable as the
+    /// parity oracle.
+    pub fn set_step_kv_cache(&mut self, kind: KvCacheKind) {
+        self.step_kv_cache = kind;
+    }
+
+    /// Which KV cache [`StepModel::new_cache_for`] builds.
+    pub fn step_kv_cache(&self) -> KvCacheKind {
+        self.step_kv_cache
+    }
+
+    /// Select how the growing `AttnKv` slots attend (story sc-24132): [`AttnFormulation::Gqa`]
+    /// (the default — [`sdpa_gqa_causal`], the static cache's arithmetic, so the reference paths
+    /// and the static cache are token-identical by construction) or [`AttnFormulation::Expanded`]
+    /// (the pre-S4 `repeat_kv` + `sdpa` arithmetic, which reproduces the sealed pre-epic baseline's
+    /// bits; a labelled comparison row, never the fast path). Applies to every growing-slot path —
+    /// the reference `Decode` loop, the step driver with the growing cache selected, and the MTP
+    /// loop's target verify. The static cache always attends un-expanded. An MTP head copies the
+    /// target's formulation when it is built ([`Qwen35Mtp::set_attn_formulation`] changes it
+    /// afterwards).
+    pub fn set_attn_formulation(&mut self, formulation: AttnFormulation) {
+        self.attn_formulation = formulation;
+    }
+
+    /// How the growing `AttnKv` slots attend.
+    pub fn attn_formulation(&self) -> AttnFormulation {
+        self.attn_formulation
+    }
+
+    /// The device the model's tensors live on.
+    pub fn device(&self) -> &Device {
+        &self.device
     }
 
     /// Run the decoder stack over `input_ids` `[B, S]` at sequence `offset`, returning the final
@@ -1019,9 +1803,10 @@ impl Qwen35Model {
         sin: &Tensor,
         cache: &mut Qwen35Cache,
     ) -> Result<Tensor> {
+        cache.begin_forward(embeds.dim(1)?)?;
         let mut h = embeds.clone();
         for (layer, slot) in self.layers.iter().zip(cache.layers.iter_mut()) {
-            h = layer.forward(&h, cos, sin, slot)?;
+            h = layer.forward(&h, cos, sin, slot, self.attn_formulation)?;
         }
         Ok(h)
     }
@@ -1264,12 +2049,15 @@ impl Qwen35Model {
             &self.device,
         )?;
         let h0 = embeds.to_dtype(self.dtype)?;
+        cache.begin_forward(h0.dim(1)?)?;
         let h = deepstack_fused_decoder_layers(
             &h0,
             visual_pos_mask,
             deepstack,
             self.layers.len(),
-            |i, h| self.layers[i].forward(h, &cos, &sin, &mut cache.layers[i]),
+            |i, h| {
+                self.layers[i].forward(h, &cos, &sin, &mut cache.layers[i], self.attn_formulation)
+            },
         )?;
         self.project_last(&h)
     }
@@ -1292,12 +2080,15 @@ impl Qwen35Model {
             &self.device,
         )?;
         let h0 = embeds.to_dtype(self.dtype)?;
+        cache.begin_forward(h0.dim(1)?)?;
         let hidden = deepstack_fused_decoder_layers(
             &h0,
             visual_pos_mask,
             deepstack,
             self.layers.len(),
-            |i, h| self.layers[i].forward(h, &cos, &sin, &mut cache.layers[i]),
+            |i, h| {
+                self.layers[i].forward(h, &cos, &sin, &mut cache.layers[i], self.attn_formulation)
+            },
         )?;
         let hidden = self.normalize(&hidden)?;
         let logits = self.project_normalized(&hidden)?;
@@ -1320,12 +2111,15 @@ impl Qwen35Model {
             &self.device,
         )?;
         let h0 = embeds.to_dtype(self.dtype)?;
+        cache.begin_forward(h0.dim(1)?)?;
         let hidden = deepstack_fused_decoder_layers(
             &h0,
             visual_pos_mask,
             deepstack,
             self.layers.len(),
-            |i, h| self.layers[i].forward(h, &cos, &sin, &mut cache.layers[i]),
+            |i, h| {
+                self.layers[i].forward(h, &cos, &sin, &mut cache.layers[i], self.attn_formulation)
+            },
         )?;
         let hidden = self.normalize(&hidden)?;
         let (b, s, _) = hidden.dims3()?;
@@ -1352,6 +2146,17 @@ impl Qwen35Model {
         Self::from_weights_dtype(w, prefix, cfg, quant, compute_dtype(w.device()))
     }
 
+    /// Build from a loaded checkpoint storing the large projections in `format` (`None` = dense;
+    /// NVFP4 included, sc-24135) at the device's compute dtype.
+    pub fn from_weights_format(
+        w: &Weights,
+        prefix: &str,
+        cfg: Qwen35Config,
+        format: Option<&ProjectionFormat>,
+    ) -> Result<Self> {
+        Self::from_weights_dtype_impl(w, prefix, cfg, format, compute_dtype(w.device()), None)
+    }
+
     /// Build from a loaded checkpoint with an explicit compute `dtype`.
     ///
     /// `prefix` is the **decoder root** path: keys are read as `{prefix}.embed_tokens.weight`,
@@ -1367,7 +2172,8 @@ impl Qwen35Model {
         quant: Option<QuantSpec>,
         dtype: DType,
     ) -> Result<Self> {
-        Self::from_weights_dtype_impl(w, prefix, cfg, quant, dtype, None)
+        let format = quant.map(ProjectionFormat::from);
+        Self::from_weights_dtype_impl(w, prefix, cfg, format.as_ref(), dtype, None)
     }
 
     /// Build Qwen3.5/3.8 with compact Prism matrices while retaining ordinary tensors for norms,
@@ -1386,7 +2192,7 @@ impl Qwen35Model {
         w: &Weights,
         prefix: &str,
         cfg: Qwen35Config,
-        quant: Option<QuantSpec>,
+        format: Option<&ProjectionFormat>,
         dtype: DType,
         prism: Option<&PrismRegistry>,
     ) -> Result<Self> {
@@ -1409,7 +2215,7 @@ impl Qwen35Model {
         let proj_q = |key: String| -> Result<Projection> {
             match prism.and_then(|registry| registry.get(&key)) {
                 Some(weight) => Ok(Projection::load_prism(weight.clone())),
-                None => Projection::load(req(key)?, quant),
+                None => Projection::load_as(req(key)?, None, format),
             }
         };
         let proj_dense = |key: String| -> Result<Projection> {
@@ -1441,9 +2247,9 @@ impl Qwen35Model {
                     "Prism tied embeddings require an explicit lm_head packed tensor".into(),
                 ));
             };
-            Projection::load(weight.clone(), quant)?
+            Projection::load_as(weight.clone(), None, format)?
         } else {
-            Projection::load(req(head_key)?, quant)?
+            Projection::load_as(req(head_key)?, None, format)?
         };
         let lm_head = std::sync::Arc::new(lm_head);
 
@@ -1517,9 +2323,9 @@ impl Qwen35Model {
                         let up_w = gu.narrow(0, mi, mi)?.contiguous()?;
                         let dn = down.narrow(0, e, 1)?.squeeze(0)?.contiguous()?; // [hidden, mi]
                         experts.push(Mlp {
-                            gate: Projection::load(gate_w, quant)?,
-                            up: Projection::load(up_w, quant)?,
-                            down: Projection::load(dn, quant)?,
+                            gate: Projection::load_as(gate_w, None, format)?,
+                            up: Projection::load_as(up_w, None, format)?,
+                            down: Projection::load_as(dn, None, format)?,
                         });
                     }
                     Ffn::Moe(MoeFfn {
@@ -1555,7 +2361,9 @@ impl Qwen35Model {
             cfg,
             dtype,
             device,
-            quantized: quant.is_some() || prism.is_some(),
+            quantized: format.is_some() || prism.is_some(),
+            step_kv_cache: KvCacheKind::Static,
+            attn_formulation: AttnFormulation::Gqa,
         })
     }
 }
@@ -1574,6 +2382,7 @@ impl KvCache for Qwen35Cache {
             .iter()
             .find_map(|l| match l {
                 Qwen35LayerCache::Attn(a) => a.kv.as_ref().map(|(k, _)| k.dims()[0] as i32),
+                Qwen35LayerCache::StaticAttn(s) => (s.offset() > 0).then(|| s.batch_size()),
                 Qwen35LayerCache::Delta(_) => None,
             })
             .unwrap_or(0)
@@ -1607,8 +2416,95 @@ impl KvCache for Qwen35Cache {
         ))
     }
 
-    fn truncate(&mut self, _len: i32) -> Result<()> {
-        Err(Error::Msg("Qwen35Cache: truncate not supported".into()))
+    // Rollback through the trait object: exact where a checkpoint exists (see `rollback_to`).
+    fn truncate(&mut self, len: i32) -> Result<()> {
+        Qwen35Cache::rollback_to(self, len)
+    }
+}
+
+impl StepModel for Qwen35Model {
+    type Cache = Qwen35Cache;
+
+    /// A cache that can roll back [`STEP_MAX_CHECKPOINTS`] positions (its rings are allocated by
+    /// the first forward — this constructor cannot fail).
+    fn new_cache(&self) -> Qwen35Cache {
+        self.new_cache_with_checkpoints(STEP_MAX_CHECKPOINTS)
+    }
+
+    /// The static cache sized for `capacity + overshoot` positions (or the growing reference cache
+    /// when [`set_step_kv_cache`](Qwen35Model::set_step_kv_cache) selected it), whose linear
+    /// layers can roll back `overshoot + 1` positions: a verify step with `K = overshoot` drafts
+    /// writes `K + 1` positions and may roll back to any of them or to its start. Every ring is
+    /// allocated here, so the request fails closed with the device's error rather than at its
+    /// first forward.
+    fn new_cache_for(&self, capacity: usize, overshoot: usize) -> Result<Qwen35Cache> {
+        let depth = overshoot.saturating_add(1);
+        let mut cache = match self.step_kv_cache {
+            KvCacheKind::Static => {
+                self.new_static_cache(capacity.saturating_add(overshoot), depth)?
+            }
+            KvCacheKind::Growing => self.new_cache_with_checkpoints(depth),
+        };
+        cache.preallocate_recurrent()?;
+        Ok(cache)
+    }
+
+    /// The static cache always attends un-expanded ([`AttnFormulation::Gqa`]); a growing cache
+    /// runs the model's selector.
+    fn attn_formulation(&self, cache: &Qwen35Cache) -> AttnFormulation {
+        match cache.kv_kind() {
+            KvCacheKind::Static => AttnFormulation::Gqa,
+            KvCacheKind::Growing => self.attn_formulation,
+        }
+    }
+
+    /// Not replayable as a CUDA graph on this revision (story sc-24134), declared so the runner
+    /// refuses before any capture: the MoE block (35B-A3B) pulls its router probabilities to
+    /// the host every step (`moe_router_host_read`), and every step's positions are Rust-side
+    /// scalars — the RoPE tables built on the host for `offset`, the KV written at
+    /// `slice_set(offset)`, attention bounded by `narrow(len)` — which a graph would replay at
+    /// the captured position (`positions_host_scalar`).
+    fn graph_support(&self) -> std::result::Result<(), &'static str> {
+        if self.cfg.moe.is_some() {
+            return Err("moe_router_host_read");
+        }
+        Err("positions_host_scalar")
+    }
+
+    fn device(&self) -> &Device {
+        &self.device
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.cfg.vocab_size as usize
+    }
+
+    fn forward_step(
+        &self,
+        cache: &mut Qwen35Cache,
+        request: StepRequest<'_>,
+    ) -> Result<StepOutput> {
+        if request.is_empty()? {
+            return Err(Error::Msg(
+                "Qwen35Model::forward_step: empty token slice".into(),
+            ));
+        }
+        // RoPE positions continue from the cache, shifted by the caller's delta (M-RoPE prompts).
+        let offset = cache.offset() + cache.rope_delta();
+        let ids = request.tokens.ids(&self.device)?;
+        let (logits, hidden) = match (request.scope, request.want_hidden) {
+            (LogitsScope::Last, false) => (self.decode_logits(&ids, cache, offset)?, None),
+            (LogitsScope::Last, true) => {
+                let (logits, hidden) = self.prefill_with_hidden(&ids, cache, offset)?;
+                (logits, Some(hidden))
+            }
+            (LogitsScope::All, false) => (self.forward(&ids, cache, offset)?, None),
+            (LogitsScope::All, true) => {
+                let (logits, hidden) = self.forward_with_hidden(&ids, cache, offset)?;
+                (logits, Some(hidden))
+            }
+        };
+        Ok(StepOutput { logits, hidden })
     }
 }
 
@@ -1688,7 +2584,7 @@ impl crate::models::VlmDecode for Qwen35Model {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
@@ -2134,7 +3030,7 @@ mod tests {
 
         // The cache advanced and holds both the recurrent and conv state for a follow-on decode step.
         assert_eq!(cache.offset(), s as i32);
-        assert!(cache.conv_state.is_some() && cache.ssm_state.is_some());
+        assert!(cache.conv_state().is_some() && cache.ssm_state().is_some());
     }
 
     /// A MoE config (`qwen3_5_moe`, the 35B-A3B shape scaled down): 6 experts, top-2, with a shared
@@ -2263,7 +3159,7 @@ mod tests {
         );
     }
 
-    fn text_model() -> (Qwen35Config, Qwen35Model) {
+    pub(crate) fn text_model() -> (Qwen35Config, Qwen35Model) {
         let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
         let model = Qwen35Model::from_weights(
             &synthetic_weights(&cfg),
@@ -2272,6 +3168,145 @@ mod tests {
         )
         .unwrap();
         (cfg, model)
+    }
+
+    /// The synthetic decoder's weights moved to `device` (bf16 on a GPU, f32 on CPU: what the
+    /// loader would produce there).
+    #[cfg(feature = "cuda")]
+    fn synthetic_weights_on(cfg: &Qwen35Config, device: &Device) -> Weights {
+        let cpu = synthetic_weights(cfg);
+        Weights::from_map(
+            cpu.keys()
+                .map(|k| {
+                    (
+                        k.to_string(),
+                        cpu.require(k).unwrap().to_device(device).unwrap(),
+                    )
+                })
+                .collect(),
+            device.clone(),
+        )
+    }
+
+    /// [`text_model`] built on `device` (the CUDA-graph runner's tests).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn text_model_on(device: &Device) -> (Qwen35Config, Qwen35Model) {
+        let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
+        let model = Qwen35Model::from_weights(
+            &synthetic_weights_on(&cfg, device),
+            "model.language_model",
+            cfg.clone(),
+        )
+        .unwrap();
+        (cfg, model)
+    }
+
+    /// The synthetic decoder with **every** layer a full-attention layer (interval 1: no
+    /// Gated DeltaNet state), on `device` — the shape whose static cache holds nothing but
+    /// stable-address KV buffers (story sc-24134).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn text_model_attention_only_on(device: &Device) -> (Qwen35Config, Qwen35Model) {
+        let mut json = cfg_json();
+        json["text_config"]["full_attention_interval"] = json!(1);
+        let cfg = Qwen35Config::from_json(&json).unwrap();
+        let model = Qwen35Model::from_weights(
+            &synthetic_weights_on(&cfg, device),
+            "model.language_model",
+            cfg.clone(),
+        )
+        .unwrap();
+        (cfg, model)
+    }
+
+    /// The parts a test needs to write the synthetic decoder as a snapshot directory: its config,
+    /// its weights (no `mtp.*` tensors) and the config JSON (`text_config` with
+    /// `mtp_num_hidden_layers = 0`) — the provider-level AC3 fixture (sc-24130).
+    pub(crate) fn text_model_snapshot_parts() -> (Qwen35Config, Weights, Value) {
+        let mut json = cfg_json();
+        json["text_config"]["mtp_num_hidden_layers"] = json!(0);
+        let cfg = Qwen35Config::from_json(&json).unwrap();
+        let weights = synthetic_weights(&cfg);
+        assert!(!Qwen35Mtp::complete_in(&weights, &cfg));
+        (cfg, weights, json)
+    }
+
+    /// The synthetic decoder with `layers` decoder layers (the schedule keeps interval 4) — a
+    /// *different* model of the same vocabulary, the draft model of the engine's tests.
+    pub(crate) fn text_model_with_layers(layers: usize) -> (Qwen35Config, Qwen35Model) {
+        let mut json = cfg_json();
+        json["text_config"]["num_hidden_layers"] = json!(layers);
+        let cfg = Qwen35Config::from_json(&json).unwrap();
+        let model = Qwen35Model::from_weights(
+            &synthetic_weights(&cfg),
+            "model.language_model",
+            cfg.clone(),
+        )
+        .unwrap();
+        (cfg, model)
+    }
+
+    /// The same synthetic decoder with a complete one-layer MTP head (the speculative engine's
+    /// tiny-config fixture, sc-24130).
+    pub(crate) fn text_model_with_mtp() -> (Qwen35Config, Qwen35Model, Qwen35Mtp) {
+        let mut json = cfg_json();
+        json["text_config"]["mtp_num_hidden_layers"] = json!(1);
+        let cfg = Qwen35Config::from_json(&json).unwrap();
+        let weights = synthetic_weights(&cfg);
+        assert!(Qwen35Mtp::complete_in(&weights, &cfg));
+        let model =
+            Qwen35Model::from_weights(&weights, "model.language_model", cfg.clone()).unwrap();
+        let mtp = Qwen35Mtp::from_weights_with(&weights, &model, None).unwrap();
+        (cfg, model, mtp)
+    }
+
+    #[test]
+    fn step_seam_rope_delta_shifts_the_continuation_positions() {
+        // A cache prefilled at positions 0..3 whose continuation must run at 3 + delta (the
+        // M-RoPE `mrope_delta` after a multimodal prompt): the step seam's logits equal a direct
+        // `decode_logits` at that shifted offset, and differ from the unshifted ones.
+        let (_cfg, model) = text_model();
+        let prompt = [3, 1, 4];
+        let mut direct = model.new_cache();
+        model
+            .decode_logits(&ids(&[3, 1, 4]), &mut direct, 0)
+            .unwrap();
+        let shifted = model.decode_logits(&ids(&[9]), &mut direct, 3 + 5).unwrap();
+        let mut plain = model.new_cache();
+        model
+            .decode_logits(&ids(&[3, 1, 4]), &mut plain, 0)
+            .unwrap();
+        let unshifted = model.decode_logits(&ids(&[9]), &mut plain, 3).unwrap();
+
+        let mut cache = StepModel::new_cache(&model);
+        model
+            .forward_step(&mut cache, StepRequest::last(&prompt))
+            .unwrap();
+        cache.set_rope_delta(5);
+        assert_eq!(cache.rope_delta(), 5);
+        let via_step = model
+            .forward_step(&mut cache, StepRequest::last(&[9]))
+            .unwrap()
+            .logits;
+        assert_eq!(host(&via_step), host(&shifted));
+        assert_ne!(host(&via_step), host(&unshifted));
+        // The delta is configuration: a rollback keeps it, and a clone carries it.
+        cache.rollback_to(3).unwrap();
+        assert_eq!(cache.rope_delta(), 5);
+        assert_eq!(cache.try_clone().unwrap().rope_delta(), 5);
+        // Device-resident ids feed the same step as host ids.
+        let mut a = StepModel::new_cache(&model);
+        let mut b = StepModel::new_cache(&model);
+        let via_host = model
+            .forward_step(&mut a, StepRequest::all(&[3, 1, 4]))
+            .unwrap()
+            .logits;
+        let device_ids = ids(&[3, 1, 4]);
+        let via_device = model
+            .forward_step(&mut b, StepRequest::all_ids(&device_ids))
+            .unwrap()
+            .logits;
+        assert_eq!(host(&via_host), host(&via_device));
+        assert_eq!(via_host.dims(), &[1, 3, 50]);
     }
 
     /// `mrope_positions` (the `get_rope_index` port) must reproduce the reference 3-D position rows +
@@ -2404,5 +3439,1055 @@ mod tests {
             .unwrap();
         assert_eq!(logits.dims(), &[1, cfg.vocab_size as usize]);
         assert!(host(&logits).iter().all(|x| x.is_finite()));
+    }
+
+    /// The load census reports every projection the synthetic decoder holds, by kind, and every
+    /// other weight tensor, with f32 (CPU) resident bytes.
+    #[test]
+    fn dense_weight_census_covers_every_projection_and_tensor() {
+        let (cfg, model) = text_model();
+        let census = model.weight_census();
+        // 3 linear layers × (qkv, z, a, b, out) + 1 attention layer × (q, k, v, o)
+        // + 4 layers × (gate, up, down) + lm_head.
+        assert_eq!(census.projections.dense.count, 15 + 4 + 12 + 1);
+        assert_eq!(census.projections.total().count, 32);
+        let total = census.total();
+        assert_eq!(total.unmeasured, 0);
+        assert_eq!(total.resident_bytes, total.params * 4, "f32 on CPU");
+        // The embedding is resident beside the (untied) head.
+        assert!(!cfg.tie_word_embeddings);
+        assert!(census.other.params >= (cfg.vocab_size * cfg.hidden_size) as u64);
+    }
+
+    /// sc-24135: the loader selecting NVFP4 stores every large projection (and the head) as NVFP4,
+    /// keeps the per-head decay/delta projections dense exactly as Q4/Q8 do, and the decoder still
+    /// produces finite logits that track the dense model's.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn nvfp4_format_loads_the_large_projections_as_nvfp4() {
+        use crate::primitives::projection::{ProjectionFormat, ProjectionKind};
+        let Ok(device) = crate::device::new_cuda_for_test() else {
+            candle_quant_kernels::skip_without_sm120("no CUDA device");
+            return;
+        };
+        let Ok(format) = ProjectionFormat::nvfp4(&device) else {
+            candle_quant_kernels::skip_without_sm120("CUDA device below the NVFP4 floor");
+            return;
+        };
+        // The fixture's vocabulary (50) is not a multiple of 16; NVFP4 needs N % 16 == 0.
+        let mut v = cfg_json();
+        v["text_config"]["vocab_size"] = json!(64);
+        let cfg = Qwen35Config::from_json(&v).unwrap();
+        let cpu = synthetic_weights(&cfg);
+        let on_device = Weights::from_map(
+            cpu.keys()
+                .map(|k| {
+                    (
+                        k.to_string(),
+                        cpu.require(k).unwrap().to_device(&device).unwrap(),
+                    )
+                })
+                .collect(),
+            device.clone(),
+        );
+        let dense =
+            Qwen35Model::from_weights_format(&on_device, "model.language_model", cfg.clone(), None)
+                .unwrap();
+        let nvfp4 = Qwen35Model::from_weights_format(
+            &on_device,
+            "model.language_model",
+            cfg.clone(),
+            Some(&format),
+        )
+        .unwrap();
+        assert!(nvfp4.is_quantized());
+        assert_eq!(nvfp4.lm_head.kind(), ProjectionKind::Nvfp4);
+        let census = nvfp4.weight_census().projections;
+        assert_eq!(census.nvfp4.count, 32 - 6, "all but in_proj_a/b");
+        assert_eq!(
+            census.dense.count, 6,
+            "in_proj_a/b stay dense, as under Q4/Q8"
+        );
+        assert_eq!(census.ggml.count, 0);
+        assert!(
+            census.nvfp4.resident_bytes < census.nvfp4.params * 2,
+            "packed below bf16"
+        );
+
+        let prompt = Tensor::from_vec(vec![1u32, 7, 3, 42, 9], (1, 5), &device).unwrap();
+        let logits = |m: &Qwen35Model| {
+            let mut cache = m.new_cache();
+            m.forward(&prompt, &mut cache, 0)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let (want, got) = (logits(&dense), logits(&nvfp4));
+        assert!(got.iter().all(|x| x.is_finite()));
+        let dot: f64 = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (*a as f64) * (*b as f64))
+            .sum();
+        let norm = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+        let cosine = dot / (norm(&got) * norm(&want)).max(1e-30);
+        assert!(
+            cosine > 0.9,
+            "NVFP4 logits diverged from dense: cosine {cosine}"
+        );
+        // Cosine is scale-invariant; the relative RMS error also pins the logits' magnitude
+        // (measured 0.290 on sm_120, cosine 0.961; a head mis-scaled by 2 reads 0.83).
+        let err: f64 = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (*a as f64 - *b as f64).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let rel_rms = err / norm(&want).max(1e-30);
+        assert!(
+            rel_rms <= 0.3,
+            "NVFP4 logits diverged from dense: relative RMS {rel_rms}"
+        );
+    }
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        assert_eq!(a.dims(), b.dims());
+        host(a)
+            .iter()
+            .zip(&host(b))
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// **AC2 (tiny config).** Decode `m > n` tokens, roll back to `n`, re-decode token `n`: the
+    /// logits must equal a fresh decode to `n + 1` — exactly, since the restored recurrent state is
+    /// the same tensor and the narrowed KV holds the same values.
+    #[test]
+    fn rollback_to_then_redecode_matches_fresh_decode() {
+        let (_cfg, model) = text_model();
+        let toks = [1u32, 7, 3, 42, 9, 2, 11, 5];
+        let n = 3usize;
+        let m = toks.len();
+
+        // Fresh: prefill toks[..n], then decode toks[n] -> logits for position n.
+        let mut fresh = model.new_cache();
+        model
+            .decode_logits(&ids(&toks[..n]), &mut fresh, 0)
+            .unwrap();
+        let fresh_logits = model
+            .decode_logits(&ids(&[toks[n]]), &mut fresh, n as i32)
+            .unwrap();
+
+        // Rolled back: prefill toks[..n], decode toks[n..m] one at a time (m > n), roll back to n.
+        // Retention is opt-in beyond the default two: keep every position of this run.
+        let mut cache = model.new_cache();
+        cache.set_max_checkpoints(8).unwrap();
+        model
+            .decode_logits(&ids(&toks[..n]), &mut cache, 0)
+            .unwrap();
+        for (i, &t) in toks[n..m].iter().enumerate() {
+            model
+                .decode_logits(&ids(&[t]), &mut cache, (n + i) as i32)
+                .unwrap();
+        }
+        assert_eq!(cache.offset(), m as i32);
+        // Every position is a checkpoint — the prefill's interior ones included (sc-24131).
+        assert_eq!(
+            cache.checkpoint_offsets(),
+            (1..m as i32).collect::<Vec<_>>()
+        );
+        cache.rollback_to(n as i32).unwrap();
+        assert_eq!(cache.offset(), n as i32);
+        assert_eq!(
+            cache.checkpoint_offsets(),
+            (1..n as i32).collect::<Vec<_>>()
+        );
+        let replayed = model
+            .decode_logits(&ids(&[toks[n]]), &mut cache, n as i32)
+            .unwrap();
+        assert_eq!(
+            max_abs_diff(&fresh_logits, &replayed),
+            0.0,
+            "rollback_to({n}) then re-decode must equal a fresh decode"
+        );
+        assert_eq!(cache.offset(), n as i32 + 1);
+
+        // Continuing past the rollback point stays exact too (the conv tail was restored as well).
+        let mut fresh2 = fresh;
+        let a = model
+            .decode_logits(&ids(&[toks[n + 1]]), &mut fresh2, n as i32 + 1)
+            .unwrap();
+        let b = model
+            .decode_logits(&ids(&[toks[n + 1]]), &mut cache, n as i32 + 1)
+            .unwrap();
+        assert_eq!(max_abs_diff(&a, &b), 0.0);
+    }
+
+    /// Rollback refuses positions the ring no longer holds (older than `max_checkpoints` behind
+    /// the current one), and never approximates; `0` and the current position always work, and
+    /// every position the ring holds — inside a multi-token prefill too — is exact.
+    #[test]
+    fn rollback_is_exact_or_refused() {
+        let (_cfg, model) = text_model();
+        let mut cache = StepModel::new_cache(&model);
+        assert_eq!(cache.max_checkpoints(), STEP_MAX_CHECKPOINTS);
+        model
+            .decode_logits(&ids(&[1, 7, 3, 42]), &mut cache, 0)
+            .unwrap();
+        assert!(cache.rollback_to(4).is_ok(), "current position is a no-op");
+        assert_eq!(cache.offset(), 4);
+        // The ring holds the newest STEP_MAX_CHECKPOINTS positions behind the current one, even
+        // inside one multi-token forward (sc-24131).
+        assert_eq!(cache.checkpoint_offsets(), vec![2, 3]);
+        // Older positions are refused with the typed variant (the S2 speculative engine matches
+        // on it, not on text).
+        match cache.rollback_to(1) {
+            Err(Error::RollbackUnavailable { n: 1, have }) => assert_eq!(have, vec![2, 3]),
+            other => panic!("expected RollbackUnavailable {{ n: 1, have: [2, 3] }}, got {other:?}"),
+        }
+        assert_eq!(
+            cache.offset(),
+            4,
+            "a refused rollback leaves the cache untouched"
+        );
+        // Out of range is a plain error, not "no checkpoint".
+        assert!(
+            matches!(cache.rollback_to(5), Err(Error::Msg(_))),
+            "past the end"
+        );
+        assert!(matches!(cache.rollback_to(-1), Err(Error::Msg(_))));
+        // An interior position of the prefill is exact: re-decoding from it equals a fresh
+        // decode of that prefix.
+        cache.rollback_to(2).unwrap();
+        assert_eq!(cache.offset(), 2);
+        assert!(cache.checkpoint_offsets().is_empty());
+        let replayed = model.decode_logits(&ids(&[3]), &mut cache, 2).unwrap();
+        let mut fresh = model.new_cache();
+        model.decode_logits(&ids(&[1, 7]), &mut fresh, 0).unwrap();
+        let fresh_logits = model.decode_logits(&ids(&[3]), &mut fresh, 2).unwrap();
+        assert_eq!(max_abs_diff(&fresh_logits, &replayed), 0.0);
+        cache.rollback_to(0).unwrap();
+        assert_eq!(cache.offset(), 0);
+        assert!(cache.checkpoint_offsets().is_empty());
+        // The rings stay allocated (they are priced from creation): one slot live, the rest
+        // checkpoints, no KV.
+        let one_state = model.recurrent_state_bytes(1);
+        assert_eq!(
+            cache.memory(),
+            CacheMemory {
+                live_bytes: one_state,
+                checkpoint_bytes: one_state * STEP_MAX_CHECKPOINTS,
+            }
+        );
+
+        // Retention: with room for one position only the newest one behind the current survives.
+        cache.set_max_checkpoints(1).unwrap();
+        model.decode_logits(&ids(&[1, 7]), &mut cache, 0).unwrap();
+        model.decode_logits(&ids(&[3]), &mut cache, 2).unwrap();
+        model.decode_logits(&ids(&[42]), &mut cache, 3).unwrap();
+        assert_eq!(cache.checkpoint_offsets(), vec![3]);
+        assert!(matches!(
+            cache.rollback_to(2),
+            Err(Error::RollbackUnavailable { n: 2, .. })
+        ));
+        cache.rollback_to(3).unwrap();
+        assert_eq!(cache.offset(), 3);
+
+        // Through the `KvCache` trait object the same rollback is reachable as `truncate`.
+        let dyn_cache: &mut dyn KvCache = &mut cache;
+        crate::decode::Decode::step(&model, &ids(&[9]), dyn_cache, 3).unwrap();
+        assert!(dyn_cache.truncate(3).is_ok());
+        assert_eq!(dyn_cache.offset(), 3);
+
+        // The reference / MTP cache (`new_cache`, what `Decode::make_cache` boxes) keeps no ring,
+        // so it holds one recurrent state — and refuses any interior rollback.
+        let mut reference = model.new_cache();
+        assert_eq!(reference.max_checkpoints(), REFERENCE_MAX_CHECKPOINTS);
+        model
+            .decode_logits(&ids(&[1, 7, 3]), &mut reference, 0)
+            .unwrap();
+        model.decode_logits(&ids(&[42]), &mut reference, 3).unwrap();
+        model.decode_logits(&ids(&[9]), &mut reference, 4).unwrap();
+        assert!(reference.checkpoint_offsets().is_empty());
+        assert_eq!(reference.memory().checkpoint_bytes, 0);
+        assert!(reference.recurrent_ring_addresses().unwrap().is_empty());
+        match reference.rollback_to(4) {
+            Err(Error::RollbackUnavailable { n: 4, have }) => assert!(have.is_empty()),
+            other => panic!("expected RollbackUnavailable {{ n: 4, have: [] }}, got {other:?}"),
+        }
+    }
+
+    /// **AC1 (tiny config).** After one verify forward of `K + 1` tokens, rolling back to any
+    /// `j in 0..=K + 1` positions into it leaves every linear layer's conv and SSM state equal to
+    /// a fresh decode of that many tokens (max abs error `<= 1e-6`; exact on CPU), for every
+    /// `K in 1..=5` — and the rings' addresses never change across the verify step and the
+    /// rollbacks (the CUDA-graph identity).
+    #[test]
+    fn verify_step_rollback_to_every_position_matches_a_fresh_decode() {
+        let (_cfg, model) = text_model();
+        let prompt = [1u32, 7, 3, 42];
+        let toks = [9u32, 2, 11, 5, 8, 6, 4];
+        let p = prompt.len();
+        let states = |cache: &Qwen35Cache| -> Vec<(Vec<f32>, Vec<f32>)> {
+            cache
+                .layers
+                .iter()
+                .filter_map(|l| match l {
+                    Qwen35LayerCache::Delta(c) => Some((
+                        c.conv_state().map(host).unwrap_or_default(),
+                        c.ssm_state().map(host).unwrap_or_default(),
+                    )),
+                    _ => None,
+                })
+                .collect()
+        };
+        let max_err = |a: &[f32], b: &[f32]| -> f32 {
+            assert_eq!(a.len(), b.len());
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        };
+        for k in 1..=5usize {
+            // The engine's cache for `K` drafts (what `new_cache_for(_, K)` builds).
+            let mut cache = model.new_cache_for(32, k).unwrap();
+            assert_eq!(cache.max_checkpoints(), k + 1);
+            let addresses = cache.recurrent_ring_addresses().unwrap();
+            assert!(!addresses.is_empty());
+            model
+                .forward_step(&mut cache, StepRequest::last(&prompt.map(|t| t as i32)))
+                .unwrap();
+            let verify: Vec<i32> = toks[..k + 1].iter().map(|&t| t as i32).collect();
+            model
+                .forward_step(
+                    &mut cache,
+                    StepRequest {
+                        tokens: crate::decode::StepTokens::Host(&verify),
+                        scope: LogitsScope::All,
+                        want_hidden: false,
+                    },
+                )
+                .unwrap();
+            assert_eq!(cache.offset(), (p + k + 1) as i32);
+            assert_eq!(cache.recurrent_ring_addresses().unwrap(), addresses);
+            assert_eq!(
+                cache.checkpoint_offsets(),
+                (p as i32..(p + k + 1) as i32).collect::<Vec<_>>(),
+                "K={k}: the step start and every verify position are restorable"
+            );
+            for j in (0..=k + 1).rev() {
+                cache.rollback_to((p + j) as i32).unwrap();
+                assert_eq!(cache.recurrent_ring_addresses().unwrap(), addresses);
+                let mut fresh = model.new_cache();
+                model.decode_logits(&ids(&prompt), &mut fresh, 0).unwrap();
+                for (i, &t) in toks[..j].iter().enumerate() {
+                    model
+                        .decode_logits(&ids(&[t]), &mut fresh, (p + i) as i32)
+                        .unwrap();
+                }
+                let (got, want) = (states(&cache), states(&fresh));
+                assert_eq!(got.len(), want.len());
+                for (layer, ((gc, gs), (wc, ws))) in got.iter().zip(&want).enumerate() {
+                    let (ce, se) = (max_err(gc, wc), max_err(gs, ws));
+                    assert!(
+                        ce <= 1e-6 && se <= 1e-6,
+                        "K={k} j={j} layer {layer}: conv {ce:e} ssm {se:e}"
+                    );
+                }
+                // And the next token decodes the same from a fresh step cache of the same kind
+                // (static KV) that never rolled back — on a deep copy, so the extra forward does
+                // not slide the ring's window past the step start.
+                let next = toks[j] as i32;
+                let mut trial = cache.try_clone().unwrap();
+                assert_ne!(trial.recurrent_ring_addresses().unwrap(), addresses);
+                let a = model
+                    .forward_step(&mut trial, StepRequest::last(&[next]))
+                    .unwrap()
+                    .logits;
+                let mut fresh_step = model.new_cache_for(32, 0).unwrap();
+                let mut fed: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+                fed.extend(toks[..j].iter().map(|&t| t as i32));
+                model
+                    .forward_step(&mut fresh_step, StepRequest::last(&fed))
+                    .unwrap();
+                let b = model
+                    .forward_step(&mut fresh_step, StepRequest::last(&[next]))
+                    .unwrap()
+                    .logits;
+                // Not bit-identical: the two caches reached position `p + j` through different
+                // row counts (a `K + 1`-row verify forward vs one `p + j`-row prefill), and a
+                // GEMM's reduction order follows its row count (the S2 finding) — last-bit
+                // differences in the projections, well inside 1e-5 on this fixture. The
+                // recurrent state itself, compared above, is what the rollback restores.
+                let logits_err = max_abs_diff(&a, &b);
+                assert!(logits_err <= 1e-5, "K={k} j={j}: logits {logits_err:e}");
+                assert_eq!(
+                    cache.offset(),
+                    (p + j) as i32,
+                    "the copy's forward left the cache alone"
+                );
+            }
+        }
+    }
+
+    /// The memory accounting: a step cache's rings are priced in full from creation (one slot
+    /// live, the rest checkpoints) and never grow; the KV follows the live positions and a
+    /// rollback drops the rolled-back positions' KV bytes.
+    /// `set_max_checkpoints` builds every linear layer's new ring before swapping any in: a
+    /// replacement that fails part-way — here the second linear layer's, whose slots cannot hold
+    /// the state it must carry over — leaves every ring (depth, buffers, restorable positions),
+    /// the recurrent bytes and `max_checkpoints` exactly as they were.
+    #[test]
+    fn a_ring_replacement_failing_part_way_leaves_the_cache_untouched() {
+        let (_cfg, model) = text_model();
+        let mut cache = StepModel::new_cache(&model);
+        model
+            .decode_logits(&ids(&[1, 7, 3, 42]), &mut cache, 0)
+            .unwrap();
+        let rings = |c: &Qwen35Cache| -> Vec<(usize, Option<(usize, usize)>)> {
+            c.layers
+                .iter()
+                .filter_map(|l| match l {
+                    Qwen35LayerCache::Delta(d) => Some((d.depth(), d.ring_addresses().unwrap())),
+                    Qwen35LayerCache::Attn(_) | Qwen35LayerCache::StaticAttn(_) => None,
+                })
+                .collect()
+        };
+        let snapshot = |c: &Qwen35Cache| {
+            (
+                rings(c),
+                c.recurrent_bytes(),
+                c.max_checkpoints(),
+                c.checkpoint_offsets(),
+            )
+        };
+        let before = snapshot(&cache);
+
+        let good = cache.recurrent_shape.ring_spec(6);
+        let mut bad = good.clone();
+        bad.ssm_dims.2 += 1;
+        let failed = cache.replace_rings(6, &mut |linear| {
+            Some(if linear == 1 {
+                bad.clone()
+            } else {
+                good.clone()
+            })
+        });
+        assert!(
+            failed.is_err(),
+            "the second linear layer's replacement fails"
+        );
+        assert_eq!(snapshot(&cache), before, "nothing was swapped in");
+
+        // The same deepening with every replacement valid goes through, for every layer.
+        cache.set_max_checkpoints(6).unwrap();
+        let depths: Vec<usize> = rings(&cache).iter().map(|&(depth, _)| depth).collect();
+        assert_eq!(
+            (depths, cache.max_checkpoints()),
+            (vec![6; before.0.len()], 6)
+        );
+    }
+
+    #[test]
+    fn memory_accounting_tracks_live_state_and_checkpoints() {
+        let (cfg, model) = text_model();
+        let mut cache = StepModel::new_cache(&model);
+        let one_state = model.recurrent_state_bytes(1);
+        let ring = model.recurrent_state_bytes(1 + STEP_MAX_CHECKPOINTS);
+        assert_eq!(
+            cache.memory(),
+            CacheMemory {
+                live_bytes: one_state,
+                checkpoint_bytes: ring - one_state,
+            },
+            "the rings are priced from creation"
+        );
+        model
+            .decode_logits(&ids(&[1, 7, 3]), &mut cache, 0)
+            .unwrap();
+        let after_prefill = cache.memory();
+        // One full-attention layer: K and V of [1, nkv, 3, hd] f32 each.
+        let kv_bytes = 2 * (cfg.num_kv_heads as usize) * 3 * (cfg.head_dim as usize) * 4;
+        assert_eq!(
+            after_prefill.live_bytes,
+            kv_bytes + one_state,
+            "KV plus the live DeltaNet slot"
+        );
+        assert_eq!(after_prefill.checkpoint_bytes, ring - one_state);
+        model.decode_logits(&ids(&[42]), &mut cache, 3).unwrap();
+        let after_step = cache.memory();
+        assert_eq!(
+            after_step.live_bytes - after_prefill.live_bytes,
+            kv_bytes / 3,
+            "one more KV position; recurrent states are fixed-size"
+        );
+        assert_eq!(after_step.checkpoint_bytes, after_prefill.checkpoint_bytes);
+        assert_eq!(cache.recurrent_bytes(), ring);
+        assert_eq!(
+            cache.recurrent_bytes(),
+            after_step.total_bytes() - kv_bytes * 4 / 3
+        );
+        cache.rollback_to(3).unwrap();
+        assert_eq!(cache.memory().live_bytes, after_prefill.live_bytes);
+        assert_eq!(
+            cache.memory().total_bytes(),
+            after_step.total_bytes() - kv_bytes / 3
+        );
+        assert_eq!(
+            cache.recurrent_bytes(),
+            ring,
+            "a rollback frees nothing: slots are reused"
+        );
+    }
+
+    /// A schedule with no full-attention layer still reports its position (from the linear layers).
+    #[test]
+    fn offset_falls_back_to_linear_layers() {
+        let mut v = cfg_json();
+        v["text_config"]["full_attention_interval"] = json!(100);
+        let cfg = Qwen35Config::from_json(&v).unwrap();
+        assert!((0..cfg.num_layers).all(|i| cfg.is_linear(i)));
+        let model = Qwen35Model::from_weights(
+            &synthetic_weights(&cfg),
+            "model.language_model",
+            cfg.clone(),
+        )
+        .unwrap();
+        let mut cache = StepModel::new_cache(&model);
+        model
+            .decode_logits(&ids(&[1, 7, 3]), &mut cache, 0)
+            .unwrap();
+        assert_eq!(cache.offset(), 3);
+        model.decode_logits(&ids(&[9]), &mut cache, 3).unwrap();
+        assert_eq!(cache.offset(), 4);
+        cache.rollback_to(3).unwrap();
+        assert_eq!(cache.offset(), 3);
+    }
+
+    /// **AC1 (tiny config).** Greedy generation through the `StepModel` seam is token-identical to
+    /// the reference `Decode` loop, and the record says which path ran.
+    #[test]
+    fn step_model_greedy_matches_reference_decode_loop() {
+        use crate::decode::{generate_step, generate_with, CancelFlag, GenerationConfig};
+        let (_cfg, model) = text_model();
+        let prompt = [1i32, 7, 3, 42, 9];
+        let cfg = GenerationConfig {
+            max_new_tokens: 24,
+            seed: Some(3),
+            ..Default::default()
+        };
+        let reference =
+            generate_with(&model, &prompt, &cfg, &CancelFlag::new(), &mut |_| {}, None).unwrap();
+        let mut events = 0usize;
+        let (step, record) = generate_step(
+            &model,
+            &prompt,
+            &cfg,
+            &CancelFlag::new(),
+            &mut |e| {
+                if matches!(e, crate::decode::StreamEvent::Token { .. }) {
+                    events += 1;
+                }
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(step.tokens.len(), 24);
+        assert_eq!(step.tokens, reference.tokens);
+        assert_eq!(step.finish_reason, reference.finish_reason);
+        assert_eq!(events, 24);
+        assert_eq!(record.path, crate::decode::DecodePath::StepModel);
+        assert_eq!(record.target_forwards, 24, "prefill + 23 steps");
+        assert_eq!(record.generated_tokens, 24);
+        assert_eq!(
+            record.host_syncs, 24,
+            "one device argmax per token on the plain-greedy path"
+        );
+
+        // Sampling (positive temperature) is seed-deterministic and identical across the seams too.
+        let mut sampled = cfg.clone();
+        sampled.sampling.temperature = 0.9;
+        sampled.sampling.top_k = 5;
+        let reference = generate_with(
+            &model,
+            &prompt,
+            &sampled,
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+        )
+        .unwrap();
+        let (step, _) = generate_step(
+            &model,
+            &prompt,
+            &sampled,
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+        )
+        .unwrap();
+        assert_eq!(step.tokens, reference.tokens);
+    }
+
+    /// The `StepModel` step shapes: last vs all logits, optional hidden states, and the cache
+    /// advancing by the token count.
+    #[test]
+    fn step_model_shapes_and_cache_advance() {
+        let (cfg, model) = text_model();
+        let vocab = cfg.vocab_size as usize;
+        let hidden = cfg.hidden_size as usize;
+        let mut cache = StepModel::new_cache(&model);
+        let out = model
+            .forward_step(&mut cache, StepRequest::all(&[1, 7, 3]))
+            .unwrap();
+        assert_eq!(out.logits.dims(), &[1, 3, vocab]);
+        assert!(out.hidden.is_none());
+        assert_eq!(cache.len(), 3);
+        let out = model
+            .forward_step(&mut cache, StepRequest::last(&[42, 9]).with_hidden(true))
+            .unwrap();
+        assert_eq!(out.logits.dims(), &[1, vocab]);
+        assert_eq!(out.hidden.unwrap().dims(), &[1, 2, hidden]);
+        assert_eq!(cache.len(), 5);
+        let out = model
+            .forward_step(&mut cache, StepRequest::all(&[2]).with_hidden(true))
+            .unwrap();
+        assert_eq!(out.logits.dims(), &[1, 1, vocab]);
+        assert_eq!(out.hidden.unwrap().dims(), &[1, 1, hidden]);
+        assert!(model
+            .forward_step(&mut cache, StepRequest::last(&[]))
+            .is_err());
+        assert_eq!(StepModel::vocab_size(&model), vocab);
+        // The last-logits step equals the reference `decode_logits` at the same position.
+        let mut reference = model.new_cache();
+        model
+            .decode_logits(&ids(&[1, 7, 3, 42, 9, 2]), &mut reference, 0)
+            .unwrap();
+        let a = model.decode_logits(&ids(&[11]), &mut reference, 6).unwrap();
+        let b = model
+            .forward_step(&mut cache, StepRequest::last(&[11]))
+            .unwrap()
+            .logits;
+        assert!(max_abs_diff(&a, &b) < 1e-4);
+    }
+
+    // ---- Static KV cache (story sc-24132) ------------------------------------------------------
+
+    fn attention_layer_count(cfg: &Qwen35Config) -> usize {
+        (0..cfg.num_layers).filter(|&i| !cfg.is_linear(i)).count()
+    }
+
+    /// **AC1 (tiny config).** Greedy generation on the static KV cache is token-identical to the
+    /// `AttnKv` reference path — both through the reference `Decode` loop and through the same
+    /// `StepModel` driver with the growing cache selected — and the record names the cache that
+    /// ran. Step logits agree to f32 reduction order on every step.
+    #[test]
+    fn static_kv_greedy_matches_attn_kv_reference_path() {
+        use crate::decode::{generate_step, generate_with, CancelFlag, GenerationConfig};
+        let (_cfg, mut model) = text_model();
+        let prompt = [1i32, 7, 3, 42, 9];
+        let cfg = GenerationConfig {
+            max_new_tokens: 24,
+            seed: Some(3),
+            ..Default::default()
+        };
+        let reference =
+            generate_with(&model, &prompt, &cfg, &CancelFlag::new(), &mut |_| {}, None).unwrap();
+        assert_eq!(model.step_kv_cache(), KvCacheKind::Static);
+        let (fixed, record) =
+            generate_step(&model, &prompt, &cfg, &CancelFlag::new(), &mut |_| {}, None).unwrap();
+        assert_eq!(record.kv_cache, KvCacheKind::Static);
+        assert_eq!(record.path, crate::decode::DecodePath::StepModel);
+        assert_eq!(fixed.tokens.len(), 24);
+        assert_eq!(fixed.tokens, reference.tokens);
+
+        // The growing cache stays selectable through the same driver (the parity oracle).
+        model.set_step_kv_cache(KvCacheKind::Growing);
+        let (growing, record) =
+            generate_step(&model, &prompt, &cfg, &CancelFlag::new(), &mut |_| {}, None).unwrap();
+        assert_eq!(record.kv_cache, KvCacheKind::Growing);
+        assert_eq!(growing.tokens, reference.tokens);
+        model.set_step_kv_cache(KvCacheKind::Static);
+
+        // Logits parity per step: prefill (all positions) then single-token steps.
+        let mut fixed = model.new_static_cache(32, STEP_MAX_CHECKPOINTS).unwrap();
+        let mut growing = StepModel::new_cache(&model);
+        assert_eq!(fixed.kv_kind(), KvCacheKind::Static);
+        assert_eq!(growing.kv_kind(), KvCacheKind::Growing);
+        let a = model
+            .forward_step(&mut fixed, StepRequest::all(&prompt))
+            .unwrap()
+            .logits;
+        let b = model
+            .forward_step(&mut growing, StepRequest::all(&prompt))
+            .unwrap()
+            .logits;
+        assert_eq!(a.dims(), &[1, 5, 50]);
+        assert!(max_abs_diff(&a, &b) < 1e-5);
+        for t in [2i32, 11, 40, 5, 5, 17] {
+            let a = model
+                .forward_step(&mut fixed, StepRequest::last(&[t]))
+                .unwrap()
+                .logits;
+            let b = model
+                .forward_step(&mut growing, StepRequest::last(&[t]))
+                .unwrap()
+                .logits;
+            assert!(max_abs_diff(&a, &b) < 1e-5);
+        }
+        assert_eq!(fixed.len(), growing.len());
+        // A multi-token (verify-shaped) step after a prefix agrees too.
+        let a = model
+            .forward_step(&mut fixed, StepRequest::all(&[8, 9, 10]))
+            .unwrap()
+            .logits;
+        let b = model
+            .forward_step(&mut growing, StepRequest::all(&[8, 9, 10]))
+            .unwrap()
+            .logits;
+        assert!(max_abs_diff(&a, &b) < 1e-5);
+    }
+
+    /// **AC2 (op counter).** After warm-up, N single-token steps on the static cache record **zero**
+    /// KV materializations (no `cat`, no `repeat_kv`) and the cache's live bytes do not grow; the
+    /// growing cache under the same driver records exactly one per attention layer per step (the
+    /// `cat` pair — it attends un-expanded through `sdpa_gqa_causal` like the static cache), and
+    /// with the `Expanded` formulation selected three (the `cat` pair plus two `repeat_kv`) — which
+    /// is what proves both that the counter counts and that the selector switches the arithmetic.
+    #[test]
+    fn static_kv_decode_steps_materialize_nothing_and_hold_memory_flat() {
+        use crate::primitives::kv_cache::kv_materialize_count;
+        let (cfg, mut model) = text_model();
+        let attention_layers = attention_layer_count(&cfg);
+        assert_eq!(attention_layers, 1);
+        let steps = 16usize;
+
+        let mut fixed = model.new_static_cache(64, STEP_MAX_CHECKPOINTS).unwrap();
+        model
+            .forward_step(&mut fixed, StepRequest::last(&[1, 7, 3]))
+            .unwrap();
+        for t in [42i32, 9] {
+            model
+                .forward_step(&mut fixed, StepRequest::last(&[t]))
+                .unwrap(); // warm-up
+        }
+        let memory = fixed.memory();
+        let before = kv_materialize_count();
+        for i in 0..steps {
+            model
+                .forward_step(&mut fixed, StepRequest::last(&[(i % 50) as i32]))
+                .unwrap();
+        }
+        assert_eq!(
+            kv_materialize_count() - before,
+            0,
+            "static KV steps must issue no cat / repeat_kv copies"
+        );
+        assert_eq!(
+            fixed.memory().live_bytes,
+            memory.live_bytes,
+            "static KV live bytes are the preallocation and never grow"
+        );
+        assert_eq!(fixed.len(), 5 + steps as i32);
+
+        let mut growing = StepModel::new_cache(&model);
+        model
+            .forward_step(&mut growing, StepRequest::last(&[1, 7, 3]))
+            .unwrap();
+        for t in [42i32, 9] {
+            model
+                .forward_step(&mut growing, StepRequest::last(&[t]))
+                .unwrap();
+        }
+        let memory = growing.memory();
+        let before = kv_materialize_count();
+        for i in 0..steps {
+            model
+                .forward_step(&mut growing, StepRequest::last(&[(i % 50) as i32]))
+                .unwrap();
+        }
+        assert_eq!(
+            kv_materialize_count() - before,
+            (attention_layers * steps) as u64,
+            "the growing gqa path materializes only the cat pair per attention layer per step"
+        );
+        assert!(growing.memory().live_bytes > memory.live_bytes);
+
+        // The pre-S4 expanded formulation, selectable for comparison rows only: two `repeat_kv`
+        // on top of the `cat` pair, on the growing slots.
+        model.set_attn_formulation(AttnFormulation::Expanded);
+        assert_eq!(model.attn_formulation(), AttnFormulation::Expanded);
+        let before = kv_materialize_count();
+        for i in 0..steps {
+            model
+                .forward_step(&mut growing, StepRequest::last(&[(i % 50) as i32]))
+                .unwrap();
+        }
+        assert_eq!(
+            kv_materialize_count() - before,
+            (3 * attention_layers * steps) as u64,
+            "the expanded formulation materializes cat + 2x repeat_kv per attention layer per step"
+        );
+        // ... and never touches the static cache, which has no expansion to select.
+        let before = kv_materialize_count();
+        for i in 0..steps {
+            model
+                .forward_step(&mut fixed, StepRequest::last(&[(i % 50) as i32]))
+                .unwrap();
+        }
+        assert_eq!(kv_materialize_count() - before, 0);
+        model.set_attn_formulation(AttnFormulation::Gqa);
+    }
+
+    /// The two formulations agree on the tiny f32 config to reduction order (the growing slots
+    /// attend through `sdpa_gqa_causal` or `repeat_kv` + `sdpa`; same tokens either way), and the
+    /// step record names the formulation that ran.
+    #[test]
+    fn attn_formulation_selector_switches_the_growing_arithmetic_and_is_recorded() {
+        use crate::decode::{generate_step, CancelFlag, GenerationConfig};
+        let (_cfg, mut model) = text_model();
+        let prompt = [1i32, 7, 3, 42, 9];
+        let cfg = GenerationConfig {
+            max_new_tokens: 12,
+            seed: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(model.attn_formulation(), AttnFormulation::Gqa);
+        model.set_step_kv_cache(KvCacheKind::Growing);
+        let (gqa, record) =
+            generate_step(&model, &prompt, &cfg, &CancelFlag::new(), &mut |_| {}, None).unwrap();
+        assert_eq!(record.attn_formulation, AttnFormulation::Gqa);
+        assert_eq!(record.kv_cache, KvCacheKind::Growing);
+        model.set_attn_formulation(AttnFormulation::Expanded);
+        let (expanded, record) =
+            generate_step(&model, &prompt, &cfg, &CancelFlag::new(), &mut |_| {}, None).unwrap();
+        assert_eq!(record.attn_formulation, AttnFormulation::Expanded);
+        assert_eq!(expanded.tokens, gqa.tokens);
+        // The static cache ignores the selector, and its record says so (what ran, not what was
+        // configured).
+        model.set_step_kv_cache(KvCacheKind::Static);
+        let (fixed, record) =
+            generate_step(&model, &prompt, &cfg, &CancelFlag::new(), &mut |_| {}, None).unwrap();
+        assert_eq!(record.kv_cache, KvCacheKind::Static);
+        assert_eq!(record.attn_formulation, AttnFormulation::Gqa);
+        assert_eq!(fixed.tokens, gqa.tokens);
+        model.set_step_kv_cache(KvCacheKind::Growing);
+
+        let mut a = StepModel::new_cache(&model);
+        let mut b = StepModel::new_cache(&model);
+        model.set_attn_formulation(AttnFormulation::Gqa);
+        let la = model
+            .forward_step(&mut a, StepRequest::all(&prompt))
+            .unwrap()
+            .logits;
+        model.set_attn_formulation(AttnFormulation::Expanded);
+        let lb = model
+            .forward_step(&mut b, StepRequest::all(&prompt))
+            .unwrap()
+            .logits;
+        assert!(max_abs_diff(&la, &lb) < 1e-5);
+    }
+
+    /// **AC3 (tiny config, storage identity).** Through 100 single-token steps and a rollback the
+    /// static attention buffers keep their storage addresses; the rollback then re-decodes exactly
+    /// (the rolled-back positions are overwritten in place).
+    #[test]
+    fn static_kv_buffers_keep_their_addresses_across_100_steps_and_rollback() {
+        let (_cfg, model) = text_model();
+        let mut cache = model.new_static_cache(128, 8).unwrap();
+        let addresses = cache.static_kv_addresses().unwrap();
+        assert_eq!(addresses.len(), 1);
+        assert_ne!(addresses[0].0, addresses[0].1);
+        model
+            .forward_step(&mut cache, StepRequest::last(&[1, 7, 3]))
+            .unwrap();
+        for i in 0..100 {
+            model
+                .forward_step(&mut cache, StepRequest::last(&[i * 7 % 50]))
+                .unwrap();
+            assert_eq!(cache.static_kv_addresses().unwrap(), addresses);
+        }
+        assert_eq!(cache.len(), 103);
+        let n = *cache.checkpoint_offsets().first().unwrap();
+        assert!(n > 3 && n < 103);
+        let fresh_logits = {
+            let mut fresh = model.new_static_cache(128, 0).unwrap();
+            let mut tokens = vec![1i32, 7, 3];
+            tokens.extend((0..(n - 3)).map(|i| i * 7 % 50));
+            model
+                .forward_step(&mut fresh, StepRequest::last(&tokens))
+                .unwrap();
+            model
+                .forward_step(&mut fresh, StepRequest::last(&[33]))
+                .unwrap()
+                .logits
+        };
+        cache.rollback_to(n).unwrap();
+        assert_eq!(cache.len(), n);
+        assert_eq!(cache.static_kv_addresses().unwrap(), addresses);
+        let replayed = model
+            .forward_step(&mut cache, StepRequest::last(&[33]))
+            .unwrap()
+            .logits;
+        assert_eq!(cache.static_kv_addresses().unwrap(), addresses);
+        assert!(max_abs_diff(&fresh_logits, &replayed) < 1e-5);
+        assert_eq!(cache.len(), n + 1);
+        cache.reset();
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.static_kv_addresses().unwrap(), addresses);
+    }
+
+    /// sc-24134 after sc-24131: the cache's CUDA-graph declaration. A linear layer that keeps the
+    /// per-token checkpoint ring holds its state at stable addresses, so the engine's static cache
+    /// passes — before and after a forward — and the model's own `positions_host_scalar` is what
+    /// refuses it; a ring-less linear layer still replaces its state per step
+    /// (`deltanet_state_unstable`, including once a ring is dropped), and a growing attention
+    /// cache is `growing_kv`.
+    #[test]
+    fn graph_support_accepts_the_ringed_static_cache_and_names_the_rest() {
+        let (_cfg, model) = text_model();
+        assert_eq!(model.graph_support(), Err("positions_host_scalar"));
+
+        let mut ringed = model.new_static_cache(16, STEP_MAX_CHECKPOINTS).unwrap();
+        assert_eq!(DecodeCache::graph_support(&ringed), Ok(()));
+        model
+            .forward_step(&mut ringed, StepRequest::last(&[1, 7, 3]))
+            .unwrap();
+        model
+            .forward_step(&mut ringed, StepRequest::last(&[5]))
+            .unwrap();
+        assert_eq!(DecodeCache::graph_support(&ringed), Ok(()));
+        ringed.set_max_checkpoints(0).unwrap();
+        assert_eq!(
+            DecodeCache::graph_support(&ringed),
+            Err("deltanet_state_unstable")
+        );
+
+        let ringless = model
+            .new_static_cache(16, REFERENCE_MAX_CHECKPOINTS)
+            .unwrap();
+        assert_eq!(
+            DecodeCache::graph_support(&ringless),
+            Err("deltanet_state_unstable")
+        );
+        let growing = model.new_cache_with_checkpoints(STEP_MAX_CHECKPOINTS);
+        assert_eq!(DecodeCache::graph_support(&growing), Err("growing_kv"));
+    }
+
+    /// **E6.** The static cache is bounded by the request and the model: a capacity of zero is a
+    /// plain error (not a capacity bound), one past `max_position_embeddings` is the typed
+    /// `KvCapacityExceeded` — both refused before allocation; a step that would run past the
+    /// capacity is refused **before** any layer runs, leaving the cache (and its checkpoints)
+    /// exactly as they were; the step driver surfaces the same typed error for an over-budget
+    /// request.
+    #[test]
+    fn static_kv_capacity_is_bounded_and_fails_closed() {
+        use crate::decode::{generate_step, CancelFlag, GenerationConfig};
+        let (cfg, model) = text_model();
+        assert_eq!(cfg.max_position_embeddings, 128);
+        let zero = model.new_static_cache(0, 0).unwrap_err();
+        assert!(
+            matches!(&zero, Error::Msg(m) if m.contains("at least one position")),
+            "{zero}"
+        );
+        assert!(matches!(
+            model.new_static_cache(129, 0),
+            Err(Error::KvCapacityExceeded {
+                requested: 129,
+                capacity: 128
+            })
+        ));
+        assert_eq!(
+            model.new_static_cache(128, 0).unwrap().kv_capacity(),
+            Some(128)
+        );
+
+        let mut cache = model.new_static_cache(6, STEP_MAX_CHECKPOINTS).unwrap();
+        model
+            .forward_step(&mut cache, StepRequest::last(&[1, 7, 3, 42]))
+            .unwrap();
+        let checkpoints = cache.checkpoint_offsets();
+        let memory = cache.memory();
+        let err = model
+            .forward_step(&mut cache, StepRequest::last(&[9, 2, 11]))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::KvCapacityExceeded {
+                    requested: 7,
+                    capacity: 6
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(cache.len(), 4, "a refused step does not advance");
+        assert_eq!(cache.checkpoint_offsets(), checkpoints);
+        assert_eq!(cache.memory(), memory);
+        model
+            .forward_step(&mut cache, StepRequest::last(&[9, 2]))
+            .unwrap();
+        assert_eq!(cache.len(), 6);
+
+        // Through the driver: prompt + budget past the model bound.
+        let over = GenerationConfig {
+            max_new_tokens: 200,
+            seed: Some(1),
+            ..Default::default()
+        };
+        let err = generate_step(
+            &model,
+            &[1, 7, 3],
+            &over,
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::KvCapacityExceeded {
+                    requested: 203,
+                    capacity: 128
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    /// **E6.** The preallocation is what the cache reports as live bytes from its first step, and
+    /// [`Qwen35Model::static_kv_bytes`] is that exact number (the term admission charges).
+    #[test]
+    fn static_kv_preallocation_is_priced_exactly() {
+        let (cfg, model) = text_model();
+        let capacity = 40usize;
+        let cache = model.new_static_cache(capacity, 0).unwrap();
+        let expected = attention_layer_count(&cfg)
+            * 2
+            * (cfg.num_kv_heads as usize)
+            * (cfg.head_dim as usize)
+            * capacity
+            * model.compute_dtype().size_in_bytes();
+        assert_eq!(model.static_kv_bytes(capacity), expected);
+        assert_eq!(
+            cache.memory().live_bytes,
+            expected,
+            "an empty static cache already holds its whole preallocation"
+        );
+        let mut cache = cache;
+        model
+            .forward_step(&mut cache, StepRequest::last(&[1, 7, 3]))
+            .unwrap();
+        assert!(cache.memory().live_bytes >= expected);
+        assert_eq!(
+            cache.memory().live_bytes - expected,
+            cache.recurrent_bytes(),
+            "past the preallocation only the recurrent state is live"
+        );
     }
 }

@@ -8,11 +8,13 @@
 use std::collections::HashMap;
 
 use candle_core::{Device, Tensor};
+use candle_llm::decode::DecodePath;
+use candle_llm::primitives::KvCacheKind;
 use candle_llm::LlamaProvider;
 use core_llm::{
     Channel, ChatTemplate, FinishReason, JinjaChatTemplate, LoadSpec, Message, MtpMode,
-    ReasoningEffort, RenderOptions, Sampling, StreamEvent, TextLlm, TextLlmRequest, ThinkingMode,
-    Tokenizer, ToolSpec,
+    ProposerKind, ReasoningEffort, RenderOptions, Sampling, StreamEvent, TextLlm, TextLlmRequest,
+    ThinkingMode, Tokenizer, ToolSpec,
 };
 use serde_json::Value;
 
@@ -160,6 +162,16 @@ fn zero_vector(map: &mut HashMap<String, Tensor>, key: impl Into<String>, len: u
 /// target embedding points along dimension zero. The LM head selects either ordinary token 1 or the
 /// frozen EOS token, while the zero MTP fusion predicts token 0 and exercises target rejection.
 fn write_snapshot(tokenizer_path: &std::path::Path, stop_first: bool) -> tempfile::TempDir {
+    write_snapshot_with(tokenizer_path, stop_first, true)
+}
+
+/// [`write_snapshot`] with or without the MTP head (`with_mtp`): a checkpoint without one
+/// advertises no MTP capability, so `MtpMode::Auto` must decode normally and say `proposer=none`.
+fn write_snapshot_with(
+    tokenizer_path: &std::path::Path,
+    stop_first: bool,
+    with_mtp: bool,
+) -> tempfile::TempDir {
     let guard = tempfile::Builder::new()
         .prefix("candle-qwen38-mtp-")
         .tempdir()
@@ -195,9 +207,10 @@ fn write_snapshot(tokenizer_path: &std::path::Path, stop_first: bool) -> tempfil
             "full_attention_interval":1, "linear_num_value_heads":2,
             "linear_num_key_heads":1, "linear_key_head_dim":4,
             "linear_value_head_dim":4, "linear_conv_kernel_dim":4,
-            "mtp_num_hidden_layers":1, "mtp_use_dedicated_embeddings":false
+            "mtp_num_hidden_layers":MTP_LAYERS, "mtp_use_dedicated_embeddings":false
           }
-        }"#,
+        }"#
+        .replace("MTP_LAYERS", if with_mtp { "1" } else { "0" }),
     )
     .unwrap();
 
@@ -268,11 +281,13 @@ fn write_snapshot(tokenizer_path: &std::path::Path, stop_first: bool) -> tempfil
         );
     };
     add_layer("model.language_model.layers.0");
-    add_layer("mtp.layers.0");
-    zeros(&mut tensors, "mtp.fc.weight", (HIDDEN, HIDDEN * 2));
-    zero_vector(&mut tensors, "mtp.pre_fc_norm_embedding.weight", HIDDEN);
-    zero_vector(&mut tensors, "mtp.pre_fc_norm_hidden.weight", HIDDEN);
-    zero_vector(&mut tensors, "mtp.norm.weight", HIDDEN);
+    if with_mtp {
+        add_layer("mtp.layers.0");
+        zeros(&mut tensors, "mtp.fc.weight", (HIDDEN, HIDDEN * 2));
+        zero_vector(&mut tensors, "mtp.pre_fc_norm_embedding.weight", HIDDEN);
+        zero_vector(&mut tensors, "mtp.pre_fc_norm_hidden.weight", HIDDEN);
+        zero_vector(&mut tensors, "mtp.norm.weight", HIDDEN);
+    }
     candle_core::safetensors::save(&tensors, dir.join("model.safetensors")).unwrap();
     guard
 }
@@ -362,6 +377,11 @@ fn frozen_qwen38_provider_executes_ar_mtp_tools_and_stops() {
         "native Qwen AR reports synchronized phase timings"
     );
     assert_eq!(ar.usage.generated_tokens, 2);
+    // Speculation off decodes on the engine with no proposer, on the static cache (sc-24140).
+    let ar_record = provider.last_decode_record().unwrap();
+    assert_eq!(ar_record.path, DecodePath::StepModel);
+    assert_eq!(ar_record.kv_cache, KvCacheKind::Static);
+    assert_eq!(ar_record.proposer, ProposerKind::None);
 
     let mut mtp_request = request("What is 2+2?", 4);
     mtp_request.mtp = MtpMode::Enabled { draft_tokens: 3 };
@@ -387,6 +407,16 @@ fn frozen_qwen38_provider_executes_ar_mtp_tools_and_stops() {
     assert_eq!(stats.accepted_tokens, 0, "fixture forces MTP rejection");
     assert!(stats.proposed_tokens > 0);
     assert!(stats.target_forwards >= 2);
+    // The unified engine ran it (sc-24130): the record names the proposer, the static step cache
+    // and one host sync per verify step (AC2).
+    let mtp_record = provider.last_decode_record().unwrap();
+    assert_eq!(mtp_record.path, DecodePath::Mtp { drafts: 3 });
+    assert_eq!(mtp_record.proposer, ProposerKind::Mtp);
+    assert_eq!(mtp_record.kv_cache, KvCacheKind::Static);
+    assert_eq!(mtp_record.proposed_tokens, u64::from(stats.proposed_tokens));
+    assert_eq!(mtp_record.target_forwards, u64::from(stats.target_forwards));
+    assert!(mtp_record.verify_steps > 0);
+    assert_eq!(mtp_record.host_syncs_per_verify_step(), Some(1.0));
 
     let mut tool_request = request("weather in Paris?", 2);
     tool_request.thinking = ThinkingMode::Auto;
@@ -418,6 +448,35 @@ fn frozen_qwen38_provider_executes_ar_mtp_tools_and_stops() {
     assert_eq!(token_events, 0, "EOS is never surfaced as a token delta");
     let stop_stats = stopped.mtp.expect("MTP route still reports its prefill");
     assert_eq!(stop_stats.proposed_tokens, 0);
+
+    // AC3 (sc-24130): the same checkpoint without an MTP head advertises no MTP; `Auto` decodes
+    // normally — the engine with no proposer (sc-24140) — and the record says `proposer=none`;
+    // `Enabled` is refused rather than downgraded.
+    drop(stop_provider);
+    drop(stop_snapshot);
+    let plain_snapshot = write_snapshot_with(&tokenizer_path, false, false);
+    let plain_provider = LlamaProvider::load(&LoadSpec::dense(
+        plain_snapshot.path().display().to_string(),
+    ))
+    .unwrap();
+    assert!(plain_provider.descriptor().capabilities.mtp.is_none());
+    let mut auto_request = request("auto without a head", 3);
+    auto_request.mtp = MtpMode::Auto;
+    let auto_output = plain_provider.generate(&auto_request, &mut |_| {}).unwrap();
+    assert!(auto_output.mtp.is_none());
+    assert_eq!(auto_output.usage.generated_tokens, 3);
+    let auto_record = plain_provider.last_decode_record().unwrap();
+    assert_eq!(auto_record.path, DecodePath::StepModel);
+    assert_eq!(auto_record.kv_cache, KvCacheKind::Static);
+    assert_eq!(auto_record.proposer, ProposerKind::None);
+    assert_eq!(auto_record.proposer.label(), "none");
+    assert_eq!(auto_record.proposed_tokens, 0);
+    let mut enabled_request = request("enabled without a head", 3);
+    enabled_request.mtp = MtpMode::Enabled { draft_tokens: 3 };
+    assert!(matches!(
+        plain_provider.generate(&enabled_request, &mut |_| {}),
+        Err(core_llm::Error::Unsupported(_))
+    ));
     assert_eq!(stop_stats.accepted_tokens, 0);
     assert_eq!(stop_stats.target_forwards, 1);
 }

@@ -77,15 +77,16 @@ fn main() {
     ];
     collect_rs(&manifest.join("src"), &mut files);
     collect_rs(&manifest.join("examples"), &mut files);
-    for name in [
-        "convrot.rs",
-        "eight_bit_linear.rs",
-        "nvfp4.rs",
-        "nvfp4_linear.rs",
-        "cublaslt.rs",
-    ] {
+    for name in ["convrot.rs", "eight_bit_linear.rs"] {
         files.push(
             repo.join("crates/media/candle-gen/candle-gen/src/quant")
+                .join(name),
+        );
+    }
+    // The NVFP4 codec + cuBLASLt wrapper moved to the shared kernels crate in sc-24135.
+    for name in ["nvfp4.rs", "nvfp4_linear.rs", "cublaslt.rs"] {
+        files.push(
+            repo.join("crates/kernels/candle-quant-kernels/src")
                 .join(name),
         );
     }

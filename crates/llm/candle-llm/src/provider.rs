@@ -9,14 +9,15 @@
 
 use std::cell::OnceCell;
 use std::path::Path;
+use std::sync::Mutex;
 
 use candle_core::{DType, Device, Tensor};
 use core_llm::{
     AudioRef, Channel, ChatTemplate, Constraint, ConstraintDecodeTable, ConstraintKind, Content,
     Error as CoreError, FinishReason as CoreFinish, GenerationTimings, ImageRef, IncrementalDetok,
     JinjaChatTemplate, JsonConstraint, Llama3Template, LlmMemoryGeometry, LoadSpec, Message,
-    ModelSamplingDefaults, MtpCapabilities, MtpMode, MtpStats, Quantize, ReasoningEffort,
-    RenderOptions, Result as CoreResult, Sampling, StopMatcher, StreamEvent as CoreEvent, TextLlm,
+    ModelSamplingDefaults, MtpCapabilities, MtpStats, Quantize, ReasoningEffort, RenderOptions,
+    Result as CoreResult, Sampling, StopMatcher, StreamEvent as CoreEvent, TextLlm,
     TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter,
     Tokenizer, ToolCallSegmenter, Usage, VideoRef,
 };
@@ -24,23 +25,24 @@ use serde_json::Value;
 
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
-    generate_from_prefill_with_stop, generate_qwen35_mtp_multimodal_with_stop,
-    generate_qwen35_mtp_timed_with_stop, ConstraintMask, Decode, FinishReason, GenerationConfig,
-    Qwen35MtpMultimodalPrompt, RewindableConstraintMask, StreamEvent,
+    cuda_graphs_enabled, generate_from_prefill_with_stop, generate_speculative_with,
+    graph_workspace_admission_bytes, ConstraintMask, CountingDecode, Decode, DecodePath,
+    DecodeRecord, FinishReason, GenerationConfig, GraphRunner, GraphTally, MtpProposer, NoProposer,
+    Proposer, RequestSpan, RewindableConstraintMask, SpeculativePrompt, StepModel, StreamEvent,
 };
 use crate::device::select_device;
 use crate::gguf::GgufCheckpoint;
 use crate::image::Qwen35ImageProcessor;
 use crate::models::gemma4_mm;
 use crate::models::{
-    CausalLm, Gemma4Layout, Gemma4Mm, Gemma4MmConfig, Qwen35Config, Qwen35Model, Qwen35Mtp,
-    Qwen35VisionConfig, Qwen35VisionModel, VlmDecode,
+    CausalLm, Gemma4Layout, Gemma4Mm, Gemma4MmConfig, Qwen35Cache, Qwen35Config, Qwen35Model,
+    Qwen35Mtp, Qwen35VisionConfig, Qwen35VisionModel, VlmDecode,
 };
 use crate::primitives::attention::EAGER_ATTN_QUERY_CHUNK_SIZE;
 use crate::primitives::nn::input_ids;
-use crate::primitives::projection::QuantSpec;
+use crate::primitives::projection::{ProjectionFormat, ProjectionKind, QuantSpec, WeightCensus};
 use crate::primitives::sampler::SamplingParams;
-use crate::primitives::{KvCache, Weights};
+use crate::primitives::{KvCache, StepKvCache, Weights};
 
 /// The registry id of this provider.
 pub const PROVIDER_ID: &str = "candle-llama";
@@ -81,16 +83,180 @@ impl Decode for Decoder {
     }
 }
 
+/// The CUDA-graph tally of a request decoded on a reference path. The runner wraps the step-seam
+/// engine only (sc-24134), so with the switch on such a request's record names why no step went
+/// through it — `fallback=reference_path` — instead of a bare `graph: none`.
+fn reference_path_graphs(tally: GraphTally, switch_on: bool) -> GraphTally {
+    if switch_on && tally.label() == "none" {
+        GraphTally {
+            fallback_reason: Some(crate::decode::graph::REASON_REFERENCE_PATH),
+            ..tally
+        }
+    } else {
+        tally
+    }
+}
+
+/// Which loop a request decodes on — what admission prices and what [`LlamaProvider::generate`]
+/// runs (sc-24140: one decision, so the price and the path cannot disagree).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecodeRoute {
+    /// The reference `Decode` loop over the growing cache: the parity oracle selected with
+    /// [`LlamaProvider::set_decode_path`], and the Qwen3-VL generic-causal multimodal request
+    /// (whose DeepStack / M-RoPE prefill has no step-seam form).
+    Reference,
+    /// The unified engine over the step seam, on the static KV cache, with `drafts` drafts per
+    /// verify step: the MTP head's `K`, or `0` — the engine with no proposer, the token-at-a-time
+    /// loop — for every request whose speculation is off.
+    Engine {
+        /// Draft tokens per verify step (`0`: no proposer).
+        drafts: u32,
+    },
+}
+
+impl DecodeRoute {
+    /// The verify step's draft width (`0` on the reference loop and the no-proposer engine).
+    fn drafts(self) -> u32 {
+        match self {
+            DecodeRoute::Reference => 0,
+            DecodeRoute::Engine { drafts } => drafts,
+        }
+    }
+}
+
+/// The bytes admission prices for a request of `admitted_prompt` + `max_new_tokens` tokens: on
+/// the reference geometry for the reference loop, and on the step seam's geometry whenever the
+/// engine runs — its cache keeps a per-token checkpoint ring of `K + 2` recurrent states per
+/// linear layer the reference cache does not (sc-24131; `2` with no proposer), and its verify
+/// step overshoots the budget by `K` positions (E6, sc-24130).
+///
+/// The recurrent term is charged **once** on both paths: the geometry's `recurrent_bytes` is
+/// already the cache's whole recurrent footprint (the ring included), and the engine rolls back
+/// by selecting a ring slot — it never clones the cache — so the `x3` clone/replay multiplier
+/// [`core_llm::estimate_chunked_request_bytes`] applies with MTP would charge `2 (K + 2)` states
+/// the request never holds.
+///
+/// Whenever the engine runs through the CUDA-graph runner (`cuda_graphs`, sc-24134) — with a
+/// proposer or without one — the graphs it may capture are priced too
+/// ([`graph_workspace_admission_bytes`] over the `1 ..= K + 1` step token counts), so a request
+/// that could not hold them fails closed at admission instead of at instantiation (sc-24140).
+fn priced_request_bytes(
+    model: &Decoder,
+    route: DecodeRoute,
+    admitted_prompt: usize,
+    max_new_tokens: u32,
+    vision_workspace: u64,
+    cuda_graphs: bool,
+) -> Option<u64> {
+    let geometry = match route {
+        DecodeRoute::Engine { drafts } => model.step_memory_geometry(drafts as usize),
+        DecodeRoute::Reference => model.memory_geometry(),
+    };
+    let graph_workspace = match route {
+        DecodeRoute::Engine { drafts } => engine_graph_workspace(
+            model,
+            drafts,
+            u64::try_from(admitted_prompt)
+                .ok()?
+                .checked_add(u64::from(max_new_tokens))?,
+            cuda_graphs,
+        )?,
+        DecodeRoute::Reference => 0,
+    };
+    core_llm::estimate_chunked_request_bytes_with_recurrent_copies(
+        admitted_prompt,
+        max_new_tokens,
+        geometry,
+        vision_workspace.checked_add(graph_workspace)?,
+        route.drafts(),
+        EAGER_ATTN_QUERY_CHUNK_SIZE,
+        1,
+    )
+}
+
+/// The CUDA-graph workspace admission charges a request on the engine with `drafts` drafts per
+/// verify step whose prompt and budget reach `positions` positions: every graph the runner may
+/// capture ([`graph_workspace_admission_bytes`] over the step geometry, the reach plus the verify
+/// overshoot, and the `1 ..= K + 1` step token counts — `1` with no proposer), or `0` when the
+/// runner is off (`cuda_graphs`). `None` on overflow (the caller fails closed).
+fn engine_graph_workspace(
+    model: &Decoder,
+    drafts: u32,
+    positions: u64,
+    cuda_graphs: bool,
+) -> Option<u64> {
+    if !cuda_graphs {
+        return Some(0);
+    }
+    graph_workspace_admission_bytes(
+        &model.step_memory_geometry(drafts as usize),
+        positions.checked_add(u64::from(drafts))?,
+        drafts.checked_add(1)?,
+    )
+}
+
+/// What the Gemma 4 soft-token splice re-admits once the expanded prompt (`capacity` = expanded
+/// prompt + budget) is known: the static KV preallocation for those positions, plus — when the
+/// CUDA-graph runner wraps the engine (`cuda_graphs`) — its graph workspace over the same reach
+/// (sc-24140). `None` on overflow.
+fn spliced_prompt_bytes(model: &Decoder, capacity: usize, cuda_graphs: bool) -> Option<u64> {
+    let graphs = engine_graph_workspace(model, 0, u64::try_from(capacity).ok()?, cuda_graphs)?;
+    u64::try_from(model.static_kv_bytes(capacity))
+        .ok()?
+        .checked_add(graphs)
+}
+
 impl Decoder {
+    /// Bytes a static KV cache of `capacity` positions preallocates for this decoder (the
+    /// model's own `static_kv_bytes`) — what a request that ran past that capacity was refused
+    /// for (sc-24140).
+    fn static_kv_bytes(&self, capacity: usize) -> usize {
+        match self {
+            Decoder::Causal(m) => m.static_kv_bytes(capacity),
+            Decoder::Qwen35(m) => m.static_kv_bytes(capacity),
+        }
+    }
+
+    /// The geometry admission prices for a request on the provider's own growing caches (the
+    /// reference paths keep [`REFERENCE_MAX_CHECKPOINTS`](crate::models::qwen35::REFERENCE_MAX_CHECKPOINTS)
+    /// — no checkpoint ring — so the recurrent term is one live state per linear layer).
     fn memory_geometry(&self) -> LlmMemoryGeometry {
+        self.memory_geometry_with_checkpoints(crate::models::qwen35::REFERENCE_MAX_CHECKPOINTS)
+    }
+
+    /// The geometry for a request that runs through the step seam — the speculative engine with
+    /// `drafts` drafts per verify step — whose cache ([`StepModel::new_cache_for`] with overshoot
+    /// `drafts`) holds a per-token checkpoint ring of `drafts + 2` recurrent states per linear
+    /// layer (the step start plus the `K + 1` verify positions; sc-24131), and whose verify step
+    /// writes `K + 1` positions past the budget (E6). The recurrent term is exactly the ring —
+    /// there is no separate start-of-step checkpoint any more.
+    ///
+    /// [`StepModel::new_cache_for`]: crate::decode::StepModel::new_cache_for
+    fn step_memory_geometry(&self, drafts: usize) -> LlmMemoryGeometry {
+        self.memory_geometry_with_checkpoints(drafts.saturating_add(1))
+    }
+
+    /// The geometry for a cache whose linear layers can roll back `retained_checkpoints`
+    /// positions: `1 + retained_checkpoints` recurrent states per linear layer, priced exactly
+    /// ([`Qwen35Model::recurrent_state_bytes`]).
+    fn memory_geometry_with_checkpoints(&self, retained_checkpoints: usize) -> LlmMemoryGeometry {
         let (query_heads, kv_heads, head_dim, layers, hidden, intermediate, vocab, recurrent) =
             match self {
                 Decoder::Causal(m) => {
                     let c = m.config();
+                    // The widest layer's KV geometry — the one layer with the largest
+                    // `kv_heads × head width` — so `layers × kv_heads × head_dim` covers every
+                    // layer's cache whatever its type, without crossing one layer type's head count
+                    // with another's width: Gemma 4's full-attention layers can be wider than the
+                    // scalar `head_dim` / `num_key_value_heads` (its sliding layers'), and
+                    // DeepSeek-V2's materialized MLA caches full-head `qk_nope + qk_rope` keys
+                    // (sc-24138, E6 — the step seam's static preallocation is this layout, and the
+                    // engine path the provider runs for this family allocates it).
+                    let (kv_heads, head_dim) = m.kv_layout().widest_layer();
                     (
                         c.num_heads,
-                        c.num_kv_heads,
-                        c.head_dim,
+                        kv_heads as i32,
+                        head_dim as i32,
                         c.num_layers,
                         c.hidden_size,
                         c.intermediate_size,
@@ -108,13 +274,7 @@ impl Decoder {
                         c.hidden_size,
                         c.intermediate_size,
                         c.vocab_size,
-                        (c.num_layers as u64)
-                            .saturating_mul(c.linear_num_value_heads as u64)
-                            .saturating_mul(c.linear_value_head_dim as u64)
-                            .saturating_mul(
-                                (c.linear_key_head_dim + c.linear_conv_kernel_dim) as u64,
-                            )
-                            .saturating_mul(4),
+                        m.recurrent_state_bytes(1 + retained_checkpoints) as u64,
                     )
                 }
             };
@@ -135,6 +295,20 @@ impl Decoder {
         match self {
             Decoder::Causal(m) => m.is_quantized(),
             Decoder::Qwen35(m) => m.is_quantized(),
+        }
+    }
+
+    /// How the decoder computes grouped-query attention (story sc-24132), for the decode record of
+    /// the provider's reference loop (the engine stamps its own record from the cache it ran on).
+    /// The generic causal family reports what its selector really ran over the growing cache
+    /// (sc-24138: `Gqa` by default — the static cache's arithmetic — when every layer can express
+    /// it; `Expanded` when that pre-migration arithmetic is selected as a comparison, or when a
+    /// layer cannot attend un-expanded: a Gemma 2 soft-cap, a Gemma 4 sliding window, MLA); the
+    /// Qwen3.5 hybrid reports its selector.
+    fn attn_formulation(&self) -> crate::primitives::AttnFormulation {
+        match self {
+            Decoder::Causal(m) => m.effective_attn_formulation(m.attn_formulation()),
+            Decoder::Qwen35(m) => m.attn_formulation(),
         }
     }
 
@@ -596,6 +770,80 @@ pub struct LlamaProvider {
     /// checkpoint that actually ships them (sc-18772). Independent of [`vision`](Self::vision):
     /// Gemma 4 does not use the Qwen-VL ViT/M-RoPE/DeepStack machinery at all.
     gemma4: Option<Gemma4Runtime>,
+    /// The measured [`DecodeRecord`] of the most recent [`TextLlm::generate`] call — which decode
+    /// path ran and its counters (sc-24129). The backend-neutral `TextLlmOutput` carries only the
+    /// MTP subset (`MtpStats`); the full record is read back through
+    /// [`LlamaProvider::last_decode_record`].
+    last_decode: Mutex<Option<DecodeRecord>>,
+    /// What the load produced (sc-24135): the requested weight format and the resident weight
+    /// census by projection kind (the qwen3_5 and — sc-24140 — llama families). Read through
+    /// [`LlamaProvider::load_record`].
+    load_record: LoadRecord,
+    /// Which loop a request whose speculation is off decodes on, for both families (sc-24138,
+    /// sc-24140): [`DecodePath::StepModel`] — the unified engine over the step seam on the static
+    /// KV cache, the default — or [`DecodePath::Reference`], the `Decode` loop kept as the parity
+    /// oracle. Selected with [`LlamaProvider::set_decode_path`].
+    decode_path: DecodePath,
+}
+
+/// The load telemetry of a [`LlamaProvider`] (sc-24135, epic sc-24128 E2): which weight format was
+/// requested and which projection kinds the decoder actually holds, with their resident bytes.
+///
+/// An NVFP4 request never reports a dense projection under an NVFP4 label: the qwen3_5 family
+/// loads every requested projection under `census.projections.nvfp4` or fails at load, and the
+/// llama family (sc-24140) keeps a projection whose shape the FP4 GEMM cannot serve dense, counted
+/// under `census.projections.dense` — this record is how a caller (and the evidence harness)
+/// sees which, and reads the resident bits/param.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoadRecord {
+    /// The load-time weight format the caller requested (`None` = the checkpoint's own dtype, or
+    /// its persisted `quantization` block).
+    pub requested: Option<Quantize>,
+    /// The decoder's resident weights by projection kind (target plus native MTP predictor): the
+    /// qwen3_5-family decoders and, since sc-24140, the llama family (`CausalLm`, safetensors or
+    /// GGUF); `None` for the Prism/Bonsai GGUF hybrid and a provider assembled from parts.
+    pub census: Option<WeightCensus>,
+    /// The CUDA-graph switch this provider was loaded under (sc-24139): `LoadSpec::cuda_graphs`,
+    /// else the process switch at load time. The CUDA stream is settled at load, so every
+    /// generation runs under this switch rather than whatever the process switch says later.
+    /// `None` for a provider assembled without a load ([`LlamaProvider::from_parts`]), which
+    /// follows the process switch.
+    pub cuda_graphs: Option<bool>,
+}
+
+impl LoadRecord {
+    /// The backend-neutral report a product renders (sc-24139): the requested format, the
+    /// projection kinds actually resident (only the kinds present) and the CUDA-graph switch the
+    /// load settled ([`cuda_graphs`](Self::cuda_graphs)).
+    pub fn report(&self) -> core_llm::LoadReport {
+        let projections = self
+            .census
+            .map(|census| {
+                [
+                    ProjectionKind::Dense,
+                    ProjectionKind::Ggml,
+                    ProjectionKind::Prism,
+                    ProjectionKind::Nvfp4,
+                ]
+                .into_iter()
+                .filter_map(|kind| {
+                    let tally = census.projections.tally(kind);
+                    (tally.count > 0).then(|| core_llm::ProjectionReport {
+                        kind: kind.label().to_string(),
+                        count: tally.count,
+                        params: tally.params,
+                        resident_bytes: tally.resident_bytes,
+                    })
+                })
+                .collect()
+            })
+            .unwrap_or_default();
+        core_llm::LoadReport {
+            requested: self.requested,
+            projections,
+            cuda_graphs: self.cuda_graphs,
+        }
+    }
 }
 
 /// Whether Gemma 4's vision path has been validated end-to-end, and may therefore be advertised.
@@ -689,6 +937,212 @@ fn requires_accelerator(source: &Path) -> CoreResult<bool> {
     }))
 }
 
+/// The NVFP4 projection format for a load, or `None` when `spec` does not request NVFP4
+/// (sc-24135). The capability floor is settled here — before admission or any weight read — so a
+/// CPU or sub-sm_120 device is a typed refusal naming the capability (`CoreError::Unsupported`
+/// carrying "nvfp4"), never a fallback to another representation. A source whose family cannot
+/// hold NVFP4 projections is refused by name too, also before admission, so a memory refusal can
+/// never mask the capability refusal: a GGUF file or a Prism/Bonsai snapshot (both already
+/// packed; NVFP4 quantizes from a dense snapshot). The qwen3_5 hybrid (sc-24135) and every
+/// llama-family `CausalLm` decoder (sc-24140 — Llama/Mistral, Qwen3 dense, Phi-3, Qwen2-MoE,
+/// Gemma 2/4, GLM-4, DeepSeek-V2, the Qwen3-VL decoder) are served; a multimodal tower beside the
+/// decoder stays dense, as on the qwen3_5 family, and LLaVA — whose provider owns the tower
+/// load — refuses NVFP4 itself.
+fn nvfp4_format(spec: &LoadSpec, device: &Device) -> CoreResult<Option<ProjectionFormat>> {
+    nvfp4_format_with(spec, device, ProjectionFormat::nvfp4)
+}
+
+/// [`nvfp4_format`] with the device gate injected (`gate` is [`ProjectionFormat::nvfp4`] on the
+/// real path), so the gate's refusal can be driven through this helper with a mocked compute
+/// capability.
+fn nvfp4_format_with(
+    spec: &LoadSpec,
+    device: &Device,
+    gate: impl FnOnce(&Device) -> crate::Result<ProjectionFormat>,
+) -> CoreResult<Option<ProjectionFormat>> {
+    if spec.quantize != Some(Quantize::Nvfp4) {
+        return Ok(None);
+    }
+    nvfp4_model_gate(spec)?;
+    gate(device).map(Some).map_err(to_core)
+}
+
+/// The model half of [`nvfp4_format`]: whether this provider serves NVFP4 for the checkpoint at
+/// `spec.source`, from `config.json` and the snapshot's tensor names (never tensor data). The load
+/// runs it before the device gate, and [`crate::backend::nvfp4_support`] answers a product's
+/// per-snapshot question with it (sc-24139), so the two can never disagree about which
+/// checkpoints NVFP4 serves.
+///
+/// A GGUF source is refused: it is already block-quantized, and NVFP4 quantizes from a dense
+/// snapshot. So is a Prism/Bonsai snapshot (already packed affine-2 — `load_dir` refuses any
+/// repacking), by name ([`nvfp4_family_refusal`]), and a packed MLX-affine snapshot of any family
+/// ([`packed_affine_refusal`] — the loader refuses its triples too, but only after reading the
+/// weights). The qwen3_5 hybrid (sc-24135) and every llama-family `CausalLm` architecture
+/// (sc-24140) are served. A missing or unreadable config is left to the loader's own error.
+pub(crate) fn nvfp4_model_gate(spec: &LoadSpec) -> CoreResult<()> {
+    if crate::gguf::is_gguf_path(&spec.source) {
+        return Err(CoreError::Unsupported(
+            "nvfp4: NVFP4 projections are quantized from a dense safetensors snapshot; a GGUF \
+             checkpoint is already block-quantized"
+                .into(),
+        ));
+    }
+    // The family rule (sc-24140): the one place it lives, so every caller — the load path and the
+    // capability probe alike — answers the same. A missing or unreadable config, or an
+    // architecture the dispatch does not recognize, is left to the loader's own error.
+    let dir = Path::new(&spec.source);
+    if let Some(config) = read_json(dir, "config.json") {
+        if let Some(reason) =
+            nvfp4_family_refusal(&config).or_else(|| packed_affine_refusal(dir, &config))
+        {
+            return Err(CoreError::Unsupported(format!("nvfp4: {reason}")));
+        }
+    }
+    Ok(())
+}
+
+/// Why a snapshot's projections are already packed MLX-affine, or `None` (the packed half of
+/// [`nvfp4_model_gate`], sc-24140 feature-end review). Packed means both: a `quantization` block
+/// in `config.json` (top level or `text_config`, where [`ModelConfig`] reads it) **and** a
+/// `<stem>.weight` whose `<stem>.scales` sidecar the snapshot names. A prepared Q4/Q8 snapshot
+/// ([`crate::prepare`]) carries the block over *dense* weights, so it is not packed: NVFP4
+/// quantizes its projections like any dense snapshot's. The tensor names come from
+/// `model.safetensors.index.json` when it exists, else from each shard's header — never from
+/// tensor data. An unreadable index or header is left to the loader's own error.
+fn packed_affine_refusal(dir: &Path, config: &Value) -> Option<String> {
+    let has_block = config.get("quantization").is_some()
+        || config
+            .get("text_config")
+            .is_some_and(|text| text.get("quantization").is_some());
+    if !has_block {
+        return None;
+    }
+    let names = snapshot_tensor_names(dir)?;
+    let mut stems: Vec<&str> = names
+        .iter()
+        .filter_map(|name| {
+            let stem = name.strip_suffix(".scales")?;
+            names.contains(&format!("{stem}.weight")).then_some(stem)
+        })
+        .collect();
+    // The first packed projection by name, so the refusal reads the same on every run.
+    stems.sort_unstable();
+    let stem = stems.first()?;
+    Some(format!(
+        "this snapshot's projections are packed MLX-affine (a `quantization` block over affine \
+         sidecars such as `{stem}.scales`); NVFP4 projections are quantized from a dense snapshot"
+    ))
+}
+
+/// The tensor names a safetensors snapshot holds: the index's `weight_map` keys, else every
+/// `*.safetensors` shard's header keys (the 8-byte length prefix and the JSON header only).
+/// `None` when neither can be read.
+fn snapshot_tensor_names(dir: &Path) -> Option<std::collections::HashSet<String>> {
+    if let Some(index) = read_json(dir, "model.safetensors.index.json") {
+        let map = index.get("weight_map")?.as_object()?;
+        return Some(map.keys().cloned().collect());
+    }
+    let mut names = std::collections::HashSet::new();
+    for entry in std::fs::read_dir(dir).ok()? {
+        let path = entry.ok()?.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("safetensors") {
+            names.extend(safetensors_header_names(&path)?);
+        }
+    }
+    Some(names)
+}
+
+/// The tensor names in one safetensors file's header, without reading its data.
+fn safetensors_header_names(path: &Path) -> Option<Vec<String>> {
+    use std::io::Read;
+    // A real header is kilobytes to a few megabytes; never allocate for a corrupt length.
+    const MAX_HEADER_BYTES: u64 = 256 << 20;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut len = [0u8; 8];
+    file.read_exact(&mut len).ok()?;
+    let len = u64::from_le_bytes(len);
+    if len > MAX_HEADER_BYTES {
+        return None;
+    }
+    let mut header = vec![0u8; len as usize];
+    file.read_exact(&mut header).ok()?;
+    let header: Value = serde_json::from_slice(&header).ok()?;
+    Some(
+        header
+            .as_object()?
+            .keys()
+            .filter(|key| key.as_str() != "__metadata__")
+            .cloned()
+            .collect(),
+    )
+}
+
+/// Test seam for [`packed_affine_refusal`]: write tiny tensors named `names` into `dir` — as a
+/// `model.safetensors` shard, or (`index`) only a `model.safetensors.index.json` naming them.
+#[cfg(test)]
+pub(crate) fn write_test_snapshot_tensors(dir: &Path, names: &[&str], index: bool) {
+    if index {
+        let map: serde_json::Map<String, Value> = names
+            .iter()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    Value::from("model-00001-of-00001.safetensors"),
+                )
+            })
+            .collect();
+        let index = serde_json::json!({"metadata": {}, "weight_map": map});
+        std::fs::write(dir.join("model.safetensors.index.json"), index.to_string()).unwrap();
+        return;
+    }
+    let tensors: std::collections::HashMap<String, Tensor> = names
+        .iter()
+        .map(|name| {
+            let dtype = if name.ends_with(".weight") {
+                DType::U32
+            } else {
+                DType::BF16
+            };
+            let tensor = Tensor::zeros((2, 2), dtype, &Device::Cpu).unwrap();
+            (name.to_string(), tensor)
+        })
+        .collect();
+    candle_core::safetensors::save(&tensors, dir.join("model.safetensors")).unwrap();
+}
+
+/// Why a snapshot's family cannot hold NVFP4 projections, or `None` when it can (the family half of
+/// [`nvfp4_format_with`]). Prism/Bonsai snapshots are already packed affine-2; the qwen3_5 hybrid
+/// and every llama-family (`CausalLm`) architecture quantize their dense projections through the
+/// shared loader ([`Projection::load_as`](crate::primitives::Projection::load_as) /
+/// [`load_eligible`](crate::primitives::Projection::load_eligible)).
+fn nvfp4_family_refusal(config: &Value) -> Option<String> {
+    if config.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35") {
+        return Some(
+            "a Prism/Bonsai snapshot is already packed affine-2; NVFP4 projections are quantized \
+             from a dense snapshot"
+                .into(),
+        );
+    }
+    match Architecture::from_config(config) {
+        // Every architecture the provider dispatches decodes through `Qwen35Model` or `CausalLm`,
+        // and both load NVFP4 projections.
+        Ok(
+            Architecture::Qwen35
+            | Architecture::Llama
+            | Architecture::Qwen3
+            | Architecture::Phi3
+            | Architecture::Qwen2Moe
+            | Architecture::Gemma2
+            | Architecture::Glm4
+            | Architecture::DeepseekV2
+            | Architecture::Qwen3Vl
+            | Architecture::Gemma4Unified
+            | Architecture::Gemma4,
+        )
+        | Err(_) => None,
+    }
+}
+
 fn ensure_supported_device(source: &Path, device: &Device) -> CoreResult<()> {
     if device.is_cpu() && requires_accelerator(source)? {
         return Err(CoreError::Load(
@@ -700,6 +1154,87 @@ fn ensure_supported_device(source: &Path, device: &Device) -> CoreResult<()> {
 }
 
 impl LlamaProvider {
+    /// The measured decode record of the most recent `generate` call on this provider, or `None`
+    /// before the first. Says which path ran (`Reference`, `Mtp { drafts }`, …) and its counters;
+    /// the MTP subset also reaches callers as `TextLlmOutput::mtp`.
+    pub fn last_decode_record(&self) -> Option<DecodeRecord> {
+        *self
+            .last_decode
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Select the loop a request whose speculation is off decodes on — one selector for both
+    /// families (sc-24138, sc-24140): [`DecodePath::StepModel`] (the default) runs the unified
+    /// engine over the step seam with no proposer on the static KV cache (through the CUDA-graph
+    /// runner when it is on); [`DecodePath::Reference`] runs the `Decode` loop on the growing
+    /// cache — the parity oracle. Any other path is [`CoreError::InvalidRequest`]: speculation is
+    /// chosen per request (MTP), and a request with an MTP plan always runs the engine with the
+    /// MTP proposer, whatever this says. A Qwen3-VL generic-causal multimodal request (DeepStack /
+    /// M-RoPE prefill, no step-seam form) decodes on the reference loop either way, and its
+    /// record says so.
+    pub fn set_decode_path(&mut self, path: DecodePath) -> CoreResult<()> {
+        match path {
+            DecodePath::StepModel | DecodePath::Reference => {
+                self.decode_path = path;
+                Ok(())
+            }
+            other => Err(CoreError::InvalidRequest(format!(
+                "[candle-llama] the decode path is `step_model` or `reference`, not `{}`",
+                other.label()
+            ))),
+        }
+    }
+
+    /// The loop a request whose speculation is off decodes on (see
+    /// [`set_decode_path`](Self::set_decode_path)).
+    pub fn decode_path(&self) -> DecodePath {
+        self.decode_path
+    }
+
+    /// Which loop this request decodes on: the engine with the MTP proposer for an MTP plan, the
+    /// engine with no proposer for a request whose speculation is off (the selector's default —
+    /// both families), the reference loop when the selector asks for it or the request is a
+    /// Qwen3-VL generic-causal multimodal one. `qwen_vl_multimodal` is whether the request
+    /// carries Qwen-VL visuals.
+    fn decode_route(&self, mtp_plan: core_llm::MtpPlan, qwen_vl_multimodal: bool) -> DecodeRoute {
+        if let Some(drafts) = mtp_plan.draft_tokens() {
+            return DecodeRoute::Engine { drafts };
+        }
+        match (&self.model, self.decode_path) {
+            (_, DecodePath::Reference) => DecodeRoute::Reference,
+            (Decoder::Causal(_), _) if qwen_vl_multimodal => DecodeRoute::Reference,
+            _ => DecodeRoute::Engine { drafts: 0 },
+        }
+    }
+
+    /// Bridge an error from a request's decode into the contract error. A static KV cache asked
+    /// for more positions than it holds ([`crate::Error::KvCapacityExceeded`] — at its
+    /// construction for the request's bound plus the verify overshoot, or at a step) is the typed
+    /// [`CoreError::RequestResourceExhausted`] with the request's geometry and the figures the
+    /// refusal is about: the preallocation the requested positions would take against the one the
+    /// cache can hold (sc-24140), never an opaque backend error. Everything else is [`to_core`].
+    fn request_error(
+        &self,
+        error: crate::Error,
+        prompt_tokens: usize,
+        max_new_tokens: u32,
+    ) -> CoreError {
+        match error {
+            crate::Error::KvCapacityExceeded {
+                requested,
+                capacity,
+            } => CoreError::RequestResourceExhausted(core_llm::RequestResourceExhausted {
+                prompt_tokens,
+                max_new_tokens,
+                max_context_tokens: self.descriptor.capabilities.max_context_tokens,
+                required_bytes: self.model.static_kv_bytes(requested) as u64,
+                available_bytes: self.model.static_kv_bytes(capacity) as u64,
+            }),
+            other => to_core(other),
+        }
+    }
+
     /// Load a provider from `spec.source`: either a `*.gguf` file (loaded directly via Candle's
     /// native GGUF reader, story 7254) or an HF snapshot directory (config.json + tokenizer.json +
     /// shards). Either way the decoder architecture is dispatched (Llama / Mistral / Qwen3) and the
@@ -708,7 +1243,17 @@ impl LlamaProvider {
         if spec.projector_source.is_some() && !crate::gguf::is_gguf_path(&spec.source) {
             return Err(CoreError::Load("an external projector is only valid with a GGUF language checkpoint; safetensors vision must be embedded".into()));
         }
+        // The load's CUDA-graph policy (sc-24139): settled before the device is opened — the
+        // graph runner needs the model on its own CUDA stream, which the device selection picks
+        // under this switch — and held for the whole load, then recorded so every generation on
+        // this provider runs under the same switch.
+        let cuda_graphs = spec.cuda_graphs.unwrap_or_else(cuda_graphs_enabled);
+        let _cuda_graphs_scope = crate::decode::cuda_graphs_scope(Some(cuda_graphs));
         let device = select_device().map_err(to_core)?;
+        // NVFP4 (sc-24135): the capability floor is settled first — before the accelerator gate,
+        // admission or any weight read — so a CPU or sub-sm_120 device answers an NVFP4 request with
+        // the typed refusal naming the capability, never a fallback to another representation.
+        let nvfp4 = nvfp4_format(spec, &device)?;
         ensure_supported_device(Path::new(&spec.source), &device)?;
         let payload = core_llm::checkpoint_payload_bytes(Path::new(&spec.source))?;
         let staging = core_llm::checkpoint_staging_bytes(Path::new(&spec.source))?;
@@ -722,9 +1267,15 @@ impl LlamaProvider {
             || read_json(Path::new(&spec.source), "config.json").is_some_and(|c| {
                 c.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35")
             });
-        let (host_required, device_required) =
-            load_memory_requirements(payload, staging, projector, packed, device.is_cuda())
-                .ok_or_else(|| CoreError::Load("load memory estimate overflow".into()))?;
+        let (host_required, device_required) = load_memory_requirements(
+            payload,
+            staging,
+            projector,
+            packed,
+            device.is_cuda(),
+            nvfp4.is_some(),
+        )
+        .ok_or_else(|| CoreError::Load("load memory estimate overflow".into()))?;
         let budget = core_llm::operational_memory_override()?;
         // A discrete CUDA launcher's override describes device headroom. Host staging is a separate
         // allocation domain and must be checked against host capacity rather than GPU capacity.
@@ -737,25 +1288,30 @@ impl LlamaProvider {
             core_llm::admit_request_memory(device_required, request_available_memory(&device)?)?;
         }
 
-        let requested = spec.quantize.map(|q| match q {
-            Quantize::Q4 => QuantSpec::q4(),
-            Quantize::Q8 => QuantSpec::q8(),
-        });
-        if crate::gguf::is_gguf_path(&spec.source) {
+        let requested = match spec.quantize {
+            None => None,
+            Some(Quantize::Q4) => Some(ProjectionFormat::from(QuantSpec::q4())),
+            Some(Quantize::Q8) => Some(ProjectionFormat::from(QuantSpec::q8())),
+            Some(Quantize::Nvfp4) => nvfp4,
+        };
+        let mut provider = if crate::gguf::is_gguf_path(&spec.source) {
             Self::load_gguf(
                 Path::new(&spec.source),
                 spec.projector_source.as_deref().map(Path::new),
                 &device,
-                requested,
-            )
+                requested.as_ref().and_then(ProjectionFormat::ggml),
+            )?
         } else {
             if spec.projector_source.is_some() {
                 return Err(CoreError::Load(
                     "an external projector is only valid with a GGUF language checkpoint; safetensors vision must be embedded".into(),
                 ));
             }
-            Self::load_dir(Path::new(&spec.source), &device, requested)
-        }
+            Self::load_dir(Path::new(&spec.source), &device, requested.as_ref())?
+        };
+        provider.load_record.requested = spec.quantize;
+        provider.load_record.cuda_graphs = Some(cuda_graphs);
+        Ok(provider)
     }
 
     /// Load from an HF snapshot directory (config.json + tokenizer.json + safetensors shards).
@@ -763,14 +1319,18 @@ impl LlamaProvider {
     /// `requested` is an explicit load-time quantization (`spec.quantize`); when it is `None` the
     /// snapshot's own persisted `quantization` block (written by the [`prepare`](crate::prepare)
     /// writer) is honored, so a `LoadSpec::dense` of a prepared Q4/Q8 snapshot loads quantized.
-    fn load_dir(dir: &Path, device: &Device, requested: Option<QuantSpec>) -> CoreResult<Self> {
+    fn load_dir(
+        dir: &Path,
+        device: &Device,
+        requested: Option<&ProjectionFormat>,
+    ) -> CoreResult<Self> {
         let cfg_value = read_json(dir, "config.json")
             .ok_or_else(|| CoreError::Load(format!("read config.json in {}", dir.display())))?;
         let is_prism =
             cfg_value.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35");
         if is_prism && requested.is_some() {
             return Err(CoreError::Load(
-                "Prism/Bonsai is already packed affine-2; Q4/Q8 repacking would expand the model"
+                "Prism/Bonsai is already packed affine-2; Q4/Q8/NVFP4 repacking would expand the model"
                     .into(),
             ));
         }
@@ -807,13 +1367,13 @@ impl LlamaProvider {
                 .map_err(to_core)?
             } else {
                 let prefix = qwen35_dense_prefix(|key| weights.contains(key))?;
-                Qwen35Model::from_weights_with(&weights, prefix, qcfg, requested)
+                Qwen35Model::from_weights_format(&weights, prefix, qcfg, requested)
                     .map_err(to_core)?
             };
             let configured_layers = m.config().mtp_num_hidden_layers;
             let has_mtp_tensors = weights.keys().any(|key| key.starts_with("mtp."));
             let mtp = if configured_layers > 0 {
-                Some(Qwen35Mtp::from_weights_with(&weights, &m, requested).map_err(to_core)?)
+                Some(Qwen35Mtp::from_weights_format(&weights, &m, requested).map_err(to_core)?)
             } else if has_mtp_tensors {
                 return Err(CoreError::Load(
                     "qwen3_5 checkpoint carries MTP tensors while config disables MTP".into(),
@@ -825,8 +1385,13 @@ impl LlamaProvider {
         } else {
             let cfg = ModelConfig::from_dir(dir).map_err(to_core)?;
             let descriptor = descriptor_for(&cfg);
-            let quant = requested.or(cfg.quantization);
-            let m = CausalLm::from_weights_with(&weights, "", cfg, quant).map_err(to_core)?;
+            // An explicit request (Q4 / Q8 / NVFP4, sc-24140) wins; otherwise the snapshot's own
+            // persisted `quantization` block, as before.
+            let format = requested
+                .cloned()
+                .or_else(|| cfg.quantization.map(ProjectionFormat::from));
+            let m = CausalLm::from_weights_format(&weights, "", cfg, format.as_ref())
+                .map_err(to_core)?;
             (Decoder::Causal(m), descriptor, None)
         };
         if mtp.is_some() {
@@ -935,6 +1500,17 @@ impl LlamaProvider {
         }
         descriptor.capabilities.supports_preserve_thinking = supports_preserve_thinking;
         descriptor.capabilities.supports_tools = supports_tools;
+        let census = match &model {
+            Decoder::Qwen35(m) => {
+                let mut census = m.weight_census();
+                if let Some(mtp) = &mtp {
+                    census.merge(&mtp.weight_census());
+                }
+                Some(census)
+            }
+            // sc-24140: the llama family reports its census too (bits/param by projection kind).
+            Decoder::Causal(m) => Some(m.weight_census()),
+        };
         Ok(Self {
             descriptor,
             model,
@@ -943,8 +1519,15 @@ impl LlamaProvider {
             template,
             stop_tokens,
             constraint_table: OnceCell::new(),
+            last_decode: Mutex::new(None),
+            decode_path: DecodePath::StepModel,
             vision,
             gemma4,
+            load_record: LoadRecord {
+                requested: None,
+                census,
+                cuda_graphs: None,
+            },
         })
     }
 
@@ -1072,9 +1655,12 @@ impl LlamaProvider {
                 tokenizer,
                 template,
                 stop_tokens: ck.stop_tokens,
+                last_decode: Mutex::new(None),
+                decode_path: DecodePath::StepModel,
                 constraint_table: OnceCell::new(),
                 vision,
                 gemma4: None,
+                load_record: LoadRecord::default(),
             });
         }
         if projector_path.is_some() {
@@ -1086,10 +1672,11 @@ impl LlamaProvider {
         let mut descriptor = descriptor_for(&ck.config);
         let quant = requested.or(ck.config.quantization);
         // GGUF is the dense Llama-family path only (no hybrid Qwen3.6 GGUF remap).
-        let model = Decoder::Causal(
-            CausalLm::from_weights_with(&ck.weights, "", ck.config.clone(), quant)
-                .map_err(to_core)?,
-        );
+        let causal = CausalLm::from_weights_with(&ck.weights, "", ck.config.clone(), quant)
+            .map_err(to_core)?;
+        // sc-24140: the llama family reports its census on every load path.
+        let census = Some(causal.weight_census());
+        let model = Decoder::Causal(causal);
 
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
         let sibling_tokenizer = dir.join("tokenizer.json");
@@ -1123,17 +1710,30 @@ impl LlamaProvider {
             tokenizer,
             template,
             stop_tokens,
+            last_decode: Mutex::new(None),
+            decode_path: DecodePath::StepModel,
             constraint_table: OnceCell::new(),
             vision: None, // GGUF is the dense Llama-family path only — no Qwen3.6 VLM.
             // Likewise no Gemma 4 front-ends: the GGUF path reconstructs a dense text decoder,
             // and llama.cpp GGUFs carry no vision embedder / audio projector tensors.
             gemma4: None,
+            load_record: LoadRecord {
+                requested: None,
+                census,
+                cuda_graphs: None,
+            },
         })
     }
 
     /// Whether the loaded model's projections are quantized.
     pub fn is_quantized(&self) -> bool {
         self.model.is_quantized()
+    }
+
+    /// The load telemetry: the requested weight format and the resident weight census by
+    /// projection kind (sc-24135).
+    pub fn load_record(&self) -> LoadRecord {
+        self.load_record
     }
 
     /// Assemble a provider from already-loaded parts with a default Llama-3 template (used by tests
@@ -1146,9 +1746,12 @@ impl LlamaProvider {
             tokenizer,
             template: Box::new(Llama3Template),
             stop_tokens,
+            last_decode: Mutex::new(None),
+            decode_path: DecodePath::StepModel,
             constraint_table: OnceCell::new(),
             vision: None,
             gemma4: None,
+            load_record: LoadRecord::default(),
         }
     }
 
@@ -1445,12 +2048,18 @@ impl LlamaProvider {
 /// while source tensors are still alive. CPU dense conversion retains source tensors plus
 /// constructed F32 tensors. Packed CPU paths keep their existing two-copy upper bound, and external
 /// projectors retain the audited four-copy conversion allowance.
+///
+/// An NVFP4 load (sc-24135) quantizes on the device while the bf16 source tensors are still
+/// resident, so the device additionally holds the growing packed copy: 4.5 bits per 16-bit source
+/// element, i.e. `payload · 9/32`. The existing 25 percent headroom still covers the transient f32
+/// copy of the largest tensor the quantizer reads.
 fn load_memory_requirements(
     payload: u64,
     staging: u64,
     projector: u64,
     packed: bool,
     cuda: bool,
+    nvfp4: bool,
 ) -> Option<(u64, Option<u64>)> {
     let projector_bound = projector.checked_mul(4)?;
     let host = if cuda && !packed {
@@ -1461,9 +2070,15 @@ fn load_memory_requirements(
         payload.checked_mul(3)?.checked_add(projector_bound)?
     };
     let device = if cuda {
+        let nvfp4_packed = if nvfp4 {
+            payload.checked_mul(9)? / 32
+        } else {
+            0
+        };
         Some(
             payload
                 .checked_add(payload / 4)?
+                .checked_add(nvfp4_packed)?
                 .checked_add(projector_bound)?,
         )
     } else {
@@ -1857,15 +2472,30 @@ impl TextLlm for LlamaProvider {
             .validate_request(&self.descriptor.id, req)
     }
 
+    fn load_report(&self) -> Option<core_llm::LoadReport> {
+        Some(self.load_record.report())
+    }
+
     fn generate(
         &self,
         req: &TextLlmRequest,
         on_event: &mut dyn FnMut(CoreEvent),
     ) -> CoreResult<TextLlmOutput> {
+        // Request start: a request that fails or is cancelled (anywhere below, before the record
+        // is written on success) must not leave the previous request's record readable.
+        *self
+            .last_decode
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         self.validate(req)?;
         if req.cancel.is_cancelled() {
             return Err(CoreError::Canceled); // typed pre-inference cancel
         }
+        // The load's CUDA-graph policy (sc-24139) governs everything this request does on this
+        // thread — admission's workspace pricing, wrapping the step model, the runner's switch —
+        // and the report says which switch it ran under.
+        let _cuda_graphs_scope = crate::decode::cuda_graphs_scope(self.load_record.cuda_graphs);
+        let cuda_graphs_on = cuda_graphs_enabled();
 
         // Multimodal (Qwen-VL + image/video content): replace image/video blocks with the Qwen-VL
         // placeholder text so the (vision-free) chat template renders the vision framing
@@ -1954,21 +2584,19 @@ impl TextLlm for LlamaProvider {
         // Every portable eager-attention mask variant is query-tiled; CUDA flash attention is
         // bounded more tightly. Use the runtime's exact maximum tile so admission prices the same
         // peak score/mask/weight lifetime the implementation enforces.
-        let required = core_llm::estimate_chunked_request_bytes(
+        // The backend-neutral mode resolution (core-llm): Auto on a model without a head decodes
+        // normally, and the record says `proposer=none` (E2, sc-24130).
+        let mtp_plan = core_llm::resolve_mtp_plan(req.mtp, self.descriptor.capabilities.mtp);
+        // Which loop decodes this request (sc-24140): decided once, so admission prices the
+        // cache and graphs that loop will actually hold.
+        let route = self.decode_route(mtp_plan, multimodal && !gemma4_mm_request);
+        let required = priced_request_bytes(
+            &self.model,
+            route,
             admitted_prompt,
             req.max_new_tokens,
-            self.model.memory_geometry(),
             vision_workspace,
-            match req.mtp {
-                MtpMode::Off => 0,
-                MtpMode::Auto => self
-                    .descriptor
-                    .capabilities
-                    .mtp
-                    .map_or(0, |c| c.recommended_draft_tokens),
-                MtpMode::Enabled { draft_tokens } => draft_tokens,
-            },
-            EAGER_ATTN_QUERY_CHUNK_SIZE,
+            cuda_graphs_enabled(),
         )
         .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
         let available = request_available_memory(self.model.device())?;
@@ -1985,6 +2613,10 @@ impl TextLlm for LlamaProvider {
             .synchronize()
             .map_err(|e| to_core(e.into()))?;
         let generation_started = std::time::Instant::now();
+        let request_span = RequestSpan::begin();
+        // The reference loop's forwards are measured, not inferred (sc-24129).
+        let counted = CountingDecode::new(&self.model);
+        let mut extra_forwards = 0u64;
 
         // Encode + splice the visuals and compute M-RoPE positions (the placeholder-expanded prompt
         // becomes the effective sequence). `None` on the text-only path.
@@ -2015,16 +2647,6 @@ impl TextLlm for LlamaProvider {
             seed: req.seed,
             stop_tokens: self.stop_tokens.clone(),
         };
-        let mtp_drafts = match req.mtp {
-            MtpMode::Off => None,
-            MtpMode::Auto => self
-                .descriptor
-                .capabilities
-                .mtp
-                .map(|cap| cap.recommended_draft_tokens),
-            MtpMode::Enabled { draft_tokens } => Some(draft_tokens),
-        };
-
         // Structured-output constraint: build a JSON mask over the cached decode table.
         let constraint_starts_in_reasoning =
             self.descriptor.capabilities.supports_thinking && prompt_opens_thinking(&prompt);
@@ -2085,6 +2707,7 @@ impl TextLlm for LlamaProvider {
         // The segmenter (when active) splits each delta into reasoning vs answer.
         let tokenizer = &self.tokenizer;
         let mut mtp_stats = None;
+        let mut engine_record: Option<DecodeRecord> = None;
         let phase_prefill;
         let phase_decode_started;
         let out = {
@@ -2165,60 +2788,99 @@ impl TextLlm for LlamaProvider {
             };
             let should_stop = || halt.get();
             let should_stop_opt = stop_active.then_some(&should_stop as &dyn Fn() -> bool);
-            if let Some(draft_tokens) = mtp_drafts {
-                let target = match &self.model {
-                    Decoder::Qwen35(model) => model,
-                    Decoder::Causal(_) => {
-                        return Err(CoreError::Load(
-                            "MTP was advertised for a non-Qwen target decoder".into(),
-                        ))
-                    }
+            if let (DecodeRoute::Engine { drafts }, Decoder::Qwen35(target)) = (route, &self.model)
+            {
+                // The Qwen3.5 family through the unified engine over the step seam (sc-24130,
+                // sc-24140): the MTP proposer for an MTP plan, no proposer — the token-at-a-time
+                // loop, on the same static KV cache, checkpoint ring and CUDA-graph runner — for
+                // a request whose speculation is off. The reference `Decode` loop stays
+                // selectable (`set_decode_path`) as the oracle.
+                let drafts = drafts as usize;
+                let mut mtp_proposer = match mtp_plan.draft_tokens() {
+                    Some(_) => Some(MtpProposer::new(self.mtp.as_ref().ok_or_else(|| {
+                        CoreError::Load("MTP was advertised without a loaded predictor".into())
+                    })?)),
+                    None => None,
                 };
-                let mtp = self.mtp.as_ref().ok_or_else(|| {
-                    CoreError::Load("MTP was advertised without a loaded predictor".into())
-                })?;
+                let speculative = mtp_proposer.is_some();
+                let mut no_proposer = NoProposer;
                 let constraint = json_mask
                     .as_mut()
                     .map(|m| m as &mut dyn RewindableConstraintMask);
-                let (generated, stats) = match &mm {
+                // The CUDA-graph runner (sc-24134) wraps the target when the switch is on: it
+                // replays captured decode / verify steps where it can and falls back eager with
+                // a named reason otherwise (`decode_record.cuda_graphs`); the engine is the
+                // same either way.
+                let graphs = GraphRunner::new(target);
+                let stepper: &dyn StepModel<Cache = Qwen35Cache> = if cuda_graphs_enabled() {
+                    &graphs
+                } else {
+                    target
+                };
+                let run = match &mm {
                     Some(m) => {
-                        let mut prefill = None;
-                        let mut decode_started = None;
-                        let mut boundary = || -> crate::error::Result<()> {
-                            target.device().synchronize()?;
-                            prefill = Some(generation_started.elapsed());
-                            decode_started = Some(std::time::Instant::now());
-                            Ok(())
-                        };
+                        // Multimodal: the fused-embedding / M-RoPE prefill is the caller's, into
+                        // the engine's own step cache; an MTP predictor is warmed from the same
+                        // fused rows; the continuation positions are shifted by `mrope_delta`
+                        // inside the cache.
+                        let capacity = m.expanded_ids.len().saturating_add(config.max_new_tokens);
+                        let mut cache = target
+                            .new_cache_for(capacity, drafts)
+                            .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         let (t, h, w, delta) = &m.positions;
-                        let result = generate_qwen35_mtp_multimodal_with_stop(
-                            target,
-                            mtp,
-                            Qwen35MtpMultimodalPrompt {
-                                input_ids: &m.expanded_ids,
-                                embeddings: &m.embeds,
-                                positions: [t.as_slice(), h.as_slice(), w.as_slice()],
-                                visual_pos_mask: &m.visual_pos_mask,
-                                deepstack: &m.deepstack,
-                                continuation_delta: *delta,
-                            },
-                            &config,
-                            draft_tokens,
-                            &req.cancel,
-                            &mut sink,
-                            constraint,
-                            should_stop_opt,
-                            Some(&mut boundary),
-                        )
-                        .map_err(to_core)?;
+                        let positions = [t.as_slice(), h.as_slice(), w.as_slice()];
+                        let (logits, hidden) = target
+                            .prefill_from_embeds_deepstack_with_hidden(
+                                &m.embeds,
+                                positions,
+                                &mut cache,
+                                &m.visual_pos_mask,
+                                &m.deepstack,
+                            )
+                            .map_err(to_core)?;
+                        cache.set_rope_delta(*delta);
+                        if let Some(proposer) = mtp_proposer.as_mut() {
+                            proposer
+                                .warm_multimodal(&m.embeds, &hidden, positions)
+                                .map_err(to_core)?;
+                        }
                         target
                             .device()
                             .synchronize()
                             .map_err(|e| to_core(e.into()))?;
-                        phase_prefill = prefill.unwrap_or_else(|| generation_started.elapsed());
-                        phase_decode_started =
-                            decode_started.unwrap_or_else(std::time::Instant::now);
-                        result
+                        let prefill = generation_started.elapsed();
+                        let decode_started = std::time::Instant::now();
+                        let proposer: &mut dyn Proposer = match mtp_proposer.as_mut() {
+                            Some(proposer) => proposer,
+                            None => &mut no_proposer,
+                        };
+                        let run = generate_speculative_with(
+                            stepper,
+                            proposer,
+                            SpeculativePrompt::Prefilled {
+                                cache: &mut cache,
+                                logits,
+                                hidden: speculative.then_some(hidden),
+                                history: &m.expanded_ids,
+                                position_delta: *delta,
+                                warm_proposer: false,
+                            },
+                            &config,
+                            drafts,
+                            &req.cancel,
+                            &mut sink,
+                            constraint,
+                            should_stop_opt,
+                            None,
+                        )
+                        .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
+                        target
+                            .device()
+                            .synchronize()
+                            .map_err(|e| to_core(e.into()))?;
+                        phase_prefill = prefill;
+                        phase_decode_started = decode_started;
+                        run
                     }
                     None => {
                         target
@@ -2234,19 +2896,23 @@ impl TextLlm for LlamaProvider {
                             decode_started = Some(std::time::Instant::now());
                             Ok(())
                         };
-                        let result = generate_qwen35_mtp_timed_with_stop(
-                            target,
-                            mtp,
-                            &prompt_ids,
+                        let proposer: &mut dyn Proposer = match mtp_proposer.as_mut() {
+                            Some(proposer) => proposer,
+                            None => &mut no_proposer,
+                        };
+                        let run = generate_speculative_with(
+                            stepper,
+                            proposer,
+                            SpeculativePrompt::Tokens(&prompt_ids),
                             &config,
-                            draft_tokens,
+                            drafts,
                             &req.cancel,
                             &mut sink,
                             constraint,
                             should_stop_opt,
-                            &mut boundary,
+                            Some(&mut boundary),
                         )
-                        .map_err(to_core)?;
+                        .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         target
                             .device()
                             .synchronize()
@@ -2254,15 +2920,144 @@ impl TextLlm for LlamaProvider {
                         phase_prefill = prefill.unwrap_or_else(|| generation_started.elapsed());
                         phase_decode_started =
                             decode_started.unwrap_or_else(std::time::Instant::now);
-                        result
+                        run
                     }
                 };
-                mtp_stats = Some(MtpStats {
-                    proposed_tokens: u32::try_from(stats.proposed).unwrap_or(u32::MAX),
-                    accepted_tokens: u32::try_from(stats.accepted).unwrap_or(u32::MAX),
-                    target_forwards: u32::try_from(stats.forwards).unwrap_or(u32::MAX),
-                });
-                generated
+                if speculative {
+                    mtp_stats = Some(MtpStats {
+                        proposed_tokens: u32::try_from(run.stats.proposed).unwrap_or(u32::MAX),
+                        accepted_tokens: u32::try_from(run.stats.accepted).unwrap_or(u32::MAX),
+                        target_forwards: u32::try_from(run.stats.forwards).unwrap_or(u32::MAX),
+                    });
+                }
+                engine_record = Some(run.record);
+                run.output
+            } else if let (DecodeRoute::Engine { drafts }, Decoder::Causal(model)) =
+                (route, &self.model)
+            {
+                // The llama family (text, and the Gemma 4 soft-token splice) through the unified
+                // engine over the step seam, on the static KV cache (sc-24138). The family has no
+                // MTP head, so the resolved plan is `Off` and the proposer is none; admission above
+                // priced the static preallocation (the widest layer's geometry, E6) and, with the
+                // runner on, its graph workspace (sc-24140). The reference `Decode` loop stays
+                // selectable (`set_decode_path`) as the oracle.
+                if drafts > 0 {
+                    return Err(CoreError::Load(
+                        "MTP was advertised for a non-Qwen target decoder".into(),
+                    ));
+                }
+                let constraint = json_mask
+                    .as_mut()
+                    .map(|m| m as &mut dyn RewindableConstraintMask);
+                // The CUDA-graph runner (sc-24134) wraps the model when the switch is on, as on
+                // the MTP path: the family declares its steps uncapturable
+                // (`positions_host_scalar`), so every step runs eager and the record names why.
+                let graphs = GraphRunner::new(model);
+                let stepper: &dyn StepModel<Cache = StepKvCache> = if cuda_graphs_enabled() {
+                    &graphs
+                } else {
+                    model
+                };
+                let run = match &g4 {
+                    Some(m) => {
+                        // Gemma 4 multimodal: the spliced embeddings prefill the step cache on
+                        // ordinary causal 1-D positions (no M-RoPE, so no position shift), then the
+                        // continuation decodes through the engine. The expanded prompt (soft-token
+                        // spans included) is only known here, so its static preallocation is
+                        // admitted here, before anything is allocated.
+                        let capacity = m.expanded_ids.len().saturating_add(config.max_new_tokens);
+                        let required =
+                            spliced_prompt_bytes(&self.model, capacity, cuda_graphs_enabled())
+                                .ok_or_else(|| {
+                                    CoreError::InvalidRequest(
+                                        "request memory estimate overflow".into(),
+                                    )
+                                })?;
+                        core_llm::admit_request_memory_with_geometry(
+                            m.expanded_ids.len(),
+                            req.max_new_tokens,
+                            self.descriptor.capabilities.max_context_tokens,
+                            required,
+                            request_available_memory(model.device())?,
+                        )?;
+                        let mut cache = model
+                            .new_cache_for(capacity, 0)
+                            .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
+                        let logits = model
+                            .step_prefill_from_embeds(&m.embeds, &mut cache)
+                            .map_err(to_core)?;
+                        model
+                            .device()
+                            .synchronize()
+                            .map_err(|e| to_core(e.into()))?;
+                        let prefill = generation_started.elapsed();
+                        let decode_started = std::time::Instant::now();
+                        let run = generate_speculative_with(
+                            stepper,
+                            &mut NoProposer,
+                            SpeculativePrompt::Prefilled {
+                                cache: &mut cache,
+                                logits,
+                                hidden: None,
+                                history: &m.expanded_ids,
+                                position_delta: 0,
+                                warm_proposer: true,
+                            },
+                            &config,
+                            0,
+                            &req.cancel,
+                            &mut sink,
+                            constraint,
+                            should_stop_opt,
+                            None,
+                        )
+                        .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
+                        model
+                            .device()
+                            .synchronize()
+                            .map_err(|e| to_core(e.into()))?;
+                        phase_prefill = prefill;
+                        phase_decode_started = decode_started;
+                        run
+                    }
+                    None => {
+                        model
+                            .device()
+                            .synchronize()
+                            .map_err(|e| to_core(e.into()))?;
+                        let mut prefill = None;
+                        let mut decode_started = None;
+                        let mut boundary = || -> crate::error::Result<()> {
+                            model.device().synchronize()?;
+                            prefill = Some(generation_started.elapsed());
+                            decode_started = Some(std::time::Instant::now());
+                            Ok(())
+                        };
+                        let run = generate_speculative_with(
+                            stepper,
+                            &mut NoProposer,
+                            SpeculativePrompt::Tokens(&prompt_ids),
+                            &config,
+                            0,
+                            &req.cancel,
+                            &mut sink,
+                            constraint,
+                            should_stop_opt,
+                            Some(&mut boundary),
+                        )
+                        .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
+                        model
+                            .device()
+                            .synchronize()
+                            .map_err(|e| to_core(e.into()))?;
+                        phase_prefill = prefill.unwrap_or_else(|| generation_started.elapsed());
+                        phase_decode_started =
+                            decode_started.unwrap_or_else(std::time::Instant::now);
+                        run
+                    }
+                };
+                engine_record = Some(run.record);
+                run.output
             } else {
                 let constraint = json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask);
                 match &mm {
@@ -2291,6 +3086,8 @@ impl TextLlm for LlamaProvider {
                             model,
                             delta: *delta,
                         };
+                        let shifted = CountingDecode::new(&shifted);
+                        shifted.note_external_forward(); // the DeepStack prefill above
                         let result = generate_from_prefill_with_stop(
                             &shifted,
                             &mut *cache,
@@ -2303,6 +3100,7 @@ impl TextLlm for LlamaProvider {
                             should_stop_opt,
                         )
                         .map_err(to_core)?;
+                        extra_forwards = shifted.forwards();
                         model
                             .device()
                             .synchronize()
@@ -2321,7 +3119,7 @@ impl TextLlm for LlamaProvider {
                                     Decoder::Causal(c) => c,
                                     Decoder::Qwen35(_) => return Err(CoreError::Load(
                                         "gemma 4: the multimodal path requires the generic causal \
-                                     decoder"
+                                 decoder"
                                             .into(),
                                     )),
                                 };
@@ -2329,6 +3127,7 @@ impl TextLlm for LlamaProvider {
                             let first = model
                                 .decode_logits_from_embeds(&m.embeds, &mut *cache, 0)
                                 .map_err(to_core)?;
+                            counted.note_external_forward();
                             self.model
                                 .device()
                                 .synchronize()
@@ -2336,7 +3135,7 @@ impl TextLlm for LlamaProvider {
                             let prefill = generation_started.elapsed();
                             let decode_started = std::time::Instant::now();
                             let result = generate_from_prefill_with_stop(
-                                &self.model,
+                                &counted,
                                 &mut *cache,
                                 first,
                                 m.expanded_ids.clone(),
@@ -2364,8 +3163,7 @@ impl TextLlm for LlamaProvider {
                                 let mut cache = self.model.make_cache();
                                 let ids =
                                     input_ids(&prompt_ids, self.model.device()).map_err(to_core)?;
-                                let first =
-                                    self.model.step(&ids, &mut *cache, 0).map_err(to_core)?;
+                                let first = counted.step(&ids, &mut *cache, 0).map_err(to_core)?;
                                 self.model
                                     .device()
                                     .synchronize()
@@ -2373,7 +3171,7 @@ impl TextLlm for LlamaProvider {
                                 let prefill = generation_started.elapsed();
                                 let decode_started = std::time::Instant::now();
                                 let result = generate_from_prefill_with_stop(
-                                    &self.model,
+                                    &counted,
                                     &mut *cache,
                                     first,
                                     prompt_ids.clone(),
@@ -2396,8 +3194,7 @@ impl TextLlm for LlamaProvider {
                                 let mut cache = self.model.make_cache();
                                 let ids =
                                     input_ids(&prompt_ids, self.model.device()).map_err(to_core)?;
-                                let first =
-                                    self.model.step(&ids, &mut *cache, 0).map_err(to_core)?;
+                                let first = counted.step(&ids, &mut *cache, 0).map_err(to_core)?;
                                 self.model
                                     .device()
                                     .synchronize()
@@ -2405,7 +3202,7 @@ impl TextLlm for LlamaProvider {
                                 let prefill = generation_started.elapsed();
                                 let decode_started = std::time::Instant::now();
                                 let result = generate_from_prefill_with_stop(
-                                    &self.model,
+                                    &counted,
                                     &mut *cache,
                                     first,
                                     prompt_ids.clone(),
@@ -2429,6 +3226,33 @@ impl TextLlm for LlamaProvider {
                 }
             }
         };
+
+        let span_counters = request_span.counters();
+        // The engine's record is measured by the engine itself (the cache it ran on, the
+        // proposer, the per-verify-step syncs); the request span — which also covers a caller
+        // prefill — supplies the host-side counters and every tally. Both records name the
+        // proposer that ran: `none` for a request whose speculation is off, including one whose
+        // `MtpMode::Auto` resolved to no proposer (AC3, sc-24130).
+        let decode_record = match engine_record {
+            Some(record) => record.with_request_span(&request_span),
+            None => DecodeRecord::plain(
+                DecodePath::Reference,
+                counted.forwards() + extra_forwards,
+                out.tokens.len(),
+                span_counters,
+            )
+            .with_attn_formulation(self.model.attn_formulation())
+            .with_proposer(mtp_plan.proposer())
+            .with_span_tallies(&request_span)
+            .with_cuda_graphs(reference_path_graphs(
+                request_span.cuda_graphs(),
+                cuda_graphs_enabled(),
+            )),
+        };
+        *self
+            .last_decode
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(decode_record);
 
         // End-of-generation tails, in pipeline order. First the reasoning segmenter's held-back
         // partial marker (it turned out not to begin a marker) as current-channel text — reasoning
@@ -2529,6 +3353,7 @@ impl TextLlm for LlamaProvider {
             tool_calls,
             usage,
             mtp: mtp_stats,
+            decode: Some(decode_record.report(cuda_graphs_on)),
             finish_reason: Some(finish),
         })
     }
@@ -2699,9 +3524,16 @@ pub(crate) fn to_core(e: crate::Error) -> CoreError {
     match e {
         crate::Error::Canceled => CoreError::Canceled,
         crate::Error::Unsupported(m) => CoreError::Unsupported(m),
+        // The typed capability refusal (sc-24135) is the contract's `Unsupported`, verbatim.
+        crate::Error::Nvfp4Refused(r) => CoreError::Unsupported(r.to_string()),
         crate::Error::MissingTensor(m) => CoreError::Load(format!("missing tensor: {m}")),
         crate::Error::Config(m) => CoreError::Load(m),
         crate::Error::Io(e) => CoreError::Io(e),
+        // A static KV cache's capacity bound is a request-level refusal, never an opaque backend
+        // failure. A request's decode maps it with the request's geometry
+        // ([`LlamaProvider::request_error`]: `RequestResourceExhausted`); without one it is still
+        // the request's fault.
+        e @ crate::Error::KvCapacityExceeded { .. } => CoreError::InvalidRequest(e.to_string()),
         other => CoreError::backend(other),
     }
 }
@@ -2881,6 +3713,11 @@ mod tests {
         substitute_vision_placeholders, validate_context_window, video_placeholder_text, JsonMask,
         EAGER_ATTN_QUERY_CHUNK_SIZE,
     };
+    use super::{Decode as _, Decoder};
+    use crate::decode::DecodePath;
+    use crate::models::CausalLm;
+    use candle_core::Tensor;
+    use std::collections::HashMap;
 
     #[test]
     fn accelerator_only_selector_is_exact_to_qwen38_and_bonsai() {
@@ -2994,7 +3831,7 @@ mod tests {
         let payload = 55_563_006_776;
         let largest_shard = 3_988_973_152;
         let (host_required, device_required) =
-            load_memory_requirements(payload, largest_shard, 0, false, true).unwrap();
+            load_memory_requirements(payload, largest_shard, 0, false, true, false).unwrap();
 
         assert_eq!(host_required, largest_shard);
         assert_eq!(device_required, Some(69_453_758_470));
@@ -3048,8 +3885,9 @@ mod tests {
 
     #[test]
     fn load_memory_requirements_remain_checked() {
-        assert!(load_memory_requirements(u64::MAX, 1, 0, false, true).is_none());
-        assert!(load_memory_requirements(1, 1, u64::MAX, false, true).is_none());
+        assert!(load_memory_requirements(u64::MAX, 1, 0, false, true, false).is_none());
+        assert!(load_memory_requirements(1, 1, u64::MAX, false, true, false).is_none());
+        assert!(load_memory_requirements(u64::MAX / 4, 1, 0, false, true, true).is_none());
     }
 
     #[test]
@@ -3485,5 +4323,1272 @@ mod tests {
             "w within per-frame grid"
         );
         let _ = h;
+    }
+    /// E6 (sc-24132): the static KV cache preallocates K/V for the whole request bound at its
+    /// first step, and the geometry-based admission estimate already covers that preallocation —
+    /// `estimate_request_bytes` charges KV for `prompt + max_new_tokens` positions over every layer
+    /// at `element_bytes` (4), while the static cache holds only the full-attention layers in the
+    /// compute dtype — so a request admitted under the estimate cannot fail its preallocation
+    /// (and a request past the model bound fails closed with the typed error before allocating).
+    #[test]
+    fn qwen35_admission_covers_the_static_kv_preallocation() {
+        use crate::decode::StepModel;
+
+        let (_cfg, model) = crate::models::qwen35::tests::text_model();
+        let (prompt_tokens, max_new_tokens) = (11usize, 21u32);
+        let capacity = prompt_tokens + max_new_tokens as usize;
+        let preallocation = model.static_kv_bytes(capacity) as u64;
+        assert!(preallocation > 0);
+        let decoder = Decoder::Qwen35(model);
+        let geometry = decoder.memory_geometry();
+        let kv_term = (capacity as u64)
+            * geometry.layers
+            * geometry.kv_heads
+            * geometry.head_dim
+            * geometry.element_bytes
+            * 2;
+        assert!(
+            preallocation <= kv_term,
+            "static preallocation {preallocation} exceeds the KV term {kv_term} admission charges"
+        );
+        let estimate =
+            core_llm::estimate_request_bytes(prompt_tokens, max_new_tokens, geometry, 0, 0)
+                .unwrap();
+        assert!(estimate >= preallocation + geometry.recurrent_bytes);
+
+        // What the step seam really allocates for that request is exactly the priced number.
+        let Decoder::Qwen35(model) = &decoder else {
+            unreachable!()
+        };
+        // (The live bytes also carry one ring slot per linear layer — the recurrent term, priced
+        // separately; sc-24131.)
+        let live_recurrent = model.recurrent_state_bytes(1) as u64;
+        let cache = model.new_cache_for(capacity, 0).unwrap();
+        assert_eq!(
+            cache.memory().live_bytes as u64,
+            preallocation + live_recurrent
+        );
+        assert_eq!(cache.kv_kind(), crate::primitives::KvCacheKind::Static);
+        // A declared overshoot is part of the bound (and of the priced preallocation).
+        let cache = model.new_cache_for(capacity, 3).unwrap();
+        assert_eq!(cache.kv_capacity(), Some(capacity + 3));
+        assert_eq!(
+            cache.memory().live_bytes as u64,
+            model.static_kv_bytes(capacity + 3) as u64 + live_recurrent
+        );
+    }
+
+    /// A tiny dense causal decoder from a JSON config and seeded weights (llama or Gemma 4 keys).
+    fn tiny_causal_from(cfg: serde_json::Value, weights: HashMap<String, Tensor>) -> CausalLm {
+        let cfg = crate::config::ModelConfig::from_json(&cfg).unwrap();
+        CausalLm::from_weights(
+            &crate::primitives::Weights::from_map(weights, candle_core::Device::Cpu),
+            "",
+            cfg,
+        )
+        .unwrap()
+    }
+
+    fn tiny_llama_for_admission() -> CausalLm {
+        let (cfg, w) = tiny_llama_parts();
+        tiny_causal_from(cfg, w)
+    }
+
+    /// The tiny llama decoder's config and seeded weights (3 layers, vocab 40).
+    fn tiny_llama_parts() -> (serde_json::Value, HashMap<String, Tensor>) {
+        use crate::primitives::{SplitMix64, TokenRng};
+        let (vocab, hidden, inter, heads, kv_heads, layers) = (40usize, 32, 64, 4, 2, 3);
+        let head_dim = hidden / heads;
+        let mut rng = SplitMix64::new(0x000A_D417);
+        let mut rand = |dims: &[usize]| {
+            let n: usize = dims.iter().product();
+            let data: Vec<f32> = (0..n).map(|_| rng.next_f32() - 0.5).collect();
+            Tensor::from_vec(data, dims.to_vec(), &candle_core::Device::Cpu).unwrap()
+        };
+        let mut w = HashMap::new();
+        w.insert(
+            "model.embed_tokens.weight".to_string(),
+            rand(&[vocab, hidden]),
+        );
+        w.insert("model.norm.weight".to_string(), rand(&[hidden]));
+        w.insert("lm_head.weight".to_string(), rand(&[vocab, hidden]));
+        for i in 0..layers {
+            let p = |s: &str| format!("model.layers.{i}.{s}");
+            w.insert(p("input_layernorm.weight"), rand(&[hidden]));
+            w.insert(p("post_attention_layernorm.weight"), rand(&[hidden]));
+            w.insert(
+                p("self_attn.q_proj.weight"),
+                rand(&[heads * head_dim, hidden]),
+            );
+            w.insert(
+                p("self_attn.k_proj.weight"),
+                rand(&[kv_heads * head_dim, hidden]),
+            );
+            w.insert(
+                p("self_attn.v_proj.weight"),
+                rand(&[kv_heads * head_dim, hidden]),
+            );
+            w.insert(
+                p("self_attn.o_proj.weight"),
+                rand(&[hidden, heads * head_dim]),
+            );
+            w.insert(p("mlp.gate_proj.weight"), rand(&[inter, hidden]));
+            w.insert(p("mlp.up_proj.weight"), rand(&[inter, hidden]));
+            w.insert(p("mlp.down_proj.weight"), rand(&[hidden, inter]));
+        }
+        (
+            serde_json::json!({
+                "architectures": ["LlamaForCausalLM"], "model_type": "llama",
+                "hidden_size": hidden, "intermediate_size": inter, "num_hidden_layers": layers,
+                "num_attention_heads": heads, "num_key_value_heads": kv_heads,
+                "vocab_size": vocab, "rms_norm_eps": 1e-6, "rope_theta": 10000.0,
+                "max_position_embeddings": 256, "tie_word_embeddings": false
+            }),
+            w,
+        )
+    }
+
+    /// sc-24140: a llama-family load reports its weight census (the `LoadRecord` said `None` for
+    /// every non-qwen3_5 architecture), and the requested format reaches `CausalLm`: dense keeps
+    /// all 3 × 7 projections and the head dense; `Quantize::Q8` makes the layer projections GGML
+    /// and keeps the head dense.
+    #[test]
+    fn a_llama_family_load_reports_its_census_for_the_requested_format() {
+        use core_llm::{LoadSpec, Quantize};
+        let (cfg, weights) = tiny_llama_parts();
+        let dir = tempfile::Builder::new()
+            .prefix("candle-llama-census-")
+            .tempdir()
+            .unwrap();
+        std::fs::write(dir.path().join("config.json"), cfg.to_string()).unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer.json"),
+            synthetic_tokenizer_json(40),
+        )
+        .unwrap();
+        candle_core::safetensors::save(&weights, dir.path().join("model.safetensors")).unwrap();
+        let load = |quantize| {
+            super::LlamaProvider::load(&LoadSpec {
+                quantize,
+                ..LoadSpec::dense(dir.path().display().to_string())
+            })
+            .expect("load the synthetic llama snapshot")
+            .load_record()
+        };
+        let dense = load(None);
+        let census = dense
+            .census
+            .expect("a llama-family load reports its census");
+        assert_eq!(census.projections.dense.count, 3 * 7 + 1);
+        assert_eq!(census.projections.ggml.count, 0);
+        let q8 = load(Some(Quantize::Q8));
+        assert_eq!(q8.requested, Some(Quantize::Q8));
+        let census = q8.census.expect("census");
+        assert_eq!(
+            census.projections.ggml.count,
+            3 * 7,
+            "every layer projection is Q8"
+        );
+        assert_eq!(
+            census.projections.dense.count, 1,
+            "the head stays dense under GGML"
+        );
+        assert_eq!(census.projections.dense.params, 40 * 32);
+    }
+
+    /// The shared Gemma 4 decoder fixture: sliding layers 2 KV heads × 8, full layers
+    /// `attention_k_eq_v` with 1 global KV head × 16 — equal `kv_heads × head width` per layer.
+    ///
+    /// With `k_eq_v` off (`k_eq_v = false`) the full layers keep the ordinary two KV heads at the
+    /// global width 16 (upstream gates `num_global_key_value_heads` on the flag) and get their own
+    /// `v_proj`: 2 × 16 per full layer against the sliding layers' 2 × 8, so the full layers are
+    /// the widest and the scalar `num_key_value_heads × head_dim` (2 × 8) under-prices them.
+    fn tiny_gemma4_for_admission_with(k_eq_v: bool) -> CausalLm {
+        use crate::primitives::{SplitMix64, TokenRng};
+        let g: serde_json::Value = serde_json::from_str(include_str!(
+            "../../testdata/gemma4/gemma4_decoder_goldens.json"
+        ))
+        .unwrap();
+        let mut w = HashMap::new();
+        for (key, spec) in g["weights"].as_object().unwrap() {
+            let shape: Vec<usize> = spec["shape"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_u64().unwrap() as usize)
+                .collect();
+            let data: Vec<f32> = spec["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect();
+            w.insert(
+                key.clone(),
+                Tensor::from_vec(data, shape, &candle_core::Device::Cpu).unwrap(),
+            );
+        }
+        let mut cfg = g["config"].clone();
+        if !k_eq_v {
+            cfg["text_config"]["attention_k_eq_v"] = serde_json::json!(false);
+            let text = &cfg["text_config"];
+            let hidden = text["hidden_size"].as_u64().unwrap() as usize;
+            let kv_heads = text["num_key_value_heads"].as_u64().unwrap() as usize;
+            let global_head_dim = text["global_head_dim"].as_u64().unwrap() as usize;
+            let mut rng = SplitMix64::new(0x6E4F_A11D);
+            let mut rand = |dims: [usize; 2]| {
+                let data: Vec<f32> = (0..dims[0] * dims[1])
+                    .map(|_| (rng.next_f32() - 0.5) * 0.2)
+                    .collect();
+                Tensor::from_vec(data, dims.to_vec(), &candle_core::Device::Cpu).unwrap()
+            };
+            let layer_types = text["layer_types"].as_array().unwrap().clone();
+            for (i, kind) in layer_types.iter().enumerate() {
+                if kind.as_str() == Some("full_attention") {
+                    let rows = kv_heads * global_head_dim;
+                    w.insert(
+                        format!("model.layers.{i}.self_attn.k_proj.weight"),
+                        rand([rows, hidden]),
+                    );
+                    w.insert(
+                        format!("model.layers.{i}.self_attn.v_proj.weight"),
+                        rand([rows, hidden]),
+                    );
+                }
+            }
+        }
+        tiny_causal_from(cfg, w)
+    }
+
+    /// E6 (sc-24138): the provider decodes the llama family through the engine on the step seam's
+    /// static KV cache, which preallocates every caching layer's K/V for the request bound at
+    /// once, and admission prices it: the causal geometry carries the one widest layer's
+    /// `(kv_heads, head width)`, so `layers × kv_heads × head_dim × 2` covers every layer.
+    ///
+    /// * llama (uniform) and Gemma 4 with `k_eq_v` (sliding 2 × 8, full 1 × 16 — equal widths):
+    ///   the KV term is **exactly** the preallocation — no inflation (the old independent maxima,
+    ///   2 heads × 16, charged twice what any layer holds);
+    /// * Gemma 4 without `k_eq_v` (full 2 × 16 wider than sliding 2 × 8): the full layers set the
+    ///   geometry, and the scalar `num_key_value_heads × head_dim` would under-price the cache.
+    ///
+    /// The request is long enough (9 + 200 positions) that the KV term dominates the estimate, so
+    /// `priced >= preallocation` fails if the KV geometry is lost. The provider's causal engine
+    /// path runs no proposer, so it declares no verify overshoot and its request is priced on the
+    /// `Off` plan for exactly `prompt + max_new_tokens` positions; the seam's own overshoot
+    /// contract (`static_kv_bytes(capacity + overshoot)` exactly) is checked here too, but no
+    /// provider path prices one for this family.
+    #[test]
+    fn causal_admission_covers_the_static_kv_preallocation() {
+        use crate::decode::StepModel;
+        use crate::primitives::DecodeCache;
+
+        for (label, model, exact) in [
+            ("llama", tiny_llama_for_admission(), true),
+            ("gemma4 k_eq_v", tiny_gemma4_for_admission_with(true), true),
+            (
+                "gemma4 full wider",
+                tiny_gemma4_for_admission_with(false),
+                false,
+            ),
+        ] {
+            let (prompt_tokens, max_new_tokens) = (9usize, 200u32);
+            let capacity = prompt_tokens + max_new_tokens as usize;
+            let preallocation = model.static_kv_bytes(capacity) as u64;
+            assert!(preallocation > 0, "{label}");
+            let layout = model.kv_layout();
+            let widest = layout
+                .layers
+                .iter()
+                .flatten()
+                .map(|l| l.kv_heads * l.key_dim.max(l.value_dim))
+                .max()
+                .unwrap();
+            let decoder = Decoder::Causal(model);
+            let geometry = decoder.memory_geometry();
+            assert_eq!(
+                (geometry.kv_heads, geometry.head_dim),
+                {
+                    let (h, d) = layout.widest_layer();
+                    (h as u64, d as u64)
+                },
+                "{label}: the geometry is the widest layer's"
+            );
+            assert_eq!(
+                geometry.kv_heads * geometry.head_dim,
+                widest as u64,
+                "{label}: one layer's heads × width, never the maxima of two layer types"
+            );
+            let kv_term = (capacity as u64)
+                * geometry.layers
+                * geometry.kv_heads
+                * geometry.head_dim
+                * geometry.element_bytes
+                * 2;
+            if exact {
+                // CPU f32 cache elements are the geometry's 4 bytes: nothing is over-charged.
+                assert_eq!(
+                    kv_term, preallocation,
+                    "{label}: the KV term is exactly the preallocation (no inflation)"
+                );
+            } else {
+                assert!(
+                    preallocation <= kv_term,
+                    "{label}: static preallocation {preallocation} exceeds the KV term {kv_term}"
+                );
+            }
+            // What the provider charges this request (the causal engine path: no proposer).
+            let engine = super::DecodeRoute::Engine { drafts: 0 };
+            let priced = super::priced_request_bytes(
+                &decoder,
+                engine,
+                prompt_tokens,
+                max_new_tokens,
+                0,
+                false,
+            )
+            .unwrap();
+            // With the CUDA-graph runner on, the runner wraps this engine too, so its graph
+            // workspace is priced (sc-24140): one step token count (`K + 1 = 1`) over the
+            // request's reach.
+            let graph_term = crate::decode::graph_workspace_admission_bytes(
+                &decoder.step_memory_geometry(0),
+                capacity as u64,
+                1,
+            )
+            .unwrap();
+            assert!(graph_term > 0, "{label}");
+            assert_eq!(
+                super::priced_request_bytes(
+                    &decoder,
+                    engine,
+                    prompt_tokens,
+                    max_new_tokens,
+                    0,
+                    true,
+                )
+                .unwrap()
+                    - priced,
+                graph_term,
+                "{label}"
+            );
+            let Decoder::Causal(model) = &decoder else {
+                unreachable!()
+            };
+            // The cache the engine builds for that request (`new_cache_for(prompt + budget, 0)`)
+            // is exactly the priced preallocation, and the estimate covers it.
+            let cache = model.new_cache_for(capacity, 0).unwrap();
+            assert_eq!(cache.kv_kind(), crate::primitives::KvCacheKind::Static);
+            assert_eq!(cache.memory().live_bytes as u64, preallocation, "{label}");
+            assert!(
+                priced >= preallocation,
+                "{label}: priced {priced} < preallocation {preallocation}"
+            );
+            // The seam's overshoot contract: a declared overshoot is part of the bound, and the
+            // cache is exactly `static_kv_bytes(capacity + overshoot)` (the provider's causal path
+            // declares none — see above).
+            let cache = model.new_cache_for(capacity, 3).unwrap();
+            assert_eq!(cache.kv_capacity(), Some(capacity + 3), "{label}");
+            assert_eq!(
+                cache.memory().live_bytes as u64,
+                model.static_kv_bytes(capacity + 3) as u64,
+                "{label}"
+            );
+        }
+
+        // The non-`k_eq_v` fixture is where the full layers are widest: the scalar geometry the
+        // family read before sc-24138 would under-price the static cache.
+        let gemma4 = tiny_gemma4_for_admission_with(false);
+        let cfg = gemma4.config();
+        let scalar = (cfg.num_kv_heads * cfg.head_dim) as u64;
+        let (h, d) = gemma4.kv_layout().widest_layer();
+        assert_eq!((h, d), (2, 16), "the full layers (2 × 16) are the widest");
+        let capacity = 26u64;
+        let scalar_term = capacity * cfg.num_layers as u64 * scalar * 4 * 2;
+        assert!(
+            scalar_term < gemma4.static_kv_bytes(capacity as usize) as u64,
+            "the scalar geometry under-prices the full layers"
+        );
+    }
+
+    /// sc-24140 (E6): the Gemma 4 soft-token splice re-admits its expanded prompt with the
+    /// static preallocation and, when the CUDA-graph runner wraps the engine, the runner's graph
+    /// workspace over the same reach (one step token count: no proposer).
+    #[test]
+    fn the_spliced_prompt_readmission_prices_the_graph_workspace_when_the_runner_is_on() {
+        let decoder = Decoder::Causal(tiny_gemma4_for_admission_with(false));
+        let capacity = 40usize;
+        let kv = decoder.static_kv_bytes(capacity) as u64;
+        assert!(kv > 0);
+        assert_eq!(
+            super::spliced_prompt_bytes(&decoder, capacity, false),
+            Some(kv)
+        );
+        let graphs = crate::decode::graph_workspace_admission_bytes(
+            &decoder.step_memory_geometry(0),
+            capacity as u64,
+            1,
+        )
+        .unwrap();
+        assert!(graphs > 0);
+        assert_eq!(
+            super::spliced_prompt_bytes(&decoder, capacity, true),
+            Some(kv + graphs)
+        );
+    }
+
+    fn nvfp4_spec(source: &str) -> core_llm::LoadSpec {
+        core_llm::LoadSpec {
+            source: source.into(),
+            projector_source: None,
+            quantize: Some(core_llm::Quantize::Nvfp4),
+            cuda_graphs: None,
+        }
+    }
+
+    /// sc-24135 AC2: NVFP4 on a CPU device is a typed refusal naming the capability, settled by the
+    /// helper `LlamaProvider::load` calls before the accelerator gate, admission or any weight read.
+    #[test]
+    fn nvfp4_on_cpu_is_a_typed_refusal_naming_the_capability() {
+        let device = candle_core::Device::Cpu;
+        match super::nvfp4_format(&nvfp4_spec("snapshot-dir"), &device) {
+            Err(core_llm::Error::Unsupported(msg)) => {
+                assert!(msg.starts_with("nvfp4: "), "names the capability: {msg}");
+                assert!(msg.contains("sm_120"), "names the floor: {msg}");
+                assert!(msg.contains("Cpu"), "names the device: {msg}");
+            }
+            other => panic!("expected a typed Unsupported refusal, got {other:?}"),
+        }
+        // Non-NVFP4 requests never touch the gate.
+        for quantize in [
+            None,
+            Some(core_llm::Quantize::Q4),
+            Some(core_llm::Quantize::Q8),
+        ] {
+            let spec = core_llm::LoadSpec {
+                quantize,
+                ..nvfp4_spec("snapshot-dir")
+            };
+            assert!(super::nvfp4_format(&spec, &device).unwrap().is_none());
+        }
+        // A GGUF source is refused by name on any device (it is already block-quantized).
+        match super::nvfp4_format(&nvfp4_spec("model.gguf"), &device) {
+            Err(core_llm::Error::Unsupported(msg)) => assert!(msg.starts_with("nvfp4: "), "{msg}"),
+            other => panic!("expected a typed Unsupported refusal, got {other:?}"),
+        }
+    }
+
+    /// sc-24135 AC2 with a mocked sub-sm_120 capability: the device gate's refusal reaches the
+    /// backend-neutral contract as `Unsupported`, naming the capability, the floor and the device.
+    #[test]
+    fn a_sub_sm120_refusal_reaches_the_contract_as_unsupported() {
+        for cap in [(8, 9), (9, 0), (10, 0)] {
+            let refusal = candle_quant_kernels::nvfp4_refusal_for_compute_cap(cap).unwrap();
+            match super::to_core(crate::Error::Nvfp4Refused(refusal)) {
+                core_llm::Error::Unsupported(msg) => {
+                    assert!(msg.starts_with("nvfp4: "), "{msg}");
+                    assert!(msg.contains("sm_120"), "{msg}");
+                    assert!(msg.contains(&format!("sm_{}{}", cap.0, cap.1)), "{msg}");
+                }
+                other => panic!("expected Unsupported, got {other:?}"),
+            }
+        }
+    }
+
+    /// sc-24135 AC2 through the real gate: `nvfp4_format` → `Nvfp4Context::require_with` (a real
+    /// cuBLASLt handle, the capability probe mocked to a sub-sm_120 device) → the typed refusal →
+    /// the contract's `Unsupported`, naming the capability, the floor and the mocked device.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn nvfp4_format_refuses_a_mocked_sub_sm120_device_as_unsupported() {
+        let Ok(device) = crate::device::new_cuda_for_test() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        for cap in [(8, 9), (10, 0)] {
+            let gate = |d: &candle_core::Device| {
+                crate::primitives::projection::ProjectionFormat::nvfp4_with_cap_probe(d, |_| {
+                    Ok(cap)
+                })
+            };
+            match super::nvfp4_format_with(&nvfp4_spec("snapshot-dir"), &device, gate) {
+                Err(core_llm::Error::Unsupported(msg)) => {
+                    assert!(msg.starts_with("nvfp4: "), "{msg}");
+                    assert!(msg.contains("sm_120"), "names the floor: {msg}");
+                    assert!(
+                        msg.contains(&format!("sm_{}{}", cap.0, cap.1)),
+                        "names the device: {msg}"
+                    );
+                }
+                Err(other) => panic!("expected Unsupported for {cap:?}, got {other:?}"),
+                Ok(_) => panic!("a mocked sm_{}{} device served NVFP4", cap.0, cap.1),
+            }
+        }
+    }
+
+    /// sc-24140: the family rule `nvfp4_format` applies before admission and the device gate. The
+    /// qwen3_5 hybrid **and** the llama family (a `CausalLm` — Qwen3-8B's `qwen3`, Llama/Mistral,
+    /// Gemma, …) reach the gate; a Prism/Bonsai snapshot (already packed affine-2) is refused by
+    /// name before it, so no memory or device error can mask the refusal. The refusing gate below
+    /// panics if reached.
+    #[test]
+    fn nvfp4_family_rule_serves_qwen35_and_the_llama_family_and_refuses_prism() {
+        let root = tempfile::tempdir().unwrap();
+        let spec = nvfp4_spec(&root.path().to_string_lossy());
+        for config in [
+            r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5"}"#,
+            r#"{"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3"}"#,
+            r#"{"architectures":["LlamaForCausalLM"],"model_type":"llama"}"#,
+            r#"{"architectures":["MistralForCausalLM"],"model_type":"mistral"}"#,
+            r#"{"architectures":["Gemma2ForCausalLM"],"model_type":"gemma2"}"#,
+            r#"{"architectures":["DeepseekV2ForCausalLM"],"model_type":"deepseek_v2"}"#,
+            r#"{"architectures":["Qwen3VLForConditionalGeneration"],"model_type":"qwen3_vl"}"#,
+        ] {
+            std::fs::write(root.path().join("config.json"), config).unwrap();
+            let reached = std::cell::Cell::new(false);
+            let gate = |_: &candle_core::Device| -> crate::Result<_> {
+                reached.set(true);
+                Err(crate::Error::Unsupported("nvfp4: gate reached".into()))
+            };
+            match super::nvfp4_format_with(&spec, &candle_core::Device::Cpu, gate) {
+                Err(core_llm::Error::Unsupported(msg)) => assert_eq!(msg, "nvfp4: gate reached"),
+                other => panic!("{config}: expected the gate's refusal, got {other:?}"),
+            }
+            assert!(reached.get(), "{config} must reach the device gate");
+        }
+
+        std::fs::write(
+            root.path().join("config.json"),
+            r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"prism_hadamard_qwen35"}"#,
+        )
+        .unwrap();
+        let gate = |_: &candle_core::Device| -> crate::Result<_> {
+            panic!("the device gate ran before the family refusal")
+        };
+        match super::nvfp4_format_with(&spec, &candle_core::Device::Cpu, gate) {
+            Err(core_llm::Error::Unsupported(msg)) => {
+                assert!(msg.starts_with("nvfp4: "), "{msg}");
+                assert!(msg.contains("Prism/Bonsai"), "names the family: {msg}");
+                assert!(msg.contains("dense snapshot"), "names the reason: {msg}");
+            }
+            other => panic!("expected the family refusal, got {other:?}"),
+        }
+    }
+
+    /// sc-24140 feature-end review: a packed MLX-affine snapshot — a `quantization` block over
+    /// `<stem>.weight` + `<stem>.scales` — is refused by the model gate, from the index's
+    /// `weight_map` or the shard headers (never tensor data), on the llama family and the hybrid
+    /// alike; the loader would otherwise refuse its triples only after reading every weight. A
+    /// prepared Q4/Q8 snapshot (the block over dense weights), a triple without the block and an
+    /// orphan `.scales` are not packed. The device gate below panics if the refusal misses it.
+    #[test]
+    fn nvfp4_gate_refuses_a_packed_mlx_affine_snapshot_before_the_device_gate() {
+        let llama =
+            serde_json::json!({"architectures": ["LlamaForCausalLM"], "model_type": "llama"});
+        let block = serde_json::json!({"group_size": 64, "bits": 4});
+        let with_block = |mut config: serde_json::Value| {
+            config["quantization"] = block.clone();
+            config
+        };
+        let triple = [
+            "model.layers.0.mlp.up_proj.weight",
+            "model.layers.0.mlp.up_proj.scales",
+            "model.layers.0.mlp.up_proj.biases",
+        ];
+        let refusal = |config: &serde_json::Value, names: &[&str], index: bool| {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("config.json"), config.to_string()).unwrap();
+            super::write_test_snapshot_tensors(root.path(), names, index);
+            let gate = |_: &candle_core::Device| -> crate::Result<_> {
+                Err(crate::Error::Unsupported("nvfp4: gate reached".into()))
+            };
+            let spec = nvfp4_spec(&root.path().to_string_lossy());
+            match super::nvfp4_format_with(&spec, &candle_core::Device::Cpu, gate) {
+                Err(core_llm::Error::Unsupported(msg)) => msg,
+                other => panic!("{config}: expected an Unsupported refusal, got {other:?}"),
+            }
+        };
+        let hybrid = serde_json::json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "model_type": "qwen3_5",
+            "text_config": {"quantization": block.clone()}
+        });
+        for (config, index) in [
+            (with_block(llama.clone()), true),
+            (with_block(llama.clone()), false),
+            (hybrid, false),
+        ] {
+            let msg = refusal(&config, &triple, index);
+            assert!(msg.starts_with("nvfp4: "), "{msg}");
+            assert!(
+                msg.contains("packed MLX-affine"),
+                "{config} (index {index}): {msg}"
+            );
+            assert!(msg.contains("model.layers.0.mlp.up_proj.scales"), "{msg}");
+            assert!(msg.contains("dense snapshot"), "{msg}");
+            assert!(!msg.contains("  "), "{msg:?}");
+        }
+        // Not packed: each reaches the device gate.
+        let dense = [
+            "model.layers.0.mlp.up_proj.weight",
+            "model.layers.0.mlp.down_proj.weight",
+        ];
+        for (config, names) in [
+            (with_block(llama.clone()), &dense[..]),
+            (llama.clone(), &triple[..]),
+            (
+                with_block(llama.clone()),
+                &[
+                    "model.layers.0.mlp.up_proj.scales",
+                    "model.layers.0.mlp.down_proj.weight",
+                ][..],
+            ),
+        ] {
+            for index in [true, false] {
+                assert_eq!(
+                    refusal(&config, names, index),
+                    "nvfp4: gate reached",
+                    "{config} {names:?} (index {index})"
+                );
+            }
+        }
+    }
+
+    /// On a build with no CUDA backend the whole load refuses NVFP4 before reading a byte: the
+    /// source here does not exist, so any later step would have failed with a Load/IO error.
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn nvfp4_load_without_cuda_refuses_before_reading_the_snapshot() {
+        // A snapshot path that does not exist, inside a self-removing root.
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("no-snapshot-here");
+        match super::LlamaProvider::load(&nvfp4_spec(&missing.to_string_lossy())) {
+            Err(core_llm::Error::Unsupported(msg)) => assert!(msg.starts_with("nvfp4: "), "{msg}"),
+            Err(other) => panic!("expected the NVFP4 refusal first, got {other:?}"),
+            Ok(_) => panic!("NVFP4 cannot load without CUDA"),
+        }
+    }
+
+    /// E6: an NVFP4 load prices the packed copy (4.5 of every 16 source bits) on the device on top
+    /// of the resident bf16 source and the existing headroom; the host side is unchanged.
+    #[test]
+    fn nvfp4_admission_prices_the_packed_copy_beside_the_bf16_source() {
+        let payload = 55_000_000_000u64; // ~Qwen3.8-27B bf16
+        let (host_dense, dense) =
+            load_memory_requirements(payload, payload / 10, 0, false, true, false).unwrap();
+        let (host_nv, nv) =
+            load_memory_requirements(payload, payload / 10, 0, false, true, true).unwrap();
+        assert_eq!(
+            host_nv, host_dense,
+            "NVFP4 quantizes on the device, not the host"
+        );
+        assert_eq!(nv.unwrap() - dense.unwrap(), payload * 9 / 32);
+        assert_eq!(nv.unwrap(), payload + payload / 4 + payload * 9 / 32);
+        // No device domain on CPU (NVFP4 never gets this far there, but the pricing is total).
+        assert_eq!(
+            load_memory_requirements(payload, payload, 0, false, false, true)
+                .unwrap()
+                .1,
+            None
+        );
+    }
+
+    /// E6: admission prices exactly the recurrent state a Qwen3.5-family request's cache holds.
+    /// The provider's reference/MTP cache (`Decode::make_cache`) keeps no checkpoint ring — one
+    /// live state per linear layer, `1 + REFERENCE_MAX_CHECKPOINTS` states; the engine's step
+    /// cache for `K` drafts keeps a per-token checkpoint ring of `K + 2` states per linear layer,
+    /// and the geometry for that request charges exactly the ring's bytes — the old start-of-step
+    /// checkpoint term is gone (sc-24131).
+    #[test]
+    fn qwen35_admission_prices_every_recurrent_state_the_cache_holds() {
+        use crate::decode::{StepModel, StepRequest};
+        use crate::models::qwen35::{REFERENCE_MAX_CHECKPOINTS, STEP_MAX_CHECKPOINTS};
+        use crate::models::Qwen35Cache;
+        use crate::primitives::nn::input_ids;
+
+        let (_cfg, model) = crate::models::qwen35::tests::text_model();
+        let one_state = model.recurrent_state_bytes(1) as u64;
+        assert!(one_state > 0);
+        assert_eq!(model.recurrent_state_bytes(4), 4 * one_state as usize);
+        let decoder = Decoder::Qwen35(model);
+        let geometry = decoder.memory_geometry();
+        assert_eq!(
+            geometry.recurrent_bytes,
+            one_state * (1 + REFERENCE_MAX_CHECKPOINTS as u64),
+            "the geometry charges the live state plus the provider cache's checkpoints"
+        );
+        // The admission estimate carries the whole recurrent term (charged once with MTP off).
+        let without = core_llm::LlmMemoryGeometry {
+            recurrent_bytes: 0,
+            ..geometry
+        };
+        let est = |g| core_llm::estimate_chunked_request_bytes(8, 4, g, 0, 0, 64).unwrap();
+        assert_eq!(est(geometry) - est(without), geometry.recurrent_bytes);
+
+        // What the provider's cache really holds at steady state (prefill + several steps).
+        let device = candle_core::Device::Cpu;
+        let mut cache = decoder.make_cache();
+        decoder
+            .step(&input_ids(&[1, 7, 3], &device).unwrap(), cache.as_mut(), 0)
+            .unwrap();
+        for (i, t) in [42, 9, 2, 11].into_iter().enumerate() {
+            decoder
+                .step(
+                    &input_ids(&[t], &device).unwrap(),
+                    cache.as_mut(),
+                    3 + i as i32,
+                )
+                .unwrap();
+        }
+        let held = cache.as_any_mut().downcast_mut::<Qwen35Cache>().unwrap();
+        assert_eq!(held.max_checkpoints(), REFERENCE_MAX_CHECKPOINTS);
+        assert_eq!(
+            held.recurrent_bytes() as u64,
+            geometry.recurrent_bytes,
+            "provider cache holds {} recurrent bytes, admission charges {}",
+            held.recurrent_bytes(),
+            geometry.recurrent_bytes
+        );
+
+        // The engine's step cache for `K` drafts: the ring is the whole recurrent term, priced
+        // exactly, from creation (preallocated) through decoding (written in place).
+        let Decoder::Qwen35(model) = &decoder else {
+            unreachable!()
+        };
+        for k in 0..=5usize {
+            let step_geometry = decoder.step_memory_geometry(k);
+            let mut step = model.new_cache_for(16, k).unwrap();
+            assert_eq!(
+                step.max_checkpoints(),
+                k + 1,
+                "K={k}: the step start + K + 1 positions"
+            );
+            assert_eq!(
+                step.recurrent_bytes() as u64,
+                one_state * (k as u64 + 2),
+                "K={k}: a ring of K + 2 states per linear layer"
+            );
+            assert_eq!(
+                step_geometry.recurrent_bytes,
+                step.recurrent_bytes() as u64,
+                "K={k}: admission charges exactly the ring"
+            );
+            model
+                .forward_step(&mut step, StepRequest::last(&[1, 7, 3]))
+                .unwrap();
+            for t in [42, 9, 2, 11] {
+                model
+                    .forward_step(&mut step, StepRequest::last(&[t]))
+                    .unwrap();
+            }
+            assert_eq!(
+                step_geometry.recurrent_bytes,
+                step.recurrent_bytes() as u64,
+                "K={k}: nothing grew while decoding"
+            );
+        }
+
+        // The unbounded step cache keeps STEP_MAX_CHECKPOINTS positions behind the current one.
+        let mut step = StepModel::new_cache(model);
+        model
+            .forward_step(&mut step, StepRequest::last(&[1, 7, 3]))
+            .unwrap();
+        for t in [42, 9, 2, 11] {
+            model
+                .forward_step(&mut step, StepRequest::last(&[t]))
+                .unwrap();
+        }
+        assert_eq!(step.checkpoint_offsets().len(), STEP_MAX_CHECKPOINTS);
+        assert_eq!(
+            step.recurrent_bytes() as u64,
+            one_state * (1 + STEP_MAX_CHECKPOINTS as u64)
+        );
+        assert_eq!(
+            decoder
+                .memory_geometry_with_checkpoints(STEP_MAX_CHECKPOINTS)
+                .recurrent_bytes,
+            step.recurrent_bytes() as u64
+        );
+    }
+
+    /// E6 (sc-24134, sc-24140): with the CUDA-graph runner switched on, every request the runner
+    /// wraps is priced for every graph it may capture — exactly [`graph_workspace_admission_bytes`]
+    /// over the step geometry, the request's reach (`prompt + budget + K`) and the `K + 1` step
+    /// token counts: an MTP request (`K`) and a request whose speculation is off (the engine with
+    /// no proposer, `K = 0`) alike. The reference loop, which the runner never wraps, is priced as
+    /// before.
+    #[test]
+    fn admission_includes_the_cuda_graph_workspace_when_the_runner_is_on() {
+        use super::DecodeRoute;
+
+        let (_cfg, model) = crate::models::qwen35::tests::text_model();
+        let decoder = Decoder::Qwen35(model);
+        let (prompt, budget, k) = (11usize, 21u32, 3u32);
+        let price = |route, graphs| {
+            super::priced_request_bytes(&decoder, route, prompt, budget, 0, graphs).unwrap()
+        };
+        let graph_term = |drafts: u32| {
+            crate::decode::graph_workspace_admission_bytes(
+                &decoder.step_memory_geometry(drafts as usize),
+                (prompt as u64) + u64::from(budget) + u64::from(drafts),
+                drafts + 1,
+            )
+            .unwrap()
+        };
+        let mtp = DecodeRoute::Engine { drafts: k };
+        let off = DecodeRoute::Engine { drafts: 0 };
+        assert!(graph_term(k) > graph_term(0) && graph_term(0) > 0);
+        assert_eq!(price(mtp, true) - price(mtp, false), graph_term(k));
+        assert_eq!(price(off, true) - price(off, false), graph_term(0));
+        assert_eq!(
+            price(DecodeRoute::Reference, true),
+            price(DecodeRoute::Reference, false)
+        );
+    }
+
+    #[test]
+    fn mtp_admission_prices_the_step_cache_checkpoints_and_the_verify_overshoot() {
+        use super::DecodeRoute;
+
+        let (_cfg, model) = crate::models::qwen35::tests::text_model();
+        let one_state = model.recurrent_state_bytes(1) as u64;
+        let decoder = Decoder::Qwen35(model);
+        let (prompt, budget) = (11usize, 21u32);
+        let k = 3u32;
+        let price =
+            |route| super::priced_request_bytes(&decoder, route, prompt, budget, 0, false).unwrap();
+        let on_bytes = price(DecodeRoute::Engine { drafts: k });
+        let off_bytes = price(DecodeRoute::Engine { drafts: 0 });
+        let reference_bytes = price(DecodeRoute::Reference);
+
+        // The same request priced on the reference geometry with the width set: what admission
+        // would charge if it forgot the engine's cache. The step geometry's ring term — `K + 2`
+        // states per linear layer against the reference cache's one (sc-24131) — is the only
+        // difference, charged once: the engine rolls back by slot selection, never by a clone.
+        let on_reference_geometry = core_llm::estimate_chunked_request_bytes_with_recurrent_copies(
+            prompt,
+            budget,
+            decoder.memory_geometry(),
+            0,
+            k,
+            EAGER_ATTN_QUERY_CHUNK_SIZE,
+            1,
+        )
+        .unwrap();
+        let ring_term = u64::from(k + 1) * one_state;
+        assert!(ring_term > 0);
+        assert_eq!(
+            on_bytes - on_reference_geometry,
+            ring_term,
+            "an Enabled request is priced on the step cache's per-token checkpoint ring, once"
+        );
+
+        // A request whose speculation is off runs the engine with no proposer (sc-24140): its
+        // cache's `K = 0` ring holds two states per linear layer against the reference cache's
+        // one — the only difference from the reference loop's price.
+        assert_eq!(
+            decoder.step_memory_geometry(0).recurrent_bytes,
+            2 * one_state
+        );
+        assert_eq!(off_bytes - reference_bytes, one_state);
+
+        // Against the Off request: `K` more ring states plus at least the K positions the verify
+        // step writes past the budget (each `layers * kv_heads * head_dim * 2 * element` bytes).
+        let geometry = decoder.step_memory_geometry(k as usize);
+        assert_eq!(geometry.recurrent_bytes, u64::from(k + 2) * one_state);
+        let kv_per_position =
+            geometry.layers * geometry.kv_heads * geometry.head_dim * geometry.element_bytes * 2;
+        assert!(
+            on_bytes >= off_bytes + u64::from(k) * one_state + u64::from(k) * kv_per_position,
+            "Enabled {on_bytes} vs Off {off_bytes}: ring {k} x {one_state}, overshoot {k} x {kv_per_position}"
+        );
+    }
+
+    /// sc-24140: one decision picks the loop — and so the price. An MTP plan always runs the
+    /// engine with its proposer; a request whose speculation is off (`Off`, or `Auto` on a
+    /// checkpoint without a head) runs the engine with none — text and Qwen-VL multimodal alike on
+    /// the hybrid — unless the reference loop is selected.
+    #[test]
+    fn a_request_decodes_on_the_engine_unless_the_reference_loop_is_selected() {
+        use super::DecodeRoute;
+        use core_llm::{MtpMode, MtpPlan};
+
+        let (_dir, mut provider) = synthetic_qwen35_provider_without_mtp();
+        assert_eq!(provider.decode_path(), DecodePath::StepModel, "the default");
+        let auto = core_llm::resolve_mtp_plan(MtpMode::Auto, None);
+        assert_eq!(auto, MtpPlan::Off);
+        let mtp = MtpPlan::Mtp { draft_tokens: 3 };
+        for multimodal in [false, true] {
+            assert_eq!(
+                provider.decode_route(auto, multimodal),
+                DecodeRoute::Engine { drafts: 0 },
+                "multimodal={multimodal}"
+            );
+            assert_eq!(
+                provider.decode_route(mtp, multimodal),
+                DecodeRoute::Engine { drafts: 3 }
+            );
+        }
+        provider
+            .set_decode_path(DecodePath::Reference)
+            .expect("the reference loop is selectable");
+        assert_eq!(provider.decode_route(auto, false), DecodeRoute::Reference);
+        assert_eq!(provider.decode_route(auto, true), DecodeRoute::Reference);
+        assert_eq!(
+            provider.decode_route(mtp, false),
+            DecodeRoute::Engine { drafts: 3 },
+            "an MTP plan runs the engine whatever the selector says"
+        );
+        assert!(provider.set_decode_path(DecodePath::PromptLookup).is_err());
+        assert_eq!(provider.decode_path(), DecodePath::Reference);
+    }
+
+    /// A tokenizer.json whose vocab is `t0..t{vocab-1}` (whitespace WordLevel), so every id of
+    /// the synthetic decoder decodes to a distinct piece.
+    fn synthetic_tokenizer_json(vocab: usize) -> String {
+        let entries: Vec<String> = (0..vocab).map(|i| format!("\"t{i}\": {i}")).collect();
+        format!(
+            r#"{{
+                "version": "1.0",
+                "added_tokens": [],
+                "normalizer": null,
+                "pre_tokenizer": {{ "type": "Whitespace" }},
+                "post_processor": null,
+                "decoder": null,
+                "model": {{ "type": "WordLevel", "vocab": {{ {} }}, "unk_token": "t0" }}
+            }}"#,
+            entries.join(", ")
+        )
+    }
+
+    /// The synthetic Qwen3.5 decoder written as a weights-free snapshot with no `mtp.*` tensors
+    /// and `mtp_num_hidden_layers = 0`.
+    fn synthetic_qwen35_snapshot_without_mtp() -> tempfile::TempDir {
+        let (cfg, weights, cfg_json) = crate::models::qwen35::tests::text_model_snapshot_parts();
+        let dir = tempfile::Builder::new()
+            .prefix("candle-qwen35-no-mtp-")
+            .tempdir()
+            .unwrap();
+        let mut config = serde_json::json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "model_type": "qwen3_5",
+        });
+        config["text_config"] = cfg_json["text_config"].clone();
+        assert_eq!(config["text_config"]["mtp_num_hidden_layers"], 0);
+        std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer.json"),
+            synthetic_tokenizer_json(cfg.vocab_size as usize),
+        )
+        .unwrap();
+        let tensors: std::collections::HashMap<String, candle_core::Tensor> = weights
+            .keys()
+            .map(|k| (k.to_string(), weights.get(k).unwrap().clone()))
+            .collect();
+        assert!(tensors.keys().all(|k| !k.starts_with("mtp.")));
+        candle_core::safetensors::save(&tensors, dir.path().join("model.safetensors")).unwrap();
+        dir
+    }
+
+    /// [`synthetic_qwen35_snapshot_without_mtp`] loaded as a provider with the backend's default
+    /// graph switch (keep the directory alive with it).
+    fn synthetic_qwen35_provider_without_mtp() -> (tempfile::TempDir, super::LlamaProvider) {
+        use core_llm::LoadSpec;
+
+        let dir = synthetic_qwen35_snapshot_without_mtp();
+        let provider =
+            super::LlamaProvider::load(&LoadSpec::dense(dir.path().display().to_string()))
+                .expect("load the synthetic Qwen3.5 snapshot");
+        (dir, provider)
+    }
+
+    /// sc-24139: the load's CUDA-graph policy is settled at load and recorded, every generation
+    /// runs under it (not under whatever the process switch says later), and the contract carries
+    /// the decode report and the load report a product renders — the same record the evidence
+    /// harness reads, never a guess.
+    #[test]
+    fn the_load_settles_the_graph_policy_and_the_contract_carries_the_reports() {
+        use core_llm::{LoadSpec, Message, ProposerKind, Sampling, TextLlm, TextLlmRequest};
+
+        let _process = crate::decode::graph::cuda_graphs_policy_guard(Some(false));
+        let dir = synthetic_qwen35_snapshot_without_mtp();
+        let source = dir.path().display().to_string();
+        let request = TextLlmRequest {
+            messages: vec![Message::user("t3 t7 t11 t2 t7 t11")],
+            sampling: Sampling::greedy(),
+            max_new_tokens: 4,
+            seed: Some(0),
+            ..Default::default()
+        };
+
+        // `Some(true)` wins over a process switch that is off, and the load records it.
+        let on = super::LlamaProvider::load(&LoadSpec {
+            cuda_graphs: Some(true),
+            ..LoadSpec::dense(source.clone())
+        })
+        .expect("load with graphs requested");
+        assert_eq!(on.load_record().cuda_graphs, Some(true));
+        // The load report carries the settled switch, not a guess from the request.
+        assert_eq!(on.load_report().unwrap().cuda_graphs, Some(true));
+        // Flipping the process switch after the load does not change the loaded model's policy.
+        crate::decode::set_cuda_graphs(Some(false));
+        let out = on.generate(&request, &mut |_| {}).expect("generate");
+        let report = out
+            .decode
+            .clone()
+            .expect("the provider reports its decode path");
+        assert!(report.cuda_graphs.enabled, "the load's Some(true) governs");
+        assert_eq!(report, on.last_decode_record().unwrap().report(true));
+        assert_eq!(report.proposer, ProposerKind::None);
+        // `Auto` on a snapshot without a head: the engine with no proposer, since sc-24140.
+        assert_eq!(report.path, "step_model");
+        assert_eq!(
+            report.target_forwards,
+            u64::from(out.usage.generated_tokens)
+        );
+
+        // `None` keeps the process switch at load (off here); the report says so.
+        let default = super::LlamaProvider::load(&LoadSpec::dense(source)).expect("load");
+        assert_eq!(default.load_record().cuda_graphs, Some(false));
+        crate::decode::set_cuda_graphs(Some(true));
+        let out = default.generate(&request, &mut |_| {}).expect("generate");
+        assert!(!out.decode.expect("reported").cuda_graphs.enabled);
+
+        // The load report names the requested format and the resident projection kinds.
+        let load = default
+            .load_report()
+            .expect("the provider reports its load");
+        assert_eq!(load.requested, None);
+        // `None` requested, the process switch (off) at load settled it: the report says `false`.
+        assert_eq!(load.cuda_graphs, Some(false));
+        assert_eq!(load.projections.len(), 1, "{:?}", load.projections);
+        assert_eq!(load.projections[0].kind, "dense");
+        assert!(load.projections[0].count > 0 && load.projections[0].resident_bytes > 0);
+    }
+
+    #[test]
+    fn auto_mtp_on_a_qwen35_snapshot_without_a_head_decodes_normally_and_says_proposer_none() {
+        // AC3 (sc-24130), weights-free: the synthetic Qwen3.5 decoder written as a snapshot with
+        // no `mtp.*` tensors and `mtp_num_hidden_layers = 0`. The provider advertises no MTP,
+        // an `Auto` request decodes normally and the record names the proposer that ran — `none`
+        // — rather than silently downgrading; `Enabled` is refused. "Normally" is the engine with
+        // no proposer on the static KV cache (sc-24140), not the reference loop: the record says
+        // `step_model` / `static`, one verify step per token after the first.
+        use core_llm::{Message, MtpMode, ProposerKind, Sampling, TextLlm, TextLlmRequest};
+
+        let (_dir, mut provider) = synthetic_qwen35_provider_without_mtp();
+        assert!(provider.descriptor().capabilities.mtp.is_none());
+
+        let request = |mtp| TextLlmRequest {
+            messages: vec![Message::user("t3 t7 t11 t2 t7 t11")],
+            sampling: Sampling::greedy(),
+            max_new_tokens: 6,
+            seed: Some(0),
+            mtp,
+            ..Default::default()
+        };
+        let out = provider
+            .generate(&request(MtpMode::Auto), &mut |_| {})
+            .expect("Auto decodes normally without a head");
+        assert_eq!(out.usage.generated_tokens, 6);
+        assert!(out.mtp.is_none());
+        let record = provider.last_decode_record().unwrap();
+        assert_eq!(record.proposer, ProposerKind::None);
+        assert_eq!(record.proposer.label(), "none");
+        assert_eq!(record.path, DecodePath::StepModel, "the engine ran");
+        assert_eq!(record.kv_cache, crate::primitives::KvCacheKind::Static);
+        assert_eq!(record.proposed_tokens, 0);
+        assert_eq!(
+            (
+                record.target_forwards,
+                record.prefill_forwards,
+                record.verify_steps
+            ),
+            (6, 1, 5),
+            "the prefill plus one single-token verify step per token after the first"
+        );
+        assert_eq!(record.replay_forwards, 0);
+        // The same tokens as an explicit Off request: Auto is not a different decode.
+        let off = provider
+            .generate(&request(MtpMode::Off), &mut |_| {})
+            .unwrap();
+        assert_eq!(off.text, out.text);
+        assert_eq!(
+            provider.last_decode_record().unwrap().path,
+            DecodePath::StepModel
+        );
+        assert!(matches!(
+            provider.generate(&request(MtpMode::Enabled { draft_tokens: 2 }), &mut |_| {}),
+            Err(core_llm::Error::Unsupported(_))
+        ));
+
+        // The reference loop stays selectable as the oracle; it names itself, and on CPU f32
+        // (where the two caches are bit-identical) it is the same decode.
+        provider
+            .set_decode_path(DecodePath::Reference)
+            .expect("the reference loop is selectable");
+        let reference = provider
+            .generate(&request(MtpMode::Auto), &mut |_| {})
+            .unwrap();
+        let record = provider.last_decode_record().unwrap();
+        assert_eq!(record.path, DecodePath::Reference);
+        assert_eq!(record.kv_cache, crate::primitives::KvCacheKind::Growing);
+        assert_eq!(record.proposer, ProposerKind::None);
+        if provider.model.device().is_cpu() {
+            assert_eq!(reference.text, out.text, "the same tokens on both loops");
+        }
+    }
+
+    /// sc-24134, sc-24139, sc-24140: with the CUDA-graph switch on — the one the provider was
+    /// loaded under (`LoadSpec::cuda_graphs`; the stream is settled at load) — a request whose
+    /// speculation is off runs through the runner (the engine with no proposer) and its record
+    /// says what the runner did with each step; a request decoded on the reference loop never runs
+    /// through the runner, and its record says why rather than a bare `graph: none`. With the
+    /// switch off neither record shows the runner.
+    #[test]
+    fn the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run() {
+        use core_llm::{LoadSpec, Message, MtpMode, Sampling, TextLlm, TextLlmRequest};
+
+        let dir = synthetic_qwen35_snapshot_without_mtp();
+        let request = TextLlmRequest {
+            messages: vec![Message::user("t3 t7 t11 t2")],
+            sampling: Sampling::greedy(),
+            max_new_tokens: 3,
+            seed: Some(0),
+            mtp: MtpMode::Off,
+            ..Default::default()
+        };
+        let load = |on: bool| {
+            super::LlamaProvider::load(&LoadSpec {
+                cuda_graphs: Some(on),
+                ..LoadSpec::dense(dir.path().display().to_string())
+            })
+            .expect("load the synthetic Qwen3.5 snapshot")
+        };
+        let run = |provider: &super::LlamaProvider| {
+            provider.generate(&request, &mut |_| {}).unwrap();
+            provider.last_decode_record().unwrap()
+        };
+
+        let (mut on, mut off) = (load(true), load(false));
+        let engine = run(&on);
+        assert_eq!(engine.path, DecodePath::StepModel);
+        assert_eq!(
+            engine.cuda_graphs.eager + engine.cuda_graphs.replayed,
+            engine.target_forwards,
+            "every step of the Off request went through the runner: {}",
+            engine.cuda_graphs.describe()
+        );
+        let reason = engine
+            .cuda_graphs
+            .fallback_reason
+            .expect("an eager step names why");
+        assert_ne!(reason, crate::decode::graph::REASON_REFERENCE_PATH);
+        assert_eq!(run(&off).cuda_graphs.label(), "none");
+
+        let describe = |provider: &mut super::LlamaProvider| {
+            provider.set_decode_path(DecodePath::Reference).unwrap();
+            let record = run(provider);
+            assert_eq!(record.path, DecodePath::Reference);
+            record.cuda_graphs.describe()
+        };
+        assert_eq!(
+            describe(&mut on),
+            "graph: none replayed=0 eager=0 captured=0 fallback=reference_path"
+        );
+        assert_eq!(
+            describe(&mut off),
+            "graph: none replayed=0 eager=0 captured=0"
+        );
+    }
+
+    /// sc-24140 (E7): a static KV cache's capacity refusal reaches the contract as the typed
+    /// `RequestResourceExhausted` — the request's geometry plus the preallocation the requested
+    /// positions would take against the one the cache holds — never an opaque backend error; an
+    /// unrelated engine error still maps as before, and without a request's geometry the refusal
+    /// is still the request's fault (`InvalidRequest`), not the backend's.
+    #[test]
+    fn a_kv_capacity_refusal_is_a_typed_resource_exhaustion() {
+        let (_dir, provider) = synthetic_qwen35_provider_without_mtp();
+        let (requested, capacity) = (70usize, 64usize);
+        let error = provider.request_error(
+            crate::Error::KvCapacityExceeded {
+                requested,
+                capacity,
+            },
+            9,
+            61,
+        );
+        let core_llm::Error::RequestResourceExhausted(evidence) = error else {
+            panic!("expected RequestResourceExhausted, got {error:?}");
+        };
+        assert_eq!(
+            evidence,
+            core_llm::RequestResourceExhausted {
+                prompt_tokens: 9,
+                max_new_tokens: 61,
+                max_context_tokens: provider.descriptor.capabilities.max_context_tokens,
+                required_bytes: provider.model.static_kv_bytes(requested) as u64,
+                available_bytes: provider.model.static_kv_bytes(capacity) as u64,
+            }
+        );
+        assert!(evidence.required_bytes > evidence.available_bytes);
+        assert!(matches!(
+            provider.request_error(crate::Error::Canceled, 9, 61),
+            core_llm::Error::Canceled
+        ));
+        assert!(matches!(
+            super::to_core(crate::Error::KvCapacityExceeded {
+                requested,
+                capacity
+            }),
+            core_llm::Error::InvalidRequest(_)
+        ));
+    }
+
+    /// sc-24140 (E0 / E2): a temperature + top-p request whose speculation is off — ChatWorks'
+    /// default — decodes on the engine with no proposer and draws every token through `sample`:
+    /// on CUDA the device sampler (zero logits rows copied to the host), on CPU the host reference
+    /// and the record says why; every draw is recorded either way.
+    #[test]
+    fn a_stochastic_off_request_draws_through_the_device_sampler_where_there_is_one() {
+        use core_llm::{Message, MtpMode, Sampling, TextLlm, TextLlmRequest};
+
+        let (_dir, provider) = synthetic_qwen35_provider_without_mtp();
+        let request = TextLlmRequest {
+            messages: vec![Message::user("t3 t7 t11 t2 t7 t11")],
+            sampling: Sampling {
+                temperature: 0.8,
+                top_p: 0.9,
+                ..Sampling::greedy()
+            },
+            max_new_tokens: 8,
+            seed: Some(5),
+            mtp: MtpMode::Off,
+            ..Default::default()
+        };
+        let out = provider.generate(&request, &mut |_| {}).unwrap();
+        let record = provider.last_decode_record().unwrap();
+        assert_eq!(record.path, DecodePath::StepModel);
+        // A stop token is drawn but not emitted.
+        let stopped = out.finish_reason == Some(core_llm::FinishReason::Stop);
+        let draws = u64::from(out.usage.generated_tokens) + u64::from(stopped);
+        assert!(draws > 0);
+        assert_eq!(
+            record.sampler.device_draws + record.sampler.host_draws,
+            draws,
+            "every draw is recorded: {:?}",
+            record.sampler
+        );
+        if provider.model.device().is_cuda() {
+            assert_eq!(record.sampler.label(), "device");
+            assert_eq!(record.sampler.device_draws, draws);
+            assert_eq!(
+                record.sampler.logits_to_host, 0,
+                "no logits row reached the host"
+            );
+        } else {
+            assert_eq!(record.sampler.label(), "host:device_unavailable");
+            assert_eq!(record.sampler.host_draws, draws);
+        }
     }
 }

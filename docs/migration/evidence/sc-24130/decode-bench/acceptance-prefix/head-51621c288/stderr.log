@@ -1,0 +1,7 @@
+[decode_bench] reference          15.73 tok/s  prefill 0.653s  fused {"switch":"on","fused":33852,"reference":0,"reference_reason":null,"path":"fused"}
+[decode_bench] mtp K=1            20.43 tok/s  accept 0.877  fwd/tok 0.605  syncs/verify 1.00
+[decode_bench] mtp K=2            24.24 tok/s  accept 0.846  fwd/tok 0.460  syncs/verify 1.00
+[decode_bench] mtp K=3            22.43 tok/s  accept 0.709  fwd/tok 0.468  syncs/verify 1.00
+[decode_bench] mtp K=4            22.41 tok/s  accept 0.682  fwd/tok 0.427  syncs/verify 1.00
+[decode_bench] mtp K=5            21.50 tok/s  accept 0.597  fwd/tok 0.435  syncs/verify 1.00
+[decode_bench] wrote C:\Users\Michael\AppData\Local\Temp\claude\D--repos-ChatWorks--claude-worktrees-shortcut-epic-24128-4c11bb\e80b586c-dde2-4d4d-84b1-e3247a13f59c\scratchpad\sc24130\acceptance-prefix\head-51621c288\decode_bench.json

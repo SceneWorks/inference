@@ -1,0 +1,145 @@
+{
+  "baselines": [
+    {
+      "run": "baseline-d2b8cb335-qwen3-8b-16tok",
+      "run_directory": "baselines/baseline-d2b8cb335-qwen3-8b-16tok",
+      "run_seal_sha256": "de2f48cdb0aaa215a164439c5c4e6778753db68f43cf762b518b8aa1be7a9e8e"
+    }
+  ],
+  "cells": [
+    {
+      "cuda_graphs": "off",
+      "family": "llama",
+      "model": "qwen3-8b",
+      "run": "head-qwen3-8b-bf16-graphs-off",
+      "run_directory": "runs/qwen3-8b-bf16-graphs-off",
+      "run_seal_sha256": "aa11e39a519bdaa8f5c369d53ca2466cbeaf7b3826d57126bcb389c860d2de04",
+      "speculative": {
+        "mtp": "n/a (no MTP head)",
+        "ngram": "ok (K=3)",
+        "off": "ok",
+        "sampled": "ok"
+      },
+      "weight_format": "bf16"
+    },
+    {
+      "cuda_graphs": "on",
+      "family": "llama",
+      "model": "qwen3-8b",
+      "run": "head-qwen3-8b-bf16-graphs-on",
+      "run_directory": "runs/qwen3-8b-bf16-graphs-on",
+      "run_seal_sha256": "8879d861ef85a7c08e010e0e0ea7df7b66b76d610db09a1b5a3cd6d4059e9466",
+      "speculative": {
+        "mtp": "n/a (no MTP head)",
+        "ngram": "ok (K=3)",
+        "off": "ok",
+        "sampled": "ok"
+      },
+      "weight_format": "bf16"
+    },
+    {
+      "cuda_graphs": "off",
+      "family": "llama",
+      "model": "qwen3-8b",
+      "run": "head-qwen3-8b-q8-graphs-off",
+      "run_directory": "runs/qwen3-8b-q8-graphs-off",
+      "run_seal_sha256": "5081e4b40755cd7c0ff552c667a836ac02777405fb2a90ac5cba4cc6da2345e6",
+      "speculative": {
+        "mtp": "n/a (no MTP head)",
+        "ngram": "ok (K=3)",
+        "off": "ok",
+        "sampled": "ok"
+      },
+      "weight_format": "q8"
+    },
+    {
+      "cuda_graphs": "on",
+      "family": "llama",
+      "model": "qwen3-8b",
+      "run": "head-qwen3-8b-q8-graphs-on",
+      "run_directory": "runs/qwen3-8b-q8-graphs-on",
+      "run_seal_sha256": "c8d03c72befea3d74ba0d797c667dcc9230a0597ddc332e07b40b0541dec43b2",
+      "speculative": {
+        "mtp": "n/a (no MTP head)",
+        "ngram": "ok (K=3)",
+        "off": "ok",
+        "sampled": "ok"
+      },
+      "weight_format": "q8"
+    },
+    {
+      "cuda_graphs": "off",
+      "family": "llama",
+      "model": "qwen3-8b",
+      "run": "head-qwen3-8b-nvfp4-graphs-off",
+      "run_directory": "runs/qwen3-8b-nvfp4-graphs-off",
+      "run_seal_sha256": "962a11de0b902073513361192738e9d681982f9159a0496e320516f1b2372713",
+      "speculative": {
+        "mtp": "n/a (no MTP head)",
+        "ngram": "ok (K=3)",
+        "off": "ok",
+        "sampled": "ok"
+      },
+      "weight_format": "nvfp4"
+    },
+    {
+      "cuda_graphs": "on",
+      "family": "llama",
+      "model": "qwen3-8b",
+      "run": "head-qwen3-8b-nvfp4-graphs-on",
+      "run_directory": "runs/qwen3-8b-nvfp4-graphs-on",
+      "run_seal_sha256": "fe315d8b0967d20572c5bec3f551d1b1bbbc4cf129635695b33ebb0dd7e35835",
+      "speculative": {
+        "mtp": "n/a (no MTP head)",
+        "ngram": "ok (K=3)",
+        "off": "ok",
+        "sampled": "ok"
+      },
+      "weight_format": "nvfp4"
+    }
+  ],
+  "label": "RTX Pro 6000 / sm_120",
+  "matrix": {
+    "cuda_graphs": [
+      "off",
+      "on"
+    ],
+    "models": [
+      "qwen3-8b"
+    ],
+    "mtp_drafts": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "sampled": true,
+    "speculative": [
+      "off",
+      "mtp",
+      "ngram"
+    ],
+    "weight_formats": [
+      "bf16",
+      "q8",
+      "nvfp4"
+    ]
+  },
+  "missing": [],
+  "mode": "run",
+  "runtime_sha": "e155acb090be06d49e7fca6a53fdd176abaae875",
+  "schema_version": 1,
+  "suite": "decode_bench_campaign",
+  "tables": {
+    "qwen3-8b": [
+      "baseline-d2b8cb335-qwen3-8b-16tok",
+      "head-qwen3-8b-bf16-graphs-off",
+      "head-qwen3-8b-bf16-graphs-on",
+      "head-qwen3-8b-q8-graphs-off",
+      "head-qwen3-8b-q8-graphs-on",
+      "head-qwen3-8b-nvfp4-graphs-off",
+      "head-qwen3-8b-nvfp4-graphs-on"
+    ]
+  }
+}

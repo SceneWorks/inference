@@ -322,7 +322,7 @@ jobs:
       - name: Clippy Candle packages
         run: >-
           cargo clippy --locked
-          -p candle-llm -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu
+          -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu
           --features candle-audio/testkit
           --all-targets -- -D warnings
       - name: Reclaim Clippy artifacts before linking tests
@@ -344,7 +344,7 @@ jobs:
           cargo doc --locked --no-deps
           -p core-llm -p core-llm-testkit
           -p sceneworks-gen-core -p sceneworks-gen-core-testkit
-          -p candle-llm -p 'candle-gen*' -p 'candle-audio*'
+          -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*'
           -p runtime-cpu -p runtime-catalog
       # The three guards ride the lint job rather than a test job: `check-lock-poison.sh` shells out
       # to no build tool at all and `check-gen-core-skew.sh` only runs `cargo tree`, so neither
@@ -387,7 +387,7 @@ jobs:
         # `--tests` runner anywhere.
         run: >-
           cargo test --locked --lib -j 1
-          -p candle-llm -p 'candle-audio*' -p runtime-cpu
+          -p candle-llm -p candle-quant-kernels -p 'candle-audio*' -p runtime-cpu
       # sc-19447. Until this step existed, `candle-gen*`'s 176 integration targets executed in NO
       # lane that runs automatically: this job was `--lib` only, `candle-cpu-lint` compiles them
       # under all-target Clippy without running them, `windows-cuda-check` compiles them
@@ -766,7 +766,7 @@ jobs:
       - name: Clippy Candle Metal packages
         run: >-
           cargo clippy --locked
-          -p candle-llm -p 'candle-gen*' -p 'candle-audio*'
+          -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*'
           --all-targets --features metal -- -D warnings
 
   macos-nax:
@@ -924,7 +924,7 @@ jobs:
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked --lib --tests -p candle-llm -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-run
+          cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-run
       - name: Execute weights-free CUDA catalog conformance (no GPU required)
         shell: cmd
         run: |
@@ -943,7 +943,7 @@ jobs:
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo clippy --locked --all-targets -p candle-llm -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda -- -D warnings
+          cargo clippy --locked --all-targets -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda -- -D warnings
       # The doc twin of the compile check above. The hosted rustdoc gate cannot pass --features cuda
       # (no CUDA toolkit), so `#[cfg(feature = "cuda")]` docs need this lane. Keep this doc package
       # set aligned with the compile check above; together with the hosted gate, the CPU and CUDA
@@ -957,7 +957,7 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
         run: |
           call "%VCVARS%"
-          cargo doc --locked --no-deps -p candle-llm -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda
+          cargo doc --locked --no-deps -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda
 
   windows-cuda:
     name: Candle CUDA packages (Windows, manual)
@@ -999,12 +999,12 @@ jobs:
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo build --locked -p candle-llm -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda
+          cargo build --locked -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda
       - name: Test Candle CUDA packages
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked --lib --tests -p candle-llm -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-fail-fast
+          cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-fail-fast
       - name: Test LLM-only CUDA bundle
         shell: cmd
         run: |

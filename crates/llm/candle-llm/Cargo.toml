@@ -26,10 +26,15 @@ candle-flash-attn = { workspace = true, optional = true }
 # The backend-neutral contract this crate implements. The root workspace path keeps Candle and MLX
 # providers on one contract package and type identity.
 core-llm = { workspace = true }
+# The shared low-precision kernels (sc-24135): the one NVFP4 codec + cuBLASLt FP4 GEMM the media
+# lane also serves, behind `Projection::Nvfp4`. Device code is gated by this crate's `cuda` feature.
+candle-quant-kernels = { workspace = true }
 # Error plumbing for the engine surface.
 thiserror = { workspace = true }
 # config.json parsing (HF model configs) — Value-based, no derive, matching the mlx-llm convention.
 serde_json = { workspace = true }
+# One-time warning when the CUDA device sampler kernel fails to compile/load (sc-24133).
+tracing = "0.1"
 
 [dev-dependencies]
 # Run the registered LlamaProvider through the backend-neutral contract checks.
@@ -38,14 +43,16 @@ core-llm-testkit = { workspace = true }
 tempfile = { workspace = true }
 # CUDA operator tests encode fixture scales as IEEE f16 bytes.
 half = "2"
+# Slice identity for the NVFP4 real-weight evidence run (sc-24135); already in the graph.
+sha2 = { workspace = true }
 
 [features]
 # Default works with NO extra features: candle-core defaults to the CPU backend (builds anywhere).
 default = []
 # NVIDIA CUDA backend (the Windows target). MUST NOT be in `default` — it needs the CUDA toolkit.
-cuda = ["candle-core/cuda", "candle-nn/cuda"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-quant-kernels/cuda"]
 # Apple Metal GPU backend.
-metal = ["candle-core/metal", "candle-nn/metal"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-quant-kernels/metal"]
 # FlashAttention-2 (Windows/CUDA). Implies `cuda` and pulls in `candle-flash-attn`'s fused kernels,
 # which the attention seam (`primitives::attention::sdpa`) dispatches to for the dense causal path,
 # falling back to the eager softmax SDPA for the cases the kernel can't serve (soft-cap, mismatched

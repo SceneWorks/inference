@@ -8,10 +8,11 @@
 //! * JoyCaption parity: `top_k = 0`, `repetition_penalty = 1.05` → penalty + temperature + top-p.
 //! * sensenova parity: `repetition_penalty = 1.0`, `top_k > 0` → temperature + top-k + top-p.
 //!
-//! The math matches the references exactly: a stabilised, **unnormalised** `exp((logit - max)/T)`
-//! weight per token (equivalent to softmax for nucleus selection and for the inverse-CDF draw,
-//! since both scale by the total), heap-based nucleus selection (verified against a full sort), and
-//! a categorical inverse-CDF draw from the pluggable [`TokenRng`]. Greedy (`temperature <= 0`) with
+//! The math matches the references (except the nucleus mass, accumulated in f64 — see
+//! `nucleus_select`): a stabilised, **unnormalised** `exp((logit - max)/T)` weight per token
+//! (equivalent to softmax for nucleus selection and for the inverse-CDF draw, since both scale by
+//! the total), heap-based nucleus selection (verified against a full sort), and a categorical
+//! inverse-CDF draw from the pluggable [`TokenRng`]. Greedy (`temperature <= 0`) with
 //! no penalty and no constraint takes the on-device argmax fast path (a single-element host
 //! transfer) like sensenova's `decode_argmax`; otherwise logits are pulled to host f32.
 
@@ -263,15 +264,19 @@ fn weight_desc_index_asc(a: (usize, f32), b: (usize, f32)) -> Ordering {
 /// Heap-ordered nucleus: pop highest-weight tokens until the cumulative weight reaches
 /// `top_p * total`, always keeping at least one. Equivalent to a descending sort + prefix for
 /// distinct weights (the references verify this against a full sort); ties break to lower index.
+/// The mass is accumulated in f64 (sc-24133, matching `candle-llm`'s `nucleus_select`): an f32
+/// running sum over a wide vocabulary drifts by more than a tail token's weight and moved the
+/// nucleus boundary by rounding alone, so knife-edge boundaries may differ from the f32 mlx-gen
+/// references by one token.
 fn nucleus_select(weights: &[(usize, f32)], top_p: f32) -> Vec<(usize, f32)> {
-    let total: f32 = weights.iter().map(|x| x.1).sum();
-    let threshold = top_p.max(0.0) * total;
+    let total: f64 = weights.iter().map(|x| f64::from(x.1)).sum();
+    let threshold = f64::from(top_p.max(0.0)) * total;
     let mut heap: BinaryHeap<ByWeight> = weights.iter().map(|&(i, w)| ByWeight(i, w)).collect();
     let mut kept = Vec::new();
-    let mut cum = 0.0f32;
+    let mut cum = 0.0f64;
     while let Some(ByWeight(i, w)) = heap.pop() {
         kept.push((i, w));
-        cum += w;
+        cum += f64::from(w);
         if cum >= threshold {
             break;
         }
