@@ -55,6 +55,12 @@ fn dense_tensor(
     target_device: Option<&Device>,
 ) -> Result<Tensor> {
     let source = w.require(key)?;
+    if source.dtype() == DType::U8 && source.rank() == 3 {
+        return Err(Error::Config(format!(
+            "stored GGML block tensor `{key}` cannot be interpreted as a dense weight; only a \
+             separate layer projection may be stored quantized"
+        )));
+    }
     if source.dtype() == DType::U32 {
         return Err(Error::Config(format!(
             "packed U32 tensor `{key}` cannot be interpreted as a dense weight; its affine .scales/.biases sidecars are missing or this packed layout is unsupported"
@@ -166,6 +172,43 @@ fn projection_from_weights(
     } else {
         None
     };
+
+    if let Some((stored, _, _)) =
+        crate::primitives::quant::ggml_block_storage(source.dtype() == DType::U8, source.dims())
+    {
+        // A prepared Q4 / Q8 snapshot's stored GGML blocks (sc-19375), used exactly as stored.
+        // They already are the lossy code, so any other requested format would re-quantize a
+        // quantized weight — refused rather than silently served at the stored precision.
+        let bits = if stored == candle_core::quantized::GgmlDType::Q8_0 {
+            8
+        } else {
+            4
+        };
+        match format {
+            Some(ProjectionFormat::Ggml(quant)) if quant.bits() == bits => {}
+            Some(ProjectionFormat::Ggml(quant)) => {
+                return Err(Error::Unsupported(format!(
+                    "projection `{stem}` is stored {stored:?} (a prepared Q{bits} snapshot); it \
+                     cannot be re-quantized to Q{}",
+                    quant.bits()
+                )))
+            }
+            Some(ProjectionFormat::Nvfp4(_)) => {
+                return Err(Error::Unsupported(format!(
+                    "nvfp4: projection `{stem}` is stored {stored:?} (a prepared Q{bits} \
+                     snapshot); NVFP4 projections are quantized from a dense snapshot"
+                )))
+            }
+            None => {
+                return Err(Error::Config(format!(
+                    "projection `{stem}` is stored {stored:?} but the model config has no \
+                     quantization block"
+                )))
+            }
+        }
+        let qt = crate::primitives::quant::from_ggml_block_tensor(source, target)?;
+        return Projection::load_qtensor(qt, bias);
+    }
 
     if w.contains(&scales_key) {
         let quant = match format {
