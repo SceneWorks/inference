@@ -405,6 +405,7 @@ dependencies = [
  "candle-llm",
  "candle-nn",
  "sceneworks-gen-core-testkit",
+ "serde_json",
  "tempfile",
 ]
 

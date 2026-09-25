@@ -3,7 +3,7 @@
 //!
 //! These are pipeline facts (epic sc-19373), not stage internals: the tokenizer (sc-19376) emits
 //! them, stage 1 (sc-19380) samples inside them, stage 2 (sc-19381) slices its logits by them, and
-//! the engine de-interleaves stage 1's output with [`split_stage1_tokens`].
+//! the engine de-interleaves stage 1's output with [`split_raw_output`].
 
 /// Start-of-audio marker (`<SOA>`).
 pub const SOA: u32 = 32_001;
@@ -48,7 +48,10 @@ pub fn cb0_code(token: u32) -> Option<u32> {
 /// Codebook-0 codes for the two tracks stage 1 interleaves.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TrackCodes {
-    /// Vocal-track codebook-0 codes (`0..CODEBOOK_SIZE`), one per 20 ms frame.
+    /// Vocal-track codes, one per 20 ms frame: the stage-1 token minus [`CODEC_OFFSET`] (the
+    /// reference `ids2npy`). A token the stage-1 allow-list admits beyond codebook 0 yields a code
+    /// `>= CODEBOOK_SIZE`, as in the reference; the engine refuses such a code before stage 2, where
+    /// the reference's `offset_tok_ids` asserts on it.
     pub vocals: Vec<u32>,
     /// Instrumental-track codebook-0 codes, frame-aligned with [`vocals`](Self::vocals).
     pub instrumental: Vec<u32>,
@@ -92,26 +95,67 @@ impl CodecFrames {
     }
 }
 
-/// De-interleave stage 1's per-segment token streams into the two codebook-0 tracks.
+/// The `[start_of_segment]` marker as the mm tokenizer encodes it — the pattern stage 1's smart
+/// context searches for when it drops the oldest segment block.
+pub const START_OF_SEGMENT: [u32; 7] = [518, 2962, 29918, 974, 29918, 28192, 29962];
+/// The `[end_of_segment]` marker as the mm tokenizer encodes it (it opens every later segment's
+/// prompt block).
+pub const END_OF_SEGMENT: [u32; 7] = [518, 355, 29918, 974, 29918, 28192, 29962];
+
+/// Split a render's stage-1 sequence (every prompt block, generated token and `<EOA>`, in order)
+/// into the two codebook-0 tracks, with the reference `Stage1Pipeline.save` semantics:
 ///
-/// Stage 1 emits `vocal, instrumental, vocal, instrumental, …` codebook-0 ids per frame. Each
-/// segment is trimmed to a whole number of frames (an odd trailing token is a half frame) before
-/// concatenation, as the reference does. A token outside codebook 0 is a stage-1 allow-list defect
-/// and is refused rather than wrapped into range.
-pub fn split_stage1_tokens(segments: &[Vec<u32>]) -> Result<TrackCodes, String> {
+/// * `<SOA>` and `<EOA>` must occur equally often; the `i`-th `<SOA>` pairs with the `i`-th `<EOA>`;
+/// * the first `skip_pairs` pairs are prompt audio (an ICL reference block), not generated audio;
+/// * each remaining pair's body drops a leading `<xcodec>` separator, is truncated to an even
+///   length, and is de-interleaved `vocal, instrumental, vocal, …`;
+/// * a track's code is `token - CODEC_OFFSET`. A track whose first token is not a codebook-0 id, or
+///   that holds a token below [`CODEC_OFFSET`], is refused (the reference asserts on both).
+///
+/// One deliberate difference: a pair whose body is empty after the separator drop and the even
+/// truncation contributes no frames, where the reference raises an `IndexError`.
+pub fn split_raw_output(raw: &[u32], skip_pairs: usize) -> Result<TrackCodes, String> {
+    let soa: Vec<usize> = (0..raw.len()).filter(|&i| raw[i] == SOA).collect();
+    let eoa: Vec<usize> = (0..raw.len()).filter(|&i| raw[i] == EOA).collect();
+    if soa.len() != eoa.len() {
+        return Err(format!(
+            "invalid pairs of soa and eoa, Num of soa: {}, Num of eoa: {}",
+            soa.len(),
+            eoa.len()
+        ));
+    }
     let mut out = TrackCodes::default();
-    for (index, tokens) in segments.iter().enumerate() {
-        let whole = tokens.len() - tokens.len() % 2;
-        for pair in tokens[..whole].chunks_exact(2) {
-            let code = |t: u32| {
-                cb0_code(t).ok_or_else(|| {
-                    format!(
-                        "stage-1 segment {index} emitted token {t}, which is not a codebook-0 id"
-                    )
-                })
-            };
-            out.vocals.push(code(pair[0])?);
-            out.instrumental.push(code(pair[1])?);
+    for (pair, (&s, &e)) in soa.iter().zip(&eoa).enumerate().skip(skip_pairs) {
+        if e <= s {
+            return Err(format!(
+                "audio pair {pair}: <EOA> at {e} does not follow its <SOA> at {s}"
+            ));
+        }
+        let mut body = &raw[s + 1..e];
+        if body.first() == Some(&XCODEC_SEP) {
+            body = &body[1..];
+        }
+        let body = &body[..body.len() - body.len() % 2];
+        if body.is_empty() {
+            continue;
+        }
+        for (track, dest) in [(0, &mut out.vocals), (1, &mut out.instrumental)] {
+            let first = body[track];
+            if cb0_code(first).is_none() {
+                return Err(format!(
+                    "audio pair {pair}: the {} track starts with token {first}, which is not a \
+                     codebook-0 id",
+                    if track == 0 { "vocal" } else { "instrumental" }
+                ));
+            }
+            for &t in body[track..].iter().step_by(2) {
+                if t < CODEC_OFFSET {
+                    return Err(format!(
+                        "audio pair {pair}: token {t} is below the codec range"
+                    ));
+                }
+                dest.push(t - CODEC_OFFSET);
+            }
         }
     }
     Ok(out)
@@ -130,18 +174,43 @@ mod tests {
     }
 
     #[test]
-    fn split_deinterleaves_and_trims_half_frames() {
-        let seg0 = vec![codec_token(0, 1), codec_token(0, 2), codec_token(0, 3)];
-        let seg1 = vec![codec_token(0, 4), codec_token(0, 5)];
-        let codes = split_stage1_tokens(&[seg0, seg1]).unwrap();
+    fn split_pairs_soa_eoa_drops_the_separator_and_trims_half_frames() {
+        let c = |code| codec_token(0, code);
+        let raw = [
+            7,
+            SOA,
+            XCODEC_SEP,
+            c(1),
+            c(2),
+            c(3),
+            EOA,
+            9,
+            SOA,
+            XCODEC_SEP,
+            c(4),
+            c(5),
+            EOA,
+        ];
+        let codes = split_raw_output(&raw, 0).unwrap();
         assert_eq!(codes.vocals, [1, 4]);
         assert_eq!(codes.instrumental, [2, 5]);
+        // A skipped leading pair is prompt audio (an ICL reference block).
+        let codes = split_raw_output(&raw, 1).unwrap();
+        assert_eq!(codes.vocals, [4]);
+        assert_eq!(codes.instrumental, [5]);
     }
 
     #[test]
-    fn split_refuses_tokens_outside_codebook_zero() {
-        let err = split_stage1_tokens(&[vec![codec_token(0, 1), codec_token(1, 1)]]).unwrap_err();
+    fn split_refuses_unpaired_markers_and_non_codebook0_track_starts() {
+        let c = |code| codec_token(0, code);
+        let err = split_raw_output(&[SOA, c(1), c(2)], 0).unwrap_err();
+        assert!(err.contains("invalid pairs"), "{err}");
+        let err = split_raw_output(&[SOA, codec_token(1, 1), c(1), EOA], 0).unwrap_err();
         assert!(err.contains("not a codebook-0 id"), "{err}");
-        assert!(split_stage1_tokens(&[vec![EOA, codec_token(0, 1)]]).is_err());
+        // A mid-track token beyond codebook 0 keeps the reference's raw offset.
+        let raw = [SOA, c(1), c(2), codec_token(3, 5), c(3), EOA];
+        let codes = split_raw_output(&raw, 0).unwrap();
+        assert_eq!(codes.vocals, [1, 3 * CODEBOOK_SIZE + 5]);
+        assert_eq!(codes.instrumental, [2, 3]);
     }
 }

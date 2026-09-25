@@ -415,6 +415,53 @@ mod tests {
         assert_eq!(empty.embedding.dims(), [1, E, 0]);
     }
 
+    /// max |got − want| / max |want|.
+    fn max_rel(got: &[f32], want: &[f32]) -> f64 {
+        assert_eq!(got.len(), want.len(), "length mismatch");
+        let peak = want.iter().fold(0f64, |m, &v| m.max(v.abs() as f64));
+        let diff = got
+            .iter()
+            .zip(want)
+            .fold(0f64, |m, (&a, &b)| m.max((a as f64 - b as f64).abs()));
+        diff / peak
+    }
+
+    /// Always-run numeric parity against the **upstream** decode modules at toy widths
+    /// (`scripts/reference/yue_xcodec_reference.py tiny`): the fixture is one safetensors file
+    /// holding a `SoundStream`-layout state dict (random codebooks, `fc_post2`, a DAC
+    /// `Decoder(3, 16, [8, 5, 4, 2])` with randomized weight-norm `g` and Snake `α`) plus a code
+    /// grid and torch-CPU `get_embed` / `decode` outputs. It loads through the production
+    /// [`XcodecDecoder::load`], so a wrong dilation, activation, padding or weight-norm fold is
+    /// caught without real weights. Measured max relative error: embed 0, wave 5.4e-7.
+    #[test]
+    fn tiny_upstream_decoder_matches_the_torch_reference() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("xcodec_tiny_reference.safetensors");
+        let fx = candle_audio::candle_core::safetensors::load(&path, &Device::Cpu).unwrap();
+        let flat = |k: &str| -> Vec<f32> { fx[k].flatten_all().unwrap().to_vec1().unwrap() };
+        let frames = CodecFrames {
+            codebooks: fx["ref.codes"]
+                .to_vec2::<i64>()
+                .unwrap()
+                .into_iter()
+                .map(|r| r.into_iter().map(|c| c as u32).collect())
+                .collect(),
+        };
+        let dec = XcodecDecoder::load(&path, &Device::Cpu).unwrap();
+        let embed = dec.get_embed(&frames).unwrap();
+        let embed_rel = max_rel(
+            &embed.flatten_all().unwrap().to_vec1().unwrap(),
+            &flat("ref.embed"),
+        );
+        assert!(embed_rel <= 1e-6, "get_embed diverges: {embed_rel:.3e}");
+        let wave = dec.decode(&frames, &CancelFlag::new()).unwrap().wave;
+        let wave_rel = max_rel(&wave, &flat("ref.wave"));
+        println!("tiny parity: embed {embed_rel:.3e}, wave {wave_rel:.3e}");
+        assert!(wave_rel <= 1e-5, "decode diverges: {wave_rel:.3e}");
+    }
+
     #[test]
     fn a_missing_checkpoint_is_an_error_not_a_refusal() {
         let dir = tempfile::tempdir().unwrap();
