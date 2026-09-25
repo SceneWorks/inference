@@ -113,7 +113,7 @@ impl Variant {
     }
 }
 
-/// The LM weight tier for stage 1 and stage 2 (epic R2). xcodec and Vocos stay fp16 at every tier
+/// The LM weight tier for stage 1 and stage 2 (epic R2). xcodec and Vocos stay float32 at every tier
 /// — the approved whole-pipeline carve-out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Tier {

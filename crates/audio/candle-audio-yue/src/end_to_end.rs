@@ -455,6 +455,20 @@ fn production_wiring_refuses_instead_of_rendering_placeholder_audio() {
         matches!((s.codec)(&assets), Err(e) if !matches!(e, Error::Unsupported(_))),
         "codec"
     );
-    assert!(refused((s.vocoder)(&assets)), "vocoder");
-    assert!(refused((s.splice)(&[0.0], &[0.0])), "splice");
+    // The Vocos upsamplers and the splice (sc-19378) are real: the vocoders fail to load with
+    // nothing staged (never `Unsupported`) — `vocoder::tests` loads staged decoders — and the
+    // splice post-processes (`splice::tests` and `tests/splice_parity.rs`).
+    assert!(
+        matches!((s.vocoder)(&assets), Err(e) if !matches!(e, Error::Unsupported(_))),
+        "vocoder"
+    );
+    let pair = crate::splice::TrackPair {
+        vocals: vec![0.1; 320],
+        instrumental: vec![0.2; 320],
+    };
+    let wide = crate::splice::TrackPair {
+        vocals: vec![0.1; 882],
+        instrumental: vec![0.2; 882],
+    };
+    assert_eq!((s.splice)(&pair, &wide).unwrap().mix.len(), 882, "splice");
 }

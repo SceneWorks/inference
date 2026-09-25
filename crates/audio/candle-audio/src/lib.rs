@@ -54,6 +54,7 @@ pub mod harness;
 pub mod mel;
 pub mod neural_codec;
 pub mod ops;
+pub mod vocos;
 pub mod wav;
 
 // Test-support helpers shared across the candle audio provider crates. Feature-gated so it never
