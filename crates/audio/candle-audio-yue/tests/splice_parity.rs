@@ -19,9 +19,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use candle_audio_yue::candle_audio::candle_core::{DType, Device, Tensor};
-use candle_audio_yue::splice::{
-    post_process, replace_low_freq_with_energy_matched, Limiter, TrackPair,
-};
+use candle_audio_yue::gen_core::OutputLimiter;
+use candle_audio_yue::splice::{post_process, replace_low_freq_with_energy_matched, TrackPair};
 
 /// Measured max relative difference vs the torch/torchaudio CPU reference: 2.6e-7 (clamp mix),
 /// 2.5e-7 (rescale mix), 0 on the limited stems — f32 rounding in the resampler's and the IIR's
@@ -91,7 +90,10 @@ fn post_process_matches_the_reference_in_both_limiter_modes() {
         .collect();
     assert!(peak(&raw_mix) > 0.99, "the vocoder mix exceeds the limit");
 
-    for (limiter, mode) in [(Limiter::Clamp, "clamp"), (Limiter::Rescale, "rescale")] {
+    for (limiter, mode) in [
+        (OutputLimiter::Clamp, "clamp"),
+        (OutputLimiter::Rescale, "rescale"),
+    ] {
         let out = post_process(&codec, &vocoder, limiter);
         // AC 3: mix and both stems at 44.1 kHz (882 samples per 50 Hz codec frame).
         assert_eq!(out.mix.len(), 25 * 882);
@@ -119,20 +121,20 @@ fn mutated_goldens_and_wrong_ports_fail_the_same_check() {
     let fx = fixture();
     let (codec, vocoder) = pairs(&fx);
     let want = flat(&fx, "clamp_mix");
-    let out = post_process(&codec, &vocoder, Limiter::Clamp);
+    let out = post_process(&codec, &vocoder, OutputLimiter::Clamp);
     assert!(max_rel(&out.mix, &want) <= MAX_REL);
 
     let mut gained = want.clone();
     gained.iter_mut().for_each(|v| *v *= 1.001);
     let mut shifted = want.clone();
     shifted.rotate_right(1);
-    let wrong_limiter = post_process(&codec, &vocoder, Limiter::Rescale).mix;
+    let wrong_limiter = post_process(&codec, &vocoder, OutputLimiter::Rescale).mix;
     // The crossover moved 5 % (and the energy match then scales a different band).
-    let recons: Vec<f32> = candle_audio_yue::splice::limit(&codec.vocals, Limiter::Clamp)
+    let recons: Vec<f32> = candle_audio_yue::splice::limit(&codec.vocals, OutputLimiter::Clamp)
         .iter()
         .zip(candle_audio_yue::splice::limit(
             &codec.instrumental,
-            Limiter::Clamp,
+            OutputLimiter::Clamp,
         ))
         .map(|(a, b)| a + b)
         .collect();
@@ -143,7 +145,7 @@ fn mutated_goldens_and_wrong_ports_fail_the_same_check() {
             .zip(&vocoder.vocals)
             .map(|(a, b)| a + b)
             .collect::<Vec<_>>(),
-        Limiter::Clamp,
+        OutputLimiter::Clamp,
     );
     let right_cutoff =
         replace_low_freq_with_energy_matched(&recons, 16_000, &mix44, 44_100, 5_500.0);

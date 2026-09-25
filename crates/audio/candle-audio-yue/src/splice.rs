@@ -15,8 +15,9 @@
 //!   Vocos stems ─ limit ─ vocals, instrumental
 //! ```
 //!
-//! * `limit` is upstream `save_audio`: [`Limiter::Clamp`] (`clamp(±0.99)`, the default) or
-//!   [`Limiter::Rescale`] (`× min(0.99 / peak, 1)`, upstream's `--rescale`). The 16 kHz stems are
+//! * `limit` is upstream `save_audio`: [`OutputLimiter::Clamp`] (`clamp(±0.99)`, the default) or
+//!   [`OutputLimiter::Rescale`] (`× min(0.99 / peak, 1)`, upstream's `--rescale`) — the request's
+//!   `audio.output_limiter`. The 16 kHz stems are
 //!   always clamped — upstream never passes `rescale` to that `save_audio` call.
 //! * The resampler is torchaudio's `Resample(16000, 44100)` (windowed sinc, Hann window, width 6,
 //!   rolloff 0.99; [`resample_sinc_hann`]); the filters are torchaudio's `lowpass_biquad` /
@@ -29,7 +30,7 @@
 //!
 //! [`splice_stub`] is the end-to-end seam test's double.
 
-use candle_audio::gen_core;
+use candle_audio::gen_core::{self, OutputLimiter};
 
 use crate::codec::SAMPLE_RATE as CODEC_RATE;
 use crate::vocoder::SAMPLE_RATE as VOCODER_RATE;
@@ -63,23 +64,19 @@ pub struct SplicedMix {
     pub instrumental: Vec<f32>,
 }
 
-/// The post-process seam: `(stems at the codec rate, stems at the vocoder rate) → spliced mix +
-/// limited stems at the vocoder rate`. The rates are [`crate::codec::SAMPLE_RATE`] and
-/// [`crate::vocoder::SAMPLE_RATE`].
-pub type SpliceFn = fn(&TrackPair, &TrackPair) -> gen_core::Result<SplicedMix>;
+/// The post-process seam: `(stems at the codec rate, stems at the vocoder rate, limiter) → spliced
+/// mix + limited stems at the vocoder rate`. The rates are [`crate::codec::SAMPLE_RATE`] and
+/// [`crate::vocoder::SAMPLE_RATE`]; the limiter is the request's
+/// [`gen_core::AudioParams::output_limiter`] ([`crate::config::YueRequest::limiter`]).
+pub type SpliceFn = fn(&TrackPair, &TrackPair, OutputLimiter) -> gen_core::Result<SplicedMix>;
 
-/// Upstream `save_audio`'s limiter.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Limiter {
-    /// `clamp(±0.99)` — upstream's default.
-    Clamp,
-    /// `× min(0.99 / peak, 1)` — upstream's `--rescale`.
-    Rescale,
-}
-
-/// Production post-process: [`post_process`] with upstream's default [`Limiter::Clamp`].
-pub fn splice(codec_rate: &TrackPair, vocoder_rate: &TrackPair) -> gen_core::Result<SplicedMix> {
-    Ok(post_process(codec_rate, vocoder_rate, Limiter::Clamp))
+/// Production post-process: [`post_process`] with the request's limiter.
+pub fn splice(
+    codec_rate: &TrackPair,
+    vocoder_rate: &TrackPair,
+    limiter: OutputLimiter,
+) -> gen_core::Result<SplicedMix> {
+    Ok(post_process(codec_rate, vocoder_rate, limiter))
 }
 
 /// The upstream post-process (module docs): limits the stems, builds both mixes and splices the
@@ -87,11 +84,11 @@ pub fn splice(codec_rate: &TrackPair, vocoder_rate: &TrackPair) -> gen_core::Res
 pub fn post_process(
     codec_rate: &TrackPair,
     vocoder_rate: &TrackPair,
-    limiter: Limiter,
+    limiter: OutputLimiter,
 ) -> SplicedMix {
     let recons_mix = sum_tracks(
-        &limit(&codec_rate.vocals, Limiter::Clamp),
-        &limit(&codec_rate.instrumental, Limiter::Clamp),
+        &limit(&codec_rate.vocals, OutputLimiter::Clamp),
+        &limit(&codec_rate.instrumental, OutputLimiter::Clamp),
     );
     let vocoder_mix = limit(
         &sum_tracks(&vocoder_rate.instrumental, &vocoder_rate.vocals),
@@ -111,10 +108,10 @@ pub fn post_process(
 }
 
 /// Upstream `save_audio`'s limiter arithmetic.
-pub fn limit(wave: &[f32], limiter: Limiter) -> Vec<f32> {
+pub fn limit(wave: &[f32], limiter: OutputLimiter) -> Vec<f32> {
     match limiter {
-        Limiter::Clamp => wave.iter().map(|v| v.clamp(-LIMIT, LIMIT)).collect(),
-        Limiter::Rescale => {
+        OutputLimiter::Clamp => wave.iter().map(|v| v.clamp(-LIMIT, LIMIT)).collect(),
+        OutputLimiter::Rescale => {
             let peak = wave.iter().fold(0f32, |m, v| m.max(v.abs()));
             // `min(0.99 / peak, 1)`: a silent clip (peak 0 → ∞) keeps unit gain.
             let gain = if peak > 0.0 {
@@ -259,6 +256,7 @@ pub fn biquad(x: &[f32], kind: BiquadKind, rate: u32, cutoff: f32) -> Vec<f32> {
 pub fn splice_stub(
     _codec_rate: &TrackPair,
     vocoder_rate: &TrackPair,
+    _limiter: OutputLimiter,
 ) -> gen_core::Result<SplicedMix> {
     Ok(SplicedMix {
         mix: sum_tracks(&vocoder_rate.vocals, &vocoder_rate.instrumental),
@@ -274,12 +272,12 @@ mod tests {
     #[test]
     fn limiter_clamps_or_rescales_like_save_audio() {
         let w = [0.5, -1.98, 1.2, 0.0];
-        assert_eq!(limit(&w, Limiter::Clamp), [0.5, -0.99, 0.99, 0.0]);
-        let r = limit(&w, Limiter::Rescale);
+        assert_eq!(limit(&w, OutputLimiter::Clamp), [0.5, -0.99, 0.99, 0.0]);
+        let r = limit(&w, OutputLimiter::Rescale);
         assert!((r[1] + 0.99).abs() < 1e-7 && (r[0] - 0.25).abs() < 1e-7);
         // Under the limit, rescale is unit gain; silence stays silence.
-        assert_eq!(limit(&[0.1, -0.2], Limiter::Rescale), [0.1, -0.2]);
-        assert_eq!(limit(&[0.0; 3], Limiter::Rescale), [0.0; 3]);
+        assert_eq!(limit(&[0.1, -0.2], OutputLimiter::Rescale), [0.1, -0.2]);
+        assert_eq!(limit(&[0.0; 3], OutputLimiter::Rescale), [0.0; 3]);
     }
 
     #[test]
@@ -332,7 +330,7 @@ mod tests {
             vocals: vec![0.6; frames * 882],
             instrumental: vec![1.3; frames * 882],
         };
-        let out = splice(&codec, &vocoder).expect("production splice runs");
+        let out = splice(&codec, &vocoder, OutputLimiter::Clamp).expect("production splice runs");
         assert_eq!(out.mix.len(), frames * 882);
         assert_eq!(out.vocals.len(), frames * 882);
         assert!(out.instrumental.iter().all(|&v| v == LIMIT));

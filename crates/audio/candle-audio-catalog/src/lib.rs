@@ -315,11 +315,12 @@ mod tests {
     /// a provider that would fail bundle validation is caught in its own family first.
     /// sc-19382: the segmented-song / reference-window controls fail closed on every shipped
     /// generator that does not read them — only YuE advertises them (the window on ICL only).
+    /// sc-19378 adds `output_limiter` (YuE's clamp / rescale), YuE-only as well.
     #[test]
     fn segmented_song_controls_reach_only_the_models_that_read_them() {
-        use super::gen_core::{AudioParams, Error, GenerationRequest, TimeRegion};
+        use super::gen_core::{AudioParams, Error, GenerationRequest, OutputLimiter, TimeRegion};
         let registry = super::provider_registry().unwrap();
-        let fields: [(&str, AudioParams); 4] = [
+        let fields: [(&str, AudioParams); 6] = [
             (
                 "segments",
                 AudioParams {
@@ -348,6 +349,21 @@ mod tests {
                         start_secs: 0.0,
                         end_secs: Some(10.0),
                     }),
+                    ..Default::default()
+                },
+            ),
+            // sc-19378: both limiter values reach YuE and only YuE.
+            (
+                "output_limiter",
+                AudioParams {
+                    output_limiter: Some(OutputLimiter::Clamp),
+                    ..Default::default()
+                },
+            ),
+            (
+                "output_limiter",
+                AudioParams {
+                    output_limiter: Some(OutputLimiter::Rescale),
                     ..Default::default()
                 },
             ),

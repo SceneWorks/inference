@@ -859,6 +859,20 @@ pub struct AudioParams {
     /// The span of the [`Conditioning::ReferenceAudio`] clip a model conditions on (in-context
     /// audio prompting, e.g. YuE ICL — sc-19382), in seconds. `None` ⇒ the model default window.
     pub reference_region: Option<TimeRegion>,
+    /// How the rendered output is kept inside full scale (song models whose reference writes its
+    /// output through a limiter, e.g. YuE's `save_audio` — sc-19378). `None` ⇒ the model default
+    /// (YuE: [`OutputLimiter::Clamp`], the reference default).
+    pub output_limiter: Option<OutputLimiter>,
+}
+
+/// The output limiter a model applies before returning audio ([`AudioParams::output_limiter`],
+/// sc-19378). Gated by [`Capabilities::supports_output_limiter`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputLimiter {
+    /// Hard-clamp every sample to the model's limit (YuE: `±0.99`) — the reference default.
+    Clamp,
+    /// Scale the whole track by `min(limit / peak, 1)` so nothing clips (YuE's `--rescale`).
+    Rescale,
 }
 
 /// One segment of a multi-speaker dialogue [`script`](AudioParams::script) (sc-12848) — the text a
@@ -1380,6 +1394,8 @@ impl GenerationRequest {
             // Integer counts (sc-19382): no floats to classify.
             segments: _,
             max_new_tokens_per_segment: _,
+            // A unit enum (sc-19378): no floats to classify.
+            output_limiter: _,
             target_duration,
             bpm,
             repetition_penalty,
@@ -2836,6 +2852,10 @@ pub struct Capabilities {
     /// [`Error::Unsupported`], since a model that reads the whole clip (or no reference at all)
     /// would render from a different span than the caller asked for.
     pub supports_reference_region: bool,
+    /// Whether this model reads [`AudioParams::output_limiter`] (sc-19378 — YuE's `save_audio`
+    /// clamp vs. rescale). `Default` is `false`; the shared floor then rejects the field as the
+    /// typed [`Error::Unsupported`] instead of letting a model with no such limiter drop it.
+    pub supports_output_limiter: bool,
 
     // --- LTX-2.5 generation axes (sc-18778) ------------------------------------------------------
     //
@@ -3071,7 +3091,9 @@ impl Capabilities {
     ///   `max_new_tokens_per_segment` / `repetition_penalty` / `reference_region` only when the
     ///   matching [`supports_segmented_lyrics`](Self::supports_segmented_lyrics) /
     ///   [`supports_repetition_penalty`](Self::supports_repetition_penalty) /
-    ///   [`supports_reference_region`](Self::supports_reference_region) flag is set (sc-19382),
+    ///   [`supports_reference_region`](Self::supports_reference_region) flag is set (sc-19382), and
+    ///   `output_limiter` only when [`supports_output_limiter`](Self::supports_output_limiter) is
+    ///   set (sc-19378),
     ///
     /// Capability-gap rejections (unsupported negative_prompt / guidance / true_cfg / sampler /
     /// scheduler / guidance_method / conditioning) return the typed [`Error::Unsupported`] so a
@@ -3526,6 +3548,11 @@ impl Capabilities {
                     "audio.reference_region",
                     audio.reference_region.is_some(),
                     self.supports_reference_region,
+                ),
+                (
+                    "audio.output_limiter",
+                    audio.output_limiter.is_some(),
+                    self.supports_output_limiter,
                 ),
             ];
             for (field, present, supported) in gated {
@@ -5577,7 +5604,7 @@ mod tests {
         // passes once its own flag is advertised.
         type Set = fn(&mut AudioParams);
         type Flag = fn(&mut Capabilities);
-        let cases: [(&str, Set, Flag); 4] = [
+        let cases: [(&str, Set, Flag); 5] = [
             (
                 "segments",
                 |a| a.segments = Some(3),
@@ -5602,6 +5629,11 @@ mod tests {
                     })
                 },
                 |c| c.supports_reference_region = true,
+            ),
+            (
+                "output_limiter",
+                |a| a.output_limiter = Some(OutputLimiter::Rescale),
+                |c| c.supports_output_limiter = true,
             ),
         ];
         for (name, set, flag) in cases {

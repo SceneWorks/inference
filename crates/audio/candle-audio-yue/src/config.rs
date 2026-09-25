@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use candle_audio::gen_core::{self, AudioTrack, Quant};
+use candle_audio::gen_core::{self, AudioTrack, OutputLimiter, Quant};
 
 /// Stage-1 checkpoint language.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -278,6 +278,8 @@ pub struct YueRequest {
     pub seed: u64,
     /// The ICL reference; required for ICL variants, refused for CoT ones.
     pub icl: Option<IclReference>,
+    /// The output limiter (upstream `save_audio`: clamp by default, `--rescale` on request).
+    pub limiter: OutputLimiter,
 }
 
 impl YueRequest {
@@ -290,6 +292,7 @@ impl YueRequest {
             decode: DecodeConfig::default(),
             seed: DEFAULT_SEED,
             icl: None,
+            limiter: OutputLimiter::Clamp,
         }
     }
 

@@ -253,7 +253,7 @@ impl YueEngine {
             mut mix,
             mut vocals,
             mut instrumental,
-        } = (s.splice)(&codec_rate, &vocoder_rate)?;
+        } = (s.splice)(&codec_rate, &vocoder_rate, req.limiter)?;
         let len = mix.len().min(vocals.len()).min(instrumental.len());
         if len == 0 {
             return Err(gen_core::Error::Msg(format!(

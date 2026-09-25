@@ -24,7 +24,8 @@ use std::path::PathBuf;
 
 use candle_audio_yue::candle_audio::candle_core::{DType, Device, Tensor};
 use candle_audio_yue::codec::{XcodecDecoder, CHECKPOINT};
-use candle_audio_yue::splice::{post_process, Limiter, TrackPair};
+use candle_audio_yue::gen_core::OutputLimiter;
+use candle_audio_yue::splice::{post_process, TrackPair};
 use candle_audio_yue::tokens::CodecFrames;
 use candle_audio_yue::vocoder::{Track, VocosUpsampler, SAMPLES_PER_FRAME};
 
@@ -154,7 +155,10 @@ fn vocos_decoders_and_the_post_processed_mix_match_the_reference() {
         vocals: native["vocal"].1.clone(),
         instrumental: native["inst"].1.clone(),
     };
-    for (limiter, mode) in [(Limiter::Clamp, "clamp"), (Limiter::Rescale, "rescale")] {
+    for (limiter, mode) in [
+        (OutputLimiter::Clamp, "clamp"),
+        (OutputLimiter::Rescale, "rescale"),
+    ] {
         let out = post_process(&codec_rate, &vocoder_rate, limiter);
         for (got, part) in [
             (&out.mix, "mix"),
