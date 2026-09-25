@@ -818,6 +818,78 @@
       "family": "apache-2-0",
       "attribution": "Whisper © OpenAI — licensed under Apache-2.0",
       "retrieved": "2026-08-02"
+    },
+    {
+      "component": "xcodec_mini_infer",
+      "source_url": "https://huggingface.co/m-a-p/xcodec_mini_infer",
+      "gated": false,
+      "declared": "apache-2.0",
+      "family": "apache-2-0",
+      "attribution": "YuE © Multimodal Art Projection (M-A-P) and HKUST — licensed under Apache-2.0",
+      "retrieved": "2026-09-24"
+    },
+    {
+      "component": "yue_s1_7b_anneal_en_cot",
+      "source_url": "https://huggingface.co/m-a-p/YuE-s1-7B-anneal-en-cot",
+      "gated": false,
+      "declared": "apache-2.0",
+      "family": "apache-2-0",
+      "attribution": "YuE © Multimodal Art Projection (M-A-P) and HKUST — licensed under Apache-2.0",
+      "retrieved": "2026-09-24"
+    },
+    {
+      "component": "yue_s1_7b_anneal_en_icl",
+      "source_url": "https://huggingface.co/m-a-p/YuE-s1-7B-anneal-en-icl",
+      "gated": false,
+      "declared": "apache-2.0",
+      "family": "apache-2-0",
+      "attribution": "YuE © Multimodal Art Projection (M-A-P) and HKUST — licensed under Apache-2.0",
+      "retrieved": "2026-09-24"
+    },
+    {
+      "component": "yue_s1_7b_anneal_jp_kr_cot",
+      "source_url": "https://huggingface.co/m-a-p/YuE-s1-7B-anneal-jp-kr-cot",
+      "gated": false,
+      "declared": "apache-2.0",
+      "family": "apache-2-0",
+      "attribution": "YuE © Multimodal Art Projection (M-A-P) and HKUST — licensed under Apache-2.0",
+      "retrieved": "2026-09-24"
+    },
+    {
+      "component": "yue_s1_7b_anneal_jp_kr_icl",
+      "source_url": "https://huggingface.co/m-a-p/YuE-s1-7B-anneal-jp-kr-icl",
+      "gated": false,
+      "declared": "apache-2.0",
+      "family": "apache-2-0",
+      "attribution": "YuE © Multimodal Art Projection (M-A-P) and HKUST — licensed under Apache-2.0",
+      "retrieved": "2026-09-24"
+    },
+    {
+      "component": "yue_s1_7b_anneal_zh_cot",
+      "source_url": "https://huggingface.co/m-a-p/YuE-s1-7B-anneal-zh-cot",
+      "gated": false,
+      "declared": "apache-2.0",
+      "family": "apache-2-0",
+      "attribution": "YuE © Multimodal Art Projection (M-A-P) and HKUST — licensed under Apache-2.0",
+      "retrieved": "2026-09-24"
+    },
+    {
+      "component": "yue_s1_7b_anneal_zh_icl",
+      "source_url": "https://huggingface.co/m-a-p/YuE-s1-7B-anneal-zh-icl",
+      "gated": false,
+      "declared": "apache-2.0",
+      "family": "apache-2-0",
+      "attribution": "YuE © Multimodal Art Projection (M-A-P) and HKUST — licensed under Apache-2.0",
+      "retrieved": "2026-09-24"
+    },
+    {
+      "component": "yue_s2_1b_general",
+      "source_url": "https://huggingface.co/m-a-p/YuE-s2-1B-general",
+      "gated": false,
+      "declared": "apache-2.0",
+      "family": "apache-2-0",
+      "attribution": "YuE © Multimodal Art Projection (M-A-P) and HKUST — licensed under Apache-2.0",
+      "retrieved": "2026-09-24"
     }
   ],
   "providers": [
@@ -1287,6 +1359,126 @@
       "provider_id": "whisper_base",
       "components": [
         "whisper_base"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "apache-2-0"
+        },
+        {
+          "term": "notice_file_required"
+        }
+      ]
+    },
+    {
+      "provider_id": "yue_en_cot",
+      "components": [
+        "xcodec_mini_infer",
+        "yue_s1_7b_anneal_en_cot",
+        "yue_s2_1b_general"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "apache-2-0"
+        },
+        {
+          "term": "notice_file_required"
+        }
+      ]
+    },
+    {
+      "provider_id": "yue_en_icl",
+      "components": [
+        "xcodec_mini_infer",
+        "yue_s1_7b_anneal_en_icl",
+        "yue_s2_1b_general"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "apache-2-0"
+        },
+        {
+          "term": "notice_file_required"
+        }
+      ]
+    },
+    {
+      "provider_id": "yue_jp_kr_cot",
+      "components": [
+        "xcodec_mini_infer",
+        "yue_s1_7b_anneal_jp_kr_cot",
+        "yue_s2_1b_general"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "apache-2-0"
+        },
+        {
+          "term": "notice_file_required"
+        }
+      ]
+    },
+    {
+      "provider_id": "yue_jp_kr_icl",
+      "components": [
+        "xcodec_mini_infer",
+        "yue_s1_7b_anneal_jp_kr_icl",
+        "yue_s2_1b_general"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "apache-2-0"
+        },
+        {
+          "term": "notice_file_required"
+        }
+      ]
+    },
+    {
+      "provider_id": "yue_zh_cot",
+      "components": [
+        "xcodec_mini_infer",
+        "yue_s1_7b_anneal_zh_cot",
+        "yue_s2_1b_general"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "apache-2-0"
+        },
+        {
+          "term": "notice_file_required"
+        }
+      ]
+    },
+    {
+      "provider_id": "yue_zh_icl",
+      "components": [
+        "xcodec_mini_infer",
+        "yue_s1_7b_anneal_zh_icl",
+        "yue_s2_1b_general"
       ],
       "terms": [
         {

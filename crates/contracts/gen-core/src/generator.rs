@@ -846,6 +846,33 @@ pub struct AudioParams {
     /// [`AudioParams`]. `prompt` still carries any single-voice / global text; a model that reads the
     /// script renders it in preference to `prompt`.
     pub script: Option<Vec<SpeechSegment>>,
+    /// How many **lyric segments** to render (segment-by-segment autoregressive song models, e.g.
+    /// YuE — sc-19382). `None` ⇒ the model default. A model that renders the whole text in one pass
+    /// ignores it; one that reads it documents how it resolves a count larger than the lyrics hold.
+    pub segments: Option<u32>,
+    /// Per-segment autoregressive **token budget** (segment-by-segment song models, sc-19382).
+    /// `None` ⇒ the model default. Must be `>= 1` where read.
+    pub max_new_tokens_per_segment: Option<u32>,
+    /// Autoregressive **repetition penalty** (token-sampled audio models, sc-19382). `None` ⇒ the
+    /// model default. Must be finite and `> 0` where read.
+    pub repetition_penalty: Option<f32>,
+    /// The span of the [`Conditioning::ReferenceAudio`] clip a model conditions on (in-context
+    /// audio prompting, e.g. YuE ICL — sc-19382), in seconds. `None` ⇒ the model default window.
+    pub reference_region: Option<TimeRegion>,
+    /// How the rendered output is kept inside full scale (song models whose reference writes its
+    /// output through a limiter, e.g. YuE's `save_audio` — sc-19378). `None` ⇒ the model default
+    /// (YuE: [`OutputLimiter::Clamp`], the reference default).
+    pub output_limiter: Option<OutputLimiter>,
+}
+
+/// The output limiter a model applies before returning audio ([`AudioParams::output_limiter`],
+/// sc-19378). Gated by [`Capabilities::supports_output_limiter`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputLimiter {
+    /// Hard-clamp every sample to the model's limit (YuE: `±0.99`) — the reference default.
+    Clamp,
+    /// Scale the whole track by `min(limit / peak, 1)` so nothing clips (YuE's `--rescale`).
+    Rescale,
 }
 
 /// One segment of a multi-speaker dialogue [`script`](AudioParams::script) (sc-12848) — the text a
@@ -1364,13 +1391,29 @@ impl GenerationRequest {
             // The script carries no floats (text + opaque labels); named (no `..`) so a future
             // float-bearing per-segment control fails to compile here until it is classified.
             script: _,
+            // Integer counts (sc-19382): no floats to classify.
+            segments: _,
+            max_new_tokens_per_segment: _,
+            // A unit enum (sc-19378): no floats to classify.
+            output_limiter: _,
             target_duration,
             bpm,
+            repetition_penalty,
+            reference_region,
         }) = audio
         {
-            let audio_floats: [(&'static str, Option<f32>); 2] = [
+            let audio_floats: [(&'static str, Option<f32>); 5] = [
                 ("audio.target_duration", *target_duration),
                 ("audio.bpm", *bpm),
+                ("audio.repetition_penalty", *repetition_penalty),
+                (
+                    "audio.reference_region.start_secs",
+                    reference_region.map(|r| r.start_secs),
+                ),
+                (
+                    "audio.reference_region.end_secs",
+                    reference_region.and_then(|r| r.end_secs),
+                ),
             ];
             for (name, v) in audio_floats {
                 if let Some(x) = v {
@@ -2793,6 +2836,26 @@ pub struct Capabilities {
     /// set; a script naming more than `max_speakers` distinct speakers is a range error
     /// ([`Error::Msg`], not a capability gap). `Default` is `None`.
     pub max_speakers: Option<u32>,
+    /// Whether this model renders lyrics **segment by segment** and reads
+    /// [`AudioParams::segments`] and [`AudioParams::max_new_tokens_per_segment`] (sc-19382, YuE).
+    /// `Default` is `false`, and the shared floor then rejects a request carrying either field as
+    /// the typed [`Error::Unsupported`] — a one-pass model would otherwise silently ignore the
+    /// requested segment count or budget.
+    pub supports_segmented_lyrics: bool,
+    /// Whether this model's autoregressive sampler reads [`AudioParams::repetition_penalty`]
+    /// (sc-19382). `Default` is `false`; the shared floor then rejects the field as the typed
+    /// [`Error::Unsupported`] instead of letting a model that never samples with it drop it.
+    pub supports_repetition_penalty: bool,
+    /// Whether this model conditions on a caller-chosen **window** of its
+    /// [`Conditioning::ReferenceAudio`] clip ([`AudioParams::reference_region`], sc-19382 — YuE
+    /// ICL). `Default` is `false`; the shared floor then rejects the field as the typed
+    /// [`Error::Unsupported`], since a model that reads the whole clip (or no reference at all)
+    /// would render from a different span than the caller asked for.
+    pub supports_reference_region: bool,
+    /// Whether this model reads [`AudioParams::output_limiter`] (sc-19378 — YuE's `save_audio`
+    /// clamp vs. rescale). `Default` is `false`; the shared floor then rejects the field as the
+    /// typed [`Error::Unsupported`] instead of letting a model with no such limiter drop it.
+    pub supports_output_limiter: bool,
 
     // --- LTX-2.5 generation axes (sc-18778) ------------------------------------------------------
     //
@@ -3024,7 +3087,13 @@ impl Capabilities {
     ///   `target_duration` within `(0, `[`max_audio_duration_secs`](Self::max_audio_duration_secs)`]`,
     ///   positive `bpm` — sc-12834); and a multi-speaker [`script`](AudioParams::script) only when
     ///   [`supports_multi_speaker`](Self::supports_multi_speaker) is set, within any advertised
-    ///   [`max_speakers`](Self::max_speakers) cap (sc-12848),
+    ///   [`max_speakers`](Self::max_speakers) cap (sc-12848); and `segments` /
+    ///   `max_new_tokens_per_segment` / `repetition_penalty` / `reference_region` only when the
+    ///   matching [`supports_segmented_lyrics`](Self::supports_segmented_lyrics) /
+    ///   [`supports_repetition_penalty`](Self::supports_repetition_penalty) /
+    ///   [`supports_reference_region`](Self::supports_reference_region) flag is set (sc-19382), and
+    ///   `output_limiter` only when [`supports_output_limiter`](Self::supports_output_limiter) is
+    ///   set (sc-19378),
     ///
     /// Capability-gap rejections (unsupported negative_prompt / guidance / true_cfg / sampler /
     /// scheduler / guidance_method / conditioning) return the typed [`Error::Unsupported`] so a
@@ -3454,6 +3523,43 @@ impl Capabilities {
                             }
                         }
                     }
+                }
+            }
+            // Segmented-song / autoregressive / reference-window controls (sc-19382): each is a
+            // capability gap on a model that does not advertise reading it → typed
+            // `Error::Unsupported`, so no provider can silently ignore one.
+            let gated = [
+                (
+                    "audio.segments",
+                    audio.segments.is_some(),
+                    self.supports_segmented_lyrics,
+                ),
+                (
+                    "audio.max_new_tokens_per_segment",
+                    audio.max_new_tokens_per_segment.is_some(),
+                    self.supports_segmented_lyrics,
+                ),
+                (
+                    "audio.repetition_penalty",
+                    audio.repetition_penalty.is_some(),
+                    self.supports_repetition_penalty,
+                ),
+                (
+                    "audio.reference_region",
+                    audio.reference_region.is_some(),
+                    self.supports_reference_region,
+                ),
+                (
+                    "audio.output_limiter",
+                    audio.output_limiter.is_some(),
+                    self.supports_output_limiter,
+                ),
+            ];
+            for (field, present, supported) in gated {
+                if present && !supported {
+                    return Err(Error::Unsupported(format!(
+                        "{id}: {field} is not supported"
+                    )));
                 }
             }
         }
@@ -5490,6 +5596,69 @@ mod tests {
             ..audio_req()
         };
         assert!(c.validate_request_audio("tts", &single).is_ok());
+    }
+
+    #[test]
+    fn segmented_song_controls_are_refused_unless_advertised() {
+        // sc-19382: each field is a typed capability gap on a model that does not read it, and
+        // passes once its own flag is advertised.
+        type Set = fn(&mut AudioParams);
+        type Flag = fn(&mut Capabilities);
+        let cases: [(&str, Set, Flag); 5] = [
+            (
+                "segments",
+                |a| a.segments = Some(3),
+                |c| c.supports_segmented_lyrics = true,
+            ),
+            (
+                "max_new_tokens_per_segment",
+                |a| a.max_new_tokens_per_segment = Some(100),
+                |c| c.supports_segmented_lyrics = true,
+            ),
+            (
+                "repetition_penalty",
+                |a| a.repetition_penalty = Some(1.1),
+                |c| c.supports_repetition_penalty = true,
+            ),
+            (
+                "reference_region",
+                |a| {
+                    a.reference_region = Some(TimeRegion {
+                        start_secs: 0.0,
+                        end_secs: Some(10.0),
+                    })
+                },
+                |c| c.supports_reference_region = true,
+            ),
+            (
+                "output_limiter",
+                |a| a.output_limiter = Some(OutputLimiter::Rescale),
+                |c| c.supports_output_limiter = true,
+            ),
+        ];
+        for (name, set, flag) in cases {
+            let mut req = audio_req();
+            set(req.audio.as_mut().unwrap());
+            let mut c = Capabilities {
+                audio_voices: vec!["nova"],
+                audio_languages: vec!["en"],
+                audio_sample_rates: vec![24_000],
+                max_count: 1,
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    c.validate_request_audio("tts", &req),
+                    Err(Error::Unsupported(_))
+                ),
+                "{name} must be refused when not advertised"
+            );
+            flag(&mut c);
+            assert!(
+                c.validate_request_audio("tts", &req).is_ok(),
+                "{name} must pass when advertised"
+            );
+        }
     }
 
     #[test]

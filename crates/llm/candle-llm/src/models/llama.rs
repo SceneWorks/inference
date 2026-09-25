@@ -44,6 +44,7 @@ use crate::primitives::nn::{
 use crate::primitives::projection::{
     KvProjection, Projection, ProjectionFormat, QuantSpec, WeightCensus,
 };
+use crate::primitives::quant::is_ggml_block_tensor;
 use crate::primitives::rope::{apply_rope, rms_norm_rope, Rope};
 use crate::primitives::step_kv_cache::{KvLayout, LayerKvShape, StepKvCache};
 use crate::primitives::{repeat_kv, ContiguousKvCache, PagedKvCache, Weights};
@@ -55,6 +56,12 @@ fn dense_tensor(
     target_device: Option<&Device>,
 ) -> Result<Tensor> {
     let source = w.require(key)?;
+    if source.dtype() == DType::U8 && source.rank() >= 3 {
+        return Err(Error::Config(format!(
+            "stored GGML block tensor `{key}` cannot be interpreted as a dense weight; only a \
+             separate layer projection may be stored quantized"
+        )));
+    }
     if source.dtype() == DType::U32 {
         return Err(Error::Config(format!(
             "packed U32 tensor `{key}` cannot be interpreted as a dense weight; its affine .scales/.biases sidecars are missing or this packed layout is unsupported"
@@ -145,6 +152,31 @@ pub(crate) fn decoder_root(
     }
 }
 
+/// Whether a [`CausalLm`] load of a snapshot with this config stores the checkpoint tensor `key`
+/// in a requested projection format: a [`quantizes_layer_tensor`] suffix of a layer the loader
+/// builds (`layer < num_layers`) under the snapshot's [`decoder_root`] `root`. The one rule both
+/// load admission prices the quantized copy by and the snapshot preparer stores GGML blocks for
+/// (sc-19375), so a prepared tier never stores a tensor admission does not price, or the loader
+/// does not read as a projection.
+pub(crate) fn loads_quantized(cfg: &ModelConfig, root: &str, key: &str) -> bool {
+    super::split_layer_key(key).is_some_and(|(key_root, layer, suffix)| {
+        key_root == root && layer < cfg.num_layers && quantizes_layer_tensor(suffix)
+    })
+}
+
+/// The device a projection read from `source` is built on: the load's target, else where the
+/// source lives — except a stored GGML block tensor, which [`Weights::from_dir`] keeps on the
+/// host (sc-19375) so its `QTensor` is built once on the model's device.
+fn load_target<'a>(w: &'a Weights, source: &'a Tensor, target: Option<&'a Device>) -> &'a Device {
+    target.unwrap_or_else(|| {
+        if is_ggml_block_tensor(source) && source.device().is_cpu() {
+            w.device()
+        } else {
+            source.device()
+        }
+    })
+}
+
 fn projection_from_weights(
     w: &Weights,
     wkey: &str,
@@ -157,7 +189,7 @@ fn projection_from_weights(
     let stem = wkey.strip_suffix(".weight").unwrap_or(wkey);
     let scales_key = format!("{stem}.scales");
     let source = w.require(wkey)?;
-    let target = target_device.unwrap_or_else(|| source.device());
+    let target = load_target(w, source, target_device);
     let bias = if with_bias {
         let bias_key = format!("{stem}.bias");
         w.contains(&bias_key)
@@ -167,6 +199,10 @@ fn projection_from_weights(
         None
     };
 
+    // A prepared Q4 / Q8 snapshot's stored GGML blocks (sc-19375), used exactly as stored.
+    if is_ggml_block_tensor(source) {
+        return Projection::load_stored_blocks(stem, source, bias, format, target);
+    }
     if w.contains(&scales_key) {
         let quant = match format {
             Some(ProjectionFormat::Ggml(quant)) => *quant,
@@ -470,13 +506,24 @@ impl CausalLm {
                                 "packed fused projection `{stem}` cannot be split safely; provide separate q_proj/k_proj/v_proj tensors"
                             )));
                         }
-                        let qkv = req(packed)?; // [qd + 2*kvd, hidden]
+                        let source = w.require(&packed)?;
+                        // Stored GGML blocks (a prepared tier, sc-19375) split by rows exactly
+                        // like the dense weight: each row is whole blocks, so every part is the
+                        // blocks its own quantization would have written.
+                        let stored = is_ggml_block_tensor(source);
+                        let target = load_target(w, source, target_device);
+                        let qkv = match stored {
+                            true => source.clone(),
+                            false => req(packed.clone())?, // [qd + 2*kvd, hidden]
+                        };
                         let split = |start: usize, len: usize| -> Result<Projection> {
-                            Projection::load_eligible(
-                                qkv.narrow(0, start, len)?.contiguous()?,
-                                None,
-                                format,
-                            )
+                            let part = qkv.narrow(0, start, len)?;
+                            if stored {
+                                return Projection::load_stored_blocks(
+                                    stem, &part, None, format, target,
+                                );
+                            }
+                            Projection::load_eligible(part.contiguous()?, None, format)
                         };
                         (
                             split(0, qd)?,
@@ -586,13 +633,22 @@ impl CausalLm {
                                 "packed fused projection `{stem}` cannot be split safely; provide separate gate_proj/up_proj tensors"
                             )));
                         }
-                        let gu = req(packed)?; // [2*inter, hidden]
+                        let source = w.require(&packed)?;
+                        // Stored GGML blocks split by rows, as for `qkv_proj` above.
+                        let stored = is_ggml_block_tensor(source);
+                        let target = load_target(w, source, target_device);
+                        let gu = match stored {
+                            true => source.clone(),
+                            false => req(packed.clone())?, // [2*inter, hidden]
+                        };
                         let split = |start: usize| -> Result<Projection> {
-                            Projection::load_eligible(
-                                gu.narrow(0, start, inter)?.contiguous()?,
-                                None,
-                                format,
-                            )
+                            let part = gu.narrow(0, start, inter)?;
+                            if stored {
+                                return Projection::load_stored_blocks(
+                                    stem, &part, None, format, target,
+                                );
+                            }
+                            Projection::load_eligible(part.contiguous()?, None, format)
                         };
                         (split(0)?, split(inter)?)
                     } else {

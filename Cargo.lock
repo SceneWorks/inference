@@ -184,6 +184,7 @@ name = "candle-audio"
 version = "0.0.0"
 dependencies = [
  "candle-core",
+ "candle-nn",
  "libc",
  "sceneworks-gen-core",
  "sha2",
@@ -224,6 +225,7 @@ dependencies = [
  "candle-audio-openvoice",
  "candle-audio-stable-audio-3",
  "candle-audio-whisper",
+ "candle-audio-yue",
  "candle-llm",
  "tempfile",
 ]
@@ -391,6 +393,21 @@ dependencies = [
  "core-llm",
  "rand",
  "serde_json",
+ "tempfile",
+ "tokenizers 0.22.2",
+]
+
+[[package]]
+name = "candle-audio-yue"
+version = "0.0.0"
+dependencies = [
+ "candle-audio",
+ "candle-llm",
+ "candle-nn",
+ "regex",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
  "tempfile",
  "tokenizers 0.22.2",
 ]
