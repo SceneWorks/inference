@@ -2534,3 +2534,80 @@ environment = ["BONSAI_BASELINE_SNAPSHOT"]
 expected_files = ["config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.json", "generation_config.json", "preprocessor_config.json", "video_preprocessor_config.json", "model.safetensors.index.json"]
 admission_language_weight_bytes = 16381470720
 admission_vision_weight_bytes = 1152776672
+
+# sc-19387 (epic sc-19373) -- YuE-v1 lyrics2song: the four published SceneWorks rehosts the
+# `candle-audio-yue` registered loader reads. Materialized on the Windows CUDA runner under
+# `CANDLE_GEN_MODELS_ROOT` by the dispatch-only `yue` profile, which junctions them into the
+# `YUE_SNAPSHOT_ROOT` layout `tests/registered_loader_real_weights.rs` expects. Each stage-1 row
+# fetches ONLY the tier its case runs (CoT at bf16, ICL at q4) rather than all three (~24 GB per
+# repo); stage 2 carries both of those tiers; xcodec fetches exactly the three checkpoints the
+# SceneWorks manifest provisions for the `xcodec` component.
+[[models]]
+key = "yue-s1-7b-anneal-en-cot-bf16"
+repository = "SceneWorks/yue-s1-7b-anneal-en-cot-candle"
+revision = "5842b8bc97d2a6dddc427a444920050dd3860949"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_EN_COT_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "sceneworks-tiers.json", "bf16/*"]
+expected_files = [
+    "sceneworks-tiers.json",
+    "bf16/config.json",
+    "bf16/generation_config.json",
+    "bf16/model.safetensors.index.json",
+    "bf16/tokenizer.json",
+    "bf16/tokenizer.model",
+]
+
+[[models]]
+key = "yue-s1-7b-anneal-en-icl-q4"
+repository = "SceneWorks/yue-s1-7b-anneal-en-icl-candle"
+revision = "fc8cb3515e654d419c2831dcdaf931b61a050179"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_EN_ICL_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "sceneworks-tiers.json", "q4/*"]
+expected_files = [
+    "sceneworks-tiers.json",
+    "q4/config.json",
+    "q4/generation_config.json",
+    "q4/model.safetensors",
+    "q4/tokenizer.json",
+    "q4/tokenizer.model",
+]
+
+[[models]]
+key = "yue-s2-1b-general"
+repository = "SceneWorks/yue-s2-1b-general-candle"
+revision = "3d6a71c7f2af1010983fc9da7bcaba528f083da6"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_S2_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "sceneworks-tiers.json", "bf16/*", "q4/*"]
+expected_files = [
+    "sceneworks-tiers.json",
+    "bf16/config.json",
+    "bf16/model.safetensors",
+    "bf16/tokenizer.json",
+    "q4/config.json",
+    "q4/model.safetensors",
+    "q4/tokenizer.json",
+]
+
+[[models]]
+key = "yue-xcodec-mini-infer"
+repository = "SceneWorks/xcodec-mini-infer"
+revision = "8ca30a19de500892e23a6ee687fca030053db60d"
+license = "Apache-2.0"
+size_class = "medium"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_XCODEC_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "final_ckpt/ckpt_00360000.safetensors", "decoders/decoder_131000.safetensors", "decoders/decoder_151000.safetensors"]
+expected_files = [
+    "final_ckpt/ckpt_00360000.safetensors",
+    "decoders/decoder_131000.safetensors",
+    "decoders/decoder_151000.safetensors",
+]

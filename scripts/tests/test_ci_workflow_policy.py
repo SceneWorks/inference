@@ -55,6 +55,10 @@ WINDOWS_MAGE_LOCK = (
 MACOS_MAGE_LOCK = (
     "crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt"
 )
+# sc-19387: decodes YuE's upstream ICL reference clip in the dispatch-only `candle-audio-yue` lane.
+WINDOWS_YUE_LOCK = (
+    ".github/requirements/real-weights-yue-reference-windows-x64-py312.txt"
+)
 MACOS_INTERPRETER = "python3.12"
 WINDOWS_SETUP_ACTION = "astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e"
 WINDOWS_UV_VERSION = 'version: "0.12.3"'
@@ -85,6 +89,7 @@ APPROVED_REAL_WEIGHT_LOCKS = {
     WINDOWS_SCAIL_HUB_LOCK,
     WINDOWS_MAGE_LOCK,
     MACOS_MAGE_LOCK,
+    WINDOWS_YUE_LOCK,
 }
 HUB_LOCK_PACKAGES = {
     "annotated-doc",
@@ -667,6 +672,8 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             expected_lock = MACOS_MAGE_LOCK
         elif "mage-oracle-verify" in command:
             expected_lock = WINDOWS_MAGE_LOCK
+        elif "yue-reference-decode" in command:
+            expected_lock = WINDOWS_YUE_LOCK
         elif f"{MACOS_INTERPRETER} -m pip" in command:
             expected_lock = MACOS_HUB_LOCK
         elif f"{WINDOWS_INTERPRETER} -m pip" in command:
@@ -712,14 +719,16 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # `mlx-qwen-image-producers` jobs; 24 since sc-17250 added the JoyCaption and
         # MOSS-TTS-Realtime jobs; 22 before).
         MACOS_HUB_LOCK: 35,
+        # 14 since sc-19387 added the `candle-audio-yue` job;
         # 13 since sc-24114 added the `candle-qwen-image-2-1` job;
         # 12 since SC-23942 added the Qwen/Bonsai Candle materialization lane;
         # 11 since sc-18932 added the `candle-minimax-h3` job.
-        WINDOWS_HUB_LOCK: 13,
+        WINDOWS_HUB_LOCK: 14,
         # `candle-scail2-shared` is the only lane on the py314 Windows lock.
         WINDOWS_SCAIL_HUB_LOCK: 1,
         WINDOWS_MAGE_LOCK: 1,
         MACOS_MAGE_LOCK: 1,
+        WINDOWS_YUE_LOCK: 1,
     }
     actual_lock_counts = {lock: locks_seen.count(lock) for lock in set(locks_seen)}
     if actual_lock_counts != expected_lock_counts:
@@ -1000,15 +1009,16 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
         # 35 / 12 after SC-23942 added one pinned materialization lane per native backend; 13 Windows
-        # after sc-24114 added `candle-qwen-image-2-1`.
+        # after sc-24114 added `candle-qwen-image-2-1`; 14 after sc-19387 added `candle-audio-yue`.
         # The remaining jobs retain their materialization lanes. These counts
         # are the anti-drift half of the policy above: the shape checks pass on a job that installs
         # nothing, so only a count notices a lane that quietly stopped materializing its snapshot.
         # Bump them when you add or remove a lane.
         self.assertEqual(workflow.count(MACOS_HUB_LOCK), 35)
-        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 13)
+        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 14)
         self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
+        self.assertEqual(workflow.count(WINDOWS_YUE_LOCK), 1)
         self.assertNotRegex(
             workflow,
             r"\bpip\s+install[^\n]*(?:huggingface[_-]hub|numpy|safetensors)==",
@@ -1368,6 +1378,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 encoding="utf-8"
             ),
             {"numpy", "safetensors"},
+        )
+        validate_binary_hashed_lock(
+            (REAL_WEIGHT_REQUIREMENTS / Path(WINDOWS_YUE_LOCK).name).read_text(
+                encoding="utf-8"
+            ),
+            {"cffi", "numpy", "pycparser", "soundfile", "typing-extensions"},
         )
         self.assertEqual(macos["huggingface-hub"][0], "1.20.1")
         self.assertEqual(windows["huggingface-hub"][0], "1.20.1")
