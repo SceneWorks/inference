@@ -70,8 +70,9 @@ thread_local! {
     static KV_MATERIALIZATIONS: Cell<u64> = const { Cell::new(0) };
 }
 
-/// Record one KV materialization (a growing-cache `cat`, a `repeat_kv` expansion) on the current
-/// thread. Called by the leaves that copy cached K/V; the static path never does.
+/// Record one KV materialization (a growing-cache `cat`, a `repeat_kv` expansion, a contiguous copy
+/// of a K/V layout the attention matmul cannot read) on the current thread. Called by the leaves
+/// that copy cached K/V; the static path never does.
 #[inline]
 pub fn note_kv_materialize() {
     KV_MATERIALIZATIONS.with(|c| c.set(c.get().wrapping_add(1)));
@@ -91,6 +92,11 @@ pub fn kv_materialize_count() -> u64 {
 pub trait KvCache {
     /// Append `keys`/`values` for `layer` (each `[batch, n_kv_heads, step, head_dim]`) and return
     /// the full cached `(keys, values)` to attend over, same layout with the sequence axis grown.
+    ///
+    /// Decoders hand over **contiguous** head-major tensors. A growing cache returns the first
+    /// append unchanged, so whatever layout a decoder passes reaches attention as-is on prefill;
+    /// `sdpa_gqa_causal` copies a layout its matmul cannot read rather than failing, but that copy
+    /// is a per-call materialization the contract exists to avoid (sc-24164).
     fn update(&mut self, layer: usize, keys: &Tensor, values: &Tensor) -> Result<(Tensor, Tensor)>;
 
     /// Number of sequence positions currently cached — i.e. the RoPE offset for the next step.

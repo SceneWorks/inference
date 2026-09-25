@@ -459,9 +459,16 @@ impl StarCoder2Attention {
             self.cfg.kv_heads,
             dim,
         ))?;
-        let q = apply_rope(&q, cos, sin, false)?.transpose(1, 2)?;
-        let k = apply_rope(&k, cos, sin, false)?.transpose(1, 2)?;
-        let v = v.transpose(1, 2)?;
+        // Head-major and contiguous, as llama's `project` hands them over: the growing cache returns
+        // the first append's K/V unchanged, and `sdpa_gqa_causal` attends them directly — a bare
+        // transpose of a multi-token GQA projection is a layout the CUDA matmul rejects (sc-24164).
+        let q = apply_rope(&q, cos, sin, false)?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = apply_rope(&k, cos, sin, false)?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v = v.transpose(1, 2)?.contiguous()?;
         let (k, v) = cache.update(index, &k, &v)?;
         let scale = 1.0 / (dim as f32).sqrt();
         let out = match formulation {
@@ -652,5 +659,167 @@ mod tests {
             crate::error::Error::Config(message)
                 if message.contains("must be [3, 4]") && message.contains("got [4, 4]")
         ));
+    }
+
+    /// A weight-file-free StarCoder2 on `device`: bounded, deterministic cos-pattern weights (a
+    /// distinct phase per tensor) with unit LayerNorm scales.
+    fn synthetic_decoder(cfg: StarCoder2Config, device: &Device) -> StarCoder2 {
+        let mut phase = 0.0f64;
+        let mut det = |dims: &[usize], scale: f64| -> Tensor {
+            phase += 0.61;
+            let n: usize = dims.iter().product();
+            Tensor::arange(0f32, n as f32, device)
+                .unwrap()
+                .affine(0.0137, phase)
+                .unwrap()
+                .cos()
+                .unwrap()
+                .affine(scale, 0.0)
+                .unwrap()
+                .reshape(dims)
+                .unwrap()
+        };
+        let ones = |n: usize| Tensor::ones(n, DType::F32, device).unwrap();
+        let (hidden, inter) = (cfg.hidden_size, cfg.intermediate_size);
+        let kv = cfg.kv_heads * cfg.head_dim();
+        let p = "fixture";
+        let mut map = HashMap::new();
+        map.insert(
+            format!("{p}.model.embed_tokens.weight"),
+            det(&[cfg.vocab_size, hidden], 0.5),
+        );
+        map.insert(format!("{p}.model.norm.weight"), ones(hidden));
+        map.insert(format!("{p}.model.norm.bias"), det(&[hidden], 0.02));
+        for layer in 0..cfg.layers {
+            let key = |suffix: &str| format!("{p}.model.layers.{layer}.{suffix}");
+            for norm in ["input_layernorm", "post_attention_layernorm"] {
+                map.insert(key(&format!("{norm}.weight")), ones(hidden));
+                map.insert(key(&format!("{norm}.bias")), det(&[hidden], 0.02));
+            }
+            for (proj, rows) in [
+                ("q_proj", hidden),
+                ("k_proj", kv),
+                ("v_proj", kv),
+                ("o_proj", hidden),
+            ] {
+                map.insert(
+                    key(&format!("self_attn.{proj}.weight")),
+                    det(&[rows, hidden], 0.2),
+                );
+                map.insert(key(&format!("self_attn.{proj}.bias")), det(&[rows], 0.02));
+            }
+            map.insert(key("mlp.c_fc.weight"), det(&[inter, hidden], 0.2));
+            map.insert(key("mlp.c_fc.bias"), det(&[inter], 0.02));
+            map.insert(key("mlp.c_proj.weight"), det(&[hidden, inter], 0.2));
+            map.insert(key("mlp.c_proj.bias"), det(&[hidden], 0.02));
+        }
+        StarCoder2::from_weights(&Weights::from_map(map, device.clone()), p, cfg).unwrap()
+    }
+
+    /// sc-24164 regression (release gate 2, `runtime-2026.09.1-rc.1`): StarVector-8B's CUDA prefill
+    /// failed with "matmul is only supported for contiguous tensors". StarCoder2 handed the growing
+    /// cache bare head transposes of its GQA projections, the growing cache returns the first
+    /// append unchanged, and `sdpa_gqa_causal`'s `Kᵀ` matmul rejected that layout. It takes more
+    /// than one KV head and a multi-token prefill to produce it (a single KV head or a single token
+    /// leaves the transpose dense), so a small synthetic decoder with 2 KV heads is prefilled with
+    /// 11 positions through the growing step cache the 8B provider uses, and through the reference
+    /// `Decode` path's growing cache. Both must run, copy no K/V (StarCoder2 hands the cache
+    /// contiguous head-major tensors, so attention never needs its fallback copy), agree bit for
+    /// bit, decode on from the prefill, and agree with the static cache's prefill.
+    fn assert_multi_token_gqa_prefill_through_the_growing_cache(device: &Device) {
+        use crate::primitives::kv_cache::kv_materialize_count;
+        let cfg = StarCoder2Config {
+            vocab_size: 48,
+            hidden_size: 64,
+            intermediate_size: 128,
+            layers: 2,
+            heads: 4,
+            kv_heads: 2,
+            rope_theta: 1_000_000.0,
+            layer_norm_eps: 1e-5,
+        };
+        let model = synthetic_decoder(cfg, device);
+        let prompt = 11usize;
+        // Stand-ins for the projected image rows + `<svg` prompt embeddings the provider joins.
+        let embeds = Tensor::arange(0f32, (prompt * cfg.hidden_size) as f32, device)
+            .unwrap()
+            .affine(0.021, 0.3)
+            .unwrap()
+            .sin()
+            .unwrap()
+            .reshape((1, prompt, cfg.hidden_size))
+            .unwrap();
+        let host = |t: &Tensor| -> Vec<f32> {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+
+        // The StarVector-8B provider's prefill: a fresh growing step cache.
+        let mut growing = model.new_step_cache();
+        let before = kv_materialize_count();
+        let provider = model
+            .step_prefill_from_embeds(&embeds, &mut growing)
+            .expect("a multi-token GQA prefill through the growing cache must run");
+        assert_eq!(
+            kv_materialize_count(),
+            before,
+            "the first append attends StarCoder2's K/V as handed over: no copy"
+        );
+        assert_eq!(provider.dims(), &[1, cfg.vocab_size]);
+        assert!(host(&provider).iter().all(|x| x.is_finite()));
+
+        // The reference `Decode` path over the same growing concat: identical arithmetic.
+        let mut reference_cache = model.cache();
+        let reference = model
+            .logits_from_embeds(&embeds, &mut reference_cache, 0)
+            .expect("the reference prefill must run");
+        assert_eq!(host(&provider), host(&reference));
+        // ... and it decodes on from the prefilled cache (the `cat` path).
+        let next = model
+            .embed(&Tensor::new(&[[3u32]], device).unwrap())
+            .unwrap();
+        let step = model
+            .logits_from_embeds(&next, &mut reference_cache, prompt as i32)
+            .expect("a decode step after the prefill must run");
+        assert!(host(&step).iter().all(|x| x.is_finite()));
+
+        // The static cache (in-place contiguous writes, narrowed views) attends the same values.
+        let mut fixed = model.new_static_cache(prompt + 4).unwrap();
+        let fixed = model.step_prefill_from_embeds(&embeds, &mut fixed).unwrap();
+        let (a, b) = (host(&provider), host(&fixed));
+        let peak = a.iter().fold(0f32, |m, x| m.max(x.abs()));
+        let diff = a
+            .iter()
+            .zip(&b)
+            .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+        eprintln!(
+            "[starcoder2 {:?}] growing vs static prefill: max|delta| = {diff} (max|logit| = \
+             {peak}), bit-identical = {}",
+            device,
+            a == b
+        );
+        assert!(
+            diff <= 2e-2 * peak.max(1.0),
+            "growing vs static max|delta| = {diff}"
+        );
+    }
+
+    /// The sc-24164 regression on the CPU lane: the CPU `gemm` reads any strides, so this pins the
+    /// no-copy contract (fix (a)) rather than the matmul failure.
+    #[test]
+    fn multi_token_gqa_prefill_through_the_growing_cache_copies_no_kv_on_cpu() {
+        assert_multi_token_gqa_prefill_through_the_growing_cache(&Device::Cpu);
+    }
+
+    /// The sc-24164 regression where it failed: on CUDA, where the matmul rejects the layout.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn multi_token_gqa_prefill_through_the_growing_cache_runs_on_cuda() {
+        let device = crate::device::new_cuda_for_test().expect("cuda device");
+        assert_multi_token_gqa_prefill_through_the_growing_cache(&device);
     }
 }
