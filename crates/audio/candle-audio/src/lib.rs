@@ -22,6 +22,8 @@
 //!   sc-13886 / sc-13691).
 //! - [`mel`] — HTK mel filterbank construction and application for mel-spectrogram
 //!   front-ends (reference-audio conditioning, model preprocessing parity).
+//! - [`neural_codec`] — neural-codec building blocks several providers' decoders share
+//!   (weight-norm folding, RVQ dequantization, Snake, the DAC convolutional decoder).
 //! - [`wav`] — 16-bit PCM WAV encoding of a [`gen_core::AudioTrack`], the audio
 //!   sibling of the media families' image/video encode step.
 //! - [`harness`] — the audio validation & quality harness (sc-12854): per-run
@@ -50,6 +52,7 @@ use thiserror::Error;
 pub mod dsp;
 pub mod harness;
 pub mod mel;
+pub mod neural_codec;
 pub mod ops;
 pub mod wav;
 

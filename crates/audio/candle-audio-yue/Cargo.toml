@@ -27,7 +27,8 @@ candle-nn = { workspace = true }
 sceneworks-gen-core-testkit = { workspace = true }
 # RAII fixture roots for the load-gate tests.
 tempfile = { workspace = true }
-# Reads the committed stage-2 parity goldens (tests/fixtures) and writes synthetic snapshot configs.
+# Reads the committed parity fixtures (stage 1: scripts/reference/yue_stage1_reference.py; stage 2:
+# tests/fixtures) and writes synthetic snapshot configs.
 serde_json = { workspace = true }
 
 [features]

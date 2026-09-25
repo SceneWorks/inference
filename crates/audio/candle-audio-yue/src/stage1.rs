@@ -8,15 +8,20 @@
 //! top-p, repetition penalty, the minimum-new-tokens floor, and the "smart context" that drops the
 //! oldest segment block when the sequence outgrows the cache — lives behind `step`.
 //!
-//! The production loader refuses (`Unsupported`) until its story lands;
-//! [`StubStage1`] is the test double; **sc-19380** replaces
-//! [`load`] with the candle-llm `CausalLm` (Llama, GQA, KV cache, bf16/q8/q4) driven decode. The
-//! stub stays as the end-to-end seam test's weights-free double.
+//! The production loader ([`load`]) is [`Stage1Lm`]: the candle-llm `CausalLm` (Llama, GQA, KV
+//! cache, bf16/q8/q4) driven decode (sc-19380). [`StubStage1`] stays as the end-to-end seam test's
+//! weights-free double.
 
 use candle_audio::gen_core;
 
 use crate::config::{Assets, DecodeConfig, Tier};
 use crate::tokens::{codec_token, CODEBOOK_SIZE};
+
+mod lm;
+#[cfg(test)]
+mod parity;
+
+pub use lm::{shorten_context, Stage1Lm};
 
 /// What the engine hands stage 1 at the start of a segment.
 #[derive(Clone, Copy, Debug)]
@@ -52,11 +57,10 @@ pub trait Stage1Model: Send {
     fn end_segment(&mut self) -> gen_core::Result<()>;
 }
 
-/// Production loader. **Refuses until sc-19380** lands the real stage-1 LM ([`load_stub`] is the
-/// test double only). `tier` is `None` when the caller asserted no tier (detect it from the staged
-/// snapshot).
-pub fn load(_assets: &Assets, _tier: Option<Tier>) -> gen_core::Result<Box<dyn Stage1Model>> {
-    Err(crate::stages::not_yet_implemented("stage-1 LM", "sc-19380"))
+/// Production loader: the stage-1 LM from `assets.stage1` through candle-llm ([`Stage1Lm::load`]).
+/// `tier` is `None` when the caller asserted no tier (load whatever tier is staged).
+pub fn load(assets: &Assets, tier: Option<Tier>) -> gen_core::Result<Box<dyn Stage1Model>> {
+    Ok(Box::new(Stage1Lm::load(&assets.stage1, tier)?))
 }
 
 /// The weights-free stub loader (the seam test's double).
@@ -67,7 +71,7 @@ pub fn load_stub(_assets: &Assets, _tier: Option<Tier>) -> gen_core::Result<Box<
 /// Frames (vocal + instrumental token pairs) the stub emits per segment before `<EOA>`.
 pub const STUB_FRAMES_PER_SEGMENT: usize = 10;
 
-/// **Stub stage 1** — replaced as the production stage by **sc-19380**. Emits
+/// **Stub stage 1** — the weights-free test double for [`Stage1Lm`]. Emits
 /// [`STUB_FRAMES_PER_SEGMENT`] deterministic codebook-0 token pairs (keyed by seed, segment, step
 /// and the prompt length) and then `<EOA>`.
 #[derive(Clone, Debug, Default)]

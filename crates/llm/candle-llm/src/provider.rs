@@ -1832,9 +1832,11 @@ impl LlamaProvider {
         }
     }
 
-    /// Consume the provider and keep only its Llama-family decoder (`None` for the Qwen3.6
-    /// hybrid) — [`LlamaProvider::causal_lm`] for an engine that owns the decoder: the provider's
-    /// chat template is not `Send`, and such an engine needs none of the chat/tokenizer state.
+    /// [`LlamaProvider::causal_lm`] by value: consume the provider and keep only its Llama-family
+    /// decoder (`None` for the Qwen3.6 hybrid). For an engine that must own the decoder in a
+    /// `Send` type — the provider itself is not `Send` (its chat template is a non-`Send` trait
+    /// object) — after loading through the same [`LlamaProvider::load`] path. The tokenizer, chat
+    /// template and decode records are dropped; the decoder's weights are moved, not copied.
     pub fn into_causal_lm(self) -> Option<CausalLm> {
         match self.model {
             Decoder::Causal(m) => Some(m),

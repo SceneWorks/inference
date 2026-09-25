@@ -208,6 +208,10 @@ pub struct DecodeConfig {
     pub repetition_penalty: f32,
     /// Nucleus sampling threshold.
     pub top_p: f32,
+    /// Keep only the `top_k` highest-scoring tokens before the nucleus (`0` disables it). The
+    /// reference pipeline passes no `top_k` to Hugging Face `generate`, which therefore applies its
+    /// library default of 50 — so 50 is the reference default here.
+    pub top_k: u32,
     /// Sampling temperature.
     pub temperature: f32,
     /// Classifier-free guidance.
@@ -221,6 +225,7 @@ impl Default for DecodeConfig {
             min_new_tokens: 100,
             repetition_penalty: 1.1,
             top_p: 0.93,
+            top_k: 50,
             temperature: 1.0,
             guidance: Guidance::DEFAULT,
         }
@@ -405,6 +410,8 @@ mod tests {
         assert_eq!(r.decode.max_new_tokens, 3_000);
         assert_eq!(r.decode.repetition_penalty, 1.1);
         assert_eq!(r.decode.top_p, 0.93);
+        assert_eq!(r.decode.top_k, 50);
+        assert_eq!(r.decode.min_new_tokens, 100);
         assert_eq!(r.decode.guidance.scale_for(0), Some(1.5));
         assert_eq!(r.decode.guidance.scale_for(3), Some(1.2));
         assert_eq!(Guidance::Off.scale_for(0), None);

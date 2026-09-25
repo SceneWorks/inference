@@ -23,7 +23,7 @@ use crate::config::{Assets, Tier, Variant, YueRequest};
 use crate::stage1::{SegmentStart, Stage1Step};
 use crate::stages::StageSet;
 use crate::tokenizer::PromptInput;
-use crate::tokens::split_stage1_tokens;
+use crate::tokens::{split_raw_output, TrackCodes, CODEBOOK_SIZE, EOA};
 use crate::vocoder::Track;
 
 /// A pipeline stage, as named in [`YueEvent`]s.
@@ -184,11 +184,24 @@ impl YueEngine {
         on_event(YueEvent::StageLoaded(Stage::Stage1));
         let segments = self.run_stage1(stage1.as_mut(), req, &prompt, total, cancel, on_event);
         release(Stage::Stage1, stage1, on_event);
-        let tracks = split_stage1_tokens(&segments?)
+        let tracks = stage1_tracks(&prompt, &segments?)
             .map_err(|e| gen_core::Error::Msg(format!("{id}: {e}")))?;
         if tracks.vocals.is_empty() {
             return Err(gen_core::Error::Msg(format!(
                 "{id}: stage 1 produced no audio frames"
+            )));
+        }
+        // The reference's stage 2 asserts every code is inside codebook 0 (`offset_tok_ids`); a
+        // token the allow-list admits beyond it cannot be upsampled.
+        if let Some(code) = tracks
+            .vocals
+            .iter()
+            .chain(&tracks.instrumental)
+            .find(|&&c| c >= CODEBOOK_SIZE)
+        {
+            return Err(gen_core::Error::Msg(format!(
+                "{id}: stage 1 emitted a token outside codebook 0 (code {code}), which stage 2 \
+                 cannot upsample"
             )));
         }
 
@@ -304,6 +317,25 @@ impl YueEngine {
         }
         Ok(segments)
     }
+}
+
+/// Rebuild the render's stage-1 sequence — each run segment's prompt block, its generated tokens
+/// and the `<EOA>` that closed it (sampled or forced) — and split it with the reference `save`
+/// semantics. Complete `<SOA>…<EOA>` pairs inside the prompt blocks (the ICL reference block) are
+/// prompt audio, skipped as the reference skips its first pair for an audio-prompted render.
+pub(crate) fn stage1_tracks(
+    prompt: &crate::tokenizer::Stage1Prompt,
+    generated: &[Vec<u32>],
+) -> Result<TrackCodes, String> {
+    let mut raw = Vec::new();
+    let mut prompt_pairs = 0;
+    for (block, tokens) in prompt.segments.iter().zip(generated) {
+        prompt_pairs += block.ids.iter().filter(|&&t| t == EOA).count();
+        raw.extend_from_slice(&block.ids);
+        raw.extend_from_slice(tokens);
+        raw.push(EOA);
+    }
+    split_raw_output(&raw, prompt_pairs)
 }
 
 /// Sample-wise sum of two mono tracks, over the shorter length.
