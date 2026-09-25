@@ -20,6 +20,7 @@ use crate::model::{load_with_stages, STAGE2_COMPONENT_ID, XCODEC_COMPONENT_ID};
 use crate::stage1::{SegmentStart, Stage1Model, Stage1Step, STUB_FRAMES_PER_SEGMENT};
 use crate::stage2::Stage2Model;
 use crate::stages::StageSet;
+use crate::tokenizer::{PromptInput, PromptTokenizer, Stage1Prompt};
 use crate::tokens::CodecFrames;
 use crate::vocoder::{Track, Vocoder, SAMPLES_PER_FRAME};
 
@@ -433,6 +434,97 @@ fn an_icl_request_against_a_non_icl_checkpoint_is_refused_before_any_stage_loads
 
 fn log_default() -> Log {
     Log::default()
+}
+
+/// Stage 1 wrapper that records every segment prompt it is handed.
+struct PromptRecorder {
+    inner: Box<dyn Stage1Model>,
+    prompts: Arc<Mutex<Vec<Vec<u32>>>>,
+}
+
+impl Stage1Model for PromptRecorder {
+    fn begin_render(&mut self, seed: u64) -> crate::gen_core::Result<()> {
+        self.inner.begin_render(seed)
+    }
+    fn begin_segment(&mut self, segment: &SegmentStart<'_>) -> crate::gen_core::Result<()> {
+        self.prompts.lock().unwrap().push(segment.prompt.to_vec());
+        self.inner.begin_segment(segment)
+    }
+    fn step(&mut self) -> crate::gen_core::Result<Stage1Step> {
+        self.inner.step()
+    }
+    fn end_segment(&mut self) -> crate::gen_core::Result<()> {
+        self.inner.end_segment()
+    }
+}
+
+/// Tokenizer wrapper that records whether each build carried an ICL block.
+struct IclProbe {
+    inner: Box<dyn PromptTokenizer>,
+    icl_seen: Arc<Mutex<Vec<bool>>>,
+}
+
+impl PromptTokenizer for IclProbe {
+    fn build(&self, input: &PromptInput<'_>) -> crate::gen_core::Result<Stage1Prompt> {
+        self.icl_seen.lock().unwrap().push(input.icl.is_some());
+        self.inner.build(input)
+    }
+}
+
+/// Render `req` on `variant` through the instrumented stubs, returning the audio, the stage log,
+/// the stage-1 segment prompts, and whether each prompt build carried an ICL block.
+fn render_recording(
+    variant: Variant,
+    req: &GenerationRequest,
+) -> (AudioTrack, Vec<String>, Vec<Vec<u32>>, Vec<bool>) {
+    let (log, steps) = (Log::default(), Arc::new(Mutex::new(0)));
+    let mut set = instrumented(&log, &steps, None);
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let (p, b) = (prompts.clone(), set.stage1.clone());
+    set.stage1 = Arc::new(move |a: &Assets, t| {
+        Ok(Box::new(PromptRecorder {
+            inner: b(a, t)?,
+            prompts: p.clone(),
+        }) as Box<dyn Stage1Model>)
+    });
+    let icl_seen = Arc::new(Mutex::new(Vec::new()));
+    let (seen, b) = (icl_seen.clone(), set.tokenizer.clone());
+    set.tokenizer = Arc::new(move |a: &Assets| {
+        Ok(Box::new(IclProbe {
+            inner: b(a)?,
+            icl_seen: seen.clone(),
+        }) as Box<dyn PromptTokenizer>)
+    });
+    let g = load_with_stages(variant, &spec(), set).unwrap();
+    let track = audio(g.generate(req, &mut |_| {}).unwrap());
+    let log = log.lock().unwrap().clone();
+    let prompts = prompts.lock().unwrap().clone();
+    let icl_seen = icl_seen.lock().unwrap().clone();
+    (track, log, prompts, icl_seen)
+}
+
+/// R1 full surface: the reference `infer.py` runs an `-icl` checkpoint with neither
+/// `--use_audio_prompt` nor `--use_dual_tracks_prompt`, building `head_id` from the
+/// instruction/genre/lyrics text alone — the CoT construction. So an ICL variant with no reference
+/// renders, never loads the reference encoder, and hands stage 1 exactly the prompts the CoT variant
+/// does for the same request (the prompt builder is variant-agnostic; its `icl: None` construction
+/// is the one the sc-19376 prompt golden pins against the reference).
+#[test]
+fn icl_variant_without_a_reference_renders_from_the_cot_prompt() {
+    let req = song(None);
+    let (icl_track, icl_log, icl_prompts, icl_seen) =
+        render_recording(Variant::new(Language::En, Mode::Icl), &req);
+    let (cot_track, _, cot_prompts, cot_seen) = render_recording(cot(), &req);
+
+    assert!(
+        !icl_log.iter().any(|e| e.starts_with("icl:")),
+        "{icl_log:?}"
+    );
+    assert_eq!(icl_seen, [false], "no ICL block reaches the prompt builder");
+    assert_eq!(icl_seen, cot_seen);
+    assert_eq!(icl_prompts.len(), 2);
+    assert_eq!(icl_prompts, cot_prompts, "the CoT prompt construction");
+    assert_eq!(icl_track, cot_track, "same prompts + seed, same song");
 }
 
 #[test]

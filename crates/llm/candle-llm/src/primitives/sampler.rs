@@ -108,7 +108,9 @@ pub struct SamplingParams {
     pub top_p: f32,
     /// Keep only the `top_k` highest-logit tokens before nucleus selection. `0` disables top-k.
     pub top_k: usize,
-    /// CTRL/HF repetition penalty. `1.0` disables it.
+    /// CTRL/HF repetition penalty. `1.0` disables it. Applied **once per distinct id** in the
+    /// window (Hugging Face `RepetitionPenaltyLogitsProcessor` gathers and scatters, so a repeated
+    /// id is divided / multiplied once, never compounded by its count).
     pub repetition_penalty: f32,
     /// How many recent history tokens the repetition penalty looks back over.
     pub repetition_context: usize,
@@ -613,10 +615,13 @@ fn penalize_host(
         }
     }
 
-    // Repetition penalty (Keskar et al. 2019 / HF CTRL formulation) over the recent window.
+    // Repetition penalty (Keskar et al. 2019 / HF CTRL formulation) over the recent window,
+    // once per distinct id: HF gathers each id's logit and scatters the transformed value back,
+    // so an id repeated in the window is penalised exactly once.
     if params.repetition_penalty != 1.0 && params.repetition_context > 0 {
         let start = history.len().saturating_sub(params.repetition_context);
-        for &tok in &history[start..] {
+        let mut penalized = HashSet::with_capacity(history.len() - start);
+        for &tok in history[start..].iter().filter(|&&t| penalized.insert(t)) {
             if let Some(slot) = usize::try_from(tok).ok().and_then(|i| v.get_mut(i)) {
                 *slot = if *slot < 0.0 {
                     *slot * params.repetition_penalty
@@ -1434,6 +1439,23 @@ mod tests {
         let mut rng = SplitMix64::new(0);
         let t = sample(&l, &history, &params, &mut rng, Some(&[true, true, true])).unwrap();
         assert_eq!(t, 1);
+    }
+
+    #[test]
+    fn repetition_penalty_is_applied_once_per_distinct_id() {
+        // Hugging Face `RepetitionPenaltyLogitsProcessor` gathers each id's logit and scatters the
+        // transformed value back: an id repeated in the window is penalised once, not per count.
+        let params = SamplingParams {
+            repetition_penalty: 2.0,
+            repetition_context: 8,
+            ..Default::default()
+        };
+        let mut row = vec![4.0, -2.0, 3.0];
+        penalize_host(&mut row, &[0, 0, 0, 1, 1], &params, None);
+        assert_eq!(row, vec![2.0, -4.0, 3.0]);
+        let l = logits(&[4.0, -2.0, 3.0]);
+        let adjusted = penalized_logits(&l, &[1, 0, 1, 0, 0], &params, None).unwrap();
+        assert_eq!(adjusted, vec![2.0, -4.0, 3.0]);
     }
 
     #[test]
