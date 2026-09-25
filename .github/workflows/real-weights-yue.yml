@@ -141,10 +141,11 @@ jobs:
           set "YUE_TIER=%~1"
           set "log=%YUE_EVIDENCE%\%~2-%~1.log"
           set "vram=%YUE_EVIDENCE%\%~2-%~1-vram.csv"
-          start "" /b nvidia-smi --query-gpu=timestamp,index,memory.used --format=csv,noheader,nounits -lms 500 -f "%vram%"
+          start "" /b powershell -NoProfile -Command "while (-not (Test-Path '%vram%.stop')) { nvidia-smi --query-gpu=timestamp,index,memory.used --format=csv,noheader,nounits | Add-Content -Path '%vram%'; Start-Sleep -Milliseconds 500 }"
           cargo test --locked --release -p candle-audio-yue --features cuda --test registered_loader_real_weights %~2 -- --ignored --exact --nocapture > "%log%" 2>&1
           set "rc=%ERRORLEVEL%"
-          taskkill /im nvidia-smi.exe /f >nul 2>&1
+          echo stop> "%vram%.stop"
+          powershell -NoProfile -Command "Start-Sleep -Seconds 2; Import-Csv -Header t,i,m '%vram%' | Group-Object i | ForEach-Object { 'cuda:' + $_.Name + ' peak ' + ($_.Group | Measure-Object -Property m -Maximum).Maximum + ' MiB' }"
           type "%log%"
           if not "%rc%"=="0" (echo ::error::%~2 at %~1 failed& exit /b 1)
           findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~2 did not run exactly one passing test& exit /b 1)
