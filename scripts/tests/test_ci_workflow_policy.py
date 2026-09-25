@@ -55,6 +55,12 @@ WINDOWS_MAGE_LOCK = (
 MACOS_MAGE_LOCK = (
     "crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt"
 )
+# sc-19387: the dispatch-only YuE CUDA lane, in its own file because `real-weights.yml` is at
+# GitHub's 500 KB workflow-size limit, and the lock that decodes YuE's upstream ICL reference clip.
+YUE_WORKFLOW = WORKFLOW.with_name("real-weights-yue.yml")
+WINDOWS_YUE_LOCK = (
+    ".github/requirements/real-weights-yue-reference-windows-x64-py312.txt"
+)
 MACOS_INTERPRETER = "python3.12"
 WINDOWS_SETUP_ACTION = "astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e"
 WINDOWS_UV_VERSION = 'version: "0.12.3"'
@@ -1369,6 +1375,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             ),
             {"numpy", "safetensors"},
         )
+        validate_binary_hashed_lock(
+            (REAL_WEIGHT_REQUIREMENTS / Path(WINDOWS_YUE_LOCK).name).read_text(
+                encoding="utf-8"
+            ),
+            {"cffi", "numpy", "pycparser", "soundfile", "typing-extensions"},
+        )
         self.assertEqual(macos["huggingface-hub"][0], "1.20.1")
         self.assertEqual(windows["huggingface-hub"][0], "1.20.1")
         self.assertEqual(scail_windows["huggingface-hub"][0], "1.20.1")
@@ -1569,6 +1581,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             REAL_WEIGHTS_WORKFLOW,
             LTX25_QUANT_CAMPAIGN_WORKFLOW,
             LTX25_QUANT_PROMOTION_WORKFLOW,
+            YUE_WORKFLOW,
         ):
             with self.subTest(workflow=path.name):
                 workflow = path.read_text(encoding="utf-8")
@@ -1577,6 +1590,20 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     1,
                 )
                 self.assertIn("cancel-in-progress: false", workflow)
+
+    def test_yue_workflow_python_installs_are_binary_hash_locked(self) -> None:
+        installs = [
+            line.strip()
+            for line in YUE_WORKFLOW.read_text(encoding="utf-8").splitlines()
+            if re.search(r"\bpip\s+install\b", line) and not line.lstrip().startswith("#")
+        ]
+        locks = [re.search(r"\s-r\s+(\S+)", line).group(1) for line in installs]
+        self.assertEqual(locks, [WINDOWS_HUB_LOCK, WINDOWS_YUE_LOCK])
+        for line in installs:
+            with self.subTest(install=line):
+                self.assertTrue(line.startswith(f"{WINDOWS_INTERPRETER} -m pip install "))
+                self.assertIn("--only-binary=:all: --require-hashes", line)
+                self.assertTrue(line.endswith("|| exit /b 1"))
 
     def test_ltx25_terminal_workflows_are_autonomous_and_artifact_bound(self) -> None:
         campaign = LTX25_QUANT_CAMPAIGN_WORKFLOW.read_text(encoding="utf-8")
