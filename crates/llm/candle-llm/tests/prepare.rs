@@ -116,6 +116,30 @@ fn write_synthetic_as(tag: &str, hidden: usize, inter: usize, dtype: DType) -> F
     dir
 }
 
+/// `into_causal_lm` hands over the very decoder `causal_lm` borrows (identical logits), and the
+/// owned decoder is `Send` — what an engine that owns it across threads (YuE, sc-19380) needs.
+#[test]
+fn into_causal_lm_moves_the_loaded_decoder_out() {
+    fn assert_send<T: Send>(_: &T) {}
+    let src = write_synthetic("into-causal", 8, 16);
+    let provider = LlamaProvider::load(&LoadSpec::dense(src.to_string_lossy())).unwrap();
+    let borrowed = logits(&provider);
+    let model = provider.into_causal_lm().expect("a llama-family decoder");
+    assert_send(&model);
+    let ids = Tensor::from_vec(vec![1u32, 5, 9, 2, 7], (1, 5), model.device()).unwrap();
+    let mut cache = model.new_cache();
+    let owned = model
+        .decode_logits(&ids, &mut cache, 0)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    assert_eq!(owned, borrowed);
+}
+
 /// A dense source is detected as safetensors and prepared as a passthrough (returned as-is, nothing
 /// written), and the returned snapshot loads and generates.
 #[test]

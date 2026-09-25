@@ -34,6 +34,8 @@ serde_json = { workspace = true }
 sceneworks-gen-core-testkit = { workspace = true }
 # RAII fixture roots for the load-gate tests.
 tempfile = { workspace = true }
+# Reads the committed stage-1 parity fixture (scripts/reference/yue_stage1_reference.py).
+serde_json = { workspace = true }
 
 [features]
 default = []
