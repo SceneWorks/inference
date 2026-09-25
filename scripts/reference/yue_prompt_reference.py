@@ -225,7 +225,7 @@ def load_reference(ref_dir: Path):
     from codecmanipulator import CodecManipulator  # noqa: E402
     from mmtokenizer import _MMSentencePieceTokenizer  # noqa: E402
 
-    infer_src = (inf / "infer.py").read_text()
+    infer_src = (inf / "infer.py").read_text(encoding="utf-8")
     split_lyrics_v1 = extract(infer_src, "split_lyrics", {"re": re})
     tok = _MMSentencePieceTokenizer("./mm_tokenizer_v0.2_hf/tokenizer.model")
     return tok, CodecManipulator, split_lyrics_v1
@@ -318,7 +318,7 @@ def read_like_cli(text: str) -> str:
         f.write(text)
         path = f.name
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:  # text mode: universal newlines, as the CLI
             return f.read().strip()
     finally:
         os.unlink(path)
