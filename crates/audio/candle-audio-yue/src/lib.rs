@@ -19,10 +19,9 @@
 //! | Vocos upsampler | [`vocoder`] | [`vocoder::Vocoder::decode`] | sc-19378 (ported) |
 //! | limiter + low-band splice | [`splice`] | [`splice::SpliceFn`] | sc-19378 (ported) |
 //!
-//! **Walking skeleton (sc-19382).** Every production loader whose story has not landed refuses
-//! with `Unsupported` (landed: tokenizer sc-19376, ICL encoder sc-19379, stage 1 sc-19380, codec sc-19377, Vocos + splice sc-19378), so a
-//! registered provider fails closed instead of rendering placeholder audio;
-//! the story named in the table replaces that module's `load`. Each module's deterministic,
+//! **Stages.** Every production loader is the real port (the story in the table); the walking
+//! skeleton (sc-19382) had each refuse with `Unsupported` until its story landed. Each module's
+//! deterministic,
 //! weights-free `load_stub` is the end-to-end seam test's double. The engine itself — staged residency
 //! (each stage released before the next loads), the stage-1 decode loop with a cancel check before
 //! every step, segment-level progress, codebook-0 de-interleave, stem assembly — is final.
@@ -45,6 +44,7 @@ pub mod engine;
 pub mod hubert;
 pub mod icl;
 pub mod model;
+pub mod snapshot;
 pub mod splice;
 pub mod stage1;
 pub mod stage2;

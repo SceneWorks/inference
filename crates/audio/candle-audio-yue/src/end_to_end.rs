@@ -585,10 +585,6 @@ fn the_requested_output_limiter_reaches_the_splice() {
     assert_eq!(render(Some(OutputLimiter::Rescale)), 1.0);
 }
 
-fn refused<T>(r: crate::gen_core::Result<T>) -> bool {
-    matches!(r, Err(Error::Unsupported(_)))
-}
-
 #[test]
 fn production_wiring_refuses_instead_of_rendering_placeholder_audio() {
     // The production tokenizer (sc-19376) is real: it loads the stage-1 snapshot's tokenizer.json.
@@ -605,8 +601,8 @@ fn production_wiring_refuses_instead_of_rendering_placeholder_audio() {
         Err(Error::Msg(_))
     ));
 
-    // Every unported production stage refuses on its own, so no later stage can fall back to its
-    // stub.
+    // Every production stage is real (the last, stage 2, landed with sc-19381): with nothing staged
+    // each fails to load on its own — none can fall back to its stub.
     let s = StageSet::production();
     let assets = Assets {
         stage1: stage1.path().to_path_buf(),
@@ -626,7 +622,11 @@ fn production_wiring_refuses_instead_of_rendering_placeholder_audio() {
         matches!((s.stage1)(&assets, None), Err(Error::Msg(_))),
         "stage 1"
     );
-    assert!(refused((s.stage2)(&assets, None)), "stage 2");
+    // Stage 2 is real (sc-19381): with nothing staged it fails to load, never a stub.
+    assert!(
+        matches!((s.stage2)(&assets, None), Err(e) if !matches!(e, Error::Unsupported(_))),
+        "stage 2"
+    );
     // The codec (sc-19377) is real: with nothing staged it fails to load (never `Unsupported`);
     // `codec::tests::production_load_decodes_a_staged_checkpoint_instead_of_refusing` loads it.
     assert!(

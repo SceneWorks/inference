@@ -29,7 +29,6 @@
 
 use candle_audio::candle_core::{Device, Tensor};
 use candle_audio::gen_core;
-use candle_llm::core_llm::{LoadSpec, Quantize};
 use candle_llm::primitives::kv_cache::{ContiguousKvCache, KvCache};
 use candle_llm::primitives::sampler::{
     logits_rows_host, sample_row_host, SamplingParams, SplitMix64,
@@ -108,28 +107,6 @@ impl std::fmt::Debug for Stage1Lm {
     }
 }
 
-/// The directory a stage-1 (or stage-2) `LoadSpec` loads from: `root` itself when it is a model
-/// snapshot (`config.json`), else — for a tiered repo root (`sceneworks-tiers.json` with `bf16/`,
-/// `q8/`, `q4/`) — the asserted tier's directory, or `bf16/` when no tier was asserted. A tier
-/// directory that is not staged falls back to `bf16/`, which the loader then quantizes to the
-/// asserted tier on load.
-pub(crate) fn lm_snapshot_dir(root: &std::path::Path, tier: Option<Tier>) -> std::path::PathBuf {
-    if root.join("config.json").is_file() {
-        return root.to_path_buf();
-    }
-    let sub = match tier {
-        Some(Tier::Q8) => "q8",
-        Some(Tier::Q4) => "q4",
-        Some(Tier::Bf16) | None => "bf16",
-    };
-    let dir = root.join(sub);
-    if dir.join("config.json").is_file() {
-        dir
-    } else {
-        root.join("bf16")
-    }
-}
-
 impl Stage1Lm {
     /// Load the stage-1 LM from `root` — a snapshot directory, or a tiered repo root whose
     /// `bf16/` / `q8/` / `q4/` directory the tier picks — through [`LlamaProvider::load`]
@@ -137,13 +114,8 @@ impl Stage1Lm {
     /// snapshot's stored GGML blocks. `tier` asserts Q8/Q4 (quantizing a dense snapshot on load,
     /// refusing a snapshot stored at a different tier); `None` loads whatever tier is staged.
     pub fn load(root: &std::path::Path, tier: Option<Tier>) -> gen_core::Result<Self> {
-        let dir = lm_snapshot_dir(root, tier);
-        let mut spec = LoadSpec::dense(dir.to_string_lossy().into_owned());
-        spec.quantize = match tier {
-            Some(Tier::Q8) => Some(Quantize::Q8),
-            Some(Tier::Q4) => Some(Quantize::Q4),
-            Some(Tier::Bf16) | None => None,
-        };
+        let (dir, _stored) = crate::snapshot::resolve_tier_dir(root, tier, "stage-1")?;
+        let spec = crate::snapshot::lm_load_spec(&dir, tier);
         let provider = LlamaProvider::load(&spec).map_err(|e| {
             gen_core::Error::Msg(format!(
                 "candle-audio-yue stage 1: load {}: {e}",
