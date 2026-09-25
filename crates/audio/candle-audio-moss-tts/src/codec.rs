@@ -48,6 +48,7 @@
 
 use candle_audio::candle_core::pickle::PthTensors;
 use candle_audio::candle_core::{DType, Device, IndexOp, Module, Result as CandleResult, Tensor};
+use candle_audio::neural_codec::{resolve_weight_norm, rvq_dequantize};
 use candle_audio::{AudioError, Result};
 use candle_nn::{
     Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, LayerNorm, Linear, VarBuilder,
@@ -126,30 +127,7 @@ fn load_decode_tensors(ckpt: &Path) -> Result<HashMap<String, Tensor>> {
             .to_dtype(DType::F32)?;
         raw.insert(name.clone(), t);
     }
-    resolve_weight_norm(raw)
-}
-
-/// Fold every `X.weight_g` / `X.weight_v` pair into `X.weight = g · v / ‖v‖` (norm over all dims
-/// except 0 — the torch `weight_norm(dim=0)` default). Non-paired tensors pass through unchanged.
-fn resolve_weight_norm(raw: HashMap<String, Tensor>) -> Result<HashMap<String, Tensor>> {
-    let mut out = HashMap::with_capacity(raw.len());
-    for (name, tensor) in &raw {
-        if let Some(base) = name.strip_suffix(".weight_g") {
-            let v = raw.get(&format!("{base}.weight_v")).ok_or_else(|| {
-                AudioError::Msg(format!("codec: {base}.weight_g without weight_v"))
-            })?;
-            let mut sq = v.sqr()?;
-            for d in 1..v.rank() {
-                sq = sq.sum_keepdim(d)?;
-            }
-            let norm = sq.sqrt()?;
-            let w = v.broadcast_mul(&tensor.broadcast_div(&norm)?)?;
-            out.insert(format!("{base}.weight"), w);
-        } else if !name.ends_with(".weight_v") {
-            out.insert(name.clone(), tensor.clone());
-        }
-    }
-    Ok(out)
+    Ok(resolve_weight_norm(raw)?)
 }
 
 // --------------------------------------------------------------------------------------------
@@ -242,18 +220,15 @@ impl RvqDecoder {
 
     /// `codes[q]` = quantizer `q`'s code row (length `T`) → `[1, CODE_DIM, T]`.
     fn decode(&self, codes: &[Vec<u32>], device: &Device) -> CandleResult<Tensor> {
-        let t = codes.first().map(Vec::len).unwrap_or(0);
-        let mut emb = Tensor::zeros((1, CODEBOOK_DIM, t), DType::F32, device)?;
-        for (q, code_row) in codes.iter().enumerate().take(self.codebooks.len()) {
-            let ids: Vec<u32> = code_row
-                .iter()
-                .map(|&c| c.min(CODEBOOK_SIZE as u32 - 1))
-                .collect();
-            let ids_t = Tensor::from_vec(ids, (t,), device)?;
-            let looked = self.codebooks[q].index_select(&ids_t, 0)?; // [T, dim]
-            let z = looked.t()?.unsqueeze(0)?.contiguous()?; // [1, dim, T]
-            emb = (emb + z)?;
-        }
+        let clamped: Vec<Vec<u32>> = codes
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|&c| c.min(CODEBOOK_SIZE as u32 - 1))
+                    .collect()
+            })
+            .collect();
+        let emb = rvq_dequantize(&self.codebooks, &clamped, device)?; // [1, CODEBOOK_DIM, T]
         self.output_proj.forward(&emb) // [1, CODE_DIM, T]
     }
 }
